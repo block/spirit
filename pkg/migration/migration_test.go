@@ -574,3 +574,171 @@ func TestSecondaryEngineAttribute(t *testing.T) {
 	err = migration.Run()
 	assert.NoError(t, err)
 }
+
+func TestCredsFileLoading(t *testing.T) {
+	// Create a temporary credentials file
+	credsContent := `[client]
+user = testuser
+password = testpass
+`
+	tmpFile, err := os.CreateTemp("", "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  "defaultpass",
+		Database:  "testdb",
+		Table:     "testtable",
+		Alter:     "ENGINE=InnoDB",
+		CredsFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "testuser", migration.Username)
+	assert.Equal(t, "testpass", migration.Password)
+}
+
+func TestCredsFileLoadingUserOnly(t *testing.T) {
+	// Test with only username in creds file
+	credsContent := `[client]
+user = onlyuser
+`
+	tmpFile, err := os.CreateTemp("", "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  "defaultpass",
+		Database:  "testdb",
+		Table:     "testtable",
+		Alter:     "ENGINE=InnoDB",
+		CredsFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "onlyuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password) // password should remain default
+}
+
+func TestCredsFileLoadingPasswordOnly(t *testing.T) {
+	// Test with only password in creds file
+	credsContent := `[client]
+password = onlypass
+`
+	tmpFile, err := os.CreateTemp("", "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  "defaultpass",
+		Database:  "testdb",
+		Table:     "testtable",
+		Alter:     "ENGINE=InnoDB",
+		CredsFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "defaultuser", migration.Username) // username should remain default
+	assert.Equal(t, "onlypass", migration.Password)
+}
+
+func TestCredsFileLoadingEmptyClientSection(t *testing.T) {
+	// Test with empty client section
+	credsContent := `[client]
+`
+	tmpFile, err := os.CreateTemp("", "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  "defaultpass",
+		Database:  "testdb",
+		Table:     "testtable",
+		Alter:     "ENGINE=InnoDB",
+		CredsFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	// Both should remain defaults since nothing was in the creds file
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+}
+
+func TestCredsFileLoadingNoClientSection(t *testing.T) {
+	// Test with no client section at all
+	credsContent := `[mysql]
+user = mysqluser
+password = mysqlpass
+`
+	tmpFile, err := os.CreateTemp("", "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  "defaultpass",
+		Database:  "testdb",
+		Table:     "testtable",
+		Alter:     "ENGINE=InnoDB",
+		CredsFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+}
+
+func TestCredsFileLoadingInvalidFile(t *testing.T) {
+	migration := &Migration{
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  "defaultpass",
+		Database:  "testdb",
+		Table:     "testtable",
+		Alter:     "ENGINE=InnoDB",
+		CredsFile: "/nonexistent/file.cnf",
+	}
+
+	_, err := migration.normalizeOptions()
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "no such file or directory")
+}
