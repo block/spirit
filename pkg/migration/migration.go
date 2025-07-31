@@ -11,6 +11,7 @@ import (
 	"github.com/cashapp/spirit/pkg/check"
 	"github.com/cashapp/spirit/pkg/statement"
 	"github.com/cashapp/spirit/pkg/table"
+	"github.com/go-ini/ini"
 	"github.com/pingcap/tidb/pkg/parser"
 )
 
@@ -23,6 +24,7 @@ type Migration struct {
 	Username             string        `name:"username" help:"User" optional:"" default:"msandbox"`
 	Password             string        `name:"password" help:"Password" optional:"" default:"msandbox"`
 	Database             string        `name:"database" help:"Database" optional:"" default:"test"`
+	CredsFile            string        `name:"creds-file" help:"Credentials ini file. Overrides credentials passed via CLI" optional:"" type:"existingfile"`
 	Table                string        `name:"table" help:"Table" optional:""`
 	Alter                string        `name:"alter" help:"The alter statement to run on the table" optional:""`
 	Threads              int           `name:"threads" help:"Number of concurrent threads for copy and checksum tasks" optional:"" default:"4"`
@@ -115,5 +117,19 @@ func (m *Migration) normalizeOptions() (stmt *statement.AbstractStatement, err e
 			StmtNode:  &stmtNodes[0],
 		}
 	}
+	if m.CredsFile != "" {
+		creds, err := ini.Load(m.CredsFile)
+		if err != nil {
+			return nil, err
+		}
+		if creds.Section("client").HasKey("user") {
+			m.Username = creds.Section("client").Key("user").String()
+		}
+
+		if creds.Section("client").HasKey("password") {
+			m.Password = creds.Section("client").Key("password").String()
+		}
+	}
+
 	return stmt, err
 }

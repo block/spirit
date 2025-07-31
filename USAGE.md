@@ -35,6 +35,12 @@ Checksum failure is not fatal. Spirit will re-copy chunks that fail checksums au
 
 In testing, the checksum feature has identified corruption issues on desktops with non ECC memory. You may believe that this is what the InnoDB page checksums are for, but they are more specifically for detecting corruption introduced from the IO layer. Memory based corruption is not detected and remains common.
 
+### creds-file
+
+- Type: String
+
+Path to INI file containing username and password to be used when connecting to MySQL. Spirit expects the 'user' and 'password' to be defined in a 'client' section within the INI file. Values provided in file take precedence over what's provided in the `--username` and `--password` arguments to spirit.
+
 ### database
 
 - Type: String
