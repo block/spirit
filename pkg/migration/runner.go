@@ -387,9 +387,6 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 	// an inplace add index, we will attempt inplace regardless
 	// of the statement.
 	err = r.stmt.AlgorithmInplaceConsideredSafe()
-	if err != nil {
-		r.logger.Infof("unable to use INPLACE: %v", err)
-	}
 	if r.migration.ForceInplace || err == nil {
 		err = r.attemptInplaceDDL(ctx)
 		if err == nil {
@@ -397,6 +394,7 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 			return nil
 		}
 	}
+	r.logger.Infof("unable to use INPLACE: %v", err)
 
 	// Failure is expected, since MySQL DDL only applies in limited scenarios
 	// Return the error, which will be ignored by the caller.

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
@@ -150,6 +152,13 @@ func (a *AbstractStatement) AlgorithmInplaceConsideredSafe() error {
 			ast.AlterTableTruncatePartition,
 			ast.AlterTableAddPartitions:
 			continue
+		case ast.AlterTableModifyColumn, ast.AlterTableChangeColumn:
+			// Only safe if changing length of a VARCHAR column. We don't know the type of the column
+			// or its length, so we cannot determine if this is safe only by parsing. We can simply try
+			// INPLACE, and if it fails we will retry with our own schema change process.
+			if spec.NewColumns[0].Tp != nil && spec.NewColumns[0].Tp.GetType() == mysql.TypeVarchar {
+				continue
+			}
 		default:
 			unsafeClauses++
 		}
