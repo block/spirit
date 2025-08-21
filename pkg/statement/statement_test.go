@@ -120,7 +120,6 @@ func TestAlgorithmInplaceConsideredSafe(t *testing.T) {
 	assert.Error(t, test("drop index `a`, add column `b` int"))
 	assert.Error(t, test("ALTER INDEX b INVISIBLE, add column `c` int"))
 	assert.Error(t, test("remove partitioning"))
-
 }
 
 func TestAlterIsAddUnique(t *testing.T) {
