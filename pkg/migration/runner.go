@@ -277,10 +277,11 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	if r.checker != nil {
 		checksumTime = r.checker.ExecTime
 	}
+	_, copiedChunks, _ := r.copier.GetChunker().Progress()
 	r.logger.Infof("apply complete: instant-ddl=%v inplace-ddl=%v total-chunks=%v copy-rows-time=%s checksum-time=%s total-time=%s conns-in-use=%d",
 		r.usedInstantDDL,
 		r.usedInplaceDDL,
-		r.copier.CopyChunksCount,
+		copiedChunks,
 		r.copier.ExecTime.Round(time.Second),
 		checksumTime.Round(time.Second),
 		time.Since(r.startTime).Round(time.Second),
@@ -442,7 +443,16 @@ func (r *Runner) setup(ctx context.Context) error {
 			}
 		}
 
-		r.copier, err = row.NewCopier(r.db, r.table, r.newTable, &row.CopierConfig{
+		// Create chunker first with destination table info, then create copier with it
+		chunker, err := table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+		if err != nil {
+			return err
+		}
+		// For now we always "open" the chunker, but that might become obsolete later.
+		if err := chunker.Open(); err != nil {
+			return err
+		}
+		r.copier, err = row.NewCopier(r.db, chunker, &row.CopierConfig{
 			Concurrency:     r.migration.Threads,
 			TargetChunkTime: r.migration.TargetChunkTime,
 			FinalChecksum:   r.migration.Checksum,
@@ -618,7 +628,6 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 	binlog_name VARCHAR(255),
 	binlog_pos INT,
 	rows_copied BIGINT,
-	rows_copied_logical BIGINT,
 	alter_statement TEXT
 	)`,
 		r.table.SchemaName, cpName); err != nil {
@@ -643,7 +652,7 @@ func (r *Runner) GetProgress() Progress {
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
 	case stateChecksum:
 		r.checkerLock.Lock()
-		summary = fmt.Sprintf("Checksum Progress=%s/%s", r.checker.RecentValue(), r.table.MaxValue())
+		summary = "Checksum Progress=" + r.checker.GetProgress()
 		r.checkerLock.Unlock()
 	}
 	return Progress{
@@ -738,8 +747,8 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		r.stmt.Schema, cpName)
 	var copierWatermark, binlogName, alterStatement string
 	var id, binlogPos int
-	var rowsCopied, rowsCopiedLogical uint64
-	err := r.db.QueryRow(query).Scan(&id, &copierWatermark, &r.checksumWatermark, &binlogName, &binlogPos, &rowsCopied, &rowsCopiedLogical, &alterStatement)
+	var rowsCopied uint64
+	err := r.db.QueryRow(query).Scan(&id, &copierWatermark, &r.checksumWatermark, &binlogName, &binlogPos, &rowsCopied, &alterStatement)
 	if err != nil {
 		return fmt.Errorf("could not read from table '%s', err:%v", cpName, err)
 	}
@@ -760,7 +769,22 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// we checksum the table at the end. Thus, resume-from-checkpoint MUST
 	// have the checksum enabled to apply all changes safely.
 	r.migration.Checksum = true
-	r.copier, err = row.NewCopierFromCheckpoint(r.db, r.table, r.newTable, &row.CopierConfig{
+
+	// Create chunker first and open at the checkpoint watermark
+	chunker, err := table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+	if err != nil {
+		return err
+	}
+
+	// Open chunker at the specified watermark
+	// For high watermark, use the type of old table, not the new one.
+	highPtr := table.NewDatum(r.newTable.MaxValue().Val, r.table.MaxValue().Tp)
+	if err := chunker.OpenAtWatermark(copierWatermark, highPtr, rowsCopied); err != nil {
+		return err
+	}
+
+	// Create copier with the prepared chunker
+	r.copier, err = row.NewCopier(r.db, chunker, &row.CopierConfig{
 		Concurrency:     r.migration.Threads,
 		TargetChunkTime: r.migration.TargetChunkTime,
 		FinalChecksum:   r.migration.Checksum,
@@ -768,7 +792,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		Logger:          r.logger,
 		MetricsSink:     r.metricsSink,
 		DBConfig:        r.dbConfig,
-	}, copierWatermark, rowsCopied, rowsCopiedLogical)
+	})
 	if err != nil {
 		return err
 	}
@@ -903,14 +927,14 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 			}
 		}
 	}
-	copyRows := atomic.LoadUint64(&r.copier.CopyRowsCount)
-	logicalCopyRows := atomic.LoadUint64(&r.copier.CopyRowsLogicalCount)
+	copyRows, _, _ := r.copier.GetChunker().Progress()
+
 	// Note: when we dump the lowWatermark to the log, we are exposing the PK values,
 	// when using the composite chunker are based on actual user-data.
 	// We believe this is OK but may change it in the future. Please do not
 	// add any other fields to this log line.
-	r.logger.Infof("checkpoint: low-watermark=%s log-file=%s log-pos=%d rows-copied=%d rows-copied-logical=%d", copierWatermark, binlog.Name, binlog.Pos, copyRows, logicalCopyRows)
-	return dbconn.Exec(ctx, r.db, "INSERT INTO %n.%n (copier_watermark, checksum_watermark, binlog_name, binlog_pos, rows_copied, rows_copied_logical, alter_statement) VALUES (%?, %?, %?, %?, %?, %?, %?)",
+	r.logger.Infof("checkpoint: low-watermark=%s log-file=%s log-pos=%d rows-copied=%d", copierWatermark, binlog.Name, binlog.Pos, copyRows)
+	return dbconn.Exec(ctx, r.db, "INSERT INTO %n.%n (copier_watermark, checksum_watermark, binlog_name, binlog_pos, rows_copied, alter_statement) VALUES (%?, %?, %?, %?, %?, %?)",
 		r.checkpointTable.SchemaName,
 		r.checkpointTable.TableName,
 		copierWatermark,
@@ -918,7 +942,6 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 		binlog.Name,
 		binlog.Pos,
 		copyRows,
-		logicalCopyRows,
 		r.stmt.Alter,
 	)
 }
@@ -989,14 +1012,11 @@ func (r *Runner) dumpStatus(ctx context.Context) {
 					r.db.Stats().InUse,
 				)
 			case stateChecksum:
-				// This could take a while if it's a large table. We just have to show approximate progress.
-				// This is a little bit harder for checksum because it doesn't have returned rows
-				// so we just show a "recent value" over the "maximum value".
+				// This could take a while if it's a large table.
 				r.checkerLock.Lock()
-				r.logger.Infof("migration status: state=%s checksum-progress=%s/%s binlog-deltas=%v total-time=%s checksum-time=%s conns-in-use=%d",
+				r.logger.Infof("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s conns-in-use=%d",
 					r.getCurrentState().String(),
-					r.checker.RecentValue(),
-					r.table.MaxValue(),
+					r.checker.GetProgress(),
 					r.replClient.GetDeltaLen(),
 					time.Since(r.startTime).Round(time.Second),
 					time.Since(r.checker.StartTime()).Round(time.Second),

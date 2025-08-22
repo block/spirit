@@ -39,7 +39,7 @@ func TestCompositeChunkerCompositeBinary(t *testing.T) {
 	assert.Equal(t, binaryType, t1.keyDatums[0])
 	assert.Equal(t, binaryType, t1.keyDatums[1])
 
-	chunker, err := NewChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 
@@ -139,7 +139,7 @@ func TestCompositeChunkerBinary(t *testing.T) {
 	assert.Equal(t, []string{"varbinary"}, t1.keyColumnsMySQLTp)
 	assert.Equal(t, binaryType, t1.keyDatums[0])
 
-	chunker, err := NewChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 
@@ -215,7 +215,7 @@ func TestCompositeChunkerInt(t *testing.T) {
 	assert.Equal(t, []string{"int"}, t1.keyColumnsMySQLTp)
 	assert.Equal(t, signedType, t1.keyDatums[0])
 
-	chunker, err := NewChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 
@@ -290,7 +290,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 	assert.Equal(t, "`pk` < 1008", chunk.String()) // first chunk
 	_, err = chunker.GetLowWatermark()
 	assert.Error(t, err) // no feedback yet.
-	chunker.Feedback(chunk, time.Millisecond*500)
+	chunker.Feedback(chunk, time.Millisecond*500, 1)
 	assert.Equal(t, StartingChunkSize, int(chunker.chunkSize)) // should not have changed yet (requires 10 feedbacks)
 
 	_, err = chunker.GetLowWatermark()
@@ -299,7 +299,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`pk` >= 1008 AND `pk` < 2032", chunk.String())
-	chunker.Feedback(chunk, time.Second)
+	chunker.Feedback(chunk, time.Second, 1)
 	assert.Equal(t, 100, int(chunker.chunkSize)) // usually requires 10 feedbacks, but changed because >5x target
 
 	watermark, err := chunker.GetLowWatermark()
@@ -309,7 +309,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`pk` >= 2032 AND `pk` < 2133", chunk.String())
-	chunker.Feedback(chunk, time.Second)
+	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"pk\"],\"ChunkSize\":100,\"LowerBound\":{\"Value\": [\"2032\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2133\"],\"Inclusive\":false}}", watermark)
@@ -326,17 +326,17 @@ func TestCompositeLowWatermark(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "`pk` >= 2155 AND `pk` < 2166", chunkAsync3.String())
 
-	chunker.Feedback(chunkAsync2, time.Second)
+	chunker.Feedback(chunkAsync2, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"pk\"],\"ChunkSize\":100,\"LowerBound\":{\"Value\": [\"2032\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2133\"],\"Inclusive\":false}}", watermark)
 
-	chunker.Feedback(chunkAsync3, time.Second)
+	chunker.Feedback(chunkAsync3, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"pk\"],\"ChunkSize\":100,\"LowerBound\":{\"Value\": [\"2032\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2133\"],\"Inclusive\":false}}", watermark)
 
-	chunker.Feedback(chunkAsync1, time.Second)
+	chunker.Feedback(chunkAsync1, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"pk\"],\"ChunkSize\":10,\"LowerBound\":{\"Value\": [\"2155\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2166\"],\"Inclusive\":false}}", watermark)
@@ -347,7 +347,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"pk\"],\"ChunkSize\":10,\"LowerBound\":{\"Value\": [\"2155\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2166\"],\"Inclusive\":false}}", watermark)
-	chunker.Feedback(chunk, time.Second)
+	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"pk\"],\"ChunkSize\":10,\"LowerBound\":{\"Value\": [\"2166\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2177\"],\"Inclusive\":false}}", watermark)
@@ -360,7 +360,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 		if chunk.ChunkSize != 10 {
 			break // feedback has worked
 		}
-		chunker.Feedback(chunk, time.Millisecond*5) // say that it took 5ms to process 10 rows
+		chunker.Feedback(chunk, time.Millisecond*5, 1) // say that it took 5ms to process 10 rows
 	}
 	assert.Empty(t, chunker.chunkTimingInfo)
 	assert.Equal(t, 15, int(chunker.chunkSize)) // scales up a maximum of 50% at a time.
@@ -389,7 +389,7 @@ func TestCompositeSmallTable(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "compositesmall_t1")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 
-	chunker, err := NewChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 

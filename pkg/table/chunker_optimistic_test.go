@@ -103,14 +103,14 @@ func TestLowWatermark(t *testing.T) {
 	assert.Equal(t, "`id` < 1", chunk.String()) // first chunk
 	_, err = chunker.GetLowWatermark()
 	assert.Error(t, err) // no feedback yet.
-	chunker.Feedback(chunk, time.Second)
+	chunker.Feedback(chunk, time.Second, 1)
 	_, err = chunker.GetLowWatermark()
 	assert.Error(t, err) // there has been feedback, but watermark is not ready after first chunk.
 
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`id` >= 1 AND `id` < 1001", chunk.String()) // first chunk
-	chunker.Feedback(chunk, time.Second)
+	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err := chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false}}", watermark)
@@ -118,7 +118,7 @@ func TestLowWatermark(t *testing.T) {
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`id` >= 1001 AND `id` < 2001", chunk.String()) // first chunk
-	chunker.Feedback(chunk, time.Second)
+	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
@@ -135,17 +135,17 @@ func TestLowWatermark(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "`id` >= 4001 AND `id` < 5001", chunkAsync3.String())
 
-	chunker.Feedback(chunkAsync2, time.Second)
+	chunker.Feedback(chunkAsync2, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
 
-	chunker.Feedback(chunkAsync3, time.Second)
+	chunker.Feedback(chunkAsync3, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
 
-	chunker.Feedback(chunkAsync1, time.Second)
+	chunker.Feedback(chunkAsync1, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermark)
@@ -157,7 +157,7 @@ func TestLowWatermark(t *testing.T) {
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermark)
 
-	chunker.Feedback(chunk, time.Second)
+	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"5001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"6001\"],\"Inclusive\":false}}", watermark)
@@ -180,19 +180,19 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	t1.columnsMySQLTps = make(map[string]string)
 	t1.columnsMySQLTps["id"] = "bigint"
 
-	chunker, err := NewChunker(t1, 100*time.Millisecond, logrus.New())
+	chunker, err := newChunker(t1, 100*time.Millisecond, logrus.New())
 	assert.NoError(t, err)
 
 	assert.NoError(t, chunker.Open())
 
 	chunk, err := chunker.Next()
 	assert.NoError(t, err)
-	chunker.Feedback(chunk, time.Second) // way too long.
+	chunker.Feedback(chunk, time.Second, 1) // way too long.
 
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(100), chunk.ChunkSize) // immediate change from before
-	chunker.Feedback(chunk, time.Second)          // way too long again, it will reduce to 10
+	chunker.Feedback(chunk, time.Second, 1)       // way too long again, it will reduce to 10
 
 	newChunk, err := chunker.Next()
 	assert.NoError(t, err)
@@ -200,17 +200,17 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	// Feedback is only taken if the chunk.ChunkSize matches the current size.
 	// so lets give bad feedback and see no change.
 	newChunk.ChunkSize = 1234
-	chunker.Feedback(newChunk, 10*time.Second) // way too long.
+	chunker.Feedback(newChunk, 10*time.Second, 1) // way too long.
 
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
-	assert.Equal(t, uint64(10), chunk.ChunkSize) // no change
-	chunker.Feedback(chunk, 50*time.Microsecond) //must give feedback to advance watermark.
+	assert.Equal(t, uint64(10), chunk.ChunkSize)    // no change
+	chunker.Feedback(chunk, 50*time.Microsecond, 1) //must give feedback to advance watermark.
 
 	// Feedback to increase the chunk size is more gradual.
 	for range 10 { // no change
 		chunk, err = chunker.Next()
-		chunker.Feedback(chunk, 50*time.Microsecond) // very short.
+		chunker.Feedback(chunk, 50*time.Microsecond, 1) // very short.
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(10), chunk.ChunkSize) // no change.
 	}
@@ -219,13 +219,13 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(15), chunk.ChunkSize)
-	chunker.Feedback(chunk, 50*time.Microsecond)
+	chunker.Feedback(chunk, 50*time.Microsecond, 1)
 
 	// Advance the watermark a little bit.
 	for range 20 {
 		chunk, err = chunker.Next()
 		assert.NoError(t, err)
-		chunker.Feedback(chunk, time.Millisecond)
+		chunker.Feedback(chunk, time.Millisecond, 1)
 	}
 
 	// Fetch the watermark.
@@ -245,10 +245,10 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	t2.columnsMySQLTps = make(map[string]string)
 	t2.columnsMySQLTps["id"] = "bigint"
 
-	chunker2, err := NewChunker(t1, 100, logrus.New())
+	chunker2, err := newChunker(t1, 100, logrus.New())
 	assert.NoError(t, err)
 	t2.Columns = []string{"id", "name"}
-	assert.NoError(t, chunker2.OpenAtWatermark(watermark, NewNilDatum(signedType)))
+	assert.NoError(t, chunker2.OpenAtWatermark(watermark, NewNilDatum(signedType), 0))
 
 	// The pointer goes to the lowerbound.value.
 	// It could equally go to the upperbound.value but then
@@ -306,7 +306,7 @@ func TestOptimisticPrefetchChunking(t *testing.T) {
 	for !chunker.finalChunkSent {
 		chunk, err := chunker.Next()
 		assert.NoError(t, err)
-		chunker.Feedback(chunk, 100*time.Millisecond) // way too short.
+		chunker.Feedback(chunk, 100*time.Millisecond, 1) // way too short.
 	}
 	assert.True(t, chunker.chunkPrefetchingEnabled)
 }

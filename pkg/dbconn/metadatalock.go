@@ -93,7 +93,7 @@ func NewMetadataLock(ctx context.Context, dsn string, table *table.TableInfo, lo
 
 	// Setup background refresh runner
 	ctx, mdl.cancel = context.WithCancel(ctx)
-	mdl.closeCh = make(chan error)
+	mdl.closeCh = make(chan error, 1) // Make it buffered to prevent blocking
 	go func() {
 		ticker := time.NewTicker(mdl.refreshInterval)
 		defer ticker.Stop()
@@ -102,7 +102,13 @@ func NewMetadataLock(ctx context.Context, dsn string, table *table.TableInfo, lo
 			case <-ctx.Done():
 				// Close the dedicated connection to release the lock
 				logger.Infof("releasing metadata lock: %s", mdl.lockName)
-				mdl.closeCh <- mdl.db.Close()
+				// Use select with default to avoid blocking if Close() isn't called
+				select {
+				case mdl.closeCh <- mdl.db.Close():
+				default:
+					// If no one is listening, just close the connection anyway
+					mdl.db.Close()
+				}
 				return
 			case <-ticker.C:
 				if err = getLock(); err != nil {

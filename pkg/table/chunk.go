@@ -14,6 +14,8 @@ type Chunk struct {
 	LowerBound           *Boundary
 	UpperBound           *Boundary
 	AdditionalConditions string
+	Table                *TableInfo // Source table information for this chunk
+	NewTable             *TableInfo // Destination table information for this chunk
 }
 
 // Boundary is used by chunk for lower or upper boundary

@@ -27,7 +27,7 @@ var (
 type TableInfo struct {
 	sync.Mutex
 	db                          *sql.DB
-	EstimatedRows               uint64
+	EstimatedRows               uint64 // used by the composite chunker for Max
 	SchemaName                  string
 	TableName                   string
 	QuotedName                  string

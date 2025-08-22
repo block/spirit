@@ -93,15 +93,16 @@ func TestReplClientComplex(t *testing.T) {
 
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
-	copier, err := row.NewCopier(db, t1, t2, row.NewCopierDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+	copier, err := row.NewCopier(db, chunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
 	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 	client.SetKeyAboveWatermarkOptimization(true)
-
-	assert.NoError(t, copier.Open4Test()) // need to manually open because we are not calling Run()
 
 	// Insert into t1, but because there is no read yet, the key is above the watermark
 	testutils.RunSQL(t, "DELETE FROM replcomplext1 WHERE a BETWEEN 10 and 500")
@@ -293,14 +294,15 @@ func TestReplClientQueue(t *testing.T) {
 
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
-	copier, err := row.NewCopier(db, t1, t2, row.NewCopierDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+	copier, err := row.NewCopier(db, chunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
 	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
-
-	assert.NoError(t, copier.Open4Test()) // need to manually open because we are not calling Run()
 
 	// Delete from the table, because there is no keyabove watermark
 	// optimization these deletes will be queued immediately.

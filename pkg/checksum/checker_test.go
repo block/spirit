@@ -53,10 +53,7 @@ func TestBasicChecksum(t *testing.T) {
 	checker, err := NewChecker(db, t1, t2, feed, NewCheckerDefaultConfig())
 	assert.NoError(t, err)
 
-	assert.Nil(t, checker.recentValue)
-	assert.Equal(t, "TBD", checker.RecentValue())
 	assert.NoError(t, checker.Run(t.Context()))
-	assert.Equal(t, "TBD", checker.RecentValue()) // still TBD because its a 1 and done chunker.
 }
 
 func TestBasicValidation(t *testing.T) {

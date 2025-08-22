@@ -9,14 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/metrics"
-
 	"github.com/cashapp/spirit/pkg/dbconn"
+	"github.com/cashapp/spirit/pkg/metrics"
 	"github.com/cashapp/spirit/pkg/table"
 	"github.com/cashapp/spirit/pkg/throttler"
 	"github.com/cashapp/spirit/pkg/utils"
@@ -32,27 +30,21 @@ const (
 
 type Copier struct {
 	sync.Mutex
-	db                   *sql.DB
-	table                *table.TableInfo
-	newTable             *table.TableInfo
-	chunker              table.Chunker
-	concurrency          int
-	finalChecksum        bool
-	CopyRowsStartTime    time.Time
-	CopyRowsExecTime     time.Duration
-	CopyRowsCount        uint64 // used for estimates: the exact number of rows copied
-	CopyRowsLogicalCount uint64 // used for estimates on auto-inc PKs: rows copied including any gaps
-	CopyChunksCount      uint64
-	rowsPerSecond        uint64
-	isInvalid            bool
-	isOpen               bool
-	startTime            time.Time
-	ExecTime             time.Duration
-	Throttler            throttler.Throttler
-	dbConfig             *dbconn.DBConfig
-	logger               loggers.Advanced
-	metricsSink          metrics.Sink
-	copierEtaHistory     *copierEtaHistory
+	db                *sql.DB
+	chunker           table.Chunker
+	concurrency       int
+	finalChecksum     bool
+	CopyRowsStartTime time.Time
+	CopyRowsExecTime  time.Duration
+	rowsPerSecond     uint64
+	isInvalid         bool
+	startTime         time.Time
+	ExecTime          time.Duration
+	Throttler         throttler.Throttler
+	dbConfig          *dbconn.DBConfig
+	logger            loggers.Advanced
+	metricsSink       metrics.Sink
+	copierEtaHistory  *copierEtaHistory
 }
 
 type CopierConfig struct {
@@ -78,22 +70,19 @@ func NewCopierDefaultConfig() *CopierConfig {
 	}
 }
 
-// NewCopier creates a new copier object.
-func NewCopier(db *sql.DB, tbl, newTable *table.TableInfo, config *CopierConfig) (*Copier, error) {
-	if newTable == nil || tbl == nil {
-		return nil, errors.New("table and newTable must be non-nil")
-	}
-	chunker, err := table.NewChunker(tbl, config.TargetChunkTime, config.Logger)
-	if err != nil {
-		return nil, err
+// NewCopier creates a new copier object with the provided chunker.
+// The chunker could have been opened at a watermark, we are agnostic to that.
+// It could also return different tables on each Next() call in future,
+// so we don't save any fields related to the table.
+func NewCopier(db *sql.DB, chunker table.Chunker, config *CopierConfig) (*Copier, error) {
+	if chunker == nil {
+		return nil, errors.New("chunker must be non-nil")
 	}
 	if config.DBConfig == nil {
 		return nil, errors.New("dbConfig must be non-nil")
 	}
 	return &Copier{
 		db:               db,
-		table:            tbl,
-		newTable:         newTable,
 		concurrency:      config.Concurrency,
 		finalChecksum:    config.FinalChecksum,
 		Throttler:        config.Throttler,
@@ -105,26 +94,6 @@ func NewCopier(db *sql.DB, tbl, newTable *table.TableInfo, config *CopierConfig)
 	}, nil
 }
 
-// NewCopierFromCheckpoint creates a new copier object, from a checkpoint (copyRowsAt, copyRows)
-func NewCopierFromCheckpoint(db *sql.DB, tbl, newTable *table.TableInfo, config *CopierConfig, lowWatermark string, rowsCopied uint64, rowsCopiedLogical uint64) (*Copier, error) {
-	c, err := NewCopier(db, tbl, newTable, config)
-	if err != nil {
-		return c, err
-	}
-	// Overwrite the previously attached chunker with one at a specific watermark.
-	// For high watermark, use the type of old table, not the new one.
-	highPtr := table.NewDatum(newTable.MaxValue().Val, tbl.MaxValue().Tp)
-	if err := c.chunker.OpenAtWatermark(lowWatermark, highPtr); err != nil {
-		return c, err
-	}
-	c.isOpen = true
-	// Success from this point on
-	// Overwrite copy-rows
-	atomic.StoreUint64(&c.CopyRowsCount, rowsCopied)
-	atomic.StoreUint64(&c.CopyRowsLogicalCount, rowsCopiedLogical)
-	return c, nil
-}
-
 // CopyChunk copies a chunk from the table to the newTable.
 // it is public so it can be used in tests incrementally.
 func (c *Copier) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
@@ -133,10 +102,10 @@ func (c *Copier) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	// INSERT INGORE because we can have duplicate rows in the chunk because in
 	// resuming from checkpoint we will be re-applying some of the previous executed work.
 	query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) SELECT %s FROM %s FORCE INDEX (PRIMARY) WHERE %s",
-		c.newTable.QuotedName,
-		utils.IntersectNonGeneratedColumns(c.table, c.newTable),
-		utils.IntersectNonGeneratedColumns(c.table, c.newTable),
-		c.table.QuotedName,
+		chunk.NewTable.QuotedName,
+		utils.IntersectNonGeneratedColumns(chunk.Table, chunk.NewTable),
+		utils.IntersectNonGeneratedColumns(chunk.Table, chunk.NewTable),
+		chunk.Table.QuotedName,
 		chunk.String(),
 	)
 	c.logger.Debugf("running chunk: %s, query: %s", chunk.String(), query)
@@ -145,13 +114,12 @@ func (c *Copier) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	if affectedRows, err = dbconn.RetryableTransaction(ctx, c.db, c.finalChecksum, c.dbConfig, query); err != nil {
 		return err
 	}
-	atomic.AddUint64(&c.CopyRowsCount, uint64(affectedRows))
-	atomic.AddUint64(&c.CopyRowsLogicalCount, chunk.ChunkSize)
-	atomic.AddUint64(&c.CopyChunksCount, 1)
 	// Send feedback which can be used by the chunker
 	// and infoschema to create a low watermark.
 	chunkProcessingTime := time.Since(startTime)
-	c.chunker.Feedback(chunk, chunkProcessingTime)
+
+	// Send feedback to chunker with processing time and statistics
+	c.chunker.Feedback(chunk, chunkProcessingTime, uint64(affectedRows))
 
 	// Send metrics
 	err = c.sendMetrics(ctx, chunkProcessingTime, chunk.ChunkSize, uint64(affectedRows))
@@ -178,19 +146,10 @@ func (c *Copier) StartTime() time.Time {
 }
 
 func (c *Copier) Run(ctx context.Context) error {
-	c.Lock()
 	c.startTime = time.Now()
 	defer func() {
 		c.ExecTime = time.Since(c.startTime)
 	}()
-	if !c.isOpen {
-		// For practical reasons resume-from-checkpoint
-		// will already be open, new copy processes will not be.
-		if err := c.chunker.Open(); err != nil {
-			return err
-		}
-	}
-	c.Unlock()
 	go c.estimateRowsPerSecondLoop(ctx) // estimate rows while copying
 	g, errGrpCtx := errgroup.WithContext(ctx)
 	g.SetLimit(c.concurrency)
@@ -233,26 +192,16 @@ func (c *Copier) SetThrottler(throttler throttler.Throttler) {
 }
 
 func (c *Copier) getCopyStats() (uint64, uint64, float64) {
-	if c.table.KeyIsAutoInc {
-		// If the table has an autoinc column we use a different estimation method,
-		// which tends to be more accurate. We use the maxValue as the estimated rows,
-		// and the "logical copied rows" (which is the sum of the chunk sizes) as the
-		// rows copied so far.
-		copyRows := atomic.LoadUint64(&c.CopyRowsLogicalCount)
-		maxValue, err := strconv.ParseUint(c.table.MaxValue().String(), 10, 64)
-		if err != nil {
-			maxValue = c.table.EstimatedRows
-		}
-		pct := float64(copyRows) / float64(maxValue) * 100
-		return copyRows, maxValue, pct
+	// Get progress from the chunker instead of calculating it ourselves
+	rowsProcessed, _, totalRows := c.chunker.Progress()
+
+	// Calculate percentage
+	pct := float64(0)
+	if totalRows > 0 {
+		pct = float64(rowsProcessed) / float64(totalRows) * 100
 	}
-	// This is the legacy estimation method, which is not as accurate as the one above.
-	// It is required for scenarios like VARBINARY primary keys. The downside here is that
-	// the estimated rows can jump around a lot on a big table with a high variability of row size.
-	// Because we include the CopyRowsCount to users at least it will
-	// appear like it is always progressing.
-	pct := float64(atomic.LoadUint64(&c.CopyRowsCount)) / float64(c.table.EstimatedRows) * 100
-	return atomic.LoadUint64(&c.CopyRowsCount), c.table.EstimatedRows, pct
+
+	return rowsProcessed, totalRows, pct
 }
 
 // GetProgress returns the progress of the copier
@@ -290,12 +239,8 @@ func (c *Copier) GetETA() string {
 
 func (c *Copier) estimateRowsPerSecondLoop(ctx context.Context) {
 	// We take >10 second averages because with parallel copy it bounces around a lot.
-	// If it's an auto-inc key we use the "logical copy rows", because the estimate
-	// will be based on the max value of the auto-inc column.
-	prevRowsCount := atomic.LoadUint64(&c.CopyRowsCount)
-	if c.table.KeyIsAutoInc {
-		prevRowsCount = atomic.LoadUint64(&c.CopyRowsLogicalCount)
-	}
+	// Get progress from chunker since we no longer track rows locally
+	prevRowsCount, _, _ := c.chunker.Progress()
 	ticker := time.NewTicker(copyEstimateInterval)
 	defer ticker.Stop()
 	for {
@@ -306,10 +251,7 @@ func (c *Copier) estimateRowsPerSecondLoop(ctx context.Context) {
 			if !c.isHealthy(ctx) {
 				return
 			}
-			newRowsCount := atomic.LoadUint64(&c.CopyRowsCount)
-			if c.table.KeyIsAutoInc {
-				newRowsCount = atomic.LoadUint64(&c.CopyRowsLogicalCount)
-			}
+			newRowsCount, _, _ := c.chunker.Progress()
 			rowsPerInterval := float64(newRowsCount - prevRowsCount)
 			intervalsDivisor := float64(copyEstimateInterval / time.Second) // should be something like 10 for 10 seconds
 			rowsPerSecond := uint64(rowsPerInterval / intervalsDivisor)
@@ -366,8 +308,7 @@ func (c *Copier) Next4Test() (*table.Chunk, error) {
 	return c.chunker.Next()
 }
 
-// Open4Test is typically only used in integration tests that don't want to actually migrate data,
-// but need to open the chunker.
-func (c *Copier) Open4Test() error {
-	return c.chunker.Open()
+// GetChunker returns the chunker for accessing progress information
+func (c *Copier) GetChunker() table.Chunker {
+	return c.chunker
 }

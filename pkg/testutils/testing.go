@@ -13,7 +13,7 @@ import (
 func DSN() string {
 	dsn := os.Getenv("MYSQL_DSN")
 	if dsn == "" {
-		return "msandbox:msandbox@tcp(127.0.0.1:8030)/test"
+		return "msandbox:msandbox@tcp(127.0.0.1:3306)/test"
 	}
 	return dsn
 }

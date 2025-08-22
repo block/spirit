@@ -26,7 +26,7 @@ func TestCompositeChunker(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "composite")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 
-	chunker, err := NewChunker(t1, 0, logrus.New())
+	chunker, err := newChunker(t1, 0, logrus.New())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 }
@@ -46,7 +46,7 @@ func TestOptimisticChunker(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "optimistic")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 
-	chunker, err := NewChunker(t1, 0, logrus.New())
+	chunker, err := newChunker(t1, 0, logrus.New())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerOptimistic{}, chunker)
 }

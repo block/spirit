@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/siddontang/loggers"
@@ -13,6 +15,7 @@ import (
 type chunkerOptimistic struct {
 	sync.Mutex
 	Ti                *TableInfo
+	NewTi             *TableInfo // Destination table info
 	chunkSize         uint64
 	chunkPtr          Datum
 	checkpointHighPtr Datum // the high watermark detected on restore
@@ -36,6 +39,12 @@ type chunkerOptimistic struct {
 	// The chunk prefetching algorithm is used when the chunker detects
 	// that there are very large gaps in the sequence.
 	chunkPrefetchingEnabled bool
+
+	// Progress tracking: the implementation here is up to the chunker,
+	// and for the optimistic chunker it is based on the progress
+	// through the auto_increment counter.
+	rowsCopied   uint64 // The sum of chunkSize
+	chunksCopied uint64
 
 	logger loggers.Advanced
 }
@@ -79,6 +88,8 @@ func (t *chunkerOptimistic) nextChunkByPrefetching() (*Chunk, error) {
 			Key:        t.Ti.KeyColumns,
 			LowerBound: &Boundary{[]Datum{minVal}, true},
 			UpperBound: &Boundary{[]Datum{maxVal}, false},
+			Table:      t.Ti,
+			NewTable:   t.NewTi,
 		}, nil
 	}
 	if rows.Err() != nil {
@@ -92,6 +103,8 @@ func (t *chunkerOptimistic) nextChunkByPrefetching() (*Chunk, error) {
 		ChunkSize:  t.chunkSize,
 		Key:        t.Ti.KeyColumns,
 		LowerBound: &Boundary{[]Datum{t.chunkPtr}, true},
+		Table:      t.Ti,
+		NewTable:   t.NewTi,
 	}, nil
 }
 
@@ -113,6 +126,8 @@ func (t *chunkerOptimistic) Next() (*Chunk, error) {
 			ChunkSize:  t.chunkSize,
 			Key:        t.Ti.KeyColumns,
 			UpperBound: &Boundary{[]Datum{t.chunkPtr}, false},
+			Table:      t.Ti,
+			NewTable:   t.NewTi,
 		}, nil
 	}
 	if t.chunkPrefetchingEnabled {
@@ -139,6 +154,8 @@ func (t *chunkerOptimistic) Next() (*Chunk, error) {
 			ChunkSize:  t.chunkSize,
 			Key:        t.Ti.KeyColumns,
 			LowerBound: &Boundary{[]Datum{t.chunkPtr}, true},
+			Table:      t.Ti,
+			NewTable:   t.NewTi,
 		}, nil
 	}
 
@@ -154,6 +171,8 @@ func (t *chunkerOptimistic) Next() (*Chunk, error) {
 		Key:        t.Ti.KeyColumns,
 		LowerBound: &Boundary{[]Datum{minVal}, true},
 		UpperBound: &Boundary{[]Datum{maxVal}, false},
+		Table:      t.Ti,
+		NewTable:   t.NewTi,
 	}, nil
 }
 
@@ -172,7 +191,7 @@ func (t *chunkerOptimistic) setDynamicChunking(newValue bool) {
 	t.disableDynamicChunker = !newValue
 }
 
-func (t *chunkerOptimistic) OpenAtWatermark(cp string, highPtr Datum) error {
+func (t *chunkerOptimistic) OpenAtWatermark(cp string, highPtr Datum, rowsCopied uint64) error {
 	t.Lock()
 	defer t.Unlock()
 
@@ -195,6 +214,8 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string, highPtr Datum) error {
 	// keys, it uses Value[0].
 	t.watermark = chunk
 	t.chunkPtr = chunk.LowerBound.Value[0]
+	t.rowsCopied = rowsCopied
+
 	return nil
 }
 
@@ -205,10 +226,19 @@ func (t *chunkerOptimistic) Close() error {
 // Feedback is a way for consumers of chunks to give feedback on how long
 // processing the chunk took. It is incorporated into the calculation of future
 // chunk sizes.
-func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration) {
+func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration, _ uint64) {
 	t.Lock()
 	defer t.Unlock()
 	t.bumpWatermark(chunk)
+
+	// It is up to the chunker implementation to decide how to track "rows copied"
+	// In the optimistic chunker, since it is really designed around auto_increment
+	// tables, we add the ChunkSize to the rowsCopied counter, and ignore
+	// the actualRows. This differs from the composite chunker, which doesn't have an
+	// auto_inc max so it takes the table estimate and compares it to the actual
+	// rows copied.
+	atomic.AddUint64(&t.rowsCopied, chunk.ChunkSize)
+	atomic.AddUint64(&t.chunksCopied, 1)
 
 	// Check if the feedback is based on an earlier chunker size.
 	// if it is, it is misleading to incorporate feedback now.
@@ -345,6 +375,9 @@ func (t *chunkerOptimistic) open() (err error) {
 	t.finalChunkSent = false
 	t.chunkSize = StartingChunkSize
 
+	// Initialize progress tracking
+	atomic.StoreUint64(&t.rowsCopied, 0)
+
 	// Make sure min/max value are always specified
 	// To simplify the code in NextChunk funcs.
 	if t.Ti.minValue.IsNil() {
@@ -406,6 +439,17 @@ func (t *chunkerOptimistic) calculateNewTargetChunkSize() uint64 {
 		t.chunkPrefetchingEnabled = true
 	}
 	return uint64(newTargetRows)
+}
+
+// Progress returns the current progress of the chunker as (rowsCopied, totalRows)
+// It is up to the chunker implementation to select the formula. The optimistic
+// chunker is based on the progress of the auto_increment column.
+func (t *chunkerOptimistic) Progress() (uint64, uint64, uint64) {
+	maxValue, err := strconv.ParseUint(t.Ti.MaxValue().String(), 10, 64) // autoInc max
+	if err != nil {
+		maxValue = t.Ti.EstimatedRows // should not be needed.
+	}
+	return atomic.LoadUint64(&t.rowsCopied), atomic.LoadUint64(&t.chunksCopied), maxValue
 }
 
 // KeyAboveHighWatermark returns true if the key is above the high watermark.

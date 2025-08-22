@@ -35,7 +35,6 @@ type Checker struct {
 	chunker          table.Chunker
 	startTime        time.Time
 	ExecTime         time.Duration
-	recentValue      any // used for status
 	dbConfig         *dbconn.DBConfig
 	logger           loggers.Advanced
 	fixDifferences   bool
@@ -74,7 +73,7 @@ func NewChecker(db *sql.DB, tbl, newTable *table.TableInfo, feed *repl.Client, c
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig()
 	}
-	chunker, err := table.NewChunker(tbl, config.TargetChunkTime, config.Logger)
+	chunker, err := table.NewChunker(tbl, newTable, config.TargetChunkTime, config.Logger)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +81,7 @@ func NewChecker(db *sql.DB, tbl, newTable *table.TableInfo, feed *repl.Client, c
 	// Overwrite the previously attached chunker with a new one.
 	if config.Watermark != "" {
 		config.Logger.Warnf("opening checksum chunker at watermark: %s", config.Watermark)
-		if err := chunker.OpenAtWatermark(config.Watermark, newTable.MaxValue()); err != nil {
+		if err := chunker.OpenAtWatermark(config.Watermark, newTable.MaxValue(), 0); err != nil {
 			return nil, err
 		}
 	}
@@ -109,22 +108,23 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 	}
 	defer trxPool.Put(trx)
 	c.logger.Debugf("checksumming chunk: %s", chunk.String())
-	source := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum FROM %s WHERE %s",
+	source := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum, count(*) as c FROM %s WHERE %s",
 		c.intersectColumns(),
 		c.table.QuotedName,
 		chunk.String(),
 	)
-	target := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum FROM %s WHERE %s",
+	target := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum, count(*) as c FROM %s WHERE %s",
 		c.intersectColumns(),
 		c.newTable.QuotedName,
 		chunk.String(),
 	)
 	var sourceChecksum, targetChecksum int64
-	err = trx.QueryRow(source).Scan(&sourceChecksum)
+	var sourceCount, targetCount uint64
+	err = trx.QueryRow(source).Scan(&sourceChecksum, &sourceCount)
 	if err != nil {
 		return err
 	}
-	err = trx.QueryRow(target).Scan(&targetChecksum)
+	err = trx.QueryRow(target).Scan(&targetChecksum, &targetCount)
 	if err != nil {
 		return err
 	}
@@ -132,7 +132,7 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 		// The checksums do not match, so we first need
 		// to inspect closely and report on the differences.
 		c.differencesFound.Add(1)
-		c.logger.Warnf("checksum mismatch for chunk %s: source %d != target %d", chunk.String(), sourceChecksum, targetChecksum)
+		c.logger.Warnf("checksum mismatch for chunk %s: source %d != target %d sourceCount: %d targetCount: %d", chunk.String(), sourceChecksum, targetChecksum, sourceCount, targetCount)
 		if err := c.inspectDifferences(trx, chunk); err != nil {
 			return err
 		}
@@ -146,13 +146,8 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 			return err
 		}
 	}
-	if chunk.LowerBound != nil {
-		c.Lock()
-		// For recent value we only use the first part of the key.
-		c.recentValue = chunk.LowerBound.Value[0]
-		c.Unlock()
-	}
-	c.chunker.Feedback(chunk, time.Since(startTime))
+	// When we give feedback, we need to say how many rows were in the chunk.
+	c.chunker.Feedback(chunk, time.Since(startTime), targetCount)
 	return nil
 }
 
@@ -160,13 +155,26 @@ func (c *Checker) DifferencesFound() uint64 {
 	return c.differencesFound.Load()
 }
 
-func (c *Checker) RecentValue() string {
+func (c *Checker) getStats() (uint64, uint64, float64) {
+	// Get progress from the chunker instead of calculating it ourselves
+	rowsProcessed, _, totalRows := c.chunker.Progress()
+
+	// Calculate percentage
+	pct := float64(0)
+	if totalRows > 0 {
+		pct = float64(rowsProcessed) / float64(totalRows) * 100
+	}
+
+	return rowsProcessed, totalRows, pct
+}
+
+// GetProgress returns the progress of the checker
+func (c *Checker) GetProgress() string {
 	c.Lock()
 	defer c.Unlock()
-	if c.recentValue == nil {
-		return "TBD"
-	}
-	return fmt.Sprintf("%v", c.recentValue)
+
+	copied, total, pct := c.getStats()
+	return fmt.Sprintf("%d/%d %.2f%%", copied, total, pct)
 }
 
 func (c *Checker) GetLowWatermark() (string, error) {

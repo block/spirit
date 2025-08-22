@@ -27,7 +27,7 @@ func TestOpenOnBinaryType(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := NewChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 }
@@ -40,7 +40,7 @@ func TestOpenOnNoMinMax(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := NewChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 }
@@ -53,7 +53,7 @@ func TestCallingNextChunkWithoutOpen(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := NewChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, logrus.New())
 	assert.NoError(t, err)
 
 	_, err = chunker.Next()
@@ -190,7 +190,7 @@ func TestDiscoveryBalancesTable(t *testing.T) {
 	assert.Equal(t, "0", t1.minValue.String())
 	assert.Equal(t, "0", t1.maxValue.String())
 
-	chunker, err := NewChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, logrus.New())
 	assert.NoError(t, err)
 
 	assert.NoError(t, chunker.Open())

@@ -30,16 +30,21 @@ const (
 
 type Chunker interface {
 	Open() error
-	OpenAtWatermark(watermark string, datum Datum) error
+	OpenAtWatermark(watermark string, datum Datum, rowsCopied uint64) error
 	IsRead() bool
 	Close() error
 	Next() (*Chunk, error)
-	Feedback(chunk *Chunk, duration time.Duration)
+	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)
 	GetLowWatermark() (string, error)
 	KeyAboveHighWatermark(key any) bool
+	Progress() (uint64, uint64, uint64) // Returns (rowsRead, chunksCopied, totalRowsExpected)
 }
 
-func NewChunker(t *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced) (Chunker, error) {
+func newChunker(t *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced) (Chunker, error) {
+	return NewChunker(t, nil, chunkerTarget, logger)
+}
+
+func NewChunker(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced) (Chunker, error) {
 	if chunkerTarget == 0 {
 		chunkerTarget = ChunkerDefaultTarget
 	}
@@ -48,19 +53,27 @@ func NewChunker(t *TableInfo, chunkerTarget time.Duration, logger loggers.Advanc
 	if len(t.KeyColumns) == 1 && t.KeyIsAutoInc {
 		return &chunkerOptimistic{
 			Ti:                     t,
+			NewTi:                  newTable,
 			ChunkerTarget:          chunkerTarget,
 			lowerBoundWatermarkMap: make(map[string]*Chunk, 0),
 			logger:                 logger,
 		}, nil
 	}
-	return NewCompositeChunker(t, chunkerTarget, logger, "", "")
+	return newCompositeChunkerWithDestination(t, newTable, chunkerTarget, logger, "", "")
 }
 
 // NewCompositeChunker returns a chunkerComposite ,
 // setting its Key if keyName and where conditions are provided
 func NewCompositeChunker(t *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced, keyName string, whereCondition string) (Chunker, error) {
+	return newCompositeChunkerWithDestination(t, nil, chunkerTarget, logger, keyName, whereCondition)
+}
+
+// NewCompositeChunkerWithDestination returns a chunkerComposite with destination table info,
+// setting its Key if keyName and where conditions are provided
+func newCompositeChunkerWithDestination(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced, keyName string, whereCondition string) (Chunker, error) {
 	c := chunkerComposite{
 		Ti:                     t,
+		NewTi:                  newTable,
 		ChunkerTarget:          chunkerTarget,
 		lowerBoundWatermarkMap: make(map[string]*Chunk, 0),
 		logger:                 logger,
