@@ -3394,12 +3394,7 @@ func TestAlterExtendVarcharE2E(t *testing.T) {
 		assert.Equal(t, attempt.InPlace, m.usedInplaceDDL)
 
 		// go test howls about resource leaks if we don't close all these things
-		_ = m.db.Close()
-		if m.replica != nil {
-			_ = m.replica.Close()
-		}
-		if m.replClient != nil {
-			m.replClient.Close()
-		}
+		err = m.Close()
+		assert.NoError(t, err)
 	}
 }
