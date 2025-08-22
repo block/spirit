@@ -1,3 +1,4 @@
+//nolint:dupword
 package migration
 
 import (
@@ -3351,4 +3352,54 @@ func TestTrailingSemicolon(t *testing.T) {
 
 	require.True(t, m.usedInplaceDDL) // must be inplace
 	require.NoError(t, m.Close())
+}
+func TestAlterExtendVarcharE2E(t *testing.T) {
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1extendvarchar, _t1extendvarchar_new`)
+	table := `CREATE TABLE t1extendvarchar (
+		id int not null primary key auto_increment,
+		col1 varchar(10),
+		col2 varchar(10)
+	) character set utf8mb4`
+	testutils.RunSQL(t, table)
+
+	type alterAttempt struct {
+		Statement string
+		Error     bool
+		InPlace   bool
+	}
+	alters := []alterAttempt{
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(20)`, InPlace: true},
+		{Statement: `ALTER TABLE t1extendvarchar CHANGE col1 col1 varchar(21)`, InPlace: true},
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(22), CHANGE col2 col2 varchar(22) `, InPlace: true},
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(23), CHANGE col2 col2 varchar(200) `, InPlace: false},
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(200)`, InPlace: false},
+	}
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+
+	for _, attempt := range alters {
+		m, err := NewRunner(&Migration{
+			Host:      cfg.Addr,
+			Username:  cfg.User,
+			Password:  cfg.Passwd,
+			Database:  cfg.DBName,
+			Threads:   1,
+			Checksum:  true,
+			Statement: attempt.Statement,
+		})
+		require.NoError(t, err)
+		err = m.Run(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, attempt.InPlace, m.usedInplaceDDL)
+
+		// go test howls about resource leaks if we don't close all these things
+		_ = m.db.Close()
+		if m.replica != nil {
+			_ = m.replica.Close()
+		}
+		if m.replClient != nil {
+			m.replClient.Close()
+		}
+	}
 }
