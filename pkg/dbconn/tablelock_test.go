@@ -8,7 +8,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func testConfig() *DBConfig {
@@ -137,13 +136,25 @@ func TestTableLockFail(t *testing.T) {
 	// We acquire an exclusive lock first, so the tablelock should fail.
 	trx, err := db.Begin()
 	assert.NoError(t, err)
+	defer func() {
+		err := trx.Rollback()
+		assert.NoError(t, err, "Failed to rollback transaction")
+	}()
 
 	_, err = trx.Exec("LOCK TABLES test.testlockfail WRITE")
 	assert.NoError(t, err)
 
 	// Try to get a table lock - this should fail since we already have an exclusive lock
-	tbl := &table.TableInfo{SchemaName: "test", TableName: "testlockfail"}
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), logrus.New())
+	tbl := table.NewTableInfo(db, "test", "testlockfail")
+	cfg := testConfig()
+	cfg.ForceKill = false
+	cfg.MaxRetries = 3 // Set max retries to 3 for this test
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, logrus.New())
 	assert.Error(t, err) // failed to acquire lock
-	require.NoError(t, trx.Rollback())
+
+	// Enable force killing to allow retrying with query killing. This will FAIL because we do not kill
+	// connections with explicit table locks.
+	cfg.ForceKill = true
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, logrus.New())
+	assert.Error(t, err) // We won't kill a connection with an explicit table lock, so this should fail after exhausting retries
 }

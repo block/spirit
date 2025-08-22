@@ -27,6 +27,7 @@ See also: `--statement`.
 When set to `TRUE`, Spirit will perform a checksum of the data in the table after the copy phase. This is a good way to ensure that the copy phase was successful, but it does add some overhead to the process. When you resume-from-checkpoint, Spirit will only run with the checksum enabled (regardless of your configuration). This is because it can not rely on duplicate-key errors to detect issues in the copy phase if the DDL included adding a new `UNIQUE` key.
 
 The checksum typically adds about 10-20% of additional time to the migration, but it is recommended to always leave it enabled. A failed checksum means that there is either:
+
 - A bug in Spirit
 - A bug in MySQL
 - Hardware errors
@@ -63,7 +64,25 @@ Note that the checksum, if enabled, will be computed after the sentinel table is
 
 When set to `TRUE`, Spirit will attempt to perform the schema change using MySQL's `INPLACE` algorithm, before falling back to performing its usual copy process. `INPLACE` is non-blocking on the system where the DDL is initiated, but it will block on binary-log based read replicas. This means it's typically only safe to enable if you have no read replicas, or your read replicas are based on physical log shipping (i.e. Aurora).
 
-Even when force-inplace is `FALSE`, Spirit automatically detects "safe" operations that use the `INPLACE` algorithm. These include operations that modify only metadata, specifically `ALTER INDEX .. VISIBLE/INVISIBLE`, `DROP KEY/INDEX` and `RENAME KEY/INDEX`. Consult https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html for more details.
+Even when force-inplace is `FALSE`, Spirit automatically detects "safe" operations that use the `INPLACE` algorithm. These include operations that modify only metadata, specifically `ALTER INDEX .. VISIBLE/INVISIBLE`, `DROP KEY/INDEX` and `RENAME KEY/INDEX`. Consult <https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html> for more details.
+
+### force-kill
+
+- Type: Boolean
+- Default value: FALSE
+
+When set to TRUE, Spirit will aggressively try to kill connections that are blocking the checksum or cutover process from starting. It does this in a semi-intelligent way:
+
+- It will read `performance_schema` to find only connections that are blocking a meta data lock being acquired on the migrating table.
+- It refuses to kill connections if they have a transaction open that has modified a large number of rows (>1 million).
+- It refuses to kill connections that hold an explicit `LOCK TABLE`, since unlike transactions these are not always retryable.
+- It only starts killing transactions as it approaches the `lock-wait-timeout`. For example, if the `lock-wait-timeout` is 30 seconds, it will start killing transactions after 27 seconds.
+
+Enabling the `force-kill` option requires spirit to be granted additional privileges:
+
+GRANT SELECT ON performance_schema.* TO spirituser;
+GRANT CONNECTION_ADMIN, PROCESS ON *.* TO spirituser;
+
 
 ### host
 
@@ -150,6 +169,7 @@ The target time for each copy or checksum operation. Note that the chunk size is
 The target is not a hard limit, but rather a guideline which is recalculated based on a 90th percentile from the last 10 chunks that were copied. You should expect some outliers where the copy time is higher than the target. Outliers >5x the target will print to the log, and force an immediate reduction in how many rows are copied per chunk without waiting for the next recalculation.
 
 Larger values generally yield better performance, but have consequences:
+
 - A `5s` value means that at any point replicas will appear `5s` behind the source. Spirit does not support read-replicas, so we do not typically consider this a problem. See [replica-max-lag](#replica-max-lag) for more context.
 - Data locks (row locks) are held for the duration of each transaction, so even a `1s` chunk may lead to frustrating user experiences. Consider the scenario that a simple update query usually takes `<5ms`. If it tries to update a row that has just started being copied it will now take approximately `1.005s` to complete. In scenarios where there is a lot of contention around a few rows, this could even lead to a large backlog of queries waiting to be executed.
 - It is recommended to set the target chunk time to a value for which if queries increased by this much, user experience would still be acceptable even if a little frustrating. In some of our systems this means up to `2s`. We do not know of scenarios where values should ever exceed `5s`. If you can tolerate more unavailability, consider running DDL directly on the MySQL server.
@@ -163,6 +183,7 @@ Note that Spirit does not support dynamically adjusting the target-chunk-time wh
 - Range: `1-64`
 
 Spirit uses `threads` to set the parallelism of:
+
 - The copier task
 - The checksum task
 - The replication applier task

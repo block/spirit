@@ -49,7 +49,33 @@ func TestPrivileges(t *testing.T) {
 	assert.NoError(t, err)
 
 	err = privilegesCheck(t.Context(), r, logrus.New())
-	assert.NoError(t, err) // still not enough, needs replication client and replication slave
+	assert.NoError(t, err) // it's all good now
+
+	// ForceKill requires additional privileges!
+	r.ForceKill = true
+	err = privilegesCheck(t.Context(), r, logrus.New())
+	assert.Error(t, err)
+	t.Log(err)
+
+	_, err = db.Exec("GRANT SELECT on `performance_schema`.* TO testprivsuser")
+	assert.NoError(t, err)
+
+	err = privilegesCheck(t.Context(), r, logrus.New())
+	assert.Error(t, err) // still not enough, needs connection_admin
+	t.Log(err)
+
+	_, err = db.Exec("GRANT CONNECTION_ADMIN ON *.* TO testprivsuser")
+	assert.NoError(t, err)
+
+	err = privilegesCheck(t.Context(), r, logrus.New())
+	assert.Error(t, err) // still not enough, needs PROCESS
+	t.Log(err)
+
+	_, err = db.Exec("GRANT PROCESS ON *.* TO testprivsuser")
+	assert.NoError(t, err)
+
+	err = privilegesCheck(t.Context(), r, logrus.New())
+	assert.NoError(t, err)
 
 	// Test the root user
 	r = Resources{

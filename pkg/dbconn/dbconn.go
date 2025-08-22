@@ -31,6 +31,7 @@ type DBConfig struct {
 	MaxOpenConnections       int
 	RangeOptimizerMaxMemSize int64
 	InterpolateParams        bool
+	ForceKill                bool // If true, kill locking transactions to acquire metadata locks
 }
 
 func NewDBConfig() *DBConfig {
@@ -41,6 +42,7 @@ func NewDBConfig() *DBConfig {
 		MaxOpenConnections:       32,    // default is high for historical tests. It's overwritten by the user threads count + 2 for headroom.
 		RangeOptimizerMaxMemSize: 0,     // default is 8M, we set to unlimited. Not user configurable (may reconsider in the future).
 		InterpolateParams:        false, // default is false
+		ForceKill:                false, // default is false
 	}
 }
 

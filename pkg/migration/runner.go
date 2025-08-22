@@ -115,6 +115,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	r.dbConfig = dbconn.NewDBConfig()
 	r.dbConfig.LockWaitTimeout = int(r.migration.LockWaitTimeout.Seconds())
 	r.dbConfig.InterpolateParams = r.migration.InterpolateParams
+	r.dbConfig.ForceKill = r.migration.ForceKill
 	// The copier and checker will use Threads to limit N tasks concurrently,
 	// but we also set it at the DB pool level with +1. Because the copier and
 	// the replication applier use the same pool, it allows for some natural throttling
@@ -355,6 +356,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 		TargetChunkTime: r.migration.TargetChunkTime,
 		Threads:         r.migration.Threads,
 		ReplicaMaxLag:   r.migration.ReplicaMaxLag,
+		ForceKill:       r.migration.ForceKill,
 		// For the pre-run checks we don't have a DB connection yet.
 		// Instead we check the credentials provided.
 		Host:                 r.migration.Host,
