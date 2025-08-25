@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 )

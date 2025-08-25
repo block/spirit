@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/check"
-	"github.com/cashapp/spirit/pkg/statement"
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/check"
+	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
 	"github.com/pingcap/tidb/pkg/parser"
 )
 

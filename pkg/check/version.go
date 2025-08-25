@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/siddontang/loggers"
 )
 

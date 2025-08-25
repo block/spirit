@@ -3,7 +3,7 @@ package check
 import (
 	"testing"
 
-	"github.com/cashapp/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/statement"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )

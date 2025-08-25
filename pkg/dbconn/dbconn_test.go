@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/testutils"
 	"go.uber.org/goleak"
 
 	"github.com/stretchr/testify/assert"

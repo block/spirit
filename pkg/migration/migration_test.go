@@ -12,7 +12,7 @@ import (
 
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/stretchr/testify/assert"
@@ -552,7 +552,7 @@ func TestSchemaNameIncluded(t *testing.T) {
 // TestSecondaryEngineAttribute tests that we can add a secondary engine attribute
 // We can't quite test to the original bug report, because the vector type + index
 // may not be supported in the version of MySQL we are using:
-// https://github.com/cashapp/spirit/issues/405
+// https://github.com/block/spirit/issues/405
 func TestSecondaryEngineAttribute(t *testing.T) {
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1secondary, _t1secondary_new`)
 	tbl := `CREATE /*vt+ QUERY_TIMEOUT_MS=0 */ TABLE t1secondary (

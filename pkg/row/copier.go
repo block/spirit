@@ -14,12 +14,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/metrics"
+	"github.com/block/spirit/pkg/metrics"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/throttler"
-	"github.com/cashapp/spirit/pkg/utils"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/siddontang/go-log/loggers"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"

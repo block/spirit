@@ -11,15 +11,15 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/cashapp/spirit/pkg/check"
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/metrics"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/check"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
+	"github.com/block/spirit/pkg/testutils"
 
-	"github.com/cashapp/spirit/pkg/repl"
-	"github.com/cashapp/spirit/pkg/row"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/row"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 
@@ -52,7 +52,7 @@ func TestVarcharNonBinaryComparable(t *testing.T) {
 }
 
 // TestPartitioningSyntax tests that ALTERs that don't support ALGORITHM assertion
-// are still supported. From https://github.com/cashapp/spirit/issues/277
+// are still supported. From https://github.com/block/spirit/issues/277
 func TestPartitioningSyntax(t *testing.T) {
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS partt1, _partt1_new`)
 	table := `CREATE TABLE partt1 (
@@ -1055,7 +1055,7 @@ func TestCheckpointRestore(t *testing.T) {
 	assert.NoError(t, r2.Close())
 }
 
-// https://github.com/cashapp/spirit/issues/381
+// https://github.com/block/spirit/issues/381
 func TestCheckpointRestoreBinaryPK(t *testing.T) {
 	ctx := t.Context()
 	tbl := `CREATE TABLE binarypk (
@@ -3028,7 +3028,7 @@ func TestPreRunChecksE2E(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// From https://github.com/cashapp/spirit/issues/241
+// From https://github.com/block/spirit/issues/241
 // If an ALTER qualifies as instant, but an instant can't apply, don't burn an instant version.
 func TestForNonInstantBurn(t *testing.T) {
 	// We skip this test in MySQL 8.0.28. It uses INSTANT_COLS instead of total_row_versions
@@ -3088,7 +3088,7 @@ func TestForNonInstantBurn(t *testing.T) {
 	assert.Equal(t, 0, rowVersions()) // confirm we reset to zero, not 1 (no burn)
 }
 
-// From https://github.com/cashapp/spirit/issues/283
+// From https://github.com/block/spirit/issues/283
 // ALTER INDEX .. VISIBLE is INPLACE which is really weird.
 // it only makes sense to be instant, so we attempt it as a "safe inplace".
 // If it's not with a set of safe changes, then we error.
@@ -3342,7 +3342,7 @@ func TestTrailingSemicolon(t *testing.T) {
 		Password: cfg.Passwd,
 		Database: cfg.DBName,
 		Table:    "multiSecondary",
-		// https://github.com/cashapp/spirit/issues/384
+		// https://github.com/block/spirit/issues/384
 		Alter:   dropIndexesAlter + "; ",
 		Threads: 1,
 	})

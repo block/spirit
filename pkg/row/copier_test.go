@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/metrics"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
+	"github.com/block/spirit/pkg/testutils"
 	"go.uber.org/goleak"
 
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

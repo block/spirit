@@ -1,4 +1,4 @@
-module github.com/cashapp/spirit
+module github.com/block/spirit
 
 go 1.24.0
 

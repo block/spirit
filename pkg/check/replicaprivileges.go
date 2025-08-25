@@ -3,7 +3,7 @@ package check
 import (
 	"context"
 
-	"github.com/cashapp/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/siddontang/loggers"
 )
 

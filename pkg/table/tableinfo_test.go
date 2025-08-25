@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/testutils"
 	"go.uber.org/goleak"
 
 	_ "github.com/go-sql-driver/mysql"

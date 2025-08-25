@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/testutils"
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"

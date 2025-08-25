@@ -7,7 +7,7 @@ import (
 
 	"github.com/siddontang/loggers"
 
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/table"
 )
 
 type TableLock struct {

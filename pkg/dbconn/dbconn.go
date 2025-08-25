@@ -9,7 +9,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -128,7 +128,7 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, ignoreDupKeyWarnings 
 						// "Memory capacity of 8388608 bytes for 'range_optimizer_max_mem_size' exceeded.
 						// Range optimization was not done for this query."
 						// i.e. the query can still execute, but it won't be efficient. Prior to
-						// https://github.com/cashapp/spirit/issues/239 we allowed this warning
+						// https://github.com/block/spirit/issues/239 we allowed this warning
 						// to be ignored. *However* if range optimization is disabled the query is going to
 						// tablescan, so it's better to just bail out and present a useful error message.
 						isFatal = true

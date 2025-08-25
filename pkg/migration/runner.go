@@ -9,16 +9,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/metrics"
-	"github.com/cashapp/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/metrics"
+	"github.com/block/spirit/pkg/statement"
 
-	"github.com/cashapp/spirit/pkg/check"
-	"github.com/cashapp/spirit/pkg/checksum"
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/repl"
-	"github.com/cashapp/spirit/pkg/row"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/check"
+	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/row"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/siddontang/go-log/loggers"
 	"github.com/sirupsen/logrus"
@@ -188,7 +188,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	}
 
 	// Force enable the checksum if it's an ADD UNIQUE INDEX operation
-	// https://github.com/cashapp/spirit/issues/266
+	// https://github.com/block/spirit/issues/266
 	if !r.migration.Checksum {
 		if err := r.stmt.AlterContainsAddUnique(); err != nil {
 			r.logger.Warnf("force enabling checksum: %v", err)
@@ -200,7 +200,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	// This is because we've already attempted MySQL DDL as INPLACE, and it didn't work.
 	// It likely means the user is combining this operation with other unsafe operations,
 	// which is not a good idea. We need to protect them by not allowing it.
-	// https://github.com/cashapp/spirit/issues/283
+	// https://github.com/block/spirit/issues/283
 	if err := r.stmt.AlterContainsIndexVisibility(); err != nil {
 		return err
 	}
@@ -856,7 +856,7 @@ func (r *Runner) checksum(ctx context.Context) error {
 			if err := r.stmt.AlterContainsAddUnique(); err != nil {
 				return errors.New("checksum failed after 3 attempts. Check that the ALTER statement is not adding a UNIQUE INDEX to non-unique data")
 			}
-			return errors.New("checksum failed after 3 attempts. This likely indicates either a bug in Spirit, or a manual modification to the _new table outside of Spirit. Please report @ github.com/cashapp/spirit")
+			return errors.New("checksum failed after 3 attempts. This likely indicates either a bug in Spirit, or a manual modification to the _new table outside of Spirit. Please report @ github.com/block/spirit")
 		}
 		r.logger.Errorf("checksum failed, retrying %d/%d times", i+1, 3)
 	}

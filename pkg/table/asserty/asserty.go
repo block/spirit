@@ -7,7 +7,7 @@ import (
 	"errors"
 	"slices"
 
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/table"
 	_ "github.com/go-sql-driver/mysql"
 )
 

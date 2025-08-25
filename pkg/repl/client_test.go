@@ -7,15 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/row"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/row"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/goleak"
 
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/cashapp/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
 type datumTp int

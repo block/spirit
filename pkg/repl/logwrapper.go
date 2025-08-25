@@ -39,7 +39,7 @@ func (c *LogWrapper) Warnf(format string, args ...any) {
 
 func (c *LogWrapper) Errorf(format string, args ...any) {
 	// Noisy bug on close, can be ignored.
-	// https://github.com/cashapp/spirit/pull/65
+	// https://github.com/block/spirit/pull/65
 	if len(args) == 1 {
 		message := fmt.Sprintf("%s", args[0])
 		if format == "canal start sync binlog err: %v" && message == "Sync was closed" {
