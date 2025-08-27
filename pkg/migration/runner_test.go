@@ -1,3 +1,4 @@
+//nolint:dupword
 package migration
 
 import (
@@ -10,15 +11,15 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/cashapp/spirit/pkg/check"
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/metrics"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/check"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
+	"github.com/block/spirit/pkg/testutils"
 
-	"github.com/cashapp/spirit/pkg/repl"
-	"github.com/cashapp/spirit/pkg/row"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/row"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 
@@ -51,7 +52,7 @@ func TestVarcharNonBinaryComparable(t *testing.T) {
 }
 
 // TestPartitioningSyntax tests that ALTERs that don't support ALGORITHM assertion
-// are still supported. From https://github.com/cashapp/spirit/issues/277
+// are still supported. From https://github.com/block/spirit/issues/277
 func TestPartitioningSyntax(t *testing.T) {
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS partt1, _partt1_new`)
 	table := `CREATE TABLE partt1 (
@@ -569,8 +570,10 @@ func TestChangeDatatypeLossyNoAutoInc(t *testing.T) {
 	assert.NoError(t, err)
 	err = m.Run(t.Context())
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "Out of range value")    // Error 1264: Out of range value for column 'id' at row 1
-	assert.Less(t, m.copier.CopyChunksCount, uint64(500)) // should be very low
+	assert.ErrorContains(t, err, "Out of range value") // Error 1264: Out of range value for column 'id' at row 1
+	// Check that the chunker processed fewer than 500 chunks
+	_, chunksCopied, _ := m.copier.GetChunker().Progress()
+	assert.Less(t, chunksCopied, uint64(500))
 	assert.NoError(t, m.Close())
 }
 
@@ -602,8 +605,10 @@ func TestChangeDatatypeLossless(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	err = m.Run(t.Context())
-	assert.NoError(t, err)                                // works because there are no violations.
-	assert.Less(t, m.copier.CopyChunksCount, uint64(500)) // prefetch makes it copy fast.
+	assert.NoError(t, err) // works because there are no violations.
+	// Check that the chunker processed fewer than 500 chunks
+	_, chunksCopied, _ := m.copier.GetChunker().Progress()
+	assert.Less(t, chunksCopied, uint64(500))
 	assert.NoError(t, m.Close())
 }
 
@@ -703,36 +708,28 @@ func TestChangeIntToBigIntPKResumeFromChkPt(t *testing.T) {
 			pk int(11) NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			name varchar(255) NOT NULL,
 			b varchar(10) NOT NULL,
-            version bigint unsigned NOT NULL DEFAULT '1' COMMENT 'Used for
-optimistic concurrency.'
+            version bigint unsigned NOT NULL DEFAULT '1' COMMENT 'Used for optimistic concurrency.'
 		)`
 	testutils.RunSQL(t, table)
-
-	// Insert initial data
+	// Insert initial data, there needs to be enough that it doesn't just finish
+	// the full copy before the first checkpoint can be written.
 	testutils.RunSQL(t, "INSERT INTO bigintpk (name, b) VALUES ('a', 'a')")
-	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name,
-a.b FROM bigintpk a JOIN bigintpk b JOIN
-bigintpk c`)
-	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name,
-a.b FROM bigintpk a JOIN bigintpk b JOIN
-bigintpk c`)
-	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name,
-a.b FROM bigintpk a JOIN bigintpk b JOIN
-bigintpk c`)
-	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name,
-a.b FROM bigintpk a JOIN bigintpk b JOIN
-bigintpk c lIMIT 100000`)
+	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name, a.b FROM bigintpk a JOIN bigintpk b JOIN bigintpk c`)
+	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name, a.b FROM bigintpk a JOIN bigintpk b JOIN bigintpk c`)
+	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name, a.b FROM bigintpk a JOIN bigintpk b JOIN bigintpk c`)
+	testutils.RunSQL(t, `INSERT INTO bigintpk (name, b) SELECT a.name, a.b FROM bigintpk a JOIN bigintpk b JOIN bigintpk c LIMIT 100000`)
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	m, err := NewRunner(&Migration{
-		Host:     &cfg.Addr,
-		Username: &cfg.User,
-		Password: &cfg.Passwd,
-		Database: &cfg.DBName,
-		Threads:  16,
-		Table:    "bigintpk",
-		Alter:    "modify column pk bigint unsigned not null auto_increment",
+		Host:            &cfg.Addr,
+		Username:        &cfg.User,
+		Password:        &cfg.Passwd,
+		Database:        &cfg.DBName,
+		Threads:         1,
+		TargetChunkTime: 100 * time.Millisecond,
+		Table:           "bigintpk",
+		Alter:           "modify column pk bigint unsigned not null auto_increment",
 	})
 	assert.NoError(t, err)
 
@@ -741,24 +738,35 @@ bigintpk c lIMIT 100000`)
 		err := m.Run(ctx)
 		assert.Error(t, err) // it gets interrupted as soon as there is a checkpoint saved.
 	}()
-
 	// wait until a checkpoint is saved (which means copy is in progress)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	assert.NoError(t, err)
 	defer db.Close()
+
+	// Add timeout to prevent infinite waiting
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
-		var rowCount int
-		err = db.QueryRow(`SELECT count(*) from _bigintpk_chkpnt`).Scan(&rowCount)
-		if err != nil {
-			continue // table does not exist yet
-		}
-		if rowCount > 0 {
-			break
+		select {
+		case <-timeout:
+			t.Fatal("Timeout waiting for checkpoint to be created")
+		case <-ticker.C:
+			var rowCount int
+			err = db.QueryRow(`SELECT count(*) from _bigintpk_chkpnt`).Scan(&rowCount)
+			if err != nil {
+				continue // table does not exist yet
+			}
+			if rowCount > 0 {
+				goto checkpointFound
+			}
 		}
 	}
+checkpointFound:
 	// Between cancel and Close() every resource is freed.
-	cancel()
 	assert.NoError(t, m.Close())
+	cancel()
 
 	// Insert some more dummy data
 	testutils.RunSQL(t, "INSERT INTO bigintpk (name,b) VALUES('t', 't')")
@@ -871,7 +879,11 @@ func TestCheckpoint(t *testing.T) {
 		ServerID:        repl.NewServerID(),
 	})
 	assert.NoError(t, r.replClient.AddSubscription(r.table, r.newTable, nil))
-	r.copier, err = row.NewCopier(r.db, r.table, r.newTable, row.NewCopierDefaultConfig())
+
+	r.copyChunker, err = table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+	require.NoError(t, err)
+	require.NoError(t, r.copyChunker.Open())
+	r.copier, err = row.NewCopier(r.db, r.copyChunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	assert.NoError(t, r.replClient.Run(t.Context()))
 
@@ -887,9 +899,6 @@ func TestCheckpoint(t *testing.T) {
 	testLogger.Lock()
 	assert.Contains(t, testLogger.lastInfof, `migration status: state=copyRows copy-progress=0/101040 0.00% binlog-deltas=0`)
 	testLogger.Unlock()
-
-	// because we are not calling copier.Run() we need to manually open.
-	assert.NoError(t, r.copier.Open4Test())
 
 	// first chunk.
 	chunk1, err := r.copier.Next4Test()
@@ -1014,7 +1023,9 @@ func TestCheckpointRestore(t *testing.T) {
 		ServerID:        repl.NewServerID(),
 	})
 	assert.NoError(t, r.replClient.AddSubscription(r.table, r.newTable, nil))
-	r.copier, err = row.NewCopier(r.db, r.table, r.newTable, row.NewCopierDefaultConfig())
+	chunker, err := table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+	require.NoError(t, err)
+	r.copier, err = row.NewCopier(r.db, chunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	err = r.replClient.Run(t.Context())
 	assert.NoError(t, err)
@@ -1024,16 +1035,15 @@ func TestCheckpointRestore(t *testing.T) {
 	watermark := "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\":[\"53926425\"],\"Inclusive\":true},\"UpperBound\":{\"Value\":[\"53926425\"],\"Inclusive\":false}}"
 	binlog := r.replClient.GetBinlogApplyPosition()
 	err = dbconn.Exec(t.Context(), r.db, `INSERT INTO %n.%n
-	(copier_watermark, checksum_watermark, binlog_name, binlog_pos, rows_copied, rows_copied_logical, alter_statement)
+	(copier_watermark, checksum_watermark, binlog_name, binlog_pos, rows_copied, alter_statement)
 	VALUES
-	(%?, %?, %?, %?, %?, %?, %?)`,
+	(%?,  %?, %?, %?, %?, %?)`,
 		r.checkpointTable.SchemaName,
 		r.checkpointTable.TableName,
 		watermark,
 		"",
 		binlog.Name,
 		binlog.Pos,
-		0,
 		0,
 		r.migration.Alter,
 	)
@@ -1056,7 +1066,7 @@ func TestCheckpointRestore(t *testing.T) {
 	assert.NoError(t, r2.Close())
 }
 
-// https://github.com/cashapp/spirit/issues/381
+// https://github.com/block/spirit/issues/381
 func TestCheckpointRestoreBinaryPK(t *testing.T) {
 	ctx := t.Context()
 	tbl := `CREATE TABLE binarypk (
@@ -1109,13 +1119,14 @@ func TestCheckpointRestoreBinaryPK(t *testing.T) {
 		ServerID:        repl.NewServerID(),
 	})
 	assert.NoError(t, r.replClient.AddSubscription(r.table, r.newTable, nil))
-	r.copier, err = row.NewCopier(r.db, r.table, r.newTable, row.NewCopierDefaultConfig())
+	r.copyChunker, err = table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+	require.NoError(t, err)
+	require.NoError(t, r.copyChunker.Open())
+	r.copier, err = row.NewCopier(r.db, r.copyChunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	err = r.replClient.Run(t.Context())
 	assert.NoError(t, err)
 
-	// copy a few batches and then dump a checkpoint.
-	assert.NoError(t, r.copier.Open4Test())
 	for range 3 {
 		chunk, err := r.copier.Next4Test()
 		assert.NoError(t, err)
@@ -1276,7 +1287,10 @@ func TestCheckpointDifferentRestoreOptions(t *testing.T) {
 		ServerID:        repl.NewServerID(),
 	})
 	assert.NoError(t, m.replClient.AddSubscription(m.table, m.newTable, nil))
-	m.copier, err = row.NewCopier(m.db, m.table, m.newTable, row.NewCopierDefaultConfig())
+	m.copyChunker, err = table.NewChunker(m.table, m.newTable, m.migration.TargetChunkTime, m.logger)
+	assert.NoError(t, err)
+	require.NoError(t, m.copyChunker.Open())
+	m.copier, err = row.NewCopier(m.db, m.copyChunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	err = m.replClient.Run(t.Context())
 	assert.NoError(t, err)
@@ -1288,8 +1302,6 @@ func TestCheckpointDifferentRestoreOptions(t *testing.T) {
 	// m.copier.StartTime = time.Now()
 	m.setCurrentState(stateCopyRows)
 	assert.Equal(t, "copyRows", m.getCurrentState().String())
-
-	assert.NoError(t, m.copier.Open4Test())
 
 	// first chunk.
 	chunk1, err := m.copier.Next4Test()
@@ -1475,7 +1487,10 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 		TargetBatchTime: m.migration.TargetChunkTime,
 		ServerID:        repl.NewServerID(),
 	})
-	m.copier, err = row.NewCopier(m.db, m.table, m.newTable, &row.CopierConfig{
+	chunker, err := table.NewChunker(m.table, m.newTable, m.migration.TargetChunkTime, m.logger)
+	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
+	m.copier, err = row.NewCopier(m.db, chunker, &row.CopierConfig{
 		Concurrency:     m.migration.Threads,
 		TargetChunkTime: m.migration.TargetChunkTime,
 		FinalChecksum:   m.migration.Checksum,
@@ -1498,7 +1513,6 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	assert.Equal(t, "copyRows", m.getCurrentState().String())
 
 	// We expect 2 chunks to be copied.
-	assert.NoError(t, m.copier.Open4Test())
 
 	// first chunk.
 	chunk, err := m.copier.Next4Test()
@@ -1606,7 +1620,10 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 		TargetBatchTime: m.migration.TargetChunkTime,
 		ServerID:        repl.NewServerID(),
 	})
-	m.copier, err = row.NewCopier(m.db, m.table, m.newTable, &row.CopierConfig{
+	chunker, err := table.NewChunker(m.table, m.newTable, m.migration.TargetChunkTime, m.logger)
+	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
+	m.copier, err = row.NewCopier(m.db, chunker, &row.CopierConfig{
 		Concurrency:     m.migration.Threads,
 		TargetChunkTime: m.migration.TargetChunkTime,
 		FinalChecksum:   m.migration.Checksum,
@@ -1631,7 +1648,6 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 
 	// We expect 3 chunks to be copied.
 	// The special first and last case and middle case.
-	assert.NoError(t, m.copier.Open4Test())
 
 	// first chunk.
 	chunk, err := m.copier.Next4Test()
@@ -2318,7 +2334,10 @@ func TestE2ERogueValues(t *testing.T) {
 		TargetBatchTime: m.migration.TargetChunkTime,
 		ServerID:        repl.NewServerID(),
 	})
-	m.copier, err = row.NewCopier(m.db, m.table, m.newTable, &row.CopierConfig{
+	chunker, err := table.NewChunker(m.table, m.newTable, m.migration.TargetChunkTime, m.logger)
+	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
+	m.copier, err = row.NewCopier(m.db, chunker, &row.CopierConfig{
 		Concurrency:     m.migration.Threads,
 		TargetChunkTime: m.migration.TargetChunkTime,
 		FinalChecksum:   m.migration.Checksum,
@@ -2341,7 +2360,6 @@ func TestE2ERogueValues(t *testing.T) {
 	assert.Equal(t, "copyRows", m.getCurrentState().String())
 
 	// We expect 2 chunks to be copied.
-	assert.NoError(t, m.copier.Open4Test())
 
 	// first chunk.
 	chunk, err := m.copier.Next4Test()
@@ -2483,7 +2501,10 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 		TargetBatchTime: m.migration.TargetChunkTime,
 		ServerID:        repl.NewServerID(),
 	})
-	m.copier, err = row.NewCopier(m.db, m.table, m.newTable, &row.CopierConfig{
+	m.copyChunker, err = table.NewChunker(m.table, m.newTable, m.migration.TargetChunkTime, m.logger)
+	require.NoError(t, err)
+	require.NoError(t, m.copyChunker.Open())
+	m.copier, err = row.NewCopier(m.db, m.copyChunker, &row.CopierConfig{
 		Concurrency:     m.migration.Threads,
 		TargetChunkTime: m.migration.TargetChunkTime,
 		FinalChecksum:   m.migration.Checksum,
@@ -2504,9 +2525,6 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 	// m.copier.StartTime = time.Now()
 	m.setCurrentState(stateCopyRows)
 	assert.Equal(t, "copyRows", m.getCurrentState().String())
-
-	// Open
-	assert.NoError(t, m.copier.Open4Test())
 
 	// first chunk.
 	chunk, err := m.copier.Next4Test()
@@ -3028,7 +3046,7 @@ func TestPreRunChecksE2E(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// From https://github.com/cashapp/spirit/issues/241
+// From https://github.com/block/spirit/issues/241
 // If an ALTER qualifies as instant, but an instant can't apply, don't burn an instant version.
 func TestForNonInstantBurn(t *testing.T) {
 	// We skip this test in MySQL 8.0.28. It uses INSTANT_COLS instead of total_row_versions
@@ -3088,7 +3106,7 @@ func TestForNonInstantBurn(t *testing.T) {
 	assert.Equal(t, 0, rowVersions()) // confirm we reset to zero, not 1 (no burn)
 }
 
-// From https://github.com/cashapp/spirit/issues/283
+// From https://github.com/block/spirit/issues/283
 // ALTER INDEX .. VISIBLE is INPLACE which is really weird.
 // it only makes sense to be instant, so we attempt it as a "safe inplace".
 // If it's not with a set of safe changes, then we error.
@@ -3342,7 +3360,7 @@ func TestTrailingSemicolon(t *testing.T) {
 		Password: &cfg.Passwd,
 		Database: &cfg.DBName,
 		Table:    "multiSecondary",
-		// https://github.com/cashapp/spirit/issues/384
+		// https://github.com/block/spirit/issues/384
 		Alter:   dropIndexesAlter + "; ",
 		Threads: 1,
 	})
@@ -3352,4 +3370,49 @@ func TestTrailingSemicolon(t *testing.T) {
 
 	require.True(t, m.usedInplaceDDL) // must be inplace
 	require.NoError(t, m.Close())
+}
+func TestAlterExtendVarcharE2E(t *testing.T) {
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1extendvarchar, _t1extendvarchar_new`)
+	table := `CREATE TABLE t1extendvarchar (
+		id int not null primary key auto_increment,
+		col1 varchar(10),
+		col2 varchar(10)
+	) character set utf8mb4`
+	testutils.RunSQL(t, table)
+
+	type alterAttempt struct {
+		Statement string
+		Error     bool
+		InPlace   bool
+	}
+	alters := []alterAttempt{
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(20)`, InPlace: true},
+		{Statement: `ALTER TABLE t1extendvarchar CHANGE col1 col1 varchar(21)`, InPlace: true},
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(22), CHANGE col2 col2 varchar(22) `, InPlace: true},
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(23), CHANGE col2 col2 varchar(200) `, InPlace: false},
+		{Statement: `ALTER TABLE t1extendvarchar MODIFY col1 varchar(200)`, InPlace: false},
+	}
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+
+	for _, attempt := range alters {
+		m, err := NewRunner(&Migration{
+			Host:      cfg.Addr,
+			Username:  cfg.User,
+			Password:  cfg.Passwd,
+			Database:  cfg.DBName,
+			Threads:   1,
+			Checksum:  true,
+			Statement: attempt.Statement,
+		})
+		require.NoError(t, err)
+		err = m.Run(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, attempt.InPlace, m.usedInplaceDDL)
+
+		// go test howls about resource leaks if we don't close all these things
+		err = m.Close()
+		assert.NoError(t, err)
+	}
 }

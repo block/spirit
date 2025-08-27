@@ -12,7 +12,7 @@ type MySQL80Replica struct {
 }
 
 // MySQL8LagQuery is a query that is used to get the lag between the source and the replica.
-// The implementation is described in https://github.com/cashapp/spirit/issues/286
+// The implementation is described in https://github.com/block/spirit/issues/286
 // It uses performance_schema instead of a heartbeat injection or seconds_behind_source.
 const MySQL8LagQuery = `WITH applier_latency AS (
 	SELECT MAX(TIMESTAMPDIFF(MICROSECOND, APPLYING_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP, NOW())/1000 ) AS applier_latency_ms

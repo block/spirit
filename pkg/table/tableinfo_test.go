@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/testutils"
 	"go.uber.org/goleak"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -27,7 +27,7 @@ func TestOpenOnBinaryType(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := NewChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 }
@@ -40,7 +40,7 @@ func TestOpenOnNoMinMax(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := NewChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 }
@@ -53,7 +53,7 @@ func TestCallingNextChunkWithoutOpen(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := NewChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, logrus.New())
 	assert.NoError(t, err)
 
 	_, err = chunker.Next()
@@ -190,7 +190,7 @@ func TestDiscoveryBalancesTable(t *testing.T) {
 	assert.Equal(t, "0", t1.minValue.String())
 	assert.Equal(t, "0", t1.maxValue.String())
 
-	chunker, err := NewChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, logrus.New())
 	assert.NoError(t, err)
 
 	assert.NoError(t, chunker.Open())
@@ -299,7 +299,7 @@ func TestKeyColumnsValuesExtraction(t *testing.T) {
 	err = db.QueryRow("SELECT * FROM `test`.`colvaluest1` ORDER BY id DESC LIMIT 1").Scan(&id, &name, &age)
 	assert.NoError(t, err)
 
-	row := []interface{}{id, name, age}
+	row := []any{id, name, age}
 	pkVals, err := t1.PrimaryKeyValues(row)
 	assert.Equal(t, id, pkVals[0])
 	assert.Equal(t, age, pkVals[1])

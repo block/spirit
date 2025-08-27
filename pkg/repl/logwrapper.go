@@ -21,11 +21,11 @@ type LogWrapper struct {
 	logger loggers.Advanced
 }
 
-func (c *LogWrapper) Debugf(format string, args ...interface{}) {
+func (c *LogWrapper) Debugf(format string, args ...any) {
 	c.logger.Debugf(format, args...)
 }
 
-func (c *LogWrapper) Infof(format string, args ...interface{}) {
+func (c *LogWrapper) Infof(format string, args ...any) {
 	switch format {
 	case "rotate to %s", "received fake rotate event, next log name is %s", "rotate binlog to %s", "table structure changed, clear table cache: %s.%s\n":
 		return
@@ -33,13 +33,13 @@ func (c *LogWrapper) Infof(format string, args ...interface{}) {
 	c.logger.Infof(format, args...)
 }
 
-func (c *LogWrapper) Warnf(format string, args ...interface{}) {
+func (c *LogWrapper) Warnf(format string, args ...any) {
 	c.logger.Warnf(format, args...)
 }
 
-func (c *LogWrapper) Errorf(format string, args ...interface{}) {
+func (c *LogWrapper) Errorf(format string, args ...any) {
 	// Noisy bug on close, can be ignored.
-	// https://github.com/cashapp/spirit/pull/65
+	// https://github.com/block/spirit/pull/65
 	if len(args) == 1 {
 		message := fmt.Sprintf("%s", args[0])
 		if format == "canal start sync binlog err: %v" && message == "Sync was closed" {
@@ -49,70 +49,70 @@ func (c *LogWrapper) Errorf(format string, args ...interface{}) {
 	c.logger.Errorf(format, args...)
 }
 
-func (c *LogWrapper) Fatalf(format string, args ...interface{}) {
+func (c *LogWrapper) Fatalf(format string, args ...any) {
 	c.logger.Fatalf(format, args...)
 }
 
-func (c *LogWrapper) Debug(args ...interface{}) {
+func (c *LogWrapper) Debug(args ...any) {
 	c.logger.Debug(args...)
 }
 
-func (c *LogWrapper) Info(args ...interface{}) {
+func (c *LogWrapper) Info(args ...any) {
 	c.logger.Info(args...)
 }
 
-func (c *LogWrapper) Warn(args ...interface{}) {
+func (c *LogWrapper) Warn(args ...any) {
 	c.logger.Warn(args...)
 }
 
-func (c *LogWrapper) Error(args ...interface{}) {
+func (c *LogWrapper) Error(args ...any) {
 	c.logger.Error(args...)
 }
 
-func (c *LogWrapper) Fatal(args ...interface{}) {
+func (c *LogWrapper) Fatal(args ...any) {
 	c.logger.Fatal(args...)
 }
 
-func (c *LogWrapper) Debugln(args ...interface{}) {
+func (c *LogWrapper) Debugln(args ...any) {
 	c.logger.Debugln(args...)
 }
 
-func (c *LogWrapper) Infoln(args ...interface{}) {
+func (c *LogWrapper) Infoln(args ...any) {
 	c.logger.Infoln(args...)
 }
 
-func (c *LogWrapper) Warnln(args ...interface{}) {
+func (c *LogWrapper) Warnln(args ...any) {
 	c.logger.Warnln(args...)
 }
 
-func (c *LogWrapper) Errorln(args ...interface{}) {
+func (c *LogWrapper) Errorln(args ...any) {
 	c.logger.Errorln(args...)
 }
 
-func (c *LogWrapper) Fatalln(args ...interface{}) {
+func (c *LogWrapper) Fatalln(args ...any) {
 	c.logger.Fatalln(args...)
 }
 
-func (c *LogWrapper) Panic(args ...interface{}) {
+func (c *LogWrapper) Panic(args ...any) {
 	c.logger.Panic(args...)
 }
 
-func (c *LogWrapper) Panicf(format string, args ...interface{}) {
+func (c *LogWrapper) Panicf(format string, args ...any) {
 	c.logger.Panicf(format, args...)
 }
 
-func (c *LogWrapper) Panicln(args ...interface{}) {
+func (c *LogWrapper) Panicln(args ...any) {
 	c.logger.Panicln(args...)
 }
 
-func (c *LogWrapper) Print(args ...interface{}) {
+func (c *LogWrapper) Print(args ...any) {
 	c.logger.Print(args...)
 }
 
-func (c *LogWrapper) Printf(format string, args ...interface{}) {
+func (c *LogWrapper) Printf(format string, args ...any) {
 	c.logger.Printf(format, args...)
 }
 
-func (c *LogWrapper) Println(args ...interface{}) {
+func (c *LogWrapper) Println(args ...any) {
 	c.logger.Println(args...)
 }

@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/table"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/siddontang/loggers"
@@ -136,7 +136,7 @@ func NewClientDefaultConfig() *ClientConfig {
 
 // AddSubscription adds a new subscription.
 // Returns an error if a subscription already exists for the given table.
-func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, keyAboveCopierCallback func(interface{}) bool) error {
+func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, keyAboveCopierCallback func(any) bool) error {
 	c.Lock()
 	defer c.Unlock()
 

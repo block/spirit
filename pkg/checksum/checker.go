@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/repl"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/utils"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/siddontang/loggers"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -25,8 +25,6 @@ import (
 
 type Checker struct {
 	sync.Mutex
-	table            *table.TableInfo
-	newTable         *table.TableInfo
 	concurrency      int
 	feed             *repl.Client
 	db               *sql.DB
@@ -35,13 +33,11 @@ type Checker struct {
 	chunker          table.Chunker
 	startTime        time.Time
 	ExecTime         time.Duration
-	recentValue      interface{} // used for status
 	dbConfig         *dbconn.DBConfig
 	logger           loggers.Advanced
 	fixDifferences   bool
 	differencesFound atomic.Uint64
 	recopyLock       sync.Mutex
-	isResume         bool
 }
 
 type CheckerConfig struct {
@@ -64,31 +60,17 @@ func NewCheckerDefaultConfig() *CheckerConfig {
 }
 
 // NewChecker creates a new checksum object.
-func NewChecker(db *sql.DB, tbl, newTable *table.TableInfo, feed *repl.Client, config *CheckerConfig) (*Checker, error) {
+func NewChecker(db *sql.DB, chunker table.Chunker, feed *repl.Client, config *CheckerConfig) (*Checker, error) {
 	if feed == nil {
 		return nil, errors.New("feed must be non-nil")
 	}
-	if newTable == nil || tbl == nil {
-		return nil, errors.New("table and newTable must be non-nil")
+	if chunker == nil {
+		return nil, errors.New("chunker must be non-nil")
 	}
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig()
 	}
-	chunker, err := table.NewChunker(tbl, config.TargetChunkTime, config.Logger)
-	if err != nil {
-		return nil, err
-	}
-	// If there is a watermark, we need to open the chunker at that watermark.
-	// Overwrite the previously attached chunker with a new one.
-	if config.Watermark != "" {
-		config.Logger.Warnf("opening checksum chunker at watermark: %s", config.Watermark)
-		if err := chunker.OpenAtWatermark(config.Watermark, newTable.MaxValue()); err != nil {
-			return nil, err
-		}
-	}
 	checksum := &Checker{
-		table:          tbl,
-		newTable:       newTable,
 		concurrency:    config.Concurrency,
 		db:             db,
 		feed:           feed,
@@ -96,7 +78,6 @@ func NewChecker(db *sql.DB, tbl, newTable *table.TableInfo, feed *repl.Client, c
 		dbConfig:       config.DBConfig,
 		logger:         config.Logger,
 		fixDifferences: config.FixDifferences,
-		isResume:       config.Watermark != "",
 	}
 	return checksum, nil
 }
@@ -109,22 +90,23 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 	}
 	defer trxPool.Put(trx)
 	c.logger.Debugf("checksumming chunk: %s", chunk.String())
-	source := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum FROM %s WHERE %s",
-		c.intersectColumns(),
-		c.table.QuotedName,
+	source := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum, count(*) as c FROM %s WHERE %s",
+		c.intersectColumns(chunk),
+		chunk.Table.QuotedName,
 		chunk.String(),
 	)
-	target := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum FROM %s WHERE %s",
-		c.intersectColumns(),
-		c.newTable.QuotedName,
+	target := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum, count(*) as c FROM %s WHERE %s",
+		c.intersectColumns(chunk),
+		chunk.NewTable.QuotedName,
 		chunk.String(),
 	)
 	var sourceChecksum, targetChecksum int64
-	err = trx.QueryRow(source).Scan(&sourceChecksum)
+	var sourceCount, targetCount uint64
+	err = trx.QueryRow(source).Scan(&sourceChecksum, &sourceCount)
 	if err != nil {
 		return err
 	}
-	err = trx.QueryRow(target).Scan(&targetChecksum)
+	err = trx.QueryRow(target).Scan(&targetChecksum, &targetCount)
 	if err != nil {
 		return err
 	}
@@ -132,7 +114,7 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 		// The checksums do not match, so we first need
 		// to inspect closely and report on the differences.
 		c.differencesFound.Add(1)
-		c.logger.Warnf("checksum mismatch for chunk %s: source %d != target %d", chunk.String(), sourceChecksum, targetChecksum)
+		c.logger.Warnf("checksum mismatch for chunk %s: source %d != target %d sourceCount: %d targetCount: %d", chunk.String(), sourceChecksum, targetChecksum, sourceCount, targetCount)
 		if err := c.inspectDifferences(trx, chunk); err != nil {
 			return err
 		}
@@ -146,13 +128,8 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 			return err
 		}
 	}
-	if chunk.LowerBound != nil {
-		c.Lock()
-		// For recent value we only use the first part of the key.
-		c.recentValue = chunk.LowerBound.Value[0]
-		c.Unlock()
-	}
-	c.chunker.Feedback(chunk, time.Since(startTime))
+	// When we give feedback, we need to say how many rows were in the chunk.
+	c.chunker.Feedback(chunk, time.Since(startTime), targetCount)
 	return nil
 }
 
@@ -160,33 +137,41 @@ func (c *Checker) DifferencesFound() uint64 {
 	return c.differencesFound.Load()
 }
 
-func (c *Checker) RecentValue() string {
+func (c *Checker) getStats() (uint64, uint64, float64) {
+	// Get progress from the chunker instead of calculating it ourselves
+	rowsProcessed, _, totalRows := c.chunker.Progress()
+
+	// Calculate percentage
+	pct := float64(0)
+	if totalRows > 0 {
+		pct = float64(rowsProcessed) / float64(totalRows) * 100
+	}
+
+	return rowsProcessed, totalRows, pct
+}
+
+// GetProgress returns the progress of the checker
+func (c *Checker) GetProgress() string {
 	c.Lock()
 	defer c.Unlock()
-	if c.recentValue == nil {
-		return "TBD"
-	}
-	return fmt.Sprintf("%v", c.recentValue)
+
+	copied, total, pct := c.getStats()
+	return fmt.Sprintf("%d/%d %.2f%%", copied, total, pct)
 }
 
-func (c *Checker) GetLowWatermark() (string, error) {
-	if c.chunker == nil {
-		return "", errors.New("chunker not initialized")
-	}
-	return c.chunker.GetLowWatermark()
-}
-
+// inspectDifferences looks at the chunk and tries
+// to find differences.
 func (c *Checker) inspectDifferences(trx *sql.Tx, chunk *table.Chunk) error {
 	sourceSubquery := fmt.Sprintf("SELECT CRC32(CONCAT(%s)) as row_checksum, %s FROM %s WHERE %s",
-		c.intersectColumns(),
-		strings.Join(c.table.KeyColumns, ", "),
-		c.table.QuotedName,
+		c.intersectColumns(chunk),
+		strings.Join(chunk.Table.KeyColumns, ", "),
+		chunk.Table.QuotedName,
 		chunk.String(),
 	)
 	targetSubquery := fmt.Sprintf("SELECT CRC32(CONCAT(%s)) as row_checksum, %s FROM %s WHERE %s",
-		c.intersectColumns(),
-		strings.Join(c.newTable.KeyColumns, ", "),
-		c.newTable.QuotedName,
+		c.intersectColumns(chunk),
+		strings.Join(chunk.NewTable.KeyColumns, ", "),
+		chunk.NewTable.QuotedName,
 		chunk.String(),
 	)
 	// In MySQL 8.0 we could do this as a CTE, but because we kinda support
@@ -197,14 +182,14 @@ func (c *Checker) inspectDifferences(trx *sql.Tx, chunk *table.Chunk) error {
 UNION
 SELECT source.row_checksum as source_row_checksum, target.row_checksum as target_row_checksum, CONCAT_WS(",", %s) as pk FROM (%s) AS source RIGHT JOIN (%s) AS target USING (%s) WHERE source.row_checksum != target.row_checksum OR source.row_checksum IS NULL
 `,
-		strings.Join(c.table.KeyColumns, ", "),
+		strings.Join(chunk.Table.KeyColumns, ", "),
 		sourceSubquery,
 		targetSubquery,
-		strings.Join(c.table.KeyColumns, ", "),
-		strings.Join(c.table.KeyColumns, ", "),
+		strings.Join(chunk.Table.KeyColumns, ", "),
+		strings.Join(chunk.Table.KeyColumns, ", "),
 		sourceSubquery,
 		targetSubquery,
-		strings.Join(c.table.KeyColumns, ", "),
+		strings.Join(chunk.Table.KeyColumns, ", "),
 	)
 	res, err := trx.Query(stmt)
 	if err != nil {
@@ -240,12 +225,12 @@ SELECT source.row_checksum as source_row_checksum, target.row_checksum as target
 // stall from an XL sized chunk is considered acceptable.
 func (c *Checker) replaceChunk(ctx context.Context, chunk *table.Chunk) error {
 	c.logger.Warnf("recopying chunk: %s", chunk.String())
-	deleteStmt := "DELETE FROM " + c.newTable.QuotedName + " WHERE " + chunk.String()
+	deleteStmt := "DELETE FROM " + chunk.NewTable.QuotedName + " WHERE " + chunk.String()
 	replaceStmt := fmt.Sprintf("REPLACE INTO %s (%s) SELECT %s FROM %s WHERE %s",
-		c.newTable.QuotedName,
-		utils.IntersectNonGeneratedColumns(c.table, c.newTable),
-		utils.IntersectNonGeneratedColumns(c.table, c.newTable),
-		c.table.QuotedName,
+		chunk.NewTable.QuotedName,
+		utils.IntersectNonGeneratedColumns(chunk.Table, chunk.NewTable),
+		utils.IntersectNonGeneratedColumns(chunk.Table, chunk.NewTable),
+		chunk.Table.QuotedName,
 		chunk.String(),
 	)
 	// Note: historically this process has caused deadlocks between the DELETE statement
@@ -350,7 +335,7 @@ func (c *Checker) initConnPool(ctx context.Context) error {
 	// Lock the source and target table in a trx
 	// so the connection is not used by others
 	c.logger.Info("starting checksum operation, this will require a table lock")
-	tableLock, err := dbconn.NewTableLock(ctx, c.db, []*table.TableInfo{c.table, c.newTable}, c.dbConfig, c.logger)
+	tableLock, err := dbconn.NewTableLock(ctx, c.db, c.chunker.Tables(), c.dbConfig, c.logger)
 	if err != nil {
 		return err
 	}
@@ -375,20 +360,10 @@ func (c *Checker) initConnPool(ctx context.Context) error {
 }
 
 func (c *Checker) Run(ctx context.Context) error {
-	c.Lock()
 	c.startTime = time.Now()
 	defer func() {
 		c.ExecTime = time.Since(c.startTime)
 	}()
-	// Open the chunker if it's not open.
-	// It will already be open if this is a resume from checkpoint.
-	// This is a little annoying, but just the way the chunker API works.
-	if !c.isResume {
-		if err := c.chunker.Open(); err != nil {
-			return err
-		}
-	}
-	c.Unlock()
 
 	// initConnPool initialize the connection pool.
 	// This is done under a table lock which is acquired in this func.
@@ -444,14 +419,14 @@ func (c *Checker) Run(ctx context.Context) error {
 // intersectColumns is similar to utils.IntersectColumns, but it
 // wraps an IFNULL(), ISNULL() and cast operation around the columns.
 // The cast is to c.newTable type.
-func (c *Checker) intersectColumns() string {
+func (c *Checker) intersectColumns(chunk *table.Chunk) string {
 	var intersection []string
-	for _, col := range c.table.NonGeneratedColumns {
-		for _, col2 := range c.newTable.NonGeneratedColumns {
+	for _, col := range chunk.Table.NonGeneratedColumns {
+		for _, col2 := range chunk.NewTable.NonGeneratedColumns {
 			if col == col2 {
 				// Column exists in both, so we add intersection wrapped in
 				// IFNULL, ISNULL and CAST.
-				intersection = append(intersection, "IFNULL("+c.newTable.WrapCastType(col)+",''), ISNULL(`"+col+"`)")
+				intersection = append(intersection, "IFNULL("+chunk.NewTable.WrapCastType(col)+",''), ISNULL(`"+col+"`)")
 			}
 		}
 	}

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/utils"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
 )
 

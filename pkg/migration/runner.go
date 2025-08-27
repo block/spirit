@@ -9,16 +9,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/metrics"
-	"github.com/cashapp/spirit/pkg/statement"
-
-	"github.com/cashapp/spirit/pkg/check"
-	"github.com/cashapp/spirit/pkg/checksum"
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/repl"
-	"github.com/cashapp/spirit/pkg/row"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/check"
+	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
+	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/row"
+	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/siddontang/go-log/loggers"
 	"github.com/sirupsen/logrus"
@@ -49,6 +48,9 @@ type Runner struct {
 	throttler    throttler.Throttler
 	checker      *checksum.Checker
 	checkerLock  sync.Mutex
+
+	copyChunker     table.Chunker // the chunker for copying
+	checksumChunker table.Chunker // the chunker for checksum
 
 	// used to recover direct to checksum.
 	checksumWatermark string
@@ -115,6 +117,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	r.dbConfig = dbconn.NewDBConfig()
 	r.dbConfig.LockWaitTimeout = int(r.migration.LockWaitTimeout.Seconds())
 	r.dbConfig.InterpolateParams = r.migration.InterpolateParams
+	r.dbConfig.ForceKill = r.migration.ForceKill
 	// The copier and checker will use Threads to limit N tasks concurrently,
 	// but we also set it at the DB pool level with +1. Because the copier and
 	// the replication applier use the same pool, it allows for some natural throttling
@@ -187,7 +190,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	}
 
 	// Force enable the checksum if it's an ADD UNIQUE INDEX operation
-	// https://github.com/cashapp/spirit/issues/266
+	// https://github.com/block/spirit/issues/266
 	if !r.migration.Checksum {
 		if err := r.stmt.AlterContainsAddUnique(); err != nil {
 			r.logger.Warnf("force enabling checksum: %v", err)
@@ -199,7 +202,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	// This is because we've already attempted MySQL DDL as INPLACE, and it didn't work.
 	// It likely means the user is combining this operation with other unsafe operations,
 	// which is not a good idea. We need to protect them by not allowing it.
-	// https://github.com/cashapp/spirit/issues/283
+	// https://github.com/block/spirit/issues/283
 	if err := r.stmt.AlterContainsIndexVisibility(); err != nil {
 		return err
 	}
@@ -276,10 +279,11 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	if r.checker != nil {
 		checksumTime = r.checker.ExecTime
 	}
+	_, copiedChunks, _ := r.copyChunker.Progress()
 	r.logger.Infof("apply complete: instant-ddl=%v inplace-ddl=%v total-chunks=%v copy-rows-time=%s checksum-time=%s total-time=%s conns-in-use=%d",
 		r.usedInstantDDL,
 		r.usedInplaceDDL,
-		r.copier.CopyChunksCount,
+		copiedChunks,
 		r.copier.ExecTime.Round(time.Second),
 		checksumTime.Round(time.Second),
 		time.Since(r.startTime).Round(time.Second),
@@ -355,6 +359,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 		TargetChunkTime: r.migration.TargetChunkTime,
 		Threads:         r.migration.Threads,
 		ReplicaMaxLag:   r.migration.ReplicaMaxLag,
+		ForceKill:       r.migration.ForceKill,
 		// For the pre-run checks we don't have a DB connection yet.
 		// Instead we check the credentials provided.
 		Host:                 *r.migration.Host,
@@ -387,9 +392,6 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 	// an inplace add index, we will attempt inplace regardless
 	// of the statement.
 	err = r.stmt.AlgorithmInplaceConsideredSafe()
-	if err != nil {
-		r.logger.Infof("unable to use INPLACE: %v", err)
-	}
 	if r.migration.ForceInplace || err == nil {
 		err = r.attemptInplaceDDL(ctx)
 		if err == nil {
@@ -397,6 +399,7 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 			return nil
 		}
 	}
+	r.logger.Infof("unable to use INPLACE: %v", err)
 
 	// Failure is expected, since MySQL DDL only applies in limited scenarios
 	// Return the error, which will be ignored by the caller.
@@ -442,7 +445,22 @@ func (r *Runner) setup(ctx context.Context) error {
 			}
 		}
 
-		r.copier, err = row.NewCopier(r.db, r.table, r.newTable, &row.CopierConfig{
+		// Create chunker first with destination table info, then create copier with it
+		r.copyChunker, err = table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+		if err != nil {
+			return err
+		}
+		// For now we always "open" the chunker, but that might become obsolete later.
+		if err := r.copyChunker.Open(); err != nil {
+			return err
+		}
+
+		if r.migration.Multi {
+			// Wrap the chunker in a multi-chunker
+			r.copyChunker = table.NewMultiChunker(r.copyChunker)
+		}
+
+		r.copier, err = row.NewCopier(r.db, r.copyChunker, &row.CopierConfig{
 			Concurrency:     r.migration.Threads,
 			TargetChunkTime: r.migration.TargetChunkTime,
 			FinalChecksum:   r.migration.Checksum,
@@ -618,7 +636,6 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 	binlog_name VARCHAR(255),
 	binlog_pos INT,
 	rows_copied BIGINT,
-	rows_copied_logical BIGINT,
 	alter_statement TEXT
 	)`,
 		r.table.SchemaName, cpName); err != nil {
@@ -643,7 +660,7 @@ func (r *Runner) GetProgress() Progress {
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
 	case stateChecksum:
 		r.checkerLock.Lock()
-		summary = fmt.Sprintf("Checksum Progress=%s/%s", r.checker.RecentValue(), r.table.MaxValue())
+		summary = "Checksum Progress=" + r.checker.GetProgress()
 		r.checkerLock.Unlock()
 	}
 	return Progress{
@@ -738,8 +755,8 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		r.stmt.Schema, cpName)
 	var copierWatermark, binlogName, alterStatement string
 	var id, binlogPos int
-	var rowsCopied, rowsCopiedLogical uint64
-	err := r.db.QueryRow(query).Scan(&id, &copierWatermark, &r.checksumWatermark, &binlogName, &binlogPos, &rowsCopied, &rowsCopiedLogical, &alterStatement)
+	var rowsCopied uint64
+	err := r.db.QueryRow(query).Scan(&id, &copierWatermark, &r.checksumWatermark, &binlogName, &binlogPos, &rowsCopied, &alterStatement)
 	if err != nil {
 		return fmt.Errorf("could not read from table '%s', err:%v", cpName, err)
 	}
@@ -760,7 +777,28 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// we checksum the table at the end. Thus, resume-from-checkpoint MUST
 	// have the checksum enabled to apply all changes safely.
 	r.migration.Checksum = true
-	r.copier, err = row.NewCopierFromCheckpoint(r.db, r.table, r.newTable, &row.CopierConfig{
+
+	// Create chunker first and open at the checkpoint watermark
+	chunker, err := table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+	if err != nil {
+		return err
+	}
+
+	// Open chunker at the specified watermark
+	// For high watermark, use the type of old table, not the new one.
+	highPtr := table.NewDatum(r.newTable.MaxValue().Val, r.table.MaxValue().Tp)
+	if err := chunker.OpenAtWatermark(copierWatermark, highPtr, rowsCopied); err != nil {
+		return err
+	}
+
+	r.copyChunker = table.NewMultiChunker(chunker)
+	if r.migration.Multi {
+		// Wrap the copy chunker in a multi chunker.
+		r.copyChunker = table.NewMultiChunker(chunker)
+	}
+
+	// Create copier with the prepared chunker
+	r.copier, err = row.NewCopier(r.db, r.copyChunker, &row.CopierConfig{
 		Concurrency:     r.migration.Threads,
 		TargetChunkTime: r.migration.TargetChunkTime,
 		FinalChecksum:   r.migration.Checksum,
@@ -768,7 +806,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		Logger:          r.logger,
 		MetricsSink:     r.metricsSink,
 		DBConfig:        r.dbConfig,
-	}, copierWatermark, rowsCopied, rowsCopiedLogical)
+	})
 	if err != nil {
 		return err
 	}
@@ -824,13 +862,30 @@ func (r *Runner) checksum(ctx context.Context) error {
 			r.checksumWatermark = "" // reset the watermark if we are retrying.
 		}
 		r.checkerLock.Lock()
-		r.checker, err = checksum.NewChecker(r.db, r.table, r.newTable, r.replClient, &checksum.CheckerConfig{
+
+		// Create a chunker
+		r.checksumChunker, err = table.NewChunker(r.table, r.newTable, r.migration.TargetChunkTime, r.logger)
+		if err != nil {
+			return err
+		}
+		if r.checksumWatermark != "" {
+			if err := r.checksumChunker.OpenAtWatermark(r.checksumWatermark, r.newTable.MaxValue(), 0); err != nil {
+				return err
+			}
+		} else {
+			if err := r.checksumChunker.Open(); err != nil {
+				return err
+			}
+		}
+		if r.migration.Multi {
+			r.checksumChunker = table.NewMultiChunker(r.checksumChunker)
+		}
+		r.checker, err = checksum.NewChecker(r.db, r.checksumChunker, r.replClient, &checksum.CheckerConfig{
 			Concurrency:     r.migration.Threads,
 			TargetChunkTime: r.migration.TargetChunkTime,
 			DBConfig:        r.dbConfig,
 			Logger:          r.logger,
 			FixDifferences:  true, // we want to repair the differences.
-			Watermark:       r.checksumWatermark,
 		})
 		r.checkerLock.Unlock()
 		if err != nil {
@@ -856,7 +911,7 @@ func (r *Runner) checksum(ctx context.Context) error {
 			if err := r.stmt.AlterContainsAddUnique(); err != nil {
 				return errors.New("checksum failed after 3 attempts. Check that the ALTER statement is not adding a UNIQUE INDEX to non-unique data")
 			}
-			return errors.New("checksum failed after 3 attempts. This likely indicates either a bug in Spirit, or a manual modification to the _new table outside of Spirit. Please report @ github.com/cashapp/spirit")
+			return errors.New("checksum failed after 3 attempts. This likely indicates either a bug in Spirit, or a manual modification to the _new table outside of Spirit. Please report @ github.com/block/spirit")
 		}
 		r.logger.Errorf("checksum failed, retrying %d/%d times", i+1, 3)
 	}
@@ -885,7 +940,7 @@ func (r *Runner) setCurrentState(s migrationState) {
 func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 	// Retrieve the binlog position first and under a mutex.
 	binlog := r.replClient.GetBinlogApplyPosition()
-	copierWatermark, err := r.copier.GetLowWatermark()
+	copierWatermark, err := r.copyChunker.GetLowWatermark()
 	if err != nil {
 		return err // it might not be ready, we can try again.
 	}
@@ -897,20 +952,20 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 		r.checkerLock.Lock()
 		defer r.checkerLock.Unlock()
 		if r.checker != nil {
-			checksumWatermark, err = r.checker.GetLowWatermark()
+			checksumWatermark, err = r.checksumChunker.GetLowWatermark()
 			if err != nil {
 				return err
 			}
 		}
 	}
-	copyRows := atomic.LoadUint64(&r.copier.CopyRowsCount)
-	logicalCopyRows := atomic.LoadUint64(&r.copier.CopyRowsLogicalCount)
+	copyRows, _, _ := r.copyChunker.Progress()
+
 	// Note: when we dump the lowWatermark to the log, we are exposing the PK values,
 	// when using the composite chunker are based on actual user-data.
 	// We believe this is OK but may change it in the future. Please do not
 	// add any other fields to this log line.
-	r.logger.Infof("checkpoint: low-watermark=%s log-file=%s log-pos=%d rows-copied=%d rows-copied-logical=%d", copierWatermark, binlog.Name, binlog.Pos, copyRows, logicalCopyRows)
-	return dbconn.Exec(ctx, r.db, "INSERT INTO %n.%n (copier_watermark, checksum_watermark, binlog_name, binlog_pos, rows_copied, rows_copied_logical, alter_statement) VALUES (%?, %?, %?, %?, %?, %?, %?)",
+	r.logger.Infof("checkpoint: low-watermark=%s log-file=%s log-pos=%d rows-copied=%d", copierWatermark, binlog.Name, binlog.Pos, copyRows)
+	return dbconn.Exec(ctx, r.db, "INSERT INTO %n.%n (copier_watermark, checksum_watermark, binlog_name, binlog_pos, rows_copied, alter_statement) VALUES (%?, %?, %?, %?, %?, %?)",
 		r.checkpointTable.SchemaName,
 		r.checkpointTable.TableName,
 		copierWatermark,
@@ -918,7 +973,6 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 		binlog.Name,
 		binlog.Pos,
 		copyRows,
-		logicalCopyRows,
 		r.stmt.Alter,
 	)
 }
@@ -989,14 +1043,11 @@ func (r *Runner) dumpStatus(ctx context.Context) {
 					r.db.Stats().InUse,
 				)
 			case stateChecksum:
-				// This could take a while if it's a large table. We just have to show approximate progress.
-				// This is a little bit harder for checksum because it doesn't have returned rows
-				// so we just show a "recent value" over the "maximum value".
+				// This could take a while if it's a large table.
 				r.checkerLock.Lock()
-				r.logger.Infof("migration status: state=%s checksum-progress=%s/%s binlog-deltas=%v total-time=%s checksum-time=%s conns-in-use=%d",
+				r.logger.Infof("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s conns-in-use=%d",
 					r.getCurrentState().String(),
-					r.checker.RecentValue(),
-					r.table.MaxValue(),
+					r.checker.GetProgress(),
 					r.replClient.GetDeltaLen(),
 					time.Since(r.startTime).Round(time.Second),
 					time.Since(r.checker.StartTime()).Round(time.Second),

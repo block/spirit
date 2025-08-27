@@ -107,6 +107,9 @@ func TestAlgorithmInplaceConsideredSafe(t *testing.T) {
 	assert.NoError(t, test("add partition (partition `p1` values less than (100))"))
 	assert.NoError(t, test("add partition partitions 4"))
 
+	assert.NoError(t, test("modify `a` varchar(100)"))
+	assert.NoError(t, test("change column `a` `a` varchar(100)"))
+
 	assert.Error(t, test("ADD COLUMN `a` INT"))
 	assert.Error(t, test("ADD index (a)"))
 	assert.Error(t, test("drop index `a`, add index `b` (`b`)"))

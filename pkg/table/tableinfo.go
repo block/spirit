@@ -27,7 +27,7 @@ var (
 type TableInfo struct {
 	sync.Mutex
 	db                          *sql.DB
-	EstimatedRows               uint64
+	EstimatedRows               uint64 // used by the composite chunker for Max
 	SchemaName                  string
 	TableName                   string
 	QuotedName                  string
@@ -60,15 +60,15 @@ func NewTableInfo(db *sql.DB, schema, table string) *TableInfo {
 // position of primary key columns (there might be more than one).
 // For minimal row image, you need to send the before image to extract the PK.
 // This is because in the after image, the PK might be nil.
-func (t *TableInfo) PrimaryKeyValues(row interface{}) ([]interface{}, error) {
-	var pkCols []interface{}
+func (t *TableInfo) PrimaryKeyValues(row any) ([]any, error) {
+	var pkCols []any
 	for _, pCol := range t.KeyColumns {
 		for i, col := range t.Columns {
 			if col == pCol {
-				if row.([]interface{})[i] == nil {
+				if row.([]any)[i] == nil {
 					return nil, errors.New("primary key column is NULL, possibly a bug sending after-image instead of before")
 				}
-				pkCols = append(pkCols, row.([]interface{})[i])
+				pkCols = append(pkCols, row.([]any)[i])
 			}
 		}
 	}

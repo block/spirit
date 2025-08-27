@@ -5,9 +5,9 @@ import (
 
 	"testing"
 
-	"github.com/cashapp/spirit/pkg/statement"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/sirupsen/logrus"
 
 	"github.com/stretchr/testify/assert"

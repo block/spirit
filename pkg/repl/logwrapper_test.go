@@ -14,53 +14,53 @@ type mockLogger struct {
 	messages []string
 }
 
-func (m *mockLogger) Debug(args ...interface{}) { m.messages = append(m.messages, fmt.Sprint(args...)) }
-func (m *mockLogger) Info(args ...interface{})  { m.messages = append(m.messages, fmt.Sprint(args...)) }
-func (m *mockLogger) Warn(args ...interface{})  { m.messages = append(m.messages, fmt.Sprint(args...)) }
-func (m *mockLogger) Error(args ...interface{}) { m.messages = append(m.messages, fmt.Sprint(args...)) }
-func (m *mockLogger) Fatal(args ...interface{}) { m.messages = append(m.messages, fmt.Sprint(args...)) }
-func (m *mockLogger) Debugf(format string, args ...interface{}) {
+func (m *mockLogger) Debug(args ...any) { m.messages = append(m.messages, fmt.Sprint(args...)) }
+func (m *mockLogger) Info(args ...any)  { m.messages = append(m.messages, fmt.Sprint(args...)) }
+func (m *mockLogger) Warn(args ...any)  { m.messages = append(m.messages, fmt.Sprint(args...)) }
+func (m *mockLogger) Error(args ...any) { m.messages = append(m.messages, fmt.Sprint(args...)) }
+func (m *mockLogger) Fatal(args ...any) { m.messages = append(m.messages, fmt.Sprint(args...)) }
+func (m *mockLogger) Debugf(format string, args ...any) {
 	m.messages = append(m.messages, fmt.Sprintf(format, args...))
 }
-func (m *mockLogger) Infof(format string, args ...interface{}) {
+func (m *mockLogger) Infof(format string, args ...any) {
 	m.messages = append(m.messages, fmt.Sprintf(format, args...))
 }
-func (m *mockLogger) Warnf(format string, args ...interface{}) {
+func (m *mockLogger) Warnf(format string, args ...any) {
 	m.messages = append(m.messages, fmt.Sprintf(format, args...))
 }
-func (m *mockLogger) Errorf(format string, args ...interface{}) {
+func (m *mockLogger) Errorf(format string, args ...any) {
 	m.messages = append(m.messages, fmt.Sprintf(format, args...))
 }
-func (m *mockLogger) Fatalf(format string, args ...interface{}) {
+func (m *mockLogger) Fatalf(format string, args ...any) {
 	m.messages = append(m.messages, fmt.Sprintf(format, args...))
 }
-func (m *mockLogger) Debugln(args ...interface{}) {
+func (m *mockLogger) Debugln(args ...any) {
 	m.messages = append(m.messages, fmt.Sprintln(args...))
 }
-func (m *mockLogger) Infoln(args ...interface{}) {
+func (m *mockLogger) Infoln(args ...any) {
 	m.messages = append(m.messages, fmt.Sprintln(args...))
 }
-func (m *mockLogger) Warnln(args ...interface{}) {
+func (m *mockLogger) Warnln(args ...any) {
 	m.messages = append(m.messages, fmt.Sprintln(args...))
 }
-func (m *mockLogger) Errorln(args ...interface{}) {
+func (m *mockLogger) Errorln(args ...any) {
 	m.messages = append(m.messages, fmt.Sprintln(args...))
 }
-func (m *mockLogger) Fatalln(args ...interface{}) {
+func (m *mockLogger) Fatalln(args ...any) {
 	m.messages = append(m.messages, fmt.Sprintln(args...))
 }
-func (m *mockLogger) Panic(args ...interface{}) { m.messages = append(m.messages, fmt.Sprint(args...)) }
-func (m *mockLogger) Panicf(format string, args ...interface{}) {
+func (m *mockLogger) Panic(args ...any) { m.messages = append(m.messages, fmt.Sprint(args...)) }
+func (m *mockLogger) Panicf(format string, args ...any) {
 	m.messages = append(m.messages, fmt.Sprintf(format, args...))
 }
-func (m *mockLogger) Panicln(args ...interface{}) {
+func (m *mockLogger) Panicln(args ...any) {
 	m.messages = append(m.messages, fmt.Sprintln(args...))
 }
-func (m *mockLogger) Print(args ...interface{}) { m.messages = append(m.messages, fmt.Sprint(args...)) }
-func (m *mockLogger) Printf(format string, args ...interface{}) {
+func (m *mockLogger) Print(args ...any) { m.messages = append(m.messages, fmt.Sprint(args...)) }
+func (m *mockLogger) Printf(format string, args ...any) {
 	m.messages = append(m.messages, fmt.Sprintf(format, args...))
 }
-func (m *mockLogger) Println(args ...interface{}) {
+func (m *mockLogger) Println(args ...any) {
 	m.messages = append(m.messages, fmt.Sprintln(args...))
 }
 
@@ -87,7 +87,7 @@ func TestLogWrapperComprehensive(t *testing.T) {
 	t.Run("basic logging methods", func(t *testing.T) {
 		testCases := []struct {
 			name     string
-			logFunc  func(...interface{})
+			logFunc  func(...any)
 			message  string
 			expected string
 		}{
@@ -109,15 +109,15 @@ func TestLogWrapperComprehensive(t *testing.T) {
 	t.Run("formatted logging methods", func(t *testing.T) {
 		testCases := []struct {
 			name     string
-			logFunc  func(string, ...interface{})
+			logFunc  func(string, ...any)
 			format   string
-			args     []interface{}
+			args     []any
 			expected string
 		}{
-			{"Debugf", logger.Debugf, "debug %s", []interface{}{"formatted"}, "debug formatted"},
-			{"Infof", logger.Infof, "info %s", []interface{}{"formatted"}, "info formatted"},
-			{"Warnf", logger.Warnf, "warn %s", []interface{}{"formatted"}, "warn formatted"},
-			{"Errorf", logger.Errorf, "error %s", []interface{}{"formatted"}, "error formatted"},
+			{"Debugf", logger.Debugf, "debug %s", []any{"formatted"}, "debug formatted"},
+			{"Infof", logger.Infof, "info %s", []any{"formatted"}, "info formatted"},
+			{"Warnf", logger.Warnf, "warn %s", []any{"formatted"}, "warn formatted"},
+			{"Errorf", logger.Errorf, "error %s", []any{"formatted"}, "error formatted"},
 		}
 
 		for _, tc := range testCases {
@@ -132,7 +132,7 @@ func TestLogWrapperComprehensive(t *testing.T) {
 	t.Run("line logging methods", func(t *testing.T) {
 		testCases := []struct {
 			name     string
-			logFunc  func(...interface{})
+			logFunc  func(...any)
 			message  string
 			expected string
 		}{
@@ -154,23 +154,23 @@ func TestLogWrapperComprehensive(t *testing.T) {
 	t.Run("print methods", func(t *testing.T) {
 		testCases := []struct {
 			name     string
-			logFunc  interface{}
-			args     []interface{}
+			logFunc  any
+			args     []any
 			format   string
 			expected string
 		}{
-			{"Print", logger.Print, []interface{}{"print message"}, "", "print message"},
-			{"Printf", logger.Printf, []interface{}{"formatted"}, "print %s", "print formatted"},
-			{"Println", logger.Println, []interface{}{"print line"}, "", "print line"},
+			{"Print", logger.Print, []any{"print message"}, "", "print message"},
+			{"Printf", logger.Printf, []any{"formatted"}, "print %s", "print formatted"},
+			{"Println", logger.Println, []any{"print line"}, "", "print line"},
 		}
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				mock.clear()
 				switch f := tc.logFunc.(type) {
-				case func(...interface{}):
+				case func(...any):
 					f(tc.args...)
-				case func(string, ...interface{}):
+				case func(string, ...any):
 					f(tc.format, tc.args...)
 				}
 				assert.True(t, mock.contains(tc.expected))

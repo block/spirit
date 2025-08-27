@@ -21,7 +21,7 @@ func settingsCheck(ctx context.Context, r Resources, logger loggers.Advanced) er
 	// TargetChunkTime must be in the range of 100ms-5s
 	// Note to future self: if you increase this, make sure you also extend
 	// the timeouts for locks in dbconn/dbconn.go, otherwise you will encounter problems.
-	// See: https://github.com/cashapp/spirit/issues/96 for an example.
+	// See: https://github.com/block/spirit/issues/96 for an example.
 	if r.TargetChunkTime < 100*time.Millisecond || r.TargetChunkTime > 5*time.Second {
 		return errors.New("--target-chunk-time must be in the range of 100ms-5s")
 	}

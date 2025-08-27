@@ -46,7 +46,7 @@ func scanToMap(rows *sql.Rows) (map[string]sql.NullString, error) {
 			return nil, nil
 		}
 	}
-	values := make([]interface{}, len(columns))
+	values := make([]any, len(columns))
 	for index := range values {
 		values[index] = new(sql.NullString)
 	}

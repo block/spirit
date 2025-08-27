@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/statement"
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
 	"github.com/siddontang/loggers"
 )
 
@@ -35,6 +35,7 @@ type Resources struct {
 	Threads              int
 	ReplicaMaxLag        time.Duration
 	SkipDropAfterCutover bool
+	ForceKill            bool
 	// The following resources are only used by the
 	// pre-run checks
 	Host     string

@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 )
@@ -33,15 +33,15 @@ func TestIntersectColumns(t *testing.T) {
 
 func TestHashAndUnhashKey(t *testing.T) {
 	// This func helps put composite keys in a map.
-	key := []interface{}{"1234", "ACDC", "12"}
+	key := []any{"1234", "ACDC", "12"}
 	hashed := HashKey(key)
 	assert.Equal(t, "1234-#-ACDC-#-12", hashed)
 	unhashed := UnhashKey(hashed)
-	// unhashed returns as a string, not the original interface{}
+	// unhashed returns as a string, not the original any
 	assert.Equal(t, "('1234','ACDC','12')", unhashed)
 
 	// This also works on single keys.
-	key = []interface{}{"1234"}
+	key = []any{"1234"}
 	hashed = HashKey(key)
 	assert.Equal(t, "1234", hashed)
 	unhashed = UnhashKey(hashed)

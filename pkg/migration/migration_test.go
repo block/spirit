@@ -12,7 +12,7 @@ import (
 
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/stretchr/testify/assert"
@@ -493,6 +493,19 @@ func TestUnparsableStatements(t *testing.T) {
 	err = migration.Run()
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "could not parse SQL statement")
+
+	//https://github.com/pingcap/tidb/pull/61498
+	migration = &Migration{
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: cfg.Passwd,
+		Database: cfg.DBName,
+		Threads:  1,
+		Checksum: true,
+		Table:    "t1parse",
+		Alter:    `ADD COLUMN src_col timestamp NULL DEFAULT NULL, add column new_col timestamp NULL DEFAULT(src_col)`}
+	err = migration.Run()
+	assert.NoError(t, err)
 }
 
 func TestCreateIndexIsRewritten(t *testing.T) {
@@ -543,7 +556,7 @@ func TestSchemaNameIncluded(t *testing.T) {
 // TestSecondaryEngineAttribute tests that we can add a secondary engine attribute
 // We can't quite test to the original bug report, because the vector type + index
 // may not be supported in the version of MySQL we are using:
-// https://github.com/cashapp/spirit/issues/405
+// https://github.com/block/spirit/issues/405
 func TestSecondaryEngineAttribute(t *testing.T) {
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1secondary, _t1secondary_new`)
 	tbl := `CREATE /*vt+ QUERY_TIMEOUT_MS=0 */ TABLE t1secondary (

@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/repl"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -50,13 +50,13 @@ func TestBasicChecksum(t *testing.T) {
 	defer feed.Close()
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 
-	checker, err := NewChecker(db, t1, t2, feed, NewCheckerDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+	checker, err := NewChecker(db, chunker, feed, NewCheckerDefaultConfig())
 	assert.NoError(t, err)
 
-	assert.Nil(t, checker.recentValue)
-	assert.Equal(t, "TBD", checker.RecentValue())
 	assert.NoError(t, checker.Run(t.Context()))
-	assert.Equal(t, "TBD", checker.RecentValue()) // still TBD because its a 1 and done chunker.
 }
 
 func TestBasicValidation(t *testing.T) {
@@ -89,13 +89,13 @@ func TestBasicValidation(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	_, err = NewChecker(db, nil, t2, feed, NewCheckerDefaultConfig())
-	assert.EqualError(t, err, "table and newTable must be non-nil")
-	_, err = NewChecker(db, t1, nil, feed, NewCheckerDefaultConfig())
-	assert.EqualError(t, err, "table and newTable must be non-nil")
-	_, err = NewChecker(db, t1, t2, feed, NewCheckerDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
 	assert.NoError(t, err)
-	_, err = NewChecker(db, t1, t2, nil, NewCheckerDefaultConfig()) // no feed
+
+	_, err = NewChecker(db, nil, feed, NewCheckerDefaultConfig())
+	assert.EqualError(t, err, "chunker must be non-nil")
+
+	_, err = NewChecker(db, chunker, nil, NewCheckerDefaultConfig()) // no feed
 	assert.EqualError(t, err, "feed must be non-nil")
 }
 
@@ -130,16 +130,20 @@ func TestFixCorrupt(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
+	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+
 	config := NewCheckerDefaultConfig()
 	config.FixDifferences = true
-	checker, err := NewChecker(db, t1, t2, feed, config)
+	checker, err := NewChecker(db, chunker, feed, config)
 	assert.NoError(t, err)
 	err = checker.Run(t.Context())
 	assert.NoError(t, err) // yes there is corruption, but it was fixed.
 	assert.Equal(t, uint64(1), checker.DifferencesFound())
 
 	// If we run the checker again, it will report zero differences.
-	checker2, err := NewChecker(db, t1, t2, feed, config)
+	checker2, err := NewChecker(db, chunker, feed, config)
 	assert.NoError(t, err)
 	err = checker2.Run(t.Context())
 	assert.NoError(t, err)
@@ -177,7 +181,11 @@ func TestCorruptChecksum(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	checker, err := NewChecker(db, t1, t2, feed, NewCheckerDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+
+	checker, err := NewChecker(db, chunker, feed, NewCheckerDefaultConfig())
 	assert.NoError(t, err)
 	err = checker.Run(t.Context())
 	assert.ErrorContains(t, err, "checksum mismatch")
@@ -213,13 +221,17 @@ func TestBoundaryCases(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	checker, err := NewChecker(db, t1, t2, feed, NewCheckerDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+
+	checker, err := NewChecker(db, chunker, feed, NewCheckerDefaultConfig())
 	assert.NoError(t, err)
 	assert.Error(t, checker.Run(t.Context()))
 
 	// UPDATE t1 to also be NULL
 	testutils.RunSQL(t, "UPDATE checkert1 SET c = NULL")
-	checker, err = NewChecker(db, t1, t2, feed, NewCheckerDefaultConfig())
+	checker, err = NewChecker(db, chunker, feed, NewCheckerDefaultConfig())
 	assert.NoError(t, err)
 	assert.NoError(t, checker.Run(t.Context()))
 }
@@ -281,7 +293,11 @@ func TestChangeDataTypeDatetime(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	checker, err := NewChecker(db, t1, t2, feed, NewCheckerDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+
+	checker, err := NewChecker(db, chunker, feed, NewCheckerDefaultConfig())
 	assert.NoError(t, err)
 	assert.NoError(t, checker.Run(t.Context())) // fails
 }
@@ -290,7 +306,6 @@ func TestFromWatermark(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS tfromwatermark, _tfromwatermark_new, _tfromwatermark_chkpnt")
 	testutils.RunSQL(t, "CREATE TABLE tfromwatermark (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
 	testutils.RunSQL(t, "CREATE TABLE _tfromwatermark_new (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "CREATE TABLE _tfromwatermark_chkpnt (a INT)") // for binlog advancement
 	testutils.RunSQL(t, "INSERT INTO tfromwatermark VALUES (1, 2, 3)")
 	testutils.RunSQL(t, "INSERT INTO _tfromwatermark_new VALUES (1, 2, 3)")
 
@@ -316,9 +331,13 @@ func TestFromWatermark(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
+	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+
 	config := NewCheckerDefaultConfig()
 	config.Watermark = "{\"Key\":[\"a\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"2\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"3\"],\"Inclusive\":false}}"
-	checker, err := NewChecker(db, t1, t2, feed, config)
+	checker, err := NewChecker(db, chunker, feed, config)
 	assert.NoError(t, err)
 	assert.NoError(t, checker.Run(t.Context()))
 }

@@ -3,7 +3,7 @@ package repl
 import (
 	"strings"
 
-	"github.com/cashapp/spirit/pkg/utils"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"

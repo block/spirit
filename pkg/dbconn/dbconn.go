@@ -9,7 +9,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -31,6 +31,7 @@ type DBConfig struct {
 	MaxOpenConnections       int
 	RangeOptimizerMaxMemSize int64
 	InterpolateParams        bool
+	ForceKill                bool // If true, kill locking transactions to acquire metadata locks
 }
 
 func NewDBConfig() *DBConfig {
@@ -41,6 +42,7 @@ func NewDBConfig() *DBConfig {
 		MaxOpenConnections:       32,    // default is high for historical tests. It's overwritten by the user threads count + 2 for headroom.
 		RangeOptimizerMaxMemSize: 0,     // default is 8M, we set to unlimited. Not user configurable (may reconsider in the future).
 		InterpolateParams:        false, // default is false
+		ForceKill:                false, // default is false
 	}
 }
 
@@ -126,7 +128,7 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, ignoreDupKeyWarnings 
 						// "Memory capacity of 8388608 bytes for 'range_optimizer_max_mem_size' exceeded.
 						// Range optimization was not done for this query."
 						// i.e. the query can still execute, but it won't be efficient. Prior to
-						// https://github.com/cashapp/spirit/issues/239 we allowed this warning
+						// https://github.com/block/spirit/issues/239 we allowed this warning
 						// to be ignored. *However* if range optimization is disabled the query is going to
 						// tablescan, so it's better to just bail out and present a useful error message.
 						isFatal = true
@@ -180,7 +182,7 @@ func backoff(i int) {
 // This makes it a little bit easier to use in error handling.
 // It accepts args which are escaped client side using the TiDB escape library.
 // i.e. %n is an identifier, %? is automatic type conversion on a variable.
-func Exec(ctx context.Context, db *sql.DB, stmt string, args ...interface{}) error {
+func Exec(ctx context.Context, db *sql.DB, stmt string, args ...any) error {
 	stmt, err := sqlescape.EscapeSQL(stmt, args...)
 	if err != nil {
 		return err

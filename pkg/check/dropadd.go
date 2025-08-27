@@ -15,7 +15,7 @@ func init() {
 }
 
 // dropAddCheck checks for a DROP and then ADD in the same statement.
-// This is unsupported per https://github.com/cashapp/spirit/issues/102
+// This is unsupported per https://github.com/block/spirit/issues/102
 // The actual implementation is a bit simpler:
 //   - We only allow a column name to be mentioned once across all
 //     DROP and ADD parts of the alter statement.

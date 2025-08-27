@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/table"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,10 +63,10 @@ func TestSubscriptionDeltaMap(t *testing.T) {
 	assert.Equal(t, 0, sub.getDeltaLen())
 
 	// Test key changes
-	sub.keyHasChanged([]interface{}{1}, false) // Insert/Replace
+	sub.keyHasChanged([]any{1}, false) // Insert/Replace
 	assert.Equal(t, 1, sub.getDeltaLen())
 
-	sub.keyHasChanged([]interface{}{2}, true) // Delete
+	sub.keyHasChanged([]any{2}, true) // Delete
 	assert.Equal(t, 2, sub.getDeltaLen())
 
 	// Test statement generation
@@ -105,10 +105,10 @@ func TestSubscriptionDeltaQueue(t *testing.T) {
 	assert.Equal(t, 0, sub.getDeltaLen())
 
 	// Test key changes with queue
-	sub.keyHasChanged([]interface{}{1}, false) // Insert/Replace
+	sub.keyHasChanged([]any{1}, false) // Insert/Replace
 	assert.Equal(t, 1, sub.getDeltaLen())
 
-	sub.keyHasChanged([]interface{}{2}, true) // Delete
+	sub.keyHasChanged([]any{2}, true) // Delete
 	assert.Equal(t, 2, sub.getDeltaLen())
 
 	// Verify queue order is maintained
@@ -139,12 +139,12 @@ func TestKeyAboveWatermark(t *testing.T) {
 	}
 
 	// Test with watermark optimization disabled
-	sub.keyHasChanged([]interface{}{1}, false)
+	sub.keyHasChanged([]any{1}, false)
 	assert.Equal(t, 1, sub.getDeltaLen())
 
 	// Setup watermark callback
 	watermark := 5
-	sub.keyAboveCopierCallback = func(key interface{}) bool {
+	sub.keyAboveCopierCallback = func(key any) bool {
 		return key.(int) > watermark
 	}
 
@@ -152,11 +152,11 @@ func TestKeyAboveWatermark(t *testing.T) {
 	sub.setKeyAboveWatermarkOptimization(true)
 
 	// Test key below watermark
-	sub.keyHasChanged([]interface{}{3}, false)
+	sub.keyHasChanged([]any{3}, false)
 	assert.Equal(t, 2, sub.getDeltaLen())
 
 	// Test key above watermark
-	sub.keyHasChanged([]interface{}{10}, false)
+	sub.keyHasChanged([]any{10}, false)
 	assert.Equal(t, 2, sub.getDeltaLen()) // Should not increase as key is above watermark
 }
 
@@ -187,8 +187,8 @@ func TestFlushWithLock(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO subscription_test (id, name) VALUES (1, 'test1'), (2, 'test2')`)
 
 	// Add some changes
-	sub.keyHasChanged([]interface{}{1}, false)
-	sub.keyHasChanged([]interface{}{2}, true)
+	sub.keyHasChanged([]any{1}, false)
+	sub.keyHasChanged([]any{2}, true)
 
 	// Create a table lock
 	lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), logrus.New())
@@ -235,10 +235,10 @@ func TestFlushWithoutLock(t *testing.T) {
 		(1, 'test1'), (2, 'test2'), (3, 'test3'), (4, 'test4')`)
 
 	// Add multiple changes to test batch processing
-	sub.keyHasChanged([]interface{}{1}, false)
-	sub.keyHasChanged([]interface{}{2}, false)
-	sub.keyHasChanged([]interface{}{3}, true)
-	sub.keyHasChanged([]interface{}{4}, true)
+	sub.keyHasChanged([]any{1}, false)
+	sub.keyHasChanged([]any{2}, false)
+	sub.keyHasChanged([]any{3}, true)
+	sub.keyHasChanged([]any{4}, true)
 
 	// Test flush without lock
 	err = sub.flush(t.Context(), false, nil)
@@ -274,14 +274,14 @@ func TestConcurrentKeyChanges(t *testing.T) {
 	done := make(chan bool)
 	go func() {
 		for i := range 100 {
-			sub.keyHasChanged([]interface{}{i}, false)
+			sub.keyHasChanged([]any{i}, false)
 		}
 		done <- true
 	}()
 
 	go func() {
 		for i := 100; i < 200; i++ {
-			sub.keyHasChanged([]interface{}{i}, true)
+			sub.keyHasChanged([]any{i}, true)
 		}
 		done <- true
 	}()
@@ -314,10 +314,10 @@ func TestKeyChangedOverwrite(t *testing.T) {
 	}
 
 	// Test overwriting the same key multiple times
-	sub.keyHasChanged([]interface{}{1}, false) // Insert
-	sub.keyHasChanged([]interface{}{1}, true)  // Delete
-	sub.keyHasChanged([]interface{}{1}, false) // Insert again
-	assert.Equal(t, 1, sub.getDeltaLen())      // Should only count once in the map
+	sub.keyHasChanged([]any{1}, false)    // Insert
+	sub.keyHasChanged([]any{1}, true)     // Delete
+	sub.keyHasChanged([]any{1}, false)    // Insert again
+	assert.Equal(t, 1, sub.getDeltaLen()) // Should only count once in the map
 
 	// Test with deltaQueue
 	subQueue := &subscription{
@@ -330,9 +330,9 @@ func TestKeyChangedOverwrite(t *testing.T) {
 	}
 
 	// Same operations with queue should maintain history
-	subQueue.keyHasChanged([]interface{}{1}, false)
-	subQueue.keyHasChanged([]interface{}{1}, true)
-	subQueue.keyHasChanged([]interface{}{1}, false)
+	subQueue.keyHasChanged([]any{1}, false)
+	subQueue.keyHasChanged([]any{1}, true)
+	subQueue.keyHasChanged([]any{1}, false)
 	assert.Equal(t, 3, subQueue.getDeltaLen()) // Queue maintains all changes
 }
 
@@ -356,16 +356,16 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 	}
 
 	// Test with string keys
-	sub.keyHasChanged([]interface{}{"key1"}, false)
+	sub.keyHasChanged([]any{"key1"}, false)
 	assert.Equal(t, 1, sub.getDeltaLen())
 
 	// Test with composite keys
-	sub.keyHasChanged([]interface{}{"prefix", 123}, false)
+	sub.keyHasChanged([]any{"prefix", 123}, false)
 	assert.Equal(t, 2, sub.getDeltaLen())
 
 	// Test watermark edge cases
 	watermark := 5
-	sub.keyAboveCopierCallback = func(key interface{}) bool {
+	sub.keyAboveCopierCallback = func(key any) bool {
 		// Handle different types of keys
 		switch v := key.(type) {
 		case int:
@@ -379,15 +379,15 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 	sub.setKeyAboveWatermarkOptimization(true)
 
 	// Test exactly at watermark
-	sub.keyHasChanged([]interface{}{5}, false)
+	sub.keyHasChanged([]any{5}, false)
 	assert.Equal(t, 3, sub.getDeltaLen())
 
 	// Test one above watermark
-	sub.keyHasChanged([]interface{}{6}, false)
+	sub.keyHasChanged([]any{6}, false)
 	assert.Equal(t, 3, sub.getDeltaLen()) // Should not increase as it's above watermark
 
 	// Test with string key when watermark is enabled
-	sub.keyHasChanged([]interface{}{"key2"}, false)
+	sub.keyHasChanged([]any{"key2"}, false)
 	assert.Equal(t, 4, sub.getDeltaLen()) // Should still process string keys
 }
 
@@ -411,15 +411,15 @@ func TestKeyChangedNilAndEmpty(t *testing.T) {
 	}
 
 	// Test with empty string key
-	sub.keyHasChanged([]interface{}{""}, false)
+	sub.keyHasChanged([]any{""}, false)
 	assert.Equal(t, 1, sub.getDeltaLen())
 
 	// Test with empty array as part of composite key
-	sub.keyHasChanged([]interface{}{"prefix", []string{}}, false)
+	sub.keyHasChanged([]any{"prefix", []string{}}, false)
 	assert.Equal(t, 2, sub.getDeltaLen())
 
 	// Test with zero values
-	sub.keyHasChanged([]interface{}{0}, false)
+	sub.keyHasChanged([]any{0}, false)
 	assert.Equal(t, 3, sub.getDeltaLen())
 }
 
@@ -480,11 +480,11 @@ func TestFlushDeltaQueue(t *testing.T) {
 				(1, 'test1'), (2, 'test2'), (3, 'test3'), (4, 'test4'), (5, 'test5')`)
 
 		// Create a sequence: REPLACE<1,2>, DELETE<3>, REPLACE<4,5>
-		sub.keyHasChanged([]interface{}{1}, false) // Replace
-		sub.keyHasChanged([]interface{}{2}, false) // Replace
-		sub.keyHasChanged([]interface{}{3}, true)  // Delete
-		sub.keyHasChanged([]interface{}{4}, false) // Replace
-		sub.keyHasChanged([]interface{}{5}, false) // Replace
+		sub.keyHasChanged([]any{1}, false) // Replace
+		sub.keyHasChanged([]any{2}, false) // Replace
+		sub.keyHasChanged([]any{3}, true)  // Delete
+		sub.keyHasChanged([]any{4}, false) // Replace
+		sub.keyHasChanged([]any{5}, false) // Replace
 
 		// Flush without lock
 		// calls flushDeltaQueue
@@ -540,7 +540,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 
 		// Add 5 replace operations
 		for i := 1; i <= 5; i++ {
-			sub.keyHasChanged([]interface{}{i}, false)
+			sub.keyHasChanged([]any{i}, false)
 		}
 
 		// Flush - should create multiple statements due to batch size
@@ -579,8 +579,8 @@ func TestFlushDeltaQueue(t *testing.T) {
 				(1, 'test1'), (2, 'test2'), (3, 'test3'), (4, 'test4'), (5, 'test5')`)
 
 		// Add some changes
-		sub.keyHasChanged([]interface{}{1}, false)
-		sub.keyHasChanged([]interface{}{2}, true)
+		sub.keyHasChanged([]any{1}, false)
+		sub.keyHasChanged([]any{2}, true)
 
 		// Create a table lock
 		lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), logrus.New())
@@ -627,7 +627,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 		done := make(chan bool)
 		go func() {
 			for i := 1; i <= 100; i++ {
-				sub.keyHasChanged([]interface{}{i}, false)
+				sub.keyHasChanged([]any{i}, false)
 				time.Sleep(time.Millisecond) // Small delay to ensure interleaving
 			}
 			done <- true
@@ -695,7 +695,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 		}
 
 		for _, op := range operations {
-			sub.keyHasChanged([]interface{}{op.id}, op.isDelete)
+			sub.keyHasChanged([]any{op.id}, op.isDelete)
 		}
 
 		// Flush all changes

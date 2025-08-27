@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cashapp/spirit/pkg/dbconn/sqlescape"
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/table"
 )
 
 const (
@@ -15,7 +15,7 @@ const (
 
 // HashKey is used to convert a composite key into a string
 // so that it can be placed in a map.
-func HashKey(key []interface{}) string {
+func HashKey(key []any) string {
 	var pk []string
 	for _, v := range key {
 		pk = append(pk, fmt.Sprintf("%v", v))

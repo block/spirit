@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/cashapp/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
 type datumTp int
@@ -22,7 +22,7 @@ const (
 
 // Datum could be a binary string, uint64 or int64.
 type Datum struct {
-	Val interface{}
+	Val any
 	Tp  datumTp // signed, unsigned, binary
 }
 
@@ -38,7 +38,7 @@ func mySQLTypeToDatumTp(mysqlTp string) datumTp {
 	return unknownType
 }
 
-func NewDatum(val interface{}, tp datumTp) Datum {
+func NewDatum(val any, tp datumTp) Datum {
 	var err error
 	switch tp { //nolint:exhaustive
 	case signedType:
@@ -76,7 +76,7 @@ func NewDatum(val interface{}, tp datumTp) Datum {
 	}
 }
 
-func datumValFromString(val string, tp datumTp) (interface{}, error) {
+func datumValFromString(val string, tp datumTp) (any, error) {
 	switch tp { //nolint:exhaustive
 	case signedType:
 		i, err := strconv.ParseInt(val, 10, 64)

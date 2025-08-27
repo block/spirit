@@ -7,15 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cashapp/spirit/pkg/dbconn"
-	"github.com/cashapp/spirit/pkg/row"
-	"github.com/cashapp/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/row"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/goleak"
 
-	"github.com/cashapp/spirit/pkg/table"
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -93,15 +93,16 @@ func TestReplClientComplex(t *testing.T) {
 
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
-	copier, err := row.NewCopier(db, t1, t2, row.NewCopierDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+	copier, err := row.NewCopier(db, chunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
 	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 	client.SetKeyAboveWatermarkOptimization(true)
-
-	assert.NoError(t, copier.Open4Test()) // need to manually open because we are not calling Run()
 
 	// Insert into t1, but because there is no read yet, the key is above the watermark
 	testutils.RunSQL(t, "DELETE FROM replcomplext1 WHERE a BETWEEN 10 and 500")
@@ -293,14 +294,15 @@ func TestReplClientQueue(t *testing.T) {
 
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
-	copier, err := row.NewCopier(db, t1, t2, row.NewCopierDefaultConfig())
+	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+	copier, err := row.NewCopier(db, chunker, row.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
 	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
-
-	assert.NoError(t, copier.Open4Test()) // need to manually open because we are not calling Run()
 
 	// Delete from the table, because there is no keyabove watermark
 	// optimization these deletes will be queued immediately.
@@ -574,7 +576,7 @@ func TestAllChangesFlushed(t *testing.T) {
 	assert.True(t, client.AllChangesFlushed(), "Should be flushed with empty subscription")
 
 	// Test 3: Add changes and verify not flushed
-	sub.keyHasChanged([]interface{}{1}, false)
+	sub.keyHasChanged([]any{1}, false)
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with pending changes")
 
 	// Test 4: Test with buffered position ahead
@@ -591,7 +593,7 @@ func TestAllChangesFlushed(t *testing.T) {
 		deltaQueue: nil,
 	}
 	client.subscriptions["test2"] = sub2
-	sub2.keyHasChanged([]interface{}{2}, false)
+	sub2.keyHasChanged([]any{2}, false)
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with changes in any subscription")
 
 	// Test 6: Clear changes but keep positions different - should still be considered flushed
@@ -616,6 +618,6 @@ func TestAllChangesFlushed(t *testing.T) {
 	client.subscriptions["test3"] = subQueue
 	assert.True(t, client.AllChangesFlushed(), "Should be flushed with empty queue")
 
-	subQueue.keyHasChanged([]interface{}{3}, false)
+	subQueue.keyHasChanged([]any{3}, false)
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with items in queue")
 }

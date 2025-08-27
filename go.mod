@@ -1,4 +1,4 @@
-module github.com/cashapp/spirit
+module github.com/block/spirit
 
 go 1.24.0
 
@@ -7,8 +7,8 @@ require (
 	github.com/go-ini/ini v1.67.0
 	github.com/go-mysql-org/go-mysql v1.9.1
 	github.com/go-sql-driver/mysql v1.7.1
-	github.com/pingcap/errors v0.11.5-0.20240311024730-e056997136bb
-	github.com/pingcap/tidb/pkg/parser v0.0.0-20250501143621-a50a2323f4ba
+	github.com/pingcap/errors v0.11.5-0.20250523034308-74f78ae071ee
+	github.com/pingcap/tidb/pkg/parser v0.0.0-20250811102254-4230cf349b01
 	github.com/siddontang/go-log v0.0.0-20190221022429-1e957dd83bed
 	github.com/siddontang/loggers v1.0.3
 	github.com/sirupsen/logrus v1.9.3
