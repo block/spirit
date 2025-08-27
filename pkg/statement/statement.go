@@ -27,95 +27,108 @@ var (
 	ErrNotAlterTable         = errors.New("not an ALTER TABLE statement")
 )
 
-func New(statement string) (*AbstractStatement, error) {
+func New(statement string) ([]*AbstractStatement, error) {
 	p := parser.New()
 	stmtNodes, _, err := p.Parse(statement, "", "")
 	if err != nil {
 		return nil, err
 	}
-	if len(stmtNodes) != 1 {
-		return nil, errors.New("only one statement may be specified at once")
-	}
-	switch stmtNodes[0].(type) {
-	case *ast.AlterTableStmt:
-		// type assert stmtNodes[0] as an AlterTableStmt and then
-		// extract the table and alter from it.
-		alterStmt := stmtNodes[0].(*ast.AlterTableStmt)
-		// if the schema name is included it could be different from the --database
-		// specified, which causes all sorts of problems. The easiest way to handle this
-		// it just to not permit it.
-		var sb strings.Builder
-		sb.Reset()
-		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-		if err = alterStmt.Restore(rCtx); err != nil {
-			return nil, fmt.Errorf("could not restore alter clause statement: %s", err)
-		}
-		normalizedStmt := sb.String()
-		trimLen := len(alterStmt.Table.Name.String()) + 15 // len ALTER TABLE + quotes
-		if len(alterStmt.Table.Schema.String()) > 0 {
-			trimLen += len(alterStmt.Table.Schema.String()) + 3 // len schema + quotes and dot.
-		}
-		return &AbstractStatement{
-			Schema:    alterStmt.Table.Schema.String(),
-			Table:     alterStmt.Table.Name.String(),
-			Alter:     normalizedStmt[trimLen:],
-			Statement: statement,
-			StmtNode:  &stmtNodes[0],
-		}, nil
-	case *ast.CreateIndexStmt:
-		// Need to rewrite to a corresponding ALTER TABLE statement
-		return convertCreateIndexToAlterTable(stmtNodes[0])
-	// returning an empty alter means we are allowed to run it
-	// but it's not a spirit migration. But the table should be specified.
-	case *ast.CreateTableStmt:
-		stmt := stmtNodes[0].(*ast.CreateTableStmt)
-		return &AbstractStatement{
-			Schema:    stmt.Table.Schema.String(),
-			Table:     stmt.Table.Name.String(),
-			Statement: statement,
-			StmtNode:  &stmtNodes[0],
-		}, err
-	case *ast.DropTableStmt:
-		stmt := stmtNodes[0].(*ast.DropTableStmt)
-		distinctSchemas := make(map[string]struct{})
-		for _, table := range stmt.Tables {
-			distinctSchemas[table.Schema.String()] = struct{}{}
-		}
-		if len(distinctSchemas) > 1 {
-			return nil, errors.New("statement attempts to drop tables from multiple schemas")
-		}
-		return &AbstractStatement{
-			Schema:    stmt.Tables[0].Schema.String(),
-			Table:     stmt.Tables[0].Name.String(), // TODO: this is just used in log lines, but there could be more than one!
-			Statement: statement,
-			StmtNode:  &stmtNodes[0],
-		}, err
-	case *ast.RenameTableStmt:
-		stmt := stmtNodes[0].(*ast.RenameTableStmt)
-		distinctSchemas := make(map[string]struct{})
-		for _, clause := range stmt.TableToTables {
-			if clause.OldTable.Schema.String() != clause.NewTable.Schema.String() {
-				return nil, errors.New("statement attempts to move table between schemas")
+	stmts := make([]*AbstractStatement, 0, len(stmtNodes))
+	var mustBeOnlyStatement bool
+	for i, node := range stmtNodes {
+		switch node := node.(type) {
+		case *ast.AlterTableStmt:
+			// type assert node as an AlterTableStmt and then
+			// extract the table and alter from it.
+			alterStmt := node
+			// if the schema name is included it could be different from the --database
+			// specified, which causes all sorts of problems. The easiest way to handle this
+			// it just to not permit it.
+			var sb strings.Builder
+			sb.Reset()
+			rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
+			if err = alterStmt.Restore(rCtx); err != nil {
+				return nil, fmt.Errorf("could not restore alter clause statement: %s", err)
 			}
-			distinctSchemas[clause.OldTable.Schema.String()] = struct{}{}
+			normalizedStmt := sb.String()
+			trimLen := len(alterStmt.Table.Name.String()) + 15 // len ALTER TABLE + quotes
+			if len(alterStmt.Table.Schema.String()) > 0 {
+				trimLen += len(alterStmt.Table.Schema.String()) + 3 // len schema + quotes and dot.
+			}
+			stmts = append(stmts, &AbstractStatement{
+				Schema:    alterStmt.Table.Schema.String(),
+				Table:     alterStmt.Table.Name.String(),
+				Alter:     normalizedStmt[trimLen:],
+				Statement: statement,
+				StmtNode:  &stmtNodes[i],
+			})
+		case *ast.CreateIndexStmt:
+			// Need to rewrite to a corresponding ALTER TABLE statement
+			stmt, err := convertCreateIndexToAlterTable(node)
+			if err != nil {
+				return nil, err
+			}
+			stmts = append(stmts, stmt)
+		// returning an empty alter means we are allowed to run it
+		// but it's not a spirit migration. But the table should be specified.
+		case *ast.CreateTableStmt:
+			mustBeOnlyStatement = true
+			stmts = append(stmts, &AbstractStatement{
+				Schema:    node.Table.Schema.String(),
+				Table:     node.Table.Name.String(),
+				Statement: statement,
+				StmtNode:  &stmtNodes[i],
+			})
+		case *ast.DropTableStmt:
+			mustBeOnlyStatement = true
+			distinctSchemas := make(map[string]struct{})
+			for _, table := range node.Tables {
+				distinctSchemas[table.Schema.String()] = struct{}{}
+			}
+			if len(distinctSchemas) > 1 {
+				return nil, errors.New("statement attempts to drop tables from multiple schemas")
+			}
+			stmts = append(stmts, &AbstractStatement{
+				Schema:    node.Tables[0].Schema.String(),
+				Table:     node.Tables[0].Name.String(),
+				Statement: statement,
+				StmtNode:  &stmtNodes[i],
+			})
+		case *ast.RenameTableStmt:
+			mustBeOnlyStatement = true
+			stmt := node
+			distinctSchemas := make(map[string]struct{})
+			for _, clause := range stmt.TableToTables {
+				if clause.OldTable.Schema.String() != clause.NewTable.Schema.String() {
+					return nil, errors.New("statement attempts to move table between schemas")
+				}
+				distinctSchemas[clause.OldTable.Schema.String()] = struct{}{}
+			}
+			if len(distinctSchemas) > 1 {
+				return nil, errors.New("statement attempts to rename tables in multiple schemas")
+			}
+			stmts = append(stmts, &AbstractStatement{
+				Schema:    stmt.TableToTables[0].OldTable.Schema.String(),
+				Table:     stmt.TableToTables[0].OldTable.Name.String(),
+				Statement: statement,
+				StmtNode:  &stmtNodes[i],
+			})
 		}
-		if len(distinctSchemas) > 1 {
-			return nil, errors.New("statement attempts to rename tables in multiple schemas")
-		}
-		return &AbstractStatement{
-			Schema:    stmt.TableToTables[0].OldTable.Schema.String(),
-			Table:     stmt.TableToTables[0].OldTable.Name.String(), // TODO: this is just used in log lines, but there could be more than one!
-			Statement: statement,
-			StmtNode:  &stmtNodes[0],
-		}, err
 	}
-	// default:
-	return nil, ErrNotSupportedStatement
+
+	if len(stmts) > 1 && mustBeOnlyStatement {
+		return nil, errors.New("statement must be executed alone")
+	}
+	if len(stmts) < 1 {
+		return nil, errors.New("could not find any compatible statements to execute")
+	}
+
+	return stmts, nil
 }
 
 // MustNew is like New but panics if the statement cannot be parsed.
 // It is used by tests.
-func MustNew(statement string) *AbstractStatement {
+func MustNew(statement string) []*AbstractStatement {
 	stmt, err := New(statement)
 	if err != nil {
 		panic(err)

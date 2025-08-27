@@ -57,7 +57,14 @@ func TestCutOver(t *testing.T) {
 	// the feed must be started.
 	assert.NoError(t, feed.Run(t.Context()))
 
-	cutover, err := NewCutOver(db, t1, t1new, t1old, feed, dbconn.NewDBConfig(), logger)
+	cutoverConfig := []*cutoverConfig{
+		{
+			table:        t1,
+			newTable:     t1new,
+			oldTableName: t1old,
+		},
+	}
+	cutover, err := NewCutOver(db, cutoverConfig, feed, dbconn.NewDBConfig(), logger)
 	assert.NoError(t, err)
 
 	err = cutover.Run(t.Context())
@@ -122,7 +129,14 @@ func TestMDLLockFails(t *testing.T) {
 	// the feed must be started.
 	assert.NoError(t, feed.Run(t.Context()))
 
-	cutover, err := NewCutOver(db, t1, t1new, t1old, feed, config, logger)
+	cutoverConfig := []*cutoverConfig{
+		{
+			table:        t1,
+			newTable:     t1new,
+			oldTableName: t1old,
+		},
+	}
+	cutover, err := NewCutOver(db, cutoverConfig, feed, config, logger)
 	assert.NoError(t, err)
 
 	// Before we cutover, we READ LOCK the table.
@@ -160,7 +174,7 @@ func TestInvalidOptions(t *testing.T) {
 	)`
 	testutils.RunSQL(t, tbl)
 	// Invalid options
-	_, err = NewCutOver(db, nil, nil, "", nil, dbconn.NewDBConfig(), logger)
+	_, err = NewCutOver(db, []*cutoverConfig{{}}, nil, dbconn.NewDBConfig(), logger)
 	assert.Error(t, err)
 	t1 := table.NewTableInfo(db, "test", "invalid_t1")
 	assert.NoError(t, t1.SetInfo(t.Context())) // required to extract PK.
@@ -175,8 +189,17 @@ func TestInvalidOptions(t *testing.T) {
 		ServerID:        repl.NewServerID(),
 	})
 	assert.NoError(t, feed.AddSubscription(t1, t1new, nil))
-	_, err = NewCutOver(db, nil, t1new, t1old, feed, dbconn.NewDBConfig(), logger)
+
+	_, err = NewCutOver(db, []*cutoverConfig{{
+		table:        nil,
+		newTable:     t1new,
+		oldTableName: t1old,
+	}}, feed, dbconn.NewDBConfig(), logger)
 	assert.Error(t, err)
-	_, err = NewCutOver(db, nil, t1new, "", feed, dbconn.NewDBConfig(), logger)
+	_, err = NewCutOver(db, []*cutoverConfig{{
+		table:        nil,
+		newTable:     t1new,
+		oldTableName: "",
+	}}, feed, dbconn.NewDBConfig(), logger)
 	assert.Error(t, err)
 }

@@ -15,40 +15,45 @@ func TestMain(m *testing.M) {
 func TestExtractFromStatement(t *testing.T) {
 	abstractStmt, err := New("ALTER TABLE t1 ADD INDEX (something)")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Equal(t, "ADD INDEX(`something`)", abstractStmt.Alter)
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Equal(t, "ADD INDEX(`something`)", abstractStmt[0].Alter)
 
 	abstractStmt, err = New("ALTER TABLE test.t1 ADD INDEX (something)")
 	assert.NoError(t, err)
-	assert.Equal(t, "test", abstractStmt.Schema)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Equal(t, "ADD INDEX(`something`)", abstractStmt.Alter)
+	assert.Equal(t, "test", abstractStmt[0].Schema)
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Equal(t, "ADD INDEX(`something`)", abstractStmt[0].Alter)
 
 	abstractStmt, err = New("ALTER TABLE t1aaaa ADD COLUMN newcol int")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1aaaa", abstractStmt.Table)
-	assert.Equal(t, "ADD COLUMN `newcol` INT", abstractStmt.Alter)
-	assert.True(t, abstractStmt.IsAlterTable())
+	assert.Equal(t, "t1aaaa", abstractStmt[0].Table)
+	assert.Equal(t, "ADD COLUMN `newcol` INT", abstractStmt[0].Alter)
+	assert.True(t, abstractStmt[0].IsAlterTable())
 
 	abstractStmt, err = New("ALTER TABLE t1 DROP COLUMN foo")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Equal(t, "DROP COLUMN `foo`", abstractStmt.Alter)
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Equal(t, "DROP COLUMN `foo`", abstractStmt[0].Alter)
 
 	abstractStmt, err = New("CREATE TABLE t1 (a int)")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Empty(t, abstractStmt.Alter)
-	assert.False(t, abstractStmt.IsAlterTable())
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Empty(t, abstractStmt[0].Alter)
+	assert.False(t, abstractStmt[0].IsAlterTable())
 
 	// Try and extract multiple statements.
+	// This works
 	_, err = New("ALTER TABLE t1 ADD INDEX (something); ALTER TABLE t2 ADD INDEX (something)")
+	assert.NoError(t, err)
+
+	// This doesn't though:
+	_, err = New("CREATE TABLE tnn (a int); ALTER TABLE t2 ADD INDEX (something)")
 	assert.Error(t, err)
 
 	// Include the schema name.
 	abstractStmt, err = New("ALTER TABLE test.t1 ADD INDEX (something)")
 	assert.NoError(t, err)
-	assert.Equal(t, "test", abstractStmt.Schema)
+	assert.Equal(t, "test", abstractStmt[0].Schema)
 
 	// Try and parse an invalid statement.
 	_, err = New("ALTER TABLE t1 yes")
@@ -57,27 +62,26 @@ func TestExtractFromStatement(t *testing.T) {
 	// Test create index is rewritten.
 	abstractStmt, err = New("CREATE INDEX idx ON t1 (a)")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Equal(t, "ADD INDEX idx (a)", abstractStmt.Alter)
-	assert.Equal(t, "/* rewritten from CREATE INDEX */ ALTER TABLE `t1` ADD INDEX idx (a)", abstractStmt.Statement)
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Equal(t, "ADD INDEX idx (a)", abstractStmt[0].Alter)
+	assert.Equal(t, "/* rewritten from CREATE INDEX */ ALTER TABLE `t1` ADD INDEX idx (a)", abstractStmt[0].Statement)
 
 	abstractStmt, err = New("CREATE INDEX idx ON test.`t1` (a)")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Equal(t, "ADD INDEX idx (a)", abstractStmt.Alter)
-	assert.Equal(t, "/* rewritten from CREATE INDEX */ ALTER TABLE `t1` ADD INDEX idx (a)", abstractStmt.Statement)
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Equal(t, "ADD INDEX idx (a)", abstractStmt[0].Alter)
+	assert.Equal(t, "/* rewritten from CREATE INDEX */ ALTER TABLE `t1` ADD INDEX idx (a)", abstractStmt[0].Statement)
 
 	// test unsupported.
 	_, err = New("INSERT INTO t1 (a) VALUES (1)")
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "not a supported statement type")
 
 	// drop table
 	abstractStmt, err = New("DROP TABLE t1")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Empty(t, abstractStmt.Alter)
-	assert.False(t, abstractStmt.IsAlterTable())
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Empty(t, abstractStmt[0].Alter)
+	assert.False(t, abstractStmt[0].IsAlterTable())
 
 	// drop table with multiple schemas
 	_, err = New("DROP TABLE test.t1, test2.t1")
@@ -86,15 +90,15 @@ func TestExtractFromStatement(t *testing.T) {
 	// rename table
 	abstractStmt, err = New("RENAME TABLE t1 TO t2")
 	assert.NoError(t, err)
-	assert.Equal(t, "t1", abstractStmt.Table)
-	assert.Empty(t, abstractStmt.Alter)
-	assert.False(t, abstractStmt.IsAlterTable())
-	assert.Equal(t, "RENAME TABLE t1 TO t2", abstractStmt.Statement)
+	assert.Equal(t, "t1", abstractStmt[0].Table)
+	assert.Empty(t, abstractStmt[0].Alter)
+	assert.False(t, abstractStmt[0].IsAlterTable())
+	assert.Equal(t, "RENAME TABLE t1 TO t2", abstractStmt[0].Statement)
 }
 
 func TestAlgorithmInplaceConsideredSafe(t *testing.T) {
 	var test = func(stmt string) error {
-		return MustNew("ALTER TABLE `t1` " + stmt).AlgorithmInplaceConsideredSafe()
+		return MustNew("ALTER TABLE `t1` " + stmt)[0].AlgorithmInplaceConsideredSafe()
 	}
 	assert.NoError(t, test("drop index `a`"))
 	assert.NoError(t, test("rename index `a` to `b`"))
@@ -124,7 +128,7 @@ func TestAlgorithmInplaceConsideredSafe(t *testing.T) {
 
 func TestAlterIsAddUnique(t *testing.T) {
 	var test = func(stmt string) error {
-		return MustNew("ALTER TABLE `t1` " + stmt).AlterContainsAddUnique()
+		return MustNew("ALTER TABLE `t1` " + stmt)[0].AlterContainsAddUnique()
 	}
 	assert.NoError(t, test("drop index `a`"))
 	assert.NoError(t, test("rename index `a` to `b`"))
@@ -140,7 +144,7 @@ func TestAlterIsAddUnique(t *testing.T) {
 
 func TestAlterContainsIndexVisibility(t *testing.T) {
 	var test = func(stmt string) error {
-		return MustNew("ALTER TABLE `t1` " + stmt).AlterContainsIndexVisibility()
+		return MustNew("ALTER TABLE `t1` " + stmt)[0].AlterContainsIndexVisibility()
 	}
 
 	assert.NoError(t, test("drop index `a`"))
@@ -159,7 +163,7 @@ func TestAlterContainsIndexVisibility(t *testing.T) {
 
 func TestAlterContainsUnsupportedClause(t *testing.T) {
 	var test = func(stmt string) error {
-		return MustNew("ALTER TABLE `t1` " + stmt).AlterContainsUnsupportedClause()
+		return MustNew("ALTER TABLE `t1` " + stmt)[0].AlterContainsUnsupportedClause()
 	}
 	assert.NoError(t, test("drop index `a`"))
 	assert.Error(t, test("drop index `a`, algorithm=inplace"))

@@ -15,7 +15,7 @@ import (
 func TestReplicaHealth(t *testing.T) {
 	r := Resources{
 		Table:     &table.TableInfo{TableName: "test"},
-		Statement: statement.MustNew("ALTER TABLE test RENAME TO newtablename"),
+		Statement: statement.MustNew("ALTER TABLE test RENAME TO newtablename")[0],
 	}
 	err := replicaHealth(t.Context(), r, logrus.New())
 	assert.NoError(t, err) // if no replica, it returns no error.

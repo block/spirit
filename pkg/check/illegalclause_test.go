@@ -10,23 +10,23 @@ import (
 
 func TestIllegalClauseCheck(t *testing.T) {
 	r := Resources{
-		Statement: statement.MustNew("ALTER TABLE t1 ADD INDEX (b), ALGORITHM=INPLACE"),
+		Statement: statement.MustNew("ALTER TABLE t1 ADD INDEX (b), ALGORITHM=INPLACE")[0],
 	}
 	err := illegalClauseCheck(t.Context(), r, logrus.New())
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "contains unsupported clause")
 
-	r.Statement = statement.MustNew("ALTER TABLE t1  ADD c INT, ALGORITHM=INPLACE, LOCK=shared")
+	r.Statement = statement.MustNew("ALTER TABLE t1  ADD c INT, ALGORITHM=INPLACE, LOCK=shared")[0]
 	err = illegalClauseCheck(t.Context(), r, logrus.New())
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "contains unsupported clause")
 
-	r.Statement = statement.MustNew("ALTER TABLE t1  ADD c INT, lock=none")
+	r.Statement = statement.MustNew("ALTER TABLE t1  ADD c INT, lock=none")[0]
 	err = illegalClauseCheck(t.Context(), r, logrus.New())
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "contains unsupported clause")
 
-	r.Statement = statement.MustNew("ALTER TABLE t1 engine=innodb, algorithm=copy")
+	r.Statement = statement.MustNew("ALTER TABLE t1 engine=innodb, algorithm=copy")[0]
 	err = illegalClauseCheck(t.Context(), r, logrus.New())
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "contains unsupported clause")

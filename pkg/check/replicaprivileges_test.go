@@ -19,7 +19,7 @@ func TestReplicaPrivileges(t *testing.T) {
 	}
 	r := Resources{
 		Table:     &table.TableInfo{TableName: "test"},
-		Statement: statement.MustNew("ALTER TABLE test RENAME TO newtablename"),
+		Statement: statement.MustNew("ALTER TABLE test RENAME TO newtablename")[0],
 	}
 	err := replicaPrivilegeCheck(t.Context(), r, logrus.New())
 	assert.NoError(t, err) // if no replica, it returns no error.

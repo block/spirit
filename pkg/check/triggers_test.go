@@ -36,7 +36,7 @@ func TestHasTriggers(t *testing.T) {
 	r := Resources{
 		DB:        db,
 		Table:     &table.TableInfo{SchemaName: "test", TableName: "account"},
-		Statement: statement.MustNew("ALTER TABLE account Engine=innodb"),
+		Statement: statement.MustNew("ALTER TABLE account Engine=innodb")[0],
 	}
 
 	err = hasTriggersCheck(t.Context(), r, logrus.New())

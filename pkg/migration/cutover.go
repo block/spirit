@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/repl"
@@ -13,35 +14,40 @@ import (
 )
 
 type CutOver struct {
-	db           *sql.DB
+	db       *sql.DB
+	feed     *repl.Client
+	config   []*cutoverConfig
+	dbConfig *dbconn.DBConfig
+	logger   loggers.Advanced
+}
+
+type cutoverConfig struct {
 	table        *table.TableInfo
 	newTable     *table.TableInfo
 	oldTableName string
-	feed         *repl.Client
-	dbConfig     *dbconn.DBConfig
-	logger       loggers.Advanced
 }
 
 // NewCutOver contains the logic to perform the final cut over. It requires the original table,
 // new table, and a replication feed which is used to ensure consistency before the cut over.
-func NewCutOver(db *sql.DB, table, newTable *table.TableInfo, oldTableName string, feed *repl.Client, dbConfig *dbconn.DBConfig, logger loggers.Advanced) (*CutOver, error) {
+func NewCutOver(db *sql.DB, config []*cutoverConfig, feed *repl.Client, dbConfig *dbconn.DBConfig, logger loggers.Advanced) (*CutOver, error) {
 	if feed == nil {
 		return nil, errors.New("feed must be non-nil")
 	}
-	if table == nil || newTable == nil {
-		return nil, errors.New("table and newTable must be non-nil")
-	}
-	if oldTableName == "" {
-		return nil, errors.New("oldTableName must be non-empty")
+	// validate the cutoverConfig
+	for _, cfg := range config {
+		if cfg.table == nil || cfg.newTable == nil {
+			return nil, errors.New("table and newTable must be non-nil")
+		}
+		if cfg.oldTableName == "" {
+			return nil, errors.New("oldTableName must be non-empty")
+		}
 	}
 	return &CutOver{
-		db:           db,
-		table:        table,
-		newTable:     newTable,
-		oldTableName: oldTableName,
-		feed:         feed,
-		dbConfig:     dbConfig,
-		logger:       logger,
+		db:       db,
+		config:   config,
+		feed:     feed,
+		dbConfig: dbConfig,
+		logger:   logger,
 	}, nil
 }
 
@@ -86,7 +92,17 @@ func (c *CutOver) Run(ctx context.Context) error {
 func (c *CutOver) algorithmRenameUnderLock(ctx context.Context) error {
 	// Lock the source table in a trx
 	// so the connection is not used by others
-	tableLock, err := dbconn.NewTableLock(ctx, c.db, []*table.TableInfo{c.table, c.newTable}, c.dbConfig, c.logger)
+	tablesToLock := []*table.TableInfo{}
+	renameFragments := []string{}
+	for _, cfg := range c.config {
+		tablesToLock = append(tablesToLock, cfg.table, cfg.newTable)
+		oldQuotedName := fmt.Sprintf("`%s`.`%s`", cfg.table.SchemaName, cfg.oldTableName)
+		renameFragments = append(renameFragments,
+			fmt.Sprintf("%s TO %s", cfg.table.QuotedName, oldQuotedName),
+			fmt.Sprintf("%s TO %s", cfg.newTable.QuotedName, cfg.table.QuotedName),
+		)
+	}
+	tableLock, err := dbconn.NewTableLock(ctx, c.db, tablesToLock, c.dbConfig, c.logger)
 	if err != nil {
 		return err
 	}
@@ -97,10 +113,7 @@ func (c *CutOver) algorithmRenameUnderLock(ctx context.Context) error {
 	if !c.feed.AllChangesFlushed() {
 		return errors.New("not all changes flushed, final flush might be broken")
 	}
-	oldQuotedName := fmt.Sprintf("`%s`.`%s`", c.table.SchemaName, c.oldTableName)
-	renameStatement := fmt.Sprintf("RENAME TABLE %s TO %s, %s TO %s",
-		c.table.QuotedName, oldQuotedName,
-		c.newTable.QuotedName, c.table.QuotedName,
-	)
+
+	renameStatement := "RENAME TABLE " + strings.Join(renameFragments, ", ")
 	return tableLock.ExecUnderLock(ctx, renameStatement)
 }

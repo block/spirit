@@ -59,7 +59,7 @@ func (m *Migration) Run() error {
 
 // normalizeOptions does some validation and sets defaults.
 // for example, it validates that only --statement or --table and --alter are specified.
-func (m *Migration) normalizeOptions() (stmt *statement.AbstractStatement, err error) {
+func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, err error) {
 	if m.TargetChunkTime == 0 {
 		m.TargetChunkTime = table.ChunkerDefaultTarget
 	}
@@ -85,16 +85,20 @@ func (m *Migration) normalizeOptions() (stmt *statement.AbstractStatement, err e
 		// extract the table and alter from the statement.
 		// if it is a CREATE INDEX statement, we rewrite it to an alter statement.
 		// This also returns the StmtNode.
-		stmt, err = statement.New(m.Statement)
+		stmts, err = statement.New(m.Statement)
 		if err != nil {
 			// Omit the parser error messages, just show the statement.
 			return nil, errors.New("could not parse SQL statement: " + m.Statement)
 		}
-		if stmt.Schema != "" && stmt.Schema != m.Database {
-			return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
+		for _, stmt := range stmts {
+			if stmt.Schema != "" && stmt.Schema != m.Database {
+				return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
+			}
+			stmt.Schema = m.Database
 		}
-		stmt.Schema = m.Database
 	} else {
+		// Parse table + alter into statement.
+		// So that in various contexts we can start moving to using the AbstractStatement.
 		if m.Table == "" {
 			return nil, errors.New("table name is required")
 		}
@@ -110,13 +114,13 @@ func (m *Migration) normalizeOptions() (stmt *statement.AbstractStatement, err e
 		if err != nil {
 			return nil, errors.New("could not parse SQL statement: " + fullStatement)
 		}
-		stmt = &statement.AbstractStatement{
+		stmts = append(stmts, &statement.AbstractStatement{
 			Schema:    m.Database,
 			Table:     m.Table,
 			Alter:     m.Alter,
 			Statement: fullStatement,
 			StmtNode:  &stmtNodes[0],
-		}
+		})
 	}
-	return stmt, err
+	return stmts, err
 }
