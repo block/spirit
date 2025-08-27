@@ -17,14 +17,19 @@ import (
 
 var (
 	ErrMismatchedAlter = errors.New("alter statement in checkpoint table does not match the alter statement specified here")
+	defaultHost        = "127.0.0.1"
+	defaultPort        = 3306
+	defaultUsername    = "msandbox"
+	defaultPassword    = "msandbox"
+	defaultDatabase    = "test"
 )
 
 type Migration struct {
-	Host                 string        `name:"host" help:"Hostname" optional:"" default:"127.0.0.1:3306"`
-	Username             string        `name:"username" help:"User" optional:"" default:"msandbox"`
-	Password             string        `name:"password" help:"Password" optional:"" default:"msandbox"`
-	Database             string        `name:"database" help:"Database" optional:"" default:"test"`
-	CredsFile            string        `name:"creds-file" help:"Credentials ini file. Overrides credentials passed via CLI" optional:"" type:"existingfile"`
+	Host                 *string       `name:"host" help:"Hostname" optional:""`
+	Username             *string       `name:"username" help:"User" optional:""`
+	Password             *string       `name:"password" help:"Password" optional:""`
+	Database             *string       `name:"database" help:"Database" optional:""`
+	ConfFile             string        `name:"conf" help:"MySQL conf file" optional:"" type:"existingfile"`
 	Table                string        `name:"table" help:"Table" optional:""`
 	Alter                string        `name:"alter" help:"The alter statement to run on the table" optional:""`
 	Threads              int           `name:"threads" help:"Number of concurrent threads for copy and checksum tasks" optional:"" default:"4"`
@@ -68,15 +73,11 @@ func (m *Migration) normalizeOptions() (stmt *statement.AbstractStatement, err e
 	if m.ReplicaMaxLag == 0 {
 		m.ReplicaMaxLag = 120 * time.Second
 	}
-	if m.Host == "" {
-		return nil, errors.New("host is required")
+
+	if err := m.normalizeConnectionOptions(); err != nil {
+		return nil, err
 	}
-	if !strings.Contains(m.Host, ":") {
-		m.Host = fmt.Sprintf("%s:%d", m.Host, 3306)
-	}
-	if m.Database == "" {
-		return nil, errors.New("database/schema name is required")
-	}
+
 	if m.Statement != "" { // statement is specified
 		if m.Table != "" || m.Alter != "" {
 			return nil, errors.New("only --statement or --table and --alter can be specified")
@@ -89,10 +90,11 @@ func (m *Migration) normalizeOptions() (stmt *statement.AbstractStatement, err e
 			// Omit the parser error messages, just show the statement.
 			return nil, errors.New("could not parse SQL statement: " + m.Statement)
 		}
-		if stmt.Schema != "" && stmt.Schema != m.Database {
+		if stmt.Schema != "" && stmt.Schema != *m.Database {
 			return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
 		}
-		stmt.Schema = m.Database
+
+		stmt.Schema = *m.Database
 	} else {
 		if m.Table == "" {
 			return nil, errors.New("table name is required")
@@ -105,31 +107,139 @@ func (m *Migration) normalizeOptions() (stmt *statement.AbstractStatement, err e
 		m.Alter = strings.TrimSuffix(m.Alter, ";")
 		fullStatement := fmt.Sprintf("ALTER TABLE `%s` %s", m.Table, m.Alter)
 		p := parser.New()
+
 		stmtNodes, _, err := p.Parse(fullStatement, "", "")
 		if err != nil {
 			return nil, errors.New("could not parse SQL statement: " + fullStatement)
 		}
 		stmt = &statement.AbstractStatement{
-			Schema:    m.Database,
+			Schema:    *m.Database,
 			Table:     m.Table,
 			Alter:     m.Alter,
 			Statement: fullStatement,
 			StmtNode:  &stmtNodes[0],
 		}
 	}
-	if m.CredsFile != "" {
-		creds, err := ini.Load(m.CredsFile)
-		if err != nil {
-			return nil, err
-		}
-		if creds.Section("client").HasKey("user") {
-			m.Username = creds.Section("client").Key("user").String()
-		}
 
-		if creds.Section("client").HasKey("password") {
-			m.Password = creds.Section("client").Key("password").String()
+	return stmt, err
+}
+
+func (m *Migration) normalizeConnectionOptions() error {
+	confParams, err := newConfParams(m.ConfFile)
+	if err != nil {
+		return err
+	}
+	if m.Host == nil {
+		m.Host = confParams.GetHost()
+	}
+	if m.Username == nil {
+		m.Username = confParams.GetUser()
+	}
+	if m.Password == nil {
+		m.Password = confParams.GetPassword()
+	}
+	if m.Database == nil {
+		m.Database = confParams.GetDatabase()
+	}
+
+	if !strings.Contains(*m.Host, ":") {
+		hostAndPort := fmt.Sprintf("%s:%d", *m.Host, *confParams.GetPort())
+		m.Host = &hostAndPort
+	}
+
+	return nil
+}
+
+// confParams abstracts parameters loaded from ini file. Will provide defaults when receiveer is
+// nil or parameter is not defined.
+type confParams struct {
+	host, database, user, password *string
+	port                           *int
+}
+
+func (c *confParams) GetHost() *string {
+	if c == nil || c.host == nil {
+		return &defaultHost
+	}
+
+	return c.host
+}
+
+func (c *confParams) GetDatabase() *string {
+	if c == nil || c.database == nil {
+		return &defaultDatabase
+	}
+
+	return c.database
+}
+
+func (c *confParams) GetUser() *string {
+	if c == nil || c.user == nil {
+		return &defaultUsername
+	}
+
+	return c.user
+}
+
+func (c *confParams) GetPassword() *string {
+	if c == nil || c.password == nil {
+		return &defaultPassword
+	}
+
+	return c.password
+}
+
+func (c *confParams) GetPort() *int {
+	if c == nil || c.port == nil {
+		return &defaultPort
+	}
+
+	return c.port
+}
+
+// newConfParams attempts to load a confParams struct from a path to an ini file. It will
+// return a nil configParams  when an empty path is provided and non-nil if file is able to be loaded
+func newConfParams(confFilePath string) (*confParams, error) {
+	if confFilePath == "" {
+		return nil, nil
+	}
+
+	creds, err := ini.Load(confFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	confParams := &confParams{}
+
+	if creds.HasSection("client") {
+		clientSection := creds.Section("client")
+		maybeHost := clientSection.Key("host").String()
+		maybeDb := clientSection.Key("database").String()
+		maybeUser := clientSection.Key("user").String()
+		maybePw := clientSection.Key("password").String()
+		maybePort := clientSection.Key("port").String()
+
+		if maybeHost != "" {
+			confParams.host = &maybeHost
+		}
+		if maybeDb != "" {
+			confParams.database = &maybeDb
+		}
+		if maybeUser != "" {
+			confParams.user = &maybeUser
+		}
+		if maybePw != "" {
+			confParams.password = &maybePw
+		}
+		if maybePort != "" {
+			port, err := clientSection.Key("port").Int()
+			if err != nil {
+				return nil, err
+			}
+
+			confParams.port = &port
 		}
 	}
 
-	return stmt, err
+	return confParams, nil
 }
