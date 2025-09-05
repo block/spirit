@@ -16,13 +16,13 @@ func TestTrxPool(t *testing.T) {
 		return
 	}
 	defer db.Close()
-	
+
 	// Test database connectivity before proceeding
 	if err := db.Ping(); err != nil {
 		t.Skipf("Database not available, skipping transaction pool test: %v", err)
 		return
 	}
-	
+
 	config := NewDBConfig()
 	config.LockWaitTimeout = 10
 	err = Exec(t.Context(), db, "DROP TABLE IF EXISTS test.trxpool")
