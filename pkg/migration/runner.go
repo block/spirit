@@ -17,7 +17,7 @@ import (
 	"github.com/block/spirit/pkg/row"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
-	"github.com/go-mysql-org/go-mysql/mysql"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/siddontang/go-log/loggers"
 	"github.com/sirupsen/logrus"
 )
@@ -416,6 +416,8 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			Host:                 r.migration.Host,
 			Username:             r.migration.Username,
 			Password:             r.migration.Password,
+			TLSMode:              r.migration.TLSMode,
+			TLSCertificatePath:   r.migration.TLSCertificatePath,
 			SkipDropAfterCutover: r.migration.SkipDropAfterCutover,
 		}, r.logger, scope); err != nil {
 			return err
@@ -425,7 +427,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 }
 
 func (r *Runner) dsn() string {
-	return fmt.Sprintf("%s:%s@tcp(%s)/%s", r.migration.Username, r.migration.Password, r.migration.Host, r.changes[0].stmt.Schema)
+	return fmt.Sprintf("%s:%s@tcp(%s)/%s", r.migration.Username, r.migration.Password, r.migration.Host, r.stmt.Schema)
 }
 
 func (r *Runner) setup(ctx context.Context) error {
@@ -798,7 +800,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.replClient.AddSubscription(r.changes[0].table, r.changes[0].newTable, r.copier.KeyAboveHighWatermark); err != nil {
 		return err
 	}
-	r.replClient.SetFlushedPos(mysql.Position{
+	r.replClient.SetFlushedPos(gomysql.Position{
 		Name: binlogName,
 		Pos:  uint32(binlogPos),
 	})
