@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,15 +19,17 @@ import (
 )
 
 const (
-	rdsTLSConfigName = "rds"
-	maxConnLifetime  = time.Minute * 3
+	rdsTLSConfigName    = "rds"
+	customTLSConfigName = "custom"
+	maxConnLifetime     = time.Minute * 3
 )
 
 // rdsAddr matches Amazon RDS hostnames with optional :port suffix.
 // It's used to automatically load the Amazon RDS CA and enable TLS
 var (
-	rdsAddr = regexp.MustCompile(`rds\.amazonaws\.com(:\d+)?$`)
-	once    sync.Once
+	rdsAddr    = regexp.MustCompile(`rds\.amazonaws\.com(:\d+)?$`)
+	once       sync.Once
+	customOnce sync.Once
 	// https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 	//go:embed rdsGlobalBundle.pem
 	rdsGlobalBundle []byte
@@ -36,10 +39,66 @@ func IsRDSHost(host string) bool {
 	return rdsAddr.MatchString(host)
 }
 
+// NewTLSConfig creates a TLS config using the embedded RDS global bundle
 func NewTLSConfig() *tls.Config {
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(rdsGlobalBundle)
 	return &tls.Config{RootCAs: caCertPool}
+}
+
+// NewCustomTLSConfig creates a TLS config based on SSL mode and certificate data
+func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(certData)
+
+	switch sslMode {
+	case "DISABLED":
+		// This shouldn't be called for DISABLED mode, but handle gracefully
+		return nil
+	case "PREFERRED", "REQUIRED":
+		// Encryption only - no certificate verification
+		return &tls.Config{
+			RootCAs:            caCertPool,
+			InsecureSkipVerify: true,
+		}
+	case "VERIFY_CA":
+		// Verify certificate against CA, but allow hostname mismatches
+		return &tls.Config{
+			RootCAs:            caCertPool,
+			InsecureSkipVerify: false,
+			VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+				// Custom verification that skips hostname checking
+				// but validates the certificate chain
+				if len(verifiedChains) > 0 {
+					return nil // Certificate chain is valid
+				}
+				return fmt.Errorf("certificate verification failed")
+			},
+			ServerName: "", // Don't set ServerName to skip hostname verification
+		}
+	case "VERIFY_IDENTITY":
+		// Full verification including hostname
+		return &tls.Config{
+			RootCAs:            caCertPool,
+			InsecureSkipVerify: false,
+		}
+	default:
+		// Default to full verification for unknown modes
+		return &tls.Config{
+			RootCAs:            caCertPool,
+			InsecureSkipVerify: false,
+		}
+	}
+}
+
+// LoadCertificateFromFile loads certificate data from a file
+func LoadCertificateFromFile(filePath string) ([]byte, error) {
+	return os.ReadFile(filePath)
+}
+
+// GetEmbeddedRDSBundle returns the embedded RDS certificate bundle
+func GetEmbeddedRDSBundle() []byte {
+	return rdsGlobalBundle
 }
 
 func initRDSTLS() error {
@@ -50,20 +109,92 @@ func initRDSTLS() error {
 	return err
 }
 
+// initCustomTLS initializes a custom TLS configuration based on SSL mode
+func initCustomTLS(config *DBConfig) error {
+	var err error
+	customOnce.Do(func() {
+		var certData []byte
+
+		if config.TLSCertificatePath != "" {
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return
+			}
+		} else {
+			// Use embedded RDS bundle as fallback
+			certData = rdsGlobalBundle
+		}
+
+		tlsConfig := NewCustomTLSConfig(certData, config.TLSMode)
+		if tlsConfig != nil {
+			err = mysql.RegisterTLSConfig(customTLSConfigName, tlsConfig)
+		}
+	})
+	return err
+}
+
 // newDSN returns a new DSN to be used to connect to MySQL.
 // It accepts a DSN as input and appends TLS configuration
-// if the host is an Amazon RDS hostname.
+// based on the provided configuration and host detection.
 func newDSN(dsn string, config *DBConfig) (string, error) {
 	var ops []string
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", err
 	}
-	if IsRDSHost(cfg.Addr) {
-		if err = initRDSTLS(); err != nil {
-			return "", err
+
+	// Determine TLS configuration strategy based on SSL mode
+	switch config.TLSMode {
+	case "DISABLED":
+		// No TLS - don't add any TLS parameters
+
+	case "PREFERRED":
+		// Try to establish TLS if server supports it
+		// For RDS hosts, always use TLS. For others, attempt TLS gracefully
+		if IsRDSHost(cfg.Addr) {
+			if err = initRDSTLS(); err != nil {
+				return "", err
+			}
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
+		} else if config.TLSCertificatePath != "" {
+			// Custom certificate provided - use it
+			if err = initCustomTLS(config); err != nil {
+				return "", err
+			}
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(customTLSConfigName)))
 		}
-		ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
+		// For PREFERRED mode, if no custom cert and not RDS, we don't force TLS
+
+	case "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY":
+		// TLS is required - determine which certificate to use
+		if config.TLSCertificatePath != "" {
+			// Use custom certificate
+			if err = initCustomTLS(config); err != nil {
+				return "", err
+			}
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(customTLSConfigName)))
+		} else if IsRDSHost(cfg.Addr) {
+			// Use RDS certificate for RDS hosts
+			if err = initRDSTLS(); err != nil {
+				return "", err
+			}
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
+		} else {
+			// Use embedded RDS bundle as fallback for non-RDS hosts
+			if err = initCustomTLS(config); err != nil {
+				return "", err
+			}
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(customTLSConfigName)))
+		}
+
+	default:
+		// Unknown mode - default to PREFERRED behavior
+		if IsRDSHost(cfg.Addr) {
+			if err = initRDSTLS(); err != nil {
+				return "", err
+			}
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
+		}
 	}
 
 	// Setting sql_mode looks ill-advised, but unfortunately it's required.
