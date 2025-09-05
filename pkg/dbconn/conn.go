@@ -78,7 +78,7 @@ func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
 				if len(rawCerts) == 0 {
 					return fmt.Errorf("no certificates provided")
 				}
-				
+
 				// Parse all certificates in the chain
 				var certs []*x509.Certificate
 				for _, rawCert := range rawCerts {
@@ -88,25 +88,25 @@ func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
 					}
 					certs = append(certs, cert)
 				}
-				
+
 				// Create intermediate pool from the chain (excluding leaf)
 				intermediates := x509.NewCertPool()
 				for _, cert := range certs[1:] {
 					intermediates.AddCert(cert)
 				}
-				
+
 				// Verify the certificate chain against our CA pool
 				opts := x509.VerifyOptions{
 					Roots:         caCertPool,
 					Intermediates: intermediates,
 					// Don't set DNSName to skip hostname verification
 				}
-				
+
 				_, err := certs[0].Verify(opts)
 				if err != nil {
 					return fmt.Errorf("certificate verification failed: %w", err)
 				}
-				
+
 				return nil // Certificate is valid
 			},
 		}

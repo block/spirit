@@ -484,7 +484,7 @@ func TestVERIFY_CAHostnameFlexibility(t *testing.T) {
 			dsn := fmt.Sprintf("root:password@tcp(%s:3306)/test", tt.host)
 			result, err := newDSN(dsn, config)
 			assert.NoError(t, err, tt.description)
-			
+
 			// Assert the correct TLS config name based on mode
 			if tt.tlsMode == "VERIFY_CA" {
 				assert.Contains(t, result, "tls=verify_ca", "Should use verify_ca TLS config")
