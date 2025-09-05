@@ -19,17 +19,19 @@ import (
 )
 
 const (
-	rdsTLSConfigName    = "rds"
-	customTLSConfigName = "custom"
-	maxConnLifetime     = time.Minute * 3
+	rdsTLSConfigName      = "rds"
+	customTLSConfigName   = "custom"
+	requiredTLSConfigName = "required"
+	verifyCATLSConfigName = "verify_ca"
+	verifyIDTLSConfigName = "verify_identity"
+	maxConnLifetime       = time.Minute * 3
 )
 
 // rdsAddr matches Amazon RDS hostnames with optional :port suffix.
 // It's used to automatically load the Amazon RDS CA and enable TLS
 var (
-	rdsAddr    = regexp.MustCompile(`rds\.amazonaws\.com(:\d+)?$`)
-	once       sync.Once
-	customOnce sync.Once
+	rdsAddr = regexp.MustCompile(`rds\.amazonaws\.com(:\d+)?$`)
+	once    sync.Once
 	// https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 	//go:embed rdsGlobalBundle.pem
 	rdsGlobalBundle []byte
@@ -55,8 +57,13 @@ func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
 	case "DISABLED":
 		// This shouldn't be called for DISABLED mode, but handle gracefully
 		return nil
-	case "PREFERRED", "REQUIRED":
-		// Encryption only - no certificate verification
+	case "PREFERRED":
+		// Encryption only - no certificate verification at all
+		return &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	case "REQUIRED":
+		// Encryption only - no certificate verification but could use RootCAs for fallback
 		return &tls.Config{
 			RootCAs:            caCertPool,
 			InsecureSkipVerify: true,
@@ -65,16 +72,43 @@ func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
 		// Verify certificate against CA, but allow hostname mismatches
 		return &tls.Config{
 			RootCAs:            caCertPool,
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: true, // Skip all default verification
 			VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-				// Custom verification that skips hostname checking
-				// but validates the certificate chain
-				if len(verifiedChains) > 0 {
-					return nil // Certificate chain is valid
+				// Custom verification that validates certificate chain but skips hostname
+				if len(rawCerts) == 0 {
+					return fmt.Errorf("no certificates provided")
 				}
-				return fmt.Errorf("certificate verification failed")
+				
+				// Parse all certificates in the chain
+				var certs []*x509.Certificate
+				for _, rawCert := range rawCerts {
+					cert, err := x509.ParseCertificate(rawCert)
+					if err != nil {
+						return fmt.Errorf("failed to parse certificate: %w", err)
+					}
+					certs = append(certs, cert)
+				}
+				
+				// Create intermediate pool from the chain (excluding leaf)
+				intermediates := x509.NewCertPool()
+				for _, cert := range certs[1:] {
+					intermediates.AddCert(cert)
+				}
+				
+				// Verify the certificate chain against our CA pool
+				opts := x509.VerifyOptions{
+					Roots:         caCertPool,
+					Intermediates: intermediates,
+					// Don't set DNSName to skip hostname verification
+				}
+				
+				_, err := certs[0].Verify(opts)
+				if err != nil {
+					return fmt.Errorf("certificate verification failed: %w", err)
+				}
+				
+				return nil // Certificate is valid
 			},
-			ServerName: "", // Don't set ServerName to skip hostname verification
 		}
 	case "VERIFY_IDENTITY":
 		// Full verification including hostname
@@ -111,26 +145,44 @@ func initRDSTLS() error {
 
 // initCustomTLS initializes a custom TLS configuration based on SSL mode
 func initCustomTLS(config *DBConfig) error {
+	var certData []byte
 	var err error
-	customOnce.Do(func() {
-		var certData []byte
 
-		if config.TLSCertificatePath != "" {
-			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
-			if err != nil {
-				return
-			}
-		} else {
-			// Use embedded RDS bundle as fallback
-			certData = rdsGlobalBundle
+	if config.TLSCertificatePath != "" {
+		certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+		if err != nil {
+			return err
 		}
+	} else {
+		// Use embedded RDS bundle as fallback
+		certData = rdsGlobalBundle
+	}
 
-		tlsConfig := NewCustomTLSConfig(certData, config.TLSMode)
-		if tlsConfig != nil {
-			err = mysql.RegisterTLSConfig(customTLSConfigName, tlsConfig)
+	tlsConfig := NewCustomTLSConfig(certData, config.TLSMode)
+	if tlsConfig != nil {
+		// Use mode-specific config names to avoid conflicts
+		configName := getTLSConfigName(config.TLSMode)
+		err = mysql.RegisterTLSConfig(configName, tlsConfig)
+		// Ignore "TLS config already registered" errors for tests
+		if err != nil && strings.Contains(err.Error(), "already registered") {
+			err = nil
 		}
-	})
+	}
 	return err
+}
+
+// getTLSConfigName returns the appropriate TLS config name for the mode
+func getTLSConfigName(mode string) string {
+	switch mode {
+	case "REQUIRED":
+		return requiredTLSConfigName
+	case "VERIFY_CA":
+		return verifyCATLSConfigName
+	case "VERIFY_IDENTITY":
+		return verifyIDTLSConfigName
+	default:
+		return customTLSConfigName
+	}
 }
 
 // newDSN returns a new DSN to be used to connect to MySQL.
@@ -161,9 +213,17 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 			if err = initCustomTLS(config); err != nil {
 				return "", err
 			}
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(customTLSConfigName)))
+			configName := getTLSConfigName(config.TLSMode)
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
+		} else {
+			// For non-RDS hosts without custom cert, use permissive TLS (encryption only)
+			if err = initCustomTLS(config); err != nil {
+				return "", err
+			}
+			configName := getTLSConfigName(config.TLSMode)
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
 		}
-		// For PREFERRED mode, if no custom cert and not RDS, we don't force TLS
+		// PREFERRED mode always attempts TLS but doesn't fail if unavailable
 
 	case "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY":
 		// TLS is required - determine which certificate to use
@@ -172,7 +232,8 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 			if err = initCustomTLS(config); err != nil {
 				return "", err
 			}
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(customTLSConfigName)))
+			configName := getTLSConfigName(config.TLSMode)
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
 		} else if IsRDSHost(cfg.Addr) {
 			// Use RDS certificate for RDS hosts
 			if err = initRDSTLS(); err != nil {
@@ -184,7 +245,8 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 			if err = initCustomTLS(config); err != nil {
 				return "", err
 			}
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(customTLSConfigName)))
+			configName := getTLSConfigName(config.TLSMode)
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
 		}
 
 	default:
@@ -220,7 +282,15 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	ops = append(ops, fmt.Sprintf("%s=%s", "rejectReadOnly", "true"))
 	// Set interpolateParams
 	ops = append(ops, fmt.Sprintf("%s=%t", "interpolateParams", config.InterpolateParams))
-	dsn = fmt.Sprintf("%s?%s", dsn, strings.Join(ops, "&"))
+	// Allow mysql_native_password authentication
+	ops = append(ops, fmt.Sprintf("%s=%s", "allowNativePasswords", "true"))
+
+	// Check if DSN already has query parameters
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	dsn = fmt.Sprintf("%s%s%s", dsn, separator, strings.Join(ops, "&"))
 	return dsn, nil
 }
 

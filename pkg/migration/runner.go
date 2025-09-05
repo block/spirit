@@ -18,7 +18,8 @@ import (
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
-	"github.com/go-mysql-org/go-mysql/mysql"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/siddontang/go-log/loggers"
 	"github.com/sirupsen/logrus"
 )
@@ -368,6 +369,8 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 		Host:                 r.migration.Host,
 		Username:             r.migration.Username,
 		Password:             r.migration.Password,
+		TLSMode:              r.migration.TLSMode,
+		TLSCertificatePath:   r.migration.TLSCertificatePath,
 		SkipDropAfterCutover: r.migration.SkipDropAfterCutover,
 	}, r.logger, scope)
 }
@@ -411,7 +414,25 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 }
 
 func (r *Runner) dsn() string {
-	return fmt.Sprintf("%s:%s@tcp(%s)/%s", r.migration.Username, r.migration.Password, r.migration.Host, r.stmt.Schema)
+	// Use the go-sql-driver/mysql.Config to properly escape the DSN
+	cfg := mysql.Config{
+		User:   r.migration.Username,
+		Passwd: r.migration.Password,
+		Net:    "tcp",
+		Addr:   r.migration.Host,
+		DBName: r.stmt.Schema,
+	}
+	dsn := cfg.FormatDSN()
+	// Debug: log the DSN without password for troubleshooting
+	debugCfg := mysql.Config{
+		User:   r.migration.Username,
+		Passwd: "***",
+		Net:    "tcp",
+		Addr:   r.migration.Host,
+		DBName: r.stmt.Schema,
+	}
+	r.logger.Infof("Generated DSN: %s", debugCfg.FormatDSN())
+	return dsn
 }
 
 func (r *Runner) setup(ctx context.Context) error {
@@ -828,7 +849,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.replClient.AddSubscription(r.table, r.newTable, r.copier.KeyAboveHighWatermark); err != nil {
 		return err
 	}
-	r.replClient.SetFlushedPos(mysql.Position{
+	r.replClient.SetFlushedPos(gomysql.Position{
 		Name: binlogName,
 		Pos:  uint32(binlogPos),
 	})

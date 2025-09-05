@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -65,6 +64,7 @@ func TestNewCustomTLSConfigModes(t *testing.T) {
 		expectNil        bool
 		expectSkipVerify bool
 		expectVerifyFunc bool
+		expectRootCAs    bool
 	}{
 		{
 			name:             "VERIFY_IDENTITY mode",
@@ -73,14 +73,16 @@ func TestNewCustomTLSConfigModes(t *testing.T) {
 			expectNil:        false,
 			expectSkipVerify: false,
 			expectVerifyFunc: false,
+			expectRootCAs:    true,
 		},
 		{
 			name:             "VERIFY_CA mode",
 			certData:         testCert,
 			sslMode:          "VERIFY_CA",
 			expectNil:        false,
-			expectSkipVerify: false,
+			expectSkipVerify: true,
 			expectVerifyFunc: true,
+			expectRootCAs:    true,
 		},
 		{
 			name:             "REQUIRED mode",
@@ -89,6 +91,7 @@ func TestNewCustomTLSConfigModes(t *testing.T) {
 			expectNil:        false,
 			expectSkipVerify: true,
 			expectVerifyFunc: false,
+			expectRootCAs:    true,
 		},
 		{
 			name:             "PREFERRED mode",
@@ -97,6 +100,7 @@ func TestNewCustomTLSConfigModes(t *testing.T) {
 			expectNil:        false,
 			expectSkipVerify: true,
 			expectVerifyFunc: false,
+			expectRootCAs:    false, // PREFERRED mode doesn't use RootCAs
 		},
 		{
 			name:             "DISABLED mode",
@@ -105,6 +109,7 @@ func TestNewCustomTLSConfigModes(t *testing.T) {
 			expectNil:        true,
 			expectSkipVerify: false,
 			expectVerifyFunc: false,
+			expectRootCAs:    false,
 		},
 	}
 
@@ -116,8 +121,13 @@ func TestNewCustomTLSConfigModes(t *testing.T) {
 				assert.Nil(t, config)
 			} else {
 				assert.NotNil(t, config)
-				assert.NotNil(t, config.RootCAs)
 				assert.Equal(t, tt.expectSkipVerify, config.InsecureSkipVerify)
+
+				if tt.expectRootCAs {
+					assert.NotNil(t, config.RootCAs, "Expected RootCAs for mode %s", tt.sslMode)
+				} else {
+					assert.Nil(t, config.RootCAs, "Expected no RootCAs for mode %s", tt.sslMode)
+				}
 
 				if tt.expectVerifyFunc {
 					assert.NotNil(t, config.VerifyPeerCertificate)
@@ -179,7 +189,7 @@ func TestNewDSNWithTLSModes(t *testing.T) {
 				cfg.TLSMode = "PREFERRED"
 				return cfg
 			}(),
-			expectedTLS: "",
+			expectedTLS: "tls=custom", // PREFERRED now uses custom TLS config
 			expectError: false,
 		},
 		{
@@ -214,7 +224,7 @@ func TestNewDSNWithTLSModes(t *testing.T) {
 				cfg.TLSMode = "REQUIRED"
 				return cfg
 			}(),
-			expectedTLS: "tls=custom",
+			expectedTLS: "tls=required",
 			expectError: false,
 		},
 		{
@@ -226,7 +236,7 @@ func TestNewDSNWithTLSModes(t *testing.T) {
 				cfg.TLSCertificatePath = tempFile.Name()
 				return cfg
 			}(),
-			expectedTLS: "tls=custom",
+			expectedTLS: "tls=required",
 			expectError: false,
 		},
 		// VERIFY_CA mode
@@ -250,7 +260,7 @@ func TestNewDSNWithTLSModes(t *testing.T) {
 				cfg.TLSCertificatePath = tempFile.Name()
 				return cfg
 			}(),
-			expectedTLS: "tls=custom",
+			expectedTLS: "tls=verify_ca",
 			expectError: false,
 		},
 		// VERIFY_IDENTITY mode
@@ -274,7 +284,7 @@ func TestNewDSNWithTLSModes(t *testing.T) {
 				cfg.TLSCertificatePath = tempFile.Name()
 				return cfg
 			}(),
-			expectedTLS: "tls=custom",
+			expectedTLS: "tls=verify_identity",
 			expectError: false,
 		},
 		// Error cases
@@ -294,9 +304,6 @@ func TestNewDSNWithTLSModes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Reset the sync.Once for custom TLS registration
-			customOnce = sync.Once{}
-
 			result, err := newDSN(tt.dsn, tt.config)
 
 			if tt.expectError {
@@ -382,9 +389,6 @@ func TestVERIFY_CACertificateTrustLogic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Reset custom TLS registration
-			customOnce = sync.Once{}
-
 			config := NewDBConfig()
 			config.TLSMode = "VERIFY_CA"
 			config.TLSCertificatePath = tt.tlsCaFile
@@ -394,7 +398,7 @@ func TestVERIFY_CACertificateTrustLogic(t *testing.T) {
 			require.NotNil(t, tlsConfig, tt.description)
 
 			// Verify VERIFY_CA specific behavior
-			assert.False(t, tlsConfig.InsecureSkipVerify, "VERIFY_CA should validate certificates")
+			assert.True(t, tlsConfig.InsecureSkipVerify, "VERIFY_CA uses InsecureSkipVerify=true with custom verification")
 			assert.NotNil(t, tlsConfig.VerifyPeerCertificate, "VERIFY_CA should have custom verification")
 			assert.NotNil(t, tlsConfig.RootCAs, "VERIFY_CA should have CA bundle")
 			assert.Equal(t, "", tlsConfig.ServerName, "VERIFY_CA should not set ServerName for hostname flexibility")
@@ -403,7 +407,7 @@ func TestVERIFY_CACertificateTrustLogic(t *testing.T) {
 			dsn := "root:password@tcp(192.168.1.100:3306)/test"
 			result, err := newDSN(dsn, config)
 			assert.NoError(t, err, tt.description)
-			assert.Contains(t, result, "tls=custom", "Should use custom TLS config")
+			assert.Contains(t, result, "tls=verify_ca", "Should use verify_ca TLS config")
 		})
 	}
 }
@@ -458,9 +462,6 @@ func TestVERIFY_CAHostnameFlexibility(t *testing.T) {
 
 	for _, tt := range hostnameTests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Reset custom TLS registration
-			customOnce = sync.Once{}
-
 			config := NewDBConfig()
 			config.TLSMode = tt.tlsMode
 			config.TLSCertificatePath = tempFile.Name()
@@ -470,7 +471,7 @@ func TestVERIFY_CAHostnameFlexibility(t *testing.T) {
 
 			// Test the specific behaviors mentioned in documentation
 			if tt.tlsMode == "VERIFY_CA" {
-				assert.False(t, tlsConfig.InsecureSkipVerify, "VERIFY_CA should validate certificate chain")
+				assert.True(t, tlsConfig.InsecureSkipVerify, "VERIFY_CA uses InsecureSkipVerify=true with custom verification")
 				assert.NotNil(t, tlsConfig.VerifyPeerCertificate, "VERIFY_CA should have custom verification function")
 				assert.Equal(t, "", tlsConfig.ServerName, "VERIFY_CA should not set ServerName (allows hostname mismatches)")
 			} else if tt.tlsMode == "VERIFY_IDENTITY" {
@@ -483,7 +484,15 @@ func TestVERIFY_CAHostnameFlexibility(t *testing.T) {
 			dsn := fmt.Sprintf("root:password@tcp(%s:3306)/test", tt.host)
 			result, err := newDSN(dsn, config)
 			assert.NoError(t, err, tt.description)
-			assert.Contains(t, result, "tls=custom", "Should use custom TLS config")
+			
+			// Assert the correct TLS config name based on mode
+			if tt.tlsMode == "VERIFY_CA" {
+				assert.Contains(t, result, "tls=verify_ca", "Should use verify_ca TLS config")
+			} else if tt.tlsMode == "VERIFY_IDENTITY" {
+				assert.Contains(t, result, "tls=verify_identity", "Should use verify_identity TLS config")
+			} else {
+				assert.Contains(t, result, "tls=custom", "Should use custom TLS config")
+			}
 		})
 	}
 }
@@ -512,7 +521,7 @@ func TestCertificateAuthorityPrecedence(t *testing.T) {
 			host:            "mydb.us-west-2.rds.amazonaws.com", // RDS host
 			tlsMode:         "VERIFY_CA",
 			tlsCertPath:     customCertFile.Name(), // Custom cert provided
-			expectedTLSType: "tls=custom",
+			expectedTLSType: "tls=verify_ca",
 			description:     "Custom certificate has HIGHEST priority - disregards RDS bundle even for RDS hosts",
 		},
 		{
@@ -528,16 +537,13 @@ func TestCertificateAuthorityPrecedence(t *testing.T) {
 			host:            "mysql.company.com", // Non-RDS host
 			tlsMode:         "VERIFY_CA",
 			tlsCertPath:     "", // No custom cert
-			expectedTLSType: "tls=custom",
+			expectedTLSType: "tls=verify_ca",
 			description:     "Embedded RDS bundle as FALLBACK for non-RDS hosts when no custom cert",
 		},
 	}
 
 	for _, tt := range precedenceTests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Reset TLS registration
-			customOnce = sync.Once{}
-
 			config := NewDBConfig()
 			config.TLSMode = tt.tlsMode
 			config.TLSCertificatePath = tt.tlsCertPath
