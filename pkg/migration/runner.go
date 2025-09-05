@@ -161,7 +161,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	// We release the lock when this function finishes executing.
 	// We need to call this after r.table is ready - otherwise we'd move this to
 	// the start of the execution.
-	metadataLock, err := dbconn.NewMetadataLock(ctx, r.dsn(), r.table, r.logger)
+	metadataLock, err := dbconn.NewMetadataLock(ctx, r.dsn(), r.table, r.dbConfig, r.logger)
 	if err != nil {
 		return err
 	}

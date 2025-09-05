@@ -16,19 +16,19 @@ import (
 func TestMetadataLock(t *testing.T) {
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test"}
 	logger := logrus.New()
-	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger)
+	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	assert.NoError(t, err)
 	assert.NotNil(t, mdl)
 
 	// Confirm a second lock cannot be acquired
-	_, err = NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger)
+	_, err = NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	assert.ErrorContains(t, err, "lock is held by another connection")
 
 	// Close the original mdl
 	assert.NoError(t, mdl.Close())
 
 	// Confirm a new lock can be acquired
-	mdl3, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger)
+	mdl3, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	assert.NoError(t, err)
 	assert.NoError(t, mdl3.Close())
 }
@@ -38,7 +38,7 @@ func TestMetadataLockContextCancel(t *testing.T) {
 
 	logger := logrus.New()
 	ctx, cancel := context.WithCancel(t.Context())
-	mdl, err := NewMetadataLock(ctx, testutils.DSN(), &lockTableInfo, logger)
+	mdl, err := NewMetadataLock(ctx, testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	assert.NoError(t, err)
 	assert.NotNil(t, mdl)
 
@@ -49,7 +49,7 @@ func TestMetadataLockContextCancel(t *testing.T) {
 	<-mdl.closeCh
 
 	// Confirm the lock is released by acquiring a new one
-	mdl2, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger)
+	mdl2, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	assert.NoError(t, err)
 	assert.NotNil(t, mdl2)
 	assert.NoError(t, mdl2.Close())
@@ -59,7 +59,7 @@ func TestMetadataLockRefresh(t *testing.T) {
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-refresh"}
 	logger := logrus.New()
 
-	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger, func(mdl *MetadataLock) {
+	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger, func(mdl *MetadataLock) {
 		// override the refresh interval for faster testing
 		mdl.refreshInterval = 1 * time.Second
 	})
@@ -70,7 +70,7 @@ func TestMetadataLockRefresh(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Confirm the lock is still held
-	_, err = NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger)
+	_, err = NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	assert.ErrorContains(t, err, "lock is held by another connection")
 
 	// Close the lock
@@ -105,12 +105,12 @@ func TestMetadataLockLength(t *testing.T) {
 
 	logger := logrus.New()
 
-	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger)
+	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	// No error anymore after using a hash of the table name
 	assert.NoError(t, err)
 	defer mdl.Close()
 
-	_, err = NewMetadataLock(t.Context(), testutils.DSN(), empty, logger)
+	_, err = NewMetadataLock(t.Context(), testutils.DSN(), empty, NewDBConfig(), logger)
 	assert.ErrorContains(t, err, "metadata lock table info is nil")
 }
 
@@ -130,7 +130,7 @@ func TestMetadataLockRefreshWithConnIssueSimulation(t *testing.T) {
 	logger.SetLevel(logrus.DebugLevel)
 
 	// create a new MetadataLock with a short refresh interval for testing
-	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger, func(mdl *MetadataLock) {
+	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger, func(mdl *MetadataLock) {
 		mdl.refreshInterval = 2 * time.Second
 	})
 	assert.NoError(t, err)
@@ -145,7 +145,7 @@ func TestMetadataLockRefreshWithConnIssueSimulation(t *testing.T) {
 	time.Sleep(4 * time.Second)
 
 	// confirm the lock is still held by attempting to acquire it with a new connection
-	_, err = NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, logger)
+	_, err = NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
 	assert.ErrorContains(t, err, "lock is held by another connection")
 
 	// close the lock
