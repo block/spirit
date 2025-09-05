@@ -43,26 +43,33 @@ spirit --tls-mode VERIFY_IDENTITY --tls-ca /path/to/ca.pem --host mysql.company.
 
 ### VERIFY_CA Certificate Trust Logic
 
-When using `VERIFY_CA` mode, your `--tls-ca` bundle defines what Certificate Authorities are considered "trusted":
+When using `VERIFY_CA` mode, Spirit implements custom certificate verification that provides security without hostname restrictions:
 
-1. **Your `--tls-ca` bundle is the sole authority**
-   - Only Certificate Authorities in your specified bundle are trusted
-   - If server's certificate is signed by a CA **not** in your bundle → **Connection fails**
-   - If server's certificate is signed by a CA **in** your bundle → **Connection succeeds** (regardless of hostname)
+1. **Technical Implementation**
+   - Uses `InsecureSkipVerify=true` to bypass Go's default TLS verification
+   - Implements custom `VerifyPeerCertificate` function for selective validation
+   - Your `--tls-ca` bundle (or embedded RDS bundle) defines trusted Certificate Authorities
 
 2. **What gets verified:**
    - ✅ **Certificate chain validation**: Full cryptographic verification against your CA bundle
    - ✅ **Expiration dates**: Certificate must be valid and not expired  
-   - ✅ **CA signature**: Must be signed by a CA in your `--tls-ca` bundle
-   - ❌ **Hostname matching**: Ignored (allows IP addresses, load balancers, etc.)
+   - ✅ **CA signature**: Must be signed by a CA in your certificate bundle
+   - ✅ **Intermediate certificates**: Properly handles certificate chains
+   - ❌ **Hostname matching**: Intentionally skipped (allows IP addresses, load balancers, etc.)
 
-3. **Example scenarios:**
+3. **Certificate Authority Trust**
+   - Only Certificate Authorities in your specified bundle are trusted
+   - If server's certificate is signed by a CA **not** in your bundle → **Connection fails**
+   - If server's certificate is signed by a CA **in** your bundle → **Connection succeeds** (regardless of hostname)
+
+4. **Example scenarios:**
    ```bash
    # Your bundle contains "CompanyCA"
    spirit --tls-mode VERIFY_CA --tls-ca /path/to/company-ca.pem --host 192.168.1.100:3306
    
    # ✅ Server cert signed by "CompanyCA" → Works (even with IP address)
    # ❌ Server cert signed by "SomeOtherCA" → Fails (not in your bundle)
+   # ✅ Server cert expired but signed by "CompanyCA" → Fails (expiration checked)
    ```
 
 This makes `VERIFY_CA` perfect for company-internal environments where you have your own Certificate Authority but need flexibility with hostnames/IPs.
@@ -75,22 +82,28 @@ This makes `VERIFY_CA` perfect for company-internal environments where you have 
 | `--tls-ca` | Path to custom TLS CA certificate file | `""` |
 
 ### tls-ca
-When you provide `--tls-ca`, Spirit completely disregards the embedded RDS certificate bundle, even for RDS hosts. Your custom certificate becomes the sole authority for certificate validation.
+When you provide `--tls-ca`, Spirit uses your custom certificate exclusively for all certificate validation. When no `--tls-ca` is provided, Spirit falls back to the embedded RDS certificate bundle for all hosts, providing reasonable certificate validation even for non-RDS MySQL servers.
+
+**Key behavior:**
+- **With `--tls-ca`**: Your certificate becomes the sole authority
+- **Without `--tls-ca`**: Embedded RDS bundle used for all verification modes
+- **RDS auto-detection**: RDS hosts automatically get appropriate TLS settings regardless of `--tls-ca`
 
 This approach gives you full control while providing sensible defaults when no custom certificate is specified.
 
 ### Precedence for CA selection:
-1. Custom certificate via `--tls-ca` has HIGHEST priority
-- If you provide `--tls-ca /path/to/custom-ca.pem`, Spirit will completely disregard the embedded RDS bundle
-- It loads your custom certificate and uses only that for verification
+1. **Custom certificate via `--tls-ca` has HIGHEST priority**
+   - If you provide `--tls-ca /path/to/custom-ca.pem`, Spirit uses your custom certificate exclusively
+   - Your custom certificate becomes the sole authority for all certificate validation
 
-2. RDS auto-detection is SECONDARY
-- Only used if no `--tls-ca` is provided AND the host is an RDS hostname
-- Uses the embedded RDS certificate bundle
+2. **RDS auto-detection for RDS hosts**
+   - For RDS hostnames (ending in `.rds.amazonaws.com`), Spirit automatically uses the `tls=rds` configuration
+   - Uses the embedded RDS certificate bundle for verification
 
-3. Embedded RDS bundle as FALLBACK
-- For non-RDS hosts when no custom certificate is provided
-- Uses the embedded RDS bundle as a "reasonable default"
+3. **Embedded RDS bundle as fallback for all hosts**
+   - For non-RDS hosts when no custom certificate is provided, Spirit still uses the embedded RDS bundle
+   - This provides reasonable certificate validation even for non-RDS MySQL servers
+   - Uses mode-specific TLS configurations: `tls=required`, `tls=verify_ca`, `tls=verify_identity`
 
 ## Usage Examples
 
@@ -252,6 +265,17 @@ Spirit automatically detects Amazon RDS hostnames (ending in `.rds.amazonaws.com
    openssl s_client -connect hostname:3306 -servername hostname
    ```
 4. **Gradually increase security**: PREFERRED → REQUIRED → VERIFY_CA → VERIFY_IDENTITY
+5. **Verify TLS configuration registration**:
+   - Check logs for TLS config registration messages
+   - Look for mode-specific names: `tls=required`, `tls=verify_ca`, `tls=verify_identity`, `tls=rds`
+6. **Certificate bundle verification**:
+   ```bash
+   # Check certificate validity
+   openssl x509 -in /path/to/cert.pem -text -noout
+   
+   # Verify certificate chain
+   openssl verify -CAfile /path/to/ca.pem /path/to/server-cert.pem
+   ```
 
 ## Migration from Previous Versions
 
@@ -268,11 +292,31 @@ If you were using the previous TLS flags, here's how to migrate:
 
 The TLS mode system works as follows:
 
-1. **Mode Processing**: The specified `--tls-mode` determines the verification level
-2. **Certificate Selection**: 
+### TLS Configuration Registration
+Spirit registers mode-specific TLS configurations with the MySQL driver:
+- `REQUIRED` mode → `tls=required` 
+- `VERIFY_CA` mode → `tls=verify_ca`
+- `VERIFY_IDENTITY` mode → `tls=verify_identity`
+- RDS hosts → `tls=rds` (uses embedded certificate bundle)
+- Default/PREFERRED → `tls=custom`
+
+### Certificate Loading and Validation
+1. **Certificate Selection**: 
    - Custom certificate via `--tls-ca` if provided
-   - Embedded RDS certificate for RDS hosts
-   - Embedded RDS certificate as fallback for non-RDS hosts in verification modes
+   - Embedded RDS certificate bundle as fallback for all modes requiring verification
+2. **Mode-Specific Behavior**:
+   - **REQUIRED**: Encryption only with `InsecureSkipVerify=true` (no certificate validation)
+   - **VERIFY_CA**: Uses `InsecureSkipVerify=true` with custom `VerifyPeerCertificate` function that validates certificate chain but skips hostname verification
+   - **VERIFY_IDENTITY**: Full standard TLS verification including hostname matching
 3. **Connection Establishment**: MySQL driver uses the registered TLS configuration
+
+### VERIFY_CA Technical Implementation
+The `VERIFY_CA` mode uses a sophisticated approach:
+- Sets `InsecureSkipVerify=true` to bypass Go's default verification
+- Implements custom `VerifyPeerCertificate` function that:
+  - Validates the full certificate chain against the CA bundle
+  - Checks certificate expiration and validity
+  - **Skips hostname verification** (allowing IP addresses, load balancers, etc.)
+  - Handles intermediate certificates properly
 
 This approach provides maximum compatibility with MySQL tooling while offering secure defaults and clear upgrade paths.
