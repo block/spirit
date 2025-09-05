@@ -3,6 +3,7 @@ package repl
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -93,9 +94,13 @@ type Client struct {
 
 // NewClient creates a new Client instance.
 func NewClient(db *sql.DB, host string, username, password string, config *ClientConfig) *Client {
+	dbConfig := config.DBConfig
+	if dbConfig == nil {
+		dbConfig = dbconn.NewDBConfig()
+	}
 	return &Client{
 		db:              db,
-		dbConfig:        dbconn.NewDBConfig(),
+		dbConfig:        dbConfig,
 		host:            host,
 		username:        username,
 		password:        password,
@@ -115,6 +120,7 @@ type ClientConfig struct {
 	Logger          loggers.Advanced
 	OnDDL           chan string
 	ServerID        uint32
+	DBConfig        *dbconn.DBConfig
 }
 
 // NewServerID randomizes the server ID to avoid conflicts with other binlog readers.
@@ -131,6 +137,7 @@ func NewClientDefaultConfig() *ClientConfig {
 		Logger:          logrus.New(),
 		OnDDL:           nil,
 		ServerID:        NewServerID(),
+		DBConfig:        dbconn.NewDBConfig(),
 	}
 }
 
@@ -255,12 +262,50 @@ func (c *Client) Run(ctx context.Context) (err error) {
 		Password: c.password,
 		Logger:   NewLogWrapper(c.logger),
 	}
-	if dbconn.IsRDSHost(c.host) {
-		cfg.TLSConfig = dbconn.NewTLSConfig()
-	}
-	if cfg.TLSConfig != nil {
-		// Set the ServerName so that the TLS config can verify the server's certificate.
-		cfg.TLSConfig.ServerName = host
+
+	// Configure TLS using the new TLS mode system
+	if c.dbConfig != nil {
+		switch c.dbConfig.TLSMode {
+		case "DISABLED":
+			// No TLS configuration needed
+
+		case "PREFERRED":
+			// TLS is preferred - use TLS with RDS hosts, optional for others
+			if dbconn.IsRDSHost(c.host) {
+				// Use RDS TLS configuration
+				cfg.TLSConfig = &tls.Config{
+					InsecureSkipVerify: true,
+				}
+			}
+
+		case "REQUIRED":
+			// TLS is required with minimal verification
+			cfg.TLSConfig = &tls.Config{
+				InsecureSkipVerify: true,
+			}
+
+		case "VERIFY_CA", "VERIFY_IDENTITY":
+			// TLS is required with certificate verification
+			var certData []byte
+			var err error
+
+			if c.dbConfig.TLSCertificatePath != "" {
+				// Use custom certificate
+				certData, err = dbconn.LoadCertificateFromFile(c.dbConfig.TLSCertificatePath)
+				if err != nil {
+					return fmt.Errorf("failed to load custom certificate: %w", err)
+				}
+			} else {
+				// Use embedded RDS bundle as fallback
+				certData = dbconn.GetEmbeddedRDSBundle()
+			}
+
+			// Create TLS config with certificate data
+			cfg.TLSConfig = dbconn.NewCustomTLSConfig(certData, c.dbConfig.TLSMode)
+			if cfg.TLSConfig != nil && c.dbConfig.TLSMode == "VERIFY_IDENTITY" {
+				cfg.TLSConfig.ServerName = host
+			}
+		}
 	}
 	if dbconn.IsMySQL84(c.db) { // handle MySQL 8.4
 		c.isMySQL84 = true
