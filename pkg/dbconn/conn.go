@@ -118,10 +118,9 @@ func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
 			InsecureSkipVerify: false,
 		}
 	default:
-		// Default to full verification for unknown modes
+		// Default to PREFERRED behavior - encryption only, no certificate verification
 		return &tls.Config{
-			RootCAs:            caCertPool,
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: true,
 		}
 	}
 }
