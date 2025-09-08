@@ -10,7 +10,7 @@ func TestSimpleTLSConfigDefaults(t *testing.T) {
 	config := NewDBConfig()
 
 	// Test TLS defaults
-	assert.Equal(t, "", config.TLSCertificatePath)
+	assert.Empty(t, config.TLSCertificatePath)
 	assert.Equal(t, "PREFERRED", config.TLSMode)
 }
 

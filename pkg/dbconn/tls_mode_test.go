@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -327,7 +328,7 @@ func TestDBConfigTLSModeDefaults(t *testing.T) {
 
 	// Test TLS defaults
 	assert.Equal(t, "PREFERRED", config.TLSMode)
-	assert.Equal(t, "", config.TLSCertificatePath)
+	assert.Empty(t, config.TLSCertificatePath)
 }
 
 func TestTLSModeConfigRegistration(t *testing.T) {
@@ -401,7 +402,7 @@ func TestVERIFY_CACertificateTrustLogic(t *testing.T) {
 			assert.True(t, tlsConfig.InsecureSkipVerify, "VERIFY_CA uses InsecureSkipVerify=true with custom verification")
 			assert.NotNil(t, tlsConfig.VerifyPeerCertificate, "VERIFY_CA should have custom verification")
 			assert.NotNil(t, tlsConfig.RootCAs, "VERIFY_CA should have CA bundle")
-			assert.Equal(t, "", tlsConfig.ServerName, "VERIFY_CA should not set ServerName for hostname flexibility")
+			assert.Empty(t, tlsConfig.ServerName, "VERIFY_CA should not set ServerName for hostname flexibility")
 
 			// Test DSN generation uses custom TLS
 			dsn := "root:password@tcp(192.168.1.100:3306)/test"
@@ -470,11 +471,12 @@ func TestVERIFY_CAHostnameFlexibility(t *testing.T) {
 			require.NotNil(t, tlsConfig, tt.description)
 
 			// Test the specific behaviors mentioned in documentation
-			if tt.tlsMode == "VERIFY_CA" {
+			switch tt.tlsMode {
+			case "VERIFY_CA":
 				assert.True(t, tlsConfig.InsecureSkipVerify, "VERIFY_CA uses InsecureSkipVerify=true with custom verification")
 				assert.NotNil(t, tlsConfig.VerifyPeerCertificate, "VERIFY_CA should have custom verification function")
 				assert.Equal(t, "", tlsConfig.ServerName, "VERIFY_CA should not set ServerName (allows hostname mismatches)")
-			} else if tt.tlsMode == "VERIFY_IDENTITY" {
+			case "VERIFY_IDENTITY":
 				assert.False(t, tlsConfig.InsecureSkipVerify, "VERIFY_IDENTITY should validate everything")
 				assert.Nil(t, tlsConfig.VerifyPeerCertificate, "VERIFY_IDENTITY uses default verification")
 				// ServerName would be set by Go's TLS library during actual connection
@@ -486,11 +488,12 @@ func TestVERIFY_CAHostnameFlexibility(t *testing.T) {
 			assert.NoError(t, err, tt.description)
 
 			// Assert the correct TLS config name based on mode
-			if tt.tlsMode == "VERIFY_CA" {
+			switch tt.tlsMode {
+			case "VERIFY_CA":
 				assert.Contains(t, result, "tls=verify_ca", "Should use verify_ca TLS config")
-			} else if tt.tlsMode == "VERIFY_IDENTITY" {
+			case "VERIFY_IDENTITY":
 				assert.Contains(t, result, "tls=verify_identity", "Should use verify_identity TLS config")
-			} else {
+			default:
 				assert.Contains(t, result, "tls=custom", "Should use custom TLS config")
 			}
 		})
@@ -559,9 +562,7 @@ func TestCertificateAuthorityPrecedence(t *testing.T) {
 // MockDB simulates database connection behavior for testing
 type MockDB struct {
 	shouldFailPing  bool
-	shouldFailOpen  bool
 	pingCallCount   int
-	openCallCount   int
 	closeCallCount  int
 	maxOpenConns    int
 	connMaxLifetime time.Duration
@@ -570,7 +571,7 @@ type MockDB struct {
 func (m *MockDB) Ping() error {
 	m.pingCallCount++
 	if m.shouldFailPing {
-		return fmt.Errorf("mock ping failure")
+		return errors.New("mock ping failure")
 	}
 	return nil
 }
@@ -865,7 +866,7 @@ func TestPREFERREDModeIntegration(t *testing.T) {
 			resultDSN, err := newDSN(baseDSN, config)
 			require.NoError(t, err, scenario.description)
 
-			expectedTLSParam := fmt.Sprintf("tls=%s", scenario.expectedTLSConfig)
+			expectedTLSParam := "tls=" + scenario.expectedTLSConfig
 			assert.Contains(t, resultDSN, expectedTLSParam, scenario.description)
 		})
 	}
