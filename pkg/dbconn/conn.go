@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	_ "embed"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -76,7 +77,7 @@ func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
 			VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 				// Custom verification that validates certificate chain but skips hostname
 				if len(rawCerts) == 0 {
-					return fmt.Errorf("no certificates provided")
+					return errors.New("no certificates provided")
 				}
 
 				// Parse all certificates in the chain
