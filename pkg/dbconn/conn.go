@@ -174,6 +174,11 @@ func initCustomTLS(config *DBConfig) error {
 // getTLSConfigName returns the appropriate TLS config name for the mode
 func getTLSConfigName(mode string) string {
 	switch mode {
+	case "DISABLED":
+		// This should never be called for DISABLED mode, but handle gracefully
+		return ""
+	case "PREFERRED":
+		return customTLSConfigName
 	case "REQUIRED":
 		return requiredTLSConfigName
 	case "VERIFY_CA":
@@ -181,6 +186,7 @@ func getTLSConfigName(mode string) string {
 	case "VERIFY_IDENTITY":
 		return verifyIDTLSConfigName
 	default:
+		// Unknown modes default to custom behavior
 		return customTLSConfigName
 	}
 }
