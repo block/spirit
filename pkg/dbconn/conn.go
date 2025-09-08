@@ -308,6 +308,43 @@ func New(inputDSN string, config *DBConfig) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// For PREFERRED mode, implement fallback behavior
+	if config.TLSMode == "PREFERRED" {
+		// First try with TLS
+		db, err := sql.Open("mysql", dsn)
+		if err == nil {
+			if err := db.Ping(); err == nil {
+				// TLS connection successful
+				db.SetMaxOpenConns(config.MaxOpenConnections)
+				db.SetConnMaxLifetime(maxConnLifetime)
+				return db, nil
+			}
+			utils.ErrInErr(db.Close())
+		}
+
+		// TLS failed, try without TLS by creating a DISABLED mode DSN
+		configCopy := *config
+		configCopy.TLSMode = "DISABLED"
+		fallbackDSN, err := newDSN(inputDSN, &configCopy)
+		if err != nil {
+			return nil, err
+		}
+
+		db, err = sql.Open("mysql", fallbackDSN)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.Ping(); err != nil {
+			utils.ErrInErr(db.Close())
+			return nil, err
+		}
+		db.SetMaxOpenConns(config.MaxOpenConnections)
+		db.SetConnMaxLifetime(maxConnLifetime)
+		return db, nil
+	}
+
+	// For all other modes, use standard connection
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err

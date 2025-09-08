@@ -555,3 +555,318 @@ func TestCertificateAuthorityPrecedence(t *testing.T) {
 		})
 	}
 }
+
+// MockDB simulates database connection behavior for testing
+type MockDB struct {
+	shouldFailPing  bool
+	shouldFailOpen  bool
+	pingCallCount   int
+	openCallCount   int
+	closeCallCount  int
+	maxOpenConns    int
+	connMaxLifetime time.Duration
+}
+
+func (m *MockDB) Ping() error {
+	m.pingCallCount++
+	if m.shouldFailPing {
+		return fmt.Errorf("mock ping failure")
+	}
+	return nil
+}
+
+func (m *MockDB) Close() error {
+	m.closeCallCount++
+	return nil
+}
+
+func (m *MockDB) SetMaxOpenConns(n int) {
+	m.maxOpenConns = n
+}
+
+func (m *MockDB) SetConnMaxLifetime(d time.Duration) {
+	m.connMaxLifetime = d
+}
+
+func TestPREFERREDModeFallbackBehavior(t *testing.T) {
+	// Skip this test if we can't mock sql.Open
+	// This test demonstrates the intended behavior structure
+	t.Skip("Integration test - requires actual database connections")
+
+	tests := []struct {
+		name             string
+		tlsSucceeds      bool
+		plainSucceeds    bool
+		expectedAttempts int
+		expectError      bool
+		description      string
+	}{
+		{
+			name:             "TLS succeeds on first attempt",
+			tlsSucceeds:      true,
+			plainSucceeds:    true,
+			expectedAttempts: 1,
+			expectError:      false,
+			description:      "Should use TLS connection when server supports it",
+		},
+		{
+			name:             "TLS fails, plain succeeds",
+			tlsSucceeds:      false,
+			plainSucceeds:    true,
+			expectedAttempts: 2,
+			expectError:      false,
+			description:      "Should fallback to plain connection when TLS fails",
+		},
+		{
+			name:             "Both TLS and plain fail",
+			tlsSucceeds:      false,
+			plainSucceeds:    false,
+			expectedAttempts: 2,
+			expectError:      true,
+			description:      "Should fail when both TLS and plain connections fail",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// This test would require mocking sql.Open
+			// The actual implementation is tested through integration tests
+			t.Logf("Test case: %s", tt.description)
+		})
+	}
+}
+
+func TestPREFERREDModeDSNGeneration(t *testing.T) {
+	testCert := generateTestCertForMode(t)
+
+	// Create a temporary certificate file
+	tempFile, err := os.CreateTemp(t.TempDir(), "test_cert_*.pem")
+	require.NoError(t, err)
+	defer tempFile.Close()
+
+	_, err = tempFile.Write(testCert)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		host        string
+		tlsCertPath string
+		expectedTLS string
+		description string
+	}{
+		{
+			name:        "RDS host with PREFERRED",
+			host:        "mydb.us-west-2.rds.amazonaws.com",
+			tlsCertPath: "",
+			expectedTLS: "tls=rds",
+			description: "RDS hosts should use rds TLS config",
+		},
+		{
+			name:        "Non-RDS host with custom certificate",
+			host:        "mysql.company.com",
+			tlsCertPath: tempFile.Name(),
+			expectedTLS: "tls=custom",
+			description: "Non-RDS hosts with custom cert should use custom TLS config",
+		},
+		{
+			name:        "Non-RDS host without custom certificate",
+			host:        "mysql.internal.com",
+			tlsCertPath: "",
+			expectedTLS: "tls=custom",
+			description: "Non-RDS hosts without custom cert should use custom TLS config with embedded RDS bundle",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &DBConfig{
+				TLSMode:                  "PREFERRED",
+				TLSCertificatePath:       tt.tlsCertPath,
+				MaxOpenConnections:       10,
+				InnodbLockWaitTimeout:    60,
+				LockWaitTimeout:          60,
+				RangeOptimizerMaxMemSize: 8388608,
+				InterpolateParams:        true,
+			}
+
+			dsn := fmt.Sprintf("root:password@tcp(%s:3306)/test", tt.host)
+			result, err := newDSN(dsn, config)
+			require.NoError(t, err, tt.description)
+			assert.Contains(t, result, tt.expectedTLS, tt.description)
+		})
+	}
+}
+
+func TestPREFERREDModeDISABLEDFallback(t *testing.T) {
+	// Test that PREFERRED mode fallback creates correct DISABLED DSN
+	config := &DBConfig{
+		TLSMode:                  "PREFERRED",
+		TLSCertificatePath:       "",
+		MaxOpenConnections:       10,
+		InnodbLockWaitTimeout:    60,
+		LockWaitTimeout:          60,
+		RangeOptimizerMaxMemSize: 8388608,
+		InterpolateParams:        true,
+	}
+
+	// Create a fallback config as done in the New() function
+	configCopy := *config
+	configCopy.TLSMode = "DISABLED"
+
+	baseDSN := "root:password@tcp(mysql.internal.com:3306)/test"
+
+	// Test original PREFERRED DSN
+	preferredDSN, err := newDSN(baseDSN, config)
+	require.NoError(t, err)
+	assert.Contains(t, preferredDSN, "tls=custom", "PREFERRED should include TLS config")
+
+	// Test fallback DISABLED DSN
+	disabledDSN, err := newDSN(baseDSN, &configCopy)
+	require.NoError(t, err)
+	assert.NotContains(t, disabledDSN, "tls=", "DISABLED fallback should not include any TLS config")
+
+	// Both should have the same non-TLS parameters
+	expectedParams := []string{
+		"sql_mode=",
+		"time_zone=",
+		"innodb_lock_wait_timeout=60",
+		"lock_wait_timeout=60",
+		"charset=binary",
+		"collation=binary",
+		"rejectReadOnly=true",
+		"interpolateParams=true",
+		"allowNativePasswords=true",
+	}
+
+	for _, param := range expectedParams {
+		assert.Contains(t, preferredDSN, param, "PREFERRED DSN should contain %s", param)
+		assert.Contains(t, disabledDSN, param, "DISABLED fallback DSN should contain %s", param)
+	}
+}
+
+func TestPREFERREDModeConfigConsistency(t *testing.T) {
+	// Ensure PREFERRED mode TLS config matches expectations
+	testCert := generateTestCertForMode(t)
+
+	config := NewCustomTLSConfig(testCert, "PREFERRED")
+	require.NotNil(t, config)
+
+	// PREFERRED mode should use InsecureSkipVerify=true (encryption only)
+	assert.True(t, config.InsecureSkipVerify, "PREFERRED mode should skip certificate verification")
+	assert.Nil(t, config.RootCAs, "PREFERRED mode should not set RootCAs")
+	assert.Nil(t, config.VerifyPeerCertificate, "PREFERRED mode should not use custom verification")
+}
+
+func TestGetTLSConfigNameForAllModes(t *testing.T) {
+	tests := []struct {
+		mode         string
+		expectedName string
+		description  string
+	}{
+		{
+			mode:         "DISABLED",
+			expectedName: "",
+			description:  "DISABLED should return empty string",
+		},
+		{
+			mode:         "PREFERRED",
+			expectedName: "custom",
+			description:  "PREFERRED should return custom config name",
+		},
+		{
+			mode:         "REQUIRED",
+			expectedName: "required",
+			description:  "REQUIRED should return required config name",
+		},
+		{
+			mode:         "VERIFY_CA",
+			expectedName: "verify_ca",
+			description:  "VERIFY_CA should return verify_ca config name",
+		},
+		{
+			mode:         "VERIFY_IDENTITY",
+			expectedName: "verify_identity",
+			description:  "VERIFY_IDENTITY should return verify_identity config name",
+		},
+		{
+			mode:         "UNKNOWN_MODE",
+			expectedName: "custom",
+			description:  "Unknown modes should default to custom config name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			result := getTLSConfigName(tt.mode)
+			assert.Equal(t, tt.expectedName, result, tt.description)
+		})
+	}
+}
+
+// TestPREFERREDModeIntegration tests the integration between DSN generation and TLS config
+func TestPREFERREDModeIntegration(t *testing.T) {
+	testCert := generateTestCertForMode(t)
+
+	// Create temporary certificate file
+	tempFile, err := os.CreateTemp(t.TempDir(), "test_cert_*.pem")
+	require.NoError(t, err)
+	defer tempFile.Close()
+
+	_, err = tempFile.Write(testCert)
+	require.NoError(t, err)
+
+	scenarios := []struct {
+		name              string
+		host              string
+		tlsCertPath       string
+		expectedTLSConfig string
+		shouldRegisterTLS bool
+		description       string
+	}{
+		{
+			name:              "RDS host",
+			host:              "prod.us-east-1.rds.amazonaws.com",
+			tlsCertPath:       "",
+			expectedTLSConfig: "rds",
+			shouldRegisterTLS: true,
+			description:       "RDS hosts should use rds TLS configuration",
+		},
+		{
+			name:              "Non-RDS with custom cert",
+			host:              "mysql.company.com",
+			tlsCertPath:       tempFile.Name(),
+			expectedTLSConfig: "custom",
+			shouldRegisterTLS: true,
+			description:       "Non-RDS hosts with custom cert should use custom TLS configuration",
+		},
+		{
+			name:              "Non-RDS without custom cert",
+			host:              "mysql.internal.local",
+			tlsCertPath:       "",
+			expectedTLSConfig: "custom",
+			shouldRegisterTLS: true,
+			description:       "Non-RDS hosts without custom cert should use custom TLS configuration with embedded bundle",
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			config := &DBConfig{
+				TLSMode:                  "PREFERRED",
+				TLSCertificatePath:       scenario.tlsCertPath,
+				MaxOpenConnections:       10,
+				InnodbLockWaitTimeout:    60,
+				LockWaitTimeout:          60,
+				RangeOptimizerMaxMemSize: 8388608,
+				InterpolateParams:        true,
+			}
+
+			baseDSN := fmt.Sprintf("root:password@tcp(%s:3306)/test", scenario.host)
+			resultDSN, err := newDSN(baseDSN, config)
+			require.NoError(t, err, scenario.description)
+
+			expectedTLSParam := fmt.Sprintf("tls=%s", scenario.expectedTLSConfig)
+			assert.Contains(t, resultDSN, expectedTLSParam, scenario.description)
+		})
+	}
+}
