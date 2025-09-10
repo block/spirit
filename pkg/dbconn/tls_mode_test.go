@@ -475,7 +475,7 @@ func TestVERIFY_CAHostnameFlexibility(t *testing.T) {
 			case "VERIFY_CA":
 				assert.True(t, tlsConfig.InsecureSkipVerify, "VERIFY_CA uses InsecureSkipVerify=true with custom verification")
 				assert.NotNil(t, tlsConfig.VerifyPeerCertificate, "VERIFY_CA should have custom verification function")
-				assert.Equal(t, "", tlsConfig.ServerName, "VERIFY_CA should not set ServerName (allows hostname mismatches)")
+				assert.Empty(t, tlsConfig.ServerName, "VERIFY_CA should not set ServerName (allows hostname mismatches)")
 			case "VERIFY_IDENTITY":
 				assert.False(t, tlsConfig.InsecureSkipVerify, "VERIFY_IDENTITY should validate everything")
 				assert.Nil(t, tlsConfig.VerifyPeerCertificate, "VERIFY_IDENTITY uses default verification")
