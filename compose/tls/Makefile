@@ -85,7 +85,7 @@ verify-tls:
 	@echo "  ❌ DISABLED mode - should FAIL (server requires secure transport)"
 	@echo "  ✅ REQUIRED mode - should work (TLS connection required and available)"
 	@echo "  ✅ VERIFY_CA mode - should work (certificate verification)"
-	@echo "  ✅ VERIFY_IDENTITY mode - expected to fail (hostname mismatch, default MySQL certs)
+	@echo "  ✅ VERIFY_IDENTITY mode - expected to fail (hostname mismatch, default MySQL certs)"
 	@echo "  ✅ PREFERRED mode - should work (TLS available and preferred)"
 	@echo ""
 	@echo "Starting TLS-enabled tests..."
