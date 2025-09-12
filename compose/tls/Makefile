@@ -36,7 +36,7 @@ verify:
 	@echo ""
 	@echo "Starting tests..."
 	@echo ""
-	@./test-tls-modes.sh
+	@./test-tls-disabled.sh
 
 # Clean up containers and resources
 cleanup:
@@ -90,7 +90,7 @@ verify-tls:
 	@echo ""
 	@echo "Starting TLS-enabled tests..."
 	@echo ""
-	@./test-tls-enabled-modes.sh
+	@./test-tls-enabled.sh
 
 # Clean up TLS-enabled containers and resources
 cleanup-tls:
