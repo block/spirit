@@ -26,8 +26,7 @@ func TestKillLongRunningTransactions(t *testing.T) {
 	dbConfig.InterpolateParams = true
 	db, err := New(testutils.DSN(), dbConfig)
 	if err != nil {
-		t.Skipf("Database not available, skipping kill transactions test: %v", err)
-		return
+		t.Fatalf("Failed to create DB connection: %v", err)
 	}
 	defer db.Close()
 

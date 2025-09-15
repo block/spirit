@@ -17,10 +17,7 @@ func TestMetadataLock(t *testing.T) {
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test"}
 	logger := logrus.New()
 	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
-	if err != nil {
-		t.Skipf("Database not available, skipping metadata lock test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	assert.NotNil(t, mdl)
 
 	// Confirm a second lock cannot be acquired
@@ -42,10 +39,7 @@ func TestMetadataLockContextCancel(t *testing.T) {
 	logger := logrus.New()
 	ctx, cancel := context.WithCancel(t.Context())
 	mdl, err := NewMetadataLock(ctx, testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
-	if err != nil {
-		t.Skipf("Database not available, skipping metadata lock context cancel test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	assert.NotNil(t, mdl)
 
 	// Cancel the context
@@ -69,10 +63,7 @@ func TestMetadataLockRefresh(t *testing.T) {
 		// override the refresh interval for faster testing
 		mdl.refreshInterval = 1 * time.Second
 	})
-	if err != nil {
-		t.Skipf("Database not available, skipping metadata lock refresh test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	assert.NotNil(t, mdl)
 
 	// wait for the refresh to happen
@@ -115,10 +106,7 @@ func TestMetadataLockLength(t *testing.T) {
 	logger := logrus.New()
 
 	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger)
-	if err != nil {
-		t.Skipf("Database not available, skipping metadata lock length test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	defer mdl.Close()
 
 	_, err = NewMetadataLock(t.Context(), testutils.DSN(), empty, NewDBConfig(), logger)
@@ -144,10 +132,7 @@ func TestMetadataLockRefreshWithConnIssueSimulation(t *testing.T) {
 	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), &lockTableInfo, NewDBConfig(), logger, func(mdl *MetadataLock) {
 		mdl.refreshInterval = 2 * time.Second
 	})
-	if err != nil {
-		t.Skipf("Database not available, skipping metadata lock refresh with connection issue test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	assert.NotNil(t, mdl)
 
 	time.Sleep(4 * time.Second)

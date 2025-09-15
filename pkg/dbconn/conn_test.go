@@ -55,11 +55,6 @@ func TestNewConn(t *testing.T) {
 	assert.Nil(t, db)
 
 	db, err = New(testutils.DSN(), NewDBConfig())
-	if err != nil {
-		// Skip the test if no database is available (connection refused)
-		t.Skipf("Database not available, skipping connection test: %v", err)
-		return
-	}
 	assert.NoError(t, err)
 	if db != nil {
 		defer db.Close()
@@ -77,12 +72,9 @@ func TestNewConn(t *testing.T) {
 }
 
 func TestNewConnRejectsReadOnlyConnections(t *testing.T) {
-	// Skip if database is not available
+	// Database connection check
 	db, err := New(testutils.DSN(), NewDBConfig())
-	if err != nil {
-		t.Skipf("Database not available, skipping read-only connection test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	db.Close()
 
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS conn_read_only")

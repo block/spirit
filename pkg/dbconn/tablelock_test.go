@@ -18,10 +18,7 @@ func testConfig() *DBConfig {
 
 func TestTableLock(t *testing.T) {
 	db, err := New(testutils.DSN(), testConfig())
-	if err != nil {
-		t.Skipf("Database not available, skipping table lock test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	defer db.Close()
 	err = Exec(t.Context(), db, "DROP TABLE IF EXISTS testlock, _testlock_new")
 	assert.NoError(t, err)
@@ -45,10 +42,7 @@ func TestTableLock(t *testing.T) {
 
 func TestExecUnderLock(t *testing.T) {
 	db, err := New(testutils.DSN(), testConfig())
-	if err != nil {
-		t.Skipf("Database not available, skipping exec under lock test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	defer db.Close()
 	err = Exec(t.Context(), db, "DROP TABLE IF EXISTS testunderlock, _testunderlock_new")
 	assert.NoError(t, err)
@@ -71,10 +65,7 @@ func TestExecUnderLock(t *testing.T) {
 
 func TestTableLockMultiple(t *testing.T) {
 	db, err := New(testutils.DSN(), testConfig())
-	if err != nil {
-		t.Skipf("Database not available, skipping table lock multiple test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	defer db.Close()
 
 	// Create multiple test tables
@@ -134,10 +125,7 @@ func TestTableLockMultiple(t *testing.T) {
 
 func TestTableLockFail(t *testing.T) {
 	db, err := New(testutils.DSN(), testConfig())
-	if err != nil {
-		t.Skipf("Database not available, skipping table lock fail test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	defer db.Close()
 
 	err = Exec(t.Context(), db, "DROP TABLE IF EXISTS test.testlockfail")

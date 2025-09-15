@@ -11,17 +11,12 @@ import (
 
 func TestTrxPool(t *testing.T) {
 	db, err := sql.Open("mysql", testutils.DSN())
-	if err != nil {
-		t.Skipf("Database not available, skipping transaction pool test: %v", err)
-		return
-	}
+	assert.NoError(t, err)
 	defer db.Close()
 
 	// Test database connectivity before proceeding
-	if err := db.Ping(); err != nil {
-		t.Skipf("Database not available, skipping transaction pool test: %v", err)
-		return
-	}
+	err = db.Ping()
+	assert.NoError(t, err)
 
 	config := NewDBConfig()
 	config.LockWaitTimeout = 10
