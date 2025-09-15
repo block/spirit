@@ -506,7 +506,6 @@ func (r *Runner) setup(ctx context.Context) error {
 			TargetBatchTime: r.migration.TargetChunkTime,
 			OnDDL:           r.ddlNotification,
 			ServerID:        repl.NewServerID(),
-			DBConfig:        r.dbConfig,
 		})
 
 		for _, change := range r.changes {
@@ -524,7 +523,17 @@ func (r *Runner) setup(ctx context.Context) error {
 	// Otherwise, it will default to the NOOP throttler.
 	var err error
 	if r.migration.ReplicaDSN != "" {
-		r.replica, err = dbconn.New(r.migration.ReplicaDSN, r.dbConfig)
+		// Create a separate DB config for replica connection without TLS overrides
+		// The replica DSN should contain its own TLS configuration
+		replicaDBConfig := dbconn.NewDBConfig()
+		replicaDBConfig.LockWaitTimeout = r.dbConfig.LockWaitTimeout
+		replicaDBConfig.InterpolateParams = r.dbConfig.InterpolateParams
+		replicaDBConfig.ForceKill = r.dbConfig.ForceKill
+		replicaDBConfig.MaxOpenConnections = r.dbConfig.MaxOpenConnections
+		// Note: Deliberately NOT copying TLS settings (TLSMode, TLSCertificatePath)
+		// Replica TLS configuration will be handled in a separate PR
+
+		r.replica, err = dbconn.New(r.migration.ReplicaDSN, replicaDBConfig)
 		if err != nil {
 			return err
 		}
@@ -795,7 +804,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		TargetBatchTime: r.migration.TargetChunkTime,
 		OnDDL:           r.ddlNotification,
 		ServerID:        repl.NewServerID(),
-		DBConfig:        r.dbConfig,
 	})
 	if err := r.replClient.AddSubscription(r.changes[0].table, r.changes[0].newTable, r.copier.KeyAboveHighWatermark); err != nil {
 		return err

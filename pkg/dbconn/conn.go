@@ -206,33 +206,8 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	case "DISABLED":
 		// No TLS - don't add any TLS parameters
 
-	case "PREFERRED":
-		// Try to establish TLS if server supports it
-		// For RDS hosts, always use TLS. For others, attempt TLS gracefully
-		if IsRDSHost(cfg.Addr) {
-			if err = initRDSTLS(); err != nil {
-				return "", err
-			}
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
-		} else if config.TLSCertificatePath != "" {
-			// Custom certificate provided - use it
-			if err = initCustomTLS(config); err != nil {
-				return "", err
-			}
-			configName := getTLSConfigName(config.TLSMode)
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
-		} else {
-			// For non-RDS hosts without custom cert, use permissive TLS (encryption only)
-			if err = initCustomTLS(config); err != nil {
-				return "", err
-			}
-			configName := getTLSConfigName(config.TLSMode)
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
-		}
-		// PREFERRED mode always attempts TLS but doesn't fail if unavailable
-
 	case "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY":
-		// TLS is required - determine which certificate to use
+		// TLS with certificate selection - determine which certificate to use
 		if config.TLSCertificatePath != "" {
 			// Use custom certificate
 			if err = initCustomTLS(config); err != nil {
@@ -255,13 +230,24 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
 		}
 
+	case "PREFERRED":
+		fallthrough // Use same logic as default case
+
 	default:
-		// Unknown mode - default to PREFERRED behavior
+		// PREFERRED and unknown modes - use permissive TLS behavior
+		// For RDS hosts, use RDS certificate. For others, use embedded RDS bundle as fallback
 		if IsRDSHost(cfg.Addr) {
 			if err = initRDSTLS(); err != nil {
 				return "", err
 			}
 			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
+		} else {
+			// Use embedded RDS bundle as fallback for non-RDS hosts
+			if err = initCustomTLS(config); err != nil {
+				return "", err
+			}
+			configName := getTLSConfigName(config.TLSMode)
+			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
 		}
 	}
 

@@ -17,7 +17,6 @@ import (
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestMain(m *testing.M) {
@@ -621,60 +620,4 @@ func TestAllChangesFlushed(t *testing.T) {
 
 	subQueue.keyHasChanged([]any{3}, false)
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with items in queue")
-}
-
-func TestReplClientTLSConfiguration(t *testing.T) {
-	logger := logrus.New()
-
-	// Test creating client with different TLS modes
-	testCases := []struct {
-		name     string
-		tlsMode  string
-		certPath string
-		wantErr  bool
-	}{
-		{
-			name:    "disabled mode",
-			tlsMode: "DISABLED",
-			wantErr: false,
-		},
-		{
-			name:    "preferred mode",
-			tlsMode: "PREFERRED",
-			wantErr: false,
-		},
-		{
-			name:    "required mode",
-			tlsMode: "REQUIRED",
-			wantErr: false,
-		},
-		{
-			name:    "verify_ca mode",
-			tlsMode: "VERIFY_CA",
-			wantErr: false,
-		},
-		{
-			name:    "verify_identity mode",
-			tlsMode: "VERIFY_IDENTITY",
-			wantErr: false,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			dbConfig := &dbconn.DBConfig{
-				TLSMode:            tc.tlsMode,
-				TLSCertificatePath: tc.certPath,
-			}
-
-			client := NewClient(nil, "localhost:3306", "user", "pass", &ClientConfig{
-				Logger:   logger,
-				ServerID: NewServerID(),
-				DBConfig: dbConfig,
-			})
-
-			require.NotNil(t, client)
-			assert.Equal(t, dbConfig, client.dbConfig)
-		})
-	}
 }

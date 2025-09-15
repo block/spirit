@@ -93,13 +93,9 @@ type Client struct {
 
 // NewClient creates a new Client instance.
 func NewClient(db *sql.DB, host string, username, password string, config *ClientConfig) *Client {
-	dbConfig := config.DBConfig
-	if dbConfig == nil {
-		dbConfig = dbconn.NewDBConfig()
-	}
 	return &Client{
 		db:              db,
-		dbConfig:        dbConfig,
+		dbConfig:        dbconn.NewDBConfig(),
 		host:            host,
 		username:        username,
 		password:        password,
@@ -119,7 +115,6 @@ type ClientConfig struct {
 	Logger          loggers.Advanced
 	OnDDL           chan string
 	ServerID        uint32
-	DBConfig        *dbconn.DBConfig
 }
 
 // NewServerID randomizes the server ID to avoid conflicts with other binlog readers.
@@ -136,7 +131,6 @@ func NewClientDefaultConfig() *ClientConfig {
 		Logger:          logrus.New(),
 		OnDDL:           nil,
 		ServerID:        NewServerID(),
-		DBConfig:        dbconn.NewDBConfig(),
 	}
 }
 
@@ -261,48 +255,12 @@ func (c *Client) Run(ctx context.Context) (err error) {
 		Password: c.password,
 		Logger:   NewLogWrapper(c.logger),
 	}
-
-	// Configure TLS using the same logic as dbconn.newDSN()
-	if c.dbConfig != nil {
-		switch c.dbConfig.TLSMode {
-		case "DISABLED":
-			// No TLS configuration needed
-
-		case "PREFERRED":
-			// Try to establish TLS if server supports it
-			// For RDS hosts, always use TLS. For others, attempt TLS gracefully
-			if dbconn.IsRDSHost(c.host) {
-				// Use RDS TLS configuration
-				cfg.TLSConfig = dbconn.NewTLSConfig()
-			} else if c.dbConfig.TLSCertificatePath != "" {
-				// Custom certificate provided - use it
-				certData, err := dbconn.LoadCertificateFromFile(c.dbConfig.TLSCertificatePath)
-				if err != nil {
-					return fmt.Errorf("failed to load custom certificate: %w", err)
-				}
-				cfg.TLSConfig = dbconn.NewCustomTLSConfig(certData, c.dbConfig.TLSMode)
-			} else {
-				// For non-RDS hosts without custom cert, use embedded RDS bundle as fallback
-				cfg.TLSConfig = dbconn.NewCustomTLSConfig(dbconn.GetEmbeddedRDSBundle(), c.dbConfig.TLSMode)
-			}
-
-		case "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY":
-			// TLS is required - determine which certificate to use
-			if c.dbConfig.TLSCertificatePath != "" {
-				// Use custom certificate
-				certData, err := dbconn.LoadCertificateFromFile(c.dbConfig.TLSCertificatePath)
-				if err != nil {
-					return fmt.Errorf("failed to load custom certificate: %w", err)
-				}
-				cfg.TLSConfig = dbconn.NewCustomTLSConfig(certData, c.dbConfig.TLSMode)
-			} else if dbconn.IsRDSHost(c.host) {
-				// Use RDS certificate for RDS hosts
-				cfg.TLSConfig = dbconn.NewTLSConfig()
-			} else {
-				// Use embedded RDS bundle as fallback for non-RDS hosts
-				cfg.TLSConfig = dbconn.NewCustomTLSConfig(dbconn.GetEmbeddedRDSBundle(), c.dbConfig.TLSMode)
-			}
-		}
+	if dbconn.IsRDSHost(c.host) {
+		cfg.TLSConfig = dbconn.NewTLSConfig()
+	}
+	if cfg.TLSConfig != nil {
+		// Set the ServerName so that the TLS config can verify the server's certificate.
+		cfg.TLSConfig.ServerName = host
 	}
 	if dbconn.IsMySQL84(c.db) { // handle MySQL 8.4
 		c.isMySQL84 = true
