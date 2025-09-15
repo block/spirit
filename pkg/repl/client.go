@@ -365,7 +365,14 @@ func (c *Client) processDDLNotification(table string) {
 	if c.onDDL == nil {
 		return // no one is listening for DDL events
 	}
-	c.onDDL <- table
+	// Use non-blocking send to prevent deadlock
+	select {
+	case c.onDDL <- table:
+		// Successfully sent notification
+	default:
+		// Channel is full or blocked, skip notification to prevent deadlock
+		// This is acceptable as DDL notifications are best-effort
+	}
 }
 
 // processRowsEvent processes a RowsEvent. It will search all active
