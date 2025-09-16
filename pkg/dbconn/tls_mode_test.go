@@ -871,3 +871,129 @@ func TestPREFERREDModeIntegration(t *testing.T) {
 		})
 	}
 }
+
+func TestTLSModeCaseInsensitive(t *testing.T) {
+	// Test that TLS mode values are case insensitive
+	testCases := []struct {
+		name        string
+		tlsMode     string
+		expectedDSN string
+	}{
+		{
+			name:        "lowercase disabled",
+			tlsMode:     "disabled",
+			expectedDSN: "", // DISABLED mode should not add TLS params
+		},
+		{
+			name:        "lowercase preferred",
+			tlsMode:     "preferred",
+			expectedDSN: "tls=custom",
+		},
+		{
+			name:        "lowercase required",
+			tlsMode:     "required",
+			expectedDSN: "tls=required",
+		},
+		{
+			name:        "lowercase verify_ca",
+			tlsMode:     "verify_ca",
+			expectedDSN: "tls=verify_ca",
+		},
+		{
+			name:        "lowercase verify_identity",
+			tlsMode:     "verify_identity",
+			expectedDSN: "tls=verify_identity",
+		},
+		{
+			name:        "mixed case Required",
+			tlsMode:     "Required",
+			expectedDSN: "tls=required",
+		},
+		{
+			name:        "mixed case Verify_Ca",
+			tlsMode:     "Verify_Ca",
+			expectedDSN: "tls=verify_ca",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &DBConfig{
+				TLSMode:                  tc.tlsMode,
+				TLSCertificatePath:       "",
+				MaxOpenConnections:       10,
+				InnodbLockWaitTimeout:    60,
+				LockWaitTimeout:          60,
+				RangeOptimizerMaxMemSize: 8388608,
+				InterpolateParams:        true,
+			}
+
+			baseDSN := "root:password@tcp(mysql.company.com:3306)/test"
+			resultDSN, err := newDSN(baseDSN, config)
+			require.NoError(t, err)
+
+			if tc.expectedDSN == "" {
+				// DISABLED mode should not contain any TLS parameters
+				assert.NotContains(t, resultDSN, "tls=")
+			} else {
+				assert.Contains(t, resultDSN, tc.expectedDSN)
+			}
+		})
+	}
+}
+
+func TestTLSConfigCaseInsensitive(t *testing.T) {
+	// Test that getTLSConfigName works with case insensitive input
+	testCases := []struct {
+		input    string
+		expected string
+	}{
+		{"disabled", ""},
+		{"DISABLED", ""},
+		{"Disabled", ""},
+		{"preferred", customTLSConfigName},
+		{"PREFERRED", customTLSConfigName},
+		{"Preferred", customTLSConfigName},
+		{"required", requiredTLSConfigName},
+		{"REQUIRED", requiredTLSConfigName},
+		{"Required", requiredTLSConfigName},
+		{"verify_ca", verifyCATLSConfigName},
+		{"VERIFY_CA", verifyCATLSConfigName},
+		{"Verify_Ca", verifyCATLSConfigName},
+		{"verify_identity", verifyIDTLSConfigName},
+		{"VERIFY_IDENTITY", verifyIDTLSConfigName},
+		{"Verify_Identity", verifyIDTLSConfigName},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.input, func(t *testing.T) {
+			result := getTLSConfigName(tc.input)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestNewCustomTLSConfigCaseInsensitive(t *testing.T) {
+	// Test that NewCustomTLSConfig works with case insensitive input
+	certData := generateTestCertForMode(t)
+
+	testCases := []string{
+		"preferred", "PREFERRED", "Preferred",
+		"required", "REQUIRED", "Required",
+		"verify_ca", "VERIFY_CA", "Verify_Ca",
+		"verify_identity", "VERIFY_IDENTITY", "Verify_Identity",
+	}
+
+	for _, mode := range testCases {
+		t.Run(mode, func(t *testing.T) {
+			config := NewCustomTLSConfig(certData, mode)
+			assert.NotNil(t, config, "Should create valid TLS config for mode: %s", mode)
+
+			// All non-DISABLED modes should have some configuration
+			if mode != "disabled" && mode != "DISABLED" && mode != "Disabled" {
+				assert.True(t, config.InsecureSkipVerify || config.RootCAs != nil || config.VerifyPeerCertificate != nil,
+					"TLS config should have some security settings for mode: %s", mode)
+			}
+		})
+	}
+}

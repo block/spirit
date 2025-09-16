@@ -54,7 +54,7 @@ func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(certData)
 
-	switch sslMode {
+	switch strings.ToUpper(sslMode) {
 	case "DISABLED":
 		// This shouldn't be called for DISABLED mode, but handle gracefully
 		return nil
@@ -173,7 +173,7 @@ func initCustomTLS(config *DBConfig) error {
 
 // getTLSConfigName returns the appropriate TLS config name for the mode
 func getTLSConfigName(mode string) string {
-	switch mode {
+	switch strings.ToUpper(mode) {
 	case "DISABLED":
 		// This should never be called for DISABLED mode, but handle gracefully
 		return ""
@@ -202,7 +202,7 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	}
 
 	// Determine TLS configuration strategy based on SSL mode
-	switch config.TLSMode {
+	switch strings.ToUpper(config.TLSMode) {
 	case "DISABLED":
 		// No TLS - don't add any TLS parameters
 

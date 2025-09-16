@@ -38,7 +38,7 @@ type Migration struct {
 	Strict               bool          `name:"strict" help:"Exit on --alter mismatch when incomplete migration is detected" optional:"" default:"false"`
 	Statement            string        `name:"statement" help:"The SQL statement to run (replaces --table and --alter)" optional:"" default:""`
 	// TLS Configuration
-	TLSMode            string `name:"tls-mode" help:"TLS connection mode: DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:"" default:"PREFERRED"`
+	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:"" default:"PREFERRED"`
 	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
 	// Hidden options for now.
 	InterpolateParams bool `name:"interpolate-params" help:"Enable interpolate params for DSN" optional:"" default:"false" hidden:""`
