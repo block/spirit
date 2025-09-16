@@ -36,11 +36,20 @@ Checksum failure is not fatal. Spirit will re-copy chunks that fail checksums au
 
 In testing, the checksum feature has identified corruption issues on desktops with non ECC memory. You may believe that this is what the InnoDB page checksums are for, but they are more specifically for detecting corruption introduced from the IO layer. Memory based corruption is not detected and remains common.
 
-### creds-file
+### conf
 
 - Type: String
 
-Path to INI file containing username and password to be used when connecting to MySQL. Spirit expects the 'user' and 'password' to be defined in a 'client' section within the INI file. Values provided in file take precedence over what's provided in the `--username` and `--password` arguments to spirit.
+Optional path to INI file containing host, port, username, password, and database to be used when connecting to MySQL. Spirit will only interpret the `[client]` section within the INI file and ignore all other sections. Values for `--host`, `--username`, `--password`, and `--database` provided via command line arguments to Spirit take precedence over what is provided in file.
+
+Expected INI file format:
+```
+[client]
+user=$username
+password=$password
+host=$hostname
+port=$port
+```
 
 ### database
 
@@ -97,7 +106,7 @@ GRANT CONNECTION_ADMIN, PROCESS ON *.* TO spirituser;
 - Default value: `localhost:3306`
 - Examples: `mydbhost`, `mydbhost:3307`
 
-The host (and optional port) to use when connecting to MySQL.
+The host (and optional port) to use when connecting to MySQL. If no port is provided, 3306 is used.
 
 ### lock-wait-timeout
 
