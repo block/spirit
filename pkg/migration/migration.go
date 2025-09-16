@@ -20,8 +20,8 @@ var (
 	ErrMismatchedAlter = errors.New("alter statement in checkpoint table does not match the alter statement specified here")
 	defaultHost        = "127.0.0.1"
 	defaultPort        = 3306
-	defaultUsername    = "msandbox"
-	defaultPassword    = "msandbox"
+	defaultUsername    = "spirit"
+	defaultPassword    = "spirit"
 	defaultDatabase    = "test"
 )
 
