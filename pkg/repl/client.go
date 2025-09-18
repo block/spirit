@@ -387,31 +387,77 @@ func (c *Client) processRowsEvent(ev *replication.BinlogEvent, e *replication.Ro
 		return nil // ignore event, it could be to a _new table.
 	}
 	eventType := parseEventType(ev.Header.EventType)
-	var i = 0
-	for _, row := range e.Rows {
-		if eventType == eventTypeUpdate {
-			// For update events there are always before and after images (i.e. e.Rows is always in pairs.)
-			// We only need to capture one of the events, and since in MINIMAL RBR row
-			// image the PK is only included in the before, we chose that one.
-			i++
-			if i%2 == 0 {
-				continue
+
+	if eventType == eventTypeUpdate {
+		// For update events there are always before and after images (i.e. e.Rows is always in pairs.)
+		// With MINIMAL row image, the PK is only included in the before image for non-PK updates.
+		// For PK updates, both before and after images will contain the PK columns since they changed.
+		for i := 0; i < len(e.Rows); i += 2 {
+			beforeRow := e.Rows[i]
+			afterRow := e.Rows[i+1]
+
+			// Always process the before image (guaranteed to have PK in minimal mode)
+			beforeKey, err := sub.table.PrimaryKeyValues(beforeRow)
+			if err != nil {
+				return err
+			}
+			if len(beforeKey) == 0 {
+				return fmt.Errorf("no primary key found for before row: %#v", beforeRow)
+			}
+
+			// With MINIMAL row image, we need to reconstruct the after key
+			// by combining the before key with any changed PK columns from the after image
+			afterKey := make([]any, len(beforeKey))
+			copy(afterKey, beforeKey) // Start with the before key
+
+			// Check if any PK columns were updated by examining the after row
+			isPKUpdate := false
+			afterRowSlice := afterRow
+
+			for pkIdx, pkCol := range sub.table.KeyColumns {
+				// Find the position of this PK column in the table columns
+				for colIdx, col := range sub.table.Columns {
+					if col == pkCol {
+						// If this column exists in the after image and is not nil, use it
+						if colIdx < len(afterRowSlice) && afterRowSlice[colIdx] != nil {
+							if fmt.Sprintf("%v", beforeKey[pkIdx]) != fmt.Sprintf("%v", afterRowSlice[colIdx]) {
+								afterKey[pkIdx] = afterRowSlice[colIdx]
+								isPKUpdate = true
+							}
+						}
+						break
+					}
+				}
+			}
+
+			if isPKUpdate {
+				// This is a primary key update - track both delete and insert
+				sub.keyHasChanged(beforeKey, true)  // delete old key
+				sub.keyHasChanged(afterKey, false) // insert new key
+			} else {
+				// Same PK, just a regular update
+				sub.keyHasChanged(beforeKey, false)
 			}
 		}
-		key, err := sub.table.PrimaryKeyValues(row)
-		if err != nil {
-			return err
-		}
-		if len(key) == 0 {
-			return fmt.Errorf("no primary key found for row: %#v", row)
-		}
-		switch eventType {
-		case eventTypeInsert, eventTypeUpdate:
-			sub.keyHasChanged(key, false)
-		case eventTypeDelete:
-			sub.keyHasChanged(key, true)
-		default:
-			c.logger.Errorf("unknown event type: %v", ev.Header.EventType)
+	} else {
+		// For INSERT and DELETE events, process each row normally
+		for _, row := range e.Rows {
+			key, err := sub.table.PrimaryKeyValues(row)
+			if err != nil {
+				return err
+			}
+			if len(key) == 0 {
+				// In theory this is unreachable since we mandate a PK on tables
+				return fmt.Errorf("no primary key found for row: %#v", row)
+			}
+			switch eventType {
+			case eventTypeInsert:
+				sub.keyHasChanged(key, false)
+			case eventTypeDelete:
+				sub.keyHasChanged(key, true)
+			default:
+				c.logger.Errorf("unknown event type: %v", ev.Header.EventType)
+			}
 		}
 	}
 	return nil
