@@ -19,6 +19,7 @@ func DSN() string {
 }
 
 func RunSQL(t *testing.T, stmt string) {
+	t.Helper()
 	db, err := sql.Open("mysql", DSN())
 	assert.NoError(t, err)
 	defer db.Close()

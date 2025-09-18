@@ -360,9 +360,14 @@ func (c *Checker) initConnPool(ctx context.Context) error {
 }
 
 func (c *Checker) Run(ctx context.Context) error {
+	// Set startTime under lock to prevent race with StartTime() method
+	c.Lock()
 	c.startTime = time.Now()
+	startTime := c.startTime // capture for defer
+	c.Unlock()
+
 	defer func() {
-		c.ExecTime = time.Since(c.startTime)
+		c.ExecTime = time.Since(startTime)
 	}()
 
 	// initConnPool initialize the connection pool.
