@@ -201,3 +201,115 @@ Note that Spirit does not support dynamically adjusting the number of threads wh
 - Default value: `spirit`
 
 The username to use when connecting to MySQL.
+
+
+### tls
+Spirit uses the same TLS/SSL mode options as the MySQL client, making it familiar and intuitive for users. 
+
+| Mode | Description | Encryption | CA Verification | Hostname Verification | --tls-ca Required? |
+|------|-------------|------------|-----------------|----------------------|-------------------|
+| `DISABLED` | No TLS encryption | ❌ No | ❌ No | ❌ No | ❌ Never needed |
+| `PREFERRED` | TLS if server supports it (default) | ✅ If available | ❌ No | ❌ No | ❌ Never needed |
+| `REQUIRED` | TLS required, connection fails if unavailable | ✅ Required | ❌ No | ❌ No | ❌ Never needed |
+| `VERIFY_CA` | TLS required + verify server certificate | ✅ Required | ✅ Yes | ❌ No | ⚠️ Optional* |
+| `VERIFY_IDENTITY` | Full verification including hostname | ✅ Required | ✅ Yes | ✅ Yes | ⚠️ Optional* |
+
+Configuration Flags:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--tls-mode` | TLS connection mode (see table above) | `PREFERRED` |
+| `--tls-ca` | Path to custom TLS CA certificate file | `""` |
+
+**\* Optional but recommended**: These modes can use the embedded RDS certificate bundle as a fallback, but providing `--tls-ca` gives you full control over which Certificate Authorities are trusted.
+
+**Examples:**
+#### PREFERRED Mode - Default Behavior
+```bash
+# Add a column with automatic TLS detection (default mode)
+spirit --tls-mode PREFERRED \
+       --host mydb.us-west-2.rds.amazonaws.com:3306 \
+       --username admin \
+       --password mypassword \
+       --database production \
+       --table users \
+       --alter "ADD COLUMN last_login_ip VARCHAR(45) AFTER last_login" \
+       --threads 8 \
+       --chunk-size 2000
+```
+**Result**: Automatically uses TLS for RDS hosts with embedded certificates, optional for others.
+
+#### REQUIRED Mode - Force TLS Without Certificate Verification
+```bash
+# Add a column requiring TLS but not verifying certificates
+spirit --tls-mode REQUIRED \
+       --host mysql.staging.company.com:3306 \
+       --username staging_user \
+       --password staging_pass \
+       --database inventory \
+       --table products \
+       --alter "ADD COLUMN supplier_notes JSON AFTER supplier_id" \
+       --threads 6 \
+       --chunk-size 1500
+```
+**Result**: TLS encryption required, but accepts self-signed or invalid certificates.
+
+#### VERIFY_CA Mode - Certificate Verification Without Hostname Check
+```bash
+# Add a column with CA verification using custom certificate
+spirit --tls-mode VERIFY_CA \
+       --tls-ca /etc/ssl/certs/company-ca-bundle.pem \
+       --host 192.168.1.100:3306 \
+       --username app_user \
+       --password app_password \
+       --database analytics \
+       --table events \
+       --alter "ADD COLUMN event_metadata JSON AFTER event_type" \
+       --threads 4 \
+       --chunk-size 1000
+```
+**Result**: Verifies certificate against custom CA bundle but allows IP addresses/hostname mismatches.
+
+```bash
+# Add a column using embedded RDS certificate for non-RDS MySQL server
+spirit --tls-mode VERIFY_CA \
+       --host mysql.internal.corp:3306 \
+       --username internal_user \
+       --password internal_pass \
+       --database hr_system \
+       --table employees \
+       --alter "ADD COLUMN emergency_contact VARCHAR(255) AFTER phone_number" \
+       --threads 2 \
+       --chunk-size 500
+```
+**Result**: Uses embedded RDS certificate bundle as fallback for certificate verification.
+
+#### VERIFY_IDENTITY Mode - Full Certificate and Hostname Verification
+```bash
+# Add a column with maximum security verification
+spirit --tls-mode VERIFY_IDENTITY \
+       --tls-ca /opt/certificates/production-ca.pem \
+       --host mysql.secure.company.com:3306 \
+       --username secure_user \
+       --password very_secure_password \
+       --database financial \
+       --table transactions \
+       --alter "ADD COLUMN fraud_score DECIMAL(5,4) AFTER amount" \
+       --threads 8 \
+       --chunk-size 2000
+```
+**Result**: Full TLS verification including hostname matching - maximum security. Custom certificate takes precedence over RDS auto-detection.
+
+```bash
+# Add a column to RDS with full verification using auto-detected certificate
+spirit --tls-mode VERIFY_IDENTITY \
+       --host prod-db.cluster-xyz.us-east-1.rds.amazonaws.com:3306 \
+       --username rds_admin \
+       --password rds_password \
+       --database customer_data \
+       --table profiles \
+       --alter "ADD COLUMN gdpr_consent_date DATETIME AFTER created_at" \
+       --threads 10 \
+       --chunk-size 3000
+```
+**Result**: Uses embedded RDS certificate with full verification for RDS hostname.

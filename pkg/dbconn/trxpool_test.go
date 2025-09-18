@@ -13,6 +13,11 @@ func TestTrxPool(t *testing.T) {
 	db, err := sql.Open("mysql", testutils.DSN())
 	assert.NoError(t, err)
 	defer db.Close()
+
+	// Test database connectivity before proceeding
+	err = db.Ping()
+	assert.NoError(t, err)
+
 	config := NewDBConfig()
 	config.LockWaitTimeout = 10
 	err = Exec(t.Context(), db, "DROP TABLE IF EXISTS test.trxpool")
