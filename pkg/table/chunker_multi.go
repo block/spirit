@@ -39,7 +39,12 @@ func (m *multiChunker) Open() error {
 		return errors.New("multi-chunker is already open")
 	}
 
-	// For now, The child chunkers are already open.
+	// Open each of the child chunkers.
+	for _, chunker := range m.chunkers {
+		if err := chunker.Open(); err != nil {
+			return fmt.Errorf("failed to open child chunker: %w", err)
+		}
+	}
 	m.isOpen = true
 	return nil
 }
@@ -170,12 +175,24 @@ func (m *multiChunker) OpenAtWatermark(watermark string, datum Datum, rowsCopied
 	return errors.New("OpenAtWatermark not yet implemented for multi-chunker")
 }
 
-// GetLowWatermark is not yet implemented for multi-chunker
+// GetLowWatermark calls GetLowWatermark on all the child chunkers
+// and then merges them into a single watermark string.
 func (m *multiChunker) GetLowWatermark() (string, error) {
-	return "", errors.New("GetLowWatermark not yet implemented for multi-chunker")
+	watermarks := make([]string, 0, len(m.chunkers))
+	for _, chunker := range m.chunkers {
+		watermark, err := chunker.GetLowWatermark()
+		if err != nil {
+			return "", err
+		}
+		tbl := chunker.Tables()[0]
+		watermarks = append(watermarks, fmt.Sprintf("tbl=%s watermark=%q", tbl.TableName, watermark))
+	}
+
+	return fmt.Sprintf("%q", watermarks), nil
 }
 
 // Tables returns all tables from all chunkers
+// By convention the first table is always the one being migrated.
 func (m *multiChunker) Tables() []*TableInfo {
 	m.Lock()
 	defer m.Unlock()
@@ -192,6 +209,5 @@ func (m *multiChunker) Tables() []*TableInfo {
 			}
 		}
 	}
-
 	return allTables
 }

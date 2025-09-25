@@ -35,10 +35,15 @@ type Chunker interface {
 	Next() (*Chunk, error)
 	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)
 	KeyAboveHighWatermark(key any) bool
-	Progress() (uint64, uint64, uint64) // Returns (rowsRead, chunksCopied, totalRowsExpected)
+	Progress() (rowsRead uint64, chunksCopied uint64, totalRowsExpected uint64)
 	OpenAtWatermark(watermark string, datum Datum, rowsCopied uint64) error
 	GetLowWatermark() (string, error)
-	Tables() []*TableInfo // return a list of table names
+	// Tables return a list of table names
+	// By convention the first table is the "current" table,
+	// and the second table (if any) is the "new" table.
+	// There could be more than 2 tables in the case of multi-chunker.
+	// In which case every second table is the "new" table, etc.
+	Tables() []*TableInfo
 }
 
 func newChunker(t *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced) (Chunker, error) {
