@@ -44,12 +44,14 @@ type Runner struct {
 
 	currentState migrationState // must use atomic to get/set
 	replClient   *repl.Client   // feed contains all binlog subscription activity.
-	copier       copier.Copier
 	throttler    throttler.Throttler
-	checker      *checksum.Checker
-	checkerLock  sync.Mutex
 
-	copyChunker     table.Chunker // the chunker for copying
+	copier       copier.Copier
+	copyChunker  table.Chunker // the chunker for copying
+	copyDuration time.Duration // how long the copy took
+
+	checker         *checksum.Checker
+	checkerLock     sync.Mutex
 	checksumChunker table.Chunker // the chunker for checksum
 
 	// used to recover direct to checksum.
@@ -253,6 +255,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 		return err
 	}
 	r.logger.Info("copy rows complete")
+	r.copyDuration = time.Since(r.copier.StartTime())
 	r.replClient.SetKeyAboveWatermarkOptimization(false) // should no longer be used.
 
 	// r.waitOnSentinel may return an error if there is
@@ -325,7 +328,7 @@ func (r *Runner) Run(originalCtx context.Context) error {
 		r.usedInstantDDL,
 		r.usedInplaceDDL,
 		copiedChunks,
-		time.Since(r.copier.StartTime()).Round(time.Second),
+		r.copyDuration.Round(time.Second),
 		checksumTime.Round(time.Second),
 		time.Since(r.startTime).Round(time.Second),
 		r.db.Stats().InUse,
@@ -509,7 +512,7 @@ func (r *Runner) setup(ctx context.Context) error {
 		})
 
 		for _, change := range r.changes {
-			if err := r.replClient.AddSubscription(change.table, change.newTable, r.copier.KeyAboveHighWatermark); err != nil {
+			if err := r.replClient.AddSubscription(change.table, change.newTable, r.copyChunker.KeyAboveHighWatermark); err != nil {
 				return err
 			}
 		}
@@ -805,7 +808,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		OnDDL:           r.ddlNotification,
 		ServerID:        repl.NewServerID(),
 	})
-	if err := r.replClient.AddSubscription(r.changes[0].table, r.changes[0].newTable, r.copier.KeyAboveHighWatermark); err != nil {
+	if err := r.replClient.AddSubscription(r.changes[0].table, r.changes[0].newTable, r.copyChunker.KeyAboveHighWatermark); err != nil {
 		return err
 	}
 	r.replClient.SetFlushedPos(gomysql.Position{

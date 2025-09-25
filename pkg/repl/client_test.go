@@ -97,10 +97,10 @@ func TestReplClientComplex(t *testing.T) {
 	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
-	copier, err := copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
+	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
-	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
+	assert.NoError(t, client.AddSubscription(t1, t2, chunker.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 	client.SetKeyAboveWatermarkOptimization(true)
@@ -111,11 +111,11 @@ func TestReplClientComplex(t *testing.T) {
 	assert.Equal(t, 0, client.GetDeltaLen())
 
 	// Read from the copier so that the key is below the watermark
-	chk, err := copier.Next4Test()
+	chk, err := chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`a` < 1", chk.String())
 	// read again
-	chk, err = copier.Next4Test()
+	chk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`a` >= 1 AND `a` < 1001", chk.String())
 
@@ -298,10 +298,10 @@ func TestReplClientQueue(t *testing.T) {
 	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
-	copier, err := copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
+	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
 	assert.NoError(t, err)
-	// Attach copier's keyabovewatermark to the repl client
-	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
+	// Attach chunker's keyabovewatermark to the repl client
+	assert.NoError(t, client.AddSubscription(t1, t2, chunker.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 
@@ -312,12 +312,12 @@ func TestReplClientQueue(t *testing.T) {
 	assert.Equal(t, 1000, client.GetDeltaLen())
 
 	// Read from the copier
-	chk, err := copier.Next4Test()
+	chk, err := chunker.Next()
 	assert.NoError(t, err)
 	prevUpperBound := chk.UpperBound.Value[0].String()
 	assert.Equal(t, "`a` < "+prevUpperBound, chk.String())
 	// read again
-	chk, err = copier.Next4Test()
+	chk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, fmt.Sprintf("`a` >= %s AND `a` < %s", prevUpperBound, chk.UpperBound.Value[0].String()), chk.String())
 

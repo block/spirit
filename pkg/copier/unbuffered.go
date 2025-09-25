@@ -21,7 +21,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type unbuffered struct {
+type Unbuffered struct {
 	sync.Mutex
 	db               *sql.DB
 	chunker          table.Chunker
@@ -38,11 +38,11 @@ type unbuffered struct {
 }
 
 // Assert that unbuffered implements the Copier interface
-var _ Copier = (*unbuffered)(nil)
+var _ Copier = (*Unbuffered)(nil)
 
 // CopyChunk copies a chunk from the table to the newTable.
 // it is public so it can be used in tests incrementally.
-func (c *unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
+func (c *Unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	c.throttler.BlockWait()
 	startTime := time.Now()
 	// INSERT INGORE because we can have duplicate rows in the chunk because in
@@ -76,7 +76,7 @@ func (c *unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	return nil
 }
 
-func (c *unbuffered) isHealthy(ctx context.Context) bool {
+func (c *Unbuffered) isHealthy(ctx context.Context) bool {
 	c.Lock()
 	defer c.Unlock()
 	if ctx.Err() != nil {
@@ -85,13 +85,13 @@ func (c *unbuffered) isHealthy(ctx context.Context) bool {
 	return !c.isInvalid
 }
 
-func (c *unbuffered) StartTime() time.Time {
+func (c *Unbuffered) StartTime() time.Time {
 	c.Lock()
 	defer c.Unlock()
 	return c.startTime
 }
 
-func (c *unbuffered) Run(ctx context.Context) error {
+func (c *Unbuffered) Run(ctx context.Context) error {
 	c.startTime = time.Now()
 	go c.estimateRowsPerSecondLoop(ctx) // estimate rows while copying
 	g, errGrpCtx := errgroup.WithContext(ctx)
@@ -122,19 +122,19 @@ func (c *unbuffered) Run(ctx context.Context) error {
 	return nil
 }
 
-func (c *unbuffered) setInvalid(newVal bool) {
+func (c *Unbuffered) setInvalid(newVal bool) {
 	c.Lock()
 	defer c.Unlock()
 	c.isInvalid = newVal
 }
 
-func (c *unbuffered) SetThrottler(throttler throttler.Throttler) {
+func (c *Unbuffered) SetThrottler(throttler throttler.Throttler) {
 	c.Lock()
 	defer c.Unlock()
 	c.throttler = throttler
 }
 
-func (c *unbuffered) getCopyStats() (uint64, uint64, float64) {
+func (c *Unbuffered) getCopyStats() (uint64, uint64, float64) {
 	// Get progress from the chunker instead of calculating it ourselves
 	rowsProcessed, _, totalRows := c.chunker.Progress()
 
@@ -148,14 +148,14 @@ func (c *unbuffered) getCopyStats() (uint64, uint64, float64) {
 }
 
 // GetProgress returns the progress of the copier
-func (c *unbuffered) GetProgress() string {
+func (c *Unbuffered) GetProgress() string {
 	c.Lock()
 	defer c.Unlock()
 	copied, total, pct := c.getCopyStats()
 	return fmt.Sprintf("%d/%d %.2f%%", copied, total, pct)
 }
 
-func (c *unbuffered) GetETA() string {
+func (c *Unbuffered) GetETA() string {
 	c.Lock()
 	defer c.Unlock()
 	copiedRows, totalRows, pct := c.getCopyStats()
@@ -180,7 +180,7 @@ func (c *unbuffered) GetETA() string {
 	return estimate.String()
 }
 
-func (c *unbuffered) estimateRowsPerSecondLoop(ctx context.Context) {
+func (c *Unbuffered) estimateRowsPerSecondLoop(ctx context.Context) {
 	// We take >10 second averages because with parallel copy it bounces around a lot.
 	// Get progress from chunker since we no longer track rows locally
 	prevRowsCount, _, _ := c.chunker.Progress()
@@ -204,20 +204,7 @@ func (c *unbuffered) estimateRowsPerSecondLoop(ctx context.Context) {
 	}
 }
 
-// The following funcs proxy to the chunker.
-// This is done, so we don't need to export the chunker,
-// KeyAboveHighWatermark returns true if the key is above where the chunker is currently at.
-func (c *unbuffered) KeyAboveHighWatermark(key any) bool {
-	return c.chunker.KeyAboveHighWatermark(key)
-}
-
-// GetLowWatermark returns the low watermark of the chunker, i.e. the lowest key that has been
-// guaranteed to be written to the new table.
-func (c *unbuffered) GetLowWatermark() (string, error) {
-	return c.chunker.GetLowWatermark()
-}
-
-func (c *unbuffered) sendMetrics(ctx context.Context, processingTime time.Duration, logicalRowsCount uint64, affectedRowsCount uint64) error {
+func (c *Unbuffered) sendMetrics(ctx context.Context, processingTime time.Duration, logicalRowsCount uint64, affectedRowsCount uint64) error {
 	m := &metrics.Metrics{
 		Values: []metrics.MetricValue{
 			{
@@ -244,18 +231,12 @@ func (c *unbuffered) sendMetrics(ctx context.Context, processingTime time.Durati
 	return c.metricsSink.Send(contextWithTimeout, m)
 }
 
-// Next4Test is typically only used in integration tests that don't want to actually migrate data,
-// but need to advance the chunker.
-func (c *unbuffered) Next4Test() (*table.Chunk, error) {
-	return c.chunker.Next()
-}
-
 // GetChunker returns the chunker for accessing progress information
-func (c *unbuffered) GetChunker() table.Chunker {
+func (c *Unbuffered) GetChunker() table.Chunker {
 	return c.chunker
 }
 
-func (c *unbuffered) GetThrottler() throttler.Throttler {
+func (c *Unbuffered) GetThrottler() throttler.Throttler {
 	c.Lock()
 	defer c.Unlock()
 	return c.throttler
