@@ -41,7 +41,7 @@ func NewDBConfig() *DBConfig {
 	return &DBConfig{
 		LockWaitTimeout:          30,
 		InnodbLockWaitTimeout:    3,
-		MaxRetries:               5,
+		MaxRetries:               3,
 		MaxOpenConnections:       32,    // default is high for historical tests. It's overwritten by the user threads count + 2 for headroom.
 		RangeOptimizerMaxMemSize: 0,     // default is 8M, we set to unlimited. Not user configurable (may reconsider in the future).
 		InterpolateParams:        false, // default is false

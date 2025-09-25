@@ -571,6 +571,10 @@ func (c *Client) Flush(ctx context.Context) error {
 		// actually a lot to do!
 		if err := c.BlockWait(ctx); err != nil {
 			c.logger.Warnf("error waiting for binlog reader to catch up: %v", err)
+			// Check if the error is due to context cancellation
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
 			continue
 		}
 		//  If it doesn't timeout, we ensure the deltas
@@ -643,13 +647,14 @@ func (c *Client) BlockWait(ctx context.Context) error {
 	}
 	c.logger.Infof("waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
 	timer := time.NewTimer(DefaultTimeout)
+	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
 	for {
 		select {
 		case <-timer.C:
 			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
 		default:
 			if err := dbconn.Exec(ctx, c.db, "FLUSH BINARY LOGS"); err != nil {
-				break // error flushing binary logs
+				return err // it could be context cancelled, return it
 			}
 			if c.getBufferedPos().Compare(targetPos) >= 0 {
 				return nil // we are up to date!

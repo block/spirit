@@ -1082,6 +1082,7 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) error {
 	r.logger.Warnf("cutover deferred while sentinel table %s.%s exists; will wait %s", r.changes[0].table.SchemaName, r.sentinelTableName(), sentinelWaitLimit)
 
 	timer := time.NewTimer(sentinelWaitLimit)
+	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
 
 	ticker := time.NewTicker(sentinelCheckInterval)
 	defer ticker.Stop()
