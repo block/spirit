@@ -9,7 +9,7 @@ The tests require a MySQL server to run. If you have MySQL installed locally, yo
 ```bash
 MYSQL_DSN="root:mypassword@tcp(127.0.0.1:3306)/test" go test -v ./...
 ```
-If the `MYSQL_DSN` is not specified, it currently defaults to `msandbox:msandbox@tcp(127.0.0.1:8030)/test`. This may change in the future.
+If the `MYSQL_DSN` is not specified, it currently defaults to `spirit:spirit@tcp(127.0.0.1:8030)/test`. This may change in the future.
 
 
 ### Running tests with docker on specific MySQL version
