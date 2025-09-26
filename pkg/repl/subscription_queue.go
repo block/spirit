@@ -44,7 +44,7 @@ func (s *deltaQueue) Table() *table.TableInfo {
 	return s.table
 }
 
-func (s *deltaQueue) KeyHasChanged(key []any, deleted bool) {
+func (s *deltaQueue) HasChanged(key, _ []any, deleted bool) {
 	s.Lock()
 	defer s.Unlock()
 

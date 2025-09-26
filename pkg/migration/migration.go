@@ -41,8 +41,14 @@ type Migration struct {
 	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:"" default:"PREFERRED"`
 	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
 	// Hidden options for now.
+	Multi bool `name:"multi" help:"Use multi chunker (for testing)" optional:"" default:"false" hidden:""`
+
+	// Experimental features
+	// These are no longer hidden, we document them.
+	EnableExperimentalBufferedCopy bool `name:"enable-experimental-buffered-copy" help:"Use the experimental buffered copier/repl applier based on the DBLog algorithm" optional:"" default:"false" hidden:""`
+
+	// Hidden options for now (supports more obscure cash/sq usecases)
 	InterpolateParams bool `name:"interpolate-params" help:"Enable interpolate params for DSN" optional:"" default:"false" hidden:""`
-	Multi             bool `name:"multi" help:"Use multi chunker (for testing)" optional:"" default:"false" hidden:""`
 }
 
 func (m *Migration) Run() error {

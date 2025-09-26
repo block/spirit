@@ -26,6 +26,7 @@ const (
 	verifyCATLSConfigName = "verify_ca"
 	verifyIDTLSConfigName = "verify_identity"
 	maxConnLifetime       = time.Minute * 3
+	maxIdleConns          = 10
 )
 
 // rdsAddr matches Amazon RDS hostnames with optional :port suffix.
@@ -289,12 +290,20 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 // New is similar to sql.Open except we take the inputDSN and
 // append additional options to it to standardize the connection.
 // It will also ping the connection to ensure it is valid.
-func New(inputDSN string, config *DBConfig) (*sql.DB, error) {
+func New(inputDSN string, config *DBConfig) (db *sql.DB, err error) {
 	dsn, err := newDSN(inputDSN, config)
 	if err != nil {
 		return nil, err
 	}
-
+	defer func() {
+		if db != nil && err == nil { // successful connection
+			// There are many different ways we create a DB connection.
+			// Ensure we change conn settings in all code paths.
+			db.SetMaxOpenConns(config.MaxOpenConnections)
+			db.SetConnMaxLifetime(maxConnLifetime)
+			db.SetMaxIdleConns(maxIdleConns)
+		}
+	}()
 	// For PREFERRED mode, implement fallback behavior
 	if config.TLSMode == "PREFERRED" {
 		// First try with TLS
@@ -302,8 +311,6 @@ func New(inputDSN string, config *DBConfig) (*sql.DB, error) {
 		if err == nil {
 			if err := db.Ping(); err == nil {
 				// TLS connection successful
-				db.SetMaxOpenConns(config.MaxOpenConnections)
-				db.SetConnMaxLifetime(maxConnLifetime)
 				return db, nil
 			}
 			utils.ErrInErr(db.Close())
@@ -325,13 +332,11 @@ func New(inputDSN string, config *DBConfig) (*sql.DB, error) {
 			utils.ErrInErr(db.Close())
 			return nil, err
 		}
-		db.SetMaxOpenConns(config.MaxOpenConnections)
-		db.SetConnMaxLifetime(maxConnLifetime)
 		return db, nil
 	}
 
 	// For all other modes, use standard connection
-	db, err := sql.Open("mysql", dsn)
+	db, err = sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -339,7 +344,5 @@ func New(inputDSN string, config *DBConfig) (*sql.DB, error) {
 		utils.ErrInErr(db.Close())
 		return nil, err
 	}
-	db.SetMaxOpenConns(config.MaxOpenConnections)
-	db.SetConnMaxLifetime(maxConnLifetime)
 	return db, nil
 }

@@ -129,9 +129,6 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	r.dbConfig.LockWaitTimeout = int(r.migration.LockWaitTimeout.Seconds())
 	r.dbConfig.InterpolateParams = r.migration.InterpolateParams
 	r.dbConfig.ForceKill = r.migration.ForceKill
-	// Map TLS configuration from migration to dbConfig
-	r.dbConfig.TLSMode = r.migration.TLSMode
-	r.dbConfig.TLSCertificatePath = r.migration.TLSCertificatePath
 	// The copier and checker will use Threads to limit N tasks concurrently,
 	// but we also set it at the DB pool level with +1. Because the copier and
 	// the replication applier use the same pool, it allows for some natural throttling
@@ -146,6 +143,11 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	// We could extend the +1 to +2, but instead we increase the pool size
 	// during the cutover procedure.
 	r.dbConfig.MaxOpenConnections = r.migration.Threads + 1
+	if r.migration.EnableExperimentalBufferedCopy {
+		// Buffered has many more connections because it fans out x8 more write threads
+		// Plus it has read threads. Set this high and figure it out later.
+		r.dbConfig.MaxOpenConnections = 100
+	}
 	r.db, err = dbconn.New(r.dsn(), r.dbConfig)
 	if err != nil {
 		return err
@@ -489,23 +491,25 @@ func (r *Runner) setup(ctx context.Context) error {
 		}
 
 		r.copier, err = copier.NewCopier(r.db, r.copyChunker, &copier.CopierConfig{
-			Concurrency:     r.migration.Threads,
-			TargetChunkTime: r.migration.TargetChunkTime,
-			FinalChecksum:   r.migration.Checksum,
-			Throttler:       &throttler.Noop{},
-			Logger:          r.logger,
-			MetricsSink:     r.metricsSink,
-			DBConfig:        r.dbConfig,
+			Concurrency:                   r.migration.Threads,
+			TargetChunkTime:               r.migration.TargetChunkTime,
+			FinalChecksum:                 r.migration.Checksum,
+			Throttler:                     &throttler.Noop{},
+			Logger:                        r.logger,
+			MetricsSink:                   r.metricsSink,
+			DBConfig:                      r.dbConfig,
+			UseExperimentalBufferedCopier: r.migration.EnableExperimentalBufferedCopy,
 		})
 		if err != nil {
 			return err
 		}
 		r.replClient = repl.NewClient(r.db, r.migration.Host, r.migration.Username, r.migration.Password, &repl.ClientConfig{
-			Logger:          r.logger,
-			Concurrency:     r.migration.Threads,
-			TargetBatchTime: r.migration.TargetChunkTime,
-			OnDDL:           r.ddlNotification,
-			ServerID:        repl.NewServerID(),
+			Logger:                     r.logger,
+			Concurrency:                r.migration.Threads,
+			TargetBatchTime:            r.migration.TargetChunkTime,
+			OnDDL:                      r.ddlNotification,
+			ServerID:                   repl.NewServerID(),
+			UseExperimentalBufferedMap: r.migration.EnableExperimentalBufferedCopy,
 		})
 
 		for _, change := range r.changes {
@@ -784,13 +788,14 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 
 	// Create copier with the prepared chunker
 	r.copier, err = copier.NewCopier(r.db, r.copyChunker, &copier.CopierConfig{
-		Concurrency:     r.migration.Threads,
-		TargetChunkTime: r.migration.TargetChunkTime,
-		FinalChecksum:   r.migration.Checksum,
-		Throttler:       &throttler.Noop{},
-		Logger:          r.logger,
-		MetricsSink:     r.metricsSink,
-		DBConfig:        r.dbConfig,
+		Concurrency:                   r.migration.Threads,
+		TargetChunkTime:               r.migration.TargetChunkTime,
+		FinalChecksum:                 r.migration.Checksum,
+		Throttler:                     &throttler.Noop{},
+		Logger:                        r.logger,
+		MetricsSink:                   r.metricsSink,
+		DBConfig:                      r.dbConfig,
+		UseExperimentalBufferedCopier: r.migration.EnableExperimentalBufferedCopy,
 	})
 	if err != nil {
 		return err
@@ -799,11 +804,12 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// Set the binlog position.
 	// Create a binlog subscriber
 	r.replClient = repl.NewClient(r.db, r.migration.Host, r.migration.Username, r.migration.Password, &repl.ClientConfig{
-		Logger:          r.logger,
-		Concurrency:     r.migration.Threads,
-		TargetBatchTime: r.migration.TargetChunkTime,
-		OnDDL:           r.ddlNotification,
-		ServerID:        repl.NewServerID(),
+		Logger:                     r.logger,
+		Concurrency:                r.migration.Threads,
+		TargetBatchTime:            r.migration.TargetChunkTime,
+		OnDDL:                      r.ddlNotification,
+		ServerID:                   repl.NewServerID(),
+		UseExperimentalBufferedMap: r.migration.EnableExperimentalBufferedCopy,
 	})
 	if err := r.replClient.AddSubscription(r.changes[0].table, r.changes[0].newTable, r.copier.KeyAboveHighWatermark); err != nil {
 		return err

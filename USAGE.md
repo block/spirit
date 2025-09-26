@@ -28,6 +28,7 @@
       - [REQUIRED](#required)
       - [VERIFY\_CA](#verify_ca)
       - [VERIFY\_IDENTITY](#verify_identity)
+  - [Experimental Features](#experimental-features)
 
 ## Getting Started
 
@@ -348,3 +349,23 @@ spirit --tls-mode VERIFY_IDENTITY \
        --chunk-size 3000
 ```
 **Result**: Uses embedded RDS certificate with full verification for RDS hostname.
+
+## Experimental Features
+
+### enable-experimental-buffered-copy
+
+**Feature Description**
+
+This feature changes how changes are copied to the new table. Rather than using `INSERT IGNORE .. SELECT` the copier instead reads the rows completely from the source table, and then inserts them into the new table (fanning out the insert into many parallel threads). Changes from replication are also applied in a similar way.
+
+This algorithm is the same as [Netflix's DBLog](https://netflixtechblog.com/dblog-a-generic-change-data-capture-framework-69351fb9099b). The advantage of buffered copies is that they do not require any locks on the source table. The algorithm is also generic, in that we intend to use it in future to implement a logical move (copy tables) between MySQL servers. In some cases it may also allow for faster schema changes, although to date the improvements have been relatively modest (and varies based on how much you are willing to overload the MySQL server).
+
+**Current Status**
+
+This feature is not feature complete. Getting in the business of reading rows and re-inserting them (vs `INSERT.. SELECT`) means that we need to add a lot of tests to handle edge cases, such as character set and datetime mangling.
+
+We also haven't technically imlemented the low-watermark requirement for replication apply, which means that there is a brief race where inconsistencies can occur during copy. Thankfully, this will be detected from the final checksum, but we would rather not rely on that.
+
+Buffered changes also puts a lot more stress on the `spirit` binary in terms of CPU use and memory. Ideally we can get a good understanding on this, and ensure that there is some protection in place to prevent out of memory cases etc.
+
+There is also the risk that the buffered algorithm write threads can overwhelm a server. We need to implement a throttler that detects that the server is overloaded, and possibly some configuration over write threads.

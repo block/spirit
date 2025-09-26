@@ -34,10 +34,10 @@ func TestSubscriptionDeltaQueue(t *testing.T) {
 	assert.Equal(t, 0, sub.Length())
 
 	// Test key changes with queue
-	sub.KeyHasChanged([]any{1}, false) // Insert/Replace
+	sub.HasChanged([]any{1}, nil, false) // Insert/Replace
 	assert.Equal(t, 1, sub.Length())
 
-	sub.KeyHasChanged([]any{2}, true) // Delete
+	sub.HasChanged([]any{2}, nil, true) // Delete
 	assert.Equal(t, 2, sub.Length())
 
 	// Verify queue order is maintained
@@ -101,11 +101,11 @@ func TestFlushDeltaQueue(t *testing.T) {
 				(1, 'test1'), (2, 'test2'), (3, 'test3'), (4, 'test4'), (5, 'test5')`)
 
 		// Create a sequence: REPLACE<1,2>, DELETE<3>, REPLACE<4,5>
-		sub.KeyHasChanged([]any{1}, false) // Replace
-		sub.KeyHasChanged([]any{2}, false) // Replace
-		sub.KeyHasChanged([]any{3}, true)  // Delete
-		sub.KeyHasChanged([]any{4}, false) // Replace
-		sub.KeyHasChanged([]any{5}, false) // Replace
+		sub.HasChanged([]any{1}, nil, false) // Replace
+		sub.HasChanged([]any{2}, nil, false) // Replace
+		sub.HasChanged([]any{3}, nil, true)  // Delete
+		sub.HasChanged([]any{4}, nil, false) // Replace
+		sub.HasChanged([]any{5}, nil, false) // Replace
 
 		// Flush without lock
 		// calls flushDeltaQueue
@@ -159,7 +159,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 
 		// Add 5 replace operations
 		for i := 1; i <= 5; i++ {
-			sub.KeyHasChanged([]any{i}, false)
+			sub.HasChanged([]any{i}, nil, false)
 		}
 
 		// Flush - should create multiple statements due to batch size
@@ -196,8 +196,8 @@ func TestFlushDeltaQueue(t *testing.T) {
 				(1, 'test1'), (2, 'test2'), (3, 'test3'), (4, 'test4'), (5, 'test5')`)
 
 		// Add some changes
-		sub.KeyHasChanged([]any{1}, false)
-		sub.KeyHasChanged([]any{2}, true)
+		sub.HasChanged([]any{1}, nil, false)
+		sub.HasChanged([]any{2}, nil, true)
 
 		// Create a table lock
 		lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), logrus.New())
@@ -242,7 +242,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 		done := make(chan bool)
 		go func() {
 			for i := 1; i <= 100; i++ {
-				sub.KeyHasChanged([]any{i}, false)
+				sub.HasChanged([]any{i}, nil, false)
 				time.Sleep(time.Millisecond) // Small delay to ensure interleaving
 			}
 			done <- true
@@ -308,7 +308,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 		}
 
 		for _, op := range operations {
-			sub.KeyHasChanged([]any{op.id}, op.isDelete)
+			sub.HasChanged([]any{op.id}, nil, op.isDelete)
 		}
 
 		// Flush all changes

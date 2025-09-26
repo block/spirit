@@ -41,7 +41,7 @@ func (s *deltaMap) Table() *table.TableInfo {
 	return s.table
 }
 
-func (s *deltaMap) KeyHasChanged(key []any, deleted bool) {
+func (s *deltaMap) HasChanged(key, _ []any, deleted bool) {
 	s.Lock()
 	defer s.Unlock()
 

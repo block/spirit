@@ -1,3 +1,6 @@
+// Package copier copies rows from one table to another.
+// it makes use of tableinfo.Chunker, and does the parallelism
+// and retries here. It fails on the first error.
 package copier
 
 import (
@@ -47,13 +50,14 @@ type Copier interface { //nolint: interfacebloat
 }
 
 type CopierConfig struct {
-	Concurrency     int
-	TargetChunkTime time.Duration
-	FinalChecksum   bool
-	Throttler       throttler.Throttler
-	Logger          loggers.Advanced
-	MetricsSink     metrics.Sink
-	DBConfig        *dbconn.DBConfig
+	Concurrency                   int
+	TargetChunkTime               time.Duration
+	FinalChecksum                 bool
+	Throttler                     throttler.Throttler
+	Logger                        loggers.Advanced
+	MetricsSink                   metrics.Sink
+	DBConfig                      *dbconn.DBConfig
+	UseExperimentalBufferedCopier bool
 }
 
 // NewCopierDefaultConfig returns a default config for the copier.
@@ -79,6 +83,19 @@ func NewCopier(db *sql.DB, chunker table.Chunker, config *CopierConfig) (Copier,
 	}
 	if config.DBConfig == nil {
 		return nil, errors.New("dbConfig must be non-nil")
+	}
+	if config.UseExperimentalBufferedCopier {
+		return &buffered{
+			db:               db,
+			concurrency:      config.Concurrency,
+			finalChecksum:    config.FinalChecksum,
+			throttler:        config.Throttler,
+			chunker:          chunker,
+			logger:           config.Logger,
+			metricsSink:      config.MetricsSink,
+			dbConfig:         config.DBConfig,
+			copierEtaHistory: newcopierEtaHistory(),
+		}, nil
 	}
 	return &unbuffered{
 		db:               db,

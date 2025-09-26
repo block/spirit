@@ -32,10 +32,10 @@ func TestSubscriptionDeltaMap(t *testing.T) {
 	assert.Equal(t, 0, sub.Length())
 
 	// Test key changes
-	sub.KeyHasChanged([]any{1}, false) // Insert/Replace
+	sub.HasChanged([]any{1}, nil, false) // Insert/Replace
 	assert.Equal(t, 1, sub.Length())
 
-	sub.KeyHasChanged([]any{2}, true) // Delete
+	sub.HasChanged([]any{2}, nil, true) // Delete
 	assert.Equal(t, 2, sub.Length())
 
 	// Test statement generation
@@ -76,8 +76,8 @@ func TestFlushWithLock(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO subscription_test (id, name) VALUES (1, 'test1'), (2, 'test2')`)
 
 	// Add some changes
-	sub.KeyHasChanged([]any{1}, false)
-	sub.KeyHasChanged([]any{2}, true)
+	sub.HasChanged([]any{1}, nil, false)
+	sub.HasChanged([]any{2}, nil, true)
 
 	// Create a table lock
 	lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), logrus.New())
@@ -123,10 +123,10 @@ func TestFlushWithoutLock(t *testing.T) {
 		(1, 'test1'), (2, 'test2'), (3, 'test3'), (4, 'test4')`)
 
 	// Add multiple changes to test batch processing
-	sub.KeyHasChanged([]any{1}, false)
-	sub.KeyHasChanged([]any{2}, false)
-	sub.KeyHasChanged([]any{3}, true)
-	sub.KeyHasChanged([]any{4}, true)
+	sub.HasChanged([]any{1}, nil, false)
+	sub.HasChanged([]any{2}, nil, false)
+	sub.HasChanged([]any{3}, nil, true)
+	sub.HasChanged([]any{4}, nil, true)
 
 	// Test flush without lock
 	err = sub.Flush(t.Context(), false, nil)
@@ -161,14 +161,14 @@ func TestConcurrentKeyChanges(t *testing.T) {
 	done := make(chan bool)
 	go func() {
 		for i := range 100 {
-			sub.KeyHasChanged([]any{i}, false)
+			sub.HasChanged([]any{i}, nil, false)
 		}
 		done <- true
 	}()
 
 	go func() {
 		for i := 100; i < 200; i++ {
-			sub.KeyHasChanged([]any{i}, true)
+			sub.HasChanged([]any{i}, nil, true)
 		}
 		done <- true
 	}()
@@ -200,10 +200,10 @@ func TestKeyChangedOverwrite(t *testing.T) {
 	}
 
 	// Test overwriting the same key multiple times
-	sub.KeyHasChanged([]any{1}, false) // Insert
-	sub.KeyHasChanged([]any{1}, true)  // Delete
-	sub.KeyHasChanged([]any{1}, false) // Insert again
-	assert.Equal(t, 1, sub.Length())   // Should only count once in the map
+	sub.HasChanged([]any{1}, nil, false) // Insert
+	sub.HasChanged([]any{1}, nil, true)  // Delete
+	sub.HasChanged([]any{1}, nil, false) // Insert again
+	assert.Equal(t, 1, sub.Length())     // Should only count once in the map
 
 	// Test with deltaQueue
 	subQueue := &deltaQueue{
@@ -214,9 +214,9 @@ func TestKeyChangedOverwrite(t *testing.T) {
 	}
 
 	// Same operations with queue should maintain history
-	subQueue.KeyHasChanged([]any{1}, false)
-	subQueue.KeyHasChanged([]any{1}, true)
-	subQueue.KeyHasChanged([]any{1}, false)
+	subQueue.HasChanged([]any{1}, nil, false)
+	subQueue.HasChanged([]any{1}, nil, true)
+	subQueue.HasChanged([]any{1}, nil, false)
 	assert.Equal(t, 3, subQueue.Length()) // Queue maintains all changes
 }
 
@@ -239,11 +239,11 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 	}
 
 	// Test with string keys
-	sub.KeyHasChanged([]any{"key1"}, false)
+	sub.HasChanged([]any{"key1"}, nil, false)
 	assert.Equal(t, 1, sub.Length())
 
 	// Test with composite keys
-	sub.KeyHasChanged([]any{"prefix", 123}, false)
+	sub.HasChanged([]any{"prefix", 123}, nil, false)
 	assert.Equal(t, 2, sub.Length())
 
 	// Test watermark edge cases
@@ -262,15 +262,15 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 	sub.SetKeyAboveWatermarkOptimization(true)
 
 	// Test exactly at watermark
-	sub.KeyHasChanged([]any{5}, false)
+	sub.HasChanged([]any{5}, nil, false)
 	assert.Equal(t, 3, sub.Length())
 
 	// Test one above watermark
-	sub.KeyHasChanged([]any{6}, false)
+	sub.HasChanged([]any{6}, nil, false)
 	assert.Equal(t, 3, sub.Length()) // Should not increase as it's above watermark
 
 	// Test with string key when watermark is enabled
-	sub.KeyHasChanged([]any{"key2"}, false)
+	sub.HasChanged([]any{"key2"}, nil, false)
 	assert.Equal(t, 4, sub.Length()) // Should still process string keys
 }
 
@@ -293,15 +293,15 @@ func TestKeyChangedNilAndEmpty(t *testing.T) {
 	}
 
 	// Test with empty string key
-	sub.KeyHasChanged([]any{""}, false)
+	sub.HasChanged([]any{""}, nil, false)
 	assert.Equal(t, 1, sub.Length())
 
 	// Test with empty array as part of composite key
-	sub.KeyHasChanged([]any{"prefix", []string{}}, false)
+	sub.HasChanged([]any{"prefix", []string{}}, nil, false)
 	assert.Equal(t, 2, sub.Length())
 
 	// Test with zero values
-	sub.KeyHasChanged([]any{0}, false)
+	sub.HasChanged([]any{0}, nil, false)
 	assert.Equal(t, 3, sub.Length())
 }
 
@@ -324,7 +324,7 @@ func TestKeyAboveWatermark(t *testing.T) {
 	}
 
 	// Test with watermark optimization disabled
-	sub.KeyHasChanged([]any{1}, false)
+	sub.HasChanged([]any{1}, nil, false)
 	assert.Equal(t, 1, sub.Length())
 
 	// Setup watermark callback
@@ -337,10 +337,10 @@ func TestKeyAboveWatermark(t *testing.T) {
 	sub.SetKeyAboveWatermarkOptimization(true)
 
 	// Test key below watermark
-	sub.KeyHasChanged([]any{3}, false)
+	sub.HasChanged([]any{3}, nil, false)
 	assert.Equal(t, 2, sub.Length())
 
 	// Test key above watermark
-	sub.KeyHasChanged([]any{10}, false)
+	sub.HasChanged([]any{10}, nil, false)
 	assert.Equal(t, 2, sub.Length()) // Should not increase as key is above watermark
 }
