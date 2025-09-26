@@ -409,8 +409,8 @@ func TestTableLength(t *testing.T) {
 }
 
 func TestBadOptions(t *testing.T) {
-	// N.B. host, user, password and database have defaults enforced so they should all fail
-	// will the same error message
+	// N.B. Because host, user, password and database have defaults enforced, we expect to
+	// fail in the same way when they're not provided.
 	_, err := NewRunner(&Migration{})
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "table name is required")
@@ -3023,6 +3023,7 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 func TestPreRunChecksE2E(t *testing.T) {
 	// We test the checks in tests for that package, but we also want to test
 	// that the checks run correctly when instantiating a migration.
+
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
