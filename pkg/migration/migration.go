@@ -26,10 +26,10 @@ var (
 )
 
 type Migration struct {
-	Host                 *string       `name:"host" help:"Hostname" optional:""`
-	Username             *string       `name:"username" help:"User" optional:""`
-	Password             *string       `name:"password" help:"Password" optional:""`
-	Database             *string       `name:"database" help:"Database" optional:""`
+	Host                 string        `name:"host" help:"Hostname" optional:""`
+	Username             string        `name:"username" help:"User" optional:""`
+	Password             string        `name:"password" help:"Password" optional:""`
+	Database             string        `name:"database" help:"Database" optional:""`
 	ConfFile             string        `name:"conf" help:"MySQL conf file" optional:"" type:"existingfile"`
 	Table                string        `name:"table" help:"Table" optional:""`
 	Alter                string        `name:"alter" help:"The alter statement to run on the table" optional:""`
@@ -95,10 +95,10 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 			return nil, errors.New("could not parse SQL statement: " + m.Statement)
 		}
 		for _, stmt := range stmts {
-			if stmt.Schema != "" && stmt.Schema != *m.Database {
+			if stmt.Schema != "" && stmt.Schema != m.Database {
 				return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
 			}
-			stmt.Schema = *m.Database
+			stmt.Schema = m.Database
 		}
 	} else {
 		// Parse table + alter into statement.
@@ -119,7 +119,7 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 			return nil, errors.New("could not parse SQL statement: " + fullStatement)
 		}
 		stmts = append(stmts, &statement.AbstractStatement{
-			Schema:    *m.Database,
+			Schema:    m.Database,
 			Table:     m.Table,
 			Alter:     m.Alter,
 			Statement: fullStatement,
@@ -134,79 +134,78 @@ func (m *Migration) normalizeConnectionOptions() error {
 	if err != nil {
 		return err
 	}
-	if m.Host == nil {
+	if m.Host == "" {
 		m.Host = confParams.GetHost()
 	}
-	if m.Username == nil {
+	if !strings.Contains(m.Host, ":") {
+		hostAndPort := fmt.Sprintf("%s:%d", m.Host, confParams.GetPort())
+		m.Host = hostAndPort
+	}
+	if m.Username == "" {
 		m.Username = confParams.GetUser()
 	}
-	if m.Password == nil {
+	if m.Password == "" {
 		m.Password = confParams.GetPassword()
 	}
-	if m.Database == nil {
+	if m.Database == "" {
 		m.Database = confParams.GetDatabase()
 	}
-
-	if !strings.Contains(*m.Host, ":") {
-		hostAndPort := fmt.Sprintf("%s:%d", *m.Host, *confParams.GetPort())
-		m.Host = &hostAndPort
-	}
-
 	return nil
 }
 
 // confParams abstracts parameters loaded from ini file. Will provide defaults when receiveer is
 // nil or parameter is not defined.
 type confParams struct {
-	host, database, user, password *string
-	port                           *int
+	host, database, user, password string
+	port                           int
 }
 
-func (c *confParams) GetHost() *string {
-	if c == nil || c.host == nil {
-		return &defaultHost
+func (c *confParams) GetHost() string {
+	if c == nil || c.host == "" {
+		return defaultHost
 	}
 
 	return c.host
 }
 
-func (c *confParams) GetDatabase() *string {
-	if c == nil || c.database == nil {
-		return &defaultDatabase
+func (c *confParams) GetDatabase() string {
+	if c == nil || c.database == "" {
+		return defaultDatabase
 	}
 
 	return c.database
 }
 
-func (c *confParams) GetUser() *string {
-	if c == nil || c.user == nil {
-		return &defaultUsername
+func (c *confParams) GetUser() string {
+	if c == nil || c.user == "" {
+		return defaultUsername
 	}
 
 	return c.user
 }
 
-func (c *confParams) GetPassword() *string {
-	if c == nil || c.password == nil {
-		return &defaultPassword
+func (c *confParams) GetPassword() string {
+	if c == nil || c.password == "" {
+		return defaultPassword
 	}
 
 	return c.password
 }
 
-func (c *confParams) GetPort() *int {
-	if c == nil || c.port == nil {
-		return &defaultPort
+func (c *confParams) GetPort() int {
+	if c == nil || c.port == 0 {
+		return defaultPort
 	}
 
 	return c.port
 }
 
-// newConfParams attempts to load a confParams struct from a path to an ini file. It will
-// return a nil configParams when an empty path is provided and non-nil if file is able to be loaded
+// newConfParams attempts to load a confParams struct from a path to an ini file.
 func newConfParams(confFilePath string) (*confParams, error) {
+	confParams := &confParams{}
+
 	if confFilePath == "" {
-		return nil, nil
+		return confParams, nil
 	}
 
 	creds, err := ini.Load(confFilePath)
@@ -214,36 +213,13 @@ func newConfParams(confFilePath string) (*confParams, error) {
 		return nil, err
 	}
 
-	confParams := &confParams{}
-
 	if creds.HasSection("client") {
 		clientSection := creds.Section("client")
-		maybeHost := clientSection.Key("host").String()
-		maybeDb := clientSection.Key("database").String()
-		maybeUser := clientSection.Key("user").String()
-		maybePw := clientSection.Key("password").String()
-		maybePort := clientSection.Key("port").String()
-
-		if maybeHost != "" {
-			confParams.host = &maybeHost
-		}
-		if maybeDb != "" {
-			confParams.database = &maybeDb
-		}
-		if maybeUser != "" {
-			confParams.user = &maybeUser
-		}
-		if maybePw != "" {
-			confParams.password = &maybePw
-		}
-		if maybePort != "" {
-			port, err := clientSection.Key("port").Int()
-			if err != nil {
-				return nil, err
-			}
-
-			confParams.port = &port
-		}
+		confParams.host = clientSection.Key("host").String()
+		confParams.database = clientSection.Key("database").String()
+		confParams.user = clientSection.Key("user").String()
+		confParams.password = clientSection.Key("password").String()
+		confParams.port = clientSection.Key("port").MustInt()
 	}
 
 	return confParams, nil

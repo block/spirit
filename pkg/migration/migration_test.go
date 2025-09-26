@@ -18,10 +18,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func mkPtr[T any](t T) *T {
-	return &t
-}
-
 func TestMain(m *testing.M) {
 	checkpointDumpInterval = 100 * time.Millisecond
 	statusInterval = 10 * time.Millisecond // the status will be accurate to 1ms
@@ -43,10 +39,10 @@ func TestE2ENullAlterEmpty(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 1
 	migration.Checksum = true
 	migration.Table = "t1e2e"
@@ -68,10 +64,10 @@ func TestMissingAlter(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 16
 	migration.Checksum = true
 	migration.Table = "t1"
@@ -94,10 +90,10 @@ func TestBadDatabaseCredentials(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = mkPtr("127.0.0.1:9999")
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = "127.0.0.1:9999"
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 16
 	migration.Checksum = true
 	migration.Table = "t1"
@@ -121,10 +117,10 @@ func TestE2ENullAlter1Row(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 16
 	migration.Checksum = true
 	migration.Table = "t1"
@@ -150,10 +146,10 @@ func TestE2ENullAlterWithReplicas(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 16
 	migration.Checksum = true
 	migration.Table = "replicatest"
@@ -184,10 +180,10 @@ func TestRenameInMySQL80(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 16
 	migration.Checksum = true
 	migration.Table = "renamet1"
@@ -217,10 +213,10 @@ func TestUniqueOnNonUniqueData(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 16
 	migration.Checksum = true
 	migration.Table = "uniquet1"
@@ -242,10 +238,10 @@ func TestGeneratedColumns(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 1
 	migration.Checksum = true
 	migration.Table = "t1generated"
@@ -287,10 +283,10 @@ VALUES
 	assert.NoError(t, err)
 
 	migration := &Migration{
-		Host:     &cfg.Addr,
-		Username: &cfg.User,
-		Password: &cfg.Passwd,
-		Database: &cfg.DBName,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: cfg.Passwd,
+		Database: cfg.DBName,
 		Threads:  2,
 		Checksum: true,
 		Statement: `ALTER TABLE t1stored
@@ -341,10 +337,10 @@ func TestBinaryChecksum(t *testing.T) {
 		migration := &Migration{}
 		cfg, err := mysql.ParseDSN(testutils.DSN())
 		assert.NoError(t, err)
-		migration.Host = &cfg.Addr
-		migration.Username = &cfg.User
-		migration.Password = &cfg.Passwd
-		migration.Database = &cfg.DBName
+		migration.Host = cfg.Addr
+		migration.Username = cfg.User
+		migration.Password = cfg.Passwd
+		migration.Database = cfg.DBName
 		migration.Threads = 1
 		migration.Checksum = true
 		migration.Table = "t1varbin"
@@ -368,10 +364,10 @@ func TestConvertCharset(t *testing.T) {
 	migration := &Migration{}
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	migration.Host = &cfg.Addr
-	migration.Username = &cfg.User
-	migration.Password = &cfg.Passwd
-	migration.Database = &cfg.DBName
+	migration.Host = cfg.Addr
+	migration.Username = cfg.User
+	migration.Password = cfg.Passwd
+	migration.Database = cfg.DBName
 	migration.Threads = 1
 	migration.Checksum = true
 	migration.Table = "t1charset"
@@ -382,10 +378,10 @@ func TestConvertCharset(t *testing.T) {
 	// Because utf8mb4 is the superset, it doesn't matter that that's
 	// what the checksum casts to. We should be able to convert back as well.
 	migration = &Migration{
-		Host:     &cfg.Addr,
-		Username: &cfg.User,
-		Password: &cfg.Passwd,
-		Database: &cfg.DBName,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: cfg.Passwd,
+		Database: cfg.DBName,
 		Threads:  1,
 		Checksum: true,
 		Table:    "t1charset",
@@ -404,10 +400,10 @@ func TestStmtWorkflow(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	migration := &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: table, // CREATE TABLE.
@@ -416,10 +412,10 @@ func TestStmtWorkflow(t *testing.T) {
 	assert.NoError(t, err)
 	// We can also specify ALTER options in the statement.
 	migration = &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: "ALTER TABLE t1s ADD COLUMN c int", // ALTER TABLE.
@@ -439,10 +435,10 @@ func TestUnparsableStatements(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	migration := &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: table,
@@ -452,10 +448,10 @@ func TestUnparsableStatements(t *testing.T) {
 
 	// Try again as ALTER TABLE, with --statement
 	migration = &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: "ALTER TABLE t1parse ADD COLUMN c BLOB DEFAULT ('abc')",
@@ -468,10 +464,10 @@ func TestUnparsableStatements(t *testing.T) {
 
 	// With ALTER TABLE as --table and --alter
 	migration = &Migration{
-		Host:     &cfg.Addr,
-		Username: &cfg.User,
-		Password: &cfg.Passwd,
-		Database: &cfg.DBName,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: cfg.Passwd,
+		Database: cfg.DBName,
 		Threads:  1,
 		Checksum: true,
 		Table:    "t1parse",
@@ -482,10 +478,10 @@ func TestUnparsableStatements(t *testing.T) {
 
 	// With CREATE TRIGGER.
 	migration = &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: "CREATE TRIGGER ins_sum BEFORE INSERT ON t1parse FOR EACH ROW SET @sum = @sum + NEW.b;",
@@ -496,10 +492,10 @@ func TestUnparsableStatements(t *testing.T) {
 
 	//https://github.com/pingcap/tidb/pull/61498
 	migration = &Migration{
-		Host:     &cfg.Addr,
-		Username: &cfg.User,
-		Password: &cfg.Passwd,
-		Database: &cfg.DBName,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: cfg.Passwd,
+		Database: cfg.DBName,
 		Threads:  1,
 		Checksum: true,
 		Table:    "t1parse",
@@ -519,10 +515,10 @@ func TestCreateIndexIsRewritten(t *testing.T) {
 	assert.NoError(t, err)
 	require.NotEmpty(t, cfg.DBName)
 	migration := &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: "CREATE INDEX idx ON " + cfg.DBName + ".t1createindex (b)",
@@ -541,10 +537,10 @@ func TestSchemaNameIncluded(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	migration := &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: "ALTER TABLE test.t1schemaname ADD COLUMN c int",
@@ -567,10 +563,10 @@ func TestSecondaryEngineAttribute(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	migration := &Migration{
-		Host:      &cfg.Addr,
-		Username:  &cfg.User,
-		Password:  &cfg.Passwd,
-		Database:  &cfg.DBName,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  cfg.Passwd,
+		Database:  cfg.DBName,
 		Threads:   1,
 		Checksum:  true,
 		Statement: `ALTER TABLE t1secondary ADD KEY (title) SECONDARY_ENGINE_ATTRIBUTE='{"type":"spann", "distance":"l2", "product_quantization":{"dimensions":96}}'`,
@@ -597,10 +593,10 @@ port = 5678
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     mkPtr("cli-host:1234"),
-		Username: mkPtr("cli-user"),
-		Password: mkPtr("cli-password"),
-		Database: mkPtr("cli-db"),
+		Host:     "cli-host:1234",
+		Username: "cli-user",
+		Password: "cli-password",
+		Database: "cli-db",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -609,10 +605,10 @@ port = 5678
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "cli-user", *migration.Username)
-	assert.Equal(t, "cli-password", *migration.Password)
-	assert.Equal(t, "cli-host:1234", *migration.Host)
-	assert.Equal(t, "cli-db", *migration.Database)
+	assert.Equal(t, "cli-user", migration.Username)
+	assert.Equal(t, "cli-password", migration.Password)
+	assert.Equal(t, "cli-host:1234", migration.Host)
+	assert.Equal(t, "cli-db", migration.Database)
 }
 
 func TestConfFileLoadingIfNoCommandLineOptions(t *testing.T) {
@@ -633,10 +629,10 @@ port = 5678
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     nil,
-		Username: nil,
-		Password: nil,
-		Database: nil,
+		Host:     "",
+		Username: "",
+		Password: "",
+		Database: "",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -645,10 +641,10 @@ port = 5678
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "fileuser", *migration.Username)
-	assert.Equal(t, "filepass", *migration.Password)
-	assert.Equal(t, "filehost:5678", *migration.Host)
-	assert.Equal(t, "filedb", *migration.Database)
+	assert.Equal(t, "fileuser", migration.Username)
+	assert.Equal(t, "filepass", migration.Password)
+	assert.Equal(t, "filehost:5678", migration.Host)
+	assert.Equal(t, "filedb", migration.Database)
 }
 
 func TestConfFileLoadingUsesDefaultPort(t *testing.T) {
@@ -668,10 +664,10 @@ database = filedb
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     nil,
-		Username: nil,
-		Password: nil,
-		Database: nil,
+		Host:     "",
+		Username: "",
+		Password: "",
+		Database: "",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -680,10 +676,10 @@ database = filedb
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "fileuser", *migration.Username)
-	assert.Equal(t, "filepass", *migration.Password)
-	assert.Equal(t, "filehost:3306", *migration.Host)
-	assert.Equal(t, "filedb", *migration.Database)
+	assert.Equal(t, "fileuser", migration.Username)
+	assert.Equal(t, "filepass", migration.Password)
+	assert.Equal(t, "filehost:3306", migration.Host)
+	assert.Equal(t, "filedb",  migration.Database)
 }
 
 func TestConfFileLoadingUserOnly(t *testing.T) {
@@ -700,10 +696,10 @@ user = onlyuser
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     mkPtr("localhost:3306"),
-		Username: nil,
-		Password: mkPtr("defaultpass"),
-		Database: mkPtr("testdb"),
+		Host:     "localhost:3306",
+		Username: "",
+		Password: "defaultpass",
+		Database: "testdb",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -712,10 +708,10 @@ user = onlyuser
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "onlyuser", *migration.Username)
-	assert.Equal(t, "defaultpass", *migration.Password)
-	assert.Equal(t, "localhost:3306", *migration.Host)
-	assert.Equal(t, "testdb", *migration.Database)
+	assert.Equal(t, "onlyuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "testdb", migration.Database)
 }
 
 func TestConfFileLoadingPasswordOnly(t *testing.T) {
@@ -732,10 +728,10 @@ password = filepass
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     mkPtr("localhost:3306"),
-		Username: mkPtr("defaultuser"),
-		Password: nil,
-		Database: mkPtr("testdb"),
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "",
+		Database: "testdb",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -744,10 +740,10 @@ password = filepass
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "filepass", *migration.Password)
-	assert.Equal(t, "defaultuser", *migration.Username)
-	assert.Equal(t, "localhost:3306", *migration.Host)
-	assert.Equal(t, "testdb", *migration.Database)
+	assert.Equal(t, "filepass", migration.Password)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "testdb", migration.Database)
 }
 
 func TestConfFilePortUsedIfCommandLineHostHasNone(t *testing.T) {
@@ -763,10 +759,10 @@ port=1234
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     mkPtr("localhost"),
-		Username: mkPtr("defaultuser"),
-		Password: mkPtr("defaultpass"),
-		Database: mkPtr("testdb"),
+		Host:     "localhost",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -775,10 +771,10 @@ port=1234
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "defaultpass", *migration.Password)
-	assert.Equal(t, "defaultuser", *migration.Username)
-	assert.Equal(t, "localhost:1234", *migration.Host)
-	assert.Equal(t, "testdb", *migration.Database)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "localhost:1234", migration.Host)
+	assert.Equal(t, "testdb", migration.Database)
 }
 
 func TestConfFileLoadingEmptyClientSection(t *testing.T) {
@@ -794,10 +790,10 @@ func TestConfFileLoadingEmptyClientSection(t *testing.T) {
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     mkPtr("localhost:3306"),
-		Username: mkPtr("defaultuser"),
-		Password: mkPtr("defaultpass"),
-		Database: mkPtr("testdb"),
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -806,10 +802,10 @@ func TestConfFileLoadingEmptyClientSection(t *testing.T) {
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "localhost:3306", *migration.Host)
-	assert.Equal(t, "defaultuser", *migration.Username)
-	assert.Equal(t, "defaultpass", *migration.Password)
-	assert.Equal(t, "testdb", *migration.Database)
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "testdb", migration.Database)
 }
 
 func TestConfFileLoadingNoClientSection(t *testing.T) {
@@ -827,10 +823,10 @@ password = mysqlpass
 	require.NoError(t, tmpFile.Close())
 
 	migration := &Migration{
-		Host:     mkPtr("localhost:3306"),
-		Username: mkPtr("defaultuser"),
-		Password: mkPtr("defaultpass"),
-		Database: mkPtr("testdb"),
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: tmpFile.Name(),
@@ -839,18 +835,18 @@ password = mysqlpass
 	_, err = migration.normalizeOptions()
 	require.NoError(t, err)
 
-	assert.Equal(t, "localhost:3306", *migration.Host)
-	assert.Equal(t, "defaultuser", *migration.Username)
-	assert.Equal(t, "defaultpass", *migration.Password)
-	assert.Equal(t, "testdb", *migration.Database)
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "testdb", migration.Database)
 }
 
 func TestConfFileLoadingInvalidFile(t *testing.T) {
 	migration := &Migration{
-		Host:     mkPtr("localhost:3306"),
-		Username: mkPtr("defaultuser"),
-		Password: mkPtr("defaultpass"),
-		Database: mkPtr("testdb"),
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: "/nonexistent/file.cnf",
@@ -863,10 +859,10 @@ func TestConfFileLoadingInvalidFile(t *testing.T) {
 
 func TestConfFileLoadingEmptyFile(t *testing.T) {
 	migration := &Migration{
-		Host:     mkPtr("localhost:3306"),
-		Username: mkPtr("defaultuser"),
-		Password: mkPtr("defaultpass"),
-		Database: mkPtr("testdb"),
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
 		Table:    "testtable",
 		Alter:    "ENGINE=InnoDB",
 		ConfFile: "",
@@ -875,8 +871,8 @@ func TestConfFileLoadingEmptyFile(t *testing.T) {
 	_, err := migration.normalizeOptions()
 	assert.NoError(t, err)
 
-	assert.Equal(t, "localhost:3306", *migration.Host)
-	assert.Equal(t, "defaultuser", *migration.Username)
-	assert.Equal(t, "defaultpass", *migration.Password)
-	assert.Equal(t, "testdb", *migration.Database)
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "testdb", migration.Database)
 }
