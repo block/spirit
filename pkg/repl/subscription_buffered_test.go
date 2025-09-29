@@ -48,7 +48,7 @@ func TestBufferedMap(t *testing.T) {
 
 	// As single row:
 	statement := sub.createUpsertStmt([]logicalRow{sub.changes["1"]})
-	assert.Equal(t, "INSERT INTO `test`.`_subscription_test_new` (`id`, `name`) VALUES ('1', 'test') AS new ON DUPLICATE KEY UPDATE `name` = new.`name`", statement.stmt)
+	assert.Equal(t, "INSERT INTO `test`.`_subscription_test_new` (`id`, `name`) VALUES (1, 'test') AS new ON DUPLICATE KEY UPDATE `name` = new.`name`", statement.stmt)
 
 	// Now delete the row.
 	testutils.RunSQL(t, "DELETE FROM subscription_test WHERE id = 1")
@@ -67,7 +67,7 @@ func TestBufferedMap(t *testing.T) {
 
 	// Check the upsert statement.
 	statement = sub.createUpsertStmt([]logicalRow{sub.changes["2"], sub.changes["3"]})
-	assert.Equal(t, "INSERT INTO `test`.`_subscription_test_new` (`id`, `name`) VALUES ('2', 'test2'), ('3', 'test3') AS new ON DUPLICATE KEY UPDATE `name` = new.`name`", statement.stmt)
+	assert.Equal(t, "INSERT INTO `test`.`_subscription_test_new` (`id`, `name`) VALUES (2, 'test2'), (3, 'test3') AS new ON DUPLICATE KEY UPDATE `name` = new.`name`", statement.stmt)
 
 	// Now flush the changes.
 	err = sub.Flush(t.Context(), false, nil)

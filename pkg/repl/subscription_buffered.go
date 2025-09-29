@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"golang.org/x/sync/errgroup"
@@ -122,8 +123,8 @@ func (s *bufferedMap) createUpsertStmt(insertRows []logicalRow) statement {
 					if value == nil {
 						values = append(values, "NULL")
 					} else {
-						// Quote the value for SQL safety
-						values = append(values, fmt.Sprintf("'%v'", value))
+						// Use proper SQL escaping
+						values = append(values, s.formatSQLValue(value))
 					}
 				} else {
 					// Column doesn't exist in row image, use NULL
@@ -218,7 +219,7 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 			st := stmt
 			g.Go(func() error {
 				startTime := time.Now()
-				_, err := dbconn.RetryableTransaction(errGrpCtx, s.c.db, false, dbconn.NewDBConfig(), st.stmt)
+				_, err := dbconn.RetryableTransaction(errGrpCtx, s.c.writeDB, false, dbconn.NewDBConfig(), st.stmt)
 				s.c.feedback(st.numKeys, time.Since(startTime))
 				return err
 			})
@@ -279,4 +280,16 @@ func (s *bufferedMap) columnExistsInBothTables(columnName string) bool {
 	}
 
 	return sourceExists && destExists
+}
+
+// formatSQLValue formats a Go value for use in SQL VALUES clause using proper SQL escaping
+func (s *bufferedMap) formatSQLValue(value any) string {
+	// Use the proper SQL escaping library to handle all data types correctly
+	escaped, err := sqlescape.EscapeSQL("%?", value)
+	if err != nil {
+		// Fallback to NULL if escaping fails
+		s.c.logger.Warnf("failed to escape SQL value %v: %v, using NULL", value, err)
+		return "NULL"
+	}
+	return escaped
 }

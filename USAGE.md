@@ -381,3 +381,16 @@ We also haven't technically implemented the low-watermark requirement for replic
 Buffered changes also puts a lot more stress on the `spirit` binary in terms of CPU use and memory. Ideally we can get a good understanding on this, and ensure that there is some protection in place to prevent out of memory cases etc.
 
 There is also the risk that the buffered algorithm write threads can overwhelm a server. We need to implement a throttler that detects that the server is overloaded, and possibly some configuration over write threads.
+
+
+### `move` command
+
+**Feature Description**
+
+This feature provides a new top level binary `move`, which can copy whole schemas between different MySQL servers.
+
+**Current Status**
+
+This command depends strongly on the experimental buffered copy and multi-table support, both which are currently experimental. There is not too much which is special to move on top of these two features, so once they become stable, so too can `move`.
+
+It is anticipated that `move` will need to provide some pluggable method of cutover so external metadata systems can be updated. There is no current design for this.

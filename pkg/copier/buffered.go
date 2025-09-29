@@ -40,6 +40,7 @@ const (
 type buffered struct {
 	sync.Mutex
 	db               *sql.DB
+	writeDB          *sql.DB // for move command
 	chunker          table.Chunker
 	concurrency      int
 	finalChecksum    bool
@@ -391,7 +392,7 @@ func (c *buffered) writeChunklet(ctx context.Context, chunkletData chunklet) (in
 	c.logger.Debugf("writing chunklet of %d rows to %s", len(chunkletData.rows), chunkletData.chunk.NewTable.QuotedName)
 
 	// Execute the batch insert
-	result, err := dbconn.RetryableTransaction(ctx, c.db, c.finalChecksum, c.dbConfig, query)
+	result, err := dbconn.RetryableTransaction(ctx, c.writeDB, c.finalChecksum, c.dbConfig, query)
 	if err != nil {
 		return 0, fmt.Errorf("failed to execute chunklet insert: %w", err)
 	}
