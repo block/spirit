@@ -998,17 +998,16 @@ func TestCheckpointRestore(t *testing.T) {
 	watermark := "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\":[\"53926425\"],\"Inclusive\":true},\"UpperBound\":{\"Value\":[\"53926425\"],\"Inclusive\":false}}"
 	binlog := r.replClient.GetBinlogApplyPosition()
 	err = dbconn.Exec(t.Context(), r.db, `INSERT INTO %n.%n
-	(copier_watermark, checksum_watermark, binlog_name, binlog_pos, rows_copied, alter_statement)
+	(copier_watermark, checksum_watermark, binlog_name, binlog_pos, statement)
 	VALUES
-	(%?,  %?, %?, %?, %?, %?)`,
+	(%?,  %?, %?, %?, %?)`,
 		r.checkpointTable.SchemaName,
 		r.checkpointTable.TableName,
 		watermark,
 		"",
 		binlog.Name,
 		binlog.Pos,
-		0,
-		r.migration.Alter,
+		r.migration.Statement,
 	)
 	assert.NoError(t, err)
 	assert.NoError(t, r.Close())
@@ -2129,7 +2128,8 @@ func TestResumeFromCheckpointStrict(t *testing.T) {
 	// by disabling --strict
 
 	migrationB.Strict = false
-	migrationB.Threads = 4 // to make the test run faster
+	migrationB.Threads = 4    // to make the test run faster
+	migrationB.Statement = "" // reset for validation
 
 	runner, err = NewRunner(migrationB)
 	assert.NoError(t, err)

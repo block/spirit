@@ -36,7 +36,7 @@ type Chunker interface {
 	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)
 	KeyAboveHighWatermark(key any) bool
 	Progress() (rowsRead uint64, chunksCopied uint64, totalRowsExpected uint64)
-	OpenAtWatermark(watermark string, datum Datum, rowsCopied uint64) error
+	OpenAtWatermark(watermark string) error
 	GetLowWatermark() (string, error)
 	// Tables return a list of table names
 	// By convention the first table is the "current" table,

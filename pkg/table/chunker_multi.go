@@ -1,6 +1,7 @@
 package table
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -11,7 +12,7 @@ import (
 // to the chunker that has made the least progress
 type multiChunker struct {
 	sync.Mutex
-	chunkers []Chunker
+	chunkers map[string]Chunker // map of table name to chunker for quick lookup
 	isOpen   bool
 }
 
@@ -25,8 +26,18 @@ func NewMultiChunker(c ...Chunker) Chunker {
 	if len(c) == 1 {
 		return c[0]
 	}
+	chunkers := make(map[string]Chunker, len(c))
+	for _, chunker := range c {
+		tables := chunker.Tables()
+		if len(tables) == 0 {
+			continue
+		}
+		// By convention the first table is the "current" table
+		table := tables[0]
+		chunkers[table.TableName] = chunker
+	}
 	return &multiChunker{
-		chunkers: c,
+		chunkers: chunkers,
 	}
 }
 
@@ -68,9 +79,9 @@ func (m *multiChunker) Close() error {
 	defer m.Unlock()
 
 	var errs []error
-	for i, chunker := range m.chunkers {
+	for name, chunker := range m.chunkers {
 		if err := chunker.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close chunker %d: %w", i, err))
+			errs = append(errs, fmt.Errorf("failed to close chunker %s: %w", name, err))
 		}
 	}
 	m.isOpen = false
@@ -146,10 +157,9 @@ func (m *multiChunker) Feedback(chunk *Chunk, duration time.Duration, actualRows
 }
 
 // KeyAboveHighWatermark currently not supported for multi-chunker
-// The interface will need to be changed to accept (table, key) to route properly
+// The interface would need to be changed to accept (table, key) to route properly
+// We work around this by using the child chunkers in repl.AddSubscription() directly.
 func (m *multiChunker) KeyAboveHighWatermark(key any) bool {
-	// TODO: Interface needs to be changed to KeyAboveHighWatermark(table, key)
-	// to properly route to the correct underlying chunker
 	return false
 }
 
@@ -170,27 +180,60 @@ func (m *multiChunker) Progress() (uint64, uint64, uint64) {
 	return totalRowsCopied, totalChunksCopied, totalRowsExpected
 }
 
-// OpenAtWatermark is not yet implemented for multi-chunker
-func (m *multiChunker) OpenAtWatermark(watermark string, datum Datum, rowsCopied uint64) error {
-	return errors.New("OpenAtWatermark not yet implemented for multi-chunker")
+// OpenAtWatermark for multi-chunker. We deserialize the watermarks
+// into a map, and then call OpenAtWatermark on each child chunker
+// with the corresponding watermark.
+func (m *multiChunker) OpenAtWatermark(watermark string) error {
+	m.Lock()
+	defer m.Unlock()
+
+	watermarks := make(map[string]string, len(m.chunkers))
+	if err := json.Unmarshal([]byte(watermark), &watermarks); err != nil {
+		return fmt.Errorf("could not parse multi-chunker watermark: %w", err)
+	}
+
+	// First, check that all chunkers have a corresponding watermark
+	for tableName := range m.chunkers {
+		if _, ok := watermarks[tableName]; !ok {
+			return fmt.Errorf("could not find chunker for table %q in watermark", tableName)
+		}
+	}
+
+	// Now we have to call OpenAtWatermark on each child chunker
+	// The children are in m.chunkers and keyed by their table name
+	for tbl, watermark := range watermarks {
+		chunker, ok := m.chunkers[tbl]
+		if !ok {
+			return fmt.Errorf("could not find chunker for table %q in multi-chunker", tbl)
+		}
+		// Call OpenAtWatermark on the child chunker
+		if err := chunker.OpenAtWatermark(watermark); err != nil {
+			return fmt.Errorf("could not open chunker %q at watermark %q: %w", chunker, watermark, err)
+		}
+	}
+	// Set isOpen to true after successfully opening all child chunkers
+	m.isOpen = true
+	return nil
 }
 
 // GetLowWatermark calls GetLowWatermark on all the child chunkers
 // and then merges them into a single watermark string.
 func (m *multiChunker) GetLowWatermark() (string, error) {
-	watermarks := make([]string, 0, len(m.chunkers))
+	watermarks := make(map[string]string, len(m.chunkers))
 	for _, chunker := range m.chunkers {
 		watermark, err := chunker.GetLowWatermark()
 		if err != nil {
 			return "", err
 		}
 		tbl := chunker.Tables()[0]
-		// TODO: This code is temporary. It is creating a watermark that
-		// combines other watermarks, but is not in a format that is restorable yet.
-		watermarks = append(watermarks, fmt.Sprintf("tbl=%s watermark=%q", tbl.TableName, watermark))
+		watermarks[tbl.TableName] = watermark
 	}
-
-	return fmt.Sprintf("%q", watermarks), nil
+	// We have to serialize the map to a string.
+	json, err := json.Marshal(watermarks)
+	if err != nil {
+		return "", err
+	}
+	return string(json), nil
 }
 
 // Tables returns all tables from all chunkers

@@ -2,6 +2,7 @@ package table
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -45,6 +46,11 @@ type chunkerComposite struct {
 	chunksCopied uint64
 
 	logger loggers.Advanced
+}
+
+type compositeWatermark struct {
+	ChunkJSON  string
+	RowsCopied uint64
 }
 
 var _ Chunker = &chunkerComposite{}
@@ -198,16 +204,19 @@ func (t *chunkerComposite) Open() (err error) {
 
 // OpenAtWatermark opens a table for the resume-from-checkpoint use case.
 // This will set the chunkPtr to a known safe value that is contained within
-// the checkpoint. Because the composite chunker *does not support* the
-// KeyAboveWatermark optimization, the second argument is ignored.
-func (t *chunkerComposite) OpenAtWatermark(checkpnt string, _ Datum, rowsCopied uint64) error {
+// the checkpoint.
+func (t *chunkerComposite) OpenAtWatermark(checkpnt string) error {
 	t.Lock()
 	defer t.Unlock()
 
+	var watermark compositeWatermark
+	if err := json.Unmarshal([]byte(checkpnt), &watermark); err != nil {
+		return fmt.Errorf("could not parse composite watermark: %w", err)
+	}
 	if err := t.open(); err != nil {
 		return err
 	}
-	chunk, err := newChunkFromJSON(t.Ti, checkpnt)
+	chunk, err := newChunkFromJSON(t.Ti, watermark.ChunkJSON)
 	if err != nil {
 		return err
 	}
@@ -216,7 +225,7 @@ func (t *chunkerComposite) OpenAtWatermark(checkpnt string, _ Datum, rowsCopied 
 	// from the chunk.LowerBound.
 	t.watermark = chunk
 	t.chunkPtrs = chunk.LowerBound.Value
-	t.rowsCopied = rowsCopied
+	t.rowsCopied = watermark.RowsCopied
 	return nil
 }
 
@@ -278,7 +287,20 @@ func (t *chunkerComposite) GetLowWatermark() (string, error) {
 		return "", errors.New("watermark not yet ready")
 	}
 
-	return t.watermark.JSON(), nil
+	// For composite chunks we also need to embed the rowsCopied
+	// into the watermark. This is because progress is determined
+	// based on rowsCopied / estimatedRows (not based on logical
+	// key space).
+	watermark := compositeWatermark{
+		ChunkJSON:  t.watermark.JSON(),
+		RowsCopied: atomic.LoadUint64(&t.rowsCopied),
+	}
+	// Serialize to JSON
+	jsonBytes, err := json.Marshal(watermark)
+	if err != nil {
+		return "", fmt.Errorf("could not serialize composite watermark: %w", err)
+	}
+	return string(jsonBytes), nil
 }
 
 // isSpecialRestoredChunk is used to test for the first chunk after restore-from-checkpoint.

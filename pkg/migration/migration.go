@@ -65,7 +65,10 @@ func (m *Migration) Run() error {
 }
 
 // normalizeOptions does some validation and sets defaults.
-// for example, it validates that only --statement or --table and --alter are specified.
+// for example, it validates that only --statement or --table and --alter are specified,
+// and when --statement is not specified, it generates it
+// so the rest of the code can use --statement as the canonical
+// source of truth for what's happening.
 func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, err error) {
 	if m.TargetChunkTime == 0 {
 		m.TargetChunkTime = table.ChunkerDefaultTarget
@@ -103,9 +106,7 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 			}
 			stmt.Schema = m.Database
 		}
-	} else {
-		// Parse table + alter into statement.
-		// So that in various contexts we can start moving to using the AbstractStatement.
+	} else { // --alter and --table are specified
 		if m.Table == "" {
 			return nil, errors.New("table name is required")
 		}
@@ -116,6 +117,7 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		m.Alter = strings.TrimSpace(m.Alter)
 		m.Alter = strings.TrimSuffix(m.Alter, ";")
 		fullStatement := fmt.Sprintf("ALTER TABLE `%s` %s", m.Table, m.Alter)
+		m.Statement = fullStatement // used in resume from checkpoint
 		p := parser.New()
 		stmtNodes, _, err := p.Parse(fullStatement, "", "")
 		if err != nil {

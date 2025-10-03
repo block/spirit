@@ -191,7 +191,7 @@ func (t *chunkerOptimistic) setDynamicChunking(newValue bool) {
 	t.disableDynamicChunker = !newValue
 }
 
-func (t *chunkerOptimistic) OpenAtWatermark(cp string, highPtr Datum, rowsCopied uint64) error {
+func (t *chunkerOptimistic) OpenAtWatermark(cp string) error {
 	t.Lock()
 	defer t.Unlock()
 
@@ -203,7 +203,8 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string, highPtr Datum, rowsCopied
 	}
 	// Because this chunker only supports single-column primary keys,
 	// we can safely set the checkpointHighPtr as a single value like this.
-	t.checkpointHighPtr = highPtr // set the high pointer.
+	// For high watermark, use the type of old table, not the new one.
+	t.checkpointHighPtr = NewDatum(t.NewTi.MaxValue().Val, t.Ti.MaxValue().Tp) // set the high pointer.
 	chunk, err := newChunkFromJSON(t.Ti, cp)
 	if err != nil {
 		return err
@@ -214,8 +215,15 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string, highPtr Datum, rowsCopied
 	// keys, it uses Value[0].
 	t.watermark = chunk
 	t.chunkPtr = chunk.LowerBound.Value[0]
-	t.rowsCopied = rowsCopied
 
+	// For the optimistic chunker, we also calculate progress (i.e. rowsCopied)
+	// Based on the progress of copying the auto_increment key.
+	// So we don't have to recover it from the checkpoint, we can just set the value
+	// from the current chunkPtr.
+	t.rowsCopied, err = strconv.ParseUint(t.chunkPtr.String(), 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse chunkPtr to uint64: %w", err)
+	}
 	return nil
 }
 

@@ -352,9 +352,7 @@ This feature allows Spirit to apply multiple schema changes at once, and cut the
 
 **Current Status**
 
-This feature is not feature complete. See Issue [#388](https://github.com/block/spirit/issues/388) for details.
-
-The main issues are that multi-table migrations are not currently resumable, and there is a lack of a lock to prevent concurrent migrations. This feature also lacks sufficient testing.
+This feature is feature complete. The main issue is that there is insufficient test coverage. See issue [#388](https://github.com/block/spirit/issues/388) for details.
 
 ### enable-experimental-buffered-copy
 
