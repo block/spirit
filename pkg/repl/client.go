@@ -432,7 +432,7 @@ func (c *Client) processRowsEvent(ev *replication.BinlogEvent, e *replication.Ro
 
 			if isPKUpdate {
 				// This is a primary key update - track both delete and insert
-				sub.keyHasChanged(beforeKey, true)  // delete old key
+				sub.keyHasChanged(beforeKey, true) // delete old key
 				sub.keyHasChanged(afterKey, false) // insert new key
 			} else {
 				// Same PK, just a regular update
