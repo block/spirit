@@ -1,7 +1,12 @@
 name: MySQL 8.0 Build and Run /w docker-compose
 on:
+on:
   push:
-    branches: [ main ]
+    tags:
+      - v*
+    branches:
+      - main
+      - release/v*
   pull_request:
     branches: [ main ]
 jobs:

@@ -1,7 +1,11 @@
 name: MySQL 8.0.33 (with replicas) /w docker-compose
 on:
   push:
-    branches: [ main ]
+    tags:
+      - v*
+    branches:
+      - main
+      - release/v*
   pull_request:
     branches: [ main ]
 jobs:
