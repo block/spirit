@@ -500,7 +500,7 @@ func TestUnparsableStatements(t *testing.T) {
 	}
 	err = migration.Run()
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "could not parse SQL statement")
+	assert.ErrorContains(t, err, "line 1 column 14 near \"TRIGGER")
 
 	//https://github.com/pingcap/tidb/pull/61498
 	migration = &Migration{

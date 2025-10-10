@@ -48,7 +48,7 @@ func TestExtractFromStatement(t *testing.T) {
 
 	// This doesn't though:
 	_, err = New("CREATE TABLE tnn (a int); ALTER TABLE t2 ADD INDEX (something)")
-	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrMixMatchMultiStatements)
 
 	// Include the schema name.
 	abstractStmt, err = New("ALTER TABLE test.t1 ADD INDEX (something)")
@@ -78,7 +78,7 @@ func TestExtractFromStatement(t *testing.T) {
 
 	// test unsupported.
 	_, err = New("INSERT INTO t1 (a) VALUES (1)")
-	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotSupportedStatement)
 
 	// drop table
 	abstractStmt, err = New("DROP TABLE t1")
@@ -89,7 +89,7 @@ func TestExtractFromStatement(t *testing.T) {
 
 	// drop table with multiple schemas
 	_, err = New("DROP TABLE test.t1, test2.t1")
-	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrMultipleSchemas)
 
 	// rename table
 	abstractStmt, err = New("RENAME TABLE t1 TO t2")
@@ -98,6 +98,12 @@ func TestExtractFromStatement(t *testing.T) {
 	assert.Empty(t, abstractStmt[0].Alter)
 	assert.False(t, abstractStmt[0].IsAlterTable())
 	assert.Equal(t, "RENAME TABLE t1 TO t2", abstractStmt[0].Statement)
+
+	_, err = New("-- commented out sql")
+	assert.ErrorIs(t, err, ErrNoStatements)
+
+	_, err = New("RENAME TABLE test.t1 TO test2.t2")
+	assert.ErrorIs(t, err, ErrMultipleSchemas)
 }
 
 func TestAlgorithmInplaceConsideredSafe(t *testing.T) {
@@ -124,27 +130,27 @@ func TestAlgorithmInplaceConsideredSafe(t *testing.T) {
 	assert.NoError(t, test("change column `a` `new_a` varchar(50)"))
 
 	// Non-VARCHAR column modifications should be unsafe (table-rebuilding)
-	assert.Error(t, test("modify `a` int"))
-	assert.Error(t, test("change column `a` `a` int"))
-	assert.Error(t, test("modify `a` text"))
-	assert.Error(t, test("change column `a` `new_a` bigint"))
-	assert.Error(t, test("modify `a` decimal(10,2)"))
-	assert.Error(t, test("change column `a` `a` datetime"))
+	assert.ErrorIs(t, test("modify `a` int"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("change column `a` `a` int"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("modify `a` text"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("change column `a` `new_a` bigint"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("modify `a` decimal(10,2)"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("change column `a` `a` datetime"), ErrUnsafeForInplace)
 
 	// Other unsafe operations (table-rebuilding)
-	assert.Error(t, test("ADD COLUMN `a` INT"))
-	assert.Error(t, test("ADD index (a)"))
-	assert.Error(t, test("drop index `a`, add index `b` (`b`)"))
-	assert.Error(t, test("engine=innodb"))
-	assert.Error(t, test("partition by HASH(`id`) partitions 8;"))
-	assert.Error(t, test("remove partitioning"))
+	assert.ErrorIs(t, test("ADD COLUMN `a` INT"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("ADD index (a)"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("drop index `a`, add index `b` (`b`)"), ErrMultipleAlterClauses)
+	assert.ErrorIs(t, test("engine=innodb"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("partition by HASH(`id`) partitions 8;"), ErrUnsafeForInplace)
+	assert.ErrorIs(t, test("remove partitioning"), ErrUnsafeForInplace)
 
 	// Mixed safe and unsafe operations should be unsafe - these cannot be split
 	// because we cannot safely detect which operations are INSTANT vs INPLACE
-	assert.Error(t, test("drop index `a`, add column `b` int"))
-	assert.Error(t, test("ALTER INDEX b INVISIBLE, add column `c` int"))
-	assert.Error(t, test("modify `a` varchar(100), add index (b)"))
-	assert.Error(t, test("drop index `a`, modify `b` int")) // non-VARCHAR modification makes it unsafe
+	assert.ErrorIs(t, test("drop index `a`, add column `b` int"), ErrMultipleAlterClauses)
+	assert.ErrorIs(t, test("ALTER INDEX b INVISIBLE, add column `c` int"), ErrMultipleAlterClauses)
+	assert.ErrorIs(t, test("modify `a` varchar(100), add index (b)"), ErrMultipleAlterClauses)
+	assert.ErrorIs(t, test("drop index `a`, modify `b` int"), ErrMultipleAlterClauses) // non-VARCHAR modification makes it unsafe
 }
 
 func TestAlterIsAddUnique(t *testing.T) {
@@ -160,7 +166,7 @@ func TestAlterIsAddUnique(t *testing.T) {
 	assert.NoError(t, test("ADD index (a)"))
 	assert.NoError(t, test("drop index `a`, add index `b` (`b`)"))
 	assert.NoError(t, test("engine=innodb"))
-	assert.Error(t, test("add unique(b)")) // this is potentially lossy.
+	assert.ErrorIs(t, test("add unique(b)"), ErrAlterContainsUnique) // this is potentially lossy.
 }
 
 func TestAlterContainsIndexVisibility(t *testing.T) {
@@ -200,12 +206,12 @@ func TestAlterContainsIndexVisibility(t *testing.T) {
 	assert.NoError(t, test("ALTER INDEX b INVISIBLE, change column `a` `a` varchar(150)")) // VARCHAR modifications are metadata-only
 
 	// Index visibility mixed with table-rebuilding operations should fail
-	assert.Error(t, test("ALTER INDEX b INVISIBLE, ADD COLUMN `c` INT"))
-	assert.Error(t, test("ALTER INDEX b VISIBLE, ADD index (d)"))
-	assert.Error(t, test("ALTER INDEX b INVISIBLE, engine=innodb"))
-	assert.Error(t, test("ALTER INDEX b VISIBLE, add unique(e)"))
-	assert.Error(t, test("ALTER INDEX b INVISIBLE, modify `a` int"))          // Non-VARCHAR modifications are table-rebuilding
-	assert.Error(t, test("ALTER INDEX b VISIBLE, change column `a` `a` int")) // Non-VARCHAR modifications are table-rebuilding
+	assert.ErrorIs(t, test("ALTER INDEX b INVISIBLE, ADD COLUMN `c` INT"), ErrVisibilityMixedWithOtherChanges)
+	assert.ErrorIs(t, test("ALTER INDEX b VISIBLE, ADD index (d)"), ErrVisibilityMixedWithOtherChanges)
+	assert.ErrorIs(t, test("ALTER INDEX b INVISIBLE, engine=innodb"), ErrVisibilityMixedWithOtherChanges)
+	assert.ErrorIs(t, test("ALTER INDEX b VISIBLE, add unique(e)"), ErrVisibilityMixedWithOtherChanges)
+	assert.ErrorIs(t, test("ALTER INDEX b INVISIBLE, modify `a` int"), ErrVisibilityMixedWithOtherChanges)          // Non-VARCHAR modifications are table-rebuilding
+	assert.ErrorIs(t, test("ALTER INDEX b VISIBLE, change column `a` `a` int"), ErrVisibilityMixedWithOtherChanges) // Non-VARCHAR modifications are table-rebuilding
 }
 
 func TestAlterContainsUnsupportedClause(t *testing.T) {
@@ -247,8 +253,8 @@ func TestMixedOperationsLogic(t *testing.T) {
 	assert.NoError(t, testInplace("change column `a` `a` varchar(50), change column `b` `b` varchar(75)"))
 
 	// Mixed VARCHAR and non-VARCHAR should be unsafe
-	assert.Error(t, testInplace("modify `a` varchar(100), modify `b` int"))
-	assert.Error(t, testInplace("change column `a` `a` varchar(50), change column `b` `b` text"))
+	assert.ErrorIs(t, testInplace("modify `a` varchar(100), modify `b` int"), ErrMultipleAlterClauses)
+	assert.ErrorIs(t, testInplace("change column `a` `a` varchar(50), change column `b` `b` text"), ErrMultipleAlterClauses)
 
 	// Test AlterContainsIndexVisibility with complex mixed operations
 	var testVisibility = func(stmt string) error {

@@ -23,8 +23,15 @@ type AbstractStatement struct {
 }
 
 var (
-	ErrNotSupportedStatement = errors.New("not a supported statement type")
-	ErrNotAlterTable         = errors.New("not an ALTER TABLE statement")
+	ErrNotSupportedStatement           = errors.New("not a supported statement type")
+	ErrNotAlterTable                   = errors.New("not an ALTER TABLE statement")
+	ErrMultipleSchemas                 = errors.New("statement attempts to modify tables across multiple schemas")
+	ErrNoStatements                    = errors.New("could not find any compatible statements to execute")
+	ErrMixMatchMultiStatements         = errors.New("when performing atomic schema changes, all statements must be of type ALTER TABLE")
+	ErrUnsafeForInplace                = errors.New("statement contains operations that are not safe for INPLACE algorithm")
+	ErrMultipleAlterClauses            = errors.New("ALTER contains multiple clauses. Combinations of INSTANT and INPLACE operations cannot be detected safely. Consider executing these as separate ALTER statements")
+	ErrAlterContainsUnique             = errors.New("ALTER contains adding a unique index")
+	ErrVisibilityMixedWithOtherChanges = errors.New("the ALTER operation contains a change to index visibility mixed with table-rebuilding operations. This creates semantic issues for experiments. Please split the ALTER statement into separate statements for changing the invisible index and other operations")
 )
 
 func New(statement string) ([]*AbstractStatement, error) {
@@ -86,7 +93,7 @@ func New(statement string) ([]*AbstractStatement, error) {
 				distinctSchemas[table.Schema.String()] = struct{}{}
 			}
 			if len(distinctSchemas) > 1 {
-				return nil, errors.New("statement attempts to drop tables from multiple schemas")
+				return nil, ErrMultipleSchemas
 			}
 			stmts = append(stmts, &AbstractStatement{
 				Schema:    node.Tables[0].Schema.String(),
@@ -100,12 +107,12 @@ func New(statement string) ([]*AbstractStatement, error) {
 			distinctSchemas := make(map[string]struct{})
 			for _, clause := range stmt.TableToTables {
 				if clause.OldTable.Schema.String() != clause.NewTable.Schema.String() {
-					return nil, errors.New("statement attempts to move table between schemas")
+					return nil, ErrMultipleSchemas
 				}
 				distinctSchemas[clause.OldTable.Schema.String()] = struct{}{}
 			}
 			if len(distinctSchemas) > 1 {
-				return nil, errors.New("statement attempts to rename tables in multiple schemas")
+				return nil, ErrMultipleSchemas
 			}
 			stmts = append(stmts, &AbstractStatement{
 				Schema:    stmt.TableToTables[0].OldTable.Schema.String(),
@@ -113,14 +120,16 @@ func New(statement string) ([]*AbstractStatement, error) {
 				Statement: statement,
 				StmtNode:  &stmtNodes[i],
 			})
+		default:
+			return nil, ErrNotSupportedStatement
 		}
 	}
 
 	if len(stmts) > 1 && mustBeOnlyStatement {
-		return nil, errors.New("statement must be executed alone")
+		return nil, ErrMixMatchMultiStatements
 	}
 	if len(stmts) < 1 {
-		return nil, errors.New("could not find any compatible statements to execute")
+		return nil, ErrNoStatements
 	}
 
 	return stmts, nil
@@ -179,9 +188,9 @@ func (a *AbstractStatement) AlgorithmInplaceConsideredSafe() error {
 	}
 	if unsafeClauses > 0 {
 		if len(alterStmt.Specs) > 1 {
-			return errors.New("ALTER contains multiple clauses. Combinations of INSTANT and INPLACE operations cannot be detected safely. Consider executing these as separate ALTER statements")
+			return ErrMultipleAlterClauses
 		}
-		return errors.New("ALTER statement contains operations that are not safe for INPLACE algorithm")
+		return ErrUnsafeForInplace
 	}
 	return nil
 }
@@ -221,7 +230,7 @@ func (a *AbstractStatement) AlterContainsAddUnique() error {
 	}
 	for _, spec := range alterStmt.Specs {
 		if spec.Tp == ast.AlterTableAddConstraint && spec.Constraint.Tp == ast.ConstraintUniq {
-			return errors.New("contains adding a unique index")
+			return ErrAlterContainsUnique
 		}
 	}
 	return nil
@@ -267,7 +276,7 @@ func (a *AbstractStatement) AlterContainsIndexVisibility() error {
 
 	// Only fail if index visibility is mixed with non-metadata operations
 	if hasIndexVisibility && hasNonMetadataOperation {
-		return errors.New("the ALTER operation contains a change to index visibility mixed with table-rebuilding operations. This creates semantic issues for experiments. Please split the ALTER statement into separate statements for changing the invisible index and other operations")
+		return ErrVisibilityMixedWithOtherChanges
 	}
 
 	return nil

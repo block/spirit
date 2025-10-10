@@ -101,8 +101,9 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		// This also returns the StmtNode.
 		stmts, err = statement.New(m.Statement)
 		if err != nil {
-			// Omit the parser error messages, just show the statement.
-			return nil, errors.New("could not parse SQL statement: " + m.Statement)
+			// The error could be a parser error, or it might be something
+			// specific like mixed ALTER + non alter statements.
+			return nil, err
 		}
 		for _, stmt := range stmts {
 			if stmt.Schema != "" && stmt.Schema != m.Database {
