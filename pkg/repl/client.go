@@ -54,8 +54,11 @@ type Client struct {
 	streamer *replication.BinlogStreamer
 
 	// The DB connection is used for queries like SHOW MASTER STATUS
-	// or flushing changes in subscriptions.
-	db       *sql.DB
+	db *sql.DB
+	// The writeDB is used for flushing writes from subscriptions
+	// In spirit, it's the same as the db connection, but for Move
+	// it will be the target.
+	writeDB  *sql.DB
 	dbConfig *dbconn.DBConfig
 
 	// subscriptions is a map of tables that are actively
@@ -95,6 +98,9 @@ type Client struct {
 
 // NewClient creates a new Client instance.
 func NewClient(db *sql.DB, host string, username, password string, config *ClientConfig) *Client {
+	if config.WriteDB == nil {
+		config.WriteDB = db // default to using the read DB for writes
+	}
 	return &Client{
 		db:                         db,
 		dbConfig:                   dbconn.NewDBConfig(),
@@ -109,6 +115,7 @@ func NewClient(db *sql.DB, host string, username, password string, config *Clien
 		onDDL:                      config.OnDDL,
 		serverID:                   config.ServerID,
 		useExperimentalBufferedMap: config.UseExperimentalBufferedMap,
+		writeDB:                    config.WriteDB,
 	}
 }
 
@@ -119,6 +126,7 @@ type ClientConfig struct {
 	OnDDL                      chan string
 	ServerID                   uint32
 	UseExperimentalBufferedMap bool
+	WriteDB                    *sql.DB // if not nil, use this DB for writes.
 }
 
 // NewServerID randomizes the server ID to avoid conflicts with other binlog readers.

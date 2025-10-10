@@ -239,7 +239,7 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 			st := stmt
 			g.Go(func() error {
 				startTime := time.Now()
-				_, err := dbconn.RetryableTransaction(errGrpCtx, s.c.db, false, dbconn.NewDBConfig(), st.stmt)
+				_, err := dbconn.RetryableTransaction(errGrpCtx, s.c.writeDB, false, dbconn.NewDBConfig(), st.stmt)
 				s.c.feedback(st.numKeys, time.Since(startTime))
 				return err
 			})
