@@ -112,24 +112,19 @@ func (s *subscription) flush(ctx context.Context, underLock bool, lock *dbconn.T
 // that if there are operations: REPLACE<1>, REPLACE<2>, DELETE<3>, REPLACE<4>
 // we merge it to REPLACE<1,2>, DELETE<3>, REPLACE<4>.
 func (s *subscription) flushDeltaQueue(ctx context.Context, underLock bool, lock *dbconn.TableLock) error {
-	// Pop the changes into changesToFlush
-	// and then reset the delta queue. This allows concurrent
-	// inserts back into the queue to increase parallelism.
 	s.Lock()
-	changesToFlush := s.deltaQueue
-	s.deltaQueue = nil
-	s.Unlock()
+	defer s.Unlock()
 
 	// Early return if there is nothing to flush.
-	if len(changesToFlush) == 0 {
+	if len(s.deltaQueue) == 0 {
 		return nil
 	}
 	// Otherwise, flush the changes.
 	var stmts []statement
 	var buffer []string
-	prevKey := changesToFlush[0] // for initialization
+	prevKey := s.deltaQueue[0] // for initialization
 	target := int(atomic.LoadInt64(&s.c.targetBatchSize))
-	for _, change := range changesToFlush {
+	for _, change := range s.deltaQueue {
 		// We are changing from DELETE to REPLACE
 		// or vice versa, *or* the buffer is getting very large.
 		if change.isDelete != prevKey.isDelete || len(buffer) > target {
@@ -163,27 +158,26 @@ func (s *subscription) flushDeltaQueue(ctx context.Context, underLock bool, lock
 			return err
 		}
 	}
+	// If it's successful, we can clear the queue
+	// and return to release the mutex for new changes
+	// to start accumulating again.
+	s.deltaQueue = nil
 	return nil
 }
 
 // flushMap is the internal version of Flush() for the delta map.
 // it is used by default unless the PRIMARY KEY is non memory comparable.
 func (s *subscription) flushDeltaMap(ctx context.Context, underLock bool, lock *dbconn.TableLock) error {
-	// Pop the changes into changesToFlush
-	// and then reset the delta map. This allows concurrent
-	// inserts back into the map to increase parallelism.
 	s.Lock()
-	changesToFlush := s.deltaMap
-	s.deltaMap = make(map[string]bool)
-	s.Unlock()
+	defer s.Unlock()
 
-	// We must now apply the changeset setToFlush to the new table.
+	// We must now apply the changeset s.deltaMap to the new table.
 	var deleteKeys []string
 	var replaceKeys []string
 	var stmts []statement
 	var i int64
 	target := atomic.LoadInt64(&s.c.targetBatchSize)
-	for key, isDelete := range changesToFlush {
+	for key, isDelete := range s.deltaMap {
 		i++
 		if isDelete {
 			deleteKeys = append(deleteKeys, key)
@@ -228,6 +222,10 @@ func (s *subscription) flushDeltaMap(ctx context.Context, underLock bool, lock *
 			return err
 		}
 	}
+	// If it's successful, we can clear the map
+	// and return to release the mutex for new changes
+	// to start accumulating again.
+	s.deltaMap = make(map[string]bool)
 	return nil
 }
 
