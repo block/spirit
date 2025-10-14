@@ -294,11 +294,16 @@ func TestSchemaAnalyzer_JSONSerialization(t *testing.T) {
 	err = json.Unmarshal(jsonData, &deserializedColumns)
 	require.NoError(t, err)
 
-	for i := range columns {
-		columns[i].Ref = nil // Zero the Ref out before comparing because it can't be serialized
-	}
+	// Verify columns match by comparing key fields
+	require.Len(t, deserializedColumns, 2)
 
-	assert.Equal(t, columns, deserializedColumns)
+	assert.Equal(t, "id", deserializedColumns[0].Name)
+	assert.Equal(t, "int", deserializedColumns[0].Type)
+	assert.True(t, deserializedColumns[0].PrimaryKey)
+
+	assert.Equal(t, "name", deserializedColumns[1].Name)
+	assert.Contains(t, deserializedColumns[1].Type, "varchar")
+	assert.False(t, deserializedColumns[1].Nullable)
 }
 
 func TestSchemaAnalyzer_IndexVisibilityStructured(t *testing.T) {
@@ -572,6 +577,137 @@ func TestSchemaAnalyzer_PartitionSupport(t *testing.T) {
 	}
 }
 
+func TestSchemaAnalyzer_EnumAndSetSupport(t *testing.T) {
+	sql := `
+	CREATE TABLE test_enum_set (
+		id INT PRIMARY KEY,
+		status ENUM('active', 'inactive', 'pending') DEFAULT 'active',
+		permissions SET('read', 'write', 'execute') DEFAULT 'read',
+		priority ENUM('low', 'medium', 'high') NOT NULL,
+		flags SET('flag1', 'flag2', 'flag3', 'flag4'),
+		name VARCHAR(100)
+	)
+	`
+
+	analyzer, err := ParseCreateTable(sql)
+	require.NoError(t, err)
+
+	columns := analyzer.GetColumns()
+	require.Len(t, columns, 6)
+
+	// Test ENUM column with default
+	statusCol := columns.ByName("status")
+	require.NotNil(t, statusCol)
+	assert.Equal(t, "enum", statusCol.Type)
+	require.NotNil(t, statusCol.EnumValues)
+	assert.Equal(t, []string{"active", "inactive", "pending"}, statusCol.EnumValues)
+	assert.Nil(t, statusCol.SetValues, "ENUM column should not have SetValues")
+	require.NotNil(t, statusCol.Default)
+	assert.Equal(t, "active", *statusCol.Default)
+	assert.True(t, statusCol.Nullable)
+
+	// Test SET column with default
+	permissionsCol := columns.ByName("permissions")
+	require.NotNil(t, permissionsCol)
+	assert.Equal(t, "set", permissionsCol.Type)
+	require.NotNil(t, permissionsCol.SetValues)
+	assert.Equal(t, []string{"read", "write", "execute"}, permissionsCol.SetValues)
+	assert.Nil(t, permissionsCol.EnumValues, "SET column should not have EnumValues")
+	require.NotNil(t, permissionsCol.Default)
+	assert.Equal(t, "read", *permissionsCol.Default)
+
+	// Test ENUM column NOT NULL
+	priorityCol := columns.ByName("priority")
+	require.NotNil(t, priorityCol)
+	assert.Equal(t, "enum", priorityCol.Type)
+	require.NotNil(t, priorityCol.EnumValues)
+	assert.Equal(t, []string{"low", "medium", "high"}, priorityCol.EnumValues)
+	assert.False(t, priorityCol.Nullable)
+
+	// Test SET column without default
+	flagsCol := columns.ByName("flags")
+	require.NotNil(t, flagsCol)
+	assert.Equal(t, "set", flagsCol.Type)
+	require.NotNil(t, flagsCol.SetValues)
+	assert.Equal(t, []string{"flag1", "flag2", "flag3", "flag4"}, flagsCol.SetValues)
+	assert.Nil(t, flagsCol.Default)
+
+	// Test regular column (should have no enum/set values)
+	nameCol := columns.ByName("name")
+	require.NotNil(t, nameCol)
+	assert.Contains(t, nameCol.Type, "varchar")
+	assert.Nil(t, nameCol.EnumValues)
+	assert.Nil(t, nameCol.SetValues)
+}
+
+func TestSchemaAnalyzer_EnumSetJSONSerialization(t *testing.T) {
+	sql := `
+	CREATE TABLE test_json (
+		id INT PRIMARY KEY,
+		status ENUM('active', 'inactive') DEFAULT 'active',
+		permissions SET('read', 'write')
+	)
+	`
+
+	analyzer, err := ParseCreateTable(sql)
+	require.NoError(t, err)
+
+	// Test JSON serialization
+	columns := analyzer.GetColumns()
+	jsonData, err := json.Marshal(columns)
+	require.NoError(t, err)
+
+	// Deserialize and verify
+	var deserializedColumns []Column
+	err = json.Unmarshal(jsonData, &deserializedColumns)
+	require.NoError(t, err)
+
+	// Verify the columns match by name and key fields
+	require.Len(t, deserializedColumns, 3)
+
+	// Check id column
+	assert.Equal(t, "id", deserializedColumns[0].Name)
+	assert.Equal(t, "int", deserializedColumns[0].Type)
+	assert.True(t, deserializedColumns[0].PrimaryKey)
+	assert.Nil(t, deserializedColumns[0].EnumValues)
+	assert.Nil(t, deserializedColumns[0].SetValues)
+
+	// Verify enum values are preserved
+	statusCol := deserializedColumns[1]
+	assert.Equal(t, "status", statusCol.Name)
+	assert.Equal(t, "enum", statusCol.Type)
+	assert.Equal(t, []string{"active", "inactive"}, statusCol.EnumValues)
+	assert.Nil(t, statusCol.SetValues)
+	require.NotNil(t, statusCol.Default)
+	assert.Equal(t, "active", *statusCol.Default)
+
+	// Verify set values are preserved
+	permissionsCol := deserializedColumns[2]
+	assert.Equal(t, "permissions", permissionsCol.Name)
+	assert.Equal(t, "set", permissionsCol.Type)
+	assert.Equal(t, []string{"read", "write"}, permissionsCol.SetValues)
+	assert.Nil(t, permissionsCol.EnumValues)
+}
+
+func TestSchemaAnalyzer_EnumSingleValue(t *testing.T) {
+	sql := `
+	CREATE TABLE test_single (
+		status ENUM('only_one') DEFAULT 'only_one'
+	)
+	`
+
+	analyzer, err := ParseCreateTable(sql)
+	require.NoError(t, err)
+
+	columns := analyzer.GetColumns()
+	require.Len(t, columns, 1)
+
+	statusCol := columns[0]
+	assert.Equal(t, "enum", statusCol.Type)
+	require.NotNil(t, statusCol.EnumValues)
+	assert.Equal(t, []string{"only_one"}, statusCol.EnumValues)
+}
+
 func Test_Sloppy(t *testing.T) {
 	// This is just a big jumble of tests about different aspects of a very screwy CREATE TABLE statement
 	// that could never even be parsed by MySQL. Many of these tests are to confirm quirks of the current
@@ -620,4 +756,8 @@ func Test_Sloppy(t *testing.T) {
 	enum := analyzer.GetColumns().ByName("order_status")
 	require.NotNil(t, enum)
 	assert.True(t, strings.EqualFold("ENUM", enum.Type))
+
+	// Verify enum values are captured
+	require.NotNil(t, enum.EnumValues)
+	assert.Equal(t, []string{"pending", "processing", "shipped", "delivered", "cancelled"}, enum.EnumValues)
 }

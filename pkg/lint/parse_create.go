@@ -59,6 +59,8 @@ type Column struct {
 	Precision  *int              `json:"precision,omitempty"`
 	Scale      *int              `json:"scale,omitempty"`
 	Unsigned   *bool             `json:"unsigned,omitempty"`
+	EnumValues []string          `json:"enum_values,omitempty"` // Permitted values for ENUM type
+	SetValues  []string          `json:"set_values,omitempty"`  // Permitted values for SET type
 	Nullable   bool              `json:"nullable"`
 	Default    *string           `json:"default,omitempty"`
 	AutoInc    bool              `json:"auto_increment"`
@@ -282,6 +284,17 @@ func (ts *tableSchema) parseColumn(col *ast.ColumnDef) Column {
 	if mysql.HasUnsignedFlag(col.Tp.GetFlag()) {
 		unsigned := true
 		column.Unsigned = &unsigned
+	}
+
+	// Extract ENUM/SET permitted values
+	if col.Tp.GetType() == mysql.TypeEnum {
+		if elems := col.Tp.GetElems(); len(elems) > 0 {
+			column.EnumValues = elems
+		}
+	} else if col.Tp.GetType() == mysql.TypeSet {
+		if elems := col.Tp.GetElems(); len(elems) > 0 {
+			column.SetValues = elems
+		}
 	}
 
 	// Process column options
