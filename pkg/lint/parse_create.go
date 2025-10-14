@@ -1,0 +1,949 @@
+package lint
+
+// This file provides structured parsing of CREATE TABLE statements.
+// The CreateTable struct and related types use pointer fields for optional elements
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/parser/test_driver"
+	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
+	"github.com/pingcap/tidb/pkg/parser/types"
+)
+
+// Partition type constants (from model package)
+const (
+	PartitionTypeNone       = 0
+	PartitionTypeRange      = 1
+	PartitionTypeHash       = 2
+	PartitionTypeList       = 3
+	PartitionTypeKey        = 4
+	PartitionTypeSystemTime = 5
+)
+
+// TableSchema provides methods to interrogate the parsed schema
+type TableSchema interface {
+	GetTableName() string
+	GetColumns() Columns
+	GetIndexes() Indexes
+	GetConstraints() Constraints
+	GetTableOptions() map[string]interface{}
+	GetPartition() *PartitionOptions
+
+	// GetCreateTable returns the structured CreateTable
+	GetCreateTable() *CreateTable
+}
+
+// CreateTable represents a parsed CREATE TABLE statement with structured data
+type CreateTable struct {
+	TableName    string            `json:"table_name"`
+	Temporary    bool              `json:"temporary"`
+	IfNotExists  bool              `json:"if_not_exists"`
+	Columns      Columns           `json:"columns"`
+	Indexes      Indexes           `json:"indexes"`
+	Constraints  Constraints       `json:"constraints"`
+	TableOptions *TableOptions     `json:"table_options,omitempty"`
+	Partition    *PartitionOptions `json:"partition,omitempty"`
+}
+
+// Column represents a table column definition
+type Column struct {
+	Ref        *ast.ColumnDef    `json:"-"`
+	Name       string            `json:"name"`
+	Type       string            `json:"type"`
+	Length     *int              `json:"length,omitempty"`
+	Precision  *int              `json:"precision,omitempty"`
+	Scale      *int              `json:"scale,omitempty"`
+	Unsigned   *bool             `json:"unsigned,omitempty"`
+	Nullable   bool              `json:"nullable"`
+	Default    *string           `json:"default,omitempty"`
+	AutoInc    bool              `json:"auto_increment"`
+	PrimaryKey bool              `json:"primary_key"`
+	Unique     bool              `json:"unique"`
+	Comment    *string           `json:"comment,omitempty"`
+	Charset    *string           `json:"charset,omitempty"`
+	Collation  *string           `json:"collation,omitempty"`
+	Options    map[string]string `json:"options,omitempty"`
+}
+
+// Index represents an index definition
+type Index struct {
+	Ref          *ast.Constraint   `json:"-"`
+	Name         string            `json:"name"`
+	Type         string            `json:"type"` // PRIMARY, UNIQUE, INDEX, FULLTEXT, SPATIAL
+	Columns      []string          `json:"columns"`
+	Invisible    *bool             `json:"invisible,omitempty"`
+	Using        *string           `json:"using,omitempty"` // BTREE, HASH, RTREE
+	Comment      *string           `json:"comment,omitempty"`
+	KeyBlockSize *uint64           `json:"key_block_size,omitempty"`
+	ParserName   *string           `json:"parser_name,omitempty"`
+	Options      map[string]string `json:"options,omitempty"`
+}
+
+// Constraint represents a table constraint
+type Constraint struct {
+	Ref        *ast.Constraint        `json:"-"`
+	Name       string                 `json:"name"`
+	Type       string                 `json:"type"` // CHECK, FOREIGN KEY, etc.
+	Columns    []string               `json:"columns,omitempty"`
+	Expression *string                `json:"expression,omitempty"`
+	References *ForeignKeyReference   `json:"references,omitempty"`
+	Definition *string                `json:"definition,omitempty"` // Generated definition string for compatibility
+	Options    map[string]interface{} `json:"options,omitempty"`
+}
+
+type Indexes []Index
+type Columns []Column
+type Constraints []Constraint
+
+// HasName is a type constraint for types that have a Name field
+type HasName interface {
+	GetName() string
+}
+
+// ForeignKeyReference represents a foreign key reference
+type ForeignKeyReference struct {
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+}
+
+// TableOptions represents table-level options
+type TableOptions struct {
+	Engine        *string `json:"engine,omitempty"`
+	Charset       *string `json:"charset,omitempty"`
+	Collation     *string `json:"collation,omitempty"`
+	Comment       *string `json:"comment,omitempty"`
+	AutoIncrement *uint64 `json:"auto_increment,omitempty"`
+	RowFormat     *string `json:"row_format,omitempty"`
+}
+
+// PartitionOptions represents table partitioning configuration
+type PartitionOptions struct {
+	Type         string                `json:"type"`                   // RANGE, LIST, HASH, KEY, SYSTEM_TIME
+	Expression   *string               `json:"expression,omitempty"`   // For HASH and RANGE
+	Columns      []string              `json:"columns,omitempty"`      // For KEY, RANGE COLUMNS, LIST COLUMNS
+	Linear       bool                  `json:"linear,omitempty"`       // For LINEAR HASH/KEY
+	Partitions   uint64                `json:"partitions,omitempty"`   // Number of partitions
+	Definitions  []PartitionDefinition `json:"definitions,omitempty"`  // Individual partition definitions
+	SubPartition *SubPartitionOptions  `json:"subpartition,omitempty"` // Subpartitioning options
+}
+
+// PartitionDefinition represents a single partition definition
+type PartitionDefinition struct {
+	Name          string                   `json:"name"`
+	Values        *PartitionValues         `json:"values,omitempty"` // VALUES LESS THAN or VALUES IN
+	Comment       *string                  `json:"comment,omitempty"`
+	Engine        *string                  `json:"engine,omitempty"`
+	Options       map[string]interface{}   `json:"options,omitempty"`
+	SubPartitions []SubPartitionDefinition `json:"subpartitions,omitempty"`
+}
+
+// PartitionValues represents the VALUES clause in partition definitions
+type PartitionValues struct {
+	Type   string        `json:"type"`   // "LESS_THAN", "IN", "MAXVALUE"
+	Values []interface{} `json:"values"` // The actual values
+}
+
+// SubPartitionOptions represents subpartitioning configuration
+type SubPartitionOptions struct {
+	Type       string   `json:"type"`                 // HASH, KEY
+	Expression *string  `json:"expression,omitempty"` // For HASH
+	Columns    []string `json:"columns,omitempty"`    // For KEY
+	Linear     bool     `json:"linear,omitempty"`     // For LINEAR HASH/KEY
+	Count      uint64   `json:"count,omitempty"`      // Number of subpartitions
+}
+
+// SubPartitionDefinition represents a single subpartition definition
+type SubPartitionDefinition struct {
+	Name    string                 `json:"name"`
+	Comment *string                `json:"comment,omitempty"`
+	Engine  *string                `json:"engine,omitempty"`
+	Options map[string]interface{} `json:"options,omitempty"`
+}
+
+// tableSchema represents a parsed CREATE TABLE statement with flexible access
+type tableSchema struct {
+	raw    *ast.CreateTableStmt
+	parsed *CreateTable
+}
+
+// ParseCreateTable parses a CREATE TABLE statement and returns an analyzer
+// This function is particularly designed to be used with the output of SHOW CREATE TABLE,
+// which we consider to be the "canonical" form of a CREATE TABLE statement.
+//
+// Because there's so much variation in the ways a human might write a CREATE TABLE statement,
+// from index names being auto-generated to column attributes being turned into table
+// options, you should consider use of this function on non-canonical CREATE statements
+// to be experimental at best.
+//
+// Note also that this parser does not attempt to validate the SQL beyond what the
+// underlying parser does. For example, it will not check that a PRIMARY KEY column is NOT NULL,
+// or that column names are unique, or that indexed columns exist.
+func ParseCreateTable(sql string) (TableSchema, error) {
+	p := parser.New()
+	stmts, _, err := p.Parse(sql, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse SQL: %w", err)
+	}
+
+	if len(stmts) != 1 {
+		return nil, fmt.Errorf("expected exactly one statement, got %d", len(stmts))
+	}
+
+	createStmt, ok := stmts[0].(*ast.CreateTableStmt)
+	if !ok {
+		return nil, fmt.Errorf("expected CREATE TABLE statement, got %T", stmts[0])
+	}
+
+	schema := &tableSchema{
+		raw: createStmt,
+	}
+
+	// Parse into structured format
+	if err := schema.parseToStruct(); err != nil {
+		return nil, fmt.Errorf("failed to parse table schema: %w", err)
+	}
+
+	return schema, nil
+}
+
+// parseToStruct converts the AST into a structured CreateTable
+func (ts *tableSchema) parseToStruct() error {
+	ts.parsed = &CreateTable{
+		TableName:   ts.raw.Table.Name.String(),
+		IfNotExists: ts.raw.IfNotExists,
+		Temporary:   ts.raw.TemporaryKeyword != 0,
+		Columns:     make([]Column, 0, len(ts.raw.Cols)),
+		Indexes:     make([]Index, 0),
+		Constraints: make([]Constraint, 0),
+	}
+
+	// Parse columns
+	for _, col := range ts.raw.Cols {
+		column := ts.parseColumn(col)
+		ts.parsed.Columns = append(ts.parsed.Columns, column)
+	}
+
+	// Parse constraints/indexes
+	for _, constraint := range ts.raw.Constraints {
+		switch constraint.Tp {
+		case ast.ConstraintCheck:
+			ts.parsed.Constraints = append(ts.parsed.Constraints, ts.parseConstraint(constraint))
+		case ast.ConstraintForeignKey:
+			ts.parsed.Constraints = append(ts.parsed.Constraints, ts.parseConstraint(constraint))
+		default:
+			// Other constraints are treated as indexes
+			ts.parsed.Indexes = append(ts.parsed.Indexes, ts.parseIndex(constraint))
+		}
+	}
+
+	// Parse table options
+	if len(ts.raw.Options) > 0 {
+		ts.parsed.TableOptions = ts.parseTableOptions(ts.raw.Options)
+	}
+
+	// Parse partition options
+	if ts.raw.Partition != nil {
+		ts.parsed.Partition = ts.parsePartitionOptions(ts.raw.Partition)
+	}
+
+	return nil
+}
+
+// parseColumn converts a column definition to a Column struct
+func (ts *tableSchema) parseColumn(col *ast.ColumnDef) Column {
+	column := Column{
+		Ref:      col,
+		Name:     col.Name.Name.String(),
+		Type:     types.TypeStr(col.Tp.GetType()),
+		Nullable: true, // Default to nullable
+		Options:  make(map[string]string),
+	}
+
+	// Extract type information
+	typeStr := col.Tp.String()
+	if length := extractLengthFromTypeString(typeStr); length > 0 {
+		column.Length = &length
+	}
+
+	// Parse precision and scale for decimal types
+	if precision, scale := extractPrecisionScaleFromTypeString(typeStr); precision > 0 {
+		column.Precision = &precision
+		if scale > 0 {
+			column.Scale = &scale
+		}
+	}
+
+	// Check if the column type is unsigned
+	if mysql.HasUnsignedFlag(col.Tp.GetFlag()) {
+		unsigned := true
+		column.Unsigned = &unsigned
+	}
+
+	// Process column options
+	for _, opt := range col.Options {
+		switch opt.Tp {
+		case ast.ColumnOptionNotNull:
+			column.Nullable = false
+		case ast.ColumnOptionNull:
+			column.Nullable = true
+		case ast.ColumnOptionAutoIncrement:
+			column.AutoInc = true
+		case ast.ColumnOptionPrimaryKey:
+			column.PrimaryKey = true
+			column.Nullable = false // PRIMARY KEY implies NOT NULL
+		case ast.ColumnOptionUniqKey:
+			column.Unique = true
+		case ast.ColumnOptionDefaultValue:
+			if opt.Expr != nil {
+				defaultVal := ts.parseExpression(opt.Expr)
+				if defaultStr, ok := defaultVal.(string); ok && defaultStr != "" {
+					// Remove surrounding quotes if present for string literals
+					if len(defaultStr) >= 2 && defaultStr[0] == '\'' && defaultStr[len(defaultStr)-1] == '\'' {
+						defaultStr = defaultStr[1 : len(defaultStr)-1]
+					}
+					column.Default = &defaultStr
+				}
+			}
+		case ast.ColumnOptionComment:
+			if opt.Expr != nil {
+				comment := ts.parseExpression(opt.Expr)
+				if commentStr, ok := comment.(string); ok && commentStr != "" {
+					// Remove surrounding quotes if present
+					if len(commentStr) >= 2 && commentStr[0] == '\'' && commentStr[len(commentStr)-1] == '\'' {
+						commentStr = commentStr[1 : len(commentStr)-1]
+					}
+					column.Comment = &commentStr
+				}
+			}
+		case ast.ColumnOptionCollate:
+			if opt.StrValue != "" {
+				column.Collation = &opt.StrValue
+			}
+		default:
+			// Store unknown options for flexibility
+			column.Options[fmt.Sprintf("option_%d", opt.Tp)] = opt.StrValue
+		}
+	}
+
+	// Clean up options map if empty
+	if len(column.Options) == 0 {
+		column.Options = nil
+	}
+
+	return column
+}
+
+// parseIndex converts a constraint to an Index struct
+func (ts *tableSchema) parseIndex(constraint *ast.Constraint) Index {
+	index := Index{
+		Ref:     constraint,
+		Name:    constraint.Name,
+		Columns: ts.parseIndexColumns(constraint.Keys),
+		Options: make(map[string]string),
+	}
+
+	switch constraint.Tp {
+	case ast.ConstraintPrimaryKey:
+		index.Type = "PRIMARY KEY"
+	case ast.ConstraintKey, ast.ConstraintIndex:
+		index.Type = "INDEX"
+	case ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex:
+		index.Type = "UNIQUE"
+	case ast.ConstraintFulltext:
+		index.Type = "FULLTEXT"
+	default:
+		panic(fmt.Sprintf("unknown constraint type: %d", constraint.Tp))
+	}
+
+	// Parse index options
+	if constraint.Option != nil {
+		opt := constraint.Option
+
+		// Visibility (VISIBLE/INVISIBLE)
+		if opt.Visibility == ast.IndexVisibilityInvisible {
+			invisible := true
+			index.Invisible = &invisible
+		} else if opt.Visibility == ast.IndexVisibilityVisible {
+			visible := false
+			index.Invisible = &visible
+		}
+
+		// Index type (USING BTREE/HASH/RTREE)
+		if opt.Tp != ast.IndexTypeInvalid && opt.Tp.String() != "" {
+			using := opt.Tp.String()
+			index.Using = &using
+		}
+
+		// Comment
+		if opt.Comment != "" {
+			index.Comment = &opt.Comment
+		}
+
+		// Key block size
+		if opt.KeyBlockSize > 0 {
+			index.KeyBlockSize = &opt.KeyBlockSize
+		}
+
+		// Parser name (for FULLTEXT indexes)
+		if opt.ParserName.L != "" {
+			parserName := opt.ParserName.String()
+			index.ParserName = &parserName
+		}
+	}
+
+	// Clean up options map if empty
+	if len(index.Options) == 0 {
+		index.Options = nil
+	}
+
+	return index
+}
+
+// parseConstraint converts a constraint to a Constraint struct
+func (ts *tableSchema) parseConstraint(constraint *ast.Constraint) Constraint {
+	constr := Constraint{
+		Ref:     constraint,
+		Name:    constraint.Name,
+		Columns: ts.parseIndexColumns(constraint.Keys),
+		Options: make(map[string]interface{}),
+	}
+
+	switch constraint.Tp {
+	case ast.ConstraintCheck:
+		constr.Type = "CHECK"
+		if constraint.Expr != nil {
+			expr := ts.parseExpression(constraint.Expr)
+			if exprStr, ok := expr.(string); ok {
+				constr.Expression = &exprStr
+				// Generate definition string
+				definition := fmt.Sprintf("CHECK (%s)", exprStr)
+				constr.Definition = &definition
+			}
+		}
+	case ast.ConstraintForeignKey:
+		constr.Type = "FOREIGN KEY"
+		if constraint.Refer != nil {
+			constr.References = &ForeignKeyReference{
+				Table:   constraint.Refer.Table.Name.String(),
+				Columns: ts.parseIndexColumns(constraint.Refer.IndexPartSpecifications),
+			}
+			// Generate definition string
+			definition := fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)",
+				strings.Join(constr.Columns, ", "),
+				constr.References.Table,
+				strings.Join(constr.References.Columns, ", "))
+			constr.Definition = &definition
+		}
+	}
+
+	// Clean up options map if empty
+	if len(constr.Options) == 0 {
+		constr.Options = nil
+	}
+
+	return constr
+}
+
+// parseIndexColumns extracts column names from index specifications
+func (ts *tableSchema) parseIndexColumns(keys []*ast.IndexPartSpecification) []string {
+	columns := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key.Column != nil {
+			columns = append(columns, key.Column.Name.String())
+		}
+	}
+	return columns
+}
+
+// parseTableOptions converts table options to a TableOptions struct
+func (ts *tableSchema) parseTableOptions(options []*ast.TableOption) *TableOptions {
+	tableOpts := &TableOptions{}
+	hasOptions := false
+
+	for _, option := range options {
+		switch option.Tp {
+		case ast.TableOptionEngine:
+			if option.StrValue != "" {
+				tableOpts.Engine = &option.StrValue
+				hasOptions = true
+			}
+		case ast.TableOptionCharset:
+			if option.StrValue != "" {
+				tableOpts.Charset = &option.StrValue
+				hasOptions = true
+			}
+		case ast.TableOptionCollate:
+			if option.StrValue != "" {
+				tableOpts.Collation = &option.StrValue
+				hasOptions = true
+			}
+		case ast.TableOptionComment:
+			if option.StrValue != "" {
+				tableOpts.Comment = &option.StrValue
+				hasOptions = true
+			}
+		case ast.TableOptionAutoIncrement:
+			if option.UintValue > 0 {
+				tableOpts.AutoIncrement = &option.UintValue
+				hasOptions = true
+			}
+		case ast.TableOptionRowFormat:
+			if option.UintValue > 0 {
+				var rowFormat string
+				switch option.UintValue {
+				case 1: // RowFormatDefault
+					rowFormat = "DEFAULT"
+				case 2: // RowFormatDynamic
+					rowFormat = "DYNAMIC"
+				case 3: // RowFormatFixed
+					rowFormat = "FIXED"
+				case 4: // RowFormatCompressed
+					rowFormat = "COMPRESSED"
+				case 5: // RowFormatRedundant
+					rowFormat = "REDUNDANT"
+				case 6: // RowFormatCompact
+					rowFormat = "COMPACT"
+				default:
+					rowFormat = fmt.Sprintf("UNKNOWN_%d", option.UintValue)
+				}
+				tableOpts.RowFormat = &rowFormat
+				hasOptions = true
+			}
+		}
+	}
+
+	if !hasOptions {
+		return nil
+	}
+	return tableOpts
+}
+
+// parsePartitionOptions converts partition options to a PartitionOptions struct
+func (ts *tableSchema) parsePartitionOptions(partition *ast.PartitionOptions) *PartitionOptions {
+	if partition == nil {
+		return nil
+	}
+
+	partOpts := &PartitionOptions{
+		Linear:      partition.Linear,
+		Partitions:  partition.Num,
+		Definitions: make([]PartitionDefinition, 0, len(partition.Definitions)),
+	}
+
+	// Parse partition type
+	switch partition.Tp {
+	case PartitionTypeRange:
+		partOpts.Type = "RANGE"
+	case PartitionTypeHash:
+		partOpts.Type = "HASH"
+	case PartitionTypeKey:
+		partOpts.Type = "KEY"
+	case PartitionTypeList:
+		partOpts.Type = "LIST"
+	case PartitionTypeSystemTime:
+		partOpts.Type = "SYSTEM_TIME"
+	default:
+		partOpts.Type = fmt.Sprintf("UNKNOWN_%d", partition.Tp)
+	}
+
+	// Parse expression for HASH and RANGE
+	if partition.Expr != nil {
+		expr := ts.parseExpression(partition.Expr)
+		if exprStr, ok := expr.(string); ok && exprStr != "" {
+			partOpts.Expression = &exprStr
+		}
+	}
+
+	// Parse column names for KEY, RANGE COLUMNS, LIST COLUMNS
+	if len(partition.ColumnNames) > 0 {
+		partOpts.Columns = make([]string, 0, len(partition.ColumnNames))
+		for _, colName := range partition.ColumnNames {
+			partOpts.Columns = append(partOpts.Columns, colName.Name.String())
+		}
+	}
+
+	// Parse individual partition definitions
+	for _, def := range partition.Definitions {
+		partDef := ts.parsePartitionDefinition(def)
+		partOpts.Definitions = append(partOpts.Definitions, partDef)
+	}
+
+	// Parse subpartitioning if present
+	if partition.Sub != nil {
+		partOpts.SubPartition = ts.parseSubPartitionOptions(partition.Sub)
+	}
+
+	return partOpts
+}
+
+// parsePartitionDefinition converts a partition definition to a PartitionDefinition struct
+func (ts *tableSchema) parsePartitionDefinition(def *ast.PartitionDefinition) PartitionDefinition {
+	partDef := PartitionDefinition{
+		Name:          def.Name.String(),
+		Options:       make(map[string]interface{}),
+		SubPartitions: make([]SubPartitionDefinition, 0, len(def.Sub)),
+	}
+
+	// Parse partition values clause
+	if def.Clause != nil {
+		partDef.Values = ts.parsePartitionClause(def.Clause)
+	}
+
+	// Parse partition options
+	for _, opt := range def.Options {
+		switch opt.Tp {
+		case ast.TableOptionComment:
+			if opt.StrValue != "" {
+				partDef.Comment = &opt.StrValue
+			}
+		case ast.TableOptionEngine:
+			if opt.StrValue != "" {
+				partDef.Engine = &opt.StrValue
+			}
+		default:
+			// Store other options in the options map
+			partDef.Options[fmt.Sprintf("option_%d", opt.Tp)] = opt.StrValue
+		}
+	}
+
+	// Parse subpartitions
+	for _, sub := range def.Sub {
+		subDef := ts.parseSubPartitionDefinition(sub)
+		partDef.SubPartitions = append(partDef.SubPartitions, subDef)
+	}
+
+	// Clean up options map if empty
+	if len(partDef.Options) == 0 {
+		partDef.Options = nil
+	}
+
+	return partDef
+}
+
+// parsePartitionClause converts a partition clause to PartitionValues
+func (ts *tableSchema) parsePartitionClause(clause ast.PartitionDefinitionClause) *PartitionValues {
+	switch c := clause.(type) {
+	case *ast.PartitionDefinitionClauseLessThan:
+		values := &PartitionValues{
+			Type:   "LESS_THAN",
+			Values: make([]interface{}, 0, len(c.Exprs)),
+		}
+		for _, expr := range c.Exprs {
+			val := ts.parseExpression(expr)
+			values.Values = append(values.Values, val)
+		}
+		return values
+	case *ast.PartitionDefinitionClauseIn:
+		values := &PartitionValues{
+			Type:   "IN",
+			Values: make([]interface{}, 0, len(c.Values)),
+		}
+		for _, valList := range c.Values {
+			if len(valList) == 1 {
+				val := ts.parseExpression(valList[0])
+				values.Values = append(values.Values, val)
+			} else {
+				// Multiple values in a single clause
+				subValues := make([]interface{}, 0, len(valList))
+				for _, expr := range valList {
+					val := ts.parseExpression(expr)
+					subValues = append(subValues, val)
+				}
+				values.Values = append(values.Values, subValues)
+			}
+		}
+		return values
+	case *ast.PartitionDefinitionClauseHistory:
+		if c.Current {
+			return &PartitionValues{Type: "CURRENT", Values: []interface{}{}}
+		} else {
+			return &PartitionValues{Type: "HISTORY", Values: []interface{}{}}
+		}
+	default:
+		return nil
+	}
+}
+
+// parseSubPartitionOptions converts subpartition options to SubPartitionOptions
+func (ts *tableSchema) parseSubPartitionOptions(sub *ast.PartitionMethod) *SubPartitionOptions {
+	if sub == nil {
+		return nil
+	}
+
+	subOpts := &SubPartitionOptions{
+		Linear: sub.Linear,
+		Count:  sub.Num,
+	}
+
+	// Parse subpartition type
+	switch sub.Tp {
+	case PartitionTypeHash:
+		subOpts.Type = "HASH"
+	case PartitionTypeKey:
+		subOpts.Type = "KEY"
+	default:
+		subOpts.Type = fmt.Sprintf("UNKNOWN_%d", sub.Tp)
+	}
+
+	// Parse expression for HASH
+	if sub.Expr != nil {
+		expr := ts.parseExpression(sub.Expr)
+		if exprStr, ok := expr.(string); ok && exprStr != "" {
+			subOpts.Expression = &exprStr
+		}
+	}
+
+	// Parse column names for KEY
+	if len(sub.ColumnNames) > 0 {
+		subOpts.Columns = make([]string, 0, len(sub.ColumnNames))
+		for _, colName := range sub.ColumnNames {
+			subOpts.Columns = append(subOpts.Columns, colName.Name.String())
+		}
+	}
+
+	return subOpts
+}
+
+// parseSubPartitionDefinition converts a subpartition definition to SubPartitionDefinition
+func (ts *tableSchema) parseSubPartitionDefinition(sub *ast.SubPartitionDefinition) SubPartitionDefinition {
+	subDef := SubPartitionDefinition{
+		Name:    sub.Name.String(),
+		Options: make(map[string]interface{}),
+	}
+
+	// Parse subpartition options
+	for _, opt := range sub.Options {
+		switch opt.Tp {
+		case ast.TableOptionComment:
+			if opt.StrValue != "" {
+				subDef.Comment = &opt.StrValue
+			}
+		case ast.TableOptionEngine:
+			if opt.StrValue != "" {
+				subDef.Engine = &opt.StrValue
+			}
+		default:
+			// Store other options in the options map
+			subDef.Options[fmt.Sprintf("option_%d", opt.Tp)] = opt.StrValue
+		}
+	}
+
+	// Clean up options map if empty
+	if len(subDef.Options) == 0 {
+		subDef.Options = nil
+	}
+
+	return subDef
+}
+
+// parseExpression converts an expression to a string representation
+func (ts *tableSchema) parseExpression(expr ast.ExprNode) interface{} {
+	if expr == nil {
+		return nil
+	}
+
+	// Handle different expression types
+	switch e := expr.(type) {
+	case *test_driver.ValueExpr:
+		// Handle literal values
+		if e.Kind() == test_driver.KindString {
+			return e.GetString()
+		} else if e.Kind() == test_driver.KindInt64 {
+			return fmt.Sprintf("%d", e.GetInt64())
+		} else if e.Kind() == test_driver.KindFloat64 {
+			return fmt.Sprintf("%g", e.GetFloat64())
+		}
+		return e.GetDatumString()
+	case *ast.FuncCallExpr:
+		// Handle function calls like CURRENT_TIMESTAMP
+		return e.FnName.L
+	default:
+		// For other types, fall back to text representation
+		return expr.Text()
+	}
+}
+
+// extractLengthFromTypeString extracts length from type string like "varchar(100)"
+func extractLengthFromTypeString(typeStr string) int {
+	// Simple regex-like parsing for common cases
+	if strings.Contains(typeStr, "(") && strings.Contains(typeStr, ")") {
+		start := strings.Index(typeStr, "(")
+		end := strings.Index(typeStr, ")")
+		if start < end && start != -1 && end != -1 {
+			lengthStr := typeStr[start+1 : end]
+			// Handle cases like "decimal(10,2)" - take the first number
+			if commaIdx := strings.Index(lengthStr, ","); commaIdx != -1 {
+				lengthStr = lengthStr[:commaIdx]
+			}
+			var length int
+			if n, err := fmt.Sscanf(lengthStr, "%d", &length); n == 1 && err == nil {
+				return length
+			}
+		}
+	}
+	return 0
+}
+
+// extractPrecisionScaleFromTypeString extracts precision and scale from type string like "decimal(10,2)"
+func extractPrecisionScaleFromTypeString(typeStr string) (int, int) {
+	if strings.Contains(typeStr, "(") && strings.Contains(typeStr, ")") {
+		start := strings.Index(typeStr, "(")
+		end := strings.Index(typeStr, ")")
+		if start < end && start != -1 && end != -1 {
+			paramStr := typeStr[start+1 : end]
+			if commaIdx := strings.Index(paramStr, ","); commaIdx != -1 {
+				precisionStr := strings.TrimSpace(paramStr[:commaIdx])
+				scaleStr := strings.TrimSpace(paramStr[commaIdx+1:])
+
+				var precision, scale int
+				if n, err := fmt.Sscanf(precisionStr, "%d", &precision); n == 1 && err == nil {
+					if n, err := fmt.Sscanf(scaleStr, "%d", &scale); n == 1 && err == nil {
+						return precision, scale
+					}
+					return precision, 0
+				}
+			}
+		}
+	}
+	return 0, 0
+}
+
+// Implementation of TableSchema interface
+
+func (ts *tableSchema) GetCreateTable() *CreateTable {
+	return ts.parsed
+}
+
+func (ts *tableSchema) GetTableName() string {
+	if ts.parsed != nil {
+		return ts.parsed.TableName
+	}
+	return ""
+}
+
+func (ts *tableSchema) GetColumns() Columns {
+	return ts.parsed.Columns
+}
+
+func (ts *tableSchema) GetIndexes() Indexes {
+	indexList := make([]Index, 0, len(ts.parsed.Indexes))
+
+	// Add table-level indexes
+	indexList = append(indexList, ts.parsed.Indexes...)
+
+	// Add column-level constraints that turn into indexes (PRIMARY KEY, UNIQUE)
+	for _, col := range ts.parsed.Columns {
+		if col.PrimaryKey {
+			indexList = append(indexList, Index{
+				Name:    "PRIMARY",
+				Type:    "PRIMARY KEY",
+				Columns: []string{col.Name},
+			})
+		}
+
+		if col.Unique {
+			indexList = append(indexList, Index{
+				// The real name of this index is computed by the server
+				Name:    fmt.Sprintf("UNIQUE %s", col.Name),
+				Type:    "UNIQUE",
+				Columns: []string{col.Name},
+			})
+		}
+	}
+
+	return indexList
+}
+
+func (ts *tableSchema) GetConstraints() Constraints {
+	return ts.parsed.Constraints
+}
+
+func (ts *tableSchema) GetTableOptions() map[string]interface{} {
+	options := make(map[string]interface{})
+	if ts.parsed.TableOptions != nil {
+		opts := ts.parsed.TableOptions
+		if opts.Engine != nil {
+			options["engine"] = *opts.Engine
+		}
+		if opts.Charset != nil {
+			options["charset"] = *opts.Charset
+		}
+		if opts.Collation != nil {
+			options["collation"] = *opts.Collation
+		}
+		if opts.Comment != nil {
+			options["comment"] = *opts.Comment
+		}
+		if opts.AutoIncrement != nil {
+			options["auto_increment"] = *opts.AutoIncrement
+		}
+		if opts.RowFormat != nil {
+			options["row_format"] = *opts.RowFormat
+		}
+	}
+	return options
+}
+
+func (ts *tableSchema) GetPartition() *PartitionOptions {
+	return ts.parsed.Partition
+}
+
+func (indexes Indexes) AnyInvisible() bool {
+	for _, idx := range indexes {
+		if idx.Invisible != nil && *idx.Invisible {
+			return true
+		}
+	}
+	return false
+}
+
+func (indexes Indexes) AllInvisible() (invisibleIndexes []*Index) {
+	for i := range indexes {
+		if indexes[i].Invisible != nil && *indexes[i].Invisible {
+			invisibleIndexes = append(invisibleIndexes, &indexes[i])
+		}
+	}
+	return invisibleIndexes
+}
+
+// ByName is a generic function that finds an element by name in any slice of types with Name field
+// NOTE: This function assumes that names are unique within the slice! That will be true for
+// "canonical" CREATE TABLE statements as returned by SHOW CREATE TABLE, but may not be true for
+// arbitrary input.
+func ByName[T HasName](slice []T, name string) *T {
+	for _, item := range slice {
+		if item.GetName() == name {
+			return &item
+		}
+	}
+	return nil
+}
+
+func (i Index) GetName() string {
+	return i.Name
+}
+
+func (c Column) GetName() string {
+	return c.Name
+}
+
+func (c Constraint) GetName() string {
+	return c.Name
+}
+
+func (indexes Indexes) ByName(name string) *Index {
+	return ByName(indexes, name)
+}
+
+func (columns Columns) ByName(name string) *Column {
+	return ByName(columns, name)
+}
+
+func (constraints Constraints) ByName(name string) *Constraint {
+	return ByName(constraints, name)
+}
