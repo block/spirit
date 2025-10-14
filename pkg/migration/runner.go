@@ -180,19 +180,29 @@ func (r *Runner) Run(originalCtx context.Context) error {
 	}
 
 	locks := make([]*dbconn.MetadataLock, 0, len(r.changes))
+	lockedTables := make(map[string]*table.TableInfo) // Track tables we've already locked
+
 	// Set info for all of the tables.
 	for _, change := range r.changes {
 		change.table = table.NewTableInfo(r.db, change.stmt.Schema, change.stmt.Table)
 		if err := change.table.SetInfo(ctx); err != nil {
 			return err
 		}
-		// Take a metadata lock on the source table to prevent concurrent DDL.
-		// We release the lock when this function finishes executing.
-		lock, err := dbconn.NewMetadataLock(ctx, r.dsn(), change.table, r.dbConfig, r.logger)
-		if err != nil {
-			return err
+
+		// Create a unique key for this table (schema.table)
+		tableKey := change.stmt.Schema + "." + change.stmt.Table
+
+		// Only acquire metadata lock if we haven't already locked this table
+		if _, alreadyLocked := lockedTables[tableKey]; !alreadyLocked {
+			// Take a metadata lock on the source table to prevent concurrent DDL.
+			// We release the lock when this function finishes executing.
+			lock, err := dbconn.NewMetadataLock(ctx, r.dsn(), change.table, r.dbConfig, r.logger)
+			if err != nil {
+				return err
+			}
+			locks = append(locks, lock)
+			lockedTables[tableKey] = change.table
 		}
-		locks = append(locks, lock)
 	}
 
 	// Release all our locks

@@ -138,7 +138,14 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 	}
 
 	if len(stmts) > 1 && !m.EnableExperimentalMultiTableSupport {
-		return nil, errors.New("multiple statements detected. To enable this experimental feature, please specify --enable-experimental-multi-table-support")
+		// Check if all statements are for the same table
+		firstTable := stmts[0].Table
+		firstSchema := stmts[0].Schema
+		for _, stmt := range stmts[1:] {
+			if stmt.Table != firstTable || stmt.Schema != firstSchema {
+				return nil, errors.New("multiple tables detected. To enable this experimental feature, please specify --enable-experimental-multi-table-support")
+			}
+		}
 	}
 	return stmts, err
 }

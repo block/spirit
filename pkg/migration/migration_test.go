@@ -586,3 +586,74 @@ func TestSecondaryEngineAttribute(t *testing.T) {
 	err = migration.Run()
 	assert.NoError(t, err)
 }
+
+func TestNormalizeOptionsMultiTableValidation(t *testing.T) {
+	tests := []struct {
+		name                                string
+		statement                           string
+		enableExperimentalMultiTableSupport bool
+		expectError                         bool
+		expectedErrorMessage                string
+	}{
+		{
+			name:                                "single statement - should always work",
+			statement:                           "ALTER TABLE t1 ADD COLUMN col1 INT",
+			enableExperimentalMultiTableSupport: false,
+			expectError:                         false,
+		},
+		{
+			name:                                "same table idempotency operations - should work",
+			statement:                           "ALTER TABLE t1 ALTER INDEX idx_name INVISIBLE; ALTER TABLE t1 ALTER INDEX idx_email INVISIBLE",
+			enableExperimentalMultiTableSupport: false,
+			expectError:                         false,
+		},
+		{
+			name:                                "same table TiDB parser edge case - should work",
+			statement:                           "ALTER TABLE t1 ADD COLUMN price DECIMAL(10,2) GENERATED ALWAYS AS (JSON_EXTRACT(metadata, '$.price')); ALTER TABLE t1 ADD INDEX idx_price ((JSON_EXTRACT(metadata, '$.price')))",
+			enableExperimentalMultiTableSupport: false,
+			expectError:                         false,
+		},
+		{
+			name:                                "multiple tables without experimental flag - should fail",
+			statement:                           "ALTER TABLE t1 ADD COLUMN col1 INT; ALTER TABLE t2 ADD COLUMN col2 INT",
+			enableExperimentalMultiTableSupport: false,
+			expectError:                         true,
+			expectedErrorMessage:                "multiple tables detected. To enable this experimental feature, please specify --enable-experimental-multi-table-support",
+		},
+		{
+			name:                                "multiple tables with experimental flag - should work",
+			statement:                           "ALTER TABLE t1 ADD COLUMN col1 INT; ALTER TABLE t2 ADD COLUMN col2 INT",
+			enableExperimentalMultiTableSupport: true,
+			expectError:                         false,
+		},
+		{
+			name:                                "schema mismatch - should fail early",
+			statement:                           "ALTER TABLE otherschema.t1 ADD COLUMN col1 INT",
+			enableExperimentalMultiTableSupport: false,
+			expectError:                         true,
+			expectedErrorMessage:                "schema name in statement (`schema`.`table`) does not match --database",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Migration{
+				Database:                            "test",
+				Host:                                "localhost:3306", // Required by normalizeOptions validation
+				Statement:                           tt.statement,
+				EnableExperimentalMultiTableSupport: tt.enableExperimentalMultiTableSupport,
+			}
+
+			_, err := m.normalizeOptions()
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.expectedErrorMessage != "" {
+					assert.ErrorContains(t, err, tt.expectedErrorMessage)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
