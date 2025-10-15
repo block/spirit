@@ -370,14 +370,14 @@ func TestSchemaAnalyzer_PartitionSupport(t *testing.T) {
 						Name: "p2020",
 						Values: &PartitionValues{
 							Type:   "LESS_THAN",
-							Values: []interface{}{"2021"},
+							Values: []interface{}{int64(2021)},
 						},
 					},
 					{
 						Name: "p2021",
 						Values: &PartitionValues{
 							Type:   "LESS_THAN",
-							Values: []interface{}{"2022"},
+							Values: []interface{}{int64(2022)},
 						},
 					},
 				},
