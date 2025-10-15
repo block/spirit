@@ -1,4 +1,4 @@
-package row
+package copier
 
 import (
 	"context"
@@ -125,9 +125,12 @@ func TestCopierUniqueDestination(t *testing.T) {
 	cfg.FinalChecksum = false
 	chunker, err := table.NewChunker(t1, t2, cfg.TargetChunkTime, cfg.Logger)
 	assert.NoError(t, err)
+	require.NoError(t, chunker.Open())
 	copier, err := NewCopier(db, chunker, cfg)
 	assert.NoError(t, err)
-	assert.Error(t, copier.Run(t.Context())) // fails
+	err = copier.Run(t.Context())
+	assert.Error(t, err) // fails
+	assert.ErrorContains(t, err, "Duplicate entry")
 
 	// however, if the checksum is TRUE, the unique violation will be ignored.
 	// This is because it's not possible to differentiate between a resume from checkpoint
@@ -332,7 +335,7 @@ func TestCopierValidation(t *testing.T) {
 
 func TestCopierFromCheckpoint(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS copierchkpt1, _copierchkpt1_new")
-	testutils.RunSQL(t, "CREATE TABLE copierchkpt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE copierchkpt1 (a INT NOT NULL auto_increment, b INT, c INT, PRIMARY KEY (a))")
 	testutils.RunSQL(t, "CREATE TABLE _copierchkpt1_new (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
 	testutils.RunSQL(t, "INSERT INTO copierchkpt1 VALUES (1, 2, 3), (2, 3, 4), (3, 4, 5), (4, 5, 6), (5, 6, 7), (6, 7, 8), (7, 8, 9), (8, 9, 10), (9, 10, 11), (10, 11, 12)")
 	testutils.RunSQL(t, "INSERT INTO _copierchkpt1_new VALUES (1, 2, 3),(2,3,4),(3,4,5)") // 1-3 row is already copied
@@ -353,8 +356,7 @@ func TestCopierFromCheckpoint(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Open chunker at the specified watermark
-	highPtr := table.NewDatum(t1new.MaxValue().Val, t1.MaxValue().Tp)
-	err = chunker.OpenAtWatermark(lowWatermark, highPtr, 0)
+	err = chunker.OpenAtWatermark(lowWatermark)
 	assert.NoError(t, err)
 
 	// Create copier with the prepared chunker

@@ -61,7 +61,7 @@ type Client struct {
 	// subscriptions is a map of tables that are actively
 	// watching for changes on. The key is schemaName.tableName.
 	// each subscription has its own set of changes.
-	subscriptions map[string]*subscription
+	subscriptions map[string]Subscription
 
 	// onDDL is a channel that is used to notify of
 	// any schema changes. It will send any changes,
@@ -89,32 +89,36 @@ type Client struct {
 	cancelFunc func()
 	isClosed   atomic.Bool
 	logger     loggers.Advanced
+
+	useExperimentalBufferedMap bool // for testing new subscription type
 }
 
 // NewClient creates a new Client instance.
 func NewClient(db *sql.DB, host string, username, password string, config *ClientConfig) *Client {
 	return &Client{
-		db:              db,
-		dbConfig:        dbconn.NewDBConfig(),
-		host:            host,
-		username:        username,
-		password:        password,
-		logger:          config.Logger,
-		targetBatchTime: config.TargetBatchTime,
-		targetBatchSize: DefaultBatchSize, // initial starting value.
-		concurrency:     config.Concurrency,
-		subscriptions:   make(map[string]*subscription),
-		onDDL:           config.OnDDL,
-		serverID:        config.ServerID,
+		db:                         db,
+		dbConfig:                   dbconn.NewDBConfig(),
+		host:                       host,
+		username:                   username,
+		password:                   password,
+		logger:                     config.Logger,
+		targetBatchTime:            config.TargetBatchTime,
+		targetBatchSize:            DefaultBatchSize, // initial starting value.
+		concurrency:                config.Concurrency,
+		subscriptions:              make(map[string]Subscription),
+		onDDL:                      config.OnDDL,
+		serverID:                   config.ServerID,
+		useExperimentalBufferedMap: config.UseExperimentalBufferedMap,
 	}
 }
 
 type ClientConfig struct {
-	TargetBatchTime time.Duration
-	Concurrency     int
-	Logger          loggers.Advanced
-	OnDDL           chan string
-	ServerID        uint32
+	TargetBatchTime            time.Duration
+	Concurrency                int
+	Logger                     loggers.Advanced
+	OnDDL                      chan string
+	ServerID                   uint32
+	UseExperimentalBufferedMap bool
 }
 
 // NewServerID randomizes the server ID to avoid conflicts with other binlog readers.
@@ -145,10 +149,34 @@ func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, keyAbo
 		return fmt.Errorf("subscription already exists for table %s.%s", currentTable.SchemaName, currentTable.TableName)
 	}
 
-	c.subscriptions[subKey] = &subscription{
+	// Decide which subscription type to use. We always prefer deltaMap
+	// But will fall back to deltaQueue if the PK is not memory comparable.
+	if err := currentTable.PrimaryKeyIsMemoryComparable(); err != nil {
+		c.subscriptions[subKey] = &deltaQueue{
+			table:                  currentTable,
+			newTable:               newTable,
+			changes:                make([]queuedChange, 0),
+			c:                      c,
+			keyAboveCopierCallback: keyAboveCopierCallback,
+		}
+		return nil
+	}
+	if c.useExperimentalBufferedMap {
+		c.logger.Infof("Using experimental buffered map for table %s.%s", currentTable.SchemaName, currentTable.TableName)
+		c.subscriptions[subKey] = &bufferedMap{
+			table:                  currentTable,
+			newTable:               newTable,
+			changes:                make(map[string]logicalRow),
+			c:                      c,
+			keyAboveCopierCallback: keyAboveCopierCallback,
+		}
+		return nil
+	}
+	// Default case is delta map
+	c.subscriptions[subKey] = &deltaMap{
 		table:                  currentTable,
 		newTable:               newTable,
-		deltaMap:               make(map[string]bool),
+		changes:                make(map[string]bool),
 		c:                      c,
 		keyAboveCopierCallback: keyAboveCopierCallback,
 	}
@@ -188,7 +216,7 @@ func (c *Client) AllChangesFlushed() bool {
 	}
 	// We check if all subscriptions have flushed their changes.
 	for _, subscription := range c.subscriptions {
-		if subscription.getDeltaLen() > 0 {
+		if subscription.Length() > 0 {
 			return false
 		}
 	}
@@ -209,7 +237,7 @@ func (c *Client) GetDeltaLen() int {
 	defer c.Unlock()
 	deltaLen := 0
 	for _, subscription := range c.subscriptions {
-		deltaLen += subscription.getDeltaLen()
+		deltaLen += subscription.Length()
 	}
 	return deltaLen
 }
@@ -297,13 +325,20 @@ func (c *Client) readStream(ctx context.Context) {
 	currentLogName := c.flushedPos.Name
 	c.Unlock()
 	for {
+		// Check if context is done before processing
+		select {
+		case <-ctx.Done():
+			return // stop processing
+		default:
+		}
+
 		// Read the next event from the stream
 		ev, err := c.streamer.GetEvent(ctx)
 		if err != nil {
 			// We only stop processing for context cancelled errors.
 			// For other errors we just continue, because we want the readStream
 			// to continually retry.
-			if errors.Is(err, context.Canceled) || c.isClosed.Load() {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.isClosed.Load() {
 				return // stop processing
 			}
 			c.logger.Errorf("error reading binlog stream: %v, current position: %v",
@@ -359,13 +394,38 @@ func (c *Client) readStream(ctx context.Context) {
 	}
 }
 
-func (c *Client) processDDLNotification(table string) {
+// processDDLNotification sends a notification to the onDDL channel if the table matches
+// The table is encoded with EncodeSchemaTable() and should include the schema name.
+func (c *Client) processDDLNotification(encodedTable string) {
 	c.Lock()
 	defer c.Unlock()
 	if c.onDDL == nil {
 		return // no one is listening for DDL events
 	}
-	c.onDDL <- table
+	// Check if the encodedTable matches any of our subscriptions.
+	matchFound := false
+	for _, sub := range c.subscriptions {
+		for _, tsub := range sub.Tables() { // currentTable, newTable
+			tName := EncodeSchemaTable(tsub.SchemaName, tsub.TableName)
+			if encodedTable == tName {
+				matchFound = true
+				break
+			}
+		}
+	}
+	// If there is no matchFound, we don't send the notification.
+	if !matchFound {
+		return
+	}
+
+	// Use non-blocking send to prevent deadlock
+	select {
+	case c.onDDL <- encodedTable:
+		// Successfully sent notification
+	default:
+		// Channel is full or blocked, skip notification to prevent deadlock
+		// This is acceptable as DDL notifications are best-effort
+	}
 }
 
 // processRowsEvent processes a RowsEvent. It will search all active
@@ -387,31 +447,77 @@ func (c *Client) processRowsEvent(ev *replication.BinlogEvent, e *replication.Ro
 		return nil // ignore event, it could be to a _new table.
 	}
 	eventType := parseEventType(ev.Header.EventType)
-	var i = 0
-	for _, row := range e.Rows {
-		if eventType == eventTypeUpdate {
-			// For update events there are always before and after images (i.e. e.Rows is always in pairs.)
-			// We only need to capture one of the events, and since in MINIMAL RBR row
-			// image the PK is only included in the before, we chose that one.
-			i++
-			if i%2 == 0 {
-				continue
+
+	if eventType == eventTypeUpdate {
+		// For update events there are always before and after images (i.e. e.Rows is always in pairs.)
+		// With MINIMAL row image, the PK is only included in the before image for non-PK updates.
+		// For PK updates, both before and after images will contain the PK columns since they changed.
+		for i := 0; i < len(e.Rows); i += 2 {
+			beforeRow := e.Rows[i]
+			afterRow := e.Rows[i+1]
+
+			// Always process the before image (guaranteed to have PK in minimal mode)
+			beforeKey, err := sub.Tables()[0].PrimaryKeyValues(beforeRow)
+			if err != nil {
+				return err
+			}
+			if len(beforeKey) == 0 {
+				return fmt.Errorf("no primary key found for before row: %#v", beforeRow)
+			}
+
+			// With MINIMAL row image, we need to reconstruct the after key
+			// by combining the before key with any changed PK columns from the after image
+			afterKey := make([]any, len(beforeKey))
+			copy(afterKey, beforeKey) // Start with the before key
+
+			// Check if any PK columns were updated by examining the after row
+			isPKUpdate := false
+			afterRowSlice := afterRow
+
+			for pkIdx, pkCol := range sub.Tables()[0].KeyColumns {
+				// Find the position of this PK column in the table columns
+				for colIdx, col := range sub.Tables()[0].Columns {
+					if col == pkCol {
+						// If this column exists in the after image and is not nil, use it
+						if colIdx < len(afterRowSlice) && afterRowSlice[colIdx] != nil {
+							if fmt.Sprintf("%v", beforeKey[pkIdx]) != fmt.Sprintf("%v", afterRowSlice[colIdx]) {
+								afterKey[pkIdx] = afterRowSlice[colIdx]
+								isPKUpdate = true
+							}
+						}
+						break
+					}
+				}
+			}
+
+			if isPKUpdate {
+				// This is a primary key update - track both delete and insert
+				sub.HasChanged(beforeKey, nil, true)      // delete old key
+				sub.HasChanged(afterKey, afterRow, false) // insert new key
+			} else {
+				// Same PK, just a regular update
+				sub.HasChanged(beforeKey, afterRow, false)
 			}
 		}
-		key, err := sub.table.PrimaryKeyValues(row)
-		if err != nil {
-			return err
-		}
-		if len(key) == 0 {
-			return fmt.Errorf("no primary key found for row: %#v", row)
-		}
-		switch eventType {
-		case eventTypeInsert, eventTypeUpdate:
-			sub.keyHasChanged(key, false)
-		case eventTypeDelete:
-			sub.keyHasChanged(key, true)
-		default:
-			c.logger.Errorf("unknown event type: %v", ev.Header.EventType)
+	} else {
+		// For INSERT and DELETE events, process each row normally
+		for _, row := range e.Rows {
+			key, err := sub.Tables()[0].PrimaryKeyValues(row)
+			if err != nil {
+				return err
+			}
+			if len(key) == 0 {
+				// In theory this is unreachable since we mandate a PK on tables
+				return fmt.Errorf("no primary key found for row: %#v", row)
+			}
+			switch eventType {
+			case eventTypeInsert:
+				sub.HasChanged(key, row, false)
+			case eventTypeDelete:
+				sub.HasChanged(key, nil, true)
+			default:
+				c.logger.Errorf("unknown event type: %v", ev.Header.EventType)
+			}
 		}
 	}
 	return nil
@@ -482,7 +588,7 @@ func (c *Client) flush(ctx context.Context, underLock bool, lock *dbconn.TableLo
 	c.Unlock()
 
 	for _, subscription := range c.subscriptions {
-		if err := subscription.flush(ctx, underLock, lock); err != nil {
+		if err := subscription.Flush(ctx, underLock, lock); err != nil {
 			return err
 		}
 	}
@@ -506,6 +612,10 @@ func (c *Client) Flush(ctx context.Context) error {
 		// actually a lot to do!
 		if err := c.BlockWait(ctx); err != nil {
 			c.logger.Warnf("error waiting for binlog reader to catch up: %v", err)
+			// Check if the error is due to context cancellation
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
 			continue
 		}
 		//  If it doesn't timeout, we ensure the deltas
@@ -578,13 +688,14 @@ func (c *Client) BlockWait(ctx context.Context) error {
 	}
 	c.logger.Infof("waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
 	timer := time.NewTimer(DefaultTimeout)
+	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
 	for {
 		select {
 		case <-timer.C:
 			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
 		default:
 			if err := dbconn.Exec(ctx, c.db, "FLUSH BINARY LOGS"); err != nil {
-				break // error flushing binary logs
+				return err // it could be context cancelled, return it
 			}
 			if c.getBufferedPos().Compare(targetPos) >= 0 {
 				return nil // we are up to date!
@@ -645,7 +756,7 @@ func (c *Client) SetKeyAboveWatermarkOptimization(newVal bool) {
 	defer c.Unlock()
 
 	for _, sub := range c.subscriptions {
-		sub.setKeyAboveWatermarkOptimization(newVal)
+		sub.SetKeyAboveWatermarkOptimization(newVal)
 	}
 }
 

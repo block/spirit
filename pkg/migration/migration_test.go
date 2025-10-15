@@ -18,6 +18,18 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// cleanupSentinelTable drops the sentinel table to ensure tests start with a clean state
+// and registers a cleanup function to drop it after the test completes
+func cleanupSentinelTable(t *testing.T) {
+	t.Helper()
+	// Drop the table before the test starts
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS _spirit_sentinel`)
+	// Register cleanup to drop it after the test completes (even if test fails)
+	t.Cleanup(func() {
+		testutils.RunSQL(t, `DROP TABLE IF EXISTS _spirit_sentinel`)
+	})
+}
+
 func TestMain(m *testing.M) {
 	checkpointDumpInterval = 100 * time.Millisecond
 	statusInterval = 10 * time.Millisecond // the status will be accurate to 1ms
@@ -488,7 +500,7 @@ func TestUnparsableStatements(t *testing.T) {
 	}
 	err = migration.Run()
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "could not parse SQL statement")
+	assert.ErrorContains(t, err, "line 1 column 14 near \"TRIGGER")
 
 	//https://github.com/pingcap/tidb/pull/61498
 	migration = &Migration{

@@ -1,5 +1,38 @@
 # How to use Spirit
 
+## Table of Contents
+
+- [How to use Spirit](#how-to-use-spirit)
+  - [Table of Contents](#table-of-contents)
+  - [Getting Started](#getting-started)
+  - [Configuration](#configuration)
+    - [alter](#alter)
+    - [checksum](#checksum)
+    - [database](#database)
+    - [defer-cutover](#defer-cutover)
+    - [force-kill](#force-kill)
+    - [host](#host)
+    - [lock-wait-timeout](#lock-wait-timeout)
+    - [password](#password)
+    - [replica-dsn](#replica-dsn)
+    - [replica-max-lag](#replica-max-lag)
+    - [statement](#statement)
+    - [strict](#strict)
+    - [table](#table)
+    - [target-chunk-time](#target-chunk-time)
+    - [threads](#threads)
+    - [username](#username)
+    - [tls](#tls)
+      - [PREFERRED](#preferred)
+      - [REQUIRED](#required)
+      - [VERIFY\_CA](#verify_ca)
+      - [VERIFY\_IDENTITY](#verify_identity)
+  - [Experimental Features](#experimental-features)
+    - [enable-experimental-multi-table-support](#enable-experimental-multi-table-support)
+    - [enable-experimental-buffered-copy](#enable-experimental-buffered-copy)
+
+## Getting Started
+
 To create a binary:
 
 ```
@@ -45,26 +78,17 @@ The database that the schema change will be performed in.
 
 ### defer-cutover
 
-The "defer cutover" feature makes spirit wait to perform the final cutover until a "sentinel" table has been dropped. This is similar to the --postpone-cut-over-flag-file feature of gh-ost.
+The "defer cutover" feature makes spirit wait to perform the final cutover until the "sentinel" table has been dropped. This is similar to the `--postpone-cut-over-flag-file` feature of gh-ost.
 
-The defer cutover feature will not be used and the sentinel table will not be created if the schema migration can be successfully executed using ALGORITHM=INSTANT (see "Attempt Instant DDL" in README.md).
+The defer cutover feature will not be used and the sentinel table will not be created if the schema migration can be successfully executed using `ALGORITHM=INSTANT` (see "Attempt Instant DDL" in README.md).
 
-If defer-cutover is true, Spirit will create a "sentinel" table in the same schema as the table being altered; the name of the sentinel table will use the pattern `_<table>_sentinel`. Spirit will block before the cutover, waiting for the operator to manually drop the sentinel table, which triggers Spirit to proceed with the cutover. Spirit will never delete the sentinel table on its own. It will block for 48 hours waiting for the sentinel table to be dropped by the operator, after which it will exit with an error.
+If defer-cutover is true, Spirit will create the "sentinel" table in the same schema as the table being altered; the name of the sentinel table will always be `_spirit_sentinel`. Spirit will block before the cutover, waiting for the operator to manually drop the sentinel table, which triggers Spirit to proceed with the cutover. Spirit will never delete the sentinel table on its own. It will block for 48 hours waiting for the sentinel table to be dropped by the operator, after which it will exit with an error.
 
-You can resume a migration from checkpoint and Spirit will start waiting again for you to drop the sentinel table. You can also choose to delete the sentinel table before restarting Spirit, which will cause it to resume from checkpoint and complete the cutover without waiting, even if you have again enabled defer-cutover for the migration.
+You can resume a migration from checkpoint and Spirit will start waiting again for you to drop the sentinel table. You can also choose to delete the sentinel table before restarting Spirit, which will cause it to resume from checkpoint and complete the cutover without waiting, even if you have again enabled `defer-cutover` for the migration.
 
-If you start a migration and realize that you forgot to set defer-cutover, worry not! You can manually create a sentinel table using the pattern `_<table>_sentinel`, and Spirit will detect the table before the cutover is completed and block as though defer-cutover had been enabled from the beginning.
+If you start a migration and realize that you forgot to set defer-cutover, worry not! You can manually create a sentinel table `_spirit_sentinel`, and Spirit will detect the table before the cutover is completed and block as though defer-cutover had been enabled from the beginning.
 
 Note that the checksum, if enabled, will be computed after the sentinel table is dropped. Because the checksum step takes an estimated 10-20% of the migration, the cutover will not occur immediately after the sentinel table is dropped.
-
-### force-inplace
-
-- Type: Boolean
-- Default value: FALSE
-
-When set to `TRUE`, Spirit will attempt to perform the schema change using MySQL's `INPLACE` algorithm, before falling back to performing its usual copy process. `INPLACE` is non-blocking on the system where the DDL is initiated, but it will block on binary-log based read replicas. This means it's typically only safe to enable if you have no read replicas, or your read replicas are based on physical log shipping (i.e. Aurora).
-
-Even when force-inplace is `FALSE`, Spirit automatically detects "safe" operations that use the `INPLACE` algorithm. These include operations that modify only metadata, specifically `ALTER INDEX .. VISIBLE/INVISIBLE`, `DROP KEY/INDEX` and `RENAME KEY/INDEX`. Consult <https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html> for more details.
 
 ### force-kill
 
@@ -201,3 +225,149 @@ Note that Spirit does not support dynamically adjusting the number of threads wh
 - Default value: `spirit`
 
 The username to use when connecting to MySQL.
+
+
+### tls
+Spirit uses the same TLS/SSL mode options as the MySQL client, making it familiar and intuitive for users. 
+
+| Mode | Description | Encryption | CA Verification | Hostname Verification | --tls-ca Required? |
+|------|-------------|------------|-----------------|----------------------|-------------------|
+| `DISABLED` | No TLS encryption | ❌ No | ❌ No | ❌ No | ❌ Never needed |
+| `PREFERRED` | TLS if server supports it (default) | ✅ If available | ❌ No | ❌ No | ❌ Never needed |
+| `REQUIRED` | TLS required, connection fails if unavailable | ✅ Required | ❌ No | ❌ No | ❌ Never needed |
+| `VERIFY_CA` | TLS required + verify server certificate | ✅ Required | ✅ Yes | ❌ No | ⚠️ Optional* |
+| `VERIFY_IDENTITY` | Full verification including hostname | ✅ Required | ✅ Yes | ✅ Yes | ⚠️ Optional* |
+
+Configuration Flags:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--tls-mode` | TLS connection mode (see table above) | `PREFERRED` |
+| `--tls-ca` | Path to custom TLS CA certificate file | `""` |
+
+**\* Optional but recommended**: These modes can use the embedded RDS certificate bundle as a fallback, but providing `--tls-ca` gives you full control over which Certificate Authorities are trusted.
+
+**Examples:**
+#### PREFERRED
+NOTE: This mode is the default behavior
+```bash
+# Add a column with automatic TLS detection (default mode)
+spirit --tls-mode PREFERRED \
+       --host mydb.us-west-2.rds.amazonaws.com:3306 \
+       --username admin \
+       --password mypassword \
+       --database production \
+       --table users \
+       --alter "ADD COLUMN last_login_ip VARCHAR(45) AFTER last_login" \
+       --threads 8 \
+       --chunk-size 2000
+```
+**Result**: Automatically uses TLS for RDS hosts with embedded certificates, optional for others.
+
+#### REQUIRED
+Force TLS Without Certificate Verification
+```bash
+# Add a column requiring TLS but not verifying certificates
+spirit --tls-mode REQUIRED \
+       --host mysql.staging.company.com:3306 \
+       --username staging_user \
+       --password staging_pass \
+       --database inventory \
+       --table products \
+       --alter "ADD COLUMN supplier_notes JSON AFTER supplier_id" \
+       --threads 6 \
+       --chunk-size 1500
+```
+**Result**: TLS encryption required, but accepts self-signed or invalid certificates.
+
+#### VERIFY_CA
+Certificate Verification Without Hostname Check
+```bash
+# Add a column with CA verification using custom certificate
+spirit --tls-mode VERIFY_CA \
+       --tls-ca /etc/ssl/certs/company-ca-bundle.pem \
+       --host 192.168.1.100:3306 \
+       --username app_user \
+       --password app_password \
+       --database analytics \
+       --table events \
+       --alter "ADD COLUMN event_metadata JSON AFTER event_type" \
+       --threads 4 \
+       --chunk-size 1000
+```
+**Result**: Verifies certificate against custom CA bundle but allows IP addresses/hostname mismatches.
+
+```bash
+# Add a column using embedded RDS certificate for non-RDS MySQL server
+spirit --tls-mode VERIFY_CA \
+       --host mysql.internal.corp:3306 \
+       --username internal_user \
+       --password internal_pass \
+       --database hr_system \
+       --table employees \
+       --alter "ADD COLUMN emergency_contact VARCHAR(255) AFTER phone_number" \
+       --threads 2 \
+       --chunk-size 500
+```
+**Result**: Uses embedded RDS certificate bundle as fallback for certificate verification.
+
+#### VERIFY_IDENTITY
+Full Certificate and Hostname Verification
+```bash
+# Add a column with maximum security verification
+spirit --tls-mode VERIFY_IDENTITY \
+       --tls-ca /opt/certificates/production-ca.pem \
+       --host mysql.secure.company.com:3306 \
+       --username secure_user \
+       --password very_secure_password \
+       --database financial \
+       --table transactions \
+       --alter "ADD COLUMN fraud_score DECIMAL(5,4) AFTER amount" \
+       --threads 8 \
+       --chunk-size 2000
+```
+**Result**: Full TLS verification including hostname matching - maximum security. Custom certificate takes precedence over RDS auto-detection.
+
+```bash
+# Add a column to RDS with full verification using auto-detected certificate
+spirit --tls-mode VERIFY_IDENTITY \
+       --host prod-db.cluster-xyz.us-east-1.rds.amazonaws.com:3306 \
+       --username rds_admin \
+       --password rds_password \
+       --database customer_data \
+       --table profiles \
+       --alter "ADD COLUMN gdpr_consent_date DATETIME AFTER created_at" \
+       --threads 10 \
+       --chunk-size 3000
+```
+**Result**: Uses embedded RDS certificate with full verification for RDS hostname.
+
+## Experimental Features
+
+### enable-experimental-multi-table-support
+
+**Feature Description**
+
+This feature allows Spirit to apply multiple schema changes at once, and cut them over atomically. The intended use-case is for complicated scenarios where there are collation mismatches between tables. If you change the collation of one table, it could result in performance issues with joins. For satefy, you really need to change all collation settings at once, which has not historically been easy.
+
+**Current Status**
+
+This feature is feature complete. The main issue is that there is insufficient test coverage. See issue [#388](https://github.com/block/spirit/issues/388) for details.
+
+### enable-experimental-buffered-copy
+
+**Feature Description**
+
+This feature changes how changes are copied to the new table. Rather than using `INSERT IGNORE .. SELECT` the copier instead reads the rows completely from the source table, and then inserts them into the new table (fanning out the insert into many parallel threads). Changes from replication are also applied in a similar way.
+
+This algorithm is the same as [Netflix's DBLog](https://netflixtechblog.com/dblog-a-generic-change-data-capture-framework-69351fb9099b). The advantage of buffered copies is that they do not require any locks on the source table. The algorithm is also generic, in that we intend to use it in future to implement a logical move (copy tables) between MySQL servers. In some cases it may also allow for faster schema changes, although to date the improvements have been relatively modest (and varies based on how much you are willing to overload the MySQL server).
+
+**Current Status**
+
+This feature is not feature complete. Getting in the business of reading rows and re-inserting them (vs `INSERT.. SELECT`) means that we need to add a lot of tests to handle edge cases, such as character set and datetime mangling.
+
+We also haven't technically implemented the low-watermark requirement for replication apply, which means that there is a brief race where inconsistencies can occur during copy. Thankfully, this will be detected from the final checksum, but we would rather not rely on that.
+
+Buffered changes also puts a lot more stress on the `spirit` binary in terms of CPU use and memory. Ideally we can get a good understanding on this, and ensure that there is some protection in place to prevent out of memory cases etc.
+
+There is also the risk that the buffered algorithm write threads can overwhelm a server. We need to implement a throttler that detects that the server is overloaded, and possibly some configuration over write threads.

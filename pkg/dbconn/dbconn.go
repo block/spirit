@@ -32,17 +32,23 @@ type DBConfig struct {
 	RangeOptimizerMaxMemSize int64
 	InterpolateParams        bool
 	ForceKill                bool // If true, kill locking transactions to acquire metadata locks
+	// TLS Configuration
+	TLSMode            string // TLS connection mode (DISABLED, PREFERRED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY)
+	TLSCertificatePath string // Path to custom TLS certificate file
 }
 
 func NewDBConfig() *DBConfig {
 	return &DBConfig{
 		LockWaitTimeout:          30,
 		InnodbLockWaitTimeout:    3,
-		MaxRetries:               5,
+		MaxRetries:               3,
 		MaxOpenConnections:       32,    // default is high for historical tests. It's overwritten by the user threads count + 2 for headroom.
 		RangeOptimizerMaxMemSize: 0,     // default is 8M, we set to unlimited. Not user configurable (may reconsider in the future).
 		InterpolateParams:        false, // default is false
 		ForceKill:                false, // default is false
+		// TLS defaults
+		TLSMode:            "PREFERRED", // default to PREFERRED mode like MySQL
+		TLSCertificatePath: "",          // no custom certificate by default
 	}
 }
 

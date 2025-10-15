@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/block/spirit/pkg/row"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	mysql2 "github.com/go-sql-driver/mysql"
@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMain(m *testing.M) {
@@ -96,10 +97,10 @@ func TestReplClientComplex(t *testing.T) {
 	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
-	copier, err := row.NewCopier(db, chunker, row.NewCopierDefaultConfig())
+	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
-	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
+	assert.NoError(t, client.AddSubscription(t1, t2, chunker.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 	client.SetKeyAboveWatermarkOptimization(true)
@@ -110,11 +111,11 @@ func TestReplClientComplex(t *testing.T) {
 	assert.Equal(t, 0, client.GetDeltaLen())
 
 	// Read from the copier so that the key is below the watermark
-	chk, err := copier.Next4Test()
+	chk, err := chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`a` < 1", chk.String())
 	// read again
-	chk, err = copier.Next4Test()
+	chk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`a` >= 1 AND `a` < 1001", chk.String())
 
@@ -297,10 +298,10 @@ func TestReplClientQueue(t *testing.T) {
 	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
-	copier, err := row.NewCopier(db, chunker, row.NewCopierDefaultConfig())
+	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
 	assert.NoError(t, err)
-	// Attach copier's keyabovewatermark to the repl client
-	assert.NoError(t, client.AddSubscription(t1, t2, copier.KeyAboveHighWatermark))
+	// Attach chunker's keyabovewatermark to the repl client
+	assert.NoError(t, client.AddSubscription(t1, t2, chunker.KeyAboveHighWatermark))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 
@@ -311,12 +312,12 @@ func TestReplClientQueue(t *testing.T) {
 	assert.Equal(t, 1000, client.GetDeltaLen())
 
 	// Read from the copier
-	chk, err := copier.Next4Test()
+	chk, err := chunker.Next()
 	assert.NoError(t, err)
 	prevUpperBound := chk.UpperBound.Value[0].String()
 	assert.Equal(t, "`a` < "+prevUpperBound, chk.String())
 	// read again
-	chk, err = copier.Next4Test()
+	chk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, fmt.Sprintf("`a` >= %s AND `a` < %s", prevUpperBound, chk.UpperBound.Value[0].String()), chk.String())
 
@@ -469,12 +470,21 @@ func TestDDLNotification(t *testing.T) {
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 
-	// Create a new table.
-	// check that we get notification of it.
-	testutils.RunSQL(t, "CREATE TABLE ddl_t3 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	// Alter the existing table ddl_t2, check that we get notification of it.
+	testutils.RunSQL(t, "ALTER TABLE ddl_t2 ADD COLUMN d INT")
 
 	tableModified := <-ddlNotifications
-	assert.Equal(t, "test.ddl_t3", tableModified)
+	assert.Equal(t, "test.ddl_t2", tableModified)
+
+	// Set the channel to a new channel.
+	ddlNotifications2 := make(chan string, 1)
+	client.SetDDLNotificationChannel(ddlNotifications2)
+
+	// Alter the existing table ddl_t1, check that we get notification of it on the new channel.
+	testutils.RunSQL(t, "ALTER TABLE ddl_t1 ADD COLUMN d INT")
+
+	tableModified = <-ddlNotifications2
+	assert.Equal(t, "test.ddl_t1", tableModified)
 }
 
 func TestSetDDLNotificationChannel(t *testing.T) {
@@ -549,34 +559,152 @@ func TestSetDDLNotificationChannel(t *testing.T) {
 	})
 }
 
-func TestAllChangesFlushed(t *testing.T) {
-	srcTable, dstTable := setupTestTables(t)
+// TestCompositePKUpdate tests that we correctly handle
+// the case when a PRIMARY KEY is moved.
+// See: https://github.com/block/spirit/issues/417
+func TestCompositePKUpdate(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	assert.NoError(t, err)
+	defer db.Close()
 
+	// Drop tables if they exist
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS composite_pk_src, composite_pk_dst")
+
+	// Create a table with composite primary key similar to customer's message_groups table
+	testutils.RunSQL(t, `CREATE TABLE composite_pk_src (
+		organization_id BIGINT NOT NULL,
+		from_id BIGINT NOT NULL DEFAULT 0,
+		id BIGINT NOT NULL,
+		message VARCHAR(255) NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (organization_id, from_id, id),
+		UNIQUE KEY idx_id (id)
+	)`)
+
+	testutils.RunSQL(t, `CREATE TABLE composite_pk_dst (
+		organization_id BIGINT NOT NULL,
+		from_id BIGINT NOT NULL DEFAULT 0,
+		id BIGINT NOT NULL,
+		message VARCHAR(255) NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (organization_id, from_id, id),
+		UNIQUE KEY idx_id (id)
+	)`)
+
+	// Insert initial test data in *both* source and destination tables
+	testutils.RunSQL(t, `INSERT INTO composite_pk_src (organization_id, from_id, id, message) VALUES 
+		(1, 100, 1, 'message 1'),
+		(1, 200, 2, 'message 2'),
+		(1, 300, 3, 'message 3'),
+		(2, 100, 4, 'message 4'),
+		(2, 200, 5, 'message 5')`)
+	testutils.RunSQL(t, `INSERT INTO composite_pk_dst SELECT * FROM composite_pk_src`)
+
+	// Set up table info
+	t1 := table.NewTableInfo(db, "test", "composite_pk_src")
+	assert.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "composite_pk_dst")
+	assert.NoError(t, t2.SetInfo(t.Context()))
+
+	// Create replication client
+	logger := logrus.New()
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+		Logger:          logger,
+		Concurrency:     4,
+		TargetBatchTime: time.Second,
+		ServerID:        NewServerID(),
+	})
+
+	// Add subscription - note that keyAboveWatermark is disabled for composite PKs
+	assert.NoError(t, client.AddSubscription(t1, t2, nil))
+	assert.NoError(t, client.Run(t.Context()))
+	defer client.Close()
+
+	// Update the from_id (part of the primary key)
+	testutils.RunSQL(t, `UPDATE composite_pk_src SET from_id = 999 WHERE id IN (1, 3)`)
+	assert.NoError(t, client.BlockWait(t.Context()))
+
+	// The update should result in changes being tracked
+	// With binlog_row_image=minimal and PK updates, we expect 4 changes (2 deletes + 2 inserts)
+	deltaLen := client.GetDeltaLen()
+	require.Equal(t, 4, deltaLen, "Should have tracked 4 changes for PK update (2 deletes + 2 inserts)")
+
+	// Flush the changes
+	// This should update the destination table correctly
+	assert.NoError(t, client.Flush(t.Context()))
+
+	// Verify the data was replicated correctly
+	var count int
+
+	// Check that rows with new from_id exist in destination
+	err = db.QueryRow(`SELECT COUNT(*) FROM composite_pk_dst 
+		WHERE organization_id = 1 AND from_id = 999 AND id IN (1, 3)`).Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, count, "Rows with updated from_id should exist in destination")
+
+	// Check that rows with old from_id don't exist in destination
+	err = db.QueryRow(`SELECT COUNT(*) FROM composite_pk_dst 
+		WHERE (organization_id = 1 AND from_id = 100 AND id = 1) 
+		   OR (organization_id = 1 AND from_id = 300 AND id = 3)`).Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, count, "Rows with old from_id should not exist in destination")
+
+	// Verify total row count
+	err = db.QueryRow("SELECT COUNT(*) FROM composite_pk_dst").Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 5, count, "Should have all 5 rows in destination")
+
+	// Now test another PK update
+	testutils.RunSQL(t, `UPDATE composite_pk_src SET from_id = 888 WHERE id = 5`)
+	assert.NoError(t, client.BlockWait(t.Context()))
+	assert.Positive(t, client.GetDeltaLen(), "Should have tracked changes for second PK update")
+	assert.NoError(t, client.Flush(t.Context()))
+
+	// Verify the second update
+	err = db.QueryRow(`SELECT COUNT(*) FROM composite_pk_dst 
+		WHERE organization_id = 2 AND from_id = 888 AND id = 5`).Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, count, "Row with updated from_id=888 should exist in destination")
+}
+
+func TestAllChangesFlushed(t *testing.T) {
+	t1 := `CREATE TABLE subscription_test (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	t2 := `CREATE TABLE _subscription_test_new (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	srcTable, dstTable := setupTestTables(t, t1, t2)
 	client := &Client{
 		db:              nil,
 		logger:          logrus.New(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
-		subscriptions:   make(map[string]*subscription),
+		subscriptions:   make(map[string]Subscription),
 	}
 
 	// Test 1: Initial state - should be flushed when no changes
 	assert.True(t, client.AllChangesFlushed(), "Should be flushed with no changes")
 
 	// Test 2: Add a subscription and verify initial state
-	sub := &subscription{
-		c:          client,
-		table:      srcTable,
-		newTable:   dstTable,
-		deltaMap:   make(map[string]bool),
-		deltaQueue: nil,
+	sub := &deltaMap{
+		c:        client,
+		table:    srcTable,
+		newTable: dstTable,
+		changes:  make(map[string]bool),
 	}
 	client.subscriptions[EncodeSchemaTable(srcTable.SchemaName, srcTable.TableName)] = sub
 	assert.True(t, client.AllChangesFlushed(), "Should be flushed with empty subscription")
 
 	// Test 3: Add changes and verify not flushed
-	sub.keyHasChanged([]any{1}, false)
+	sub.HasChanged([]any{1}, nil, false)
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with pending changes")
 
 	// Test 4: Test with buffered position ahead
@@ -585,20 +713,19 @@ func TestAllChangesFlushed(t *testing.T) {
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with buffered position ahead")
 
 	// Test 5: Test with multiple subscriptions
-	sub2 := &subscription{
-		c:          client,
-		table:      srcTable,
-		newTable:   dstTable,
-		deltaMap:   make(map[string]bool),
-		deltaQueue: nil,
+	sub2 := &deltaMap{
+		c:        client,
+		table:    srcTable,
+		newTable: dstTable,
+		changes:  make(map[string]bool),
 	}
 	client.subscriptions["test2"] = sub2
-	sub2.keyHasChanged([]any{2}, false)
+	sub2.HasChanged([]any{2}, nil, false)
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with changes in any subscription")
 
 	// Test 6: Clear changes but keep positions different - should still be considered flushed
-	sub.deltaMap = make(map[string]bool)
-	sub2.deltaMap = make(map[string]bool)
+	sub.changes = make(map[string]bool)
+	sub2.changes = make(map[string]bool)
 	assert.True(t, client.AllChangesFlushed(), "Should be flushed when no pending changes, even with positions different")
 
 	// Test 7: Align positions and verify still flushed
@@ -607,17 +734,15 @@ func TestAllChangesFlushed(t *testing.T) {
 	assert.True(t, client.AllChangesFlushed(), "Should be flushed with aligned positions and no changes")
 
 	// Test 8: Test with queue-based subscription
-	subQueue := &subscription{
-		c:               client,
-		table:           srcTable,
-		newTable:        dstTable,
-		deltaMap:        nil,
-		deltaQueue:      make([]queuedChange, 0),
-		disableDeltaMap: true,
+	subQueue := &deltaQueue{
+		c:        client,
+		table:    srcTable,
+		newTable: dstTable,
+		changes:  make([]queuedChange, 0),
 	}
 	client.subscriptions["test3"] = subQueue
 	assert.True(t, client.AllChangesFlushed(), "Should be flushed with empty queue")
 
-	subQueue.keyHasChanged([]any{3}, false)
+	subQueue.HasChanged([]any{3}, nil, false)
 	assert.False(t, client.AllChangesFlushed(), "Should not be flushed with items in queue")
 }

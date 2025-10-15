@@ -111,11 +111,10 @@ func (c *change) attemptMySQLDDL(ctx context.Context) error {
 	// because replicas do not use the binlog. Some, however,
 	// only modify the table metadata and are safe.
 	//
-	// If the operator has specified that they want to attempt
-	// an inplace add index, we will attempt inplace regardless
-	// of the statement.
+	// Spirit automatically detects safe operations that can use
+	// the INPLACE algorithm without blocking read replicas.
 	err = c.stmt.AlgorithmInplaceConsideredSafe()
-	if c.runner.migration.ForceInplace || err == nil {
+	if err == nil {
 		err = c.attemptInplaceDDL(ctx)
 		if err == nil {
 			c.runner.usedInplaceDDL = true // success

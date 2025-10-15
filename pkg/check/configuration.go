@@ -14,18 +14,20 @@ func init() {
 // check the configuration of the database. There are some hard nos,
 // and some suggestions around configuration for performance.
 func configurationCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
-	var binlogFormat, innodbAutoincLockMode, binlogRowImage, logBin, logSlaveUpdates string
+	var binlogFormat, innodbAutoincLockMode, binlogRowImage, logBin, logSlaveUpdates, binlogRowValueOptions string
 	err := r.DB.QueryRowContext(ctx,
 		`SELECT @@global.binlog_format,
 		@@global.innodb_autoinc_lock_mode,
 		@@global.binlog_row_image,
 		@@global.log_bin,
-		@@global.log_slave_updates`).Scan(
+		@@global.log_slave_updates,
+		@@global.binlog_row_value_options`).Scan(
 		&binlogFormat,
 		&innodbAutoincLockMode,
 		&binlogRowImage,
 		&logBin,
 		&logSlaveUpdates,
+		&binlogRowValueOptions,
 	)
 	if err != nil {
 		return err
@@ -45,6 +47,15 @@ func configurationCheck(ctx context.Context, r Resources, logger loggers.Advance
 		// To keep the testing scope reduced for now, it is required.
 		return errors.New("binlog_row_image must be FULL or MINIMAL")
 	}
+	if r.ExperimentalBufferedCopy {
+		if binlogRowImage != "FULL" {
+			return errors.New("binlog_row_image must be FULL when using experimental buffered copy because it relies on reading all columns from the binlog")
+		}
+		if binlogRowValueOptions != "" {
+			return errors.New("binlog_row_value_options must be empty when using experimental buffered copy because it relies on reading all columns from the binlog")
+		}
+	}
+
 	if logBin != "1" {
 		// This is a hard requirement because we need to be able to read the binlog.
 		return errors.New("log_bin must be enabled")

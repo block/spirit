@@ -30,7 +30,7 @@ type MetadataLock struct {
 	lockName        string
 }
 
-func NewMetadataLock(ctx context.Context, dsn string, table *table.TableInfo, logger loggers.Advanced, optionFns ...func(*MetadataLock)) (*MetadataLock, error) {
+func NewMetadataLock(ctx context.Context, dsn string, table *table.TableInfo, config *DBConfig, logger loggers.Advanced, optionFns ...func(*MetadataLock)) (*MetadataLock, error) {
 	if table == nil {
 		return nil, errors.New("metadata lock table info is nil")
 	}
@@ -45,10 +45,11 @@ func NewMetadataLock(ctx context.Context, dsn string, table *table.TableInfo, lo
 	}
 
 	// Setup the dedicated connection for this lock
-	dbConfig := NewDBConfig()
+	// Use the provided config but ensure MaxOpenConnections is 1 for metadata locks
+	dbConfig := *config // Copy the config
 	dbConfig.MaxOpenConnections = 1
 	var err error
-	mdl.db, err = New(dsn, dbConfig)
+	mdl.db, err = New(dsn, &dbConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +127,7 @@ func NewMetadataLock(ctx context.Context, dsn string, table *table.TableInfo, lo
 					}
 
 					// try to re-establish the connection
-					mdl.db, err = New(dsn, dbConfig)
+					mdl.db, err = New(dsn, &dbConfig)
 					if err != nil {
 						logger.Warnf("could not re-establish database connection: %s", err)
 						continue

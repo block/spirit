@@ -15,7 +15,9 @@ import (
 )
 
 var (
-	ErrMismatchedAlter = errors.New("alter statement in checkpoint table does not match the alter statement specified here")
+	ErrMismatchedAlter         = errors.New("alter statement in checkpoint table does not match the alter statement specified here")
+	ErrCouldNotWriteCheckpoint = errors.New("could not write checkpoint")
+	ErrWatermarkNotReady       = errors.New("watermark not ready")
 )
 
 type Migration struct {
@@ -27,7 +29,6 @@ type Migration struct {
 	Alter                string        `name:"alter" help:"The alter statement to run on the table" optional:""`
 	Threads              int           `name:"threads" help:"Number of concurrent threads for copy and checksum tasks" optional:"" default:"4"`
 	TargetChunkTime      time.Duration `name:"target-chunk-time" help:"The target copy time for each chunk" optional:"" default:"500ms"`
-	ForceInplace         bool          `name:"force-inplace" help:"Force attempt to use inplace (only safe without replicas or with Aurora Global)" optional:"" default:"false"`
 	Checksum             bool          `name:"checksum" help:"Checksum new table before final cut-over" optional:"" default:"true"`
 	ReplicaDSN           string        `name:"replica-dsn" help:"A DSN for a replica which (if specified) will be used for lag checking." optional:""`
 	ReplicaMaxLag        time.Duration `name:"replica-max-lag" help:"The maximum lag allowed on the replica before the migration throttles." optional:"" default:"120s"`
@@ -37,9 +38,21 @@ type Migration struct {
 	ForceKill            bool          `name:"force-kill" help:"Kill long-running transactions in order to acquire metadata lock (MDL) at checksum and cutover time" optional:"" default:"false"`
 	Strict               bool          `name:"strict" help:"Exit on --alter mismatch when incomplete migration is detected" optional:"" default:"false"`
 	Statement            string        `name:"statement" help:"The SQL statement to run (replaces --table and --alter)" optional:"" default:""`
-	// Hidden options for now.
+	// TLS Configuration
+	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:"" default:"PREFERRED"`
+	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
+
+	// Experimental features
+	// These are no longer hidden, we document them.
+	EnableExperimentalMultiTableSupport bool `name:"enable-experimental-multi-table-support" help:"Allow multiple alter statements to run concurrently and cutover together" optional:"" default:"false"`
+	EnableExperimentalBufferedCopy      bool `name:"enable-experimental-buffered-copy" help:"Use the experimental buffered copier/repl applier based on the DBLog algorithm" optional:"" default:"false"`
+
+	// Hidden options for now (supports more obscure cash/sq usecases)
 	InterpolateParams bool `name:"interpolate-params" help:"Enable interpolate params for DSN" optional:"" default:"false" hidden:""`
-	Multi             bool `name:"multi" help:"Use multi chunker (for testing)" optional:"" default:"false" hidden:""`
+	// Used for tests so we can concurrently execute without issues even though
+	// the sentinel name is shared. Basically it will be true here, but false
+	// in the tests unless we set it explicitly true.
+	RespectSentinel bool `name:"respect-sentinel" help:"Look for sentinel table to exist and block if it does" optional:"" default:"true" hidden:""`
 }
 
 func (m *Migration) Run() error {
@@ -58,7 +71,10 @@ func (m *Migration) Run() error {
 }
 
 // normalizeOptions does some validation and sets defaults.
-// for example, it validates that only --statement or --table and --alter are specified.
+// for example, it validates that only --statement or --table and --alter are specified,
+// and when --statement is not specified, it generates it
+// so the rest of the code can use --statement as the canonical
+// source of truth for what's happening.
 func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, err error) {
 	if m.TargetChunkTime == 0 {
 		m.TargetChunkTime = table.ChunkerDefaultTarget
@@ -87,8 +103,9 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		// This also returns the StmtNode.
 		stmts, err = statement.New(m.Statement)
 		if err != nil {
-			// Omit the parser error messages, just show the statement.
-			return nil, errors.New("could not parse SQL statement: " + m.Statement)
+			// The error could be a parser error, or it might be something
+			// specific like mixed ALTER + non alter statements.
+			return nil, err
 		}
 		for _, stmt := range stmts {
 			if stmt.Schema != "" && stmt.Schema != m.Database {
@@ -96,9 +113,7 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 			}
 			stmt.Schema = m.Database
 		}
-	} else {
-		// Parse table + alter into statement.
-		// So that in various contexts we can start moving to using the AbstractStatement.
+	} else { // --alter and --table are specified
 		if m.Table == "" {
 			return nil, errors.New("table name is required")
 		}
@@ -109,6 +124,7 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		m.Alter = strings.TrimSpace(m.Alter)
 		m.Alter = strings.TrimSuffix(m.Alter, ";")
 		fullStatement := fmt.Sprintf("ALTER TABLE `%s` %s", m.Table, m.Alter)
+		m.Statement = fullStatement // used in resume from checkpoint
 		p := parser.New()
 		stmtNodes, _, err := p.Parse(fullStatement, "", "")
 		if err != nil {
@@ -121,6 +137,10 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 			Statement: fullStatement,
 			StmtNode:  &stmtNodes[0],
 		})
+	}
+
+	if len(stmts) > 1 && !m.EnableExperimentalMultiTableSupport {
+		return nil, errors.New("multiple statements detected. To enable this experimental feature, please specify --enable-experimental-multi-table-support")
 	}
 	return stmts, err
 }

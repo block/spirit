@@ -38,9 +38,13 @@ type Resources struct {
 	ForceKill            bool
 	// The following resources are only used by the
 	// pre-run checks
-	Host     string
-	Username string
-	Password string
+	Host                     string
+	Username                 string
+	Password                 string
+	TLSMode                  string
+	TLSCertificatePath       string
+	ExperimentalBufferedCopy bool
+	Checksum                 bool
 }
 
 type check struct {

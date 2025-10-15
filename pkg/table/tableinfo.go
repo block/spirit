@@ -345,3 +345,9 @@ func (t *TableInfo) datumTp(col string) datumTp {
 	}
 	return mySQLTypeToDatumTp(tp)
 }
+
+// GetColumnMySQLType returns the MySQL type for a given column name
+func (t *TableInfo) GetColumnMySQLType(col string) (string, bool) {
+	tp, ok := t.columnsMySQLTps[col]
+	return tp, ok
+}

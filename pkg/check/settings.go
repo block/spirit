@@ -29,5 +29,8 @@ func settingsCheck(ctx context.Context, r Resources, logger loggers.Advanced) er
 	if r.ReplicaMaxLag < 10*time.Second || r.ReplicaMaxLag > time.Hour*4 {
 		return errors.New("--replica-max-lag must be in the range of 10s-4hr")
 	}
+	if r.ExperimentalBufferedCopy && !r.Checksum {
+		return errors.New("--enable-experimental-buffered-copy requires --checksum to be enabled")
+	}
 	return nil
 }

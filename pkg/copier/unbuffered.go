@@ -1,12 +1,8 @@
-// Package row copies rows from one table to another.
-// it makes use of tableinfo.Chunker, and does the parallelism
-// and retries here. It fails on the first error.
-package row
+package copier
 
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -19,85 +15,32 @@ import (
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/siddontang/go-log/loggers"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	copyEstimateInterval   = 10 * time.Second // how frequently to re-estimate copy speed
-	copyETAInitialWaitTime = 1 * time.Minute  // how long to wait before first estimating copy speed (to allow for fast start)
-)
-
-type Copier struct {
+type Unbuffered struct {
 	sync.Mutex
-	db                *sql.DB
-	chunker           table.Chunker
-	concurrency       int
-	finalChecksum     bool
-	CopyRowsStartTime time.Time
-	CopyRowsExecTime  time.Duration
-	rowsPerSecond     uint64
-	isInvalid         bool
-	startTime         time.Time
-	ExecTime          time.Duration
-	Throttler         throttler.Throttler
-	dbConfig          *dbconn.DBConfig
-	logger            loggers.Advanced
-	metricsSink       metrics.Sink
-	copierEtaHistory  *copierEtaHistory
+	db               *sql.DB
+	chunker          table.Chunker
+	concurrency      int
+	finalChecksum    bool
+	rowsPerSecond    uint64
+	isInvalid        bool
+	startTime        time.Time
+	throttler        throttler.Throttler
+	dbConfig         *dbconn.DBConfig
+	logger           loggers.Advanced
+	metricsSink      metrics.Sink
+	copierEtaHistory *copierEtaHistory
 }
 
-type CopierConfig struct {
-	Concurrency     int
-	TargetChunkTime time.Duration
-	FinalChecksum   bool
-	Throttler       throttler.Throttler
-	Logger          loggers.Advanced
-	MetricsSink     metrics.Sink
-	DBConfig        *dbconn.DBConfig
-}
-
-// NewCopierDefaultConfig returns a default config for the copier.
-func NewCopierDefaultConfig() *CopierConfig {
-	return &CopierConfig{
-		Concurrency:     4,
-		TargetChunkTime: 1000 * time.Millisecond,
-		FinalChecksum:   true,
-		Throttler:       &throttler.Noop{},
-		Logger:          logrus.New(),
-		MetricsSink:     &metrics.NoopSink{},
-		DBConfig:        dbconn.NewDBConfig(),
-	}
-}
-
-// NewCopier creates a new copier object with the provided chunker.
-// The chunker could have been opened at a watermark, we are agnostic to that.
-// It could also return different tables on each Next() call in future,
-// so we don't save any fields related to the table.
-func NewCopier(db *sql.DB, chunker table.Chunker, config *CopierConfig) (*Copier, error) {
-	if chunker == nil {
-		return nil, errors.New("chunker must be non-nil")
-	}
-	if config.DBConfig == nil {
-		return nil, errors.New("dbConfig must be non-nil")
-	}
-	return &Copier{
-		db:               db,
-		concurrency:      config.Concurrency,
-		finalChecksum:    config.FinalChecksum,
-		Throttler:        config.Throttler,
-		chunker:          chunker,
-		logger:           config.Logger,
-		metricsSink:      config.MetricsSink,
-		dbConfig:         config.DBConfig,
-		copierEtaHistory: newcopierEtaHistory(),
-	}, nil
-}
+// Assert that unbuffered implements the Copier interface
+var _ Copier = (*Unbuffered)(nil)
 
 // CopyChunk copies a chunk from the table to the newTable.
 // it is public so it can be used in tests incrementally.
-func (c *Copier) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
-	c.Throttler.BlockWait()
+func (c *Unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
+	c.throttler.BlockWait()
 	startTime := time.Now()
 	// INSERT INGORE because we can have duplicate rows in the chunk because in
 	// resuming from checkpoint we will be re-applying some of the previous executed work.
@@ -130,7 +73,7 @@ func (c *Copier) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	return nil
 }
 
-func (c *Copier) isHealthy(ctx context.Context) bool {
+func (c *Unbuffered) isHealthy(ctx context.Context) bool {
 	c.Lock()
 	defer c.Unlock()
 	if ctx.Err() != nil {
@@ -139,17 +82,14 @@ func (c *Copier) isHealthy(ctx context.Context) bool {
 	return !c.isInvalid
 }
 
-func (c *Copier) StartTime() time.Time {
+func (c *Unbuffered) StartTime() time.Time {
 	c.Lock()
 	defer c.Unlock()
 	return c.startTime
 }
 
-func (c *Copier) Run(ctx context.Context) error {
+func (c *Unbuffered) Run(ctx context.Context) error {
 	c.startTime = time.Now()
-	defer func() {
-		c.ExecTime = time.Since(c.startTime)
-	}()
 	go c.estimateRowsPerSecondLoop(ctx) // estimate rows while copying
 	g, errGrpCtx := errgroup.WithContext(ctx)
 	g.SetLimit(c.concurrency)
@@ -179,19 +119,19 @@ func (c *Copier) Run(ctx context.Context) error {
 	return nil
 }
 
-func (c *Copier) setInvalid(newVal bool) {
+func (c *Unbuffered) setInvalid(newVal bool) {
 	c.Lock()
 	defer c.Unlock()
 	c.isInvalid = newVal
 }
 
-func (c *Copier) SetThrottler(throttler throttler.Throttler) {
+func (c *Unbuffered) SetThrottler(throttler throttler.Throttler) {
 	c.Lock()
 	defer c.Unlock()
-	c.Throttler = throttler
+	c.throttler = throttler
 }
 
-func (c *Copier) getCopyStats() (uint64, uint64, float64) {
+func (c *Unbuffered) getCopyStats() (uint64, uint64, float64) {
 	// Get progress from the chunker instead of calculating it ourselves
 	rowsProcessed, _, totalRows := c.chunker.Progress()
 
@@ -205,14 +145,14 @@ func (c *Copier) getCopyStats() (uint64, uint64, float64) {
 }
 
 // GetProgress returns the progress of the copier
-func (c *Copier) GetProgress() string {
+func (c *Unbuffered) GetProgress() string {
 	c.Lock()
 	defer c.Unlock()
 	copied, total, pct := c.getCopyStats()
 	return fmt.Sprintf("%d/%d %.2f%%", copied, total, pct)
 }
 
-func (c *Copier) GetETA() string {
+func (c *Unbuffered) GetETA() string {
 	c.Lock()
 	defer c.Unlock()
 	copiedRows, totalRows, pct := c.getCopyStats()
@@ -237,7 +177,7 @@ func (c *Copier) GetETA() string {
 	return estimate.String()
 }
 
-func (c *Copier) estimateRowsPerSecondLoop(ctx context.Context) {
+func (c *Unbuffered) estimateRowsPerSecondLoop(ctx context.Context) {
 	// We take >10 second averages because with parallel copy it bounces around a lot.
 	// Get progress from chunker since we no longer track rows locally
 	prevRowsCount, _, _ := c.chunker.Progress()
@@ -261,20 +201,7 @@ func (c *Copier) estimateRowsPerSecondLoop(ctx context.Context) {
 	}
 }
 
-// The following funcs proxy to the chunker.
-// This is done, so we don't need to export the chunker,
-// KeyAboveHighWatermark returns true if the key is above where the chunker is currently at.
-func (c *Copier) KeyAboveHighWatermark(key any) bool {
-	return c.chunker.KeyAboveHighWatermark(key)
-}
-
-// GetLowWatermark returns the low watermark of the chunker, i.e. the lowest key that has been
-// guaranteed to be written to the new table.
-func (c *Copier) GetLowWatermark() (string, error) {
-	return c.chunker.GetLowWatermark()
-}
-
-func (c *Copier) sendMetrics(ctx context.Context, processingTime time.Duration, logicalRowsCount uint64, affectedRowsCount uint64) error {
+func (c *Unbuffered) sendMetrics(ctx context.Context, processingTime time.Duration, logicalRowsCount uint64, affectedRowsCount uint64) error {
 	m := &metrics.Metrics{
 		Values: []metrics.MetricValue{
 			{
@@ -301,13 +228,13 @@ func (c *Copier) sendMetrics(ctx context.Context, processingTime time.Duration, 
 	return c.metricsSink.Send(contextWithTimeout, m)
 }
 
-// Next4Test is typically only used in integration tests that don't want to actually migrate data,
-// but need to advance the chunker.
-func (c *Copier) Next4Test() (*table.Chunk, error) {
-	return c.chunker.Next()
+// GetChunker returns the chunker for accessing progress information
+func (c *Unbuffered) GetChunker() table.Chunker {
+	return c.chunker
 }
 
-// GetChunker returns the chunker for accessing progress information
-func (c *Copier) GetChunker() table.Chunker {
-	return c.chunker
+func (c *Unbuffered) GetThrottler() throttler.Throttler {
+	c.Lock()
+	defer c.Unlock()
+	return c.throttler
 }

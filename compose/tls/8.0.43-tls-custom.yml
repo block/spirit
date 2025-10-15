@@ -1,0 +1,36 @@
+services:
+  mysql-tls-custom:
+    image: mysql:8.0.43
+    container_name: spirit-mysql-tls-custom
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: spirit_test
+      MYSQL_USER: spirit
+      MYSQL_PASSWORD: spirit
+    ports:
+      - "3308:3306"  # Different port for custom cert testing
+    volumes:
+      - mysql_tls_custom_data:/var/lib/mysql
+      - ./init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql
+      # Mount certificates to a temporary location, then copy them in entrypoint
+      - ./mysql-certs/custom-ca.pem:/tmp/certs/ca.pem:ro
+      - ./mysql-certs/custom-server-cert.pem:/tmp/certs/server-cert.pem:ro
+      - ./mysql-certs/custom-server-key.pem:/tmp/certs/server-key.pem:ro
+      - ./init-custom-certs.sh:/docker-entrypoint-initdb.d/00-init-custom-certs.sh:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --ssl=ON
+      --ssl-ca=/var/lib/mysql/ca.pem
+      --ssl-cert=/var/lib/mysql/server-cert.pem
+      --ssl-key=/var/lib/mysql/server-key.pem
+      --require-secure-transport=ON
+      --bind-address=0.0.0.0
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      timeout: 20s
+      retries: 10
+      interval: 5s
+    restart: unless-stopped
+
+volumes:
+  mysql_tls_custom_data:

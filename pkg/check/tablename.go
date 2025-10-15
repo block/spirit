@@ -14,7 +14,6 @@ const (
 	maxTableNameLength = 64
 
 	// Formats for table names
-	NameFormatSentinel     = "_%s_sentinel"
 	NameFormatCheckpoint   = "_%s_chkpnt"
 	NameFormatNew          = "_%s_new"
 	NameFormatOld          = "_%s_old"
@@ -33,7 +32,7 @@ func init() {
 	registerCheck("tablename", tableNameCheck, ScopePreflight)
 
 	// Calculate the number of extra characters needed table names with all possible formats
-	for _, format := range []string{NameFormatSentinel, NameFormatCheckpoint, NameFormatNew, NameFormatOld} {
+	for _, format := range []string{NameFormatCheckpoint, NameFormatNew, NameFormatOld} {
 		extraChars := len(strings.ReplaceAll(format, "%s", ""))
 		if extraChars > NameFormatNormalExtraChars {
 			NameFormatNormalExtraChars = extraChars

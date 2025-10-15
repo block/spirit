@@ -4,9 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/go-sql-driver/mysql"
 	"github.com/siddontang/loggers"
 )
 
@@ -15,8 +15,24 @@ func init() {
 }
 
 func versionCheck(_ context.Context, r Resources, _ loggers.Advanced) error {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/", r.Username, r.Password, r.Host)
-	db, err := dbconn.New(dsn, dbconn.NewDBConfig())
+	// Use the go-sql-driver/mysql.Config to properly escape the DSN
+	// For version check, we try to connect without specifying a database first,
+	// but if that fails due to permissions, we can still check the version
+	cfg := mysql.Config{
+		User:   r.Username,
+		Passwd: r.Password,
+		Net:    "tcp",
+		Addr:   r.Host,
+		// Don't specify DBName - connect without selecting a database
+	}
+	dsn := cfg.FormatDSN()
+
+	// Create DBConfig with TLS settings from the migration
+	dbConfig := dbconn.NewDBConfig()
+	dbConfig.TLSMode = r.TLSMode
+	dbConfig.TLSCertificatePath = r.TLSCertificatePath
+
+	db, err := dbconn.New(dsn, dbConfig)
 	if err != nil {
 		return err
 	}

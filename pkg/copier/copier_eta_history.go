@@ -1,4 +1,4 @@
-package row
+package copier
 
 import (
 	"strings"
