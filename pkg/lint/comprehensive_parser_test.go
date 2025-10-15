@@ -41,6 +41,7 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				columns := analyzer.GetColumns()
 				assert.Len(t, columns, 4)
+
 				for _, col := range columns {
 					// TiDB parser includes UNSIGNED in the type string as "type(size) UNSIGNED"
 					assert.NotNil(t, col.Unsigned)
@@ -57,13 +58,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var invisibleIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx_name" {
 						invisibleIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, invisibleIndex)
 				require.NotNil(t, invisibleIndex.Invisible)
 				assert.True(t, *invisibleIndex.Invisible)
@@ -75,13 +79,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var visibleIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx_name" {
 						visibleIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, visibleIndex)
 				// For VISIBLE indexes, Invisible should be nil or false
 				assert.True(t, visibleIndex.Invisible == nil || !*visibleIndex.Invisible)
@@ -93,13 +100,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var testIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx" {
 						testIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, testIndex)
 				// Last option should win (VISIBLE), so Invisible should be false
 				require.NotNil(t, testIndex.Invisible)
@@ -114,13 +124,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var btreeIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx" {
 						btreeIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, btreeIndex)
 				require.NotNil(t, btreeIndex.Using)
 				assert.Equal(t, "BTREE", *btreeIndex.Using)
@@ -132,13 +145,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var hashIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx" {
 						hashIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, hashIndex)
 				require.NotNil(t, hashIndex.Using)
 				assert.Equal(t, "HASH", *hashIndex.Using)
@@ -150,13 +166,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var combinedIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx" {
 						combinedIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, combinedIndex)
 				require.NotNil(t, combinedIndex.Using)
 				assert.Equal(t, "HASH", *combinedIndex.Using)
@@ -172,13 +191,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var commentIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx" {
 						commentIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, commentIndex)
 				require.NotNil(t, commentIndex.Comment)
 				assert.Equal(t, "Index comment", *commentIndex.Comment)
@@ -192,13 +214,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var kbsIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "idx" {
 						kbsIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, kbsIndex)
 				require.NotNil(t, kbsIndex.KeyBlockSize)
 				assert.Equal(t, uint64(16), *kbsIndex.KeyBlockSize)
@@ -212,13 +237,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var fulltextIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Type == "FULLTEXT" {
 						fulltextIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, fulltextIndex)
 				require.NotNil(t, fulltextIndex.ParserName)
 				assert.Equal(t, "ngram", *fulltextIndex.ParserName)
@@ -232,13 +260,16 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 			ShouldParse: true,
 			Validate: func(t *testing.T, analyzer TableSchema) {
 				indexes := analyzer.GetIndexes()
+
 				var uniqueIndex *Index
+
 				for _, idx := range indexes {
 					if idx.Name == "uk_email" {
 						uniqueIndex = &idx
 						break
 					}
 				}
+
 				require.NotNil(t, uniqueIndex)
 				assert.Equal(t, "UNIQUE", uniqueIndex.Type)
 				require.NotNil(t, uniqueIndex.Using)
@@ -369,6 +400,7 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 
 				// Validate indexes
 				indexes := analyzer.GetIndexes()
+
 				indexMap := make(map[string]Index)
 				for _, idx := range indexes {
 					indexMap[idx.Name] = idx
@@ -512,11 +544,13 @@ func BenchmarkComprehensiveParsing(b *testing.B) {
 	) ENGINE=InnoDB CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='Comprehensive benchmark table'`
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		analyzer, err := ParseCreateTable(complexSQL)
 		if err != nil {
 			b.Fatal(err)
 		}
+
 		_ = analyzer.GetColumns()
 		_ = analyzer.GetIndexes()
 		_ = analyzer.GetConstraints()
