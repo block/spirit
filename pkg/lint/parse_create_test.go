@@ -2,7 +2,6 @@ package lint
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -99,11 +98,13 @@ func TestSchemaAnalyzer_StructuredAccess(t *testing.T) {
 
 	// Test finding nullable columns using structured approach
 	var nullableColumns []Column
+
 	for _, col := range columns {
 		if col.Nullable {
 			nullableColumns = append(nullableColumns, col)
 		}
 	}
+
 	assert.GreaterOrEqual(t, len(nullableColumns), 1) // price should be nullable
 }
 
@@ -125,14 +126,18 @@ func TestSchemaAnalyzer_ComplexConstraints(t *testing.T) {
 	// Should have at least the FOREIGN KEY constraint
 	assert.GreaterOrEqual(t, len(constraints), 1)
 
+	assert.True(t, constraints.AnyForeignKeys())
+
 	// Find the foreign key constraint
 	var fkConstraint *Constraint
+
 	for i := range constraints {
 		if constraints[i].Type == "FOREIGN KEY" {
 			fkConstraint = &constraints[i]
 			break
 		}
 	}
+
 	require.NotNil(t, fkConstraint)
 	assert.Equal(t, "fk_orders_user", fkConstraint.Name)
 	assert.Contains(t, *fkConstraint.Definition, "REFERENCES users")
@@ -193,87 +198,6 @@ func TestSchemaAnalyzer_UnsignedSupport(t *testing.T) {
 	assert.Nil(t, idCol.Unsigned, "id should not have Unsigned field set")
 }
 
-// Example of how to implement custom linting rules
-func TestCustomLintingRules(t *testing.T) {
-	sql := `
-	CREATE TABLE bad_table (
-		ID INT PRIMARY KEY,
-		userName VARCHAR(50),
-		user_email VARCHAR(255),
-		CreatedAt TIMESTAMP
-	)
-	`
-
-	analyzer, err := ParseCreateTable(sql)
-	require.NoError(t, err)
-
-	// Rule 1: Check for snake_case column names
-	violations := checkSnakeCaseColumns(analyzer)
-	assert.Len(t, violations, 3) // ID, userName, CreatedAt should violate
-
-	// Rule 2: Check for missing NOT NULL on important columns
-	nullableViolations := checkRequiredNotNullColumns(analyzer, []string{"user_email"})
-	assert.Len(t, nullableViolations, 1)
-
-	// Rule 3: Check for missing indexes on foreign key-like columns
-	indexViolations := checkMissingIndexes(analyzer, []string{"user_id", "category_id"})
-	assert.Len(t, indexViolations, 0) // No FK columns in this example
-}
-
-// Example linting rule implementations
-func checkSnakeCaseColumns(analyzer TableSchema) []string {
-	var violations []string
-	columns := analyzer.GetColumns()
-
-	for _, col := range columns {
-		if !isSnakeCase(col.Name) {
-			violations = append(violations, fmt.Sprintf("Column '%s' is not in snake_case", col.Name))
-		}
-	}
-
-	return violations
-}
-
-func checkRequiredNotNullColumns(analyzer TableSchema, requiredCols []string) []string {
-	var violations []string
-	columns := analyzer.GetColumns()
-
-	for _, col := range columns {
-		for _, required := range requiredCols {
-			if col.Name == required && col.Nullable {
-				violations = append(violations, fmt.Sprintf("Column '%s' should be NOT NULL", col.Name))
-			}
-		}
-	}
-
-	return violations
-}
-
-func checkMissingIndexes(analyzer TableSchema, fkColumns []string) []string {
-	var violations []string
-	indexes := analyzer.GetIndexes()
-	columns := analyzer.GetColumns()
-
-	// Create a map of indexed columns
-	indexedCols := make(map[string]bool)
-	for _, idx := range indexes {
-		for _, col := range idx.Columns {
-			indexedCols[col] = true
-		}
-	}
-
-	// Check if FK-like columns are indexed
-	for _, col := range columns {
-		for _, fkCol := range fkColumns {
-			if col.Name == fkCol && !indexedCols[col.Name] {
-				violations = append(violations, fmt.Sprintf("Foreign key column '%s' should have an index", col.Name))
-			}
-		}
-	}
-
-	return violations
-}
-
 func TestSchemaAnalyzer_JSONSerialization(t *testing.T) {
 	sql := `
 	CREATE TABLE test_table (
@@ -291,6 +215,7 @@ func TestSchemaAnalyzer_JSONSerialization(t *testing.T) {
 	require.NoError(t, err)
 
 	var deserializedColumns []Column
+
 	err = json.Unmarshal(jsonData, &deserializedColumns)
 	require.NoError(t, err)
 
@@ -338,7 +263,7 @@ func TestSchemaAnalyzer_IndexVisibilityStructured(t *testing.T) {
 	// Test using structured access
 	createTable := analyzer.GetCreateTable()
 	indexes := createTable.Indexes
-	require.Greater(t, len(indexes), 0)
+	require.NotEmpty(t, indexes)
 
 	// Find specific indexes by name
 	emailIdx := indexes.ByName("idx_email")
@@ -366,6 +291,7 @@ func TestSchemaAnalyzer_IndexVisibilityStructured(t *testing.T) {
 
 	// Test finding all invisible indexes using structured approach
 	var invisibleIndexes []Index
+
 	for _, idx := range indexes {
 		if idx.Invisible != nil && *idx.Invisible {
 			invisibleIndexes = append(invisibleIndexes, idx)
@@ -407,11 +333,13 @@ func BenchmarkParseCreateTable(b *testing.B) {
 	`
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for range b.N {
 		analyzer, err := ParseCreateTable(sql)
 		if err != nil {
 			b.Fatal(err)
 		}
+
 		_ = analyzer.GetColumns()
 		_ = analyzer.GetIndexes()
 		_ = analyzer.GetConstraints()
@@ -561,6 +489,7 @@ func TestSchemaAnalyzer_PartitionSupport(t *testing.T) {
 			}
 
 			assert.Len(t, partition.Definitions, len(tc.expected.Definitions))
+
 			for i, expectedDef := range tc.expected.Definitions {
 				if i < len(partition.Definitions) {
 					actualDef := partition.Definitions[i]
@@ -659,6 +588,7 @@ func TestSchemaAnalyzer_EnumSetJSONSerialization(t *testing.T) {
 
 	// Deserialize and verify
 	var deserializedColumns []Column
+
 	err = json.Unmarshal(jsonData, &deserializedColumns)
 	require.NoError(t, err)
 
@@ -743,7 +673,7 @@ func Test_Sloppy(t *testing.T) {
 	firstIdx := analyzer.GetCreateTable().Indexes[0]
 	require.NotNil(t, firstIdx)
 	// Nameless indexes get an empty string as the name
-	assert.Equal(t, "", firstIdx.Name)
+	assert.Empty(t, firstIdx.Name)
 	assert.Equal(t, []string{"user_id", "customerEmail"}, firstIdx.Columns)
 	assert.Nil(t, firstIdx.Comment)
 
@@ -760,4 +690,11 @@ func Test_Sloppy(t *testing.T) {
 	// Verify enum values are captured
 	require.NotNil(t, enum.EnumValues)
 	assert.Equal(t, []string{"pending", "processing", "shipped", "delivered", "cancelled"}, enum.EnumValues)
+	assert.Equal(t, "pending", *enum.Default)
+
+	total_amount := analyzer.GetColumns().ByName("total_amount")
+	require.NotNil(t, total_amount)
+	assert.Contains(t, strings.ToLower(total_amount.Type), "decimal")
+	assert.NotNil(t, total_amount.Default)
+	assert.Equal(t, "0.00", *total_amount.Default)
 }
