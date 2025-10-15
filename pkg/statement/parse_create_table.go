@@ -66,14 +66,14 @@ type Index struct {
 
 // Constraint represents a table constraint
 type Constraint struct {
-	Raw        *ast.Constraint        `json:"-"`
-	Name       string                 `json:"name"`
-	Type       string                 `json:"type"` // CHECK, FOREIGN KEY, etc.
-	Columns    []string               `json:"columns,omitempty"`
-	Expression *string                `json:"expression,omitempty"`
-	References *ForeignKeyReference   `json:"references,omitempty"`
-	Definition *string                `json:"definition,omitempty"` // Generated definition string for compatibility
-	Options    map[string]interface{} `json:"options,omitempty"`
+	Raw        *ast.Constraint      `json:"-"`
+	Name       string               `json:"name"`
+	Type       string               `json:"type"` // CHECK, FOREIGN KEY, etc.
+	Columns    []string             `json:"columns,omitempty"`
+	Expression *string              `json:"expression,omitempty"`
+	References *ForeignKeyReference `json:"references,omitempty"`
+	Definition *string              `json:"definition,omitempty"` // Generated definition string for compatibility
+	Options    map[string]any       `json:"options,omitempty"`
 }
 
 type Indexes []Index
@@ -118,14 +118,14 @@ type PartitionDefinition struct {
 	Values        *PartitionValues         `json:"values,omitempty"` // VALUES LESS THAN or VALUES IN
 	Comment       *string                  `json:"comment,omitempty"`
 	Engine        *string                  `json:"engine,omitempty"`
-	Options       map[string]interface{}   `json:"options,omitempty"`
+	Options       map[string]any           `json:"options,omitempty"`
 	SubPartitions []SubPartitionDefinition `json:"subpartitions,omitempty"`
 }
 
 // PartitionValues represents the VALUES clause in partition definitions
 type PartitionValues struct {
-	Type   string        `json:"type"`   // "LESS_THAN", "IN", "MAXVALUE"
-	Values []interface{} `json:"values"` // The actual values
+	Type   string `json:"type"`   // "LESS_THAN", "IN", "MAXVALUE"
+	Values []any  `json:"values"` // The actual values
 }
 
 // SubPartitionOptions represents subpartitioning configuration
@@ -139,10 +139,10 @@ type SubPartitionOptions struct {
 
 // SubPartitionDefinition represents a single subpartition definition
 type SubPartitionDefinition struct {
-	Name    string                 `json:"name"`
-	Comment *string                `json:"comment,omitempty"`
-	Engine  *string                `json:"engine,omitempty"`
-	Options map[string]interface{} `json:"options,omitempty"`
+	Name    string         `json:"name"`
+	Comment *string        `json:"comment,omitempty"`
+	Engine  *string        `json:"engine,omitempty"`
+	Options map[string]any `json:"options,omitempty"`
 }
 
 // tableSchema represents a parsed CREATE TABLE statement with flexible access
@@ -243,8 +243,8 @@ func (ct *CreateTable) GetConstraints() Constraints {
 	return ct.Constraints
 }
 
-func (ct *CreateTable) GetTableOptions() map[string]interface{} {
-	options := make(map[string]interface{})
+func (ct *CreateTable) GetTableOptions() map[string]any {
+	options := make(map[string]any)
 
 	if ct.TableOptions != nil {
 		opts := ct.TableOptions
@@ -280,7 +280,7 @@ func (ct *CreateTable) GetPartition() *PartitionOptions {
 	return ct.Partition
 }
 
-func (indexes Indexes) AnyInvisible() bool {
+func (indexes Indexes) HasInvisible() bool {
 	for _, idx := range indexes {
 		if idx.Invisible != nil && *idx.Invisible {
 			return true
@@ -290,7 +290,7 @@ func (indexes Indexes) AnyInvisible() bool {
 	return false
 }
 
-func (constraints Constraints) AnyForeignKeys() bool {
+func (constraints Constraints) HasForeignKeys() bool {
 	for _, c := range constraints {
 		if c.Type == "FOREIGN KEY" {
 			return true
@@ -516,7 +516,7 @@ func (ct *CreateTable) parseConstraint(constraint *ast.Constraint) Constraint {
 		Raw:     constraint,
 		Name:    constraint.Name,
 		Columns: ct.parseIndexColumns(constraint.Keys),
-		Options: make(map[string]interface{}),
+		Options: make(map[string]any),
 	}
 
 	switch constraint.Tp {
@@ -696,7 +696,7 @@ func (ct *CreateTable) parsePartitionOptions(partition *ast.PartitionOptions) *P
 func (ct *CreateTable) parsePartitionDefinition(def *ast.PartitionDefinition) PartitionDefinition {
 	partDef := PartitionDefinition{
 		Name:          def.Name.String(),
-		Options:       make(map[string]interface{}),
+		Options:       make(map[string]any),
 		SubPartitions: make([]SubPartitionDefinition, 0, len(def.Sub)),
 	}
 
@@ -742,7 +742,7 @@ func (ct *CreateTable) parsePartitionClause(clause ast.PartitionDefinitionClause
 	case *ast.PartitionDefinitionClauseLessThan:
 		values := &PartitionValues{
 			Type:   "LESS_THAN",
-			Values: make([]interface{}, 0, len(c.Exprs)),
+			Values: make([]any, 0, len(c.Exprs)),
 		}
 		for _, expr := range c.Exprs {
 			val := ct.parseExpression(expr)
@@ -753,7 +753,7 @@ func (ct *CreateTable) parsePartitionClause(clause ast.PartitionDefinitionClause
 	case *ast.PartitionDefinitionClauseIn:
 		values := &PartitionValues{
 			Type:   "IN",
-			Values: make([]interface{}, 0, len(c.Values)),
+			Values: make([]any, 0, len(c.Values)),
 		}
 		for _, valList := range c.Values {
 			if len(valList) == 1 {
@@ -761,7 +761,7 @@ func (ct *CreateTable) parsePartitionClause(clause ast.PartitionDefinitionClause
 				values.Values = append(values.Values, val)
 			} else {
 				// Multiple values in a single clause
-				subValues := make([]interface{}, 0, len(valList))
+				subValues := make([]any, 0, len(valList))
 				for _, expr := range valList {
 					val := ct.parseExpression(expr)
 					subValues = append(subValues, val)
@@ -774,9 +774,9 @@ func (ct *CreateTable) parsePartitionClause(clause ast.PartitionDefinitionClause
 		return values
 	case *ast.PartitionDefinitionClauseHistory:
 		if c.Current {
-			return &PartitionValues{Type: "CURRENT", Values: []interface{}{}}
+			return &PartitionValues{Type: "CURRENT", Values: []any{}}
 		} else {
-			return &PartitionValues{Type: "HISTORY", Values: []interface{}{}}
+			return &PartitionValues{Type: "HISTORY", Values: []any{}}
 		}
 	default:
 		return nil
@@ -827,7 +827,7 @@ func (ct *CreateTable) parseSubPartitionOptions(sub *ast.PartitionMethod) *SubPa
 func (ct *CreateTable) parseSubPartitionDefinition(sub *ast.SubPartitionDefinition) SubPartitionDefinition {
 	subDef := SubPartitionDefinition{
 		Name:    sub.Name.String(),
-		Options: make(map[string]interface{}),
+		Options: make(map[string]any),
 	}
 
 	// Parse subpartition options
@@ -856,7 +856,7 @@ func (ct *CreateTable) parseSubPartitionDefinition(sub *ast.SubPartitionDefiniti
 }
 
 // parseExpression converts an expression to a string representation
-func (ct *CreateTable) parseExpression(expr ast.ExprNode) interface{} {
+func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
 	if expr == nil {
 		return nil
 	}
