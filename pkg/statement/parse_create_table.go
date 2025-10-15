@@ -1,5 +1,5 @@
 //nolint:noinlineerr,exhaustive
-package lint
+package statement
 
 // This file provides structured parsing of CREATE TABLE statements.
 // The CreateTable struct and related types use pointer fields for optional elements
@@ -14,19 +14,6 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/types"
 	driver "github.com/pingcap/tidb/pkg/types/parser_driver"
 )
-
-// TableSchema provides methods to interrogate the parsed schema
-type TableSchema interface {
-	GetTableName() string
-	GetColumns() Columns
-	GetIndexes() Indexes
-	GetConstraints() Constraints
-	GetTableOptions() map[string]interface{}
-	GetPartition() *PartitionOptions
-
-	// GetCreateTable returns the structured CreateTable
-	GetCreateTable() *CreateTable
-}
 
 // CreateTable represents a parsed CREATE TABLE statement with structured data
 type CreateTable struct {
@@ -179,7 +166,7 @@ type tableSchema struct {
 // Note also that this parser does not attempt to validate the SQL beyond what the
 // underlying parser does. For example, it will not check that a PRIMARY KEY column is NOT NULL,
 // or that column names are unique, or that indexed columns exist.
-func ParseCreateTable(sql string) (TableSchema, error) {
+func ParseCreateTable(sql string) (*CreateTable, error) {
 	p := parser.New()
 
 	stmts, _, err := p.Parse(sql, "", "")
@@ -196,20 +183,20 @@ func ParseCreateTable(sql string) (TableSchema, error) {
 		return nil, fmt.Errorf("expected CREATE TABLE statement, got %T", stmts[0])
 	}
 
-	schema := &CreateTable{
+	ct := &CreateTable{
 		Raw: createStmt,
 	}
 
 	// Parse into structured format
-	err = schema.parseToStruct()
+	err = ct.parseToStruct()
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse table schema: %w", err)
+		return nil, fmt.Errorf("failed to parse CREATE TABLE statement: %w", err)
 	}
 
-	return schema, nil
+	return ct, nil
 }
 
-// Implementation of TableSchema interface
+// Implementation of CreateTable interface
 
 func (ct *CreateTable) GetCreateTable() *CreateTable {
 	return ct

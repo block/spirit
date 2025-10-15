@@ -1,4 +1,4 @@
-package lint
+package statement
 
 import (
 	"encoding/json"
@@ -19,14 +19,14 @@ func TestParseCreateTable_BasicTable(t *testing.T) {
 	) ENGINE=InnoDB CHARSET=utf8mb4 COMMENT='User table'
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
 	// Test basic table info
-	assert.Equal(t, "users", analyzer.GetTableName())
+	assert.Equal(t, "users", ct.GetTableName())
 
 	// Test columns
-	columns := analyzer.GetColumns()
+	columns := ct.GetColumns()
 	assert.Len(t, columns, 4)
 
 	// Test first column (id)
@@ -45,11 +45,11 @@ func TestParseCreateTable_BasicTable(t *testing.T) {
 	assert.False(t, nameCol.Nullable)
 
 	// Test indexes (PRIMARY KEY and UNIQUE should be detected)
-	indexes := analyzer.GetIndexes()
+	indexes := ct.GetIndexes()
 	assert.GreaterOrEqual(t, len(indexes), 2) // At least PRIMARY KEY and UNIQUE
 
 	// Test table options
-	options := analyzer.GetTableOptions()
+	options := ct.GetTableOptions()
 	assert.Equal(t, "InnoDB", options["engine"])
 	assert.Equal(t, "utf8mb4", options["charset"])
 	assert.Equal(t, "User table", options["comment"])
@@ -64,11 +64,11 @@ func TestSchemaAnalyzer_StructuredAccess(t *testing.T) {
 	) ENGINE=InnoDB ROW_FORMAT=COMPRESSED
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
 	// Test direct structured access
-	createTable := analyzer.GetCreateTable()
+	createTable := ct.GetCreateTable()
 	assert.Equal(t, "products", createTable.TableName)
 
 	// Test columns access
@@ -77,7 +77,7 @@ func TestSchemaAnalyzer_StructuredAccess(t *testing.T) {
 	assert.Equal(t, "id", columns[0].Name)
 
 	// Test table options access
-	options := analyzer.GetTableOptions()
+	options := ct.GetTableOptions()
 	assert.Equal(t, "InnoDB", options["engine"])
 
 	// Test using ByName methods
@@ -118,10 +118,10 @@ func TestSchemaAnalyzer_ComplexConstraints(t *testing.T) {
 	)
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
-	constraints := analyzer.GetConstraints()
+	constraints := ct.GetConstraints()
 
 	// Should have at least the FOREIGN KEY constraint
 	assert.GreaterOrEqual(t, len(constraints), 1)
@@ -156,10 +156,10 @@ func TestSchemaAnalyzer_UnsignedSupport(t *testing.T) {
 	)
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
-	createTable := analyzer.GetCreateTable()
+	createTable := ct.GetCreateTable()
 	columns := createTable.Columns
 	require.Len(t, columns, 7)
 
@@ -206,11 +206,11 @@ func TestSchemaAnalyzer_JSONSerialization(t *testing.T) {
 	) ENGINE=InnoDB
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
 	// Test that we can serialize the structured data
-	columns := analyzer.GetColumns()
+	columns := ct.GetColumns()
 	jsonData, err := json.Marshal(columns)
 	require.NoError(t, err)
 
@@ -257,11 +257,11 @@ func TestSchemaAnalyzer_IndexVisibilityStructured(t *testing.T) {
 	)
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
 	// Test using structured access
-	createTable := analyzer.GetCreateTable()
+	createTable := ct.GetCreateTable()
 	indexes := createTable.Indexes
 	require.NotEmpty(t, indexes)
 
@@ -335,14 +335,14 @@ func BenchmarkParseCreateTable(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		analyzer, err := ParseCreateTable(sql)
+		ct, err := ParseCreateTable(sql)
 		if err != nil {
 			b.Fatal(err)
 		}
 
-		_ = analyzer.GetColumns()
-		_ = analyzer.GetIndexes()
-		_ = analyzer.GetConstraints()
+		_ = ct.GetColumns()
+		_ = ct.GetIndexes()
+		_ = ct.GetConstraints()
 	}
 }
 
@@ -466,10 +466,10 @@ func TestSchemaAnalyzer_PartitionSupport(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			analyzer, err := ParseCreateTable(tc.sql)
+			ct, err := ParseCreateTable(tc.sql)
 			require.NoError(t, err)
 
-			partition := analyzer.GetPartition()
+			partition := ct.GetPartition()
 
 			if tc.expected == nil {
 				assert.Nil(t, partition)
@@ -518,10 +518,10 @@ func TestSchemaAnalyzer_EnumAndSetSupport(t *testing.T) {
 	)
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
-	columns := analyzer.GetColumns()
+	columns := ct.GetColumns()
 	require.Len(t, columns, 6)
 
 	// Test ENUM column with default
@@ -578,11 +578,11 @@ func TestSchemaAnalyzer_EnumSetJSONSerialization(t *testing.T) {
 	)
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
 	// Test JSON serialization
-	columns := analyzer.GetColumns()
+	columns := ct.GetColumns()
 	jsonData, err := json.Marshal(columns)
 	require.NoError(t, err)
 
@@ -626,10 +626,10 @@ func TestSchemaAnalyzer_EnumSingleValue(t *testing.T) {
 	)
 	`
 
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	require.NoError(t, err)
 
-	columns := analyzer.GetColumns()
+	columns := ct.GetColumns()
 	require.Len(t, columns, 1)
 
 	statusCol := columns[0]
@@ -661,29 +661,29 @@ func Test_Sloppy(t *testing.T) {
 		CONSTRAINT fk_orders_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	) ENGINE=InnoDB CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='E-commerce order tracking table'
 	`
-	analyzer, err := ParseCreateTable(sql)
+	ct, err := ParseCreateTable(sql)
 	assert.NoError(t, err)
 
 	// This accounts for the two different primary keys and 2 different unique indexes,
 	// each given once as a column attribute and once as a table constraint.
-	assert.Len(t, analyzer.GetIndexes(), 7)
+	assert.Len(t, ct.GetIndexes(), 7)
 
 	// The "first" index should be the first one defined as a table attribute, not the PK or UNIQUE
 	// index defined as a column attribute.
-	firstIdx := analyzer.GetCreateTable().Indexes[0]
+	firstIdx := ct.GetCreateTable().Indexes[0]
 	require.NotNil(t, firstIdx)
 	// Nameless indexes get an empty string as the name
 	assert.Empty(t, firstIdx.Name)
 	assert.Equal(t, []string{"user_id", "customerEmail"}, firstIdx.Columns)
 	assert.Nil(t, firstIdx.Comment)
 
-	assert.True(t, analyzer.GetIndexes().AnyInvisible())
-	idx_created_at := analyzer.GetCreateTable().Indexes.ByName("idx_created_at")
+	assert.True(t, ct.GetIndexes().AnyInvisible())
+	idx_created_at := ct.GetCreateTable().Indexes.ByName("idx_created_at")
 	require.NotNil(t, idx_created_at)
 	require.NotNil(t, idx_created_at.Invisible)
 	assert.True(t, *idx_created_at.Invisible)
 
-	enum := analyzer.GetColumns().ByName("order_status")
+	enum := ct.GetColumns().ByName("order_status")
 	require.NotNil(t, enum)
 	assert.True(t, strings.EqualFold("ENUM", enum.Type))
 
@@ -692,7 +692,7 @@ func Test_Sloppy(t *testing.T) {
 	assert.Equal(t, []string{"pending", "processing", "shipped", "delivered", "cancelled"}, enum.EnumValues)
 	assert.Equal(t, "pending", *enum.Default)
 
-	total_amount := analyzer.GetColumns().ByName("total_amount")
+	total_amount := ct.GetColumns().ByName("total_amount")
 	require.NotNil(t, total_amount)
 	assert.Contains(t, strings.ToLower(total_amount.Type), "decimal")
 	assert.NotNil(t, total_amount.Default)
