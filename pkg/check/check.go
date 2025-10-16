@@ -44,7 +44,6 @@ type Resources struct {
 	TLSMode                  string
 	TLSCertificatePath       string
 	ExperimentalBufferedCopy bool
-	Checksum                 bool
 }
 
 type check struct {

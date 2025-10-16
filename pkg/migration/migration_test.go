@@ -56,7 +56,6 @@ func TestE2ENullAlterEmpty(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 1
-	migration.Checksum = true
 	migration.Table = "t1e2e"
 	migration.Alter = "ENGINE=InnoDB"
 
@@ -81,7 +80,6 @@ func TestMissingAlter(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 16
-	migration.Checksum = true
 	migration.Table = "t1"
 	migration.Alter = ""
 
@@ -107,7 +105,6 @@ func TestBadDatabaseCredentials(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 16
-	migration.Checksum = true
 	migration.Table = "t1"
 	migration.Alter = "ENGINE=InnoDB"
 
@@ -134,7 +131,6 @@ func TestE2ENullAlter1Row(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 16
-	migration.Checksum = true
 	migration.Table = "t1"
 	migration.Alter = "ENGINE=InnoDB"
 
@@ -163,7 +159,6 @@ func TestE2ENullAlterWithReplicas(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 16
-	migration.Checksum = true
 	migration.Table = "replicatest"
 	migration.Alter = "ENGINE=InnoDB"
 	migration.ReplicaDSN = replicaDSN
@@ -197,7 +192,6 @@ func TestRenameInMySQL80(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 16
-	migration.Checksum = true
 	migration.Table = "renamet1"
 	migration.Alter = "CHANGE name nameNew varchar(255) not null"
 
@@ -230,7 +224,6 @@ func TestUniqueOnNonUniqueData(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 16
-	migration.Checksum = true
 	migration.Table = "uniquet1"
 	migration.Alter = "ADD UNIQUE (b)"
 	err = migration.Run()
@@ -255,7 +248,6 @@ func TestGeneratedColumns(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 1
-	migration.Checksum = true
 	migration.Table = "t1generated"
 	migration.Alter = "ENGINE=InnoDB"
 
@@ -300,7 +292,6 @@ VALUES
 		Password: cfg.Passwd,
 		Database: cfg.DBName,
 		Threads:  2,
-		Checksum: true,
 		Statement: `ALTER TABLE t1stored
 MODIFY COLUMN s4 TINYINT(1)
 GENERATED ALWAYS AS (
@@ -354,7 +345,6 @@ func TestBinaryChecksum(t *testing.T) {
 		migration.Password = cfg.Passwd
 		migration.Database = cfg.DBName
 		migration.Threads = 1
-		migration.Checksum = true
 		migration.Table = "t1varbin"
 		migration.Alter = fmt.Sprintf("CHANGE b b %s not null", test.NewType) //nolint: dupword
 		err = migration.Run()
@@ -381,7 +371,6 @@ func TestConvertCharset(t *testing.T) {
 	migration.Password = cfg.Passwd
 	migration.Database = cfg.DBName
 	migration.Threads = 1
-	migration.Checksum = true
 	migration.Table = "t1charset"
 	migration.Alter = "CONVERT TO CHARACTER SET UTF8MB4"
 	err = migration.Run()
@@ -395,7 +384,6 @@ func TestConvertCharset(t *testing.T) {
 		Password: cfg.Passwd,
 		Database: cfg.DBName,
 		Threads:  1,
-		Checksum: true,
 		Table:    "t1charset",
 		Alter:    "CONVERT TO CHARACTER SET latin1",
 	}
@@ -417,7 +405,6 @@ func TestStmtWorkflow(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: table, // CREATE TABLE.
 	}
 	err = migration.Run()
@@ -429,7 +416,6 @@ func TestStmtWorkflow(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: "ALTER TABLE t1s ADD COLUMN c int", // ALTER TABLE.
 	}
 	err = migration.Run()
@@ -452,7 +438,6 @@ func TestUnparsableStatements(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: table,
 	}
 	err = migration.Run()
@@ -465,7 +450,6 @@ func TestUnparsableStatements(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: "ALTER TABLE t1parse ADD COLUMN c BLOB DEFAULT ('abc')",
 	}
 	err = migration.Run()
@@ -481,7 +465,6 @@ func TestUnparsableStatements(t *testing.T) {
 		Password: cfg.Passwd,
 		Database: cfg.DBName,
 		Threads:  1,
-		Checksum: true,
 		Table:    "t1parse",
 		Alter:    "ADD COLUMN c BLOB DEFAULT ('abc')",
 	}
@@ -495,7 +478,6 @@ func TestUnparsableStatements(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: "CREATE TRIGGER ins_sum BEFORE INSERT ON t1parse FOR EACH ROW SET @sum = @sum + NEW.b;",
 	}
 	err = migration.Run()
@@ -509,7 +491,6 @@ func TestUnparsableStatements(t *testing.T) {
 		Password: cfg.Passwd,
 		Database: cfg.DBName,
 		Threads:  1,
-		Checksum: true,
 		Table:    "t1parse",
 		Alter:    `ADD COLUMN src_col timestamp NULL DEFAULT NULL, add column new_col timestamp NULL DEFAULT(src_col)`}
 	err = migration.Run()
@@ -532,7 +513,6 @@ func TestCreateIndexIsRewritten(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: "CREATE INDEX idx ON " + cfg.DBName + ".t1createindex (b)",
 	}
 	err = migration.Run()
@@ -554,7 +534,6 @@ func TestSchemaNameIncluded(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: "ALTER TABLE test.t1schemaname ADD COLUMN c int",
 	}
 	err = migration.Run()
@@ -580,7 +559,6 @@ func TestSecondaryEngineAttribute(t *testing.T) {
 		Password:  cfg.Passwd,
 		Database:  cfg.DBName,
 		Threads:   1,
-		Checksum:  true,
 		Statement: `ALTER TABLE t1secondary ADD KEY (title) SECONDARY_ENGINE_ATTRIBUTE='{"type":"spann", "distance":"l2", "product_quantization":{"dimensions":96}}'`,
 	}
 	err = migration.Run()

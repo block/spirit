@@ -104,6 +104,10 @@ func TestThrottler(t *testing.T) {
 	assert.Equal(t, 1, count)
 }
 
+// The expected behavior of the copier is it tolerates non-unique data
+// in the destination. We require this property in order to be able to
+// resume from checkpoints, because there is always an assumption
+// we are replaying some of the previous work.
 func TestCopierUniqueDestination(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS copieruniqt1, copieruniqt2")
 	testutils.RunSQL(t, "CREATE TABLE copieruniqt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
@@ -120,29 +124,17 @@ func TestCopierUniqueDestination(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "copieruniqt2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	// if the checksum is FALSE, the unique violation will cause an error.
-	cfg := NewCopierDefaultConfig()
-	cfg.FinalChecksum = false
-	chunker, err := table.NewChunker(t1, t2, cfg.TargetChunkTime, cfg.Logger)
-	assert.NoError(t, err)
-	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
-	assert.NoError(t, err)
-	err = copier.Run(t.Context())
-	assert.Error(t, err) // fails
-	assert.ErrorContains(t, err, "Duplicate entry")
-
-	// however, if the checksum is TRUE, the unique violation will be ignored.
+	// Because of the checksum, the unique violation will be ignored.
 	// This is because it's not possible to differentiate between a resume from checkpoint
 	// causing a duplicate key, and the DDL being applied causing it.
 	t1 = table.NewTableInfo(db, "test", "copieruniqt1")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 = table.NewTableInfo(db, "test", "copieruniqt2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	chunker2, err := table.NewChunker(t1, t2, NewCopierDefaultConfig().TargetChunkTime, NewCopierDefaultConfig().Logger)
+	chunker, err := table.NewChunker(t1, t2, NewCopierDefaultConfig().TargetChunkTime, NewCopierDefaultConfig().Logger)
 	assert.NoError(t, err)
-	require.NoError(t, chunker2.Open())
-	copier, err = NewCopier(db, chunker2, NewCopierDefaultConfig())
+	require.NoError(t, chunker.Open())
+	copier, err := NewCopier(db, chunker, NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	assert.NoError(t, copier.Run(t.Context())) // works
 	require.Equal(t, 0, db.Stats().InUse)      // no connections in use.

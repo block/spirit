@@ -23,7 +23,6 @@ type Unbuffered struct {
 	db               *sql.DB
 	chunker          table.Chunker
 	concurrency      int
-	finalChecksum    bool
 	rowsPerSecond    uint64
 	isInvalid        bool
 	startTime        time.Time
@@ -54,7 +53,7 @@ func (c *Unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	c.logger.Debugf("running chunk: %s, query: %s", chunk.String(), query)
 	var affectedRows int64
 	var err error
-	if affectedRows, err = dbconn.RetryableTransaction(ctx, c.db, c.finalChecksum, c.dbConfig, query); err != nil {
+	if affectedRows, err = dbconn.RetryableTransaction(ctx, c.db, true, c.dbConfig, query); err != nil {
 		return err
 	}
 	// Send feedback which can be used by the chunker

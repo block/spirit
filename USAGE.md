@@ -7,7 +7,6 @@
   - [Getting Started](#getting-started)
   - [Configuration](#configuration)
     - [alter](#alter)
-    - [checksum](#checksum)
     - [database](#database)
     - [defer-cutover](#defer-cutover)
     - [force-kill](#force-kill)
@@ -51,23 +50,6 @@ go build
 The alter table command to perform. The default value is a _null alter table_, which can be useful for testing.
 
 See also: `--statement`.
-
-### checksum
-
-- Type: Boolean
-- Default value: TRUE
-
-When set to `TRUE`, Spirit will perform a checksum of the data in the table after the copy phase. This is a good way to ensure that the copy phase was successful, but it does add some overhead to the process. When you resume-from-checkpoint, Spirit will only run with the checksum enabled (regardless of your configuration). This is because it can not rely on duplicate-key errors to detect issues in the copy phase if the DDL included adding a new `UNIQUE` key.
-
-The checksum typically adds about 10-20% of additional time to the migration, but it is recommended to always leave it enabled. A failed checksum means that there is either:
-
-- A bug in Spirit
-- A bug in MySQL
-- Hardware errors
-
-Checksum failure is not fatal. Spirit will re-copy chunks that fail checksums automatically during the checksum process, and then re-run the checksum. If the checksum completes without error on a subsequent run then the entire checksum operation is successful. Three successive attempts to checksum where differences were found will result in Spirit exiting with an error.
-
-In testing, the checksum feature has identified corruption issues on desktops with non ECC memory. You may believe that this is what the InnoDB page checksums are for, but they are more specifically for detecting corruption introduced from the IO layer. Memory based corruption is not detected and remains common.
 
 ### database
 
