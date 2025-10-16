@@ -80,12 +80,12 @@ This table does [include some secondary indexes](https://github.com/square/finch
 
 For a non-idle table, the performance delta is even greater. Consider the following microbench performed on a m1 mac with 10 cores and MySQL 8.0.31 using defaults:
 
-| Table/Scenario                               | Gh-ost   | spirit  | spirit (checksum disabled) |
-| -------------------------------------------- | -------- | ------- | -------------------------- |
-| finch.balances (800MB/1M rows), idle load    | 28.720s  | 11.197s | 9.278s                     |
-| finch.balances (800MB/1M rows), during bench | 2:50m+   | ~15-18s | ~15-18s                    |
+| Table/Scenario                               | Gh-ost   | spirit  |
+| -------------------------------------------- | -------- | ------- |
+| finch.balances (800MB/1M rows), idle load    | 28.720s  | 11.197s |
+| finch.balances (800MB/1M rows), during bench | 2:50m+   | ~15-18s |
 
-This scenario is kind of a worse case for gh-ost since it prioritizes replication over row-copying and the benchmark never lets up. The checksum feature is not present in gh-ost, and adds about 10-20% to migration time. We typically do not recommend disabling it.
+This scenario is kind of a worse case for gh-ost since it prioritizes replication over row-copying and the benchmark never lets up. The spirit time also includes a checksum.
 
 ## Unsupported Features
 
@@ -119,7 +119,7 @@ GRANT SELECT on performance_schema.replication_applier_status_by_worker, perform
 
 ## Risks and Limitations
 
-Writing a new data migration tool is scary, since bugs have real consequences (data loss).
+Writing a new data migration tool is scary, since bugs have real consequences (data loss). Spirit performs a checksum operation at the end of each schema change to detect potential bugs, and refuses to cutover if there are issues.
 
 We have also tried to balance making Spirit _as fast as possible_ while still being safe to run on production systems that are running existing workloads. Sometimes this means spirit might venture into creating slow downs in application performance. If it does, please file an issue and help us make improvements.
 

@@ -228,13 +228,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Force enable the checksum if it's an ADD UNIQUE INDEX operation
-	// https://github.com/block/spirit/issues/266
-	if !r.migration.Checksum && r.addsUniqueIndex() {
-		r.logger.Warn("force enabling checksum")
-		r.migration.Checksum = true
-	}
-
 	// Run post-setup checks
 	if err := r.runChecks(ctx, check.ScopePostSetup); err != nil {
 		return err
@@ -269,7 +262,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 	// Perform steps to prepare for final cutover.
-	// This includes computing an optional checksum,
+	// This includes computing a checksum,
 	// catching up on replClient apply, running ANALYZE TABLE so
 	// that the statistics will be up-to-date on cutover.
 	if err := r.prepareForCutover(ctx); err != nil {
@@ -385,18 +378,10 @@ func (r *Runner) prepareForCutover(ctx context.Context) error {
 		change.table.DisableAutoUpdateStatistics.Store(true)
 	}
 
-	// The checksum is (usually) optional, but it is ONLINE after an initial lock
+	// The checksum is ONLINE after an initial lock
 	// for consistency. It is the main way that we determine that
-	// this program is safe to use even when immature. In the event that it is
-	// a resume-from-checkpoint operation, the checksum is NOT optional.
-	// This is because adding a unique index can not be differentiated from a
-	// duplicate key error caused by retrying partial work.
-	if r.migration.Checksum {
-		if err := r.checksum(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
+	// this program is safe to use even when immature.
+	return r.checksum(ctx)
 }
 
 // runChecks wraps around check.RunChecks and adds the context of this migration
@@ -421,7 +406,6 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			TLSCertificatePath:       r.migration.TLSCertificatePath,
 			SkipDropAfterCutover:     r.migration.SkipDropAfterCutover,
 			ExperimentalBufferedCopy: r.migration.EnableExperimentalBufferedCopy,
-			Checksum:                 r.migration.Checksum,
 		}, r.logger, scope); err != nil {
 			return err
 		}
@@ -451,7 +435,6 @@ func (r *Runner) setupCopierAndReplClient(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.db, r.copyChunker, &copier.CopierConfig{
 		Concurrency:                   r.migration.Threads,
 		TargetChunkTime:               r.migration.TargetChunkTime,
-		FinalChecksum:                 r.migration.Checksum,
 		Throttler:                     &throttler.Noop{},
 		Logger:                        r.logger,
 		MetricsSink:                   r.metricsSink,
@@ -794,15 +777,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 			return err
 		}
 	}
-
-	// In resume-from-checkpoint we need to ignore duplicate key errors when
-	// applying copy-rows because we will partially re-apply some rows.
-	// The problem with this is, we can't tell if it's not a re-apply but a new
-	// row that's a duplicate and violating a new UNIQUE constraint we are trying
-	// to add. The only way we can reconcile this fact is to make sure that
-	// we checksum the table at the end. Thus, resume-from-checkpoint MUST
-	// have the checksum enabled to apply all changes safely.
-	r.migration.Checksum = true
 
 	// Initialize the chunker now that we have the new table info
 	if err := r.initCopierChunker(); err != nil {
