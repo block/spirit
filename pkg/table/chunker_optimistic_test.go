@@ -115,10 +115,19 @@ func TestLowWatermark(t *testing.T) {
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false}}", watermark)
 
+	// Check key w.r.t. watermark
+	assert.False(t, chunker.KeyAboveHighWatermark(1000))
+	assert.True(t, chunker.KeyAboveHighWatermark(1001))
+	assert.True(t, chunker.KeyBelowLowWatermark(1000)) // 1000 is done, so this is below.
+	assert.False(t, chunker.KeyBelowLowWatermark(1001))
+
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`id` >= 1001 AND `id` < 2001", chunk.String()) // first chunk
+	// Check KeyBelowLowWatermark before and after feedback.
+	assert.False(t, chunker.KeyBelowLowWatermark(1001))
 	chunker.Feedback(chunk, time.Second, 1)
+	assert.True(t, chunker.KeyBelowLowWatermark(1001))
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
@@ -126,14 +135,17 @@ func TestLowWatermark(t *testing.T) {
 	chunkAsync1, err := chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`id` >= 2001 AND `id` < 3001", chunkAsync1.String())
+	assert.False(t, chunker.KeyBelowLowWatermark(2001))
 
 	chunkAsync2, err := chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`id` >= 3001 AND `id` < 4001", chunkAsync2.String())
+	assert.False(t, chunker.KeyBelowLowWatermark(2001))
 
 	chunkAsync3, err := chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`id` >= 4001 AND `id` < 5001", chunkAsync3.String())
+	assert.False(t, chunker.KeyBelowLowWatermark(2001))
 
 	chunker.Feedback(chunkAsync2, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
@@ -144,11 +156,14 @@ func TestLowWatermark(t *testing.T) {
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	assert.False(t, chunker.KeyBelowLowWatermark(2001))
 
 	chunker.Feedback(chunkAsync1, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	assert.NoError(t, err)
 	assert.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermark)
+	assert.True(t, chunker.KeyBelowLowWatermark(2001))
+	assert.True(t, chunker.KeyBelowLowWatermark(5000))
 
 	chunk, err = chunker.Next()
 	assert.NoError(t, err)

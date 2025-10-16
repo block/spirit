@@ -54,7 +54,7 @@ func TestHashAndUnhashKey(t *testing.T) {
 	key := []any{"1234", "ACDC", "12"}
 	hashed := HashKey(key)
 	assert.Equal(t, "1234-#-ACDC-#-12", hashed)
-	unhashed := UnhashKey(hashed)
+	unhashed := UnhashKeyToString(hashed)
 	// unhashed returns as a string, not the original any
 	assert.Equal(t, "('1234','ACDC','12')", unhashed)
 
@@ -62,7 +62,7 @@ func TestHashAndUnhashKey(t *testing.T) {
 	key = []any{"1234"}
 	hashed = HashKey(key)
 	assert.Equal(t, "1234", hashed)
-	unhashed = UnhashKey(hashed)
+	unhashed = UnhashKeyToString(hashed)
 	assert.Equal(t, "'1234'", unhashed)
 }
 

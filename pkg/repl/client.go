@@ -148,7 +148,7 @@ func NewClientDefaultConfig() *ClientConfig {
 
 // AddSubscription adds a new subscription.
 // Returns an error if a subscription already exists for the given table.
-func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, keyAboveCopierCallback func(any) bool) error {
+func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, chunker table.Chunker) error {
 	c.Lock()
 	defer c.Unlock()
 
@@ -161,32 +161,32 @@ func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, keyAbo
 	// But will fall back to deltaQueue if the PK is not memory comparable.
 	if err := currentTable.PrimaryKeyIsMemoryComparable(); err != nil {
 		c.subscriptions[subKey] = &deltaQueue{
-			table:                  currentTable,
-			newTable:               newTable,
-			changes:                make([]queuedChange, 0),
-			c:                      c,
-			keyAboveCopierCallback: keyAboveCopierCallback,
+			table:    currentTable,
+			newTable: newTable,
+			changes:  make([]queuedChange, 0),
+			c:        c,
+			chunker:  chunker,
 		}
 		return nil
 	}
 	if c.useExperimentalBufferedMap {
 		c.logger.Infof("Using experimental buffered map for table %s.%s", currentTable.SchemaName, currentTable.TableName)
 		c.subscriptions[subKey] = &bufferedMap{
-			table:                  currentTable,
-			newTable:               newTable,
-			changes:                make(map[string]logicalRow),
-			c:                      c,
-			keyAboveCopierCallback: keyAboveCopierCallback,
+			table:    currentTable,
+			newTable: newTable,
+			changes:  make(map[string]logicalRow),
+			c:        c,
+			chunker:  chunker,
 		}
 		return nil
 	}
 	// Default case is delta map
 	c.subscriptions[subKey] = &deltaMap{
-		table:                  currentTable,
-		newTable:               newTable,
-		changes:                make(map[string]bool),
-		c:                      c,
-		keyAboveCopierCallback: keyAboveCopierCallback,
+		table:    currentTable,
+		newTable: newTable,
+		changes:  make(map[string]bool),
+		c:        c,
+		chunker:  chunker,
 	}
 	return nil
 }
@@ -594,14 +594,32 @@ func (c *Client) flush(ctx context.Context, underLock bool, lock *dbconn.TableLo
 	c.Lock()
 	newFlushedPos := c.bufferedPos
 	c.Unlock()
-
+	var allChangesFlushed = true
 	for _, subscription := range c.subscriptions {
-		if err := subscription.Flush(ctx, underLock, lock); err != nil {
+		flushed, err := subscription.Flush(ctx, underLock, lock)
+		if err != nil {
 			return err
 		}
+		if !flushed {
+			allChangesFlushed = false
+		}
 	}
-	// Update the position that has been flushed.
-	c.SetFlushedPos(newFlushedPos)
+	// If there is a scenario where a key couldn't be flushed because it wasn't
+	// below the watermark, then we need to skip advancing the checkpoint.
+	// TODO: This could lead to a starvation issue under contention where
+	// the checkpoint never advances. The longterm fix for this is that we
+	// would need to track the minimum binlog position that applies to a key.
+	// We could then advance up to just below the lowest key that couldn't be flushed.
+	// This is a little bit complicated, so for now we just accept that in some
+	// high contention scenarios the binlog position in the checkpoint
+	// won't advance.
+	// Another potential fix is that we disable the belowLowWatermark optimization
+	// for these high contention cases. But that's not a great solution either,
+	// because the low watermark optimization helps a lot in these cases because
+	// it reduces contention between the copier and the repl applier.
+	if allChangesFlushed {
+		c.SetFlushedPos(newFlushedPos)
+	}
 	return nil
 }
 

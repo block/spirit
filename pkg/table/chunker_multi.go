@@ -159,8 +159,14 @@ func (m *multiChunker) Feedback(chunk *Chunk, duration time.Duration, actualRows
 // KeyAboveHighWatermark currently not supported for multi-chunker
 // The interface would need to be changed to accept (table, key) to route properly
 // We work around this by using the child chunkers in repl.AddSubscription() directly.
-func (m *multiChunker) KeyAboveHighWatermark(key any) bool {
+func (m *multiChunker) KeyAboveHighWatermark(_ any) bool {
 	return false
+}
+
+// KeyBelowLowWatermark currently not supported for multi-chunker
+// We need to return true so callers don't block flushing.
+func (m *multiChunker) KeyBelowLowWatermark(_ any) bool {
+	return true
 }
 
 // Progress returns aggregate progress across all chunkers

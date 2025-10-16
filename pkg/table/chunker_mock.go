@@ -216,8 +216,61 @@ func (m *MockChunker) Feedback(chunk *Chunk, duration time.Duration, actualRows 
 	})
 }
 
+// KeyAboveHighWatermark returns true if the given key is above the current watermark
+// It returns FALSE in cases that are difficult to determine (e.g. non-numeric keys)
 func (m *MockChunker) KeyAboveHighWatermark(key any) bool {
-	return false // Not implemented for mock
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Convert key to uint64 for comparison
+	var keyPos uint64
+	switch v := key.(type) {
+	case int:
+		keyPos = uint64(v)
+	case uint64:
+		keyPos = v
+	case int64:
+		keyPos = uint64(v)
+	default:
+		// For non-numeric keys, return false (always process)
+		return false
+	}
+
+	// Key is above high watermark if it's greater than current position
+	return keyPos > m.currentPosition
+}
+
+// KeyBelowLowWatermark returns true if the given key is below the current low watermark
+// It returns TRUE in cases that are difficult to determine (e.g. non-numeric keys)
+func (m *MockChunker) KeyBelowLowWatermark(key any) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// For string keys (hashed keys), we need to handle differently
+	// Since we can't easily convert hash back to position, return true
+	// to allow processing (this matches the behavior of other chunkers
+	// that return true to not block flushing when not supported)
+	if _, ok := key.(string); ok {
+		return true
+	}
+
+	// Convert key to uint64 for comparison
+	var keyPos uint64
+	switch v := key.(type) {
+	case int:
+		keyPos = uint64(v)
+	case uint64:
+		keyPos = v
+	case int64:
+		keyPos = uint64(v)
+	default:
+		// For non-numeric keys, return true (allow processing)
+		return true
+	}
+
+	// Key is below low watermark if it's less than current position
+	// This means the copier has already passed this key
+	return keyPos < m.currentPosition
 }
 
 func (m *MockChunker) Progress() (uint64, uint64, uint64) {

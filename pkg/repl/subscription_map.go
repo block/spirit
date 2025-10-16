@@ -24,7 +24,7 @@ type deltaMap struct {
 	changes map[string]bool // delta map, for memory comparable PKs
 
 	enableKeyAboveWatermark bool
-	keyAboveCopierCallback  func(any) bool
+	chunker                 table.Chunker
 }
 
 // Assert that deltaMap implements subscription
@@ -49,7 +49,7 @@ func (s *deltaMap) HasChanged(key, _ []any, deleted bool) {
 	// We enable it once all the setup has been done (since we create a repl client
 	// earlier in setup to ensure binary logs are available).
 	// We then disable the optimization after the copier phase has finished.
-	if s.keyAboveWatermarkEnabled() && s.keyAboveCopierCallback(key[0]) {
+	if s.keyAboveWatermarkEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
 		s.c.logger.Debugf("key above watermark: %v", key[0])
 		return
 	}
@@ -89,21 +89,31 @@ func (s *deltaMap) createReplaceStmt(replaceKeys []string) statement {
 	}
 }
 
-// Flush writes changes to the new table.
-// If underLock is true, then it uses the provided lock to execute
-// the statements under a table lock. This is used for the final flush
-// to ensure no changes are missed.
-func (s *deltaMap) Flush(ctx context.Context, underLock bool, lock *dbconn.TableLock) error {
+// Flush writes the pending changes to the new table.
+// We do this under a mutex, which means that unfortunately pending changes
+// are blocked from being collected while we do this. In future we may
+// come up with a more sophisticated approach to allow concurrent
+// collection of changes while we flush.
+func (s *deltaMap) Flush(ctx context.Context, underLock bool, lock *dbconn.TableLock) (allChangesFlushed bool, err error) {
 	s.Lock()
 	defer s.Unlock()
 
 	var deleteKeys []string
 	var replaceKeys []string
 	var stmts []statement
+	var keysFlushed []string // keys we need to remove from the map at the end.
 	var i int64
+	allChangesFlushed = true // assume all changes are flushed unless we find some that are not.
 	target := atomic.LoadInt64(&s.c.targetBatchSize)
 	for key, isDelete := range s.changes {
+		unhashedKey := utils.UnhashKey(key)
+		if s.chunker != nil && !s.chunker.KeyBelowLowWatermark(unhashedKey[0]) {
+			s.c.logger.Debugf("key below watermark: %v", unhashedKey[0])
+			allChangesFlushed = false
+			continue
+		}
 		i++
+		keysFlushed = append(keysFlushed, key) // we are going to flush this key either way.
 		if isDelete {
 			deleteKeys = append(deleteKeys, key)
 		} else {
@@ -124,7 +134,7 @@ func (s *deltaMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Table
 		// We need to use the lock connection to do this
 		// so there is no parallelism.
 		if err := lock.ExecUnderLock(ctx, extractStmt(stmts)...); err != nil {
-			return err
+			return false, err
 		}
 	} else {
 		// Execute the statements in parallel
@@ -144,20 +154,21 @@ func (s *deltaMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Table
 		}
 		// wait for all work to finish
 		if err := g.Wait(); err != nil {
-			return err
+			return false, err
 		}
 	}
-	// If it's successful, we can clear the map
-	// and return to release the mutex for new changes
-	// to start accumulating again.
-	s.changes = make(map[string]bool)
-	return nil
+	// The statements have been executed successfully.
+	// We can now remove the flushed keys from the map.
+	for _, key := range keysFlushed {
+		delete(s.changes, key)
+	}
+	return allChangesFlushed, nil
 }
 
 // keyAboveWatermarkEnabled returns true if the KeyAboveWatermark optimization
 // is enabled. This is already called under a mutex.
 func (s *deltaMap) keyAboveWatermarkEnabled() bool {
-	return s.enableKeyAboveWatermark && s.keyAboveCopierCallback != nil
+	return s.enableKeyAboveWatermark && s.chunker != nil
 }
 
 func (s *deltaMap) SetKeyAboveWatermarkOptimization(enabled bool) {

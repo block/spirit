@@ -31,7 +31,7 @@ type bufferedMap struct {
 	changes map[string]logicalRow
 
 	enableKeyAboveWatermark bool
-	keyAboveCopierCallback  func(any) bool
+	chunker                 table.Chunker
 }
 
 // logicalRow represents the current state of a row in the subscription buffer.
@@ -65,7 +65,7 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 	// We enable it once all the setup has been done (since we create a repl client
 	// earlier in setup to ensure binary logs are available).
 	// We then disable the optimization after the copier phase has finished.
-	if s.keyAboveWatermarkEnabled() && s.keyAboveCopierCallback(key[0]) {
+	if s.keyAboveWatermarkEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
 		s.c.logger.Debugf("key above watermark: %v", key[0])
 		return
 	}
@@ -174,11 +174,12 @@ func (s *bufferedMap) createUpsertStmt(insertRows []logicalRow) (statement, erro
 	}, nil
 }
 
-// Flush writes changes to the new table.
-// If underLock is true, then it uses the provided lock to execute
-// the statements under a table lock. This is used for the final flush
-// to ensure no changes are missed.
-func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.TableLock) error {
+// Flush writes the pending changes to the new table.
+// We do this under a mutex, which means that unfortunately pending changes
+// are blocked from being collected while we do this. In future we may
+// come up with a more sophisticated approach to allow concurrent
+// collection of changes while we flush.
+func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.TableLock) (allChangesFlushed bool, err error) {
 	s.Lock()
 	defer s.Unlock()
 
@@ -186,10 +187,19 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 	var deleteKeys []string
 	var upsertRows []logicalRow
 	var stmts []statement
+	var keysFlushed []string
 	var i int64
+	allChangesFlushed = true // assume all changes are flushed unless we find some that are not.
 	target := atomic.LoadInt64(&s.c.targetBatchSize)
 	for key, logicalRow := range s.changes {
+		unhashedKey := utils.UnhashKey(key)
+		if s.chunker != nil && s.chunker.KeyBelowLowWatermark(unhashedKey[0]) {
+			s.c.logger.Debugf("key below watermark: %v", unhashedKey[0])
+			allChangesFlushed = false
+			continue
+		}
 		i++
+		keysFlushed = append(keysFlushed, key) // we are going to flush this key
 		if logicalRow.isDeleted {
 			deleteKeys = append(deleteKeys, key)
 		} else {
@@ -198,11 +208,11 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 		if (i % target) == 0 {
 			deleteStmts, err := s.createDeleteStmt(deleteKeys)
 			if err != nil {
-				return err
+				return false, err
 			}
 			upsertStmts, err := s.createUpsertStmt(upsertRows)
 			if err != nil {
-				return err
+				return false, err
 			}
 			stmts = append(stmts, deleteStmts)
 			stmts = append(stmts, upsertStmts)
@@ -212,11 +222,11 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 	}
 	deleteStmts, err := s.createDeleteStmt(deleteKeys)
 	if err != nil {
-		return err
+		return false, err
 	}
 	upsertStmts, err := s.createUpsertStmt(upsertRows)
 	if err != nil {
-		return err
+		return false, err
 	}
 	stmts = append(stmts, deleteStmts)
 	stmts = append(stmts, upsertStmts)
@@ -226,7 +236,7 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 		// We need to use the lock connection to do this
 		// so there is no parallelism.
 		if err := lock.ExecUnderLock(ctx, extractStmt(stmts)...); err != nil {
-			return err
+			return false, err
 		}
 	} else {
 		// Execute the statements in parallel
@@ -246,20 +256,21 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 		}
 		// wait for all work to finish
 		if err := g.Wait(); err != nil {
-			return err
+			return false, err
 		}
 	}
-	// If it's successful, we can clear the map
-	// and return to release the mutex for new changes
-	// to start accumulating again.
-	s.changes = make(map[string]logicalRow)
-	return nil
+	// The statements have been executed successfully.
+	// We can now remove the flushed keys from the map.
+	for _, key := range keysFlushed {
+		delete(s.changes, key)
+	}
+	return allChangesFlushed, nil
 }
 
 // keyAboveWatermarkEnabled returns true if the KeyAboveWatermark optimization
 // is enabled. This is already called under a mutex.
 func (s *bufferedMap) keyAboveWatermarkEnabled() bool {
-	return s.enableKeyAboveWatermark && s.keyAboveCopierCallback != nil
+	return s.enableKeyAboveWatermark && s.chunker != nil
 }
 
 func (s *bufferedMap) SetKeyAboveWatermarkOptimization(enabled bool) {
