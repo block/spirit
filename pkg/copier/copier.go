@@ -45,6 +45,7 @@ type CopierConfig struct {
 	MetricsSink                   metrics.Sink
 	DBConfig                      *dbconn.DBConfig
 	UseExperimentalBufferedCopier bool
+	WriteDB                       *sql.DB // for move command
 }
 
 // NewCopierDefaultConfig returns a default config for the copier.
@@ -70,6 +71,9 @@ func NewCopier(db *sql.DB, chunker table.Chunker, config *CopierConfig) (Copier,
 	if config.DBConfig == nil {
 		return nil, errors.New("dbConfig must be non-nil")
 	}
+	if config.WriteDB == nil {
+		config.WriteDB = db
+	}
 	if config.UseExperimentalBufferedCopier {
 		return &buffered{
 			db:               db,
@@ -80,6 +84,7 @@ func NewCopier(db *sql.DB, chunker table.Chunker, config *CopierConfig) (Copier,
 			metricsSink:      config.MetricsSink,
 			dbConfig:         config.DBConfig,
 			copierEtaHistory: newcopierEtaHistory(),
+			writeDB:          config.WriteDB,
 		}, nil
 	}
 	return &Unbuffered{

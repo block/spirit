@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pingcap/tidb/pkg/parser/mysql"
-
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 )
 
@@ -23,15 +22,14 @@ type AbstractStatement struct {
 }
 
 var (
-	ErrNotSupportedStatement           = errors.New("not a supported statement type")
-	ErrNotAlterTable                   = errors.New("not an ALTER TABLE statement")
-	ErrMultipleSchemas                 = errors.New("statement attempts to modify tables across multiple schemas")
-	ErrNoStatements                    = errors.New("could not find any compatible statements to execute")
-	ErrMixMatchMultiStatements         = errors.New("when performing atomic schema changes, all statements must be of type ALTER TABLE")
-	ErrUnsafeForInplace                = errors.New("statement contains operations that are not safe for INPLACE algorithm")
-	ErrMultipleAlterClauses            = errors.New("ALTER contains multiple clauses. Combinations of INSTANT and INPLACE operations cannot be detected safely. Consider executing these as separate ALTER statements")
-	ErrAlterContainsUnique             = errors.New("ALTER contains adding a unique index")
-	ErrVisibilityMixedWithOtherChanges = errors.New("the ALTER operation contains a change to index visibility mixed with table-rebuilding operations. This creates semantic issues for experiments. Please split the ALTER statement into separate statements for changing the invisible index and other operations")
+	ErrNotSupportedStatement   = errors.New("not a supported statement type")
+	ErrNotAlterTable           = errors.New("not an ALTER TABLE statement")
+	ErrMultipleSchemas         = errors.New("statement attempts to modify tables across multiple schemas")
+	ErrNoStatements            = errors.New("could not find any compatible statements to execute")
+	ErrMixMatchMultiStatements = errors.New("when performing atomic schema changes, all statements must be of type ALTER TABLE")
+	ErrUnsafeForInplace        = errors.New("statement contains operations that are not safe for INPLACE algorithm")
+	ErrMultipleAlterClauses    = errors.New("ALTER contains multiple clauses. Combinations of INSTANT and INPLACE operations cannot be detected safely. Consider executing these as separate ALTER statements")
+	ErrAlterContainsUnique     = errors.New("ALTER contains adding a unique index")
 )
 
 func New(statement string) ([]*AbstractStatement, error) {
@@ -233,52 +231,6 @@ func (a *AbstractStatement) AlterContainsAddUnique() error {
 			return ErrAlterContainsUnique
 		}
 	}
-	return nil
-}
-
-// AlterContainsIndexVisibility checks to see if there are any clauses of an ALTER to change index visibility.
-// It now allows index visibility changes when mixed with other metadata-only operations,
-// but blocks them when mixed with table-rebuilding operations to avoid semantic issues.
-func (a *AbstractStatement) AlterContainsIndexVisibility() error {
-	alterStmt, ok := (*a.StmtNode).(*ast.AlterTableStmt)
-	if !ok {
-		return ErrNotAlterTable
-	}
-
-	hasIndexVisibility := false
-	hasNonMetadataOperation := false
-
-	for _, spec := range alterStmt.Specs {
-		switch spec.Tp {
-		case ast.AlterTableIndexInvisible:
-			hasIndexVisibility = true
-		case ast.AlterTableDropIndex,
-			ast.AlterTableRenameIndex,
-			ast.AlterTableDropPartition,
-			ast.AlterTableTruncatePartition,
-			ast.AlterTableAddPartitions,
-			ast.AlterTableAlterColumn:
-			// These are metadata-only operations - safe to mix with index visibility
-			continue
-		case ast.AlterTableModifyColumn, ast.AlterTableChangeColumn:
-			// Only safe if changing length of a VARCHAR column
-			if spec.NewColumns[0].Tp != nil && spec.NewColumns[0].Tp.GetType() == mysql.TypeVarchar {
-				continue
-			}
-			hasNonMetadataOperation = true
-		case ast.AlterTableAddConstraint: // ADD INDEX operations are table-rebuilding
-			hasNonMetadataOperation = true
-		default:
-			// All other operations are considered non-metadata (table rebuilding)
-			hasNonMetadataOperation = true
-		}
-	}
-
-	// Only fail if index visibility is mixed with non-metadata operations
-	if hasIndexVisibility && hasNonMetadataOperation {
-		return ErrVisibilityMixedWithOtherChanges
-	}
-
 	return nil
 }
 

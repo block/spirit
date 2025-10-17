@@ -10,9 +10,9 @@ import (
 
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/format"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/parser/types"
-	driver "github.com/pingcap/tidb/pkg/types/parser_driver"
 )
 
 // CreateTable represents a parsed CREATE TABLE statement with structured data
@@ -664,10 +664,14 @@ func (ct *CreateTable) parsePartitionOptions(partition *ast.PartitionOptions) *P
 
 	// Parse expression for HASH and RANGE
 	if partition.Expr != nil {
-		expr := ct.parseExpression(partition.Expr)
-		if exprStr, ok := expr.(string); ok && exprStr != "" {
-			partOpts.Expression = &exprStr
+		// Check if it's a function call first
+		if funcExpr, ok := partition.Expr.(*ast.FuncCallExpr); ok {
+			// For function calls, use the function name as the expression
+			funcName := funcExpr.FnName.L
+			partOpts.Expression = &funcName
 		}
+		// For simple column references in HASH/KEY partitions, we don't set Expression
+		// The column reference is implicit in the partition type
 	}
 
 	// Parse column names for KEY, RANGE COLUMNS, LIST COLUMNS
@@ -863,14 +867,23 @@ func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
 
 	// Handle different expression types
 	switch e := expr.(type) {
-	case *driver.ValueExpr:
-		return e.GetValue()
 	case *ast.FuncCallExpr:
 		// Handle function calls like CURRENT_TIMESTAMP
 		return e.FnName.L
 	default:
 		// For other types, fall back to text representation
-		return expr.Text()
+		var sb strings.Builder
+		sb.Reset()
+		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags|format.RestoreStringWithoutCharset, &sb)
+		if err := expr.Restore(rCtx); err != nil {
+			return "<error>"
+		}
+		str := sb.String()
+		// if the string is quoted, remove quotes
+		if strings.HasPrefix(str, "'") && strings.HasSuffix(str, "'") {
+			str = str[1 : len(str)-1]
+		}
+		return str
 	}
 }
 

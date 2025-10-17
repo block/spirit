@@ -28,6 +28,7 @@ type Checker struct {
 	concurrency      int
 	feed             *repl.Client
 	db               *sql.DB
+	writeDB          *sql.DB
 	trxPool          *dbconn.TrxPool
 	isInvalid        bool
 	chunker          table.Chunker
@@ -46,7 +47,8 @@ type CheckerConfig struct {
 	DBConfig        *dbconn.DBConfig
 	Logger          loggers.Advanced
 	FixDifferences  bool
-	Watermark       string // optional; defines a watermark to start from
+	Watermark       string  // optional; defines a watermark to start from
+	WriteDB         *sql.DB // optional; use a different DB for the "new" side.
 }
 
 func NewCheckerDefaultConfig() *CheckerConfig {
@@ -70,6 +72,9 @@ func NewChecker(db *sql.DB, chunker table.Chunker, feed *repl.Client, config *Ch
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig()
 	}
+	if config.WriteDB != nil && config.FixDifferences {
+		return nil, errors.New("fix differences not yet supported when using a different WriteDB")
+	}
 	checksum := &Checker{
 		concurrency:    config.Concurrency,
 		db:             db,
@@ -78,6 +83,7 @@ func NewChecker(db *sql.DB, chunker table.Chunker, feed *repl.Client, config *Ch
 		dbConfig:       config.DBConfig,
 		logger:         config.Logger,
 		fixDifferences: config.FixDifferences,
+		writeDB:        config.WriteDB,
 	}
 	return checksum, nil
 }
@@ -106,7 +112,16 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 	if err != nil {
 		return err
 	}
-	err = trx.QueryRow(target).Scan(&targetChecksum, &targetCount)
+	if c.writeDB != nil {
+		// We are requesting to use a different DB for the target side.
+		// In this case we don't have a consistent transaction, we are
+		// relying on the property that we've halted writes to this side
+		// ourselves.
+		err = c.writeDB.QueryRow(target).Scan(&targetChecksum, &targetCount)
+	} else {
+		// Write target is same server
+		err = trx.QueryRow(target).Scan(&targetChecksum, &targetCount)
+	}
 	if err != nil {
 		return err
 	}
