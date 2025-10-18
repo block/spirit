@@ -101,7 +101,7 @@ func NewClient(db *sql.DB, host string, username, password string, config *Clien
 	if config.WriteDB == nil {
 		config.WriteDB = db // default to using the read DB for writes
 	}
-	return &Client{
+	client := &Client{
 		db:                         db,
 		dbConfig:                   dbconn.NewDBConfig(),
 		host:                       host,
@@ -109,7 +109,6 @@ func NewClient(db *sql.DB, host string, username, password string, config *Clien
 		password:                   password,
 		logger:                     config.Logger,
 		targetBatchTime:            config.TargetBatchTime,
-		targetBatchSize:            DefaultBatchSize, // initial starting value.
 		concurrency:                config.Concurrency,
 		subscriptions:              make(map[string]Subscription),
 		onDDL:                      config.OnDDL,
@@ -117,6 +116,10 @@ func NewClient(db *sql.DB, host string, username, password string, config *Clien
 		useExperimentalBufferedMap: config.UseExperimentalBufferedMap,
 		writeDB:                    config.WriteDB,
 	}
+	// Initialize targetBatchSize atomically to avoid data race
+	// since it's accessed atomically elsewhere in the code
+	atomic.StoreInt64(&client.targetBatchSize, DefaultBatchSize)
+	return client
 }
 
 type ClientConfig struct {
