@@ -171,7 +171,7 @@ func ParseCreateTable(sql string) (*CreateTable, error) {
 
 	stmts, _, err := p.Parse(sql, "", "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse SQL: %w", err)
+		return nil, fmt.Errorf("failed to parse SQL %q: %w", sql, err)
 	}
 
 	if len(stmts) != 1 {
