@@ -206,8 +206,9 @@ type Lint struct {
 }
 
 func (l *Lint) Run() error {
+	var allCreateTables []*statement.CreateTable
+	var allAlterStatements []*statement.AbstractStatement
 	var lintConfig Config
-	foundViolations := false
 
 	if len(l.Statement) == 0 {
 		return errors.New("must specify at least one statement to lint")
@@ -233,24 +234,20 @@ func (l *Lint) Run() error {
 			fmt.Fprintf(os.Stderr, "Warning: no valid statements found in %s, skipping\n", source.Origin)
 			continue // No valid statements in this source
 		}
-
-		// Run linters
-		violations := RunLinters(createTables, alterStatements, lintConfig)
-
-		if len(violations) == 0 {
-			fmt.Printf("No lint violations found in %q\n", source.Origin)
-			continue
-		}
-		fmt.Printf("Found lint violations found in %q:\n", source.Origin)
-		foundViolations = true
-
-		for _, v := range violations {
-			fmt.Println(v.String())
-		}
+		allCreateTables = append(allCreateTables, createTables...)
+		allAlterStatements = append(allAlterStatements, alterStatements...)
 	}
 
-	if foundViolations {
-		return errors.New("lint violations found")
+	// Run linters
+	violations := RunLinters(allCreateTables, allAlterStatements, lintConfig)
+
+	if len(violations) == 0 {
+		fmt.Println("No lint violations found")
+		return nil
 	}
-	return nil
+
+	for _, v := range violations {
+		fmt.Println(v.String())
+	}
+	return errors.New("lint violations found")
 }
