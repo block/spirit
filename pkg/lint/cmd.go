@@ -36,6 +36,7 @@ func resolveStatement(arg string) ([]StatementSource, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read from stdin: %w", err)
 		}
+
 		return []StatementSource{{
 			Origin: "stdin",
 			SQL:    string(content),
@@ -110,7 +111,6 @@ func resolveDirectory(dir string) ([]StatementSource, error) {
 
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +141,7 @@ func resolveGlob(pattern string) ([]StatementSource, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to stat file %s: %w", path, err)
 		}
+
 		if info.IsDir() {
 			continue
 		}
@@ -172,8 +173,10 @@ func parseStatementSource(source StatementSource) ([]*statement.CreateTable, []*
 		return nil, nil, nil // Empty source is OK
 	}
 
-	var createTables []*statement.CreateTable
-	var alterStatements []*statement.AbstractStatement
+	var (
+		createTables    []*statement.CreateTable
+		alterStatements []*statement.AbstractStatement
+	)
 
 	// Parse all statements
 	stmts, err := statement.New(sql)
@@ -191,6 +194,7 @@ func parseStatementSource(source StatementSource) ([]*statement.CreateTable, []*
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to parse CREATE TABLE from %s: %w", source.Origin, err)
 			}
+
 			createTables = append(createTables, ct)
 		}
 	}
@@ -206,9 +210,11 @@ type Lint struct {
 }
 
 func (l *Lint) Run() error {
-	var allCreateTables []*statement.CreateTable
-	var allAlterStatements []*statement.AbstractStatement
-	var lintConfig Config
+	var (
+		allCreateTables    []*statement.CreateTable
+		allAlterStatements []*statement.AbstractStatement
+		lintConfig         Config
+	)
 
 	if len(l.Statement) == 0 {
 		return errors.New("must specify at least one statement to lint")
@@ -216,11 +222,13 @@ func (l *Lint) Run() error {
 
 	// Resolve all statement arguments into sources
 	var sources []StatementSource
+
 	for _, arg := range l.Statement {
 		s, err := resolveStatement(arg)
 		if err != nil {
 			return err
 		}
+
 		sources = append(sources, s...)
 	}
 
@@ -230,16 +238,21 @@ func (l *Lint) Run() error {
 		if err != nil {
 			return err
 		}
+
 		if len(createTables) == 0 && len(alterStatements) == 0 {
 			fmt.Fprintf(os.Stderr, "Warning: no valid statements found in %s, skipping\n", source.Origin)
 			continue // No valid statements in this source
 		}
+
 		allCreateTables = append(allCreateTables, createTables...)
 		allAlterStatements = append(allAlterStatements, alterStatements...)
 	}
 
 	// Run linters
-	violations := RunLinters(allCreateTables, allAlterStatements, lintConfig)
+	violations, err := RunLinters(allCreateTables, allAlterStatements, lintConfig)
+	if err != nil {
+		return fmt.Errorf("failed to run linters: %w", err)
+	}
 
 	if len(violations) == 0 {
 		fmt.Println("No lint violations found")
@@ -249,5 +262,6 @@ func (l *Lint) Run() error {
 	for _, v := range violations {
 		fmt.Println(v.String())
 	}
+
 	return errors.New("lint violations found")
 }

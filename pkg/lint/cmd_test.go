@@ -43,14 +43,16 @@ func TestResolveStatement_Cmdline(t *testing.T) {
 func TestResolveStatement_Stdin(t *testing.T) {
 	// Mock stdin
 	oldStdin := os.Stdin
+
 	defer func() { os.Stdin = oldStdin }()
 
 	r, w, _ := os.Pipe()
 	os.Stdin = r
 
 	sql := "CREATE TABLE users (id BIGINT PRIMARY KEY)"
+
 	go func() {
-		w.Write([]byte(sql))
+		_, _ = w.WriteString(sql)
 		w.Close()
 	}()
 
@@ -63,12 +65,13 @@ func TestResolveStatement_Stdin(t *testing.T) {
 
 func TestResolveStatement_File(t *testing.T) {
 	// Create a temporary file
-	tmpfile, err := os.CreateTemp("", "test_*.sql")
+	tmpfile, err := os.CreateTemp(t.TempDir(), "test_*.sql")
 	require.NoError(t, err)
+
 	defer os.Remove(tmpfile.Name())
 
 	sql := "CREATE TABLE users (id BIGINT PRIMARY KEY)"
-	_, err = tmpfile.Write([]byte(sql))
+	_, err = tmpfile.WriteString(sql)
 	require.NoError(t, err)
 	tmpfile.Close()
 
@@ -88,22 +91,22 @@ func TestResolveStatement_FileNotExists(t *testing.T) {
 
 func TestResolveStatement_Directory(t *testing.T) {
 	// Create a temporary directory with SQL files
-	tmpdir, err := os.MkdirTemp("", "test_migrations_")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Create some files
 	sql1 := "CREATE TABLE users (id INT)"
 	sql2 := "CREATE TABLE orders (id INT)"
-	os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte(sql1), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte(sql2), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "README.md"), []byte("# Migrations"), 0644)
+
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte(sql1), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte(sql2), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "README.md"), []byte("# Migrations"), 0644))
 
 	// Create a subdirectory with a file
 	subdir := filepath.Join(tmpdir, "archived")
-	os.Mkdir(subdir, 0755)
+	require.NoError(t, os.Mkdir(subdir, 0755))
+
 	sql3 := "CREATE TABLE old (id INT)"
-	os.WriteFile(filepath.Join(subdir, "old.sql"), []byte(sql3), 0644)
+	require.NoError(t, os.WriteFile(filepath.Join(subdir, "old.sql"), []byte(sql3), 0644))
 
 	sources, err := resolveStatement("file:" + tmpdir)
 	require.NoError(t, err)
@@ -123,9 +126,7 @@ func TestResolveStatement_Directory(t *testing.T) {
 }
 
 func TestResolveStatement_DirectoryEmpty(t *testing.T) {
-	tmpdir, err := os.MkdirTemp("", "test_empty_")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	sources, err := resolveStatement("file:" + tmpdir)
 	assert.Error(t, err)
@@ -135,18 +136,17 @@ func TestResolveStatement_DirectoryEmpty(t *testing.T) {
 
 func TestResolveStatement_Glob(t *testing.T) {
 	// Create a temporary directory with SQL files
-	tmpdir, err := os.MkdirTemp("", "test_migrations_")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Create some files
 	sql1 := "CREATE TABLE users (id INT)"
 	sql2 := "CREATE TABLE orders (id INT)"
 	sql3 := "CREATE TABLE products (id INT)"
-	os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte(sql1), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte(sql2), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "003_products.sql"), []byte(sql3), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "README.md"), []byte("# Migrations"), 0644)
+
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte(sql1), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte(sql2), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "003_products.sql"), []byte(sql3), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "README.md"), []byte("# Migrations"), 0644))
 
 	// Test glob pattern
 	pattern := "file:" + filepath.Join(tmpdir, "*.sql")
@@ -162,9 +162,7 @@ func TestResolveStatement_Glob(t *testing.T) {
 }
 
 func TestResolveStatement_GlobNoMatches(t *testing.T) {
-	tmpdir, err := os.MkdirTemp("", "test_migrations_")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	pattern := "file:" + filepath.Join(tmpdir, "*.sql")
 	sources, err := resolveStatement(pattern)
@@ -174,14 +172,12 @@ func TestResolveStatement_GlobNoMatches(t *testing.T) {
 }
 
 func TestResolveStatement_GlobWithPattern(t *testing.T) {
-	tmpdir, err := os.MkdirTemp("", "test_migrations_")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Create files with different patterns
-	os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte("CREATE TABLE users (id INT)"), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "999_old.sql"), []byte("CREATE TABLE old (id INT)"), 0644)
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte("CREATE TABLE users (id INT)"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "999_old.sql"), []byte("CREATE TABLE old (id INT)"), 0644))
 
 	// Test pattern that matches only 001 and 002
 	pattern := "file:" + filepath.Join(tmpdir, "00[12]*.sql")
@@ -191,16 +187,14 @@ func TestResolveStatement_GlobWithPattern(t *testing.T) {
 }
 
 func TestResolveStatement_GlobSkipsDirectories(t *testing.T) {
-	tmpdir, err := os.MkdirTemp("", "test_migrations_")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Create a subdirectory that would match the glob
 	subdir := filepath.Join(tmpdir, "migrations")
-	os.Mkdir(subdir, 0755)
+	require.NoError(t, os.Mkdir(subdir, 0755))
 
 	// Create a file
-	os.WriteFile(filepath.Join(tmpdir, "001.sql"), []byte("CREATE TABLE users (id INT)"), 0644)
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "001.sql"), []byte("CREATE TABLE users (id INT)"), 0644))
 
 	// Glob should skip the directory
 	pattern := "file:" + filepath.Join(tmpdir, "*")
@@ -211,13 +205,11 @@ func TestResolveStatement_GlobSkipsDirectories(t *testing.T) {
 
 func TestResolveStatement_Integration(t *testing.T) {
 	// Create a realistic test directory structure
-	tmpdir, err := os.MkdirTemp("", "test_migrations_")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Create some files
-	os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte("CREATE TABLE users (id INT)"), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0644)
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "001_users.sql"), []byte("CREATE TABLE users (id INT)"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "002_orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0644))
 
 	tests := []struct {
 		name          string
@@ -293,7 +285,7 @@ func TestParseStatementSource_SingleCreateTable(t *testing.T) {
 	createTables, alterStatements, err := parseStatementSource(source)
 	require.NoError(t, err)
 	require.Len(t, createTables, 1)
-	assert.Len(t, alterStatements, 0)
+	assert.Empty(t, alterStatements)
 	assert.Equal(t, "users", createTables[0].GetTableName())
 }
 
@@ -305,7 +297,7 @@ func TestParseStatementSource_SingleAlterTable(t *testing.T) {
 
 	createTables, alterStatements, err := parseStatementSource(source)
 	require.NoError(t, err)
-	assert.Len(t, createTables, 0)
+	assert.Empty(t, createTables)
 	require.Len(t, alterStatements, 1)
 	assert.Equal(t, "users", alterStatements[0].Table)
 }
@@ -321,7 +313,7 @@ func TestParseStatementSource_MultipleAlterStatements(t *testing.T) {
 
 	createTables, alterStatements, err := parseStatementSource(source)
 	require.NoError(t, err)
-	assert.Len(t, createTables, 0)
+	assert.Empty(t, createTables)
 	require.Len(t, alterStatements, 2)
 	assert.Equal(t, "users", alterStatements[0].Table)
 	assert.Equal(t, "users", alterStatements[1].Table)
@@ -399,6 +391,6 @@ func TestParseStatementSource_WithComments(t *testing.T) {
 
 	createTables, alterStatements, err := parseStatementSource(source)
 	require.NoError(t, err)
-	assert.Len(t, createTables, 0)
+	assert.Empty(t, createTables)
 	require.Len(t, alterStatements, 2)
 }
