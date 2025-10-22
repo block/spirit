@@ -162,6 +162,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
+	if r.migration.EnableExperimentalLinting || len(r.migration.EnableExperimentalLinters) > 0 || len(r.migration.ExperimentalLinterConfig) > 0 {
+		if err := r.lint(ctx); err != nil {
+			return err
+		}
+	}
+
 	if r.migration.EnableExperimentalMultiTableSupport {
 		// We don't (yet) support a lot of features in multi-schema changes, and
 		// we never attempt instant/inplace DDL. So for now all we need to do

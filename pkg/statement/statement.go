@@ -148,6 +148,28 @@ func (a *AbstractStatement) IsAlterTable() bool {
 	return ok
 }
 
+func (a *AbstractStatement) IsCreateTable() bool {
+	_, ok := (*a.StmtNode).(*ast.CreateTableStmt)
+	return ok
+}
+
+func (a *AbstractStatement) ParseCreateTable() (*CreateTable, error) {
+	createStmt, ok := (*a.StmtNode).(*ast.CreateTableStmt)
+	if !ok {
+		return nil, errors.New("not a CREATE TABLE statement")
+	}
+
+	ct := &CreateTable{
+		Raw: createStmt,
+	}
+	// Parse into structured format
+	err := ct.parseToStruct()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CREATE TABLE AST: %w", err)
+	}
+	return ct, nil
+}
+
 // AlgorithmInplaceConsideredSafe checks to see if all clauses of an ALTER
 // statement are "safe". We consider an operation to be "safe" if it is "In
 // Place" and "Only Modifies Metadata". See

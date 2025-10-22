@@ -75,6 +75,27 @@ type Config struct {
 	Settings map[string]map[string]string
 }
 
+// IsEnabled checks the config as well as the registry to see if
+// a given linter is enabled in either place. If the linter doesn't exist,
+// false is returned because a non-existent linter can't be enabled.
+func (c *Config) IsEnabled(linterName string) bool {
+	enabled, ok := c.Enabled[linterName]
+	if !ok {
+		// Not explicitly set - use default
+		lock.RLock()
+		defer lock.RUnlock()
+
+		linter, exists := linters[linterName]
+		if !exists {
+			return false
+		}
+
+		return linter.enabled
+	}
+
+	return enabled
+}
+
 // RunLinters runs all enabled linters and returns any violations found.
 // Linters are executed in an undefined order.
 //

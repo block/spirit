@@ -378,4 +378,12 @@ This feature adds native linting support to Spirit, allowing for various rules t
 
 **Current Status**
 
-This feature is partially complete. It relies on new support for parsing CREATE TABLE statements (see `pkg/statetement/parse_create_table.go`). There are so far only a few linters implemented. This functionality is not currently exposed via command line flags.
+This feature is partially complete. It relies on new support for parsing CREATE TABLE statements (see `pkg/statetement/parse_create_table.go`). There are so far only a few linters implemented.
+
+You can use this experimental feature via these 3 command-line options:
+
+* `--enable-experimental-linting` a boolean flag to enable the feature
+* `--enable-experimental-linters` a comma-separated (or multiple option instance) list of names of individual linters you want to enable explicitly (in addition to the default set) or, if preceded by `-`, that you wish to _disable_
+* `--experimental-linter-config` a comma-separated (or multiple option instance) list of linter_name.key=value configuration settings to control the behavior of individual linters
+
+If you provide `--enable-experimental-linters` or `--experimental-linter-config` without explicitly setting `--enable-experimental-linting`, linting will be enabled implicitly

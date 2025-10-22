@@ -13,7 +13,7 @@ type linter struct {
 }
 
 var (
-	linters map[string]linter
+	linters map[string]*linter
 	lock    sync.RWMutex
 )
 
@@ -25,10 +25,10 @@ func Register(l Linter) {
 	defer lock.Unlock()
 
 	if linters == nil {
-		linters = make(map[string]linter)
+		linters = make(map[string]*linter)
 	}
 
-	linters[l.Name()] = linter{
+	linters[l.Name()] = &linter{
 		l:       l,
 		enabled: true,
 	}
@@ -47,10 +47,24 @@ func Enable(names ...string) error {
 		}
 
 		l.enabled = true
-		linters[name] = l
 	}
 
 	return nil
+}
+
+// Enabled returns whether a specific linter is enabled.
+// Returns an error if the linter is not found.
+func Enabled(name string) bool {
+	lock.RLock()
+	defer lock.RUnlock()
+
+	// if the linter is not found, just return false
+	l, ok := linters[name]
+	if !ok {
+		return false
+	}
+
+	return l.enabled
 }
 
 // Disable disables specific linters by name.
@@ -66,7 +80,6 @@ func Disable(names ...string) error {
 		}
 
 		l.enabled = false
-		linters[name] = l
 	}
 
 	return nil
@@ -107,5 +120,5 @@ func Reset() {
 	lock.Lock()
 	defer lock.Unlock()
 
-	linters = make(map[string]linter)
+	linters = make(map[string]*linter)
 }

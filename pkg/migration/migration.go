@@ -43,8 +43,11 @@ type Migration struct {
 
 	// Experimental features
 	// These are no longer hidden, we document them.
-	EnableExperimentalMultiTableSupport bool `name:"enable-experimental-multi-table-support" help:"Allow multiple alter statements to run concurrently and cutover together" optional:"" default:"false"`
-	EnableExperimentalBufferedCopy      bool `name:"enable-experimental-buffered-copy" help:"Use the experimental buffered copier/repl applier based on the DBLog algorithm" optional:"" default:"false"`
+	EnableExperimentalMultiTableSupport bool     `name:"enable-experimental-multi-table-support" help:"Allow multiple alter statements to run concurrently and cutover together" optional:"" default:"false"`
+	EnableExperimentalBufferedCopy      bool     `name:"enable-experimental-buffered-copy" help:"Use the experimental buffered copier/repl applier based on the DBLog algorithm" optional:"" default:"false"`
+	EnableExperimentalLinting           bool     `name:"enable-experimental-linting" help:"Enable experimental linting checks before running migration" optional:"" default:"false"`
+	EnableExperimentalLinters           []string `name:"enable-experimental-linters" help:"Experimental linters to enable (default \"all\")" optional:""`
+	ExperimentalLinterConfig            []string `name:"experimental-linter-config" help:"Configuration options for experimental linters in the form linter_name.key=value" optional:""`
 
 	// Hidden options for now (supports more obscure cash/sq usecases)
 	InterpolateParams bool `name:"interpolate-params" help:"Enable interpolate params for DSN" optional:"" default:"false" hidden:""`
