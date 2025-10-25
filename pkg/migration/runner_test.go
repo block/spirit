@@ -404,9 +404,11 @@ func TestTableLength(t *testing.T) {
 }
 
 func TestBadOptions(t *testing.T) {
+	// N.B. Because host, user, password and database have defaults enforced, we expect to
+	// fail in the same way when they're not provided.
 	_, err := NewRunner(&Migration{})
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "host is required")
+	assert.ErrorContains(t, err, "table name is required")
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
@@ -414,7 +416,7 @@ func TestBadOptions(t *testing.T) {
 		Host: cfg.Addr,
 	})
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "schema name is required")
+	assert.ErrorContains(t, err, "table name is required")
 	_, err = NewRunner(&Migration{
 		Host:     cfg.Addr,
 		Database: "mytable",
@@ -423,7 +425,7 @@ func TestBadOptions(t *testing.T) {
 	assert.ErrorContains(t, err, "table name is required")
 	_, err = NewRunner(&Migration{
 		Host:     cfg.Addr,
-		Database: "mytable",
+		Database: "mydatabase",
 		Table:    "mytable",
 	})
 	assert.Error(t, err)

@@ -589,3 +589,303 @@ func TestLargeNumberOfMultiChanges(t *testing.T) {
 	err = migration.Run()
 	assert.NoError(t, err)
 }
+
+func TestConfFileLoadingPrefersCommandLineOptions(t *testing.T) {
+	// Create a temporary credentials file
+	credsContent := `[client]
+user = fileuser
+password = filepass
+host = filehost
+database = filedb
+port = 5678
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:     "cli-host:1234",
+		Username: "cli-user",
+		Password: "cli-password",
+		Database: "cli-db",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "cli-user", migration.Username)
+	assert.Equal(t, "cli-password", migration.Password)
+	assert.Equal(t, "cli-host:1234", migration.Host)
+	assert.Equal(t, "cli-db", migration.Database)
+}
+
+func TestConfFileLoadingIfNoCommandLineOptions(t *testing.T) {
+	// Create a temporary credentials file
+	credsContent := `[client]
+user = fileuser
+password = filepass
+host = filehost
+database = filedb
+port = 5678
+tls-mode = REQUIRED
+tls-ca = /path/to/ca
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "fileuser", migration.Username)
+	assert.Equal(t, "filepass", migration.Password)
+	assert.Equal(t, "filehost:5678", migration.Host)
+	assert.Equal(t, "filedb", migration.Database)
+	assert.Equal(t, "REQUIRED", migration.TLSMode)
+	assert.Equal(t, "/path/to/ca", migration.TLSCertificatePath)
+}
+
+func TestConfFileLoadingUsesDefaultPort(t *testing.T) {
+	// Create a temporary credentials file
+	credsContent := `[client]
+user = fileuser
+password = filepass
+host = filehost
+database = filedb
+tls-mode = VERIFY_IDENTITY
+tls-ca = /path/to/another/ca
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "fileuser", migration.Username)
+	assert.Equal(t, "filepass", migration.Password)
+	assert.Equal(t, "filehost:3306", migration.Host)
+	assert.Equal(t, "filedb",  migration.Database)
+	assert.Equal(t, "VERIFY_IDENTITY", migration.TLSMode)
+	assert.Equal(t, "/path/to/another/ca", migration.TLSCertificatePath)
+}
+
+func TestConfFileLoadingUserOnly(t *testing.T) {
+	// Test with only username in creds file
+	credsContent := `[client]
+user = onlyuser
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:     "localhost:3306",
+		Password: "defaultpass",
+		Database: "testdb",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "onlyuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "testdb", migration.Database)
+}
+
+func TestConfFileLoadingPasswordOnly(t *testing.T) {
+	// Test with only password in creds file
+	credsContent := `[client]
+password = filepass
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Database: "testdb",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "filepass", migration.Password)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "testdb", migration.Database)
+}
+
+func TestConfFilePortUsedIfCommandLineHostHasNone(t *testing.T) {
+	credsContent := `[client]
+port=1234
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:     "localhost",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "localhost:1234", migration.Host)
+	assert.Equal(t, "testdb", migration.Database)
+}
+
+func TestConfFileLoadingEmptyClientSection(t *testing.T) {
+	// Test with empty client section
+	credsContent := `[client]
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "testdb", migration.Database)
+}
+
+func TestConfFileLoadingNoClientSection(t *testing.T) {
+	// Test with no client section at all
+	credsContent := `[mysql]
+user = mysqluser
+password = mysqlpass
+`
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test_creds_*.cnf")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(credsContent)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	migration := &Migration{
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: tmpFile.Name(),
+	}
+
+	_, err = migration.normalizeOptions()
+	require.NoError(t, err)
+
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "testdb", migration.Database)
+	assert.Equal(t, "PREFERRED", migration.TLSMode)
+}
+
+func TestConfFileLoadingInvalidFile(t *testing.T) {
+	migration := &Migration{
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+		ConfFile: "/nonexistent/file.cnf",
+	}
+
+	_, err := migration.normalizeOptions()
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "no such file or directory")
+}
+
+func TestConfFileLoadingEmptyFile(t *testing.T) {
+	migration := &Migration{
+		Host:     "localhost:3306",
+		Username: "defaultuser",
+		Password: "defaultpass",
+		Database: "testdb",
+		Table:    "testtable",
+		Alter:    "ENGINE=InnoDB",
+	}
+
+	_, err := migration.normalizeOptions()
+	assert.NoError(t, err)
+
+	assert.Equal(t, "localhost:3306", migration.Host)
+	assert.Equal(t, "defaultuser", migration.Username)
+	assert.Equal(t, "defaultpass", migration.Password)
+	assert.Equal(t, "testdb", migration.Database)
+}
