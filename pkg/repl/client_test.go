@@ -30,10 +30,9 @@ func TestReplClient(t *testing.T) {
 	assert.NoError(t, err)
 	defer db.Close()
 
-	testutils.RunSQL(t, "DROP TABLE IF EXISTS replt1, replt2, _replt1_chkpnt")
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS replt1, replt2")
 	testutils.RunSQL(t, "CREATE TABLE replt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
 	testutils.RunSQL(t, "CREATE TABLE replt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "CREATE TABLE _replt1_chkpnt (a int)") // just used to advance binlog
 
 	t1 := table.NewTableInfo(db, "test", "replt1")
 	assert.NoError(t, t1.SetInfo(t.Context()))
@@ -73,10 +72,9 @@ func TestReplClientComplex(t *testing.T) {
 	assert.NoError(t, err)
 	defer db.Close()
 
-	testutils.RunSQL(t, "DROP TABLE IF EXISTS replcomplext1, replcomplext2, _replcomplext1_chkpnt")
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS replcomplext1, replcomplext2")
 	testutils.RunSQL(t, "CREATE TABLE replcomplext1 (a INT NOT NULL auto_increment, b INT, c INT, PRIMARY KEY (a))")
 	testutils.RunSQL(t, "CREATE TABLE replcomplext2 (a INT NOT NULL  auto_increment, b INT, c INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "CREATE TABLE _replcomplext1_chkpnt (a int)") // just used to advance binlog
 
 	testutils.RunSQL(t, "INSERT INTO replcomplext1 (a, b, c) SELECT NULL, 1, 1 FROM dual")
 	testutils.RunSQL(t, "INSERT INTO replcomplext1 (a, b, c) SELECT NULL, 1, 1 FROM replcomplext1 a JOIN replcomplext1 b JOIN replcomplext1 c LIMIT 100000")
@@ -94,13 +92,13 @@ func TestReplClientComplex(t *testing.T) {
 
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
-	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, time.Second, logrus.New())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
-	assert.NoError(t, client.AddSubscription(t1, t2, chunker.KeyAboveHighWatermark))
+	assert.NoError(t, client.AddSubscription(t1, t2, chunker))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 	client.SetKeyAboveWatermarkOptimization(true)
@@ -111,10 +109,13 @@ func TestReplClientComplex(t *testing.T) {
 	assert.Equal(t, 0, client.GetDeltaLen())
 
 	// Read from the copier so that the key is below the watermark
+	// + give feedback
 	chk, err := chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`a` < 1", chk.String())
-	// read again
+	chunker.Feedback(chk, time.Second, 10)
+
+	// read again but don't give feedback
 	chk, err = chunker.Next()
 	assert.NoError(t, err)
 	assert.Equal(t, "`a` >= 1 AND `a` < 1001", chk.String())
@@ -124,8 +125,16 @@ func TestReplClientComplex(t *testing.T) {
 	assert.NoError(t, client.BlockWait(t.Context()))
 	assert.Equal(t, 10, client.GetDeltaLen()) // 10 keys did not exist on t1
 
-	// Flush the changeset
+	// Try to flush the changeset
+	// It should be empty, but it's not! This is because of KeyBelowWatermark
 	assert.NoError(t, client.Flush(t.Context()))
+	assert.Equal(t, 10, client.GetDeltaLen())
+
+	// However after we give feedback, then it should be able to flush these deltas.
+	// This is because the watermark advances above 1000.
+	chunker.Feedback(chk, time.Second, 1000)
+	assert.NoError(t, client.Flush(t.Context()))
+	assert.Equal(t, 0, client.GetDeltaLen())
 
 	// Accumulate more deltas
 	testutils.RunSQL(t, "DELETE FROM replcomplext1 WHERE a >= 550 AND a < 570")
@@ -269,6 +278,9 @@ func TestReplClientOpts(t *testing.T) {
 	assert.NotEqual(t, startingPos, client.GetBinlogApplyPosition())
 }
 
+// TestReplClientQueue tests the "queue" based approach to buffering changes
+// We've removed the queue based approach, but we keep this test anyway to ensure
+// the buffered map behaves correct for this.
 func TestReplClientQueue(t *testing.T) {
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	assert.NoError(t, err)
@@ -301,7 +313,7 @@ func TestReplClientQueue(t *testing.T) {
 	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
 	assert.NoError(t, err)
 	// Attach chunker's keyabovewatermark to the repl client
-	assert.NoError(t, client.AddSubscription(t1, t2, chunker.KeyAboveHighWatermark))
+	assert.NoError(t, client.AddSubscription(t1, t2, chunker))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
 

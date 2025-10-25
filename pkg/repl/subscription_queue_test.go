@@ -93,8 +93,9 @@ func TestFlushDeltaQueue(t *testing.T) {
 			changes:  make([]queuedChange, 0),
 		}
 
-		err := sub.Flush(t.Context(), false, nil)
+		allFlushed, err := sub.Flush(t.Context(), false, nil)
 		assert.NoError(t, err)
+		assert.True(t, allFlushed)
 	})
 	t.Run("statement merging", func(t *testing.T) {
 		client := &Client{
@@ -129,8 +130,9 @@ func TestFlushDeltaQueue(t *testing.T) {
 
 		// Flush without lock
 		// calls flushDeltaQueue
-		err := sub.Flush(t.Context(), false, nil)
+		allFlushed, err := sub.Flush(t.Context(), false, nil)
 		assert.NoError(t, err)
+		assert.True(t, allFlushed)
 
 		// Verify the results
 		var count int
@@ -183,8 +185,9 @@ func TestFlushDeltaQueue(t *testing.T) {
 		}
 
 		// Flush - should create multiple statements due to batch size
-		err := sub.Flush(t.Context(), false, nil)
+		allFlushed, err := sub.Flush(t.Context(), false, nil)
 		assert.NoError(t, err)
+		assert.True(t, allFlushed)
 
 		// Verify all records were inserted
 		var count int
@@ -224,8 +227,9 @@ func TestFlushDeltaQueue(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Flush under lock
-		err = sub.Flush(t.Context(), true, lock)
+		allFlushed, err := sub.Flush(t.Context(), true, lock)
 		assert.NoError(t, err)
+		assert.True(t, allFlushed)
 		lock.Close()
 
 		// Verify the results
@@ -270,16 +274,18 @@ func TestFlushDeltaQueue(t *testing.T) {
 
 		// Perform multiple flushes while changes are being added
 		for range 5 {
-			err := sub.Flush(t.Context(), false, nil)
+			allFlushed, err := sub.Flush(t.Context(), false, nil)
 			assert.NoError(t, err)
+			assert.True(t, allFlushed)
 			time.Sleep(time.Millisecond * 10)
 		}
 
 		<-done // Wait for all changes to be added
 
 		// Final flush
-		err := sub.Flush(t.Context(), false, nil)
+		allFlushed, err := sub.Flush(t.Context(), false, nil)
 		assert.NoError(t, err)
+		assert.True(t, allFlushed)
 
 		// Verify that records were inserted
 		var count int
@@ -332,8 +338,9 @@ func TestFlushDeltaQueue(t *testing.T) {
 		}
 
 		// Flush all changes
-		err := sub.Flush(t.Context(), false, nil)
+		allFlushed, err := sub.Flush(t.Context(), false, nil)
 		assert.NoError(t, err)
+		assert.True(t, allFlushed)
 
 		// Verify final state
 		rows, err := db.Query("SELECT id FROM _subscription_test_new ORDER BY id")

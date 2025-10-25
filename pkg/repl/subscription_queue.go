@@ -27,7 +27,7 @@ type deltaQueue struct {
 	changes []queuedChange
 
 	enableKeyAboveWatermark bool
-	keyAboveCopierCallback  func(any) bool
+	chunker                 table.Chunker
 }
 
 // Assert that deltaQueue implements subscription
@@ -52,7 +52,7 @@ func (s *deltaQueue) HasChanged(key, _ []any, deleted bool) {
 	// We enable it once all the setup has been done (since we create a repl client
 	// earlier in setup to ensure binary logs are available).
 	// We then disable the optimization after the copier phase has finished.
-	if s.keyAboveWatermarkEnabled() && s.keyAboveCopierCallback(key[0]) {
+	if s.keyAboveWatermarkEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
 		s.c.logger.Debugf("key above watermark: %v", key[0])
 		return
 	}
@@ -100,13 +100,15 @@ func (s *deltaQueue) createReplaceStmt(replaceKeys []string) statement {
 // The only optimization we do is we try to MERGE statements together, such
 // that if there are operations: REPLACE<1>, REPLACE<2>, DELETE<3>, REPLACE<4>
 // we merge it to REPLACE<1,2>, DELETE<3>, REPLACE<4>.
-func (s *deltaQueue) Flush(ctx context.Context, underLock bool, lock *dbconn.TableLock) error {
+//
+// The queue always flushes all changes. It does not implement keyBelowLowWatermark
+func (s *deltaQueue) Flush(ctx context.Context, underLock bool, lock *dbconn.TableLock) (allChangesFlushed bool, err error) {
 	s.Lock()
 	defer s.Unlock()
 
 	// Early return if there is nothing to flush.
 	if len(s.changes) == 0 {
-		return nil
+		return true, nil
 	}
 	// Otherwise, flush the changes.
 	var stmts []statement
@@ -138,26 +140,26 @@ func (s *deltaQueue) Flush(ctx context.Context, underLock bool, lock *dbconn.Tab
 		// We need to use the lock connection to do this
 		// so there is no parallelism.
 		if err := lock.ExecUnderLock(ctx, extractStmt(stmts)...); err != nil {
-			return err
+			return false, err
 		}
 	} else {
 		// Execute the statements in a transaction.
 		// They still need to be single threaded.
 		if _, err := dbconn.RetryableTransaction(ctx, s.c.db, true, s.c.dbConfig, extractStmt(stmts)...); err != nil {
-			return err
+			return false, err
 		}
 	}
 	// If it's successful, we can clear the queue
 	// and return to release the mutex for new changes
 	// to start accumulating again.
 	s.changes = nil
-	return nil
+	return true, nil
 }
 
 // keyAboveWatermarkEnabled returns true if the KeyAboveWatermark optimization
 // is enabled. This is already called under a mutex.
 func (s *deltaQueue) keyAboveWatermarkEnabled() bool {
-	return s.enableKeyAboveWatermark && s.keyAboveCopierCallback != nil
+	return s.enableKeyAboveWatermark && s.chunker != nil
 }
 
 func (s *deltaQueue) SetKeyAboveWatermarkOptimization(enabled bool) {

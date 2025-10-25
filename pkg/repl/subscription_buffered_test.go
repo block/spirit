@@ -57,8 +57,9 @@ func TestBufferedMap(t *testing.T) {
 	assert.Equal(t, "INSERT INTO `test`.`_subscription_test_new` (`id`, `name`) VALUES (2, 'test2'), (3, 'test3') AS new ON DUPLICATE KEY UPDATE `name` = new.`name`", statement.stmt)
 
 	// Now flush the changes.
-	err = sub.Flush(t.Context(), false, nil)
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
 	assert.NoError(t, err)
+	assert.True(t, allFlushed)
 
 	// The destination table should now have the 2 rows.
 	var name string

@@ -3,6 +3,7 @@ package migration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -1426,7 +1427,7 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 		DBConfig:        dbconn.NewDBConfig(),
 	})
 	assert.NoError(t, err)
-	assert.NoError(t, m.replClient.AddSubscription(m.changes[0].table, m.changes[0].newTable, m.copyChunker.KeyAboveHighWatermark))
+	assert.NoError(t, m.replClient.AddSubscription(m.changes[0].table, m.changes[0].newTable, m.copyChunker))
 	err = m.replClient.Run(t.Context())
 	assert.NoError(t, err)
 
@@ -1494,7 +1495,6 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	assert.Equal(t, Progress{CurrentState: statePostChecksum.String(), Summary: "Applying Changeset Deltas=0"}, m.GetProgress())
 
 	// All done!
-
 	assert.Equal(t, 0, m.db.Stats().InUse) // all connections are returned.
 }
 
@@ -1562,16 +1562,12 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 		DBConfig:        dbconn.NewDBConfig(),
 	})
 	assert.NoError(t, err)
-	assert.NoError(t, m.replClient.AddSubscription(m.changes[0].table, m.changes[0].newTable, m.copyChunker.KeyAboveHighWatermark))
+	assert.NoError(t, m.replClient.AddSubscription(m.changes[0].table, m.changes[0].newTable, m.copyChunker))
 	err = m.replClient.Run(t.Context())
 	assert.NoError(t, err)
 	m.replClient.SetKeyAboveWatermarkOptimization(true)
 
 	// Now we are ready to start copying rows.
-	// Instead of calling m.copyRows() we will step through it manually.
-	// Since we want to checkpoint after a few chunks.
-
-	// m.copier.StartTime = time.Now()
 	m.setCurrentState(stateCopyRows)
 	assert.Equal(t, "copyRows", m.getCurrentState().String())
 
@@ -1592,30 +1588,47 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 	// Because it's ahead of the high watermark.
 	testutils.RunSQL(t, `insert into e2et2 (id) values (4)`)
 	assert.True(t, m.copyChunker.KeyAboveHighWatermark(4))
-
-	// Give it a chance, since we need to read from the binary log to populate this
-	// Even though we expect nothing.
 	assert.NoError(t, m.replClient.BlockWait(t.Context()))
 	assert.Equal(t, 0, m.replClient.GetDeltaLen())
 
 	// second chunk is between min and max value.
+	// retrieve it first. We'll copy it after we insert data.
 	chunk, err = m.copyChunker.Next()
 	assert.NoError(t, err)
-	assert.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
 	assert.Equal(t, "`id` >= 1 AND `id` < 1001", chunk.String())
 
 	// Now insert some data.
 	// This should be picked up by the binlog subscription
 	// because it is within chunk size range of the second chunk.
+	// but until we copy the chunk it is *not* below the low watermark
+	// and can't be flushed.
 	testutils.RunSQL(t, `insert into e2et2 (id) values (5)`)
 	assert.False(t, m.copyChunker.KeyAboveHighWatermark(5))
+	assert.False(t, m.copyChunker.KeyBelowLowWatermark(5))
+	assert.NoError(t, m.replClient.BlockWait(t.Context()))
+	assert.Equal(t, 1, m.replClient.GetDeltaLen())
+	assert.NoError(t, m.replClient.Flush(t.Context()))
+	assert.Equal(t, 1, m.replClient.GetDeltaLen())
+
+	// Now copy it and because the CopyChunk() calls Feedback()
+	// it will mean that the low watermark is advanced and
+	// we can safely flush all changes.
+	assert.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
+	assert.True(t, m.copyChunker.KeyBelowLowWatermark(5))
+	assert.NoError(t, m.replClient.Flush(t.Context()))
+	assert.Equal(t, 0, m.replClient.GetDeltaLen())
+
+	// delete some data.
+	testutils.RunSQL(t, `delete from e2et2 where id = 1`)
+	assert.False(t, m.copyChunker.KeyAboveHighWatermark(1))
+	assert.True(t, m.copyChunker.KeyBelowLowWatermark(1))
 	assert.NoError(t, m.replClient.BlockWait(t.Context()))
 	assert.Equal(t, 1, m.replClient.GetDeltaLen())
 
-	testutils.RunSQL(t, `delete from e2et2 where id = 1`)
-	assert.False(t, m.copyChunker.KeyAboveHighWatermark(1))
-	assert.NoError(t, m.replClient.BlockWait(t.Context()))
-	assert.Equal(t, 2, m.replClient.GetDeltaLen())
+	// We are able to flush, but we still have deltas
+	// *because* of keyBelowLowWatermark.
+	assert.NoError(t, m.replClient.Flush(t.Context()))
+	assert.Equal(t, 0, m.replClient.GetDeltaLen())
 
 	// third (and last) chunk is open ended,
 	// so anything after it will be picked up by the binlog.
@@ -2272,7 +2285,7 @@ func TestE2ERogueValues(t *testing.T) {
 		DBConfig:        dbconn.NewDBConfig(),
 	})
 	assert.NoError(t, err)
-	assert.NoError(t, m.replClient.AddSubscription(m.changes[0].table, m.changes[0].newTable, m.copyChunker.KeyAboveHighWatermark))
+	assert.NoError(t, m.replClient.AddSubscription(m.changes[0].table, m.changes[0].newTable, m.copyChunker))
 	err = m.replClient.Run(t.Context())
 	assert.NoError(t, err)
 
@@ -3107,7 +3120,6 @@ func TestIndexVisibility(t *testing.T) {
 func TestPreventConcurrentRuns(t *testing.T) {
 	cleanupSentinelTable(t) // this makes use of the sentinel table
 	tableName := `prevent_concurrent_runs`
-	checkpointTableName := fmt.Sprintf("_%s_chkpnt", tableName)
 
 	dropStmt := `DROP TABLE IF EXISTS %s`
 	testutils.RunSQL(t, fmt.Sprintf(dropStmt, tableName))
@@ -3142,7 +3154,11 @@ func TestPreventConcurrentRuns(t *testing.T) {
 		// Shadow err to avoid a data race
 		err := m.Run(t.Context())
 		assert.Error(t, err)
-		assert.ErrorContains(t, err, "timed out waiting for sentinel table to be dropped")
+		// The error can either be context cancelled or timed out.
+		// Both are acceptable
+		if !errors.Is(err, context.Canceled) {
+			assert.ErrorContains(t, err, "timed out waiting for sentinel table to be dropped")
+		}
 	}()
 
 	// While it's waiting, start another run and confirm it fails.

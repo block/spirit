@@ -28,16 +28,17 @@ const (
 	ChunkerDefaultTarget = 100 * time.Millisecond
 )
 
-type Chunker interface {
+type Chunker interface { //nolint: interfacebloat
 	Open() error
 	IsRead() bool
 	Close() error
 	Next() (*Chunk, error)
 	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)
-	KeyAboveHighWatermark(key any) bool
+	KeyAboveHighWatermark(key0 any) bool
+	KeyBelowLowWatermark(key0 any) bool
 	Progress() (rowsRead uint64, chunksCopied uint64, totalRowsExpected uint64)
 	OpenAtWatermark(watermark string) error
-	GetLowWatermark() (string, error)
+	GetLowWatermark() (watermark string, err error)
 	// Tables return a list of table names
 	// By convention the first table is the "current" table,
 	// and the second table (if any) is the "new" table.

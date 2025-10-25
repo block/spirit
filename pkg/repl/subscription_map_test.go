@@ -104,8 +104,9 @@ func TestFlushWithLock(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Test flush with lock
-	err = sub.Flush(t.Context(), true, lock)
+	allFlushed, err := sub.Flush(t.Context(), true, lock)
 	assert.NoError(t, err)
+	assert.True(t, allFlushed)
 
 	lock.Close()
 
@@ -159,8 +160,9 @@ func TestFlushWithoutLock(t *testing.T) {
 	sub.HasChanged([]any{4}, nil, true)
 
 	// Test flush without lock
-	err = sub.Flush(t.Context(), false, nil)
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
 	assert.NoError(t, err)
+	assert.True(t, allFlushed)
 
 	// Verify the changes were applied
 	var count int
@@ -291,11 +293,17 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 		dbConfig:        dbconn.NewDBConfig(),
 	}
 
+	// Create mock chunker with watermark behavior
+	mockChunker := table.NewMockChunker("test_table", 1000)
+	// Set current position to 5, so keys above 5 will be above watermark
+	mockChunker.SimulateProgress(0.005) // 5/1000 = 0.005
+
 	sub := &deltaMap{
 		c:        client,
 		table:    srcTable,
 		newTable: dstTable,
 		changes:  make(map[string]bool),
+		chunker:  mockChunker,
 	}
 
 	// Test with string keys
@@ -306,26 +314,13 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 	sub.HasChanged([]any{"prefix", 123}, nil, false)
 	assert.Equal(t, 2, sub.Length())
 
-	// Test watermark edge cases
-	watermark := 5
-	sub.keyAboveCopierCallback = func(key any) bool {
-		// Handle different types of keys
-		switch v := key.(type) {
-		case int:
-			return v > watermark
-		case string:
-			return false // strings always process
-		default:
-			return false
-		}
-	}
 	sub.SetKeyAboveWatermarkOptimization(true)
 
-	// Test exactly at watermark
+	// Test exactly at watermark (position 5)
 	sub.HasChanged([]any{5}, nil, false)
 	assert.Equal(t, 3, sub.Length())
 
-	// Test one above watermark
+	// Test one above watermark (position 6 > 5)
 	sub.HasChanged([]any{6}, nil, false)
 	assert.Equal(t, 3, sub.Length()) // Should not increase as it's above watermark
 
@@ -395,31 +390,80 @@ func TestKeyAboveWatermark(t *testing.T) {
 		dbConfig:        dbconn.NewDBConfig(),
 	}
 
+	mockChunker := table.NewMockChunker("test_table", 1000)
+	// Set current position to 5, so keys above 5 will be above watermark
+	mockChunker.SimulateProgress(0.005) // 5/1000 = 0.005
+
 	sub := &deltaMap{
 		c:        client,
 		table:    srcTable,
 		newTable: dstTable,
 		changes:  make(map[string]bool),
+		chunker:  mockChunker,
 	}
 
 	// Test with watermark optimization disabled
 	sub.HasChanged([]any{1}, nil, false)
 	assert.Equal(t, 1, sub.Length())
 
-	// Setup watermark callback
-	watermark := 5
-	sub.keyAboveCopierCallback = func(key any) bool {
-		return key.(int) > watermark
-	}
-
 	// Enable watermark optimization
 	sub.SetKeyAboveWatermarkOptimization(true)
 
-	// Test key below watermark
+	// Test key below watermark (3 < 5)
 	sub.HasChanged([]any{3}, nil, false)
 	assert.Equal(t, 2, sub.Length())
 
-	// Test key above watermark
+	// Test key above watermark (10 > 5)
 	sub.HasChanged([]any{10}, nil, false)
 	assert.Equal(t, 2, sub.Length()) // Should not increase as key is above watermark
+}
+
+func TestKeyBelowWatermarkMock(t *testing.T) {
+	t1 := `CREATE TABLE subscription_test (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	t2 := `CREATE TABLE _subscription_test_new (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	srcTable, dstTable := setupTestTables(t, t1, t2)
+
+	client := &Client{
+		db:              nil,
+		logger:          logrus.New(),
+		concurrency:     2,
+		targetBatchSize: 1000,
+		dbConfig:        dbconn.NewDBConfig(),
+	}
+
+	// Create mock chunker with low watermark behavior
+	mockChunker := table.NewMockChunker("test_table", 1000)
+	// Set current position to 5, so keys below 5 will be below watermark
+	mockChunker.SimulateProgress(0.005) // 5/1000 = 0.005
+
+	sub := &deltaMap{
+		c:        client,
+		table:    srcTable,
+		newTable: dstTable,
+		changes:  make(map[string]bool),
+		chunker:  mockChunker,
+	}
+
+	// Add some changes first
+	sub.HasChanged([]any{1}, nil, false)
+	sub.HasChanged([]any{3}, nil, false)
+	sub.HasChanged([]any{7}, nil, false)
+	assert.Equal(t, 3, sub.Length())
+
+	// Test that keys below watermark are identified correctly
+	// Key 3 < 5 (current position), so it should be below watermark
+	assert.True(t, mockChunker.KeyBelowLowWatermark(3))
+	// Key 7 > 5 (current position), so it should not be below watermark
+	assert.False(t, mockChunker.KeyBelowLowWatermark(7))
+
+	// Test with string keys (should return true to allow processing)
+	assert.True(t, mockChunker.KeyBelowLowWatermark("string_key"))
 }

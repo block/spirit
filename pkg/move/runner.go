@@ -168,7 +168,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := r.replClient.AddSubscription(src, dest, copyChunker.KeyAboveHighWatermark); err != nil {
+		if err := r.replClient.AddSubscription(src, dest, copyChunker); err != nil {
 			return err
 		}
 		checksumChunker, err := table.NewChunker(src, dest, r.move.TargetChunkTime, r.logger)

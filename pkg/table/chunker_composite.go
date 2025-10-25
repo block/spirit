@@ -446,8 +446,16 @@ func (t *chunkerComposite) Progress() (uint64, uint64, uint64) {
 	return atomic.LoadUint64(&t.rowsCopied), atomic.LoadUint64(&t.chunksCopied), atomic.LoadUint64(&t.Ti.EstimatedRows)
 }
 
-func (t *chunkerComposite) KeyAboveHighWatermark(key any) bool {
+// KeyAboveHighWatermark is not yet supported for composite chunker.
+// See: https://github.com/block/spirit/issues/479
+func (t *chunkerComposite) KeyAboveHighWatermark(key0 any) bool {
 	return false
+}
+
+// KeyBelowLowWatermark is not yet supported for composite chunker.
+// See: https://github.com/block/spirit/issues/479
+func (t *chunkerComposite) KeyBelowLowWatermark(key0 any) bool {
+	return true
 }
 
 // SetKey allows you to chunk on a secondary index, and not the primary key.

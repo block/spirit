@@ -14,7 +14,7 @@ import (
 func pksToRowValueConstructor(d []string) string {
 	var pkValues []string
 	for _, v := range d {
-		pkValues = append(pkValues, utils.UnhashKey(v))
+		pkValues = append(pkValues, utils.UnhashKeyToString(v))
 	}
 	return strings.Join(pkValues, ",")
 }
