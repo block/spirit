@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/block/spirit/pkg/check"
@@ -15,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -44,9 +44,9 @@ type Runner struct {
 	// With a stmt, alter, table, newTable.
 	changes []*change
 
-	currentState migrationState // must use atomic to get/set
-	replClient   *repl.Client   // feed contains all binlog subscription activity.
-	throttler    throttler.Throttler
+	status     status.State // must use atomic helpers to change.
+	replClient *repl.Client // feed contains all binlog subscription activity.
+	throttler  throttler.Throttler
 
 	copier       copier.Copier
 	copyChunker  table.Chunker // the chunker for copying
@@ -77,14 +77,6 @@ type Runner struct {
 
 	// MetricsSink
 	metricsSink metrics.Sink
-}
-
-// Progress is returned as a struct because we may add more to it later.
-// It is designed for wrappers (like a GUI) to be able to summarize the
-// current status without parsing log output.
-type Progress struct {
-	CurrentState string // string of current state, i.e. copyRows
-	Summary      string // text based representation, i.e. "12.5% copyRows ETA 1h 30m"
 }
 
 func NewRunner(m *Migration) (*Runner, error) {
@@ -240,7 +232,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// of migrations usually spend time. It is not strictly necessary,
 	// but we always recopy the last-bit, even if we are resuming
 	// partially through the checksum.
-	r.setCurrentState(stateCopyRows)
+	r.status.Set(status.CopyRows)
 	if err := r.copier.Run(ctx); err != nil {
 		return err
 	}
@@ -256,7 +248,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// manually after the migration started.
 	if r.migration.RespectSentinel {
 		r.sentinelWaitStartTime = time.Now()
-		r.setCurrentState(stateWaitingOnSentinelTable)
+		r.status.Set(status.WaitingOnSentinelTable)
 		if err := r.waitOnSentinelTable(ctx); err != nil {
 			return err
 		}
@@ -274,7 +266,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	// It's time for the final cut-over, where
 	// the tables are swapped under a lock.
-	r.setCurrentState(stateCutOver)
+	r.status.Set(status.CutOver)
 	cutoverCfg := []*cutoverConfig{}
 	for _, change := range r.changes {
 		cutoverCfg = append(cutoverCfg, &cutoverConfig{
@@ -338,7 +330,7 @@ func (r *Runner) Run(ctx context.Context) error {
 // could for example cause a stall during the cutover if the replClient
 // has too many pending updates.
 func (r *Runner) prepareForCutover(ctx context.Context) error {
-	r.setCurrentState(stateApplyChangeset)
+	r.status.Set(status.ApplyChangeset)
 	// Disable the periodic flush and flush all pending events.
 	// We want it disabled for ANALYZE TABLE and acquiring a table lock
 	// *but* it will be started again briefly inside of the checksum
@@ -352,7 +344,7 @@ func (r *Runner) prepareForCutover(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	r.setCurrentState(stateAnalyzeTable)
+	r.status.Set(status.AnalyzeTable)
 	r.logger.Infof("Running ANALYZE TABLE")
 	for _, change := range r.changes {
 		if err := dbconn.Exec(ctx, r.db, "ANALYZE TABLE %n.%n", change.newTable.SchemaName, change.newTable.TableName); err != nil {
@@ -583,7 +575,7 @@ func (r *Runner) setup(ctx context.Context) error {
 		// a user re-running a migration with a different alter
 		// statement when a previous migration was incomplete,
 		// and all progress is lost.
-		if r.migration.Strict && err == ErrMismatchedAlter {
+		if r.migration.Strict && err == status.ErrMismatchedAlter {
 			return err
 		}
 
@@ -623,7 +615,7 @@ func (r *Runner) tableChangeNotification(ctx context.Context) {
 			if !ok {
 				return // channel was closed
 			}
-			if r.getCurrentState() >= stateCutOver {
+			if r.status.Get() >= status.CutOver {
 				return
 			}
 
@@ -631,7 +623,7 @@ func (r *Runner) tableChangeNotification(ctx context.Context) {
 			// Before they are sent here, so we know it's one of our tables.
 			// Because there has been an external change,
 			// we now have to cancel our work :(
-			r.setCurrentState(stateErrCleanup)
+			r.status.Set(status.ErrCleanup)
 			// Write this to the logger, so it can be captured by the initiator.
 			r.logger.Errorf("table definition of %s changed during migration", tbl)
 			// Invalidate the checkpoint, so we don't try to resume.
@@ -669,26 +661,26 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runner) GetProgress() Progress {
+func (r *Runner) GetProgress() status.Progress {
 	var summary string
-	switch r.getCurrentState() { //nolint: exhaustive
-	case stateCopyRows:
+	switch r.status.Get() { //nolint: exhaustive
+	case status.CopyRows:
 		summary = fmt.Sprintf("%v %s ETA %v",
 			r.copier.GetProgress(),
-			r.getCurrentState().String(),
+			r.status.Get().String(),
 			r.copier.GetETA(),
 		)
-	case stateWaitingOnSentinelTable:
+	case status.WaitingOnSentinelTable:
 		summary = "Waiting on Sentinel Table"
-	case stateApplyChangeset, statePostChecksum:
+	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
-	case stateChecksum:
+	case status.Checksum:
 		r.checkerLock.Lock()
 		summary = "Checksum Progress=" + r.checker.GetProgress()
 		r.checkerLock.Unlock()
 	}
-	return Progress{
-		CurrentState: r.getCurrentState().String(),
+	return status.Progress{
+		CurrentState: r.status.Get().String(),
 		Summary:      summary,
 	}
 }
@@ -704,7 +696,7 @@ func (r *Runner) createSentinelTable(ctx context.Context) error {
 }
 
 func (r *Runner) Close() error {
-	r.setCurrentState(stateClose)
+	r.status.Set(status.Close)
 	for _, change := range r.changes {
 		err := change.Close()
 		if err != nil {
@@ -770,7 +762,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// to r.migration.Statement since it is going to be populated for both
 	// multi and non-multi table migrations.
 	if r.migration.Statement != statement {
-		return ErrMismatchedAlter
+		return status.ErrMismatchedAlter
 	}
 
 	// Initialize and call SetInfo on all the new tables, since we need the column info
@@ -871,7 +863,7 @@ func (r *Runner) initChecksumChunker() error {
 
 // checksum creates the checksum which opens the read view
 func (r *Runner) checksum(ctx context.Context) error {
-	r.setCurrentState(stateChecksum)
+	r.status.Set(status.Checksum)
 
 	// The checksum keeps the pool threads open, so we need to extend
 	// by more than +1 on threads as we did previously. We have:
@@ -930,7 +922,7 @@ func (r *Runner) checksum(ctx context.Context) error {
 	// A long checksum extends the binlog deltas
 	// So if we've called this optional checksum, we need one more state
 	// of applying the binlog deltas.
-	r.setCurrentState(statePostChecksum)
+	r.status.Set(status.PostChecksum)
 	return r.replClient.Flush(ctx)
 }
 
@@ -943,14 +935,6 @@ func (r *Runner) addsUniqueIndex() bool {
 	return false
 }
 
-func (r *Runner) getCurrentState() migrationState {
-	return migrationState(atomic.LoadInt32((*int32)(&r.currentState)))
-}
-
-func (r *Runner) setCurrentState(s migrationState) {
-	atomic.StoreInt32((*int32)(&r.currentState), int32(s))
-}
-
 // dumpCheckpoint is called approximately every minute.
 // It writes the current state of the migration to the checkpoint table,
 // which can be used in recovery. Previously resuming from checkpoint
@@ -961,19 +945,19 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 	binlog := r.replClient.GetBinlogApplyPosition()
 	copierWatermark, err := r.copyChunker.GetLowWatermark()
 	if err != nil {
-		return ErrWatermarkNotReady // it might not be ready, we can try again.
+		return status.ErrWatermarkNotReady // it might not be ready, we can try again.
 	}
 	// We only dump the checksumWatermark if we are in >= checksum state.
 	// We require a mutex because the checker can be replaced during
 	// operation, leaving a race condition.
 	var checksumWatermark string
-	if r.getCurrentState() >= stateChecksum {
+	if r.status.Get() >= status.Checksum {
 		r.checkerLock.Lock()
 		defer r.checkerLock.Unlock()
 		if r.checker != nil {
 			checksumWatermark, err = r.checksumChunker.GetLowWatermark()
 			if err != nil {
-				return ErrWatermarkNotReady
+				return status.ErrWatermarkNotReady
 			}
 		}
 	}
@@ -992,7 +976,7 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 		r.migration.Statement,
 	)
 	if err != nil {
-		return ErrCouldNotWriteCheckpoint
+		return status.ErrCouldNotWriteCheckpoint
 	}
 	return nil
 }
@@ -1006,11 +990,11 @@ func (r *Runner) dumpCheckpointContinuously(ctx context.Context) {
 			return
 		case <-ticker.C:
 			// Continue to checkpoint until we exit the checksum.
-			if r.getCurrentState() >= stateCutOver {
+			if r.status.Get() >= status.CutOver {
 				return
 			}
 			if err := r.dumpCheckpoint(ctx); err != nil {
-				if errors.Is(err, ErrWatermarkNotReady) {
+				if errors.Is(err, status.ErrWatermarkNotReady) {
 					// This is non fatal, we can try again later.
 					r.logger.Warnf("could not write checkpoint yet, watermark not ready")
 					continue
@@ -1036,16 +1020,16 @@ func (r *Runner) dumpStatus(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			state := r.getCurrentState()
-			if state > stateCutOver {
+			state := r.status.Get()
+			if state > status.CutOver {
 				return
 			}
 
 			switch state {
-			case stateCopyRows:
+			case status.CopyRows:
 				// Status for copy rows
 				r.logger.Infof("migration status: state=%s copy-progress=%s binlog-deltas=%v total-time=%s copier-time=%s copier-remaining-time=%v copier-is-throttled=%v conns-in-use=%d",
-					r.getCurrentState().String(),
+					r.status.Get().String(),
 					r.copier.GetProgress(),
 					r.replClient.GetDeltaLen(),
 					time.Since(r.startTime).Round(time.Second),
@@ -1054,9 +1038,9 @@ func (r *Runner) dumpStatus(ctx context.Context) {
 					r.copier.GetThrottler().IsThrottled(),
 					r.db.Stats().InUse,
 				)
-			case stateWaitingOnSentinelTable:
+			case status.WaitingOnSentinelTable:
 				r.logger.Infof("migration status: state=%s sentinel-table=%s.%s total-time=%s sentinel-wait-time=%s sentinel-max-wait-time=%s conns-in-use=%d",
-					r.getCurrentState().String(),
+					r.status.Get().String(),
 					r.changes[0].table.SchemaName,
 					sentinelTableName,
 					time.Since(r.startTime).Round(time.Second),
@@ -1064,23 +1048,23 @@ func (r *Runner) dumpStatus(ctx context.Context) {
 					sentinelWaitLimit,
 					r.db.Stats().InUse,
 				)
-			case stateApplyChangeset, statePostChecksum:
+			case status.ApplyChangeset, status.PostChecksum:
 				// We've finished copying rows, and we are now trying to reduce the number of binlog deltas before
 				// proceeding to the checksum and then the final cutover.
 				r.logger.Infof("migration status: state=%s binlog-deltas=%v total-time=%s conns-in-use=%d",
-					r.getCurrentState().String(),
+					r.status.Get().String(),
 					r.replClient.GetDeltaLen(),
 					time.Since(r.startTime).Round(time.Second),
 					r.db.Stats().InUse,
 				)
-			case stateChecksum:
+			case status.Checksum:
 				// This could take a while if it's a large table.
 				r.checkerLock.Lock()
 				if r.checker != nil {
 					checkerProgress := r.checker.GetProgress()
 					checkerStartTime := r.checker.StartTime()
 					r.logger.Infof("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s conns-in-use=%d",
-						r.getCurrentState().String(),
+						r.status.Get().String(),
 						checkerProgress,
 						r.replClient.GetDeltaLen(),
 						time.Since(r.startTime).Round(time.Second),
@@ -1089,7 +1073,7 @@ func (r *Runner) dumpStatus(ctx context.Context) {
 					)
 				} else {
 					r.logger.Infof("migration status: state=%s checksum-progress=initializing binlog-deltas=%v total-time=%s conns-in-use=%d",
-						r.getCurrentState().String(),
+						r.status.Get().String(),
 						r.replClient.GetDeltaLen(),
 						time.Since(r.startTime).Round(time.Second),
 						r.db.Stats().InUse,

@@ -14,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/repl"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
@@ -829,7 +830,7 @@ func TestCheckpoint(t *testing.T) {
 			Alter:    "ENGINE=InnoDB",
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, "initial", r.getCurrentState().String())
+		assert.Equal(t, "initial", r.status.Get().String())
 		r.SetLogger(testLogger)
 		// Usually we would call r.Run() but we want to step through
 		// the migration process manually.
@@ -858,8 +859,8 @@ func TestCheckpoint(t *testing.T) {
 	// Since we want to checkpoint after a few chunks.
 
 	// r.copier.StartTime = time.Now()
-	r.setCurrentState(stateCopyRows)
-	assert.Equal(t, "copyRows", r.getCurrentState().String())
+	r.status.Set(status.CopyRows)
+	assert.Equal(t, "copyRows", r.status.Get().String())
 
 	time.Sleep(time.Second) // wait for status to be updated.
 	testLogger.Lock()
@@ -972,7 +973,7 @@ func TestCheckpointRestore(t *testing.T) {
 		Alter:    "ENGINE=InnoDB",
 	})
 	assert.NoError(t, err)
-	assert.Equal(t, "initial", r.getCurrentState().String())
+	assert.Equal(t, "initial", r.status.Get().String())
 	// Usually we would call r.Run() but we want to step through
 	// the migration process manually.
 	r.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
@@ -1052,7 +1053,7 @@ func TestCheckpointRestoreBinaryPK(t *testing.T) {
 		Alter:    "ENGINE=InnoDB",
 	})
 	assert.NoError(t, err)
-	assert.Equal(t, "initial", r.getCurrentState().String())
+	assert.Equal(t, "initial", r.status.Get().String())
 	// Usually we would call r.Run() but we want to step through
 	// the migration process manually.
 	r.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
@@ -1132,7 +1133,7 @@ func TestCheckpointResumeDuringChecksum(t *testing.T) {
 		err := r.Run(ctx)
 		assert.Error(t, err) // context cancelled
 	}()
-	for r.getCurrentState() < stateWaitingOnSentinelTable {
+	for r.status.Get() < status.WaitingOnSentinelTable {
 		// Wait for the sentinel table.
 		time.Sleep(time.Millisecond)
 	}
@@ -1195,7 +1196,7 @@ func TestCheckpointDifferentRestoreOptions(t *testing.T) {
 			Alter:    alter,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, "initial", m.getCurrentState().String())
+		assert.Equal(t, "initial", m.status.Get().String())
 		// Usually we would call m.Run() but we want to step through
 		// the migration process manually.
 		m.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
@@ -1223,8 +1224,8 @@ func TestCheckpointDifferentRestoreOptions(t *testing.T) {
 	// Since we want to checkpoint after a few chunks.
 
 	// m.copier.StartTime = time.Now()
-	m.setCurrentState(stateCopyRows)
-	assert.Equal(t, "copyRows", m.getCurrentState().String())
+	m.status.Set(status.CopyRows)
+	assert.Equal(t, "copyRows", m.status.Get().String())
 
 	// first chunk.
 	chunk1, err := m.copyChunker.Next()
@@ -1386,8 +1387,8 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	defer m.Close()
-	assert.Equal(t, "initial", m.getCurrentState().String())
-	assert.Equal(t, Progress{CurrentState: "initial", Summary: ""}, m.GetProgress())
+	assert.Equal(t, "initial", m.status.Get().String())
+	assert.Equal(t, status.Progress{CurrentState: "initial", Summary: ""}, m.GetProgress())
 
 	// Usually we would call m.Run() but we want to step through
 	// the migration process manually.
@@ -1435,8 +1436,8 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	// Since we want to checkpoint after a few chunks.
 
 	// m.copier.StartTime = time.Now()
-	m.setCurrentState(stateCopyRows)
-	assert.Equal(t, "copyRows", m.getCurrentState().String())
+	m.status.Set(status.CopyRows)
+	assert.Equal(t, "copyRows", m.status.Get().String())
 
 	// We expect 2 chunks to be copied.
 	ccopier, ok := m.copier.(*copier.Unbuffered)
@@ -1448,7 +1449,7 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	assert.NotNil(t, chunk)
 	assert.Equal(t, "((`id1` < 1001)\n OR (`id1` = 1001 AND `id2` < 1))", chunk.String())
 	assert.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
-	assert.Equal(t, Progress{CurrentState: stateCopyRows.String(), Summary: "1000/1200 83.33% copyRows ETA TBD"}, m.GetProgress())
+	assert.Equal(t, status.Progress{CurrentState: status.CopyRows.String(), Summary: "1000/1200 83.33% copyRows ETA TBD"}, m.GetProgress())
 
 	// Now insert some data.
 	testutils.RunSQL(t, `insert into e2et1 (id1, id2) values (1002, 2)`)
@@ -1463,7 +1464,7 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "((`id1` > 1001)\n OR (`id1` = 1001 AND `id2` >= 1))", chunk.String())
 	assert.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
-	assert.Equal(t, Progress{CurrentState: stateCopyRows.String(), Summary: "1201/1200 100.08% copyRows ETA DUE"}, m.GetProgress())
+	assert.Equal(t, status.Progress{CurrentState: status.CopyRows.String(), Summary: "1201/1200 100.08% copyRows ETA DUE"}, m.GetProgress())
 
 	// Now insert some data.
 	// This should be picked up by the binlog subscription
@@ -1485,13 +1486,13 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	// Now that copy rows is done, we flush the changeset until trivial.
 	// and perform the optional checksum.
 	assert.NoError(t, m.replClient.Flush(t.Context()))
-	m.setCurrentState(stateApplyChangeset)
-	assert.Equal(t, "applyChangeset", m.getCurrentState().String())
-	m.setCurrentState(stateChecksum)
+	m.status.Set(status.ApplyChangeset)
+	assert.Equal(t, "applyChangeset", m.status.Get().String())
+	m.status.Set(status.Checksum)
 	m.dbConfig = dbconn.NewDBConfig()
 	assert.NoError(t, m.checksum(t.Context()))
-	assert.Equal(t, "postChecksum", m.getCurrentState().String())
-	assert.Equal(t, Progress{CurrentState: statePostChecksum.String(), Summary: "Applying Changeset Deltas=0"}, m.GetProgress())
+	assert.Equal(t, "postChecksum", m.status.Get().String())
+	assert.Equal(t, status.Progress{CurrentState: status.PostChecksum.String(), Summary: "Applying Changeset Deltas=0"}, m.GetProgress())
 
 	// All done!
 
@@ -1523,7 +1524,7 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	defer m.Close()
-	assert.Equal(t, "initial", m.getCurrentState().String())
+	assert.Equal(t, "initial", m.status.Get().String())
 
 	// Usually we would call m.Run() but we want to step through
 	// the migration process manually.
@@ -1572,8 +1573,8 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 	// Since we want to checkpoint after a few chunks.
 
 	// m.copier.StartTime = time.Now()
-	m.setCurrentState(stateCopyRows)
-	assert.Equal(t, "copyRows", m.getCurrentState().String())
+	m.status.Set(status.CopyRows)
+	assert.Equal(t, "copyRows", m.status.Get().String())
 
 	// We expect 3 chunks to be copied.
 	// The special first and last case and middle case.
@@ -1634,12 +1635,12 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 	// Now that copy rows is done, we flush the changeset until trivial.
 	// and perform the optional checksum.
 	assert.NoError(t, m.replClient.Flush(t.Context()))
-	m.setCurrentState(stateApplyChangeset)
-	assert.Equal(t, "applyChangeset", m.getCurrentState().String())
-	m.setCurrentState(stateChecksum)
+	m.status.Set(status.ApplyChangeset)
+	assert.Equal(t, "applyChangeset", m.status.Get().String())
+	m.status.Set(status.Checksum)
 	m.dbConfig = dbconn.NewDBConfig()
 	assert.NoError(t, m.checksum(t.Context()))
-	assert.Equal(t, "postChecksum", m.getCurrentState().String())
+	assert.Equal(t, "postChecksum", m.status.Get().String())
 	// All done!
 }
 
@@ -2102,7 +2103,7 @@ func TestResumeFromCheckpointStrict(t *testing.T) {
 
 	err = runner.Run(t.Context())
 	assert.Error(t, err)
-	assert.ErrorIs(t, err, ErrMismatchedAlter)
+	assert.ErrorIs(t, err, status.ErrMismatchedAlter)
 
 	assert.NoError(t, runner.Close())
 
@@ -2234,7 +2235,7 @@ func TestE2ERogueValues(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	defer m.Close()
-	assert.Equal(t, "initial", m.getCurrentState().String())
+	assert.Equal(t, "initial", m.status.Get().String())
 
 	// Usually we would call m.Run() but we want to step through
 	// the migration process manually.
@@ -2281,8 +2282,8 @@ func TestE2ERogueValues(t *testing.T) {
 	// Since we want to checkpoint after a few chunks.
 
 	// m.copier.StartTime = time.Now()
-	m.setCurrentState(stateCopyRows)
-	assert.Equal(t, "copyRows", m.getCurrentState().String())
+	m.status.Set(status.CopyRows)
+	assert.Equal(t, "copyRows", m.status.Get().String())
 
 	// We expect 2 chunks to be copied.
 	ccopier, ok := m.copier.(*copier.Unbuffered)
@@ -2320,12 +2321,12 @@ func TestE2ERogueValues(t *testing.T) {
 	// Now that copy rows is done, we flush the changeset until trivial.
 	// and perform the optional checksum.
 	assert.NoError(t, m.replClient.Flush(t.Context()))
-	m.setCurrentState(stateApplyChangeset)
-	assert.Equal(t, "applyChangeset", m.getCurrentState().String())
-	m.setCurrentState(stateChecksum)
+	m.status.Set(status.ApplyChangeset)
+	assert.Equal(t, "applyChangeset", m.status.Get().String())
+	m.status.Set(status.Checksum)
 	m.dbConfig = dbconn.NewDBConfig()
 	assert.NoError(t, m.checksum(t.Context()))
-	assert.Equal(t, "postChecksum", m.getCurrentState().String())
+	assert.Equal(t, "postChecksum", m.status.Get().String())
 	// All done!
 }
 
@@ -2429,8 +2430,8 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 	copier, ok := m.copier.(*copier.Unbuffered)
 	assert.True(t, ok)
 
-	m.setCurrentState(stateCopyRows)
-	assert.Equal(t, "copyRows", m.getCurrentState().String())
+	m.status.Set(status.CopyRows)
+	assert.Equal(t, "copyRows", m.status.Get().String())
 
 	// first chunk.
 	chunk, err := m.copyChunker.Next()
@@ -2655,7 +2656,7 @@ func TestDeferCutOver(t *testing.T) {
 
 	// While it's waiting, check the Progress.
 	time.Sleep(1 * time.Second)
-	assert.Equal(t, Progress{CurrentState: "waitingOnSentinelTable", Summary: "Waiting on Sentinel Table"}, m.GetProgress())
+	assert.Equal(t, status.Progress{CurrentState: "waitingOnSentinelTable", Summary: "Waiting on Sentinel Table"}, m.GetProgress())
 	wg.Wait()
 
 	sql := fmt.Sprintf(
@@ -2785,7 +2786,7 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	assert.NoError(t, err)
 	defer db.Close()
-	for m.getCurrentState() != stateWaitingOnSentinelTable {
+	for m.status.Get() != status.WaitingOnSentinelTable {
 	}
 	assert.NoError(t, err)
 
@@ -3345,7 +3346,7 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	}()
 
 	// Wait until the copy phase has started.
-	for m.getCurrentState() != stateCopyRows {
+	for m.status.Get() != status.CopyRows {
 		time.Sleep(1 * time.Millisecond)
 	}
 

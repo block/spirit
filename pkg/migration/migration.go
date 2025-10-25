@@ -14,12 +14,6 @@ import (
 	"github.com/pingcap/tidb/pkg/parser"
 )
 
-var (
-	ErrMismatchedAlter         = errors.New("alter statement in checkpoint table does not match the alter statement specified here")
-	ErrCouldNotWriteCheckpoint = errors.New("could not write checkpoint")
-	ErrWatermarkNotReady       = errors.New("watermark not ready")
-)
-
 type Migration struct {
 	Host                 string        `name:"host" help:"Hostname" optional:"" default:"127.0.0.1:3306"`
 	Username             string        `name:"username" help:"User" optional:"" default:"spirit"`
