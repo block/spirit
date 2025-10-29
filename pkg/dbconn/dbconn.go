@@ -211,7 +211,7 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	timer := time.AfterFunc(threshold, func() {
 		err := KillLockingTransactions(ctx, db, tables, dbConfig, logger, []int{connId})
 		if err != nil {
-			logger.Errorf("failed to kill locking transactions: %v", err)
+			return // just return, we can't do much more here
 		}
 	})
 	defer timer.Stop()
