@@ -385,8 +385,8 @@ func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 
 	cfg, err := mysql.ParseDSN(inputDSN)
 	if err != nil {
-		_ = err              // Explicitly ignore parsing error for graceful degradation
-		return inputDSN, nil // Return original DSN without error if parsing fails
+		// Return original DSN for graceful degradation when parsing fails
+		return inputDSN, nil //nolint:nilerr // Intentional graceful degradation
 	}
 
 	// If DSN already has TLS configuration, respect it
@@ -464,8 +464,8 @@ func addTLSParametersToDSN(dsn string, config *DBConfig) (string, error) {
 func createFallbackDSN(inputDSN string) (string, error) {
 	cfg, err := mysql.ParseDSN(inputDSN)
 	if err != nil {
-		_ = err              // Explicitly ignore parsing error for graceful degradation
-		return inputDSN, nil // Return original DSN without error if parsing fails
+		// Return original DSN for graceful degradation when parsing fails
+		return inputDSN, nil //nolint:nilerr // Intentional graceful degradation
 	}
 
 	// Remove TLS configuration - both from TLSConfig field and params
