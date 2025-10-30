@@ -146,7 +146,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.db, err = dbconn.New(r.dsn(), r.dbConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to main database (DSN: %s): %w", r.dsn(), err)
 	}
 
 	if r.migration.EnableExperimentalMultiTableSupport {
@@ -440,6 +440,7 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 		TargetBatchTime: r.migration.TargetChunkTime,
 		OnDDL:           r.ddlNotification,
 		ServerID:        repl.NewServerID(),
+		TLSConfig:       r.dbConfig, // Pass TLS configuration to replication client
 	})
 	// For each of the changes, we know the new table exists now
 	// So we should call SetInfo to populate the columns etc.
@@ -521,19 +522,31 @@ func (r *Runner) setupReplicationThrottler(ctx context.Context) error {
 	}
 
 	var err error
-	// Create a separate DB config for replica connection without TLS overrides
-	// The replica DSN should contain its own TLS configuration
+	// Create a separate DB config for replica connection
 	replicaDBConfig := dbconn.NewDBConfig()
 	replicaDBConfig.LockWaitTimeout = r.dbConfig.LockWaitTimeout
 	replicaDBConfig.InterpolateParams = r.dbConfig.InterpolateParams
 	replicaDBConfig.ForceKill = r.dbConfig.ForceKill
 	replicaDBConfig.MaxOpenConnections = r.dbConfig.MaxOpenConnections
-	// Note: Deliberately NOT copying TLS settings (TLSMode, TLSCertificatePath)
-	// TODO: Replica TLS configuration will be handled in a separate PR
-	// See https://github.com/block/spirit/issues/175
-	r.replica, err = dbconn.New(r.migration.ReplicaDSN, replicaDBConfig)
+
+	// Copy TLS settings from main DB config to replica config
+	// This allows the DSN enhancement to use the correct TLS settings
+	replicaDBConfig.TLSMode = r.dbConfig.TLSMode
+	replicaDBConfig.TLSCertificatePath = r.dbConfig.TLSCertificatePath
+
+	// Enhance replica DSN with TLS settings if not already present
+	// This preserves any explicit TLS configuration in the replica DSN
+	// while providing sensible defaults from the main DB configuration
+	enhancedReplicaDSN, err := dbconn.EnhanceDSNWithTLS(r.migration.ReplicaDSN, replicaDBConfig)
 	if err != nil {
-		return err
+		r.logger.Warnf("could not enhance replica DSN with TLS settings: %v", err)
+		// Continue with original DSN if enhancement fails
+		enhancedReplicaDSN = r.migration.ReplicaDSN
+	}
+
+	r.replica, err = dbconn.NewWithContext(enhancedReplicaDSN, replicaDBConfig, "replica database")
+	if err != nil {
+		return fmt.Errorf("failed to connect to replica database (DSN: %s): %w", r.migration.ReplicaDSN, err)
 	}
 
 	// An error here means the connection to the replica is not valid, or it can't be detected

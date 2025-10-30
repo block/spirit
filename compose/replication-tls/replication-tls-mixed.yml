@@ -1,0 +1,66 @@
+services:
+  mysql-main:
+    image: mysql:8.0.43
+    container_name: spirit-mysql-repl-mixed-main
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: spirit_test
+      MYSQL_USER: spirit
+      MYSQL_PASSWORD: spirit
+    ports:
+      - "3420:3306"  # Main DB port (TLS enabled)
+    volumes:
+      - mysql_main_mixed_data:/var/lib/mysql
+      - ./init-main-db.sql:/docker-entrypoint-initdb.d/init-main-db.sql
+      - ./mysql-certs:/var/lib/mysql-certs
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --ssl=ON
+      --require-secure-transport=ON
+      --bind-address=0.0.0.0
+      --server-id=1
+      --log-bin=mysql-bin
+      --gtid-mode=on
+      --enforce-gtid-consistency=on
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      timeout: 20s
+      retries: 10
+      interval: 5s
+    restart: unless-stopped
+
+  mysql-replica:
+    image: mysql:8.0.43
+    container_name: spirit-mysql-repl-mixed-replica
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: spirit_test
+      MYSQL_USER: replica_user
+      MYSQL_PASSWORD: replica_pass
+    ports:
+      - "3421:3306"  # Replica DB port (TLS disabled)
+    volumes:
+      - mysql_replica_mixed_data:/var/lib/mysql
+      - ./init-replica-db-unified.sql:/docker-entrypoint-initdb.d/init-replica-db-unified.sql
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --ssl=OFF
+      --bind-address=0.0.0.0
+      --server-id=2
+      --relay-log=mysql-relay-bin
+      --gtid-mode=on
+      --enforce-gtid-consistency=on
+      --read-only=ON
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      timeout: 20s
+      retries: 10
+      interval: 5s
+    restart: unless-stopped
+    depends_on:
+      mysql-main:
+        condition: service_healthy
+
+volumes:
+  mysql_main_mixed_data:
+  mysql_replica_mixed_data:

@@ -14,6 +14,7 @@
     - [lock-wait-timeout](#lock-wait-timeout)
     - [password](#password)
     - [replica-dsn](#replica-dsn)
+      - [Replica TLS Behavior](#replica-tls-behavior)
     - [replica-max-lag](#replica-max-lag)
     - [statement](#statement)
     - [strict](#strict)
@@ -125,6 +126,24 @@ The password to use when connecting to MySQL.
 
 Used in combination with [replica-max-lag](#replica-max-lag). This is the host which Spirit will connect to to determine if the copy should be throttled to ensure replica health.
 
+#### Replica TLS Behavior
+
+Spirit automatically applies the main database TLS configuration to replica connections when:
+- The replica DSN does not already contain TLS configuration
+- The main database TLS mode is not `DISABLED`
+
+**TLS Inheritance Rules:**
+- If replica DSN contains `tls=` parameter (any case), that setting is preserved (even if main TLS mode is `DISABLED`)
+- If main TLS mode is `DISABLED`, no TLS inheritance occurs but existing replica TLS settings remain untouched
+- Otherwise, replica inherits main DB TLS mode and certificate configuration
+- RDS replicas automatically use RDS certificate bundle when appropriate
+
+**Examples and Test Matrix:**
+
+For comprehensive examples of replica TLS behavior, including all possible combinations of main DB TLS modes and replica DSN configurations, see:
+
+📋 **[Replica TLS Testing Matrix](compose/replication-tls/usage.md)**
+
 ### replica-max-lag
 
 - Type: Duration
@@ -213,6 +232,16 @@ The username to use when connecting to MySQL.
 
 ### tls
 Spirit uses the same TLS/SSL mode options as the MySQL client, making it familiar and intuitive for users. 
+
+Spirit applies TLS configuration consistently across all database connections:
+
+**Main Database Connection**: Uses the specified `--tls-mode` and `--tls-ca` settings.
+
+**Replica Throttler Connection**: Automatically inherits TLS settings from main database unless the replica DSN already contains TLS configuration.
+
+**Binary Log Replication**: Uses the same TLS configuration as the main database for streaming binary log events.
+
+This ensures security consistency across all database communications during the migration process.
 
 | Mode | Description | Encryption | CA Verification | Hostname Verification | --tls-ca Required? |
 |------|-------------|------------|-----------------|----------------------|-------------------|

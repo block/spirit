@@ -1,0 +1,76 @@
+services:
+  mysql-main:
+    image: mysql:8.0.43
+    container_name: spirit-mysql-repl-custom-main
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: spirit_test
+      MYSQL_USER: spirit
+      MYSQL_PASSWORD: spirit
+    ports:
+      - "3410:3306"  # Main DB port for custom TLS
+    volumes:
+      - mysql_main_custom_data:/var/lib/mysql
+      - ./init-main-db.sql:/docker-entrypoint-initdb.d/init-main-db.sql
+      - ./mysql-certs:/var/lib/mysql-certs
+      - ./init-custom-certs.sh:/docker-entrypoint-initdb.d/01-init-custom-certs.sh
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --ssl=ON
+      --require-secure-transport=ON
+      --bind-address=0.0.0.0
+      --ssl-ca=/var/lib/mysql-certs/custom-ca.pem
+      --ssl-cert=/var/lib/mysql-certs/custom-server-cert.pem
+      --ssl-key=/var/lib/mysql-certs/custom-server-key.pem
+      --server-id=1
+      --log-bin=mysql-bin
+      --gtid-mode=on
+      --enforce-gtid-consistency=on
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      timeout: 20s
+      retries: 10
+      interval: 5s
+    restart: unless-stopped
+
+  mysql-replica:
+    image: mysql:8.0.43
+    container_name: spirit-mysql-repl-custom-replica
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: spirit_test
+      MYSQL_USER: replica_user
+      MYSQL_PASSWORD: replica_pass
+    ports:
+      - "3411:3306"  # Replica DB port for custom TLS
+    volumes:
+      - mysql_replica_custom_data:/var/lib/mysql
+      - ./init-replica-db-unified.sql:/docker-entrypoint-initdb.d/init-replica-db-unified.sql
+      - ./mysql-certs:/var/lib/mysql-certs
+      - ./init-custom-certs.sh:/docker-entrypoint-initdb.d/01-init-custom-certs.sh
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --ssl=ON
+      --require-secure-transport=ON
+      --bind-address=0.0.0.0
+      --ssl-ca=/var/lib/mysql-certs/custom-ca.pem
+      --ssl-cert=/var/lib/mysql-certs/custom-server-cert.pem
+      --ssl-key=/var/lib/mysql-certs/custom-server-key.pem
+      --server-id=2
+      --relay-log=mysql-relay-bin
+      --gtid-mode=on
+      --enforce-gtid-consistency=on
+      --read-only=ON
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      timeout: 20s
+      retries: 10
+      interval: 5s
+    restart: unless-stopped
+    depends_on:
+      mysql-main:
+        condition: service_healthy
+
+volumes:
+  mysql_main_custom_data:
+  mysql_replica_custom_data:

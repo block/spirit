@@ -70,6 +70,9 @@ type Client struct {
 	writeDB  *sql.DB
 	dbConfig *dbconn.DBConfig
 
+	// TLS configuration for binary log connections
+	tlsConfig *dbconn.DBConfig
+
 	// subscriptions is a map of tables that are actively
 	// watching for changes on. The key is schemaName.tableName.
 	// each subscription has its own set of changes.
@@ -113,6 +116,7 @@ func NewClient(db *sql.DB, host string, username, password string, config *Clien
 	return &Client{
 		db:                         db,
 		dbConfig:                   dbconn.NewDBConfig(),
+		tlsConfig:                  config.TLSConfig,
 		host:                       host,
 		username:                   username,
 		password:                   password,
@@ -135,7 +139,8 @@ type ClientConfig struct {
 	OnDDL                      chan string
 	ServerID                   uint32
 	UseExperimentalBufferedMap bool
-	WriteDB                    *sql.DB // if not nil, use this DB for writes.
+	WriteDB                    *sql.DB          // if not nil, use this DB for writes.
+	TLSConfig                  *dbconn.DBConfig // TLS configuration for binary log connections
 }
 
 // NewServerID randomizes the server ID to avoid conflicts with other binlog readers.
@@ -300,12 +305,14 @@ func (c *Client) Run(ctx context.Context) (err error) {
 		Password: c.password,
 		Logger:   NewLogWrapper(c.logger),
 	}
-	if dbconn.IsRDSHost(c.host) {
-		c.cfg.TLSConfig = dbconn.NewTLSConfig()
-	}
-	if c.cfg.TLSConfig != nil {
-		// Set the ServerName so that the TLS config can verify the server's certificate.
-		c.cfg.TLSConfig.ServerName = host
+
+	// Apply TLS configuration using the same infrastructure as main database connections
+	if c.tlsConfig != nil {
+		tlsConfig, err := dbconn.GetTLSConfigForBinlog(c.tlsConfig, host)
+		if err != nil {
+			return fmt.Errorf("failed to configure TLS for binlog connection: %w", err)
+		}
+		c.cfg.TLSConfig = tlsConfig
 	}
 	if dbconn.IsMySQL84(c.db) { // handle MySQL 8.4
 		c.isMySQL84 = true

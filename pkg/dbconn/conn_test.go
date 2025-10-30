@@ -58,12 +58,11 @@ func TestNewConn(t *testing.T) {
 	assert.NoError(t, err)
 	if db != nil {
 		defer db.Close()
+		var resp int
+		err = db.QueryRow("SELECT 1").Scan(&resp)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, resp)
 	}
-
-	var resp int
-	err = db.QueryRow("SELECT 1").Scan(&resp)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, resp)
 
 	// New on syntactically valid but won't respond to ping.
 	db, err = New("root:wrongpassword@tcp(127.0.0.1)/doesnotexist", NewDBConfig())
@@ -75,7 +74,9 @@ func TestNewConnRejectsReadOnlyConnections(t *testing.T) {
 	// Database connection check
 	db, err := New(testutils.DSN(), NewDBConfig())
 	assert.NoError(t, err)
-	db.Close()
+	if db != nil {
+		db.Close()
+	}
 
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS conn_read_only")
 	testutils.RunSQL(t, "CREATE TABLE conn_read_only (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")

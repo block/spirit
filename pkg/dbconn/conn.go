@@ -203,6 +203,19 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 		return "", err
 	}
 
+	// If DSN already has TLS configuration, respect it and don't override
+	if cfg.TLSConfig != "" {
+		// DSN already has explicit TLS configuration - use it as-is
+		return dsn, nil
+	}
+
+	// Check if DSN already has tls parameter in query string (case insensitive)
+	lowerDSN := strings.ToLower(dsn)
+	if strings.Contains(lowerDSN, "tls=") {
+		// DSN already has explicit TLS parameter - use it as-is
+		return dsn, nil
+	}
+
 	// Determine TLS configuration strategy based on SSL mode
 	switch strings.ToUpper(config.TLSMode) {
 	case "DISABLED":
@@ -292,6 +305,11 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 // append additional options to it to standardize the connection.
 // It will also ping the connection to ensure it is valid.
 func New(inputDSN string, config *DBConfig) (db *sql.DB, err error) {
+	return NewWithContext(inputDSN, config, "main database")
+}
+
+// NewWithContext is like New but includes context about the connection type for better error messages
+func NewWithContext(inputDSN string, config *DBConfig, connectionType string) (db *sql.DB, err error) {
 	dsn, err := newDSN(inputDSN, config)
 	if err != nil {
 		return nil, err
@@ -317,21 +335,24 @@ func New(inputDSN string, config *DBConfig) (db *sql.DB, err error) {
 			_ = db.Close()
 		}
 
-		// TLS failed, try without TLS by creating a DISABLED mode DSN
+		// TLS failed, try without TLS by explicitly removing TLS parameters
 		configCopy := *config
 		configCopy.TLSMode = "DISABLED"
-		fallbackDSN, err := newDSN(inputDSN, &configCopy)
+
+		// For fallback, we need to strip any existing TLS parameters from the DSN
+		// because the TLS parameter preservation logic will otherwise keep them
+		fallbackDSN, err := createFallbackDSN(inputDSN)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create fallback DSN for %s connection: %w", connectionType, err)
 		}
 
 		db, err = sql.Open("mysql", fallbackDSN)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to open fallback %s connection: %w", connectionType, err)
 		}
 		if err := db.Ping(); err != nil {
 			_ = db.Close()
-			return nil, err
+			return nil, fmt.Errorf("[%s-CONNECTION-FALLBACK] ping failed: %w", strings.ToUpper(strings.ReplaceAll(connectionType, " ", "-")), err)
 		}
 		return db, nil
 	}
@@ -339,11 +360,240 @@ func New(inputDSN string, config *DBConfig) (db *sql.DB, err error) {
 	// For all other modes, use standard connection
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open %s connection: %w", connectionType, err)
 	}
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, fmt.Errorf("[%s-CONNECTION] ping failed: %w", strings.ToUpper(strings.ReplaceAll(connectionType, " ", "-")), err)
 	}
 	return db, nil
+}
+
+// EnhanceDSNWithTLS enhances a DSN with TLS settings from the provided config
+// if the DSN doesn't already contain TLS parameters.
+// This allows replica connections to inherit TLS settings from the main connection
+// while still respecting explicit TLS configuration in the DSN.
+func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
+	if config == nil || config.TLSMode == "DISABLED" {
+		return inputDSN, nil
+	}
+
+	// Handle empty DSN
+	if inputDSN == "" {
+		return inputDSN, nil
+	}
+
+	cfg, err := mysql.ParseDSN(inputDSN)
+	if err != nil {
+		// Return original DSN for graceful degradation when parsing fails
+		return inputDSN, nil //nolint:nilerr // Intentional graceful degradation
+	}
+
+	// If DSN already has TLS configuration, respect it
+	if cfg.TLSConfig != "" {
+		return inputDSN, nil
+	}
+
+	// Check if DSN already has tls parameter in query string (case insensitive)
+	lowerDSN := strings.ToLower(inputDSN)
+	if strings.Contains(lowerDSN, "tls=") {
+		return inputDSN, nil
+	}
+
+	// Enhance DSN with TLS settings from main config
+	return addTLSParametersToDSN(inputDSN, config)
+}
+
+// addTLSParametersToDSN adds TLS parameters to a DSN based on the provided config
+func addTLSParametersToDSN(dsn string, config *DBConfig) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return dsn, err // Return original DSN with error if parsing fails
+	}
+
+	// Initialize TLS configurations if needed
+	var tlsParam string
+	switch strings.ToUpper(config.TLSMode) {
+	case "DISABLED":
+		return dsn, nil // No TLS needed
+	case "PREFERRED":
+		// For PREFERRED mode, we need to setup custom TLS config
+		if err := initCustomTLS(config); err != nil {
+			return dsn, err
+		}
+		tlsParam = customTLSConfigName
+	case "REQUIRED":
+		if IsRDSHost(cfg.Addr) {
+			if err := initRDSTLS(); err != nil {
+				return dsn, err
+			}
+			tlsParam = rdsTLSConfigName
+		} else {
+			if err := initCustomTLS(config); err != nil {
+				return dsn, err
+			}
+			tlsParam = requiredTLSConfigName
+		}
+	case "VERIFY_CA":
+		if err := initCustomTLS(config); err != nil {
+			return dsn, err
+		}
+		tlsParam = verifyCATLSConfigName
+	case "VERIFY_IDENTITY":
+		if err := initCustomTLS(config); err != nil {
+			return dsn, err
+		}
+		tlsParam = verifyIDTLSConfigName
+	default:
+		// For unknown modes, use PREFERRED logic
+		if err := initCustomTLS(config); err != nil {
+			return dsn, err
+		}
+		tlsParam = customTLSConfigName
+	}
+
+	// Add TLS parameter to DSN
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	return fmt.Sprintf("%s%stls=%s", dsn, separator, url.QueryEscape(tlsParam)), nil
+}
+
+// createFallbackDSN creates a DSN with all TLS parameters removed for PREFERRED mode fallback
+func createFallbackDSN(inputDSN string) (string, error) {
+	cfg, err := mysql.ParseDSN(inputDSN)
+	if err != nil {
+		// Return original DSN for graceful degradation when parsing fails
+		return inputDSN, nil //nolint:nilerr // Intentional graceful degradation
+	}
+
+	// Remove TLS configuration - both from TLSConfig field and params
+	cfg.TLSConfig = ""
+
+	// Remove tls parameter from params if present (case-insensitive)
+	if cfg.Params != nil {
+		// Remove 'tls' parameter in any case variation
+		for key := range cfg.Params {
+			if strings.ToLower(key) == "tls" {
+				delete(cfg.Params, key)
+			}
+		}
+	}
+
+	// Format the DSN back without TLS parameters
+	return cfg.FormatDSN(), nil
+}
+
+// GetTLSConfigForBinlog creates a TLS config for binary log connections
+// using the same logic as main database connections
+func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
+	if config == nil || config.TLSMode == "DISABLED" {
+		return nil, nil
+	}
+
+	var tlsConfig *tls.Config
+
+	switch strings.ToUpper(config.TLSMode) {
+	case "PREFERRED":
+		// For PREFERRED mode, we need to setup custom TLS config
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+
+	case "REQUIRED":
+		if IsRDSHost(host) {
+			if err := initRDSTLS(); err != nil {
+				return nil, err
+			}
+			tlsConfig = NewTLSConfig()
+		} else {
+			if err := initCustomTLS(config); err != nil {
+				return nil, err
+			}
+			var certData []byte
+			if config.TLSCertificatePath != "" {
+				var err error
+				certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+				if err != nil {
+					return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+				}
+			} else {
+				certData = GetEmbeddedRDSBundle()
+			}
+			tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+		}
+
+	case "VERIFY_CA":
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+
+	case "VERIFY_IDENTITY":
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+
+	default:
+		// For unknown modes, use PREFERRED logic
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+	}
+
+	// Special handling for RDS hosts when TLS config is disabled or nil
+	if tlsConfig == nil && IsRDSHost(host) {
+		tlsConfig = NewTLSConfig()
+	}
+
+	// Set ServerName for certificate verification if we have a TLS config
+	if tlsConfig != nil {
+		tlsConfig.ServerName = host
+	}
+
+	return tlsConfig, nil
 }

@@ -42,12 +42,19 @@ verify:
 cleanup:
 	@echo "🧹 Cleaning up TLS-disabled test environment"
 	@echo "============================================"
-	@docker-compose -f 8.0.43-tls-disabled.yml down -v --remove-orphans
+	@docker-compose -f 8.0.43-tls-disabled.yml down -v --remove-orphans 2>/dev/null || true
+	@docker stop spirit-mysql-tls-test 2>/dev/null || true
 	@docker container prune -f
+	@docker volume rm mysql_test_data tls_mysql_test_data 2>/dev/null || true
 	@docker network prune -f
 	@rm -f spirit
 	@echo ""
 	@echo "✅ Cleanup complete!"
+
+# Alternative: Use the comprehensive clean-start script
+clean-start:
+	@echo "🚀 Using comprehensive clean-start script..."
+	@./clean-start.sh disabled
 
 # Start MySQL container with TLS enabled
 start-tls:
@@ -173,6 +180,9 @@ cleanup-custom:
 help:
 	@echo "Spirit TLS Testing Makefile"
 	@echo "=========================="
+	@echo ""
+	@echo "QUICK START:"
+	@echo "  make clean-start    - Complete cleanup and fresh start (recommended)"
 	@echo ""
 	@echo "TLS-DISABLED Server Tests (Port 3306):"
 	@echo "  make start      - Start MySQL with SSL disabled"
