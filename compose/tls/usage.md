@@ -2,7 +2,9 @@
 
 ## Complete Test Matrix
 
-This document outlines the comprehensive TLS testing scenarios for Spirit's MySQL-compatible TLS modes.
+This document outlines the comprehensive TLS testing scenarios for Spirit's MySQL-compatible TLS modes, including replica TLS inheritance behavior.
+
+## Main Database TLS Modes
 
 ### TLS-Disabled Server (Port 3306) 🔓
 

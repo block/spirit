@@ -9,7 +9,6 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -307,37 +306,13 @@ func (c *Client) Run(ctx context.Context) (err error) {
 		Logger:   NewLogWrapper(c.logger),
 	}
 
-	// Enhanced TLS configuration logic
-	if c.tlsConfig != nil && c.tlsConfig.TLSMode != "DISABLED" {
-		var certData []byte
-		tlsMode := c.tlsConfig.TLSMode
-
-		// Load certificate data
-		if c.tlsConfig.TLSCertificatePath != "" {
-			certData, err = dbconn.LoadCertificateFromFile(c.tlsConfig.TLSCertificatePath)
-			if err != nil {
-				return fmt.Errorf("failed to load TLS certificate: %w", err)
-			}
-		} else {
-			// Use embedded RDS bundle as fallback
-			certData = dbconn.GetEmbeddedRDSBundle()
+	// Apply TLS configuration using the same infrastructure as main database connections
+	if c.tlsConfig != nil {
+		tlsConfig, err := dbconn.GetTLSConfigForBinlog(c.tlsConfig, host)
+		if err != nil {
+			return fmt.Errorf("failed to configure TLS for binlog connection: %w", err)
 		}
-
-		// For RDS hosts in REQUIRED mode, use RDS TLS config
-		if dbconn.IsRDSHost(c.host) && strings.ToUpper(tlsMode) == "REQUIRED" {
-			c.cfg.TLSConfig = dbconn.NewTLSConfig()
-		} else {
-			// Use custom TLS config for all other cases
-			c.cfg.TLSConfig = dbconn.NewCustomTLSConfig(certData, tlsMode)
-		}
-	} else if dbconn.IsRDSHost(c.host) {
-		// Fallback to old behavior for RDS hosts when no TLS config is provided
-		c.cfg.TLSConfig = dbconn.NewTLSConfig()
-	}
-
-	if c.cfg.TLSConfig != nil {
-		// Set the ServerName so that the TLS config can verify the server's certificate.
-		c.cfg.TLSConfig.ServerName = host
+		c.cfg.TLSConfig = tlsConfig
 	}
 	if dbconn.IsMySQL84(c.db) { // handle MySQL 8.4
 		c.isMySQL84 = true

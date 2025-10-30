@@ -484,3 +484,116 @@ func createFallbackDSN(inputDSN string) (string, error) {
 	// Format the DSN back without TLS parameters
 	return cfg.FormatDSN(), nil
 }
+
+// GetTLSConfigForBinlog creates a TLS config for binary log connections
+// using the same logic as main database connections
+func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
+	if config == nil || config.TLSMode == "DISABLED" {
+		return nil, nil
+	}
+
+	var tlsConfig *tls.Config
+
+	switch strings.ToUpper(config.TLSMode) {
+	case "PREFERRED":
+		// For PREFERRED mode, we need to setup custom TLS config
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+
+	case "REQUIRED":
+		if IsRDSHost(host) {
+			if err := initRDSTLS(); err != nil {
+				return nil, err
+			}
+			tlsConfig = NewTLSConfig()
+		} else {
+			if err := initCustomTLS(config); err != nil {
+				return nil, err
+			}
+			var certData []byte
+			if config.TLSCertificatePath != "" {
+				var err error
+				certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+				if err != nil {
+					return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+				}
+			} else {
+				certData = GetEmbeddedRDSBundle()
+			}
+			tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+		}
+
+	case "VERIFY_CA":
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+
+	case "VERIFY_IDENTITY":
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+
+	default:
+		// For unknown modes, use PREFERRED logic
+		if err := initCustomTLS(config); err != nil {
+			return nil, err
+		}
+		var certData []byte
+		if config.TLSCertificatePath != "" {
+			var err error
+			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			}
+		} else {
+			certData = GetEmbeddedRDSBundle()
+		}
+		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
+	}
+
+	// Special handling for RDS hosts when TLS config is disabled or nil
+	if tlsConfig == nil && IsRDSHost(host) {
+		tlsConfig = NewTLSConfig()
+	}
+
+	// Set ServerName for certificate verification if we have a TLS config
+	if tlsConfig != nil {
+		tlsConfig.ServerName = host
+	}
+
+	return tlsConfig, nil
+}
