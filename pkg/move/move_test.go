@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	checkpointDumpInterval = 100 * time.Millisecond
+	status.CheckpointDumpInterval = 100 * time.Millisecond
 	sentinelCheckInterval = 100 * time.Millisecond
 	sentinelWaitLimit = 10 * time.Second
 	goleak.VerifyTestMain(m)

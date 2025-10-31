@@ -28,7 +28,6 @@ var (
 	sentinelWaitLimit       = 48 * time.Hour
 	sentinelTableName       = "_spirit_sentinel" // this is now a const.
 	checkpointTableName     = "_spirit_checkpoint"
-	checkpointDumpInterval  = 50 * time.Second
 )
 
 type Runner struct {
@@ -60,6 +59,8 @@ type Runner struct {
 	cancelFunc context.CancelFunc
 	dbConfig   *dbconn.DBConfig
 }
+
+var _ status.Task = (*Runner)(nil)
 
 func NewRunner(m *Move) (*Runner, error) {
 	r := &Runner{
@@ -445,8 +446,53 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 	go r.replClient.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
 	//go r.tableChangeNotification(ctx)
 
-	//go r.dumpStatus(ctx)                 // start periodically writing status
-	go r.dumpCheckpointContinuously(ctx) // start periodically dumping the checkpoint.
+	// Start go routines for checkpointing and dumping status
+	status.WatchTask(ctx, r, r.logger)
+}
+
+func (r *Runner) Status() string {
+	state := r.status.Get()
+	if state > status.CutOver {
+		return ""
+	}
+	switch state { //nolint: exhaustive
+	case status.CopyRows:
+		// Status for copy rows
+		return fmt.Sprintf("migration status: state=%s copy-progress=%s binlog-deltas=%v total-time=%s copier-time=%s copier-remaining-time=%v copier-is-throttled=%v",
+			r.status.Get().String(),
+			r.copier.GetProgress(),
+			r.replClient.GetDeltaLen(),
+			time.Since(r.startTime).Round(time.Second),
+			time.Since(r.copier.StartTime()).Round(time.Second),
+			r.copier.GetETA(),
+			r.copier.GetThrottler().IsThrottled(),
+		)
+	case status.WaitingOnSentinelTable:
+		return fmt.Sprintf("migration status: state=%s total-time=%s sentinel-wait-time=%s sentinel-max-wait-time=%s",
+			r.status.Get().String(),
+			time.Since(r.startTime).Round(time.Second),
+			time.Since(r.sentinelWaitStartTime).Round(time.Second),
+			sentinelWaitLimit,
+		)
+	case status.ApplyChangeset, status.PostChecksum:
+		// We've finished copying rows, and we are now trying to reduce the number of binlog deltas before
+		// proceeding to the checksum and then the final cutover.
+		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s",
+			r.status.Get().String(),
+			r.replClient.GetDeltaLen(),
+			time.Since(r.startTime).Round(time.Second),
+		)
+	case status.Checksum:
+		// This could take a while if it's a large table.
+		return fmt.Sprintf("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s",
+			r.status.Get().String(),
+			r.checker.GetProgress(),
+			r.replClient.GetDeltaLen(),
+			time.Since(r.startTime).Round(time.Second),
+			time.Since(r.checker.StartTime()).Round(time.Second),
+		)
+	}
+	return ""
 }
 
 func (r *Runner) SetLogger(logger loggers.Advanced) {
@@ -476,15 +522,12 @@ func (r *Runner) prepareForCutover(ctx context.Context) error {
 		}
 	}
 
-	r.status.Set(status.Checksum)
 	if err := r.checksumChunker.Open(); err != nil {
 		return err
 	}
 	defer r.checksumChunker.Close()
 
 	// Perform a checksum operation
-	// TODO: we currently don't support repairing in move
-	// But if we do, we need to modify the checker so it can re-run on failure.
 	var err error
 	r.checker, err = checksum.NewChecker(r.source, r.checksumChunker, r.replClient, &checksum.CheckerConfig{
 		Concurrency:     r.move.Threads,
@@ -492,10 +535,12 @@ func (r *Runner) prepareForCutover(ctx context.Context) error {
 		DBConfig:        r.dbConfig,
 		Logger:          r.logger,
 		WriteDB:         r.target,
+		FixDifferences:  true,
 	})
 	if err != nil {
 		return err
 	}
+	r.status.Set(status.Checksum)
 	return r.checker.Run(ctx)
 }
 
@@ -503,7 +548,7 @@ func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {
 	r.cutoverFunc = cutover
 }
 
-func (r *Runner) GetProgress() status.Progress {
+func (r *Runner) Progress() status.Progress {
 	var summary string
 	switch r.status.Get() { //nolint: exhaustive
 	case status.CopyRows:
@@ -524,13 +569,10 @@ func (r *Runner) GetProgress() status.Progress {
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
 	case status.Checksum:
-		summary = fmt.Sprintf("%v %s",
-			r.checker.GetProgress(),
-			r.status.Get().String(),
-		)
+		summary = "Checksum Progress=" + r.checker.GetProgress()
 	}
 	return status.Progress{
-		CurrentState: r.status.Get().String(),
+		CurrentState: r.status.Get(),
 		Summary:      summary,
 	}
 }
@@ -589,12 +631,12 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) error {
 	}
 }
 
-// dumpCheckpoint is called approximately every minute.
+// DumpCheckpoint is called approximately every minute.
 // It writes the current state of the migration to the checkpoint table,
 // which can be used in recovery. Previously resuming from checkpoint
 // would always restart at the copier, but it can now also resume at
 // the checksum phase.
-func (r *Runner) dumpCheckpoint(ctx context.Context) error {
+func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	// Retrieve the binlog position first and under a mutex.
 	binlog := r.replClient.GetBinlogApplyPosition()
 	copierWatermark, err := r.copyChunker.GetLowWatermark()
@@ -633,37 +675,6 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runner) dumpCheckpointContinuously(ctx context.Context) {
-	ticker := time.NewTicker(checkpointDumpInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// Continue to checkpoint until we exit the checksum.
-			if r.status.Get() >= status.CutOver {
-				return
-			}
-			if err := r.dumpCheckpoint(ctx); err != nil {
-				if errors.Is(err, status.ErrWatermarkNotReady) {
-					// This is non fatal, we can try again later.
-					r.logger.Warnf("could not write checkpoint yet, watermark not ready")
-					continue
-				}
-				// If the error is context canceled, that's fine too.
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				// Other errors such as not being able to write to the checkpoint
-				// table are considered fatal. This is because if we can't record
-				// our progress, we don't want to continue doing work.
-				// We could get 10 days into a migration, and then fail, and then
-				// discover this. It's better to fast fail now.
-				r.logger.Errorf("error writing checkpoint: %v", err)
-				r.cancelFunc()
-				return
-			}
-		}
-	}
+func (r *Runner) Cancel() {
+	r.cancelFunc()
 }
