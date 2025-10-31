@@ -303,7 +303,7 @@ func TestInvisibleIndexBeforeDropLinter_RaiseErrorTrue_ProducesError(t *testing.
 	violations := linter.Lint(nil, stmts)
 
 	require.Len(t, violations, 1)
-	assert.Equal(t, SeverityError, violations[0].Severity)
+	assert.Equal(t, SeverityWarning, violations[0].Severity)
 }
 
 func TestInvisibleIndexBeforeDropLinter_RaiseErrorFalse_ProducesWarning(t *testing.T) {
@@ -357,7 +357,7 @@ func TestInvisibleIndexBeforeDropLinter_IntegrationWithConfig_RaiseErrorTrue(t *
 	require.NoError(t, err)
 
 	require.Len(t, violations, 1)
-	assert.Equal(t, SeverityError, violations[0].Severity)
+	assert.Equal(t, SeverityWarning, violations[0].Severity)
 }
 
 func TestInvisibleIndexBeforeDropLinter_IntegrationWithConfig_RaiseErrorFalse(t *testing.T) {

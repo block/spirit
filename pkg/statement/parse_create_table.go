@@ -188,7 +188,7 @@ func ParseCreateTable(sql string) (*CreateTable, error) {
 	}
 
 	// Parse into structured format
-	err = ct.parseToStruct()
+	ct.parseToStruct()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse CREATE TABLE statement: %w", err)
 	}
@@ -301,7 +301,7 @@ func (constraints Constraints) HasForeignKeys() bool {
 }
 
 // parseToStruct converts the AST into a structured CreateTable
-func (ct *CreateTable) parseToStruct() error {
+func (ct *CreateTable) parseToStruct() {
 	ct.TableName = ct.Raw.Table.Name.String()
 	ct.IfNotExists = ct.Raw.IfNotExists
 	ct.Temporary = ct.Raw.TemporaryKeyword != 0
@@ -337,8 +337,6 @@ func (ct *CreateTable) parseToStruct() error {
 	if ct.Raw.Partition != nil {
 		ct.Partition = ct.parsePartitionOptions(ct.Raw.Partition)
 	}
-
-	return nil
 }
 
 // parseColumn converts a column definition to a Column struct

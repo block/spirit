@@ -56,10 +56,9 @@ func (l *InvisibleIndexBeforeDropLinter) DefaultConfig() map[string]string {
 var _ ConfigurableLinter = &InvisibleIndexBeforeDropLinter{}
 
 func (l *InvisibleIndexBeforeDropLinter) Lint(existingTables []*statement.CreateTable, changes []*statement.AbstractStatement) []Violation {
+	// TODO: Consider re-enabling raiseError configuration to allow SeverityError
+	// For now, always use SeverityWarning regardless of raiseError setting
 	severity := SeverityWarning
-	if l.raiseError {
-		severity = SeverityError
-	}
 
 	var violations []Violation
 

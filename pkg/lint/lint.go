@@ -59,9 +59,11 @@ package lint
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 
 	"github.com/block/spirit/pkg/statement"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 )
 
 // Config holds linter configuration
@@ -77,6 +79,9 @@ type Config struct {
 	// LintOnlyChanges indicates whether to lint only the changes
 	// or all of the existing schema plus the changes.
 	LintOnlyChanges bool
+
+	// IgnoreTables can be used to discard violations for specific tables
+	IgnoreTables map[string]bool
 }
 
 // RunLinters runs all enabled linters and returns any violations found.
@@ -158,12 +163,25 @@ func RunLinters(existingSchema []*statement.CreateTable, changes []*statement.Ab
 			return nil, err
 		}
 		for _, v := range violations {
-			if _, ok := tables[v.Location.Table]; ok {
+			if v.Location != nil {
+				if _, ok := tables[v.Location.Table]; ok {
+					filtered = append(filtered, v)
+				}
+			}
+		}
+		violations = filtered
+	}
+
+	if len(config.IgnoreTables) > 0 {
+		var filtered []Violation
+		for _, v := range violations {
+			if v.Location == nil || !config.IgnoreTables[v.Location.Table] {
 				filtered = append(filtered, v)
 			}
 		}
 		violations = filtered
 	}
+
 	return violations, errors.Join(errs...)
 }
 
@@ -221,4 +239,127 @@ func FilterByLinter(violations []Violation, linterName string) []Violation {
 	}
 
 	return filtered
+}
+
+// AlterTableTypeToString converts an AlterTableType constant to a human-readable string
+func AlterTableTypeToString(tp ast.AlterTableType) string {
+	switch tp {
+	case ast.AlterTableOption:
+		return "ALTER TABLE OPTION"
+	case ast.AlterTableAddColumns:
+		return "ADD COLUMN"
+	case ast.AlterTableAddConstraint:
+		return "ADD CONSTRAINT"
+	case ast.AlterTableDropColumn:
+		return "DROP COLUMN"
+	case ast.AlterTableDropPrimaryKey:
+		return "DROP PRIMARY KEY"
+	case ast.AlterTableDropIndex:
+		return "DROP INDEX"
+	case ast.AlterTableDropForeignKey:
+		return "DROP FOREIGN KEY"
+	case ast.AlterTableModifyColumn:
+		return "MODIFY COLUMN"
+	case ast.AlterTableChangeColumn:
+		return "CHANGE COLUMN"
+	case ast.AlterTableRenameColumn:
+		return "RENAME COLUMN"
+	case ast.AlterTableRenameTable:
+		return "RENAME TABLE"
+	case ast.AlterTableAlterColumn:
+		return "ALTER COLUMN"
+	case ast.AlterTableLock:
+		return "LOCK"
+	case ast.AlterTableAlgorithm:
+		return "ALGORITHM"
+	case ast.AlterTableRenameIndex:
+		return "RENAME INDEX"
+	case ast.AlterTableForce:
+		return "FORCE"
+	case ast.AlterTableAddPartitions:
+		return "ADD PARTITION"
+	case ast.AlterTableCoalescePartitions:
+		return "COALESCE PARTITION"
+	case ast.AlterTableDropPartition:
+		return "DROP PARTITION"
+	case ast.AlterTableTruncatePartition:
+		return "TRUNCATE PARTITION"
+	case ast.AlterTablePartition:
+		return "PARTITION BY"
+	case ast.AlterTableEnableKeys:
+		return "ENABLE KEYS"
+	case ast.AlterTableDisableKeys:
+		return "DISABLE KEYS"
+	case ast.AlterTableRemovePartitioning:
+		return "REMOVE PARTITIONING"
+	case ast.AlterTableWithValidation:
+		return "WITH VALIDATION"
+	case ast.AlterTableWithoutValidation:
+		return "WITHOUT VALIDATION"
+	case ast.AlterTableSecondaryLoad:
+		return "SECONDARY_LOAD"
+	case ast.AlterTableSecondaryUnload:
+		return "SECONDARY_UNLOAD"
+	case ast.AlterTableRebuildPartition:
+		return "REBUILD PARTITION"
+	case ast.AlterTableReorganizePartition:
+		return "REORGANIZE PARTITION"
+	case ast.AlterTableCheckPartitions:
+		return "CHECK PARTITION"
+	case ast.AlterTableExchangePartition:
+		return "EXCHANGE PARTITION"
+	case ast.AlterTableOptimizePartition:
+		return "OPTIMIZE PARTITION"
+	case ast.AlterTableRepairPartition:
+		return "REPAIR PARTITION"
+	case ast.AlterTableImportPartitionTablespace:
+		return "IMPORT PARTITION TABLESPACE"
+	case ast.AlterTableDiscardPartitionTablespace:
+		return "DISCARD PARTITION TABLESPACE"
+	case ast.AlterTableAlterCheck:
+		return "ALTER CHECK"
+	case ast.AlterTableDropCheck:
+		return "DROP CHECK"
+	case ast.AlterTableImportTablespace:
+		return "IMPORT TABLESPACE"
+	case ast.AlterTableDiscardTablespace:
+		return "DISCARD TABLESPACE"
+	case ast.AlterTableIndexInvisible:
+		return "ALTER INDEX INVISIBLE"
+	case ast.AlterTableOrderByColumns:
+		return "ORDER BY"
+	case ast.AlterTableSetTiFlashReplica:
+		return "SET TIFLASH REPLICA"
+	default:
+		return fmt.Sprintf("ALTER TABLE (type %d)", tp)
+	}
+}
+
+// CreateTableStatements returns an iterator over all CREATE TABLE statements,
+// combining those from the existing schema state and those included in incoming changes.
+func CreateTableStatements(statements ...any) iter.Seq[*statement.CreateTable] {
+	return func(yield func(*statement.CreateTable) bool) {
+		for _, arg := range statements {
+			switch v := arg.(type) {
+			case []*statement.CreateTable:
+				for _, ct := range v {
+					if !yield(ct) {
+						return
+					}
+				}
+			case []*statement.AbstractStatement:
+				for _, stmt := range v {
+					if stmt.IsCreateTable() {
+						ct, _ := stmt.ParseCreateTable()
+						if !yield(ct) {
+							return
+						}
+					}
+				}
+			default:
+				// If someone passes an unsupported type, just skip it — it's not a CREATE TABLE statement
+				continue
+			}
+		}
+	}
 }

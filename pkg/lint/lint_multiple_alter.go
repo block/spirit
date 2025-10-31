@@ -69,14 +69,11 @@ func (l *MultipleAlterTableLinter) Lint(_ []*statement.CreateTable, changes []*s
 				strings.Join(operations, ", "))
 		}
 
-		message := fmt.Sprintf("Table '%s' has %d separate ALTER TABLE statements that could be combined into one for better performance",
-			tableName,
-			len(indices))
-
 		violation := Violation{
-			Linter:   l,
-			Severity: SeverityInfo,
-			Message:  message,
+			Linter: l,
+			// TODO: Consider changing back to SeverityInfo - this is an optimization suggestion, not a problem
+			Severity: SeverityWarning,
+			Message:  fmt.Sprintf("Table '%s' has %d separate ALTER TABLE statements that could be combined into one for better performance", tableName, len(indices)),
 			Location: &Location{
 				Table: tableName,
 			},

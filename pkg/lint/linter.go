@@ -17,7 +17,7 @@ type Linter interface {
 
 	// Lint performs the actual linting and returns any violations found.
 	// Linters can use either or both of the parameters as needed.
-	Lint(existingTables []*statement.CreateTable, changes []*statement.AbstractStatement) []Violation
+	Lint(existingTables []*statement.CreateTable, changes []*statement.AbstractStatement) (violations []Violation)
 
 	// String returns a string representation of the linter
 	String() string
@@ -54,4 +54,15 @@ func ConfigBool(value string, key string) (bool, error) {
 	}
 
 	return false, fmt.Errorf("invalid value for %s: %s (expected 'true' or 'false')", key, value)
+}
+
+func GetConfigBool(c map[string]string, key string) bool {
+	if v, ok := c[key]; ok {
+		return strings.EqualFold(v, "true")
+	}
+	return false
+}
+
+func strPtr(s string) *string {
+	return &s
 }

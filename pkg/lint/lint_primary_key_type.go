@@ -2,6 +2,7 @@ package lint
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/statement"
@@ -9,48 +10,90 @@ import (
 )
 
 func init() {
-	Register(&PrimaryKeyTypeLinter{})
+	Register(&PrimaryKeyLinter{})
 }
 
-// PrimaryKeyTypeLinter checks that primary keys use appropriate data types.
-// Primary keys should be BIGINT (preferably UNSIGNED) or BINARY/VARBINARY.
-// Other types are flagged as errors, and signed BIGINT is flagged as a warning.
-type PrimaryKeyTypeLinter struct{}
+// PrimaryKeyLinter checks that primary keys are defined and use appropriate data types.
+// Primary keys should be BIGINT (preferably UNSIGNED) or BINARY/VARBINARY, but the linter can be configured to allow other types.
+// Missing PK and other types are flagged as errors, and signed int types are flagged as a warning.
+type PrimaryKeyLinter struct {
+	allowedTypes map[string]struct{}
+}
 
-func (l *PrimaryKeyTypeLinter) String() string {
+var primaryKeyTypeLinterSupportedTypes = []string{
+	"BINARY", "VARBINARY", "BIGINT",
+	"CHAR", "VARCHAR",
+	"BIT", "DECIMAL", "ENUM", "SET",
+	"TINYINT", "SMALLINT", "MEDIUMINT", "INT",
+	"TIME", "TIMESTAMP", "YEAR", "DATE", "DATETIME",
+}
+
+func (l *PrimaryKeyLinter) String() string {
 	return Stringer(l)
 }
 
-func (l *PrimaryKeyTypeLinter) Name() string {
-	return "primary_key_type"
+func (l *PrimaryKeyLinter) Name() string {
+	return "primary_key"
 }
 
-func (l *PrimaryKeyTypeLinter) Description() string {
+func (l *PrimaryKeyLinter) Description() string {
 	return "Ensures primary keys use BIGINT (preferably UNSIGNED) or BINARY/VARBINARY types"
 }
 
-func (l *PrimaryKeyTypeLinter) Lint(existingTables []*statement.CreateTable, changes []*statement.AbstractStatement) []Violation {
-	var violations []Violation
-
-	// Add any new changes to the change list.
-	for _, change := range changes {
-		if change.IsCreateTable() {
-			ct, err := statement.ParseCreateTable(change.Statement)
-			if err != nil {
-				panic("err passing statement")
+func (l *PrimaryKeyLinter) Configure(config map[string]string) error {
+	if l.allowedTypes == nil {
+		l.allowedTypes = make(map[string]struct{})
+	}
+	for name, value := range config {
+		switch name {
+		case "allowedTypes":
+			allowedTypes := strings.Split(value, ",")
+			for _, tp := range allowedTypes {
+				t := strings.ToUpper(strings.TrimSpace(tp))
+				if !slices.Contains(primaryKeyTypeLinterSupportedTypes, t) {
+					return fmt.Errorf("unsupported type %q (not in %s)", tp, primaryKeyTypeLinterSupportedTypes)
+				}
+				l.allowedTypes[t] = struct{}{}
 			}
-			existingTables = append(existingTables, ct)
+		default:
+			return fmt.Errorf("unknown config key for %s: %s", l.Name(), name)
+		}
+	}
+	return nil
+}
+
+func (l *PrimaryKeyLinter) DefaultConfig() map[string]string {
+	return map[string]string{
+		"allowedTypes": "BIGINT,BINARY,VARBINARY",
+	}
+}
+
+func (l *PrimaryKeyLinter) Lint(existingTables []*statement.CreateTable, changes []*statement.AbstractStatement) (violations []Violation) {
+	// TODO: add support for ALTER TABLE statements that try to modify a primary key to an unsupported type
+
+	// If the linter is run without a default allowedTypes configuration, set it to the default value
+	if len(l.allowedTypes) == 0 {
+		err := l.Configure(l.DefaultConfig())
+		if err != nil {
+			panic(err)
 		}
 	}
 
-	// TODO: do we apply ALTER TABLE changes to existing tables here so we can compare existing?
-
-	for _, ct := range existingTables {
+	// We only look over definitions of existing tables and newly created tables.
+	for ct := range CreateTableStatements(existingTables, changes) {
 		tableName := ct.GetTableName()
 
 		// Get primary key columns from indexes (this includes both table-level and column-level PRIMARY KEY)
 		pkColumns := l.getPrimaryKeyColumnsFromIndexes(ct)
 		if len(pkColumns) == 0 {
+			violations = append(violations, Violation{
+				Linter:   l,
+				Location: &Location{Table: tableName},
+				Message:  "No primary key defined",
+				// TODO: Consider changing back to SeverityError - missing primary keys are a serious schema issue
+				Severity:   SeverityWarning,
+				Suggestion: strPtr("Every table should have an explicit primary key"),
+			})
 			continue
 		}
 
@@ -73,7 +116,7 @@ func (l *PrimaryKeyTypeLinter) Lint(existingTables []*statement.CreateTable, cha
 
 // getPrimaryKeyColumnsFromIndexes returns the names of columns that are part of the primary key
 // by checking the indexes (which includes both table-level and column-level PRIMARY KEY definitions)
-func (l *PrimaryKeyTypeLinter) getPrimaryKeyColumnsFromIndexes(ct *statement.CreateTable) []string {
+func (l *PrimaryKeyLinter) getPrimaryKeyColumnsFromIndexes(ct *statement.CreateTable) []string {
 	var pkColumns []string
 
 	// Check for PRIMARY KEY in indexes
@@ -88,57 +131,59 @@ func (l *PrimaryKeyTypeLinter) getPrimaryKeyColumnsFromIndexes(ct *statement.Cre
 }
 
 // checkColumnType checks if a primary key column has an appropriate type
-func (l *PrimaryKeyTypeLinter) checkColumnType(tableName string, column *statement.Column) *Violation {
+func (l *PrimaryKeyLinter) checkColumnType(tableName string, column *statement.Column) *Violation {
 	columnType := strings.ToUpper(column.Type)
 
-	// Check for BIGINT
-	if strings.HasPrefix(columnType, "BIGINT") {
-		// Check if it's unsigned (either in type string or Unsigned field)
-		isUnsigned := column.Unsigned != nil && *column.Unsigned
-		if !isUnsigned {
-			isUnsigned = strings.Contains(columnType, "UNSIGNED")
-		}
+	if _, ok := l.allowedTypes[columnType]; ok {
+		// If the PK column uses a signed integer type, return a warning that it should be unsigned instead
+		// disabling this functionality for now to avoid overly verbose linter output
+		/*
+			if isSignedIntType(column) {
+				return &Violation{
+					Linter:   l,
+					Severity: SeverityWarning,
+					Message:  fmt.Sprintf("Primary key column %q uses signed %s; UNSIGNED is preferred", column.Name, columnType),
+					Location: &Location{
+						Table:  tableName,
+						Column: &column.Name,
+					},
+					Suggestion: strPtr(fmt.Sprintf("Consider using BIGINT UNSIGNED for column '%s' to avoid negative values and increase range", column.Name)),
+				}
+			}
 
-		if isUnsigned {
-			// BIGINT UNSIGNED is ideal - no violation
-			return nil
-		}
-
-		// BIGINT without UNSIGNED is a warning
-		suggestion := fmt.Sprintf("Consider using BIGINT UNSIGNED for column '%s' to avoid negative values and increase range", column.Name)
-
-		return &Violation{
-			Linter:   l,
-			Severity: SeverityWarning,
-			Message:  fmt.Sprintf("Primary key column '%s' uses signed BIGINT; UNSIGNED is preferred", column.Name),
-			Location: &Location{
-				Table:  tableName,
-				Column: &column.Name,
-			},
-			Suggestion: &suggestion,
-		}
-	}
-
-	// Check for BINARY/VARBINARY
-	// Note: The parser returns "char" for BINARY and "varchar" for VARBINARY,
-	// so we need to check the raw type and binary flag
-	if l.isBinaryType(column) {
-		// BINARY/VARBINARY is acceptable - no violation
+		*/
 		return nil
 	}
 
+	// The parser rewrites binary->char and varbinary->varchar, so these are handled specially
+	if columnType == "CHAR" {
+		if _, ok := l.allowedTypes["BINARY"]; ok && l.isBinaryType(column) {
+			return nil
+		}
+	}
+	if columnType == "VARCHAR" {
+		if _, ok := l.allowedTypes["VARBINARY"]; ok && l.isBinaryType(column) {
+			return nil
+		}
+	}
+
 	// Any other type is an error
-	suggestion := fmt.Sprintf("Change column '%s' to BIGINT UNSIGNED or BINARY/VARBINARY", column.Name)
+	keys := make([]string, 0, len(l.allowedTypes))
+	for k := range l.allowedTypes {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
 
 	return &Violation{
-		Linter:   l,
+		Linter: l,
+		// TODO: Consider changing back to SeverityError - wrong primary key types are a serious schema issue
 		Severity: SeverityWarning,
-		Message:  fmt.Sprintf("Primary key column '%s' has type '%s'; must be BIGINT or BINARY/VARBINARY", column.Name, column.Type),
+		Message:  fmt.Sprintf("Primary key column %q has type %q", column.Name, column.Type),
 		Location: &Location{
 			Table:  tableName,
 			Column: &column.Name,
 		},
-		Suggestion: &suggestion,
+		Suggestion: strPtr(fmt.Sprintf("Change column %q to a supported column type (%s)", column.Name, strings.Join(keys, ","))),
 		Context: map[string]interface{}{
 			"current_type": column.Type,
 		},
@@ -147,7 +192,7 @@ func (l *PrimaryKeyTypeLinter) checkColumnType(tableName string, column *stateme
 
 // isBinaryType checks if a column is BINARY or VARBINARY type
 // The parser returns "char" for BINARY and "varchar" for VARBINARY, so we need to check the binary flag
-func (l *PrimaryKeyTypeLinter) isBinaryType(column *statement.Column) bool {
+func (l *PrimaryKeyLinter) isBinaryType(column *statement.Column) bool {
 	if column.Raw == nil || column.Raw.Tp == nil {
 		return false
 	}
@@ -157,4 +202,8 @@ func (l *PrimaryKeyTypeLinter) isBinaryType(column *statement.Column) bool {
 	rawType := column.Raw.Tp.GetType()
 
 	return (rawType == mysql.TypeString || rawType == mysql.TypeVarchar) && mysql.HasBinaryFlag(column.Raw.Tp.GetFlag())
+}
+
+func isSignedIntType(column *statement.Column) bool {
+	return mysql.IsIntegerType(column.Raw.Tp.GetType()) && (column.Unsigned == nil || !*column.Unsigned)
 }

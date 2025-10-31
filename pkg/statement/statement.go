@@ -148,9 +148,29 @@ func (a *AbstractStatement) IsAlterTable() bool {
 	return ok
 }
 
+// AsAlterTable is a helper function that simply wraps the type case so the caller
+// doesn't have to import the ast package and use the cast syntax
+func (a *AbstractStatement) AsAlterTable() (*ast.AlterTableStmt, bool) {
+	at, ok := (*a.StmtNode).(*ast.AlterTableStmt)
+	return at, ok
+}
+
 func (a *AbstractStatement) IsCreateTable() bool {
 	_, ok := (*a.StmtNode).(*ast.CreateTableStmt)
 	return ok
+}
+func (a *AbstractStatement) ParseCreateTable() (*CreateTable, error) {
+	createStmt, ok := (*a.StmtNode).(*ast.CreateTableStmt)
+	if !ok {
+		return nil, errors.New("not a CREATE TABLE statement")
+	}
+
+	ct := &CreateTable{
+		Raw: createStmt,
+	}
+	// Parse into structured format
+	ct.parseToStruct()
+	return ct, nil
 }
 
 // AlgorithmInplaceConsideredSafe checks to see if all clauses of an ALTER
