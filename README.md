@@ -61,6 +61,10 @@ Spirit periodically saves the progress of a schema change to an internal checkpo
 
 When you consider that many migrations are best measured in _days_, this feature can save you a lot of lost work and improves the predictability of large-table schema migrations.
 
+## Atomic Multi-table changes
+
+Spirit supports cutting over multiple schema changes at once using the `--statement` option.
+
 ## Performance
 
 Our internal goal for Spirit is to be able to migrate a 10TiB table in under 5 days. We believe we are able to achieve this in most-cases, but it depends on:

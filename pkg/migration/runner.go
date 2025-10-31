@@ -105,8 +105,10 @@ func (r *Runner) SetLogger(logger loggers.Advanced) {
 	r.logger = logger
 }
 
+// attemptMySQLDDL tries to perform the DDL using MySQL's built-in
+// either with INSTANT or known safe INPLACE operations.
 func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
-	if r.migration.EnableExperimentalMultiTableSupport {
+	if len(r.changes) > 1 {
 		return errors.New("attemptMySQLDDL only supports single-table changes")
 	}
 	return r.changes[0].attemptMySQLDDL(ctx)
@@ -149,12 +151,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	if r.migration.EnableExperimentalMultiTableSupport {
-		// We don't (yet) support a lot of features in multi-schema changes, and
-		// we never attempt instant/inplace DDL. So for now all we need to do
-		// is setup and call SetInfo on each of the tables.
-		r.logger.Warn("Enabling the experimental option: enable-experimental-multi-table-support")
-	} else {
+	if len(r.changes) == 1 {
 		// We only allow non-ALTERs (i.e. CREATE TABLE, DROP TABLE, RENAME TABLE)
 		// in single table mode.
 		if !r.changes[0].stmt.IsAlterTable() {
@@ -317,6 +314,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 	}
+	// drop the checkpoint table
+	if r.checkpointTable != nil {
+		if err := r.dropCheckpoint(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -407,12 +410,10 @@ func (r *Runner) dsn() string {
 func (r *Runner) checkpointTableName() string {
 	// We also call the create functions for the sentinel
 	// and checkpoint tables.
-	cpName := fmt.Sprintf(check.NameFormatCheckpoint, r.changes[0].table.TableName)
-	if r.migration.EnableExperimentalMultiTableSupport {
-		// In multi-mode we always use a centralized checkpoint table.
-		cpName = checkpointTableName
+	if len(r.changes) > 1 {
+		return checkpointTableName
 	}
-	return cpName
+	return fmt.Sprintf(check.NameFormatCheckpoint, r.changes[0].table.TableName)
 }
 
 func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
@@ -846,13 +847,10 @@ func (r *Runner) initChunkers() error {
 		copyChunkers = append(copyChunkers, copyChunker)
 		checksumChunkers = append(checksumChunkers, checksumChunker)
 	}
-	if !r.migration.EnableExperimentalMultiTableSupport {
-		r.copyChunker = copyChunkers[0]
-		r.checksumChunker = checksumChunkers[0]
-	} else {
-		r.copyChunker = table.NewMultiChunker(copyChunkers...)
-		r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
-	}
+	// We can wrap it the multi-chunker regardless.
+	// It won't cause any harm.
+	r.copyChunker = table.NewMultiChunker(copyChunkers...)
+	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 	return nil
 }
 

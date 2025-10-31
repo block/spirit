@@ -107,12 +107,6 @@ func (c *change) cleanup(ctx context.Context) error {
 			return err
 		}
 	}
-	// TODO: only cleanup this migration, not the checkpoint table.
-	if c.runner.checkpointTable != nil {
-		if err := c.runner.dropCheckpoint(ctx); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 

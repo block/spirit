@@ -37,8 +37,7 @@ type Migration struct {
 
 	// Experimental features
 	// These are no longer hidden, we document them.
-	EnableExperimentalMultiTableSupport bool `name:"enable-experimental-multi-table-support" help:"Allow multiple alter statements to run concurrently and cutover together" optional:"" default:"false"`
-	EnableExperimentalBufferedCopy      bool `name:"enable-experimental-buffered-copy" help:"Use the experimental buffered copier/repl applier based on the DBLog algorithm" optional:"" default:"false"`
+	EnableExperimentalBufferedCopy bool `name:"enable-experimental-buffered-copy" help:"Use the experimental buffered copier/repl applier based on the DBLog algorithm" optional:"" default:"false"`
 
 	// Hidden options for now (supports more obscure cash/sq usecases)
 	InterpolateParams bool `name:"interpolate-params" help:"Enable interpolate params for DSN" optional:"" default:"false" hidden:""`
@@ -130,10 +129,6 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 			Statement: fullStatement,
 			StmtNode:  &stmtNodes[0],
 		})
-	}
-
-	if len(stmts) > 1 && !m.EnableExperimentalMultiTableSupport {
-		return nil, errors.New("multiple statements detected. To enable this experimental feature, please specify --enable-experimental-multi-table-support")
 	}
 	return stmts, err
 }
