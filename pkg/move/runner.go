@@ -388,6 +388,21 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Take a single metadata lock for all tables to prevent concurrent DDL.
+	// This uses a single DB connection instead of one per table.
+	// We release the lock when this function finishes executing.
+	lock, err := dbconn.NewMetadataLock(ctx, r.move.SourceDSN, r.sourceTables, r.dbConfig, r.logger)
+	if err != nil {
+		return err
+	}
+
+	// Release the lock
+	defer func() {
+		if err := lock.Close(); err != nil {
+			r.logger.Errorf("failed to release metadata lock: %v", err)
+		}
+	}()
+
 	// Start background monitoring routines
 	r.startBackgroundRoutines(ctx)
 

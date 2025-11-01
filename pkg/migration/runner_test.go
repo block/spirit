@@ -2787,6 +2787,7 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	dbName := testutils.CreateUniqueTestDatabase(t)
 	tableName := `resume_checkpoint_e2e_w_sentinel`
 	tableInfo := table.TableInfo{SchemaName: dbName, TableName: tableName}
+	lockTables := []*table.TableInfo{&tableInfo}
 
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(`DROP TABLE IF EXISTS %s, _%s_old, _%s_chkpnt`, tableName, tableName, tableName))
 	table := fmt.Sprintf(`CREATE TABLE %s (
@@ -2843,7 +2844,7 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 			// Test that it's not possible to acquire metadata lock with name
 			// as tablename while the migration is running.
 			lock, err := dbconn.NewMetadataLock(ctx, testutils.DSN(),
-				&tableInfo, dbconn.NewDBConfig(), &testLogger{})
+				lockTables, dbconn.NewDBConfig(), &testLogger{})
 			assert.Error(t, err)
 			if lock != nil {
 				assert.ErrorContains(t, err, fmt.Sprintf("could not acquire metadata lock for %s, lock is held by another connection", lock.GetLockName()))
