@@ -119,7 +119,7 @@ func New(statement string) ([]*AbstractStatement, error) {
 				StmtNode:  &stmtNodes[i],
 			})
 		default:
-			return nil, ErrNotSupportedStatement
+			return nil, fmt.Errorf("%w: %v (%T)", ErrNotSupportedStatement, node.Text(), node)
 		}
 	}
 
