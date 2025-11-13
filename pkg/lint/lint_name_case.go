@@ -33,7 +33,8 @@ func (l *NameCaseLinter) Lint(createTables []*statement.CreateTable, changes []*
 				Location: &Location{
 					Table: ct.TableName,
 				},
-				Message: fmt.Sprintf("table name %q is not lowercase", ct.TableName),
+				Message:  fmt.Sprintf("table name %q is not lowercase", ct.TableName),
+				Severity: SeverityWarning,
 			})
 		}
 	}
@@ -49,7 +50,8 @@ func (l *NameCaseLinter) Lint(createTables []*statement.CreateTable, changes []*
 							Location: &Location{
 								Table: oldName,
 							},
-							Message: fmt.Sprintf("table %q being renamed to %q, which is not lowercase", oldName, newName),
+							Message:  fmt.Sprintf("table %q being renamed to %q, which is not lowercase", oldName, newName),
+							Severity: SeverityWarning,
 						})
 					}
 				}

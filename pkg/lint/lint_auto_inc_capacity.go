@@ -85,7 +85,8 @@ func (l *AutoIncCapacityLinter) Lint(existingTables []*statement.CreateTable, ch
 						Table:  ct.TableName,
 						Column: &col.Name,
 					},
-					Message: fmt.Sprintf("unknown column type %q (%d). this is a bug!", col.Type, col.Raw.Tp.GetType()),
+					Message:  fmt.Sprintf("unknown column type %q (%d). this is a bug!", col.Type, col.Raw.Tp.GetType()),
+					Severity: SeverityWarning,
 				})
 			}
 

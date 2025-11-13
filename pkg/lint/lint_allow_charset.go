@@ -58,6 +58,7 @@ func (l *AllowCharset) Lint(createTables []*statement.CreateTable, changes []*st
 				Linter:     l,
 				Location:   &Location{Table: ct.TableName},
 				Message:    fmt.Sprintf("Character set %q given for table %q is not allowed", *ct.TableOptions.Charset, ct.TableName),
+				Severity:   SeverityWarning,
 				Suggestion: &suggestion,
 			})
 		}

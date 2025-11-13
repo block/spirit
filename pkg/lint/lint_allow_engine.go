@@ -77,6 +77,7 @@ func (l *AllowEngine) Lint(existingTables []*statement.CreateTable, changes []*s
 				Linter:     l,
 				Location:   &Location{Table: ct.TableName},
 				Message:    fmt.Sprintf("Table %q uses an unsupported engine %q", ct.TableName, engineName),
+				Severity:   SeverityWarning,
 				Suggestion: strPtr("Use a supported storage engine: " + strings.Join(slices.Sorted(maps.Keys(l.allowedEngines)), ", ")),
 			})
 		}
@@ -97,6 +98,7 @@ func (l *AllowEngine) Lint(existingTables []*statement.CreateTable, changes []*s
 						Linter:     l,
 						Location:   &Location{Table: alter.Table.Name.String()},
 						Message:    fmt.Sprintf("Table %q uses an unsupported engine %q", alter.Table.Name, engineName),
+						Severity:   SeverityWarning,
 						Suggestion: strPtr("Use a supported storage engine: " + strings.Join(slices.Sorted(maps.Keys(l.allowedEngines)), ", ")),
 					})
 				}
