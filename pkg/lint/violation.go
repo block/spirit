@@ -3,19 +3,33 @@ package lint
 import "fmt"
 
 // Severity represents the severity level of a linting violation
-type Severity string
+type Severity int
 
 const (
-	// SeverityError indicates a violation that will cause actual problems
-	// (syntax errors, MySQL limitations, etc.)
-	SeverityError Severity = "ERROR"
+	// SeverityInfo indicates a suggestion or style preference
+	// This is the default value if no explicit Severity is given
+	SeverityInfo Severity = iota
 
 	// SeverityWarning indicates a best practice violation or potential issue
-	SeverityWarning Severity = "WARNING"
+	SeverityWarning
 
-	// SeverityInfo indicates a suggestion or style preference
-	SeverityInfo Severity = "INFO"
+	// SeverityError indicates a violation that will cause actual problems
+	// (syntax errors, MySQL limitations, etc.)
+	SeverityError
 )
+
+func (s Severity) String() string {
+	switch s {
+	case SeverityInfo:
+		return "INFO"
+	case SeverityWarning:
+		return "WARNING"
+	case SeverityError:
+		return "ERROR"
+	default:
+		return "UNKNOWN"
+	}
+}
 
 // Violation represents a linting violation found during analysis
 type Violation struct {
