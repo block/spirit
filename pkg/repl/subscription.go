@@ -17,6 +17,6 @@ type Subscription interface {
 	HasChanged(key, row []any, deleted bool)
 	Length() int
 	Flush(ctx context.Context, underLock bool, lock *dbconn.TableLock) (allChangesFlushed bool, err error)
-	Tables() []*table.TableInfo // returns the tables related to the subscription in currentTable, newTable order
-	SetKeyAboveWatermarkOptimization(enabled bool)
+	Tables() []*table.TableInfo            // returns the tables related to the subscription in currentTable, newTable order
+	SetWatermarkOptimization(enabled bool) // Controls both high and low watermark optimizations
 }

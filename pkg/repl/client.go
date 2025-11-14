@@ -916,14 +916,15 @@ func (c *Client) feedback(numberOfKeys int, d time.Duration) {
 	}
 }
 
-// SetKeyAboveWatermarkOptimization sets the key above watermark optimization
-// for all subscriptions. In future this should become obsolete!
-func (c *Client) SetKeyAboveWatermarkOptimization(newVal bool) {
+// SetWatermarkOptimization sets both high and low watermark optimizations
+// for all subscriptions. This should be disabled before checksum/cutover to ensure
+// all changes are flushed regardless of watermark position.
+func (c *Client) SetWatermarkOptimization(newVal bool) {
 	c.Lock()
 	defer c.Unlock()
 
 	for _, sub := range c.subscriptions {
-		sub.SetKeyAboveWatermarkOptimization(newVal)
+		sub.SetWatermarkOptimization(newVal)
 	}
 }
 

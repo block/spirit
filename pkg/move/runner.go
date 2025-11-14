@@ -363,6 +363,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	var err error
 	r.dbConfig = dbconn.NewDBConfig()
+	r.dbConfig.ForceKill = true // in move we always use force kill; it's new code.
 	r.logger.Warn("the move command is experimental and not yet safe for production use.")
 	r.source, err = dbconn.New(r.move.SourceDSN, r.dbConfig)
 	if err != nil {
@@ -406,11 +407,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Start background monitoring routines
 	r.startBackgroundRoutines(ctx)
 
+	r.replClient.SetWatermarkOptimization(true)
+
 	// Run the copier.
 	r.status.Set(status.CopyRows)
 	if err := r.copier.Run(ctx); err != nil {
 		return err
 	}
+
+	// Disable both watermark optimizations so that all changes can be flushed.
+	// The watermark optimizations can prevent some keys from being flushed,
+	// which would cause flushedPos to not advance, leading to a mismatch
+	// with bufferedPos and causing AllChangesFlushed() to return false.
+	r.replClient.SetWatermarkOptimization(false)
 
 	// When the copier has finished, catch up the replication client
 	// This is in a non-blocking way first.
@@ -432,6 +441,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
+	r.logger.Info("Checksum completed successfully, starting cutover")
+
 	// Create a cutover.
 	r.status.Set(status.CutOver)
 	cutover, err := NewCutOver(r.source, r.sourceTables, r.cutoverFunc, r.replClient, r.dbConfig, r.logger)
@@ -439,6 +450,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 	if err = cutover.Run(ctx); err != nil {
+		return err
+	}
+	// Delete checkpoint table
+	if err := dbconn.Exec(ctx, r.target, "DROP TABLE IF EXISTS %n.%n", r.targetConfig.DBName, checkpointTableName); err != nil {
 		return err
 	}
 	r.logger.Info("Move operation complete.")

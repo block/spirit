@@ -314,7 +314,7 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 	sub.HasChanged([]any{"prefix", 123}, nil, false)
 	assert.Equal(t, 2, sub.Length())
 
-	sub.SetKeyAboveWatermarkOptimization(true)
+	sub.SetWatermarkOptimization(true)
 
 	// Test exactly at watermark (position 5)
 	sub.HasChanged([]any{5}, nil, false)
@@ -407,7 +407,7 @@ func TestKeyAboveWatermark(t *testing.T) {
 	assert.Equal(t, 1, sub.Length())
 
 	// Enable watermark optimization
-	sub.SetKeyAboveWatermarkOptimization(true)
+	sub.SetWatermarkOptimization(true)
 
 	// Test key below watermark (3 < 5)
 	sub.HasChanged([]any{3}, nil, false)

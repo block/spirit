@@ -26,8 +26,8 @@ type deltaQueue struct {
 
 	changes []queuedChange
 
-	enableKeyAboveWatermark bool
-	chunker                 table.Chunker
+	watermarkOptimization bool
+	chunker               table.Chunker
 }
 
 // Assert that deltaQueue implements subscription
@@ -52,7 +52,7 @@ func (s *deltaQueue) HasChanged(key, _ []any, deleted bool) {
 	// We enable it once all the setup has been done (since we create a repl client
 	// earlier in setup to ensure binary logs are available).
 	// We then disable the optimization after the copier phase has finished.
-	if s.keyAboveWatermarkEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
+	if s.watermarkOptimizationEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
 		s.c.logger.Debug("key above watermark", "key", key[0])
 		return
 	}
@@ -156,14 +156,14 @@ func (s *deltaQueue) Flush(ctx context.Context, underLock bool, lock *dbconn.Tab
 	return true, nil
 }
 
-// keyAboveWatermarkEnabled returns true if the KeyAboveWatermark optimization
+// watermarkOptimizationEnabled returns true if the KeyAboveWatermark optimization
 // is enabled. This is already called under a mutex.
-func (s *deltaQueue) keyAboveWatermarkEnabled() bool {
-	return s.enableKeyAboveWatermark && s.chunker != nil
+func (s *deltaQueue) watermarkOptimizationEnabled() bool {
+	return s.watermarkOptimization && s.chunker != nil
 }
 
-func (s *deltaQueue) SetKeyAboveWatermarkOptimization(enabled bool) {
+func (s *deltaQueue) SetWatermarkOptimization(enabled bool) {
 	s.Lock()
 	defer s.Unlock()
-	s.enableKeyAboveWatermark = enabled
+	s.watermarkOptimization = enabled
 }

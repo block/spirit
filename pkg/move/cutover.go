@@ -61,7 +61,7 @@ func (c *CutOver) Run(ctx context.Context) error {
 		c.logger.Warn("Attempting final cut over operation",
 			"attempt", i+1,
 			"max-retries", c.dbConfig.MaxRetries)
-		err = c.algorithmRenameUnderLock(ctx)
+		err = c.algorithmCutover(ctx)
 		if err != nil {
 			c.logger.Warn("cutover failed", "error", err.Error())
 			continue
@@ -73,15 +73,19 @@ func (c *CutOver) Run(ctx context.Context) error {
 	return err
 }
 
-func (c *CutOver) algorithmRenameUnderLock(ctx context.Context) error {
+func (c *CutOver) algorithmCutover(ctx context.Context) error {
 	tableLock, err := dbconn.NewTableLock(ctx, c.db, c.tables, c.dbConfig, c.logger)
 	if err != nil {
 		return err
 	}
 	defer tableLock.Close()
-	if err := c.feed.FlushUnderTableLock(ctx, tableLock); err != nil {
+
+	// We don't use FlushUnderLock: that's for within the same server.
+	// We use a regular flush. No new changes will arrive because of the table lock.
+	if err := c.feed.Flush(ctx); err != nil {
 		return err
 	}
+
 	if !c.feed.AllChangesFlushed() {
 		return errors.New("not all changes flushed, final flush might be broken")
 	}

@@ -242,7 +242,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logger.Info("copy rows complete")
 	r.copyDuration = time.Since(r.copier.StartTime())
-	r.replClient.SetKeyAboveWatermarkOptimization(false) // should no longer be used.
+
+	// Disable both watermark optimizations so that all changes can be flushed.
+	// The watermark optimizations can prevent some keys from being flushed,
+	// which would cause flushedPos to not advance, leading to a mismatch
+	// with bufferedPos and causing AllChangesFlushed() to return false.
+	r.replClient.SetWatermarkOptimization(false)
 
 	// r.waitOnSentinel may return an error if there is
 	// some unexpected problem checking for the existence of
@@ -667,7 +672,7 @@ func (r *Runner) setup(ctx context.Context) error {
 	}
 
 	// We can enable the key above watermark optimization
-	r.replClient.SetKeyAboveWatermarkOptimization(true)
+	r.replClient.SetWatermarkOptimization(true)
 
 	// Start background monitoring routines (common logic for both paths)
 	r.startBackgroundRoutines(ctx)

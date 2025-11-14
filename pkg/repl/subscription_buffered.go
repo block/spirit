@@ -30,8 +30,8 @@ type bufferedMap struct {
 
 	changes map[string]logicalRow
 
-	enableKeyAboveWatermark bool
-	chunker                 table.Chunker
+	watermarkOptimization bool
+	chunker               table.Chunker
 }
 
 // logicalRow represents the current state of a row in the subscription buffer.
@@ -65,7 +65,7 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 	// We enable it once all the setup has been done (since we create a repl client
 	// earlier in setup to ensure binary logs are available).
 	// We then disable the optimization after the copier phase has finished.
-	if s.keyAboveWatermarkEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
+	if s.watermarkOptimizationEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
 		s.c.logger.Debug("key above watermark", "key", key[0])
 		return
 	}
@@ -193,7 +193,10 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 	target := atomic.LoadInt64(&s.c.targetBatchSize)
 	for key, logicalRow := range s.changes {
 		unhashedKey := utils.UnhashKey(key)
-		if s.chunker != nil && s.chunker.KeyBelowLowWatermark(unhashedKey[0]) {
+		// Check low watermark only if the optimization is enabled
+		// Note: bufferedMap has inverted logic - KeyBelowLowWatermark returns true
+		// for keys that are still being copied, so we skip flushing them
+		if s.watermarkOptimizationEnabled() && s.chunker.KeyBelowLowWatermark(unhashedKey[0]) {
 			s.c.logger.Debug("key below watermark", "key", unhashedKey[0])
 			allChangesFlushed = false
 			continue
@@ -267,16 +270,16 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Ta
 	return allChangesFlushed, nil
 }
 
-// keyAboveWatermarkEnabled returns true if the KeyAboveWatermark optimization
+// watermarkOptimizationEnabled returns true if the watermark optimization
 // is enabled. This is already called under a mutex.
-func (s *bufferedMap) keyAboveWatermarkEnabled() bool {
-	return s.enableKeyAboveWatermark && s.chunker != nil
+func (s *bufferedMap) watermarkOptimizationEnabled() bool {
+	return s.watermarkOptimization && s.chunker != nil
 }
 
-func (s *bufferedMap) SetKeyAboveWatermarkOptimization(enabled bool) {
+func (s *bufferedMap) SetWatermarkOptimization(enabled bool) {
 	s.Lock()
 	defer s.Unlock()
-	s.enableKeyAboveWatermark = enabled
+	s.watermarkOptimization = enabled
 }
 
 // getIntersectedColumns returns the column indices from the source table

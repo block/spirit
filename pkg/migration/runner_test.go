@@ -2432,7 +2432,7 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 	// this is normally done in m.setup() but we want to call it in isolation.
 	assert.NoError(t, m.resumeFromCheckpoint(ctx))
 	// This is normally done in m.setup()
-	m.replClient.SetKeyAboveWatermarkOptimization(true)
+	m.replClient.SetWatermarkOptimization(true)
 	// doublecheck that the highPtr is 1002 in the _new table and not in the original table.
 	assert.Equal(t, "10", m.changes[0].table.MaxValue().String())
 	assert.Equal(t, "1002", m.changes[0].newTable.MaxValue().String())

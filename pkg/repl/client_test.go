@@ -104,7 +104,7 @@ func TestReplClientComplex(t *testing.T) {
 	assert.NoError(t, client.AddSubscription(t1, t2, chunker))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
-	client.SetKeyAboveWatermarkOptimization(true)
+	client.SetWatermarkOptimization(true)
 
 	// Insert into t1, but because there is no read yet, the key is above the watermark
 	testutils.RunSQL(t, "DELETE FROM replcomplext1 WHERE a BETWEEN 10 and 500")
@@ -260,7 +260,7 @@ func TestReplClientOpts(t *testing.T) {
 	defer client.Close()
 
 	// Disable key above watermark.
-	client.SetKeyAboveWatermarkOptimization(false)
+	client.SetWatermarkOptimization(false)
 
 	startingPos := client.GetBinlogApplyPosition()
 

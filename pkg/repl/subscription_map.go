@@ -23,8 +23,8 @@ type deltaMap struct {
 
 	changes map[string]bool // delta map, for memory comparable PKs
 
-	enableKeyAboveWatermark bool
-	chunker                 table.Chunker
+	watermarkOptimization bool
+	chunker               table.Chunker
 }
 
 // Assert that deltaMap implements subscription
@@ -49,7 +49,7 @@ func (s *deltaMap) HasChanged(key, _ []any, deleted bool) {
 	// We enable it once all the setup has been done (since we create a repl client
 	// earlier in setup to ensure binary logs are available).
 	// We then disable the optimization after the copier phase has finished.
-	if s.keyAboveWatermarkEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
+	if s.watermarkOptimizationEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
 		s.c.logger.Debug("key above watermark", "key", key[0])
 		return
 	}
@@ -107,7 +107,8 @@ func (s *deltaMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Table
 	target := atomic.LoadInt64(&s.c.targetBatchSize)
 	for key, isDelete := range s.changes {
 		unhashedKey := utils.UnhashKey(key)
-		if s.chunker != nil && !s.chunker.KeyBelowLowWatermark(unhashedKey[0]) {
+		// Check low watermark only if the optimization is enabled
+		if s.watermarkOptimizationEnabled() && !s.chunker.KeyBelowLowWatermark(unhashedKey[0]) {
 			s.c.logger.Debug("key not below watermark", "key", unhashedKey[0])
 			allChangesFlushed = false
 			continue
@@ -165,14 +166,14 @@ func (s *deltaMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Table
 	return allChangesFlushed, nil
 }
 
-// keyAboveWatermarkEnabled returns true if the KeyAboveWatermark optimization
+// watermarkOptimizationEnabled returns true if the watermark optimization
 // is enabled. This is already called under a mutex.
-func (s *deltaMap) keyAboveWatermarkEnabled() bool {
-	return s.enableKeyAboveWatermark && s.chunker != nil
+func (s *deltaMap) watermarkOptimizationEnabled() bool {
+	return s.watermarkOptimization && s.chunker != nil
 }
 
-func (s *deltaMap) SetKeyAboveWatermarkOptimization(enabled bool) {
+func (s *deltaMap) SetWatermarkOptimization(enabled bool) {
 	s.Lock()
 	defer s.Unlock()
-	s.enableKeyAboveWatermark = enabled
+	s.watermarkOptimization = enabled
 }
