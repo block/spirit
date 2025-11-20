@@ -2,12 +2,12 @@ package check
 
 import (
 	"database/sql"
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -16,12 +16,12 @@ func TestAddForeignKey(t *testing.T) {
 	r := Resources{
 		Statement: statement.MustNew("ALTER TABLE t1 ADD FOREIGN KEY (customer_id) REFERENCES customers (id)")[0],
 	}
-	err = addForeignKeyCheck(t.Context(), r, logrus.New())
+	err = addForeignKeyCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // add foreign key
 	assert.ErrorContains(t, err, "adding foreign key constraints is not supported")
 
 	r.Statement = statement.MustNew("ALTER TABLE t1 DROP COLUMN foo")[0]
-	err = addForeignKeyCheck(t.Context(), r, logrus.New())
+	err = addForeignKeyCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // regular DDL
 }
 
@@ -58,18 +58,18 @@ func TestHasForeignKey(t *testing.T) {
 		Table:     &table.TableInfo{SchemaName: "test", TableName: "customers"},
 		Statement: statement.MustNew("ALTER TABLE customers ENGINE=innodb")[0],
 	}
-	err = hasForeignKeysCheck(t.Context(), r, logrus.New())
+	err = hasForeignKeysCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // already has foreign keys.
 
 	r.Table.TableName = "customer_contacts"
 	r.Statement = statement.MustNew("ALTER TABLE customer_contacts ENGINE=innodb")[0]
-	err = hasForeignKeysCheck(t.Context(), r, logrus.New())
+	err = hasForeignKeysCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // already has foreign keys.
 
 	_, err = db.Exec(`drop table if exists customer_contacts`)
 	assert.NoError(t, err)
 	r.Table.TableName = "customers"
 	r.Statement = statement.MustNew("ALTER TABLE customers ENGINE=innodb")[0]
-	err = hasForeignKeysCheck(t.Context(), r, logrus.New())
+	err = hasForeignKeysCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // no longer said to have foreign keys.
 }

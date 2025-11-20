@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 type chunkerOptimistic struct {
@@ -46,7 +45,7 @@ type chunkerOptimistic struct {
 	rowsCopied   uint64 // The sum of chunkSize
 	chunksCopied uint64
 
-	logger loggers.Advanced
+	logger *slog.Logger
 }
 
 var _ Chunker = &chunkerOptimistic{}
@@ -78,7 +77,10 @@ func (t *chunkerOptimistic) nextChunkByPrefetching() (*Chunk, error) {
 		// If the difference between min and max is less than
 		// MaxDynamicRowSize we can turn off prefetching.
 		if maxVal.Range(minVal) < MaxDynamicRowSize {
-			t.logger.Warnf("disabling chunk prefetching: min-val=%s max-val=%s max-dynamic-row-size=%d", minVal, maxVal, MaxDynamicRowSize)
+			t.logger.Warn("disabling chunk prefetching",
+				"min-val", minVal,
+				"max-val", maxVal,
+				"max-dynamic-row-size", MaxDynamicRowSize)
 			t.chunkSize = StartingChunkSize // reset
 			t.chunkPrefetchingEnabled = false
 		}
@@ -295,12 +297,12 @@ func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration, _ uint64) {
 	// and don't wait for more feedback.
 	if d > t.ChunkerTarget*DynamicPanicFactor {
 		newTarget := uint64(float64(t.chunkSize) / float64(DynamicPanicFactor*2))
-		t.logger.Infof("high chunk processing time. time: %s threshold: %s target-rows: %v target-ms: %v new-target-rows: %v",
-			d,
-			t.ChunkerTarget*DynamicPanicFactor,
-			t.chunkSize,
-			t.ChunkerTarget,
-			newTarget,
+		t.logger.Info("high chunk processing time",
+			"time", d,
+			"threshold", t.ChunkerTarget*DynamicPanicFactor,
+			"target-rows", t.chunkSize,
+			"target-ms", t.ChunkerTarget,
+			"new-target-rows", newTarget,
 		)
 		t.updateChunkerTarget(newTarget)
 		return
@@ -365,7 +367,8 @@ func (t *chunkerOptimistic) bumpWatermark(chunk *Chunk) {
 	// Validate that chunk has lower bound before moving on
 	if chunk.LowerBound == nil {
 		errMsg := fmt.Sprintf("coreChunker.bumpWatermark: nil lowerBound value encountered more than once: %v", chunk)
-		t.logger.Fatal(errMsg)
+		t.logger.Error(errMsg)
+		panic(errMsg) // Fatal equivalent - log and panic
 	}
 
 	// We haven't set the first chunk yet, or it's not aligned with the
@@ -475,8 +478,11 @@ func (t *chunkerOptimistic) calculateNewTargetChunkSize() uint64 {
 	// - This new target wants to go higher
 	// - our current p90 is only a fraction of our target time
 	if t.chunkSize == MaxDynamicRowSize && newTargetRows > MaxDynamicRowSize && (p90*5 < targetTime) {
-		t.logger.Warnf("dynamic chunking is not working as expected: target-time=%s p90-time=%s new-target-rows=%d max-dynamic-row-size=%d",
-			time.Duration(targetTime), time.Duration(p90), uint64(newTargetRows), MaxDynamicRowSize,
+		t.logger.Warn("dynamic chunking is not working as expected",
+			"target-time", time.Duration(targetTime),
+			"p90-time", time.Duration(p90),
+			"new-target-rows", uint64(newTargetRows),
+			"max-dynamic-row-size", MaxDynamicRowSize,
 		)
 		t.logger.Warn("switching to prefetch algorithm")
 		t.chunkSize = StartingChunkSize // reset

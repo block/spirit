@@ -2,6 +2,7 @@ package migration
 
 import (
 	"database/sql"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -10,7 +11,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -43,7 +43,7 @@ func TestCutOver(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context())) // required to extract PK.
 	t1new := table.NewTableInfo(db, "test", "_cutovert1_new")
 	t1old := "_cutovert1_old"
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
@@ -115,7 +115,7 @@ func TestMDLLockFails(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context())) // required to extract PK.
 	t1new := table.NewTableInfo(db, "test", "_mdllocks_new")
 	t1old := "test_old"
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
@@ -158,7 +158,7 @@ func TestInvalidOptions(t *testing.T) {
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	assert.NoError(t, err)
 	defer db.Close()
-	logger := logrus.New()
+	logger := slog.Default()
 
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS invalid_t1, _invalid_t1_new`)
 	tbl := `CREATE TABLE invalid_t1 (

@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
-	"github.com/siddontang/loggers"
 )
 
 func init() {
@@ -19,7 +19,7 @@ func init() {
 // The actual implementation is a bit simpler:
 //   - We only allow a column name to be mentioned once across all
 //     DROP and ADD parts of the alter statement.
-func dropAddCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func dropAddCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	alterStmt, ok := (*r.Statement.StmtNode).(*ast.AlterTableStmt)
 	if !ok {
 		return errors.New("not a valid alter table statement")

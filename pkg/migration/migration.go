@@ -11,14 +11,26 @@ import (
 	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
+	"github.com/go-ini/ini"
+
 	"github.com/pingcap/tidb/pkg/parser"
 )
 
+var (
+	defaultHost     = "127.0.0.1"
+	defaultPort     = 3306
+	defaultUsername = "spirit"
+	defaultPassword = "spirit"
+	defaultDatabase = "test"
+	defaultTLSMode  = "PREFERRED"
+)
+
 type Migration struct {
-	Host                 string        `name:"host" help:"Hostname" optional:"" default:"127.0.0.1:3306"`
-	Username             string        `name:"username" help:"User" optional:"" default:"spirit"`
-	Password             string        `name:"password" help:"Password" optional:"" default:"spirit"`
-	Database             string        `name:"database" help:"Database" optional:"" default:"test"`
+	Host                 string        `name:"host" help:"Hostname" optional:""`
+	Username             string        `name:"username" help:"User" optional:""`
+	Password             *string       `name:"password" help:"Password" optional:""`
+	Database             string        `name:"database" help:"Database" optional:""`
+	ConfFile             string        `name:"conf" help:"MySQL conf file" optional:"" type:"existingfile"`
 	Table                string        `name:"table" help:"Table" optional:""`
 	Alter                string        `name:"alter" help:"The alter statement to run on the table" optional:""`
 	Threads              int           `name:"threads" help:"Number of concurrent threads for copy and checksum tasks" optional:"" default:"4"`
@@ -32,7 +44,7 @@ type Migration struct {
 	Strict               bool          `name:"strict" help:"Exit on --alter mismatch when incomplete migration is detected" optional:"" default:"false"`
 	Statement            string        `name:"statement" help:"The SQL statement to run (replaces --table and --alter)" optional:"" default:""`
 	// TLS Configuration
-	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:"" default:"PREFERRED"`
+	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:""`
 	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
 
 	// Experimental features
@@ -82,15 +94,11 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 	if m.ReplicaMaxLag == 0 {
 		m.ReplicaMaxLag = 120 * time.Second
 	}
-	if m.Host == "" {
-		return nil, errors.New("host is required")
+
+	if err := m.normalizeConnectionOptions(); err != nil {
+		return nil, err
 	}
-	if !strings.Contains(m.Host, ":") {
-		m.Host = fmt.Sprintf("%s:%d", m.Host, 3306)
-	}
-	if m.Database == "" {
-		return nil, errors.New("database/schema name is required")
-	}
+
 	if m.Statement != "" { // statement is specified
 		if m.Table != "" || m.Alter != "" {
 			return nil, errors.New("only --statement or --table and --alter can be specified")
@@ -136,4 +144,131 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		})
 	}
 	return stmts, err
+}
+
+func (m *Migration) normalizeConnectionOptions() error {
+	confParams, err := newConfParams(m.ConfFile)
+	if err != nil {
+		return err
+	}
+	if m.Host == "" {
+		m.Host = confParams.GetHost()
+	}
+	if !strings.Contains(m.Host, ":") {
+		hostAndPort := fmt.Sprintf("%s:%d", m.Host, confParams.GetPort())
+		m.Host = hostAndPort
+	}
+	if m.Username == "" {
+		m.Username = confParams.GetUser()
+	}
+	if m.Password == nil {
+		pw := confParams.GetPassword()
+		m.Password = &pw
+	}
+	if m.Database == "" {
+		m.Database = confParams.GetDatabase()
+	}
+	if m.TLSMode == "" {
+		m.TLSMode = confParams.GetTLSMode()
+	}
+	if m.TLSCertificatePath == "" {
+		m.TLSCertificatePath = confParams.GetTLSCA()
+	}
+	return nil
+}
+
+// confParams abstracts parameters loaded from ini file. Will provide defaults when receiveer is
+// nil or parameter is not defined.
+type confParams struct {
+	host, database, user, tlsMode, tlsCA string
+	password                             *string
+	port                                 int
+}
+
+func (c *confParams) GetHost() string {
+	if c == nil || c.host == "" {
+		return defaultHost
+	}
+
+	return c.host
+}
+
+func (c *confParams) GetDatabase() string {
+	if c == nil || c.database == "" {
+		return defaultDatabase
+	}
+
+	return c.database
+}
+
+func (c *confParams) GetUser() string {
+	if c == nil || c.user == "" {
+		return defaultUsername
+	}
+
+	return c.user
+}
+
+func (c *confParams) GetPassword() string {
+	if c == nil || c.password == nil {
+		return defaultPassword
+	}
+
+	return *c.password
+}
+
+func (c *confParams) GetTLSMode() string {
+	if c == nil || c.tlsMode == "" {
+		return defaultTLSMode
+	}
+
+	return c.tlsMode
+}
+
+// N.B. There is no default for tls-ca
+func (c *confParams) GetTLSCA() string {
+	if c == nil {
+		return ""
+	}
+
+	return c.tlsCA
+}
+
+func (c *confParams) GetPort() int {
+	if c == nil || c.port == 0 {
+		return defaultPort
+	}
+
+	return c.port
+}
+
+// newConfParams attempts to load a confParams struct from a path to an ini file.
+func newConfParams(confFilePath string) (*confParams, error) {
+	confParams := &confParams{}
+
+	if confFilePath == "" {
+		return confParams, nil
+	}
+
+	creds, err := ini.Load(confFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	if creds.HasSection("client") {
+		clientSection := creds.Section("client")
+		confParams.host = clientSection.Key("host").String()
+		confParams.database = clientSection.Key("database").String()
+		confParams.user = clientSection.Key("user").String()
+		confParams.tlsMode = clientSection.Key("tls-mode").String()
+		confParams.tlsCA = clientSection.Key("tls-ca").String()
+		confParams.port = clientSection.Key("port").MustInt()
+
+		if clientSection.HasKey("password") {
+			pw := clientSection.Key("password").String()
+			confParams.password = &pw
+		}
+	}
+
+	return confParams, nil
 }

@@ -1,12 +1,11 @@
 package dbconn
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -29,12 +28,12 @@ func TestTableLock(t *testing.T) {
 
 	tbl := &table.TableInfo{SchemaName: "test", TableName: "testlock", QuotedName: "`test`.`testlock`"}
 
-	lock1, err := NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), logrus.New())
+	lock1, err := NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), slog.Default())
 	assert.NoError(t, err)
 
 	// Try to acquire a table that is already locked, should fail because we use WRITE locks now.
 	// But should also fail very quickly because we've set the lock_wait_timeout to 1s.
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), logrus.New())
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), slog.Default())
 	assert.Error(t, err)
 
 	assert.NoError(t, lock1.Close())
@@ -52,7 +51,7 @@ func TestExecUnderLock(t *testing.T) {
 	assert.NoError(t, err)
 
 	tbl := &table.TableInfo{SchemaName: "test", TableName: "testunderlock", QuotedName: "`test`.`testunderlock`"}
-	lock, err := NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), logrus.New())
+	lock, err := NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), slog.Default())
 	assert.NoError(t, err)
 	err = lock.ExecUnderLock(t.Context(), "INSERT INTO testunderlock VALUES (1, 1)", "", "INSERT INTO testunderlock VALUES (2, 2)")
 	assert.NoError(t, err) // pass, under write lock.
@@ -91,15 +90,15 @@ func TestTableLockMultiple(t *testing.T) {
 	}
 
 	// Acquire locks on all tables
-	lock1, err := NewTableLock(t.Context(), db, tables, testConfig(), logrus.New())
+	lock1, err := NewTableLock(t.Context(), db, tables, testConfig(), slog.Default())
 	assert.NoError(t, err)
 
 	// Try to acquire a lock on any of the tables - should fail because they're all locked
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tables[0]}, testConfig(), logrus.New())
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tables[0]}, testConfig(), slog.Default())
 	assert.Error(t, err)
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tables[1]}, testConfig(), logrus.New())
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tables[1]}, testConfig(), slog.Default())
 	assert.Error(t, err)
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tables[2]}, testConfig(), logrus.New())
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tables[2]}, testConfig(), slog.Default())
 	assert.Error(t, err)
 
 	// Test we can write to all tables under the lock
@@ -114,7 +113,7 @@ func TestTableLockMultiple(t *testing.T) {
 	assert.NoError(t, lock1.Close())
 
 	// Verify we can now acquire individual locks
-	lock2, err := NewTableLock(t.Context(), db, []*table.TableInfo{tables[0]}, testConfig(), logrus.New())
+	lock2, err := NewTableLock(t.Context(), db, []*table.TableInfo{tables[0]}, testConfig(), slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, lock2.Close())
 
@@ -149,12 +148,12 @@ func TestTableLockFail(t *testing.T) {
 	cfg := testConfig()
 	cfg.ForceKill = false
 	cfg.MaxRetries = 3 // Set max retries to 3 for this test
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, logrus.New())
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, slog.Default())
 	assert.Error(t, err) // failed to acquire lock
 
 	// Enable force killing to allow retrying with query killing. This will FAIL because we do not kill
 	// connections with explicit table locks.
 	cfg.ForceKill = true
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, logrus.New())
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, slog.Default())
 	assert.Error(t, err) // We won't kill a connection with an explicit table lock, so this should fail after exhausting retries
 }

@@ -5,14 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 type chunkerComposite struct {
@@ -45,7 +44,7 @@ type chunkerComposite struct {
 	rowsCopied   uint64
 	chunksCopied uint64
 
-	logger loggers.Advanced
+	logger *slog.Logger
 }
 
 type compositeWatermark struct {
@@ -281,12 +280,12 @@ func (t *chunkerComposite) Feedback(chunk *Chunk, d time.Duration, actualRows ui
 	// and don't wait for more feedback.
 	if d > t.ChunkerTarget*DynamicPanicFactor {
 		newTarget := uint64(float64(t.chunkSize) / float64(DynamicPanicFactor*2))
-		t.logger.Infof("high chunk processing time. time: %s threshold: %s target-rows: %v target-ms: %v new-target-rows: %v",
-			d,
-			t.ChunkerTarget*DynamicPanicFactor,
-			t.chunkSize,
-			t.ChunkerTarget,
-			newTarget,
+		t.logger.Info("high chunk processing time",
+			"time", d,
+			"threshold", t.ChunkerTarget*DynamicPanicFactor,
+			"target-rows", t.chunkSize,
+			"target-ms", t.ChunkerTarget,
+			"new-target-rows", newTarget,
 		)
 		t.updateChunkerTarget(newTarget)
 		return
@@ -363,7 +362,8 @@ func (t *chunkerComposite) bumpWatermark(chunk *Chunk) {
 	// Validate that chunk has lower bound before moving on
 	if chunk.LowerBound == nil {
 		errMsg := fmt.Sprintf("coreChunker.bumpWatermark: nil lowerBound value encountered more than once: %v", chunk)
-		t.logger.Fatal(errMsg)
+		t.logger.Error(errMsg)
+		panic(errMsg) // Fatal equivalent - log and panic
 	}
 
 	// We haven't set the first chunk yet, or it's not aligned with the

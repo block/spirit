@@ -1,6 +1,7 @@
 package checksum
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -10,7 +11,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	mysql "github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 )
@@ -36,7 +36,7 @@ func TestBasicChecksum(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "_basic_checksum_new")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -50,7 +50,7 @@ func TestBasicChecksum(t *testing.T) {
 	defer feed.Close()
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 	checker, err := NewChecker(db, chunker, feed, NewCheckerDefaultConfig())
@@ -75,7 +75,7 @@ func TestBasicValidation(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "basic_validation2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -89,7 +89,7 @@ func TestBasicValidation(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 
 	_, err = NewChecker(db, nil, feed, NewCheckerDefaultConfig())
@@ -130,7 +130,7 @@ func TestUnfixableUniqueChecksum(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "uniqfailuret2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -144,7 +144,7 @@ func TestUnfixableUniqueChecksum(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 
@@ -173,7 +173,7 @@ func TestFixCorrupt(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "_fixcorruption_t1_new")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -187,7 +187,7 @@ func TestFixCorrupt(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 
@@ -225,7 +225,7 @@ func TestCorruptChecksum(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "_chkpcorruptt1_new")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -239,7 +239,7 @@ func TestCorruptChecksum(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 
@@ -265,7 +265,7 @@ func TestBoundaryCases(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "_checkert1_new")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -279,7 +279,7 @@ func TestBoundaryCases(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 
@@ -337,7 +337,7 @@ func TestChangeDataTypeDatetime(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "_tdatetime_new")
 	assert.NoError(t, t2.SetInfo(t.Context())) // fails
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -351,7 +351,7 @@ func TestChangeDataTypeDatetime(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 
@@ -375,7 +375,7 @@ func TestFromWatermark(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "_tfromwatermark_new")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
@@ -389,7 +389,7 @@ func TestFromWatermark(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 
@@ -430,7 +430,7 @@ func TestFixCorruptWithWriter(t *testing.T) {
 	assert.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(dest, newDBName, "corruptt1")
 	assert.NoError(t, t2.SetInfo(t.Context()))
-	logger := logrus.New()
+	logger := slog.Default()
 
 	feed := repl.NewClient(src, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
 		Logger:                     logger,
@@ -444,7 +444,7 @@ func TestFixCorruptWithWriter(t *testing.T) {
 	assert.NoError(t, feed.AddSubscription(t1, t2, nil))
 	assert.NoError(t, feed.Run(t.Context()))
 
-	chunker, err := table.NewChunker(t1, t2, 0, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 

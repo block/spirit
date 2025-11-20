@@ -3,13 +3,13 @@ package dbconn
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,9 +18,7 @@ var (
 )
 
 func TestKillLongRunningTransactions(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
-	logger.ReportCaller = true
+	logger := slog.Default()
 
 	dbConfig := NewDBConfig()
 	dbConfig.InterpolateParams = true

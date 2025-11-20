@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/repl"
 	"github.com/block/spirit/pkg/table"
-	"github.com/siddontang/loggers"
 )
 
 type CutOver struct {
@@ -19,12 +19,12 @@ type CutOver struct {
 	tables      []*table.TableInfo
 	cutoverFunc func(ctx context.Context) error
 	dbConfig    *dbconn.DBConfig
-	logger      loggers.Advanced
+	logger      *slog.Logger
 }
 
 // NewCutOver contains the logic to perform the final cut over. It can cutover multiple tables
 // at once based on config. A replication feed which is used to ensure consistency before the cut over.
-func NewCutOver(db *sql.DB, tables []*table.TableInfo, cutoverFunc func(ctx context.Context) error, feed *repl.Client, dbConfig *dbconn.DBConfig, logger loggers.Advanced) (*CutOver, error) {
+func NewCutOver(db *sql.DB, tables []*table.TableInfo, cutoverFunc func(ctx context.Context) error, feed *repl.Client, dbConfig *dbconn.DBConfig, logger *slog.Logger) (*CutOver, error) {
 	if feed == nil {
 		return nil, errors.New("feed must be non-nil")
 	}
@@ -58,10 +58,12 @@ func (c *CutOver) Run(ctx context.Context) error {
 		}
 		// We use maxCutoverRetries as our retrycount, but nested
 		// within c.algorithmX() it may also have a retry for the specific statement
-		c.logger.Warnf("Attempting final cut over operation (attempt %d/%d)", i+1, c.dbConfig.MaxRetries)
-		err = c.algorithmRenameUnderLock(ctx)
+		c.logger.Warn("Attempting final cut over operation",
+			"attempt", i+1,
+			"max-retries", c.dbConfig.MaxRetries)
+		err = c.algorithmCutover(ctx)
 		if err != nil {
-			c.logger.Warnf("cutover failed. err: %s", err.Error())
+			c.logger.Warn("cutover failed", "error", err.Error())
 			continue
 		}
 		c.logger.Warn("final cut over operation complete")
@@ -71,15 +73,19 @@ func (c *CutOver) Run(ctx context.Context) error {
 	return err
 }
 
-func (c *CutOver) algorithmRenameUnderLock(ctx context.Context) error {
+func (c *CutOver) algorithmCutover(ctx context.Context) error {
 	tableLock, err := dbconn.NewTableLock(ctx, c.db, c.tables, c.dbConfig, c.logger)
 	if err != nil {
 		return err
 	}
 	defer tableLock.Close()
-	if err := c.feed.FlushUnderTableLock(ctx, tableLock); err != nil {
+
+	// We don't use FlushUnderLock: that's for within the same server.
+	// We use a regular flush. No new changes will arrive because of the table lock.
+	if err := c.feed.Flush(ctx); err != nil {
 		return err
 	}
+
 	if !c.feed.AllChangesFlushed() {
 		return errors.New("not all changes flushed, final flush might be broken")
 	}

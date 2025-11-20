@@ -53,6 +53,23 @@ The alter table command to perform. The default value is a _null alter table_, w
 
 See also: `--statement`.
 
+### conf
+
+- Type: String
+
+Optional path to INI file containing host, port, username, password, database and tls settings to be used when connecting to MySQL. Spirit will only interpret the `[client]` section within the INI file and ignore all other sections. Values for `--host`, `--username`, `--password`, `--database`, `--tls-ca` and `tls-mode` provided via command line arguments to Spirit take precedence over what is provided in file.
+
+Expected INI file format:
+```
+[client]
+user=$username
+password=$password
+host=$hostname
+port=$port
+tls-ca=$tls-ca
+tls-mode=$tls-mode
+```
+
 ### database
 
 - Type: String
@@ -99,7 +116,7 @@ GRANT CONNECTION_ADMIN, PROCESS ON *.* TO spirituser;
 - Default value: `localhost:3306`
 - Examples: `mydbhost`, `mydbhost:3307`
 
-The host (and optional port) to use when connecting to MySQL.
+The host (and optional port) to use when connecting to MySQL. If no port is provided, 3306 is used.
 
 ### lock-wait-timeout
 
@@ -115,7 +132,7 @@ If you are seeing cutover or checksum lock requests failing, you may consider in
 - Type: String
 - Default value: `spirit`
 
-The password to use when connecting to MySQL.
+The password to use when connecting to MySQL. To connect to MySQL without any password, pass the empty string.
 
 ### replica-dsn
 
@@ -234,7 +251,7 @@ The username to use when connecting to MySQL.
 
 
 ### tls
-Spirit uses the same TLS/SSL mode options as the MySQL client, making it familiar and intuitive for users. 
+Spirit uses the same TLS/SSL mode options as the MySQL client, making it familiar and intuitive for users.
 
 Spirit applies TLS configuration consistently across all database connections:
 

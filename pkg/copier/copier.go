@@ -7,14 +7,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
-	"github.com/siddontang/go-log/loggers"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -41,7 +40,7 @@ type CopierConfig struct {
 	Concurrency                   int
 	TargetChunkTime               time.Duration
 	Throttler                     throttler.Throttler
-	Logger                        loggers.Advanced
+	Logger                        *slog.Logger
 	MetricsSink                   metrics.Sink
 	DBConfig                      *dbconn.DBConfig
 	UseExperimentalBufferedCopier bool
@@ -54,7 +53,7 @@ func NewCopierDefaultConfig() *CopierConfig {
 		Concurrency:     4,
 		TargetChunkTime: 1000 * time.Millisecond,
 		Throttler:       &throttler.Noop{},
-		Logger:          logrus.New(),
+		Logger:          slog.Default(),
 		MetricsSink:     &metrics.NoopSink{},
 		DBConfig:        dbconn.NewDBConfig(),
 	}

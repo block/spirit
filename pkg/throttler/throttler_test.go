@@ -2,15 +2,14 @@ package throttler
 
 import (
 	"database/sql"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"go.uber.org/goleak"
-
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
@@ -29,7 +28,7 @@ func TestThrottlerInterface(t *testing.T) {
 
 	//	NewReplicationThrottler will attach either MySQL 8.0 or MySQL 5.7 throttler
 	loopInterval = 1 * time.Millisecond
-	throttler, err := NewReplicationThrottler(db, 60*time.Second, logrus.New())
+	throttler, err := NewReplicationThrottler(db, 60*time.Second, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, throttler.Open(t.Context()))
 

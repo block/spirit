@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 
@@ -8,7 +9,6 @@ import (
 	"github.com/block/spirit/pkg/repl"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -108,7 +108,7 @@ func TestReplicaTLSEnhancement(t *testing.T) {
 			migration := &Migration{
 				Host:               cfg.Addr,
 				Username:           cfg.User,
-				Password:           cfg.Passwd,
+				Password:           &cfg.Passwd,
 				Database:           cfg.DBName,
 				Table:              "test_table",
 				Alter:              "ADD COLUMN test_col INT",
@@ -211,7 +211,7 @@ func TestReplicationClientTLSConfig(t *testing.T) {
 
 			// Create replication client config with database config
 			clientConfig := &repl.ClientConfig{
-				Logger:   logrus.New(),
+				Logger:   slog.Default(),
 				ServerID: repl.NewServerID(),
 				DBConfig: tlsConfig,
 			} // Create a mock database connection for testing
@@ -260,7 +260,7 @@ func TestReplicaTLSIntegration(t *testing.T) {
 	migration := &Migration{
 		Host:               cfg.Addr,
 		Username:           cfg.User,
-		Password:           cfg.Passwd,
+		Password:           &cfg.Passwd,
 		Database:           cfg.DBName,
 		Table:              "test_table",
 		Alter:              "ADD COLUMN test_col INT",

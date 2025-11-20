@@ -2,10 +2,9 @@ package throttler
 
 import (
 	"database/sql"
+	"log/slog"
 	"sync/atomic"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 var blockWaitInterval = 1 * time.Second
@@ -14,7 +13,7 @@ type Repl struct {
 	replica        *sql.DB
 	lagTolerance   time.Duration
 	currentLagInMs int64
-	logger         loggers.Advanced
+	logger         *slog.Logger
 }
 
 func (l *Repl) IsThrottled() bool {
@@ -30,5 +29,5 @@ func (l *Repl) BlockWait() {
 		}
 		time.Sleep(blockWaitInterval)
 	}
-	l.logger.Warnf("lag monitor timed out. lag: %v tolerance: %v", atomic.LoadInt64(&l.currentLagInMs), l.lagTolerance)
+	l.logger.Warn("lag monitor timed out", "lag_ms", atomic.LoadInt64(&l.currentLagInMs), "tolerance", l.lagTolerance)
 }

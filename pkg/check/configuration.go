@@ -3,8 +3,7 @@ package check
 import (
 	"context"
 	"errors"
-
-	"github.com/siddontang/loggers"
+	"log/slog"
 )
 
 func init() {
@@ -13,7 +12,7 @@ func init() {
 
 // check the configuration of the database. There are some hard nos,
 // and some suggestions around configuration for performance.
-func configurationCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func configurationCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	var binlogFormat, innodbAutoincLockMode, binlogRowImage, logBin, logSlaveUpdates, binlogRowValueOptions string
 	err := r.DB.QueryRowContext(ctx,
 		`SELECT @@global.binlog_format,
@@ -40,7 +39,7 @@ func configurationCheck(ctx context.Context, r Resources, logger loggers.Advance
 		// i.e. on a test with 2 threads running INSERT INTO new SELECT * FROM old WHERE <range>
 		// the inserts will run in serial when there is an autoinc column on new and innodbAutoincLockMode != "2"
 		// This is the auto-inc lock. It won't show up in SHOW PROCESSLIST that they are serial.
-		logger.Warn("innodb_autoinc_lock_mode != 2. This will cause the migration to run slower than expected because concurrent inserts to the new table will be serialized.")
+		logger.Warn("innodb_autoinc_lock_mode != 2. This will cause the migration to run slower than expected because concurrent inserts to the new table will be serialized.", "innodb_autoinc_lock_mode", innodbAutoincLockMode)
 	}
 	if binlogRowImage != "FULL" && binlogRowImage != "MINIMAL" {
 		// This might not be required, but these are the only options that have been tested so far.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -14,7 +15,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/siddontang/go-log/loggers"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -28,7 +28,7 @@ type Unbuffered struct {
 	startTime        time.Time
 	throttler        throttler.Throttler
 	dbConfig         *dbconn.DBConfig
-	logger           loggers.Advanced
+	logger           *slog.Logger
 	metricsSink      metrics.Sink
 	copierEtaHistory *copierEtaHistory
 }
@@ -50,7 +50,7 @@ func (c *Unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 		chunk.Table.QuotedName,
 		chunk.String(),
 	)
-	c.logger.Debugf("running chunk: %s, query: %s", chunk.String(), query)
+	c.logger.Debug("running chunk", "chunk", chunk.String(), "query", query)
 	var affectedRows int64
 	var err error
 	if affectedRows, err = dbconn.RetryableTransaction(ctx, c.db, true, c.dbConfig, query); err != nil {
@@ -67,7 +67,7 @@ func (c *Unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	err = c.sendMetrics(ctx, chunkProcessingTime, chunk.ChunkSize, uint64(affectedRows))
 	if err != nil {
 		// we don't want to stop processing if metrics sending fails, log and continue
-		c.logger.Errorf("error sending metrics from copier: %v", err)
+		c.logger.Error("error sending metrics from copier", "error", err)
 	}
 	return nil
 }

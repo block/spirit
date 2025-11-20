@@ -2,11 +2,10 @@ package table
 
 import (
 	"database/sql"
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/testutils"
-
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -26,7 +25,7 @@ func TestCompositeChunker(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "composite")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 
-	chunker, err := newChunker(t1, 0, logrus.New())
+	chunker, err := newChunker(t1, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 }
@@ -46,7 +45,7 @@ func TestOptimisticChunker(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "optimistic")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 
-	chunker, err := newChunker(t1, 0, logrus.New())
+	chunker, err := newChunker(t1, 0, slog.Default())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerOptimistic{}, chunker)
 }
@@ -68,7 +67,7 @@ func TestNewCompositeChunker(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "composite")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 
-	chunker, err := NewCompositeChunker(t1, 0, logrus.New(), "age_idx", "age > 50")
+	chunker, err := NewCompositeChunker(t1, 0, slog.Default(), "age_idx", "age > 50")
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 	assert.Equal(t, "age_idx", chunker.(*chunkerComposite).keyName)

@@ -60,7 +60,7 @@ func (l *MySQL80Replica) Open(ctx context.Context) error {
 					return
 				}
 				if err := l.UpdateLag(); err != nil {
-					l.logger.Errorf("error getting lag: %s", err.Error())
+					l.logger.Error("error getting lag", "error", err)
 				}
 			}
 		}
@@ -82,8 +82,9 @@ func (l *MySQL80Replica) UpdateLag() error {
 	}
 	atomic.StoreInt64(&l.currentLagInMs, newLagValue)
 	if l.IsThrottled() {
-		l.logger.Warnf("replication delayed, throttling in progress. lag: %v tolerance: %v",
-			atomic.LoadInt64(&l.currentLagInMs), l.lagTolerance)
+		l.logger.Warn("replication delayed, throttling in progress",
+			"lag_ms", atomic.LoadInt64(&l.currentLagInMs),
+			"tolerance", l.lagTolerance)
 	}
 	return nil
 }

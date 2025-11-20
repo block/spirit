@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
-
-	"github.com/siddontang/loggers"
 )
 
 func init() {
@@ -19,7 +18,7 @@ func init() {
 // Check the privileges of the user running the migration.
 // Ensure there is LOCK TABLES etc so we don't find out and get errors
 // at cutover time.
-func privilegesCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	// This is a re-implementation of the gh-ost check
 	// validateGrants() in gh-ost/go/logic/inspect.go
 	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload, foundConnectionAdmin, foundProcess bool

@@ -3,6 +3,7 @@ package repl
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,7 +15,6 @@ import (
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	mysql2 "github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"go.uber.org/goleak"
 
 	"github.com/block/spirit/pkg/table"
@@ -42,7 +42,7 @@ func TestReplClient(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "replt2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
@@ -95,7 +95,7 @@ func TestReplClientComplex(t *testing.T) {
 
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
-	chunker, err := table.NewChunker(t1, t2, time.Second, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, time.Second, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
@@ -104,7 +104,7 @@ func TestReplClientComplex(t *testing.T) {
 	assert.NoError(t, client.AddSubscription(t1, t2, chunker))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
-	client.SetKeyAboveWatermarkOptimization(true)
+	client.SetWatermarkOptimization(true)
 
 	// Insert into t1, but because there is no read yet, the key is above the watermark
 	testutils.RunSQL(t, "DELETE FROM replcomplext1 WHERE a BETWEEN 10 and 500")
@@ -172,7 +172,7 @@ func TestReplClientResumeFromImpossible(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "replresumet2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
@@ -204,7 +204,7 @@ func TestReplClientResumeFromPoint(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "replresumepointt2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
@@ -245,7 +245,7 @@ func TestReplClientOpts(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "replclientoptst2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
@@ -260,7 +260,7 @@ func TestReplClientOpts(t *testing.T) {
 	defer client.Close()
 
 	// Disable key above watermark.
-	client.SetKeyAboveWatermarkOptimization(false)
+	client.SetWatermarkOptimization(false)
 
 	startingPos := client.GetBinlogApplyPosition()
 
@@ -310,7 +310,7 @@ func TestReplClientQueue(t *testing.T) {
 
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
-	chunker, err := table.NewChunker(t1, t2, 1000, logrus.New())
+	chunker, err := table.NewChunker(t1, t2, 1000, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 	_, err = copier.NewCopier(db, chunker, copier.NewCopierDefaultConfig())
@@ -424,7 +424,7 @@ func TestBlockWait(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "blockwaitt2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
@@ -470,7 +470,7 @@ func TestDDLNotification(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "ddl_t2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	ddlNotifications := make(chan string, 1)
@@ -517,7 +517,7 @@ func TestSetDDLNotificationChannel(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "ddl_channel_t2")
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
@@ -622,7 +622,7 @@ func TestCompositePKUpdate(t *testing.T) {
 	assert.NoError(t, t2.SetInfo(t.Context()))
 
 	// Create replication client
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
@@ -698,7 +698,7 @@ func TestAllChangesFlushed(t *testing.T) {
 	srcTable, dstTable := setupTestTables(t, t1, t2)
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -815,8 +815,8 @@ func testMaxRecreateAttemptsPanicSubprocess(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "panic_test_t2")
 	require.NoError(t, t2.SetInfo(t.Context()))
 
-	logger := logrus.New()
-	logger.SetLevel(logrus.ErrorLevel)
+	logger := slog.Default()
+	// Note: slog doesn't have SetLevel method, level is set via handler options
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)

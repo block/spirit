@@ -2,6 +2,7 @@ package dbconn
 
 import (
 	"database/sql"
+	"log/slog"
 	"os"
 	"strconv"
 	"testing"
@@ -9,10 +10,8 @@ import (
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
-	"go.uber.org/goleak"
-
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
@@ -142,7 +141,7 @@ func TestForceExec(t *testing.T) {
 	assert.Error(t, err)
 
 	// But change it to forceexec and it will work!
-	err = ForceExec(t.Context(), db, []*table.TableInfo{ti}, config, logrus.New(), "ALTER TABLE requires_mdl ALGORITHM=INSTANT, ADD COLUMN colc INT")
+	err = ForceExec(t.Context(), db, []*table.TableInfo{ti}, config, slog.Default(), "ALTER TABLE requires_mdl ALGORITHM=INSTANT, ADD COLUMN colc INT")
 	assert.NoError(t, err)
 }
 

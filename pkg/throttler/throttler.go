@@ -4,9 +4,8 @@ package throttler
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 var (
@@ -25,7 +24,7 @@ type Throttler interface {
 // current replica. It will return a MySQL80Replica throttler if the version is detected
 // as 8.0, and a MySQL57Replica throttler otherwise.
 // It returns an error if querying for either fails, i.e. it might not be a valid DB connection.
-func NewReplicationThrottler(replica *sql.DB, lagTolerance time.Duration, logger loggers.Advanced) (Throttler, error) {
+func NewReplicationThrottler(replica *sql.DB, lagTolerance time.Duration, logger *slog.Logger) (Throttler, error) {
 	return &MySQL80Replica{
 		Repl: Repl{
 			replica:      replica,

@@ -3,10 +3,10 @@ package check
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
-	"github.com/siddontang/loggers"
 )
 
 func init() {
@@ -17,7 +17,7 @@ func init() {
 // The spirit OSC algorithm does not support foreign key constraints.
 // That's either pre-existing foreign keys, or adding new ones.
 
-func hasForeignKeysCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func hasForeignKeysCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	sql := `SELECT * FROM information_schema.referential_constraints WHERE 
 	(constraint_schema=? AND table_name=?)
 	or (constraint_schema=? AND referenced_table_name=?)`
@@ -35,7 +35,7 @@ func hasForeignKeysCheck(ctx context.Context, r Resources, logger loggers.Advanc
 	return nil
 }
 
-func addForeignKeyCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func addForeignKeyCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	alterStmt, ok := (*r.Statement.StmtNode).(*ast.AlterTableStmt)
 	if !ok {
 		return errors.New("not a valid alter table statement")

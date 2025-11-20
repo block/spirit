@@ -26,7 +26,7 @@ func TestLintingBasicInfrastructure(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1lint",
 		Alter:                     "ENGINE=InnoDB",
@@ -58,7 +58,7 @@ func TestLintInvisibleIndexBeforeDrop_Warning(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1idx",
 		Alter:                     "DROP INDEX c2",
@@ -90,7 +90,7 @@ func TestLintInvisibleIndexBeforeDrop_Error(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1idxerr",
 		Alter:                     "DROP INDEX c2",
@@ -124,7 +124,7 @@ func TestLintInvisibleIndexBeforeDrop_AlreadyInvisible(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1idxinv",
 		Alter:                     "DROP INDEX c2",
@@ -156,7 +156,7 @@ func TestLintDisableSpecificLinter(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1disable",
 		Alter:                     "DROP INDEX c2",
@@ -182,7 +182,7 @@ func TestLintPrimaryKeyType_IntError(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -205,7 +205,7 @@ func TestLintPrimaryKeyType_SignedBigintWarning(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -228,7 +228,7 @@ func TestLintPrimaryKeyType_UnsignedBigintOK(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -251,7 +251,7 @@ func TestLintPrimaryKeyType_BinaryOK(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -274,7 +274,7 @@ func TestLintPrimaryKeyType_DisableLinter(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -311,7 +311,7 @@ func TestLintMultipleAlterTable(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -339,7 +339,7 @@ func TestLintInvalidConfigFormat(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1badcfg",
 		Alter:                     "ENGINE=InnoDB",
@@ -373,7 +373,7 @@ func TestLintConfigOverridesDefaults(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1override",
 		Alter:                     "DROP INDEX c2",
@@ -392,7 +392,7 @@ func TestLintConfigOverridesDefaults(t *testing.T) {
 	migration = &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1override",
 		Alter:                     "DROP INDEX c2",
@@ -417,7 +417,7 @@ func TestLintCombinedEnableDisable(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -433,7 +433,7 @@ func TestLintCombinedEnableDisable(t *testing.T) {
 	migration = &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1combined",
 		Alter:                     "DROP INDEX idx_c1",
@@ -467,7 +467,7 @@ func TestLintGetCreateTable(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1getcreate",
 		Alter:                     "ADD COLUMN age INT",
@@ -491,7 +491,7 @@ func TestLintCreateTableWithLinting(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Threads:                   1,
 		EnableExperimentalLinting: true,
@@ -506,7 +506,7 @@ func TestLintCreateTableWithLinting(t *testing.T) {
 	migration = &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1createalter",
 		Alter:                     "ADD COLUMN email VARCHAR(255)",
@@ -535,7 +535,7 @@ func TestLintNoViolations(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1clean",
 		Alter:                     "ADD COLUMN email VARCHAR(255)",
@@ -559,7 +559,7 @@ func TestLintWithoutEnablingLinting(t *testing.T) {
 	migration := &Migration{
 		Host:     cfg.Addr,
 		Username: cfg.User,
-		Password: cfg.Passwd,
+		Password: &cfg.Passwd,
 		Database: cfg.DBName,
 		Threads:  1,
 		// EnableExperimentalLinting is NOT set
@@ -590,7 +590,7 @@ func TestLintEnableByConfigOnly(t *testing.T) {
 	migration := &Migration{
 		Host:                     cfg.Addr,
 		Username:                 cfg.User,
-		Password:                 cfg.Passwd,
+		Password:                 &cfg.Passwd,
 		Database:                 cfg.DBName,
 		Table:                    "t1cfgonly",
 		Alter:                    "DROP INDEX c2",
@@ -624,7 +624,7 @@ func TestLintEnableByLintersOnly(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1lintersonly",
 		Alter:                     "DROP INDEX c2",
@@ -656,7 +656,7 @@ func TestLintExperimentalLintOnly(t *testing.T) {
 	migration := &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1lintonly",
 		Alter:                     "DROP INDEX c2",
@@ -687,7 +687,7 @@ func TestLintExperimentalLintOnly(t *testing.T) {
 	migration = &Migration{
 		Host:                      cfg.Addr,
 		Username:                  cfg.User,
-		Password:                  cfg.Passwd,
+		Password:                  &cfg.Passwd,
 		Database:                  cfg.DBName,
 		Table:                     "t1lintonly2",
 		Alter:                     "ADD COLUMN email VARCHAR(255)",

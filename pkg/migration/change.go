@@ -139,7 +139,7 @@ func (c *change) attemptMySQLDDL(ctx context.Context) error {
 			return nil
 		}
 	}
-	c.runner.logger.Infof("unable to use INPLACE: %v", err)
+	c.runner.logger.Info("unable to use INPLACE", "error", err)
 
 	// Failure is expected, since MySQL DDL only applies in limited scenarios
 	// Return the error, which will be ignored by the caller.

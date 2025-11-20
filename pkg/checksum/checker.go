@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,8 +19,6 @@ import (
 	"github.com/block/spirit/pkg/repl"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/siddontang/loggers"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -41,7 +40,7 @@ type Checker struct {
 	startTime        time.Time
 	ExecTime         time.Duration
 	dbConfig         *dbconn.DBConfig
-	logger           loggers.Advanced
+	logger           *slog.Logger
 	fixDifferences   bool
 	differencesFound atomic.Uint64
 	recopyLock       sync.Mutex
@@ -52,7 +51,7 @@ type CheckerConfig struct {
 	Concurrency     int
 	TargetChunkTime time.Duration
 	DBConfig        *dbconn.DBConfig
-	Logger          loggers.Advanced
+	Logger          *slog.Logger
 	FixDifferences  bool
 	Watermark       string  // optional; defines a watermark to start from
 	WriteDB         *sql.DB // optional; use a different DB for the "new" side.
@@ -64,7 +63,7 @@ func NewCheckerDefaultConfig() *CheckerConfig {
 		Concurrency:     4,
 		TargetChunkTime: 1000 * time.Millisecond,
 		DBConfig:        dbconn.NewDBConfig(),
-		Logger:          logrus.New(),
+		Logger:          slog.Default(),
 		FixDifferences:  false,
 		MaxRetries:      3,
 	}
@@ -113,7 +112,7 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 		}
 		defer c.writeTrxPool.Put(writeTrx)
 	}
-	c.logger.Debugf("checksumming chunk: %s", chunk.String())
+	c.logger.Debug("checksumming chunk", "chunk", chunk.String())
 	source := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum, count(*) as c FROM %s WHERE %s",
 		c.intersectColumns(chunk),
 		chunk.Table.QuotedName,
@@ -138,7 +137,7 @@ func (c *Checker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPool, ch
 		// The checksums do not match, so we first need
 		// to inspect closely and report on the differences.
 		c.differencesFound.Add(1)
-		c.logger.Warnf("checksum mismatch for chunk %s: source %d != target %d sourceCount: %d targetCount: %d", chunk.String(), sourceChecksum, targetChecksum, sourceCount, targetCount)
+		c.logger.Warn("checksum mismatch for chunk", "chunk", chunk.String(), "sourceChecksum", sourceChecksum, "targetChecksum", targetChecksum, "sourceCount", sourceCount, "targetCount", targetCount)
 		if err := c.inspectDifferences(srcTrx, writeTrx, chunk); err != nil {
 			return err
 		}
@@ -171,7 +170,7 @@ func (c *Checker) GetProgress() string {
 // inspectDifferences looks at the chunk and tries to find differences.
 // For cross-database scenarios, it queries each database separately and compares in memory.
 func (c *Checker) inspectDifferences(srcTrx, writeTrx *sql.Tx, chunk *table.Chunk) error {
-	c.logger.Infof("inspecting differences for chunk: %s", chunk.String())
+	c.logger.Info("inspecting differences for chunk", "chunk", chunk.String())
 
 	sourceRows, err := srcTrx.Query(fmt.Sprintf(queryTemplate,
 		c.intersectColumns(chunk),
@@ -220,10 +219,10 @@ func (c *Checker) inspectDifferences(srcTrx, writeTrx *sql.Tx, chunk *table.Chun
 		// Check if this row exists in source and has different checksum
 		if sourceChecksum, exists := sourceChecksums[pk]; exists {
 			if sourceChecksum != checksum {
-				c.logger.Warnf("inspection revealed row checksum mismatch for pk: %s: source %s != target %s", pk, sourceChecksum, checksum)
+				c.logger.Warn("inspection revealed row checksum mismatch", "pk", pk, "sourceChecksum", sourceChecksum, "targetChecksum", checksum)
 			}
 		} else {
-			c.logger.Warnf("inspection revealed row does not exist in source for pk: %s", pk)
+			c.logger.Warn("inspection revealed row does not exist in source", "pk", pk)
 		}
 	}
 	if err := targetRows.Err(); err != nil {
@@ -233,7 +232,7 @@ func (c *Checker) inspectDifferences(srcTrx, writeTrx *sql.Tx, chunk *table.Chun
 	// Check for rows that exist in source but not in target
 	for pk, sourceChecksum := range sourceChecksums {
 		if _, exists := targetChecksums[pk]; !exists {
-			c.logger.Warnf("inspection revealed row does not exist in target for pk: %s (source checksum: %s)", pk, sourceChecksum)
+			c.logger.Warn("inspection revealed row does not exist in target", "pk", pk, "sourceChecksum", sourceChecksum)
 		}
 	}
 
@@ -254,7 +253,7 @@ func (c *Checker) readChunkData(ctx context.Context, chunk *table.Chunk) ([]rowD
 		chunk.Table.QuotedName,
 		chunk.String(),
 	)
-	c.logger.Debugf("reading chunk data: %s, query: %s", chunk.String(), query)
+	c.logger.Debug("reading chunk data", "chunk", chunk.String(), "query", query)
 	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query chunk data: %w", err)
@@ -278,7 +277,7 @@ func (c *Checker) readChunkData(ctx context.Context, chunk *table.Chunk) ([]rowD
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
-	c.logger.Debugf("read %d rows from chunk %s", len(rowDataList), chunk.String())
+	c.logger.Debug("read rows from chunk", "rowCount", len(rowDataList), "chunk", chunk.String())
 	return rowDataList, nil
 }
 
@@ -311,7 +310,7 @@ func (c *Checker) writeRowsToTarget(ctx context.Context, chunk *table.Chunk, row
 		strings.Join(chunk.Table.Columns, ", "),
 		strings.Join(valuesClauses, ", "),
 	)
-	c.logger.Debugf("writing %d rows to %s", len(rows), chunk.NewTable.QuotedName)
+	c.logger.Debug("writing rows to target", "rowCount", len(rows), "table", chunk.NewTable.QuotedName)
 
 	// Execute the batch insert/replace
 	_, err := dbconn.RetryableTransaction(ctx, c.writeDB, false, c.dbConfig, query)
@@ -329,7 +328,7 @@ func (c *Checker) writeRowsToTarget(ctx context.Context, chunk *table.Chunk, row
 // the chunk here, but this is expected to be a very rare situation, so a small
 // stall from an XL sized chunk is considered acceptable.
 func (c *Checker) replaceChunk(ctx context.Context, chunk *table.Chunk) error {
-	c.logger.Warnf("recopying chunk: %s", chunk.String())
+	c.logger.Warn("recopying chunk", "chunk", chunk.String())
 
 	// We further prevent the chance of deadlocks from the recopying process by only re-copying one chunk at a time.
 	// We may revisit this in future, but since conflicts are expected to be low, it should be fine for now.
@@ -554,7 +553,7 @@ func (c *Checker) Run(ctx context.Context) error {
 	// Try the checksum up to n times if differences are found and we can fix them
 	for attempt := 1; attempt <= c.maxRetries; attempt++ {
 		if attempt > 1 {
-			c.logger.Errorf("checksum failed, retrying %d/%d times", attempt, c.maxRetries)
+			c.logger.Error("checksum failed, retrying", "attempt", attempt, "maxRetries", c.maxRetries)
 			// Reset the chunker to start from the beginning
 			if err := c.chunker.Reset(); err != nil {
 				return fmt.Errorf("failed to reset chunker for retry: %w", err)

@@ -3,9 +3,8 @@ package status
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
-
-	"github.com/siddontang/go-log/loggers"
 )
 
 var (
@@ -23,12 +22,12 @@ type Task interface {
 // WatchTask periodically does the status reporting for a task.
 // This includes writing to the logger the current state,
 // and dumping checkpoints.
-func WatchTask(ctx context.Context, task Task, logger loggers.Advanced) {
+func WatchTask(ctx context.Context, task Task, logger *slog.Logger) {
 	go continuallyDumpStatus(ctx, task, logger)
 	go continuallyDumpCheckpoint(ctx, task, logger)
 }
 
-func continuallyDumpStatus(ctx context.Context, task Task, logger loggers.Advanced) {
+func continuallyDumpStatus(ctx context.Context, task Task, logger *slog.Logger) {
 	ticker := time.NewTicker(StatusInterval)
 	defer ticker.Stop()
 	for {
@@ -45,7 +44,7 @@ func continuallyDumpStatus(ctx context.Context, task Task, logger loggers.Advanc
 	}
 }
 
-func continuallyDumpCheckpoint(ctx context.Context, task Task, logger loggers.Advanced) {
+func continuallyDumpCheckpoint(ctx context.Context, task Task, logger *slog.Logger) {
 	ticker := time.NewTicker(CheckpointDumpInterval)
 	defer ticker.Stop()
 	for {
@@ -60,7 +59,7 @@ func continuallyDumpCheckpoint(ctx context.Context, task Task, logger loggers.Ad
 			if err := task.DumpCheckpoint(ctx); err != nil {
 				if errors.Is(err, ErrWatermarkNotReady) {
 					// This is non fatal, we can try again later.
-					logger.Warnf("could not write checkpoint yet, watermark not ready")
+					logger.Warn("could not write checkpoint yet, watermark not ready")
 					continue
 				}
 				// If the error is context canceled, that's fine too.
@@ -80,7 +79,7 @@ func continuallyDumpCheckpoint(ctx context.Context, task Task, logger loggers.Ad
 				// our progress, we don't want to continue doing work.
 				// We could get 10 days into a migration, and then fail, and then
 				// discover this. It's better to fast fail now.
-				logger.Errorf("error writing checkpoint: %v", err)
+				logger.Error("error writing checkpoint", "error", err)
 				task.Cancel()
 				return
 			}

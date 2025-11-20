@@ -7,11 +7,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 const (
@@ -281,7 +280,7 @@ func (t *TableInfo) Close() error {
 
 // AutoUpdateStatistics runs a loop that updates the table statistics every interval.
 // This will continue until Close() is called on the tableInfo, or t.DisableAutoUpdateStatistics is set to true.
-func (t *TableInfo) AutoUpdateStatistics(ctx context.Context, interval time.Duration, logger loggers.Advanced) {
+func (t *TableInfo) AutoUpdateStatistics(ctx context.Context, interval time.Duration, logger *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -293,9 +292,11 @@ func (t *TableInfo) AutoUpdateStatistics(ctx context.Context, interval time.Dura
 			return
 		case <-ticker.C:
 			if err := t.updateTableStatistics(ctx); err != nil {
-				logger.Errorf("error updating table statistics: %v", err)
+				logger.Error("error updating table statistics", "error", err)
 			}
-			logger.Infof("table statistics updated: estimated-rows=%d pk[0].max-value=%v", t.EstimatedRows, t.MaxValue())
+			logger.Info("table statistics updated",
+				"estimated-rows", t.EstimatedRows,
+				"pk[0].max-value", t.MaxValue())
 		}
 	}
 }

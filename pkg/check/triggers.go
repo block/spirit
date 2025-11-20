@@ -3,8 +3,7 @@ package check
 import (
 	"context"
 	"errors"
-
-	"github.com/siddontang/loggers"
+	"log/slog"
 )
 
 func init() {
@@ -12,7 +11,7 @@ func init() {
 }
 
 // hasTriggersCheck check if table has triggers associated with it, which is not supported
-func hasTriggersCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func hasTriggersCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	sql := `SELECT * FROM information_schema.triggers WHERE 
 	(event_object_schema=? AND event_object_table=?)`
 	rows, err := r.DB.QueryContext(ctx, sql, r.Table.SchemaName, r.Table.TableName)

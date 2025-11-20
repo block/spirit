@@ -3,9 +3,8 @@ package check
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 func init() {
@@ -13,7 +12,7 @@ func init() {
 }
 
 // check the settings used to initialize spirit.
-func settingsCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func settingsCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	// Threads must be in the range of 1-64
 	if r.Threads < 1 || r.Threads > 64 {
 		return errors.New("--threads must be in the range of 1-64")

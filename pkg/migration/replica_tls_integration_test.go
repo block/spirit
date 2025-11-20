@@ -139,7 +139,7 @@ func TestReplicaTLSIntegrationScenarios(t *testing.T) {
 			migration := &Migration{
 				Host:               cfg.Addr,
 				Username:           cfg.User,
-				Password:           cfg.Passwd,
+				Password:           &cfg.Passwd,
 				Database:           cfg.DBName,
 				Table:              "test_tls_table",
 				Alter:              "ADD COLUMN test_col_" + sanitizedName + " VARCHAR(50)",
@@ -228,7 +228,7 @@ func TestTLSConfigurationFlow(t *testing.T) {
 			migration: &Migration{
 				Host:               cfg.Addr,
 				Username:           cfg.User,
-				Password:           cfg.Passwd,
+				Password:           &cfg.Passwd,
 				Database:           cfg.DBName,
 				Table:              "test_table",
 				Alter:              "ADD COLUMN flow_test VARCHAR(50)",
@@ -245,7 +245,7 @@ func TestTLSConfigurationFlow(t *testing.T) {
 			migration: &Migration{
 				Host:               cfg.Addr,
 				Username:           cfg.User,
-				Password:           cfg.Passwd,
+				Password:           &cfg.Passwd,
 				Database:           cfg.DBName,
 				Table:              "test_table",
 				Alter:              "ADD COLUMN flow_test VARCHAR(50)",
@@ -262,7 +262,7 @@ func TestTLSConfigurationFlow(t *testing.T) {
 			migration: &Migration{
 				Host:               cfg.Addr,
 				Username:           cfg.User,
-				Password:           cfg.Passwd,
+				Password:           &cfg.Passwd,
 				Database:           cfg.DBName,
 				Table:              "test_table",
 				Alter:              "ADD COLUMN flow_test VARCHAR(50)",
@@ -330,7 +330,7 @@ func TestTLSErrorHandling(t *testing.T) {
 			migration: &Migration{
 				Host:               cfg.Addr,
 				Username:           cfg.User,
-				Password:           cfg.Passwd,
+				Password:           &cfg.Passwd,
 				Database:           cfg.DBName,
 				Table:              "test_table",
 				Alter:              "ADD COLUMN error_test VARCHAR(50)",
@@ -346,7 +346,7 @@ func TestTLSErrorHandling(t *testing.T) {
 			migration: &Migration{
 				Host:               cfg.Addr,
 				Username:           cfg.User,
-				Password:           cfg.Passwd,
+				Password:           &cfg.Passwd,
 				Database:           cfg.DBName,
 				Table:              "test_table",
 				Alter:              "ADD COLUMN error_test VARCHAR(50)",
@@ -388,7 +388,7 @@ func TestConcurrentTLSConfiguration(t *testing.T) {
 		migration := &Migration{
 			Host:               cfg.Addr,
 			Username:           cfg.User,
-			Password:           cfg.Passwd,
+			Password:           &cfg.Passwd,
 			Database:           cfg.DBName,
 			Table:              "test_table",
 			Alter:              "ADD COLUMN concurrent_test VARCHAR(50)",

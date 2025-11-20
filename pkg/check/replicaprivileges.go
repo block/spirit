@@ -2,9 +2,9 @@ package check
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/block/spirit/pkg/throttler"
-	"github.com/siddontang/loggers"
 )
 
 func init() {
@@ -12,7 +12,7 @@ func init() {
 }
 
 // Check that there is permission to run perfschema queries for replication (8.0)
-func replicaPrivilegeCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func replicaPrivilegeCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	if r.Replica == nil {
 		return nil // The user is not using the replica DSN feature.
 	}

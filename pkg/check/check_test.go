@@ -2,10 +2,9 @@ package check
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 
-	"github.com/siddontang/loggers"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -14,7 +13,7 @@ func TestCheckAPI(t *testing.T) {
 	myfunc := func(
 		_ context.Context,
 		_ Resources,
-		_ loggers.Advanced,
+		_ *slog.Logger,
 	) error {
 		testVal = "newval"
 		return nil
@@ -28,7 +27,7 @@ func TestCheckAPI(t *testing.T) {
 	assert.Len(t, checks, checkLen+1)
 
 	assert.Equal(t, "test", testVal)
-	err := RunChecks(t.Context(), Resources{}, logrus.New(), ScopeTesting)
+	err := RunChecks(t.Context(), Resources{}, slog.Default(), ScopeTesting)
 	assert.NoError(t, err)
 	assert.Equal(t, "newval", testVal)
 }

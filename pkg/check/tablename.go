@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
-
-	"github.com/siddontang/loggers"
 )
 
 const (
@@ -43,7 +42,7 @@ func init() {
 	NameFormatTimestampExtraChars = len(strings.ReplaceAll(NameFormatOldTimeStamp, "%s", "")) + len(NameFormatTimestamp)
 }
 
-func tableNameCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func tableNameCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	tableName := r.Table.TableName
 	if len(tableName) < 1 {
 		return errors.New("table name must be at least 1 character")

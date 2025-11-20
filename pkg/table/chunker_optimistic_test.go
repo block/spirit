@@ -2,12 +2,11 @@ package table
 
 import (
 	"database/sql"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/testutils"
-
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -29,7 +28,7 @@ func TestOptimisticChunkerBasic(t *testing.T) {
 	chunker := &chunkerOptimistic{
 		Ti:            t1,
 		ChunkerTarget: ChunkerDefaultTarget,
-		logger:        logrus.New(),
+		logger:        slog.Default(),
 	}
 	chunker.setDynamicChunking(false)
 
@@ -89,7 +88,7 @@ func TestLowWatermark(t *testing.T) {
 		Ti:                     t1,
 		ChunkerTarget:          ChunkerDefaultTarget,
 		lowerBoundWatermarkMap: make(map[string]*Chunk, 0),
-		logger:                 logrus.New(),
+		logger:                 slog.Default(),
 	}
 	chunker.setDynamicChunking(false)
 
@@ -195,7 +194,7 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	t1.columnsMySQLTps = make(map[string]string)
 	t1.columnsMySQLTps["id"] = "bigint"
 
-	chunker, err := newChunker(t1, 100*time.Millisecond, logrus.New())
+	chunker, err := newChunker(t1, 100*time.Millisecond, slog.Default())
 	assert.NoError(t, err)
 
 	assert.NoError(t, chunker.Open())
@@ -262,7 +261,7 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	t2.columnsMySQLTps = make(map[string]string)
 	t2.columnsMySQLTps["id"] = "bigint"
 
-	chunker2, err := NewChunker(t2, t2, 100, logrus.New())
+	chunker2, err := NewChunker(t2, t2, 100, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker2.OpenAtWatermark(watermark))
 
@@ -313,7 +312,7 @@ func TestOptimisticPrefetchChunking(t *testing.T) {
 	chunker := &chunkerOptimistic{
 		Ti:            t1,
 		ChunkerTarget: time.Second,
-		logger:        logrus.New(),
+		logger:        slog.Default(),
 	}
 	chunker.setDynamicChunking(true)
 	assert.NoError(t, chunker.Open())
@@ -349,7 +348,7 @@ func TestOptimisticChunkerReset(t *testing.T) {
 		Ti:                     t1,
 		ChunkerTarget:          ChunkerDefaultTarget,
 		lowerBoundWatermarkMap: make(map[string]*Chunk, 0),
-		logger:                 logrus.New(),
+		logger:                 slog.Default(),
 	}
 	chunker.setDynamicChunking(false)
 

@@ -6,13 +6,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
 	"github.com/go-sql-driver/mysql"
-	"github.com/siddontang/loggers"
 )
 
 const (
@@ -189,7 +189,7 @@ func backoff(i int) {
 // ForceExec is like Exec but it has some added logic to force kill
 // any connections that are holding up metadata locks preventing this from
 // succeeding.
-func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbConfig *DBConfig, logger loggers.Advanced, stmt string, args ...any) error {
+func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbConfig *DBConfig, logger *slog.Logger, stmt string, args ...any) error {
 	trx, connId, err := BeginStandardTrx(ctx, db, nil)
 	if err != nil {
 		return err

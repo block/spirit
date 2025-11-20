@@ -7,12 +7,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
-	"github.com/siddontang/loggers"
 )
 
 var (
@@ -30,7 +30,7 @@ type MetadataLock struct {
 	lockNames       []string // Multiple lock names for multiple tables
 }
 
-func NewMetadataLock(ctx context.Context, dsn string, tables []*table.TableInfo, config *DBConfig, logger loggers.Advanced, optionFns ...func(*MetadataLock)) (*MetadataLock, error) {
+func NewMetadataLock(ctx context.Context, dsn string, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, optionFns ...func(*MetadataLock)) (*MetadataLock, error) {
 	if len(tables) == 0 {
 		return nil, errors.New("no tables provided for metadata lock")
 	}
@@ -71,7 +71,7 @@ func NewMetadataLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 			}
 			if answer == 0 {
 				// 0 means the lock is held by another connection
-				logger.Warnf("could not acquire metadata lock for %s, lock is held by another connection", lockName)
+				logger.Warn("could not acquire metadata lock, lock is held by another connection", "lock_name", lockName)
 				return fmt.Errorf("could not acquire metadata lock for %s, lock is held by another connection", lockName)
 			} else if answer != 1 {
 				// probably we never get here, but just in case
@@ -82,13 +82,13 @@ func NewMetadataLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 	}
 
 	// Acquire all locks or return an error immediately
-	logger.Infof("attempting to acquire metadata lock ")
+	logger.Info("attempting to acquire metadata lock")
 	if err = getLocks(); err != nil {
 		mdl.db.Close() // close if we are not returning an MDL.
 		return nil, err
 	}
 	for _, lockName := range mdl.lockNames {
-		logger.Infof("acquired metadata lock: %s", lockName)
+		logger.Info("acquired metadata lock", "lock_name", lockName)
 	}
 
 	// Setup background refresh runner
@@ -102,7 +102,7 @@ func NewMetadataLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 			case <-ctx.Done():
 				// Close the dedicated connection to release all locks
 				for _, lockName := range mdl.lockNames {
-					logger.Infof("releasing metadata lock: %s", lockName)
+					logger.Info("releasing metadata lock", "lock_name", lockName)
 				}
 				// Use select with default to avoid blocking if Close() isn't called
 				select {
@@ -119,30 +119,30 @@ func NewMetadataLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 					// for example, we watch the binary log to see metadata changes
 					// that we did not make. This makes it a warning, not an error,
 					// and we can try again on the next tick interval.
-					logger.Warnf("could not refresh metadata locks: %s", err)
+					logger.Warn("could not refresh metadata locks", "error", err)
 
 					// try to close the existing connection
 					if closeErr := mdl.db.Close(); closeErr != nil {
-						logger.Warnf("could not close database connection: %s", closeErr)
+						logger.Warn("could not close database connection", "error", closeErr)
 						continue
 					}
 
 					// try to re-establish the connection
 					mdl.db, err = New(dsn, &dbConfig)
 					if err != nil {
-						logger.Warnf("could not re-establish database connection: %s", err)
+						logger.Warn("could not re-establish database connection", "error", err)
 						continue
 					}
 
 					// try to acquire the locks again with the new connection
 					if err = getLocks(); err != nil {
-						logger.Warnf("could not acquire metadata locks after re-establishing connection: %s", err)
+						logger.Warn("could not acquire metadata locks after re-establishing connection", "error", err)
 						continue
 					}
 
-					logger.Infof("re-acquired metadata locks after re-establishing connection")
+					logger.Info("re-acquired metadata locks after re-establishing connection")
 				} else {
-					logger.Debugf("refreshed metadata locks")
+					logger.Debug("refreshed metadata locks")
 				}
 			}
 		}
@@ -159,9 +159,9 @@ func (m *MetadataLock) Close() error {
 	return <-m.closeCh
 }
 
-func (m *MetadataLock) CloseDBConnection(logger loggers.Advanced) error {
+func (m *MetadataLock) CloseDBConnection(logger *slog.Logger) error {
 	// Closes the database connection for the MetadataLock
-	logger.Infof("About to close MetadataLock database connection")
+	logger.Info("about to close MetadataLock database connection")
 	if m.db != nil {
 		return m.db.Close()
 	}

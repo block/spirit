@@ -30,7 +30,7 @@ func TestMultiChangesDifferentSchemas(t *testing.T) {
 	migration := &Migration{
 		Host:            cfg.Addr,
 		Username:        cfg.User,
-		Password:        cfg.Passwd,
+		Password:        &cfg.Passwd,
 		Database:        cfg.DBName,
 		Threads:         4,
 		TargetChunkTime: 2 * time.Second,

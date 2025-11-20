@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/repl"
 	"github.com/block/spirit/pkg/table"
-	"github.com/siddontang/loggers"
 )
 
 type CutOver struct {
@@ -18,7 +18,7 @@ type CutOver struct {
 	feed     *repl.Client
 	config   []*cutoverConfig
 	dbConfig *dbconn.DBConfig
-	logger   loggers.Advanced
+	logger   *slog.Logger
 }
 
 type cutoverConfig struct {
@@ -29,7 +29,7 @@ type cutoverConfig struct {
 
 // NewCutOver contains the logic to perform the final cut over. It can cutover multiple tables
 // at once based on config. A replication feed which is used to ensure consistency before the cut over.
-func NewCutOver(db *sql.DB, config []*cutoverConfig, feed *repl.Client, dbConfig *dbconn.DBConfig, logger loggers.Advanced) (*CutOver, error) {
+func NewCutOver(db *sql.DB, config []*cutoverConfig, feed *repl.Client, dbConfig *dbconn.DBConfig, logger *slog.Logger) (*CutOver, error) {
 	if feed == nil {
 		return nil, errors.New("feed must be non-nil")
 	}
@@ -73,10 +73,15 @@ func (c *CutOver) Run(ctx context.Context) error {
 		}
 		// We use maxCutoverRetries as our retrycount, but nested
 		// within c.algorithmX() it may also have a retry for the specific statement
-		c.logger.Warnf("Attempting final cut over operation (attempt %d/%d)", i+1, c.dbConfig.MaxRetries)
+		c.logger.Warn("Attempting final cut over operation",
+			"attempt", i+1,
+			"max_retries", c.dbConfig.MaxRetries,
+		)
 		err = c.algorithmRenameUnderLock(ctx)
 		if err != nil {
-			c.logger.Warnf("cutover failed. err: %s", err.Error())
+			c.logger.Warn("cutover failed",
+				"error", err.Error(),
+			)
 			continue
 		}
 		c.logger.Warn("final cut over operation complete")

@@ -1,10 +1,10 @@
 package check
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -26,7 +26,7 @@ func TestCheckTableName(t *testing.T) {
 			},
 			SkipDropAfterCutover: skipDropAfterCutover,
 		}
-		return tableNameCheck(t.Context(), r, logrus.New())
+		return tableNameCheck(t.Context(), r, slog.Default())
 	}
 
 	assert.NoError(t, testTableName("a", false))

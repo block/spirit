@@ -2,11 +2,11 @@ package check
 
 import (
 	"database/sql"
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -19,7 +19,7 @@ func TestConfiguration(t *testing.T) {
 		Table: &table.TableInfo{TableName: "test", SchemaName: "test"},
 	}
 
-	err = configurationCheck(t.Context(), r, logrus.New())
+	err = configurationCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // all looks good of course.
 
 	// Current binlog row image format.
@@ -32,7 +32,7 @@ func TestConfiguration(t *testing.T) {
 	_, err = db.Exec("SET GLOBAL binlog_row_image = 'NOBLOB'")
 	assert.NoError(t, err)
 
-	err = configurationCheck(t.Context(), r, logrus.New())
+	err = configurationCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err)
 
 	// restore the binlog row image format.

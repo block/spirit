@@ -4,12 +4,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/testutils"
 
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -40,7 +40,7 @@ func TestCompositeChunkerCompositeBinary(t *testing.T) {
 	assert.Equal(t, binaryType, t1.keyDatums[0])
 	assert.Equal(t, binaryType, t1.keyDatums[1])
 
-	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, slog.Default())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 
@@ -140,7 +140,7 @@ func TestCompositeChunkerBinary(t *testing.T) {
 	assert.Equal(t, []string{"varbinary"}, t1.keyColumnsMySQLTp)
 	assert.Equal(t, binaryType, t1.keyDatums[0])
 
-	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, slog.Default())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 
@@ -216,7 +216,7 @@ func TestCompositeChunkerInt(t *testing.T) {
 	assert.Equal(t, []string{"int"}, t1.keyColumnsMySQLTp)
 	assert.Equal(t, signedType, t1.keyDatums[0])
 
-	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, slog.Default())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 
@@ -275,7 +275,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 		Ti:                     t1,
 		ChunkerTarget:          ChunkerDefaultTarget,
 		lowerBoundWatermarkMap: make(map[string]*Chunk, 0),
-		logger:                 logrus.New(),
+		logger:                 slog.Default(),
 	}
 	_, err = chunker.Next()
 	assert.Error(t, err) // not open yet
@@ -399,7 +399,7 @@ func TestCompositeSmallTable(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "compositesmall_t1")
 	assert.NoError(t, t1.SetInfo(t.Context()))
 
-	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, slog.Default())
 	assert.NoError(t, err)
 	assert.IsType(t, &chunkerComposite{}, chunker)
 
@@ -442,7 +442,7 @@ func TestSetKey(t *testing.T) {
 	chunkerPK := &chunkerComposite{
 		Ti:            t1,
 		ChunkerTarget: 100 * time.Millisecond,
-		logger:        logrus.New(),
+		logger:        slog.Default(),
 	}
 	err = chunkerPK.SetKey("PRIMARY", "id < 1008")
 	assert.NoError(t, err)
@@ -455,7 +455,7 @@ func TestSetKey(t *testing.T) {
 	chunker := &chunkerComposite{
 		Ti:            t1,
 		ChunkerTarget: 100 * time.Millisecond,
-		logger:        logrus.New(),
+		logger:        slog.Default(),
 	}
 	err = chunker.SetKey("s", "status = 'ARCHIVED' AND updated_at < NOW() - INTERVAL 1 DAY")
 	assert.NoError(t, err)
@@ -472,7 +472,7 @@ func TestSetKey(t *testing.T) {
 	chunker = &chunkerComposite{
 		Ti:            t1,
 		ChunkerTarget: 100 * time.Millisecond,
-		logger:        logrus.New(),
+		logger:        slog.Default(),
 	}
 	err = chunker.SetKey("s", "status = 'PENDING' AND updated_at > NOW() - INTERVAL 1 DAY")
 	assert.NoError(t, err)
@@ -505,7 +505,7 @@ func TestSetKey(t *testing.T) {
 		chunker = &chunkerComposite{
 			Ti:            t1,
 			ChunkerTarget: 100 * time.Millisecond,
-			logger:        logrus.New(),
+			logger:        slog.Default(),
 		}
 		err = chunker.SetKey(index, "updated_at < NOW() - INTERVAL 1 DAY")
 		assert.NoError(t, err)
@@ -573,7 +573,7 @@ func TestSetKeyCompositeKeyMerge(t *testing.T) {
 	chunker := &chunkerComposite{
 		Ti:            t1,
 		ChunkerTarget: 100 * time.Millisecond,
-		logger:        logrus.New(),
+		logger:        slog.Default(),
 	}
 	err = chunker.SetKey("dnc", "")
 	assert.NoError(t, err)
@@ -607,7 +607,7 @@ func TestCompositeChunkerReset(t *testing.T) {
 		Ti:                     t1,
 		ChunkerTarget:          ChunkerDefaultTarget,
 		lowerBoundWatermarkMap: make(map[string]*Chunk, 0),
-		logger:                 logrus.New(),
+		logger:                 slog.Default(),
 	}
 
 	// Test that Reset() fails when chunker is not open
@@ -715,7 +715,7 @@ func TestCompositeChunkerReset(t *testing.T) {
 		Ti:                     t1,
 		ChunkerTarget:          ChunkerDefaultTarget,
 		lowerBoundWatermarkMap: make(map[string]*Chunk, 0),
-		logger:                 logrus.New(),
+		logger:                 slog.Default(),
 	}
 
 	// Set a custom key and where condition

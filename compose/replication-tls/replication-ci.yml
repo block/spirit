@@ -1,3 +1,4 @@
+# Docker Compose configuration for CI testing (no TLS)
 services:
   mysql:
     image: mysql:8.0.33
@@ -36,12 +37,13 @@ services:
       retries: 60
     volumes:
       - mysql-replica-data-dir:/var/lib/mysql
-      - ./bootstrap_replica.sql:/docker-entrypoint-initdb.d/bootstrap_replica.sql
+      - ./init-ci-replica.sql:/docker-entrypoint-initdb.d/init-ci-replica.sql
       - ./replication_health_check.sh:/replication_health_check.sh
     command: --server-id=2 --relay-log=mysql-relay-bin --gtid-mode=on --enforce-gtid-consistency=on
     depends_on:
       mysql:
         condition: service_healthy
+
   test:
     build:
       context: ../../.

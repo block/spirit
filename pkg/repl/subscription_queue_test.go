@@ -1,13 +1,13 @@
 package repl
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,7 +27,7 @@ func TestSubscriptionDeltaQueue(t *testing.T) {
 
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -80,7 +80,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	t.Run("empty queue", func(t *testing.T) {
 		client := &Client{
 			db:              db,
-			logger:          logrus.New(),
+			logger:          slog.Default(),
 			concurrency:     2,
 			targetBatchSize: 1000,
 			dbConfig:        dbconn.NewDBConfig(),
@@ -100,7 +100,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	t.Run("statement merging", func(t *testing.T) {
 		client := &Client{
 			db:              db,
-			logger:          logrus.New(),
+			logger:          slog.Default(),
 			concurrency:     2,
 			targetBatchSize: 1000,
 			dbConfig:        dbconn.NewDBConfig(),
@@ -159,7 +159,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	t.Run("batch size limit", func(t *testing.T) {
 		client := &Client{
 			db:              db,
-			logger:          logrus.New(),
+			logger:          slog.Default(),
 			concurrency:     2,
 			targetBatchSize: 2, // Small batch size to force multiple statements
 			dbConfig:        dbconn.NewDBConfig(),
@@ -198,7 +198,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	t.Run("under lock execution", func(t *testing.T) {
 		client := &Client{
 			db:              db,
-			logger:          logrus.New(),
+			logger:          slog.Default(),
 			concurrency:     2,
 			targetBatchSize: 1000,
 			dbConfig:        dbconn.NewDBConfig(),
@@ -223,7 +223,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 		sub.HasChanged([]any{2}, nil, true)
 
 		// Create a table lock
-		lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), logrus.New())
+		lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), slog.Default())
 		assert.NoError(t, err)
 
 		// Flush under lock
@@ -242,7 +242,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	t.Run("concurrent queue access", func(t *testing.T) {
 		client := &Client{
 			db:              db,
-			logger:          logrus.New(),
+			logger:          slog.Default(),
 			concurrency:     2,
 			targetBatchSize: 1000,
 			dbConfig:        dbconn.NewDBConfig(),
@@ -297,7 +297,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	t.Run("mixed operations", func(t *testing.T) {
 		client := &Client{
 			db:              db,
-			logger:          logrus.New(),
+			logger:          slog.Default(),
 			concurrency:     2,
 			targetBatchSize: 2, // Small batch size to force splits
 			dbConfig:        dbconn.NewDBConfig(),

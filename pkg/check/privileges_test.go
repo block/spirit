@@ -3,12 +3,12 @@ package check
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -36,36 +36,36 @@ func TestPrivileges(t *testing.T) {
 		DB:    lowPrivDB,
 		Table: &table.TableInfo{TableName: "test", SchemaName: "test"},
 	}
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // privileges fail, since user has nothing granted.
 
 	_, err = db.Exec("GRANT ALL ON test.* TO testprivsuser")
 	assert.NoError(t, err)
 
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // still not enough, needs replication client
 
 	_, err = db.Exec("GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testprivsuser")
 	assert.NoError(t, err)
 
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // it's all good now
 
 	// ForceKill requires additional privileges!
 	r.ForceKill = true
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err)
 
 	_, err = db.Exec("GRANT SELECT on `performance_schema`.* TO testprivsuser")
 	assert.NoError(t, err)
 
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // still not enough, needs connection_admin
 
 	_, err = db.Exec("GRANT CONNECTION_ADMIN ON *.* TO testprivsuser")
 	assert.NoError(t, err)
 
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // still not enough, needs PROCESS
 	t.Log(err)
 
@@ -81,7 +81,7 @@ func TestPrivileges(t *testing.T) {
 	defer lowPrivDB.Close()
 	r.DB = lowPrivDB
 
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err)
 
 	// Test the root user
@@ -89,6 +89,6 @@ func TestPrivileges(t *testing.T) {
 		DB:    db,
 		Table: &table.TableInfo{TableName: "test", SchemaName: "test"},
 	}
-	err = privilegesCheck(t.Context(), r, logrus.New())
+	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // privileges work fine
 }

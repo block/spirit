@@ -2,6 +2,7 @@ package repl
 
 import (
 	"database/sql"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -9,7 +10,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	mysql2 "github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -47,7 +47,7 @@ func setupBufferedTest(t *testing.T) (*sql.DB, *Client) {
 	srcTable, dstTable := setupTestTables(t, t1, t2)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	assert.NoError(t, err)
-	logger := logrus.New()
+	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{

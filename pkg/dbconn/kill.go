@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/block/spirit/pkg/table"
-	"github.com/siddontang/loggers"
 )
 
 // We want to be able to kill locking transactions that prevent us from acquiring locks
@@ -94,7 +94,7 @@ type LockDetail struct {
 	TrxWeight    sql.NullInt64  // Rows modified by the transaction
 }
 
-func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger loggers.Advanced, ignorePIDs []int) error {
+func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) error {
 	// First, check if there are explicit table locks that would prevent us from acquiring the metadata lock.
 	locks, err := GetTableLocks(ctx, db, tables, logger, ignorePIDs)
 	if err != nil {
@@ -105,7 +105,7 @@ func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 		// This is a fatal error because it means we cannot acquire the metadata lock,
 		// and it's unsafe to kill connections with explicit, non-transactional table locks.
 		for _, lock := range locks {
-			logger.Errorf("Found explicit table lock: %#v", lock)
+			logger.Error("found explicit table lock", "lock", fmt.Sprintf("%#v", lock))
 		}
 		return ErrTableLockFound
 	}
@@ -116,7 +116,7 @@ func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 	// Now we can kill these transactions
 	var errs []error
 	for _, pid := range pids {
-		logger.Warnf("Killing locking transaction %d", pid)
+		logger.Warn("killing locking transaction", "pid", pid)
 		err = KillTransaction(ctx, db, pid)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to kill transaction %d: %w", pid, err))
@@ -133,7 +133,7 @@ func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 // If no tables are specified, it will return all long-running transactions.
 // If a transaction's weight exceeds the TransactionWeightThreshold, it will be skipped.
 // If no long-running transactions are found, it returns nil.
-func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger loggers.Advanced, ignorePIDs []int) ([]int, error) {
+func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) ([]int, error) {
 	// This function should query the performance schema to find long-running transactions
 	// that are holding locks on the specified tables.
 
@@ -182,7 +182,7 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 			return nil, err
 		}
 
-		logger.Infof("Found locking transaction: %#v", &lock)
+		logger.Info("found locking transaction", "lock", fmt.Sprintf("%#v", &lock))
 		locks = append(locks, lock)
 	}
 	if err := rows.Err(); err != nil {
@@ -196,7 +196,10 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 	var uniquePids []int
 	for _, lock := range locks {
 		if lock.TrxWeight.Valid && lock.TrxWeight.Int64 > TransactionWeightThreshold {
-			logger.Warnf("Skipping transaction %d with weight %d, exceeds threshold %d", lock.PID, lock.TrxWeight.Int64, TransactionWeightThreshold)
+			logger.Warn("skipping transaction with weight exceeding threshold",
+				"pid", lock.PID,
+				"weight", lock.TrxWeight.Int64,
+				"threshold", TransactionWeightThreshold)
 			continue // Skip transactions that are too heavy
 		}
 		// Check if this PID is already in the unique list
@@ -212,12 +215,12 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 		}
 	}
 
-	logger.Infof("Found %d locking transactions: %v", len(uniquePids), uniquePids)
+	logger.Info("found locking transactions", "count", len(uniquePids), "pids", uniquePids)
 
 	return uniquePids, nil
 }
 
-func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, logger loggers.Advanced, ignorePIDs []int) ([]*LockDetail, error) {
+func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, logger *slog.Logger, ignorePIDs []int) ([]*LockDetail, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -244,7 +247,7 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 
 	rows, err := tx.QueryContext(ctx, query, params...)
 	if err != nil {
-		logger.Errorf("failed to query table locks: %v", err)
+		logger.Error("failed to query table locks", "error", err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -286,7 +289,7 @@ func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
 	return nil
 }
 
-func tablesToInList(tables []*table.TableInfo, logger loggers.Advanced) (inList string, params []any) {
+func tablesToInList(tables []*table.TableInfo, logger *slog.Logger) (inList string, params []any) {
 	if len(tables) == 0 {
 		return "", nil
 	}
@@ -296,7 +299,9 @@ func tablesToInList(tables []*table.TableInfo, logger loggers.Advanced) (inList 
 			continue // Skip nil table info
 		}
 		if tableInfo.SchemaName == "" || tableInfo.TableName == "" {
-			logger.Warnf("skipping table with empty schema or name: %s.%s", tableInfo.SchemaName, tableInfo.TableName)
+			logger.Warn("skipping table with empty schema or name",
+				"schema", tableInfo.SchemaName,
+				"table", tableInfo.TableName)
 			continue // Skip tables with empty schema or name
 		}
 		inList += "(?,?)"

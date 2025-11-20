@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -18,8 +19,6 @@ import (
 	"github.com/block/spirit/pkg/throttler"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-sql-driver/mysql"
-	"github.com/siddontang/loggers"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -55,7 +54,7 @@ type Runner struct {
 
 	cutoverFunc func(ctx context.Context) error
 
-	logger     loggers.Advanced
+	logger     *slog.Logger
 	cancelFunc context.CancelFunc
 	dbConfig   *dbconn.DBConfig
 }
@@ -65,7 +64,7 @@ var _ status.Task = (*Runner)(nil)
 func NewRunner(m *Move) (*Runner, error) {
 	r := &Runner{
 		move:   m,
-		logger: logrus.New(),
+		logger: slog.Default(),
 	}
 	return r, nil
 }
@@ -230,11 +229,11 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 func (r *Runner) setup(ctx context.Context) error {
 	var err error
 	// Fetch a list of tables from the source.
-	r.logger.Infof("Fetching source table list")
+	r.logger.Info("Fetching source table list")
 	if r.sourceTables, err = r.getTables(ctx, r.source); err != nil {
 		return err
 	}
-	r.logger.Infof("Setting up repl client")
+	r.logger.Info("Setting up repl client")
 
 	r.replClient = repl.NewClient(r.source, r.sourceConfig.Addr, r.sourceConfig.User, r.sourceConfig.Passwd, &repl.ClientConfig{
 		Logger:                     r.logger,
@@ -245,7 +244,7 @@ func (r *Runner) setup(ctx context.Context) error {
 		WriteDB:                    r.target,
 	})
 
-	r.logger.Infof("Checking target database state")
+	r.logger.Info("Checking target database state")
 
 	if err := r.checkTargetEmpty(); err != nil {
 		// There are existing tables there.
@@ -255,7 +254,7 @@ func (r *Runner) setup(ctx context.Context) error {
 		if err := r.resumeFromCheckpoint(ctx); err != nil {
 			return fmt.Errorf("target database is not empty and could not resume from checkpoint: %v", err)
 		}
-		r.logger.Infof("Resumed move from existing checkpoint")
+		r.logger.Info("Resumed move from existing checkpoint")
 	} else {
 		return r.newCopy(ctx)
 	}
@@ -360,10 +359,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
 	r.startTime = time.Now()
-	r.logger.Infof("Starting table move")
+	r.logger.Info("Starting table move")
 
 	var err error
 	r.dbConfig = dbconn.NewDBConfig()
+	r.dbConfig.ForceKill = true // in move we always use force kill; it's new code.
 	r.logger.Warn("the move command is experimental and not yet safe for production use.")
 	r.source, err = dbconn.New(r.move.SourceDSN, r.dbConfig)
 	if err != nil {
@@ -400,12 +400,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Release the lock
 	defer func() {
 		if err := lock.Close(); err != nil {
-			r.logger.Errorf("failed to release metadata lock: %v", err)
+			r.logger.Error("failed to release metadata lock", "error", err)
 		}
 	}()
 
 	// Start background monitoring routines
 	r.startBackgroundRoutines(ctx)
+
+	r.replClient.SetWatermarkOptimization(true)
 
 	// Run the copier.
 	r.status.Set(status.CopyRows)
@@ -413,13 +415,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Disable both watermark optimizations so that all changes can be flushed.
+	// The watermark optimizations can prevent some keys from being flushed,
+	// which would cause flushedPos to not advance, leading to a mismatch
+	// with bufferedPos and causing AllChangesFlushed() to return false.
+	r.replClient.SetWatermarkOptimization(false)
+
 	// When the copier has finished, catch up the replication client
 	// This is in a non-blocking way first.
 	if err := r.replClient.Flush(ctx); err != nil {
 		return err
 	}
 
-	r.logger.Infof("All tables copied successfully.")
+	r.logger.Info("All tables copied successfully.")
 
 	r.sentinelWaitStartTime = time.Now()
 	r.status.Set(status.WaitingOnSentinelTable)
@@ -433,6 +441,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
+	r.logger.Info("Checksum completed successfully, starting cutover")
+
 	// Create a cutover.
 	r.status.Set(status.CutOver)
 	cutover, err := NewCutOver(r.source, r.sourceTables, r.cutoverFunc, r.replClient, r.dbConfig, r.logger)
@@ -442,7 +452,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err = cutover.Run(ctx); err != nil {
 		return err
 	}
-	r.logger.Infof("Move operation complete.")
+	// Delete checkpoint table
+	if err := dbconn.Exec(ctx, r.target, "DROP TABLE IF EXISTS %n.%n", r.targetConfig.DBName, checkpointTableName); err != nil {
+		return err
+	}
+	r.logger.Info("Move operation complete.")
 	return nil
 }
 
@@ -511,7 +525,7 @@ func (r *Runner) Status() string {
 	}
 }
 
-func (r *Runner) SetLogger(logger loggers.Advanced) {
+func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
 }
 
@@ -531,7 +545,7 @@ func (r *Runner) prepareForCutover(ctx context.Context) error {
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
 	r.status.Set(status.AnalyzeTable)
-	r.logger.Infof("Running ANALYZE TABLE")
+	r.logger.Info("Running ANALYZE TABLE")
 	for _, tbl := range r.sourceTables {
 		if err := dbconn.Exec(ctx, r.target, "ANALYZE TABLE %n.%n", tbl.SchemaName, tbl.TableName); err != nil {
 			return err
@@ -574,13 +588,12 @@ func (r *Runner) Progress() status.Progress {
 			r.copier.GetETA(),
 		)
 	case status.WaitingOnSentinelTable:
-		r.logger.Infof("migration status: state=%s sentinel-table=%s.%s total-time=%s sentinel-wait-time=%s sentinel-max-wait-time=%s",
-			r.status.Get().String(),
-			r.targetConfig.DBName,
-			sentinelTableName,
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.sentinelWaitStartTime).Round(time.Second),
-			sentinelWaitLimit,
+		r.logger.Info("migration status",
+			"state", r.status.Get().String(),
+			"sentinel-table", fmt.Sprintf("%s.%s", r.targetConfig.DBName, sentinelTableName),
+			"total-time", time.Since(r.startTime).Round(time.Second),
+			"sentinel-wait-time", time.Since(r.sentinelWaitStartTime).Round(time.Second),
+			"sentinel-max-wait-time", sentinelWaitLimit,
 		)
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
@@ -622,7 +635,9 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) error {
 		return nil
 	}
 
-	r.logger.Warnf("cutover deferred while sentinel table %s exists; will wait %s", sentinelTableName, sentinelWaitLimit)
+	r.logger.Warn("cutover deferred while sentinel table exists; will wait",
+		"sentinel-table", sentinelTableName,
+		"wait-limit", sentinelWaitLimit)
 
 	timer := time.NewTimer(sentinelWaitLimit)
 	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
@@ -638,7 +653,7 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) error {
 			}
 			if !sentinelExists {
 				// Sentinel table has been dropped, we can proceed with cutover
-				r.logger.Infof("sentinel table dropped at %s", t)
+				r.logger.Info("sentinel table dropped", "time", t)
 				return nil
 			}
 		case <-timer.C:
@@ -675,7 +690,10 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	// when using the composite chunker are based on actual user-data.
 	// We believe this is OK but may change it in the future. Please do not
 	// add any other fields to this log line.
-	r.logger.Infof("checkpoint: low-watermark=%s log-file=%s log-pos=%d", copierWatermark, binlog.Name, binlog.Pos)
+	r.logger.Info("checkpoint",
+		"low-watermark", copierWatermark,
+		"log-file", binlog.Name,
+		"log-pos", binlog.Pos)
 	err = dbconn.Exec(ctx, r.target, "INSERT INTO %n.%n (copier_watermark, checksum_watermark, binlog_name, binlog_pos, statement) VALUES (%?, %?, %?, %?, %?)",
 		r.checkpointTable.SchemaName,
 		r.checkpointTable.TableName,

@@ -4,9 +4,8 @@ package metrics
 
 import (
 	"context"
+	"log/slog"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 // Metric types.
@@ -59,18 +58,18 @@ func NewNoopSink() *NoopSink {
 
 // logSink logs metrics
 type logSink struct {
-	logger loggers.Advanced
+	logger *slog.Logger
 }
 
 func (l *logSink) Send(ctx context.Context, m *Metrics) error {
 	for _, v := range m.Values {
 		switch v.Type {
 		case COUNTER:
-			l.logger.Infof("metric: name: %s, type: counter, value: %f", v.Name, v.Value)
+			l.logger.Info("metric", "name", v.Name, "type", "counter", "value", v.Value)
 		case GAUGE:
-			l.logger.Infof("metric: name: %s, type: gauge, value: %f", v.Name, v.Value)
+			l.logger.Info("metric", "name", v.Name, "type", "gauge", "value", v.Value)
 		default:
-			l.logger.Errorf("Received invalid metric type: %s, name: %s, value: %f", v.Type, v.Name, v.Value)
+			l.logger.Error("Received invalid metric type", "type", v.Type, "name", v.Name, "value", v.Value)
 		}
 	}
 	return nil
@@ -78,7 +77,7 @@ func (l *logSink) Send(ctx context.Context, m *Metrics) error {
 
 var _ Sink = &logSink{}
 
-func NewLogSink(logger loggers.Advanced) *logSink {
+func NewLogSink(logger *slog.Logger) *logSink {
 	return &logSink{
 		logger: logger,
 	}

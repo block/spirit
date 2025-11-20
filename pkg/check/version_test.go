@@ -2,11 +2,11 @@ package check
 
 import (
 	"database/sql"
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -20,7 +20,7 @@ func TestVersion(t *testing.T) {
 		Username: cfg.User,
 		Password: cfg.Passwd,
 	}
-	err = versionCheck(t.Context(), r, logrus.New())
+	err = versionCheck(t.Context(), r, slog.Default())
 	if isMySQL8(db) {
 		assert.NoError(t, err) // all looks good of course.
 	} else {

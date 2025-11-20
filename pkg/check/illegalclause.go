@@ -2,8 +2,7 @@ package check
 
 import (
 	"context"
-
-	"github.com/siddontang/loggers"
+	"log/slog"
 )
 
 func init() {
@@ -12,6 +11,6 @@ func init() {
 
 // illegalClauseCheck checks for the presence of specific, unsupported
 // clauses in the ALTER statement, such as ALGORITHM= and LOCK=.
-func illegalClauseCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func illegalClauseCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	return r.Statement.AlterContainsUnsupportedClause()
 }

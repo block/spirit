@@ -2,14 +2,12 @@ package check
 
 import (
 	"database/sql"
-
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
-
 	"github.com/stretchr/testify/assert"
 )
 
@@ -39,11 +37,11 @@ func TestHasTriggers(t *testing.T) {
 		Statement: statement.MustNew("ALTER TABLE account Engine=innodb")[0],
 	}
 
-	err = hasTriggersCheck(t.Context(), r, logrus.New())
+	err = hasTriggersCheck(t.Context(), r, slog.Default())
 	assert.ErrorContains(t, err, "tables with triggers associated are not supported") // already has a trigger associated.
 
 	_, err = db.Exec(`drop trigger if exists ins_sum`)
 	assert.NoError(t, err)
-	err = hasTriggersCheck(t.Context(), r, logrus.New())
+	err = hasTriggersCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // no longer said to have trigger associated.
 }

@@ -3,11 +3,11 @@ package check
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
-	"github.com/siddontang/loggers"
 )
 
 // ErrVisibilityMixedWithOtherChanges is returned when index visibility changes are mixed with table-rebuilding operations
@@ -23,7 +23,7 @@ func init() {
 // It likely means the user is combining this operation with other unsafe operations,
 // which is not a good idea. We need to protect them by not allowing it.
 // https://github.com/block/spirit/issues/283
-func visibilityCheck(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func visibilityCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	return AlterContainsIndexVisibility(r.Statement)
 }
 

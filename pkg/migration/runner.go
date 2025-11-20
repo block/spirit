@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -20,8 +21,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/siddontang/go-log/loggers"
-	"github.com/sirupsen/logrus"
 )
 
 // These are really consts, but set to var for testing.
@@ -68,7 +67,7 @@ type Runner struct {
 	usedResumeFromCheckpoint bool
 
 	// Attached logger
-	logger     loggers.Advanced
+	logger     *slog.Logger
 	cancelFunc context.CancelFunc
 
 	// MetricsSink
@@ -90,7 +89,7 @@ func NewRunner(m *Migration) (*Runner, error) {
 	}
 	runner := &Runner{
 		migration:   m,
-		logger:      logrus.New(),
+		logger:      slog.Default(),
 		metricsSink: &metrics.NoopSink{},
 		changes:     changes,
 	}
@@ -104,7 +103,7 @@ func (r *Runner) SetMetricsSink(sink metrics.Sink) {
 	r.metricsSink = sink
 }
 
-func (r *Runner) SetLogger(logger loggers.Advanced) {
+func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
 }
 
@@ -121,9 +120,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
 	r.startTime = time.Now()
-	r.logger.Infof("Starting spirit migration: concurrency=%d target-chunk-size=%s",
-		r.migration.Threads,
-		r.migration.TargetChunkTime,
+	r.logger.Info("Starting spirit migration",
+		"concurrency", r.migration.Threads,
+		"target-chunk-size", r.migration.TargetChunkTime,
 	)
 
 	// Create a database connection
@@ -174,7 +173,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			r.logger.Infof("apply complete")
+			r.logger.Info("apply complete")
 			return nil
 		}
 	}
@@ -199,7 +198,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Release the lock
 	defer func() {
 		if err := lock.Close(); err != nil {
-			r.logger.Errorf("failed to release metadata lock: %v", err)
+			r.logger.Error("failed to release metadata lock", "error", err)
 		}
 	}()
 	// This step is technically optional, but first we attempt to
@@ -209,7 +208,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Note: this function returns an error when in multi-table mode.
 	err = r.attemptMySQLDDL(ctx)
 	if err == nil {
-		r.logger.Infof("apply complete: instant-ddl=%v inplace-ddl=%v", r.usedInstantDDL, r.usedInplaceDDL)
+		r.logger.Info("apply complete",
+			"instant-ddl", r.usedInstantDDL,
+			"inplace-ddl", r.usedInplaceDDL,
+		)
 		return nil // success!
 	}
 
@@ -240,7 +242,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logger.Info("copy rows complete")
 	r.copyDuration = time.Since(r.copier.StartTime())
-	r.replClient.SetKeyAboveWatermarkOptimization(false) // should no longer be used.
+
+	// Disable both watermark optimizations so that all changes can be flushed.
+	// The watermark optimizations can prevent some keys from being flushed,
+	// which would cause flushedPos to not advance, leading to a mismatch
+	// with bufferedPos and causing AllChangesFlushed() to return false.
+	r.replClient.SetWatermarkOptimization(false)
 
 	// r.waitOnSentinel may return an error if there is
 	// some unexpected problem checking for the existence of
@@ -296,23 +303,28 @@ func (r *Runner) Run(ctx context.Context) error {
 			if err := change.dropOldTable(ctx); err != nil {
 				// Don't return the error because our automation
 				// will retry the migration (but it's already happened)
-				r.logger.Errorf("migration successful but failed to drop old table: %s - %v", change.oldTableName(), err)
+				r.logger.Error("migration successful but failed to drop old table",
+					"table", change.oldTableName(),
+					"error", err,
+				)
 			} else {
-				r.logger.Info("successfully dropped old table: ", change.oldTableName())
+				r.logger.Info("successfully dropped old table",
+					"table", change.oldTableName(),
+				)
 			}
 		}
 	} else {
 		r.logger.Info("skipped dropping old table")
 	}
 	_, copiedChunks, _ := r.copyChunker.Progress()
-	r.logger.Infof("apply complete: instant-ddl=%v inplace-ddl=%v total-chunks=%v copy-rows-time=%s checksum-time=%s total-time=%s conns-in-use=%d",
-		r.usedInstantDDL,
-		r.usedInplaceDDL,
-		copiedChunks,
-		r.copyDuration.Round(time.Second),
-		r.checker.ExecTime.Round(time.Second),
-		time.Since(r.startTime).Round(time.Second),
-		r.db.Stats().InUse,
+	r.logger.Info("apply complete",
+		"instant-ddl", r.usedInstantDDL,
+		"inplace-ddl", r.usedInplaceDDL,
+		"total-chunks", copiedChunks,
+		"copy-rows-time", r.copyDuration.Round(time.Second),
+		"checksum-time", r.checker.ExecTime.Round(time.Second),
+		"total-time", time.Since(r.startTime).Round(time.Second),
+		"conns-in-use", r.db.Stats().InUse,
 	)
 	// cleanup all the tables
 	for _, change := range r.changes {
@@ -349,7 +361,7 @@ func (r *Runner) prepareForCutover(ctx context.Context) error {
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
 	r.status.Set(status.AnalyzeTable)
-	r.logger.Infof("Running ANALYZE TABLE")
+	r.logger.Info("Running ANALYZE TABLE")
 	for _, change := range r.changes {
 		if err := dbconn.Exec(ctx, r.db, "ANALYZE TABLE %n.%n", change.newTable.SchemaName, change.newTable.TableName); err != nil {
 			return err
@@ -397,7 +409,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			// Instead we check the credentials provided.
 			Host:                     r.migration.Host,
 			Username:                 r.migration.Username,
-			Password:                 r.migration.Password,
+			Password:                 *r.migration.Password,
 			TLSMode:                  r.migration.TLSMode,
 			TLSCertificatePath:       r.migration.TLSCertificatePath,
 			SkipDropAfterCutover:     r.migration.SkipDropAfterCutover,
@@ -410,7 +422,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 }
 
 func (r *Runner) dsn() string {
-	return fmt.Sprintf("%s:%s@tcp(%s)/%s", r.migration.Username, r.migration.Password, r.migration.Host, r.changes[0].stmt.Schema)
+	return fmt.Sprintf("%s:%s@tcp(%s)/%s", r.migration.Username, *r.migration.Password, r.migration.Host, r.changes[0].stmt.Schema)
 }
 
 // maskPasswordInDSN masks the password in any DSN string for safe logging
@@ -469,7 +481,7 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 
 	// Set the binlog position.
 	// Create a binlog subscriber
-	r.replClient = repl.NewClient(r.db, r.migration.Host, r.migration.Username, r.migration.Password, &repl.ClientConfig{
+	r.replClient = repl.NewClient(r.db, r.migration.Host, r.migration.Username, *r.migration.Password, &repl.ClientConfig{
 		Logger:          r.logger,
 		Concurrency:     r.migration.Threads,
 		TargetBatchTime: r.migration.TargetChunkTime,
@@ -574,7 +586,9 @@ func (r *Runner) setupReplicationThrottler(ctx context.Context) error {
 	// while providing sensible defaults from the main DB configuration
 	enhancedReplicaDSN, err := dbconn.EnhanceDSNWithTLS(r.migration.ReplicaDSN, replicaDBConfig)
 	if err != nil {
-		r.logger.Warnf("could not enhance replica DSN with TLS settings: %v", err)
+		r.logger.Warn("could not enhance replica DSN with TLS settings",
+			"error", err,
+		)
 		// Continue with original DSN if enhancement fails
 		enhancedReplicaDSN = r.migration.ReplicaDSN
 	}
@@ -589,7 +603,9 @@ func (r *Runner) setupReplicationThrottler(ctx context.Context) error {
 	// we should not proceed.
 	r.throttler, err = throttler.NewReplicationThrottler(r.replica, r.migration.ReplicaMaxLag, r.logger)
 	if err != nil {
-		r.logger.Warnf("could not create replication throttler: %v", err)
+		r.logger.Warn("could not create replication throttler",
+			"error", err,
+		)
 		return err
 	}
 
@@ -639,7 +655,9 @@ func (r *Runner) setup(ctx context.Context) error {
 			return err
 		}
 
-		r.logger.Infof("could not resume from checkpoint: reason=%s", err) // explain why it failed.
+		r.logger.Info("could not resume from checkpoint",
+			"reason", err,
+		) // explain why it failed.
 
 		// Since we are not strict, we are allowed to
 		// start a new migration.
@@ -654,7 +672,7 @@ func (r *Runner) setup(ctx context.Context) error {
 	}
 
 	// We can enable the key above watermark optimization
-	r.replClient.SetKeyAboveWatermarkOptimization(true)
+	r.replClient.SetWatermarkOptimization(true)
 
 	// Start background monitoring routines (common logic for both paths)
 	r.startBackgroundRoutines(ctx)
@@ -685,12 +703,16 @@ func (r *Runner) tableChangeNotification(ctx context.Context) {
 			// we now have to cancel our work :(
 			r.status.Set(status.ErrCleanup)
 			// Write this to the logger, so it can be captured by the initiator.
-			r.logger.Errorf("table definition of %s changed during migration", tbl)
+			r.logger.Error("table definition changed during migration",
+				"table", tbl,
+			)
 			// Invalidate the checkpoint, so we don't try to resume.
 			// If we don't do this, the migration will permanently be blocked from proceeding.
 			// Letting it start again is the better choice.
 			if err := r.dropCheckpoint(ctx); err != nil {
-				r.logger.Errorf("could not remove checkpoint. err: %v", err)
+				r.logger.Error("could not remove checkpoint",
+					"error", err,
+				)
 			}
 			r.cancelFunc() // cancel the migration context
 		}
@@ -870,10 +892,18 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// and still be able to start from scratch.
 	// Start the binary log feed just before copy rows starts.
 	if err := r.replClient.Run(ctx); err != nil {
-		r.logger.Warnf("resuming from checkpoint failed because resuming from the previous binlog position failed. log-file: %s log-pos: %d", binlogName, binlogPos)
+		r.logger.Warn("resuming from checkpoint failed because resuming from the previous binlog position failed",
+			"log-file", binlogName,
+			"log-pos", binlogPos,
+		)
 		return err
 	}
-	r.logger.Warnf("resuming from checkpoint. copier-watermark: %s checksum-watermark: %s log-file: %s log-pos: %d", copierWatermark, checksumWatermark, binlogName, binlogPos)
+	r.logger.Warn("resuming from checkpoint",
+		"copier-watermark", copierWatermark,
+		"checksum-watermark", checksumWatermark,
+		"log-file", binlogName,
+		"log-pos", binlogPos,
+	)
 	r.usedResumeFromCheckpoint = true
 	return nil
 }
@@ -966,7 +996,11 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	// when using the composite chunker are based on actual user-data.
 	// We believe this is OK but may change it in the future. Please do not
 	// add any other fields to this log line.
-	r.logger.Infof("checkpoint: low-watermark=%s log-file=%s log-pos=%d", copierWatermark, binlog.Name, binlog.Pos)
+	r.logger.Info("checkpoint",
+		"low-watermark", copierWatermark,
+		"log-file", binlog.Name,
+		"log-pos", binlog.Pos,
+	)
 	err = dbconn.Exec(ctx, r.db, "INSERT INTO %n.%n (copier_watermark, checksum_watermark, binlog_name, binlog_pos, statement) VALUES (%?, %?, %?, %?, %?)",
 		r.checkpointTable.SchemaName,
 		r.checkpointTable.TableName,
@@ -1051,7 +1085,10 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) error {
 		return nil
 	}
 
-	r.logger.Warnf("cutover deferred while sentinel table %s exists; will wait %s", sentinelTableName, sentinelWaitLimit)
+	r.logger.Warn("cutover deferred while sentinel table exists; will wait",
+		"sentinel-table", sentinelTableName,
+		"wait-limit", sentinelWaitLimit,
+	)
 
 	timer := time.NewTimer(sentinelWaitLimit)
 	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
@@ -1067,7 +1104,9 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) error {
 			}
 			if !sentinelExists {
 				// Sentinel table has been dropped, we can proceed with cutover
-				r.logger.Infof("sentinel table dropped at %s", t)
+				r.logger.Info("sentinel table dropped",
+					"time", t,
+				)
 				return nil
 			}
 		case <-timer.C:

@@ -4,8 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-
-	"github.com/siddontang/loggers"
+	"log/slog"
 )
 
 func init() {
@@ -14,7 +13,7 @@ func init() {
 
 // replicaHealth checks SHOW REPLICA STATUS for Yes and Yes.
 // It should be run at various stages of the migration if a replica is present.
-func replicaHealth(ctx context.Context, r Resources, logger loggers.Advanced) error {
+func replicaHealth(ctx context.Context, r Resources, logger *slog.Logger) error {
 	if r.Replica == nil {
 		return nil // The user is not using the replica DSN feature.
 	}

@@ -2,16 +2,15 @@ package table
 
 import (
 	"database/sql"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/testutils"
-	"go.uber.org/goleak"
-
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
@@ -27,7 +26,7 @@ func TestOpenOnBinaryType(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := newChunker(t1, ChunkerDefaultTarget, logrus.New())
+	chunker, err := newChunker(t1, ChunkerDefaultTarget, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 }
@@ -40,7 +39,7 @@ func TestOpenOnNoMinMax(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := newChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, slog.Default())
 	assert.NoError(t, err)
 	assert.NoError(t, chunker.Open())
 }
@@ -53,7 +52,7 @@ func TestCallingNextChunkWithoutOpen(t *testing.T) {
 	t1.keyDatums = []datumTp{binaryType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}
-	chunker, err := newChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, slog.Default())
 	assert.NoError(t, err)
 
 	_, err = chunker.Next()
@@ -190,7 +189,7 @@ func TestDiscoveryBalancesTable(t *testing.T) {
 	assert.Equal(t, "0", t1.minValue.String())
 	assert.Equal(t, "0", t1.maxValue.String())
 
-	chunker, err := newChunker(t1, 100, logrus.New())
+	chunker, err := newChunker(t1, 100, slog.Default())
 	assert.NoError(t, err)
 
 	assert.NoError(t, chunker.Open())
@@ -269,7 +268,7 @@ func TestStatisticsUpdate(t *testing.T) {
 	}
 	t1.statisticsLastUpdated = time.Now()
 
-	go t1.AutoUpdateStatistics(t.Context(), time.Millisecond*10, logrus.New())
+	go t1.AutoUpdateStatistics(t.Context(), time.Millisecond*10, slog.Default())
 	time.Sleep(time.Millisecond * 100)
 
 	t1.Close()

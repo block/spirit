@@ -2,21 +2,20 @@ package dbconn
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
-	"github.com/siddontang/loggers"
 
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestMetadataLock(t *testing.T) {
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
-	logger := logrus.New()
+	logger := slog.Default()
 	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), lockTables, NewDBConfig(), logger)
 	assert.NoError(t, err)
 	assert.NotNil(t, mdl)
@@ -38,7 +37,7 @@ func TestMetadataLockContextCancel(t *testing.T) {
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-cancel"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
 
-	logger := logrus.New()
+	logger := slog.Default()
 	ctx, cancel := context.WithCancel(t.Context())
 	mdl, err := NewMetadataLock(ctx, testutils.DSN(), lockTables, NewDBConfig(), logger)
 	assert.NoError(t, err)
@@ -60,7 +59,7 @@ func TestMetadataLockContextCancel(t *testing.T) {
 func TestMetadataLockRefresh(t *testing.T) {
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-refresh"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
-	logger := logrus.New()
+	logger := slog.Default()
 
 	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), lockTables, NewDBConfig(), logger, func(mdl *MetadataLock) {
 		// override the refresh interval for faster testing
@@ -107,7 +106,7 @@ func TestMetadataLockLength(t *testing.T) {
 	lockTables := []*table.TableInfo{&lockTableInfo}
 	empty := []*table.TableInfo{}
 
-	logger := logrus.New()
+	logger := slog.Default()
 
 	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), lockTables, NewDBConfig(), logger)
 	assert.NoError(t, err)
@@ -118,7 +117,7 @@ func TestMetadataLockLength(t *testing.T) {
 }
 
 // simulateConnectionClose simulates a temporary network issue by closing the connection
-func simulateConnectionClose(t *testing.T, mdl *MetadataLock, logger loggers.Advanced) {
+func simulateConnectionClose(t *testing.T, mdl *MetadataLock, logger *slog.Logger) {
 	// close the existing connection to simulate a network issue
 	err := mdl.CloseDBConnection(logger)
 	assert.NoError(t, err)
@@ -130,8 +129,7 @@ func simulateConnectionClose(t *testing.T, mdl *MetadataLock, logger loggers.Adv
 func TestMetadataLockRefreshWithConnIssueSimulation(t *testing.T) {
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-refresh"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
+	logger := slog.Default()
 
 	// create a new MetadataLock with a short refresh interval for testing
 	mdl, err := NewMetadataLock(t.Context(), testutils.DSN(), lockTables, NewDBConfig(), logger, func(mdl *MetadataLock) {

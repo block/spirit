@@ -4,17 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/go-sql-driver/mysql"
-	"github.com/siddontang/loggers"
 )
 
 func init() {
 	registerCheck("version", versionCheck, ScopePreRun)
 }
 
-func versionCheck(_ context.Context, r Resources, _ loggers.Advanced) error {
+func versionCheck(_ context.Context, r Resources, _ *slog.Logger) error {
 	// Use the go-sql-driver/mysql.Config to properly escape the DSN
 	// For version check, we try to connect without specifying a database first,
 	// but if that fails due to permissions, we can still check the version

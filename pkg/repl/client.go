@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net"
 	"strconv"
@@ -17,8 +18,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/siddontang/loggers"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -106,7 +105,7 @@ type Client struct {
 
 	cancelFunc func()
 	isClosed   atomic.Bool
-	logger     loggers.Advanced
+	logger     *slog.Logger
 	streamWG   sync.WaitGroup // tracks readStream goroutine for proper cleanup
 
 	useExperimentalBufferedMap bool // for testing new subscription type
@@ -141,7 +140,7 @@ func NewClient(db *sql.DB, host string, username, password string, config *Clien
 type ClientConfig struct {
 	TargetBatchTime            time.Duration
 	Concurrency                int
-	Logger                     loggers.Advanced
+	Logger                     *slog.Logger
 	OnDDL                      chan string
 	ServerID                   uint32
 	UseExperimentalBufferedMap bool
@@ -160,7 +159,7 @@ func NewClientDefaultConfig() *ClientConfig {
 	return &ClientConfig{
 		Concurrency:     4,
 		TargetBatchTime: DefaultTargetBatchTime,
-		Logger:          logrus.New(),
+		Logger:          slog.Default(),
 		OnDDL:           nil,
 		ServerID:        NewServerID(),
 	}
@@ -190,7 +189,7 @@ func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, chunke
 		return nil
 	}
 	if c.useExperimentalBufferedMap {
-		c.logger.Infof("Using experimental buffered map for table %s.%s", currentTable.SchemaName, currentTable.TableName)
+		c.logger.Info("Using experimental buffered map for table", "schema", currentTable.SchemaName, "table", currentTable.TableName)
 		c.subscriptions[subKey] = &bufferedMap{
 			table:    currentTable,
 			newTable: newTable,
@@ -245,7 +244,7 @@ func (c *Client) AllChangesFlushed() bool {
 	// We check if the buffered position is ahead of the flushed position.
 	// We have a mutex, so we can read safely.
 	if c.bufferedPos.Compare(c.flushedPos) > 0 {
-		c.logger.Warnf("Binlog reader info flushed-pos=%v buffered-pos=%v. Discrepancies could be due to modifications on other tables.", c.flushedPos, c.bufferedPos)
+		c.logger.Warn("Binlog reader info flushed-pos buffered-pos. Discrepancies could be due to modifications on other tables.", "flushed-pos", c.flushedPos, "buffered-pos", c.bufferedPos)
 	}
 	// We check if all subscriptions have flushed their changes.
 	for _, subscription := range c.subscriptions {
@@ -314,7 +313,7 @@ func (c *Client) Run(ctx context.Context) (err error) {
 		Port:     uint16(port),
 		User:     c.username,
 		Password: c.password,
-		Logger:   NewLogWrapper(c.logger),
+		Logger:   c.logger,
 	}
 
 	// Apply TLS configuration using the same infrastructure as main database connections
@@ -355,7 +354,7 @@ func (c *Client) Run(ctx context.Context) (err error) {
 
 // recreateStreamer recreates the binlog streamer from the current buffered position
 func (c *Client) recreateStreamer() error {
-	c.logger.Warnf("Recreating binlog streamer from position: %v", c.getBufferedPos())
+	c.logger.Warn("Recreating binlog streamer from position", "position", c.getBufferedPos())
 
 	if c.syncer != nil {
 		c.syncer.Close()
@@ -374,7 +373,7 @@ func (c *Client) recreateStreamer() error {
 	if err != nil {
 		return fmt.Errorf("failed to start binlog streamer: %w", err)
 	}
-	c.logger.Infof("Successfully recreated binlog streamer from position: %v", startPos)
+	c.logger.Info("Successfully recreated binlog streamer from position", "position", startPos)
 	return nil
 }
 
@@ -394,13 +393,13 @@ func (c *Client) readStream(ctx context.Context) {
 	backoffDuration := initialBackoffDuration
 	lastErrorTime := time.Time{}
 
-	c.logger.Debugf("readStream started for binlog position: %v, current log name: %v", startPos, currentLogName)
+	c.logger.Debug("readStream started for binlog position", "position", startPos, "log_name", currentLogName)
 
 	for {
 		// Check if context is done before processing
 		select {
 		case <-ctx.Done():
-			c.logger.Debugf("readStream context cancelled: %v", ctx.Err())
+			c.logger.Debug("readStream context cancelled", "error", ctx.Err())
 			return // stop processing
 		default:
 		}
@@ -426,14 +425,12 @@ func (c *Client) readStream(ctx context.Context) {
 			consecutiveErrors++
 			currentTime := time.Now()
 
-			c.logger.Errorf("error reading binlog stream (consecutive errors: %d): %v, current position: %v",
-				consecutiveErrors, err, c.getBufferedPos())
+			c.logger.Error("error reading binlog stream", "consecutive_errors", consecutiveErrors, "error", err, "current_position", c.getBufferedPos())
 
 			// If we've had too many consecutive errors, try to recreate the streamer
 			if consecutiveErrors >= maxConsecutiveErrors {
 				recreateAttempts++
-				c.logger.Warnf("Too many consecutive errors (%d), attempting to recreate streamer (attempt %d/%d)",
-					consecutiveErrors, recreateAttempts, maxRecreateAttempts)
+				c.logger.Warn("Too many consecutive errors, attempting to recreate streamer", "consecutive_errors", consecutiveErrors, "attempt", recreateAttempts, "max_attempts", maxRecreateAttempts)
 
 				// Check if we've exceeded the maximum number of recreation attempts
 				if recreateAttempts >= maxRecreateAttempts {
@@ -443,7 +440,7 @@ func (c *Client) readStream(ctx context.Context) {
 
 				// Apply exponential backoff
 				if currentTime.Sub(lastErrorTime) < backoffDuration {
-					c.logger.Infof("Backing off for %v before recreating streamer", backoffDuration)
+					c.logger.Info("Backing off before recreating streamer", "duration", backoffDuration)
 					backoffTimer := time.NewTimer(backoffDuration)
 					select {
 					case <-ctx.Done():
@@ -455,7 +452,7 @@ func (c *Client) readStream(ctx context.Context) {
 
 				// Try to recreate the streamer
 				if recreateErr := c.recreateStreamer(); recreateErr != nil {
-					c.logger.Errorf("Failed to recreate streamer: %v", recreateErr)
+					c.logger.Error("Failed to recreate streamer", "error", recreateErr)
 
 					// Set streamer to nil so next iteration will trigger recreation
 					c.streamer = nil
@@ -487,7 +484,7 @@ func (c *Client) readStream(ctx context.Context) {
 
 		// Reset error counters on successful read
 		if consecutiveErrors > 0 {
-			c.logger.Infof("Binlog stream recovered after %d consecutive errors", consecutiveErrors)
+			c.logger.Info("Binlog stream recovered after consecutive errors", "consecutive_errors", consecutiveErrors)
 			consecutiveErrors = 0
 			backoffDuration = initialBackoffDuration
 		}
@@ -501,7 +498,7 @@ func (c *Client) readStream(ctx context.Context) {
 			// Rotate event, update the current log name.
 			rotateEvent := ev.Event.(*replication.RotateEvent)
 			currentLogName = string(rotateEvent.NextLogName)
-			c.logger.Debugf("Binlog rotated to: %s", currentLogName)
+			c.logger.Debug("Binlog rotated to", "log_name", currentLogName)
 		case *replication.RowsEvent:
 			// Rows event, check if there are any active subscriptions
 			// for it, and pass it to the subscription.
@@ -521,10 +518,7 @@ func (c *Client) readStream(ctx context.Context) {
 				// https://github.com/go-mysql-org/go-mysql/blob/ee9447d96b48783abb05ab76a12501e5f1161e47/canal/sync.go#L144C1-L150C1
 				// We can't print the statement because it could contain user-data.
 				// We instead rely on file + pos being useful.
-				c.logger.Errorf("Skipping query that was unable to parse at File %s Pos: %d",
-					currentLogName,
-					ev.Header.LogPos,
-				)
+				c.logger.Error("Skipping query that was unable to parse", "file", currentLogName, "pos", ev.Header.LogPos)
 				continue
 			}
 			for _, table := range tables {
@@ -532,7 +526,7 @@ func (c *Client) readStream(ctx context.Context) {
 			}
 		default:
 			// Log unknown event types for debugging
-			c.logger.Debugf("Received unknown event type: %T", ev.Event)
+			c.logger.Debug("Received unknown event type", "type", fmt.Sprintf("%T", ev.Event))
 		}
 		// Update the buffered position
 		// under a mutex.
@@ -665,7 +659,7 @@ func (c *Client) processRowsEvent(ev *replication.BinlogEvent, e *replication.Ro
 			case eventTypeDelete:
 				sub.HasChanged(key, nil, true)
 			default:
-				c.logger.Errorf("unknown event type: %v", ev.Header.EventType)
+				c.logger.Error("unknown event type", "type", ev.Header.EventType)
 			}
 		}
 	}
@@ -787,7 +781,7 @@ func (c *Client) Flush(ctx context.Context) error {
 		// and move from the copy phase to the apply phase, and there's
 		// actually a lot to do!
 		if err := c.BlockWait(ctx); err != nil {
-			c.logger.Warnf("error waiting for binlog reader to catch up: %v", err)
+			c.logger.Warn("error waiting for binlog reader to catch up", "error", err)
 			// Check if the error is due to context cancellation
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				return ctx.Err()
@@ -840,13 +834,10 @@ func (c *Client) StartPeriodicFlush(ctx context.Context, interval time.Duration)
 			// we allow this to run, and then expect that if it is under load the throttler
 			// will kick in and slow down the copy-rows.
 			if err := c.flush(ctx, false, nil); err != nil {
-				c.logger.Errorf("error flushing binary log: %v", err)
+				c.logger.Error("error flushing binary log", "error", err)
 			}
 			c.periodicFlushLock.Unlock()
-			c.logger.Infof("finished periodic flush of binary log: total-duration=%v batch-size=%d",
-				time.Since(startLoop),
-				atomic.LoadInt64(&c.targetBatchSize),
-			)
+			c.logger.Info("finished periodic flush of binary log", "total-duration", time.Since(startLoop), "batch-size", atomic.LoadInt64(&c.targetBatchSize))
 		}
 	}
 }
@@ -862,7 +853,7 @@ func (c *Client) BlockWait(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.logger.Infof("waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
+	c.logger.Info("waiting to catch up to source position", "target_position", targetPos, "current_position", c.getBufferedPos())
 	timer := time.NewTimer(DefaultTimeout)
 	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
 	for {
@@ -925,14 +916,15 @@ func (c *Client) feedback(numberOfKeys int, d time.Duration) {
 	}
 }
 
-// SetKeyAboveWatermarkOptimization sets the key above watermark optimization
-// for all subscriptions. In future this should become obsolete!
-func (c *Client) SetKeyAboveWatermarkOptimization(newVal bool) {
+// SetWatermarkOptimization sets both high and low watermark optimizations
+// for all subscriptions. This should be disabled before checksum/cutover to ensure
+// all changes are flushed regardless of watermark position.
+func (c *Client) SetWatermarkOptimization(newVal bool) {
 	c.Lock()
 	defer c.Unlock()
 
 	for _, sub := range c.subscriptions {
-		sub.SetKeyAboveWatermarkOptimization(newVal)
+		sub.SetWatermarkOptimization(newVal)
 	}
 }
 

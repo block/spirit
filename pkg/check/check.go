@@ -5,12 +5,12 @@ package check
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
-	"github.com/siddontang/loggers"
 )
 
 // ScopeFlag scopes a check
@@ -47,7 +47,7 @@ type Resources struct {
 }
 
 type check struct {
-	callback func(context.Context, Resources, loggers.Advanced) error
+	callback func(context.Context, Resources, *slog.Logger) error
 	scope    ScopeFlag
 }
 
@@ -57,7 +57,7 @@ var (
 )
 
 // registerCheck registers a check (callback func) and a scope (aka time) that it is expected to be run
-func registerCheck(name string, callback func(context.Context, Resources, loggers.Advanced) error, scope ScopeFlag) {
+func registerCheck(name string, callback func(context.Context, Resources, *slog.Logger) error, scope ScopeFlag) {
 	lock.Lock()
 	defer lock.Unlock()
 	if checks == nil {
@@ -67,7 +67,7 @@ func registerCheck(name string, callback func(context.Context, Resources, logger
 }
 
 // RunChecks runs all checks that are registered for the given scope
-func RunChecks(ctx context.Context, r Resources, logger loggers.Advanced, scope ScopeFlag) error {
+func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, scope ScopeFlag) error {
 	for _, check := range checks {
 		if check.scope&scope == 0 {
 			continue

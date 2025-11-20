@@ -3,9 +3,8 @@ package dbconn
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"time"
-
-	"github.com/siddontang/loggers"
 
 	"github.com/block/spirit/pkg/table"
 )
@@ -13,7 +12,7 @@ import (
 type TableLock struct {
 	tables  []*table.TableInfo
 	lockTxn *sql.Tx
-	logger  loggers.Advanced
+	logger  *slog.Logger
 }
 
 // NewTableLock creates a new server wide lock on multiple tables.
@@ -26,7 +25,7 @@ type TableLock struct {
 // that the lock acquisition is successful by killing long-running queries that are
 // blocking our lock acquisition after we have waited for 90% of our configured
 // LockWaitTimeout.
-func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger loggers.Advanced) (*TableLock, error) {
+func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger) (*TableLock, error) {
 	var err error
 	var lockTxn *sql.Tx
 	var lockStmt = "LOCK TABLES "
@@ -57,7 +56,7 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 		timer := time.AfterFunc(threshold, func() {
 			err := KillLockingTransactions(ctx, db, tables, config, logger, []int{pid})
 			if err != nil {
-				logger.Errorf("failed to kill locking transactions: %v", err)
+				logger.Error("failed to kill locking transactions", "error", err)
 			}
 		})
 		defer timer.Stop()
@@ -65,10 +64,10 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 
 	// We need to lock all the tables we intend to write to while we have the lock.
 	// For each table, we need to lock both the main table and its _new table.
-	logger.Warnf("trying to acquire table locks, timeout: %d", config.LockWaitTimeout)
+	logger.Warn("trying to acquire table locks", "timeout", config.LockWaitTimeout)
 	_, err = lockTxn.ExecContext(ctx, lockStmt)
 	if err != nil {
-		logger.Warnf("failed to acquire table lock(s), consider setting --force-kill=TRUE and trying again: %v", err)
+		logger.Warn("failed to acquire table lock(s), consider setting --force-kill=TRUE and trying again", "error", err)
 		return nil, err
 	}
 

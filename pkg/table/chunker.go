@@ -1,9 +1,8 @@
 package table
 
 import (
+	"log/slog"
 	"time"
-
-	"github.com/siddontang/loggers"
 )
 
 const (
@@ -50,11 +49,11 @@ type Chunker interface { //nolint: interfacebloat
 	Tables() []*TableInfo
 }
 
-func newChunker(t *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced) (Chunker, error) {
+func newChunker(t *TableInfo, chunkerTarget time.Duration, logger *slog.Logger) (Chunker, error) {
 	return NewChunker(t, nil, chunkerTarget, logger)
 }
 
-func NewChunker(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced) (Chunker, error) {
+func NewChunker(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, logger *slog.Logger) (Chunker, error) {
 	if chunkerTarget == 0 {
 		chunkerTarget = ChunkerDefaultTarget
 	}
@@ -74,13 +73,13 @@ func NewChunker(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, 
 
 // NewCompositeChunker returns a chunkerComposite ,
 // setting its Key if keyName and where conditions are provided
-func NewCompositeChunker(t *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced, keyName string, whereCondition string) (Chunker, error) {
+func NewCompositeChunker(t *TableInfo, chunkerTarget time.Duration, logger *slog.Logger, keyName string, whereCondition string) (Chunker, error) {
 	return newCompositeChunkerWithDestination(t, nil, chunkerTarget, logger, keyName, whereCondition)
 }
 
 // NewCompositeChunkerWithDestination returns a chunkerComposite with destination table info,
 // setting its Key if keyName and where conditions are provided
-func newCompositeChunkerWithDestination(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, logger loggers.Advanced, keyName string, whereCondition string) (Chunker, error) {
+func newCompositeChunkerWithDestination(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, logger *slog.Logger, keyName string, whereCondition string) (Chunker, error) {
 	c := chunkerComposite{
 		Ti:                     t,
 		NewTi:                  newTable,

@@ -1,12 +1,12 @@
 package repl
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -25,7 +25,7 @@ func TestSubscriptionDeltaMap(t *testing.T) {
 
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -79,7 +79,7 @@ func TestFlushWithLock(t *testing.T) {
 
 	client := &Client{
 		db:              db,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -100,7 +100,7 @@ func TestFlushWithLock(t *testing.T) {
 	sub.HasChanged([]any{2}, nil, true)
 
 	// Create a table lock
-	lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), logrus.New())
+	lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{srcTable, dstTable}, dbconn.NewDBConfig(), slog.Default())
 	assert.NoError(t, err)
 
 	// Test flush with lock
@@ -136,7 +136,7 @@ func TestFlushWithoutLock(t *testing.T) {
 
 	client := &Client{
 		db:              db,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 2,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -186,7 +186,7 @@ func TestConcurrentKeyChanges(t *testing.T) {
 
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -237,7 +237,7 @@ func TestKeyChangedOverwrite(t *testing.T) {
 
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -287,7 +287,7 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -314,7 +314,7 @@ func TestKeyChangedEdgeCases(t *testing.T) {
 	sub.HasChanged([]any{"prefix", 123}, nil, false)
 	assert.Equal(t, 2, sub.Length())
 
-	sub.SetKeyAboveWatermarkOptimization(true)
+	sub.SetWatermarkOptimization(true)
 
 	// Test exactly at watermark (position 5)
 	sub.HasChanged([]any{5}, nil, false)
@@ -343,7 +343,7 @@ func TestKeyChangedNilAndEmpty(t *testing.T) {
 	srcTable, dstTable := setupTestTables(t, t1, t2)
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -384,7 +384,7 @@ func TestKeyAboveWatermark(t *testing.T) {
 
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
@@ -407,7 +407,7 @@ func TestKeyAboveWatermark(t *testing.T) {
 	assert.Equal(t, 1, sub.Length())
 
 	// Enable watermark optimization
-	sub.SetKeyAboveWatermarkOptimization(true)
+	sub.SetWatermarkOptimization(true)
 
 	// Test key below watermark (3 < 5)
 	sub.HasChanged([]any{3}, nil, false)
@@ -433,7 +433,7 @@ func TestKeyBelowWatermarkMock(t *testing.T) {
 
 	client := &Client{
 		db:              nil,
-		logger:          logrus.New(),
+		logger:          slog.Default(),
 		concurrency:     2,
 		targetBatchSize: 1000,
 		dbConfig:        dbconn.NewDBConfig(),
