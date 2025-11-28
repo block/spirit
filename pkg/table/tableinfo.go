@@ -43,7 +43,17 @@ type TableInfo struct {
 	statisticsLastUpdated       time.Time
 	statisticsLock              sync.Mutex
 	DisableAutoUpdateStatistics atomic.Bool
+
+	// Sharding configuration (for ShardedApplier)
+	// These are set per-table when using multi-table migrations with different sharding keys
+	VindexColumn string     // Column name to extract and hash (e.g., "user_id")
+	VindexFunc   VindexFunc // Hash function: value -> uint64
 }
+
+// VindexFunc is a hash function that takes a single column value and returns a uint64 hash.
+// This matches Vitess vindex behavior where the hash is used to determine shard placement.
+// The hash value is then matched against key ranges to find the target shard.
+type VindexFunc func(value any) (uint64, error)
 
 func NewTableInfo(db *sql.DB, schema, table string) *TableInfo {
 	return &TableInfo{
@@ -351,4 +361,16 @@ func (t *TableInfo) datumTp(col string) datumTp {
 func (t *TableInfo) GetColumnMySQLType(col string) (string, bool) {
 	tp, ok := t.columnsMySQLTps[col]
 	return tp, ok
+}
+
+// GetColumnOrdinal returns the ordinal position (0-indexed) of a column by name.
+// This is useful for extracting values from row slices where the position matters.
+// Returns an error if the column is not found.
+func (t *TableInfo) GetColumnOrdinal(columnName string) (int, error) {
+	for i, col := range t.Columns {
+		if col == columnName {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("column %s not found in table %s", columnName, t.TableName)
 }

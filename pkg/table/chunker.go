@@ -57,6 +57,12 @@ func NewChunker(t *TableInfo, newTable *TableInfo, chunkerTarget time.Duration, 
 	if chunkerTarget == 0 {
 		chunkerTarget = ChunkerDefaultTarget
 	}
+	if newTable == nil {
+		// This supports moveTable cases where there is no new table per-se.
+		// But the chunker needs a non-nil newTable for some operations,
+		// like resuming from a checkpoint.
+		newTable = t
+	}
 	// Use the optimistic chunker for auto_increment
 	// tables with a single column key.
 	if len(t.KeyColumns) == 1 && t.KeyIsAutoInc {

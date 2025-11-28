@@ -168,6 +168,60 @@ func TestResumeFromCheckpointE2E(t *testing.T) {
 	assert.NoError(t, r.Run(t.Context()))
 }
 
+// TestEmptyDatabaseMove tests that a move operation succeeds when the source database has no tables.
+// This is a valid scenario for shard splits where an empty shard needs to be split.
+func TestEmptyDatabaseMove(t *testing.T) {
+	settingsCheck(t)
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+
+	src := cfg.Clone()
+	src.DBName = "source_empty"
+	dest := cfg.Clone()
+	dest.DBName = "dest_empty"
+
+	sourceDSN := src.FormatDSN()
+	targetDSN := dest.FormatDSN()
+
+	// Create empty source database (no tables)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS source_empty`)
+	testutils.RunSQL(t, `CREATE DATABASE source_empty`)
+
+	// Create empty target database
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS dest_empty`)
+	testutils.RunSQL(t, `CREATE DATABASE dest_empty`)
+
+	// Track if cutover was called
+	cutoverCalled := false
+	cutoverFunc := func(ctx context.Context) error {
+		cutoverCalled = true
+		return nil
+	}
+
+	// Run move with empty source
+	move := &Move{
+		SourceDSN:       sourceDSN,
+		TargetDSN:       targetDSN,
+		TargetChunkTime: 5 * time.Second,
+		Threads:         4,
+		CreateSentinel:  false,
+	}
+
+	runner, err := NewRunner(move)
+	assert.NoError(t, err)
+	runner.SetCutover(cutoverFunc)
+
+	// The move should succeed even with no tables
+	err = runner.Run(t.Context())
+	assert.NoError(t, err, "Move should succeed with empty source database")
+
+	// Verify cutover was called
+	assert.True(t, cutoverCalled, "Cutover function should have been called")
+
+	// Clean up
+	runner.Close()
+}
+
 // settingsCheck checks that the database settings are appropriate for running moves.
 // Move is not supported unless there is full binlog images, etc. but in CI
 // we have some tests and features that do not require this.

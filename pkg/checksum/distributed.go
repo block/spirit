@@ -276,7 +276,9 @@ func (c *DistributedChecker) initConnPool(ctx context.Context) error {
 	c.logger.Info("distributed checksum will lock tables on all targets", "targetCount", len(targets))
 
 	// Extract the source and target tables from the chunker's Tables() method
-	// By convention, every second table is the "new" table
+	// By convention, every second table is the "new" table.
+	// However, in a move we don't usually specify the writeTable when creating the chunker,
+	// so it automatically gets set to the same as the readTable.
 	var readTables, writeTables []*table.TableInfo
 	for i, tbl := range c.chunker.Tables() {
 		if i%2 == 0 {

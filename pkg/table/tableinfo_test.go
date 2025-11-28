@@ -350,3 +350,32 @@ func TestDiscoveryGeneratedCols(t *testing.T) {
 	assert.Equal(t, []string{"id", "pa", "p1", "p2", "s1", "s2", "s3", "s4"}, t2.Columns)
 	assert.Equal(t, []string{"id", "pa", "p1", "p2"}, t2.NonGeneratedColumns)
 }
+
+func TestGetColumnOrdinal(t *testing.T) {
+	// Create a simple TableInfo for testing
+	t1 := NewTableInfo(nil, "test", "testtable")
+	t1.Columns = []string{"id", "name", "age", "email"}
+
+	// Test finding existing columns
+	ordinal, err := t1.GetColumnOrdinal("id")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, ordinal)
+
+	ordinal, err = t1.GetColumnOrdinal("name")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, ordinal)
+
+	ordinal, err = t1.GetColumnOrdinal("age")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, ordinal)
+
+	ordinal, err = t1.GetColumnOrdinal("email")
+	assert.NoError(t, err)
+	assert.Equal(t, 3, ordinal)
+
+	// Test finding non-existent column
+	ordinal, err = t1.GetColumnOrdinal("nonexistent")
+	assert.Error(t, err)
+	assert.Equal(t, -1, ordinal)
+	assert.ErrorContains(t, err, "column nonexistent not found in table testtable")
+}

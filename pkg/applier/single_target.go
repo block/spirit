@@ -412,7 +412,10 @@ func (a *SingleTargetApplier) DeleteKeys(ctx context.Context, sourceTable, targe
 	if len(keys) == 0 {
 		return 0, nil
 	}
-
+	// For move operations, targetTable may be nil - use sourceTable for both
+	if targetTable == nil {
+		targetTable = sourceTable
+	}
 	// Convert hashed keys to row value constructor format
 	var pkValues []string
 	for _, key := range keys {
@@ -453,7 +456,10 @@ func (a *SingleTargetApplier) UpsertRows(ctx context.Context, sourceTable, targe
 	if len(rows) == 0 {
 		return 0, nil
 	}
-
+	// For move operations, targetTable may be nil - use sourceTable for both
+	if targetTable == nil {
+		targetTable = sourceTable
+	}
 	// Get the columns that exist in both source and destination tables
 	columnList := utils.IntersectNonGeneratedColumns(sourceTable, targetTable)
 	columnNames := utils.IntersectNonGeneratedColumnsAsSlice(sourceTable, targetTable)

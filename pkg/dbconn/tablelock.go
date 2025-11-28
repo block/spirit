@@ -34,7 +34,7 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 		if idx > 0 {
 			lockStmt += ", "
 		}
-		lockStmt += tbl.QuotedName + " WRITE"
+		lockStmt += "`" + tbl.TableName + "` WRITE"
 	}
 
 	// Try and acquire the lock. No retries are permitted here.
