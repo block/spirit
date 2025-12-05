@@ -1,9 +1,13 @@
 package table
 
 import (
+	"fmt"
+	"log/slog"
 	"math"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -83,4 +87,49 @@ func TestDatumInt32ToUnsigned(t *testing.T) {
 	d5 := NewDatum(positiveUint32, unsignedType)
 	assert.Equal(t, uint64(3454523340), d5.Val)
 	assert.Equal(t, "3454523340", d5.String())
+}
+
+func TestStringPanic(t *testing.T) {
+	ti := &TableInfo{
+		SchemaName:        "test",
+		TableName:         "t1",
+		QuotedName:        "`test`.`t1`",
+		KeyColumns:        []string{"id"},
+		keyColumnsMySQLTp: []string{"int unsigned"},
+		KeyIsAutoInc:      true,
+		minValue:          NewDatum(uint64(0), unsignedType),
+		maxValue:          NewDatum(uint64(1000), unsignedType),
+	}
+
+	// Create the optimistic chunker directly
+	chk := &chunkerOptimistic{
+		Ti:            ti,
+		ChunkerTarget: 100 * time.Millisecond,
+		logger:        slog.Default(),
+		watermark: &Chunk{
+			UpperBound: &Boundary{Value: []Datum{NewDatum(uint64(100), unsignedType)}},
+			LowerBound: &Boundary{Value: []Datum{NewDatum(uint64(0), unsignedType)}},
+		},
+		// We need chunkPtr to have a type for NewDatum call
+		chunkPtr: NewDatum(uint64(0), unsignedType),
+	}
+
+	// 1. setup value like it would in repl.deltaMap
+	// Value arrives as int32(-12345) (representing a large unsigned int)
+	// 4294954951 as uint32 is -12345 as int32
+	originalVal := int32(-12345)
+
+	// 2. copy behavior of utils.HashKey
+	hashed := fmt.Sprintf("%v", originalVal) //nolint:perfsprint
+	assert.Equal(t, "-12345", hashed)
+
+	// 3. copy behavior of utils.UnhashKey
+	unhashed := strings.Split(hashed, "-#-")
+	assert.Equal(t, "-12345", unhashed[0])
+
+	// 4. flush function in repl.deltaMap calls KeyBelowLowWatermark with this string
+	// This triggers NewDatum("-12345", unsignedType)
+	assert.NotPanics(t, func() {
+		chk.KeyBelowLowWatermark(unhashed[0])
+	}, "KeyBelowLowWatermark should NOT panic with negative string input for unsigned type")
 }

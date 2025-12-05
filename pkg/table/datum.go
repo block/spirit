@@ -70,9 +70,15 @@ func NewDatum(val any, tp datumTp) Datum {
 			// We need to reinterpret the bits as unsigned.
 			val = uint64(uint32(v))
 		default:
-			val, err = strconv.ParseUint(fmt.Sprint(val), 10, 64)
+			valStr := fmt.Sprint(val)
+			val, err = strconv.ParseUint(valStr, 10, 64)
 			if err != nil {
-				panic("could not convert datum to uint64")
+				// String can arrive as a negative number from int32 -> string conversion (utils.HashKey)
+				if vInt, err2 := strconv.ParseInt(valStr, 10, 64); err2 == nil {
+					val = uint64(vInt)
+				} else {
+					panic("could not convert datum to uint64")
+				}
 			}
 		}
 	}
