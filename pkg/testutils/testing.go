@@ -38,7 +38,7 @@ func CreateUniqueTestDatabase(t *testing.T) string {
 	t.Helper()
 
 	// Create a unique database name based on test name
-	dbName := fmt.Sprintf("spirit_test_%s_%d",
+	dbName := fmt.Sprintf("t_%s_%d",
 		strings.ReplaceAll(strings.ToLower(t.Name()), "/", "_"),
 		os.Getpid())
 

@@ -50,7 +50,7 @@ func TestCutOver(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -122,7 +122,7 @@ func TestMDLLockFails(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -186,7 +186,7 @@ func TestInvalidOptions(t *testing.T) {
 	t1old := "test_old"
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,

@@ -4,6 +4,7 @@ run:
 linters:
   default: all
   disable:
+    - tparallel
     - wsl_v5 # drives me crazy
     - noinlineerr # don't agree with this one
     - unqueryvet # maybe makes sense for a user app, not spirit

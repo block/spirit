@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/copier"
@@ -34,7 +35,8 @@ var (
 
 type Runner struct {
 	migration       *Migration
-	db              *sql.DB
+	poolDB          *sql.DB // Worker pool for copier/applier/repl (thread-limited)
+	db              *sql.DB // Dedicated connection for checkpoints/sentinels/control queries
 	dbConfig        *dbconn.DBConfig
 	replica         *sql.DB
 	checkpointTable *table.TableInfo
@@ -135,22 +137,31 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Map TLS configuration from migration to dbConfig
 	r.dbConfig.TLSMode = r.migration.TLSMode
 	r.dbConfig.TLSCertificatePath = r.migration.TLSCertificatePath
-	// The copier and checker will use Threads to limit N tasks concurrently,
-	// but we also set it at the DB pool level with +1. Because the copier and
-	// the replication applier use the same pool, it allows for some natural throttling
-	// of the copier if the replication applier is lagging. Because it's +1 it
-	// means that the replication applier can always make progress immediately,
-	// and does not need to wait for free slots from the copier *until* it needs
-	// copy in more than 1 thread.
+	// The copier and checker will use Threads to limit N tasks concurrently.
+	// We always +1 on what the user asks for (legacy; to always make progress)
 	r.dbConfig.MaxOpenConnections = r.migration.Threads + 1
 	if r.migration.EnableExperimentalBufferedCopy {
-		// Buffered has many more connections because it fans out x8 more write threads
-		// Plus it has read threads. Set this high and figure it out later.
-		r.dbConfig.MaxOpenConnections = 100
+		// Buffered has many more connections because it fans out read and write.
+		// Currently in the migration runner we don't have a writeThreads config,
+		// so we just need to make sure we add the default here.
+		r.dbConfig.MaxOpenConnections += 2 /* applier.defaultWriteWorkers*/
 	}
-	r.db, err = dbconn.New(r.dsn(), r.dbConfig)
+	r.poolDB, err = dbconn.New(r.dsn(), r.dbConfig)
 	if err != nil {
 		return fmt.Errorf("failed to connect to main database (DSN: %s): %w", maskPasswordInDSN(r.dsn()), err)
+	}
+
+	// Create dedicated management connection for checkpoints, sentinels, and control queries
+	// This connection is never blocked by worker pool exhaustion
+	managementConfig := dbconn.NewDBConfig()
+	managementConfig.TLSMode = r.migration.TLSMode
+	managementConfig.TLSCertificatePath = r.migration.TLSCertificatePath
+	managementConfig.LockWaitTimeout = int(r.migration.LockWaitTimeout.Seconds())
+	managementConfig.ForceKill = r.migration.ForceKill
+	managementConfig.MaxOpenConnections = 5
+	r.db, err = dbconn.New(r.dsn(), managementConfig)
+	if err != nil {
+		return fmt.Errorf("failed to connect to management database (DSN: %s): %w", maskPasswordInDSN(r.dsn()), err)
 	}
 
 	// Enable linting if any of the linting related options are given
@@ -466,8 +477,27 @@ func (r *Runner) checkpointTableName() string {
 func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 	var err error
 	r.checkpointTable = table.NewTableInfo(r.db, r.changes[0].table.SchemaName, r.checkpointTableName())
+	// Create an applier if using buffered copy or buffered replication
+	var appl applier.Applier
+	if r.migration.EnableExperimentalBufferedCopy {
+		// For now, we only support single-table migrations with buffered copy
+		if len(r.changes) > 1 {
+			return errors.New("buffered copy is not yet supported for multi-table migrations")
+		}
+		// Create a SingleTargetApplier for the buffered copier
+		appl, err = applier.NewSingleTargetApplier(
+			applier.Target{DB: r.poolDB},
+			&applier.ApplierConfig{
+				Logger:   r.logger,
+				DBConfig: r.dbConfig,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create applier for buffered copier: %w", err)
+		}
+	}
 	// Create copier with the prepared chunker
-	r.copier, err = copier.NewCopier(r.db, r.copyChunker, &copier.CopierConfig{
+	r.copier, err = copier.NewCopier(r.poolDB, r.copyChunker, &copier.CopierConfig{
 		Concurrency:                   r.migration.Threads,
 		TargetChunkTime:               r.migration.TargetChunkTime,
 		Throttler:                     &throttler.Noop{},
@@ -475,20 +505,22 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 		MetricsSink:                   r.metricsSink,
 		DBConfig:                      r.dbConfig,
 		UseExperimentalBufferedCopier: r.migration.EnableExperimentalBufferedCopy,
+		Applier:                       appl,
 	})
 	if err != nil {
 		return err
 	}
 
 	// Set the binlog position.
-	// Create a binlog subscriber
-	r.replClient = repl.NewClient(r.db, r.migration.Host, r.migration.Username, *r.migration.Password, &repl.ClientConfig{
+	// Create a binlog subscriber with both worker pool and management connections
+	r.replClient = repl.NewClient(r.poolDB, r.db, r.migration.Host, r.migration.Username, *r.migration.Password, &repl.ClientConfig{
 		Logger:          r.logger,
 		Concurrency:     r.migration.Threads,
 		TargetBatchTime: r.migration.TargetChunkTime,
 		OnDDL:           r.ddlNotification,
 		ServerID:        repl.NewServerID(),
 		DBConfig:        r.dbConfig, // Pass database configuration to replication client
+		Applier:         appl,
 	})
 	// For each of the changes, we know the new table exists now
 	// So we should call SetInfo to populate the columns etc.
@@ -501,7 +533,7 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 		}
 	}
 
-	r.checker, err = checksum.NewChecker(r.db, r.checksumChunker, r.replClient, &checksum.CheckerConfig{
+	r.checker, err = checksum.NewChecker(r.poolDB, r.checksumChunker, r.replClient, &checksum.CheckerConfig{
 		Concurrency:     r.migration.Threads,
 		TargetChunkTime: r.migration.TargetChunkTime,
 		DBConfig:        r.dbConfig,
@@ -813,6 +845,12 @@ func (r *Runner) Close() error {
 			return err
 		}
 	}
+	if r.poolDB != nil {
+		err := r.poolDB.Close()
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -938,14 +976,6 @@ func (r *Runner) initChunkers() error {
 func (r *Runner) checksum(ctx context.Context) error {
 	r.status.Set(status.Checksum)
 
-	// The checksum keeps the pool threads open, so we need to extend
-	// by more than +1 on threads as we did previously. We have:
-	// - background flushing
-	// - checkpoint thread
-	// - checksum "replaceChunk" DB connections
-	// Handle a case just in the tests not having a dbConfig
-	r.db.SetMaxOpenConns(r.dbConfig.MaxOpenConnections + 2)
-
 	// Run the checksum with internal retry logic
 	if err := r.checker.Run(ctx); err != nil {
 		if r.addsUniqueIndex() {
@@ -1068,6 +1098,7 @@ func (r *Runner) Status() string {
 }
 
 func (r *Runner) sentinelTableExists(ctx context.Context) (bool, error) {
+	// Use managementDB for sentinel checks (infrastructure, not data)
 	sql := "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
 	var sentinelTableExists int
 	err := r.db.QueryRowContext(ctx, sql, r.changes[0].table.SchemaName, sentinelTableName).Scan(&sentinelTableExists)

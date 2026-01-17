@@ -854,6 +854,9 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
 	assert.NoError(t, err)
 	defer m.db.Close()
+	m.poolDB, err = dbconn.New(testutils.DSN(), m.dbConfig)
+	assert.NoError(t, err)
+	defer m.poolDB.Close()
 	// Get Table Info
 	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
@@ -957,6 +960,10 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 	// the migration process manually.
 	m.dbConfig = dbconn.NewDBConfig()
 	m.startTime = time.Now()
+	// Set up both connections: poolDB for worker operations and db for management
+	m.poolDB, err = dbconn.New(testutils.DSN(), m.dbConfig)
+	assert.NoError(t, err)
+	defer m.poolDB.Close()
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
 	assert.NoError(t, err)
 	defer m.db.Close()
@@ -1388,6 +1395,9 @@ func TestE2ERogueValues(t *testing.T) {
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
 	assert.NoError(t, err)
 	defer m.db.Close()
+	m.poolDB, err = dbconn.New(testutils.DSN(), m.dbConfig)
+	assert.NoError(t, err)
+	defer m.poolDB.Close()
 	// Get Table Info
 	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
 	err = m.changes[0].table.SetInfo(t.Context())

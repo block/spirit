@@ -145,7 +145,7 @@ func (s *deltaQueue) Flush(ctx context.Context, underLock bool, lock *dbconn.Tab
 	} else {
 		// Execute the statements in a transaction.
 		// They still need to be single threaded.
-		if _, err := dbconn.RetryableTransaction(ctx, s.c.db, true, s.c.dbConfig, extractStmt(stmts)...); err != nil {
+		if _, err := dbconn.RetryableTransaction(ctx, s.c.poolDB, true, s.c.dbConfig, extractStmt(stmts)...); err != nil {
 			return false, err
 		}
 	}

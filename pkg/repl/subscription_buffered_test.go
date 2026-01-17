@@ -92,7 +92,7 @@ func TestBufferedMapVariableColumns(t *testing.T) {
 	}
 	applier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:                     logger,
 		Concurrency:                4,
 		TargetBatchTime:            time.Second,
@@ -148,7 +148,7 @@ func TestBufferedMapIllegalValues(t *testing.T) {
 	}
 	applier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:                     logger,
 		Concurrency:                4,
 		TargetBatchTime:            time.Second,

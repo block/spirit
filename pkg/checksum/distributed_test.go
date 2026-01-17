@@ -55,7 +55,7 @@ func TestFixCorruptWithApplier(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start the applier so its workers can process async Apply calls
-	feed := repl.NewClient(src, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(src, src, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
 		Logger:                     logger,
 		Concurrency:                4,
 		TargetBatchTime:            time.Second,

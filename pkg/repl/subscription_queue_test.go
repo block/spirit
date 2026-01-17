@@ -77,8 +77,13 @@ func TestFlushDeltaQueue(t *testing.T) {
 	assert.NoError(t, err)
 	defer db.Close()
 
+	poolDB, err := dbconn.New(testutils.DSN(), dbConfig)
+	assert.NoError(t, err)
+	defer poolDB.Close()
+
 	t.Run("empty queue", func(t *testing.T) {
 		client := &Client{
+			poolDB:          poolDB,
 			db:              db,
 			logger:          slog.Default(),
 			concurrency:     2,
@@ -99,6 +104,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	})
 	t.Run("statement merging", func(t *testing.T) {
 		client := &Client{
+			poolDB:          poolDB,
 			db:              db,
 			logger:          slog.Default(),
 			concurrency:     2,
@@ -158,6 +164,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 
 	t.Run("batch size limit", func(t *testing.T) {
 		client := &Client{
+			poolDB:          poolDB,
 			db:              db,
 			logger:          slog.Default(),
 			concurrency:     2,
@@ -197,6 +204,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 	})
 	t.Run("under lock execution", func(t *testing.T) {
 		client := &Client{
+			poolDB:          poolDB,
 			db:              db,
 			logger:          slog.Default(),
 			concurrency:     2,
@@ -241,6 +249,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 
 	t.Run("concurrent queue access", func(t *testing.T) {
 		client := &Client{
+			poolDB:          poolDB,
 			db:              db,
 			logger:          slog.Default(),
 			concurrency:     2,
@@ -296,6 +305,7 @@ func TestFlushDeltaQueue(t *testing.T) {
 
 	t.Run("mixed operations", func(t *testing.T) {
 		client := &Client{
+			poolDB:          poolDB,
 			db:              db,
 			logger:          slog.Default(),
 			concurrency:     2,

@@ -45,7 +45,7 @@ func TestReplClient(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -93,7 +93,7 @@ func TestReplClientComplex(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
 	chunker, err := table.NewChunker(t1, t2, time.Second, slog.Default())
 	assert.NoError(t, err)
@@ -175,7 +175,7 @@ func TestReplClientResumeFromImpossible(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -207,7 +207,7 @@ func TestReplClientResumeFromPoint(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -248,7 +248,7 @@ func TestReplClientOpts(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -308,7 +308,7 @@ func TestReplClientQueue(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 
 	chunker, err := table.NewChunker(t1, t2, 1000, slog.Default())
 	assert.NoError(t, err)
@@ -373,7 +373,7 @@ func TestFeedback(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 	assert.NoError(t, client.AddSubscription(t1, t2, nil))
 	assert.NoError(t, client.Run(t.Context()))
 	defer client.Close()
@@ -427,7 +427,7 @@ func TestBlockWait(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -474,7 +474,7 @@ func TestDDLNotification(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
 	ddlNotifications := make(chan string, 1)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -522,7 +522,7 @@ func TestSetDDLNotificationChannel(t *testing.T) {
 	assert.NoError(t, err)
 
 	t.Run("change notification channels", func(t *testing.T) {
-		client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+		client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 			Logger:          logger,
 			Concurrency:     4,
 			TargetBatchTime: time.Second,
@@ -626,7 +626,7 @@ func TestCompositePKUpdate(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	assert.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -822,7 +822,7 @@ func testMaxRecreateAttemptsPanicSubprocess(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,

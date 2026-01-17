@@ -414,7 +414,7 @@ func (r *Runner) setup(ctx context.Context) error {
 	}
 
 	r.logger.Info("Setting up repl client")
-	r.replClient = repl.NewClient(r.source, r.sourceConfig.Addr, r.sourceConfig.User, r.sourceConfig.Passwd, &repl.ClientConfig{
+	r.replClient = repl.NewClient(r.source, r.source, r.sourceConfig.Addr, r.sourceConfig.User, r.sourceConfig.Passwd, &repl.ClientConfig{
 		Logger:                     r.logger,
 		Concurrency:                r.move.Threads,
 		TargetBatchTime:            r.move.TargetChunkTime,
@@ -551,6 +551,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	var err error
 	r.dbConfig = dbconn.NewDBConfig()
 	r.dbConfig.ForceKill = true // in move we always use force kill; it's new code.
+	// Buffered copier needs more connections due to parallel read/write workers
+	r.dbConfig.MaxOpenConnections = r.move.Threads + r.move.WriteThreads + 2
 	r.logger.Warn("the move command is experimental and not yet safe for production use.")
 	r.source, err = dbconn.New(r.move.SourceDSN, r.dbConfig)
 	if err != nil {

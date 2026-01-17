@@ -153,7 +153,7 @@ func (s *deltaMap) Flush(ctx context.Context, underLock bool, lock *dbconn.Table
 			st := stmt
 			g.Go(func() error {
 				startTime := time.Now()
-				_, err := dbconn.RetryableTransaction(errGrpCtx, s.c.db, false, dbconn.NewDBConfig(), st.stmt)
+				_, err := dbconn.RetryableTransaction(errGrpCtx, s.c.poolDB, false, dbconn.NewDBConfig(), st.stmt)
 				s.c.feedback(st.numKeys, time.Since(startTime))
 				return err
 			})

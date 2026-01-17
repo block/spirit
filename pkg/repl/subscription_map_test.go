@@ -77,7 +77,12 @@ func TestFlushWithLock(t *testing.T) {
 	assert.NoError(t, err)
 	defer db.Close()
 
+	poolDB, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	assert.NoError(t, err)
+	defer poolDB.Close()
+
 	client := &Client{
+		poolDB:          poolDB,
 		db:              db,
 		logger:          slog.Default(),
 		concurrency:     2,
@@ -134,7 +139,12 @@ func TestFlushWithoutLock(t *testing.T) {
 	assert.NoError(t, err)
 	defer db.Close()
 
+	poolDB, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	assert.NoError(t, err)
+	defer poolDB.Close()
+
 	client := &Client{
+		poolDB:          poolDB,
 		db:              db,
 		logger:          slog.Default(),
 		concurrency:     2,

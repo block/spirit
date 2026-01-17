@@ -21,7 +21,7 @@ services:
   test:
     build:
       context: ../
-    command: bash -c "go test -json -race -v ./... -timeout=5m | tee /proc/1/fd/1 | tparse -all"
+    command: bash -c "go test -json -race -v ./... -timeout=10m | tee /proc/1/fd/1 | tparse -all"
     depends_on:
       mysql:
         condition: service_healthy

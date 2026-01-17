@@ -219,8 +219,8 @@ func TestReplicationClientTLSConfig(t *testing.T) {
 			require.NoError(t, err)
 			defer db.Close()
 
-			// Create replication client
-			client := repl.NewClient(db, tc.host, "user", "pass", clientConfig)
+			// Create replication client (pass db twice: once for poolDB, once for management db)
+			client := repl.NewClient(db, db, tc.host, "user", "pass", clientConfig)
 			assert.NotNil(t, client)
 
 			// Verify TLS config is stored
