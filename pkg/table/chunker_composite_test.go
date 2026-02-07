@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -770,4 +771,579 @@ func TestCompositeChunkerReset(t *testing.T) {
 
 	assert.NoError(t, chunker2.Close())
 	assert.NoError(t, chunker.Close())
+}
+
+// TestCompositeChunkerWatermarkOptimizations tests KeyAboveHighWatermark and KeyBelowLowWatermark
+// for composite chunker with numeric first column.
+func TestCompositeChunkerWatermarkOptimizations(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS compositewatermarkopt_t1")
+	testutils.RunSQL(t, `CREATE TABLE compositewatermarkopt_t1 (
+		a int NOT NULL,
+		b int NOT NULL,
+		c int NOT NULL,
+		PRIMARY KEY (a,b,c)
+	)`)
+	// Insert test data with sequential b values for each a value
+	// Use a recursive CTE (MySQL 8.0+) to generate sequential numbers
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkopt_t1 (a, b, c)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1000
+		)
+		SELECT 1, n, 1 FROM seq`)
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkopt_t1 (a, b, c)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1000
+		)
+		SELECT 2, n, 1 FROM seq`)
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkopt_t1 (a, b, c)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1000
+		)
+		SELECT 3, n, 1 FROM seq`)
+
+	db, err := sql.Open("mysql", testutils.DSN())
+	assert.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	// Verify data was inserted correctly
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM compositewatermarkopt_t1").Scan(&count)
+	require.NoError(t, err, "Failed to count rows")
+	require.Equal(t, 3000, count, "Expected 3000 total rows")
+
+	var countA1 int
+	err = db.QueryRow("SELECT COUNT(*) FROM compositewatermarkopt_t1 WHERE a = 1").Scan(&countA1)
+	require.NoError(t, err, "Failed to count rows for a=1")
+	require.Equal(t, 1000, countA1, "Expected 1000 rows for a=1")
+
+	tbl := NewTableInfo(db, "test", "compositewatermarkopt_t1")
+	assert.NoError(t, tbl.SetInfo(t.Context()))
+
+	chunker, err := newChunker(tbl, ChunkerDefaultTarget, slog.Default())
+	assert.NoError(t, err)
+	comp := chunker.(*chunkerComposite)
+
+	// Before opening, everything is above high watermark
+	assert.True(t, comp.KeyAboveHighWatermark(1))
+	assert.True(t, comp.KeyAboveHighWatermark(100))
+	assert.False(t, comp.KeyBelowLowWatermark(1)) // watermark not ready
+
+	assert.NoError(t, comp.Open())
+
+	// After opening but before first chunk, key=1 should still be above
+	assert.True(t, comp.KeyAboveHighWatermark(1))
+	assert.False(t, comp.KeyBelowLowWatermark(1))
+
+	// Get first chunk for tenant_id=1
+	chunk1, err := comp.Next()
+	require.NoError(t, err)
+	require.NotNil(t, chunk1)
+
+	// After dispatching first chunk:
+	// - Keys at or above chunkPtr[0] should be above high watermark
+	// - Keys below watermark should return false until feedback is given
+	// First chunk has no LowerBound, use UpperBound instead
+	require.Nil(t, chunk1.LowerBound)
+	require.NotNil(t, chunk1.UpperBound, "chunk1.UpperBound should not be nil")
+	require.NotEmpty(t, chunk1.UpperBound.Value, "chunk1.UpperBound.Value should not be empty")
+	require.NotNil(t, chunk1.UpperBound.Value[0].Val, "chunk1.UpperBound.Value[0].Val should not be nil")
+	val1 := int(chunk1.UpperBound.Value[0].Val.(int64))
+	t.Logf("First chunk upper bound: a=%d, b=%v, c=%v", val1, chunk1.UpperBound.Value[1].Val, chunk1.UpperBound.Value[2].Val)
+	// With StartingChunkSize=1000 and 1000 rows per 'a' value, first chunk may span to a=2
+	// The important thing is that the watermark tracking works correctly
+	require.True(t, val1 >= 1 && val1 <= 3, "First chunk upper bound should be within data range")
+
+	// Key below the lowest 'a' value should not be above watermark
+	assert.False(t, comp.KeyAboveHighWatermark(0))
+
+	// Key at or above chunkPtr should be above high watermark
+	assert.True(t, comp.KeyAboveHighWatermark(val1))
+	assert.True(t, comp.KeyAboveHighWatermark(val1+1))
+
+	// Nothing is below low watermark yet (no feedback given)
+	assert.False(t, comp.KeyBelowLowWatermark(1))
+
+	// Provide feedback to bump watermark
+	comp.Feedback(chunk1, 100*time.Millisecond, 1000)
+
+	// Now keys up to but not including val1 should be below low watermark
+	// If val1=1, then nothing is below yet (chunk hasn't been fully processed)
+	// If val1=2, then a=1 should be below
+	if val1 > 1 {
+		assert.True(t, comp.KeyBelowLowWatermark(1))
+	}
+	assert.False(t, comp.KeyBelowLowWatermark(val1))   // upper bound itself not below
+	assert.False(t, comp.KeyBelowLowWatermark(val1+1)) // above upper bound not below
+
+	// Get second chunk
+	chunk2, err := comp.Next()
+	require.NoError(t, err)
+	if chunk2 != nil {
+		// Provide feedback for chunk2
+		comp.Feedback(chunk2, 100*time.Millisecond, 1000)
+
+		// Keys below chunk2's upper bound should now be below watermark
+		// But the upper bound itself is NOT below (watermark > key, not >=)
+		if chunk2.UpperBound != nil {
+			val2 := int(chunk2.UpperBound.Value[0].Val.(int64))
+			assert.False(t, comp.KeyBelowLowWatermark(val2), "Upper bound itself should not be below watermark")
+			if val2 > 1 {
+				assert.True(t, comp.KeyBelowLowWatermark(val2-1), "Keys below upper bound should be below watermark")
+			}
+		}
+	}
+	// After first chunk feedback, a=1 should definitely be below
+	if val1 > 1 {
+		assert.True(t, comp.KeyBelowLowWatermark(1))
+	}
+
+	// Exhaust remaining chunks
+	for {
+		chunk, err := comp.Next()
+		if err != nil {
+			require.Equal(t, ErrTableIsRead, err, "Expected ErrTableIsRead when table exhausted")
+			break
+		}
+		if chunk == nil {
+			break
+		}
+		comp.Feedback(chunk, 100*time.Millisecond, 1000)
+	}
+
+	// After final chunk is sent, everything should be below, nothing above
+	assert.False(t, comp.KeyAboveHighWatermark(1))
+	assert.False(t, comp.KeyAboveHighWatermark(100))
+	assert.True(t, comp.KeyBelowLowWatermark(1))
+	assert.True(t, comp.KeyBelowLowWatermark(100))
+
+	assert.NoError(t, comp.Close())
+}
+
+// TestCompositeChunkerWatermarkNonNumeric tests that watermark optimizations
+// work correctly with non-numeric (VARCHAR) first columns.
+// Since watermark optimizations are disabled before checksum (see runner.go),
+// there's no risk of corruption even if collation comparison differs slightly.
+func TestCompositeChunkerWatermarkNonNumeric(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS compositewatermarknn_t1")
+	testutils.RunSQL(t, `CREATE TABLE compositewatermarknn_t1 (
+		a varchar(40) NOT NULL,
+		b int NOT NULL,
+		PRIMARY KEY (a,b)
+	)`)
+	// Insert test data with sequential VARCHAR keys using recursive CTE
+	// Need more than StartingChunkSize (1000) rows for chunker to find upper bound
+	// Generate in batches to avoid CTE recursion depth limit
+	testutils.RunSQL(t, `INSERT INTO compositewatermarknn_t1 (a, b)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1000
+		)
+		SELECT CONCAT('key', LPAD(n, 5, '0')), n FROM seq`)
+	testutils.RunSQL(t, `INSERT INTO compositewatermarknn_t1 (a, b)
+		WITH RECURSIVE seq AS (
+			SELECT 1001 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1500
+		)
+		SELECT CONCAT('key', LPAD(n, 5, '0')), n FROM seq`)
+
+	db, err := sql.Open("mysql", testutils.DSN())
+	assert.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	// Verify data was inserted
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM compositewatermarknn_t1").Scan(&count)
+	require.NoError(t, err, "Failed to count rows")
+	require.Equal(t, 1500, count, "Expected 1500 rows")
+	t.Logf("VARCHAR test: %d rows inserted", count)
+
+	tbl := NewTableInfo(db, "test", "compositewatermarknn_t1")
+	assert.NoError(t, tbl.SetInfo(t.Context()))
+
+	chunker, err := newChunker(tbl, ChunkerDefaultTarget, slog.Default())
+	assert.NoError(t, err)
+	comp := chunker.(*chunkerComposite)
+
+	assert.NoError(t, comp.Open())
+
+	// Get first chunk
+	chunk1, err := comp.Next()
+	require.NoError(t, err)
+	require.NotNil(t, chunk1, "First chunk should not be nil")
+	require.NotNil(t, chunk1.UpperBound, "chunk1.UpperBound should not be nil")
+	require.NotEmpty(t, chunk1.UpperBound.Value, "chunk1.UpperBound.Value should not be empty")
+	t.Logf("VARCHAR test: chunk1.UpperBound = %+v", chunk1.UpperBound.Value)
+
+	// For VARCHAR keys, the optimization should work (not fall back to conservative)
+	// Test with a key that's clearly above the first chunk's upper bound
+	upperVal := chunk1.UpperBound.Value[0].Val.(string)
+	assert.False(t, comp.KeyAboveHighWatermark("key00001")) // Below or equal to upper bound
+	assert.True(t, comp.KeyAboveHighWatermark("zzzzzzzzz")) // Above upper bound
+
+	// KeyBelowLowWatermark should work with VARCHAR comparison
+	comp.Feedback(chunk1, 100*time.Millisecond, 100)
+	watermarkUpper := comp.watermark.UpperBound.Value[0].Val.(string)
+	assert.True(t, comp.KeyBelowLowWatermark("key00001"))   // Below watermark
+	assert.False(t, comp.KeyBelowLowWatermark("zzzzzzzzz")) // Above watermark
+
+	// Verify the watermark value is what we expect
+	assert.Equal(t, upperVal, watermarkUpper)
+
+	assert.NoError(t, comp.Close())
+}
+
+// TestCompositeChunkerWatermarkDateTime tests that watermark optimizations
+// work correctly with DATETIME first columns.
+// Since watermark optimizations are disabled before checksum (see runner.go),
+// there's no risk of corruption even if temporal comparison differs slightly.
+func TestCompositeChunkerWatermarkDateTime(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS compositewatermarkdt_t1")
+	testutils.RunSQL(t, `CREATE TABLE compositewatermarkdt_t1 (
+		created_at DATETIME NOT NULL,
+		event_id int NOT NULL,
+		PRIMARY KEY (created_at, event_id)
+	)`)
+	// Insert test data with sequential DATETIME values using recursive CTE
+	// Need more than StartingChunkSize (1000) rows for chunker to find upper bound
+	// Generate in batches to avoid CTE recursion depth limit
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkdt_t1 (created_at, event_id)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1000
+		)
+		SELECT DATE_ADD('2024-01-01 00:00:00', INTERVAL n HOUR), n FROM seq`)
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkdt_t1 (created_at, event_id)
+		WITH RECURSIVE seq AS (
+			SELECT 1001 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1500
+		)
+		SELECT DATE_ADD('2024-01-01 00:00:00', INTERVAL n HOUR), n FROM seq`)
+
+	db, err := sql.Open("mysql", testutils.DSN())
+	assert.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	// Verify data was inserted
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM compositewatermarkdt_t1").Scan(&count)
+	require.NoError(t, err, "Failed to count rows")
+	require.Equal(t, 1500, count, "Expected 1500 rows")
+	t.Logf("DATETIME test: %d rows inserted", count)
+
+	tbl := NewTableInfo(db, "test", "compositewatermarkdt_t1")
+	assert.NoError(t, tbl.SetInfo(t.Context()))
+
+	chunker, err := newChunker(tbl, ChunkerDefaultTarget, slog.Default())
+	assert.NoError(t, err)
+	comp := chunker.(*chunkerComposite)
+
+	assert.NoError(t, comp.Open())
+
+	// Get first chunk
+	chunk1, err := comp.Next()
+	require.NoError(t, err)
+	require.NotNil(t, chunk1, "First chunk should not be nil")
+	require.NotNil(t, chunk1.UpperBound, "chunk1.UpperBound should not be nil")
+	require.NotEmpty(t, chunk1.UpperBound.Value, "chunk1.UpperBound.Value should not be empty")
+	t.Logf("DATETIME test: chunk1.UpperBound = %+v", chunk1.UpperBound.Value)
+
+	// For DATETIME keys, the optimization should work
+	// Test with timestamps that are clearly above/below the first chunk's upper bound
+	upperVal := chunk1.UpperBound.Value[0].Val.(string)
+	assert.False(t, comp.KeyAboveHighWatermark("2024-01-01 00:00:00")) // Below upper bound
+	assert.True(t, comp.KeyAboveHighWatermark("2025-12-31 23:59:59"))  // Above upper bound
+
+	// KeyBelowLowWatermark should work with DATETIME comparison
+	comp.Feedback(chunk1, 100*time.Millisecond, 100)
+	watermarkUpper := comp.watermark.UpperBound.Value[0].Val.(string)
+	assert.True(t, comp.KeyBelowLowWatermark("2024-01-01 00:00:00"))  // Below watermark
+	assert.False(t, comp.KeyBelowLowWatermark("2025-12-31 23:59:59")) // Above watermark
+
+	// Verify the watermark value is what we expect
+	assert.Equal(t, upperVal, watermarkUpper)
+
+	assert.NoError(t, comp.Close())
+}
+
+// TestCompositeChunkerCollationDifference demonstrates how Go's lexicographic comparison
+// differs from MySQL collation, showing why watermark optimizations must be disabled
+// before the checksum phase. This test simulates a scenario where:
+// 1. Binlog changes to certain rows are buffered longer than necessary due to comparison differences
+// 2. The checksum phase ensures all changes are applied by using full table scans without watermarks
+func TestCompositeChunkerCollationDifference(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS compositecollation_t1")
+	// Use case-insensitive collation (MySQL default for utf8mb4)
+	testutils.RunSQL(t, `CREATE TABLE compositecollation_t1 (
+		name VARCHAR(50) NOT NULL,
+		id INT NOT NULL,
+		PRIMARY KEY (name, id)
+	) COLLATE=utf8mb4_0900_ai_ci`) // ai = accent insensitive, ci = case insensitive
+
+	// Insert enough data to trigger multiple chunks (need > 1000 rows for watermark to be used)
+	// Mix case variations throughout to demonstrate the collation difference
+	testutils.RunSQL(t, `INSERT INTO compositecollation_t1 (name, id)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 400
+		)
+		SELECT CONCAT('KEY', LPAD(n, 4, '0')), n FROM seq`)
+
+	testutils.RunSQL(t, `INSERT INTO compositecollation_t1 (name, id)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 400
+		)
+		SELECT CONCAT('Key', LPAD(n, 4, '0')), n + 400 FROM seq`)
+
+	testutils.RunSQL(t, `INSERT INTO compositecollation_t1 (name, id)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 400
+		)
+		SELECT CONCAT('key', LPAD(n, 4, '0')), n + 800 FROM seq`)
+
+	// Add some specific test cases with same key but different cases
+	testutils.RunSQL(t, "INSERT INTO compositecollation_t1 VALUES ('TEST', 9001)")
+	testutils.RunSQL(t, "INSERT INTO compositecollation_t1 VALUES ('Test', 9002)")
+	testutils.RunSQL(t, "INSERT INTO compositecollation_t1 VALUES ('test', 9003)")
+
+	db, err := sql.Open("mysql", testutils.DSN())
+	assert.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	// Verify data count
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM compositecollation_t1").Scan(&count)
+	require.NoError(t, err)
+	t.Logf("Inserted %d rows for collation test", count)
+
+	// Verify MySQL's collation order vs Go's lexicographic order
+	var mysqlOrder []string
+	rows, err := db.Query("SELECT DISTINCT name FROM compositecollation_t1 ORDER BY name LIMIT 20")
+	assert.NoError(t, err)
+	for rows.Next() {
+		var name string
+		assert.NoError(t, rows.Scan(&name))
+		mysqlOrder = append(mysqlOrder, name)
+	}
+	assert.NoError(t, rows.Close())
+
+	// MySQL collation order (case-insensitive): KEY/Key/key variants grouped together
+	t.Logf("MySQL collation order (first 20): %v", mysqlOrder)
+	// Go's lexicographic order would be: KEY0001 < KEY0002 < ... < Key0001 < Key0002 < ... < key0001 < key0002
+	// (uppercase letters have lower byte values than lowercase in ASCII)
+
+	tbl := NewTableInfo(db, "test", "compositecollation_t1")
+	assert.NoError(t, tbl.SetInfo(t.Context()))
+
+	chunker, err := newChunker(tbl, ChunkerDefaultTarget, slog.Default())
+	assert.NoError(t, err)
+	comp := chunker.(*chunkerComposite)
+
+	assert.NoError(t, comp.Open())
+
+	// Get first chunk to establish the watermark
+	chunk1, err := comp.Next()
+	require.NoError(t, err)
+	require.NotNil(t, chunk1)
+	require.NotNil(t, chunk1.UpperBound)
+
+	// Provide feedback to set the watermark
+	comp.Feedback(chunk1, 100*time.Millisecond, 5)
+
+	// Now test the comparison difference:
+	// In Go: "KEY01" < "KEY02" < "Key01" < "key01" < "key02"
+	// In MySQL utf8mb4_0900_ai_ci: "KEY01" ≈ "Key01" ≈ "key01" < "KEY02" ≈ "key02"
+
+	t.Log("=== Demonstrating Comparison Differences ===")
+
+	// Verify watermark was set
+	require.NotNil(t, comp.watermark, "Watermark should be set after feedback")
+	watermarkVal := comp.watermark.UpperBound.Value[0].Val.(string)
+	t.Logf("Watermark upper bound: '%s'", watermarkVal)
+
+	// Test various strings against the watermark using Go comparison (what KeyBelowLowWatermark uses)
+	// Focus on the TEST/Test/test variants to show the comparison difference clearly
+	testStrings := []string{"TEST", "Test", "test", "KEY0001", "Key0001", "key0001"}
+	t.Log("Testing Go lexicographic comparison vs MySQL collation:")
+	for _, s := range testStrings {
+		goBelow := comp.KeyBelowLowWatermark(s)
+		t.Logf("  KeyBelowLowWatermark('%s'): %v (watermark='%s')", s, goBelow, watermarkVal)
+	}
+
+	// The key insight: If watermark is 'Key0050' (for example) and we use Go comparison:
+	// - ALL 'KEY*' strings would be below (uppercase K < lowercase k in byte order)
+	// - ALL 'key*' strings would be ABOVE (lowercase k > uppercase K in byte order)
+	// String comparison stops at first differing character, so the prefix determines the result
+	// But in MySQL collation, they're all equivalent in terms of case!
+
+	// Demonstrate the problem: A row that MySQL considers "already processed"
+	// would be classified by Go as "above watermark" and get buffered
+
+	// Assume we processed chunk ending at 'Key0100'
+	// In MySQL collation: 'KEY0050', 'Key0050', 'key0050' are all < 'Key0100' (already processed)
+	// In Go comparison: 'key0050' > 'Key0100' (would be buffered as "not yet processed")
+
+	// Verify this with actual comparison
+	testKey := "key0050"
+	if strings.HasPrefix(watermarkVal, "Key") {
+		isBelowWatermark := comp.KeyBelowLowWatermark(testKey)
+
+		// MySQL would consider this row already processed (case-insensitive: key0050 < Key0100)
+		// But Go thinks it's above the watermark (byte order: key > Key)
+		assert.False(t, isBelowWatermark,
+			"Go incorrectly classifies '%s' as above watermark '%s' (would buffer the change)",
+			testKey, watermarkVal)
+
+		t.Logf("DEMONSTRATED: Row '%s' would be buffered instead of applied immediately", testKey)
+		t.Logf("  - Go comparison: '%s' > '%s' (buffer it)", testKey, watermarkVal)
+		t.Logf("  - MySQL collation: '%s' ≈ '%s' (so the belief is that its already processed in earlier chunk)", testKey, strings.ToUpper(testKey))
+		t.Logf("  - Result: Binlog changes to this row would be held in memory until watermark advances")
+		t.Logf("  - Risk: Crash before flush = unflushed changes lost")
+		t.Logf("  - Safety: Checksum phase uses full table scans without watermarks")
+	}
+
+	assert.NoError(t, comp.Close())
+}
+
+// TestCompositeChunkerWatermarkWithOutOfOrderCompletion tests that watermark
+// correctly handles out-of-order chunk completion.
+func TestCompositeChunkerWatermarkWithOutOfOrderCompletion(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS compositewatermarkooo_t1")
+	testutils.RunSQL(t, `CREATE TABLE compositewatermarkooo_t1 (
+		a int NOT NULL primary key
+	)`)
+	// Insert test data - need at least 3000 rows to ensure 3+ chunks with StartingChunkSize=1000
+	// Generate in batches to avoid CTE recursion depth limit
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkooo_t1 (a)
+		WITH RECURSIVE seq AS (
+			SELECT 1 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 1000
+		)
+		SELECT n FROM seq`)
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkooo_t1 (a)
+		WITH RECURSIVE seq AS (
+			SELECT 1001 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 2000
+		)
+		SELECT n FROM seq`)
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkooo_t1 (a)
+		WITH RECURSIVE seq AS (
+			SELECT 2001 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 3000
+		)
+		SELECT n FROM seq`)
+	testutils.RunSQL(t, `INSERT INTO compositewatermarkooo_t1 (a)
+		WITH RECURSIVE seq AS (
+			SELECT 3001 AS n
+			UNION ALL
+			SELECT n + 1 FROM seq WHERE n < 3500
+		)
+		SELECT n FROM seq`)
+
+	db, err := sql.Open("mysql", testutils.DSN())
+	assert.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	tbl := NewTableInfo(db, "test", "compositewatermarkooo_t1")
+	assert.NoError(t, tbl.SetInfo(t.Context()))
+
+	chunker, err := newChunker(tbl, ChunkerDefaultTarget, slog.Default())
+	assert.NoError(t, err)
+	comp := chunker.(*chunkerComposite)
+
+	assert.NoError(t, comp.Open())
+
+	// Get three chunks - need this many to test out-of-order completion
+	chunk1, err := comp.Next()
+	require.NoError(t, err)
+	require.NotNil(t, chunk1, "Should have at least 1 chunk")
+	chunk2, err := comp.Next()
+	require.NoError(t, err)
+	require.NotNil(t, chunk2, "Should have at least 2 chunks")
+	chunk3, err := comp.Next()
+	require.NoError(t, err)
+	require.NotNil(t, chunk3, "Should have at least 3 chunks")
+
+	// Simulate out-of-order completion: chunk2, then chunk1, then chunk3
+
+	// Complete chunk2 first (out of order)
+	comp.Feedback(chunk2, 100*time.Millisecond, 1000)
+
+	// Watermark should still be nil because chunk1 hasn't completed
+	assert.Nil(t, comp.watermark)
+
+	// Keys in chunk2 range should not be below watermark yet (chunk1 hasn't completed)
+	// chunk1 is the first chunk (no LowerBound), chunk2 is second (has LowerBound)
+	if chunk2.LowerBound != nil && len(chunk2.LowerBound.Value) > 0 {
+		chunk2Lower := int(chunk2.LowerBound.Value[0].Val.(int64))
+		assert.False(t, comp.KeyBelowLowWatermark(chunk2Lower), "Keys in chunk2 should not be below watermark until chunk1 completes")
+	}
+
+	// Complete chunk1 (the first chunk, which aligns with nil watermark)
+	comp.Feedback(chunk1, 100*time.Millisecond, 1000)
+
+	// Now watermark should advance through both chunk1 and chunk2 (cascade)
+	require.NotNil(t, comp.watermark)
+	require.NotNil(t, chunk2.UpperBound, "chunk2.UpperBound should not be nil")
+	require.NotEmpty(t, chunk2.UpperBound.Value, "chunk2.UpperBound.Value should not be empty")
+	chunk2Upper := int(chunk2.UpperBound.Value[0].Val.(int64))
+
+	// Extract chunk1Lower - chunk1 is the first chunk so use a value from its range
+	// Since chunk1 starts from the beginning, use 1 (first row)
+	chunk1Lower := 1
+
+	// Keys up to chunk2's upper bound should now be below watermark
+	assert.True(t, comp.KeyBelowLowWatermark(chunk1Lower))
+	assert.True(t, comp.KeyBelowLowWatermark(chunk2Upper-1))
+
+	// chunk3 range should not be below yet
+	require.NotNil(t, chunk3.LowerBound, "chunk3.LowerBound should not be nil")
+	require.NotEmpty(t, chunk3.LowerBound.Value, "chunk3.LowerBound.Value should not be empty")
+	chunk3Lower := int(chunk3.LowerBound.Value[0].Val.(int64))
+	assert.False(t, comp.KeyBelowLowWatermark(chunk3Lower))
+
+	// Complete chunk3
+	comp.Feedback(chunk3, 100*time.Millisecond, 1000)
+
+	// Now chunk3 range should be below watermark
+	assert.True(t, comp.KeyBelowLowWatermark(chunk3Lower))
+
+	assert.NoError(t, comp.Close())
 }

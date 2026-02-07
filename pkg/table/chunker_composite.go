@@ -481,16 +481,77 @@ func (t *chunkerComposite) Progress() (uint64, uint64, uint64) {
 	return atomic.LoadUint64(&t.rowsCopied), atomic.LoadUint64(&t.chunksCopied), atomic.LoadUint64(&t.Ti.EstimatedRows)
 }
 
-// KeyAboveHighWatermark is not yet supported for composite chunker.
+// KeyAboveHighWatermark checks if a key is above the high watermark (chunkPtr).
+// This optimization works with comparable types in key[0] (first column): numeric, string, binary, temporal.
+// For VARCHAR/TEXT with collations, Go's byte-order comparison may differ from MySQL's collation order
+// (e.g., 'aa' = 'AA' in utf8mb4_0900_ai_ci, or "ch" > "h" in utf8mb4_czech_ci), which can cause
+// events to be incorrectly discarded or buffered. However, checksum will fix any discrepancies.
+// Binary types use byte-order comparison matching Go, so they work correctly.
+// Note: Watermark optimizations are disabled before checksum phase (see runner.go).
 // See: https://github.com/block/spirit/issues/479
 func (t *chunkerComposite) KeyAboveHighWatermark(key0 any) bool {
-	return false
+	t.Lock()
+	defer t.Unlock()
+
+	// If we haven't dispatched any chunks yet (chunkPtrs is empty),
+	// everything is "above" the high watermark (we haven't started copying yet)
+	// Return true to discard binlog events that are ahead of our progress
+	if len(t.chunkPtrs) == 0 {
+		return true
+	}
+
+	// If we've sent the final chunk, nothing is above
+	if t.finalChunkSent {
+		return false
+	}
+
+	// Convert key0 to Datum for comparison
+	keyDatum, err := NewDatum(key0, t.chunkPtrs[0].Tp)
+	if err != nil {
+		// If we can't convert the key, return false to be safe (don't discard the row)
+		t.logger.Error("failed to create datum in KeyAboveHighWatermark", "key", key0, "error", err)
+		return false
+	}
+
+	// Check if key is greater than or equal to the current chunkPtr[0]
+	// Use GreaterThanOrEqual which supports all types (numeric, string, temporal)
+	return keyDatum.GreaterThanOrEqual(t.chunkPtrs[0])
 }
 
-// KeyBelowLowWatermark is not yet supported for composite chunker.
+// KeyBelowLowWatermark checks if a key is below the low watermark.
+// This optimization works with comparable types in key[0] (first column): numeric, string, binary, temporal.
+// For VARCHAR/TEXT with collations, Go's byte-order comparison may differ from MySQL's collation order
+// (e.g., 'aa' = 'AA' in utf8mb4_0900_ai_ci, or "ch" > "h" in utf8mb4_czech_ci), which can cause
+// events to be incorrectly discarded or buffered with delayed flush. However, checksum will fix any discrepancies.
+// Binary types use byte-order comparison matching Go, so they work correctly.
+// Note: Watermark optimizations are disabled before checksum phase (see runner.go).
 // See: https://github.com/block/spirit/issues/479
 func (t *chunkerComposite) KeyBelowLowWatermark(key0 any) bool {
-	return true
+	t.Lock()
+	defer t.Unlock()
+
+	// If we've sent the final chunk, everything is below
+	if t.finalChunkSent {
+		return true
+	}
+
+	// If watermark isn't ready yet, return false (nothing has been confirmed as copied yet)
+	if t.watermark == nil || t.watermark.UpperBound == nil || len(t.watermark.UpperBound.Value) == 0 {
+		return false
+	}
+
+	// Convert key0 to Datum for comparison
+	keyDatum, err := NewDatum(key0, t.watermark.UpperBound.Value[0].Tp)
+	if err != nil {
+		// If we can't convert the key, return false (assume not below watermark)
+		t.logger.Error("failed to create keyDatum in KeyBelowLowWatermark", "key", key0, "error", err)
+		return false
+	}
+
+	// Key is below watermark if watermark.UpperBound[0] > key
+	// Use GreaterThan which supports all types (numeric, string, temporal)
+	// t.watermark.UpperBound represents the maximum value that has been safely copied in that chunk
+	return t.watermark.UpperBound.Value[0].GreaterThan(keyDatum)
 }
 
 // SetKey allows you to chunk on a secondary index, and not the primary key.

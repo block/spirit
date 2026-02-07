@@ -568,15 +568,15 @@ func (t *chunkerOptimistic) KeyBelowLowWatermark(key0 any) bool {
 	// upperBound to the key to decide what to return.
 	keyDatum, err := NewDatum(key0, t.chunkPtr.Tp)
 	if err != nil {
-		// If we can't convert the key, return false to be safe (assume it's not below watermark)
+		// If we can't convert the key, return true to be safe (buffer everything)
 		t.logger.Error("failed to create keyDatum in KeyBelowLowWatermark", "key", key0, "error", err)
-		return false
+		return true
 	}
 	watermarkDatum, err := NewDatum(t.watermark.UpperBound.Value[0].Val, t.chunkPtr.Tp)
 	if err != nil {
-		// If we can't convert the watermark, return false to be safe
+		// If we can't convert the watermark, return true to be safe (buffer everything)
 		t.logger.Error("failed to create watermarkDatum in KeyBelowLowWatermark", "error", err)
-		return false
+		return true
 	}
 	return watermarkDatum.GreaterThan(keyDatum)
 }
