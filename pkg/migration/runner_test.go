@@ -3,6 +3,7 @@ package migration
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1670,6 +1671,16 @@ func TestDeferCutOverE2E(t *testing.T) {
 	dropStmt := `DROP TABLE IF EXISTS %s`
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(dropStmt, tableName))
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(dropStmt, checkpointTableName))
+
+	// Add cleanup handler to guarantee table cleanup even on failure/timeout
+	t.Cleanup(func() {
+		db, _ := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+		defer func() { _ = db.Close() }()
+		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(
+			"DROP TABLE IF EXISTS %s, _%s_new, _%s_old, _%s_chkpnt, %s",
+			tableName, tableName, tableName, tableName, sentinelTableName))
+	})
+
 	table := fmt.Sprintf(`CREATE TABLE %s (id bigint unsigned not null auto_increment, primary key(id))`, tableName)
 
 	testutils.RunSQLInDatabase(t, dbName, table)
@@ -1740,6 +1751,16 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 	dropStmt := `DROP TABLE IF EXISTS %s`
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(dropStmt, tableName))
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(dropStmt, checkpointTableName))
+
+	// Add cleanup handler to guarantee table cleanup even on failure/timeout
+	t.Cleanup(func() {
+		db, _ := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+		defer func() { _ = db.Close() }()
+		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(
+			"DROP TABLE IF EXISTS %s, _%s_new, _%s_old, _%s_chkpnt, %s",
+			tableName, tableName, tableName, tableName, sentinelTableName))
+	})
+
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(`CREATE TABLE %s (id bigint unsigned not null auto_increment, primary key(id))`, tableName))
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("insert into %s () values (),(),(),(),(),(),(),(),(),()", tableName))
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("insert into %s (id) select null from %s a, %s b, %s c limit 1000", tableName, tableName, tableName, tableName))
@@ -1769,7 +1790,18 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 	db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
 	assert.NoError(t, err)
 	defer utils.CloseAndLog(db)
+
+	// Wait for WaitingOnSentinelTable status with timeout
+	timeout := time.After(30 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 	for m.status.Get() != status.WaitingOnSentinelTable {
+		select {
+		case <-ticker.C:
+			continue
+		case <-timeout:
+			t.Fatal("timeout waiting for WaitingOnSentinelTable status")
+		}
 	}
 	assert.NoError(t, err)
 

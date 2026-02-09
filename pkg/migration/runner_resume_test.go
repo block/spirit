@@ -2,6 +2,7 @@ package migration
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -965,6 +966,16 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	lockTables := []*table.TableInfo{&tableInfo}
 
 	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(`DROP TABLE IF EXISTS %s, _%s_old, _%s_chkpnt`, tableName, tableName, tableName))
+
+	// Add cleanup handler to guarantee table cleanup even on failure/timeout
+	t.Cleanup(func() {
+		db, _ := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+		defer func() { _ = db.Close() }()
+		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(
+			"DROP TABLE IF EXISTS %s, _%s_new, _%s_old, _%s_chkpnt, _spirit_sentinel",
+			tableName, tableName, tableName, tableName))
+	})
+
 	table := fmt.Sprintf(`CREATE TABLE %s (
 		id int(11) NOT NULL AUTO_INCREMENT,
 		pad varbinary(1024) NOT NULL,
