@@ -14,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/migration/check"
+	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -2295,6 +2296,92 @@ func TestPasswordMasking(t *testing.T) {
 			t.Parallel()
 			result := maskPasswordInDSN(tt.input)
 			assert.Equal(t, tt.expected, result, "Password masking failed for input: %s", tt.input)
+		})
+	}
+}
+
+func TestDSN(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		user     string
+		password string
+		host     string
+		schema   string
+	}{
+		{
+			name:     "simple password",
+			user:     "root",
+			password: "secret",
+			host:     "127.0.0.1:3306",
+			schema:   "testdb",
+		},
+		{
+			name:     "password with @",
+			user:     "root",
+			password: "p@ssword",
+			host:     "127.0.0.1:3306",
+			schema:   "testdb",
+		},
+		{
+			name:     "password with multiple @",
+			user:     "root",
+			password: "p@ss@word",
+			host:     "127.0.0.1:3306",
+			schema:   "testdb",
+		},
+		{
+			name:     "password with special characters",
+			user:     "root",
+			password: "p@ss:word/with#special!chars",
+			host:     "127.0.0.1:3306",
+			schema:   "testdb",
+		},
+		{
+			name:     "empty password",
+			user:     "root",
+			password: "",
+			host:     "127.0.0.1:3306",
+			schema:   "testdb",
+		},
+		{
+			name:     "AWS IAM-style token",
+			user:     "iam_user",
+			password: "aaa@bbb.ccc.us-east-1.rds.amazonaws.com:3306/?Action=connect&DBUser=iam_user",
+			host:     "mydb.cluster-xyz.us-east-1.rds.amazonaws.com:3306",
+			schema:   "production",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pw := tt.password
+			r := &Runner{
+				migration: &Migration{
+					Username: tt.user,
+					Password: &pw,
+					Host:     tt.host,
+				},
+				changes: []*change{
+					{
+						stmt: &statement.AbstractStatement{
+							Schema: tt.schema,
+						},
+					},
+				},
+			}
+
+			dsn := r.dsn()
+
+			// Parse the DSN back and verify all fields round-trip correctly.
+			cfg, err := mysql.ParseDSN(dsn)
+			require.NoError(t, err)
+			assert.Equal(t, tt.user, cfg.User)
+			assert.Equal(t, tt.password, cfg.Passwd)
+			assert.Equal(t, tt.host, cfg.Addr)
+			assert.Equal(t, tt.schema, cfg.DBName)
+			assert.Equal(t, "tcp", cfg.Net)
 		})
 	}
 }

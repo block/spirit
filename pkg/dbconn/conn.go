@@ -7,7 +7,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -197,7 +196,6 @@ func getTLSConfigName(mode string) string {
 // It accepts a DSN as input and appends TLS configuration
 // based on the provided configuration and host detection.
 func newDSN(dsn string, config *DBConfig) (string, error) {
-	var ops []string
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", err
@@ -209,11 +207,14 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 		return dsn, nil
 	}
 
-	// Check if DSN already has tls parameter in query string (case insensitive)
-	lowerDSN := strings.ToLower(dsn)
-	if strings.Contains(lowerDSN, "tls=") {
-		// DSN already has explicit TLS parameter - use it as-is
-		return dsn, nil
+	// Check if DSN already has tls parameter in Params (from query string)
+	if cfg.Params != nil {
+		for key := range cfg.Params {
+			if strings.EqualFold(key, "tls") {
+				// DSN already has explicit TLS parameter - use it as-is
+				return dsn, nil
+			}
+		}
 	}
 
 	// Determine TLS configuration strategy based on SSL mode
@@ -228,21 +229,19 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 			if err = initCustomTLS(config); err != nil {
 				return "", err
 			}
-			configName := getTLSConfigName(config.TLSMode)
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
+			cfg.TLSConfig = getTLSConfigName(config.TLSMode)
 		} else if IsRDSHost(cfg.Addr) {
 			// Use RDS certificate for RDS hosts
 			if err = initRDSTLS(); err != nil {
 				return "", err
 			}
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
+			cfg.TLSConfig = rdsTLSConfigName
 		} else {
 			// Use embedded RDS bundle as fallback for non-RDS hosts
 			if err = initCustomTLS(config); err != nil {
 				return "", err
 			}
-			configName := getTLSConfigName(config.TLSMode)
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
+			cfg.TLSConfig = getTLSConfigName(config.TLSMode)
 		}
 
 	case "PREFERRED":
@@ -255,17 +254,17 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 			if err = initRDSTLS(); err != nil {
 				return "", err
 			}
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(rdsTLSConfigName)))
+			cfg.TLSConfig = rdsTLSConfigName
 		} else {
 			// Use embedded RDS bundle as fallback for non-RDS hosts
 			if err = initCustomTLS(config); err != nil {
 				return "", err
 			}
-			configName := getTLSConfigName(config.TLSMode)
-			ops = append(ops, fmt.Sprintf("%s=%s", "tls", url.QueryEscape(configName)))
+			cfg.TLSConfig = getTLSConfigName(config.TLSMode)
 		}
 	}
 
+	// Set session variables via Params map.
 	// Setting sql_mode looks ill-advised, but unfortunately it's required.
 	// A user might have set their SQL mode to empty even if the
 	// server has it enabled. After they've inserted data,
@@ -273,32 +272,33 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	// If you look at standard packages like wordpress, drupal etc.
 	// they all change the SQL mode. If you look at mysqldump, etc.
 	// they all unset the SQL mode just like this.
-	ops = append(ops, fmt.Sprintf("%s=%s", "sql_mode", url.QueryEscape(`""`)))
-	ops = append(ops, fmt.Sprintf("%s=%s", "time_zone", url.QueryEscape(`"+00:00"`)))
-	ops = append(ops, fmt.Sprintf("%s=%s", "innodb_lock_wait_timeout", url.QueryEscape(strconv.Itoa(config.InnodbLockWaitTimeout))))
-	ops = append(ops, fmt.Sprintf("%s=%s", "lock_wait_timeout", url.QueryEscape(strconv.Itoa(config.LockWaitTimeout))))
-	ops = append(ops, fmt.Sprintf("%s=%s", "range_optimizer_max_mem_size", url.QueryEscape(strconv.FormatInt(config.RangeOptimizerMaxMemSize, 10))))
-	ops = append(ops, fmt.Sprintf("%s=%s", "transaction_isolation", url.QueryEscape(`"read-committed"`)))
-	// go driver options, should set:
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string)
+	}
+	cfg.Params["sql_mode"] = `""`
+	cfg.Params["time_zone"] = `"+00:00"`
+	cfg.Params["innodb_lock_wait_timeout"] = strconv.Itoa(config.InnodbLockWaitTimeout)
+	cfg.Params["lock_wait_timeout"] = strconv.Itoa(config.LockWaitTimeout)
+	cfg.Params["range_optimizer_max_mem_size"] = strconv.FormatInt(config.RangeOptimizerMaxMemSize, 10)
+	cfg.Params["transaction_isolation"] = `"read-committed"`
+	// go driver charset option, sets:
 	// character_set_client, character_set_connection, character_set_results
-	ops = append(ops, fmt.Sprintf("%s=%s", "charset", "utf8mb4"))
-	ops = append(ops, fmt.Sprintf("%s=%s", "collation", "utf8mb4_bin"))
+	cfg.Params["charset"] = "utf8mb4"
+
+	// Set driver options directly on the config struct.
+	cfg.Collation = "utf8mb4_bin"
 	// So that we recycle the connection if we inadvertently connect to an old primary which is now a read only replica.
 	// This behaviour has been observed during blue/green upgrades and failover on AWS Aurora.
 	// See also: https://github.com/go-sql-driver/mysql?tab=readme-ov-file#rejectreadonly
-	ops = append(ops, fmt.Sprintf("%s=%s", "rejectReadOnly", "true"))
-	// Set interpolateParams
-	ops = append(ops, fmt.Sprintf("%s=%t", "interpolateParams", config.InterpolateParams))
+	cfg.RejectReadOnly = true
+	cfg.InterpolateParams = config.InterpolateParams
 	// Allow mysql_native_password authentication
-	ops = append(ops, fmt.Sprintf("%s=%s", "allowNativePasswords", "true"))
+	cfg.AllowNativePasswords = true
+	// Allow cleartext password authentication (required for AWS RDS IAM auth).
+	// This is safe because the connection uses TLS when cleartext auth is needed.
+	cfg.AllowCleartextPasswords = true
 
-	// Check if DSN already has query parameters
-	separator := "?"
-	if strings.Contains(dsn, "?") {
-		separator = "&"
-	}
-	dsn = fmt.Sprintf("%s%s%s", dsn, separator, strings.Join(ops, "&"))
-	return dsn, nil
+	return cfg.FormatDSN(), nil
 }
 
 // New is similar to sql.Open except we take the inputDSN and
@@ -336,13 +336,11 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 			_ = db.Close()
 		}
 
-		// TLS failed, try without TLS by explicitly removing TLS parameters
+		// TLS failed, try without TLS by stripping TLS and re-enriching
 		configCopy := *config
 		configCopy.TLSMode = "DISABLED"
 
-		// For fallback, we need to strip any existing TLS parameters from the DSN
-		// because the TLS parameter preservation logic will otherwise keep them
-		fallbackDSN, err := createFallbackDSN(inputDSN)
+		fallbackDSN, err := newDSN(inputDSN, &configCopy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create fallback DSN for %s connection: %w", connectionType, err)
 		}
@@ -397,10 +395,13 @@ func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 		return inputDSN, nil
 	}
 
-	// Check if DSN already has tls parameter in query string (case insensitive)
-	lowerDSN := strings.ToLower(inputDSN)
-	if strings.Contains(lowerDSN, "tls=") {
-		return inputDSN, nil
+	// Check if DSN already has tls parameter in Params (from query string)
+	if cfg.Params != nil {
+		for key := range cfg.Params {
+			if strings.EqualFold(key, "tls") {
+				return inputDSN, nil
+			}
+		}
 	}
 
 	// Enhance DSN with TLS settings from main config
@@ -455,12 +456,10 @@ func addTLSParametersToDSN(dsn string, config *DBConfig) (string, error) {
 		tlsParam = customTLSConfigName
 	}
 
-	// Add TLS parameter to DSN
-	separator := "?"
-	if strings.Contains(dsn, "?") {
-		separator = "&"
-	}
-	return fmt.Sprintf("%s%stls=%s", dsn, separator, url.QueryEscape(tlsParam)), nil
+	// Add TLS parameter to DSN via parsed config to avoid issues with
+	// special characters (e.g. ? or &) in the password
+	cfg.TLSConfig = tlsParam
+	return cfg.FormatDSN(), nil
 }
 
 // createFallbackDSN creates a DSN with all TLS parameters removed for PREFERRED mode fallback
@@ -476,9 +475,8 @@ func createFallbackDSN(inputDSN string) (string, error) {
 
 	// Remove tls parameter from params if present (case-insensitive)
 	if cfg.Params != nil {
-		// Remove 'tls' parameter in any case variation
 		for key := range cfg.Params {
-			if strings.ToLower(key) == "tls" {
+			if strings.EqualFold(key, "tls") {
 				delete(cfg.Params, key)
 			}
 		}
