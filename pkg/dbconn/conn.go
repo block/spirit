@@ -207,20 +207,11 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 		return dsn, nil
 	}
 
-	// Check if DSN already has tls parameter in Params (from query string)
-	if cfg.Params != nil {
-		for key := range cfg.Params {
-			if strings.EqualFold(key, "tls") {
-				// DSN already has explicit TLS parameter - use it as-is
-				return dsn, nil
-			}
-		}
-	}
-
 	// Determine TLS configuration strategy based on SSL mode
 	switch strings.ToUpper(config.TLSMode) {
 	case "DISABLED":
-		// No TLS - don't add any TLS parameters
+		// No TLS - explicitly clear any TLS configuration
+		cfg.TLSConfig = ""
 
 	case "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY":
 		// TLS with certificate selection - determine which certificate to use
@@ -294,9 +285,9 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	cfg.InterpolateParams = config.InterpolateParams
 	// Allow mysql_native_password authentication
 	cfg.AllowNativePasswords = true
-	// Allow cleartext password authentication (required for AWS RDS IAM auth).
-	// This is safe because the connection uses TLS when cleartext auth is needed.
-	cfg.AllowCleartextPasswords = true
+	// Allow cleartext password authentication only when TLS is configured
+	// (required for AWS RDS IAM auth, safe because the connection uses TLS).
+	cfg.AllowCleartextPasswords = cfg.TLSConfig != ""
 
 	return cfg.FormatDSN(), nil
 }
@@ -395,15 +386,6 @@ func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 		return inputDSN, nil
 	}
 
-	// Check if DSN already has tls parameter in Params (from query string)
-	if cfg.Params != nil {
-		for key := range cfg.Params {
-			if strings.EqualFold(key, "tls") {
-				return inputDSN, nil
-			}
-		}
-	}
-
 	// Enhance DSN with TLS settings from main config
 	return addTLSParametersToDSN(inputDSN, config)
 }
@@ -459,30 +441,6 @@ func addTLSParametersToDSN(dsn string, config *DBConfig) (string, error) {
 	// Add TLS parameter to DSN via parsed config to avoid issues with
 	// special characters (e.g. ? or &) in the password
 	cfg.TLSConfig = tlsParam
-	return cfg.FormatDSN(), nil
-}
-
-// createFallbackDSN creates a DSN with all TLS parameters removed for PREFERRED mode fallback
-func createFallbackDSN(inputDSN string) (string, error) {
-	cfg, err := mysql.ParseDSN(inputDSN)
-	if err != nil {
-		// Return original DSN for graceful degradation when parsing fails
-		return inputDSN, nil //nolint:nilerr // Intentional graceful degradation
-	}
-
-	// Remove TLS configuration - both from TLSConfig field and params
-	cfg.TLSConfig = ""
-
-	// Remove tls parameter from params if present (case-insensitive)
-	if cfg.Params != nil {
-		for key := range cfg.Params {
-			if strings.EqualFold(key, "tls") {
-				delete(cfg.Params, key)
-			}
-		}
-	}
-
-	// Format the DSN back without TLS parameters
 	return cfg.FormatDSN(), nil
 }
 

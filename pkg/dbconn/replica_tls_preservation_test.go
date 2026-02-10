@@ -322,11 +322,11 @@ func TestTLSParameterEdgeCases(t *testing.T) {
 		description string
 	}{
 		{
-			name:        "Mixed case TLS parameter preserved",
+			name:        "Mixed case TLS parameter not recognized by ParseDSN",
 			dsn:         "user:pass@tcp(host:3306)/db?TLS=false",
 			config:      &DBConfig{TLSMode: "REQUIRED"},
-			expected:    "user:pass@tcp(host:3306)/db?TLS=false",
-			description: "Mixed case TLS parameter should be preserved",
+			expected:    "user:pass@tcp(host:3306)/db?tls=required&TLS=false",
+			description: "Mixed case TLS parameter is not recognized by ParseDSN, so TLS config is added",
 		},
 		{
 			name:        "TLS in middle of query params",

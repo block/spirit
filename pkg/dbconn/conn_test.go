@@ -73,11 +73,38 @@ func TestNewDSN(t *testing.T) {
 	assert.NoError(t, err)
 	assertDSNConfig(t, resp, "iam_user", iamToken, "host.docker.internal:8410", "mydb", "custom", false)
 
+	// DSN with explicit tls parameter should be preserved as-is
+	dsn = "root:password@tcp(127.0.0.1:3306)/test?tls=skip-verify"
+	resp, err = newDSN(dsn, NewDBConfig())
+	assert.NoError(t, err)
+	assert.Equal(t, dsn, resp, "DSN with explicit tls parameter should be returned unchanged")
+
 	// Invalid DSN, can't parse.
 	dsn = "invalid"
 	resp, err = newDSN(dsn, NewDBConfig())
 	assert.Error(t, err)
 	assert.Empty(t, resp)
+}
+
+func TestNewDSNAllowCleartextPasswords(t *testing.T) {
+	// With TLS enabled (default PREFERRED mode), AllowCleartextPasswords should be true
+	dsn := "root:password@tcp(127.0.0.1:3306)/test"
+	resp, err := newDSN(dsn, NewDBConfig())
+	assert.NoError(t, err)
+	cfg, err := mysql.ParseDSN(resp)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, cfg.TLSConfig, "TLS should be configured in default mode")
+	assert.True(t, cfg.AllowCleartextPasswords, "AllowCleartextPasswords should be true when TLS is enabled")
+
+	// With TLS disabled, AllowCleartextPasswords should be false
+	config := NewDBConfig()
+	config.TLSMode = "DISABLED"
+	resp, err = newDSN(dsn, config)
+	assert.NoError(t, err)
+	cfg, err = mysql.ParseDSN(resp)
+	assert.NoError(t, err)
+	assert.Empty(t, cfg.TLSConfig, "TLS should not be configured in DISABLED mode")
+	assert.False(t, cfg.AllowCleartextPasswords, "AllowCleartextPasswords should be false when TLS is disabled")
 }
 
 func TestNewConn(t *testing.T) {
