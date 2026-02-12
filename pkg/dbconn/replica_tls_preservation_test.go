@@ -336,11 +336,11 @@ func TestTLSParameterEdgeCases(t *testing.T) {
 			description: "TLS parameter in middle of query string should be preserved",
 		},
 		{
-			name:        "Empty TLS value",
+			name:        "Empty TLS value treated as unset",
 			dsn:         "user:pass@tcp(host:3306)/db?tls=",
 			config:      &DBConfig{TLSMode: "REQUIRED"},
-			expected:    "user:pass@tcp(host:3306)/db?tls=",
-			description: "Empty TLS value should be preserved",
+			expected:    "user:pass@tcp(host:3306)/db?tls=required",
+			description: "Empty TLS value is indistinguishable from unset after ParseDSN, so TLS config is applied",
 		},
 		{
 			name:        "URL encoded TLS value",
