@@ -728,6 +728,8 @@ func TestPREFERREDModeDISABLEDFallback(t *testing.T) {
 	assert.NotContains(t, disabledDSN, "tls=", "DISABLED fallback should not include any TLS config")
 
 	// Both should have the same non-TLS parameters
+	// Note: allowNativePasswords is set to true in newDSN, but since true is the
+	// go-mysql-driver default, FormatDSN() omits it from the DSN string.
 	expectedParams := []string{
 		"sql_mode=",
 		"time_zone=",
@@ -737,7 +739,6 @@ func TestPREFERREDModeDISABLEDFallback(t *testing.T) {
 		"collation=utf8mb4_bin",
 		"rejectReadOnly=true",
 		"interpolateParams=true",
-		"allowNativePasswords=true",
 	}
 
 	for _, param := range expectedParams {

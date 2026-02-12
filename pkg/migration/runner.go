@@ -428,7 +428,13 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 }
 
 func (r *Runner) dsn() string {
-	return fmt.Sprintf("%s:%s@tcp(%s)/%s", r.migration.Username, *r.migration.Password, r.migration.Host, r.changes[0].stmt.Schema)
+	cfg := mysql.NewConfig()
+	cfg.User = r.migration.Username
+	cfg.Passwd = *r.migration.Password
+	cfg.Net = "tcp"
+	cfg.Addr = r.migration.Host
+	cfg.DBName = r.changes[0].stmt.Schema
+	return cfg.FormatDSN()
 }
 
 // maskPasswordInDSN masks the password in any DSN string for safe logging
