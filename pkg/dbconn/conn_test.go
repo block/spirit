@@ -73,11 +73,11 @@ func TestNewDSN(t *testing.T) {
 	assert.NoError(t, err)
 	assertDSNConfig(t, resp, "iam_user", iamToken, "host.docker.internal:8410", "mydb", "custom", false)
 
-	// DSN with explicit tls parameter should be preserved as-is
+	// DSN with explicit tls parameter — TLS config preserved, but session vars still applied
 	dsn = "root:password@tcp(127.0.0.1:3306)/test?tls=skip-verify"
 	resp, err = newDSN(dsn, NewDBConfig())
 	assert.NoError(t, err)
-	assert.Equal(t, dsn, resp, "DSN with explicit tls parameter should be returned unchanged")
+	assertDSNConfig(t, resp, "root", "password", "127.0.0.1:3306", "test", "skip-verify", false)
 
 	// Invalid DSN, can't parse.
 	dsn = "invalid"

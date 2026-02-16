@@ -201,13 +201,9 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 		return "", err
 	}
 
-	// If DSN already has TLS configuration, respect it and don't override
-	if cfg.TLSConfig != "" {
-		// DSN already has explicit TLS configuration - use it as-is
-		return dsn, nil
-	}
-
-	// Determine TLS configuration strategy based on SSL mode
+	// Determine TLS configuration strategy based on SSL mode,
+	// but only if the DSN doesn't already have explicit TLS configuration.
+	if cfg.TLSConfig == "" {
 	switch strings.ToUpper(config.TLSMode) {
 	case "DISABLED":
 		// No TLS - explicitly clear any TLS configuration
@@ -254,6 +250,7 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 			cfg.TLSConfig = getTLSConfigName(config.TLSMode)
 		}
 	}
+	} // end if cfg.TLSConfig == ""
 
 	// Set session variables via Params map.
 	// Setting sql_mode looks ill-advised, but unfortunately it's required.
@@ -395,6 +392,11 @@ func addTLSParametersToDSN(dsn string, config *DBConfig) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return dsn, err // Return original DSN with error if parsing fails
+	}
+
+	// If DSN already has explicit TLS configuration, preserve it
+	if cfg.TLSConfig != "" {
+		return cfg.FormatDSN(), nil
 	}
 
 	// Initialize TLS configurations if needed

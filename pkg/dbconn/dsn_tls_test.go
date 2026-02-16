@@ -379,17 +379,23 @@ func TestNewDSNTLSPreservation(t *testing.T) {
 				t.Fatalf("newDSN failed: %v", err)
 			}
 
+			inputCfg, _ := mysql.ParseDSN(tt.inputDSN)
+			resultCfg, err := mysql.ParseDSN(result)
+			assert.NoError(t, err)
+
 			if tt.expectSame {
-				assert.Equal(t, tt.inputDSN, result, tt.description)
+				// TLS config from the input DSN should be preserved
+				assert.Equal(t, inputCfg.TLSConfig, resultCfg.TLSConfig, tt.description)
+				// Session variables should still be applied
+				assert.NotEmpty(t, resultCfg.Params["sql_mode"], "session variables should be applied even when TLS is preserved")
 			} else {
-				assert.NotEqual(t, tt.inputDSN, result, tt.description)
 				// For REQUIRED mode, verify that TLS was actually added
 				if tt.config.TLSMode == "REQUIRED" {
-					assert.Contains(t, result, "tls=", "Expected TLS parameter to be added to DSN")
+					assert.NotEmpty(t, resultCfg.TLSConfig, "Expected TLS config to be set")
 				}
 				// For DISABLED mode, verify that TLS was NOT added
 				if tt.config.TLSMode == "DISABLED" {
-					assert.NotContains(t, result, "tls=", "TLS parameter should not be added when disabled")
+					assert.Empty(t, resultCfg.TLSConfig, "TLS config should not be set when disabled")
 				}
 			}
 		})
