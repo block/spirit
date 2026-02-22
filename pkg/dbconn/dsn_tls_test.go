@@ -1,9 +1,11 @@
 package dbconn
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -216,8 +218,8 @@ func TestEnhanceDSNWithTLS_EdgeCases(t *testing.T) {
 				cfg.TLSMode = "REQUIRED"
 				return cfg
 			}(),
-			expectedResult: "user:pass@tcp(localhost:3306)/db?TLS=skip-verify",
-			description:    "Mixed case TLS parameter should be preserved",
+			expectedResult: "user:pass@tcp(localhost:3306)/db?tls=required&TLS=skip-verify",
+			description:    "Mixed case TLS parameter is not recognized by ParseDSN, so TLS config is added",
 		},
 		{
 			name:     "Empty DSN should be handled gracefully",
@@ -377,19 +379,97 @@ func TestNewDSNTLSPreservation(t *testing.T) {
 				t.Fatalf("newDSN failed: %v", err)
 			}
 
+			inputCfg, _ := mysql.ParseDSN(tt.inputDSN)
+			resultCfg, err := mysql.ParseDSN(result)
+			assert.NoError(t, err)
+
 			if tt.expectSame {
-				assert.Equal(t, tt.inputDSN, result, tt.description)
+				// TLS config from the input DSN should be preserved
+				assert.Equal(t, inputCfg.TLSConfig, resultCfg.TLSConfig, tt.description)
+				// Session variables should still be applied
+				assert.NotEmpty(t, resultCfg.Params["sql_mode"], "session variables should be applied even when TLS is preserved")
 			} else {
-				assert.NotEqual(t, tt.inputDSN, result, tt.description)
 				// For REQUIRED mode, verify that TLS was actually added
 				if tt.config.TLSMode == "REQUIRED" {
-					assert.Contains(t, result, "tls=", "Expected TLS parameter to be added to DSN")
+					assert.NotEmpty(t, resultCfg.TLSConfig, "Expected TLS config to be set")
 				}
 				// For DISABLED mode, verify that TLS was NOT added
 				if tt.config.TLSMode == "DISABLED" {
-					assert.NotContains(t, result, "tls=", "TLS parameter should not be added when disabled")
+					assert.Empty(t, resultCfg.TLSConfig, "TLS config should not be set when disabled")
 				}
 			}
+		})
+	}
+}
+
+func TestEnhanceDSNWithTLS_SpecialCharPasswords(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), "test-cert-*.pem")
+	require.NoError(t, err)
+	certData := generateTestCertForMode(t)
+	_, err = tempFile.Write(certData)
+	require.NoError(t, err)
+	require.NoError(t, tempFile.Close())
+
+	tests := []struct {
+		name     string
+		password string
+	}{
+		{"password with @", "p@ssword"},
+		{"password with ? and &", "token?key=val&other=123"},
+		{"AWS IAM-style token", "host.rds.amazonaws.com:3306/?Action=connect&DBUser=iam_user&X-Amz-Signature=abc123"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputDSN := fmt.Sprintf("user:%s@tcp(example.com:3306)/db", tt.password)
+			config := NewDBConfig()
+			config.TLSMode = "PREFERRED"
+			config.TLSCertificatePath = tempFile.Name()
+
+			result, err := EnhanceDSNWithTLS(inputDSN, config)
+			assert.NoError(t, err)
+
+			cfg, err := mysql.ParseDSN(result)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.password, cfg.Passwd, "password should survive round-trip through EnhanceDSNWithTLS")
+			assert.Equal(t, "custom", cfg.TLSConfig, "TLS config should be added")
+			assert.Equal(t, "user", cfg.User)
+			assert.Equal(t, "db", cfg.DBName)
+		})
+	}
+}
+
+func TestAddTLSParametersToDSN_SpecialCharPasswords(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), "test-cert-*.pem")
+	require.NoError(t, err)
+	certData := generateTestCertForMode(t)
+	_, err = tempFile.Write(certData)
+	require.NoError(t, err)
+	require.NoError(t, tempFile.Close())
+
+	tests := []struct {
+		name     string
+		password string
+	}{
+		{"password with @", "p@ssword"},
+		{"password with ? and &", "token?key=val&other=123"},
+		{"password with all special chars", "p@ss?w&rd/with#special!chars"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputDSN := fmt.Sprintf("user:%s@tcp(example.com:3306)/db", tt.password)
+			config := NewDBConfig()
+			config.TLSMode = "REQUIRED"
+			config.TLSCertificatePath = tempFile.Name()
+
+			result, err := addTLSParametersToDSN(inputDSN, config)
+			assert.NoError(t, err)
+
+			cfg, err := mysql.ParseDSN(result)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.password, cfg.Passwd, "password should survive round-trip through addTLSParametersToDSN")
+			assert.Equal(t, "required", cfg.TLSConfig, "TLS config should be set to required")
 		})
 	}
 }

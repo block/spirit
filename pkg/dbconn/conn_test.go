@@ -4,49 +4,107 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"testing"
 
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 )
+
+func assertDSNConfig(t *testing.T, dsnStr string, user, password, addr, dbName, tlsConfig string, interpolateParams bool) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(dsnStr)
+	assert.NoError(t, err)
+	if cfg == nil {
+		return
+	}
+	assert.Equal(t, user, cfg.User)
+	assert.Equal(t, password, cfg.Passwd)
+	assert.Equal(t, addr, cfg.Addr)
+	assert.Equal(t, dbName, cfg.DBName)
+	assert.Equal(t, tlsConfig, cfg.TLSConfig)
+	assert.Equal(t, true, cfg.AllowNativePasswords)
+	assert.Equal(t, true, cfg.RejectReadOnly)
+	assert.Equal(t, interpolateParams, cfg.InterpolateParams)
+	assert.Equal(t, "utf8mb4_bin", cfg.Collation)
+	assert.Equal(t, `""`, cfg.Params["sql_mode"])
+	assert.Equal(t, `"+00:00"`, cfg.Params["time_zone"])
+	assert.Equal(t, `"read-committed"`, cfg.Params["transaction_isolation"])
+}
 
 func TestNewDSN(t *testing.T) {
 	// Start with a basic example
 	dsn := "root:password@tcp(127.0.0.1:3306)/test"
 	resp, err := newDSN(dsn, NewDBConfig())
 	assert.NoError(t, err)
-	assert.Equal(t, "root:password@tcp(127.0.0.1:3306)/test?tls=custom&sql_mode=%22%22&time_zone=%22%2B00%3A00%22&innodb_lock_wait_timeout=3&lock_wait_timeout=30&range_optimizer_max_mem_size=0&transaction_isolation=%22read-committed%22&charset=utf8mb4&collation=utf8mb4_bin&rejectReadOnly=true&interpolateParams=false&allowNativePasswords=true", resp)
+	assertDSNConfig(t, resp, "root", "password", "127.0.0.1:3306", "test", "custom", false)
+
 	// With interpolate on.
 	config := NewDBConfig()
 	config.InterpolateParams = true
 	resp, err = newDSN(dsn, config)
 	assert.NoError(t, err)
-	assert.Equal(t, "root:password@tcp(127.0.0.1:3306)/test?tls=custom&sql_mode=%22%22&time_zone=%22%2B00%3A00%22&innodb_lock_wait_timeout=3&lock_wait_timeout=30&range_optimizer_max_mem_size=0&transaction_isolation=%22read-committed%22&charset=utf8mb4&collation=utf8mb4_bin&rejectReadOnly=true&interpolateParams=true&allowNativePasswords=true", resp)
+	assertDSNConfig(t, resp, "root", "password", "127.0.0.1:3306", "test", "custom", true)
 
 	// Also with TLS for non-RDS hosts (now includes tls=custom)
 	dsn = "root:password@tcp(mydbhost.internal:3306)/test"
 	resp, err = newDSN(dsn, NewDBConfig())
 	assert.NoError(t, err)
-	assert.Equal(t, "root:password@tcp(mydbhost.internal:3306)/test?tls=custom&sql_mode=%22%22&time_zone=%22%2B00%3A00%22&innodb_lock_wait_timeout=3&lock_wait_timeout=30&range_optimizer_max_mem_size=0&transaction_isolation=%22read-committed%22&charset=utf8mb4&collation=utf8mb4_bin&rejectReadOnly=true&interpolateParams=false&allowNativePasswords=true", resp)
+	assertDSNConfig(t, resp, "root", "password", "mydbhost.internal:3306", "test", "custom", false)
 
 	// However, if it is RDS - it will be changed to use rds bundle.
 	dsn = "root:password@tcp(tern-001.cluster-ro-ckxxxxxxvm.us-west-2.rds.amazonaws.com)/test"
 	resp, err = newDSN(dsn, NewDBConfig())
 	assert.NoError(t, err)
-	assert.Equal(t, "root:password@tcp(tern-001.cluster-ro-ckxxxxxxvm.us-west-2.rds.amazonaws.com)/test?tls=rds&sql_mode=%22%22&time_zone=%22%2B00%3A00%22&innodb_lock_wait_timeout=3&lock_wait_timeout=30&range_optimizer_max_mem_size=0&transaction_isolation=%22read-committed%22&charset=utf8mb4&collation=utf8mb4_bin&rejectReadOnly=true&interpolateParams=false&allowNativePasswords=true", resp)
+	assertDSNConfig(t, resp, "root", "password", "tern-001.cluster-ro-ckxxxxxxvm.us-west-2.rds.amazonaws.com:3306", "test", "rds", false)
 
 	// This is with optional port too
 	dsn = "root:password@tcp(tern-001.cluster-ro-ckxxxxxxvm.us-west-2.rds.amazonaws.com:12345)/test"
 	resp, err = newDSN(dsn, NewDBConfig())
 	assert.NoError(t, err)
-	assert.Equal(t, "root:password@tcp(tern-001.cluster-ro-ckxxxxxxvm.us-west-2.rds.amazonaws.com:12345)/test?tls=rds&sql_mode=%22%22&time_zone=%22%2B00%3A00%22&innodb_lock_wait_timeout=3&lock_wait_timeout=30&range_optimizer_max_mem_size=0&transaction_isolation=%22read-committed%22&charset=utf8mb4&collation=utf8mb4_bin&rejectReadOnly=true&interpolateParams=false&allowNativePasswords=true", resp)
+	assertDSNConfig(t, resp, "root", "password", "tern-001.cluster-ro-ckxxxxxxvm.us-west-2.rds.amazonaws.com:12345", "test", "rds", false)
+
+	// Password with special characters (e.g. AWS IAM auth token with ?, @, &)
+	iamToken := "dbhost.rds.amazonaws.com:3306/?Action=connect&DBUser=iam_user&X-Amz-Signature=abc123"
+	dsn = fmt.Sprintf("iam_user:%s@tcp(host.docker.internal:8410)/mydb", iamToken)
+	resp, err = newDSN(dsn, NewDBConfig())
+	assert.NoError(t, err)
+	assertDSNConfig(t, resp, "iam_user", iamToken, "host.docker.internal:8410", "mydb", "custom", false)
+
+	// DSN with explicit tls parameter — TLS config preserved, but session vars still applied
+	dsn = "root:password@tcp(127.0.0.1:3306)/test?tls=skip-verify"
+	resp, err = newDSN(dsn, NewDBConfig())
+	assert.NoError(t, err)
+	assertDSNConfig(t, resp, "root", "password", "127.0.0.1:3306", "test", "skip-verify", false)
 
 	// Invalid DSN, can't parse.
 	dsn = "invalid"
 	resp, err = newDSN(dsn, NewDBConfig())
 	assert.Error(t, err)
 	assert.Empty(t, resp)
+}
+
+func TestNewDSNAllowCleartextPasswords(t *testing.T) {
+	// With TLS enabled (default PREFERRED mode), AllowCleartextPasswords should be true
+	dsn := "root:password@tcp(127.0.0.1:3306)/test"
+	resp, err := newDSN(dsn, NewDBConfig())
+	assert.NoError(t, err)
+	cfg, err := mysql.ParseDSN(resp)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, cfg.TLSConfig, "TLS should be configured in default mode")
+	assert.True(t, cfg.AllowCleartextPasswords, "AllowCleartextPasswords should be true when TLS is enabled")
+
+	// With TLS disabled, AllowCleartextPasswords should be false
+	config := NewDBConfig()
+	config.TLSMode = "DISABLED"
+	resp, err = newDSN(dsn, config)
+	assert.NoError(t, err)
+	cfg, err = mysql.ParseDSN(resp)
+	assert.NoError(t, err)
+	assert.Empty(t, cfg.TLSConfig, "TLS should not be configured in DISABLED mode")
+	assert.False(t, cfg.AllowCleartextPasswords, "AllowCleartextPasswords should be false when TLS is disabled")
 }
 
 func TestNewConn(t *testing.T) {
