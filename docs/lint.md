@@ -1,6 +1,16 @@
 # Lint subcommand
 
-The `lint` command validates an entire MySQL schema against Spirit's built-in lint rules. It checks for common issues such as foreign keys, unsafe data types, redundant indexes, and naming conventions.
+The `lint` command validates an entire MySQL schema against Spirit's built-in lint rules.
+
+## Philosophy
+
+Spirit's linters focus on **migration safety and policy enforcement**, not semantic validation. They catch issues that MySQL would allow but could cause problems during online schema changes:
+
+- **Safety**: Operations that are risky for online migrations (foreign keys, unsafe ALTER patterns)
+- **Data types**: Types that cause precision issues (FLOAT/DOUBLE) or capacity problems (auto-increment overflow)
+- **Policy**: Naming conventions, allowed engines/charsets, index best practices
+
+Spirit linters do **not** perform semantic validation of SQL correctness. They assume input schemas are syntactically valid. For example, linters will not detect if an index references a non-existent column—MySQL itself will reject such statements. If you need semantic validation, test your schemas against MySQL before linting.
 
 Basic usage:
 
@@ -42,21 +52,39 @@ A regex pattern of table names to exclude from linting. For example, `--ignore-t
 
 ## Built-in Linters
 
+### Migration Safety
+
+These linters detect issues that could cause problems during online schema changes:
+
 | Linter | Description |
 |--------|-------------|
-| `allow_charset` | Checks that only allowed character sets are used |
+| `has_foreign_key` | Foreign keys can block online schema changes and cause replication issues |
+| `invisible_index_before_drop` | Dropping indexes without first making them invisible is risky |
+| `multiple_alter_table` | Multiple ALTERs on the same table should be combined for efficiency |
+| `unsafe` | Detects unsafe operations in schema changes |
+
+### Data Type Safety
+
+These linters catch data types that can cause precision or capacity issues:
+
+| Linter | Description |
+|--------|-------------|
+| `auto_inc_capacity` | Warns when auto-increment columns approach their maximum value |
+| `has_float` | FLOAT/DOUBLE types have precision issues; DECIMAL is preferred |
+| `primary_key` | Primary keys should use BIGINT UNSIGNED or BINARY types for longevity |
+| `zero_date` | Zero-date defaults cause issues with strict SQL mode |
+
+### Policy Enforcement
+
+These linters enforce organizational standards and best practices:
+
+| Linter | Description |
+|--------|-------------|
+| `allow_charset` | Restricts which character sets are allowed |
 | `allow_engine` | Restricts which storage engines are allowed |
-| `auto_inc_capacity` | Ensures that an auto-inc column is not within a percentage threshold of the maximum capacity of the column type |
-| `has_foreign_key` | Detects usage of FOREIGN KEY constraints in table definitions |
-| `has_float` | Detects usage of FLOAT or DOUBLE data types in table definitions |
-| `invisible_index_before_drop` | Requires indexes to be made invisible before dropping them as a safety measure |
-| `multiple_alter_table` | Detects multiple ALTER TABLE statements on the same table that could be combined |
-| `name_case` | Ensures that table names are all lowercase |
-| `primary_key` | Ensures primary keys use BIGINT (preferably UNSIGNED) or BINARY/VARBINARY types |
-| `redundant_indexes` | Detects redundant indexes including duplicates, prefix matches, and unnecessary PRIMARY KEY suffixes |
-| `reserved_words` | Checks for usage of MySQL reserved words in table and column names |
-| `unsafe` | Detects usage of unsafe operations in database schema changes |
-| `zero_date` | Checks for columns with zero-date default values |
+| `name_case` | Ensures table names are lowercase |
+| `redundant_indexes` | Detects duplicate or unnecessary indexes |
+| `reserved_words` | Warns about MySQL reserved words in identifiers |
 
 ## Violation Severity
 
