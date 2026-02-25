@@ -12,6 +12,15 @@ Spirit's linters focus on **migration safety and policy enforcement**, not seman
 
 Spirit linters do **not** perform semantic validation of SQL correctness. They assume input schemas are syntactically valid. For example, linters will not detect if an index references a non-existent column—MySQL itself will reject such statements. If you need semantic validation, test your schemas against MySQL before linting.
 
+**Best practice:** When using `lint` or `diff`, it is recommended to use the `CREATE TABLE` statements returned from MySQL's `SHOW CREATE TABLE` output. MySQL normalizes SQL in ways the linter may not fully replicate. For example:
+- `SERIAL` becomes `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT`
+- `BOOL` and `BOOLEAN` become `TINYINT(1)`
+- Inline `PRIMARY KEY` on a column becomes a table-level `PRIMARY KEY (col)` clause
+- `INTEGER` becomes `INT`
+- Default character sets and collations are made explicit
+
+Using `SHOW CREATE TABLE` output ensures the linter sees the same SQL that MySQL uses internally.
+
 Basic usage:
 
 ```bash
