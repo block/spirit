@@ -108,4 +108,4 @@ Each violation has one of three severity levels:
 ## See Also
 
 - [`spirit diff`](diff.md) — compare two schemas and lint the changes
-- [Inline linting](migrate.md#inline-linting) — run lint checks as part of `spirit migrate`
+- [`spirit migrate --lint`](migrate.md#lint) — run lint checks inline as part of `spirit migrate`

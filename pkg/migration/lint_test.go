@@ -1,9 +1,12 @@
 package migration
 
 import (
+	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,14 +27,14 @@ func TestLintingBasicInfrastructure(t *testing.T) {
 	require.NoError(t, err)
 
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1lint",
-		Alter:                     "ENGINE=InnoDB",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1lint",
+		Alter:    "ENGINE=InnoDB",
+		Threads:  1,
+		Lint:     true,
 	}
 
 	// This should succeed - just a null alter with linting enabled
@@ -56,53 +59,19 @@ func TestLintInvisibleIndexBeforeDrop_Warning(t *testing.T) {
 	require.NoError(t, err)
 
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1idx",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1idx",
+		Alter:    "DROP INDEX c2",
+		Threads:  1,
+		Lint:     true,
 	}
 
 	// Should succeed with warning (default raiseError=false)
 	err = migration.Run()
 	assert.NoError(t, err)
-}
-
-// TestLintInvisibleIndexBeforeDrop_Error tests the invisible_index_before_drop linter
-// with raiseError=true (should fail the migration)
-func TestLintInvisibleIndexBeforeDrop_Error(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1idxerr, _t1idxerr_new`)
-	table := `CREATE TABLE t1idxerr (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		c1 varchar(255) NOT NULL,
-		c2 varchar(255) NOT NULL,
-		PRIMARY KEY (id),
-		KEY c2 (c2)
-	)`
-	testutils.RunSQL(t, table)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1idxerr",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLinterConfig:  []string{"invisible_index_before_drop.raiseError=true"},
-	}
-
-	// Should fail because index is not invisible
-	err = migration.Run()
-	assert.Error(t, err)
-	assert.ErrorContains(t, err, "should be made invisible before dropping")
 }
 
 // TestLintInvisibleIndexBeforeDrop_AlreadyInvisible tests that no violation occurs
@@ -122,15 +91,14 @@ func TestLintInvisibleIndexBeforeDrop_AlreadyInvisible(t *testing.T) {
 	require.NoError(t, err)
 
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1idxinv",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLinterConfig:  []string{"invisible_index_before_drop.raiseError=true"},
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1idxinv",
+		Alter:    "DROP INDEX c2",
+		Threads:  1,
+		Lint:     true,
 	}
 
 	// Should succeed because index is already invisible
@@ -138,41 +106,8 @@ func TestLintInvisibleIndexBeforeDrop_AlreadyInvisible(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestLintDisableSpecificLinter tests disabling a specific linter with -linter_name
-func TestLintDisableSpecificLinter(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1disable, _t1disable_new`)
-	table := `CREATE TABLE t1disable (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		c1 varchar(255) NOT NULL,
-		c2 varchar(255) NOT NULL,
-		PRIMARY KEY (id),
-		KEY c2 (c2)
-	)`
-	testutils.RunSQL(t, table)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1disable",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		EnableExperimentalLinters: []string{"-invisible_index_before_drop"},
-		ExperimentalLinterConfig:  []string{"invisible_index_before_drop.raiseError=true"},
-	}
-
-	// Should succeed because the linter is disabled
-	err = migration.Run()
-	assert.NoError(t, err)
-}
-
-// TestLintPrimaryKeyType_IntError tests that INT primary key raises an error
-func TestLintPrimaryKeyType_IntError(t *testing.T) {
+// TestLintPrimaryKeyType_IntError tests that INT primary key raises a warning
+func TestLintPrimaryKeyType_IntWarning(t *testing.T) {
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1pkint, _t1pkint_new`)
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
@@ -180,13 +115,13 @@ func TestLintPrimaryKeyType_IntError(t *testing.T) {
 
 	// Use CREATE TABLE statement to create a table with INT primary key
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		Statement:                 `CREATE TABLE t1pkint (id INT NOT NULL PRIMARY KEY, name VARCHAR(255))`,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Threads:   1,
+		Lint:      true,
+		Statement: `CREATE TABLE t1pkint (id INT NOT NULL PRIMARY KEY, name VARCHAR(255))`,
 	}
 
 	// Should succeed with warning (INT is not recommended but only raises a warning)
@@ -203,13 +138,13 @@ func TestLintPrimaryKeyType_SignedBigintWarning(t *testing.T) {
 
 	// Use CREATE TABLE statement with signed BIGINT
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		Statement:                 `CREATE TABLE t1pksigned (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(255))`,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Threads:   1,
+		Lint:      true,
+		Statement: `CREATE TABLE t1pksigned (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(255))`,
 	}
 
 	// Should succeed with warning (warnings don't fail the migration)
@@ -226,13 +161,13 @@ func TestLintPrimaryKeyType_UnsignedBigintOK(t *testing.T) {
 
 	// Use CREATE TABLE statement with BIGINT UNSIGNED
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		Statement:                 `CREATE TABLE t1pkunsigned (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, name VARCHAR(255))`,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Threads:   1,
+		Lint:      true,
+		Statement: `CREATE TABLE t1pkunsigned (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, name VARCHAR(255))`,
 	}
 
 	// Should succeed without any violations
@@ -249,40 +184,16 @@ func TestLintPrimaryKeyType_BinaryOK(t *testing.T) {
 
 	// Use CREATE TABLE statement with BINARY
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		Statement:                 `CREATE TABLE t1pkbinary (id BINARY(16) NOT NULL PRIMARY KEY, name VARCHAR(255))`,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Threads:   1,
+		Lint:      true,
+		Statement: `CREATE TABLE t1pkbinary (id BINARY(16) NOT NULL PRIMARY KEY, name VARCHAR(255))`,
 	}
 
 	// Should succeed without any violations
-	err = migration.Run()
-	assert.NoError(t, err)
-}
-
-// TestLintPrimaryKeyType_DisableLinter tests disabling the primary_key_type linter
-func TestLintPrimaryKeyType_DisableLinter(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1pkdisable, _t1pkdisable_new`)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	// Use CREATE TABLE statement with INT (normally would fail)
-	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		EnableExperimentalLinters: []string{"-primary_key"},
-		Statement:                 `CREATE TABLE t1pkdisable (id INT NOT NULL PRIMARY KEY, name VARCHAR(255))`,
-	}
-
-	// Should succeed because linter is disabled
 	err = migration.Run()
 	assert.NoError(t, err)
 }
@@ -309,143 +220,18 @@ func TestLintMultipleAlterTable(t *testing.T) {
 
 	// Multiple ALTER statements on different tables - should not trigger the linter
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		Statement:                 `ALTER TABLE t1multi ADD COLUMN c1 INT; ALTER TABLE t2multi ADD COLUMN c2 INT`,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Threads:   1,
+		Lint:      true,
+		Statement: `ALTER TABLE t1multi ADD COLUMN c1 INT; ALTER TABLE t2multi ADD COLUMN c2 INT`,
 	}
 
 	// Should succeed - different tables, no violation
 	err = migration.Run()
 	assert.NoError(t, err)
-}
-
-// TestLintInvalidConfigFormat tests that invalid config format is rejected
-func TestLintInvalidConfigFormat(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1badcfg, _t1badcfg_new`)
-	table := `CREATE TABLE t1badcfg (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		name VARCHAR(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`
-	testutils.RunSQL(t, table)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1badcfg",
-		Alter:                     "ENGINE=InnoDB",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLinterConfig:  []string{"invalid_format_no_equals"},
-	}
-
-	// Should fail due to invalid config format
-	err = migration.Run()
-	assert.Error(t, err)
-	assert.ErrorContains(t, err, "invalid linter config")
-}
-
-// TestLintConfigOverridesDefaults tests that user config overrides default settings
-func TestLintConfigOverridesDefaults(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1override, _t1override_new`)
-	table := `CREATE TABLE t1override (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		c1 varchar(255) NOT NULL,
-		c2 varchar(255) NOT NULL,
-		PRIMARY KEY (id),
-		KEY c2 (c2)
-	)`
-	testutils.RunSQL(t, table)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	// Test with raiseError=false explicitly set - should succeed with warning
-	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1override",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLinterConfig:  []string{"invisible_index_before_drop.raiseError=false"},
-	}
-	err = migration.Run()
-	assert.NoError(t, err)
-
-	// Recreate the table for second test
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1override, _t1override_new`)
-	testutils.RunSQL(t, table)
-
-	// Test with raiseError=true - should fail
-	migration = &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1override",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLinterConfig:  []string{"invisible_index_before_drop.raiseError=true"},
-	}
-	err = migration.Run()
-	assert.Error(t, err)
-	assert.ErrorContains(t, err, "should be made invisible before dropping")
-}
-
-// TestLintCombinedEnableDisable tests combining enabled and disabled linters
-func TestLintCombinedEnableDisable(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1combined, _t1combined_new`)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	// Create table with INT primary key and an index to drop
-	// Disable primary_key but keep invisible_index_before_drop enabled with raiseError=true
-	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		EnableExperimentalLinters: []string{"-primary_key"},
-		Statement:                 `CREATE TABLE t1combined (id INT NOT NULL PRIMARY KEY, c1 VARCHAR(255), KEY idx_c1 (c1))`,
-	}
-
-	// Should succeed - primary_key is disabled so INT is OK
-	err = migration.Run()
-	assert.NoError(t, err)
-
-	// Now try to drop the index with invisible_index_before_drop.raiseError=true
-	migration = &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1combined",
-		Alter:                     "DROP INDEX idx_c1",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLinterConfig:  []string{"invisible_index_before_drop.raiseError=true"},
-	}
-
-	// Should fail - invisible_index_before_drop is still enabled
-	err = migration.Run()
-	assert.Error(t, err)
-	assert.ErrorContains(t, err, "should be made invisible before dropping")
 }
 
 // TestLintGetCreateTable tests that getCreateTable retrieves table definition correctly
@@ -465,14 +251,14 @@ func TestLintGetCreateTable(t *testing.T) {
 
 	// Alter the table - this will cause getCreateTable to be called
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1getcreate",
-		Alter:                     "ADD COLUMN age INT",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1getcreate",
+		Alter:    "ADD COLUMN age INT",
+		Threads:  1,
+		Lint:     true,
 	}
 
 	// Should succeed and properly retrieve the CREATE TABLE
@@ -489,13 +275,13 @@ func TestLintCreateTableWithLinting(t *testing.T) {
 
 	// Create a table with proper primary key
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		Statement:                 `CREATE TABLE t1createalter (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, name VARCHAR(255))`,
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Threads:   1,
+		Lint:      true,
+		Statement: `CREATE TABLE t1createalter (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, name VARCHAR(255))`,
 	}
 
 	// Should succeed - proper primary key type
@@ -504,14 +290,14 @@ func TestLintCreateTableWithLinting(t *testing.T) {
 
 	// Now alter the table with linting enabled
 	migration = &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1createalter",
-		Alter:                     "ADD COLUMN email VARCHAR(255)",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1createalter",
+		Alter:    "ADD COLUMN email VARCHAR(255)",
+		Threads:  1,
+		Lint:     true,
 	}
 
 	// Should also succeed
@@ -533,14 +319,14 @@ func TestLintNoViolations(t *testing.T) {
 	require.NoError(t, err)
 
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1clean",
-		Alter:                     "ADD COLUMN email VARCHAR(255)",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1clean",
+		Alter:    "ADD COLUMN email VARCHAR(255)",
+		Threads:  1,
+		Lint:     true,
 	}
 
 	// Should succeed with no violations
@@ -562,7 +348,7 @@ func TestLintWithoutEnablingLinting(t *testing.T) {
 		Password: &cfg.Passwd,
 		Database: cfg.DBName,
 		Threads:  1,
-		// EnableExperimentalLinting is NOT set
+		// Lint is NOT set
 		Statement: `CREATE TABLE t1nolint (id INT NOT NULL PRIMARY KEY, name VARCHAR(255))`,
 	}
 
@@ -571,74 +357,8 @@ func TestLintWithoutEnablingLinting(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestLintEnableByConfigOnly tests that linting runs when only config is provided
-func TestLintEnableByConfigOnly(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1cfgonly, _t1cfgonly_new`)
-	table := `CREATE TABLE t1cfgonly (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		c2 varchar(255) NOT NULL,
-		PRIMARY KEY (id),
-		KEY c2 (c2)
-	)`
-	testutils.RunSQL(t, table)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	// Don't set EnableExperimentalLinting, but provide config
-	// This should trigger linting per the runner.go logic
-	migration := &Migration{
-		Host:                     cfg.Addr,
-		Username:                 cfg.User,
-		Password:                 &cfg.Passwd,
-		Database:                 cfg.DBName,
-		Table:                    "t1cfgonly",
-		Alter:                    "DROP INDEX c2",
-		Threads:                  1,
-		ExperimentalLinterConfig: []string{"invisible_index_before_drop.raiseError=true"},
-	}
-
-	// Should fail because linting is enabled by config and index is not invisible
-	err = migration.Run()
-	assert.Error(t, err)
-	assert.ErrorContains(t, err, "should be made invisible before dropping")
-}
-
-// TestLintEnableByLintersOnly tests that linting runs when only linters list is provided
-func TestLintEnableByLintersOnly(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1lintersonly, _t1lintersonly_new`)
-	table := `CREATE TABLE t1lintersonly (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		c2 varchar(255) NOT NULL,
-		PRIMARY KEY (id),
-		KEY c2 (c2) INVISIBLE
-	)`
-	testutils.RunSQL(t, table)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	// Don't set EnableExperimentalLinting, but provide linters list
-	// This enables linting and the invisible_index_before_drop linter will run
-	// Make the index invisible first so we don't get a violation
-	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1lintersonly",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinters: []string{"invisible_index_before_drop"},
-	}
-
-	// Should succeed - index is already invisible
-	err = migration.Run()
-	assert.NoError(t, err)
-}
-
-// TestLintExperimentalLintOnly tests that ExperimentalLintOnly runs linters and exits without performing migration
-func TestLintExperimentalLintOnly(t *testing.T) {
+// TestLintOnly tests that LintOnly runs linters and exits without performing migration
+func TestLintOnly(t *testing.T) {
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1lintonly, _t1lintonly_new`)
 	table := `CREATE TABLE t1lintonly (
 		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -652,30 +372,33 @@ func TestLintExperimentalLintOnly(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	// Test with ExperimentalLintOnly=true and a violation that would normally fail
+	// Test with LintOnly=true - should run linters and exit without migrating.
+	// The invisible_index_before_drop linter fires a warning (not error) by default.
 	migration := &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1lintonly",
-		Alter:                     "DROP INDEX c2",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLinterConfig:  []string{"invisible_index_before_drop.raiseError=true"},
-		ExperimentalLintOnly:      true,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1lintonly",
+		Alter:    "DROP INDEX c2",
+		Threads:  1,
+		LintOnly: true,
 	}
 
-	// Should fail because of the linting error (index not invisible)
+	// Should succeed - warning only, no error
 	err = migration.Run()
-	assert.Error(t, err)
-	assert.ErrorContains(t, err, "should be made invisible before dropping")
+	assert.NoError(t, err)
 
 	// Verify that the new table was NOT created (migration didn't run)
-	// We need to check this directly via SQL
-	testutils.RunSQL(t, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = '_t1lintonly_new'`)
+	db, err := sql.Open("mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var tableCount int
+	err = db.QueryRowContext(t.Context(), fmt.Sprintf(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME = '_t1lintonly_new'`, cfg.DBName)).Scan(&tableCount)
+	require.NoError(t, err)
+	assert.Equal(t, 0, tableCount)
 
-	// Test with ExperimentalLintOnly=true and no violations
+	// Test with LintOnly=true and no violations
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1lintonly2, _t1lintonly2_new`)
 	table2 := `CREATE TABLE t1lintonly2 (
 		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -685,15 +408,14 @@ func TestLintExperimentalLintOnly(t *testing.T) {
 	testutils.RunSQL(t, table2)
 
 	migration = &Migration{
-		Host:                      cfg.Addr,
-		Username:                  cfg.User,
-		Password:                  &cfg.Passwd,
-		Database:                  cfg.DBName,
-		Table:                     "t1lintonly2",
-		Alter:                     "ADD COLUMN email VARCHAR(255)",
-		Threads:                   1,
-		EnableExperimentalLinting: true,
-		ExperimentalLintOnly:      true,
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Table:    "t1lintonly2",
+		Alter:    "ADD COLUMN email VARCHAR(255)",
+		Threads:  1,
+		LintOnly: true,
 	}
 
 	// Should succeed - no linting violations
@@ -701,6 +423,40 @@ func TestLintExperimentalLintOnly(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify that the new table was NOT created (migration didn't run)
-	// Check that _t1lintonly2_new does not exist
-	testutils.RunSQL(t, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = '_t1lintonly2_new'`)
+	var tableCount2 int
+	err = db.QueryRowContext(t.Context(), fmt.Sprintf(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME = '_t1lintonly2_new'`, cfg.DBName)).Scan(&tableCount2)
+	require.NoError(t, err)
+	assert.Equal(t, 0, tableCount2)
+}
+
+// TestLintOnlyImpliesLint tests that --lint-only implies --lint behavior
+func TestLintOnlyImpliesLint(t *testing.T) {
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1lintimply, _t1lintimply_new`)
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	// Use LintOnly without Lint - should still run linters
+	migration := &Migration{
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Threads:   1,
+		LintOnly:  true,
+		Statement: `CREATE TABLE t1lintimply (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, name VARCHAR(255))`,
+	}
+
+	// Should succeed - linters run, no violations, exits without migrating
+	err = migration.Run()
+	assert.NoError(t, err)
+
+	// Verify that the table was NOT created (lint-only should not execute the statement)
+	db, err := sql.Open("mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var tableCount int
+	err = db.QueryRowContext(t.Context(), fmt.Sprintf(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME = 't1lintimply'`, cfg.DBName)).Scan(&tableCount)
+	require.NoError(t, err)
+	assert.Equal(t, 0, tableCount)
 }

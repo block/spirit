@@ -161,14 +161,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to main database (DSN: %s): %w", maskPasswordInDSN(r.dsn()), err)
 	}
 
-	// Enable linting if any of the linting related options are given
-	if r.migration.EnableExperimentalLinting || r.migration.ExperimentalLintOnly ||
-		len(r.migration.EnableExperimentalLinters) > 0 || len(r.migration.ExperimentalLinterConfig) > 0 {
+	// Run linting if --lint or --lint-only is specified.
+	// --lint-only implies lint.
+	if r.migration.Lint || r.migration.LintOnly {
 		if err := r.lint(ctx); err != nil {
 			return err
 		}
-		if r.migration.ExperimentalLintOnly {
-			fmt.Printf("Exiting after running linters.\n")
+		if r.migration.LintOnly {
+			r.logger.Info("--lint-only set; exiting after running linters")
 			return nil
 		}
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/block/spirit/pkg/lint"
@@ -12,7 +11,6 @@ import (
 )
 
 var (
-	linterConfigRE = regexp.MustCompile(`^([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)=(.+)$`)
 	// defaultLinterSettings holds settings for linters where we know we want to override linter
 	// system defaults or ensure specific behavior.
 	defaultLinterSettings = map[string]map[string]string{
@@ -28,33 +26,6 @@ func (r *Runner) lint(ctx context.Context) error {
 	config := lint.Config{
 		Enabled:  make(map[string]bool),
 		Settings: defaultLinterSettings,
-	}
-
-	// Enable/disable linters based on migration config.
-	// A linter name prefixed with '-' indicates it should be disabled.
-	// This overrides the default enabled state of linters in the registry.
-	for _, linterName := range r.migration.EnableExperimentalLinters {
-		if linterName[0] == '-' {
-			config.Enabled[linterName[1:]] = false
-		} else {
-			config.Enabled[linterName] = true
-		}
-	}
-
-	// Parse linter settings from migration config. These override defaultLinterSettings.
-	for _, cfg := range r.migration.ExperimentalLinterConfig {
-		matches := linterConfigRE.FindStringSubmatch(cfg)
-		if len(matches) != 4 {
-			return fmt.Errorf("invalid linter config: %s", cfg)
-		}
-		linterName := matches[1]
-		key := matches[2]
-		value := matches[3]
-
-		if _, ok := config.Settings[linterName]; !ok {
-			config.Settings[linterName] = make(map[string]string)
-		}
-		config.Settings[linterName][key] = value
 	}
 
 	if err := printLinters(config); err != nil {

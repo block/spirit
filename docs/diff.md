@@ -87,4 +87,4 @@ spirit diff --source-dsn "..." --target-dir ./schema-v2/ | mysql -u root mydb
 ## See Also
 
 - [`spirit lint`](lint.md) — lint an entire schema without diffing
-- [Inline linting](migrate.md#inline-linting) — run lint checks as part of `spirit migrate`
+- [`spirit migrate --lint`](migrate.md#lint) — run lint checks inline as part of `spirit migrate`

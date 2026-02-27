@@ -19,6 +19,8 @@ spirit migrate --host mydb:3306 --username root --password secret \
 - [database](#database)
 - [defer-cutover](#defer-cutover)
 - [host](#host)
+- [lint](#lint)
+- [lint-only](#lint-only)
 - [lock-wait-timeout](#lock-wait-timeout)
 - [password](#password)
 - [replica-dsn](#replica-dsn)
@@ -113,6 +115,20 @@ Note that the checksum, if enabled, will be computed after the sentinel table is
 - Examples: `mydbhost`, `mydbhost:3307`
 
 The host (and optional port) to use when connecting to MySQL. If no port is provided, 3306 is used.
+
+### lint
+
+- Type: Boolean
+- Default value: `false`
+
+Spirit can optionally run lint checks before executing a migration. This uses the same linting engine as [`spirit lint`](lint.md) and [`spirit diff`](diff.md), but runs inline as part of the migration process.
+
+### lint-only
+
+- Type: Boolean
+- Default value: `false`
+
+Similar to `--lint` except spirit will exit after running linting.
 
 ### lock-wait-timeout
 
@@ -392,18 +408,3 @@ spirit migrate --tls-mode VERIFY_IDENTITY \
 - Default value: `spirit`
 
 The username to use when connecting to MySQL.
-
-## Inline Linting
-
-Spirit can optionally run lint checks before executing a migration. This uses the same linting engine as [`spirit lint`](lint.md) and [`spirit diff`](diff.md), but runs inline as part of the migration process.
-
-You can enable this via these command-line options:
-
-* `--enable-experimental-linting` — a boolean flag to enable linting before migration
-* `--enable-experimental-linters` — a comma-separated list of linter names to enable explicitly (in addition to the default set), or if preceded by `-`, to disable
-* `--experimental-linter-config` — a comma-separated list of `linter_name.key=value` configuration settings
-* `--experimental-lint-only` — exit after running linters without performing the migration
-
-If you provide `--enable-experimental-linters` or `--experimental-linter-config` without explicitly setting `--enable-experimental-linting`, linting will be enabled implicitly.
-
-For standalone schema linting without running a migration, see [`spirit lint`](lint.md) and [`spirit diff`](diff.md).
