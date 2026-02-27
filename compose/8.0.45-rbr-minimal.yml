@@ -1,5 +1,5 @@
 services:
   mysql:
-    image: mysql:8.0.33
+    image: mysql:8.0.45
     ports: [ '8033:3306' ]
     command: --binlog-row-image=MINIMAL

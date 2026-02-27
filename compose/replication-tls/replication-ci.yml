@@ -1,7 +1,7 @@
 # Docker Compose configuration for CI testing (no TLS)
 services:
   mysql:
-    image: mysql:8.0.33
+    image: mysql:8.0.45
     ports: [ '8033:3306' ]
     # to supress mbind: Operation not permitted in CI
     # https://stackoverflow.com/a/55706057
@@ -21,7 +21,7 @@ services:
     command: --server-id=1 --log-bin=mysql-bin --gtid-mode=on --enforce-gtid-consistency=on
 
   mysql_replica:
-    image: mysql:8.0.33
+    image: mysql:8.0.45
     ports: [ '8133:3306' ]
     # to supress mbind: Operation not permitted in CI
     # https://stackoverflow.com/a/55706057

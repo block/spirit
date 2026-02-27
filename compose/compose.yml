@@ -1,6 +1,6 @@
 services:
   mysql:
-    image: mysql:8.0.33
+    image: mysql:8.0.45
     ports: [ '8033:3306' ]
     # to suppress mbind: Operation not permitted in CI
     # https://stackoverflow.com/a/55706057

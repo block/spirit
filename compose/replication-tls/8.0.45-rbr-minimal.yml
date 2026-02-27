@@ -1,8 +1,8 @@
 services:
   mysql:
-    image: mysql:8.0.33
+    image: mysql:8.0.45
     ports: [ '8033:3306' ]
     command: --binlog-row-image=MINIMAL --server-id=1 --log-bin=mysql-bin --gtid-mode=on --enforce-gtid-consistency=on
   mysql_replica:
-    image: mysql:8.0.33
+    image: mysql:8.0.45
     ports: [ '8133:3306' ]
