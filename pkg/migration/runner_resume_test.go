@@ -1073,14 +1073,13 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	assert.NoError(t, m.Close())
 }
 
-// TestResumeFromCheckpointCleanupOnFailure tests that when resumeFromCheckpoint
-// fails AFTER creating the replClient and adding subscriptions (e.g., at replClient.Run()
-// because the binlog position is too old), the subscriptions are properly cleaned up
-// before newMigration is called. Without this cleanup, newMigration would fail with
-// "subscription already exists for table X".
+// TestResumeFromCheckpointCleanupOnFailure tests that when a checkpoint's binlog
+// position is no longer available on the server (e.g., purged), resumeFromCheckpoint
+// detects this early — before creating the replClient — and falls back to newMigration.
 //
-// This tests the fix for a bug where volume changes during a migration could cause
-// the migration to fail with "subscription already exists" errors.
+// This validates the fix for a bug where volume changes (stop/start cycle) during a
+// migration could cause stale binlog positions, leading to "subscription already exists"
+// errors when the fallback to newMigration tried to re-create subscriptions.
 func TestResumeFromCheckpointCleanupOnFailure(t *testing.T) {
 	t.Parallel()
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS cleanup_test, _cleanup_test_new, _cleanup_test_chkpnt, _cleanup_test_old`)
@@ -1131,19 +1130,15 @@ func TestResumeFromCheckpointCleanupOnFailure(t *testing.T) {
 	assert.NoError(t, r.Close())
 	cancel()
 
-	// Now corrupt the checkpoint by setting an invalid binlog position
-	// that will cause replClient.Run() to fail during resumeFromCheckpoint
+	// Now corrupt the checkpoint by setting an invalid binlog position.
+	// This simulates binlog expiry between stop and start.
 	testutils.RunSQL(t, `UPDATE _cleanup_test_chkpnt SET binlog_name = 'nonexistent-bin.999999', binlog_pos = 999999999`)
 
 	// Start a new migration - it should:
 	// 1. Try to resumeFromCheckpoint
-	// 2. Create replClient and add subscriptions
-	// 3. Fail at replClient.Run() due to invalid binlog position
-	// 4. Clean up the replClient (our fix)
-	// 5. Fall back to newMigration
-	// 6. Successfully complete the migration
-	//
-	// Before the fix, step 5 would fail with "subscription already exists for table X"
+	// 2. Detect that the binlog file doesn't exist (early validation)
+	// 3. Fall back to newMigration without creating any replClient
+	// 4. Successfully complete the migration
 	r2, err := NewRunner(&Migration{
 		Host:     cfg.Addr,
 		Username: cfg.User,
@@ -1156,7 +1151,7 @@ func TestResumeFromCheckpointCleanupOnFailure(t *testing.T) {
 	assert.NoError(t, err)
 
 	err = r2.Run(t.Context())
-	assert.NoError(t, err)                       // Should succeed - the fix ensures subscriptions are cleaned up
+	assert.NoError(t, err)                       // Should succeed - early binlog check prevents partial state
 	assert.False(t, r2.usedResumeFromCheckpoint) // Should NOT have resumed because binlog was invalid
 	assert.NoError(t, r2.Close())
 }

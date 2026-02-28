@@ -26,17 +26,18 @@ Runner.Run()
                     ├── 1. Check _tablename_new table exists
                     ├── 2. Read checkpoint table
                     ├── 3. Validate DDL statement matches
-                    ├── 4. setupCopierCheckerAndReplClient()
+                    ├── 4. Validate binlog file still exists (SHOW BINARY LOGS)
+                    ├── 5. setupCopierCheckerAndReplClient()
                     │       ├── Create replClient
                     │       └── AddSubscription() for each table
-                    └── 5. replClient.Run() ← Start binlog streaming
+                    └── 6. replClient.Run() ← Start binlog streaming
 ```
 
 ## Failure Modes
 
 ### Binlog Position Too Old
 
-MySQL automatically deletes old binary log files based on `expire_logs_days` or `binlog_expire_logs_seconds`. If the checkpoint's binlog position references a deleted file, `replClient.Run()` fails.
+MySQL automatically deletes old binary log files based on `expire_logs_days` or `binlog_expire_logs_seconds`. If the checkpoint's binlog position references a deleted file, `resumeFromCheckpoint` detects this early via `SHOW BINARY LOGS` and returns an error before creating any resources.
 
 ```
 Checkpoint saved:
@@ -49,7 +50,7 @@ After some time, MySQL expires old logs:
 └── mysql-bin.000044 ← Current
 
 Resume attempt:
-└── replClient.Run() fails: "could not find first log file in binary log index"
+└── binlogFileExists() returns false → bail out before creating replClient
 ```
 
 ### Volume Change Scenario
@@ -75,17 +76,11 @@ Volume changes (adjusting migration speed) trigger a stop/resume cycle:
        ├── Check new table exists ✓
        ├── Read checkpoint table ✓
        ├── Validate statement matches ✓
-       ├── setupCopierCheckerAndReplClient()
-       │     ├── Creates replClient
-       │     └── Adds subscriptions for all tables
-       └── replClient.Run() ← May fail if binlog stale
+       ├── Validate binlog file exists ← Fails early if stale
        ↓
-6. If resumeFromCheckpoint() fails:
-       ├── Close replClient (cleanup subscriptions) ← IMPORTANT
-       └── Call newMigration() to start fresh
+6. setup() logs the error, falls back to newMigration()
        ↓
-7. newMigration() → setupCopierCheckerAndReplClient()
-       └── AddSubscription() ← Works because old subscriptions cleaned up
+7. newMigration() starts fresh (no partial state to clean up)
 ```
 
 ## Best Practices

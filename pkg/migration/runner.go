@@ -698,15 +698,6 @@ func (r *Runner) setup(ctx context.Context) error {
 			"reason", err,
 		) // explain why it failed.
 
-		// Clean up any partially initialized state from resumeFromCheckpoint.
-		// This is important because resumeFromCheckpoint may have created a replClient
-		// and added subscriptions before failing (e.g., at replClient.Run()).
-		// Without cleanup, newMigration would fail with "subscription already exists".
-		if r.replClient != nil {
-			r.replClient.Close()
-			r.replClient = nil
-		}
-
 		// Since we are not strict, we are allowed to
 		// start a new migration.
 		if err := r.newMigration(ctx); err != nil {
@@ -922,6 +913,13 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return status.ErrMismatchedAlter
 	}
 
+	// Validate the checkpoint's binlog position is still available on the server
+	// before creating any resources (replClient, subscriptions, etc.).
+	// This avoids partial initialization that would need cleanup on failure.
+	if !r.binlogFileExists(ctx, binlogName) {
+		return fmt.Errorf("checkpoint binlog file %s no longer exists on server (purged), cannot resume", binlogName)
+	}
+
 	// Initialize and call SetInfo on all the new tables, since we need the column info
 	for _, change := range r.changes {
 		// Initialize newTable with the expected new table name
@@ -983,6 +981,26 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	)
 	r.usedResumeFromCheckpoint = true
 	return nil
+}
+
+// binlogFileExists checks if the given binlog file is still available on the server.
+// Used to validate checkpoint binlog positions before creating resources.
+func (r *Runner) binlogFileExists(ctx context.Context, binlogName string) bool {
+	rows, err := r.db.QueryContext(ctx, "SHOW BINARY LOGS")
+	if err != nil {
+		return false
+	}
+	defer func() { _ = rows.Close() }()
+	var logname, size, encrypted string
+	for rows.Next() {
+		if err := rows.Scan(&logname, &size, &encrypted); err != nil {
+			return false
+		}
+		if logname == binlogName {
+			return true
+		}
+	}
+	return false
 }
 
 // initChunkers sets up the chunker(s) for the migration.
