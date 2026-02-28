@@ -685,12 +685,13 @@ func (r *Runner) setup(ctx context.Context) error {
 
 	// We always attempt to resume from a checkpoint.
 	if err = r.resumeFromCheckpoint(ctx); err != nil {
-		// Strict mode means if we have a mismatched alter,
-		// we should not continue. This is to protect against
-		// a user re-running a migration with a different alter
-		// statement when a previous migration was incomplete,
-		// and all progress is lost.
-		if r.migration.Strict && errors.Is(err, status.ErrMismatchedAlter) {
+		// Strict mode prevents silent loss of checkpoint progress.
+		// A mismatched alter means the user changed the DDL between runs.
+		// An expired binlog means the checkpoint can't be used because
+		// changes would be lost in the replication gap.
+		// In both cases, strict mode surfaces the error rather than
+		// silently restarting from scratch.
+		if r.migration.Strict && (errors.Is(err, status.ErrMismatchedAlter) || errors.Is(err, status.ErrBinlogNotFound)) {
 			return err
 		}
 
@@ -913,6 +914,13 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return status.ErrMismatchedAlter
 	}
 
+	// Validate the checkpoint's binlog position is still available on the server
+	// before creating any resources (replClient, subscriptions, etc.).
+	// This avoids partial initialization that would need cleanup on failure.
+	if !r.binlogFileExists(ctx, binlogName) {
+		return fmt.Errorf("%w: %s has been purged, cannot resume", status.ErrBinlogNotFound, binlogName)
+	}
+
 	// Initialize and call SetInfo on all the new tables, since we need the column info
 	for _, change := range r.changes {
 		// Initialize newTable with the expected new table name
@@ -974,6 +982,26 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	)
 	r.usedResumeFromCheckpoint = true
 	return nil
+}
+
+// binlogFileExists checks if the given binlog file is still available on the server.
+// Used to validate checkpoint binlog positions before creating resources.
+func (r *Runner) binlogFileExists(ctx context.Context, binlogName string) bool {
+	rows, err := r.db.QueryContext(ctx, "SHOW BINARY LOGS")
+	if err != nil {
+		return false
+	}
+	defer func() { _ = rows.Close() }()
+	var logname, size, encrypted string
+	for rows.Next() {
+		if err := rows.Scan(&logname, &size, &encrypted); err != nil {
+			return false
+		}
+		if logname == binlogName {
+			return true
+		}
+	}
+	return false
 }
 
 // initChunkers sets up the chunker(s) for the migration.

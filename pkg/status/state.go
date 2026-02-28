@@ -10,6 +10,7 @@ type State int32
 
 var (
 	ErrMismatchedAlter         = errors.New("alter statement in checkpoint table does not match the alter statement specified here")
+	ErrBinlogNotFound          = errors.New("checkpoint binlog file not found on server")
 	ErrCouldNotWriteCheckpoint = errors.New("could not write checkpoint")
 	ErrWatermarkNotReady       = errors.New("watermark not ready")
 )
