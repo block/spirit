@@ -1134,11 +1134,7 @@ func TestResumeFromCheckpointCleanupOnFailure(t *testing.T) {
 	// This simulates binlog expiry between stop and start.
 	testutils.RunSQL(t, `UPDATE _cleanup_test_chkpnt SET binlog_name = 'nonexistent-bin.999999', binlog_pos = 999999999`)
 
-	// Start a new migration - it should:
-	// 1. Try to resumeFromCheckpoint
-	// 2. Detect that the binlog file doesn't exist (early validation)
-	// 3. Fall back to newMigration without creating any replClient
-	// 4. Successfully complete the migration
+	// Without strict mode: falls back to newMigration and completes successfully.
 	r2, err := NewRunner(&Migration{
 		Host:     cfg.Addr,
 		Username: cfg.User,
@@ -1151,7 +1147,69 @@ func TestResumeFromCheckpointCleanupOnFailure(t *testing.T) {
 	assert.NoError(t, err)
 
 	err = r2.Run(t.Context())
-	assert.NoError(t, err)                       // Should succeed - early binlog check prevents partial state
+	assert.NoError(t, err)                       // Should succeed - falls back to newMigration
 	assert.False(t, r2.usedResumeFromCheckpoint) // Should NOT have resumed because binlog was invalid
+	assert.NoError(t, r2.Close())
+}
+
+func TestResumeFromCheckpointStrictBinlogExpired(t *testing.T) {
+	t.Parallel()
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS strictbinlogtest, _strictbinlogtest_old, _strictbinlogtest_chkpnt`)
+	testutils.RunSQL(t, `CREATE TABLE strictbinlogtest (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		pad varbinary(1024) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	testutils.RunSQL(t, "INSERT INTO strictbinlogtest (name, pad) VALUES ('a', REPEAT('x', 1000))")
+	testutils.RunSQL(t, `INSERT INTO strictbinlogtest (name, pad) SELECT a.name, a.pad FROM strictbinlogtest a, strictbinlogtest b, strictbinlogtest c LIMIT 10`)
+	testutils.RunSQL(t, `INSERT INTO strictbinlogtest (name, pad) SELECT a.name, a.pad FROM strictbinlogtest a, strictbinlogtest b, strictbinlogtest c LIMIT 100`)
+	testutils.RunSQL(t, `INSERT INTO strictbinlogtest (name, pad) SELECT a.name, a.pad FROM strictbinlogtest a, strictbinlogtest b LIMIT 1000`)
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+
+	// First run: create a checkpoint
+	r, err := NewRunner(&Migration{
+		Host:             cfg.Addr,
+		Username:         cfg.User,
+		Password:         &cfg.Passwd,
+		Database:         cfg.DBName,
+		Threads:          1,
+		TargetChunkTime:  100 * time.Millisecond,
+		Table:            "strictbinlogtest",
+		Alter:            "ENGINE=InnoDB",
+		useTestThrottler: true,
+	})
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		_ = r.Run(ctx)
+	}()
+
+	waitForCheckpoint(t, r)
+	assert.NoError(t, r.Close())
+	cancel()
+
+	// Corrupt binlog name to simulate expiry
+	testutils.RunSQL(t, `UPDATE _strictbinlogtest_chkpnt SET binlog_name = 'nonexistent-bin.999999', binlog_pos = 999999999`)
+
+	// With strict mode: should error with ErrBinlogNotFound instead of silently restarting
+	r2, err := NewRunner(&Migration{
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Threads:  2,
+		Table:    "strictbinlogtest",
+		Alter:    "ENGINE=InnoDB",
+		Strict:   true,
+	})
+	assert.NoError(t, err)
+
+	err = r2.Run(t.Context())
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, status.ErrBinlogNotFound)
 	assert.NoError(t, r2.Close())
 }

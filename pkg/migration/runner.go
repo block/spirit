@@ -685,12 +685,13 @@ func (r *Runner) setup(ctx context.Context) error {
 
 	// We always attempt to resume from a checkpoint.
 	if err = r.resumeFromCheckpoint(ctx); err != nil {
-		// Strict mode means if we have a mismatched alter,
-		// we should not continue. This is to protect against
-		// a user re-running a migration with a different alter
-		// statement when a previous migration was incomplete,
-		// and all progress is lost.
-		if r.migration.Strict && errors.Is(err, status.ErrMismatchedAlter) {
+		// Strict mode prevents silent loss of checkpoint progress.
+		// A mismatched alter means the user changed the DDL between runs.
+		// An expired binlog means the checkpoint can't be used because
+		// changes would be lost in the replication gap.
+		// In both cases, strict mode surfaces the error rather than
+		// silently restarting from scratch.
+		if r.migration.Strict && (errors.Is(err, status.ErrMismatchedAlter) || errors.Is(err, status.ErrBinlogNotFound)) {
 			return err
 		}
 
@@ -917,7 +918,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// before creating any resources (replClient, subscriptions, etc.).
 	// This avoids partial initialization that would need cleanup on failure.
 	if !r.binlogFileExists(ctx, binlogName) {
-		return fmt.Errorf("checkpoint binlog file %s no longer exists on server (purged), cannot resume", binlogName)
+		return fmt.Errorf("%w: %s has been purged, cannot resume", status.ErrBinlogNotFound, binlogName)
 	}
 
 	// Initialize and call SetInfo on all the new tables, since we need the column info
