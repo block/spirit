@@ -698,6 +698,15 @@ func (r *Runner) setup(ctx context.Context) error {
 			"reason", err,
 		) // explain why it failed.
 
+		// Clean up any partially initialized state from resumeFromCheckpoint.
+		// This is important because resumeFromCheckpoint may have created a replClient
+		// and added subscriptions before failing (e.g., at replClient.Run()).
+		// Without cleanup, newMigration would fail with "subscription already exists".
+		if r.replClient != nil {
+			r.replClient.Close()
+			r.replClient = nil
+		}
+
 		// Since we are not strict, we are allowed to
 		// start a new migration.
 		if err := r.newMigration(ctx); err != nil {

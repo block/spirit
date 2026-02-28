@@ -1072,3 +1072,91 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	assert.True(t, m.usedResumeFromCheckpoint)
 	assert.NoError(t, m.Close())
 }
+
+// TestResumeFromCheckpointCleanupOnFailure tests that when resumeFromCheckpoint
+// fails AFTER creating the replClient and adding subscriptions (e.g., at replClient.Run()
+// because the binlog position is too old), the subscriptions are properly cleaned up
+// before newMigration is called. Without this cleanup, newMigration would fail with
+// "subscription already exists for table X".
+//
+// This tests the fix for a bug where volume changes during a migration could cause
+// the migration to fail with "subscription already exists" errors.
+func TestResumeFromCheckpointCleanupOnFailure(t *testing.T) {
+	t.Parallel()
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS cleanup_test, _cleanup_test_new, _cleanup_test_chkpnt, _cleanup_test_old`)
+	testutils.RunSQL(t, `CREATE TABLE cleanup_test (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		pad VARCHAR(1000) NOT NULL default 'x')`) // Larger pad for slower copy
+	// Insert enough data for the migration to take some time (need ~1000+ rows)
+	testutils.RunSQL(t, "INSERT INTO cleanup_test (name, pad) VALUES ('a', REPEAT('x', 1000))")
+	testutils.RunSQL(t, `INSERT INTO cleanup_test (name, pad) SELECT a.name, a.pad FROM cleanup_test a, cleanup_test b, cleanup_test c LIMIT 10`)
+	testutils.RunSQL(t, `INSERT INTO cleanup_test (name, pad) SELECT a.name, a.pad FROM cleanup_test a, cleanup_test b, cleanup_test c LIMIT 100`)
+	testutils.RunSQL(t, `INSERT INTO cleanup_test (name, pad) SELECT a.name, a.pad FROM cleanup_test a, cleanup_test b LIMIT 1000`)
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+
+	// First run: create a checkpoint that we can manipulate
+	r, err := NewRunner(&Migration{
+		Host:             cfg.Addr,
+		Username:         cfg.User,
+		Password:         &cfg.Passwd,
+		Database:         cfg.DBName,
+		Threads:          1,
+		TargetChunkTime:  100 * time.Millisecond,
+		Table:            "cleanup_test",
+		Alter:            "ENGINE=InnoDB",
+		useTestThrottler: true,
+	})
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		_ = r.Run(ctx)
+	}()
+
+	// Wait for checkpoint to be created
+	waitForCheckpoint(t, r)
+
+	// Verify the _new table exists (required for the resume path we want to test)
+	db, err := sql.Open("mysql", testutils.DSN())
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	var tableName string
+	err = db.QueryRowContext(t.Context(), "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = '_cleanup_test_new'").Scan(&tableName)
+	assert.NoError(t, err, "_cleanup_test_new table should exist after checkpoint")
+
+	// Close() before cancel() to avoid race conditions (see other tests)
+	assert.NoError(t, r.Close())
+	cancel()
+
+	// Now corrupt the checkpoint by setting an invalid binlog position
+	// that will cause replClient.Run() to fail during resumeFromCheckpoint
+	testutils.RunSQL(t, `UPDATE _cleanup_test_chkpnt SET binlog_name = 'nonexistent-bin.999999', binlog_pos = 999999999`)
+
+	// Start a new migration - it should:
+	// 1. Try to resumeFromCheckpoint
+	// 2. Create replClient and add subscriptions
+	// 3. Fail at replClient.Run() due to invalid binlog position
+	// 4. Clean up the replClient (our fix)
+	// 5. Fall back to newMigration
+	// 6. Successfully complete the migration
+	//
+	// Before the fix, step 5 would fail with "subscription already exists for table X"
+	r2, err := NewRunner(&Migration{
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Threads:  2,
+		Table:    "cleanup_test",
+		Alter:    "ENGINE=InnoDB",
+	})
+	assert.NoError(t, err)
+
+	err = r2.Run(t.Context())
+	assert.NoError(t, err)                       // Should succeed - the fix ensures subscriptions are cleaned up
+	assert.False(t, r2.usedResumeFromCheckpoint) // Should NOT have resumed because binlog was invalid
+	assert.NoError(t, r2.Close())
+}
