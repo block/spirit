@@ -22,6 +22,13 @@ func init() {
 func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	// This is a re-implementation of the gh-ost check
 	// validateGrants() in gh-ost/go/logic/inspect.go
+	// Activate all granted roles so their privileges appear in SHOW GRANTS.
+	// Without this, roles that aren't SET DEFAULT ROLE won't expand their
+	// privileges (e.g. rds_superuser_role on Amazon RDS).
+	if _, err := r.DB.ExecContext(ctx, `SET ROLE ALL`); err != nil {
+		logger.Warn("SET ROLE ALL failed (may not have granted roles)", "error", err)
+	}
+
 	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload, foundConnectionAdmin, foundProcess bool
 	rows, err := r.DB.QueryContext(ctx, `SHOW GRANTS`)
 	if err != nil {
