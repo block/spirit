@@ -500,8 +500,9 @@ func TestDDLNotification(t *testing.T) {
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
-		CancelFunc: func() {
+		CancelFunc: func() bool {
 			cancelled <- struct{}{}
+			return true
 		},
 		ServerID: NewServerID(),
 	})
@@ -734,7 +735,7 @@ func TestMaxRecreateAttemptsError(t *testing.T) {
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
 		ServerID:        NewServerID(),
-		CancelFunc:      cancel,
+		CancelFunc:      func() bool { cancel(); return true },
 	})
 	require.NoError(t, client.AddSubscription(t1, t2, nil))
 	require.NoError(t, client.Run(ctx))
@@ -970,7 +971,7 @@ func TestProcessDDLNotification(t *testing.T) {
 		cancelled := false
 		c := &Client{
 			logger:           slog.Default(),
-			callerCancelFunc: func() { cancelled = true },
+			callerCancelFunc: func() bool { cancelled = true; return true },
 			ddlFilterSchema:  filterSchema,
 			ddlFilterTables:  toSet(filterTables),
 			subscriptions:    make(map[string]Subscription),
@@ -997,7 +998,7 @@ func TestProcessDDLNotification(t *testing.T) {
 		cancelled := false
 		c := &Client{
 			logger:           slog.Default(),
-			callerCancelFunc: func() { cancelled = true },
+			callerCancelFunc: func() bool { cancelled = true; return true },
 			subscriptions:    make(map[string]Subscription),
 		}
 		c.subscriptions[dbName+".orders"] = &deltaMap{

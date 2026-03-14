@@ -89,8 +89,10 @@ type Client struct {
 	// callerCancelFunc is an optional callback that is called when a DDL
 	// change is detected on a subscribed table, or when a fatal stream
 	// error occurs. The caller is expected to handle cancellation and
-	// cleanup in this callback.
-	callerCancelFunc func()
+	// cleanup in this callback. It returns true if the error was acted
+	// upon (i.e. the caller actually cancelled), or false if it was
+	// ignored (e.g. because the migration is already past cutover).
+	callerCancelFunc func() bool
 	ddlFilterSchema  string
 	ddlFilterTables  map[string]struct{}
 
@@ -156,7 +158,9 @@ type ClientConfig struct {
 	// It is called when a DDL change is detected on a subscribed table, or when a fatal
 	// stream error occurs (such as minimal RBR detection or exhausted streamer recreation
 	// attempts). The caller is expected to handle cancellation and cleanup.
-	CancelFunc func()
+	// It returns true if the error was acted upon (caller actually cancelled),
+	// or false if it was ignored (e.g. because the caller is already past cutover).
+	CancelFunc func() bool
 
 	// DDLFilterSchema, when set, broadens DDL detection to cancel on any DDL change
 	// in the specified schema, rather than only on exact table matches against subscriptions.
@@ -693,8 +697,9 @@ func (c *Client) processDDLNotification(schema, table string) {
 			return
 		}
 	}
-	c.logger.Error("table definition changed, cancelling operation", "schema", schema, "table", table)
-	c.fatalError()
+	if c.fatalError() {
+		c.logger.Error("table definition changed, cancelling operation", "schema", schema, "table", table)
+	}
 }
 
 // processRowsEvent processes a RowsEvent. It will search all active
@@ -839,14 +844,16 @@ func (c *Client) binlogPositionIsImpossible(ctx context.Context) bool {
 
 // fatalError is called from within the readStream goroutine when a truly fatal
 // stream error occurs (e.g. unrecoverable stream error, minimal RBR detection,
-// or a fatal rows event error).
+// or a fatal rows event error). It returns true if the caller acknowledged the
+// error (i.e. the cancel function was called and acted upon).
 //
 // IMPORTANT: This method must NOT call Close() because Close() calls
 // streamWG.Wait(), which would deadlock since readStream is the caller.
-func (c *Client) fatalError() {
+func (c *Client) fatalError() bool {
 	if c.callerCancelFunc != nil {
-		c.callerCancelFunc()
+		return c.callerCancelFunc()
 	}
+	return false
 }
 
 func (c *Client) Close() {
