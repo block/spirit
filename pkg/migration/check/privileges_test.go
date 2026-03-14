@@ -19,6 +19,7 @@ func TestPrivileges(t *testing.T) {
 	config.User = "root" // needs grant privilege
 	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	assert.NoError(t, err)
+	defer utils.CloseAndLog(db)
 
 	_, err = db.ExecContext(t.Context(), "DROP USER IF EXISTS testprivsuser")
 	assert.NoError(t, err)
@@ -95,6 +96,73 @@ func TestPrivileges(t *testing.T) {
 	assert.NoError(t, err) // privileges work fine
 }
 
+// TestPrivilegesWithRoles tests that privileges granted via roles are detected.
+// In RDS environments, privileges like CONNECTION_ADMIN and PROCESS may be
+// granted via a role (e.g. rds_superuser_role) that is not enabled by default.
+func TestPrivilegesWithRoles(t *testing.T) {
+	config, err := mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+	config.User = "root" // needs grant privilege
+	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	assert.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	// Clean up any previous test artifacts
+	_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS testprivsroleuser")
+	_, _ = db.ExecContext(t.Context(), "DROP ROLE IF EXISTS testprivsrole")
+
+	// Create a role with CONNECTION_ADMIN and PROCESS privileges
+	_, err = db.ExecContext(t.Context(), "CREATE ROLE testprivsrole")
+	assert.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(t.Context(), "DROP ROLE IF EXISTS testprivsrole")
+	})
+
+	_, err = db.ExecContext(t.Context(), "GRANT CONNECTION_ADMIN, PROCESS ON *.* TO testprivsrole")
+	assert.NoError(t, err)
+
+	_, err = db.ExecContext(t.Context(), "GRANT SELECT ON `performance_schema`.* TO testprivsrole")
+	assert.NoError(t, err)
+
+	// Create a user with basic privileges but NOT CONNECTION_ADMIN or PROCESS directly
+	_, err = db.ExecContext(t.Context(), "CREATE USER testprivsroleuser")
+	assert.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS testprivsroleuser")
+	})
+
+	_, err = db.ExecContext(t.Context(), "GRANT ALL ON test.* TO testprivsroleuser")
+	assert.NoError(t, err)
+
+	_, err = db.ExecContext(t.Context(), "GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testprivsroleuser")
+	assert.NoError(t, err)
+
+	// Grant the role to the user
+	_, err = db.ExecContext(t.Context(), "GRANT testprivsrole TO testprivsroleuser")
+	assert.NoError(t, err)
+
+	config, err = mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+	config.User = "testprivsroleuser"
+	config.Passwd = ""
+
+	lowPrivDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	assert.NoError(t, err)
+	defer utils.CloseAndLog(lowPrivDB)
+
+	r := Resources{
+		DB:        lowPrivDB,
+		Table:     &table.TableInfo{TableName: "test", SchemaName: "test"},
+		ForceKill: true, // default behavior
+	}
+
+	// The user has CONNECTION_ADMIN and PROCESS via a role, not directly.
+	// The KILL 0 probe with SET ROLE ALL detects CONNECTION_ADMIN via the role.
+	// The performance_schema and PROCESS checks also use SET ROLE ALL internally.
+	err = privilegesCheck(t.Context(), r, slog.Default())
+	assert.NoError(t, err)
+}
+
 // TestPrivilegesWithSkipForceKill tests that when ForceKill is disabled
 // (i.e. --skip-force-kill is set), the additional force-kill privileges
 // are not required.
@@ -104,6 +172,7 @@ func TestPrivilegesWithSkipForceKill(t *testing.T) {
 	config.User = "root" // needs grant privilege
 	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	assert.NoError(t, err)
+	defer utils.CloseAndLog(db)
 
 	_, err = db.ExecContext(t.Context(), "DROP USER IF EXISTS testprivsskipfk")
 	assert.NoError(t, err)

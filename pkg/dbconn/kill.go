@@ -129,7 +129,7 @@ func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 	var errs []error
 	for _, pid := range pids {
 		logger.Warn("killing locking transaction", "pid", pid)
-		err = KillTransaction(ctx, db, pid)
+		err = KillTransaction(ctx, db, pid, logger)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to kill transaction %d: %w", pid, err))
 		}
@@ -148,6 +148,21 @@ func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) ([]int, error) {
 	// This function should query the performance schema to find long-running transactions
 	// that are holding locks on the specified tables.
+	// We use a transaction to ensure a dedicated connection for SET ROLE ALL.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Activate all granted roles on this transaction. In RDS environments,
+	// SELECT on performance_schema may be granted via a role that is not enabled by default.
+	// We must reset the role before the connection is returned to the pool.
+	resetRole, err := SetRoleAllOnTxn(ctx, tx, logger)
+	if err != nil {
+		return nil, err
+	}
+	defer resetRole()
 
 	query := LongRunningEventQuery
 
@@ -167,7 +182,7 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 		params = append(params, inParams...)
 	}
 
-	rows, err := db.QueryContext(ctx, query, params...)
+	rows, err := tx.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, err
 	}
@@ -238,6 +253,16 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+
+	// Activate all granted roles on this transaction. In RDS environments,
+	// SELECT on performance_schema may be granted via a role that is not enabled by default.
+	// We must reset the role before the connection is returned to the pool.
+	resetRole, err := SetRoleAllOnTxn(ctx, tx, logger)
+	if err != nil {
+		return nil, err
+	}
+	defer resetRole()
+
 	query := TableLockQuery
 	params := make([]any, 0, len(tables)*2)
 	if len(ignorePIDs) > 0 {
@@ -293,12 +318,28 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 	return locks, nil
 }
 
-func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(killStatement, pid)); err != nil {
+func KillTransaction(ctx context.Context, db *sql.DB, pid int, logger *slog.Logger) error {
+	// We use a transaction to ensure a dedicated connection for SET ROLE ALL.
+	// In RDS environments, the CONNECTION_ADMIN privilege needed for KILL
+	// may be granted via a role (e.g. rds_superuser_role) that is not enabled by default.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for kill: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Activate all granted roles on this transaction.
+	// resetRole must be called before Rollback closes the transaction.
+	resetRole, err := SetRoleAllOnTxn(ctx, tx, logger)
+	if err != nil {
+		return err
+	}
+	defer resetRole() // runs before deferred Rollback (LIFO)
+
+	if _, err = tx.ExecContext(ctx, fmt.Sprintf(killStatement, pid)); err != nil {
 		return fmt.Errorf("failed to kill transaction %d: %w", pid, err)
 	}
-
-	return nil
+	return nil // This will "rollback", but KILL is non transactional
 }
 
 func tablesToInList(tables []*table.TableInfo, logger *slog.Logger) (inList string, params []any) {

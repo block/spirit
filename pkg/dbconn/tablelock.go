@@ -3,6 +3,8 @@ package dbconn
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -12,9 +14,10 @@ import (
 )
 
 type TableLock struct {
-	tables  []*table.TableInfo
-	lockTxn *sql.Tx
-	logger  *slog.Logger
+	tables   []*table.TableInfo
+	lockTxn  *sql.Tx
+	logger   *slog.Logger
+	cleanups []func() // cleanup functions to run when the lock is closed
 }
 
 // NewTableLock creates a new server wide lock on multiple tables.
@@ -46,14 +49,30 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	if err != nil {
 		return nil, err
 	}
+	var resetRole func()
 	defer func() {
 		// Before we return an error, we need to now ensure that
 		// we rollback the transaction if it was opened,
 		// this helps prevent a connection leak.
 		if err != nil {
+			if resetRole != nil {
+				resetRole()
+			}
 			_ = lockTxn.Rollback()
 		}
 	}()
+
+	// Activate all granted roles on this transaction. In RDS environments,
+	// LOCK TABLES privilege may be granted via a role (e.g. rds_superuser_role)
+	// that is not enabled by default. The role reset is deferred to Close()
+	// so that the role remains active for the lifetime of the lock, and is
+	// cleaned up before the connection is returned to the pool (the Go MySQL
+	// driver does not reset session state on transaction commit/rollback).
+	resetRole, err = SetRoleAllOnTxn(ctx, lockTxn, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	if config.ForceKill {
 		// If ForceKill is true, we will wait for 90% of the configured LockWaitTimeout
 		threshold := time.Duration(float64(config.LockWaitTimeout)*lockWaitTimeoutForceKillMultiplier) * time.Second
@@ -91,9 +110,10 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	// it's a critical function.
 	logger.Warn("table lock(s) acquired")
 	return &TableLock{
-		tables:  tables,
-		lockTxn: lockTxn,
-		logger:  logger,
+		tables:   tables,
+		lockTxn:  lockTxn,
+		logger:   logger,
+		cleanups: []func(){resetRole},
 	}, nil
 }
 
@@ -113,13 +133,22 @@ func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 
 // Close closes the table lock
 func (s *TableLock) Close(ctx context.Context) error {
+	var errs []error
 	_, err := s.lockTxn.ExecContext(ctx, "UNLOCK TABLES")
 	if err != nil {
-		return err
+		errs = append(errs, err)
+	}
+	// Run cleanup functions (e.g. SET ROLE DEFAULT) before releasing the
+	// connection back to the pool.
+	for _, cleanup := range s.cleanups {
+		cleanup()
 	}
 	err = s.lockTxn.Rollback()
 	if err != nil {
-		return err
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("errors occurred while closing table lock: %w", errors.Join(errs...))
 	}
 	s.logger.Warn("table lock released")
 	return nil

@@ -210,6 +210,17 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 		}
 	}()
 
+	// Activate all granted roles on this transaction. In RDS environments,
+	// privileges needed for DDL operations may be granted via a role
+	// that is not enabled by default. We must reset the role before the
+	// connection is returned to the pool, because the Go MySQL driver
+	// does not reset session state on transaction commit/rollback.
+	resetRole, err := SetRoleAllOnTxn(ctx, trx, logger)
+	if err != nil {
+		return err
+	}
+	defer resetRole()
+
 	// The threshold is hardcoded to be at least 0.9 seconds. This should be the minimum anyway,
 	// since the minimum LockWaitTimeout=1 second
 	threshold := max(float64(dbConfig.LockWaitTimeout)*lockWaitTimeoutForceKillMultiplier, 0.9)
