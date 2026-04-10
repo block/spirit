@@ -440,3 +440,123 @@ func TestBufferedMapFlushWithoutLockRespectsWatermark(t *testing.T) {
 	err = db.QueryRowContext(t.Context(), "SELECT name FROM _subscription_test_new WHERE id = 5").Scan(&name)
 	assert.Error(t, err, "Row with id=5 (at watermark) should NOT exist yet")
 }
+
+// TestBufferedMapGeometry tests that GEOMETRY column data (binary spatial values)
+// is correctly handled by the buffered map subscription. The buffered map stores
+// full row images from binlog events, so this verifies the binary geometry
+// representation survives the replication pipeline without corruption due to
+// partial values replicated, strange encoding etc.
+// This test requires full binlog_row_image (non-minimal RBR).
+func TestBufferedMapGeometry(t *testing.T) {
+	if testutils.IsMinimalRBRTestRunner(t) {
+		t.Skip("Skipping test for minimal RBR test runner")
+	}
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS subscription_test, _subscription_test_new")
+	testutils.RunSQL(t, `CREATE TABLE subscription_test (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		location GEOMETRY NOT NULL SRID 4326,
+		PRIMARY KEY (id)
+	)`)
+	testutils.RunSQL(t, `CREATE TABLE _subscription_test_new (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		location GEOMETRY NOT NULL SRID 4326,
+		PRIMARY KEY (id)
+	)`)
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	assert.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	srcTable := table.NewTableInfo(db, "test", "subscription_test")
+	assert.NoError(t, srcTable.SetInfo(t.Context()))
+	dstTable := table.NewTableInfo(db, "test", "_subscription_test_new")
+	assert.NoError(t, dstTable.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+	target := applier.Target{
+		DB:       db,
+		KeyRange: "0",
+		Config:   cfg,
+	}
+	appl, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	assert.NoError(t, err)
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+		Logger:          slog.Default(),
+		Concurrency:     4,
+		TargetBatchTime: time.Second,
+		ServerID:        NewServerID(),
+		Applier:         appl,
+	})
+	assert.NoError(t, client.AddSubscription(srcTable, dstTable, nil))
+	assert.NoError(t, client.Run(t.Context()))
+	defer client.Close()
+
+	// INSERT geometry data.
+	testutils.RunSQL(t, `INSERT INTO subscription_test (id, name, location) VALUES
+		(1, 'Statue of Liberty', ST_GeomFromText('POINT(-74.0445 40.6892)', 4326, 'axis-order=long-lat')),
+		(2, 'Eiffel Tower', ST_GeomFromText('POINT(2.2945 48.8584)', 4326, 'axis-order=long-lat')),
+		(3, 'Big Ben', ST_GeomFromText('POINT(-0.1246 51.5007)', 4326, 'axis-order=long-lat'))
+	`)
+	assert.NoError(t, client.BlockWait(t.Context()))
+	assert.Equal(t, 3, client.GetDeltaLen())
+
+	// Inspect the buffered subscription directly to verify row images contain geometry data.
+	sub, ok := client.subscriptions["test.subscription_test"].(*bufferedMap)
+	assert.True(t, ok)
+	assert.False(t, sub.changes["1"].logicalRow.IsDeleted)
+	// The row image should have 3 columns: id, name, location (as binary geometry).
+	assert.Len(t, sub.changes["1"].logicalRow.RowImage, 3)
+
+	// Flush and verify the geometry data was applied correctly.
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	assert.NoError(t, err)
+	assert.True(t, allFlushed)
+
+	var count int
+	err = db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _subscription_test_new").Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, count)
+
+	// Verify the geometry data round-trips correctly via ST_AsText.
+	var wkt string
+	err = db.QueryRowContext(t.Context(),
+		"SELECT ST_AsText(location) FROM _subscription_test_new WHERE id = 1").Scan(&wkt)
+	assert.NoError(t, err)
+	assert.Contains(t, wkt, "POINT")
+
+	// UPDATE geometry data — move the Eiffel Tower.
+	testutils.RunSQL(t, `UPDATE subscription_test SET location = ST_GeomFromText('POINT(2.3 48.9)', 4326, 'axis-order=long-lat') WHERE id = 2`)
+	assert.NoError(t, client.BlockWait(t.Context()))
+	allFlushed, err = sub.Flush(t.Context(), false, nil)
+	assert.NoError(t, err)
+	assert.True(t, allFlushed)
+
+	err = db.QueryRowContext(t.Context(),
+		"SELECT ST_AsText(location) FROM _subscription_test_new WHERE id = 2").Scan(&wkt)
+	assert.NoError(t, err)
+	assert.Contains(t, wkt, "2.3")
+
+	// DELETE a row.
+	testutils.RunSQL(t, `DELETE FROM subscription_test WHERE id = 3`)
+	assert.NoError(t, client.BlockWait(t.Context()))
+	allFlushed, err = sub.Flush(t.Context(), false, nil)
+	assert.NoError(t, err)
+	assert.True(t, allFlushed)
+
+	err = db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _subscription_test_new").Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, count)
+
+	// Final checksum: verify all geometry data matches.
+	var checksumSrc, checksumDst string
+	err = db.QueryRowContext(t.Context(),
+		"SELECT BIT_XOR(CRC32(CONCAT(id, name, ST_AsText(location)))) FROM subscription_test").Scan(&checksumSrc)
+	assert.NoError(t, err)
+	err = db.QueryRowContext(t.Context(),
+		"SELECT BIT_XOR(CRC32(CONCAT(id, name, ST_AsText(location)))) FROM _subscription_test_new").Scan(&checksumDst)
+	assert.NoError(t, err)
+	assert.Equal(t, checksumSrc, checksumDst)
+}

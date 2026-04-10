@@ -390,6 +390,57 @@ IF(
 	assert.NoError(t, err)
 }
 
+// TestSpatialGeneratedColumnAndIndex tests that the parser accepts a combined ALTER TABLE
+// that adds a GEOMETRY generated column with SRID and a SPATIAL INDEX in one statement.
+// The actual geometry data lives in a text column, so this only validates parsing + DDL execution.
+func TestSpatialGeneratedColumnAndIndex(t *testing.T) {
+	t.Parallel()
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS t1spatial, _t1spatial_new`)
+	testutils.RunSQL(t, `CREATE TABLE t1spatial (
+  id bigint NOT NULL AUTO_INCREMENT,
+  name varchar(255) NOT NULL,
+  geometry_wkt varchar(500) NOT NULL,
+  PRIMARY KEY (id)
+)`)
+	testutils.RunSQL(t, `INSERT INTO t1spatial (name, geometry_wkt) VALUES
+('Statue of Liberty', 'POINT(-74.0445 40.6892)'),
+('Eiffel Tower', 'POINT(2.2945 48.8584)'),
+('Big Ben', 'POINT(-0.1246 51.5007)'),
+('Colosseum', 'POINT(12.4924 41.8902)'),
+('Sydney Opera House', 'POINT(151.2153 -33.8568)'),
+('Great Wall of China', 'POINT(116.5704 40.4319)'),
+('Machu Picchu', 'POINT(-72.5450 -13.1631)'),
+('Taj Mahal', 'POINT(78.0421 27.1751)'),
+('Christ the Redeemer', 'POINT(-43.2105 -22.9519)'),
+('Golden Gate Bridge', 'POINT(-122.4783 37.8199)')
+`)
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	assert.NoError(t, err)
+
+	migration := &Migration{
+		Host:     cfg.Addr,
+		Username: cfg.User,
+		Password: &cfg.Passwd,
+		Database: cfg.DBName,
+		Threads:  2,
+		Statement: `ALTER TABLE t1spatial
+ADD COLUMN points_of_interest GEOMETRY GENERATED ALWAYS AS (ST_GeomFromText(geometry_wkt, 4326, 'axis-order=long-lat')) STORED NOT NULL SRID 4326,
+ADD SPATIAL INDEX idx_points_of_interest (points_of_interest)`,
+	}
+	err = migration.Run()
+	assert.NoError(t, err)
+
+	db, err := sql.Open("mysql", testutils.DSN())
+	assert.NoError(t, err)
+	defer func() { assert.NoError(t, db.Close()) }()
+
+	var count int
+	err = db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM t1spatial`).Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 10, count)
+}
+
 type testcase struct {
 	OldType string
 	NewType string
