@@ -22,7 +22,7 @@ func TestConfigurationCheck(t *testing.T) {
 
 	// Test with valid configuration
 	r := Resources{
-		SourceDB: db,
+		Sources: []SourceResource{{DB: db}},
 	}
 	err = configurationCheck(context.Background(), r, slog.Default())
 	assert.NoError(t, err)

@@ -35,7 +35,16 @@ var grantedRolesRegexp = regexp.MustCompile("`([^`]+)`@`[^`]+`")
 // active on every connection, so we tolerate its presence as a substitute for
 // CONNECTION_ADMIN and PROCESS.
 func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
-	if r.SourceDB == nil {
+	for i, src := range r.Sources {
+		if err := checkSourcePrivileges(ctx, src, r, logger); err != nil {
+			return fmt.Errorf("source %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources, logger *slog.Logger) error {
+	if src.DB == nil {
 		return nil // skip if no source DB connection yet (pre-run phase)
 	}
 
@@ -43,11 +52,11 @@ func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 	var grantedRoles []string
 
 	schemaName := ""
-	if r.SourceConfig != nil {
-		schemaName = r.SourceConfig.DBName
+	if src.Config != nil {
+		schemaName = src.Config.DBName
 	}
 
-	rows, err := r.SourceDB.QueryContext(ctx, `SHOW GRANTS`)
+	rows, err := src.DB.QueryContext(ctx, `SHOW GRANTS`)
 	if err != nil {
 		return err
 	}
@@ -110,7 +119,7 @@ func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 	// opaque rds_superuser_role. When activate_all_roles_on_login=ON, this role
 	// is automatically active on every connection, so we can skip checking for
 	// those privileges directly.
-	skipRolePrivilegeCheck := hasRole(grantedRoles, "rds_superuser_role") && activateAllRolesOnLogin(ctx, r.SourceDB, logger)
+	skipRolePrivilegeCheck := hasRole(grantedRoles, "rds_superuser_role") && activateAllRolesOnLogin(ctx, src.DB, logger)
 
 	// Move operations always use force-kill (it's enabled by default in DBConfig).
 	// Check the force-kill related privileges.
@@ -118,10 +127,10 @@ func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 
 	// Verify SELECT access on performance_schema.*, which is required for the
 	// queries used by force-kill during cutover.
-	if _, err := dbconn.GetTableLocks(ctx, r.SourceDB, r.SourceTables, logger, nil); err != nil {
+	if _, err := dbconn.GetTableLocks(ctx, src.DB, r.SourceTables, logger, nil); err != nil {
 		errs = append(errs, err)
 	}
-	if _, err := dbconn.GetLockingTransactions(ctx, r.SourceDB, r.SourceTables, nil, logger, nil); err != nil {
+	if _, err := dbconn.GetLockingTransactions(ctx, src.DB, r.SourceTables, nil, logger, nil); err != nil {
 		errs = append(errs, err)
 	}
 	if !skipRolePrivilegeCheck {

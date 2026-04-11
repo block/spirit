@@ -53,8 +53,7 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 1: No checkpoint table should fail
 	t.Run("no checkpoint table fails", func(t *testing.T) {
 		r := Resources{
-			SourceDB:     sourceDB,
-			SourceConfig: sourceConfig,
+			Sources: []SourceResource{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -85,8 +84,7 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 2: Checkpoint exists but no target tables should fail
 	t.Run("checkpoint exists but no target tables fails", func(t *testing.T) {
 		r := Resources{
-			SourceDB:     sourceDB,
-			SourceConfig: sourceConfig,
+			Sources: []SourceResource{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -111,8 +109,7 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 3: Checkpoint and matching target tables should pass
 	t.Run("checkpoint and matching target tables pass", func(t *testing.T) {
 		r := Resources{
-			SourceDB:     sourceDB,
-			SourceConfig: sourceConfig,
+			Sources: []SourceResource{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -136,8 +133,7 @@ func TestResumeStateCheck(t *testing.T) {
 			_, _ = targetDB.ExecContext(t.Context(), "DROP TABLE IF EXISTS resume_tgt.test_table")
 		}()
 		r := Resources{
-			SourceDB:     sourceDB,
-			SourceConfig: sourceConfig,
+			Sources: []SourceResource{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -155,8 +151,7 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 5: No source tables should fail
 	t.Run("no source tables fails", func(t *testing.T) {
 		r := Resources{
-			SourceDB:     sourceDB,
-			SourceConfig: sourceConfig,
+			Sources: []SourceResource{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -198,8 +193,7 @@ func TestResumeStateCheck(t *testing.T) {
 		}
 
 		r := Resources{
-			SourceDB:     sourceDB,
-			SourceConfig: sourceConfig,
+			Sources: []SourceResource{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -231,8 +225,7 @@ func TestResumeStateCheck(t *testing.T) {
 		}
 
 		r := Resources{
-			SourceDB:     sourceDB,
-			SourceConfig: sourceConfig,
+			Sources: []SourceResource{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,

@@ -49,7 +49,7 @@ func TestTargetStateCheck(t *testing.T) {
 	// Test 1: Empty target should pass
 	t.Run("empty target passes", func(t *testing.T) {
 		r := Resources{
-			SourceDB: sourceDB,
+			Sources: []SourceResource{{DB: sourceDB}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -71,7 +71,7 @@ func TestTargetStateCheck(t *testing.T) {
 		}()
 
 		r := Resources{
-			SourceDB: sourceDB,
+			Sources: []SourceResource{{DB: sourceDB}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -97,7 +97,7 @@ func TestTargetStateCheck(t *testing.T) {
 		}()
 
 		r := Resources{
-			SourceDB: sourceDB,
+			Sources: []SourceResource{{DB: sourceDB}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -122,7 +122,7 @@ func TestTargetStateCheck(t *testing.T) {
 		}()
 
 		r := Resources{
-			SourceDB: sourceDB,
+			Sources: []SourceResource{{DB: sourceDB}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,

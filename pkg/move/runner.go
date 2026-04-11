@@ -719,13 +719,14 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 // runChecks wraps around check.RunChecks and adds the context of this move operation
 func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 	return check.RunChecks(ctx, check.Resources{
-		SourceDB:       r.source,
-		SourceConfig:   r.sourceConfig,
+		Sources: []check.SourceResource{{
+			DB:     r.source,
+			Config: r.sourceConfig,
+			DSN:    r.move.SourceDSN,
+		}},
 		Targets:        r.targets,
 		SourceTables:   r.sourceTables,
 		CreateSentinel: r.move.CreateSentinel,
-		SourceDSN:      r.move.SourceDSN,
-		TargetDSN:      r.move.TargetDSN,
 	}, r.logger, scope)
 }
 

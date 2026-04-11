@@ -43,8 +43,7 @@ func TestMovePrivileges(t *testing.T) {
 	defer utils.CloseAndLog(lowPrivDB)
 
 	r := Resources{
-		SourceDB:     lowPrivDB,
-		SourceConfig: sourceConfig,
+		Sources: []SourceResource{{DB: lowPrivDB, Config: sourceConfig}},
 	}
 	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.Error(t, err) // privileges fail, since user has nothing granted.
@@ -82,15 +81,14 @@ func TestMovePrivileges(t *testing.T) {
 	lowPrivDB, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	assert.NoError(t, err)
 	defer utils.CloseAndLog(lowPrivDB)
-	r.SourceDB = lowPrivDB
+	r.Sources = []SourceResource{{DB: lowPrivDB, Config: sourceConfig}}
 
 	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // all privileges granted, should pass now
 
 	// Test the root user
 	r = Resources{
-		SourceDB:     db,
-		SourceConfig: sourceConfig,
+		Sources: []SourceResource{{DB: db, Config: sourceConfig}},
 	}
 	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err) // root privileges work fine
@@ -163,8 +161,7 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	defer utils.CloseAndLog(lowPrivDB)
 
 	r := Resources{
-		SourceDB:     lowPrivDB,
-		SourceConfig: sourceConfig,
+		Sources: []SourceResource{{DB: lowPrivDB, Config: sourceConfig}},
 	}
 
 	err = privilegesCheck(t.Context(), r, slog.Default())
@@ -180,7 +177,7 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	require.NoError(t, lowPrivDB.Close())
 	lowPrivDB, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
-	r.SourceDB = lowPrivDB
+	r.Sources = []SourceResource{{DB: lowPrivDB, Config: sourceConfig}}
 
 	err = privilegesCheck(t.Context(), r, slog.Default())
 	assert.NoError(t, err, "should pass when activate_all_roles_on_login=ON and rds_superuser_role is granted")

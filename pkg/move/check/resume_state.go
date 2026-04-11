@@ -29,21 +29,26 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 		return errors.New("no source tables available for resume validation")
 	}
 
-	// Check 1: Verify checkpoint table exists on source
+	if len(r.Sources) == 0 {
+		return errors.New("no sources configured for resume validation")
+	}
+
+	// Check 1: Verify checkpoint table exists on sources[0] (by convention).
+	src0 := r.Sources[0]
 	checkpointTableName := "_spirit_checkpoint"
 	var checkpointExists int
-	err := r.SourceDB.QueryRowContext(ctx,
+	err := src0.DB.QueryRowContext(ctx,
 		"SELECT 1 FROM information_schema.TABLES WHERE table_schema = ? AND table_name = ?",
-		r.SourceConfig.DBName, checkpointTableName).Scan(&checkpointExists)
+		src0.Config.DBName, checkpointTableName).Scan(&checkpointExists)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("checkpoint table '%s.%s' does not exist; cannot resume", r.SourceConfig.DBName, checkpointTableName)
+		return fmt.Errorf("checkpoint table '%s.%s' does not exist; cannot resume", src0.Config.DBName, checkpointTableName)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to check for checkpoint table: %w", err)
 	}
 
 	logger.Info("checkpoint table exists, validating target tables for resume",
-		"checkpoint_table", fmt.Sprintf("%s.%s", r.SourceConfig.DBName, checkpointTableName))
+		"checkpoint_table", fmt.Sprintf("%s.%s", src0.Config.DBName, checkpointTableName))
 
 	// Check 2: Verify all source tables have corresponding target tables with matching schema
 	for _, sourceTable := range r.SourceTables {

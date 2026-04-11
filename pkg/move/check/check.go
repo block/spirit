@@ -24,16 +24,19 @@ const (
 	ScopeResume
 )
 
+// SourceResource holds per-source connection state for checks.
+type SourceResource struct {
+	DB     *sql.DB
+	Config *mysql.Config
+	DSN    string
+}
+
 // Resources contains the resources needed for move checks
 type Resources struct {
-	SourceDB       *sql.DB
-	SourceConfig   *mysql.Config
+	Sources        []SourceResource
 	Targets        []applier.Target
 	SourceTables   []*table.TableInfo
 	CreateSentinel bool
-	// For PreRun checks (before DB connections established)
-	SourceDSN string
-	TargetDSN string
 }
 
 type check struct {
