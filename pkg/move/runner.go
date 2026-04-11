@@ -597,7 +597,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.logger.Info("Checksum completed successfully, starting cutover")
 	// Create a cutover.
 	r.status.Set(status.CutOver)
-	cutover, err := NewCutOver(r.source, r.sourceTables, r.cutoverFunc, r.replClient, r.dbConfig, r.logger)
+	cutover, err := NewCutOver(
+		[]CutOverSource{{DB: r.source, ReplClient: r.replClient, Tables: r.sourceTables}},
+		r.cutoverFunc, r.dbConfig, r.logger,
+	)
 	if err != nil {
 		return err
 	}

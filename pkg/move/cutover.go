@@ -14,32 +14,38 @@ import (
 	"github.com/block/spirit/pkg/utils"
 )
 
+// CutOverSource holds per-source state needed for the cutover.
+type CutOverSource struct {
+	DB         *sql.DB
+	ReplClient *repl.Client
+	Tables     []*table.TableInfo
+}
+
 type CutOver struct {
-	db          *sql.DB
-	feed        *repl.Client
-	tables      []*table.TableInfo
+	sources     []CutOverSource
 	cutoverFunc func(ctx context.Context) error
 	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
 }
 
-// NewCutOver contains the logic to perform the final cut over. It can cutover multiple tables
-// at once based on config. A replication feed which is used to ensure consistency before the cut over.
-func NewCutOver(db *sql.DB, tables []*table.TableInfo, cutoverFunc func(ctx context.Context) error, feed *repl.Client, dbConfig *dbconn.DBConfig, logger *slog.Logger) (*CutOver, error) {
-	if feed == nil {
-		return nil, errors.New("feed must be non-nil")
+// NewCutOver creates a new CutOver that handles multiple sources.
+func NewCutOver(sources []CutOverSource, cutoverFunc func(ctx context.Context) error, dbConfig *dbconn.DBConfig, logger *slog.Logger) (*CutOver, error) {
+	if len(sources) == 0 {
+		return nil, errors.New("at least one source must be provided")
 	}
-	// validate the cutoverConfig
-	for _, tbl := range tables {
-		if tbl == nil {
-			return nil, errors.New("table must be non-nil")
+	for i, src := range sources {
+		if src.ReplClient == nil {
+			return nil, fmt.Errorf("source %d: repl client must be non-nil", i)
+		}
+		for _, tbl := range src.Tables {
+			if tbl == nil {
+				return nil, fmt.Errorf("source %d: table must be non-nil", i)
+			}
 		}
 	}
 	return &CutOver{
-		db:          db,
-		tables:      tables,
+		sources:     sources,
 		cutoverFunc: cutoverFunc,
-		feed:        feed,
 		dbConfig:    dbConfig,
 		logger:      logger,
 	}, nil
@@ -51,14 +57,12 @@ func (c *CutOver) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// Try and catch up before we attempt the cutover.
-		// since we will need to catch up again with the lock held
-		// and we want to minimize that.
-		if err := c.feed.Flush(ctx); err != nil {
-			return err
+		// Flush all sources before attempting the cutover.
+		for _, src := range c.sources {
+			if err := src.ReplClient.Flush(ctx); err != nil {
+				return err
+			}
 		}
-		// We use maxCutoverRetries as our retrycount, but nested
-		// within c.algorithmX() it may also have a retry for the specific statement
 		c.logger.Warn("Attempting final cut over operation",
 			"attempt", i+1,
 			"max-retries", c.dbConfig.MaxRetries)
@@ -75,23 +79,40 @@ func (c *CutOver) Run(ctx context.Context) error {
 }
 
 func (c *CutOver) algorithmCutover(ctx context.Context) error {
-	tableLock, err := dbconn.NewTableLock(ctx, c.db, c.tables, c.dbConfig, c.logger)
-	if err != nil {
-		return err
+	// Lock tables on ALL sources.
+	var sourceLocks []*dbconn.TableLock
+	for i, src := range c.sources {
+		lock, err := dbconn.NewTableLock(ctx, src.DB, src.Tables, c.dbConfig, c.logger)
+		if err != nil {
+			// Close any locks we already acquired.
+			for _, l := range sourceLocks {
+				utils.CloseAndLogWithContext(ctx, l)
+			}
+			return fmt.Errorf("failed to lock tables on source %d: %w", i, err)
+		}
+		sourceLocks = append(sourceLocks, lock)
 	}
-	defer utils.CloseAndLogWithContext(ctx, tableLock)
+	defer func() {
+		for _, l := range sourceLocks {
+			utils.CloseAndLogWithContext(ctx, l)
+		}
+	}()
 
-	// We don't use FlushUnderLock: that's for within the same server.
-	// We use a regular flush. No new changes will arrive because of the table lock.
-	if err := c.feed.Flush(ctx); err != nil {
-		return err
+	// Flush ALL repl clients. No new changes will arrive because all sources are locked.
+	for i, src := range c.sources {
+		if err := src.ReplClient.Flush(ctx); err != nil {
+			return fmt.Errorf("failed to flush repl client for source %d: %w", i, err)
+		}
 	}
 
-	if !c.feed.AllChangesFlushed() {
-		return fmt.Errorf("%w, final flush might be broken", repl.ErrChangesNotFlushed)
+	// Check ALL changes flushed.
+	for i, src := range c.sources {
+		if !src.ReplClient.AllChangesFlushed() {
+			return fmt.Errorf("%w on source %d, final flush might be broken", repl.ErrChangesNotFlushed, i)
+		}
 	}
 
-	// If we have all changes flushed under a lock, we can now run the cutover func.
+	// Run the cutover function (Vitess coordination).
 	if c.cutoverFunc != nil {
 		c.logger.Info("Running cutover function")
 		if err := c.cutoverFunc(ctx); err != nil {
@@ -100,16 +121,34 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 		c.logger.Info("Cutover function complete")
 	}
 
-	// If the cutover func succeeded, we can do a rename to prevent
-	// the original tables from being used. We are now effectively serving
-	// from the new location.
-	renameFragments := []string{}
-	for _, tbl := range c.tables {
-		oldQuotedName := fmt.Sprintf("`%s_old`", tbl.TableName)
-		renameFragments = append(renameFragments,
-			fmt.Sprintf("%s TO %s", tbl.QuotedTableName, oldQuotedName),
-		)
+	// Rename tables on each source, with rollback on partial failure.
+	var completedRenames []int
+	for i, src := range c.sources {
+		renameFragments := make([]string, 0, len(src.Tables))
+		for _, tbl := range src.Tables {
+			oldQuotedName := fmt.Sprintf("`%s_old`", tbl.TableName)
+			renameFragments = append(renameFragments,
+				fmt.Sprintf("%s TO %s", tbl.QuotedTableName, oldQuotedName),
+			)
+		}
+		renameStatement := "RENAME TABLE " + strings.Join(renameFragments, ", ")
+		if err := sourceLocks[i].ExecUnderLock(ctx, renameStatement); err != nil {
+			// Rollback completed renames.
+			for _, j := range completedRenames {
+				undoFragments := make([]string, 0, len(c.sources[j].Tables))
+				for _, tbl := range c.sources[j].Tables {
+					oldQuotedName := fmt.Sprintf("`%s_old`", tbl.TableName)
+					undoFragments = append(undoFragments,
+						fmt.Sprintf("%s TO %s", oldQuotedName, tbl.QuotedTableName),
+					)
+				}
+				undoStatement := "RENAME TABLE " + strings.Join(undoFragments, ", ")
+				_ = sourceLocks[j].ExecUnderLock(ctx, undoStatement)
+			}
+			return fmt.Errorf("rename failed on source %d, rolled back %d completed renames: %w",
+				i, len(completedRenames), err)
+		}
+		completedRenames = append(completedRenames, i)
 	}
-	renameStatement := "RENAME TABLE " + strings.Join(renameFragments, ", ")
-	return tableLock.ExecUnderLock(ctx, renameStatement)
+	return nil
 }
