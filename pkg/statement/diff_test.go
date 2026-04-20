@@ -865,6 +865,25 @@ func TestDiff(t *testing.T) {
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, metadata JSON NOT NULL DEFAULT (json_object()))",
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `metadata` json NOT NULL DEFAULT (json_object())",
 		},
+		{
+			name: "AddJSONColumnWithExpressionDefaultToExistingTable",
+			source: `CREATE TABLE t1 (
+				id bigint PRIMARY KEY AUTO_INCREMENT,
+				name varchar(255) NOT NULL,
+				details json,
+				customer_id bigint NOT NULL,
+				UNIQUE KEY unq_name (name)
+			) ENGINE InnoDB DEFAULT CHARSET utf8mb4`,
+			target: `CREATE TABLE t1 (
+				id bigint PRIMARY KEY AUTO_INCREMENT,
+				name varchar(255) NOT NULL,
+				details json,
+				customer_id bigint NOT NULL,
+				extra json NOT NULL DEFAULT (json_object()),
+				UNIQUE KEY unq_name (name)
+			) ENGINE InnoDB DEFAULT CHARSET utf8mb4`,
+			expected: "ALTER TABLE `t1` ADD COLUMN `extra` json NOT NULL DEFAULT (json_object())",
+		},
 	}
 
 	for _, tt := range tests {
