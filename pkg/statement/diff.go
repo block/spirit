@@ -1054,12 +1054,13 @@ func formatColumnDefinition(col *Column) string {
 	// Default value
 	if col.Default != nil {
 		defaultVal := *col.Default
-		if col.DefaultIsExpr {
+		switch {
+		case col.DefaultIsExpr:
 			// Expression defaults must be wrapped in parentheses, e.g. DEFAULT (json_object())
 			parts = append(parts, fmt.Sprintf("DEFAULT (%s)", defaultVal))
-		} else if needsQuotes(defaultVal) {
+		case needsQuotes(defaultVal):
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
-		} else {
+		default:
 			parts = append(parts, fmt.Sprintf("DEFAULT %s", defaultVal))
 		}
 	}
