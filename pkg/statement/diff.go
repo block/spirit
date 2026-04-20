@@ -738,6 +738,9 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	if !stringPtrEqual(sourceDefault, targetDefault) {
 		return false
 	}
+	if a.DefaultIsExpr != b.DefaultIsExpr {
+		return false
+	}
 	if a.AutoInc != b.AutoInc {
 		return false
 	}
@@ -832,6 +835,9 @@ func columnsEqualIgnorePK(a, b *Column) bool {
 		}
 	}
 	if !stringPtrEqual(sourceDefault, targetDefault) {
+		return false
+	}
+	if a.DefaultIsExpr != b.DefaultIsExpr {
 		return false
 	}
 	if a.AutoInc != b.AutoInc {
@@ -1047,9 +1053,11 @@ func formatColumnDefinition(col *Column) string {
 
 	// Default value
 	if col.Default != nil {
-		// Check if it's a function/expression (no quotes) or a literal value (needs quotes)
 		defaultVal := *col.Default
-		if needsQuotes(defaultVal) {
+		if col.DefaultIsExpr {
+			// Expression defaults must be wrapped in parentheses, e.g. DEFAULT (json_object())
+			parts = append(parts, fmt.Sprintf("DEFAULT (%s)", defaultVal))
+		} else if needsQuotes(defaultVal) {
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
 		} else {
 			parts = append(parts, fmt.Sprintf("DEFAULT %s", defaultVal))

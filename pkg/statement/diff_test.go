@@ -209,7 +209,7 @@ func TestDiff(t *testing.T) {
 			name:     "DefaultValueFunction_UUID",
 			source:   "CREATE TABLE t1 (id VARCHAR(36) PRIMARY KEY, name VARCHAR(100))",
 			target:   "CREATE TABLE t1 (id VARCHAR(36) PRIMARY KEY DEFAULT (UUID()), name VARCHAR(100))",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `id` varchar(36) NOT NULL DEFAULT 'uuid'",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `id` varchar(36) NOT NULL DEFAULT (uuid())",
 		},
 		{
 			name: "MultipleChangesComplex",
@@ -840,6 +840,30 @@ func TestDiff(t *testing.T) {
 			source:   "CREATE TABLE `t1` (\n  `version` varchar(50) NOT NULL,\n  PRIMARY KEY (`version`)\n)",
 			target:   "CREATE TABLE `t1` (\n  `version` varchar(50) NOT NULL,\n  PRIMARY KEY `version` (`version`)\n)",
 			expected: "",
+		},
+		{
+			name:     "AddJSONColumnWithExpressionDefault",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY)",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, metadata JSON NOT NULL DEFAULT (json_object()))",
+			expected: "ALTER TABLE `t1` ADD COLUMN `metadata` json NOT NULL DEFAULT (json_object())",
+		},
+		{
+			name:     "AddJSONColumnWithJsonArrayDefault",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY)",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, tags JSON NOT NULL DEFAULT (json_array()))",
+			expected: "ALTER TABLE `t1` ADD COLUMN `tags` json NOT NULL DEFAULT (json_array())",
+		},
+		{
+			name:     "NoChanges_JSONColumnWithExpressionDefault",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, metadata JSON NOT NULL DEFAULT (json_object()))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, metadata JSON NOT NULL DEFAULT (json_object()))",
+			expected: "",
+		},
+		{
+			name:     "ModifyColumnToAddJSONExpressionDefault",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, metadata JSON NULL)",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, metadata JSON NOT NULL DEFAULT (json_object()))",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `metadata` json NOT NULL DEFAULT (json_object())",
 		},
 	}
 

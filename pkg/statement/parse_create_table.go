@@ -31,24 +31,25 @@ type CreateTable struct {
 
 // Column represents a table column definition
 type Column struct {
-	Raw        *ast.ColumnDef    `json:"-"`
-	Name       string            `json:"name"`
-	Type       string            `json:"type"`
-	Length     *int              `json:"length,omitempty"`
-	Precision  *int              `json:"precision,omitempty"`
-	Scale      *int              `json:"scale,omitempty"`
-	Unsigned   *bool             `json:"unsigned,omitempty"`
-	EnumValues []string          `json:"enum_values,omitempty"` // Permitted values for ENUM type
-	SetValues  []string          `json:"set_values,omitempty"`  // Permitted values for SET type
-	Nullable   bool              `json:"nullable"`
-	Default    *string           `json:"default,omitempty"`
-	AutoInc    bool              `json:"auto_increment"`
-	PrimaryKey bool              `json:"primary_key"`
-	Unique     bool              `json:"unique"`
-	Comment    *string           `json:"comment,omitempty"`
-	Charset    *string           `json:"charset,omitempty"`
-	Collation  *string           `json:"collation,omitempty"`
-	Options    map[string]string `json:"options,omitempty"`
+	Raw           *ast.ColumnDef    `json:"-"`
+	Name          string            `json:"name"`
+	Type          string            `json:"type"`
+	Length        *int              `json:"length,omitempty"`
+	Precision     *int              `json:"precision,omitempty"`
+	Scale         *int              `json:"scale,omitempty"`
+	Unsigned      *bool             `json:"unsigned,omitempty"`
+	EnumValues    []string          `json:"enum_values,omitempty"` // Permitted values for ENUM type
+	SetValues     []string          `json:"set_values,omitempty"`  // Permitted values for SET type
+	Nullable      bool              `json:"nullable"`
+	Default       *string           `json:"default,omitempty"`
+	DefaultIsExpr bool              `json:"default_is_expr,omitempty"` // true when default is an expression (needs parens), e.g. DEFAULT (json_object())
+	AutoInc       bool              `json:"auto_increment"`
+	PrimaryKey    bool              `json:"primary_key"`
+	Unique        bool              `json:"unique"`
+	Comment       *string           `json:"comment,omitempty"`
+	Charset       *string           `json:"charset,omitempty"`
+	Collation     *string           `json:"collation,omitempty"`
+	Options       map[string]string `json:"options,omitempty"`
 }
 
 // IndexColumn represents a column or expression in an index
@@ -513,6 +514,11 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 			column.Unique = true
 		case ast.ColumnOptionDefaultValue:
 			if opt.Expr != nil {
+				// Detect expression defaults: the TiDB parser wraps non-CURRENT_TIMESTAMP
+				// function calls in outer parentheses (e.g., DEFAULT (json_object())).
+				// We track this so we can reproduce the correct syntax when generating ALTERs.
+				column.DefaultIsExpr = isExpressionDefault(opt.Expr)
+
 				defaultVal := ct.parseExpression(opt.Expr)
 				if defaultStr, ok := defaultVal.(string); ok && defaultStr != "" {
 					// Remove surrounding quotes if present for string literals
@@ -1031,6 +1037,31 @@ func (ct *CreateTable) parseSubPartitionDefinition(sub *ast.SubPartitionDefiniti
 	return subDef
 }
 
+// isExpressionDefault returns true when the default value expression should be
+// wrapped in parentheses in the generated DDL. MySQL requires expression defaults
+// (as opposed to literal defaults) to be enclosed in parens, e.g. DEFAULT (json_object()).
+// This mirrors the logic in the TiDB parser's ColumnOption.Restore for ColumnOptionDefaultValue:
+// non-CURRENT_TIMESTAMP function calls and column name expressions get outer parentheses.
+func isExpressionDefault(expr ast.ExprNode) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case *ast.FuncCallExpr:
+		// CURRENT_TIMESTAMP (and aliases NOW, LOCALTIME, etc.) are literal-style defaults
+		// that don't need parens. Everything else is an expression default.
+		switch e.FnName.L {
+		case "current_timestamp", "now", "localtime", "localtimestamp", "utc_timestamp":
+			return false
+		}
+		return true
+	case *ast.ColumnNameExpr:
+		return true
+	default:
+		return false
+	}
+}
+
 // parseExpression converts an expression to a string representation
 func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
 	if expr == nil {
@@ -1042,8 +1073,6 @@ func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
 	case *ast.FuncCallExpr:
 		// Handle function calls like CURRENT_TIMESTAMP, CURRENT_TIMESTAMP(3), UUID(), etc.
 		// We use Restore to preserve function arguments (e.g. precision in CURRENT_TIMESTAMP(3)).
-		// For CURRENT_TIMESTAMP with no args, Restore produces "CURRENT_TIMESTAMP()" but
-		// MySQL's canonical form (SHOW CREATE TABLE) omits the parens, so we normalize it.
 		var sb strings.Builder
 		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags|format.RestoreStringWithoutCharset, &sb)
 		if err := e.Restore(rCtx); err != nil {
@@ -1052,7 +1081,12 @@ func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
 		restored := sb.String()
 		// Normalize: MySQL's canonical SHOW CREATE TABLE uses "CURRENT_TIMESTAMP" (no parens)
 		// when there is no fractional seconds precision, but the parser's Restore always adds "()".
-		if len(e.Args) == 0 && strings.HasSuffix(restored, "()") {
+		// We only strip parens for timestamp-family functions; other functions like json_object()
+		// need to keep their parens as they represent actual function calls.
+		name := strings.ToUpper(e.FnName.L)
+		isTimestampFunc := name == "CURRENT_TIMESTAMP" || name == "NOW" ||
+			name == "LOCALTIME" || name == "LOCALTIMESTAMP" || name == "UTC_TIMESTAMP"
+		if isTimestampFunc && len(e.Args) == 0 && strings.HasSuffix(restored, "()") {
 			restored = strings.TrimSuffix(restored, "()")
 		}
 		return strings.ToLower(restored)

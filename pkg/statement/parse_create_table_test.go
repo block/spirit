@@ -1843,6 +1843,67 @@ func TestCurrentTimestampPrecision(t *testing.T) {
 	}
 }
 
+// TestExpressionDefaultParsing tests that expression defaults (e.g., DEFAULT (json_object()))
+// are correctly parsed with DefaultIsExpr=true, while literal defaults remain DefaultIsExpr=false.
+func TestExpressionDefaultParsing(t *testing.T) {
+	testCases := []struct {
+		name            string
+		sql             string
+		columnName      string
+		expectedDefault string
+		expectedIsExpr  bool
+	}{
+		{
+			name:            "json_object expression default",
+			sql:             "CREATE TABLE t1 (id INT PRIMARY KEY, metadata JSON NOT NULL DEFAULT (json_object()))",
+			columnName:      "metadata",
+			expectedDefault: "json_object()",
+			expectedIsExpr:  true,
+		},
+		{
+			name:            "json_array expression default",
+			sql:             "CREATE TABLE t1 (id INT PRIMARY KEY, tags JSON NOT NULL DEFAULT (json_array()))",
+			columnName:      "tags",
+			expectedDefault: "json_array()",
+			expectedIsExpr:  true,
+		},
+		{
+			name:            "CURRENT_TIMESTAMP is not an expression default",
+			sql:             "CREATE TABLE t1 (id INT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+			columnName:      "created_at",
+			expectedDefault: "current_timestamp",
+			expectedIsExpr:  false,
+		},
+		{
+			name:            "string literal is not an expression default",
+			sql:             "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) DEFAULT 'hello')",
+			columnName:      "name",
+			expectedDefault: "hello",
+			expectedIsExpr:  false,
+		},
+		{
+			name:            "UUID expression default",
+			sql:             "CREATE TABLE t1 (id INT PRIMARY KEY, uid VARCHAR(36) NOT NULL DEFAULT (uuid()))",
+			columnName:      "uid",
+			expectedDefault: "uuid()",
+			expectedIsExpr:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ct, err := ParseCreateTable(tc.sql)
+			require.NoError(t, err)
+
+			col := ct.Columns.ByName(tc.columnName)
+			require.NotNil(t, col, "column %q not found", tc.columnName)
+			require.NotNil(t, col.Default, "column %q has no default", tc.columnName)
+			assert.Equal(t, tc.expectedDefault, *col.Default)
+			assert.Equal(t, tc.expectedIsExpr, col.DefaultIsExpr, "DefaultIsExpr mismatch for %q", tc.columnName)
+		})
+	}
+}
+
 // TestBinaryTypeDetection tests that binary types are correctly detected and converted
 // from their text equivalents when the binary flag is set
 func TestBinaryTypeDetection(t *testing.T) {
