@@ -359,3 +359,65 @@ func (d *delayedCallbackApplier) Stop() error {
 func (d *delayedCallbackApplier) GetTargets() []applier.Target {
 	return d.realApplier.GetTargets()
 }
+
+// TestBufferedCopierGeometry tests that the buffered copier correctly handles
+// GEOMETRY column data (binary spatial values). This is important because
+// geometry data is stored as binary blobs with internal structure, and
+// incorrect handling (e.g. charset conversion, escaping) could corrupt it.
+func TestBufferedCopierGeometry(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS geomsrc, geomdst")
+	testutils.RunSQL(t, `CREATE TABLE geomsrc (
+		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(255) NOT NULL,
+		location GEOMETRY NOT NULL SRID 4326,
+		SPATIAL INDEX idx_location (location)
+	)`)
+	testutils.RunSQL(t, `CREATE TABLE geomdst (
+		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(255) NOT NULL,
+		location GEOMETRY NOT NULL SRID 4326,
+		SPATIAL INDEX idx_location (location)
+	)`)
+	testutils.RunSQL(t, `INSERT INTO geomsrc (name, location) VALUES
+		('Statue of Liberty', ST_GeomFromText('POINT(-74.0445 40.6892)', 4326, 'axis-order=long-lat')),
+		('Eiffel Tower', ST_GeomFromText('POINT(2.2945 48.8584)', 4326, 'axis-order=long-lat')),
+		('Big Ben', ST_GeomFromText('POINT(-0.1246 51.5007)', 4326, 'axis-order=long-lat')),
+		('Colosseum', ST_GeomFromText('POINT(12.4924 41.8902)', 4326, 'axis-order=long-lat')),
+		('Sydney Opera House', ST_GeomFromText('POINT(151.2153 -33.8568)', 4326, 'axis-order=long-lat')),
+		('Great Wall of China', ST_GeomFromText('POINT(116.5704 40.4319)', 4326, 'axis-order=long-lat')),
+		('Machu Picchu', ST_GeomFromText('POINT(-72.5450 -13.1631)', 4326, 'axis-order=long-lat')),
+		('Taj Mahal', ST_GeomFromText('POINT(78.0421 27.1751)', 4326, 'axis-order=long-lat')),
+		('Christ the Redeemer', ST_GeomFromText('POINT(-43.2105 -22.9519)', 4326, 'axis-order=long-lat')),
+		('Golden Gate Bridge', ST_GeomFromText('POINT(-122.4783 37.8199)', 4326, 'axis-order=long-lat'))
+	`)
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	assert.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	t1 := table.NewTableInfo(db, "test", "geomsrc")
+	assert.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "geomdst")
+	assert.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg := NewCopierDefaultConfig()
+	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
+	require.NoError(t, err)
+	chunker, err := table.NewChunker(t1, t2, cfg.TargetChunkTime, cfg.Logger)
+	assert.NoError(t, err)
+	assert.NoError(t, chunker.Open())
+
+	copier, err := NewCopier(db, chunker, cfg)
+	assert.NoError(t, err)
+	assert.NoError(t, copier.Run(t.Context()))
+
+	// Verify geometry data was copied correctly by comparing ST_AsText output.
+	var checksumSrc, checksumDst string
+	err = db.QueryRowContext(t.Context(),
+		"SELECT BIT_XOR(CRC32(CONCAT(id, name, ST_AsText(location)))) FROM geomsrc").Scan(&checksumSrc)
+	assert.NoError(t, err)
+	err = db.QueryRowContext(t.Context(),
+		"SELECT BIT_XOR(CRC32(CONCAT(id, name, ST_AsText(location)))) FROM geomdst").Scan(&checksumDst)
+	assert.NoError(t, err)
+	assert.Equal(t, checksumSrc, checksumDst, "geometry data checksum mismatch after buffered copy")
+}
