@@ -495,13 +495,13 @@ func TestRunLinters_AppliesDefaultConfig(t *testing.T) {
 	stmts, err := statement.New(sql)
 	require.NoError(t, err)
 
-	// Run without any config - should apply default (raiseError=false)
+	// Run without any config - should apply default (raiseError=true)
 	violations, err := RunLinters(nil, stmts, Config{})
 	require.NoError(t, err)
 
 	require.Len(t, violations, 1)
-	// Default raiseError is "false", so severity should be Warning
-	assert.Equal(t, SeverityWarning, violations[0].Severity)
+	// Default raiseError is "true", so severity should be Error
+	assert.Equal(t, SeverityError, violations[0].Severity)
 }
 
 func TestRunLinters_UserConfigOverridesDefault(t *testing.T) {
@@ -512,19 +512,19 @@ func TestRunLinters_UserConfigOverridesDefault(t *testing.T) {
 	stmts, err := statement.New(sql)
 	require.NoError(t, err)
 
-	// Override default raiseError=false with true
+	// Override default raiseError=true with false
 	violations, err := RunLinters(nil, stmts, Config{
 		Settings: map[string]map[string]string{
 			"invisible_index_before_drop": {
-				"raiseError": "true",
+				"raiseError": "false",
 			},
 		},
 	})
 	require.NoError(t, err)
 
 	require.Len(t, violations, 1)
-	// User set raiseError=true, so severity should be Error
-	assert.Equal(t, SeverityError, violations[0].Severity)
+	// User set raiseError=false, so severity should be Warning
+	assert.Equal(t, SeverityWarning, violations[0].Severity)
 }
 
 // LintOnlyChanges tests

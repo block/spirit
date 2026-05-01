@@ -29,7 +29,7 @@ func TestRenameColumnLinter_RenameColumn(t *testing.T) {
 
 	require.Len(t, violations, 1)
 	assert.Equal(t, "rename_column", violations[0].Linter.Name())
-	assert.Equal(t, SeverityWarning, violations[0].Severity)
+	assert.Equal(t, SeverityError, violations[0].Severity)
 	assert.Contains(t, violations[0].Message, "old_name")
 	assert.Contains(t, violations[0].Message, "new_name")
 	assert.Contains(t, violations[0].Message, "users")
@@ -49,7 +49,7 @@ func TestRenameColumnLinter_ChangeColumnWithRename(t *testing.T) {
 
 	require.Len(t, violations, 1)
 	assert.Equal(t, "rename_column", violations[0].Linter.Name())
-	assert.Equal(t, SeverityWarning, violations[0].Severity)
+	assert.Equal(t, SeverityError, violations[0].Severity)
 	assert.Contains(t, violations[0].Message, "old_col")
 	assert.Contains(t, violations[0].Message, "new_col")
 	assert.Contains(t, violations[0].Message, "CHANGE COLUMN")
@@ -93,8 +93,8 @@ func TestRenameColumnLinter_MultipleRenames(t *testing.T) {
 	violations := linter.Lint(nil, stmts)
 
 	require.Len(t, violations, 2)
-	assert.Equal(t, SeverityWarning, violations[0].Severity)
-	assert.Equal(t, SeverityWarning, violations[1].Severity)
+	assert.Equal(t, SeverityError, violations[0].Severity)
+	assert.Equal(t, SeverityError, violations[1].Severity)
 }
 
 func TestRenameColumnLinter_MixedOperations(t *testing.T) {

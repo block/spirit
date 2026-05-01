@@ -49,7 +49,7 @@ func (l *InvisibleIndexBeforeDropLinter) Configure(config map[string]string) err
 
 func (l *InvisibleIndexBeforeDropLinter) DefaultConfig() map[string]string {
 	return map[string]string{
-		"raiseError": "false",
+		"raiseError": "true",
 	}
 }
 

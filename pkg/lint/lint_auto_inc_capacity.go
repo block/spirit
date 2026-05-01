@@ -107,8 +107,7 @@ func (l *AutoIncCapacityLinter) Lint(existingTables []*statement.CreateTable, ch
 			threshold := maxValue * l.threshold / 100
 			if autoInc > threshold {
 				violations = append(violations, Violation{
-					// TODO: Consider changing back to SeverityError - exceeding auto-increment capacity is a serious issue
-					Severity: SeverityWarning,
+					Severity: SeverityError,
 					Linter:   l,
 					Location: &Location{
 						Table:  ct.TableName,

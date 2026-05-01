@@ -91,7 +91,7 @@ func TestAutoIncCapacity_AboveThreshold_TinyInt(t *testing.T) {
 	// 220 is above 85% of 255 (216)
 	require.Len(t, violations, 1)
 	assert.Equal(t, "auto_inc_capacity", violations[0].Linter.Name())
-	assert.Equal(t, SeverityWarning, violations[0].Severity)
+	assert.Equal(t, SeverityError, violations[0].Severity)
 	assert.Equal(t, "users", violations[0].Location.Table)
 	assert.NotNil(t, violations[0].Location.Column)
 	assert.Equal(t, "id", *violations[0].Location.Column)
@@ -582,7 +582,7 @@ func TestAutoIncCapacity_ViolationStructure(t *testing.T) {
 
 	assert.NotNil(t, v.Linter)
 	assert.Equal(t, "auto_inc_capacity", v.Linter.Name())
-	assert.Equal(t, SeverityWarning, v.Severity)
+	assert.Equal(t, SeverityError, v.Severity)
 	assert.NotEmpty(t, v.Message)
 	assert.Contains(t, v.Message, "AUTO_INCREMENT")
 	assert.NotNil(t, v.Location)

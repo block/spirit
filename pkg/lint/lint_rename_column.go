@@ -63,7 +63,7 @@ func (l *RenameColumnLinter) Lint(_ []*statement.CreateTable, changes []*stateme
 						Column: strPtr(oldName),
 					},
 					Message:    fmt.Sprintf("Column rename detected in table %q: %q to %q. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled", change.Table, oldName, newName),
-					Severity:   SeverityWarning,
+					Severity:   SeverityError,
 					Suggestion: strPtr("Use ADD COLUMN + DROP COLUMN instead of RENAME COLUMN. This is the only safe approach"),
 				})
 			case ast.AlterTableChangeColumn:
@@ -80,7 +80,7 @@ func (l *RenameColumnLinter) Lint(_ []*statement.CreateTable, changes []*stateme
 								Column: strPtr(oldName),
 							},
 							Message:    fmt.Sprintf("Column rename detected in table %q: %q to %q via CHANGE COLUMN. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled", change.Table, oldName, newName),
-							Severity:   SeverityWarning,
+							Severity:   SeverityError,
 							Suggestion: strPtr("Use ADD COLUMN + DROP COLUMN instead of RENAME COLUMN. This is the only safe approach"),
 						})
 					}

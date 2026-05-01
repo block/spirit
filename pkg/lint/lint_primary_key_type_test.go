@@ -97,7 +97,7 @@ func TestPrimaryKeyLinter_IntError(t *testing.T) {
 	linter := &PrimaryKeyLinter{}
 	violations := linter.Lint([]*statement.CreateTable{ct}, nil)
 
-	// INT is not acceptable - but for now its a warning
+	// INT is not acceptable - warning for existing tables, error for new tables
 	require.Len(t, violations, 1)
 	assert.Equal(t, "primary_key", violations[0].Linter.Name())
 	assert.Equal(t, SeverityWarning, violations[0].Severity)
@@ -120,7 +120,7 @@ func TestPrimaryKeyLinter_VarcharError(t *testing.T) {
 	linter := &PrimaryKeyLinter{}
 	violations := linter.Lint([]*statement.CreateTable{ct}, nil)
 
-	// VARCHAR is not acceptable - but for now its a warning
+	// VARCHAR is not acceptable - warning for existing tables, error for new tables
 	require.Len(t, violations, 1)
 	assert.Equal(t, "primary_key", violations[0].Linter.Name())
 	assert.Equal(t, SeverityWarning, violations[0].Severity)
@@ -1272,4 +1272,37 @@ func TestIsSignedIntType_AllIntegerTypes(t *testing.T) {
 				"Expected %s to have signed=%v", tc.typeName, tc.shouldBeSigned)
 		})
 	}
+}
+
+// TestPrimaryKeyLinter_CreateTableInChanges_Error verifies that CREATE TABLE
+// statements in the changes parameter get SeverityError (stricter for new tables).
+func TestPrimaryKeyLinter_CreateTableInChanges_Error(t *testing.T) {
+	sql := "CREATE TABLE new_table (id INT PRIMARY KEY, name VARCHAR(255))"
+	stmts, err := statement.New(sql)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+
+	linter := &PrimaryKeyLinter{}
+	violations := linter.Lint(nil, stmts)
+
+	require.Len(t, violations, 1)
+	assert.Equal(t, SeverityError, violations[0].Severity)
+	assert.Contains(t, violations[0].Message, "Primary key column")
+	assert.Equal(t, "new_table", violations[0].Location.Table)
+}
+
+// TestPrimaryKeyLinter_ExistingTable_Warning verifies that existing tables
+// passed as existingTables get SeverityWarning (don't block ALTERs on legacy schemas).
+func TestPrimaryKeyLinter_ExistingTable_Warning(t *testing.T) {
+	sql := `CREATE TABLE legacy_table (id INT PRIMARY KEY, name VARCHAR(255))`
+	ct, err := statement.ParseCreateTable(sql)
+	require.NoError(t, err)
+
+	linter := &PrimaryKeyLinter{}
+	violations := linter.Lint([]*statement.CreateTable{ct}, nil)
+
+	require.Len(t, violations, 1)
+	assert.Equal(t, SeverityWarning, violations[0].Severity)
+	assert.Contains(t, violations[0].Message, "Primary key column")
+	assert.Equal(t, "legacy_table", violations[0].Location.Table)
 }
