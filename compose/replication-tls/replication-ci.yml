@@ -47,7 +47,7 @@ services:
   test:
     build:
       context: ../../.
-    command: go test -race -timeout=10m -parallel=4  ./...
+    command: go test -race -timeout=10m -parallel=2  ./...
     depends_on:
       mysql:
         condition: service_healthy
