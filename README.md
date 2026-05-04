@@ -36,7 +36,7 @@ For now, this optimization _only applies_ well when your table has an `auto_incr
 
 ### Change Row Map
 
-As Spirit discovers rows that have been changed via the binary log, it stores them in a map. Or rather, it stores the key, and if the last operation was a `DELETE` or any other operation. This is called the "change row map". Periodically it then flushes the change row map by batching a large `REPLACE INTO new_table .. SELECT FROM old_table` and `DELETE FROM new_table WHERE pk IN (..)` statement.
+As Spirit discovers rows that have been changed via the binary log, it stores them in a map. Or rather, it stores the row, and if the last operation was a `DELETE` or any other operation. This is called the "change row map". Periodically it then flushes the change row map.
 
 In some workloads this can result in significant performance improvements, because updates from the binary log are merged and de-duplicated. i.e. if a row is updated 10 times, it will only be copied once.
 
@@ -104,7 +104,8 @@ This scenario is kind of a worst case for gh-ost since it prioritizes replicatio
 Spirit works with the default configuration of MySQL 8.0, but checks that you have not changed the following settings:
   - `log-bin`
   - `binlog_format=ROW`
-  - `binlog_row_image=FULL` or `MINIMAL`
+  - `binlog_row_image=FULL`
+  - `binlog_order_commits=ON`
   - `innodb_autoinc_lock_mode=2`
   - `log_slave_updates=1`
   - `performance_schema=1`

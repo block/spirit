@@ -314,6 +314,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		MetricsSink:     &metrics.NoopSink{},
 		DBConfig:        r.dbConfig,
 		Applier:         r.applier, // Use the shared applier
+		Buffered:        true,      // move always uses the buffered copier
 	})
 	if err != nil {
 		return err
@@ -417,7 +418,7 @@ func (r *Runner) setup(ctx context.Context) error {
 	r.logger.Info("Setting up repl clients", "sourceCount", len(r.sources))
 	for i := range r.sources {
 		src := &r.sources[i]
-		src.replClient = repl.NewClient(src.db, src.config.Addr, src.config.User, src.config.Passwd, &repl.ClientConfig{
+		src.replClient = repl.NewClient(src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, &repl.ClientConfig{
 			Logger:          r.logger,
 			Concurrency:     r.move.Threads,
 			TargetBatchTime: r.move.TargetChunkTime,
@@ -425,7 +426,6 @@ func (r *Runner) setup(ctx context.Context) error {
 			DDLFilterSchema: src.config.DBName,
 			DDLFilterTables: r.move.SourceTables,
 			ServerID:        repl.NewServerID(),
-			Applier:         r.applier,
 			DBConfig:        r.dbConfig,
 		})
 	}
@@ -508,6 +508,7 @@ func (r *Runner) newCopy(ctx context.Context) error {
 		MetricsSink:     &metrics.NoopSink{},
 		DBConfig:        r.dbConfig,
 		Applier:         r.applier, // Use the shared applier
+		Buffered:        true,      // move always uses the buffered copier
 	})
 	if err != nil {
 		return err

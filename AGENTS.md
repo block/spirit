@@ -63,7 +63,6 @@ The `pkg/testutils/` package provides helpers used across all test files:
 - `NewTestTable(t, name, createSQL)` — creates a test table with automatic cleanup (see below)
 - `CreateUniqueTestDatabase(t)` — creates a unique temporary database with automatic cleanup via `t.Cleanup()`
 - `RunSQL(t, stmt)` / `RunSQLInDatabase(t, dbName, stmt)` — execute SQL against the test MySQL
-- `IsMinimalRBRTestRunner(t)` — detects minimal `binlog_row_image` environments to skip incompatible tests
 
 #### `NewTestTable` — preferred way to create test tables
 
@@ -204,15 +203,14 @@ Each package has its own `README.md` with detailed documentation. Key packages t
 The main orchestrator. `runner.go` contains the core migration loop. `Migration` struct is the Kong CLI binding. The `Run()` method drives the full lifecycle. See `cutover.go` for the atomic rename logic.
 
 ### `pkg/repl`
-Acts as a MySQL replica using [go-mysql](https://github.com/go-mysql-org/go-mysql). Three subscription types:
-- **DeltaMap** (preferred) — deduplicates changes in a map; requires memory-comparable PKs
-- **DeltaQueue** (fallback) — FIFO queue for non-memory-comparable PKs
-- **BufferedMap** (experimental) — stores full row data for cross-server moves
+Acts as a MySQL replica using [go-mysql](https://github.com/go-mysql-org/go-mysql). Two subscription types:
+- **BufferedMap** (default) — stores the full row image from the binlog and writes via the applier. Used for memory-comparable PKs (integers, binary strings, etc.). Sidesteps the binlog/visibility race that motivates `binlog_row_image=FULL` (see #746).
+- **DeltaQueue** (fallback) — FIFO queue using `REPLACE INTO ... SELECT` for non-memory-comparable PKs (e.g. `VARCHAR` collations). Slower; used only when `BufferedMap` cannot be.
 
 ### `pkg/copier`
 Two algorithms:
-- **Unbuffered** (default) — `INSERT IGNORE INTO ... SELECT` directly in MySQL
-- **Buffered** (experimental) — producer/consumer pattern for cross-server migrations
+- **Unbuffered** (default) — `INSERT IGNORE INTO ... SELECT` directly in MySQL.
+- **Buffered** (`--buffered`) — producer/consumer pattern; required for cross-server migrations (`pkg/move`) and opt-in for single-server schema changes. Selected via `CopierConfig.Buffered`; ignores the applier when `Buffered` is false even if one is supplied.
 
 ### `pkg/table`
 Three chunker implementations:
@@ -280,6 +278,5 @@ GitHub Actions workflows (`.github/workflows/`):
 - **mysql8.0.42-docker.yml** — integration tests against MySQL 8.0.42
 - **mysql84-docker.yml** — integration tests against MySQL 8.4
 - **mysql97-docker.yml** — integration tests against MySQL 9.7
-- **mysql8_rbr_minimal-docker.yml** — tests with minimal `binlog_row_image`
 - **buildandrun-docker.yml** — build and run smoke test
 - **release.yml** — release automation

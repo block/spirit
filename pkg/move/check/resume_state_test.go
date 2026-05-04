@@ -14,10 +14,6 @@ import (
 )
 
 func TestResumeStateCheck(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	// Setup source and target databases
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS resume_src`)
 	testutils.RunSQL(t, `CREATE DATABASE resume_src`)

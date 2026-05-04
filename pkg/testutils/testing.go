@@ -8,13 +8,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -118,38 +116,6 @@ func RunSQL(t *testing.T, stmt string) {
 	// Might be run in cleanup, use Background context
 	_, err = db.ExecContext(context.Background(), stmt)
 	require.NoError(t, err)
-}
-
-var (
-	isRBRTestRunnerCached bool
-	isRBRTestRunnerOnce   sync.Once
-)
-
-func IsMinimalRBRTestRunner(t *testing.T) bool {
-	// Check if we are in the minimal RBR test runner.
-	// we use this to skip certain tests.
-	isRBRTestRunnerOnce.Do(func() {
-		cfg, err := mysql.ParseDSN(DSN())
-		require.NoError(t, err)
-		db, err := sql.Open("mysql", cfg.FormatDSN())
-		require.NoError(t, err)
-		defer func() {
-			_ = db.Close()
-		}()
-		var binlogRowImage, binlogRowValueOptions string
-		err = db.QueryRowContext(t.Context(),
-			`SELECT
-		@@global.binlog_row_image,
-		@@global.binlog_row_value_options`).Scan(
-			&binlogRowImage,
-			&binlogRowValueOptions,
-		)
-		require.NoError(t, err)
-		if binlogRowImage != "FULL" || binlogRowValueOptions != "" {
-			isRBRTestRunnerCached = true
-		}
-	})
-	return isRBRTestRunnerCached
 }
 
 // WaitForReplicaHealthy polls SHOW REPLICA STATUS until both the IO and SQL

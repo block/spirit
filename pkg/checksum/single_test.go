@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/repl"
 	"github.com/block/spirit/pkg/table"
@@ -40,7 +41,7 @@ func TestBasicChecksum(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -78,7 +79,7 @@ func TestBasicValidation(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -135,7 +136,7 @@ func TestUnfixableUniqueChecksum(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -182,7 +183,7 @@ func TestFixCorrupt(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -239,7 +240,7 @@ func TestCorruptChecksum(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -280,7 +281,7 @@ func TestBoundaryCases(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -357,7 +358,7 @@ func TestChangeDataTypeDatetime(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -399,7 +400,7 @@ func TestYieldTimeout(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -451,7 +452,7 @@ func TestFromWatermark(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,

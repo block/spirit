@@ -16,9 +16,6 @@ import (
 )
 
 func TestBufferedMap(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	db, client, srcTable, dstTable := setupBufferedTest(t)
 	defer client.Close()
 	defer utils.CloseAndLog(db)
@@ -73,9 +70,6 @@ func TestBufferedMap(t *testing.T) {
 // TestBufferedMapVariableColumns tests the buffered map with a newTable
 // That doesn't have all the columns of the source table.
 func TestBufferedMapVariableColumns(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	t1 := `CREATE TABLE subscription_test (
 		id INT NOT NULL,
 		name VARCHAR(255) NOT NULL,
@@ -101,12 +95,11 @@ func TestBufferedMapVariableColumns(t *testing.T) {
 	}
 	applier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
 		ServerID:        NewServerID(),
-		Applier:         applier,
 	})
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
@@ -129,9 +122,6 @@ func TestBufferedMapVariableColumns(t *testing.T) {
 // TestBufferedMapIllegalValues tests the buffered map with values that
 // need escaping (e.g. quotes, backslashes, nulls).
 func TestBufferedMapIllegalValues(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	t1 := `CREATE TABLE subscription_test (
 		id INT NOT NULL,
 		name VARCHAR(255) NOT NULL,
@@ -161,12 +151,11 @@ func TestBufferedMapIllegalValues(t *testing.T) {
 	}
 	applier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
 		ServerID:        NewServerID(),
-		Applier:         applier,
 	})
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
@@ -213,9 +202,6 @@ func TestBufferedMapIllegalValues(t *testing.T) {
 // With the fix (new code): This test passes because underLock=true bypasses the
 // watermark optimization check, ensuring all changes are flushed.
 func TestBufferedMapFlushUnderLockBypassesWatermark(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	t1 := `CREATE TABLE subscription_test (
 		id INT NOT NULL,
 		name VARCHAR(255) NOT NULL,
@@ -347,9 +333,6 @@ func TestBufferedMapFlushUnderLockBypassesWatermark(t *testing.T) {
 // flushed, while keys at or above the watermark (copier hasn't passed them) are skipped.
 // This matches the deltaMap behavior.
 func TestBufferedMapFlushWithoutLockRespectsWatermark(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	t1 := `CREATE TABLE subscription_test (
 		id INT NOT NULL,
 		name VARCHAR(255) NOT NULL,

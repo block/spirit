@@ -192,9 +192,6 @@ func TestEnumReorder(t *testing.T) {
 		testEnumReorder(t, false)
 	})
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testEnumReorder(t, true)
 	})
 }
@@ -285,9 +282,6 @@ func TestSetReorder(t *testing.T) {
 		testSetReorder(t, false)
 	})
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testSetReorder(t, true)
 	})
 }
@@ -344,9 +338,6 @@ func testSetReorder(t *testing.T, enableBuffered bool) {
 // migration fails gracefully when it receives minimal RBR events from a rogue session.
 func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 	t.Parallel()
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner (global setting already minimal)")
-	}
 
 	tt := testutils.NewTestTable(t, "minrbr_buffered", `CREATE TABLE minrbr_buffered (
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -413,9 +404,6 @@ func TestAlterPKIntToBigInt(t *testing.T) {
 	t.Parallel()
 	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigInt(t, false) })
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testAlterPKIntToBigInt(t, true)
 	})
 }
@@ -449,9 +437,6 @@ func TestAlterPKIntToBigIntUnsigned(t *testing.T) {
 	t.Parallel()
 	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntUnsigned(t, false) })
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testAlterPKIntToBigIntUnsigned(t, true)
 	})
 }
@@ -480,9 +465,6 @@ func TestAlterPKTinyIntToInt(t *testing.T) {
 	t.Parallel()
 	t.Run("unbuffered", func(t *testing.T) { testAlterPKTinyIntToInt(t, false) })
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testAlterPKTinyIntToInt(t, true)
 	})
 }
@@ -511,9 +493,6 @@ func TestAlterPKIntToBigIntWithDML(t *testing.T) {
 	t.Parallel()
 	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntWithDML(t, false) })
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testAlterPKIntToBigIntWithDML(t, true)
 	})
 }
@@ -556,9 +535,6 @@ func TestAlterPKCompositeDatatypeChange(t *testing.T) {
 	t.Parallel()
 	t.Run("unbuffered", func(t *testing.T) { testAlterPKCompositeDatatypeChange(t, false) })
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testAlterPKCompositeDatatypeChange(t, true)
 	})
 }
@@ -595,9 +571,6 @@ func TestAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T) {
 	t.Parallel()
 	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t, false) })
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t, true)
 	})
 }

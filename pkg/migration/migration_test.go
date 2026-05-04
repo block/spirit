@@ -152,9 +152,6 @@ func TestGeneratedColumns(t *testing.T) {
 		testGeneratedColumns(t, false)
 	})
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testGeneratedColumns(t, true)
 	})
 }
@@ -177,9 +174,6 @@ func TestStoredGeneratedColumns(t *testing.T) {
 		testStoredGeneratedColumns(t, false)
 	})
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testStoredGeneratedColumns(t, true)
 	})
 }
@@ -222,9 +216,6 @@ func TestBinaryChecksum(t *testing.T) {
 		testBinaryChecksum(t, false)
 	})
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testBinaryChecksum(t, true)
 	})
 }
@@ -264,9 +255,6 @@ func TestConvertCharset(t *testing.T) {
 		testConvertCharset(t, false)
 	})
 	t.Run("buffered", func(t *testing.T) {
-		if testutils.IsMinimalRBRTestRunner(t) {
-			t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-		}
 		testConvertCharset(t, true)
 	})
 }
@@ -404,9 +392,6 @@ func TestLargeNumberOfMultiChanges(t *testing.T) {
 }
 
 func TestBufferedMultiTableMigration(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping buffered copy test because binlog_row_image is not FULL or binlog_row_value_options is not empty")
-	}
 	tt := testutils.NewTestTable(t, "bmt_t1", `CREATE TABLE bmt_t1 (
 		id int not null primary key auto_increment,
 		name varchar(100) not null,

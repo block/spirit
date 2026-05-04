@@ -24,9 +24,6 @@ import (
 // and a reserved name column: `values` which stores an email address.
 // The generated column appears before the sharding column to test column order handling.
 func TestShardedMove(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -148,9 +145,6 @@ func TestShardedMove(t *testing.T) {
 // TestNtoMShardedMove tests an N:M resharding scenario:
 // 2 source shards → 2 target shards, with data redistributed by even/odd hash.
 func TestNtoMShardedMove(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	// Create 2 source databases and 2 target databases.
 	src0Name, _ := testutils.CreateUniqueTestDatabase(t)
 	src1Name, _ := testutils.CreateUniqueTestDatabase(t)
@@ -252,10 +246,6 @@ func TestNtoMShardedMove(t *testing.T) {
 // the checkpoint is always written to sources[0], and the upstream caller may
 // construct the DSN slice from a map with non-deterministic iteration order.
 func TestNtoMShardedMoveCheckpointDeterminism(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	src0Name, _ := testutils.CreateUniqueTestDatabase(t)
 	src1Name, _ := testutils.CreateUniqueTestDatabase(t)
 	tgt0Name, _ := testutils.CreateUniqueTestDatabase(t)

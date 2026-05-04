@@ -128,7 +128,8 @@ type Client struct {
 }
 
 // NewClient creates a new Client instance.
-func NewClient(db *sql.DB, host string, username, password string, config *ClientConfig) *Client {
+// config.Applier is required!
+func NewClient(db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig) *Client {
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig() // default DB config
 	}
@@ -147,7 +148,7 @@ func NewClient(db *sql.DB, host string, username, password string, config *Clien
 		ddlFilterSchema:  config.DDLFilterSchema,
 		ddlFilterTables:  toSet(config.DDLFilterTables),
 		serverID:         config.ServerID,
-		applier:          config.Applier,
+		applier:          appl,
 	}
 }
 
@@ -156,7 +157,6 @@ type ClientConfig struct {
 	Concurrency     int
 	Logger          *slog.Logger
 	ServerID        uint32
-	Applier         applier.Applier
 	DBConfig        *dbconn.DBConfig // Database configuration including TLS settings
 
 	// CancelFunc is an optional callback from the caller (e.g. migration or move runner).
@@ -229,8 +229,10 @@ func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, chunke
 		return fmt.Errorf("subscription already exists for table %s.%s", currentTable.SchemaName, currentTable.TableName)
 	}
 
-	// Decide which subscription type to use. We always prefer deltaMap
-	// But will fall back to deltaQueue if the PK is not memory comparable.
+	// Decide which subscription type to use. We always prefer bufferedMap
+	// But will fall back to deltaQueue if the PK is not memory comparable
+	// *for now*. In future we intend to handle everything via
+	// bufferedMap, see: https://github.com/block/spirit/issues/475
 	if err := currentTable.PrimaryKeyIsMemoryComparable(); err != nil {
 		c.subscriptions[subKey] = &deltaQueue{
 			table:    currentTable,
@@ -241,24 +243,13 @@ func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, chunke
 		}
 		return nil
 	}
-	if c.applier != nil {
-		c.subscriptions[subKey] = &bufferedMap{
-			table:    currentTable,
-			newTable: newTable,
-			changes:  make(map[string]bufferedChange),
-			c:        c,
-			chunker:  chunker,
-			applier:  c.applier,
-		}
-		return nil
-	}
-	// Default case is delta map
-	c.subscriptions[subKey] = &deltaMap{
+	c.subscriptions[subKey] = &bufferedMap{
 		table:    currentTable,
 		newTable: newTable,
-		changes:  make(map[string]mapChange),
+		changes:  make(map[string]bufferedChange),
 		c:        c,
 		chunker:  chunker,
+		applier:  c.applier,
 	}
 	return nil
 }
@@ -736,14 +727,8 @@ func (c *Client) processRowsEvent(ev *replication.BinlogEvent, e *replication.Ro
 	}
 
 	// Runtime check for minimal RBR (binlog_row_image=MINIMAL).
-	// When a buffered applier is in use, it needs full row images to replay
-	// changes on the target. Minimal row images skip non-PK, non-changed columns
-	// which would cause data loss. We check c.applier rather than iterating
-	// all subscriptions for performance, since c.applier != nil implies a
-	// bufferedMap subscription is in use.
-	if c.applier != nil && isMinimalRowImage(e) {
-		return fmt.Errorf("received a minimal RBR event for table %s.%s, but a buffered applier is in use which requires full row images (binlog_row_image=FULL). "+
-			"Please set binlog_row_image=FULL on the source server", string(e.Table.Schema), string(e.Table.Table))
+	if isMinimalRowImage(e) {
+		return fmt.Errorf("received a minimal RBR event for table %s.%s, but we require binlog_row_image=FULL on the source server", string(e.Table.Schema), string(e.Table.Table))
 	}
 
 	eventType := parseEventType(ev.Header.EventType)

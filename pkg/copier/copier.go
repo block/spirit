@@ -44,7 +44,17 @@ type CopierConfig struct {
 	Logger          *slog.Logger
 	MetricsSink     metrics.Sink
 	DBConfig        *dbconn.DBConfig
-	Applier         applier.Applier
+	// Applier is used by the buffered copier to write rows to the destination.
+	// It is also used by callers (migration/move runner) for the replication
+	// client. Construction is shared so that both paths use the same applier
+	// when buffered copy is opted in. When Buffered is false the copier
+	// ignores the applier.
+	Applier applier.Applier
+	// Buffered selects between the buffered copier (which streams row images
+	// through Applier) and the unbuffered copier (which issues
+	// INSERT IGNORE INTO _new ... SELECT FROM original directly). Defaults to
+	// false (unbuffered).
+	Buffered bool
 }
 
 // NewCopierDefaultConfig returns a default config for the copier.
@@ -70,7 +80,10 @@ func NewCopier(db *sql.DB, chunker table.Chunker, config *CopierConfig) (Copier,
 	if config.DBConfig == nil {
 		return nil, errors.New("dbConfig must be non-nil")
 	}
-	if config.Applier != nil {
+	if config.Buffered {
+		if config.Applier == nil {
+			return nil, errors.New("buffered copier requires a non-nil Applier")
+		}
 		return &buffered{
 			db:               db,
 			concurrency:      config.Concurrency,

@@ -16,7 +16,6 @@ import (
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/go-mysql-org/go-mysql/replication"
 	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -24,7 +23,7 @@ import (
 
 func TestMain(m *testing.M) {
 	// Tests run at Debug level so diagnostic logs in the binlog applier
-	// path (HasChanged add/drop, deltaMap.Flush stmt + affected_rows) are
+	// path (HasChanged add/drop, bufferedMap.Flush stmt + affected_rows) are
 	// captured in CI output. See issue #746.
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 	maxRecreateAttempts = 3
@@ -48,7 +47,7 @@ func TestReplClient(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -98,7 +97,7 @@ func TestReplClientComplex(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
 
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second})
 	require.NoError(t, err)
@@ -191,7 +190,7 @@ func TestReplClientResumeFromImpossible(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -225,7 +224,7 @@ func TestReplClientResumeFromPoint(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -265,7 +264,7 @@ func TestReplClientOpts(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -327,7 +326,7 @@ func TestReplClientQueue(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
 
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: 1000})
 	require.NoError(t, err)
@@ -392,7 +391,7 @@ func TestFeedback(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
 	require.NoError(t, client.AddSubscription(t1, t2, chunker))
@@ -451,7 +450,7 @@ func TestBlockWait(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -522,7 +521,7 @@ func TestDDLNotification(t *testing.T) {
 
 	// Use a channel to track cancel calls from the CancelFunc callback.
 	cancelled := make(chan struct{}, 1)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -596,7 +595,7 @@ func TestCompositePKUpdate(t *testing.T) {
 	logger := slog.Default()
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -682,11 +681,11 @@ func TestAllChangesFlushed(t *testing.T) {
 	require.True(t, client.AllChangesFlushed(), "Should be flushed with no changes")
 
 	// Test 2: Add a subscription and verify initial state
-	sub := &deltaMap{
+	sub := &bufferedMap{
 		c:        client,
 		table:    srcTable,
 		newTable: dstTable,
-		changes:  make(map[string]mapChange),
+		changes:  make(map[string]bufferedChange),
 	}
 	client.subscriptions[encodeSchemaTable(srcTable.SchemaName, srcTable.TableName)] = sub
 	require.True(t, client.AllChangesFlushed(), "Should be flushed with empty subscription")
@@ -701,19 +700,19 @@ func TestAllChangesFlushed(t *testing.T) {
 	require.False(t, client.AllChangesFlushed(), "Should not be flushed with buffered position ahead")
 
 	// Test 5: Test with multiple subscriptions
-	sub2 := &deltaMap{
+	sub2 := &bufferedMap{
 		c:        client,
 		table:    srcTable,
 		newTable: dstTable,
-		changes:  make(map[string]mapChange),
+		changes:  make(map[string]bufferedChange),
 	}
 	client.subscriptions["test2"] = sub2
 	sub2.HasChanged([]any{2}, nil, false)
 	require.False(t, client.AllChangesFlushed(), "Should not be flushed with changes in any subscription")
 
 	// Test 6: Clear changes but keep positions different - should still be considered flushed
-	sub.changes = make(map[string]mapChange)
-	sub2.changes = make(map[string]mapChange)
+	sub.changes = make(map[string]bufferedChange)
+	sub2.changes = make(map[string]bufferedChange)
 	require.True(t, client.AllChangesFlushed(), "Should be flushed when no pending changes, even with positions different")
 
 	// Test 7: Align positions and verify still flushed
@@ -760,7 +759,7 @@ func TestMaxRecreateAttemptsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
+	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), &ClientConfig{
 		Logger:          slog.Default(),
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
@@ -876,131 +875,6 @@ func TestNewServerIDRange(t *testing.T) {
 	}
 }
 
-// TestIsMinimalRowImage tests the isMinimalRowImage helper function.
-func TestIsMinimalRowImage(t *testing.T) {
-	// Full row image: SkippedColumns is nil
-	e := &replication.RowsEvent{}
-	require.False(t, isMinimalRowImage(e))
-
-	// Full row image: SkippedColumns has entries but all are empty
-	e = &replication.RowsEvent{
-		SkippedColumns: [][]int{{}, {}},
-	}
-	require.False(t, isMinimalRowImage(e))
-
-	// Minimal row image: SkippedColumns has entries with skipped column indices
-	e = &replication.RowsEvent{
-		SkippedColumns: [][]int{{1, 2}},
-	}
-	require.True(t, isMinimalRowImage(e))
-
-	// Minimal row image: mixed - some rows full, some minimal
-	e = &replication.RowsEvent{
-		SkippedColumns: [][]int{{}, {2}},
-	}
-	require.True(t, isMinimalRowImage(e))
-}
-
-// TestProcessRowsEventMinimalRBRWithApplier tests that processRowsEvent returns
-// an error when it detects a minimal RBR event and a buffered applier is in use.
-func TestProcessRowsEventMinimalRBRWithApplier(t *testing.T) {
-	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	testutils.RunSQL(t, "DROP TABLE IF EXISTS replminrbrt1, replminrbrt2")
-	testutils.RunSQL(t, "CREATE TABLE replminrbrt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "CREATE TABLE replminrbrt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
-
-	t1 := table.NewTableInfo(db, "test", "replminrbrt1")
-	require.NoError(t, t1.SetInfo(t.Context()))
-	t2 := table.NewTableInfo(db, "test", "replminrbrt2")
-	require.NoError(t, t2.SetInfo(t.Context()))
-
-	// Create a mock RowsEvent with minimal row image (skipped columns)
-	rowsEvent := &replication.RowsEvent{
-		Table: &replication.TableMapEvent{
-			Schema: []byte("test"),
-			Table:  []byte("replminrbrt1"),
-		},
-		Rows: [][]interface{}{
-			{1, nil, nil}, // INSERT with only PK, other columns skipped
-		},
-		SkippedColumns: [][]int{
-			{1, 2}, // columns b and c were skipped
-		},
-	}
-	binlogEvent := &replication.BinlogEvent{
-		Header: &replication.EventHeader{
-			EventType: replication.WRITE_ROWS_EVENTv2,
-		},
-		Event: rowsEvent,
-	}
-
-	// Test 1: With an applier set (buffered mode), minimal RBR should return an error
-	cfg, err := mysql2.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	applierInstance, err := applier.NewSingleTargetApplier(applier.Target{
-		DB:     db,
-		Config: cfg,
-	}, applier.NewApplierDefaultConfig())
-	require.NoError(t, err)
-
-	client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
-		Logger:          slog.Default(),
-		Concurrency:     4,
-		TargetBatchTime: time.Second,
-		ServerID:        NewServerID(),
-		Applier:         applierInstance,
-	})
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
-	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
-
-	err = client.processRowsEvent(binlogEvent, rowsEvent)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "minimal RBR event")
-	require.Contains(t, err.Error(), "binlog_row_image=FULL")
-
-	// Test 2: Without an applier (delta mode), minimal RBR should NOT return an error
-	client2 := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, &ClientConfig{
-		Logger:          slog.Default(),
-		Concurrency:     4,
-		TargetBatchTime: time.Second,
-		ServerID:        NewServerID(),
-	})
-	chunker, err = table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
-	require.NoError(t, err)
-	require.NoError(t, client2.AddSubscription(t1, t2, chunker))
-
-	err = client2.processRowsEvent(binlogEvent, rowsEvent)
-	require.NoError(t, err)
-
-	// Test 3: With an applier but full row image, should NOT return an error
-	fullRowsEvent := &replication.RowsEvent{
-		Table: &replication.TableMapEvent{
-			Schema: []byte("test"),
-			Table:  []byte("replminrbrt1"),
-		},
-		Rows: [][]interface{}{
-			{1, 2, 3}, // INSERT with all columns present
-		},
-		SkippedColumns: [][]int{
-			{}, // no columns skipped
-		},
-	}
-	fullBinlogEvent := &replication.BinlogEvent{
-		Header: &replication.EventHeader{
-			EventType: replication.WRITE_ROWS_EVENTv2,
-		},
-		Event: fullRowsEvent,
-	}
-
-	err = client.processRowsEvent(fullBinlogEvent, fullRowsEvent)
-	require.NoError(t, err)
-}
-
 func TestProcessDDLNotification(t *testing.T) {
 	// Helper: create a minimal Client with the given filter config and a cancel tracker.
 	makeClient := func(filterSchema string, filterTables []string) (*Client, *bool) {
@@ -1033,10 +907,10 @@ func TestProcessDDLNotification(t *testing.T) {
 			callerCancelFunc: func() bool { cancelled = true; return true },
 			subscriptions:    make(map[string]Subscription),
 		}
-		c.subscriptions[dbName+".orders"] = &deltaMap{
+		c.subscriptions[dbName+".orders"] = &bufferedMap{
 			table:    tbl,
 			newTable: newTbl,
-			changes:  make(map[string]mapChange),
+			changes:  make(map[string]bufferedChange),
 			c:        c,
 		}
 

@@ -24,9 +24,6 @@ func TestMain(m *testing.M) {
 }
 
 func TestBasicMove(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -72,9 +69,6 @@ func TestResumeFromCheckpointE2E(t *testing.T) {
 }
 
 func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -169,9 +163,6 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 // TestEmptyDatabaseMove tests that a move operation succeeds when the source database has no tables.
 // This is a valid scenario for shard splits where an empty shard needs to be split.
 func TestEmptyDatabaseMove(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 

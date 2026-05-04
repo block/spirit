@@ -18,9 +18,6 @@ import (
 // writes, exercising both deferred and non-deferred secondary indexes and
 // reproducing the "not all changes flushed" error seen during cutover.
 func TestMoveWithConcurrentWrites(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
 	testMoveWithConcurrentWrites(t, false)
 	testMoveWithConcurrentWrites(t, true)
 }
@@ -202,10 +199,6 @@ func doOneWriteLoop(ctx context.Context, db *sql.DB) error {
 // TestMoveWithNewTableCreation verifies that creating a new table in the source database
 // during a move operation causes the move to be cancelled immediately via table notification.
 func TestMoveWithNewTableCreation(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	sourceDSN := testutils.DSNForDatabase("source_newtable")
 	targetDSN := testutils.DSNForDatabase("dest_newtable")
 
@@ -316,10 +309,6 @@ func TestMoveWithNewTableCreation(t *testing.T) {
 // SET binlog_row_image = 'minimal' at the session level, which causes its DML
 // to produce minimal row images in the binlog even though the global setting is FULL.
 func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner (global setting already minimal)")
-	}
-
 	sourceDSN := testutils.DSNForDatabase("source_minrbr")
 	targetDSN := testutils.DSNForDatabase("dest_minrbr")
 
@@ -403,10 +392,6 @@ func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
 // target tables before resuming. This prevents phantom rows from the
 // keyAboveWatermark optimization race condition.
 func TestMoveResumeDeletesAboveWatermark(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	sourceDSN := testutils.DSNForDatabase("source_resume_wm")
 	targetDSN := testutils.DSNForDatabase("dest_resume_wm")
 

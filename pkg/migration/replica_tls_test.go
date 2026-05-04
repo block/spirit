@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/repl"
 	"github.com/block/spirit/pkg/testutils"
@@ -218,7 +219,13 @@ func TestReplicationClientTLSConfig(t *testing.T) {
 			defer utils.CloseAndLog(db)
 
 			// Create replication client
-			client := repl.NewClient(db, tc.host, "user", "pass", clientConfig)
+			appl, err := applier.NewSingleTargetApplier(applier.Target{DB: db}, &applier.ApplierConfig{
+				Logger:   slog.Default(),
+				DBConfig: tlsConfig,
+				Threads:  1,
+			})
+			require.NoError(t, err)
+			client := repl.NewClient(db, tc.host, "user", "pass", appl, clientConfig)
 			require.NotNil(t, client)
 
 			// Verify TLS config is stored

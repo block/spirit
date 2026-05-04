@@ -51,7 +51,7 @@ func TestNewCutOverValidation(t *testing.T) {
 	cfg.CancelFunc = func() bool { return false }
 	srcConfig, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	replClient := repl.NewClient(db, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
+	replClient := repl.NewClient(db, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
 
 	_, err = NewCutOver([]CutOverSource{{
 		DB:         db,
@@ -76,10 +76,6 @@ func TestNewCutOverValidation(t *testing.T) {
 // blocks source 1's LOCK TABLES attempt. In production, each source is
 // a separate MySQL server so this is not an issue.
 func TestCutOverSingleSource(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
 
 	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE t1 (
@@ -108,7 +104,7 @@ func TestCutOverSingleSource(t *testing.T) {
 
 	cfg := repl.NewClientDefaultConfig()
 	cfg.CancelFunc = func() bool { return false }
-	replClient := repl.NewClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
+	replClient := repl.NewClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
 	require.NoError(t, replClient.Run(ctx))
 	defer replClient.Close()
 

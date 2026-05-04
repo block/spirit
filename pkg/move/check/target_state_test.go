@@ -14,10 +14,6 @@ import (
 )
 
 func TestTargetStateCheck(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	// Setup source and target databases
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS state_src`)
 	testutils.RunSQL(t, `CREATE DATABASE state_src`)

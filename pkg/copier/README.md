@@ -90,6 +90,7 @@ type CopierConfig struct {
     MetricsSink                   metrics.Sink
     DBConfig                      *dbconn.DBConfig
     Applier                       applier.Applier
+    Buffered                      bool
 }
 ```
 
@@ -101,7 +102,8 @@ type CopierConfig struct {
 - **`Logger`** (default: `slog.Default()`): Structured logger for debugging and monitoring.
 - **`MetricsSink`** (default: `NoopSink`): Destination for metrics like chunk processing time and row counts.
 - **`DBConfig`**: Database connection configuration including retry settings.
-- **`Applier`**: When non-nil, the buffered copier is used instead of the unbuffered copier. The applier handles writing rows to the target.
+- **`Applier`**: Used by the buffered copier to write rows to the target. The migration runner shares one applier between the copier and the replication client, so this field may be set even when the copier itself is unbuffered — the unbuffered copier ignores it. Required (non-nil) when `Buffered` is true.
+- **`Buffered`** (default: `false`): Selects between the buffered and unbuffered copier implementations. The buffered copier streams rows through `Applier`; the unbuffered copier issues `INSERT IGNORE INTO _new ... SELECT FROM original` directly and ignores `Applier`.
 
 ## Usage
 
@@ -191,9 +193,10 @@ if err != nil {
     return err
 }
 
-// Create copier with buffered mode by specifying an applier
+// Create copier with buffered mode
 config := copier.NewCopierDefaultConfig()
 config.Applier = rowApplier
+config.Buffered = true
 
 copier, err := copier.NewCopier(sourceDB, chunker, config)
 if err != nil {

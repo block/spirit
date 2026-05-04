@@ -2,35 +2,39 @@
 
 The replication client tracks changes to tables by acting as a MySQL replica. The [go-mysql library](https://github.com/go-mysql-org/go-mysql) does most of the heavy lifting by connecting to MySQL and parsing binary log events. Spirit's role is to manage subscriptions for each table being migrated, deduplicate changes, and coordinate with the copier to avoid redundant work.
 
-Each table tracked is represented by a `subscription`, with three main implementations:
+Each table tracked is represented by a `subscription`, with two implementations:
 
 ## Subscription Implementations
 
-### Delta Map
+### Buffered Map
 
-The delta map is the preferred subscription type and is selected for tables with memory-comparable primary keys (integers, binary strings, etc.). It uses a map to track changes:
+The buffered map is the default subscription type and is selected for tables with memory-comparable primary keys (integers, binary strings, etc.). It stores the full row image directly from the binlog and applies it through the applier interface:
 
 **How it works:**
-- Maintains a map of `primaryKey -> (isDelete, originalKey)`
+- Maintains a map of `primaryKey -> (isDelete, fullRowImage)`
 - Multiple changes to the same row are automatically deduplicated (only the final state is stored)
-- Flushes changes in parallel across multiple threads
-- Uses `REPLACE INTO ... SELECT` to apply changes efficiently
+- Uses the applier's `UpsertRows` and `DeleteKeys` to write changes — there is no `SELECT FROM original` round-trip
+- Flushes changes through the applier's parallel write workers
 
 **Advantages:**
-- **Excellent deduplication**: If a row is modified 100 times, only one REPLACE operation is performed
-- **Parallel flushing**: Independent keys can be written concurrently for maximum throughput
-- **Memory efficient**: Only stores the latest state for each key
+- **Excellent deduplication**: If a row is modified 100 times, only one upsert is performed
+- **Parallel flushing**: Independent keys can be written concurrently via the applier
+- **No source-side reads at flush**: The row image is already in memory, so no contention with OLTP traffic on the source
+- **Sidesteps the binlog/visibility race**: Because the row image *is* the applied state, there is no opportunity for MySQL's binlog-vs-visibility ordering to surface a stale row (see [issue #746](https://github.com/block/spirit/issues/746))
 - **Watermark optimization (when supported by the chunker)**: Can skip ranges of keys using both `KeyAboveHighWatermark` and `KeyBelowLowWatermark`
+- **Cross-server compatibility**: The applier can target a different MySQL server, which is what `pkg/move` relies on
 
 **Limitations:**
-- Requires memory-comparable primary keys (no VARCHAR, FLOAT etc.)
+- Requires `binlog_row_image=FULL` and an empty `binlog_row_value_options` (the applier needs the complete row image)
+- Higher memory usage than a key-only map: stores full row data for each changed key
+- Requires memory-comparable primary keys; non-memory-comparable PKs fall back to the delta queue
 - Watermark optimizations (`KeyAboveHighWatermark` and `KeyBelowLowWatermark`) are available on `MappedChunker` implementations (both optimistic and composite chunkers). They work correctly for numeric, binary, and temporal primary key types. For `VARCHAR`/`TEXT` columns with collations, Go's byte-order comparison may differ from MySQL's collation order; any discrepancies are caught by the checksum phase (see [issue #479](https://github.com/block/spirit/issues/479)).
 
 **Example scenario:**
 ```
-Binlog events:  INSERT(id=1), UPDATE(id=1), UPDATE(id=1), DELETE(id=2)
-Delta map:      {1: REPLACE, 2: DELETE}
-Applied:        REPLACE INTO ... WHERE id=1; DELETE FROM ... WHERE id=2;
+Binlog events:  INSERT(id=1, ...), UPDATE(id=1, ...), UPDATE(id=1, ...), DELETE(id=2)
+Buffered map:   {1: {row: <latest image>}, 2: {isDelete}}
+Applied:        UpsertRows({id=1, ...}); DeleteKeys({id=2});
 ```
 
 ### Delta Queue
@@ -60,33 +64,7 @@ Delta queue:    [("abc", REPLACE), ("def" REPLACE), ("def", DELETE), ("abc", REP
 Applied:        REPLACE INTO ... WHERE k IN ("abc", "def"); DELETE FROM ... WHERE k="def"; REPLACE INTO ... WHERE k="abc";
 ```
 
-**Performance note:** The delta queue is significantly worse performing than the other two implementations. It should only be used when the primary key type makes the delta map impossible. It is so bad in fact, that in the future it is worth considering disabling it and relying on the checksum to catch issues. See [issue #475](https://github.com/block/spirit/issues/475).
-
-### Buffered Map
-
-The buffered map is a subscription type required for move operations where source and target are on different MySQL servers. It stores full row data and uses the applier interface:
-
-**How it works:**
-- Maintains a map of `primaryKeyHash -> (isDelete, fullRowData)`
-- Stores complete row data in memory, not just primary keys
-- Uses the applier interface to write changes (supports sharding and remote targets)
-- Flushes changes in parallel using the applier's batching logic
-
-**Advantages:**
-- **Better concurrency**: Doesn't hold locks on the source table during flush (no `SELECT` needed)
-- **Supports sharding**: Can distribute changes across multiple target databases via the applier
-- **Flexible targets**: Can potentially target non-MySQL destinations in the future
-- **Watermark optimization**: Supports both `KeyAboveHighWatermark` and `KeyBelowLowWatermark` optimizations
-
-**Limitations:**
-- **Significantly higher memory usage**: Stores full row data for each changed key
-- **Higher CPU usage**: buffering changes in the spirit daemon adds CPU load to Spirit
-- **More complex**: Requires coordination with the applier layer
-- **Not the default**: Less battle-tested than delta map for single-server schema changes
-
-**When to use:** Primarily for move operations where `REPLACE INTO ... SELECT` cannot be used because the source and target are on different MySQL servers.
-
-**Enabling:** Provide a non-nil `Applier` in the client config. When an applier is configured, buffered map behavior is enabled automatically, and this is set up by default for move operations.
+**Performance note:** The delta queue is significantly worse performing than the buffered map. It should only be used when the primary key type makes the buffered map impossible. It is so bad in fact, that in the future it is worth considering disabling it and relying on the checksum to catch issues. See [issue #475](https://github.com/block/spirit/issues/475).
 
 ## Features
 

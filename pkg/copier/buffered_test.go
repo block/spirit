@@ -34,6 +34,7 @@ func TestBufferedCopier(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
+	cfg.Buffered = true
 	target := applier.Target{
 		DB:       db,
 		KeyRange: "0",
@@ -95,6 +96,7 @@ func TestBufferedCopierCharsetConversion(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
+	cfg.Buffered = true
 	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
@@ -151,6 +153,7 @@ func TestBufferedCopierDataTypeConversionError(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
+	cfg.Buffered = true
 	cfg.TargetChunkTime = 10 // Small chunk time to create more chunks
 	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
@@ -207,6 +210,7 @@ func TestBufferedCopierChunkTimingIncludesCallbackDelay(t *testing.T) {
 
 	// Create copier config first so we can use its logger
 	cfg := NewCopierDefaultConfig()
+	cfg.Buffered = true
 
 	// Create a real chunker (we need real chunk metadata for the copier)
 	realChunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: 1000 * time.Millisecond, Logger: cfg.Logger})

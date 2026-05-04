@@ -56,12 +56,11 @@ func TestFixCorruptWithApplier(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start the applier so its workers can process async Apply calls
-	feed := repl.NewClient(src, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(src, cfg.Addr, cfg.User, cfg.Passwd, applier, &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
 		ServerID:        repl.NewServerID(),
-		Applier:         applier,
 	})
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
@@ -157,12 +156,11 @@ func TestDistributedChecksum(t *testing.T) {
 	// Create replication feed
 	// We're not going to do anything, but it's required by the distributed checker
 	logger := slog.Default()
-	feed := repl.NewClient(sourceDB, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed := repl.NewClient(sourceDB, cfg.Addr, cfg.User, cfg.Passwd, shardedApplier, &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
 		ServerID:        repl.NewServerID(),
-		Applier:         shardedApplier,
 	})
 	defer feed.Close()
 
@@ -285,12 +283,11 @@ func TestDistributedChecksumNtoM(t *testing.T) {
 
 	// Create a repl client per source. Both share the same applier.
 	logger := slog.Default()
-	feed0 := repl.NewClient(src0DB, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed0 := repl.NewClient(src0DB, cfg.Addr, cfg.User, cfg.Passwd, shardedApplier, &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
 		ServerID:        repl.NewServerID(),
-		Applier:         shardedApplier,
 	})
 	defer feed0.Close()
 	chunker0, err := table.NewChunker(src0Table, table.ChunkerConfig{NewTable: src0Table})
@@ -298,12 +295,11 @@ func TestDistributedChecksumNtoM(t *testing.T) {
 	require.NoError(t, feed0.AddSubscription(src0Table, src0Table, chunker0))
 	require.NoError(t, feed0.Run(t.Context()))
 
-	feed1 := repl.NewClient(src1DB, cfg.Addr, cfg.User, cfg.Passwd, &repl.ClientConfig{
+	feed1 := repl.NewClient(src1DB, cfg.Addr, cfg.User, cfg.Passwd, shardedApplier, &repl.ClientConfig{
 		Logger:          logger,
 		Concurrency:     4,
 		TargetBatchTime: time.Second,
 		ServerID:        repl.NewServerID(),
-		Applier:         shardedApplier,
 	})
 	defer feed1.Close()
 	chunker1, err := table.NewChunker(src1Table, table.ChunkerConfig{Logger: logger})

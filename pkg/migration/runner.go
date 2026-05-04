@@ -513,24 +513,29 @@ func (r *Runner) checkpointTableName() string {
 func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 	var err error
 	r.checkpointTable = table.NewTableInfo(r.db, r.changes[0].table.SchemaName, r.checkpointTableName())
-	// Create an applier if using buffered copy or buffered replication
-	var appl applier.Applier
-	if r.migration.Buffered {
-		// Create a SingleTargetApplier for the buffered copier.
-		// The applier is table-aware: each chunk/operation carries its own
-		// table info, so a single applier handles multi-table migrations correctly.
-		appl, err = applier.NewSingleTargetApplier(
-			applier.Target{DB: r.db},
-			&applier.ApplierConfig{
-				Logger:   r.logger,
-				DBConfig: r.dbConfig,
-				Threads:  r.migration.Threads,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to create applier for buffered copier: %w", err)
-		}
+
+	// We always create an applier — the replication client requires one to
+	// apply row images directly from the binlog (the buffered subscription
+	// path). This is what sidesteps the MySQL binlog/visibility race that
+	// caused silent row loss under load (issue #746): there is no SELECT
+	// FROM original ... after the row event arrives, the row image *is* the
+	// applied state.
+	//
+	// The same applier is handed to the copier, but the copier only uses it
+	// when buffered copy is opted in. Unbuffered copy issues INSERT IGNORE
+	// INTO _new ... SELECT FROM original directly and ignores the applier.
+	appl, err := applier.NewSingleTargetApplier(
+		applier.Target{DB: r.db},
+		&applier.ApplierConfig{
+			Logger:   r.logger,
+			DBConfig: r.dbConfig,
+			Threads:  r.migration.Threads,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create applier: %w", err)
 	}
+
 	// Create copier with the prepared chunker
 	r.copier, err = copier.NewCopier(r.db, r.copyChunker, &copier.CopierConfig{
 		Concurrency:     r.migration.Threads,
@@ -540,6 +545,7 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 		MetricsSink:     r.metricsSink,
 		DBConfig:        r.dbConfig,
 		Applier:         appl,
+		Buffered:        r.migration.Buffered,
 	})
 	if err != nil {
 		return err
@@ -547,14 +553,13 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 
 	// Set the binlog position.
 	// Create a binlog subscriber
-	r.replClient = repl.NewClient(r.db, r.migration.Host, r.migration.Username, *r.migration.Password, &repl.ClientConfig{
+	r.replClient = repl.NewClient(r.db, r.migration.Host, r.migration.Username, *r.migration.Password, appl, &repl.ClientConfig{
 		Logger:          r.logger,
 		Concurrency:     r.migration.Threads,
 		TargetBatchTime: r.migration.TargetChunkTime,
 		CancelFunc:      r.fatalError,
 		ServerID:        repl.NewServerID(),
 		DBConfig:        r.dbConfig, // Pass database configuration to replication client
-		Applier:         appl,
 	})
 	// For each of the changes, we know the new table exists now
 	// So we should call SetInfo to populate the columns etc.

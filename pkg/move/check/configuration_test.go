@@ -12,10 +12,6 @@ import (
 )
 
 func TestConfigurationCheck(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	db, err := sql.Open("mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -29,10 +25,6 @@ func TestConfigurationCheck(t *testing.T) {
 }
 
 func TestConfigurationCheckMultipleSources(t *testing.T) {
-	if testutils.IsMinimalRBRTestRunner(t) {
-		t.Skip("Skipping test for minimal RBR test runner")
-	}
-
 	db, err := sql.Open("mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
