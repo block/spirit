@@ -1780,3 +1780,180 @@ func TestBufferedMapGeometry(t *testing.T) {
 		"SELECT BIT_XOR(CRC32(CONCAT(id, name, ST_AsText(location)))) FROM _subscription_test_new").Scan(&checksumDst))
 	require.Equal(t, checksumSrc, checksumDst)
 }
+
+// TestBufferedMapJSONNumberRoundTrip is a regression test for a checksum
+// mismatch on JSON columns that surfaces whenever a binlog event for a row
+// with a numeric JSON value flows through the applier.
+//
+// Scenario: the row already exists in both the source and the _new table
+// (the bulk copier preserves the JSON binary server-side via
+// INSERT … SELECT), but a concurrent UPDATE on an unrelated non-JSON
+// column emits a full row image through binlog, and the JSON column is
+// re-serialised by the applier on the way to _new.
+//
+// The default go-mysql JSON decoder builds a Go value tree and then
+// json.Marshal's it, which silently drops type tags: JSONB_DOUBLE 1.0
+// becomes "1" (re-parsed as JSON INTEGER), and JSONB_OPAQUE/NEWDECIMAL
+// 1.0 becomes "\"1.0\"" (re-parsed as JSON STRING). The CRC32 over
+// CAST(j AS json) then disagrees, and every retry of pkg/checksum finds
+// fresh mismatches as concurrent traffic continues — manifesting as
+// "checksum found differences on every attempt (N/N)" on JSON-bearing
+// tables.
+//
+// All subtests pass with RenderJSONAsMySQLText=true on the
+// BinlogSyncerConfig, which routes JSON values through a renderer that
+// emits MySQL-text-compatible JSON directly from the JSONB byte stream,
+// preserving each value's original type tag.
+func TestBufferedMapJSONNumberRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		// initial JSON value seeded into both src and _new before the
+		// subscription begins — i.e. the state the bulk copier has
+		// already produced server-side.
+		initialJSON string
+	}{
+		// CAST(... AS DOUBLE) forces a JSONB_DOUBLE in MySQL.
+		{
+			name:        "json_double_with_double_cast",
+			initialJSON: `JSON_OBJECT('amount', CAST(1.0 AS DOUBLE), 'rate', CAST(2.5 AS DOUBLE))`,
+		},
+		// Bare 1.0 inside JSON_OBJECT is a SQL decimal literal that
+		// MySQL stores as JSONB_OPAQUE/NEWDECIMAL. Without the
+		// MySQL-text renderer this used to round-trip as a JSON STRING.
+		{
+			name:        "json_decimal_in_object",
+			initialJSON: `JSON_OBJECT('amount', 1.0, 'rate', 2.5)`,
+		},
+		// A JSON array containing bare 1.0 literals among integer
+		// zeros — the production failure shape. In array context MySQL
+		// stores 1.0 as JSONB_DOUBLE.
+		{
+			name:        "json_double_array",
+			initialJSON: `'[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0, 1.0]'`,
+		},
+		// Mixed-type object: string, int, bool, null, nested array of
+		// decimals. Exercises object key handling alongside the
+		// numeric subcases.
+		{
+			name:        "json_mixed_object",
+			initialJSON: `JSON_OBJECT('s', 'hi', 'n', 42, 'b', CAST(1 AS JSON), 'z', CAST(NULL AS JSON), 'a', JSON_ARRAY(1.0, 2.5, 3.0))`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Schema: a non-JSON column that the workload bumps, plus
+			// the JSON column we care about preserving.
+			t1 := `CREATE TABLE subscription_test (
+				id INT NOT NULL,
+				updated_at DATETIME(3) NOT NULL,
+				j JSON NOT NULL,
+				PRIMARY KEY (id)
+			)`
+			t2 := `CREATE TABLE _subscription_test_new (
+				id INT NOT NULL,
+				updated_at DATETIME(3) NOT NULL,
+				j JSON NOT NULL,
+				PRIMARY KEY (id)
+			)`
+			srcTable, dstTable := setupTestTables(t, t1, t2)
+
+			// Seed both tables BEFORE starting the binlog subscription
+			// so the JSON binary is identical on both sides (server-side
+			// INSERT … SELECT, no Go round-trip yet). This simulates the
+			// state Spirit's bulk copier produces before the checksum
+			// phase begins.
+			testutils.RunSQL(t, fmt.Sprintf(
+				"INSERT INTO %s (id, updated_at, j) VALUES (1, '2026-05-13 10:58:35.612', %s), (2, '2026-05-13 10:58:35.612', %s)",
+				srcTable.QuotedTableName, tc.initialJSON, tc.initialJSON))
+			testutils.RunSQL(t, fmt.Sprintf(
+				"INSERT INTO %s (id, updated_at, j) SELECT id, updated_at, j FROM %s",
+				dstTable.QuotedTableName, srcTable.QuotedTableName))
+
+			// Sanity check: the seed produced matching CRC32 before any
+			// binlog activity. If this fails the test is invalid.
+			require.Equal(t, fetchJSONColumnCRC(t, "j", srcTable), fetchJSONColumnCRC(t, "j", dstTable),
+				"pre-condition: server-side seed must produce identical JSON binary on both tables")
+
+			db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+
+			cfg, err := mysql2.ParseDSN(testutils.DSN())
+			require.NoError(t, err)
+			target := applier.Target{
+				DB:       db,
+				KeyRange: "0",
+				Config:   cfg,
+			}
+			appl, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+			require.NoError(t, err)
+			client := NewClient(db, cfg.Addr, cfg.User, cfg.Passwd, appl, &ClientConfig{
+				Logger:          slog.Default(),
+				Concurrency:     4,
+				TargetBatchTime: time.Second,
+				ServerID:        NewServerID(),
+			})
+			chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
+			require.NoError(t, err)
+			require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+			require.NoError(t, client.Run(t.Context()))
+			defer client.Close()
+
+			// Bump a non-JSON column on the source. With
+			// binlog_row_image=FULL the UPDATE event carries the full
+			// AFTER image — including the unchanged JSON column — and
+			// the applier writes the row back to _new through the JSON
+			// re-encode path that this test guards against.
+			const newUpdatedAt = "2026-05-13 11:00:00.000"
+			testutils.RunSQL(t, fmt.Sprintf(
+				"UPDATE %s SET updated_at = '%s' WHERE id = 1",
+				srcTable.QuotedTableName, newUpdatedAt))
+			require.NoError(t, client.BlockWait(t.Context()))
+			require.NoError(t, client.Flush(t.Context()))
+
+			// Sanity check: the UPDATE event must have been applied to
+			// _new. Without this, a regression that silently dropped the
+			// event would let the JSON CRCs stay equal (they were equal
+			// from the seed) and the test would pass vacuously.
+			var dstUpdatedAt string
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				fmt.Sprintf("SELECT updated_at FROM %s WHERE id = 1", dstTable.QuotedTableName),
+			).Scan(&dstUpdatedAt))
+			require.Equal(t, newUpdatedAt, dstUpdatedAt,
+				"binlog UPDATE event did not propagate to _new; JSON CRC equality below is vacuous")
+
+			// pkg/checksum compares JSON columns via the CRC32 of
+			// CAST(j AS json), so use exactly that comparison here.
+			srcCk := fetchJSONColumnCRC(t, "j", srcTable)
+			dstCk := fetchJSONColumnCRC(t, "j", dstTable)
+			if srcCk != dstCk {
+				// Pull both rendered values for a useful failure message.
+				var srcJSON, dstJSON string
+				require.NoError(t, db.QueryRowContext(t.Context(),
+					fmt.Sprintf("SELECT CAST(j AS char CHARACTER SET utf8mb4) FROM %s WHERE id = 1", srcTable.QuotedTableName),
+				).Scan(&srcJSON))
+				require.NoError(t, db.QueryRowContext(t.Context(),
+					fmt.Sprintf("SELECT CAST(j AS char CHARACTER SET utf8mb4) FROM %s WHERE id = 1", dstTable.QuotedTableName),
+				).Scan(&dstJSON))
+				t.Fatalf("checksum mismatch after binlog UPDATE on a non-JSON column rewrote the JSON value:\n  src(id=1) = %s\n  dst(id=1) = %s", srcJSON, dstJSON)
+			}
+		})
+	}
+}
+
+// fetchJSONColumnCRC returns the table-aggregate CRC32 of a JSON column
+// (BIT_XOR of CRC32(CAST(col AS json)) across all rows), using the same
+// IFNULL / ISNULL / CAST expression that pkg/checksum builds. Used by
+// TestBufferedMapJSONNumberRoundTrip.
+func fetchJSONColumnCRC(t *testing.T, col string, tbl *table.TableInfo) int64 {
+	t.Helper()
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var ck int64
+	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT BIT_XOR(CRC32(CONCAT(IFNULL(CAST(`id` AS signed),''), ISNULL(`id`), IFNULL(CAST(`%s` AS json),''), ISNULL(`%s`)))) FROM %s",
+		col, col, tbl.QuotedTableName)).Scan(&ck))
+	return ck
+}
