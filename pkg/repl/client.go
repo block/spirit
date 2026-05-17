@@ -301,11 +301,25 @@ func (c *Client) AddSubscription(currentTable, newTable *table.TableInfo, chunke
 	return nil
 }
 
-// setBufferedPos updates the in-memory position that all changes have been read
-// but not necessarily flushed.
+// setBufferedPos updates the in-memory position that all changes have
+// been read but not necessarily flushed. The update is monotonic:
+// a position that compares less-than-or-equal to the current
+// bufferedPos is silently dropped.
+//
+// The monotonicity matters because recreateStreamer restarts the
+// binlog dump at position 4 of the current bufferedPos.Name, and
+// MySQL prefaces every binlog dump with a synthetic RotateEvent whose
+// `event.Position` is 4. Without the guard, that synthetic rotate
+// would drag bufferedPos back to {file, 4}, and a flush that ran
+// before subsequent events caught the position back up would publish
+// the rewound value via SetFlushedPos — silently regressing the
+// checkpoint and forcing a large re-read on the next resume.
 func (c *Client) setBufferedPos(pos mysql.Position) {
 	c.Lock()
 	defer c.Unlock()
+	if pos.Compare(c.bufferedPos) <= 0 {
+		return
+	}
 	c.bufferedPos = pos
 }
 
@@ -466,20 +480,29 @@ func (c *Client) Run(ctx context.Context) (err error) {
 	return nil
 }
 
-// recreateStreamer recreates the binlog streamer from the current buffered position.
-// When we recreate the syncer, the parser's table map is lost. MySQL only sends
-// TableMapEvents once per connection, so when we resume from a mid-stream position,
-// we won't have the table metadata needed to decode RowsEvents.
+// recreateStreamer recreates the binlog streamer from position 4 of the
+// current bufferedPos file. Used by readStream's error path to recover
+// from transient stream-level read errors. Position 4 is the start of a
+// binlog file; restarting there guarantees the syncer sees the
+// FormatDescriptionEvent and any TableMapEvents needed to decode
+// subsequent RowsEvents — MySQL does not re-send TableMaps from earlier
+// in the file when serving a mid-position dump, so restarting mid-file
+// would leave the parser unable to decode rows.
 //
-// To handle this safely, we check if the binlog has rotated since we started:
-// - Same file as initial: error
-// - Different file: Safely recreate and resume from position 4.
+// Re-reading events from position 4 is safe because the applier is
+// idempotent: it uses REPLACE INTO so re-applying any already-applied
+// event simply re-inserts the same row image, and re-applying an
+// out-of-order event transiently sets the destination to that row's
+// older state, which a subsequent binlog event (in this or a later
+// flush) will correct. The eventual-consistency property holds in both
+// map mode and queue mode — see UpsertRows in pkg/applier/single_target.go.
 func (c *Client) recreateStreamer() error {
 	c.Lock()
 	defer c.Unlock()
 
 	c.logger.Info("recreateStreamer called",
 		"buffered_position", c.bufferedPos,
+		"flushed_position", c.flushedPos,
 		"syncer_exists", c.syncer != nil,
 		"streamer_exists", c.streamer != nil)
 
@@ -489,10 +512,6 @@ func (c *Client) recreateStreamer() error {
 		c.syncer.Close()
 	}
 
-	// Still on the same binlog file we started with.
-	// Safe to replay from position 4 because the subscription data structures
-	// (deltaMap, bufferedMap, deltaQueue) are idempotent - reprocessing events
-	// will simply overwrite previous state with the same value.
 	newStartPos := mysql.Position{
 		Name: c.bufferedPos.Name,
 		Pos:  4, // Binlog files always start at position 4
@@ -705,20 +724,15 @@ func (c *Client) readStream(ctx context.Context) {
 		default:
 			c.logger.Debug("Received unknown event type", "type", fmt.Sprintf("%T", ev.Event))
 		}
-		// Update the buffered position
-		// under a mutex.
-		// Only update if LogPos > 0 (some events like FormatDescriptionEvent have LogPos=0)
-		// and only if the position is moving forward (to avoid going backwards after rotation)
+		// Update the buffered position under a mutex. Some events
+		// (FormatDescriptionEvent and similar housekeeping events) have
+		// LogPos=0 and don't represent a real position. setBufferedPos
+		// itself enforces monotonicity, so we don't filter further here.
 		if ev.Header.LogPos > 0 {
-			newPos := mysql.Position{
+			c.setBufferedPos(mysql.Position{
 				Name: currentLogName,
 				Pos:  ev.Header.LogPos,
-			}
-			currentPos := c.getBufferedPos()
-			// Only update if the new position is ahead of the current position
-			if newPos.Compare(currentPos) > 0 {
-				c.setBufferedPos(newPos)
-			}
+			})
 		}
 	}
 }

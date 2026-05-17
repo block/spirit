@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -472,15 +471,52 @@ func (a *SingleTargetApplier) DeleteKeys(ctx context.Context, sourceTable, targe
 	return affectedRows, nil
 }
 
-// UpsertRows performs an upsert (INSERT ... ON DUPLICATE KEY UPDATE) synchronously.
-// The rows are LogicalRow structs containing the row images.
-// If lock is non-nil, the upsert is executed under the table lock.
+// UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously.
+// The rows are LogicalRow structs containing inline row images from the
+// binlog. If lock is non-nil, the upsert is executed under the table lock.
+//
+// REPLACE semantics, and why we use them:
+//
+// MySQL's `REPLACE INTO target (cols) VALUES (...)` treats each value
+// tuple as an INSERT, except that for any row in `target` that conflicts
+// with the new row on PRIMARY KEY *or any UNIQUE index*, the old row is
+// deleted before the new row is inserted. Per the docs, conflicts on
+// multiple unique indexes can lead to multiple deletions for a single
+// new row.
+//
+// Two implications matter for callers reading this code:
+//
+//  1. A single REPLACE may delete rows whose PKs are *not* in the
+//     `rows` argument. If row B's image collides on a unique key with
+//     some other row A currently in the destination (because A was the
+//     previous holder of that unique value), REPLACE deletes A while
+//     inserting B. A is then transiently missing from the destination
+//     until its own event arrives in a later flush (or a later batch in
+//     the same flush) and re-inserts it. This is what restores the
+//     order-independence the pre-#821 deltaMap had with `REPLACE INTO
+//     ... SELECT`. See block/spirit#847.
+//
+//  2. Eventual consistency. Between the moment REPLACE deletes A and
+//     the moment A's image is re-applied, the destination is not a
+//     valid snapshot of source — it has fewer rows. Spirit relies on
+//     the bufferedMap being an *up-to-date and disjoint* representation
+//     of pending changes (each PK appears at most once, holding the
+//     latest row image) so that every transiently-deleted row will be
+//     re-inserted as flushes progress. The destination converges back
+//     to source's current state once the last unflushed event for each
+//     affected PK has been applied. The post-cutover checksum (with
+//     `FixDifferences=true`) is the backstop that catches any
+//     divergence that survives.
+//
+// We supply inline row images rather than `REPLACE INTO ... SELECT FROM
+// source`, so the read-after-commit race that motivated #746 does not
+// apply.
 func (a *SingleTargetApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, lock *dbconn.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
 	_, targetColumnList := mapping.Columns()
-	sourceColumnNames, targetColumnNames := mapping.ColumnsSlice()
+	sourceColumnNames, _ := mapping.ColumnsSlice()
 	intersectedColumns := mapping.SourceColumnIndices()
 
 	// Build the VALUES clause from the row images
@@ -514,37 +550,16 @@ func (a *SingleTargetApplier) UpsertRows(ctx context.Context, mapping *table.Col
 		return 0, nil
 	}
 
-	// Build the ON DUPLICATE KEY UPDATE clause using target column names.
-	var updateClauses []string
-	for _, col := range targetColumnNames {
-		if !slices.Contains(mapping.TargetTable().KeyColumns, col) {
-			updateClauses = append(updateClauses, fmt.Sprintf("`%s` = new.`%s`", col, col))
-		}
-	}
+	// See the function-level doc for the REPLACE-vs-ODKU rationale and
+	// the eventual-consistency implications of REPLACE deleting rows on
+	// unique-key conflicts.
+	upsertStmt := fmt.Sprintf("REPLACE INTO %s (%s) VALUES %s",
+		mapping.TargetTable().QuotedTableName,
+		targetColumnList,
+		strings.Join(valuesClauses, ", "),
+	)
 
-	// If every column is part of the PK there's nothing to UPDATE on conflict
-	// (the row's content is the PK and a same-PK conflict means same content).
-	// `INSERT … ON DUPLICATE KEY UPDATE` with an empty clause is a SQL syntax
-	// error, so use `INSERT IGNORE` for that case instead — same semantics.
-	var upsertStmt, upsertPath string
-	if len(updateClauses) == 0 {
-		upsertPath = "insert-ignore"
-		upsertStmt = fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES %s",
-			mapping.TargetTable().QuotedTableName,
-			targetColumnList,
-			strings.Join(valuesClauses, ", "),
-		)
-	} else {
-		upsertPath = "on-duplicate-key-update"
-		upsertStmt = fmt.Sprintf("INSERT INTO %s (%s) VALUES %s AS new ON DUPLICATE KEY UPDATE %s",
-			mapping.TargetTable().QuotedTableName,
-			targetColumnList,
-			strings.Join(valuesClauses, ", "),
-			strings.Join(updateClauses, ", "),
-		)
-	}
-
-	a.logger.Debug("executing upsert", "rowCount", len(valuesClauses), "table", mapping.TargetTable().TableName, "path", upsertPath)
+	a.logger.Debug("executing upsert", "rowCount", len(valuesClauses), "table", mapping.TargetTable().TableName, "path", "replace-into")
 
 	// Execute under lock if provided
 	if lock != nil {

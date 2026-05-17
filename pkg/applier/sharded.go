@@ -645,7 +645,14 @@ func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, _ *table.T
 }
 
 // UpsertRows performs upserts synchronously, distributing across shards.
-// The rows are LogicalRow structs containing the row images.
+// The rows are LogicalRow structs containing inline row images from the
+// binlog. Each shard issues `REPLACE INTO target (cols) VALUES (...)`;
+// the REPLACE semantics — and their eventual-consistency implications
+// for callers — are documented on SingleTargetApplier.UpsertRows. The
+// short version: REPLACE may delete rows whose PKs are not in the
+// `rows` argument (via the unique-key conflict resolution) and those
+// rows are re-inserted by their own events in subsequent batches.
+//
 // If lock is non-nil, operations are executed under table locks (one per shard).
 //
 // Note: we only track modifications by PRIMARY KEY, not be shard key (aka primary vindex).
@@ -765,21 +772,14 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 				valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
 			}
 
-			// Build the ON DUPLICATE KEY UPDATE clause (all non-PK columns)
-			var updateClauses []string
-			for _, col := range sourceTable.NonGeneratedColumns {
-				if !slices.Contains(sourceTable.KeyColumns, col) {
-					updateClauses = append(updateClauses, fmt.Sprintf("`%s` = new.`%s`", col, col))
-				}
-			}
-
-			// Use just the table name, not the fully qualified name, because
-			// the database connection (shard.writeDB) already determines which database to write to
-			upsertStmt := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s AS new ON DUPLICATE KEY UPDATE %s",
+			// See ShardedApplier.UpsertRows (and SingleTargetApplier.UpsertRows)
+			// for the REPLACE rationale and the eventual-consistency
+			// implications. Just the table name here — the per-shard DB
+			// connection already determines which database to write to.
+			upsertStmt := fmt.Sprintf("REPLACE INTO %s (%s) VALUES %s",
 				sourceTable.QuotedTableName,
 				columnList,
 				strings.Join(valuesClauses, ", "),
-				strings.Join(updateClauses, ", "),
 			)
 			a.logger.Debug("executing upsert on shard",
 				"shardID", sid,

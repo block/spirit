@@ -63,12 +63,39 @@ The applier interface provides both asynchronous and synchronous methods:
 - `Apply(ctx, chunk, rows, callback)`: Queues rows for writing and returns immediately. The callback is invoked when all rows have been written.
 
 **Synchronous (used by subscription)**:
-- `DeleteKeys(ctx, sourceTable, targetTable, keys, lock)`: Deletes rows by primary key and waits for completion.
-- `UpsertRows(ctx, mapping, rows, lock)`: Upserts rows using a `ColumnMapping` and waits for completion.
+- `DeleteKeys(ctx, sourceTable, targetTable, keys, lock)`: Deletes rows by primary key and waits for completion. Emits `DELETE FROM target WHERE (pk) IN (...)`.
+- `UpsertRows(ctx, mapping, rows, lock)`: Upserts rows using a `ColumnMapping` and waits for completion. Emits `REPLACE INTO target (cols) VALUES (...)` — see [REPLACE INTO semantics](#replace-into-semantics-and-eventual-consistency) below.
 
 This distinction exists because:
 - The **copier** processes large batches of rows and benefits from async processing with callbacks to advance its watermark.
 - The **subscription** processes individual binlog events and needs immediate confirmation that changes have been applied before advancing the binlog position.
+
+### REPLACE INTO semantics and eventual consistency
+
+`UpsertRows` uses `REPLACE INTO target (cols) VALUES (...)`, not `INSERT ... ON DUPLICATE KEY UPDATE`. Per MySQL's manual:
+
+> REPLACE works exactly like INSERT, except that if an old row in the table has the same value as a new row for a PRIMARY KEY or a UNIQUE index, the old row is deleted before the new row is inserted.
+
+Two consequences for callers:
+
+1. **REPLACE may delete rows whose PKs are not in the `rows` argument.** If a new row's image collides on a unique key with some *other* row currently in the destination (the previous holder of that unique value), REPLACE deletes that other row to make room. A single REPLACE statement may therefore delete more than one row. This is what makes the multi-row VALUES list order-independent — within a batch, every row's conflicts (on PK or any unique index) are resolved before its insert runs.
+
+2. **The destination is only eventually consistent with source mid-flush.** Between the moment REPLACE deletes a row to resolve a unique-key conflict and the moment that row's own event re-inserts it, the destination is briefly missing that row. Spirit relies on the replication client's `bufferedMap` being an up-to-date and *disjoint* representation of pending changes — every PK in the buffer holds the latest image MySQL has emitted for it — so any transiently-deleted row is guaranteed to be re-inserted as flushes progress. The destination converges back to source's current state once every event for each affected PK has been applied. The post-cutover checksum (with `FixDifferences=true`) is the backstop for any divergence that survives.
+
+The row image is supplied inline (the binlog reader stored it on `HasChanged`); the applier never re-reads source. This avoids the binlog/visibility race fixed in [#746](https://github.com/block/spirit/issues/746) that earlier `REPLACE INTO ... SELECT` paths could lose to.
+
+#### Why this matters for workloads that move unique values
+
+The motivating case is a source-side transaction that legally moves a unique value between two rows:
+
+```sql
+START TRANSACTION;
+UPDATE t SET slot_id = NULL WHERE id = 1;  -- was 'S'
+UPDATE t SET slot_id = 'S'  WHERE id = 2;  -- was NULL
+COMMIT;
+```
+
+With `INSERT ... ON DUPLICATE KEY UPDATE`, the random map iteration order in the subscription could land "activate id=2" before "deactivate id=1" in the same multi-row statement; MySQL would resolve id=2's UPDATE branch, then fail with `Error 1062 (23000): Duplicate entry 'S'` because id=1 still held the value. With `REPLACE INTO` the same batch in any order works: each REPLACE deletes the prior holder of `'S'` before inserting its own row. See [block/spirit#847](https://github.com/block/spirit/issues/847).
 
 ### Callbacks and Feedback
 

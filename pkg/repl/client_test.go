@@ -725,6 +725,55 @@ func TestAllChangesFlushed(t *testing.T) {
 	require.True(t, client.AllChangesFlushed(), "Should be flushed with aligned positions and no changes")
 }
 
+// TestSetBufferedPosIsMonotonic locks in the invariant that
+// `setBufferedPos` refuses to move `bufferedPos` backwards. This
+// matters because `recreateStreamer` restarts the binlog dump at
+// position 4 of the current bufferedPos file, and MySQL prefaces every
+// dump with a synthetic RotateEvent whose `event.Position` is 4. The
+// RotateEvent handler in readStream calls `setBufferedPos` directly
+// (bypassing the LogPos generic-update branch), so without the guard
+// here that synthetic rotate would drag bufferedPos to {file, 4} —
+// and a flush that ran before subsequent events caught the position
+// back up would publish the rewound value via SetFlushedPos, silently
+// regressing the checkpoint and causing a large re-read on resume.
+//
+// Regression gate for the Copilot review on #853.
+func TestSetBufferedPosIsMonotonic(t *testing.T) {
+	client := &Client{logger: slog.Default()}
+
+	// Initial setBufferedPos always wins (zero-value start).
+	start := mysql.Position{Name: "binlog.000010", Pos: 5000}
+	client.setBufferedPos(start)
+	require.Equal(t, start, client.getBufferedPos())
+
+	// A move backwards in the same file (the synthetic-rotate
+	// scenario after a recreate) is rejected.
+	client.setBufferedPos(mysql.Position{Name: "binlog.000010", Pos: 4})
+	require.Equal(t, start, client.getBufferedPos(),
+		"backwards move within the same file must be ignored")
+
+	// A move forwards in the same file (a normal LogPos update) advances.
+	forward := mysql.Position{Name: "binlog.000010", Pos: 6000}
+	client.setBufferedPos(forward)
+	require.Equal(t, forward, client.getBufferedPos())
+
+	// A move to an earlier binlog file is rejected too.
+	client.setBufferedPos(mysql.Position{Name: "binlog.000009", Pos: 9999})
+	require.Equal(t, forward, client.getBufferedPos(),
+		"earlier-file move must be ignored")
+
+	// A real binlog rotation to the next file (with pos=4) advances —
+	// the new file name compares greater, so Compare returns > 0.
+	nextFile := mysql.Position{Name: "binlog.000011", Pos: 4}
+	client.setBufferedPos(nextFile)
+	require.Equal(t, nextFile, client.getBufferedPos(),
+		"genuine rotation to a later binlog file must advance")
+
+	// A duplicate setBufferedPos for the exact current position is a no-op.
+	client.setBufferedPos(nextFile)
+	require.Equal(t, nextFile, client.getBufferedPos())
+}
+
 // TestMaxRecreateAttemptsError tests that the readStream goroutine sets a stream error
 // and exits cleanly after exhausting the maximum number of streamer recreation attempts.
 func TestMaxRecreateAttemptsError(t *testing.T) {

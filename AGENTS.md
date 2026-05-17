@@ -203,9 +203,11 @@ Each package has its own `README.md` with detailed documentation. Key packages t
 The main orchestrator. `runner.go` contains the core migration loop. `Migration` struct is the Kong CLI binding. The `Run()` method drives the full lifecycle. See `cutover.go` for the atomic rename logic.
 
 ### `pkg/repl`
-Acts as a MySQL replica using [go-mysql](https://github.com/go-mysql-org/go-mysql). Two subscription types:
-- **BufferedMap** (default) — stores the full row image from the binlog and writes via the applier. Used for memory-comparable PKs (integers, binary strings, etc.). Sidesteps the binlog/visibility race that motivates `binlog_row_image=FULL` (see #746).
-- **DeltaQueue** (fallback) — FIFO queue using `REPLACE INTO ... SELECT` for non-memory-comparable PKs (e.g. `VARCHAR` collations). Slower; used only when `BufferedMap` cannot be.
+Acts as a MySQL replica using [go-mysql](https://github.com/go-mysql-org/go-mysql). One subscription type — the **bufferedMap** — stores the full row image from the binlog and writes via the applier. It has two internal flush modes:
+- **Map mode** (default for memory-comparable PKs) — keeps one entry per PK in a map; multiple events on the same PK dedupe to the latest image. Used for integer/binary PKs where Go map-key equality matches MySQL row identity.
+- **Queue mode** (post-copy for non-memory-comparable PKs like `VARCHAR` collations) — FIFO queue preserving binlog order. Required because case-insensitive collations break the map-key-equality assumption. Slower; only entered after `SetWatermarkOptimization(false)`.
+
+The applier issues `REPLACE INTO target VALUES (...)` from inline row images (not `SELECT FROM source`), which sidesteps the binlog/visibility race that motivated `binlog_row_image=FULL` (see #746) and makes flushes order-independent for swap-pair workloads (see #847). REPLACE may delete rows on unique-key conflicts as well as PK conflicts — those rows are re-inserted by their own events in subsequent batches, so the destination is *eventually consistent* between batches and converges once every event for each affected PK has been applied.
 
 ### `pkg/copier`
 Two algorithms:

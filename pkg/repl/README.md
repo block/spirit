@@ -34,7 +34,7 @@ applies it through the applier interface:
 - **Excellent deduplication**: if a row is modified 100 times, only one upsert is performed.
 - **Parallel flushing**: independent keys can be written concurrently via the applier.
 - **No source-side reads at flush**: the row image is already in memory, so no contention with OLTP traffic on the source.
-- **Sidesteps the binlog/visibility race**: because the row image *is* the applied state, there is no opportunity for MySQL's binlog-vs-visibility ordering to surface a stale row (see [issue #746](https://github.com/block/spirit/issues/746)).
+- **Sidesteps the binlog/visibility race**: because the row image *is* the applied state, there is no opportunity for MySQL's binlog-vs-visibility ordering to surface a stale row (see [issue #746](https://github.com/block/spirit/issues/746)). This also makes spirit safe to run against sources configured with **semi-synchronous replication**, which can widen that window by tens or hundreds of milliseconds depending on replica ACK latency. The `mysql-semisync-docker.yml` CI lane exercises this configuration end-to-end.
 - **Watermark optimization (when supported by the chunker)**: can skip ranges of keys using both `KeyAboveHighWatermark` and `KeyBelowLowWatermark`.
 - **Cross-server compatibility**: the applier can target a different MySQL server, which is what `pkg/move` relies on.
 
@@ -42,6 +42,12 @@ applies it through the applier interface:
 - Requires `binlog_row_image=FULL` and an empty `binlog_row_value_options` (the applier needs the complete row image).
 - Higher memory usage than a key-only map: stores full row data for each changed key.
 - Watermark optimizations (`KeyAboveHighWatermark` and `KeyBelowLowWatermark`) are available on `MappedChunker` implementations (both optimistic and composite chunkers). They work correctly for numeric, binary, and temporal primary key types. For `VARCHAR`/`TEXT` columns with collations, Go's byte-order comparison may differ from MySQL's collation order; any discrepancies are caught by the checksum phase (see [issue #479](https://github.com/block/spirit/issues/479)).
+
+**Map iteration order is irrelevant** because the applier issues
+`REPLACE INTO target VALUES (...)`, which deletes any row that conflicts
+on PRIMARY KEY or any UNIQUE index before each insert. That makes the
+multi-row VALUES list order-independent — see "Applier idempotence via
+REPLACE INTO" below.
 
 **Example scenario:**
 ```
@@ -53,9 +59,10 @@ Applied:        UpsertRows({id=1, ...}); DeleteKeys({id=2});
 #### FIFO fallback for non-memory-comparable primary keys
 
 For tables with non-memory-comparable primary keys (e.g. `VARCHAR` with a
-case-insensitive collation), the subscription falls back to an internal
-FIFO queue. The queue still stores row images inline and applies them via
-the applier — there is no `REPLACE INTO ... SELECT`, so the #746 fix and
+case-insensitive collation), the subscription uses LWW buffered-map dedup
+during the copy phase and switches to an internal FIFO queue post-copy.
+The queue still stores row images inline and applies them via the
+applier — there is no `REPLACE INTO ... SELECT`, so the #746 fix and
 cross-server move support ([issue #607](https://github.com/block/spirit/issues/607))
 are preserved. The queue exists only to preserve binlog order:
 collation-equivalent keys like `"A"` and `"a"` hash to different map slots
@@ -64,26 +71,110 @@ would apply events out of order. FIFO replay through the applier preserves
 binlog order; the target's own collation-aware uniqueness then collapses
 the events onto the right row.
 
-Two routing policies are available, controlled by the
-`--force-enable-buffered-map` migration flag (and the equivalent
-`Move.ForceEnableBufferedMap` field):
+During the copy phase the chunker's own SELECT covers in-window
+case-collision races, so LWW map dedup is safe and considerably faster.
+When the watermark optimization is disabled at the end of the copy phase,
+`SetWatermarkOptimization` drains the map inline and the subscription
+switches into queue mode for the cutover/checksum window. The
+post-cutover checksum (with `FixDifferences=true`) repairs any residual
+divergence.
 
-- **Default (`--force-enable-buffered-map=false`):** queue-mode runs
-  full-time for non-memory-comparable PKs, in both copy and post-copy
-  phases. This mirrors the previous `deltaQueue` performance
-  characteristics but keeps the queue path warm in CI (especially
-  `TestCutoverAtomicityWithConcurrentWrites`) so any bug in the queue
-  surfaces against real workloads before we trust it as a corner-case
-  path.
-- **Optimization (`--force-enable-buffered-map=true`):** during the copy
-  phase the subscription uses LWW buffered-map dedup (faster, works
-  because the chunker's own SELECT covers in-window case-collision
-  races). When the watermark optimization is disabled at the end of the
-  copy phase, `SetWatermarkOptimization` drains the map inline and the
-  subscription switches into queue mode for the cutover/checksum window.
+Memory-comparable PKs always use the buffered map, since map-key
+equality matches MySQL row identity.
 
-Memory-comparable PKs always use the buffered map regardless of the
-flag, since map-key equality matches MySQL row identity.
+#### Applier idempotence via REPLACE INTO (#847)
+
+The applier writes a multi-row statement per batch. We use:
+
+```sql
+REPLACE INTO target (cols) VALUES (...), (...), ...;
+```
+
+rather than `INSERT ... ON DUPLICATE KEY UPDATE`. The choice matters
+whenever two rows in the same batch can collide on a unique key —
+typically because a source-side transaction legally moves a unique
+value between rows:
+
+```sql
+-- Legal in source: deactivate one row, then activate another,
+-- inside a single transaction. UNIQUE(slot_id) allows NULLs to
+-- duplicate, so the invariant holds.
+START TRANSACTION;
+UPDATE t SET slot_id = NULL  WHERE id = 1;  -- was 'S'
+UPDATE t SET slot_id = 'S'   WHERE id = 2;  -- was NULL
+COMMIT;
+```
+
+With `INSERT ... ON DUPLICATE KEY UPDATE`, MySQL processes the
+multi-row VALUES list in array order and resolves only the *first*
+conflict on each row (via the UPDATE clause). If the resulting update
+introduces a *second* unique-key collision the statement fails with
+`Error 1062`. The map's randomized iteration meant a swap pair could
+land "activate-first" in the batch, hitting that exact failure.
+
+`REPLACE INTO` is order-independent for this case. Per the docs:
+
+> REPLACE works exactly like INSERT, except that if an old row in
+> the table has the same value as a new row for a PRIMARY KEY or a
+> UNIQUE index, the old row is deleted before the new row is
+> inserted.
+
+So each row's conflicts — on PK or any unique index — are deleted
+before that row's insert runs, irrespective of where the conflicting
+row sits in the batch. The swap pair collapses to "delete the
+previous holder, insert the new holder" and the order of the two
+events inside the batch doesn't matter.
+
+This is the same robustness the pre-#821 `deltaMap` had with
+`REPLACE INTO target SELECT FROM source`, but **without** the
+read-after-commit race that motivated #746 — we supply the inline
+row image, not a `SELECT` against source.
+
+##### Eventual consistency between batches
+
+REPLACE's "delete any unique-key conflict before each insert"
+semantic means a single REPLACE statement can delete *more rows* than
+the ones in its VALUES list — specifically, any row currently in the
+destination that previously held a unique value the new row is now
+claiming. That row is briefly missing from the destination until its
+own event arrives in a later batch (or in the same batch but
+processed later) and re-inserts it.
+
+Concretely, for the swap pair above with batches of size 1:
+
+| Step | Batch | Destination state |
+|------|-------|-------------------|
+| 0    | —     | id=1: 'S', id=2: NULL |
+| 1    | `REPLACE (id=1, slot=NULL)` | id=1: NULL, id=2: NULL |
+| 2    | `REPLACE (id=2, slot='S')`  | id=1: NULL, id=2: 'S' |
+
+And for the same swap pair if the activate landed first across batches:
+
+| Step | Batch | Destination state |
+|------|-------|-------------------|
+| 0    | —     | id=1: 'S', id=2: NULL |
+| 1    | `REPLACE (id=2, slot='S')` | id=2: 'S' (id=1 **deleted** — unique-key conflict on 'S') |
+| 2    | `REPLACE (id=1, slot=NULL)` | id=1: NULL, id=2: 'S' (id=1 re-inserted) |
+
+Binlog ordering gives us the first table in practice — within a
+single source-side transaction, the deactivate event has a lower
+binlog position than the activate — but Spirit's correctness does
+not depend on which case occurs. The destination converges to
+source's current state once the last unflushed event for each
+affected PK has been applied.
+
+This eventual consistency is safe because the `bufferedMap` is an
+**up-to-date and disjoint** representation of pending changes: every
+PK appears at most once at flush time, holding the latest row image
+MySQL emitted for it. Any row transiently deleted by REPLACE's
+conflict resolution is therefore guaranteed to have its own event in
+the buffer (or arriving shortly) — its row image isn't lost,
+just temporarily not yet applied. The post-cutover checksum (with
+`FixDifferences=true`) is the backstop for anything that slips
+through.
+
+See `TestBufferedMapSwapPairFlushesViaReplace` (unit) and
+`TestSwapPairEndToEndViaReplace` (end-to-end) for the regression gates.
 
 ## Features
 
