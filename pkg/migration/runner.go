@@ -183,6 +183,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	// means that the replication applier can always make progress immediately,
 	// and does not need to wait for free slots from the copier *until* it needs
 	// copy in more than 1 thread.
+	//
+	// Pool size grows monotonically across migration phases — later phases
+	// (checksum, cutover) ratchet the limit upward via SetMaxOpenConns but
+	// never shrink it. That is deliberate: each phase's increase reflects
+	// its own connection budget, and by the time we're past the copy phase
+	// the copier/applier backpressure that motivated the starting +1 no
+	// longer applies. There is no point past which a smaller pool would
+	// help, so there is nothing to restore.
 	r.dbConfig.MaxOpenConnections = r.migration.Threads + 1
 	if r.migration.Buffered {
 		// Buffered has many more connections because it fans out x8 more write threads
@@ -1235,7 +1243,13 @@ func (r *Runner) checksum(ctx context.Context) error {
 	// - background flushing
 	// - checkpoint thread
 	// - checksum "replaceChunk" DB connections
-	// Handle a case just in the tests not having a dbConfig
+	// Handle a case just in the tests not having a dbConfig.
+	//
+	// Not restored when checksum completes — by then we are past the copy
+	// phase, so the +1 backpressure between copier and applier no longer
+	// applies, and the only thing left is cutover, which itself wants at
+	// least 5 connections. Pool size grows monotonically; see the
+	// MaxOpenConnections doc in (*Runner).Run.
 	r.db.SetMaxOpenConns(r.dbConfig.MaxOpenConnections + 2)
 
 	// Run the checksum with internal retry logic
