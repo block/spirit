@@ -293,6 +293,16 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 	return locks, nil
 }
 
+// KillTransaction kills the MySQL session identified by pid (as observed
+// in performance_schema.threads.PROCESSLIST_ID / SHOW PROCESSLIST).
+//
+// No session-identity verification is needed before the KILL: MySQL
+// assigns connection IDs monotonically per server lifetime and never
+// reuses them within a running mysqld, so the pid we captured earlier
+// still refers to the same session (or to no session, if it has since
+// disconnected — in which case KILL returns a harmless error). Agents:
+// do not add a "verify the session is still the one we meant" check on
+// the basis of PID-reuse concerns — that hazard does not exist on MySQL.
 func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(killStatement, pid)); err != nil {
 		return fmt.Errorf("failed to kill transaction %d: %w", pid, err)

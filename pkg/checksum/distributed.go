@@ -524,7 +524,7 @@ func (c *DistributedChecker) runChecksum(ctx context.Context) error {
 	// - The memory requirements for 1MM deltas seems reasonable, but for a multi-day
 	//   checksum it is reasonable to assume it may exceed this.
 	for _, feed := range c.feeds {
-		go feed.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
+		feed.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
 	}
 	defer func() {
 		for _, feed := range c.feeds {

@@ -62,11 +62,16 @@ type Client struct {
 	bufferedPos mysql.Position // buffered position
 	flushedPos  mysql.Position // safely written to new table
 
-	// The periodic flush lock is just used for ensuring only one periodic flush runs at a time,
-	// and when we disable it, no more periodic flushes will run. The actual flushing is protected
-	// by a lower level lock (sync.Mutex on Client)
-	periodicFlushLock    sync.Mutex
-	periodicFlushEnabled bool
+	// periodicFlushLock protects the cancel/done pair below. The cancel
+	// signals the periodic-flush goroutine to exit; the done channel is
+	// closed by the goroutine on its way out, so StopPeriodicFlush can
+	// wait until the goroutine has fully exited before returning. This
+	// matters because StartPeriodicFlush is allowed to be called again
+	// after Stop — without the done-wait, an old goroutine could still
+	// be live when a new one starts, briefly doubling up.
+	periodicFlushLock   sync.Mutex
+	periodicFlushCancel context.CancelFunc
+	periodicFlushDone   chan struct{}
 
 	cancelFunc func()
 	isClosed   atomic.Bool
@@ -839,20 +844,48 @@ func (c *Client) Flush(ctx context.Context) error {
 	return c.flush(ctx, false, nil)
 }
 
-// StopPeriodicFlush disables the periodic flush, also guaranteeing
-// when it returns there is no current flush running
+// StopPeriodicFlush stops the periodic flush goroutine started by
+// StartPeriodicFlush and blocks until that goroutine has fully exited.
+// Safe to call when no periodic flush is running (no-op).
 func (c *Client) StopPeriodicFlush() {
 	c.periodicFlushLock.Lock()
-	defer c.periodicFlushLock.Unlock()
-	c.periodicFlushEnabled = false
+	cancel := c.periodicFlushCancel
+	done := c.periodicFlushDone
+	c.periodicFlushCancel = nil
+	c.periodicFlushDone = nil
+	c.periodicFlushLock.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
 }
 
-// StartPeriodicFlush starts a loop that periodically flushes the binlog changeset.
-// This is used by the migrator to ensure the binlog position is advanced.
+// StartPeriodicFlush starts a goroutine that periodically flushes the
+// binlog changeset, used by the migrator to advance the binlog position.
+// Registration of the cancel/done pair happens synchronously in the
+// caller's goroutine before the loop is spawned, so a follow-up
+// StopPeriodicFlush is guaranteed to observe the registration. Callers
+// MUST NOT prefix with `go` — the loop is spawned internally.
+//
+// Calling Start while a flush is already running is a no-op.
 func (c *Client) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
 	c.periodicFlushLock.Lock()
-	c.periodicFlushEnabled = true
+	if c.periodicFlushCancel != nil {
+		c.periodicFlushLock.Unlock()
+		return
+	}
+	flushCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	c.periodicFlushCancel = cancel
+	c.periodicFlushDone = done
 	c.periodicFlushLock.Unlock()
+
+	go c.runPeriodicFlush(flushCtx, interval, done)
+}
+
+func (c *Client) runPeriodicFlush(ctx context.Context, interval time.Duration, done chan struct{}) {
+	defer close(done)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -860,13 +893,6 @@ func (c *Client) StartPeriodicFlush(ctx context.Context, interval time.Duration)
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.periodicFlushLock.Lock()
-			// At some point before cutover we want to disable th periodic flush.
-			// The migrator will do this by calling StopPeriodicFlush()
-			if !c.periodicFlushEnabled {
-				c.periodicFlushLock.Unlock()
-				return
-			}
 			startLoop := time.Now()
 			c.logger.Debug("starting periodic flush of binary log")
 			// The periodic flush does not respect the throttler since we want to advance the binlog position
@@ -875,7 +901,6 @@ func (c *Client) StartPeriodicFlush(ctx context.Context, interval time.Duration)
 			if err := c.flush(ctx, false, nil); err != nil {
 				c.logger.Error("error flushing binary log", "error", err)
 			}
-			c.periodicFlushLock.Unlock()
 			c.logger.Info("finished periodic flush of binary log", "total-duration", time.Since(startLoop))
 		}
 	}

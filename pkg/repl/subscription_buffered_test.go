@@ -713,6 +713,89 @@ func TestBufferedMapTransitionDrainsOutgoing(t *testing.T) {
 	require.Equal(t, 3, count, "drain on toggle must apply queue contents through the applier")
 }
 
+// TestBufferedMapToggleDrainFailureLeavesFlagUnchanged verifies that a
+// failed drain during SetWatermarkOptimization leaves the subscription in
+// its prior mode (flag unchanged, entries still in the outgoing store), so
+// the caller can detect the failure and the migration aborts cleanly rather
+// than continuing in a half-toggled state. The fix-continous-cutover branch
+// tightened the ordering so the drain runs before the flag flip; this test
+// guards that invariant.
+func TestBufferedMapToggleDrainFailureLeavesFlagUnchanged(t *testing.T) {
+	t1 := `CREATE TABLE subscription_test (
+		id VARCHAR(64) NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	t2 := `CREATE TABLE _subscription_test_new (
+		id VARCHAR(64) NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	srcTable, dstTable := setupTestTables(t, t1, t2)
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
+	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	require.NoError(t, err)
+
+	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
+	mockChunker.SetColumnMapping(table.NewColumnMapping(srcTable, dstTable, nil))
+	mockChunker.MarkAsComplete()
+
+	client := &Client{
+		db:       db,
+		logger:   slog.Default(),
+		dbConfig: dbconn.NewDBConfig(),
+	}
+
+	sub := &bufferedMap{
+		c:                     client,
+		applier:               applierInstance,
+		table:                 srcTable,
+		newTable:              dstTable,
+		changes:               make(map[string]bufferedChange),
+		chunker:               mockChunker,
+		watermarkOptimization: true,
+		pkIsMemoryComparable:  false,
+	}
+	sub.cond = sync.NewCond(&sub.Mutex)
+
+	// Seed the map with copy-phase events.
+	sub.HasChanged([]any{"k1"}, []any{"k1", "v1"}, false)
+	sub.HasChanged([]any{"k2"}, []any{"k2", "v2"}, false)
+	require.Len(t, sub.changes, 2)
+
+	// Force the drain to fail by dropping the destination table so the
+	// applier's REPLACE INTO returns an error.
+	testutils.RunSQL(t, "DROP TABLE "+dstTable.QuotedTableName)
+
+	// Toggle from map mode → queue mode. The drain must fail and the
+	// failure must surface to the caller.
+	err = sub.SetWatermarkOptimization(t.Context(), false)
+	require.Error(t, err, "toggle must surface the drain error to the caller")
+
+	// The flag must NOT have flipped — the caller halts the migration on
+	// this error, and any subsequent HasChanged calls must continue to
+	// route to the same store as before, not split between two stores.
+	require.True(t, sub.watermarkOptimization,
+		"watermarkOptimization must remain in its prior state after a failed drain")
+	sub.Lock()
+	require.False(t, sub.queueModeActive(),
+		"queueModeActive must remain false (map mode) after a failed drain")
+	sub.Unlock()
+
+	// Events must still be in the outgoing store — none silently lost.
+	require.Len(t, sub.changes, 2,
+		"outgoing store must still hold the undrained events")
+	require.Empty(t, sub.queue,
+		"no events should have been routed to the queue: flag did not flip")
+}
+
 // TestBufferedMapTogglePassthrough verifies that for memory-comparable PKs
 // SetWatermarkOptimization is a no-op other than flipping the flag — the
 // active store is the map in both states, so there is nothing to drain.

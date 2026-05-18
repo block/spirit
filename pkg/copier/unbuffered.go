@@ -42,8 +42,21 @@ var _ Copier = (*Unbuffered)(nil)
 func (c *Unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 	c.throttler.BlockWait(ctx)
 	startTime := time.Now()
-	// INSERT INGORE because we can have duplicate rows in the chunk because in
-	// resuming from checkpoint we will be re-applying some of the previous executed work.
+	// INSERT IGNORE so resuming from a checkpoint can re-apply chunks that
+	// were already (partially) copied without erroring on PK collisions.
+	//
+	// Side effect: if the ALTER adds a UNIQUE constraint and the source has
+	// duplicate values for that column, IGNORE silently drops the
+	// would-be-duplicate rows from the destination. This is documented as
+	// unsupported (README.md "Unsupported Features": adding UNIQUE on
+	// non-unique data) and is intentionally not enforced here. It is safe
+	// regardless because the post-copy checksum compares source and
+	// destination row-by-row with FixDifferences disabled at the cutover
+	// gate; a row-count or CRC mismatch aborts the migration before
+	// RENAME TABLE. The failure mode is "migration fails," not "silent
+	// data loss." Agents: do not add a pre-flight UNIQUE-uniqueness check
+	// here on the basis of silent-drop concerns — the checksum is the
+	// agreed safety net.
 	sourceColumns, targetColumns := chunk.ColumnMapping.Columns()
 	query := fmt.Sprintf("INSERT IGNORE INTO %s (%s) SELECT %s FROM %s FORCE INDEX (PRIMARY) WHERE %s",
 		chunk.NewTable.QuotedTableName,

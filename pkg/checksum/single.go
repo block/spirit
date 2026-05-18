@@ -495,7 +495,7 @@ func (c *SingleChecker) runChecksum(ctx context.Context) error {
 	// This must not run while initConnPool holds the table lock, because
 	// the periodic flush executes DML (INSERT/DELETE) against the locked
 	// table, which would deadlock with the lock holder.
-	go c.feed.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
+	c.feed.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
 	defer c.feed.StopPeriodicFlush()
 
 	// Create a yield-timeout context to limit how long a single checksum pass

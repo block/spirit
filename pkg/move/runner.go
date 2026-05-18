@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
@@ -87,15 +86,6 @@ type Runner struct {
 	startTime                time.Time
 	sentinelWaitStartTime    time.Time
 	usedResumeFromCheckpoint bool
-
-	// continuousFlushMu serializes the sentinel-wait flush goroutine with
-	// each continuous-checksum iteration. The flush holds a subscription
-	// mutex and runs DML against the new tables; the checksum's initConnPool
-	// acquires a table lock and then a subscription mutex via
-	// FlushUnderTableLock. Running them concurrently can deadlock. We hold
-	// continuousFlushMu around both the periodic flush and the checker.Run
-	// call so they never overlap.
-	continuousFlushMu sync.Mutex
 
 	cutoverFunc func(ctx context.Context) error
 
@@ -761,7 +751,7 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 		for _, tbl := range r.sources[i].tables {
 			go tbl.AutoUpdateStatistics(ctx, tableStatUpdateInterval, r.logger)
 		}
-		go r.sources[i].replClient.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
+		r.sources[i].replClient.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
 	}
 
 	// Start go routines for checkpointing and dumping status. The returned
@@ -1134,41 +1124,12 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) (retErr error) {
 		"sentinel-table", sentinelTableName,
 		"wait-limit", sentinelWaitLimit)
 
-	// Keep periodic flushing alive throughout the sentinel wait. postCopyPhase
-	// stopped it; without restarting it here, binlog deltas accumulate until
-	// the next continuous-checksum iteration (up to an hour) and the cutover
-	// has to drain them all under lock.
-	//
-	// We serialize this flush with the continuous-checksum iteration via
-	// continuousFlushMu. Holding the mutex during a flush ensures we are not
-	// flushing while the checksum's initConnPool is acquiring its table lock,
-	// which would deadlock: our flush holds the subscription mutex while its
-	// DML waits on the table lock, and FlushUnderTableLock then needs that
-	// same subscription mutex.
-	flushCtx, cancelFlush := context.WithCancel(ctx)
-	flushDone := make(chan struct{})
-	go func() {
-		defer close(flushDone)
-		ticker := time.NewTicker(repl.DefaultFlushInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-flushCtx.Done():
-				return
-			case <-ticker.C:
-				r.continuousFlushMu.Lock()
-				err := r.flushAllReplClients(flushCtx)
-				r.continuousFlushMu.Unlock()
-				if err != nil && !errors.Is(err, context.Canceled) {
-					r.logger.Warn("periodic flush failed during sentinel wait", "error", err)
-				}
-			}
-		}
-	}()
-
 	// Spawn the continuous checksum. It uses its own checker + chunker and is
 	// not wired into the checkpoint — so a crash during sentinel wait does
-	// not add mandatory checksum time on resume.
+	// not add mandatory checksum time on resume. The checker manages its own
+	// periodic-flush lifecycle per iteration; runContinuousChecksum drives
+	// flushes during the inter-iteration wait so binlog deltas don't pile up
+	// between passes.
 	continuousCtx, cancelContinuous := context.WithCancel(ctx)
 	continuousDone := make(chan struct{})
 	var continuousErr error
@@ -1177,19 +1138,12 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) (retErr error) {
 		continuousErr = r.runContinuousChecksum(continuousCtx)
 	}()
 
-	// Single defer that handles teardown for both goroutines. We cancel the
-	// flush goroutine first so that its in-flight Flush (which holds
-	// continuousFlushMu) can drop the mutex promptly, otherwise the
-	// continuous goroutine may block on Lock() while we wait for it to exit.
-	// Then we cancel the continuous goroutine and wait for both to finish.
 	// runContinuousChecksum already filters harmless sentinel cancellations
 	// to nil, so any non-nil continuousErr is one it intentionally chose to
 	// propagate — surface it as retErr whenever the parent ctx itself has
 	// not been cancelled (parent cancellation is its own error path).
 	defer func() {
-		cancelFlush()
 		cancelContinuous()
-		<-flushDone
 		<-continuousDone
 		if retErr != nil {
 			return
@@ -1288,15 +1242,29 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		// Wait the minimum interval (less time already spent in the prior
 		// iteration). On the first iteration this is the full interval, so
 		// we don't kick off a checksum immediately after the initial pass.
-		// Sleep is ctx-cancellable so a sentinel drop interrupts immediately.
+		// Run StartPeriodicFlush on every source during the wait — the
+		// checker.Run inside each iteration starts its own per-source, but
+		// the inter-iteration gap (up to continuousChecksumMinInterval)
+		// sits outside that lifetime. Without flushing here, binlog deltas
+		// accumulate during the wait and have to be drained under the
+		// cutover's table lock.
 		if remaining := continuousChecksumMinInterval - lastDuration; remaining > 0 {
 			r.logger.Info("continuous checksum waiting before next iteration", "wait", remaining.Round(time.Second))
+			for i := range r.sources {
+				r.sources[i].replClient.StartPeriodicFlush(ctx, repl.DefaultFlushInterval)
+			}
 			timer := time.NewTimer(remaining)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				for i := range r.sources {
+					r.sources[i].replClient.StopPeriodicFlush()
+				}
 				return nil
 			case <-timer.C:
+			}
+			for i := range r.sources {
+				r.sources[i].replClient.StopPeriodicFlush()
 			}
 		}
 		if err := ctx.Err(); err != nil {
@@ -1312,11 +1280,7 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		iteration++
 		iterationStart := time.Now()
 		r.logger.Info("continuous checksum iteration starting", "iteration", iteration)
-		// Serialize the iteration with the sentinel-wait flush goroutine so
-		// they don't race on the subscription mutex / table lock.
-		r.continuousFlushMu.Lock()
 		runErr := checker.Run(ctx)
-		r.continuousFlushMu.Unlock()
 		if runErr != nil {
 			// Only suppress a `context.Canceled` that came from OUR ctx
 			// being cancelled (the sentinel was dropped while a pass was
