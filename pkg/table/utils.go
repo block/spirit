@@ -90,6 +90,12 @@ func QuoteColumns(cols []string) string {
 // not always optimizing conditions such as (a,b,c) > (1,2,3).
 // This limitation is still current in 8.0, and was not fixed
 // by the work in https://dev.mysql.com/worklog/task/?id=7019
+//
+// vals[i].String() is inlined directly into the SQL fragment because
+// Datum.String() returns a pre-escaped self-contained SQL literal
+// (see its doc comment for the contract). Don't change the format
+// strings below to add quoting or escaping — the values already carry
+// it.
 func expandRowConstructorComparison(cols []string, operator Operator, vals []Datum) string {
 	if len(cols) != len(vals) {
 		panic("cols should be same size as values")

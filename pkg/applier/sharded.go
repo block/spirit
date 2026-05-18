@@ -445,6 +445,10 @@ func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, 
 			if err != nil {
 				return 0, fmt.Errorf("failed to convert value to datum for column %s: %w", columnNames[i], err)
 			}
+			// datum.String() returns a complete pre-escaped SQL literal
+			// (NULL, a numeric, 0x… hex, or a "..."-quoted string). Safe
+			// to concatenate into the VALUES clause as-is — see the
+			// contract on Datum.String.
 			values = append(values, datum.String())
 		}
 		valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
@@ -767,6 +771,10 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 						results <- result{err: fmt.Errorf("failed to convert value to datum for column %s: %w", col, err)}
 						return
 					}
+					// datum.String() returns a complete pre-escaped SQL
+					// literal (NULL, a numeric, 0x… hex, or a "..."-quoted
+					// string). Safe to concatenate into the VALUES clause
+					// as-is — see the contract on Datum.String.
 					values = append(values, datum.String())
 				}
 				valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))

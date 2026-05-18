@@ -276,14 +276,30 @@ func (d Datum) Range(d2 Datum) (uint64, error) {
 	return d.Val.(uint64) - d2.Val.(uint64), nil
 }
 
-// String returns the datum as a SQL-escaped literal. It is also
-// fmt.Stringer for log / debug formatting. The previous form panicked
-// when a non-numeric datum's Val was not a string; this form coerces
-// via %v so a misconstructed datum still produces a valid SQL fragment
-// (correctly escaped/quoted below) rather than crashing the migration.
-// NewDatum always normalizes Val to string for binaryType/unknownType,
-// so this coercion only fires for datums built by hand with an
-// unexpected Val type.
+// String returns the datum as a complete, self-contained SQL literal.
+// Every return path is safe to inline directly into a SQL statement
+// without further quoting or escaping by the caller:
+//
+//   - NULL                            for IsNil()
+//   - the numeric literal (e.g. 42)   for IsNumeric()
+//   - 0x... hex literal               for IsBinaryString()
+//   - "..." with backslash escapes    for everything else
+//
+// The string-literal path runs sqlescape.EscapeString on the contents
+// and wraps in double quotes, so callers like Chunk.String /
+// expandRowConstructorComparison / applier UpsertRows can construct
+// SQL by simple fmt.Sprintf concatenation. New code that has explicit
+// error handling available may prefer a typed accessor, but the
+// pre-escaped contract here is load-bearing for the migration's SQL
+// emission paths.
+//
+// It is also fmt.Stringer for log / debug output. The previous form
+// panicked when a non-numeric datum's Val was not a string; this form
+// coerces via %v so a misconstructed datum still produces a valid SQL
+// fragment rather than crashing the migration. NewDatum always
+// normalizes Val to string for binaryType/unknownType, so this
+// coercion only fires for datums built by hand with an unexpected Val
+// type.
 func (d Datum) String() string {
 	if d.IsNil() {
 		return "NULL"

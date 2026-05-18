@@ -331,6 +331,10 @@ func (a *SingleTargetApplier) writeChunklet(ctx context.Context, chunkletData ch
 			if err != nil {
 				return 0, fmt.Errorf("failed to convert value to datum for column %s: %w", columnNames[i], err)
 			}
+			// datum.String() returns a complete pre-escaped SQL literal
+			// (NULL, a numeric, 0x… hex, or a "..."-quoted string). Safe
+			// to concatenate into the VALUES clause as-is — see the
+			// contract on Datum.String.
 			values = append(values, datum.String())
 		}
 		valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
@@ -541,6 +545,10 @@ func (a *SingleTargetApplier) UpsertRows(ctx context.Context, mapping *table.Col
 			if err != nil {
 				return 0, fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)
 			}
+			// datum.String() returns a complete pre-escaped SQL literal
+			// (NULL, a numeric, 0x… hex, or a "..."-quoted string). Safe
+			// to concatenate into the VALUES clause as-is — see the
+			// contract on Datum.String.
 			values = append(values, datum.String())
 		}
 		valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
