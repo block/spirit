@@ -697,18 +697,12 @@ func TestDeferCutOverE2E(t *testing.T) {
 		c <- m.Run(t.Context())
 	}()
 
-	// Wait until the sentinel table exists.
 	db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	require.Eventually(t, func() bool {
-		var rowCount int
-		_ = db.QueryRowContext(t.Context(), fmt.Sprintf(
-			`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES 
-			WHERE TABLE_SCHEMA='%s' AND TABLE_NAME='%s'`, dbName, sentinelTableName)).Scan(&rowCount)
-		return rowCount > 0
-	}, 30*time.Second, 10*time.Millisecond, "sentinel table should appear within 30s")
+	waitForStatus(t, m, status.WaitingOnSentinelTable)
+	waitForSentinelStatus(t, db, dbName, sentinelStatusReady)
 
 	// Drop the sentinel table — migration should complete.
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinelTableName)
@@ -752,6 +746,7 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 	defer utils.CloseAndLog(db)
 
 	waitForStatus(t, m, status.WaitingOnSentinelTable)
+	waitForSentinelStatus(t, db, dbName, sentinelStatusReady)
 
 	// Verify binlog position advances while waiting.
 	binlogPos := m.replClient.GetBinlogApplyPosition()

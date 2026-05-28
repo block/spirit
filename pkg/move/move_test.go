@@ -3,6 +3,7 @@ package move
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -59,6 +60,52 @@ func TestBasicMove(t *testing.T) {
 	}
 	require.NoError(t, move.Run())
 }
+
+func waitForSentinelStatus(t *testing.T, db *sql.DB, dbName, expectedStatus string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var actualStatus string
+		err := db.QueryRowContext(t.Context(),
+			fmt.Sprintf("SELECT status FROM `%s`.`%s` WHERE id = 1", dbName, sentinelTableName)).Scan(&actualStatus)
+		return err == nil && actualStatus == expectedStatus
+	}, 30*time.Second, 100*time.Millisecond, "sentinel table did not reach status %q", expectedStatus)
+}
+
+func TestMoveSentinelStatusReady(t *testing.T) {
+	sourceDBName, _ := testutils.CreateUniqueTestDatabase(t)
+	targetDBName, _ := testutils.CreateUniqueTestDatabase(t)
+	t.Cleanup(func() {
+		testutils.RunSQLInDatabase(t, sourceDBName, "DROP TABLE IF EXISTS "+sentinelTableName)
+	})
+
+	testutils.RunSQLInDatabase(t, sourceDBName, `CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQLInDatabase(t, sourceDBName, `INSERT INTO t1 (id, val) VALUES (1, 'one'), (2, 'two'), (3, 'three')`)
+
+	sourceDSN := testutils.DSNForDatabase(sourceDBName)
+	targetDSN := testutils.DSNForDatabase(targetDBName)
+	sourceDB, err := sql.Open("mysql", sourceDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(sourceDB)
+
+	move := &Move{
+		SourceDSN:       sourceDSN,
+		TargetDSN:       targetDSN,
+		TargetChunkTime: 100 * time.Millisecond,
+		Threads:         2,
+		WriteThreads:    2,
+		CreateSentinel:  true,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- move.Run()
+	}()
+
+	waitForSentinelStatus(t, sourceDB, sourceDBName, sentinelStatusReady)
+	testutils.RunSQLInDatabase(t, sourceDBName, "DROP TABLE "+sentinelTableName)
+	require.NoError(t, <-done)
+}
+
 func TestResumeFromCheckpointE2E(t *testing.T) {
 	t.Run("deferFalse", func(t *testing.T) { // known to race.
 		testResumeFromCheckpointE2E(t, false)

@@ -1,6 +1,8 @@
 package migration
 
 import (
+	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -52,6 +54,16 @@ func waitForStatus(t *testing.T, m *Runner, target status.State) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+}
+
+func waitForSentinelStatus(t *testing.T, db *sql.DB, dbName, expectedStatus string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var actualStatus string
+		err := db.QueryRowContext(t.Context(),
+			fmt.Sprintf("SELECT status FROM `%s`.`%s` WHERE id = 1", dbName, sentinelTableName)).Scan(&actualStatus)
+		return err == nil && actualStatus == expectedStatus
+	}, 30*time.Second, 100*time.Millisecond, "sentinel table did not reach status %q", expectedStatus)
 }
 
 // RunnerOption is a functional option for configuring a test Runner.

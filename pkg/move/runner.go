@@ -34,6 +34,8 @@ var (
 	tableStatUpdateInterval = 5 * time.Minute
 	sentinelWaitLimit       = 48 * time.Hour
 	sentinelTableName       = "_spirit_sentinel" // this is now a const.
+	sentinelStatusCopying   = "copying"
+	sentinelStatusReady     = "ready"
 	checkpointTableName     = "_spirit_checkpoint"
 	// continuousChecksumMinInterval is the minimum amount of time between
 	// continuous-checksum iterations during the sentinel wait. Without it,
@@ -1092,7 +1094,10 @@ func (r *Runner) createSentinelTable(ctx context.Context) error {
 	if err := dbconn.Exec(ctx, r.sources[0].db, "DROP TABLE IF EXISTS %n.%n", r.sources[0].config.DBName, sentinelTableName); err != nil {
 		return err
 	}
-	if err := dbconn.Exec(ctx, r.sources[0].db, "CREATE TABLE %n.%n (id int NOT NULL PRIMARY KEY)", r.sources[0].config.DBName, sentinelTableName); err != nil {
+	if err := dbconn.Exec(ctx, r.sources[0].db, "CREATE TABLE %n.%n (id int NOT NULL PRIMARY KEY, status varchar(32) NOT NULL)", r.sources[0].config.DBName, sentinelTableName); err != nil {
+		return err
+	}
+	if err := dbconn.Exec(ctx, r.sources[0].db, "INSERT INTO %n.%n (id, status) VALUES (1, %?)", r.sources[0].config.DBName, sentinelTableName, sentinelStatusCopying); err != nil {
 		return err
 	}
 	return nil
@@ -1107,6 +1112,59 @@ func (r *Runner) sentinelTableExists(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return sentinelTableExists > 0, nil
+}
+
+func (r *Runner) sentinelStatusColumnExists(ctx context.Context) (bool, error) {
+	sql := "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'status'"
+	var columnExists int
+	err := r.sources[0].db.QueryRowContext(ctx, sql, r.sources[0].config.DBName, sentinelTableName).Scan(&columnExists)
+	if err != nil {
+		return false, err
+	}
+	return columnExists > 0, nil
+}
+
+func (r *Runner) markSentinelReady(ctx context.Context) (bool, error) {
+	columnExists, err := r.sentinelStatusColumnExists(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !columnExists {
+		sentinelExists, err := r.sentinelTableExists(ctx)
+		if err != nil {
+			return false, err
+		}
+		if !sentinelExists {
+			r.logger.Info("sentinel table dropped before ready status update",
+				"sentinel-table", sentinelTableName,
+			)
+			return true, nil
+		}
+		r.logger.Warn("sentinel table exists without status column; waiting without marking ready",
+			"sentinel-table", sentinelTableName,
+		)
+		return false, nil
+	}
+	err = dbconn.Exec(ctx, r.sources[0].db, "INSERT INTO %n.%n (id, status) VALUES (1, %?) ON DUPLICATE KEY UPDATE status = %?",
+		r.sources[0].config.DBName,
+		sentinelTableName,
+		sentinelStatusReady,
+		sentinelStatusReady,
+	)
+	if err == nil {
+		return false, nil
+	}
+	sentinelExists, checkErr := r.sentinelTableExists(ctx)
+	if checkErr != nil {
+		return false, err
+	}
+	if !sentinelExists {
+		r.logger.Info("sentinel table dropped before ready status update",
+			"sentinel-table", sentinelTableName,
+		)
+		return true, nil
+	}
+	return false, err
 }
 
 // Check every sentinelCheckInterval up to sentinelWaitLimit to see if sentinelTable has been dropped.
@@ -1124,6 +1182,14 @@ func (r *Runner) waitOnSentinelTable(ctx context.Context) (retErr error) {
 		return err
 	} else if !sentinelExists {
 		// Sentinel table does not exist, we can proceed with cutover
+		return nil
+	}
+
+	sentinelReleased, err := r.markSentinelReady(ctx)
+	if err != nil {
+		return err
+	}
+	if sentinelReleased {
 		return nil
 	}
 
