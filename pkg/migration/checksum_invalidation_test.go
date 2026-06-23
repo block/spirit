@@ -27,11 +27,12 @@ type mockChecker struct {
 	differencesFound atomic.Uint64
 }
 
-func (m *mockChecker) Run(ctx context.Context) error { return m.runErr }
-func (m *mockChecker) GetProgress() string           { return "mock" }
-func (m *mockChecker) StartTime() time.Time          { return time.Now() }
-func (m *mockChecker) ExecTime() time.Duration       { return 0 }
-func (m *mockChecker) DifferencesFound() uint64      { return m.differencesFound.Load() }
+func (m *mockChecker) Run(ctx context.Context) error     { return m.runErr }
+func (m *mockChecker) GetProgress() string               { return "mock" }
+func (m *mockChecker) GetProgressRows() (uint64, uint64) { return 0, 0 }
+func (m *mockChecker) StartTime() time.Time              { return time.Now() }
+func (m *mockChecker) ExecTime() time.Duration           { return 0 }
+func (m *mockChecker) DifferencesFound() uint64          { return m.differencesFound.Load() }
 
 // setupRunnerForChecksumTest creates a real table, runs the runner setup as
 // far as creating the checkpoint table on disk, and returns a Runner that can

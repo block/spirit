@@ -107,12 +107,14 @@ func (c *SingleChecker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPo
 // GetProgress returns the progress of the checker
 // this is really just a proxy to the chunker progress.
 func (c *SingleChecker) GetProgress() string {
+	rowsChecked, rowsTotal := c.GetProgressRows()
+	return formatChecksumProgress(rowsChecked, rowsTotal)
+}
+
+// GetProgressRows returns rows verified so far and the total to verify.
+func (c *SingleChecker) GetProgressRows() (rowsChecked, rowsTotal uint64) {
 	rowsProcessed, _, totalRows := c.chunker.Progress()
-	pct := float64(0)
-	if totalRows > 0 {
-		pct = float64(rowsProcessed) / float64(totalRows) * 100
-	}
-	return fmt.Sprintf("%d/%d %.2f%%", rowsProcessed, totalRows, pct)
+	return rowsProcessed, totalRows
 }
 
 // inspectDifferences looks at the chunk and tries to find differences.

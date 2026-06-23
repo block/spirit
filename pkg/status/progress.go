@@ -41,9 +41,22 @@ type Progress struct {
 	// ETA is the structured remaining row-copy estimate and its availability.
 	ETA ETA
 
+	// Checksum is the structured progress of the post-copy checksum phase,
+	// populated while CurrentState is Checksum and zero otherwise. It is the
+	// structured form of the checksum progress embedded in Summary.
+	Checksum ChecksumProgress
+
 	// Tables contains per-table progress for multi-table migrations.
 	// For single-table migrations, this will have one entry.
 	Tables []TableProgress
+}
+
+// ChecksumProgress tracks progress of the checksum phase, where Spirit verifies
+// the copied data against the source before cutover. RowsChecked and RowsTotal
+// are 0 outside the checksum phase.
+type ChecksumProgress struct {
+	RowsChecked uint64 // rows verified so far
+	RowsTotal   uint64 // total rows to verify
 }
 
 // TableProgress tracks progress for a single table in the migration.

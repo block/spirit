@@ -94,6 +94,10 @@ type Checker interface {
 	// Run performs the checksum operation.
 	Run(ctx context.Context) error
 	GetProgress() string
+	// GetProgressRows returns the structured checksum progress — rows verified so
+	// far and the total to verify — so callers can render progress without
+	// parsing GetProgress's display string.
+	GetProgressRows() (rowsChecked, rowsTotal uint64)
 	StartTime() time.Time
 	ExecTime() time.Duration
 	// DifferencesFound returns the number of chunks where a source/target
@@ -103,6 +107,17 @@ type Checker interface {
 	// checksum loop uses it to decide whether a sentinel-drop swallow is
 	// safe.
 	DifferencesFound() uint64
+}
+
+// formatChecksumProgress renders checksum progress for the human-readable
+// summary line, e.g. "71436/221193 32.30%". Shared by the checker
+// implementations so the display string and GetProgressRows stay in sync.
+func formatChecksumProgress(rowsChecked, rowsTotal uint64) string {
+	pct := float64(0)
+	if rowsTotal > 0 {
+		pct = float64(rowsChecked) / float64(rowsTotal) * 100
+	}
+	return fmt.Sprintf("%d/%d %.2f%%", rowsChecked, rowsTotal, pct)
 }
 
 type CheckerConfig struct {

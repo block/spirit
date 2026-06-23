@@ -1039,6 +1039,7 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 func (r *Runner) Progress() status.Progress {
 	var summary string
 	var eta status.ETA
+	var checksum status.ChecksumProgress
 	switch r.status.Get() { //nolint: exhaustive
 	case status.CopyRows:
 		summary = fmt.Sprintf("%v %s ETA %v",
@@ -1052,6 +1053,8 @@ func (r *Runner) Progress() status.Progress {
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
 	case status.Checksum:
+		rowsChecked, rowsTotal := r.checker.GetProgressRows()
+		checksum = status.ChecksumProgress{RowsChecked: rowsChecked, RowsTotal: rowsTotal}
 		summary = "Checksum Progress=" + r.checker.GetProgress()
 	}
 
@@ -1091,6 +1094,7 @@ func (r *Runner) Progress() status.Progress {
 		CurrentState: r.status.Get(),
 		Summary:      summary,
 		ETA:          eta,
+		Checksum:     checksum,
 		Tables:       tables,
 	}
 }
