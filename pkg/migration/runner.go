@@ -1053,9 +1053,8 @@ func (r *Runner) Progress() status.Progress {
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
 	case status.Checksum:
-		rowsChecked, rowsTotal := r.checker.GetProgressRows()
-		checksum = status.ChecksumProgress{RowsChecked: rowsChecked, RowsTotal: rowsTotal}
-		summary = "Checksum Progress=" + r.checker.GetProgress()
+		checksum = r.checker.GetProgress()
+		summary = "Checksum Progress=" + checksum.String()
 	}
 
 	// Get per-table progress if available (multi-table migrations).
@@ -1550,7 +1549,7 @@ func (r *Runner) Status() string {
 	case status.Checksum:
 		return fmt.Sprintf("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s conns-in-use=%d",
 			r.status.Get().String(),
-			r.checker.GetProgress(),
+			r.checker.GetProgress().String(),
 			r.replClient.GetDeltaLen(),
 			time.Since(r.startTime).Round(time.Second),
 			time.Since(r.checker.StartTime()).Round(time.Second),

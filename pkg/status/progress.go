@@ -1,6 +1,9 @@
 package status
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Progress is returned as a struct because we may add more to it later.
 // It is designed for wrappers (like a GUI) to be able to summarize the
@@ -57,6 +60,16 @@ type Progress struct {
 type ChecksumProgress struct {
 	RowsChecked uint64 // rows verified so far
 	RowsTotal   uint64 // total rows to verify
+}
+
+// String renders the checksum progress for the human-readable summary line,
+// e.g. "71436/221193 32.30%".
+func (c ChecksumProgress) String() string {
+	pct := float64(0)
+	if c.RowsTotal > 0 {
+		pct = float64(c.RowsChecked) / float64(c.RowsTotal) * 100
+	}
+	return fmt.Sprintf("%d/%d %.2f%%", c.RowsChecked, c.RowsTotal, pct)
 }
 
 // TableProgress tracks progress for a single table in the migration.

@@ -978,7 +978,7 @@ func (r *Runner) Status() string {
 		// This could take a while if it's a large table.
 		return fmt.Sprintf("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s",
 			r.status.Get().String(),
-			r.checker.GetProgress(),
+			r.checker.GetProgress().String(),
 			r.getDeltaLenAll(),
 			time.Since(r.startTime).Round(time.Second),
 			time.Since(r.checker.StartTime()).Round(time.Second),
@@ -1272,7 +1272,7 @@ func (r *Runner) Progress() status.Progress {
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.getDeltaLenAll())
 	case status.Checksum:
-		summary = "Checksum Progress=" + r.checker.GetProgress()
+		summary = "Checksum Progress=" + r.checker.GetProgress().String()
 	default:
 		summary = ""
 	}

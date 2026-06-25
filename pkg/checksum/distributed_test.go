@@ -69,9 +69,9 @@ func TestFixCorruptWithApplier(t *testing.T) {
 
 	checker, err := NewChecker([]*sql.DB{src}, chunker, []change.Source{feed}, config)
 	require.NoError(t, err)
-	require.Equal(t, "0/3 0.00%", checker.GetProgress())
+	require.Equal(t, "0/3 0.00%", checker.GetProgress().String())
 	require.NoError(t, checker.Run(t.Context())) // should be fixed!
-	require.Equal(t, "3/3 100.00%", checker.GetProgress())
+	require.Equal(t, "3/3 100.00%", checker.GetProgress().String())
 }
 
 func TestDistributedChecksum(t *testing.T) {

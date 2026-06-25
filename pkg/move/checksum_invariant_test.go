@@ -26,12 +26,11 @@ type mockChecker struct {
 	differencesFound atomic.Uint64
 }
 
-func (m *mockChecker) Run(ctx context.Context) error     { return m.runErr }
-func (m *mockChecker) GetProgress() string               { return "mock" }
-func (m *mockChecker) GetProgressRows() (uint64, uint64) { return 0, 0 }
-func (m *mockChecker) StartTime() time.Time              { return time.Now() }
-func (m *mockChecker) ExecTime() time.Duration           { return 0 }
-func (m *mockChecker) DifferencesFound() uint64          { return m.differencesFound.Load() }
+func (m *mockChecker) Run(ctx context.Context) error        { return m.runErr }
+func (m *mockChecker) GetProgress() status.ChecksumProgress { return status.ChecksumProgress{} }
+func (m *mockChecker) StartTime() time.Time                 { return time.Now() }
+func (m *mockChecker) ExecTime() time.Duration              { return 0 }
+func (m *mockChecker) DifferencesFound() uint64             { return m.differencesFound.Load() }
 
 // setupRunnerForChecksumTest builds a move.Runner up to the point where the
 // checkpoint table exists on the first target, the copier has produced a watermark,
