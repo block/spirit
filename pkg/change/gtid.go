@@ -629,8 +629,15 @@ func (c *gtidClient) processRowsEvent(ev *replication.BinlogEvent, e *replicatio
 		return fmt.Errorf("received a minimal RBR event for table %s.%s, but we require binlog_row_image=FULL on the source server", string(e.Table.Schema), string(e.Table.Table))
 	}
 
-	tbl := sub.Tables()[0]
 	eventType := parseEventType(ev.Header.EventType)
+	if eventType == eventTypeUnknown {
+		// Hard-fail, mirroring the minimal-row-image check above — see the
+		// matching guard in binlogClient.processRowsEvent. Dropping an
+		// unrecognized rows-event subtype would silently lose row changes.
+		return fmt.Errorf("received unsupported rows event type %v (0x%02x) for table %s.%s: cannot apply its row changes", ev.Header.EventType, uint8(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
+	}
+
+	tbl := sub.Tables()[0]
 
 	// Decode ENUM/SET integers and re-pad BINARY(N) values before key
 	// extraction and buffering — see the matching block in binlog.go's
@@ -676,7 +683,10 @@ func (c *gtidClient) processRowsEvent(ev *replication.BinlogEvent, e *replicatio
 		case eventTypeDelete:
 			sub.HasChanged(key, nil, true)
 		default:
-			c.logger.Error("unknown event type", "type", ev.Header.EventType)
+			// Unreachable: eventTypeUnknown is rejected above and
+			// eventTypeUpdate returned earlier. Kept as a hard error so a
+			// future eventType addition cannot silently drop rows.
+			return fmt.Errorf("unhandled rows event type %v (0x%02x) for table %s.%s", ev.Header.EventType, uint8(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
 		}
 	}
 	return nil

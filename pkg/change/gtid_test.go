@@ -3,6 +3,7 @@ package change
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/block/spirit/pkg/applier"
@@ -11,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -348,4 +350,70 @@ func TestGTIDRoundtripPosition(t *testing.T) {
 	require.NoError(t, client2.AddSubscription(t1, t2, chunker2))
 	require.NoError(t, client2.StartFromPosition(t.Context(), pos))
 	client2.Close()
+}
+
+// TestGTIDProcessRowsEventUnknownSubtypeFails mirrors
+// TestProcessRowsEventUnknownSubtypeFails for the GTID client: a rows-event
+// subtype parseEventType does not recognize must be a hard error (routed to
+// fatalError by readStream), never a logged skip that silently loses rows.
+func TestGTIDProcessRowsEventUnknownSubtypeFails(t *testing.T) {
+	t1 := `CREATE TABLE subscription_test (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	t2 := `CREATE TABLE _subscription_test_new (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	srcTable, dstTable := setupTestTables(t, t1, t2)
+
+	client := &gtidClient{
+		logger: slog.Default(),
+		subs:   newSubscriptionRegistry(),
+	}
+	sub := &bufferedMap{
+		logger:               client.logger,
+		table:                srcTable,
+		newTable:             dstTable,
+		changes:              make(map[string]bufferedChange),
+		pkIsMemoryComparable: true,
+	}
+	sub.cond = sync.NewCond(&sub.Mutex)
+	require.True(t, client.subs.Add(encodeSchemaTable(srcTable.SchemaName, srcTable.TableName), sub))
+
+	mkEvent := func(et replication.EventType, schema, tableName string) (*replication.BinlogEvent, *replication.RowsEvent) {
+		rows := &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema: []byte(schema),
+				Table:  []byte(tableName),
+			},
+			Rows: [][]any{{1, "x"}},
+		}
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: et, LogPos: 1000},
+			Event:  rows,
+		}, rows
+	}
+
+	// Sanity: a recognized subtype flows through and buffers the row.
+	ev, rows := mkEvent(replication.WRITE_ROWS_EVENTv2, srcTable.SchemaName, srcTable.TableName)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, sub.Length())
+
+	// An unrecognized subtype for a subscribed table must hard-error,
+	// naming the event type (string and header value) and the table.
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, srcTable.SchemaName, srcTable.TableName)
+	err := client.processRowsEvent(ev, rows)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "PartialUpdateRowsEvent")
+	require.ErrorContains(t, err, fmt.Sprintf("0x%02x", uint8(replication.PARTIAL_UPDATE_ROWS_EVENT)))
+	require.ErrorContains(t, err, srcTable.TableName)
+	require.Equal(t, 1, sub.Length(), "the unsupported event must not buffer rows")
+
+	// Events for tables without a subscription stay ignored regardless of
+	// subtype (e.g. writes to unrelated tables, or to a _new table).
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, srcTable.SchemaName, "not_subscribed")
+	require.NoError(t, client.processRowsEvent(ev, rows))
 }

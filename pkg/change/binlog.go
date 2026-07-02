@@ -190,6 +190,53 @@ func shouldSkipReplayedEvent(eventPos, bufferedPos mysql.Position) bool {
 	return eventPos.Compare(bufferedPos) <= 0
 }
 
+// logPosWrapThreshold is how far below bufferedPos (within the same binlog
+// file) an event's end position must sit before the gap is classified as
+// uint32 LogPos wraparound rather than a post-reconnect replay. Half the
+// uint32 space cleanly separates the two: immediately after a wrap the gap
+// is nearly 2^32 (bufferedPos froze just under 4GiB, wrapped positions
+// restart near zero), while a replay's gap only ever spans event positions
+// that were actually reached within the file.
+const logPosWrapThreshold = uint32(1) << 31 // 2 GiB
+
+// isWrappedLogPos reports whether eventPos sitting below bufferedPos in the
+// same binlog file is best explained by LogPos wraparound. ev.Header.LogPos
+// is a 4-byte wire field, and a binlog file only rotates on a transaction
+// boundary — one transaction writing more than 4GiB of row images past the
+// max_binlog_size point pushes end positions past 2^32, where they wrap to
+// small values. setBufferedPos's monotonicity then freezes bufferedPos just
+// under the wrap point, so every post-wrap event compares below it by an
+// enormous margin.
+func isWrappedLogPos(eventPos, bufferedPos mysql.Position) bool {
+	return eventPos.Name == bufferedPos.Name &&
+		eventPos.Pos < bufferedPos.Pos &&
+		bufferedPos.Pos-eventPos.Pos > logPosWrapThreshold
+}
+
+// shouldSkipRowsEvent is the full skip decision for a RowsEvent: skip
+// genuine replays (shouldSkipReplayedEvent), but fail safe on LogPos
+// wraparound by delivering the event. wrapped=true reports that the event
+// compares below bufferedPos only because the 4-byte LogPos wrapped past
+// 4GiB — the event is live, and skipping it would silently discard row
+// changes. Re-delivering is safe (REPLACE/DELETE application is idempotent);
+// skipping is not.
+//
+// replaying must be true from a successful recreateStreamer until the replay
+// catches back up to bufferedPos: replayed events legitimately sit far below
+// the high-water mark (the replay restarts at position 4), so the wraparound
+// heuristic is suppressed inside that window. The residual ambiguity — a
+// reconnect while bufferedPos is already frozen at a pre-wrap value — cannot
+// be resolved with 32-bit positions at all, and keeps the old skip behavior.
+func shouldSkipRowsEvent(eventPos, bufferedPos mysql.Position, replaying bool) (skip, wrapped bool) {
+	if !shouldSkipReplayedEvent(eventPos, bufferedPos) {
+		return false, false
+	}
+	if !replaying && isWrappedLogPos(eventPos, bufferedPos) {
+		return false, true
+	}
+	return true, false
+}
+
 // AllChangesFlushed returns true if all buffered changes across all
 // subscriptions have been flushed to the target tables.
 // Satisfies Source interface.
@@ -452,6 +499,17 @@ func (c *binlogClient) readStream(ctx context.Context) {
 	lastErrorTime := time.Time{}
 	var recentErrors []string // Track recent errors for debugging
 
+	// replaying is true from a successful streamer recreation until the
+	// replay catches back up to the buffered position (i.e. the first rows
+	// event delivered again). Inside the window, events at or below
+	// bufferedPos are replays and must be skipped; outside it, a same-file
+	// event far below bufferedPos is uint32 LogPos wraparound and must be
+	// delivered instead. See shouldSkipRowsEvent.
+	replaying := false
+	// wrapWarnedFile dedupes the LogPos-wraparound warning to once per
+	// binlog file.
+	wrapWarnedFile := ""
+
 	c.logger.Debug("readStream started for binlog position", "position", startPos, "log_name", currentLogName)
 
 	for {
@@ -546,6 +604,11 @@ func (c *binlogClient) readStream(ctx context.Context) {
 					consecutiveErrors = 0
 					recreateAttempts = 0
 					backoffDuration = initialBackoffDuration
+					// The recreated dump restarts at position 4 of the
+					// current file and replays events we already buffered.
+					// Mark the replay window so those low positions are
+					// skipped as replays, not mistaken for LogPos wraparound.
+					replaying = true
 				}
 				lastErrorTime = currentTime
 			}
@@ -587,13 +650,33 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		case *replication.RowsEvent:
 			// Skip events already buffered/applied: a post-recreateStreamer
 			// replay must not re-buffer them and regress a key to a stale
-			// image. See shouldSkipReplayedEvent.
+			// image. LogPos is only 4 bytes on the wire, though, and one
+			// huge transaction can push a file past 4GiB (rotation only
+			// happens on a transaction boundary), wrapping positions back
+			// to small values — those events are live, not replays, and
+			// must be delivered. See shouldSkipRowsEvent.
 			eventPos := mysql.Position{Name: currentLogName, Pos: ev.Header.LogPos}
-			if shouldSkipReplayedEvent(eventPos, c.getBufferedPos()) {
+			bufferedPos := c.getBufferedPos()
+			skip, wrapped := shouldSkipRowsEvent(eventPos, bufferedPos, replaying)
+			if wrapped && wrapWarnedFile != currentLogName {
+				wrapWarnedFile = currentLogName
+				c.logger.Warn("binlog LogPos wrapped past 4GiB within a single file; "+
+					"delivering events below the buffered position instead of skipping them as replays. "+
+					"The buffered/flushed position cannot advance until the next rotation.",
+					"file", currentLogName,
+					"event_log_pos", ev.Header.LogPos,
+					"buffered_position", bufferedPos)
+			}
+			if skip {
 				c.logger.Debug("skipping replayed rows event at or below the buffered position",
 					"event_position", eventPos)
 				continue
 			}
+			// This event is being delivered, so any post-recreate replay
+			// window is over: the replay has caught back up to bufferedPos
+			// (or the position wrapped, which the window cannot outlive —
+			// reaching a wrap requires ~4GiB of delivered events first).
+			replaying = false
 			if err = c.processRowsEvent(ev, event); err != nil {
 				c.logger.Error("fatal error processing binlog rows event", "error", err)
 				c.fatalError()
@@ -713,8 +796,19 @@ func (c *binlogClient) processRowsEvent(ev *replication.BinlogEvent, e *replicat
 		return fmt.Errorf("received a minimal RBR event for table %s.%s, but we require binlog_row_image=FULL on the source server", string(e.Table.Schema), string(e.Table.Table))
 	}
 
-	tbl := sub.Tables()[0]
 	eventType := parseEventType(ev.Header.EventType)
+	if eventType == eventTypeUnknown {
+		// Hard-fail, mirroring the minimal-row-image check above: an
+		// unrecognized rows-event subtype (e.g. PARTIAL_UPDATE_ROWS_EVENT,
+		// which the server emits once binlog_row_value_options=PARTIAL_JSON
+		// is set — the global can change after our preflight check) still
+		// carries row changes. Dropping it with only an error log would
+		// silently lose those changes; they'd only be caught by the
+		// checksum where enabled.
+		return fmt.Errorf("received unsupported rows event type %v (0x%02x) for table %s.%s: cannot apply its row changes", ev.Header.EventType, uint8(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
+	}
+
+	tbl := sub.Tables()[0]
 
 	// Decode ENUM ordinals / SET bitmasks back to their string form and
 	// re-pad BINARY(N) values (MySQL strips trailing 0x00 from the row
@@ -769,7 +863,10 @@ func (c *binlogClient) processRowsEvent(ev *replication.BinlogEvent, e *replicat
 		case eventTypeDelete:
 			sub.HasChanged(key, nil, true)
 		default:
-			c.logger.Error("unknown event type", "type", ev.Header.EventType)
+			// Unreachable: eventTypeUnknown is rejected above and
+			// eventTypeUpdate returned earlier. Kept as a hard error so a
+			// future eventType addition cannot silently drop rows.
+			return fmt.Errorf("unhandled rows event type %v (0x%02x) for table %s.%s", ev.Header.EventType, uint8(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
 		}
 	}
 	return nil

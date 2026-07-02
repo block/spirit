@@ -1,10 +1,12 @@
 package change
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -965,6 +968,278 @@ func TestShouldSkipReplayedEventWidensWithBufferedPos(t *testing.T) {
 	// filter is inert for it (delivered).
 	require.False(t, shouldSkipReplayedEvent(mysql.Position{Name: file, Pos: 500}, boundary),
 		"once the boundary advances, later live events are delivered")
+}
+
+// TestShouldSkipRowsEventWraparound unit-tests the wraparound-aware skip
+// decision. ev.Header.LogPos is a 4-byte wire field: one transaction writing
+// more than 4GiB of row images into a single binlog file (rotation only
+// happens on a transaction boundary) wraps end positions back to small
+// values. setBufferedPos's monotonicity freezes bufferedPos just under the
+// wrap point, so pre-fix every post-wrap RowsEvent compared <= bufferedPos
+// and was silently discarded as a replay. The fix fails safe: outside a
+// post-reconnect replay window, a same-file event below bufferedPos by more
+// than 2^31 is classified as wraparound and delivered (re-applying is
+// idempotent; skipping loses changes).
+func TestShouldSkipRowsEventWraparound(t *testing.T) {
+	const file = "binlog.000010"
+	// bufferedPos as left behind by a wrap: frozen just under 4GiB.
+	frozen := mysql.Position{Name: file, Pos: 4294967000}
+	tests := []struct {
+		name        string
+		eventPos    mysql.Position
+		bufferedPos mysql.Position
+		replaying   bool
+		skip        bool
+		wrapped     bool
+	}{
+		{
+			name:        "live event above bufferedPos: deliver",
+			eventPos:    mysql.Position{Name: file, Pos: 4294967100},
+			bufferedPos: frozen,
+			skip:        false,
+		},
+		{
+			name:        "live event slightly below bufferedPos: replay dedup skips (unchanged behavior)",
+			eventPos:    mysql.Position{Name: file, Pos: frozen.Pos - 1000},
+			bufferedPos: frozen,
+			skip:        true,
+		},
+		{
+			name:        "live event equal to bufferedPos: skip (last buffered event)",
+			eventPos:    frozen,
+			bufferedPos: frozen,
+			skip:        true,
+		},
+		{
+			name:        "gap of exactly 2^31 is not classified as wraparound: skip",
+			eventPos:    mysql.Position{Name: file, Pos: frozen.Pos - logPosWrapThreshold},
+			bufferedPos: frozen,
+			skip:        true,
+		},
+		{
+			name:        "gap just past 2^31: wraparound, deliver",
+			eventPos:    mysql.Position{Name: file, Pos: frozen.Pos - logPosWrapThreshold - 1},
+			bufferedPos: frozen,
+			skip:        false,
+			wrapped:     true,
+		},
+		{
+			name:        "realistic post-wrap event near the start of the uint32 space: wraparound, deliver",
+			eventPos:    mysql.Position{Name: file, Pos: 500},
+			bufferedPos: frozen,
+			skip:        false,
+			wrapped:     true,
+		},
+		{
+			name:        "earlier file with a huge offset gap is not wraparound: skip",
+			eventPos:    mysql.Position{Name: "binlog.000009", Pos: 500},
+			bufferedPos: frozen,
+			skip:        true,
+		},
+		{
+			name:        "replay window: event below bufferedPos is a replay, skip",
+			eventPos:    mysql.Position{Name: file, Pos: frozen.Pos - 1000},
+			bufferedPos: frozen,
+			replaying:   true,
+			skip:        true,
+		},
+		{
+			name: "replay window suppresses the wraparound heuristic: a replayed " +
+				"event far below the high-water mark (replay restarts at pos 4) " +
+				"must still be skipped",
+			eventPos:    mysql.Position{Name: file, Pos: 500},
+			bufferedPos: frozen,
+			replaying:   true,
+			skip:        true,
+		},
+		{
+			name:        "replay catch-up: event above bufferedPos delivers even while replaying",
+			eventPos:    mysql.Position{Name: file, Pos: 4294967100},
+			bufferedPos: frozen,
+			replaying:   true,
+			skip:        false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skip, wrapped := shouldSkipRowsEvent(tt.eventPos, tt.bufferedPos, tt.replaying)
+			require.Equal(t, tt.skip, skip, "skip")
+			require.Equal(t, tt.wrapped, wrapped, "wrapped")
+		})
+	}
+}
+
+// TestReadStreamDeliversWrappedLogPosEvents drives readStream through an
+// injected streamer (no real syncer) to lock in the end-to-end wraparound
+// behavior: with bufferedPos frozen just under 4GiB by a >4GiB transaction,
+// post-wrap RowsEvents (small LogPos) must be buffered — pre-fix they were
+// silently discarded as replays — and the wraparound warning is logged once
+// per file. An event only slightly below bufferedPos (a genuine stale
+// position) must still be skipped.
+func TestReadStreamDeliversWrappedLogPosEvents(t *testing.T) {
+	t1 := `CREATE TABLE subscription_test (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	t2 := `CREATE TABLE _subscription_test_new (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	srcTable, dstTable := setupTestTables(t, t1, t2)
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// bufferedPos frozen just under the 4GiB wrap point, as setBufferedPos's
+	// monotonic guard leaves it once LogPos wraps.
+	frozen := mysql.Position{Name: "binlog.000042", Pos: 4294967000}
+	streamer := replication.NewBinlogStreamer()
+	client := &binlogClient{
+		logger:      logger,
+		subs:        newSubscriptionRegistry(),
+		streamer:    streamer,
+		flushedPos:  frozen,
+		bufferedPos: frozen,
+	}
+	sub := &bufferedMap{
+		logger:               logger,
+		table:                srcTable,
+		newTable:             dstTable,
+		changes:              make(map[string]bufferedChange),
+		pkIsMemoryComparable: true,
+	}
+	sub.cond = sync.NewCond(&sub.Mutex)
+	require.True(t, client.subs.Add(encodeSchemaTable(srcTable.SchemaName, srcTable.TableName), sub))
+
+	mkInsert := func(logPos uint32, pk int) *replication.BinlogEvent {
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{
+				Timestamp: uint32(time.Now().Unix()), //nolint: gosec
+				EventType: replication.WRITE_ROWS_EVENTv2,
+				LogPos:    logPos,
+			},
+			Event: &replication.RowsEvent{
+				Table: &replication.TableMapEvent{
+					Schema: []byte(srcTable.SchemaName),
+					Table:  []byte(srcTable.TableName),
+				},
+				Rows: [][]any{{pk, "x"}},
+			},
+		}
+	}
+	// A genuinely stale position (slightly below the high-water mark, gap
+	// far under 2^31): must be skipped as a replay.
+	require.NoError(t, streamer.AddEventToStreamer(mkInsert(frozen.Pos-1000, 1)))
+	// Two post-wrap events (LogPos wrapped back to small values): must be
+	// delivered, with the warning logged only once for the file.
+	require.NoError(t, streamer.AddEventToStreamer(mkInsert(500, 2)))
+	require.NoError(t, streamer.AddEventToStreamer(mkInsert(600, 3)))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	client.streamWG.Add(1)
+	go client.readStream(ctx)
+
+	// Events are processed in order, so once the last event's key is
+	// buffered, the decisions for all three are final.
+	key3 := utils.HashKey([]any{3})
+	require.Eventually(t, func() bool {
+		sub.Lock()
+		defer sub.Unlock()
+		_, ok := sub.changes[key3]
+		return ok
+	}, 10*time.Second, 10*time.Millisecond, "post-wrap events were not delivered")
+
+	cancel()
+	client.streamWG.Wait()
+
+	sub.Lock()
+	_, hasKey1 := sub.changes[utils.HashKey([]any{1})]
+	_, hasKey2 := sub.changes[utils.HashKey([]any{2})]
+	sub.Unlock()
+	require.False(t, hasKey1, "an event slightly below bufferedPos is a genuine replay and must still be skipped")
+	require.True(t, hasKey2, "post-wrap events must be buffered, not discarded as replays")
+	require.Equal(t, 2, sub.Length())
+
+	// bufferedPos stays frozen at the pre-wrap value (setBufferedPos is
+	// monotonic and wrapped positions compare below it).
+	require.Equal(t, frozen, client.getBufferedPos())
+
+	// The wraparound warning is emitted exactly once per binlog file, even
+	// though two wrapped events were delivered.
+	require.Equal(t, 1, strings.Count(logBuf.String(), "wrapped past 4GiB"),
+		"expected exactly one wraparound warning per file")
+}
+
+// TestProcessRowsEventUnknownSubtypeFails asserts that a rows-event subtype
+// parseEventType does not recognize is a hard error, not a logged skip.
+// go-mysql delivers e.g. PARTIAL_UPDATE_ROWS_EVENT (emitted once
+// binlog_row_value_options=PARTIAL_JSON is set — the global can change after
+// preflight) as a regular *replication.RowsEvent; pre-fix processRowsEvent
+// dropped its rows with only logger.Error, silently losing changes. It must
+// fail exactly like the minimal-row-image case so readStream cancels the
+// migration via fatalError.
+func TestProcessRowsEventUnknownSubtypeFails(t *testing.T) {
+	t1 := `CREATE TABLE subscription_test (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	t2 := `CREATE TABLE _subscription_test_new (
+		id INT NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	srcTable, dstTable := setupTestTables(t, t1, t2)
+
+	client := &binlogClient{
+		logger: slog.Default(),
+		subs:   newSubscriptionRegistry(),
+	}
+	sub := &bufferedMap{
+		logger:               client.logger,
+		table:                srcTable,
+		newTable:             dstTable,
+		changes:              make(map[string]bufferedChange),
+		pkIsMemoryComparable: true,
+	}
+	sub.cond = sync.NewCond(&sub.Mutex)
+	require.True(t, client.subs.Add(encodeSchemaTable(srcTable.SchemaName, srcTable.TableName), sub))
+
+	mkEvent := func(et replication.EventType, schema, tableName string) (*replication.BinlogEvent, *replication.RowsEvent) {
+		rows := &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema: []byte(schema),
+				Table:  []byte(tableName),
+			},
+			Rows: [][]any{{1, "x"}},
+		}
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: et, LogPos: 1000},
+			Event:  rows,
+		}, rows
+	}
+
+	// Sanity: a recognized subtype flows through and buffers the row.
+	ev, rows := mkEvent(replication.WRITE_ROWS_EVENTv2, srcTable.SchemaName, srcTable.TableName)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, sub.Length())
+
+	// An unrecognized subtype for a subscribed table must hard-error,
+	// naming the event type (string and header value) and the table.
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, srcTable.SchemaName, srcTable.TableName)
+	err := client.processRowsEvent(ev, rows)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "PartialUpdateRowsEvent")
+	require.ErrorContains(t, err, fmt.Sprintf("0x%02x", uint8(replication.PARTIAL_UPDATE_ROWS_EVENT)))
+	require.ErrorContains(t, err, srcTable.TableName)
+	require.Equal(t, 1, sub.Length(), "the unsupported event must not buffer rows")
+
+	// Events for tables without a subscription stay ignored regardless of
+	// subtype (e.g. writes to unrelated tables, or to a _new table).
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, srcTable.SchemaName, "not_subscribed")
+	require.NoError(t, client.processRowsEvent(ev, rows))
 }
 
 // TestRecreateStreamerSkipsFlushedReplay locks in the fix end-to-end by
