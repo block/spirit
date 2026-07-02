@@ -46,6 +46,27 @@ var (
 	continuousChecksumMinInterval = 1 * time.Hour
 )
 
+// errCheckpointUnresumable marks checkpoint-resume failures that are
+// definitive properties of the persisted checkpoint record itself: a
+// positions payload that does not parse (e.g. a row written by the migration
+// runner, which stores a single opaque position under the same
+// _spirit_checkpoint table name) or a source missing from the positions map.
+// Unlike transient failures (connectivity, locking) these can never succeed
+// on retry, so --force may recover from them by wipe-and-restart. The other
+// definitive state, a checkpoint past CheckpointMaxAge, keeps its existing
+// sentinel status.ErrCheckpointTooOld. See isDefinitivelyUnresumable.
+var errCheckpointUnresumable = errors.New("checkpoint is not resumable")
+
+// isDefinitivelyUnresumable reports whether a resumeFromCheckpoint error
+// identifies a checkpoint that no retry can ever resume: it is too old
+// (status.ErrCheckpointTooOld) or its persisted record is unusable
+// (errCheckpointUnresumable). Only these states are covered by --force's
+// wipe-and-restart contract; any other failure may be transient, and wiping
+// on a transient error would destroy a target that could still resume.
+func isDefinitivelyUnresumable(err error) bool {
+	return errors.Is(err, status.ErrCheckpointTooOld) || errors.Is(err, errCheckpointUnresumable)
+}
+
 // sourceInfo holds per-source connection state for N:M moves.
 type sourceInfo struct {
 	db         *sql.DB
@@ -320,9 +341,80 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 }
 
 func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
+	// Read and validate the checkpoint record before this function causes any
+	// side effect (chunker subscriptions, runner state, target modifications).
+	// A definitive validation failure — the checkpoint is too old, or its
+	// positions payload is unusable — must leave the runner exactly as it
+	// found it: under --force, setup() reacts to it by falling through to the
+	// wipe-and-restart path, which rebuilds all of that state via newCopy().
+	//
+	// Read checkpoint from targets[0] by convention. A checkpoint table written
+	// by an incompatible spirit version (e.g. missing or renamed a column) fails
+	// the read and aborts the move; we do not support cross-version resume.
+	rec, err := r.checkpointTbl().ReadLatest(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read from checkpoint table '%s' on target: %w", checkpointTableName, err)
+	}
+
+	// Check if the checkpoint is too old to safely resume — replaying many
+	// days of binary logs can be slower than re-copying, and the binlogs may
+	// have been purged anyway. Unlike migrate, move cannot silently fall back
+	// to a fresh copy: the target tables are non-empty (that is exactly why
+	// setup() chose the resume path), so we fail loudly and leave the decision
+	// to the operator — --force opts into the wipe-and-restart.
+	if checkpointAge := rec.Age(); checkpointAge >= r.move.CheckpointMaxAge {
+		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or re-run with --force to wipe the target tables (including '%s') and restart the move from scratch",
+			status.ErrCheckpointTooOld,
+			checkpointAge.Round(time.Second),
+			r.move.CheckpointMaxAge,
+			checkpointTableName,
+		)
+	}
+
+	// Parse per-source positions (opaque strings owned by the source impl),
+	// keyed by sourceKey (addr/dbname). A payload that does not parse — e.g.
+	// the row was written by the migration runner, which stores a single
+	// opaque position under the same _spirit_checkpoint table name — or that
+	// is missing a source can never be resumed by retrying, so both are
+	// tagged errCheckpointUnresumable for --force to act on.
+	var positions map[string]string
+	if err := json.Unmarshal([]byte(rec.Position), &positions); err != nil {
+		return fmt.Errorf("%w: could not parse binlog positions from checkpoint: %w", errCheckpointUnresumable, err)
+	}
+	for i := range r.sources {
+		if _, ok := positions[r.sources[i].sourceKey()]; !ok {
+			return fmt.Errorf("%w: checkpoint missing binlog position for source %s", errCheckpointUnresumable, r.sources[i].sourceKey())
+		}
+	}
+
+	copierWatermark := rec.CopierWatermark
+	r.checksumWatermark = rec.ChecksumWatermark
+
+	// With multiple sources, a persisted checksum watermark cannot be trusted.
+	// deleteAboveWatermark (below) runs every (source, table) DELETE against
+	// every target, and same-named tables from different sources interleave in
+	// the target tables — so one source's DELETE also removes OTHER sources'
+	// rows below their own watermarks. Those rows are not recopied (each
+	// source's chunker resumes from its own watermark); only a checksum pass
+	// that runs from the very beginning detects and repairs the hole. Resuming
+	// the checksum at a watermark would skip re-verifying exactly the range
+	// where the hole sits, so discard it and force a full pass.
+	//
+	// With a single source the watermark is kept: deletes are per-table, and
+	// each table's delete range (above its watermark upper bound) is a subset
+	// of its recopy range (from the watermark lower bound), so nothing below
+	// the checksum watermark can have been deleted without being recopied.
+	if len(r.sources) > 1 && r.checksumWatermark != "" {
+		r.logger.Info("discarding persisted checksum watermark: multi-source resume requires a full checksum pass",
+			"reason", "deleteAboveWatermark may remove rows below other sources' watermarks; only a from-scratch checksum re-verifies and repairs them",
+			"sources", len(r.sources))
+		r.checksumWatermark = ""
+	}
+
+	// The checkpoint record is fully validated — everything from here on has
+	// side effects.
 	copyChunkers := make([]table.Chunker, 0, len(r.sources)*len(r.sourceTables))
 	checksumChunkers := make([]table.Chunker, 0, len(r.sources)*len(r.sourceTables))
-	var err error
 
 	// For each source and each table, create a chunker and add a subscription
 	// to that source's repl client.
@@ -380,67 +472,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
-	// Read checkpoint from targets[0] by convention. A checkpoint table written
-	// by an incompatible spirit version (e.g. missing or renamed a column) fails
-	// the read and aborts the move; we do not support cross-version resume.
-	tgt0 := &r.targets[0]
-	rec, err := r.checkpointTbl().ReadLatest(ctx)
-	if err != nil {
-		return fmt.Errorf("could not read from checkpoint table '%s' on target: %w", checkpointTableName, err)
-	}
-	copierWatermark := rec.CopierWatermark
-	r.checksumWatermark = rec.ChecksumWatermark
-	binlogPositionsJSON := rec.Position
-
-	// Check if the checkpoint is too old to safely resume — replaying many
-	// days of binary logs can be slower than re-copying, and the binlogs may
-	// have been purged anyway. This must happen before any destructive step
-	// (deleteAboveWatermark below modifies the targets). Unlike migrate,
-	// move cannot silently fall back to a fresh copy: the target tables are
-	// non-empty (that is exactly why setup() chose the resume path), so we
-	// fail loudly and leave the decision to the operator.
-	if checkpointAge := rec.Age(); checkpointAge >= r.move.CheckpointMaxAge {
-		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or wipe the target tables (including '%s') and restart the move from scratch",
-			status.ErrCheckpointTooOld,
-			checkpointAge.Round(time.Second),
-			r.move.CheckpointMaxAge,
-			checkpointTableName,
-		)
-	}
-
-	// With multiple sources, a persisted checksum watermark cannot be trusted.
-	// deleteAboveWatermark (below) runs every (source, table) DELETE against
-	// every target, and same-named tables from different sources interleave in
-	// the target tables — so one source's DELETE also removes OTHER sources'
-	// rows below their own watermarks. Those rows are not recopied (each
-	// source's chunker resumes from its own watermark); only a checksum pass
-	// that runs from the very beginning detects and repairs the hole. Resuming
-	// the checksum at a watermark would skip re-verifying exactly the range
-	// where the hole sits, so discard it and force a full pass.
-	//
-	// With a single source the watermark is kept: deletes are per-table, and
-	// each table's delete range (above its watermark upper bound) is a subset
-	// of its recopy range (from the watermark lower bound), so nothing below
-	// the checksum watermark can have been deleted without being recopied.
-	if len(r.sources) > 1 && r.checksumWatermark != "" {
-		r.logger.Info("discarding persisted checksum watermark: multi-source resume requires a full checksum pass",
-			"reason", "deleteAboveWatermark may remove rows below other sources' watermarks; only a from-scratch checksum re-verifies and repairs them",
-			"sources", len(r.sources))
-		r.checksumWatermark = ""
-	}
-
-	// Parse per-source positions (opaque strings owned by the source impl),
-	// keyed by sourceKey (addr/dbname).
-	var positions map[string]string
-	if err := json.Unmarshal([]byte(binlogPositionsJSON), &positions); err != nil {
-		return fmt.Errorf("could not parse binlog positions from checkpoint: %w", err)
-	}
-	for i := range r.sources {
-		if _, ok := positions[r.sources[i].sourceKey()]; !ok {
-			return fmt.Errorf("checkpoint missing binlog position for source %s", r.sources[i].sourceKey())
-		}
-	}
-
 	// Delete rows above the watermark from all target tables before resuming.
 	// When resuming from a checkpoint, the keyAboveWatermark optimization
 	// needs to know the highest key in the target table to avoid discarding
@@ -466,6 +497,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		}
 	}
 
+	tgt0 := &r.targets[0]
 	r.checkpointTable = table.NewTableInfo(tgt0.DB, tgt0.Config.DBName, checkpointTableName)
 	r.usedResumeFromCheckpoint = true
 	return nil
@@ -560,14 +592,38 @@ func (r *Runner) setup(ctx context.Context) error {
 			return probeErr // the probe itself failed transiently — don't wipe on a blip
 		}
 		if resumable {
-			if resumeErr := r.resumeFromCheckpoint(ctx); resumeErr != nil {
+			resumeErr := r.resumeFromCheckpoint(ctx)
+			if resumeErr == nil {
+				r.logger.Info("Successfully resumed move from existing checkpoint")
+				return nil
+			}
+			// resumeFromCheckpoint's deeper validations can still find the
+			// checkpoint definitively unusable (too old; positions that do not
+			// parse; a source missing from the positions map). Those are
+			// exactly the "cannot resume from a checkpoint" states --force
+			// promises to recover from, so fall through to the wipe path
+			// below. Anything else may be transient (connectivity, locking):
+			// hard-fail rather than wipe a target that could still resume on
+			// a retry.
+			if !r.move.Force || !isDefinitivelyUnresumable(resumeErr) {
 				return fmt.Errorf("resume validation passed but checkpoint resume failed: %w", resumeErr)
 			}
-			r.logger.Info("Successfully resumed move from existing checkpoint")
-			return nil
+			r.logger.Warn("force set and the checkpoint is definitively unresumable; falling back to a fresh copy", "reason", resumeErr)
 		}
 		if !r.move.Force {
 			return fmt.Errorf("target state is invalid for both new copy and resume (re-run with --force to wipe the target and start fresh): %w", err)
+		}
+		// Wiping the target only cures target-side state: the target_state
+		// check (non-empty tables, mismatched schema) and the checkpoint. The
+		// triggering failure may just as well have been source-side —
+		// rename_safety's leftover _old table, source_schema_consistency
+		// drift, table_compatibility — which RunChecks surfaces in arbitrary
+		// order (it iterates a map). Re-run every post-setup check except
+		// target_state BEFORE wiping, so a move that would still fail
+		// afterwards fails now, with the target (possibly a large partial
+		// copy plus a valid checkpoint) intact.
+		if preErr := r.runChecksExcluding(ctx, check.ScopePostSetup, check.TargetStateCheckName); preErr != nil {
+			return fmt.Errorf("force: refusing to wipe the target because a check that wiping cannot fix is failing: %w", preErr)
 		}
 		r.logger.Warn("force set and the target cannot resume; wiping target tables and starting fresh")
 		if werr := r.wipeTargets(ctx); werr != nil {
@@ -575,11 +631,10 @@ func (r *Runner) setup(ctx context.Context) error {
 		}
 		// --force only overrides the target-not-empty decision — it must not
 		// bypass the other post-setup safety checks (rename_safety,
-		// source_schema_consistency, ...). Re-run them against the now-wiped
-		// target (target_state passes for the absent tables, exactly as a fresh
-		// move); abort if anything still fails rather than copying into a state
-		// that would only fail at cutover. RunChecks iterates a map, so the
-		// original failure was not necessarily target_state.
+		// source_schema_consistency, ...). Re-run the full set against the
+		// now-wiped target (target_state passes for the absent tables, exactly
+		// as a fresh move); abort if anything still fails rather than copying
+		// into a state that would only fail at cutover.
 		if err := r.runChecks(ctx, check.ScopePostSetup); err != nil {
 			return fmt.Errorf("force: target still fails post-setup checks after wiping: %w", err)
 		}
@@ -1057,8 +1112,9 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
 }
 
-// runChecks wraps around check.RunChecks and adds the context of this move operation
-func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
+// checkResources assembles the check.Resources describing this move
+// operation, shared by runChecks and runChecksExcluding.
+func (r *Runner) checkResources() check.Resources {
 	sources := make([]check.SourceResource, len(r.sources))
 	for i := range r.sources {
 		sources[i] = check.SourceResource{
@@ -1067,14 +1123,26 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			DSN:    r.sources[i].dsn,
 		}
 	}
-	return check.RunChecks(ctx, check.Resources{
+	return check.Resources{
 		Sources:        sources,
 		Targets:        r.targets,
 		SourceTables:   r.sourceTables,
 		CreateSentinel: r.move.CreateSentinel,
 		GTID:           r.move.EnableExperimentalGTID,
 		MoveEverything: len(r.move.SourceTables) == 0,
-	}, r.logger, scope)
+	}
+}
+
+// runChecks wraps around check.RunChecks and adds the context of this move operation
+func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
+	return check.RunChecks(ctx, r.checkResources(), r.logger, scope)
+}
+
+// runChecksExcluding is runChecks minus the named checks. The --force path
+// uses it to ask "would the post-setup checks still fail for a reason that
+// wiping the target cannot cure?" before destroying any target data.
+func (r *Runner) runChecksExcluding(ctx context.Context, scope check.ScopeFlag, exclude ...string) error {
+	return check.RunChecksExcluding(ctx, r.checkResources(), r.logger, scope, exclude...)
 }
 
 // restoreSecondaryIndexes restores any secondary indexes that were deferred during table creation.

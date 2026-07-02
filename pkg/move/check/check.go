@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"slices"
 	"sync"
 
 	"github.com/block/spirit/pkg/applier"
@@ -72,8 +73,19 @@ func registerCheck(name string, callback func(context.Context, Resources, *slog.
 
 // RunChecks runs all checks that are registered for the given scope
 func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, scope ScopeFlag) error {
-	for _, check := range checks {
-		if check.scope != scope {
+	return RunChecksExcluding(ctx, r, logger, scope)
+}
+
+// RunChecksExcluding runs all checks registered for the given scope except
+// those named in exclude. The runner's --force recovery path uses it to
+// re-run the post-setup checks minus the target-state check before wiping
+// the target: wiping only cures target-side state, so a failure in any other
+// (source-side) check must surface before the target is destroyed. New
+// checks are deliberately included by default — excluding too little only
+// blocks a wipe, excluding too much could green-light one.
+func RunChecksExcluding(ctx context.Context, r Resources, logger *slog.Logger, scope ScopeFlag, exclude ...string) error {
+	for name, check := range checks {
+		if check.scope != scope || slices.Contains(exclude, name) {
 			continue
 		}
 		err := check.callback(ctx, r, logger)

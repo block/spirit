@@ -511,6 +511,77 @@ func TestMoveForceWipesUnresumableTarget(t *testing.T) {
 	require.Zero(t, stale, "force must drop+recreate the target, not overlay the source onto stale rows")
 }
 
+// TestMoveForcePreservesTargetOnSourceSideFailure verifies that the --force
+// wipe is gated on the failure actually being curable by a wipe. Wiping the
+// target only cures target-side state (the target_state check and the
+// checkpoint); a source-side failure — here rename_safety's leftover t1_old
+// on the source — would make the move fail identically after the wipe,
+// destroying a possibly large partial copy for nothing. --force must fail
+// WITHOUT touching the target, and only wipe once the source-side problem is
+// gone. Before the fix, the wipe ran first and the checks after, so the
+// partial copy and checkpoint were destroyed and the run still failed.
+func TestMoveForcePreservesTargetOnSourceSideFailure(t *testing.T) {
+	srcDB := "source_force_srcside"
+	dstDB := "dest_force_srcside"
+	sourceDSN := testutils.DSNForDatabase(srcDB)
+	targetDSN := testutils.DSNForDatabase(dstDB)
+
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+dstDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+dstDB)
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50) NOT NULL)")
+	testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 (name) VALUES ('a'),('b'),('c'),('d'),('e')")
+	// The source-side problem: a leftover t1_old from a previous move. The
+	// cutover renames t1 to t1_old, so rename_safety fails while it exists —
+	// and no amount of wiping the TARGET can fix it.
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1_old (id INT NOT NULL PRIMARY KEY)")
+
+	// Target: a partial copy from a prior run (the id-999 row marks it) plus a
+	// checkpoint from an incompatible spirit version, so resume is impossible —
+	// the same unresumable-target shape as TestMoveForceWipesUnresumableTarget.
+	testutils.RunSQL(t, "CREATE TABLE "+dstDB+".t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50) NOT NULL)")
+	testutils.RunSQL(t, "INSERT INTO "+dstDB+".t1 (id, name) VALUES (999, 'precious')")
+	testutils.RunSQL(t, "CREATE TABLE "+dstDB+"._spirit_checkpoint (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, copier_watermark TEXT, checksum_watermark TEXT, binlog_positions TEXT, statement TEXT, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+	testutils.RunSQL(t, "INSERT INTO "+dstDB+"._spirit_checkpoint (copier_watermark, binlog_positions) VALUES ('stale-wm', '{}')")
+
+	newMove := func() *Move {
+		return &Move{
+			SourceDSN:       sourceDSN,
+			TargetDSN:       targetDSN,
+			TargetChunkTime: 100 * time.Millisecond,
+			Threads:         2,
+			WriteThreads:    2,
+			Force:           true,
+		}
+	}
+
+	// --force with the source-side failure: the run must fail on rename_safety
+	// and must NOT have wiped the target.
+	err := newMove().Run()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "refusing to wipe")
+	require.ErrorContains(t, err, "t1_old")
+
+	targetDB, err := sql.Open("mysql", targetDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+	var count int
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1 WHERE id = 999").Scan(&count))
+	require.Equal(t, 1, count, "a source-side failure must not wipe the partial copy on the target")
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+checkpointTableName).Scan(&count))
+	require.Equal(t, 1, count, "a source-side failure must not drop the checkpoint on the target")
+
+	// Clear the source-side problem: --force can now cure what is left (the
+	// unresumable target) by wiping, and the move completes.
+	testutils.RunSQL(t, "DROP TABLE "+srcDB+".t1_old")
+	require.NoError(t, newMove().Run())
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1").Scan(&count))
+	require.Equal(t, 5, count, "after the source-side failure is fixed, force must wipe and re-copy")
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1 WHERE id = 999").Scan(&count))
+	require.Zero(t, count, "the stale partial-copy row must be gone after the wipe")
+}
+
 // TestMoveWithVarcharPK verifies a move on a table with a non-memory-comparable
 // primary key (VARCHAR with a CI collation) — the case from issue #607. The
 // move runs under concurrent writes to exercise the binlog replay path.
@@ -1262,6 +1333,123 @@ func TestResumeFromCheckpointNotTooOld(t *testing.T) {
 	require.NoError(t, r.Run(t.Context()))
 	require.True(t, r.usedResumeFromCheckpoint, "a fresh checkpoint must still resume")
 	require.NoError(t, r.Close())
+}
+
+// testForceRecoversUnresumableCheckpoint is the shared body for the
+// --force-recovers-a-definitively-unresumable-checkpoint tests. It produces a
+// real checkpoint on the target via checkpointAndStop, lets the caller corrupt
+// the checkpoint row into a state that passes the resume probe but fails
+// resumeFromCheckpoint's deeper validation, then asserts the contract from
+// both sides:
+//   - without --force the move hard-fails with the typed sentinel, leaving the
+//     target's rows and checkpoint untouched;
+//   - with --force the move wipes the target and completes as a fresh copy
+//     (usedResumeFromCheckpoint stays false) instead of hard-failing.
+func testForceRecoversUnresumableCheckpoint(t *testing.T, suffix string, corrupt func(dstDB string), wantSentinel error, wantErrContains string) {
+	srcDB := "source_force_" + suffix
+	dstDB := "dest_force_" + suffix
+	sourceDSN := testutils.DSNForDatabase(srcDB)
+	targetDSN := testutils.DSNForDatabase(dstDB)
+
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+dstDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+dstDB)
+
+	// Same seeding as TestResumeFromCheckpointTooOld: enough rows for several
+	// chunks so the copier watermark is ready when checkpointAndStop dumps the
+	// checkpoint (1 -> 2 -> 10 -> 1010 rows).
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, val VARBINARY(64))")
+	testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 (val) SELECT RANDOM_BYTES(64)")
+	for range 3 {
+		testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 (val) SELECT RANDOM_BYTES(64) FROM "+srcDB+".t1 a JOIN "+srcDB+".t1 b JOIN "+srcDB+".t1 c LIMIT 5000")
+	}
+
+	move := &Move{
+		SourceDSN:       sourceDSN,
+		TargetDSN:       targetDSN,
+		TargetChunkTime: 100 * time.Millisecond,
+		Threads:         1,
+		WriteThreads:    1,
+	}
+	checkpointAndStop(t, move)
+	corrupt(dstDB)
+
+	sourceDB, err := sql.Open("mysql", sourceDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(sourceDB)
+	targetDB, err := sql.Open("mysql", targetDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+	// Capture the expected row count now: the successful --force run below
+	// ends with a cutover that renames the source t1 away.
+	var srcCount int
+	require.NoError(t, sourceDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1").Scan(&srcCount))
+
+	// Without --force: the resume probe passes (the checkpoint row reads fine
+	// with move's schema) but the deeper validation fails; this must stay a
+	// hard error and must not touch the target.
+	r, err := NewRunner(move)
+	require.NoError(t, err)
+	err = r.Run(t.Context())
+	require.Error(t, err)
+	require.ErrorIs(t, err, wantSentinel)
+	require.ErrorContains(t, err, wantErrContains)
+	require.False(t, r.usedResumeFromCheckpoint)
+	require.NoError(t, r.Close())
+
+	var count int
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1").Scan(&count))
+	require.Equal(t, srcCount, count, "without --force the target's copied rows must be left untouched")
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+checkpointTableName).Scan(&count))
+	require.Equal(t, 1, count, "without --force the checkpoint must be left untouched")
+
+	// With --force: the definitive unresumable state falls through to
+	// wipe-and-restart. Before the fix this hard-failed with "resume
+	// validation passed but checkpoint resume failed" even with --force set,
+	// leaving the operator to DROP the target tables by hand.
+	move.Force = true
+	r, err = NewRunner(move)
+	require.NoError(t, err)
+	require.NoError(t, r.Run(t.Context()))
+	require.False(t, r.usedResumeFromCheckpoint, "--force must wipe and start fresh, not resume")
+	require.NoError(t, r.Close())
+	require.NoError(t, targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1").Scan(&count))
+	require.Equal(t, srcCount, count, "the fresh copy must move all source rows")
+}
+
+// TestMoveForceRecoversUnparseableCheckpointPositions covers the checkpoint
+// shape a migration-runner row leaves in the same _spirit_checkpoint table
+// name: binlog_position holds a single opaque position, not move's JSON map of
+// per-source positions. The resume probe passes but the positions can never
+// parse, so the state is definitively unresumable: a hard error without
+// --force, wipe-and-restart with it.
+func TestMoveForceRecoversUnparseableCheckpointPositions(t *testing.T) {
+	testForceRecoversUnresumableCheckpoint(t, "badpos", func(dstDB string) {
+		testutils.RunSQL(t, "UPDATE "+dstDB+"."+checkpointTableName+" SET binlog_position = 'mysql-bin.000123:4567'")
+	}, errCheckpointUnresumable, "could not parse binlog positions")
+}
+
+// TestMoveForceRecoversCheckpointMissingSource covers a checkpoint whose
+// positions payload parses but does not contain this move's source key (e.g.
+// the checkpoint belongs to a move of a different source into the same
+// target). Definitively unresumable: a hard error without --force,
+// wipe-and-restart with it.
+func TestMoveForceRecoversCheckpointMissingSource(t *testing.T) {
+	testForceRecoversUnresumableCheckpoint(t, "nosrckey", func(dstDB string) {
+		testutils.RunSQL(t, "UPDATE "+dstDB+"."+checkpointTableName+" SET binlog_position = '{}'")
+	}, errCheckpointUnresumable, "checkpoint missing binlog position for source")
+}
+
+// TestMoveForceRecoversTooOldCheckpoint complements
+// TestResumeFromCheckpointTooOld (which pins the hard failure without
+// --force): a checkpoint past CheckpointMaxAge is a definitive unresumable
+// state, so with --force the move must wipe the target and restart fresh
+// instead of failing.
+func TestMoveForceRecoversTooOldCheckpoint(t *testing.T) {
+	testForceRecoversUnresumableCheckpoint(t, "oldchkpt", func(dstDB string) {
+		testutils.RunSQL(t, "UPDATE "+dstDB+"."+checkpointTableName+" SET created_at = DATE_SUB(NOW(), INTERVAL 8 DAY)")
+	}, status.ErrCheckpointTooOld, "re-run with a larger --checkpoint-max-age")
 }
 
 // TestCreateSentinelTableIdempotent verifies that sentinel.Create
