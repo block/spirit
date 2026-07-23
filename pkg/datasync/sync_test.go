@@ -500,8 +500,9 @@ func TestSyncResumeNoWatermarkRow(t *testing.T) {
 
 // TestSyncForce verifies the Force flag: when a resumable checkpoint exists the
 // target is kept and resumed (no drop); when it can't resume (no checkpoint but
-// a non-empty target) the target database is dropped and recreated so the copy
-// can proceed instead of tripping the fresh-sync target-empty guard.
+// a non-empty target) the sync-owned target tables are dropped and recreated so
+// the copy can proceed instead of tripping the fresh-sync target-empty guard —
+// while tables that don't belong to the sync survive.
 func TestSyncForce(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
@@ -551,8 +552,8 @@ func TestSyncForce(t *testing.T) {
 	// First copy completes and writes a checkpoint.
 	require.NoError(t, run(false))
 
-	// Sentinel table not present in the source: survives a resume, vanishes
-	// on a force drop+recreate.
+	// Sentinel table not present in the source: not owned by the sync, so it
+	// survives both a resume and a per-table force wipe.
 	testutils.RunSQL(t, `CREATE TABLE sync_force_dest._keep_me (id INT PRIMARY KEY)`)
 
 	// Force with a resumable checkpoint present: must NOT drop — the sentinel
@@ -568,15 +569,99 @@ func TestSyncForce(t *testing.T) {
 	// Without force this would fail the target-empty guard.
 	require.Error(t, run(false), "a non-empty target with no checkpoint must fail without force")
 
-	// With force it drops + recreates: the sentinel is gone and the data is
-	// freshly re-copied.
+	// With force the sync-owned tables are dropped + recreated and the data is
+	// freshly re-copied; the foreign table is untouched (the wipe is per-table,
+	// never DROP DATABASE).
 	require.NoError(t, run(true))
-	require.False(t, tableExists("_keep_me"), "force must drop+recreate when it cannot resume")
+	require.True(t, tableExists("_keep_me"), "force must not touch tables the sync does not own")
 	var n int
 	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sync_force_dest.t1").Scan(&n))
 	require.Equal(t, 3, n)
 	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sync_force_dest.t2").Scan(&n))
 	require.Equal(t, 2, n)
+}
+
+// TestSyncForcePreservesForeignTables is the safety regression test for the
+// --force wipe scope: a target database shared with a table the sync never
+// owned (a "foreign" table), holding a stale non-resumable checkpoint (present
+// but without a copier watermark) plus leftover junk in a source-named table.
+// --force must recover by wiping only the sync-owned objects: the foreign
+// table and its rows survive, the source-named tables are recreated with
+// exactly the source's data, and the checkpoint is recreated. Before the
+// per-table wipe, --force executed DROP DATABASE and destroyed the foreign
+// table.
+func TestSyncForcePreservesForeignTables(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_forcewipe_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_forcewipe_dest"
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_forcewipe_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_forcewipe_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_forcewipe_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `CREATE TABLE sync_forcewipe_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_src.t2 VALUES (10,'ten'),(20,'twenty')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_forcewipe_dest`)
+
+	newSync := func(force bool) *Sync {
+		return &Sync{
+			SourceDSN:       src.FormatDSN(),
+			TargetDSN:       dest.FormatDSN(),
+			TargetChunkTime: 100 * time.Millisecond,
+			Threads:         2,
+			WriteThreads:    2,
+			Force:           force,
+		}
+	}
+	run := func(force bool) error {
+		r, nerr := NewRunner(newSync(force))
+		require.NoError(t, nerr)
+		rerr := runUntilCopied(t, r)
+		require.NoError(t, r.Close())
+		return rerr
+	}
+
+	// First run copies everything and writes a current-schema checkpoint.
+	require.NoError(t, run(false))
+
+	// An unrelated reporting table shares the target database. It must survive
+	// any --force recovery.
+	testutils.RunSQL(t, `CREATE TABLE sync_forcewipe_dest.reporting (id INT PRIMARY KEY, note VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_dest.reporting VALUES (1,'keep'),(2,'me')`)
+
+	// Make the checkpoint stale/non-resumable (present, but no copier
+	// watermark) and plant junk in a source-named table, simulating a prior
+	// run that died before its first watermark write.
+	testutils.RunSQL(t, `UPDATE sync_forcewipe_dest._spirit_sync_checkpoint SET copier_watermark = ''`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_dest.t1 VALUES (999,'junk')`)
+
+	// --force recovers by wiping only the sync-owned tables.
+	require.NoError(t, run(true))
+
+	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(tgt)
+
+	// The foreign table and its rows survive.
+	var n int
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM reporting").Scan(&n))
+	require.Equal(t, 2, n, "a table the sync never owned must survive --force")
+
+	// The source-named tables were recreated with exactly the source's data.
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n, "t1 must be recreated with the source's rows")
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1 WHERE id = 999").Scan(&n))
+	require.Zero(t, n, "junk from the prior partial run must be gone")
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t2").Scan(&n))
+	require.Equal(t, 2, n)
+
+	// The checkpoint table was recreated by the fresh run.
+	require.NoError(t, tgt.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE table_schema='sync_forcewipe_dest' AND table_name='_spirit_sync_checkpoint'").Scan(&n))
+	require.Equal(t, 1, n)
 }
 
 // TestSyncResumeIncompatibleCheckpoint covers recovery when the target carries a
@@ -657,6 +742,223 @@ func TestSyncResumeIncompatibleCheckpoint(t *testing.T) {
 	require.NoError(t, tgt.QueryRowContext(context.Background(),
 		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE table_schema='sync_incompat_dest' AND table_name='_spirit_sync_checkpoint' AND column_name='binlog_position'").Scan(&n2))
 	require.Equal(t, 1, n2, "force must recreate the checkpoint table with the current schema")
+}
+
+// TestSyncPositionEncodeDecode covers the checkpoint-position payload codec:
+// round-tripping preserves position + identity, and anything that is not our
+// structured payload (legacy bare positions, empty strings, foreign JSON,
+// wrong versions) decodes as a legacy position with no identity attached.
+func TestSyncPositionEncodeDecode(t *testing.T) {
+	// Round trip.
+	raw, err := encodeSyncPosition("binlog.000123:456", "6d1f6f10-0000-1111-2222-333344445555", "db1:3306")
+	require.NoError(t, err)
+	p, ok := decodeSyncPosition(raw)
+	require.True(t, ok, "an encoded payload must decode as structured")
+	require.Equal(t, "binlog.000123:456", p.Position)
+	require.Equal(t, "6d1f6f10-0000-1111-2222-333344445555", p.ServerUUID)
+	require.Equal(t, "db1:3306", p.SourceAddr)
+
+	// Empty identity still round-trips (injected sources record no identity).
+	raw, err = encodeSyncPosition("vgtid-opaque", "", "")
+	require.NoError(t, err)
+	p, ok = decodeSyncPosition(raw)
+	require.True(t, ok)
+	require.Equal(t, "vgtid-opaque", p.Position)
+	require.Empty(t, p.ServerUUID)
+
+	// Legacy / foreign inputs: returned verbatim as the position, not ours.
+	for _, legacy := range []string{
+		"",                        // no saved position
+		"binlog.000042:4",         // pre-identity file:pos checkpoint
+		"uuid:1-100",              // pre-identity GTID checkpoint
+		`{"foo":"bar"}`,           // JSON, but not our payload (unknown fields)
+		`{"v":99,"position":"x"}`, // future/unknown version
+		`{not json`,               // malformed
+	} {
+		p, ok = decodeSyncPosition(legacy)
+		require.False(t, ok, "input %q must not decode as a structured payload", legacy)
+		require.Equal(t, legacy, p.Position)
+		require.Empty(t, p.ServerUUID)
+	}
+}
+
+// TestSyncResumeSourceIdentity verifies that a file:pos resume is gated on the
+// recorded source identity. Binlog file names are sequential on every server,
+// so after a failover/replica promotion/source rebuild behind the same
+// endpoint, a checkpointed position usually "exists" on the new server and
+// would silently skip or replay the wrong events. The checkpoint therefore
+// records @@server_uuid, and resume must hard-error when it doesn't match —
+// while a matching identity resumes normally, and --force recovers by
+// starting fresh.
+func TestSyncResumeSourceIdentity(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_identity_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_identity_dest"
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_identity_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_identity_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_identity_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_identity_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `CREATE TABLE sync_identity_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_identity_src.t2 VALUES (10,'ten'),(20,'twenty')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_identity_dest`)
+
+	newSync := func(force bool) *Sync {
+		return &Sync{
+			SourceDSN:       src.FormatDSN(),
+			TargetDSN:       dest.FormatDSN(),
+			TargetChunkTime: 100 * time.Millisecond,
+			Threads:         2,
+			WriteThreads:    2,
+			Force:           force,
+		}
+	}
+	run := func(force bool) error {
+		r, nerr := NewRunner(newSync(force))
+		require.NoError(t, nerr)
+		rerr := runUntilCopied(t, r)
+		require.NoError(t, r.Close())
+		return rerr
+	}
+
+	// First run: copies and records a checkpoint carrying the source identity.
+	require.NoError(t, run(false))
+
+	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(tgt)
+
+	// The stored position is the structured payload with the real
+	// @@server_uuid of the source and a non-empty inner position.
+	var realUUID string
+	srcDB, err := sql.Open("mysql", src.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(srcDB)
+	require.NoError(t, srcDB.QueryRowContext(context.Background(), "SELECT @@server_uuid").Scan(&realUUID))
+	var storedUUID, storedPos string
+	require.NoError(t, tgt.QueryRowContext(context.Background(),
+		`SELECT JSON_UNQUOTE(JSON_EXTRACT(binlog_position, '$.server_uuid')),
+		        JSON_UNQUOTE(JSON_EXTRACT(binlog_position, '$.position'))
+		 FROM _spirit_sync_checkpoint`).Scan(&storedUUID, &storedPos))
+	require.Equal(t, realUUID, storedUUID, "the checkpoint must record the source's @@server_uuid")
+	require.NotEmpty(t, storedPos, "the checkpoint must record a change-feed position")
+
+	// Simulate a replaced source behind the same endpoint: same position, a
+	// different server_uuid. The inner position still names a binlog file
+	// that exists on this server, so before the identity check this resume
+	// would have succeeded silently.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = JSON_SET(binlog_position, '$.server_uuid', '00000000-dead-beef-0000-000000000000')`)
+	err = run(false)
+	require.Error(t, err, "a checkpoint recorded on a different source server must not resume")
+	require.ErrorContains(t, err, "different source server")
+	require.ErrorContains(t, err, "--force")
+
+	// Restore the real identity: the resume proceeds normally, data intact.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = JSON_SET(binlog_position, '$.server_uuid', '`+realUUID+`')`)
+	require.NoError(t, run(false), "a matching source identity must resume normally")
+	var n int
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n)
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t2").Scan(&n))
+	require.Equal(t, 2, n)
+
+	// A legacy checkpoint (bare position, no identity — written by an older
+	// spirit) is unverifiable and must refuse to resume, pointing at --force.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = JSON_UNQUOTE(JSON_EXTRACT(binlog_position, '$.position'))`)
+	err = run(false)
+	require.Error(t, err, "an identity-less legacy checkpoint must not silently resume")
+	require.ErrorContains(t, err, "no source identity")
+	require.ErrorContains(t, err, "--force")
+
+	// --force recovers: the unverifiable checkpoint is treated as
+	// non-resumable, the sync-owned tables are wiped, and a fresh copy runs.
+	require.NoError(t, run(true))
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n)
+}
+
+// TestSyncFreshTargetSchemaMismatch verifies that a fresh sync refuses a
+// pre-existing (empty) target table whose schema differs from the source,
+// before any row is copied. The copy and continuous replication write with
+// REPLACE/INSERT IGNORE, so a collation difference — the dangerous case being
+// on a primary-key column — would silently collapse case-distinct rows and
+// the continuous checksum would never converge. An identical pre-created
+// table must still be accepted (the declarative pre-created-schema workflow).
+func TestSyncFreshTargetSchemaMismatch(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_schemachk_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_schemachk_dest"
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_schemachk_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_schemachk_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_schemachk_src.t1 (
+		id INT PRIMARY KEY,
+		val VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+	)`)
+	testutils.RunSQL(t, `INSERT INTO sync_schemachk_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_schemachk_dest`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_schemachk_dest`)
+
+	newRunner := func() *Runner {
+		r, nerr := NewRunner(&Sync{
+			SourceDSN:       src.FormatDSN(),
+			TargetDSN:       dest.FormatDSN(),
+			TargetChunkTime: 100 * time.Millisecond,
+			Threads:         2,
+			WriteThreads:    2,
+		})
+		require.NoError(t, nerr)
+		return r
+	}
+
+	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(tgt)
+
+	// Pre-create the target table EMPTY but with a different collation on the
+	// val column. Before the schema check, this passed the fresh-sync
+	// target-empty guard with zero schema comparison.
+	testutils.RunSQL(t, `CREATE TABLE sync_schemachk_dest.t1 (
+		id INT PRIMARY KEY,
+		val VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+	)`)
+
+	r1 := newRunner()
+	err = runUntilCopied(t, r1)
+	require.NoError(t, r1.Close())
+	require.Error(t, err, "a pre-existing target table with a mismatched schema must be rejected")
+	require.ErrorContains(t, err, "does not match the source")
+	require.ErrorContains(t, err, "t1")
+
+	// The sync failed during setup: nothing was copied and no checkpoint was
+	// created that would claim ownership of the target.
+	var n int
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Zero(t, n, "the sync must error before copying any rows")
+	require.NoError(t, tgt.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE table_schema='sync_schemachk_dest' AND table_name='_spirit_sync_checkpoint'").Scan(&n))
+	require.Zero(t, n, "the sync must error before creating its checkpoint table")
+
+	// An identical pre-created table passes and the copy proceeds.
+	testutils.RunSQL(t, `DROP TABLE sync_schemachk_dest.t1`)
+	testutils.RunSQL(t, `CREATE TABLE sync_schemachk_dest.t1 (
+		id INT PRIMARY KEY,
+		val VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+	)`)
+	r2 := newRunner()
+	require.NoError(t, runUntilCopied(t, r2), "an identical pre-created table must be accepted")
+	require.NoError(t, r2.Close())
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n)
 }
 
 // TestSyncCreateTableLegacyDefault verifies that target tables are created with

@@ -71,14 +71,17 @@ type Sync struct {
 	// completed) rather than starting over.
 	CopyOnly bool `name:"copy-only" help:"Only run the initial copy, then exit (no continuous change capture)." default:"false"`
 
-	// Force, when set, makes the runner drop and recreate the target database
-	// at startup *unless* a resumable checkpoint exists — i.e. it only nukes
-	// the target when the copy could not have resumed anyway. A resumable
-	// run (checkpoint present) is left intact and resumes as normal. Intended
-	// for testing/iterating, where a previous partial run can leave the target
-	// non-empty with no usable checkpoint, otherwise tripping the fresh-sync
-	// target-empty guard.
-	Force bool `name:"force" help:"Drop and recreate the target database when the copy cannot resume from a checkpoint." default:"false"`
+	// Force, when set, makes the runner wipe the sync-owned objects on the
+	// target at startup — the target copies of the source tables plus the sync
+	// checkpoint table — *unless* a resumable checkpoint exists, i.e. it only
+	// wipes when the copy could not have resumed anyway. A resumable run
+	// (checkpoint present) is left intact and resumes as normal. The wipe is
+	// per-table, never DROP DATABASE: sync tolerates a target database shared
+	// with unrelated tables, and --force must not destroy tables the sync
+	// never owned. Intended for testing/iterating, where a previous partial
+	// run can leave the target non-empty with no usable checkpoint, otherwise
+	// tripping the fresh-sync target-empty guard.
+	Force bool `name:"force" help:"Drop and recreate the sync's target tables (never the whole target database) when the copy cannot resume from a checkpoint." default:"false"`
 
 	// GTID switches the built-in change source from binlog file+position to
 	// MySQL GTIDs. EXPERIMENTAL — see pkg/change/gtid.go. Ignored when a
