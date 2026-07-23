@@ -11,7 +11,7 @@ import (
 )
 
 func init() {
-	registerCheck("dropadd", dropAddCheck, ScopePreflight)
+	registerCheck("dropadd", dropAddCheck, ScopePreflight|ScopeStatement)
 }
 
 // dropAddCheck checks for a DROP and then ADD in the same statement.

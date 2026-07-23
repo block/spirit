@@ -10,7 +10,7 @@ import (
 )
 
 func init() {
-	registerCheck("primarykey", primaryKeyCheck, ScopePreflight)
+	registerCheck("primarykey", primaryKeyCheck, ScopePreflight|ScopeStatement)
 }
 
 func primaryKeyCheck(ctx context.Context, r Resources, logger *slog.Logger) error {

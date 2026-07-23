@@ -12,7 +12,7 @@ import (
 )
 
 func init() {
-	registerCheck("rename", renameCheck, ScopePreflight)
+	registerCheck("rename", renameCheck, ScopePreflight|ScopeStatement)
 }
 
 // renameCheck validates rename operations in ALTER TABLE statements.

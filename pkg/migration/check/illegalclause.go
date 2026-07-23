@@ -6,7 +6,7 @@ import (
 )
 
 func init() {
-	registerCheck("illegalClause", illegalClauseCheck, ScopePreflight)
+	registerCheck("illegalClause", illegalClauseCheck, ScopePreflight|ScopeStatement)
 }
 
 // illegalClauseCheck checks for the presence of specific, unsupported

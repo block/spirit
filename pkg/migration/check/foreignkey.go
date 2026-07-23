@@ -11,7 +11,7 @@ import (
 )
 
 func init() {
-	registerCheck("addforeignkey", addForeignKeyCheck, ScopePreflight)
+	registerCheck("addforeignkey", addForeignKeyCheck, ScopePreflight|ScopeStatement)
 	registerCheck("hasforeignkeys", hasForeignKeysCheck, ScopePreflight)
 }
 
