@@ -87,8 +87,11 @@ func registerCheck(name string, callback func(context.Context, Resources, *slog.
 // Checks run in name order so that a statement failing more than one
 // check always reports the same error.
 func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, scope ScopeFlag) error {
-	for _, name := range slices.Sorted(maps.Keys(checks)) {
-		check := checks[name]
+	lock.Lock()
+	registered := maps.Clone(checks)
+	lock.Unlock()
+	for _, name := range slices.Sorted(maps.Keys(registered)) {
+		check := registered[name]
 		if check.scope&scope == 0 {
 			continue
 		}
