@@ -35,6 +35,7 @@ func (a *noopDistributedApplier) UpsertRows(context.Context, *table.ColumnMappin
 
 func (a *noopDistributedApplier) Wait(context.Context) error { return nil }
 func (a *noopDistributedApplier) Stop() error                { return nil }
+func (a *noopDistributedApplier) Stats() applier.Stats       { return applier.Stats{} }
 func (a *noopDistributedApplier) GetTargets() []applier.Target {
 	return nil
 }

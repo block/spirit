@@ -67,6 +67,12 @@ type Applier interface {
 	// For the subscription: callback will update binlog coordinates
 	Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback ApplyCallback) error
 
+	// Stats returns a point-in-time snapshot of the write pipeline: queue
+	// occupancy, pending work, live workers, and rolling queue-wait /
+	// write-time percentiles. Safe to call concurrently with Apply; values
+	// are approximate. See the Stats type for field semantics.
+	Stats() Stats
+
 	// DeleteKeys deletes rows by their key values synchronously. Each entry
 	// in keys is one key tuple of the original (typed) column values, in
 	// sourceTable.KeyColumns order.
