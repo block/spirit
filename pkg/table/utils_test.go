@@ -79,15 +79,18 @@ func TestCastableTp(t *testing.T) {
 }
 
 func TestCastExpr(t *testing.T) {
-	// JSON is normalized through a text round-trip so that scalar types
-	// unexpressible in JSON text (DECIMAL, temporal/binary opaques) hash the
-	// same as the text-degraded form the copier/applier writes. Everything
-	// else is a single CAST to castableTp.
-	require.Equal(t, "CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)", castExpr("j", "json"))
-	require.Equal(t, "CAST(`id` AS signed)", castExpr("id", "int(11)"))
-	require.Equal(t, "CAST(`name` AS char CHARACTER SET utf8mb4)", castExpr("name", "varchar(100)"))
-	require.Equal(t, "CAST(`b` AS binary(16))", castExpr("b", "binary(16)"))
-	require.Equal(t, "CAST(`d` AS decimal(6,2))", castExpr("d", "decimal(6,2)"))
+	// JSON casts are side-dependent (the "text-image contract", see castExpr):
+	// the source side is normalized through a text round-trip — predicting
+	// the text-degraded form the copier/applier writes — while the target
+	// side renders the stored document strictly, so it is never re-parsed.
+	// Everything else is a single CAST to castableTp on both sides.
+	require.Equal(t, "CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)", castExpr("j", "json", castSource))
+	require.Equal(t, "CAST(`j` AS json)", castExpr("j", "json", castTarget))
+	require.Equal(t, "CAST(`id` AS signed)", castExpr("id", "int(11)", castSource))
+	require.Equal(t, "CAST(`id` AS signed)", castExpr("id", "int(11)", castTarget))
+	require.Equal(t, "CAST(`name` AS char CHARACTER SET utf8mb4)", castExpr("name", "varchar(100)", castSource))
+	require.Equal(t, "CAST(`b` AS binary(16))", castExpr("b", "binary(16)", castTarget))
+	require.Equal(t, "CAST(`d` AS decimal(6,2))", castExpr("d", "decimal(6,2)", castSource))
 }
 
 func TestQuoteCols(t *testing.T) {

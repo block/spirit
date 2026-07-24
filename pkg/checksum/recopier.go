@@ -108,7 +108,10 @@ func (r *MySQLRecopier) Recopy(ctx context.Context, chunk *table.Chunk) error {
 	// because the applier's write path expects exactly those (it can't
 	// write generated columns). The column ordering matches the applier's
 	// expectation as long as we use the same column-list helper the
-	// distributed checker's recopy uses.
+	// distributed checker's recopy uses. JSON columns are deliberately read
+	// bare — the SELECT+applier pair already constitutes the one text
+	// round-trip the checksum's JSON contract expects; see the matching
+	// comment in DistributedChecker.replaceChunk.
 	columnList := table.QuoteColumns(chunk.Table.NonGeneratedColumns)
 	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 		columnList,

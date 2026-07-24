@@ -60,9 +60,18 @@ func (c *DistributedChecker) ChecksumChunk(ctx context.Context, chunk *table.Chu
 
 	c.logger.Debug("checksumming chunk", "chunk", chunk.String())
 
-	// Build the checksum query fragment. The same WHERE clause and column list
-	// applies to both sources and targets since all schemas are identical.
-	checksumColumns, _, err := chunk.ColumnMapping.ChecksumExprs()
+	// Build the checksum query fragments. The same WHERE clause applies to
+	// both sources and targets since all schemas are identical, but the
+	// column expressions are side-dependent: JSON columns round-trip through
+	// text on the source and render strictly on the target (see
+	// table.castExpr). Move/sync writes are text-mediated — the applier
+	// writes rendered text that the target re-parses — so the same
+	// text-image contract as the single-server checksum applies here. This
+	// does assume source and target servers parse JSON text identically; if
+	// a future server version changed parse behavior (e.g. fixed the double
+	// misrounding bugs), a cross-version move of affected values would fail
+	// the checksum safely rather than pass silently.
+	sourceChecksumCols, targetChecksumCols, err := chunk.ColumnMapping.ChecksumExprs()
 	if err != nil {
 		return err
 	}
@@ -82,7 +91,7 @@ func (c *DistributedChecker) ChecksumChunk(ctx context.Context, chunk *table.Chu
 		defer c.sourcePools[i].trxPool.Put(srcTrx)
 
 		sourceQuery := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum, count(*) as c FROM %s WHERE %s",
-			checksumColumns,
+			sourceChecksumCols,
 			chunk.Table.QuotedTableName,
 			whereClause,
 		)
@@ -108,7 +117,7 @@ func (c *DistributedChecker) ChecksumChunk(ctx context.Context, chunk *table.Chu
 		defer targetTrxPool.Put(targetTrx)
 
 		targetQuery := fmt.Sprintf("SELECT BIT_XOR(CRC32(CONCAT(%s))) as checksum, count(*) as c FROM %s WHERE %s",
-			checksumColumns,
+			targetChecksumCols,
 			chunk.Table.QuotedTableName,
 			whereClause,
 		)
@@ -207,6 +216,15 @@ func (c *DistributedChecker) replaceChunk(ctx context.Context, chunk *table.Chun
 	// Step 2: Read all rows from ALL sources for the chunk range and merge them.
 	// Use NonGeneratedColumns because the applier expects non-generated columns only.
 	// This ensures the column ordinals match when the applier extracts the sharding column.
+	//
+	// JSON columns are deliberately read bare here — no text round-trip cast.
+	// Unlike the single-server repair (see table.ColumnMapping.RepairExprs),
+	// this path is already text-mediated: the SELECT renders each document to
+	// text on the wire and the applier writes it back as a SQL literal that
+	// the target re-parses. The repaired row therefore lands as exactly the
+	// one-round-trip text image the checksum's source side predicts. Adding a
+	// round-trip cast on top would apply parse∘render twice, which does not
+	// converge for misparsed doubles.
 	columnList := table.QuoteColumns(chunk.Table.NonGeneratedColumns)
 	// Use the table name only; each source DB connection determines which database is queried.
 	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s",

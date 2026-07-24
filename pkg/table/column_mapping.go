@@ -1,6 +1,7 @@
 package table
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -121,7 +122,8 @@ const checksumSeparator = ", '#', "
 // CONCAT()) for source and target, wrapping each column in IFNULL(), ISNULL()
 // and CAST, with a '#' separator literal between every value (see
 // checksumSeparator). The CAST type always comes from the target table's type
-// definition. When there are no renames, both expressions are identical.
+// definition, but the cast itself is side-dependent for JSON columns (see
+// castExpr), so the two expressions can differ even without renames.
 func (m *ColumnMapping) ChecksumExprs() (source, target string, err error) {
 	sourceExprs := make([]string, len(m.sourceColumns))
 	targetExprs := make([]string, len(m.targetColumns))
@@ -130,11 +132,11 @@ func (m *ColumnMapping) ChecksumExprs() (source, target string, err error) {
 		// so that type conversions (e.g. INT→BIGINT) are applied consistently.
 		// For source: SQL references the old column name, type from target's new column name.
 		// For target: both SQL reference and type lookup use the new column name.
-		srcCast, err := m.targetTable.wrapCastTypeAs(m.sourceColumns[i], m.targetColumns[i])
+		srcCast, err := m.targetTable.wrapCastTypeAs(m.sourceColumns[i], m.targetColumns[i], castSource)
 		if err != nil {
 			return "", "", err
 		}
-		tgtCast, err := m.targetTable.wrapCastType(m.targetColumns[i])
+		tgtCast, err := m.targetTable.wrapCastType(m.targetColumns[i], castTarget)
 		if err != nil {
 			return "", "", err
 		}
@@ -142,6 +144,36 @@ func (m *ColumnMapping) ChecksumExprs() (source, target string, err error) {
 		targetExprs[i] = "IFNULL(" + tgtCast + ",'')" + checksumSeparator + "ISNULL(`" + m.targetColumns[i] + "`)"
 	}
 	return strings.Join(sourceExprs, checksumSeparator), strings.Join(targetExprs, checksumSeparator), nil
+}
+
+// RepairExprs returns the SELECT expression list and the INSERT column list
+// for the checksum's same-server chunk repair:
+//
+//	REPLACE INTO target (<targetColumns>) SELECT <sourceExprs> FROM source ...
+//
+// For most columns the source expression is the bare quoted column — a
+// byte-faithful server-side copy. JSON columns are instead wrapped in the
+// same text round-trip the checksum's source side uses (see castExpr): the
+// checksum asserts that the target holds the one-text-round-trip image of
+// each source document, so a repair that copied the raw bytes would store a
+// value the next checksum pass flags again — misparsed doubles would re-flag
+// forever. Like ChecksumExprs, the type decision comes from the target
+// table's column type.
+func (m *ColumnMapping) RepairExprs() (sourceExprs, targetColumns string, err error) {
+	srcExprs := make([]string, len(m.sourceColumns))
+	tgtQuoted := make([]string, len(m.targetColumns))
+	for i := range m.sourceColumns {
+		tgtQuoted[i] = sqlescape.EscapeIdentifier(m.targetColumns[i])
+		tp, ok := m.targetTable.columnsMySQLTps[m.targetColumns[i]]
+		if !ok {
+			return "", "", fmt.Errorf("column %q not found in table %s", m.targetColumns[i], m.targetTable.TableName)
+		}
+		srcExprs[i] = sqlescape.EscapeIdentifier(m.sourceColumns[i])
+		if castableTp(tp) == "json" {
+			srcExprs[i] = textRoundTripCast(srcExprs[i])
+		}
+	}
+	return strings.Join(srcExprs, ", "), strings.Join(tgtQuoted, ", "), nil
 }
 
 // SourceColumnIndices returns the indices into sourceTable.NonGeneratedColumns

@@ -63,8 +63,8 @@ func castableTp(tp string) string {
 	case "float", "double": // required for MySQL 5.7
 		return "char"
 	case "json":
-		// castExpr wraps json in a text round-trip rather than a plain
-		// CAST; see the comment there.
+		// castExpr casts json differently depending on which side of the
+		// comparison it is building; see the comment there.
 		return "json"
 	case "decimal":
 		return tp
@@ -76,32 +76,85 @@ func castableTp(tp string) string {
 	}
 }
 
+// castSide identifies which side of a source/target comparison a cast
+// expression is built for. Every type except JSON casts identically on both
+// sides; see castExpr for the JSON asymmetry.
+type castSide int
+
+const (
+	castSource castSide = iota
+	castTarget
+)
+
 // castExpr builds the CAST expression that the checksum uses for a single
 // column (see ColumnMapping.ChecksumExprs). col is the column referenced in
-// SQL (escaped here); tp is the MySQL column type the cast is derived from.
+// SQL (escaped here); tp is the MySQL column type the cast is derived from;
+// side says whether the expression reads the source or the target table.
 //
-// JSON columns are checksummed through a text round-trip — render to text,
-// re-parse as JSON — rather than a plain CAST(col AS json). A JSON document
-// can hold scalar types that JSON text cannot express: DECIMAL (e.g. from
-// JSON_OBJECT('a', CAST(169.09 AS DECIMAL(12,6)))) and temporal/binary
-// opaques. Spirit's buffered copier and binlog applier write JSON values as
-// text, so on the target those degrade to DOUBLE/strings. The values are
-// still equal under JSON comparison, but their canonical text can differ —
-// a DECIMAL renders at its declared scale ("169.090000") while the
-// re-parsed DOUBLE renders shortest ("169.09") — so a strict checksum
-// flags every applier-written row, and under concurrent DML re-flags rows
-// faster than repairs fix them, failing all attempts. Round-tripping BOTH
-// sides collapses each document to its text-expressible form: exactly the
-// fidelity the text-based copy/replication pipeline can deliver, and no
-// less — genuine value differences still hash differently, and int vs
-// double (which text does preserve) stays distinct.
-func castExpr(col, tp string) string {
+// JSON columns are checksummed asymmetrically:
+//
+//	source: CAST(CAST(col AS char CHARACTER SET utf8mb4) AS json) — render
+//	        to text and re-parse, i.e. one text round-trip
+//	target: CAST(col AS json) — render the stored document as-is
+//
+// This asserts the "text-image contract". Spirit's JSON write paths (the
+// buffered copier, the binlog applier, and the move/sync appliers) all
+// transfer JSON as rendered text that the target then re-parses, so for a
+// source document x the target is expected to store exactly parse(render(x)).
+// The source expression predicts that image; the target expression renders
+// what is actually stored. The two hash equal iff the target holds the
+// one-round-trip image, so every real divergence — a missed update, a stale
+// row, even a row byte-equal to the source where the text image would differ
+// — still fails the checksum.
+//
+// The round-trip exists because JSON text is lossier than binary JSON in two
+// ways, and the target can only ever hold what text delivered:
+//
+//   - Scalar types: a document can hold DECIMAL (e.g. from
+//     JSON_OBJECT('a', CAST(169.09 AS DECIMAL(12,6)))) and temporal/binary
+//     opaques, which degrade to DOUBLE/strings through text. A DECIMAL
+//     renders at its declared scale ("169.090000") while the re-parsed
+//     DOUBLE renders shortest ("169.09").
+//   - Parse fidelity: the server's JSON text parser misrounds doubles that
+//     need 17 significant digits by ±1 ulp (MySQL bugs #116160/#112904,
+//     unfixed through 8.0.45), so parse(render(x)) can differ from x — and
+//     for some values repeated parse/render cycles never converge (each
+//     cycle drifts a further ulp, or oscillates between two neighbors).
+//     MySQL 9.x parses the regression tests' probe values correctly (they
+//     are parse/render fixed points there), so the 8.0.x/8.4 CI legs —
+//     not the 9.x leg — carry the regression coverage for this class;
+//     don't trim them thinking the coverage is redundant.
+//
+// The previous symmetric form round-tripped BOTH sides, which handled the
+// scalar degradation but re-parsed the target's already-degraded text: for
+// the non-converging values above that adds a fresh ±1 ulp to the target
+// side only, self-minting checksum failures on rows the copier wrote
+// perfectly — failures no repair could ever clear. Rendering the target
+// strictly makes the comparison exact for every write-path image while
+// staying sensitive to all genuine corruption.
+//
+// The checksum's repair must uphold the same contract: recopying a chunk has
+// to store the text image, not the source bytes. See
+// ColumnMapping.RepairExprs and the replaceChunk implementations in
+// pkg/checksum.
+func castExpr(col, tp string, side castSide) string {
 	quotedCol := sqlescape.EscapeIdentifier(col)
 	castTp := castableTp(tp)
 	if castTp == "json" {
-		return "CAST(CAST(" + quotedCol + " AS char CHARACTER SET utf8mb4) AS json)"
+		if side == castSource {
+			return textRoundTripCast(quotedCol)
+		}
+		return "CAST(" + quotedCol + " AS json)"
 	}
 	return "CAST(" + quotedCol + " AS " + castTp + ")"
+}
+
+// textRoundTripCast renders a JSON expression to utf8mb4 text and re-parses
+// it — the server-side equivalent of one trip through Spirit's text-based
+// write paths. Shared by castExpr (source side) and
+// ColumnMapping.RepairExprs (chunk repair).
+func textRoundTripCast(quotedCol string) string {
+	return "CAST(CAST(" + quotedCol + " AS char CHARACTER SET utf8mb4) AS json)"
 }
 
 func removeWidth(s string) string {

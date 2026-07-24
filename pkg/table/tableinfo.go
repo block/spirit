@@ -480,12 +480,12 @@ func (t *TableInfo) setBoundsIfUnset(minVal, maxVal Datum) {
 	}
 }
 
-func (t *TableInfo) wrapCastType(col string) (string, error) {
+func (t *TableInfo) wrapCastType(col string, side castSide) (string, error) {
 	tp, ok := t.columnsMySQLTps[col] // the tp keeps the width in this context.
 	if !ok {
 		return "", fmt.Errorf("column %q not found in table %s", col, t.TableName)
 	}
-	return castExpr(col, tp), nil
+	return castExpr(col, tp, side), nil
 }
 
 // wrapCastTypeAs generates a CAST expression using sqlCol as the column reference
@@ -493,12 +493,12 @@ func (t *TableInfo) wrapCastType(col string) (string, error) {
 // This is used for column renames where the SQL column name differs from the
 // type-lookup column name (e.g., source table uses old name, but cast type
 // comes from the target table's new name).
-func (t *TableInfo) wrapCastTypeAs(sqlCol, typeCol string) (string, error) {
+func (t *TableInfo) wrapCastTypeAs(sqlCol, typeCol string, side castSide) (string, error) {
 	tp, ok := t.columnsMySQLTps[typeCol]
 	if !ok {
 		return "", fmt.Errorf("column %q not found for type lookup in table %s", typeCol, t.TableName)
 	}
-	return castExpr(sqlCol, tp), nil
+	return castExpr(sqlCol, tp, side), nil
 }
 
 func (t *TableInfo) datumTp(col string) (datumTp, error) {

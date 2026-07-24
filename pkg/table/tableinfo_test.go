@@ -90,10 +90,10 @@ func TestDiscovery(t *testing.T) {
 
 	// normalize for mysql 5.7 and 8.0
 	require.Equal(t, "int", removeWidth(t1.columnsMySQLTps["id"]))
-	castID, err := t1.wrapCastType("id")
+	castID, err := t1.wrapCastType("id", castSource)
 	require.NoError(t, err)
 	require.Equal(t, "CAST(`id` AS signed)", castID)
-	castName, err := t1.wrapCastType("name")
+	castName, err := t1.wrapCastType("name", castTarget)
 	require.NoError(t, err)
 	require.Equal(t, "CAST(`name` AS char CHARACTER SET utf8mb4)", castName)
 

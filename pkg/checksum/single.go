@@ -266,11 +266,21 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 	// first so that any since-deleted rows (which wouldn't get removed by replace) are removed first.
 	// By doing this as two transactions we should be able to remove
 	// the opportunity for deadlocks.
-	sourceColumns, targetColumns := chunk.ColumnMapping.Columns()
+	//
+	// The SELECT list comes from RepairExprs, not Columns(): JSON columns are
+	// recopied through a text round-trip rather than byte-faithfully. The
+	// checksum asserts that the target holds the one-text-round-trip image of
+	// each source document (see table.ColumnMapping.RepairExprs), so a
+	// byte-faithful recopy of a document whose text image differs from its
+	// source bytes would be re-flagged by the next pass, indefinitely.
+	sourceExprs, targetColumns, err := chunk.ColumnMapping.RepairExprs()
+	if err != nil {
+		return err
+	}
 	replaceStmt := fmt.Sprintf("REPLACE INTO %s (%s) SELECT %s FROM %s WHERE %s",
 		chunk.NewTable.QuotedTableName,
 		targetColumns,
-		sourceColumns,
+		sourceExprs,
 		chunk.Table.QuotedTableName,
 		chunk.String(),
 	)

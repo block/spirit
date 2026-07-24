@@ -192,3 +192,66 @@ func TestColumnMappingTargetNil(t *testing.T) {
 	require.Equal(t, "`a`, `b`, `c`", tgt)
 	require.Equal(t, t1, m.TargetTable())
 }
+
+func TestColumnMappingChecksumExprsJSONAsymmetric(t *testing.T) {
+	// JSON columns are checksummed asymmetrically (see castExpr): the source
+	// expression predicts the one-text-round-trip image the copier/applier
+	// writes, while the target expression renders the stored document
+	// strictly — so the two sides differ even without renames.
+	t1 := NewTableInfo(nil, "test", "t1")
+	t1new := NewTableInfo(nil, "test", "t1_new")
+	t1.NonGeneratedColumns = []string{"id", "j"}
+	t1new.NonGeneratedColumns = []string{"id", "j"}
+	t1new.columnsMySQLTps = map[string]string{"id": "int", "j": "json"}
+
+	m := NewColumnMapping(t1, t1new, nil)
+	src, tgt, err := m.ChecksumExprs()
+	require.NoError(t, err)
+	require.Contains(t, src, "CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)")
+	require.Contains(t, tgt, "CAST(`j` AS json)")
+	require.NotContains(t, tgt, "CAST(CAST(`j`")
+	// Non-JSON columns cast identically on both sides.
+	require.Contains(t, src, "CAST(`id` AS signed)")
+	require.Contains(t, tgt, "CAST(`id` AS signed)")
+
+	// With a rename the source expression references the old name but the
+	// asymmetry is unchanged.
+	t1.NonGeneratedColumns = []string{"id", "old_j"}
+	m = NewColumnMapping(t1, t1new, map[string]string{"old_j": "j"})
+	src, tgt, err = m.ChecksumExprs()
+	require.NoError(t, err)
+	require.Contains(t, src, "CAST(CAST(`old_j` AS char CHARACTER SET utf8mb4) AS json)")
+	require.Contains(t, tgt, "CAST(`j` AS json)")
+}
+
+func TestColumnMappingRepairExprs(t *testing.T) {
+	// The repair (REPLACE INTO ... SELECT) must store the text image of JSON
+	// documents, not the source bytes — so JSON columns are wrapped in the
+	// text round-trip while all other columns copy byte-faithfully.
+	t1 := NewTableInfo(nil, "test", "t1")
+	t1new := NewTableInfo(nil, "test", "t1_new")
+	t1.NonGeneratedColumns = []string{"id", "name", "j"}
+	t1new.NonGeneratedColumns = []string{"id", "name", "j"}
+	t1new.columnsMySQLTps = map[string]string{"id": "int", "name": "varchar(100)", "j": "json"}
+
+	m := NewColumnMapping(t1, t1new, nil)
+	srcExprs, tgtCols, err := m.RepairExprs()
+	require.NoError(t, err)
+	require.Equal(t, "`id`, `name`, CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)", srcExprs)
+	require.Equal(t, "`id`, `name`, `j`", tgtCols)
+
+	// Renames: the SELECT references the old source name, the INSERT list
+	// the new target name; the JSON decision comes from the target type.
+	t1.NonGeneratedColumns = []string{"id", "old_j"}
+	t1new.NonGeneratedColumns = []string{"id", "j"}
+	m = NewColumnMapping(t1, t1new, map[string]string{"old_j": "j"})
+	srcExprs, tgtCols, err = m.RepairExprs()
+	require.NoError(t, err)
+	require.Equal(t, "`id`, CAST(CAST(`old_j` AS char CHARACTER SET utf8mb4) AS json)", srcExprs)
+	require.Equal(t, "`id`, `j`", tgtCols)
+
+	// A target column with no known type is an error (mirrors wrapCastType).
+	t1new.columnsMySQLTps = map[string]string{"id": "int"}
+	_, _, err = m.RepairExprs()
+	require.ErrorContains(t, err, "not found")
+}
