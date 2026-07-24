@@ -1362,7 +1362,7 @@ func (r *Runner) Status() string {
 	switch state { //nolint:exhaustive
 	case status.CopyRows:
 		// Status for copy rows
-		return fmt.Sprintf("migration status: state=%s copy-progress=%s binlog-deltas=%v total-time=%s copier-time=%s copier-remaining-time=%v copier-is-throttled=%v",
+		return fmt.Sprintf("migration status: state=%s copy-progress=%s binlog-deltas=%v total-time=%s copier-time=%s copier-remaining-time=%v copier-is-throttled=%v%s",
 			r.status.Get().String(),
 			r.copier.GetProgress(),
 			r.getDeltaLenAll(),
@@ -1370,6 +1370,7 @@ func (r *Runner) Status() string {
 			time.Since(r.copier.StartTime()).Round(time.Second),
 			r.copier.GetETA(),
 			r.copier.GetThrottler().IsThrottled(),
+			applier.StatusSuffix(r.applier),
 		)
 	case status.WaitingOnSentinelTable:
 		return fmt.Sprintf("migration status: state=%s total-time=%s sentinel-wait-time=%s sentinel-max-wait-time=%s",
@@ -1381,10 +1382,11 @@ func (r *Runner) Status() string {
 	case status.ApplyChangeset, status.PostChecksum:
 		// We've finished copying rows, and we are now trying to reduce the number of binlog deltas before
 		// proceeding to the checksum and then the final cutover.
-		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s",
+		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s%s",
 			r.status.Get().String(),
 			r.getDeltaLenAll(),
 			time.Since(r.startTime).Round(time.Second),
+			applier.StatusSuffix(r.applier),
 		)
 	case status.Checksum:
 		// This could take a while if it's a large table.

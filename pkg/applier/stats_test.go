@@ -72,6 +72,44 @@ func TestTimingRingWraps(t *testing.T) {
 	require.Equal(t, time.Millisecond, wt90)
 }
 
+// TestStatsString pins the exact status-line rendering, including the
+// zero-value form (durations render as 0s) and millisecond rounding — a
+// change to either should be deliberate, since operators grep these fields.
+func TestStatsString(t *testing.T) {
+	s := Stats{
+		QueueDepth:    48,
+		QueueCap:      128,
+		PendingWork:   53,
+		ActiveWorkers: 4,
+		QueueWaitP50:  1800 * time.Millisecond,
+		QueueWaitP90:  4200 * time.Millisecond,
+		WriteTimeP50:  95 * time.Millisecond,
+		WriteTimeP90:  210 * time.Millisecond,
+	}
+	require.Equal(t,
+		"applier-queue=48/128 applier-pending=53 applier-workers=4 "+
+			"applier-queue-wait-p50=1.8s applier-queue-wait-p90=4.2s "+
+			"applier-write-p50=95ms applier-write-p90=210ms",
+		s.String())
+
+	require.Equal(t,
+		"applier-queue=0/0 applier-pending=0 applier-workers=0 "+
+			"applier-queue-wait-p50=0s applier-queue-wait-p90=0s "+
+			"applier-write-p50=0s applier-write-p90=0s",
+		Stats{}.String())
+
+	// Sub-millisecond noise rounds away.
+	require.Contains(t,
+		Stats{WriteTimeP50: 1499 * time.Microsecond}.String(),
+		"applier-write-p50=1ms")
+}
+
+// TestStatusSuffixNil verifies the runner-facing helper is nil-safe: Status()
+// can be requested before the applier is constructed.
+func TestStatusSuffixNil(t *testing.T) {
+	require.Empty(t, StatusSuffix(nil))
+}
+
 // TestSingleTargetApplierStatsFresh verifies the zero-value snapshot of a
 // constructed-but-not-started applier.
 func TestSingleTargetApplierStatsFresh(t *testing.T) {
@@ -91,6 +129,9 @@ func TestSingleTargetApplierStatsFresh(t *testing.T) {
 	require.Zero(t, stats.ActiveWorkers)
 	require.Zero(t, stats.QueueWaitP90)
 	require.Zero(t, stats.WriteTimeP90)
+
+	// StatusSuffix on a live applier: a leading space plus String().
+	require.Equal(t, " "+a.Stats().String(), StatusSuffix(a))
 }
 
 // TestSingleTargetApplierStatsQueueDepth verifies that chunklets enqueued

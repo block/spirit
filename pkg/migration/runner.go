@@ -78,6 +78,11 @@ type Runner struct {
 	copyChunker  table.Chunker // the chunker for copying
 	copyDuration time.Duration // how long the copy took
 
+	// applier is the shared write layer used by both the copier (buffered
+	// copy) and the replication client (binlog deltas). Kept on the runner
+	// so Status() can report its pipeline snapshot.
+	applier applier.Applier
+
 	checker         checksum.Checker
 	checksumChunker table.Chunker // the chunker for checksum
 
@@ -756,14 +761,16 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 	appl, err := applier.NewSingleTargetApplier(
 		applier.Target{DB: r.db},
 		&applier.ApplierConfig{
-			Logger:   r.logger,
-			DBConfig: r.dbConfig,
-			Threads:  r.migration.WriteThreads,
+			Logger:      r.logger,
+			DBConfig:    r.dbConfig,
+			Threads:     r.migration.WriteThreads,
+			MetricsSink: r.metricsSink,
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create applier: %w", err)
 	}
+	r.applier = appl
 
 	// Create copier with the prepared chunker
 	r.copier, err = copier.NewCopier(r.db, r.copyChunker, &copier.CopierConfig{
@@ -1641,7 +1648,7 @@ func (r *Runner) Status() string {
 	switch state { //nolint: exhaustive
 	case status.CopyRows:
 		// Status for copy rows
-		return fmt.Sprintf("migration status: state=%s copy-progress=%s binlog-deltas=%v total-time=%s copier-time=%s copier-remaining-time=%v copier-is-throttled=%v conns-in-use=%d",
+		return fmt.Sprintf("migration status: state=%s copy-progress=%s binlog-deltas=%v total-time=%s copier-time=%s copier-remaining-time=%v copier-is-throttled=%v conns-in-use=%d%s",
 			r.status.Get().String(),
 			r.copier.GetProgress(),
 			r.replClient.GetDeltaLen(),
@@ -1650,6 +1657,7 @@ func (r *Runner) Status() string {
 			r.copier.GetETA(),
 			r.copier.GetThrottler().IsThrottled(),
 			r.db.Stats().InUse,
+			applier.StatusSuffix(r.applier),
 		)
 	case status.WaitingOnSentinelTable:
 		return fmt.Sprintf("migration status: state=%s sentinel-table=%s.%s total-time=%s sentinel-wait-time=%s sentinel-max-wait-time=%s conns-in-use=%d",
@@ -1664,11 +1672,12 @@ func (r *Runner) Status() string {
 	case status.ApplyChangeset, status.PostChecksum:
 		// We've finished copying rows, and we are now trying to reduce the number of binlog deltas before
 		// proceeding to the checksum and then the final cutover.
-		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s conns-in-use=%d",
+		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s conns-in-use=%d%s",
 			r.status.Get().String(),
 			r.replClient.GetDeltaLen(),
 			time.Since(r.startTime).Round(time.Second),
 			r.db.Stats().InUse,
+			applier.StatusSuffix(r.applier),
 		)
 	case status.Checksum:
 		return fmt.Sprintf("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s conns-in-use=%d",

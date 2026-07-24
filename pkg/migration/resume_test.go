@@ -162,6 +162,9 @@ func TestCheckpoint(t *testing.T) {
 	require.Equal(t, "copyRows", r.status.Get().String())
 
 	require.Contains(t, r.Status(), `migration status: state=copyRows copy-progress=0/11040 0.00% binlog-deltas=0`)
+	// The status line also reports the applier pipeline snapshot.
+	require.Contains(t, r.Status(), `applier-queue=`)
+	require.Contains(t, r.Status(), `applier-queue-wait-p90=`)
 
 	// first chunk.
 	chunk1, err := r.copyChunker.Next()

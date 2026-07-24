@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -20,9 +21,10 @@ import (
 type SingleTargetApplier struct {
 	sync.Mutex
 
-	target   Target
-	dbConfig *dbconn.DBConfig
-	logger   *slog.Logger
+	target      Target
+	dbConfig    *dbconn.DBConfig
+	logger      *slog.Logger
+	metricsSink metrics.Sink // nil disables the stats emitter
 
 	// Internal chunklet processing
 	chunkletBuffer      chan chunklet
@@ -65,7 +67,7 @@ type SingleTargetApplier struct {
 
 	// Context management
 	cancelFunc context.CancelFunc
-	wg         sync.WaitGroup // tracks the feedbackCoordinator goroutine only
+	wg         sync.WaitGroup // tracks the feedbackCoordinator and stats-emitter goroutines
 
 	// State management to make Start/Stop idempotent
 	started bool
@@ -105,6 +107,7 @@ func NewSingleTargetApplier(target Target, cfg *ApplierConfig) (*SingleTargetApp
 		target:              target,
 		dbConfig:            cfg.DBConfig,
 		logger:              cfg.Logger,
+		metricsSink:         cfg.MetricsSink,
 		chunkletBuffer:      make(chan chunklet, defaultBufferSize),
 		chunkletCompletions: make(chan chunkletCompletion, defaultBufferSize),
 		pendingWork:         make(map[int64]*pendingWork),
@@ -161,6 +164,14 @@ func (a *SingleTargetApplier) Start(ctx context.Context) error {
 	// drained.
 	a.wg.Add(1)
 	go a.feedbackCoordinator(workerCtx)
+
+	// Report pipeline gauges for the applier's lifetime. Exits on Stop()'s
+	// context cancellation; joined via a.wg like the coordinator.
+	if a.metricsSink != nil {
+		a.wg.Go(func() {
+			emitStatsLoop(workerCtx, a, a.metricsSink, a.logger)
+		})
+	}
 
 	// Spawn the initial worker pool. SetWriteWorkers only takes scaleMu, so
 	// calling it while holding the main lock is safe (no lock nesting on the
