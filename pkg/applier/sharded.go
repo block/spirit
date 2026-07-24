@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -26,10 +27,11 @@ import (
 type ShardedApplier struct {
 	sync.Mutex
 
-	shards   []*shardTarget
-	targets  []Target // Original target configurations
-	dbConfig *dbconn.DBConfig
-	logger   *slog.Logger
+	shards      []*shardTarget
+	targets     []Target // Original target configurations
+	dbConfig    *dbconn.DBConfig
+	logger      *slog.Logger
+	metricsSink metrics.Sink // nil disables the stats emitter
 
 	// Pending work tracking (shared across all shards).
 	//
@@ -148,6 +150,7 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 		targets:     targets,
 		dbConfig:    cfg.DBConfig,
 		logger:      cfg.Logger,
+		metricsSink: cfg.MetricsSink,
 		pendingWork: make(map[int64]*pendingWork),
 	}, nil
 }
@@ -201,6 +204,14 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 	// Start a single feedback coordinator for all shards
 	a.wg.Add(1)
 	go a.feedbackCoordinator(workerCtx)
+
+	// Report pipeline gauges (aggregated across shards) for the applier's
+	// lifetime. Exits on Stop()'s context cancellation; joined via a.wg.
+	if a.metricsSink != nil {
+		a.wg.Go(func() {
+			emitStatsLoop(workerCtx, a, a.metricsSink, a.logger)
+		})
+	}
 
 	return nil
 }

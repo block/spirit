@@ -1,6 +1,7 @@
 package applier
 
 import (
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -40,6 +41,32 @@ type Stats struct {
 	QueueWaitP90 time.Duration
 	WriteTimeP50 time.Duration
 	WriteTimeP90 time.Duration
+}
+
+// String renders the snapshot in the kebab-case key=value style used by the
+// runner status lines, so migrate and move report identical fields. Durations
+// are rounded to the millisecond — finer precision is noise at status cadence.
+func (s Stats) String() string {
+	return fmt.Sprintf("applier-queue=%d/%d applier-pending=%d applier-workers=%d applier-queue-wait-p50=%v applier-queue-wait-p90=%v applier-write-p50=%v applier-write-p90=%v",
+		s.QueueDepth,
+		s.QueueCap,
+		s.PendingWork,
+		s.ActiveWorkers,
+		s.QueueWaitP50.Round(time.Millisecond),
+		s.QueueWaitP90.Round(time.Millisecond),
+		s.WriteTimeP50.Round(time.Millisecond),
+		s.WriteTimeP90.Round(time.Millisecond),
+	)
+}
+
+// StatusSuffix renders a's Stats() for appending to a runner status line: a
+// leading space plus Stats().String(), or "" when a is nil. Runner Status()
+// can be called before the applier is constructed, so this must be nil-safe.
+func StatusSuffix(a Applier) string {
+	if a == nil {
+		return ""
+	}
+	return " " + a.Stats().String()
 }
 
 // chunkletTiming is one completed chunklet's queue-wait and write durations.

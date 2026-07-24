@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
 	"github.com/go-sql-driver/mysql"
 )
@@ -165,6 +166,10 @@ type ApplierConfig struct {
 	ChunkletMaxSize int
 	Logger          *slog.Logger
 	DBConfig        *dbconn.DBConfig
+	// MetricsSink, when non-nil, makes the applier periodically report its
+	// Stats() snapshot as gauges (see pkg/metrics applier_* names). Nil
+	// disables emission entirely — no goroutine is started.
+	MetricsSink metrics.Sink
 }
 
 // NewApplierDefaultConfig returns a default config for the applier.
