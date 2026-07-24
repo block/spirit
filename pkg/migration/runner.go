@@ -272,7 +272,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		// We only allow non-ALTERs (i.e. CREATE TABLE, DROP TABLE, RENAME TABLE)
 		// in single table mode.
 		if !r.changes[0].stmt.IsAlterTable() {
-			err := dbconn.Exec(ctx, r.db, r.changes[0].stmt.Statement)
+			// The statement is the user's own SQL and must be executed
+			// verbatim: it is not a sqlescape format string, and may contain
+			// % characters in literals (e.g. COMMENT '100%new').
+			err := dbconn.ExecRaw(ctx, r.db, r.changes[0].stmt.Statement)
 			if err != nil {
 				return err
 			}

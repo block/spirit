@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -49,12 +50,15 @@ func (c *tableChange) createNewTable(ctx context.Context) error {
 // We first attempt to do this using ALGORITHM=COPY so we don't burn
 // an INSTANT version. But surprisingly this is not supported for all DDLs (issue #277)
 func (c *tableChange) alterNewTable(ctx context.Context) error {
-	if err := dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n "+c.stmt.TrimAlter()+", ALGORITHM=COPY",
-		c.newTable.TableName); err != nil {
+	// The user's ALTER clause is raw SQL, not a sqlescape format string: it may
+	// legitimately contain % characters (e.g. COMMENT '100%new'). Escape the
+	// trusted prefix only, append the clause verbatim, and execute via ExecRaw.
+	alterPrefix := sqlescape.MustEscapeSQL("ALTER TABLE %n ", c.newTable.TableName)
+	if err := dbconn.ExecRaw(ctx, c.runner.db, alterPrefix+c.stmt.TrimAlter()+", ALGORITHM=COPY"); err != nil {
 		// Retry without the ALGORITHM=COPY. If there is a second error, then the DDL itself
 		// is not supported. It could be a syntax error, in which case we return the second error,
 		// which will probably be easier to read because it is unaltered.
-		if err := dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n "+c.stmt.Alter, c.newTable.TableName); err != nil {
+		if err := dbconn.ExecRaw(ctx, c.runner.db, alterPrefix+c.stmt.Alter); err != nil {
 			return err
 		}
 	}
@@ -125,33 +129,37 @@ func (c *tableChange) oldTableName() string {
 }
 
 func (c *tableChange) attemptInstantDDL(ctx context.Context) error {
+	// The user's ALTER clause is raw SQL, not a sqlescape format string: escape
+	// the trusted prefix only, then append the clause verbatim.
+	stmt := sqlescape.MustEscapeSQL("ALTER TABLE %n ALGORITHM=INSTANT, ", c.table.TableName) + c.stmt.Alter
 	if !c.runner.migration.SkipForceKill {
-		return dbconn.ForceExec(
+		return dbconn.ForceExecRaw(
 			ctx,
 			c.runner.db,
 			[]*table.TableInfo{c.table},
 			c.runner.dbConfig,
 			c.runner.logger,
-			"ALTER TABLE %n ALGORITHM=INSTANT, "+c.stmt.Alter,
-			c.table.TableName,
+			stmt,
 		)
 	}
-	return dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n ALGORITHM=INSTANT, "+c.stmt.Alter, c.table.TableName)
+	return dbconn.ExecRaw(ctx, c.runner.db, stmt)
 }
 
 func (c *tableChange) attemptInplaceDDL(ctx context.Context) error {
+	// As in attemptInstantDDL, the user's ALTER clause must not be
+	// format-interpreted.
+	stmt := sqlescape.MustEscapeSQL("ALTER TABLE %n ALGORITHM=INPLACE, LOCK=NONE, ", c.table.TableName) + c.stmt.Alter
 	if !c.runner.migration.SkipForceKill {
-		return dbconn.ForceExec(
+		return dbconn.ForceExecRaw(
 			ctx,
 			c.runner.db,
 			[]*table.TableInfo{c.table},
 			c.runner.dbConfig,
 			c.runner.logger,
-			"ALTER TABLE %n ALGORITHM=INPLACE, LOCK=NONE, "+c.stmt.Alter,
-			c.table.TableName,
+			stmt,
 		)
 	}
-	return dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n ALGORITHM=INPLACE, LOCK=NONE, "+c.stmt.Alter, c.table.TableName)
+	return dbconn.ExecRaw(ctx, c.runner.db, stmt)
 }
 
 func (c *tableChange) cleanup(ctx context.Context) error {
