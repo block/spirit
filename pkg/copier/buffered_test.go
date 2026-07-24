@@ -329,6 +329,10 @@ func (d *delayedCallbackApplier) Start(ctx context.Context) error {
 	return d.realApplier.Start(ctx)
 }
 
+func (d *delayedCallbackApplier) Stats() applier.Stats {
+	return d.realApplier.Stats()
+}
+
 func (d *delayedCallbackApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback applier.ApplyCallback) error {
 	// Wrap the callback to add delay
 	wrappedCallback := func(affectedRows int64, err error) {

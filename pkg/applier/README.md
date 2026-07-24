@@ -119,6 +119,10 @@ The applier tracks all pending work internally and invokes the callback only whe
 
 This allows the copier to continue reading and queuing more work without blocking, while still maintaining correctness by only advancing the watermark after writes complete.
 
+### Pipeline observability (`Stats()`)
+
+Both appliers expose a point-in-time `Stats()` snapshot (see `stats.go`): queue depth/capacity, pending work, live write workers, and rolling p50/p90 of per-chunklet **queue wait** (time between `Apply()` offering a chunklet to the buffer and a worker dequeueing it, including send-side backpressure) and **write time**. This exists because the copier's chunk feedback is end-to-end — read + queue wait + write — so a saturated write side otherwise presents as a read/chunker problem. A queue pegged at capacity with queue-wait far above write time means the pipeline is write-limited; a near-empty queue means it is read-limited.
+
 
 ## Implementation Details
 

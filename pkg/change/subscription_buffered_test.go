@@ -1818,6 +1818,13 @@ func (c *countingApplier) Start(ctx context.Context) error {
 	return nil
 }
 
+func (c *countingApplier) Stats() applier.Stats {
+	if c.inner != nil {
+		return c.inner.Stats()
+	}
+	return applier.Stats{}
+}
+
 func (c *countingApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback applier.ApplyCallback) error {
 	if c.inner != nil {
 		return c.inner.Apply(ctx, chunk, rows, callback)
