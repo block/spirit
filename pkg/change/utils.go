@@ -3,6 +3,7 @@ package change
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/block/spirit/pkg/table"
@@ -177,6 +178,32 @@ func checkImmutableColumn(tbl *table.TableInfo, ordinal int, beforeRow, afterRow
 			tbl.SchemaName, tbl.TableName, tbl.Columns[ordinal], key)
 	}
 	return nil
+}
+
+// errXAUnsupported is the fatal error produced when XA transaction
+// activity is observed in the binlog stream. An XA transaction's row
+// events are written to the binary log at XA PREPARE time, before the
+// transaction's outcome is known: applying them treats the prepare as a
+// commit, and a later XA ROLLBACK has no binlog representation that
+// could undo them, so the target would diverge permanently. Rather than
+// tracking prepared XIDs and buffering until the outcome (full XA
+// support), spirit refuses XA workloads outright — the same posture as
+// the preflight refusal of non-empty binlog_row_value_options. Both
+// change clients treat this as a fatal stream error, aborting before
+// any of the XA transaction's row events are buffered.
+var errXAUnsupported = errors.New("XA transactions detected in the binlog stream: spirit does not support XA workloads")
+
+// isXAStatement reports whether q (a binlogged statement, whitespace
+// already trimmed) is one of the XA transaction statements MySQL writes
+// to the binary log as QueryEvents: "XA START", "XA END", "XA COMMIT"
+// or "XA ROLLBACK". (Two-phase "XA PREPARE" is logged as an
+// XA_PREPARE_LOG_EVENT, not a QueryEvent.) The server rewrites XA
+// statements canonically before logging — XA BEGIN 'x' is binlogged as
+// "XA START" with a hex-encoded xid — so a keyword prefix match is
+// exact, and no other statement the server binlogs begins with the XA
+// keyword.
+func isXAStatement(q string) bool {
+	return hasPrefixFold(q, "XA ")
 }
 
 // isMinimalRowImage returns true if the RowsEvent contains a minimal row image,

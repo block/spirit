@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,9 @@ import (
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	mysql2 "github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -707,6 +710,164 @@ func TestDDLNotificationTransactionCompression(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, FatalReasonSchemaChange, <-cancelled)
+}
+
+// TestBinlogClientXATransactionGuard is the binlog (file/offset) client's
+// twin of TestGTIDClientXATransaction: the non-GTID path buffers and
+// applies XA prepare-time row images exactly the same way, so it carries
+// the same guard. A real two-phase XA transaction's first group —
+// Query("XA START ..."), the row events, Query("XA END ...") and the
+// terminating XA_PREPARE_LOG_EVENT — is written to the binlog in one
+// burst at XA PREPARE time; the guard must fail the stream at the
+// opening "XA START" QueryEvent, before any of the row events after it
+// are buffered, and classify the abort as a checkpoint-preserving
+// stream error. Unique xids and per-run table names for the reasons
+// documented on TestGTIDClientXATransaction.
+func TestBinlogClientXATransactionGuard(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	xid := xaTestXIDPrefix + "_binlog_" + uuid.NewString()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	srcTable := "binlogxat1_" + suffix
+	dstTable := "binlogxat2_" + suffix
+
+	// Best-effort sweep of stragglers from prior interrupted runs (a
+	// logged no-op without XA_RECOVER_ADMIN).
+	rollbackDanglingXATestTxns(t, db)
+	testutils.RunSQL(t, fmt.Sprintf("DROP TABLE IF EXISTS %s, %s", srcTable, dstTable))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", srcTable))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", dstTable))
+	t.Cleanup(func() {
+		// See TestGTIDClientXATransaction: terminate this run's XA
+		// transactions before dropping the tables, from a fresh connection.
+		cleanupDB, err := sql.Open("mysql", testutils.DSN())
+		if err != nil {
+			return
+		}
+		defer utils.CloseAndLog(cleanupDB)
+		rollbackDanglingXATestTxns(t, cleanupDB, xid)
+		_, _ = cleanupDB.ExecContext(context.Background(), "SET SESSION lock_wait_timeout=5")
+		_, _ = cleanupDB.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s, %s", srcTable, dstTable))
+	})
+
+	t1 := table.NewTableInfo(db, "test", srcTable)
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", dstTable)
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	var gotReason atomic.Int64
+	gotReason.Store(-1)
+	clientConfig := NewClientDefaultConfig()
+	clientConfig.CancelFunc = func(reason FatalReason) bool {
+		gotReason.Store(int64(reason))
+		return true
+	}
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.Start(t.Context()))
+	defer client.Close()
+
+	// XA transactions are session-scoped between XA START and XA
+	// PREPARE: pin a single connection for the whole two-phase dance.
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	xaExec := func(stmt string) {
+		t.Helper()
+		_, err := conn.ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+
+	xaExec(fmt.Sprintf("XA START '%s'", xid))
+	xaExec(fmt.Sprintf("INSERT INTO %s (a, b, c) VALUES (1, 2, 3)", srcTable))
+	xaExec(fmt.Sprintf("INSERT INTO %s (a, b, c) VALUES (2, 3, 4)", srcTable))
+	xaExec(fmt.Sprintf("XA END '%s'", xid))
+
+	// Before XA PREPARE nothing of the transaction exists in the binary
+	// log, so no row events can have streamed and the guard cannot have
+	// fired.
+	require.NoError(t, client.BlockWait(t.Context()))
+	require.Equal(t, 0, client.GetDeltaLen(), "row events must not stream before XA PREPARE")
+	require.Equal(t, int64(-1), gotReason.Load(), "the guard must not fire before the XA group is binlogged")
+
+	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonStreamError) },
+		5*time.Second, 5*time.Millisecond, "XA PREPARE must fail the stream as a stream error")
+	client.streamWG.Wait() // reader fully exited: buffering is final
+	require.Equal(t, 0, client.GetDeltaLen(), "no prepared row events may be buffered once the guard fires")
+
+	// Roll the prepared transaction back and verify the target never saw
+	// the prepared rows — the divergence the guard exists to prevent.
+	xaExec(fmt.Sprintf("XA ROLLBACK '%s'", xid))
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", dstTable)).Scan(&count))
+	require.Equal(t, 0, count, "prepared-then-rolled-back rows must never reach the target")
+}
+
+// TestBinlogProcessTransactionPayloadXAGuard is the binlog client's twin
+// of TestGTIDProcessTransactionPayloadXAGuard: an inner "XA START"
+// QueryEvent must fail a compressed payload before the row events after
+// it are buffered, and an inner XA_PREPARE_LOG_EVENT (the
+// defense-in-depth branch) must fail it too.
+func TestBinlogProcessTransactionPayloadXAGuard(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	// Real tables so the subscription would buffer the inner row event
+	// if the guard failed to fire first.
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS binlogxapayt1, binlogxapayt2")
+	testutils.RunSQL(t, "CREATE TABLE binlogxapayt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE binlogxapayt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "binlogxapayt1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "binlogxapayt2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	defer client.Close()
+
+	// A compressed XA prepare group as go-mysql decompresses it: the
+	// inner "XA START" QueryEvent precedes the inner row events.
+	xaGroup := &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
+		{
+			Header: &replication.EventHeader{EventType: replication.QUERY_EVENT},
+			Event:  &replication.QueryEvent{Schema: []byte("test"), Query: []byte("XA START X'78',X'',1")},
+		},
+		{
+			Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2},
+			Event: &replication.RowsEvent{
+				Table: &replication.TableMapEvent{Schema: []byte("test"), Table: []byte("binlogxapayt1")},
+				Rows:  [][]any{{int32(1), int32(0), int32(0)}},
+			},
+		},
+	}}
+	require.ErrorIs(t, client.processTransactionPayload(xaGroup, mysql.Position{Name: "binlog.000001", Pos: 4}), errXAUnsupported)
+	require.Equal(t, 0, client.GetDeltaLen(), "the inner row events after XA START must not be buffered")
+
+	// Defense in depth: an inner XA_PREPARE_LOG_EVENT without its
+	// opening "XA START".
+	prepareOnly := &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
+		{
+			Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
+			Event:  &replication.GenericEvent{},
+		},
+	}}
+	require.ErrorIs(t, client.processTransactionPayload(prepareOnly, mysql.Position{Name: "binlog.000001", Pos: 4}), errXAUnsupported)
+	require.Equal(t, 0, client.GetDeltaLen())
 }
 
 // TestCompositePKUpdate tests that we correctly handle
