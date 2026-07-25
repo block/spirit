@@ -170,7 +170,7 @@ type autoScaler struct {
 	metricsSink              metrics.Sink
 
 	// Read-side state, populated by enableReadScaling; reader == nil means
-	// the write-only law from #1074 (no arbitration, no read pool).
+	// the write-only law from #953 (no arbitration, no read pool).
 	reader                        readScaler
 	stats                         statsProvider
 	readMin, readMax, readCurrent int
@@ -241,7 +241,7 @@ func (a *autoScaler) run(ctx context.Context) {
 // tick performs a single control step. Split out so tests can drive it directly
 // without real time.
 //
-// Write-only mode (reader == nil) is the #1074 law verbatim. With read
+// Write-only mode (reader == nil) is the #953 law verbatim. With read
 // scaling engaged, utilization still sets the zone (it is the global cap —
 // both pools feed it), but the applier queue arbitrates which pool an
 // additive step lands on:
