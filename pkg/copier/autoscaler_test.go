@@ -308,11 +308,41 @@ func TestCeilDiv(t *testing.T) {
 	require.Equal(t, 3, ceilDiv(5, 2))
 }
 
+// TestResolveMaxReadThreads pins the pool-size formula the migration runner
+// budgets connections with: dropping the doubling would silently queue
+// scaled-up readers on the sql.DB pool (the runner and the copier's reader
+// cap must agree, and both call this).
+func TestResolveMaxReadThreads(t *testing.T) {
+	// Autoscaling disabled: the pool cannot move, so the cap is the start.
+	require.Equal(t, 4, ResolveMaxReadThreads(4, false))
+	require.Equal(t, 1, ResolveMaxReadThreads(1, false))
+	// Autoscaling enabled: 2x the start, mirroring ResolveMaxWriteThreads.
+	require.Equal(t, 8, ResolveMaxReadThreads(4, true))
+	require.Equal(t, 2, ResolveMaxReadThreads(1, true))
+}
+
+// TestEnableReadScalingClamps pins the defensive clamps: a start below 1 is
+// raised to 1 (the copy must keep making progress) and a cap below the start
+// is raised to the start (mirroring newAutoScaler's write-side clamp).
+func TestEnableReadScalingClamps(t *testing.T) {
+	as, _, _ := newTestScaler(2, 4)
+	as.enableReadScaling(&fakeReadScaler{}, &stubStats{}, 0, 0)
+	require.Equal(t, 1, as.readCurrent, "start must clamp up to 1")
+	require.Equal(t, 1, as.readMin)
+	require.Equal(t, 1, as.readMax, "cap must clamp up to the (clamped) start")
+
+	as, _, _ = newTestScaler(2, 4)
+	as.enableReadScaling(&fakeReadScaler{}, &stubStats{}, 4, 2)
+	require.Equal(t, 4, as.readCurrent)
+	require.Equal(t, 4, as.readMax, "cap below start must be raised to start")
+}
+
 // TestClassifyQueue pins the arbitration thresholds and their boundary
 // semantics: starved needs occupancy <= acQueueStarvedOccupancy AND
 // queue-wait strictly under the epsilon; full needs occupancy >=
-// acQueueFullOccupancy AND queue-wait at/above write time; a zero-cap
-// snapshot (applier not started) must read balanced, never starved.
+// acQueueFullOccupancy AND queue-wait at/above write time AND at least one
+// completed write as evidence (both-zero percentiles must not read as full);
+// a zero-cap snapshot (applier not started) must read balanced, never starved.
 func TestClassifyQueue(t *testing.T) {
 	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
 	tests := []struct {
@@ -326,6 +356,8 @@ func TestClassifyQueue(t *testing.T) {
 		{"above starved occupancy is balanced", applier.Stats{QueueDepth: 11, QueueCap: 100, QueueWaitP90: 0}, queueBalanced},
 		{"empty queue but wait at epsilon is balanced", applier.Stats{QueueDepth: 0, QueueCap: 100, QueueWaitP90: acQueueWaitEpsilon}, queueBalanced},
 		{"exactly full occupancy with wait >= write is full", applier.Stats{QueueDepth: 80, QueueCap: 100, QueueWaitP90: ms(10), WriteTimeP90: ms(10)}, queueFull},
+		{"full occupancy with zero write evidence is balanced", applier.Stats{QueueDepth: 100, QueueCap: 100, QueueWaitP90: 0, WriteTimeP90: 0}, queueBalanced},
+		{"full occupancy with waits but no completed write is balanced", applier.Stats{QueueDepth: 100, QueueCap: 100, QueueWaitP90: ms(50), WriteTimeP90: 0}, queueBalanced},
 		{"below full occupancy is balanced", applier.Stats{QueueDepth: 79, QueueCap: 100, QueueWaitP90: ms(50), WriteTimeP90: ms(10)}, queueBalanced},
 		{"full occupancy but wait below write is balanced", applier.Stats{QueueDepth: 90, QueueCap: 100, QueueWaitP90: ms(5), WriteTimeP90: ms(10)}, queueBalanced},
 		{"mid occupancy is balanced", applier.Stats{QueueDepth: 50, QueueCap: 100, QueueWaitP90: ms(3), WriteTimeP90: ms(5)}, queueBalanced},
@@ -441,6 +473,39 @@ func TestDualAutoScaler_ShedDefaultsToWriteSide(t *testing.T) {
 	as.tick(t.Context())
 	require.Equal(t, 3, as.current)
 	require.Equal(t, 4, as.readCurrent)
+	require.Equal(t, 4, fr.n)
+}
+
+func TestDualAutoScaler_ShedFallsThroughAtReaderFloor(t *testing.T) {
+	// Soft overload with a confirmed-starved queue but the read pool already
+	// at its floor: blaming the reader would clamp into a no-op that still
+	// burns the cooldowns — a phantom action. The blame must fall through to
+	// the writer so the zone actually sheds a thread.
+	as, fs, fr, st, ut := newTestDualScaler(4, 8, 1, 8)
+	st.s = starvedStats()
+	ut.setUtil(0.55) // dead band: confirm the state without acting
+	as.tick(t.Context())
+	as.tick(t.Context())
+
+	ut.setUtil(0.8)
+	as.tick(t.Context())
+	require.Equal(t, 1, as.readCurrent, "read pool must hold at its floor")
+	require.Equal(t, 1, fr.n)
+	require.Equal(t, 3, as.current, "shed must fall through to the write pool")
+	require.Equal(t, 3, fs.n)
+}
+
+func TestDualAutoScaler_ShedUnconfirmedStarvedShedsWriter(t *testing.T) {
+	// Soft overload on the very first starved observation: the state has not
+	// persisted yet, so it must not arbitrate — the shed lands on the writer
+	// (the write-only default), not the reader.
+	as, _, fr, st, ut := newTestDualScaler(4, 8, 4, 8)
+	st.s = starvedStats()
+	ut.setUtil(0.8)
+
+	as.tick(t.Context())
+	require.Equal(t, 3, as.current, "unconfirmed starved state must shed a writer")
+	require.Equal(t, 4, as.readCurrent, "read pool must be untouched")
 	require.Equal(t, 4, fr.n)
 }
 

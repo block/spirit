@@ -736,13 +736,12 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 	commitLatencyEnabled := r.migration.MaxCommitLatency > 0
 	maxWrite := throttler.ResolveMaxWriteThreads(r.migration.WriteThreads, autoscale, redoAware, commitLatencyEnabled)
 	// The read side mirrors it: when autoscaling engages, the copier may grow
-	// its read-worker pool to 2x Threads (see autoscalerIfEnabled), so size for
-	// that ceiling too — readers scaled above the pool budget would just queue
-	// on the sql.DB pool, silently buying no extra parallelism.
-	maxRead := r.migration.Threads
-	if autoscale {
-		maxRead *= 2
-	}
+	// its read-worker pool up to copier.ResolveMaxReadThreads (2x Threads; see
+	// autoscalerIfEnabled), so size for that ceiling too — readers scaled
+	// above the pool budget would just queue on the sql.DB pool, silently
+	// buying no extra parallelism. Same formula as the copier's cap, by
+	// construction.
+	maxRead := copier.ResolveMaxReadThreads(r.migration.Threads, autoscale)
 	// Finalize the pool now that WriteThreads (and its autoscale ceiling) is
 	// known: maxRead + maxWrite + controlPlaneConns() (see the MaxOpenConnections
 	// doc in Run). Sizing for the ceilings ensures a scaled-up applier or reader

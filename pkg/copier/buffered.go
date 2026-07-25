@@ -285,12 +285,13 @@ func (c *buffered) autoscalerIfEnabled() *autoScaler {
 	// Read scaling engages whenever the write side does: the copier's own
 	// reader pool is runtime-resizable (SetReadWorkers) and every applier
 	// reports the queue snapshot (Stats) the arbiter needs. The reader
-	// ceiling is 2x the starting count, for symmetry with the write scaler
-	// (see throttler.ResolveMaxWriteThreads); the runner's connection-pool
-	// sizing accounts for it.
+	// ceiling comes from ResolveMaxReadThreads (2x the starting count, for
+	// symmetry with the write scaler); the runner's connection-pool sizing
+	// uses the same formula, so a scaled-up pool never starves on connections.
+	maxRead := ResolveMaxReadThreads(c.concurrency, true)
 	c.logger.Info("read-worker scaling engaged",
-		"start", c.concurrency, "max", c.concurrency*2)
-	as.enableReadScaling(c, c.applier, c.concurrency, c.concurrency*2)
+		"start", c.concurrency, "max", maxRead)
+	as.enableReadScaling(c, c.applier, c.concurrency, maxRead)
 	return as
 }
 

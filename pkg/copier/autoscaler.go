@@ -125,6 +125,21 @@ const (
 // never mutates it.
 var acTick = 5 * time.Second
 
+// ResolveMaxReadThreads resolves the upper bound the read-worker pool may
+// scale to: the read-side mirror of throttler.ResolveMaxWriteThreads. When
+// autoscaling is disabled the cap equals start, so the pool cannot move; when
+// enabled it is fixed at 2 × start, for symmetry with the write scaler.
+// Exported so the migration runner sizes the connection pool from the same
+// formula the copier caps the pool with — readers scaled above the connection
+// budget would just queue on the sql.DB pool, silently buying no extra
+// parallelism.
+func ResolveMaxReadThreads(start int, autoscaleEnabled bool) int {
+	if !autoscaleEnabled {
+		return start
+	}
+	return 2 * start
+}
+
 // writeScaler is the optional capability the autoscaler drives. The
 // SingleTargetApplier implements it; the ShardedApplier does not (yet), so the
 // copier type-asserts it and skips autoscaling when it's absent.
@@ -289,9 +304,13 @@ func (a *autoScaler) tick(ctx context.Context) {
 		// Shedding one thread at a time avoids the halve-and-reclimb sawtooth
 		// on a signal our own workers largely produce. A starved queue means
 		// idle writers — the load is coming from the read side, so shed there;
-		// anything else sheds a writer (the write-only default).
+		// anything else sheds a writer (the write-only default). The read side
+		// is only blamed while it can actually shed (readCurrent > readMin):
+		// at the reader floor the blame falls through to the writer, so this
+		// zone always removes a real thread rather than clamping into a
+		// phantom no-op that still burns the cooldowns.
 		if a.downCooldown == 0 {
-			if a.reader != nil && queue == queueStarved {
+			if a.reader != nil && queue == queueStarved && a.readCurrent > a.readMin {
 				a.setRead(a.readCurrent - 1)
 			} else {
 				a.setWrite(a.current - 1)
@@ -372,7 +391,11 @@ func classifyQueue(s applier.Stats) queueState {
 	switch {
 	case occupancy <= acQueueStarvedOccupancy && s.QueueWaitP90 < acQueueWaitEpsilon:
 		return queueStarved
-	case occupancy >= acQueueFullOccupancy && s.QueueWaitP90 >= s.WriteTimeP90:
+	case occupancy >= acQueueFullOccupancy && s.WriteTimeP90 > 0 && s.QueueWaitP90 >= s.WriteTimeP90:
+		// WriteTimeP90 > 0 demands evidence: before the first chunklet ever
+		// completes both percentiles are zero, and 0 >= 0 would read a
+		// freshly-filled queue as write-limited with no completed write to
+		// base that on. Balanced (hold) until the first completion instead.
 		return queueFull
 	default:
 		return queueBalanced
