@@ -735,12 +735,21 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 	// ResolveMaxWriteThreads).
 	commitLatencyEnabled := r.migration.MaxCommitLatency > 0
 	maxWrite := throttler.ResolveMaxWriteThreads(r.migration.WriteThreads, autoscale, redoAware, commitLatencyEnabled)
+	// The read side mirrors it: when autoscaling engages, the copier may grow
+	// its read-worker pool to 2x Threads (see autoscalerIfEnabled), so size for
+	// that ceiling too — readers scaled above the pool budget would just queue
+	// on the sql.DB pool, silently buying no extra parallelism.
+	maxRead := r.migration.Threads
+	if autoscale {
+		maxRead *= 2
+	}
 	// Finalize the pool now that WriteThreads (and its autoscale ceiling) is
-	// known: threads + maxWrite + controlPlaneConns() (see the MaxOpenConnections
-	// doc in Run). Sizing for maxWrite ensures a scaled-up applier never starves
-	// on connections. This is a no-op unless WriteThreads was auto-sized up from 0
-	// or autoscaling raised the ceiling; the pool only ever grows.
-	if poolSize := r.migration.Threads + maxWrite + r.controlPlaneConns(); poolSize > r.dbConfig.MaxOpenConnections {
+	// known: maxRead + maxWrite + controlPlaneConns() (see the MaxOpenConnections
+	// doc in Run). Sizing for the ceilings ensures a scaled-up applier or reader
+	// pool never starves on connections. This is a no-op unless WriteThreads was
+	// auto-sized up from 0 or autoscaling raised a ceiling; the pool only ever
+	// grows.
+	if poolSize := maxRead + maxWrite + r.controlPlaneConns(); poolSize > r.dbConfig.MaxOpenConnections {
 		r.dbConfig.MaxOpenConnections = poolSize
 		r.db.SetMaxOpenConns(poolSize)
 	}

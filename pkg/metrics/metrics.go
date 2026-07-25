@@ -20,9 +20,11 @@ const (
 	ChunkLogicalRowsCountMetricName  = "chunk_num_logical_rows"
 	ChunkAffectedRowsCountMetricName = "chunk_num_affected_rows"
 	// WriteThreadsMetricName reports the live write-thread (apply-worker) count
-	// chosen by the autoscaler. ThrottlerUtilizationMetricName reports the
-	// continuous load signal (0..>1) the autoscaler controls on.
+	// chosen by the autoscaler; ReadThreadsMetricName is its read-side
+	// counterpart (copier read-worker count). ThrottlerUtilizationMetricName
+	// reports the continuous load signal (0..>1) the autoscaler controls on.
 	WriteThreadsMetricName         = "write_threads"
+	ReadThreadsMetricName          = "read_threads"
 	ThrottlerUtilizationMetricName = "throttler_utilization"
 
 	// Applier pipeline gauges (see pkg/applier Stats). Together they

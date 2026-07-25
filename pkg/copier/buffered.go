@@ -281,7 +281,17 @@ func (c *buffered) autoscalerIfEnabled() *autoScaler {
 	c.logger.Info("starting experimental write-thread autoscaler",
 		"start", c.autoscale.StartThreads, "max", c.autoscale.MaxThreads,
 		"low_watermark", acLowWatermark, "high_watermark", acHighWatermark)
-	return newAutoScaler(gradual, scaler, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
+	as := newAutoScaler(gradual, scaler, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
+	// Read scaling engages whenever the write side does: the copier's own
+	// reader pool is runtime-resizable (SetReadWorkers) and every applier
+	// reports the queue snapshot (Stats) the arbiter needs. The reader
+	// ceiling is 2x the starting count, for symmetry with the write scaler
+	// (see throttler.ResolveMaxWriteThreads); the runner's connection-pool
+	// sizing accounts for it.
+	c.logger.Info("read-worker scaling engaged",
+		"start", c.concurrency, "max", c.concurrency*2)
+	as.enableReadScaling(c, c.applier, c.concurrency, c.concurrency*2)
+	return as
 }
 
 // readWorker reads chunks and sends them to the applier. It exits when the
