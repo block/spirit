@@ -134,6 +134,10 @@ var acTick = 5 * time.Second
 // budget would just queue on the sql.DB pool, silently buying no extra
 // parallelism.
 func ResolveMaxReadThreads(start int, autoscaleEnabled bool) int {
+	// The reader pool never runs below one worker (SetReadWorkers and
+	// enableReadScaling both clamp to 1), so the cap honors the same floor —
+	// a zero/invalid start would otherwise under-budget the connection pool.
+	start = max(start, 1)
 	if !autoscaleEnabled {
 		return start
 	}

@@ -319,6 +319,12 @@ func TestResolveMaxReadThreads(t *testing.T) {
 	// Autoscaling enabled: 2x the start, mirroring ResolveMaxWriteThreads.
 	require.Equal(t, 8, ResolveMaxReadThreads(4, true))
 	require.Equal(t, 2, ResolveMaxReadThreads(1, true))
+	// A zero/invalid start clamps to the pool's real floor of one reader
+	// (SetReadWorkers and enableReadScaling clamp identically), so the cap
+	// never under-budgets the connection pool.
+	require.Equal(t, 1, ResolveMaxReadThreads(0, false))
+	require.Equal(t, 2, ResolveMaxReadThreads(0, true))
+	require.Equal(t, 2, ResolveMaxReadThreads(-3, true))
 }
 
 // TestEnableReadScalingClamps pins the defensive clamps: a start below 1 is
