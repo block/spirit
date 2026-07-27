@@ -245,18 +245,18 @@ Both copier implementations use goroutines for parallel chunk processing:
 - The applier has its own internal parallelism for writing
 - Callbacks notify readers when writes complete
 
-### Write-thread autoscaling (experimental)
+### Autoscaling (experimental)
 
-When `AutoscaleConfig.Enabled` is set (the `--enable-experimental-autoscaling` flag), the buffered copier runs a control loop that adjusts the applier's live write-worker count between `StartThreads` and `MaxThreads`, based on a throttler's continuous **utilization** signal. It only engages when the throttler implements `throttler.GradualThrottler` (the Aurora throttlers do) and the applier implements the dynamic-scaling capability (`SingleTargetApplier` does; `ShardedApplier` does not); otherwise it is skipped.
+When `AutoscaleConfig.Enabled` is set (the `--enable-experimental-autoscaling` flag), the buffered copier runs a control loop that adjusts both of the pipeline's live worker pools — its own read workers (between `Concurrency` and `ResolveMaxReadThreads`, i.e. 2× the start) and the applier's write workers (between `StartThreads` and `MaxThreads`) — based on a throttler's continuous **utilization** signal. It only engages when the throttler implements `throttler.GradualThrottler` (the Aurora throttlers do) and the applier implements the dynamic-scaling capability (`SingleTargetApplier` does; `ShardedApplier` does not); otherwise it is skipped.
 
-Each tick (5s, aligned to the throttler poll) it reads utilization — `0` = idle, `1.0` = the point the hard-stop trips — and steers toward a dead band:
+Each tick (5s, aligned to the throttler poll) it reads utilization — `0` = idle, `1.0` = the point the hard-stop trips — and steers toward a dead band. Utilization alone cannot decide *which* pool to move — both pools feed the same signal — so the applier queue between them arbitrates: near-empty with ~zero queue wait reads as **read-starved**, near-full with waits at/above write time reads as **write-limited**, anything else is **balanced**. A state must persist two consecutive ticks before it arbitrates, so chunk-size transients don't flap the controller.
 
-- **below 40%**: add one thread (cooldown-gated)
+- **below 40%**: grow the bottleneck pool by one thread (starved → reader, full → writer; balanced holds), cooldown-gated
 - **40–70%**: hold
-- **70–100%**: shed one thread (cooldown-gated)
-- **≥100%**: halve (the first breach is immediate)
+- **70–100%**: shed one thread from the side the queue blames (starved → reader, unless already at the reader floor; else writer), cooldown-gated
+- **≥100%**: halve both pools (the first breach is immediate)
 
-Steps are ±1 with a ~15s per-direction cooldown; only the panic zone is multiplicative. The shape is deliberately gentle because the signal is largely self-induced — the copy's own write workers move `Threads_running` — so classic AIMD halving would sawtooth. The autoscaler never touches the binary `BlockWait()` hard-stop, which remains the safety net underneath. See `autoscaler.go` and [issue #831](https://github.com/block/spirit/issues/831).
+Steps are ±1 with a ~15s per-direction cooldown shared across the pools — one action per window, whichever side it lands on; only the panic zone is multiplicative. The shape is deliberately gentle because the signal is largely self-induced — the copy's own workers move `Threads_running` — so classic AIMD halving would sawtooth. Note one consequence of the starved test: on a well-provisioned target where writers always keep pace, an empty queue is indistinguishable from a read-starved one, so the read pool ratchets to its 2× ceiling and rests there — `Concurrency` is effectively a floor for reads, and the utilization band plus the hard-stop remain the global brake. The autoscaler never touches the binary `BlockWait()` hard-stop, which remains the safety net underneath. See `autoscaler.go` and [issue #831](https://github.com/block/spirit/issues/831).
 
 ### Error Handling
 
