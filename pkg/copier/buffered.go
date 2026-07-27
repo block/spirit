@@ -187,7 +187,7 @@ func (c *buffered) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start applier: %w", err)
 	}
 
-	// Experimental: start the write-thread autoscaler. It runs for the lifetime
+	// Experimental: start the dual read/write autoscaler. It runs for the lifetime
 	// of the copy and stops when ctx is cancelled (deferred above). It only
 	// engages when the applier supports dynamic scaling (SingleTargetApplier)
 	// AND the throttler provides a continuous load signal (GradualThrottler);
@@ -256,7 +256,7 @@ func (c *buffered) Run(ctx context.Context) error {
 	return err
 }
 
-// autoscalerIfEnabled returns the experimental write-thread autoscaler to run
+// autoscalerIfEnabled returns the experimental dual read/write autoscaler to run
 // for this copy, or nil when it should not engage: autoscaling disabled, an
 // applier without dynamic scaling (ShardedApplier), or a throttler without a
 // continuous load signal. Only GradualThrottler implementations (the Aurora
@@ -278,7 +278,7 @@ func (c *buffered) autoscalerIfEnabled() *autoScaler {
 			"write_threads", c.autoscale.StartThreads)
 		return nil
 	}
-	c.logger.Info("starting experimental write-thread autoscaler",
+	c.logger.Info("starting experimental autoscaler: write-thread scaling engaged",
 		"start", c.autoscale.StartThreads, "max", c.autoscale.MaxThreads,
 		"low_watermark", acLowWatermark, "high_watermark", acHighWatermark)
 	as := newAutoScaler(gradual, scaler, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
