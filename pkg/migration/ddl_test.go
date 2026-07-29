@@ -1,10 +1,12 @@
 package migration
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -255,4 +257,95 @@ ALTER TABLE t1_comment_test ADD INDEX idx_a (a)`))
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 		"SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='t1_comment_test' AND INDEX_NAME='idx_a'").Scan(&indexName))
 	require.Equal(t, "idx_a", indexName)
+}
+
+// showCreateTable returns the SHOW CREATE TABLE output for a table.
+func showCreateTable(t *testing.T, db *sql.DB, tableName string) string {
+	t.Helper()
+	var tbl, createStmt string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SHOW CREATE TABLE "+sqlescape.EscapeIdentifier(tableName)).Scan(&tbl, &createStmt))
+	return createStmt
+}
+
+// columnDefinition returns the definition of a single column as printed by
+// SHOW CREATE TABLE (trailing comma and surrounding whitespace removed).
+func columnDefinition(t *testing.T, db *sql.DB, tableName, colName string) string {
+	t.Helper()
+	for line := range strings.SplitSeq(showCreateTable(t, db, tableName), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "`"+colName+"`") {
+			return strings.TrimSuffix(strings.TrimSpace(line), ",")
+		}
+	}
+	t.Fatalf("column %s not found in SHOW CREATE TABLE %s", colName, tableName)
+	return ""
+}
+
+// TestPercentSignsInDDLLiterals is a regression test for user DDL containing
+// % characters inside string literals. The trusted "ALTER TABLE %n ..." prefix
+// used to be concatenated with the user's clause and the result passed to
+// sqlescape as a format string: %n / %? inside a literal failed escaping with
+// "missing arguments" (a process panic on the ForceExec path), and %% was
+// silently collapsed to a single %, so spirit executed different DDL than the
+// user wrote.
+func TestPercentSignsInDDLLiterals(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "pct_literals", `CREATE TABLE pct_literals (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		a INT
+	)`)
+	testutils.RunSQL(t, "INSERT INTO pct_literals (a) VALUES (1), (2), (3)")
+
+	// Instant path: ADD COLUMN with %n and %? sequences in the comment.
+	// This exercises attemptInstantDDL via the force-kill path (SkipForceKill
+	// defaults to false), which previously panicked the process.
+	m := NewTestRunner(t, "pct_literals", "ADD COLUMN pct_n VARCHAR(20) COMMENT '100%new, a%?b'", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.True(t, m.usedInstantDDL)
+	require.NoError(t, m.Close())
+	require.Contains(t, showCreateTable(t, tt.DB, "pct_literals"), "COMMENT '100%new, a%?b'")
+
+	// Instant path: %% in DEFAULT and COMMENT literals. Previously this was
+	// silently rewritten to a single %, so the stored default was '50% off'.
+	// Run the identical clause directly with a plain client on a sibling
+	// table: the resulting column definitions must be identical.
+	alterClause := "ADD COLUMN pct_pct VARCHAR(20) NOT NULL DEFAULT '50%% off' COMMENT 'literal 50%%'"
+	m = NewTestRunner(t, "pct_literals", alterClause, WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.True(t, m.usedInstantDDL)
+	require.NoError(t, m.Close())
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS pct_literals_direct")
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS pct_literals_direct") })
+	testutils.RunSQL(t, "CREATE TABLE pct_literals_direct (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT)")
+	testutils.RunSQL(t, "ALTER TABLE pct_literals_direct "+alterClause)
+	require.Equal(t,
+		columnDefinition(t, tt.DB, "pct_literals_direct", "pct_pct"),
+		columnDefinition(t, tt.DB, "pct_literals", "pct_pct"))
+	require.Contains(t, columnDefinition(t, tt.DB, "pct_literals", "pct_pct"), "'50%% off'")
+
+	// Copy path: ADD INDEX forces the copy algorithm, exercising alterNewTable
+	// (which applies the raw clause to the shadow table).
+	m = NewTestRunner(t, "pct_literals", "ADD COLUMN pct_c VARCHAR(20) NOT NULL DEFAULT 'copy a%?b', ADD INDEX idx_a (a)", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.False(t, m.usedInstantDDL)
+	require.False(t, m.usedInplaceDDL)
+	require.NoError(t, m.Close())
+	sc := showCreateTable(t, tt.DB, "pct_literals")
+	require.Contains(t, sc, "DEFAULT 'copy a%?b'")
+	require.Contains(t, sc, "KEY `idx_a`")
+
+	// Non-ALTER statement path (the runner executes stmt.Statement directly):
+	// previously the raw user statement was the escape format string, so
+	// '100%new' failed with "missing arguments".
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS pct_literals_create")
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS pct_literals_create") })
+	m = NewTestRunnerFromStatement(t,
+		"CREATE TABLE pct_literals_create (id INT NOT NULL PRIMARY KEY, b VARCHAR(20) NOT NULL DEFAULT '50%% off' COMMENT '100%new')",
+		WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	sc = showCreateTable(t, tt.DB, "pct_literals_create")
+	require.Contains(t, sc, "DEFAULT '50%% off'")
+	require.Contains(t, sc, "COMMENT '100%new'")
 }

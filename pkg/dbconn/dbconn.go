@@ -296,8 +296,25 @@ func backoff(attempt int) {
 
 // ForceExec is like Exec but it has some added logic to force kill
 // any connections that are holding up metadata locks preventing this from
-// succeeding.
+// succeeding. The stmt is a sqlescape format string; use ForceExecRaw for
+// statements that embed raw user SQL and must not be format-interpreted.
 func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbConfig *DBConfig, logger *slog.Logger, stmt string, args ...any) error {
+	// Escape before ForceExecRaw arms the kill timer: a bad format string
+	// must fail fast here, not while a timer that kills other connections
+	// is already pending.
+	escapedStmt, err := sqlescape.EscapeSQL(stmt, args...)
+	if err != nil {
+		return err
+	}
+	return ForceExecRaw(ctx, db, tables, dbConfig, logger, escapedStmt)
+}
+
+// ForceExecRaw is like ForceExec but executes stmt exactly as provided, with
+// no sqlescape format interpretation. Use it when the statement embeds raw
+// user-provided SQL (such as an ALTER clause), which may legitimately contain
+// % characters (e.g. COMMENT '100%new') that must not be treated as format
+// specifiers.
+func ForceExecRaw(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbConfig *DBConfig, logger *slog.Logger, stmt string) error {
 	trx, connId, err := BeginStandardTrx(ctx, db, nil)
 	if err != nil {
 		return err
@@ -328,8 +345,7 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 			return // just return, we can't do much more here
 		}
 	})
-	escapedStmt := sqlescape.MustEscapeSQL(stmt, args...)
-	_, err = trx.ExecContext(ctx, escapedStmt)
+	_, err = trx.ExecContext(ctx, stmt)
 	if timer.Stop() {
 		// Timer was stopped before it fired, so the goroutine never started.
 		// We need to manually decrement the WaitGroup.
@@ -341,7 +357,7 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	wg.Wait()
 	if shouldRetryForceExecAfterKill(err, killTimerFired.Load()) {
 		logger.Warn("retrying statement after lock wait timeout because force-kill timer fired", "error", err)
-		_, err = trx.ExecContext(ctx, escapedStmt)
+		_, err = trx.ExecContext(ctx, stmt)
 	}
 	return err
 }
@@ -364,6 +380,16 @@ func Exec(ctx context.Context, db *sql.DB, stmt string, args ...any) error {
 		return err
 	}
 	_, err = db.ExecContext(ctx, stmt)
+	return err
+}
+
+// ExecRaw is like Exec but executes stmt exactly as provided, with no
+// sqlescape format interpretation. Use it when the statement embeds raw
+// user-provided SQL (such as a DDL statement passed to spirit), which may
+// legitimately contain % characters (e.g. COMMENT '100%new') that must not
+// be treated as format specifiers.
+func ExecRaw(ctx context.Context, db *sql.DB, stmt string) error {
+	_, err := db.ExecContext(ctx, stmt)
 	return err
 }
 
