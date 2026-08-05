@@ -1,6 +1,7 @@
 package statement
 
 import (
+	"context"
 	"database/sql"
 	"testing"
 
@@ -77,7 +78,10 @@ func applyAndConverge(t *testing.T, db *sql.DB, table, createSQL, targetSQL stri
 	_, err = db.ExecContext(t.Context(), createSQL)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS "+sqlescape.EscapeIdentifier(table))
+		// t.Context() is already cancelled by cleanup time; the drop must
+		// really run, or leaked tables (and their schema-scoped constraint
+		// names) accumulate in the shared scratch database.
+		_, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+sqlescape.EscapeIdentifier(table))
 	})
 
 	source, err := ParseCreateTable(showCreate(t, db, table))
@@ -202,7 +206,7 @@ func TestRoundTrip_KeywordLikeStringDefault(t *testing.T) {
 		require.NoError(t, err)
 		_, err = db.ExecContext(t.Context(), "CREATE TABLE rt (id INT PRIMARY KEY)")
 		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt") })
+		t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS rt") })
 		_, err = db.ExecContext(t.Context(), stmts[0].Statement)
 		require.NoError(t, err, "emitted ALTER failed: %s", stmts[0].Statement)
 
@@ -268,7 +272,7 @@ func TestRoundTrip_NumericDefaultConverges(t *testing.T) {
 			_, err = db.ExecContext(t.Context(), tc.targetSQL)
 			require.NoError(t, err)
 			t.Cleanup(func() {
-				_, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
+				_, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS rt")
 			})
 
 			// MySQL renders the numeric default quoted; the desired DDL has it
@@ -311,7 +315,7 @@ func TestRoundTrip_PartitionStringValuesWithQuotes(t *testing.T) {
 		"CREATE TABLE rt (id INT, region VARCHAR(20), PRIMARY KEY (id, region)) "+
 			"PARTITION BY LIST COLUMNS(region) (PARTITION pInit VALUES IN ('init'))")
 	require.NoError(t, err)
-	t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt") })
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS rt") })
 
 	sourceCreate := showCreate(t, db, "rt")
 	source, err := ParseCreateTable(sourceCreate)

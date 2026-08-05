@@ -1,6 +1,7 @@
 package statement
 
 import (
+	"context"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -118,7 +119,7 @@ func TestRoundTrip_ExpressionDefaultLiteralCase(t *testing.T) {
 		_, err = db.ExecContext(t.Context(),
 			"CREATE TABLE tf_exprdef (id INT NOT NULL PRIMARY KEY, c VARCHAR(50) DEFAULT (CONCAT('A','B')))")
 		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS tf_exprdef") })
+		t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS tf_exprdef") })
 		canonical := showCreate(t, db, "tf_exprdef")
 		require.Contains(t, canonical, "'A'", "sanity: MySQL's canonical form keeps literal case")
 
@@ -218,7 +219,7 @@ func TestRoundTrip_Zerofill(t *testing.T) {
 		require.NoError(t, err)
 		_, err = db.ExecContext(t.Context(), targetSQL)
 		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS tf_zerofill2") })
+		t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS tf_zerofill2") })
 
 		live, err := ParseCreateTable(showCreate(t, db, "tf_zerofill2"))
 		require.NoError(t, err)
@@ -251,7 +252,7 @@ func TestRoundTrip_VarcharBinaryAttribute(t *testing.T) {
 		require.NoError(t, err)
 		_, err = db.ExecContext(t.Context(), fileSQL)
 		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS tf_vcbin") })
+		t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS tf_vcbin") })
 		canonical := showCreate(t, db, "tf_vcbin")
 		require.Contains(t, canonical, "varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
 			"sanity: MySQL canonicalizes the BINARY attribute to the binary collation")
@@ -278,7 +279,7 @@ func TestRoundTrip_VarcharBinaryAttribute(t *testing.T) {
 		require.NoError(t, err)
 		_, err = db.ExecContext(t.Context(), fileSQL)
 		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS tf_vcbin_l1") })
+		t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS tf_vcbin_l1") })
 		canonical := showCreate(t, db, "tf_vcbin_l1")
 		require.Contains(t, canonical, "varchar(100) CHARACTER SET latin1 COLLATE latin1_bin")
 
@@ -337,7 +338,7 @@ func TestRoundTrip_VarcharBinaryAttribute(t *testing.T) {
 		require.NoError(t, err)
 		_, err = db.ExecContext(t.Context(), fileSQL)
 		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS tf_vb") })
+		t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS tf_vb") })
 
 		live, err := ParseCreateTable(showCreate(t, db, "tf_vb"))
 		require.NoError(t, err)
