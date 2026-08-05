@@ -301,6 +301,8 @@ Key principles:
 
 ### Adding a normalization rule
 Normalization canonicalizes a parsed `CreateTable` so a user-written schema matches what MySQL stores (and reports via `SHOW CREATE TABLE`), preventing spurious diffs. It mirrors the linter registration pattern.
+
+**All MySQL canonical-form handling belongs in this layer.** When the desired schema and the live `SHOW CREATE TABLE` disagree only in representation — parenthesization, display widths, inline vs table-level declarations, auto-generated names — fix it by adding a `Normalizer` rule, never by special-casing `Diff`, the parse helpers, or restore functions. Keeping every MySQL-ism in the registry is what keeps the rest of the code free of per-exception complexity: `Diff` and the parser assume canonical input and stay simple.
 1. Create `pkg/statement/normalize_<name>.go` with a type implementing the `Normalizer` interface (`Name() string` + `Normalize(*CreateTable) *CreateTable`)
 2. Register it in an `init()` function using `registerNormalizer()` (defined in `normalize.go`)
 3. Mutate the **structured** fields of `CreateTable` (`Columns`, `Indexes`, …) and return the same instance — never touch `Raw`
