@@ -537,6 +537,45 @@ func TestDiff(t *testing.T) {
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, age INT, CONSTRAINT chk_v2 CHECK (age >= 18))",
 			expected: "ALTER TABLE `t1` DROP CHECK `chk_v1`, ADD CONSTRAINT `chk_v2` CHECK (`age`>=18)",
 		},
+		{
+			// MySQL rewrites stored CHECK expressions into a fully
+			// parenthesized canonical form, so SHOW CREATE TABLE (the source
+			// here) never returns the expression as the user wrote it (the
+			// target). The two must converge with no diff.
+			name:     "CheckConstraintMySQLCanonicalParensNoDiff",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref CHECK ((((`kind` = _utf8mb4'x') and (`ref_x` is not null) and (`ref_y` is null)) or ((`kind` = _utf8mb4'y') and (`ref_y` is not null) and (`ref_x` is null)))))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref CHECK ((kind = 'x' AND ref_x IS NOT NULL AND ref_y IS NULL) OR (kind = 'y' AND ref_y IS NOT NULL AND ref_x IS NULL)))",
+			expected: "",
+		},
+		{
+			// CHECK constraint names are schema-scoped, so creating a shadow
+			// table renames them; after cutover the live table carries a
+			// different name AND MySQL's canonical parenthesization. The
+			// cross-name expression matching must still converge with no diff.
+			name:     "CheckConstraintRenamedAndCanonicalParensNoDiff",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref_renamed CHECK ((((`kind` = _utf8mb4'x') and (`ref_x` is not null)) or ((`kind` = _utf8mb4'y') and (`ref_y` is not null)))))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref CHECK ((kind = 'x' AND ref_x IS NOT NULL) OR (kind = 'y' AND ref_y IS NOT NULL)))",
+			expected: "",
+		},
+		{
+			// Parentheses that change operator binding are semantic, not
+			// cosmetic: (a OR b) AND c is a different constraint from
+			// a OR b AND c, and normalization must keep them distinct.
+			name:     "CheckConstraintMovedParensStillDiffs",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT, c INT, CONSTRAINT chk_expr CHECK ((a = 1 OR b = 2) AND c = 3))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT, c INT, CONSTRAINT chk_expr CHECK (a = 1 OR b = 2 AND c = 3))",
+			expected: "ALTER TABLE `t1` DROP CHECK `chk_expr`, ADD CONSTRAINT `chk_expr` CHECK ((`a`=1) OR ((`b`=2) AND (`c`=3)))",
+		},
+		{
+			// Same distinctness for non-binary operators: NOT and IS NULL
+			// render without connecting parentheses, so only explicit
+			// parenthesization of each operator keeps (NOT a) IS NULL apart
+			// from NOT (a IS NULL).
+			name:     "CheckConstraintUnaryIsNullParensStillDiffs",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, CONSTRAINT chk_expr CHECK (NOT (a IS NULL)))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, CONSTRAINT chk_expr CHECK ((NOT a) IS NULL))",
+			expected: "ALTER TABLE `t1` DROP CHECK `chk_expr`, ADD CONSTRAINT `chk_expr` CHECK ((NOT `a`) IS NULL)",
+		},
 		// CHECK constraint enforcement ([NOT] ENFORCED)
 		{
 			// MySQL's SHOW CREATE TABLE renders NOT ENFORCED inside a
