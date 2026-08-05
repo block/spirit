@@ -675,12 +675,15 @@ func (ct *CreateTable) parseConstraint(constraint *ast.Constraint) Constraint {
 
 		if constraint.Expr != nil {
 			// Use restoreExpressionText (not parseExpression) so the stored
-			// expression has any balanced outer parentheses stripped. MySQL's
-			// SHOW CREATE TABLE wraps the CHECK body in an extra set of parens
-			// (e.g. CHECK ((`age` >= 0))) while user-written DDL usually does
-			// not (CHECK (age >= 0)). Normalizing both to the unwrapped form
-			// (`age`>=0) lets the two compare equal so a re-diff converges
-			// instead of emitting a spurious DROP+ADD.
+			// expression is in canonical parenthesization (see
+			// parenCanonicalizer). MySQL's SHOW CREATE TABLE rewrites the CHECK
+			// body into its own fully-parenthesized form (CHECK (a = 1 AND
+			// b = 2) comes back as CHECK (((`a` = 1) and (`b` = 2)))) while
+			// user-written DDL carries whatever parentheses the author typed.
+			// Canonicalizing both makes semantically identical expressions
+			// compare equal so a re-diff converges instead of emitting a
+			// spurious DROP+ADD, while expressions with different structure
+			// still compare different.
 			if exprStr, ok := restoreExpressionText(constraint.Expr); ok {
 				constr.Expression = &exprStr
 				// Generate definition string
