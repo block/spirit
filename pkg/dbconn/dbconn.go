@@ -174,12 +174,12 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 		return 0, fmt.Errorf("RetryableTransaction: invalid DupKeyHandling value %d", dupKeyHandling)
 	}
 	var (
-		err          error
-		trx          *sql.Tx
-		rowsAffected int64
-		isFatal      bool
+		err     error
+		trx     *sql.Tx
+		isFatal bool
 	)
 	for i := range config.MaxRetries {
+		var attemptRowsAffected int64
 		func() {
 			// Start a transaction
 			if trx, err = db.BeginTx(ctx, nil); err != nil {
@@ -256,7 +256,7 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 				// and that's absolutely fine!
 				count, errC := res.RowsAffected()
 				if errC == nil { // affectedRows is supported
-					rowsAffected += count
+					attemptRowsAffected += count
 				}
 			} // end for each statement
 			// Commit it!
@@ -265,17 +265,17 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 			}
 		}()
 		if isFatal { // don't retry loop if fatal
-			return rowsAffected, err
+			return 0, err
 		}
 		// If error is nil, break the loop and return
 		// The transaction was successful
 		if err == nil {
-			return rowsAffected, nil
+			return attemptRowsAffected, nil
 		}
 	} // end of retry loop
 	// We've exhausted retries and the error is non-nil
 	// return the last error
-	return rowsAffected, err
+	return 0, err
 }
 
 // backoffDuration returns the delay before a retry for the given 0-based

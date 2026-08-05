@@ -75,6 +75,13 @@ func (s *State) Get() State {
 	return State(atomic.LoadInt32((*int32)(s)))
 }
 
-func (s *State) Set(newState State) {
+// Set stores newState, then synchronously invokes any supplied notifications.
+// Notifications observe the new value and must return promptly.
+func (s *State) Set(newState State, notifications ...func()) {
 	atomic.StoreInt32((*int32)(s), int32(newState))
+	for _, notify := range notifications {
+		if notify != nil {
+			notify()
+		}
+	}
 }

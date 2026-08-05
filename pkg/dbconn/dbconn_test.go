@@ -149,6 +149,50 @@ func TestRetryableTrx(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestRetryableTransactionRowsAffectedExcludesRolledBackAttempts(t *testing.T) {
+	config := NewDBConfig()
+	config.InnodbLockWaitTimeout = 1
+	config.MaxRetries = 3
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, Exec(t.Context(), db, "DROP TABLE IF EXISTS test.retry_rows_affected"))
+	require.NoError(t, Exec(t.Context(), db, "CREATE TABLE test.retry_rows_affected (id INT PRIMARY KEY, val INT NOT NULL)"))
+	require.NoError(t, Exec(t.Context(), db, "INSERT INTO test.retry_rows_affected VALUES (1, 0)"))
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS test.retry_rows_affected")
+	}()
+
+	lockingTx, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = lockingTx.ExecContext(t.Context(), "SELECT * FROM test.retry_rows_affected WHERE id=1 FOR UPDATE")
+	require.NoError(t, err)
+
+	rollbackErr := make(chan error, 1)
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		rollbackErr <- lockingTx.Rollback()
+	}()
+
+	rowsAffected, err := RetryableTransaction(
+		t.Context(),
+		db,
+		ErrorOnDupKey,
+		config,
+		"INSERT INTO test.retry_rows_affected VALUES (2, 0)",
+		"UPDATE test.retry_rows_affected SET val=val+1 WHERE id=1",
+	)
+	require.NoError(t, err)
+	require.NoError(t, <-rollbackErr)
+	require.Equal(t, int64(2), rowsAffected,
+		"rolled-back attempt rows must not be added to the committed attempt")
+
+	var val int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT val FROM test.retry_rows_affected WHERE id=1").Scan(&val))
+	require.Equal(t, 1, val)
+}
+
 func TestCanRetryError(t *testing.T) {
 	// Server-side errors that are retryable.
 	require.True(t, canRetryError(&mysql.MySQLError{Number: 1205})) // lock wait timeout
