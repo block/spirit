@@ -2,6 +2,7 @@ package move
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -280,4 +281,46 @@ func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 
 	_, err = srcDB.ExecContext(ctx, "SELECT 1 FROM t1")
 	require.Error(t, err, "t1 should not exist after rename")
+}
+
+func TestCutOverResultControlsRetry(t *testing.T) {
+	callbackErr := errors.New("cutover callback failed")
+	for _, tt := range []struct {
+		name            string
+		durableMutation bool
+		wantCalls       int
+		wantErr         bool
+	}{
+		{name: "retry before durable mutation", wantCalls: 2},
+		{name: "abort after durable mutation", durableMutation: true, wantCalls: 1, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dbConfig := dbconn.NewDBConfig()
+			dbConfig.MaxRetries = 3
+			cutover := &CutOver{dbConfig: dbConfig, logger: slog.Default()}
+			callbackCalls := 0
+			cutover.SetCutoverWithResult(func(context.Context) (CutoverResult, error) {
+				callbackCalls++
+				if callbackCalls == 1 {
+					return CutoverResult{DurableMutation: tt.durableMutation}, callbackErr
+				}
+				return CutoverResult{}, nil
+			})
+
+			err := cutover.runWithRetries(t.Context(), func(int) error {
+				return cutover.runCutoverCallback(t.Context())
+			})
+			require.Equal(t, tt.wantCalls, callbackCalls)
+			if tt.wantErr {
+				require.ErrorIs(t, err, callbackErr)
+				require.ErrorContains(t, err, "manual intervention required")
+				require.True(t, cutover.cutoverFuncMutated)
+				require.False(t, cutover.cutoverFuncSucceeded)
+				return
+			}
+			require.NoError(t, err)
+			require.False(t, cutover.cutoverFuncMutated)
+			require.True(t, cutover.cutoverFuncSucceeded)
+		})
+	}
 }

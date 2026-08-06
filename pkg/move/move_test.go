@@ -3,6 +3,7 @@ package move
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -216,6 +217,77 @@ func TestEmptyDatabaseMove(t *testing.T) {
 
 	// Clean up
 	require.NoError(t, runner.Close())
+}
+
+func TestEmptyDatabaseMoveWithCutoverResult(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	src := cfg.Clone()
+	src.DBName = "source_empty_result"
+	dest := cfg.Clone()
+	dest.DBName = "dest_empty_result"
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS source_empty_result")
+	testutils.RunSQL(t, "CREATE DATABASE source_empty_result")
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS dest_empty_result")
+	testutils.RunSQL(t, "CREATE DATABASE dest_empty_result")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:       src.FormatDSN(),
+		TargetDSN:       dest.FormatDSN(),
+		TargetChunkTime: 5 * time.Second,
+		Threads:         4,
+		WriteThreads:    4,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+
+	callbackErr := errors.New("result-bearing cutover failed")
+	callbackCalls := 0
+	runner.SetCutoverWithResult(func(context.Context) (CutoverResult, error) {
+		callbackCalls++
+		return CutoverResult{DurableMutation: true}, callbackErr
+	})
+
+	require.ErrorIs(t, runner.Run(t.Context()), callbackErr)
+	require.Equal(t, 1, callbackCalls)
+}
+
+func TestForwardCutoverCallbackConfiguration(t *testing.T) {
+	runner := &Runner{}
+	legacyErr := errors.New("legacy cutover failed")
+	legacyCalls := 0
+	runner.SetCutover(func(context.Context) error {
+		legacyCalls++
+		return legacyErr
+	})
+	require.NotNil(t, runner.cutoverFunc)
+	require.Nil(t, runner.cutoverResultFunc)
+
+	result, err := runner.runForwardCutoverCallback(t.Context())
+	require.Equal(t, CutoverResult{}, result)
+	require.ErrorIs(t, err, legacyErr)
+	require.Equal(t, 1, legacyCalls)
+
+	runner.SetCutoverWithResult(nil)
+	require.Nil(t, runner.cutoverFunc)
+	require.Nil(t, runner.cutoverResultFunc)
+
+	resultErr := errors.New("result cutover failed")
+	wantResult := CutoverResult{DurableMutation: true}
+	runner.SetCutoverWithResult(func(context.Context) (CutoverResult, error) {
+		return wantResult, resultErr
+	})
+	require.Nil(t, runner.cutoverFunc)
+	require.NotNil(t, runner.cutoverResultFunc)
+
+	result, err = runner.runForwardCutoverCallback(t.Context())
+	require.Equal(t, wantResult, result)
+	require.ErrorIs(t, err, resultErr)
+
+	runner.SetCutover(nil)
+	require.Nil(t, runner.cutoverFunc)
+	require.Nil(t, runner.cutoverResultFunc)
 }
 
 // TestMoveReservedWordPK is a regression test for issue #828. Moving a

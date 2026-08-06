@@ -130,7 +130,8 @@ type Runner struct {
 	sentinelWaitStartTime    time.Time
 	usedResumeFromCheckpoint bool
 
-	cutoverFunc func(ctx context.Context) error
+	cutoverFunc       func(ctx context.Context) error
+	cutoverResultFunc CutoverResultCallback
 	// reverseCutoverFunc is the reverse-window rollback's traffic switch (route
 	// back to the source). Set via SetReverseCutover; used only when
 	// move.ReverseWindow > 0 and a revert is requested during the window.
@@ -1116,20 +1117,14 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	if len(r.sourceTables) == 0 {
 		// Because this is called from orchestration, there might be a bug where
-		// it is asked to move *no tables*. Since there are no tables,
-		// there is no:
-		// - copier, replication changes
-		// - advisory lock
-		// - cutover step
-		//
-		// But the caller will still want their cutoverFunc called. So we do that
-		// and then exit.
+		// it is asked to move *no tables*. Since there are no tables, there is no
+		// copier, replication, advisory lock, or physical cutover. The caller's
+		// cutover callback still runs through the same result-bearing helper as
+		// the full cutover path.
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
 		r.status.Set(status.CutOver)
-		if r.cutoverFunc != nil {
-			if err := r.cutoverFunc(ctx); err != nil {
-				return err
-			}
+		if _, err := r.runForwardCutoverCallback(ctx); err != nil {
+			return err
 		}
 		r.logger.Info("Move operation complete.")
 		return nil
@@ -1232,9 +1227,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			Tables:     r.sources[i].tables,
 		}
 	}
-	cutover, err := NewCutOver(cutoverSources, r.cutoverFunc, r.dbConfig, r.logger)
+	cutover, err := NewCutOver(cutoverSources, nil, r.dbConfig, r.logger)
 	if err != nil {
 		return err
+	}
+	if r.cutoverResultFunc != nil || r.cutoverFunc != nil {
+		cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
 	}
 	if r.move.ReverseWindow > 0 {
 		// Under the cutover lock, right after the traffic switch, capture the
@@ -1716,8 +1714,29 @@ func (r *Runner) analyzeTable(ctx context.Context, db *sql.DB, tableName string)
 	return rows.Err()
 }
 
+// runForwardCutoverCallback invokes whichever mutually exclusive callback was
+// configured and always returns the result-bearing form used by both runner
+// cutover paths.
+func (r *Runner) runForwardCutoverCallback(ctx context.Context) (CutoverResult, error) {
+	if r.cutoverResultFunc != nil {
+		return r.cutoverResultFunc(ctx)
+	}
+	if r.cutoverFunc != nil {
+		return CutoverResult{}, r.cutoverFunc(ctx)
+	}
+	return CutoverResult{}, nil
+}
+
 func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {
+	r.cutoverResultFunc = nil
 	r.cutoverFunc = cutover
+}
+
+// SetCutoverWithResult installs a result-bearing forward cutover callback.
+// It is mutually exclusive with SetCutover; the most recent setter wins.
+func (r *Runner) SetCutoverWithResult(cutover CutoverResultCallback) {
+	r.cutoverFunc = nil
+	r.cutoverResultFunc = cutover
 }
 
 // SetReverseCutover registers the rollback traffic switch used if a revert is
