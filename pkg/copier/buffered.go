@@ -28,20 +28,22 @@ import (
 type buffered struct {
 	sync.Mutex
 
-	applier       applier.Applier
-	chunker       table.Chunker
-	concurrency   int
-	rowsPerSecond atomic.Uint64
-	chunkSize     atomic.Uint64 // size of the most recently claimed chunk; see Copier.ChunkSize
-	isInvalid     atomic.Bool
-	errMu         sync.Mutex // guards firstErr
-	firstErr      error      // first error that invalidated the copy (any goroutine)
-	startTime     time.Time
-	throttler     throttler.Throttler
-	dbConfig      *dbconn.DBConfig
-	logger        *slog.Logger
-	metricsSink   metrics.Sink
-	autoscale     AutoscaleConfig
+	applier         applier.Applier
+	chunker         table.Chunker
+	concurrency     int
+	rowsPerSecond   atomic.Uint64
+	chunkSize       atomic.Uint64 // size of the most recently claimed chunk; see Copier.ChunkSize
+	isInvalid       atomic.Bool
+	errMu           sync.Mutex // guards firstErr
+	firstErr        error      // first error that invalidated the copy (any goroutine)
+	completedRows   atomic.Uint64
+	completedChunks atomic.Uint64
+	startTime       time.Time
+	throttler       throttler.Throttler
+	dbConfig        *dbconn.DBConfig
+	logger          *slog.Logger
+	metricsSink     metrics.Sink
+	autoscale       AutoscaleConfig
 
 	// Read-worker pool management, symmetric with the applier's write-worker
 	// pool (SetWriteWorkers/ActiveWriteWorkers). concurrency above is the
@@ -111,6 +113,7 @@ func (c *buffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 		}
 		totalTime := time.Since(startTime)
 		c.chunker.Feedback(chunk, totalTime, uint64(affectedRows))
+		c.recordCompletedChunk(uint64(affectedRows))
 		if metricsErr := c.sendMetrics(ctx, totalTime, chunk.ChunkSize, uint64(affectedRows)); metricsErr != nil {
 			// Metrics failures don't fail the copy; log and continue.
 			c.logger.Error("error sending metrics from copier", "error", metricsErr)
@@ -254,6 +257,8 @@ func (c *buffered) Run(ctx context.Context) error {
 	c.Lock()
 	c.startTime = time.Now()
 	c.Unlock()
+	c.completedRows.Store(0)
+	c.completedChunks.Store(0)
 	go c.estimateRowsPerSecondLoop(ctx) // estimate rows while copying
 
 	// Start the applier
@@ -426,6 +431,7 @@ func (c *buffered) readWorker(ctx context.Context, quit <-chan struct{}) error {
 			totalTime := time.Since(chunkStartTime)
 			c.logger.Debug("readWorker chunk is empty, sending immediate feedback", "chunk", chunk.String())
 			c.chunker.Feedback(chunk, totalTime, 0)
+			c.recordCompletedChunk(0)
 
 			// Send metrics for empty chunk
 			err := c.sendMetrics(ctx, totalTime, chunk.ChunkSize, 0)
@@ -467,6 +473,7 @@ func (c *buffered) readWorker(ctx context.Context, quit <-chan struct{}) error {
 
 			// Send feedback to chunker with total processing time
 			c.chunker.Feedback(capturedChunk, totalTime, uint64(affectedRows))
+			c.recordCompletedChunk(uint64(affectedRows))
 
 			// Send metrics with total processing time
 			metricsErr := c.sendMetrics(ctx, totalTime, capturedChunk.ChunkSize, uint64(affectedRows))
@@ -719,6 +726,15 @@ func (c *buffered) sendMetrics(ctx context.Context, processingTime time.Duration
 // GetChunker returns the chunker for accessing progress information
 func (c *buffered) GetChunker() table.Chunker {
 	return c.chunker
+}
+
+func (c *buffered) recordCompletedChunk(affectedRows uint64) {
+	c.completedRows.Add(affectedRows)
+	c.completedChunks.Add(1)
+}
+
+func (c *buffered) CompletedWork() (uint64, uint64) {
+	return c.completedRows.Load(), c.completedChunks.Load()
 }
 
 func (c *buffered) GetThrottler() throttler.Throttler {

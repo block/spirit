@@ -91,6 +91,24 @@ type ChunkCopier interface {
 	CopyChunk(ctx context.Context, chunk *table.Chunk) error
 }
 
+// CompletedWorkReporter is an optional capability implemented by copiers that
+// can report exact terminal aggregate work.
+type CompletedWorkReporter interface {
+	CompletedWork() (rows uint64, chunks uint64)
+}
+
+// CompletedWork returns authoritative aggregate rows and chunks completed by a
+// built-in copier. The boolean is false for Copier implementations that do not
+// implement CompletedWorkReporter.
+func CompletedWork(c Copier) (rows uint64, chunks uint64, available bool) {
+	reporter, ok := c.(CompletedWorkReporter)
+	if !ok {
+		return 0, 0, false
+	}
+	rows, chunks = reporter.CompletedWork()
+	return rows, chunks, true
+}
+
 type CopierConfig struct {
 	Concurrency int
 	Throttler   throttler.Throttler
