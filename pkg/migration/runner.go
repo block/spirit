@@ -205,6 +205,17 @@ func (r *Runner) observeWorkflowStageFinished(parent, runCtx context.Context, st
 	r.workflowObserver.ObserveWorkflow(parent, event)
 }
 
+// observeWorkflowDurableMutation records that cutover atomically swapped the
+// source and shadow table names. It is emitted before post-cutover cleanup so a
+// caller can distinguish a pre-cutover failure from a cleanup failure after the
+// migration has already taken effect.
+func (r *Runner) observeWorkflowDurableMutation(parent context.Context) {
+	if r.workflowObserver == nil {
+		return
+	}
+	r.workflowObserver.ObserveWorkflow(parent, status.WorkflowEvent{DurableMutation: true})
+}
+
 func (r *Runner) runObservedCopy(parent, ctx context.Context) error {
 	err := r.copier.Run(ctx)
 	if err == nil && ctx.Err() != nil {
@@ -541,6 +552,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := cutover.Run(ctx); err != nil {
 		return fmt.Errorf("cutover failed: %w", err)
 	}
+	r.observeWorkflowDurableMutation(parentCtx)
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
 			if err := change.dropOldTable(ctx); err != nil {

@@ -954,6 +954,32 @@ func TestDropAfterCutover(t *testing.T) {
 	require.NoError(t, m.Close())
 }
 
+func TestWorkflowObserverReportsZeroRowCutoverBeforeCleanupError(t *testing.T) {
+	t.Parallel()
+	testutils.NewTestTable(t, "observed_cutover", `CREATE TABLE observed_cutover (
+		pk int UNSIGNED NOT NULL,
+		PRIMARY KEY(pk)
+	)`)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	observer := &cancelOnDurableMutationObserver{cancel: cancel}
+	m := NewTestRunner(t, "observed_cutover", "ADD INDEX observed_idx (pk)")
+	m.SetWorkflowObserver(observer)
+
+	err := m.Run(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Contains(t, observer.events, status.WorkflowEvent{DurableMutation: true})
+	var indexCount int
+	require.NoError(t, m.db.QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='observed_cutover' AND INDEX_NAME='observed_idx'
+	`).Scan(&indexCount))
+	require.Equal(t, 1, indexCount)
+	require.NoError(t, m.Close())
+}
+
 // TestDeferCutOver tests that deferred cutover times out waiting for the sentinel table.
 func TestDeferCutOver(t *testing.T) {
 	t.Skip("skipping: this test waits for sentinel.WaitLimit to expire, which is too slow with the current 48 hour limit")

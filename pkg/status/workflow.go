@@ -108,14 +108,17 @@ type WorkflowTotals struct {
 // WorkflowEvent is one typed workflow observation.
 //
 // Stage events set Stage and Transition. Finished stage events also set Outcome;
-// a finished copy event may set TotalsAvailable and Totals. Terminal ownership
-// evidence is emitted as a terminal-only event with TerminalOwnership set and
-// all stage fields left at their zero values.
+// a finished copy event may set TotalsAvailable and Totals. Terminal evidence
+// events set exactly one of TerminalOwnership or DurableMutation and leave all
+// stage fields at their zero values. DurableMutation means the externally
+// visible table-name swap has completed successfully, even if later cleanup
+// causes Runner.Run to return an error.
 type WorkflowEvent struct {
 	Stage             WorkflowStage
 	Transition        WorkflowTransition
 	Outcome           WorkflowOutcome
 	TerminalOwnership WorkflowTerminalOwnership
+	DurableMutation   bool
 	Totals            WorkflowTotals
 	TotalsAvailable   bool
 }

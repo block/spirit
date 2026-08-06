@@ -47,6 +47,18 @@ type cancelOnCopyStartObserver struct {
 	cancel context.CancelFunc
 }
 
+type cancelOnDurableMutationObserver struct {
+	recordingWorkflowObserver
+	cancel context.CancelFunc
+}
+
+func (o *cancelOnDurableMutationObserver) ObserveWorkflow(ctx context.Context, event status.WorkflowEvent) {
+	o.recordingWorkflowObserver.ObserveWorkflow(ctx, event)
+	if event.DurableMutation {
+		o.cancel()
+	}
+}
+
 func (o *cancelOnCopyStartObserver) ObserveWorkflow(ctx context.Context, event status.WorkflowEvent) {
 	o.recordingWorkflowObserver.ObserveWorkflow(ctx, event)
 	if event.Stage == status.WorkflowStageCopy && event.Transition == status.WorkflowTransitionStarted {
@@ -128,4 +140,19 @@ func TestWorkflowObserverOptionalAndNilBehavior(t *testing.T) {
 	})
 	r.observeWorkflowStageFinished(t.Context(), t.Context(), status.WorkflowStageCopy, nil)
 	require.Empty(t, observer.events)
+}
+
+func TestWorkflowObserverReportsDurableMutation(t *testing.T) {
+	parent := context.WithValue(t.Context(), workflowObserverContextKey{}, "parent")
+	observer := &recordingWorkflowObserver{}
+	r := &Runner{workflowObserver: observer}
+
+	r.observeWorkflowDurableMutation(parent)
+
+	require.Equal(t, []status.WorkflowEvent{{DurableMutation: true}}, observer.events)
+	require.Equal(t, []context.Context{parent}, observer.contexts)
+
+	r.workflowObserver = nil
+	r.observeWorkflowDurableMutation(parent)
+	require.Len(t, observer.events, 1)
 }
