@@ -92,7 +92,7 @@ type Runner struct {
 	move            *Move
 	sources         []sourceInfo     // one per source database
 	targets         []applier.Target // Combined DB, Config, and KeyRange
-	status          status.State     // must use atomic to get/set
+	status          status.Lifecycle
 	checkpointTable *table.TableInfo
 
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
@@ -166,6 +166,9 @@ type Runner struct {
 	// (stopWatchTask) so the reverse window is the sole writer of the checkpoint
 	// row.
 	bgCancel context.CancelFunc
+
+	reverseFinalized   bool
+	ownershipAmbiguous bool
 }
 
 var _ status.Task = (*Runner)(nil)
@@ -202,6 +205,49 @@ func NewRunner(m *Move) (*Runner, error) {
 		logger: slog.Default(),
 	}
 	return r, nil
+}
+
+// SetWorkflowObserver installs the optional typed workflow observer. It must be
+// called before Run. A nil observer disables workflow observation.
+func (r *Runner) SetWorkflowObserver(observer status.WorkflowObserver) {
+	r.status.SetObserver(observer)
+}
+
+func (r *Runner) runCopy(parentCtx, ctx context.Context) error {
+	copyAttempt := r.status.Start(parentCtx, status.CopyRows)
+	err := r.copier.Run(ctx)
+	if err == nil && ctx.Err() != nil {
+		chunker := r.copier.GetChunker()
+		if chunker == nil || !chunker.IsRead() {
+			err = ctx.Err()
+		}
+	}
+	copyResult := status.WorkflowResult{Err: err}
+	if r.status.HasObserver() {
+		rows, chunks, available := copier.CompletedWork(r.copier)
+		copyResult.Totals = status.WorkflowTotals{CompletedRows: rows, CompletedChunks: chunks}
+		copyResult.TotalsAvailable = available
+	}
+	copyAttempt.Finish(ctx, copyResult)
+	return err
+}
+
+func (r *Runner) terminalOwnership() status.WorkflowTerminalOwnership {
+	switch {
+	case r.reverseFinalized:
+		return status.WorkflowTerminalOwnershipReverseFinalized
+	case r.ownershipAmbiguous:
+		return status.WorkflowTerminalOwnershipAmbiguous
+	default:
+		return 0
+	}
+}
+
+func (r *Runner) recordForwardCutoverFailure(cutover *CutOver, err error) {
+	r.ownershipAmbiguous = r.ownershipAmbiguous ||
+		cutover.cutoverFuncSucceeded ||
+		cutover.cutoverFuncMutated ||
+		errors.Is(err, errRenameRollbackFailed)
 }
 
 func (r *Runner) Close() error {
@@ -768,10 +814,10 @@ func (r *Runner) dropStaleRevertTables(ctx context.Context) error {
 // the checkpoint before any locks or discovery. Returns handled=true when it
 // owns the run.
 //
-// Not yet handled: an interrupted reverse *cutover* (phase "reverting") leaves
-// an ambiguous half-renamed state, so that surfaces as an error for manual
-// completion rather than an unsafe auto-resume.
-func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
+// An interrupted reverse cutover remains unsafe to resume automatically after
+// it crosses the persisted "reverting" boundary. A finalized reverse cutover
+// only needs its idempotent marker/checkpoint cleanup retried.
+func (r *Runner) maybeResumeReverseWindow(parentCtx, ctx context.Context) (bool, error) {
 	rec, err := r.checkpointTbl().ReadLatest(ctx)
 	if err != nil {
 		// No usable checkpoint (fresh move, empty, or a layout this version
@@ -782,8 +828,12 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 	switch rec.Phase {
 	case phaseReverseWindow:
 		r.logger.Warn("resuming an interrupted reverse window from checkpoint", "cutover_at", rec.CutoverAt)
-		return true, r.resumeReverseWindow(ctx, rec)
+		return true, r.resumeReverseWindow(parentCtx, ctx, rec)
+	case phaseReverseFinalized:
+		r.cutoverAt = rec.CutoverAt
+		return true, newReverseWindow(r).finalizeReverse(ctx)
 	case phaseReverting:
+		r.ownershipAmbiguous = true
 		return true, fmt.Errorf("a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually", rec.Phase)
 	default:
 		return false, nil // phase "" (copy) — the normal flow handles resume/fresh
@@ -798,7 +848,7 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 // of the same move is an operator error), and the feed always resumes from the
 // original cutover position — correct via idempotent apply, at the cost of
 // re-reading the window's binlog.
-func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record) error {
+func (r *Runner) resumeReverseWindow(parentCtx, ctx context.Context, rec checkpoint.Record) error {
 	var positions map[string]string
 	if err := json.Unmarshal([]byte(rec.Position), &positions); err != nil {
 		return fmt.Errorf("resume reverse window: parse stored positions: %w", err)
@@ -827,7 +877,7 @@ func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record)
 	}
 	r.sourceTables = r.sources[0].tables
 
-	return newReverseWindow(r).run(ctx)
+	return newReverseWindow(r).run(parentCtx, ctx)
 }
 
 // reverseWindowLogicalTables recovers the logical names of the moved tables when
@@ -980,6 +1030,13 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 }
 
 func (r *Runner) Run(ctx context.Context) error {
+	parentCtx := ctx
+	r.status.ResetEvidence()
+	r.reverseFinalized = false
+	r.ownershipAmbiguous = false
+	defer func() {
+		r.status.Terminal(parentCtx, r.terminalOwnership())
+	}()
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
 	r.startTime = time.Now()
@@ -1095,7 +1152,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// treat them as fresh data and re-copy them. This must run before the
 	// revert-marker pre-flight guard, since a resumed window legitimately honors
 	// a marker created before the crash.
-	if handled, err := r.maybeResumeReverseWindow(ctx); err != nil {
+	if handled, err := r.maybeResumeReverseWindow(parentCtx, ctx); err != nil {
 		return err
 	} else if handled {
 		return nil
@@ -1123,7 +1180,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		// the full cutover path.
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
 		r.status.Set(status.CutOver)
-		if _, err := r.runForwardCutoverCallback(ctx); err != nil {
+		result, err := r.runForwardCutoverCallback(ctx)
+		if result.DurableMutation {
+			r.status.DurableMutation(parentCtx)
+		}
+		if err != nil {
 			return err
 		}
 		r.logger.Info("Move operation complete.")
@@ -1167,19 +1228,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	r.status.Set(status.CopyRows)
-	if err := r.copier.Run(ctx); err != nil {
+	if err = r.runCopy(parentCtx, ctx); err != nil {
 		return err
 	}
 
-	// Disable both watermark optimizations so that all changes can be flushed.
-	// For non-memory-comparable PKs this also drains the buffered map and
-	// switches the subscription into FIFO queue mode (see
-	// pkg/change/subscription_buffered.go), so the call can return an error.
-	if err := r.setWatermarkOptimizationAll(ctx, false); err != nil {
-		return err
+	// Disable both watermark optimizations and flush pending changes at the
+	// first authoritative post-copy catch-up boundary.
+	catchUpAttempt := r.status.Start(parentCtx, status.ApplyChangeset)
+	err = r.setWatermarkOptimizationAll(ctx, false)
+	if err == nil {
+		err = r.flushAllReplClients(ctx)
 	}
-	if err := r.flushAllReplClients(ctx); err != nil {
+	catchUpAttempt.Finish(ctx, status.WorkflowResult{Err: err})
+	if err != nil {
 		return err
 	}
 
@@ -1189,24 +1250,32 @@ func (r *Runner) Run(ctx context.Context) error {
 	// ANALYZE TABLE, run the initial checksum. While the sentinel blocks
 	// cutover, waitOnSentinelTable runs a continuous checksum loop in the
 	// background — see docs/move.md for the two-checksum model.
-	if err := r.postCopyPhase(ctx); err != nil {
+	if err := r.postCopyPhaseObserved(parentCtx, ctx); err != nil {
 		return err
 	}
 	r.logger.Info("Initial checksum completed successfully")
 
-	r.sentinelWaitStartTime = time.Now()
-	r.status.Set(status.WaitingOnSentinelTable)
-	// Block on the sentinel via the shared sentinel.Wait (poll/timeout timing
-	// lives in the sentinel package). The continuous-checksum lifecycle and
-	// watermark invalidation are move-specific (multi-source feeds;
-	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
-	// so they are injected as callbacks. See pkg/sentinel.
-	if err := sentinel.Wait(ctx, sentinel.WaitConfig{
-		Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
+	var waitAttempt status.WorkflowAttempt
+	waitStarted := false
+	exists := func(ctx context.Context) (bool, error) {
+		ok, err := sentinel.Exists(ctx, r.targets[0].DB)
+		if err == nil && ok && !waitStarted {
+			waitStarted = true
+			r.sentinelWaitStartTime = time.Now()
+			waitAttempt = r.status.Start(parentCtx, status.WaitingOnSentinelTable)
+		}
+		return ok, err
+	}
+	err = sentinel.Wait(ctx, sentinel.WaitConfig{
+		Exists:              exists,
 		RunChecksum:         r.runContinuousChecksum,
 		InvalidateWatermark: r.invalidateChecksumWatermark,
 		Logger:              r.logger,
-	}); err != nil {
+	})
+	if waitStarted {
+		waitAttempt.Finish(ctx, status.WorkflowResult{Err: err})
+	}
+	if err != nil {
 		return err
 	}
 
@@ -1247,14 +1316,20 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 	if err = cutover.Run(ctx); err != nil {
+		r.recordForwardCutoverFailure(cutover, err)
+		if r.ownershipAmbiguous {
+			r.status.DurableMutation(parentCtx)
+		}
 		return err
 	}
+	r.ownershipAmbiguous = false
+	r.status.DurableMutation(parentCtx)
 
 	if r.move.ReverseWindow > 0 {
 		// Hold the reverse window keeping the source current, then complete
 		// forward (retire the source) or roll back. The checkpoint is dropped by
 		// the terminal action, not here.
-		return newReverseWindow(r).run(ctx)
+		return newReverseWindow(r).run(parentCtx, ctx)
 	}
 
 	// Delete checkpoint table from targets[0].
@@ -1575,6 +1650,10 @@ func (r *Runner) restoreIndexesForTargets(ctx context.Context, host string, targ
 // When create-sentinel is not in use this is also the last phase
 // before cutover.
 func (r *Runner) postCopyPhase(ctx context.Context) error {
+	return r.postCopyPhaseObserved(ctx, ctx)
+}
+
+func (r *Runner) postCopyPhaseObserved(parentCtx, ctx context.Context) error {
 	// Flush all pending events, but leave the periodic flush running until
 	// just before the checksum. With --defer-secondary-indexes,
 	// restoreSecondaryIndexes issues one giant ALTER per table that can run
@@ -1664,7 +1743,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.status.Set(status.Checksum)
+	checksumAttempt := r.status.Start(parentCtx, status.Checksum)
 	// On a checker error we just propagate. The DumpCheckpoint invariant
 	// guarantees that any persisted checksum_watermark describes only
 	// verified-clean chunks, so a resumed run either replays the checksum
@@ -1672,7 +1751,9 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// repair) or resumes safely from a watermark that came from a clean
 	// pass. See pkg/migration/runner.go DumpCheckpoint for the full
 	// rationale.
-	return r.checker.Run(ctx)
+	err = r.checker.Run(ctx)
+	checksumAttempt.Finish(ctx, status.WorkflowResult{Err: err})
+	return err
 }
 
 // analyzeTable runs ANALYZE TABLE for tableName on db, unqualified: db is
@@ -1718,13 +1799,18 @@ func (r *Runner) analyzeTable(ctx context.Context, db *sql.DB, tableName string)
 // configured and always returns the result-bearing form used by both runner
 // cutover paths.
 func (r *Runner) runForwardCutoverCallback(ctx context.Context) (CutoverResult, error) {
-	if r.cutoverResultFunc != nil {
-		return r.cutoverResultFunc(ctx)
+	var result CutoverResult
+	var err error
+	switch {
+	case r.cutoverResultFunc != nil:
+		result, err = r.cutoverResultFunc(ctx)
+	case r.cutoverFunc != nil:
+		err = r.cutoverFunc(ctx)
 	}
-	if r.cutoverFunc != nil {
-		return CutoverResult{}, r.cutoverFunc(ctx)
+	if err != nil && result.DurableMutation {
+		r.ownershipAmbiguous = true
 	}
-	return CutoverResult{}, nil
+	return result, err
 }
 
 func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {

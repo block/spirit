@@ -324,3 +324,20 @@ func TestCutOverResultControlsRetry(t *testing.T) {
 		})
 	}
 }
+
+func TestCutOverRenameRollbackFailureStopsOuterRetries(t *testing.T) {
+	dbConfig := dbconn.NewDBConfig()
+	dbConfig.MaxRetries = 3
+	cutover := &CutOver{dbConfig: dbConfig, logger: slog.Default()}
+	attempts := 0
+
+	err := cutover.runWithRetries(t.Context(), func(int) error {
+		attempts++
+		return fmt.Errorf("partially renamed source: %w", errRenameRollbackFailed)
+	})
+
+	require.ErrorIs(t, err, errRenameRollbackFailed)
+	require.Equal(t, 1, attempts)
+	require.False(t, cutover.cutoverFuncMutated)
+	require.False(t, cutover.cutoverFuncSucceeded)
+}

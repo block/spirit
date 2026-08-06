@@ -141,6 +141,11 @@ func (c *CutOver) runWithRetries(ctx context.Context, runAttempt func(attempt in
 		}
 		err = runAttempt(attempt)
 		if err != nil {
+			if errors.Is(err, errRenameRollbackFailed) {
+				c.logger.Error("source rename rollback failed; not retrying a partially renamed cutover",
+					"error", err.Error())
+				return err
+			}
 			if c.cutoverFuncMutated && !c.cutoverFuncSucceeded {
 				c.logger.Error("cutover callback failed after reporting a durable mutation; not retrying",
 					"error", err.Error())

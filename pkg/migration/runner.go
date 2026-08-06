@@ -72,7 +72,7 @@ type Runner struct {
 	// With a stmt, alter, table, newTable.
 	changes []*tableChange
 
-	status     status.State  // must use atomic helpers to change.
+	status     status.Lifecycle
 	replClient change.Source // feed contains all binlog subscription activity.
 	throttler  throttler.Throttler
 
@@ -216,6 +216,12 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
 }
 
+// SetWorkflowObserver installs an optional typed workflow observer. It must be
+// called before Run. A nil observer disables workflow observation.
+func (r *Runner) SetWorkflowObserver(observer status.WorkflowObserver) {
+	r.status.SetObserver(observer)
+}
+
 // attemptMySQLDDL tries to perform the DDL using MySQL's built-in
 // either with INSTANT or known safe INPLACE operations.
 func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
@@ -225,7 +231,31 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 	return r.changes[0].attemptMySQLDDL(ctx)
 }
 
+func (r *Runner) runCopyAttempt(ctx context.Context, attempt *status.WorkflowAttempt) error {
+	err := r.copier.Run(ctx)
+	if err == nil && ctx.Err() != nil {
+		chunker := r.copier.GetChunker()
+		if chunker == nil || !chunker.IsRead() {
+			err = ctx.Err()
+		}
+	}
+
+	result := status.WorkflowResult{Err: err}
+	if r.status.HasObserver() {
+		rows, chunks, available := copier.CompletedWork(r.copier)
+		result.Totals = status.WorkflowTotals{
+			CompletedRows:   rows,
+			CompletedChunks: chunks,
+		}
+		result.TotalsAvailable = available
+	}
+	attempt.Finish(ctx, result)
+	return err
+}
+
 func (r *Runner) Run(ctx context.Context) error {
+	parentCtx := ctx
+	r.status.ResetEvidence()
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
 	r.startTime = time.Now()
@@ -395,24 +425,29 @@ func (r *Runner) Run(ctx context.Context) error {
 	// of migrations usually spend time. It is not strictly necessary,
 	// but we always recopy the last-bit, even if we are resuming
 	// partially through the checksum.
-	r.status.Set(status.CopyRows)
-	if err := r.copier.Run(ctx); err != nil {
+	copyAttempt := r.status.Start(parentCtx, status.CopyRows)
+	err = r.runCopyAttempt(ctx, &copyAttempt)
+	if err != nil {
 		return err
 	}
 	r.logger.Info("copy rows complete")
 	r.copyDuration = time.Since(r.copier.StartTime())
 
-	// Disable both watermark optimizations so that all changes can be flushed.
-	// For non-memory-comparable PKs this also drains the buffered map and
-	// switches the subscription into FIFO queue mode (see
-	// pkg/change/subscription_buffered.go), so the call can return an error.
-	if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
+	// Disable both watermark optimizations, stop periodic flushing, and flush
+	// pending changes at the authoritative catch-up boundary.
+	catchUpAttempt := r.status.Start(parentCtx, status.ApplyChangeset)
+	err = r.replClient.SetWatermarkOptimization(ctx, false)
+	if err == nil {
+		r.replClient.StopPeriodicFlush()
+		err = r.replClient.Flush(ctx)
+	}
+	catchUpAttempt.Finish(ctx, status.WorkflowResult{Err: err})
+	if err != nil {
 		return err
 	}
 
-	// Post-copy phase: catch up on replClient apply, run ANALYZE TABLE
-	// so cutover stats are fresh, and run the initial checksum.
-	if err := r.postCopyPhase(ctx); err != nil {
+	// Post-copy phase: update table statistics and run the initial checksum.
+	if err := r.postCopyPhase(parentCtx, ctx); err != nil {
 		return err
 	}
 
@@ -427,19 +462,27 @@ func (r *Runner) Run(ctx context.Context) error {
 	// that the sentinel table was created manually after the migration
 	// started.
 	if r.migration.RespectSentinel {
-		r.sentinelWaitStartTime = time.Now()
-		r.status.Set(status.WaitingOnSentinelTable)
-		// Block on the sentinel via the shared sentinel.Wait (poll/timeout timing
-		// lives in the sentinel package). The continuous-checksum lifecycle and
-		// watermark invalidation are migration-specific — invalidateChecksumWatermark
-		// scopes its UPDATE by statement because the checkpoint table is shared in
-		// multi-table mode — so they are injected as callbacks. See pkg/sentinel.
-		if err := sentinel.Wait(ctx, sentinel.WaitConfig{
-			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
+		var waitAttempt status.WorkflowAttempt
+		waitStarted := false
+		exists := func(ctx context.Context) (bool, error) {
+			ok, err := sentinel.Exists(ctx, r.db)
+			if err == nil && ok && !waitStarted {
+				waitStarted = true
+				r.sentinelWaitStartTime = time.Now()
+				waitAttempt = r.status.Start(parentCtx, status.WaitingOnSentinelTable)
+			}
+			return ok, err
+		}
+		err = sentinel.Wait(ctx, sentinel.WaitConfig{
+			Exists:              exists,
 			RunChecksum:         r.runContinuousChecksum,
 			InvalidateWatermark: r.invalidateChecksumWatermark,
 			Logger:              r.logger,
-		}); err != nil {
+		})
+		if waitStarted {
+			waitAttempt.Finish(ctx, status.WorkflowResult{Err: err})
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -473,6 +516,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := cutover.Run(ctx); err != nil {
 		return fmt.Errorf("cutover failed: %w", err)
 	}
+	r.status.DurableMutation(parentCtx)
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
 			if err := change.dropOldTable(ctx); err != nil {
@@ -516,20 +560,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	return nil
 }
 
-// postCopyPhase runs the work that happens between copy-rows and the
-// sentinel wait: drain the binlog backlog, run ANALYZE TABLE, and
-// perform the initial checksum. When defer-cutover is not in use this
-// is also the last phase before cutover.
-func (r *Runner) postCopyPhase(ctx context.Context) error {
-	r.status.Set(status.ApplyChangeset)
-	// Disable the periodic flush and flush all pending events.
-	// We want it disabled for ANALYZE TABLE and acquiring a table lock
-	// *but* it will be started again briefly inside of the checksum
-	// runner to ensure that the lag does not grow too long.
-	r.replClient.StopPeriodicFlush()
-	if err := r.replClient.Flush(ctx); err != nil {
-		return err
-	}
+// postCopyPhase runs the work that happens between the authoritative binlog
+// catch-up and the sentinel wait: update table statistics and perform the
+// initial checksum. When defer-cutover is not in use this is also the last
+// phase before cutover.
+func (r *Runner) postCopyPhase(parentCtx, ctx context.Context) error {
 
 	// Run ANALYZE TABLE to update the statistics on the new table.
 	// This is required so on cutover plans don't go sideways, which
@@ -564,7 +599,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// The checksum is ONLINE after an initial lock
 	// for consistency. It is the main way that we determine that
 	// this program is safe to use even when immature.
-	return r.checksum(ctx)
+	return r.checksumAttempt(parentCtx, ctx)
 }
 
 // runChecks wraps around check.RunChecks and adds the context of this migration
@@ -1667,9 +1702,13 @@ func (r *Runner) initChunkers() error {
 	return nil
 }
 
-// checksum creates the checksum which opens the read view
+// checksum creates the checksum which opens the read view.
 func (r *Runner) checksum(ctx context.Context) error {
-	r.status.Set(status.Checksum)
+	return r.checksumAttempt(ctx, ctx)
+}
+
+func (r *Runner) checksumAttempt(parentCtx, ctx context.Context) error {
+	attempt := r.status.Start(parentCtx, status.Checksum)
 
 	// The checksum keeps the pool threads open, so we need to extend
 	// by more than +1 on threads as we did previously. We have:
@@ -1695,7 +1734,9 @@ func (r *Runner) checksum(ctx context.Context) error {
 	// (forcing full re-verification) or a watermark from a clean pass
 	// (safe to resume from). Either way the silent-cutover hole is
 	// closed without needing to special-case the error path.
-	if err := r.checker.Run(ctx); err != nil {
+	err := r.checker.Run(ctx)
+	attempt.Finish(ctx, status.WorkflowResult{Err: err})
+	if err != nil {
 		if r.addsUniqueIndex() {
 			// Overwrite the error if we think it's because of a unique index addition
 			return errors.New("checksum failed after several attempts. This is likely related to your statement adding a UNIQUE index on non-unique data")

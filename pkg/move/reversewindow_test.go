@@ -183,6 +183,66 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	require.False(t, tableExists(t, ctl, "rwrv_dst", checkpointTableName), "checkpoint should be dropped")
 }
 
+func TestMoveLifecyclePartialReverseSourceRenameIsAmbiguous(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwpartial_src", "rwpartial_dst")
+	testutils.RunSQL(t, "CREATE TABLE rwpartial_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))")
+	testutils.RunSQL(t, "INSERT INTO rwpartial_src.t2 (id, val) VALUES (1,'one')")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:       sourceDSN,
+		TargetDSN:       targetDSN,
+		TargetChunkTime: time.Second,
+		Threads:         1,
+		WriteThreads:    1,
+		ReverseWindow:   30 * time.Second,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+
+	observer := &recordingMoveWorkflowObserver{}
+	runner.SetWorkflowObserver(observer)
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { return nil })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- runner.Run(context.Background()) }()
+	waitForReverseWindow(t, ctl, "rwpartial_dst")
+	waitForTable(t, ctl, "rwpartial_src", "t1_old")
+	waitForTable(t, ctl, "rwpartial_src", "t2_old")
+
+	// The first source restore succeeds, then the collision forces the second
+	// restore to fail with both old and real source names present.
+	testutils.RunSQL(t, "CREATE TABLE rwpartial_src.t2 (id INT PRIMARY KEY)")
+	testutils.RunSQL(t, "CREATE TABLE rwpartial_dst."+revertMarkerName+" (id INT)")
+
+	select {
+	case runErr := <-errCh:
+		require.Error(t, runErr)
+		require.ErrorContains(t, runErr, "un-retire source")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for partial reverse cutover failure")
+	}
+
+	require.True(t, tableExists(t, ctl, "rwpartial_src", "t1"))
+	require.True(t, tableExists(t, ctl, "rwpartial_src", "t2_old"))
+	events, _ := observer.snapshot()
+	var reverseEvents, terminals []status.WorkflowEvent
+	for _, event := range events {
+		if event.State == status.ReverseWindow {
+			reverseEvents = append(reverseEvents, event)
+		}
+		if event.TerminalOwnership != 0 {
+			terminals = append(terminals, event)
+		}
+	}
+	require.Equal(t, []status.WorkflowEvent{
+		{State: status.ReverseWindow, Transition: status.WorkflowTransitionStarted},
+		{State: status.ReverseWindow, Transition: status.WorkflowTransitionFinished, Outcome: status.WorkflowOutcomeFailed},
+	}, reverseEvents)
+	require.Equal(t, []status.WorkflowEvent{{TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous}}, terminals)
+}
+
 // runRevertingMove runs one reverse-window move against the given DSNs and, once
 // the window opens, requests a revert (creates the marker), returning when the
 // reverse cutover has completed. Fails the test on any error.
