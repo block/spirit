@@ -12,7 +12,6 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/move/check"
-	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -93,20 +92,31 @@ type reverseWindow struct {
 	feed *ReverseFeed
 	// watched[i] is target i's real-name tables, used to lock and then retire
 	// the targets during a reverse cutover.
-	watched [][]*table.TableInfo
+	watched        [][]*table.TableInfo
+	dropMarker     func(context.Context) error
+	dropCheckpoint func(context.Context) error
 }
 
-func newReverseWindow(r *Runner) *reverseWindow { return &reverseWindow{r: r} }
+func newReverseWindow(r *Runner) *reverseWindow {
+	return &reverseWindow{
+		r:              r,
+		dropMarker:     func(ctx context.Context) error { return dropRevertMarker(ctx, r.targets[0].DB) },
+		dropCheckpoint: func(ctx context.Context) error { return r.checkpointTbl().Drop(ctx) },
+	}
+}
 
 // run holds the window and performs the terminal action. It owns the feed's
-// lifecycle.
-func (w *reverseWindow) run(ctx context.Context) error {
+// lifecycle. started runs after the reverse feed is live.
+func (w *reverseWindow) run(ctx context.Context, started func()) error {
 	if err := w.buildFeed(ctx); err != nil {
 		return err
 	}
 	defer w.feed.Close() // idempotent; the terminal actions also close explicitly
 	if err := w.feed.Start(ctx); err != nil {
 		return fmt.Errorf("reverse window: start feed: %w", err)
+	}
+	if started != nil {
+		started()
 	}
 
 	r := w.r
@@ -117,7 +127,6 @@ func (w *reverseWindow) run(ctx context.Context) error {
 	r.logger.Info(fmt.Sprintf("reverse window open; watching for a table named %s to be created on %s (create it to roll back)",
 		revertMarkerName, revertLoc),
 		"window", r.move.ReverseWindow, "deadline", deadline, "reverse_sources", len(r.targets))
-	r.status.Set(status.ReverseWindow)
 
 	ticker := time.NewTicker(reverseWindowPollInterval)
 	defer ticker.Stop()
@@ -272,10 +281,10 @@ func (w *reverseWindow) revertRequested(ctx context.Context) (bool, error) {
 // checkpoint is dropped. The reverse feed is stopped.
 func (w *reverseWindow) completeForward(ctx context.Context) error {
 	w.feed.Close()
-	if err := dropRevertMarker(ctx, w.r.targets[0].DB); err != nil {
+	if err := w.dropMarker(ctx); err != nil {
 		return fmt.Errorf("reverse window: drop revert marker on complete-forward: %w", err)
 	}
-	if err := w.r.checkpointTbl().Drop(ctx); err != nil {
+	if err := w.dropCheckpoint(ctx); err != nil {
 		return fmt.Errorf("reverse window: drop checkpoint on complete-forward: %w", err)
 	}
 	w.r.logger.Info("reverse window complete; move finalized forward (source retired)")
@@ -337,6 +346,7 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 			if err := dbconn.Exec(ctx, s.db, "RENAME TABLE %n TO %n", oldName, t.TableName); err != nil {
 				return fmt.Errorf("reverse cutover: un-retire source %d table %q: %w", si, t.TableName, err)
 			}
+			r.ownershipAmbiguous = true
 		}
 	}
 
@@ -361,11 +371,20 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 		}
 	}
 
-	// 6. Drop the revert marker and the checkpoint.
-	if err := dropRevertMarker(ctx, r.targets[0].DB); err != nil {
+	return w.finalizeReverse(ctx)
+}
+
+// finalizeReverse records definitive reverse ownership before best-effort
+// cleanup. Once every target has been retired, cleanup failure cannot move
+// ownership away from the restored source.
+func (w *reverseWindow) finalizeReverse(ctx context.Context) error {
+	r := w.r
+	r.ownershipAmbiguous = false
+	r.reverseFinalized = true
+	if err := w.dropMarker(ctx); err != nil {
 		return fmt.Errorf("reverse cutover: drop revert marker: %w", err)
 	}
-	if err := r.checkpointTbl().Drop(ctx); err != nil {
+	if err := w.dropCheckpoint(ctx); err != nil {
 		return fmt.Errorf("reverse cutover: drop checkpoint: %w", err)
 	}
 	r.logger.Info("reverse cutover complete; move rolled back to source")

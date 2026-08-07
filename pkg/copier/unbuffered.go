@@ -26,6 +26,8 @@ type Unbuffered struct {
 	concurrency      int
 	rowsPerSecond    atomic.Uint64
 	isInvalid        bool
+	completedRows    atomic.Uint64
+	completedChunks  atomic.Uint64
 	startTime        time.Time
 	throttler        throttler.Throttler
 	dbConfig         *dbconn.DBConfig
@@ -80,6 +82,7 @@ func (c *Unbuffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
 
 	// Send feedback to chunker with processing time and statistics
 	c.chunker.Feedback(chunk, chunkProcessingTime, uint64(affectedRows))
+	c.recordCompletedChunk(uint64(affectedRows))
 
 	// Send metrics
 	err = c.sendMetrics(ctx, chunkProcessingTime, chunk.ChunkSize, uint64(affectedRows))
@@ -109,6 +112,8 @@ func (c *Unbuffered) Run(ctx context.Context) error {
 	c.Lock()
 	c.startTime = time.Now()
 	c.Unlock()
+	c.completedRows.Store(0)
+	c.completedChunks.Store(0)
 	go c.estimateRowsPerSecondLoop(ctx) // estimate rows while copying
 	g, errGrpCtx := errgroup.WithContext(ctx)
 	g.SetLimit(c.concurrency)
@@ -253,6 +258,15 @@ func (c *Unbuffered) sendMetrics(ctx context.Context, processingTime time.Durati
 // GetChunker returns the chunker for accessing progress information
 func (c *Unbuffered) GetChunker() table.Chunker {
 	return c.chunker
+}
+
+func (c *Unbuffered) recordCompletedChunk(affectedRows uint64) {
+	c.completedRows.Add(affectedRows)
+	c.completedChunks.Add(1)
+}
+
+func (c *Unbuffered) CompletedWork() (uint64, uint64) {
+	return c.completedRows.Load(), c.completedChunks.Load()
 }
 
 func (c *Unbuffered) GetThrottler() throttler.Throttler {

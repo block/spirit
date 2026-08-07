@@ -22,3 +22,16 @@ func TestStateString(t *testing.T) {
 	require.Equal(t, "analyzeTable", AnalyzeTable.String())
 	require.Equal(t, "close", Close.String())
 }
+
+func TestStateSetNotifiesAfterStore(t *testing.T) {
+	var state State
+	notifications := 0
+
+	state.Set(CopyRows, func() {
+		notifications++
+		require.Equal(t, CopyRows, state.Get())
+	}, nil)
+
+	require.Equal(t, CopyRows, state.Get())
+	require.Equal(t, 1, notifications)
+}

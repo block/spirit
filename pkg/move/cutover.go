@@ -27,6 +27,15 @@ var renameRetryWait = 1 * time.Second
 // that state cannot converge, so the retry loop aborts immediately.
 var errRenameRollbackFailed = errors.New("rename rollback failed")
 
+// CutoverResult reports whether a caller-owned forward cutover callback made a
+// durable ownership or topology mutation, even when it also returned an error.
+type CutoverResult struct {
+	DurableMutation bool
+}
+
+// CutoverResultCallback is the result-bearing form of a forward cutover callback.
+type CutoverResultCallback func(context.Context) (CutoverResult, error)
+
 // CutOverSource holds per-source state needed for the cutover.
 type CutOverSource struct {
 	DB         *sql.DB
@@ -35,10 +44,12 @@ type CutOverSource struct {
 }
 
 type CutOver struct {
-	sources     []CutOverSource
-	cutoverFunc func(ctx context.Context) error
-	dbConfig    *dbconn.DBConfig
-	logger      *slog.Logger
+	sources            []CutOverSource
+	cutoverFunc        func(ctx context.Context) error
+	dbConfig           *dbconn.DBConfig
+	cutoverResultFunc  CutoverResultCallback
+	cutoverFuncMutated bool
+	logger             *slog.Logger
 	// cutoverFuncSucceeded tracks whether cutoverFunc has been invoked and
 	// returned nil. The cutover function is a caller-supplied traffic switch
 	// (e.g. a Vitess routing change) and is not assumed to be idempotent:
@@ -62,6 +73,13 @@ type CutOver struct {
 // traffic switch and before the source rename. See CutOver.postSwitch.
 func (c *CutOver) SetPostSwitch(fn func(ctx context.Context) error) {
 	c.postSwitch = fn
+}
+
+// SetCutoverWithResult installs a result-bearing forward cutover callback.
+// It is mutually exclusive with the legacy error-only callback.
+func (c *CutOver) SetCutoverWithResult(fn CutoverResultCallback) {
+	c.cutoverFunc = nil
+	c.cutoverResultFunc = fn
 }
 
 // NewCutOver creates a new CutOver that handles multiple sources.
@@ -119,6 +137,11 @@ func (c *CutOver) Run(ctx context.Context) error {
 			"max-retries", c.dbConfig.MaxRetries)
 		err = c.algorithmCutover(ctx)
 		if err != nil {
+			if c.cutoverFuncMutated && !c.cutoverFuncSucceeded {
+				c.logger.Error("cutover callback failed after reporting a durable mutation; not retrying",
+					"error", err.Error())
+				return fmt.Errorf("cutover callback reported a durable ownership or topology mutation before failing; manual intervention required: %w", err)
+			}
 			if c.cutoverFuncSucceeded {
 				// The traffic switch has already succeeded, so traffic may be
 				// on the target. Another attempt would have released the
@@ -178,15 +201,25 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 	}
 
 	// Run the cutover function (Vitess coordination). It is invoked at most
-	// once per CutOver: the traffic switch is not assumed to be idempotent,
-	// so if a later step fails the retry must never re-run it.
-	if c.cutoverFunc != nil && !c.cutoverFuncSucceeded {
+	// once after it succeeds or reports a durable mutation.
+	if !c.cutoverFuncSucceeded && (c.cutoverResultFunc != nil || c.cutoverFunc != nil) {
 		c.logger.Info("Running cutover function")
-		if err := c.cutoverFunc(ctx); err != nil {
-			return err
+		if c.cutoverResultFunc != nil {
+			result, callbackErr := c.cutoverResultFunc(ctx)
+			c.cutoverFuncMutated = c.cutoverFuncMutated || result.DurableMutation
+			if callbackErr != nil {
+				return callbackErr
+			}
+			c.cutoverFuncSucceeded = true
+		} else if c.cutoverFunc != nil {
+			if err := c.cutoverFunc(ctx); err != nil {
+				return err
+			}
+			c.cutoverFuncSucceeded = true
 		}
-		c.cutoverFuncSucceeded = true
-		c.logger.Info("Cutover function complete")
+		if c.cutoverFuncSucceeded {
+			c.logger.Info("Cutover function complete")
+		}
 	}
 
 	// Reverse-window hook: after the traffic switch and before retiring the
