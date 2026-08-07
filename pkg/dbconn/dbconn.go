@@ -192,6 +192,7 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 	)
 	for i := range config.MaxRetries {
 		func() {
+			var attemptRowsAffected int64
 			// Start a transaction
 			if trx, err = db.BeginTx(ctx, nil); err != nil {
 				return
@@ -267,13 +268,14 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 				// and that's absolutely fine!
 				count, errC := res.RowsAffected()
 				if errC == nil { // affectedRows is supported
-					rowsAffected += count
+					attemptRowsAffected += count
 				}
 			} // end for each statement
 			// Commit it!
 			if err = trx.Commit(); err != nil {
 				return
 			}
+			rowsAffected = attemptRowsAffected
 		}()
 		if isFatal { // don't retry loop if fatal
 			return rowsAffected, err
