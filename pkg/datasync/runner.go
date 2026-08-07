@@ -275,18 +275,26 @@ func (r *Runner) Run(ctx context.Context) error {
 		// events for keys the copier has not reached yet (above the watermark)
 		// are discarded, because the copier will copy those rows directly.
 		//
-		// CORRECTNESS CAVEAT — read replicas:
+		// CORRECTNESS CAVEAT:
 		// keyAboveWatermark is only safe when the copier reads from a source
 		// that reflects every change the change feed has already delivered.
-		// That holds on a PRIMARY, but NOT on a lagging REPLICA: an update to
-		// an above-watermark key can be observed on the change stream — and
-		// discarded — while the copier's later read of that key on the replica
-		// still returns the pre-update (stale) value, silently losing it. The
-		// intended safety net is the post-copy checksum, which isn't usable on
-		// the read-only import source yet (it needs privileges that credential
-		// lacks). So a replica source (e.g. the strata import) gets only
-		// best-effort consistency. On resume we leave the optimization OFF
-		// (startResume) so every change applies.
+		// That does NOT strictly hold anywhere (see
+		// docs/key-above-watermark-visibility.md): even on a PRIMARY, binlog
+		// subscribers receive a transaction's events at the binlog sync
+		// stage, before its engine commit makes the rows visible — a window
+		// that semi-sync (AFTER_SYNC) and Aurora commit latency stretch from
+		// sub-millisecond to hundreds of milliseconds or more. On a lagging
+		// REPLICA it is worse: an update to an above-watermark key can be
+		// observed on the change stream — and discarded — while the copier's
+		// later read of that key on the replica still returns the pre-update
+		// (stale) value, silently losing it. The intended safety net is the
+		// post-copy continuous checksum, which repairs divergence only
+		// lazily, and isn't usable at all on the read-only import source yet
+		// (it needs privileges that credential lacks). So this optimization
+		// trades a small, environment-dependent divergence risk for initial
+		// copy throughput; a replica source (e.g. the strata import) gets
+		// only best-effort consistency. On resume we leave the optimization
+		// OFF (startResume) so every change applies.
 		if err := r.replClient.SetWatermarkOptimization(ctx, true); err != nil {
 			return err
 		}
