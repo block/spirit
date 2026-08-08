@@ -117,35 +117,36 @@ func (w *reverseWindow) run(ctx context.Context) error {
 	r.logger.Info(fmt.Sprintf("reverse window open; watching for a table named %s to be created on %s (create it to roll back)",
 		revertMarkerName, revertLoc),
 		"window", r.move.ReverseWindow, "deadline", deadline, "reverse_sources", len(r.targets))
-	r.status.Set(status.ReverseWindow)
 
-	ticker := time.NewTicker(reverseWindowPollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if ferr := w.feed.Err(); ferr != nil {
-				r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", ferr)
-				return w.completeForward(ctx)
-			}
-			requested, err := w.revertRequested(ctx)
-			if err != nil {
-				// A transient read error should not abandon the window; log and
-				// retry on the next tick.
-				r.logger.Warn("could not read revert flag; continuing window", "error", err)
-			} else if requested {
-				r.logger.Info(fmt.Sprintf("revert triggered: detected a table named %s on %s; rolling back to source",
-					revertMarkerName, revertLoc))
-				return w.reverseCutover(ctx)
-			}
-			if !time.Now().Before(deadline) {
-				r.logger.Info("reverse window elapsed; completing forward")
-				return w.completeForward(ctx)
+	return r.status.Do(status.ReverseWindow, func() error {
+		ticker := time.NewTicker(reverseWindowPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				if ferr := w.feed.Err(); ferr != nil {
+					r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", ferr)
+					return w.completeForward(ctx)
+				}
+				requested, err := w.revertRequested(ctx)
+				if err != nil {
+					// A transient read error should not abandon the window; log and
+					// retry on the next tick.
+					r.logger.Warn("could not read revert flag; continuing window", "error", err)
+				} else if requested {
+					r.logger.Info(fmt.Sprintf("revert triggered: detected a table named %s on %s; rolling back to source",
+						revertMarkerName, revertLoc))
+					return w.reverseCutover(ctx)
+				}
+				if !time.Now().Before(deadline) {
+					r.logger.Info("reverse window elapsed; completing forward")
+					return w.completeForward(ctx)
+				}
 			}
 		}
-	}
+	})
 }
 
 // buildFeed constructs the reverse feed: reverse sources are the former targets

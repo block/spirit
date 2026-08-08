@@ -72,13 +72,12 @@ type Runner struct {
 	// With a stmt, alter, table, newTable.
 	changes []*tableChange
 
-	status     status.State  // must use atomic helpers to change.
-	replClient change.Source // feed contains all binlog subscription activity.
+	status     status.Tracker // owns the current state and per-state timing.
+	replClient change.Source  // feed contains all binlog subscription activity.
 	throttler  throttler.Throttler
 
-	copier       copier.Copier
-	copyChunker  table.Chunker // the chunker for copying
-	copyDuration time.Duration // how long the copy took
+	copier      copier.Copier
+	copyChunker table.Chunker // the chunker for copying
 
 	// applier is the shared write layer used by both the copier (buffered
 	// copy) and the replication client (binlog deltas). Kept on the runner
@@ -109,10 +108,6 @@ type Runner struct {
 	// path's UPDATE, resurrecting the watermark on the latest row — the
 	// row resume reads. It also guards continuousChecker (see above).
 	checkpointMu sync.Mutex
-
-	// Track some key statistics.
-	startTime             time.Time
-	sentinelWaitStartTime time.Time
 
 	// Used by the test-suite and some post-migration output.
 	// Indicates if certain optimizations applied.
@@ -228,7 +223,7 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 func (r *Runner) Run(ctx context.Context) error {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
-	r.startTime = time.Now()
+	r.status.Begin()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting spirit migration",
 		"version", bi.Version,
@@ -395,12 +390,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	// of migrations usually spend time. It is not strictly necessary,
 	// but we always recopy the last-bit, even if we are resuming
 	// partially through the checksum.
-	r.status.Set(status.CopyRows)
-	if err := r.copier.Run(ctx); err != nil {
+	if err := r.status.Do(status.CopyRows, func() error {
+		return r.copier.Run(ctx)
+	}); err != nil {
 		return err
 	}
 	r.logger.Info("copy rows complete")
-	r.copyDuration = time.Since(r.copier.StartTime())
 
 	// Disable both watermark optimizations so that all changes can be flushed.
 	// For non-memory-comparable PKs this also drains the buffered map and
@@ -427,18 +422,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	// that the sentinel table was created manually after the migration
 	// started.
 	if r.migration.RespectSentinel {
-		r.sentinelWaitStartTime = time.Now()
-		r.status.Set(status.WaitingOnSentinelTable)
 		// Block on the sentinel via the shared sentinel.Wait (poll/timeout timing
 		// lives in the sentinel package). The continuous-checksum lifecycle and
 		// watermark invalidation are migration-specific — invalidateChecksumWatermark
 		// scopes its UPDATE by statement because the checkpoint table is shared in
 		// multi-table mode — so they are injected as callbacks. See pkg/sentinel.
-		if err := sentinel.Wait(ctx, sentinel.WaitConfig{
-			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
-			RunChecksum:         r.runContinuousChecksum,
-			InvalidateWatermark: r.invalidateChecksumWatermark,
-			Logger:              r.logger,
+		if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
+			return sentinel.Wait(ctx, sentinel.WaitConfig{
+				Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
+				RunChecksum:         r.runContinuousChecksum,
+				InvalidateWatermark: r.invalidateChecksumWatermark,
+				Logger:              r.logger,
+			})
 		}); err != nil {
 			return err
 		}
@@ -449,29 +444,33 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	// It's time for the final cut-over, where
 	// the tables are swapped under a lock.
-	r.status.Set(status.CutOver)
-	cutoverCfg := []*cutoverConfig{}
-	for _, change := range r.changes {
-		cutoverCfg = append(cutoverCfg, &cutoverConfig{
-			table:          change.table,
-			newTable:       change.newTable,
-			oldTableName:   change.oldTableName(),
-			useTestCutover: r.migration.useTestCutover, // indicates we want the test cutover
-		})
-	}
-	cutover, err := NewCutOver(r.db, cutoverCfg, r.replClient, r.dbConfig, r.logger)
-	if err != nil {
-		return err
-	}
-	// Drop the _old table if it exists. This ensures
-	// that the rename will succeed (although there is a brief race)
-	for _, change := range r.changes {
-		if err := change.dropOldTable(ctx); err != nil {
+	if err := r.status.Do(status.CutOver, func() error {
+		cutoverCfg := []*cutoverConfig{}
+		for _, change := range r.changes {
+			cutoverCfg = append(cutoverCfg, &cutoverConfig{
+				table:          change.table,
+				newTable:       change.newTable,
+				oldTableName:   change.oldTableName(),
+				useTestCutover: r.migration.useTestCutover, // indicates we want the test cutover
+			})
+		}
+		cutover, err := NewCutOver(r.db, cutoverCfg, r.replClient, r.dbConfig, r.logger)
+		if err != nil {
 			return err
 		}
-	}
-	if err := cutover.Run(ctx); err != nil {
-		return fmt.Errorf("cutover failed: %w", err)
+		// Drop the _old table if it exists. This ensures
+		// that the rename will succeed (although there is a brief race)
+		for _, change := range r.changes {
+			if err := change.dropOldTable(ctx); err != nil {
+				return err
+			}
+		}
+		if err := cutover.Run(ctx); err != nil {
+			return fmt.Errorf("cutover failed: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
@@ -496,9 +495,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		"instant-ddl", r.usedInstantDDL,
 		"inplace-ddl", r.usedInplaceDDL,
 		"total-chunks", copiedChunks,
-		"copy-rows-time", r.copyDuration.Round(time.Second).String(),
-		"checksum-time", r.checker.ExecTime().Round(time.Second).String(),
-		"total-time", time.Since(r.startTime).Round(time.Second).String(),
+		"copy-rows-time", r.status.Duration(status.CopyRows).Round(time.Second).String(),
+		"checksum-time", r.status.Duration(status.Checksum).Round(time.Second).String(),
+		"total-time", r.status.TotalElapsed().Round(time.Second).String(),
 		"conns-in-use", r.db.Stats().InUse,
 	)
 	// cleanup all the tables
@@ -521,13 +520,14 @@ func (r *Runner) Run(ctx context.Context) error {
 // perform the initial checksum. When defer-cutover is not in use this
 // is also the last phase before cutover.
 func (r *Runner) postCopyPhase(ctx context.Context) error {
-	r.status.Set(status.ApplyChangeset)
 	// Disable the periodic flush and flush all pending events.
 	// We want it disabled for ANALYZE TABLE and acquiring a table lock
 	// *but* it will be started again briefly inside of the checksum
 	// runner to ensure that the lag does not grow too long.
-	r.replClient.StopPeriodicFlush()
-	if err := r.replClient.Flush(ctx); err != nil {
+	if err := r.status.Do(status.ApplyChangeset, func() error {
+		r.replClient.StopPeriodicFlush()
+		return r.replClient.Flush(ctx)
+	}); err != nil {
 		return err
 	}
 
@@ -535,30 +535,34 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	r.status.Set(status.AnalyzeTable)
-	r.logger.Info("Running ANALYZE TABLE")
-	for _, change := range r.changes {
-		if err := dbconn.Exec(ctx, r.db, "ANALYZE TABLE %n.%n", change.newTable.SchemaName, change.newTable.TableName); err != nil {
-			return err
-		}
+	if err := r.status.Do(status.AnalyzeTable, func() error {
+		r.logger.Info("Running ANALYZE TABLE")
+		for _, change := range r.changes {
+			if err := dbconn.Exec(ctx, r.db, "ANALYZE TABLE %n.%n", change.newTable.SchemaName, change.newTable.TableName); err != nil {
+				return err
+			}
 
-		// Disable the auto-update statistics go routine. This is because the
-		// checksum uses a consistent read and doesn't see any of the new rows in the
-		// table anyway. Chunking in the space where the consistent reads may need
-		// to read a lot of older versions is *much* slower.
-		// In a previous migration:
-		// - The checksum chunks were about 100K rows each
-		// - When the checksum reached the point at which the copier had reached,
-		//   the chunks slowed down to about 30 rows(!)
-		// - The checksum task should have finished in the next 5 minutes, but instead
-		//   the projected time was another 40 hours.
-		// My understanding of MVCC in MySQL is that the consistent read threads may
-		// have had to follow pointers to older versions of rows in UNDO, which is a
-		// linked list to find the specific versions these transactions needed. It
-		// appears that it is likely N^2 complexity, and we are better off to just
-		// have the last chunk of the checksum be slow and do this once rather than
-		// repeatedly chunking in this range.
-		change.table.DisableAutoUpdateStatistics.Store(true)
+			// Disable the auto-update statistics go routine. This is because the
+			// checksum uses a consistent read and doesn't see any of the new rows in the
+			// table anyway. Chunking in the space where the consistent reads may need
+			// to read a lot of older versions is *much* slower.
+			// In a previous migration:
+			// - The checksum chunks were about 100K rows each
+			// - When the checksum reached the point at which the copier had reached,
+			//   the chunks slowed down to about 30 rows(!)
+			// - The checksum task should have finished in the next 5 minutes, but instead
+			//   the projected time was another 40 hours.
+			// My understanding of MVCC in MySQL is that the consistent read threads may
+			// have had to follow pointers to older versions of rows in UNDO, which is a
+			// linked list to find the specific versions these transactions needed. It
+			// appears that it is likely N^2 complexity, and we are better off to just
+			// have the last chunk of the checksum be slow and do this once rather than
+			// repeatedly chunking in this range.
+			change.table.DisableAutoUpdateStatistics.Store(true)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// The checksum is ONLINE after an initial lock
@@ -1669,33 +1673,33 @@ func (r *Runner) initChunkers() error {
 
 // checksum creates the checksum which opens the read view
 func (r *Runner) checksum(ctx context.Context) error {
-	r.status.Set(status.Checksum)
+	if err := r.status.Do(status.Checksum, func() error {
+		// The checksum keeps the pool threads open, so we need to extend
+		// by more than +1 on threads as we did previously. We have:
+		// - background flushing
+		// - checkpoint thread
+		// - checksum "replaceChunk" DB connections
+		// Handle a case just in the tests not having a dbConfig.
+		//
+		// Not restored when checksum completes — by then we are past the copy
+		// phase, so the +1 backpressure between copier and applier no longer
+		// applies, and the only thing left is cutover, which itself wants at
+		// least 5 connections. Pool size grows monotonically; see the
+		// MaxOpenConnections doc in (*Runner).Run.
+		dbconn.SetPoolSize(r.db, r.dbConfig.MaxOpenConnections+2)
 
-	// The checksum keeps the pool threads open, so we need to extend
-	// by more than +1 on threads as we did previously. We have:
-	// - background flushing
-	// - checkpoint thread
-	// - checksum "replaceChunk" DB connections
-	// Handle a case just in the tests not having a dbConfig.
-	//
-	// Not restored when checksum completes — by then we are past the copy
-	// phase, so the +1 backpressure between copier and applier no longer
-	// applies, and the only thing left is cutover, which itself wants at
-	// least 5 connections. Pool size grows monotonically; see the
-	// MaxOpenConnections doc in (*Runner).Run.
-	dbconn.SetPoolSize(r.db, r.dbConfig.MaxOpenConnections+2)
-
-	// Run the checksum with internal retry logic.
-	//
-	// We do not invalidate the checkpoint on a checksum error. The dumper
-	// already refuses to persist a checksum_watermark for any pass that
-	// had to repair a chunk (see DumpCheckpoint), so on resume — whether
-	// the failure here was retry exhaustion, operator cancellation, or
-	// anything else — the persisted row either carries an empty watermark
-	// (forcing full re-verification) or a watermark from a clean pass
-	// (safe to resume from). Either way the silent-cutover hole is
-	// closed without needing to special-case the error path.
-	if err := r.checker.Run(ctx); err != nil {
+		// Run the checksum with internal retry logic.
+		//
+		// We do not invalidate the checkpoint on a checksum error. The dumper
+		// already refuses to persist a checksum_watermark for any pass that
+		// had to repair a chunk (see DumpCheckpoint), so on resume — whether
+		// the failure here was retry exhaustion, operator cancellation, or
+		// anything else — the persisted row either carries an empty watermark
+		// (forcing full re-verification) or a watermark from a clean pass
+		// (safe to resume from). Either way the silent-cutover hole is
+		// closed without needing to special-case the error path.
+		return r.checker.Run(ctx)
+	}); err != nil {
 		if r.addsUniqueIndex() {
 			// Overwrite the error if we think it's because of a unique index addition
 			return errors.New("checksum failed after several attempts. This is likely related to your statement adding a UNIQUE index on non-unique data")
@@ -1706,8 +1710,9 @@ func (r *Runner) checksum(ctx context.Context) error {
 	// A long checksum extends the binlog deltas
 	// So if we've called this optional checksum, we need one more state
 	// of applying the binlog deltas.
-	r.status.Set(status.PostChecksum)
-	return r.replClient.Flush(ctx)
+	return r.status.Do(status.PostChecksum, func() error {
+		return r.replClient.Flush(ctx)
+	})
 }
 
 func (r *Runner) addsUniqueIndex() bool {
@@ -1834,8 +1839,8 @@ func (r *Runner) Status() string {
 			r.status.Get().String(),
 			r.copier.GetProgress(),
 			r.replClient.GetDeltaLen(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.copier.StartTime()).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 			r.copier.GetETA(),
 			r.copier.GetThrottler().IsThrottled(),
 			r.db.Stats().InUse,
@@ -1846,8 +1851,8 @@ func (r *Runner) Status() string {
 			r.status.Get().String(),
 			r.changes[0].table.SchemaName,
 			sentinel.TableName,
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.sentinelWaitStartTime).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 			sentinel.WaitLimit,
 			r.db.Stats().InUse,
 		)
@@ -1857,7 +1862,7 @@ func (r *Runner) Status() string {
 		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s conns-in-use=%d%s",
 			r.status.Get().String(),
 			r.replClient.GetDeltaLen(),
-			time.Since(r.startTime).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
 			r.db.Stats().InUse,
 			applier.StatusSuffix(r.applier),
 		)
@@ -1866,8 +1871,8 @@ func (r *Runner) Status() string {
 			r.status.Get().String(),
 			r.checker.GetProgress().String(),
 			r.replClient.GetDeltaLen(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.checker.StartTime()).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 			r.db.Stats().InUse,
 			// Mirrors copier-is-throttled on the copy line: without it a
 			// checksum that is deliberately paused or scaled down looks

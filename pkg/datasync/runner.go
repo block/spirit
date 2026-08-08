@@ -76,8 +76,7 @@ type Runner struct {
 	// checkpointed position.
 	resuming bool
 
-	status    status.State
-	startTime time.Time
+	status status.Tracker
 
 	logger     *slog.Logger
 	cancelFunc context.CancelFunc
@@ -103,7 +102,7 @@ type Runner struct {
 	fatalOnce sync.Once
 
 	// progMu guards the progress-related fields (copier, copyChunker,
-	// replClient, startTime, cancelFunc) that Run assigns during setup and
+	// replClient, cancelFunc) that Run assigns during setup and
 	// that the status.Task accessors (Progress/Status/DumpCheckpoint/Cancel)
 	// read concurrently from a separate monitoring goroutine.
 	progMu sync.RWMutex
@@ -178,8 +177,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer cancel()
 	r.progMu.Lock()
 	r.cancelFunc = cancel
-	r.startTime = time.Now()
 	r.progMu.Unlock()
+	r.status.Begin()
 	r.logger.Info("Starting sync", "source_dsn", dbconn.RedactDSN(r.sync.SourceDSN))
 
 	r.sourceDBConfig = dbconn.NewDBConfig()
@@ -291,22 +290,26 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	r.status.Set(status.CopyRows)
-	r.logger.Info("Starting copy", "resuming", r.resuming)
-	if err := r.copier.Run(ctx); err != nil {
-		return fmt.Errorf("copy failed: %w", err)
-	}
-	if !r.sync.CopyOnly {
-		if !r.resuming {
-			if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
-				return err
+	if err := r.status.Do(status.CopyRows, func() error {
+		r.logger.Info("Starting copy", "resuming", r.resuming)
+		if err := r.copier.Run(ctx); err != nil {
+			return fmt.Errorf("copy failed: %w", err)
+		}
+		if !r.sync.CopyOnly {
+			if !r.resuming {
+				if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
+					return err
+				}
+			}
+			// Drain the copy-phase backlog so every change observed so far is
+			// applied before steady-state streaming.
+			if err := r.replClient.Flush(ctx); err != nil {
+				return fmt.Errorf("failed to flush after copy: %w", err)
 			}
 		}
-		// Drain the copy-phase backlog so every change observed so far is
-		// applied before steady-state streaming.
-		if err := r.replClient.Flush(ctx); err != nil {
-			return fmt.Errorf("failed to flush after copy: %w", err)
-		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// The initial copy is done. Restore any secondary indexes deferred during
@@ -314,8 +317,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	// the post-copy checksum walks it (copy-only). Always called — it is a
 	// no-op when nothing was deferred and resume-safe; see
 	// restoreSecondaryIndexes.
-	r.status.Set(status.RestoreSecondaryIndexes)
-	if err := r.restoreSecondaryIndexes(ctx); err != nil {
+	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
+		return r.restoreSecondaryIndexes(ctx)
+	}); err != nil {
 		return fmt.Errorf("failed to restore secondary indexes: %w", err)
 	}
 
@@ -331,11 +335,15 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.logger.Warn("post-copy checkpoint write failed", "error", err)
 		}
 		r.logger.Info("Copy complete; entering continuous checksum (CopyOnly mode)")
-		return r.runCopyOnlyChecksum(ctx)
+		return r.status.Do(status.ApplyChangeset, func() error {
+			return r.runCopyOnlyChecksum(ctx)
+		})
 	}
 
 	r.logger.Info("Copy complete; entering continuous sync")
-	return r.runContinuous(ctx)
+	return r.status.Do(status.ApplyChangeset, func() error {
+		return r.runContinuous(ctx)
+	})
 }
 
 // runCopyOnlyChecksum runs the post-copy continuous checksum without a
@@ -346,10 +354,9 @@ func (r *Runner) Run(ctx context.Context) error {
 // final checkpoint.
 //
 // This is structurally a stripped-down runContinuous: same checker
-// lifecycle and shutdown contract, no replClient calls.
+// lifecycle and shutdown contract, no replClient calls. The caller brackets
+// it in the ApplyChangeset state.
 func (r *Runner) runCopyOnlyChecksum(ctx context.Context) error {
-	r.status.Set(status.ApplyChangeset)
-
 	checksumCtx, cancelChecksum := context.WithCancel(ctx)
 	defer cancelChecksum()
 	checksumDone := make(chan struct{})
@@ -390,7 +397,7 @@ func (r *Runner) runCopyOnlyChecksum(ctx context.Context) error {
 	if err := r.dumpCheckpoint(cpCtx); err != nil {
 		r.logger.Warn("Final checkpoint write failed", "error", err)
 	}
-	r.logger.Info("Copy-only sync stopped", "total_time", time.Since(r.startTime).Round(time.Second).String())
+	r.logger.Info("Copy-only sync stopped", "total_time", r.status.TotalElapsed().Round(time.Second).String())
 
 	// A recorded fatal (e.g. a checkpoint-write failure that status.WatchTask
 	// cancelled us for) must surface rather than be masked by the clean
@@ -414,13 +421,12 @@ func (r *Runner) runCopyOnlyChecksum(ctx context.Context) error {
 // backlog and returns nil; on a fatal source event or a checksum failure
 // it returns that error.
 func (r *Runner) runContinuous(ctx context.Context) error {
-	// status moves off CopyRows so the status goroutine logs the continuous
-	// phase. The checkpoint table and the periodic checkpoint loop were already
-	// set up before the copy (checkpointTbl().Create in startFresh/startResume,
-	// the loop in startBackgroundRoutines), so a restart at any point — copy or
+	// The caller brackets this in ApplyChangeset (off CopyRows) so the status
+	// goroutine logs the continuous phase. The checkpoint table and the
+	// periodic checkpoint loop were already set up before the copy
+	// (checkpointTbl().Create in startFresh/startResume, the loop in
+	// startBackgroundRoutines), so a restart at any point — copy or
 	// continuous — resumes from the last checkpoint.
-	r.status.Set(status.ApplyChangeset)
-
 	r.logger.Info("Continuous sync running; will run until cancelled")
 
 	// Spawn the continuous checksum. It uses a separate chunker so
@@ -493,7 +499,7 @@ func (r *Runner) runContinuous(ctx context.Context) error {
 	if err := r.dumpCheckpoint(cpCtx); err != nil {
 		r.logger.Warn("Final checkpoint write failed", "error", err)
 	}
-	r.logger.Info("Sync stopped", "total_time", time.Since(r.startTime).Round(time.Second).String())
+	r.logger.Info("Sync stopped", "total_time", r.status.TotalElapsed().Round(time.Second).String())
 	// A real checksum failure outranks a clean nil — surface it so the
 	// caller (and exit code) reflect the underlying problem rather than
 	// just "ctx cancelled."
@@ -1456,10 +1462,9 @@ func (r *Runner) Status() string {
 	r.progMu.RLock()
 	cp := r.copier
 	repl := r.replClient
-	start := r.startTime
 	r.progMu.RUnlock()
 
-	elapsed := time.Since(start).Round(time.Second)
+	elapsed := r.status.TotalElapsed().Round(time.Second)
 	switch state { //nolint:exhaustive // sync only uses Initial/CopyRows/ApplyChangeset
 	case status.CopyRows:
 		progress, eta := "", ""

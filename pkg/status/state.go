@@ -71,10 +71,12 @@ func (s State) String() string {
 	return "unknown"
 }
 
-func (s *State) Get() State {
+// get is now private, use tracker.Get instead
+func (s *State) get() State {
 	return State(atomic.LoadInt32((*int32)(s)))
 }
 
-func (s *State) Set(newState State) {
+// set is now private, use tracker.Set / tracker.Do instead
+func (s *State) set(newState State) {
 	atomic.StoreInt32((*int32)(s), int32(newState))
 }

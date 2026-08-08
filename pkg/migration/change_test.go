@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -271,7 +270,6 @@ func TestModifyAddAutoIncrementPreservesZeroPK(t *testing.T) {
 
 func TestOldTableNameTruncation(t *testing.T) {
 	t.Parallel()
-	startTime := time.Date(2025, 6, 15, 10, 30, 45, 0, time.UTC)
 
 	tests := []struct {
 		name                 string
@@ -319,16 +317,17 @@ func TestOldTableNameTruncation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			r := &Runner{
+				migration: &Migration{
+					SkipDropAfterCutover: tt.skipDropAfterCutover,
+				},
+			}
+			r.status.Begin() // the run start the timestamped _old name derives from
 			c := &tableChange{
 				table: &table.TableInfo{
 					TableName: tt.tableName,
 				},
-				runner: &Runner{
-					migration: &Migration{
-						SkipDropAfterCutover: tt.skipDropAfterCutover,
-					},
-					startTime: startTime,
-				},
+				runner: r,
 			}
 
 			result := c.oldTableName()
@@ -338,8 +337,8 @@ func TestOldTableNameTruncation(t *testing.T) {
 			require.NotEmpty(t, result, "oldTableName() should not be empty")
 
 			if tt.skipDropAfterCutover {
-				// Should contain the timestamp
-				require.Contains(t, result, "20250615_103045")
+				// Should contain the run-start timestamp
+				require.Contains(t, result, r.status.StartTime().UTC().Format(utils.NameFormatTimestamp))
 				// Should have the expected format prefix and suffix
 				require.True(t, strings.HasPrefix(result, "_"))
 				require.Contains(t, result, "_old_")
@@ -364,16 +363,19 @@ func TestOldTableNameTruncationCollision(t *testing.T) {
 	// for the checkpoint table is provided by the original_table_name column
 	// (see TestResumeRejectsCheckpointFromDifferentTable); the old table is named
 	// only for human archaeology when SkipDropAfterCutover is set.
-	startTime := time.Date(2025, 6, 15, 10, 30, 45, 0, time.UTC)
 	prefix := strings.Repeat("x", 50)
 
+	// One shared runner, as in a real multi-table migration: both names
+	// derive from the same run-start timestamp.
+	r := &Runner{migration: &Migration{SkipDropAfterCutover: true}}
+	r.status.Begin()
 	c1 := &tableChange{
 		table:  &table.TableInfo{TableName: prefix + "_aaaaaaaaaaa"},
-		runner: &Runner{migration: &Migration{SkipDropAfterCutover: true}, startTime: startTime},
+		runner: r,
 	}
 	c2 := &tableChange{
 		table:  &table.TableInfo{TableName: prefix + "_bbbbbbbbbbb"},
-		runner: &Runner{migration: &Migration{SkipDropAfterCutover: true}, startTime: startTime},
+		runner: r,
 	}
 
 	result1 := c1.oldTableName()

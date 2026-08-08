@@ -92,7 +92,7 @@ type Runner struct {
 	move            *Move
 	sources         []sourceInfo     // one per source database
 	targets         []applier.Target // Combined DB, Config, and KeyRange
-	status          status.State     // must use atomic to get/set
+	status          status.Tracker   // owns the current state and per-state timing
 	checkpointTable *table.TableInfo
 
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
@@ -126,8 +126,6 @@ type Runner struct {
 	checkpointMu sync.Mutex
 
 	// Track some key statistics.
-	startTime                time.Time
-	sentinelWaitStartTime    time.Time
 	usedResumeFromCheckpoint bool
 
 	cutoverFunc func(ctx context.Context) error
@@ -981,7 +979,7 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 func (r *Runner) Run(ctx context.Context) error {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
-	r.startTime = time.Now()
+	r.status.Begin()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting table move",
 		"version", bi.Version,
@@ -1009,7 +1007,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	var err error
 	r.dbConfig = dbconn.NewDBConfig()
 	// ForceKill is now true by default in NewDBConfig(), no need to set explicitly.
 	// Buffered copier needs more connections due to parallel read/write workers
@@ -1125,11 +1122,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		// But the caller will still want their cutoverFunc called. So we do that
 		// and then exit.
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
-		r.status.Set(status.CutOver)
-		if r.cutoverFunc != nil {
-			if err := r.cutoverFunc(ctx); err != nil {
-				return err
+		if err := r.status.Do(status.CutOver, func() error {
+			if r.cutoverFunc == nil {
+				return nil
 			}
+			return r.cutoverFunc(ctx)
+		}); err != nil {
+			return err
 		}
 		r.logger.Info("Move operation complete.")
 		return nil
@@ -1172,8 +1171,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	r.status.Set(status.CopyRows)
-	if err := r.copier.Run(ctx); err != nil {
+	if err := r.status.Do(status.CopyRows, func() error {
+		return r.copier.Run(ctx)
+	}); err != nil {
 		return err
 	}
 
@@ -1199,18 +1199,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logger.Info("Initial checksum completed successfully")
 
-	r.sentinelWaitStartTime = time.Now()
-	r.status.Set(status.WaitingOnSentinelTable)
 	// Block on the sentinel via the shared sentinel.Wait (poll/timeout timing
 	// lives in the sentinel package). The continuous-checksum lifecycle and
 	// watermark invalidation are move-specific (multi-source feeds;
 	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
 	// so they are injected as callbacks. See pkg/sentinel.
-	if err := sentinel.Wait(ctx, sentinel.WaitConfig{
-		Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
-		RunChecksum:         r.runContinuousChecksum,
-		InvalidateWatermark: r.invalidateChecksumWatermark,
-		Logger:              r.logger,
+	if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
+		return sentinel.Wait(ctx, sentinel.WaitConfig{
+			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
+			RunChecksum:         r.runContinuousChecksum,
+			InvalidateWatermark: r.invalidateChecksumWatermark,
+			Logger:              r.logger,
+		})
 	}); err != nil {
 		return err
 	}
@@ -1223,32 +1223,33 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logger.Info("Sentinel released, starting cutover")
 	// Create a cutover.
-	r.status.Set(status.CutOver)
-	cutoverSources := make([]CutOverSource, len(r.sources))
-	for i := range r.sources {
-		cutoverSources[i] = CutOverSource{
-			DB:         r.sources[i].db,
-			ReplClient: r.sources[i].replClient,
-			Tables:     r.sources[i].tables,
+	if err := r.status.Do(status.CutOver, func() error {
+		cutoverSources := make([]CutOverSource, len(r.sources))
+		for i := range r.sources {
+			cutoverSources[i] = CutOverSource{
+				DB:         r.sources[i].db,
+				ReplClient: r.sources[i].replClient,
+				Tables:     r.sources[i].tables,
+			}
 		}
-	}
-	cutover, err := NewCutOver(cutoverSources, r.cutoverFunc, r.dbConfig, r.logger)
-	if err != nil {
-		return err
-	}
-	if r.move.ReverseWindow > 0 {
-		// Under the cutover lock, right after the traffic switch, capture the
-		// reverse-feed start positions and record that the move has entered its
-		// reverse window (see captureReverseWindow). The source rename still runs.
-		cutover.SetPostSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
-	}
-	// Pre-cutover: refuse to switch traffic if a revert has been requested (a
-	// marker appeared on targets[0] during the copy). Cutting over only to
-	// immediately roll back is pointless — abort while the source is still live.
-	if err := r.assertNoRevertMarker(ctx, "pre-cutover"); err != nil {
-		return err
-	}
-	if err = cutover.Run(ctx); err != nil {
+		cutover, err := NewCutOver(cutoverSources, r.cutoverFunc, r.dbConfig, r.logger)
+		if err != nil {
+			return err
+		}
+		if r.move.ReverseWindow > 0 {
+			// Under the cutover lock, right after the traffic switch, capture the
+			// reverse-feed start positions and record that the move has entered its
+			// reverse window (see captureReverseWindow). The source rename still runs.
+			cutover.SetPostSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
+		}
+		// Pre-cutover: refuse to switch traffic if a revert has been requested (a
+		// marker appeared on targets[0] during the copy). Cutting over only to
+		// immediately roll back is pointless — abort while the source is still live.
+		if err := r.assertNoRevertMarker(ctx, "pre-cutover"); err != nil {
+			return err
+		}
+		return cutover.Run(ctx)
+	}); err != nil {
 		return err
 	}
 
@@ -1401,8 +1402,8 @@ func (r *Runner) Status() string {
 			r.status.Get().String(),
 			r.copier.GetProgress(),
 			r.getDeltaLenAll(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.copier.StartTime()).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 			r.copier.GetETA(),
 			r.copier.GetThrottler().IsThrottled(),
 			applier.StatusSuffix(r.applier),
@@ -1410,8 +1411,8 @@ func (r *Runner) Status() string {
 	case status.WaitingOnSentinelTable:
 		return fmt.Sprintf("migration status: state=%s total-time=%s sentinel-wait-time=%s sentinel-max-wait-time=%s",
 			r.status.Get().String(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.sentinelWaitStartTime).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 			sentinel.WaitLimit,
 		)
 	case status.ApplyChangeset, status.PostChecksum:
@@ -1420,7 +1421,7 @@ func (r *Runner) Status() string {
 		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s%s",
 			r.status.Get().String(),
 			r.getDeltaLenAll(),
-			time.Since(r.startTime).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
 			applier.StatusSuffix(r.applier),
 		)
 	case status.Checksum:
@@ -1429,13 +1430,13 @@ func (r *Runner) Status() string {
 			r.status.Get().String(),
 			r.checker.GetProgress().String(),
 			r.getDeltaLenAll(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.checker.StartTime()).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 		)
 	case status.RestoreSecondaryIndexes:
 		return fmt.Sprintf("migration status: state=%s total-time=%s",
 			r.status.Get().String(),
-			time.Since(r.startTime).Round(time.Second),
+			r.status.TotalElapsed().Round(time.Second),
 		)
 	default:
 		return ""
@@ -1589,16 +1590,18 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// pkg/change/subscription_buffered.go), unread binlog would pile up
 	// server-side, and a source purging binlogs past the reader's position
 	// during an hours-long index build would fail the move fatally.
-	r.status.Set(status.ApplyChangeset)
-	if err := r.flushAllReplClients(ctx); err != nil {
+	if err := r.status.Do(status.ApplyChangeset, func() error {
+		return r.flushAllReplClients(ctx)
+	}); err != nil {
 		return err
 	}
 
 	// Restore secondary indexes if they were deferred during table creation.
 	// This is always called (not conditional on DeferSecondaryIndexes) to handle
 	// checkpoint resume scenarios where indexes may have been deferred in a previous run.
-	r.status.Set(status.RestoreSecondaryIndexes)
-	if err := r.restoreSecondaryIndexes(ctx); err != nil {
+	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
+		return r.restoreSecondaryIndexes(ctx)
+	}); err != nil {
 		return err
 	}
 
@@ -1606,17 +1609,21 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	r.status.Set(status.AnalyzeTable)
-	r.logger.Info("Running ANALYZE TABLE")
-	for _, target := range r.targets {
-		for _, tbl := range r.sourceTables {
-			// Unqualified on target.DB: the old code qualified with the source
-			// schema, which doesn't exist on a cross-cluster target (and breaks
-			// through a vtgate). See analyzeTable.
-			if err := r.analyzeTable(ctx, target.DB, tbl.TableName); err != nil {
-				return err
+	if err := r.status.Do(status.AnalyzeTable, func() error {
+		r.logger.Info("Running ANALYZE TABLE")
+		for _, target := range r.targets {
+			for _, tbl := range r.sourceTables {
+				// Unqualified on target.DB: the old code qualified with the source
+				// schema, which doesn't exist on a cross-cluster target (and breaks
+				// through a vtgate). See analyzeTable.
+				if err := r.analyzeTable(ctx, target.DB, tbl.TableName); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Now stop the periodic flush: the checksum requires it. The checker
@@ -1666,7 +1673,6 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.status.Set(status.Checksum)
 	// On a checker error we just propagate. The DumpCheckpoint invariant
 	// guarantees that any persisted checksum_watermark describes only
 	// verified-clean chunks, so a resumed run either replays the checksum
@@ -1674,7 +1680,9 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// repair) or resumes safely from a watermark that came from a clean
 	// pass. See pkg/migration/runner.go DumpCheckpoint for the full
 	// rationale.
-	return r.checker.Run(ctx)
+	return r.status.Do(status.Checksum, func() error {
+		return r.checker.Run(ctx)
+	})
 }
 
 // analyzeTable runs ANALYZE TABLE for tableName on db, unqualified: db is
@@ -1740,8 +1748,8 @@ func (r *Runner) Progress() status.Progress {
 		r.logger.Info("migration status",
 			"state", r.status.Get().String(),
 			"sentinel-table", fmt.Sprintf("%s.%s", r.targets[0].Config.DBName, sentinel.TableName),
-			"total-time", time.Since(r.startTime).Round(time.Second).String(),
-			"sentinel-wait-time", time.Since(r.sentinelWaitStartTime).Round(time.Second).String(),
+			"total-time", r.status.TotalElapsed().Round(time.Second).String(),
+			"sentinel-wait-time", r.status.Elapsed().Round(time.Second).String(),
 			"sentinel-max-wait-time", sentinel.WaitLimit.String(),
 		)
 	case status.ApplyChangeset, status.PostChecksum:

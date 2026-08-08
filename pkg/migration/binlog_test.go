@@ -130,7 +130,7 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 
 	// Usually we would call m.Run() but we want to step through
 	// the migration process manually.
-	m.startTime = time.Now()
+	m.status.Begin()
 	m.dbConfig = dbconn.NewDBConfig()
 	var err error
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
@@ -243,7 +243,7 @@ func TestE2EBinlogSubscribingCompositeKeyVarchar(t *testing.T) {
 	}()
 
 	// Setup but don't call Run() - step through manually
-	m.startTime = time.Now()
+	m.status.Begin()
 	m.dbConfig = dbconn.NewDBConfig()
 	var err error
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
@@ -348,7 +348,7 @@ func TestE2EBinlogSubscribingCompositeKeyCollation(t *testing.T) {
 	}()
 
 	// Setup for manual stepping to observe checksum behavior
-	m.startTime = time.Now()
+	m.status.Begin()
 	m.dbConfig = dbconn.NewDBConfig()
 	var err error
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
@@ -498,7 +498,7 @@ func TestE2EBinlogSubscribingCompositeKeyBinary(t *testing.T) {
 	}()
 
 	// Setup for manual stepping to observe watermark behavior
-	m.startTime = time.Now()
+	m.status.Begin()
 	m.dbConfig = dbconn.NewDBConfig()
 	var err error
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
@@ -641,7 +641,7 @@ func TestE2EBinlogSubscribingCompositeKeyDateTime(t *testing.T) {
 	}()
 
 	// Setup but don't call Run() - step through manually
-	m.startTime = time.Now()
+	m.status.Begin()
 	m.dbConfig = dbconn.NewDBConfig()
 	var err error
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
@@ -716,7 +716,7 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 	// Usually we would call m.Run() but we want to step through
 	// the migration process manually.
 	m.dbConfig = dbconn.NewDBConfig()
-	m.startTime = time.Now()
+	m.status.Begin()
 	var err error
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
 	require.NoError(t, err)
@@ -921,7 +921,7 @@ func TestE2EBinlogSubscribingRogueValues(t *testing.T) {
 	// Usually we would call m.Run() but we want to step through
 	// the migration process manually.
 	m.dbConfig = dbconn.NewDBConfig()
-	m.startTime = time.Now()
+	m.status.Begin()
 	var err error
 	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
 	require.NoError(t, err)

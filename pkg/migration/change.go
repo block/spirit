@@ -120,7 +120,7 @@ func (c *tableChange) oldTableName() string {
 	if !c.runner.migration.SkipDropAfterCutover {
 		return utils.OldTableName(c.table.TableName)
 	}
-	timestamp := c.runner.startTime.UTC().Format(utils.NameFormatTimestamp)
+	timestamp := c.runner.status.StartTime().UTC().Format(utils.NameFormatTimestamp)
 	return utils.OldTableNameWithTimestamp(c.table.TableName, timestamp)
 }
 
