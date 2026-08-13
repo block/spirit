@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/block/spirit/pkg/status"
@@ -9,9 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The tests here use a minimal hand-constructed Runner: Progress() in the
-// Initial state reads neither the copier nor the chunkers, so the fields under
-// test can be exercised without a live migration.
+// The tests here use a minimal hand-constructed Runner. Progress() in the
+// Initial state reads neither the copier nor the chunkers, and throttleStatus
+// reads nothing but the throttler, so the fields under test can be exercised
+// without a live migration.
 
 func TestProgressReportsResume(t *testing.T) {
 	// Resume exists so a wrapper can tell a recovering run from one that is
@@ -24,20 +26,20 @@ func TestProgressReportsResume(t *testing.T) {
 	require.True(t, r.Progress().Resume)
 }
 
-func TestProgressReportsThrottleState(t *testing.T) {
+func TestThrottleStatusReportsReasonDuringCopy(t *testing.T) {
 	r := &Runner{}
 
 	// No throttler resolved yet (setup has not reached setupThrottler, or found
 	// nothing to throttle on): not throttled, and no invented load reading.
-	p := r.Progress()
-	require.False(t, p.Throttle.Throttled)
-	require.Empty(t, p.Throttle.Reason)
-	require.Zero(t, p.Throttle.Utilization)
+	ts := r.throttleStatus(status.CopyRows)
+	require.False(t, ts.Throttled)
+	require.Empty(t, ts.Reason)
+	require.Zero(t, ts.Utilization)
 
 	r.setThrottler(&throttler.Mock{})
-	p = r.Progress()
-	require.True(t, p.Throttle.Throttled)
-	require.Equal(t, "mock throttler (always throttled)", p.Throttle.Reason)
+	ts = r.throttleStatus(status.CopyRows)
+	require.True(t, ts.Throttled)
+	require.Equal(t, "mock throttler (always throttled)", ts.Reason)
 }
 
 func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
@@ -55,6 +57,42 @@ func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
 	require.Empty(t, checksumThrottle.Reason)
 }
 
+// TestThrottleStatusIsZeroInUnpacedPhases pins the rule that makes Throttled
+// mean one thing everywhere: only the copy and the checksum pace themselves
+// against a throttler (they are the only SetThrottler callers), so every other
+// phase must report the zero value however loaded the server is.
+//
+// Reporting the composite in these phases would be actively misleading rather
+// than merely imprecise. The sentinel wait is the pointed case — a human is
+// watching that screen to decide when to cut over, and the only work running is
+// the continuous checker, which takes no throttler at all. Worse, the replica
+// throttler fails closed on a stale signal and Close() stops its poll loop
+// without changing IsThrottled, so a *finished* migration would start reporting
+// itself as paused on replica lag once the signal aged out.
+func TestThrottleStatusIsZeroInUnpacedPhases(t *testing.T) {
+	r := &Runner{}
+	r.setThrottler(&throttler.Mock{}) // always throttled
+
+	unpaced := []status.State{
+		status.Initial,
+		status.ApplyChangeset,
+		status.RestoreSecondaryIndexes,
+		status.AnalyzeTable,
+		status.PostChecksum,
+		status.WaitingOnSentinelTable,
+		status.CutOver,
+		status.ReverseWindow,
+		status.Close,
+		status.ErrCleanup,
+	}
+	for _, state := range unpaced {
+		t.Run(state.String(), func(t *testing.T) {
+			require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(state),
+				"nothing paces itself against a throttler in %s, so status must not report it as paused", state)
+		})
+	}
+}
+
 // TestProgressPolledConcurrentlyWithRun covers the seam the new Progress fields
 // opened up: an API caller polls Progress() from its own goroutine while setup is
 // still writing the state those fields report. Under -race this fails if the
@@ -64,7 +102,7 @@ func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
 // WithTestThrottler is what makes the write side real: without any replica DSN
 // and off Aurora, setupThrottler finds nothing to throttle on and never assigns,
 // so there would be no concurrent write to race with. It also lets the test
-// assert a throttled migration reports its reason.
+// assert that a throttled copy reports its reason through the API.
 func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
 	tt := testutils.NewTestTable(t, "progresspoll",
 		`CREATE TABLE progresspoll (
@@ -77,6 +115,9 @@ func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
 
 	m := NewTestRunner(t, "progresspoll", "ENGINE=InnoDB", WithTestThrottler())
 
+	// Recorded off the test goroutine, so assert on them after the join rather
+	// than calling require here (testifylint go-require).
+	var sawThrottledCopy, sawReason atomic.Bool
 	done := make(chan struct{})
 	pollDone := make(chan struct{})
 	go func() {
@@ -86,7 +127,13 @@ func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
 			case <-done:
 				return
 			default:
-				_ = m.Progress()
+				p := m.Progress()
+				if p.CurrentState == status.CopyRows && p.Throttle.Throttled {
+					sawThrottledCopy.Store(true)
+					if p.Throttle.Reason == "mock throttler (always throttled)" {
+						sawReason.Store(true)
+					}
+				}
 				_ = m.Status()
 			}
 		}
@@ -98,10 +145,13 @@ func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
 	require.NoError(t, runErr)
 	require.NoError(t, m.Close())
 
-	// A fresh migration reports no resume, and the always-throttled test
-	// throttler reaches the status API with its reason attached.
+	require.True(t, sawThrottledCopy.Load(),
+		"a copy paced by the always-throttled test throttler must report Throttled through the API")
+	require.True(t, sawReason.Load(), "and must carry the throttler's reason with it")
+
+	// After the run, nothing is being paced: the status API must not describe a
+	// finished migration as paused, however the throttler answers.
 	p := m.Progress()
 	require.False(t, p.Resume)
-	require.True(t, p.Throttle.Throttled)
-	require.Equal(t, "mock throttler (always throttled)", p.Throttle.Reason)
+	require.Equal(t, status.ThrottleStatus{}, p.Throttle)
 }

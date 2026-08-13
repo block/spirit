@@ -66,7 +66,9 @@ This exists for the status API: throttling used to be visible only in the logs, 
 
 `Describe(t)` is the accessor the runners use, folding the two optional extensions and a nil throttler into the three values `status.Progress.Throttle` carries: `throttled`, `reason`, and `utilization`. Note the asymmetry: `reason` is only read while throttling, whereas `utilization` is always read — a load reading below the throttle point is exactly what makes "running at 40% of the limit" reportable before anything pauses.
 
-Implementations of `ThrottleReason` must not disturb the signal they report on. It is called from status polling, so — unlike the throttle path — it must not consume the warn-once staleness logging (`Replica.ThrottleReason` uses `gapExceeds` rather than `check` for this reason).
+Implementations of `ThrottleReason` must not disturb the signal they report on: asking for a reason should never change what the throttle path will log. `Replica.ThrottleReason` uses `gapExceeds` rather than `check` for this reason, so it cannot consume the warn-once staleness logging.
+
+Note this is a requirement on the *method*, not a claim about the status path: `Describe` calls `IsThrottled` first to get the field it reports, so a status poll can still be what logs that stale-signal warning. The `CompareAndSwap` behind it means the warning is still logged exactly once per stale period — only the attribution moves.
 
 ## Implementations
 

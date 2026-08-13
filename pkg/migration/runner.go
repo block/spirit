@@ -1433,19 +1433,35 @@ func (r *Runner) Progress() status.Progress {
 	}
 }
 
-// throttleStatus reports how the phase named by state is currently being paced.
+// throttleStatus reports how the phase named by state is currently being paced,
+// reading only the signals that phase actually honours so that Throttled means
+// the same thing in every phase: this phase is paused right now.
 //
-// The signals reported are the ones that phase actually honours, so that status
-// never blames a pause on a signal the running phase is ignoring: the copier
-// honours the whole composite, while the checksum narrows it to the load signals
-// exactly as checksum's loadOnlyThrottler does (a read-only snapshot pass cannot
-// cause replica lag, so it does not pause on it). Phases that are not paced at
-// all report the composite, which is then read as "the server is asking spirit
-// to back off" rather than "this phase is paused".
+// Only two phases pace themselves against a throttler — they are the only
+// callers of SetThrottler:
+//
+//   - CopyRows: the copier writes, so it honours every signal in the composite.
+//   - Checksum: narrowed to the load signals, exactly as checksum's
+//     loadOnlyThrottler does (a read-only snapshot pass cannot cause replica
+//     lag, so pausing it on lag would only hold the snapshot open for longer).
+//
+// Every other phase reports the zero value, because nothing there consults a
+// throttler: the sentinel wait runs the continuous checker, which takes no
+// throttler at all, and the changeset applies and cutover are not paced. Those
+// phases previously reported the composite, which made Throttled mean "the
+// server is loaded" there and "this phase is paused" in the two above — and
+// since the replica throttler fails closed on a stale signal and Close() stops
+// its poll loop without changing IsThrottled, a *finished* migration would
+// start reporting itself as paused on replica lag once the signal aged out.
 func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
-	t := r.currentThrottler()
-	if state == status.Checksum {
-		t = throttler.GradualOnly(t)
+	var t throttler.Throttler
+	switch state { //nolint:exhaustive // only the two paced phases report throttling
+	case status.CopyRows:
+		t = r.currentThrottler()
+	case status.Checksum:
+		t = throttler.GradualOnly(r.currentThrottler())
+	default:
+		return status.ThrottleStatus{}
 	}
 	throttled, reason, utilization := throttler.Describe(t)
 	return status.ThrottleStatus{

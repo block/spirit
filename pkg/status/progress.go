@@ -44,6 +44,11 @@ type ETA struct {
 type ThrottleStatus struct {
 	// Throttled is true while a throttler is telling the current phase to
 	// pause. This is the field to branch on.
+	//
+	// It is false in phases that do not pace themselves against a throttler at
+	// all — which is every phase except the row copy and the checksum. A loaded
+	// server is not reported as pausing a cutover or a sentinel wait, because
+	// nothing there is reading that signal.
 	Throttled bool
 
 	// Reason names the signal and the comparison that tripped it, in the form
@@ -55,6 +60,13 @@ type ThrottleStatus struct {
 	// It is intended for display, not for branching: it is "" when Throttled is
 	// false, and may also be "" when the configured throttler cannot explain
 	// itself (see throttler.ReasonedThrottler).
+	//
+	// It is also sampled independently of Throttled rather than atomically with
+	// it, so on a signal that is changing underneath the poll the two can
+	// disagree: a throttler that clears in between yields Throttled with an
+	// empty Reason, and a reason can quote a comparison that has just stopped
+	// holding. Both are display-level staleness on a value that is a snapshot
+	// anyway — not a bug to report.
 	Reason string
 
 	// Utilization is load relative to the point at which throttling begins:
