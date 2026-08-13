@@ -63,12 +63,12 @@ Alongside the summary it carries structured fields for the things a wrapper woul
 | --- | --- |
 | `Throttled` | The phase is paused right now. **Branch on this.** |
 | `Reason` | Display string naming the signal and comparison, e.g. `commit-latency 128ms >= 100ms`. Multiple concurrent signals are joined with `"; "`. May be `""` even while throttled (see below). |
-| `Utilization` | Load relative to the throttle point: 0 = idle, 1.0 = at the point throttling begins, >1.0 = over. |
+| `Utilization` | Load relative to the throttle point: `1.0` = at the point throttling begins, `>1.0` = over, lower = further below. **`0` does not mean idle** — see below. |
 
 Two traps for consumers:
 
 - `Reason` is for display, not for branching. It is empty when the configured throttler cannot explain itself (see [`ReasonedThrottler`](../throttler/README.md#reasonedthrottler-optional-extension)).
-- `Utilization` is `0` when no *continuous* load signal exists — notably when throttling is replica-lag-only, which is a budget rather than a load gauge. Treat `0` as "unknown", not "idle".
+- `Utilization` is also `0` when no *continuous* load signal exists — notably when throttling is replica-lag-only, which is a budget rather than a load gauge. So a copy paused on replica lag reports `Throttled` with `Utilization` `0`: treat `0` as "unknown" and hide the gauge, rather than drawing an idle server.
 
 Which signals count depends on the phase, and the runner narrows the report to the ones that phase actually honours: the copy honours all of them, while a checksum honours only load signals (a read-only snapshot pass cannot cause replica lag, so pausing it on lag would only hold the snapshot open for longer). A `move` reports no throttling at all — it copies through a `Noop` throttler for now.
 

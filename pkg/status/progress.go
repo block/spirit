@@ -58,13 +58,16 @@ type ThrottleStatus struct {
 	Reason string
 
 	// Utilization is load relative to the point at which throttling begins:
-	// 0 = idle, 1.0 = exactly at the throttle point, >1.0 = over. It lets a
-	// wrapper show "running at 40% of the load limit" rather than only a
-	// long ETA.
+	// 1.0 is exactly at that point, >1.0 is over it, and lower values are
+	// further below it. It lets a wrapper show "running at 40% of the load
+	// limit" rather than only a long ETA.
 	//
-	// It is 0 when no continuous load signal is available — notably when
+	// 0 is ambiguous and must not be rendered as idle. It is also what this
+	// field reports when no continuous load signal exists at all — notably when
 	// throttling is replica-lag-only, which is a budget rather than a load gauge
-	// (see throttler.GradualThrottler) — so treat 0 as "unknown", not "idle".
+	// (see throttler.GradualThrottler). A copy paused on replica lag therefore
+	// reports Throttled with Utilization 0, so a wrapper drawing a load gauge
+	// should treat 0 as "unknown" and hide it rather than show an idle server.
 	Utilization float64
 }
 

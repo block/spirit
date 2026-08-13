@@ -106,10 +106,11 @@ func TestReplicaThrottleReasonWhenLagUnobservable(t *testing.T) {
 }
 
 func TestReplicaThrottleReasonHasNoStaleWarnSideEffect(t *testing.T) {
-	// ThrottleReason is called from status polling, which must not consume the
-	// warn-once that the throttle path wants to log. If it called IsThrottled
-	// (and hence stale.check) the subsequent IsThrottled would find warned
-	// already set and stay silent.
+	// Asking for a reason must not consume the warn-once that IsThrottled logs
+	// on entering a stale period: if ThrottleReason called IsThrottled (and hence
+	// stale.check), the next IsThrottled would find warned already set and stay
+	// silent. This pins the method as pure — the status path as a whole is not,
+	// since Describe calls IsThrottled to get the field it reports.
 	l := newTestReplica(t, 120*time.Second)
 	l.applyLag(5)
 	ageLastSample(&l.stale, staleSignalThreshold+time.Second)

@@ -123,9 +123,11 @@ func (l *Replica) IsThrottled() bool {
 // tripped, or — for the fail-closed stale case, which has no trustworthy lag
 // number to quote — how long lag has been unobservable.
 //
-// It deliberately re-derives staleness with gapExceeds rather than calling
-// IsThrottled: check() carries the warn-once side effect, and a status poll
-// should not be what consumes the one warning the throttle path wants to log.
+// It is itself side-effect-free: it re-derives staleness with gapExceeds rather
+// than check(), so asking for a reason never consumes the warn-once that
+// IsThrottled logs on entering a stale period. Note this makes the *method*
+// pure, not the status path — Describe calls IsThrottled first, so a status poll
+// can still be what logs that warning.
 func (l *Replica) ThrottleReason() string {
 	if l.stale.gapExceeds(staleSignalThreshold) {
 		return "replica-lag unobservable for " + l.stale.age().Round(time.Second).String() + " (failing closed)"
