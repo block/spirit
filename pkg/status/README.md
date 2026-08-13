@@ -47,6 +47,31 @@ The checkpoint dumper also handles a race condition where the state transitions 
 
 `Progress` is a struct (not just a string) containing the current state and a summary. It is designed as a struct specifically to allow future expansion for GUI wrappers and external tooling.
 
+Alongside the summary it carries structured fields for the things a wrapper would otherwise have to parse out of prose or scrape from the logs: `ETA`, per-table `Tables` progress, `Checksum` progress, and — from [#844](https://github.com/block/spirit/issues/844) — `Resume` and `Throttle`.
+
+### `Resume`
+
+`Resume` is true when the run resumed from a checkpoint left by an earlier run. A resumed run walks the whole state machine again (`CopyRows`, `Checksum`, ...) even when those phases are near-instant, so a wrapper watching only `CurrentState` sees what looks like a migration starting over — confusing when the previous pod died while waiting on the sentinel table.
+
+`CurrentState` is deliberately **not** overloaded with a synthetic "recovering" value: callers parse it for phase display, so a new state would be a breaking change. Pair `Resume` with the progress fields instead — a resumed run whose copy and checksum progress are both near-complete is one to render as "recovering" rather than "starting".
+
+### `Throttle`
+
+`Throttle` reports whether the current phase is paused by a throttler, and why:
+
+| Field | Meaning |
+| --- | --- |
+| `Throttled` | The phase is paused right now. **Branch on this.** |
+| `Reason` | Display string naming the signal and comparison, e.g. `commit-latency 128ms >= 100ms`. Multiple concurrent signals are joined with `"; "`. May be `""` even while throttled (see below). |
+| `Utilization` | Load relative to the throttle point: 0 = idle, 1.0 = at the point throttling begins, >1.0 = over. |
+
+Two traps for consumers:
+
+- `Reason` is for display, not for branching. It is empty when the configured throttler cannot explain itself (see [`ReasonedThrottler`](../throttler/README.md#reasonedthrottler-optional-extension)).
+- `Utilization` is `0` when no *continuous* load signal exists — notably when throttling is replica-lag-only, which is a budget rather than a load gauge. Treat `0` as "unknown", not "idle".
+
+Which signals count depends on the phase, and the runner narrows the report to the ones that phase actually honours: the copy honours all of them, while a checksum honours only load signals (a read-only snapshot pass cannot cause replica lag, so pausing it on lag would only hold the snapshot open for longer). A `move` reports no throttling at all — it copies through a `Noop` throttler for now.
+
 ## See Also
 
 - [pkg/migration](../migration/README.md) - Migration runner that implements the `Task` interface

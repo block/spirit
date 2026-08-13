@@ -55,6 +55,7 @@ type gradualSubset struct {
 }
 
 var _ GradualThrottler = &gradualSubset{}
+var _ ReasonedThrottler = &gradualSubset{}
 
 // Open is a no-op: the composite this view was derived from owns the children.
 func (g *gradualSubset) Open(_ context.Context) error { return nil }
@@ -70,6 +71,11 @@ func (g *gradualSubset) UpdateLag(_ context.Context) error { return nil }
 func (g *gradualSubset) IsThrottled() bool { return g.inner.IsThrottled() }
 
 func (g *gradualSubset) BlockWait(ctx context.Context) { g.inner.BlockWait(ctx) }
+
+// ThrottleReason names only the retained children, so a consumer of this view
+// (the checksum's status) is never told it is paused on a signal this view
+// dropped.
+func (g *gradualSubset) ThrottleReason() string { return g.inner.ThrottleReason() }
 
 // Utilization is the maximum across the retained children, matching
 // gradualMultiThrottler. Every child here is gradual, so nothing is skipped.

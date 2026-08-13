@@ -49,6 +49,25 @@ The copier's write-thread autoscaler type-asserts for this and only engages when
 
 The distinction also decides *who is allowed to pause whom*. `GradualOnly(t)` returns a view of a composite that keeps only its gradual children, for consumers that cannot cause what a binary throttler protects: the checksum reads inside a `REPEATABLE READ` snapshot and emits no binlog events, so pausing it on replica lag cannot reduce that lag, while the pause holds the snapshot open and retains undo. The view is read-only — its `Open`, `Close` and `UpdateLag` are no-ops, because the composite it came from is still what gets opened, polled and closed.
 
+### `ReasonedThrottler` (optional extension)
+
+Throttlers that can explain *why* they are throttling implement `ReasonedThrottler` ([#844](https://github.com/block/spirit/issues/844)):
+
+```go
+type ReasonedThrottler interface {
+    Throttler
+    // ThrottleReason names the signal and the comparison that tripped it,
+    // e.g. "commit-latency 128ms >= 100ms". "" when not throttling.
+    ThrottleReason() string
+}
+```
+
+This exists for the status API: throttling used to be visible only in the logs, so a wrapper polling `status.Progress` saw a migration that had gone quiet with no way to say why. Every throttler in this package implements it, and the composite names *every* currently-throttling child (joined with `"; "`) because clearing only one of them will not resume the copy. It is optional, so a custom throttler that omits it still works — it just reports being throttled without a reason.
+
+`Describe(t)` is the accessor the runners use, folding the two optional extensions and a nil throttler into the three values `status.Progress.Throttle` carries: `throttled`, `reason`, and `utilization`. Note the asymmetry: `reason` is only read while throttling, whereas `utilization` is always read — a load reading below the throttle point is exactly what makes "running at 40% of the limit" reportable before anything pauses.
+
+Implementations of `ThrottleReason` must not disturb the signal they report on. It is called from status polling, so — unlike the throttle path — it must not consume the warn-once staleness logging (`Replica.ThrottleReason` uses `gapExceeds` rather than `check` for this reason).
+
 ## Implementations
 
 ### Noop Throttler
@@ -130,6 +149,7 @@ To implement a custom throttler (e.g., for Freno integration):
 3. Update throttling state based on your metrics
 4. Return the current state in `IsThrottled()`
 5. Block appropriately in `BlockWait()` with context support
+6. Optionally implement `ThrottleReason()` so the status API can explain your pauses to a GUI
 
 Example structure:
 

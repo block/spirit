@@ -521,7 +521,7 @@ func TestMoveResumeDeletesRecopyRange(t *testing.T) {
 	defer closeTestRunner(t, r)
 	require.NoError(t, r.setupDiscovery(ctx))
 	require.NoError(t, r.setupUnderLocks(ctx))
-	require.True(t, r.usedResumeFromCheckpoint)
+	require.True(t, r.usedResumeFromCheckpoint.Load())
 
 	// The target must hold no rows at/above the copier's resume position:
 	// both markers AND the previously-copied rows in [lower, srcMaxID] are
@@ -993,7 +993,11 @@ func TestResumeFromCheckpointMultiTableE2E(t *testing.T) {
 	r, err := NewRunner(move)
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
-	require.True(t, r.usedResumeFromCheckpoint, "the move must resume from the checkpoint, not start over")
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
+	// The same fact must reach API callers, who cannot infer recovery from
+	// CurrentState — a resumed run walks the same states as a fresh one
+	// (issue #844).
+	require.True(t, r.Progress().Resume)
 	require.NoError(t, r.Close())
 
 	// After cutover the source tables are renamed *_old. The target must
@@ -1058,7 +1062,7 @@ func TestResumeFromCheckpointCompositePKE2E(t *testing.T) {
 	r, err := NewRunner(move)
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
-	require.True(t, r.usedResumeFromCheckpoint, "the move must resume from the checkpoint, not start over")
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
 	require.NoError(t, r.Close())
 
 	db, err := sql.Open("mysql", targetDSN)
@@ -1143,7 +1147,7 @@ func TestMultiSourceResumeFromCheckpointE2E(t *testing.T) {
 	r, err := NewRunner(move)
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
-	require.True(t, r.usedResumeFromCheckpoint, "the move must resume from the checkpoint, not start over")
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
 	require.NoError(t, r.Close())
 
 	// After cutover the source tables are renamed users_old on each source.
@@ -1247,7 +1251,7 @@ func TestMultiSourceResumeDiscardsChecksumWatermark(t *testing.T) {
 	r, err := NewRunner(move)
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
-	require.True(t, r.usedResumeFromCheckpoint, "the move must resume from the checkpoint, not start over")
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
 	require.Empty(t, r.checksumWatermark,
 		"a multi-source resume must discard the persisted checksum watermark and run a full checksum pass")
 	require.NoError(t, r.Close())
@@ -1310,7 +1314,7 @@ func TestSingleSourceResumeKeepsChecksumWatermark(t *testing.T) {
 	r, err := NewRunner(move)
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
-	require.True(t, r.usedResumeFromCheckpoint, "the move must resume from the checkpoint, not start over")
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
 	require.Equal(t, craftedChecksumWM, r.checksumWatermark,
 		"a single-source resume must preserve the persisted checksum watermark (resume-at-watermark optimization)")
 	require.NoError(t, r.Close())
@@ -1565,7 +1569,7 @@ func TestResumeFromCheckpointTooOld(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, status.ErrCheckpointTooOld)
 	require.ErrorContains(t, err, "wipe the target tables")
-	require.False(t, r.usedResumeFromCheckpoint)
+	require.False(t, r.usedResumeFromCheckpoint.Load())
 	require.NoError(t, r.Close())
 }
 
@@ -1605,7 +1609,7 @@ func TestResumeFromCheckpointNotTooOld(t *testing.T) {
 	r, err := NewRunner(move)
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
-	require.True(t, r.usedResumeFromCheckpoint, "a fresh checkpoint must still resume")
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "a fresh checkpoint must still resume")
 	require.NoError(t, r.Close())
 }
 

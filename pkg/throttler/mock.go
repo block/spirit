@@ -15,7 +15,7 @@ type Mock struct {
 	blockDuration time.Duration
 }
 
-var _ Throttler = &Mock{}
+var _ ReasonedThrottler = &Mock{}
 
 func (t *Mock) blockFor() time.Duration {
 	if t.blockDuration == 0 {
@@ -34,6 +34,12 @@ func (t *Mock) Close() error {
 
 func (t *Mock) IsThrottled() bool {
 	return true
+}
+
+// ThrottleReason implements ReasonedThrottler so that tests wiring the mock
+// (--test-throttler) exercise the same status plumbing production does.
+func (t *Mock) ThrottleReason() string {
+	return "mock throttler (always throttled)"
 }
 
 func (t *Mock) BlockWait(ctx context.Context) {

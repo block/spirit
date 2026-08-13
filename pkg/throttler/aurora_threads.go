@@ -275,6 +275,7 @@ type AuroraThreads struct {
 }
 
 var _ GradualThrottler = (*AuroraThreads)(nil)
+var _ ReasonedThrottler = (*AuroraThreads)(nil)
 
 // newAuroraThreadsThrottler returns a throttler that polls the given mode's
 // signal and throttles when it exceeds the instance vCPU count (plus the mode's
@@ -336,6 +337,17 @@ func (a *AuroraThreads) Close() error {
 
 func (a *AuroraThreads) IsThrottled() bool {
 	return a.isThrottled.Load()
+}
+
+// ThrottleReason implements ReasonedThrottler. It quotes the raw sample against
+// the hard-stop threshold — the comparison applySample actually throttles on —
+// not the EWMA that Utilization reports, and names the mode so the reason says
+// which signal was read ("redo-aware 24 > 17", "threads-running 24 > 20").
+func (a *AuroraThreads) ThrottleReason() string {
+	if !a.isThrottled.Load() {
+		return ""
+	}
+	return fmt.Sprintf("%s %d > %d", a.mode.label, a.lastSample.Load(), a.throttleThreshold())
 }
 
 // Utilization reports the smoothed (EWMA) thread count as a fraction of the

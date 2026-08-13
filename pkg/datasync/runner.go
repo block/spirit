@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
@@ -73,8 +74,10 @@ type Runner struct {
 
 	// resuming is set when a checkpoint was found on the target: the
 	// initial copy is skipped and the change feed is opened from the
-	// checkpointed position.
-	resuming bool
+	// checkpointed position. It is atomic because it is also reported to API
+	// callers as Progress().Resume, which they poll from their own goroutine
+	// while setup is still writing it.
+	resuming atomic.Bool
 
 	status status.Tracker
 
@@ -269,7 +272,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// — and finishes immediately if the copy had already completed. The applier
 	// copies with INSERT IGNORE, so re-copying the chunks straddling the
 	// watermark is idempotent.
-	if !r.sync.CopyOnly && !r.resuming {
+	if !r.sync.CopyOnly && !r.resuming.Load() {
 		// Watermark optimization ON during a fresh continuous copy: change
 		// events for keys the copier has not reached yet (above the watermark)
 		// are discarded, because the copier will copy those rows directly.
@@ -299,12 +302,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 	if err := r.status.Do(status.CopyRows, func() error {
-		r.logger.Info("Starting copy", "resuming", r.resuming)
+		r.logger.Info("Starting copy", "resuming", r.resuming.Load())
 		if err := r.copier.Run(ctx); err != nil {
 			return fmt.Errorf("copy failed: %w", err)
 		}
 		if !r.sync.CopyOnly {
-			if !r.resuming {
+			if !r.resuming.Load() {
 				if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
 					return err
 				}
@@ -726,7 +729,7 @@ func (r *Runner) setup(ctx context.Context) error {
 		return err
 	}
 	if hasCheckpoint {
-		r.resuming = true
+		r.resuming.Store(true)
 		r.logger.Info("Found checkpoint on target; resuming", "position", pos)
 		return r.startResume(ctx, watermark, pos)
 	}
@@ -1459,7 +1462,14 @@ func (r *Runner) Progress() status.Progress {
 		})
 	}
 
-	return status.Progress{CurrentState: state, Summary: summary, Tables: tables}
+	return status.Progress{
+		CurrentState: state,
+		Summary:      summary,
+		Resume:       r.resuming.Load(),
+		Tables:       tables,
+		// Throttle is deliberately left zero: a sync copies through a Noop
+		// throttler, so there is nothing to report yet.
+	}
 }
 
 // Status returns a one-line, human-readable status for logging. It does not

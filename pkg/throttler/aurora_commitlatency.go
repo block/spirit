@@ -92,6 +92,7 @@ type CommitLatency struct {
 }
 
 var _ GradualThrottler = (*CommitLatency)(nil)
+var _ ReasonedThrottler = (*CommitLatency)(nil)
 
 // NewCommitLatencyThrottler returns a Throttler that polls Aurora's commit
 // counters and throttles when window-averaged commit latency >= threshold.
@@ -149,6 +150,21 @@ func (c *CommitLatency) Close() error {
 
 func (c *CommitLatency) IsThrottled() bool {
 	return c.isThrottled.Load()
+}
+
+// ThrottleReason implements ReasonedThrottler, quoting the window-averaged
+// commit latency against the configured threshold — the same comparison
+// applySample throttles on.
+//
+// Unlike Utilization it does not consult the stale guard: the hard-stop this
+// reason explains is itself unaffected by staleness (see stale.go), so reporting
+// a stale-signal caveat here would describe a state IsThrottled is not in.
+func (c *CommitLatency) ThrottleReason() string {
+	if !c.isThrottled.Load() {
+		return ""
+	}
+	avg := time.Duration(c.avgLatencyUs.Load()) * time.Microsecond
+	return fmt.Sprintf("commit-latency %s >= %s", avg.Round(time.Microsecond), c.threshold)
 }
 
 // Utilization reports the most recent window-averaged commit latency as a

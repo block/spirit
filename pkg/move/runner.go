@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
@@ -125,8 +126,10 @@ type Runner struct {
 	// row resume reads. It also guards continuousChecker (see above).
 	checkpointMu sync.Mutex
 
-	// Track some key statistics.
-	usedResumeFromCheckpoint bool
+	// Track some key statistics. usedResumeFromCheckpoint is atomic because it
+	// is also reported to API callers as Progress().Resume, which they poll from
+	// their own goroutine while setup is still writing it.
+	usedResumeFromCheckpoint atomic.Bool
 
 	cutoverFunc func(ctx context.Context) error
 	// reverseCutoverFunc is the reverse-window rollback's traffic switch (route
@@ -535,7 +538,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	r.checkpointTable = table.NewTableInfo(tgt0.DB, tgt0.Config.DBName, checkpointTableName)
-	r.usedResumeFromCheckpoint = true
+	r.usedResumeFromCheckpoint.Store(true)
 	return nil
 }
 
@@ -1762,6 +1765,10 @@ func (r *Runner) Progress() status.Progress {
 	return status.Progress{
 		CurrentState: r.status.Get(),
 		Summary:      summary,
+		Resume:       r.usedResumeFromCheckpoint.Load(),
+		// Throttle is deliberately left zero: a move always copies through a
+		// Noop throttler, so there is nothing to report yet. Populate it here
+		// when move learns to throttle (issue #831).
 	}
 }
 

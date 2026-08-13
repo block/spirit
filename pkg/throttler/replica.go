@@ -63,7 +63,7 @@ const MySQL8LagQuery = `WITH applier_latency AS (
    SELECT IFNULL(IF(queue_status='IDLE',0,CEIL(GREATEST(applier_latency_ms, queue_latency_ms))),0) as lagMs FROM applier_latency, queue_latency
 `
 
-var _ Throttler = &Replica{}
+var _ ReasonedThrottler = &Replica{}
 
 // Open starts the lag monitor. This is not gh-ost. The lag monitor is primitive
 // because the requirement is only for DR, and not for up-to-date read-replicas.
@@ -117,6 +117,24 @@ func (l *Replica) IsThrottled() bool {
 		return true
 	}
 	return l.currentLagInMs.Load() >= l.lagTolerance.Milliseconds()
+}
+
+// ThrottleReason implements ReasonedThrottler. It names the lag comparison that
+// tripped, or — for the fail-closed stale case, which has no trustworthy lag
+// number to quote — how long lag has been unobservable.
+//
+// It deliberately re-derives staleness with gapExceeds rather than calling
+// IsThrottled: check() carries the warn-once side effect, and a status poll
+// should not be what consumes the one warning the throttle path wants to log.
+func (l *Replica) ThrottleReason() string {
+	if l.stale.gapExceeds(staleSignalThreshold) {
+		return "replica-lag unobservable for " + l.stale.age().Round(time.Second).String() + " (failing closed)"
+	}
+	lagMs := l.currentLagInMs.Load()
+	if lagMs < l.lagTolerance.Milliseconds() {
+		return ""
+	}
+	return fmt.Sprintf("replica-lag %dms >= %dms", lagMs, l.lagTolerance.Milliseconds())
 }
 
 // Replica deliberately does NOT implement GradualThrottler: replication lag

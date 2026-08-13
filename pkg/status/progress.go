@@ -37,9 +37,59 @@ type ETA struct {
 	Duration time.Duration
 }
 
+// ThrottleStatus reports whether the current phase is paused by a throttler,
+// and why. Before this, throttling was only visible in the logs, so a wrapper
+// polling status saw a migration that had gone quiet with no way to say why
+// (issue #844).
+type ThrottleStatus struct {
+	// Throttled is true while a throttler is telling the current phase to
+	// pause. This is the field to branch on.
+	Throttled bool
+
+	// Reason names the signal and the comparison that tripped it, in the form
+	// "<signal> <observed> <op> <threshold>" — e.g. "commit-latency 128ms >= 100ms"
+	// or "redo-aware 24 > 17". When several signals throttle at once they are
+	// joined with "; ", because clearing only one of them will not resume the
+	// copy.
+	//
+	// It is intended for display, not for branching: it is "" when Throttled is
+	// false, and may also be "" when the configured throttler cannot explain
+	// itself (see throttler.ReasonedThrottler).
+	Reason string
+
+	// Utilization is load relative to the point at which throttling begins:
+	// 0 = idle, 1.0 = exactly at the throttle point, >1.0 = over. It lets a
+	// wrapper show "running at 40% of the load limit" rather than only a
+	// long ETA.
+	//
+	// It is 0 when no continuous load signal is available — notably when
+	// throttling is replica-lag-only, which is a budget rather than a load gauge
+	// (see throttler.GradualThrottler) — so treat 0 as "unknown", not "idle".
+	Utilization float64
+}
+
 type Progress struct {
 	CurrentState State  // current state, i.e. CopyRows
 	Summary      string // text based representation, i.e. "12.5% copyRows ETA 1h 30m"
+
+	// Resume is true when this run resumed from a checkpoint left by an earlier
+	// run, rather than starting the copy from scratch.
+	//
+	// It exists because a resumed run walks the whole state machine again
+	// (CopyRows, Checksum, ...) even when those phases are near-instant, so a
+	// wrapper watching CurrentState sees what looks like a migration starting
+	// over. CurrentState is deliberately left alone — callers parse it for phase
+	// display — and this reports the fact alongside it: pair it with
+	// Tables/Checksum progress to decide whether to render the run as
+	// "recovering" rather than "starting".
+	Resume bool
+
+	// Throttle reports whether the current phase is paused by a throttler, and
+	// why. Which signals count depends on the phase: the copy honours all of
+	// them, while a checksum only honours load signals (a read-only snapshot
+	// pass cannot cause replica lag, so pausing it on lag would only hold the
+	// snapshot open for longer).
+	Throttle ThrottleStatus
 
 	// ETA is the structured remaining row-copy estimate and its availability.
 	ETA ETA

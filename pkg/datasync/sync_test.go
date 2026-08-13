@@ -448,6 +448,10 @@ func TestSyncResume(t *testing.T) {
 	r2, err := NewRunner(newSync())
 	require.NoError(t, err)
 	require.NoError(t, runUntilCopied(t, r2))
+	// The resume must also be visible to API callers, who cannot infer it from
+	// CurrentState — a resumed run walks the same states as a fresh one
+	// (issue #844).
+	require.True(t, r2.Progress().Resume)
 	require.NoError(t, r2.Close())
 
 	require.Equal(t, 3, countRows("t1"), "resume must not duplicate or drop rows")

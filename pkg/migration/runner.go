@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -76,6 +77,11 @@ type Runner struct {
 	replClient change.Source  // feed contains all binlog subscription activity.
 	throttler  throttler.Throttler
 
+	// throttlerMu guards throttler. setupThrottler assigns it partway through
+	// setup, while an API caller may already be polling Progress() — which reads
+	// the throttler to report whether the migration is currently paused.
+	throttlerMu sync.RWMutex
+
 	copier      copier.Copier
 	copyChunker table.Chunker // the chunker for copying
 
@@ -111,9 +117,12 @@ type Runner struct {
 
 	// Used by the test-suite and some post-migration output.
 	// Indicates if certain optimizations applied.
-	usedInstantDDL           bool
-	usedInplaceDDL           bool
-	usedResumeFromCheckpoint bool
+	usedInstantDDL bool
+	usedInplaceDDL bool
+	// usedResumeFromCheckpoint is atomic because it is also reported to API
+	// callers as Progress().Resume, which they poll from their own goroutine
+	// while setup is still writing it.
+	usedResumeFromCheckpoint atomic.Bool
 
 	// Attached logger
 	logger     *slog.Logger
@@ -1045,6 +1054,23 @@ func (r *Runner) closeReplicas() error {
 	return errors.Join(errs...)
 }
 
+// setThrottler publishes the resolved throttler. It is written once during
+// setup, but Progress() may be reading it concurrently — see throttlerMu.
+func (r *Runner) setThrottler(t throttler.Throttler) {
+	r.throttlerMu.Lock()
+	defer r.throttlerMu.Unlock()
+	r.throttler = t
+}
+
+// currentThrottler returns the resolved throttler, or nil if setup has not got
+// that far (or found nothing to throttle on, in which case the copier keeps its
+// own Noop).
+func (r *Runner) currentThrottler() throttler.Throttler {
+	r.throttlerMu.RLock()
+	defer r.throttlerMu.RUnlock()
+	return r.throttler
+}
+
 // setThrottlerOnPhases hands the resolved throttler to every phase that paces
 // itself against it. The copier always accepts one; the checksum does so via
 // the optional checksum.ThrottleAware capability (test doubles and the
@@ -1054,11 +1080,13 @@ func (r *Runner) closeReplicas() error {
 // it: the copier writes and so honours every signal in it, while the checksum
 // narrows it to the load signals (see checksum's loadOnlyThrottler — a read-only
 // snapshot pass cannot cause replica lag, so pausing it on lag would only hold
-// the snapshot open for longer).
+// the snapshot open for longer). Progress().Throttle mirrors that split — see
+// throttleStatus.
 func (r *Runner) setThrottlerOnPhases() {
-	r.copier.SetThrottler(r.throttler)
+	t := r.currentThrottler()
+	r.copier.SetThrottler(t)
 	if aware, ok := r.checker.(checksum.ThrottleAware); ok {
-		aware.SetThrottler(r.throttler)
+		aware.SetThrottler(t)
 	} else {
 		// Not fatal: the checksum falls back to its Noop and runs unthrottled,
 		// which is how it behaved before it learned to throttle at all. Worth a
@@ -1089,9 +1117,9 @@ func (r *Runner) setupThrottler(ctx context.Context) error {
 		// Handing it to the checksum as well would add a second per checksum
 		// chunk to every test that uses it — real wall-clock cost, no extra
 		// coverage. Checksum throttling is covered directly in pkg/checksum.
-		r.throttler = &throttler.Mock{}
-		r.copier.SetThrottler(r.throttler)
-		return r.throttler.Open(ctx)
+		r.setThrottler(&throttler.Mock{})
+		r.copier.SetThrottler(r.currentThrottler())
+		return r.currentThrottler().Open(ctx)
 	}
 
 	var throttlers []throttler.Throttler
@@ -1141,9 +1169,9 @@ func (r *Runner) setupThrottler(ctx context.Context) error {
 		return nil // use default Noop throttler
 	}
 
-	r.throttler = throttler.NewMultiThrottler(throttlers...)
+	r.setThrottler(throttler.NewMultiThrottler(throttlers...))
 	r.setThrottlerOnPhases()
-	if err := r.throttler.Open(ctx); err != nil {
+	if err := r.currentThrottler().Open(ctx); err != nil {
 		// multiThrottler already closes child throttlers on partial Open
 		// failure, but the *sql.DB connections backing replica throttlers
 		// are owned by r.replicas (and the Aurora monitor pool is owned
@@ -1339,14 +1367,18 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 }
 
 func (r *Runner) Progress() status.Progress {
+	// Read the state once: the phase-specific fields below (summary, ETA,
+	// checksum, throttle) must all describe the same state, not whichever state
+	// each happened to observe.
+	state := r.status.Get()
 	var summary string
 	var eta status.ETA
 	var checksum status.ChecksumProgress
-	switch r.status.Get() { //nolint: exhaustive
+	switch state { //nolint: exhaustive
 	case status.CopyRows:
 		summary = fmt.Sprintf("%v %s ETA %v",
 			r.copier.GetProgress(),
-			r.status.Get().String(),
+			state.String(),
 			r.copier.GetETA(),
 		)
 		eta = r.copier.GetETAState()
@@ -1391,11 +1423,35 @@ func (r *Runner) Progress() status.Progress {
 		})
 	}
 	return status.Progress{
-		CurrentState: r.status.Get(),
+		CurrentState: state,
 		Summary:      summary,
+		Resume:       r.usedResumeFromCheckpoint.Load(),
+		Throttle:     r.throttleStatus(state),
 		ETA:          eta,
 		Checksum:     checksum,
 		Tables:       tables,
+	}
+}
+
+// throttleStatus reports how the phase named by state is currently being paced.
+//
+// The signals reported are the ones that phase actually honours, so that status
+// never blames a pause on a signal the running phase is ignoring: the copier
+// honours the whole composite, while the checksum narrows it to the load signals
+// exactly as checksum's loadOnlyThrottler does (a read-only snapshot pass cannot
+// cause replica lag, so it does not pause on it). Phases that are not paced at
+// all report the composite, which is then read as "the server is asking spirit
+// to back off" rather than "this phase is paused".
+func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
+	t := r.currentThrottler()
+	if state == status.Checksum {
+		t = throttler.GradualOnly(t)
+	}
+	throttled, reason, utilization := throttler.Describe(t)
+	return status.ThrottleStatus{
+		Throttled:   throttled,
+		Reason:      reason,
+		Utilization: utilization,
 	}
 }
 
@@ -1429,8 +1485,8 @@ func (r *Runner) Close() error {
 	if r.replClient != nil {
 		r.replClient.Close()
 	}
-	if r.throttler != nil {
-		if err := r.throttler.Close(); err != nil {
+	if t := r.currentThrottler(); t != nil {
+		if err := t.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1571,7 +1627,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		"checksum-watermark", checksumWatermark,
 		"position", binlogPosition,
 	)
-	r.usedResumeFromCheckpoint = true
+	r.usedResumeFromCheckpoint.Store(true)
 	return nil
 }
 
