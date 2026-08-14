@@ -62,6 +62,26 @@ The actual implementation includes additional handling:
 
 The CRC32 + XOR aggregate technique for table checksumming was pioneered by **pt-table-checksum** from Percona Toolkit, which established this as a reliable method for verifying data consistency in MySQL. This same approach has since been adopted by other database tools, including TiDB's data migration and verification utilities, demonstrating its effectiveness for distributed database scenarios.
 
+## Chunk repair
+
+When a chunk mismatches and `FixDifferences` is set, the chunk is *repaired* rather than the run failing immediately. Every implementation repairs the same way:
+
+1. `DELETE` the chunk's key range on the target — this is what removes rows the source no longer has, which a pure upsert could never do.
+2. `SELECT` the chunk's rows from the source into Spirit.
+3. Write them back through the **applier**, the same buffered write path the copier and the binlog apply use.
+
+Repairs are serialized (one chunk at a time) and run under a cancellation-detached, time-bounded (10 minute) context, so a chunk is never left deleted-but-not-rewritten. Rows are read and submitted in batches, so client memory is bounded no matter how large the chunk is.
+
+Going through the applier — rather than the `REPLACE INTO _new (...) SELECT ... FROM original` that `SingleChecker` used historically — matters for lock footprint, and it is what makes large checksum chunks safe to repair without splitting them first:
+
+- `INSERT ... SELECT` is a **locking** read under `REPEATABLE READ`: it takes shared next-key locks on every source row it reads, so application `UPDATE`s to the original table blocked behind a repair for as long as the statement ran. Reading into Spirit is a plain consistent read and locks nothing.
+- The write side is split into bounded statements (applier chunklets) instead of one statement whose row locks are held for its whole duration.
+
+Two consequences of the applier being the write path:
+
+- It writes with `INSERT IGNORE`, not `REPLACE`. Rows inside the key range were just deleted, so nothing there conflicts; a row that collides on a `UNIQUE` secondary key with a row *outside* the range is skipped instead of clobbering that row. The chunk then stays diverged, the next attempt re-flags it, and retries exhaust into a hard error — the correct outcome for a lossy `ALTER` such as adding a unique index to non-unique data. The count of skipped rows is logged.
+- JSON columns are read **bare**, with no round-trip cast. The read/write pair is already text-mediated (the `SELECT` renders each document to text; the applier writes it back as a literal the target re-parses), so a repaired row lands as exactly the one-text-round-trip image the checksum's source side predicts. Casting on top would apply `parse∘render` twice, which does not converge for the doubles MySQL's JSON text parser misrounds — see `castExpr` in `pkg/table`.
+
 ## Pacing and scaling
 
 `SingleChecker` and `DistributedChecker` pace themselves against the same throttler the copier uses. Two things are separate here:

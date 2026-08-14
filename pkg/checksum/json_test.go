@@ -210,10 +210,11 @@ func TestDistributedJSONChecksumTextImage(t *testing.T) {
 // must flag this: for a misparsed double, byte-equal is the WRONG target
 // state (the deployed text write paths could never have produced it), and
 // notably the previous symmetric casts were blind to it — both sides
-// round-tripped onto the same value. The repair then recopies the chunk
-// through RepairExprs' text round-trip, so the recopied rows store exactly
-// the predicted image and the next attempt converges. A byte-faithful repair
-// would NOT converge (Run would exhaust MaxRetries=2 re-flagging the same
+// round-tripped onto the same value. The repair then recopies the chunk by
+// reading each document as text and writing it back through the applier for the
+// target to re-parse — one text round-trip, exactly the predicted image — so the
+// next attempt converges. A byte-faithful repair, or one that round-tripped
+// twice, would NOT converge (Run would exhaust MaxRetries=2 re-flagging the same
 // rows): that this test passes is the convergence proof.
 func TestJSONChecksumMisparsedDoubleRepairConverges(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS chkjsonasym2, _chkjsonasym2_new, _chkjsonasym2_chkpnt")

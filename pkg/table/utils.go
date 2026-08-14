@@ -134,9 +134,11 @@ const (
 // staying sensitive to all genuine corruption.
 //
 // The checksum's repair must uphold the same contract: recopying a chunk has
-// to store the text image, not the source bytes. See
-// ColumnMapping.RepairExprs and the replaceChunk implementations in
-// pkg/checksum.
+// to store the text image, not the source bytes. Every repair path does so by
+// construction — each reads the document as text and writes it back through the
+// applier for the target to re-parse, which is one round-trip exactly. See the
+// replaceChunk implementations in pkg/checksum, which explain why they must not
+// add a round-trip cast on top of that.
 func castExpr(col, tp string, side castSide) string {
 	quotedCol := sqlescape.EscapeIdentifier(col)
 	castTp := castableTp(tp)
@@ -151,8 +153,7 @@ func castExpr(col, tp string, side castSide) string {
 
 // textRoundTripCast renders a JSON expression to utf8mb4 text and re-parses
 // it — the server-side equivalent of one trip through Spirit's text-based
-// write paths. Shared by castExpr (source side) and
-// ColumnMapping.RepairExprs (chunk repair).
+// write paths. Used by castExpr for the checksum's source side.
 func textRoundTripCast(quotedCol string) string {
 	return "CAST(CAST(" + quotedCol + " AS char CHARACTER SET utf8mb4) AS json)"
 }

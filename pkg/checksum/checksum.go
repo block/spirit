@@ -34,14 +34,34 @@ var (
 	// pass before yielding to release long-running REPEATABLE READ transactions.
 	DefaultYieldTimeout = 24 * time.Hour
 
-	// fixChunkTimeout bounds the DELETE + REPLACE (or DELETE + Apply) pair that
-	// recopies a mismatched chunk. The pair runs under a context derived from
-	// context.WithoutCancel so a sentinel-drop cancellation can't leave the
-	// target in a partial state between the two transactions. The bound still
-	// catches the case where one transaction is hung. This applies to every
-	// repair path (initial and continuous checksum), so it has to be generous
-	// enough for legitimate large/slow recopies on busy or distant replicas.
+	// fixChunkTimeout bounds the DELETE + Apply pair that recopies a mismatched
+	// chunk. The pair runs under a context derived from context.WithoutCancel so
+	// a sentinel-drop cancellation can't leave the target in a partial state
+	// between the two steps. The bound still catches the case where one of them
+	// is hung. This applies to every repair path (initial and continuous
+	// checksum), so it has to be generous enough for legitimate large/slow
+	// recopies on busy or distant replicas.
 	fixChunkTimeout = 10 * time.Minute
+)
+
+const (
+	// repairBatchRows and repairBatchBytes bound how much of a mismatched chunk
+	// SingleChecker.replaceChunk holds in memory at once: source rows are read in
+	// batches and each batch is handed to the applier, which splits it further
+	// into the statements it writes. Both bounds are deliberately of the same
+	// order as the applier's own chunklet limits, so a batch is roughly one
+	// statement's worth of rows and the read stays a little ahead of the writers
+	// without buffering a whole (possibly enormous) chunk.
+	repairBatchRows  = 1000
+	repairBatchBytes = applier.MaxStatementSizeBytes
+
+	// repairApplierThreads is the write concurrency used to rewrite a mismatched
+	// chunk. Repairs are serialized by SingleChecker.recopyLock, so this is the
+	// most write connections a repair can hold at once. It is fixed and small
+	// rather than tied to the checksum's own concurrency: repairs are rare, and
+	// they run in a phase where the connection budget is already committed to the
+	// checksum's reader transactions.
+	repairApplierThreads = 4
 )
 
 // chunkMismatch describes why a chunk's source and target disagreed. It is
@@ -196,7 +216,14 @@ type CheckerConfig struct {
 	Watermark       string // optional; defines a watermark to start from
 	MaxRetries      int
 	Applier         applier.Applier // optional; indicates it is a distributed checker
-	YieldTimeout    time.Duration   // maximum duration for a single checksum pass before yielding to release long-running transactions
+	// RepairApplier is the write path the single-server checker rewrites a
+	// mismatched chunk through (see SingleChecker.replaceChunk). Optional: when
+	// nil, a SingleTargetApplier over sourceDBs[0] is created, which is always
+	// correct for this checker — source and target live on the same server.
+	// Ignored when Applier is set, because that selects the distributed checker,
+	// which repairs through Applier itself.
+	RepairApplier applier.Applier
+	YieldTimeout  time.Duration // maximum duration for a single checksum pass before yielding to release long-running transactions
 	// Throttler paces the checksum. Optional: nil installs a Noop, and callers
 	// that build the checker before their throttlers are open should use
 	// SetThrottler instead (the migration runner does).
@@ -239,6 +266,9 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 	if config.DBConfig == nil {
 		return nil, errors.New("dbconfig must be non-nil")
 	}
+	if config.Logger == nil {
+		config.Logger = slog.Default()
+	}
 	if config.MaxRetries == 0 {
 		config.MaxRetries = 3
 	}
@@ -272,6 +302,27 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 			yieldTimeout:    config.YieldTimeout,
 		}, nil
 	}
+	// The single-server checker repairs a mismatched chunk through an applier
+	// (see SingleChecker.replaceChunk). Callers that already have one can pass it
+	// in; otherwise build one here, which is unambiguous for this checker because
+	// its target table is on the same server as its source. No metrics sink: the
+	// repair path is rare and would otherwise report applier gauges that read as
+	// the copy phase's.
+	repairApplier := config.RepairApplier
+	if repairApplier == nil {
+		var err error
+		repairApplier, err = applier.NewSingleTargetApplier(
+			applier.Target{DB: sourceDBs[0]},
+			&applier.ApplierConfig{
+				Threads:  repairApplierThreads,
+				Logger:   config.Logger,
+				DBConfig: config.DBConfig,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create repair applier: %w", err)
+		}
+	}
 	return &SingleChecker{
 		concurrency:     concurrency,
 		maxConcurrency:  maxConcurrency,
@@ -286,6 +337,7 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		logger:          config.Logger,
 		fixDifferences:  config.FixDifferences,
 		maxRetries:      config.MaxRetries,
+		repairApplier:   repairApplier,
 		yieldTimeout:    config.YieldTimeout,
 	}, nil
 }

@@ -343,8 +343,7 @@ func (c *DistributedChecker) replaceChunk(ctx context.Context, chunk *table.Chun
 	// This ensures the column ordinals match when the applier extracts the sharding column.
 	//
 	// JSON columns are deliberately read bare here — no text round-trip cast.
-	// Unlike the single-server repair (see table.ColumnMapping.RepairExprs),
-	// this path is already text-mediated: the SELECT renders each document to
+	// This path is already text-mediated: the SELECT renders each document to
 	// text on the wire and the applier writes it back as a SQL literal that
 	// the target re-parses. The repaired row therefore lands as exactly the
 	// one-round-trip text image the checksum's source side predicts. Adding a

@@ -177,8 +177,11 @@ func NewRunner(m *Migration) (*Runner, error) {
 // the pool does not cover. Both are serialized, so one connection each:
 //
 //   - Chunk repair. When a chunk mismatches, replaceChunk runs its DELETE and
-//     REPLACE on r.db rather than on the pooled read-view transaction, and the
-//     two statements run sequentially under the checker's recopyLock.
+//     then its re-read of the source on r.db rather than on the pooled read-view
+//     transaction, and repairs are serialized under the checker's recopyLock —
+//     so it is one connection at a time. (The rewrite itself goes through the
+//     applier, whose write connections are already budgeted below as maxWrite;
+//     the copy phase has finished by then, so that headroom is free.)
 //   - Chunker prefetch. chunker.Next() runs a SELECT ... LIMIT 1 OFFSET n on
 //     Ti.Db to find the next chunk boundary, also off-pool. Workers call it
 //     concurrently but the chunker's own mutex serializes them, so only one
@@ -974,6 +977,12 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 		MaxRetries:      3,
 		YieldTimeout:    r.migration.ChecksumYieldTimeout,
 		MetricsSink:     r.metricsSink,
+		// Repairing a mismatched chunk writes through the same applier the copy
+		// and binlog-apply phases use, so a repair inherits the configured write
+		// concurrency instead of standing up a second write path. The copier has
+		// stopped it by the time the checksum runs; the checker starts and stops
+		// it around each repair.
+		RepairApplier: appl,
 		// The checksum reads with its own pool, so it shares the read side's
 		// bounds: it starts at Threads and grows to maxRead, which is already in
 		// the pool sizing above. The copier's readers have finished by the time the

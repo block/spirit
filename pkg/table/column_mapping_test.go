@@ -223,35 +223,3 @@ func TestColumnMappingChecksumExprsJSONAsymmetric(t *testing.T) {
 	require.Contains(t, src, "CAST(CAST(`old_j` AS char CHARACTER SET utf8mb4) AS json)")
 	require.Contains(t, tgt, "CAST(`j` AS json)")
 }
-
-func TestColumnMappingRepairExprs(t *testing.T) {
-	// The repair (REPLACE INTO ... SELECT) must store the text image of JSON
-	// documents, not the source bytes — so JSON columns are wrapped in the
-	// text round-trip while all other columns copy byte-faithfully.
-	t1 := NewTableInfo(nil, "test", "t1")
-	t1new := NewTableInfo(nil, "test", "t1_new")
-	t1.NonGeneratedColumns = []string{"id", "name", "j"}
-	t1new.NonGeneratedColumns = []string{"id", "name", "j"}
-	t1new.columnsMySQLTps = map[string]string{"id": "int", "name": "varchar(100)", "j": "json"}
-
-	m := NewColumnMapping(t1, t1new, nil)
-	srcExprs, tgtCols, err := m.RepairExprs()
-	require.NoError(t, err)
-	require.Equal(t, "`id`, `name`, CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)", srcExprs)
-	require.Equal(t, "`id`, `name`, `j`", tgtCols)
-
-	// Renames: the SELECT references the old source name, the INSERT list
-	// the new target name; the JSON decision comes from the target type.
-	t1.NonGeneratedColumns = []string{"id", "old_j"}
-	t1new.NonGeneratedColumns = []string{"id", "j"}
-	m = NewColumnMapping(t1, t1new, map[string]string{"old_j": "j"})
-	srcExprs, tgtCols, err = m.RepairExprs()
-	require.NoError(t, err)
-	require.Equal(t, "`id`, CAST(CAST(`old_j` AS char CHARACTER SET utf8mb4) AS json)", srcExprs)
-	require.Equal(t, "`id`, `j`", tgtCols)
-
-	// A target column with no known type is an error (mirrors wrapCastType).
-	t1new.columnsMySQLTps = map[string]string{"id": "int"}
-	_, _, err = m.RepairExprs()
-	require.ErrorContains(t, err, "not found")
-}
