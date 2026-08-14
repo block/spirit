@@ -21,8 +21,9 @@ import (
 // the copy phase — the only value migration/datasync ever write, and what a
 // normal move writes right up to (and including) its cutover.
 const (
-	phaseReverseWindow = "reverse_window" // forward cutover done, reverse feed live
-	phaseReverting     = "reverting"      // reverse cutover under way
+	phaseReverseWindow    = "reverse_window"    // forward cutover done, reverse feed live
+	phaseReverting        = "reverting"         // reverse cutover crossed its first mutation boundary
+	phaseReverseFinalized = "reverse_finalized" // source ownership restored; cleanup may remain
 )
 
 // reverseWindowPollInterval is how often the window loop checks for a revert
@@ -92,10 +93,22 @@ type reverseWindow struct {
 	feed *ReverseFeed
 	// watched[i] is target i's real-name tables, used to lock and then retire
 	// the targets during a reverse cutover.
-	watched [][]*table.TableInfo
+	watched        [][]*table.TableInfo
+	persistPhase   func(context.Context, string) error
+	dropMarker     func(context.Context) error
+	dropCheckpoint func(context.Context) error
 }
 
-func newReverseWindow(r *Runner) *reverseWindow { return &reverseWindow{r: r} }
+func newReverseWindow(r *Runner) *reverseWindow {
+	return &reverseWindow{
+		r: r,
+		persistPhase: func(ctx context.Context, phase string) error {
+			return r.checkpointTbl().Write(ctx, checkpoint.Record{Phase: phase, CutoverAt: r.cutoverAt})
+		},
+		dropMarker:     func(ctx context.Context) error { return dropRevertMarker(ctx, r.targets[0].DB) },
+		dropCheckpoint: func(ctx context.Context) error { return r.checkpointTbl().Drop(ctx) },
+	}
+}
 
 // run holds the window and performs the terminal action. It owns the feed's
 // lifecycle.
@@ -271,10 +284,10 @@ func (w *reverseWindow) revertRequested(ctx context.Context) (bool, error) {
 // checkpoint is dropped. The reverse feed is stopped.
 func (w *reverseWindow) completeForward(ctx context.Context) error {
 	w.feed.Close()
-	if err := dropRevertMarker(ctx, w.r.targets[0].DB); err != nil {
+	if err := w.dropMarker(ctx); err != nil {
 		return fmt.Errorf("reverse window: drop revert marker on complete-forward: %w", err)
 	}
-	if err := w.r.checkpointTbl().Drop(ctx); err != nil {
+	if err := w.dropCheckpoint(ctx); err != nil {
 		return fmt.Errorf("reverse window: drop checkpoint on complete-forward: %w", err)
 	}
 	w.r.logger.Info("reverse window complete; move finalized forward (source retired)")
@@ -287,11 +300,6 @@ func (w *reverseWindow) completeForward(ctx context.Context) error {
 // traffic returns to them.
 func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	r := w.r
-
-	// Record that we are rolling back (best-effort; for a future resume).
-	if err := r.checkpointTbl().Write(ctx, checkpoint.Record{Phase: phaseReverting, CutoverAt: r.cutoverAt}); err != nil {
-		r.logger.Warn("could not persist reverting phase; continuing", "error", err)
-	}
 
 	// Clear any stale _revert tables on the targets before the retire (step 5)
 	// renames each target table to its _revert form — a leftover from a prior
@@ -326,6 +334,13 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	}
 	w.feed.Close()
 
+	// Persist the ambiguous ownership boundary immediately before the first
+	// source rename. Fail closed: proceeding without this durable fact could
+	// make a restart mistake a partially reverted move for a live window.
+	if err := w.persistPhase(ctx, phaseReverting); err != nil {
+		return fmt.Errorf("reverse cutover: persist reverting phase: %w", err)
+	}
+
 	// 3. Un-retire the source: rename its _old tables back to their real names
 	//    (on every source shard) so it can serve again. The feed is stopped, so
 	//    nothing writes them.
@@ -336,6 +351,7 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 			if err := dbconn.Exec(ctx, s.db, "RENAME TABLE %n TO %n", oldName, t.TableName); err != nil {
 				return fmt.Errorf("reverse cutover: un-retire source %d table %q: %w", si, t.TableName, err)
 			}
+			r.ownershipAmbiguous = true
 		}
 	}
 
@@ -360,11 +376,23 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 		}
 	}
 
-	// 6. Drop the revert marker and the checkpoint.
-	if err := dropRevertMarker(ctx, r.targets[0].DB); err != nil {
+	return w.finalizeReverse(ctx)
+}
+
+// finalizeReverse records definitive reverse ownership before fallible
+// persistence and cleanup. Once every former target has been retired, no
+// remaining operation can move ownership away from the restored source.
+func (w *reverseWindow) finalizeReverse(ctx context.Context) error {
+	r := w.r
+	r.ownershipAmbiguous = false
+	r.reverseFinalized = true
+	if err := w.persistPhase(ctx, phaseReverseFinalized); err != nil {
+		return fmt.Errorf("reverse cutover: persist finalized phase: %w", err)
+	}
+	if err := w.dropMarker(ctx); err != nil {
 		return fmt.Errorf("reverse cutover: drop revert marker: %w", err)
 	}
-	if err := r.checkpointTbl().Drop(ctx); err != nil {
+	if err := w.dropCheckpoint(ctx); err != nil {
 		return fmt.Errorf("reverse cutover: drop checkpoint: %w", err)
 	}
 	r.logger.Info("reverse cutover complete; move rolled back to source")

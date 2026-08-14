@@ -251,6 +251,7 @@ func TestEmptyDatabaseMoveWithCutoverResult(t *testing.T) {
 
 	require.ErrorIs(t, runner.Run(t.Context()), callbackErr)
 	require.Equal(t, 1, callbackCalls)
+	require.True(t, runner.ownershipAmbiguous)
 }
 
 func TestForwardCutoverCallbackConfiguration(t *testing.T) {
@@ -284,10 +285,56 @@ func TestForwardCutoverCallbackConfiguration(t *testing.T) {
 	result, err = runner.runForwardCutoverCallback(t.Context())
 	require.Equal(t, wantResult, result)
 	require.ErrorIs(t, err, resultErr)
+	require.True(t, runner.ownershipAmbiguous)
 
 	runner.SetCutover(nil)
 	require.Nil(t, runner.cutoverFunc)
 	require.Nil(t, runner.cutoverResultFunc)
+}
+
+func TestRecordForwardCutoverFailure(t *testing.T) {
+	ordinaryErr := errors.New("cutover failed")
+	for _, tt := range []struct {
+		name    string
+		cutover *CutOver
+		err     error
+		want    bool
+	}{
+		{
+			name:    "pre-mutation failure",
+			cutover: &CutOver{},
+			err:     ordinaryErr,
+		},
+		{
+			name:    "reverse checkpoint alone",
+			cutover: &CutOver{postSwitchDone: true},
+			err:     ordinaryErr,
+		},
+		{
+			name:    "successful external cutover",
+			cutover: &CutOver{cutoverFuncSucceeded: true},
+			err:     ordinaryErr,
+			want:    true,
+		},
+		{
+			name:    "reported external mutation",
+			cutover: &CutOver{cutoverFuncMutated: true},
+			err:     ordinaryErr,
+			want:    true,
+		},
+		{
+			name:    "partial source rename",
+			cutover: &CutOver{},
+			err:     errRenameRollbackFailed,
+			want:    true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &Runner{}
+			runner.recordForwardCutoverFailure(tt.cutover, tt.err)
+			require.Equal(t, tt.want, runner.ownershipAmbiguous)
+		})
+	}
 }
 
 // TestMoveReservedWordPK is a regression test for issue #828. Moving a

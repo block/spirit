@@ -173,6 +173,11 @@ type Runner struct {
 	// (stopWatchTask) so the reverse window is the sole writer of the checkpoint
 	// row.
 	bgCancel context.CancelFunc
+
+	// reverseFinalized and ownershipAmbiguous retain terminal ownership evidence
+	// across fallible cleanup so callers never have to infer it from an error.
+	reverseFinalized   bool
+	ownershipAmbiguous bool
 }
 
 var _ status.Task = (*Runner)(nil)
@@ -784,7 +789,12 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 		r.logger.Warn("resuming an interrupted reverse window from checkpoint", "cutover_at", rec.CutoverAt)
 		return true, r.resumeReverseWindow(ctx, rec)
 	case phaseReverting:
+		r.ownershipAmbiguous = true
 		return true, fmt.Errorf("a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually", rec.Phase)
+	case phaseReverseFinalized:
+		// Ownership is already definitive. Retry only the idempotent cleanup
+		// that may have failed after the phase was durably persisted.
+		return true, newReverseWindow(r).finalizeReverse(ctx)
 	default:
 		return false, nil // phase "" (copy) — the normal flow handles resume/fresh
 	}
@@ -1013,6 +1023,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
 	r.status.Begin()
+	r.reverseFinalized = false
+	r.ownershipAmbiguous = false
 	bi := buildinfo.Get()
 	r.logger.Info("Starting table move",
 		"version", bi.Version,
@@ -1278,7 +1290,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err := r.assertNoRevertMarker(ctx, "pre-cutover"); err != nil {
 			return err
 		}
-		return cutover.Run(ctx)
+		if err := cutover.Run(ctx); err != nil {
+			r.recordForwardCutoverFailure(cutover, err)
+			return err
+		}
+		r.ownershipAmbiguous = false
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -1792,13 +1809,25 @@ func (r *Runner) analyzeTable(ctx context.Context, db *sql.DB, tableName string)
 // configured and always returns the result-bearing form used by both runner
 // cutover paths.
 func (r *Runner) runForwardCutoverCallback(ctx context.Context) (CutoverResult, error) {
-	if r.cutoverResultFunc != nil {
-		return r.cutoverResultFunc(ctx)
+	var result CutoverResult
+	var err error
+	switch {
+	case r.cutoverResultFunc != nil:
+		result, err = r.cutoverResultFunc(ctx)
+	case r.cutoverFunc != nil:
+		err = r.cutoverFunc(ctx)
 	}
-	if r.cutoverFunc != nil {
-		return CutoverResult{}, r.cutoverFunc(ctx)
+	if err != nil && result.DurableMutation {
+		r.ownershipAmbiguous = true
 	}
-	return CutoverResult{}, nil
+	return result, err
+}
+
+func (r *Runner) recordForwardCutoverFailure(cutover *CutOver, err error) {
+	r.ownershipAmbiguous = r.ownershipAmbiguous ||
+		cutover.cutoverFuncSucceeded ||
+		cutover.cutoverFuncMutated ||
+		errors.Is(err, errRenameRollbackFailed)
 }
 
 func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {

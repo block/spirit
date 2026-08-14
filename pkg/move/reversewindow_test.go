@@ -10,6 +10,7 @@ package move
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -585,4 +586,78 @@ func TestMoveReverseWindowNMResumesAfterKill(t *testing.T) {
 	for _, tgt := range []string{f.tgtEvenName, f.tgtOddName} {
 		require.True(t, tableExists(t, f.ctl, tgt, "users_revert"), "target %s retired to _revert", tgt)
 	}
+}
+
+func TestFinalizeReversePersistsOwnershipBeforeCleanup(t *testing.T) {
+	cleanupErr := errors.New("cleanup failed")
+	for _, tt := range []struct {
+		name           string
+		dropMarker     func(context.Context) error
+		dropCheckpoint func(context.Context) error
+		wantOrder      []string
+	}{
+		{
+			name:           "revert marker",
+			dropMarker:     func(context.Context) error { return cleanupErr },
+			dropCheckpoint: func(context.Context) error { return nil },
+			wantOrder:      []string{"persist", "marker"},
+		},
+		{
+			name:           "checkpoint",
+			dropMarker:     func(context.Context) error { return nil },
+			dropCheckpoint: func(context.Context) error { return cleanupErr },
+			wantOrder:      []string{"persist", "marker", "checkpoint"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Runner{ownershipAmbiguous: true}
+			var order []string
+			w := &reverseWindow{
+				r: r,
+				persistPhase: func(_ context.Context, phase string) error {
+					require.Equal(t, phaseReverseFinalized, phase)
+					order = append(order, "persist")
+					return nil
+				},
+				dropMarker: func(ctx context.Context) error {
+					order = append(order, "marker")
+					return tt.dropMarker(ctx)
+				},
+				dropCheckpoint: func(ctx context.Context) error {
+					order = append(order, "checkpoint")
+					return tt.dropCheckpoint(ctx)
+				},
+			}
+
+			require.ErrorIs(t, w.finalizeReverse(t.Context()), cleanupErr)
+			require.True(t, r.reverseFinalized)
+			require.False(t, r.ownershipAmbiguous)
+			require.Equal(t, tt.wantOrder, order)
+		})
+	}
+}
+
+func TestFinalizeReverseFailsClosedWhenOwnershipCannotBePersisted(t *testing.T) {
+	persistErr := errors.New("persist failed")
+	r := &Runner{ownershipAmbiguous: true}
+	cleanupCalled := false
+	w := &reverseWindow{
+		r: r,
+		persistPhase: func(context.Context, string) error {
+			return persistErr
+		},
+		dropMarker: func(context.Context) error {
+			cleanupCalled = true
+			return nil
+		},
+		dropCheckpoint: func(context.Context) error {
+			cleanupCalled = true
+			return nil
+		},
+	}
+
+	require.ErrorIs(t, w.finalizeReverse(t.Context()), persistErr)
+	require.True(t, r.reverseFinalized)
+	require.False(t, r.ownershipAmbiguous)
+	require.False(t, cleanupCalled)
 }
