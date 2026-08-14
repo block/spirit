@@ -1875,7 +1875,8 @@ func (r *Runner) recordForwardCutoverFailure(cutover *CutOver, err error) {
 	r.ownershipAmbiguous = r.ownershipAmbiguous ||
 		cutover.cutoverFuncSucceeded ||
 		cutover.cutoverFuncMutated ||
-		errors.Is(err, errRenameRollbackFailed)
+		errors.Is(err, errRenameRollbackFailed) ||
+		errors.Is(err, errRenameOwnershipAmbiguous)
 }
 
 func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {

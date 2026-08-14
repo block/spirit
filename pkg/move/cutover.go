@@ -27,6 +27,11 @@ var renameRetryWait = 1 * time.Second
 // that state cannot converge, so the retry loop aborts immediately.
 var errRenameRollbackFailed = errors.New("rename rollback failed")
 
+// errRenameOwnershipAmbiguous marks a connection loss during a rename. The
+// server may have committed the atomic statement before the client lost its
+// acknowledgement, so retrying cannot safely infer current ownership.
+var errRenameOwnershipAmbiguous = errors.New("rename ownership ambiguous")
+
 // CutoverResult reports whether a caller-owned forward cutover callback made a
 // durable ownership or topology mutation, even when it also returned an error.
 type CutoverResult struct {
@@ -141,6 +146,11 @@ func (c *CutOver) runWithRetries(ctx context.Context, runAttempt func(attempt in
 		}
 		err = runAttempt(attempt)
 		if err != nil {
+			if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, errRenameOwnershipAmbiguous) {
+				c.logger.Error("cutover rename left ownership unresolved; not retrying",
+					"error", err.Error())
+				return fmt.Errorf("cutover rename left ownership unresolved; manual intervention required: %w", err)
+			}
 			if c.cutoverFuncMutated && !c.cutoverFuncSucceeded {
 				c.logger.Error("cutover callback failed after reporting a durable mutation; not retrying",
 					"error", err.Error())
@@ -270,8 +280,9 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 			c.stopSourceFeeds()
 			return nil
 		}
-		if errors.Is(err, errRenameRollbackFailed) {
-			// The sources are partially renamed; retrying cannot converge.
+		if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, errRenameOwnershipAmbiguous) {
+			// The sources are partially renamed or the failed rename may have
+			// committed; retrying cannot safely converge.
 			return err
 		}
 		c.logger.Warn("rename failed", "error", err.Error())
@@ -324,6 +335,10 @@ func (c *CutOver) renameAllSources(ctx context.Context, sourceLocks []*dbconn.Ta
 			if len(rollbackErrors) > 0 {
 				return fmt.Errorf("%w: rename failed on source %d and rollback also failed (%s): %w",
 					errRenameRollbackFailed, i, strings.Join(rollbackErrors, "; "), err)
+			}
+			if dbconn.IsConnectionLossError(err) {
+				return fmt.Errorf("%w: rename outcome is unknown on source %d: %w",
+					errRenameOwnershipAmbiguous, i, err)
 			}
 			return fmt.Errorf("rename failed on source %d, rolled back %d completed renames: %w",
 				i, len(completedRenames), err)

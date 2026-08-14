@@ -98,6 +98,25 @@ func TestNewCutOverValidation(t *testing.T) {
 	require.ErrorContains(t, err, "MaxRetries must be at least 1")
 }
 
+func TestCutOverDoesNotRetryUnresolvedRenameOwnership(t *testing.T) {
+	for _, marker := range []error{errRenameRollbackFailed, errRenameOwnershipAmbiguous} {
+		t.Run(marker.Error(), func(t *testing.T) {
+			cfg := dbconn.NewDBConfig()
+			cfg.MaxRetries = 3
+			cutover := &CutOver{dbConfig: cfg, logger: slog.Default()}
+			attempts := 0
+
+			err := cutover.runWithRetries(t.Context(), func(int) error {
+				attempts++
+				return marker
+			})
+
+			require.ErrorIs(t, err, marker)
+			require.Equal(t, 1, attempts)
+		})
+	}
+}
+
 // TestCutOverSingleSource tests the cutover flow with a single source,
 // verifying table rename and cutoverFunc callback.
 // Note: multi-source cutover cannot be tested with a single MySQL server

@@ -328,6 +328,12 @@ func TestRecordForwardCutoverFailure(t *testing.T) {
 			err:     errRenameRollbackFailed,
 			want:    true,
 		},
+		{
+			name:    "unacknowledged source rename",
+			cutover: &CutOver{},
+			err:     errRenameOwnershipAmbiguous,
+			want:    true,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			runner := &Runner{}

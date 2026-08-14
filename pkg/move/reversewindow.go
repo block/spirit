@@ -349,6 +349,9 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 		for _, t := range r.sourceTables {
 			oldName := check.CutoverOldName(t.TableName)
 			if err := dbconn.Exec(ctx, s.db, "RENAME TABLE %n TO %n", oldName, t.TableName); err != nil {
+				if dbconn.IsConnectionLossError(err) {
+					r.ownershipAmbiguous = true
+				}
 				return fmt.Errorf("reverse cutover: un-retire source %d table %q: %w", si, t.TableName, err)
 			}
 			r.ownershipAmbiguous = true
@@ -371,6 +374,9 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 			revertName := check.RevertRetiredName(t.TableName)
 			stmt := sqlescape.MustEscapeSQL("RENAME TABLE %n TO %n", t.TableName, revertName)
 			if err := locks[i].ExecUnderLock(ctx, stmt); err != nil {
+				if dbconn.IsConnectionLossError(err) {
+					r.ownershipAmbiguous = true
+				}
 				return fmt.Errorf("reverse cutover: retire target %d table %q: %w", i, t.TableName, err)
 			}
 		}
