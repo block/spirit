@@ -266,9 +266,10 @@ func TestForwardCutoverCallbackConfiguration(t *testing.T) {
 	require.Nil(t, runner.cutoverResultFunc)
 
 	result, err := runner.runForwardCutoverCallback(t.Context())
-	require.Equal(t, CutoverResult{}, result)
+	require.Equal(t, CutoverResult{OwnershipAmbiguous: true}, result)
 	require.ErrorIs(t, err, legacyErr)
 	require.Equal(t, 1, legacyCalls)
+	require.True(t, runner.ownershipAmbiguous)
 
 	runner.SetCutoverWithResult(nil)
 	require.Nil(t, runner.cutoverFunc)
@@ -332,6 +333,12 @@ func TestRecordForwardCutoverFailure(t *testing.T) {
 			name:    "unacknowledged source rename",
 			cutover: &CutOver{},
 			err:     errRenameOwnershipAmbiguous,
+			want:    true,
+		},
+		{
+			name:    "ambiguous external cutover",
+			cutover: &CutOver{cutoverFuncAmbiguous: true},
+			err:     ordinaryErr,
 			want:    true,
 		},
 	} {

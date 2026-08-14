@@ -32,10 +32,12 @@ var errRenameRollbackFailed = errors.New("rename rollback failed")
 // acknowledgement, so retrying cannot safely infer current ownership.
 var errRenameOwnershipAmbiguous = errors.New("rename ownership ambiguous")
 
-// CutoverResult reports whether a caller-owned forward cutover callback made a
-// durable ownership or topology mutation, even when it also returned an error.
+// CutoverResult reports authoritative evidence from a caller-owned forward
+// cutover callback, including failures after a durable mutation and failures
+// whose mutation outcome cannot be determined.
 type CutoverResult struct {
-	DurableMutation bool
+	DurableMutation    bool
+	OwnershipAmbiguous bool
 }
 
 // CutoverResultCallback is the result-bearing form of a forward cutover callback.
@@ -49,16 +51,18 @@ type CutOverSource struct {
 }
 
 type CutOver struct {
-	sources            []CutOverSource
-	cutoverFunc        func(ctx context.Context) error
-	cutoverResultFunc  CutoverResultCallback
-	cutoverFuncMutated bool
-	dbConfig           *dbconn.DBConfig
-	logger             *slog.Logger
+	sources              []CutOverSource
+	cutoverFunc          func(ctx context.Context) error
+	cutoverResultFunc    CutoverResultCallback
+	cutoverFuncMutated   bool
+	cutoverFuncAmbiguous bool
+	dbConfig             *dbconn.DBConfig
+	logger               *slog.Logger
 	// cutoverFuncSucceeded tracks whether the cutover callback has returned nil.
 	// The callback is a caller-supplied traffic switch (e.g. a Vitess routing
-	// change) and is not assumed to be idempotent: once it has succeeded or
-	// reported a durable mutation it must never be invoked again.
+	// change) and is not assumed to be idempotent: once it has succeeded,
+	// reported a durable mutation, or reported ambiguity it must never be
+	// invoked again.
 	cutoverFuncSucceeded bool
 
 	// postSwitch, when set, runs once under the source locks after the traffic
@@ -151,6 +155,11 @@ func (c *CutOver) runWithRetries(ctx context.Context, runAttempt func(attempt in
 					"error", err.Error())
 				return fmt.Errorf("cutover rename left ownership unresolved; manual intervention required: %w", err)
 			}
+			if c.cutoverFuncAmbiguous && !c.cutoverFuncSucceeded {
+				c.logger.Error("cutover callback failed with ambiguous ownership; not retrying",
+					"error", err.Error())
+				return fmt.Errorf("cutover callback left ownership ambiguous; manual intervention required: %w", err)
+			}
 			if c.cutoverFuncMutated && !c.cutoverFuncSucceeded {
 				c.logger.Error("cutover callback failed after reporting a durable mutation; not retrying",
 					"error", err.Error())
@@ -188,6 +197,7 @@ func (c *CutOver) runCutoverCallback(ctx context.Context) error {
 	if c.cutoverResultFunc != nil {
 		result, err := c.cutoverResultFunc(ctx)
 		c.cutoverFuncMutated = c.cutoverFuncMutated || result.DurableMutation
+		c.cutoverFuncAmbiguous = c.cutoverFuncAmbiguous || (err != nil && result.OwnershipAmbiguous)
 		if err != nil {
 			return err
 		}

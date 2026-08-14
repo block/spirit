@@ -305,13 +305,15 @@ func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 func TestCutOverResultControlsRetry(t *testing.T) {
 	callbackErr := errors.New("cutover callback failed")
 	for _, tt := range []struct {
-		name            string
-		durableMutation bool
-		wantCalls       int
-		wantErr         bool
+		name               string
+		durableMutation    bool
+		ownershipAmbiguous bool
+		wantCalls          int
+		wantErr            bool
 	}{
-		{name: "retry before durable mutation", wantCalls: 2},
+		{name: "retry before authoritative evidence", wantCalls: 2},
 		{name: "abort after durable mutation", durableMutation: true, wantCalls: 1, wantErr: true},
+		{name: "abort after ambiguous outcome", ownershipAmbiguous: true, wantCalls: 1, wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dbConfig := dbconn.NewDBConfig()
@@ -321,7 +323,10 @@ func TestCutOverResultControlsRetry(t *testing.T) {
 			cutover.SetCutoverWithResult(func(context.Context) (CutoverResult, error) {
 				callbackCalls++
 				if callbackCalls == 1 {
-					return CutoverResult{DurableMutation: tt.durableMutation}, callbackErr
+					return CutoverResult{
+						DurableMutation:    tt.durableMutation,
+						OwnershipAmbiguous: tt.ownershipAmbiguous,
+					}, callbackErr
 				}
 				return CutoverResult{}, nil
 			})
@@ -333,12 +338,14 @@ func TestCutOverResultControlsRetry(t *testing.T) {
 			if tt.wantErr {
 				require.ErrorIs(t, err, callbackErr)
 				require.ErrorContains(t, err, "manual intervention required")
-				require.True(t, cutover.cutoverFuncMutated)
+				require.Equal(t, tt.durableMutation, cutover.cutoverFuncMutated)
+				require.Equal(t, tt.ownershipAmbiguous, cutover.cutoverFuncAmbiguous)
 				require.False(t, cutover.cutoverFuncSucceeded)
 				return
 			}
 			require.NoError(t, err)
 			require.False(t, cutover.cutoverFuncMutated)
+			require.False(t, cutover.cutoverFuncAmbiguous)
 			require.True(t, cutover.cutoverFuncSucceeded)
 		})
 	}

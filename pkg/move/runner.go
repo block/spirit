@@ -1861,11 +1861,16 @@ func (r *Runner) runForwardCutoverCallback(ctx context.Context) (CutoverResult, 
 		result, err = r.cutoverResultFunc(ctx)
 	case r.cutoverFunc != nil:
 		err = r.cutoverFunc(ctx)
+		if err != nil {
+			// The legacy callback cannot report whether it mutated before
+			// failing. Do not retry an unknown traffic-switch outcome.
+			result.OwnershipAmbiguous = true
+		}
 	}
 	if result.DurableMutation {
 		r.status.DurableMutation(ctx)
 	}
-	if err != nil && result.DurableMutation {
+	if err != nil && (result.DurableMutation || result.OwnershipAmbiguous) {
 		r.ownershipAmbiguous = true
 	}
 	return result, err
@@ -1875,6 +1880,7 @@ func (r *Runner) recordForwardCutoverFailure(cutover *CutOver, err error) {
 	r.ownershipAmbiguous = r.ownershipAmbiguous ||
 		cutover.cutoverFuncSucceeded ||
 		cutover.cutoverFuncMutated ||
+		cutover.cutoverFuncAmbiguous ||
 		errors.Is(err, errRenameRollbackFailed) ||
 		errors.Is(err, errRenameOwnershipAmbiguous)
 }
