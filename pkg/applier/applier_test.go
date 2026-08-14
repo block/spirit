@@ -92,7 +92,7 @@ func TestEstimateRowSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			size := estimateRowSize(tt.values)
+			size := EstimateRowSize(tt.values)
 			assert.GreaterOrEqual(t, size, tt.minSize, "size should be at least minSize")
 			assert.LessOrEqual(t, size, tt.maxSize, "size should not exceed maxSize")
 			t.Logf("Estimated size for %s: %d bytes", tt.name, size)
@@ -111,7 +111,7 @@ func TestEstimateRowSizeRealistic(t *testing.T) {
 			"2024-01-15 10:30:00",
 			true,
 		}
-		size := estimateRowSize(values)
+		size := EstimateRowSize(values)
 		// Should be reasonable size, not too large
 		require.Greater(t, size, 40, "should account for all fields")
 		require.Less(t, size, 150, "should not be excessively large")
@@ -130,7 +130,7 @@ func TestEstimateRowSizeRealistic(t *testing.T) {
 			string(largeContent),
 			int64(42),
 		}
-		size := estimateRowSize(values)
+		size := EstimateRowSize(values)
 		// Should be roughly 10KB + overhead
 		require.Greater(t, size, 10000, "should account for large content")
 		require.Less(t, size, 11000, "overhead should be reasonable")
@@ -148,7 +148,7 @@ func TestEstimateRowSizeRealistic(t *testing.T) {
 			string(largeData),
 			"metadata",
 		}
-		size := estimateRowSize(values)
+		size := EstimateRowSize(values)
 		// Should be close to but not exceed our threshold
 		require.Greater(t, size, 900000, "should account for large data")
 		require.Less(t, size, MaxStatementSizeBytes, "single row should fit in a chunklet")
@@ -160,9 +160,9 @@ func TestEstimateRowSizeConsistency(t *testing.T) {
 	// Test that the same input produces the same output
 	values := []any{int64(123), "test", true, 3.14}
 
-	size1 := estimateRowSize(values)
-	size2 := estimateRowSize(values)
-	size3 := estimateRowSize(values)
+	size1 := EstimateRowSize(values)
+	size2 := EstimateRowSize(values)
+	size3 := EstimateRowSize(values)
 
 	require.Equal(t, size1, size2, "should be consistent")
 	require.Equal(t, size2, size3, "should be consistent")
@@ -198,7 +198,7 @@ func TestEstimateRowSizeZeroValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			size := estimateRowSize(tt.values)
+			size := EstimateRowSize(tt.values)
 			// Should have some size even for zero values
 			require.Positive(t, size, "should have non-zero size")
 			t.Logf("%s size: %d bytes", tt.name, size)
@@ -275,7 +275,7 @@ func TestSplitRowsIntoChunklets(t *testing.T) {
 		for i, chunklet := range chunklets {
 			totalSize := 0
 			for _, row := range chunklet {
-				totalSize += estimateRowSize(row.values)
+				totalSize += EstimateRowSize(row.values)
 			}
 			// Allow some overhead, but should be reasonably close to limit
 			require.LessOrEqual(t, totalSize, MaxStatementSizeBytes+10000,
@@ -370,7 +370,7 @@ func TestSplitRowsIntoChunklets(t *testing.T) {
 		require.Len(t, chunklets[0], 1, "chunklet should have the one oversized row")
 
 		// Verify the row size does exceed our threshold
-		rowSize := estimateRowSize(rows[0].values)
+		rowSize := EstimateRowSize(rows[0].values)
 		require.Greater(t, rowSize, MaxStatementSizeBytes, "row should exceed MaxStatementSizeBytes")
 		t.Logf("Single row size: %d bytes (exceeds threshold of %d bytes)", rowSize, MaxStatementSizeBytes)
 		t.Logf("Note: This relies on max_allowed_packet being large enough (typically 64 MiB)")
@@ -439,7 +439,7 @@ func TestEstimateRowSizeTracksRenderedSize(t *testing.T) {
 	}
 	rendered := len("(" + strings.Join(literals, ", ") + ")")
 
-	estimated := estimateRowSize(values)
+	estimated := EstimateRowSize(values)
 	ratio := float64(estimated) / float64(rendered)
 	assert.InDelta(t, 1.0, ratio, 0.5,
 		"estimate %d vs rendered %d (%.2fx) — the estimate has drifted from what is actually emitted",
@@ -447,8 +447,8 @@ func TestEstimateRowSizeTracksRenderedSize(t *testing.T) {
 
 	// And it must not allocate: this runs on every value of every copied row,
 	// on top of the rendering writeChunklet does anyway.
-	assert.Zero(t, testing.AllocsPerRun(100, func() { _ = estimateRowSize(values) }),
-		"estimateRowSize should not allocate")
+	assert.Zero(t, testing.AllocsPerRun(100, func() { _ = EstimateRowSize(values) }),
+		"EstimateRowSize should not allocate")
 }
 
 // TestEstimateRowSizeUnderestimateStaysSafe pins the safety argument behind
@@ -469,7 +469,7 @@ func TestEstimateRowSizeUnderestimateStaysSafe(t *testing.T) {
 		[]byte("\x00\x01\x02\x03\x04\x05\x06\x07"), // hex-renders at 2x
 		`a string with "quotes" and \backslashes\ that escaping will grow`,
 	}
-	estimated := estimateRowSize(worst)
+	estimated := EstimateRowSize(worst)
 	require.Positive(t, estimated)
 
 	// Worst-case compounding is bounded by ~2x per value, so a full statement

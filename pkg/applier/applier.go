@@ -217,11 +217,15 @@ func (cfg *ApplierConfig) Validate() error {
 	return nil
 }
 
-// estimateRowSize estimates the size in bytes of a row's values as they will
+// EstimateRowSize estimates the size in bytes of a row's values as they will
 // be rendered into a VALUES clause. It does not need to be precise: the budget
 // it feeds (MaxStatementSizeBytes, 1 MiB) sits ~64x below a typical
 // max_allowed_packet, so the estimate only has to be the right order of
 // magnitude to keep a statement well clear of the wire limit.
+//
+// It is exported for callers that batch rows before handing them to Apply and
+// so need to bound a batch by the same measure the applier itself uses — the
+// checksum's chunk repair does this.
 //
 // It does need to be cheap. It runs on every value of every copied row, once
 // per row on top of the rendering writeChunklet does anyway, so it is pure
@@ -233,7 +237,7 @@ func (cfg *ApplierConfig) Validate() error {
 // over-estimated by ~2.7x, so chunklets were being cut well short of the
 // budget they were supposed to fill. A type switch is ~290x cheaper, allocates
 // nothing, and lands much closer to what datum.String() actually emits.
-func estimateRowSize(values []any) int {
+func EstimateRowSize(values []any) int {
 	size := 2 // the tuple's parentheses
 	for _, value := range values {
 		// +2 for the ", " separator. That over-counts by one separator per
@@ -313,7 +317,7 @@ func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 	currentSize := 0
 
 	for _, row := range rows {
-		rowSize := estimateRowSize(row.values)
+		rowSize := EstimateRowSize(row.values)
 		// Check if adding this row would exceed either threshold
 		if len(currentChunklet) >= chunkletMaxRows ||
 			(len(currentChunklet) > 0 && currentSize+rowSize > MaxStatementSizeBytes) {

@@ -519,7 +519,7 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 			return fmt.Errorf("failed to scan source row: %w", err)
 		}
 		batch = append(batch, values)
-		batchBytes += repairRowBytes(values)
+		batchBytes += applier.EstimateRowSize(values)
 		sourceRows++
 		if len(batch) >= repairBatchRows || batchBytes >= repairBatchBytes {
 			if err := flush(); err != nil {
@@ -572,28 +572,6 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 		"elapsed", time.Since(start).Round(time.Millisecond).String(),
 	)
 	return nil
-}
-
-// repairRowBytes approximates the memory a scanned row occupies, for the byte
-// half of the repair's batching budget. Precision is not needed: the budget only
-// exists to keep one batch's rows in client memory bounded, and the applier does
-// its own (also approximate) sizing of the statements it builds from them. The
-// text protocol hands back []byte for essentially every column, so the two
-// slice cases carry almost all real rows.
-func repairRowBytes(values []any) int {
-	size := 0
-	for _, value := range values {
-		switch v := value.(type) {
-		case nil:
-		case []byte:
-			size += len(v)
-		case string:
-			size += len(v)
-		default:
-			size += 8
-		}
-	}
-	return size
 }
 
 func (c *SingleChecker) isHealthy(ctx context.Context) bool {
