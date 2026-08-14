@@ -148,6 +148,8 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)
+	observer := &recordingMoveWorkflowObserver{}
+	runner.SetWorkflowObserver(observer)
 
 	var reverseCutoverCalled bool
 	runner.SetCutover(func(context.Context) error { return nil })
@@ -171,6 +173,15 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	}
 
 	require.True(t, reverseCutoverCalled, "reverse cutover func must run on revert")
+	events, _ := observer.snapshot()
+	require.Equal(t, status.WorkflowEvent{
+		TerminalOwnership: status.WorkflowTerminalOwnershipReverseFinalized,
+	}, events[len(events)-1])
+	require.Contains(t, events, status.WorkflowEvent{
+		State:      status.ReverseWindow,
+		Transition: status.WorkflowTransitionFinished,
+		Outcome:    status.WorkflowOutcomeSucceeded,
+	})
 	// Source un-retired and serving, with the window's write flowed back.
 	require.True(t, tableExists(t, ctl, "rwrv_src", "t1"), "source should be un-retired")
 	require.False(t, tableExists(t, ctl, "rwrv_src", "t1_old"), "source _old should be gone after un-retire")

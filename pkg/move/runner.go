@@ -216,6 +216,44 @@ func NewRunner(m *Move) (*Runner, error) {
 	return r, nil
 }
 
+// SetWorkflowObserver installs the optional typed workflow observer. It must be
+// called before Run. A nil observer disables workflow observation.
+func (r *Runner) SetWorkflowObserver(observer status.WorkflowObserver) {
+	r.status.SetObserver(observer)
+}
+
+func (r *Runner) runCopy(ctx context.Context) error {
+	if r.status.HasObserver() {
+		defer func() {
+			rows, chunks, available := copier.CompletedWork(r.copier)
+			if available {
+				r.status.RecordCompletedWork(ctx, rows, chunks)
+			}
+		}()
+	}
+	return r.status.Do(ctx, status.CopyRows, func() error {
+		err := r.copier.Run(ctx)
+		if err == nil && ctx.Err() != nil {
+			chunker := r.copier.GetChunker()
+			if chunker == nil || !chunker.IsRead() {
+				return ctx.Err()
+			}
+		}
+		return err
+	})
+}
+
+func (r *Runner) terminalOwnership() status.WorkflowTerminalOwnership {
+	switch {
+	case r.reverseFinalized:
+		return status.WorkflowTerminalOwnershipReverseFinalized
+	case r.ownershipAmbiguous:
+		return status.WorkflowTerminalOwnershipAmbiguous
+	default:
+		return 0
+	}
+}
+
 func (r *Runner) Close() error {
 	// Cancel the runner context so background goroutines (status.WatchTask)
 	// observe ctx.Done() and exit. Idempotent.
@@ -1025,6 +1063,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.status.Begin()
 	r.reverseFinalized = false
 	r.ownershipAmbiguous = false
+	defer func() {
+		r.status.Terminal(ctx, r.terminalOwnership())
+	}()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting table move",
 		"version", bi.Version,
@@ -1210,9 +1251,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	if err := r.status.Do(ctx, status.CopyRows, func() error {
-		return r.copier.Run(ctx)
-	}); err != nil {
+	if err := r.runCopy(ctx); err != nil {
 		return err
 	}
 
@@ -1242,14 +1281,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	// lives in the sentinel package). The continuous-checksum lifecycle and
 	// watermark invalidation are move-specific (multi-source feeds;
 	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
-	// so they are injected as callbacks. See pkg/sentinel.
-	if err := r.status.Do(ctx, status.WaitingOnSentinelTable, func() error {
-		return sentinel.Wait(ctx, sentinel.WaitConfig{
-			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
-			RunChecksum:         r.runContinuousChecksum,
-			InvalidateWatermark: r.invalidateChecksumWatermark,
-			Logger:              r.logger,
-		})
+	// so they are injected as callbacks. RunWait brackets only an observed
+	// sentinel; an absent optional sentinel emits no phase.
+	if err := sentinel.Wait(ctx, sentinel.WaitConfig{
+		Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
+		RunChecksum:         r.runContinuousChecksum,
+		InvalidateWatermark: r.invalidateChecksumWatermark,
+		Logger:              r.logger,
+		RunWait: func(wait func() error) error {
+			return r.status.Do(ctx, status.WaitingOnSentinelTable, wait)
+		},
 	}); err != nil {
 		return err
 	}
@@ -1295,6 +1336,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 		r.ownershipAmbiguous = false
+		r.status.DurableMutation(ctx)
 		return nil
 	}); err != nil {
 		return err
@@ -1816,6 +1858,9 @@ func (r *Runner) runForwardCutoverCallback(ctx context.Context) (CutoverResult, 
 		result, err = r.cutoverResultFunc(ctx)
 	case r.cutoverFunc != nil:
 		err = r.cutoverFunc(ctx)
+	}
+	if result.DurableMutation {
+		r.status.DurableMutation(ctx)
 	}
 	if err != nil && result.DurableMutation {
 		r.ownershipAmbiguous = true
