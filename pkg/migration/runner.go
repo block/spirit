@@ -42,6 +42,8 @@ var (
 	// checksum.DefaultContinuousRetryDelay), so they are shared with move/sync.
 )
 
+var errDirectDDLOwnershipAmbiguous = errors.New("direct DDL may have committed; verify table ownership manually")
+
 // continuousDivergenceReporter is the minimal view of the sentinel-wait
 // continuous checker that the checkpoint machinery needs: "has this checker
 // observed any divergence?". Both the production *checksum.ContinuousChecker
@@ -327,7 +329,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			// '100%new') that must not be format-interpreted.
 			err := dbconn.Exec(ctx, r.db, "%r", sqlescape.RawSQL(r.changes[0].stmt.Statement))
 			if err != nil {
-				return err
+				return r.reportDirectDDLError(ctx, err)
 			}
 			r.status.DurableMutation(ctx)
 			r.logger.Info("apply complete")
@@ -403,6 +405,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		)
 		r.status.DurableMutation(ctx)
 		return nil // success!
+	}
+	if errors.Is(err, errDirectDDLOwnershipAmbiguous) {
+		return r.reportDirectDDLError(ctx, err)
 	}
 
 	// Perform preflight basic checks.
@@ -556,6 +561,16 @@ func (r *Runner) wrapCutoverError(ctx context.Context, err error) error {
 		r.status.Terminal(ctx, status.WorkflowTerminalOwnershipAmbiguous)
 	}
 	return fmt.Errorf("cutover failed: %w", err)
+}
+
+func (r *Runner) reportDirectDDLError(ctx context.Context, err error) error {
+	if dbconn.IsConnectionLossError(err) && !errors.Is(err, errDirectDDLOwnershipAmbiguous) {
+		err = errors.Join(err, errDirectDDLOwnershipAmbiguous)
+	}
+	if errors.Is(err, errDirectDDLOwnershipAmbiguous) {
+		r.status.Terminal(ctx, status.WorkflowTerminalOwnershipAmbiguous)
+	}
+	return err
 }
 
 // postCopyPhase runs the work that happens between copy-rows and the

@@ -11,6 +11,7 @@ import (
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -230,6 +231,21 @@ func TestMigrationWorkflowReportsAmbiguousCutoverOwnership(t *testing.T) {
 	err := r.wrapCutoverError(t.Context(), errors.Join(cause, errCutoverOwnershipAmbiguous))
 
 	require.ErrorIs(t, err, cause)
+	events, _ := observer.snapshot()
+	require.Equal(t, []status.WorkflowEvent{{
+		TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,
+	}}, events)
+}
+
+func TestMigrationWorkflowReportsAmbiguousDirectDDLOwnership(t *testing.T) {
+	observer := &recordingWorkflowObserver{}
+	r := &Runner{}
+	r.SetWorkflowObserver(observer)
+
+	err := r.reportDirectDDLError(t.Context(), mysql.ErrInvalidConn)
+
+	require.ErrorIs(t, err, mysql.ErrInvalidConn)
+	require.ErrorIs(t, err, errDirectDDLOwnershipAmbiguous)
 	events, _ := observer.snapshot()
 	require.Equal(t, []status.WorkflowEvent{{
 		TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,

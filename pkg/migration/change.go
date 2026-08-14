@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/block/spirit/pkg/dbconn"
@@ -179,6 +180,9 @@ func (c *tableChange) attemptMySQLDDL(ctx context.Context) error {
 		c.runner.usedInstantDDL = true // success
 		return nil
 	}
+	if dbconn.IsConnectionLossError(err) {
+		return errors.Join(err, errDirectDDLOwnershipAmbiguous)
+	}
 
 	// Many "inplace" operations (such as adding an index)
 	// are only online-safe to do in Aurora GLOBAL
@@ -193,6 +197,9 @@ func (c *tableChange) attemptMySQLDDL(ctx context.Context) error {
 		if err == nil {
 			c.runner.usedInplaceDDL = true // success
 			return nil
+		}
+		if dbconn.IsConnectionLossError(err) {
+			return errors.Join(err, errDirectDDLOwnershipAmbiguous)
 		}
 	}
 	c.runner.logger.Info("unable to use INPLACE", "error", err)
