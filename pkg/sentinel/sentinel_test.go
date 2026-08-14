@@ -77,23 +77,29 @@ func blockingChecksum(started *atomic.Bool) func(context.Context) error {
 }
 
 func TestWaitSentinelAbsentUpFront(t *testing.T) {
-	var checksumStarted, invalidateCalled atomic.Bool
+	var checksumStarted, invalidateCalled, waitWrapped atomic.Bool
 	err := sentinel.Wait(t.Context(), sentinel.WaitConfig{
 		Exists:              func(context.Context) (bool, error) { return false, nil },
 		RunChecksum:         blockingChecksum(&checksumStarted),
 		InvalidateWatermark: func(context.Context) error { invalidateCalled.Store(true); return nil },
 		Logger:              discardLogger(),
+		RunWait: func(wait func() error) error {
+			waitWrapped.Store(true)
+			return wait()
+		},
 	})
 	require.NoError(t, err)
 	// An absent sentinel means "proceed immediately": no checksum is spawned
 	// and no watermark cleanup runs.
 	assert.False(t, checksumStarted.Load(), "checksum must not start when sentinel is already absent")
 	assert.False(t, invalidateCalled.Load(), "watermark must not be touched when sentinel is already absent")
+	assert.False(t, waitWrapped.Load(), "wait wrapper must not run when sentinel is already absent")
 }
 
 func TestWaitSentinelDropped(t *testing.T) {
 	setTiming(t, time.Hour, time.Millisecond)
 	var calls atomic.Int32
+	var wrapperCalls atomic.Int32
 	var checksumStarted, invalidateCalled atomic.Bool
 	err := sentinel.Wait(t.Context(), sentinel.WaitConfig{
 		// true up front and on the first tick, then dropped.
@@ -101,10 +107,15 @@ func TestWaitSentinelDropped(t *testing.T) {
 		RunChecksum:         blockingChecksum(&checksumStarted),
 		InvalidateWatermark: func(context.Context) error { invalidateCalled.Store(true); return nil },
 		Logger:              discardLogger(),
+		RunWait: func(wait func() error) error {
+			wrapperCalls.Add(1)
+			return wait()
+		},
 	})
 	require.NoError(t, err)
 	assert.True(t, checksumStarted.Load(), "checksum must run while waiting")
 	assert.True(t, invalidateCalled.Load(), "watermark cleanup must run on the way out")
+	assert.Equal(t, int32(1), wrapperCalls.Load(), "confirmed wait must be wrapped exactly once")
 }
 
 func TestWaitTimeout(t *testing.T) {

@@ -86,6 +86,11 @@ type WaitConfig struct {
 	InvalidateWatermark func(ctx context.Context) error
 
 	Logger *slog.Logger
+
+	// RunWait optionally wraps the blocking wait after the sentinel has been
+	// observed. It is not called when the sentinel is absent. A wrapper must
+	// invoke wait exactly once and return its result.
+	RunWait func(wait func() error) error
 }
 
 // Wait blocks until the sentinel table is dropped (proceed with cutover),
@@ -104,7 +109,7 @@ type WaitConfig struct {
 //
 // Exists, RunChecksum and InvalidateWatermark are required (Wait returns an
 // error if any is nil); a nil Logger defaults to slog.Default().
-func Wait(ctx context.Context, cfg WaitConfig) (retErr error) {
+func Wait(ctx context.Context, cfg WaitConfig) error {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -118,6 +123,16 @@ func Wait(ctx context.Context, cfg WaitConfig) (retErr error) {
 		return nil
 	}
 
+	run := func() error {
+		return waitWhilePresent(ctx, cfg)
+	}
+	if cfg.RunWait != nil {
+		return cfg.RunWait(run)
+	}
+	return run()
+}
+
+func waitWhilePresent(ctx context.Context, cfg WaitConfig) (retErr error) {
 	cfg.Logger.Warn("cutover deferred while sentinel table exists; will wait",
 		"sentinel-table", TableName,
 		"wait-limit", WaitLimit.String(),

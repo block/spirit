@@ -227,6 +227,12 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
 }
 
+// SetWorkflowObserver installs the optional typed workflow observer. It must be
+// called before Run. A nil observer disables workflow observation.
+func (r *Runner) SetWorkflowObserver(observer status.WorkflowObserver) {
+	r.status.SetObserver(observer)
+}
+
 // attemptMySQLDDL tries to perform the DDL using MySQL's built-in
 // either with INSTANT or known safe INPLACE operations.
 func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
@@ -234,6 +240,27 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 		return errors.New("attemptMySQLDDL only supports single-table changes")
 	}
 	return r.changes[0].attemptMySQLDDL(ctx)
+}
+
+func (r *Runner) runCopy(ctx context.Context) error {
+	if r.status.HasObserver() {
+		defer func() {
+			rows, chunks, available := copier.CompletedWork(r.copier)
+			if available {
+				r.status.RecordCompletedWork(ctx, rows, chunks)
+			}
+		}()
+	}
+	return r.status.Do(ctx, status.CopyRows, func() error {
+		err := r.copier.Run(ctx)
+		if err == nil && ctx.Err() != nil {
+			chunker := r.copier.GetChunker()
+			if chunker == nil || !chunker.IsRead() {
+				return ctx.Err()
+			}
+		}
+		return err
+	})
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -397,9 +424,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// of migrations usually spend time. It is not strictly necessary,
 	// but we always recopy the last-bit, even if we are resuming
 	// partially through the checksum.
-	if err := r.status.Do(ctx, status.CopyRows, func() error {
-		return r.copier.Run(ctx)
-	}); err != nil {
+	if err := r.runCopy(ctx); err != nil {
 		return err
 	}
 	r.logger.Info("copy rows complete")
@@ -433,14 +458,16 @@ func (r *Runner) Run(ctx context.Context) error {
 		// lives in the sentinel package). The continuous-checksum lifecycle and
 		// watermark invalidation are migration-specific — invalidateChecksumWatermark
 		// scopes its UPDATE by statement because the checkpoint table is shared in
-		// multi-table mode — so they are injected as callbacks. See pkg/sentinel.
-		if err := r.status.Do(ctx, status.WaitingOnSentinelTable, func() error {
-			return sentinel.Wait(ctx, sentinel.WaitConfig{
-				Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
-				RunChecksum:         r.runContinuousChecksum,
-				InvalidateWatermark: r.invalidateChecksumWatermark,
-				Logger:              r.logger,
-			})
+		// multi-table mode — so they are injected as callbacks. RunWait brackets
+		// only an observed sentinel; an absent optional sentinel emits no phase.
+		if err := sentinel.Wait(ctx, sentinel.WaitConfig{
+			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
+			RunChecksum:         r.runContinuousChecksum,
+			InvalidateWatermark: r.invalidateChecksumWatermark,
+			Logger:              r.logger,
+			RunWait: func(wait func() error) error {
+				return r.status.Do(ctx, status.WaitingOnSentinelTable, wait)
+			},
 		}); err != nil {
 			return err
 		}
@@ -475,6 +502,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err := cutover.Run(ctx); err != nil {
 			return fmt.Errorf("cutover failed: %w", err)
 		}
+		r.status.DurableMutation(ctx)
 		return nil
 	}); err != nil {
 		return err
