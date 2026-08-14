@@ -22,6 +22,16 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
+// newTestCheckerConfig is NewCheckerDefaultConfig plus the repair applier that
+// the single-server checker requires (see CheckerConfig.RepairApplier). The
+// applier writes to db, which in these tests holds both tables.
+func newTestCheckerConfig(t *testing.T, db *sql.DB) *CheckerConfig {
+	t.Helper()
+	config := NewCheckerDefaultConfig()
+	config.RepairApplier = applier.NewSingleTargetForTest(t, db)
+	return config
+}
+
 func TestBasicChecksum(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS basic_checksum, _basic_checksum_new, _basic_checksum_chkpnt")
 	testutils.RunSQL(t, "CREATE TABLE basic_checksum (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
@@ -48,7 +58,7 @@ func TestBasicChecksum(t *testing.T) {
 	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 
 	require.NoError(t, checker.Run(t.Context()))
@@ -80,14 +90,26 @@ func TestBasicValidation(t *testing.T) {
 	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
 	require.NoError(t, feed.Start(t.Context()))
 
-	_, err = NewChecker(nil, chunker, []change.Source{feed}, NewCheckerDefaultConfig()) // no source DBs
+	_, err = NewChecker(nil, chunker, []change.Source{feed}, newTestCheckerConfig(t, db)) // no source DBs
 	require.EqualError(t, err, "at least one source database must be provided")
 
-	_, err = NewChecker([]*sql.DB{db}, nil, []change.Source{feed}, NewCheckerDefaultConfig())
+	_, err = NewChecker([]*sql.DB{db}, nil, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.EqualError(t, err, "chunker must be non-nil")
 
-	_, err = NewChecker([]*sql.DB{db}, chunker, nil, NewCheckerDefaultConfig()) // no feed
+	_, err = NewChecker([]*sql.DB{db}, chunker, nil, newTestCheckerConfig(t, db)) // no feed
 	require.EqualError(t, err, "at least one feed must be provided")
+
+	// The single checker cannot repair without an applier, and that has to fail
+	// here rather than on the first mismatch hours into a migration.
+	_, err = NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	require.EqualError(t, err, "repair applier must be non-nil")
+
+	// ... but the distributed checker repairs through its own applier, so it does
+	// not need one.
+	distConfig := NewCheckerDefaultConfig()
+	distConfig.Applier = applier.NewSingleTargetForTest(t, db)
+	_, err = NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, distConfig)
+	require.NoError(t, err)
 }
 
 func TestUnfixableUniqueChecksum(t *testing.T) {
@@ -132,7 +154,7 @@ func TestUnfixableUniqueChecksum(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	config := NewCheckerDefaultConfig()
+	config := newTestCheckerConfig(t, db)
 	config.FixDifferences = true
 	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
 	require.NoError(t, err)
@@ -173,7 +195,7 @@ func TestFixCorrupt(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	config := NewCheckerDefaultConfig()
+	config := newTestCheckerConfig(t, db)
 	config.FixDifferences = true
 	config.MaxRetries = 2
 	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
@@ -232,7 +254,7 @@ func TestRetryDoesNotVacuouslyPass(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	config := NewCheckerDefaultConfig()
+	config := newTestCheckerConfig(t, db)
 	config.FixDifferences = false // surface the mismatch as an error on every attempt
 	config.MaxRetries = 2
 	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
@@ -285,7 +307,7 @@ func TestRunResetsPriorInvalidState(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 	singleChecker, ok := checker.(*SingleChecker)
 	require.True(t, ok, "checker is not of type *SingleChecker")
@@ -326,7 +348,7 @@ func TestCorruptChecksum(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 	singleChecker, ok := checker.(*SingleChecker)
 	require.True(t, ok, "checker is not of type *SingleChecker")
@@ -368,7 +390,7 @@ func TestCorruptBinaryChecksum(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 	singleChecker, ok := checker.(*SingleChecker)
 	require.True(t, ok, "checker is not of type *SingleChecker")
@@ -403,7 +425,7 @@ func TestBoundaryCases(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 	// Type assert to *SingleChecker to access runChecksum
 	singleChecker, ok := checker.(*SingleChecker)
@@ -412,7 +434,7 @@ func TestBoundaryCases(t *testing.T) {
 
 	// UPDATE t1 to also be NULL
 	testutils.RunSQL(t, "UPDATE checkert1 SET c = NULL")
-	checker, err = NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err = NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 	// Type assert to *SingleChecker to access runChecksum
 	singleChecker, ok = checker.(*SingleChecker)
@@ -474,7 +496,7 @@ func TestChangeDataTypeDatetime(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 	require.NoError(t, checker.Run(t.Context())) // fails
 }
@@ -510,7 +532,7 @@ func TestYieldTimeout(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	config := NewCheckerDefaultConfig()
+	config := newTestCheckerConfig(t, db)
 	config.Concurrency = 1
 	// Use a short yield timeout. The initConnPool phase uses the parent
 	// context (not the yield context), so lock acquisition always succeeds.
@@ -556,7 +578,7 @@ func TestFromWatermark(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	config := NewCheckerDefaultConfig()
+	config := newTestCheckerConfig(t, db)
 	config.Watermark = "{\"Key\":[\"a\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"2\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"3\"],\"Inclusive\":false}}"
 	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
 	require.NoError(t, err)
@@ -598,7 +620,7 @@ func TestColumnBoundaryShift(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, NewCheckerDefaultConfig())
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
 	require.NoError(t, err)
 	singleChecker, ok := checker.(*SingleChecker)
 	require.True(t, ok, "checker is not of type *SingleChecker")
@@ -642,7 +664,7 @@ func TestChecksumChunkReleasesTrxDuringRepair(t *testing.T) {
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	config := NewCheckerDefaultConfig()
+	config := newTestCheckerConfig(t, db)
 	config.FixDifferences = true
 	checkerIntf, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
 	require.NoError(t, err)
@@ -785,7 +807,7 @@ func checksumRetryHarness(t *testing.T, name string, mutateSQL string) (*flakyCh
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
-	config := NewCheckerDefaultConfig()
+	config := newTestCheckerConfig(t, db)
 	config.Concurrency = 1 // deterministic: chunks 1-2 complete (watermark ready) before Next() call 3 injects
 	config.FixDifferences = true
 	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)

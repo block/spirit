@@ -34,7 +34,10 @@ func newRepairFixture(t *testing.T, srcName, dstName string, renames map[string]
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	// One applier for both the feed and the repairs, which is how the migration
+	// runner wires it: a repair Start/Stops the same applier the feed is using.
+	app := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, app, change.NewClientDefaultConfig())
 	t.Cleanup(feed.Close)
 	chunker, err := table.NewChunker(src, table.ChunkerConfig{NewTable: dst, ColumnMapping: mapping})
 	require.NoError(t, err)
@@ -43,6 +46,7 @@ func newRepairFixture(t *testing.T, srcName, dstName string, renames map[string]
 
 	config := NewCheckerDefaultConfig()
 	config.FixDifferences = true
+	config.RepairApplier = app
 	checkerIntf, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
 	require.NoError(t, err)
 	checker, ok := checkerIntf.(*SingleChecker)

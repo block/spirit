@@ -126,9 +126,12 @@ func checksumFixture(t *testing.T, name string, rows int, cfg *CheckerConfig) Ch
 
 	dsn, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, dsn.Addr, dsn.User, dsn.Passwd,
-		applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	app := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, dsn.Addr, dsn.User, dsn.Passwd, app, change.NewClientDefaultConfig())
 	t.Cleanup(feed.Close)
+	// The single-server checker requires a repair applier even when the fixture
+	// never produces a mismatch; the callers here only care about pacing.
+	cfg.RepairApplier = app
 
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
