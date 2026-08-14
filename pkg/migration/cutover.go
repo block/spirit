@@ -32,6 +32,8 @@ const (
 	cutoverUnlockTimeout = 30 * time.Second
 )
 
+var errCutoverOwnershipAmbiguous = errors.New("cutover rename may have committed; verify table ownership manually")
+
 type CutOver struct {
 	db       *sql.DB
 	feed     change.Source
@@ -43,6 +45,9 @@ type CutOver struct {
 	// that died after the server committed the RENAME TABLE but before the
 	// client read the OK packet.
 	testInjectRenameError error
+	// testAfterRenameError runs immediately before testInjectRenameError is
+	// returned. It lets tests make the subsequent ownership check unavailable.
+	testAfterRenameError func()
 }
 
 type cutoverConfig struct {
@@ -102,7 +107,7 @@ func (c *CutOver) Run(ctx context.Context) error {
 	renameMayHaveCommitted := false
 	for i := range max(1, c.dbConfig.MaxRetries) {
 		if ctx.Err() != nil {
-			return errors.Join(append(attemptErrs, ctx.Err())...)
+			return joinCutoverErrors(attemptErrs, ctx.Err(), renameMayHaveCommitted)
 		}
 		if i > 0 {
 			// Exponential backoff between attempts. Without this a
@@ -113,7 +118,7 @@ func (c *CutOver) Run(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return errors.Join(append(attemptErrs, ctx.Err())...)
+				return joinCutoverErrors(attemptErrs, ctx.Err(), renameMayHaveCommitted)
 			case <-timer.C:
 			}
 			backoff *= 2
@@ -133,7 +138,7 @@ func (c *CutOver) Run(ctx context.Context) error {
 		// since we will need to catch up again with the lock held
 		// and we want to minimize that.
 		if err := c.feed.Flush(ctx); err != nil {
-			return errors.Join(append(attemptErrs, err)...)
+			return joinCutoverErrors(attemptErrs, err, renameMayHaveCommitted)
 		}
 		// We use maxCutoverRetries as our retrycount, but nested
 		// within c.algorithmX() it may also have a retry for the specific statement
@@ -182,7 +187,19 @@ func (c *CutOver) Run(ctx context.Context) error {
 		return nil
 	}
 	c.logger.Error("cutover failed, and retries exhausted")
-	return errors.Join(attemptErrs...)
+	return joinCutoverErrors(attemptErrs, nil, renameMayHaveCommitted)
+}
+
+func joinCutoverErrors(attemptErrs []error, terminalErr error, ownershipAmbiguous bool) error {
+	errs := make([]error, 0, len(attemptErrs)+2)
+	errs = append(errs, attemptErrs...)
+	if terminalErr != nil {
+		errs = append(errs, terminalErr)
+	}
+	if ownershipAmbiguous {
+		errs = append(errs, errCutoverOwnershipAmbiguous)
+	}
+	return errors.Join(errs...)
 }
 
 // confirmRenameCompleted wraps renameCompleted with logging for use in the
@@ -320,6 +337,9 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	if c.testInjectRenameError != nil {
 		// Test-only seam: the rename was committed by the server, but we
 		// pretend the client never read the OK packet.
+		if c.testAfterRenameError != nil {
+			c.testAfterRenameError()
+		}
 		return c.testInjectRenameError
 	}
 	return nil

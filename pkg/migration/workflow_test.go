@@ -220,3 +220,18 @@ func TestMigrationWorkflowReportsDurableMutationBeforeCleanup(t *testing.T) {
 	require.Equal(t, 1, indexCount)
 	require.NoError(t, r.Close())
 }
+
+func TestMigrationWorkflowReportsAmbiguousCutoverOwnership(t *testing.T) {
+	observer := &recordingWorkflowObserver{}
+	r := &Runner{}
+	r.SetWorkflowObserver(observer)
+	cause := errors.New("connection lost after rename")
+
+	err := r.wrapCutoverError(t.Context(), errors.Join(cause, errCutoverOwnershipAmbiguous))
+
+	require.ErrorIs(t, err, cause)
+	events, _ := observer.snapshot()
+	require.Equal(t, []status.WorkflowEvent{{
+		TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,
+	}}, events)
+}

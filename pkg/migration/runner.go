@@ -502,13 +502,14 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		}
 		if err := cutover.Run(ctx); err != nil {
-			return fmt.Errorf("cutover failed: %w", err)
+			return r.wrapCutoverError(ctx, err)
 		}
 		r.status.DurableMutation(ctx)
 		return nil
 	}); err != nil {
 		return err
 	}
+
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
 			if err := change.dropOldTable(ctx); err != nil {
@@ -549,6 +550,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+func (r *Runner) wrapCutoverError(ctx context.Context, err error) error {
+	if errors.Is(err, errCutoverOwnershipAmbiguous) {
+		r.status.Terminal(ctx, status.WorkflowTerminalOwnershipAmbiguous)
+	}
+	return fmt.Errorf("cutover failed: %w", err)
 }
 
 // postCopyPhase runs the work that happens between copy-rows and the
