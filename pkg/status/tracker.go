@@ -36,6 +36,7 @@ type Tracker struct {
 	durations map[State]time.Duration // closed time attributed per state
 
 	observer                atomic.Pointer[workflowObserverSlot]
+	completedWorkObserved   atomic.Bool
 	durableMutationObserved atomic.Bool
 	terminalObserved        atomic.Bool
 }
@@ -47,6 +48,7 @@ type Tracker struct {
 // Begin again starts a fresh run rather than extending the previous one.
 func (t *Tracker) Begin() {
 	t.durableMutationObserved.Store(false)
+	t.completedWorkObserved.Store(false)
 	t.terminalObserved.Store(false)
 	now := time.Now()
 	t.mu.Lock()
@@ -118,9 +120,13 @@ func (t *Tracker) HasObserver() bool {
 	return t.observer.Load() != nil
 }
 
-// RecordCompletedWork synchronously reports authoritative aggregate copy work.
-// It is separate from Do's finished event because the copier owns this evidence.
+// RecordCompletedWork synchronously reports the authoritative terminal copy
+// aggregate at most once per run. It is separate from Do's finished event
+// because the copier owns this evidence.
 func (t *Tracker) RecordCompletedWork(ctx context.Context, rows, chunks uint64) {
+	if !t.completedWorkObserved.CompareAndSwap(false, true) {
+		return
+	}
 	t.emit(ctx, WorkflowEvent{
 		State:           CopyRows,
 		Totals:          WorkflowTotals{CompletedRows: rows, CompletedChunks: chunks},

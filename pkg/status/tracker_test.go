@@ -382,6 +382,7 @@ func TestTrackerEvidenceIsTypedDeduplicatedAndResetPerRun(t *testing.T) {
 	tr.Begin()
 
 	tr.RecordCompletedWork(t.Context(), 12, 3)
+	tr.RecordCompletedWork(t.Context(), 99, 99)
 	tr.DurableMutation(t.Context())
 	tr.DurableMutation(t.Context())
 	tr.Terminal(t.Context(), 0)
@@ -400,9 +401,16 @@ func TestTrackerEvidenceIsTypedDeduplicatedAndResetPerRun(t *testing.T) {
 	}, events)
 
 	tr.Begin()
+	tr.RecordCompletedWork(t.Context(), 4, 2)
+	tr.RecordCompletedWork(t.Context(), 8, 4)
 	tr.DurableMutation(t.Context())
 	tr.Terminal(t.Context(), WorkflowTerminalOwnershipAmbiguous)
 	events, _ = observer.snapshot()
-	require.Equal(t, WorkflowEvent{DurableMutation: true}, events[3])
-	require.Equal(t, WorkflowEvent{TerminalOwnership: WorkflowTerminalOwnershipAmbiguous}, events[4])
+	require.Equal(t, WorkflowEvent{
+		State:           CopyRows,
+		Totals:          WorkflowTotals{CompletedRows: 4, CompletedChunks: 2},
+		TotalsAvailable: true,
+	}, events[3])
+	require.Equal(t, WorkflowEvent{DurableMutation: true}, events[4])
+	require.Equal(t, WorkflowEvent{TerminalOwnership: WorkflowTerminalOwnershipAmbiguous}, events[5])
 }
