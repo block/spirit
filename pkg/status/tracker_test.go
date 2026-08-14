@@ -250,6 +250,15 @@ func TestTrackerDoClassifiesOutcomes(t *testing.T) {
 			want:    WorkflowOutcomeSucceeded,
 		},
 		{
+			name: "cancelled runner context with nil error",
+			context: func() context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			want: WorkflowOutcomeCancelled,
+		},
+		{
 			name:    "failure",
 			context: t.Context,
 			err:     failureErr,

@@ -247,14 +247,14 @@ func notifyWorkflowObserver(observer WorkflowObserver, ctx context.Context, even
 }
 
 func workflowOutcome(ctx context.Context, err error) WorkflowOutcome {
-	if err == nil {
-		return WorkflowOutcomeSucceeded
-	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return WorkflowOutcomeCancelled
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return WorkflowOutcomeCancelled
+	}
+	if err == nil {
+		return WorkflowOutcomeSucceeded
 	}
 	return WorkflowOutcomeFailed
 }
