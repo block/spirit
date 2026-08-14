@@ -329,6 +329,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
+			r.status.DurableMutation(ctx)
 			r.logger.Info("apply complete")
 			return nil
 		}
@@ -400,6 +401,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			"instant-ddl", r.usedInstantDDL,
 			"inplace-ddl", r.usedInplaceDDL,
 		)
+		r.status.DurableMutation(ctx)
 		return nil // success!
 	}
 

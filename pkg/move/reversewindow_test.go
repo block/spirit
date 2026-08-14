@@ -294,6 +294,8 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(run2)
+	observer := &recordingMoveWorkflowObserver{}
+	run2.SetWorkflowObserver(observer)
 	run2.SetCutover(func(context.Context) error {
 		t.Error("resume must NOT run the forward cutover again (it re-copied instead of resuming)")
 		return nil
@@ -317,6 +319,9 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 	require.True(t, reverseCutoverCalled, "resumed window must be able to roll back")
 	require.True(t, tableExists(t, ctl, "rwrk_src", "t1"), "source un-retired after rollback")
 	require.True(t, tableExists(t, ctl, "rwrk_dst", "t1_revert"), "target retired to _revert after rollback")
+	events, _ := observer.snapshot()
+	require.Contains(t, events, status.WorkflowEvent{DurableMutation: true},
+		"a resumed post-cutover run must report the mutation inherited from its checkpoint")
 	require.False(t, tableExists(t, ctl, "rwrk_dst", "t1"), "target real table gone after rollback")
 }
 

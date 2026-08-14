@@ -141,6 +141,46 @@ func TestMigrationWorkflowCompletedWorkCapabilityIsConditional(t *testing.T) {
 	})
 }
 
+func TestMigrationWorkflowReportsDirectDDLMutation(t *testing.T) {
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE direct_ddl_observer (
+		id bigint unsigned NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+
+	t.Run("instant alter", func(t *testing.T) {
+		observer := &recordingWorkflowObserver{}
+		r := NewTestRunnerFromStatement(
+			t,
+			"ALTER TABLE direct_ddl_observer ADD COLUMN observed INT",
+			WithDBName(dbName),
+			WithThreads(1),
+		)
+		r.SetWorkflowObserver(observer)
+
+		require.NoError(t, r.Run(t.Context()))
+		require.True(t, r.usedInstantDDL)
+		events, _ := observer.snapshot()
+		require.Equal(t, []status.WorkflowEvent{{DurableMutation: true}}, events)
+		require.NoError(t, r.Close())
+	})
+
+	t.Run("direct statement", func(t *testing.T) {
+		observer := &recordingWorkflowObserver{}
+		r := NewTestRunnerFromStatement(
+			t,
+			"CREATE TABLE direct_statement_observer (id INT PRIMARY KEY)",
+			WithDBName(dbName),
+		)
+		r.SetWorkflowObserver(observer)
+
+		require.NoError(t, r.Run(t.Context()))
+		events, _ := observer.snapshot()
+		require.Equal(t, []status.WorkflowEvent{{DurableMutation: true}}, events)
+		require.NoError(t, r.Close())
+	})
+}
+
 func TestMigrationWorkflowReportsDurableMutationBeforeCleanup(t *testing.T) {
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
 	const tableName = "observed_empty_cutover"

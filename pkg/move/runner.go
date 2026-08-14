@@ -824,12 +824,15 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 	}
 	switch rec.Phase {
 	case phaseReverseWindow:
+		r.status.DurableMutation(ctx)
 		r.logger.Warn("resuming an interrupted reverse window from checkpoint", "cutover_at", rec.CutoverAt)
 		return true, r.resumeReverseWindow(ctx, rec)
 	case phaseReverting:
+		r.status.DurableMutation(ctx)
 		r.ownershipAmbiguous = true
 		return true, fmt.Errorf("a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually", rec.Phase)
 	case phaseReverseFinalized:
+		r.status.DurableMutation(ctx)
 		// Ownership is already definitive. Retry only the idempotent cleanup
 		// that may have failed after the phase was durably persisted.
 		return true, newReverseWindow(r).finalizeReverse(ctx)
