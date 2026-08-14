@@ -397,7 +397,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// of migrations usually spend time. It is not strictly necessary,
 	// but we always recopy the last-bit, even if we are resuming
 	// partially through the checksum.
-	if err := r.status.Do(status.CopyRows, func() error {
+	if err := r.status.Do(ctx, status.CopyRows, func() error {
 		return r.copier.Run(ctx)
 	}); err != nil {
 		return err
@@ -434,7 +434,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		// watermark invalidation are migration-specific — invalidateChecksumWatermark
 		// scopes its UPDATE by statement because the checkpoint table is shared in
 		// multi-table mode — so they are injected as callbacks. See pkg/sentinel.
-		if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
+		if err := r.status.Do(ctx, status.WaitingOnSentinelTable, func() error {
 			return sentinel.Wait(ctx, sentinel.WaitConfig{
 				Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
 				RunChecksum:         r.runContinuousChecksum,
@@ -451,7 +451,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	// It's time for the final cut-over, where
 	// the tables are swapped under a lock.
-	if err := r.status.Do(status.CutOver, func() error {
+	if err := r.status.Do(ctx, status.CutOver, func() error {
 		cutoverCfg := []*cutoverConfig{}
 		for _, change := range r.changes {
 			cutoverCfg = append(cutoverCfg, &cutoverConfig{
@@ -530,7 +530,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// We want it disabled for ANALYZE TABLE and acquiring a table lock
 	// *but* it will be started again briefly inside of the checksum
 	// runner to ensure that the lag does not grow too long.
-	if err := r.status.Do(status.ApplyChangeset, func() error {
+	if err := r.status.Do(ctx, status.ApplyChangeset, func() error {
 		r.replClient.StopPeriodicFlush()
 		return r.replClient.Flush(ctx)
 	}); err != nil {
@@ -541,7 +541,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	if err := r.status.Do(status.AnalyzeTable, func() error {
+	if err := r.status.Do(ctx, status.AnalyzeTable, func() error {
 		r.logger.Info("Running ANALYZE TABLE")
 		for _, change := range r.changes {
 			if err := dbconn.Exec(ctx, r.db, "ANALYZE TABLE %n.%n", change.newTable.SchemaName, change.newTable.TableName); err != nil {
@@ -1683,7 +1683,7 @@ func (r *Runner) initChunkers() error {
 
 // checksum creates the checksum which opens the read view
 func (r *Runner) checksum(ctx context.Context) error {
-	if err := r.status.Do(status.Checksum, func() error {
+	if err := r.status.Do(ctx, status.Checksum, func() error {
 		// The checksum keeps the pool threads open, so we need to extend
 		// by more than +1 on threads as we did previously. We have:
 		// - background flushing
@@ -1720,7 +1720,7 @@ func (r *Runner) checksum(ctx context.Context) error {
 	// A long checksum extends the binlog deltas
 	// So if we've called this optional checksum, we need one more state
 	// of applying the binlog deltas.
-	return r.status.Do(status.PostChecksum, func() error {
+	return r.status.Do(ctx, status.PostChecksum, func() error {
 		return r.replClient.Flush(ctx)
 	})
 }

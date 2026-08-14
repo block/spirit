@@ -1,7 +1,12 @@
 package status
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -23,7 +28,7 @@ func TestTrackerDoSetsStateAndReturnsError(t *testing.T) {
 
 	var tr Tracker
 	sentinelErr := errors.New("copy failed")
-	err := tr.Do(CopyRows, func() error {
+	err := tr.Do(t.Context(), CopyRows, func() error {
 		// The state is current while fn runs, so concurrent readers
 		// (status loggers, watchers) observe it.
 		require.Equal(t, CopyRows, tr.Get())
@@ -39,7 +44,7 @@ func TestTrackerDoRecordsDuration(t *testing.T) {
 	t.Parallel()
 
 	var tr Tracker
-	require.NoError(t, tr.Do(Checksum, func() error {
+	require.NoError(t, tr.Do(t.Context(), Checksum, func() error {
 		time.Sleep(20 * time.Millisecond)
 		return nil
 	}))
@@ -58,7 +63,7 @@ func TestTrackerBeginResetsRun(t *testing.T) {
 	var tr Tracker
 	tr.Begin()
 	first := tr.StartTime()
-	require.NoError(t, tr.Do(CopyRows, func() error {
+	require.NoError(t, tr.Do(t.Context(), CopyRows, func() error {
 		time.Sleep(10 * time.Millisecond)
 		return nil
 	}))
@@ -92,7 +97,7 @@ func TestTrackerRepeatedStatesAccumulate(t *testing.T) {
 
 	var tr Tracker
 	for range 2 {
-		require.NoError(t, tr.Do(Checksum, func() error {
+		require.NoError(t, tr.Do(t.Context(), Checksum, func() error {
 			time.Sleep(10 * time.Millisecond)
 			return nil
 		}))
@@ -104,7 +109,7 @@ func TestTrackerDoThenSetDoesNotDoubleCount(t *testing.T) {
 	t.Parallel()
 
 	var tr Tracker
-	require.NoError(t, tr.Do(CopyRows, func() error {
+	require.NoError(t, tr.Do(t.Context(), CopyRows, func() error {
 		time.Sleep(10 * time.Millisecond)
 		return nil
 	}))
@@ -120,7 +125,7 @@ func TestTrackerDoRecordsOnPanic(t *testing.T) {
 
 	var tr Tracker
 	require.Panics(t, func() {
-		_ = tr.Do(CutOver, func() error {
+		_ = tr.Do(t.Context(), CutOver, func() error {
 			time.Sleep(10 * time.Millisecond)
 			panic("cutover exploded")
 		})
@@ -137,9 +142,9 @@ func TestTrackerNestedDoAttributesToInnermost(t *testing.T) {
 
 	var tr Tracker
 	start := time.Now()
-	require.NoError(t, tr.Do(WaitingOnSentinelTable, func() error {
+	require.NoError(t, tr.Do(t.Context(), WaitingOnSentinelTable, func() error {
 		time.Sleep(10 * time.Millisecond)
-		return tr.Do(Checksum, func() error {
+		return tr.Do(t.Context(), Checksum, func() error {
 			time.Sleep(10 * time.Millisecond)
 			return nil
 		})
@@ -175,10 +180,220 @@ func TestTrackerConcurrentReaders(t *testing.T) {
 		})
 	}
 	for range 100 {
-		require.NoError(t, tr.Do(CopyRows, func() error { return nil }))
+		require.NoError(t, tr.Do(t.Context(), CopyRows, func() error { return nil }))
 		tr.Set(Checksum)
 	}
 	close(done)
 	wg.Wait()
 	require.Positive(t, tr.Duration(CopyRows))
+}
+
+type recordingWorkflowObserver struct {
+	mu       sync.Mutex
+	events   []WorkflowEvent
+	contexts []context.Context
+}
+
+func (o *recordingWorkflowObserver) ObserveWorkflow(ctx context.Context, event WorkflowEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.contexts = append(o.contexts, ctx)
+	o.events = append(o.events, event)
+}
+
+func (o *recordingWorkflowObserver) snapshot() ([]WorkflowEvent, []context.Context) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]WorkflowEvent(nil), o.events...), append([]context.Context(nil), o.contexts...)
+}
+
+type workflowObserverFunc func(context.Context, WorkflowEvent)
+
+func (f workflowObserverFunc) ObserveWorkflow(ctx context.Context, event WorkflowEvent) {
+	f(ctx, event)
+}
+
+func TestTrackerDoEmitsOrderedAttempts(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(t.Context(), contextKey{}, "workflow")
+	observer := &recordingWorkflowObserver{}
+	var tr Tracker
+	tr.SetObserver(observer)
+
+	require.NoError(t, tr.Do(ctx, CopyRows, func() error { return nil }))
+	require.NoError(t, tr.Do(ctx, CopyRows, func() error { return nil }))
+
+	events, contexts := observer.snapshot()
+	require.Equal(t, []WorkflowEvent{
+		{State: CopyRows, Transition: WorkflowTransitionStarted},
+		{State: CopyRows, Transition: WorkflowTransitionFinished, Outcome: WorkflowOutcomeSucceeded},
+		{State: CopyRows, Transition: WorkflowTransitionStarted},
+		{State: CopyRows, Transition: WorkflowTransitionFinished, Outcome: WorkflowOutcomeSucceeded},
+	}, events)
+	require.Len(t, contexts, len(events))
+	for _, observedCtx := range contexts {
+		require.Equal(t, "workflow", observedCtx.Value(contextKey{}))
+	}
+}
+
+func TestTrackerDoClassifiesOutcomes(t *testing.T) {
+	failureErr := errors.New("failed")
+	for _, tt := range []struct {
+		name    string
+		context func() context.Context
+		err     error
+		want    WorkflowOutcome
+	}{
+		{
+			name:    "success",
+			context: t.Context,
+			want:    WorkflowOutcomeSucceeded,
+		},
+		{
+			name:    "failure",
+			context: t.Context,
+			err:     failureErr,
+			want:    WorkflowOutcomeFailed,
+		},
+		{
+			name:    "returned cancellation",
+			context: t.Context,
+			err:     fmt.Errorf("copy stopped: %w", context.Canceled),
+			want:    WorkflowOutcomeCancelled,
+		},
+		{
+			name: "cancelled runner context",
+			context: func() context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			err:  failureErr,
+			want: WorkflowOutcomeCancelled,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			observer := &recordingWorkflowObserver{}
+			var tr Tracker
+			tr.SetObserver(observer)
+			require.ErrorIs(t, tr.Do(tt.context(), Checksum, func() error {
+				return tt.err
+			}), tt.err)
+
+			events, _ := observer.snapshot()
+			require.Len(t, events, 2)
+			require.Equal(t, tt.want, events[1].Outcome)
+		})
+	}
+}
+
+func TestTrackerDoReportsPanicWithoutRecoveringIt(t *testing.T) {
+	observer := &recordingWorkflowObserver{}
+	var tr Tracker
+	tr.SetObserver(observer)
+	panicValue := &struct{ message string }{message: "cutover exploded"}
+
+	require.PanicsWithValue(t, panicValue, func() {
+		_ = tr.Do(t.Context(), CutOver, func() error {
+			panic(panicValue)
+		})
+	})
+
+	events, _ := observer.snapshot()
+	require.Equal(t, []WorkflowEvent{
+		{State: CutOver, Transition: WorkflowTransitionStarted},
+		{State: CutOver, Transition: WorkflowTransitionFinished, Outcome: WorkflowOutcomeFailed},
+	}, events)
+}
+
+func TestTrackerDoReportsRuntimeGoexit(t *testing.T) {
+	observer := &recordingWorkflowObserver{}
+	var tr Tracker
+	tr.SetObserver(observer)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		_ = tr.Do(t.Context(), ReverseWindow, func() error {
+			runtime.Goexit()
+			return nil
+		})
+	}()
+	<-done
+
+	events, _ := observer.snapshot()
+	require.Equal(t, []WorkflowEvent{
+		{State: ReverseWindow, Transition: WorkflowTransitionStarted},
+		{State: ReverseWindow, Transition: WorkflowTransitionFinished, Outcome: WorkflowOutcomeFailed},
+	}, events)
+}
+
+func TestTrackerDoPreservesLegacyNilPanic(t *testing.T) {
+	const childEnv = "SPIRIT_TEST_TRACKER_PANIC_NIL"
+	if os.Getenv(childEnv) == "1" {
+		var tr Tracker
+		tr.SetObserver(workflowObserverFunc(func(_ context.Context, event WorkflowEvent) {
+			if event.Transition == WorkflowTransitionFinished && event.Outcome == WorkflowOutcomeFailed {
+				fmt.Println("tracker-failed")
+			}
+		}))
+		_ = tr.Do(context.Background(), CutOver, func() error {
+			panic(nil)
+		})
+		fmt.Println("panic-was-swallowed")
+		return
+	}
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestTrackerDoPreservesLegacyNilPanic$")
+	cmd.Env = append(os.Environ(), "GODEBUG=panicnil=1", childEnv+"=1")
+	output, err := cmd.CombinedOutput()
+	require.Error(t, err, "an unhandled legacy panic(nil) must still terminate the child")
+	require.Contains(t, string(output), "tracker-failed")
+	require.NotContains(t, string(output), "panic-was-swallowed")
+}
+
+func TestTrackerObserverPanicCannotChangeRunnerBehavior(t *testing.T) {
+	var tr Tracker
+	tr.SetObserver(workflowObserverFunc(func(context.Context, WorkflowEvent) {
+		panic("observer panic")
+	}))
+
+	require.NotPanics(t, func() {
+		require.NoError(t, tr.Do(t.Context(), CopyRows, func() error { return nil }))
+		tr.RecordCompletedWork(t.Context(), 3, 1)
+		tr.DurableMutation(t.Context())
+		tr.Terminal(t.Context(), WorkflowTerminalOwnershipAmbiguous)
+	})
+}
+
+func TestTrackerEvidenceIsTypedDeduplicatedAndResetPerRun(t *testing.T) {
+	observer := &recordingWorkflowObserver{}
+	var tr Tracker
+	tr.SetObserver(observer)
+	tr.Begin()
+
+	tr.RecordCompletedWork(t.Context(), 12, 3)
+	tr.DurableMutation(t.Context())
+	tr.DurableMutation(t.Context())
+	tr.Terminal(t.Context(), 0)
+	tr.Terminal(t.Context(), WorkflowTerminalOwnershipReverseFinalized)
+	tr.Terminal(t.Context(), WorkflowTerminalOwnershipAmbiguous)
+
+	events, _ := observer.snapshot()
+	require.Equal(t, []WorkflowEvent{
+		{
+			State:           CopyRows,
+			Totals:          WorkflowTotals{CompletedRows: 12, CompletedChunks: 3},
+			TotalsAvailable: true,
+		},
+		{DurableMutation: true},
+		{TerminalOwnership: WorkflowTerminalOwnershipReverseFinalized},
+	}, events)
+
+	tr.Begin()
+	tr.DurableMutation(t.Context())
+	tr.Terminal(t.Context(), WorkflowTerminalOwnershipAmbiguous)
+	events, _ = observer.snapshot()
+	require.Equal(t, WorkflowEvent{DurableMutation: true}, events[3])
+	require.Equal(t, WorkflowEvent{TerminalOwnership: WorkflowTerminalOwnershipAmbiguous}, events[4])
 }

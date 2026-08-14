@@ -16,10 +16,10 @@ This ordering is deliberate — the code uses ordinal comparisons (e.g., `state 
 
 ## Tracker
 
-`Tracker` wraps a `State` with per-state wall-clock timing, and is what the runners hold in place of a bare `State` field. Phases with a clear extent run under `Do(state, fn)`, which transitions to `state`, runs `fn`, and attributes `fn`'s elapsed time (panic inclusive) to that state:
+`Tracker` wraps a `State` with per-state wall-clock timing, and is what the runners hold in place of a bare `State` field. Phases with a clear extent run under `Do(ctx, state, fn)`, which transitions to `state`, synchronously emits typed started/finished observations, runs `fn`, and attributes `fn`'s elapsed time (panic and `runtime.Goexit` inclusive) to that state:
 
 ```go
-err := r.status.Do(status.CopyRows, func() error {
+err := r.status.Do(ctx, status.CopyRows, func() error {
     return r.copier.Run(ctx)
 })
 ```
@@ -29,6 +29,8 @@ err := r.status.Do(status.CopyRows, func() error {
 Because the tracker owns the timing, the runners no longer carry ad-hoc fields like `copyDuration` or `sentinelWaitStartTime`: the status block header renders `Elapsed()` (time in the current state) and final summaries render `Duration(state)` (total time attributed to a state, accumulating across repeat visits). The two can disagree after a bracket completes: `Duration(state)` freezes when the bracket closes, while `Elapsed()` keeps growing until the next transition.
 
 The tracker assumes spirit's linear execution model — one goroutine advances through the phases in order, and the only concurrent transition is a fatal `Set(ErrCleanup)` racing an open bracket (time accrues to the bracketed state up to the fatal transition; the bracket's own exit becomes a no-op). It is not designed for concurrent or overlapping phases. `Begin()` marks the start of a run and resets all timing; runners call it once at the top of `Run`.
+
+An optional `WorkflowObserver` receives the bracketed state transitions and separate authoritative evidence reported by a runner: aggregate completed copy work, durable mutation, and terminal ownership. Observer panics are isolated from runner behavior. `Do` does not recover application panics; its deferred finish reports an abnormal unwind as failed and lets the original panic or `runtime.Goexit` continue unchanged. Evidence is synchronous and independent of a phase's returned error, so a successful mutation followed by fallible cleanup remains observable.
 
 ## Task Interface
 

@@ -1163,7 +1163,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		// cutover callback still runs through the same result-bearing helper as
 		// the full cutover path.
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
-		if err := r.status.Do(status.CutOver, func() error {
+		if err := r.status.Do(ctx, status.CutOver, func() error {
 			_, err := r.runForwardCutoverCallback(ctx)
 			return err
 		}); err != nil {
@@ -1210,7 +1210,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	if err := r.status.Do(status.CopyRows, func() error {
+	if err := r.status.Do(ctx, status.CopyRows, func() error {
 		return r.copier.Run(ctx)
 	}); err != nil {
 		return err
@@ -1243,7 +1243,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// watermark invalidation are move-specific (multi-source feeds;
 	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
 	// so they are injected as callbacks. See pkg/sentinel.
-	if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
+	if err := r.status.Do(ctx, status.WaitingOnSentinelTable, func() error {
 		return sentinel.Wait(ctx, sentinel.WaitConfig{
 			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
 			RunChecksum:         r.runContinuousChecksum,
@@ -1262,7 +1262,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logger.Info("Sentinel released, starting cutover")
 	// Create a cutover.
-	if err := r.status.Do(status.CutOver, func() error {
+	if err := r.status.Do(ctx, status.CutOver, func() error {
 		cutoverSources := make([]CutOverSource, len(r.sources))
 		for i := range r.sources {
 			cutoverSources[i] = CutOverSource{
@@ -1671,7 +1671,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// pkg/change/subscription_buffered.go), unread binlog would pile up
 	// server-side, and a source purging binlogs past the reader's position
 	// during an hours-long index build would fail the move fatally.
-	if err := r.status.Do(status.ApplyChangeset, func() error {
+	if err := r.status.Do(ctx, status.ApplyChangeset, func() error {
 		return r.flushAllReplClients(ctx)
 	}); err != nil {
 		return err
@@ -1680,7 +1680,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// Restore secondary indexes if they were deferred during table creation.
 	// This is always called (not conditional on DeferSecondaryIndexes) to handle
 	// checkpoint resume scenarios where indexes may have been deferred in a previous run.
-	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
+	if err := r.status.Do(ctx, status.RestoreSecondaryIndexes, func() error {
 		return r.restoreSecondaryIndexes(ctx)
 	}); err != nil {
 		return err
@@ -1690,7 +1690,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	if err := r.status.Do(status.AnalyzeTable, func() error {
+	if err := r.status.Do(ctx, status.AnalyzeTable, func() error {
 		r.logger.Info("Running ANALYZE TABLE")
 		for _, target := range r.targets {
 			for _, tbl := range r.sourceTables {
@@ -1761,7 +1761,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// repair) or resumes safely from a watermark that came from a clean
 	// pass. See pkg/migration/runner.go DumpCheckpoint for the full
 	// rationale.
-	return r.status.Do(status.Checksum, func() error {
+	return r.status.Do(ctx, status.Checksum, func() error {
 		return r.checker.Run(ctx)
 	})
 }

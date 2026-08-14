@@ -1,7 +1,10 @@
 package status
 
 import (
+	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +34,10 @@ type Tracker struct {
 	enteredAt time.Time               // when the current state was entered
 	open      bool                    // the current state has a running interval
 	durations map[State]time.Duration // closed time attributed per state
+
+	observer                atomic.Pointer[workflowObserverSlot]
+	durableMutationObserved atomic.Bool
+	terminalObserved        atomic.Bool
 }
 
 // Begin marks the start of a run: it resets all timing (start time, per-state
@@ -39,6 +46,8 @@ type Tracker struct {
 // at the top of Run, where they previously recorded a startTime field. Calling
 // Begin again starts a fresh run rather than extending the previous one.
 func (t *Tracker) Begin() {
+	t.durableMutationObserved.Store(false)
+	t.terminalObserved.Store(false)
 	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -62,14 +71,78 @@ func (t *Tracker) Set(state State) {
 	t.enter(state)
 }
 
-// Do runs fn as the given state: it transitions to state, runs fn, and
-// attributes fn's wall-clock time (panic inclusive) to state. The state
-// remains current after Do returns — as with Set, the next state begins only
-// when it is entered.
-func (t *Tracker) Do(state State, fn func() error) error {
+// Do runs fn as the given state: it transitions to state, synchronously emits
+// started and finished observations, and attributes fn's wall-clock time
+// (panic and runtime.Goexit inclusive) to state. The state remains current
+// after Do returns — as with Set, the next state begins only when it is entered.
+//
+// A single deferred finish distinguishes normal return from abnormal unwind
+// without recovering. This preserves the application's original panic value,
+// including legacy panic(nil), and runtime.Goexit behavior.
+func (t *Tracker) Do(ctx context.Context, state State, fn func() error) (err error) {
 	t.enter(state)
-	defer t.exit(state)
-	return fn()
+	completedNormally := false
+	defer func() {
+		t.exit(state)
+		outcome := WorkflowOutcomeFailed
+		if completedNormally {
+			outcome = workflowOutcome(ctx, err)
+		}
+		t.emit(ctx, WorkflowEvent{
+			State:      state,
+			Transition: WorkflowTransitionFinished,
+			Outcome:    outcome,
+		})
+	}()
+
+	t.emit(ctx, WorkflowEvent{
+		State:      state,
+		Transition: WorkflowTransitionStarted,
+	})
+	err = fn()
+	completedNormally = true
+	return err
+}
+
+// SetObserver replaces the workflow observer. A nil observer disables delivery.
+func (t *Tracker) SetObserver(observer WorkflowObserver) {
+	if observer == nil {
+		t.observer.Store(nil)
+		return
+	}
+	t.observer.Store(&workflowObserverSlot{observer: observer})
+}
+
+// HasObserver reports whether workflow event delivery is enabled.
+func (t *Tracker) HasObserver() bool {
+	return t.observer.Load() != nil
+}
+
+// RecordCompletedWork synchronously reports authoritative aggregate copy work.
+// It is separate from Do's finished event because the copier owns this evidence.
+func (t *Tracker) RecordCompletedWork(ctx context.Context, rows, chunks uint64) {
+	t.emit(ctx, WorkflowEvent{
+		State:           CopyRows,
+		Totals:          WorkflowTotals{CompletedRows: rows, CompletedChunks: chunks},
+		TotalsAvailable: true,
+	})
+}
+
+// DurableMutation reports that an externally visible mutation completed. It is
+// emitted at most once per run and remains independent of any phase outcome.
+func (t *Tracker) DurableMutation(ctx context.Context) {
+	if !t.durableMutationObserved.CompareAndSwap(false, true) {
+		return
+	}
+	t.emit(ctx, WorkflowEvent{DurableMutation: true})
+}
+
+// Terminal reports terminal ownership evidence at most once per run.
+func (t *Tracker) Terminal(ctx context.Context, ownership WorkflowTerminalOwnership) {
+	if !ownership.valid() || !t.terminalObserved.CompareAndSwap(false, true) {
+		return
+	}
+	t.emit(ctx, WorkflowEvent{TerminalOwnership: ownership})
 }
 
 // StartTime returns when the run began: Begin, or the first transition if
@@ -156,4 +229,32 @@ func (t *Tracker) accrueLocked(now time.Time) {
 	}
 	t.durations[t.state.get()] += now.Sub(t.enteredAt)
 	t.open = false
+}
+
+func (t *Tracker) emit(ctx context.Context, event WorkflowEvent) {
+	slot := t.observer.Load()
+	if slot == nil {
+		return
+	}
+	notifyWorkflowObserver(slot.observer, ctx, event)
+}
+
+func notifyWorkflowObserver(observer WorkflowObserver, ctx context.Context, event WorkflowEvent) {
+	defer func() {
+		_ = recover()
+	}()
+	observer.ObserveWorkflow(ctx, event)
+}
+
+func workflowOutcome(ctx context.Context, err error) WorkflowOutcome {
+	if err == nil {
+		return WorkflowOutcomeSucceeded
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return WorkflowOutcomeCancelled
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return WorkflowOutcomeCancelled
+	}
+	return WorkflowOutcomeFailed
 }

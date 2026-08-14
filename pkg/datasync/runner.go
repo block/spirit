@@ -306,7 +306,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := r.status.Do(status.CopyRows, func() error {
+	if err := r.status.Do(ctx, status.CopyRows, func() error {
 		r.logger.Info("Starting copy", "resuming", r.resuming.Load())
 		if err := r.copier.Run(ctx); err != nil {
 			return fmt.Errorf("copy failed: %w", err)
@@ -333,7 +333,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// the post-copy checksum walks it (copy-only). Always called — it is a
 	// no-op when nothing was deferred and resume-safe; see
 	// restoreSecondaryIndexes.
-	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
+	if err := r.status.Do(ctx, status.RestoreSecondaryIndexes, func() error {
 		return r.restoreSecondaryIndexes(ctx)
 	}); err != nil {
 		return fmt.Errorf("failed to restore secondary indexes: %w", err)
@@ -351,13 +351,13 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.logger.Warn("post-copy checkpoint write failed", "error", err)
 		}
 		r.logger.Info("Copy complete; entering continuous checksum (CopyOnly mode)")
-		return r.status.Do(status.ApplyChangeset, func() error {
+		return r.status.Do(ctx, status.ApplyChangeset, func() error {
 			return r.runCopyOnlyChecksum(ctx)
 		})
 	}
 
 	r.logger.Info("Copy complete; entering continuous sync")
-	return r.status.Do(status.ApplyChangeset, func() error {
+	return r.status.Do(ctx, status.ApplyChangeset, func() error {
 		return r.runContinuous(ctx)
 	})
 }
