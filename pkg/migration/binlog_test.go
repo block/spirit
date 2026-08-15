@@ -137,7 +137,7 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(m.db)
 	// Get Table Info
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
 	require.NoError(t, err)
 	require.NoError(t, m.setup(t.Context()))
@@ -253,7 +253,7 @@ func TestE2EBinlogSubscribingCompositeKeyVarchar(t *testing.T) {
 	}()
 
 	// Get Table Info
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
 	require.NoError(t, err)
 	require.NoError(t, m.setup(t.Context()))
@@ -355,7 +355,7 @@ func TestE2EBinlogSubscribingCompositeKeyCollation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get table info and setup
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
 	require.NoError(t, err)
 	require.NoError(t, m.setup(t.Context()))
@@ -505,7 +505,7 @@ func TestE2EBinlogSubscribingCompositeKeyBinary(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get table info and setup
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
 	require.NoError(t, err)
 	require.NoError(t, m.setup(t.Context()))
@@ -651,7 +651,7 @@ func TestE2EBinlogSubscribingCompositeKeyDateTime(t *testing.T) {
 	}()
 
 	// Get Table Info
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
 	require.NoError(t, err)
 	require.NoError(t, m.setup(t.Context()))
@@ -722,7 +722,7 @@ func TestE2EBinlogSubscribingNonCompositeKey(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(m.db)
 	// Get Table Info
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
 	require.NoError(t, err)
 	require.NoError(t, m.setup(t.Context()))
@@ -927,7 +927,7 @@ func TestE2EBinlogSubscribingRogueValues(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(m.db)
 	// Get Table Info
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	err = m.changes[0].table.SetInfo(t.Context())
 	require.NoError(t, err)
 

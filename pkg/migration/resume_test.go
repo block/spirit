@@ -129,8 +129,7 @@ func TestCheckpoint(t *testing.T) {
 			Threads:          1,
 			WriteThreads:     1,
 			TargetChunkTime:  100 * time.Millisecond,
-			Table:            "cpt1",
-			Alter:            "ENGINE=InnoDB",
+			Statement:        "ALTER TABLE cpt1 ENGINE=InnoDB",
 			Unbuffered:       true, // see the test's doc comment: intentionally unbuffered
 			useTestThrottler: true,
 		})
@@ -143,7 +142,7 @@ func TestCheckpoint(t *testing.T) {
 		r.dbConfig = dbconn.NewDBConfig()
 
 		// Get Table Info
-		r.changes[0].table = table.NewTableInfo(r.db, r.migration.Database, r.migration.Table)
+		r.changes[0].table = table.NewTableInfo(r.db, r.migration.Database, r.changes[0].stmt.Table)
 		require.NoError(t, r.changes[0].table.SetInfo(t.Context()))
 		require.NoError(t, r.changes[0].dropOldTable(t.Context()))
 		return r
@@ -281,8 +280,7 @@ func TestCheckpointRestore(t *testing.T) {
 		Database:     cfg.DBName,
 		Threads:      2,
 		WriteThreads: 2,
-		Table:        "cpt2",
-		Alter:        "ENGINE=InnoDB",
+		Statement:    "ALTER TABLE cpt2 ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	require.Equal(t, "initial", r.status.Get().String())
@@ -292,7 +290,7 @@ func TestCheckpointRestore(t *testing.T) {
 	require.NoError(t, err)
 	r.dbConfig = dbconn.NewDBConfig()
 	// Get Table Info
-	r.changes[0].table = table.NewTableInfo(r.db, r.migration.Database, r.migration.Table)
+	r.changes[0].table = table.NewTableInfo(r.db, r.migration.Database, r.changes[0].stmt.Table)
 	require.NoError(t, r.changes[0].table.SetInfo(t.Context()))
 	require.NoError(t, r.changes[0].dropOldTable(t.Context()))
 
@@ -324,8 +322,7 @@ func TestCheckpointRestore(t *testing.T) {
 		Database:     cfg.DBName,
 		Threads:      2,
 		WriteThreads: 2,
-		Table:        "cpt2",
-		Alter:        "ENGINE=InnoDB",
+		Statement:    "ALTER TABLE cpt2 ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	require.NoError(t, r2.Run(t.Context()))
@@ -469,15 +466,14 @@ func TestCheckpointDifferentRestoreOptions(t *testing.T) {
 		Database:        cfg.DBName,
 		Threads:         2,
 		WriteThreads:    2,
-		Table:           "cpt1difft1",
-		Alter:           "ADD COLUMN id4 INT NOT NULL DEFAULT 0, ADD INDEX(id2)",
+		Statement:       "ALTER TABLE cpt1difft1 ADD COLUMN id4 INT NOT NULL DEFAULT 0, ADD INDEX(id2)",
 		TargetChunkTime: 100 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	m2.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	m2.dbConfig = dbconn.NewDBConfig()
-	m2.changes[0].table = table.NewTableInfo(m2.db, m2.migration.Database, m2.migration.Table)
+	m2.changes[0].table = table.NewTableInfo(m2.db, m2.migration.Database, m2.changes[0].stmt.Table)
 	require.NoError(t, m2.changes[0].table.SetInfo(t.Context()))
 	require.NoError(t, m2.changes[0].dropOldTable(t.Context()))
 	require.ErrorIs(t, m2.resumeFromCheckpoint(t.Context()), status.ErrMismatchedAlter)
@@ -622,8 +618,7 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 		Database:         cfg.DBName,
 		Threads:          2,
 		WriteThreads:     2,
-		Table:            "phantomtest",
-		Alter:            "ENGINE=InnoDB",
+		Statement:        "ALTER TABLE phantomtest ENGINE=InnoDB",
 		TargetChunkTime:  100 * time.Millisecond,
 		Unbuffered:       true, // see the test's doc comment: intentionally unbuffered
 		useTestThrottler: true,
@@ -636,7 +631,7 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 	m.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	m.dbConfig = dbconn.NewDBConfig()
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	require.NoError(t, m.changes[0].table.SetInfo(ctx))
 
 	require.NoError(t, m.newMigration(t.Context()))
@@ -695,8 +690,7 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 		Database:        cfg.DBName,
 		Threads:         2,
 		WriteThreads:    2,
-		Table:           "phantomtest",
-		Alter:           "ENGINE=InnoDB",
+		Statement:       "ALTER TABLE phantomtest ENGINE=InnoDB",
 		TargetChunkTime: 100 * time.Millisecond,
 		Unbuffered:      true, // continues the unbuffered scenario above (see doc comment)
 	})
@@ -704,7 +698,7 @@ func TestResumeFromCheckpointPhantom(t *testing.T) {
 	m.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	m.dbConfig = dbconn.NewDBConfig()
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.migration.Table)
+	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
 	require.NoError(t, m.changes[0].table.SetInfo(ctx))
 	// check we can resume from checkpoint
 	// this is normally done in m.setup() but we want to call it in isolation.
@@ -1058,15 +1052,14 @@ func TestResumeTransientErrorPreservesState(t *testing.T) {
 		Threads:         1,
 		WriteThreads:    1,
 		TargetChunkTime: 100 * time.Millisecond,
-		Table:           "transientresume",
-		Alter:           "ENGINE=InnoDB",
+		Statement:       "ALTER TABLE transientresume ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	r.dbConfig = dbconn.NewDBConfig()
 	goodDB, err := dbconn.New(testutils.DSN(), r.dbConfig)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(goodDB)
-	r.changes[0].table = table.NewTableInfo(goodDB, r.migration.Database, r.migration.Table)
+	r.changes[0].table = table.NewTableInfo(goodDB, r.migration.Database, r.changes[0].stmt.Table)
 	require.NoError(t, r.changes[0].table.SetInfo(t.Context()))
 
 	brokenDB, err := dbconn.New(testutils.DSN(), r.dbConfig)

@@ -19,7 +19,8 @@ func runRenameTest(t *testing.T, enableBuffered bool, tableName, createTable, in
 		testutils.RunSQLInDatabase(t, dbName, insertData)
 	}
 
-	m := NewTestMigration(t, WithDBName(dbName), WithTable(tableName), WithAlter(alter), WithBuffered(enableBuffered))
+	m := NewTestMigration(t, WithDBName(dbName),
+		WithStatement(fmt.Sprintf("ALTER TABLE %s %s", tableName, alter)), WithBuffered(enableBuffered))
 	require.NoError(t, m.Run())
 
 	if verifyFunc != nil {
@@ -310,8 +311,9 @@ func testRenameColumnLargerDataset(t *testing.T, enableBuffered bool) {
 	}
 	// Should have 16 rows now
 
-	m := NewTestMigration(t, WithDBName(dbName), WithTable(tableName),
-		WithAlter("RENAME COLUMN old_name TO new_name"), WithBuffered(enableBuffered))
+	m := NewTestMigration(t, WithDBName(dbName),
+		WithStatement(fmt.Sprintf("ALTER TABLE %s RENAME COLUMN old_name TO new_name", tableName)),
+		WithBuffered(enableBuffered))
 	require.NoError(t, m.Run())
 
 	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
@@ -349,8 +351,8 @@ func TestRenameColumnPKBlocked(t *testing.T) {
 
 	// CHANGE COLUMN with type change on PK forces Spirit's copy algorithm,
 	// which should be blocked by the preflight check.
-	m := NewTestMigration(t, WithDBName(dbName), WithTable(tableName),
-		WithAlter("CHANGE COLUMN id new_id BIGINT NOT NULL AUTO_INCREMENT"),
+	m := NewTestMigration(t, WithDBName(dbName),
+		WithStatement(fmt.Sprintf("ALTER TABLE %s CHANGE COLUMN id new_id BIGINT NOT NULL AUTO_INCREMENT", tableName)),
 		WithThreads(1))
 	err := m.Run()
 	require.Error(t, err)
@@ -540,8 +542,8 @@ func testRenameColumnForceCopyPath(t *testing.T, enableBuffered bool) {
 	// Should have 32 rows
 
 	// CHANGE COLUMN with type change forces the copy algorithm
-	m := NewTestMigration(t, WithDBName(dbName), WithTable(tableName),
-		WithAlter("CHANGE COLUMN old_name new_name varchar(200) NOT NULL"),
+	m := NewTestMigration(t, WithDBName(dbName),
+		WithStatement(fmt.Sprintf("ALTER TABLE %s CHANGE COLUMN old_name new_name varchar(200) NOT NULL", tableName)),
 		WithBuffered(enableBuffered))
 	require.NoError(t, m.Run())
 

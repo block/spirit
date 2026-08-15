@@ -59,8 +59,7 @@ func setupRunnerForChecksumTest(t *testing.T, tableName string) *Runner {
 		Database:     cfg.DBName,
 		Threads:      1,
 		WriteThreads: 1,
-		Table:        tableName,
-		Alter:        "ENGINE=InnoDB",
+		Statement:    fmt.Sprintf("ALTER TABLE %s ENGINE=InnoDB", tableName),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(r) })
@@ -71,7 +70,7 @@ func setupRunnerForChecksumTest(t *testing.T, tableName string) *Runner {
 	r.db, err = dbconn.New(testutils.DSN(), dbCfg)
 	require.NoError(t, err)
 	r.dbConfig = dbCfg
-	r.changes[0].table = table.NewTableInfo(r.db, r.migration.Database, r.migration.Table)
+	r.changes[0].table = table.NewTableInfo(r.db, r.migration.Database, r.changes[0].stmt.Table)
 	require.NoError(t, r.changes[0].table.SetInfo(t.Context()))
 	require.NoError(t, r.changes[0].dropOldTable(t.Context()))
 	require.NoError(t, r.changes[0].createNewTable(t.Context()))
@@ -339,7 +338,7 @@ func TestContinuousChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
 // which in practice requires more than one chunk on the runway.
 func advanceRunnerToChecksumWatermarks(t *testing.T, r *Runner) {
 	t.Helper()
-	seedRows(t, r.db, r.migration.Table, 4096)
+	seedRows(t, r.db, r.changes[0].stmt.Table, 4096)
 	require.NoError(t, r.changes[0].table.SetInfo(t.Context()))
 	require.NoError(t, r.initChunkers())
 	require.NoError(t, r.copyChunker.Open())

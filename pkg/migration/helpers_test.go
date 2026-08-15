@@ -2,10 +2,12 @@ package migration
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -114,20 +116,6 @@ func WithAutoscaling() RunnerOption {
 	}
 }
 
-// WithTable sets the table name for the migration.
-func WithTable(name string) RunnerOption {
-	return func(m *Migration) {
-		m.Table = name
-	}
-}
-
-// WithAlter sets the ALTER clause for the migration.
-func WithAlter(a string) RunnerOption {
-	return func(m *Migration) {
-		m.Alter = a
-	}
-}
-
 // WithStatement sets the SQL statement for the migration.
 func WithStatement(s string) RunnerOption {
 	return func(m *Migration) {
@@ -217,7 +205,7 @@ func WithSkipDropAfterCutover() RunnerOption {
 
 // newTestMigration creates a Migration with sensible defaults for integration tests.
 // It parses the test DSN and fills in Host/Username/Password/Database.
-// Callers must set either Table+Alter or Statement before calling Run().
+// Callers must set Statement before calling Run().
 func newTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	t.Helper()
 
@@ -238,7 +226,9 @@ func newTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	return migration
 }
 
-// NewTestRunner creates a Runner for a Table+Alter migration with sensible defaults.
+// NewTestRunner creates a Runner with sensible defaults, composing the table
+// and alter arguments into a full ALTER TABLE statement so tests exercise the
+// same --statement path as production callers.
 //
 // Defaults: Threads=2, TargetChunkTime=500ms (the production default).
 //
@@ -257,8 +247,7 @@ func NewTestRunner(t *testing.T, table, alter string, opts ...RunnerOption) *Run
 	t.Helper()
 
 	migration := newTestMigration(t, opts...)
-	migration.Table = table
-	migration.Alter = alter
+	migration.Statement = fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(table), alter)
 
 	runner, err := NewRunner(migration)
 	require.NoError(t, err)
@@ -266,8 +255,9 @@ func NewTestRunner(t *testing.T, table, alter string, opts ...RunnerOption) *Run
 }
 
 // NewTestRunnerFromStatement creates a Runner for a Statement-based migration
-// with sensible defaults. Use this for tests that use full SQL statements
-// (ALTER TABLE, CREATE INDEX, etc.) rather than Table+Alter.
+// with sensible defaults. Use this for tests that need the raw statement form
+// (CREATE INDEX, CREATE TABLE, etc.) rather than the composed ALTER TABLE of
+// NewTestRunner.
 //
 // Example:
 //
@@ -291,7 +281,7 @@ func NewTestRunnerFromStatement(t *testing.T, statement string, opts ...RunnerOp
 //
 // Example:
 //
-//	m := NewTestMigration(t, WithTable("mytable"), WithAlter("ENGINE=InnoDB"))
+//	m := NewTestMigration(t, WithStatement("ALTER TABLE mytable ENGINE=InnoDB"))
 //	require.NoError(t, m.Run())
 func NewTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	t.Helper()

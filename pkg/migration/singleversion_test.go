@@ -39,7 +39,7 @@ func TestUniqueOnNonUniqueData(t *testing.T) {
 	testutils.RunSQL(t, `UPDATE uniquet1 SET b = id`)
 	testutils.RunSQL(t, `UPDATE uniquet1 SET b = 12345 ORDER BY RAND() LIMIT 2`)
 
-	m := NewTestMigration(t, WithTable("uniquet1"), WithAlter("ADD UNIQUE (b)"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE uniquet1 ADD UNIQUE (b)"))
 	err := m.Run()
 	require.Error(t, err)
 	require.ErrorContains(t, err, "checksum failed after several attempts. This is likely related to your statement adding a UNIQUE index on non-unique data")
@@ -62,9 +62,12 @@ func TestUnparsableStatements(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorContains(t, err, "can't have a default value")
 
-	// ALTER TABLE with BLOB DEFAULT via --table/--alter — works (bypasses parser limitation).
-	m = NewTestMigration(t, WithTable("t1parse"),
-		WithAlter("ADD COLUMN c BLOB DEFAULT ('abc')"))
+	// ALTER TABLE with BLOB DEFAULT via the legacy --table/--alter path — works
+	// because the alter clause is executed verbatim, bypassing the parser
+	// restore limitation (issue #542). Dies with the legacy path.
+	m = NewTestMigration(t)
+	m.Table = "t1parse"
+	m.Alter = "ADD COLUMN c BLOB DEFAULT ('abc')"
 	require.NoError(t, m.Run())
 
 	// CREATE TRIGGER — not supported.
@@ -74,8 +77,10 @@ func TestUnparsableStatements(t *testing.T) {
 	require.ErrorContains(t, err, "line 1 column 14 near \"TRIGGER")
 
 	// https://github.com/pingcap/tidb/pull/61498
-	m = NewTestMigration(t, WithTable("t1parse"),
-		WithAlter(`ADD COLUMN src_col timestamp NULL DEFAULT NULL, add column new_col timestamp NULL DEFAULT(src_col)`))
+	// Legacy --table/--alter path for the same reason as above.
+	m = NewTestMigration(t)
+	m.Table = "t1parse"
+	m.Alter = `ADD COLUMN src_col timestamp NULL DEFAULT NULL, add column new_col timestamp NULL DEFAULT(src_col)`
 	require.NoError(t, m.Run())
 
 	// Cleanup

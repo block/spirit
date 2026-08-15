@@ -49,7 +49,7 @@ func TestE2ENullAlterEmpty(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("t1e2e"), WithAlter("ENGINE=InnoDB"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1e2e ENGINE=InnoDB"))
 	require.NoError(t, m.Run())
 }
 
@@ -61,8 +61,8 @@ func TestE2EExplicitAutoIncrementInAlter(t *testing.T) {
 		PRIMARY KEY (id)
 	) ENGINE=InnoDB AUTO_INCREMENT=1000`)
 
-	m := NewTestMigration(t, WithTable("t1explicit_autoinc"),
-		WithAlter("ADD COLUMN test_col VARCHAR(255), AUTO_INCREMENT=5000"))
+	m := NewTestMigration(t,
+		WithStatement("ALTER TABLE t1explicit_autoinc ADD COLUMN test_col VARCHAR(255), AUTO_INCREMENT=5000"))
 	require.NoError(t, m.Run())
 
 	// Verify that new inserts start from 5000
@@ -79,7 +79,10 @@ func TestMissingAlter(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("t1missing"), WithAlter(""))
+	// Deliberately exercises the legacy --table/--alter path: an empty alter
+	// must be rejected. Dies with the legacy path.
+	m := NewTestMigration(t)
+	m.Table = "t1missing"
 	err := m.Run()
 	require.Error(t, err)
 	require.ErrorContains(t, err, "alter statement is required")
@@ -92,7 +95,7 @@ func TestBadDatabaseCredentials(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("t1bad"), WithAlter("ENGINE=InnoDB"), WithHost("127.0.0.1:9999"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1bad ENGINE=InnoDB"), WithHost("127.0.0.1:9999"))
 	err := m.Run()
 	require.Error(t, err)
 	require.ErrorContains(t, err, "connect: connection refused")
@@ -106,7 +109,7 @@ func TestE2ENullAlter1Row(t *testing.T) {
 		PRIMARY KEY (id)
 	)`)
 	testutils.RunSQL(t, `INSERT INTO t1nullalter (id, name) VALUES (1, 'aaa')`)
-	m := NewTestMigration(t, WithTable("t1nullalter"), WithAlter("ENGINE=InnoDB"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1nullalter ENGINE=InnoDB"))
 	require.NoError(t, m.Run())
 }
 
@@ -125,7 +128,7 @@ func TestE2EAutoscalingEnabled(t *testing.T) {
 		PRIMARY KEY (id)
 	)`)
 	testutils.RunSQL(t, `INSERT INTO t1autoscale (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')`)
-	m := NewTestMigration(t, WithTable("t1autoscale"), WithAlter("ENGINE=InnoDB"),
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1autoscale ENGINE=InnoDB"),
 		WithWriteThreads(2), WithAutoscaling())
 	require.NoError(t, m.Run())
 
@@ -146,7 +149,7 @@ func TestE2ENullAlterWithReplicas(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("replicatest"), WithAlter("ENGINE=InnoDB"),
+	m := NewTestMigration(t, WithStatement("ALTER TABLE replicatest ENGINE=InnoDB"),
 		WithReplicaDSN(replicaDSN), WithReplicaMaxLag(10*time.Second))
 	require.NoError(t, m.Run())
 }
@@ -162,7 +165,7 @@ func TestRenameInMySQL80(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("renamet1"), WithAlter("CHANGE name nameNew varchar(255) not null"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE renamet1 CHANGE name nameNew varchar(255) not null"))
 	require.NoError(t, m.Run())
 }
 
@@ -184,7 +187,7 @@ func testGeneratedColumns(t *testing.T, enableBuffered bool) {
 		d int
 	)`)
 	testutils.RunSQL(t, `INSERT INTO t1generated (b, d) VALUES (1, 10), (2, 20), (3, 30)`)
-	m := NewTestMigration(t, WithTable("t1generated"), WithAlter("ENGINE=InnoDB"), WithBuffered(enableBuffered))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1generated ENGINE=InnoDB"), WithBuffered(enableBuffered))
 	require.NoError(t, m.Run())
 }
 
@@ -260,8 +263,8 @@ func testBinaryChecksum(t *testing.T, enableBuffered bool) {
 		)`, test.OldType))
 		testutils.RunSQL(t, `INSERT INTO t1varbin VALUES (null, 'abcdefg')`)
 
-		m := NewTestMigration(t, WithTable("t1varbin"), WithBuffered(enableBuffered),
-			WithAlter(fmt.Sprintf("CHANGE b b %s not null", test.NewType))) //nolint: dupword
+		m := NewTestMigration(t, WithBuffered(enableBuffered),
+			WithStatement(fmt.Sprintf("ALTER TABLE t1varbin CHANGE b b %s not null", test.NewType))) //nolint: dupword
 		require.NoError(t, m.Run())
 	}
 }
@@ -286,14 +289,14 @@ func testConvertCharset(t *testing.T, enableBuffered bool) {
 	) charset=latin1`)
 	testutils.RunSQL(t, `INSERT INTO t1charset VALUES (null, 'à'), (null, '€')`)
 
-	m := NewTestMigration(t, WithTable("t1charset"), WithBuffered(enableBuffered),
-		WithAlter("CONVERT TO CHARACTER SET UTF8MB4"))
+	m := NewTestMigration(t, WithBuffered(enableBuffered),
+		WithStatement("ALTER TABLE t1charset CONVERT TO CHARACTER SET UTF8MB4"))
 	require.NoError(t, m.Run())
 
 	// Because utf8mb4 is the superset, it doesn't matter that that's
 	// what the checksum casts to. We should be able to convert back as well.
-	m = NewTestMigration(t, WithTable("t1charset"), WithBuffered(enableBuffered),
-		WithAlter("CONVERT TO CHARACTER SET latin1"))
+	m = NewTestMigration(t, WithBuffered(enableBuffered),
+		WithStatement("ALTER TABLE t1charset CONVERT TO CHARACTER SET latin1"))
 	require.NoError(t, m.Run())
 }
 
@@ -408,7 +411,7 @@ func TestBufferedMultiTableMigration(t *testing.T) {
 
 func TestMigrationParamsDefaultsUsed(t *testing.T) {
 	t.Parallel()
-	migration := &Migration{Table: "test_table", Alter: "ENGINE=INNODB"}
+	migration := &Migration{Statement: "ALTER TABLE test_table ENGINE=INNODB"}
 
 	_, err := migration.normalizeOptions()
 	require.NoError(t, err)
@@ -446,8 +449,7 @@ func TestMigrationParamsCLIUsed(t *testing.T) {
 		Username:           "cli-user",
 		Password:           new("cli-password"),
 		Database:           "cli-db",
-		Table:              "testtable",
-		Alter:              "ENGINE=InnoDB",
+		Statement:          "ALTER TABLE testtable ENGINE=InnoDB",
 		TLSMode:            "VERIFY_CA",
 		TLSCertificatePath: "/path/to/ca",
 	}
@@ -466,9 +468,8 @@ func TestMigrationParamsCLIUsed(t *testing.T) {
 func TestMigrationParamsEmptyPasswordUsedIfProvided(t *testing.T) {
 	t.Parallel()
 	migration := &Migration{
-		Password: new(""),
-		Table:    "test_table",
-		Alter:    "ENGINE=INNODB",
+		Password:  new(""),
+		Statement: "ALTER TABLE test_table ENGINE=INNODB",
 	}
 
 	_, err := migration.normalizeOptions()
@@ -485,13 +486,12 @@ func TestMigrationParamsEmptyPasswordUsedIfProvided(t *testing.T) {
 func TestMigrationParamsIniFileInvalidFile(t *testing.T) {
 	t.Parallel()
 	migration := &Migration{
-		Host:     "localhost:3306",
-		Username: "defaultuser",
-		Password: new("defaultpass"),
-		Database: "testdb",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: "/nonexistent/file.cnf",
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  new("defaultpass"),
+		Database:  "testdb",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  "/nonexistent/file.cnf",
 	}
 
 	_, err := migration.normalizeOptions()
@@ -516,8 +516,7 @@ tls-ca = /path/from/file
 		Username:           "cli-user",
 		Password:           new("cli-password"),
 		Database:           "cli-db",
-		Table:              "testtable",
-		Alter:              "ENGINE=InnoDB",
+		Statement:          "ALTER TABLE testtable ENGINE=InnoDB",
 		ConfFile:           confPath,
 		TLSMode:            "REQUIRED",
 		TLSCertificatePath: "/path/to/cert",
@@ -547,9 +546,8 @@ tls-ca = /path/to/cert
 `)
 
 	migration := &Migration{
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -575,9 +573,8 @@ tls-ca = /path/to/another/ca
 `)
 
 	migration := &Migration{
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -599,12 +596,11 @@ user = fileuser
 `)
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Password: new("cli-pass"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Password:  new("cli-pass"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -625,12 +621,11 @@ password = filepass
 `)
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -652,12 +647,11 @@ password =
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -679,13 +673,12 @@ password =
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Password: new("cli-password"),
-		Username: "cli-user",
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Password:  new("cli-password"),
+		Username:  "cli-user",
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -707,13 +700,12 @@ port=1234
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host",
-		Username: "cli-user",
-		Password: new("cli-password"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -735,13 +727,12 @@ func TestMigrationParamsIniFileEmptyClientSection(t *testing.T) {
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Password: new("cli-password"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -765,13 +756,12 @@ password = mysqlpass
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Password: new("cli-password"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -825,7 +815,7 @@ func TestBadAlter(t *testing.T) {
 	)`)
 
 	// Completely invalid ALTER — should fail at parse time.
-	m := NewTestMigration(t, WithTable("bot1"), WithAlter("badalter"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE bot1 badalter"))
 	r, err := NewRunner(m)
 	require.Nil(t, r)
 	require.Error(t, err)
@@ -860,13 +850,12 @@ func TestBadAlter(t *testing.T) {
 func TestDefaultPort(t *testing.T) {
 	t.Parallel()
 	m, err := NewRunner(&Migration{
-		Host:     "localhost",
-		Username: "root",
-		Password: new("mypassword"),
-		Database: "test",
-		Threads:  2,
-		Table:    "t1",
-		Alter:    "DROP COLUMN b, ENGINE=InnoDB",
+		Host:      "localhost",
+		Username:  "root",
+		Password:  new("mypassword"),
+		Database:  "test",
+		Threads:   2,
+		Statement: "ALTER TABLE t1 DROP COLUMN b, ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	require.Equal(t, "localhost:3306", m.migration.Host)
@@ -930,7 +919,7 @@ func TestE2EGTIDChangeSource(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("t1e2egtid"), WithAlter("ENGINE=InnoDB"), WithGTID(true))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1e2egtid ENGINE=InnoDB"), WithGTID(true))
 	require.NoError(t, m.Run())
 }
 

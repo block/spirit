@@ -671,7 +671,7 @@ func runCutoverAtomicityTest(t *testing.T, tableName, schemaTmpl string, buffere
 
 	// Create and configure the migration with a custom cutover algorithm
 	// that intentionally fails after renaming the original table.
-	migration := NewTestMigration(t, WithTable(tableName), WithAlter("ENGINE=InnoDB"),
+	migration := NewTestMigration(t, WithStatement(fmt.Sprintf("ALTER TABLE %s ENGINE=InnoDB", tableName)),
 		WithThreads(2), WithTargetChunkTime(100*time.Millisecond),
 		WithBuffered(buffered))
 	migration.useTestCutover = true
