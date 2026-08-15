@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -603,13 +604,16 @@ func TestPeriodicFlushPrioritizesParkedSubscription(t *testing.T) {
 		return subA.timesParked.Load() >= 1
 	}, 10*time.Second, 10*time.Millisecond, "binlog-driven HasChanged should park on soft limit")
 
-	// The priority flush drains A; the follow-up pass drains B.
+	// The priority flush drains A; the follow-up pass drains B. Gate on B
+	// specifically rather than on a bare count: the all-subscription pass
+	// walks the registry in map order, so it can drain A a second time
+	// (the 'parked' insert buffers once the park releases) before it ever
+	// reaches B, and a count of two would then snapshot [A, A].
 	require.Eventually(t, func() bool {
-		return len(rec.recorded()) >= 2
-	}, 15*time.Second, 50*time.Millisecond, "park-requested flush did not reach the applier")
+		return slices.Contains(rec.recorded(), srcB.TableName)
+	}, 15*time.Second, 50*time.Millisecond, "the all-subscription pass must still drain the other subscription")
 	order := rec.recorded()
 	require.Equal(t, srcA.TableName, order[0], "the parked subscription must be flushed before the all-subscription pass")
-	require.Contains(t, order, srcB.TableName, "the all-subscription pass must still drain the other subscription")
 }
 
 // totalUpsertedRows sums the rows across all recorded UpsertRows calls.
