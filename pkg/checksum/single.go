@@ -320,8 +320,10 @@ func (c *SingleChecker) inspectDifferences(ctx context.Context, trx *sql.Tx, chu
 // neither half's lock footprint grows with the chunk any more. That is what makes
 // a large checksum chunk safe to repair without splitting it first
 // (block/spirit#1130). Rows are streamed in batches rather than materialized
-// whole, so client memory is bounded by repairBatchRows/repairBatchBytes
-// regardless of how big the chunk is.
+// whole: the client holds one batch (repairBatchRows/repairBatchBytes) plus
+// whatever the applier has accepted and not yet written, which its chunklet
+// buffer bounds. Neither bound grows with the chunk, which is the property that
+// matters here — it is not one batch's worth of memory.
 //
 // Note that the chunk is dynamically sized based on the target-time that it took
 // to *read* data in the checksum. This could be substantially longer than the time
@@ -343,6 +345,15 @@ func (c *SingleChecker) inspectDifferences(ctx context.Context, trx *sql.Tx, chu
 //     repaired row lands as exactly the one-text-round-trip image the checksum's
 //     source side predicts. Casting on top would apply parse∘render twice, which
 //     does not converge for misparsed doubles — see castExpr in pkg/table.
+//   - The read is not synchronized with the binlog feed, so a row deleted on the
+//     source *after* it is read here is written back if the feed has already
+//     applied that DELETE to the target. The chunk then stays diverged, the next
+//     attempt re-flags it, and the repair converges as soon as the churn on that
+//     key range stops. Cutover is gated on a pass that finds no differences at
+//     all, so the cost is attempts, never a bad cutover. The window is wider than
+//     the old locking read's (which held the source rows still for the duration
+//     of its own statement) but it was never closed, and the other repair paths
+//     have the same shape.
 func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) error {
 	start := time.Now()
 	c.logger.Warn("recopying chunk via DELETE + Apply", "chunk", chunk.String())
@@ -455,9 +466,14 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 	// The column list is the source/target intersection (with renames applied on
 	// the target side), which is exactly what the applier expects: row values are
 	// positional, values[i] belongs to sourceColumns[i].
+	//
+	// FORCE INDEX (PRIMARY) for the same reason the copier's read of this shape
+	// does (pkg/copier/buffered.go): the predicate is a range over the primary
+	// key, and misleading statistics on a wide table can otherwise talk the
+	// optimizer into a scan.
 	sourceColumns, _ := chunk.ColumnMapping.ColumnsSlice()
 	sourceColumnList, _ := chunk.ColumnMapping.Columns()
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+	query := fmt.Sprintf("SELECT %s FROM %s FORCE INDEX (PRIMARY) WHERE %s",
 		sourceColumnList,
 		chunk.Table.QuotedTableName,
 		chunk.String(),
@@ -466,7 +482,13 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 	if err != nil {
 		return fmt.Errorf("failed to read source chunk: %w", err)
 	}
-	defer utils.CloseAndLog(rows)
+	// Closed early on the success path (see below) to hand the connection back
+	// before waiting on the writers; this covers the early returns until then.
+	defer func() {
+		if rows != nil {
+			utils.CloseAndLog(rows)
+		}
+	}()
 
 	// Apply() is asynchronous: it hands the batch to the write workers and
 	// returns, so reads and writes pipeline. Callbacks run on the applier's
@@ -535,10 +557,10 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 	}
 	// Return the read connection before waiting on the writers. They take their
 	// connections from the same pool, so holding this one across the wait would
-	// be one connection of headroom given up for nothing. Closing twice (here and
-	// in the deferred close, which still covers the early returns above) is a
-	// no-op.
+	// be one connection of headroom given up for nothing. Nil it out so the
+	// deferred close does not close it a second time.
 	utils.CloseAndLog(rows)
+	rows = nil
 
 	// Wait for every submitted batch to be written and its callback to have run.
 	// Repairs are serialized on recopyLock, so on the private applier there is no
@@ -560,6 +582,13 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 		// INSERT IGNORE skipped rows: see the note on UNIQUE secondary keys in
 		// the function doc. The chunk is still diverged, so this is reported
 		// rather than swallowed — the next attempt re-flags it.
+		//
+		// One-directional: appliedRows is a sum of SQL rows-affected, and
+		// dbconn.RetryableTransaction accumulates that across its retry attempts
+		// (a statement that succeeded but whose COMMIT was then retried counts
+		// twice), so an inflated count can hide this warning. That costs a log
+		// line, not correctness — the divergence itself is caught by the next
+		// attempt's checksum either way.
 		c.logger.Warn("recopying chunk did not rewrite every source row; a UNIQUE key conflict outside the chunk range is the usual cause",
 			"chunk", chunk.String(),
 			"sourceRows", sourceRows,

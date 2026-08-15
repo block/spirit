@@ -70,7 +70,7 @@ When a chunk mismatches and `FixDifferences` is set, the chunk is *repaired* rat
 2. `SELECT` the chunk's rows from the source into Spirit.
 3. Write them back through the **applier**, the same buffered write path the copier and the binlog apply use.
 
-Repairs are serialized (one chunk at a time) and run under a cancellation-detached, time-bounded (10 minute) context, so a chunk is never left deleted-but-not-rewritten. Rows are read and submitted in batches, so client memory is bounded no matter how large the chunk is.
+Repairs are serialized (one chunk at a time) and run under a cancellation-detached, time-bounded (10 minute) context, so a chunk is never left deleted-but-not-rewritten. Rows are read and submitted in batches, so what Spirit holds is one batch plus the applier's queue — bounded by the write pipeline, not by the size of the chunk.
 
 Going through the applier — rather than the `REPLACE INTO _new (...) SELECT ... FROM original` that `SingleChecker` used historically — matters for lock footprint, and it is what makes large checksum chunks safe to repair without splitting them first:
 
@@ -81,6 +81,8 @@ Two consequences of the applier being the write path:
 
 - It writes with `INSERT IGNORE`, not `REPLACE`. Rows inside the key range were just deleted, so nothing there conflicts; a row that collides on a `UNIQUE` secondary key with a row *outside* the range is skipped instead of clobbering that row. The chunk then stays diverged, the next attempt re-flags it, and retries exhaust into a hard error — the correct outcome for a lossy `ALTER` such as adding a unique index to non-unique data. The count of skipped rows is logged.
 - JSON columns are read **bare**, with no round-trip cast. The read/write pair is already text-mediated (the `SELECT` renders each document to text; the applier writes it back as a literal the target re-parses), so a repaired row lands as exactly the one-text-round-trip image the checksum's source side predicts. Casting on top would apply `parse∘render` twice, which does not converge for the doubles MySQL's JSON text parser misrounds — see `castExpr` in `pkg/table`.
+
+The read is not synchronized with the change feed: a row deleted on the source after the repair reads it is written back if the feed has already applied that `DELETE` to the target. The chunk stays diverged and the next attempt repairs it again, converging once the churn on that key range stops. Cut-over requires a pass that finds no differences at all, so sustained delete churn on one chunk costs attempts, never a bad cut-over.
 
 ## Pacing and scaling
 

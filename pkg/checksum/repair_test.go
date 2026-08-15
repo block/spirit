@@ -1,7 +1,9 @@
 package checksum
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -58,6 +60,54 @@ func newRepairFixture(t *testing.T, srcName, dstName string, renames map[string]
 		NewTable:      dst,
 		ColumnMapping: mapping,
 	}, db
+}
+
+// spyApplier wraps a real applier so a test can count the lifecycle calls the
+// repair makes and inject failures into them. Everything the repair does not
+// use is inherited from the embedded interface. The counters are only touched
+// from replaceChunk, which the tests call synchronously.
+type spyApplier struct {
+	applier.Applier
+	starts int
+	stops  int
+
+	startErr    error
+	applyErr    error
+	waitErr     error
+	callbackErr error // reported through the Apply callback rather than by Apply
+}
+
+func (s *spyApplier) Start(ctx context.Context) error {
+	s.starts++
+	if s.startErr != nil {
+		return s.startErr
+	}
+	return s.Applier.Start(ctx)
+}
+
+func (s *spyApplier) Stop() error {
+	s.stops++
+	return s.Applier.Stop()
+}
+
+func (s *spyApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback applier.ApplyCallback) error {
+	switch {
+	case s.applyErr != nil:
+		return s.applyErr
+	case s.callbackErr != nil:
+		// The real applier reports a write failure this way, from its
+		// coordinator goroutine, so this is the path firstApplyErr exists for.
+		callback(0, s.callbackErr)
+		return nil
+	}
+	return s.Applier.Apply(ctx, chunk, rows, callback)
+}
+
+func (s *spyApplier) Wait(ctx context.Context) error {
+	if s.waitErr != nil {
+		return s.waitErr
+	}
+	return s.Applier.Wait(ctx)
 }
 
 // requireTablesMatch asserts the two tables hold identical (a, b, c) rows, using
@@ -194,10 +244,85 @@ func TestRepairEmptySourceRange(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO _repairempty_t1_new VALUES (1, 'stale', 1), (2, 'stale', 2)")
 
 	checker, chunk, db := newRepairFixture(t, "repairempty_t1", "_repairempty_t1_new", nil)
+	spy := &spyApplier{Applier: checker.repairApplier}
+	checker.repairApplier = spy
 
 	require.NoError(t, checker.replaceChunk(t.Context(), chunk))
 
 	var rows int
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _repairempty_t1_new").Scan(&rows))
 	require.Equal(t, 0, rows)
+	// The point of the test: no rows to write means no workers started, and so
+	// nothing to stop or wait on either.
+	require.Zero(t, spy.starts, "the applier must not be started for an empty source range")
+	require.Zero(t, spy.stops)
+}
+
+// TestRepairRestartsApplierBetweenRepairs covers the lifecycle production
+// actually uses: the applier is started and stopped per repair, so the second
+// repair of a run takes the applier's restart-after-Stop path. The rewrite has
+// to work as well the second time as the first.
+func TestRepairRestartsApplierBetweenRepairs(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS repairtwice_t1, _repairtwice_t1_new, _repairtwice_t1_chkpnt")
+	testutils.RunSQL(t, "CREATE TABLE repairtwice_t1 (a INT NOT NULL, b VARCHAR(64) NOT NULL, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE _repairtwice_t1_new (a INT NOT NULL, b VARCHAR(64) NOT NULL, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE _repairtwice_t1_chkpnt (a INT)") // for binlog advancement
+	testutils.RunSQL(t, "INSERT INTO repairtwice_t1 VALUES (1, 'one', 1), (2, 'two', 2)")
+	testutils.RunSQL(t, "INSERT INTO _repairtwice_t1_new VALUES (1, 'one', 999)") // wrong, and row 2 missing
+
+	checker, chunk, db := newRepairFixture(t, "repairtwice_t1", "_repairtwice_t1_new", nil)
+	spy := &spyApplier{Applier: checker.repairApplier}
+	checker.repairApplier = spy
+
+	require.NoError(t, checker.replaceChunk(t.Context(), chunk))
+	requireTablesMatch(t, db, "repairtwice_t1", "_repairtwice_t1_new")
+
+	// Diverge it again and repair a second time, now against a stopped applier.
+	testutils.RunSQL(t, "UPDATE _repairtwice_t1_new SET c = 999 WHERE a = 2")
+	require.NoError(t, checker.replaceChunk(t.Context(), chunk))
+	requireTablesMatch(t, db, "repairtwice_t1", "_repairtwice_t1_new")
+
+	require.Equal(t, 2, spy.starts, "each repair must start the applier")
+	require.Equal(t, 2, spy.stops, "and stop it again before returning")
+}
+
+// TestRepairSurfacesApplierErrors pins the error paths of the repair. Each is a
+// write that did not happen, and the chunk is left deleted-but-not-rewritten,
+// so none of them may be swallowed into a "successful" repair: the checksum
+// would then treat the chunk as fixed and only notice on the next attempt (or,
+// on the final attempt, not at all).
+func TestRepairSurfacesApplierErrors(t *testing.T) {
+	injected := errors.New("injected applier failure")
+	tests := []struct {
+		name      string
+		inject    func(*spyApplier)
+		wantErr   string
+		wantStops int
+	}{
+		{"start", func(s *spyApplier) { s.startErr = injected }, "failed to start repair applier", 0},
+		{"apply", func(s *spyApplier) { s.applyErr = injected }, "failed to submit rows for rewrite", 1},
+		{"wait", func(s *spyApplier) { s.waitErr = injected }, "failed waiting for chunk rewrite", 1},
+		{"callback", func(s *spyApplier) { s.callbackErr = injected }, "failed to rewrite chunk data", 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			testutils.RunSQL(t, "DROP TABLE IF EXISTS repairerr_t1, _repairerr_t1_new, _repairerr_t1_chkpnt")
+			testutils.RunSQL(t, "CREATE TABLE repairerr_t1 (a INT NOT NULL, b VARCHAR(64) NOT NULL, c INT, PRIMARY KEY (a))")
+			testutils.RunSQL(t, "CREATE TABLE _repairerr_t1_new (a INT NOT NULL, b VARCHAR(64) NOT NULL, c INT, PRIMARY KEY (a))")
+			testutils.RunSQL(t, "CREATE TABLE _repairerr_t1_chkpnt (a INT)") // for binlog advancement
+			testutils.RunSQL(t, "INSERT INTO repairerr_t1 VALUES (1, 'one', 1), (2, 'two', 2)")
+
+			checker, chunk, _ := newRepairFixture(t, "repairerr_t1", "_repairerr_t1_new", nil)
+			spy := &spyApplier{Applier: checker.repairApplier}
+			tc.inject(spy)
+			checker.repairApplier = spy
+
+			err := checker.replaceChunk(t.Context(), chunk)
+			require.ErrorContains(t, err, tc.wantErr)
+			require.ErrorIs(t, err, injected, "the underlying failure must not be flattened away")
+			// A started applier is stopped on every return path, so a failed
+			// repair leaves no workers behind for the next one.
+			require.Equal(t, tc.wantStops, spy.stops)
+		})
+	}
 }
