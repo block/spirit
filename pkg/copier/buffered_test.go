@@ -40,12 +40,12 @@ func TestBufferedCopier(t *testing.T) {
 	}
 	cfg.Applier, err = applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	require.NoError(t, copier.Run(t.Context())) // works.
 
@@ -65,11 +65,12 @@ func TestBufferedCopier(t *testing.T) {
 // TestBufferedCopierCharsetConversion tests that the buffered copier
 // handles charset conversions correctly.
 //
-// In the unbuffered copier, we don't really have to worry about this because
-// MySQL can infer source and dest charset from the INSERT.. SELECT
-// and do any conversion that is required.
+// With a server-side INSERT .. SELECT (how the legacy unbuffered copier
+// wrote), charsets never leave the server: MySQL infers source and dest
+// charset and converts as required.
 //
-// In the buffered copier, we need to set the connection charset to utf8mb4.
+// In the buffered copier, rows pass through the client, so we need to set
+// the connection charset to utf8mb4.
 // For this test, what this means is that on *read* of charsetsrc, the characters
 // will be converted from latin1 to utf8mb4 by the MySQL server. We then insert
 // into charsetdst as utf8mb4 characters.
@@ -97,12 +98,12 @@ func TestBufferedCopierCharsetConversion(t *testing.T) {
 	cfg := NewCopierDefaultConfig()
 	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 
 	// The copy should succeed because we set the connection charset to utf8mb4
@@ -113,9 +114,9 @@ func TestBufferedCopierCharsetConversion(t *testing.T) {
 	// Reverse the copy to show the other direction works too
 	// Start by emptying the "src" table, which is our intended destination.
 	testutils.RunSQL(t, "TRUNCATE TABLE charsetsrc")
-	chunker, err = table.NewChunker(t2, table.ChunkerConfig{NewTable: t1, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err = table.NewChunker(t2, table.ChunkerConfig{NewTable: t1, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
-	copier, err = NewCopier(db, chunker, cfg)
+	copier, err = NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
 	err = copier.Run(t.Context())
@@ -151,15 +152,16 @@ func TestBufferedCopierDataTypeConversionError(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
-	cfg.TargetChunkTime = 10 // Small chunk time to create more chunks
 	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	// Absurdly tiny chunk-time target (10ns) so the chunker creates many
+	// small chunks.
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: 10 * time.Nanosecond, Logger: cfg.Logger})
 	require.NoError(t, err)
 
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 
 	// Run the copier - should fail with conversion error.
@@ -249,7 +251,7 @@ func TestBufferedCopierChunkTimingIncludesCallbackDelay(t *testing.T) {
 	cfg.Concurrency = 1 // Single worker for predictable behavior
 
 	// Create the copier via the public constructor to match production configuration
-	copier, err := NewCopier(db, wrappedChunker, cfg)
+	copier, err := NewCopier(wrappedChunker, cfg)
 	require.NoError(t, err)
 
 	// Run the copier with a context that won't timeout during the delay
@@ -414,13 +416,13 @@ func TestBufferedCopierGeometry(t *testing.T) {
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
 		NewTable:        t2,
-		TargetChunkTime: cfg.TargetChunkTime,
+		TargetChunkTime: time.Second,
 		Logger:          cfg.Logger,
 	})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	require.NoError(t, copier.Run(t.Context()))
 
@@ -495,14 +497,14 @@ func TestBufferedCopierReadWorkerScaling(t *testing.T) {
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
 		NewTable:         t2,
-		TargetChunkTime:  cfg.TargetChunkTime,
+		TargetChunkTime:  time.Second,
 		TargetChunkBytes: 64 * 1024, // keep chunks small so the copy has many
 		Logger:           cfg.Logger,
 	})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	b := copier.(*buffered)
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -434,4 +435,37 @@ func TestStandardTrx(t *testing.T) {
 	err = trx.QueryRowContext(t.Context(), "SELECT connection_id()").Scan(&observedConnID)
 	require.NoError(t, err)
 	require.Equal(t, connID, observedConnID)
+}
+
+// TestRangeOptimizerRefusal covers the errCapacityExceeded (3170) branch of
+// the warning inspection: when range_optimizer_max_mem_size is too low MySQL
+// silently falls back to a table scan, so RetryableTransaction refuses the
+// statement instead of letting a chunk-ranged query scan the whole table.
+// (Previously exercised through the legacy unbuffered copier's
+// INSERT ... SELECT; the copier no longer issues ranged writes itself.)
+func TestRangeOptimizerRefusal(t *testing.T) {
+	config := NewDBConfig()
+	config.RangeOptimizerMaxMemSize = 1024 // 1KB: low enough that a many-range scan trips it
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	err = Exec(t.Context(), db, "DROP TABLE IF EXISTS test.rangeopt1, test.rangeopt2")
+	require.NoError(t, err)
+	err = Exec(t.Context(), db, "CREATE TABLE test.rangeopt1 (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b))")
+	require.NoError(t, err)
+	err = Exec(t.Context(), db, "CREATE TABLE test.rangeopt2 (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b))")
+	require.NoError(t, err)
+	err = Exec(t.Context(), db, "INSERT INTO test.rangeopt1 VALUES (1,1,1),(2,2,2),(3,3,3)")
+	require.NoError(t, err)
+
+	// A predicate with many ranges over the composite PK (the shape the
+	// chunker generates) exceeds the 1KB budget and raises warning 3170.
+	preds := make([]string, 0, 200)
+	for i := range 200 {
+		preds = append(preds, fmt.Sprintf("(a = %d AND b >= %d)", i, i))
+	}
+	query := "INSERT INTO test.rangeopt2 SELECT * FROM test.rangeopt1 WHERE " + strings.Join(preds, " OR ")
+	_, err = RetryableTransaction(t.Context(), db, IgnoreDupKeyWarnings, config, query)
+	require.ErrorContains(t, err, "range_optimizer_max_mem_size")
 }

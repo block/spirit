@@ -19,11 +19,11 @@ type Chunk struct {
 	ColumnMapping        *ColumnMapping // Column relationship between source and target, including renames
 
 	// ActualBytes is a transient measurement, not part of the chunk's identity
-	// or its checkpoint/watermark JSON (see JSON()). The buffered copier sets it
-	// to the in-memory size of the rows it read for this chunk, so the chunker's
+	// or its checkpoint/watermark JSON (see JSON()). The copier sets it to the
+	// in-memory size of the rows it read for this chunk, so the chunker's
 	// Feedback() can size the next chunk against a byte budget instead of wall
 	// time when dynamicChunkSizer.TargetChunkBytes is set. Zero for the
-	// unbuffered/checksum paths, which read server-side and never see the bytes.
+	// checksum path, which reads server-side and never sees the bytes.
 	ActualBytes uint64
 }
 

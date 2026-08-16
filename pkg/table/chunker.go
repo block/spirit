@@ -89,10 +89,10 @@ type ChunkerConfig struct {
 	// TargetChunkTime is the target duration for each chunk. Defaults to ChunkerDefaultTarget.
 	TargetChunkTime time.Duration
 	// TargetChunkBytes, when non-zero, switches the dynamic chunker from the
-	// wall-clock signal to an in-memory byte-budget signal (the buffered-copier
-	// default, table.DefaultTargetChunkBytes). Only meaningful for the buffered
-	// copier, which reads full rows into memory; the unbuffered and checksum
-	// paths never see row bytes and keep the time signal. See
+	// wall-clock signal to an in-memory byte-budget signal (the copier
+	// default, table.DefaultTargetChunkBytes). Only meaningful for the
+	// copier, which reads full rows into memory; the checksum path never
+	// sees row bytes and keeps the time signal. See
 	// dynamicChunkSizer.TargetChunkBytes.
 	TargetChunkBytes uint64
 	// Logger is the structured logger. Defaults to slog.Default().

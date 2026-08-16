@@ -20,7 +20,7 @@ The first downside can be mitigated by using smaller chunks to yield the lock pe
 
 Appliers were created to support an algorithm which we refer to as _buffered_, which is an implementation of [DBLog](https://netflixtechblog.com/dblog-a-generic-change-data-capture-framework-69351fb9099b). Changes are extracted from the source table(s), and then sent to the applier to be loaded into an underlying target.
 
-The _buffered_ copier is now the default for schema changes; passing `--unbuffered` opts back into the legacy unbuffered copier. The applier is used by the buffered copier and is also always used by the replication client's `bufferedMap` subscription, which writes row images directly from the binlog instead of issuing `REPLACE INTO ... SELECT` (see [issue #746](https://github.com/block/spirit/issues/746)). For move operations only the _buffered_ copier is supported.
+The _buffered_ copier is now the only implementation — it became the default for schema changes in v0.15.0 ([#908](https://github.com/block/spirit/issues/908)) and the legacy unbuffered copier has since been removed. The applier is used by the copier and is also always used by the replication client's `bufferedMap` subscription, which writes row images directly from the binlog instead of issuing `REPLACE INTO ... SELECT` (see [issue #746](https://github.com/block/spirit/issues/746)).
 
 ## Why an Applier Abstraction?
 

@@ -695,10 +695,10 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 	cfg.Concurrency = 2
 	cfg.Autoscale = AutoscaleConfig{Enabled: true, StartThreads: start, MaxThreads: maxThreads}
 
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 
 	copyDone := make(chan error, 1)

@@ -22,8 +22,7 @@ func init() {
 
 // renameCheck validates rename operations in ALTER TABLE statements.
 // Table renames are always blocked. Column renames are allowed for
-// non-PK columns in both the buffered and unbuffered copier paths.
-// PK renames are blocked. Additionally, it blocks dangerous patterns
+// non-PK columns; PK renames are blocked. Additionally, it blocks dangerous patterns
 // where a rename's old or new name overlaps with an added column
 // name, which could cause data corruption.
 func renameCheck(ctx context.Context, r Resources, logger *slog.Logger) error {

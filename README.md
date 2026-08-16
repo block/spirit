@@ -26,8 +26,8 @@ The following are some of the optimizations that make Spirit fast:
 
 Rather than accept a fixed chunk size (such as 1000 rows), Spirit dynamically adjusts the chunk size against a target. This is both safer for very wide tables with a lot of indexes and faster for smaller tables. The target depends on the copier:
 
-- The **default buffered copier** reads full rows into memory, so it sizes each chunk against an in-memory **byte budget** (`--target-chunk-size`, default 16 MiB). Time is a poor signal here — the buffered copier's measured chunk time includes waiting behind the write queue, which inflates under load independently of chunk size — whereas a byte budget is a stable property of the data and keeps chunks large enough to engage InnoDB/Aurora read-ahead.
-- The **checksum** and the legacy `--unbuffered` copier size each chunk against a **target time** (such as 500ms), configured via [`--target-chunk-time`](docs/migrate.md#target-chunk-time).
+- The **copier** reads full rows into memory, so it sizes each chunk against an in-memory **byte budget** (`--target-chunk-size`, default 16 MiB). Time is a poor signal here — the copier's measured chunk time includes waiting behind the write queue, which inflates under load independently of chunk size — whereas a byte budget is a stable property of the data and keeps chunks large enough to engage InnoDB/Aurora read-ahead.
+- The **checksum** sizes each chunk against a **target time** (such as 500ms), configured via [`--target-chunk-time`](docs/migrate.md#target-chunk-time).
 
 500ms is quite "high" for traditional MySQL environments, but remember _Spirit does not support read-replicas_. This helps it copy chunks as efficiently as possible.
 

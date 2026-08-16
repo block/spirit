@@ -76,9 +76,8 @@ func (d *dynamicChunkSizer) panicShrink(logger *slog.Logger, dur time.Duration) 
 }
 
 // feedbackTime incorporates a wall-clock duration for one completed chunk. It
-// is the time-signal path (unbuffered copier, checksum, and the buffered copier
-// when TargetChunkBytes is unset), shared by both the composite and optimistic
-// chunkers.
+// is the time-signal path (the checksum, and the copier when TargetChunkBytes
+// is unset), shared by both the composite and optimistic chunkers.
 //
 // beforeUpdate, if non-nil, is called with the freshly computed target and p90
 // just before the new chunk size is applied — a seam for chunker-specific

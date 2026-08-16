@@ -5,7 +5,6 @@ package copier
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log/slog"
 	"math"
@@ -47,11 +46,11 @@ func etaEstimate(copiedRows, totalRows uint64, pct float64, rowsPerSecond uint64
 	return time.Duration(remainingSeconds * float64(time.Second)), status.ETAReady
 }
 
-// Copier is the interface which copiers use. Currently we only have
-// one implementation, which we call unbuffered because it uses
-// INSERT .. SELECT without any intermediate buffering in spirit.
-// In future we may have another implementation, see:
-// https://github.com/block/spirit/issues/451
+// Copier is the interface which copiers use. The single implementation
+// streams rows from the source through an applier to the target (the
+// DBLog-style buffered algorithm; see buffered.go). The legacy unbuffered
+// copier (INSERT IGNORE .. SELECT directly in MySQL) was removed after the
+// buffered copier became the default (issue #908).
 type Copier interface {
 	Run(ctx context.Context) error
 	GetETA() string
@@ -82,26 +81,27 @@ type Copier interface {
 	ChunkSize() uint64
 }
 
+// ChunkCopier is the incremental counterpart of Copier.Run: copying exactly
+// one chunk, synchronously, with chunker feedback sent before it returns.
+// Low-level tests (binlog watermark ordering, checkpoint stepping) assert on
+// it to drive the copy one chunk at a time in a controlled order, which
+// Run's parallel pipeline cannot do. The copier returned by NewCopier
+// implements it.
+type ChunkCopier interface {
+	CopyChunk(ctx context.Context, chunk *table.Chunk) error
+}
+
 type CopierConfig struct {
-	Concurrency     int
-	TargetChunkTime time.Duration
-	Throttler       throttler.Throttler
-	Logger          *slog.Logger
-	MetricsSink     metrics.Sink
-	DBConfig        *dbconn.DBConfig
-	// Applier is used by the buffered copier to write rows to the destination.
-	// It is also used by callers (migration/move runner) for the replication
-	// client. Construction is shared so that both paths use the same applier
-	// for buffered copy (the default). When the unbuffered copier is selected
-	// (Unbuffered=true) the copier ignores the applier.
+	Concurrency int
+	Throttler   throttler.Throttler
+	Logger      *slog.Logger
+	MetricsSink metrics.Sink
+	DBConfig    *dbconn.DBConfig
+	// Applier is used by the copier to write rows to the destination. It is
+	// required (non-nil). It is also used by callers (migration/move runner)
+	// for the replication client; construction is shared so that both paths
+	// use the same applier.
 	Applier applier.Applier
-	// Unbuffered selects the legacy unbuffered copier, which issues
-	// INSERT IGNORE INTO _new ... SELECT FROM original directly and ignores
-	// Applier. When false (the default), the buffered copier is used, which
-	// streams row images through Applier and therefore requires a non-nil
-	// Applier. NewCopierDefaultConfig leaves this false (buffered), matching the
-	// production default.
-	Unbuffered bool
 	// Autoscale configures experimental dynamic write-thread scaling. When
 	// disabled (the default) the copier behaves exactly as before. See
 	// AutoscaleConfig and issue #831.
@@ -109,8 +109,8 @@ type CopierConfig struct {
 }
 
 // AutoscaleConfig controls the experimental write-thread autoscaler driven by
-// throttler utilization. It only applies to the buffered copier whose Applier
-// implements the dynamic-scaling capability (SingleTargetApplier).
+// throttler utilization. It only applies when the Applier implements the
+// dynamic-scaling capability (SingleTargetApplier).
 type AutoscaleConfig struct {
 	// Enabled gates the whole feature (the --enable-experimental-autoscaling
 	// flag). Off by default.
@@ -129,48 +129,35 @@ type AutoscaleConfig struct {
 	MaxReadThreads int
 }
 
-// NewCopierDefaultConfig returns a default config for the copier. It defaults
-// to the buffered copier (Unbuffered=false), matching the production default,
-// so callers must supply an Applier (see CopierConfig.Applier). Tests that want
-// the legacy unbuffered copier set Unbuffered=true, which needs no Applier.
+// NewCopierDefaultConfig returns a default config for the copier. Callers
+// must supply an Applier (see CopierConfig.Applier).
 func NewCopierDefaultConfig() *CopierConfig {
 	return &CopierConfig{
-		Concurrency:     4,
-		TargetChunkTime: 1000 * time.Millisecond,
-		Throttler:       &throttler.Noop{},
-		Logger:          slog.Default(),
-		MetricsSink:     &metrics.NoopSink{},
-		DBConfig:        dbconn.NewDBConfig(),
+		Concurrency: 4,
+		Throttler:   &throttler.Noop{},
+		Logger:      slog.Default(),
+		MetricsSink: &metrics.NoopSink{},
+		DBConfig:    dbconn.NewDBConfig(),
 	}
 }
 
 // NewCopier creates a new copier object with the provided chunker.
 // The chunker could have been opened at a watermark, we are agnostic to that.
 // It could also return different tables on each Next() call in future,
-// so we don't save any fields related to the table.
-func NewCopier(db *sql.DB, chunker table.Chunker, config *CopierConfig) (Copier, error) {
+// so we don't save any fields related to the table. Reads use each chunk's
+// own table connection (chunk.Table.DB()) and writes go through the applier,
+// so no database handle is passed here.
+func NewCopier(chunker table.Chunker, config *CopierConfig) (Copier, error) {
 	if chunker == nil {
 		return nil, errors.New("chunker must be non-nil")
 	}
 	if config.DBConfig == nil {
 		return nil, errors.New("dbConfig must be non-nil")
 	}
-	if config.Unbuffered {
-		return &Unbuffered{
-			db:          db,
-			concurrency: config.Concurrency,
-			throttler:   config.Throttler,
-			chunker:     chunker,
-			logger:      config.Logger,
-			metricsSink: config.MetricsSink,
-			dbConfig:    config.DBConfig,
-		}, nil
-	}
 	if config.Applier == nil {
-		return nil, errors.New("buffered copier requires a non-nil Applier")
+		return nil, errors.New("copier requires a non-nil Applier")
 	}
 	return &buffered{
-		db:          db,
 		concurrency: config.Concurrency,
 		throttler:   config.Throttler,
 		chunker:     chunker,

@@ -1101,15 +1101,13 @@ func (r *Runner) buildCopyPipeline() error {
 		return err
 	}
 	r.setCopyChunker(table.NewMultiChunker(chunkers...))
-	cp, err := copier.NewCopier(r.source.db, r.copyChunker, &copier.CopierConfig{
-		Concurrency:     r.sync.Threads,
-		TargetChunkTime: r.sync.TargetChunkTime,
-		Logger:          r.logger,
-		Throttler:       &throttler.Noop{},
-		MetricsSink:     &metrics.NoopSink{},
-		DBConfig:        r.sourceDBConfig,
-		Applier:         r.applier,
-		Unbuffered:      false, // sync always uses the buffered copier
+	cp, err := copier.NewCopier(r.copyChunker, &copier.CopierConfig{
+		Concurrency: r.sync.Threads,
+		Logger:      r.logger,
+		Throttler:   &throttler.Noop{},
+		MetricsSink: &metrics.NoopSink{},
+		DBConfig:    r.sourceDBConfig,
+		Applier:     r.applier,
 	})
 	if err != nil {
 		return err

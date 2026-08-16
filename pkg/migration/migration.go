@@ -52,20 +52,19 @@ type Migration struct {
 	// setupCopierCheckerAndReplClient and autoscale.ReadBounds. See issue #831.
 	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: size the copy, apply and checksum thread pools from the instance and scale them on throttler feedback. Overrides --threads and --write-threads. Requires an Aurora target" optional:"" default:"false"`
 	// TargetChunkTime sizes chunks for the time-based signal: the checksum
-	// (server-side CRC) and the legacy --unbuffered copier. The default buffered
-	// copier ignores it and sizes chunks by an in-memory byte budget
-	// (table.DefaultTargetChunkBytes), because its fed-back time measures
-	// read + applier-queue-wait + write/commit — a signal that is
-	// size-independent under backpressure and collapses the chunk size.
-	TargetChunkTime time.Duration `name:"target-chunk-time" help:"Target time per chunk for the checksum and the legacy --unbuffered copier. The default buffered copier ignores it and sizes chunks by memory." optional:"" default:"500ms"`
-	// TargetChunkSize is the in-memory byte budget the default buffered copier
-	// sizes each copy chunk against (the memory signal; see
-	// table.DefaultTargetChunkBytes and pkg/table/README.md). It has no effect
-	// with --unbuffered, which sizes copy chunks by --target-chunk-time. A zero
-	// value means "use the default" (normalizeOptions fills it in), so callers
-	// that construct Migration programmatically don't have to set it.
+	// (server-side CRC). The copier ignores it and sizes chunks by an
+	// in-memory byte budget (table.DefaultTargetChunkBytes), because its
+	// fed-back time measures read + applier-queue-wait + write/commit — a
+	// signal that is size-independent under backpressure and collapses the
+	// chunk size.
+	TargetChunkTime time.Duration `name:"target-chunk-time" help:"Target time per chunk for the checksum. The copier sizes chunks by memory instead; see --target-chunk-size." optional:"" default:"500ms"`
+	// TargetChunkSize is the in-memory byte budget the copier sizes each copy
+	// chunk against (the memory signal; see table.DefaultTargetChunkBytes and
+	// pkg/table/README.md). A zero value means "use the default"
+	// (normalizeOptions fills it in), so callers that construct Migration
+	// programmatically don't have to set it.
 	// The Kong default below must stay equal to table.DefaultTargetChunkBytes.
-	TargetChunkSize      uint64        `name:"target-chunk-size" help:"In-memory byte budget per copy chunk for the default buffered copier (in bytes). No effect with --unbuffered." optional:"" default:"16777216"`
+	TargetChunkSize      uint64        `name:"target-chunk-size" help:"In-memory byte budget per copy chunk (in bytes)" optional:"" default:"16777216"`
 	ReplicaDSN           string        `name:"replica-dsn" help:"DSN(s) for replica(s) used for lag checking. Multiple replicas can be comma-separated; Spirit throttles on the slowest." optional:""`
 	ReplicaMaxLag        time.Duration `name:"replica-max-lag" help:"The maximum lag allowed on the replica before the migration throttles. If lag becomes unobservable (lag polling keeps failing) the migration pauses (fails closed) until polling recovers; remove --replica-dsn to proceed without lag protection." optional:"" default:"120s"`
 	LockWaitTimeout      time.Duration `name:"lock-wait-timeout" help:"The DDL lock_wait_timeout required for checksum and cutover" optional:"" default:"30s"`
@@ -77,13 +76,6 @@ type Migration struct {
 	// TLS Configuration
 	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:""`
 	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
-
-	// Buffered copy (the default) uses the DBLog algorithm for copying and
-	// replication applying. It reads rows from the source and inserts them into
-	// the target, rather than using INSERT IGNORE .. SELECT, and is also required
-	// for cross-server moves. Unbuffered opts back into the legacy
-	// INSERT IGNORE .. SELECT copier.
-	Unbuffered bool `name:"unbuffered" help:"Use the legacy unbuffered copier (INSERT IGNORE .. SELECT) instead of the default buffered DBLog copier" optional:"" default:"false"`
 
 	// EnableExperimentalGTID switches the change source from binlog file+position to MySQL GTIDs.
 	// EXPERIMENTAL — see pkg/change/gtid.go. Requires gtid_mode=ON and

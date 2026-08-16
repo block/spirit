@@ -95,13 +95,11 @@ func TestCheckpoint(t *testing.T) {
 	// watermark, checkpoint dump, and restore behavior.
 	// It uses specific INSERT patterns that produce exactly 11040 rows.
 	//
-	// It is intentionally unbuffered: it drives the copier's synchronous
-	// CopyChunk to complete chunks in a controlled order (2, 1, 3) and assert
-	// the exact watermark/progress at each step. The default buffered copier
-	// copies chunks in parallel and cannot be stepped deterministically, so
-	// this low-level watermark coverage stays on the unbuffered copier;
-	// buffered checkpoint/resume is covered by the TestResumeFromCheckpoint*
-	// E2E tests.
+	// It drives the copier's synchronous CopyChunk API (copier.ChunkCopier)
+	// to complete chunks in a controlled order (2, 1, 3) and assert the
+	// exact watermark/progress at each step; Copier.Run copies chunks in
+	// parallel and cannot be stepped deterministically. End-to-end
+	// checkpoint/resume is covered by the TestResumeFromCheckpoint* tests.
 	tbl := `CREATE TABLE cpt1 (
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		id2 INT NOT NULL,
@@ -130,7 +128,6 @@ func TestCheckpoint(t *testing.T) {
 			WriteThreads:     1,
 			TargetChunkTime:  100 * time.Millisecond,
 			Statement:        "ALTER TABLE cpt1 ENGINE=InnoDB",
-			Unbuffered:       true, // see the test's doc comment: intentionally unbuffered
 			useTestThrottler: true,
 		})
 		require.NoError(t, err)
@@ -191,7 +188,7 @@ func TestCheckpoint(t *testing.T) {
 	// Dump checkpoint also returns an error for the same reason.
 	require.Error(t, r.DumpCheckpoint(t.Context()))
 
-	ccopier, ok := r.copier.(*copier.Unbuffered)
+	ccopier, ok := r.copier.(copier.ChunkCopier)
 	require.True(t, ok)
 
 	// Because it's multi-threaded, we can't guarantee the order of the chunks.
@@ -235,7 +232,7 @@ func TestCheckpoint(t *testing.T) {
 	// the watermark to this point so new watermarks "align" correctly.
 	// So lets now call NextChunk to verify.
 
-	ccopier, ok = r.copier.(*copier.Unbuffered)
+	ccopier, ok = r.copier.(copier.ChunkCopier)
 	require.True(t, ok)
 
 	chunk, err := r.copyChunker.Next()
@@ -575,150 +572,6 @@ FROM compositevarcharpk a WHERE version='1'`)
 	require.NoError(t, m2.Run(t.Context()))
 	require.True(t, m2.usedResumeFromCheckpoint.Load())
 	require.NoError(t, m2.Close())
-}
-
-// TestResumeFromCheckpointPhantom tests that there is not a phantom row issue
-// when resuming from checkpoint. i.e. consider the following scenario:
-// 1) A new row is inserted at the end of the table, and the copier copies it.. but the low watermark never advances past this point
-// 2) The row is then deleted after it's been copied (but the binary log doesn't get to this point)
-// 3) A resume occurs
-// 4) The insert and delete tracking ignore the row because it's above the high watermark.
-// 5) The INSERT..SELECT only inserts new rows, it doesn't delete non-conflicting existing rows.
-// This leaves a broken state because the _new table has a row that should have been deleted.
-//
-// The fix for this is simple:
-// - When resuming from checkpoint, we need to initialize the high watermark from a SELECT MAX(key) FROM the _new table.
-// - If this is done correctly, then on resume the DELETE will no longer be ignored.
-// TestResumeFromCheckpointPhantom is intentionally unbuffered: it is a
-// regression test for the legacy unbuffered copier's recopy behavior. It
-// manually copies a chunk, inserts that row into _new without feedback, then
-// deletes it from the source so the recopy-on-resume finds nothing — a
-// "phantom" that only arises on the INSERT IGNORE ... SELECT recopy path. The
-// buffered copier reads row images and applies via REPLACE rather than
-// recopying, so this scenario has no buffered equivalent.
-func TestResumeFromCheckpointPhantom(t *testing.T) {
-	t.Parallel()
-	testutils.NewTestTable(t, "phantomtest", `CREATE TABLE phantomtest (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		pad varbinary(1024) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	// Exactly 10 rows needed — the test asserts MaxValue() == "10".
-	testutils.RunSQL(t, "INSERT INTO phantomtest (pad) SELECT RANDOM_BYTES(1024) FROM dual")
-	testutils.RunSQL(t, "INSERT INTO phantomtest (pad) SELECT RANDOM_BYTES(1024) FROM phantomtest a, phantomtest b, phantomtest c LIMIT 100000")
-	testutils.RunSQL(t, "INSERT INTO phantomtest (pad) SELECT RANDOM_BYTES(1024) FROM phantomtest a, phantomtest b, phantomtest c LIMIT 100000")
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	m, err := NewRunner(&Migration{
-		Host:             cfg.Addr,
-		Username:         cfg.User,
-		Password:         &cfg.Passwd,
-		Database:         cfg.DBName,
-		Threads:          2,
-		WriteThreads:     2,
-		Statement:        "ALTER TABLE phantomtest ENGINE=InnoDB",
-		TargetChunkTime:  100 * time.Millisecond,
-		Unbuffered:       true, // see the test's doc comment: intentionally unbuffered
-		useTestThrottler: true,
-	})
-	require.NoError(t, err)
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	// Do the initial setup.
-	m.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	m.dbConfig = dbconn.NewDBConfig()
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
-	require.NoError(t, m.changes[0].table.SetInfo(ctx))
-
-	require.NoError(t, m.newMigration(t.Context()))
-
-	// Now we are ready to start copying rows.
-	// We step through this manually using the unbuffered copier, since we want
-	// to checkpoint after a few chunks.
-
-	ccopier, ok := m.copier.(*copier.Unbuffered)
-	require.True(t, ok)
-
-	m.status.Set(status.CopyRows)
-	require.Equal(t, "copyRows", m.status.Get().String())
-
-	// first chunk.
-	chunk, err := m.copyChunker.Next()
-	require.NoError(t, err)
-	require.Equal(t, "`id` < 1", chunk.String())
-	require.NoError(t, ccopier.CopyChunk(ctx, chunk))
-
-	// second chunk
-	chunk, err = m.copyChunker.Next()
-	require.NoError(t, err)
-	require.Equal(t, "`id` >= 1 AND `id` < 1001", chunk.String())
-	require.NoError(t, ccopier.CopyChunk(ctx, chunk))
-
-	// now we insert a row in the range of the third chunk
-	testutils.RunSQL(t, "INSERT INTO phantomtest (id, pad) VALUES (1002, RANDOM_BYTES(1024))")
-
-	// we copy it but we don't feedback it (a hack)
-	testutils.RunSQL(t, "INSERT INTO _phantomtest_new (id, pad) SELECT * FROM phantomtest WHERE id = 1002")
-
-	// delete the row (but not from the _new table)
-	// when it gets to recopy it will not be there.
-	testutils.RunSQL(t, "DELETE FROM phantomtest WHERE id = 1002")
-
-	// then we save the checkpoint without the feedback.
-	require.NoError(t, m.DumpCheckpoint(ctx))
-	// assert there is a checkpoint
-	var rowCount int
-	err = m.db.QueryRowContext(ctx, `SELECT count(*) from _phantomtest_chkpnt`).Scan(&rowCount)
-	require.NoError(t, err)
-	require.Equal(t, 1, rowCount)
-
-	// kill it.
-	cancel()
-	require.NoError(t, m.Close())
-
-	// Resume the migration using and apply all of the replication
-	// changes before starting the copier.
-	ctx = t.Context()
-	m, err = NewRunner(&Migration{
-		Host:            cfg.Addr,
-		Username:        cfg.User,
-		Password:        &cfg.Passwd,
-		Database:        cfg.DBName,
-		Threads:         2,
-		WriteThreads:    2,
-		Statement:       "ALTER TABLE phantomtest ENGINE=InnoDB",
-		TargetChunkTime: 100 * time.Millisecond,
-		Unbuffered:      true, // continues the unbuffered scenario above (see doc comment)
-	})
-	require.NoError(t, err)
-	m.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	m.dbConfig = dbconn.NewDBConfig()
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
-	require.NoError(t, m.changes[0].table.SetInfo(ctx))
-	// check we can resume from checkpoint
-	// this is normally done in m.setup() but we want to call it in isolation.
-	require.NoError(t, m.resumeFromCheckpoint(ctx))
-	// This is normally done in m.setup()
-	require.NoError(t, m.replClient.SetWatermarkOptimization(ctx, true))
-	// doublecheck that the highPtr is 1002 in the _new table and not in the original table.
-	require.Equal(t, "10", m.changes[0].table.MaxValue().String())
-	require.Equal(t, "1002", m.changes[0].newTable.MaxValue().String())
-
-	// flush the replication changes
-	// if the bug exists, this would cause the breakage.
-	require.NoError(t, m.replClient.Flush(ctx))
-	// start the copier.
-	require.NoError(t, m.copier.Run(ctx))
-	// the checksum runs in prepare for cutover.
-	// previously it would fail, but it should work as long as the resumeFromCheckpoint()
-	// correctly finds the high watermark.
-	require.NoError(t, m.checksum(ctx))
-	require.NoError(t, m.Close())
 }
 
 func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {

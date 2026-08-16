@@ -43,18 +43,10 @@ func (t *TestMetricsSink) Send(ctx context.Context, m *metrics.Metrics) error {
 }
 
 // bufferedConfig returns a default copier config wired with a single-target
-// applier, which selects the buffered copier — the production default.
+// applier.
 func bufferedConfig(t *testing.T, db *sql.DB) *CopierConfig {
 	cfg := NewCopierDefaultConfig()
 	cfg.Applier = applier.NewSingleTargetForTest(t, db)
-	return cfg
-}
-
-// unbufferedConfig returns a default copier config that selects the legacy
-// unbuffered copier (INSERT IGNORE ... SELECT), which needs no applier.
-func unbufferedConfig() *CopierConfig {
-	cfg := NewCopierDefaultConfig()
-	cfg.Unbuffered = true
 	return cfg
 }
 
@@ -77,10 +69,10 @@ func TestCopier(t *testing.T) {
 	copierConfig := bufferedConfig(t, db)
 	testMetricsSink := &TestMetricsSink{}
 	copierConfig.MetricsSink = testMetricsSink
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: copierConfig.TargetChunkTime, Logger: copierConfig.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: copierConfig.Logger})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, copierConfig)
+	copier, err := NewCopier(chunker, copierConfig)
 	require.NoError(t, err)
 	require.NoError(t, copier.Run(t.Context())) // works
 
@@ -111,9 +103,9 @@ func TestThrottler(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := bufferedConfig(t, db)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	copier.SetThrottler(&throttler.Noop{})
 	require.NoError(t, chunker.Open())
@@ -154,45 +146,18 @@ func TestCopierUniqueDestination(t *testing.T) {
 	t2 = table.NewTableInfo(db, "test", "copieruniqt2")
 	require.NoError(t, t2.SetInfo(t.Context()))
 	cfg := bufferedConfig(t, db)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	require.NoError(t, copier.Run(t.Context())) // works
 	require.Equal(t, 0, db.Stats().InUse)       // no connections in use.
 }
 
-func TestCopierLossyDataTypeConversion(t *testing.T) {
-	testutils.RunSQL(t, "DROP TABLE IF EXISTS datatpt1, datatpt2")
-	testutils.RunSQL(t, "CREATE TABLE datatpt1 (a INT NOT NULL, b INT, c VARCHAR(255), PRIMARY KEY (a))")
-	testutils.RunSQL(t, "CREATE TABLE datatpt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "INSERT INTO datatpt1 VALUES (1, 2, 'aaa'), (2,2,'bbb')")
-
-	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.Equal(t, 0, db.Stats().InUse) // no connections in use.
-
-	t1 := table.NewTableInfo(db, "test", "datatpt1")
-	require.NoError(t, t1.SetInfo(t.Context()))
-	t2 := table.NewTableInfo(db, "test", "datatpt2")
-	require.NoError(t, t2.SetInfo(t.Context()))
-
-	// The "unsafe warning" detection here is specific to the unbuffered
-	// INSERT ... SELECT path; the buffered copier's conversion handling is
-	// covered by TestBufferedCopierDataTypeConversionError.
-	cfg := unbufferedConfig()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
-	require.NoError(t, err)
-	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
-	require.NoError(t, err)
-	err = copier.Run(t.Context())
-	require.ErrorContains(t, err, "unsafe warning")
-	require.Equal(t, 0, db.Stats().InUse) // no connections in use.
-}
-
+// TestCopierNullToNotNullConversion verifies that copying a NULL into a NOT
+// NULL destination column fails the copy (via the applier's "unsafe warning"
+// classification) rather than silently writing an implicit default.
 func TestCopierNullToNotNullConversion(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS null2notnullt1, null2notnullt2")
 	testutils.RunSQL(t, "CREATE TABLE null2notnullt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
@@ -209,13 +174,11 @@ func TestCopierNullToNotNullConversion(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "null2notnullt2")
 	require.NoError(t, t2.SetInfo(t.Context()))
 
-	// As above, the "unsafe warning" detection is specific to the unbuffered
-	// INSERT ... SELECT path.
-	cfg := unbufferedConfig()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	cfg := bufferedConfig(t, db)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	err = copier.Run(t.Context())
 	require.ErrorContains(t, err, "unsafe warning")
@@ -238,10 +201,10 @@ func TestSQLModeAllowZeroInvalidDates(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := bufferedConfig(t, db)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	err = copier.Run(t.Context())
 	require.NoError(t, err)
@@ -282,12 +245,12 @@ func TestLockWaitTimeoutIsRetyable(t *testing.T) {
 	})
 	wg1.Wait()
 	// The retry-on-lock-wait logic lives in the shared dbconn layer; this
-	// exercises it via the unbuffered copier's INSERT ... SELECT.
-	cfg := unbufferedConfig()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	// exercises it via the applier's INSERT ... VALUES write.
+	cfg := bufferedConfig(t, db)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	err = copier.Run(t.Context())
 	require.NoError(t, err) // succeeded within retry.
@@ -332,10 +295,10 @@ func TestLockWaitTimeoutRetryExceeded(t *testing.T) {
 		require.NoError(t, err)
 	})
 	wg1.Wait() // Wait only for the lock to be acquired.
-	cfg := unbufferedConfig()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	cfg := bufferedConfig(t, db)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	err = copier.Run(t.Context())
 	require.Error(t, err) // exceeded retry.
@@ -347,10 +310,22 @@ func TestCopierValidation(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	// Test that NewCopier fails with nil chunker (the nil-chunker check runs
-	// before the buffered-copier Applier check, so no applier is needed here).
-	_, err = NewCopier(db, nil, NewCopierDefaultConfig())
-	require.Error(t, err)
+	// Test that NewCopier fails with a nil chunker (checked before the
+	// Applier requirement) and with a nil Applier.
+	_, err = NewCopier(nil, NewCopierDefaultConfig())
+	require.ErrorContains(t, err, "chunker must be non-nil")
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS validationt1, validationt2")
+	testutils.RunSQL(t, "CREATE TABLE validationt1 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE validationt2 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+	t1 := table.NewTableInfo(db, "test", "validationt1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "validationt2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: slog.Default()})
+	require.NoError(t, err)
+	_, err = NewCopier(chunker, NewCopierDefaultConfig())
+	require.ErrorContains(t, err, "non-nil Applier")
 }
 
 func TestCopierFromCheckpoint(t *testing.T) {
@@ -373,7 +348,7 @@ func TestCopierFromCheckpoint(t *testing.T) {
 
 	cfg := bufferedConfig(t, db)
 	// Create chunker first and open at the checkpoint watermark
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 
 	// Open chunker at the specified watermark
@@ -381,7 +356,7 @@ func TestCopierFromCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create copier with the prepared chunker
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 
 	require.NoError(t, copier.Run(t.Context())) // works
@@ -391,52 +366,4 @@ func TestCopierFromCheckpoint(t *testing.T) {
 	err = db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _copierchkpt1_new").Scan(&count)
 	require.NoError(t, err)
 	require.Equal(t, 10, count)
-}
-
-func TestRangeOptimizationMustApply(t *testing.T) {
-	testutils.RunSQL(t, "DROP TABLE IF EXISTS rangeoptimizertest, _rangeoptimizertest_new")
-	testutils.RunSQL(t, "CREATE TABLE rangeoptimizertest (a INT NOT NULL auto_increment, b INT NOT NULL, c INT, PRIMARY KEY (a, b))")
-	testutils.RunSQL(t, "CREATE TABLE _rangeoptimizertest_new (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b))")
-	testutils.RunSQL(t, "insert into rangeoptimizertest select null,1,1 from dual")
-	testutils.RunSQL(t, "insert into rangeoptimizertest select null,1,1 from rangeoptimizertest a join rangeoptimizertest b join rangeoptimizertest c LIMIT 10000")
-	testutils.RunSQL(t, "insert into rangeoptimizertest select null,1,1 from rangeoptimizertest a join rangeoptimizertest b join rangeoptimizertest c LIMIT 10000")
-	testutils.RunSQL(t, "insert into rangeoptimizertest select null,1,1 from rangeoptimizertest a join rangeoptimizertest b join rangeoptimizertest c LIMIT 10000")
-	testutils.RunSQL(t, "insert into rangeoptimizertest select a,2,1 from rangeoptimizertest where b=1")
-	testutils.RunSQL(t, "insert into rangeoptimizertest select a,3,1 from rangeoptimizertest where b=1")
-	testutils.RunSQL(t, "insert into rangeoptimizertest select a,4,1 from rangeoptimizertest where b=1")
-
-	config := dbconn.NewDBConfig()
-	config.RangeOptimizerMaxMemSize = 1024 // 1KB
-	db, err := dbconn.New(testutils.DSN(), config)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	t1 := table.NewTableInfo(db, "test", "rangeoptimizertest")
-	require.NoError(t, t1.SetInfo(t.Context()))
-	t1new := table.NewTableInfo(db, "test", "_rangeoptimizertest_new")
-	require.NoError(t, t1new.SetInfo(t.Context()))
-
-	// Range-optimizer refusal is raised on the unbuffered copier's
-	// INSERT ... SELECT (via the shared dbconn warning inspection).
-	cfg := unbufferedConfig()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
-	require.NoError(t, err)
-	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
-	require.NoError(t, err)
-	err = copier.Run(t.Context())
-	require.ErrorContains(t, err, "range_optimizer_max_mem_size") // verify that spirit refuses to run if it encounters range optimizer memory limits.
-
-	// Now create a new DB config, which should default to be unlimited.
-	db2, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db2)
-	testutils.RunSQL(t, "TRUNCATE _rangeoptimizertest_new")
-	chunker2, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
-	require.NoError(t, err)
-	require.NoError(t, chunker2.Open())
-	copier, err = NewCopier(db2, chunker2, cfg)
-	require.NoError(t, err)
-	err = copier.Run(t.Context())
-	require.NoError(t, err) // works now.
 }

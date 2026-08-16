@@ -2,7 +2,6 @@ package copier
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,7 +28,6 @@ import (
 type buffered struct {
 	sync.Mutex
 
-	db            *sql.DB
 	applier       applier.Applier
 	chunker       table.Chunker
 	concurrency   int
@@ -63,8 +61,78 @@ type buffered struct {
 	readScalingClosed bool               // set true when the pool has drained, to block new spawns
 }
 
-// Assert that buffered implements the Copier interface
-var _ Copier = (*buffered)(nil)
+// Assert that buffered implements the Copier interface, and ChunkCopier for
+// the tests that step through the copy one chunk at a time.
+var (
+	_ Copier      = (*buffered)(nil)
+	_ ChunkCopier = (*buffered)(nil)
+)
+
+// CopyChunk copies a single chunk synchronously: it reads the chunk's rows,
+// writes them through the applier, and blocks until the write has completed
+// and chunker feedback has been sent. It exists for tests that need to drive
+// the copy deterministically (see ChunkCopier); Run does not use it.
+//
+// It starts the applier if needed (Start is idempotent, so this composes with
+// a later Run on the same copier). It does not stop it: write workers stay up
+// for the next call, and the runner's Close (or Run's own Stop) tears them
+// down.
+//
+// If ctx is cancelled while waiting for the applier, CopyChunk returns
+// ctx.Err() without waiting for the callback — and if the apply then
+// completes anyway, the callback still runs later on the applier's
+// coordinator goroutine, feeding the chunker for a chunk whose caller was
+// told it failed. The in-tree appliers make that branch unreachable (they
+// guarantee callback delivery on every path, including cancellation); it
+// exists as defense against a non-conforming applier.
+func (c *buffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
+	if err := c.applier.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start applier: %w", err)
+	}
+	c.throttler.BlockWait(ctx)
+	c.chunkSize.Store(chunk.ChunkSize)
+	startTime := time.Now()
+	rows, err := c.readChunkData(ctx, chunk)
+	if err != nil {
+		return fmt.Errorf("failed to read chunk data: %w", err)
+	}
+	chunk.ActualBytes = rowsByteSize(rows)
+	// The callback runs on the applier's feedback coordinator goroutine; done
+	// closes only after feedback and metrics are sent, so both have completed
+	// before CopyChunk returns. Empty chunks take the same path — the applier
+	// invokes the callback immediately.
+	done := make(chan struct{})
+	var applyErr error
+	callback := func(affectedRows int64, err error) {
+		defer close(done)
+		if err != nil {
+			applyErr = err
+			return
+		}
+		totalTime := time.Since(startTime)
+		c.chunker.Feedback(chunk, totalTime, uint64(affectedRows))
+		if metricsErr := c.sendMetrics(ctx, totalTime, chunk.ChunkSize, uint64(affectedRows)); metricsErr != nil {
+			// Metrics failures don't fail the copy; log and continue.
+			c.logger.Error("error sending metrics from copier", "error", metricsErr)
+		}
+	}
+	if err := c.applier.Apply(ctx, chunk, rows, callback); err != nil {
+		return fmt.Errorf("failed to apply rows: %w", err)
+	}
+	// The applier guarantees the callback is invoked exactly once per Apply
+	// that returned nil: worker errors and cancellation are delivered as
+	// error completions, and its feedback coordinator drains until the
+	// completions channel closes rather than exiting on ctx.Done(). The ctx
+	// branch below is defense-in-depth against a non-conforming future
+	// applier; if it fires, the callback (chunker feedback + metrics) may
+	// still run later on the coordinator goroutine.
+	select {
+	case <-done:
+		return applyErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // readChunkData reads all rows from a chunk into memory
 func (c *buffered) readChunkData(ctx context.Context, chunk *table.Chunk) ([][]any, error) {

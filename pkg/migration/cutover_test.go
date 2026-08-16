@@ -580,9 +580,7 @@ const cutoverAtomicityCompositeSchema = `CREATE TABLE %s (
 // This test proves that the window does not introduce inconsistency, even when
 // there are concurrent writes happening that are trying to introduce it.
 //
-// The test runs four times — across the cross product of:
-//   - chunker selection (optimistic vs composite)
-//   - copier mode (unbuffered vs buffered)
+// The test runs twice, once per chunker selection (optimistic vs composite).
 //
 // The optimistic chunker is selected automatically for single-column
 // auto_increment PKs; the composite chunker covers everything else (here we
@@ -608,8 +606,8 @@ const cutoverAtomicityCompositeSchema = `CREATE TABLE %s (
 // binlog/visibility race documented in #746 violates under sufficient
 // parallel-commit load. In production this is harmless because the
 // checksum's repair pass (FixDifferences=true) re-copies any missed rows
-// before cutover; in the test it surfaced as a CI flake on the
-// composite_unbuffered variant. We accept that FixDifferences=true masks
+// before cutover; in the test it surfaced as a CI flake on the composite
+// variant of the since-removed unbuffered copier. We accept that FixDifferences=true masks
 // algorithmic bugs in the copy/applier path here: the production cutover
 // path has the same masking, so probing without it was probing a stricter
 // invariant than spirit actually offers.
@@ -620,27 +618,24 @@ func TestCutoverAtomicityWithConcurrentWrites(t *testing.T) {
 		name      string
 		tableName string
 		schema    string
-		buffered  bool
 	}{
-		{"optimistic_unbuffered", "t1concurrent_oub", cutoverAtomicityOptimisticSchema, false},
-		{"optimistic_buffered", "t1concurrent_obu", cutoverAtomicityOptimisticSchema, true},
-		{"composite_unbuffered", "t1concurrent_cub", cutoverAtomicityCompositeSchema, false},
-		{"composite_buffered", "t1concurrent_cbu", cutoverAtomicityCompositeSchema, true},
+		{"optimistic", "t1concurrent_opt", cutoverAtomicityOptimisticSchema},
+		{"composite", "t1concurrent_comp", cutoverAtomicityCompositeSchema},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			runCutoverAtomicityTest(t, tc.tableName, tc.schema, tc.buffered)
+			runCutoverAtomicityTest(t, tc.tableName, tc.schema)
 		})
 	}
 }
 
 // runCutoverAtomicityTest runs the body of the cutover-atomicity probe
-// against an arbitrary table/schema pair, in either unbuffered or buffered
-// copier mode. tableName must be unique per call so the four variants can
-// run in parallel without conflicting on `_<name>_old`/`_<name>_new`.
-func runCutoverAtomicityTest(t *testing.T, tableName, schemaTmpl string, buffered bool) {
+// against an arbitrary table/schema pair. tableName must be unique per call
+// so the variants can run in parallel without conflicting on
+// `_<name>_old`/`_<name>_new`.
+func runCutoverAtomicityTest(t *testing.T, tableName, schemaTmpl string) {
 	t.Helper()
 
 	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf(schemaTmpl, tableName))
@@ -672,8 +667,7 @@ func runCutoverAtomicityTest(t *testing.T, tableName, schemaTmpl string, buffere
 	// Create and configure the migration with a custom cutover algorithm
 	// that intentionally fails after renaming the original table.
 	migration := NewTestMigration(t, WithStatement(fmt.Sprintf("ALTER TABLE %s ENGINE=InnoDB", tableName)),
-		WithThreads(2), WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(buffered))
+		WithThreads(2), WithTargetChunkTime(100*time.Millisecond))
 	migration.useTestCutover = true
 
 	// Run the migration — we expect it to fail with our intentional error.

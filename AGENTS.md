@@ -160,7 +160,7 @@ pkg/
   migration/  → Orchestrator for single-table schema changes (main entry point)
   move/       → Orchestrator for multi-table cross-server migrations
   change/     → change.Source abstraction + binlog implementation (acts as MySQL replica)
-  copier/     → Parallel row copying (unbuffered and buffered algorithms)
+  copier/     → Parallel row copying (DBLog-style buffered algorithm)
   applier/    → Write layer for target tables (single-target and sharded)
   table/      → Chunking strategies (optimistic, composite, multi)
   checksum/   → Post-copy data verification (CRC32 + BIT_XOR)
@@ -191,7 +191,7 @@ scripts/      → Build and run helper scripts
 
 ### Key design decisions
 
-- **Dynamic chunking**: chunk size auto-adjusts against a target based on the 90th percentile of the last 10 chunks, rather than a fixed row count. The default buffered copier targets an in-memory *byte budget* (`--target-chunk-size`, default `table.DefaultTargetChunkBytes` = 16 MiB); the checksum and legacy `--unbuffered` copier target a *chunk time* (`--target-chunk-time`, default 500ms for migrate).
+- **Dynamic chunking**: chunk size auto-adjusts against a target based on the 90th percentile of the last 10 chunks, rather than a fixed row count. The copier targets an in-memory *byte budget* (`--target-chunk-size`, default `table.DefaultTargetChunkBytes` = 16 MiB); the checksum targets a *chunk time* (`--target-chunk-time`, default 500ms for migrate).
 - **Change row map**: binlog changes are deduplicated in a map before flushing, so a row updated 10 times is only copied once.
 - **High watermark optimization**: binlog changes above the copier's current position are discarded (only for auto-increment PKs).
 - **Checkpoint/resume**: progress is saved periodically; interrupted migrations resume automatically with ~1 minute of lost progress.
@@ -213,9 +213,7 @@ Defines the `change.Source` interface — the abstraction spirit uses to consume
 The applier issues `REPLACE INTO target VALUES (...)` from inline row images (not `SELECT FROM source`), which sidesteps the binlog/visibility race that motivated `binlog_row_image=FULL` (see #746) and makes flushes order-independent for swap-pair workloads (see #847). REPLACE may delete rows on unique-key conflicts as well as PK conflicts — those rows are re-inserted by their own events in subsequent batches, so the destination is *eventually consistent* between batches and converges once every event for each affected PK has been applied.
 
 ### `pkg/copier`
-Two algorithms:
-- **Buffered** (default) — producer/consumer pattern; required for cross-server migrations (`pkg/move`) and the default for single-server schema changes. Reads rows into Spirit and writes them through the applier, taking no locks on the source.
-- **Unbuffered** (`--unbuffered`) — `INSERT IGNORE INTO ... SELECT` directly in MySQL; the legacy copier. Selected via `CopierConfig.Unbuffered`, which the migration runner wires straight from `--unbuffered`, so the buffered copier runs unless `--unbuffered` is passed. The copier ignores the applier when `Unbuffered` is true even if one is supplied.
+One algorithm: a DBLog-style **buffered** producer/consumer pattern, used for both single-server schema changes and cross-server migrations (`pkg/move`). Reads rows into Spirit and writes them through the applier (`CopierConfig.Applier`, required non-nil), taking no locks on the source. The legacy *unbuffered* copier (`INSERT IGNORE INTO ... SELECT` directly in MySQL, behind `--unbuffered`) has been removed.
 
 ### `pkg/table`
 Three chunker implementations:
@@ -285,7 +283,7 @@ Key principles:
 
 ## Unsupported Features (Do Not Implement)
 
-- **RENAME column** — some rename operations are intentionally not supported. Renaming primary key columns and dangerous overlap patterns (e.g., `RENAME COLUMN c1 TO n1, ADD COLUMN c1 ...`) are blocked. Simple non-PK column renames are supported in both the buffered and unbuffered copier paths.
+- **RENAME column** — some rename operations are intentionally not supported. Renaming primary key columns and dangerous overlap patterns (e.g., `RENAME COLUMN c1 TO n1, ADD COLUMN c1 ...`) are blocked. Simple non-PK column renames are supported.
 - **ALTER/DROP PRIMARY KEY** — primary key must remain unchanged
 - **Lossy conversions** (e.g., shortening VARCHAR below max data length)
 - **FOREIGN KEYS or TRIGGERS** on migrated tables

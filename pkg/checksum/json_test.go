@@ -204,8 +204,8 @@ func TestDistributedJSONChecksumTextImage(t *testing.T) {
 
 // TestJSONChecksumMisparsedDoubleRepairConverges proves the repair side of
 // the text-image contract. The target rows here hold the source documents
-// byte-for-byte (server-side INSERT..SELECT — the unbuffered copy path, or
-// tampering), NOT the one-text-round-trip image the checksum's source side
+// byte-for-byte (a server-side INSERT..SELECT, as the legacy unbuffered
+// copier issued, or tampering), NOT the one-text-round-trip image the checksum's source side
 // predicts, plus one genuinely different document. The asymmetric checksum
 // must flag this: for a misparsed double, byte-equal is the WRONG target
 // state (the deployed text write paths could never have produced it), and

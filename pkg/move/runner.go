@@ -431,15 +431,13 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
-	r.copier, err = copier.NewCopier(r.sources[0].db, r.copyChunker, &copier.CopierConfig{
-		Concurrency:     r.move.Threads,
-		TargetChunkTime: r.move.TargetChunkTime,
-		Logger:          r.logger,
-		Throttler:       &throttler.Noop{},
-		MetricsSink:     &metrics.NoopSink{},
-		DBConfig:        r.dbConfig,
-		Applier:         r.applier, // Use the shared applier
-		Unbuffered:      false,     // move always uses the buffered copier
+	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
+		Concurrency: r.move.Threads,
+		Logger:      r.logger,
+		Throttler:   &throttler.Noop{},
+		MetricsSink: &metrics.NoopSink{},
+		DBConfig:    r.dbConfig,
+		Applier:     r.applier, // Use the shared applier
 	})
 	if err != nil {
 		return err
@@ -934,15 +932,13 @@ func (r *Runner) newCopy(ctx context.Context) error {
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
 	var err error
-	r.copier, err = copier.NewCopier(r.sources[0].db, r.copyChunker, &copier.CopierConfig{
-		Concurrency:     r.move.Threads,
-		TargetChunkTime: r.move.TargetChunkTime,
-		Logger:          r.logger,
-		Throttler:       &throttler.Noop{},
-		MetricsSink:     &metrics.NoopSink{},
-		DBConfig:        r.dbConfig,
-		Applier:         r.applier, // Use the shared applier
-		Unbuffered:      false,     // move always uses the buffered copier
+	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
+		Concurrency: r.move.Threads,
+		Logger:      r.logger,
+		Throttler:   &throttler.Noop{},
+		MetricsSink: &metrics.NoopSink{},
+		DBConfig:    r.dbConfig,
+		Applier:     r.applier, // Use the shared applier
 	})
 	if err != nil {
 		return err

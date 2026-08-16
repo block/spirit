@@ -100,7 +100,7 @@ func TestReplClientComplex(t *testing.T) {
 	require.NoError(t, chunker.Open())
 	copierCfg := copier.NewCopierDefaultConfig()
 	copierCfg.Applier = applier.NewSingleTargetForTest(t, db)
-	_, err = copier.NewCopier(db, chunker, copierCfg)
+	_, err = copier.NewCopier(chunker, copierCfg)
 	require.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
 	require.NoError(t, client.AddSubscription(t1, t2, chunker))
@@ -511,7 +511,7 @@ func TestReplClientQueue(t *testing.T) {
 	require.NoError(t, chunker.Open())
 	copierCfg := copier.NewCopierDefaultConfig()
 	copierCfg.Applier = applier.NewSingleTargetForTest(t, db)
-	_, err = copier.NewCopier(db, chunker, copierCfg)
+	_, err = copier.NewCopier(chunker, copierCfg)
 	require.NoError(t, err)
 	// Attach chunker's keyabovewatermark to the repl client
 	require.NoError(t, client.AddSubscription(t1, t2, chunker))

@@ -170,15 +170,6 @@ func TestRenameInMySQL80(t *testing.T) {
 
 func TestGeneratedColumns(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testGeneratedColumns(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testGeneratedColumns(t, true)
-	})
-}
-
-func testGeneratedColumns(t *testing.T, enableBuffered bool) {
 	testutils.NewTestTable(t, "t1generated", `CREATE TABLE t1generated (
 		id int not null primary key auto_increment,
 		b int not null,
@@ -186,21 +177,12 @@ func testGeneratedColumns(t *testing.T, enableBuffered bool) {
 		d int
 	)`)
 	testutils.RunSQL(t, `INSERT INTO t1generated (b, d) VALUES (1, 10), (2, 20), (3, 30)`)
-	m := NewTestMigration(t, WithStatement("ALTER TABLE t1generated ENGINE=InnoDB"), WithBuffered(enableBuffered))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1generated ENGINE=InnoDB"))
 	require.NoError(t, m.Run())
 }
 
 func TestStoredGeneratedColumns(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testStoredGeneratedColumns(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testStoredGeneratedColumns(t, true)
-	})
-}
-
-func testStoredGeneratedColumns(t *testing.T, enableBuffered bool) {
 	testutils.NewTestTable(t, "t1stored", `CREATE TABLE t1stored (
 		id bigint NOT NULL AUTO_INCREMENT,
 		pa bigint DEFAULT NULL,
@@ -219,7 +201,7 @@ func testStoredGeneratedColumns(t *testing.T, enableBuffered bool) {
 		(1, 1, 0, 95), (1, 0, 1, 94), (1, 0, 0, 93), (1, NULL, 0, 92),
 		(1, 0, NULL, 91), (1, NULL, NULL, 90), (NULL, NULL, NULL, 89)`)
 
-	m := NewTestMigration(t, WithBuffered(enableBuffered),
+	m := NewTestMigration(t,
 		WithStatement(`ALTER TABLE t1stored MODIFY COLUMN s4 TINYINT(1) GENERATED ALWAYS AS (IF(pa <> p2 OR (pa IS NULL AND p2 IS NOT NULL) OR (pa IS NOT NULL AND p2 IS NULL), 1, NULL)) STORED`))
 	require.NoError(t, m.Run())
 }
@@ -234,15 +216,6 @@ type testcase struct {
 // without an intermediate cast.
 func TestBinaryChecksum(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testBinaryChecksum(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testBinaryChecksum(t, true)
-	})
-}
-
-func testBinaryChecksum(t *testing.T, enableBuffered bool) {
 	tests := []testcase{
 		{"binary(50)", "varbinary(100)"},
 		{"binary(50)", "binary(100)"},
@@ -262,7 +235,7 @@ func testBinaryChecksum(t *testing.T, enableBuffered bool) {
 		)`, test.OldType))
 		testutils.RunSQL(t, `INSERT INTO t1varbin VALUES (null, 'abcdefg')`)
 
-		m := NewTestMigration(t, WithBuffered(enableBuffered),
+		m := NewTestMigration(t,
 			WithStatement(fmt.Sprintf("ALTER TABLE t1varbin CHANGE b b %s not null", test.NewType))) //nolint: dupword
 		require.NoError(t, m.Run())
 	}
@@ -273,28 +246,19 @@ func testBinaryChecksum(t *testing.T, enableBuffered bool) {
 // checksum correctly against their multi-byte utf8mb4 representations
 func TestConvertCharset(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testConvertCharset(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testConvertCharset(t, true)
-	})
-}
-
-func testConvertCharset(t *testing.T, enableBuffered bool) {
 	testutils.NewTestTable(t, "t1charset", `CREATE TABLE t1charset (
 		id int not null primary key auto_increment,
 		b varchar(100) not null
 	) charset=latin1`)
 	testutils.RunSQL(t, `INSERT INTO t1charset VALUES (null, 'à'), (null, '€')`)
 
-	m := NewTestMigration(t, WithBuffered(enableBuffered),
+	m := NewTestMigration(t,
 		WithStatement("ALTER TABLE t1charset CONVERT TO CHARACTER SET UTF8MB4"))
 	require.NoError(t, m.Run())
 
 	// Because utf8mb4 is the superset, it doesn't matter that that's
 	// what the checksum casts to. We should be able to convert back as well.
-	m = NewTestMigration(t, WithBuffered(enableBuffered),
+	m = NewTestMigration(t,
 		WithStatement("ALTER TABLE t1charset CONVERT TO CHARACTER SET latin1"))
 	require.NoError(t, m.Run())
 }
@@ -394,7 +358,7 @@ func TestBufferedMultiTableMigration(t *testing.T) {
 		WITH RECURSIVE seq_cte AS (SELECT 0 AS seq UNION ALL SELECT seq+1 FROM seq_cte WHERE seq < 99)
 		SELECT seq FROM seq_cte) t`)
 
-	m := NewTestMigration(t, WithBuffered(true),
+	m := NewTestMigration(t,
 		WithStatement("ALTER TABLE bmt_t1 ADD COLUMN extra int DEFAULT 0; ALTER TABLE bmt_t2 ADD COLUMN extra int DEFAULT 0"))
 	require.NoError(t, m.Run())
 

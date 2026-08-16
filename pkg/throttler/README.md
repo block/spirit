@@ -134,10 +134,10 @@ Both throttlers require an `IsAurora()` probe — which confirms `performance_sc
 Throttlers are integrated into the copier and automatically pause chunk copying when the system is under stress:
 
 ```go
-copier := &copier.Unbuffered{
-    Throttler: throttler,
-    // ... other config
-}
+config := copier.NewCopierDefaultConfig()
+config.Throttler = throttler
+config.Applier = rowApplier // required (non-nil); see pkg/applier
+c, err := copier.NewCopier(chunker, config)
 ```
 
 During migration, the copier calls `throttler.BlockWait(ctx)` before each chunk, pausing operations if `IsThrottled()` returns true.

@@ -172,26 +172,15 @@ func TestTpConversion(t *testing.T) {
 	require.NoError(t, m.Close())
 }
 
-// TestEnumReorder verifies that ENUM reordering ALTERs are refused at preflight
-// in both unbuffered and buffered modes.
+// TestEnumReorder verifies that ENUM reordering ALTERs are refused at preflight.
 //
-// The binlog replay path (bufferedMap) is now used for any memory-comparable PK
-// regardless of copy mode, and it represents ENUM values as int64 ordinals from
-// the binlog. Reordering the ENUM definition makes those ordinals point at
+// The binlog replay path (bufferedMap) represents ENUM values as int64
+// ordinals from the binlog. Reordering the ENUM definition makes those ordinals point at
 // different strings in the target, which would corrupt rows. The preflight
 // check refuses these ALTERs unconditionally — it's better to fail fast than
 // to corrupt data.
 func TestEnumReorder(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testEnumReorder(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testEnumReorder(t, true)
-	})
-}
-
-func testEnumReorder(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "enumreorder", `CREATE TABLE enumreorder (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		status ENUM('active', 'inactive', 'pending') NOT NULL
@@ -205,7 +194,6 @@ func testEnumReorder(t *testing.T, enableBuffered bool) {
 	m := NewTestRunner(t, "enumreorder", "MODIFY COLUMN status ENUM('pending', 'active', 'inactive') NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	// Concurrent DML during copy phase to exercise binlog replay.
@@ -241,19 +229,10 @@ func testEnumReorder(t *testing.T, enableBuffered bool) {
 }
 
 // TestSetReorder mirrors TestEnumReorder but for SET columns.
-// Both buffered and unbuffered modes refuse SET reordering because the string
-// representation changes cause checksum failures.
+// SET reordering is refused because the string representation changes
+// cause checksum failures.
 func TestSetReorder(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testSetReorder(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testSetReorder(t, true)
-	})
-}
-
-func testSetReorder(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "setreorder", `CREATE TABLE setreorder (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		perms SET('read', 'write', 'execute') NOT NULL
@@ -263,7 +242,6 @@ func testSetReorder(t *testing.T, enableBuffered bool) {
 	m := NewTestRunner(t, "setreorder", "MODIFY COLUMN perms SET('execute', 'read', 'write') NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	// Concurrent DML during copy phase.
@@ -307,8 +285,8 @@ func testSetReorder(t *testing.T, enableBuffered bool) {
 // original string and MySQL maps them onto the new (smaller) enum without
 // data corruption.
 //
-// The matrix covers both copy modes (buffered/unbuffered) and both change
-// sources (binlog file+position and GTID). The decode happens in
+// The matrix covers both change sources (binlog file+position and GTID).
+// The decode happens in
 // TableInfo.DecodeBinlogRow, which both pkg/change clients call, but we
 // exercise them separately so a future divergence between the two source
 // implementations can't silently break ENUM drops on one of them.
@@ -320,21 +298,15 @@ func TestEnumDrop(t *testing.T) {
 			source = "gtid"
 		}
 		t.Run(source, func(t *testing.T) {
-			t.Run("unbuffered", func(t *testing.T) {
-				testEnumDrop(t, false, useGTID)
-			})
-			t.Run("buffered", func(t *testing.T) {
-				testEnumDrop(t, true, useGTID)
-			})
+			testEnumDrop(t, useGTID)
 		})
 	}
 }
 
-func testEnumDrop(t *testing.T, enableBuffered, useGTID bool) {
-	// Unique table per matrix cell so the four combinations stay independent.
-	tableName := fmt.Sprintf("enumdrop_%s_%s",
-		map[bool]string{true: "gtid", false: "binlog"}[useGTID],
-		map[bool]string{true: "buf", false: "unbuf"}[enableBuffered])
+func testEnumDrop(t *testing.T, useGTID bool) {
+	// Unique table per matrix cell so the two change sources stay independent.
+	tableName := fmt.Sprintf("enumdrop_%s",
+		map[bool]string{true: "gtid", false: "binlog"}[useGTID])
 	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf(`CREATE TABLE %s (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		status ENUM('active', 'inactive', 'pending', 'archived') NOT NULL
@@ -353,7 +325,6 @@ func testEnumDrop(t *testing.T, enableBuffered, useGTID bool) {
 	m := NewTestRunner(t, tableName, "MODIFY COLUMN status ENUM('active', 'pending', 'archived') NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
 		WithGTID(useGTID),
 		WithTestThrottler())
 
@@ -447,7 +418,6 @@ func TestEnumToVarchar(t *testing.T) {
 	m := NewTestRunner(t, "enumtovarchar", "MODIFY COLUMN status VARCHAR(32) NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	// Concurrent DML during the copy phase exercises the binlog replay
@@ -519,7 +489,6 @@ func TestSetToVarchar(t *testing.T) {
 	m := NewTestRunner(t, "settovarchar", "MODIFY COLUMN perms VARCHAR(64) NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -579,7 +548,6 @@ func TestEnumToSet(t *testing.T) {
 		"MODIFY COLUMN status SET('active', 'inactive', 'pending') NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -650,7 +618,6 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 	m := NewTestRunner(t, "minrbr_buffered", "ENGINE=InnoDB",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	// Run the migration in a goroutine so we can inject minimal-RBR writes.
@@ -690,13 +657,6 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 
 func TestAlterPKIntToBigInt(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigInt(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigInt(t, true)
-	})
-}
-
-func testAlterPKIntToBigInt(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_int2big", `CREATE TABLE altpk_int2big (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(255) NOT NULL,
@@ -704,8 +664,7 @@ func testAlterPKIntToBigInt(t *testing.T, enableBuffered bool) {
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_int2big (name, val) SELECT 'a', 1", 3)
 
-	m := NewTestRunner(t, "altpk_int2big", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_int2big", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT")
 	require.NoError(t, m.Run(t.Context()))
 	require.False(t, m.usedInstantDDL)
 	require.NoError(t, m.Close())
@@ -723,21 +682,13 @@ func testAlterPKIntToBigInt(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKIntToBigIntUnsigned(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntUnsigned(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigIntUnsigned(t, true)
-	})
-}
-
-func testAlterPKIntToBigIntUnsigned(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_int2bigu", `CREATE TABLE altpk_int2bigu (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(255) NOT NULL
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_int2bigu (name) SELECT 'a'", 5)
 
-	m := NewTestRunner(t, "altpk_int2bigu", "MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_int2bigu", "MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT")
 	require.NoError(t, m.Run(t.Context()))
 	require.False(t, m.usedInstantDDL)
 	require.NoError(t, m.Close())
@@ -751,21 +702,13 @@ func testAlterPKIntToBigIntUnsigned(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKTinyIntToInt(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKTinyIntToInt(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKTinyIntToInt(t, true)
-	})
-}
-
-func testAlterPKTinyIntToInt(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_tiny2int", `CREATE TABLE altpk_tiny2int (
 		id tinyint unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		data varchar(100) NOT NULL
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_tiny2int (data) SELECT 'test'", 50)
 
-	m := NewTestRunner(t, "altpk_tiny2int", "MODIFY COLUMN id INT UNSIGNED NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_tiny2int", "MODIFY COLUMN id INT UNSIGNED NOT NULL AUTO_INCREMENT")
 	require.NoError(t, m.Run(t.Context()))
 	require.False(t, m.usedInstantDDL)
 	require.NoError(t, m.Close())
@@ -779,13 +722,6 @@ func testAlterPKTinyIntToInt(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKIntToBigIntWithDML(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntWithDML(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigIntWithDML(t, true)
-	})
-}
-
-func testAlterPKIntToBigIntWithDML(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_dml", `CREATE TABLE altpk_dml (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(255) NOT NULL,
@@ -793,7 +729,6 @@ func testAlterPKIntToBigIntWithDML(t *testing.T, enableBuffered bool) {
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_dml (name, val) SELECT 'seed', 1", 4096)
 	m := NewTestRunner(t, "altpk_dml", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	var wg sync.WaitGroup
@@ -821,13 +756,6 @@ func testAlterPKIntToBigIntWithDML(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKCompositeDatatypeChange(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKCompositeDatatypeChange(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKCompositeDatatypeChange(t, true)
-	})
-}
-
-func testAlterPKCompositeDatatypeChange(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_comp", `CREATE TABLE altpk_comp (
 		id1 int NOT NULL,
 		id2 int NOT NULL,
@@ -839,8 +767,7 @@ func testAlterPKCompositeDatatypeChange(t *testing.T, enableBuffered bool) {
 		testutils.RunSQL(t, fmt.Sprintf("INSERT INTO altpk_comp (id1, id2, data) VALUES (%d, %d, 'row%d')", i/10, i%10, i))
 	}
 
-	m := NewTestRunner(t, "altpk_comp", "MODIFY COLUMN id1 BIGINT NOT NULL",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_comp", "MODIFY COLUMN id1 BIGINT NOT NULL")
 	require.NoError(t, m.Run(t.Context()))
 	require.NoError(t, m.Close())
 
@@ -857,13 +784,6 @@ func testAlterPKCompositeDatatypeChange(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t, true)
-	})
-}
-
-func testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_multi", `CREATE TABLE altpk_multi (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(100) NOT NULL,
@@ -875,7 +795,6 @@ func testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T, enable
 		"MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT, MODIFY COLUMN name VARCHAR(255) NOT NULL",
 		WithThreads(2),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	var wg sync.WaitGroup
@@ -981,7 +900,6 @@ func TestBinaryToVarbinaryConcurrentDML(t *testing.T) {
 	m := NewTestRunner(t, "bin2varbin", "MODIFY data VARBINARY(32) NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -1164,7 +1082,6 @@ func runBitDMLTest(t *testing.T, tableName, colName, colDef string, values []uin
 	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
