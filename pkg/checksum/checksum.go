@@ -30,6 +30,20 @@ var (
 	// long-running transactions to reduce HLL (history list length) growth.
 	ErrYieldTimeout = errors.New("checksum yield timeout")
 
+	// ErrDifferencesExhausted is returned by Run when every attempt completed
+	// but kept finding row differences. The table is diverging in a way the
+	// repairs cannot close, so a further attempt reproduces it: a lossy ALTER
+	// (adding a UNIQUE index to non-unique data being the common one), or a
+	// bug. Callers that decide whether to retry should not.
+	ErrDifferencesExhausted = errors.New("checksum found differences on every attempt")
+
+	// ErrAttemptsExhausted is returned by Run when every attempt errored before
+	// it could compare the whole table — killed connections, a cancelled
+	// context, a failure inside a pass. Nothing has been proven about the data,
+	// and the condition may well be gone by the next attempt. It wraps the last
+	// attempt's error, which is the one worth triaging.
+	ErrAttemptsExhausted = errors.New("checksum errored on every attempt")
+
 	// DefaultYieldTimeout is the default maximum duration for a single checksum
 	// pass before yielding to release long-running REPEATABLE READ transactions.
 	DefaultYieldTimeout = 24 * time.Hour

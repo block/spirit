@@ -799,10 +799,14 @@ func (c *SingleChecker) Run(ctx context.Context) error {
 	//      (lastErr == nil) — this is the original "lossy ALTER or bug"
 	//      shape (e.g. adding a UNIQUE INDEX to non-unique data, or a real
 	//      bug in Spirit's copy phase). Keep the original guidance.
+	//
+	// Each shape carries its own sentinel so a caller can tell them apart
+	// without reading the message: only the second is reproducible, and a
+	// caller that decides whether to retry needs to know which it has.
 	if lastErr != nil {
-		return fmt.Errorf("checksum errored on every attempt (%d/%d); last error: %w", c.maxRetries, c.maxRetries, lastErr)
+		return fmt.Errorf("%w (%d/%d); last error: %w", ErrAttemptsExhausted, c.maxRetries, c.maxRetries, lastErr)
 	}
-	return fmt.Errorf("checksum found differences on every attempt (%d/%d). This likely indicates either a bug in Spirit, or a manual modification to the _new table outside of Spirit. Please report @ github.com/block/spirit", c.maxRetries, c.maxRetries)
+	return fmt.Errorf("%w (%d/%d). This likely indicates either a bug in Spirit, or a manual modification to the _new table outside of Spirit. Please report @ github.com/block/spirit", ErrDifferencesExhausted, c.maxRetries, c.maxRetries)
 }
 
 // logChunkSummary reports the pass's chunk-size distribution. Info level: it
