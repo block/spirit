@@ -285,28 +285,13 @@ func TestSetReorder(t *testing.T) {
 // original string and MySQL maps them onto the new (smaller) enum without
 // data corruption.
 //
-// The matrix covers both change sources (binlog file+position and GTID).
-// The decode happens in
-// TableInfo.DecodeBinlogRow, which both pkg/change clients call, but we
-// exercise them separately so a future divergence between the two source
-// implementations can't silently break ENUM drops on one of them.
+// The change source (binlog file+position vs GTID) is auto-detected from the
+// server, so each CI server configuration exercises its own source
+// implementation; the decode happens in TableInfo.DecodeBinlogRow, which both
+// pkg/change clients call.
 func TestEnumDrop(t *testing.T) {
 	t.Parallel()
-	for _, useGTID := range []bool{false, true} {
-		source := "binlog"
-		if useGTID {
-			source = "gtid"
-		}
-		t.Run(source, func(t *testing.T) {
-			testEnumDrop(t, useGTID)
-		})
-	}
-}
-
-func testEnumDrop(t *testing.T, useGTID bool) {
-	// Unique table per matrix cell so the two change sources stay independent.
-	tableName := fmt.Sprintf("enumdrop_%s",
-		map[bool]string{true: "gtid", false: "binlog"}[useGTID])
+	tableName := "enumdrop"
 	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf(`CREATE TABLE %s (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		status ENUM('active', 'inactive', 'pending', 'archived') NOT NULL
@@ -325,7 +310,6 @@ func testEnumDrop(t *testing.T, useGTID bool) {
 	m := NewTestRunner(t, tableName, "MODIFY COLUMN status ENUM('active', 'pending', 'archived') NOT NULL",
 		WithThreads(1),
 		WithTargetChunkTime(100*time.Millisecond),
-		WithGTID(useGTID),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())

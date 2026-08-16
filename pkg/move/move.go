@@ -43,11 +43,6 @@ type Move struct {
 	// reverseWindow (reversewindow.go).
 	ReverseWindow time.Duration `name:"reverse-window" help:"After cutover, reverse the move (change-only) and keep it alive for this long to allow rollback. 0 disables (normal cutover)." default:"0"`
 
-	// EnableExperimentalGTID switches the change source from binlog file+position to MySQL GTIDs.
-	// EXPERIMENTAL — see pkg/change/gtid.go. Requires gtid_mode=ON and
-	// enforce_gtid_consistency=ON on every source.
-	EnableExperimentalGTID bool `name:"enable-experimental-gtid" help:"EXPERIMENTAL: use GTID-based change source instead of binlog file+position" default:"false"`
-
 	// SourceTables optionally specifies a list of tables to move.
 	// If empty, all tables in the source database will be moved.
 	// This is useful for Vitess MoveTables operations where only specific tables should be moved.

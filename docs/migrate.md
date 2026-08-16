@@ -20,7 +20,6 @@ spirit migrate --host mydb:3306 --username root --password secret \
 - [database](#database)
 - [defer-cutover](#defer-cutover)
 - [enable-experimental-autoscaling](#enable-experimental-autoscaling)
-- [enable-experimental-gtid](#enable-experimental-gtid)
 - [host](#host)
 - [lock-wait-timeout](#lock-wait-timeout)
 - [max-commit-latency](#max-commit-latency)
@@ -161,52 +160,6 @@ copy rows → initial checksum → wait on sentinel (continuous checksum loop) �
 The continuous checksum runs single-threaded today (see [block/spirit#831](https://github.com/block/spirit/issues/831) for dynamic thread tuning) and shares the same yield behavior as the initial pass. The first continuous-checksum iteration starts **one hour after the initial checksum completes** — without this delay, small tables would re-acquire the table lock back-to-back with the initial pass. Subsequent iterations run **at most once per hour**: after each pass finishes, Spirit waits one hour minus the duration of the just-finished pass before starting the next one (so passes that themselves take longer than an hour proceed immediately). The wait is interrupted immediately when the sentinel is dropped. It is enabled automatically whenever the sentinel is in effect — there is no separate flag.
 
 Each continuous-checksum pass runs once with no internal retry (the loop itself is the retry mechanism). If a pass detects a difference, the affected chunk is recopied via `FixDifferences` and the migration is aborted with a "checksum found differences" error. The fix is durable on disk, so the operator can re-run the migration and it will resume from the checkpoint and succeed if the drift has been addressed. The intent is "fail loud, investigate" — since the initial checksum already passed, any difference detected during the sentinel wait is unexpected.
-
-### enable-experimental-gtid
-
-- Type: Boolean
-- Default value: `false`
-
-> **⚠️ Experimental.** The GTID change source is new and the on-wire / on-disk
-> coordinate format may change between releases. Do not mix `--enable-experimental-gtid` and non-GTID
-> runs against the same checkpoint — the persisted resume coordinate is not
-> interchangeable between the two paths.
-
-When set to `true`, Spirit switches its replication change feed from the default
-binlog **file + offset** coordinate to a MySQL **GTID set** coordinate. The
-copier, applier, checksum, cutover, and checkpoint contract are otherwise
-unchanged — only the way Spirit asks the source for "everything after position
-X" differs.
-
-The main practical differences vs. the default path:
-
-- Spirit no longer issues `FLUSH BINARY LOGS` to read or advance its position
-  (the default path runs `FLUSH BINARY LOGS` from `getCurrentBinlogPosition` and
-  again from `BlockWait`'s stall recovery). This eliminates Spirit-induced binlog
-  rotations on the source.
-- Resume after a streamer reconnect is naturally transaction-aligned: the GTID
-  client re-asks the server for "everything after `bufferedGTID`" rather than
-  rewinding to the start of the current binlog file and re-reading.
-- The opaque resume coordinate written to the checkpoint table is a GTID set
-  string (e.g. `uuid:1-5,otheruuid:1-3`) rather than `<file>:<offset>`.
-
-**Requirements on the source server (in addition to the default
-[Requirements](../docs/README.md#requirements)):**
-
-- `gtid_mode = ON`
-- `enforce_gtid_consistency = ON`
-
-A resume from checkpoint fails fast if `@@GLOBAL.gtid_purged` is no longer a
-subset of the checkpointed GTID set (i.e. the source has dropped binlogs Spirit
-would need to re-apply). In that case Spirit surfaces
-`change.Source: cannot resume from position`, logs the reason, and restarts the
-migration from scratch.
-
-```bash
-spirit migrate --enable-experimental-gtid \
-       --host mydb:3306 --database mydb --table users \
-       --alter "ADD COLUMN email VARCHAR(255)"
-```
 
 ### host
 
@@ -626,6 +579,50 @@ spirit migrate --tls-mode VERIFY_IDENTITY \
 
 The username to use when connecting to MySQL.
 
+## GTID auto-detection
+
+Spirit keeps the new table in sync by following the source's replication
+stream, and MySQL has two coordinate schemes for positions in that stream.
+Spirit picks between them automatically at the start of each migration — there
+is no flag:
+
+- **GTID set** (e.g. `3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5`): used
+  whenever the server has GTIDs enabled (`gtid_mode=ON` **and**
+  `enforce_gtid_consistency=ON`).
+- **Binlog file + offset** (e.g. `binlog.000002:4`): used when it does not.
+
+The copier, applier, checksum, cutover, and checkpoint contract are identical
+either way — only the way Spirit asks the source for "everything after
+position X" differs. The practical differences of the GTID scheme:
+
+- Spirit never issues `FLUSH BINARY LOGS` to read or advance its position (the
+  file+offset path runs it to establish the start position and again from
+  `BlockWait`'s stall recovery), so a GTID-mode migration induces no binlog
+  rotations on the source.
+- Resume after a streamer reconnect is naturally transaction-aligned: the GTID
+  client re-asks the server for "everything after GTID set X" rather than
+  rewinding to the start of the current binlog file and re-reading.
+- The opaque resume coordinate written to the checkpoint table is a GTID set
+  string (e.g. `uuid:1-5,otheruuid:1-3`) rather than `<file>:<offset>`.
+
+Auto-detection applies to **new** migrations. A resume from checkpoint always
+keeps the coordinate scheme the run started with, which is recorded by the
+format of the checkpointed position itself:
+
+- A file+offset checkpoint resumes on the file+offset client even if the
+  server has GTIDs enabled — for example a checkpoint written by an older
+  Spirit version, or a server whose GTIDs were switched on mid-migration.
+- A GTID checkpoint requires the server to still have GTIDs enabled. If GTIDs
+  were switched off mid-migration, the resume fails with an error (the
+  file+offset client cannot interpret a GTID coordinate) rather than silently
+  restarting the copy; re-enable GTIDs to resume.
+
+A GTID resume also fails fast if `@@GLOBAL.gtid_purged` is no longer a subset
+of the checkpointed GTID set (i.e. the source has dropped binlogs Spirit would
+need to re-apply). In that case Spirit surfaces
+`change.Source: cannot resume from position`, logs the reason, and restarts the
+migration from scratch.
+
 ## Reading the status output
 
 While a migration runs, Spirit logs one status report every 30 seconds. It is deliberately the only recurring `INFO` output: the checkpoint, the binlog flush and the binlog rotations each used to log on their own schedule, and they are now rows in this report instead ([#329](https://github.com/block/spirit/issues/329)). Their detail is still available by running with debug logging.
@@ -672,12 +669,14 @@ Spirit keeps the new table in sync with writes that land during the copy by subs
 | --- | --- |
 | `deltas` | Changes discovered in the binary log that have not been applied to the new table yet. This is usually low at the start of a migration because of the *key above watermark* optimization: a change to a row the copier has not reached yet can simply be dropped, since the copier will read the current version when it gets there. It rises as the copy approaches 100%, and the `applyChangeset` state exists to drain it before cutover. |
 | `rotations` | How many binlog rotations Spirit has followed on the source. High counts usually just indicate a high volume of write activity on the server (from any workload, not only this migration). Worth knowing because binlog retention is what bounds how long a paused or resumable migration can survive. |
-| `(n forced)` | The subset of those rotations Spirit caused itself, by issuing `FLUSH BINARY LOGS` when it was waiting for the feed to catch up and the position had stalled. A number that climbs here (rather than in `rotations`) means Spirit's own catch-up waiting is churning through binlogs. |
+| `(n forced)` | The subset of those rotations Spirit caused itself, by issuing `FLUSH BINARY LOGS` when it was waiting for the feed to catch up and the position had stalled. A number that climbs here (rather than in `rotations`) means Spirit's own catch-up waiting is churning through binlogs. Always `0` when the run uses GTID coordinates (see [GTID auto-detection](#gtid-auto-detection)) — that feed never issues `FLUSH BINARY LOGS`. |
 | `flushed X ago (took Y, n rows)` | When the change feed last flushed its buffered changes to the new table, how long that flush took, and how many buffered changes it started with. Flushes are periodic (every 30 seconds by default), so `X` reads somewhere between `0s` and the interval during a healthy copy; a value that keeps climbing well past it means flushes are not completing. `0 rows` is the normal reading for a feed that is keeping up — there was nothing left to write. |
 
 ### `ckpt` row
 
-Reads `<age> ago  <position>`, or `never` before the first checkpoint.
+Reads `<age> ago  <position>`, or `never` before the first checkpoint. The
+position is in the run's coordinate scheme — `<file>:<offset>` or a GTID set,
+per [GTID auto-detection](#gtid-auto-detection).
 
 The age is how long ago the resume checkpoint was last written. Checkpoints are attempted every 50 seconds but are skipped while the copier has no resumable watermark yet, so `never` early in a run is expected. If the age keeps growing, an interrupted migration will resume from further back than you would like. A checkpoint that cannot be written at all is fatal — Spirit stops rather than working for hours without being able to record progress.
 

@@ -185,17 +185,19 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 
 // runRevertingMove runs one reverse-window move against the given DSNs and, once
 // the window opens, requests a revert (creates the marker), returning when the
-// reverse cutover has completed. Fails the test on any error.
-func runRevertingMove(t *testing.T, sourceDSN, targetDSN string, ctl *sql.DB, dstDBName string, gtid bool) {
+// reverse cutover has completed. Fails the test on any error. The change
+// source (binlog file+position vs GTID) is auto-detected from the server, so
+// the GTID-enabled CI configuration exercises the GTID reverse feed and the
+// no-GTID configuration exercises the binlog one.
+func runRevertingMove(t *testing.T, sourceDSN, targetDSN string, ctl *sql.DB, dstDBName string) {
 	t.Helper()
 	m := &Move{
-		SourceDSN:              sourceDSN,
-		TargetDSN:              targetDSN,
-		TargetChunkTime:        time.Second,
-		Threads:                1,
-		WriteThreads:           1,
-		ReverseWindow:          30 * time.Second, // long; the revert ends it early
-		EnableExperimentalGTID: gtid,
+		SourceDSN:       sourceDSN,
+		TargetDSN:       targetDSN,
+		TargetChunkTime: time.Second,
+		Threads:         1,
+		WriteThreads:    1,
+		ReverseWindow:   30 * time.Second, // long; the revert ends it early
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
@@ -225,24 +227,11 @@ func TestMoveReverseWindowRevertIdempotentAcrossRetries(t *testing.T) {
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwidem_src", "rwidem_dst")
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		runRevertingMove(t, sourceDSN, targetDSN, ctl, "rwidem_dst", false)
+		runRevertingMove(t, sourceDSN, targetDSN, ctl, "rwidem_dst")
 		require.True(t, tableExists(t, ctl, "rwidem_src", "t1"), "attempt %d: source should be serving", attempt)
 		require.True(t, tableExists(t, ctl, "rwidem_dst", "t1_revert"), "attempt %d: target retired to _revert", attempt)
 		require.False(t, tableExists(t, ctl, "rwidem_dst", "t1"), "attempt %d: target real table gone", attempt)
 	}
-}
-
-// TestMoveReverseWindowRevertGTID: the reverse window works end-to-end with the
-// GTID change source (--enable-experimental-gtid), exercising the GTID path of
-// Source.CurrentPosition (position capture at cutover) and the GTID reverse feed
-// — proving the feature is not binlog-only.
-func TestMoveReverseWindowRevertGTID(t *testing.T) {
-	shortenReverseWindowPolling(t)
-	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwgtid_src", "rwgtid_dst")
-	runRevertingMove(t, sourceDSN, targetDSN, ctl, "rwgtid_dst", true)
-	require.True(t, tableExists(t, ctl, "rwgtid_src", "t1"), "source should be serving after rollback")
-	require.True(t, tableExists(t, ctl, "rwgtid_dst", "t1_revert"), "target retired to _revert")
-	require.False(t, tableExists(t, ctl, "rwgtid_dst", "t1"), "target real table gone")
 }
 
 // TestMoveReverseWindowResumesAfterKill: killing a move while it is in the

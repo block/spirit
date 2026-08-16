@@ -16,7 +16,6 @@ This will copy all tables from the source database to the target database, verif
 - [checkpoint-max-age](#checkpoint-max-age)
 - [create-sentinel](#create-sentinel)
 - [defer-secondary-indexes](#defer-secondary-indexes)
-- [enable-experimental-gtid](#enable-experimental-gtid)
 - [force](#force)
 - [reverse-window](#reverse-window)
 - [source-dsn](#source-dsn)
@@ -77,37 +76,6 @@ When Move cannot resume from an existing checkpoint — for example the checkpoi
 
 Passing `--force` changes that recovery behaviour: instead of failing, Move wipes the target tables and starts the copy fresh, re-running the post-setup safety checks against the cleaned target rather than bypassing them. Use it only when the target's current contents can safely be discarded.
 
-### enable-experimental-gtid
-
-- Type: Boolean
-- Default value: `false`
-
-> **⚠️ Experimental.** See the full caveats and on-disk-format warning in the
-> [migrate `--enable-experimental-gtid` documentation](migrate.md#enable-experimental-gtid).
-
-When set to `true`, Move switches each source's replication change feed from
-the default binlog **file + offset** coordinate to a MySQL **GTID set**
-coordinate. Behaviour is identical to [`spirit migrate --enable-experimental-gtid`](migrate.md#enable-experimental-gtid)
-in every other respect — the copier, applier, checksum, sentinel wait, cutover,
-and checkpoint contract are unchanged.
-
-For N:M moves (multiple `SourceDSNs`) the flag is applied uniformly to **every**
-source — Move does not support mixing GTID and file+offset across sources in a
-single run. Each source's checkpointed coordinate is stored independently in the
-checkpoint table's `binlog_positions` JSON, keyed by source address+database, so
-a partial failure on one source still resumes the others from their own GTID sets.
-
-**Requirements (on every source):**
-
-- `gtid_mode = ON`
-- `enforce_gtid_consistency = ON`
-
-```bash
-spirit move --enable-experimental-gtid \
-            --source-dsn "user:pass@tcp(source-host:3306)/mydb" \
-            --target-dsn "user:pass@tcp(target-host:3306)/mydb"
-```
-
 ### reverse-window
 
 - Type: Duration
@@ -115,7 +83,7 @@ spirit move --enable-experimental-gtid \
 
 A normal Move ends with a one-way cutover: traffic moves to the target and the source tables are renamed to `_old`. `--reverse-window` makes that cutover **reversible** for a bounded period. Given a non-zero duration, Move does not exit after cutover — it stays running and, in change-only mode, streams writes from the target(s) *back* to the source's now-retired `_old` tables, keeping the source current so the move can be rolled back.
 
-While the window is open the run reports the `reverseWindow` state. The reverse feed uses the same change-source coordinate (binlog file+offset, or GTID with [`--enable-experimental-gtid`](#enable-experimental-gtid)) as the forward move. One of three things ends the window:
+While the window is open the run reports the `reverseWindow` state. The reverse feed streams from the target servers, so its change-source coordinate (binlog file+offset vs. GTID) is auto-detected from each *target*, independently of the forward move (see [GTID auto-detection](#gtid-auto-detection)). One of three things ends the window:
 
 1. **It elapses.** Move finalizes forward exactly as a normal cutover would — the source stays retired as `_old`, the checkpoint is dropped — and exits.
 2. **A rollback is requested** (see below). Move rolls back to the source and exits.
@@ -187,3 +155,25 @@ How many chunks to copy in parallel from the source.
 How many concurrent write threads to use per target when inserting rows. This controls the fan-out parallelism of the buffered copier's write side.
 
 Move does not support the experimental thread autoscaling available in [`spirit migrate`](migrate.md#enable-experimental-autoscaling), so `--threads` and `--write-threads` are always honored here.
+
+## GTID auto-detection
+
+Like `migrate`, Move selects each replication feed's coordinate scheme
+automatically: a source with GTIDs enabled (`gtid_mode=ON` and
+`enforce_gtid_consistency=ON`) is followed by GTID set, and one without by
+binlog file+offset. See the
+[migrate GTID auto-detection documentation](migrate.md#gtid-auto-detection)
+for the behavioural differences and the resume rules (a checkpointed position
+always resumes in the scheme it was written in, and a GTID checkpoint requires
+the server to still have GTIDs enabled).
+
+Move-specific notes:
+
+- The selection is **per source**: an N:M move whose sources disagree on GTID
+  support simply mixes schemes, since each source's coordinate is stored
+  independently in the checkpoint table's `binlog_positions` JSON (keyed by
+  source address+database) and classified independently on resume.
+- During a [`--reverse-window`](#reverse-window), the reverse feed streams
+  from the *targets*, so its scheme is auto-detected from each target server —
+  a move from a non-GTID source to a GTID-enabled target reverses over GTIDs,
+  and vice versa.

@@ -82,7 +82,7 @@ func newFanInFeed(t *testing.T, positions []string) (*ReverseFeed, *sql.DB) {
 		}
 	}
 
-	feed, err := NewReverseFeed(ReverseFeedConfig{
+	feed, err := NewReverseFeed(t.Context(), ReverseFeedConfig{
 		Sources:      []ReverseSource{mkSource("poc_rf_s0", 0), mkSource("poc_rf_s1", 1)},
 		Target:       applier.Target{DB: uDB, KeyRange: "0"},
 		TargetTables: map[string]*table.TableInfo{"t1": uTbl},
@@ -259,7 +259,7 @@ func newFanOutFeed(t *testing.T) (*ReverseFeed, *sql.DB) {
 		}
 	}
 
-	feed, err := NewReverseFeed(ReverseFeedConfig{
+	feed, err := NewReverseFeed(t.Context(), ReverseFeedConfig{
 		Sources: []ReverseSource{mkSource("poc_rfnm_s0"), mkSource("poc_rfnm_s1")},
 		Targets: []applier.Target{
 			{DB: u0DB, KeyRange: "-80"},
@@ -320,7 +320,7 @@ func TestReverseFeedShardedConfigValidation(t *testing.T) {
 	}
 	targets := []applier.Target{{DB: u0DB, KeyRange: "-80"}, {DB: u1DB, KeyRange: "80-"}}
 
-	_, err = NewReverseFeed(ReverseFeedConfig{
+	_, err = NewReverseFeed(t.Context(), ReverseFeedConfig{
 		Sources:      []ReverseSource{src},
 		Target:       applier.Target{DB: u0DB},
 		Targets:      targets,
@@ -328,7 +328,7 @@ func TestReverseFeedShardedConfigValidation(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "mutually exclusive")
 
-	_, err = NewReverseFeed(ReverseFeedConfig{
+	_, err = NewReverseFeed(t.Context(), ReverseFeedConfig{
 		Sources:      []ReverseSource{src},
 		Targets:      targets,
 		TargetTables: map[string]*table.TableInfo{"t1": oldTbl},
@@ -337,7 +337,7 @@ func TestReverseFeedShardedConfigValidation(t *testing.T) {
 
 	// A nil shard connection would otherwise only surface when a row happened
 	// to route to that shard, mid-window.
-	_, err = NewReverseFeed(ReverseFeedConfig{
+	_, err = NewReverseFeed(t.Context(), ReverseFeedConfig{
 		Sources:      []ReverseSource{src},
 		Targets:      []applier.Target{{DB: u0DB, KeyRange: "-80"}, {DB: nil, KeyRange: "80-"}},
 		TargetTables: map[string]*table.TableInfo{"t1": oldTbl},

@@ -277,9 +277,10 @@ func (c *binlogClient) StartFromPosition(ctx context.Context, pos string) error 
 		return errors.New("StartFromPosition: empty position; use Start instead for a fresh start")
 	}
 	// Parse failures are wrapped with ErrPositionNotFound, mirroring the
-	// GTID client: an unparseable position (e.g. a GTID-set checkpoint from
-	// a --gtid run) can never become resumable by retrying, so callers
-	// should treat it the same as a purged binlog and start fresh.
+	// GTID client: an unparseable position (e.g. a GTID-set checkpoint fed
+	// to this client directly, bypassing NewAutoClient's classification)
+	// can never become resumable by retrying, so callers should treat it
+	// the same as a purged binlog and start fresh.
 	parsed, err := parseBinlogPositionString(pos)
 	if err != nil {
 		return fmt.Errorf("%w: StartFromPosition: %w", ErrPositionNotFound, err)

@@ -85,12 +85,6 @@ type Sync struct {
 	// target-empty guard.
 	Force bool `name:"force" help:"Drop and recreate the target database when the copy cannot resume from a checkpoint." default:"false"`
 
-	// GTID switches the built-in change source from binlog file+position to
-	// MySQL GTIDs. EXPERIMENTAL — see pkg/change/gtid.go. Ignored when a
-	// pre-constructed Source is injected. Requires gtid_mode=ON and
-	// enforce_gtid_consistency=ON on the source.
-	GTID bool `name:"gtid" help:"EXPERIMENTAL: use GTID-based change source instead of binlog file+position" default:"false"`
-
 	// Source optionally provides a pre-constructed change.Source to use
 	// for replication instead of constructing a built-in MySQL-binlog
 	// client from SourceDSN. When set, the runner uses this as the change

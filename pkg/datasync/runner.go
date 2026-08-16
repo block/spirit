@@ -708,10 +708,21 @@ func (r *Runner) setup(ctx context.Context) error {
 	r.applier = appl
 	r.progMu.Unlock()
 
+	// Read any checkpoint before wiring the change source: the saved position's
+	// encoding decides which built-in client a resumed sync gets (see
+	// change.NewAutoClient), so the read has to come first.
+	watermark, pos, hasCheckpoint, err := r.readCheckpoint(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Wire the change source (continuous mode only): injected (e.g. VStream),
-	// or a built-in MySQL binlog client constructed from the source DSN. Sync
-	// replicates a whole schema, so the DDL filter is by schema only. Copy-only
-	// sync constructs no change source.
+	// or a built-in MySQL client constructed from the source DSN. The built-in
+	// client's coordinate scheme (GTID vs binlog file+position) is selected
+	// automatically: a resumed sync stays in the scheme its checkpointed
+	// position was written in, and a fresh one uses GTIDs whenever the source
+	// has them enabled. Sync replicates a whole schema, so the DDL filter is
+	// by schema only. Copy-only sync constructs no change source.
 	if !r.sync.CopyOnly {
 		if r.sync.Source != nil {
 			r.setReplClient(r.sync.Source)
@@ -721,12 +732,11 @@ func (r *Runner) setup(ctx context.Context) error {
 			replConfig.CancelFunc = r.fatalError
 			replConfig.DDLFilterSchema = r.source.config.DBName
 			replConfig.DBConfig = r.sourceDBConfig
-			if r.sync.GTID {
-				r.logger.Info("EXPERIMENTAL: using GTID-based change source")
-				r.setReplClient(change.NewGTIDClient(r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig))
-			} else {
-				r.setReplClient(change.NewBinlogClient(r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig))
+			client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig, pos)
+			if err != nil {
+				return err
 			}
+			r.setReplClient(client)
 		}
 	}
 
@@ -734,10 +744,6 @@ func (r *Runner) setup(ctx context.Context) error {
 	// the saved watermark (continuing a partial copy) and open the change feed
 	// at the saved position — skipping the target-empty check. So a restarted
 	// sync resumes its partial copy instead of starting over.
-	watermark, pos, hasCheckpoint, err := r.readCheckpoint(ctx)
-	if err != nil {
-		return err
-	}
 	if hasCheckpoint {
 		r.resuming.Store(true)
 		r.logger.Info("Found checkpoint on target; resuming", "position", pos)

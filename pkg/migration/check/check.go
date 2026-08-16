@@ -73,10 +73,6 @@ type Resources struct {
 	Password           string
 	TLSMode            string
 	TLSCertificatePath string
-	// GTID, when true, opts the migration into the experimental GTID-based
-	// change source. The configuration check uses this to additionally
-	// validate gtid_mode and enforce_gtid_consistency on the source.
-	GTID bool
 
 	// scope is the scope the checks are running under, set by RunChecks. A
 	// check that tolerates a missing resource for an external caller reads it

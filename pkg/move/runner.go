@@ -379,9 +379,67 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 }
 
 func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
+	// Read checkpoint from targets[0] by convention. This happens first
+	// because the checkpointed per-source positions decide which change
+	// source implementation each source gets (buildReplClients below). A
+	// checkpoint table written by an incompatible spirit version (e.g.
+	// missing or renamed a column) fails the read and aborts the move; we do
+	// not support cross-version resume.
+	tgt0 := &r.targets[0]
+	rec, err := r.checkpointTbl().ReadLatest(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read from checkpoint table '%s' on target: %w", checkpointTableName, err)
+	}
+	// A checkpoint past the forward cutover (a reverse-window phase) is resumed
+	// earlier by maybeResumeReverseWindow, before discovery/locks — it should
+	// never reach this copy-path resume. This is a defensive backstop: getting
+	// here with a non-empty phase means that earlier handoff was bypassed, so
+	// fail loudly rather than re-run the copy and cutover (which would re-invoke
+	// the traffic switch and rename the already-retired tables).
+	if rec.Phase != "" {
+		return fmt.Errorf("cannot resume move down the copy path: checkpoint is past cutover (phase=%q); a reverse-window resume is handled earlier (see maybeResumeReverseWindow)", rec.Phase)
+	}
+	copierWatermark := rec.CopierWatermark
+	r.checksumWatermark = rec.ChecksumWatermark
+
+	// Check if the checkpoint is too old to safely resume — replaying many
+	// days of binary logs can be slower than re-copying, and the binlogs may
+	// have been purged anyway. This must happen before any destructive step
+	// (deleteRecopyRange below modifies the targets). Unlike migrate,
+	// move cannot silently fall back to a fresh copy: the target tables are
+	// non-empty (that is exactly why setupUnderLocks() chose the resume path), so we
+	// fail loudly and leave the decision to the operator.
+	if checkpointAge := rec.Age(); checkpointAge >= r.move.CheckpointMaxAge {
+		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or wipe the target tables (including '%s') and restart the move from scratch",
+			status.ErrCheckpointTooOld,
+			checkpointAge.Round(time.Second),
+			r.move.CheckpointMaxAge,
+			checkpointTableName,
+		)
+	}
+
+	// Parse per-source positions (opaque strings owned by the source impl),
+	// keyed by sourceKey (addr/dbname).
+	var positions map[string]string
+	if err := json.Unmarshal([]byte(rec.Position), &positions); err != nil {
+		return fmt.Errorf("could not parse binlog positions from checkpoint: %w", err)
+	}
+	for i := range r.sources {
+		if _, ok := positions[r.sources[i].sourceKey()]; !ok {
+			return fmt.Errorf("checkpoint missing binlog position for source %s", r.sources[i].sourceKey())
+		}
+	}
+
+	// Build each source's change source in the coordinate scheme its
+	// checkpointed position was written in (a GTID set resumes through the
+	// GTID client and requires the server to still have GTIDs enabled; a
+	// binlog file:offset position resumes through the binlog client).
+	if err := r.buildReplClients(ctx, positions); err != nil {
+		return err
+	}
+
 	copyChunkers := make([]table.Chunker, 0, len(r.sources)*len(r.sourceTables))
 	checksumChunkers := make([]table.Chunker, 0, len(r.sources)*len(r.sourceTables))
-	var err error
 
 	// For each source and each table, create a chunker and add a subscription
 	// to that source's repl client.
@@ -443,43 +501,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
-	// Read checkpoint from targets[0] by convention. A checkpoint table written
-	// by an incompatible spirit version (e.g. missing or renamed a column) fails
-	// the read and aborts the move; we do not support cross-version resume.
-	tgt0 := &r.targets[0]
-	rec, err := r.checkpointTbl().ReadLatest(ctx)
-	if err != nil {
-		return fmt.Errorf("could not read from checkpoint table '%s' on target: %w", checkpointTableName, err)
-	}
-	// A checkpoint past the forward cutover (a reverse-window phase) is resumed
-	// earlier by maybeResumeReverseWindow, before discovery/locks — it should
-	// never reach this copy-path resume. This is a defensive backstop: getting
-	// here with a non-empty phase means that earlier handoff was bypassed, so
-	// fail loudly rather than re-run the copy and cutover (which would re-invoke
-	// the traffic switch and rename the already-retired tables).
-	if rec.Phase != "" {
-		return fmt.Errorf("cannot resume move down the copy path: checkpoint is past cutover (phase=%q); a reverse-window resume is handled earlier (see maybeResumeReverseWindow)", rec.Phase)
-	}
-	copierWatermark := rec.CopierWatermark
-	r.checksumWatermark = rec.ChecksumWatermark
-	binlogPositionsJSON := rec.Position
-
-	// Check if the checkpoint is too old to safely resume — replaying many
-	// days of binary logs can be slower than re-copying, and the binlogs may
-	// have been purged anyway. This must happen before any destructive step
-	// (deleteRecopyRange below modifies the targets). Unlike migrate,
-	// move cannot silently fall back to a fresh copy: the target tables are
-	// non-empty (that is exactly why setupUnderLocks() chose the resume path), so we
-	// fail loudly and leave the decision to the operator.
-	if checkpointAge := rec.Age(); checkpointAge >= r.move.CheckpointMaxAge {
-		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or wipe the target tables (including '%s') and restart the move from scratch",
-			status.ErrCheckpointTooOld,
-			checkpointAge.Round(time.Second),
-			r.move.CheckpointMaxAge,
-			checkpointTableName,
-		)
-	}
-
 	// With multiple sources, a persisted checksum watermark cannot be trusted.
 	// deleteRecopyRange (below) runs every (source, table) DELETE against
 	// every target, and same-named tables from different sources interleave in
@@ -499,18 +520,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 			"reason", "deleteRecopyRange may remove rows below other sources' watermarks; only a from-scratch checksum re-verifies and repairs them",
 			"sources", len(r.sources))
 		r.checksumWatermark = ""
-	}
-
-	// Parse per-source positions (opaque strings owned by the source impl),
-	// keyed by sourceKey (addr/dbname).
-	var positions map[string]string
-	if err := json.Unmarshal([]byte(binlogPositionsJSON), &positions); err != nil {
-		return fmt.Errorf("could not parse binlog positions from checkpoint: %w", err)
-	}
-	for i := range r.sources {
-		if _, ok := positions[r.sources[i].sourceKey()]; !ok {
-			return fmt.Errorf("checkpoint missing binlog position for source %s", r.sources[i].sourceKey())
-		}
 	}
 
 	// Delete rows at/above the copier's resume position (the watermark
@@ -613,25 +622,11 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		return err
 	}
 
-	// Create one repl client per source, all sharing the same applier.
-	r.logger.Debug("Setting up repl clients", "sourceCount", len(r.sources))
-	if r.move.EnableExperimentalGTID {
-		r.logger.Info("EXPERIMENTAL: using GTID-based change source")
-	}
-	for i := range r.sources {
-		src := &r.sources[i]
-		replConfig := change.NewClientDefaultConfig()
-		replConfig.Logger = r.logger
-		replConfig.CancelFunc = r.fatalError
-		replConfig.DDLFilterSchema = src.config.DBName
-		replConfig.DDLFilterTables = r.move.SourceTables
-		replConfig.DBConfig = r.dbConfig
-		if r.move.EnableExperimentalGTID {
-			src.replClient = change.NewGTIDClient(src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig)
-		} else {
-			src.replClient = change.NewBinlogClient(src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig)
-		}
-	}
+	// The repl clients are NOT built here: their coordinate scheme (GTID vs
+	// binlog file+position) depends on whether we start fresh (probe each
+	// source; see change.NewAutoClient) or resume (the checkpointed
+	// position's encoding decides). buildReplClients is called from newCopy
+	// and resumeFromCheckpoint once that is known.
 
 	// Run post-setup checks
 	if err = r.runChecks(ctx, check.ScopePostSetup); err != nil {
@@ -866,8 +861,40 @@ func (r *Runner) reverseWindowLogicalTables(ctx context.Context) ([]string, erro
 	return logical, rows.Err()
 }
 
+// buildReplClients constructs one change source per source server, all
+// sharing r.applier. resumePositions is the checkpoint's per-source position
+// map when resuming (keyed by sourceKey), or nil for a fresh copy. Each
+// source's client is selected by change.NewAutoClient: a resumed source stays
+// in the coordinate scheme its checkpointed position was written in, and a
+// fresh one uses GTIDs whenever that server has them enabled. The selection
+// is per source, so an N:M move whose shards disagree on GTID support simply
+// runs each shard's feed in that shard's own scheme.
+func (r *Runner) buildReplClients(ctx context.Context, resumePositions map[string]string) error {
+	r.logger.Debug("Setting up repl clients", "sourceCount", len(r.sources))
+	for i := range r.sources {
+		src := &r.sources[i]
+		replConfig := change.NewClientDefaultConfig()
+		replConfig.Logger = r.logger
+		replConfig.CancelFunc = r.fatalError
+		replConfig.DDLFilterSchema = src.config.DBName
+		replConfig.DDLFilterTables = r.move.SourceTables
+		replConfig.DBConfig = r.dbConfig
+		client, err := change.NewAutoClient(ctx, src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig, resumePositions[src.sourceKey()])
+		if err != nil {
+			return fmt.Errorf("source %d: %w", i, err)
+		}
+		src.replClient = client
+	}
+	return nil
+}
+
 func (r *Runner) newCopy(ctx context.Context) error {
-	// Starting fresh. Clear any leftover _revert tables from an earlier
+	// Starting fresh: build each source's change source by probing the server
+	// (no checkpoint positions to inherit a coordinate scheme from).
+	if err := r.buildReplClients(ctx, nil); err != nil {
+		return err
+	}
+	// Clear any leftover _revert tables from an earlier
 	// reverse-window rollback on these targets, so this run's own reverse
 	// cutover can retire the targets without colliding (and so they don't
 	// linger). Only on the fresh path — a resume must not drop tables.
@@ -1502,7 +1529,6 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 		Targets:        r.targets,
 		SourceTables:   r.sourceTables,
 		CreateSentinel: r.move.CreateSentinel,
-		GTID:           r.move.EnableExperimentalGTID,
 		MoveEverything: len(r.move.SourceTables) == 0,
 	}, r.logger, scope)
 }

@@ -79,5 +79,6 @@ func TestBinlogCurrentPosition(t *testing.T) {
 // TestGTIDCurrentPosition covers gtidClient.CurrentPosition
 // (@@GLOBAL.gtid_executed). Requires gtid_mode=ON, like the rest of gtid_test.go.
 func TestGTIDCurrentPosition(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	currentPositionRoundTrip(t, "curposgtid", NewGTIDClient)
 }

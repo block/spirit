@@ -72,6 +72,9 @@ func TestRowsEventDecodeFuncSkipsUnsubscribed(t *testing.T) {
 
 	for _, mode := range []string{"binlog", "gtid"} {
 		t.Run(mode, func(t *testing.T) {
+			if mode == "gtid" {
+				skipUnlessGTIDEnabled(t)
+			}
 			// Each mode replays the same statements; start from empty tables —
 			// the noise table included, or its INSERT ... SELECT doublings
 			// compound across modes and the workload depends on run order.
@@ -113,6 +116,7 @@ func TestRowsEventDecodeFuncSkipsUnsubscribed(t *testing.T) {
 // TestGTIDClient mirrors TestReplClient but uses the GTID-backed change
 // source. Verifies the basic INSERT → buffer → flush loop end-to-end.
 func TestGTIDClient(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -158,6 +162,7 @@ func TestGTIDClient(t *testing.T) {
 // lose the deltas AND leave bufferedGTID permanently behind gtid_executed,
 // so the BlockWait calls below would time out.
 func TestGTIDClientTransactionCompression(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -360,6 +365,7 @@ func TestValidateResumeGTIDSet(t *testing.T) {
 // mutation: gtid_executed only ever grows, so a synthetic future GTID
 // stays unexecuted no matter what concurrent tests commit.
 func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -426,6 +432,7 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 // cancelled. The INSERT below doubles as the next-GTIDEvent promotion
 // trigger for the trigger-DDL's deferred GTID.
 func TestGTIDClientUnparseableDDL(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -484,6 +491,7 @@ func TestGTIDClientUnparseableDDL(t *testing.T) {
 // COMMIT/ROLLBACK early-out used to `continue` without promoting the
 // pending GTID, leaving bufferedGTID permanently behind gtid_executed.
 func TestGTIDClientNonXIDCommit(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -619,6 +627,7 @@ func rollbackDanglingXATestTxns(t *testing.T, db *sql.DB, knownXIDs ...string) {
 // stragglers from hard-killed runs leak in isolation instead of wedging
 // future runs; graceful failures are reclaimed by the cleanup below.
 func TestGTIDClientXATransaction(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -758,6 +767,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 // Unique xids and per-run table names for the same reasons documented on
 // TestGTIDClientXATransaction.
 func TestGTIDClientXATransactionCompression(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -861,6 +871,7 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 // consumed strictly in order, so once GetDeltaLen reflects a row event,
 // every event injected before it has been processed.
 func TestGTIDClientXAPromotionOrdering(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -995,6 +1006,7 @@ func TestGTIDClientXAPromotionOrdering(t *testing.T) {
 // GetDeltaLen reflects a row event, every event injected before it has
 // been processed.
 func TestGTIDClientSavepointPromotionOrdering(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1134,6 +1146,7 @@ func TestGTIDClientSavepointPromotionOrdering(t *testing.T) {
 // after the savepoints must replicate, while the rolled-back row must
 // not.
 func TestGTIDClientSavepointTransaction(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1243,6 +1256,7 @@ func TestGTIDClientSavepointTransaction(t *testing.T) {
 // processed. (In a real CTAS group the row events target the created —
 // unsubscribed — table; a subscribed table stands in for any group tail.)
 func TestGTIDClientUnparseableQueryPromotionOrdering(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1388,6 +1402,7 @@ func TestGTIDClientUnparseableQueryPromotionOrdering(t *testing.T) {
 // BlockWait right after the CTAS would time out, with no later traffic to
 // bail it out.
 func TestGTIDClientCreateTableAsSelect(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1549,6 +1564,7 @@ func TestFlushedGTIDIsMonotonicAcrossOverlappingFlushes(t *testing.T) {
 // TestGTIDRoundtripPosition verifies that the opaque Position string
 // emitted after Start parses back into a GTIDSet (i.e. format round-trips).
 func TestGTIDRoundtripPosition(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1593,6 +1609,7 @@ func TestGTIDRoundtripPosition(t *testing.T) {
 // readStream goroutine on any DDL notification for a non-subscribed
 // table.
 func TestGTIDProcessDDLNotificationMoveStyle(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	dbName, db := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE orders (id INT NOT NULL PRIMARY KEY)")
 

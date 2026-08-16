@@ -96,5 +96,6 @@ func TestBinlogFlushUnderTableLockErrors(t *testing.T) {
 }
 
 func TestGTIDFlushUnderTableLockErrors(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	runFlushUnderTableLockErrorBranches(t, true, "gtidflushlockerrt1", "gtidflushlockerrt2")
 }

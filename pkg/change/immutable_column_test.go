@@ -91,6 +91,7 @@ func TestImmutableColumnUpdateFatal(t *testing.T) {
 // TestImmutableColumnUpdateFatalGTID mirrors TestImmutableColumnUpdateFatal
 // for the GTID-backed change source.
 func TestImmutableColumnUpdateFatalGTID(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)

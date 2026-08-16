@@ -58,23 +58,3 @@ func TestConfigurationCheckMultipleSources(t *testing.T) {
 // values via an injectable struct (and is therefore unit-testable without
 // touching the server), we accept that the negative branches are exercised
 // only at startup against a real misconfigured server.
-
-// TestConfigurationCheckGTID exercises the GTID branch on the happy path
-// across multiple sources. Same SET-GLOBAL-races caveat as the comment
-// above applies: negative branches (gtid_mode=OFF) are not unit-tested.
-func TestConfigurationCheckGTID(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	db2, err := sql.Open("mysql", testutils.DSN())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db2)
-
-	r := Resources{
-		Sources: []SourceResource{{DB: db}, {DB: db2}},
-		GTID:    true,
-	}
-	err = configurationCheck(t.Context(), r, slog.Default())
-	require.NoError(t, err)
-}

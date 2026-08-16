@@ -30,21 +30,20 @@ const (
 var reverseWindowPollInterval = 1 * time.Second
 
 // targetCurrentPosition reads target tgt's current head position in the change
-// feed's coordinate scheme — matching the mode the reverse feed will use
-// (r.move.EnableExperimentalGTID) — so the captured string round-trips through
-// StartFromPosition. It uses a short-lived, unstarted Source purely for the
-// Source.CurrentPosition read (the applier is unused on that path, hence nil),
-// because at cutover the reverse feed itself cannot exist yet: its target-side
-// _old tables are created by the rename that immediately follows this hook.
+// feed's coordinate scheme — auto-detected from that target server (GTIDs when
+// it has them enabled), the same way NewReverseFeed later classifies the
+// captured string, so it round-trips through StartFromPosition. It uses a
+// short-lived, unstarted Source purely for the Source.CurrentPosition read
+// (the applier is unused on that path, hence nil), because at cutover the
+// reverse feed itself cannot exist yet: its target-side _old tables are
+// created by the rename that immediately follows this hook.
 func targetCurrentPosition(ctx context.Context, r *Runner, tgt *applier.Target) (string, error) {
 	cfg := change.NewClientDefaultConfig()
 	cfg.Logger = r.logger
 	cfg.DBConfig = r.dbConfig
-	var src change.Source
-	if r.move.EnableExperimentalGTID {
-		src = change.NewGTIDClient(tgt.DB, tgt.Config.Addr, tgt.Config.User, tgt.Config.Passwd, nil, cfg)
-	} else {
-		src = change.NewBinlogClient(tgt.DB, tgt.Config.Addr, tgt.Config.User, tgt.Config.Passwd, nil, cfg)
+	src, err := change.NewAutoClient(ctx, tgt.DB, tgt.Config.Addr, tgt.Config.User, tgt.Config.Passwd, nil, cfg, "")
+	if err != nil {
+		return "", err
 	}
 	defer src.Close()
 	return src.CurrentPosition(ctx)
@@ -240,7 +239,6 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 		Logger:       r.logger,
 		DBConfig:     r.dbConfig,
 		Threads:      r.move.WriteThreads,
-		GTID:         r.move.EnableExperimentalGTID,
 	}
 	if sharded {
 		revTargets := make([]applier.Target, len(r.sources))
@@ -256,7 +254,7 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 		cfg.Target = applier.Target{DB: src.db}
 	}
 
-	feed, err := NewReverseFeed(cfg)
+	feed, err := NewReverseFeed(ctx, cfg)
 	if err != nil {
 		return err
 	}

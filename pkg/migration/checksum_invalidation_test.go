@@ -345,7 +345,7 @@ func advanceRunnerToChecksumWatermarks(t *testing.T, r *Runner) {
 	require.NoError(t, r.checksumChunker.Open())
 	disableDynamicChunking(t, r.copyChunker)
 	disableDynamicChunking(t, r.checksumChunker)
-	require.NoError(t, r.setupCopierCheckerAndReplClient(t.Context()))
+	require.NoError(t, r.setupCopierCheckerAndReplClient(t.Context(), ""))
 	require.NoError(t, r.replClient.Start(t.Context()))
 	t.Cleanup(func() { r.replClient.Close() })
 

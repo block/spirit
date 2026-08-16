@@ -109,27 +109,9 @@ func configurationCheck(ctx context.Context, r Resources, logger *slog.Logger) e
 		// silently lost during cutover. See issue #818.
 		return errors.New("binlog_order_commits must be ON (this is the MySQL default; setting it OFF allows commit reordering that breaks Spirit's binlog→applier visibility assumption)")
 	}
-	// GTID-specific preflight. The GTID change source asks the server for
-	// COM_BINLOG_DUMP_GTID and reads @@GLOBAL.gtid_executed / gtid_purged for
-	// resume validation; both require gtid_mode=ON and
-	// enforce_gtid_consistency=ON (otherwise gtid_executed is empty and
-	// COM_BINLOG_DUMP_GTID fails with an opaque protocol error). Validate up
-	// front so the operator gets a clear message rather than a stream-level
-	// failure mid-run.
-	if r.GTID {
-		var gtidMode, enforceGTIDConsistency string
-		if err := r.DB.QueryRowContext(ctx,
-			`SELECT @@global.gtid_mode, @@global.enforce_gtid_consistency`).Scan(
-			&gtidMode, &enforceGTIDConsistency,
-		); err != nil {
-			return err
-		}
-		if gtidMode != "ON" {
-			return errors.New("--gtid requires gtid_mode=ON on the source (current: " + gtidMode + ")")
-		}
-		if enforceGTIDConsistency != "ON" {
-			return errors.New("--gtid requires enforce_gtid_consistency=ON on the source (current: " + enforceGTIDConsistency + ")")
-		}
-	}
+	// There is no GTID preflight here: the change source is selected
+	// automatically (change.NewAutoClient probes gtid_mode /
+	// enforce_gtid_consistency itself), so a server without GTIDs simply
+	// gets the binlog file+position client rather than an error.
 	return nil
 }

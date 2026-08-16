@@ -24,10 +24,11 @@ import (
 // Compile-time assertion that the GTID-backed Client satisfies Source.
 var _ Source = (*gtidClient)(nil)
 
-// gtidClient is an experimental change.Source that uses MySQL GTIDs as the
-// resume coordinate instead of (binlog-file, offset). It is a parallel
-// implementation to binlogClient; nothing is shared with it directly so the
-// binlog client can be kept untouched while this one matures.
+// gtidClient is a change.Source that uses MySQL GTIDs as the resume
+// coordinate instead of (binlog-file, offset). It is selected automatically
+// (see NewAutoClient) whenever the source server has GTIDs enabled. It is a
+// parallel implementation to binlogClient; nothing is shared with it directly
+// so the binlog client can be kept untouched while this one matures.
 //
 // Wire protocol: COM_BINLOG_DUMP_GTID via go-mysql's
 // BinlogSyncer.StartSyncGTID. The server requires gtid_mode=ON and
@@ -118,8 +119,9 @@ type gtidClient struct {
 // NewGTIDClient constructs the GTID-backed change.Source. It mirrors
 // NewBinlogClient: config.Applier (passed via appl) is required.
 //
-// EXPERIMENTAL. See docs in pkg/migration and pkg/move for the --gtid
-// flag.
+// Most callers should use NewAutoClient instead, which selects between this
+// and the binlog client based on the server's GTID support (fresh runs) or
+// the checkpointed position's encoding (resumes).
 func NewGTIDClient(db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig) Source {
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig()

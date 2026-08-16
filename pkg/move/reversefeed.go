@@ -48,7 +48,13 @@ type ReverseSource struct {
 	Password string             // binlog syncer password
 	Tables   []*table.TableInfo // S-side tables to watch, built on DB
 	// Position is the opaque change.Source position to resume from (captured at
-	// cutover). Empty means start from the source's current head.
+	// cutover). Empty means start from the source's current head. Its encoding
+	// also selects the change-source coordinate scheme, exactly like a
+	// checkpoint resume (see change.NewAutoClient): a GTID set resumes through
+	// the GTID client (and requires the server to still have GTIDs enabled), a
+	// file:offset position through the binlog client, and the empty head-start
+	// case probes the server so the scheme matches what a cutover capture on
+	// that server would have produced.
 	Position string
 }
 
@@ -80,10 +86,6 @@ type ReverseFeedConfig struct {
 	DBConfig      *dbconn.DBConfig
 	Threads       int           // applier write threads; 0 => default (4)
 	FlushInterval time.Duration // 0 => change.DefaultFlushInterval
-	// GTID selects the GTID-based change source (matching the forward move's
-	// --enable-experimental-gtid) instead of binlog file+offset, so the reverse
-	// feed uses the same coordinate scheme the operator chose for the move.
-	GTID bool
 }
 
 // ReverseFeed is a running change-only reverse feed: one change.Source per
@@ -107,8 +109,12 @@ type ReverseFeed struct {
 }
 
 // NewReverseFeed wires the feeds and their shared applier. It does not open any
-// binlog stream; call Start or Run for that.
-func NewReverseFeed(cfg ReverseFeedConfig) (_ *ReverseFeed, err error) {
+// binlog stream — call Start or Run for that — but it does query each source
+// server once: change.NewAutoClient selects (and validates) the change-source
+// coordinate scheme per source, so e.g. a GTID-set Position on a server that no
+// longer has GTIDs enabled fails here with a clear error rather than as a
+// stream failure at Start.
+func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed, err error) {
 	if len(cfg.Sources) == 0 {
 		return nil, errors.New("reverse feed: at least one source is required")
 	}
@@ -204,11 +210,20 @@ func NewReverseFeed(cfg ReverseFeedConfig) (_ *ReverseFeed, err error) {
 			DBConfig:   dbCfg,
 			CancelFunc: rf.onFatal,
 		}
-		var client change.Source
-		if cfg.GTID {
-			client = change.NewGTIDClient(src.DB, src.Addr, src.User, src.Password, appl, clientCfg)
-		} else {
-			client = change.NewBinlogClient(src.DB, src.Addr, src.User, src.Password, appl, clientCfg)
+		// The captured start position's own encoding selects the change
+		// source implementation: it was captured by targetCurrentPosition in
+		// this server's auto-detected coordinate scheme (GTID when the server
+		// has GTIDs enabled), and Start hands it back via StartFromPosition,
+		// so classifying it here guarantees the round-trip parses. Routing
+		// through NewAutoClient (rather than classifying locally) adds the
+		// same validation a checkpoint resume gets — a GTID position on a
+		// server that lost GTIDs is a purpose-built error now, not a stream
+		// failure later — and makes the empty head-start case (Position "",
+		// see ReverseSource) probe the server instead of silently defaulting
+		// to the file+offset scheme.
+		client, cerr := change.NewAutoClient(ctx, src.DB, src.Addr, src.User, src.Password, appl, clientCfg, src.Position)
+		if cerr != nil {
+			return nil, fmt.Errorf("reverse feed: source %d: %w", si, cerr)
 		}
 		// Track the client now so the deferred cleanup closes it — and every
 		// earlier client — if a later subscription or source fails to wire up.

@@ -1,9 +1,11 @@
-name: MySQL 8.0.28 (Aurora version) /w docker-compose
+name: MySQL 8.0.28 (Aurora version, no GTID) /w docker-compose
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,9 +23,14 @@ jobs:
               - '!**/*.md'
               - '!docs/**'
 
+      # This runner boots MySQL without GTIDs (nogtid.yml overlay), doubling
+      # as the full-suite coverage for the binlog file+offset change source:
+      # the coordinate scheme is auto-detected per server, and every other
+      # full-suite runner boots GTID-on so it exercises only the GTID client.
+      # It also matches real Aurora MySQL, where GTIDs default to off.
       - name: Test
         if: steps.filter.outputs.code == 'true'
-        run: docker compose -f compose.yml -f 8.0.28.yml up mysql test --abort-on-container-exit
+        run: docker compose -f compose.yml -f 8.0.28.yml -f nogtid.yml up mysql test --abort-on-container-exit
         working-directory: compose
 
       - name: Skip — documentation-only change

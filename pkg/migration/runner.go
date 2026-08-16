@@ -598,7 +598,6 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			TLSMode:              r.migration.TLSMode,
 			TLSCertificatePath:   r.migration.TLSCertificatePath,
 			SkipDropAfterCutover: r.migration.SkipDropAfterCutover,
-			GTID:                 r.migration.EnableExperimentalGTID,
 		}, r.logger, scope); err != nil {
 			return err
 		}
@@ -639,7 +638,11 @@ func (r *Runner) checkpointTbl() *checkpoint.Table {
 	return checkpoint.NewTable(r.db, r.checkpointTableName(), checkpoint.Transient)
 }
 
-func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
+// setupCopierCheckerAndReplClient builds the copier, the checker, and the
+// change source. resumePosition is the checkpointed source position when
+// resuming ("" for a fresh migration); it decides the change source's
+// coordinate scheme — see change.NewAutoClient.
+func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosition string) error {
 	var err error
 
 	autoscaleEnabled := r.migration.EnableExperimentalAutoscaling
@@ -858,17 +861,17 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context) error {
 		return err
 	}
 
-	// Set the binlog position.
-	// Create a binlog subscriber
+	// Create the change source. The GTID vs binlog file+position choice is
+	// automatic: a resumed migration stays in the coordinate scheme its
+	// checkpoint was written in (resumePosition), and a fresh one uses GTIDs
+	// whenever the server has them enabled.
 	replConfig := change.NewClientDefaultConfig()
 	replConfig.Logger = r.logger
 	replConfig.CancelFunc = r.fatalError
 	replConfig.DBConfig = r.dbConfig
-	if r.migration.EnableExperimentalGTID {
-		r.logger.Info("EXPERIMENTAL: using GTID-based change source")
-		r.replClient = change.NewGTIDClient(r.db, r.migration.Host, r.migration.Username, *r.migration.Password, appl, replConfig)
-	} else {
-		r.replClient = change.NewBinlogClient(r.db, r.migration.Host, r.migration.Username, *r.migration.Password, appl, replConfig)
+	r.replClient, err = change.NewAutoClient(ctx, r.db, r.migration.Host, r.migration.Username, *r.migration.Password, appl, replConfig, resumePosition)
+	if err != nil {
+		return err
 	}
 	// For each of the changes, we know the new table exists now
 	// So we should call SetInfo to populate the columns etc.
@@ -952,10 +955,10 @@ func (r *Runner) newMigration(ctx context.Context) error {
 	// This is setup the same way in both code-paths,
 	// but we need to do it before we finish resumeFromCheckpoint
 	// because we need to check that the binlog file exists.
-	if err := r.setupCopierCheckerAndReplClient(ctx); err != nil {
+	if err := r.setupCopierCheckerAndReplClient(ctx, ""); err != nil {
 		return err
 	}
-	// Start the binary log feed now
+	// Start the change feed now
 	if err := r.replClient.Start(ctx); err != nil {
 		return err
 	}
@@ -1517,7 +1520,10 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 
 	copierWatermark := rec.CopierWatermark
 	checksumWatermark := rec.ChecksumWatermark
-	binlogPosition := rec.Position
+	// The source position: a binlog file:offset coordinate or a GTID set,
+	// depending on which change source the checkpointing run was using. Its
+	// encoding decides which client the resume constructs (NewAutoClient).
+	resumePosition := rec.Position
 
 	// Initialize and call SetInfo on all the new tables, since we need the column info
 	for _, change := range r.changes {
@@ -1551,8 +1557,12 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 
 	// Setup is the same shape as the fresh-start path; we do it here so
 	// the replClient and its subscriptions exist before we hand them the
-	// checkpointed position via StartFromPosition.
-	if err := r.setupCopierCheckerAndReplClient(ctx); err != nil {
+	// checkpointed position via StartFromPosition. Passing the position keeps
+	// the resume in the coordinate scheme the checkpoint was written in; a
+	// GTID checkpoint on a server that no longer has GTIDs enabled errors
+	// here (not definitive, so the run fails with state preserved rather
+	// than silently restarting).
+	if err := r.setupCopierCheckerAndReplClient(ctx, resumePosition); err != nil {
 		return err
 	}
 
@@ -1563,9 +1573,9 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// "cannot resume", so setup() falls back to a fresh migration; any other
 	// error propagates as-is and fails the run (state preserved), because it
 	// may be transient.
-	if err := r.replClient.StartFromPosition(ctx, binlogPosition); err != nil {
+	if err := r.replClient.StartFromPosition(ctx, resumePosition); err != nil {
 		r.logger.Warn("resuming from checkpoint failed because resuming from the previous source position failed",
-			"position", binlogPosition,
+			"position", resumePosition,
 		)
 		if errors.Is(err, change.ErrPositionNotFound) {
 			return fmt.Errorf("%w: %w", status.ErrBinlogNotFound, err)
@@ -1575,7 +1585,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	r.logger.Warn("resuming from checkpoint",
 		"copier-watermark", copierWatermark,
 		"checksum-watermark", checksumWatermark,
-		"position", binlogPosition,
+		"position", resumePosition,
 	)
 	r.usedResumeFromCheckpoint.Store(true)
 	return nil

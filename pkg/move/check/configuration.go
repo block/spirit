@@ -87,24 +87,10 @@ func configurationCheck(ctx context.Context, r Resources, logger *slog.Logger) e
 			// visibility assumption (see issue #818).
 			return fmt.Errorf("source %d: binlog_order_commits must be ON (this is the MySQL default; setting it OFF allows commit reordering that breaks Spirit's binlog→applier visibility assumption)", i)
 		}
-		// GTID-specific preflight, applied per-source so an inconsistent N:M
-		// cluster (one shard with gtid_mode=ON, another OFF) is caught here
-		// rather than failing mid-stream on the misconfigured shard.
-		if r.GTID {
-			var gtidMode, enforceGTIDConsistency string
-			if err := src.DB.QueryRowContext(ctx,
-				`SELECT @@global.gtid_mode, @@global.enforce_gtid_consistency`).Scan(
-				&gtidMode, &enforceGTIDConsistency,
-			); err != nil {
-				return fmt.Errorf("source %d: %w", i, err)
-			}
-			if gtidMode != "ON" {
-				return fmt.Errorf("source %d: --gtid requires gtid_mode=ON (current: %s)", i, gtidMode)
-			}
-			if enforceGTIDConsistency != "ON" {
-				return fmt.Errorf("source %d: --gtid requires enforce_gtid_consistency=ON (current: %s)", i, enforceGTIDConsistency)
-			}
-		}
+		// There is no GTID preflight here: each source's change source is
+		// selected automatically (change.NewAutoClient probes gtid_mode /
+		// enforce_gtid_consistency per source), so a source without GTIDs
+		// simply gets the binlog file+position client rather than an error.
 	}
 	return nil
 }

@@ -48,6 +48,7 @@ import (
 // scratch server rather than a shared one. Both CI lanes skip it: the
 // default lane has no plugin, and the semi-sync lane has an ACKing replica.
 func TestKeyAboveWatermarkVisibilityWindow(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
