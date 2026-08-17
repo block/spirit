@@ -65,6 +65,18 @@ func mySQLTypeToDatumTp(mysqlTp string) datumTp {
 		return unknownType
 	case "VARBINARY", "BLOB", "BINARY", "LONGBLOB", "MEDIUMBLOB", "TINYBLOB":
 		return binaryType
+	case "VECTOR":
+		// VECTOR (MySQL 9.7+) is a packed array of 4-byte little-endian
+		// floats. Both the driver and the binlog surface it as []byte, and
+		// MySQL only accepts it back as a binary-charset literal: a
+		// character-set string of the right length is rejected outright
+		// ("Value of type 'string, size: 12' cannot be converted to
+		// 'vector' type"). Classifying it as binaryType forces the 0x-hex
+		// literal in Datum.String() even for byte images that happen to be
+		// valid UTF-8 — e.g. the all-zeros vector [0,0,0], which the
+		// IsBinaryString() UTF-8 heuristic alone would emit as a quoted
+		// string and the server would reject.
+		return binaryType
 	case "VARCHAR", "CHAR", "TEXT", "LONGTEXT", "MEDIUMTEXT", "TINYTEXT", "JSON":
 		return unknownType
 	case "DATETIME", "TIMESTAMP", "DATE", "TIME":

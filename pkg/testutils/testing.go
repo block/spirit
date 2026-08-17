@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -91,6 +92,34 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	})
 
 	return dbName, scopedDB
+}
+
+// vectorSupported caches the one-time capability probe behind
+// SkipUnlessVectorSupported.
+var vectorSupported struct {
+	sync.Once
+	ok bool
+}
+
+// SkipUnlessVectorSupported skips the test unless the server understands the
+// VECTOR data type (MySQL 9.7+). It probes for the feature rather than parsing
+// version(), so a fork or a future version that renames itself still gets the
+// coverage. The probe result is cached for the life of the test binary.
+func SkipUnlessVectorSupported(t *testing.T) {
+	t.Helper()
+	vectorSupported.Do(func() {
+		db, err := sql.Open("mysql", DSN())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(db)
+		var dim int
+		// STRING_TO_VECTOR/VECTOR_DIM exist only where the type does.
+		err = db.QueryRowContext(context.Background(),
+			`SELECT VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))`).Scan(&dim)
+		vectorSupported.ok = err == nil && dim == 3
+	})
+	if !vectorSupported.ok {
+		t.Skip("skipping: server does not support the VECTOR type (requires MySQL 9.7+)")
+	}
 }
 
 // RunSQLInDatabase runs SQL in a specific database

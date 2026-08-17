@@ -72,6 +72,14 @@ func TestCastableTp(t *testing.T) {
 		{"enum('a', 'b', 'c')", "char CHARACTER SET utf8mb4"},
 		{"set('a', 'b', 'c')", "char CHARACTER SET utf8mb4"},
 		{"decimal(6,2)", "decimal(6,2)"},
+		// VECTOR (MySQL 9.7+) has no char cast at all — the server rejects
+		// CAST(v AS char) with ER_WRONG_ARGUMENTS, which would fail the
+		// checksum query for any table holding one. Binary is exact, and
+		// unlike binary(N) it must not carry the width: the declared
+		// dimension is a maximum, not a padded length.
+		{"vector", "binary"},
+		{"vector(3)", "binary"},
+		{"vector(2048)", "binary"},
 	}
 	for _, tp := range tps {
 		require.Equal(t, tp.expected, castableTp(tp.tp), "tp failed: %s, expected: %s", tp.tp, tp.expected)

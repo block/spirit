@@ -459,9 +459,11 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 
 	// Extract charset and collation from the type itself
 	// (they may be overridden by column options later).
-	// Spatial types are skipped: the parser assigns them a synthetic
-	// "binary" charset/collation, which is not valid SQL to emit.
-	if col.Tp.GetType() != mysql.TypeGeometry {
+	// Spatial and VECTOR types are skipped: the parser assigns them a
+	// synthetic "binary" charset/collation, which is not valid SQL to emit
+	// — MySQL rejects `vector(3) CHARACTER SET binary`, and so does our own
+	// parser when it re-parses the generated ALTER.
+	if col.Tp.GetType() != mysql.TypeGeometry && col.Tp.GetType() != mysql.TypeVector {
 		if charset := col.Tp.GetCharset(); charset != "" {
 			column.Charset = &charset
 		}

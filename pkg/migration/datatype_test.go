@@ -1128,3 +1128,272 @@ func runBitDMLTest(t *testing.T, tableName, colName, colDef string, values []uin
 			mk.id, colDef, mk.val, got)
 	}
 }
+
+// The VECTOR type (MySQL 9.7+) is a packed array of 4-byte little-endian
+// floats. Spirit sees it as raw bytes on every path — the copier's SELECT, the
+// binlog row image, and the checksum's CAST — and MySQL only accepts those
+// bytes back as a binary-charset literal:
+//
+//	INSERT ... VALUES (0x0000c03f...)         -- accepted
+//	INSERT ... VALUES ("<the same 12 bytes>") -- ER_INVALID_CAST_TO_VECTOR
+//	                                             "Value of type 'string, size: 12'
+//	                                              cannot be converted to 'vector' type"
+//
+// so a VECTOR value must be classified as a binary type in table.Datum rather
+// than left to the "hex-encode whatever isn't valid UTF-8" fallback: the
+// all-zeros vector [0,0,0] *is* valid UTF-8 and would be emitted as the second
+// form, aborting the copy or the binlog flush. The checksum has the mirror
+// constraint — a VECTOR cannot be cast to char at all (ER_WRONG_ARGUMENTS,
+// "Incorrect arguments to cast_as_char"), so castableTp must map it to binary.
+//
+// The tests below cover the three write paths end to end: row copy, binlog
+// replay of concurrent DML, and the checksum that gates cutover.
+
+// vectorSeedValues are the values every test in this file seeds. The first is
+// the all-zeros vector — the value whose byte image is valid UTF-8 and which
+// therefore fails on any path that hex-encodes only "binary-looking" data.
+var vectorSeedValues = []string{
+	"[0,0,0]",
+	"[1.5,-2,0.0003]",
+	"[1e30,-1e-5,123456789.5]",
+	"[0,1,0]",
+}
+
+// hexVectors reads id -> HEX(col) for the whole table, which is how these
+// tests compare vector contents: HEX() is exact (VECTOR_TO_STRING rounds to
+// 5 decimal places) and works the same before and after a migration.
+func hexVectors(t *testing.T, db *sql.DB, table, col string) map[int]string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(),
+		fmt.Sprintf("SELECT id, IFNULL(HEX(%s), 'NULL') FROM %s", col, table))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	out := make(map[int]string)
+	for rows.Next() {
+		var id int
+		var hexVal string
+		require.NoError(t, rows.Scan(&id, &hexVal))
+		out[id] = hexVal
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+// TestVectorE2ECopy migrates a table holding VECTOR columns through the copy
+// path and asserts every value survives byte-for-byte. The migration also runs
+// the checksum, so this covers the CAST side too: before castableTp knew about
+// VECTOR the checksum query itself failed with "Incorrect arguments to
+// cast_as_char".
+func TestVectorE2ECopy(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_copy", `CREATE TABLE vector_copy (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		pad VARCHAR(64) NOT NULL,
+		embedding VECTOR(3) NOT NULL,
+		optional_embedding VECTOR(4) NULL,
+		default_dim VECTOR NULL
+	)`)
+
+	for _, v := range vectorSeedValues {
+		testutils.RunSQL(t, fmt.Sprintf(`INSERT INTO vector_copy (pad, embedding, optional_embedding, default_dim)
+			VALUES ('seed', STRING_TO_VECTOR('%s'), NULL, STRING_TO_VECTOR('[0,0]'))`, v))
+	}
+	testutils.RunSQL(t, `INSERT INTO vector_copy (pad, embedding, optional_embedding, default_dim)
+		VALUES ('nulls', STRING_TO_VECTOR('[0,0,0]'), STRING_TO_VECTOR('[0,0,0,0]'), NULL)`)
+	// Bulk rows so the copier does real chunked work rather than a single
+	// chunk of 5 rows.
+	tt.SeedRows(t, "INSERT INTO vector_copy (pad, embedding, optional_embedding, default_dim) SELECT 'bulk', STRING_TO_VECTOR('[0,0,0]'), STRING_TO_VECTOR('[1,2,3,4]'), STRING_TO_VECTOR('[0]')", 2000)
+
+	before := hexVectors(t, tt.DB, "vector_copy", "embedding")
+	beforeOptional := hexVectors(t, tt.DB, "vector_copy", "optional_embedding")
+	require.GreaterOrEqual(t, len(before), 2000)
+
+	// MODIFY of a VARCHAR across the 255-byte length-prefix boundary is not
+	// INSTANT or INPLACE, so this forces the copy path.
+	m := NewTestRunner(t, "vector_copy", "MODIFY COLUMN pad VARCHAR(300) NOT NULL", WithThreads(2))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.False(t, m.usedInstantDDL)
+	require.False(t, m.usedInplaceDDL)
+
+	require.Equal(t, before, hexVectors(t, tt.DB, "vector_copy", "embedding"),
+		"copied VECTOR values must be byte-identical to the source")
+	require.Equal(t, beforeOptional, hexVectors(t, tt.DB, "vector_copy", "optional_embedding"),
+		"copied nullable VECTOR values (including NULLs) must be preserved")
+
+	// The stored values must still be readable as vectors — a corrupted
+	// byte image would either fail VECTOR_DIM or report the wrong width.
+	var badDims int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_copy WHERE VECTOR_DIM(embedding) <> 3`).Scan(&badDims))
+	require.Zero(t, badDims, "every copied embedding must still be a 3-dimension vector")
+}
+
+// TestVectorE2EDimensionChange widens a VECTOR column's declared dimension.
+// The stored images do not change (a VECTOR is only as wide as the value
+// written into it), but source and target column types now differ, which is
+// the case where the checksum's CAST type comes from the *target* table —
+// exercising the VECTOR arm of castableTp on a genuine type change.
+func TestVectorE2EDimensionChange(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_widen", `CREATE TABLE vector_widen (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		embedding VECTOR(3) NOT NULL
+	)`)
+	for _, v := range vectorSeedValues {
+		testutils.RunSQL(t, fmt.Sprintf(
+			"INSERT INTO vector_widen (embedding) VALUES (STRING_TO_VECTOR('%s'))", v))
+	}
+	tt.SeedRows(t, "INSERT INTO vector_widen (embedding) SELECT STRING_TO_VECTOR('[0,0,0]')", 1000)
+	before := hexVectors(t, tt.DB, "vector_widen", "embedding")
+
+	m := NewTestRunner(t, "vector_widen", "MODIFY COLUMN embedding VECTOR(8) NOT NULL", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	var colType string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT column_type FROM information_schema.columns
+		 WHERE table_schema=DATABASE() AND table_name='vector_widen' AND column_name='embedding'`).Scan(&colType))
+	require.Equal(t, "vector(8)", colType)
+
+	require.Equal(t, before, hexVectors(t, tt.DB, "vector_widen", "embedding"),
+		"widening the declared dimension must not alter the stored vectors")
+}
+
+// TestVectorE2EAddColumn adds a VECTOR column to an existing table. The new
+// column only exists on the target, so the copier writes its DEFAULT and the
+// checksum compares the intersected columns — a cheap guard that a VECTOR
+// column present on one side only does not break either.
+func TestVectorE2EAddColumn(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_add", `CREATE TABLE vector_add (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		pad VARCHAR(64) NOT NULL
+	)`)
+	tt.SeedRows(t, "INSERT INTO vector_add (pad) SELECT 'bulk'", 1000)
+
+	m := NewTestRunner(t, "vector_add",
+		"ADD COLUMN embedding VECTOR(3) NULL, MODIFY COLUMN pad VARCHAR(300) NOT NULL",
+		WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	var nonNull int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_add WHERE embedding IS NOT NULL`).Scan(&nonNull))
+	require.Zero(t, nonNull, "the added VECTOR column has no source data, so every row must be NULL")
+
+	// The column must be usable afterwards.
+	testutils.RunSQL(t, "UPDATE vector_add SET embedding = STRING_TO_VECTOR('[0,0,0]') WHERE id = 1")
+	var dim int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT VECTOR_DIM(embedding) FROM vector_add WHERE id = 1`).Scan(&dim))
+	require.Equal(t, 3, dim)
+}
+
+// TestVectorConcurrentDML is the binlog-capture half of the issue: rows
+// written *while* the migration is copying reach the target through the
+// buffered subscription and the applier's REPLACE INTO, not through the
+// copier. Every concurrent write here carries an all-zeros vector, the value
+// whose byte image is valid UTF-8 — before the Datum fix the applier emitted
+// it as a quoted string literal and the flush failed with
+// ER_INVALID_CAST_TO_VECTOR, aborting the migration.
+func TestVectorConcurrentDML(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_dml", `CREATE TABLE vector_dml (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		info VARCHAR(64) NOT NULL,
+		embedding VECTOR(3) NOT NULL
+	)`)
+
+	// Rows the concurrent UPDATEs target. They start with a non-zero vector
+	// so a missed UPDATE leaves the row-copied value behind and the
+	// assertions below can tell the two apart.
+	testutils.RunSQL(t, `INSERT INTO vector_dml (info, embedding) VALUES
+		('update-target-1', STRING_TO_VECTOR('[1.5,-2,0.0003]')),
+		('update-target-2', STRING_TO_VECTOR('[1e30,-1e-5,123456789.5]')),
+		('delete-target', STRING_TO_VECTOR('[9,9,9]'))`)
+	tt.SeedRows(t, "INSERT INTO vector_dml (info, embedding) SELECT 'bulk', STRING_TO_VECTOR('[0,0,0]')", 2000)
+
+	m := NewTestRunner(t, "vector_dml", "MODIFY COLUMN info VARCHAR(300) NOT NULL",
+		WithThreads(1),
+		WithTargetChunkTime(100*time.Millisecond),
+		WithTestThrottler())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	dmlDone := make(chan struct{})
+	go func() {
+		defer close(dmlDone)
+		if !waitForCopyRows(ctx, m) {
+			return
+		}
+		// The DELETE happens once, up front, so the row is gone from the
+		// source before the copier necessarily reached it.
+		_, _ = tt.DB.ExecContext(ctx, `DELETE FROM vector_dml WHERE info = 'delete-target'`)
+		for range 50 {
+			if ctx.Err() != nil {
+				return
+			}
+			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO vector_dml (info, embedding) VALUES ('insert-during', STRING_TO_VECTOR('[0,0,0]'))`)
+			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO vector_dml (info, embedding) VALUES ('insert-during', STRING_TO_VECTOR('[0,1,0]'))`)
+			// UPDATE to the all-zeros vector: the full after-image drags the
+			// value back through the applier.
+			_, _ = tt.DB.ExecContext(ctx, `UPDATE vector_dml SET embedding = STRING_TO_VECTOR('[0,0,0]') WHERE info = 'update-target-1'`)
+			_, _ = tt.DB.ExecContext(ctx, `UPDATE vector_dml SET embedding = STRING_TO_VECTOR('[0,0,1e-5]') WHERE info = 'update-target-2'`)
+		}
+	}()
+
+	migrationErr := m.Run(ctx)
+	cancel()
+	<-dmlDone
+	require.NoError(t, m.Close())
+	require.NoError(t, migrationErr, "VECTOR values written during the copy must replicate through the applier")
+
+	// The UPDATE targets must hold their post-UPDATE values, proving the
+	// binlog UPDATE path replayed rather than the copier's initial image
+	// surviving.
+	requireVectorEquals(t, tt.DB, "update-target-1", "[0,0,0]")
+	requireVectorEquals(t, tt.DB, "update-target-2", "[0,0,1e-5]")
+
+	// The DELETE must have replayed too.
+	var deleted int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_dml WHERE info = 'delete-target'`).Scan(&deleted))
+	require.Zero(t, deleted, "the row deleted during the migration must not reappear on the target")
+
+	// Rows inserted during the copy must be present and intact — otherwise
+	// the binlog INSERT path was never exercised and the test is vacuous.
+	var insertCount int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_dml WHERE info = 'insert-during'`).Scan(&insertCount))
+	require.Positive(t, insertCount, "no concurrent INSERTs reached the binlog path — test is vacuous")
+
+	var badRows int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_dml
+		 WHERE info = 'insert-during' AND (VECTOR_DIM(embedding) <> 3 OR OCTET_LENGTH(embedding) <> 12)`).Scan(&badRows))
+	require.Zero(t, badRows, "vectors inserted during the migration must keep their exact byte image")
+}
+
+// requireVectorEquals asserts the row identified by info holds exactly the
+// vector described by the given STRING_TO_VECTOR literal, compared as raw
+// bytes.
+func requireVectorEquals(t *testing.T, db *sql.DB, info, want string) {
+	t.Helper()
+	var got, expected string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT HEX(embedding), HEX(STRING_TO_VECTOR(?)) FROM vector_dml WHERE info = ? LIMIT 1`,
+		want, info).Scan(&got, &expected))
+	require.Equal(t, expected, got, "row %q must hold the vector %s", info, want)
+}
