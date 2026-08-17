@@ -1710,9 +1710,15 @@ func (r *Runner) checksum(ctx context.Context) error {
 		// closed without needing to special-case the error path.
 		return r.checker.Run(ctx)
 	}); err != nil {
+		// A statement adding a UNIQUE index over data that is not unique is the
+		// common cause of a checksum that keeps finding differences: the copier
+		// drops the duplicate rows rather than refusing them, so the new table
+		// is simply short. Say so, but keep the checker's error in the chain —
+		// it carries whether the attempts kept finding differences (this cause,
+		// and reproducible) or merely errored (nothing proven, and worth
+		// another attempt), which a caller deciding whether to retry needs.
 		if r.addsUniqueIndex() {
-			// Overwrite the error if we think it's because of a unique index addition
-			return errors.New("checksum failed after several attempts. This is likely related to your statement adding a UNIQUE index on non-unique data")
+			return fmt.Errorf("checksum failed after several attempts. This is likely related to your statement adding a UNIQUE index on non-unique data: %w", err)
 		}
 		return fmt.Errorf("checksum failed: %w", err)
 	}

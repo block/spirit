@@ -164,7 +164,7 @@ func TestUnfixableUniqueChecksum(t *testing.T) {
 	// "found differences" path. The migration layer wraps this into a more
 	// user-friendly "lossy unique-index" message; here we just assert the
 	// underlying checksum-layer error.
-	require.ErrorContains(t, err, "checksum found differences on every attempt")
+	require.ErrorIs(t, err, ErrDifferencesExhausted)
 }
 
 func TestFixCorrupt(t *testing.T) {
@@ -262,7 +262,8 @@ func TestRetryDoesNotVacuouslyPass(t *testing.T) {
 
 	err = checker.Run(t.Context())
 	require.Error(t, err)
-	require.ErrorContains(t, err, "checksum errored on every attempt")
+	require.ErrorIs(t, err, ErrAttemptsExhausted)
+	require.NotErrorIs(t, err, ErrDifferencesExhausted)
 	require.ErrorContains(t, err, "checksum mismatch")
 
 	// The final attempt must have actually re-verified chunks: its counter

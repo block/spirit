@@ -27,6 +27,7 @@ package migration
 import (
 	"testing"
 
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -34,6 +35,9 @@ import (
 // TestUniqueOnNonUniqueData tests that we:
 // 1. Fail trying to add a unique index on non-unique data.
 // 2. The error does not blame spirit, but is instead suggestive of user-data error.
+// 3. The checksum's own error stays in the chain, so a caller can tell that the
+// attempts kept finding differences rather than merely erroring, and decide
+// against retrying a run that would fail the same way.
 func TestUniqueOnNonUniqueData(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "uniquet1", `CREATE TABLE uniquet1 (id int not null primary key auto_increment, b int not null, pad1 varbinary(1024))`)
@@ -45,6 +49,7 @@ func TestUniqueOnNonUniqueData(t *testing.T) {
 	err := m.Run()
 	require.Error(t, err)
 	require.ErrorContains(t, err, "checksum failed after several attempts. This is likely related to your statement adding a UNIQUE index on non-unique data")
+	require.ErrorIs(t, err, checksum.ErrDifferencesExhausted)
 }
 
 // TestUnparsableStatements tests that the behavior is expected in cases
