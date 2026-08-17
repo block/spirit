@@ -269,50 +269,7 @@ func TestCutoverRenameCompletedDetection(t *testing.T) {
 // retrying into ER_NO_SUCH_TABLE failures.
 func TestCutoverConnectionLossAfterRenameCommitted(t *testing.T) {
 	t.Parallel()
-	testutils.NewTestTable(t, "cutoverconnloss", `CREATE TABLE cutoverconnloss (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	testutils.RunSQL(t, `CREATE TABLE _cutoverconnloss_new (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	testutils.RunSQL(t, `CREATE TABLE _cutoverconnloss_chkpnt (a int)`) // for binlog advancement
-	// Two rows in the original table so post-cutover state is distinguishable.
-	testutils.RunSQL(t, `INSERT INTO cutoverconnloss VALUES (1, 2), (2, 2)`)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	t1 := table.NewTableInfo(db, cfg.DBName, "cutoverconnloss")
-	require.NoError(t, t1.SetInfo(t.Context()))
-	t1new := table.NewTableInfo(db, cfg.DBName, "_cutoverconnloss_new")
-	logger := slog.Default()
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
-	defer feed.Close()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
-	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
-	require.NoError(t, feed.Start(t.Context()))
-
-	cutover, err := NewCutOver(db, []*cutoverConfig{
-		{
-			table:        t1,
-			newTable:     t1new,
-			oldTableName: "_cutoverconnloss_old",
-		},
-	}, feed, dbconn.NewDBConfig(), logger)
-	require.NoError(t, err)
-	// Simulate the server committing the rename while the client's
-	// connection dies before the OK packet is read. mysql.ErrInvalidConn is
-	// exactly what go-sql-driver returns when a connection dies mid-statement.
-	cutover.testInjectRenameError = mysql.ErrInvalidConn
+	cutover, db, dbName := newConnectionLossCutover(t, "cutoverconnloss")
 
 	require.NoError(t, cutover.Run(t.Context()),
 		"a rename committed by the server must be reported as success despite the connection loss")
@@ -327,8 +284,73 @@ func TestCutoverConnectionLossAfterRenameCommitted(t *testing.T) {
 	require.Equal(t, 2, count)
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = '_cutoverconnloss_new'",
-		cfg.DBName).Scan(&count))
+		dbName).Scan(&count))
 	require.Equal(t, 0, count)
+}
+
+func TestCutoverConnectionLossWithUnavailableOwnershipCheck(t *testing.T) {
+	t.Parallel()
+	cutover, _, _ := newConnectionLossCutover(t, "cutoverconnunknown")
+	ctx, cancel := context.WithCancel(t.Context())
+	cutover.testAfterRenameError = cancel
+
+	err := cutover.Run(ctx)
+
+	require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func newConnectionLossCutover(t *testing.T, tableName string) (*CutOver, *sql.DB, string) {
+	t.Helper()
+	newTableName := "_" + tableName + "_new"
+	oldTableName := "_" + tableName + "_old"
+	checkpointTableName := "_" + tableName + "_chkpnt"
+	testutils.NewTestTable(t, tableName, fmt.Sprintf(`CREATE TABLE %s (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`, tableName))
+	testutils.RunSQL(t, fmt.Sprintf(`CREATE TABLE %s (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`, newTableName))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a int)", checkpointTableName))
+	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s VALUES (1, 2), (2, 2)", tableName))
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+
+	original := table.NewTableInfo(db, cfg.DBName, tableName)
+	require.NoError(t, original.SetInfo(t.Context()))
+	replacement := table.NewTableInfo(db, cfg.DBName, newTableName)
+	feed := change.NewBinlogClient(
+		db,
+		cfg.Addr,
+		cfg.User,
+		cfg.Passwd,
+		applier.NewSingleTargetForTest(t, db),
+		change.NewClientDefaultConfig(),
+	)
+	t.Cleanup(feed.Close)
+	chunker, err := table.NewChunker(original, table.ChunkerConfig{NewTable: replacement})
+	require.NoError(t, err)
+	require.NoError(t, feed.AddSubscription(original, replacement, chunker))
+	require.NoError(t, feed.Start(t.Context()))
+
+	cutover, err := NewCutOver(db, []*cutoverConfig{{
+		table:        original,
+		newTable:     replacement,
+		oldTableName: oldTableName,
+	}}, feed, dbconn.NewDBConfig(), slog.Default())
+	require.NoError(t, err)
+	// Simulate the server committing the rename while the client's connection
+	// dies before the OK packet is read.
+	cutover.testInjectRenameError = mysql.ErrInvalidConn
+	return cutover, db, cfg.DBName
 }
 
 // TestCutoverDeterministicErrorDoesNotVerify is the negative counterpart of

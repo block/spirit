@@ -768,8 +768,10 @@ func (r *Runner) dropStaleRevertTables(ctx context.Context) error {
 // owns the run.
 //
 // Not yet handled: an interrupted reverse *cutover* (phase "reverting") leaves
-// an ambiguous half-renamed state, so that surfaces as an error for manual
-// completion rather than an unsafe auto-resume.
+// an ambiguous half-renamed state, so that surfaces as an ownership-ambiguous
+// error for manual completion rather than an unsafe auto-resume. Phase
+// "reverse_finalized" is different: ownership is already definitively back on
+// the source and only idempotent cleanup remains, so it is retried.
 func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 	rec, err := r.checkpointTbl().ReadLatest(ctx)
 	if err != nil {
@@ -783,7 +785,15 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 		r.logger.Warn("resuming an interrupted reverse window from checkpoint", "cutover_at", rec.CutoverAt)
 		return true, r.resumeReverseWindow(ctx, rec)
 	case phaseReverting:
-		return true, fmt.Errorf("a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually", rec.Phase)
+		return true, fmt.Errorf("%w: a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually",
+			status.ErrOwnershipAmbiguous, rec.Phase)
+	case phaseReverseFinalized:
+		// Ownership is already definitive: every former target was retired
+		// before this phase was written. Only the idempotent cleanup that
+		// follows it can have failed, so repeat exactly that.
+		r.logger.Warn("resuming cleanup of a completed reverse cutover", "cutover_at", rec.CutoverAt)
+		r.cutoverAt = rec.CutoverAt
+		return true, newReverseWindow(r).finalizeReverse(ctx)
 	default:
 		return false, nil // phase "" (copy) — the normal flow handles resume/fresh
 	}

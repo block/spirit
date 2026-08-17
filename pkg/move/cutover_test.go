@@ -2,6 +2,7 @@ package move
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -280,4 +282,64 @@ func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 
 	_, err = srcDB.ExecContext(ctx, "SELECT 1 FROM t1")
 	require.Error(t, err, "t1 should not exist after rename")
+}
+
+// TestCutOverDoesNotRetryUnresolvedRenameOwnership asserts the retry policy:
+// once a failure has left ownership unresolved, another attempt from the top
+// could retire a source that is already retired, so there must be exactly one.
+func TestCutOverDoesNotRetryUnresolvedRenameOwnership(t *testing.T) {
+	for _, marker := range []error{errRenameRollbackFailed, status.ErrOwnershipAmbiguous} {
+		t.Run(marker.Error(), func(t *testing.T) {
+			cfg := dbconn.NewDBConfig()
+			cfg.MaxRetries = 3
+			cutover := &CutOver{dbConfig: cfg, logger: slog.Default()}
+			attempts := 0
+
+			err := cutover.runWithRetries(t.Context(), func(int) error {
+				attempts++
+				return marker
+			})
+
+			require.ErrorIs(t, err, marker)
+			require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
+			require.Equal(t, 1, attempts)
+		})
+	}
+}
+
+// TestCutOverRetriesResolvedFailures is the negative counterpart: a failure
+// that says nothing about ownership is still retried to exhaustion.
+func TestCutOverRetriesResolvedFailures(t *testing.T) {
+	cfg := dbconn.NewDBConfig()
+	cfg.MaxRetries = 3
+	cutover := &CutOver{dbConfig: cfg, logger: slog.Default()}
+	attempts := 0
+
+	err := cutover.runWithRetries(t.Context(), func(int) error {
+		attempts++
+		return errors.New("lock wait timeout")
+	})
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, status.ErrOwnershipAmbiguous)
+	require.Equal(t, 3, attempts)
+}
+
+// TestCutOverFuncSucceededFailureIsAmbiguous covers the pre-existing
+// "traffic switched, rename did not finish" abort: it keeps its message and
+// gains the machine-checkable marker.
+func TestCutOverFuncSucceededFailureIsAmbiguous(t *testing.T) {
+	cfg := dbconn.NewDBConfig()
+	cfg.MaxRetries = 3
+	cutover := &CutOver{dbConfig: cfg, logger: slog.Default(), cutoverFuncSucceeded: true}
+	attempts := 0
+
+	err := cutover.runWithRetries(t.Context(), func(int) error {
+		attempts++
+		return errors.New("rename failed")
+	})
+
+	require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
+	require.ErrorContains(t, err, "manual intervention required")
+	require.Equal(t, 1, attempts)
 }

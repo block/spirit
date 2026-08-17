@@ -300,6 +300,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			// '100%new') that must not be format-interpreted.
 			err := dbconn.Exec(ctx, r.db, "%r", sqlescape.RawSQL(r.changes[0].stmt.Statement))
 			if err != nil {
+				if ambiguous := ambiguousDDLError(err); ambiguous != nil {
+					return ambiguous
+				}
 				return err
 			}
 			r.logger.Info("apply complete")
@@ -374,6 +377,13 @@ func (r *Runner) Run(ctx context.Context) error {
 			"inplace-ddl", r.usedInplaceDDL,
 		)
 		return nil // success!
+	}
+	// A direct-DDL failure is normally expected and ignored: we fall through
+	// to the copy algorithm below. But if the DDL's outcome is unknown, the
+	// source table may already carry the ALTER, and copying from it would
+	// build the _new table from an unexpected schema. Abort instead.
+	if errors.Is(err, status.ErrOwnershipAmbiguous) {
+		return err
 	}
 
 	// Perform preflight basic checks.

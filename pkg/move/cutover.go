@@ -13,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/move/check"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -103,11 +104,7 @@ func NewCutOver(sources []CutOverSource, cutoverFunc func(ctx context.Context) e
 }
 
 func (c *CutOver) Run(ctx context.Context) error {
-	var err error
-	for attempt := range c.dbConfig.MaxRetries {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	return c.runWithRetries(ctx, func(attempt int) error {
 		// Flush all sources before attempting the cutover.
 		for i, src := range c.sources {
 			if err := src.ReplClient.Flush(ctx); err != nil {
@@ -117,8 +114,28 @@ func (c *CutOver) Run(ctx context.Context) error {
 		c.logger.Warn("Attempting final cut over operation",
 			"attempt", attempt+1,
 			"max-retries", c.dbConfig.MaxRetries)
-		err = c.algorithmCutover(ctx)
+		return c.algorithmCutover(ctx)
+	})
+}
+
+// runWithRetries owns the cutover retry policy: which failures may be tried
+// again from the top, and which have left table ownership in a state that a
+// retry could make worse. runAttempt is a parameter so the policy can be
+// tested without a live topology.
+func (c *CutOver) runWithRetries(ctx context.Context, runAttempt func(attempt int) error) error {
+	var err error
+	for attempt := range c.dbConfig.MaxRetries {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err = runAttempt(attempt)
 		if err != nil {
+			if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, status.ErrOwnershipAmbiguous) {
+				c.logger.Error("cutover rename left ownership unresolved; not retrying",
+					"error", err.Error())
+				return fmt.Errorf("%w: cutover rename left ownership unresolved: %w",
+					status.ErrOwnershipAmbiguous, err)
+			}
 			if c.cutoverFuncSucceeded {
 				// The traffic switch has already succeeded, so traffic may be
 				// on the target. Another attempt would have released the
@@ -129,9 +146,10 @@ func (c *CutOver) Run(ctx context.Context) error {
 				// retry from the top: surface the error instead.
 				c.logger.Error("cutover failed after the cutover function had already succeeded; not retrying",
 					"error", err.Error())
-				return fmt.Errorf("cutover failed after the cutover function succeeded; "+
+				return fmt.Errorf("%w: cutover failed after the cutover function succeeded; "+
 					"source tables are unlocked and not fully renamed (the rename may have "+
-					"partially applied), manual intervention required: %w", err)
+					"partially applied), manual intervention required: %w",
+					status.ErrOwnershipAmbiguous, err)
 			}
 			c.logger.Warn("cutover failed", "error", err.Error())
 			continue
@@ -232,8 +250,9 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 			c.stopSourceFeeds()
 			return nil
 		}
-		if errors.Is(err, errRenameRollbackFailed) {
-			// The sources are partially renamed; retrying cannot converge.
+		if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, status.ErrOwnershipAmbiguous) {
+			// The sources are partially renamed, or a rename's outcome is
+			// unknown; retrying cannot converge on either.
 			return err
 		}
 		c.logger.Warn("rename failed", "error", err.Error())
@@ -286,6 +305,15 @@ func (c *CutOver) renameAllSources(ctx context.Context, sourceLocks []*dbconn.Ta
 			if len(rollbackErrors) > 0 {
 				return fmt.Errorf("%w: rename failed on source %d and rollback also failed (%s): %w",
 					errRenameRollbackFailed, i, strings.Join(rollbackErrors, "; "), err)
+			}
+			if dbconn.IsConnectionLossError(err) {
+				// The connection died, so the server may have committed this
+				// source's rename before the OK packet was lost. The earlier
+				// sources have definitively been rolled back, but this one's
+				// state is unknown: retrying the whole rename could retire a
+				// source that is already retired.
+				return fmt.Errorf("%w: rename outcome unknown on source %d, rolled back %d completed renames: %w",
+					status.ErrOwnershipAmbiguous, i, len(completedRenames), err)
 			}
 			return fmt.Errorf("rename failed on source %d, rolled back %d completed renames: %w",
 				i, len(completedRenames), err)

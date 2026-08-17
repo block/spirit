@@ -8,6 +8,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -166,6 +167,20 @@ func (c *tableChange) cleanup(ctx context.Context) error {
 	return nil
 }
 
+// ambiguousDDLError converts a direct-DDL failure whose outcome is unknown
+// into an ownership-ambiguous error. A deterministic server error ("this
+// ALTER cannot be INSTANT") means the DDL definitely did not apply, which is
+// the expected case the caller falls through on. A connection loss means the
+// server may have applied it and the client never saw the OK packet — falling
+// through to the copy algorithm would then build a _new table from a table
+// that has *already* been altered. It returns nil when err is unambiguous.
+func ambiguousDDLError(err error) error {
+	if !dbconn.IsConnectionLossError(err) {
+		return nil
+	}
+	return fmt.Errorf("%w: direct DDL may have committed: %w", status.ErrOwnershipAmbiguous, err)
+}
+
 // attemptMySQLDDL "attempts" to use DDL directly on MySQL with an assertion
 // such as ALGORITHM=INSTANT. If MySQL is able to use the INSTANT algorithm,
 // it will perform the operation without error. If it can't, it will return
@@ -173,11 +188,18 @@ func (c *tableChange) cleanup(ctx context.Context) error {
 // operation, because keeping track of which operations are "INSTANT"
 // is incredibly difficult. It will depend on MySQL minor version,
 // and could possibly be specific to the table.
+//
+// Most failures here are expected and are ignored by the caller, which then
+// proceeds with the copy algorithm. The exception is an ownership-ambiguous
+// failure (see ambiguousDDLError): the caller must abort on those instead.
 func (c *tableChange) attemptMySQLDDL(ctx context.Context) error {
 	err := c.attemptInstantDDL(ctx)
 	if err == nil {
 		c.runner.usedInstantDDL = true // success
 		return nil
+	}
+	if ambiguous := ambiguousDDLError(err); ambiguous != nil {
+		return ambiguous
 	}
 
 	// Many "inplace" operations (such as adding an index)
@@ -193,6 +215,9 @@ func (c *tableChange) attemptMySQLDDL(ctx context.Context) error {
 		if err == nil {
 			c.runner.usedInplaceDDL = true // success
 			return nil
+		}
+		if ambiguous := ambiguousDDLError(err); ambiguous != nil {
+			return ambiguous
 		}
 	}
 	c.runner.logger.Info("unable to use INPLACE", "error", err)
