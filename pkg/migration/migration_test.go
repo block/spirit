@@ -71,20 +71,27 @@ func TestE2EExplicitAutoIncrementInAlter(t *testing.T) {
 	require.Equal(t, int64(5000), insertedID, "User-specified AUTO_INCREMENT=5000 should be preserved")
 }
 
-func TestMissingAlter(t *testing.T) {
+func TestMissingStatement(t *testing.T) {
 	t.Parallel()
-	testutils.NewTestTable(t, "t1missing", `CREATE TABLE t1missing (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	// Deliberately exercises the legacy --table/--alter path: an empty alter
-	// must be rejected. Dies with the legacy path.
+	// --statement is the only way to describe the change, so an empty one
+	// must be rejected before we touch the database.
 	m := NewTestMigration(t)
-	m.Table = "t1missing"
 	err := m.Run()
 	require.Error(t, err)
-	require.ErrorContains(t, err, "alter statement is required")
+	require.ErrorContains(t, err, "--statement is required")
+
+	// A statement that is not a schema change at all is rejected too.
+	m = NewTestMigration(t, WithStatement("SELECT 1"))
+	err = m.Run()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "not a supported statement type")
+
+	// An ALTER TABLE that does not say what to alter. MySQL rejects this as a
+	// syntax error; our parser accepts it, so it is rejected downstream.
+	m = NewTestMigration(t, WithStatement("ALTER TABLE t1missing"))
+	err = m.Run()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "does not specify any changes")
 }
 
 func TestBadDatabaseCredentials(t *testing.T) {
@@ -745,22 +752,24 @@ func TestBadOptions(t *testing.T) {
 	t.Parallel()
 	_, err := NewRunner(&Migration{})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "table name is required")
+	require.ErrorContains(t, err, "--statement is required")
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
 	_, err = NewRunner(&Migration{Host: cfg.Addr})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "table name is required")
+	require.ErrorContains(t, err, "--statement is required")
 
-	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mytable"})
+	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mydatabase"})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "table name is required")
+	require.ErrorContains(t, err, "--statement is required")
 
-	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mydatabase", Table: "mytable"})
+	// The schema in the statement must match --database.
+	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mydatabase",
+		Statement: "ALTER TABLE otherdb.mytable ENGINE=InnoDB"})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "alter statement is required")
+	require.ErrorContains(t, err, "does not match --database")
 }
 
 // TestBadAlter tests various invalid ALTER statement scenarios.

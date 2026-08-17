@@ -20,7 +20,7 @@ Spirit is designed for **speed** — it is multi-threaded in both row-copying an
 cd cmd/spirit && go build
 
 # Run a schema change
-./spirit migrate --host=<host> --username=<user> --password=<pass> --database=<db> --table=<table> --alter="<alter statement>"
+./spirit migrate --host=<host> --username=<user> --password=<pass> --database=<db> --statement="<ddl statement>"
 
 # Other subcommands
 ./spirit move --help
@@ -126,13 +126,11 @@ assert.NoError(t, m.Close())
 For tests that need to call `Migration.Run()` directly (e.g., testing error paths, replica DSN, or the `Migration` struct API), use `NewTestMigration`:
 
 ```go
-m := NewTestMigration(t, WithThreads(1))
-m.Table = "mytable"
-m.Alter = "ENGINE=InnoDB"
+m := NewTestMigration(t, WithThreads(1), WithStatement("ALTER TABLE mytable ENGINE=InnoDB"))
 require.NoError(t, m.Run())
 ```
 
-Available options: `WithThreads(n)`, `WithTargetChunkTime(d)`, `WithBuffered(b)`, `WithTable(name)`, `WithAlter(stmt)`, `WithStatement(sql)`, `WithTestThrottler()`, `WithDeferCutOver()`, `WithSkipDropAfterCutover()`, `WithDBName(name)`, `WithRespectSentinel()`, `WithHost(host)`, `WithReplicaDSN(dsn)`, `WithReplicaMaxLag(d)`, `WithConfFile(t, content)`.
+Available options: `WithThreads(n)`, `WithWriteThreads(n)`, `WithAutoscaling()`, `WithStatement(sql)`, `WithTargetChunkTime(d)`, `WithTestThrottler()`, `WithDeferCutOver()`, `WithDBName(name)`, `WithRespectSentinel()`, `WithHost(host)`, `WithReplicaDSN(dsn)`, `WithReplicaMaxLag(d)`, `WithSkipDropAfterCutover()`.
 
 **General test patterns:**
 - Integration tests connect to real MySQL — there are no mocked database tests for core logic

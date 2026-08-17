@@ -8,12 +8,11 @@ Basic usage:
 
 ```bash
 spirit migrate --host mydb:3306 --username root --password secret \
-               --database mydb --table users --alter "ADD COLUMN email VARCHAR(255)"
+               --database mydb --statement "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
 ```
 
 ## Configuration
 
-- [alter](#alter)
 - [checkpoint-max-age](#checkpoint-max-age)
 - [checksum-yield-timeout](#checksum-yield-timeout)
 - [conf](#conf)
@@ -29,7 +28,6 @@ spirit migrate --host mydb:3306 --username root --password secret \
 - [replica-max-lag](#replica-max-lag)
 - [skip-drop-after-cutover](#skip-drop-after-cutover)
 - [statement](#statement)
-- [table](#table)
 - [target-chunk-time](#target-chunk-time)
 - [target-chunk-size](#target-chunk-size)
 - [threads](#threads)
@@ -41,16 +39,6 @@ spirit migrate --host mydb:3306 --username root --password secret \
   - [VERIFY\_CA](#verify_ca)
   - [VERIFY\_IDENTITY](#verify_identity)
 - [username](#username)
-
-### alter
-
-- Type: String
-- Default value: ``
-- Examples: `add column foo int`, `add index foo (bar)`
-
-The alter table command to perform. The default value is a _null alter table_, which can be useful for testing.
-
-See also: `--statement`.
 
 ### checkpoint-max-age
 
@@ -76,6 +64,12 @@ Operationally, this means:
 - If you must change Spirit versions, let the in-flight migration finish first, or accept the lost progress and start fresh with the new version.
 - For long-running migrations that span planned binary upgrades, plan to drain the migration before the upgrade window.
 
+##### Upgrading from a version with `--table`/`--alter`
+
+Resume requires the statement text to match the checkpoint exactly. Versions that still had `--table` and `--alter` stored the statement they composed from that pair (``ALTER TABLE `t` <alter>``, with the table name back-quoted), so a migration started on such a version will **not** resume once you upgrade: the mismatch is treated as definitive and Spirit starts a fresh copy, discarding the checkpoint and the `_new` table.
+
+Drain any in-flight migrations before upgrading past the release that removed those flags.
+
 ### checksum-yield-timeout
 
 - Type: Duration
@@ -99,8 +93,8 @@ For most migrations the default of `24h` is appropriate. You may want to lower t
 ```bash
 # Yield every 4 hours to limit HLL growth
 spirit migrate --checksum-yield-timeout=4h \
-       --host mydb:3306 --database mydb --table large_table \
-       --alter "ADD INDEX idx_foo (foo)"
+       --host mydb:3306 --database mydb \
+       --statement "ALTER TABLE large_table ADD INDEX idx_foo (foo)"
 ```
 
 ### conf
@@ -263,9 +257,13 @@ When set to `true`, Spirit will keep the old table (renamed to `_<table>_old`) a
 ### statement
 
 - Type: String
-- Default value: ``
+- Required
 
-Spirit accepts either a pair of `--table` and `--alter` arguments or a `--statement` argument. When using `--statement` you can send most DDL statements to Spirit, including `CREATE TABLE`, `ALTER TABLE`, `CREATE INDEX`, `RENAME TABLE` and `DROP TABLE`. Others such as `DROP INDEX` are _not_ supported and should be rewritten as `ALTER TABLE` statements.
+`--statement` is the only way to tell Spirit what change to make. It accepts most DDL statements, including `CREATE TABLE`, `ALTER TABLE`, `CREATE INDEX`, `RENAME TABLE` and `DROP TABLE`. Others such as `DROP INDEX` are _not_ supported and should be rewritten as `ALTER TABLE` statements.
+
+The table name is taken from the statement itself. If it is qualified (`` `schema`.`table` ``) the schema must match `--database`.
+
+`--statement` replaced the earlier `--table` and `--alter` pair, which has been removed. Because resume matches on the exact statement text, migrations started before that removal will not resume — see [Upgrading from a version with `--table`/`--alter`](#upgrading-from-a-version-with---table--alter).
 
 You can also send multiple `ALTER TABLE` statements at once, for example: `--statement="ALTER TABLE t1 CHARSET=utf8mb4; ALTER TABLE t2 CHARSET=utf8mb4;"` All of these statements will cutover atomically, which is useful when you are changing charsets or collations since if you were to perform these alters sequentially it may cause performance issues due to datatype mismatches in joins.
 
@@ -274,13 +272,6 @@ There are some restrictions to `--statement`:
 - When sending multiple statements, all statements must be `ALTER TABLE` statements.
 - When sending multiple statements, the `INSTANT` and `INPLACE` optimizations will be skipped. This means that metadata-only changes that would execute instantly if submitted alone will require a full table copy.
 - When sending multiple statements, all statements must operate on tables in the same underlying database (aka schema).
-
-### table
-
-- Type: String
-- Default value: ``
-
-The table that the schema change will be performed on.
 
 ### target-chunk-time
 
@@ -484,8 +475,7 @@ spirit migrate --tls-mode PREFERRED \
        --username admin \
        --password mypassword \
        --database production \
-       --table users \
-       --alter "ADD COLUMN last_login_ip VARCHAR(45) AFTER last_login" \
+       --statement "ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(45) AFTER last_login" \
        --threads 8
 ```
 **Result**: Automatically uses TLS for RDS hosts with embedded certificates, optional for others.
@@ -499,8 +489,7 @@ spirit migrate --tls-mode REQUIRED \
        --username staging_user \
        --password staging_pass \
        --database inventory \
-       --table products \
-       --alter "ADD COLUMN supplier_notes JSON AFTER supplier_id" \
+       --statement "ALTER TABLE products ADD COLUMN supplier_notes JSON AFTER supplier_id" \
        --threads 6
 ```
 **Result**: TLS encryption required, but accepts self-signed or invalid certificates.
@@ -515,8 +504,7 @@ spirit migrate --tls-mode VERIFY_CA \
        --username app_user \
        --password app_password \
        --database analytics \
-       --table events \
-       --alter "ADD COLUMN event_metadata JSON AFTER event_type" \
+       --statement "ALTER TABLE events ADD COLUMN event_metadata JSON AFTER event_type" \
        --threads 4
 ```
 **Result**: Verifies certificate against custom CA bundle but allows IP addresses/hostname mismatches.
@@ -528,8 +516,7 @@ spirit migrate --tls-mode VERIFY_CA \
        --username internal_user \
        --password internal_pass \
        --database hr_system \
-       --table employees \
-       --alter "ADD COLUMN emergency_contact VARCHAR(255) AFTER phone_number" \
+       --statement "ALTER TABLE employees ADD COLUMN emergency_contact VARCHAR(255) AFTER phone_number" \
        --threads 2
 ```
 **Result**: Uses embedded RDS certificate bundle as fallback for certificate verification.
@@ -544,8 +531,7 @@ spirit migrate --tls-mode VERIFY_IDENTITY \
        --username secure_user \
        --password very_secure_password \
        --database financial \
-       --table transactions \
-       --alter "ADD COLUMN fraud_score DECIMAL(5,4) AFTER amount" \
+       --statement "ALTER TABLE transactions ADD COLUMN fraud_score DECIMAL(5,4) AFTER amount" \
        --threads 8
 ```
 **Result**: Full TLS verification including hostname matching - maximum security. Custom certificate takes precedence over RDS auto-detection.
@@ -557,8 +543,7 @@ spirit migrate --tls-mode VERIFY_IDENTITY \
        --username rds_admin \
        --password rds_password \
        --database customer_data \
-       --table profiles \
-       --alter "ADD COLUMN gdpr_consent_date DATETIME AFTER created_at" \
+       --statement "ALTER TABLE profiles ADD COLUMN gdpr_consent_date DATETIME AFTER created_at" \
        --threads 10
 ```
 **Result**: Uses embedded RDS certificate with full verification for RDS hostname.

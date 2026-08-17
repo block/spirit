@@ -28,8 +28,7 @@ echo "------------------------------"
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="DISABLED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_disabled VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_disabled VARCHAR(50)"
 
 echo ""
 echo "🔍 Testing TLS Mode: PREFERRED (should fallback to plain)"
@@ -40,8 +39,7 @@ echo "---------------------------------------------------------"
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="PREFERRED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_preferred VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_preferred VARCHAR(50)"
 
 echo ""
 echo "🔍 Testing TLS Mode: REQUIRED (should fail)"
@@ -53,8 +51,7 @@ set +e  # Allow this to fail
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="REQUIRED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_required VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_required VARCHAR(50)"
 set -e
 
 echo ""
