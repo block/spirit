@@ -44,6 +44,7 @@ type insertRowAlias struct {
 type likeEscapeSpec struct {
 	escape   string
 	explicit bool
+	expr     ast.ExprNode
 }
 %}
 
@@ -83,6 +84,7 @@ type likeEscapeSpec struct {
 	array             "ARRAY"
 	as                "AS"
 	asc               "ASC"
+	before            "BEFORE"
 	between           "BETWEEN"
 	bigIntType        "BIGINT"
 	binaryType        "BINARY"
@@ -118,6 +120,27 @@ type likeEscapeSpec struct {
 	defaultKwd        "DEFAULT"
 	delayed           "DELAYED"
 	deleteKwd         "DELETE"
+	declare           "DECLARE"
+	deterministic     "DETERMINISTIC"
+	continueKwd       "CONTINUE"
+	cursor            "CURSOR"
+	each              "EACH"
+	elseifKwd         "ELSEIF"
+	exit              "EXIT"
+	inout             "INOUT"
+	iterate           "ITERATE"
+	leave             "LEAVE"
+	loop              "LOOP"
+	modifies          "MODIFIES"
+	out               "OUT"
+	reads             "READS"
+	resignal          "RESIGNAL"
+	returnKwd         "RETURN"
+	signal            "SIGNAL"
+	sqlexception      "SQLEXCEPTION"
+	sqlstate          "SQLSTATE"
+	sqlwarning        "SQLWARNING"
+	while             "WHILE"
 	denseRank         "DENSE_RANK"
 	desc              "DESC"
 	describe          "DESCRIBE"
@@ -128,6 +151,7 @@ type likeEscapeSpec struct {
 	drop              "DROP"
 	dual              "DUAL"
 	elseKwd           "ELSE"
+	empty             "EMPTY"
 	enclosed          "ENCLOSED"
 	escaped           "ESCAPED"
 	except            "EXCEPT"
@@ -172,6 +196,7 @@ type likeEscapeSpec struct {
 	into              "INTO"
 	is                "IS"
 	join              "JOIN"
+	jsonTable         "JSON_TABLE"
 	key               "KEY"
 	keys              "KEYS"
 	kill              "KILL"
@@ -212,6 +237,7 @@ type likeEscapeSpec struct {
 	of                "OF"
 	on                "ON"
 	optimize          "OPTIMIZE"
+	optimizerCosts    "OPTIMIZER_COSTS"
 	option            "OPTION"
 	optionally        "OPTIONALLY"
 	or                "OR"
@@ -224,6 +250,8 @@ type likeEscapeSpec struct {
 	precisionType     "PRECISION"
 	primary           "PRIMARY"
 	procedure         "PROCEDURE"
+	purge             "PURGE"
+	qualify           "QUALIFY"
 	rangeKwd          "RANGE"
 	rank              "RANK"
 	read              "READ"
@@ -248,6 +276,7 @@ type likeEscapeSpec struct {
 	set               "SET"
 	show              "SHOW"
 	smallIntType      "SMALLINT"
+	sounds            "SOUNDS"
 	spatial           "SPATIAL"
 	sql               "SQL"
 	sqlBigResult      "SQL_BIG_RESULT"
@@ -257,6 +286,7 @@ type likeEscapeSpec struct {
 	starting          "STARTING"
 	stored            "STORED"
 	straightJoin      "STRAIGHT_JOIN"
+	system            "SYSTEM"
 	tableKwd          "TABLE"
 	terminated        "TERMINATED"
 	then              "THEN"
@@ -267,6 +297,7 @@ type likeEscapeSpec struct {
 	trailing          "TRAILING"
 	trigger           "TRIGGER"
 	trueKwd           "TRUE"
+	undo              "UNDO"
 	union             "UNION"
 	unique            "UNIQUE"
 	unlock            "UNLOCK"
@@ -296,17 +327,23 @@ type likeEscapeSpec struct {
 	/* The following tokens belong to UnReservedKeyword. Notice: make sure these tokens are contained in UnReservedKeyword. */
 	account                  "ACCOUNT"
 	action                   "ACTION"
+	active                   "ACTIVE"
+	admin                    "ADMIN"
 	after                    "AFTER"
 	against                  "AGAINST"
 	algorithm                "ALGORITHM"
 	always                   "ALWAYS"
 	any                      "ANY"
 	ascii                    "ASCII"
+	at                       "AT"
 	attribute                "ATTRIBUTE"
+	authentication           "AUTHENTICATION"
+	auto                     "AUTO"
 	autoextendSize           "AUTOEXTEND_SIZE"
 	autoIncrement            "AUTO_INCREMENT"
 	avg                      "AVG"
 	avgRowLength             "AVG_ROW_LENGTH"
+	backup                   "BACKUP"
 	begin                    "BEGIN"
 	binlog                   "BINLOG"
 	bitType                  "BIT"
@@ -316,13 +353,20 @@ type likeEscapeSpec struct {
 	btree                    "BTREE"
 	buckets                  "BUCKETS"
 	byteType                 "BYTE"
+	cache                    "CACHE"
 	cascaded                 "CASCADED"
 	chain                    "CHAIN"
+	challengeResponse        "CHALLENGE_RESPONSE"
+	changed                  "CHANGED"
+	channel                  "CHANNEL"
 	charsetKwd               "CHARSET"
 	checksum                 "CHECKSUM"
 	cipher                   "CIPHER"
 	client                   "CLIENT"
+	clone                    "CLONE"
+	closeKwd                 "CLOSE"
 	coalesce                 "COALESCE"
+	code                     "CODE"
 	collation                "COLLATION"
 	columns                  "COLUMNS"
 	columnFormat             "COLUMN_FORMAT"
@@ -330,8 +374,11 @@ type likeEscapeSpec struct {
 	commit                   "COMMIT"
 	committed                "COMMITTED"
 	compact                  "COMPACT"
+	component                "COMPONENT"
 	compressed               "COMPRESSED"
 	compression              "COMPRESSION"
+	concurrent               "CONCURRENT"
+	condition                "CONDITION"
 	config                   "CONFIG"
 	connection               "CONNECTION"
 	consistent               "CONSISTENT"
@@ -339,17 +386,23 @@ type likeEscapeSpec struct {
 	cpu                      "CPU"
 	current                  "CURRENT"
 	data                     "DATA"
+	datafile                 "DATAFILE"
 	dateType                 "DATE"
 	datetimeType             "DATETIME"
 	day                      "DAY"
 	deallocate               "DEALLOCATE"
+	defaultAuth              "DEFAULT_AUTH"
 	definer                  "DEFINER"
+	definition               "DEFINITION"
 	delayKeyWrite            "DELAY_KEY_WRITE"
+	description              "DESCRIPTION"
+	diagnostics              "DIAGNOSTICS"
 	directory                "DIRECTORY"
 	disable                  "DISABLE"
 	discard                  "DISCARD"
 	disk                     "DISK"
 	do                       "DO"
+	dumpfile                 "DUMPFILE"
 	duplicate                "DUPLICATE"
 	dynamic                  "DYNAMIC"
 	enable                   "ENABLE"
@@ -370,11 +423,18 @@ type likeEscapeSpec struct {
 	expansion                "EXPANSION"
 	expire                   "EXPIRE"
 	explore                  "EXPLORE"
+	export                   "EXPORT"
 	extended                 "EXTENDED"
+	extentSize               "EXTENT_SIZE"
+	factor                   "FACTOR"
 	failedLoginAttempts      "FAILED_LOGIN_ATTEMPTS"
+	fast                     "FAST"
 	faultsSym                "FAULTS"
 	fields                   "FIELDS"
 	file                     "FILE"
+	fileBlockSize            "FILE_BLOCK_SIZE"
+	filter                   "FILTER"
+	finish                   "FINISH"
 	first                    "FIRST"
 	fixed                    "FIXED"
 	flush                    "FLUSH"
@@ -384,47 +444,70 @@ type likeEscapeSpec struct {
 	full                     "FULL"
 	function                 "FUNCTION"
 	general                  "GENERAL"
+	geomCollection           "GEOMCOLLECTION"
 	geometry                 "GEOMETRY"
 	geometryCollection       "GEOMETRYCOLLECTION"
+	get                      "GET"
 	global                   "GLOBAL"
 	grants                   "GRANTS"
+	grouping                 "GROUPING"
+	groupReplication         "GROUP_REPLICATION"
+	gtids                    "GTIDS"
+	handler                  "HANDLER"
 	hash                     "HASH"
+	help                     "HELP"
 	histogram                "HISTOGRAM"
 	history                  "HISTORY"
+	host                     "HOST"
 	hosts                    "HOSTS"
 	hour                     "HOUR"
 	identified               "IDENTIFIED"
 	importKwd                "IMPORT"
+	inactive                 "INACTIVE"
 	indexes                  "INDEXES"
+	initial                  "INITIAL"
+	initialSize              "INITIAL_SIZE"
+	initiate                 "INITIATE"
 	insertMethod             "INSERT_METHOD"
+	install                  "INSTALL"
 	instance                 "INSTANCE"
 	invisible                "INVISIBLE"
 	invoker                  "INVOKER"
 	io                       "IO"
+	ioThread                 "IO_THREAD"
 	ipc                      "IPC"
 	isolation                "ISOLATION"
 	issuer                   "ISSUER"
 	jsonType                 "JSON"
+	jsonValue                "JSON_VALUE"
+	keyring                  "KEYRING"
 	keyBlockSize             "KEY_BLOCK_SIZE"
 	language                 "LANGUAGE"
 	last                     "LAST"
+	leaves                   "LEAVES"
+	library                  "LIBRARY"
 	less                     "LESS"
 	level                    "LEVEL"
 	lineString               "LINESTRING"
 	list                     "LIST"
 	local                    "LOCAL"
 	locked                   "LOCKED"
+	logfile                  "LOGFILE"
 	logs                     "LOGS"
+	manual                   "MANUAL"
 	master                   "MASTER"
 	maxConnectionsPerHour    "MAX_CONNECTIONS_PER_HOUR"
 	maxQueriesPerHour        "MAX_QUERIES_PER_HOUR"
 	maxRows                  "MAX_ROWS"
+	maxSize                  "MAX_SIZE"
 	maxUpdatesPerHour        "MAX_UPDATES_PER_HOUR"
 	maxUserConnections       "MAX_USER_CONNECTIONS"
+	medium                   "MEDIUM"
 	member                   "MEMBER"
 	memory                   "MEMORY"
 	merge                    "MERGE"
 	microsecond              "MICROSECOND"
+	migrate                  "MIGRATE"
 	minute                   "MINUTE"
 	minRows                  "MIN_ROWS"
 	mode                     "MODE"
@@ -433,35 +516,54 @@ type likeEscapeSpec struct {
 	multiLineString          "MULTILINESTRING"
 	multiPoint               "MULTIPOINT"
 	multiPolygon             "MULTIPOLYGON"
+	mutex                    "MUTEX"
+	nameKwd                  "NAME"
 	names                    "NAMES"
 	national                 "NATIONAL"
 	ncharType                "NCHAR"
+	nested                   "NESTED"
 	never                    "NEVER"
 	next                     "NEXT"
 	no                       "NO"
 	nodegroup                "NODEGROUP"
 	none                     "NONE"
 	nowait                   "NOWAIT"
+	noWaitTablespace         "NO_WAIT"
 	nulls                    "NULLS"
 	nvarcharType             "NVARCHAR"
 	offset                   "OFFSET"
 	old                      "OLD"
+	one                      "ONE"
 	only                     "ONLY"
 	open                     "OPEN"
+	optional                 "OPTIONAL"
+	options                  "OPTIONS"
+	ordinality               "ORDINALITY"
+	organization             "ORGANIZATION"
+	owner                    "OWNER"
 	packKeys                 "PACK_KEYS"
 	pageSym                  "PAGE"
 	parser                   "PARSER"
 	partial                  "PARTIAL"
+	parseTree                "PARSE_TREE"
 	partitioning             "PARTITIONING"
 	partitions               "PARTITIONS"
 	password                 "PASSWORD"
+	path                     "PATH"
 	passwordLockTime         "PASSWORD_LOCK_TIME"
+	persist                  "PERSIST"
+	persistOnly              "PERSIST_ONLY"
+	phase                    "PHASE"
 	pipesAsOr
+	plugin                   "PLUGIN"
+	pluginDir                "PLUGIN_DIR"
 	plugins                  "PLUGINS"
 	point                    "POINT"
 	polygon                  "POLYGON"
+	port                     "PORT"
 	preceding                "PRECEDING"
 	prepare                  "PREPARE"
+	prev                     "PREV"
 	privileges               "PRIVILEGES"
 	process                  "PROCESS"
 	processlist              "PROCESSLIST"
@@ -471,24 +573,50 @@ type likeEscapeSpec struct {
 	quarter                  "QUARTER"
 	query                    "QUERY"
 	quick                    "QUICK"
+	random                   "RANDOM"
 	rebuild                  "REBUILD"
+	recover                  "RECOVER"
+	redoBufferSize           "REDO_BUFFER_SIZE"
 	redundant                "REDUNDANT"
+	reference                "REFERENCE"
+	registration             "REGISTRATION"
+	relay                    "RELAY"
+	relaylog                 "RELAYLOG"
+	duality                  "DUALITY"
+	relational               "RELATIONAL"
+	returns                  "RETURNS"
+	contains                 "CONTAINS"
+	follows                  "FOLLOWS"
+	precedes                 "PRECEDES"
+	schedule                 "SCHEDULE"
+	completion               "COMPLETION"
+	preserve                 "PRESERVE"
+	starts                   "STARTS"
+	ends                     "ENDS"
+	every                    "EVERY"
+	stringKwd                "STRING"
+	aggregate                "AGGREGATE"
 	reload                   "RELOAD"
 	remove                   "REMOVE"
 	reorganize               "REORGANIZE"
 	repair                   "REPAIR"
 	repeatable               "REPEATABLE"
 	replica                  "REPLICA"
+	replicas                 "REPLICAS"
 	replication              "REPLICATION"
+	reset                    "RESET"
 	resource                 "RESOURCE"
 	respect                  "RESPECT"
 	restart                  "RESTART"
+	resume                   "RESUME"
 	retain                   "RETAIN"
+	returning                "RETURNING"
 	reuse                    "REUSE"
 	reverse                  "REVERSE"
 	role                     "ROLE"
 	rollback                 "ROLLBACK"
 	rollup                   "ROLLUP"
+	rotate                   "ROTATE"
 	routine                  "ROUTINE"
 	rowCount                 "ROW_COUNT"
 	rowFormat                "ROW_FORMAT"
@@ -496,6 +624,7 @@ type likeEscapeSpec struct {
 	san                      "SAN"
 	savepoint                "SAVEPOINT"
 	second                   "SECOND"
+	secondary                "SECONDARY"
 	secondaryEngine          "SECONDARY_ENGINE"
 	secondaryEngineAttribute "SECONDARY_ENGINE_ATTRIBUTE"
 	secondaryLoad            "SECONDARY_LOAD"
@@ -504,7 +633,9 @@ type likeEscapeSpec struct {
 	separator                "SEPARATOR"
 	serial                   "SERIAL"
 	serializable             "SERIALIZABLE"
+	server                   "SERVER"
 	session                  "SESSION"
+	sets                     "SETS"
 	share                    "SHARE"
 	shutdown                 "SHUTDOWN"
 	signed                   "SIGNED"
@@ -513,11 +644,14 @@ type likeEscapeSpec struct {
 	slave                    "SLAVE"
 	slow                     "SLOW"
 	snapshot                 "SNAPSHOT"
+	socket                   "SOCKET"
 	some                     "SOME"
+	soname                   "SONAME"
 	source                   "SOURCE"
 	sqlBufferResult          "SQL_BUFFER_RESULT"
 	sqlCache                 "SQL_CACHE"
 	sqlNoCache               "SQL_NO_CACHE"
+	sqlThread                "SQL_THREAD"
 	sqlTsiDay                "SQL_TSI_DAY"
 	sqlTsiHour               "SQL_TSI_HOUR"
 	sqlTsiMinute             "SQL_TSI_MINUTE"
@@ -527,16 +661,19 @@ type likeEscapeSpec struct {
 	sqlTsiWeek               "SQL_TSI_WEEK"
 	sqlTsiYear               "SQL_TSI_YEAR"
 	srid                     "SRID"
+	stacked                  "STACKED"
 	start                    "START"
 	statsAutoRecalc          "STATS_AUTO_RECALC"
 	statsPersistent          "STATS_PERSISTENT"
 	statsSamplePages         "STATS_SAMPLE_PAGES"
 	status                   "STATUS"
+	stop                     "STOP"
 	storage                  "STORAGE"
 	subject                  "SUBJECT"
 	subpartition             "SUBPARTITION"
 	subpartitions            "SUBPARTITIONS"
 	super                    "SUPER"
+	suspend                  "SUSPEND"
 	swaps                    "SWAPS"
 	switchesSym              "SWITCHES"
 	tables                   "TABLES"
@@ -545,10 +682,12 @@ type likeEscapeSpec struct {
 	temptable                "TEMPTABLE"
 	textType                 "TEXT"
 	than                     "THAN"
+	threadPriority           "THREAD_PRIORITY"
 	timeType                 "TIME"
 	timestampType            "TIMESTAMP"
 	tokenIssuer              "TOKEN_ISSUER"
 	traditional              "TRADITIONAL"
+	tree                     "TREE"
 	transaction              "TRANSACTION"
 	triggers                 "TRIGGERS"
 	truncate                 "TRUNCATE"
@@ -556,12 +695,22 @@ type likeEscapeSpec struct {
 	unbounded                "UNBOUNDED"
 	uncommitted              "UNCOMMITTED"
 	undefined                "UNDEFINED"
+	undofile                 "UNDOFILE"
+	undoBufferSize           "UNDO_BUFFER_SIZE"
 	unicodeSym               "UNICODE"
+	uninstall                "UNINSTALL"
 	unknown                  "UNKNOWN"
+	unregister               "UNREGISTER"
+	until                    "UNTIL"
+	upgrade                  "UPGRADE"
 	user                     "USER"
+	useFrm                   "USE_FRM"
+	userResources            "USER_RESOURCES"
 	validation               "VALIDATION"
 	value                    "VALUE"
 	variables                "VARIABLES"
+	vcpu                     "VCPU"
+	vectorType               "VECTOR"
 	view                     "VIEW"
 	visible                  "VISIBLE"
 	wait                     "WAIT"
@@ -569,8 +718,14 @@ type likeEscapeSpec struct {
 	week                     "WEEK"
 	weightString             "WEIGHT_STRING"
 	without                  "WITHOUT"
+	work                     "WORK"
+	wrapper                  "WRAPPER"
 	x509                     "X509"
+	xa                       "XA"
+	xid                      "XID"
+	xml                      "XML"
 	yearType                 "YEAR"
+	zone                     "ZONE"
 
 	/* The following tokens belong to NotKeywordToken. Notice: make sure these tokens are contained in NotKeywordToken. */
 	addDate                    "ADDDATE"
@@ -592,6 +747,7 @@ type likeEscapeSpec struct {
 	builtinApproxCountDistinct
 	builtinApproxPercentile
 	builtinBitAnd
+	builtinStCollect
 	builtinBitOr
 	builtinBitXor
 	builtinCast
@@ -602,6 +758,7 @@ type likeEscapeSpec struct {
 	builtinDateSub
 	builtinExtract
 	builtinGroupConcat
+	builtinJSONDualityObject
 	builtinMax
 	builtinMin
 	builtinNow
@@ -648,34 +805,38 @@ type likeEscapeSpec struct {
 
 %token not2
 %type	<expr>
-	Expression                      "expression"
-	MaxValueOrExpression            "maxvalue or expression"
-	BoolPri                         "boolean primary expression"
-	ExprOrDefault                   "expression or default"
-	PredicateExpr                   "Predicate expression factor"
-	SetExpr                         "Set variable statement value's expression"
-	BitExpr                         "bit expression"
-	SimpleExpr                      "simple expression"
-	SimpleIdent                     "Simple Identifier expression"
-	SumExpr                         "aggregate functions"
-	FunctionCallGeneric             "Function call with Identifier"
-	FunctionCallKeyword             "Function call with keyword as function name"
-	FunctionCallNonKeyword          "Function call with nonkeyword as function name"
-	Literal                         "literal value"
-	Variable                        "User or system variable"
-	SystemVariable                  "System defined variable name"
-	UserVariable                    "User defined variable name"
-	SubSelect                       "Sub Select"
-	StringLiteral                   "text literal"
-	ExpressionOpt                   "Optional expression"
-	SignedLiteral                   "Literal or NumLiteral with sign"
-	DefaultValueExpr                "DefaultValueExpr(Now or Signed Literal)"
-	NowSymOptionFraction            "NowSym with optional fraction part"
-	NowSymOptionFractionParentheses "NowSym with optional fraction part within potential parentheses"
-	CharsetNameOrDefault            "Character set name or default"
-	BuiltinFunction                 "Default builtin functions for columns"
-	WindowFuncCall                  "WINDOW function call"
-	ProcedureCall                   "Procedure call with Identifier or identifier"
+	Expression                    "expression"
+	IntoVar                       "SELECT INTO target variable"
+	UDFExpression                 "function call argument with optional alias"
+	MaxValueOrExpression          "maxvalue or expression"
+	BoolPri                       "boolean primary expression"
+	ExprOrDefault                 "expression or default"
+	PredicateExpr                 "Predicate expression factor"
+	SetExpr                       "Set variable statement value's expression"
+	BitExpr                       "bit expression"
+	SimpleExpr                    "simple expression"
+	SimpleIdent                   "Simple Identifier expression"
+	SumExpr                       "aggregate functions"
+	FunctionCallGeneric           "Function call with Identifier"
+	FunctionCallKeyword           "Function call with keyword as function name"
+	FunctionCallNonKeyword        "Function call with nonkeyword as function name"
+	Literal                       "literal value"
+	Variable                      "User or system variable"
+	SystemVariable                "System defined variable name"
+	UserVariable                  "User defined variable name"
+	GetDiagnosticsConditionNumber "GET DIAGNOSTICS condition number"
+	DoExpression                  "DO statement expression"
+	SubSelect                     "Sub Select"
+	StringLiteral                 "text literal"
+	ExpressionOpt                 "Optional expression"
+	SignedLiteral                 "Literal or NumLiteral with sign"
+	DefaultValueExpr              "DefaultValueExpr(Now or Signed Literal)"
+	NowSymOptionFraction          "NowSym with optional fraction part"
+	CharsetNameOrDefault          "Character set name or default"
+	BuiltinFunction               "Default builtin functions for columns"
+	BareBuiltinFunction           "Builtin function call without enclosing parentheses"
+	WindowFuncCall                "WINDOW function call"
+	ProcedureCall                 "Procedure call with Identifier or identifier"
 
 %type	<statement>
 	AlterDatabaseStmt          "Alter database statement"
@@ -684,10 +845,12 @@ type likeEscapeSpec struct {
 	AlterInstanceStmt          "Alter instance statement"
 	AnalyzeTableStmt           "Analyze table statement"
 	BeginTransactionStmt       "BEGIN TRANSACTION statement"
+	StartTransactionStmt       "START TRANSACTION statement"
 	BinlogStmt                 "Binlog base64 statement"
 	CommitStmt                 "COMMIT statement"
 	CreateTableStmt            "CREATE TABLE statement"
 	CreateViewStmt             "CREATE VIEW  statement"
+	CreateJSONDualityViewStmt  "CREATE JSON DUALITY VIEW statement"
 	CreateUserStmt             "CREATE User statement"
 	CreateRoleStmt             "CREATE Role statement"
 	CreateDatabaseStmt         "Create Database Statement"
@@ -714,6 +877,8 @@ type likeEscapeSpec struct {
 	InsertIntoStmt             "INSERT INTO statement"
 	CallStmt                   "CALL statement"
 	KillStmt                   "Kill statement"
+	HelpStmt                   "HELP statement"
+	GetDiagnosticsStmt         "GET DIAGNOSTICS statement"
 	LoadDataStmt               "Load data statement"
 	LockTablesStmt             "Lock tables statement"
 	OptimizeTableStmt          "OPTIMIZE statement"
@@ -722,9 +887,24 @@ type likeEscapeSpec struct {
 	SelectStmtWithClause       "common table expression SELECT statement"
 	RenameTableStmt            "rename table statement"
 	RenameUserStmt             "rename user statement"
+	RepairTableStmt            "REPAIR TABLE statement"
+	AlterViewStmt              "ALTER VIEW statement"
+	XAStmt                     "XA transaction statement"
+	CreateSpatialRefSysStmt    "CREATE SPATIAL REFERENCE SYSTEM statement"
+	DropSpatialRefSysStmt      "DROP SPATIAL REFERENCE SYSTEM statement"
+	CreateLibraryStmt          "CREATE LIBRARY statement"
+	AlterLibraryStmt           "ALTER LIBRARY statement"
+	DropLibraryStmt            "DROP LIBRARY statement"
+	CreateTablespaceStmt       "CREATE [UNDO] TABLESPACE statement"
+	AlterTablespaceStmt        "ALTER [UNDO] TABLESPACE statement"
+	DropTablespaceStmt         "DROP [UNDO] TABLESPACE statement"
+	CreateLogfileGroupStmt     "CREATE LOGFILE GROUP statement"
+	AlterLogfileGroupStmt      "ALTER LOGFILE GROUP statement"
+	DropLogfileGroupStmt       "DROP LOGFILE GROUP statement"
 	ReplaceIntoStmt            "REPLACE INTO statement"
 	RevokeStmt                 "Revoke statement"
 	RevokeRoleStmt             "Revoke role statement"
+	RevokeProxyStmt            "Revoke proxy statement"
 	RollbackStmt               "ROLLBACK statement"
 	ReleaseSavepointStmt       "RELEASE SAVEPOINT statement"
 	SavepointStmt              "SAVEPOINT statement"
@@ -733,6 +913,27 @@ type likeEscapeSpec struct {
 	SetDefaultRoleStmt         "Set default statement for some user"
 	ShowStmt                   "Show engines/databases/tables/user/columns/warnings/status statement"
 	Statement                  "statement"
+	SimpleStatement            "statement other than BEGIN"
+	ProcedureBodyStmt          "statement in a stored program body"
+	CreateProcedureStmt        "CREATE PROCEDURE statement"
+	CreateFunctionStmt         "CREATE FUNCTION statement"
+	CreateTriggerStmt          "CREATE TRIGGER statement"
+	CreateEventStmt            "CREATE EVENT statement"
+	AlterProcedureStmt         "ALTER PROCEDURE statement"
+	AlterFunctionStmt          "ALTER FUNCTION statement"
+	AlterEventStmt             "ALTER EVENT statement"
+	DropRoutineStmt            "DROP PROCEDURE/FUNCTION/TRIGGER/EVENT statement"
+	SignalStmt                 "SIGNAL statement"
+	ResignalStmt               "RESIGNAL statement"
+	BeginEndStmt               "BEGIN ... END compound statement"
+	ProcLabeledStmt            "labeled compound statement"
+	ProcIfStmt                 "procedure IF statement"
+	ProcCaseStmt               "procedure CASE statement"
+	ProcWhileStmt              "WHILE loop statement"
+	ProcRepeatStmt             "REPEAT loop statement"
+	ProcLoopStmt               "LOOP statement"
+	DeclareStmt                "DECLARE statement"
+	ProcFlowStmt               "RETURN/LEAVE/ITERATE/cursor statement"
 	TruncateTableStmt          "TRUNCATE TABLE statement"
 	UnlockTablesStmt           "Unlock tables statement"
 	UpdateStmt                 "UPDATE statement"
@@ -744,9 +945,143 @@ type likeEscapeSpec struct {
 	RestartStmt                "RESTART statement"
 	CreateViewSelectOpt        "Select/Union/Except/Intersect statement in CREATE VIEW ... AS SELECT"
 	UpdateStmtNoWith           "Update statement without CTE clause"
+	CheckTableStmt             "CHECK TABLE statement"
+	ChecksumTableStmt          "CHECKSUM TABLE statement"
+	HandlerStmt                "HANDLER statement"
+	PurgeStmt                  "PURGE BINARY LOGS statement"
+	ImportTableStmt            "IMPORT TABLE statement"
+	CacheIndexStmt             "CACHE INDEX statement"
+	LoadIndexStmt              "LOAD INDEX INTO CACHE statement"
+	InstallStmt                "INSTALL PLUGIN/COMPONENT statement"
+	UninstallStmt              "UNINSTALL PLUGIN/COMPONENT statement"
+	CreateServerStmt           "CREATE SERVER statement"
+	AlterServerStmt            "ALTER SERVER statement"
+	DropServerStmt             "DROP SERVER statement"
+	CreateResourceGroupStmt    "CREATE RESOURCE GROUP statement"
+	AlterResourceGroupStmt     "ALTER RESOURCE GROUP statement"
+	DropResourceGroupStmt      "DROP RESOURCE GROUP statement"
+	SetResourceGroupStmt       "SET RESOURCE GROUP statement"
+	CloneStmt                  "CLONE statement"
+	LockInstanceStmt           "LOCK INSTANCE FOR BACKUP statement"
+	UnlockInstanceStmt         "UNLOCK INSTANCE statement"
+	ChangeReplicationStmt      "CHANGE REPLICATION SOURCE/FILTER statement"
+	StartReplicaStmt           "START REPLICA/GROUP_REPLICATION statement"
+	StopReplicaStmt            "STOP REPLICA/GROUP_REPLICATION statement"
+	ResetStmt                  "RESET statement"
 
 %type	<item>
 	LikeEscapeOpt                          "like escape option"
+	CheckTableOption                       "CHECK TABLE option"
+	CheckTableOptionListOpt                "CHECK TABLE option list"
+	ChecksumTypeOpt                        "CHECKSUM TABLE QUICK/EXTENDED modifier"
+	HandlerReadTarget                      "HANDLER READ scan or index target"
+	HandlerCompareOp                       "HANDLER READ comparison operator"
+	StringLitList                          "string literal list"
+	CacheTableIndex                        "CACHE INDEX table entry"
+	CacheTableIndexList                    "CACHE INDEX table entry list"
+	CacheIndexNames                        "CACHE INDEX index names"
+	RoutineCreatePrefix                    "CREATE routine statement prefix"
+	ProcParamListOpt                       "procedure parameter list"
+	ProcParamList                          "procedure parameters"
+	ProcParam                              "procedure parameter"
+	ProcParamDirection                     "procedure parameter direction"
+	FuncParamListOpt                       "function parameter list"
+	FuncParamList                          "function parameters"
+	FuncParam                              "function parameter"
+	RoutineOptListOpt                      "routine characteristics"
+	RoutineOptItem                         "routine characteristic"
+	RoutineLibListOpt                      "USING library list"
+	RoutineLibList                         "USING libraries"
+	RoutineLib                             "USING library"
+	RoutineBodyTail                        "routine body"
+	UDFReturnTypeKwd                       "loadable function return type"
+	ProcStmtListOpt                        "compound statement list"
+	ProcStmtListNonEmpty                   "non-empty compound statement list"
+	ProcIfTail                             "IF statement tail"
+	ProcIfElseTail                         "IF statement ELSE tail"
+	ProcCaseExprOpt                        "CASE statement operand"
+	ProcCaseWhenList                       "CASE statement WHEN list"
+	ProcCaseWhen                           "CASE statement WHEN arm"
+	ProcCaseElseOpt                        "CASE statement ELSE arm"
+	DeclareIdentList                       "DECLARE variable names"
+	DeclareDefaultOpt                      "DECLARE DEFAULT value"
+	HandlerActionKwd                       "handler action"
+	HandlerConditionList                   "handler condition list"
+	HandlerConditionItem                   "handler condition"
+	ConditionBasic                         "error code or SQLSTATE condition"
+	SignalConditionValue                   "SIGNAL condition value"
+	SignalSetOpt                           "SIGNAL SET clause"
+	SignalItems                            "SIGNAL SET items"
+	SignalItemEntry                        "SIGNAL SET item"
+	FetchVarList                           "FETCH INTO targets"
+	FetchVar                               "FETCH INTO target"
+	EventScheduleClause                    "event schedule"
+	EventStartsOpt                         "event STARTS clause"
+	EventEndsOpt                           "event ENDS clause"
+	OnCompletionOpt                        "event ON COMPLETION clause"
+	EventStatusOpt                         "event status"
+	EventCommentOpt                        "event comment"
+	EventRenameOpt                         "event RENAME TO clause"
+	AlterEventSchedComplOpt                "ALTER EVENT schedule/completion clause"
+	EventDoOpt                             "ALTER EVENT DO clause"
+	TriggerTimeKwd                         "trigger action time"
+	TriggerEventKwd                        "trigger event"
+	TriggerOrderOpt                        "trigger order clause"
+	IntoVarList                            "SELECT INTO target variable list"
+	TypeWithCollate                        "field type with optional COLLATE"
+	UDFExpressionListOpt                   "function call argument list"
+	UDFExpressionList                      "function call arguments"
+	RelationalOpt                          "optional RELATIONAL keyword"
+	DualityWithOpt                         "optional JSON_DUALITY_OBJECT WITH annotation"
+	DualityOpList                          "JSON_DUALITY_OBJECT WITH operation list"
+	DualityKeyValueList                    "JSON_DUALITY_OBJECT member list"
+	DualityKeyValue                        "JSON_DUALITY_OBJECT member"
+	CacheIndexNameList                     "CACHE INDEX index name list"
+	LoadIndexTableIndex                    "LOAD INDEX table entry"
+	LoadIndexTableIndexList                "LOAD INDEX table entry list"
+	InstallComponentSetOpt                 "INSTALL COMPONENT optional SET clause"
+	ServerOption                           "CREATE SERVER option"
+	ServerOptionList                       "CREATE SERVER option list"
+	ServerOptionName                       "CREATE SERVER option name"
+	IdentOrText                            "identifier or text string"
+	ResourceGroupVcpuOpt                   "resource group optional VCPU clause"
+	VcpuRangeList                          "resource group VCPU range list"
+	VcpuRange                              "resource group VCPU range"
+	ResourceGroupPriorityOpt               "resource group optional THREAD_PRIORITY clause"
+	EnableDisableOpt                       "resource group optional ENABLE or DISABLE"
+	ThreadIdListOpt                        "SET RESOURCE GROUP optional FOR thread list"
+	ThreadIdList                           "thread id list"
+	CloneDataDirectoryOpt                  "CLONE INSTANCE optional DATA DIRECTORY clause"
+	CloneRequireSSLOpt                     "CLONE INSTANCE optional REQUIRE SSL clause"
+	ReplicationOption                      "replication statement option"
+	ReplicationOptionEq                    "replication statement name=value option"
+	ReplicationOptionList                  "replication statement option list"
+	ReplicationOptionValue                 "replication statement option value"
+	ReplicationListItem                    "replication option list value item"
+	ReplicationListItemList                "replication option list value items"
+	ForChannelOpt                          "optional FOR CHANNEL clause"
+	ReplicaThreadType                      "replica thread type"
+	ReplicaThreadList                      "replica thread type list"
+	ReplicaThreadListOpt                   "optional replica thread type list"
+	ReplicaUntilOpt                        "optional START REPLICA UNTIL clause"
+	SpaceSepOptionListOpt                  "optional space-separated replication options"
+	SpaceSepOptionList                     "space-separated replication options"
+	SpaceSepOption                         "single space-separated replication option"
+	BinlogInOpt                            "optional SHOW BINLOG EVENTS IN clause"
+	GetDiagnosticsScopeOpt                 "optional GET DIAGNOSTICS scope (CURRENT or STACKED)"
+	GetDiagnosticsItem                     "GET DIAGNOSTICS information item"
+	GetDiagnosticsItemList                 "GET DIAGNOSTICS information item list"
+	QualifyClauseOptional                  "optional QUALIFY clause"
+	DoExpressionList                       "DO statement expression list"
+	GroupingSet                            "grouping set (expression list in parens)"
+	GroupingSetList                        "grouping set list"
+	JsonValueReturningOpt                  "optional JSON_VALUE RETURNING clause"
+	JsonValueOnEmptyOrErrorOpt             "optional JSON_VALUE ON EMPTY/ON ERROR clauses"
+	JsonTableOnEmptyOrErrorOpt             "optional JSON_TABLE ON EMPTY/ON ERROR clauses"
+	JsonTableColumn                        "JSON_TABLE column definition"
+	JsonTableColumnList                    "JSON_TABLE column definition list"
+	JsonValueBehavior                      "JSON_VALUE ON EMPTY/ON ERROR behavior"
+	BinlogFromOpt                          "optional SHOW BINLOG EVENTS FROM position"
 	AllOrPartitionNameList                 "All or partition name list"
 	AlgorithmClause                        "Alter table algorithm"
 	AlterTableSpecSingleOpt                "Alter table single option"
@@ -761,6 +1096,13 @@ type likeEscapeSpec struct {
 	Assignment                             "assignment"
 	AssignmentList                         "assignment list"
 	AuthOption                             "User auth option"
+	IdentifiedOption                       "One authentication factor (IDENTIFIED ...)"
+	InitialAuthOption                      "INITIAL AUTHENTICATION auth option"
+	ReplacePasswordOpt                     "Optional REPLACE 'current password' clause"
+	RetainCurrentPasswordOpt               "Optional RETAIN CURRENT PASSWORD clause"
+	DefaultRoleClauseOpt                   "Optional DEFAULT ROLE clause of CREATE USER"
+	IgnoreUnknownUserOpt                   "Optional IGNORE UNKNOWN USER clause of REVOKE"
+	GrantAsOpt                             "Optional AS user WITH ROLE clause of GRANT"
 	OptionalBraces                         "optional braces"
 	CastType                               "Cast function target type"
 	CharsetOpt                             "CHARACTER SET option in LOAD DATA"
@@ -813,6 +1155,9 @@ type likeEscapeSpec struct {
 	Fields                                 "Fields clause"
 	FieldList                              "field expression list"
 	FlushOption                            "Flush option"
+	FlushNonTableOption                    "Flush option other than a table list"
+	FlushNonTableOptionListOpt             "Optional additional comma-separated flush options"
+	LibraryCommentOpt                      "Optional COMMENT clause of CREATE LIBRARY"
 	ForceOpt                               "Force opt"
 	InstanceOption                         "Instance option"
 	FulltextSearchModifierOpt              "Fulltext modifier"
@@ -861,6 +1206,8 @@ type likeEscapeSpec struct {
 	LocalOpt                               "Local opt"
 	LockClause                             "Alter table lock clause"
 	LogTypeOpt                             "Optional log type used in FLUSH statements"
+	InPrimaryKeyOrderOpt                   "LOAD DATA IN PRIMARY KEY ORDER or empty"
+	LoadDataPriorityOpt                    "LOAD DATA priority modifier (LOW_PRIORITY or CONCURRENT) or empty"
 	LowPriorityOpt                         "LOAD DATA low priority option"
 	NumLiteral                             "Num/Int/Float/Decimal Literal"
 	NoWriteToBinLogAliasOpt                "NO_WRITE_TO_BINLOG alias LOCAL or empty"
@@ -924,7 +1271,10 @@ type likeEscapeSpec struct {
 	RowFormat                              "Row format option"
 	RowValue                               "Row value"
 	RowStmt                                "Row constructor"
-	SelectLockOpt                          "SELECT lock options"
+	SelectLockClause                       "SELECT single locking clause"
+	SelectLockList                         "SELECT locking clause list"
+	SelectLockListOpt                      "SELECT optional locking clause list"
+	SelectLockIntoOpt                      "SELECT optional locking and INTO clauses"
 	SelectStmtSQLCache                     "SELECT statement optional SQL_CAHCE/SQL_NO_CACHE"
 	SelectStmtFieldList                    "SELECT statement field list"
 	SelectStmtLimit                        "SELECT statement LIMIT clause"
@@ -936,7 +1286,7 @@ type likeEscapeSpec struct {
 	SelectStmtFromDualTable                "SELECT statement from dual table"
 	SelectStmtFromTable                    "SELECT statement from table"
 	SelectStmtGroup                        "SELECT statement optional GROUP BY clause"
-	SelectStmtIntoOption                   "SELECT statement into clause"
+	IntoClause                             "SELECT INTO clause"
 	SetRoleOpt                             "Set role options"
 	SetDefaultRoleOpt                      "Set default role options"
 	SetOpr                                 "Set operator contain UNION, EXCEPT and INTERSECT"
@@ -1015,7 +1365,20 @@ type likeEscapeSpec struct {
 	WhenClauseList                         "When clause list"
 	WithClause                             "With Clause"
 	WithList                               "With list"
-	WithReadLockOpt                        "With Read Lock opt"
+	WithReadLockOpt                        "FLUSH TABLES WITH READ LOCK / FOR EXPORT opt"
+	StartTransactionOpt                    "START TRANSACTION characteristic"
+	StartTransactionOptList                "START TRANSACTION characteristic list"
+	RepairTypeListOpt                      "REPAIR TABLE options"
+	XAXid                                  "XA transaction identifier"
+	SRSAttribute                           "Spatial reference system attribute"
+	SRSAttributeListOpt                    "Spatial reference system attribute list"
+	TablespaceOption                       "Tablespace or logfile group option"
+	TablespaceOptionList                   "Tablespace or logfile group option list"
+	TablespaceOptionListOpt                "Optional tablespace or logfile group option list"
+	TablespaceSizeValue                    "Tablespace size value"
+	HistogramUpdateOpt                     "UPDATE HISTOGRAM MANUAL/AUTO UPDATE opt"
+	NoRollbackOnErrorOpt                   "NO ROLLBACK ON ERROR opt"
+	DatabaseOptionReadOnlyValue            "READ ONLY option value"
 	WithGrantOptionOpt                     "With Grant Option opt"
 	WithValidation                         "with validation"
 	WithValidationOpt                      "optional with validation"
@@ -1083,50 +1446,59 @@ type likeEscapeSpec struct {
 	MatchOpt                               "optional MATCH clause"
 
 %type	<ident>
-	AsOpt             "AS or EmptyString"
-	KeyOrIndex        "{KEY|INDEX}"
-	ColumnKeywordOpt  "Column keyword or empty"
-	PrimaryOpt        "Optional primary keyword"
-	NowSym            "CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP"
-	NowSymFunc        "CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP/NOW"
-	CurdateSym        "CURDATE or CURRENT_DATE"
-	DefaultKwdOpt     "optional DEFAULT keyword"
-	DatabaseSym       "DATABASE or SCHEMA"
-	ExplainSym        "EXPLAIN or DESCRIBE or DESC"
-	RegexpSym         "REGEXP or RLIKE"
-	IntoOpt           "INTO or EmptyString"
-	ValueSym          "Value or Values"
-	NotSym            "Not token"
-	Char              "{CHAR|CHARACTER}"
-	NChar             "{NCHAR|NATIONAL CHARACTER|NATIONAL CHAR}"
-	Varchar           "{VARCHAR|VARCHARACTER|CHARACTER VARYING|CHAR VARYING}"
-	NVarchar          "{NATIONAL VARCHAR|NATIONAL VARCHARACTER|NVARCHAR|NCHAR VARCHAR|NATIONAL CHARACTER VARYING|NATIONAL CHAR VARYING|NCHAR VARYING}"
-	Year              "{YEAR|SQL_TSI_YEAR}"
-	DeallocateSym     "Deallocate or drop"
-	OuterOpt          "optional OUTER clause"
-	CrossOpt          "Cross join option"
-	TablesTerminalSym "{TABLE|TABLES}"
-	IsolationLevel    "Isolation level"
-	ShowIndexKwd      "Show index/indexs/key keyword"
-	DistinctKwd       "DISTINCT/DISTINCTROW keyword"
-	FromOrIn          "From or In"
-	OptTable          "Optional table keyword"
-	OptInteger        "Optional Integer keyword"
-	CharsetKw         "charset or charater set"
-	logAnd            "logical and operator"
-	logOr             "logical or operator"
-	LinearOpt         "linear or empty"
-	FieldsOrColumns   "Fields or columns"
-	StorageMedia      "{DISK|MEMORY|DEFAULT}"
-	EncryptionOpt     "Encryption option 'Y' or 'N'"
-	FirstOrNext       "FIRST or NEXT"
-	RowOrRows         "ROW or ROWS"
-	Replica           "{REPLICA | SLAVE}"
+	AsOpt                     "AS or EmptyString"
+	KeyOrIndex                "{KEY|INDEX}"
+	ColumnKeywordOpt          "Column keyword or empty"
+	PrimaryOpt                "Optional primary keyword"
+	WorkOpt                   "Optional WORK keyword"
+	BeginOrStartSym           "BEGIN or START"
+	TablespaceDataFileOpt     "Tablespace ADD DATAFILE opt"
+	TablespaceLogfileGroupOpt "Tablespace USE LOGFILE GROUP opt"
+	TLSChannelOpt             "ALTER INSTANCE RELOAD TLS FOR CHANNEL opt"
+	FlushRelayChannelOpt      "FLUSH RELAY LOGS FOR CHANNEL opt"
+	NowSym                    "CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP"
+	NowSymFunc                "CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP/NOW"
+	CurdateSym                "CURDATE or CURRENT_DATE"
+	DefaultKwdOpt             "optional DEFAULT keyword"
+	DatabaseSym               "DATABASE or SCHEMA"
+	ExplainSym                "EXPLAIN or DESCRIBE or DESC"
+	RegexpSym                 "REGEXP or RLIKE"
+	IntoOpt                   "INTO or EmptyString"
+	ValueSym                  "Value or Values"
+	NotSym                    "Not token"
+	Char                      "{CHAR|CHARACTER}"
+	NChar                     "{NCHAR|NATIONAL CHARACTER|NATIONAL CHAR}"
+	Varchar                   "{VARCHAR|VARCHARACTER|CHARACTER VARYING|CHAR VARYING}"
+	NVarchar                  "{NATIONAL VARCHAR|NATIONAL VARCHARACTER|NVARCHAR|NCHAR VARCHAR|NATIONAL CHARACTER VARYING|NATIONAL CHAR VARYING|NCHAR VARYING}"
+	Year                      "{YEAR|SQL_TSI_YEAR}"
+	DeallocateSym             "Deallocate or drop"
+	OuterOpt                  "optional OUTER clause"
+	CrossOpt                  "Cross join option"
+	TablesTerminalSym         "{TABLE|TABLES}"
+	IsolationLevel            "Isolation level"
+	ShowIndexKwd              "Show index/indexs/key keyword"
+	DistinctKwd               "DISTINCT/DISTINCTROW keyword"
+	FromOrIn                  "From or In"
+	OptTable                  "Optional table keyword"
+	OptInteger                "Optional Integer keyword"
+	CharsetKw                 "charset or charater set"
+	logAnd                    "logical and operator"
+	logOr                     "logical or operator"
+	LinearOpt                 "linear or empty"
+	FieldsOrColumns           "Fields or columns"
+	StorageMedia              "{DISK|MEMORY|DEFAULT}"
+	EncryptionOpt             "Encryption option 'Y' or 'N'"
+	FirstOrNext               "FIRST or NEXT"
+	RowOrRows                 "ROW or ROWS"
+	Replica                   "{REPLICA | SLAVE}"
 
 %type	<ident>
 	Identifier                      "identifier or unreserved keyword"
 	NotKeywordToken                 "Tokens not mysql keyword but treated specially"
 	UnReservedKeyword               "MySQL unreserved keywords"
+	LabelKeyword                    "unreserved keywords usable as a label"
+	NonLabelKeyword                 "unreserved keywords not usable as a label"
+	LabelIdent                      "compound statement label"
 	FunctionNameConflict            "Built-in function call names which are conflict with keywords"
 	FunctionNameConflictNonNow      "FunctionNameConflict except NOW, which DefaultValueExpr handles separately"
 	FunctionNameOptionalBraces      "Function with optional braces, all of them are reserved keywords."
@@ -1140,14 +1512,21 @@ type likeEscapeSpec struct {
 	CollationName                   "Collation name"
 	ColumnFormat                    "Column format"
 	DBName                          "Database Name"
+	ExplainForDB                    "SCHEMA or DATABASE keyword of EXPLAIN FOR"
+	XmlRowsIdentifiedByOpt          "optional LOAD XML ROWS IDENTIFIED BY clause"
+	DoAliasOpt                      "optional DO expression alias"
 	ResourceGroupName               "Resource Group Name"
 	ExplainFormatType               "explain format type"
 	FieldAsName                     "Field alias name"
 	FieldAsNameOpt                  "Field alias name opt"
 	FieldTerminator                 "Field terminator"
 	HashString                      "Hashed string"
-	OptCharset                      "Optional Character setting"
 	OptCollate                      "Optional Collate setting"
+	JsonPathString                  "JSON path literal"
+	CacheIndexName                  "CACHE INDEX index name (identifier or PRIMARY)"
+	LibraryBody                     "CREATE LIBRARY body literal"
+	DualityOp                       "JSON_DUALITY_OBJECT WITH operation"
+	EndLabelOpt                     "optional end label"
 	PasswordOpt                     "Password option"
 	RoleNameString                  "role name string"
 	ShowDatabaseNameOpt             "Show tables/columns statement database name option"
@@ -1155,6 +1534,7 @@ type likeEscapeSpec struct {
 	Symbol                          "Constraint Symbol"
 
 %precedence empty
+%precedence member
 %precedence as
 %precedence lowerThanSelectOpt
 %precedence sqlBufferResult
@@ -1171,6 +1551,13 @@ type likeEscapeSpec struct {
 %precedence lowerThanSetKeyword
 %precedence set
 %precedence selectKwd
+
+/* Like selectKwd above: in `CREATE TABLE t ...` a following TABLE/VALUES
+ * query operand must lose to the empty TableElementListOpt reduction
+ * (%prec lowerThanCreateTableSelect) so the query is parsed through
+ * CreateTableSelectOpt, exactly as a plain SELECT is. */
+%precedence tableKwd
+%precedence values
 %precedence lowerThanSelectStmt
 %precedence lowerThanInsertValues
 %precedence insertValues
@@ -1187,8 +1574,16 @@ type likeEscapeSpec struct {
 %precedence lowerThenOrder
 %precedence order
 %precedence lowerThanFunction
-%precedence function
+%precedence function library
 %precedence constraint
+
+/* Give PARTITION a precedence so that after SECONDARY_LOAD/SECONDARY_UNLOAD
+ * the parser shifts it (extending the spec with a partition list) instead of
+ * reducing the bare spec and treating PARTITION as the start of a trailing
+ * PARTITION BY clause. MySQL does not allow combining SECONDARY_LOAD with
+ * repartitioning, so nothing valid is lost. */
+%precedence lowerThanPartitionKwd
+%precedence partition
 
 /* A dummy token to force the priority of TableRef production in a join. */
 %left tableRefPriority
@@ -1246,13 +1641,6 @@ AlterTableStmt:
 			Specs: specs,
 		}
 	}
-|	"ALTER" IgnoreOptional "TABLE" TableName "ANALYZE" "PARTITION" PartitionNameList
-	{
-		// MySQL partition maintenance: ALTER TABLE t ANALYZE PARTITION p1 [, p2 ...].
-		// Kept from the TiDB grammar (minus TiDB analyze options), which maps it
-		// to an AnalyzeTableStmt rather than an AlterTableSpec.
-		$$ = &ast.AnalyzeTableStmt{TableNames: []*ast.TableName{$4.(*ast.TableName)}, PartitionNames: $7.([]ast.CIStr)}
-	}
 
 AlterTableSpecSingleOpt:
 	PartitionOpt
@@ -1271,12 +1659,6 @@ AlterTableSpecSingleOpt:
 		$$ = &ast.AlterTableSpec{
 			Tp: ast.AlterTableRemovePartitioning,
 		}
-	}
-|	"REORGANIZE" "PARTITION" NoWriteToBinLogAliasOpt ReorganizePartitionRuleOpt
-	{
-		ret := $4.(*ast.AlterTableSpec)
-		ret.NoWriteToBinlog = $3.(bool)
-		$$ = ret
 	}
 
 AlterTableSpec:
@@ -1388,6 +1770,25 @@ AlterTableSpec:
 		} else {
 			ret.PartitionNames = $3.([]ast.CIStr)
 		}
+		$$ = ret
+	}
+|	"ANALYZE" "PARTITION" NoWriteToBinLogAliasOpt AllOrPartitionNameList
+	{
+		ret := &ast.AlterTableSpec{
+			NoWriteToBinlog: $3.(bool),
+			Tp:              ast.AlterTableAnalyzePartitions,
+		}
+		if $4 == nil {
+			ret.OnAllPartitions = true
+		} else {
+			ret.PartitionNames = $4.([]ast.CIStr)
+		}
+		$$ = ret
+	}
+|	"REORGANIZE" "PARTITION" NoWriteToBinLogAliasOpt ReorganizePartitionRuleOpt
+	{
+		ret := $4.(*ast.AlterTableSpec)
+		ret.NoWriteToBinlog = $3.(bool)
 		$$ = ret
 	}
 |	"COALESCE" "PARTITION" NoWriteToBinLogAliasOpt NUM
@@ -1613,6 +2014,16 @@ AlterTableSpec:
 			NewColumns: []*ast.ColumnDef{colDef},
 		}
 	}
+|	"ALTER" ColumnKeywordOpt ColumnName "SET" IndexInvisible
+	{
+		// ALTER TABLE t ALTER COLUMN c SET {VISIBLE | INVISIBLE} (MySQL
+		// 8.0.23+). Column and index visibility share ast.IndexVisibility.
+		$$ = &ast.AlterTableSpec{
+			Tp:            ast.AlterTableAlterColumnVisibility,
+			OldColumnName: $3.(*ast.ColumnName),
+			Visibility:    $5.(ast.IndexVisibility),
+		}
+	}
 |	"RENAME" "COLUMN" Identifier "TO" Identifier
 	{
 		oldColName := &ast.ColumnName{Name: ast.NewCIStr($3)}
@@ -1689,7 +2100,7 @@ AlterTableSpec:
 		}
 	}
 // Added in MySQL 8.0.13, see: https://dev.mysql.com/doc/refman/8.0/en/keywords.html for details
-|	"SECONDARY_LOAD"
+|	"SECONDARY_LOAD" %prec lowerThanPartitionKwd
 	{
 		// Parse it and ignore it. Just for compatibility.
 		$$ = &ast.AlterTableSpec{
@@ -1698,12 +2109,32 @@ AlterTableSpec:
 		yylex.AppendError(yylex.Errorf("The SECONDARY_LOAD clause is parsed but not implement yet."))
 		parser.lastErrorAsWarn()
 	}
+|	"SECONDARY_LOAD" "PARTITION" '(' PartitionNameList ')'
+	{
+		// MySQL 9.x allows loading/unloading individual partitions.
+		$$ = &ast.AlterTableSpec{
+			Tp:             ast.AlterTableSecondaryLoad,
+			PartitionNames: $4.([]ast.CIStr),
+		}
+		yylex.AppendError(yylex.Errorf("The SECONDARY_LOAD clause is parsed but not implement yet."))
+		parser.lastErrorAsWarn()
+	}
 // Added in MySQL 8.0.13, see: https://dev.mysql.com/doc/refman/8.0/en/keywords.html for details
-|	"SECONDARY_UNLOAD"
+|	"SECONDARY_UNLOAD" %prec lowerThanPartitionKwd
 	{
 		// Parse it and ignore it. Just for compatibility.
 		$$ = &ast.AlterTableSpec{
 			Tp: ast.AlterTableSecondaryUnload,
+		}
+		yylex.AppendError(yylex.Errorf("The SECONDARY_UNLOAD VALIDATION clause is parsed but not implement yet."))
+		parser.lastErrorAsWarn()
+	}
+|	"SECONDARY_UNLOAD" "PARTITION" '(' PartitionNameList ')'
+	{
+		// MySQL 9.x allows loading/unloading individual partitions.
+		$$ = &ast.AlterTableSpec{
+			Tp:             ast.AlterTableSecondaryUnload,
+			PartitionNames: $4.([]ast.CIStr),
 		}
 		yylex.AppendError(yylex.Errorf("The SECONDARY_UNLOAD VALIDATION clause is parsed but not implement yet."))
 		parser.lastErrorAsWarn()
@@ -1906,7 +2337,7 @@ Symbol:
  *     [, tbl_name2 TO new_tbl_name2] ...
  *******************************************************************************************/
 RenameTableStmt:
-	"RENAME" "TABLE" TableToTableList
+	"RENAME" TableOrTables TableToTableList
 	{
 		$$ = &ast.RenameTableStmt{
 			TableToTables: $3.([]*ast.TableToTable),
@@ -1976,28 +2407,53 @@ UserToUser:
  *
  *******************************************************************/
 AnalyzeTableStmt:
-	"ANALYZE" NoWriteToBinLogAliasOpt "TABLE" TableNameList
+	"ANALYZE" NoWriteToBinLogAliasOpt TableOrTables TableNameList
 	{
 		$$ = &ast.AnalyzeTableStmt{TableNames: $4.([]*ast.TableName), NoWriteToBinLog: $2.(bool)}
 	}
-|	"ANALYZE" NoWriteToBinLogAliasOpt "TABLE" TableName "UPDATE" "HISTOGRAM" "ON" IdentList AnalyzeOptionListOpt
+|	"ANALYZE" NoWriteToBinLogAliasOpt TableOrTables TableNameList "UPDATE" "HISTOGRAM" "ON" IdentList AnalyzeOptionListOpt HistogramUpdateOpt
 	{
 		$$ = &ast.AnalyzeTableStmt{
-			TableNames:         []*ast.TableName{$4.(*ast.TableName)},
+			TableNames:         $4.([]*ast.TableName),
 			NoWriteToBinLog:    $2.(bool),
 			ColumnNames:        $8.([]ast.CIStr),
 			AnalyzeOpts:        $9.([]ast.AnalyzeOpt),
+			HistogramUpdate:    $10.(ast.HistogramUpdateType),
 			HistogramOperation: ast.HistogramOperationUpdate,
 		}
 	}
-|	"ANALYZE" NoWriteToBinLogAliasOpt "TABLE" TableName "DROP" "HISTOGRAM" "ON" IdentList
+|	"ANALYZE" NoWriteToBinLogAliasOpt TableOrTables TableNameList "UPDATE" "HISTOGRAM" "ON" IdentList "USING" "DATA" stringLit
 	{
 		$$ = &ast.AnalyzeTableStmt{
-			TableNames:         []*ast.TableName{$4.(*ast.TableName)},
+			TableNames:         $4.([]*ast.TableName),
+			NoWriteToBinLog:    $2.(bool),
+			ColumnNames:        $8.([]ast.CIStr),
+			HistogramOperation: ast.HistogramOperationUpdate,
+			UsingData:          true,
+			HistogramData:      $11,
+		}
+	}
+|	"ANALYZE" NoWriteToBinLogAliasOpt TableOrTables TableNameList "DROP" "HISTOGRAM" "ON" IdentList
+	{
+		$$ = &ast.AnalyzeTableStmt{
+			TableNames:         $4.([]*ast.TableName),
 			NoWriteToBinLog:    $2.(bool),
 			ColumnNames:        $8.([]ast.CIStr),
 			HistogramOperation: ast.HistogramOperationDrop,
 		}
+	}
+
+HistogramUpdateOpt:
+	{
+		$$ = ast.HistogramUpdateNop
+	}
+|	"MANUAL" "UPDATE"
+	{
+		$$ = ast.HistogramUpdateManual
+	}
+|	"AUTO" "UPDATE"
+	{
+		$$ = ast.HistogramUpdateAuto
 	}
 
 AnalyzeOptionListOpt:
@@ -2046,28 +2502,53 @@ AssignmentList:
 	}
 
 BeginTransactionStmt:
-	"BEGIN"
+	"BEGIN" WorkOpt
 	{
 		$$ = &ast.BeginStmt{}
 	}
-|	"START" "TRANSACTION"
+|	StartTransactionStmt
+
+// StartTransactionStmt is split out of BeginTransactionStmt because a
+// routine body may contain START TRANSACTION, while a bare BEGIN there
+// opens a compound statement instead.
+StartTransactionStmt:
+	"START" "TRANSACTION"
 	{
 		$$ = &ast.BeginStmt{}
 	}
-|	"START" "TRANSACTION" "READ" "WRITE"
-	{
-		$$ = &ast.BeginStmt{}
-	}
-|	"START" "TRANSACTION" "WITH" "CONSISTENT" "SNAPSHOT"
-	{
-		$$ = &ast.BeginStmt{}
-	}
-|	"START" "TRANSACTION" "READ" "ONLY"
+|	"START" "TRANSACTION" StartTransactionOptList
 	{
 		$$ = &ast.BeginStmt{
-			ReadOnly: true,
+			ReadOnly: $3.(bool),
 		}
 	}
+
+// StartTransactionOptList is a comma-separated list of transaction
+// characteristics; its value is whether READ ONLY was among them.
+StartTransactionOptList:
+	StartTransactionOpt
+|	StartTransactionOptList ',' StartTransactionOpt
+	{
+		$$ = $1.(bool) || $3.(bool)
+	}
+
+StartTransactionOpt:
+	"READ" "ONLY"
+	{
+		$$ = true
+	}
+|	"READ" "WRITE"
+	{
+		$$ = false
+	}
+|	"WITH" "CONSISTENT" "SNAPSHOT"
+	{
+		$$ = false
+	}
+
+WorkOpt:
+	{}
+|	"WORK"
 
 BinlogStmt:
 	"BINLOG" stringLit
@@ -2189,13 +2670,13 @@ ColumnNameOrUserVarListOptWithBrackets:
 	}
 
 CommitStmt:
-	"COMMIT"
+	"COMMIT" WorkOpt
 	{
 		$$ = &ast.CommitStmt{}
 	}
-|	"COMMIT" CompletionTypeWithinTransaction
+|	"COMMIT" WorkOpt CompletionTypeWithinTransaction
 	{
-		$$ = &ast.CommitStmt{CompletionType: $2.(ast.CompletionType)}
+		$$ = &ast.CommitStmt{CompletionType: $3.(ast.CompletionType)}
 	}
 
 PrimaryOpt:
@@ -2247,6 +2728,10 @@ ColumnOption:
 	NotSym "NULL"
 	{
 		$$ = &ast.ColumnOption{Tp: ast.ColumnOptionNotNull}
+	}
+|	NotSym "SECONDARY"
+	{
+		$$ = &ast.ColumnOption{Tp: ast.ColumnOptionNotSecondary}
 	}
 |	"NULL"
 	{
@@ -2352,6 +2837,13 @@ ColumnOption:
 		yylex.AppendError(yylex.Errorf("The STORAGE clause is parsed but ignored by all storage engines."))
 		parser.lastErrorAsWarn()
 	}
+|	"ENGINE_ATTRIBUTE" EqOpt stringLit
+	{
+		$$ = &ast.ColumnOption{
+			Tp:       ast.ColumnOptionEngineAttribute,
+			StrValue: $3,
+		}
+	}
 |	"SECONDARY_ENGINE_ATTRIBUTE" EqOpt stringLit
 	{
 		$$ = &ast.ColumnOption{
@@ -2368,6 +2860,16 @@ ColumnOption:
 			return 1
 		}
 		$$ = &ast.ColumnOption{Tp: ast.ColumnOptionSrid, Srid: uint32(srid)}
+	}
+|	"VISIBLE"
+	{
+		$$ = &ast.ColumnOption{Tp: ast.ColumnOptionVisibility, StrValue: "VISIBLE"}
+	}
+|	"INVISIBLE"
+	{
+		// Invisible columns (MySQL 8.0.23+). SHOW CREATE TABLE emits this as
+		// /*!80023 INVISIBLE */, which the lexer unwraps.
+		$$ = &ast.ColumnOption{Tp: ast.ColumnOptionVisibility, StrValue: "INVISIBLE"}
 	}
 
 StorageMedia:
@@ -2662,21 +3164,17 @@ ReferOpt:
  *     https://dev.mysql.com/doc/refman/8.0/en/data-type-defaults.html
  */
 DefaultValueExpr:
-	NowSymOptionFractionParentheses
+	NowSymOptionFraction
 |	SignedLiteral
-|	BuiltinFunction
-|	'(' Identifier ')'
+|	BareBuiltinFunction
+|	'(' Expression ')'
 	{
-		$$ = &ast.ColumnNameExpr{Name: &ast.ColumnName{
-			Name: ast.NewCIStr($2),
-		}}
-	}
-|	'(' SignedLiteral ')'
-	{
-		// MySQL 8.0.13+ distinguishes literal defaults (DEFAULT '{}') from
-		// expression defaults (DEFAULT ('{}')): BLOB/TEXT/JSON/GEOMETRY
-		// columns only accept the parenthesized form. Keep the parentheses
-		// in the AST so restoring the statement preserves the distinction.
+		// MySQL 8.0.13+ expression defaults: DEFAULT (expr) accepts a full
+		// expression (sql_yacc.yy uses expr here too; invalid constructs such
+		// as subqueries are rejected semantically, not by the grammar). Keep
+		// the parentheses in the AST: MySQL distinguishes literal defaults
+		// (DEFAULT '{}') from expression defaults (DEFAULT ('{}')), and
+		// BLOB/TEXT/JSON/GEOMETRY columns only accept the latter.
 		$$ = &ast.ParenthesesExpr{Expr: $2}
 	}
 
@@ -2685,7 +3183,10 @@ BuiltinFunction:
 	{
 		$$ = $2.(*ast.FuncCallExpr)
 	}
-|	identifier '(' ')'
+|	BareBuiltinFunction
+
+BareBuiltinFunction:
+	identifier '(' ')'
 	{
 		$$ = &ast.FuncCallExpr{
 			FnName: ast.NewCIStr($1),
@@ -2698,6 +3199,16 @@ BuiltinFunction:
 			Args:   $3.([]ast.ExprNode),
 		}
 	}
+|	"INTERVAL" '(' Expression ',' ExpressionList ')'
+	{
+		// INTERVAL() takes two or more arguments. With a single
+		// parenthesised argument the token instead starts a temporal
+		// interval, as in `d - INTERVAL (n) DAY_MICROSECOND`.
+		$$ = &ast.FuncCallExpr{
+			FnName: ast.NewCIStr("INTERVAL"),
+			Args:   append([]ast.ExprNode{$3}, $5.([]ast.ExprNode)...),
+		}
+	}
 |	FunctionNameConflictNonNow '(' ExpressionListOpt ')'
 	{
 		// Function names that lex as keyword tokens rather than plain
@@ -2705,20 +3216,13 @@ BuiltinFunction:
 		// expression defaults — DEFAULT (POINT(0,0)) is the manual's own
 		// example — and SHOW CREATE TABLE emits them, so without this a
 		// table using one is unparseable (block/spirit#1128). NOW is
-		// excluded: DEFAULT (NOW()) must keep resolving through
-		// NowSymOptionFractionParentheses to CURRENT_TIMESTAMP.
+		// excluded: DEFAULT NOW() must keep resolving through
+		// NowSymOptionFraction to CURRENT_TIMESTAMP.
 		$$ = &ast.FuncCallExpr{
 			FnName: ast.NewCIStr($1),
 			Args:   $3.([]ast.ExprNode),
 		}
 	}
-
-NowSymOptionFractionParentheses:
-	'(' NowSymOptionFractionParentheses ')'
-	{
-		$$ = $2.(*ast.FuncCallExpr)
-	}
-|	NowSymOptionFraction
 
 NowSymOptionFraction:
 	NowSym
@@ -2952,6 +3456,22 @@ DatabaseOption:
 	{
 		$$ = &ast.DatabaseOption{Tp: ast.DatabaseOptionEncryption, Value: $4}
 	}
+|	"READ" "ONLY" EqOpt DatabaseOptionReadOnlyValue
+	{
+		opt := $4.(*ast.DatabaseOption)
+		opt.Tp = ast.DatabaseOptionReadOnly
+		$$ = opt
+	}
+
+DatabaseOptionReadOnlyValue:
+	"DEFAULT"
+	{
+		$$ = &ast.DatabaseOption{Value: "DEFAULT"}
+	}
+|	NUM
+	{
+		$$ = &ast.DatabaseOption{UintValue: getUint64FromNUM($1)}
+	}
 
 DatabaseOptionListOpt:
 	{
@@ -2997,6 +3517,64 @@ CreateTableStmt:
 		}
 		stmt.OnDuplicate = $9.(ast.OnDuplicateKeyHandlingType)
 		stmt.Select = $11.(*ast.CreateTableStmt).Select
+		$$ = stmt
+	}
+|	"CREATE" OptTemporary "TABLE" IfNotExists TableName SubSelect
+	{
+		// CREATE TABLE t (SELECT ...): MySQL allows a parenthesized query
+		// expression with no AS keyword and no column list.
+		var sel ast.ResultSetNode
+		switch x := $6.(*ast.SubqueryExpr).Query.(type) {
+		case *ast.SelectStmt:
+			x.IsInBraces = true
+			sel = x
+		case *ast.SetOprStmt:
+			x.IsInBraces = true
+			sel = x
+		}
+		$$ = &ast.CreateTableStmt{
+			Table:            $5.(*ast.TableName),
+			IfNotExists:      $4.(bool),
+			TemporaryKeyword: $2.(ast.TemporaryKeyword),
+			Options:          []*ast.TableOption{},
+			Select:           sel,
+		}
+	}
+|	"CREATE" OptTemporary "TABLE" IfNotExists TableName SetOprStmtWithLimitOrderBy
+	{
+		// CREATE TABLE t (SELECT ...) ORDER BY/LIMIT, or a set operation with
+		// a parenthesized first operand, again with no AS keyword. A leading
+		// plain SELECT still parses through CreateTableSelectOpt because the
+		// empty TableElementListOpt reduction outranks shifting `selectKwd`.
+		$$ = &ast.CreateTableStmt{
+			Table:            $5.(*ast.TableName),
+			IfNotExists:      $4.(bool),
+			TemporaryKeyword: $2.(ast.TemporaryKeyword),
+			Options:          []*ast.TableOption{},
+			Select:           $6.(ast.ResultSetNode),
+		}
+	}
+|	"CREATE" OptTemporary "TABLE" IfNotExists TableName SetOprStmtWoutLimitOrderBy
+	{
+		$$ = &ast.CreateTableStmt{
+			Table:            $5.(*ast.TableName),
+			IfNotExists:      $4.(bool),
+			TemporaryKeyword: $2.(ast.TemporaryKeyword),
+			Options:          []*ast.TableOption{},
+			Select:           $6.(ast.ResultSetNode),
+		}
+	}
+|	"CREATE" OptTemporary "TABLE" IfNotExists TableName TableElementListOpt CreateTableOptionListOpt PartitionOpt "START" "TRANSACTION"
+	{
+		stmt := $6.(*ast.CreateTableStmt)
+		stmt.Table = $5.(*ast.TableName)
+		stmt.IfNotExists = $4.(bool)
+		stmt.TemporaryKeyword = $2.(ast.TemporaryKeyword)
+		stmt.Options = $7.([]*ast.TableOption)
+		if $8 != nil {
+			stmt.Partition = $8.(*ast.PartitionOptions)
+		}
+		stmt.StartTransaction = true
 		$$ = stmt
 	}
 |	"CREATE" OptTemporary "TABLE" IfNotExists TableName LikeTableWithOrWithoutParen
@@ -3391,24 +3969,1045 @@ LikeTableWithOrWithoutParen:
  *          as select Col1,Col2 from table WITH LOCAL CHECK OPTION
  *******************************************************************/
 CreateViewStmt:
-	"CREATE" OrReplace ViewAlgorithm ViewDefiner ViewSQLSecurity "VIEW" ViewName ViewFieldList "AS" CreateViewSelectOpt ViewCheckOption
+	"CREATE" OrReplace ViewAlgorithm ViewDefiner ViewSQLSecurity "VIEW" IfNotExists ViewName ViewFieldList "AS" CreateViewSelectOpt ViewCheckOption
 	{
 		startOffset := parser.startOffset(&yyS[yypt-1])
 		endOffset := parser.yylval.offset
-		selStmt := $10.(ast.StmtNode)
+		selStmt := $11.(ast.StmtNode)
 		x := &ast.CreateViewStmt{
-			OrReplace: $2.(bool),
-			ViewName:  $7.(*ast.TableName),
-			Select:    selStmt,
-			Algorithm: $3.(ast.ViewAlgorithm),
-			Definer:   $4.(*auth.UserIdentity),
-			Security:  $5.(ast.ViewSecurity),
+			OrReplace:   $2.(bool),
+			IfNotExists: $7.(bool),
+			ViewName:    $8.(*ast.TableName),
+			Select:      selStmt,
+			Algorithm:   $3.(ast.ViewAlgorithm),
+			Definer:     $4.(*auth.UserIdentity),
+			Security:    $5.(ast.ViewSecurity),
 		}
+		if $9 != nil {
+			x.Cols = $9.([]ast.CIStr)
+		}
+		if $12 != nil {
+			x.CheckOption = $12.(ast.ViewCheckOption)
+			endOffset = parser.startOffset(&yyS[yypt])
+		} else {
+			x.CheckOption = ast.CheckOptionCascaded
+		}
+		parser.setNodeText(selStmt, strings.TrimSpace(parser.src[startOffset:endOffset]))
+		$$ = x
+	}
+
+/*******************************************************************
+ *
+ *  Create JSON Duality View Statement
+ *
+ *  Example:
+ *      CREATE JSON RELATIONAL DUALITY VIEW dv AS
+ *          SELECT JSON_DUALITY_OBJECT(WITH (INSERT, UPDATE, DELETE) '_id' : t.id) FROM t
+ *******************************************************************/
+CreateJSONDualityViewStmt:
+	"CREATE" OrReplace ViewAlgorithm ViewDefiner ViewSQLSecurity "JSON" RelationalOpt "DUALITY" "VIEW" IfNotExists ViewName "AS" CreateViewSelectOpt
+	{
+		startOffset := parser.startOffset(&yyS[yypt])
+		endOffset := parser.yylval.offset
+		selStmt := $13.(ast.StmtNode)
+		x := &ast.CreateJSONDualityViewStmt{
+			OrReplace:   $2.(bool),
+			Algorithm:   $3.(ast.ViewAlgorithm),
+			Definer:     $4.(*auth.UserIdentity),
+			Security:    $5.(ast.ViewSecurity),
+			Relational:  $7.(bool),
+			IfNotExists: $10.(bool),
+			ViewName:    $11.(*ast.TableName),
+			Select:      selStmt,
+		}
+		parser.setNodeText(selStmt, strings.TrimSpace(parser.src[startOffset:endOffset]))
+		$$ = x
+	}
+
+RelationalOpt:
+	/* EMPTY */
+	{
+		$$ = false
+	}
+|	"RELATIONAL"
+	{
+		$$ = true
+	}
+
+DualityWithOpt:
+	/* EMPTY */
+	{
+		$$ = []string(nil)
+	}
+|	"WITH" '(' DualityOpList ')'
+	{
+		$$ = $3
+	}
+
+DualityOpList:
+	DualityOp
+	{
+		$$ = []string{$1}
+	}
+|	DualityOpList ',' DualityOp
+	{
+		$$ = append($1.([]string), $3)
+	}
+
+DualityOp:
+	"INSERT"
+	{
+		$$ = "INSERT"
+	}
+|	"UPDATE"
+	{
+		$$ = "UPDATE"
+	}
+|	"DELETE"
+	{
+		$$ = "DELETE"
+	}
+
+DualityKeyValueList:
+	DualityKeyValue
+	{
+		$$ = []*ast.JSONDualityObjectPair{$1.(*ast.JSONDualityObjectPair)}
+	}
+|	DualityKeyValueList ',' DualityKeyValue
+	{
+		$$ = append($1.([]*ast.JSONDualityObjectPair), $3.(*ast.JSONDualityObjectPair))
+	}
+
+DualityKeyValue:
+	stringLit ':' Expression
+	{
+		$$ = &ast.JSONDualityObjectPair{Key: $1, Value: $3}
+	}
+
+// RoutineCreatePrefix shares the exact shape of the CREATE VIEW prefix so
+// the grammar stays LALR(1); OR REPLACE, ALGORITHM and SQL SECURITY are not
+// meaningful for routines and are discarded.
+RoutineCreatePrefix:
+	"CREATE" OrReplace ViewAlgorithm ViewDefiner ViewSQLSecurity
+	{
+		$$ = $4
+	}
+
+CreateProcedureStmt:
+	RoutineCreatePrefix "PROCEDURE" IfNotExists TableName '(' ProcParamListOpt ')' RoutineOptListOpt RoutineBodyTail
+	{
+		x := &ast.CreateProcedureStmt{
+			IfNotExists: $3.(bool),
+			Definer:     $1.(*auth.UserIdentity),
+			Name:        $4.(*ast.TableName),
+			Params:      $6.([]*ast.RoutineParam),
+			Options:     $8.([]*ast.RoutineOption),
+		}
+		if s, ok := $9.(string); ok {
+			x.BodyStr = s
+			x.HasBodyStr = true
+		} else {
+			x.Body = $9.(ast.StmtNode)
+		}
+		$$ = x
+	}
+
+CreateFunctionStmt:
+	RoutineCreatePrefix "FUNCTION" IfNotExists TableName '(' FuncParamListOpt ')' "RETURNS" TypeWithCollate RoutineOptListOpt RoutineBodyTail
+	{
+		x := &ast.CreateFunctionStmt{
+			IfNotExists: $3.(bool),
+			Definer:     $1.(*auth.UserIdentity),
+			Name:        $4.(*ast.TableName),
+			Params:      $6.([]*ast.RoutineParam),
+			ReturnType:  $9.(*types.FieldType),
+			Options:     $10.([]*ast.RoutineOption),
+		}
+		if s, ok := $11.(string); ok {
+			x.BodyStr = s
+			x.HasBodyStr = true
+		} else {
+			x.Body = $11.(ast.StmtNode)
+		}
+		$$ = x
+	}
+|	RoutineCreatePrefix "FUNCTION" IfNotExists TableName "RETURNS" UDFReturnTypeKwd "SONAME" stringLit
+	{
+		// The loadable (UDF) function form has no parameter list.
+		$$ = &ast.CreateLoadableFunctionStmt{
+			IfNotExists: $3.(bool),
+			Name:        $4.(*ast.TableName),
+			ReturnType:  $6.(string),
+			Soname:      $8,
+		}
+	}
+|	RoutineCreatePrefix "AGGREGATE" "FUNCTION" IfNotExists TableName "RETURNS" UDFReturnTypeKwd "SONAME" stringLit
+	{
+		$$ = &ast.CreateLoadableFunctionStmt{
+			IfNotExists: $4.(bool),
+			Aggregate:   true,
+			Name:        $5.(*ast.TableName),
+			ReturnType:  $7.(string),
+			Soname:      $9,
+		}
+	}
+
+UDFReturnTypeKwd:
+	"STRING"
+	{
+		$$ = "STRING"
+	}
+|	"INT"
+	{
+		$$ = "INTEGER"
+	}
+|	"INTEGER"
+	{
+		$$ = "INTEGER"
+	}
+|	"REAL"
+	{
+		$$ = "REAL"
+	}
+|	"DECIMAL"
+	{
+		$$ = "DECIMAL"
+	}
+
+ProcParamListOpt:
+	/* EMPTY */
+	{
+		$$ = []*ast.RoutineParam(nil)
+	}
+|	ProcParamList
+
+ProcParamList:
+	ProcParam
+	{
+		$$ = []*ast.RoutineParam{$1.(*ast.RoutineParam)}
+	}
+|	ProcParamList ',' ProcParam
+	{
+		$$ = append($1.([]*ast.RoutineParam), $3.(*ast.RoutineParam))
+	}
+
+ProcParam:
+	ProcParamDirection Identifier TypeWithCollate
+	{
+		$$ = &ast.RoutineParam{
+			Name:      ast.NewCIStr($2),
+			Direction: $1.(ast.RoutineParamDirection),
+			Type:      $3.(*types.FieldType),
+		}
+	}
+
+ProcParamDirection:
+	/* EMPTY */
+	{
+		$$ = ast.RoutineParamIn
+	}
+|	"IN"
+	{
+		$$ = ast.RoutineParamIn
+	}
+|	"OUT"
+	{
+		$$ = ast.RoutineParamOut
+	}
+|	"INOUT"
+	{
+		$$ = ast.RoutineParamInOut
+	}
+
+FuncParamListOpt:
+	/* EMPTY */
+	{
+		$$ = []*ast.RoutineParam(nil)
+	}
+|	FuncParamList
+
+FuncParamList:
+	FuncParam
+	{
+		$$ = []*ast.RoutineParam{$1.(*ast.RoutineParam)}
+	}
+|	FuncParamList ',' FuncParam
+	{
+		$$ = append($1.([]*ast.RoutineParam), $3.(*ast.RoutineParam))
+	}
+
+FuncParam:
+	Identifier TypeWithCollate
+	{
+		$$ = &ast.RoutineParam{Name: ast.NewCIStr($1), Type: $2.(*types.FieldType)}
+	}
+
+// TypeWithCollate is a field type with the optional trailing COLLATE
+// routine parameters, RETURNS clauses and DECLARE statements allow (in
+// column definitions the collation is a column option instead).
+TypeWithCollate:
+	Type
+|	Type "COLLATE" CollationName
+	{
+		ft := $1.(*types.FieldType)
+		ft.SetCollate($3)
+		$$ = ft
+	}
+
+RoutineOptListOpt:
+	/* EMPTY */
+	{
+		$$ = []*ast.RoutineOption(nil)
+	}
+|	RoutineOptListOpt RoutineOptItem
+	{
+		$$ = append($1.([]*ast.RoutineOption), $2.(*ast.RoutineOption))
+	}
+
+RoutineOptItem:
+	"COMMENT" stringLit
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionComment, StrValue: $2}
+	}
+|	"LANGUAGE" "SQL"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionLanguageSQL}
+	}
+|	"LANGUAGE" Identifier
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionLanguage, StrValue: strings.ToUpper($2)}
+	}
+|	"NOT" "DETERMINISTIC"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionNotDeterministic}
+	}
+|	"DETERMINISTIC"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionDeterministic}
+	}
+|	"CONTAINS" "SQL"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionContainsSQL}
+	}
+|	"NO" "SQL"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionNoSQL}
+	}
+|	"READS" "SQL" "DATA"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionReadsSQLData}
+	}
+|	"MODIFIES" "SQL" "DATA"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionModifiesSQLData}
+	}
+|	"SQL" "SECURITY" "DEFINER"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionSecurityDefiner}
+	}
+|	"SQL" "SECURITY" "INVOKER"
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionSecurityInvoker}
+	}
+|	"DROP" "COMMENT"
+	{
+		// ALTER routine only; accepted uniformly for grammar simplicity.
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionDropComment}
+	}
+|	"USING" '(' RoutineLibListOpt ')'
+	{
+		$$ = &ast.RoutineOption{Tp: ast.RoutineOptionUsing, Libraries: $3.([]*ast.RoutineLibrary)}
+	}
+
+RoutineLibListOpt:
+	/* EMPTY */
+	{
+		$$ = []*ast.RoutineLibrary{}
+	}
+|	RoutineLibList
+
+RoutineLibList:
+	RoutineLib
+	{
+		$$ = []*ast.RoutineLibrary{$1.(*ast.RoutineLibrary)}
+	}
+|	RoutineLibList ',' RoutineLib
+	{
+		$$ = append($1.([]*ast.RoutineLibrary), $3.(*ast.RoutineLibrary))
+	}
+
+RoutineLib:
+	TableName
+	{
+		$$ = &ast.RoutineLibrary{Name: $1.(*ast.TableName)}
+	}
+|	TableName "AS" Identifier
+	{
+		$$ = &ast.RoutineLibrary{Name: $1.(*ast.TableName), Alias: ast.NewCIStr($3)}
+	}
+|	TableName Identifier
+	{
+		// The AS is optional, as in table aliases.
+		$$ = &ast.RoutineLibrary{Name: $1.(*ast.TableName), Alias: ast.NewCIStr($2)}
+	}
+
+RoutineBodyTail:
+	ProcedureBodyStmt
+	{
+		$$ = $1
+	}
+|	"AS" stringLit
+	{
+		// External language routine body: AS 'code' or AS $$code$$.
+		$$ = $2
+	}
+
+CreateTriggerStmt:
+	RoutineCreatePrefix "TRIGGER" IfNotExists TableName TriggerTimeKwd TriggerEventKwd "ON" TableName "FOR" "EACH" "ROW" TriggerOrderOpt ProcedureBodyStmt
+	{
+		x := &ast.CreateTriggerStmt{
+			IfNotExists: $3.(bool),
+			Definer:     $1.(*auth.UserIdentity),
+			Name:        $4.(*ast.TableName),
+			Time:        $5.(ast.TriggerTime),
+			Event:       $6.(ast.TriggerEvent),
+			Table:       $8.(*ast.TableName),
+			Body:        $13,
+		}
+		if $12 != nil {
+			order := $12.(*ast.CreateTriggerStmt)
+			x.Order = order.Order
+			x.OtherTrigger = order.OtherTrigger
+		}
+		$$ = x
+	}
+
+TriggerTimeKwd:
+	"BEFORE"
+	{
+		$$ = ast.TriggerTimeBefore
+	}
+|	"AFTER"
+	{
+		$$ = ast.TriggerTimeAfter
+	}
+
+TriggerEventKwd:
+	"INSERT"
+	{
+		$$ = ast.TriggerEventInsert
+	}
+|	"UPDATE"
+	{
+		$$ = ast.TriggerEventUpdate
+	}
+|	"DELETE"
+	{
+		$$ = ast.TriggerEventDelete
+	}
+
+TriggerOrderOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"FOLLOWS" Identifier
+	{
+		$$ = &ast.CreateTriggerStmt{Order: ast.TriggerOrderFollows, OtherTrigger: ast.NewCIStr($2)}
+	}
+|	"PRECEDES" Identifier
+	{
+		$$ = &ast.CreateTriggerStmt{Order: ast.TriggerOrderPrecedes, OtherTrigger: ast.NewCIStr($2)}
+	}
+
+CreateEventStmt:
+	RoutineCreatePrefix "EVENT" IfNotExists TableName "ON" "SCHEDULE" EventScheduleClause OnCompletionOpt EventStatusOpt EventCommentOpt "DO" ProcedureBodyStmt
+	{
+		x := &ast.CreateEventStmt{
+			IfNotExists: $3.(bool),
+			Definer:     $1.(*auth.UserIdentity),
+			Name:        $4.(*ast.TableName),
+			Schedule:    $7.(*ast.EventSchedule),
+			Completion:  $8.(ast.EventCompletion),
+			Status:      $9.(ast.EventStatus),
+			Body:        $12,
+		}
+		if $10 != nil {
+			x.HasComment = true
+			x.Comment = $10.(string)
+		}
+		$$ = x
+	}
+
+EventScheduleClause:
+	"AT" Expression
+	{
+		$$ = &ast.EventSchedule{At: $2}
+	}
+|	"EVERY" Expression TimeUnit EventStartsOpt EventEndsOpt
+	{
+		sched := &ast.EventSchedule{Every: $2, Unit: $3.(ast.TimeUnitType)}
+		if $4 != nil {
+			sched.Starts = $4.(ast.ExprNode)
+		}
+		if $5 != nil {
+			sched.Ends = $5.(ast.ExprNode)
+		}
+		$$ = sched
+	}
+
+EventStartsOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"STARTS" Expression
+	{
+		$$ = $2
+	}
+
+EventEndsOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"ENDS" Expression
+	{
+		$$ = $2
+	}
+
+OnCompletionOpt:
+	/* EMPTY */
+	{
+		$$ = ast.EventCompletionDefault
+	}
+|	"ON" "COMPLETION" "PRESERVE"
+	{
+		$$ = ast.EventCompletionPreserve
+	}
+|	"ON" "COMPLETION" "NOT" "PRESERVE"
+	{
+		$$ = ast.EventCompletionNotPreserve
+	}
+
+EventStatusOpt:
+	/* EMPTY */
+	{
+		$$ = ast.EventStatusDefault
+	}
+|	"ENABLE"
+	{
+		$$ = ast.EventStatusEnable
+	}
+|	"DISABLE"
+	{
+		$$ = ast.EventStatusDisable
+	}
+|	"DISABLE" "ON" "SLAVE"
+	{
+		$$ = ast.EventStatusDisableOnReplica
+	}
+|	"DISABLE" "ON" "REPLICA"
+	{
+		$$ = ast.EventStatusDisableOnReplica
+	}
+
+EventCommentOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"COMMENT" stringLit
+	{
+		$$ = $2
+	}
+
+AlterProcedureStmt:
+	"ALTER" "PROCEDURE" TableName RoutineOptListOpt
+	{
+		$$ = &ast.AlterProcedureStmt{Name: $3.(*ast.TableName), Options: $4.([]*ast.RoutineOption)}
+	}
+
+AlterFunctionStmt:
+	"ALTER" "FUNCTION" TableName RoutineOptListOpt
+	{
+		$$ = &ast.AlterFunctionStmt{Name: $3.(*ast.TableName), Options: $4.([]*ast.RoutineOption)}
+	}
+
+AlterEventStmt:
+	"ALTER" ViewAlgorithm ViewDefiner ViewSQLSecurity "EVENT" TableName AlterEventSchedComplOpt EventRenameOpt EventStatusOpt EventCommentOpt EventDoOpt
+	{
+		x := $7.(*ast.AlterEventStmt)
+		x.Definer = $3.(*auth.UserIdentity)
+		x.Name = $6.(*ast.TableName)
+		x.Status = $9.(ast.EventStatus)
 		if $8 != nil {
-			x.Cols = $8.([]ast.CIStr)
+			x.RenameTo = $8.(*ast.TableName)
+		}
+		if $10 != nil {
+			x.HasComment = true
+			x.Comment = $10.(string)
 		}
 		if $11 != nil {
-			x.CheckOption = $11.(ast.ViewCheckOption)
+			x.Body = $11.(ast.StmtNode)
+		}
+		$$ = x
+	}
+
+// ON SCHEDULE and ON COMPLETION are folded into one clause so both can
+// begin with ON without an LALR(1) conflict.
+AlterEventSchedComplOpt:
+	/* EMPTY */
+	{
+		$$ = &ast.AlterEventStmt{Completion: ast.EventCompletionDefault}
+	}
+|	"ON" "SCHEDULE" EventScheduleClause OnCompletionOpt
+	{
+		$$ = &ast.AlterEventStmt{Schedule: $3.(*ast.EventSchedule), Completion: $4.(ast.EventCompletion)}
+	}
+|	"ON" "COMPLETION" "PRESERVE"
+	{
+		$$ = &ast.AlterEventStmt{Completion: ast.EventCompletionPreserve}
+	}
+|	"ON" "COMPLETION" "NOT" "PRESERVE"
+	{
+		$$ = &ast.AlterEventStmt{Completion: ast.EventCompletionNotPreserve}
+	}
+
+EventRenameOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"RENAME" "TO" TableName
+	{
+		$$ = $3
+	}
+
+EventDoOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"DO" ProcedureBodyStmt
+	{
+		$$ = $2
+	}
+
+DropRoutineStmt:
+	"DROP" "PROCEDURE" IfExists TableName
+	{
+		$$ = &ast.DropRoutineStmt{Tp: ast.RoutineTypeProcedure, IfExists: $3.(bool), Name: $4.(*ast.TableName)}
+	}
+|	"DROP" "FUNCTION" IfExists TableName
+	{
+		$$ = &ast.DropRoutineStmt{Tp: ast.RoutineTypeFunction, IfExists: $3.(bool), Name: $4.(*ast.TableName)}
+	}
+|	"DROP" "TRIGGER" IfExists TableName
+	{
+		$$ = &ast.DropRoutineStmt{Tp: ast.RoutineTypeTrigger, IfExists: $3.(bool), Name: $4.(*ast.TableName)}
+	}
+|	"DROP" "EVENT" IfExists TableName
+	{
+		$$ = &ast.DropRoutineStmt{Tp: ast.RoutineTypeEvent, IfExists: $3.(bool), Name: $4.(*ast.TableName)}
+	}
+
+/*
+ * The compound statement language of stored program bodies.
+ * See https://dev.mysql.com/doc/refman/8.4/en/sql-compound-statements.html
+ */
+ProcedureBodyStmt:
+	SimpleStatement
+|	StartTransactionStmt
+|	BeginEndStmt
+|	ProcLabeledStmt
+|	ProcIfStmt
+|	ProcCaseStmt
+|	ProcWhileStmt
+|	ProcRepeatStmt
+|	ProcLoopStmt
+|	DeclareStmt
+|	ProcFlowStmt
+
+ProcStmtListOpt:
+	/* EMPTY */
+	{
+		$$ = []ast.StmtNode(nil)
+	}
+|	ProcStmtListNonEmpty
+
+ProcStmtListNonEmpty:
+	ProcedureBodyStmt ';'
+	{
+		$$ = []ast.StmtNode{$1}
+	}
+|	ProcStmtListNonEmpty ProcedureBodyStmt ';'
+	{
+		$$ = append($1.([]ast.StmtNode), $2)
+	}
+
+BeginEndStmt:
+	"BEGIN" ProcStmtListOpt "END"
+	{
+		$$ = &ast.BeginEndStmt{Stmts: $2.([]ast.StmtNode)}
+	}
+
+ProcWhileStmt:
+	"WHILE" Expression "DO" ProcStmtListNonEmpty "END" "WHILE"
+	{
+		$$ = &ast.WhileStmt{Cond: $2, Stmts: $4.([]ast.StmtNode)}
+	}
+
+ProcRepeatStmt:
+	"REPEAT" ProcStmtListNonEmpty "UNTIL" Expression "END" "REPEAT"
+	{
+		$$ = &ast.RepeatStmt{Stmts: $2.([]ast.StmtNode), Until: $4}
+	}
+
+ProcLoopStmt:
+	"LOOP" ProcStmtListNonEmpty "END" "LOOP"
+	{
+		$$ = &ast.LoopStmt{Stmts: $2.([]ast.StmtNode)}
+	}
+
+// Labels use the raw identifier token: like label_keyword in MySQL, none of
+// the keywords that can begin a body statement may label one.
+ProcLabeledStmt:
+	LabelIdent ':' "BEGIN" ProcStmtListOpt "END" EndLabelOpt
+	{
+		$$ = &ast.BeginEndStmt{Label: ast.NewCIStr($1), Stmts: $4.([]ast.StmtNode), HasEndLabel: $6 != ""}
+	}
+|	LabelIdent ':' "WHILE" Expression "DO" ProcStmtListNonEmpty "END" "WHILE" EndLabelOpt
+	{
+		$$ = &ast.WhileStmt{Label: ast.NewCIStr($1), Cond: $4, Stmts: $6.([]ast.StmtNode), HasEndLabel: $9 != ""}
+	}
+|	LabelIdent ':' "REPEAT" ProcStmtListNonEmpty "UNTIL" Expression "END" "REPEAT" EndLabelOpt
+	{
+		$$ = &ast.RepeatStmt{Label: ast.NewCIStr($1), Stmts: $4.([]ast.StmtNode), Until: $6, HasEndLabel: $9 != ""}
+	}
+|	LabelIdent ':' "LOOP" ProcStmtListNonEmpty "END" "LOOP" EndLabelOpt
+	{
+		$$ = &ast.LoopStmt{Label: ast.NewCIStr($1), Stmts: $4.([]ast.StmtNode), HasEndLabel: $7 != ""}
+	}
+
+EndLabelOpt:
+	/* EMPTY */
+	{
+		$$ = ""
+	}
+|	LabelIdent
+
+ProcIfStmt:
+	"IF" ProcIfTail "END" "IF"
+	{
+		$$ = $2.(*ast.ProcIfStmt)
+	}
+
+ProcIfTail:
+	Expression "THEN" ProcStmtListOpt ProcIfElseTail
+	{
+		tail := $4.(*ast.ProcIfStmt)
+		branches := append([]*ast.ProcIfBranch{{Cond: $1, Stmts: $3.([]ast.StmtNode)}}, tail.Branches...)
+		$$ = &ast.ProcIfStmt{Branches: branches, Else: tail.Else}
+	}
+
+ProcIfElseTail:
+	/* EMPTY */
+	{
+		$$ = &ast.ProcIfStmt{}
+	}
+|	"ELSE" ProcStmtListNonEmpty
+	{
+		$$ = &ast.ProcIfStmt{Else: $2.([]ast.StmtNode)}
+	}
+|	"ELSEIF" ProcIfTail
+	{
+		$$ = $2
+	}
+
+ProcCaseStmt:
+	"CASE" ProcCaseExprOpt ProcCaseWhenList ProcCaseElseOpt "END" "CASE"
+	{
+		x := &ast.ProcCaseStmt{WhenClauses: $3.([]*ast.ProcWhenClause)}
+		if $2 != nil {
+			x.Expr = $2.(ast.ExprNode)
+		}
+		if $4 != nil {
+			x.Else = $4.([]ast.StmtNode)
+		}
+		$$ = x
+	}
+
+ProcCaseExprOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	Expression
+	{
+		$$ = $1
+	}
+
+ProcCaseWhenList:
+	ProcCaseWhen
+	{
+		$$ = []*ast.ProcWhenClause{$1.(*ast.ProcWhenClause)}
+	}
+|	ProcCaseWhenList ProcCaseWhen
+	{
+		$$ = append($1.([]*ast.ProcWhenClause), $2.(*ast.ProcWhenClause))
+	}
+
+ProcCaseWhen:
+	"WHEN" Expression "THEN" ProcStmtListNonEmpty
+	{
+		$$ = &ast.ProcWhenClause{Expr: $2, Stmts: $4.([]ast.StmtNode)}
+	}
+
+ProcCaseElseOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"ELSE" ProcStmtListNonEmpty
+	{
+		$$ = $2
+	}
+
+DeclareStmt:
+	"DECLARE" DeclareIdentList TypeWithCollate DeclareDefaultOpt
+	{
+		x := &ast.DeclareVarStmt{Names: $2.([]ast.CIStr), Type: $3.(*types.FieldType)}
+		if $4 != nil {
+			x.Default = $4.(ast.ExprNode)
+		}
+		$$ = x
+	}
+|	"DECLARE" Identifier "CURSOR" "FOR" CreateViewSelectOpt
+	{
+		$$ = &ast.DeclareCursorStmt{Name: ast.NewCIStr($2), Select: $5.(ast.StmtNode)}
+	}
+|	"DECLARE" Identifier "CONDITION" "FOR" ConditionBasic
+	{
+		$$ = &ast.DeclareConditionStmt{Name: ast.NewCIStr($2), Condition: $5.(*ast.HandlerCondition)}
+	}
+|	"DECLARE" HandlerActionKwd "HANDLER" "FOR" HandlerConditionList ProcedureBodyStmt
+	{
+		$$ = &ast.DeclareHandlerStmt{
+			Action:     $2.(ast.HandlerAction),
+			Conditions: $5.([]*ast.HandlerCondition),
+			Handler:    $6,
+		}
+	}
+
+DeclareIdentList:
+	Identifier
+	{
+		$$ = []ast.CIStr{ast.NewCIStr($1)}
+	}
+|	DeclareIdentList ',' Identifier
+	{
+		$$ = append($1.([]ast.CIStr), ast.NewCIStr($3))
+	}
+
+DeclareDefaultOpt:
+	/* EMPTY */
+	{
+		$$ = nil
+	}
+|	"DEFAULT" Expression
+	{
+		$$ = $2
+	}
+
+HandlerActionKwd:
+	"CONTINUE"
+	{
+		$$ = ast.HandlerActionContinue
+	}
+|	"EXIT"
+	{
+		$$ = ast.HandlerActionExit
+	}
+|	"UNDO"
+	{
+		$$ = ast.HandlerActionUndo
+	}
+
+HandlerConditionList:
+	HandlerConditionItem
+	{
+		$$ = []*ast.HandlerCondition{$1.(*ast.HandlerCondition)}
+	}
+|	HandlerConditionList ',' HandlerConditionItem
+	{
+		$$ = append($1.([]*ast.HandlerCondition), $3.(*ast.HandlerCondition))
+	}
+
+HandlerConditionItem:
+	ConditionBasic
+|	Identifier
+	{
+		$$ = &ast.HandlerCondition{Tp: ast.HandlerConditionName, Name: ast.NewCIStr($1)}
+	}
+|	"SQLWARNING"
+	{
+		$$ = &ast.HandlerCondition{Tp: ast.HandlerConditionSQLWarning}
+	}
+|	"NOT" "FOUND"
+	{
+		$$ = &ast.HandlerCondition{Tp: ast.HandlerConditionNotFound}
+	}
+|	"SQLEXCEPTION"
+	{
+		$$ = &ast.HandlerCondition{Tp: ast.HandlerConditionSQLException}
+	}
+
+ConditionBasic:
+	NUM
+	{
+		$$ = &ast.HandlerCondition{Tp: ast.HandlerConditionErrorCode, Code: getUint64FromNUM($1)}
+	}
+|	"SQLSTATE" stringLit
+	{
+		$$ = &ast.HandlerCondition{Tp: ast.HandlerConditionSQLState, State: $2}
+	}
+|	"SQLSTATE" "VALUE" stringLit
+	{
+		$$ = &ast.HandlerCondition{Tp: ast.HandlerConditionSQLState, State: $3}
+	}
+
+ProcFlowStmt:
+	"RETURN" Expression
+	{
+		$$ = &ast.ReturnStmt{Expr: $2}
+	}
+|	"LEAVE" Identifier
+	{
+		$$ = &ast.LeaveStmt{Label: ast.NewCIStr($2)}
+	}
+|	"ITERATE" Identifier
+	{
+		$$ = &ast.IterateStmt{Label: ast.NewCIStr($2)}
+	}
+|	"OPEN" Identifier
+	{
+		$$ = &ast.OpenCursorStmt{Name: ast.NewCIStr($2)}
+	}
+|	"CLOSE" Identifier
+	{
+		$$ = &ast.CloseCursorStmt{Name: ast.NewCIStr($2)}
+	}
+|	"FETCH" Identifier "INTO" FetchVarList
+	{
+		$$ = &ast.FetchCursorStmt{Name: ast.NewCIStr($2), Vars: $4.([]ast.ExprNode)}
+	}
+|	"FETCH" "FROM" Identifier "INTO" FetchVarList
+	{
+		$$ = &ast.FetchCursorStmt{Name: ast.NewCIStr($3), Vars: $5.([]ast.ExprNode)}
+	}
+|	"FETCH" "NEXT" "FROM" Identifier "INTO" FetchVarList
+	{
+		$$ = &ast.FetchCursorStmt{Name: ast.NewCIStr($4), Vars: $6.([]ast.ExprNode)}
+	}
+
+FetchVarList:
+	FetchVar
+	{
+		$$ = []ast.ExprNode{$1.(ast.ExprNode)}
+	}
+|	FetchVarList ',' FetchVar
+	{
+		$$ = append($1.([]ast.ExprNode), $3.(ast.ExprNode))
+	}
+
+FetchVar:
+	Identifier
+	{
+		$$ = &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($1)}}
+	}
+|	UserVariable
+	{
+		$$ = $1
+	}
+
+SignalStmt:
+	"SIGNAL" SignalConditionValue SignalSetOpt
+	{
+		$$ = &ast.SignalStmt{Condition: $2.(*ast.SignalCondition), Items: $3.([]*ast.SignalItem)}
+	}
+
+ResignalStmt:
+	"RESIGNAL" SignalSetOpt
+	{
+		$$ = &ast.ResignalStmt{Items: $2.([]*ast.SignalItem)}
+	}
+|	"RESIGNAL" SignalConditionValue SignalSetOpt
+	{
+		$$ = &ast.ResignalStmt{Condition: $2.(*ast.SignalCondition), Items: $3.([]*ast.SignalItem)}
+	}
+
+SignalConditionValue:
+	"SQLSTATE" stringLit
+	{
+		$$ = &ast.SignalCondition{IsSQLState: true, State: $2}
+	}
+|	"SQLSTATE" "VALUE" stringLit
+	{
+		$$ = &ast.SignalCondition{IsSQLState: true, State: $3}
+	}
+|	Identifier
+	{
+		$$ = &ast.SignalCondition{Name: ast.NewCIStr($1)}
+	}
+
+SignalSetOpt:
+	/* EMPTY */
+	{
+		$$ = []*ast.SignalItem(nil)
+	}
+|	"SET" SignalItems
+	{
+		$$ = $2
+	}
+
+SignalItems:
+	SignalItemEntry
+	{
+		$$ = []*ast.SignalItem{$1.(*ast.SignalItem)}
+	}
+|	SignalItems ',' SignalItemEntry
+	{
+		$$ = append($1.([]*ast.SignalItem), $3.(*ast.SignalItem))
+	}
+
+SignalItemEntry:
+	Identifier eq Expression
+	{
+		// Condition information item names (MESSAGE_TEXT, MYSQL_ERRNO, ...)
+		// are ordinary identifiers, like in GET DIAGNOSTICS.
+		$$ = &ast.SignalItem{Name: strings.ToUpper($1), Value: $3}
+	}
+
+/* See https://dev.mysql.com/doc/refman/8.4/en/alter-view.html */
+AlterViewStmt:
+	"ALTER" ViewAlgorithm ViewDefiner ViewSQLSecurity "VIEW" ViewName ViewFieldList "AS" CreateViewSelectOpt ViewCheckOption
+	{
+		startOffset := parser.startOffset(&yyS[yypt-1])
+		endOffset := parser.yylval.offset
+		selStmt := $9.(ast.StmtNode)
+		x := &ast.AlterViewStmt{
+			ViewName:  $6.(*ast.TableName),
+			Select:    selStmt,
+			Algorithm: $2.(ast.ViewAlgorithm),
+			Definer:   $3.(*auth.UserIdentity),
+			Security:  $4.(ast.ViewSecurity),
+		}
+		if $7 != nil {
+			x.Cols = $7.([]ast.CIStr)
+		}
+		if $10 != nil {
+			x.CheckOption = $10.(ast.ViewCheckOption)
 			endOffset = parser.startOffset(&yyS[yypt])
 		} else {
 			x.CheckOption = ast.CheckOptionCascaded
@@ -3501,6 +5100,10 @@ ViewCheckOption:
 	{
 		$$ = ast.CheckOptionCascaded
 	}
+|	"WITH" "CHECK" "OPTION"
+	{
+		$$ = ast.CheckOptionCascaded
+	}
 |	"WITH" "LOCAL" "CHECK" "OPTION"
 	{
 		$$ = ast.CheckOptionLocal
@@ -3511,11 +5114,43 @@ ViewCheckOption:
  * See https://dev.mysql.com/doc/refman/5.7/en/do.html
  ******************************************************************/
 DoStmt:
-	"DO" ExpressionList
+	"DO" DoExpressionList
 	{
 		$$ = &ast.DoStmt{
 			Exprs: $2.([]ast.ExprNode),
 		}
+	}
+
+DoExpressionList:
+	DoExpression
+	{
+		$$ = []ast.ExprNode{$1}
+	}
+|	DoExpressionList ',' DoExpression
+	{
+		$$ = append($1.([]ast.ExprNode), $3)
+	}
+
+DoExpression:
+	Expression DoAliasOpt
+	{
+		// MySQL parses DO through the SELECT item list, so aliases are
+		// accepted; they have no effect and are dropped.
+		$$ = $1
+	}
+
+DoAliasOpt:
+	{
+		$$ = ""
+	}
+|	Identifier
+|	"AS" Identifier
+	{
+		$$ = $2
+	}
+|	"AS" stringLit
+	{
+		$$ = $2
 	}
 
 /*******************************************************************
@@ -3806,10 +5441,98 @@ ExplainStmt:
 			Analyze: true,
 		}
 	}
+|	ExplainSym "ANALYZE" "FORMAT" "=" stringLit ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:    $6,
+			Format:  $5,
+			Analyze: true,
+		}
+	}
+|	ExplainSym "FORMAT" "=" ExplainFormatType "INTO" singleAtIdentifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:    $7,
+			Format:  $4,
+			IntoVar: "@" + $6,
+		}
+	}
+|	ExplainSym "FORMAT" "=" stringLit "INTO" singleAtIdentifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:    $7,
+			Format:  $4,
+			IntoVar: "@" + $6,
+		}
+	}
+|	ExplainSym "ANALYZE" "FORMAT" "=" ExplainFormatType "INTO" singleAtIdentifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:    $8,
+			Format:  $5,
+			Analyze: true,
+			IntoVar: "@" + $7,
+		}
+	}
+|	ExplainSym "ANALYZE" "FORMAT" "=" stringLit "INTO" singleAtIdentifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:    $8,
+			Format:  $5,
+			Analyze: true,
+			IntoVar: "@" + $7,
+		}
+	}
+|	ExplainSym "FOR" ExplainForDB Identifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:      $5,
+			Format:    "row",
+			ForSchema: $4,
+		}
+	}
+|	ExplainSym "FORMAT" "=" ExplainFormatType "FOR" ExplainForDB Identifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:      $8,
+			Format:    $4,
+			ForSchema: $7,
+		}
+	}
+|	ExplainSym "FORMAT" "=" stringLit "FOR" ExplainForDB Identifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:      $8,
+			Format:    $4,
+			ForSchema: $7,
+		}
+	}
+|	ExplainSym "FORMAT" "=" ExplainFormatType "INTO" singleAtIdentifier "FOR" ExplainForDB Identifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:      $10,
+			Format:    $4,
+			IntoVar:   "@" + $6,
+			ForSchema: $9,
+		}
+	}
+|	ExplainSym "FORMAT" "=" stringLit "INTO" singleAtIdentifier "FOR" ExplainForDB Identifier ExplainableStmt
+	{
+		$$ = &ast.ExplainStmt{
+			Stmt:      $10,
+			Format:    $4,
+			IntoVar:   "@" + $6,
+			ForSchema: $9,
+		}
+	}
 
 ExplainFormatType:
 	"TRADITIONAL"
 |	"JSON"
+|	"TREE"
+
+ExplainForDB:
+	"DATABASE"
 
 SavepointStmt:
 	"SAVEPOINT" Identifier
@@ -3852,18 +5575,7 @@ NUM:
 	intLit
 
 Expression:
-	singleAtIdentifier assignmentEq Expression %prec assignmentEq
-	{
-		v := $1
-		v = strings.TrimPrefix(v, "@")
-		$$ = &ast.VariableExpr{
-			Name:     v,
-			IsGlobal: false,
-			IsSystem: false,
-			Value:    $3,
-		}
-	}
-|	Expression logOr Expression %prec pipes
+	Expression logOr Expression %prec pipes
 	{
 		$$ = &ast.BinaryOperationExpr{Op: opcode.LogicOr, L: $1, R: $3}
 	}
@@ -3883,14 +5595,6 @@ Expression:
 			$$ = $2
 		} else {
 			$$ = &ast.UnaryOperationExpr{Op: opcode.Not, V: $2}
-		}
-	}
-|	"MATCH" '(' ColumnNameList ')' "AGAINST" '(' BitExpr FulltextSearchModifierOpt ')'
-	{
-		$$ = &ast.MatchAgainst{
-			ColumnNames: $3.([]*ast.ColumnName),
-			Against:     $7,
-			Modifier:    ast.FulltextSearchModifier($8.(int)),
 		}
 	}
 |	BoolPri IsOrNotOp trueKwd %prec is
@@ -3946,7 +5650,9 @@ logAnd:
 |	"AND"
 
 ExpressionList:
-	Expression
+	// Lowest precedence so that a ',' following the first element is always
+	// shifted: INTERVAL(a, b) is the function, not a row expression.
+	Expression %prec empty
 	{
 		$$ = []ast.ExprNode{$1}
 	}
@@ -3998,18 +5704,6 @@ BoolPri:
 		sq := $4.(*ast.SubqueryExpr)
 		sq.MultiRows = true
 		$$ = &ast.CompareSubqueryExpr{Op: $2.(opcode.Op), L: $1, R: sq, All: $3.(bool)}
-	}
-|	BoolPri CompareOp singleAtIdentifier assignmentEq PredicateExpr %prec assignmentEq
-	{
-		v := $3
-		v = strings.TrimPrefix(v, "@")
-		variable := &ast.VariableExpr{
-			Name:     v,
-			IsGlobal: false,
-			IsSystem: false,
-			Value:    $5,
-		}
-		$$ = &ast.BinaryOperationExpr{Op: $2.(opcode.Op), L: $1, R: variable}
 	}
 |	PredicateExpr
 
@@ -4136,9 +5830,12 @@ PredicateExpr:
 		escapeSpec := $4.(*likeEscapeSpec)
 		escape := escapeSpec.escape
 		explicit := escapeSpec.explicit
-		if len(escape) > 1 {
-			yylex.AppendError(ErrWrongArguments.GenByArgs("ESCAPE"))
-			return 1
+		escapeExpr := escapeSpec.expr
+		if escapeExpr == nil && len(escape) > 1 {
+			// Multi-byte escape characters are kept as an expression; MySQL
+			// validates the one-character requirement at execution time.
+			escapeExpr = ast.NewValueExpr(escape, parser.charset, parser.collation)
+			escape = ""
 		}
 		// When ESCAPE empty string is specified, escape is empty and explicit is true.
 		// This means no escape character should be used (Escape = 0).
@@ -4151,18 +5848,36 @@ PredicateExpr:
 			Pattern:        $3,
 			Not:            !$2.(bool),
 			Escape:         escapeChar,
+			EscapeExpr:     escapeExpr,
 			EscapeExplicit: explicit,
 		}
 	}
-|	BitExpr RegexpOrNotOp SimpleExpr
+|	BitExpr RegexpOrNotOp BitExpr
 	{
+		// The pattern is a full bit_expr, unlike LIKE's, which is a
+		// simple_expr: `'a' REGEXP 'a' + 'b'` is valid, `'a' LIKE 'a' + 'b'`
+		// is not.
 		$$ = &ast.PatternRegexpExpr{Expr: $1, Pattern: $3, Not: !$2.(bool)}
 	}
 |	BitExpr memberof '(' SimpleExpr ')'
 	{
 		$$ = &ast.FuncCallExpr{FnName: ast.NewCIStr(ast.JSONMemberOf), Args: []ast.ExprNode{$1, $4}}
 	}
-|	BitExpr
+|	BitExpr "MEMBER" '(' SimpleExpr ')'
+	{
+		// OF is optional: `x MEMBER (doc)` means `x MEMBER OF (doc)`.
+		// MySQL likewise prefers this reading over treating MEMBER as an
+		// alias, so a trailing bare MEMBER is a syntax error there too.
+		$$ = &ast.FuncCallExpr{FnName: ast.NewCIStr(ast.JSONMemberOf), Args: []ast.ExprNode{$1, $4}}
+	}
+|	BitExpr "SOUNDS" "LIKE" BitExpr
+	{
+		// MySQL defines `a SOUNDS LIKE b` as `SOUNDEX(a) = SOUNDEX(b)`.
+		l := &ast.FuncCallExpr{FnName: ast.NewCIStr("soundex"), Args: []ast.ExprNode{$1}}
+		r := &ast.FuncCallExpr{FnName: ast.NewCIStr("soundex"), Args: []ast.ExprNode{$4}}
+		$$ = &ast.BinaryOperationExpr{Op: opcode.EQ, L: l, R: r}
+	}
+|	BitExpr %prec empty
 
 RegexpSym:
 	"REGEXP"
@@ -4173,9 +5888,21 @@ LikeEscapeOpt:
 	{
 		$$ = &likeEscapeSpec{escape: "\\", explicit: false}
 	}
-|	"ESCAPE" stringLit
+|	"ESCAPE" SimpleExpr
 	{
-		$$ = &likeEscapeSpec{escape: $2, explicit: true}
+		// MySQL accepts any simple expression here and validates the
+		// one-character requirement at execution time.
+		spec := &likeEscapeSpec{explicit: true}
+		if ve, ok := $2.(*ast.ValueExpr); ok {
+			if s, isStr := ve.GetValue().(string); isStr {
+				spec.escape = s
+			} else {
+				spec.expr = $2
+			}
+		} else {
+			spec.expr = $2
+		}
+		$$ = spec
 	}
 
 Field:
@@ -4218,6 +5945,15 @@ FieldAsName:
 	{
 		$$ = $2
 	}
+|	"CURRENT_ROLE"
+	{
+		// MySQL allows CURRENT_ROLE as a column alias.
+		$$ = "CURRENT_ROLE"
+	}
+|	"AS" "CURRENT_ROLE"
+	{
+		$$ = "CURRENT_ROLE"
+	}
 
 FieldList:
 	Field
@@ -4256,6 +5992,36 @@ GroupByClause:
 	"GROUP" "BY" ByList WithRollupClause
 	{
 		$$ = &ast.GroupByClause{Items: $3.([]*ast.ByItem), Rollup: $4.(bool)}
+	}
+|	"GROUP" "BY" "ROLLUP" '(' ByList ')'
+	{
+		// GROUP BY ROLLUP(...) is the function-style spelling of
+		// GROUP BY ... WITH ROLLUP; the restored form uses WITH ROLLUP.
+		$$ = &ast.GroupByClause{Items: $5.([]*ast.ByItem), Rollup: true}
+	}
+|	"GROUP" "BY" "GROUPING" "SETS" '(' GroupingSetList ')'
+	{
+		$$ = &ast.GroupByClause{GroupingSets: $6.([][]ast.ExprNode)}
+	}
+
+GroupingSetList:
+	GroupingSet
+	{
+		$$ = [][]ast.ExprNode{$1.([]ast.ExprNode)}
+	}
+|	GroupingSetList ',' GroupingSet
+	{
+		$$ = append($1.([][]ast.ExprNode), $3.([]ast.ExprNode))
+	}
+
+GroupingSet:
+	'(' ')'
+	{
+		$$ = []ast.ExprNode{}
+	}
+|	'(' ExpressionList ')'
+	{
+		$$ = $2
 	}
 
 HavingClause:
@@ -4331,6 +6097,8 @@ IndexOptionList:
 				opt1.ParserName = opt2.ParserName
 			} else if opt2.Visibility != ast.IndexVisibilityDefault {
 				opt1.Visibility = opt2.Visibility
+			} else if len(opt2.EngineAttr) > 0 {
+				opt1.EngineAttr = opt2.EngineAttr
 			} else if len(opt2.SecondaryEngineAttr) > 0 {
 				opt1.SecondaryEngineAttr = opt2.SecondaryEngineAttr
 			}
@@ -4368,6 +6136,10 @@ IndexOption:
 		$$ = &ast.IndexOption{
 			Visibility: $1.(ast.IndexVisibility),
 		}
+	}
+|	"ENGINE_ATTRIBUTE" EqOpt stringLit
+	{
+		$$ = &ast.IndexOption{EngineAttr: $3}
 	}
 |	"SECONDARY_ENGINE_ATTRIBUTE" EqOpt stringLit
 	{
@@ -4434,28 +6206,86 @@ Identifier:
 |	UnReservedKeyword
 |	NotKeywordToken
 
+// LabelIdent is Identifier minus the keywords that cannot open a label.
+LabelIdent:
+	identifier
+|	LabelKeyword
+|	NotKeywordToken
+
 UnReservedKeyword:
+	LabelKeyword
+|	NonLabelKeyword
+
+// NonLabelKeyword holds the unreserved keywords that may not be used as a
+// compound-statement label. Most of them open a statement, so accepting
+// them would make the label rule ambiguous -- MySQL excludes the same set.
+NonLabelKeyword:
+	"ASCII"
+|	"BEGIN"
+|	"BYTE"
+|	"CACHE"
+|	"CHARSET"
+|	"CLONE"
+|	"COMMIT"
+|	"DEALLOCATE"
+|	"DO"
+|	"END"
+|	"FILE"
+|	"FLUSH"
+|	"HANDLER"
+|	"INSTALL"
+|	"PREPARE"
+|	"PROXY"
+|	"RESOURCE"
+|	"ROLLBACK"
+|	"SIGNED"
+|	"START"
+|	"TRUNCATE"
+|	"COMMENT"
+|	"CHECKSUM"
+|	"NO"
+|	"NONE"
+|	"SUPER"
+|	"PROCESS"
+|	"SAVEPOINT"
+|	"REPLICATION"
+|	"RESET"
+|	"SLAVE"
+|	"RELOAD"
+|	"EVENT"
+|	"REPAIR"
+|	"IMPORT"
+|	"CONTAINS"
+|	"FOLLOWS"
+|	"PRECEDES"
+|	"HELP"
+|	"UNICODE"
+|	"LANGUAGE"
+|	"STOP"
+|	"UNINSTALL"
+|	"XA"
+
+LabelKeyword:
 	"ACTION"
-|	"ASCII"
 |	"ATTRIBUTE"
 |	"AUTO_INCREMENT"
 |	"AFTER"
 |	"ALWAYS"
 |	"AVG"
-|	"BEGIN"
+|	"BACKUP"
 |	"BIT"
 |	"BOOL"
 |	"BOOLEAN"
 |	"BTREE"
 |	"BUCKETS"
-|	"BYTE"
 |	"CHAIN"
-|	"CHARSET"
+|	"CHANGED"
+|	"CLOSE"
 |	"COLUMNS"
 |	"CONFIG"
 |	"SAN"
-|	"COMMIT"
 |	"COMPACT"
+|	"COMPONENT"
 |	"COMPRESSED"
 |	"CONSISTENT"
 |	"CURRENT"
@@ -4463,16 +6293,18 @@ UnReservedKeyword:
 |	"DATE" %prec lowerThanStringLitToken
 |	"DATETIME"
 |	"DAY"
-|	"DEALLOCATE"
-|	"DO"
+|	"DEFAULT_AUTH"
+|	"DUMPFILE"
 |	"DUPLICATE"
 |	"DYNAMIC"
 |	"ENCRYPTION"
-|	"END"
 |	"ENFORCED"
 |	"ENGINE"
 |	"ENGINES"
 |	"ENGINE_ATTRIBUTE"
+|	"FILTER"
+|	"GTIDS"
+|	"IO_THREAD"
 |	"SECONDARY_ENGINE_ATTRIBUTE"
 |	"ENUM"
 |	"ERROR"
@@ -4481,44 +6313,49 @@ UnReservedKeyword:
 |	"EXECUTE"
 |	"EXPLORE"
 |	"EXTENDED"
+|	"FAST"
 |	"FIELDS"
-|	"FILE"
 |	"FIRST"
 |	"FIXED"
-|	"FLUSH"
 |	"FOLLOWING"
 |	"FORMAT"
 |	"FULL"
 |	"GENERAL"
 |	"GLOBAL"
+|	"GROUP_REPLICATION"
 |	"HASH"
+|	"HOST"
 |	"HOUR"
 |	"INSERT_METHOD"
 |	"LESS"
 |	"LOCAL"
 |	"LAST"
+|	"LEAVES"
+|	"MEDIUM"
 |	"NAMES"
 |	"NVARCHAR"
 |	"OFFSET"
+|	"OPTIONS"
+|	"OWNER"
 |	"PACK_KEYS"
 |	"PARSER"
 |	"PASSWORD" %prec lowerThanEq
-|	"PREPARE"
-|	"PROXY"
+|	"PERSIST"
+|	"PERSIST_ONLY"
+|	"PLUGIN"
+|	"PLUGIN_DIR"
+|	"PORT"
+|	"PREV"
 |	"QUICK"
 |	"REBUILD"
 |	"REDUNDANT"
 |	"REORGANIZE"
-|	"RESOURCE"
 |	"RESTART"
 |	"ROLE"
-|	"ROLLBACK"
 |	"ROLLUP"
 |	"SESSION"
-|	"SIGNED"
 |	"SHUTDOWN"
 |	"SNAPSHOT"
-|	"START"
 |	"STATUS"
 |	"OPEN"
 |	"POINT"
@@ -4531,7 +6368,6 @@ UnReservedKeyword:
 |	"TIME" %prec lowerThanStringLitToken
 |	"TIMESTAMP" %prec lowerThanStringLitToken
 |	"TRANSACTION"
-|	"TRUNCATE"
 |	"UNBOUNDED"
 |	"UNKNOWN"
 |	"VALUE" %prec lowerThanValueKeyword
@@ -4540,15 +6376,16 @@ UnReservedKeyword:
 |	"MODE"
 |	"WEEK"
 |	"WEIGHT_STRING"
+|	"RETURNING"
+|	"GEOMCOLLECTION"
+|	"JSON_VALUE"
 |	"ANY"
 |	"SOME"
 |	"USER"
 |	"IDENTIFIED"
 |	"COLLATION"
-|	"COMMENT"
 |	"AVG_ROW_LENGTH"
 |	"CONNECTION"
-|	"CHECKSUM"
 |	"COMPRESSION"
 |	"KEY_BLOCK_SIZE"
 |	"MASTER"
@@ -4572,6 +6409,7 @@ UnReservedKeyword:
 |	"SERIALIZABLE"
 |	"LEVEL"
 |	"VARIABLES"
+|	"VECTOR"
 |	"SQL_CACHE"
 |	"INDEXES"
 |	"PROCESSLIST"
@@ -4580,22 +6418,20 @@ UnReservedKeyword:
 |	"ENABLE"
 |	"REVERSE"
 |	"PRIVILEGES"
-|	"NO"
 |	"BINLOG"
 |	"FUNCTION"
 |	"VIEW"
 |	"MODIFY"
 |	"EVENTS"
 |	"PARTITIONS"
-|	"NONE"
 |	"NULLS"
-|	"SUPER"
+|	"SQL_THREAD"
 |	"STATS_PERSISTENT"
 |	"STATS_AUTO_RECALC"
 |	"ROW_COUNT"
 |	"COALESCE"
+|	"CODE"
 |	"MONTH"
-|	"PROCESS"
 |	"PROFILE"
 |	"PROFILES"
 |	"MICROSECOND"
@@ -4603,7 +6439,6 @@ UnReservedKeyword:
 |	"PLUGINS"
 |	"PRECEDING"
 |	"QUERY"
-|	"SAVEPOINT"
 |	"SECOND"
 |	"SEPARATOR"
 |	"SHARE"
@@ -4612,13 +6447,9 @@ UnReservedKeyword:
 |	"MAX_QUERIES_PER_HOUR"
 |	"MAX_UPDATES_PER_HOUR"
 |	"MAX_USER_CONNECTIONS"
-|	"REPLICATION"
 |	"CLIENT"
-|	"SLAVE"
-|	"RELOAD"
 |	"TEMPORARY"
 |	"ROUTINE"
-|	"EVENT"
 |	"ALGORITHM"
 |	"DEFINER"
 |	"INVOKER"
@@ -4647,6 +6478,7 @@ UnReservedKeyword:
 |	"SWAPS"
 |	"SOURCE"
 |	"TRADITIONAL"
+|	"TREE"
 |	"SQL_BUFFER_RESULT"
 |	"DIRECTORY"
 |	"HISTOGRAM"
@@ -4654,12 +6486,14 @@ UnReservedKeyword:
 |	"LIST"
 |	"NODEGROUP"
 |	"PARTIAL"
+|	"PARSE_TREE"
 |	"SIMPLE"
 |	"REMOVE"
 |	"PARTITIONING"
 |	"STORAGE"
 |	"DISK"
 |	"STATS_SAMPLE_PAGES"
+|	"SECONDARY"
 |	"SECONDARY_ENGINE"
 |	"SECONDARY_LOAD"
 |	"SECONDARY_UNLOAD"
@@ -4668,19 +6502,45 @@ UnReservedKeyword:
 |	"RTREE"
 |	"EXCHANGE"
 |	"COLUMN_FORMAT"
-|	"REPAIR"
-|	"IMPORT"
 |	"DISCARD"
 |	"OLD"
 |	"RETAIN"
-|	"UNICODE"
+|	"SERVER"
+|	"SOCKET"
+|	"SONAME"
+|	"RELAYLOG"
+|	"DUALITY"
+|	"RELATIONAL"
+|	"RETURNS"
+|	"SCHEDULE"
+|	"COMPLETION"
+|	"PRESERVE"
+|	"STARTS"
+|	"ENDS"
+|	"EVERY"
+|	"STRING"
+|	"AGGREGATE"
+|	"CONCURRENT"
+|	"NESTED"
+|	"ORDINALITY"
+|	"PATH"
+|	"AT"
+|	"GROUPING"
+|	"SETS"
+|	"ZONE"
+|	"CONDITION"
+|	"DIAGNOSTICS"
+|	"GET"
+|	"MUTEX"
+|	"STACKED"
+|	"XML"
 |	"SQL_TSI_DAY"
 |	"SQL_TSI_HOUR"
 |	"SQL_TSI_MINUTE"
 |	"SQL_TSI_MONTH"
 |	"SQL_TSI_QUARTER"
 |	"SQL_TSI_SECOND"
-|	"LANGUAGE"
+|	"LIBRARY"
 |	"SQL_TSI_WEEK"
 |	"SQL_TSI_YEAR"
 |	"INVISIBLE"
@@ -4688,7 +6548,20 @@ UnReservedKeyword:
 |	"TYPE"
 |	"NOWAIT"
 |	"INSTANCE"
+|	"ADMIN"
+|	"AUTHENTICATION"
+|	"CHALLENGE_RESPONSE"
+|	"FACTOR"
+|	"FINISH"
+|	"INITIAL"
+|	"INITIATE"
+|	"OPTIONAL"
+|	"RANDOM"
+|	"REGISTRATION"
+|	"UNREGISTER"
+|	"UNTIL"
 |	"REPLICA"
+|	"REPLICAS"
 |	"LOGS"
 |	"HOSTS"
 |	"AGAINST"
@@ -4711,6 +6584,44 @@ UnReservedKeyword:
 |	"MULTIPOLYGON"
 |	"POLYGON"
 |	"SRID"
+|	"ACTIVE"
+|	"AUTO"
+|	"CHANNEL"
+|	"DATAFILE"
+|	"DEFINITION"
+|	"DESCRIPTION"
+|	"EXPORT"
+|	"EXTENT_SIZE"
+|	"FILE_BLOCK_SIZE"
+|	"INACTIVE"
+|	"INITIAL_SIZE"
+|	"KEYRING"
+|	"LOGFILE"
+|	"MANUAL"
+|	"MAX_SIZE"
+|	"MIGRATE"
+|	"NAME"
+|	"ONE"
+|	"ORGANIZATION"
+|	"PHASE"
+|	"RECOVER"
+|	"REDO_BUFFER_SIZE"
+|	"NO_WAIT"
+|	"REFERENCE"
+|	"RELAY"
+|	"RESUME"
+|	"ROTATE"
+|	"SUSPEND"
+|	"THREAD_PRIORITY"
+|	"UNDOFILE"
+|	"UNDO_BUFFER_SIZE"
+|	"UPGRADE"
+|	"USE_FRM"
+|	"USER_RESOURCES"
+|	"VCPU"
+|	"WORK"
+|	"WRAPPER"
+|	"XID"
 
 NotKeywordToken:
 	"ADDDATE"
@@ -4739,7 +6650,7 @@ CallStmt:
 	}
 
 ProcedureCall:
-	identifier
+	Identifier
 	{
 		$$ = &ast.FuncCallExpr{
 			Tp:     ast.FuncCallExprTypeGeneric,
@@ -4756,7 +6667,7 @@ ProcedureCall:
 			Args:   []ast.ExprNode{},
 		}
 	}
-|	identifier '(' ExpressionListOpt ')'
+|	Identifier '(' ExpressionListOpt ')'
 	{
 		$$ = &ast.FuncCallExpr{
 			Tp:     ast.FuncCallExprTypeGeneric,
@@ -5279,7 +7190,7 @@ BitExpr:
 	{
 		$$ = &ast.BinaryOperationExpr{Op: opcode.Xor, L: $1, R: $3}
 	}
-|	SimpleExpr
+|	SimpleExpr %prec assignmentEq
 
 SimpleIdent:
 	Identifier
@@ -5309,6 +7220,59 @@ SimpleExpr:
 |	FunctionCallKeyword
 |	FunctionCallNonKeyword
 |	FunctionCallGeneric
+|	singleAtIdentifier assignmentEq BitExpr %prec assignmentEq
+	{
+		// @var := val is a simple expression in MySQL (sql_yacc.yy
+		// variable_aux), usable as any operand: SELECT (@a:=1)+@b:=2.
+		// The assigned value is a BitExpr rather than a full Expression:
+		// an unrestricted right side would make every expression chain
+		// reduction conflict with the in-progress assignment. Arithmetic
+		// still binds greedily (@a:=1+2 assigns 3); comparison and logical
+		// operators bind outside the assignment.
+		v := $1
+		v = strings.TrimPrefix(v, "@")
+		$$ = &ast.VariableExpr{
+			Name:     v,
+			IsGlobal: false,
+			IsSystem: false,
+			Value:    $3,
+		}
+	}
+|	"MATCH" '(' ColumnNameList ')' "AGAINST" '(' BitExpr FulltextSearchModifierOpt ')'
+	{
+		$$ = &ast.MatchAgainst{
+			ColumnNames: $3.([]*ast.ColumnName),
+			Against:     $7,
+			Modifier:    ast.FulltextSearchModifier($8.(int)),
+		}
+	}
+|	"MATCH" ColumnNameList "AGAINST" '(' BitExpr FulltextSearchModifierOpt ')'
+	{
+		// MySQL also accepts the MATCH column list without parentheses.
+		$$ = &ast.MatchAgainst{
+			ColumnNames: $2.([]*ast.ColumnName),
+			Against:     $5,
+			Modifier:    ast.FulltextSearchModifier($6.(int)),
+		}
+	}
+|	jsonValue '(' Expression ',' Expression JsonValueReturningOpt JsonValueOnEmptyOrErrorOpt ')'
+	{
+		x := &ast.JSONValueExpr{
+			Doc:  $3,
+			Path: $5,
+		}
+		if $6 != nil {
+			r := $6.(*jsonValueReturningHolder)
+			x.ReturningType = r.tp
+			x.ReturningExplicitCharset = r.explicitCharset
+		}
+		if $7 != nil {
+			h := $7.(*jsonValueOnHolder)
+			x.OnEmpty = h.onEmpty
+			x.OnError = h.onError
+		}
+		$$ = x
+	}
 |	SimpleExpr "COLLATE" CollationName
 	{
 		$$ = &ast.SetCollationExpr{Expr: $1, Collate: $3}
@@ -5405,6 +7369,33 @@ SimpleExpr:
 			Expr:         $2,
 			Tp:           tp,
 			FunctionType: ast.CastBinaryOperator,
+		}
+	}
+|	builtinCast '(' Expression "AT" "TIME" "ZONE" stringLit "AS" CastType ArrayKwdOpt ')'
+	{
+		/* CAST(expr AT TIME ZONE 'tz' AS DATETIME): datetime with time zone conversion. */
+		tp := $9.(*types.FieldType)
+		defaultFlen, defaultDecimal := mysql.GetDefaultFieldLengthAndDecimalForCast(tp.GetType())
+		if tp.GetFlen() == types.UnspecifiedLength {
+			tp.SetFlen(defaultFlen)
+		}
+		if tp.GetDecimal() == types.UnspecifiedLength {
+			tp.SetDecimal(defaultDecimal)
+		}
+		isArray := $10.(bool)
+		tp.SetArray(isArray)
+		explicitCharset := parser.explicitCharset
+		if isArray && !explicitCharset && tp.GetCharset() != charset.CharsetBin {
+			tp.SetCharset(charset.CharsetUTF8MB4)
+			tp.SetCollate(charset.CollationUTF8MB4)
+		}
+		parser.explicitCharset = false
+		$$ = &ast.FuncCastExpr{
+			Expr:            $3,
+			Tp:              tp,
+			FunctionType:    ast.CastFunction,
+			ExplicitCharSet: explicitCharset,
+			AtTimeZone:      $7,
 		}
 	}
 |	builtinCast '(' Expression "AS" CastType ArrayKwdOpt ')'
@@ -5566,7 +7557,7 @@ FunctionNameConflict:
 // FunctionNameConflictNonNow is split out so that BuiltinFunction (the
 // DEFAULT-expression grammar) can accept keyword-named functions without
 // swallowing NOW(), which DefaultValueExpr folds to CURRENT_TIMESTAMP via
-// NowSymOptionFractionParentheses.
+// NowSymOptionFraction.
 FunctionNameConflictNonNow:
 	"ASCII"
 |	"CHARSET"
@@ -5576,9 +7567,10 @@ FunctionNameConflictNonNow:
 |	"DATABASE"
 |	"DAY"
 |	"GEOMETRYCOLLECTION"
+|	"GEOMCOLLECTION"
+|	"GROUPING"
 |	"HOUR"
 |	"IF"
-|	"INTERVAL"
 |	"LINESTRING"
 |	"LOG"
 |	"FORMAT"
@@ -5628,6 +7620,16 @@ FunctionCallKeyword:
 	FunctionNameConflict '(' ExpressionListOpt ')'
 	{
 		$$ = &ast.FuncCallExpr{FnName: ast.NewCIStr($1), Args: $3.([]ast.ExprNode)}
+	}
+|	"INTERVAL" '(' Expression ',' ExpressionList ')'
+	{
+		// INTERVAL() takes two or more arguments. With a single
+		// parenthesised argument the token instead starts a temporal
+		// interval, as in `d - INTERVAL (n) DAY_MICROSECOND`.
+		$$ = &ast.FuncCallExpr{
+			FnName: ast.NewCIStr("INTERVAL"),
+			Args:   append([]ast.ExprNode{$3}, $5.([]ast.ExprNode)...),
+		}
 	}
 |	builtinUser '(' ExpressionListOpt ')'
 	{
@@ -5699,6 +7701,10 @@ FunctionCallNonKeyword:
 	builtinCurTime '(' FuncDatetimePrecListOpt ')'
 	{
 		$$ = &ast.FuncCallExpr{FnName: ast.NewCIStr($1), Args: $3.([]ast.ExprNode)}
+	}
+|	builtinJSONDualityObject '(' DualityWithOpt DualityKeyValueList ')'
+	{
+		$$ = &ast.JSONDualityObjectExpr{With: $3.([]string), Pairs: $4.([]*ast.JSONDualityObjectPair)}
 	}
 |	builtinSysDate '(' FuncDatetimePrecListOpt ')'
 	{
@@ -5851,6 +7857,14 @@ FunctionCallNonKeyword:
 		$$ = &ast.FuncCallExpr{
 			FnName: ast.NewCIStr($1),
 			Args:   []ast.ExprNode{$3, ast.NewValueExpr("BINARY", parser.charset, parser.collation), ast.NewValueExpr($6, parser.charset, parser.collation)},
+		}
+	}
+|	weightString '(' Expression ',' Expression ',' Expression ',' Expression ')'
+	{
+		// Undocumented debug form: WEIGHT_STRING(str, retlen, maxlen, flags).
+		$$ = &ast.FuncCallExpr{
+			FnName: ast.NewCIStr($1),
+			Args:   []ast.ExprNode{$3, $5, $7, $9},
 		}
 	}
 |	builtinTranslate '(' Expression ',' Expression ',' Expression ')'
@@ -6021,6 +8035,14 @@ SumExpr:
 			$$ = &ast.AggregateFuncExpr{F: $1, Args: []ast.ExprNode{$4}, Distinct: $3.(bool)}
 		}
 	}
+|	builtinStCollect '(' BuggyDefaultFalseDistinctOpt Expression ')' OptWindowingClause
+	{
+		if $6 != nil {
+			$$ = &ast.WindowFuncExpr{Name: $1, Args: []ast.ExprNode{$4}, Distinct: $3.(bool), Spec: *($6.(*ast.WindowSpec))}
+		} else {
+			$$ = &ast.AggregateFuncExpr{F: $1, Args: []ast.ExprNode{$4}, Distinct: $3.(bool)}
+		}
+	}
 |	builtinMin '(' BuggyDefaultFalseDistinctOpt Expression ')' OptWindowingClause
 	{
 		if $6 != nil {
@@ -6077,6 +8099,17 @@ SumExpr:
 			$$ = &ast.AggregateFuncExpr{F: $1, Args: []ast.ExprNode{$3}}
 		}
 	}
+|	"JSON_ARRAYAGG" '(' Expression "NULL" "ON" "NULL" ')' OptWindowingClause
+	{
+		// NULL ON NULL spells out the default null handling; the AST is
+		// identical to the bare form. (ABSENT ON NULL is rejected by the
+		// MySQL grammar with ER_NOT_SUPPORTED_YET, not implemented here.)
+		if $8 != nil {
+			$$ = &ast.WindowFuncExpr{Name: $1, Args: []ast.ExprNode{$3}, Spec: *($8.(*ast.WindowSpec))}
+		} else {
+			$$ = &ast.AggregateFuncExpr{F: $1, Args: []ast.ExprNode{$3}}
+		}
+	}
 |	"JSON_ARRAYAGG" '(' "ALL" Expression ')' OptWindowingClause
 	{
 		if $6 != nil {
@@ -6128,14 +8161,14 @@ OptGConcatSeparator:
 	}
 
 FunctionCallGeneric:
-	identifier '(' ExpressionListOpt ')'
+	identifier '(' UDFExpressionListOpt ')'
 	{
 		$$ = &ast.FuncCallExpr{
 			FnName: ast.NewCIStr($1),
 			Args:   $3.([]ast.ExprNode),
 		}
 	}
-|	Identifier '.' Identifier '(' ExpressionListOpt ')'
+|	Identifier '.' Identifier '(' UDFExpressionListOpt ')'
 	{
 		var tp ast.FuncCallExprType
 		if isInTokenMap($3) {
@@ -6149,6 +8182,38 @@ FunctionCallGeneric:
 			FnName: ast.NewCIStr($3),
 			Args:   $5.([]ast.ExprNode),
 		}
+	}
+
+UDFExpressionListOpt:
+	/* EMPTY */
+	{
+		$$ = []ast.ExprNode{}
+	}
+|	UDFExpressionList
+
+UDFExpressionList:
+	UDFExpression
+	{
+		$$ = []ast.ExprNode{$1}
+	}
+|	UDFExpressionList ',' UDFExpression
+	{
+		$$ = append($1.([]ast.ExprNode), $3)
+	}
+
+// UDFExpression is a function call argument with MySQL's optional UDF
+// attribute alias (udf_expr: expr [[AS] ident]). The server accepts the
+// alias syntactically for any function and rejects non-UDF uses at
+// resolution time, so accepting it here is faithful.
+UDFExpression:
+	Expression
+|	Expression "AS" Identifier
+	{
+		$$ = &ast.FuncCallArgAliasExpr{Expr: $1, AsName: ast.NewCIStr($3)}
+	}
+|	Expression Identifier
+	{
+		$$ = &ast.FuncCallArgAliasExpr{Expr: $1, AsName: ast.NewCIStr($2)}
 	}
 
 FuncDatetimePrec:
@@ -6330,7 +8395,7 @@ CastType:
 		tp.AddFlag(mysql.BinaryFlag)
 		$$ = tp
 	}
-|	Char OptFieldLen OptBinary
+|	Char OptFieldLen OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeVarString)
 		tp.SetFlen($2.(int)) // TODO: Flen should be the flen of expression
@@ -6338,6 +8403,15 @@ CastType:
 		if $3.(*ast.OptBinary).IsBinary {
 			tp.AddFlag(mysql.BinaryFlag)
 			tp.SetCharset(charset.CharsetBin)
+			tp.SetCollate(charset.CollationBin)
+		} else if tp.GetCharset() == charset.CharsetBin {
+			// CHAR(n) BYTE is the binary charset: match what the BINARY
+			// cast target parses to so the restored form re-parses
+			// identically, including its flen-dependent type switch.
+			if tp.GetFlen() != types.UnspecifiedLength {
+				tp.SetType(mysql.TypeString)
+			}
+			tp.AddFlag(mysql.BinaryFlag)
 			tp.SetCollate(charset.CollationBin)
 		} else if tp.GetCharset() != "" {
 			co, err := charset.GetDefaultCollation(tp.GetCharset())
@@ -6351,6 +8425,23 @@ CastType:
 			tp.SetCharset(parser.charset)
 			tp.SetCollate(parser.collation)
 		}
+		$$ = tp
+	}
+|	NChar OptFieldLen
+	{
+		// CAST(... AS NCHAR(n)): the national character set is always
+		// utf8mb3, which the charset registry resolves via its "utf8"
+		// alias, so the restored CHAR(n) CHARSET form re-parses identically.
+		tp := types.NewFieldType(mysql.TypeVarString)
+		tp.SetFlen($2.(int))
+		tp.SetCharset(charset.CharsetUTF8)
+		co, err := charset.GetDefaultCollation(charset.CharsetUTF8)
+		if err != nil {
+			yylex.AppendError(yylex.Errorf("Get collation error for charset: %s", tp.GetCharset()))
+			return 1
+		}
+		tp.SetCollate(co)
+		parser.explicitCharset = true
 		$$ = tp
 	}
 |	"DATE"
@@ -6432,7 +8523,28 @@ CastType:
 		tp.SetCollate(mysql.DefaultCollationName)
 		$$ = tp
 	}
+|	"VECTOR" OptFieldLen
+	{
+		// CAST(expr AS VECTOR[(N)]) (MySQL 9.0+).
+		tp := types.NewFieldType(mysql.TypeVector)
+		tp.SetFlen($2.(int))
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
 |	"DOUBLE"
+	{
+		tp := types.NewFieldType(mysql.TypeDouble)
+		flen, decimal := mysql.GetDefaultFieldLengthAndDecimalForCast(mysql.TypeDouble)
+		tp.SetFlen(flen)
+		tp.SetDecimal(decimal)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"DOUBLE" "PRECISION"
 	{
 		tp := types.NewFieldType(mysql.TypeDouble)
 		flen, decimal := mysql.GetDefaultFieldLengthAndDecimalForCast(mysql.TypeDouble)
@@ -6475,6 +8587,168 @@ CastType:
 		tp.SetCharset(charset.CharsetBin)
 		tp.SetCollate(charset.CollationBin)
 		$$ = tp
+	}
+|	"GEOMETRY"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomGeometry)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"GEOMETRYCOLLECTION"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomGeometryCollection)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"GEOMCOLLECTION"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomGeometryCollection)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"LINESTRING"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomLineString)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"MULTILINESTRING"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomMultiLineString)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"MULTIPOINT"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomMultiPoint)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"MULTIPOLYGON"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomMultiPolygon)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"POINT"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomPoint)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"POLYGON"
+	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomPolygon)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+
+JsonValueReturningOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"RETURNING" CastType
+	{
+		explicit := parser.explicitCharset
+		parser.explicitCharset = false
+		$$ = &jsonValueReturningHolder{
+			tp:              $2.(*types.FieldType),
+			explicitCharset: explicit,
+		}
+	}
+
+JsonValueBehavior:
+	"NULL"
+	{
+		$$ = &ast.JSONValueOnBehavior{Tp: ast.JSONValueBehaviorNull}
+	}
+|	"ERROR"
+	{
+		$$ = &ast.JSONValueOnBehavior{Tp: ast.JSONValueBehaviorError}
+	}
+|	"DEFAULT" SignedLiteral
+	{
+		$$ = &ast.JSONValueOnBehavior{Tp: ast.JSONValueBehaviorDefault, Default: $2}
+	}
+|	"DEFAULT" "DATE" stringLit
+	{
+		expr := ast.NewValueExpr($3, "", "")
+		def := &ast.FuncCallExpr{FnName: ast.NewCIStr(ast.DateLiteral), Args: []ast.ExprNode{expr}}
+		$$ = &ast.JSONValueOnBehavior{Tp: ast.JSONValueBehaviorDefault, Default: def}
+	}
+|	"DEFAULT" "TIME" stringLit
+	{
+		expr := ast.NewValueExpr($3, "", "")
+		def := &ast.FuncCallExpr{FnName: ast.NewCIStr(ast.TimeLiteral), Args: []ast.ExprNode{expr}}
+		$$ = &ast.JSONValueOnBehavior{Tp: ast.JSONValueBehaviorDefault, Default: def}
+	}
+|	"DEFAULT" "TIMESTAMP" stringLit
+	{
+		expr := ast.NewValueExpr($3, "", "")
+		def := &ast.FuncCallExpr{FnName: ast.NewCIStr(ast.TimestampLiteral), Args: []ast.ExprNode{expr}}
+		$$ = &ast.JSONValueOnBehavior{Tp: ast.JSONValueBehaviorDefault, Default: def}
+	}
+
+// MySQL requires ON EMPTY to precede ON ERROR when both are given.
+JsonValueOnEmptyOrErrorOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	JsonValueBehavior "ON" "EMPTY"
+	{
+		$$ = &jsonValueOnHolder{onEmpty: $1.(*ast.JSONValueOnBehavior)}
+	}
+|	JsonValueBehavior "ON" "ERROR"
+	{
+		$$ = &jsonValueOnHolder{onError: $1.(*ast.JSONValueOnBehavior)}
+	}
+|	JsonValueBehavior "ON" "EMPTY" JsonValueBehavior "ON" "ERROR"
+	{
+		$$ = &jsonValueOnHolder{
+			onEmpty: $1.(*ast.JSONValueOnBehavior),
+			onError: $4.(*ast.JSONValueOnBehavior),
+		}
+	}
+
+// JSON_TABLE columns, unlike JSON_VALUE, accept the two clauses in either
+// order.
+JsonTableOnEmptyOrErrorOpt:
+	JsonValueOnEmptyOrErrorOpt
+|	JsonValueBehavior "ON" "ERROR" JsonValueBehavior "ON" "EMPTY"
+	{
+		$$ = &jsonValueOnHolder{
+			onError: $1.(*ast.JSONValueOnBehavior),
+			onEmpty: $4.(*ast.JSONValueOnBehavior),
+		}
 	}
 
 Priority:
@@ -6630,6 +8904,25 @@ UserVariableList:
 		$$ = append($1.([]ast.ExprNode), $3)
 	}
 
+IntoVarList:
+	IntoVar
+	{
+		$$ = []ast.ExprNode{$1}
+	}
+|	IntoVarList ',' IntoVar
+	{
+		$$ = append($1.([]ast.ExprNode), $3)
+	}
+
+// IntoVar is one SELECT ... INTO target: a user variable or a stored
+// program variable (a bare identifier).
+IntoVar:
+	UserVariable
+|	Identifier
+	{
+		$$ = &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($1)}}
+	}
+
 DeallocateStmt:
 	DeallocateSym "PREPARE" Identifier
 	{
@@ -6641,21 +8934,21 @@ DeallocateSym:
 |	"DROP"
 
 RollbackStmt:
-	"ROLLBACK"
+	"ROLLBACK" WorkOpt
 	{
 		$$ = &ast.RollbackStmt{}
 	}
-|	"ROLLBACK" CompletionTypeWithinTransaction
+|	"ROLLBACK" WorkOpt CompletionTypeWithinTransaction
 	{
-		$$ = &ast.RollbackStmt{CompletionType: $2.(ast.CompletionType)}
+		$$ = &ast.RollbackStmt{CompletionType: $3.(ast.CompletionType)}
 	}
-|	"ROLLBACK" "TO" Identifier
-	{
-		$$ = &ast.RollbackStmt{SavepointName: $3}
-	}
-|	"ROLLBACK" "TO" "SAVEPOINT" Identifier
+|	"ROLLBACK" WorkOpt "TO" Identifier
 	{
 		$$ = &ast.RollbackStmt{SavepointName: $4}
+	}
+|	"ROLLBACK" WorkOpt "TO" "SAVEPOINT" Identifier
+	{
+		$$ = &ast.RollbackStmt{SavepointName: $5}
 	}
 
 CompletionTypeWithinTransaction:
@@ -6731,15 +9024,31 @@ SelectStmtFromDualTable:
 			st.Where = $3.(ast.ExprNode)
 		}
 	}
+|	SelectStmtBasic IntoClause FromDual WhereClauseOptional
+	{
+		// SELECT ... INTO ... FROM DUAL: MySQL also allows the INTO clause
+		// directly after the select item list.
+		st := $1.(*ast.SelectStmt)
+		st.SelectIntoOpt = $2.(*ast.SelectIntoOption)
+		lastField := st.Fields.Fields[len(st.Fields.Fields)-1]
+		if lastField.Expr != nil && lastField.AsName.O == "" {
+			lastEnd := yyS[yypt-2].offset - 1
+			parser.setNodeText(lastField, parser.src[lastField.Offset:lastEnd])
+		}
+		if $4 != nil {
+			st.Where = $4.(ast.ExprNode)
+		}
+		$$ = st
+	}
 
 SelectStmtFromTable:
-	SelectStmtBasic "FROM" TableRefsClause WhereClauseOptional SelectStmtGroup HavingClause WindowClauseOptional
+	SelectStmtBasic "FROM" TableRefsClause WhereClauseOptional SelectStmtGroup HavingClause WindowClauseOptional QualifyClauseOptional
 	{
 		st := $1.(*ast.SelectStmt)
 		st.From = $3.(*ast.TableRefsClause)
 		lastField := st.Fields.Fields[len(st.Fields.Fields)-1]
 		if lastField.Expr != nil && lastField.AsName.O == "" {
-			lastEnd := parser.endOffset(&yyS[yypt-5])
+			lastEnd := parser.endOffset(&yyS[yypt-6])
 			parser.setNodeText(lastField, parser.src[lastField.Offset:lastEnd])
 		}
 		if $4 != nil {
@@ -6754,39 +9063,88 @@ SelectStmtFromTable:
 		if $7 != nil {
 			st.WindowSpecs = ($7.([]ast.WindowSpec))
 		}
+		if $8 != nil {
+			st.Qualify = $8.(ast.ExprNode)
+		}
+		$$ = st
+	}
+|	SelectStmtBasic IntoClause "FROM" TableRefsClause WhereClauseOptional SelectStmtGroup HavingClause WindowClauseOptional QualifyClauseOptional
+	{
+		// SELECT ... INTO ... FROM t: MySQL also allows the INTO clause
+		// directly after the select item list.
+		st := $1.(*ast.SelectStmt)
+		st.SelectIntoOpt = $2.(*ast.SelectIntoOption)
+		st.From = $4.(*ast.TableRefsClause)
+		lastField := st.Fields.Fields[len(st.Fields.Fields)-1]
+		if lastField.Expr != nil && lastField.AsName.O == "" {
+			lastEnd := parser.endOffset(&yyS[yypt-7])
+			parser.setNodeText(lastField, parser.src[lastField.Offset:lastEnd])
+		}
+		if $5 != nil {
+			st.Where = $5.(ast.ExprNode)
+		}
+		if $6 != nil {
+			st.GroupBy = $6.(*ast.GroupByClause)
+		}
+		if $7 != nil {
+			st.Having = $7.(*ast.HavingClause)
+		}
+		if $8 != nil {
+			st.WindowSpecs = ($8.([]ast.WindowSpec))
+		}
+		if $9 != nil {
+			st.Qualify = $9.(ast.ExprNode)
+		}
 		$$ = st
 	}
 
+QualifyClauseOptional:
+	{
+		$$ = nil
+	}
+|	"QUALIFY" Expression
+	{
+		$$ = $2
+	}
+
 SelectStmt:
-	SelectStmtBasic WhereClauseOptional SelectStmtGroup OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
+	SelectStmtBasic SelectLockListOpt
 	{
 		st := $1.(*ast.SelectStmt)
-		if $6 != nil {
-			st.LockInfo = $6.(*ast.SelectLockInfo)
-		}
 		if $2 != nil {
-			st.Where = $2.(ast.ExprNode)
+			st.LockInfos = $2.([]*ast.SelectLockInfo)
 		}
-		if $3 != nil {
-			st.GroupBy = $3.(*ast.GroupByClause)
-		}
+		$$ = st
+	}
+|	SelectStmtBasic "QUALIFY" Expression OrderByOptional SelectStmtLimitOpt SelectLockIntoOpt
+	{
+		// QUALIFY needs no FROM clause: SELECT 1 QUALIFY ROW_NUMBER() OVER () > 1.
+		st := $1.(*ast.SelectStmt)
+		st.Qualify = $3
 		if $4 != nil {
 			st.OrderBy = $4.(*ast.OrderByClause)
 		}
 		if $5 != nil {
 			st.Limit = $5.(*ast.Limit)
 		}
-		if $7 != nil {
-			st.SelectIntoOpt = $7.(*ast.SelectIntoOption)
+		if $6 != nil {
+			h := $6.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			st.SelectIntoOpt = h.into
 		}
 		$$ = st
 	}
-|	SelectStmtFromDualTable SelectStmtGroup OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
+|	SelectStmtBasic SelectLockList IntoClause
 	{
 		st := $1.(*ast.SelectStmt)
-		if $2 != nil {
-			st.GroupBy = $2.(*ast.GroupByClause)
-		}
+		st.LockInfos = $2.([]*ast.SelectLockInfo)
+		st.SelectIntoOpt = $3.(*ast.SelectIntoOption)
+		$$ = st
+	}
+|	SelectStmtBasic IntoClause OrderByOptional SelectStmtLimitOpt SelectLockListOpt
+	{
+		st := $1.(*ast.SelectStmt)
+		st.SelectIntoOpt = $2.(*ast.SelectIntoOption)
 		if $3 != nil {
 			st.OrderBy = $3.(*ast.OrderByClause)
 		}
@@ -6794,31 +9152,129 @@ SelectStmt:
 			st.Limit = $4.(*ast.Limit)
 		}
 		if $5 != nil {
-			st.LockInfo = $5.(*ast.SelectLockInfo)
-		}
-		if $6 != nil {
-			st.SelectIntoOpt = $6.(*ast.SelectIntoOption)
+			st.LockInfos = $5.([]*ast.SelectLockInfo)
 		}
 		$$ = st
 	}
-|	SelectStmtFromTable OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
+|	SelectStmtBasic WhereClause SelectStmtGroup HavingClause OrderByOptional SelectStmtLimitOpt SelectLockIntoOpt
 	{
 		st := $1.(*ast.SelectStmt)
-		if $4 != nil {
-			st.LockInfo = $4.(*ast.SelectLockInfo)
+		st.Where = $2.(ast.ExprNode)
+		if $3 != nil {
+			st.GroupBy = $3.(*ast.GroupByClause)
 		}
+		if $4 != nil {
+			st.Having = $4.(*ast.HavingClause)
+		}
+		if $5 != nil {
+			st.OrderBy = $5.(*ast.OrderByClause)
+		}
+		if $6 != nil {
+			st.Limit = $6.(*ast.Limit)
+		}
+		if $7 != nil {
+			h := $7.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			st.SelectIntoOpt = h.into
+		}
+		$$ = st
+	}
+|	SelectStmtBasic GroupByClause HavingClause OrderByOptional SelectStmtLimitOpt SelectLockIntoOpt
+	{
+		st := $1.(*ast.SelectStmt)
+		st.GroupBy = $2.(*ast.GroupByClause)
+		if $3 != nil {
+			st.Having = $3.(*ast.HavingClause)
+		}
+		if $4 != nil {
+			st.OrderBy = $4.(*ast.OrderByClause)
+		}
+		if $5 != nil {
+			st.Limit = $5.(*ast.Limit)
+		}
+		if $6 != nil {
+			h := $6.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			st.SelectIntoOpt = h.into
+		}
+		$$ = st
+	}
+|	SelectStmtBasic OrderBy SelectStmtLimitOpt SelectLockIntoOpt
+	{
+		st := $1.(*ast.SelectStmt)
+		st.OrderBy = $2.(*ast.OrderByClause)
+		if $3 != nil {
+			st.Limit = $3.(*ast.Limit)
+		}
+		if $4 != nil {
+			h := $4.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			st.SelectIntoOpt = h.into
+		}
+		$$ = st
+	}
+|	SelectStmtBasic SelectStmtLimit SelectLockIntoOpt
+	{
+		st := $1.(*ast.SelectStmt)
+		st.Limit = $2.(*ast.Limit)
+		if $3 != nil {
+			h := $3.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			st.SelectIntoOpt = h.into
+		}
+		$$ = st
+	}
+|	SelectStmtFromDualTable SelectStmtGroup HavingClause OrderByOptional SelectStmtLimitOpt SelectLockIntoOpt
+	{
+		st := $1.(*ast.SelectStmt)
+		if $2 != nil {
+			st.GroupBy = $2.(*ast.GroupByClause)
+		}
+		if $3 != nil {
+			st.Having = $3.(*ast.HavingClause)
+		}
+		if $4 != nil {
+			st.OrderBy = $4.(*ast.OrderByClause)
+		}
+		if $5 != nil {
+			st.Limit = $5.(*ast.Limit)
+		}
+		if $6 != nil {
+			h := $6.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			if h.into != nil {
+				if st.SelectIntoOpt != nil {
+					yylex.AppendError(yylex.Errorf("Multiple INTO clauses in one query block"))
+					return 1
+				}
+				st.SelectIntoOpt = h.into
+			}
+		}
+		$$ = st
+	}
+|	SelectStmtFromTable OrderByOptional SelectStmtLimitOpt SelectLockIntoOpt
+	{
+		st := $1.(*ast.SelectStmt)
 		if $2 != nil {
 			st.OrderBy = $2.(*ast.OrderByClause)
 		}
 		if $3 != nil {
 			st.Limit = $3.(*ast.Limit)
 		}
-		if $5 != nil {
-			st.SelectIntoOpt = $5.(*ast.SelectIntoOption)
+		if $4 != nil {
+			h := $4.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			if h.into != nil {
+				if st.SelectIntoOpt != nil {
+					yylex.AppendError(yylex.Errorf("Multiple INTO clauses in one query block"))
+					return 1
+				}
+				st.SelectIntoOpt = h.into
+			}
 		}
 		$$ = st
 	}
-|	"TABLE" TableName OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
+|	"TABLE" TableName OrderByOptional SelectStmtLimitOpt SelectLockIntoOpt
 	{
 		st := &ast.SelectStmt{
 			Kind:   ast.SelectStmtKindTable,
@@ -6833,14 +9289,13 @@ SelectStmt:
 			st.Limit = $4.(*ast.Limit)
 		}
 		if $5 != nil {
-			st.LockInfo = $5.(*ast.SelectLockInfo)
-		}
-		if $6 != nil {
-			st.SelectIntoOpt = $6.(*ast.SelectIntoOption)
+			h := $5.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			st.SelectIntoOpt = h.into
 		}
 		$$ = st
 	}
-|	"VALUES" ValuesStmtList OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
+|	"VALUES" ValuesStmtList OrderByOptional SelectStmtLimitOpt SelectLockIntoOpt
 	{
 		st := &ast.SelectStmt{
 			Kind:   ast.SelectStmtKindValues,
@@ -6854,10 +9309,9 @@ SelectStmt:
 			st.Limit = $4.(*ast.Limit)
 		}
 		if $5 != nil {
-			st.LockInfo = $5.(*ast.SelectLockInfo)
-		}
-		if $6 != nil {
-			st.SelectIntoOpt = $6.(*ast.SelectIntoOption)
+			h := $5.(*selectLockIntoHolder)
+			st.LockInfos = h.locks
+			st.SelectIntoOpt = h.into
 		}
 		$$ = st
 	}
@@ -7180,6 +9634,25 @@ OptLeadLagInfo:
 		}
 		$$ = args
 	}
+|	',' UserVariable OptLLDefault
+	{
+		// The offset may be a user variable: LAG(x, @n) OVER ().
+		args := []ast.ExprNode{$2}
+		if $3 != nil {
+			args = append(args, $3.(ast.ExprNode))
+		}
+		$$ = args
+	}
+|	',' Identifier OptLLDefault
+	{
+		// ... or a routine parameter/local: LAG(x, n) OVER ().
+		col := &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($2)}}
+		args := []ast.ExprNode{col}
+		if $3 != nil {
+			args = append(args, $3.(ast.ExprNode))
+		}
+		$$ = args
+	}
 |	',' paramMarker OptLLDefault
 	{
 		args := []ast.ExprNode{ast.NewParamMarkerExpr(yyS[yypt-1].offset)}
@@ -7274,6 +9747,11 @@ TableFactor:
 		resultNode := $1.(*ast.SubqueryExpr).Query
 		$$ = &ast.TableSource{Source: resultNode, AsName: $2.(ast.CIStr)}
 	}
+|	SubSelect TableAsName '(' IdentList ')'
+	{
+		resultNode := $1.(*ast.SubqueryExpr).Query
+		$$ = &ast.TableSource{Source: resultNode, AsName: $2.(ast.CIStr), ColumnNames: $4.([]ast.CIStr)}
+	}
 |	"LATERAL" SubSelect TableAsName IdentListWithParenOpt
 	{
 		resultNode := $2.(*ast.SubqueryExpr).Query
@@ -7286,6 +9764,79 @@ TableFactor:
 	{
 		j := $2.(*ast.Join)
 		j.ExplicitParens = true
+		$$ = $2
+	}
+|	jsonTable '(' Expression ',' JsonPathString "COLUMNS" '(' JsonTableColumnList ')' ')' TableAsNameOpt
+	{
+		jt := &ast.JSONTableExpr{
+			Doc:     $3,
+			Path:    $5,
+			Columns: $8.([]*ast.JSONTableColumn),
+		}
+		$$ = &ast.TableSource{Source: jt, AsName: $11.(ast.CIStr)}
+	}
+
+JsonTableColumnList:
+	JsonTableColumn
+	{
+		$$ = []*ast.JSONTableColumn{$1.(*ast.JSONTableColumn)}
+	}
+|	JsonTableColumnList ',' JsonTableColumn
+	{
+		$$ = append($1.([]*ast.JSONTableColumn), $3.(*ast.JSONTableColumn))
+	}
+
+JsonTableColumn:
+	Identifier "FOR" "ORDINALITY"
+	{
+		$$ = &ast.JSONTableColumn{Name: ast.NewCIStr($1), ForOrdinality: true}
+	}
+|	Identifier Type OptCollate "PATH" JsonPathString JsonTableOnEmptyOrErrorOpt
+	{
+		tp := $2.(*types.FieldType)
+		if $3 != "" {
+			// MySQL validates the collation against the column charset at
+			// execution time, not in the grammar.
+			tp.SetCollate($3)
+		}
+		col := &ast.JSONTableColumn{Name: ast.NewCIStr($1), Tp: tp, Path: $5}
+		if $6 != nil {
+			on := $6.(*jsonValueOnHolder)
+			col.OnEmpty = on.onEmpty
+			col.OnError = on.onError
+		}
+		$$ = col
+	}
+|	Identifier Type OptCollate "EXISTS" "PATH" JsonPathString JsonTableOnEmptyOrErrorOpt
+	{
+		tp := $2.(*types.FieldType)
+		if $3 != "" {
+			tp.SetCollate($3)
+		}
+		col := &ast.JSONTableColumn{Name: ast.NewCIStr($1), Tp: tp, Exists: true, Path: $6}
+		if $7 != nil {
+			on := $7.(*jsonValueOnHolder)
+			col.OnEmpty = on.onEmpty
+			col.OnError = on.onError
+		}
+		$$ = col
+	}
+|	"NESTED" JsonPathString "COLUMNS" '(' JsonTableColumnList ')'
+	{
+		$$ = &ast.JSONTableColumn{Path: $2, NestedColumns: $5.([]*ast.JSONTableColumn)}
+	}
+|	"NESTED" "PATH" JsonPathString "COLUMNS" '(' JsonTableColumnList ')'
+	{
+		$$ = &ast.JSONTableColumn{Path: $3, NestedColumns: $6.([]*ast.JSONTableColumn)}
+	}
+
+// A character-set introducer is allowed on a JSON path literal. It only
+// selects the literal's collation, which path evaluation ignores, so the
+// path text alone is kept.
+JsonPathString:
+	stringLit
+|	"UNDERSCORE_CHARSET" stringLit
+	{
 		$$ = $2
 	}
 
@@ -7423,12 +9974,20 @@ JoinTable:
 	{
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $4.(ast.ResultSetNode), NaturalJoin: true}
 	}
+|	TableRef "NATURAL" "INNER" "JOIN" TableRef
+	{
+		// NATURAL INNER JOIN is a spelling of NATURAL JOIN.
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), NaturalJoin: true}
+	}
 |	TableRef "NATURAL" JoinType OuterOpt "JOIN" TableRef
 	{
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $6.(ast.ResultSetNode), Tp: $3.(ast.JoinType), NaturalJoin: true}
 	}
-|	TableRef "STRAIGHT_JOIN" TableRef
+|	TableRef "STRAIGHT_JOIN" TableRef %prec tableRefPriority
 	{
+		// Same low priority as a plain cross join, so a following join binds
+		// tighter and its ON clause stays with it:
+		// a STRAIGHT_JOIN (b JOIN c ON ...) ON ...
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), StraightJoin: true}
 	}
 |	TableRef "STRAIGHT_JOIN" TableRef "ON" Expression
@@ -7466,7 +10025,7 @@ LimitClause:
 	}
 |	"LIMIT" LimitOption
 	{
-		$$ = &ast.Limit{Count: $2.(*ast.ValueExpr)}
+		$$ = &ast.Limit{Count: $2.(ast.ExprNode)}
 	}
 
 LimitOption:
@@ -7477,6 +10036,11 @@ LimitOption:
 |	paramMarker
 	{
 		$$ = ast.NewParamMarkerExpr(yyS[yypt].offset)
+	}
+|	Identifier
+	{
+		// A routine parameter or local variable: SELECT ... LIMIT p1, p2.
+		$$ = &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($1)}}
 	}
 
 RowOrRows:
@@ -7684,24 +10248,38 @@ SelectStmtGroup:
 	}
 |	GroupByClause
 
-SelectStmtIntoOption:
-	{
-		$$ = nil
-	}
-|	"INTO" "OUTFILE" stringLit Fields Lines
+IntoClause:
+	"INTO" "OUTFILE" stringLit CharsetOpt Fields Lines
 	{
 		x := &ast.SelectIntoOption{
 			Tp:       ast.SelectIntoOutfile,
 			FileName: $3,
 		}
-		if $4 != nil {
-			x.FieldsInfo = $4.(*ast.FieldsClause)
+		if cs := $4.(*string); cs != nil {
+			x.Charset = *cs
 		}
 		if $5 != nil {
-			x.LinesInfo = $5.(*ast.LinesClause)
+			x.FieldsInfo = $5.(*ast.FieldsClause)
+		}
+		if $6 != nil {
+			x.LinesInfo = $6.(*ast.LinesClause)
 		}
 
 		$$ = x
+	}
+|	"INTO" "DUMPFILE" stringLit
+	{
+		$$ = &ast.SelectIntoOption{
+			Tp:       ast.SelectIntoDumpfile,
+			FileName: $3,
+		}
+	}
+|	"INTO" IntoVarList
+	{
+		$$ = &ast.SelectIntoOption{
+			Tp:        ast.SelectIntoVars,
+			Variables: $2.([]ast.ExprNode),
+		}
 	}
 
 // See https://dev.mysql.com/doc/refman/5.7/en/subqueries.html
@@ -7764,12 +10342,8 @@ SubSelect:
 	}
 
 // See https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html
-SelectLockOpt:
-	/* empty */
-	{
-		$$ = nil
-	}
-|	"FOR" "UPDATE" OfTablesOpt
+SelectLockClause:
+	"FOR" "UPDATE" OfTablesOpt
 	{
 		$$ = &ast.SelectLockInfo{
 			LockType: ast.SelectLockForUpdate,
@@ -7824,6 +10398,51 @@ SelectLockOpt:
 		$$ = &ast.SelectLockInfo{
 			LockType: ast.SelectLockForShare,
 			Tables:   []*ast.TableName{},
+		}
+	}
+
+SelectLockList:
+	SelectLockClause
+	{
+		$$ = []*ast.SelectLockInfo{$1.(*ast.SelectLockInfo)}
+	}
+|	SelectLockList SelectLockClause
+	{
+		$$ = append($1.([]*ast.SelectLockInfo), $2.(*ast.SelectLockInfo))
+	}
+
+SelectLockListOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	SelectLockList
+
+SelectLockIntoOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	SelectLockList
+	{
+		$$ = &selectLockIntoHolder{locks: $1.([]*ast.SelectLockInfo)}
+	}
+|	SelectLockList IntoClause
+	{
+		$$ = &selectLockIntoHolder{
+			locks: $1.([]*ast.SelectLockInfo),
+			into:  $2.(*ast.SelectIntoOption),
+		}
+	}
+|	IntoClause
+	{
+		$$ = &selectLockIntoHolder{into: $1.(*ast.SelectIntoOption)}
+	}
+|	IntoClause SelectLockList
+	{
+		$$ = &selectLockIntoHolder{
+			into:  $1.(*ast.SelectIntoOption),
+			locks: $2.([]*ast.SelectLockInfo),
 		}
 	}
 
@@ -8030,6 +10649,37 @@ SetOprStmtWithLimitOrderBy:
 		setOpr.Limit = $3.(*ast.Limit)
 		$$ = setOpr
 	}
+|	SubSelect IntoClause
+	{
+		// (query) INTO ...: MySQL allows the INTO clause after a
+		// parenthesized query expression, optionally preceded by
+		// ORDER BY and LIMIT (the alternatives below).
+		setOpr := parenQueryToSetOpr($1.(*ast.SubqueryExpr))
+		setOpr.IntoOpt = $2.(*ast.SelectIntoOption)
+		$$ = setOpr
+	}
+|	SubSelect OrderBy IntoClause
+	{
+		setOpr := parenQueryToSetOpr($1.(*ast.SubqueryExpr))
+		setOpr.OrderBy = $2.(*ast.OrderByClause)
+		setOpr.IntoOpt = $3.(*ast.SelectIntoOption)
+		$$ = setOpr
+	}
+|	SubSelect SelectStmtLimit IntoClause
+	{
+		setOpr := parenQueryToSetOpr($1.(*ast.SubqueryExpr))
+		setOpr.Limit = $2.(*ast.Limit)
+		setOpr.IntoOpt = $3.(*ast.SelectIntoOption)
+		$$ = setOpr
+	}
+|	SubSelect OrderBy SelectStmtLimit IntoClause
+	{
+		setOpr := parenQueryToSetOpr($1.(*ast.SubqueryExpr))
+		setOpr.OrderBy = $2.(*ast.OrderByClause)
+		setOpr.Limit = $3.(*ast.Limit)
+		setOpr.IntoOpt = $4.(*ast.SelectIntoOption)
+		$$ = setOpr
+	}
 
 SetOprClauseList:
 	SetOprClause
@@ -8105,21 +10755,42 @@ SetStmt:
 	{
 		$$ = &ast.SetStmt{Variables: $2.([]*ast.VariableAssignment)}
 	}
-|	"SET" "PASSWORD" EqOrAssignmentEq PasswordOpt
+|	"SET" "PASSWORD" EqOrAssignmentEq PasswordOpt ReplacePasswordOpt RetainCurrentPasswordOpt
 	{
-		$$ = &ast.SetPwdStmt{Password: $4}
+		stmt := &ast.SetPwdStmt{Password: $4, RetainCurrentPassword: $6.(bool)}
+		if $5 != nil {
+			stmt.HasReplace = true
+			stmt.ReplaceString = $5.(string)
+		}
+		$$ = stmt
 	}
-|	"SET" "PASSWORD" EqOrAssignmentEq PasswordOpt "RETAIN" "CURRENT" "PASSWORD"
+|	"SET" "PASSWORD" "TO" "RANDOM" ReplacePasswordOpt RetainCurrentPasswordOpt
 	{
-		$$ = &ast.SetPwdStmt{Password: $4, RetainCurrentPassword: true}
+		// SET PASSWORD TO RANDOM (MySQL 8.0.18+).
+		stmt := &ast.SetPwdStmt{Random: true, RetainCurrentPassword: $6.(bool)}
+		if $5 != nil {
+			stmt.HasReplace = true
+			stmt.ReplaceString = $5.(string)
+		}
+		$$ = stmt
 	}
-|	"SET" "PASSWORD" "FOR" Username EqOrAssignmentEq PasswordOpt
+|	"SET" "PASSWORD" "FOR" Username EqOrAssignmentEq PasswordOpt ReplacePasswordOpt RetainCurrentPasswordOpt
 	{
-		$$ = &ast.SetPwdStmt{User: $4.(*auth.UserIdentity), Password: $6}
+		stmt := &ast.SetPwdStmt{User: $4.(*auth.UserIdentity), Password: $6, RetainCurrentPassword: $8.(bool)}
+		if $7 != nil {
+			stmt.HasReplace = true
+			stmt.ReplaceString = $7.(string)
+		}
+		$$ = stmt
 	}
-|	"SET" "PASSWORD" "FOR" Username EqOrAssignmentEq PasswordOpt "RETAIN" "CURRENT" "PASSWORD"
+|	"SET" "PASSWORD" "FOR" Username "TO" "RANDOM" ReplacePasswordOpt RetainCurrentPasswordOpt
 	{
-		$$ = &ast.SetPwdStmt{User: $4.(*auth.UserIdentity), Password: $6, RetainCurrentPassword: true}
+		stmt := &ast.SetPwdStmt{User: $4.(*auth.UserIdentity), Random: true, RetainCurrentPassword: $8.(bool)}
+		if $7 != nil {
+			stmt.HasReplace = true
+			stmt.ReplaceString = $7.(string)
+		}
+		$$ = stmt
 	}
 |	"SET" "GLOBAL" "TRANSACTION" TransactionChars
 	{
@@ -8131,6 +10802,11 @@ SetStmt:
 	}
 |	"SET" "SESSION" "TRANSACTION" TransactionChars
 	{
+		$$ = &ast.SetStmt{Variables: $4.([]*ast.VariableAssignment)}
+	}
+|	"SET" "LOCAL" "TRANSACTION" TransactionChars
+	{
+		// LOCAL is a synonym for SESSION.
 		$$ = &ast.SetStmt{Variables: $4.([]*ast.VariableAssignment)}
 	}
 |	"SET" "TRANSACTION" TransactionChars
@@ -8256,6 +10932,18 @@ SetExpr:
 	{
 		$$ = ast.NewValueExpr("BINARY", parser.charset, parser.collation)
 	}
+|	"ALL"
+	{
+		$$ = ast.NewValueExpr("ALL", parser.charset, parser.collation)
+	}
+|	"ROW"
+	{
+		$$ = ast.NewValueExpr("ROW", parser.charset, parser.collation)
+	}
+|	"SYSTEM"
+	{
+		$$ = ast.NewValueExpr("SYSTEM", parser.charset, parser.collation)
+	}
 |	ExprOrDefault
 
 EqOrAssignmentEq:
@@ -8290,17 +10978,33 @@ VariableAssignment:
 	{
 		$$ = &ast.VariableAssignment{Name: $2, Value: $4, IsSystem: true}
 	}
+|	"PERSIST" VariableName EqOrAssignmentEq SetExpr
+	{
+		$$ = &ast.VariableAssignment{Name: $2, Value: $4, IsPersist: true, IsSystem: true}
+	}
+|	"PERSIST_ONLY" VariableName EqOrAssignmentEq SetExpr
+	{
+		$$ = &ast.VariableAssignment{Name: $2, Value: $4, IsPersistOnly: true, IsSystem: true}
+	}
 |	doubleAtIdentifier EqOrAssignmentEq SetExpr
 	{
 		v := strings.ToLower($1)
 		var isGlobal bool
 		var isInstance bool
+		var isPersist bool
+		var isPersistOnly bool
 		if strings.HasPrefix(v, "@@global.") {
 			isGlobal = true
 			v = strings.TrimPrefix(v, "@@global.")
 		} else if strings.HasPrefix(v, "@@instance.") {
 			isInstance = true
 			v = strings.TrimPrefix(v, "@@instance.")
+		} else if strings.HasPrefix(v, "@@persist_only.") {
+			isPersistOnly = true
+			v = strings.TrimPrefix(v, "@@persist_only.")
+		} else if strings.HasPrefix(v, "@@persist.") {
+			isPersist = true
+			v = strings.TrimPrefix(v, "@@persist.")
 		} else if strings.HasPrefix(v, "@@session.") {
 			v = strings.TrimPrefix(v, "@@session.")
 		} else if strings.HasPrefix(v, "@@local.") {
@@ -8308,7 +11012,7 @@ VariableAssignment:
 		} else if strings.HasPrefix(v, "@@") {
 			v = strings.TrimPrefix(v, "@@")
 		}
-		$$ = &ast.VariableAssignment{Name: v, Value: $3, IsGlobal: isGlobal, IsInstance: isInstance, IsSystem: true}
+		$$ = &ast.VariableAssignment{Name: v, Value: $3, IsGlobal: isGlobal, IsInstance: isInstance, IsPersist: isPersist, IsPersistOnly: isPersistOnly, IsSystem: true}
 	}
 |	singleAtIdentifier EqOrAssignmentEq Expression
 	{
@@ -8361,15 +11065,15 @@ CharsetNameOrDefault:
 CharsetName:
 	StringName
 	{
-		// Validate input charset name to keep the same behavior as parser of MySQL.
-		cs, err := charset.GetCharsetInfo($1)
-		if err != nil {
-			yylex.AppendError(ErrUnknownCharacterSet.GenByArgs($1))
-			return 1
+		// Use the canonical name from the registry when the charset is
+		// known, keeping lower case of input for generated column restore.
+		// Unknown names are kept as written (lowered): MySQL reports
+		// ER_UNKNOWN_CHARACTER_SET at execution time, not as a syntax error.
+		if cs, err := charset.GetCharsetInfo($1); err == nil {
+			$$ = cs.Name
+		} else {
+			$$ = strings.ToLower($1)
 		}
-		// Use charset name returned from charset.GetCharsetInfo(),
-		// to keep lower case of input for generated column restore.
-		$$ = cs.Name
 	}
 |	binaryType
 	{
@@ -8379,12 +11083,14 @@ CharsetName:
 CollationName:
 	StringName
 	{
-		info, err := charset.GetCollationByName($1)
-		if err != nil {
-			yylex.AppendError(err)
-			return 1
+		// Like CharsetName above: unknown collations, including
+		// user-defined LDML collations such as utf8mb4_test_ci, are a
+		// runtime error in MySQL (ER_UNKNOWN_COLLATION), not a parse error.
+		if info, err := charset.GetCollationByName($1); err == nil {
+			$$ = info.Name
+		} else {
+			$$ = strings.ToLower($1)
 		}
-		$$ = info.Name
 	}
 |	binaryType
 	{
@@ -8425,6 +11131,31 @@ SystemVariable:
 		} else if strings.HasPrefix(v, "@@") {
 			v, explicitScope = strings.TrimPrefix(v, "@@"), false
 		}
+		$$ = &ast.VariableExpr{Name: v, IsGlobal: isGlobal, IsInstance: isInstance, IsSystem: true, ExplicitScope: explicitScope}
+	}
+|	doubleAtIdentifier '.' Identifier
+	{
+		// Structured system variables whose component after the dot is
+		// quoted separately: @@global.`default`.`key_buffer_size`. The
+		// fully unquoted form lexes as a single token via the rule above.
+		v := strings.ToLower($1)
+		var isGlobal bool
+		var isInstance bool
+		explicitScope := true
+		if strings.HasPrefix(v, "@@global.") {
+			isGlobal = true
+			v = strings.TrimPrefix(v, "@@global.")
+		} else if strings.HasPrefix(v, "@@instance.") {
+			isInstance = true
+			v = strings.TrimPrefix(v, "@@instance.")
+		} else if strings.HasPrefix(v, "@@session.") {
+			v = strings.TrimPrefix(v, "@@session.")
+		} else if strings.HasPrefix(v, "@@local.") {
+			v = strings.TrimPrefix(v, "@@local.")
+		} else if strings.HasPrefix(v, "@@") {
+			v, explicitScope = strings.TrimPrefix(v, "@@"), false
+		}
+		v = v + "." + strings.ToLower($3)
 		$$ = &ast.VariableExpr{Name: v, IsGlobal: isGlobal, IsInstance: isInstance, IsSystem: true, ExplicitScope: explicitScope}
 	}
 
@@ -8477,6 +11208,11 @@ AuthString:
 RoleNameString:
 	stringLit
 |	identifier
+|	"SKIP"
+|	"LOCKED"
+|	"NOWAIT"
+|	"BINLOG"
+|	"ROLE"
 
 RolenameComposed:
 	StringName '@' StringName
@@ -8532,6 +11268,27 @@ ShowStmt:
 		}
 		$$ = stmt
 	}
+|	"SHOW" "ENGINE" Identifier "STATUS"
+	{
+		$$ = &ast.ShowStmt{
+			Tp:         ast.ShowEngineStatus,
+			EngineName: $3,
+		}
+	}
+|	"SHOW" "ENGINE" Identifier "LOGS"
+	{
+		$$ = &ast.ShowStmt{
+			Tp:         ast.ShowEngineLogs,
+			EngineName: $3,
+		}
+	}
+|	"SHOW" "ENGINE" Identifier "MUTEX"
+	{
+		$$ = &ast.ShowStmt{
+			Tp:         ast.ShowEngineMutex,
+			EngineName: $3,
+		}
+	}
 |	"SHOW" "CREATE" "TABLE" TableName
 	{
 		$$ = &ast.ShowStmt{
@@ -8560,6 +11317,41 @@ ShowStmt:
 		$$ = &ast.ShowStmt{
 			Tp:   ast.ShowCreateUser,
 			User: $4.(*auth.UserIdentity),
+		}
+	}
+|	"SHOW" "CREATE" "PROCEDURE" TableName
+	{
+		$$ = &ast.ShowStmt{
+			Tp:    ast.ShowCreateProcedure,
+			Table: $4.(*ast.TableName),
+		}
+	}
+|	"SHOW" "CREATE" "FUNCTION" TableName
+	{
+		$$ = &ast.ShowStmt{
+			Tp:    ast.ShowCreateFunction,
+			Table: $4.(*ast.TableName),
+		}
+	}
+|	"SHOW" "CREATE" "TRIGGER" TableName
+	{
+		$$ = &ast.ShowStmt{
+			Tp:    ast.ShowCreateTrigger,
+			Table: $4.(*ast.TableName),
+		}
+	}
+|	"SHOW" "CREATE" "EVENT" TableName
+	{
+		$$ = &ast.ShowStmt{
+			Tp:    ast.ShowCreateEvent,
+			Table: $4.(*ast.TableName),
+		}
+	}
+|	"SHOW" "CREATE" "LIBRARY" TableName
+	{
+		$$ = &ast.ShowStmt{
+			Tp:    ast.ShowCreateLibrary,
+			Table: $4.(*ast.TableName),
 		}
 	}
 |	"SHOW" "GRANTS"
@@ -8597,14 +11389,65 @@ ShowStmt:
 			Tp: ast.ShowBinlogStatus,
 		}
 	}
-|	"SHOW" Replica "STATUS"
+|	"SHOW" "BINARY" "LOGS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowBinaryLogs}
+	}
+|	"SHOW" "MASTER" "LOGS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowBinaryLogs}
+	}
+|	"SHOW" "BINLOG" "EVENTS" BinlogInOpt BinlogFromOpt SelectStmtLimitOpt
+	{
+		stmt := &ast.ShowStmt{Tp: ast.ShowBinlogEvents}
+		if $4 != nil {
+			stmt.LogName = $4.(string)
+		}
+		if $5 != nil {
+			stmt.Pos = $5.(uint64)
+			stmt.HasPos = true
+		}
+		if $6 != nil {
+			stmt.Limit = $6.(*ast.Limit)
+		}
+		$$ = stmt
+	}
+|	"SHOW" "RELAYLOG" "EVENTS" BinlogInOpt BinlogFromOpt SelectStmtLimitOpt
+	{
+		stmt := &ast.ShowStmt{Tp: ast.ShowRelaylogEvents}
+		if $4 != nil {
+			stmt.LogName = $4.(string)
+		}
+		if $5 != nil {
+			stmt.Pos = $5.(uint64)
+			stmt.HasPos = true
+		}
+		if $6 != nil {
+			stmt.Limit = $6.(*ast.Limit)
+		}
+		$$ = stmt
+	}
+|	"SHOW" "REPLICAS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowReplicas}
+	}
+|	"SHOW" "SLAVE" "HOSTS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowReplicas}
+	}
+|	"SHOW" Replica "STATUS" ForChannelOpt
 	// From MySQL 8.0.22, use SHOW REPLICA STATUS in place of SHOW SLAVE STATUS,
 	// which is deprecated from that release. In releases before MySQL 8.0.22,
 	// use SHOW SLAVE STATUS.
 	{
-		$$ = &ast.ShowStmt{
+		stmt := &ast.ShowStmt{
 			Tp: ast.ShowReplicaStatus,
 		}
+		if $4 != nil {
+			stmt.Channel = $4.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
 	}
 |	"SHOW" OptFull "PROCESSLIST"
 	{
@@ -8639,6 +11482,51 @@ ShowStmt:
 	{
 		$$ = &ast.ShowStmt{
 			Tp: ast.ShowPrivileges,
+		}
+	}
+|	"SHOW" "WARNINGS" SelectStmtLimitOpt
+	{
+		stmt := &ast.ShowStmt{Tp: ast.ShowWarnings}
+		if $3 != nil {
+			stmt.Limit = $3.(*ast.Limit)
+		}
+		$$ = stmt
+	}
+|	"SHOW" "ERRORS" SelectStmtLimitOpt
+	{
+		stmt := &ast.ShowStmt{Tp: ast.ShowErrors}
+		if $3 != nil {
+			stmt.Limit = $3.(*ast.Limit)
+		}
+		$$ = stmt
+	}
+|	"SHOW" builtinCount '(' '*' ')' "WARNINGS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowWarnings, CountWarningsOrErrors: true}
+	}
+|	"SHOW" builtinCount '(' '*' ')' "ERRORS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowErrors, CountWarningsOrErrors: true}
+	}
+|	"SHOW" "PROCEDURE" "CODE" TableName
+	{
+		$$ = &ast.ShowStmt{
+			Tp:    ast.ShowProcedureCode,
+			Table: $4.(*ast.TableName),
+		}
+	}
+|	"SHOW" "FUNCTION" "CODE" TableName
+	{
+		$$ = &ast.ShowStmt{
+			Tp:    ast.ShowFunctionCode,
+			Table: $4.(*ast.TableName),
+		}
+	}
+|	"SHOW" "PARSE_TREE" ExplainableStmt
+	{
+		$$ = &ast.ShowStmt{
+			Tp:            ast.ShowParseTree,
+			ParseTreeStmt: $3,
 		}
 	}
 
@@ -8731,6 +11619,22 @@ ShowTargetFilterable:
 	{
 		$$ = &ast.ShowStmt{Tp: ast.ShowEngines}
 	}
+|	"STORAGE" "ENGINES"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowEngines}
+	}
+|	"PROCEDURE" "STATUS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowProcedureStatus}
+	}
+|	"FUNCTION" "STATUS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowFunctionStatus}
+	}
+|	"LIBRARY" "STATUS"
+	{
+		$$ = &ast.ShowStmt{Tp: ast.ShowLibraryStatus}
+	}
 |	"DATABASES"
 	{
 		$$ = &ast.ShowStmt{Tp: ast.ShowDatabases}
@@ -8795,21 +11699,31 @@ ShowTargetFilterable:
 			Extended: true,
 		}
 	}
-|	builtinCount '(' '*' ')' "WARNINGS"
+|	"EXTENDED" OptFull "TABLES" ShowDatabaseNameOpt
 	{
-		$$ = &ast.ShowStmt{Tp: ast.ShowWarnings, CountWarningsOrErrors: true}
+		$$ = &ast.ShowStmt{
+			Tp:       ast.ShowTables,
+			DBName:   $4,
+			Full:     $2.(bool),
+			Extended: true,
+		}
 	}
-|	"WARNINGS"
+|	"EXTENDED" ShowIndexKwd FromOrIn TableName
 	{
-		$$ = &ast.ShowStmt{Tp: ast.ShowWarnings}
+		$$ = &ast.ShowStmt{
+			Tp:       ast.ShowIndex,
+			Table:    $4.(*ast.TableName),
+			Extended: true,
+		}
 	}
-|	builtinCount '(' '*' ')' "ERRORS"
+|	"EXTENDED" ShowIndexKwd FromOrIn Identifier FromOrIn Identifier
 	{
-		$$ = &ast.ShowStmt{Tp: ast.ShowErrors, CountWarningsOrErrors: true}
-	}
-|	"ERRORS"
-	{
-		$$ = &ast.ShowStmt{Tp: ast.ShowErrors}
+		show := &ast.ShowStmt{
+			Tp:       ast.ShowIndex,
+			Table:    &ast.TableName{Name: ast.NewCIStr($4), Schema: ast.NewCIStr($6)},
+			Extended: true,
+		}
+		$$ = show
 	}
 |	GlobalScope "VARIABLES"
 	{
@@ -8881,6 +11795,10 @@ GlobalScope:
 	{
 		$$ = false
 	}
+|	"LOCAL"
+	{
+		$$ = false
+	}
 
 OptFull:
 	{
@@ -8910,6 +11828,26 @@ Replica:
 	"REPLICA"
 |	"SLAVE"
 
+BinlogInOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"IN" stringLit
+	{
+		$$ = $2
+	}
+
+BinlogFromOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"FROM" NUM
+	{
+		$$ = getUint64FromNUM($2)
+	}
+
 FlushStmt:
 	"FLUSH" NoWriteToBinLogAliasOpt FlushOption
 	{
@@ -8919,6 +11857,33 @@ FlushStmt:
 	}
 
 FlushOption:
+	TableOrTables TableNameListOpt WithReadLockOpt
+	{
+		stmt := &ast.FlushStmt{
+			Tp:     ast.FlushTables,
+			Tables: $2.([]*ast.TableName),
+		}
+		switch $3.(int) {
+		case 1:
+			stmt.ReadLock = true
+		case 2:
+			stmt.ForExport = true
+		}
+		$$ = stmt
+	}
+|	FlushNonTableOption FlushNonTableOptionListOpt
+	{
+		// MySQL allows a comma-separated list of the non-table flush
+		// options: FLUSH STATUS, USER_RESOURCES. The table form is
+		// exclusive and cannot appear in a list.
+		tmp := $1.(*ast.FlushStmt)
+		if $2 != nil {
+			tmp.ExtraTargets = $2.([]*ast.FlushStmt)
+		}
+		$$ = tmp
+	}
+
+FlushNonTableOption:
 	"PRIVILEGES"
 	{
 		$$ = &ast.FlushStmt{
@@ -8937,6 +11902,18 @@ FlushOption:
 			Tp: ast.FlushHosts,
 		}
 	}
+|	"USER_RESOURCES"
+	{
+		$$ = &ast.FlushStmt{
+			Tp: ast.FlushUserResources,
+		}
+	}
+|	"OPTIMIZER_COSTS"
+	{
+		$$ = &ast.FlushStmt{
+			Tp: ast.FlushOptimizerCosts,
+		}
+	}
 |	LogTypeOpt "LOGS"
 	{
 		$$ = &ast.FlushStmt{
@@ -8944,13 +11921,35 @@ FlushOption:
 			LogType: $1.(ast.LogType),
 		}
 	}
-|	TableOrTables TableNameListOpt WithReadLockOpt
+|	"RELAY" "LOGS" FlushRelayChannelOpt
 	{
 		$$ = &ast.FlushStmt{
-			Tp:       ast.FlushTables,
-			Tables:   $2.([]*ast.TableName),
-			ReadLock: $3.(bool),
+			Tp:      ast.FlushLogs,
+			LogType: ast.LogTypeRelay,
+			Channel: $3,
 		}
+	}
+
+FlushNonTableOptionListOpt:
+	{
+		$$ = nil
+	}
+|	FlushNonTableOptionListOpt ',' FlushNonTableOption
+	{
+		var list []*ast.FlushStmt
+		if $1 != nil {
+			list = $1.([]*ast.FlushStmt)
+		}
+		$$ = append(list, $3.(*ast.FlushStmt))
+	}
+
+FlushRelayChannelOpt:
+	{
+		$$ = ""
+	}
+|	"FOR" "CHANNEL" stringLit
+	{
+		$$ = $3
 	}
 
 LogTypeOpt:
@@ -9002,21 +12001,32 @@ TableNameListOpt:
 
 WithReadLockOpt:
 	{
-		$$ = false
+		$$ = 0
 	}
 |	"WITH" "READ" "LOCK"
 	{
-		$$ = true
+		$$ = 1
+	}
+|	"FOR" "EXPORT"
+	{
+		$$ = 2
 	}
 
 Statement:
+	SimpleStatement
+|	BeginTransactionStmt
+
+// SimpleStatement is every statement except the bare BEGIN [WORK]
+// transaction spelling. Stored program bodies use this rule: inside a body
+// BEGIN always opens a compound block (like statement vs
+// simple_statement_or_begin in MySQL sql_yacc.yy).
+SimpleStatement:
 	EmptyStmt
 |	AlterDatabaseStmt
 |	AlterTableStmt
 |	AlterUserStmt
 |	AlterInstanceStmt
 |	AnalyzeTableStmt
-|	BeginTransactionStmt
 |	BinlogStmt
 |	CommitStmt
 |	DeallocateStmt
@@ -9027,6 +12037,7 @@ Statement:
 |	CreateIndexStmt
 |	CreateTableStmt
 |	CreateViewStmt
+|	CreateJSONDualityViewStmt
 |	CreateUserStmt
 |	CreateRoleStmt
 |	DoStmt
@@ -9043,15 +12054,32 @@ Statement:
 |	CallStmt
 |	InsertIntoStmt
 |	KillStmt
+|	HelpStmt
+|	GetDiagnosticsStmt
 |	LoadDataStmt
 |	PreparedStmt
 |	RollbackStmt
 |	RenameTableStmt
+|	RepairTableStmt
+|	AlterViewStmt
+|	XAStmt
+|	CreateSpatialRefSysStmt
+|	DropSpatialRefSysStmt
+|	CreateLibraryStmt
+|	AlterLibraryStmt
+|	DropLibraryStmt
+|	CreateTablespaceStmt
+|	AlterTablespaceStmt
+|	DropTablespaceStmt
+|	CreateLogfileGroupStmt
+|	AlterLogfileGroupStmt
+|	DropLogfileGroupStmt
 |	RenameUserStmt
 |	ReplaceIntoStmt
 |	ReleaseSavepointStmt
 |	RevokeStmt
 |	RevokeRoleStmt
+|	RevokeProxyStmt
 |	SavepointStmt
 |	SetOprStmt
 |	SelectStmt
@@ -9081,6 +12109,39 @@ Statement:
 |	ShutdownStmt
 |	RestartStmt
 |	OptimizeTableStmt
+|	CheckTableStmt
+|	ChecksumTableStmt
+|	HandlerStmt
+|	PurgeStmt
+|	ImportTableStmt
+|	CacheIndexStmt
+|	LoadIndexStmt
+|	InstallStmt
+|	UninstallStmt
+|	CreateServerStmt
+|	AlterServerStmt
+|	DropServerStmt
+|	CreateResourceGroupStmt
+|	AlterResourceGroupStmt
+|	DropResourceGroupStmt
+|	SetResourceGroupStmt
+|	CloneStmt
+|	LockInstanceStmt
+|	UnlockInstanceStmt
+|	ChangeReplicationStmt
+|	StartReplicaStmt
+|	StopReplicaStmt
+|	ResetStmt
+|	CreateProcedureStmt
+|	CreateFunctionStmt
+|	CreateTriggerStmt
+|	CreateEventStmt
+|	AlterProcedureStmt
+|	AlterFunctionStmt
+|	AlterEventStmt
+|	DropRoutineStmt
+|	SignalStmt
+|	ResignalStmt
 
 ExplainableStmt:
 	DeleteFromStmt
@@ -9335,6 +12396,13 @@ TableOption:
 	{
 		// Parse it but will ignore it
 		$$ = &ast.TableOption{Tp: ast.TableOptionAutoextendSize, StrValue: $3}
+		yylex.AppendError(yylex.Errorf("The AUTOEXTEND_SIZE option is parsed but ignored by all storage engines."))
+		parser.lastErrorAsWarn()
+	}
+|	"AUTOEXTEND_SIZE" EqOpt LengthNum
+	{
+		// Parse it but will ignore it
+		$$ = &ast.TableOption{Tp: ast.TableOptionAutoextendSize, UintValue: $3.(uint64)}
 		yylex.AppendError(yylex.Errorf("The AUTOEXTEND_SIZE option is parsed but ignored by all storage engines."))
 		parser.lastErrorAsWarn()
 	}
@@ -9620,59 +12688,85 @@ BitValueType:
 	}
 
 StringType:
-	Char FieldLen OptBinary
+	Char FieldLen OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeString)
 		tp.SetFlen($2.(int))
 		tp.SetCharset($3.(*ast.OptBinary).Charset)
+		if $3.(*ast.OptBinary).Charset == charset.CharsetBin {
+			// CHAR(n) BYTE is the binary charset: match what BINARY(n)
+			// parses to so the restored form re-parses identically.
+			tp.AddFlag(mysql.BinaryFlag)
+			tp.SetCollate(charset.CollationBin)
+		}
 		if $3.(*ast.OptBinary).IsBinary {
 			tp.AddFlag(mysql.BinaryFlag)
 		}
 		$$ = tp
 	}
-|	Char OptBinary
+|	Char OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeString)
 		tp.SetCharset($2.(*ast.OptBinary).Charset)
+		if $2.(*ast.OptBinary).Charset == charset.CharsetBin {
+			tp.AddFlag(mysql.BinaryFlag)
+			tp.SetCollate(charset.CollationBin)
+		}
 		if $2.(*ast.OptBinary).IsBinary {
 			tp.AddFlag(mysql.BinaryFlag)
 		}
 		$$ = tp
 	}
-|	NChar FieldLen OptBinary
+|	NChar FieldLen OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeString)
 		tp.SetFlen($2.(int))
 		tp.SetCharset($3.(*ast.OptBinary).Charset)
+		if $3.(*ast.OptBinary).Charset == charset.CharsetBin {
+			tp.AddFlag(mysql.BinaryFlag)
+			tp.SetCollate(charset.CollationBin)
+		}
 		if $3.(*ast.OptBinary).IsBinary {
 			tp.AddFlag(mysql.BinaryFlag)
 		}
 		$$ = tp
 	}
-|	NChar OptBinary
+|	NChar OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeString)
 		tp.SetCharset($2.(*ast.OptBinary).Charset)
+		if $2.(*ast.OptBinary).Charset == charset.CharsetBin {
+			tp.AddFlag(mysql.BinaryFlag)
+			tp.SetCollate(charset.CollationBin)
+		}
 		if $2.(*ast.OptBinary).IsBinary {
 			tp.AddFlag(mysql.BinaryFlag)
 		}
 		$$ = tp
 	}
-|	Varchar FieldLen OptBinary
+|	Varchar FieldLen OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeVarchar)
 		tp.SetFlen($2.(int))
 		tp.SetCharset($3.(*ast.OptBinary).Charset)
+		if $3.(*ast.OptBinary).Charset == charset.CharsetBin {
+			tp.AddFlag(mysql.BinaryFlag)
+			tp.SetCollate(charset.CollationBin)
+		}
 		if $3.(*ast.OptBinary).IsBinary {
 			tp.AddFlag(mysql.BinaryFlag)
 		}
 		$$ = tp
 	}
-|	NVarchar FieldLen OptBinary
+|	NVarchar FieldLen OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeVarchar)
 		tp.SetFlen($2.(int))
 		tp.SetCharset($3.(*ast.OptBinary).Charset)
+		if $3.(*ast.OptBinary).Charset == charset.CharsetBin {
+			tp.AddFlag(mysql.BinaryFlag)
+			tp.SetCollate(charset.CollationBin)
+		}
 		if $3.(*ast.OptBinary).IsBinary {
 			tp.AddFlag(mysql.BinaryFlag)
 		}
@@ -9765,6 +12859,16 @@ StringType:
 		tp.SetCollate(charset.CollationBin)
 		$$ = tp
 	}
+|	"VECTOR" OptFieldLen
+	{
+		// VECTOR(N) (MySQL 9.0+): N float32 dimensions, default 2048
+		// when unspecified.
+		tp := types.NewFieldType(mysql.TypeVector)
+		tp.SetFlen($2.(int))
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
 |	"LONG" Varchar OptCharsetWithOptBinary
 	{
 		tp := types.NewFieldType(mysql.TypeMediumBlob)
@@ -9802,6 +12906,16 @@ StringType:
 	}
 |	"GEOMETRYCOLLECTION"
 	{
+		tp := types.NewFieldType(mysql.TypeGeometry)
+		tp.SetGeometryType(types.GeomGeometryCollection)
+		tp.AddFlag(mysql.BinaryFlag)
+		tp.SetCharset(charset.CharsetBin)
+		tp.SetCollate(charset.CollationBin)
+		$$ = tp
+	}
+|	"GEOMCOLLECTION"
+	{
+		// Synonym for GEOMETRYCOLLECTION (MySQL 8.0.24+).
 		tp := types.NewFieldType(mysql.TypeGeometry)
 		tp.SetGeometryType(types.GeomGeometryCollection)
 		tp.AddFlag(mysql.BinaryFlag)
@@ -9946,14 +13060,21 @@ TextType:
 
 OptCharsetWithOptBinary:
 	OptBinary
-|	"ASCII"
+|	"ASCII" OptBinMod
 	{
 		$$ = &ast.OptBinary{
-			IsBinary: false,
+			IsBinary: $2.(bool),
 			Charset:  charset.CharsetLatin1,
 		}
 	}
-|	"UNICODE"
+|	"BINARY" "ASCII"
+	{
+		$$ = &ast.OptBinary{
+			IsBinary: true,
+			Charset:  charset.CharsetLatin1,
+		}
+	}
+|	"UNICODE" OptBinMod
 	{
 		cs, err := charset.GetCharsetInfo("ucs2")
 		if err != nil {
@@ -9961,7 +13082,19 @@ OptCharsetWithOptBinary:
 			return 1
 		}
 		$$ = &ast.OptBinary{
-			IsBinary: false,
+			IsBinary: $2.(bool),
+			Charset:  cs.Name,
+		}
+	}
+|	"BINARY" "UNICODE"
+	{
+		cs, err := charset.GetCharsetInfo("ucs2")
+		if err != nil {
+			yylex.AppendError(ErrUnknownCharacterSet.GenByArgs("ucs2"))
+			return 1
+		}
+		$$ = &ast.OptBinary{
+			IsBinary: true,
 			Charset:  cs.Name,
 		}
 	}
@@ -10027,6 +13160,7 @@ FieldLen:
 	}
 
 OptFieldLen:
+	/* EMPTY */ %prec lowerThanParenthese
 	{
 		$$ = types.UnspecifiedLength
 	}
@@ -10056,12 +13190,19 @@ FieldOpts:
 	}
 
 FloatOpt:
+	/* EMPTY */ %prec lowerThanParenthese
 	{
 		$$ = &ast.FloatOpt{Flen: types.UnspecifiedLength, Decimal: types.UnspecifiedLength}
 	}
 |	FieldLen
 	{
 		$$ = &ast.FloatOpt{Flen: $1.(int), Decimal: types.UnspecifiedLength}
+	}
+|	'(' decLit ')'
+	{
+		// MySQL accepts a decimal precision like FLOAT(10.3) and ignores it,
+		// creating a plain FLOAT column.
+		$$ = &ast.FloatOpt{Flen: types.UnspecifiedLength, Decimal: types.UnspecifiedLength}
 	}
 |	Precision
 
@@ -10081,17 +13222,25 @@ OptBinMod:
 	}
 
 OptBinary:
+	/* EMPTY */ %prec lowerThanParenthese
 	{
 		$$ = &ast.OptBinary{
 			IsBinary: false,
 			Charset:  "",
 		}
 	}
-|	"BINARY" OptCharset
+|	"BINARY"
 	{
 		$$ = &ast.OptBinary{
 			IsBinary: true,
-			Charset:  $2,
+			Charset:  "",
+		}
+	}
+|	"BINARY" CharsetKw CharsetName
+	{
+		$$ = &ast.OptBinary{
+			IsBinary: true,
+			Charset:  $3,
 		}
 	}
 |	CharsetKw CharsetName OptBinMod
@@ -10100,15 +13249,6 @@ OptBinary:
 			IsBinary: $3.(bool),
 			Charset:  $2,
 		}
-	}
-
-OptCharset:
-	{
-		$$ = ""
-	}
-|	CharsetKw CharsetName
-	{
-		$$ = $2
 	}
 
 CharsetKw:
@@ -10147,6 +13287,492 @@ TextStringList:
 |	TextStringList ',' TextString
 	{
 		$$ = append($1.([]*ast.TextString), $3.(*ast.TextString))
+	}
+
+/*******************************************************************
+ * XA transaction statements. spirit refuses XA workloads, but the
+ * parser must recognize them so pkg/change can do so cleanly.
+ * See https://dev.mysql.com/doc/refman/8.4/en/xa-statements.html
+ *******************************************************************/
+XAStmt:
+	"XA" BeginOrStartSym XAXid
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpStart, Xid: $3.(*ast.XAXid)}
+	}
+|	"XA" BeginOrStartSym XAXid "JOIN"
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpStart, Xid: $3.(*ast.XAXid), Join: true}
+	}
+|	"XA" BeginOrStartSym XAXid "RESUME"
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpStart, Xid: $3.(*ast.XAXid), Resume: true}
+	}
+|	"XA" "END" XAXid
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpEnd, Xid: $3.(*ast.XAXid)}
+	}
+|	"XA" "END" XAXid "SUSPEND"
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpEnd, Xid: $3.(*ast.XAXid), Suspend: true}
+	}
+|	"XA" "END" XAXid "SUSPEND" "FOR" "MIGRATE"
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpEnd, Xid: $3.(*ast.XAXid), Suspend: true, ForMigrate: true}
+	}
+|	"XA" "PREPARE" XAXid
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpPrepare, Xid: $3.(*ast.XAXid)}
+	}
+|	"XA" "COMMIT" XAXid
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpCommit, Xid: $3.(*ast.XAXid)}
+	}
+|	"XA" "COMMIT" XAXid "ONE" "PHASE"
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpCommit, Xid: $3.(*ast.XAXid), OnePhase: true}
+	}
+|	"XA" "ROLLBACK" XAXid
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpRollback, Xid: $3.(*ast.XAXid)}
+	}
+|	"XA" "RECOVER"
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpRecover}
+	}
+|	"XA" "RECOVER" "CONVERT" "XID"
+	{
+		$$ = &ast.XAStmt{Op: ast.XAOpRecover, ConvertXid: true}
+	}
+
+BeginOrStartSym:
+	"BEGIN"
+|	"START"
+
+XAXid:
+	TextString
+	{
+		$$ = &ast.XAXid{GTRID: $1.(*ast.TextString).Value, NParts: 1}
+	}
+|	TextString ',' TextString
+	{
+		$$ = &ast.XAXid{GTRID: $1.(*ast.TextString).Value, BQual: $3.(*ast.TextString).Value, NParts: 2}
+	}
+|	TextString ',' TextString ',' NUM
+	{
+		$$ = &ast.XAXid{GTRID: $1.(*ast.TextString).Value, BQual: $3.(*ast.TextString).Value, FormatID: getUint64FromNUM($5), NParts: 3}
+	}
+|	TextString ',' TextString ',' hexLit
+	{
+		// MySQL's ulong_num accepts a hex number (0xb) as the formatID.
+		var formatID uint64
+		for _, b := range []byte($5.(ast.HexLiteral)) {
+			formatID = formatID<<8 | uint64(b)
+		}
+		$$ = &ast.XAXid{GTRID: $1.(*ast.TextString).Value, BQual: $3.(*ast.TextString).Value, FormatID: formatID, NParts: 3}
+	}
+
+/*******************************************************************
+ * Spatial reference system statements
+ * See https://dev.mysql.com/doc/refman/8.4/en/create-spatial-reference-system.html
+ *******************************************************************/
+/********************************************************************
+ * CREATE/ALTER/DROP LIBRARY (MySQL 9.x)
+ * See https://dev.mysql.com/doc/refman/9.4/en/create-library.html
+ * The body accepts an ordinary string literal or a dollar-quoted
+ * string ($tag$ ... $tag$); the lexer delivers both as stringLit.
+ *******************************************************************/
+CreateLibraryStmt:
+	"CREATE" "LIBRARY" IfNotExists TableName LibraryCommentOpt "LANGUAGE" Identifier LibraryCommentOpt "AS" LibraryBody
+	{
+		stmt := &ast.CreateLibraryStmt{
+			IfNotExists: $3.(bool),
+			Library:     $4.(*ast.TableName),
+			Language:    strings.ToUpper($7),
+			Body:        $10,
+		}
+		// COMMENT may be written before or after LANGUAGE; the restored
+		// form always places it before.
+		if $5 != nil {
+			stmt.HasComment = true
+			stmt.Comment = $5.(string)
+		}
+		if $8 != nil {
+			stmt.HasComment = true
+			stmt.Comment = $8.(string)
+		}
+		$$ = stmt
+	}
+
+LibraryBody:
+	stringLit
+|	hexLit
+	{
+		// Binary library bodies (AS 0x... / X'...') decode to their byte
+		// content; the restored form is an ordinary quoted string.
+		$$ = $1.(ast.HexLiteral).ToString()
+	}
+|	bitLit
+	{
+		$$ = $1.(ast.BitLiteral).ToString()
+	}
+|	"UNDERSCORE_CHARSET" hexLit
+	{
+		// The _binary introducer adds nothing at parse level.
+		$$ = $2.(ast.HexLiteral).ToString()
+	}
+|	"UNDERSCORE_CHARSET" bitLit
+	{
+		$$ = $2.(ast.BitLiteral).ToString()
+	}
+
+LibraryCommentOpt:
+	{
+		$$ = nil
+	}
+|	"COMMENT" stringLit
+	{
+		$$ = $2
+	}
+
+AlterLibraryStmt:
+	"ALTER" "LIBRARY" TableName "COMMENT" stringLit
+	{
+		$$ = &ast.AlterLibraryStmt{
+			Library: $3.(*ast.TableName),
+			Comment: $5,
+		}
+	}
+
+DropLibraryStmt:
+	"DROP" "LIBRARY" IfExists TableName
+	{
+		$$ = &ast.DropLibraryStmt{
+			IfExists: $3.(bool),
+			Library:  $4.(*ast.TableName),
+		}
+	}
+
+CreateSpatialRefSysStmt:
+	"CREATE" "SPATIAL" "REFERENCE" "SYSTEM" IfNotExists NUM SRSAttributeListOpt
+	{
+		$$ = &ast.CreateSpatialRefSysStmt{
+			IfNotExists: $5.(bool),
+			SRID:        getUint64FromNUM($6),
+			Attributes:  $7.([]*ast.SRSAttribute),
+		}
+	}
+|	"CREATE" "OR" "REPLACE" "SPATIAL" "REFERENCE" "SYSTEM" IfNotExists NUM SRSAttributeListOpt
+	{
+		$$ = &ast.CreateSpatialRefSysStmt{
+			OrReplace:   true,
+			IfNotExists: $7.(bool),
+			SRID:        getUint64FromNUM($8),
+			Attributes:  $9.([]*ast.SRSAttribute),
+		}
+	}
+
+DropSpatialRefSysStmt:
+	"DROP" "SPATIAL" "REFERENCE" "SYSTEM" IfExists NUM
+	{
+		$$ = &ast.DropSpatialRefSysStmt{
+			IfExists: $5.(bool),
+			SRID:     getUint64FromNUM($6),
+		}
+	}
+
+SRSAttributeListOpt:
+	{
+		$$ = []*ast.SRSAttribute{}
+	}
+|	SRSAttributeListOpt SRSAttribute
+	{
+		$$ = append($1.([]*ast.SRSAttribute), $2.(*ast.SRSAttribute))
+	}
+
+SRSAttribute:
+	"NAME" stringLit
+	{
+		$$ = &ast.SRSAttribute{Tp: ast.SRSAttrName, Value: $2}
+	}
+|	"DEFINITION" stringLit
+	{
+		$$ = &ast.SRSAttribute{Tp: ast.SRSAttrDefinition, Value: $2}
+	}
+|	"ORGANIZATION" stringLit "IDENTIFIED" "BY" NUM
+	{
+		$$ = &ast.SRSAttribute{Tp: ast.SRSAttrOrganization, Value: $2, OrgID: getUint64FromNUM($5)}
+	}
+|	"DESCRIPTION" stringLit
+	{
+		$$ = &ast.SRSAttribute{Tp: ast.SRSAttrDescription, Value: $2}
+	}
+
+/*******************************************************************
+ * Tablespace and logfile group statements
+ * See https://dev.mysql.com/doc/refman/8.4/en/create-tablespace.html
+ *******************************************************************/
+CreateTablespaceStmt:
+	"CREATE" "TABLESPACE" Identifier TablespaceDataFileOpt TablespaceLogfileGroupOpt TablespaceOptionListOpt
+	{
+		stmt := &ast.CreateTablespaceStmt{
+			Name:         ast.NewCIStr($3),
+			LogfileGroup: ast.NewCIStr($5),
+			Options:      $6.([]*ast.TablespaceOption),
+		}
+		if $4 != "" {
+			stmt.DataFile = $4
+			stmt.HasDataFile = true
+		}
+		$$ = stmt
+	}
+|	"CREATE" "UNDO" "TABLESPACE" Identifier TablespaceDataFileOpt TablespaceOptionListOpt
+	{
+		stmt := &ast.CreateTablespaceStmt{
+			Undo:    true,
+			Name:    ast.NewCIStr($4),
+			Options: $6.([]*ast.TablespaceOption),
+		}
+		if $5 != "" {
+			stmt.DataFile = $5
+			stmt.HasDataFile = true
+		}
+		$$ = stmt
+	}
+
+TablespaceDataFileOpt:
+	{
+		$$ = ""
+	}
+|	"ADD" "DATAFILE" stringLit
+	{
+		$$ = $3
+	}
+
+TablespaceLogfileGroupOpt:
+	{
+		$$ = ""
+	}
+|	"USE" "LOGFILE" "GROUP" Identifier
+	{
+		$$ = $4
+	}
+
+AlterTablespaceStmt:
+	"ALTER" "TABLESPACE" Identifier "ADD" "DATAFILE" stringLit TablespaceOptionListOpt
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Name:     ast.NewCIStr($3),
+			Action:   ast.AlterTablespaceAddDataFile,
+			DataFile: $6,
+			Options:  $7.([]*ast.TablespaceOption),
+		}
+	}
+|	"ALTER" "TABLESPACE" Identifier "DROP" "DATAFILE" stringLit TablespaceOptionListOpt
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Name:     ast.NewCIStr($3),
+			Action:   ast.AlterTablespaceDropDataFile,
+			DataFile: $6,
+			Options:  $7.([]*ast.TablespaceOption),
+		}
+	}
+|	"ALTER" "TABLESPACE" Identifier "RENAME" "TO" Identifier
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Name:    ast.NewCIStr($3),
+			Action:  ast.AlterTablespaceRenameTo,
+			NewName: ast.NewCIStr($6),
+			Options: []*ast.TablespaceOption{},
+		}
+	}
+|	"ALTER" "TABLESPACE" Identifier TablespaceOptionList
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Name:    ast.NewCIStr($3),
+			Options: $4.([]*ast.TablespaceOption),
+		}
+	}
+|	"ALTER" "TABLESPACE" Identifier "SET" "ACTIVE" TablespaceOptionListOpt
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Name:    ast.NewCIStr($3),
+			Action:  ast.AlterTablespaceSetActive,
+			Options: $6.([]*ast.TablespaceOption),
+		}
+	}
+|	"ALTER" "TABLESPACE" Identifier "SET" "INACTIVE" TablespaceOptionListOpt
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Name:    ast.NewCIStr($3),
+			Action:  ast.AlterTablespaceSetInactive,
+			Options: $6.([]*ast.TablespaceOption),
+		}
+	}
+|	"ALTER" "UNDO" "TABLESPACE" Identifier "SET" "ACTIVE" TablespaceOptionListOpt
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Undo:    true,
+			Name:    ast.NewCIStr($4),
+			Action:  ast.AlterTablespaceSetActive,
+			Options: $7.([]*ast.TablespaceOption),
+		}
+	}
+|	"ALTER" "UNDO" "TABLESPACE" Identifier "SET" "INACTIVE" TablespaceOptionListOpt
+	{
+		$$ = &ast.AlterTablespaceStmt{
+			Undo:    true,
+			Name:    ast.NewCIStr($4),
+			Action:  ast.AlterTablespaceSetInactive,
+			Options: $7.([]*ast.TablespaceOption),
+		}
+	}
+
+DropTablespaceStmt:
+	"DROP" "TABLESPACE" Identifier TablespaceOptionListOpt
+	{
+		$$ = &ast.DropTablespaceStmt{
+			Name:    ast.NewCIStr($3),
+			Options: $4.([]*ast.TablespaceOption),
+		}
+	}
+|	"DROP" "UNDO" "TABLESPACE" Identifier TablespaceOptionListOpt
+	{
+		$$ = &ast.DropTablespaceStmt{
+			Undo:    true,
+			Name:    ast.NewCIStr($4),
+			Options: $5.([]*ast.TablespaceOption),
+		}
+	}
+
+CreateLogfileGroupStmt:
+	"CREATE" "LOGFILE" "GROUP" Identifier "ADD" "UNDOFILE" stringLit TablespaceOptionListOpt
+	{
+		$$ = &ast.CreateLogfileGroupStmt{
+			Name:     ast.NewCIStr($4),
+			UndoFile: $7,
+			Options:  $8.([]*ast.TablespaceOption),
+		}
+	}
+
+AlterLogfileGroupStmt:
+	"ALTER" "LOGFILE" "GROUP" Identifier "ADD" "UNDOFILE" stringLit TablespaceOptionListOpt
+	{
+		$$ = &ast.AlterLogfileGroupStmt{
+			Name:     ast.NewCIStr($4),
+			UndoFile: $7,
+			Options:  $8.([]*ast.TablespaceOption),
+		}
+	}
+
+DropLogfileGroupStmt:
+	"DROP" "LOGFILE" "GROUP" Identifier TablespaceOptionListOpt
+	{
+		$$ = &ast.DropLogfileGroupStmt{
+			Name:    ast.NewCIStr($4),
+			Options: $5.([]*ast.TablespaceOption),
+		}
+	}
+
+TablespaceOptionListOpt:
+	{
+		$$ = []*ast.TablespaceOption{}
+	}
+|	TablespaceOptionList
+
+TablespaceOptionList:
+	TablespaceOption
+	{
+		$$ = []*ast.TablespaceOption{$1.(*ast.TablespaceOption)}
+	}
+|	TablespaceOptionList TablespaceOption
+	{
+		$$ = append($1.([]*ast.TablespaceOption), $2.(*ast.TablespaceOption))
+	}
+|	TablespaceOptionList ',' TablespaceOption
+	{
+		$$ = append($1.([]*ast.TablespaceOption), $3.(*ast.TablespaceOption))
+	}
+
+TablespaceOption:
+	"INITIAL_SIZE" EqOpt TablespaceSizeValue
+	{
+		opt := $3.(*ast.TablespaceOption)
+		opt.Tp = ast.TablespaceOptInitialSize
+		$$ = opt
+	}
+|	"MAX_SIZE" EqOpt TablespaceSizeValue
+	{
+		opt := $3.(*ast.TablespaceOption)
+		opt.Tp = ast.TablespaceOptMaxSize
+		$$ = opt
+	}
+|	"EXTENT_SIZE" EqOpt TablespaceSizeValue
+	{
+		opt := $3.(*ast.TablespaceOption)
+		opt.Tp = ast.TablespaceOptExtentSize
+		$$ = opt
+	}
+|	"AUTOEXTEND_SIZE" EqOpt TablespaceSizeValue
+	{
+		opt := $3.(*ast.TablespaceOption)
+		opt.Tp = ast.TablespaceOptAutoextendSize
+		$$ = opt
+	}
+|	"FILE_BLOCK_SIZE" EqOpt TablespaceSizeValue
+	{
+		opt := $3.(*ast.TablespaceOption)
+		opt.Tp = ast.TablespaceOptFileBlockSize
+		$$ = opt
+	}
+|	"UNDO_BUFFER_SIZE" EqOpt TablespaceSizeValue
+	{
+		opt := $3.(*ast.TablespaceOption)
+		opt.Tp = ast.TablespaceOptUndoBufferSize
+		$$ = opt
+	}
+|	"REDO_BUFFER_SIZE" EqOpt TablespaceSizeValue
+	{
+		opt := $3.(*ast.TablespaceOption)
+		opt.Tp = ast.TablespaceOptRedoBufferSize
+		$$ = opt
+	}
+|	"NODEGROUP" EqOpt NUM
+	{
+		$$ = &ast.TablespaceOption{Tp: ast.TablespaceOptNodegroup, UintValue: getUint64FromNUM($3)}
+	}
+|	"WAIT"
+	{
+		$$ = &ast.TablespaceOption{Tp: ast.TablespaceOptWait}
+	}
+|	"NO_WAIT"
+	{
+		$$ = &ast.TablespaceOption{Tp: ast.TablespaceOptNoWait}
+	}
+|	"COMMENT" EqOpt stringLit
+	{
+		$$ = &ast.TablespaceOption{Tp: ast.TablespaceOptComment, StrValue: $3}
+	}
+|	"ENCRYPTION" EqOpt stringLit
+	{
+		$$ = &ast.TablespaceOption{Tp: ast.TablespaceOptEncryption, StrValue: $3}
+	}
+|	"ENGINE" EqOpt StringName
+	{
+		$$ = &ast.TablespaceOption{Tp: ast.TablespaceOptEngine, StrValue: $3}
+	}
+|	"ENGINE_ATTRIBUTE" EqOpt stringLit
+	{
+		$$ = &ast.TablespaceOption{Tp: ast.TablespaceOptEngineAttribute, StrValue: $3}
+	}
+
+TablespaceSizeValue:
+	NUM
+	{
+		$$ = &ast.TablespaceOption{UintValue: getUint64FromNUM($1)}
+	}
+|	Identifier
+	{
+		$$ = &ast.TablespaceOption{StrValue: $1}
 	}
 
 StringName:
@@ -10231,24 +13857,36 @@ WhereClauseOptional:
  *  https://dev.mysql.com/doc/refman/5.7/en/account-management-sql.html
  ************************************************************************************/
 CreateUserStmt:
-	"CREATE" "USER" IfNotExists UserSpecList RequireClauseOpt ConnectionOptions PasswordOrLockOptions CommentOrAttributeOption ResourceGroupNameOption
+	"CREATE" "USER" IfNotExists UserSpecList DefaultRoleClauseOpt RequireClauseOpt ConnectionOptions PasswordOrLockOptions CommentOrAttributeOption ResourceGroupNameOption
 	{
 		// See https://dev.mysql.com/doc/refman/8.0/en/create-user.html
 		ret := &ast.CreateUserStmt{
 			IsCreateRole:          false,
 			IfNotExists:           $3.(bool),
 			Specs:                 $4.([]*ast.UserSpec),
-			AuthTokenOrTLSOptions: $5.([]*ast.AuthTokenOrTLSOption),
-			ResourceOptions:       $6.([]*ast.ResourceOption),
-			PasswordOrLockOptions: $7.([]*ast.PasswordOrLockOption),
+			AuthTokenOrTLSOptions: $6.([]*ast.AuthTokenOrTLSOption),
+			ResourceOptions:       $7.([]*ast.ResourceOption),
+			PasswordOrLockOptions: $8.([]*ast.PasswordOrLockOption),
 		}
-		if $8 != nil {
-			ret.CommentOrAttributeOption = $8.(*ast.CommentOrAttributeOption)
+		if $5 != nil {
+			ret.DefaultRoles = $5.([]*auth.RoleIdentity)
 		}
 		if $9 != nil {
-			ret.ResourceGroupNameOption = $9.(*ast.ResourceGroupNameOption)
+			ret.CommentOrAttributeOption = $9.(*ast.CommentOrAttributeOption)
+		}
+		if $10 != nil {
+			ret.ResourceGroupNameOption = $10.(*ast.ResourceGroupNameOption)
 		}
 		$$ = ret
+	}
+
+DefaultRoleClauseOpt:
+	{
+		$$ = nil
+	}
+|	"DEFAULT" "ROLE" RolenameList
+	{
+		$$ = $3
 	}
 
 CreateRoleStmt:
@@ -10281,24 +13919,32 @@ AlterUserStmt:
 		}
 		$$ = ret
 	}
-|	"ALTER" "USER" IfExists "USER" '(' ')' "IDENTIFIED" "BY" AuthString
+|	"ALTER" "USER" IfExists "USER" '(' ')' "IDENTIFIED" "BY" AuthString ReplacePasswordOpt
 	{
 		auth := &ast.AuthOption{
 			AuthString:   $9,
 			ByAuthString: true,
+		}
+		if $10 != nil {
+			auth.HasReplace = true
+			auth.ReplaceString = $10.(string)
 		}
 		$$ = &ast.AlterUserStmt{
 			IfExists:    $3.(bool),
 			CurrentAuth: auth,
 		}
 	}
-|	"ALTER" "USER" IfExists "USER" '(' ')' "IDENTIFIED" "BY" AuthString "RETAIN" "CURRENT" "PASSWORD"
+|	"ALTER" "USER" IfExists "USER" '(' ')' "IDENTIFIED" "BY" AuthString ReplacePasswordOpt "RETAIN" "CURRENT" "PASSWORD"
 	{
 		// MySQL 8.0 user_func_auth_option allows RETAIN CURRENT PASSWORD on
 		// the current-user form.
 		auth := &ast.AuthOption{
 			AuthString:   $9,
 			ByAuthString: true,
+		}
+		if $10 != nil {
+			auth.HasReplace = true
+			auth.ReplaceString = $10.(string)
 		}
 		$$ = &ast.AlterUserStmt{
 			IfExists:                  $3.(bool),
@@ -10315,6 +13961,86 @@ AlterUserStmt:
 			CurrentDualPasswordOption: ast.DualPasswordDiscardOld,
 		}
 	}
+|	"ALTER" "USER" IfExists Username "DEFAULT" "ROLE" SetDefaultRoleOpt
+	{
+		// ALTER USER ... DEFAULT ROLE {NONE | ALL | role [, role]...}
+		tmp := $7.(*ast.SetRoleStmt)
+		$$ = &ast.AlterUserDefaultRoleStmt{
+			IfExists:   $3.(bool),
+			User:       $4.(*auth.UserIdentity),
+			SetRoleOpt: tmp.SetRoleOpt,
+			RoleList:   tmp.RoleList,
+		}
+	}
+|	"ALTER" "USER" IfExists Username "ADD" NUM "FACTOR" IdentifiedOption
+	{
+		// Multi-factor authentication management (MySQL 8.0.27+).
+		$$ = &ast.AlterUserFactorStmt{
+			IfExists: $3.(bool),
+			User:     $4.(*auth.UserIdentity),
+			Op:       ast.FactorOpAdd,
+			Factor:   getUint64FromNUM($6),
+			AuthOpt:  $8.(*ast.AuthOption),
+		}
+	}
+|	"ALTER" "USER" IfExists Username "MODIFY" NUM "FACTOR" IdentifiedOption
+	{
+		$$ = &ast.AlterUserFactorStmt{
+			IfExists: $3.(bool),
+			User:     $4.(*auth.UserIdentity),
+			Op:       ast.FactorOpModify,
+			Factor:   getUint64FromNUM($6),
+			AuthOpt:  $8.(*ast.AuthOption),
+		}
+	}
+|	"ALTER" "USER" IfExists Username "DROP" NUM "FACTOR"
+	{
+		$$ = &ast.AlterUserFactorStmt{
+			IfExists: $3.(bool),
+			User:     $4.(*auth.UserIdentity),
+			Op:       ast.FactorOpDrop,
+			Factor:   getUint64FromNUM($6),
+		}
+	}
+|	"ALTER" "USER" IfExists Username NUM "FACTOR" "INITIATE" "REGISTRATION"
+	{
+		// WebAuthn device registration (MySQL 8.0.27+).
+		$$ = &ast.AlterUserFactorStmt{
+			IfExists: $3.(bool),
+			User:     $4.(*auth.UserIdentity),
+			Op:       ast.FactorOpInitiateRegistration,
+			Factor:   getUint64FromNUM($5),
+		}
+	}
+|	"ALTER" "USER" IfExists Username NUM "FACTOR" "FINISH" "REGISTRATION"
+	{
+		$$ = &ast.AlterUserFactorStmt{
+			IfExists: $3.(bool),
+			User:     $4.(*auth.UserIdentity),
+			Op:       ast.FactorOpFinishRegistration,
+			Factor:   getUint64FromNUM($5),
+		}
+	}
+|	"ALTER" "USER" IfExists Username NUM "FACTOR" "FINISH" "REGISTRATION" "SET" "CHALLENGE_RESPONSE" "AS" AuthString
+	{
+		$$ = &ast.AlterUserFactorStmt{
+			IfExists:             $3.(bool),
+			User:                 $4.(*auth.UserIdentity),
+			Op:                   ast.FactorOpFinishRegistration,
+			Factor:               getUint64FromNUM($5),
+			HasChallengeResponse: true,
+			ChallengeResponse:    $12,
+		}
+	}
+|	"ALTER" "USER" IfExists Username NUM "FACTOR" "UNREGISTER"
+	{
+		$$ = &ast.AlterUserFactorStmt{
+			IfExists: $3.(bool),
+			User:     $4.(*auth.UserIdentity),
+			Op:       ast.FactorOpUnregister,
+			Factor:   getUint64FromNUM($5),
+		}
+	}
 
 /* See https://dev.mysql.com/doc/refman/8.0/en/alter-instance.html */
 AlterInstanceStmt:
@@ -10324,18 +14050,68 @@ AlterInstanceStmt:
 	}
 
 InstanceOption:
-	"RELOAD" "TLS"
-	{
-		$$ = &ast.AlterInstanceStmt{
-			ReloadTLS: true,
-		}
-	}
-|	"RELOAD" "TLS" "NO" "ROLLBACK" "ON" "ERROR"
+	"RELOAD" "TLS" TLSChannelOpt NoRollbackOnErrorOpt
 	{
 		$$ = &ast.AlterInstanceStmt{
 			ReloadTLS:         true,
-			NoRollbackOnError: true,
+			TLSChannel:        $3,
+			NoRollbackOnError: $4.(bool),
 		}
+	}
+|	"RELOAD" "KEYRING"
+	{
+		$$ = &ast.AlterInstanceStmt{
+			ReloadKeyring: true,
+		}
+	}
+|	"ROTATE" Identifier "MASTER" "KEY"
+	{
+		engine := strings.ToUpper($2)
+		if engine != "INNODB" && engine != "BINLOG" {
+			yylex.AppendError(yylex.Errorf("ALTER INSTANCE ROTATE %s MASTER KEY is not supported", $2))
+			return 1
+		}
+		$$ = &ast.AlterInstanceStmt{
+			RotateMasterKey: engine,
+		}
+	}
+|	"ENABLE" Identifier Identifier
+	{
+		if !strings.EqualFold($2, "INNODB") || !strings.EqualFold($3, "REDO_LOG") {
+			yylex.AppendError(yylex.Errorf("ALTER INSTANCE ENABLE %s %s is not supported", $2, $3))
+			return 1
+		}
+		$$ = &ast.AlterInstanceStmt{
+			RedoLog: ast.RedoLogActionEnable,
+		}
+	}
+|	"DISABLE" Identifier Identifier
+	{
+		if !strings.EqualFold($2, "INNODB") || !strings.EqualFold($3, "REDO_LOG") {
+			yylex.AppendError(yylex.Errorf("ALTER INSTANCE DISABLE %s %s is not supported", $2, $3))
+			return 1
+		}
+		$$ = &ast.AlterInstanceStmt{
+			RedoLog: ast.RedoLogActionDisable,
+		}
+	}
+
+TLSChannelOpt:
+	{
+		$$ = ""
+	}
+|	"FOR" "CHANNEL" Identifier
+	{
+		$$ = $3
+	}
+
+NoRollbackOnErrorOpt:
+	{
+		$$ = false
+	}
+|	"NO" "ROLLBACK" "ON" "ERROR"
+	{
+		$$ = true
 	}
 
 UserSpec:
@@ -10348,6 +14124,24 @@ UserSpec:
 			userSpec.AuthOpt = $2.(*ast.AuthOption)
 		}
 		$$ = userSpec
+	}
+|	Username IdentifiedOption "AND" IdentifiedOption
+	{
+		// Two-factor authentication spec (MySQL 8.0.27+).
+		$$ = &ast.UserSpec{
+			User:             $1.(*auth.UserIdentity),
+			AuthOpt:          $2.(*ast.AuthOption),
+			ExtraAuthFactors: []*ast.AuthOption{$4.(*ast.AuthOption)},
+		}
+	}
+|	Username IdentifiedOption "AND" IdentifiedOption "AND" IdentifiedOption
+	{
+		// Three-factor authentication spec (MySQL 8.0.27+).
+		$$ = &ast.UserSpec{
+			User:             $1.(*auth.UserIdentity),
+			AuthOpt:          $2.(*ast.AuthOption),
+			ExtraAuthFactors: []*ast.AuthOption{$4.(*ast.AuthOption), $6.(*ast.AuthOption)},
+		}
 	}
 
 UserSpecList:
@@ -10384,6 +14178,24 @@ AlterUserSpec:
 		}
 		$$ = userSpec
 	}
+|	Username IdentifiedOption "AND" IdentifiedOption
+	{
+		// Two-factor authentication spec (MySQL 8.0.27+).
+		$$ = &ast.UserSpec{
+			User:             $1.(*auth.UserIdentity),
+			AuthOpt:          $2.(*ast.AuthOption),
+			ExtraAuthFactors: []*ast.AuthOption{$4.(*ast.AuthOption)},
+		}
+	}
+|	Username IdentifiedOption "AND" IdentifiedOption "AND" IdentifiedOption
+	{
+		// Three-factor authentication spec (MySQL 8.0.27+).
+		$$ = &ast.UserSpec{
+			User:             $1.(*auth.UserIdentity),
+			AuthOpt:          $2.(*ast.AuthOption),
+			ExtraAuthFactors: []*ast.AuthOption{$4.(*ast.AuthOption), $6.(*ast.AuthOption)},
+		}
+	}
 |	Username AuthOptionWithPassword "RETAIN" "CURRENT" "PASSWORD"
 	{
 		$$ = &ast.UserSpec{
@@ -10418,20 +14230,51 @@ AlterUserSpecList:
  * option at all).
  */
 AuthOptionWithPassword:
-	"IDENTIFIED" "BY" AuthString
+	"IDENTIFIED" "BY" AuthString ReplacePasswordOpt
 	{
-		$$ = &ast.AuthOption{
+		opt := &ast.AuthOption{
 			AuthString:   $3,
 			ByAuthString: true,
 		}
+		if $4 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $4.(string)
+		}
+		$$ = opt
 	}
-|	"IDENTIFIED" "WITH" AuthPlugin "BY" AuthString
+|	"IDENTIFIED" "BY" "RANDOM" "PASSWORD" ReplacePasswordOpt
 	{
-		$$ = &ast.AuthOption{
+		opt := &ast.AuthOption{ByRandomPassword: true}
+		if $5 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $5.(string)
+		}
+		$$ = opt
+	}
+|	"IDENTIFIED" "WITH" AuthPlugin "BY" AuthString ReplacePasswordOpt
+	{
+		opt := &ast.AuthOption{
 			AuthPlugin:   $3,
 			AuthString:   $5,
 			ByAuthString: true,
 		}
+		if $6 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $6.(string)
+		}
+		$$ = opt
+	}
+|	"IDENTIFIED" "WITH" AuthPlugin "BY" "RANDOM" "PASSWORD" ReplacePasswordOpt
+	{
+		opt := &ast.AuthOption{
+			AuthPlugin:       $3,
+			ByRandomPassword: true,
+		}
+		if $7 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $7.(string)
+		}
+		$$ = opt
 	}
 
 ConnectionOptions:
@@ -10707,31 +14550,85 @@ PasswordOrLockOption:
 			Type: ast.PasswordRequireCurrentDefault,
 		}
 	}
+|	"PASSWORD" "REQUIRE" "CURRENT"
+	{
+		$$ = &ast.PasswordOrLockOption{
+			Type: ast.PasswordRequireCurrent,
+		}
+	}
+|	"PASSWORD" "REQUIRE" "CURRENT" "OPTIONAL"
+	{
+		$$ = &ast.PasswordOrLockOption{
+			Type: ast.PasswordRequireCurrentOptional,
+		}
+	}
 
 AuthOption:
 	{
 		$$ = nil
 	}
-|	"IDENTIFIED" "BY" AuthString
+|	IdentifiedOption
+
+/*
+ * IdentifiedOption is one authentication factor. MySQL 8.0.27+ multi-factor
+ * specs chain up to three of these with AND (see UserSpec / AlterUserSpec).
+ */
+IdentifiedOption:
+	"IDENTIFIED" "BY" AuthString ReplacePasswordOpt
 	{
-		$$ = &ast.AuthOption{
+		opt := &ast.AuthOption{
 			AuthString:   $3,
 			ByAuthString: true,
 		}
+		if $4 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $4.(string)
+		}
+		$$ = opt
 	}
-|	"IDENTIFIED" "WITH" AuthPlugin
+|	"IDENTIFIED" "BY" "RANDOM" "PASSWORD" ReplacePasswordOpt
 	{
+		opt := &ast.AuthOption{ByRandomPassword: true}
+		if $5 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $5.(string)
+		}
+		$$ = opt
+	}
+|	"IDENTIFIED" "WITH" AuthPlugin %prec empty
+	{
+		// %prec empty: GrantAsOpt puts AS in the follow set of a GRANT user
+		// spec, which LALR-merges into this state. Prefer shifting AS so
+		// IDENTIFIED WITH plugin AS 'hash' parses as the hash form; the rule's
+		// implicit precedence (from WITH) would otherwise win and reduce here.
 		$$ = &ast.AuthOption{
 			AuthPlugin: $3,
 		}
 	}
-|	"IDENTIFIED" "WITH" AuthPlugin "BY" AuthString
+|	"IDENTIFIED" "WITH" AuthPlugin "BY" AuthString ReplacePasswordOpt
 	{
-		$$ = &ast.AuthOption{
+		opt := &ast.AuthOption{
 			AuthPlugin:   $3,
 			AuthString:   $5,
 			ByAuthString: true,
 		}
+		if $6 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $6.(string)
+		}
+		$$ = opt
+	}
+|	"IDENTIFIED" "WITH" AuthPlugin "BY" "RANDOM" "PASSWORD" ReplacePasswordOpt
+	{
+		opt := &ast.AuthOption{
+			AuthPlugin:       $3,
+			ByRandomPassword: true,
+		}
+		if $7 != nil {
+			opt.HasReplace = true
+			opt.ReplaceString = $7.(string)
+		}
+		$$ = opt
 	}
 |	"IDENTIFIED" "WITH" AuthPlugin "AS" HashString
 	{
@@ -10741,6 +14638,14 @@ AuthOption:
 			ByHashString: true,
 		}
 	}
+|	"IDENTIFIED" "WITH" AuthPlugin "INITIAL" "AUTHENTICATION" InitialAuthOption
+	{
+		// Passwordless authentication setup (MySQL 8.0.27+).
+		$$ = &ast.AuthOption{
+			AuthPlugin:  $3,
+			InitialAuth: $6.(*ast.AuthOption),
+		}
+	}
 |	"IDENTIFIED" "BY" "PASSWORD" HashString
 	{
 		$$ = &ast.AuthOption{
@@ -10748,6 +14653,46 @@ AuthOption:
 			HashString:   $4,
 			ByHashString: true,
 		}
+	}
+
+InitialAuthOption:
+	"IDENTIFIED" "BY" AuthString
+	{
+		$$ = &ast.AuthOption{
+			AuthString:   $3,
+			ByAuthString: true,
+		}
+	}
+|	"IDENTIFIED" "BY" "RANDOM" "PASSWORD"
+	{
+		$$ = &ast.AuthOption{ByRandomPassword: true}
+	}
+|	"IDENTIFIED" "WITH" AuthPlugin "AS" HashString
+	{
+		$$ = &ast.AuthOption{
+			AuthPlugin:   $3,
+			HashString:   $5,
+			ByHashString: true,
+		}
+	}
+
+ReplacePasswordOpt:
+	{
+		$$ = nil
+	}
+|	"REPLACE" AuthString
+	{
+		// REPLACE 'current password' for password verification (8.0.14+).
+		$$ = $2
+	}
+
+RetainCurrentPasswordOpt:
+	{
+		$$ = false
+	}
+|	"RETAIN" "CURRENT" "PASSWORD"
+	{
+		$$ = true
 	}
 
 AuthPlugin:
@@ -10785,20 +14730,46 @@ RoleSpecList:
 	}
 
 GrantStmt:
-	"GRANT" RoleOrPrivElemList "ON" ObjectType PrivLevel "TO" UserSpecList RequireClauseOpt WithGrantOptionOpt
+	"GRANT" RoleOrPrivElemList "ON" ObjectType PrivLevel "TO" UserSpecList RequireClauseOpt WithGrantOptionOpt GrantAsOpt
 	{
 		p, err := convertToPriv($2.([]*ast.RoleOrPriv))
 		if err != nil {
 			yylex.AppendError(err)
 			return 1
 		}
-		$$ = &ast.GrantStmt{
+		ret := &ast.GrantStmt{
 			Privs:                 p,
 			ObjectType:            $4.(ast.ObjectTypeType),
 			Level:                 $5.(*ast.GrantLevel),
 			Users:                 $7.([]*ast.UserSpec),
 			AuthTokenOrTLSOptions: $8.([]*ast.AuthTokenOrTLSOption),
 			WithGrant:             $9.(bool),
+		}
+		if $10 != nil {
+			ret.As = $10.(*ast.GrantAsClause)
+		}
+		$$ = ret
+	}
+
+GrantAsOpt:
+	{
+		$$ = nil
+	}
+|	"AS" Username
+	{
+		// GRANT ... AS user [WITH ROLE ...] (MySQL 8.0.16+).
+		$$ = &ast.GrantAsClause{
+			User: $2.(*auth.UserIdentity),
+		}
+	}
+|	"AS" Username "WITH" "ROLE" SetRoleOpt
+	{
+		tmp := $5.(*ast.SetRoleStmt)
+		$$ = &ast.GrantAsClause{
+			User:       $2.(*auth.UserIdentity),
+			WithRole:   true,
+			SetRoleOpt: tmp.SetRoleOpt,
+			RoleList:   tmp.RoleList,
 		}
 	}
 
@@ -10823,6 +14794,19 @@ GrantRoleStmt:
 		$$ = &ast.GrantRoleStmt{
 			Roles: r,
 			Users: $4.([]*auth.UserIdentity),
+		}
+	}
+|	"GRANT" RoleOrPrivElemList "TO" UsernameList "WITH" "ADMIN" "OPTION"
+	{
+		r, err := convertToRole($2.([]*ast.RoleOrPriv))
+		if err != nil {
+			yylex.AppendError(err)
+			return 1
+		}
+		$$ = &ast.GrantRoleStmt{
+			Roles:           r,
+			Users:           $4.([]*auth.UserIdentity),
+			WithAdminOption: true,
 		}
 	}
 
@@ -11077,6 +15061,10 @@ ObjectType:
 	{
 		$$ = ast.ObjectTypeProcedure
 	}
+|	"LIBRARY"
+	{
+		$$ = ast.ObjectTypeLibrary
+	}
 
 PrivLevel:
 	'*'
@@ -11118,78 +15106,142 @@ PrivLevel:
  * See https://dev.mysql.com/doc/refman/5.7/en/revoke.html
  *******************************************************************************************/
 RevokeStmt:
-	"REVOKE" RoleOrPrivElemList "ON" ObjectType PrivLevel "FROM" UserSpecList
+	"REVOKE" IfExists RoleOrPrivElemList "ON" ObjectType PrivLevel "FROM" UserSpecList IgnoreUnknownUserOpt
 	{
-		p, err := convertToPriv($2.([]*ast.RoleOrPriv))
+		p, err := convertToPriv($3.([]*ast.RoleOrPriv))
 		if err != nil {
 			yylex.AppendError(err)
 			return 1
 		}
 		$$ = &ast.RevokeStmt{
-			Privs:      p,
-			ObjectType: $4.(ast.ObjectTypeType),
-			Level:      $5.(*ast.GrantLevel),
-			Users:      $7.([]*ast.UserSpec),
+			IfExists:          $2.(bool),
+			Privs:             p,
+			ObjectType:        $5.(ast.ObjectTypeType),
+			Level:             $6.(*ast.GrantLevel),
+			Users:             $8.([]*ast.UserSpec),
+			IgnoreUnknownUser: $9.(bool),
 		}
 	}
 
 RevokeRoleStmt:
-	"REVOKE" RoleOrPrivElemList "FROM" UsernameList
+	"REVOKE" IfExists RoleOrPrivElemList "FROM" UsernameList IgnoreUnknownUserOpt
 	{
 		// MySQL has special syntax for REVOKE ALL [PRIVILEGES], GRANT OPTION
 		// which uses the RevokeRoleStmt syntax but is of type RevokeStmt.
 		// It is documented at https://dev.mysql.com/doc/refman/5.7/en/revoke.html
 		// as the "second syntax" for REVOKE. It is only valid if *both*
 		// ALL PRIVILEGES + GRANT OPTION are specified in that order.
-		if isRevokeAllGrant($2.([]*ast.RoleOrPriv)) {
+		if isRevokeAllGrant($3.([]*ast.RoleOrPriv)) {
 			var users []*ast.UserSpec
-			for _, u := range $4.([]*auth.UserIdentity) {
+			for _, u := range $5.([]*auth.UserIdentity) {
 				users = append(users, &ast.UserSpec{
 					User: u,
 				})
 			}
 			$$ = &ast.RevokeStmt{
-				Privs:      []*ast.PrivElem{{Priv: mysql.AllPriv}, {Priv: mysql.GrantPriv}},
-				ObjectType: ast.ObjectTypeNone,
-				Level:      &ast.GrantLevel{Level: ast.GrantLevelGlobal},
-				Users:      users,
+				IfExists:          $2.(bool),
+				Privs:             []*ast.PrivElem{{Priv: mysql.AllPriv}, {Priv: mysql.GrantPriv}},
+				ObjectType:        ast.ObjectTypeNone,
+				Level:             &ast.GrantLevel{Level: ast.GrantLevelGlobal},
+				Users:             users,
+				IgnoreUnknownUser: $6.(bool),
 			}
 		} else {
-			r, err := convertToRole($2.([]*ast.RoleOrPriv))
+			r, err := convertToRole($3.([]*ast.RoleOrPriv))
 			if err != nil {
 				yylex.AppendError(err)
 				return 1
 			}
 			$$ = &ast.RevokeRoleStmt{
-				Roles: r,
-				Users: $4.([]*auth.UserIdentity),
+				IfExists:          $2.(bool),
+				Roles:             r,
+				Users:             $5.([]*auth.UserIdentity),
+				IgnoreUnknownUser: $6.(bool),
 			}
 		}
+	}
+
+RevokeProxyStmt:
+	"REVOKE" IfExists "PROXY" "ON" Username "FROM" UsernameList IgnoreUnknownUserOpt
+	{
+		$$ = &ast.RevokeProxyStmt{
+			IfExists:          $2.(bool),
+			LocalUser:         $5.(*auth.UserIdentity),
+			ExternalUsers:     $7.([]*auth.UserIdentity),
+			IgnoreUnknownUser: $8.(bool),
+		}
+	}
+
+IgnoreUnknownUserOpt:
+	{
+		$$ = false
+	}
+|	"IGNORE" "UNKNOWN" "USER"
+	{
+		// REVOKE ... IGNORE UNKNOWN USER (MySQL 8.0.30+).
+		$$ = true
 	}
 
 /**************************************LoadDataStmt*****************************************
  * See https://dev.mysql.com/doc/refman/5.7/en/load-data.html
  *******************************************************************************************/
 LoadDataStmt:
-	"LOAD" "DATA" LowPriorityOpt LocalOpt "INFILE" stringLit DuplicateOpt "INTO" "TABLE" TableName CharsetOpt Fields Lines IgnoreLines ColumnNameOrUserVarListOptWithBrackets LoadDataSetSpecOpt
+	"LOAD" "DATA" LoadDataPriorityOpt FromKwdOpt LocalOpt "INFILE" stringLit InPrimaryKeyOrderOpt DuplicateOpt "INTO" "TABLE" TableName PartitionNameListOpt CharsetOpt Fields Lines IgnoreLines ColumnNameOrUserVarListOptWithBrackets LoadDataSetSpecOpt
 	{
 		x := &ast.LoadDataStmt{
+			LowPriority:        $3.(int) == 1,
+			Concurrent:         $3.(int) == 2,
+			InPrimaryKeyOrder:  $8.(bool),
+			FileLocRef:         ast.FileLocServer,
+			Path:               $7,
+			OnDuplicate:        $9.(ast.OnDuplicateKeyHandlingType),
+			Table:              $12.(*ast.TableName),
+			Charset:            $14.(*string),
+			FieldsInfo:         $15.(*ast.FieldsClause),
+			LinesInfo:          $16.(*ast.LinesClause),
+			IgnoreLines:        $17.(*uint64),
+			ColumnsAndUserVars: $18.([]*ast.ColumnNameOrUserVar),
+			ColumnAssignments:  $19.([]*ast.Assignment),
+		}
+		if names := $13.([]ast.CIStr); len(names) > 0 {
+			x.Table.PartitionNames = names
+		}
+		if $5 != nil {
+			x.FileLocRef = ast.FileLocClient
+			// See https://dev.mysql.com/doc/refman/5.7/en/load-data.html#load-data-duplicate-key-handling
+			// If you do not specify IGNORE or REPLACE modifier , then we set default behavior to IGNORE when LOCAL modifier is specified
+			if x.OnDuplicate == ast.OnDuplicateKeyHandlingError {
+				x.OnDuplicate = ast.OnDuplicateKeyHandlingIgnore
+			}
+		}
+		columns := []*ast.ColumnName{}
+		for _, v := range x.ColumnsAndUserVars {
+			if v.ColumnName != nil {
+				columns = append(columns, v.ColumnName)
+			}
+		}
+		x.Columns = columns
+
+		$$ = x
+	}
+|	"LOAD" "XML" LowPriorityOpt LocalOpt "INFILE" stringLit DuplicateOpt "INTO" "TABLE" TableName CharsetOpt XmlRowsIdentifiedByOpt IgnoreLines ColumnNameOrUserVarListOptWithBrackets LoadDataSetSpecOpt
+	{
+		x := &ast.LoadDataStmt{
+			Xml:                true,
 			LowPriority:        $3.(bool),
 			FileLocRef:         ast.FileLocServer,
 			Path:               $6,
 			OnDuplicate:        $7.(ast.OnDuplicateKeyHandlingType),
 			Table:              $10.(*ast.TableName),
 			Charset:            $11.(*string),
-			FieldsInfo:         $12.(*ast.FieldsClause),
-			LinesInfo:          $13.(*ast.LinesClause),
-			IgnoreLines:        $14.(*uint64),
-			ColumnsAndUserVars: $15.([]*ast.ColumnNameOrUserVar),
-			ColumnAssignments:  $16.([]*ast.Assignment),
+			XmlRowTag:          $12,
+			IgnoreLines:        $13.(*uint64),
+			ColumnsAndUserVars: $14.([]*ast.ColumnNameOrUserVar),
+			ColumnAssignments:  $15.([]*ast.Assignment),
 		}
 		if $4 != nil {
 			x.FileLocRef = ast.FileLocClient
-			// See https://dev.mysql.com/doc/refman/5.7/en/load-data.html#load-data-duplicate-key-handling
-			// If you do not specify IGNORE or REPLACE modifier , then we set default behavior to IGNORE when LOCAL modifier is specified
+			// LOCAL mode defaults duplicate handling to IGNORE, same as LOAD DATA.
 			if x.OnDuplicate == ast.OnDuplicateKeyHandlingError {
 				x.OnDuplicate = ast.OnDuplicateKeyHandlingIgnore
 			}
@@ -11214,6 +15266,34 @@ LowPriorityOpt:
 		$$ = true
 	}
 
+LoadDataPriorityOpt:
+	{
+		$$ = 0
+	}
+|	"LOW_PRIORITY"
+	{
+		$$ = 1
+	}
+|	"CONCURRENT"
+	{
+		$$ = 2
+	}
+
+FromKwdOpt:
+	{}
+|	"FROM"
+	{}
+
+InPrimaryKeyOrderOpt:
+	{
+		$$ = false
+	}
+|	"IN" "PRIMARY" "KEY" "ORDER"
+	{
+		// NDB-only load ordering hint; parsed and ignored by other engines.
+		$$ = true
+	}
+
 IgnoreLines:
 	{
 		$$ = (*uint64)(nil)
@@ -11222,6 +15302,20 @@ IgnoreLines:
 	{
 		v := getUint64FromNUM($2)
 		$$ = &v
+	}
+|	"IGNORE" NUM "ROWS"
+	{
+		v := getUint64FromNUM($2)
+		$$ = &v
+	}
+
+XmlRowsIdentifiedByOpt:
+	{
+		$$ = ""
+	}
+|	"ROWS" "IDENTIFIED" "BY" stringLit
+	{
+		$$ = $4
 	}
 
 CharsetOpt:
@@ -11407,7 +15501,7 @@ LoadDataSetList:
 	}
 
 LoadDataSetItem:
-	SimpleIdent "=" ExprOrDefault
+	SimpleIdent EqOrAssignmentEq ExprOrDefault
 	{
 		$$ = &ast.Assignment{
 			Column: $1.(*ast.ColumnNameExpr).Name,
@@ -11434,11 +15528,12 @@ TablesTerminalSym:
 |	"TABLE"
 
 TableLock:
-	TableName LockType
+	TableName TableAsNameOpt LockType
 	{
 		$$ = ast.TableLock{
 			Table: $1.(*ast.TableName),
-			Type:  $2.(ast.TableLockType),
+			Alias: $2.(ast.CIStr),
+			Type:  $3.(ast.TableLockType),
 		}
 	}
 
@@ -11459,6 +15554,10 @@ LockType:
 	{
 		$$ = ast.TableLockWriteLocal
 	}
+|	"LOW_PRIORITY" "WRITE"
+	{
+		$$ = ast.TableLockLowPriorityWrite
+	}
 
 TableLockList:
 	TableLock
@@ -11471,9 +15570,1018 @@ TableLockList:
 	}
 
 /********************************************************************
+ * Table maintenance statements
+ * See https://dev.mysql.com/doc/refman/8.0/en/table-maintenance-statements.html
+ *******************************************************************/
+CheckTableStmt:
+	"CHECK" TablesTerminalSym TableNameList CheckTableOptionListOpt
+	{
+		$$ = &ast.CheckTableStmt{
+			Tables:  $3.([]*ast.TableName),
+			Options: $4.([]ast.CheckTableCheckOption),
+		}
+	}
+
+CheckTableOptionListOpt:
+	/* empty */
+	{
+		$$ = []ast.CheckTableCheckOption{}
+	}
+|	CheckTableOptionListOpt CheckTableOption
+	{
+		$$ = append($1.([]ast.CheckTableCheckOption), $2.(ast.CheckTableCheckOption))
+	}
+
+CheckTableOption:
+	"FOR" "UPGRADE"
+	{
+		$$ = ast.CheckOptionForUpgrade
+	}
+|	"QUICK"
+	{
+		$$ = ast.CheckOptionQuick
+	}
+|	"FAST"
+	{
+		$$ = ast.CheckOptionFast
+	}
+|	"MEDIUM"
+	{
+		$$ = ast.CheckOptionMedium
+	}
+|	"EXTENDED"
+	{
+		$$ = ast.CheckOptionExtended
+	}
+|	"CHANGED"
+	{
+		$$ = ast.CheckOptionChanged
+	}
+
+ChecksumTableStmt:
+	"CHECKSUM" TablesTerminalSym TableNameList ChecksumTypeOpt
+	{
+		$$ = &ast.ChecksumTableStmt{
+			Tables: $3.([]*ast.TableName),
+			Type:   $4.(ast.ChecksumType),
+		}
+	}
+
+ChecksumTypeOpt:
+	/* empty */
+	{
+		$$ = ast.ChecksumTypeDefault
+	}
+|	"QUICK"
+	{
+		$$ = ast.ChecksumTypeQuick
+	}
+|	"EXTENDED"
+	{
+		$$ = ast.ChecksumTypeExtended
+	}
+
+/********************************************************************
+ * HANDLER statements
+ * See https://dev.mysql.com/doc/refman/8.0/en/handler.html
+ *******************************************************************/
+HandlerStmt:
+	"HANDLER" TableName "OPEN" TableAsNameOpt
+	{
+		$$ = &ast.HandlerOpenStmt{
+			Table:  $2.(*ast.TableName),
+			AsName: $4.(ast.CIStr),
+		}
+	}
+|	"HANDLER" Identifier "CLOSE"
+	{
+		$$ = &ast.HandlerCloseStmt{Handler: ast.NewCIStr($2)}
+	}
+|	"HANDLER" Identifier "READ" HandlerReadTarget WhereClauseOptional SelectStmtLimitOpt
+	{
+		stmt := $4.(*ast.HandlerReadStmt)
+		stmt.Handler = ast.NewCIStr($2)
+		if $5 != nil {
+			stmt.Where = $5.(ast.ExprNode)
+		}
+		if $6 != nil {
+			stmt.Limit = $6.(*ast.Limit)
+		}
+		$$ = stmt
+	}
+
+HandlerReadTarget:
+	"FIRST"
+	{
+		$$ = &ast.HandlerReadStmt{Direction: "FIRST"}
+	}
+|	"NEXT"
+	{
+		$$ = &ast.HandlerReadStmt{Direction: "NEXT"}
+	}
+|	Identifier "FIRST"
+	{
+		$$ = &ast.HandlerReadStmt{Index: ast.NewCIStr($1), Direction: "FIRST"}
+	}
+|	Identifier "NEXT"
+	{
+		$$ = &ast.HandlerReadStmt{Index: ast.NewCIStr($1), Direction: "NEXT"}
+	}
+|	Identifier "PREV"
+	{
+		$$ = &ast.HandlerReadStmt{Index: ast.NewCIStr($1), Direction: "PREV"}
+	}
+|	Identifier "LAST"
+	{
+		$$ = &ast.HandlerReadStmt{Index: ast.NewCIStr($1), Direction: "LAST"}
+	}
+|	Identifier HandlerCompareOp '(' ExpressionList ')'
+	{
+		$$ = &ast.HandlerReadStmt{
+			Index:     ast.NewCIStr($1),
+			CompareOp: $2.(string),
+			Values:    $4.([]ast.ExprNode),
+		}
+	}
+
+HandlerCompareOp:
+	"="
+	{
+		$$ = "="
+	}
+|	'<'
+	{
+		$$ = "<"
+	}
+|	'>'
+	{
+		$$ = ">"
+	}
+|	"<="
+	{
+		$$ = "<="
+	}
+|	">="
+	{
+		$$ = ">="
+	}
+
+/********************************************************************
+ * PURGE BINARY LOGS. The deprecated MASTER spelling parses to the
+ * same node and restores as BINARY.
+ * See https://dev.mysql.com/doc/refman/8.0/en/purge-binary-logs.html
+ *******************************************************************/
+PurgeStmt:
+	"PURGE" BinaryOrMasterSym "LOGS" "TO" stringLit
+	{
+		$$ = &ast.PurgeLogsStmt{To: $5}
+	}
+|	"PURGE" BinaryOrMasterSym "LOGS" "BEFORE" Expression
+	{
+		$$ = &ast.PurgeLogsStmt{Before: $5}
+	}
+
+BinaryOrMasterSym:
+	"BINARY"
+|	"MASTER"
+
+/********************************************************************
+ * IMPORT TABLE (SDI import)
+ * See https://dev.mysql.com/doc/refman/8.0/en/import-table.html
+ *******************************************************************/
+ImportTableStmt:
+	"IMPORT" "TABLE" "FROM" StringLitList
+	{
+		$$ = &ast.ImportTableStmt{Files: $4.([]string)}
+	}
+
+StringLitList:
+	stringLit
+	{
+		$$ = []string{$1}
+	}
+|	StringLitList ',' stringLit
+	{
+		$$ = append($1.([]string), $3)
+	}
+
+/********************************************************************
+ * MyISAM key cache statements
+ * See https://dev.mysql.com/doc/refman/8.0/en/cache-index.html
+ * and https://dev.mysql.com/doc/refman/8.0/en/load-index.html
+ *******************************************************************/
+CacheIndexStmt:
+	"CACHE" "INDEX" CacheTableIndexList "IN" Identifier
+	{
+		$$ = &ast.CacheIndexStmt{
+			TableIndexes: $3.([]*ast.CacheTableIndex),
+			CacheName:    ast.NewCIStr($5),
+		}
+	}
+|	"CACHE" "INDEX" CacheTableIndexList "IN" "DEFAULT"
+	{
+		$$ = &ast.CacheIndexStmt{
+			TableIndexes: $3.([]*ast.CacheTableIndex),
+			CacheName:    ast.NewCIStr("default"),
+		}
+	}
+
+CacheTableIndexList:
+	CacheTableIndex
+	{
+		$$ = []*ast.CacheTableIndex{$1.(*ast.CacheTableIndex)}
+	}
+|	CacheTableIndexList ',' CacheTableIndex
+	{
+		$$ = append($1.([]*ast.CacheTableIndex), $3.(*ast.CacheTableIndex))
+	}
+
+CacheTableIndex:
+	TableName
+	{
+		$$ = &ast.CacheTableIndex{Table: $1.(*ast.TableName)}
+	}
+|	TableName "PARTITION" '(' AllOrPartitionNameList ')'
+	{
+		ti := &ast.CacheTableIndex{Table: $1.(*ast.TableName)}
+		if $4 == nil {
+			ti.AllPartitions = true
+		} else {
+			ti.PartitionNames = $4.([]ast.CIStr)
+		}
+		$$ = ti
+	}
+|	TableName CacheIndexNameList
+	{
+		$$ = &ast.CacheTableIndex{
+			Table:      $1.(*ast.TableName),
+			IndexNames: $2.([]ast.CIStr),
+		}
+	}
+|	TableName "PARTITION" '(' AllOrPartitionNameList ')' CacheIndexNameList
+	{
+		ti := &ast.CacheTableIndex{
+			Table:      $1.(*ast.TableName),
+			IndexNames: $6.([]ast.CIStr),
+		}
+		if $4 == nil {
+			ti.AllPartitions = true
+		} else {
+			ti.PartitionNames = $4.([]ast.CIStr)
+		}
+		$$ = ti
+	}
+
+CacheIndexNameList:
+	KeyOrIndex '(' CacheIndexNames ')'
+	{
+		$$ = $3
+	}
+
+CacheIndexNames:
+	CacheIndexName
+	{
+		$$ = []ast.CIStr{ast.NewCIStr($1)}
+	}
+|	CacheIndexNames ',' CacheIndexName
+	{
+		$$ = append($1.([]ast.CIStr), ast.NewCIStr($3))
+	}
+
+CacheIndexName:
+	Identifier
+|	"PRIMARY"
+	{
+		// PRIMARY names the primary key: LOAD INDEX INTO CACHE t KEY (PRIMARY).
+		$$ = "PRIMARY"
+	}
+
+LoadIndexStmt:
+	"LOAD" "INDEX" "INTO" "CACHE" LoadIndexTableIndexList
+	{
+		$$ = &ast.LoadIndexStmt{TableIndexes: $5.([]*ast.CacheTableIndex)}
+	}
+
+LoadIndexTableIndexList:
+	LoadIndexTableIndex
+	{
+		$$ = []*ast.CacheTableIndex{$1.(*ast.CacheTableIndex)}
+	}
+|	LoadIndexTableIndexList ',' LoadIndexTableIndex
+	{
+		$$ = append($1.([]*ast.CacheTableIndex), $3.(*ast.CacheTableIndex))
+	}
+
+LoadIndexTableIndex:
+	CacheTableIndex
+|	CacheTableIndex "IGNORE" "LEAVES"
+	{
+		ti := $1.(*ast.CacheTableIndex)
+		ti.IgnoreLeaves = true
+		$$ = ti
+	}
+
+/********************************************************************
+ * Plugin and component management
+ * See https://dev.mysql.com/doc/refman/8.0/en/install-plugin.html
+ * and https://dev.mysql.com/doc/refman/8.0/en/install-component.html
+ *******************************************************************/
+InstallStmt:
+	"INSTALL" "PLUGIN" Identifier "SONAME" stringLit
+	{
+		$$ = &ast.InstallPluginStmt{
+			Name:   ast.NewCIStr($3),
+			SoName: $5,
+		}
+	}
+|	"INSTALL" "COMPONENT" StringLitList InstallComponentSetOpt
+	{
+		stmt := &ast.InstallComponentStmt{Components: $3.([]string)}
+		if $4 != nil {
+			stmt.SetVars = $4.([]*ast.VariableAssignment)
+		}
+		$$ = stmt
+	}
+
+InstallComponentSetOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"SET" VariableAssignmentList
+	{
+		$$ = $2
+	}
+
+UninstallStmt:
+	"UNINSTALL" "PLUGIN" Identifier
+	{
+		$$ = &ast.UninstallPluginStmt{Name: ast.NewCIStr($3)}
+	}
+|	"UNINSTALL" "COMPONENT" StringLitList
+	{
+		$$ = &ast.UninstallComponentStmt{Components: $3.([]string)}
+	}
+
+/********************************************************************
+ * FEDERATED server objects
+ * See https://dev.mysql.com/doc/refman/8.0/en/create-server.html
+ *******************************************************************/
+CreateServerStmt:
+	"CREATE" "SERVER" IdentOrText "FOREIGN" "DATA" "WRAPPER" Identifier "OPTIONS" '(' ServerOptionList ')'
+	{
+		$$ = &ast.CreateServerStmt{
+			Name:    ast.NewCIStr($3.(string)),
+			Wrapper: $7,
+			Options: $10.([]*ast.ServerOption),
+		}
+	}
+|	"CREATE" "SERVER" IdentOrText "FOREIGN" "DATA" "WRAPPER" stringLit "OPTIONS" '(' ServerOptionList ')'
+	{
+		$$ = &ast.CreateServerStmt{
+			Name:          ast.NewCIStr($3.(string)),
+			Wrapper:       $7,
+			WrapperString: true,
+			Options:       $10.([]*ast.ServerOption),
+		}
+	}
+
+AlterServerStmt:
+	"ALTER" "SERVER" IdentOrText "OPTIONS" '(' ServerOptionList ')'
+	{
+		$$ = &ast.AlterServerStmt{
+			Name:    ast.NewCIStr($3.(string)),
+			Options: $6.([]*ast.ServerOption),
+		}
+	}
+
+DropServerStmt:
+	"DROP" "SERVER" IfExists IdentOrText
+	{
+		$$ = &ast.DropServerStmt{
+			IfExists: $3.(bool),
+			Name:     ast.NewCIStr($4.(string)),
+		}
+	}
+
+IdentOrText:
+	Identifier
+	{
+		$$ = $1
+	}
+|	stringLit
+	{
+		$$ = $1
+	}
+
+ServerOptionList:
+	ServerOption
+	{
+		$$ = []*ast.ServerOption{$1.(*ast.ServerOption)}
+	}
+|	ServerOptionList ',' ServerOption
+	{
+		$$ = append($1.([]*ast.ServerOption), $3.(*ast.ServerOption))
+	}
+
+ServerOption:
+	ServerOptionName stringLit
+	{
+		$$ = &ast.ServerOption{Name: $1.(string), StrValue: $2}
+	}
+|	ServerOptionName NUM
+	{
+		$$ = &ast.ServerOption{Name: $1.(string), NumValue: getUint64FromNUM($2), IsNum: true}
+	}
+
+// MySQL fixes the option names (HOST, DATABASE, USER, PASSWORD, SOCKET,
+// OWNER, PORT) but all except DATABASE are unreserved here and parse as
+// identifiers. Uppercased for a stable restore round trip.
+ServerOptionName:
+	Identifier
+	{
+		$$ = strings.ToUpper($1)
+	}
+|	"DATABASE"
+	{
+		$$ = "DATABASE"
+	}
+
+/********************************************************************
+ * Resource groups
+ * See https://dev.mysql.com/doc/refman/8.0/en/create-resource-group.html
+ *******************************************************************/
+CreateResourceGroupStmt:
+	"CREATE" "RESOURCE" "GROUP" Identifier "TYPE" EqOpt "SYSTEM" ResourceGroupVcpuOpt ResourceGroupPriorityOpt EnableDisableOpt
+	{
+		stmt := &ast.CreateResourceGroupStmt{
+			Name:   ast.NewCIStr($4),
+			System: true,
+		}
+		if $8 != nil {
+			stmt.Vcpus = $8.([]ast.VcpuRange)
+		}
+		if $9 != nil {
+			stmt.ThreadPriority = $9.(*int64)
+		}
+		if $10 != nil {
+			stmt.Enable = $10.(*bool)
+		}
+		$$ = stmt
+	}
+|	"CREATE" "RESOURCE" "GROUP" Identifier "TYPE" EqOpt "USER" ResourceGroupVcpuOpt ResourceGroupPriorityOpt EnableDisableOpt
+	{
+		stmt := &ast.CreateResourceGroupStmt{Name: ast.NewCIStr($4)}
+		if $8 != nil {
+			stmt.Vcpus = $8.([]ast.VcpuRange)
+		}
+		if $9 != nil {
+			stmt.ThreadPriority = $9.(*int64)
+		}
+		if $10 != nil {
+			stmt.Enable = $10.(*bool)
+		}
+		$$ = stmt
+	}
+
+AlterResourceGroupStmt:
+	"ALTER" "RESOURCE" "GROUP" Identifier ResourceGroupVcpuOpt ResourceGroupPriorityOpt EnableDisableOpt ForceOpt
+	{
+		stmt := &ast.AlterResourceGroupStmt{
+			Name:  ast.NewCIStr($4),
+			Force: $8.(bool),
+		}
+		if $5 != nil {
+			stmt.Vcpus = $5.([]ast.VcpuRange)
+		}
+		if $6 != nil {
+			stmt.ThreadPriority = $6.(*int64)
+		}
+		if $7 != nil {
+			stmt.Enable = $7.(*bool)
+		}
+		$$ = stmt
+	}
+
+DropResourceGroupStmt:
+	"DROP" "RESOURCE" "GROUP" Identifier ForceOpt
+	{
+		$$ = &ast.DropResourceGroupStmt{
+			Name:  ast.NewCIStr($4),
+			Force: $5.(bool),
+		}
+	}
+
+SetResourceGroupStmt:
+	"SET" "RESOURCE" "GROUP" Identifier ThreadIdListOpt
+	{
+		stmt := &ast.SetResourceGroupStmt{Name: ast.NewCIStr($4)}
+		if $5 != nil {
+			stmt.Threads = $5.([]uint64)
+		}
+		$$ = stmt
+	}
+
+ResourceGroupVcpuOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"VCPU" EqOpt VcpuRangeList
+	{
+		$$ = $3
+	}
+
+VcpuRangeList:
+	VcpuRange
+	{
+		$$ = []ast.VcpuRange{$1.(ast.VcpuRange)}
+	}
+|	VcpuRangeList ',' VcpuRange
+	{
+		$$ = append($1.([]ast.VcpuRange), $3.(ast.VcpuRange))
+	}
+
+VcpuRange:
+	NUM
+	{
+		n := getUint64FromNUM($1)
+		$$ = ast.VcpuRange{Start: n, End: n}
+	}
+|	NUM '-' NUM
+	{
+		$$ = ast.VcpuRange{Start: getUint64FromNUM($1), End: getUint64FromNUM($3), IsRange: true}
+	}
+
+ResourceGroupPriorityOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"THREAD_PRIORITY" EqOpt SignedNum
+	{
+		v := $3.(int64)
+		$$ = &v
+	}
+
+EnableDisableOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"ENABLE"
+	{
+		b := true
+		$$ = &b
+	}
+|	"DISABLE"
+	{
+		b := false
+		$$ = &b
+	}
+
+ThreadIdListOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"FOR" ThreadIdList
+	{
+		$$ = $2
+	}
+
+ThreadIdList:
+	NUM
+	{
+		$$ = []uint64{getUint64FromNUM($1)}
+	}
+|	ThreadIdList ',' NUM
+	{
+		$$ = append($1.([]uint64), getUint64FromNUM($3))
+	}
+
+/********************************************************************
+ * CLONE plugin statements
+ * See https://dev.mysql.com/doc/refman/8.0/en/clone.html
+ *******************************************************************/
+CloneStmt:
+	"CLONE" "LOCAL" "DATA" "DIRECTORY" EqOpt stringLit
+	{
+		$$ = &ast.CloneStmt{
+			Local:            true,
+			HasDataDirectory: true,
+			DataDirectory:    $6,
+		}
+	}
+|	"CLONE" "INSTANCE" "FROM" Username ':' NUM "IDENTIFIED" "BY" stringLit CloneDataDirectoryOpt CloneRequireSSLOpt
+	{
+		stmt := &ast.CloneStmt{
+			User:     $4.(*auth.UserIdentity),
+			Port:     getUint64FromNUM($6),
+			Password: $9,
+		}
+		if $10 != nil {
+			stmt.HasDataDirectory = true
+			stmt.DataDirectory = $10.(string)
+		}
+		if $11 != nil {
+			b := $11.(bool)
+			stmt.RequireSSL = &b
+		}
+		$$ = stmt
+	}
+
+CloneDataDirectoryOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"DATA" "DIRECTORY" EqOpt stringLit
+	{
+		$$ = $4
+	}
+
+CloneRequireSSLOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"REQUIRE" "SSL"
+	{
+		$$ = true
+	}
+|	"REQUIRE" "NO" "SSL"
+	{
+		$$ = false
+	}
+
+/********************************************************************
+ * Replication administration statements. Option lists parse as generic
+ * name/value pairs; the server validates the names. Deprecated
+ * MASTER/SLAVE spellings parse to the same nodes.
+ * See https://dev.mysql.com/doc/refman/8.0/en/change-replication-source-to.html
+ *******************************************************************/
+ChangeReplicationStmt:
+	"CHANGE" "REPLICATION" "SOURCE" "TO" ReplicationOptionList ForChannelOpt
+	{
+		stmt := &ast.ChangeReplicationSourceStmt{Options: $5.([]*ast.ReplicationOption)}
+		if $6 != nil {
+			stmt.Channel = $6.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
+	}
+|	"CHANGE" "MASTER" "TO" ReplicationOptionList ForChannelOpt
+	{
+		stmt := &ast.ChangeReplicationSourceStmt{Options: $4.([]*ast.ReplicationOption)}
+		if $5 != nil {
+			stmt.Channel = $5.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
+	}
+|	"CHANGE" "REPLICATION" "FILTER" ReplicationOptionList ForChannelOpt
+	{
+		stmt := &ast.ChangeReplicationFilterStmt{Filters: $4.([]*ast.ReplicationOption)}
+		if $5 != nil {
+			stmt.Channel = $5.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
+	}
+
+ForChannelOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"FOR" "CHANNEL" stringLit
+	{
+		$$ = $3
+	}
+
+ReplicationOptionList:
+	ReplicationOption
+	{
+		$$ = []*ast.ReplicationOption{$1.(*ast.ReplicationOption)}
+	}
+|	ReplicationOptionList ',' ReplicationOption
+	{
+		$$ = append($1.([]*ast.ReplicationOption), $3.(*ast.ReplicationOption))
+	}
+
+ReplicationOption:
+	ReplicationOptionEq
+|	Identifier
+	{
+		$$ = &ast.ReplicationOption{Name: strings.ToUpper($1)}
+	}
+
+ReplicationOptionEq:
+	Identifier "=" ReplicationOptionValue
+	{
+		opt := $3.(*ast.ReplicationOption)
+		opt.Name = strings.ToUpper($1)
+		$$ = opt
+	}
+
+ReplicationOptionValue:
+	Literal
+	{
+		$$ = &ast.ReplicationOption{Value: $1}
+	}
+|	stringLit singleAtIdentifier
+	{
+		$$ = &ast.ReplicationOption{UserValue: &auth.UserIdentity{Username: $1, Hostname: strings.ToLower(strings.TrimPrefix($2, "@"))}}
+	}
+|	Identifier
+	{
+		$$ = &ast.ReplicationOption{IdentValue: ast.NewCIStr($1)}
+	}
+|	"ON"
+	{
+		$$ = &ast.ReplicationOption{IdentValue: ast.NewCIStr("ON")}
+	}
+|	'(' ')'
+	{
+		$$ = &ast.ReplicationOption{HasList: true}
+	}
+|	'(' ReplicationListItemList ')'
+	{
+		$$ = &ast.ReplicationOption{HasList: true, List: $2.([]*ast.ReplicationListItem)}
+	}
+
+ReplicationListItemList:
+	ReplicationListItem
+	{
+		$$ = []*ast.ReplicationListItem{$1.(*ast.ReplicationListItem)}
+	}
+|	ReplicationListItemList ',' ReplicationListItem
+	{
+		$$ = append($1.([]*ast.ReplicationListItem), $3.(*ast.ReplicationListItem))
+	}
+
+ReplicationListItem:
+	TableName
+	{
+		$$ = &ast.ReplicationListItem{Table: $1.(*ast.TableName)}
+	}
+|	stringLit
+	{
+		$$ = &ast.ReplicationListItem{Str: $1, IsStr: true}
+	}
+|	NUM
+	{
+		$$ = &ast.ReplicationListItem{Num: getUint64FromNUM($1), IsNum: true}
+	}
+|	'(' Identifier ',' Identifier ')'
+	{
+		$$ = &ast.ReplicationListItem{PairFrom: ast.NewCIStr($2), PairTo: ast.NewCIStr($4), IsPair: true}
+	}
+
+StartReplicaStmt:
+	"START" ReplicaSym ReplicaThreadListOpt ReplicaUntilOpt SpaceSepOptionListOpt ForChannelOpt
+	{
+		stmt := &ast.StartReplicaStmt{}
+		if $3 != nil {
+			stmt.Threads = $3.([]string)
+		}
+		if $4 != nil {
+			stmt.Until = $4.([]*ast.ReplicationOption)
+		}
+		if $5 != nil {
+			stmt.Options = $5.([]*ast.ReplicationOption)
+		}
+		if $6 != nil {
+			stmt.Channel = $6.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
+	}
+|	"START" "GROUP_REPLICATION"
+	{
+		$$ = &ast.StartGroupReplicationStmt{}
+	}
+|	"START" "GROUP_REPLICATION" ReplicationOptionList
+	{
+		$$ = &ast.StartGroupReplicationStmt{Options: $3.([]*ast.ReplicationOption)}
+	}
+
+StopReplicaStmt:
+	"STOP" ReplicaSym ReplicaThreadListOpt ForChannelOpt
+	{
+		stmt := &ast.StopReplicaStmt{}
+		if $3 != nil {
+			stmt.Threads = $3.([]string)
+		}
+		if $4 != nil {
+			stmt.Channel = $4.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
+	}
+|	"STOP" "GROUP_REPLICATION"
+	{
+		$$ = &ast.StopGroupReplicationStmt{}
+	}
+
+ReplicaSym:
+	"REPLICA"
+|	"SLAVE"
+
+ReplicaThreadListOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	ReplicaThreadList
+
+ReplicaThreadList:
+	ReplicaThreadType
+	{
+		$$ = []string{$1.(string)}
+	}
+|	ReplicaThreadList ',' ReplicaThreadType
+	{
+		$$ = append($1.([]string), $3.(string))
+	}
+
+ReplicaThreadType:
+	"IO_THREAD"
+	{
+		$$ = "IO_THREAD"
+	}
+|	"SQL_THREAD"
+	{
+		$$ = "SQL_THREAD"
+	}
+
+ReplicaUntilOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"UNTIL" ReplicationOptionList
+	{
+		$$ = $2
+	}
+
+SpaceSepOptionListOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	SpaceSepOptionList
+
+SpaceSepOptionList:
+	SpaceSepOption
+	{
+		$$ = []*ast.ReplicationOption{$1.(*ast.ReplicationOption)}
+	}
+|	SpaceSepOptionList SpaceSepOption
+	{
+		$$ = append($1.([]*ast.ReplicationOption), $2.(*ast.ReplicationOption))
+	}
+
+// SpaceSepOption is restricted to the connection option names MySQL allows in
+// START REPLICA; a generic Identifier here would be ambiguous with IO_THREAD /
+// SQL_THREAD in the optional thread-type list.
+SpaceSepOption:
+	"USER" "=" ReplicationOptionValue
+	{
+		opt := $3.(*ast.ReplicationOption)
+		opt.Name = "USER"
+		$$ = opt
+	}
+|	"PASSWORD" "=" ReplicationOptionValue
+	{
+		opt := $3.(*ast.ReplicationOption)
+		opt.Name = "PASSWORD"
+		$$ = opt
+	}
+|	"DEFAULT_AUTH" "=" ReplicationOptionValue
+	{
+		opt := $3.(*ast.ReplicationOption)
+		opt.Name = "DEFAULT_AUTH"
+		$$ = opt
+	}
+|	"PLUGIN_DIR" "=" ReplicationOptionValue
+	{
+		opt := $3.(*ast.ReplicationOption)
+		opt.Name = "PLUGIN_DIR"
+		$$ = opt
+	}
+
+ResetStmt:
+	"RESET" "PERSIST"
+	{
+		$$ = &ast.ResetPersistStmt{}
+	}
+|	"RESET" "PERSIST" VariableName
+	{
+		$$ = &ast.ResetPersistStmt{Variable: $3}
+	}
+|	"RESET" "PERSIST" "IF" "EXISTS" VariableName
+	{
+		$$ = &ast.ResetPersistStmt{IfExists: true, Variable: $5}
+	}
+|	"RESET" ReplicaSym ForChannelOpt
+	{
+		stmt := &ast.ResetReplicaStmt{}
+		if $3 != nil {
+			stmt.Channel = $3.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
+	}
+|	"RESET" ReplicaSym "ALL" ForChannelOpt
+	{
+		stmt := &ast.ResetReplicaStmt{All: true}
+		if $4 != nil {
+			stmt.Channel = $4.(string)
+			stmt.HasChannel = true
+		}
+		$$ = stmt
+	}
+|	"RESET" "MASTER"
+	{
+		$$ = &ast.ResetBinaryLogsStmt{}
+	}
+|	"RESET" "MASTER" "TO" NUM
+	{
+		$$ = &ast.ResetBinaryLogsStmt{To: getUint64FromNUM($4), HasTo: true}
+	}
+|	"RESET" "BINARY" "LOGS" "AND" "GTIDS"
+	{
+		$$ = &ast.ResetBinaryLogsStmt{}
+	}
+|	"RESET" "BINARY" "LOGS" "AND" "GTIDS" "TO" NUM
+	{
+		$$ = &ast.ResetBinaryLogsStmt{To: getUint64FromNUM($7), HasTo: true}
+	}
+|	"RESET" "BINARY" "LOGS" "AND" "GTIDS" "TO" hexLit
+	{
+		// mysql-test writes the index as a hex literal: TO 0xF. The
+		// restored form uses the decimal spelling.
+		var v uint64
+		for _, b := range $7.(ast.HexLiteral) {
+			v = v<<8 | uint64(b)
+		}
+		$$ = &ast.ResetBinaryLogsStmt{To: v, HasTo: true}
+	}
+
+/********************************************************************
+ * Instance backup locks
+ * See https://dev.mysql.com/doc/refman/8.0/en/lock-instance-for-backup.html
+ *******************************************************************/
+LockInstanceStmt:
+	"LOCK" "INSTANCE" "FOR" "BACKUP"
+	{
+		$$ = &ast.LockInstanceStmt{}
+	}
+
+UnlockInstanceStmt:
+	"UNLOCK" "INSTANCE"
+	{
+		$$ = &ast.UnlockInstanceStmt{}
+	}
+
+/********************************************************************
  * Non-transactional Delete Statement
  * Split a SQL on a column. Used for bulk delete that doesn't need ACID.
  *******************************************************************/
+RepairTableStmt:
+	"REPAIR" NoWriteToBinLogAliasOpt TableOrTables TableNameList RepairTypeListOpt
+	{
+		stmt := $5.(*ast.RepairTableStmt)
+		stmt.NoWriteToBinLog = $2.(bool)
+		stmt.Tables = $4.([]*ast.TableName)
+		$$ = stmt
+	}
+
+RepairTypeListOpt:
+	{
+		$$ = &ast.RepairTableStmt{}
+	}
+|	RepairTypeListOpt "QUICK"
+	{
+		stmt := $1.(*ast.RepairTableStmt)
+		stmt.Quick = true
+		$$ = stmt
+	}
+|	RepairTypeListOpt "EXTENDED"
+	{
+		stmt := $1.(*ast.RepairTableStmt)
+		stmt.Extended = true
+		$$ = stmt
+	}
+|	RepairTypeListOpt "USE_FRM"
+	{
+		stmt := $1.(*ast.RepairTableStmt)
+		stmt.UseFrm = true
+		$$ = stmt
+	}
+
 OptimizeTableStmt:
 	"OPTIMIZE" NoWriteToBinLogAliasOpt TableOrTables TableNameList
 	{
@@ -11507,11 +16615,139 @@ KillStmt:
 			Query:        true,
 		}
 	}
+|	"KILL" identifier
+	{
+		// The connection id may be a routine parameter or local variable.
+		$$ = &ast.KillStmt{
+			Expr: &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($2)}},
+		}
+	}
+|	"KILL" "CONNECTION" identifier
+	{
+		$$ = &ast.KillStmt{
+			Expr: &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($3)}},
+		}
+	}
+|	"KILL" "QUERY" identifier
+	{
+		$$ = &ast.KillStmt{
+			Expr:  &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($3)}},
+			Query: true,
+		}
+	}
 |	"KILL" BuiltinFunction
 	{
 		$$ = &ast.KillStmt{
 			Expr: $2,
 		}
+	}
+|	"KILL" UserVariable
+	{
+		$$ = &ast.KillStmt{
+			Expr: $2,
+		}
+	}
+|	"KILL" "CONNECTION" UserVariable
+	{
+		$$ = &ast.KillStmt{
+			Expr: $3,
+		}
+	}
+|	"KILL" "QUERY" UserVariable
+	{
+		$$ = &ast.KillStmt{
+			Expr:  $3,
+			Query: true,
+		}
+	}
+
+HelpStmt:
+	"HELP" stringLit
+	{
+		$$ = &ast.HelpStmt{Topic: $2}
+	}
+|	"HELP" Identifier
+	{
+		// MySQL also accepts an unquoted topic: HELP data_types.
+		$$ = &ast.HelpStmt{Topic: $2}
+	}
+
+/********************************************************************
+ * GET DIAGNOSTICS Statement
+ * See https://dev.mysql.com/doc/refman/8.0/en/get-diagnostics.html
+ *******************************************************************/
+GetDiagnosticsStmt:
+	"GET" GetDiagnosticsScopeOpt "DIAGNOSTICS" GetDiagnosticsItemList
+	{
+		items := $4.([]*ast.DiagnosticsItem)
+		for _, item := range items {
+			if !ast.IsStatementInformationItem(item.Name) {
+				yylex.AppendError(yylex.Errorf("Unknown statement information item '%s' in GET DIAGNOSTICS", item.Name))
+				return 1
+			}
+		}
+		$$ = &ast.GetDiagnosticsStmt{
+			Scope: $2.(ast.DiagnosticsScope),
+			Items: items,
+		}
+	}
+|	"GET" GetDiagnosticsScopeOpt "DIAGNOSTICS" "CONDITION" GetDiagnosticsConditionNumber GetDiagnosticsItemList
+	{
+		items := $6.([]*ast.DiagnosticsItem)
+		for _, item := range items {
+			if !ast.IsConditionInformationItem(item.Name) {
+				yylex.AppendError(yylex.Errorf("Unknown condition information item '%s' in GET DIAGNOSTICS", item.Name))
+				return 1
+			}
+		}
+		$$ = &ast.GetDiagnosticsStmt{
+			Scope:           $2.(ast.DiagnosticsScope),
+			ConditionNumber: $5,
+			Items:           items,
+		}
+	}
+
+GetDiagnosticsScopeOpt:
+	{
+		$$ = ast.DiagnosticsScopeNone
+	}
+|	"CURRENT"
+	{
+		$$ = ast.DiagnosticsScopeCurrent
+	}
+|	"STACKED"
+	{
+		$$ = ast.DiagnosticsScopeStacked
+	}
+
+GetDiagnosticsConditionNumber:
+	SignedLiteral
+|	UserVariable
+|	Identifier
+	{
+		// A stored program variable holding the condition number.
+		$$ = &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($1)}}
+	}
+
+GetDiagnosticsItemList:
+	GetDiagnosticsItem
+	{
+		$$ = []*ast.DiagnosticsItem{$1.(*ast.DiagnosticsItem)}
+	}
+|	GetDiagnosticsItemList ',' GetDiagnosticsItem
+	{
+		$$ = append($1.([]*ast.DiagnosticsItem), $3.(*ast.DiagnosticsItem))
+	}
+
+GetDiagnosticsItem:
+	UserVariable "=" Identifier
+	{
+		$$ = &ast.DiagnosticsItem{Target: $1, Name: strings.ToUpper($3)}
+	}
+|	Identifier "=" Identifier
+	{
+		target := &ast.ColumnNameExpr{Name: &ast.ColumnName{Name: ast.NewCIStr($1)}}
+		$$ = &ast.DiagnosticsItem{Target: target, Name: strings.ToUpper($3)}
 	}
 
 SignedNum:
@@ -11537,16 +16773,14 @@ SignedNum:
 EncryptionOpt:
 	stringLit
 	{
-		// Parse it but will ignore it
+		// Any string is grammatically valid; MySQL validates the value at
+		// execution time (ER_INVALID_ENCRYPTION_OPTION), not at parse time.
 		switch $1 {
-		case "Y", "y":
-			yylex.AppendError(yylex.Errorf("The ENCRYPTION clause is parsed but ignored by all storage engines."))
-			parser.lastErrorAsWarn()
 		case "N", "n":
 			break
 		default:
-			yylex.AppendError(ErrWrongValue.GenByArgs("argument (should be Y or N)", $1))
-			return 1
+			yylex.AppendError(yylex.Errorf("The ENCRYPTION clause is parsed but ignored by all storage engines."))
+			parser.lastErrorAsWarn()
 		}
 		$$ = $1
 	}

@@ -415,11 +415,12 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 }
 
 // TestGTIDClientUnparseableDDL is a regression test: a QueryEvent the
-// TiDB parser cannot parse (CREATE TRIGGER, stored procedure bodies,
-// certain ALTER USER variants, ...) must still get the transaction's
+// parser cannot parse (mode-dependent SQL — here DDL logged under
+// ANSI_QUOTES, which the server binlogs verbatim with its double-quoted
+// identifiers) must still get the transaction's
 // pending GTID into bufferedGTID — not at the QueryEvent itself (it
 // could sit mid-group; see
-// TestGTIDClientUnparseableQueryPromotionOrdering), but at the next
+// TestGTIDClientQueryPromotionOrdering), but at the next
 // GTIDEvent, which proves the group ended. (XA statements are also
 // unparseable but never reach the parser — they get explicit handling
 // in readStream because promoting mid-XA-group would be incorrect; see
@@ -429,8 +430,10 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 // statement in a *completely unrelated schema* left bufferedGTID
 // permanently behind gtid_executed: BlockWait timed out forever, Flush
 // looped indefinitely, and a GTID-mode migration was wedged until
-// cancelled. The INSERT below doubles as the next-GTIDEvent promotion
-// trigger for the trigger-DDL's deferred GTID.
+// cancelled. The trigger DDL after it doubles as the next-GTIDEvent
+// promotion for the deferred GTID (stored programs parse nowadays, so
+// the trigger's own group promotes at its QueryEvent — the prompt path
+// — keeping both paths covered end-to-end here).
 func TestGTIDClientUnparseableDDL(t *testing.T) {
 	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
@@ -462,10 +465,25 @@ func TestGTIDClientUnparseableDDL(t *testing.T) {
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
-	// CREATE TRIGGER is binlogged as a QueryEvent that the TiDB parser
-	// rejects (it is also recorded with a DEFINER clause, which fails the
-	// parse on its own). The statement is its own server transaction with
-	// its own GTID, terminated without an XIDEvent.
+	// The parser always runs with default quoting, so this statement is
+	// binlogged verbatim (double quotes and all) and fails to parse. It
+	// is its own server transaction with its own GTID, terminated without
+	// an XIDEvent. The SET and the CREATE must share one connection for
+	// the session mode to apply, hence the pinned sql.Conn.
+	ansiDB, err := sql.Open("mysql", testutils.DSNForDatabase(otherSchema))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(ansiDB)
+	ansiConn, err := ansiDB.Conn(t.Context())
+	require.NoError(t, err)
+	_, err = ansiConn.ExecContext(t.Context(), "SET SESSION sql_mode = 'ANSI_QUOTES'")
+	require.NoError(t, err)
+	_, err = ansiConn.ExecContext(t.Context(), `CREATE TABLE "unrelated2" ("a" int)`)
+	require.NoError(t, err)
+	require.NoError(t, ansiConn.Close())
+
+	// Stored program DDL parses these days: this group promotes at its
+	// own QueryEvent, and its GTIDEvent is also what proves the
+	// ANSI_QUOTES group above ended, promoting the deferred GTID.
 	testutils.RunSQLInDatabase(t, otherSchema,
 		"CREATE TRIGGER gtidunparse_trg BEFORE INSERT ON unrelated FOR EACH ROW SET @gtid_unparse_test = 1")
 
@@ -1225,37 +1243,39 @@ func TestGTIDClientSavepointTransaction(t *testing.T) {
 		"the row inserted between SAVEPOINT and ROLLBACK TO SAVEPOINT must not replicate; the rows before and after must")
 }
 
-// TestGTIDClientUnparseableQueryPromotionOrdering is the parser-failure
-// twin of TestGTIDClientSavepointPromotionOrdering. A QueryEvent the TiDB
-// parser cannot parse used to promote the pending GTID unconditionally,
-// on the assumption that an unparseable statement is always a standalone
-// single-statement transaction. It is not: since 8.0.21 the server logs
-// CREATE TABLE ... SELECT as GTIDEvent → Query(BEGIN) → Query("CREATE
-// TABLE ... START TRANSACTION") → row events → XIDEvent (shape verified
-// against MySQL 8.0.45), and the TiDB parser rejects the START
-// TRANSACTION suffix — so the promotion fired mid-group, before the
-// group's row events had been buffered. A flush in that window published
-// a resume coordinate that already covered the transaction (and
-// recreateStreamer resumed past it after a mere stream hiccup), so its
-// remaining events were silently lost.
+// TestGTIDClientQueryPromotionOrdering is the mid-group-DDL twin of
+// TestGTIDClientSavepointPromotionOrdering. A DDL QueryEvent used to
+// promote the pending GTID unconditionally, on the assumption that a DDL
+// statement is always a standalone single-statement transaction. It is
+// not: since 8.0.21 the server logs CREATE TABLE ... SELECT as
+// GTIDEvent → Query(BEGIN) → Query("CREATE TABLE ... START TRANSACTION")
+// → row events → XIDEvent (shape verified against MySQL 8.0.45), putting
+// the CREATE TABLE mid-group with its row events still to come. A
+// promotion fired there let a flush in that window publish a resume
+// coordinate that already covered the transaction (and recreateStreamer
+// resumed past it after a mere stream hiccup), so its remaining events
+// were silently lost.
 //
-// The fix defers instead: an unparseable QueryEvent never promotes, and
-// the pending GTID advances at the group's own terminator (the XIDEvent
-// here) or — for genuinely standalone statements such as CREATE TRIGGER,
-// which have no terminator we can recognize — at the next GTIDEvent,
-// which proves the group ended. Both shapes are covered below.
+// Both parser outcomes for such a statement must defer. The parser now
+// understands the START TRANSACTION suffix, so the parsed path defers via
+// extractTablesFromDDLStmts's opensTransaction (group 1 below); the GTID
+// advances at the group's own terminator, the XIDEvent. An unparseable
+// QueryEvent (group 2: ANSI_QUOTES DDL, which the parser does not
+// parse) never promotes either, because it could equally sit mid-group;
+// for a genuinely standalone statement the next GTIDEvent, which proves
+// the group ended, promotes instead.
 //
 // Events are injected through a synthetic go-mysql BinlogStreamer for the
 // same reason as in the XA and savepoint tests: the server writes the
 // whole group to the binlog in one burst at commit, so wall-clock timing
-// cannot reliably observe the stream state between the unparseable
+// cannot reliably observe the stream state between the mid-group
 // QueryEvent and the group terminator of the same burst. Row events for a
 // subscribed table are inert to the promotion logic and serve as ordering
 // barriers: events are consumed strictly in order, so once GetDeltaLen
 // reflects a row event, every event injected before it has been
 // processed. (In a real CTAS group the row events target the created —
 // unsubscribed — table; a subscribed table stands in for any group tail.)
-func TestGTIDClientUnparseableQueryPromotionOrdering(t *testing.T) {
+func TestGTIDClientQueryPromotionOrdering(t *testing.T) {
 	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
@@ -1329,19 +1349,20 @@ func TestGTIDClientUnparseableQueryPromotionOrdering(t *testing.T) {
 
 	// Group 1: the CREATE TABLE ... SELECT shape, exactly as the server
 	// writes it (query text taken verbatim from a MySQL 8.0.45 binlog).
-	// The row event after the unparseable statement is the group tail the
+	// The statement parses, and its StartTransaction form marks it as the
+	// group opener. The row event after it is the group tail the
 	// premature promotion used to put at risk.
 	inject(gtidEvent(300), queryEvent("BEGIN"),
 		queryEvent("CREATE TABLE `ctas1` (\n  `a` int NOT NULL,\n  `b` int DEFAULT NULL\n) START TRANSACTION"),
 		rowEvent(1))
 	require.Eventually(t, func() bool { return client.GetDeltaLen() == 1 },
-		5*time.Second, 5*time.Millisecond, "row event after the unparseable statement was not processed")
+		5*time.Second, 5*time.Millisecond, "row event after the CTAS statement was not processed")
 	require.False(t, buffered(300),
-		"the GTID must not be promoted at an unparseable QueryEvent: the group's remaining events are not buffered yet")
+		"the GTID must not be promoted at a transaction-opening QueryEvent: the group's remaining events are not buffered yet")
 	client.mu.Lock()
 	pendingGNO := client.pendingGNO
 	client.mu.Unlock()
-	require.EqualValues(t, 300, pendingGNO, "the CTAS transaction's GTID must still be pending after the unparseable statement")
+	require.EqualValues(t, 300, pendingGNO, "the CTAS transaction's GTID must still be pending after its opening statement")
 
 	// The XIDEvent terminates the group; only now may the GTID enter the
 	// buffered (resume) set.
@@ -1352,13 +1373,16 @@ func TestGTIDClientUnparseableQueryPromotionOrdering(t *testing.T) {
 	require.Eventually(t, func() bool { return buffered(300) },
 		5*time.Second, 5*time.Millisecond, "the XIDEvent must promote the pending GTID")
 
-	// Group 2: a genuinely standalone unparseable statement (CREATE
-	// TRIGGER). Its QueryEvent is its group terminator, but we cannot
-	// distinguish it from the CTAS shape above, so it must not promote
+	// Group 2: a genuinely standalone unparseable statement. The server
+	// binlogs DDL verbatim, so under ANSI_QUOTES the double-quoted
+	// identifiers reach the parser (which always runs with default
+	// quoting) and fail. Its QueryEvent is its group terminator, but an
+	// unparseable statement could equally sit mid-group (as the CTAS form
+	// did before the parser understood it), so it must not promote
 	// either. (The row event is purely an ordering barrier — a real
 	// standalone-DDL group has none.)
 	inject(gtidEvent(301),
-		queryEvent("CREATE DEFINER=`root`@`localhost` TRIGGER trg BEFORE INSERT ON gtidunpsyn1 FOR EACH ROW SET @x = 1"),
+		queryEvent(`CREATE TABLE "gtidunpsyn1" ("a" int)`),
 		rowEvent(2))
 	require.Eventually(t, func() bool { return client.GetDeltaLen() == 2 },
 		5*time.Second, 5*time.Millisecond, "row event after the trigger DDL was not processed")
@@ -1384,19 +1408,29 @@ func TestGTIDClientUnparseableQueryPromotionOrdering(t *testing.T) {
 	})
 	require.Eventually(t, func() bool { return buffered(302) },
 		5*time.Second, 5*time.Millisecond, "the follow-up transaction's XIDEvent must promote its GTID")
+
+	// Group 4: stored program DDL now parses (CREATE TRIGGER here), so it
+	// takes the parsed non-transaction-opening path and promotes at its
+	// own QueryEvent — no follow-up event needed. This is the prompt
+	// variant of the deferred promotion group 2 exercised.
+	inject(gtidEvent(303),
+		queryEvent("CREATE DEFINER=`root`@`localhost` TRIGGER trg BEFORE INSERT ON gtidunpsyn1 FOR EACH ROW SET @x = 1"))
+	require.Eventually(t, func() bool { return buffered(303) },
+		5*time.Second, 5*time.Millisecond, "parsed standalone DDL must promote at its own QueryEvent")
 }
 
 // TestGTIDClientCreateTableAsSelect drives a real CREATE TABLE ... SELECT
 // through the feed end-to-end. Since 8.0.21 the server logs it as a
 // single transaction — GTIDEvent → Query(BEGIN) → Query("CREATE TABLE ...
 // START TRANSACTION") → row events → XIDEvent — whose CREATE TABLE
-// statement the TiDB parser rejects mid-group.
+// statement sits mid-group (it parses, and its StartTransaction form
+// defers promotion).
 //
 // The premature-promotion window itself cannot be observed end-to-end
 // (the server writes the whole group in one burst at commit; that is what
-// TestGTIDClientUnparseableQueryPromotionOrdering covers
+// TestGTIDClientQueryPromotionOrdering covers
 // deterministically). What this test pins is liveness with the real
-// binlog shape: deferring promotion at the unparseable statement must not
+// binlog shape: deferring promotion at the opening statement must not
 // suppress the promotion the group gets from its own XIDEvent — if it
 // did, bufferedGTID would fall permanently behind gtid_executed and the
 // BlockWait right after the CTAS would time out, with no later traffic to

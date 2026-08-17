@@ -564,7 +564,7 @@ func TestDiff(t *testing.T) {
 			name:     "CheckConstraintMovedParensStillDiffs",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT, c INT, CONSTRAINT chk_expr CHECK ((a = 1 OR b = 2) AND c = 3))",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT, c INT, CONSTRAINT chk_expr CHECK (a = 1 OR b = 2 AND c = 3))",
-			expected: "ALTER TABLE `t1` DROP CHECK `chk_expr`, ADD CONSTRAINT `chk_expr` CHECK ((`a`=1) OR ((`b`=2) AND (`c`=3)))",
+			expected: "ALTER TABLE `t1` DROP CHECK `chk_expr`, ADD CONSTRAINT `chk_expr` CHECK (`a`=1 OR `b`=2 AND `c`=3)",
 		},
 		{
 			// Same distinctness for non-binary operators: NOT and IS NULL

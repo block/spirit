@@ -733,11 +733,11 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		case *replication.QueryEvent:
 			// Query event, check if it is a DDL statement,
 			// in which case we need to notify the caller.
-			ddlTables, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
+			ddlTables, _, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
 			if err != nil {
-				// The parser does not understand all syntax.
-				// For example, it won't parse [CREATE|DROP] TRIGGER statements *or*
-				// ALTER USER x IDENTIFIED WITH x RETAIN CURRENT PASSWORD
+				// The parser does not understand all syntax — the
+				// remaining classes are mode-dependent SQL (ANSI_QUOTES
+				// quoting) and syntax newer than the grammar.
 				// This behavior is copied from canal:
 				// https://github.com/go-mysql-org/go-mysql/blob/ee9447d96b48783abb05ab76a12501e5f1161e47/canal/sync.go#L144C1-L150C1
 				// We can't print the statement because it could contain user-data.
@@ -997,7 +997,7 @@ func (c *binlogClient) processTransactionPayload(e *replication.TransactionPaylo
 			// Usually the transaction's BEGIN, which parses cleanly and
 			// yields no DDL tables. Unparseable statements are skipped the
 			// same way readStream skips them.
-			ddlTables, err := extractTablesFromDDLStmts(string(innerEvent.Schema), string(innerEvent.Query))
+			ddlTables, _, err := extractTablesFromDDLStmts(string(innerEvent.Schema), string(innerEvent.Query))
 			if err != nil {
 				c.logger.Error("Skipping query inside transaction payload that was unable to parse",
 					"file", payloadPos.Name, "pos", payloadPos.Pos)

@@ -85,8 +85,10 @@ func TestConvert(t *testing.T) {
 		{`SELECT CONVERT("abc" USING laTiN1)`, "latin1", ""},
 		{`SELECT CONVERT("abc" USING "binary")`, "binary", ""},
 		{`SELECT CONVERT("abc" USING biNaRy)`, "binary", ""},
-		{`SELECT CONVERT(a USING a)`, "", `[parser:1115]Unknown character set: 'a'`}, // TiDB issue #4436.
-		{`SELECT CONVERT("abc" USING CONCAT("utf", "8"))`, "", `[parser:1115]Unknown character set: 'CONCAT'`},
+		// Unknown charset names parse; MySQL reports 1115 at execution.
+		{`SELECT CONVERT(a USING a)`, "a", ""},
+		// A function call is not a transcoding name: syntax error at '('.
+		{`SELECT CONVERT("abc" USING CONCAT("utf", "8"))`, "", `line 1 column 34 near "("utf", "8"))" `},
 	}
 	for _, testCase := range cases {
 		stmt, err := parser.New().ParseOneStmt(testCase.SQL, "", "")
@@ -114,8 +116,10 @@ func TestChar(t *testing.T) {
 		{`SELECT CHAR("abc" USING laTiN1)`, "latin1", ""},
 		{`SELECT CHAR("abc" USING "binary")`, "binary", ""},
 		{`SELECT CHAR("abc" USING binary)`, "binary", ""},
-		{`SELECT CHAR(a USING a)`, "", `[parser:1115]Unknown character set: 'a'`},
-		{`SELECT CHAR("abc" USING CONCAT("utf", "8"))`, "", `[parser:1115]Unknown character set: 'CONCAT'`},
+		// Unknown charset names parse; MySQL reports 1115 at execution.
+		{`SELECT CHAR(a USING a)`, "a", ""},
+		// A function call is not a charset name: syntax error at '('.
+		{`SELECT CHAR("abc" USING CONCAT("utf", "8"))`, "", `line 1 column 31 near "("utf", "8"))" `},
 	}
 	for _, testCase := range cases {
 		stmt, err := parser.New().ParseOneStmt(testCase.SQL, "", "")

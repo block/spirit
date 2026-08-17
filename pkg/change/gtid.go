@@ -787,11 +787,11 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) {
 		c.promotePendingGTID()
 		return
 	}
-	ddlTables, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
+	ddlTables, opensTransaction, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
 	if err != nil {
-		// The TiDB parser does not understand all syntax (CREATE/DROP
-		// TRIGGER, certain ALTER USER variants, etc.) — these are
-		// expected misses, not bugs. We include the parser error and
+		// The parser does not understand all syntax (mode-dependent SQL
+		// such as ANSI_QUOTES quoting, or syntax newer than the grammar)
+		// — these are expected misses, not bugs. We include the parser error and
 		// the schema so an operator can diagnose unexpected payloads,
 		// but deliberately omit the query itself: it can contain user
 		// data and ends up in logs. (Same rationale as the binlog
@@ -801,8 +801,8 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) {
 			"schema", string(event.Schema),
 			"gtid", c.getBufferedGTID().String())
 		// An unparseable statement is usually a standalone
-		// single-statement transaction (CREATE TRIGGER, a stored
-		// procedure deploy) whose QueryEvent is also its group
+		// single-statement transaction (e.g. DDL logged under
+		// ANSI_QUOTES) whose QueryEvent is also its group
 		// terminator — but not always: since 8.0.21 the server logs
 		// CREATE TABLE ... SELECT as GTIDEvent → Query(BEGIN) →
 		// Query("CREATE TABLE ... START TRANSACTION") → row events →
@@ -823,8 +823,8 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) {
 		// can time out — loud and retryable, unlike a corrupted
 		// resume coordinate. Note the schema filter only applies
 		// after parsing, so *any* unparseable statement on the server
-		// (e.g. a stored procedure deploy in an unrelated schema)
-		// takes this path.
+		// (e.g. ANSI_QUOTES DDL in an unrelated schema) takes this
+		// path.
 		return
 	}
 	// MySQL emits a synthetic GTID for DDL statements too, but the
@@ -833,7 +833,18 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) {
 	// set. This is best-effort — if the caller cancels on DDL we
 	// won't actually resume, but the position is consistent for
 	// non-cancelling filters.
-	c.promotePendingGTID()
+	//
+	// The exception is a statement that *opens* its group: the parsed
+	// CREATE TABLE ... START TRANSACTION form of CTAS (its row events
+	// are still to come, exactly like BEGIN above — the XIDEvent that
+	// ends the group promotes), or a hypothetical spelled-out
+	// START TRANSACTION the BEGIN fast-path above didn't catch.
+	// Promoting here would let a concurrent flush publish the GTID as
+	// a resume coordinate before the group's row events are buffered,
+	// silently losing them on resume.
+	if !opensTransaction {
+		c.promotePendingGTID()
+	}
 	for _, ddlTable := range ddlTables {
 		c.processDDLNotification(ddlTable.schema, ddlTable.table)
 	}

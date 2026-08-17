@@ -34,6 +34,7 @@ const (
 	TypeVarchar  byte = 15
 	TypeBit      byte = 16
 
+	TypeVector     byte = 0xf2 // VECTOR (MySQL 9.0+), MYSQL_TYPE_VECTOR
 	TypeJSON       byte = 0xf5
 	TypeNewDecimal byte = 0xf6
 	TypeEnum       byte = 0xf7

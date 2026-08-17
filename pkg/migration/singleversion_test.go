@@ -82,11 +82,13 @@ func TestUnparsableStatements(t *testing.T) {
 	m.Alter = "ADD COLUMN c2 BLOB DEFAULT ('abc')"
 	require.NoError(t, m.Run())
 
-	// CREATE TRIGGER — not supported.
+	// CREATE TRIGGER — not supported. The fork parses it now that it has
+	// stored-program grammar, so it is refused by statement type rather than
+	// rejected as a syntax error.
 	m = NewTestMigration(t, WithStatement("CREATE TRIGGER ins_sum BEFORE INSERT ON t1parse FOR EACH ROW SET @sum = @sum + NEW.b;"))
 	err := m.Run()
 	require.Error(t, err)
-	require.ErrorContains(t, err, "line 1 column 14 near \"TRIGGER")
+	require.ErrorContains(t, err, "not a supported statement type")
 
 	// https://github.com/pingcap/tidb/pull/61498
 	// Legacy --table/--alter path for the same reason as above.

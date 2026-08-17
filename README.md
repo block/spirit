@@ -131,7 +131,7 @@ Spirit requires an account with these privileges:
 * `ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE` on the schema where the table is being migrated.
 * Either `SUPER, REPLICATION SLAVE on *.*` or `REPLICATION CLIENT, REPLICATION SLAVE on *.*`.
 * The `RELOAD` privilege.
-* `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is enabled by default. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover. These privileges can be omitted if `--skip-force-kill` is used.
+* `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover.
 
 For replica throttling, Spirit requires:
 

@@ -66,6 +66,7 @@ func TestExtractTablesFromDDLStmts(t *testing.T) {
 		defaultSchema string
 		statement     string
 		want          []schemaTable
+		wantOpensTxn  bool
 		wantErr       bool
 	}{
 		{
@@ -73,6 +74,21 @@ func TestExtractTablesFromDDLStmts(t *testing.T) {
 			defaultSchema: "test",
 			statement:     "CREATE TABLE users (id INT PRIMARY KEY)",
 			want:          []schemaTable{{"test", "users"}},
+		},
+		{
+			// The binlog form of CREATE TABLE ... SELECT (8.0.21+, RBR):
+			// the row events follow, so the statement opens its group.
+			name:          "create table start transaction",
+			defaultSchema: "test",
+			statement:     "CREATE TABLE `ctas1` (\n  `a` int NOT NULL,\n  `b` int DEFAULT NULL\n) START TRANSACTION",
+			want:          []schemaTable{{"test", "ctas1"}},
+			wantOpensTxn:  true,
+		},
+		{
+			name:          "start transaction",
+			defaultSchema: "test",
+			statement:     "START TRANSACTION",
+			wantOpensTxn:  true,
 		},
 		{
 			name:          "create table with schema",
@@ -138,13 +154,14 @@ func TestExtractTablesFromDDLStmts(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := extractTablesFromDDLStmts(tt.defaultSchema, tt.statement)
+			got, opensTransaction, err := extractTablesFromDDLStmts(tt.defaultSchema, tt.statement)
 			if tt.wantErr {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, tt.want, got)
+			require.Equal(t, tt.wantOpensTxn, opensTransaction)
 		})
 	}
 }
@@ -278,7 +295,7 @@ func TestExtractTablesFromDDLStmtsComplex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := extractTablesFromDDLStmts(tt.defaultSchema, tt.statement)
+			got, _, err := extractTablesFromDDLStmts(tt.defaultSchema, tt.statement)
 			if tt.wantErr {
 				require.Error(t, err)
 				return

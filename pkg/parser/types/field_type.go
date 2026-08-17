@@ -465,6 +465,12 @@ func (ft *FieldType) CompactStr() string {
 		suffix = fmt.Sprintf("(%d)", displayFlen)
 	case mysql.TypeYear:
 		suffix = fmt.Sprintf("(%d)", ft.flen)
+	case mysql.TypeVector:
+		// Print the dimension only when it was specified; MySQL applies
+		// the default (2048) server side.
+		if ft.flen != UnspecifiedLength {
+			suffix = fmt.Sprintf("(%d)", ft.flen)
+		}
 	case mysql.TypeNull:
 		suffix = "(0)"
 	}
@@ -617,12 +623,36 @@ func (ft *FieldType) RestoreAsCastType(ctx *format.RestoreCtx, explicitCharset b
 		}
 	case mysql.TypeJSON:
 		ctx.WriteKeyWord("JSON")
+	case mysql.TypeVector:
+		ctx.WriteKeyWord("VECTOR")
+		if ft.flen != UnspecifiedLength {
+			ctx.WritePlainf("(%d)", ft.flen)
+		}
 	case mysql.TypeDouble:
 		ctx.WriteKeyWord("DOUBLE")
 	case mysql.TypeFloat:
 		ctx.WriteKeyWord("FLOAT")
 	case mysql.TypeYear:
 		ctx.WriteKeyWord("YEAR")
+	case mysql.TypeGeometry:
+		switch ft.geo { //nolint:exhaustive // GeomGeometry is the default branch
+		case GeomPoint:
+			ctx.WriteKeyWord("POINT")
+		case GeomLineString:
+			ctx.WriteKeyWord("LINESTRING")
+		case GeomPolygon:
+			ctx.WriteKeyWord("POLYGON")
+		case GeomMultiPoint:
+			ctx.WriteKeyWord("MULTIPOINT")
+		case GeomMultiLineString:
+			ctx.WriteKeyWord("MULTILINESTRING")
+		case GeomMultiPolygon:
+			ctx.WriteKeyWord("MULTIPOLYGON")
+		case GeomGeometryCollection:
+			ctx.WriteKeyWord("GEOMETRYCOLLECTION")
+		default:
+			ctx.WriteKeyWord("GEOMETRY")
+		}
 	}
 	if ft.array {
 		ctx.WritePlain(" ")

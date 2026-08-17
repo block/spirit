@@ -66,6 +66,7 @@ var type2Str = map[byte]string{
 	mysql.TypeTinyBlob:    "tinytext",
 	mysql.TypeVarchar:     "varchar",
 	mysql.TypeVarString:   "var_string",
+	mysql.TypeVector:      "vector",
 	mysql.TypeYear:        "year",
 }
 
@@ -96,6 +97,7 @@ var str2Type = map[string]byte{
 	"tinytext":    mysql.TypeTinyBlob,
 	"varchar":     mysql.TypeVarchar,
 	"var_string":  mysql.TypeVarString,
+	"vector":      mysql.TypeVector,
 	"year":        mysql.TypeYear,
 }
 

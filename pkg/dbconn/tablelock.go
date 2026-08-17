@@ -28,7 +28,8 @@ type TableLock struct {
 // config.ForceKill=true is the default, and will more or less ensure
 // that the lock acquisition is successful by killing long-running queries that are
 // blocking our lock acquisition after we have waited for 90% of our configured
-// LockWaitTimeout. It can be disabled with --skip-force-kill.
+// LockWaitTimeout. Programmatic callers that never take locks (e.g. datasync's
+// read-only source) can disable it via DBConfig.ForceKill.
 func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger) (*TableLock, error) {
 	var err error
 	var lockTxn *sql.Tx
@@ -85,7 +86,7 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	logger.Warn("trying to acquire table locks", "timeout", config.LockWaitTimeout)
 	_, err = lockTxn.ExecContext(ctx, lockStmt)
 	if err != nil {
-		logger.Warn("failed to acquire table lock(s), ensure --skip-force-kill is not set and try again", "error", err)
+		logger.Warn("failed to acquire table lock(s)", "error", err)
 		return nil, err
 	}
 

@@ -261,8 +261,8 @@ func TestPercentSignsInDDLLiterals(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO pct_literals (a) VALUES (1), (2), (3)")
 
 	// Instant path: ADD COLUMN with %n and %? sequences in the comment.
-	// This exercises attemptInstantDDL via the force-kill path (SkipForceKill
-	// defaults to false), which previously panicked the process.
+	// This exercises attemptInstantDDL via the force-kill path (always
+	// enabled), which previously panicked the process.
 	m := NewTestRunner(t, "pct_literals", "ADD COLUMN pct_n VARCHAR(20) COMMENT '100%new, a%?b'", WithThreads(1))
 	require.NoError(t, m.Run(t.Context()))
 	require.True(t, m.usedInstantDDL)

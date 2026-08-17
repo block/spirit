@@ -260,7 +260,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.dbConfig.LockWaitTimeout = int(r.migration.LockWaitTimeout.Seconds())
 	}
 	r.dbConfig.InterpolateParams = r.migration.InterpolateParams
-	r.dbConfig.ForceKill = !r.migration.SkipForceKill
+	// ForceKill is always enabled for migrations (true by default in NewDBConfig).
 	// Map TLS configuration from migration to dbConfig
 	r.dbConfig.TLSMode = r.migration.TLSMode
 	r.dbConfig.TLSCertificatePath = r.migration.TLSCertificatePath
@@ -589,7 +589,6 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			TargetChunkTime: r.migration.TargetChunkTime,
 			Threads:         r.migration.Threads,
 			ReplicaMaxLag:   r.migration.ReplicaMaxLag,
-			ForceKill:       !r.migration.SkipForceKill,
 			// For the pre-run checks we don't have a DB connection yet.
 			// Instead we check the credentials provided.
 			Host:                 r.migration.Host,
@@ -1125,7 +1124,6 @@ func (r *Runner) buildReplicaThrottlers() ([]throttler.Throttler, error) {
 	replicaDBConfig := dbconn.NewDBConfig()
 	replicaDBConfig.LockWaitTimeout = r.dbConfig.LockWaitTimeout
 	replicaDBConfig.InterpolateParams = r.dbConfig.InterpolateParams
-	replicaDBConfig.ForceKill = r.dbConfig.ForceKill
 	replicaDBConfig.MaxOpenConnections = r.dbConfig.MaxOpenConnections
 
 	// Copy TLS settings from main DB config to replica config

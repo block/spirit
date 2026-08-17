@@ -324,10 +324,17 @@ func toInt(l yyLexer, lval *yySymType, str string) int {
 func toDecimal(l yyLexer, lval *yySymType, str string) int {
 	dec, err := ast.NewDecimal(str)
 	if err != nil {
-		if errors.Is(err, types.ErrDataOutOfRange) {
+		switch {
+		case errors.Is(err, types.ErrDataOutOfRange):
+			// Integer part exceeds the 65-digit maximum: MySQL clamps the
+			// literal to the maximum decimal value with a truncation warning.
 			l.AppendWarn(types.ErrTruncatedWrongValue.GenByArgs("DECIMAL", dec))
 			dec, _ = ast.NewDecimal(mysql.DefaultDecimal)
-		} else {
+		case errors.Is(err, types.ErrTruncatedWrongValue):
+			// Fractional part was too long and got truncated; keep the
+			// truncated value like MySQL does.
+			l.AppendWarn(types.ErrTruncatedWrongValue.GenByArgs("DECIMAL", dec))
+		default:
 			l.AppendError(l.Errorf("decimal literal: %v", err))
 		}
 	}
@@ -443,6 +450,21 @@ var (
 	_ ParseParam = CollationConnection("")
 )
 
+// parenQueryToSetOpr wraps a parenthesized query expression in a
+// SetOprStmt, preserving inner WITH/ORDER BY/LIMIT as a nested select
+// list — the same shape the SubSelect OrderBy / SelectStmtLimit
+// statement alternatives build inline.
+func parenQueryToSetOpr(sub *ast.SubqueryExpr) *ast.SetOprStmt {
+	var setOprList []ast.Node
+	switch x := sub.Query.(type) {
+	case *ast.SelectStmt:
+		setOprList = []ast.Node{&ast.SetOprSelectList{Selects: []ast.Node{x}, With: x.With}}
+	case *ast.SetOprStmt:
+		setOprList = []ast.Node{&ast.SetOprSelectList{Selects: x.SelectList.Selects, With: x.With, Limit: x.Limit, OrderBy: x.OrderBy}}
+	}
+	return &ast.SetOprStmt{SelectList: &ast.SetOprSelectList{Selects: setOprList}}
+}
+
 func resetParams(p *Parser) {
 	p.charset = mysql.DefaultCharset
 	p.collation = mysql.DefaultCollationName
@@ -478,4 +500,25 @@ func (c CollationConnection) ApplyOn(p *Parser) error {
 		p.collation = string(c)
 	}
 	return nil
+}
+
+// selectLockIntoHolder carries the trailing locking clauses and INTO clause of
+// a SELECT while the grammar reduces them; it never appears in the final AST.
+type selectLockIntoHolder struct {
+	locks []*ast.SelectLockInfo
+	into  *ast.SelectIntoOption
+}
+
+// jsonValueReturningHolder carries the RETURNING clause of JSON_VALUE while
+// the grammar reduces it; it never appears in the final AST.
+type jsonValueReturningHolder struct {
+	tp              *types.FieldType
+	explicitCharset bool
+}
+
+// jsonValueOnHolder carries the ON EMPTY/ON ERROR clauses of JSON_VALUE while
+// the grammar reduces them; it never appears in the final AST.
+type jsonValueOnHolder struct {
+	onEmpty *ast.JSONValueOnBehavior
+	onError *ast.JSONValueOnBehavior
 }

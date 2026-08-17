@@ -39,6 +39,9 @@ const (
 	TableLockWrite
 	// TableLockWriteLocal means the session with this lock has write/read permission, and the other session still has read permission.
 	TableLockWriteLocal
+	// TableLockLowPriorityWrite is the deprecated LOW_PRIORITY WRITE type;
+	// MySQL still parses it but treats it as WRITE.
+	TableLockLowPriorityWrite
 )
 
 // String implements fmt.Stringer interface.
@@ -56,6 +59,8 @@ func (t TableLockType) String() string {
 		return "WRITE LOCAL"
 	case TableLockWrite:
 		return "WRITE"
+	case TableLockLowPriorityWrite:
+		return "LOW_PRIORITY WRITE"
 	}
 	return ""
 }

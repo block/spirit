@@ -47,7 +47,13 @@ func TestKeywordConsistent(t *testing.T) {
 	keywordCount := len(reservedKeywords) + len(unreservedKeywords) + len(notKeywordTokens)
 	require.Equal(t, keywordCount-len(windowFuncTokenMap), len(tokenMap)-len(aliases))
 
-	unreservedCollectionDef := extractKeywordsFromCollectionDef(content, "\nUnReservedKeyword:")
+	// UnReservedKeyword is defined as LabelKeyword plus NonLabelKeyword, the
+	// latter being the keywords that cannot open a compound statement label.
+	// Together they must still cover exactly the unreserved token block.
+	unreservedCollectionDef := extractKeywordsFromCollectionDef(content, "\nLabelKeyword:")
+	unreservedCollectionDef = append(unreservedCollectionDef,
+		extractKeywordsFromCollectionDef(content, "\nNonLabelKeyword:")...)
+	sort.Strings(unreservedCollectionDef)
 	require.Equal(t, unreservedCollectionDef, unreservedKeywords, "UnReservedKeyword")
 
 	notKeywordTokensCollectionDef := extractKeywordsFromCollectionDef(content, "\nNotKeywordToken:")

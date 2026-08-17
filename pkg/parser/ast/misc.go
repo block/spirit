@@ -44,6 +44,8 @@ var (
 	_ StmtNode = &UseStmt{}
 	_ StmtNode = &FlushStmt{}
 	_ StmtNode = &KillStmt{}
+	_ StmtNode = &HelpStmt{}
+	_ StmtNode = &GetDiagnosticsStmt{}
 	_ StmtNode = &ShutdownStmt{}
 	_ StmtNode = &RestartStmt{}
 	_ StmtNode = &RenameUserStmt{}
@@ -81,6 +83,16 @@ type AuthOption struct {
 	ByHashString bool
 	HashString   string
 	AuthPlugin   string
+	// ByRandomPassword is the IDENTIFIED BY RANDOM PASSWORD form (MySQL 8.0.18+).
+	ByRandomPassword bool
+	// HasReplace / ReplaceString carry REPLACE 'current password'
+	// (MySQL 8.0.14+ password verification). HasReplace distinguishes an
+	// absent clause from REPLACE ''.
+	HasReplace    bool
+	ReplaceString string
+	// InitialAuth is the IDENTIFIED WITH plugin INITIAL AUTHENTICATION ...
+	// form used for passwordless authentication (MySQL 8.0.27+).
+	InitialAuth *AuthOption
 }
 
 // Restore implements Node interface.
@@ -90,12 +102,25 @@ func (n *AuthOption) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord(" WITH ")
 		ctx.WriteString(n.AuthPlugin)
 	}
-	if n.ByAuthString {
+	switch {
+	case n.ByRandomPassword:
+		ctx.WriteKeyWord(" BY RANDOM PASSWORD")
+	case n.ByAuthString:
 		ctx.WriteKeyWord(" BY ")
 		ctx.WriteString(n.AuthString)
-	} else if n.ByHashString {
+	case n.ByHashString:
 		ctx.WriteKeyWord(" AS ")
 		ctx.WriteString(n.HashString)
+	}
+	if n.HasReplace {
+		ctx.WriteKeyWord(" REPLACE ")
+		ctx.WriteString(n.ReplaceString)
+	}
+	if n.InitialAuth != nil {
+		ctx.WriteKeyWord(" INITIAL AUTHENTICATION ")
+		if err := n.InitialAuth.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore AuthOption.InitialAuth: %w", err)
+		}
 	}
 	return nil
 }
@@ -143,6 +168,14 @@ type ExplainStmt struct {
 	Format  string
 	Analyze bool
 
+	// IntoVar is the raw @variable token of `EXPLAIN ... INTO @var`,
+	// including the leading '@'. Empty when no INTO clause was given.
+	IntoVar string
+
+	// ForSchema is the schema name of `EXPLAIN ... FOR {SCHEMA|DATABASE} name`.
+	// Empty when no FOR SCHEMA clause was given.
+	ForSchema string
+
 	// Explore indicates whether to use EXPLAIN EXPLORE.
 	Explore bool
 	// SQLDigest to explain, used in `EXPLAIN EXPLORE <sql_digest>`.
@@ -179,6 +212,16 @@ func (n *ExplainStmt) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord("FORMAT ")
 		ctx.WritePlain("= ")
 		ctx.WriteString(n.Format)
+		ctx.WritePlain(" ")
+	}
+	if n.IntoVar != "" {
+		ctx.WriteKeyWord("INTO ")
+		ctx.WritePlain(n.IntoVar)
+		ctx.WritePlain(" ")
+	}
+	if n.ForSchema != "" {
+		ctx.WriteKeyWord("FOR SCHEMA ")
+		ctx.WriteName(n.ForSchema)
 		ctx.WritePlain(" ")
 	}
 	if n.PlanDigest != "" {
@@ -507,6 +550,10 @@ type VariableAssignment struct {
 	IsInstance bool
 	IsGlobal   bool
 	IsSystem   bool
+	// IsPersist and IsPersistOnly are the SET PERSIST and
+	// SET PERSIST_ONLY variable scopes.
+	IsPersist     bool
+	IsPersistOnly bool
 
 	// ExtendValue is a way to store extended info.
 	// VariableAssignment should be able to store information for SetCharset/SetPWD Stmt.
@@ -524,6 +571,10 @@ func (n *VariableAssignment) Restore(ctx *format.RestoreCtx) error {
 			ctx.WriteKeyWord("GLOBAL")
 		case n.IsInstance:
 			ctx.WriteKeyWord("INSTANCE")
+		case n.IsPersist:
+			ctx.WriteKeyWord("PERSIST")
+		case n.IsPersistOnly:
+			ctx.WriteKeyWord("PERSIST_ONLY")
 		default:
 			ctx.WriteKeyWord("SESSION")
 		}
@@ -578,6 +629,8 @@ const (
 	FlushStatus
 	FlushHosts
 	FlushLogs
+	FlushUserResources
+	FlushOptimizerCosts
 )
 
 // LogType is the log type used in FLUSH statement.
@@ -590,6 +643,7 @@ const (
 	LogTypeError
 	LogTypeGeneral
 	LogTypeSlow
+	LogTypeRelay
 )
 
 // FlushStmt is a statement to flush tables/privileges/optimizer costs and so on.
@@ -601,6 +655,14 @@ type FlushStmt struct {
 	LogType         LogType
 	Tables          []*TableName // For FlushTableStmt, if Tables is empty, it means flush all tables.
 	ReadLock        bool
+	ForExport       bool
+	// Channel is the FOR CHANNEL of FLUSH RELAY LOGS.
+	Channel string
+	// ExtraTargets are the additional comma-separated flush targets when the
+	// statement lists several, e.g. FLUSH STATUS, USER_RESOURCES. Only the
+	// Tp, LogType and Channel fields of each entry are meaningful: the table
+	// form cannot appear in a list.
+	ExtraTargets []*FlushStmt
 }
 
 // Restore implements Node interface.
@@ -609,6 +671,21 @@ func (n *FlushStmt) Restore(ctx *format.RestoreCtx) error {
 	if n.NoWriteToBinLog {
 		ctx.WriteKeyWord("NO_WRITE_TO_BINLOG ")
 	}
+	if err := n.restoreTarget(ctx); err != nil {
+		return err
+	}
+	for _, extra := range n.ExtraTargets {
+		ctx.WritePlain(", ")
+		if err := extra.restoreTarget(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// restoreTarget restores one flush target, without the FLUSH keyword and
+// NO_WRITE_TO_BINLOG prefix that belong to the statement as a whole.
+func (n *FlushStmt) restoreTarget(ctx *format.RestoreCtx) error {
 	switch n.Tp { //nolint:exhaustive
 	case FlushTables:
 		ctx.WriteKeyWord("TABLES")
@@ -625,12 +702,19 @@ func (n *FlushStmt) Restore(ctx *format.RestoreCtx) error {
 		if n.ReadLock {
 			ctx.WriteKeyWord(" WITH READ LOCK")
 		}
+		if n.ForExport {
+			ctx.WriteKeyWord(" FOR EXPORT")
+		}
 	case FlushPrivileges:
 		ctx.WriteKeyWord("PRIVILEGES")
 	case FlushStatus:
 		ctx.WriteKeyWord("STATUS")
 	case FlushHosts:
 		ctx.WriteKeyWord("HOSTS")
+	case FlushUserResources:
+		ctx.WriteKeyWord("USER_RESOURCES")
+	case FlushOptimizerCosts:
+		ctx.WriteKeyWord("OPTIMIZER_COSTS")
 	case FlushLogs:
 		var logType string
 		switch n.LogType {
@@ -646,8 +730,14 @@ func (n *FlushStmt) Restore(ctx *format.RestoreCtx) error {
 			logType = "GENERAL LOGS"
 		case LogTypeSlow:
 			logType = "SLOW LOGS"
+		case LogTypeRelay:
+			logType = "RELAY LOGS"
 		}
 		ctx.WriteKeyWord(logType)
+		if n.LogType == LogTypeRelay && n.Channel != "" {
+			ctx.WriteKeyWord(" FOR CHANNEL ")
+			ctx.WriteString(n.Channel)
+		}
 	default:
 		return errors.New("unsupported type of FlushStmt")
 	}
@@ -708,6 +798,156 @@ func (n *KillStmt) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*KillStmt)
+	if n.Expr != nil {
+		node, ok := n.Expr.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Expr = node.(ExprNode)
+	}
+	return v.Leave(n)
+}
+
+// HelpStmt is the HELP statement.
+// See https://dev.mysql.com/doc/refman/8.0/en/help.html
+type HelpStmt struct {
+	stmtNode
+
+	Topic string
+}
+
+// Restore implements Node interface.
+func (n *HelpStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("HELP ")
+	ctx.WriteString(n.Topic)
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *HelpStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*HelpStmt)
+	return v.Leave(n)
+}
+
+// DiagnosticsScope is the optional scope of a GET DIAGNOSTICS statement.
+type DiagnosticsScope int
+
+// DiagnosticsScope values.
+const (
+	DiagnosticsScopeNone DiagnosticsScope = iota
+	DiagnosticsScopeCurrent
+	DiagnosticsScopeStacked
+)
+
+// DiagnosticsItem is one `target = item_name` element of GET DIAGNOSTICS.
+type DiagnosticsItem struct {
+	Target ExprNode
+	Name   string
+}
+
+var statementInformationItems = map[string]struct{}{
+	"NUMBER":    {},
+	"ROW_COUNT": {},
+}
+
+var conditionInformationItems = map[string]struct{}{
+	"CLASS_ORIGIN":       {},
+	"SUBCLASS_ORIGIN":    {},
+	"RETURNED_SQLSTATE":  {},
+	"MESSAGE_TEXT":       {},
+	"MYSQL_ERRNO":        {},
+	"CONSTRAINT_CATALOG": {},
+	"CONSTRAINT_SCHEMA":  {},
+	"CONSTRAINT_NAME":    {},
+	"CATALOG_NAME":       {},
+	"SCHEMA_NAME":        {},
+	"TABLE_NAME":         {},
+	"COLUMN_NAME":        {},
+	"CURSOR_NAME":        {},
+}
+
+// IsStatementInformationItem reports whether name is a valid GET DIAGNOSTICS
+// statement information item. MySQL keeps the statement and condition item
+// sets disjoint and rejects mixing them with a syntax error.
+func IsStatementInformationItem(name string) bool {
+	_, ok := statementInformationItems[name]
+	return ok
+}
+
+// IsConditionInformationItem reports whether name is a valid GET DIAGNOSTICS
+// condition information item.
+func IsConditionInformationItem(name string) bool {
+	_, ok := conditionInformationItems[name]
+	return ok
+}
+
+// GetDiagnosticsStmt is the GET [CURRENT|STACKED] DIAGNOSTICS statement.
+// See https://dev.mysql.com/doc/refman/8.0/en/get-diagnostics.html
+type GetDiagnosticsStmt struct {
+	stmtNode
+
+	Scope DiagnosticsScope
+	// ConditionNumber is non-nil for the CONDITION form.
+	ConditionNumber ExprNode
+	Items           []*DiagnosticsItem
+}
+
+// Restore implements Node interface.
+func (n *GetDiagnosticsStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("GET ")
+	switch n.Scope {
+	case DiagnosticsScopeCurrent:
+		ctx.WriteKeyWord("CURRENT ")
+	case DiagnosticsScopeStacked:
+		ctx.WriteKeyWord("STACKED ")
+	case DiagnosticsScopeNone:
+	}
+	ctx.WriteKeyWord("DIAGNOSTICS")
+	if n.ConditionNumber != nil {
+		ctx.WriteKeyWord(" CONDITION ")
+		if err := n.ConditionNumber.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore GetDiagnosticsStmt.ConditionNumber: %w", err)
+		}
+	}
+	for i, item := range n.Items {
+		if i != 0 {
+			ctx.WritePlain(",")
+		}
+		ctx.WritePlain(" ")
+		if err := item.Target.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore GetDiagnosticsStmt.Items: %w", err)
+		}
+		ctx.WritePlain(" = ")
+		ctx.WriteKeyWord(item.Name)
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *GetDiagnosticsStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*GetDiagnosticsStmt)
+	if n.ConditionNumber != nil {
+		node, ok := n.ConditionNumber.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.ConditionNumber = node.(ExprNode)
+	}
+	for _, item := range n.Items {
+		node, ok := item.Target.Accept(v)
+		if !ok {
+			return n, false
+		}
+		item.Target = node.(ExprNode)
+	}
 	return v.Leave(n)
 }
 
@@ -799,6 +1039,12 @@ type SetPwdStmt struct {
 	User                  *auth.UserIdentity
 	Password              string
 	RetainCurrentPassword bool
+	// Random is the SET PASSWORD ... TO RANDOM form (MySQL 8.0.18+).
+	Random bool
+	// HasReplace / ReplaceString carry REPLACE 'current password'
+	// (MySQL 8.0.14+ password verification).
+	HasReplace    bool
+	ReplaceString string
 }
 
 // Restore implements Node interface.
@@ -810,8 +1056,16 @@ func (n *SetPwdStmt) Restore(ctx *format.RestoreCtx) error {
 			return fmt.Errorf("an error occurred while restore SetPwdStmt.User: %w", err)
 		}
 	}
-	ctx.WritePlain("=")
-	ctx.WriteString(n.Password)
+	if n.Random {
+		ctx.WriteKeyWord(" TO RANDOM")
+	} else {
+		ctx.WritePlain("=")
+		ctx.WriteString(n.Password)
+	}
+	if n.HasReplace {
+		ctx.WriteKeyWord(" REPLACE ")
+		ctx.WriteString(n.ReplaceString)
+	}
 	if n.RetainCurrentPassword {
 		ctx.WriteKeyWord(" RETAIN CURRENT PASSWORD")
 	}
@@ -939,6 +1193,10 @@ type UserSpec struct {
 	AuthOpt            *AuthOption
 	DualPasswordOption DualPasswordOptionType
 	IsRole             bool
+	// ExtraAuthFactors are the second and third authentication factors of a
+	// multi-factor spec: IDENTIFIED ... AND IDENTIFIED ... [AND IDENTIFIED ...]
+	// (MySQL 8.0.27+). AuthOpt is the first factor.
+	ExtraAuthFactors []*AuthOption
 }
 
 // Restore implements Node interface.
@@ -950,6 +1208,12 @@ func (n *UserSpec) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain(" ")
 		if err := n.AuthOpt.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while restore UserSpec.AuthOpt: %w", err)
+		}
+	}
+	for i, factor := range n.ExtraAuthFactors {
+		ctx.WriteKeyWord(" AND ")
+		if err := factor.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore UserSpec.ExtraAuthFactors[%d]: %w", i, err)
 		}
 	}
 	if n.DualPasswordOption != 0 {
@@ -1131,6 +1395,8 @@ const (
 	UserCommentType
 	UserAttributeType
 	PasswordRequireCurrentDefault
+	PasswordRequireCurrent
+	PasswordRequireCurrentOptional
 
 	UserResourceGroupName
 )
@@ -1175,6 +1441,12 @@ func (p *PasswordOrLockOption) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord(" DAY")
 	case PasswordReuseDefault:
 		ctx.WriteKeyWord("PASSWORD REUSE INTERVAL DEFAULT")
+	case PasswordRequireCurrentDefault:
+		ctx.WriteKeyWord("PASSWORD REQUIRE CURRENT DEFAULT")
+	case PasswordRequireCurrent:
+		ctx.WriteKeyWord("PASSWORD REQUIRE CURRENT")
+	case PasswordRequireCurrentOptional:
+		ctx.WriteKeyWord("PASSWORD REQUIRE CURRENT OPTIONAL")
 	default:
 		return fmt.Errorf("unsupported PasswordOrLockOption.Type %d", p.Type)
 	}
@@ -1216,6 +1488,7 @@ type CreateUserStmt struct {
 	IsCreateRole             bool
 	IfNotExists              bool
 	Specs                    []*UserSpec
+	DefaultRoles             []*auth.RoleIdentity
 	AuthTokenOrTLSOptions    []*AuthTokenOrTLSOption
 	ResourceOptions          []*ResourceOption
 	PasswordOrLockOptions    []*PasswordOrLockOption
@@ -1239,6 +1512,18 @@ func (n *CreateUserStmt) Restore(ctx *format.RestoreCtx) error {
 		}
 		if err := v.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while restore CreateUserStmt.Specs[%d]: %w", i, err)
+		}
+	}
+
+	if len(n.DefaultRoles) != 0 {
+		ctx.WriteKeyWord(" DEFAULT ROLE ")
+		for i, role := range n.DefaultRoles {
+			if i != 0 {
+				ctx.WritePlain(", ")
+			}
+			if err := role.Restore(ctx); err != nil {
+				return fmt.Errorf("an error occurred while restore CreateUserStmt.DefaultRoles[%d]: %w", i, err)
+			}
 		}
 	}
 
@@ -1408,23 +1693,55 @@ func (n *AlterUserStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// RedoLogAction is the {ENABLE | DISABLE} INNODB REDO_LOG action of ALTER INSTANCE.
+type RedoLogAction int
+
+// RedoLogAction values.
+const (
+	RedoLogActionNone RedoLogAction = iota
+	RedoLogActionEnable
+	RedoLogActionDisable
+)
+
 // AlterInstanceStmt modifies instance.
-// See https://dev.mysql.com/doc/refman/8.0/en/alter-instance.html
+// See https://dev.mysql.com/doc/refman/8.4/en/alter-instance.html
 type AlterInstanceStmt struct {
 	stmtNode
 
 	ReloadTLS         bool
 	NoRollbackOnError bool
+	// TLSChannel is the optional FOR CHANNEL of RELOAD TLS.
+	TLSChannel string
+	// RotateMasterKey is "INNODB" or "BINLOG" for ROTATE ... MASTER KEY.
+	RotateMasterKey string
+	// RedoLog is set for {ENABLE | DISABLE} INNODB REDO_LOG.
+	RedoLog       RedoLogAction
+	ReloadKeyring bool
 }
 
 // Restore implements Node interface.
 func (n *AlterInstanceStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("ALTER INSTANCE")
-	if n.ReloadTLS {
+	switch {
+	case n.ReloadTLS:
 		ctx.WriteKeyWord(" RELOAD TLS")
-	}
-	if n.NoRollbackOnError {
-		ctx.WriteKeyWord(" NO ROLLBACK ON ERROR")
+		if n.TLSChannel != "" {
+			ctx.WriteKeyWord(" FOR CHANNEL ")
+			ctx.WriteName(n.TLSChannel)
+		}
+		if n.NoRollbackOnError {
+			ctx.WriteKeyWord(" NO ROLLBACK ON ERROR")
+		}
+	case n.RotateMasterKey != "":
+		ctx.WriteKeyWord(" ROTATE ")
+		ctx.WriteKeyWord(n.RotateMasterKey)
+		ctx.WriteKeyWord(" MASTER KEY")
+	case n.RedoLog == RedoLogActionEnable:
+		ctx.WriteKeyWord(" ENABLE INNODB REDO_LOG")
+	case n.RedoLog == RedoLogActionDisable:
+		ctx.WriteKeyWord(" DISABLE INNODB REDO_LOG")
+	case n.ReloadKeyring:
+		ctx.WriteKeyWord(" RELOAD KEYRING")
 	}
 	return nil
 }
@@ -1539,6 +1856,12 @@ func (n *RoleOrPriv) ToPriv() (*PrivElem, error) {
 		if p, ok := n.Node.(*PrivElem); ok {
 			return p, nil
 		}
+		if r, ok := n.Node.(*auth.RoleIdentity); ok && r.Hostname == "%" && r.Username != "" {
+			// A quoted dynamic privilege, e.g. GRANT 'SYSTEM_VARIABLES_ADMIN'
+			// ON *.*: the grammar reads the string as a role name, and the
+			// privilege position (an ON clause is present) resolves it here.
+			return &PrivElem{Priv: mysql.ExtendedPriv, Name: r.Username}, nil
+		}
 		return nil, fmt.Errorf("can't convert to PrivElem, type %T", n.Node)
 	}
 	if len(n.Symbols) == 0 {
@@ -1614,6 +1937,8 @@ const (
 	ObjectTypeFunction
 	// ObjectTypeProcedure means the following object is a stored procedure.
 	ObjectTypeProcedure
+	// ObjectTypeLibrary means the following object is a library (MySQL 9.x).
+	ObjectTypeLibrary
 )
 
 // Restore implements Node interface.
@@ -1627,6 +1952,8 @@ func (n ObjectTypeType) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord("FUNCTION")
 	case ObjectTypeProcedure:
 		ctx.WriteKeyWord("PROCEDURE")
+	case ObjectTypeLibrary:
+		ctx.WriteKeyWord("LIBRARY")
 	default:
 		return errors.New("unsupported object type")
 	}
@@ -1680,15 +2007,21 @@ func (n *GrantLevel) Restore(ctx *format.RestoreCtx) error {
 type RevokeStmt struct {
 	stmtNode
 
+	IfExists   bool
 	Privs      []*PrivElem
 	ObjectType ObjectTypeType
 	Level      *GrantLevel
 	Users      []*UserSpec
+	// IgnoreUnknownUser is the trailing IGNORE UNKNOWN USER clause (MySQL 8.0.30+).
+	IgnoreUnknownUser bool
 }
 
 // Restore implements Node interface.
 func (n *RevokeStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("REVOKE ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
 	for i, v := range n.Privs {
 		if i != 0 {
 			ctx.WritePlain(", ")
@@ -1716,6 +2049,9 @@ func (n *RevokeStmt) Restore(ctx *format.RestoreCtx) error {
 			return fmt.Errorf("an error occurred while restore RevokeStmt.Users[%d]: %w", i, err)
 		}
 	}
+	if n.IgnoreUnknownUser {
+		ctx.WriteKeyWord(" IGNORE UNKNOWN USER")
+	}
 	return nil
 }
 
@@ -1736,17 +2072,23 @@ func (n *RevokeStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// RevokeStmt is the struct for REVOKE statement.
+// RevokeRoleStmt is the struct for REVOKE <roles> FROM <users>.
 type RevokeRoleStmt struct {
 	stmtNode
 
-	Roles []*auth.RoleIdentity
-	Users []*auth.UserIdentity
+	IfExists bool
+	Roles    []*auth.RoleIdentity
+	Users    []*auth.UserIdentity
+	// IgnoreUnknownUser is the trailing IGNORE UNKNOWN USER clause (MySQL 8.0.30+).
+	IgnoreUnknownUser bool
 }
 
 // Restore implements Node interface.
 func (n *RevokeRoleStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("REVOKE ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
 	for i, role := range n.Roles {
 		if i != 0 {
 			ctx.WritePlain(", ")
@@ -1764,6 +2106,9 @@ func (n *RevokeRoleStmt) Restore(ctx *format.RestoreCtx) error {
 			return fmt.Errorf("an error occurred while restore RevokeRoleStmt.Users[%d]: %w", i, err)
 		}
 	}
+	if n.IgnoreUnknownUser {
+		ctx.WriteKeyWord(" IGNORE UNKNOWN USER")
+	}
 	return nil
 }
 
@@ -1777,6 +2122,49 @@ func (n *RevokeRoleStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// GrantAsClause is the trailing AS user [WITH ROLE ...] clause of GRANT
+// (MySQL 8.0.16+): the grant is evaluated as if executed by the given user
+// with the given roles active.
+type GrantAsClause struct {
+	User *auth.UserIdentity
+	// WithRole reports whether a WITH ROLE clause was present; SetRoleOpt's
+	// zero value (SetRoleDefault) is a valid WITH ROLE DEFAULT otherwise.
+	WithRole   bool
+	SetRoleOpt SetRoleStmtType
+	RoleList   []*auth.RoleIdentity
+}
+
+// Restore implements Node interface.
+func (n *GrantAsClause) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("AS ")
+	if err := n.User.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore GrantAsClause.User: %w", err)
+	}
+	if n.WithRole {
+		ctx.WriteKeyWord(" WITH ROLE")
+		switch n.SetRoleOpt { //nolint:exhaustive
+		case SetRoleDefault:
+			ctx.WriteKeyWord(" DEFAULT")
+		case SetRoleNone:
+			ctx.WriteKeyWord(" NONE")
+		case SetRoleAll:
+			ctx.WriteKeyWord(" ALL")
+		case SetRoleAllExcept:
+			ctx.WriteKeyWord(" ALL EXCEPT")
+		}
+		for i, role := range n.RoleList {
+			ctx.WritePlain(" ")
+			if err := role.Restore(ctx); err != nil {
+				return fmt.Errorf("an error occurred while restore GrantAsClause.RoleList[%d]: %w", i, err)
+			}
+			if i != len(n.RoleList)-1 {
+				ctx.WritePlain(",")
+			}
+		}
+	}
+	return nil
+}
+
 // GrantStmt is the struct for GRANT statement.
 type GrantStmt struct {
 	stmtNode
@@ -1787,6 +2175,7 @@ type GrantStmt struct {
 	Users                 []*UserSpec
 	AuthTokenOrTLSOptions []*AuthTokenOrTLSOption
 	WithGrant             bool
+	As                    *GrantAsClause
 }
 
 // Restore implements Node interface.
@@ -1836,6 +2225,12 @@ func (n *GrantStmt) Restore(ctx *format.RestoreCtx) error {
 	}
 	if n.WithGrant {
 		ctx.WriteKeyWord(" WITH GRANT OPTION")
+	}
+	if n.As != nil {
+		ctx.WritePlain(" ")
+		if err := n.As.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore GrantStmt.As: %w", err)
+		}
 	}
 	return nil
 }
@@ -1903,6 +2298,8 @@ type GrantRoleStmt struct {
 
 	Roles []*auth.RoleIdentity
 	Users []*auth.UserIdentity
+	// WithAdminOption is the trailing WITH ADMIN OPTION clause.
+	WithAdminOption bool
 }
 
 // Accept implements Node Accept interface.
@@ -1937,7 +2334,194 @@ func (n *GrantRoleStmt) Restore(ctx *format.RestoreCtx) error {
 			return fmt.Errorf("an error occurred while restore GrantStmt.Users[%d]: %w", i, err)
 		}
 	}
+	if n.WithAdminOption {
+		ctx.WriteKeyWord(" WITH ADMIN OPTION")
+	}
 	return nil
+}
+
+// RevokeProxyStmt is the struct for REVOKE [IF EXISTS] PROXY ON user FROM users.
+type RevokeProxyStmt struct {
+	stmtNode
+
+	IfExists      bool
+	LocalUser     *auth.UserIdentity
+	ExternalUsers []*auth.UserIdentity
+	// IgnoreUnknownUser is the trailing IGNORE UNKNOWN USER clause (MySQL 8.0.30+).
+	IgnoreUnknownUser bool
+}
+
+// Restore implements Node interface.
+func (n *RevokeProxyStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("REVOKE ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	ctx.WriteKeyWord("PROXY ON ")
+	if err := n.LocalUser.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore RevokeProxyStmt.LocalUser: %w", err)
+	}
+	ctx.WriteKeyWord(" FROM ")
+	for i, v := range n.ExternalUsers {
+		if i != 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := v.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore RevokeProxyStmt.ExternalUsers[%d]: %w", i, err)
+		}
+	}
+	if n.IgnoreUnknownUser {
+		ctx.WriteKeyWord(" IGNORE UNKNOWN USER")
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *RevokeProxyStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*RevokeProxyStmt)
+	return v.Leave(n)
+}
+
+// AlterUserDefaultRoleStmt is ALTER USER [IF EXISTS] user DEFAULT ROLE
+// {NONE | ALL | role [, role]...}.
+type AlterUserDefaultRoleStmt struct {
+	stmtNode
+
+	IfExists   bool
+	User       *auth.UserIdentity
+	SetRoleOpt SetRoleStmtType
+	RoleList   []*auth.RoleIdentity
+}
+
+// Restore implements Node interface.
+func (n *AlterUserDefaultRoleStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ALTER USER ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	if err := n.User.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore AlterUserDefaultRoleStmt.User: %w", err)
+	}
+	ctx.WriteKeyWord(" DEFAULT ROLE")
+	switch n.SetRoleOpt { //nolint:exhaustive // the grammar only produces NONE, ALL, or a role list
+	case SetRoleNone:
+		ctx.WriteKeyWord(" NONE")
+	case SetRoleAll:
+		ctx.WriteKeyWord(" ALL")
+	}
+	for i, role := range n.RoleList {
+		ctx.WritePlain(" ")
+		if err := role.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore AlterUserDefaultRoleStmt.RoleList[%d]: %w", i, err)
+		}
+		if i != len(n.RoleList)-1 {
+			ctx.WritePlain(",")
+		}
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *AlterUserDefaultRoleStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterUserDefaultRoleStmt)
+	return v.Leave(n)
+}
+
+// FactorOp is the multi-factor authentication operation of an
+// AlterUserFactorStmt.
+type FactorOp int
+
+// FactorOp values.
+const (
+	FactorOpAdd FactorOp = iota + 1
+	FactorOpModify
+	FactorOpDrop
+	FactorOpInitiateRegistration
+	FactorOpFinishRegistration
+	FactorOpUnregister
+)
+
+// AlterUserFactorStmt covers the ALTER USER multi-factor authentication
+// forms (MySQL 8.0.27+):
+//
+//	ALTER USER [IF EXISTS] user ADD | MODIFY factor FACTOR identification
+//	ALTER USER [IF EXISTS] user DROP factor FACTOR
+//	ALTER USER [IF EXISTS] user factor FACTOR INITIATE REGISTRATION
+//	ALTER USER [IF EXISTS] user factor FACTOR FINISH REGISTRATION
+//	    SET CHALLENGE_RESPONSE AS 'auth_string'
+//	ALTER USER [IF EXISTS] user factor FACTOR UNREGISTER
+type AlterUserFactorStmt struct {
+	stmtNode
+
+	IfExists             bool
+	User                 *auth.UserIdentity
+	Op                   FactorOp
+	Factor               uint64
+	AuthOpt              *AuthOption // ADD / MODIFY
+	HasChallengeResponse bool
+	ChallengeResponse    string // FINISH REGISTRATION
+}
+
+// Restore implements Node interface.
+func (n *AlterUserFactorStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ALTER USER ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	if err := n.User.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore AlterUserFactorStmt.User: %w", err)
+	}
+	switch n.Op {
+	case FactorOpAdd, FactorOpModify:
+		if n.Op == FactorOpAdd {
+			ctx.WriteKeyWord(" ADD")
+		} else {
+			ctx.WriteKeyWord(" MODIFY")
+		}
+		ctx.WritePlainf(" %d ", n.Factor)
+		ctx.WriteKeyWord("FACTOR ")
+		if err := n.AuthOpt.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore AlterUserFactorStmt.AuthOpt: %w", err)
+		}
+	case FactorOpDrop:
+		ctx.WriteKeyWord(" DROP")
+		ctx.WritePlainf(" %d ", n.Factor)
+		ctx.WriteKeyWord("FACTOR")
+	case FactorOpInitiateRegistration:
+		ctx.WritePlainf(" %d ", n.Factor)
+		ctx.WriteKeyWord("FACTOR INITIATE REGISTRATION")
+	case FactorOpFinishRegistration:
+		ctx.WritePlainf(" %d ", n.Factor)
+		ctx.WriteKeyWord("FACTOR FINISH REGISTRATION")
+		if n.HasChallengeResponse {
+			ctx.WriteKeyWord(" SET CHALLENGE_RESPONSE AS ")
+			ctx.WriteString(n.ChallengeResponse)
+		}
+	case FactorOpUnregister:
+		ctx.WritePlainf(" %d ", n.Factor)
+		ctx.WriteKeyWord("FACTOR UNREGISTER")
+	default:
+		return fmt.Errorf("unsupported AlterUserFactorStmt.Op %d", n.Op)
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *AlterUserFactorStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterUserFactorStmt)
+	return v.Leave(n)
 }
 
 // ShutdownStmt is a statement to stop the MySQL server.

@@ -343,7 +343,7 @@ Two layers of canonicalization apply:
    | `primaryKeyNormalizer` | inline `id INT PRIMARY KEY` → table-level `PRIMARY KEY` index |
    | `indexNormalizer` | inline `c INT UNIQUE` → table-level `UNIQUE KEY`; assigns MySQL's default names to unnamed indexes |
    | `columnCheckNormalizer` | hoists a column-level `CHECK` into a table-level constraint |
-   | `expressionParenNormalizer` | rewrites `CHECK` and generated-column expressions into a canonical parenthesization (MySQL stores them fully parenthesized; the parser preserves input parens verbatim) |
+   | `expressionParenNormalizer` | rewrites `CHECK` and generated-column expressions into a canonical parenthesization, keeping only the parentheses the expression's own precedence does not already imply: MySQL stores them fully parenthesized and the parser preserves input parens verbatim, so `CHECK ((a=1) OR ((b=2) AND (c=3)))` and `CHECK (a=1 OR b=2 AND c=3)` both canonicalize to the latter |
    | `binaryAttributeNormalizer` | resolves the legacy `BINARY` column attribute to the column charset's `_bin` collation |
    | `integerDisplayWidthNormalizer` | strips deprecated integer display widths (`int(11)` → `int`), keeping `tinyint(1)` and `ZEROFILL` |
 

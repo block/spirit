@@ -26,6 +26,7 @@ import (
 var (
 	_ DDLNode = &AlterTableStmt{}
 	_ DDLNode = &CreateDatabaseStmt{}
+	_ DDLNode = &CreateJSONDualityViewStmt{}
 	_ DDLNode = &CreateIndexStmt{}
 	_ DDLNode = &CreateTableStmt{}
 	_ DDLNode = &CreateViewStmt{}
@@ -60,6 +61,7 @@ const (
 	DatabaseOptionCharset
 	DatabaseOptionCollate
 	DatabaseOptionEncryption
+	DatabaseOptionReadOnly
 )
 
 // DatabaseOption represents database option.
@@ -84,6 +86,14 @@ func (n *DatabaseOption) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord("ENCRYPTION")
 		ctx.WritePlain(" = ")
 		ctx.WriteString(n.Value)
+	case DatabaseOptionReadOnly:
+		ctx.WriteKeyWord("READ ONLY")
+		ctx.WritePlain(" = ")
+		if n.Value != "" {
+			ctx.WriteKeyWord(n.Value) // DEFAULT
+		} else {
+			ctx.WritePlainf("%d", n.UintValue)
+		}
 	default:
 		return fmt.Errorf("invalid DatabaseOptionType: %d", n.Tp)
 	}
@@ -429,6 +439,9 @@ const (
 	ColumnOptionStorage
 	ColumnOptionSecondaryEngineAttribute
 	ColumnOptionSrid
+	ColumnOptionVisibility
+	ColumnOptionEngineAttribute
+	ColumnOptionNotSecondary
 )
 
 var (
@@ -566,6 +579,16 @@ func (n *ColumnOption) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteString(n.StrValue)
 	case ColumnOptionSrid:
 		ctx.WritePlainf("/*!80003 SRID %d */", n.Srid)
+	case ColumnOptionVisibility:
+		// VISIBLE or INVISIBLE (MySQL 8.0.23+ invisible columns).
+		ctx.WriteKeyWord(n.StrValue)
+	case ColumnOptionEngineAttribute:
+		ctx.WriteKeyWord("ENGINE_ATTRIBUTE")
+		ctx.WritePlain(" = ")
+		ctx.WriteString(n.StrValue)
+	case ColumnOptionNotSecondary:
+		// Excludes the column from the HeatWave secondary engine.
+		ctx.WriteKeyWord("NOT SECONDARY")
 	default:
 		return errors.New("an error occurred while splicing ColumnOption")
 	}
@@ -617,6 +640,7 @@ type IndexOption struct {
 	Comment             string
 	ParserName          CIStr
 	Visibility          IndexVisibility
+	EngineAttr          string
 	SecondaryEngineAttr string
 }
 
@@ -628,6 +652,7 @@ func (n *IndexOption) IsEmpty() bool {
 		len(n.ParserName.O) > 0 ||
 		n.Comment != "" ||
 		n.Visibility != IndexVisibilityDefault ||
+		len(n.EngineAttr) > 0 ||
 		len(n.SecondaryEngineAttr) > 0 {
 		return false
 	}
@@ -684,6 +709,16 @@ func (n *IndexOption) Restore(ctx *format.RestoreCtx) error {
 		case IndexVisibilityInvisible:
 			ctx.WriteKeyWord("INVISIBLE")
 		}
+		hasPrevOption = true
+	}
+
+	if n.EngineAttr != "" {
+		if hasPrevOption {
+			ctx.WritePlain(" ")
+		}
+		ctx.WriteKeyWord("ENGINE_ATTRIBUTE")
+		ctx.WritePlain(" = ")
+		ctx.WriteString(n.EngineAttr)
 		hasPrevOption = true
 	}
 
@@ -972,6 +1007,11 @@ type CreateTableStmt struct {
 	Partition      *PartitionOptions
 	OnDuplicate    OnDuplicateKeyHandlingType
 	Select         ResultSetNode
+	// StartTransaction is the trailing START TRANSACTION clause that MySQL
+	// 8.0.21+ writes to the binary log in place of the SELECT part of
+	// CREATE TABLE ... SELECT under row-based replication. Mutually
+	// exclusive with Select.
+	StartTransaction bool
 }
 
 // Restore implements Node interface.
@@ -1048,6 +1088,10 @@ func (n *CreateTableStmt) Restore(ctx *format.RestoreCtx) error {
 		if err := n.Select.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while splicing CreateTableStmt Select: %w", err)
 		}
+	}
+
+	if n.StartTransaction {
+		ctx.WriteKeyWord(" START TRANSACTION")
 	}
 
 	if n.TemporaryKeyword == TemporaryGlobal {
@@ -1211,6 +1255,62 @@ func (n *OptimizeTableStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// RepairTableStmt is a statement to repair tables.
+// See https://dev.mysql.com/doc/refman/8.4/en/repair-table.html
+type RepairTableStmt struct {
+	ddlNode
+
+	NoWriteToBinLog bool
+	Tables          []*TableName
+	Quick           bool
+	Extended        bool
+	UseFrm          bool
+}
+
+// Restore implements Node interface.
+func (n *RepairTableStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("REPAIR ")
+	if n.NoWriteToBinLog {
+		ctx.WriteKeyWord("NO_WRITE_TO_BINLOG ")
+	}
+	ctx.WriteKeyWord("TABLE ")
+	for index, table := range n.Tables {
+		if index != 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore RepairTableStmt.Tables[%d]: %w", index, err)
+		}
+	}
+	if n.Quick {
+		ctx.WriteKeyWord(" QUICK")
+	}
+	if n.Extended {
+		ctx.WriteKeyWord(" EXTENDED")
+	}
+	if n.UseFrm {
+		ctx.WriteKeyWord(" USE_FRM")
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *RepairTableStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*RepairTableStmt)
+	for i, val := range n.Tables {
+		node, ok := val.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Tables[i] = node.(*TableName)
+	}
+	return v.Leave(n)
+}
+
 // RenameTableStmt is a statement to rename a table.
 // See http://dev.mysql.com/doc/refman/5.7/en/rename-table.html
 type RenameTableStmt struct {
@@ -1297,6 +1397,7 @@ type CreateViewStmt struct {
 	ddlNode
 
 	OrReplace   bool
+	IfNotExists bool
 	ViewName    *TableName
 	Cols        []CIStr
 	Select      StmtNode
@@ -1333,6 +1434,9 @@ func (n *CreateViewStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord(" SQL SECURITY ")
 	ctx.WriteKeyWord(n.Security.String())
 	ctx.WriteKeyWord(" VIEW ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
 
 	if err := n.ViewName.Restore(ctx); err != nil {
 		return fmt.Errorf("an error occurred while create CreateViewStmt.ViewName: %w", err)
@@ -1381,6 +1485,398 @@ func (n *CreateViewStmt) Accept(v Visitor) (Node, bool) {
 		return n, false
 	}
 	n.Select = selnode.(StmtNode)
+	return v.Leave(n)
+}
+
+// CreateJSONDualityViewStmt is a statement to create a JSON relational
+// duality view. See https://dev.mysql.com/doc/refman/9.4/en/create-json-duality-view.html
+type CreateJSONDualityViewStmt struct {
+	ddlNode
+
+	OrReplace   bool
+	Algorithm   ViewAlgorithm
+	Definer     *auth.UserIdentity
+	Security    ViewSecurity
+	Relational  bool
+	IfNotExists bool
+	ViewName    *TableName
+	Select      StmtNode
+}
+
+// Restore implements Node interface.
+func (n *CreateJSONDualityViewStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("CREATE ")
+	if n.OrReplace {
+		ctx.WriteKeyWord("OR REPLACE ")
+	}
+	// The view attributes are only written when they differ from what an
+	// absent clause parses to, so unattributed statements restore without
+	// them.
+	if n.Algorithm != AlgorithmUndefined {
+		ctx.WriteKeyWord("ALGORITHM")
+		ctx.WritePlain(" = ")
+		ctx.WriteKeyWord(n.Algorithm.String())
+		ctx.WritePlain(" ")
+	}
+	if n.Definer != nil && !n.Definer.CurrentUser {
+		ctx.WriteKeyWord("DEFINER")
+		ctx.WritePlain(" = ")
+		ctx.WriteName(n.Definer.Username)
+		if n.Definer.Hostname != "" {
+			ctx.WritePlain("@")
+			ctx.WriteName(n.Definer.Hostname)
+		}
+		ctx.WritePlain(" ")
+	}
+	if n.Security != SecurityDefiner {
+		ctx.WriteKeyWord("SQL SECURITY ")
+		ctx.WriteKeyWord(n.Security.String())
+		ctx.WritePlain(" ")
+	}
+	ctx.WriteKeyWord("JSON ")
+	if n.Relational {
+		ctx.WriteKeyWord("RELATIONAL ")
+	}
+	ctx.WriteKeyWord("DUALITY VIEW ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
+	if err := n.ViewName.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore CreateJSONDualityViewStmt.ViewName: %w", err)
+	}
+	ctx.WriteKeyWord(" AS ")
+	if err := n.Select.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore CreateJSONDualityViewStmt.Select: %w", err)
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *CreateJSONDualityViewStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*CreateJSONDualityViewStmt)
+	node, ok := n.ViewName.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.ViewName = node.(*TableName)
+	selnode, ok := n.Select.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Select = selnode.(StmtNode)
+	return v.Leave(n)
+}
+
+// AlterViewStmt is a statement to alter a View.
+// See https://dev.mysql.com/doc/refman/8.4/en/alter-view.html
+type AlterViewStmt struct {
+	ddlNode
+
+	ViewName    *TableName
+	Cols        []CIStr
+	Select      StmtNode
+	Algorithm   ViewAlgorithm
+	Definer     *auth.UserIdentity
+	Security    ViewSecurity
+	CheckOption ViewCheckOption
+}
+
+// Restore implements Node interface.
+func (n *AlterViewStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ALTER ")
+	ctx.WriteKeyWord("ALGORITHM")
+	ctx.WritePlain(" = ")
+	ctx.WriteKeyWord(n.Algorithm.String())
+	ctx.WriteKeyWord(" DEFINER")
+	ctx.WritePlain(" = ")
+	if n.Definer.CurrentUser {
+		ctx.WriteKeyWord("current_user")
+	} else {
+		ctx.WriteName(n.Definer.Username)
+		if n.Definer.Hostname != "" {
+			ctx.WritePlain("@")
+			ctx.WriteName(n.Definer.Hostname)
+		}
+	}
+	ctx.WriteKeyWord(" SQL SECURITY ")
+	ctx.WriteKeyWord(n.Security.String())
+	ctx.WriteKeyWord(" VIEW ")
+	if err := n.ViewName.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore AlterViewStmt.ViewName: %w", err)
+	}
+	for i, col := range n.Cols {
+		if i == 0 {
+			ctx.WritePlain(" (")
+		} else {
+			ctx.WritePlain(",")
+		}
+		ctx.WriteName(col.O)
+		if i == len(n.Cols)-1 {
+			ctx.WritePlain(")")
+		}
+	}
+	ctx.WriteKeyWord(" AS ")
+	if err := n.Select.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore AlterViewStmt.Select: %w", err)
+	}
+	if n.CheckOption != CheckOptionCascaded {
+		ctx.WriteKeyWord(" WITH ")
+		ctx.WriteKeyWord(n.CheckOption.String())
+		ctx.WriteKeyWord(" CHECK OPTION")
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *AlterViewStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterViewStmt)
+	node, ok := n.ViewName.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.ViewName = node.(*TableName)
+	selnode, ok := n.Select.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Select = selnode.(StmtNode)
+	return v.Leave(n)
+}
+
+// SRSAttributeType is the attribute kind in CREATE SPATIAL REFERENCE SYSTEM.
+type SRSAttributeType int
+
+// SRS attribute types.
+const (
+	SRSAttrName SRSAttributeType = iota
+	SRSAttrDefinition
+	SRSAttrOrganization
+	SRSAttrDescription
+)
+
+// SRSAttribute is one attribute of CREATE SPATIAL REFERENCE SYSTEM.
+type SRSAttribute struct {
+	Tp    SRSAttributeType
+	Value string
+	OrgID uint64 // ORGANIZATION ... IDENTIFIED BY
+}
+
+// Restore implements Node interface.
+func (n *SRSAttribute) Restore(ctx *format.RestoreCtx) error {
+	switch n.Tp {
+	case SRSAttrName:
+		ctx.WriteKeyWord("NAME ")
+	case SRSAttrDefinition:
+		ctx.WriteKeyWord("DEFINITION ")
+	case SRSAttrOrganization:
+		ctx.WriteKeyWord("ORGANIZATION ")
+	case SRSAttrDescription:
+		ctx.WriteKeyWord("DESCRIPTION ")
+	default:
+		return fmt.Errorf("invalid SRSAttributeType: %d", n.Tp)
+	}
+	ctx.WriteString(n.Value)
+	if n.Tp == SRSAttrOrganization {
+		ctx.WriteKeyWord(" IDENTIFIED BY ")
+		ctx.WritePlainf("%d", n.OrgID)
+	}
+	return nil
+}
+
+// CreateSpatialRefSysStmt is a statement to create a spatial reference system.
+// See https://dev.mysql.com/doc/refman/8.4/en/create-spatial-reference-system.html
+type CreateSpatialRefSysStmt struct {
+	ddlNode
+
+	OrReplace   bool
+	IfNotExists bool
+	SRID        uint64
+	Attributes  []*SRSAttribute
+}
+
+// Restore implements Node interface.
+func (n *CreateSpatialRefSysStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("CREATE ")
+	if n.OrReplace {
+		ctx.WriteKeyWord("OR REPLACE ")
+	}
+	ctx.WriteKeyWord("SPATIAL REFERENCE SYSTEM ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
+	ctx.WritePlainf("%d", n.SRID)
+	for i, attr := range n.Attributes {
+		ctx.WritePlain(" ")
+		if err := attr.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore CreateSpatialRefSysStmt.Attributes[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *CreateSpatialRefSysStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*CreateSpatialRefSysStmt)
+	return v.Leave(n)
+}
+
+// DropSpatialRefSysStmt is a statement to drop a spatial reference system.
+// See https://dev.mysql.com/doc/refman/8.4/en/drop-spatial-reference-system.html
+type DropSpatialRefSysStmt struct {
+	ddlNode
+
+	IfExists bool
+	SRID     uint64
+}
+
+// Restore implements Node interface.
+func (n *DropSpatialRefSysStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("DROP SPATIAL REFERENCE SYSTEM ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	ctx.WritePlainf("%d", n.SRID)
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *DropSpatialRefSysStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*DropSpatialRefSysStmt)
+	return v.Leave(n)
+}
+
+// CreateLibraryStmt is a statement to create a library (MySQL 9.x).
+// See https://dev.mysql.com/doc/refman/9.4/en/create-library.html
+type CreateLibraryStmt struct {
+	ddlNode
+
+	IfNotExists bool
+	Library     *TableName
+	HasComment  bool
+	Comment     string
+	Language    string
+	Body        string
+}
+
+// Restore implements Node interface.
+func (n *CreateLibraryStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("CREATE LIBRARY ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
+	if err := n.Library.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore CreateLibraryStmt.Library: %w", err)
+	}
+	if n.HasComment {
+		ctx.WriteKeyWord(" COMMENT ")
+		ctx.WriteString(n.Comment)
+	}
+	ctx.WriteKeyWord(" LANGUAGE ")
+	ctx.WriteKeyWord(n.Language)
+	ctx.WriteKeyWord(" AS ")
+	ctx.WriteString(n.Body)
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *CreateLibraryStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*CreateLibraryStmt)
+	node, ok := n.Library.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Library = node.(*TableName)
+	return v.Leave(n)
+}
+
+// AlterLibraryStmt is a statement to alter a library's comment (MySQL 9.x).
+// See https://dev.mysql.com/doc/refman/9.4/en/alter-library.html
+type AlterLibraryStmt struct {
+	ddlNode
+
+	Library *TableName
+	Comment string
+}
+
+// Restore implements Node interface.
+func (n *AlterLibraryStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ALTER LIBRARY ")
+	if err := n.Library.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore AlterLibraryStmt.Library: %w", err)
+	}
+	ctx.WriteKeyWord(" COMMENT ")
+	ctx.WriteString(n.Comment)
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *AlterLibraryStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterLibraryStmt)
+	node, ok := n.Library.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Library = node.(*TableName)
+	return v.Leave(n)
+}
+
+// DropLibraryStmt is a statement to drop a library (MySQL 9.x).
+// See https://dev.mysql.com/doc/refman/9.4/en/drop-library.html
+type DropLibraryStmt struct {
+	ddlNode
+
+	IfExists bool
+	Library  *TableName
+}
+
+// Restore implements Node interface.
+func (n *DropLibraryStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("DROP LIBRARY ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	if err := n.Library.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore DropLibraryStmt.Library: %w", err)
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *DropLibraryStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*DropLibraryStmt)
+	node, ok := n.Library.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Library = node.(*TableName)
 	return v.Leave(n)
 }
 
@@ -1593,6 +2089,8 @@ type LockTablesStmt struct {
 // TableLock contains the table name and lock type.
 type TableLock struct {
 	Table *TableName
+	// Alias is the optional [AS] alias of the locked table.
+	Alias CIStr
 	Type  TableLockType
 }
 
@@ -1622,6 +2120,10 @@ func (n *LockTablesStmt) Restore(ctx *format.RestoreCtx) error {
 		}
 		if err := tl.Table.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while add index: %w", err)
+		}
+		if tl.Alias.O != "" {
+			ctx.WriteKeyWord(" AS ")
+			ctx.WriteName(tl.Alias.O)
 		}
 		ctx.WriteKeyWord(" " + tl.Type.String())
 	}
@@ -1919,7 +2421,11 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 	case TableOptionAutoextendSize:
 		ctx.WriteKeyWord("AUTOEXTEND_SIZE ")
 		ctx.WritePlain("= ")
-		ctx.WritePlain(n.StrValue) // e.g. '4M'
+		if n.StrValue != "" {
+			ctx.WritePlain(n.StrValue) // e.g. '4M'
+		} else {
+			ctx.WritePlainf("%d", n.UintValue)
+		}
 
 	default:
 		return fmt.Errorf("invalid TableOption: %d", n.Tp)
@@ -2041,6 +2547,7 @@ const (
 	AlterTableRebuildPartition
 	AlterTableReorganizePartition
 	AlterTableCheckPartitions
+	AlterTableAnalyzePartitions
 	AlterTableExchangePartition
 	AlterTableOptimizePartition
 	AlterTableRepairPartition
@@ -2051,6 +2558,7 @@ const (
 	AlterTableImportTablespace
 	AlterTableDiscardTablespace
 	AlterTableIndexInvisible
+	AlterTableAlterColumnVisibility
 	// TODO: Add more actions
 	AlterTableOrderByColumns
 )
@@ -2156,6 +2664,21 @@ func (n *AlterOrderItem) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord(" DESC")
 	}
 	return nil
+}
+
+func restoreSecondaryPartitionList(ctx *format.RestoreCtx, names []CIStr) {
+	if len(names) == 0 {
+		return
+	}
+	ctx.WriteKeyWord(" PARTITION ")
+	ctx.WritePlain("(")
+	for i, name := range names {
+		if i != 0 {
+			ctx.WritePlain(",")
+		}
+		ctx.WriteName(name.O)
+	}
+	ctx.WritePlain(")")
 }
 
 // Restore implements Node interface.
@@ -2396,6 +2919,21 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 			}
 			ctx.WriteName(name.O)
 		}
+	case AlterTableAnalyzePartitions:
+		ctx.WriteKeyWord("ANALYZE PARTITION ")
+		if n.NoWriteToBinlog {
+			ctx.WriteKeyWord("NO_WRITE_TO_BINLOG ")
+		}
+		if n.OnAllPartitions {
+			ctx.WriteKeyWord("ALL")
+			return nil
+		}
+		for i, name := range n.PartitionNames {
+			if i != 0 {
+				ctx.WritePlain(",")
+			}
+			ctx.WriteName(name.O)
+		}
 	case AlterTableOptimizePartition:
 		ctx.WriteKeyWord("OPTIMIZE PARTITION ")
 		if n.NoWriteToBinlog {
@@ -2522,8 +3060,10 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 		}
 	case AlterTableSecondaryLoad:
 		ctx.WriteKeyWord("SECONDARY_LOAD")
+		restoreSecondaryPartitionList(ctx, n.PartitionNames)
 	case AlterTableSecondaryUnload:
 		ctx.WriteKeyWord("SECONDARY_UNLOAD")
+		restoreSecondaryPartitionList(ctx, n.PartitionNames)
 	case AlterTableAlterCheck:
 		ctx.WriteKeyWord("ALTER CHECK ")
 		ctx.WriteName(n.Constraint.Name)
@@ -2546,6 +3086,17 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 			ctx.WriteKeyWord(" VISIBLE")
 		case IndexVisibilityInvisible:
 			ctx.WriteKeyWord(" INVISIBLE")
+		}
+	case AlterTableAlterColumnVisibility:
+		ctx.WriteKeyWord("ALTER COLUMN ")
+		if err := n.OldColumnName.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore AlterTableSpec.OldColumnName: %w", err)
+		}
+		switch n.Visibility { //nolint:exhaustive // the grammar only produces VISIBLE or INVISIBLE
+		case IndexVisibilityVisible:
+			ctx.WriteKeyWord(" SET VISIBLE")
+		case IndexVisibilityInvisible:
+			ctx.WriteKeyWord(" SET INVISIBLE")
 		}
 	default:
 		// TODO: not support

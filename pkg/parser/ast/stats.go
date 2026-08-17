@@ -38,6 +38,12 @@ type AnalyzeTableStmt struct {
 	HistogramOperation HistogramOperationType
 	// ColumnNames indicate the columns whose histograms are updated or dropped.
 	ColumnNames []CIStr
+	// HistogramUpdate is the MANUAL/AUTO UPDATE suffix of UPDATE HISTOGRAM (MySQL 8.4+).
+	HistogramUpdate HistogramUpdateType
+	// UsingData is set for UPDATE HISTOGRAM ... USING DATA 'json'; HistogramData
+	// holds the JSON payload.
+	UsingData     bool
+	HistogramData string
 }
 
 // AnalyzeOptionType is the type for analyze options.
@@ -52,6 +58,16 @@ const (
 var AnalyzeOptionString = map[AnalyzeOptionType]string{
 	AnalyzeOptNumBuckets: "BUCKETS",
 }
+
+// HistogramUpdateType is the MANUAL/AUTO UPDATE suffix of UPDATE HISTOGRAM.
+type HistogramUpdateType int
+
+// Histogram update types.
+const (
+	HistogramUpdateNop HistogramUpdateType = iota
+	HistogramUpdateManual
+	HistogramUpdateAuto
+)
 
 // HistogramOperationType is the type for histogram operation.
 type HistogramOperationType int
@@ -118,6 +134,10 @@ func (n *AnalyzeTableStmt) Restore(ctx *format.RestoreCtx) error {
 				ctx.WriteName(columnName.O)
 			}
 		}
+		if n.UsingData {
+			ctx.WriteKeyWord(" USING DATA ")
+			ctx.WriteString(n.HistogramData)
+		}
 	}
 	if len(n.AnalyzeOpts) != 0 {
 		ctx.WriteKeyWord(" WITH")
@@ -128,6 +148,13 @@ func (n *AnalyzeTableStmt) Restore(ctx *format.RestoreCtx) error {
 			ctx.WritePlainf(" %v ", opt.Value.GetValue())
 			ctx.WritePlain(AnalyzeOptionString[opt.Type])
 		}
+	}
+	switch n.HistogramUpdate {
+	case HistogramUpdateNop:
+	case HistogramUpdateManual:
+		ctx.WriteKeyWord(" MANUAL UPDATE")
+	case HistogramUpdateAuto:
+		ctx.WriteKeyWord(" AUTO UPDATE")
 	}
 	return nil
 }

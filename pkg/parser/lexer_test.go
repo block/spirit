@@ -53,7 +53,7 @@ type testLiteralValue struct {
 
 func TestSingleCharOther(t *testing.T) {
 	table := []testCaseItem{
-		{"AT", identifier},
+		{"AT", at},
 		{"?", paramMarker},
 		{"PLACEHOLDER", identifier},
 		{"=", eq},
@@ -420,8 +420,10 @@ func TestOptimizerHintAfterCertainKeywordOnly(t *testing.T) {
 			tokens: []int{deleteKwd, hintComment, 0},
 		},
 		{
+			// MySQL has no hint slot after CREATE: the hint is warned
+			// about and skipped like a comment instead of failing.
 			input:  "CREATE /*+ hint */",
-			tokens: []int{create, hintComment, 0},
+			tokens: []int{create, 0},
 		},
 		{
 			input:  "/*+ hint */ SELECT *",
@@ -551,77 +553,30 @@ func TestIllegal(t *testing.T) {
 
 func TestVersionDigits(t *testing.T) {
 	tests := []struct {
-		input    string
-		min      int
-		max      int
-		nextChar byte
+		input      string
+		version    int
+		hasVersion bool
+		nextChar   byte
 	}{
-		{
-			input:    "12345",
-			min:      5,
-			max:      5,
-			nextChar: 0,
-		},
-		{
-			input:    "12345xyz",
-			min:      5,
-			max:      5,
-			nextChar: 'x',
-		},
-		{
-			input:    "1234xyz",
-			min:      5,
-			max:      5,
-			nextChar: '1',
-		},
-		{
-			input:    "123456",
-			min:      5,
-			max:      5,
-			nextChar: '6',
-		},
-		{
-			input:    "1234",
-			min:      5,
-			max:      5,
-			nextChar: '1',
-		},
-		{
-			input:    "",
-			min:      5,
-			max:      5,
-			nextChar: 0,
-		},
-		{
-			input:    "1234567xyz",
-			min:      5,
-			max:      6,
-			nextChar: '7',
-		},
-		{
-			input:    "12345xyz",
-			min:      5,
-			max:      6,
-			nextChar: 'x',
-		},
-		{
-			input:    "12345",
-			min:      5,
-			max:      6,
-			nextChar: 0,
-		},
-		{
-			input:    "1234xyz",
-			min:      5,
-			max:      6,
-			nextChar: '1',
-		},
+		{input: "90700 x", version: 90700, hasVersion: true, nextChar: ' '},
+		{input: "12345xyz", version: 12345, hasVersion: true, nextChar: 'x'},
+		// Greedy like MySQL: any digit count forms the version number.
+		{input: "1234xyz", version: 1234, hasVersion: true, nextChar: 'x'},
+		{input: "00000 2", version: 0, hasVersion: true, nextChar: ' '},
+		// Values saturate once they exceed mimicMySQLVersionID; the exact
+		// saturated value is irrelevant as long as it stays above it.
+		{input: "999999xyz", version: 99999, hasVersion: true, nextChar: 'x'},
+		{input: "1234567xyz", version: 123456, hasVersion: true, nextChar: 'x'},
+		{input: "", version: 0, hasVersion: false, nextChar: 0},
+		{input: "xyz", version: 0, hasVersion: false, nextChar: 'x'},
 	}
 
 	scanner := NewScanner("")
 	for _, test := range tests {
 		scanner.reset(test.input)
-		scanner.scanVersionDigits(test.min, test.max)
+		version, hasVersion := scanner.scanVersionNumber()
+		requires.Equalf(t, test.hasVersion, hasVersion, "input = %s", test.input)
+		requires.Equalf(t, test.version, version, "input = %s", test.input)
 		nextChar := scanner.r.readByte()
 		requires.Equalf(t, test.nextChar, nextChar, "input = %s", test.input)
 	}

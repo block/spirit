@@ -90,14 +90,7 @@ func ValidCharsetAndCollation(cs string, co string) bool {
 
 // GetDefaultCollationLegacy is compatible with the charset support in old version parser.
 func GetDefaultCollationLegacy(charset string) (string, error) {
-	switch strings.ToLower(charset) {
-	case CharsetUTF8MB3:
-		return GetDefaultCollation(CharsetUTF8)
-	case CharsetUTF8, CharsetUTF8MB4, CharsetASCII, CharsetLatin1, CharsetBin:
-		return GetDefaultCollation(charset)
-	default:
-		return "", fmt.Errorf("unknown charset %s", charset)
-	}
+	return GetDefaultCollation(charset)
 }
 
 // GetDefaultCollation returns the default collation for charset.
@@ -119,22 +112,22 @@ func GetCharsetInfo(cs string) (*Charset, error) {
 		return c, nil
 	}
 
+	// Any charset known to MySQL is valid at parse level: this parser only
+	// parses and restores statements, it never needs to encode or decode
+	// the charset's data.
 	if c, ok := charsets[strings.ToLower(cs)]; ok {
-		return c, fmt.Errorf("unsupported charset %s", cs)
+		return c, nil
 	}
 
 	return nil, fmt.Errorf("unknown charset %s", cs)
 }
 
 func utf8Alias(csname string) string {
-	switch csname {
-	case "utf8mb3_bin":
-		csname = "utf8_bin"
-	case "utf8mb3_unicode_ci":
-		csname = "utf8_unicode_ci"
-	case "utf8mb3_general_ci":
-		csname = "utf8_general_ci"
-	default:
+	// MySQL 8.0 spells the 3-byte UTF-8 collations utf8mb3_*; this registry
+	// keeps the legacy utf8_* names. Every utf8mb3_* collation has a utf8_*
+	// counterpart, so alias by prefix.
+	if rest, ok := strings.CutPrefix(csname, "utf8mb3_"); ok {
+		return "utf8_" + rest
 	}
 	return csname
 }
@@ -541,6 +534,20 @@ var collations = []*Collation{
 	{307, "utf8mb4", "utf8mb4_ru_0900_as_cs", false, 1, PadNone},
 	{308, "utf8mb4", "utf8mb4_zh_0900_as_cs", false, 1, PadNone},
 	{309, "utf8mb4", "utf8mb4_0900_bin", false, 1, PadNone},
+	{310, "utf8mb4", "utf8mb4_nb_0900_ai_ci", false, 0, PadNone},
+	{311, "utf8mb4", "utf8mb4_nb_0900_as_cs", false, 0, PadNone},
+	{312, "utf8mb4", "utf8mb4_nn_0900_ai_ci", false, 0, PadNone},
+	{313, "utf8mb4", "utf8mb4_nn_0900_as_cs", false, 0, PadNone},
+	{314, "utf8mb4", "utf8mb4_sr_latn_0900_ai_ci", false, 0, PadNone},
+	{315, "utf8mb4", "utf8mb4_sr_latn_0900_as_cs", false, 0, PadNone},
+	{316, "utf8mb4", "utf8mb4_bs_0900_ai_ci", false, 0, PadNone},
+	{317, "utf8mb4", "utf8mb4_bs_0900_as_cs", false, 0, PadNone},
+	{318, "utf8mb4", "utf8mb4_bg_0900_ai_ci", false, 0, PadNone},
+	{319, "utf8mb4", "utf8mb4_bg_0900_as_cs", false, 0, PadNone},
+	{320, "utf8mb4", "utf8mb4_gl_0900_ai_ci", false, 0, PadNone},
+	{321, "utf8mb4", "utf8mb4_gl_0900_as_cs", false, 0, PadNone},
+	{322, "utf8mb4", "utf8mb4_mn_cyrl_0900_ai_ci", false, 0, PadNone},
+	{323, "utf8mb4", "utf8mb4_mn_cyrl_0900_as_cs", false, 0, PadNone},
 }
 
 // init method always puts to the end of file.

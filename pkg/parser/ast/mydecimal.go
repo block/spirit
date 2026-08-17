@@ -13,9 +13,16 @@
 
 package ast
 
-const panicInfo = "This branch is not implemented. " +
-	"The parser only uses MyDecimal to round-trip decimal literals, and this " +
-	"code path is not needed for that."
+import (
+	"errors"
+
+	"github.com/block/spirit/pkg/parser/types"
+)
+
+// errBadDecimal is returned for byte sequences FromString cannot interpret as
+// a decimal at all. The lexer never produces such sequences (decLit tokens
+// always carry at least one digit and no exponent), so this is defensive.
+var errBadDecimal = errors.New("bad decimal number")
 
 // constant values.
 const (
@@ -29,9 +36,14 @@ var (
 )
 
 // fixWordCntError limits word count in wordBufLen, and returns overflow or truncate error.
+// Like MySQL, an integer part wider than the buffer is an out-of-range error, while a
+// fractional part that merely doesn't fit is truncated to what remains.
 func fixWordCntError(wordsInt, wordsFrac int) (newWordsInt int, newWordsFrac int, err error) {
+	if wordsInt > wordBufLen {
+		return wordBufLen, 0, types.ErrDataOutOfRange
+	}
 	if wordsInt+wordsFrac > wordBufLen {
-		panic(panicInfo)
+		return wordsInt, wordBufLen - wordsInt, types.ErrTruncatedWrongValue
 	}
 	return wordsInt, wordsFrac, nil
 }
@@ -189,7 +201,7 @@ func (d *MyDecimal) FromString(str []byte) error {
 		}
 	}
 	if len(str) == 0 {
-		panic(panicInfo)
+		return errBadDecimal
 	}
 	switch str[0] {
 	case '-':
@@ -216,13 +228,23 @@ func (d *MyDecimal) FromString(str []byte) error {
 		endIdx = strIdx
 	}
 	if digitsInt+digitsFrac == 0 {
-		panic(panicInfo)
+		return errBadDecimal
 	}
 	wordsInt := digitsToWords(digitsInt)
 	wordsFrac := digitsToWords(digitsFrac)
-	wordsInt, _, err := fixWordCntError(wordsInt, wordsFrac)
+	wordsInt, wordsFrac, err := fixWordCntError(wordsInt, wordsFrac)
 	if err != nil {
-		panic(panicInfo)
+		// Clamp to what fits and keep parsing; the caller decides how to
+		// surface the overflow/truncation.
+		digitsFrac = wordsFrac * digitsPerWord
+		if errors.Is(err, types.ErrDataOutOfRange) {
+			// strIdx deliberately stays put. The extraction loop below walks
+			// backwards from it, so leaving it alone keeps the literal's
+			// trailing digits, which is what MySQL's own warning text quotes:
+			// `SELECT <65 ones><65 twos>` reports the last 81 digits, not the
+			// first. The value itself is clamped by the caller either way.
+			digitsInt = wordsInt * digitsPerWord
+		}
 	}
 	d.digitsInt = int8(digitsInt)
 	d.digitsFrac = int8(digitsFrac)
@@ -267,7 +289,9 @@ func (d *MyDecimal) FromString(str []byte) error {
 		d.wordBuf[wordIdx] = word * pow10(digitsPerWord-innerIdx)
 	}
 	if endIdx+1 <= len(str) && (str[endIdx] == 'e' || str[endIdx] == 'E') {
-		panic(panicInfo)
+		// Scientific notation never reaches here: the lexer tokenizes it as a
+		// float literal, not a decimal literal.
+		return errBadDecimal
 	}
 	allZero := true
 	for i := range wordBufLen {

@@ -21,6 +21,7 @@ import (
 	"github.com/block/spirit/pkg/parser/auth"
 	"github.com/block/spirit/pkg/parser/format"
 	"github.com/block/spirit/pkg/parser/mysql"
+	"github.com/block/spirit/pkg/parser/types"
 )
 
 var (
@@ -607,6 +608,156 @@ func (n *TableSource) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// JSONTableColumn is one column definition in the COLUMNS clause of
+// JSON_TABLE. Exactly one of ForOrdinality, Tp (value column) and
+// NestedColumns (NESTED PATH entry) is set.
+type JSONTableColumn struct {
+	// Name is the column name; empty for NESTED entries.
+	Name CIStr
+	// ForOrdinality marks a `name FOR ORDINALITY` counter column.
+	ForOrdinality bool
+	// Tp is the column type of a value column; nil otherwise.
+	Tp *types.FieldType
+	// Exists marks an `EXISTS PATH` value column.
+	Exists bool
+	// Path is the JSON path literal of value and nested entries.
+	Path string
+	// OnEmpty is the ON EMPTY behavior of a value column; nil when absent.
+	OnEmpty *JSONValueOnBehavior
+	// OnError is the ON ERROR behavior of a value column; nil when absent.
+	OnError *JSONValueOnBehavior
+	// NestedColumns is non-nil for `NESTED [PATH] '...' COLUMNS (...)` entries.
+	NestedColumns []*JSONTableColumn
+}
+
+// Restore implements Node interface.
+func (n *JSONTableColumn) Restore(ctx *format.RestoreCtx) error {
+	if n.NestedColumns != nil {
+		ctx.WriteKeyWord("NESTED PATH ")
+		ctx.WriteString(n.Path)
+		ctx.WriteKeyWord(" COLUMNS ")
+		return restoreJSONTableColumns(ctx, n.NestedColumns)
+	}
+	ctx.WriteName(n.Name.O)
+	if n.ForOrdinality {
+		ctx.WriteKeyWord(" FOR ORDINALITY")
+		return nil
+	}
+	ctx.WritePlain(" ")
+	if err := n.Tp.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore JSONTableColumn.Tp: %w", err)
+	}
+	if n.Exists {
+		ctx.WriteKeyWord(" EXISTS")
+	}
+	ctx.WriteKeyWord(" PATH ")
+	ctx.WriteString(n.Path)
+	if n.OnEmpty != nil {
+		ctx.WritePlain(" ")
+		if err := n.OnEmpty.Restore(ctx); err != nil {
+			return err
+		}
+		ctx.WriteKeyWord(" ON EMPTY")
+	}
+	if n.OnError != nil {
+		ctx.WritePlain(" ")
+		if err := n.OnError.Restore(ctx); err != nil {
+			return err
+		}
+		ctx.WriteKeyWord(" ON ERROR")
+	}
+	return nil
+}
+
+func restoreJSONTableColumns(ctx *format.RestoreCtx, cols []*JSONTableColumn) error {
+	ctx.WritePlain("(")
+	for i, col := range cols {
+		if i != 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := col.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore JSONTableColumn: %w", err)
+		}
+	}
+	ctx.WritePlain(")")
+	return nil
+}
+
+// acceptJSONTableColumns visits the behavior default expressions of all
+// (recursively nested) JSON_TABLE columns.
+func acceptJSONTableColumns(v Visitor, cols []*JSONTableColumn) bool {
+	for _, col := range cols {
+		if col.OnEmpty != nil && col.OnEmpty.Default != nil {
+			node, ok := col.OnEmpty.Default.Accept(v)
+			if !ok {
+				return false
+			}
+			col.OnEmpty.Default = node.(ExprNode)
+		}
+		if col.OnError != nil && col.OnError.Default != nil {
+			node, ok := col.OnError.Default.Accept(v)
+			if !ok {
+				return false
+			}
+			col.OnError.Default = node.(ExprNode)
+		}
+		if col.NestedColumns != nil && !acceptJSONTableColumns(v, col.NestedColumns) {
+			return false
+		}
+	}
+	return true
+}
+
+// JSONTableExpr is the JSON_TABLE(doc, path COLUMNS (...)) table function
+// used as a table factor.
+type JSONTableExpr struct {
+	node
+
+	// Doc is the JSON document argument.
+	Doc ExprNode
+	// Path is the row path literal.
+	Path string
+	// Columns is the COLUMNS clause.
+	Columns []*JSONTableColumn
+}
+
+func (*JSONTableExpr) resultSet() {}
+
+// Restore implements Node interface.
+func (n *JSONTableExpr) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("JSON_TABLE")
+	ctx.WritePlain("(")
+	if err := n.Doc.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore JSONTableExpr.Doc: %w", err)
+	}
+	ctx.WritePlain(", ")
+	ctx.WriteString(n.Path)
+	ctx.WriteKeyWord(" COLUMNS ")
+	if err := restoreJSONTableColumns(ctx, n.Columns); err != nil {
+		return err
+	}
+	ctx.WritePlain(")")
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *JSONTableExpr) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*JSONTableExpr)
+	node, ok := n.Doc.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Doc = node.(ExprNode)
+	if !acceptJSONTableColumns(v, n.Columns) {
+		return n, false
+	}
+	return v.Leave(n)
+}
+
 // SelectLockType is the lock type for SelectStmt.
 type SelectLockType int
 
@@ -870,11 +1021,35 @@ type GroupByClause struct {
 	node
 	Items  []*ByItem
 	Rollup bool
+	// GroupingSets is non-nil for GROUP BY GROUPING SETS ((...), ...);
+	// Items is empty in that case. An empty inner slice is the empty set ().
+	GroupingSets [][]ExprNode
 }
 
 // Restore implements Node interface.
 func (n *GroupByClause) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("GROUP BY ")
+	if n.GroupingSets != nil {
+		ctx.WriteKeyWord("GROUPING SETS ")
+		ctx.WritePlain("(")
+		for i, set := range n.GroupingSets {
+			if i != 0 {
+				ctx.WritePlain(",")
+			}
+			ctx.WritePlain("(")
+			for j, expr := range set {
+				if j != 0 {
+					ctx.WritePlain(",")
+				}
+				if err := expr.Restore(ctx); err != nil {
+					return fmt.Errorf("an error occurred while restore GroupByClause.GroupingSets[%d][%d]: %w", i, j, err)
+				}
+			}
+			ctx.WritePlain(")")
+		}
+		ctx.WritePlain(")")
+		return nil
+	}
 	for i, v := range n.Items {
 		if i != 0 {
 			ctx.WritePlain(",")
@@ -902,6 +1077,15 @@ func (n *GroupByClause) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Items[i] = node.(*ByItem)
+	}
+	for i, set := range n.GroupingSets {
+		for j, expr := range set {
+			node, ok := expr.Accept(v)
+			if !ok {
+				return n, false
+			}
+			n.GroupingSets[i][j] = node.(ExprNode)
+		}
 	}
 	return v.Leave(n)
 }
@@ -1078,12 +1262,15 @@ type SelectStmt struct {
 	Having *HavingClause
 	// WindowSpecs is the window specification list.
 	WindowSpecs []WindowSpec
+	// Qualify is the QUALIFY window-filter condition (MySQL 9.7+).
+	Qualify ExprNode
 	// OrderBy is the ordering expression list.
 	OrderBy *OrderByClause
 	// Limit is the limit clause.
 	Limit *Limit
-	// LockInfo is the lock type
-	LockInfo *SelectLockInfo
+	// LockInfos are the locking clauses (FOR UPDATE, FOR SHARE, LOCK IN SHARE
+	// MODE); MySQL allows several locking clauses in one query block.
+	LockInfos []*SelectLockInfo
 	// TableHints represents the table level Optimizer Hint for join type
 	TableHints []*TableOptimizerHint
 	// IsInBraces indicates whether it's a stmt in brace.
@@ -1266,6 +1453,13 @@ func (n *SelectStmt) Restore(ctx *format.RestoreCtx) error {
 				}
 			}
 		}
+
+		if n.Qualify != nil {
+			ctx.WriteKeyWord(" QUALIFY ")
+			if err := n.Qualify.Restore(ctx); err != nil {
+				return fmt.Errorf("an error occurred while restore SelectStmt.Qualify: %w", err)
+			}
+		}
 	case SelectStmtKindTable:
 		if err := n.From.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while restore SelectStmt.From: %w", err)
@@ -1295,64 +1489,10 @@ func (n *SelectStmt) Restore(ctx *format.RestoreCtx) error {
 		}
 	}
 
-	if n.LockInfo != nil {
+	for _, lock := range n.LockInfos {
 		ctx.WritePlain(" ")
-		switch n.LockInfo.LockType { //nolint:exhaustive
-		case SelectLockNone:
-		case SelectLockForUpdateNoWait:
-			ctx.WriteKeyWord("for update")
-			if len(n.LockInfo.Tables) != 0 {
-				ctx.WriteKeyWord(" OF ")
-				if err := restoreTables(ctx, n.LockInfo.Tables); err != nil {
-					return err
-				}
-			}
-			ctx.WriteKeyWord(" nowait")
-		case SelectLockForUpdateWaitN:
-			ctx.WriteKeyWord("for update")
-			if len(n.LockInfo.Tables) != 0 {
-				ctx.WriteKeyWord(" OF ")
-				if err := restoreTables(ctx, n.LockInfo.Tables); err != nil {
-					return err
-				}
-			}
-			ctx.WriteKeyWord(" wait")
-			ctx.WritePlainf(" %d", n.LockInfo.WaitSec)
-		case SelectLockForShareNoWait:
-			ctx.WriteKeyWord("for share")
-			if len(n.LockInfo.Tables) != 0 {
-				ctx.WriteKeyWord(" OF ")
-				if err := restoreTables(ctx, n.LockInfo.Tables); err != nil {
-					return err
-				}
-			}
-			ctx.WriteKeyWord(" nowait")
-		case SelectLockForUpdateSkipLocked:
-			ctx.WriteKeyWord("for update")
-			if len(n.LockInfo.Tables) != 0 {
-				ctx.WriteKeyWord(" OF ")
-				if err := restoreTables(ctx, n.LockInfo.Tables); err != nil {
-					return err
-				}
-			}
-			ctx.WriteKeyWord(" skip locked")
-		case SelectLockForShareSkipLocked:
-			ctx.WriteKeyWord("for share")
-			if len(n.LockInfo.Tables) != 0 {
-				ctx.WriteKeyWord(" OF ")
-				if err := restoreTables(ctx, n.LockInfo.Tables); err != nil {
-					return err
-				}
-			}
-			ctx.WriteKeyWord(" skip locked")
-		default:
-			ctx.WriteKeyWord(n.LockInfo.LockType.String())
-			if len(n.LockInfo.Tables) != 0 {
-				ctx.WriteKeyWord(" OF ")
-				if err := restoreTables(ctx, n.LockInfo.Tables); err != nil {
-					return err
-				}
-			}
+		if err := restoreSelectLockInfo(ctx, lock); err != nil {
+			return err
 		}
 	}
 
@@ -1360,6 +1500,67 @@ func (n *SelectStmt) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain(" ")
 		if err := n.SelectIntoOpt.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while restore SelectStmt.SelectIntoOpt: %w", err)
+		}
+	}
+	return nil
+}
+
+func restoreSelectLockInfo(ctx *format.RestoreCtx, lock *SelectLockInfo) error {
+	switch lock.LockType { //nolint:exhaustive
+	case SelectLockNone:
+	case SelectLockForUpdateNoWait:
+		ctx.WriteKeyWord("for update")
+		if len(lock.Tables) != 0 {
+			ctx.WriteKeyWord(" OF ")
+			if err := restoreTables(ctx, lock.Tables); err != nil {
+				return err
+			}
+		}
+		ctx.WriteKeyWord(" nowait")
+	case SelectLockForUpdateWaitN:
+		ctx.WriteKeyWord("for update")
+		if len(lock.Tables) != 0 {
+			ctx.WriteKeyWord(" OF ")
+			if err := restoreTables(ctx, lock.Tables); err != nil {
+				return err
+			}
+		}
+		ctx.WriteKeyWord(" wait")
+		ctx.WritePlainf(" %d", lock.WaitSec)
+	case SelectLockForShareNoWait:
+		ctx.WriteKeyWord("for share")
+		if len(lock.Tables) != 0 {
+			ctx.WriteKeyWord(" OF ")
+			if err := restoreTables(ctx, lock.Tables); err != nil {
+				return err
+			}
+		}
+		ctx.WriteKeyWord(" nowait")
+	case SelectLockForUpdateSkipLocked:
+		ctx.WriteKeyWord("for update")
+		if len(lock.Tables) != 0 {
+			ctx.WriteKeyWord(" OF ")
+			if err := restoreTables(ctx, lock.Tables); err != nil {
+				return err
+			}
+		}
+		ctx.WriteKeyWord(" skip locked")
+	case SelectLockForShareSkipLocked:
+		ctx.WriteKeyWord("for share")
+		if len(lock.Tables) != 0 {
+			ctx.WriteKeyWord(" OF ")
+			if err := restoreTables(ctx, lock.Tables); err != nil {
+				return err
+			}
+		}
+		ctx.WriteKeyWord(" skip locked")
+	default:
+		ctx.WriteKeyWord(lock.LockType.String())
+		if len(lock.Tables) != 0 {
+			ctx.WriteKeyWord(" OF ")
+			if err := restoreTables(ctx, lock.Tables); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1461,6 +1662,13 @@ func (n *SelectStmt) Accept(v Visitor) (Node, bool) {
 		}
 		n.WindowSpecs[i] = *node.(*WindowSpec)
 	}
+	if n.Qualify != nil {
+		node, ok := n.Qualify.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Qualify = node.(ExprNode)
+	}
 
 	if n.OrderBy != nil {
 		node, ok := n.OrderBy.Accept(v)
@@ -1478,14 +1686,22 @@ func (n *SelectStmt) Accept(v Visitor) (Node, bool) {
 		n.Limit = node.(*Limit)
 	}
 
-	if n.LockInfo != nil {
-		for i, t := range n.LockInfo.Tables {
+	for _, lock := range n.LockInfos {
+		for i, t := range lock.Tables {
 			node, ok := t.Accept(v)
 			if !ok {
 				return n, false
 			}
-			n.LockInfo.Tables[i] = node.(*TableName)
+			lock.Tables[i] = node.(*TableName)
 		}
+	}
+
+	if n.SelectIntoOpt != nil {
+		node, ok := n.SelectIntoOpt.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.SelectIntoOpt = node.(*SelectIntoOption)
 	}
 
 	return v.Leave(n)
@@ -1628,6 +1844,9 @@ type SetOprStmt struct {
 	OrderBy    *OrderByClause
 	Limit      *Limit
 	With       *WithClause
+	// IntoOpt is the trailing INTO of a parenthesized query expression:
+	// (SELECT ...) [ORDER BY ...] [LIMIT ...] INTO var_list.
+	IntoOpt *SelectIntoOption
 }
 
 func (*SetOprStmt) resultSet() {}
@@ -1662,6 +1881,12 @@ func (n *SetOprStmt) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain(" ")
 		if err := n.Limit.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while restore SetOprStmt.Limit: %w", err)
+		}
+	}
+	if n.IntoOpt != nil {
+		ctx.WritePlain(" ")
+		if err := n.IntoOpt.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore SetOprStmt.IntoOpt: %w", err)
 		}
 	}
 	return nil
@@ -1700,6 +1925,13 @@ func (n *SetOprStmt) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Limit = node.(*Limit)
+	}
+	if n.IntoOpt != nil {
+		node, ok := n.IntoOpt.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.IntoOpt = node.(*SelectIntoOption)
 	}
 	return v.Leave(n)
 }
@@ -1804,7 +2036,11 @@ const (
 type LoadDataStmt struct {
 	dmlNode
 
+	Xml               bool   // LOAD XML instead of LOAD DATA.
+	XmlRowTag         string // ROWS IDENTIFIED BY '<tag>' of LOAD XML; empty when absent.
 	LowPriority       bool
+	Concurrent        bool
+	InPrimaryKeyOrder bool // NDB-only IN PRIMARY KEY ORDER load hint.
 	FileLocRef        FileLocRefTp
 	Path              string
 	OnDuplicate       OnDuplicateKeyHandlingType
@@ -1821,9 +2057,16 @@ type LoadDataStmt struct {
 
 // Restore implements Node interface.
 func (n *LoadDataStmt) Restore(ctx *format.RestoreCtx) error {
-	ctx.WriteKeyWord("LOAD DATA ")
+	if n.Xml {
+		ctx.WriteKeyWord("LOAD XML ")
+	} else {
+		ctx.WriteKeyWord("LOAD DATA ")
+	}
 	if n.LowPriority {
 		ctx.WriteKeyWord("LOW_PRIORITY ")
+	}
+	if n.Concurrent {
+		ctx.WriteKeyWord("CONCURRENT ")
 	}
 	switch n.FileLocRef {
 	case FileLocServer:
@@ -1832,6 +2075,9 @@ func (n *LoadDataStmt) Restore(ctx *format.RestoreCtx) error {
 	}
 	ctx.WriteKeyWord("INFILE ")
 	ctx.WriteString(n.Path)
+	if n.InPrimaryKeyOrder {
+		ctx.WriteKeyWord(" IN PRIMARY KEY ORDER")
+	}
 	switch n.OnDuplicate { //nolint:exhaustive
 	case OnDuplicateKeyHandlingReplace:
 		ctx.WriteKeyWord(" REPLACE")
@@ -1845,6 +2091,10 @@ func (n *LoadDataStmt) Restore(ctx *format.RestoreCtx) error {
 	if n.Charset != nil {
 		ctx.WriteKeyWord(" CHARACTER SET ")
 		ctx.WritePlain(*n.Charset)
+	}
+	if n.XmlRowTag != "" {
+		ctx.WriteKeyWord(" ROWS IDENTIFIED BY ")
+		ctx.WriteString(n.XmlRowTag)
 	}
 	if n.FieldsInfo != nil {
 		if err := n.FieldsInfo.Restore(ctx); err != nil {
@@ -2718,6 +2968,24 @@ const (
 	ShowOpenTables
 	ShowBinlogStatus
 	ShowReplicaStatus
+	ShowBinaryLogs
+	ShowBinlogEvents
+	ShowReplicas
+	ShowCreateProcedure
+	ShowCreateFunction
+	ShowCreateTrigger
+	ShowCreateEvent
+	ShowCreateLibrary
+	ShowProcedureStatus
+	ShowFunctionStatus
+	ShowLibraryStatus
+	ShowProcedureCode
+	ShowFunctionCode
+	ShowParseTree
+	ShowEngineStatus
+	ShowEngineLogs
+	ShowEngineMutex
+	ShowRelaylogEvents
 )
 
 const (
@@ -2740,6 +3008,7 @@ type ShowStmt struct {
 
 	Tp          ShowStmtType // Databases/Tables/Columns/....
 	DBName      string
+	EngineName  string      // Used for SHOW ENGINE <engine> {STATUS|LOGS|MUTEX}.
 	Table       *TableName  // Used for showing columns.
 	Partition   CIStr       // Used for showing partition.
 	Column      *ColumnName // Used for `desc table column`.
@@ -2762,6 +3031,15 @@ type ShowStmt struct {
 	ShowProfileTypes []int  // Used for `SHOW PROFILE` syntax
 	ShowProfileArgs  *int64 // Used for `SHOW PROFILE` syntax
 	ShowProfileLimit *Limit // Used for `SHOW PROFILE` syntax
+
+	LogName    string // Used for `SHOW BINLOG EVENTS IN 'name'`
+	Pos        uint64 // Used for `SHOW BINLOG EVENTS ... FROM pos`
+	HasPos     bool
+	Channel    string // Used for `SHOW REPLICA STATUS FOR CHANNEL 'name'`
+	HasChannel bool
+	// ParseTreeStmt is the statement whose parse tree is requested by
+	// `SHOW PARSE_TREE <stmt>` (available in debug builds of MySQL).
+	ParseTreeStmt StmtNode
 }
 
 // Restore implements Node interface.
@@ -2804,6 +3082,70 @@ func (n *ShowStmt) Restore(ctx *format.RestoreCtx) error {
 	switch n.Tp {
 	case ShowBinlogStatus:
 		ctx.WriteKeyWord("BINARY LOG STATUS")
+	case ShowBinaryLogs:
+		ctx.WriteKeyWord("BINARY LOGS")
+	case ShowBinlogEvents, ShowRelaylogEvents:
+		if n.Tp == ShowBinlogEvents {
+			ctx.WriteKeyWord("BINLOG EVENTS")
+		} else {
+			ctx.WriteKeyWord("RELAYLOG EVENTS")
+		}
+		if n.LogName != "" {
+			ctx.WriteKeyWord(" IN ")
+			ctx.WriteString(n.LogName)
+		}
+		if n.HasPos {
+			ctx.WriteKeyWord(" FROM ")
+			ctx.WritePlainf("%d", n.Pos)
+		}
+		if n.Limit != nil {
+			ctx.WritePlain(" ")
+			if err := n.Limit.Restore(ctx); err != nil {
+				return fmt.Errorf("an error occurred while restore ShowStmt.Limit: %w", err)
+			}
+		}
+	case ShowReplicas:
+		ctx.WriteKeyWord("REPLICAS")
+	case ShowCreateProcedure:
+		ctx.WriteKeyWord("CREATE PROCEDURE ")
+		if err := n.Table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
+		}
+	case ShowCreateFunction:
+		ctx.WriteKeyWord("CREATE FUNCTION ")
+		if err := n.Table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
+		}
+	case ShowCreateTrigger:
+		ctx.WriteKeyWord("CREATE TRIGGER ")
+		if err := n.Table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
+		}
+	case ShowCreateEvent:
+		ctx.WriteKeyWord("CREATE EVENT ")
+		if err := n.Table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
+		}
+	case ShowCreateLibrary:
+		ctx.WriteKeyWord("CREATE LIBRARY ")
+		if err := n.Table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
+		}
+	case ShowProcedureCode:
+		ctx.WriteKeyWord("PROCEDURE CODE ")
+		if err := n.Table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
+		}
+	case ShowFunctionCode:
+		ctx.WriteKeyWord("FUNCTION CODE ")
+		if err := n.Table.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
+		}
+	case ShowParseTree:
+		ctx.WriteKeyWord("PARSE_TREE ")
+		if err := n.ParseTreeStmt.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore ShowStmt.ParseTreeStmt: %w", err)
+		}
 	case ShowCreateTable:
 		ctx.WriteKeyWord("CREATE TABLE ")
 		if err := n.Table.Restore(ctx); err != nil {
@@ -2898,11 +3240,26 @@ func (n *ShowStmt) Restore(ctx *format.RestoreCtx) error {
 		switch n.Tp {
 		case ShowEngines:
 			ctx.WriteKeyWord("ENGINES")
+		case ShowEngineStatus:
+			ctx.WriteKeyWord("ENGINE ")
+			ctx.WriteName(n.EngineName)
+			ctx.WriteKeyWord(" STATUS")
+		case ShowEngineLogs:
+			ctx.WriteKeyWord("ENGINE ")
+			ctx.WriteName(n.EngineName)
+			ctx.WriteKeyWord(" LOGS")
+		case ShowEngineMutex:
+			ctx.WriteKeyWord("ENGINE ")
+			ctx.WriteName(n.EngineName)
+			ctx.WriteKeyWord(" MUTEX")
 		case ShowDatabases:
 			ctx.WriteKeyWord("DATABASES")
 		case ShowCharset:
 			ctx.WriteKeyWord("CHARSET")
 		case ShowTables:
+			if n.Extended {
+				ctx.WriteKeyWord("EXTENDED ")
+			}
 			restoreOptFull()
 			ctx.WriteKeyWord("TABLES")
 			restoreShowDatabaseNameOpt()
@@ -2915,6 +3272,9 @@ func (n *ShowStmt) Restore(ctx *format.RestoreCtx) error {
 		case ShowIndex:
 			// here can be INDEX INDEXES KEYS
 			// FROM or IN
+			if n.Extended {
+				ctx.WriteKeyWord("EXTENDED ")
+			}
 			ctx.WriteKeyWord("INDEX IN ")
 			if err := n.Table.Restore(ctx); err != nil {
 				return fmt.Errorf("an error occurred while restore ShowStmt.Table: %w", err)
@@ -2934,9 +3294,29 @@ func (n *ShowStmt) Restore(ctx *format.RestoreCtx) error {
 			}
 			restoreShowDatabaseNameOpt()
 		case ShowWarnings:
-			ctx.WriteKeyWord("WARNINGS")
+			if n.CountWarningsOrErrors {
+				ctx.WriteKeyWord("COUNT(*) WARNINGS")
+			} else {
+				ctx.WriteKeyWord("WARNINGS")
+				if n.Limit != nil {
+					ctx.WritePlain(" ")
+					if err := n.Limit.Restore(ctx); err != nil {
+						return fmt.Errorf("an error occurred while restore ShowStmt.Limit: %w", err)
+					}
+				}
+			}
 		case ShowErrors:
-			ctx.WriteKeyWord("ERRORS")
+			if n.CountWarningsOrErrors {
+				ctx.WriteKeyWord("COUNT(*) ERRORS")
+			} else {
+				ctx.WriteKeyWord("ERRORS")
+				if n.Limit != nil {
+					ctx.WritePlain(" ")
+					if err := n.Limit.Restore(ctx); err != nil {
+						return fmt.Errorf("an error occurred while restore ShowStmt.Limit: %w", err)
+					}
+				}
+			}
 		case ShowVariables:
 			restoreGlobalScope()
 			ctx.WriteKeyWord("VARIABLES")
@@ -2953,8 +3333,18 @@ func (n *ShowStmt) Restore(ctx *format.RestoreCtx) error {
 			restoreShowDatabaseNameOpt()
 		case ShowPlugins:
 			ctx.WriteKeyWord("PLUGINS")
+		case ShowProcedureStatus:
+			ctx.WriteKeyWord("PROCEDURE STATUS")
+		case ShowFunctionStatus:
+			ctx.WriteKeyWord("FUNCTION STATUS")
+		case ShowLibraryStatus:
+			ctx.WriteKeyWord("LIBRARY STATUS")
 		case ShowReplicaStatus:
 			ctx.WriteKeyWord("REPLICA STATUS")
+			if n.HasChannel {
+				ctx.WriteKeyWord(" FOR CHANNEL ")
+				ctx.WriteString(n.Channel)
+			}
 		default:
 			return errors.New("unknown ShowStmt type")
 		}
@@ -3007,6 +3397,13 @@ func (n *ShowStmt) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Limit = node.(*Limit)
+	}
+	if n.ParseTreeStmt != nil {
+		node, ok := n.ParseTreeStmt.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.ParseTreeStmt = node.(StmtNode)
 	}
 	return v.Leave(n)
 }
@@ -3111,30 +3508,51 @@ const (
 type SelectIntoOption struct {
 	node
 
-	Tp         SelectIntoType
-	FileName   string
+	Tp       SelectIntoType
+	FileName string
+	// Charset is the optional CHARACTER SET clause of INTO OUTFILE.
+	Charset    string
 	FieldsInfo *FieldsClause
 	LinesInfo  *LinesClause
+	// Variables is the user variable list of SELECT ... INTO @var [, @var] ...
+	Variables []ExprNode
 }
 
 // Restore implements Node interface.
 func (n *SelectIntoOption) Restore(ctx *format.RestoreCtx) error {
-	if n.Tp != SelectIntoOutfile {
-		// only support SELECT/TABLE/VALUES ... INTO OUTFILE statement now
+	switch n.Tp {
+	case SelectIntoOutfile:
+		ctx.WriteKeyWord("INTO OUTFILE ")
+		ctx.WriteString(n.FileName)
+		if n.Charset != "" {
+			ctx.WriteKeyWord(" CHARACTER SET ")
+			ctx.WriteKeyWord(n.Charset)
+		}
+		if n.FieldsInfo != nil {
+			if err := n.FieldsInfo.Restore(ctx); err != nil {
+				return fmt.Errorf("an error occurred while restore SelectInto.FieldsInfo: %w", err)
+			}
+		}
+		if n.LinesInfo != nil {
+			if err := n.LinesInfo.Restore(ctx); err != nil {
+				return fmt.Errorf("an error occurred while restore SelectInto.LinesInfo: %w", err)
+			}
+		}
+	case SelectIntoDumpfile:
+		ctx.WriteKeyWord("INTO DUMPFILE ")
+		ctx.WriteString(n.FileName)
+	case SelectIntoVars:
+		ctx.WriteKeyWord("INTO ")
+		for i, v := range n.Variables {
+			if i != 0 {
+				ctx.WritePlain(", ")
+			}
+			if err := v.Restore(ctx); err != nil {
+				return fmt.Errorf("an error occurred while restore SelectInto.Variables[%d]: %w", i, err)
+			}
+		}
+	default:
 		return errors.New("unsupported SelectionInto type")
-	}
-
-	ctx.WriteKeyWord("INTO OUTFILE ")
-	ctx.WriteString(n.FileName)
-	if n.FieldsInfo != nil {
-		if err := n.FieldsInfo.Restore(ctx); err != nil {
-			return fmt.Errorf("an error occurred while restore SelectInto.FieldsInfo: %w", err)
-		}
-	}
-	if n.LinesInfo != nil {
-		if err := n.LinesInfo.Restore(ctx); err != nil {
-			return fmt.Errorf("an error occurred while restore SelectInto.LinesInfo: %w", err)
-		}
 	}
 	return nil
 }
@@ -3144,6 +3562,14 @@ func (n *SelectIntoOption) Accept(v Visitor) (Node, bool) {
 	newNode, skipChildren := v.Enter(n)
 	if skipChildren {
 		return v.Leave(newNode)
+	}
+	n = newNode.(*SelectIntoOption)
+	for i, val := range n.Variables {
+		node, ok := val.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Variables[i] = node.(ExprNode)
 	}
 	return v.Leave(n)
 }

@@ -131,36 +131,30 @@ func (c *tableChange) oldTableName() string {
 func (c *tableChange) attemptInstantDDL(ctx context.Context) error {
 	// The user's ALTER clause is spliced in with %r so that % characters in
 	// its literals are not interpreted as format specifiers.
-	if !c.runner.migration.SkipForceKill {
-		return dbconn.ForceExec(
-			ctx,
-			c.runner.db,
-			[]*table.TableInfo{c.table},
-			c.runner.dbConfig,
-			c.runner.logger,
-			"ALTER TABLE %n ALGORITHM=INSTANT, %r",
-			c.table.TableName,
-			sqlescape.RawSQL(c.stmt.Alter),
-		)
-	}
-	return dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n ALGORITHM=INSTANT, %r", c.table.TableName, sqlescape.RawSQL(c.stmt.Alter))
+	return dbconn.ForceExec(
+		ctx,
+		c.runner.db,
+		[]*table.TableInfo{c.table},
+		c.runner.dbConfig,
+		c.runner.logger,
+		"ALTER TABLE %n ALGORITHM=INSTANT, %r",
+		c.table.TableName,
+		sqlescape.RawSQL(c.stmt.Alter),
+	)
 }
 
 func (c *tableChange) attemptInplaceDDL(ctx context.Context) error {
 	// As in attemptInstantDDL, the user's ALTER clause is spliced in with %r.
-	if !c.runner.migration.SkipForceKill {
-		return dbconn.ForceExec(
-			ctx,
-			c.runner.db,
-			[]*table.TableInfo{c.table},
-			c.runner.dbConfig,
-			c.runner.logger,
-			"ALTER TABLE %n ALGORITHM=INPLACE, LOCK=NONE, %r",
-			c.table.TableName,
-			sqlescape.RawSQL(c.stmt.Alter),
-		)
-	}
-	return dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n ALGORITHM=INPLACE, LOCK=NONE, %r", c.table.TableName, sqlescape.RawSQL(c.stmt.Alter))
+	return dbconn.ForceExec(
+		ctx,
+		c.runner.db,
+		[]*table.TableInfo{c.table},
+		c.runner.dbConfig,
+		c.runner.logger,
+		"ALTER TABLE %n ALGORITHM=INPLACE, LOCK=NONE, %r",
+		c.table.TableName,
+		sqlescape.RawSQL(c.stmt.Alter),
+	)
 }
 
 func (c *tableChange) cleanup(ctx context.Context) error {

@@ -447,6 +447,14 @@ func (n *FuncCallExpr) Restore(ctx *format.RestoreCtx) error {
 				return fmt.Errorf("an error occurred while restore FuncCallExpr.(WEIGHT_STRING).Args[2]: %w", err)
 			}
 			ctx.WritePlain(")")
+		} else if len(n.Args) == 4 {
+			// Debug form: WEIGHT_STRING(str, retlen, maxlen, flags).
+			for i := 1; i < len(n.Args); i++ {
+				ctx.WritePlain(", ")
+				if err := n.Args[i].Restore(ctx); err != nil {
+					return fmt.Errorf("an error occurred while restore FuncCallExpr.(WEIGHT_STRING).Args[%d]: %w", i, err)
+				}
+			}
 		}
 	default:
 		for i, argv := range n.Args {
@@ -481,12 +489,12 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 	}
 	if n.FnName.L == JSONMemberOf {
 		if len(n.Args) == 2 {
-			if err := n.Args[0].Restore(ctx); err != nil {
+			if err := restoreExprWithBinaryOpParent(ctx, n.Args[0], restoreOpMemberOf, binaryOpLeftSide); err != nil {
 				return true, fmt.Errorf("an error occurred while restore FuncCallExpr.(MEMBER OF).Args[0]: %w", err)
 			}
 			ctx.WriteKeyWord(" MEMBER OF ")
 			ctx.WritePlain("(")
-			if err := n.Args[1].Restore(ctx); err != nil {
+			if err := restoreExprWithBinaryOpParent(ctx, n.Args[1], restoreOpMemberOf, binaryOpRightSide); err != nil {
 				return true, fmt.Errorf("an error occurred while restore FuncCallExpr.(MEMBER OF).Args[1]: %w", err)
 			}
 			ctx.WritePlain(")")
@@ -576,6 +584,8 @@ type FuncCastExpr struct {
 	FunctionType CastFunctionType
 	// ExplicitCharSet is true when charset is explicit indicated.
 	ExplicitCharSet bool
+	// AtTimeZone is the time zone of CAST(expr AT TIME ZONE 'tz' AS DATETIME).
+	AtTimeZone string
 }
 
 // Restore implements Node interface.
@@ -586,6 +596,10 @@ func (n *FuncCastExpr) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain("(")
 		if err := n.Expr.Restore(ctx); err != nil {
 			return fmt.Errorf("an error occurred while restore FuncCastExpr.Expr: %w", err)
+		}
+		if n.AtTimeZone != "" {
+			ctx.WriteKeyWord(" AT TIME ZONE ")
+			ctx.WriteString(n.AtTimeZone)
 		}
 		ctx.WriteKeyWord(" AS ")
 		n.Tp.RestoreAsCastType(ctx, n.ExplicitCharSet)
@@ -601,7 +615,7 @@ func (n *FuncCastExpr) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain(")")
 	case CastBinaryOperator:
 		ctx.WriteKeyWord("BINARY ")
-		if err := n.Expr.Restore(ctx); err != nil {
+		if err := restoreExprWithUnaryOpParent(ctx, n.Expr); err != nil {
 			return fmt.Errorf("an error occurred while restore FuncCastExpr.Expr: %w", err)
 		}
 	}
@@ -620,6 +634,126 @@ func (n *FuncCastExpr) Accept(v Visitor) (Node, bool) {
 		return n, false
 	}
 	n.Expr = node.(ExprNode)
+	return v.Leave(n)
+}
+
+// JSONValueBehaviorType is the type of behavior of JSON_VALUE's ON EMPTY and
+// ON ERROR clauses.
+type JSONValueBehaviorType int
+
+const (
+	// JSONValueBehaviorNull is NULL ON EMPTY/ERROR.
+	JSONValueBehaviorNull JSONValueBehaviorType = iota
+	// JSONValueBehaviorError is ERROR ON EMPTY/ERROR.
+	JSONValueBehaviorError
+	// JSONValueBehaviorDefault is DEFAULT <literal> ON EMPTY/ERROR.
+	JSONValueBehaviorDefault
+)
+
+// JSONValueOnBehavior is one ON EMPTY or ON ERROR clause of JSON_VALUE.
+type JSONValueOnBehavior struct {
+	Tp JSONValueBehaviorType
+	// Default is the literal of DEFAULT <literal>; nil otherwise.
+	Default ExprNode
+}
+
+// Restore writes the behavior keywords without the trailing ON EMPTY/ON ERROR.
+func (n *JSONValueOnBehavior) Restore(ctx *format.RestoreCtx) error {
+	switch n.Tp {
+	case JSONValueBehaviorNull:
+		ctx.WriteKeyWord("NULL")
+	case JSONValueBehaviorError:
+		ctx.WriteKeyWord("ERROR")
+	case JSONValueBehaviorDefault:
+		ctx.WriteKeyWord("DEFAULT ")
+		if err := n.Default.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore JSONValueOnBehavior.Default: %w", err)
+		}
+	}
+	return nil
+}
+
+// JSONValueExpr is JSON_VALUE(json_doc, path [RETURNING type] [on_empty] [on_error]).
+type JSONValueExpr struct {
+	funcNode
+	// Doc is the JSON document argument.
+	Doc ExprNode
+	// Path is the path expression argument.
+	Path ExprNode
+	// ReturningType is the RETURNING cast target; nil when absent.
+	ReturningType *types.FieldType
+	// ReturningExplicitCharset is true when the RETURNING type names a charset.
+	ReturningExplicitCharset bool
+	// OnEmpty is the ON EMPTY clause; nil when absent.
+	OnEmpty *JSONValueOnBehavior
+	// OnError is the ON ERROR clause; nil when absent.
+	OnError *JSONValueOnBehavior
+}
+
+// Restore implements Node interface.
+func (n *JSONValueExpr) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("JSON_VALUE")
+	ctx.WritePlain("(")
+	if err := n.Doc.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore JSONValueExpr.Doc: %w", err)
+	}
+	ctx.WritePlain(", ")
+	if err := n.Path.Restore(ctx); err != nil {
+		return fmt.Errorf("an error occurred while restore JSONValueExpr.Path: %w", err)
+	}
+	if n.ReturningType != nil {
+		ctx.WriteKeyWord(" RETURNING ")
+		n.ReturningType.RestoreAsCastType(ctx, n.ReturningExplicitCharset)
+	}
+	if n.OnEmpty != nil {
+		ctx.WritePlain(" ")
+		if err := n.OnEmpty.Restore(ctx); err != nil {
+			return err
+		}
+		ctx.WriteKeyWord(" ON EMPTY")
+	}
+	if n.OnError != nil {
+		ctx.WritePlain(" ")
+		if err := n.OnError.Restore(ctx); err != nil {
+			return err
+		}
+		ctx.WriteKeyWord(" ON ERROR")
+	}
+	ctx.WritePlain(")")
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *JSONValueExpr) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*JSONValueExpr)
+	node, ok := n.Doc.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Doc = node.(ExprNode)
+	node, ok = n.Path.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Path = node.(ExprNode)
+	if n.OnEmpty != nil && n.OnEmpty.Default != nil {
+		node, ok = n.OnEmpty.Default.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.OnEmpty.Default = node.(ExprNode)
+	}
+	if n.OnError != nil && n.OnError.Default != nil {
+		node, ok = n.OnError.Default.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.OnError.Default = node.(ExprNode)
+	}
 	return v.Leave(n)
 }
 

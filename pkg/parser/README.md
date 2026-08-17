@@ -51,7 +51,12 @@ syntax. Forking lets us:
   TiDB after the fork base are ported when relevant (e.g. the parser
   depth DoS guard, `INSERT ... AS row_alias`, dual-password syntax,
   `SET_VAR` decimal hints, and `GROUP_CONCAT` separator charset
-  handling).
+  handling), as is the opt-in
+  `format.RestoreSkipRedundantParentheses` restore flag, which lets
+  expression `Restore` drop parentheses that MySQL's precedence and
+  associativity rules make unnecessary (`a + (b * c)` restores as
+  `a + b * c`; `a - (b - c)` keeps its parentheses). Spirit uses it to
+  canonicalize CHECK-constraint and generated-column expressions.
 - **Fixes beyond upstream.** Parenthesized default values keep their
   parentheses through a parse/restore round trip (`DEFAULT ('{}')` is an
   ast.ParenthesesExpr): MySQL 8.0.13+ treats `DEFAULT ('{}')` and

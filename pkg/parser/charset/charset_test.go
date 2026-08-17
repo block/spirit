@@ -36,8 +36,12 @@ func TestValidCharset(t *testing.T) {
 		{"utf8mb4", "utf8mb4_bin", true},
 		{"latin1", "latin1_bin", true},
 		{"utf8", "utf8_invalid_ci", false},
-		{"utf16", "utf16_bin", false},
-		{"gb2312", "gb2312_chinese_ci", false},
+		{"utf16", "utf16_bin", true},
+		{"gb2312", "gb2312_chinese_ci", true},
+		{"nosuch", "nosuch_bin", false},
+		{"utf8", "utf8mb3_danish_ci", true},
+		{"utf8mb4", "utf8mb4_nb_0900_ai_ci", true},
+		{"utf8mb4", "utf8mb4_mn_cyrl_0900_as_cs", true},
 		{"UTF8", "UTF8_BIN", true},
 		{"UTF8", "utf8_bin", true},
 		{"UTF8MB4", "utf8mb4_bin", true},
@@ -75,6 +79,8 @@ func TestGetDefaultCollation(t *testing.T) {
 		{"ascii", "ascii_bin", true},
 		{"binary", "binary", true},
 		{"latin1", "latin1_bin", true},
+		{"utf16", "utf16_general_ci", true},
+		{"latin2", "latin2_general_ci", true},
 		{"invalid_cs", "", false},
 		{"", "utf8_bin", false},
 	}
@@ -151,6 +157,12 @@ func TestUTF8MB3(t *testing.T) {
 		{"utf8mb3_bin", "utf8_bin"},
 		{"utf8mb3_general_ci", "utf8_general_ci"},
 		{"utf8mb3_unicode_ci", "utf8_unicode_ci"},
+		// The alias is by prefix: every utf8mb3_* collation MySQL knows maps
+		// to the registry's utf8_* spelling.
+		{"utf8mb3_danish_ci", "utf8_danish_ci"},
+		{"utf8mb3_unicode_520_ci", "utf8_unicode_520_ci"},
+		{"utf8mb3_general_mysql500_ci", "utf8_general_mysql500_ci"},
+		{"utf8mb3_tolower_ci", "utf8_tolower_ci"},
 	}
 	for _, tt := range tests {
 		col, err := GetCollationByName(tt.cs)

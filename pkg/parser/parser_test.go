@@ -386,10 +386,15 @@ func TestKeywordFunctionCalls(t *testing.T) {
 			"alter table t add constraint c check (st_length(linestring(p, q)) > 0)",
 			"ALTER TABLE `t` ADD CONSTRAINT `c` CHECK(ST_LENGTH(LINESTRING(`p`, `q`))>0) ENFORCED",
 		},
-		// NOW is deliberately excluded from the DEFAULT-context rule:
-		// DEFAULT (now()) must keep folding to CURRENT_TIMESTAMP.
+		// Parenthesized NOW is an expression default and keeps its shape
+		// (MySQL prints DEFAULT (now()) for it); only the bare form folds
+		// to CURRENT_TIMESTAMP.
 		{
 			"create table t (ts datetime default (now()))",
+			"CREATE TABLE `t` (`ts` DATETIME DEFAULT (NOW()))",
+		},
+		{
+			"create table t (ts datetime default now())",
 			"CREATE TABLE `t` (`ts` DATETIME DEFAULT CURRENT_TIMESTAMP())",
 		},
 		// Keyword function names still work as plain identifiers.
@@ -500,8 +505,11 @@ func TestErrorMsg(t *testing.T) {
 	_, _, err = p.Parse("create table ` `.t (id int);", "", "")
 	require.EqualError(t, err, "[parser:1102]Incorrect database name ' '")
 
+	// Multi-character ESCAPE arguments are grammatically valid in MySQL
+	// (rejected with ER_WRONG_ARGUMENTS at execution time, not 1064), so the
+	// parser keeps them as expressions instead of erroring.
 	_, _, err = p.Parse("select ifnull(a,0) & ifnull(a,0) like '55' ESCAPE '\\\\a' from t;", "", "")
-	require.EqualError(t, err, "[parser:1210]Incorrect arguments to ESCAPE")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("load data infile 'aaa' into table aaa FIELDS  Enclosed by '\\\\b';", "", "")
 	require.EqualError(t, err, "[parser:1083]Field separator argument is not what is expected; check the manual")
@@ -512,26 +520,33 @@ func TestErrorMsg(t *testing.T) {
 	_, _, err = p.Parse("load data infile 'aaa' into table aaa FIELDS  Enclosed by '\\\\b' Escaped by '\\\\b' ;", "", "")
 	require.EqualError(t, err, "[parser:1083]Field separator argument is not what is expected; check the manual")
 
+	// Unknown character sets and collations are execution-time errors in
+	// MySQL (ER_UNKNOWN_CHARACTER_SET 1115 / ER_UNKNOWN_COLLATION 1273, not
+	// 1064 syntax errors), e.g. user-defined LDML collations, so the
+	// grammar accepts any name here.
 	_, _, err = p.Parse("ALTER DATABASE `` CHARACTER SET = ''", "", "")
-	require.EqualError(t, err, "[parser:1115]Unknown character set: ''")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("ALTER DATABASE t CHARACTER SET = ''", "", "")
-	require.EqualError(t, err, "[parser:1115]Unknown character set: ''")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("ALTER SCHEMA t CHARACTER SET = 'SOME_INVALID_CHARSET'", "", "")
-	require.EqualError(t, err, "[parser:1115]Unknown character set: 'SOME_INVALID_CHARSET'")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("ALTER DATABASE t COLLATE = ''", "", "")
-	require.EqualError(t, err, "[ddl:1273]Unknown collation: ''")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("ALTER SCHEMA t COLLATE = 'SOME_INVALID_COLLATION'", "", "")
-	require.EqualError(t, err, "[ddl:1273]Unknown collation: 'SOME_INVALID_COLLATION'")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("ALTER DATABASE CHARSET = 'utf8mb4' COLLATE = 'utf8_bin'", "", "")
 	require.EqualError(t, err, "line 1 column 24 near \"= 'utf8mb4' COLLATE = 'utf8_bin'\" ")
 
+	// MySQL enforces Y/N inside its grammar action (ER_WRONG_VALUE 1525, not a
+	// 1064 syntax error); we accept any string at parse time like the TABLE
+	// option, whose value the storage engine validates at execution instead.
 	_, _, err = p.Parse("ALTER DATABASE t ENCRYPTION = ''", "", "")
-	require.EqualError(t, err, "[parser:1525]Incorrect argument (should be Y or N) value: ''")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("ALTER DATABASE", "", "")
 	require.EqualError(t, err, "line 1 column 14 near \"\" ")
@@ -566,20 +581,23 @@ func TestErrorMsg(t *testing.T) {
 	_, _, err = p.Parse("alter table t lock = randomStr123", "", "")
 	require.EqualError(t, err, "[parser:1801]Unknown LOCK type 'randomStr123'")
 
+	// The UNICODE column attribute means CHARACTER SET ucs2; every charset
+	// MySQL knows is accepted at parse level.
 	_, _, err = p.Parse("create table t (a longtext unicode)", "", "")
-	require.EqualError(t, err, "[parser:1115]Unknown character set: 'ucs2'")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("create table t (a long byte, b text unicode)", "", "")
-	require.EqualError(t, err, "[parser:1115]Unknown character set: 'ucs2'")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("create table t (a long ascii, b long unicode)", "", "")
-	require.EqualError(t, err, "[parser:1115]Unknown character set: 'ucs2'")
+	require.NoError(t, err)
 
 	_, _, err = p.Parse("create table t (a text unicode, b mediumtext ascii, c int)", "", "")
-	require.EqualError(t, err, "[parser:1115]Unknown character set: 'ucs2'")
+	require.NoError(t, err)
 
+	// Unknown collations are execution-time errors (1273), not parse errors.
 	_, _, err = p.Parse("select 1 collate some_unknown_collation", "", "")
-	require.EqualError(t, err, "[ddl:1273]Unknown collation: 'some_unknown_collation'")
+	require.NoError(t, err)
 }
 
 func TestOptimizerHints(t *testing.T) {
@@ -1131,23 +1149,25 @@ func TestUnderscoreCharset(t *testing.T) {
 	tests := []struct {
 		cs        string
 		parseFail bool
-		unSupport bool
 	}{
-		{"utf8", false, false},
-		{"gbk", false, true},
-		{"ujis", false, true},
-		{"gbk1", true, true},
-		{"ujisx", true, true},
+		// Every charset MySQL knows works as an introducer; a name the lexer
+		// does not recognize is just an identifier, so the string literal
+		// after it is a syntax error.
+		{"utf8", false},
+		{"gbk", false},
+		{"ujis", false},
+		{"ucs2", false},
+		{"latin2", false},
+		{"utf16le", false},
+		{"gbk1", true},
+		{"ujisx", true},
 	}
 	for _, tt := range tests {
 		sql := fmt.Sprintf("select hex(_%s '3F')", tt.cs)
 		_, err := p.ParseOneStmt(sql, "", "")
-		switch {
-		case tt.parseFail:
+		if tt.parseFail {
 			require.EqualError(t, err, fmt.Sprintf("line 1 column %d near \"'3F')\" ", len(tt.cs)+17))
-		case tt.unSupport:
-			require.EqualError(t, err, ast.ErrUnknownCharacterSet.GenByFormat("Unsupported character introducer: '%-.64s'", tt.cs).Error())
-		default:
+		} else {
 			require.NoError(t, err)
 		}
 	}
@@ -1518,15 +1538,16 @@ func TestInsertStatementMemoryAllocation(t *testing.T) {
 
 func TestCharsetIntroducer(t *testing.T) {
 	p := parser.New()
-	// `_gbk` is a valid character set name, but introducers are restricted
-	// to the charsets with a default legacy collation (see
-	// charset.GetDefaultCollationLegacy).
+	// Any character set MySQL knows works as an introducer, on all three
+	// literal forms (string, hex, bit).
 	_, _, err := p.Parse("select _gbk 'a';", "", "")
-	require.EqualError(t, err, "[ddl:1115]Unsupported character introducer: 'gbk'")
+	require.NoError(t, err)
 	_, _, err = p.Parse("select _gbk 0x1234;", "", "")
-	require.EqualError(t, err, "[ddl:1115]Unsupported character introducer: 'gbk'")
+	require.NoError(t, err)
 	_, _, err = p.Parse("select _gbk 0b101001;", "", "")
-	require.EqualError(t, err, "[ddl:1115]Unsupported character introducer: 'gbk'")
+	require.NoError(t, err)
+	_, _, err = p.Parse("select _ucs2 0x0078;", "", "")
+	require.NoError(t, err)
 }
 
 func TestIssue45898(t *testing.T) {

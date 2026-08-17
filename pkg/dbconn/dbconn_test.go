@@ -129,8 +129,16 @@ func TestRetryableTrx(t *testing.T) {
 		time.Sleep(2 * time.Second)
 		rollbackErr <- trx.Rollback()
 	}()
-	_, err = RetryableTransaction(t.Context(), db, ErrorOnDupKey, config, "UPDATE test.dbexec SET colb=123 WHERE id = 1")
+	rowsAffected, err := RetryableTransaction(
+		t.Context(),
+		db,
+		ErrorOnDupKey,
+		config,
+		"UPDATE test.dbexec SET colb=colb+1 WHERE id = 2",
+		"UPDATE test.dbexec SET colb=123 WHERE id = 1",
+	)
 	require.NoError(t, err)
+	require.EqualValues(t, 2, rowsAffected, "rolled-back attempts must not contribute affected rows")
 	require.NoError(t, <-rollbackErr)
 	require.NoError(t, db.Close())
 
@@ -145,8 +153,16 @@ func TestRetryableTrx(t *testing.T) {
 	require.NoError(t, err)
 	_, err = trx.ExecContext(t.Context(), "SELECT * FROM test.dbexec WHERE id = 2 FOR UPDATE")
 	require.NoError(t, err)
-	_, err = RetryableTransaction(t.Context(), db, ErrorOnDupKey, config, "UPDATE test.dbexec SET colb=123 WHERE id = 2") // this will fail, since it times out and exhausts retries.
+	rowsAffected, err = RetryableTransaction(
+		t.Context(),
+		db,
+		ErrorOnDupKey,
+		config,
+		"UPDATE test.dbexec SET colb=colb+1 WHERE id = 1",
+		"UPDATE test.dbexec SET colb=123 WHERE id = 2",
+	) // this will fail, since it times out and exhausts retries.
 	require.Error(t, err)
+	require.Zero(t, rowsAffected, "rolled-back attempts must not report affected rows")
 	err = trx.Rollback() // now we can rollback.
 	require.NoError(t, err)
 }

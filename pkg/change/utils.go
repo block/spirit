@@ -43,15 +43,24 @@ type schemaTable struct {
 
 // extractTablesFromDDLStmts extracts table names from DDL statements.
 // The logic is based on canal: https://github.com/go-mysql-org/go-mysql/blob/34b6b0998dde44e51dff0bbcc1ac88339f57f830/canal/sync.go#L195-L245
-func extractTablesFromDDLStmts(defaultSchema string, statements string) ([]schemaTable, error) {
+//
+// opensTransaction reports that the statement opens a transaction group
+// rather than being one: BEGIN / START TRANSACTION, or the
+// CREATE TABLE ... START TRANSACTION form MySQL 8.0.21+ writes to the
+// binary log in place of CREATE TABLE ... SELECT under row-based
+// replication. The group's row events follow the statement, so GTID
+// promotion must wait for the group's real terminator (see
+// gtidClient.processQueryEvent).
+func extractTablesFromDDLStmts(defaultSchema string, statements string) (tables []schemaTable, opensTransaction bool, err error) {
 	p := parser.New()
 	stmts, _, err := p.Parse(statements, "", "")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	var tables []schemaTable
 	for _, stmt := range stmts {
 		switch t := stmt.(type) {
+		case *ast.BeginStmt:
+			opensTransaction = true
 		case *ast.RenameTableStmt:
 			for _, tableInfo := range t.TableToTables {
 				schema, table := getTableIdentity(defaultSchema, tableInfo.OldTable)
@@ -70,6 +79,9 @@ func extractTablesFromDDLStmts(defaultSchema string, statements string) ([]schem
 				tableNode = n.Table
 			case *ast.CreateTableStmt:
 				tableNode = n.Table
+				if n.StartTransaction {
+					opensTransaction = true
+				}
 			case *ast.TruncateTableStmt:
 				tableNode = n.Table
 			case *ast.CreateIndexStmt:
@@ -81,7 +93,7 @@ func extractTablesFromDDLStmts(defaultSchema string, statements string) ([]schem
 			tables = append(tables, schemaTable{schema, table})
 		}
 	}
-	return tables, nil
+	return tables, opensTransaction, nil
 }
 
 // toSet converts a string slice to a set (map[string]struct{}) for O(1) lookups.
