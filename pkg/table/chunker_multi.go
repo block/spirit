@@ -184,6 +184,16 @@ func (m *multiChunker) Feedback(chunk *Chunk, duration time.Duration, actualRows
 }
 
 // Progress returns aggregate progress across all chunkers
+func (m *multiChunker) RowsCopied() uint64 {
+	m.Lock()
+	defer m.Unlock()
+	var total uint64
+	for _, chunker := range m.chunkers {
+		total += chunker.RowsCopied()
+	}
+	return total
+}
+
 func (m *multiChunker) Progress() (uint64, uint64, uint64) {
 	m.Lock()
 	defer m.Unlock()

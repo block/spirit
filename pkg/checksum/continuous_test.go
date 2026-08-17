@@ -83,6 +83,8 @@ func (c *testChunker) Feedback(chunk *table.Chunk, duration time.Duration, actua
 	defer c.mu.Unlock()
 	c.feedback = append(c.feedback, table.FeedbackCall{Chunk: chunk, Duration: duration, ActualRows: actualRows, Timestamp: time.Now()})
 }
+func (c *testChunker) RowsCopied() uint64 { return 0 }
+
 func (c *testChunker) Progress() (uint64, uint64, uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

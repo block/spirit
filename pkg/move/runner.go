@@ -150,9 +150,13 @@ type Runner struct {
 	reversePositions map[string]string
 	cutoverAt        time.Time
 
-	logger     *slog.Logger
-	cancelFunc context.CancelFunc
-	dbConfig   *dbconn.DBConfig
+	logger *slog.Logger
+	// metricsSink receives the copier's per-chunk metrics and the tracker's
+	// phase transitions. It defaults to a NoopSink, so a caller that installs
+	// nothing pays only for the discarded values.
+	metricsSink metrics.Sink
+	cancelFunc  context.CancelFunc
+	dbConfig    *dbconn.DBConfig
 
 	// fatalOnce makes fatalError idempotent. Move wires N repl clients
 	// (one per source) to the same fatalError callback, so a concurrent
@@ -204,10 +208,25 @@ func NewRunner(m *Move) (*Runner, error) {
 		m.WriteThreads = defaultWriteThreads
 	}
 	r := &Runner{
-		move:   m,
-		logger: slog.Default(),
+		move:        m,
+		logger:      slog.Default(),
+		metricsSink: &metrics.NoopSink{},
 	}
 	return r, nil
+}
+
+// recordCopyCompleted reports the settled copy aggregate to the metrics sink.
+// The counts come from the chunker rather than a second tally in the copier:
+// the chunker is what accumulates copied rows from applier feedback (see
+// table.Chunker.Feedback), and on a resumed run it already carries the rows
+// copied before the restart.
+func (r *Runner) recordCopyCompleted() {
+	chunker := r.copier.GetChunker()
+	if chunker == nil {
+		return
+	}
+	_, chunks, _ := chunker.Progress()
+	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
 }
 
 func (r *Runner) Close() error {
@@ -493,7 +512,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
 		Throttler:   &throttler.Noop{},
-		MetricsSink: &metrics.NoopSink{},
+		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
 	})
@@ -963,7 +982,7 @@ func (r *Runner) newCopy(ctx context.Context) error {
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
 		Throttler:   &throttler.Noop{},
-		MetricsSink: &metrics.NoopSink{},
+		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
 	})
@@ -1011,6 +1030,7 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 func (r *Runner) Run(ctx context.Context) error {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
+	r.status.SetMetricsSink(r.metricsSink, r.logger)
 	r.status.Begin()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting table move",
@@ -1208,6 +1228,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	r.recordCopyCompleted()
 
 	// Disable both watermark optimizations so that all changes can be flushed.
 	// For non-memory-comparable PKs this also drains the buffered map and
@@ -1512,6 +1533,16 @@ func (r *Runner) Status() string {
 
 func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
+}
+
+// SetMetricsSink installs the destination for this run's metrics, including
+// the workflow phase transitions reported by status.Tracker. It must be called
+// before Run; a nil sink is ignored.
+func (r *Runner) SetMetricsSink(sink metrics.Sink) {
+	if sink == nil {
+		return
+	}
+	r.metricsSink = sink
 }
 
 // runChecks wraps around check.RunChecks and adds the context of this move operation

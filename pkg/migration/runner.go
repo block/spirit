@@ -236,9 +236,24 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 	return r.changes[0].attemptMySQLDDL(ctx)
 }
 
+// recordCopyCompleted reports the settled copy aggregate to the metrics sink.
+// The counts come from the chunker rather than a second tally in the copier:
+// the chunker is what accumulates copied rows from applier feedback (see
+// table.Chunker.Feedback), and on a resumed run it already carries the rows
+// copied before the restart.
+func (r *Runner) recordCopyCompleted() {
+	chunker := r.copier.GetChunker()
+	if chunker == nil {
+		return
+	}
+	_, chunks, _ := chunker.Progress()
+	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+}
+
 func (r *Runner) Run(ctx context.Context) error {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
+	r.status.SetMetricsSink(r.metricsSink, r.logger)
 	r.status.Begin()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting spirit migration",
@@ -402,6 +417,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	r.recordCopyCompleted()
 	r.logger.Info("copy rows complete")
 
 	// Disable both watermark optimizations so that all changes can be flushed.

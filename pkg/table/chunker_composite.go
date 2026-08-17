@@ -431,6 +431,13 @@ func (t *chunkerComposite) IsRead() bool {
 // wants to do that. For the composite chunker we use
 // the actualRows copied (from feedback) over the estimated
 // rows (from table statistics)
+// RowsCopied returns the rows settled by the applier. For the composite
+// chunker this is the same counter Progress reports, because it already
+// accumulates the actualRows from Feedback.
+func (t *chunkerComposite) RowsCopied() uint64 {
+	return atomic.LoadUint64(&t.rowsCopied)
+}
+
 func (t *chunkerComposite) Progress() (uint64, uint64, uint64) {
 	return atomic.LoadUint64(&t.rowsCopied), t.chunksCopied.Load(), atomic.LoadUint64(&t.Ti.EstimatedRows)
 }

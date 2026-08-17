@@ -301,6 +301,12 @@ func (m *MockChunker) KeyBelowLowWatermark(key any) bool {
 	return keyPos < m.currentPosition
 }
 
+func (m *MockChunker) RowsCopied() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentPosition
+}
+
 func (m *MockChunker) Progress() (uint64, uint64, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

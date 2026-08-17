@@ -34,8 +34,13 @@ type chunkerOptimistic struct {
 	// Progress tracking: the implementation here is up to the chunker,
 	// and for the optimistic chunker it is based on the progress
 	// through the auto_increment counter.
-	rowsCopied   uint64 // The sum of chunkSize
-	chunksCopied atomic.Uint64
+	rowsCopied uint64 // The sum of chunkSize: distance travelled, not a row count
+	// actualRowsCopied is the sum of the actualRows reported to Feedback, i.e.
+	// the rows the applier really settled. rowsCopied above cannot serve this
+	// purpose: it advances by the chunk's key-space width so that it can be
+	// compared against the auto-increment max.
+	actualRowsCopied atomic.Uint64
+	chunksCopied     atomic.Uint64
 
 	logger *slog.Logger
 }
@@ -344,6 +349,7 @@ func (t *chunkerOptimistic) Reset() error {
 
 	// Reset progress tracking
 	atomic.StoreUint64(&t.rowsCopied, 0)
+	t.actualRowsCopied.Store(0)
 	t.chunksCopied.Store(0)
 
 	// Make sure min/max value are always specified
@@ -356,11 +362,12 @@ func (t *chunkerOptimistic) Reset() error {
 // Feedback is a way for consumers of chunks to give feedback on how long
 // processing the chunk took. It is incorporated into the calculation of future
 // chunk sizes.
-func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration, _ uint64) {
+func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration, actualRows uint64) {
 	t.Lock()
 	defer t.Unlock()
 	t.chunkFedBack()
 	t.bumpWatermark(chunk, t.logger)
+	t.actualRowsCopied.Add(actualRows)
 
 	// It is up to the chunker implementation to decide how to track "rows copied"
 	// In the optimistic chunker, since it is really designed around auto_increment
@@ -473,6 +480,7 @@ func (t *chunkerOptimistic) open() (err error) {
 
 	// Initialize progress tracking
 	atomic.StoreUint64(&t.rowsCopied, 0)
+	t.actualRowsCopied.Store(0)
 
 	// Make sure min/max value are always specified
 	// To simplify the code in NextChunk funcs.
@@ -489,6 +497,12 @@ func (t *chunkerOptimistic) IsRead() bool {
 // Progress returns the current progress of the chunker as (rowsCopied, totalRows)
 // It is up to the chunker implementation to select the formula. The optimistic
 // chunker is based on the progress of the auto_increment column.
+// RowsCopied returns the rows settled by the applier, which for this chunker
+// is a separate counter from the key-space distance Progress reports.
+func (t *chunkerOptimistic) RowsCopied() uint64 {
+	return t.actualRowsCopied.Load()
+}
+
 func (t *chunkerOptimistic) Progress() (uint64, uint64, uint64) {
 	maxValue, err := strconv.ParseUint(t.Ti.MaxValue().String(), 10, 64) // autoInc max
 	if err != nil {

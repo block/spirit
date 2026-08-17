@@ -53,6 +53,18 @@ type Chunker interface {
 	Next() (*Chunk, error)
 	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)
 	Progress() (rowsRead uint64, chunksCopied uint64, totalRowsExpected uint64)
+	// RowsCopied returns the number of rows the applier has actually settled,
+	// summed from the actualRows reported to Feedback. It is deliberately not
+	// Progress's first return: the optimistic chunker measures progress as
+	// distance travelled through the auto-increment key space (so that it can
+	// be compared against the auto-increment max), which on a sparse table is
+	// nothing like a row count. Use Progress to render a percentage, and this
+	// to report how much data was copied.
+	//
+	// A resumed run reports only what the chunker itself has seen unless the
+	// watermark carried an earlier count forward (the composite chunker's
+	// does; the optimistic chunker's watermark stores key positions only).
+	RowsCopied() uint64
 	OpenAtWatermark(watermark string) error
 	GetLowWatermark() (watermark string, err error)
 	// Reset resets the chunker to start from the beginning, as if Open() was just called.

@@ -1,8 +1,12 @@
 package status
 
 import (
+	"context"
+	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/block/spirit/pkg/metrics"
 )
 
 // Tracker owns the current State plus per-state wall-clock timing. Runners
@@ -31,6 +35,56 @@ type Tracker struct {
 	enteredAt time.Time               // when the current state was entered
 	open      bool                    // the current state has a running interval
 	durations map[State]time.Duration // closed time attributed per state
+
+	// sink receives a phase metric on every transition. It is optional: with
+	// no sink installed the tracker does no work beyond the timing above,
+	// which is what makes phase reporting free for callers that don't want it.
+	sinkMu sync.Mutex
+	sink   metrics.Sink
+	logger *slog.Logger
+}
+
+// SetMetricsSink installs the sink that phase transitions are reported to,
+// and the logger used when a send fails. A nil sink (the default) disables
+// reporting; a metrics.NoopSink is accepted and simply discards the values.
+//
+// Reporting is synchronous, so a slow sink slows transitions — bounded by
+// metrics.SinkTimeout per send, and there are only a dozen transitions in a
+// run. It is deliberately the same trade-off the copier already makes for its
+// per-chunk metrics, which send far more often.
+func (t *Tracker) SetMetricsSink(sink metrics.Sink, logger *slog.Logger) {
+	t.sinkMu.Lock()
+	defer t.sinkMu.Unlock()
+	t.sink = sink
+	t.logger = logger
+}
+
+// send delivers one batch. It uses a background context on purpose: a phase
+// that ends because the run was cancelled is exactly the phase an operator
+// most wants reported, so the final transitions must still be sent after the
+// run's context is done.
+func (t *Tracker) send(values ...metrics.MetricValue) {
+	t.sinkMu.Lock()
+	sink, logger := t.sink, t.logger
+	t.sinkMu.Unlock()
+	if sink == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), metrics.SinkTimeout)
+	defer cancel()
+	if err := sink.Send(ctx, &metrics.Metrics{Values: values}); err != nil && logger != nil {
+		logger.Warn("could not send workflow phase metrics", "error", err)
+	}
+}
+
+// RecordCopyCompleted reports the settled copy aggregate once the copy phase
+// has ended. Runners read it from the chunker, which counts rows from applier
+// feedback and already carries a resumed run's earlier rows.
+func (t *Tracker) RecordCopyCompleted(rows, chunks uint64) {
+	t.send(
+		metrics.MetricValue{Name: metrics.CopyRowsCompletedMetricName, Type: metrics.GAUGE, Value: float64(rows)},
+		metrics.MetricValue{Name: metrics.CopyChunksCompletedMetricName, Type: metrics.GAUGE, Value: float64(chunks)},
+	)
 }
 
 // Begin marks the start of a run: it resets all timing (start time, per-state
@@ -41,12 +95,21 @@ type Tracker struct {
 func (t *Tracker) Begin() {
 	now := time.Now()
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.startedAt = now
 	t.enteredAt = now
 	t.open = true
 	t.durations = nil
 	t.state.set(Initial)
+	t.mu.Unlock()
+	// Begin is the run's first transition, so it reports Initial the same way
+	// every later transition reports its state. Nothing is completed here: a
+	// re-Begin abandons the previous run's open interval rather than closing
+	// it, which is what "starts a fresh run" means.
+	t.send(metrics.MetricValue{
+		Name:  metrics.WorkflowPhaseMetricName,
+		Type:  metrics.GAUGE,
+		Value: float64(Initial),
+	})
 }
 
 // Get returns the current state.
@@ -122,17 +185,41 @@ func (t *Tracker) Duration(state State) time.Duration {
 
 func (t *Tracker) enter(state State) {
 	now := time.Now()
+	// Closing the previous state is a phase completion in its own right: a
+	// Set-based transition (Close, ErrCleanup) never runs through exit, so
+	// this is the only place its predecessor's duration is reported.
+	var completed State
+	var completedFor time.Duration
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.startedAt.IsZero() {
 		t.startedAt = now
 	}
 	if t.open {
+		completed, completedFor = t.state.get(), now.Sub(t.enteredAt)
 		t.accrueLocked(now)
 	}
 	t.state.set(state)
 	t.enteredAt = now
 	t.open = true
+	t.mu.Unlock()
+
+	// Sending happens outside t.mu: a sink must never be able to block a
+	// state read (Get, Elapsed, the status block's goroutine).
+	if completedFor > 0 {
+		t.sendPhaseCompleted(completed, completedFor)
+	}
+	t.send(metrics.MetricValue{
+		Name:  metrics.WorkflowPhaseMetricName,
+		Type:  metrics.GAUGE,
+		Value: float64(state),
+	})
+}
+
+func (t *Tracker) sendPhaseCompleted(state State, d time.Duration) {
+	t.send(
+		metrics.MetricValue{Name: metrics.WorkflowPhaseCompletedMetricName, Type: metrics.GAUGE, Value: float64(state)},
+		metrics.MetricValue{Name: metrics.WorkflowPhaseSecondsMetricName, Type: metrics.GAUGE, Value: d.Seconds()},
+	)
 }
 
 // exit closes the bracket opened by Do for state. If a nested Do or a Set has
@@ -142,9 +229,14 @@ func (t *Tracker) enter(state State) {
 func (t *Tracker) exit(state State) {
 	now := time.Now()
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	var d time.Duration
 	if t.open && t.state.get() == state {
+		d = now.Sub(t.enteredAt)
 		t.accrueLocked(now)
+	}
+	t.mu.Unlock()
+	if d > 0 {
+		t.sendPhaseCompleted(state, d)
 	}
 }
 

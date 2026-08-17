@@ -31,6 +31,30 @@ const (
 	ChecksumThreadsMetricName      = "checksum_threads"
 	ThrottlerUtilizationMetricName = "throttler_utilization"
 
+	// Workflow phase metrics, emitted by status.Tracker on every state
+	// transition. There are no label/attribute fields on MetricValue, so the
+	// phase is carried as the numeric status.State and correlated inside a
+	// single Send batch, the same way the chunk metrics above describe one
+	// chunk together:
+	//
+	//   entry: [workflow_phase]
+	//   exit:  [workflow_phase_completed, workflow_phase_seconds]
+	//
+	// A sink that wants "time spent in copyRows" reads the exit batch; a sink
+	// that wants "what is this migration doing right now" reads the entry
+	// gauge. status.State.String() names the values.
+	WorkflowPhaseMetricName          = "workflow_phase"
+	WorkflowPhaseCompletedMetricName = "workflow_phase_completed"
+	WorkflowPhaseSecondsMetricName   = "workflow_phase_seconds"
+
+	// Copy completion totals, emitted once when the copy phase ends. They are
+	// the settled per-run aggregate read from the chunker, which is the
+	// component that counts copied rows from applier feedback and carries a
+	// resumed run's rows forward from its checkpoint. The per-chunk counters
+	// above still give the incremental view.
+	CopyRowsCompletedMetricName   = "copy_rows_completed"
+	CopyChunksCompletedMetricName = "copy_chunks_completed"
+
 	// Applier pipeline gauges (see pkg/applier Stats). Together they
 	// distinguish a read-limited copy pipeline (queue near empty, workers
 	// idle) from a write-limited one (queue pegged at capacity with

@@ -86,8 +86,12 @@ type Runner struct {
 	// status block (#329).
 	lastCheckpoint status.LastCheckpoint
 
-	logger     *slog.Logger
-	cancelFunc context.CancelFunc
+	logger *slog.Logger
+	// metricsSink receives the copier's per-chunk metrics and the tracker's
+	// phase transitions. It defaults to a NoopSink, so a caller that installs
+	// nothing pays only for the discarded values.
+	metricsSink metrics.Sink
+	cancelFunc  context.CancelFunc
 	// sourceDBConfig connects to the read-only source: ForceKill and
 	// RejectReadOnly are disabled (see Run). targetDBConfig connects to the
 	// writable target and keeps the standard safe defaults — most importantly
@@ -165,6 +169,7 @@ func NewRunner(s *Sync) (*Runner, error) {
 	r := &Runner{
 		sync:              s,
 		logger:            slog.Default(),
+		metricsSink:       &metrics.NoopSink{},
 		continuousReadyCh: make(chan struct{}),
 		firstCleanPassCh:  make(chan struct{}),
 	}
@@ -173,8 +178,32 @@ func NewRunner(s *Sync) (*Runner, error) {
 
 // SetLogger overrides the logger (used by programmatic callers to capture
 // progress output).
+// recordCopyCompleted reports the settled copy aggregate to the metrics sink.
+// The counts come from the chunker rather than a second tally in the copier:
+// the chunker is what accumulates copied rows from applier feedback (see
+// table.Chunker.Feedback), and on a resumed run it already carries the rows
+// copied before the restart.
+func (r *Runner) recordCopyCompleted() {
+	chunker := r.copier.GetChunker()
+	if chunker == nil {
+		return
+	}
+	_, chunks, _ := chunker.Progress()
+	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+}
+
 func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
+}
+
+// SetMetricsSink installs the destination for this run's metrics, including
+// the workflow phase transitions reported by status.Tracker. It must be called
+// before Run; a nil sink is ignored.
+func (r *Runner) SetMetricsSink(sink metrics.Sink) {
+	if sink == nil {
+		return
+	}
+	r.metricsSink = sink
 }
 
 // Run performs the initial copy and then streams changes continuously
@@ -186,6 +215,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.progMu.Lock()
 	r.cancelFunc = cancel
 	r.progMu.Unlock()
+	r.status.SetMetricsSink(r.metricsSink, r.logger)
 	r.status.Begin()
 	r.logger.Info("Starting sync", "source_dsn", dbconn.RedactDSN(r.sync.SourceDSN))
 
@@ -311,6 +341,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err := r.copier.Run(ctx); err != nil {
 			return fmt.Errorf("copy failed: %w", err)
 		}
+		r.recordCopyCompleted()
 		if !r.sync.CopyOnly {
 			if !r.resuming.Load() {
 				if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
@@ -1111,7 +1142,7 @@ func (r *Runner) buildCopyPipeline() error {
 		Concurrency: r.sync.Threads,
 		Logger:      r.logger,
 		Throttler:   &throttler.Noop{},
-		MetricsSink: &metrics.NoopSink{},
+		MetricsSink: r.metricsSink,
 		DBConfig:    r.sourceDBConfig,
 		Applier:     r.applier,
 	})
