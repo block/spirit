@@ -44,11 +44,12 @@ func TestVectorDefaultDimensionConverges(t *testing.T) {
 }
 
 // TestVectorDiffOmitsCharset guards the other half of the VECTOR schema
-// handling: the parser assigns VECTOR a synthetic "binary" charset/collation
-// (as it does for spatial types), which is not valid SQL to emit. Emitting it
-// produced `MODIFY COLUMN v vector(6) CHARACTER SET binary COLLATE binary`,
-// which MySQL — and Spirit's own parser, when it re-parses the generated
-// statement — rejects.
+// handling, which charsetlessTypeNormalizer owns: the parser assigns VECTOR a
+// synthetic "binary" charset/collation (as it does for spatial types), which
+// is not valid SQL to emit. Emitting it produced `MODIFY COLUMN v vector(6)
+// CHARACTER SET binary COLLATE binary`, which MySQL — and Spirit's own parser,
+// when it re-parses the generated statement — rejects. See
+// normalize_charsetless_types_test.go for the hand-written COLLATE route.
 func TestVectorDiffOmitsCharset(t *testing.T) {
 	ct, err := ParseCreateTable("CREATE TABLE t (id int NOT NULL, v vector(3) NOT NULL, PRIMARY KEY (id))")
 	require.NoError(t, err)
