@@ -49,9 +49,15 @@ const (
 
 	// Copy completion totals, emitted once when the copy phase ends. They are
 	// the settled per-run aggregate read from the chunker, which is the
-	// component that counts copied rows from applier feedback and carries a
-	// resumed run's rows forward from its checkpoint. The per-chunk counters
-	// above still give the incremental view.
+	// component that counts copied rows from applier feedback. The per-chunk
+	// counters above still give the incremental view.
+	//
+	// These are the rows *this run* copied, not the rows the migration has
+	// copied across all of its attempts. Whether a resumed run carries its
+	// earlier count forward is chunker-dependent — the composite chunker's
+	// watermark stores the count, the optimistic chunker's stores key
+	// positions only (see table.Chunker.RowsCopied) — so a sink that wants a
+	// lifetime total cannot get one by reading a single sample.
 	CopyRowsCompletedMetricName   = "copy_rows_completed"
 	CopyChunksCompletedMetricName = "copy_chunks_completed"
 

@@ -144,6 +144,52 @@ func TestTrackerWithoutSinkIsUnchanged(t *testing.T) {
 	require.Equal(t, CopyRows, tracker.Get())
 }
 
+// TestTrackerNoopSinkIsNotInstalled: every runner defaults its metricsSink to
+// a NoopSink and hands it over unconditionally, so "no sink" and "the default
+// sink" are the same request. Installing the NoopSink would mean a run that
+// wants no metrics still builds a batch and a timeout context per transition.
+func TestTrackerNoopSinkIsNotInstalled(t *testing.T) {
+	var tracker Tracker
+	tracker.SetMetricsSink(&metrics.NoopSink{}, nil)
+	require.False(t, tracker.reporting(), "a NoopSink leaves reporting off")
+
+	tracker.SetMetricsSink(nil, nil)
+	require.False(t, tracker.reporting(), "a nil sink leaves reporting off")
+
+	tracker.SetMetricsSink(&recordingSink{}, nil)
+	require.True(t, tracker.reporting(), "a real sink turns reporting on")
+
+	// ...and it can be turned back off, since the pair is swapped atomically.
+	tracker.SetMetricsSink(&metrics.NoopSink{}, nil)
+	require.False(t, tracker.reporting())
+}
+
+// TestTrackerSlowSinkDoesNotInflatePhase pins the property that makes
+// synchronous delivery acceptable: Tracker.Do is documented as timing exactly
+// the function it brackets, so the time spent announcing a phase must not be
+// charged to that phase. Without excludeDelivery, entering CopyRows behind a
+// sink that blocks would add the block to CopyRows' duration.
+func TestTrackerSlowSinkDoesNotInflatePhase(t *testing.T) {
+	const blockFor = 40 * time.Millisecond
+	sink := &recordingSink{blockFor: blockFor}
+	var tracker Tracker
+	tracker.SetMetricsSink(sink, nil)
+
+	tracker.Begin()
+	require.NoError(t, tracker.Do(CopyRows, func() error { return nil }))
+
+	// Entering CopyRows delivers two batches (Initial completed, CopyRows
+	// entered), so a naive clock would report >= 2*blockFor for a phase whose
+	// function did nothing at all.
+	require.Less(t, tracker.Duration(CopyRows), blockFor,
+		"phase duration must exclude the time spent delivering the transition")
+
+	seconds := sink.values(metrics.WorkflowPhaseSecondsMetricName)
+	require.NotEmpty(t, seconds)
+	require.Less(t, seconds[len(seconds)-1], blockFor.Seconds(),
+		"the reported duration must exclude delivery too")
+}
+
 // TestTrackerSinkErrorDoesNotFailTransition: metrics are best effort. A sink
 // that always errors must not change the tracker's behavior.
 func TestTrackerSinkErrorDoesNotFailTransition(t *testing.T) {

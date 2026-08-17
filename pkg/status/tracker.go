@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/block/spirit/pkg/metrics"
@@ -36,27 +37,52 @@ type Tracker struct {
 	open      bool                    // the current state has a running interval
 	durations map[State]time.Duration // closed time attributed per state
 
-	// sink receives a phase metric on every transition. It is optional: with
-	// no sink installed the tracker does no work beyond the timing above,
-	// which is what makes phase reporting free for callers that don't want it.
-	sinkMu sync.Mutex
+	// sink receives a phase metric on every transition. It is optional, and
+	// held as one atomically-swapped pointer so that the common case — nobody
+	// listening — costs a single load and nothing else: no lock, no context,
+	// no batch. That is what makes phase reporting free for callers that
+	// don't want it.
+	sink atomic.Pointer[trackerSink]
+}
+
+// trackerSink pairs the installed sink with the logger to complain to, so
+// that both are swapped together by a single atomic store.
+type trackerSink struct {
 	sink   metrics.Sink
 	logger *slog.Logger
 }
 
 // SetMetricsSink installs the sink that phase transitions are reported to,
-// and the logger used when a send fails. A nil sink (the default) disables
-// reporting; a metrics.NoopSink is accepted and simply discards the values.
+// and the logger used when a send fails. Reporting is off until it is called
+// with a sink that can actually receive.
 //
-// Reporting is synchronous, so a slow sink slows transitions — bounded by
+// A nil sink, or a *metrics.NoopSink, leaves reporting off rather than
+// installing a discard. That distinction matters because every runner
+// defaults its metricsSink to a NoopSink and passes it here unconditionally:
+// if a NoopSink counted as installed, a run that asked for no metrics would
+// still build a batch and a timeout context on every transition.
+//
+// Reporting is synchronous, so a slow sink delays transitions — bounded by
 // metrics.SinkTimeout per send, and there are only a dozen transitions in a
 // run. It is deliberately the same trade-off the copier already makes for its
-// per-chunk metrics, which send far more often.
+// per-chunk metrics, which send far more often. Delivery time is excluded
+// from the phase durations themselves (see enter).
 func (t *Tracker) SetMetricsSink(sink metrics.Sink, logger *slog.Logger) {
-	t.sinkMu.Lock()
-	defer t.sinkMu.Unlock()
-	t.sink = sink
-	t.logger = logger
+	if sink == nil {
+		t.sink.Store(nil)
+		return
+	}
+	if _, noop := sink.(*metrics.NoopSink); noop {
+		t.sink.Store(nil)
+		return
+	}
+	t.sink.Store(&trackerSink{sink: sink, logger: logger})
+}
+
+// reporting reports whether anything is listening. Callers check it before
+// assembling values, since the batch itself is the allocation worth avoiding.
+func (t *Tracker) reporting() bool {
+	return t.sink.Load() != nil
 }
 
 // send delivers one batch. It uses a background context on purpose: a phase
@@ -64,23 +90,30 @@ func (t *Tracker) SetMetricsSink(sink metrics.Sink, logger *slog.Logger) {
 // most wants reported, so the final transitions must still be sent after the
 // run's context is done.
 func (t *Tracker) send(values ...metrics.MetricValue) {
-	t.sinkMu.Lock()
-	sink, logger := t.sink, t.logger
-	t.sinkMu.Unlock()
-	if sink == nil {
+	s := t.sink.Load()
+	if s == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), metrics.SinkTimeout)
 	defer cancel()
-	if err := sink.Send(ctx, &metrics.Metrics{Values: values}); err != nil && logger != nil {
-		logger.Warn("could not send workflow phase metrics", "error", err)
+	if err := s.sink.Send(ctx, &metrics.Metrics{Values: values}); err != nil && s.logger != nil {
+		s.logger.Warn("could not send workflow phase metrics", "error", err)
 	}
 }
 
 // RecordCopyCompleted reports the settled copy aggregate once the copy phase
 // has ended. Runners read it from the chunker, which counts rows from applier
-// feedback and already carries a resumed run's earlier rows.
+// feedback.
+//
+// What a resumed run reports here is chunker-dependent: the composite
+// chunker restores its count from the watermark, the optimistic chunker
+// starts from zero because its watermark stores key positions only (see
+// table.Chunker.RowsCopied). Read these as the rows this run copied, not as a
+// migration lifetime total.
 func (t *Tracker) RecordCopyCompleted(rows, chunks uint64) {
+	if !t.reporting() {
+		return
+	}
 	t.send(
 		metrics.MetricValue{Name: metrics.CopyRowsCompletedMetricName, Type: metrics.GAUGE, Value: float64(rows)},
 		metrics.MetricValue{Name: metrics.CopyChunksCompletedMetricName, Type: metrics.GAUGE, Value: float64(chunks)},
@@ -101,15 +134,20 @@ func (t *Tracker) Begin() {
 	t.durations = nil
 	t.state.set(Initial)
 	t.mu.Unlock()
+	if !t.reporting() {
+		return
+	}
 	// Begin is the run's first transition, so it reports Initial the same way
 	// every later transition reports its state. Nothing is completed here: a
 	// re-Begin abandons the previous run's open interval rather than closing
 	// it, which is what "starts a fresh run" means.
+	deliveryStart := time.Now()
 	t.send(metrics.MetricValue{
 		Name:  metrics.WorkflowPhaseMetricName,
 		Type:  metrics.GAUGE,
 		Value: float64(Initial),
 	})
+	t.excludeDelivery(Initial, deliveryStart)
 }
 
 // Get returns the current state.
@@ -203,8 +241,13 @@ func (t *Tracker) enter(state State) {
 	t.open = true
 	t.mu.Unlock()
 
+	if !t.reporting() {
+		return
+	}
 	// Sending happens outside t.mu: a sink must never be able to block a
-	// state read (Get, Elapsed, the status block's goroutine).
+	// state read (Get, Elapsed, the status block's goroutine). The new state
+	// is published before delivery, so a reader never sees a stale phase.
+	deliveryStart := time.Now()
 	if completedFor > 0 {
 		t.sendPhaseCompleted(completed, completedFor)
 	}
@@ -213,9 +256,31 @@ func (t *Tracker) enter(state State) {
 		Type:  metrics.GAUGE,
 		Value: float64(state),
 	})
+	t.excludeDelivery(state, deliveryStart)
+}
+
+// excludeDelivery rolls the current phase's start forward by however long
+// delivery took, so that the phase clock begins once the transition has been
+// announced rather than when it was decided. Without it a sink blocking for
+// up to metrics.SinkTimeout would land inside the very duration it is about
+// to be told about, and Do would no longer time exactly the function it
+// brackets.
+//
+// It is a no-op once the tracker has moved on — a fatal Set (ErrCleanup)
+// racing an in-flight delivery must not have its own clock rewritten.
+func (t *Tracker) excludeDelivery(state State, deliveryStart time.Time) {
+	d := time.Since(deliveryStart)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.open && t.state.get() == state {
+		t.enteredAt = t.enteredAt.Add(d)
+	}
 }
 
 func (t *Tracker) sendPhaseCompleted(state State, d time.Duration) {
+	if !t.reporting() {
+		return
+	}
 	t.send(
 		metrics.MetricValue{Name: metrics.WorkflowPhaseCompletedMetricName, Type: metrics.GAUGE, Value: float64(state)},
 		metrics.MetricValue{Name: metrics.WorkflowPhaseSecondsMetricName, Type: metrics.GAUGE, Value: d.Seconds()},

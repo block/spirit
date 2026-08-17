@@ -371,10 +371,15 @@ func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration, actualRows u
 
 	// It is up to the chunker implementation to decide how to track "rows copied"
 	// In the optimistic chunker, since it is really designed around auto_increment
-	// tables, we add the ChunkSize to the rowsCopied counter, and ignore
-	// the actualRows. This differs from the composite chunker, which doesn't have an
-	// auto_inc max so it takes the table estimate and compares it to the actual
-	// rows copied.
+	// tables, we add the ChunkSize to the rowsCopied counter that Progress
+	// reports, and ignore the actualRows *there*. This differs from the composite
+	// chunker, which doesn't have an auto_inc max so it takes the table estimate
+	// and compares it to the actual rows copied.
+	//
+	// actualRows is not discarded outright: it is summed into actualRowsCopied
+	// above, which is what RowsCopied reports. The two counters answer
+	// different questions — how far through the key space we are, versus how
+	// many rows were actually written.
 	atomic.AddUint64(&t.rowsCopied, chunk.ChunkSize)
 	t.chunksCopied.Add(1)
 

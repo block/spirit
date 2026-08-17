@@ -218,8 +218,12 @@ func NewRunner(m *Move) (*Runner, error) {
 // recordCopyCompleted reports the settled copy aggregate to the metrics sink.
 // The counts come from the chunker rather than a second tally in the copier:
 // the chunker is what accumulates copied rows from applier feedback (see
-// table.Chunker.Feedback), and on a resumed run it already carries the rows
-// copied before the restart.
+// table.Chunker.Feedback).
+//
+// On a resumed run this reports what the chunker itself has counted, which
+// includes the rows copied before the restart only when the watermark carried
+// that count forward (see table.Chunker.RowsCopied: the composite chunker's
+// does, the optimistic chunker's does not).
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
