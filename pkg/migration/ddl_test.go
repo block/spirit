@@ -81,7 +81,7 @@ func TestUnsupportedClauseRejectedBeforeDDL(t *testing.T) {
 		return count > 0
 	}
 
-	// --alter path: a trailing ALGORITHM= clause must fail fast.
+	// Composed ALTER TABLE: a trailing ALGORITHM= clause must fail fast.
 	m := NewTestRunner(t, "rejectalgorithm", "ADD COLUMN c INT, ALGORITHM=INPLACE", WithThreads(1))
 	err := m.Run(t.Context())
 	require.Error(t, err)
@@ -91,7 +91,7 @@ func TestUnsupportedClauseRejectedBeforeDDL(t *testing.T) {
 	require.NoError(t, m.Close())
 	require.False(t, columnExists("c")) // no DDL may have been executed
 
-	// --statement path: ALGORITHM= and LOCK= must also fail fast.
+	// Raw statement: ALGORITHM= and LOCK= must also fail fast.
 	m = NewTestRunnerFromStatement(t, "ALTER TABLE rejectalgorithm ADD COLUMN d INT, ALGORITHM=COPY, LOCK=SHARED", WithThreads(1))
 	err = m.Run(t.Context())
 	require.Error(t, err)

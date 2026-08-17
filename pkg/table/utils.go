@@ -48,6 +48,15 @@ func castableTp(tp string) string {
 		return "datetime"
 	case "tinyblob", "blob", "mediumblob", "longblob", "varbinary":
 		return "binary"
+	case "vector":
+		// VECTOR (MySQL 9.7+) can not be cast to char: the server rejects
+		// it with ER_WRONG_ARGUMENTS ("Incorrect arguments to
+		// cast_as_char"), which would fail the checksum query outright for
+		// any table holding one. It casts to binary cleanly, and since the
+		// stored form is a packed array of 4-byte floats that is a
+		// byte-exact comparison — width is not padded (unlike binary(N)),
+		// so the plain "binary" cast is right for a widened VECTOR(N) too.
+		return "binary"
 	case "binary":
 		// Fixed-length binary needs special handling; blob etc is fine.
 		// We must preserve the width (e.g. binary(16)) in the cast:

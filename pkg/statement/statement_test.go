@@ -3,6 +3,7 @@ package statement
 import (
 	"testing"
 
+	"github.com/block/spirit/pkg/parser/format"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -10,6 +11,63 @@ import (
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
+
+// TestAlterClauseTrimming covers finding where the alter clauses start in a
+// restored "ALTER TABLE <table> <specs>". This used to be computed by counting
+// characters off the raw table name, which mis-trims quoted identifiers and
+// panicked outright when there were no specs at all.
+func TestAlterClauseTrimming(t *testing.T) {
+	// An embedded back-quote is doubled by restore, so the restored table
+	// reference is longer than the raw name.
+	abstractStmt, err := New("ALTER TABLE `a``b` ADD COLUMN c INT")
+	require.NoError(t, err)
+	require.Equal(t, "a`b", abstractStmt[0].Table)
+	require.Equal(t, "ADD COLUMN `c` INT", abstractStmt[0].Alter)
+
+	// Same, schema-qualified.
+	abstractStmt, err = New("ALTER TABLE `x``y`.`a``b` ADD COLUMN c INT")
+	require.NoError(t, err)
+	require.Equal(t, "x`y", abstractStmt[0].Schema)
+	require.Equal(t, "a`b", abstractStmt[0].Table)
+	require.Equal(t, "ADD COLUMN `c` INT", abstractStmt[0].Alter)
+
+	// An ALTER with no specs is a syntax error in MySQL, but our parser
+	// accepts it. It must be rejected, not returned with an empty alter.
+	_, err = New("ALTER TABLE t1")
+	require.ErrorIs(t, err, ErrAlterNoSpecs)
+
+	_, err = New("ALTER TABLE test.t1")
+	require.ErrorIs(t, err, ErrAlterNoSpecs)
+}
+
+// TestAlterClausesRestoreFlags pins that alterClauses cuts the prefix using the
+// flags it is given rather than assuming the defaults. Restoring the statement
+// and the prefix through the same flags is what keeps the cut correct, so
+// lowercase keywords and unquoted identifiers must work as well as the default
+// uppercase + back-quoted rendering.
+func TestAlterClausesRestoreFlags(t *testing.T) {
+	stmts, err := New("ALTER TABLE `a``b` ADD COLUMN c INT, DROP COLUMN d")
+	require.NoError(t, err)
+	alterStmt, ok := stmts[0].AsAlterTable()
+	require.True(t, ok)
+
+	clauses, err := alterClauses(alterStmt, format.DefaultRestoreFlags)
+	require.NoError(t, err)
+	require.Equal(t, "ADD COLUMN `c` INT, DROP COLUMN `d`", clauses)
+
+	// Lowercase keywords: the literal "ALTER TABLE " no longer appears, so a
+	// hard-coded prefix would fail to cut here.
+	clauses, err = alterClauses(alterStmt, format.RestoreKeyWordLowercase|format.RestoreNameBackQuotes)
+	require.NoError(t, err)
+	require.Equal(t, "add column `c` int, drop column `d`", clauses)
+
+	// No identifier quoting at all: the prefix shortens along with the table
+	// reference, and the embedded back-quote is no longer doubled.
+	clauses, err = alterClauses(alterStmt, format.RestoreKeyWordUppercase)
+	require.NoError(t, err)
+	require.Equal(t, "ADD COLUMN c INT, DROP COLUMN d", clauses)
+}
+
 func TestExtractFromStatement(t *testing.T) {
 	abstractStmt, err := New("ALTER TABLE t1 ADD INDEX (something)")
 	require.NoError(t, err)

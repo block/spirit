@@ -5,14 +5,17 @@ package testutils
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,6 +94,72 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	})
 
 	return dbName, scopedDB
+}
+
+// Error numbers a server without the VECTOR type returns for the probe below.
+// A missing built-in is looked up as a stored function, so what comes back
+// depends on the connecting user's privileges: root sees "does not exist",
+// while a user without EXECUTE on the schema (the CI test user) is denied
+// first and never learns the function is missing.
+const (
+	erSpDoesNotExist   = 1305 // FUNCTION test.VECTOR_DIM does not exist
+	erProcAccessDenied = 1370 // execute command denied ... for routine 'test.VECTOR_DIM'
+)
+
+// vectorSupported caches the one-time capability probe behind
+// SkipUnlessVectorSupported. err holds an infrastructure failure (see below),
+// which is reported to every caller rather than silently skipping them.
+var vectorSupported struct {
+	sync.Once
+	ok  bool
+	err error
+}
+
+// SkipUnlessVectorSupported skips the test unless the server understands the
+// VECTOR data type (MySQL 9.7+). It probes for the feature rather than parsing
+// version(), so a fork or a future version that renames itself still gets the
+// coverage. The probe result is cached for the life of the test binary.
+//
+// Only an "unknown function" answer from the server counts as unsupported.
+// Anything else — an unreachable host, a bad DSN, an auth failure, any other
+// server error — fails the test instead, so a broken environment cannot
+// masquerade as a whole suite of quietly skipped tests.
+func SkipUnlessVectorSupported(t *testing.T) {
+	t.Helper()
+	vectorSupported.Do(func() {
+		db, err := sql.Open("mysql", DSN())
+		if err != nil {
+			vectorSupported.err = err
+			return
+		}
+		defer utils.CloseAndLog(db)
+		var dim int
+		// STRING_TO_VECTOR/VECTOR_DIM exist only where the type does.
+		err = db.QueryRowContext(context.Background(),
+			`SELECT VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))`).Scan(&dim)
+		switch {
+		case err == nil:
+			vectorSupported.ok = true
+			if dim != 3 {
+				vectorSupported.err = fmt.Errorf("VECTOR probe returned dimension %d, want 3", dim)
+			}
+		case isUnknownFunctionErr(err):
+			// Server predates the VECTOR type; callers skip.
+		default:
+			vectorSupported.err = err
+		}
+	})
+	require.NoError(t, vectorSupported.err, "probing the server for VECTOR support failed")
+	if !vectorSupported.ok {
+		t.Skip("skipping: server does not support the VECTOR type (requires MySQL 9.7+)")
+	}
+}
+
+// isUnknownFunctionErr reports whether err is the server telling us a function
+// does not exist — in either of the two forms described above.
+func isUnknownFunctionErr(err error) bool {
+	myErr, ok := errors.AsType[*mysql.MySQLError](err)
+	return ok && (myErr.Number == erSpDoesNotExist || myErr.Number == erProcAccessDenied)
 }
 
 // RunSQLInDatabase runs SQL in a specific database

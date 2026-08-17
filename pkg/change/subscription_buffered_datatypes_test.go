@@ -46,6 +46,14 @@ type datatypeCase struct {
 	values []string // SQL value expressions, one row each, e.g. "b'0'", "b'1'", "NULL"
 }
 
+// requiresVector reports whether the case needs the VECTOR type (MySQL 9.7+),
+// so it can be skipped on the older servers in the CI matrix. Derived from the
+// column definition rather than a flag, so any vector case added later is
+// gated automatically.
+func (c datatypeCase) requiresVector() bool {
+	return strings.Contains(strings.ToUpper(c.colDef), "VECTOR")
+}
+
 func datatypeCases() []datatypeCase {
 	return []datatypeCase{
 		// ---- signed integers ----
@@ -92,6 +100,24 @@ func datatypeCases() []datatypeCase {
 		{"varbinary", "VARBINARY(16) NOT NULL", []string{"X'deadbeef'", "X'00'", "X'aabbccdd00000000'", "X'ff'"}},
 		{"blob", "BLOB NOT NULL", []string{"X'00112233ff'", "X'ff00'", "X'00'"}},
 
+		// ---- vector (MySQL 9.7+) ----
+		// A VECTOR is a packed array of 4-byte little-endian floats that
+		// the binlog delivers as raw bytes. The all-zeros vector is the
+		// case that matters: its byte image is valid UTF-8, so the
+		// applier's "hex-encode anything that isn't valid UTF-8"
+		// heuristic would emit it as a character-set string literal —
+		// which the server rejects outright with
+		// ER_INVALID_CAST_TO_VECTOR ("Value of type 'string, size: 12'
+		// cannot be converted to 'vector' type"), aborting the flush.
+		// The value expressions below span the same hazard for other
+		// widths: exponents/mantissas whose bytes land in the ASCII
+		// range are equally "valid UTF-8" by accident.
+		{"vector", "VECTOR(3) NOT NULL", []string{"STRING_TO_VECTOR('[0,0,0]')", "STRING_TO_VECTOR('[1.5,-2,0.0003]')", "STRING_TO_VECTOR('[1e30,-1e-5,123456789.5]')"}},
+		{"vector_nullable", "VECTOR(4) NULL", []string{"NULL", "STRING_TO_VECTOR('[0,0,0,0]')", "STRING_TO_VECTOR('[1,2,3,4]')"}},
+		// The default (unspecified) dimension is stored as vector(2048), but
+		// the stored image is only as wide as the value written into it.
+		{"vector_default_dim", "VECTOR NULL", []string{"STRING_TO_VECTOR('[0]')", "STRING_TO_VECTOR('[0,0]')", "NULL"}},
+
 		// ---- temporal ----
 		{"date", "DATE NOT NULL", []string{"'2026-06-10'", "'1000-01-01'", "'9999-12-31'"}},
 		{"datetime", "DATETIME NOT NULL", []string{"'2026-06-10 07:40:12'", "'1000-01-01 00:00:00'", "'9999-12-31 23:59:59'"}},
@@ -128,6 +154,9 @@ func datatypeCases() []datatypeCase {
 func TestBufferedDatatypeReplication(t *testing.T) {
 	for _, tc := range datatypeCases() {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.requiresVector() {
+				testutils.SkipUnlessVectorSupported(t)
+			}
 			require.GreaterOrEqual(t, len(tc.values), 2,
 				"each case needs >=2 values so the DELETE phase is non-vacuous")
 

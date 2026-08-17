@@ -459,15 +459,14 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 
 	// Extract charset and collation from the type itself
 	// (they may be overridden by column options later).
-	// Spatial types are skipped: the parser assigns them a synthetic
-	// "binary" charset/collation, which is not valid SQL to emit.
-	if col.Tp.GetType() != mysql.TypeGeometry {
-		if charset := col.Tp.GetCharset(); charset != "" {
-			column.Charset = &charset
-		}
-		if collation := col.Tp.GetCollate(); collation != "" {
-			column.Collation = &collation
-		}
+	// Spatial and VECTOR types carry a synthetic "binary" charset/collation
+	// here that is not valid SQL to emit; charsetlessTypeNormalizer strips
+	// it — along with any the author wrote by hand — once parsing is done.
+	if charset := col.Tp.GetCharset(); charset != "" {
+		column.Charset = &charset
+	}
+	if collation := col.Tp.GetCollate(); collation != "" {
+		column.Collation = &collation
 	}
 
 	// Extract ENUM/SET permitted values

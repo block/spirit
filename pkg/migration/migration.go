@@ -10,9 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
-	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/migration/check"
-	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -39,8 +37,6 @@ type Migration struct {
 	Password     *string `name:"password" help:"Password" optional:""`
 	Database     string  `name:"database" help:"Database" optional:""`
 	ConfFile     string  `name:"conf" help:"MySQL conf file" optional:"" type:"existingfile"`
-	Table        string  `name:"table" help:"Table" optional:""`
-	Alter        string  `name:"alter" help:"The alter statement to run on the table" optional:""`
 	Threads      int     `name:"threads" help:"Number of concurrent threads for copy and checksum tasks. Ignored when --enable-experimental-autoscaling engages" optional:"" default:"4"`
 	WriteThreads int     `name:"write-threads" help:"Number of concurrent apply (write) threads. Ignored when --enable-experimental-autoscaling engages" optional:"" default:"4"`
 
@@ -70,7 +66,7 @@ type Migration struct {
 	LockWaitTimeout      time.Duration `name:"lock-wait-timeout" help:"The DDL lock_wait_timeout required for checksum and cutover" optional:"" default:"30s"`
 	SkipDropAfterCutover bool          `name:"skip-drop-after-cutover" help:"Keep old table after completing cutover" optional:"" default:"false"`
 	DeferCutOver         bool          `name:"defer-cutover" help:"Defer cutover (and checksum) until sentinel table is dropped" optional:"" default:"false"`
-	Statement            string        `name:"statement" help:"The SQL statement to run (replaces --table and --alter)" optional:"" default:""`
+	Statement            string        `name:"statement" help:"The SQL statement to run" required:""`
 
 	// TLS Configuration
 	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:""`
@@ -136,10 +132,8 @@ func (m *Migration) Run() error {
 }
 
 // normalizeOptions does some validation and sets defaults.
-// for example, it validates that only --statement or --table and --alter are specified,
-// and when --statement is not specified, it generates it
-// so the rest of the code can use --statement as the canonical
-// source of truth for what's happening.
+// --statement is the only way to describe the change, and it is the canonical
+// source of truth for the rest of the code.
 func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, err error) {
 	if m.TargetChunkTime == 0 {
 		m.TargetChunkTime = table.ChunkerDefaultTarget
@@ -177,49 +171,23 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		return nil, err
 	}
 
-	if m.Statement != "" { // statement is specified
-		if m.Table != "" || m.Alter != "" {
-			return nil, errors.New("only --statement or --table and --alter can be specified")
+	if m.Statement == "" {
+		return nil, errors.New("--statement is required")
+	}
+	// extract the table and alter from the statement.
+	// if it is a CREATE INDEX statement, we rewrite it to an alter statement.
+	// This also returns the StmtNode.
+	stmts, err = statement.New(m.Statement)
+	if err != nil {
+		// The error could be a parser error, or it might be something
+		// specific like mixed ALTER + non alter statements.
+		return nil, err
+	}
+	for _, stmt := range stmts {
+		if stmt.Schema != "" && stmt.Schema != m.Database {
+			return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
 		}
-		// extract the table and alter from the statement.
-		// if it is a CREATE INDEX statement, we rewrite it to an alter statement.
-		// This also returns the StmtNode.
-		stmts, err = statement.New(m.Statement)
-		if err != nil {
-			// The error could be a parser error, or it might be something
-			// specific like mixed ALTER + non alter statements.
-			return nil, err
-		}
-		for _, stmt := range stmts {
-			if stmt.Schema != "" && stmt.Schema != m.Database {
-				return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
-			}
-			stmt.Schema = m.Database
-		}
-	} else { // --alter and --table are specified
-		if m.Table == "" {
-			return nil, errors.New("table name is required")
-		}
-		if m.Alter == "" {
-			return nil, errors.New("alter statement is required")
-		}
-		// Trim whitespace and remove trailing semicolon. Without this, the attemptInstantDDL and attemptInplaceDDL functions will fail.
-		m.Alter = strings.TrimSpace(m.Alter)
-		m.Alter = strings.TrimSuffix(m.Alter, ";")
-		fullStatement := fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(m.Table), m.Alter)
-		m.Statement = fullStatement // used in resume from checkpoint
-		p := parser.New()
-		stmtNodes, _, err := p.Parse(fullStatement, "", "")
-		if err != nil {
-			return nil, errors.New("could not parse SQL statement: " + fullStatement)
-		}
-		stmts = append(stmts, &statement.AbstractStatement{
-			Schema:    m.Database,
-			Table:     m.Table,
-			Alter:     m.Alter,
-			Statement: fullStatement,
-			StmtNode:  &stmtNodes[0],
-		})
+		stmt.Schema = m.Database
 	}
 	return stmts, err
 }

@@ -34,8 +34,7 @@ echo "----------------------------------------------------"
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="REQUIRED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_required VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_required VARCHAR(50)"
 
 echo ""
 echo "🔍 Testing TLS Mode: VERIFY_CA (should work with custom CA)"
@@ -47,8 +46,7 @@ echo "----------------------------------------------------------"
   --database="$MYSQL_DATABASE" \
   --tls-mode="VERIFY_CA" \
   --tls-ca="mysql-certs/custom-ca.pem" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_verify_ca VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_ca VARCHAR(50)"
 
 echo ""
 echo "🔍 Testing TLS Mode: VERIFY_IDENTITY with IP (should work - custom cert has IP SANs)"
@@ -60,8 +58,7 @@ echo "--------------------------------------------------------------------------
   --database="$MYSQL_DATABASE" \
   --tls-mode="VERIFY_IDENTITY" \
   --tls-ca="mysql-certs/custom-ca.pem" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_verify_identity_ip VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_identity_ip VARCHAR(50)"
 
 echo ""
 echo "🔍 Testing TLS Mode: VERIFY_IDENTITY with hostname (should work - custom cert has DNS SANs)"
@@ -73,8 +70,7 @@ echo "--------------------------------------------------------------------------
   --database="$MYSQL_DATABASE" \
   --tls-mode="VERIFY_IDENTITY" \
   --tls-ca="mysql-certs/custom-ca.pem" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_verify_identity_hostname VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_identity_hostname VARCHAR(50)"
 
 echo ""
 echo "🔍 Testing TLS Mode: PREFERRED (should use TLS when available)"
@@ -85,8 +81,7 @@ echo "-------------------------------------------------------------"
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="PREFERRED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_preferred_tls VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_preferred_tls VARCHAR(50)"
 
 echo ""
 echo "✅ Custom Certificate TLS Testing Complete!"

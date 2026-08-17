@@ -99,7 +99,7 @@ func EscapeIdentifier(identifier string) string {
 
 // RawSQL marks a string as trusted raw SQL for the %r verb. Converting a
 // value to RawSQL is an explicit assertion that it is safe to execute
-// verbatim (e.g. the operator's own --alter / --statement text): %r performs
+// verbatim (e.g. the operator's own --statement text): %r performs
 // no quoting and no format interpretation. The conversion is deliberately
 // required — a plain string is rejected — so that `grep -rn 'RawSQL('` is a
 // complete audit list of every raw splice in the tree.

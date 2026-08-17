@@ -73,15 +73,6 @@ func TestUnparsableStatements(t *testing.T) {
 	m = NewTestMigration(t, WithStatement("ALTER TABLE t1parse ADD COLUMN c BLOB DEFAULT ('abc')"))
 	require.NoError(t, m.Run())
 
-	// The same thing via the legacy --table/--alter path (this path always
-	// worked: the alter clause is executed verbatim, without a parser round
-	// trip). Adds c2 since the --statement run above already added c.
-	// Dies with the legacy path.
-	m = NewTestMigration(t)
-	m.Table = "t1parse"
-	m.Alter = "ADD COLUMN c2 BLOB DEFAULT ('abc')"
-	require.NoError(t, m.Run())
-
 	// CREATE TRIGGER — not supported. The fork parses it now that it has
 	// stored-program grammar, so it is refused by statement type rather than
 	// rejected as a syntax error.
@@ -90,11 +81,9 @@ func TestUnparsableStatements(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorContains(t, err, "not a supported statement type")
 
-	// https://github.com/pingcap/tidb/pull/61498
-	// Legacy --table/--alter path for the same reason as above.
-	m = NewTestMigration(t)
-	m.Table = "t1parse"
-	m.Alter = `ADD COLUMN src_col timestamp NULL DEFAULT NULL, add column new_col timestamp NULL DEFAULT(src_col)`
+	// A column default that references another column added in the same
+	// statement. https://github.com/pingcap/tidb/pull/61498
+	m = NewTestMigration(t, WithStatement("ALTER TABLE t1parse ADD COLUMN src_col timestamp NULL DEFAULT NULL, add column new_col timestamp NULL DEFAULT(src_col)"))
 	require.NoError(t, m.Run())
 
 	// Cleanup
