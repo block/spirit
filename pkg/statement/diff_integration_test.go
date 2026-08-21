@@ -585,3 +585,61 @@ func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, stmts)
 }
+
+// TestDiffIntegrationTableCollationChangeConverges verifies that changing a
+// table's default collation converges in a single apply when a column
+// inherits the live table's default. MySQL's table-level DEFAULT COLLATE
+// clause only affects columns added later, so the diff must include a MODIFY
+// COLUMN for the inheriting column alongside the table-option change — a diff
+// that emits only the table option leaves the column on the old collation and
+// the same drift resurfaces on the next plan.
+func TestDiffIntegrationTableCollationChangeConverges(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_collation_converge",
+		"CREATE TABLE diff_collation_converge (id varchar(512) NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	const targetSQL = "CREATE TABLE diff_collation_converge (id varchar(512) COLLATE utf8mb4_general_ci NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_converge` MODIFY COLUMN `id` varchar(512) COLLATE utf8mb4_general_ci NOT NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	var collation string
+	err := tt.DB.QueryRowContext(t.Context(),
+		"SELECT COLLATION_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'id'",
+		tt.Name).Scan(&collation)
+	require.NoError(t, err)
+	require.Equal(t, "utf8mb4_general_ci", collation)
+
+	// Re-diff: converged in one apply — nothing left over.
+	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationInheritedColumnFollowsNewTableCollation verifies the
+// same convergence when the target column also inherits its table default:
+// the emitted MODIFY carries no explicit COLLATE, and MySQL resolves it
+// against the new table default set by the table-option clause in the same
+// ALTER, so the column lands on the target collation in one apply.
+func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_collation_inherit",
+		"CREATE TABLE diff_collation_inherit (id int NOT NULL, name varchar(100), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	const targetSQL = "CREATE TABLE diff_collation_inherit (id int NOT NULL, name varchar(100), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_inherit` MODIFY COLUMN `name` varchar(100) NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	var collation string
+	err := tt.DB.QueryRowContext(t.Context(),
+		"SELECT COLLATION_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'name'",
+		tt.Name).Scan(&collation)
+	require.NoError(t, err)
+	require.Equal(t, "utf8mb4_general_ci", collation)
+
+	// Re-diff: converged in one apply — nothing left over.
+	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Nil(t, stmts)
+}

@@ -720,6 +720,53 @@ func TestDiff(t *testing.T) {
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_bin) CHARSET utf8mb4",
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) COLLATE utf8mb4_bin NULL",
 		},
+		// A table-level DEFAULT CHARSET/COLLATE change only affects columns
+		// added later, so when the table defaults differ, a column that
+		// inherits its table default must still be MODIFYed to converge in a
+		// single ALTER — even against a target column that (explicitly or by
+		// inheritance) matches the target table's different default.
+		{
+			name:     "TableCollationChangeModifiesInheritingColumn_ExplicitTarget",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) COLLATE utf8mb4_general_ci NULL, COLLATE=utf8mb4_general_ci",
+		},
+		{
+			name:     "TableCollationChangeModifiesInheritingColumn_InheritedTarget",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) NULL, COLLATE=utf8mb4_general_ci",
+		},
+		{
+			name:     "TableCharsetChangeModifiesInheritingColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=latin1 COLLATE=latin1_swedish_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) NULL, DEFAULT CHARSET=latin1, COLLATE=latin1_swedish_ci",
+		},
+		// When both tables share the same defaults, a column that inherits
+		// them and a column that explicitly restates them are the same
+		// column — no MODIFY in either direction.
+		{
+			name:     "SameTableDefaults_InheritedVsExplicitColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "",
+		},
+		{
+			name:     "SameTableDefaults_ExplicitVsInheritedColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "",
+		},
+		// A column already carrying the target's collation explicitly does
+		// not need a MODIFY when only the table default changes: the
+		// table-option clause alone converges.
+		{
+			name:     "TableCollationChangeSkipsAlreadyMatchingColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "ALTER TABLE `t1` COLLATE=utf8mb4_general_ci",
+		},
 		// Nil TableOptions tests - verifies no panic when TableOptions is nil
 		// This can happen when CREATE TABLE has no explicit ENGINE/CHARSET clause
 		{
