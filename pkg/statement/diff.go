@@ -656,9 +656,10 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 	return clauses
 }
 
-// columnsEqualWithContext checks if two columns are equal, considering table context for charset/collation
-// If a column's charset is nil, it inherits from the table. If it's explicitly set to the same as the table,
-// it's considered equal to nil (no explicit charset needed).
+// columnsEqualWithContext checks if two columns are equal, considering table
+// context for charset/collation: a column with no explicit charset/collation
+// inherits its owning table's defaults, so those attributes are compared on
+// their resolved values (see charsetCollationEqual).
 func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable, opts *DiffOptions) bool {
 	// Column names are case-insensitive in MySQL, so `id` and `ID` refer
 	// to the same column.
@@ -736,37 +737,7 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 		return false
 	}
 
-	// Charset comparison with table context
-	// If column charset is nil, it inherits from table
-	// If column charset equals table charset, it's redundant (same as nil)
-	sourceCharset := a.Charset
-	targetCharset := b.Charset
-
-	// Normalize: if charset equals table charset, treat as nil
-	if sourceCharset != nil && ct.TableOptions != nil && ct.TableOptions.Charset != nil && *sourceCharset == *ct.TableOptions.Charset {
-		sourceCharset = nil
-	}
-	if targetCharset != nil && target.TableOptions != nil && target.TableOptions.Charset != nil && *targetCharset == *target.TableOptions.Charset {
-		targetCharset = nil
-	}
-
-	if !ptrEqual(sourceCharset, targetCharset) {
-		return false
-	}
-
-	// Collation comparison with table context
-	sourceCollation := a.Collation
-	targetCollation := b.Collation
-
-	// Normalize: if collation equals table collation, treat as nil
-	if sourceCollation != nil && ct.TableOptions != nil && ct.TableOptions.Collation != nil && *sourceCollation == *ct.TableOptions.Collation {
-		sourceCollation = nil
-	}
-	if targetCollation != nil && target.TableOptions != nil && target.TableOptions.Collation != nil && *targetCollation == *target.TableOptions.Collation {
-		targetCollation = nil
-	}
-
-	if !ptrEqual(sourceCollation, targetCollation) {
+	if !charsetCollationEqual(a, b, ct, target, opts) {
 		return false
 	}
 
@@ -777,6 +748,135 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 		return false
 	}
 	return true
+}
+
+// charsetCarryingTypes are the column types that store text and therefore
+// carry a real charset/collation, inheriting the owning table's defaults when
+// the column declares neither. Type names are the parser's canonical
+// spellings. Binary and JSON types are excluded: they carry only a synthetic
+// "binary" charset that is identical on both sides of a same-type compare,
+// and spatial/vector types have theirs stripped by charsetlessTypeNormalizer.
+var charsetCarryingTypes = map[string]bool{
+	"char":       true,
+	"varchar":    true,
+	"tinytext":   true,
+	"text":       true,
+	"mediumtext": true,
+	"longtext":   true,
+	"enum":       true,
+	"set":        true,
+}
+
+// charsetOfCollation returns the character set a collation name belongs to.
+// MySQL collation names are the owning charset name followed by an
+// underscore-separated suffix (utf8mb4_general_ci -> utf8mb4); the sole
+// exception is "binary", which is both a charset and its only collation.
+func charsetOfCollation(collation string) string {
+	if idx := strings.IndexByte(collation, '_'); idx > 0 {
+		return collation[:idx]
+	}
+	return collation
+}
+
+// resolvedCharsetCollation returns the charset and collation a column
+// actually uses, following MySQL's resolution rules: explicit column values
+// win; an explicit column collation implies its charset; a column with
+// neither inherits the owning table's defaults, where a table collation
+// likewise implies the table charset. A value that cannot be determined from
+// the statement alone is returned as "": a column or table with a charset
+// but no collation uses that charset's *default* collation, and a table with
+// neither option uses the server defaults — both depend on server version
+// and configuration.
+func resolvedCharsetCollation(col *Column, table *CreateTable) (charset, collation string) {
+	switch {
+	case col.Collation != nil:
+		collation = strings.ToLower(*col.Collation)
+		if col.Charset != nil {
+			charset = strings.ToLower(*col.Charset)
+		} else {
+			charset = charsetOfCollation(collation)
+		}
+	case col.Charset != nil:
+		// An explicit column charset without a collation selects the
+		// charset's default collation — not the table's collation.
+		charset = strings.ToLower(*col.Charset)
+	default:
+		if tableCollation := table.TableOptions.getCollation(); tableCollation != nil {
+			collation = strings.ToLower(*tableCollation)
+		}
+		if tableCharset := table.TableOptions.getCharset(); tableCharset != nil {
+			charset = strings.ToLower(*tableCharset)
+		} else if collation != "" {
+			charset = charsetOfCollation(collation)
+		}
+	}
+	return charset, collation
+}
+
+// explicitUnlessTableDefault returns a column-level charset/collation value
+// with the redundant spelling of the owning table's default normalized to
+// nil, so an explicit value that merely restates the table default compares
+// equal to an inherited (nil) one.
+func explicitUnlessTableDefault(value, tableDefault *string) *string {
+	if value != nil && tableDefault != nil && *value == *tableDefault {
+		return nil
+	}
+	return value
+}
+
+// charsetCollationEqual reports whether two columns have the same effective
+// charset and collation given their owning tables' defaults. Equality is
+// decided on the RESOLVED values, not the written ones: a column that
+// inherits its table default and a column that matches a *different* default
+// on the other table are genuinely different columns, and since a
+// table-level DEFAULT CHARSET / COLLATE clause only affects columns added
+// later, converging them requires a MODIFY COLUMN in the same ALTER as the
+// table-option change.
+//
+// Each attribute is compared strictly when both sides resolve to a concrete
+// value. When a side is underdetermined (see resolvedCharsetCollation), that
+// attribute falls back to comparing the written values with redundant
+// table-default spellings normalized away — an unexpressed preference is
+// treated as a match rather than guessed at, which keeps the diff from
+// emitting a MODIFY it could never prove converged.
+func charsetCollationEqual(a, b *Column, source, target *CreateTable, opts *DiffOptions) bool {
+	if !charsetCarryingTypes[strings.ToLower(a.Type)] {
+		// Non-character types have no table default to inherit, so compare
+		// the written values directly.
+		return ptrEqual(a.Charset, b.Charset) && ptrEqual(a.Collation, b.Collation)
+	}
+
+	// IgnoreCharsetCollation suppresses the table-option diff, so the table
+	// defaults it ignores must not leak into the column comparison through
+	// resolution either — a column inheriting a difference between the two
+	// (ignored) table defaults is not a column change in this mode. Explicit
+	// column-level differences are still compared by the written-value
+	// comparisons below.
+	sourceCharset, sourceCollation := "", ""
+	targetCharset, targetCollation := "", ""
+	if !opts.IgnoreCharsetCollation {
+		sourceCharset, sourceCollation = resolvedCharsetCollation(a, source)
+		targetCharset, targetCollation = resolvedCharsetCollation(b, target)
+	}
+
+	if sourceCharset != "" && targetCharset != "" {
+		if sourceCharset != targetCharset {
+			return false
+		}
+	} else if !ptrEqual(
+		explicitUnlessTableDefault(a.Charset, source.TableOptions.getCharset()),
+		explicitUnlessTableDefault(b.Charset, target.TableOptions.getCharset()),
+	) {
+		return false
+	}
+
+	if sourceCollation != "" && targetCollation != "" {
+		return sourceCollation == targetCollation
+	}
+	return ptrEqual(
+		explicitUnlessTableDefault(a.Collation, source.TableOptions.getCollation()),
+		explicitUnlessTableDefault(b.Collation, target.TableOptions.getCollation()),
+	)
 }
 
 // getPrimaryKeyIndex returns the PRIMARY KEY index if it exists (table-level PK), nil otherwise
