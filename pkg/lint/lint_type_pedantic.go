@@ -51,7 +51,7 @@ type TypePedanticLinter struct {
 
 func (l *TypePedanticLinter) Name() string { return "type_pedantic" }
 func (l *TypePedanticLinter) Description() string {
-	return "Cross-table column type consistency: same-name columns and inferred {table}_id foreign keys should match types"
+	return "Cross-table column consistency: same-name columns and inferred {table}_id foreign keys should match types and collations"
 }
 func (l *TypePedanticLinter) String() string { return Stringer(l) }
 

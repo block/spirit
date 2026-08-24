@@ -212,6 +212,22 @@ func TestPostState_ColumnCharsetCollation(t *testing.T) {
 		require.Equal(t, "utf8mb4_general_ci", *col.Collation)
 	})
 
+	t.Run("distinct COLLATE options in one ALTER do not alias", func(t *testing.T) {
+		// ColumnDef.Options is a slice of *ColumnOption, so &opt.StrValue
+		// addresses a field inside a distinct heap object per option — no
+		// iteration can overwrite another's value.
+		fix, err := statement.New("ALTER TABLE t1 ADD COLUMN x VARCHAR(50) COLLATE utf8mb4_bin, ADD COLUMN y VARCHAR(50) COLLATE utf8mb4_general_ci")
+		require.NoError(t, err)
+		post := findTable(PostState([]*statement.CreateTable{existing}, fix), "t1")
+		require.NotNil(t, post)
+		for name, want := range map[string]string{"x": "utf8mb4_bin", "y": "utf8mb4_general_ci"} {
+			col := post.Columns.ByName(name)
+			require.NotNil(t, col, "column %s", name)
+			require.NotNil(t, col.Collation, "column %s", name)
+			require.Equal(t, want, *col.Collation, "column %s", name)
+		}
+	})
+
 	t.Run("bare COLLATE option", func(t *testing.T) {
 		fix, err := statement.New("ALTER TABLE t1 ADD COLUMN n2 VARCHAR(50) COLLATE utf8mb4_0900_ai_ci")
 		require.NoError(t, err)
