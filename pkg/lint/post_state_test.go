@@ -189,3 +189,37 @@ func TestPostState_MigratedLinters_FixingAltersSilenceWarnings(t *testing.T) {
 		require.Empty(t, linter.Lint([]*statement.CreateTable{existing}, fix))
 	})
 }
+
+// TestPostState_ColumnCharsetCollation verifies that ADD/MODIFY COLUMN carries
+// the column's charset and collation into the post-state column, whether they
+// were written on the type or as a separate COLLATE option. type_pedantic's
+// collation rule reads these, so without them an ALTER that converges a
+// collation would keep reporting the violation it fixes.
+func TestPostState_ColumnCharsetCollation(t *testing.T) {
+	existing, err := statement.ParseCreateTable("CREATE TABLE t1 (id INT PRIMARY KEY, n VARCHAR(50)) DEFAULT CHARSET=latin1")
+	require.NoError(t, err)
+
+	t.Run("charset and collation on the type", func(t *testing.T) {
+		fix, err := statement.New("ALTER TABLE t1 MODIFY COLUMN n VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+		require.NoError(t, err)
+		post := findTable(PostState([]*statement.CreateTable{existing}, fix), "t1")
+		require.NotNil(t, post)
+		col := post.Columns.ByName("n")
+		require.NotNil(t, col)
+		require.NotNil(t, col.Charset)
+		require.Equal(t, "utf8mb4", *col.Charset)
+		require.NotNil(t, col.Collation)
+		require.Equal(t, "utf8mb4_general_ci", *col.Collation)
+	})
+
+	t.Run("bare COLLATE option", func(t *testing.T) {
+		fix, err := statement.New("ALTER TABLE t1 ADD COLUMN n2 VARCHAR(50) COLLATE utf8mb4_0900_ai_ci")
+		require.NoError(t, err)
+		post := findTable(PostState([]*statement.CreateTable{existing}, fix), "t1")
+		require.NotNil(t, post)
+		col := post.Columns.ByName("n2")
+		require.NotNil(t, col)
+		require.NotNil(t, col.Collation)
+		require.Equal(t, "utf8mb4_0900_ai_ci", *col.Collation)
+	})
+}

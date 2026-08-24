@@ -181,3 +181,29 @@ func BenchmarkGetCharsetDesc(b *testing.B) {
 		_, _ = GetCharsetInfo(cs)
 	}
 }
+
+func TestMySQLDefaultCollation(t *testing.T) {
+	tests := []struct {
+		cs string
+		co string
+		ok bool
+	}{
+		// Where it deliberately differs from GetDefaultCollation, which
+		// reports this parser's legacy *_bin defaults.
+		{"utf8mb4", "utf8mb4_0900_ai_ci", true},
+		{"UTF8MB4", "utf8mb4_0900_ai_ci", true},
+		{"latin1", "latin1_swedish_ci", true},
+		{"ascii", "ascii_general_ci", true},
+		{"utf8", "utf8_general_ci", true},
+		{"utf8mb3", "utf8_general_ci", true},
+		{"binary", "binary", true},
+		{"utf16", "utf16_general_ci", true},
+		{"invalid_cs", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		co, ok := MySQLDefaultCollation(tt.cs)
+		require.Equal(t, tt.ok, ok, "charset %q", tt.cs)
+		require.Equal(t, tt.co, co, "charset %q", tt.cs)
+	}
+}

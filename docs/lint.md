@@ -91,7 +91,7 @@ These linters enforce organizational standards and best practices:
 | `name_case` | Ensures table names are lowercase |
 | `redundant_indexes` | Detects duplicate or unnecessary indexes |
 | `reserved_words` | Warns about MySQL reserved words in identifiers |
-| `type_pedantic` | Enforces cross-table type consistency for same-name columns and inferred `{table}_id` foreign keys |
+| `type_pedantic` | Enforces cross-table type and collation consistency for same-name columns and inferred `{table}_id` foreign keys |
 
 ## Violation Severity
 

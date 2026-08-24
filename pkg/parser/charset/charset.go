@@ -102,6 +102,28 @@ func GetDefaultCollation(charset string) (string, error) {
 	return cs.DefaultCollation, nil
 }
 
+// MySQLDefaultCollation returns the collation MySQL 8.0+ applies to a charset
+// that is used without an explicit COLLATE clause, and whether cs is a charset
+// this parser knows.
+//
+// It deliberately does not go through GetCharsetInfo/GetDefaultCollation: those
+// consult CharacterSetInfos first, which carries the *_bin defaults inherited
+// from this parser's upstream (utf8mb4 -> utf8mb4_bin). MySQL's own default for
+// utf8mb4 is utf8mb4_0900_ai_ci, which is what the charsets registry records,
+// so callers that need to reason about what a live server would do must read
+// that registry directly. Legacy utf8_* spellings are returned as-is; see
+// utf8Alias.
+func MySQLDefaultCollation(cs string) (string, bool) {
+	cs = strings.ToLower(cs)
+	if cs == CharsetUTF8MB3 {
+		cs = CharsetUTF8
+	}
+	if c, ok := charsets[cs]; ok {
+		return c.DefaultCollation, true
+	}
+	return "", false
+}
+
 // GetCharsetInfo returns charset and collation for cs as name.
 func GetCharsetInfo(cs string) (*Charset, error) {
 	if strings.ToLower(cs) == CharsetUTF8MB3 {

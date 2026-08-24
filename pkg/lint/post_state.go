@@ -360,6 +360,18 @@ func columnFromAst(colDef *ast.ColumnDef) statement.Column {
 	}
 	if colDef.Tp != nil {
 		col.Type = types.TypeStr(colDef.Tp.GetType())
+		// Charset/collation come off the type first and may be overridden by a
+		// COLLATE option below — the same order CreateTable.parseColumn uses,
+		// so a MODIFY/CHANGE COLUMN that converges a collation is visible to
+		// type_pedantic's collation rule. Spatial and VECTOR types carry a
+		// synthetic "binary" charset here that parseColumn's normalizer would
+		// strip; nothing reads charset for those types, so it is left alone.
+		if charset := colDef.Tp.GetCharset(); charset != "" {
+			col.Charset = &charset
+		}
+		if collation := colDef.Tp.GetCollate(); collation != "" {
+			col.Collation = &collation
+		}
 	}
 	for _, opt := range colDef.Options {
 		switch opt.Tp { //nolint:exhaustive
@@ -367,6 +379,10 @@ func columnFromAst(colDef *ast.ColumnDef) statement.Column {
 			col.PrimaryKey = true
 		case ast.ColumnOptionUniqKey:
 			col.Unique = true
+		case ast.ColumnOptionCollate:
+			if opt.StrValue != "" {
+				col.Collation = &opt.StrValue
+			}
 		}
 	}
 	return col

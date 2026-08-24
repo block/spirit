@@ -561,24 +561,38 @@ violations, err := lint.RunLinters(tables, stmts, lint.Config{
 
 ### type_pedantic
 
-**Severity**: Warning (same-name rule), Error (inferred FK rule) — both configurable  
+**Severity**: Warning for all three rules — each configurable separately  
 **Configurable**: Yes  
 **Checks**: CREATE TABLE, ALTER TABLE (ADD/MODIFY/CHANGE/DROP COLUMN, ADD/DROP INDEX)
 
-Cross-table column type consistency checks. Unlike most linters in this package, `type_pedantic` looks at the entire schema rather than a single table — it needs the full set of `existingTables` to spot inconsistencies. The linter operates on a **post-state view** of the schema: existing tables with pending CREATE TABLE and ALTER TABLE changes applied, so it's useful both for whole-schema audits (`spirit lint --source-dir`) and for ALTER-driven migration flows. Two rules are bundled:
+Cross-table column type consistency checks. Unlike most linters in this package, `type_pedantic` looks at the entire schema rather than a single table — it needs the full set of `existingTables` to spot inconsistencies. The linter operates on a **post-state view** of the schema: existing tables with pending CREATE TABLE and ALTER TABLE changes applied, so it's useful both for whole-schema audits (`spirit lint --source-dir`) and for ALTER-driven migration flows. Three rules are bundled:
 
 **Rule 1 — Same-name columns must match types.** Columns sharing a name across tables (e.g. `customer_id` in both `orders` and `returns`) should use the same MySQL type, including signedness and width. When one type clearly dominates the schema, the minority occurrences are flagged against that majority. When the top counts are tied (e.g. 2 BIGINT vs 2 INT), every occurrence is flagged as "inconsistent" with the conflicting types listed — the linter doesn't silently pick a winner by alphabet. By default `id` is excluded, since `id` is intentionally typed differently across unrelated tables in many schemas — use the `primary_key` linter for PK type enforcement. By default Rule 1 also fires only when at least one table in the column-name group indexes the column (see `requireIndexed` below for the rationale).
 
-**Rule 2 — Inferred foreign keys must match the referenced `id` type.** A column named `{table}_id` is treated as an implicit foreign key to `{table}.id`. The linter tries the literal base name and English pluralizations: `base+s`, `base+es` for sibilant- and o-stems (so `address_id → addresses`, `process_id → processes`, `bus_id → buses`, `tomato_id → tomatoes`), and `base[:-1]+ies` for y-stems (so `category_id → categories`). Mismatches default to an Error because JOINs across mismatched types force implicit casts and prevent index use. `requireIndexed` does not gate this rule — the referenced `id` is always indexed. The suggestion advises growing the smaller side rather than shrinking the larger, since the underlying problem is often an undersized PK on the target.
+**Rule 2 — Inferred foreign keys must match the referenced `id` type.** A column named `{table}_id` is treated as an implicit foreign key to `{table}.id`. The linter tries the literal base name and English pluralizations: `base+s`, `base+es` for sibilant- and o-stems (so `address_id → addresses`, `process_id → processes`, `bus_id → buses`, `tomato_id → tomatoes`), and `base[:-1]+ies` for y-stems (so `category_id → categories`). Mismatches are flagged because JOINs across mismatched types force implicit casts and prevent index use. `requireIndexed` does not gate this rule — the referenced `id` is always indexed. The suggestion advises growing the smaller side rather than shrinking the larger, since the underlying problem is often an undersized PK on the target. Note that `ignoreColumns` applies to the *referencing* column (`customer_id`), not to the target's `id` — an ignored `id` is still compared against as an FK target.
+
+**Rule 3 — Text columns compared across tables must collate the same way.** Both rules above also compare the *effective* collation of text columns (`CHAR`, `VARCHAR`, `TEXT`, `ENUM`, `SET`), reported under the rule names `same_name_collation` and `inferred_fk_collation`. A collation difference breaks a join just as thoroughly as a type difference, and in two distinct ways, which the message distinguishes:
+
+- **Different charsets** (`latin1` vs `utf8mb4`): MySQL implicitly converts one side, which prevents index use — the same cost as a type-width mismatch.
+- **Same charset, different collations** (`utf8mb4_general_ci` vs `utf8mb4_0900_ai_ci`): the comparison fails outright with `ERROR 1267 (Illegal mix of collations)`, since two equally-coercible column references cannot be unified.
+
+One vote covers both, because collation names are charset-prefixed: a charset difference always shows up as a collation difference too. Effective collation is resolved the way MySQL resolves it — an explicit column `COLLATE` wins, an explicit column `CHARACTER SET` takes that charset's default collation, and a column with neither inherits the table's options — and then the charset's *default* collation is filled in when no `COLLATE` was written anywhere. That last step is what makes the rule useful: `SHOW CREATE TABLE` omits `COLLATE` whenever it is the charset default, so `DEFAULT CHARSET=utf8mb4` really means `utf8mb4_0900_ai_ci` and must compare unequal to a table that spells `COLLATE=utf8mb4_general_ci`. This needs no server round-trip — a charset used without a collation takes that charset's default, and `collation_server` does not enter into it.
+
+Hand-written DDL that declares no charset at all (only reachable via `--source-dir`; `SHOW CREATE TABLE` always emits one) is compared as if it declared `assumeCharset`, `utf8mb4` by default. **Why:** without a stand-in, such a table drops out of its comparison group, so *deleting* a table's `DEFAULT CHARSET` line silences the warning the schema had a moment ago — a group left with one determined column has nothing to disagree about. Set `assumeCharset` to your schema's real default, or to `""` to compare only what the DDL states. Columns that carry no charset (numeric, date, binary, JSON, spatial) are always skipped, as are text columns whose declared charset the parser doesn't recognize — there is no default to look up for those, and assuming one would compare a real declaration against a guess.
+
+A column can be flagged on both axes at once — a `VARCHAR(32) CHARACTER SET latin1` pointing at a `VARCHAR(64)` utf8mb4 `id` produces one type violation and one collation violation, each precise about its own axis.
 
 **Configuration Options:**
 
 - `checkSameName` (string `"true"`/`"false"`): Enable Rule 1. Default: `"true"`.
 - `checkInferredFK` (string `"true"`/`"false"`): Enable Rule 2. Default: `"true"`.
-- `requireIndexed` (string `"true"`/`"false"`): Restrict Rule 1 to column-name groups where at least one occurrence is indexed (any position in any index, including inline column-level `PRIMARY KEY`/`UNIQUE`). Default: `"true"`. **Why:** the real cost of a type mismatch is on JOINs and lookups, where mismatched types force implicit casts and prevent index use. On unindexed columns the schema isn't paying that cost in the first place, so flagging them is mostly false positives — incidental name collisions on scalars like `status`, `name`, or `value` that happen to share a name across unrelated tables.
+- `checkCollation` (string `"true"`/`"false"`): Enable Rule 3, the collation comparison inside whichever of Rules 1 and 2 are enabled. Default: `"true"`.
+- `assumeCharset` (string): Charset to compare a table by when its DDL declares neither a charset nor a collation. Default: `"utf8mb4"`, MySQL 8.0's own compiled-in default. `""` disables the fallback and skips such tables; an unknown charset name is a configuration error.
+- `requireIndexed` (string `"true"`/`"false"`): Restrict Rule 1 to column-name groups where at least one occurrence is indexed (any position in any index, including inline column-level `PRIMARY KEY`/`UNIQUE`). Default: `"true"`. **Why:** the real cost of a type mismatch is on JOINs and lookups, where mismatched types force implicit casts and prevent index use. On unindexed columns the schema isn't paying that cost in the first place, so flagging them is mostly false positives — incidental name collisions on scalars like `status`, `name`, or `value` that happen to share a name across unrelated tables. This gates Rule 3's same-name comparison too.
 - `ignoreColumns` (string): Comma-separated column names (case-insensitive) excluded from **both** rules. Default: `"id"`.
-- `fkSeverity` (string `"error"`/`"warning"`/`"info"`): Severity for Rule 2 violations. Default: `"error"`.
+- `fkSeverity` (string `"error"`/`"warning"`/`"info"`): Severity for Rule 2 violations. Default: `"warning"`.
 - `sameNameSeverity` (string `"error"`/`"warning"`/`"info"`): Severity for Rule 1 violations. Default: `"warning"`.
+- `collationSeverity` (string `"error"`/`"warning"`/`"info"`): Severity for Rule 3 violations, from either rule. Default: `"warning"`.
 
 **Examples:**
 
@@ -592,7 +606,14 @@ CREATE TABLE returns  (id BIGINT UNSIGNED PRIMARY KEY, customer_id INT);
 -- Rule 2: inferred FK mismatch
 CREATE TABLE customers (id BIGINT UNSIGNED PRIMARY KEY);
 CREATE TABLE orders    (id BIGINT UNSIGNED PRIMARY KEY, customer_id INT UNSIGNED);
--- ❌ orders.customer_id (INT UNSIGNED) doesn't match customers.id (BIGINT UNSIGNED)
+-- ⚠️ orders.customer_id (INT UNSIGNED) doesn't match customers.id (BIGINT UNSIGNED)
+
+-- Rule 3: collation mismatch with identical types
+CREATE TABLE customers (id VARCHAR(64) PRIMARY KEY) DEFAULT CHARSET=utf8mb4;
+CREATE TABLE orders    (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64))
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+-- ⚠️ orders.customer_id collates utf8mb4_general_ci, customers.id utf8mb4_0900_ai_ci
+--    → the join fails with ERROR 1267 even though both are VARCHAR(64)
 ```
 
 **Configuration Example:**
@@ -601,10 +622,13 @@ CREATE TABLE orders    (id BIGINT UNSIGNED PRIMARY KEY, customer_id INT UNSIGNED
 violations, err := lint.RunLinters(tables, stmts, lint.Config{
     Settings: map[string]map[string]string{
         "type_pedantic": {
-            "ignoreColumns":   "id,created_at,updated_at",
-            "fkSeverity":      "warning", // downgrade FK rule to a warning
-            "requireIndexed":  "false",   // also lint unindexed columns (noisier)
-            "checkSameName":   "false",   // disable Rule 1 entirely
+            "ignoreColumns":     "id,created_at,updated_at",
+            "fkSeverity":        "error",   // upgrade FK rule to an error
+            "requireIndexed":    "false",   // also lint unindexed columns (noisier)
+            "checkSameName":     "false",   // disable Rule 1 entirely
+            "checkCollation":    "false",   // skip collation comparisons
+            "collationSeverity": "info",    // or just quieten them
+            "assumeCharset":     "latin1",  // what a table with no DEFAULT CHARSET means
         },
     },
 })
@@ -770,7 +794,7 @@ Detects column renames via RENAME COLUMN or CHANGE COLUMN. Column renames cannot
 | `redundant_indexes` | ❌ | ✅ | ❌ | Warning |
 | `rename_column` | ❌ | ❌ | ✅ | Error |
 | `reserved_words` | ❌ | ✅ | ✅ | Warning |
-| `type_pedantic` | ✅ | ✅ | ✅ | Warning / Error |
+| `type_pedantic` | ✅ | ✅ | ✅ | Warning |
 | `unsafe` | ✅ | ❌ | ✅ | Warning |
 | `zero_date` | ❌ | ✅ | ✅ | Warning |
 
