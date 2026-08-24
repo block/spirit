@@ -630,6 +630,7 @@ func TestTypePedantic_SameName_CollationMismatchAgainstImpliedDefault(t *testing
 	require.Equal(t, "utf8mb4_0900_ai_ci", v.Context["expected_collation"])
 	require.Equal(t, false, v.Context["charset_differs"])
 	require.Contains(t, v.Message, "ERROR 1267", "same charset, different collation is a hard error, not just slow")
+	require.NotContains(t, v.Message, "different charsets", "the charsets match here")
 }
 
 func TestTypePedantic_SameName_CharsetMismatchWording(t *testing.T) {
@@ -782,11 +783,48 @@ func TestTypePedantic_SameName_CollationTieEmitsForAll(t *testing.T) {
 	require.Len(t, flagged, 2)
 	for _, v := range flagged {
 		require.Contains(t, v.Message, "inconsistent across schema")
+		require.Contains(t, v.Message, "different charsets",
+			"a tie is the most common mixed-charset shape; it needs the consequence too")
+		require.Contains(t, v.Message, "ERROR 1267")
 		require.Equal(t,
 			[]string{"latin1_swedish_ci", "utf8mb4_0900_ai_ci"},
 			v.Context["conflicting_collations"],
 		)
 	}
+}
+
+func TestTypePedantic_SameName_CollationTieSameCharsetConsequence(t *testing.T) {
+	// Tied, but both sides are utf8mb4: only the ERROR 1267 outcome applies.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2)
+	for _, v := range flagged {
+		require.Contains(t, v.Message, "ERROR 1267")
+		require.NotContains(t, v.Message, "different charsets")
+	}
+}
+
+func TestTypePedantic_SameName_NonConvertibleCharsetsAreNotUnderstated(t *testing.T) {
+	// latin1 and latin2: neither is a superset of the other, so MySQL has
+	// nothing to convert to and the join fails with ERROR 1267 rather than
+	// merely losing an index. Verified on 8.0.46. The wording has to name
+	// that outcome, not just the index-degradation one.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, code VARCHAR(64), KEY k (code)) DEFAULT CHARSET=latin1`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, code VARCHAR(64), KEY k (code)) DEFAULT CHARSET=latin2`,
+		`CREATE TABLE c (id BIGINT UNSIGNED PRIMARY KEY, code VARCHAR(64), KEY k (code)) DEFAULT CHARSET=latin2`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 1, "latin1 is the minority")
+	v := flagged[0]
+	require.Equal(t, "a", v.Location.Table)
+	require.Equal(t, true, v.Context["charset_differs"])
+	require.Contains(t, v.Message, "ERROR 1267",
+		"latin1/latin2 do not convert, so this is a hard failure — not a performance nit")
+	require.Contains(t, v.Message, "prevents index use on the narrower side")
 }
 
 func TestTypePedantic_InferredFK_CollationMismatch(t *testing.T) {

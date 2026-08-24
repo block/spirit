@@ -573,8 +573,11 @@ Cross-table column type and collation consistency checks. Unlike most linters in
 
 **Rule 3 — Text columns compared across tables must collate the same way.** Both rules above also compare the *effective* collation of text columns (`CHAR`, `VARCHAR`, `TEXT`, `ENUM`, `SET`), reported under the rule names `same_name_collation` and `inferred_fk_collation`. A collation difference breaks a join just as thoroughly as a type difference, and in two distinct ways, which the message distinguishes:
 
-- **Different charsets** (`latin1` vs `utf8mb4`): MySQL implicitly converts one side, which prevents index use — the same cost as a type-width mismatch.
-- **Same charset, different collations** (`utf8mb4_general_ci` vs `utf8mb4_0900_ai_ci`): the comparison fails outright with `ERROR 1267 (Illegal mix of collations)`, since two equally-coercible column references cannot be unified.
+- **Different charsets, one convertible to the other** (`latin1` vs `utf8mb4`): MySQL converts the narrower side, so the index on *that* side goes unused — the same cost as a type-width mismatch. The wider side's index still gets used.
+- **Different charsets, neither convertible** (`latin1` vs `latin2`): there is no common charset to convert to, so the comparison fails outright with `ERROR 1267 (Illegal mix of collations)` — the same hard failure as the case below, not a performance problem.
+- **Same charset, different collations** (`utf8mb4_general_ci` vs `utf8mb4_0900_ai_ci`): the comparison fails with `ERROR 1267`, since two equally-coercible column references cannot be unified.
+
+Which of the first two applies depends on MySQL's charset-superset table, which the linter doesn't reproduce, so a charset mismatch is reported with wording that names both outcomes rather than claiming the milder one.
 
 One vote covers both, because collation names are charset-prefixed: a charset difference always shows up as a collation difference too. Effective collation is resolved the way MySQL resolves it — an explicit column `COLLATE` wins, an explicit column `CHARACTER SET` takes that charset's default collation, and a column with neither inherits the table's options — and then the charset's *default* collation is filled in when no `COLLATE` was written anywhere. That last step is what makes the rule useful: `SHOW CREATE TABLE` omits `COLLATE` whenever it is the charset default, so `DEFAULT CHARSET=utf8mb4` really means `utf8mb4_0900_ai_ci` and must compare unequal to a table that spells `COLLATE=utf8mb4_general_ci`. This needs no server round-trip — a charset used without a collation takes that charset's default, and `collation_server` does not enter into it.
 

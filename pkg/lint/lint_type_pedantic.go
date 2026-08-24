@@ -243,11 +243,34 @@ func (l *TypePedanticLinter) tpEffectiveCollation(t *statement.CreateTable, col 
 
 // tpCollationConsequence explains what a collation difference costs, which
 // depends on whether the charsets differ too.
+//
+// Differing charsets have two possible outcomes and the wording has to cover
+// both. When one charset converts to the other, MySQL converts and the index
+// on the wider side survives — it is the narrower side's index that goes
+// unused. When neither is a superset of the other (latin1 vs latin2, say)
+// there is nothing to convert to, and the comparison fails with ERROR 1267
+// exactly like the same-charset case. Deciding which applies would mean
+// reproducing MySQL's charset-superset table, so one sentence names both
+// rather than claiming the milder one.
 func tpCollationConsequence(charsetA, charsetB string) string {
 	if charsetA != charsetB {
-		return "joining columns with different charsets forces an implicit conversion that prevents index use"
+		return "joining columns with different charsets forces an implicit conversion — it prevents index use on the narrower side, and fails outright with ERROR 1267 (Illegal mix of collations) when neither charset converts to the other"
 	}
 	return "comparing columns with different collations of the same charset fails with ERROR 1267 (Illegal mix of collations)"
+}
+
+// tpTieConsequence is tpCollationConsequence for a tied vote, where more than
+// two collations may be in play. Any pair of differing charsets in the set
+// gives the group its consequence; if they all share one charset, the
+// same-charset wording applies.
+func tpTieConsequence(distinct []string, charsetOf map[string]string) string {
+	first := charsetOf[distinct[0]]
+	for _, collation := range distinct[1:] {
+		if charsetOf[collation] != first {
+			return tpCollationConsequence(first, charsetOf[collation])
+		}
+	}
+	return tpCollationConsequence(first, first)
 }
 
 func (l *TypePedanticLinter) Lint(existingTables []*statement.CreateTable, changes []*statement.AbstractStatement) (violations []Violation) {
@@ -478,14 +501,18 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 	// Tied top counts — same reasoning as the type rule: report every
 	// occurrence rather than picking a winner alphabetically.
 	distinct := slices.Sorted(maps.Keys(counts))
+	// A tie is what the most ordinary mixed-charset legacy schema produces —
+	// one latin1 table, one utf8mb4 table, no majority — so it needs the
+	// consequence clause just as much as the majority branch.
+	consequence := tpTieConsequence(distinct, charsetOf)
 	for _, r := range determined {
 		colName := r.col.Name
 		violations = append(violations, Violation{
 			Linter:   l,
 			Severity: l.collationSeverity,
 			Message: fmt.Sprintf(
-				"Column %q in table %q uses collation %q; inconsistent across schema (collations in use: %s)",
-				r.col.Name, r.table.TableName, r.collation, strings.Join(distinct, ", "),
+				"Column %q in table %q uses collation %q; inconsistent across schema (collations in use: %s) — %s",
+				r.col.Name, r.table.TableName, r.collation, strings.Join(distinct, ", "), consequence,
 			),
 			Location:   &Location{Table: r.table.TableName, Column: &colName},
 			Suggestion: new(fmt.Sprintf("Pick one canonical collation for column %q across all tables", r.col.Name)),
