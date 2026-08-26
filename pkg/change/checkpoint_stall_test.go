@@ -156,6 +156,7 @@ func TestInFlightBandStillDeferred(t *testing.T) {
 // clients gate their position advance on the same allChangesFlushed result, so
 // the stall — and the fix — are source-agnostic.
 func TestCheckpointStallPreFirstChunkGTID(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
