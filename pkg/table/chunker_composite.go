@@ -596,6 +596,31 @@ func (t *chunkerComposite) KeyBelowLowWatermark(key0 any) bool {
 	return below
 }
 
+// KeyNotYetDispatched satisfies MappedChunker. See the interface docs.
+func (t *chunkerComposite) KeyNotYetDispatched(key0 any) bool {
+	t.Lock()
+	defer t.Unlock()
+	if t.finalChunkSent {
+		return false
+	}
+	if len(t.chunkPtrs) == 0 {
+		return true
+	}
+	keyDatum, err := NewDatum(key0, t.chunkPtrs[0].Tp)
+	if err != nil {
+		t.logger.Error("failed to create keyDatum in KeyNotYetDispatched", "key", key0, "error", err)
+		return false
+	}
+	// Only a strictly greater key[0] guarantees the whole tuple sorts above
+	// every dispatched chunk — same reasoning as KeyAboveHighWatermark.
+	above, err := keyDatum.GreaterThan(t.chunkPtrs[0])
+	if err != nil {
+		t.logger.Error("comparing chunkPtrs[0] in KeyNotYetDispatched", "error", err)
+		return false
+	}
+	return above
+}
+
 // SetKey allows you to chunk on a secondary index, and not the primary key.
 // This is useful outside of the context of spirit, when the table package
 // is used directly. It is only supported by the composite chunker,

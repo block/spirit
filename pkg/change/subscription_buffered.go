@@ -747,12 +747,12 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 	}
 
 	for key, change := range snapshot {
-		// The low-watermark check defers flushing keys that are still
-		// being copied (KeyBelowLowWatermark returns false). The chunker
-		// is internally synchronized, so no Mutex is needed here.
-		if applyWatermarkFilter && !s.chunker.KeyBelowLowWatermark(change.originalKey[0]) {
+		// Keys the copier may have a read in flight for are deferred to a
+		// later flush; see mustDeferKey. The chunker is internally
+		// synchronized, so no Mutex is needed here.
+		if applyWatermarkFilter && s.mustDeferKey(change.originalKey[0]) {
 			s.keysSkippedBelow.Add(1)
-			s.logger.Debug("key not below watermark", "key", change.originalKey[0])
+			s.logger.Debug("key deferred: copier read in flight", "key", change.originalKey[0])
 			allChangesFlushed = false
 			continue
 		}
@@ -947,13 +947,13 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 	applyWatermarkFilter := !underLock && !bypassWatermark && s.watermarkOptimizationEnabled()
 
 	for key, change := range s.changes {
-		// In bufferedMap, the low-watermark check defers flushing keys that
-		// are still being copied (KeyBelowLowWatermark returns false). It is
-		// only safe to skip when we are not under cutover lock and the caller
-		// has not asked us to drain everything (bypassWatermark).
-		if applyWatermarkFilter && !s.chunker.KeyBelowLowWatermark(change.originalKey[0]) {
+		// In bufferedMap, keys the copier may have a read in flight for are
+		// deferred to a later flush (see mustDeferKey). It is only safe to
+		// skip when we are not under cutover lock and the caller has not
+		// asked us to drain everything (bypassWatermark).
+		if applyWatermarkFilter && s.mustDeferKey(change.originalKey[0]) {
 			s.keysSkippedBelow.Add(1)
-			s.logger.Debug("key not below watermark", "key", change.originalKey[0])
+			s.logger.Debug("key deferred: copier read in flight", "key", change.originalKey[0])
 			allChangesFlushed = false
 			continue
 		}
@@ -1114,6 +1114,28 @@ func (s *bufferedMap) flushQueueLocked(ctx context.Context, underLock bool, lock
 		s.cond.Broadcast()
 	}
 	return nil
+}
+
+// mustDeferKey reports whether a buffered change for key0 has to sit out this
+// flush because the copier may have a read in flight for it.
+//
+// Only the *in-flight band* has to wait:
+//
+//	[ copied & committed ) [ dispatched, not yet committed ) [ not dispatched )
+//	        flush now                    defer                    flush now
+//
+// The right-hand region is what KeyNotYetDispatched adds. Deferring it too
+// (the pre-fix behaviour) is what pinned the checkpoint's binlog position for
+// a whole copy: every change buffered before the copier dispatched its first
+// chunk — the window between SetWatermarkOptimization(true) and the first
+// chunker.Next(), which the throttler can stretch arbitrarily — sits above the
+// low watermark until the copier physically reaches its key, and one such
+// entry is enough to make every flush report allChangesFlushed=false.
+func (s *bufferedMap) mustDeferKey(key0 any) bool {
+	if s.chunker.KeyBelowLowWatermark(key0) {
+		return false // already copied and committed
+	}
+	return !s.chunker.KeyNotYetDispatched(key0)
 }
 
 // watermarkOptimizationEnabled returns true if the watermark optimization

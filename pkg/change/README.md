@@ -198,14 +198,33 @@ The copier maintains a "watermark" representing its progress. The replication cl
 - **Low watermark**: Skip changes for rows that are currently being copied (avoid races with the copier, which may cause deadlocks/lock waits)
 
 ```go
+// Ingest time (HasChanged): drop what the copier is guaranteed to pick up.
 if chunker.KeyAboveHighWatermark(key[0]) {
     return  // Skip, copier will handle this
 }
 
-if !chunker.KeyBelowLowWatermark(key[0]) {
+// Flush time (bufferedMap.mustDeferKey): defer only the in-flight band.
+if !chunker.KeyBelowLowWatermark(key[0]) && !chunker.KeyNotYetDispatched(key[0]) {
     continue  // Skip, copier is actively working on this range
 }
 ```
+
+Note the flush-time filter has two halves. A buffered change is safe to apply
+both when the copier has already committed its key (`KeyBelowLowWatermark`)
+**and** when the copier has not yet dispatched a chunk covering it
+(`KeyNotYetDispatched`) — in the latter case the copier's later read observes a
+source state at least as new as the change and overwrites it. Only the band
+between them, where a chunk read is genuinely in flight, has to wait.
+
+Deferring the not-yet-dispatched region too (the behaviour before
+[#1169](https://github.com/block/spirit/pull/1169)) pinned the checkpoint's
+binlog position for entire copies: `KeyAboveHighWatermark` returns `false`
+until the first chunk is dispatched, so every change in the window between
+`SetWatermarkOptimization(true)` and the first `chunker.Next()` — a window the
+throttler can stretch arbitrarily — was buffered, including changes to rows at
+the top of the key space. Those entries stay above the low watermark until the
+copier physically reaches their key, and a single one is enough to make every
+flush report `allChangesFlushed=false`.
 
 **Important:** The watermark optimization is disabled before the final cutover to ensure all changes are applied regardless of the copier's position.
 

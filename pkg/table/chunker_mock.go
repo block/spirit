@@ -304,6 +304,27 @@ func (m *MockChunker) KeyBelowLowWatermark(key any) bool {
 	return keyPos < m.currentPosition
 }
 
+// KeyNotYetDispatched reports whether the mock chunker has yet to hand out a
+// chunk covering key. Mirrors KeyAboveHighWatermark's comparison; ambiguous
+// keys return false so the caller keeps deferring.
+func (m *MockChunker) KeyNotYetDispatched(key any) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var keyPos uint64
+	switch v := key.(type) {
+	case int:
+		keyPos = uint64(v)
+	case uint64:
+		keyPos = v
+	case int64:
+		keyPos = uint64(v)
+	default:
+		return false
+	}
+	return keyPos > m.currentPosition
+}
+
 func (m *MockChunker) RowsCopied() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()

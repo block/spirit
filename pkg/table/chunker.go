@@ -99,6 +99,20 @@ type MappedChunker interface {
 	ColumnMapping() *ColumnMapping
 	KeyAboveHighWatermark(key0 any) bool
 	KeyBelowLowWatermark(key0 any) bool
+	// KeyNotYetDispatched reports whether the chunker has definitely not yet
+	// handed out a chunk covering key0. When true, no copier read for that key
+	// is in flight, so a buffered change for it can be flushed immediately:
+	// the copier's later read of the covering chunk observes a source state at
+	// least as new as the change, and overwrites it. It is the flush-time
+	// counterpart of KeyBelowLowWatermark ("already copied and committed") —
+	// between them sits the in-flight band, which is the only region a flush
+	// must defer.
+	//
+	// TRUE means the caller will flush, so any ambiguity must return FALSE.
+	// Unlike KeyAboveHighWatermark this is NOT a discard decision, so it
+	// deliberately ignores checkpointHighPtr: a key copied by a *previous*
+	// run has no read in flight in this one.
+	KeyNotYetDispatched(key0 any) bool
 }
 
 // ChunkerConfig holds optional configuration for creating a Chunker.

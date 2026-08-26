@@ -626,6 +626,32 @@ func (t *chunkerOptimistic) KeyBelowLowWatermark(key0 any) bool {
 	return below
 }
 
+// KeyNotYetDispatched satisfies MappedChunker. See the interface docs.
+func (t *chunkerOptimistic) KeyNotYetDispatched(key0 any) bool {
+	t.Lock()
+	defer t.Unlock()
+	if t.finalChunkSent {
+		// The final chunk is open-bounded, so every remaining key is covered
+		// by a dispatched chunk.
+		return false
+	}
+	if t.chunkPtr.IsNil() {
+		// Nothing dispatched at all: no copier read can be in flight.
+		return true
+	}
+	keyDatum, err := NewDatum(key0, t.chunkPtr.Tp)
+	if err != nil {
+		t.logger.Error("failed to create keyDatum in KeyNotYetDispatched", "key", key0, "error", err)
+		return false
+	}
+	above, err := keyDatum.GreaterThanOrEqual(t.chunkPtr)
+	if err != nil {
+		t.logger.Error("comparing chunkPtr in KeyNotYetDispatched", "error", err)
+		return false
+	}
+	return above
+}
+
 func (t *chunkerOptimistic) Tables() []*TableInfo {
 	if t.NewTi != nil {
 		return []*TableInfo{t.Ti, t.NewTi}
