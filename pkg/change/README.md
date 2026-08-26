@@ -217,7 +217,7 @@ source state at least as new as the change and overwrites it. Only the band
 between them, where a chunk read is genuinely in flight, has to wait.
 
 Deferring the not-yet-dispatched region too (the behaviour before
-[#1169](https://github.com/block/spirit/pull/1169)) pinned the checkpoint's
+[#1167](https://github.com/block/spirit/pull/1167)) pinned the checkpoint's
 binlog position for entire copies: `KeyAboveHighWatermark` returns `false`
 until the first chunk is dispatched, so every change in the window between
 `SetWatermarkOptimization(true)` and the first `chunker.Next()` — a window the
