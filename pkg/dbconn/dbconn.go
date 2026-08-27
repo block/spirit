@@ -161,6 +161,26 @@ func canRetryError(err error) bool {
 	}
 }
 
+// IsLockContentionError reports whether err is InnoDB lock contention: a lock
+// wait timeout (1205) or a deadlock (1213). Both are already covered by
+// canRetryError, but callers that can *adapt* — by backing off harder or by
+// lowering their own write concurrency — need to tell contention apart from
+// the other retryable classes, which no amount of self-throttling would fix.
+//
+// This distinction matters because contention can be self-inflicted. Spirit
+// runs on READ COMMITTED (see conn.go), so concurrent REPLACE batches with
+// disjoint primary keys never gap-conflict on the clustered index. They do
+// still take next-key locks during duplicate-key handling on every *secondary*
+// index, where "disjoint by PK" buys nothing — so a wide enough flush fan-out
+// deadlocks against itself with no external workload at all.
+func IsLockContentionError(err error) bool {
+	val, ok := errors.AsType[*mysql.MySQLError](err)
+	if !ok {
+		return false
+	}
+	return val.Number == errLockWaitTimeout || val.Number == errDeadlock
+}
+
 // DupKeyHandling selects how RetryableTransaction treats duplicate-key (1062)
 // warnings. Copy / INSERT IGNORE paths legitimately expect dup-key warnings
 // (e.g. resume re-inserts); checksum-fix DELETE/REPLACE/UPSERT paths do not and

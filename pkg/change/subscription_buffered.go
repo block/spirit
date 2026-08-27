@@ -1,9 +1,12 @@
 package change
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -193,11 +196,26 @@ type bufferedMap struct {
 	// binlog-retention headroom.
 	flushRequest chan<- Subscription
 
+	// concurrencyPenalty is the number of halvings currently applied to
+	// flushConcurrency by the drain's AIMD controller: the effective limit is
+	// flushConcurrency >> concurrencyPenalty, floored at 1. A drain that hits
+	// lock contention increments it; cleanDrains consecutive clean drains
+	// decrement it. See adaptFlushConcurrency.
+	//
+	// Kept as an atomic rather than under Mutex because
+	// effectiveFlushConcurrency is read at the top of a drain, outside the
+	// short bookkeeping critical sections, and flushMu already serializes
+	// drains against each other.
+	concurrencyPenalty atomic.Int64
+	cleanDrains        atomic.Int64
+
 	// Counters for the bookend log emitted on watermark-optimization transitions.
 	keysAdded        atomic.Int64
 	keysDroppedAbove atomic.Int64
 	keysSkippedBelow atomic.Int64
 	timesParked      atomic.Int64 // HasChanged was parked at least once on the soft limit
+	batchesContended atomic.Int64 // applier batches that failed on 1205/1213
+	serialRecoveries atomic.Int64 // drains rescued by the serial retry pass
 
 	// lastParkWarn is when the park/unpark log pair was last emitted at
 	// Warn/Info level. Since flushes release capacity per batch, a
@@ -450,8 +468,166 @@ func (s *bufferedMap) ImmutableColumnOrdinal() int {
 
 // effectiveFlushConcurrency clamps flushConcurrency to at least 1 so
 // the zero value (out-of-tree callers, bare test maps) stays serial.
+// cleanDrainsToRecover is how many consecutive contention-free drains must
+// pass before the AIMD controller gives a halving back. Recovery is
+// deliberately slower than the decrease: re-entering the pathological state
+// costs a whole flush interval (and, while the checkpoint cannot advance,
+// binlog-retention headroom), whereas running one step under-parallel costs
+// only throughput. Three drains at the default 30s interval is ~90s of proven
+// quiet before stepping back up.
+const cleanDrainsToRecover = 3
+
+// minAdaptiveBatchSize floors the batch shrink. Below roughly this many rows
+// the per-statement round trip dominates and the drain stops keeping up with a
+// busy source, which trades one stall for another.
+const minAdaptiveBatchSize = 50
+
 func (s *bufferedMap) effectiveFlushConcurrency() int {
-	return max(1, s.flushConcurrency)
+	return shiftDown(max(1, s.flushConcurrency), s.concurrencyPenalty.Load(), 1)
+}
+
+// effectiveBatchSize shrinks alongside concurrency, because batch size sets the
+// *lock footprint* of a single REPLACE while concurrency only sets how many of
+// those run at once. Both terms drive the collision probability between sibling
+// batches, so narrowing one and leaving the other is a half measure.
+//
+// A production deadlock dump on a 1000-row batch showed `6803 lock struct(s)
+// ... 6805 row lock(s), undo log entries 1942` held by a single statement that
+// had been ACTIVE 13 sec — roughly one clustered-index lock plus one
+// secondary-index lock per row per index. Every one of those locks is a record
+// a sibling batch can block on, for as long as the holder runs.
+func (s *bufferedMap) effectiveBatchSize() int {
+	return shiftDown(DefaultBatchSize, s.concurrencyPenalty.Load(), minAdaptiveBatchSize)
+}
+
+// shiftDown halves start once per penalty step, never going below floor.
+func shiftDown(start int, penalty int64, floor int) int {
+	if penalty <= 0 {
+		return start
+	}
+	if penalty >= 63 { // guard the shift width; the floor applies regardless
+		return floor
+	}
+	return max(floor, start>>penalty)
+}
+
+// adaptFlushConcurrency feeds a completed drain's contention outcome back into
+// the concurrency limit, AIMD-style: multiplicative decrease on contention,
+// additive increase after a run of clean drains.
+//
+// The signal we control on is spirit's *own* lock contention, not server load.
+// That is the whole point: an oversubscribed flush fan-out deadlocks against
+// itself on secondary-index next-key locks while the server still looks idle,
+// so every load-based signal (Threads_running, commit latency, the autoscaler's
+// throttler) reports "healthy" throughout. Nothing else in the process can see
+// this, so the drain has to police its own width.
+//
+// Called from drainMapSnapshot with flushMu held, so the read-modify-write on
+// concurrencyPenalty needs no further synchronization.
+func (s *bufferedMap) adaptFlushConcurrency(contended bool) {
+	configured := max(1, s.flushConcurrency)
+	if contended {
+		s.cleanDrains.Store(0)
+		// Stop halving once the limit is already 1: there is no narrower
+		// setting, and letting the penalty run away would make recovery take
+		// proportionally longer once the contention clears.
+		if s.effectiveFlushConcurrency() > 1 || s.effectiveBatchSize() > minAdaptiveBatchSize {
+			penalty := s.concurrencyPenalty.Add(1)
+			s.logger.Warn("reducing flush concurrency after lock contention",
+				"table", s.table.SchemaName+"."+s.table.TableName,
+				"concurrency", s.effectiveFlushConcurrency(),
+				"batch_size", s.effectiveBatchSize(),
+				"configured", configured,
+				"penalty", penalty,
+			)
+		}
+		return
+	}
+	if s.concurrencyPenalty.Load() <= 0 {
+		return // already at the configured width; nothing to recover
+	}
+	if s.cleanDrains.Add(1) < cleanDrainsToRecover {
+		return
+	}
+	s.cleanDrains.Store(0)
+	s.concurrencyPenalty.Add(-1)
+	s.logger.Info("restoring flush concurrency after clean drains",
+		"table", s.table.SchemaName+"."+s.table.TableName,
+		"concurrency", s.effectiveFlushConcurrency(),
+		"batch_size", s.effectiveBatchSize(),
+		"configured", configured,
+	)
+}
+
+// compareBufferedKeys orders two buffered primary keys component by component,
+// so a drain visits rows in (approximate) clustered-index order instead of Go's
+// randomized map order.
+//
+// "Approximate" is honest: this compares the Go values the binlog decoder
+// produced, not MySQL collation order, so for string keys under a non-binary
+// collation the order can differ from the index's. That is fine for the two
+// things the ordering is for — determinism across retries, and clustered-index
+// page locality — and it must not be relied on for anything requiring true
+// index order. Numeric keys (the overwhelmingly common case, and the case where
+// map order was worst: "10" sorting before "9") do come out exactly right.
+func compareBufferedKeys(a, b []any) int {
+	for i := range min(len(a), len(b)) {
+		if c := compareKeyComponent(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	return len(a) - len(b)
+}
+
+func compareKeyComponent(a, b any) int {
+	switch av := a.(type) {
+	case int64:
+		if bv, ok := b.(int64); ok {
+			return cmp.Compare(av, bv)
+		}
+	case uint64:
+		if bv, ok := b.(uint64); ok {
+			return cmp.Compare(av, bv)
+		}
+	case float64:
+		if bv, ok := b.(float64); ok {
+			return cmp.Compare(av, bv)
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return cmp.Compare(av, bv)
+		}
+	case []byte:
+		if bv, ok := b.([]byte); ok {
+			return bytes.Compare(av, bv)
+		}
+	}
+	// Mixed or exotic types: fall back to the rendered form. Only determinism
+	// matters here, not ordering fidelity.
+	return cmp.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
+}
+
+// contentionBackoff is the delay before the serial retry pass makes its
+// *second* and later attempts on a batch. The first attempt does not wait at
+// all: errgroup.Wait has already returned by then, so no sibling batch from
+// this drain is still in flight, and the lock that beat us is gone.
+//
+// The escalating delays only cover the cases where something outside this drain
+// holds the lock — another table's subscription flushing, or a checksum repair.
+// Those are bounded by a statement, not by a copy phase, so this tops out at a
+// couple of seconds rather than trying to outlast anything long-lived.
+//
+// Var (not const/func) so tests can shorten it, mirroring
+// throttler.threadsRunningPollInterval.
+var contentionBackoff = func(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	base := min(100*time.Millisecond<<(attempt-1), 2*time.Second)
+	// Full jitter. Batches that deadlocked against each other were, by
+	// definition, running concurrently; retrying them in lockstep would just
+	// re-stage the same collision.
+	return base/2 + time.Duration(rand.Int64N(int64(base/2)+1))
 }
 
 // queueModeActive reports whether new events should be appended to the
@@ -746,7 +922,31 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 		}
 	}
 
-	for key, change := range snapshot {
+	// Iterate in a deterministic order rather than Go's randomized map order.
+	// Map order re-shuffled both batch membership and intra-batch row order on
+	// every attempt, so a batch that lost a deadlock came back as a *different*
+	// batch with a different lock-acquisition sequence — it could not benefit
+	// from the previous attempt having warmed the same rows, and it re-rolled
+	// the dice on a fresh collision instead. Sorting by primary key also
+	// clusters each REPLACE onto fewer clustered-index pages, which cuts the
+	// lock-struct count the deadlock dump showed running into the thousands.
+	//
+	// This does not by itself prevent the deadlock: the observed cycle inverts
+	// between the clustered index and a secondary UNIQUE index, and secondary
+	// key order is unrelated to primary key order, so PK-sorted batches still
+	// interleave there. Determinism is what makes the retry pass below
+	// worthwhile; the concurrency controller is what actually breaks the cycle.
+	orderedKeys := make([]string, 0, len(snapshot))
+	for key := range snapshot {
+		orderedKeys = append(orderedKeys, key)
+	}
+	slices.SortFunc(orderedKeys, func(a, b string) int {
+		return compareBufferedKeys(snapshot[a].originalKey, snapshot[b].originalKey)
+	})
+
+	batchSize := s.effectiveBatchSize()
+	for _, key := range orderedKeys {
+		change := snapshot[key]
 		// Keys the copier may have a read in flight for are deferred to a
 		// later flush; see mustDeferKey. The chunker is internally
 		// synchronized, so no Mutex is needed here.
@@ -756,15 +956,15 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 			allChangesFlushed = false
 			continue
 		}
-		// Cut the batch when either cap is reached: DefaultBatchSize rows,
-		// or the estimated rendered statement size would exceed the byte
-		// budget the copy path also uses. Without the byte cap, buffered
-		// wide rows (LONGTEXT / BLOB) can render into a single REPLACE
-		// larger than max_allowed_packet — a deterministic, non-retryable
-		// failure. A single row over the budget still flushes, alone in
-		// its own batch (a row can't be split).
+		// Cut the batch when either cap is reached: the (possibly reduced)
+		// batch-size limit, or the estimated rendered statement size would
+		// exceed the byte budget the copy path also uses. Without the byte
+		// cap, buffered wide rows (LONGTEXT / BLOB) can render into a single
+		// REPLACE larger than max_allowed_packet — a deterministic,
+		// non-retryable failure. A single row over the budget still flushes,
+		// alone in its own batch (a row can't be split).
 		rowBytes := renderedBytesOfChange(change.logicalRow, change.originalKey)
-		if batchLen := len(current.keys); batchLen >= DefaultBatchSize ||
+		if batchLen := len(current.keys); batchLen >= batchSize ||
 			(batchLen > 0 && batchStmtBytes+rowBytes > applier.MaxStatementSizeBytes) {
 			cutBatch()
 		}
@@ -779,13 +979,56 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 	}
 	cutBatch()
 
+	// Pass 1: apply concurrently at the current (possibly reduced) width.
+	// Batches that lose to lock contention are collected rather than failing
+	// the drain — see retryContendedBatches for why that is safe and why the
+	// retry has to be serial.
+	contended, err := s.applyBatchesConcurrent(ctx, snapshot, batches)
+	if err != nil {
+		s.adaptFlushConcurrency(len(contended) > 0)
+		return false, err
+	}
+
+	// Pass 2: whatever contended in pass 1 goes again, one batch at a time.
+	if len(contended) > 0 {
+		s.batchesContended.Add(int64(len(contended)))
+		s.logger.Warn("flush batches lost to lock contention; retrying serially",
+			"table", s.table.SchemaName+"."+s.table.TableName,
+			"contended_batches", len(contended),
+			"total_batches", len(batches),
+			"concurrency", s.effectiveFlushConcurrency(),
+		)
+		if err := s.retryContendedBatches(ctx, snapshot, contended); err != nil {
+			s.adaptFlushConcurrency(true)
+			return false, err
+		}
+		s.serialRecoveries.Add(1)
+	}
+	s.adaptFlushConcurrency(len(contended) > 0)
+	return allChangesFlushed, nil
+}
+
+// applyBatchesConcurrent runs batches through the applier with up to
+// effectiveFlushConcurrency in flight, returning the batches that failed on
+// InnoDB lock contention (1205/1213) for the caller to retry serially.
+//
+// Contention does *not* cancel the group. Every other error class does, exactly
+// as before: those are not self-inflicted and retrying at a narrower width
+// would not help. Contention is different — spirit's own concurrent REPLACEs
+// are both sides of the conflict, so the same work succeeds unconditionally
+// once it stops racing itself. Letting one contended batch cancel its siblings
+// (the previous behaviour) threw away batches that were about to land and made
+// the whole drain fail, which is what pinned the buffer at its soft limit and
+// froze the flushed position.
+func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[string]bufferedChange, batches []*mapFlushBatch) ([]*mapFlushBatch, error) {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(s.effectiveFlushConcurrency())
 	// Workers delete their batch's entries as they land, so they only
-	// contend with each other here: the build loop above finished
-	// iterating the snapshot before the first worker starts, and the
-	// deferred reattach runs after Wait.
-	var snapshotMu sync.Mutex
+	// contend with each other here: the build loop finished iterating the
+	// snapshot before the first worker starts, and the deferred reattach
+	// runs after Wait.
+	var mu sync.Mutex
+	var contended []*mapFlushBatch
 	var skippedBatches bool
 	for _, batch := range batches {
 		if gctx.Err() != nil {
@@ -794,29 +1037,15 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 		}
 		g.Go(func() error {
 			if err := s.flushBatch(gctx, batch.deleteKeys, batch.upsertRows, nil); err != nil {
+				if dbconn.IsLockContentionError(err) && ctx.Err() == nil {
+					mu.Lock()
+					contended = append(contended, batch)
+					mu.Unlock()
+					return nil // handled by the serial retry pass
+				}
 				return err
 			}
-			// Drop the applied entries immediately — from the snapshot,
-			// so the deferred reattach merges back only what did not land
-			// (uncertain batches stay and re-apply on a later flush, which
-			// is safe: REPLACE and DELETE are idempotent), and from the
-			// batch, so the row images become collectible now rather than
-			// when the whole drain finishes. Without this the snapshot
-			// retains up to a full soft limit of applied images while the
-			// live map refills toward another, transiently doubling the
-			// memory the cap is meant to bound.
-			snapshotMu.Lock()
-			for _, key := range batch.keys {
-				delete(snapshot, key)
-			}
-			snapshotMu.Unlock()
-			flushedKeys := len(batch.keys)
-			batch.keys, batch.deleteKeys, batch.upsertRows = nil, nil, nil
-			s.Lock()
-			s.sizeBytes -= batch.storedBytes
-			s.flushingCount -= flushedKeys
-			s.cond.Broadcast()
-			s.Unlock()
+			s.releaseAppliedBatch(snapshot, &mu, batch)
 			return nil
 		})
 	}
@@ -830,10 +1059,75 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 		// only reattached, not applied.
 		err = ctx.Err()
 	}
-	if err != nil {
-		return false, err
+	return contended, err
+}
+
+// retryContendedBatches re-applies contended batches one at a time.
+//
+// Serial is the point, not a simplification. The contention is entirely
+// self-inflicted — the observed deadlock cycle was three of this drain's own
+// REPLACEs — so with a single writer there is no second transaction left to
+// form a cycle with, and no sibling holding the records this batch needs. The
+// retry is expected to succeed on its first, undelayed attempt; the escalating
+// attempts after it exist only for locks held from outside this drain.
+//
+// A batch that still fails here returns the error, leaving its entries in the
+// snapshot to be reattached and retried on the next flush. That is deliberate:
+// the flushed position must not advance over changes that never landed.
+func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[string]bufferedChange, contended []*mapFlushBatch) error {
+	var mu sync.Mutex
+	for _, batch := range contended {
+		var err error
+		for attempt := range contentionRetries {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(contentionBackoff(attempt)):
+			}
+			if err = s.flushBatch(ctx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
+				s.releaseAppliedBatch(snapshot, &mu, batch)
+				break
+			}
+			if !dbconn.IsLockContentionError(err) {
+				return err
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("flush batch still contended after %d serial retries: %w", contentionRetries, err)
+		}
 	}
-	return allChangesFlushed, nil
+	return nil
+}
+
+// contentionRetries is how many serial attempts a contended batch gets before
+// the drain gives up and leaves it for the next flush. The first is immediate
+// and is the one expected to land; with contentionBackoff the rest add up to
+// under a second of waiting in total.
+const contentionRetries = 4
+
+// releaseAppliedBatch drops a landed batch's entries from the snapshot and
+// returns its bytes to the buffer.
+//
+// Dropping from the snapshot means the deferred reattach merges back only what
+// did not land (uncertain batches stay and re-apply on a later flush, which is
+// safe: REPLACE and DELETE are idempotent). Nilling the batch's slices lets the
+// row images become collectible now rather than when the whole drain finishes —
+// without it the snapshot retains up to a full soft limit of applied images
+// while the live map refills toward another, transiently doubling the memory
+// the cap is meant to bound.
+func (s *bufferedMap) releaseAppliedBatch(snapshot map[string]bufferedChange, mu *sync.Mutex, batch *mapFlushBatch) {
+	mu.Lock()
+	for _, key := range batch.keys {
+		delete(snapshot, key)
+	}
+	mu.Unlock()
+	flushedKeys := len(batch.keys)
+	batch.keys, batch.deleteKeys, batch.upsertRows = nil, nil, nil
+	s.Lock()
+	s.sizeBytes -= batch.storedBytes
+	s.flushingCount -= flushedKeys
+	s.cond.Broadcast()
+	s.Unlock()
 }
 
 // drainQueueSnapshot applies a swapped-out queue snapshot through the
@@ -1236,6 +1530,9 @@ func (s *bufferedMap) SetWatermarkOptimization(ctx context.Context, enabled bool
 		"keys_dropped_above_high", s.keysDroppedAbove.Swap(0),
 		"keys_skipped_not_below_low", s.keysSkippedBelow.Swap(0),
 		"times_parked_on_soft_limit", s.timesParked.Swap(0),
+		"batches_lock_contended", s.batchesContended.Swap(0),
+		"drains_rescued_serially", s.serialRecoveries.Swap(0),
+		"flush_concurrency", s.effectiveFlushConcurrency(),
 		"delta_len", len(s.changes)+len(s.queue),
 		"size_bytes", s.sizeBytes,
 	)
