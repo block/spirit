@@ -952,14 +952,14 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 			"total_batches", len(batches),
 			"concurrency", s.effectiveFlushConcurrency(),
 		)
-		leftover, err := s.retryContendedBatches(ctx, snapshot, contended)
+		deferred, err := s.retryContendedBatches(ctx, snapshot, contended)
 		if err != nil {
 			// A hard error or a real cancellation, not contention: same
 			// reasoning as the pass-1 error path above, so the controller is
 			// left alone.
 			return false, err
 		}
-		if len(leftover) > 0 {
+		if deferred > 0 {
 			// Contention that outlived the serial pass is deferred, not failed.
 			//
 			// Reporting it as an error would throw away the whole drain, and a
@@ -980,10 +980,10 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 			// use. The difference is only that the batches which *did* land
 			// count, and the leftovers are retried on the next flush rather
 			// than after a whole failed drain's worth of lost ground.
-			s.batchesDeferred.Add(int64(len(leftover)))
+			s.batchesDeferred.Add(int64(deferred))
 			s.logger.Warn("flush batches still contended; deferring to the next flush",
 				"table", s.table.SchemaName+"."+s.table.TableName,
-				"deferred_batches", len(leftover),
+				"deferred_batches", deferred,
 				"contended_batches", len(contended),
 				"total_batches", len(batches),
 			)
@@ -1067,11 +1067,15 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 // retry is expected to succeed on its first, undelayed attempt; the escalating
 // attempts after it exist only for locks held from outside this drain.
 //
-// Returns the batches that still could not land, which the caller defers to the
-// next flush; their entries are left in the snapshot to be reattached. A
-// non-nil error means something other than contention went wrong — a hard
+// Returns how many batches still could not land. Deferring them is not
+// something this function does to them, it is something it declines to do: only
+// releaseAppliedBatch takes a batch's keys out of the snapshot, so a batch that
+// never lands is still there when drainMapSnapshot's deferred reattach runs.
+// The count is for the caller's accounting and logging.
+//
+// A non-nil error means something other than contention went wrong — a hard
 // error, or a genuine cancellation of the parent context.
-func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[string]bufferedChange, contended []*mapFlushBatch) ([]*mapFlushBatch, error) {
+func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[string]bufferedChange, contended []*mapFlushBatch) (int, error) {
 	// Bound the whole pass, not just each batch. Against an external 1205 holder
 	// a single attempt is not cheap: flushBatch goes through
 	// dbconn.RetryableTransaction, which burns its own MaxRetries against
@@ -1086,7 +1090,7 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 	defer cancel()
 
 	var mu sync.Mutex
-	var leftover []*mapFlushBatch
+	deferred := 0
 	for i, batch := range contended {
 		var err error
 		for attempt := range contentionRetries {
@@ -1096,9 +1100,9 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 				// latter is an error; the budget expiring just means the
 				// batches we have not reached yet go back in the buffer.
 				if ctx.Err() != nil {
-					return nil, ctx.Err()
+					return 0, ctx.Err()
 				}
-				return append(leftover, contended[i:]...), nil
+				return deferred + len(contended) - i, nil
 			case <-time.After(contentionBackoff(attempt)):
 			}
 			if err = s.flushBatch(passCtx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
@@ -1114,22 +1118,22 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 			// a hard error.
 			if passCtx.Err() != nil {
 				if ctx.Err() != nil {
-					return nil, ctx.Err()
+					return 0, ctx.Err()
 				}
-				return append(leftover, contended[i:]...), nil
+				return deferred + len(contended) - i, nil
 			}
 			if !dbconn.IsLockContentionError(err) {
-				return nil, err
+				return 0, err
 			}
 		}
 		if err != nil {
 			// Still contended after every attempt. Defer this one but keep
 			// going: the batches are disjoint, so one stubborn lock holder
 			// says nothing about whether the next batch can land.
-			leftover = append(leftover, batch)
+			deferred++
 		}
 	}
-	return leftover, nil
+	return deferred, nil
 }
 
 // contentionRetries is how many serial attempts a contended batch gets before
