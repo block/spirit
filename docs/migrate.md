@@ -580,7 +580,7 @@ migration from scratch.
 
 ## Reading the status output
 
-While a migration runs, Spirit logs one status report every 30 seconds. It is deliberately the only recurring `INFO` output: the checkpoint, the binlog flush and the binlog rotations each used to log on their own schedule, and they are now rows in this report instead ([#329](https://github.com/block/spirit/issues/329)). Their detail is still available by running with debug logging.
+While a migration runs, Spirit logs one status report every 30 seconds. It is deliberately the only recurring `INFO` output: the checkpoint, the binlog flush, the binlog rotations and the reader's own backpressure each used to log on their own schedule, and they are now fields in this report instead ([#329](https://github.com/block/spirit/issues/329)). Their detail is still available by running with debug logging.
 
 The report is a header line plus one indented row per subsystem:
 
@@ -588,7 +588,7 @@ The report is a header line plus one indented row per subsystem:
 2026/08/14 11:47:10 INFO migration status: state=copyRows total-time=2m30s copier-time=2m30s
   copier   46.13%  7550855/16370180  chunk-size=8097  eta=3m29s  throttled=false
   applier queue=128/128  workers=4  wait-p50=1.564s  write-p50=37ms  write-p90=131ms
-  binlog  deltas=0  rotations=56 (0 forced)  flushed 30s ago (took 9µs, 0 rows)
+  binlog  deltas=0  rotations=56 (0 forced)  parks=0 is-parked=false  flushed 30s ago (took 9µs, 0 rows)  read=binlog.000047:104861122
   ckpt    50s ago  binlog.000047:104857600
 ```
 
@@ -625,7 +625,12 @@ Spirit keeps the new table in sync with writes that land during the copy by subs
 | `deltas` | Changes discovered in the binary log that have not been applied to the new table yet. This is usually low at the start of a migration because of the *key above watermark* optimization: a change to a row the copier has not reached yet can simply be dropped, since the copier will read the current version when it gets there. It rises as the copy approaches 100%, and the `applyChangeset` state exists to drain it before cutover. |
 | `rotations` | How many binlog rotations Spirit has followed on the source. High counts usually just indicate a high volume of write activity on the server (from any workload, not only this migration). Worth knowing because binlog retention is what bounds how long a paused or resumable migration can survive. |
 | `(n forced)` | The subset of those rotations Spirit caused itself, by issuing `FLUSH BINARY LOGS` when it was waiting for the feed to catch up and the position had stalled. A number that climbs here (rather than in `rotations`) means Spirit's own catch-up waiting is churning through binlogs. Always `0` when the run uses GTID coordinates (see [GTID auto-detection](#gtid-auto-detection)) — that feed never issues `FLUSH BINARY LOGS`. |
+| `parks` | How many times Spirit has throttled its own binlog reader, cumulatively for the run. The reader parks when a subscription's buffer of pending changes reaches a soft limit — either 256MiB of buffered row images or 50,000 pending changes, whichever binds first — and resumes as the next flush applies them. Capacity comes back one applied batch at a time, so one sustained episode of backpressure produces many parks rather than one long one: read the *rate* between reports, not the absolute number. A count that never moves means the applier is keeping up with the source's write rate. |
+| `is-parked` | Whether the reader is parked *right now*. Together with `parks` this separates a reader being briefly throttled and recovering (`parks` climbing, `is-parked=false`) from one being held off for minutes at a time (`is-parked=true` across consecutive reports). The latter is the reading to act on: while the reader is parked Spirit is not consuming the source's binary log, so a long stall eats into `binlog_expire_logs_seconds` and can make the run unresumable. It usually means the change feed cannot apply as fast as the source writes; check the `flushed` figures on this row for how long a drain is taking. |
 | `flushed X ago (took Y, n rows)` | When the change feed last flushed its buffered changes to the new table, how long that flush took, and how many buffered changes it started with. Flushes are periodic (every 30 seconds by default), so `X` reads somewhere between `0s` and the interval during a healthy copy; a value that keeps climbing well past it means flushes are not completing. `0 rows` is the normal reading for a feed that is keeping up — there was nothing left to write. |
+| `read` | How far the feed has *read* the binary log, in the run's coordinate scheme. This is not the resume point: it is ahead of the `ckpt` position by whatever is still buffered and unflushed. Omitted before the feed has read anything. |
+
+The `read` field is there to tell "the reader is fine, only publication is blocked" apart from "the feed has stalled" — two situations the `ckpt` row cannot distinguish, because it shows the flushed position, which is frozen in both. Spirit only advances the flushed position when a flush lands *every* buffered change, so while any change is held back the checkpoint stops moving by design. If `read` advances between reports the reader is working normally; if it is also standing still, the feed itself has stopped. The gap between `read` and the `ckpt` position is how much re-reading a resume would have to do.
 
 ### `ckpt` row
 

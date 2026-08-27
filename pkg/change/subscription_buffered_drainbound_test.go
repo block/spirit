@@ -2,6 +2,7 @@ package change
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -299,4 +300,82 @@ func TestDrainBoundDefaultsAreOrdered(t *testing.T) {
 	roundTrips := DefaultSubscriptionSoftLimitChanges / DefaultBatchSize
 	require.LessOrEqual(t, roundTrips, 64,
 		"a full buffer should drain in a few dozen round trips, not hundreds")
+}
+
+// The status block has to be able to show a park while it is happening, not
+// only after the fact: a reader held off for minutes is the case that risks
+// running past the source's binlog retention, and it is indistinguishable from
+// a healthy feed if the only evidence is a counter that stopped moving.
+func TestParkStatsReportsAnInFlightPark(t *testing.T) {
+	const limit = 4
+	sub := newByteCapBufferedMap(&countingApplier{}, false)
+	sub.softLimitChanges = limit
+	sub.softLimitBytes = 0
+
+	parks, parked := sub.ParkStats()
+	require.Zero(t, parks)
+	require.False(t, parked)
+
+	for i := range limit {
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
+	}
+	parks, parked = sub.ParkStats()
+	require.Zero(t, parks, "filling to the cap does not park; the next add does")
+	require.False(t, parked)
+
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		sub.HasChanged([]any{int64(limit)}, []any{int64(limit), "blocked"}, false)
+	}()
+
+	// ParkStats must observe the park from another goroutine, which it can only
+	// do because the parked caller is inside cond.Wait() and has released the
+	// Mutex for the duration.
+	require.Eventually(t, func() bool {
+		parks, parked = sub.ParkStats()
+		return parked
+	}, 5*time.Second, 5*time.Millisecond, "an in-flight park must be visible")
+	require.Equal(t, int64(1), parks)
+
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err)
+	require.True(t, allFlushed)
+	<-blocked
+
+	parks, parked = sub.ParkStats()
+	require.False(t, parked, "the flag must clear when the caller resumes")
+	require.Equal(t, int64(1), parks, "the count is cumulative and does not clear")
+}
+
+// End to end: a park on any of a feed's subscriptions has to reach the feed's
+// status row, which is the whole point of moving this off the subscription's
+// own log lines.
+func TestFeedStatsReportsSubscriptionParks(t *testing.T) {
+	const limit = 2
+	sub := newByteCapBufferedMap(&countingApplier{}, false)
+	sub.softLimitChanges = limit
+	sub.softLimitBytes = 0
+
+	c := &gtidClient{subs: newSubscriptionRegistry()}
+	require.True(t, c.subs.Add("test.t1", sub))
+	require.Contains(t, StatusRow(c), "parks=0 is-parked=false")
+
+	for i := range limit {
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
+	}
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		sub.HasChanged([]any{int64(limit)}, []any{int64(limit), "blocked"}, false)
+	}()
+	require.Eventually(t, func() bool {
+		return strings.Contains(StatusRow(c), "parks=1 is-parked=true")
+	}, 5*time.Second, 5*time.Millisecond)
+
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err)
+	require.True(t, allFlushed)
+	<-blocked
+	require.Contains(t, StatusRow(c), "parks=1 is-parked=false")
 }

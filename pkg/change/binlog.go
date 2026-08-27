@@ -1206,15 +1206,18 @@ func (c *binlogClient) FlushResidual() (int, int) {
 // FeedStats satisfies StatsReporter, so the runner can fold the feed's
 // activity into the binlog row of its periodic status block.
 func (c *binlogClient) FeedStats() FeedStats {
+	// Collected before c.mu is taken: mergeParkStats locks each subscription,
+	// and the subscriptions take c.mu on their flush paths.
+	var stats FeedStats
+	mergeParkStats(&stats, c.subs.Snapshot())
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	stats := FeedStats{
-		LastFlushAt:       c.lastFlushAt,
-		LastFlushDuration: c.lastFlushDuration,
-		LastFlushRows:     c.lastFlushRows,
-		Rotations:         c.rotations.Load(),
-		ForcedRotations:   c.flushedBinlogs.Load(),
-	}
+	stats.LastFlushAt = c.lastFlushAt
+	stats.LastFlushDuration = c.lastFlushDuration
+	stats.LastFlushRows = c.lastFlushRows
+	stats.Rotations = c.rotations.Load()
+	stats.ForcedRotations = c.flushedBinlogs.Load()
 	// Already under c.mu, which is what guards bufferedPos.
 	if c.bufferedPos.Name != "" {
 		stats.BufferedPosition = formatBinlogPosition(c.bufferedPos)

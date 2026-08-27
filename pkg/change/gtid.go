@@ -1190,14 +1190,17 @@ func (c *gtidClient) countRotation(currentLogName, nextLogName string) string {
 // client never issues `FLUSH BINARY LOGS` — BlockWait polls
 // @@GLOBAL.gtid_executed instead of chasing a file offset.
 func (c *gtidClient) FeedStats() FeedStats {
+	// Collected before c.mu is taken: mergeParkStats locks each subscription,
+	// and the subscriptions take c.mu on their flush paths.
+	var stats FeedStats
+	mergeParkStats(&stats, c.subs.Snapshot())
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	stats := FeedStats{
-		LastFlushAt:       c.lastFlushAt,
-		LastFlushDuration: c.lastFlushDuration,
-		LastFlushRows:     c.lastFlushRows,
-		Rotations:         c.rotations.Load(),
-	}
+	stats.LastFlushAt = c.lastFlushAt
+	stats.LastFlushDuration = c.lastFlushDuration
+	stats.LastFlushRows = c.lastFlushRows
+	stats.Rotations = c.rotations.Load()
 	// Already under c.mu, which is what guards bufferedGTID.
 	if c.bufferedGTID != nil && !c.bufferedGTID.IsEmpty() {
 		stats.BufferedPosition = c.bufferedGTID.String()

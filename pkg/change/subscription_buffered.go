@@ -217,18 +217,22 @@ type bufferedMap struct {
 	keysAdded        atomic.Int64
 	keysDroppedAbove atomic.Int64
 	keysSkippedBelow atomic.Int64
-	timesParked      atomic.Int64 // HasChanged was parked at least once on the soft limit
+	// timesParked counts every park on a soft limit, cumulatively for the
+	// life of the subscription. Unlike its neighbours it is not reset by the
+	// watermark-toggle bookend log, because the status block reports it
+	// periodically and a counter that silently restarts mid-migration reads
+	// as the parking having stopped.
+	timesParked      atomic.Int64
 	batchesContended atomic.Int64 // applier batches that failed on 1205/1213
 	batchesDeferred  atomic.Int64 // contended batches left for the next flush
 	serialRecoveries atomic.Int64 // drains rescued by the serial retry pass
 	drainsTimedOut   atomic.Int64 // drains cut short by drainDispatchBudget
 
-	// lastParkWarn is when the park/unpark log pair was last emitted at
-	// Warn/Info level. Since flushes release capacity per batch, a
-	// saturated applier produces frequent short parks rather than one
-	// long one; without throttling, the pair would log every couple of
-	// seconds for the lifetime of a long drain. Guarded by Mutex.
-	lastParkWarn time.Time
+	// parked is true while a HasChanged caller is sitting on the soft
+	// limit. Guarded by Mutex, which the parked goroutine releases inside
+	// cond.Wait(), so a status reader can observe it while the park is in
+	// progress — that is the whole point of reporting it.
+	parked bool
 
 	pkIsMemoryComparable bool
 }
@@ -240,13 +244,6 @@ type bufferedMap struct {
 // against — these constants are noise next to the BLOB / large-string
 // payload sizes. Both are approximate; the cap is "soft" anyway.
 const (
-	// parkWarnInterval throttles the park/unpark log pair. Parks under
-	// sustained backpressure are frequent and short (capacity returns
-	// per applied batch), so the pair is emitted at Warn/Info level at
-	// most once per interval per subscription and at Debug otherwise.
-	// The timesParked counter still counts every park.
-	parkWarnInterval = 30 * time.Second
-
 	// bufferedChangeOverhead is the fixed per-entry cost for an item
 	// in s.changes beyond what estimateRowSize captures: the hashed-
 	// key string header (~16 B), the bufferedChange struct laid out
@@ -443,6 +440,19 @@ func (s *bufferedMap) Length() int {
 	s.Lock()
 	defer s.Unlock()
 	return s.lengthLocked()
+}
+
+// ParkStats satisfies ParkReporter, so the runner's status block can report
+// backpressure instead of the subscription logging every park itself.
+//
+// Taking the Mutex is what makes `parked` readable: the parked goroutine is
+// inside cond.Wait(), which releases the Mutex for the duration of the park.
+// A drain holds the Mutex only for short bookkeeping sections, so this does
+// not queue behind one.
+func (s *bufferedMap) ParkStats() (int64, bool) {
+	s.Lock()
+	defer s.Unlock()
+	return s.timesParked.Load(), s.parked
 }
 
 // lengthLocked is Length without the Mutex, for callers that already hold it.
@@ -713,21 +723,21 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 		_, dedupOverwrite = s.changes[hashedKey]
 	}
 
-	// Soft backpressure: park while the buffer is at or above the byte
-	// threshold. See softLimitBytes on bufferedMap for the semantics.
-	// We log on entry and exit because parking stalls the binlog reader
-	// — the exit duration is the operator's main signal for binlog-
-	// retention risk, and without these lines a stalled migrator looks
-	// indistinguishable from one that's just slow.
+	// Soft backpressure: park while the buffer is at or above either soft
+	// limit. See overSoftLimitLocked for the semantics.
+	//
+	// Both log lines are Debug. Parking stalls the binlog reader, so it does
+	// need to be visible — but flushes release capacity per applied batch, so
+	// sustained backpressure produces a park/unpark pair every few seconds for
+	// the lifetime of a long drain, and at Warn/Info that buried the periodic
+	// status block it was meant to complement. The status block now carries
+	// `parks=` and `is-parked=` on its binlog row instead, which answers the
+	// same question — is the reader being held back, and how often — at the
+	// cadence an operator actually reads.
 	if !dedupOverwrite && !s.closed && s.overSoftLimitLocked() {
 		s.timesParked.Add(1)
 		s.requestFlush()
-		parkEntryLog, parkExitLog := s.logger.Debug, s.logger.Debug
-		if time.Since(s.lastParkWarn) >= parkWarnInterval {
-			s.lastParkWarn = time.Now()
-			parkEntryLog, parkExitLog = s.logger.Warn, s.logger.Info
-		}
-		parkEntryLog("subscription parked on soft limit",
+		s.logger.Debug("subscription parked on soft limit",
 			"table", s.table.SchemaName+"."+s.table.TableName,
 			"size_bytes", s.sizeBytes,
 			"soft_limit_bytes", s.softLimitBytes,
@@ -735,10 +745,12 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 			"soft_limit_changes", s.softLimitChanges,
 		)
 		parkStart := time.Now()
+		s.parked = true
 		for !s.closed && s.overSoftLimitLocked() {
 			s.cond.Wait()
 		}
-		parkExitLog("subscription unparked from soft limit",
+		s.parked = false
+		s.logger.Debug("subscription unparked from soft limit",
 			"table", s.table.SchemaName+"."+s.table.TableName,
 			"parked_duration", time.Since(parkStart).String(),
 			"size_bytes", s.sizeBytes,
@@ -1749,7 +1761,7 @@ func (s *bufferedMap) SetWatermarkOptimization(ctx context.Context, enabled bool
 		"keys_added", s.keysAdded.Swap(0),
 		"keys_dropped_above_high", s.keysDroppedAbove.Swap(0),
 		"keys_skipped_not_below_low", s.keysSkippedBelow.Swap(0),
-		"times_parked_on_soft_limit", s.timesParked.Swap(0),
+		"times_parked_on_soft_limit_total", s.timesParked.Load(),
 		"batches_lock_contended", s.batchesContended.Swap(0),
 		"batches_contention_deferred", s.batchesDeferred.Swap(0),
 		"drains_rescued_serially", s.serialRecoveries.Swap(0),
