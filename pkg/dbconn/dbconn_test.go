@@ -221,6 +221,43 @@ func TestIsConnectionLossError(t *testing.T) {
 	require.False(t, IsConnectionLossError(context.Canceled))
 }
 
+func TestIsLockContentionError(t *testing.T) {
+	// InnoDB lock contention: the two codes a writer can provoke in itself, and
+	// therefore the two that respond to lowering write concurrency.
+	require.True(t, IsLockContentionError(&mysql.MySQLError{Number: 1205})) // lock wait timeout
+	require.True(t, IsLockContentionError(&mysql.MySQLError{Number: 1213})) // deadlock
+
+	// Wrapped variants must also be detected. This is the shape the real caller
+	// sees: flushBatch wraps single_target.go's upsert, which wraps the error
+	// RetryableTransaction returned bare after exhausting MaxRetries. If any
+	// link in that chain is ever changed to %v, the contention path goes
+	// silently inert, so pin the depth the production chain actually has.
+	require.True(t, IsLockContentionError(fmt.Errorf("failed to upsert rows: %w",
+		fmt.Errorf("failed to execute upsert: %w", &mysql.MySQLError{Number: 1205}))))
+
+	// Everything else must be excluded. Not because these are unretryable —
+	// 1317 and the read-only codes are all retryable, and 2013/4031 are
+	// connection loss — but because none of them are contention, so none of
+	// them get quieter when the flush narrows itself. Misclassifying one would
+	// burn the serial retry pass on a permanent failure, ratchet the AIMD
+	// controller down to concurrency 1, and log "reducing flush concurrency
+	// after lock contention" at an operator who is looking at something else.
+	require.False(t, IsLockContentionError(nil))
+	require.False(t, IsLockContentionError(errors.New("not a mysql error")))
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1062})) // duplicate key
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1064})) // syntax error
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1146})) // no such table
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1317})) // query interrupted: retryable, not contention
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1406})) // data too long
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1836})) // read only mode: retryable, not contention
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 2013})) // CR_SERVER_LOST: connection loss, not contention
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 4031})) // killed by wait_timeout: connection loss
+	require.False(t, IsLockContentionError(driver.ErrBadConn))
+	require.False(t, IsLockContentionError(mysql.ErrInvalidConn))
+	require.False(t, IsLockContentionError(context.DeadlineExceeded))
+	require.False(t, IsLockContentionError(context.Canceled))
+}
+
 // testRetryableTrxSurvivesKill blocks an UPDATE behind a row lock, kills it
 // with killStmtFmt ("KILL QUERY %d" or "KILL %d"), releases the lock, and
 // asserts that RetryableTransaction retries and ultimately succeeds.

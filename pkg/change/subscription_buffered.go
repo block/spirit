@@ -993,6 +993,14 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 		}
 		g.Go(func() error {
 			if err := s.flushBatch(gctx, batch.deleteKeys, batch.upsertRows, nil); err != nil {
+				// The ctx.Err() half deliberately reads the *parent*, not gctx:
+				// a sibling's failure cancels gctx, and that must not stop this
+				// batch's own contention from reaching the retry pass. Only a
+				// real shutdown does, because a 1213 racing a cancellation is a
+				// symptom of the connection going away rather than something a
+				// narrower flush would avoid — and pass 2 should not spend its
+				// budget, or log a concurrency reduction, on a drain that is
+				// already over. See TestContentionAtShutdownIsNotRetried.
 				if dbconn.IsLockContentionError(err) && ctx.Err() == nil {
 					mu.Lock()
 					contended = append(contended, batch)

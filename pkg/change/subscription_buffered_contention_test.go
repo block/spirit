@@ -399,3 +399,53 @@ func TestAllDeferredDrainDoesNotWiden(t *testing.T) {
 	}
 	require.Empty(t, fake.upserts(), "no applier call should have been made")
 }
+
+// cancellingContendingApplier cancels the drain's parent context and then
+// reports a deadlock, modelling contention that shows up at shutdown — where
+// the 1213 is a symptom of the connection going away, not something a narrower
+// flush would have avoided.
+type cancellingContendingApplier struct {
+	countingApplier
+	cancel context.CancelFunc
+}
+
+func (a *cancellingContendingApplier) UpsertRows(context.Context, *table.ColumnMapping, []applier.LogicalRow, []*dbconn.TableLock) (int64, error) {
+	a.cancel()
+	return 0, deadlockErr()
+}
+
+// TestContentionAtShutdownIsNotRetried pins the `ctx.Err() == nil` half of the
+// contention classification in applyBatchesConcurrent. Dropping it passed the
+// suite: a 1213 racing a cancellation was absorbed as ordinary contention and
+// handed to the serial pass, which then had to discover the cancellation for
+// itself — and its first attempt is undelayed, so `time.After(0)` and
+// `passCtx.Done()` are both ready and the select picks between them at random.
+// The drain fails either way, so this is not a correctness gap, but the retry
+// budget and the "reducing flush concurrency" log should not be spent on a
+// shutdown.
+//
+// batchesContended is the deterministic witness: it is only incremented when
+// pass 1 actually hands a batch over, so it stays zero with the guard and goes
+// non-zero without it, no matter which way the select falls.
+func TestContentionAtShutdownIsNotRetried(t *testing.T) {
+	shortenContentionBackoff(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	fake := &cancellingContendingApplier{cancel: cancel}
+	sub := newByteCapBufferedMap(&fake.countingApplier, false)
+	sub.applier = fake
+	sub.flushConcurrency = 1
+
+	const totalRows = DefaultBatchSize
+	for i := range totalRows {
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
+	}
+
+	allFlushed, err := sub.Flush(ctx, false, nil)
+	require.Error(t, err, "a cancelled drain must fail")
+	require.False(t, allFlushed, "a failed drain must never report all-flushed")
+	require.Zero(t, sub.batchesContended.Load(),
+		"contention concurrent with cancellation must not be handed to the serial pass")
+	require.Equal(t, totalRows, sub.Length(), "the rows must stay buffered for the next flush")
+}
