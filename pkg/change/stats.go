@@ -24,6 +24,20 @@ type FeedStats struct {
 	// Source.Flush always ends on (it loops until the backlog is trivial and
 	// then flushes once more).
 	LastFlushRows int
+	// BufferedPosition is how far the feed has *read*, in the same opaque
+	// encoding Source.Position uses. Empty before the feed has read anything.
+	//
+	// This is deliberately not the resume coordinate. Source.Position and the
+	// ckpt row both report the *flushed* position, which only advances when a
+	// flush lands every buffered change — so while any change is held back the
+	// checkpoint is frozen by design, and the status block goes silent about
+	// the reader even though it is working normally. That is indistinguishable
+	// from a genuinely stalled feed, which is the case an operator most needs
+	// to tell apart. Reporting the buffered position alongside restores the
+	// distinction: if it advances between status blocks the reader is fine and
+	// only publication is blocked, and the gap to the ckpt row is how much
+	// re-reading a restart would cost.
+	BufferedPosition string
 	// Rotations counts binlog rotations the feed has followed. Duplicate
 	// rotate events (the server sends a real one and an artificial one
 	// carrying the same position) are counted once.
@@ -61,7 +75,24 @@ func (s FeedStats) String() string {
 			s.LastFlushRows,
 		)
 	}
-	return fmt.Sprintf("rotations=%d (%d forced)  %s", s.Rotations, s.ForcedRotations, flush)
+	out := fmt.Sprintf("rotations=%d (%d forced)  %s", s.Rotations, s.ForcedRotations, flush)
+	if s.BufferedPosition != "" {
+		// Last, and rendered whole. A GTID set gains a UUID per failover and
+		// has no upper bound on length, so putting it anywhere but the end of
+		// the row would push the flush phrase off a narrow terminal — and the
+		// flush phrase is the other half of the answer.
+		//
+		// It is not abbreviated, for two reasons. The ckpt row prints the
+		// flushed position in full, and the point of this field is to be
+		// compared against that one: elide one copy and they stop being
+		// diffable by eye. And the interval that moves between status blocks
+		// belongs to whichever server is currently being written to, which
+		// need not sort last in the set — a middle elision could hide exactly
+		// the digits that are changing and make a healthy reader look frozen,
+		// which is the misreading this field exists to prevent.
+		out += "  read=" + s.BufferedPosition
+	}
+	return out
 }
 
 // StatusRow renders the feed stats of srcs as the binlog row of a runner status
@@ -88,6 +119,14 @@ func StatusRow(srcs ...Source) string {
 			merged.LastFlushAt = s.LastFlushAt
 			merged.LastFlushDuration = s.LastFlushDuration
 			merged.LastFlushRows = s.LastFlushRows
+			// The buffered position comes from the same feed as the flush
+			// figures rather than being merged across feeds. Positions from
+			// different sources are not comparable — a sharded move reads one
+			// feed per source, each with its own coordinate space — so there is
+			// nothing to sum or average. Taking the stalest feed's is the
+			// useful choice: that is the feed holding the position back, and
+			// therefore the one whose reader progress is in question.
+			merged.BufferedPosition = s.BufferedPosition
 		}
 		merged.Rotations += s.Rotations
 		merged.ForcedRotations += s.ForcedRotations

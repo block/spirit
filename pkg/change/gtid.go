@@ -1179,12 +1179,17 @@ func (c *gtidClient) countRotation(currentLogName, nextLogName string) string {
 func (c *gtidClient) FeedStats() FeedStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return FeedStats{
+	stats := FeedStats{
 		LastFlushAt:       c.lastFlushAt,
 		LastFlushDuration: c.lastFlushDuration,
 		LastFlushRows:     c.lastFlushRows,
 		Rotations:         c.rotations.Load(),
 	}
+	// Already under c.mu, which is what guards bufferedGTID.
+	if c.bufferedGTID != nil && !c.bufferedGTID.IsEmpty() {
+		stats.BufferedPosition = c.bufferedGTID.String()
+	}
+	return stats
 }
 
 // Flush satisfies Source. Same shape as binlogClient.Flush.

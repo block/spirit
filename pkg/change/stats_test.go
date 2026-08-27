@@ -2,6 +2,7 @@ package change
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -238,4 +239,64 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 		return client.FeedStats().Rotations > before
 	}, 10*time.Second, 50*time.Millisecond,
 		"rotation was not counted (still %d)", client.FeedStats().Rotations)
+}
+
+// The buffered position is the field that tells "the reader is fine, only
+// publication is blocked" apart from "the feed has stalled". The ckpt row
+// cannot: it shows the flushed position, which is frozen in both cases.
+func TestFeedStatsStringWithBufferedPosition(t *testing.T) {
+	s := FeedStats{
+		LastFlushAt:       time.Now().Add(-10 * time.Second),
+		LastFlushDuration: 2854617 * time.Nanosecond,
+		LastFlushRows:     5583,
+		BufferedPosition:  "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638",
+		Rotations:         4,
+		ForcedRotations:   1,
+	}
+	require.Equal(t,
+		"rotations=4 (1 forced)  flushed 10s ago (took 2.855ms, 5583 rows)  "+
+			"read=f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638",
+		s.String())
+}
+
+// The position goes last and whole. A GTID set has no bounded length, so
+// anywhere else it would push the flush phrase off a narrow terminal, and
+// truncating it would stop it being comparable with the ckpt row.
+func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
+	long := "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638," +
+		"a1b2c3d4-154f-3776-8f0f-ced626dbde36:1-42," +
+		"b7c8d9e0-154f-3776-8f0f-ced626dbde36:1-7"
+	got := FeedStats{BufferedPosition: long}.String()
+	require.Equal(t, "rotations=0 (0 forced)  never flushed  read="+long, got)
+	require.True(t, strings.HasSuffix(got, long), "nothing may follow the position")
+}
+
+// A feed that has not read anything yet omits the field rather than rendering
+// an empty one, which also keeps every pre-existing status line byte-identical.
+func TestFeedStatsStringOmitsEmptyBufferedPosition(t *testing.T) {
+	require.Equal(t, "rotations=0 (0 forced)  never flushed", FeedStats{}.String())
+	require.NotContains(t, FeedStats{Rotations: 3}.String(), "read=")
+}
+
+// The buffered position is taken from the same feed as the flush figures, not
+// merged: positions from different sources are not comparable, and the stalest
+// feed is the one whose reader progress is in question.
+func TestStatusRowBufferedPositionFollowsStalestFeed(t *testing.T) {
+	recent := &statsFeed{stats: FeedStats{
+		LastFlushAt:      time.Now().Add(-time.Second),
+		BufferedPosition: "recent-feed-pos",
+		Rotations:        2,
+	}}
+	stale := &statsFeed{stats: FeedStats{
+		LastFlushAt:      time.Now().Add(-90 * time.Second),
+		BufferedPosition: "stale-feed-pos",
+		Rotations:        3,
+	}}
+	row := StatusRow(recent, stale)
+	require.Contains(t, row, "read=stale-feed-pos")
+	require.NotContains(t, row, "recent-feed-pos")
+	require.Contains(t, row, "rotations=5 (0 forced)", "counters still sum")
+
+	// Order must not matter.
+	require.Equal(t, row, StatusRow(stale, recent))
 }

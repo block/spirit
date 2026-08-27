@@ -1195,13 +1195,18 @@ func (c *binlogClient) FlushResidual() (int, int) {
 func (c *binlogClient) FeedStats() FeedStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return FeedStats{
+	stats := FeedStats{
 		LastFlushAt:       c.lastFlushAt,
 		LastFlushDuration: c.lastFlushDuration,
 		LastFlushRows:     c.lastFlushRows,
 		Rotations:         c.rotations.Load(),
 		ForcedRotations:   c.flushedBinlogs.Load(),
 	}
+	// Already under c.mu, which is what guards bufferedPos.
+	if c.bufferedPos.Name != "" {
+		stats.BufferedPosition = formatBinlogPosition(c.bufferedPos)
+	}
+	return stats
 }
 
 // Flush empties the changeset in a loop until the amount of changes is considered "trivial".
