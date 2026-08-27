@@ -1060,6 +1060,13 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 			// A hard error or a real cancellation, not contention: same
 			// reasoning as the pass-1 error path above, so the controller is
 			// left alone.
+			//
+			// The count still lands in the counter. Batches the pass had already
+			// given up on before the error arrived are reattached and retried
+			// like any other deferral, so leaving them out understated the
+			// counter for no benefit. It is only an accounting figure — the
+			// error is what decides the drain.
+			s.batchesDeferred.Add(int64(deferred))
 			return false, err
 		}
 		if deferred > 0 {
@@ -1246,13 +1253,21 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 
 	var mu sync.Mutex
 	deferred := 0
+	// giveUpAt reports the total deferral count when the budget expires while
+	// batch i is the one in hand: the batches already counted, plus batch i and
+	// every batch after it, none of which has landed. Named and shared rather
+	// than written out at each check — the two checks below are the same
+	// decision made at different moments, and an accumulator dropped from one of
+	// them would understate how much of the drain is stuck without breaking
+	// anything a test would notice.
+	giveUpAt := func(i int) int { return deferred + len(contended) - i }
 	for i, batch := range contended {
 		var err error
 		for attempt := range contentionRetries {
 			if time.Now().After(deadline) {
 				// Our own impatience, not a failure: the batches not reached
 				// yet — this one included — go back in the buffer.
-				return deferred + len(contended) - i, nil
+				return giveUpAt(i), nil
 			}
 			select {
 			case <-ctx.Done():
@@ -1260,6 +1275,16 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 				// treat the drain as having merely deferred work.
 				return 0, ctx.Err()
 			case <-time.After(contentionBackoff(attempt)):
+			}
+			// Re-checked after the wait, and this is the check that enforces the
+			// contract. The backoff escalates to a couple of seconds, so the
+			// check above can pass with a millisecond left and the attempt would
+			// then start well past the deadline. The pre-wait check is only a
+			// cheap early exit that avoids sleeping for a budget already gone.
+			// Same division of labour as drainDispatchBudget's loop check versus
+			// its worker check.
+			if time.Now().After(deadline) {
+				return giveUpAt(i), nil
 			}
 			if err = s.flushBatch(ctx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
 				s.releaseAppliedBatch(snapshot, &mu, batch)
@@ -1269,7 +1294,12 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 				return 0, ctx.Err()
 			}
 			if !dbconn.IsLockContentionError(err) {
-				return 0, err
+				// A hard error fails the drain, but the batches this pass had
+				// already given up on are still deferred — they are back in the
+				// buffer either way. Reporting them keeps the deferral counter
+				// honest; the caller decides what to do with a count that
+				// arrives alongside an error.
+				return deferred, err
 			}
 		}
 		if err != nil {

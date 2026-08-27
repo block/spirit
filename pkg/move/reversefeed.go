@@ -304,6 +304,29 @@ func (rf *ReverseFeed) Flush(ctx context.Context) error {
 	return nil
 }
 
+// AllChangesFlushed reports whether every feed has applied its whole buffer.
+//
+// Flush returning nil is not the same question, and callers that are about to
+// discard the buffer must ask this one instead. A drain may decline to finish —
+// lock contention it could not resolve in its budget, or a drain cut short to
+// bound how long it holds the flush mutex — and reports that by leaving the
+// changes buffered rather than by erroring, because for the periodic flusher
+// "try again next tick" is the right response and failing the whole change is
+// not. Flush's own loop compounds it: it exits once the backlog is merely
+// *trivial*, not empty, so a residual below that threshold returns nil by
+// design.
+//
+// Mirrors the forward cutover's check in cutover.go, which pairs the two calls
+// for exactly this reason.
+func (rf *ReverseFeed) AllChangesFlushed() bool {
+	for _, client := range rf.clients {
+		if !client.AllChangesFlushed() {
+			return false
+		}
+	}
+	return true
+}
+
 // Positions returns each source's current safe-to-resume position, in the same
 // order as the configured sources. Intended for the caller's checkpoint so the
 // window can resume in reverse mode after a restart.

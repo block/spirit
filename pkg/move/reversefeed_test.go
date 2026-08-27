@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -343,4 +344,31 @@ func TestReverseFeedShardedConfigValidation(t *testing.T) {
 		TargetTables: map[string]*table.TableInfo{"t1": oldTbl},
 	})
 	require.ErrorContains(t, err, "target 1 DB must be non-nil")
+}
+
+// TestReverseFeedAllChangesFlushed pins the check the reverse cutover depends
+// on before it discards the buffer.
+//
+// The reverse cutover flushes, then Closes the feed — and Close discards
+// pending changes rather than applying them — then renames the source's _old
+// tables back into service. So anything still buffered at that point is a
+// target-era write that is lost. A nil error from Flush does not rule that out:
+// a drain can decline to finish (lock contention it could not resolve in its
+// budget, or a drain cut short to bound how long it holds the flush mutex) and
+// reports that by leaving the changes buffered, and Flush's own loop exits on a
+// *trivial* backlog rather than an empty one.
+func TestReverseFeedAllChangesFlushed(t *testing.T) {
+	clean := &fakeChangeSource{}
+	stuck := &fakeChangeSource{}
+	stuck.notFlushed.Store(true)
+
+	require.True(t, (&ReverseFeed{clients: []change.Source{clean}}).AllChangesFlushed())
+	require.True(t, (&ReverseFeed{clients: []change.Source{clean, clean}}).AllChangesFlushed())
+
+	// One feed holding changes is enough: the renames put every source's _old
+	// tables back, so a single un-applied shard loses writes.
+	require.False(t, (&ReverseFeed{clients: []change.Source{clean, stuck}}).AllChangesFlushed(),
+		"one feed still holding changes must fail the check")
+	require.False(t, (&ReverseFeed{clients: []change.Source{stuck, clean}}).AllChangesFlushed(),
+		"order must not matter")
 }

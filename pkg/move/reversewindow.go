@@ -337,8 +337,21 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 
 	// 2. Flush the reverse feed so the source's _old tables reflect every target
 	//    write, then stop it (no more writes to _old during the renames below).
+	//
+	// Both calls, in this order, and neither is optional. Close discards the
+	// buffer rather than flushing it, and the renames below put the source's
+	// _old tables back into service — so a change still buffered here is a
+	// target-era write that is silently lost. A nil error from Flush does not
+	// rule that out: a drain can decline to finish and report it by leaving the
+	// changes buffered, and Flush's loop exits on a *trivial* backlog rather
+	// than an empty one. AllChangesFlushed is the question that matters, and
+	// asking it is what the forward cutover already does (cutover.go).
 	if err := w.feed.Flush(ctx); err != nil {
 		return fmt.Errorf("reverse cutover: final flush: %w", err)
+	}
+	if !w.feed.AllChangesFlushed() {
+		return fmt.Errorf("reverse cutover: %w; refusing to discard buffered target writes",
+			change.ErrChangesNotFlushed)
 	}
 	w.feed.Close()
 

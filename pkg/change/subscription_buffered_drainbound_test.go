@@ -291,8 +291,6 @@ func TestDrainWithinBudgetStillReportsComplete(t *testing.T) {
 // and the flushed position would stop advancing — the exact failure both
 // changes exist to fix.
 func TestDrainBoundDefaultsAreOrdered(t *testing.T) {
-	require.Greater(t, drainDispatchBudget, DefaultFlushInterval,
-		"the backstop must outlast a single flush interval")
 	require.Greater(t, DefaultSubscriptionSoftLimitChanges, binlogTrivialThreshold,
 		"the cap must sit above the threshold the flush-until-trivial loops use")
 	// One drain of a full buffer is DefaultSubscriptionSoftLimitChanges rows,
@@ -300,6 +298,26 @@ func TestDrainBoundDefaultsAreOrdered(t *testing.T) {
 	roundTrips := DefaultSubscriptionSoftLimitChanges / DefaultBatchSize
 	require.LessOrEqual(t, roundTrips, 64,
 		"a full buffer should drain in a few dozen round trips, not hundreds")
+
+	// The load-bearing ordering, expressed against the figure the cap was
+	// actually tuned from rather than against a flush interval. The production
+	// drain this PR was written for worked through at most 452,571 rows in
+	// 21m37s; scaled to a full buffer that is ~2m23s, and it is a floor (the
+	// row count is the backlog at flush start, so if fewer rows really landed
+	// the per-row cost is higher).
+	//
+	// Asserting only "budget > one DefaultFlushInterval" would admit a 31s
+	// budget, which would truncate that drain every single time — and a
+	// truncated drain never reports allChangesFlushed=true, so the flushed
+	// position would freeze exactly as it did in production. The margin below
+	// is what makes the budget a backstop instead of the binding constraint.
+	const (
+		observedDrain = 21*time.Minute + 37*time.Second
+		observedRows  = 452571
+	)
+	fullBufferDrain := observedDrain * DefaultSubscriptionSoftLimitChanges / observedRows
+	require.Greater(t, drainDispatchBudget, 2*fullBufferDrain,
+		"the backstop must leave a full-buffer drain (~%v) room to finish", fullBufferDrain)
 }
 
 // The status block has to be able to show a park while it is happening, not

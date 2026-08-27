@@ -162,6 +162,9 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 // failed.
 type fakeChangeSource struct {
 	closed atomic.Bool
+	// notFlushed makes AllChangesFlushed report a feed still holding buffered
+	// changes. Defaults to false so the zero value is a healthy feed.
+	notFlushed atomic.Bool
 }
 
 func (f *fakeChangeSource) AddSubscription(_, _ *table.TableInfo, _ table.MappedChunker) error {
@@ -184,7 +187,7 @@ func (f *fakeChangeSource) SetWatermarkOptimization(_ context.Context, _ bool) e
 }
 func (f *fakeChangeSource) StartPeriodicFlush(_ context.Context, _ time.Duration) {}
 func (f *fakeChangeSource) StopPeriodicFlush()                                    {}
-func (f *fakeChangeSource) AllChangesFlushed() bool                               { return true }
+func (f *fakeChangeSource) AllChangesFlushed() bool                               { return !f.notFlushed.Load() }
 func (f *fakeChangeSource) Stop()                                                 {}
 func (f *fakeChangeSource) Close()                                                { f.closed.Store(true) }
 
