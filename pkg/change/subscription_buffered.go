@@ -1,9 +1,8 @@
 package change
 
 import (
-	"bytes"
-	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -466,8 +465,6 @@ func (s *bufferedMap) ImmutableColumnOrdinal() int {
 	return slices.Index(s.table.Columns, s.table.ShardingColumn)
 }
 
-// effectiveFlushConcurrency clamps flushConcurrency to at least 1 so
-// the zero value (out-of-tree callers, bare test maps) stays serial.
 // cleanDrainsToRecover is how many consecutive contention-free drains must
 // pass before the AIMD controller gives a halving back. Recovery is
 // deliberately slower than the decrease: re-entering the pathological state
@@ -482,6 +479,9 @@ const cleanDrainsToRecover = 3
 // busy source, which trades one stall for another.
 const minAdaptiveBatchSize = 50
 
+// effectiveFlushConcurrency clamps flushConcurrency to at least 1 so
+// the zero value (out-of-tree callers, bare test maps) stays serial, then
+// applies any halvings the AIMD controller has accumulated.
 func (s *bufferedMap) effectiveFlushConcurrency() int {
 	return shiftDown(max(1, s.flushConcurrency), s.concurrencyPenalty.Load(), 1)
 }
@@ -557,54 +557,6 @@ func (s *bufferedMap) adaptFlushConcurrency(contended bool) {
 		"batch_size", s.effectiveBatchSize(),
 		"configured", configured,
 	)
-}
-
-// compareBufferedKeys orders two buffered primary keys component by component,
-// so a drain visits rows in (approximate) clustered-index order instead of Go's
-// randomized map order.
-//
-// "Approximate" is honest: this compares the Go values the binlog decoder
-// produced, not MySQL collation order, so for string keys under a non-binary
-// collation the order can differ from the index's. That is fine for the two
-// things the ordering is for — determinism across retries, and clustered-index
-// page locality — and it must not be relied on for anything requiring true
-// index order. Numeric keys (the overwhelmingly common case, and the case where
-// map order was worst: "10" sorting before "9") do come out exactly right.
-func compareBufferedKeys(a, b []any) int {
-	for i := range min(len(a), len(b)) {
-		if c := compareKeyComponent(a[i], b[i]); c != 0 {
-			return c
-		}
-	}
-	return len(a) - len(b)
-}
-
-func compareKeyComponent(a, b any) int {
-	switch av := a.(type) {
-	case int64:
-		if bv, ok := b.(int64); ok {
-			return cmp.Compare(av, bv)
-		}
-	case uint64:
-		if bv, ok := b.(uint64); ok {
-			return cmp.Compare(av, bv)
-		}
-	case float64:
-		if bv, ok := b.(float64); ok {
-			return cmp.Compare(av, bv)
-		}
-	case string:
-		if bv, ok := b.(string); ok {
-			return cmp.Compare(av, bv)
-		}
-	case []byte:
-		if bv, ok := b.([]byte); ok {
-			return bytes.Compare(av, bv)
-		}
-	}
-	// Mixed or exotic types: fall back to the rendered form. Only determinism
-	// matters here, not ordering fidelity.
-	return cmp.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
 }
 
 // contentionBackoff is the delay before the serial retry pass makes its
@@ -922,31 +874,19 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 		}
 	}
 
-	// Iterate in a deterministic order rather than Go's randomized map order.
-	// Map order re-shuffled both batch membership and intra-batch row order on
-	// every attempt, so a batch that lost a deadlock came back as a *different*
-	// batch with a different lock-acquisition sequence — it could not benefit
-	// from the previous attempt having warmed the same rows, and it re-rolled
-	// the dice on a fresh collision instead. Sorting by primary key also
-	// clusters each REPLACE onto fewer clustered-index pages, which cuts the
-	// lock-struct count the deadlock dump showed running into the thousands.
+	// Map iteration order is randomized, so batch membership differs between
+	// flushes. That does not affect the retry below: pass 2 re-applies the very
+	// same mapFlushBatch values pass 1 built, so a contended batch retries as
+	// itself regardless of iteration order.
 	//
-	// This does not by itself prevent the deadlock: the observed cycle inverts
-	// between the clustered index and a secondary UNIQUE index, and secondary
-	// key order is unrelated to primary key order, so PK-sorted batches still
-	// interleave there. Determinism is what makes the retry pass below
-	// worthwhile; the concurrency controller is what actually breaks the cycle.
-	orderedKeys := make([]string, 0, len(snapshot))
-	for key := range snapshot {
-		orderedKeys = append(orderedKeys, key)
-	}
-	slices.SortFunc(orderedKeys, func(a, b string) int {
-		return compareBufferedKeys(snapshot[a].originalKey, snapshot[b].originalKey)
-	})
-
+	// An earlier revision sorted by primary key here, on the theory that a
+	// consistent lock-acquisition order would help. It would not: the observed
+	// deadlock cycle inverts between the clustered index and a secondary UNIQUE
+	// index, and secondary key order is unrelated to primary key order, so
+	// PK-sorted batches still interleave there. Narrowing concurrency is what
+	// breaks the cycle. See block/spirit#1168.
 	batchSize := s.effectiveBatchSize()
-	for _, key := range orderedKeys {
-		change := snapshot[key]
+	for key, change := range snapshot {
 		// Keys the copier may have a read in flight for are deferred to a
 		// later flush; see mustDeferKey. The chunker is internally
 		// synchronized, so no Mutex is needed here.
@@ -979,13 +919,27 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 	}
 	cutBatch()
 
+	if len(batches) == 0 {
+		// Every key was watermark-deferred. The drain produced no evidence about
+		// contention either way, so it must not advance the clean-drain streak —
+		// otherwise a run of all-deferred flushes would widen the concurrency
+		// back out on the strength of having applied nothing at all.
+		return allChangesFlushed, nil
+	}
+
 	// Pass 1: apply concurrently at the current (possibly reduced) width.
 	// Batches that lose to lock contention are collected rather than failing
 	// the drain — see retryContendedBatches for why that is safe and why the
 	// retry has to be serial.
 	contended, err := s.applyBatchesConcurrent(ctx, snapshot, batches)
 	if err != nil {
-		s.adaptFlushConcurrency(len(contended) > 0)
+		// Deliberately no adaptFlushConcurrency call here. A drain that failed
+		// on something other than contention is not evidence of contention, and
+		// it is not evidence of quiet either: feeding it in as "clean" would let
+		// three consecutive hard failures — during which nothing flushed —
+		// restore the full width, and feeding it in as "contended" would
+		// penalise the width for an unrelated non-retryable error that merely
+		// happened to land in the same drain as someone else's 1213.
 		return false, err
 	}
 
@@ -999,6 +953,8 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 			"concurrency", s.effectiveFlushConcurrency(),
 		)
 		if err := s.retryContendedBatches(ctx, snapshot, contended); err != nil {
+			// Contention that survived a serial retry is unambiguous evidence,
+			// so this one does feed the controller before returning.
 			s.adaptFlushConcurrency(true)
 			return false, err
 		}
@@ -1075,16 +1031,36 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 // snapshot to be reattached and retried on the next flush. That is deliberate:
 // the flushed position must not advance over changes that never landed.
 func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[string]bufferedChange, contended []*mapFlushBatch) error {
+	// Bound the whole pass, not just each batch. Against an external 1205 holder
+	// a single attempt is not cheap: flushBatch goes through
+	// dbconn.RetryableTransaction, which burns its own MaxRetries against
+	// innodb_lock_wait_timeout before returning, so one batch can consume tens
+	// of seconds and N batches multiply that. flushMu is held for the entire
+	// drain, so an unbounded pass 2 stalls every subsequent flush — trading the
+	// frozen checkpoint this PR fixes for a slower version of the same thing.
+	//
+	// Giving up early is cheap by comparison: the remaining batches stay in the
+	// snapshot, get reattached, and are retried on the next flush.
+	passCtx, cancel := context.WithTimeout(ctx, contentionRetryBudget)
+	defer cancel()
+
 	var mu sync.Mutex
 	for _, batch := range contended {
 		var err error
 		for attempt := range contentionRetries {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-passCtx.Done():
+				// Distinguish our own budget from real shutdown: on budget
+				// expiry the parent is still live and the caller should treat
+				// this as ordinary contention, not cancellation.
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("serial contention retry budget (%s) exhausted with %w",
+					contentionRetryBudget, errStillContended)
 			case <-time.After(contentionBackoff(attempt)):
 			}
-			if err = s.flushBatch(ctx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
+			if err = s.flushBatch(passCtx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
 				s.releaseAppliedBatch(snapshot, &mu, batch)
 				break
 			}
@@ -1099,11 +1075,27 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 	return nil
 }
 
+// errStillContended marks a pass-2 giveup so callers can tell "we ran out of
+// patience with a lock holder" from a genuine cancellation.
+var errStillContended = errors.New("batches still contended")
+
 // contentionRetries is how many serial attempts a contended batch gets before
 // the drain gives up and leaves it for the next flush. The first is immediate
-// and is the one expected to land; with contentionBackoff the rest add up to
-// under a second of waiting in total.
+// and is the one expected to land — for the self-inflicted deadlock this exists
+// to fix, no sibling is left holding anything once pass 1 has joined.
+//
+// The sleeps between the remaining attempts add up to well under a second, but
+// that is not the cost that matters: each *attempt* is a flushBatch that can
+// block on a real lock for as long as dbconn.RetryableTransaction is willing to
+// wait. contentionRetryBudget, not this count, is what bounds the pass.
 const contentionRetries = 4
+
+// contentionRetryBudget caps the total wall-clock time pass 2 may spend, across
+// all contended batches, before giving up and deferring the rest to the next
+// flush. Sized to comfortably cover the self-inflicted case (which returns
+// almost immediately) while keeping flushMu out of the multi-minute territory
+// that N batches against an external lock holder would otherwise reach.
+const contentionRetryBudget = 20 * time.Second
 
 // releaseAppliedBatch drops a landed batch's entries from the snapshot and
 // returns its bytes to the buffer.

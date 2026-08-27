@@ -2,8 +2,6 @@ package change
 
 import (
 	"context"
-	"math"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -245,92 +243,159 @@ func TestNonContentionErrorStillFailsDrain(t *testing.T) {
 	require.Equal(t, 2, sub.effectiveFlushConcurrency(), "a non-contention error must not narrow the drain")
 }
 
-// TestDrainVisitsKeysInPrimaryKeyOrder pins the switch away from Go's
-// randomized map iteration. Map order both re-shuffled batch membership on
-// every retry (so a batch that lost a deadlock came back as a different batch)
-// and scattered each REPLACE across the clustered index, inflating the
-// lock-struct count the production dump showed in the thousands.
-func TestDrainVisitsKeysInPrimaryKeyOrder(t *testing.T) {
-	fake := &countingApplier{}
-	sub := newByteCapBufferedMap(fake, false)
-	sub.flushConcurrency = 1
+// sequencedApplier fails the Nth UpsertRows call with a caller-supplied error,
+// so a test can stage a specific mix of contention and hard failure within one
+// concurrent pass. Calls past the end of the slice succeed.
+type sequencedApplier struct {
+	countingApplier
+	mu     sync.Mutex
+	errs   []error
+	nCalls int
+}
 
-	// Insert in an order that is neither ascending nor lexicographically
-	// sorted, so passing requires a real numeric comparison: string ordering
-	// would put 100 before 99.
-	const totalRows = 300
+func (a *sequencedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+	a.mu.Lock()
+	i := a.nCalls
+	a.nCalls++
+	var err error
+	if i < len(a.errs) {
+		err = a.errs[i]
+	}
+	a.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return a.countingApplier.UpsertRows(ctx, mapping, rows, locks)
+}
+
+func deadlockErr() error {
+	return &mysql2.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock"}
+}
+
+// alwaysContendingApplier fails every upsert with a deadlock, modelling a lock
+// holder that never lets go.
+type alwaysContendingApplier struct{ countingApplier }
+
+func (a *alwaysContendingApplier) UpsertRows(context.Context, *table.ColumnMapping, []applier.LogicalRow, []*dbconn.TableLock) (int64, error) {
+	return 0, deadlockErr()
+}
+
+// TestSerialRetryExhaustionFailsDrain covers the safety property the whole PR
+// turns on, which had no test: when the serial pass cannot land a batch, the
+// drain must report failure so the caller never publishes a flushed position
+// over changes that are still buffered.
+//
+// Replacing retryContendedBatches' exhausted-retries error with `continue`
+// previously survived the entire package. It makes drainMapSnapshot return
+// allChangesFlushed=true with rows still in the buffer, and the clients'
+// `if allChangesFlushed { flushedPos = ... }` is the only guard — so the
+// checkpoint would advance past unapplied changes, silently and unrecoverably.
+func TestSerialRetryExhaustionFailsDrain(t *testing.T) {
+	shortenContentionBackoff(t)
+	const totalRows = 3 * DefaultBatchSize
+	sub := newByteCapBufferedMap(&countingApplier{}, false)
+	sub.applier = &alwaysContendingApplier{}
+	sub.flushConcurrency = 4
+
 	for i := range totalRows {
-		key := int64((i * 7919) % totalRows) // deterministic scatter
-		sub.HasChanged([]any{key}, []any{key, "seed"}, false)
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
+	}
+
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.Error(t, err, "permanent contention must fail the drain")
+	require.ErrorContains(t, err, "still contended")
+	require.False(t, allFlushed, "a failed drain must never report all-flushed")
+
+	// Nothing was lost and nothing was double-counted: every row is back in the
+	// active buffer with balanced accounting and no in-flight residue.
+	require.Equal(t, totalRows, sub.Length(), "all rows must be reattached")
+	// recomputeSizeBytes takes s.Lock itself, so derive it before locking.
+	expectedBytes := recomputeSizeBytes(sub)
+	sub.Lock()
+	require.Equal(t, expectedBytes, sub.sizeBytes, "byte accounting must balance")
+	require.Zero(t, sub.flushingCount, "no entries may be left marked in-flight")
+	sub.Unlock()
+}
+
+// TestMixedContentionAndHardErrorDoesNotNarrow pins finding (a) on the AIMD
+// controller: a drain that failed on a non-retryable error must not be
+// penalised for contention that merely happened to occur in the same pass.
+//
+// This is reachable because the contention-collect branch guards on the parent
+// ctx, not the group ctx, so a sibling's 1213 is still collected after another
+// batch has cancelled the group.
+func TestMixedContentionAndHardErrorDoesNotNarrow(t *testing.T) {
+	shortenContentionBackoff(t)
+	fake := &sequencedApplier{errs: []error{deadlockErr(), errInjected}}
+	sub := newByteCapBufferedMap(&fake.countingApplier, false)
+	sub.applier = fake
+	sub.flushConcurrency = 2
+
+	for i := range 2 * DefaultBatchSize {
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
 	}
 
 	_, err := sub.Flush(t.Context(), false, nil)
-	require.NoError(t, err)
-
-	var seen []int64
-	for _, call := range fake.upserts() {
-		for _, row := range call {
-			seen = append(seen, row.RowImage[0].(int64))
-		}
-	}
-	require.Len(t, seen, totalRows)
-	require.IsIncreasing(t, seen, "batches must be built in primary key order")
+	require.ErrorIs(t, err, errInjected, "the hard error must surface")
+	require.Equal(t, 2, sub.effectiveFlushConcurrency(),
+		"a drain that failed on a hard error must not narrow on incidental contention")
+	require.Equal(t, DefaultBatchSize, sub.effectiveBatchSize())
 }
 
-func TestCompareBufferedKeys(t *testing.T) {
-	t.Run("numeric keys sort numerically, not lexicographically", func(t *testing.T) {
-		require.Negative(t, compareBufferedKeys([]any{int64(9)}, []any{int64(100)}))
-		require.Positive(t, compareBufferedKeys([]any{int64(100)}, []any{int64(9)}))
-		require.Zero(t, compareBufferedKeys([]any{int64(42)}, []any{int64(42)}))
-		require.Negative(t, compareBufferedKeys([]any{uint64(9)}, []any{uint64(100)}))
-	})
+// TestRepeatedHardFailuresDoNotWiden pins finding (b): consecutive drains that
+// fail with a non-contention error must not be counted as clean. Three of them
+// previously restored the full width — on the strength of three failures during
+// which nothing flushed at all.
+//
+// Starting from a narrowed state is essential. At penalty 0
+// adaptFlushConcurrency(false) early-returns, so the assertion would hold
+// trivially and the bug would stay invisible.
+func TestRepeatedHardFailuresDoNotWiden(t *testing.T) {
+	fake := &gatedApplier{}
+	sub := newGatedBufferedMap(fake, false)
+	sub.flushConcurrency = 8
+	sub.adaptFlushConcurrency(true) // narrow first: penalty 1, concurrency 4
+	require.Equal(t, 4, sub.effectiveFlushConcurrency())
+	fake.failUpserts.Store(true)
 
-	t.Run("composite keys compare component by component", func(t *testing.T) {
-		require.Negative(t, compareBufferedKeys([]any{int64(1), "b"}, []any{int64(2), "a"}))
-		require.Negative(t, compareBufferedKeys([]any{int64(1), "a"}, []any{int64(1), "b"}))
-		require.Zero(t, compareBufferedKeys([]any{int64(1), "a"}, []any{int64(1), "a"}))
-	})
-
-	t.Run("shorter key sorts first on a common prefix", func(t *testing.T) {
-		require.Negative(t, compareBufferedKeys([]any{int64(1)}, []any{int64(1), "a"}))
-	})
-
-	t.Run("binary keys compare by bytes", func(t *testing.T) {
-		require.Negative(t, compareBufferedKeys([]any{[]byte{0x01}}, []any{[]byte{0x02}}))
-	})
-
-	// A FLOAT/DOUBLE primary key is pathological but legal, and it can decode
-	// as a NaN. slices.SortFunc requires a strict weak ordering and panics on
-	// an inconsistent comparator, so pin the behaviour rather than assume it:
-	// cmp.Compare (unlike the < operator) defines NaN as less than any non-NaN
-	// and equal to itself, which is already a total order.
-	t.Run("NaN float keys stay a total order", func(t *testing.T) {
-		nan, other := []any{math.NaN()}, []any{1.0}
-		require.Negative(t, compareBufferedKeys(nan, other))
-		require.Positive(t, compareBufferedKeys(other, nan))
-		require.Zero(t, compareBufferedKeys(nan, []any{math.NaN()}))
-
-		keys := [][]any{{3.0}, {math.NaN()}, {1.0}, {math.NaN()}, {2.0}}
-		require.NotPanics(t, func() {
-			slices.SortFunc(keys, compareBufferedKeys)
-		})
-		// NaNs first, then ascending non-NaNs.
-		require.True(t, math.IsNaN(keys[0][0].(float64)))
-		require.True(t, math.IsNaN(keys[1][0].(float64)))
-		require.Equal(t, []any{1.0}, keys[2])
-		require.Equal(t, []any{3.0}, keys[4])
-	})
-
-	// Mixed types can't happen for a single column in practice, but the
-	// comparator must stay a total order regardless: sort requires it, and an
-	// inconsistent comparator is a panic in newer Go releases.
-	t.Run("mixed types stay deterministic and antisymmetric", func(t *testing.T) {
-		a, b := []any{int64(1)}, []any{"1x"}
-		first := compareBufferedKeys(a, b)
-		require.NotZero(t, first, "distinct keys must order")
-		require.Equal(t, -first, compareBufferedKeys(b, a), "comparator must be antisymmetric")
-		for range 100 {
-			require.Equal(t, first, compareBufferedKeys(a, b), "comparator must be stable across calls")
+	for range cleanDrainsToRecover {
+		for i := range DefaultBatchSize {
+			sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
 		}
-	})
+		_, err := sub.Flush(t.Context(), false, nil)
+		require.ErrorIs(t, err, errInjected)
+		require.Equal(t, 4, sub.effectiveFlushConcurrency(),
+			"a failed drain is not evidence of quiet and must not widen the drain")
+	}
+}
+
+// TestAllDeferredDrainDoesNotWiden pins finding (c): a non-empty snapshot whose
+// every key is watermark-deferred issues zero applier calls, so it carries no
+// evidence about contention and must not advance the clean-drain streak.
+//
+// An empty buffer never reaches the controller (Flush short-circuits on an
+// empty snapshot), so this is specifically the non-empty-but-all-deferred case.
+func TestAllDeferredDrainDoesNotWiden(t *testing.T) {
+	fake := &countingApplier{}
+	chunker := table.NewMockChunker("deferred", 1000)
+	sub := newByteCapBufferedMap(fake, false)
+	sub.chunker = chunker
+	sub.watermarkOptimization = true
+	sub.flushConcurrency = 8
+	sub.adaptFlushConcurrency(true) // narrow first: penalty 1, concurrency 4
+	require.Equal(t, 4, sub.effectiveFlushConcurrency())
+
+	// MockChunker defers exactly the key equal to its current position, so a
+	// single key there is a fully-deferred, non-empty snapshot.
+	sub.HasChanged([]any{int64(0)}, []any{int64(0), "seed"}, false)
+	require.Equal(t, 1, sub.Length())
+
+	for range cleanDrainsToRecover {
+		allFlushed, err := sub.Flush(t.Context(), false, nil)
+		require.NoError(t, err)
+		require.False(t, allFlushed, "a deferred key means not-all-flushed")
+		require.Equal(t, 4, sub.effectiveFlushConcurrency(),
+			"an all-deferred drain applied nothing and must not widen the drain")
+	}
+	require.Empty(t, fake.upserts(), "no applier call should have been made")
 }
