@@ -1187,41 +1187,53 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 	//
 	// Giving up early is cheap by comparison: the remaining batches stay in the
 	// snapshot, get reattached, and are retried on the next flush.
-	passCtx, cancel := context.WithTimeout(ctx, contentionRetryBudget)
-	defer cancel()
+	//
+	// The budget is a plain deadline rather than a context, and this is the
+	// important part. An earlier revision derived a context.WithTimeout from ctx
+	// and handed *that* to flushBatch, which meant the budget did not merely
+	// stop the pass — it killed whatever REPLACE was running when it expired.
+	// Production showed the result as
+	//
+	//	failed to upsert rows: failed to execute upsert: context deadline exceeded
+	//
+	// which reads like a statement timeout and is nothing of the sort. On a
+	// table whose batches take longer than the budget, that fires on a
+	// perfectly healthy statement, every time. Checking the error's provenance
+	// before classifying it stopped the misdiagnosis but not the abort.
+	//
+	// So the budget now gates only the decision to *start* another attempt.
+	// Attempts run on ctx and are allowed to finish, which is safe because an
+	// attempt is already bounded from below the flush: RetryableTransaction
+	// makes at most MaxRetries tries, each capped by innodb_lock_wait_timeout.
+	// Overrun past the budget is therefore one attempt's worth, and no deadline
+	// of our own can ever surface as an apply failure. Same shape as
+	// drainDispatchBudget, which likewise stops scheduling rather than
+	// cancelling.
+	deadline := time.Now().Add(contentionRetryBudget)
 
 	var mu sync.Mutex
 	deferred := 0
 	for i, batch := range contended {
 		var err error
 		for attempt := range contentionRetries {
-			select {
-			case <-passCtx.Done():
-				// Distinguish our own budget from real shutdown. Only the
-				// latter is an error; the budget expiring just means the
-				// batches we have not reached yet go back in the buffer.
-				if ctx.Err() != nil {
-					return 0, ctx.Err()
-				}
+			if time.Now().After(deadline) {
+				// Our own impatience, not a failure: the batches not reached
+				// yet — this one included — go back in the buffer.
 				return deferred + len(contended) - i, nil
+			}
+			select {
+			case <-ctx.Done():
+				// A real shutdown. That *is* an error, and the caller must not
+				// treat the drain as having merely deferred work.
+				return 0, ctx.Err()
 			case <-time.After(contentionBackoff(attempt)):
 			}
-			if err = s.flushBatch(passCtx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
+			if err = s.flushBatch(ctx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
 				s.releaseAppliedBatch(snapshot, &mu, batch)
 				break
 			}
-			// The budget can expire *during* an attempt, not just between
-			// them, in which case flushBatch reports the cancellation rather
-			// than 1205/1213 — production showed this as a bare "failed to
-			// execute upsert: context deadline exceeded", which reads like a
-			// statement timeout and is nothing of the sort. Check passCtx
-			// before classifying, so our own impatience is never mistaken for
-			// a hard error.
-			if passCtx.Err() != nil {
-				if ctx.Err() != nil {
-					return 0, ctx.Err()
-				}
-				return deferred + len(contended) - i, nil
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
 			}
 			if !dbconn.IsLockContentionError(err) {
 				return 0, err
@@ -1250,18 +1262,27 @@ const contentionRetries = 4
 
 // contentionRetryBudget caps the total wall-clock time pass 2 may spend, across
 // all contended batches, before giving up and deferring the rest to the next
-// flush. Sized to comfortably cover the self-inflicted case (which returns
-// almost immediately) while keeping flushMu out of the multi-minute territory
-// that N batches against an external lock holder would otherwise reach.
+// flush. It bounds when a new attempt may *start*; see retryContendedBatches
+// for why it is not a context, and why that distinction matters more than the
+// number.
 //
-// It is deliberately not scaled up for the case where the copier is taking the
-// target's write capacity and each attempt is slow enough that this budget buys
-// only a handful of them. Expiring is cheap now — the leftovers are deferred,
-// not failed — so the right response to losing ground is to hand the batches
-// back and let the next flush try, not to hold flushMu longer.
+// The number still has to be in scale with one attempt, or the budget expires
+// before the first batch has had a fair try and pass 2 becomes decorative. It
+// was 20s, which was too small on the table this was tuned against: a drain
+// there worked through at most 452,571 rows in 21m37s, so with batches of
+// DefaultBatchSize and the reduced concurrency in force at the time, average
+// per-batch latency was *at least* ~11s — and a single flushBatch can spend
+// several times that inside RetryableTransaction, which retries up to
+// MaxRetries with innodb_lock_wait_timeout on each.
+//
+// Two minutes gives a handful of batches a genuine serial retry while staying
+// well inside drainDispatchBudget, so the drain's own bound is still the outer
+// one. Expiring remains cheap — the leftovers are deferred, not failed — so
+// this is a "how much is worth trying before handing back" figure, not a
+// deadline anything depends on.
 //
 // A var so tests can shorten it, as with contentionBackoff.
-var contentionRetryBudget = 20 * time.Second
+var contentionRetryBudget = 2 * time.Minute
 
 // releaseAppliedBatch drops a landed batch's entries from the snapshot and
 // returns its bytes to the buffer.

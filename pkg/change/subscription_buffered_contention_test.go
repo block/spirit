@@ -530,37 +530,63 @@ func TestContentionAtShutdownIsNotRetried(t *testing.T) {
 	require.Equal(t, totalRows, sub.Length(), "the rows must stay buffered for the next flush")
 }
 
-// budgetBlockingApplier fails its first upsert with a deadlock — enough to send
-// the batch to pass 2 — and then blocks every later call until its context is
-// cancelled. That models an attempt still waiting (on MySQL, or on an applier
-// worker) at the moment pass 2's budget expires.
-type budgetBlockingApplier struct {
+// budgetBurningApplier contends on its first contendingCalls upserts — enough
+// to send every batch to pass 2 — and then makes the first serial attempt take
+// longer than the whole retry budget before succeeding. That is the shape of a
+// real slow batch: the budget expires while a statement is legitimately in
+// flight, not because anything is wrong.
+//
+// It also records whether it was ever handed an already-cancelled context,
+// which is the property the budget must never violate.
+type budgetBurningApplier struct {
 	countingApplier
-	calls atomic.Int64
+	contendingCalls int64
+	burn            time.Duration
+
+	calls          atomic.Int64
+	burned         atomic.Bool
+	sawCanceledCtx atomic.Bool
 }
 
-func (a *budgetBlockingApplier) UpsertRows(ctx context.Context, _ *table.ColumnMapping, _ []applier.LogicalRow, _ []*dbconn.TableLock) (int64, error) {
-	if a.calls.Add(1) == 1 {
+func (a *budgetBurningApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+	if ctx.Err() != nil {
+		a.sawCanceledCtx.Store(true)
+	}
+	if a.calls.Add(1) <= a.contendingCalls {
 		return 0, deadlockErr()
 	}
-	<-ctx.Done()
-	return 0, ctx.Err()
+	if a.burn > 0 && a.burned.CompareAndSwap(false, true) {
+		time.Sleep(a.burn)
+	}
+	// The interesting check: after outlasting the budget, is our context still
+	// live? Under the old context-based budget it would not be.
+	if ctx.Err() != nil {
+		a.sawCanceledCtx.Store(true)
+		return 0, ctx.Err()
+	}
+	return a.countingApplier.UpsertRows(ctx, mapping, rows, locks)
 }
 
-// TestRetryBudgetExpiryMidStatementDefers pins the production defect this
-// change was written for.
+// TestRetryBudgetNeverCancelsAnAttempt pins the production defect this change
+// was written for.
 //
-// The budget can expire *during* an attempt, not only between them. flushBatch
-// then reports the cancellation rather than 1205/1213, so classifying on the
-// error alone sent it down the hard-error path and the drain failed with a bare
-// "failed to execute upsert: context deadline exceeded" — which reads like a
-// statement timeout and is nothing of the sort. It has to be recognised as our
-// own impatience and deferred like any other unresolved contention.
-func TestRetryBudgetExpiryMidStatementDefers(t *testing.T) {
+// The budget used to be a context.WithTimeout handed to flushBatch, so
+// expiring did not merely stop the pass — it killed the REPLACE that happened
+// to be running. On a table whose batches take longer than the budget that
+// fires on a perfectly healthy statement, and it surfaced as
+//
+//	failed to upsert rows: failed to execute upsert: context deadline exceeded
+//
+// which reads like a statement timeout and is nothing of the sort. It reached
+// the operator as a failed migration.
+//
+// The budget must now gate only the *start* of an attempt. An attempt already
+// under way runs on the parent context and is allowed to finish, so it lands.
+func TestRetryBudgetNeverCancelsAnAttempt(t *testing.T) {
 	shortenContentionBackoff(t)
-	shortenContentionBudget(t, 50*time.Millisecond)
+	shortenContentionBudget(t, 20*time.Millisecond)
 
-	fake := &budgetBlockingApplier{}
+	fake := &budgetBurningApplier{contendingCalls: 1, burn: 200 * time.Millisecond}
 	sub := newByteCapBufferedMap(&fake.countingApplier, false)
 	sub.applier = fake
 	sub.flushConcurrency = 1
@@ -571,10 +597,48 @@ func TestRetryBudgetExpiryMidStatementDefers(t *testing.T) {
 	}
 
 	allFlushed, err := sub.Flush(t.Context(), false, nil)
-	require.NoError(t, err, "the budget's own deadline must not surface as a drain failure")
-	require.False(t, allFlushed, "the unlanded batch must hold the position back")
-	require.Equal(t, int64(1), sub.batchesDeferred.Load(), "the batch must be deferred")
-	require.Equal(t, totalRows, sub.Length(), "the rows must stay buffered")
+	require.NoError(t, err, "the budget must never surface as an apply failure")
+	require.False(t, fake.sawCanceledCtx.Load(),
+		"an attempt outlasting the budget must still have a live context")
+	require.True(t, allFlushed, "the attempt was allowed to finish, so the batch landed")
+	require.Zero(t, sub.Length(), "and the rows are gone from the buffer")
+	require.Zero(t, sub.batchesDeferred.Load(), "nothing needed deferring")
+}
+
+// The budget still does its job: once spent, the batches pass 2 has not reached
+// yet are deferred to the next flush rather than holding flushMu indefinitely.
+// Deferring is not an error, and the batch that did land stays landed.
+func TestRetryBudgetExpiryDefersRemainingBatches(t *testing.T) {
+	shortenContentionBackoff(t)
+	shortenContentionBudget(t, 20*time.Millisecond)
+
+	const batches = 3
+	const totalRows = batches * DefaultBatchSize
+	fake := &budgetBurningApplier{contendingCalls: batches, burn: 200 * time.Millisecond}
+	sub := newByteCapBufferedMap(&fake.countingApplier, false)
+	sub.applier = fake
+	sub.flushConcurrency = 1
+
+	for i := range totalRows {
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
+	}
+
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err, "running out of budget is not a failure")
+	require.False(t, fake.sawCanceledCtx.Load())
+	require.False(t, allFlushed, "the deferred batches must hold the position back")
+	require.Equal(t, int64(batches-1), sub.batchesDeferred.Load(),
+		"the first batch outlasted the budget and landed; the rest were never started")
+	require.Equal(t, (batches-1)*DefaultBatchSize, sub.Length(),
+		"exactly the deferred batches stay buffered")
+
+	// Not a one-way door: with the budget restored the next flush finishes.
+	shortenContentionBudget(t, time.Minute)
+	fake.burn = 0
+	allFlushed, err = sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err)
+	require.True(t, allFlushed)
+	require.Zero(t, sub.Length())
 }
 
 // TestHardErrorDuringSerialRetryStillFailsDrain is the other side of the
