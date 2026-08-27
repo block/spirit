@@ -963,10 +963,11 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 			// Contention that outlived the serial pass is deferred, not failed.
 			//
 			// Reporting it as an error would throw away the whole drain, and a
-			// drain is not a cheap thing to throw away: when the copier has the
-			// applier queue saturated, one pass over a full buffer runs for
-			// minutes, so a single batch contending at the end would discard
-			// hundreds of batches' worth of *recorded* progress. The rows they
+			// drain is not a cheap thing to throw away: with the copier taking
+			// the target's write capacity, one pass over a full buffer has been
+			// observed to run for minutes, so a single batch contending at the
+			// end would discard hundreds of batches' worth of *recorded*
+			// progress. The rows they
 			// wrote stay written either way, but on the error path flushedGTID
 			// never advances and the flush is never recorded, which is the
 			// frozen-checkpoint symptom this whole path exists to prevent —
@@ -1148,12 +1149,11 @@ const contentionRetries = 4
 // almost immediately) while keeping flushMu out of the multi-minute territory
 // that N batches against an external lock holder would otherwise reach.
 //
-// It is deliberately not scaled up for a saturated applier queue, where an
-// attempt spends seconds waiting for a worker before it even reaches MySQL and
-// this budget buys only a handful of attempts. Expiring is cheap now — the
-// leftovers are deferred, not failed — so the right response to a queue we are
-// starving behind is to hand the batches back and let the next flush try, not
-// to hold flushMu longer while the copier keeps winning the queue.
+// It is deliberately not scaled up for the case where the copier is taking the
+// target's write capacity and each attempt is slow enough that this budget buys
+// only a handful of them. Expiring is cheap now — the leftovers are deferred,
+// not failed — so the right response to losing ground is to hand the batches
+// back and let the next flush try, not to hold flushMu longer.
 //
 // A var so tests can shorten it, as with contentionBackoff.
 var contentionRetryBudget = 20 * time.Second
