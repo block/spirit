@@ -90,12 +90,24 @@ const (
 	// changes while still well inside the byte cap, and the drain that
 	// followed ran for 21m37s holding flushMu for its full duration.
 	//
-	// 50k is chosen to keep that drain in the tens of seconds rather than
-	// the tens of minutes, so it fits inside roughly one DefaultFlushInterval
-	// and the flushed position keeps advancing. It is well above
-	// binlogTrivialThreshold, so it does not interfere with the "flush until
-	// trivial" loops, and it still lets dedup absorb hot-row workloads —
-	// map-mode overwrites of already-buffered keys bypass the cap entirely.
+	// 50k targets a drain of roughly two minutes rather than twenty. Scaling
+	// that production drain — at most 452,571 rows in 21m37s — down to 50k
+	// gives about 2m23s, and that is a floor rather than an estimate: the
+	// 452,571 figure is the backlog at flush *start*, so if fewer rows actually
+	// landed the per-row cost is higher and the scaled time is longer.
+	//
+	// Two minutes is not "one flush interval", and it is not meant to be. What
+	// matters is that the drain *completes*, because only a complete drain
+	// reports allChangesFlushed=true and only that advances the flushed
+	// position; a cap tight enough to fit one DefaultFlushInterval would
+	// truncate every drain and freeze the position just as before. Overlapping
+	// flushes are not a concern either — flushMu serializes them, so a tick
+	// arriving mid-drain waits rather than piling on.
+	//
+	// It is well above binlogTrivialThreshold, so it does not interfere with
+	// the "flush until trivial" loops, and it still lets dedup absorb hot-row
+	// workloads — map-mode overwrites of already-buffered keys bypass the cap
+	// entirely.
 	DefaultSubscriptionSoftLimitChanges = 50000
 	// DefaultTimeout is how long BlockWait is supposed to wait before returning errors.
 	DefaultTimeout = 30 * time.Second

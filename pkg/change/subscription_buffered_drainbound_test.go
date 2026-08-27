@@ -184,6 +184,87 @@ func TestDrainDispatchBudgetDefersTheRemainder(t *testing.T) {
 	require.Zero(t, sub.Length())
 }
 
+// TestDrainDispatchBudgetBoundsQueueModeToo covers the store the map drain's
+// backstop does not reach. Queue mode is where non-memory-comparable PKs spend
+// the post-copy phase, and it runs under the same flushMu, so leaving it
+// unbounded would exempt exactly those tables from the bound.
+func TestDrainDispatchBudgetBoundsQueueModeToo(t *testing.T) {
+	shortenDrainDispatchBudget(t, 30*time.Millisecond)
+	const segments = 4
+	const totalRows = segments * DefaultBatchSize
+	fake := &slowApplier{perCall: 40 * time.Millisecond}
+	sub := newByteCapBufferedMap(&fake.countingApplier, true) // queue mode
+	sub.applier = fake
+	require.True(t, sub.queueModeActive(), "this test must exercise the queue drain")
+
+	for i := range totalRows {
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
+	}
+
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err, "running out of budget is not an error")
+	require.False(t, allFlushed, "the queue remainder must hold the position back")
+	require.Positive(t, sub.drainsTimedOut.Load())
+
+	applied := 0
+	for _, call := range fake.upserts() {
+		applied += len(call)
+	}
+	require.Positive(t, applied, "the drain must make progress before giving up")
+	require.Less(t, applied, totalRows, "the budget must actually truncate the drain")
+	require.Equal(t, totalRows-applied, sub.Length(), "the remainder must be reattached in order")
+
+	expectedBytes := recomputeSizeBytes(sub)
+	sub.Lock()
+	require.Equal(t, expectedBytes, sub.sizeBytes)
+	sub.Unlock()
+
+	// The remainder is still ordered and still drains on the next flush.
+	shortenDrainDispatchBudget(t, time.Minute)
+	fake.perCall = 0
+	allFlushed, err = sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err)
+	require.True(t, allFlushed)
+	require.Zero(t, sub.Length())
+}
+
+// TestDrainDispatchBudgetIsNotDefeatedByASlotWait pins the gap between checking
+// the budget and actually starting work.
+//
+// The dispatch loop's check goes stale: g.Go blocks once the concurrency limit
+// is full, so a check that passes can be followed by an arbitrarily long wait
+// for a slot, and the batch then starts on a budget that has long since
+// expired. At concurrency 1 that is enough for a second batch to run in full
+// after the deadline.
+//
+// One batch is slower than the whole budget, so the second batch's slot opens
+// only after the deadline has passed. It must not run.
+func TestDrainDispatchBudgetIsNotDefeatedByASlotWait(t *testing.T) {
+	shortenDrainDispatchBudget(t, 30*time.Millisecond)
+	const batches = 3
+	const totalRows = batches * DefaultBatchSize
+	fake := &slowApplier{perCall: 300 * time.Millisecond}
+	sub := newByteCapBufferedMap(&fake.countingApplier, false)
+	sub.applier = fake
+	sub.flushConcurrency = 1
+
+	for i := range totalRows {
+		sub.HasChanged([]any{int64(i)}, []any{int64(i), "seed"}, false)
+	}
+
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err)
+	require.False(t, allFlushed)
+
+	applied := 0
+	for _, call := range fake.upserts() {
+		applied += len(call)
+	}
+	require.Equal(t, DefaultBatchSize, applied,
+		"exactly the batch that started before the deadline may run")
+	require.Equal(t, totalRows-DefaultBatchSize, sub.Length())
+}
+
 // A drain that fits inside its budget must report success. Guards against a
 // too-eager truncation check turning every healthy flush into a deferral,
 // which would freeze the checkpoint in the name of unfreezing it.

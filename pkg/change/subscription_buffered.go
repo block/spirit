@@ -896,6 +896,13 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, locks []*dbconn
 		if err != nil {
 			return false, err
 		}
+		if len(remainder) > 0 {
+			// A remainder with no error means the drain gave up its dispatch
+			// budget. Reporting success here would publish a position covering
+			// entries that were only reattached, so it has to hold the position
+			// back — the same contract the map drain's truncation uses.
+			allChangesFlushed = false
+		}
 	}
 	return allChangesFlushed, nil
 }
@@ -1102,29 +1109,40 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 	var mu sync.Mutex
 	var contended []*mapFlushBatch
 	var skippedBatches bool
-	// Stop *scheduling* once the budget is spent; batches already in flight
-	// are waited out below. g.Go blocks once effectiveFlushConcurrency are
-	// running, so the loop paces itself and this check runs roughly once per
-	// completed batch — the finest granularity available without abandoning
-	// work that is already partly done. Overrun is therefore bounded by one
-	// batch's own latency.
+	// Stop starting new batches once the budget is spent; batches already in
+	// flight are waited out below. Unlike the cancellation above this is not an
+	// error — the unstarted batches stay in the snapshot, are reattached, and go
+	// again on the next flush — and the caller reports the drain as incomplete
+	// so no position advances past them.
+	//
+	// Checked in two places, because the loop's own check goes stale. g.Go
+	// blocks once effectiveFlushConcurrency batches are running, so a check that
+	// passes can be followed by an arbitrarily long wait for a slot: at
+	// concurrency 1 with hour-long batches, the loop tests the deadline at t≈0,
+	// blocks in g.Go for an hour, and then launches a batch the budget no longer
+	// covers. The re-check inside the worker is what actually enforces "no new
+	// batch *starts* after the deadline"; the loop check is just a cheap early
+	// exit. Overrun is therefore one in-flight batch's latency, which is the
+	// least that can be promised without abandoning work already under way.
 	deadline := time.Now().Add(drainDispatchBudget)
-	budgetSpent := false
+	var budgetSpent atomic.Bool
 	for _, batch := range batches {
 		if gctx.Err() != nil {
 			skippedBatches = true
 			break // a batch failed or ctx was canceled; don't queue the rest
 		}
-		if time.Now().After(deadline) {
-			// Unlike the cancellation above this is not an error: the
-			// unscheduled batches stay in the snapshot, are reattached, and go
-			// again on the next flush. The caller reports the drain as
-			// incomplete so the position does not advance past them.
-			budgetSpent = true
-			s.drainsTimedOut.Add(1)
+		if budgetSpent.Load() || time.Now().After(deadline) {
+			budgetSpent.Store(true)
 			break
 		}
 		g.Go(func() error {
+			if time.Now().After(deadline) {
+				// The slot opened after the budget expired. Leave this batch's
+				// entries in the snapshot for the next flush rather than
+				// starting work the budget does not cover.
+				budgetSpent.Store(true)
+				return nil
+			}
 			if err := s.flushBatch(gctx, batch.deleteKeys, batch.upsertRows, nil); err != nil {
 				// The ctx.Err() half deliberately reads the *parent*, not gctx:
 				// a sibling's failure cancels gctx, and that must not stop this
@@ -1156,7 +1174,10 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 		// only reattached, not applied.
 		err = ctx.Err()
 	}
-	return contended, !budgetSpent, err
+	if budgetSpent.Load() {
+		s.drainsTimedOut.Add(1)
+	}
+	return contended, !budgetSpent.Load(), err
 }
 
 // retryContendedBatches re-applies contended batches one at a time.
@@ -1346,6 +1367,19 @@ func (s *bufferedMap) drainQueueSnapshot(ctx context.Context, snapshot []queuedC
 		return nil
 	}
 
+	// Same dispatch backstop the map drain applies, for the same reason: this
+	// runs with flushMu held, so an unbounded queue drain blocks every
+	// subsequent flush and the post-copy phase behind it. Queue mode is where
+	// non-memory-comparable PKs spend the post-copy phase, so leaving it
+	// unbounded would exempt exactly those tables.
+	//
+	// A segment boundary is the only place it is safe to stop. The queue is
+	// ordered and drained FIFO, so an applied prefix is a valid amount of work
+	// and reattachLocked prepends the remainder ahead of anything that arrived
+	// during the drain, preserving binlog order. Stopping mid-segment would
+	// split a batch that has already been partly built.
+	deadline := time.Now().Add(drainDispatchBudget)
+
 	prevIsDelete := snapshot[0].logicalRow.IsDeleted
 	for i, change := range snapshot {
 		rowBytes := renderedBytesOfChange(change.logicalRow, change.originalKey)
@@ -1355,6 +1389,13 @@ func (s *bufferedMap) drainQueueSnapshot(ctx context.Context, snapshot []queuedC
 		if typeFlip || batchFull || overBudget {
 			if err := flushSegment(i); err != nil {
 				return snapshot[applied:], err
+			}
+			if time.Now().After(deadline) {
+				// Not an error: the remainder is handed back for the next
+				// flush, and Flush reports the drain as incomplete so no
+				// position advances past it.
+				s.drainsTimedOut.Add(1)
+				return snapshot[applied:], nil
 			}
 		}
 		if change.logicalRow.IsDeleted {
