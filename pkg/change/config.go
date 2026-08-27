@@ -72,6 +72,14 @@ type ClientConfig struct {
 	// zero-value default) means use DefaultSubscriptionSoftLimitBytes.
 	SubscriptionSoftLimitBytes int64
 
+	// SubscriptionSoftLimitChanges overrides
+	// DefaultSubscriptionSoftLimitChanges for new subscriptions: the cap on
+	// pending change *count* before HasChanged parks, applied alongside
+	// SubscriptionSoftLimitBytes. Set to a negative value to disable the cap
+	// entirely. Zero (the zero-value default) means use
+	// DefaultSubscriptionSoftLimitChanges.
+	SubscriptionSoftLimitChanges int
+
 	// FlushConcurrency overrides DefaultFlushConcurrency for new
 	// subscriptions: the maximum number of applier batches a map-mode
 	// flush keeps in flight concurrently. Set to a negative value to

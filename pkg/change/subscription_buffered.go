@@ -173,6 +173,12 @@ type bufferedMap struct {
 	// can briefly exceed the limit by up to one oversized row.
 	softLimitBytes int64
 
+	// softLimitChanges is the second soft cap, on pending change *count*
+	// (Length(), so in-flight drain entries included). Zero disables it.
+	// Same admit-then-park semantics as softLimitBytes. See
+	// overSoftLimitLocked for why both caps exist.
+	softLimitChanges int
+
 	watermarkOptimization bool
 	chunker               table.MappedChunker
 
@@ -215,6 +221,7 @@ type bufferedMap struct {
 	batchesContended atomic.Int64 // applier batches that failed on 1205/1213
 	batchesDeferred  atomic.Int64 // contended batches left for the next flush
 	serialRecoveries atomic.Int64 // drains rescued by the serial retry pass
+	drainsTimedOut   atomic.Int64 // drains cut short by drainDispatchBudget
 
 	// lastParkWarn is when the park/unpark log pair was last emitted at
 	// Warn/Info level. Since flushes release capacity per batch, a
@@ -281,6 +288,12 @@ type BufferedSubscriptionConfig struct {
 	// cap. See bufferedMap.softLimitBytes for the semantics.
 	SoftLimitBytes int64
 
+	// SoftLimitChanges is the per-subscription cap on pending change
+	// *count* before HasChanged parks, applied alongside SoftLimitBytes;
+	// whichever binds first parks the reader. Zero disables it. See
+	// bufferedMap.overSoftLimitLocked for why both exist.
+	SoftLimitChanges int
+
 	// FlushRequest, when non-nil, receives the parked subscription (a
 	// non-blocking send) each time HasChanged parks on the soft limit.
 	// Owners that flush on a periodic ticker should select on it and
@@ -343,6 +356,7 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 		applier:              cfg.Applier,
 		pkIsMemoryComparable: cfg.CurrentTable.PrimaryKeyIsMemoryComparable() == nil,
 		softLimitBytes:       cfg.SoftLimitBytes,
+		softLimitChanges:     cfg.SoftLimitChanges,
 		flushRequest:         cfg.FlushRequest,
 		flushConcurrency:     cfg.FlushConcurrency,
 	}
@@ -428,12 +442,32 @@ var _ Subscription = (*bufferedMap)(nil)
 func (s *bufferedMap) Length() int {
 	s.Lock()
 	defer s.Unlock()
+	return s.lengthLocked()
+}
 
-	// flushingCount covers entries an in-flight Flush has swapped out
-	// but not yet applied — they are still pending changes, and callers
-	// like AllChangesFlushed must not see the buffer as empty while a
-	// drain is mid-air.
+// lengthLocked is Length without the Mutex, for callers that already hold it.
+//
+// flushingCount covers entries an in-flight Flush has swapped out but not yet
+// applied — they are still pending changes, and callers like AllChangesFlushed
+// must not see the buffer as empty while a drain is mid-air.
+func (s *bufferedMap) lengthLocked() int {
 	return len(s.changes) + len(s.queue) + s.flushingCount
+}
+
+// overSoftLimitLocked reports whether the buffer has reached either soft cap.
+//
+// Two caps because bytes and count measure different costs. Bytes bound the
+// migrator's memory, which is what a few wide LONGTEXT rows threaten. Count
+// bounds how long the resulting drain takes, which is set by applier round
+// trips and is indifferent to row width — and a narrow-row table hits the
+// second wall long before the first. On a production table averaging ~600
+// bytes per buffered change, 256MiB of bytes is over 450k changes, and a drain
+// of that size ran for 21m37s holding flushMu throughout.
+func (s *bufferedMap) overSoftLimitLocked() bool {
+	if s.softLimitBytes > 0 && s.sizeBytes >= s.softLimitBytes {
+		return true
+	}
+	return s.softLimitChanges > 0 && s.lengthLocked() >= s.softLimitChanges
 }
 
 func (s *bufferedMap) Tables() []*table.TableInfo {
@@ -473,6 +507,42 @@ func (s *bufferedMap) ImmutableColumnOrdinal() int {
 // only throughput. Three drains at the default 30s interval is ~90s of proven
 // quiet before stepping back up.
 const cleanDrainsToRecover = 3
+
+// drainDispatchBudget is a backstop on how long one drain spends dispatching
+// batches. Batches not yet scheduled when it expires stay in the snapshot, are
+// reattached, and go again on the next flush.
+//
+// The primary control on drain length is not here: it is
+// DefaultSubscriptionSoftLimitChanges, which bounds how large the buffer — and
+// therefore the snapshot a drain works through — is allowed to get in the first
+// place. That is the right lever, because a drain that finishes is worth far
+// more than a drain that is merely short. Only a complete drain reports
+// allChangesFlushed=true, and only that advances the flushed position; a
+// truncated one protects the checkpoint but does not move it. Capping *time*
+// too aggressively would therefore reproduce the frozen checkpoint it is meant
+// to prevent, just with a livelier status line. So this budget is set well
+// above the time a full buffer is expected to take (~50k changes drained in
+// roughly two minutes on the production table this was tuned against) and is
+// expected never to fire in normal operation.
+//
+// It exists for the case the count cap cannot cover: per-row cost is not
+// bounded. Wide rows, many secondary indexes, or a struggling target can make
+// 50k changes take an hour, and flushMu is held for the whole drain, so
+// everything else in the flush path queues behind it —
+// SetWatermarkOptimization takes flushMu as its first act, and the runner calls
+// it the moment the copy finishes. In production a 21m37s drain over ~452k
+// changes left the post-copy phase blocked on that mutex for over half an hour
+// after the copy had already completed. It also starves the AIMD controller,
+// which is fed once per drain and needs cleanDrainsToRecover of them to give a
+// halving back: at one sample per 20 minutes, "~90s of proven quiet" becomes an
+// hour, so a width reduced by a single transient 1213 stays reduced for the
+// rest of the migration.
+//
+// The budget does not apply to flushMapLocked, the serial path used under the
+// cutover lock and by SetWatermarkOptimization. Those must drain completely.
+//
+// A var so tests can shorten it.
+var drainDispatchBudget = 10 * DefaultFlushInterval
 
 // minAdaptiveBatchSize floors the batch shrink. Below roughly this many rows
 // the per-statement round trip dominates and the drain stops keeping up with a
@@ -649,7 +719,7 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 	// — the exit duration is the operator's main signal for binlog-
 	// retention risk, and without these lines a stalled migrator looks
 	// indistinguishable from one that's just slow.
-	if s.softLimitBytes > 0 && !dedupOverwrite && s.sizeBytes >= s.softLimitBytes && !s.closed {
+	if !dedupOverwrite && !s.closed && s.overSoftLimitLocked() {
 		s.timesParked.Add(1)
 		s.requestFlush()
 		parkEntryLog, parkExitLog := s.logger.Debug, s.logger.Debug
@@ -657,19 +727,22 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 			s.lastParkWarn = time.Now()
 			parkEntryLog, parkExitLog = s.logger.Warn, s.logger.Info
 		}
-		parkEntryLog("subscription parked on soft memory limit",
+		parkEntryLog("subscription parked on soft limit",
 			"table", s.table.SchemaName+"."+s.table.TableName,
 			"size_bytes", s.sizeBytes,
 			"soft_limit_bytes", s.softLimitBytes,
+			"changes", s.lengthLocked(),
+			"soft_limit_changes", s.softLimitChanges,
 		)
 		parkStart := time.Now()
-		for s.sizeBytes >= s.softLimitBytes && !s.closed {
+		for !s.closed && s.overSoftLimitLocked() {
 			s.cond.Wait()
 		}
-		parkExitLog("subscription unparked from soft memory limit",
+		parkExitLog("subscription unparked from soft limit",
 			"table", s.table.SchemaName+"."+s.table.TableName,
 			"parked_duration", time.Since(parkStart).String(),
 			"size_bytes", s.sizeBytes,
+			"changes", s.lengthLocked(),
 			"closed", s.closed,
 		)
 	}
@@ -931,7 +1004,18 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 	// Batches that lose to lock contention are collected rather than failing
 	// the drain — see retryContendedBatches for why that is safe and why the
 	// retry has to be serial.
-	contended, err := s.applyBatchesConcurrent(ctx, snapshot, batches)
+	contended, complete, err := s.applyBatchesConcurrent(ctx, snapshot, batches)
+	if !complete {
+		// The dispatch budget expired. Everything unscheduled is still in the
+		// snapshot and will be reattached; report the drain as incomplete so no
+		// client publishes a position that covers it.
+		allChangesFlushed = false
+		s.logger.Warn("flush drain exceeded its dispatch budget; deferring the remainder",
+			"table", s.table.SchemaName+"."+s.table.TableName,
+			"budget", drainDispatchBudget.String(),
+			"total_batches", len(batches),
+		)
+	}
 	if err != nil {
 		// Deliberately no adaptFlushConcurrency call here. A drain that failed
 		// on something other than contention is not evidence of contention, and
@@ -1008,7 +1092,7 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 // (the previous behaviour) threw away batches that were about to land and made
 // the whole drain fail, which is what pinned the buffer at its soft limit and
 // froze the flushed position.
-func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[string]bufferedChange, batches []*mapFlushBatch) ([]*mapFlushBatch, error) {
+func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[string]bufferedChange, batches []*mapFlushBatch) ([]*mapFlushBatch, bool, error) {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(s.effectiveFlushConcurrency())
 	// Workers delete their batch's entries as they land, so they only
@@ -1018,10 +1102,27 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 	var mu sync.Mutex
 	var contended []*mapFlushBatch
 	var skippedBatches bool
+	// Stop *scheduling* once the budget is spent; batches already in flight
+	// are waited out below. g.Go blocks once effectiveFlushConcurrency are
+	// running, so the loop paces itself and this check runs roughly once per
+	// completed batch — the finest granularity available without abandoning
+	// work that is already partly done. Overrun is therefore bounded by one
+	// batch's own latency.
+	deadline := time.Now().Add(drainDispatchBudget)
+	budgetSpent := false
 	for _, batch := range batches {
 		if gctx.Err() != nil {
 			skippedBatches = true
 			break // a batch failed or ctx was canceled; don't queue the rest
+		}
+		if time.Now().After(deadline) {
+			// Unlike the cancellation above this is not an error: the
+			// unscheduled batches stay in the snapshot, are reattached, and go
+			// again on the next flush. The caller reports the drain as
+			// incomplete so the position does not advance past them.
+			budgetSpent = true
+			s.drainsTimedOut.Add(1)
+			break
 		}
 		g.Go(func() error {
 			if err := s.flushBatch(gctx, batch.deleteKeys, batch.upsertRows, nil); err != nil {
@@ -1055,7 +1156,7 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 		// only reattached, not applied.
 		err = ctx.Err()
 	}
-	return contended, err
+	return contended, !budgetSpent, err
 }
 
 // retryContendedBatches re-applies contended batches one at a time.
@@ -1590,6 +1691,7 @@ func (s *bufferedMap) SetWatermarkOptimization(ctx context.Context, enabled bool
 		"batches_lock_contended", s.batchesContended.Swap(0),
 		"batches_contention_deferred", s.batchesDeferred.Swap(0),
 		"drains_rescued_serially", s.serialRecoveries.Swap(0),
+		"drains_truncated_by_time_budget", s.drainsTimedOut.Swap(0),
 		"flush_concurrency", s.effectiveFlushConcurrency(),
 		"delta_len", len(s.changes)+len(s.queue),
 		"size_bytes", s.sizeBytes,

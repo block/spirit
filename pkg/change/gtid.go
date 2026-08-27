@@ -105,6 +105,11 @@ type gtidClient struct {
 
 	subscriptionSoftLimitBytes int64
 
+	// subscriptionSoftLimitChanges is the per-subscription change-count
+	// cap, applied alongside the byte cap. Zero disables it. See
+	// DefaultSubscriptionSoftLimitChanges.
+	subscriptionSoftLimitChanges int
+
 	// flushConcurrency is the map-mode flush batch concurrency passed
 	// to each subscription on construction. See DefaultFlushConcurrency.
 	flushConcurrency int
@@ -132,22 +137,29 @@ func NewGTIDClient(db *sql.DB, host string, username, password string, appl appl
 	} else if softLimit < 0 {
 		softLimit = 0
 	}
+	softLimitChanges := config.SubscriptionSoftLimitChanges
+	if softLimitChanges == 0 {
+		softLimitChanges = DefaultSubscriptionSoftLimitChanges
+	} else if softLimitChanges < 0 {
+		softLimitChanges = 0
+	}
 	return &gtidClient{
-		db:                         db,
-		dbConfig:                   config.DBConfig,
-		host:                       host,
-		username:                   username,
-		password:                   password,
-		logger:                     config.Logger,
-		subs:                       newSubscriptionRegistry(),
-		callerCancelFunc:           config.CancelFunc,
-		ddlFilterSchema:            config.DDLFilterSchema,
-		ddlFilterTables:            toSet(config.DDLFilterTables),
-		serverID:                   config.ServerID,
-		applier:                    appl,
-		subscriptionSoftLimitBytes: softLimit,
-		flushConcurrency:           config.resolveFlushConcurrency(),
-		flushRequests:              make(chan Subscription, 1),
+		db:                           db,
+		dbConfig:                     config.DBConfig,
+		host:                         host,
+		username:                     username,
+		password:                     password,
+		logger:                       config.Logger,
+		subs:                         newSubscriptionRegistry(),
+		callerCancelFunc:             config.CancelFunc,
+		ddlFilterSchema:              config.DDLFilterSchema,
+		ddlFilterTables:              toSet(config.DDLFilterTables),
+		serverID:                     config.ServerID,
+		applier:                      appl,
+		subscriptionSoftLimitBytes:   softLimit,
+		subscriptionSoftLimitChanges: softLimitChanges,
+		flushConcurrency:             config.resolveFlushConcurrency(),
+		flushRequests:                make(chan Subscription, 1),
 	}
 }
 
@@ -161,6 +173,7 @@ func (c *gtidClient) AddSubscription(currentTable, newTable *table.TableInfo, ch
 		Chunker:          chunker,
 		Logger:           c.logger,
 		SoftLimitBytes:   c.subscriptionSoftLimitBytes,
+		SoftLimitChanges: c.subscriptionSoftLimitChanges,
 		FlushRequest:     c.flushRequests,
 		FlushConcurrency: c.flushConcurrency,
 	})
