@@ -2,7 +2,6 @@ package change
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -214,6 +213,7 @@ type bufferedMap struct {
 	keysSkippedBelow atomic.Int64
 	timesParked      atomic.Int64 // HasChanged was parked at least once on the soft limit
 	batchesContended atomic.Int64 // applier batches that failed on 1205/1213
+	batchesDeferred  atomic.Int64 // contended batches left for the next flush
 	serialRecoveries atomic.Int64 // drains rescued by the serial retry pass
 
 	// lastParkWarn is when the park/unpark log pair was last emitted at
@@ -952,11 +952,42 @@ func (s *bufferedMap) drainMapSnapshot(ctx context.Context, snapshot map[string]
 			"total_batches", len(batches),
 			"concurrency", s.effectiveFlushConcurrency(),
 		)
-		if err := s.retryContendedBatches(ctx, snapshot, contended); err != nil {
-			// Contention that survived a serial retry is unambiguous evidence,
-			// so this one does feed the controller before returning.
-			s.adaptFlushConcurrency(true)
+		leftover, err := s.retryContendedBatches(ctx, snapshot, contended)
+		if err != nil {
+			// A hard error or a real cancellation, not contention: same
+			// reasoning as the pass-1 error path above, so the controller is
+			// left alone.
 			return false, err
+		}
+		if len(leftover) > 0 {
+			// Contention that outlived the serial pass is deferred, not failed.
+			//
+			// Reporting it as an error would throw away the whole drain, and a
+			// drain is not a cheap thing to throw away: when the copier has the
+			// applier queue saturated, one pass over a full buffer runs for
+			// minutes, so a single batch contending at the end would discard
+			// hundreds of batches' worth of *recorded* progress. The rows they
+			// wrote stay written either way, but on the error path flushedGTID
+			// never advances and the flush is never recorded, which is the
+			// frozen-checkpoint symptom this whole path exists to prevent —
+			// re-entered from the other side.
+			//
+			// allChangesFlushed=false protects the checkpoint exactly as well
+			// as an error does: clients gate position advancement on it, so a
+			// deferred batch holds the position back just as a failed drain
+			// would. It is the same mechanism watermark-deferred keys already
+			// use. The difference is only that the batches which *did* land
+			// count, and the leftovers are retried on the next flush rather
+			// than after a whole failed drain's worth of lost ground.
+			s.batchesDeferred.Add(int64(len(leftover)))
+			s.logger.Warn("flush batches still contended; deferring to the next flush",
+				"table", s.table.SchemaName+"."+s.table.TableName,
+				"deferred_batches", len(leftover),
+				"contended_batches", len(contended),
+				"total_batches", len(batches),
+			)
+			s.adaptFlushConcurrency(true)
+			return false, nil
 		}
 		s.serialRecoveries.Add(1)
 	}
@@ -1035,10 +1066,11 @@ func (s *bufferedMap) applyBatchesConcurrent(ctx context.Context, snapshot map[s
 // retry is expected to succeed on its first, undelayed attempt; the escalating
 // attempts after it exist only for locks held from outside this drain.
 //
-// A batch that still fails here returns the error, leaving its entries in the
-// snapshot to be reattached and retried on the next flush. That is deliberate:
-// the flushed position must not advance over changes that never landed.
-func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[string]bufferedChange, contended []*mapFlushBatch) error {
+// Returns the batches that still could not land, which the caller defers to the
+// next flush; their entries are left in the snapshot to be reattached. A
+// non-nil error means something other than contention went wrong — a hard
+// error, or a genuine cancellation of the parent context.
+func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[string]bufferedChange, contended []*mapFlushBatch) ([]*mapFlushBatch, error) {
 	// Bound the whole pass, not just each batch. Against an external 1205 holder
 	// a single attempt is not cheap: flushBatch goes through
 	// dbconn.RetryableTransaction, which burns its own MaxRetries against
@@ -1053,39 +1085,51 @@ func (s *bufferedMap) retryContendedBatches(ctx context.Context, snapshot map[st
 	defer cancel()
 
 	var mu sync.Mutex
-	for _, batch := range contended {
+	var leftover []*mapFlushBatch
+	for i, batch := range contended {
 		var err error
 		for attempt := range contentionRetries {
 			select {
 			case <-passCtx.Done():
-				// Distinguish our own budget from real shutdown: on budget
-				// expiry the parent is still live and the caller should treat
-				// this as ordinary contention, not cancellation.
+				// Distinguish our own budget from real shutdown. Only the
+				// latter is an error; the budget expiring just means the
+				// batches we have not reached yet go back in the buffer.
 				if ctx.Err() != nil {
-					return ctx.Err()
+					return nil, ctx.Err()
 				}
-				return fmt.Errorf("serial contention retry budget (%s) exhausted with %w",
-					contentionRetryBudget, errStillContended)
+				return append(leftover, contended[i:]...), nil
 			case <-time.After(contentionBackoff(attempt)):
 			}
 			if err = s.flushBatch(passCtx, batch.deleteKeys, batch.upsertRows, nil); err == nil {
 				s.releaseAppliedBatch(snapshot, &mu, batch)
 				break
 			}
+			// The budget can expire *during* an attempt, not just between
+			// them, in which case flushBatch reports the cancellation rather
+			// than 1205/1213 — production showed this as a bare "failed to
+			// execute upsert: context deadline exceeded", which reads like a
+			// statement timeout and is nothing of the sort. Check passCtx
+			// before classifying, so our own impatience is never mistaken for
+			// a hard error.
+			if passCtx.Err() != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return append(leftover, contended[i:]...), nil
+			}
 			if !dbconn.IsLockContentionError(err) {
-				return err
+				return nil, err
 			}
 		}
 		if err != nil {
-			return fmt.Errorf("flush batch still contended after %d serial retries: %w", contentionRetries, err)
+			// Still contended after every attempt. Defer this one but keep
+			// going: the batches are disjoint, so one stubborn lock holder
+			// says nothing about whether the next batch can land.
+			leftover = append(leftover, batch)
 		}
 	}
-	return nil
+	return leftover, nil
 }
-
-// errStillContended marks a pass-2 giveup so callers can tell "we ran out of
-// patience with a lock holder" from a genuine cancellation.
-var errStillContended = errors.New("batches still contended")
 
 // contentionRetries is how many serial attempts a contended batch gets before
 // the drain gives up and leaves it for the next flush. The first is immediate
@@ -1103,7 +1147,16 @@ const contentionRetries = 4
 // flush. Sized to comfortably cover the self-inflicted case (which returns
 // almost immediately) while keeping flushMu out of the multi-minute territory
 // that N batches against an external lock holder would otherwise reach.
-const contentionRetryBudget = 20 * time.Second
+//
+// It is deliberately not scaled up for a saturated applier queue, where an
+// attempt spends seconds waiting for a worker before it even reaches MySQL and
+// this budget buys only a handful of attempts. Expiring is cheap now — the
+// leftovers are deferred, not failed — so the right response to a queue we are
+// starving behind is to hand the batches back and let the next flush try, not
+// to hold flushMu longer while the copier keeps winning the queue.
+//
+// A var so tests can shorten it, as with contentionBackoff.
+var contentionRetryBudget = 20 * time.Second
 
 // releaseAppliedBatch drops a landed batch's entries from the snapshot and
 // returns its bytes to the buffer.
@@ -1531,6 +1584,7 @@ func (s *bufferedMap) SetWatermarkOptimization(ctx context.Context, enabled bool
 		"keys_skipped_not_below_low", s.keysSkippedBelow.Swap(0),
 		"times_parked_on_soft_limit", s.timesParked.Swap(0),
 		"batches_lock_contended", s.batchesContended.Swap(0),
+		"batches_contention_deferred", s.batchesDeferred.Swap(0),
 		"drains_rescued_serially", s.serialRecoveries.Swap(0),
 		"flush_concurrency", s.effectiveFlushConcurrency(),
 		"delta_len", len(s.changes)+len(s.queue),
