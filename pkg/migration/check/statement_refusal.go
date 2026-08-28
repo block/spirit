@@ -25,8 +25,12 @@ import (
 // currentCreateTable is the table's current definition, normally its
 // SHOW CREATE TABLE. It must describe the table stmt alters. Pass an empty
 // string when it is not available: coverage then narrows to the checks that need
-// only the statement, and the ENUM/SET checks — which compare a redeclared
-// column against its current type — are skipped.
+// only the statement — the ENUM/SET checks, which compare a redeclared column
+// against its current type, and the missing-primary-key refusal, which reads
+// the current key definition, are skipped. The definition must also reflect
+// the table's true key set: SHOW CREATE TABLE output collected with
+// show_gipk_in_create_table_and_information_schema disabled omits a generated
+// invisible primary key and misreports the table as unkeyed.
 //
 // logger may be nil, in which case the checks' own logging is discarded.
 //
