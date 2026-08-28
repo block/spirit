@@ -63,3 +63,25 @@ func TestStatementRefusalNoPrimaryKeyTable(t *testing.T) {
 	assert.False(t, refused, "the check must skip without table metadata")
 	assert.Empty(t, reason)
 }
+
+// TestStatementRefusalNoPrimaryKeyReasonSelection classifies a statement that
+// trips more than one refusal on a table without a primary key. The verdict is
+// what a caller acts on; the reported reason follows the fixed check name
+// order, so a statement-level refusal may be reported ahead of the table-level
+// one. Every reported reason is a true refusal, and reclassifying after fixing
+// it surfaces the next.
+func TestStatementRefusalNoPrimaryKeyReasonSelection(t *testing.T) {
+	reason, refused, err := StatementRefusal(t.Context(),
+		"ALTER TABLE `schema_version` ADD CONSTRAINT fk FOREIGN KEY (`installed_by`) REFERENCES users (id)",
+		noPKTable, discardLogger())
+	require.NoError(t, err)
+	require.True(t, refused)
+	assert.Equal(t, "adding foreign key constraints is not supported", reason)
+
+	reason, refused, err = StatementRefusal(t.Context(),
+		"ALTER TABLE `schema_version` ADD COLUMN `checksum` int, ADD CONSTRAINT fk FOREIGN KEY (`installed_by`) REFERENCES users (id)",
+		noPKTable, discardLogger())
+	require.NoError(t, err)
+	require.True(t, refused)
+	assert.Equal(t, "adding foreign key constraints is not supported", reason)
+}
