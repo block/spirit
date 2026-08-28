@@ -604,7 +604,7 @@ func TestAutoIncCapacity_Suggestion_NonBigInt(t *testing.T) {
 	violations := linter.Lint([]*statement.CreateTable{ct}, nil)
 
 	require.Len(t, violations, 1)
-	require.Contains(t, *violations[0].Suggestion, "BIGINT")
+	require.Contains(t, *violations[0].Suggestion, `consider using "BIGINT"`)
 }
 
 func TestAutoIncCapacity_Suggestion_Signed(t *testing.T) {

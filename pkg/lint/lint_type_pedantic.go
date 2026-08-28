@@ -425,7 +425,7 @@ func (l *TypePedanticLinter) sameNameTypes(refs []tpColRef) []Violation {
 			Severity: l.sameNameSeverity,
 			Message: fmt.Sprintf(
 				"Column %q in table %q has type %q; inconsistent across schema (types in use: %s)",
-				r.col.Name, r.table.TableName, r.typ, strings.Join(distinct, ", "),
+				r.col.Name, r.table.TableName, r.typ, quoteJoin(distinct),
 			),
 			Location:   &Location{Table: r.table.TableName, Column: &colName},
 			Suggestion: new(fmt.Sprintf("Pick one canonical type for column %q across all tables; the larger/safer type is usually right", r.col.Name)),
@@ -512,7 +512,7 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 			Severity: l.collationSeverity,
 			Message: fmt.Sprintf(
 				"Column %q in table %q uses collation %q; inconsistent across schema (collations in use: %s) — %s",
-				r.col.Name, r.table.TableName, r.collation, strings.Join(distinct, ", "), consequence,
+				r.col.Name, r.table.TableName, r.collation, quoteJoin(distinct), consequence,
 			),
 			Location:   &Location{Table: r.table.TableName, Column: &colName},
 			Suggestion: new(fmt.Sprintf("Pick one canonical collation for column %q across all tables", r.col.Name)),
@@ -564,7 +564,7 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 					),
 					Location: &Location{Table: t.TableName, Column: &colName},
 					Suggestion: new(fmt.Sprintf(
-						"Align types: %s.%s (%s) and %s.id (%s) should match — grow the smaller side rather than shrink the larger",
+						"Align types: %s.%s (%q) and %s.id (%q) should match — grow the smaller side rather than shrink the larger",
 						t.TableName, c.Name, colType, target.TableName, idType,
 					)),
 					Context: map[string]any{

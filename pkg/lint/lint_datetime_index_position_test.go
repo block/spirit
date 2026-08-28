@@ -50,7 +50,7 @@ func TestDatetimeIndexPositionLinter_CreateTable_TimestampNotLast(t *testing.T) 
 
 	require.Len(t, violations, 1)
 	require.Equal(t, SeverityWarning, violations[0].Severity)
-	require.Contains(t, violations[0].Message, "TIMESTAMP")
+	require.Contains(t, violations[0].Message, `"TIMESTAMP" column "created_at"`)
 	require.Equal(t, "created_at", *violations[0].Location.Column)
 }
 

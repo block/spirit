@@ -372,9 +372,7 @@ func TestAllowEngine_ViolationSuggestionMultipleEngines(t *testing.T) {
 	suggestion := *violations[0].Suggestion
 	require.Contains(t, suggestion, "supported storage engine")
 	// Should contain all allowed engines (sorted)
-	require.Contains(t, suggestion, "innodb")
-	require.Contains(t, suggestion, "memory")
-	require.Contains(t, suggestion, "myisam")
+	require.Contains(t, suggestion, `"innodb", "memory", "myisam"`)
 }
 
 // Tests for linter metadata

@@ -63,7 +63,7 @@ func (l *HasFloatLinter) Lint(existingTables []*statement.CreateTable, changes [
 				// ADD COLUMN, or a column inside a new CREATE TABLE.
 				message = fmt.Sprintf("New column %q in table %q uses floating-point data type", colName, ct.TableName)
 			default:
-				message = fmt.Sprintf("Column %q in table %q uses %s data type", colName, ct.TableName, col.Raw.Tp.String())
+				message = fmt.Sprintf("Column %q in table %q uses %q data type", colName, ct.TableName, col.Raw.Tp.String())
 			}
 			violations = append(violations, Violation{
 				Linter: l,

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // Severity represents the severity level of a linting violation
@@ -67,6 +68,18 @@ func (v Violation) String() string {
 	}
 
 	return msg
+}
+
+// quoteJoin renders a list of SQL tokens (type names, collations, engine
+// names) for a violation message, quoting each element the same way %q quotes
+// a single identifier so lists follow the same convention as standalone
+// tokens.
+func quoteJoin(items []string) string {
+	quoted := make([]string, len(items))
+	for i, item := range items {
+		quoted[i] = fmt.Sprintf("%q", item)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 // Location provides information about where a violation occurred

@@ -356,7 +356,7 @@ func TestTypePedantic_SameName_TieEmitsInconsistentForAll(t *testing.T) {
 	tables_seen := map[string]bool{}
 	for _, v := range violations {
 		require.Contains(t, v.Message, "inconsistent across schema")
-		require.Contains(t, v.Message, "types in use")
+		require.Contains(t, v.Message, `types in use: "int(11)", "int(11) unsigned"`)
 		require.NotNil(t, v.Context["conflicting_types"])
 		tables_seen[v.Location.Table] = true
 	}

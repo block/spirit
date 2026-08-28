@@ -61,7 +61,7 @@ func (l *HasTimestampLinter) Lint(existingTables []*statement.CreateTable, chang
 					Table:  ct.TableName,
 					Column: &colName,
 				},
-				Message:  fmt.Sprintf("Column %q uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.", colName),
+				Message:  fmt.Sprintf(`Column %q uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, colName),
 				Severity: severity,
 			})
 		}

@@ -115,7 +115,7 @@ func (l *DatetimeIndexPositionLinter) violation(tableName string, idx statement.
 		Linter:   l,
 		Severity: SeverityWarning,
 		Message: fmt.Sprintf(
-			"%s has %s column %q in position %d of %d. %s columns are typically "+
+			"%s has %q column %q in position %d of %d. %q columns are typically "+
 				"queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a "+
 				"non-last index column prevents the optimizer from using subsequent columns "+
 				"for sorted access.",

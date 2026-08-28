@@ -104,7 +104,7 @@ func (l *ZeroDateLinter) checkColumnZeroDate(column *ast.ColumnDef, tableName st
 					Column: &columnName,
 				},
 				Severity: SeverityWarning,
-				Message:  fmt.Sprintf("column %s with type %q has a zero default value", columnName, column.Tp.String()),
+				Message:  fmt.Sprintf("column %q with type %q has a zero default value", columnName, column.Tp.String()),
 			}
 		}
 	}
