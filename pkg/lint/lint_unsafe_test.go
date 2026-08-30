@@ -66,7 +66,7 @@ func TestUnsafeLinter_AlterTableDropColumn(t *testing.T) {
 	require.Equal(t, "unsafe", violations[0].Linter.Name())
 	require.Equal(t, SeverityError, violations[0].Severity)
 	require.Contains(t, violations[0].Message, "Unsafe operation")
-	require.Equal(t, "Unsafe operation detected: DROP COLUMN `email`", violations[0].Message)
+	require.Equal(t, "Unsafe operation detected: \"DROP COLUMN `email`\"", violations[0].Message)
 	t.Log(violations[0].Message)
 	require.Equal(t, "users", violations[0].Location.Table)
 	require.NotNil(t, violations[0].Location.Column)
@@ -128,7 +128,7 @@ func TestUnsafeLinter_AlterTableTruncatePartition(t *testing.T) {
 	require.Len(t, violations, 1)
 	require.Equal(t, "unsafe", violations[0].Linter.Name())
 	require.Equal(t, SeverityError, violations[0].Severity)
-	require.Equal(t, "Unsafe operation detected: TRUNCATE PARTITION", violations[0].Message)
+	require.Equal(t, "Unsafe operation detected: \"TRUNCATE PARTITION\"", violations[0].Message)
 	require.Equal(t, "users", violations[0].Location.Table)
 }
 
@@ -144,7 +144,7 @@ func TestUnsafeLinter_AlterTableTruncatePartitionAll(t *testing.T) {
 	require.Len(t, violations, 1)
 	require.Equal(t, "unsafe", violations[0].Linter.Name())
 	require.Equal(t, SeverityError, violations[0].Severity)
-	require.Equal(t, "Unsafe operation detected: TRUNCATE PARTITION", violations[0].Message)
+	require.Equal(t, "Unsafe operation detected: \"TRUNCATE PARTITION\"", violations[0].Message)
 	require.Equal(t, "users", violations[0].Location.Table)
 }
 
@@ -316,7 +316,7 @@ func TestUnsafeLinter_AlterTableMultipleSpecs(t *testing.T) {
 	require.Equal(t, "users", violations[0].Location.Table)
 	require.NotNil(t, violations[0].Location.Column)
 	require.Equal(t, "phone", *violations[0].Location.Column)
-	require.Equal(t, "Unsafe operation detected: DROP COLUMN `phone`", violations[0].Message)
+	require.Equal(t, "Unsafe operation detected: \"DROP COLUMN `phone`\"", violations[0].Message)
 }
 
 func TestUnsafeLinter_AlterTableMultipleUnsafeSpecs(t *testing.T) {
@@ -344,8 +344,8 @@ func TestUnsafeLinter_AlterTableMultipleUnsafeSpecs(t *testing.T) {
 		columnMessages[*v.Location.Column] = v.Message
 	}
 	require.Equal(t, map[string]string{
-		"email": "Unsafe operation detected: DROP COLUMN `email`",
-		"phone": "Unsafe operation detected: DROP COLUMN `phone`",
+		"email": "Unsafe operation detected: \"DROP COLUMN `email`\"",
+		"phone": "Unsafe operation detected: \"DROP COLUMN `phone`\"",
 	}, columnMessages)
 }
 

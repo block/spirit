@@ -79,7 +79,7 @@ func (l *UnsafeLinter) Lint(_ []*statement.CreateTable, changes []*statement.Abs
 					violations = append(violations, Violation{
 						Linter:   l,
 						Location: &Location{Table: change.Table},
-						Message:  "Unsafe operation detected: " + AlterTableTypeToString(spec.Tp),
+						Message:  fmt.Sprintf("Unsafe operation detected: %q", AlterTableTypeToString(spec.Tp)),
 						Severity: SeverityError,
 					})
 				case ast.AlterTableModifyColumn, ast.AlterTableChangeColumn:
@@ -117,17 +117,17 @@ func (l *UnsafeLinter) Lint(_ []*statement.CreateTable, changes []*statement.Abs
 
 func unsafeDropColumnViolation(l *UnsafeLinter, tableName string, spec *ast.AlterTableSpec) Violation {
 	location := &Location{Table: tableName}
-	message := "Unsafe operation detected: DROP COLUMN"
+	operation := "DROP COLUMN"
 	if spec.OldColumnName != nil {
 		columnName := spec.OldColumnName.Name.O
 		location.Column = &columnName
-		message += " " + sqlescape.EscapeIdentifier(columnName)
+		operation += " " + sqlescape.EscapeIdentifier(columnName)
 	}
 
 	return Violation{
 		Linter:   l,
 		Location: location,
-		Message:  message,
+		Message:  fmt.Sprintf("Unsafe operation detected: %q", operation),
 		Severity: SeverityError,
 	}
 }

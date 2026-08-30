@@ -142,7 +142,7 @@ func indexLabel(idx statement.Index) string {
 	if idx.Name != "" {
 		return fmt.Sprintf("index %q", idx.Name)
 	}
-	return fmt.Sprintf("unnamed index on (%s)", strings.Join(idx.Columns, ", "))
+	return "unnamed index on " + quotedList(idx.Columns)
 }
 
 func capitalize(s string) string {

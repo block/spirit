@@ -155,7 +155,7 @@ func TestRedundantIndexLinter_RedundantToUniqueIndex(t *testing.T) {
 	violations := linter.Lint([]*statement.CreateTable{ct}, nil)
 
 	require.Len(t, violations, 1, "Expected one violation")
-	require.Contains(t, violations[0].Message, "Index 'idx_XYZ_id' on columns (XYZ_id) is redundant")
+	require.Contains(t, violations[0].Message, `Index "idx_XYZ_id" on column "XYZ_id" is redundant`)
 }
 
 func TestRedundantIndexLinter_DuplicateIndexes(t *testing.T) {

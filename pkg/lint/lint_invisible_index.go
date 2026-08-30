@@ -108,7 +108,7 @@ func (l *InvisibleIndexBeforeDropLinter) Lint(existingTables []*statement.Create
 				violations = append(violations, Violation{
 					Linter:   l,
 					Severity: severity,
-					Message:  fmt.Sprintf("Index '%s' should be made invisible before dropping to ensure it's not needed", indexName),
+					Message:  fmt.Sprintf("Index %q should be made invisible before dropping to ensure it's not needed", indexName),
 					Location: &Location{
 						Table: tableName,
 						Index: &indexName,

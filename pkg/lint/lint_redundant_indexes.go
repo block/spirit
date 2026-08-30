@@ -169,21 +169,37 @@ func renderIndexPart(p statement.IndexColumn) string {
 	return rendered
 }
 
-// renderIndexParts formats a list of key parts for human-readable messages.
-func renderIndexParts(parts []statement.IndexColumn) string {
+// renderedIndexParts renders each key part for human-readable messages.
+func renderedIndexParts(parts []statement.IndexColumn) []string {
 	rendered := make([]string, 0, len(parts))
 	for _, p := range parts {
 		rendered = append(rendered, renderIndexPart(p))
 	}
-	return strings.Join(rendered, ", ")
+	return rendered
 }
 
-// renderIndexColumns formats an index's columns for human-readable messages.
-// It uses the structured key parts (which carry prefix lengths and
-// expressions), falling back to the flat Columns slice for synthesized indexes
-// (e.g. column-level PRIMARY KEY / UNIQUE) via indexParts.
-func renderIndexColumns(index statement.Index) string {
-	return renderIndexParts(indexParts(index))
+// renderIndexParts formats a list of key parts as a bare comma-separated list
+// for SQL-snippet suggestions (Redefine index ... as INDEX (...)) — quoting
+// inside a runnable statement would corrupt it. Message prose uses the quoted
+// phrase helpers below instead.
+func renderIndexParts(parts []statement.IndexColumn) string {
+	return strings.Join(renderedIndexParts(parts), ", ")
+}
+
+// keyPartsPhrase formats key parts for message prose, quoting each rendered
+// part the way %q quotes a single identifier so a column list carries the
+// same marker as the quoted index name beside it, with the "column"/"columns"
+// noun in number agreement.
+func keyPartsPhrase(parts []statement.IndexColumn) string {
+	return columnsPhrase(renderedIndexParts(parts))
+}
+
+// indexColumnsPhrase formats an index's columns for message prose. It uses the
+// structured key parts (which carry prefix lengths and expressions), falling
+// back to the flat Columns slice for synthesized indexes (e.g. column-level
+// PRIMARY KEY / UNIQUE) via indexParts.
+func indexColumnsPhrase(index statement.Index) string {
+	return keyPartsPhrase(indexParts(index))
 }
 
 // indexColumnPartCovers reports whether key part b can serve every lookup that
@@ -426,30 +442,30 @@ func hasRedundantPKSuffix(index statement.Index, primaryKey statement.Index) (bo
 func createRedundancyViolation(tableName string, redundantIndex statement.Index, coveringIndex statement.Index, isDuplicate bool, redundantToPK bool) Violation {
 	var message, suggestion string
 
-	redundantCols := renderIndexColumns(redundantIndex)
-	coveringCols := renderIndexColumns(coveringIndex)
+	redundantCols := indexColumnsPhrase(redundantIndex)
+	coveringCols := indexColumnsPhrase(coveringIndex)
 
 	if isDuplicate {
 		if redundantToPK {
 			message = fmt.Sprintf(
-				"Index '%s' on columns (%s) is a duplicate of the PRIMARY KEY",
+				"Index %q on %s is a duplicate of the PRIMARY KEY",
 				redundantIndex.Name,
 				redundantCols,
 			)
 			suggestion = fmt.Sprintf(
-				"Drop index '%s' as it duplicates the PRIMARY KEY. "+
+				"Drop index %q as it duplicates the PRIMARY KEY. "+
 					"The PRIMARY KEY already provides all the functionality of this index.",
 				redundantIndex.Name,
 			)
 		} else {
 			message = fmt.Sprintf(
-				"Index '%s' on columns (%s) is a duplicate of index '%s'",
+				"Index %q on %s is a duplicate of index %q",
 				redundantIndex.Name,
 				redundantCols,
 				coveringIndex.Name,
 			)
 			suggestion = fmt.Sprintf(
-				"Drop index '%s' as it is an exact duplicate of '%s'. "+
+				"Drop index %q as it is an exact duplicate of %q. "+
 					"Duplicate indexes waste space and slow down writes with no benefit.",
 				redundantIndex.Name,
 				coveringIndex.Name,
@@ -459,26 +475,26 @@ func createRedundancyViolation(tableName string, redundantIndex statement.Index,
 		// Prefix redundancy
 		if redundantToPK {
 			message = fmt.Sprintf(
-				"Index '%s' on columns (%s) is redundant - covered by PRIMARY KEY on columns (%s)",
+				"Index %q on %s is redundant - covered by PRIMARY KEY on %s",
 				redundantIndex.Name,
 				redundantCols,
 				coveringCols,
 			)
 			suggestion = fmt.Sprintf(
-				"Consider dropping index '%s' as it is fully covered by the PRIMARY KEY. "+
+				"Consider dropping index %q as it is fully covered by the PRIMARY KEY. "+
 					"In InnoDB, the PRIMARY KEY is the clustered index and provides prefix lookup capability.",
 				redundantIndex.Name,
 			)
 		} else {
 			message = fmt.Sprintf(
-				"Index '%s' on columns (%s) is redundant - covered by index '%s' on columns (%s)",
+				"Index %q on %s is redundant - covered by index %q on %s",
 				redundantIndex.Name,
 				redundantCols,
 				coveringIndex.Name,
 				coveringCols,
 			)
 			suggestion = fmt.Sprintf(
-				"Consider dropping index '%s' as it is fully covered by '%s'. "+
+				"Consider dropping index %q as it is fully covered by %q. "+
 					"The longer index can satisfy all queries that would use the shorter index.",
 				redundantIndex.Name,
 				coveringIndex.Name,
@@ -510,7 +526,8 @@ func createPKSuffixViolation(tableName string, index statement.Index, primaryKey
 	usefulPrefix := parts[:len(parts)-redundantColCount]
 	pkCols := primaryKey.Columns[:redundantColCount]
 
-	fullCols := renderIndexParts(parts)
+	fullColsPhrase := keyPartsPhrase(parts)
+	quotedSuffix := quotedList(renderedIndexParts(redundantSuffix))
 	redundantSuffixStr := renderIndexParts(redundantSuffix)
 	usefulPrefixStr := renderIndexParts(usefulPrefix)
 
@@ -519,37 +536,37 @@ func createPKSuffixViolation(tableName string, index statement.Index, primaryKey
 	if redundantColCount == len(primaryKey.Columns) {
 		// Full PK is redundant
 		message = fmt.Sprintf(
-			"Index '%s' on columns (%s) has redundant PRIMARY KEY suffix (%s). "+
+			"Index %q on %s has redundant PRIMARY KEY suffix %s. "+
 				"InnoDB automatically appends PK columns to secondary indexes.",
 			index.Name,
-			fullCols,
-			redundantSuffixStr,
+			fullColsPhrase,
+			quotedSuffix,
 		)
 		suggestion = fmt.Sprintf(
-			"Redefine index '%s' as INDEX (%s). "+
-				"InnoDB will automatically append the PK columns (%s) internally, "+
-				"so explicitly including them wastes space and provides no benefit.",
+			"Redefine index %q as INDEX (%s). "+
+				"InnoDB will automatically append the PK %s internally, "+
+				"so explicitly including the PK wastes space and provides no benefit.",
 			index.Name,
 			usefulPrefixStr,
-			strings.Join(pkCols, ", "),
+			columnsPhrase(pkCols),
 		)
 	} else {
 		// Prefix of PK is redundant
 		message = fmt.Sprintf(
-			"Index '%s' on columns (%s) has a redundant PRIMARY KEY suffix (%s) — a leading prefix of the PRIMARY KEY appearing at the end of the index. "+
-				"InnoDB automatically appends the full PK columns (%s) to secondary indexes, "+
+			"Index %q on %s has a redundant PRIMARY KEY suffix %s — a leading prefix of the PRIMARY KEY appearing at the end of the index. "+
+				"InnoDB automatically appends the full PK %s to secondary indexes, "+
 				"so spelling out part of the PK at the end of the index is redundant.",
 			index.Name,
-			fullCols,
-			redundantSuffixStr,
-			strings.Join(primaryKey.Columns, ", "),
+			fullColsPhrase,
+			quotedSuffix,
+			columnsPhrase(primaryKey.Columns),
 		)
 		suggestion = fmt.Sprintf(
-			"Redefine index '%s' as INDEX (%s). "+
-				"InnoDB will automatically append the full PK (%s) internally.",
+			"Redefine index %q as INDEX (%s). "+
+				"InnoDB will automatically append the full PK %s internally.",
 			index.Name,
 			usefulPrefixStr,
-			strings.Join(primaryKey.Columns, ", "),
+			quotedList(primaryKey.Columns),
 		)
 	}
 
@@ -577,20 +594,19 @@ func createPKPrefixViolation(tableName string, index statement.Index, primaryKey
 	redundantPrefix := parts[:redundantColCount]
 	usefulSuffix := parts[redundantColCount:]
 
-	fullCols := renderIndexParts(parts)
 	redundantPrefixStr := renderIndexParts(redundantPrefix)
 	usefulSuffixStr := renderIndexParts(usefulSuffix)
 
 	message := fmt.Sprintf(
-		"Index '%s' on columns (%s) leads with PRIMARY KEY columns (%s). "+
+		"Index %q on %s leads with PRIMARY KEY %s. "+
 			"Point and equality lookups by PRIMARY KEY are served by the clustered index directly, "+
 			"and InnoDB appends PK columns to secondary indexes — the leading PK columns add no capability.",
 		index.Name,
-		fullCols,
-		redundantPrefixStr,
+		keyPartsPhrase(parts),
+		keyPartsPhrase(redundantPrefix),
 	)
 	suggestion := fmt.Sprintf(
-		"Redefine index '%s' as INDEX (%s) — InnoDB will append PRIMARY KEY (%s) internally — "+
+		"Redefine index %q as INDEX (%s) — InnoDB will append PRIMARY KEY (%s) internally — "+
 			"or drop it entirely if the PRIMARY KEY alone covers the queries that use it.",
 		index.Name,
 		usefulSuffixStr,

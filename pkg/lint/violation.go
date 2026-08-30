@@ -82,6 +82,26 @@ func quoteJoin(items []string) string {
 	return strings.Join(quoted, ", ")
 }
 
+// quotedList renders SQL tokens for message prose with number agreement: a
+// single token stands alone like any quoted identifier, and only a real list
+// earns parentheses — `"a"` versus `("a", "b")`.
+func quotedList(items []string) string {
+	if len(items) == 1 {
+		return fmt.Sprintf("%q", items[0])
+	}
+	return "(" + quoteJoin(items) + ")"
+}
+
+// columnsPhrase renders a column list with its noun in number agreement —
+// `column "a"` versus `columns ("a", "b")` — so messages never read
+// `columns ("a")` for a single column.
+func columnsPhrase(items []string) string {
+	if len(items) == 1 {
+		return "column " + fmt.Sprintf("%q", items[0])
+	}
+	return "columns (" + quoteJoin(items) + ")"
+}
+
 // Location provides information about where a violation occurred
 type Location struct {
 	// Table is the name of the table where the violation occurred
