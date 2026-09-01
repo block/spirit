@@ -539,6 +539,19 @@ func TestUnsafeWarningError(t *testing.T) {
 	assert.Equal(t, uint16(1364), warning.Number)
 }
 
+// The type is exported, so a caller can hold one carrying no warning. Reading
+// its text or unwrapping it must not panic, and the empty chain must not
+// present a typed nil as a non-nil error.
+func TestUnsafeWarningErrorWithoutWarning(t *testing.T) {
+	err := &UnsafeWarningError{}
+
+	assert.Equal(t, "unsafe warning", err.Error())
+	require.NoError(t, errors.Unwrap(err))
+
+	_, ok := errors.AsType[*mysql.MySQLError](err)
+	assert.False(t, ok, "an absent warning must not match as a MySQL error")
+}
+
 // A warning MySQL raises on a statement that itself returned no error still
 // stops the transaction, and carries the code that says why.
 func TestRetryableTransactionUnsafeWarningCarriesCode(t *testing.T) {

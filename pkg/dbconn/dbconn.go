@@ -144,11 +144,25 @@ type UnsafeWarningError struct {
 	Warning *mysql.MySQLError
 }
 
+// Error reports the warning and its code. The type is exported, so a caller can
+// hold one without a warning; Error stays callable on that value because the
+// places an error's text is read — logs, %v, a failing test — are the last
+// places a panic is affordable.
 func (e *UnsafeWarningError) Error() string {
+	if e.Warning == nil {
+		return "unsafe warning"
+	}
 	return fmt.Sprintf("unsafe warning %d: %s", e.Warning.Number, e.Warning.Message)
 }
 
-func (e *UnsafeWarningError) Unwrap() error { return e.Warning }
+// Unwrap returns the underlying warning, or nil when the error carries none.
+// A nil return ends the chain, which is what errors.Is and errors.As expect.
+func (e *UnsafeWarningError) Unwrap() error {
+	if e.Warning == nil {
+		return nil
+	}
+	return e.Warning
+}
 
 // canRetryError looks at the MySQL error and decides if it is considered
 // a permanent failure or not. For simplicity a "retryable" error means
