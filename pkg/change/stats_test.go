@@ -223,6 +223,17 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 	stats := client.FeedStats()
 	require.False(t, stats.LastFlushAt.IsZero(), "a completed flush must be recorded")
 	require.Equal(t, 2, stats.LastFlushRows, "batch size is the pending count at the start of the flush")
+
+	// The event age has to come from a real event header, against a real
+	// server: it is the one field here that cannot be checked by constructing a
+	// FeedStats, because the read loop is what stamps it and the value has to
+	// be a plausible wall-clock time rather than, say, a raw unix second
+	// rendered as 56 years. Bounds not equality — the insert above happened a
+	// moment ago on a clock we do not control.
+	require.False(t, stats.BufferedEventAt.IsZero(), "reading an event must stamp the event time")
+	require.WithinDuration(t, time.Now(), stats.BufferedEventAt, time.Minute,
+		"a feed reading a live server is seconds behind, not hours")
+	require.Contains(t, StatusRow(client), " behind)")
 	residual, flushes := client.FlushResidual()
 	require.Equal(t, 1, flushes)
 	require.Zero(t, residual, "the flush drained everything")
@@ -277,6 +288,44 @@ func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
 	got := FeedStats{BufferedPosition: long}.String()
 	require.Equal(t, "rotations=0 (0 forced)  parks=0 is-parked=false  never flushed  read="+long, got)
 	require.True(t, strings.HasSuffix(got, long), "nothing may follow the position")
+
+	// The age is the one exception, and it is allowed because it is bounded:
+	// it cannot push anything else off the line the way the flush phrase would.
+	withAge := FeedStats{
+		BufferedPosition: long,
+		BufferedEventAt:  time.Now().Add(-90 * time.Second),
+	}.String()
+	require.True(t, strings.HasSuffix(withAge, long+" (1m30s behind)"))
+}
+
+// The age is what makes the coordinate legible as progress. Nothing else in the
+// status block can answer "how far behind is this feed" — the GTID number looks
+// identical whether it is seconds or a week stale, and the count of GTIDs to go
+// is not a time without the source's commit rate, which is not reported here.
+func TestFeedStatsStringRendersTheBufferedPositionAge(t *testing.T) {
+	s := FeedStats{
+		BufferedPosition: "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-39441498306",
+		BufferedEventAt:  time.Now().Add(-(14*time.Hour + 32*time.Minute + 11*time.Second)),
+	}
+	require.Contains(t, s.String(),
+		"read=f50a3ec0-154f-3776-8f0f-ced626dbde36:1-39441498306 (14h32m11s behind)")
+
+	// A feed that has read nothing renders no age, which keeps every
+	// pre-existing status line byte-identical.
+	require.NotContains(t, FeedStats{BufferedPosition: "pos"}.String(), "behind)")
+
+	// Sub-second lag is a caught-up feed, not a missing field.
+	require.Contains(t, FeedStats{
+		BufferedPosition: "pos",
+		BufferedEventAt:  time.Now().Add(-200 * time.Millisecond),
+	}.String(), "(0s behind)")
+
+	// The source's clock running ahead of ours floors at zero. "(-3s behind)"
+	// reads as a bug in the migration rather than as the caught-up feed it is.
+	require.Contains(t, FeedStats{
+		BufferedPosition: "pos",
+		BufferedEventAt:  time.Now().Add(3 * time.Second),
+	}.String(), "(0s behind)")
 }
 
 // A feed that has not read anything yet omits the field rather than rendering
@@ -293,16 +342,22 @@ func TestStatusRowBufferedPositionFollowsStalestFeed(t *testing.T) {
 	recent := &statsFeed{stats: FeedStats{
 		LastFlushAt:      time.Now().Add(-time.Second),
 		BufferedPosition: "recent-feed-pos",
+		BufferedEventAt:  time.Now().Add(-5 * time.Second),
 		Rotations:        2,
 	}}
 	stale := &statsFeed{stats: FeedStats{
 		LastFlushAt:      time.Now().Add(-90 * time.Second),
 		BufferedPosition: "stale-feed-pos",
+		BufferedEventAt:  time.Now().Add(-2 * time.Minute),
 		Rotations:        3,
 	}}
 	row := StatusRow(recent, stale)
 	require.Contains(t, row, "read=stale-feed-pos")
 	require.NotContains(t, row, "recent-feed-pos")
+	// The age must come from the same feed as the coordinate. Taking the
+	// furthest-behind age independently would pair one source's position with
+	// another source's lag, which is worse than reporting neither.
+	require.Contains(t, row, "read=stale-feed-pos (2m0s behind)")
 	require.Contains(t, row, "rotations=5 (0 forced)", "counters still sum")
 
 	// Order must not matter.

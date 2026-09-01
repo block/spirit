@@ -648,7 +648,7 @@ The report is a header line plus one indented row per subsystem:
 2026/08/14 11:47:10 INFO migration status: state=copyRows total-time=2m30s copier-time=2m30s
   copier   46.13%  7550855/16370180  chunk-size=8097  eta=3m29s  throttled=false
   applier queue=128/128  workers=4  wait-p50=1.564s  write-p50=37ms  write-p90=131ms
-  binlog  deltas=0  rotations=56 (0 forced)  parks=0 is-parked=false  flush=8x1000  flushed 30s ago (took 9µs, 0 rows)  read=binlog.000047:104861122
+  binlog  deltas=0  rotations=56 (0 forced)  parks=0 is-parked=false  flush=8x1000  flushed 30s ago (took 9µs, 0 rows)  read=binlog.000047:104861122 (1s behind)
   ckpt    50s ago  binlog.000047:104857600
 ```
 
@@ -690,8 +690,22 @@ Spirit keeps the new table in sync with writes that land during the copy by subs
 | `flush` | How wide a flush currently runs: concurrent `REPLACE` statements × rows per statement. There is no flag for this — it is `8x1000` by default, derived from the instance under [`--enable-experimental-autoscaling`](#enable-experimental-autoscaling), and adjusted at runtime by the change feed's lock-contention controller either way, so the status report is where you read it. A second figure in parentheses, as in `flush=2x250 (of 8x1000)`, means that controller has narrowed the flush after deadlocks or lock waits: the first pair is what is running now, the second is what it would run without the back-off. Each step halves *both* terms, so one step costs 4×. The parenthetical's appearance is the signal, and its disappearance — after enough clean drains — is the recovery. One that stays for the rest of a run means the contention never cleared, and the `flushed` figures below are where its cost shows up. |
 | `flushed X ago (took Y, n rows)` | When the change feed last flushed its buffered changes to the new table, how long that flush took, and how many buffered changes it started with. Flushes are periodic (every 30 seconds by default), so `X` reads somewhere between `0s` and the interval during a healthy copy; a value that keeps climbing well past it means flushes are not completing. `0 rows` is the normal reading for a feed that is keeping up — there was nothing left to write. |
 | `read` | How far the feed has *read* the binary log, in the run's coordinate scheme. This is not the resume point: it is ahead of the `ckpt` position by whatever is still buffered and unflushed. Omitted before the feed has read anything. |
+| `(X behind)` | How old the events at that position are — the source's own timestamp on the last event read, against the clock now. This is the field to read as *time to catch up*: `(2s behind)` is a healthy feed, and `(14h32m behind)` is a feed replaying yesterday. It comes from the event headers the reader already has, so it costs no extra query. Omitted before the feed has read an event. |
 
 The `read` field is there to tell "the reader is fine, only publication is blocked" apart from "the feed has stalled" — two situations the `ckpt` row cannot distinguish, because it shows the flushed position, which is frozen in both. Spirit only advances the flushed position when a flush lands *every* buffered change, so while any change is held back the checkpoint stops moving by design. If `read` advances between reports the reader is working normally; if it is also standing still, the feed itself has stopped. The gap between `read` and the `ckpt` position is how much re-reading a resume would have to do.
+
+The age next to it answers the question the coordinate cannot: a GTID or file
+offset looks the same whether the feed is a second or a week behind, and the
+number of GTIDs still to go is not a time unless you also know the source's
+commit rate, which nothing here reports. So the age is what tells you whether a
+resumed migration can converge. A run that resumes from a checkpoint written
+days ago has to replay those days of binary log before it can cut over, and this
+is where that shows up — as a large `behind` figure that shrinks slowly. Watch
+its *rate* of decline against the run's remaining time: an age that is falling
+means the feed is gaining on the source, and one that is flat or growing means it
+is not, whatever the coordinate is doing. Note it is measured against the Spirit
+host's clock, so it is only as accurate as the clock skew to the source — which
+matters not at all at the multi-hour lags that are worth acting on.
 
 ### `ckpt` row
 
@@ -699,7 +713,7 @@ Reads `<age> ago  <position>`, or `never` before the first checkpoint. The
 position is in the run's coordinate scheme — `<file>:<offset>` or a GTID set,
 per [GTID auto-detection](#gtid-auto-detection).
 
-The age is how long ago the resume checkpoint was last written. Checkpoints are attempted every 50 seconds but are skipped while the copier has no resumable watermark yet, so `never` early in a run is expected. If the age keeps growing, an interrupted migration will resume from further back than you would like. A checkpoint that cannot be written at all is fatal — Spirit stops rather than working for hours without being able to record progress.
+The age is how long ago the resume checkpoint was last written. Checkpoints are attempted every 50 seconds but are skipped while the copier has no resumable watermark yet, so `never` early in a run is expected. If the age keeps growing, an interrupted migration will resume from further back than you would like. Note that this age says nothing about how *stale the position inside it* is: a run that resumed from a week-old checkpoint rewrites that row every 50 seconds, so the age reads seconds while the position is a week behind. The `(X behind)` figure on the `binlog` row is the one that answers that. A checkpoint that cannot be written at all is fatal — Spirit stops rather than working for hours without being able to record progress.
 
 The position is the binlog coordinate that checkpoint saved: the point a resumed migration would start reading from. Read it against `rotations` and the server's binlog retention, because resuming only works while this position is still on the server — a run with heavy rotation and a short `binlog_expire_logs_seconds` can become unresumable long before it fails.
 

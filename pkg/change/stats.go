@@ -38,6 +38,33 @@ type FeedStats struct {
 	// only publication is blocked, and the gap to the ckpt row is how much
 	// re-reading a restart would cost.
 	BufferedPosition string
+	// BufferedEventAt is the source's own wall-clock timestamp on the newest
+	// event the reader has read — i.e. when the source committed the
+	// transaction that BufferedPosition names. Zero before the feed has read
+	// an event carrying a timestamp.
+	//
+	// Rendered as an age next to BufferedPosition, which is the only form in
+	// which the position is legible as *progress*. A GTID coordinate says
+	// nothing about how far behind the feed is: on a resumed run the number
+	// looks the same whether it is seconds or a week stale, and the count of
+	// GTIDs to go cannot be turned into a time without knowing the source's
+	// commit rate, which nothing in the status block reports. The age answers
+	// it directly — and it answers it from data the reader already has, with no
+	// extra query against the source.
+	//
+	// This is the field to read when deciding whether a resumed migration can
+	// converge. A migration that resumes from a week-old checkpoint has to
+	// replay a week of binlog before it can cut over, and until now the only
+	// tell was the copier starting at 99.x%. It is also the honest measure of
+	// checkpoint staleness that Record.Age() is not: that measures when the
+	// checkpoint row was last written, which on a progressing run is always
+	// seconds ago no matter how stale the position inside it is.
+	//
+	// Measured against this host's clock, so clock skew against the source
+	// shifts it. At the multi-hour lags it exists to expose that is noise; at
+	// "caught up" it is why the rendering floors at zero rather than showing a
+	// negative age.
+	BufferedEventAt time.Time
 	// Rotations counts binlog rotations the feed has followed. Duplicate
 	// rotate events (the server sends a real one and an artificial one
 	// carrying the same position) are counted once.
@@ -304,9 +331,29 @@ func (s FeedStats) String() string {
 		// need not sort last in the set — a middle elision could hide exactly
 		// the digits that are changing and make a healthy reader look frozen,
 		// which is the misreading this field exists to prevent.
-		out += "  read=" + s.BufferedPosition
+		out += "  read=" + s.BufferedPosition + s.bufferedAgeField()
 	}
 	return out
+}
+
+// bufferedAgeField renders how far behind the source's clock the buffered
+// position is, with a leading separator, or "" when no event has been read yet.
+//
+// It goes immediately after the coordinate, despite read= being deliberately
+// last for length reasons, because the two are one reading: the coordinate says
+// where the reader is, this says how far back that is. Splitting them would put
+// the age somewhere an operator has to pair it up by eye on a multi-source
+// status block. It is short and bounded, so unlike the flush phrase it costs
+// nothing to sit behind an unbounded GTID set.
+func (s FeedStats) bufferedAgeField() string {
+	if s.BufferedEventAt.IsZero() {
+		return ""
+	}
+	// max(0, ...) because the source's clock can be ahead of ours: "(-3s
+	// behind)" reads as a bug in the migration rather than as the caught-up
+	// feed it actually is.
+	age := max(time.Since(s.BufferedEventAt), 0)
+	return fmt.Sprintf(" (%v behind)", age.Round(time.Second))
 }
 
 // flushShapeField renders the drain width, with a leading separator, or "" when
@@ -367,6 +414,13 @@ func StatusRow(srcs ...Source) string {
 			// useful choice: that is the feed holding the position back, and
 			// therefore the one whose reader progress is in question.
 			merged.BufferedPosition = s.BufferedPosition
+			// Travels with the position it describes, for the reason on
+			// bufferedAgeField: an age from one feed next to another feed's
+			// coordinate would be actively misleading. Not maxed across feeds
+			// independently, even though the furthest-behind feed is the
+			// interesting one, because that could pair a coordinate and an age
+			// from different sources.
+			merged.BufferedEventAt = s.BufferedEventAt
 		}
 		merged.Rotations += s.Rotations
 		merged.ForcedRotations += s.ForcedRotations

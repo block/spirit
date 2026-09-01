@@ -99,6 +99,12 @@ type gtidClient struct {
 	// tracking here is by GTID, so this is reported for diagnostics only.
 	rotations atomic.Int64
 
+	// lastEventTime is the source's own wall-clock timestamp on the newest
+	// binlog event the reader has seen, as unix seconds. Written by
+	// recordEventTime from the read loop, read back by eventTime; see
+	// FeedStats.BufferedEventAt.
+	lastEventTime atomic.Int64
+
 	periodicFlushLock   sync.Mutex
 	periodicFlushCancel context.CancelFunc
 	periodicFlushDone   chan struct{}
@@ -664,6 +670,11 @@ func (c *gtidClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		// Stamp before the switch, not inside it: several cases below
+		// `continue` out, and one call site per client is what keeps the two
+		// clients from drifting on this. The published position is at most one
+		// transaction behind the event stamped here.
+		recordEventTime(&c.lastEventTime, ev.Header.Timestamp)
 		switch event := ev.Event.(type) {
 		case *replication.GTIDEvent:
 			// The server emits a GTIDEvent at the start of every
@@ -1232,6 +1243,7 @@ func (c *gtidClient) FeedStats() FeedStats {
 	stats.LastFlushDuration = c.lastFlushDuration
 	stats.LastFlushRows = c.lastFlushRows
 	stats.Rotations = c.rotations.Load()
+	stats.BufferedEventAt = eventTime(&c.lastEventTime)
 	// Already under c.mu, which is what guards bufferedGTID.
 	if c.bufferedGTID != nil && !c.bufferedGTID.IsEmpty() {
 		stats.BufferedPosition = c.bufferedGTID.String()

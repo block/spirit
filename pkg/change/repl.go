@@ -159,6 +159,49 @@ func periodicFlushStopping(ctx context.Context) bool {
 	return ctx.Err() != nil
 }
 
+// recordEventTime advances dst to the wall-clock timestamp carried in a binlog
+// event header, which is when the source committed that transaction. Both
+// clients call it once per event read; see FeedStats.BufferedEventAt for what
+// the number is for.
+//
+// Two guards, both load-bearing:
+//
+//   - A zero timestamp is ignored. Artificial events the syncer manufactures
+//     locally (the rotate it fabricates when re-opening a file) carry no source
+//     time, and treating 0 as a timestamp would report the reader as 56 years
+//     behind.
+//   - It only ever moves forward. Timestamps are non-decreasing in commit
+//     order, so this is a no-op on a healthy stream — but on reconnect the
+//     server re-sends the FormatDescriptionEvent from the head of the file,
+//     stamped when that file was created, which can be hours older than the
+//     position we resumed at. Taking the max ignores it instead of reporting a
+//     jump backwards in a field an operator is reading as progress.
+func recordEventTime(dst *atomic.Int64, headerTimestamp uint32) {
+	if headerTimestamp == 0 {
+		return
+	}
+	secs := int64(headerTimestamp)
+	for {
+		prev := dst.Load()
+		if secs <= prev {
+			return
+		}
+		if dst.CompareAndSwap(prev, secs) {
+			return
+		}
+	}
+}
+
+// eventTime reads back a timestamp stored by recordEventTime, or the zero time
+// if no event has been seen yet.
+func eventTime(src *atomic.Int64) time.Time {
+	secs := src.Load()
+	if secs == 0 {
+		return time.Time{}
+	}
+	return time.Unix(secs, 0)
+}
+
 // backlogWorthDraining reports whether a Flush loop should drain again
 // immediately rather than calling BlockWait. Both clients' Flush loops consult
 // it between the drain and the wait.

@@ -96,6 +96,12 @@ type binlogClient struct {
 	// FeedStats.Rotations.
 	rotations atomic.Int64
 
+	// lastEventTime is the source's own wall-clock timestamp on the newest
+	// binlog event the reader has seen, as unix seconds. Written by
+	// recordEventTime from the read loop, read back by eventTime; see
+	// FeedStats.BufferedEventAt.
+	lastEventTime atomic.Int64
+
 	// periodicFlushLock protects the cancel/done pair below. The cancel
 	// signals the periodic-flush goroutine to exit; the done channel is
 	// closed by the goroutine on its way out, so StopPeriodicFlush can
@@ -726,6 +732,11 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		// Stamp before the switch, not inside it: RotateEvent `continue`s out
+		// below, and one call site per client is what keeps the two clients
+		// from drifting on this. The published position is at most one
+		// transaction behind the event stamped here.
+		recordEventTime(&c.lastEventTime, ev.Header.Timestamp)
 		// Handle the event.
 		switch event := ev.Event.(type) {
 		case *replication.RotateEvent:
@@ -1249,6 +1260,7 @@ func (c *binlogClient) FeedStats() FeedStats {
 	stats.LastFlushRows = c.lastFlushRows
 	stats.Rotations = c.rotations.Load()
 	stats.ForcedRotations = c.flushedBinlogs.Load()
+	stats.BufferedEventAt = eventTime(&c.lastEventTime)
 	// Already under c.mu, which is what guards bufferedPos.
 	if c.bufferedPos.Name != "" {
 		stats.BufferedPosition = formatBinlogPosition(c.bufferedPos)
