@@ -3,6 +3,7 @@ package copier
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -182,6 +183,14 @@ func TestCopierNullToNotNullConversion(t *testing.T) {
 	require.NoError(t, err)
 	err = copier.Run(t.Context())
 	require.ErrorContains(t, err, "unsafe warning")
+
+	// The warning carries the code that says which condition stopped the copy,
+	// so a caller can tell "a row held NULL in a NOT NULL column" from any
+	// other warning the same branch classifies as fatal.
+	warning, ok := errors.AsType[*dbconn.UnsafeWarningError](err)
+	require.True(t, ok, "copy error does not carry the warning: %v", err)
+	require.Equal(t, uint16(1048), warning.Warning.Number)
+
 	require.Equal(t, 0, db.Stats().InUse) // no connections in use.
 }
 

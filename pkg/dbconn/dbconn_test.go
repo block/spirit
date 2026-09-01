@@ -522,3 +522,43 @@ func TestRangeOptimizerRefusal(t *testing.T) {
 	_, err = RetryableTransaction(t.Context(), db, IgnoreDupKeyWarnings, config, query)
 	require.ErrorContains(t, err, "range_optimizer_max_mem_size")
 }
+
+// An unsafe warning reads as one sentence naming its code, and stays
+// classifiable by that code through errors.As.
+func TestUnsafeWarningError(t *testing.T) {
+	err := &UnsafeWarningError{Warning: &mysql.MySQLError{
+		Number:  1364,
+		Message: "Field 'name' doesn't have a default value",
+	}}
+
+	assert.Equal(t, "unsafe warning 1364: Field 'name' doesn't have a default value", err.Error())
+
+	wrapped := fmt.Errorf("failed to execute upsert: %w", err)
+	warning, ok := errors.AsType[*mysql.MySQLError](wrapped)
+	require.True(t, ok, "the warning code is not recoverable from the error chain")
+	assert.Equal(t, uint16(1364), warning.Number)
+}
+
+// A warning MySQL raises on a statement that itself returned no error still
+// stops the transaction, and carries the code that says why.
+func TestRetryableTransactionUnsafeWarningCarriesCode(t *testing.T) {
+	config := NewDBConfig()
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, Exec(t.Context(), db, "DROP TABLE IF EXISTS test.unsafewarn1"))
+	require.NoError(t, Exec(t.Context(), db,
+		"CREATE TABLE test.unsafewarn1 (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a))"))
+
+	// INSERT IGNORE succeeds while discarding the row, so the warning is the
+	// only signal that the write did not land as asked.
+	_, err = RetryableTransaction(t.Context(), db, IgnoreDupKeyWarnings, config,
+		"INSERT IGNORE INTO test.unsafewarn1 (a, b) VALUES (1, NULL)")
+	require.Error(t, err)
+
+	warning, ok := errors.AsType[*UnsafeWarningError](err)
+	require.True(t, ok, "transaction error does not carry the warning: %v", err)
+	assert.Equal(t, uint16(1048), warning.Warning.Number)
+	assert.Contains(t, err.Error(), "unsafe warning 1048:")
+}

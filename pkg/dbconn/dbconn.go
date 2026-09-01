@@ -129,6 +129,27 @@ func IsConnectionLossError(err error) bool {
 	}
 }
 
+// UnsafeWarningError reports a warning that MySQL raised on a statement Spirit
+// executed without error, and that Spirit treats as fatal. Statements such as
+// INSERT IGNORE succeed while discarding rows, so the warning is the only
+// signal that the copy would silently lose data.
+//
+// It unwraps to the underlying *mysql.MySQLError, so callers can classify the
+// warning by its code with errors.As or errors.AsType rather than by matching
+// on the message. The code matters because the same fatal branch covers
+// unrelated conditions — a NOT NULL column with no default (1364), a duplicate
+// on a unique key (1062), a value too long for its column (1406) — which a
+// caller may want to report or act on differently.
+type UnsafeWarningError struct {
+	Warning *mysql.MySQLError
+}
+
+func (e *UnsafeWarningError) Error() string {
+	return fmt.Sprintf("unsafe warning %d: %s", e.Warning.Number, e.Warning.Message)
+}
+
+func (e *UnsafeWarningError) Unwrap() error { return e.Warning }
+
 // canRetryError looks at the MySQL error and decides if it is considered
 // a permanent failure or not. For simplicity a "retryable" error means
 // rollback the transaction and start the transaction again.
@@ -274,7 +295,10 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 						return
 					default:
 						isFatal = true
-						err = fmt.Errorf("unsafe warning: %s", message)
+						err = &UnsafeWarningError{Warning: &mysql.MySQLError{
+							Number:  uint16(code),
+							Message: message,
+						}}
 						return
 					}
 				}
