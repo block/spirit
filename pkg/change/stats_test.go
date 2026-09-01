@@ -49,6 +49,29 @@ func (f *statsFeed) AllChangesFlushed() bool                                    
 func (f *statsFeed) Stop()                                                              {}
 func (f *statsFeed) Close()                                                             {}
 
+// pinClock freezes the clock String() measures its ages against and returns the
+// instant it froze at, so a test can build timestamps relative to it and assert
+// the exact rendered age.
+//
+// Every assertion in this file of the form "flushed 10s ago" or "(1m30s behind)"
+// needs it. The timestamp is constructed from time.Now() and String() reads the
+// clock again a moment later, so without a pinned clock each one is a race
+// against Duration.Round's half-second boundary — improbable per assertion, but
+// there are eight of them and CI runs the package under -race on shared
+// hardware. Widening them to a tolerance instead would cost the exact expected
+// strings, which are the most readable part of these tests.
+//
+// Not safe under t.Parallel(): nowFunc is package state, so a parallel test
+// rendering a status row would see the frozen clock. Nothing in this package is
+// parallel, and contentionBackoff carries the same constraint.
+func pinClock(t *testing.T) time.Time {
+	t.Helper()
+	at := time.Now()
+	nowFunc = func() time.Time { return at }
+	t.Cleanup(func() { nowFunc = time.Now })
+	return at
+}
+
 func TestFeedStatsStringNeverFlushed(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  never flushed",
@@ -56,8 +79,9 @@ func TestFeedStatsStringNeverFlushed(t *testing.T) {
 }
 
 func TestFeedStatsString(t *testing.T) {
+	now := pinClock(t)
 	s := FeedStats{
-		LastFlushAt:       time.Now().Add(-10 * time.Second),
+		LastFlushAt:       now.Add(-10 * time.Second),
 		LastFlushDuration: 2854617 * time.Nanosecond,
 		LastFlushRows:     5583,
 		Rotations:         4,
@@ -77,8 +101,9 @@ func TestStatusRowNoReporter(t *testing.T) {
 }
 
 func TestStatusRowSingleSource(t *testing.T) {
+	now := pinClock(t)
 	src := &statsFeed{stats: FeedStats{
-		LastFlushAt:       time.Now().Add(-3 * time.Second),
+		LastFlushAt:       now.Add(-3 * time.Second),
 		LastFlushDuration: 5 * time.Millisecond,
 		LastFlushRows:     12,
 		Rotations:         2,
@@ -93,15 +118,16 @@ func TestStatusRowSingleSource(t *testing.T) {
 // set: counters sum, and the flush figures come from the feed that flushed
 // least recently, because that is the one holding the position back.
 func TestStatusRowMergesSources(t *testing.T) {
+	now := pinClock(t)
 	recent := &statsFeed{stats: FeedStats{
-		LastFlushAt:       time.Now().Add(-time.Second),
+		LastFlushAt:       now.Add(-time.Second),
 		LastFlushDuration: time.Millisecond,
 		LastFlushRows:     1,
 		Rotations:         2,
 		ForcedRotations:   1,
 	}}
 	stale := &statsFeed{stats: FeedStats{
-		LastFlushAt:       time.Now().Add(-90 * time.Second),
+		LastFlushAt:       now.Add(-90 * time.Second),
 		LastFlushDuration: 7 * time.Millisecond,
 		LastFlushRows:     900,
 		Rotations:         3,
@@ -174,6 +200,10 @@ func TestGTIDFeedStats(t *testing.T) {
 	require.Equal(t, 42, stats.LastFlushRows)
 	require.False(t, stats.LastFlushAt.IsZero())
 	require.GreaterOrEqual(t, stats.LastFlushDuration, 5*time.Millisecond)
+	// Not pinClock'd, unlike the rendering tests above: the timestamp here comes
+	// from recordFlush rather than from the test, so freezing only the rendering
+	// clock would leave the two halves reading different instants. The 0s has
+	// most of a second of slack against a flush recorded microseconds ago.
 	require.Contains(t, StatusRow(c), "rotations=2 (0 forced)  parks=0 is-parked=false  flushed 0s ago")
 }
 
@@ -264,8 +294,9 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 // publication is blocked" apart from "the feed has stalled". The ckpt row
 // cannot: it shows the flushed position, which is frozen in both cases.
 func TestFeedStatsStringWithBufferedPosition(t *testing.T) {
+	now := pinClock(t)
 	s := FeedStats{
-		LastFlushAt:       time.Now().Add(-10 * time.Second),
+		LastFlushAt:       now.Add(-10 * time.Second),
 		LastFlushDuration: 2854617 * time.Nanosecond,
 		LastFlushRows:     5583,
 		BufferedPosition:  "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638",
@@ -282,6 +313,7 @@ func TestFeedStatsStringWithBufferedPosition(t *testing.T) {
 // anywhere else it would push the flush phrase off a narrow terminal, and
 // truncating it would stop it being comparable with the ckpt row.
 func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
+	now := pinClock(t)
 	long := "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638," +
 		"a1b2c3d4-154f-3776-8f0f-ced626dbde36:1-42," +
 		"b7c8d9e0-154f-3776-8f0f-ced626dbde36:1-7"
@@ -293,7 +325,7 @@ func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
 	// it cannot push anything else off the line the way the flush phrase would.
 	withAge := FeedStats{
 		BufferedPosition: long,
-		BufferedEventAt:  time.Now().Add(-90 * time.Second),
+		BufferedEventAt:  now.Add(-90 * time.Second),
 	}.String()
 	require.True(t, strings.HasSuffix(withAge, long+" (1m30s behind)"))
 }
@@ -303,9 +335,10 @@ func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
 // identical whether it is seconds or a week stale, and the count of GTIDs to go
 // is not a time without the source's commit rate, which is not reported here.
 func TestFeedStatsStringRendersTheBufferedPositionAge(t *testing.T) {
+	now := pinClock(t)
 	s := FeedStats{
 		BufferedPosition: "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-39441498306",
-		BufferedEventAt:  time.Now().Add(-(14*time.Hour + 32*time.Minute + 11*time.Second)),
+		BufferedEventAt:  now.Add(-(14*time.Hour + 32*time.Minute + 11*time.Second)),
 	}
 	require.Contains(t, s.String(),
 		"read=f50a3ec0-154f-3776-8f0f-ced626dbde36:1-39441498306 (14h32m11s behind)")
@@ -317,14 +350,14 @@ func TestFeedStatsStringRendersTheBufferedPositionAge(t *testing.T) {
 	// Sub-second lag is a caught-up feed, not a missing field.
 	require.Contains(t, FeedStats{
 		BufferedPosition: "pos",
-		BufferedEventAt:  time.Now().Add(-200 * time.Millisecond),
+		BufferedEventAt:  now.Add(-200 * time.Millisecond),
 	}.String(), "(0s behind)")
 
 	// The source's clock running ahead of ours floors at zero. "(-3s behind)"
 	// reads as a bug in the migration rather than as the caught-up feed it is.
 	require.Contains(t, FeedStats{
 		BufferedPosition: "pos",
-		BufferedEventAt:  time.Now().Add(3 * time.Second),
+		BufferedEventAt:  now.Add(3 * time.Second),
 	}.String(), "(0s behind)")
 }
 
@@ -339,16 +372,17 @@ func TestFeedStatsStringOmitsEmptyBufferedPosition(t *testing.T) {
 // merged: positions from different sources are not comparable, and the stalest
 // feed is the one whose reader progress is in question.
 func TestStatusRowBufferedPositionFollowsStalestFeed(t *testing.T) {
+	now := pinClock(t)
 	recent := &statsFeed{stats: FeedStats{
-		LastFlushAt:      time.Now().Add(-time.Second),
+		LastFlushAt:      now.Add(-time.Second),
 		BufferedPosition: "recent-feed-pos",
-		BufferedEventAt:  time.Now().Add(-5 * time.Second),
+		BufferedEventAt:  now.Add(-5 * time.Second),
 		Rotations:        2,
 	}}
 	stale := &statsFeed{stats: FeedStats{
-		LastFlushAt:      time.Now().Add(-90 * time.Second),
+		LastFlushAt:      now.Add(-90 * time.Second),
 		BufferedPosition: "stale-feed-pos",
-		BufferedEventAt:  time.Now().Add(-2 * time.Minute),
+		BufferedEventAt:  now.Add(-2 * time.Minute),
 		Rotations:        3,
 	}}
 	row := StatusRow(recent, stale)
