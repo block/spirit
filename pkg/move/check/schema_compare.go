@@ -66,13 +66,20 @@ func schemaDiff(table, wantCreate, gotCreate string) (string, error) {
 //
 // The relaxation cannot mask a NULL that actually exists. On a sharded target
 // the row never reaches an INSERT: the applier hashes the shard key first and a
-// NULL fails there. For any other tightened column the copy runs under
-// spirit's session sql_mode (NO_AUTO_VALUE_ON_ZERO, i.e. non-strict), where a
-// batched INSERT coerces the NULL to the type's implicit default instead of
-// erroring — and the checksum then reports the mismatch, because
-// ColumnMapping.ChecksumExprs compares an explicit ISNULL() digit per column.
-// So the outcome is a failed move, never a silently altered value; callers that
-// want the failure sooner should probe the tightened columns for NULLs before
+// NULL fails there. For any other tightened column, both copy paths write with
+// INSERT IGNORE (the copier's INSERT IGNORE ... SELECT, the applier's
+// INSERT IGNORE ... VALUES), and IGNORE downgrades the would-be
+// ER_BAD_NULL_ERROR to a warning and stores the type's implicit default
+// instead — regardless of row count, so this does not depend on batching. The
+// checksum then reports the mismatch, because ColumnMapping.ChecksumExprs
+// compares an explicit ISNULL() digit per column, which differs even for a
+// VARCHAR NOT NULL whose implicit default is the empty string.
+//
+// So the outcome is a failed move, never a silently altered value — but it is
+// an expensive failure: the initial checker runs with FixDifferences and three
+// retries, so each attempt re-copies the chunk, re-coerces the NULL, and finds
+// it again before the run gives up. Callers that want the failure in seconds
+// rather than hours should probe the tightened columns for NULLs before
 // starting the copy.
 func targetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) {
 	diffOpts := moveDiffOptions()

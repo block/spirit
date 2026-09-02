@@ -1071,6 +1071,29 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 // would carry column defaults rather than the source's values, so an ALTER on
 // the target alone would not make the copy correct.
 //
+// The comparison is deliberately exact, unlike move's source->target check
+// (move/check.targetSchemaDiff), which forgives a target that drops the
+// source's column-level AUTO_INCREMENT or is stricter about NULL. Neither
+// relaxation transfers, because the two gates guard different states:
+//
+//   - move requires a pre-existing target table to be EMPTY (target_state
+//     rejects one holding any row), so only rows not yet copied are at stake
+//     and its unconditional pre-cutover checksum vets every one of them. This
+//     gate fires on a target that may already be half-copied by an earlier
+//     attempt — the resumable-checkpoint case above — where a divergence can
+//     mean the rows already on the target are wrong, and no schema relaxation
+//     can establish otherwise.
+//   - move's relaxations exist for a sharded Vitess target: ids from a
+//     sequence, and a shard key that cannot be NULL because a primary vindex
+//     has no keyspace id for one. Sync has a single unsharded target and no
+//     cutover, so neither reason arises here.
+//
+// The strictness is therefore a decision, not an oversight: sync copies into a
+// target shaped exactly like its source or it does not copy at all. Revisit it
+// here on its own merits rather than by reaching for move's options — the two
+// paths agreeing about a target should be on purpose, and so should their
+// disagreeing. TestSyncVerifyExistingTargetTableRequiresExactSchema pins it.
+//
 // Regular secondary indexes are excluded from the comparison on both sides.
 // With DeferSecondaryIndexes the target is deliberately created without them,
 // and an attempt that died mid-copy leaves it that way; restoreSecondaryIndexes

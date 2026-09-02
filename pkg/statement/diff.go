@@ -254,6 +254,11 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 			// belonged to (a PK column is NOT NULL; once the PK is gone the
 			// target can declare it NULL). The PK drop itself is emitted by
 			// diffIndexes.
+			//
+			// This is the same predicate IgnoreNotNullRelaxation applies in
+			// columnsEqualWithContext, gated on PK membership rather than on
+			// the option — so with that option on, this case is subsumed.
+			// Change one and check the other.
 			lower := strings.ToLower(targetCol.Name)
 			pkDroppedNullabilityChange := sourcePKColumns[lower] && !targetPKColumns[lower] &&
 				!sourceCol.Nullable && targetCol.Nullable

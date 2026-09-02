@@ -947,6 +947,61 @@ func TestSyncValidate(t *testing.T) {
 	}
 }
 
+// TestSyncVerifyExistingTargetTableRequiresExactSchema pins sync's deliberate
+// divergence from move: move's source->target check forgives a target that
+// drops the source's column-level AUTO_INCREMENT or is stricter about NULL,
+// because it has already established the target is empty and vets the copy with
+// an unconditional pre-cutover checksum. Sync's gate fires on a target that may
+// be half-copied from an earlier attempt, so it requires an exact match — see
+// verifyExistingTargetTable for the full reasoning. If this is ever relaxed, it
+// should be because someone decided to, not because move's options got reused.
+func TestSyncVerifyExistingTargetTableRequiresExactSchema(t *testing.T) {
+	r := &Runner{target: applier.Target{Config: &mysql.Config{DBName: "sync_dest"}}}
+
+	tests := []struct {
+		name     string
+		source   string
+		target   string
+		wantDiff string // empty means the target must be accepted
+	}{
+		{
+			name:   "identical",
+			source: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
+			target: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
+		},
+		{
+			// Accepted by move — a sharded target's shard key cannot be NULL —
+			// and rejected here.
+			name:     "target stricter about NULL",
+			source:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
+			target:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			wantDiff: "MODIFY COLUMN `customer_id`",
+		},
+		{
+			// Also accepted by move — a sharded target takes its ids from a
+			// Vitess sequence — and rejected here.
+			name:     "target drops column AUTO_INCREMENT",
+			source:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY AUTO_INCREMENT, val VARCHAR(64) DEFAULT NULL)",
+			target:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY, val VARCHAR(64) DEFAULT NULL)",
+			wantDiff: "MODIFY COLUMN `id`",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := r.verifyExistingTargetTable("t1", tt.source, tt.target)
+			if tt.wantDiff == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "schema has diverged from the source")
+			require.Contains(t, err.Error(), tt.wantDiff,
+				"the error must carry the ALTER that reconciles the target")
+		})
+	}
+}
+
 // TestSyncResumeSourceSchemaChanged covers issue #1165: a source DDL that lands
 // between attempts must not be silently copied past. The target table exists
 // from the first run, so createTargetTables does not recreate it; without a
