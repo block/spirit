@@ -36,8 +36,55 @@ func showCreateTable(ctx context.Context, db *sql.DB, schema, table string) (str
 //
 // "want" is treated as the source-of-truth (e.g. sources[0] or the move source);
 // "got" is the schema being validated (another source, or a pre-created target).
+//
+// This is the comparison for two schemas that must be IDENTICAL — today
+// sources[0] against every other source (source_schema_consistency). Use
+// targetSchemaDiff for a source→target comparison, which additionally forgives
+// a target that is deliberately stricter.
 func schemaDiff(table, wantCreate, gotCreate string) (string, error) {
+	return statement.DiffCreateTables(table, wantCreate, gotCreate, moveDiffOptions())
+}
+
+// targetSchemaDiff compares a move's SOURCE table against a pre-created TARGET
+// table, and is the comparison the source→target checks use (target_state,
+// resume_state). It is schemaDiff plus one further relaxation, in one
+// direction only: a target column may be NOT NULL where the source permits
+// NULL.
+//
+// That is what statement.IgnoreNotNullRelaxation does: it lets the schema being
+// validated be stricter than its reference. Here the target is the validated
+// schema, so it must be passed as DiffCreateTables' "got" and the source as
+// "want" — the other way round would forgive the opposite, dangerous direction,
+// which is why the option and the argument order stay together in this one
+// function.
+//
+// A sharded target needs this. A Vitess primary vindex cannot map NULL to a
+// keyspace id, so the target declares its shard key NOT NULL — while the source
+// may still permit NULL because the ALTER to tighten it was never affordable on
+// a multi-terabyte unsharded table. Refusing that move forced operators to
+// choose between a correct target schema and being able to move into it at all.
+//
+// The relaxation cannot mask a NULL that actually exists. On a sharded target
+// the row never reaches an INSERT: the applier hashes the shard key first and a
+// NULL fails there. For any other tightened column the copy runs under
+// spirit's session sql_mode (NO_AUTO_VALUE_ON_ZERO, i.e. non-strict), where a
+// batched INSERT coerces the NULL to the type's implicit default instead of
+// erroring — and the checksum then reports the mismatch, because
+// ColumnMapping.ChecksumExprs compares an explicit ISNULL() digit per column.
+// So the outcome is a failed move, never a silently altered value; callers that
+// want the failure sooner should probe the tightened columns for NULLs before
+// starting the copy.
+func targetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) {
+	diffOpts := moveDiffOptions()
+	diffOpts.IgnoreNotNullRelaxation = true
+	return statement.DiffCreateTables(table, sourceCreate, targetCreate, diffOpts)
+}
+
+// moveDiffOptions returns the diff options every move-tables schema comparison
+// starts from: the package defaults plus move's column-level AUTO_INCREMENT
+// relaxation (see schemaDiff).
+func moveDiffOptions() *statement.DiffOptions {
 	diffOpts := statement.NewDiffOptions()
 	diffOpts.IgnoreColumnAutoIncrement = true
-	return statement.DiffCreateTables(table, wantCreate, gotCreate, diffOpts)
+	return diffOpts
 }

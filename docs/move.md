@@ -132,6 +132,15 @@ The in-memory byte budget the buffered copier sizes each copy chunk against. Mov
 
 A Go MySQL DSN for the target database. Tables will be created here automatically from the source schema.
 
+A table that already exists on the target is used as-is, provided it is empty and its schema matches the source. "Matches" permits the target to be *stricter* in two specific ways, so a declaratively-managed target does not have to mirror artifacts of its unsharded source:
+
+- the source's column-level `AUTO_INCREMENT` may be absent on the target (its ids come from elsewhere, e.g. a Vitess sequence);
+- a column the source declares nullable may be `NOT NULL` on the target — for example a shard key, which cannot be NULL in a sharded keyspace.
+
+The reverse of either — a target looser than its source — is still a mismatch and fails pre-flight, as does any other difference (column types, charset, collation, indexes, constraints). The error reports the `ALTER` that would reconcile the target.
+
+A `NOT NULL` target column does not make Move filter or rewrite source rows. If the source data does contain a NULL there, the move fails — at row-hashing time for a sharded target, otherwise at the checksum — rather than silently substituting a value. Confirm the column holds no NULLs before starting a large copy.
+
 ### threads
 
 - Type: Integer

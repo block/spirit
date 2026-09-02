@@ -27,6 +27,38 @@ type DiffOptions struct {
 	// affect copy correctness and must not block the move.
 	IgnoreColumnAutoIncrement bool
 
+	// IgnoreNotNullRelaxation lets the schema being validated be STRICTER than
+	// its reference on nullability, and only stricter: a validated column
+	// declared NOT NULL where the reference permits NULL is accepted, while one
+	// that permits NULL where the reference is NOT NULL remains a real
+	// difference. The option therefore can never quietly accept a schema that
+	// lost a NOT NULL the reference had.
+	//
+	// Default: false (via NewDiffOptions) — for general schema diffing a column
+	// gaining or losing NOT NULL is a real change.
+	//
+	// It is enabled by the move-tables target checks (see
+	// move/check.targetSchemaDiff), where the reference is the move's SOURCE and
+	// the validated schema is its physical TARGET. What that permits is a target
+	// column declared NOT NULL where the source still permits NULL — an
+	// unsharded source moving into a sharded target whose shard key must be
+	// NOT NULL, because a Vitess primary vindex cannot map NULL to a keyspace
+	// id.
+	//
+	// In terms of Diff's own arguments the reference is the parameter and the
+	// validated schema is the receiver, because DiffCreateTables diffs
+	// got->want. Stating the direction that way inverts it, which is why the
+	// wording above and TestDiff_IgnoreNotNullRelaxation both name the two
+	// schemas by role instead.
+	//
+	// That is safe for a move because nullability is metadata, not row bytes:
+	// the copy and the checksum compare values, and every column's NULL-ness is
+	// compared explicitly (see ColumnMapping.ChecksumExprs, which emits an
+	// ISNULL() digit per column). A tightened column whose source data holds no
+	// NULLs is therefore identical on both sides, and one that does hold a NULL
+	// is reported as a mismatch rather than hidden by this option.
+	IgnoreNotNullRelaxation bool
+
 	// IgnoreEngine skips diffing the ENGINE table option.
 	// Default: true (via NewDiffOptions).
 	IgnoreEngine bool
@@ -52,6 +84,7 @@ func NewDiffOptions() *DiffOptions {
 	return &DiffOptions{
 		IgnoreAutoIncrement:       true,
 		IgnoreColumnAutoIncrement: false,
+		IgnoreNotNullRelaxation:   false,
 		IgnoreEngine:              true,
 		IgnoreCharsetCollation:    false,
 		IgnorePartitioning:        false,
@@ -684,8 +717,22 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	if !ptrEqual(a.Zerofill, b.Zerofill) {
 		return false
 	}
+	// A nullability difference is normally a real change. With
+	// IgnoreNotNullRelaxation it is forgiven in exactly one direction: `a` is
+	// NOT NULL and `b` permits NULL, so the only thing the MODIFY would do is
+	// weaken the column (the same NOT NULL -> NULL relaxation diffColumns
+	// already suppresses for a dropped primary key). The opposite direction —
+	// a difference the MODIFY would need to *tighten* — stays a real change.
+	//
+	// `a` belongs to the receiver and `b` to the diffed-to table, which for a
+	// DiffCreateTables caller means `a` is the schema under validation and `b`
+	// the reference: this forgives a validated schema that is stricter, which
+	// is the direction the option documents.
 	if a.Nullable != b.Nullable {
-		return false
+		forgivenRelaxation := opts.IgnoreNotNullRelaxation && !a.Nullable && b.Nullable
+		if !forgivenRelaxation {
+			return false
+		}
 	}
 	// Normalize default values for nullable columns:
 	// For nullable columns, nil and the NULL *keyword* are semantically
@@ -693,15 +740,22 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	// `VARCHAR(255) DEFAULT NULL`. A quoted string literal 'NULL'
 	// (DefaultIsString) is NOT the keyword and must not collapse — it is a
 	// real default that differs from no-default.
+	//
+	// Each side is normalized on its OWN nullability. Until
+	// IgnoreNotNullRelaxation existed the two were always equal here (the check
+	// above returned early otherwise), so this is the same normalization as
+	// before for every other comparison. It matters for a forgiven relaxation:
+	// there the nullable side renders `DEFAULT NULL` while the NOT NULL side
+	// carries no default, and gating on one side's nullability alone would
+	// report that as a default difference — reintroducing the very MODIFY the
+	// option exists to suppress.
 	sourceDefault := a.Default
 	targetDefault := b.Default
-	if a.Nullable {
-		if sourceDefault != nil && *sourceDefault == "NULL" && !a.DefaultIsString {
-			sourceDefault = nil
-		}
-		if targetDefault != nil && *targetDefault == "NULL" && !b.DefaultIsString {
-			targetDefault = nil
-		}
+	if a.Nullable && sourceDefault != nil && *sourceDefault == "NULL" && !a.DefaultIsString {
+		sourceDefault = nil
+	}
+	if b.Nullable && targetDefault != nil && *targetDefault == "NULL" && !b.DefaultIsString {
+		targetDefault = nil
 	}
 	if !ptrEqual(sourceDefault, targetDefault) {
 		return false
