@@ -103,7 +103,7 @@ func (l *UnsafeLinter) Lint(_ []*statement.CreateTable, changes []*statement.Abs
 					// I do not believe that PlanetScale has this detection, so we may decide to
 					// implement it here in future.
 				case ast.AlterTableDropForeignKey, ast.AlterTableRenameColumn,
-					ast.AlterTableRenameTable, ast.AlterTableDropIndex, ast.AlterTableDropCheck,
+					ast.AlterTableRenameTable, ast.AlterTableDropIndex, ast.AlterTableDropCheck, ast.AlterTableDropConstraint,
 					ast.AlterTableOption:
 					// In some definitions of "safe" these might be unsafe,
 					// but since none lose data we consider them safe.

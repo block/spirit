@@ -452,10 +452,9 @@ func (a *AbstractStatement) ColumnRenameMap() map[string]string {
 // TABLE, or one that names no check constraints.
 //
 // Note that MySQL's DROP CONSTRAINT is not specific to check constraints - it
-// also drops a foreign key or a unique constraint of that name - but the parser
-// folds it into the same clause type as DROP CHECK, so a name here is only a
-// candidate. Callers match it against the check constraints that the table
-// actually has.
+// also drops a foreign key or a unique constraint of that name - so a name it
+// contributes here is only a candidate. Callers match it against the check
+// constraints that the table actually has.
 func (a *AbstractStatement) CheckConstraintsReferenced() []string {
 	alterStmt, ok := a.AsAlterTable()
 	if !ok {
@@ -464,7 +463,7 @@ func (a *AbstractStatement) CheckConstraintsReferenced() []string {
 	var names []string
 	for _, spec := range alterStmt.Specs {
 		switch spec.Tp { //nolint:exhaustive
-		case ast.AlterTableDropCheck, ast.AlterTableAlterCheck:
+		case ast.AlterTableDropCheck, ast.AlterTableDropConstraint, ast.AlterTableAlterCheck:
 			if spec.Constraint != nil && spec.Constraint.Name != "" {
 				names = append(names, spec.Constraint.Name)
 			}
@@ -512,15 +511,17 @@ func (a *AbstractStatement) AlterWithRenamedCheckConstraints(renames map[string]
 
 	dropped := make(map[string]struct{})
 	for _, spec := range alterStmt.Specs {
-		if spec.Tp == ast.AlterTableDropCheck && spec.Constraint != nil {
-			dropped[strings.ToLower(spec.Constraint.Name)] = struct{}{}
+		if spec.Tp == ast.AlterTableDropCheck || spec.Tp == ast.AlterTableDropConstraint {
+			if spec.Constraint != nil {
+				dropped[strings.ToLower(spec.Constraint.Name)] = struct{}{}
+			}
 		}
 	}
 
 	var unnamed []string
 	for _, spec := range alterStmt.Specs {
 		switch spec.Tp { //nolint:exhaustive
-		case ast.AlterTableDropCheck, ast.AlterTableAlterCheck:
+		case ast.AlterTableDropCheck, ast.AlterTableDropConstraint, ast.AlterTableAlterCheck:
 			if spec.Constraint == nil {
 				continue
 			}

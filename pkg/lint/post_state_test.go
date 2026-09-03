@@ -115,6 +115,147 @@ func TestPostState_AddDropForeignKey(t *testing.T) {
 	require.Equal(t, 1, fkCount, "ADD CONSTRAINT FOREIGN KEY should appear in post-state")
 }
 
+// constraintNames returns the names of post-state constraints of the given
+// type, and indexNames the same for indexes. Both keep the assertions below
+// readable when a table carries several constraints.
+func constraintNames(t *statement.CreateTable, typeMatch string) []string {
+	var out []string
+	for _, c := range t.Constraints {
+		if c.Type == typeMatch {
+			out = append(out, c.Name)
+		}
+	}
+	return out
+}
+
+func indexNames(t *statement.CreateTable, typeMatch string) []string {
+	var out []string
+	for _, idx := range t.Indexes {
+		if idx.Type == typeMatch {
+			out = append(out, idx.Name)
+		}
+	}
+	return out
+}
+
+// TestPostState_DropCheck is a regression test for a latent bug found while
+// fixing block/spirit#1183: the DROP CHECK branch read the constraint name
+// from spec.Name, but that production stores it on spec.Constraint. spec.Name
+// is empty, and removeConstraint short-circuits on an empty name, so the
+// branch removed nothing and DROP CHECK was a no-op in the post-state.
+func TestPostState_DropCheck(t *testing.T) {
+	existing, err := statement.ParseCreateTable(`CREATE TABLE t1 (
+		id INT PRIMARY KEY,
+		age INT,
+		CONSTRAINT chk_age CHECK (age >= 18)
+	)`)
+	require.NoError(t, err)
+	require.Equal(t, []string{"chk_age"}, constraintNames(existing, "CHECK"))
+
+	drop, err := statement.New("ALTER TABLE t1 DROP CHECK chk_age")
+	require.NoError(t, err)
+
+	post := findTable(PostState([]*statement.CreateTable{existing}, drop), "t1")
+	require.NotNil(t, post)
+	require.Empty(t, constraintNames(post, "CHECK"), "DROP CHECK should remove the constraint from post-state")
+}
+
+// TestPostState_DropConstraint verifies that DROP CONSTRAINT resolves against
+// whichever of the table's CHECK, FOREIGN KEY and UNIQUE constraints owns the
+// name — the set MySQL resolves it against — and leaves the rest alone.
+func TestPostState_DropConstraint(t *testing.T) {
+	const create = `CREATE TABLE t1 (
+		id INT PRIMARY KEY,
+		name VARCHAR(50),
+		user_id INT,
+		age INT,
+		CONSTRAINT uq_name UNIQUE (name),
+		CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id),
+		CONSTRAINT chk_age CHECK (age >= 18),
+		KEY idx_age (age)
+	)`
+
+	testCases := []struct {
+		name          string
+		alter         string
+		wantChecks    []string
+		wantFKs       []string
+		wantUniques   []string
+		wantPlainKeys []string
+	}{
+		{
+			name:          "unique",
+			alter:         "ALTER TABLE t1 DROP CONSTRAINT uq_name",
+			wantChecks:    []string{"chk_age"},
+			wantFKs:       []string{"fk_user"},
+			wantUniques:   nil,
+			wantPlainKeys: []string{"idx_age"},
+		},
+		{
+			name:          "foreign key",
+			alter:         "ALTER TABLE t1 DROP CONSTRAINT fk_user",
+			wantChecks:    []string{"chk_age"},
+			wantFKs:       nil,
+			wantUniques:   []string{"uq_name"},
+			wantPlainKeys: []string{"idx_age"},
+		},
+		{
+			name:          "check",
+			alter:         "ALTER TABLE t1 DROP CONSTRAINT chk_age",
+			wantChecks:    nil,
+			wantFKs:       []string{"fk_user"},
+			wantUniques:   []string{"uq_name"},
+			wantPlainKeys: []string{"idx_age"},
+		},
+		{
+			// MySQL rejects this (the name is a non-unique index, which
+			// DROP CONSTRAINT does not resolve against). The post-state
+			// must not remove it either.
+			name:          "non-unique index is not a constraint",
+			alter:         "ALTER TABLE t1 DROP CONSTRAINT idx_age",
+			wantChecks:    []string{"chk_age"},
+			wantFKs:       []string{"fk_user"},
+			wantUniques:   []string{"uq_name"},
+			wantPlainKeys: []string{"idx_age"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			existing, err := statement.ParseCreateTable(create)
+			require.NoError(t, err)
+			alter, err := statement.New(tc.alter)
+			require.NoError(t, err)
+
+			post := findTable(PostState([]*statement.CreateTable{existing}, alter), "t1")
+			require.NotNil(t, post)
+			require.Equal(t, tc.wantChecks, constraintNames(post, "CHECK"))
+			require.Equal(t, tc.wantFKs, constraintNames(post, "FOREIGN KEY"))
+			require.Equal(t, tc.wantUniques, indexNames(post, "UNIQUE"))
+			require.Equal(t, tc.wantPlainKeys, indexNames(post, "INDEX"))
+		})
+	}
+}
+
+// TestPostState_DropConstraintInlineUnique covers the inline
+// `col TYPE UNIQUE` form, whose implicit index takes the column's name and
+// never appears in Indexes.
+func TestPostState_DropConstraintInlineUnique(t *testing.T) {
+	existing, err := statement.ParseCreateTable("CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(50) UNIQUE)")
+	require.NoError(t, err)
+
+	drop, err := statement.New("ALTER TABLE t1 DROP CONSTRAINT name")
+	require.NoError(t, err)
+
+	post := findTable(PostState([]*statement.CreateTable{existing}, drop), "t1")
+	require.NotNil(t, post)
+	for _, c := range post.Columns {
+		if strings.EqualFold(c.Name, "name") {
+			require.False(t, c.Unique, "DROP CONSTRAINT should clear the inline UNIQUE flag")
+		}
+	}
+}
+
 // TestPostState_MigratedLinters_FixingAltersSilenceWarnings verifies the
 // post-state convention across the six linters migrated in this change:
 // an ALTER that fixes the legacy issue should silence the warning.

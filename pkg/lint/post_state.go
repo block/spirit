@@ -265,7 +265,28 @@ func applyAlter(t *statement.CreateTable, at *ast.AlterTableStmt) *statement.Cre
 		case ast.AlterTableDropForeignKey:
 			cloned.Constraints = removeConstraint(cloned.Constraints, spec.Name, "FOREIGN KEY")
 		case ast.AlterTableDropCheck:
-			cloned.Constraints = removeConstraint(cloned.Constraints, spec.Name, "CHECK")
+			// The DROP CHECK production carries the name on spec.Constraint,
+			// not spec.Name.
+			if spec.Constraint != nil {
+				cloned.Constraints = removeConstraint(cloned.Constraints, spec.Constraint.Name, "CHECK")
+			}
+		case ast.AlterTableDropConstraint:
+			// DROP CONSTRAINT resolves the name against the table's CHECK,
+			// FOREIGN KEY and UNIQUE constraints, so drop whichever one owns
+			// it. MySQL errors if the name matches none of them; the post
+			// state just leaves the table unchanged in that case.
+			if spec.Constraint != nil {
+				name := spec.Constraint.Name
+				cloned.Constraints = removeConstraint(cloned.Constraints, name, "CHECK")
+				cloned.Constraints = removeConstraint(cloned.Constraints, name, "FOREIGN KEY")
+				before := len(cloned.Indexes)
+				cloned.Indexes = removeUniqueIndexByName(cloned.Indexes, name)
+				if len(cloned.Indexes) == before {
+					// As in DROP INDEX: an inline column-level UNIQUE has no
+					// table-level index, and takes the column's name.
+					cloned.Columns = clearInlineUniqueByName(cloned.Columns, name)
+				}
+			}
 		case ast.AlterTableRenameTable:
 			if spec.NewTable != nil {
 				cloned.TableName = spec.NewTable.Name.O
@@ -469,6 +490,23 @@ func indexFromConstraint(c *ast.Constraint) (statement.Index, bool) {
 		Type:    typeStr,
 		Columns: cols,
 	}, true
+}
+
+// removeUniqueIndexByName removes the UNIQUE index of the given name, and only
+// that: DROP CONSTRAINT does not resolve against a non-unique index, so it must
+// not remove one that happens to share the name.
+func removeUniqueIndexByName(indexes statement.Indexes, name string) statement.Indexes {
+	if name == "" {
+		return indexes
+	}
+	out := indexes[:0]
+	for _, idx := range indexes {
+		if strings.EqualFold(idx.Name, name) && idx.Type == "UNIQUE" {
+			continue
+		}
+		out = append(out, idx)
+	}
+	return out
 }
 
 func removeIndex(indexes statement.Indexes, name, typeMatch string) statement.Indexes {

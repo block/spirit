@@ -256,6 +256,30 @@ func TestUnsafeLinter_AlterTableDropCheck(t *testing.T) {
 	require.Empty(t, violations)
 }
 
+func TestUnsafeLinter_AlterTableDropConstraint(t *testing.T) {
+	// DROP CONSTRAINT is its own spec type, not a synonym for DROP CHECK. It
+	// can drop a CHECK, FOREIGN KEY or UNIQUE constraint, none of which lose
+	// row data, so it belongs in the linter's safe-list.
+	//
+	// Note the switch in UnsafeLinter.Lint has no default, so an unlisted spec
+	// type also produces no violation: what this pins is that DROP CONSTRAINT
+	// is never classified as *unsafe*, not that it stays in the safe-list. The
+	// same is true of TestUnsafeLinter_AlterTableDropCheck above.
+	for _, sql := range []string{
+		`ALTER TABLE users DROP CONSTRAINT chk_age`,
+		`ALTER TABLE users DROP CONSTRAINT uq_name`,
+		`ALTER TABLE users DROP CONSTRAINT fk_org`,
+	} {
+		stmts, err := statement.New(sql)
+		require.NoError(t, err, sql)
+
+		linter := &UnsafeLinter{}
+		violations := linter.Lint(nil, stmts)
+
+		require.Empty(t, violations, sql)
+	}
+}
+
 func TestUnsafeLinter_AlterTableOption(t *testing.T) {
 	sql := `ALTER TABLE users ENGINE=InnoDB`
 	stmts, err := statement.New(sql)

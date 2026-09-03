@@ -324,6 +324,8 @@ func AlterTableTypeToString(tp ast.AlterTableType) string {
 		return "ALTER CHECK"
 	case ast.AlterTableDropCheck:
 		return "DROP CHECK"
+	case ast.AlterTableDropConstraint:
+		return "DROP CONSTRAINT"
 	case ast.AlterTableImportTablespace:
 		return "IMPORT TABLESPACE"
 	case ast.AlterTableDiscardTablespace:

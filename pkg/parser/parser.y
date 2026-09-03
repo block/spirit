@@ -2150,14 +2150,26 @@ AlterTableSpec:
 			Constraint: c,
 		}
 	}
-|	"DROP" CheckConstraintKeyword Identifier
+|	"DROP" "CHECK" Identifier
 	{
-		// Parse it and ignore it. Just for compatibility.
 		c := &ast.Constraint{
 			Name: $3,
 		}
 		$$ = &ast.AlterTableSpec{
 			Tp:         ast.AlterTableDropCheck,
+			Constraint: c,
+		}
+	}
+|	"DROP" "CONSTRAINT" Identifier
+	{
+		// DROP CONSTRAINT is not a synonym for DROP CHECK: MySQL resolves the
+		// name against the table's CHECK, FOREIGN KEY and UNIQUE constraints.
+		// Keep the spelling so Restore reproduces it (see #1183).
+		c := &ast.Constraint{
+			Name: $3,
+		}
+		$$ = &ast.AlterTableSpec{
+			Tp:         ast.AlterTableDropConstraint,
 			Constraint: c,
 		}
 	}

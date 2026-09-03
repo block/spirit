@@ -426,6 +426,89 @@ func TestKeywordFunctionCalls(t *testing.T) {
 	}
 }
 
+// TestDropConstraintSpelling covers block/spirit#1183: DROP CONSTRAINT and
+// DROP CHECK used to share a grammar production and both restored as DROP
+// CHECK. They are not synonyms — MySQL resolves DROP CONSTRAINT against the
+// table's CHECK, FOREIGN KEY and UNIQUE constraints, while DROP CHECK only
+// finds a check constraint — so rewriting one into the other turns a statement
+// MySQL accepts into error 3821. The ALTER form is deliberately still folded:
+// ALTER CHECK and ALTER CONSTRAINT both apply only to check constraints.
+func TestDropConstraintSpelling(t *testing.T) {
+	p := parser.New()
+	testCases := []struct {
+		sql      string
+		expected string
+	}{
+		{
+			"alter table t drop constraint uq_name",
+			"ALTER TABLE `t` DROP CONSTRAINT `uq_name`",
+		},
+		{
+			"alter table t drop constraint fk_ch_p",
+			"ALTER TABLE `t` DROP CONSTRAINT `fk_ch_p`",
+		},
+		{
+			"alter table t drop check chk_age",
+			"ALTER TABLE `t` DROP CHECK `chk_age`",
+		},
+		// Both spellings in one statement keep their own keywords.
+		{
+			"alter table t drop constraint a, drop check b",
+			"ALTER TABLE `t` DROP CONSTRAINT `a`, DROP CHECK `b`",
+		},
+		// ALTER CONSTRAINT folding to ALTER CHECK is correct and retained.
+		{
+			"alter table t alter constraint chk_age not enforced",
+			"ALTER TABLE `t` ALTER CHECK `chk_age` NOT ENFORCED",
+		},
+		{
+			"alter table t alter check chk_age enforced",
+			"ALTER TABLE `t` ALTER CHECK `chk_age` ENFORCED",
+		},
+	}
+
+	for _, tc := range testCases {
+		stmt, err := p.ParseOneStmt(tc.sql, "", "")
+		require.NoError(t, err, tc.sql)
+		var sb strings.Builder
+		err = stmt.Restore(NewRestoreCtx(DefaultRestoreFlags|RestoreStringWithoutCharset, &sb))
+		require.NoError(t, err, tc.sql)
+		require.Equal(t, tc.expected, sb.String(), tc.sql)
+
+		// The restored SQL must re-parse and restore to the same text.
+		stmt2, err := p.ParseOneStmt(sb.String(), "", "")
+		require.NoError(t, err, sb.String())
+		var sb2 strings.Builder
+		err = stmt2.Restore(NewRestoreCtx(DefaultRestoreFlags|RestoreStringWithoutCharset, &sb2))
+		require.NoError(t, err, sb.String())
+		require.Equal(t, sb.String(), sb2.String(), tc.sql)
+	}
+}
+
+// TestDropConstraintSpecType pins the AST types, since the name lives on
+// Constraint rather than Spec.Name and consumers switch on Tp.
+func TestDropConstraintSpecType(t *testing.T) {
+	p := parser.New()
+	for _, tc := range []struct {
+		sql  string
+		tp   ast.AlterTableType
+		name string
+	}{
+		{"alter table t drop check chk_age", ast.AlterTableDropCheck, "chk_age"},
+		{"alter table t drop constraint uq_name", ast.AlterTableDropConstraint, "uq_name"},
+	} {
+		stmt, err := p.ParseOneStmt(tc.sql, "", "")
+		require.NoError(t, err, tc.sql)
+		alter, ok := stmt.(*ast.AlterTableStmt)
+		require.True(t, ok, tc.sql)
+		require.Len(t, alter.Specs, 1, tc.sql)
+		spec := alter.Specs[0]
+		require.Equal(t, tc.tp, spec.Tp, tc.sql)
+		require.NotNil(t, spec.Constraint, tc.sql)
+		require.Equal(t, tc.name, spec.Constraint.Name, tc.sql)
+	}
+}
+
 func TestGroupConcatSeparatorCharsetCollation(t *testing.T) {
 	p := parser.New()
 	testCases := []struct {

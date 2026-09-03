@@ -13,7 +13,8 @@ func TestCheckConstraintsReferenced(t *testing.T) {
 		expected  []string
 	}{
 		{"ALTER TABLE t1 DROP CHECK chk_a", []string{"chk_a"}},
-		// DROP CONSTRAINT is folded into the same clause type by the parser.
+		// DROP CONSTRAINT is a distinct clause type, but the name it carries
+		// is still a check constraint candidate.
 		{"ALTER TABLE t1 DROP CONSTRAINT chk_a", []string{"chk_a"}},
 		{"ALTER TABLE t1 ALTER CHECK chk_a NOT ENFORCED", []string{"chk_a"}},
 		{"ALTER TABLE t1 DROP CHECK chk_a, ALTER CHECK chk_b ENFORCED", []string{"chk_a", "chk_b"}},
@@ -92,6 +93,26 @@ func TestAlterWithRenamedCheckConstraints(t *testing.T) {
 			"DROP CHECK `chk_nonexistent`",
 			nil,
 		},
+		// DROP CONSTRAINT is retargeted the same way, but keeps its own
+		// keyword: rewriting it to DROP CHECK would narrow which constraints
+		// MySQL resolves the name against (block/spirit#1183).
+		{
+			"ALTER TABLE t1 DROP CONSTRAINT chk_a",
+			"DROP CONSTRAINT `_t1_new_chk_1`",
+			nil,
+		},
+		{
+			"ALTER TABLE t1 DROP CONSTRAINT chk_a, ADD CONSTRAINT chk_a CHECK (a > 0)",
+			"DROP CONSTRAINT `_t1_new_chk_1`, ADD CHECK(`a`>0) ENFORCED",
+			[]string{"chk_a"},
+		},
+		// A DROP CONSTRAINT naming something that is not a check constraint is
+		// not in the rename map, so it passes through untouched.
+		{
+			"ALTER TABLE t1 DROP CONSTRAINT uq_name",
+			"DROP CONSTRAINT `uq_name`",
+			nil,
+		},
 		// Clauses that have nothing to do with check constraints are untouched,
 		// including an added constraint that was never named.
 		{
@@ -109,6 +130,34 @@ func TestAlterWithRenamedCheckConstraints(t *testing.T) {
 		// Rewriting must not disturb the statement's own ALTER, which the
 		// direct-DDL attempts apply to the user's table.
 		assert.Equal(t, MustNew(test.statement)[0].Alter, stmts[0].Alter, test.statement)
+	}
+}
+
+// TestDropConstraintKeywordPreserved pins the clause text spirit sends to
+// MySQL. AbstractStatement.Alter is the restored form of the user's ALTER, not
+// their original text, so a parser that folded DROP CONSTRAINT into DROP CHECK
+// silently rewrote the statement into one MySQL rejects with error 3821 for a
+// UNIQUE or FOREIGN KEY constraint (block/spirit#1183).
+func TestDropConstraintKeywordPreserved(t *testing.T) {
+	tests := []struct {
+		statement string
+		expected  string
+	}{
+		{"ALTER TABLE t1 DROP CONSTRAINT uq_name", "DROP CONSTRAINT `uq_name`"},
+		{"ALTER TABLE t1 DROP CONSTRAINT fk_ch_p", "DROP CONSTRAINT `fk_ch_p`"},
+		{"ALTER TABLE t1 DROP CONSTRAINT chk_age", "DROP CONSTRAINT `chk_age`"},
+		{"ALTER TABLE t1 DROP CHECK chk_age", "DROP CHECK `chk_age`"},
+		{
+			"ALTER TABLE t1 DROP CONSTRAINT a, DROP CHECK b, ADD COLUMN c INT",
+			"DROP CONSTRAINT `a`, DROP CHECK `b`, ADD COLUMN `c` INT",
+		},
+		// ALTER CONSTRAINT and ALTER CHECK are genuine synonyms in MySQL —
+		// both apply only to check constraints — so that fold is retained.
+		{"ALTER TABLE t1 ALTER CONSTRAINT chk_age NOT ENFORCED", "ALTER CHECK `chk_age` NOT ENFORCED"},
+	}
+	for _, test := range tests {
+		stmts := MustNew(test.statement)
+		assert.Equal(t, test.expected, stmts[0].Alter, test.statement)
 	}
 }
 

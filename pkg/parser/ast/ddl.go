@@ -2555,6 +2555,13 @@ const (
 	AlterTableDiscardPartitionTablespace
 	AlterTableAlterCheck
 	AlterTableDropCheck
+	// AlterTableDropConstraint is DROP CONSTRAINT, which MySQL accepts for a
+	// CHECK, FOREIGN KEY or UNIQUE constraint of that name. It is kept
+	// distinct from AlterTableDropCheck (which only drops a check constraint)
+	// so that restoring the statement reproduces the keyword the user wrote:
+	// rendering DROP CONSTRAINT as DROP CHECK turns a statement MySQL accepts
+	// into one it rejects with error 3821.
+	AlterTableDropConstraint
 	AlterTableImportTablespace
 	AlterTableDiscardTablespace
 	AlterTableIndexInvisible
@@ -3073,6 +3080,9 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord(" ENFORCED")
 	case AlterTableDropCheck:
 		ctx.WriteKeyWord("DROP CHECK ")
+		ctx.WriteName(n.Constraint.Name)
+	case AlterTableDropConstraint:
+		ctx.WriteKeyWord("DROP CONSTRAINT ")
 		ctx.WriteName(n.Constraint.Name)
 	case AlterTableImportTablespace:
 		ctx.WriteKeyWord("IMPORT TABLESPACE")
