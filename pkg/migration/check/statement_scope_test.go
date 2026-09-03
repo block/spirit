@@ -24,6 +24,25 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
+// TestStatementScopeMembership pins the checks ScopeStatement carries. A check
+// joining the scope has to clear the scope's contract first: no earlier stage
+// may bypass it, so its failure is a refusal a caller can report as certain,
+// and it must tolerate every resource except the statement being unset. Adding
+// the name here is the same change that decides it does, and a caller that
+// reports these refusals to its own users pins this set too — the message text
+// is only as safe to repeat as the check that produced it.
+func TestStatementScopeMembership(t *testing.T) {
+	assert.Equal(t, []string{
+		"addforeignkey",
+		"enumReorder",
+		"enumSetRemoval",
+		"illegalClause",
+		"primarykey",
+		"primarykeyexists",
+		"setReorder",
+	}, ChecksInScope(ScopeStatement))
+}
+
 // TestStatementScopeChecks runs the statement-scoped checks the way an
 // external classifier does: only Resources.Statement is set — no database
 // connection and no table metadata. Statements Spirit deterministically

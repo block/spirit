@@ -53,6 +53,12 @@ const (
 	// rejects shapes a newer one completes instantly. Checks that need a live
 	// connection (existing foreign keys, triggers, privileges, ...) likewise
 	// run only at preflight.
+	//
+	// A caller that reports these refusals somewhere other than its own logs
+	// judges the text by reading the checks that produce it, and a check added
+	// to the scope is picked up without any change on the caller's side. Pin
+	// the membership with ChecksInScope to keep that judgement attached to the
+	// checks it was made about.
 	ScopeStatement ScopeFlag = 1 << 6
 )
 
@@ -112,15 +118,41 @@ func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, scope Scop
 	lock.Lock()
 	registered := maps.Clone(checks)
 	lock.Unlock()
-	for _, name := range slices.Sorted(maps.Keys(registered)) {
-		check := registered[name]
-		if check.scope&scope == 0 {
-			continue
-		}
-		err := check.callback(ctx, r, logger)
+	for _, name := range namesInScope(registered, scope) {
+		err := registered[name].callback(ctx, r, logger)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ChecksInScope reports the names of the checks registered for scope, in the
+// order RunChecks runs them.
+//
+// Scope membership is a curated set, not an accident of registration: each
+// scope states what a check in it must tolerate and what its failure entitles
+// the caller to conclude. A caller relying on that contract can pin the set it
+// was written against, so a check added to the scope later has to be judged
+// against the contract rather than inherit a verdict made about its
+// predecessors.
+func ChecksInScope(scope ScopeFlag) []string {
+	lock.Lock()
+	registered := maps.Clone(checks)
+	lock.Unlock()
+	return namesInScope(registered, scope)
+}
+
+// namesInScope returns the names of the checks in registered that belong to
+// scope, sorted so RunChecks and ChecksInScope agree on the order.
+func namesInScope(registered map[string]check, scope ScopeFlag) []string {
+	names := make([]string, 0, len(registered))
+	for name, c := range registered {
+		if c.scope&scope == 0 {
+			continue
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }
