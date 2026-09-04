@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -270,29 +271,38 @@ var (
 	ErrChangesNotFlushed = errors.New("not all changes flushed")
 )
 
-// serverIDCounter is an atomic counter used to help ensure unique server IDs
-var serverIDCounter atomic.Uint32
-
-// NewServerID generates a unique server ID to avoid conflicts with other binlog readers.
-// Uses crypto/rand combined with an atomic counter to ensure uniqueness even when called
-// concurrently. Returns a value in the range 1001-4294967295 to avoid conflicts with
-// typical MySQL server IDs (0-1000).
-func NewServerID() uint32 {
+// Seed lazily on first use, then allocate consecutive IDs. Mixing a fresh random
+// value with a counter on every call still permits birthday collisions between
+// readers in the same process.
+var serverIDs = sync.OnceValue(func() *serverIDSequence {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// Fallback to nanosecond-based generation if crypto/rand fails (should never happen)
-		rangeSize := int64(^uint32(0) - 1000)
-		return uint32(time.Now().UnixNano()%rangeSize) + 1001
+		// A clock-derived seed lasts for this process: cross-process
+		// separation then depends on differing process start times.
+		return newServerIDSequence(uint32(time.Now().UnixNano()))
 	}
-	// Convert bytes to uint32, mix with counter, and map to valid range
-	randomPart := binary.BigEndian.Uint32(b[:])
-	counterPart := serverIDCounter.Add(1)
+	return newServerIDSequence(binary.BigEndian.Uint32(b[:]))
+})
 
-	// XOR the random and counter parts for better distribution
-	result := randomPart ^ counterPart
+const serverIDRange = uint64(^uint32(0) - 1000)
 
-	// Map result into the range [1001, max uint32]
-	// Use modulo to constrain to the valid range, then add 1001
-	result = (result % (^uint32(0) - 1000)) + 1001
-	return result
+type serverIDSequence struct {
+	counter atomic.Uint64
+}
+
+func newServerIDSequence(seed uint32) *serverIDSequence {
+	s := &serverIDSequence{}
+	s.counter.Store(uint64(seed) % serverIDRange)
+	return s
+}
+
+func (s *serverIDSequence) next() uint32 {
+	return uint32(s.counter.Add(1)%serverIDRange) + 1001
+}
+
+// NewServerID allocates IDs in [1001, 4294967295], avoiding typical MySQL server
+// IDs. IDs do not repeat within a process until the range is exhausted. The
+// random starting point reduces, but cannot eliminate, cross-process collisions.
+func NewServerID() uint32 {
+	return serverIDs().next()
 }
