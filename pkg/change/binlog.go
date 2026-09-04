@@ -152,7 +152,7 @@ type binlogClient struct {
 	// parks), so requests never queue behind each other.
 	flushRequests chan Subscription
 
-	flushedBinlogs atomic.Int64 // for testing binlog flushing frequency
+	flushedBinlogs atomic.Int64 // stall-triggered rotations reported as FeedStats.ForcedRotations
 }
 
 // NewBinlogClient constructs the binlog-backed change.Source. The
@@ -1444,7 +1444,7 @@ func (c *binlogClient) BlockWait(ctx context.Context) error {
 			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
 		default:
 			currPos := c.getBufferedPos()
-			if stalls.observe(currPos.Compare(prevPos) > 0) {
+			if stalls.observe(prevPos, currPos) {
 				c.logger.Debug("buffered position has not advanced, flushing binary logs")
 				if err := dbconn.Exec(ctx, c.db, "FLUSH BINARY LOGS"); err != nil {
 					return err
