@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -270,16 +271,16 @@ var (
 	ErrChangesNotFlushed = errors.New("not all changes flushed")
 )
 
-// Seed once per process, then allocate consecutive IDs. Mixing a fresh random
+// Seed lazily on first use, then allocate consecutive IDs. Mixing a fresh random
 // value with a counter on every call still permits birthday collisions between
 // readers in the same process.
-var serverIDs = func() *serverIDSequence {
+var serverIDs = sync.OnceValue(func() *serverIDSequence {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return newServerIDSequence(uint32(time.Now().UnixNano()))
 	}
 	return newServerIDSequence(binary.BigEndian.Uint32(b[:]))
-}()
+})
 
 const serverIDRange = uint64(^uint32(0) - 1000)
 
@@ -301,5 +302,5 @@ func (s *serverIDSequence) next() uint32 {
 // IDs. IDs do not repeat within a process until the range is exhausted. The
 // random starting point reduces, but cannot eliminate, cross-process collisions.
 func NewServerID() uint32 {
-	return serverIDs.next()
+	return serverIDs().next()
 }
