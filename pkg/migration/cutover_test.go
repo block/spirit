@@ -987,15 +987,9 @@ func TestDeferCutOver(t *testing.T) {
 		WithDeferCutOver(),
 		WithRespectSentinel())
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		err := m.Run(t.Context())
-		require.Error(t, err)
-		require.ErrorContains(t, err, "timed out waiting for sentinel table to be dropped")
-	})
-
-	waitForStatus(t, m, status.WaitingOnSentinelTable)
-	wg.Wait()
+	running := startTestRun(t, m.Run, m.Close)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
+	require.ErrorContains(t, running.wait(t), "timed out waiting for sentinel table to be dropped")
 
 	newName := fmt.Sprintf("_%s_new", tableName)
 	var tableCount int
@@ -1186,11 +1180,8 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 		WithDBName(dbName),
 		WithDeferCutOver(),
 		WithRespectSentinel())
-	cA := make(chan error)
-	go func() {
-		cA <- mA.Run(t.Context())
-	}()
-	waitForStatus(t, mA, status.WaitingOnSentinelTable)
+	runningA := startTestRun(t, mA.Run, mA.Close)
+	waitForStatus(t, mA, status.WaitingOnSentinelTable, runningA)
 
 	// Migration B starts fresh in the same schema while A is blocked on the
 	// sentinel, and re-creates the shared sentinel during its setup.
@@ -1198,11 +1189,8 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 		WithDBName(dbName),
 		WithDeferCutOver(),
 		WithRespectSentinel())
-	cB := make(chan error)
-	go func() {
-		cB <- mB.Run(t.Context())
-	}()
-	waitForStatus(t, mB, status.WaitingOnSentinelTable)
+	runningB := startTestRun(t, mB.Run, mB.Close)
+	waitForStatus(t, mB, status.WaitingOnSentinelTable, runningB)
 
 	// Give A several sentinel poll intervals to (incorrectly) notice any
 	// sentinel gap left by B's setup. It must still be waiting: the operator
@@ -1214,10 +1202,8 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 	// Operator approves: drop the shared sentinel once; both migrations
 	// proceed to cutover.
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
-	require.NoError(t, <-cA)
-	require.NoError(t, <-cB)
-	require.NoError(t, mA.Close())
-	require.NoError(t, mB.Close())
+	require.NoError(t, runningA.wait(t))
+	require.NoError(t, runningB.wait(t))
 }
 
 // TestMultiTableMigrationBlockedPerSchema verifies that only one atomic
@@ -1240,9 +1226,8 @@ func TestMultiTableMigrationBlockedPerSchema(t *testing.T) {
 	stmtA := "ALTER TABLE mt_lock_a1 ENGINE=InnoDB; ALTER TABLE mt_lock_a2 ENGINE=InnoDB"
 	mA := NewTestRunnerFromStatement(t, stmtA, WithDBName(dbName), WithDeferCutOver(), WithRespectSentinel())
 	require.Len(t, mA.changes, 2)
-	cA := make(chan error, 1) // buffered: mA's goroutine never blocks on send if an assertion fails first
-	go func() { cA <- mA.Run(t.Context()) }()
-	waitForStatus(t, mA, status.WaitingOnSentinelTable)
+	runningA := startTestRun(t, mA.Run, mA.Close)
+	waitForStatus(t, mA, status.WaitingOnSentinelTable, runningA)
 
 	// A second atomic multi-table migration in the same schema must be blocked
 	// fast, with an error that names the cause.
@@ -1256,6 +1241,5 @@ func TestMultiTableMigrationBlockedPerSchema(t *testing.T) {
 
 	// Operator approves A; it finishes and releases the schema lock.
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
-	require.NoError(t, <-cA)
-	require.NoError(t, mA.Close())
+	require.NoError(t, runningA.wait(t))
 }

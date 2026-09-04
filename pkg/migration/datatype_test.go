@@ -201,7 +201,7 @@ func TestEnumReorder(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := range 50 {
@@ -248,7 +248,7 @@ func TestSetReorder(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := range 50 {
@@ -314,7 +314,7 @@ func TestEnumDrop(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		// Concurrent DML uses only retained values; binlog ordinals for
@@ -407,7 +407,7 @@ func TestEnumToVarchar(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := 1; i <= 100; i++ {
@@ -474,7 +474,7 @@ func TestSetToVarchar(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := 1; i <= 50; i++ {
@@ -532,7 +532,7 @@ func TestEnumToSet(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := 1; i <= 100; i++ {
@@ -596,14 +596,9 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 		WithTestThrottler())
 
 	// Run the migration in a goroutine so we can inject minimal-RBR writes.
-	var migrationErr error
-	migrationDone := make(chan struct{})
-	go func() {
-		defer close(migrationDone)
-		migrationErr = m.Run(ctx)
-	}()
+	running := startTestRun(t, m.Run, m.Close)
 
-	waitForStatus(t, m, status.CopyRows)
+	waitForStatus(t, m, status.CopyRows, running)
 
 	// Continuously write using the minimal-RBR session during the copy phase.
 	var writerWg sync.WaitGroup
@@ -618,10 +613,9 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 		}
 	})
 
-	<-migrationDone
+	migrationErr := running.wait(t)
 	cancel()
 	writerWg.Wait()
-	require.NoError(t, m.Close())
 
 	require.Error(t, migrationErr)
 }
@@ -708,7 +702,7 @@ func TestAlterPKIntToBigIntWithDML(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if !waitForCopyRows(t.Context(), m) {
+		if !waitForCopyRows(t, t.Context(), m) {
 			return
 		}
 		for i := range 100 {
@@ -773,7 +767,7 @@ func TestAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if !waitForCopyRows(t.Context(), m) {
+		if !waitForCopyRows(t, t.Context(), m) {
 			return
 		}
 		for i := range 50 {
@@ -881,7 +875,7 @@ func TestBinaryToVarbinaryConcurrentDML(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for range 50 {
@@ -1062,7 +1056,7 @@ func runBitDMLTest(t *testing.T, tableName, colName, colDef string, values []uin
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		// UPDATE the marker rows mid-migration. Each update produces a
@@ -1322,7 +1316,7 @@ func TestVectorConcurrentDML(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		// The DELETE happens once, up front, so the row is gone from the

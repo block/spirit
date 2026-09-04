@@ -47,14 +47,11 @@ func mkIniFile(t *testing.T, content string) string {
 // binlog catch-up plus 30s acquiring the table lock, and the runner retries
 // the checksum up to 3 times, so the budget must cover at least two full
 // attempts.
-func waitForStatus(t *testing.T, m *Runner, target status.State, runs ...*testRun) {
+func waitForStatus(t *testing.T, m *Runner, target status.State, run *testRun) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
-	var run *testRun
-	if len(runs) > 0 {
-		run = runs[0]
-	}
+	require.NotNil(t, run)
 	require.NoError(t, awaitTestStatus(ctx, m, target, run))
 }
 
@@ -77,9 +74,6 @@ func awaitTestStatus(ctx context.Context, m *Runner, target status.State, run *t
 		if current >= status.Close {
 			return fmt.Errorf("runner entered terminal state %s while waiting for %s", current, target)
 		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		if current >= target {
 			return nil
 		}
@@ -96,14 +90,15 @@ func awaitTestStatus(ctx context.Context, m *Runner, target status.State, run *t
 // installed before launch, so FailNow anywhere in the test cannot strand a
 // result send or race table cleanup against the runner.
 type testRun struct {
-	done chan struct{}
-	err  error // published by closing done
+	cancel context.CancelFunc
+	done   chan struct{}
+	err    error // published by closing done
 }
 
 func startTestRun(t *testing.T, run func(context.Context) error, closeRunner func() error) *testRun {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
-	running := &testRun{done: make(chan struct{})}
+	running := &testRun{done: make(chan struct{}), cancel: cancel}
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -149,12 +144,18 @@ func (r *testRun) wait(t *testing.T) error {
 // copy phase may never begin. It avoids testify so it is safe to call off the
 // test goroutine (require would call runtime.Goexit — testifylint go-require);
 // callers should return when it reports false.
-func waitForCopyRows(ctx context.Context, m *Runner) bool {
+func waitForCopyRows(t *testing.T, ctx context.Context, m *Runner) bool {
+	t.Helper()
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
 		current := m.status.Get()
-		if ctx.Err() != nil || current >= status.Close {
+		if err := ctx.Err(); err != nil {
+			t.Logf("load generator skipped: context ended before observing CopyRows (state %s): %v", current, err)
+			return false
+		}
+		if current >= status.Close {
+			t.Logf("load generator skipped: runner reached terminal state %s before CopyRows was observed", current)
 			return false
 		}
 		if current >= status.CopyRows {
@@ -162,6 +163,7 @@ func waitForCopyRows(ctx context.Context, m *Runner) bool {
 		}
 		select {
 		case <-ctx.Done():
+			t.Logf("load generator skipped: context ended before observing CopyRows (state %s): %v", m.status.Get(), ctx.Err())
 			return false
 		case <-ticker.C:
 		}

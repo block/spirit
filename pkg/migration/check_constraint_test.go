@@ -141,7 +141,7 @@ func TestCheckConstraintWithDML(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if !waitForCopyRows(t.Context(), m) {
+		if !waitForCopyRows(t, t.Context(), m) {
 			return
 		}
 		for i := range 100 {

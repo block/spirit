@@ -389,21 +389,16 @@ func TestCheckpointResumeDuringChecksum(t *testing.T) {
 	// When we see that we are waiting on the sentinel table,
 	// we then manually start the first bits of checksum, and then close()
 	// We should be able to resume from the checkpoint into the checksum state.
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	c := make(chan error, 1)
-	go func() {
-		c <- r.Run(ctx)
-	}()
+	running := startTestRun(t, r.Run, r.Close)
 	// Wait for the migration to block on the sentinel table.
-	waitForStatus(t, r, status.WaitingOnSentinelTable)
+	waitForStatus(t, r, status.WaitingOnSentinelTable, running)
 
 	require.NoError(t, r.checksum(t.Context()))       // run the checksum, the original Run is blocked on sentinel.
 	require.NoError(t, r.DumpCheckpoint(t.Context())) // dump a checkpoint with the watermark.
 	// Cancel + wait for Run to fully return before Close. See
 	// TestChangeIntToBigIntPKResumeFromChkPt for the rationale.
-	cancel()              // unblocks the goroutine that was waiting on sentinel.
-	require.Error(t, <-c) // context cancelled
+	running.cancel()                  // unblocks the goroutine that was waiting on sentinel.
+	require.Error(t, running.wait(t)) // context cancelled
 	require.NoError(t, r.Close())
 
 	// drop the sentinel table.

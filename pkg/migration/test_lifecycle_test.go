@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/status"
 	"github.com/stretchr/testify/require"
@@ -34,7 +35,7 @@ func TestAwaitTestStatusRejectsTerminalStates(t *testing.T) {
 			m := &Runner{}
 			m.status.Set(state)
 			require.ErrorContains(t, awaitTestStatus(t.Context(), m, status.CopyRows, nil), "terminal state")
-			require.False(t, waitForCopyRows(t.Context(), m))
+			require.False(t, waitForCopyRows(t, t.Context(), m))
 		})
 	}
 }
@@ -42,9 +43,15 @@ func TestAwaitTestStatusRejectsTerminalStates(t *testing.T) {
 func TestAwaitTestStatusReportsRunnerError(t *testing.T) {
 	want := errors.New("setup failed")
 	running := startTestRun(t, func(context.Context) error { return want }, func() error { return nil })
-	<-running.done
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	select {
+	case <-running.done:
+	case <-ctx.Done():
+		t.Fatal("runner did not complete")
+	}
 	m := &Runner{}
-	require.ErrorIs(t, awaitTestStatus(t.Context(), m, status.WaitingOnSentinelTable, running), want)
+	require.ErrorIs(t, awaitTestStatus(ctx, m, status.WaitingOnSentinelTable, running), want)
 }
 
 func TestAwaitTestStatusAcceptsProgress(t *testing.T) {
@@ -53,6 +60,15 @@ func TestAwaitTestStatusAcceptsProgress(t *testing.T) {
 	require.NoError(t, awaitTestStatus(t.Context(), m, status.CopyRows, nil))
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	require.ErrorIs(t, awaitTestStatus(ctx, m, status.CopyRows, nil), context.Canceled)
-	require.False(t, waitForCopyRows(ctx, m))
+	require.NoError(t, awaitTestStatus(ctx, m, status.CopyRows, nil))
+	require.ErrorIs(t, awaitTestStatus(ctx, &Runner{}, status.CopyRows, nil), context.Canceled)
+	require.False(t, waitForCopyRows(t, ctx, m))
+}
+
+func TestAwaitTestStatusReportsCleanCompletion(t *testing.T) {
+	running := startTestRun(t, func(context.Context) error { return nil }, func() error { return nil })
+	require.NoError(t, running.wait(t))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.ErrorContains(t, awaitTestStatus(ctx, &Runner{}, status.CopyRows, running), "runner completed")
 }

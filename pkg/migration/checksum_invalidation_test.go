@@ -274,16 +274,9 @@ func TestContinuousChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
 		WithThreads(1),
 		WithDeferCutOver(),
 		WithRespectSentinel())
-	defer utils.CloseAndLog(m)
+	running := startTestRun(t, m.Run, m.Close)
 
-	var runErr error
-	runDone := make(chan struct{})
-	go func() {
-		defer close(runDone)
-		runErr = m.Run(t.Context())
-	}()
-
-	waitForStatus(t, m, status.WaitingOnSentinelTable)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 
 	// The test-suite checkpoint dumper runs every 100ms (see TestMain).
 	// Wait until a checkpoint row carrying the end-of-initial-checksum
@@ -304,11 +297,7 @@ func TestContinuousChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
 	// allowing cutover.
 	testutils.RunSQL(t, fmt.Sprintf("UPDATE `%s` SET val = 'corrupted' WHERE id = 1", utils.NewTableName(tableName)))
 
-	select {
-	case <-runDone:
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timed out waiting for the continuous checksum to abort the migration")
-	}
+	runErr := running.wait(t)
 	require.Error(t, runErr)
 	require.ErrorContains(t, runErr, "continuous checksum")
 
