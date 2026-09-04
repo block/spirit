@@ -109,7 +109,9 @@ func startTestRun(t *testing.T, run func(context.Context) error, closeRunner fun
 		select {
 		case <-running.done:
 			// Close only after Run has stopped touching the runner's fields.
-			require.NoError(t, closeRunner())
+			if err := closeRunner(); err != nil {
+				t.Errorf("closing test runner: %v", err)
+			}
 		case <-time.After(30 * time.Second):
 			t.Error("runner did not stop during cleanup")
 		}
