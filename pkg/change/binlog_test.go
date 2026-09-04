@@ -583,29 +583,11 @@ func TestBlockWait(t *testing.T) {
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
-	// We test that BlockWait does not flush the binlog if the buffered position is advancing by
-	// 1. kicking off a go-routine that inserts into an unrelated table
-	// 2. verifying that flushedBinlogs is still 0 at the end of BlockWait
-	ctx, cancel := context.WithCancel(t.Context())
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		i := 1
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				_, _ = db.ExecContext(ctx, fmt.Sprintf("INSERT INTO blockwaitt3 (a, b, c) VALUES (%d, %d, %d)", i, i, i))
-				i++
-			}
-		}
-	})
-	time.Sleep(3 * time.Second) // should be enough for BlockWait to block for 1 iteration before catching up, but not guaranteed
-	client.flushedBinlogs.Store(0)
+	// Unrelated-table events must not prevent the reader catching up. Whether
+	// a real reader briefly stalls is scheduler-dependent; the exact rotation
+	// policy is covered by TestBlockWaitStalls using controlled progress.
+	testutils.RunSQL(t, "INSERT INTO blockwaitt3 (a, b, c) VALUES (1, 1, 1)")
 	require.NoError(t, client.BlockWait(t.Context()))
-	cancel()
-	wg.Wait() // ensure goroutine exits before test completes
-	require.Equal(t, int64(0), client.flushedBinlogs.Load())
 
 	// Insert into t1.
 	testutils.RunSQL(t, "INSERT INTO blockwaitt1 (a, b, c) VALUES (1, 2, 3)")
