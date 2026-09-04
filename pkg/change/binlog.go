@@ -1115,8 +1115,8 @@ func (c *binlogClient) Close() {
 
 	// Wait for the readStream goroutine to exit cleanly. This prevents
 	// goroutine leaks detected by goleak in tests.
-	// Quiesce writes as well as the reader before callers tear down pools.
-	// The periodic loop has its own context and is not joined by streamWG.
+	// Join the independently cancellable writer too. Both background loops
+	// must finish before Close returns; neither join depends on the other.
 	c.StopPeriodicFlush()
 
 	c.streamWG.Wait()
@@ -1347,11 +1347,16 @@ func (c *binlogClient) StopPeriodicFlush() {
 // StopPeriodicFlush is guaranteed to observe the registration. Callers
 // MUST NOT prefix with `go` — the loop is spawned internally.
 //
-// Calling Start while a flush is already running is a no-op.
+// Calling Start while a flush is already running or after Close is a no-op.
 // Satisfies Source interface.
 func (c *binlogClient) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
 	c.periodicFlushLock.Lock()
-	if c.isClosed.Load() || c.periodicFlushCancel != nil {
+	if c.isClosed.Load() {
+		c.periodicFlushLock.Unlock()
+		c.logger.Debug("ignoring periodic flush start on a closed client")
+		return
+	}
+	if c.periodicFlushCancel != nil {
 		c.periodicFlushLock.Unlock()
 		return
 	}

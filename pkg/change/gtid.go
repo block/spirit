@@ -1106,8 +1106,8 @@ func (c *gtidClient) Close() {
 		sub.Close()
 	}
 
-	// Quiesce writes as well as the reader before callers tear down pools.
-	// The periodic loop has its own context and is not joined by streamWG.
+	// Join the independently cancellable writer too. Both background loops
+	// must finish before Close returns; neither join depends on the other.
 	c.StopPeriodicFlush()
 
 	c.streamWG.Wait()
@@ -1299,10 +1299,15 @@ func (c *gtidClient) StopPeriodicFlush() {
 	<-done
 }
 
-// StartPeriodicFlush satisfies Source.
+// StartPeriodicFlush satisfies Source. Calls after Close are ignored.
 func (c *gtidClient) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
 	c.periodicFlushLock.Lock()
-	if c.isClosed.Load() || c.periodicFlushCancel != nil {
+	if c.isClosed.Load() {
+		c.periodicFlushLock.Unlock()
+		c.logger.Debug("ignoring periodic flush start on a closed client")
+		return
+	}
+	if c.periodicFlushCancel != nil {
 		c.periodicFlushLock.Unlock()
 		return
 	}
