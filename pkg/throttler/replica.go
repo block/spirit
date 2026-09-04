@@ -71,11 +71,13 @@ var _ ReasonedThrottler = &Replica{}
 // We only check the replica every 5 seconds, and typically allow up to 120s
 // of replica lag, which is a lot.
 func (l *Replica) Open(ctx context.Context) error {
+	if err := l.poller.checkOpen(); err != nil {
+		return err
+	}
 	if err := l.UpdateLag(ctx); err != nil {
 		return err
 	}
-	l.poller.start(ctx, l.run)
-	return nil
+	return l.poller.start(ctx, l.run)
 }
 
 func (l *Replica) run(ctx context.Context) {

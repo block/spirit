@@ -294,6 +294,9 @@ func newAuroraThreadsThrottler(db *sql.DB, mode threadsMode, logger *slog.Logger
 }
 
 func (a *AuroraThreads) Open(ctx context.Context) error {
+	if err := a.poller.checkOpen(); err != nil {
+		return err
+	}
 	vCPUs, err := AuroraVCPUs(ctx, a.db)
 	if err != nil {
 		return err
@@ -304,8 +307,7 @@ func (a *AuroraThreads) Open(ctx context.Context) error {
 	if err := a.UpdateLag(ctx); err != nil {
 		return err
 	}
-	a.poller.start(ctx, a.run)
-	return nil
+	return a.poller.start(ctx, a.run)
 }
 
 func (a *AuroraThreads) run(ctx context.Context) {

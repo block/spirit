@@ -111,14 +111,16 @@ func NewCommitLatencyThrottler(db *sql.DB, threshold time.Duration, logger *slog
 }
 
 func (c *CommitLatency) Open(ctx context.Context) error {
+	if err := c.poller.checkOpen(); err != nil {
+		return err
+	}
 	// Take an initial sample so the first delta computed by the background
 	// loop is meaningful; otherwise we'd flap "throttled" on the very first
 	// post-open chunk based on whatever the cumulative average happened to be.
 	if err := c.UpdateLag(ctx); err != nil {
 		return err
 	}
-	c.poller.start(ctx, c.run)
-	return nil
+	return c.poller.start(ctx, c.run)
 }
 
 func (c *CommitLatency) run(ctx context.Context) {

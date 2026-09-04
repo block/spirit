@@ -3,6 +3,7 @@ package throttler
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,11 +34,11 @@ func TestMonitorCloseCancelsAndJoins(t *testing.T) {
 				tc.loop.close()
 				<-closed
 			})
-			tc.loop.start(ctx, func(ctx context.Context) {
+			require.NoError(t, tc.loop.start(ctx, func(ctx context.Context) {
 				<-ctx.Done()
 				close(cancelled)
 				<-release
-			})
+			}))
 			go func() {
 				defer close(closed)
 				_ = tc.throttler.Close()
@@ -66,13 +67,13 @@ func TestMonitorCloseCancelsAndJoins(t *testing.T) {
 func TestMonitorCloseBeforeStart(t *testing.T) {
 	var loop monitorLoop
 	loop.close()
-	loop.start(t.Context(), func(context.Context) { t.Error("closed monitor started") })
+	require.ErrorIs(t, loop.start(t.Context(), func(context.Context) { t.Error("closed monitor started") }), errMonitorClosed)
 	require.Nil(t, loop.done)
 }
 
 func TestMonitorConcurrentClose(t *testing.T) {
 	var loop monitorLoop
-	loop.start(t.Context(), func(ctx context.Context) { <-ctx.Done() })
+	require.NoError(t, loop.start(t.Context(), func(ctx context.Context) { <-ctx.Done() }))
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Go(loop.close)
@@ -83,4 +84,38 @@ func TestMonitorConcurrentClose(t *testing.T) {
 	default:
 		t.Fatal("Close returned before monitor exited")
 	}
+}
+
+func TestClosedThrottlerCannotReopen(t *testing.T) {
+	for _, throttler := range []Throttler{&Replica{}, &AuroraThreads{}, &CommitLatency{}} {
+		require.NoError(t, throttler.Close())
+		require.ErrorIs(t, throttler.Open(t.Context()), errMonitorClosed)
+	}
+}
+
+func TestMonitorStartIsIdempotent(t *testing.T) {
+	var loop monitorLoop
+	var calls atomic.Int32
+	started := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	defer loop.close()
+	require.NoError(t, loop.start(ctx, func(ctx context.Context) {
+		calls.Add(1)
+		close(started)
+		<-ctx.Done()
+	}))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor did not start")
+	}
+	originalDone := loop.done
+	require.NoError(t, loop.start(ctx, func(ctx context.Context) {
+		calls.Add(1)
+		<-ctx.Done()
+	}))
+	require.Equal(t, originalDone, loop.done, "a repeated start must keep the original monitor")
+	loop.close()
+	require.Equal(t, int32(1), calls.Load())
 }
