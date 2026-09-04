@@ -72,7 +72,7 @@ type CommitLatency struct {
 	logger    *slog.Logger
 
 	isThrottled atomic.Bool
-	isClosed    atomic.Bool
+	poller      monitorLoop
 
 	// Previous sample, guarded by sampleMu. commits and latency must move
 	// together to compute a meaningful delta, so a single mutex is simpler
@@ -111,14 +111,16 @@ func NewCommitLatencyThrottler(db *sql.DB, threshold time.Duration, logger *slog
 }
 
 func (c *CommitLatency) Open(ctx context.Context) error {
+	if err := c.poller.checkOpen(); err != nil {
+		return err
+	}
 	// Take an initial sample so the first delta computed by the background
 	// loop is meaningful; otherwise we'd flap "throttled" on the very first
 	// post-open chunk based on whatever the cumulative average happened to be.
 	if err := c.UpdateLag(ctx); err != nil {
 		return err
 	}
-	go c.run(ctx)
-	return nil
+	return c.poller.start(ctx, c.run)
 }
 
 func (c *CommitLatency) run(ctx context.Context) {
@@ -129,9 +131,6 @@ func (c *CommitLatency) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if c.isClosed.Load() {
-				return
-			}
 			if err := c.UpdateLag(ctx); err != nil {
 				if isShutdownError(ctx, err) {
 					return // teardown cancelled the in-flight sample; not a monitoring failure
@@ -144,7 +143,7 @@ func (c *CommitLatency) run(ctx context.Context) {
 }
 
 func (c *CommitLatency) Close() error {
-	c.isClosed.Store(true)
+	c.poller.close()
 	return nil
 }
 
