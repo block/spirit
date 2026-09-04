@@ -277,6 +277,8 @@ var (
 var serverIDs = sync.OnceValue(func() *serverIDSequence {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
+		// A clock-derived seed lasts for this process: cross-process
+		// separation then depends on differing process start times.
 		return newServerIDSequence(uint32(time.Now().UnixNano()))
 	}
 	return newServerIDSequence(binary.BigEndian.Uint32(b[:]))
