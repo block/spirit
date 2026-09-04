@@ -46,7 +46,7 @@ func TestTableCleanupAfterTestContextCancelled(t *testing.T) {
 			_, err := tt.DB.ExecContext(t.Context(), "CREATE TABLE "+name+" (id INT PRIMARY KEY)")
 			require.NoError(t, err)
 		}
-	}) // t.Context is cancelled before NewTestTable's cleanup executes.
+	}) // The subtest's context is cancelled before NewTestTable's cleanup executes.
 	db, err := sql.Open("mysql", DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
