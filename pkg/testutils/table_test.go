@@ -3,10 +3,14 @@ package testutils
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,6 +27,7 @@ func TestDropArtifactsRespectsDeadline(t *testing.T) {
 	defer cancel()
 	err = tt.dropArtifacts(ctx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 1, strings.Count(err.Error(), context.DeadlineExceeded.Error()), "report the deadline only once")
 	require.NoError(t, trx.Rollback())
 	require.NoError(t, tt.dropArtifacts(t.Context()))
 }
@@ -56,4 +61,38 @@ func TestTableCleanupAfterTestContextCancelled(t *testing.T) {
 		('cleanup_artifacts', '_cleanup_artifacts_new', '_cleanup_artifacts_old', '_cleanup_artifacts_chkpnt')`).Scan(&count))
 	require.Zero(t, count)
 	require.Error(t, tt.DB.PingContext(t.Context()), "cleanup must also close the pool")
+}
+
+func TestIdentifierTooLongError(t *testing.T) {
+	require.True(t, isIdentifierTooLongError(&mysql.MySQLError{Number: 1059}))
+	require.True(t, isIdentifierTooLongError(fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1059})))
+	for _, err := range []error{nil, errors.New("1059"), &mysql.MySQLError{Number: 1062, Message: "Duplicate entry '1059'"}, &mysql.MySQLError{Number: 1406, Message: "Data too long at row 1059"}} {
+		require.False(t, isIdentifierTooLongError(err))
+	}
+}
+
+func TestTableCleanupLongName(t *testing.T) {
+	name := strings.Repeat("a", 60)
+	var tt *TestTable
+	t.Run("long base name", func(t *testing.T) {
+		tt = NewTestTable(t, name, "CREATE TABLE "+name+" (id INT PRIMARY KEY)")
+	})
+	require.Error(t, tt.DB.PingContext(t.Context()))
+	db, err := sql.Open("mysql", DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", name).Scan(&count))
+	require.Zero(t, count)
+}
+
+func TestCleanupContextHasThirtySecondDeadline(t *testing.T) {
+	before := time.Now()
+	ctx, cancel := newTestCleanupContext()
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok)
+	require.False(t, deadline.Before(before.Add(30*time.Second)))
+	require.False(t, deadline.After(time.Now().Add(30*time.Second)))
+	require.NoError(t, ctx.Err())
 }

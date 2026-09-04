@@ -5,12 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,12 +51,16 @@ func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 	// Register cleanup immediately so the DB is always closed and artifacts
 	// are dropped even if createSQL fails (require.NoError calls FailNow,
 	// but deferred cleanup still runs).
+	cleanupArtifacts := false
 	t.Cleanup(func() {
 		// Use context.Background() because t.Context() is canceled after
 		// the test finishes, which would cause DROP statements to fail.
-		ctx, cancel := context.WithTimeout(context.Background(), testCleanupTimeout)
+		ctx, cancel := newTestCleanupContext()
 		defer cancel()
 		defer utils.CloseAndLog(db)
+		if !cleanupArtifacts {
+			return // Setup already reported the stale-artifact failure.
+		}
 		if err := tt.dropArtifacts(ctx); err != nil {
 			t.Errorf("cleaning up test table %q: %v", tt.Name, err)
 		}
@@ -64,11 +69,17 @@ func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 	// Drop any pre-existing table and Spirit artifacts.
 	require.NoError(t, tt.dropArtifacts(t.Context()), "removing stale artifacts for %q", name)
 
+	cleanupArtifacts = true // Clean up even if CREATE fails.
+
 	// Create the table.
 	_, err = db.ExecContext(t.Context(), createSQL)
 	require.NoError(t, err)
 
 	return tt
+}
+
+func newTestCleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), testCleanupTimeout)
 }
 
 // dropArtifacts drops the base table and all Spirit shadow/checkpoint tables.
@@ -90,6 +101,9 @@ func (tt *TestTable) dropArtifacts(ctx context.Context) error {
 		_, err := tt.DB.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", sqlescape.EscapeIdentifier(tbl)))
 		if err != nil && !isIdentifierTooLongError(err) {
 			errs = append(errs, fmt.Errorf("dropping %q: %w", tbl, err))
+			if ctx.Err() != nil {
+				return errors.Join(errs...)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -99,7 +113,8 @@ func (tt *TestTable) dropArtifacts(ctx context.Context) error {
 // is too long" error (Error 1059), which happens when artifact table names
 // exceed the 64-character limit.
 func isIdentifierTooLongError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "1059")
+	mysqlErr, ok := errors.AsType[*mysql.MySQLError](err)
+	return ok && mysqlErr.Number == parsermysql.ErrTooLongIdent
 }
 
 // SeedRows populates the table by doubling rows until reaching approximately
