@@ -1115,6 +1115,10 @@ func (c *binlogClient) Close() {
 
 	// Wait for the readStream goroutine to exit cleanly. This prevents
 	// goroutine leaks detected by goleak in tests.
+	// Quiesce writes as well as the reader before callers tear down pools.
+	// The periodic loop has its own context and is not joined by streamWG.
+	c.StopPeriodicFlush()
+
 	c.streamWG.Wait()
 
 	// streamWG.Wait has returned, so readStream has exited and c.syncer
@@ -1347,7 +1351,7 @@ func (c *binlogClient) StopPeriodicFlush() {
 // Satisfies Source interface.
 func (c *binlogClient) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
 	c.periodicFlushLock.Lock()
-	if c.periodicFlushCancel != nil {
+	if c.isClosed.Load() || c.periodicFlushCancel != nil {
 		c.periodicFlushLock.Unlock()
 		return
 	}
