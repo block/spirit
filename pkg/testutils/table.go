@@ -3,14 +3,18 @@ package testutils
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
+
+const testCleanupTimeout = 30 * time.Second
 
 // TestTable manages a test table's lifecycle: creation, cleanup, and
 // provides a DB connection for verification queries after migration.
@@ -49,12 +53,16 @@ func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 	t.Cleanup(func() {
 		// Use context.Background() because t.Context() is canceled after
 		// the test finishes, which would cause DROP statements to fail.
-		tt.dropArtifacts(context.Background())
-		utils.CloseAndLog(db)
+		ctx, cancel := context.WithTimeout(context.Background(), testCleanupTimeout)
+		defer cancel()
+		defer utils.CloseAndLog(db)
+		if err := tt.dropArtifacts(ctx); err != nil {
+			t.Errorf("cleaning up test table %q: %v", tt.Name, err)
+		}
 	})
 
 	// Drop any pre-existing table and Spirit artifacts.
-	tt.dropArtifacts(t.Context())
+	require.NoError(t, tt.dropArtifacts(t.Context()), "removing stale artifacts for %q", name)
 
 	// Create the table.
 	_, err = db.ExecContext(t.Context(), createSQL)
@@ -66,22 +74,25 @@ func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 // dropArtifacts drops the base table and all Spirit shadow/checkpoint tables.
 // It ignores "identifier name too long" errors for artifact names that exceed
 // MySQL's 64-char limit (e.g., when testing long table names), but propagates
-// other unexpected errors via logging.
-func (tt *TestTable) dropArtifacts(ctx context.Context) {
+// other unexpected errors to the caller. It still attempts the remaining drops.
+func (tt *TestTable) dropArtifacts(ctx context.Context) error {
 	tables := []string{
 		tt.Name,
 		fmt.Sprintf("_%s_new", tt.Name),
 		fmt.Sprintf("_%s_old", tt.Name),
 		fmt.Sprintf("_%s_chkpnt", tt.Name),
 	}
+	var errs []error
 	for _, tbl := range tables {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		_, err := tt.DB.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", sqlescape.EscapeIdentifier(tbl)))
 		if err != nil && !isIdentifierTooLongError(err) {
-			// Log but don't fail — cleanup is best-effort and the test
-			// may already be finished (e.g., context canceled race).
-			continue
+			errs = append(errs, fmt.Errorf("dropping %q: %w", tbl, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // isIdentifierTooLongError returns true if the error is MySQL's "identifier name
