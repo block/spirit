@@ -30,7 +30,6 @@ func TestThrottlerInterface(t *testing.T) {
 	defer utils.CloseAndLog(db)
 
 	//	NewReplicationThrottler will attach either MySQL 8.0 or MySQL 5.7 throttler
-	loopInterval = 1 * time.Millisecond
 	throttler, err := NewReplicationThrottler(db, 60*time.Second, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, throttler.Open(t.Context()))
@@ -45,7 +44,6 @@ func TestThrottlerInterface(t *testing.T) {
 
 	require.NoError(t, throttler.Close())
 
-	time.Sleep(50 * time.Millisecond) // give it time to shutdown.
 }
 
 func TestNoopThrottler(t *testing.T) {

@@ -256,7 +256,7 @@ type AuroraThreads struct {
 	vCPUs int64
 
 	isThrottled atomic.Bool
-	isClosed    atomic.Bool
+	poller      monitorLoop
 
 	// lastSample holds the most recent observation for logging and the raw
 	// hard-stop comparison.
@@ -304,7 +304,7 @@ func (a *AuroraThreads) Open(ctx context.Context) error {
 	if err := a.UpdateLag(ctx); err != nil {
 		return err
 	}
-	go a.run(ctx)
+	a.poller.start(ctx, a.run)
 	return nil
 }
 
@@ -316,9 +316,6 @@ func (a *AuroraThreads) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if a.isClosed.Load() {
-				return
-			}
 			if err := a.UpdateLag(ctx); err != nil {
 				if isShutdownError(ctx, err) {
 					return // teardown cancelled the in-flight sample; not a monitoring failure
@@ -331,7 +328,7 @@ func (a *AuroraThreads) run(ctx context.Context) {
 }
 
 func (a *AuroraThreads) Close() error {
-	a.isClosed.Store(true)
+	a.poller.close()
 	return nil
 }
 

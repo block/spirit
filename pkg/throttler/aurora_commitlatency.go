@@ -72,7 +72,7 @@ type CommitLatency struct {
 	logger    *slog.Logger
 
 	isThrottled atomic.Bool
-	isClosed    atomic.Bool
+	poller      monitorLoop
 
 	// Previous sample, guarded by sampleMu. commits and latency must move
 	// together to compute a meaningful delta, so a single mutex is simpler
@@ -117,7 +117,7 @@ func (c *CommitLatency) Open(ctx context.Context) error {
 	if err := c.UpdateLag(ctx); err != nil {
 		return err
 	}
-	go c.run(ctx)
+	c.poller.start(ctx, c.run)
 	return nil
 }
 
@@ -129,9 +129,6 @@ func (c *CommitLatency) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if c.isClosed.Load() {
-				return
-			}
 			if err := c.UpdateLag(ctx); err != nil {
 				if isShutdownError(ctx, err) {
 					return // teardown cancelled the in-flight sample; not a monitoring failure
@@ -144,7 +141,7 @@ func (c *CommitLatency) run(ctx context.Context) {
 }
 
 func (c *CommitLatency) Close() error {
-	c.isClosed.Store(true)
+	c.poller.close()
 	return nil
 }
 

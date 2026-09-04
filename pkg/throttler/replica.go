@@ -30,7 +30,7 @@ type Replica struct {
 	lagTolerance   time.Duration
 	currentLagInMs atomic.Int64
 	logger         *slog.Logger
-	isClosed       atomic.Bool
+	poller         monitorLoop
 
 	// stale guards against the cached lag freezing at a healthy value when
 	// polling fails persistently: IsThrottled() fails closed while the
@@ -74,32 +74,31 @@ func (l *Replica) Open(ctx context.Context) error {
 	if err := l.UpdateLag(ctx); err != nil {
 		return err
 	}
-	go func() {
-		ticker := time.NewTicker(loopInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if l.isClosed.Load() {
-					return
-				}
-				if err := l.UpdateLag(ctx); err != nil {
-					if isShutdownError(ctx, err) {
-						return // teardown cancelled the in-flight poll; not a monitoring failure
-					}
-					l.logger.Error("error polling replica lag; keeping the last reading (throttling fails closed if polling stays stale)",
-						"error", err)
-				}
-			}
-		}
-	}()
+	l.poller.start(ctx, l.run)
 	return nil
 }
 
+func (l *Replica) run(ctx context.Context) {
+	ticker := time.NewTicker(loopInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := l.UpdateLag(ctx); err != nil {
+				if isShutdownError(ctx, err) {
+					return // teardown cancelled the in-flight poll; not a monitoring failure
+				}
+				l.logger.Error("error polling replica lag; keeping the last reading (throttling fails closed if polling stays stale)",
+					"error", err)
+			}
+		}
+	}
+}
+
 func (l *Replica) Close() error {
-	l.isClosed.Store(true)
+	l.poller.close()
 	return nil
 }
 
