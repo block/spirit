@@ -38,13 +38,6 @@ func mkIniFile(t *testing.T, content string) string {
 	return tmpFile.Name()
 }
 
-// stringerFunc adapts a func() string to fmt.Stringer so that message
-// arguments to require.Eventually can be evaluated lazily, at the moment the
-// failure message is formatted, rather than eagerly when Eventually is called.
-type stringerFunc func() string
-
-func (f stringerFunc) String() string { return f() }
-
 // waitForStatus polls until the runner reaches the target status or times out.
 // The timeout is generous because the runner must finish the copy and
 // checksum phases before it reaches the later states (e.g.
@@ -54,17 +47,96 @@ func (f stringerFunc) String() string { return f() }
 // binlog catch-up plus 30s acquiring the table lock, and the runner retries
 // the checksum up to 3 times, so the budget must cover at least two full
 // attempts.
-func waitForStatus(t *testing.T, m *Runner, target status.State) {
+func waitForStatus(t *testing.T, m *Runner, target status.State, runs ...*testRun) {
 	t.Helper()
-	// The status is read lazily via a Stringer: fmt args are evaluated when
-	// the failure message is formatted (at timeout), so the message reports
-	// the status the runner was actually stuck in, not the status when the
-	// wait began.
-	lastStatus := stringerFunc(func() string { return m.status.Get().String() })
-	require.Eventually(t, func() bool {
-		return m.status.Get() >= target
-	}, 3*time.Minute, 10*time.Millisecond,
-		"timeout waiting for status >= %s, last status: %s", target, lastStatus)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	var run *testRun
+	if len(runs) > 0 {
+		run = runs[0]
+	}
+	require.NoError(t, awaitTestStatus(ctx, m, target, run))
+}
+
+func awaitTestStatus(ctx context.Context, m *Runner, target status.State, run *testRun) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var done <-chan struct{}
+	if run != nil {
+		done = run.done
+	}
+	for {
+		// Run may fail without ever publishing a later state. Its completion is
+		// authoritative, and closing done publishes its error to this goroutine.
+		select {
+		case <-done:
+			return fmt.Errorf("runner exited before waiting for %s completed: %w", target, run.result())
+		default:
+		}
+		current := m.status.Get()
+		if current >= status.Close {
+			return fmt.Errorf("runner entered terminal state %s while waiting for %s", current, target)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if current >= target {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for %s (last state %s): %w", target, m.status.Get(), ctx.Err())
+		case <-done:
+		case <-ticker.C:
+		}
+	}
+}
+
+// testRun owns a runner until Run has exited and Close has finished. Cleanup is
+// installed before launch, so FailNow anywhere in the test cannot strand a
+// result send or race table cleanup against the runner.
+type testRun struct {
+	done chan struct{}
+	err  error // published by closing done
+}
+
+func startTestRun(t *testing.T, run func(context.Context) error, closeRunner func() error) *testRun {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	running := &testRun{done: make(chan struct{})}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-running.done:
+			// Close only after Run has stopped touching the runner's fields.
+			require.NoError(t, closeRunner())
+		case <-time.After(30 * time.Second):
+			t.Error("runner did not stop during cleanup")
+		}
+	})
+	go func() {
+		running.err = run(ctx)
+		close(running.done)
+	}()
+	return running
+}
+
+func (r *testRun) result() error {
+	if r.err != nil {
+		return r.err
+	}
+	return fmt.Errorf("runner completed")
+}
+
+func (r *testRun) wait(t *testing.T) error {
+	t.Helper()
+	select {
+	case <-r.done:
+		return r.err
+	case <-time.After(3 * time.Minute):
+		t.Fatal("runner did not complete")
+		return nil
+	}
 }
 
 // waitForCopyRows blocks until the runner reaches the CopyRows state (returning
@@ -79,7 +151,11 @@ func waitForCopyRows(ctx context.Context, m *Runner) bool {
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if m.status.Get() >= status.CopyRows {
+		current := m.status.Get()
+		if ctx.Err() != nil || current >= status.Close {
+			return false
+		}
+		if current >= status.CopyRows {
 			return true
 		}
 		select {

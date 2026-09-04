@@ -1023,10 +1023,7 @@ func TestDeferCutOverE2E(t *testing.T) {
 		WithDeferCutOver(),
 		WithRespectSentinel())
 
-	c := make(chan error)
-	go func() {
-		c <- m.Run(t.Context())
-	}()
+	running := startTestRun(t, m.Run, m.Close)
 
 	// Wait until the sentinel table exists.
 	db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
@@ -1044,7 +1041,7 @@ func TestDeferCutOverE2E(t *testing.T) {
 	// Drop the sentinel table — migration should complete.
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
 
-	err = <-c
+	err = running.wait(t)
 	require.NoError(t, err)
 
 	// Old table should be dropped (SkipDropAfterCutover is false).
@@ -1053,7 +1050,6 @@ func TestDeferCutOverE2E(t *testing.T) {
 		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES 
 		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='%s'`, m.changes[0].oldTableName())).Scan(&tableCount))
 	require.Equal(t, 0, tableCount)
-	require.NoError(t, m.Close())
 }
 
 // TestDeferCutOverE2EBinlogAdvance tests that during the sentinel wait phase,
@@ -1073,16 +1069,13 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 		WithDeferCutOver(),
 		WithRespectSentinel())
 
-	c := make(chan error)
-	go func() {
-		c <- m.Run(t.Context())
-	}()
+	running := startTestRun(t, m.Run, m.Close)
 
 	db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	waitForStatus(t, m, status.WaitingOnSentinelTable)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 
 	// Verify the source position advances while waiting. Position() is an
 	// opaque string and the binlogClient's internal setBufferedPos enforces
@@ -1099,7 +1092,7 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
 
-	err = <-c
+	err = running.wait(t)
 	require.NoError(t, err)
 
 	var tableCount int
@@ -1107,7 +1100,6 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
 		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='%s'`, m.changes[0].oldTableName())).Scan(&tableCount))
 	require.Equal(t, 0, tableCount)
-	require.NoError(t, m.Close())
 }
 
 // TestSentinelCreateNeverObservedAbsent verifies that createSentinelTable is
