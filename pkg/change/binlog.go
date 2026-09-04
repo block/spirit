@@ -152,7 +152,7 @@ type binlogClient struct {
 	// parks), so requests never queue behind each other.
 	flushRequests chan Subscription
 
-	flushedBinlogs atomic.Int64 // for testing binlog flushing frequency
+	flushedBinlogs atomic.Int64 // stall-triggered rotations reported as FeedStats.ForcedRotations
 }
 
 // NewBinlogClient constructs the binlog-backed change.Source. The
@@ -1115,6 +1115,10 @@ func (c *binlogClient) Close() {
 
 	// Wait for the readStream goroutine to exit cleanly. This prevents
 	// goroutine leaks detected by goleak in tests.
+	// Join the independently cancellable writer too. Both background loops
+	// must finish before Close returns; neither join depends on the other.
+	c.StopPeriodicFlush()
+
 	c.streamWG.Wait()
 
 	// streamWG.Wait has returned, so readStream has exited and c.syncer
@@ -1343,10 +1347,15 @@ func (c *binlogClient) StopPeriodicFlush() {
 // StopPeriodicFlush is guaranteed to observe the registration. Callers
 // MUST NOT prefix with `go` — the loop is spawned internally.
 //
-// Calling Start while a flush is already running is a no-op.
+// Calling Start while a flush is already running or after Close is a no-op.
 // Satisfies Source interface.
 func (c *binlogClient) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
 	c.periodicFlushLock.Lock()
+	if c.isClosed.Load() {
+		c.periodicFlushLock.Unlock()
+		c.logger.Debug("ignoring periodic flush start on a closed client")
+		return
+	}
 	if c.periodicFlushCancel != nil {
 		c.periodicFlushLock.Unlock()
 		return
@@ -1435,8 +1444,7 @@ func (c *binlogClient) BlockWait(ctx context.Context) error {
 	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
 
 	prevPos := c.getBufferedPos()
-	first := true
-	stallCount := 0
+	stalls := blockWaitStalls{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -1445,25 +1453,14 @@ func (c *binlogClient) BlockWait(ctx context.Context) error {
 			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
 		default:
 			currPos := c.getBufferedPos()
-			if currPos.Compare(prevPos) <= 0 && !first {
-				// Position hasn't advanced. Only flush after multiple consecutive
-				// stalls to avoid unnecessary flushes when the binlog syncer is
-				// just slightly behind (e.g., under CI load). getCurrentBinlogPosition
-				// already flushes once at the start, so a brief stall is expected.
-				stallCount++
-				if stallCount >= blockWaitStallThreshold {
-					c.logger.Debug("buffered position has not advanced, flushing binary logs")
-					if err := dbconn.Exec(ctx, c.db, "FLUSH BINARY LOGS"); err != nil {
-						return err // it could be context cancelled, return it
-					}
-					c.flushedBinlogs.Add(1)
-					stallCount = 0
+			if stalls.observe(prevPos, currPos) {
+				c.logger.Debug("buffered position has not advanced, flushing binary logs")
+				if err := dbconn.Exec(ctx, c.db, "FLUSH BINARY LOGS"); err != nil {
+					return err
 				}
-			} else {
-				stallCount = 0
+				c.flushedBinlogs.Add(1)
 			}
 			prevPos = currPos
-			first = false
 
 			if c.getBufferedPos().Compare(targetPos) >= 0 {
 				return nil // we are up to date!
