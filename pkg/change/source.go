@@ -151,7 +151,7 @@ type Source interface {
 	// StartPeriodicFlush spawns a background goroutine that flushes the
 	// changeset at the given interval. Used by the migrator to advance
 	// the safe-flushed position. Calling Start while a periodic flush
-	// is already running is a no-op.
+	// is already running or after Close has been called is a no-op.
 	StartPeriodicFlush(ctx context.Context, interval time.Duration)
 
 	// StopPeriodicFlush stops the goroutine started by
@@ -179,6 +179,8 @@ type Source interface {
 	// rename that fails ambiguously is retried via Flush and BlockWait.
 	Stop()
 
-	// Close releases all resources. Safe to call more than once.
+	// Close releases all resources, cancelling and joining the reader and any
+	// periodic flush loop. Subsequent StartPeriodicFlush calls are no-ops.
+	// Safe to call more than once.
 	Close()
 }
