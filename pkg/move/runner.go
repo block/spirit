@@ -99,7 +99,11 @@ func targetKey(t applier.Target) string {
 }
 
 type Runner struct {
-	move            *Move
+	move                     *Move
+	reverseWriteThreads      int // Configured count, unaffected by forward autoscaling.
+	continuousChecksumActive atomic.Bool
+
+	chunkerMu       sync.RWMutex     // Publishes copyChunker to concurrent Progress callers.
 	sources         []sourceInfo     // one per source database
 	targets         []applier.Target // Combined DB, Config, and KeyRange
 	status          status.Tracker   // owns the current state and per-state timing
@@ -232,9 +236,10 @@ func NewRunner(m *Move) (*Runner, error) {
 		m.WriteThreads = defaultWriteThreads
 	}
 	r := &Runner{
-		move:        m,
-		logger:      slog.Default(),
-		metricsSink: &metrics.NoopSink{},
+		move:                m,
+		reverseWriteThreads: m.WriteThreads,
+		logger:              slog.Default(),
+		metricsSink:         &metrics.NoopSink{},
 	}
 	return r, nil
 }
@@ -543,7 +548,9 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	// Then create a multi chunker of all chunkers.
+	r.chunkerMu.Lock()
 	r.copyChunker = table.NewMultiChunker(copyChunkers...)
+	r.chunkerMu.Unlock()
 	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
@@ -1038,7 +1045,9 @@ func (r *Runner) newCopy(ctx context.Context) error {
 		}
 	}
 
+	r.chunkerMu.Lock()
 	r.copyChunker = table.NewMultiChunker(copyChunkers...)
+	r.chunkerMu.Unlock()
 	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
@@ -1985,47 +1994,88 @@ func (r *Runner) SetReverseCutoverWithResult(fn CutoverResultCallback) {
 }
 
 func (r *Runner) Progress() status.Progress {
+	// Read the state once: the phase-specific fields below (summary, ETA,
+	// checksum, throttle) must all describe the same state, not whichever state
+	// each happened to observe.
+	state := r.status.Get()
 	var summary string
-	switch r.status.Get() { //nolint:exhaustive
+	var eta status.ETA
+	var checksum status.ChecksumProgress
+	switch state { //nolint: exhaustive
 	case status.CopyRows:
 		summary = fmt.Sprintf("%v %s ETA %v",
 			r.copier.GetProgress(),
-			r.status.Get().String(),
+			state.String(),
 			r.copier.GetETA(),
 		)
+		eta = r.copier.GetETAState()
 	case status.WaitingOnSentinelTable:
-		r.logger.Info("migration status",
-			"state", r.status.Get().String(),
-			"sentinel-table", fmt.Sprintf("%s.%s", r.targets[0].Config.DBName, sentinel.TableName),
-			"total-time", r.status.TotalElapsed().Round(time.Second).String(),
-			"sentinel-wait-time", r.status.Elapsed().Round(time.Second).String(),
-			"sentinel-max-wait-time", sentinel.WaitLimit.String(),
-		)
+		summary = "Waiting on Sentinel Table"
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.getDeltaLenAll())
 	case status.Checksum:
-		summary = "Checksum Progress=" + r.checker.GetProgress().String()
-	default:
-		summary = ""
+		checksum = r.checker.GetProgress()
+		summary = "Checksum Progress=" + checksum.String()
+	}
+
+	// Get per-table progress from the published copy chunker. Setup and
+	// checkpoint resume may publish it while an API caller polls Progress.
+	var tables []status.TableProgress
+	r.chunkerMu.RLock()
+	copyChunker := r.copyChunker
+	r.chunkerMu.RUnlock()
+	if mc, ok := copyChunker.(interface{ PerTableProgress() []table.TableProgress }); ok {
+		for _, tp := range mc.PerTableProgress() {
+			tables = append(tables, status.TableProgress{
+				TableName:  tp.TableName,
+				RowsCopied: tp.RowsCopied,
+				RowsTotal:  tp.RowsTotal,
+				IsComplete: tp.IsComplete,
+			})
+		}
+	} else if copyChunker != nil {
+		// A single source table does not need a multi-chunker.
+		rowsCopied, _, rowsTotal := copyChunker.Progress()
+		tableTables := copyChunker.Tables()
+		tableName := ""
+		if len(tableTables) > 0 {
+			tableName = tableTables[0].TableName
+		}
+		tables = append(tables, status.TableProgress{
+			TableName:  tableName,
+			RowsCopied: rowsCopied,
+			RowsTotal:  rowsTotal,
+			IsComplete: copyChunker.IsRead(),
+		})
 	}
 	return status.Progress{
-		CurrentState: r.status.Get(),
+		CurrentState: state,
 		Summary:      summary,
 		Resume:       r.usedResumeFromCheckpoint.Load(),
-		Throttle:     r.throttleStatus(r.status.Get()),
+		Throttle:     r.throttleStatus(state),
+		ETA:          eta,
+		Checksum:     checksum,
+		Tables:       tables,
 	}
 }
 
-// Only actively paced phases report paused status. Cutover and completed
-// runs must not appear throttled when the monitor's last sample ages out.
+// Sentinel waiting only reports pacing while a continuous checksum is running.
 func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
+	t := r.currentThrottler()
 	switch state { //nolint:exhaustive
-	case status.CopyRows, status.Checksum:
-		paused, reason, util := throttler.Describe(r.currentThrottler())
-		return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
+	case status.CopyRows:
+	case status.Checksum:
+		t = throttler.GradualOnly(t)
+	case status.WaitingOnSentinelTable:
+		if !r.continuousChecksumActive.Load() {
+			return status.ThrottleStatus{}
+		}
+		t = throttler.GradualOnly(t)
 	default:
 		return status.ThrottleStatus{}
 	}
+	paused, reason, util := throttler.Describe(t)
+	return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
 }
 
 // invalidateChecksumWatermark blanks the checksum_watermark on the persisted
@@ -2149,7 +2199,9 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		iteration++
 		iterationStart := time.Now()
 		r.logger.Info("continuous checksum iteration starting", "iteration", iteration)
+		r.continuousChecksumActive.Store(true)
 		runErr := checker.Run(ctx)
+		r.continuousChecksumActive.Store(false)
 		if runErr != nil {
 			// Only suppress a `context.Canceled` that came from OUR ctx
 			// being cancelled (the sentinel was dropped while a pass was

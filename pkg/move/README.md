@@ -70,3 +70,9 @@ Two constraints and one resume note:
 - **Unsharded source only** — reverse-window is a 1→M forward move reversed as M→1; a sharded source would need an M:N reverse and is rejected at startup.
 - **Stale-marker guard** — a `_spirit_move_revert` present at pre-flight or pre-cutover aborts the run, so a leftover from an interrupted rollback is never read as a fresh request.
 - **Resume** — the checkpoint gains `move_phase` (`reverse_window` / `reverting`) and `cutover_at` columns, so a move killed during the window resumes back into it rather than re-copying. The `reverting` phase (mid-rollback) is not auto-resumed and must be completed manually.
+
+### Structured progress
+
+`Runner.Progress()` reports the current state, resume status, structured copy ETA, initial checksum counts, per-table copy progress and throttling, matching migration. Table identifiers from the multi-chunker distinguish sources in multi-source moves. Sentinel waiting returns a summary without logging; load throttling is reported while a continuous checksum pass is active, and clears during the interval between passes.
+
+Reverse-window writes use the configured `WriteThreads` count (including its default), independently of the forward autoscaler’s resolved count. This keeps uninterrupted and resumed reverse windows consistent without applying forward-target capacity assumptions to the reverse destinations.

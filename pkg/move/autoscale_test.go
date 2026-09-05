@@ -68,7 +68,7 @@ func TestMoveThrottleStatus(t *testing.T) {
 	r := &Runner{}
 	r.setThrottler(&throttler.Mock{})
 	require.True(t, r.throttleStatus(status.CopyRows).Throttled)
-	require.True(t, r.throttleStatus(status.Checksum).Throttled)
+	require.False(t, r.throttleStatus(status.Checksum).Throttled)
 	require.Empty(t, r.throttleStatus(status.CutOver))
 	require.Empty(t, r.throttleStatus(status.Close))
 }
