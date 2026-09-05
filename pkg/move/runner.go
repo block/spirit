@@ -59,6 +59,13 @@ var (
 	continuousChecksumMinInterval = 1 * time.Hour
 )
 
+// Only definitive checkpoint failures permit --force to discard a partial copy.
+var errCheckpointUnresumable = errors.New("checkpoint is not resumable")
+
+func isDefinitivelyUnresumable(err error) bool {
+	return errors.Is(err, status.ErrCheckpointTooOld) || errors.Is(err, errCheckpointUnresumable)
+}
+
 // sourceInfo holds per-source connection state for N:M moves.
 type sourceInfo struct {
 	db         *sql.DB
@@ -429,8 +436,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if rec.Phase != "" {
 		return fmt.Errorf("cannot resume move down the copy path: checkpoint is past cutover (phase=%q); a reverse-window resume is handled earlier (see maybeResumeReverseWindow)", rec.Phase)
 	}
-	copierWatermark := rec.CopierWatermark
-	r.checksumWatermark = rec.ChecksumWatermark
 
 	// Check if the checkpoint is too old to safely resume — replaying many
 	// days of binary logs can be slower than re-copying, and the binlogs may
@@ -440,7 +445,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// non-empty (that is exactly why setupUnderLocks() chose the resume path), so we
 	// fail loudly and leave the decision to the operator.
 	if checkpointAge := rec.Age(); checkpointAge >= r.move.CheckpointMaxAge {
-		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or wipe the target tables (including '%s') and restart the move from scratch",
+		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or re-run with --force to wipe the target tables (including '%s') and restart the move from scratch",
 			status.ErrCheckpointTooOld,
 			checkpointAge.Round(time.Second),
 			r.move.CheckpointMaxAge,
@@ -452,13 +457,17 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// keyed by sourceKey (addr/dbname).
 	var positions map[string]string
 	if err := json.Unmarshal([]byte(rec.Position), &positions); err != nil {
-		return fmt.Errorf("could not parse binlog positions from checkpoint: %w", err)
+		return fmt.Errorf("%w: could not parse binlog positions from checkpoint: %w", errCheckpointUnresumable, err)
 	}
 	for i := range r.sources {
-		if _, ok := positions[r.sources[i].sourceKey()]; !ok {
-			return fmt.Errorf("checkpoint missing binlog position for source %s", r.sources[i].sourceKey())
+		if pos, ok := positions[r.sources[i].sourceKey()]; !ok || pos == "" {
+			return fmt.Errorf("%w: checkpoint missing binlog position for source %s", errCheckpointUnresumable, r.sources[i].sourceKey())
 		}
 	}
+
+	// All definitive validation has passed before changing runner or target state.
+	copierWatermark := rec.CopierWatermark
+	r.checksumWatermark = rec.ChecksumWatermark
 
 	// Build each source's change source in the coordinate scheme its
 	// checkpointed position was written in (a GTID set resumes through the
@@ -671,11 +680,20 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		}
 		switch decision {
 		case resumeCheckpoint:
-			if resumeErr := r.resumeFromCheckpoint(ctx); resumeErr != nil {
+			resumeErr := r.resumeFromCheckpoint(ctx)
+			if resumeErr == nil {
+				r.logger.Info("Successfully resumed move from existing checkpoint")
+				return nil
+			}
+			if !r.move.Force || !isDefinitivelyUnresumable(resumeErr) {
 				return fmt.Errorf("resume validation passed but checkpoint resume failed: %w", resumeErr)
 			}
-			r.logger.Info("Successfully resumed move from existing checkpoint")
-			return nil
+			r.logger.Warn("force set and checkpoint is definitively unresumable; starting fresh", "reason", resumeErr)
+			// resumeFromCheckpoint assigns this only after every definitive
+			// validation. Clear it explicitly before the fresh path so a future
+			// force-eligible failure added after that boundary cannot leak stale
+			// checkpoint state into newCopy.
+			r.checksumWatermark = ""
 		case resumeFreshOwned:
 			r.logger.Warn("target holds an empty checkpoint table: a prior move attempt stopped before writing its first checkpoint; wiping target tables and starting fresh")
 		case resumeNone:
@@ -683,6 +701,11 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 				return fmt.Errorf("target state is invalid for both new copy and resume (re-run with --force to wipe the target and start fresh): %w", err)
 			}
 			r.logger.Warn("force set and the target cannot resume; wiping target tables and starting fresh")
+		}
+		// A wipe only cures target state. Validate all other checks first,
+		// including when an empty checkpoint proves this is a prior attempt.
+		if preErr := r.runChecks(ctx, check.ScopePostSetup, check.TargetStateCheckName); preErr != nil {
+			return fmt.Errorf("refusing to wipe the target because a check that wiping cannot fix is failing: %w", preErr)
 		}
 		if werr := r.wipeTargets(ctx); werr != nil {
 			return fmt.Errorf("failed to wipe target before a fresh copy: %w", werr)
@@ -692,8 +715,7 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		// source_schema_consistency, ...). Re-run them against the now-wiped
 		// target (target_state passes for the absent tables, exactly as a fresh
 		// move); abort if anything still fails rather than copying into a state
-		// that would only fail at cutover. RunChecks iterates a map, so the
-		// original failure was not necessarily target_state.
+		// that would only fail at cutover.
 		if err := r.runChecks(ctx, check.ScopePostSetup); err != nil {
 			return fmt.Errorf("target still fails post-setup checks after wiping: %w", err)
 		}
@@ -1170,6 +1192,18 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		return strings.Compare(targetKey(a), targetKey(b))
 	})
 
+	sourceDBs := make([]*sql.DB, len(r.sources))
+	for i := range r.sources {
+		sourceDBs[i] = r.sources[i].db
+	}
+	targetDBs := make([]*sql.DB, len(r.targets))
+	for i := range r.targets {
+		targetDBs[i] = r.targets[i].DB
+	}
+	if err := dbconn.RequireDifferentDatabases(ctx, sourceDBs, targetDBs); err != nil {
+		return err
+	}
+
 	// If a prior run reached the reverse window (or a reverse cutover), resume
 	// that here instead of the normal discovery/copy path. The forward cutover
 	// renamed the source tables to _old, so the normal path would otherwise
@@ -1583,8 +1617,8 @@ func (r *Runner) SetMetricsSink(sink metrics.Sink) {
 	r.metricsSink = sink
 }
 
-// runChecks wraps around check.RunChecks and adds the context of this move operation
-func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
+// checkResources describes this move for both full and pre-wipe validation.
+func (r *Runner) checkResources() check.Resources {
 	sources := make([]check.SourceResource, len(r.sources))
 	for i := range r.sources {
 		sources[i] = check.SourceResource{
@@ -1593,13 +1627,17 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			DSN:    r.sources[i].dsn,
 		}
 	}
-	return check.RunChecks(ctx, check.Resources{
+	return check.Resources{
 		Sources:        sources,
 		Targets:        r.targets,
 		SourceTables:   r.sourceTables,
 		DeferCutOver:   r.move.DeferCutOver,
 		MoveEverything: len(r.move.SourceTables) == 0,
-	}, r.logger, scope)
+	}
+}
+
+func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag, exclude ...string) error {
+	return check.RunChecks(ctx, r.checkResources(), r.logger, scope, exclude...)
 }
 
 // restoreSecondaryIndexes restores any secondary indexes that were deferred during table creation.
