@@ -51,7 +51,6 @@ type ShardedApplier struct {
 	nextWorkID        atomic.Int64 // Atomic counter for work IDs
 
 	// Context management
-	workerCtx  context.Context
 	cancelFunc context.CancelFunc
 	wg         sync.WaitGroup
 
@@ -83,9 +82,7 @@ type shardTarget struct {
 	chunkletBuffer      chan shardedChunklet
 	chunkletCompletions chan shardedChunkletCompletion
 	writeWorkersCount   int32
-	workersWg           sync.WaitGroup
-	workerQuits         []chan struct{}
-	activeWorkers       atomic.Int32
+	workers             workerPool
 	workerIDCounter     int32
 	logger              *slog.Logger
 	dbConfig            *dbconn.DBConfig
@@ -198,7 +195,6 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 		for _, shard := range a.shards {
 			shard.chunkletBuffer = make(chan shardedChunklet, defaultBufferSize)
 			shard.chunkletCompletions = make(chan shardedChunkletCompletion, defaultBufferSize)
-			shard.workerQuits = nil
 			shard.workerIDCounter = 0
 		}
 		a.stopped = false
@@ -206,14 +202,13 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 
 	workerCtx, cancelFunc := context.WithCancel(ctx)
 	a.cancelFunc = cancelFunc
-	a.workerCtx = workerCtx
 
 	a.started = true
 	a.logger.Info("starting ShardedApplier", "shardCount", len(a.shards))
 
 	// The configured count is per target, as with fixed pools.
 	for _, shard := range a.shards {
-		a.setShardWorkers(shard, int(shard.writeWorkersCount))
+		shard.workers.start(workerCtx, int(shard.writeWorkersCount), func(ctx context.Context, quit <-chan struct{}) { a.writeWorker(ctx, shard, quit) })
 	}
 
 	// Start a single feedback coordinator for all shards
@@ -432,6 +427,7 @@ func (a *ShardedApplier) Stop() error {
 
 	// Close all shard buffers
 	for _, shard := range a.shards {
+		shard.workers.seal()
 		close(shard.chunkletBuffer)
 	}
 
@@ -445,7 +441,7 @@ func (a *ShardedApplier) Stop() error {
 	// Stop owns completion-channel closure. Retiring workers must never close
 	// it: other workers may still be writing, or the pool may grow again.
 	for _, shard := range a.shards {
-		shard.workersWg.Wait()
+		shard.workers.wait()
 		close(shard.chunkletCompletions)
 	}
 	a.wg.Wait()
@@ -464,22 +460,7 @@ func (a *ShardedApplier) SetWriteWorkers(n int) {
 		return
 	}
 	for _, shard := range a.shards {
-		a.setShardWorkers(shard, max(1, n))
-	}
-}
-
-// setShardWorkers requires a's mutex, excluding Stop's Wait from worker adds.
-func (a *ShardedApplier) setShardWorkers(shard *shardTarget, n int) {
-	for len(shard.workerQuits) < n {
-		quit := make(chan struct{})
-		shard.workerQuits = append(shard.workerQuits, quit)
-		shard.activeWorkers.Add(1)
-		shard.workersWg.Go(func() { a.writeWorker(a.workerCtx, shard, quit) })
-	}
-	for len(shard.workerQuits) > n {
-		last := len(shard.workerQuits) - 1
-		close(shard.workerQuits[last])
-		shard.workerQuits = shard.workerQuits[:last]
+		shard.workers.resize(n)
 	}
 }
 
@@ -495,7 +476,7 @@ func (a *ShardedApplier) Stats() Stats {
 		queueDepth += len(shard.chunkletBuffer)
 		queueCap += cap(shard.chunkletBuffer)
 		if a.started {
-			activeWorkers += int(shard.activeWorkers.Load())
+			activeWorkers += shard.workers.count()
 		}
 	}
 	a.Unlock()
@@ -524,7 +505,6 @@ func (a *ShardedApplier) Stats() Stats {
 
 // writeWorker processes chunklets for a specific shard
 func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, quit <-chan struct{}) {
-	defer shard.activeWorkers.Add(-1)
 	workerID := atomic.AddInt32(&shard.workerIDCounter, 1)
 
 	// Drain chunkletBuffer until it is closed by Stop(). We deliberately do not

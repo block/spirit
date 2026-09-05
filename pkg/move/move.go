@@ -6,11 +6,16 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
 
 type Move struct {
+	// Each source/target *sql.DB owns a pool at this limit; worker counts do
+	// not grow it. Dedicated monitor/advisory pools are separate.
+	MaxConnections int `name:"max-connections" help:"Size of each source and target connection pool. Workers share the pool and contend for connections." optional:"" default:"128"`
+
 	// Autoscaling uses the busiest target host to scale all shards together.
 	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: scale copy, per-target write and checksum threads using the busiest Aurora target host. Overrides --threads and --write-threads when all target hosts qualify." default:"false"`
 
@@ -95,7 +100,11 @@ func (m *Move) Validate() error {
 	if m.ReverseWindow < 0 {
 		return fmt.Errorf("--reverse-window must be non-negative, got %s", m.ReverseWindow)
 	}
-	return nil
+	threads := m.Threads
+	if threads == 0 {
+		threads = defaultThreads
+	}
+	return dbconn.ValidateMaxConnections(m.MaxConnections, threads, minChecksumPhaseReserve)
 }
 
 func (m *Move) Run() error {

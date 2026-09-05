@@ -149,6 +149,8 @@ For detailed information about the SingleTargetApplier and ShardedApplier implem
 
 The ShardedApplier has an important limitation: it only tracks changes by `PRIMARY KEY`, not by sharding column (vindex). This means DeleteKeys and UpsertRows must broadcast to all shards, and the vindex column must be immutable. See `sharded.go` for details.
 
-### Sharded write-worker scaling
+### Write-worker scaling
+
+Both appliers use the same internal `workerPool` for growth, cooperative retirement, shutdown and restart. The single-target applier owns one pool; the sharded applier owns one per target. Queue routing and completion aggregation remain specific to each applier. Throttling stays in the copier.
 
 `ShardedApplier.SetWriteWorkers(n)` sets the desired count **per target**, with a minimum of one. Workers retire between chunklets, so an in-flight write always reports its completion. `Stop` joins all workers before closing the completion channels; resizing during shutdown is a no-op. `Stats().ActiveWorkers` remains the aggregate across all targets. Move's autoscaler drives these pools together from the busiest target host's load.
