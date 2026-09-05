@@ -147,11 +147,17 @@ adds them, so an interrupted run finishes the job on the next start.
 - Type: Boolean
 - Default value: `false`
 
-Drop and recreate the target database at startup **unless** a resumable
+Drop and recreate the target tables corresponding to the source tables, plus
+the sync checkpoint table, **unless** a resumable
 checkpoint exists. A resumable run (checkpoint present) is left intact and
 resumes as normal; this only resets a target that is non-empty with no usable
 checkpoint, which would otherwise trip the fresh-sync target-empty guard.
-Intended for testing/iterating.
+Unrelated tables in the target database are preserved. Source and target
+connections must refer to different databases, including when `--force` is set.
+The source table list defines what Sync owns: if a table copied by an earlier
+run has since been dropped from the source, `--force` does not discover or
+remove that stale target table. Remove such tables manually if they are no
+longer wanted. Intended for testing/iterating.
 
 ## GTID auto-detection
 
@@ -177,8 +183,11 @@ Sync-specific notes:
   on the file+offset client even after GTIDs are enabled on the source, and a
   GTID checkpoint fails with a clear error if the source no longer has GTIDs
   enabled.
-- **Legacy copy-only checkpoints have no stream position.** When upgrading a
-  target with one of these checkpoints, Sync warns and starts the change stream
-  at the current source head. Changes made after the old checkpoint are not
-  replayed immediately; the continuous checksum finds and repairs that gap as
-  it walks the target.
+- **Legacy copy-only checkpoints have no stream position.** Sync refuses to
+  resume one because starting at the current source head could miss intervening
+  writes. Use `--force` to discard that partial copy and start fresh.
+
+File+offset checkpoints also record the source's `@@server_uuid`. Resume refuses
+coordinates from a different server or an older checkpoint without identity;
+use `--force` to discard the partial copy and start fresh. GTID checkpoints
+remain portable across servers, subject to the normal GTID resume checks.
