@@ -1363,6 +1363,12 @@ func (c *gtidClient) runPeriodicFlush(ctx context.Context, interval time.Duratio
 // BlockWait satisfies Source. Reads the source's @@GLOBAL.gtid_executed
 // and waits until our buffered set is a superset of it.
 func (c *gtidClient) BlockWait(ctx context.Context) error {
+	return c.blockWait(ctx, DefaultTimeout)
+}
+
+// blockWait accepts a budget so timeout diagnostics can be exercised without a
+// thirty-second test or mutation of shared configuration.
+func (c *gtidClient) blockWait(ctx context.Context, timeout time.Duration) error {
 	targetGTID, err := c.getCurrentGTIDSet(ctx)
 	if err != nil {
 		return err
@@ -1375,7 +1381,7 @@ func (c *gtidClient) BlockWait(ctx context.Context) error {
 		logCatchUp = c.logger.Info
 	}
 	logCatchUp("waiting to catch up to source GTID", "target", targetGTID.String(), "current", bufferedGTID.String())
-	timer := time.NewTimer(DefaultTimeout)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	for {

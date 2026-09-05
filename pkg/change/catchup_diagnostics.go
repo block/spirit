@@ -13,17 +13,16 @@ func catchUpDiagnostics(subs []Subscription) string {
 	var out []string
 	for i, subscription := range subs {
 		sub, ok := subscription.(*bufferedMap)
-		if !ok {
+		if !ok || sub == nil {
 			out = append(out, fmt.Sprintf("subscription[%d]=unavailable", i))
 			continue
 		}
-		parks := sub.timesParked.Load()
 		if !sub.TryLock() {
-			out = append(out, fmt.Sprintf("subscription[%d]=busy parks=%d", i, parks))
+			out = append(out, fmt.Sprintf("subscription[%d]=busy parks=%d drain-budget-hit=%t", i, sub.timesParked.Load(), sub.LastDrainHitBudget()))
 			continue
 		}
 		out = append(out, fmt.Sprintf("subscription[%d]: pending=%d flushing=%d bytes=%d parked=%t parks=%d drain-budget-hit=%t",
-			i, len(sub.changes)+len(sub.queue), sub.flushingCount, sub.sizeBytes, sub.parked, parks, sub.lastDrainHitBudget.Load()))
+			i, len(sub.changes)+len(sub.queue), sub.flushingCount, sub.sizeBytes, sub.parked, sub.timesParked.Load(), sub.LastDrainHitBudget()))
 		sub.Unlock()
 	}
 	if len(out) == 0 {
