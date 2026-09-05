@@ -12,7 +12,6 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
-	"github.com/block/spirit/pkg/throttler"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -174,12 +173,6 @@ func deleteKeysInClause(sourceTable *table.TableInfo, keys [][]any) (string, err
 }
 
 type ApplierConfig struct {
-	// Throttler gates asynchronous copy writes, including already queued
-	// chunklets. The runner owns its lifecycle. Nil disables the load gate.
-	Throttler throttler.Throttler
-	// Synchronous replication and under-lock writes bypass the copy throttle
-	// so that binlog draining and cutover can always make progress.
-
 	Threads         int // number of write threads
 	ChunkletMaxRows int
 	ChunkletMaxSize int

@@ -10,7 +10,6 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -36,8 +35,6 @@ func TestShardedApplierScaling(t *testing.T) {
 	chunk := &table.Chunk{Table: src, NewTable: dst, ColumnMapping: table.NewColumnMapping(src, dst, nil)}
 	cfg := NewApplierDefaultConfig()
 	cfg.Threads = 2
-	pause := newPausedCopyThrottler()
-	cfg.Throttler = throttler.NewMultiThrottler(&throttler.Noop{}, pause)
 	a, err := NewShardedApplier([]Target{{DB: target1, KeyRange: "-80"}, {DB: target2, KeyRange: "80-"}}, cfg)
 	require.NoError(t, err)
 	a.SetWriteWorkers(8) // Before Start is harmless.
@@ -76,21 +73,11 @@ func TestShardedApplierScaling(t *testing.T) {
 			callbacks.Add(1)
 		}))
 	}
-	// All chunks are queued, but the busiest-host signal must stop the
-	// applier itself. Pausing only the copier would not protect this backlog.
-	require.Eventually(t, func() bool { return pause.waiters.Load() > 0 }, time.Second, time.Millisecond)
-	require.Zero(t, callbacks.Load())
-	for _, target := range a.targets {
-		var count int
-		require.NoError(t, target.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM sharded_scaling").Scan(&count))
-		require.Zero(t, count)
-	}
-	pause.release()
 	require.NoError(t, a.Wait(t.Context()))
 	require.EqualValues(t, 100, callbacks.Load())
 	// Sudden skew after balanced traffic and repeated pool resizing: every
 	// row in these larger chunks goes to shard zero. Each shard continues
-	// to use its own worker pool, with the shared signal governing scaling.
+	// to use its own worker pool while the counts change.
 	for batch := range 5 {
 		rows := make([][]any, 1000)
 		for i := range rows {

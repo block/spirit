@@ -15,7 +15,6 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
-	"github.com/block/spirit/pkg/throttler"
 )
 
 // ShardedApplier applies rows to multiple target databases based on a Vitess-style vindex.
@@ -33,7 +32,6 @@ type ShardedApplier struct {
 	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
 	metricsSink metrics.Sink // nil disables the stats emitter
-	throttler   throttler.Throttler
 
 	// Pending work tracking (shared across all shards).
 	//
@@ -166,7 +164,6 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 
 	return &ShardedApplier{
 		shards:      shards,
-		throttler:   cfg.Throttler,
 		targets:     targets,
 		dbConfig:    cfg.DBConfig,
 		logger:      cfg.Logger,
@@ -575,9 +572,6 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, qu
 // affected row count and, separately, how long the client-side statement build
 // took — see SingleTargetApplier.writeChunklet.
 func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, chunkletData shardedChunklet) (int64, time.Duration, error) {
-	if a.throttler != nil {
-		a.throttler.BlockWait(ctx)
-	}
 	if len(chunkletData.rows) == 0 {
 		return 0, 0, nil
 	}

@@ -152,5 +152,3 @@ The ShardedApplier has an important limitation: it only tracks changes by `PRIMA
 ### Sharded write-worker scaling
 
 `ShardedApplier.SetWriteWorkers(n)` sets the desired count **per target**, with a minimum of one. Workers retire between chunklets, so an in-flight write always reports its completion. `Stop` joins all workers before closing the completion channels; resizing during shutdown is a no-op. `Stats().ActiveWorkers` remains the aggregate across all targets. Move's autoscaler drives these pools together from the busiest target host's load.
-
-`ApplierConfig.Throttler` optionally gates queued copy writes against a shared load signal. The wait runs before taking a connection, honors cancellation, and leaves synchronous replication/under-lock operations on their existing path. The runner owns throttler startup and teardown. Per-shard worker counts provide concurrency control; there is no separate host permit pool.

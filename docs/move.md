@@ -175,7 +175,7 @@ For sharded moves, all write pools scale together using the **busiest target hos
 
 The gradual multi-throttler reports the maximum utilization across hosts: all hosts must have headroom to permit growth; any host in the middle band holds scaling steady; any busy host can trigger a reduction. Which host is busiest can change from one sample to the next. Write-thread counts apply per shard. There is no additional fixed host concurrency guard.
 
-The applier checks the shared load signal before each copy write, so queued chunklets also pause. Replication draining and under-lock writes retain their existing path.
+As in migration, the copier owns throttling: it pauses before reading another chunk and its autoscaler adjusts the applier through `SetWriteWorkers`. Already-read and queued work continues draining. Moving throttler ownership into the applier is outside this change.
 
 Targets sharing a host share one Aurora monitor. Initial counts and ceilings use the smallest target host and divide its budget by the largest number of target shards sharing a host, with at least one worker per shard. The client CPU budget also limits growth. Host identity includes the connection transport and address (including port), independently of database and credentials. Use consistent direct endpoints: DNS aliases and proxies are not resolved to physical hosts.
 

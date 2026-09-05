@@ -2302,10 +2302,9 @@ func (r *Runner) createApplier() (applier.Applier, error) {
 	if len(r.targets) == 1 && r.targets[0].KeyRange == "0" {
 		// Single target - use SingleTargetApplier
 		appl, err := applier.NewSingleTargetApplier(r.targets[0], &applier.ApplierConfig{
-			DBConfig:  r.dbConfig,
-			Logger:    r.logger,
-			Threads:   r.move.WriteThreads,
-			Throttler: r.currentThrottler(),
+			DBConfig: r.dbConfig,
+			Logger:   r.logger,
+			Threads:  r.move.WriteThreads,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create SingleTargetApplier: %w", err)
@@ -2321,10 +2320,9 @@ func (r *Runner) createApplier() (applier.Applier, error) {
 	appl, err := applier.NewShardedApplier(
 		r.targets,
 		&applier.ApplierConfig{
-			DBConfig:  r.dbConfig,
-			Logger:    r.logger,
-			Threads:   r.move.WriteThreads,
-			Throttler: r.currentThrottler(),
+			DBConfig: r.dbConfig,
+			Logger:   r.logger,
+			Threads:  r.move.WriteThreads,
 		},
 	)
 	if err != nil {
