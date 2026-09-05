@@ -73,7 +73,7 @@ When set to `true`, target tables are created without secondary indexes. The ind
 
 When Move cannot resume from an existing checkpoint — for example the checkpoint was written by an incompatible Spirit version, or the target is in a state the resume path cannot validate — it fails rather than risk corrupting a partially-copied target (see [checkpoint-max-age](#checkpoint-max-age)).
 
-Passing `--force` changes that recovery behaviour: instead of failing, Move wipes the target tables and starts the copy fresh, re-running the post-setup safety checks against the cleaned target rather than bypassing them. Use it only when the target's current contents can safely be discarded.
+Passing `--force` changes that recovery behaviour: instead of failing, Move wipes the target tables and starts the copy fresh, checking for source-side failures before wiping and re-running the full post-setup checks against the cleaned target. Expired checkpoints and malformed or missing source positions are eligible for forced recovery; transient read or connection failures are not. Source and target must refer to different databases, even if different hostnames or credentials are used. Use it only when the target's current contents can safely be discarded.
 
 ### reverse-window
 

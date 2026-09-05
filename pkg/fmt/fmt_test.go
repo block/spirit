@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/block/spirit/pkg/testutils"
@@ -30,6 +31,7 @@ func TestParseAndPrepare(t *testing.T) {
 		wantTable     string
 		wantErr       bool
 		wantSchemaStr bool // if true, execSQL should differ from input (schema stripped)
+		wantReset     bool
 	}{
 		{
 			name:      "simple",
@@ -59,6 +61,19 @@ func TestParseAndPrepare(t *testing.T) {
 			wantSchemaStr: true,
 		},
 		{
+			name:      "unqualified counter preserves input",
+			input:     "CREATE TABLE `counter` (`id` bigint AUTO_INCREMENT PRIMARY KEY, `note` varchar(255) DEFAULT 'AUTO_INCREMENT=42') ENGINE=InnoDB AUTO_INCREMENT=123 COMMENT='keep AUTO_INCREMENT=999'",
+			wantTable: "counter",
+			wantReset: true,
+		},
+		{
+			name:          "qualified counter strips only schema",
+			input:         "CREATE TABLE `mydb`.`counter` (`id` bigint AUTO_INCREMENT PRIMARY KEY, `note` varchar(255) DEFAULT 'AUTO_INCREMENT=42') ENGINE=InnoDB AUTO_INCREMENT=123 COMMENT='keep AUTO_INCREMENT=999'",
+			wantTable:     "counter",
+			wantSchemaStr: true,
+			wantReset:     true,
+		},
+		{
 			name:    "not create table",
 			input:   "ALTER TABLE users ADD COLUMN x INT",
 			wantErr: true,
@@ -77,13 +92,14 @@ func TestParseAndPrepare(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tableName, execSQL, err := parseAndPrepare(tc.input)
+			tableName, execSQL, resetAutoIncrement, err := parseAndPrepare(tc.input)
 			if tc.wantErr {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.wantTable, tableName)
+			require.Equal(t, tc.wantReset, resetAutoIncrement)
 			if tc.wantSchemaStr {
 				// Schema should be stripped from execSQL
 				require.NotContains(t, execSQL, "mydb")
@@ -91,6 +107,10 @@ func TestParseAndPrepare(t *testing.T) {
 			} else {
 				// Without schema qualifier, original SQL is used as-is
 				require.Equal(t, tc.input, execSQL)
+			}
+			if tc.wantReset {
+				require.Contains(t, execSQL, "AUTO_INCREMENT=42")
+				require.Contains(t, execSQL, "AUTO_INCREMENT=999")
 			}
 		})
 	}
@@ -356,4 +376,53 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644)
 	require.NoError(t, err)
+}
+
+// Formatting must not change SQL literals or identifiers that happen to look
+// like a table counter, even when the statement also contains a real counter.
+func TestFormatFile_PreservesAutoIncrementLiterals(t *testing.T) {
+	tests := []struct {
+		name   string
+		option string
+	}{
+		{name: "without table counter"},
+		{name: "with table counter", option: " AUTO_INCREMENT=98765"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			input := "CREATE TABLE `fmt_AUTO_INCREMENT=123` (" +
+				"id BIGINT AUTO_INCREMENT PRIMARY KEY, " +
+				"val VARCHAR(100) DEFAULT 'AUTO_INCREMENT=123' COMMENT 'keep AUTO_INCREMENT = 456', " +
+				"`AUTO_INCREMENT=789` INT DEFAULT 1" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci" + tt.option + " COMMENT='keep auto_increment=321'"
+			dir := t.TempDir()
+			path := filepath.Join(dir, "schema.sql")
+			writeTestFile(t, dir, "schema.sql", input)
+			_, err := formatFile(t.Context(), db, path)
+			require.NoError(t, err)
+			content, err := os.ReadFile(path)
+			require.NoError(t, err)
+			canonical := string(content)
+			for _, preserved := range []string{"`fmt_AUTO_INCREMENT=123`", "DEFAULT 'AUTO_INCREMENT=123'", "COMMENT 'keep AUTO_INCREMENT = 456'", "`AUTO_INCREMENT=789`", "COMMENT='keep auto_increment=321'"} {
+				require.Contains(t, canonical, preserved)
+			}
+			require.NotContains(t, canonical, "98765")
+			tt := testutils.NewTestTable(t, "fmt_AUTO_INCREMENT=123", canonical)
+			_, err = tt.DB.ExecContext(t.Context(), "INSERT INTO `fmt_AUTO_INCREMENT=123` () VALUES ()")
+			require.NoError(t, err)
+			var id int
+			var val string
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT id, val FROM `fmt_AUTO_INCREMENT=123`").Scan(&id, &val))
+			require.Equal(t, 1, id)
+			require.Equal(t, "AUTO_INCREMENT=123", val)
+			changed, err := formatFile(t.Context(), db, path)
+			require.NoError(t, err)
+			after, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			require.Equal(t, canonical, string(after))
+			require.False(t, changed)
+			require.True(t, strings.HasSuffix(canonical, "\n"))
+		})
+	}
 }

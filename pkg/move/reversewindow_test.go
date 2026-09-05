@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -729,4 +730,69 @@ func TestFinalizeReverseFailsClosedWhenOwnershipCannotBePersisted(t *testing.T) 
 
 	require.ErrorIs(t, w.finalizeReverse(t.Context()), persistErr)
 	require.False(t, cleanupCalled)
+}
+
+// Traffic can reach the target before the switch callback returns. Those
+// commits must be included in the reverse feed's captured starting position.
+func TestMoveReverseWindowSwitchWrites(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	for _, resultCallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("result_%t", resultCallback), func(t *testing.T) {
+			srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
+			dstName, dstDB := testutils.CreateUniqueTestDatabase(t)
+			testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(255))")
+			testutils.RunSQLInDatabase(t, srcName, "INSERT INTO t1 VALUES (1,'one'),(2,'two')")
+			r, err := NewRunner(&Move{
+				SourceDSN: testutils.DSNForDatabase(srcName),
+				TargetDSN: testutils.DSNForDatabase(dstName),
+				Threads:   1, WriteThreads: 1, ReverseWindow: 30 * time.Second,
+			})
+			require.NoError(t, err)
+			defer utils.CloseAndLog(r)
+			switchTraffic := func(ctx context.Context) error {
+				for _, stmt := range []string{
+					"INSERT INTO t1 VALUES (99,'during switch')",
+					"UPDATE t1 SET val='updated during switch' WHERE id=1",
+					"DELETE FROM t1 WHERE id=2",
+					"CREATE TABLE " + revertMarkerName + " (id INT)",
+				} {
+					if _, err := dstDB.ExecContext(ctx, stmt); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			if resultCallback {
+				r.SetCutoverWithResult(func(ctx context.Context) (CutoverResult, error) {
+					return CutoverResult{DurableMutation: true}, switchTraffic(ctx)
+				})
+			} else {
+				r.SetCutover(switchTraffic)
+			}
+			var reverted bool
+			r.SetReverseCutover(func(ctx context.Context) error {
+				// The source must already contain every commit when traffic returns.
+				var inserted, updated string
+				var deleted int
+				if err := srcDB.QueryRowContext(ctx, "SELECT val FROM t1 WHERE id=99").Scan(&inserted); err != nil {
+					return err
+				}
+				if err := srcDB.QueryRowContext(ctx, "SELECT val FROM t1 WHERE id=1").Scan(&updated); err != nil {
+					return err
+				}
+				if err := srcDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM t1 WHERE id=2").Scan(&deleted); err != nil {
+					return err
+				}
+				if inserted != "during switch" || updated != "updated during switch" || deleted != 0 {
+					return fmt.Errorf("lost target writes at reverse switch: inserted=%q updated=%q deleted=%d", inserted, updated, deleted)
+				}
+				reverted = true
+				return nil
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			require.NoError(t, r.Run(ctx))
+			require.True(t, reverted)
+		})
+	}
 }

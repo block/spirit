@@ -65,14 +65,17 @@ type Sync struct {
 	// same as `move --defer-secondary-indexes`.
 	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Create target tables without secondary indexes, then add them after the initial copy." default:"false"`
 
-	// Force, when set, makes the runner drop and recreate the target database
-	// at startup *unless* a resumable checkpoint exists — i.e. it only nukes
-	// the target when the copy could not have resumed anyway. A resumable
-	// run (checkpoint present) is left intact and resumes as normal. Intended
-	// for testing/iterating, where a previous partial run can leave the target
-	// non-empty with no usable checkpoint, otherwise tripping the fresh-sync
-	// target-empty guard.
-	Force bool `name:"force" help:"Drop and recreate the target database when the copy cannot resume from a checkpoint." default:"false"`
+	// Force, when set, makes the runner wipe the sync-owned objects on the
+	// target at startup — the target copies of the source tables plus the sync
+	// checkpoint table — *unless* a resumable checkpoint exists, i.e. it only
+	// wipes when the copy could not have resumed anyway. A resumable run
+	// (checkpoint present) is left intact and resumes as normal. The wipe is
+	// per-table, never DROP DATABASE: sync tolerates a target database shared
+	// with unrelated tables, and --force must not destroy tables the sync
+	// never owned. Intended for testing/iterating, where a previous partial
+	// run can leave the target non-empty with no usable checkpoint, otherwise
+	// tripping the fresh-sync target-empty guard.
+	Force bool `name:"force" help:"Drop and recreate the sync's target tables (never the whole target database) when the copy cannot resume from a checkpoint." default:"false"`
 
 	// Source optionally provides a pre-constructed change.Source to use
 	// for replication instead of constructing a built-in MySQL-binlog
