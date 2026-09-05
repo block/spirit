@@ -61,15 +61,22 @@ type CutOver struct {
 	// invoked again.
 	cutoverFuncSucceeded bool
 
-	// postSwitch, when set, runs once under the source locks after the traffic
-	// switch (cutoverFunc) succeeds and before the sources are renamed out of
-	// the way. The reverse-window move uses it to capture each target's binlog
-	// position and persist that the move has entered its reverse window, while
-	// the sources are quiescent (writes switched away, replication flushed) so
-	// the captured positions cleanly bound the post-cutover writes. Like
-	// cutoverFunc it must run at most once; postSwitchDone guards that.
+	// preSwitch runs under the source locks after the final flush and before
+	// traffic can reach the target. Reverse moves capture their start positions
+	// here so writes committed during the switch are included. It runs again
+	// on a safe retry, after that attempt's final flush.
+	preSwitch func(ctx context.Context) error
+
+	// postSwitch persists the captured positions after the switch succeeds,
+	// before the source rename. It must run at most once.
 	postSwitch     func(ctx context.Context) error
 	postSwitchDone bool
+}
+
+// SetPreSwitch registers a hook after the final source flush and before the
+// traffic switch, under the source locks. See CutOver.preSwitch.
+func (c *CutOver) SetPreSwitch(fn func(ctx context.Context) error) {
+	c.preSwitch = fn
 }
 
 // SetPostSwitch registers a hook to run once under the source locks, after the
@@ -260,6 +267,12 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 		}
 	}
 
+	if c.preSwitch != nil {
+		if err := c.preSwitch(ctx); err != nil {
+			return fmt.Errorf("reverse-window pre-switch hook failed: %w", err)
+		}
+	}
+
 	// Run the caller-owned traffic switch at most once. Result-bearing callers
 	// retain durable-mutation and ambiguity evidence even when they return an
 	// error; the legacy callback is conservatively ambiguous on any error.
@@ -268,7 +281,7 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 	}
 
 	// Reverse-window hook: after the traffic switch and before retiring the
-	// sources, capture the reverse-feed start positions and record that the
+	// sources, persist the captured reverse-feed positions and record that the
 	// move has entered its reverse window. Runs once, under the source locks,
 	// while the sources are quiescent. If it fails the cutover fails: the
 	// routing switch has already succeeded, so (like a rename failure past that
@@ -305,7 +318,7 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 			// rather than after the deferred unlock, where the first straggler
 			// write races us. A reverse window is unaffected: its feeds are
 			// separate clients (ReverseFeed) reading the targets, and its start
-			// positions were captured by postSwitch above. See change.Source's
+			// positions were captured by preSwitch above. See change.Source's
 			// Stop.
 			c.stopSourceFeeds()
 			return nil

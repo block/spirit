@@ -1324,10 +1324,10 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 			cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
 		}
 		if r.move.ReverseWindow > 0 {
-			// Under the cutover lock, right after the traffic switch, capture the
-			// reverse-feed start positions and record that the move has entered its
-			// reverse window (see captureReverseWindow). The source rename still runs.
-			cutover.SetPostSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
+			// Capture before the switch can accept target writes, then persist
+			// the captured positions once the traffic switch succeeds.
+			cutover.SetPreSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
+			cutover.SetPostSwitch(func(ctx context.Context) error { return persistReverseWindow(ctx, r) })
 		}
 		// Pre-cutover: refuse to switch traffic if a revert has been requested (a
 		// marker appeared on targets[0] during the copy). Cutting over only to
