@@ -362,14 +362,21 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 // Formatting must not change SQL literals or identifiers that happen to look
 // like a table counter, even when the statement also contains a real counter.
 func TestFormatFile_PreservesAutoIncrementLiterals(t *testing.T) {
-	for _, option := range []string{"", " AUTO_INCREMENT=98765"} {
-		t.Run(option, func(t *testing.T) {
+	tests := []struct {
+		name   string
+		option string
+	}{
+		{name: "without table counter"},
+		{name: "with table counter", option: " AUTO_INCREMENT=98765"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			db := testDB(t)
 			input := "CREATE TABLE `fmt_AUTO_INCREMENT=123` (" +
 				"id BIGINT AUTO_INCREMENT PRIMARY KEY, " +
 				"val VARCHAR(100) DEFAULT 'AUTO_INCREMENT=123' COMMENT 'keep AUTO_INCREMENT = 456', " +
 				"`AUTO_INCREMENT=789` INT DEFAULT 1" +
-				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci" + option + " COMMENT='keep auto_increment=321'"
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci" + tt.option + " COMMENT='keep auto_increment=321'"
 			dir := t.TempDir()
 			path := filepath.Join(dir, "schema.sql")
 			writeTestFile(t, dir, "schema.sql", input)
