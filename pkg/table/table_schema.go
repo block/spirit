@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/parser"
+	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/format"
 )
 
 // TableSchema represents a table's name and its raw CREATE TABLE DDL statement.
@@ -42,9 +46,6 @@ const (
 // <name>_archive_YYYY, <name>_archive_YYYY_MM, or <name>_archive_YYYY_MM_DD.
 var archiveTableRegexp = regexp.MustCompile(`^.*_archive_[0-9]{4}(_[0-9]{2}(_[0-9]{2})?)?$`)
 
-// autoIncrementRegexp matches the AUTO_INCREMENT table option in CREATE TABLE output.
-var autoIncrementRegexp = regexp.MustCompile(`(?i)\s*AUTO_INCREMENT\s*=?\s*[0-9]+`)
-
 // IsArchiveTable returns true if the table name matches the archive naming
 // convention: <name>_archive_YYYY, <name>_archive_YYYY_MM, or
 // <name>_archive_YYYY_MM_DD.
@@ -56,7 +57,26 @@ func IsArchiveTable(name string) bool {
 // CREATE TABLE statement. This is useful when comparing schemas to avoid
 // spurious diffs caused by differing auto-increment counters.
 func StripAutoIncrement(stmt string) string {
-	return autoIncrementRegexp.ReplaceAllString(stmt, "")
+	node, err := parser.New().ParseOneStmt(stmt, "", "")
+	if err != nil {
+		return stmt
+	}
+	create, ok := node.(*ast.CreateTableStmt)
+	if !ok {
+		return stmt
+	}
+	originalCount := len(create.Options)
+	create.Options = slices.DeleteFunc(create.Options, func(opt *ast.TableOption) bool {
+		return opt.Tp == ast.TableOptionAutoIncrement
+	})
+	if len(create.Options) == originalCount {
+		return stmt
+	}
+	var restored strings.Builder
+	if err := create.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &restored)); err != nil {
+		return stmt
+	}
+	return restored.String()
 }
 
 // LoadSchemaFromDB retrieves all table schemas from the database using the
