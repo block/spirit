@@ -31,6 +31,7 @@ func TestParseAndPrepare(t *testing.T) {
 		wantTable     string
 		wantErr       bool
 		wantSchemaStr bool // if true, execSQL should differ from input (schema stripped)
+		wantReset     bool
 	}{
 		{
 			name:      "simple",
@@ -60,6 +61,19 @@ func TestParseAndPrepare(t *testing.T) {
 			wantSchemaStr: true,
 		},
 		{
+			name:      "unqualified counter preserves input",
+			input:     "CREATE TABLE `counter` (`id` bigint AUTO_INCREMENT PRIMARY KEY, `note` varchar(255) DEFAULT 'AUTO_INCREMENT=42') ENGINE=InnoDB AUTO_INCREMENT=123 COMMENT='keep AUTO_INCREMENT=999'",
+			wantTable: "counter",
+			wantReset: true,
+		},
+		{
+			name:          "qualified counter strips only schema",
+			input:         "CREATE TABLE `mydb`.`counter` (`id` bigint AUTO_INCREMENT PRIMARY KEY, `note` varchar(255) DEFAULT 'AUTO_INCREMENT=42') ENGINE=InnoDB AUTO_INCREMENT=123 COMMENT='keep AUTO_INCREMENT=999'",
+			wantTable:     "counter",
+			wantSchemaStr: true,
+			wantReset:     true,
+		},
+		{
 			name:    "not create table",
 			input:   "ALTER TABLE users ADD COLUMN x INT",
 			wantErr: true,
@@ -78,13 +92,14 @@ func TestParseAndPrepare(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tableName, execSQL, err := parseAndPrepare(tc.input)
+			tableName, execSQL, resetAutoIncrement, err := parseAndPrepare(tc.input)
 			if tc.wantErr {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.wantTable, tableName)
+			require.Equal(t, tc.wantReset, resetAutoIncrement)
 			if tc.wantSchemaStr {
 				// Schema should be stripped from execSQL
 				require.NotContains(t, execSQL, "mydb")
@@ -92,6 +107,10 @@ func TestParseAndPrepare(t *testing.T) {
 			} else {
 				// Without schema qualifier, original SQL is used as-is
 				require.Equal(t, tc.input, execSQL)
+			}
+			if tc.wantReset {
+				require.Contains(t, execSQL, "AUTO_INCREMENT=42")
+				require.Contains(t, execSQL, "AUTO_INCREMENT=999")
 			}
 		})
 	}
