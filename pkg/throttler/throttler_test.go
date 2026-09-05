@@ -35,7 +35,16 @@ func TestReplicationThrottlerLiveQuery(t *testing.T) {
 	throttler, err := NewReplicationThrottler(db, 60*time.Second, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, throttler.Open(t.Context()))
-	require.NoError(t, throttler.Close())
+	t.Cleanup(func() { require.NoError(t, throttler.Close()) })
+
+	replica, ok := throttler.(*Replica)
+	require.True(t, ok)
+	lag := replica.currentLagInMs.Load()
+	require.GreaterOrEqual(t, lag, int64(0))
+	// This fresh CI replica cannot predate the 10-minute package timeout. A
+	// larger value points to a unit-conversion or lag-query regression without
+	// requiring the shared replica to be caught up.
+	require.Less(t, lag, (10 * time.Minute).Milliseconds())
 }
 
 func TestNoopThrottler(t *testing.T) {
