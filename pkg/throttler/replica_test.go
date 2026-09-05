@@ -92,6 +92,28 @@ func TestReplica_BlockWaitFailsClosedOnStaleSignal(t *testing.T) {
 	require.Less(t, elapsed, 500*time.Millisecond)
 }
 
+func TestReplica_BlockWaitReturnsWhenLagRecovers(t *testing.T) {
+	// Use a short blockWaitInterval so the test doesn't have to wait a full
+	// second per loop iteration. Save and restore.
+	prev := blockWaitInterval
+	blockWaitInterval = 10 * time.Millisecond
+	t.Cleanup(func() { blockWaitInterval = prev })
+
+	l := newTestReplica(t, 60*time.Second)
+	l.applyLag(60_000) // exactly at the tolerance, so BlockWait must hold
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		l.applyLag(59_999)
+	}()
+
+	start := time.Now()
+	l.BlockWait(t.Context())
+	elapsed := time.Since(start)
+	require.GreaterOrEqual(t, elapsed, 20*time.Millisecond, "BlockWait must block while lag is over budget")
+	require.Less(t, elapsed, 500*time.Millisecond)
+}
+
 func TestReplica_UpdateLagWrapsCause(t *testing.T) {
 	// sql.Open is lazy and does not connect. A pre-canceled context makes
 	// QueryRowContext fail deterministically with context.Canceled before any
