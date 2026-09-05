@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,20 +31,9 @@ func reserveBuffer(buf []byte, appendSize int) []byte {
 	if appendSize < 0 || appendSize > maxInt-len(buf) {
 		panic("sqlescape: buffer size overflow")
 	}
-	newSize := len(buf) + appendSize
-	if cap(buf) < newSize {
-		// Preserve the historical doubling growth strategy when it is safe, but
-		// skip the extra capacity when doubling would overflow int. newSize
-		// itself was checked above.
-		newCapacity := newSize
-		if len(buf) <= maxInt-newSize {
-			newCapacity += len(buf)
-		}
-		newBuf := make([]byte, newCapacity)
-		copy(newBuf, buf)
-		buf = newBuf
-	}
-	return buf[:newSize]
+	originalLen := len(buf)
+	buf = slices.Grow(buf, appendSize)
+	return buf[:originalLen+appendSize]
 }
 
 // escapeBytesBackslash will escape []byte into the buffer, with backslash.
