@@ -244,8 +244,9 @@ func TestValidCertificateBundle(t *testing.T) {
 	// parse certificate bundle
 	var block *pem.Block
 	foundCertificates := false
+	remaining := rdsGlobalBundle
 	for {
-		block, rdsGlobalBundle = pem.Decode(rdsGlobalBundle)
+		block, remaining = pem.Decode(remaining)
 		if block == nil {
 			break
 		}
