@@ -378,6 +378,14 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	if err != nil {
 		return err
 	}
+	return forceExec(ctx, db, dbConfig, logger, stmt, func(ctx context.Context, connID int) ([]int, error) {
+		return killLockingTransactions(ctx, db, tables, dbConfig, logger, []int{connID})
+	}, waitForKilledTransactions)
+}
+
+// forceExec receives the kill and cleanup operations so tests can control their
+// failures while exercising the statement and retry against real MySQL.
+func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog.Logger, stmt string, kill func(context.Context, int) ([]int, error), waitForCleanup func(context.Context, *sql.DB, []int) error) error {
 	trx, connId, err := BeginStandardTrx(ctx, db, nil)
 	if err != nil {
 		return err
@@ -399,14 +407,13 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	duration := forceKillGracePeriod(dbConfig.LockWaitTimeout)
 	var wg sync.WaitGroup
 	var killTimerFired atomic.Bool
+	var killed []int
+	var killErr error
 	wg.Add(1)
 	timer := time.AfterFunc(duration, func() {
 		defer wg.Done()
 		killTimerFired.Store(true)
-		err := KillLockingTransactions(ctx, db, tables, dbConfig, logger, []int{connId})
-		if err != nil {
-			return // just return, we can't do much more here
-		}
+		killed, killErr = kill(ctx, connId)
 	})
 	_, err = trx.ExecContext(ctx, stmt)
 	if timer.Stop() {
@@ -419,6 +426,21 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	// are now being used for subsequent operations.
 	wg.Wait()
 	if shouldRetryForceExecAfterKill(err, killTimerFired.Load()) {
+		// These operations use other connections. Their errors must not enter
+		// the statement's error tree: callers use it to detect ambiguous DDL.
+		if killErr != nil {
+			logger.Warn("force-kill failed; retrying statement anyway", "error", killErr)
+		}
+		// MySQL KILL is asynchronous. Wait only for sessions already signalled.
+		if len(killed) > 0 {
+			logger.Debug("waiting for killed sessions to exit", "pids", killed)
+			cleanupCtx, cancel := context.WithTimeout(ctx, forceKillCleanupTimeout)
+			cleanupErr := waitForCleanup(cleanupCtx, db, killed)
+			cancel()
+			if cleanupErr != nil {
+				logger.Warn("killed-session cleanup failed; retrying statement anyway", "pids", killed, "error", cleanupErr)
+			}
+		}
 		logger.Warn("retrying statement after lock wait timeout because force-kill timer fired", "error", err)
 		_, err = trx.ExecContext(ctx, stmt)
 	}
