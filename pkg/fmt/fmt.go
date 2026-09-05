@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/parser/ast"
@@ -29,7 +30,6 @@ import (
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -137,10 +137,16 @@ func parseAndPrepare(createSQL string) (tableName string, execSQL string, err er
 
 	tableName = ct.TableName
 
-	// If there's a schema qualifier, strip it by clearing the schema on the
-	// AST and restoring to SQL. Otherwise use the original SQL directly to
-	// avoid any formatting changes from the parser's Restore.
-	if ct.Raw.Table.Schema.L != "" {
+	// Remove only the instance-specific table counter. Matching SQL text also
+	// matches defaults, comments and quoted identifiers, changing the schema.
+	optionCount := len(ct.Raw.Options)
+	ct.Raw.Options = slices.DeleteFunc(ct.Raw.Options, func(opt *ast.TableOption) bool {
+		return opt.Tp == ast.TableOptionAutoIncrement
+	})
+
+	// Restore only when stripping a schema qualifier or table counter;
+	// otherwise preserve the original SQL for MySQL to canonicalize.
+	if ct.Raw.Table.Schema.L != "" || len(ct.Raw.Options) != optionCount {
 		ct.Raw.Table.Schema = ast.CIStr{}
 		var sb strings.Builder
 		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
@@ -192,9 +198,8 @@ func canonicalize(ctx context.Context, db *sql.DB, createStmt string) (string, e
 		return "", fmt.Errorf("failed to drop table: %w", err)
 	}
 
-	// Strip AUTO_INCREMENT since it's instance-specific.
-	// Ensure trailing newline.
-	canonical = table.StripAutoIncrement(canonical)
+	// The table counter was removed before CREATE, so SHOW CREATE needs no
+	// textual substitutions. Ensure a trailing newline.
 	canonical = strings.TrimRight(canonical, "\n") + "\n"
 	return canonical, nil
 }
