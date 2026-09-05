@@ -56,8 +56,8 @@ func targetCurrentPosition(ctx context.Context, r *Runner, tgt *applier.Target) 
 }
 
 // captureReverseWindow runs under the source locks after the final forward
-// flush, BEFORE switching traffic. These positions include every target write
-// committed once the traffic switch begins, even before the callback returns.
+// flush, before switching traffic. They are the reverse feeds' start points,
+// so writes committed during the switch are included when those feeds start.
 // On a safe cutover retry they are recaptured after the new final flush.
 func captureReverseWindow(ctx context.Context, r *Runner) error {
 	positions := make(map[string]string, len(r.targets))

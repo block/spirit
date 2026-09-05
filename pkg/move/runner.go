@@ -148,11 +148,10 @@ type Runner struct {
 	// immediately after a Run goroutine returns.
 	durableMutation   atomic.Bool
 	terminalOwnership atomic.Uint32
-	// reversePositions holds each target's binlog position captured at cutover
-	// (keyed by targetKey) — the start points for the reverse feeds. cutoverAt
-	// is when the forward cutover completed (the reverse-window deadline is
-	// measured from it). Both are set by the cutover postSwitch hook when
-	// move.ReverseWindow > 0.
+	// reversePositions holds each target's binlog position captured by the
+	// pre-switch hook (keyed by targetKey) — the start points for the reverse
+	// feeds. cutoverAt is set by the post-switch hook when the forward cutover
+	// completes, and the reverse-window deadline is measured from it.
 	reversePositions map[string]string
 	cutoverAt        time.Time
 
