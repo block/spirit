@@ -10,6 +10,8 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,7 +37,14 @@ func TestShardedApplierScaling(t *testing.T) {
 	chunk := &table.Chunk{Table: src, NewTable: dst, ColumnMapping: table.NewColumnMapping(src, dst, nil)}
 	cfg := NewApplierDefaultConfig()
 	cfg.Threads = 2
-	a, err := NewShardedApplier([]Target{{DB: target1, KeyRange: "-80"}, {DB: target2, KeyRange: "80-"}}, cfg)
+	pause := newPausedCopyThrottler()
+	cfg.Throttler = throttler.NewMultiThrottler(&throttler.Noop{}, pause)
+	cfg.MaxThreadsPerHost = 2
+	targetConfig, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	config1, config2 := targetConfig.Clone(), targetConfig.Clone()
+	config1.DBName, config2.DBName = db1, db2
+	a, err := NewShardedApplier([]Target{{DB: target1, Config: config1, KeyRange: "-80"}, {DB: target2, Config: config2, KeyRange: "80-"}}, cfg)
 	require.NoError(t, err)
 	a.SetWriteWorkers(8) // Before Start is harmless.
 	require.Zero(t, a.Stats().ActiveWorkers)
@@ -73,16 +82,41 @@ func TestShardedApplierScaling(t *testing.T) {
 			callbacks.Add(1)
 		}))
 	}
+	// All chunks are queued, but the busiest-host signal must stop the
+	// applier itself. Pausing only the copier would not protect this backlog.
+	require.Eventually(t, func() bool { return pause.waiters.Load() > 0 }, time.Second, time.Millisecond)
+	require.Zero(t, callbacks.Load())
+	for _, target := range a.targets {
+		var count int
+		require.NoError(t, target.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM sharded_scaling").Scan(&count))
+		require.Zero(t, count)
+	}
+	pause.release()
 	require.NoError(t, a.Wait(t.Context()))
 	require.EqualValues(t, 100, callbacks.Load())
+	// Sudden skew after balanced traffic and repeated pool resizing: every
+	// row in these larger chunks goes to shard zero, still under the same
+	// fixed host guard (including any retiring workers).
+	for batch := range 5 {
+		rows := make([][]any, 1000)
+		for i := range rows {
+			rows[i] = []any{int64(20000 + 2*(batch*1000+i))}
+		}
+		require.NoError(t, a.Apply(t.Context(), chunk, rows, func(_ int64, err error) {
+			assert.NoError(t, err)
+			callbacks.Add(1)
+		}))
+	}
+	require.NoError(t, a.Wait(t.Context()))
+	require.EqualValues(t, 105, callbacks.Load())
 	stopScaling()
 	wg.Wait()
 	a.SetWriteWorkers(0)
 	require.Eventually(t, func() bool { return a.Stats().ActiveWorkers == 2 }, time.Second, time.Millisecond)
-	for _, target := range a.targets {
+	for i, target := range a.targets {
 		var count int
 		require.NoError(t, target.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM sharded_scaling").Scan(&count))
-		require.Equal(t, 5000, count)
+		require.Equal(t, []int{10000, 5000}[i], count)
 	}
 	// Shutdown must exclude new worker creation and remain restartable.
 	var stopWG sync.WaitGroup

@@ -77,6 +77,7 @@ type ShardedApplier struct {
 
 // shardTarget represents a single shard with its own connection, key range, and workers
 type shardTarget struct {
+	control             writeControl
 	shardID             int
 	writeDB             *sql.DB
 	keyRange            keyRange // Parsed key range for this shard
@@ -117,6 +118,10 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	controls, err := newWriteControls(targets, cfg)
+	if err != nil {
+		return nil, err
+	}
 	shards := make([]*shardTarget, len(targets))
 	for i, target := range targets {
 		// A nil connection is only discovered when a row routes to this shard,
@@ -133,6 +138,7 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 
 		shards[i] = &shardTarget{
 			shardID:             i,
+			control:             controls[i],
 			writeDB:             target.DB,
 			keyRange:            kr,
 			chunkletBuffer:      make(chan shardedChunklet, defaultBufferSize),
@@ -572,6 +578,10 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, qu
 // affected row count and, separately, how long the client-side statement build
 // took — see SingleTargetApplier.writeChunklet.
 func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, chunkletData shardedChunklet) (int64, time.Duration, error) {
+	if err := shard.control.acquire(ctx); err != nil {
+		return 0, 0, err
+	}
+	defer shard.control.release()
 	if len(chunkletData.rows) == 0 {
 		return 0, 0, nil
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/block/spirit/pkg/autoscale"
@@ -126,6 +127,9 @@ func (r *Runner) setupAutoscaling(ctx context.Context) error {
 	r.monitorDBs = monitors
 	engaged = true
 	r.autoscale = config
+	// Fixed independently of traffic distribution and the current worker
+	// count. Each host owns a separate permit pool at this conservative cap.
+	r.maxThreadsPerHost = min(autoscale.Ceiling(autoscale.WriteStart(slices.Min(vcpus)), true), autoscale.ClientCeiling())
 	r.move.Threads = readStart
 	r.move.WriteThreads = config.StartThreads
 	r.logger.Info("move autoscaling engaged: busiest target controls all shard pools; --threads and --write-threads are ignored",

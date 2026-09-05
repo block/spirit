@@ -21,6 +21,7 @@ import (
 type SingleTargetApplier struct {
 	sync.Mutex
 
+	control     writeControl
 	target      Target
 	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
@@ -106,7 +107,12 @@ func NewSingleTargetApplier(target Target, cfg *ApplierConfig) (*SingleTargetApp
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	controls, err := newWriteControls([]Target{target}, cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &SingleTargetApplier{
+		control:             controls[0],
 		target:              target,
 		dbConfig:            cfg.DBConfig,
 		logger:              cfg.Logger,
@@ -502,6 +508,10 @@ func (a *SingleTargetApplier) writeWorker(ctx context.Context, quit <-chan struc
 // connection and is spent on spirit's own CPU, so Stats() reports it apart from
 // the round trip (see Stats.BuildTimeP50).
 func (a *SingleTargetApplier) writeChunklet(ctx context.Context, chunkletData chunklet) (int64, time.Duration, error) {
+	if err := a.control.acquire(ctx); err != nil {
+		return 0, 0, err
+	}
+	defer a.control.release()
 	if len(chunkletData.rows) == 0 {
 		return 0, 0, nil
 	}
