@@ -777,9 +777,8 @@ func TestMoveWithVarcharPK(t *testing.T) {
 		updated_at DATETIME NOT NULL
 	) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`)
 
-	// Seed enough rows that the copier runs for long enough to interleave
-	// with the concurrent writers. Use UUIDs for PK values to keep them
-	// well-distributed.
+	// Seed existing rows for the initial copy. The concurrent write workload
+	// runs later, once the sentinel holds the move in FIFO replay mode.
 	for range 50 {
 		testutils.RunSQL(t, `INSERT INTO `+srcDB+`.items (id, val, updated_at)
 			VALUES (UUID(), HEX(RANDOM_BYTES(20)), NOW())`)
@@ -789,58 +788,83 @@ func TestMoveWithVarcharPK(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
-	ctx, cancel := context.WithCancel(t.Context())
+	// Hold cutover at the sentinel so the finite workload definitely runs
+	// after copy, when VARCHAR primary keys use FIFO replay. The old writers
+	// ran until move.Run returned, so a slow reader could chase them forever.
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
-
+	runner, err := NewRunner(&Move{
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      2,
+		WriteThreads: 2,
+		DeferCutOver: true,
+	})
+	require.NoError(t, err)
+	done := make(chan struct{})
+	var runErr error
 	var wg sync.WaitGroup
-	var writeCount, errorCount atomic.Int64
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		select {
+		case <-done:
+			if err := runner.Close(); err != nil {
+				t.Errorf("closing move runner: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Error("move runner did not stop during cleanup")
+		}
+	})
+	go func() { runErr = runner.Run(ctx); close(done) }()
 
-	// 4 writers doing INSERT / UPDATE / DELETE on VARCHAR PKs while the
-	// move runs. The FIFO queue must replay these in binlog order to land
-	// on the correct end state on the target.
-	//
-	// A short delay between iterations rate-limits the writers to ~400 ops/sec
-	// total. Without this, an uncapped tight loop generates binlog faster than
-	// the reader can drain it on slow CI runners — the source position
-	// outruns the buffered position indefinitely and Flush()'s BlockWait loop
-	// never converges below binlogTrivialThreshold, eventually tripping the
-	// 10-minute test timeout (issue #834).
-	for range 4 {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for runner.status.Get() != status.WaitingOnSentinelTable {
+		select {
+		case <-done:
+			t.Fatalf("move exited before sentinel wait: %v", runErr)
+		case <-ctx.Done():
+			t.Fatalf("waiting for sentinel (state %s): %v", runner.status.Get(), ctx.Err())
+		case <-ticker.C:
+		}
+	}
+
+	var writeCount, errorCount atomic.Int64
+	// Four finite writers keep concurrent FIFO apply coverage while guaranteeing
+	// a quiet source for the final drain. Pacing keeps their binlog load bounded.
+	const writers, iterations = 4, 25
+	for range writers {
 		wg.Go(func() {
-			for {
+			pace := time.NewTicker(10 * time.Millisecond)
+			defer pace.Stop()
+			for range iterations {
 				select {
 				case <-ctx.Done():
 					return
-				default:
+				case <-pace.C:
 				}
 				if err := varcharPKWriteOne(ctx, sourceDB, srcDB); err != nil {
 					errorCount.Add(1)
 				} else {
 					writeCount.Add(1)
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
 		})
 	}
-	time.Sleep(100 * time.Millisecond)
-
-	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      2,
-		WriteThreads: 2,
-		DeferCutOver: false,
-	}
-	err = move.Run()
-	cancel()
 	wg.Wait()
-
-	t.Logf("%d successful writes, %d errors during move",
-		writeCount.Load(), errorCount.Load())
-	require.NoError(t, err, "move on VARCHAR PK table must succeed (issue #607)")
+	require.Equal(t, int64(0), errorCount.Load())
+	require.Equal(t, int64(writers*iterations), writeCount.Load(), "the test must execute its concurrent write workload")
+	testutils.RunSQL(t, "DROP TABLE "+dstDB+"."+sentinel.TableName)
+	select {
+	case <-done:
+		require.NoError(t, runErr, "move on VARCHAR PK table must succeed (issue #607)")
+	case <-ctx.Done():
+		t.Fatalf("move did not finish after finite writes (state %s): %v", runner.status.Get(), ctx.Err())
+	}
 
 	// Source/target row counts must match. The internal checksum step inside
-	// move.Run() already proves content equivalence; this is a belt-and-braces
+	// runner.Run() already proves content equivalence; this is a belt-and-braces
 	// check on top of that.
 	var sourceCount, targetCount int
 	require.NoError(t, sourceDB.QueryRowContext(t.Context(),
