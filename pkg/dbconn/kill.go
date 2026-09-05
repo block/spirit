@@ -44,6 +44,10 @@ func forceKillGracePeriod(lockWaitTimeout int) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
 }
 
+// Rollback can outlast lock acquisition, so this budget is independent of
+// LockWaitTimeout. It adds at most 30 seconds before the single statement retry.
+const forceKillCleanupTimeout = 30 * time.Second
+
 const (
 	// TableLockQuery is used to find tables that are locked by a LOCK TABLES command.
 	// It's not really possible to find out how long the lock has been held, so we don't consider
@@ -437,8 +441,9 @@ func waitForKilledTransactions(ctx context.Context, db *sql.DB, pids []int) erro
 	}
 	inList, params := sliceToInList(pids)
 	query := "SELECT COUNT(*) FROM performance_schema.threads WHERE processlist_id IN (" + inList + ")"
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
+	interval := 10 * time.Millisecond
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		var remaining int
 		if err := db.QueryRowContext(ctx, query, params...).Scan(&remaining); err != nil {
@@ -450,7 +455,9 @@ func waitForKilledTransactions(ctx context.Context, db *sql.DB, pids []int) erro
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("waiting for killed sessions %v to exit: %w", pids, ctx.Err())
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		interval = min(interval*2, 100*time.Millisecond)
+		timer.Reset(interval)
 	}
 }

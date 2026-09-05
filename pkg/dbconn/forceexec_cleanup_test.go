@@ -1,8 +1,10 @@
 package dbconn
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"database/sql"
+	"io"
 	"log/slog"
 	"sync"
 	"testing"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,7 +52,7 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 				_ = blocker.Rollback()
 			})
 			return []int{pid}, nil
-		})
+		}, waitForKilledTransactions)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls, "must not kill a fresh set of blockers on retry")
 	var column string
@@ -75,25 +78,69 @@ func TestWaitForKilledTransactionsHonorsCancellation(t *testing.T) {
 	require.NoError(t, waitForKilledTransactions(t.Context(), db, []int{-1}))
 }
 
-func TestForceExecReportsKillFailure(t *testing.T) {
-	tt := testutils.NewTestTable(t, "forceexec_kill_failure", "CREATE TABLE forceexec_kill_failure (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
-	db, err := New(testutils.DSN(), config)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	blocker, _, err := BeginStandardTrx(t.Context(), tt.DB, nil)
-	require.NoError(t, err)
-	defer func() { _ = blocker.Rollback() }()
-	_, err = blocker.ExecContext(t.Context(), "SELECT * FROM forceexec_kill_failure")
-	require.NoError(t, err)
-	want := fmt.Errorf("kill permission denied")
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	err = forceExec(ctx, db, config, slog.Default(),
-		"ALTER TABLE forceexec_kill_failure ADD COLUMN c INT, ALGORITHM=INSTANT",
-		func(context.Context, int) ([]int, error) { return nil, want })
-	require.ErrorIs(t, err, want)
+// An ancillary connection failure cannot make a definite DDL timeout ambiguous.
+func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
+	for _, stage := range []string{"kill", "cleanup"} {
+		for _, release := range []bool{false, true} {
+			t.Run(stage+map[bool]string{false: "/blocked", true: "/released"}[release], func(t *testing.T) {
+				tt := testutils.NewTestTable(t, "forceexec_ancillary_failure", "CREATE TABLE forceexec_ancillary_failure (id INT PRIMARY KEY)")
+				config := NewDBConfig()
+				config.LockWaitTimeout = 1
+				db, err := New(testutils.DSN(), config)
+				require.NoError(t, err)
+				defer utils.CloseAndLog(db)
+				blocker, pid, err := BeginStandardTrx(t.Context(), tt.DB, nil)
+				require.NoError(t, err)
+				defer func() { _ = blocker.Rollback() }()
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_ancillary_failure")
+				require.NoError(t, err)
+				var logs bytes.Buffer
+				logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+				killCalls, cleanupCalls := 0, 0
+				fail := func() error {
+					// Keep the first attempt blocked beyond its one-second lock budget.
+					timer := time.NewTimer(250 * time.Millisecond)
+					defer timer.Stop()
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-timer.C:
+					}
+					if release {
+						_ = blocker.Rollback()
+					}
+					return io.EOF
+				}
+				err = forceExec(ctx, db, config, logger,
+					"ALTER TABLE forceexec_ancillary_failure ADD COLUMN c INT, ALGORITHM=INSTANT",
+					func(context.Context, int) ([]int, error) {
+						killCalls++
+						if stage == "kill" {
+							return nil, fail()
+						}
+						return []int{pid}, nil
+					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail() })
+				require.Equal(t, 1, killCalls)
+				if stage == "cleanup" {
+					require.Equal(t, 1, cleanupCalls)
+					require.Contains(t, logs.String(), "waiting for killed sessions")
+				}
+				require.Contains(t, logs.String(), "retrying statement anyway")
+				require.Contains(t, logs.String(), "EOF")
+				if release {
+					require.NoError(t, err)
+				} else {
+					var ddlErr *mysql.MySQLError
+					require.ErrorAs(t, err, &ddlErr)
+					require.EqualValues(t, 1205, ddlErr.Number)
+					require.False(t, IsConnectionLossError(err))
+					require.NotErrorIs(t, err, io.EOF)
+				}
+			})
+		}
+	}
 }
 
 // A blocker can disappear without being killed. Preserve ForceExec's existing
@@ -127,7 +174,7 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 			case <-timer.C:
 			}
 			return nil, blocker.Rollback()
-		})
+		}, waitForKilledTransactions)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
 	var count int
