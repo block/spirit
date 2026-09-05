@@ -1,0 +1,97 @@
+package dbconn
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/utils"
+	"github.com/stretchr/testify/require"
+)
+
+func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_delayed_cleanup", "CREATE TABLE forceexec_delayed_cleanup (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	blockerDB, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	blockerDB.SetMaxIdleConns(0) // Rollback also closes the physical session.
+	t.Cleanup(func() { _ = blockerDB.Close() })
+	blocker, pid, err := BeginStandardTrx(t.Context(), blockerDB, nil)
+	require.NoError(t, err)
+	// Simulate the interval between KILL's acknowledgement and server cleanup,
+	// using a real MDL-holding transaction. Release later than the old retry's
+	// one-second budget; cancellation also releases it on an assertion failure.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	var workers sync.WaitGroup
+	t.Cleanup(func() { cancel(); workers.Wait(); _ = blocker.Rollback() })
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_delayed_cleanup")
+	require.NoError(t, err)
+	calls := 0
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_delayed_cleanup ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(context.Context, int) ([]int, error) {
+			calls++
+			workers.Go(func() {
+				timer := time.NewTimer(1500 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+				case <-timer.C:
+				}
+				_ = blocker.Rollback()
+			})
+			return []int{pid}, nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, 1, calls, "must not kill a fresh set of blockers on retry")
+	var column string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COLUMN_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_delayed_cleanup' AND column_name = 'c'").Scan(&column))
+	require.Equal(t, "c", column)
+}
+
+func TestWaitForKilledTransactionsHonorsCancellation(t *testing.T) {
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	blocker, pid, err := BeginStandardTrx(t.Context(), db, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, waitForKilledTransactions(ctx, db, []int{pid}), context.DeadlineExceeded)
+	var alive int
+	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT 1").Scan(&alive))
+	require.Equal(t, 1, alive, "waiting must never kill a session")
+	// Already-gone sessions and the empty set do not wait on unrelated sessions.
+	require.NoError(t, waitForKilledTransactions(t.Context(), db, nil))
+	require.NoError(t, waitForKilledTransactions(t.Context(), db, []int{-1}))
+}
+
+func TestForceExecReportsKillFailure(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_kill_failure", "CREATE TABLE forceexec_kill_failure (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	blocker, _, err := BeginStandardTrx(t.Context(), tt.DB, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(t.Context(), "SELECT * FROM forceexec_kill_failure")
+	require.NoError(t, err)
+	want := fmt.Errorf("kill permission denied")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_kill_failure ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(context.Context, int) ([]int, error) { return nil, want })
+	require.ErrorIs(t, err, want)
+}

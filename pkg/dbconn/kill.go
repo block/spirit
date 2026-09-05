@@ -127,10 +127,17 @@ type LockDetail struct {
 }
 
 func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) error {
+	_, err := killLockingTransactions(ctx, db, tables, config, logger, ignorePIDs)
+	return err
+}
+
+// killLockingTransactions also returns the successfully signalled sessions.
+// KILL acknowledges the request before rollback and lock release complete.
+func killLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) ([]int, error) {
 	// First, check if there are explicit table locks that would prevent us from acquiring the metadata lock.
 	locks, err := GetTableLocks(ctx, db, tables, logger, ignorePIDs)
 	if err != nil {
-		return fmt.Errorf("failed to get table locks: %w", err)
+		return nil, fmt.Errorf("failed to get table locks: %w", err)
 	}
 	if len(locks) > 0 {
 		// If we find any table locks, we cannot proceed with the metadata lock.
@@ -145,25 +152,28 @@ func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 				"objectName", lock.ObjectName,
 			)
 		}
-		return ErrTableLockFound
+		return nil, ErrTableLockFound
 	}
 	pids, err := GetLockingTransactions(ctx, db, tables, config, logger, ignorePIDs)
 	if err != nil {
-		return fmt.Errorf("failed to get locking transactions: %w", err)
+		return nil, fmt.Errorf("failed to get locking transactions: %w", err)
 	}
 	// Now we can kill these transactions
 	var errs []error
+	var killed []int
 	for _, pid := range pids {
 		logger.Warn("killing locking transaction", "pid", pid)
 		err = KillTransaction(ctx, db, pid)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to kill transaction %d: %w", pid, err))
+		} else {
+			killed = append(killed, pid)
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("errors occurred while killing locking transactions: %w", errors.Join(errs...))
+		return nil, fmt.Errorf("errors occurred while killing locking transactions: %w", errors.Join(errs...))
 	}
-	return nil
+	return killed, nil
 }
 
 // GetLockingTransactions queries the performance schema to find locking transactions
@@ -416,4 +426,31 @@ func sliceToInList[S ~[]E, E any](items S) (inList string, inParams []any) {
 		}
 	}
 	return builder.String(), inParams
+}
+
+// waitForKilledTransactions waits only for the sessions we already signalled.
+// Do not discover or kill new blockers here: the retry must not broaden the
+// original kill decision. The caller supplies a bounded context.
+func waitForKilledTransactions(ctx context.Context, db *sql.DB, pids []int) error {
+	if len(pids) == 0 {
+		return nil
+	}
+	inList, params := sliceToInList(pids)
+	query := "SELECT COUNT(*) FROM performance_schema.threads WHERE processlist_id IN (" + inList + ")"
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var remaining int
+		if err := db.QueryRowContext(ctx, query, params...).Scan(&remaining); err != nil {
+			return fmt.Errorf("waiting for killed sessions %v to exit: %w", pids, err)
+		}
+		if remaining == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for killed sessions %v to exit: %w", pids, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }

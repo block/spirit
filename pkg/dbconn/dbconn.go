@@ -378,6 +378,14 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	if err != nil {
 		return err
 	}
+	return forceExec(ctx, db, dbConfig, logger, stmt, func(ctx context.Context, connID int) ([]int, error) {
+		return killLockingTransactions(ctx, db, tables, dbConfig, logger, []int{connID})
+	})
+}
+
+// forceExec receives the kill operation so tests can hold a real MySQL blocker
+// past the acknowledgement and verify the post-kill cleanup ordering.
+func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog.Logger, stmt string, kill func(context.Context, int) ([]int, error)) error {
 	trx, connId, err := BeginStandardTrx(ctx, db, nil)
 	if err != nil {
 		return err
@@ -399,14 +407,13 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	duration := forceKillGracePeriod(dbConfig.LockWaitTimeout)
 	var wg sync.WaitGroup
 	var killTimerFired atomic.Bool
+	var killed []int
+	var killErr error
 	wg.Add(1)
 	timer := time.AfterFunc(duration, func() {
 		defer wg.Done()
 		killTimerFired.Store(true)
-		err := KillLockingTransactions(ctx, db, tables, dbConfig, logger, []int{connId})
-		if err != nil {
-			return // just return, we can't do much more here
-		}
+		killed, killErr = kill(ctx, connId)
 	})
 	_, err = trx.ExecContext(ctx, stmt)
 	if timer.Stop() {
@@ -419,6 +426,20 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	// are now being used for subsequent operations.
 	wg.Wait()
 	if shouldRetryForceExecAfterKill(err, killTimerFired.Load()) {
+		if killErr != nil {
+			return errors.Join(err, fmt.Errorf("force-kill failed: %w", killErr))
+		}
+		if len(killed) == 0 {
+			return err
+		}
+		// MySQL KILL is asynchronous. Give only the sessions already signalled a
+		// bounded cleanup window before spending the retry's lock_wait_timeout.
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		cleanupErr := waitForKilledTransactions(cleanupCtx, db, killed)
+		cancel()
+		if cleanupErr != nil {
+			return errors.Join(err, cleanupErr)
+		}
 		logger.Warn("retrying statement after lock wait timeout because force-kill timer fired", "error", err)
 		_, err = trx.ExecContext(ctx, stmt)
 	}
