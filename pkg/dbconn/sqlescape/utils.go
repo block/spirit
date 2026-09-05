@@ -49,6 +49,10 @@ func reserveBuffer(buf []byte, appendSize int) []byte {
 // escapeBytesBackslash will escape []byte into the buffer, with backslash.
 func escapeBytesBackslash(buf []byte, v []byte) []byte {
 	pos := len(buf)
+	maxInt := int(^uint(0) >> 1)
+	if len(v) > maxInt/2 {
+		panic("sqlescape: buffer size overflow")
+	}
 	buf = reserveBuffer(buf, len(v)*2)
 
 	for _, c := range v {

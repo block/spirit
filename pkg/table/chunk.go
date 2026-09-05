@@ -91,6 +91,16 @@ func (c *Chunk) String() string {
 }
 
 func (c *Chunk) JSON() string {
+	out, err := c.marshalJSON()
+	if err != nil {
+		// Keep the historical string-only API for external callers. Production
+		// checkpoint paths use marshalJSON directly and propagate its error.
+		panic(err)
+	}
+	return out
+}
+
+func (c *Chunk) marshalJSON() (string, error) {
 	out, err := json.Marshal(JSONChunk{
 		Key:        c.Key,
 		ChunkSize:  c.ChunkSize,
@@ -98,12 +108,9 @@ func (c *Chunk) JSON() string {
 		UpperBound: c.UpperBound.jsonBoundary(),
 	})
 	if err != nil {
-		// JSONChunk contains only strings, integers, booleans, and slices, so
-		// encoding it cannot fail. Keep JSON's historical string-only API while
-		// making an impossible future schema regression fail loudly.
-		panic(fmt.Sprintf("could not encode chunk JSON: %v", err))
+		return "", fmt.Errorf("could not encode chunk JSON: %w", err)
 	}
-	return string(out)
+	return string(out), nil
 }
 
 // JSON encodes a boundary as JSON. The values are represented as strings,
@@ -143,8 +150,9 @@ func (b *Boundary) comparesTo(b2 *Boundary) bool {
 	return true
 }
 
-// valuesString renders the boundary values as a comma-separated list of JSON
-// string literals (used inside Boundary.JSON's "Value" array).
+// valuesString renders the boundary values as an injective, comma-separated
+// tuple key for watermarkTracker's out-of-order chunk map. JSON string quoting
+// keeps distinct tuples distinct, including ["a", "b"] versus ["a,b"].
 func (b *Boundary) valuesString() string {
 	vals := make([]string, len(b.Value))
 	for i, v := range b.Value {
@@ -157,11 +165,10 @@ func (b *Boundary) valuesString() string {
 // quoted, properly escaped). Numeric values are quoted to avoid JSON float
 // behavior (#125); binary values are hex-encoded ("0x...", or the empty
 // binary literal for a zero-length value) so they round-trip via
-// datumValFromString. Crucially it uses json.Marshal rather than
-// Datum.String() (which SQL-escapes for WHERE clauses): a string value that is
-// valid in a MySQL string literal but not in JSON — e.g. a VARCHAR PK holding a
-// control byte like 0x16, or an embedded quote — must be JSON-escaped here, or
-// the checkpoint watermark becomes unparseable and resume fails permanently.
+// datumValFromString. Crucially it uses json.Marshal rather than Datum.String()
+// (which SQL-escapes for WHERE clauses), so the tuple representation is
+// injective. Without quoting, distinct boundaries could collide in the
+// watermark map and let one out-of-order chunk overwrite another.
 func jsonQuoteDatum(v Datum) string {
 	s := jsonDatumString(v)
 	// json.Marshal of a (valid-UTF8) string never errors and escapes anything

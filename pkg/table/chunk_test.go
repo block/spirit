@@ -26,19 +26,23 @@ func TestBoundaryJSONControlChar(t *testing.T) {
 }
 
 func TestChunkJSONEscapesKeyNames(t *testing.T) {
+	ti := NewTableInfo(nil, "test", "t1")
+	ti.columnsMySQLTps = map[string]string{"quote\"key": "int", "slash\\key": "int"}
 	chunk := &Chunk{
 		Key:        []string{"quote\"key", "slash\\key"},
 		ChunkSize:  1000,
-		LowerBound: &Boundary{Value: []Datum{{Val: 1, Tp: signedType}, {Val: 2, Tp: signedType}}, Inclusive: true},
-		UpperBound: &Boundary{Value: []Datum{{Val: 3, Tp: signedType}, {Val: 4, Tp: signedType}}, Inclusive: false},
+		LowerBound: &Boundary{Value: []Datum{{Val: int64(1), Tp: signedType}, {Val: int64(2), Tp: signedType}}, Inclusive: true},
+		UpperBound: &Boundary{Value: []Datum{{Val: int64(3), Tp: signedType}, {Val: int64(4), Tp: signedType}}, Inclusive: false},
 	}
 
 	encoded := chunk.JSON()
 	require.True(t, json.Valid([]byte(encoded)), "chunk JSON must be valid: %q", encoded)
 
-	var decoded JSONChunk
-	require.NoError(t, json.Unmarshal([]byte(encoded), &decoded))
-	require.Equal(t, chunk.Key, decoded.Key)
+	restored, err := newChunkFromJSON(ti, encoded)
+	require.NoError(t, err)
+	require.Equal(t, chunk.Key, restored.Key)
+	require.Equal(t, chunk.LowerBound, restored.LowerBound)
+	require.Equal(t, chunk.UpperBound, restored.UpperBound)
 }
 
 // TestBinaryChunkJSONRoundTrip guards against checkpoint corruption for
