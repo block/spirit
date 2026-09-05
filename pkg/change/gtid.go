@@ -1383,7 +1383,7 @@ func (c *gtidClient) BlockWait(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting to catch up to source GTID: %s, current: %s", targetGTID.String(), c.getBufferedGTID().String())
+			return fmt.Errorf("timed out waiting to catch up to source GTID: %s, current: %s, started at: %s; %s", targetGTID.String(), c.getBufferedGTID().String(), bufferedGTID.String(), catchUpDiagnostics(c.subs.Snapshot()))
 		default:
 			if c.getBufferedGTID().Contain(targetGTID) {
 				return nil

@@ -1450,7 +1450,7 @@ func (c *binlogClient) BlockWait(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
+			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v, started at: %v; %s", targetPos, c.getBufferedPos(), bufferedPos, catchUpDiagnostics(c.subs.Snapshot()))
 		default:
 			currPos := c.getBufferedPos()
 			if stalls.observe(prevPos, currPos) {
