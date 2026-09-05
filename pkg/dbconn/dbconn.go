@@ -429,9 +429,6 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 		if killErr != nil {
 			return errors.Join(err, fmt.Errorf("force-kill failed: %w", killErr))
 		}
-		if len(killed) == 0 {
-			return err
-		}
 		// MySQL KILL is asynchronous. Give only the sessions already signalled a
 		// bounded cleanup window before spending the retry's lock_wait_timeout.
 		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

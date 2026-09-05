@@ -95,3 +95,43 @@ func TestForceExecReportsKillFailure(t *testing.T) {
 		func(context.Context, int) ([]int, error) { return nil, want })
 	require.ErrorIs(t, err, want)
 }
+
+// A blocker can disappear without being killed. Preserve ForceExec's existing
+// single retry in that case; the empty PID set only makes cleanup waiting a no-op.
+func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_no_kill", "CREATE TABLE forceexec_no_kill (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	blocker, _, err := BeginStandardTrx(t.Context(), tt.DB, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_no_kill")
+	require.NoError(t, err)
+	calls := 0
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_no_kill ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(ctx context.Context, _ int) ([]int, error) {
+			calls++
+			// The timer fires at 900ms. Hold the blocker beyond the first
+			// statement's one-second timeout, then let it exit voluntarily.
+			timer := time.NewTimer(250 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			return nil, blocker.Rollback()
+		})
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_no_kill' AND column_name = 'c'").Scan(&count))
+	require.Equal(t, 1, count)
+}
