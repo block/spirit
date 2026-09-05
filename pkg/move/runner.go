@@ -148,11 +148,10 @@ type Runner struct {
 	// immediately after a Run goroutine returns.
 	durableMutation   atomic.Bool
 	terminalOwnership atomic.Uint32
-	// reversePositions holds each target's binlog position captured at cutover
-	// (keyed by targetKey) — the start points for the reverse feeds. cutoverAt
-	// is when the forward cutover completed (the reverse-window deadline is
-	// measured from it). Both are set by the cutover postSwitch hook when
-	// move.ReverseWindow > 0.
+	// reversePositions holds each target's binlog position captured by the
+	// pre-switch hook (keyed by targetKey) — the start points for the reverse
+	// feeds. cutoverAt is set by the post-switch hook when the forward cutover
+	// completes, and the reverse-window deadline is measured from it.
 	reversePositions map[string]string
 	cutoverAt        time.Time
 
@@ -1324,10 +1323,10 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 			cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
 		}
 		if r.move.ReverseWindow > 0 {
-			// Under the cutover lock, right after the traffic switch, capture the
-			// reverse-feed start positions and record that the move has entered its
-			// reverse window (see captureReverseWindow). The source rename still runs.
-			cutover.SetPostSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
+			// Capture before the switch can accept target writes, then persist
+			// the captured positions once the traffic switch succeeds.
+			cutover.SetPreSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
+			cutover.SetPostSwitch(func(ctx context.Context) error { return persistReverseWindow(ctx, r) })
 		}
 		// Pre-cutover: refuse to switch traffic if a revert has been requested (a
 		// marker appeared on targets[0] during the copy). Cutting over only to
