@@ -1560,21 +1560,7 @@ func TestProcessRowsEventDoesNotDeadlockOnPark(t *testing.T) {
 
 	sub := getBufferedMap(t, client, srcTable.SchemaName+"."+srcTable.TableName)
 
-	// Seed a row so sizeBytes > 0, then drop the soft limit. Any
-	// further HasChanged from the binlog reader will park.
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'seed')", srcTable.QuotedTableName))
-	require.NoError(t, client.BlockWait(t.Context()))
-	sub.Lock()
-	sub.softLimitBytes = 1
-	sub.Unlock()
-
-	// Trigger a second INSERT. The binlog reader will pick this up
-	// asynchronously, route it through processRowsEvent, call
-	// sub.HasChanged — which must park on the soft limit.
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (2, 'parked')", srcTable.QuotedTableName))
-	require.Eventually(t, func() bool {
-		return sub.timesParked.Load() >= 1
-	}, 5*time.Second, 10*time.Millisecond, "binlog-driven HasChanged should park on soft limit")
+	parkBinlogReader(t, client, sub, srcTable)
 
 	// While HasChanged is parked from inside processRowsEvent,
 	// client.Flush must still make progress. With the lock-release
@@ -1595,6 +1581,40 @@ func TestProcessRowsEventDoesNotDeadlockOnPark(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		fmt.Sprintf("SELECT COUNT(*) FROM %s", dstTable.QuotedTableName)).Scan(&count))
 	require.Equal(t, 2, count)
+}
+
+// Real binlog delivery may be delayed on contended CI runners. Keep this test
+// budget independent of production BlockWait tuning.
+const parkWaitTimeout = 30 * time.Second
+
+// requestBinlogPark starts with an empty subscription and inserts two distinct
+// keys in one statement. The first fills the one-change cap; the second must
+// park (an overwrite of the first key would bypass the cap). This also works
+// if MySQL splits the statement across multiple row events.
+func requestBinlogPark(t *testing.T, sub *bufferedMap, src *table.TableInfo) {
+	t.Helper()
+	sub.Lock()
+	sub.softLimitBytes = 0
+	sub.softLimitChanges = 1
+	sub.Unlock()
+	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'seed'), (2, 'parked')", src.QuotedTableName))
+}
+
+// parkBinlogReader requires the caller to keep periodic flushing stopped until
+// it deliberately releases the park via Flush or Close. The entry guard catches
+// an already-running flusher; it does not prevent later starts.
+func parkBinlogReader(t *testing.T, client *binlogClient, sub *bufferedMap, src *table.TableInfo) {
+	t.Helper()
+	client.periodicFlushLock.Lock()
+	flushing := client.periodicFlushCancel != nil
+	client.periodicFlushLock.Unlock()
+	require.False(t, flushing, "a background flusher could release the test's park")
+	requestBinlogPark(t, sub, src)
+	require.Eventually(t, func() bool {
+		sub.Lock()
+		defer sub.Unlock()
+		return sub.parked && sub.lengthLocked() == 1
+	}, parkWaitTimeout, 10*time.Millisecond, "binlog reader must be held at the second row")
 }
 
 // TestBufferedMapCloseUnblocksParkedHasChanged pins the invariant that
@@ -1680,20 +1700,7 @@ func TestClientCloseUnblocksParkedHasChanged(t *testing.T) {
 		client.Close()
 	})
 
-	// Seed one row so sizeBytes > 0, then crank the soft limit down.
-	// Any further binlog-driven HasChanged will park.
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'seed')", srcTable.QuotedTableName))
-	require.NoError(t, client.BlockWait(t.Context()))
-	sub.Lock()
-	sub.softLimitBytes = 1
-	sub.Unlock()
-
-	// Trigger a second INSERT; the binlog reader will pick it up and
-	// park inside processRowsEvent → HasChanged.
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (2, 'parked')", srcTable.QuotedTableName))
-	require.Eventually(t, func() bool {
-		return sub.timesParked.Load() >= 1
-	}, 5*time.Second, 10*time.Millisecond, "binlog-driven HasChanged should park on soft limit")
+	parkBinlogReader(t, client, sub, srcTable)
 
 	// Close must return within a bounded time. Without the wake, it
 	// would block on streamWG.Wait() forever because readStream is
