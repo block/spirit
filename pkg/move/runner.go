@@ -690,6 +690,11 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 				return fmt.Errorf("resume validation passed but checkpoint resume failed: %w", resumeErr)
 			}
 			r.logger.Warn("force set and checkpoint is definitively unresumable; starting fresh", "reason", resumeErr)
+			// resumeFromCheckpoint assigns this only after every definitive
+			// validation. Clear it explicitly before the fresh path so a future
+			// force-eligible failure added after that boundary cannot leak stale
+			// checkpoint state into newCopy.
+			r.checksumWatermark = ""
 		case resumeFreshOwned:
 			r.logger.Warn("target holds an empty checkpoint table: a prior move attempt stopped before writing its first checkpoint; wiping target tables and starting fresh")
 		case resumeNone:
@@ -700,7 +705,7 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		}
 		// A wipe only cures target state. Validate all other checks first,
 		// including when an empty checkpoint proves this is a prior attempt.
-		if preErr := r.runChecksExcluding(ctx, check.ScopePostSetup, check.TargetStateCheckName); preErr != nil {
+		if preErr := r.runChecks(ctx, check.ScopePostSetup, check.TargetStateCheckName); preErr != nil {
 			return fmt.Errorf("refusing to wipe the target because a check that wiping cannot fix is failing: %w", preErr)
 		}
 		if werr := r.wipeTargets(ctx); werr != nil {
@@ -711,8 +716,7 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		// source_schema_consistency, ...). Re-run them against the now-wiped
 		// target (target_state passes for the absent tables, exactly as a fresh
 		// move); abort if anything still fails rather than copying into a state
-		// that would only fail at cutover. RunChecks iterates a map, so the
-		// original failure was not necessarily target_state.
+		// that would only fail at cutover.
 		if err := r.runChecks(ctx, check.ScopePostSetup); err != nil {
 			return fmt.Errorf("target still fails post-setup checks after wiping: %w", err)
 		}
@@ -1189,12 +1193,16 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		return strings.Compare(targetKey(a), targetKey(b))
 	})
 
-	for si := range r.sources {
-		for ti := range r.targets {
-			if err := dbconn.RequireDifferentDatabase(ctx, r.sources[si].db, r.targets[ti].DB); err != nil {
-				return fmt.Errorf("source %d / target %d: %w", si, ti, err)
-			}
-		}
+	sourceDBs := make([]*sql.DB, len(r.sources))
+	for i := range r.sources {
+		sourceDBs[i] = r.sources[i].db
+	}
+	targetDBs := make([]*sql.DB, len(r.targets))
+	for i := range r.targets {
+		targetDBs[i] = r.targets[i].DB
+	}
+	if err := dbconn.RequireDifferentDatabases(ctx, sourceDBs, targetDBs); err != nil {
+		return err
 	}
 
 	// If a prior run reached the reverse window (or a reverse cutover), resume
@@ -1629,12 +1637,8 @@ func (r *Runner) checkResources() check.Resources {
 	}
 }
 
-func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
-	return check.RunChecks(ctx, r.checkResources(), r.logger, scope)
-}
-
-func (r *Runner) runChecksExcluding(ctx context.Context, scope check.ScopeFlag, exclude ...string) error {
-	return check.RunChecksExcluding(ctx, r.checkResources(), r.logger, scope, exclude...)
+func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag, exclude ...string) error {
+	return check.RunChecks(ctx, r.checkResources(), r.logger, scope, exclude...)
 }
 
 // restoreSecondaryIndexes restores any secondary indexes that were deferred during table creation.

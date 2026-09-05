@@ -12,32 +12,78 @@ import (
 // the same database. Check the selected schemas and, when they overlap, the
 // server UUIDs before any target writes or destructive recovery.
 func RequireDifferentDatabase(ctx context.Context, source, target *sql.DB) error {
-	sourceSchema, err := selectedDatabase(ctx, source, "source")
+	return RequireDifferentDatabases(ctx, []*sql.DB{source}, []*sql.DB{target})
+}
+
+type databaseIdentity struct {
+	db       *sql.DB
+	role     string
+	schema   string
+	uuid     string
+	uuidRead bool
+}
+
+// RequireDifferentDatabases refuses any source/target database alias. Each
+// connection's identity is read at most once, which keeps sharded moves from
+// issuing the same identity queries for every source/target pair.
+func RequireDifferentDatabases(ctx context.Context, sources, targets []*sql.DB) error {
+	sourceIdentities, err := databaseIdentities(ctx, sources, "source")
 	if err != nil {
 		return err
 	}
-	targetSchema, err := selectedDatabase(ctx, target, "target")
+	targetIdentities, err := databaseIdentities(ctx, targets, "target")
 	if err != nil {
 		return err
 	}
-	// Be conservative about case: servers may fold database names. Distinct
-	// schema names remain valid even on the same server, including test setups.
-	if !strings.EqualFold(sourceSchema, targetSchema) {
+	for si := range sourceIdentities {
+		for ti := range targetIdentities {
+			source := &sourceIdentities[si]
+			target := &targetIdentities[ti]
+			// Be conservative about case: servers may fold database names.
+			if !strings.EqualFold(source.schema, target.schema) {
+				continue
+			}
+			if err := source.readUUID(ctx); err != nil {
+				return err
+			}
+			if err := target.readUUID(ctx); err != nil {
+				return err
+			}
+			if strings.EqualFold(source.uuid, target.uuid) {
+				return fmt.Errorf("%s and %s refer to the same database %q on server %s; refusing to modify the source", source.role, target.role, source.schema, source.uuid)
+			}
+		}
+	}
+	return nil
+}
+
+func databaseIdentities(ctx context.Context, dbs []*sql.DB, role string) ([]databaseIdentity, error) {
+	identities := make([]databaseIdentity, len(dbs))
+	for i, db := range dbs {
+		name := role
+		if len(dbs) > 1 {
+			name = fmt.Sprintf("%s %d", role, i)
+		}
+		schema, err := selectedDatabase(ctx, db, name)
+		if err != nil {
+			return nil, err
+		}
+		identities[i] = databaseIdentity{db: db, role: name, schema: schema}
+	}
+	return identities, nil
+}
+
+func (identity *databaseIdentity) readUUID(ctx context.Context) error {
+	if identity.uuidRead {
 		return nil
 	}
-	var sourceUUID, targetUUID string
-	if err := source.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&sourceUUID); err != nil {
-		return fmt.Errorf("verify source and target databases are different: read source server UUID: %w", err)
+	if err := identity.db.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&identity.uuid); err != nil {
+		return fmt.Errorf("verify source and target databases are different: read %s server UUID: %w", identity.role, err)
 	}
-	if err := target.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&targetUUID); err != nil {
-		return fmt.Errorf("verify source and target databases are different: read target server UUID: %w", err)
+	if identity.uuid == "" {
+		return fmt.Errorf("cannot verify source and target databases are different: empty %s server UUID", identity.role)
 	}
-	if sourceUUID == "" || targetUUID == "" {
-		return fmt.Errorf("cannot verify source and target databases are different: empty server UUID")
-	}
-	if strings.EqualFold(sourceUUID, targetUUID) {
-		return fmt.Errorf("source and target refer to the same database %q on server %s; refusing to modify the source", sourceSchema, sourceUUID)
-	}
+	identity.uuidRead = true
 	return nil
 }
 

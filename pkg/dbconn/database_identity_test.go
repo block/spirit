@@ -1,6 +1,7 @@
 package dbconn
 
 import (
+	"database/sql"
 	"testing"
 
 	"github.com/block/spirit/pkg/testutils"
@@ -26,4 +27,12 @@ func TestRequireDifferentDatabase(t *testing.T) {
 	defer func() { require.NoError(t, unscoped.Close()) }()
 	require.ErrorContains(t, RequireDifferentDatabase(t.Context(), unscoped, source), "source connection has no selected database")
 	require.ErrorContains(t, RequireDifferentDatabase(t.Context(), source, unscoped), "target connection has no selected database")
+}
+
+func TestRequireDifferentDatabases(t *testing.T) {
+	_, sourceA := testutils.CreateUniqueTestDatabase(t)
+	_, sourceB := testutils.CreateUniqueTestDatabase(t)
+	_, target := testutils.CreateUniqueTestDatabase(t)
+	require.NoError(t, RequireDifferentDatabases(t.Context(), []*sql.DB{sourceA, sourceB}, []*sql.DB{target}))
+	require.ErrorContains(t, RequireDifferentDatabases(t.Context(), []*sql.DB{sourceA, sourceB}, []*sql.DB{target, sourceB}), "source 1 and target 1 refer to the same database")
 }
