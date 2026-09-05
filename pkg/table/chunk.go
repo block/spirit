@@ -91,18 +91,37 @@ func (c *Chunk) String() string {
 }
 
 func (c *Chunk) JSON() string {
-	return fmt.Sprintf(`{"Key":["%s"],"ChunkSize":%d,"LowerBound":%s,"UpperBound":%s}`,
-		strings.Join(c.Key, `","`),
-		c.ChunkSize,
-		c.LowerBound.JSON(),
-		c.UpperBound.JSON(),
-	)
+	out, err := json.Marshal(JSONChunk{
+		Key:        c.Key,
+		ChunkSize:  c.ChunkSize,
+		LowerBound: c.LowerBound.jsonBoundary(),
+		UpperBound: c.UpperBound.jsonBoundary(),
+	})
+	if err != nil {
+		// JSONChunk contains only strings, integers, booleans, and slices, so
+		// encoding it cannot fail. Keep JSON's historical string-only API while
+		// making an impossible future schema regression fail loudly.
+		panic(fmt.Sprintf("could not encode chunk JSON: %v", err))
+	}
+	return string(out)
 }
 
 // JSON encodes a boundary as JSON. The values are represented as strings,
 // to avoid JSON float behavior. See Issue #125
 func (b *Boundary) JSON() string {
-	return fmt.Sprintf(`{"Value": [%s],"Inclusive":%t}`, b.valuesString(), b.Inclusive)
+	out, err := json.Marshal(b.jsonBoundary())
+	if err != nil {
+		panic(fmt.Sprintf("could not encode boundary JSON: %v", err))
+	}
+	return string(out)
+}
+
+func (b *Boundary) jsonBoundary() JSONBoundary {
+	values := make([]string, len(b.Value))
+	for i, value := range b.Value {
+		values[i] = jsonDatumString(value)
+	}
+	return JSONBoundary{Value: values, Inclusive: b.Inclusive}
 }
 
 // comparesTo returns true if the boundaries are the same.
@@ -144,6 +163,18 @@ func (b *Boundary) valuesString() string {
 // control byte like 0x16, or an embedded quote — must be JSON-escaped here, or
 // the checkpoint watermark becomes unparseable and resume fails permanently.
 func jsonQuoteDatum(v Datum) string {
+	s := jsonDatumString(v)
+	// json.Marshal of a (valid-UTF8) string never errors and escapes anything
+	// JSON requires escaped; binary values took the hex branch in
+	// jsonDatumString, so they're ASCII here.
+	out, _ := json.Marshal(s)
+	return string(out)
+}
+
+// jsonDatumString renders a boundary datum as the string value stored in a
+// checkpoint. The enclosing JSON encoder, rather than string interpolation,
+// is responsible for quoting and escaping it.
+func jsonDatumString(v Datum) string {
 	var s string
 	switch {
 	case v.IsNumeric():
@@ -167,11 +198,7 @@ func jsonQuoteDatum(v Datum) string {
 			s = fmt.Sprintf("%v", v.Val)
 		}
 	}
-	// json.Marshal of a (valid-UTF8) string never errors and escapes anything
-	// JSON requires escaped; binary values took the hex branch above so they're
-	// ASCII here.
-	out, _ := json.Marshal(s)
-	return string(out)
+	return s
 }
 
 type JSONChunk struct {

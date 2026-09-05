@@ -25,6 +25,22 @@ func TestBoundaryJSONControlChar(t *testing.T) {
 	require.Equal(t, []string{"foo\x16bar"}, parsed.Value)
 }
 
+func TestChunkJSONEscapesKeyNames(t *testing.T) {
+	chunk := &Chunk{
+		Key:        []string{"quote\"key", "slash\\key"},
+		ChunkSize:  1000,
+		LowerBound: &Boundary{Value: []Datum{{Val: 1, Tp: signedType}, {Val: 2, Tp: signedType}}, Inclusive: true},
+		UpperBound: &Boundary{Value: []Datum{{Val: 3, Tp: signedType}, {Val: 4, Tp: signedType}}, Inclusive: false},
+	}
+
+	encoded := chunk.JSON()
+	require.True(t, json.Valid([]byte(encoded)), "chunk JSON must be valid: %q", encoded)
+
+	var decoded JSONChunk
+	require.NoError(t, json.Unmarshal([]byte(encoded), &decoded))
+	require.Equal(t, chunk.Key, decoded.Key)
+}
+
 // TestBinaryChunkJSONRoundTrip guards against checkpoint corruption for
 // binary boundary values that are valid UTF-8. The restore path
 // (datumValFromString) unconditionally hex-decodes any binaryType value with
