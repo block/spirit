@@ -13,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 )
 
 // SingleTargetApplier applies rows to a single target database.
@@ -21,7 +22,7 @@ import (
 type SingleTargetApplier struct {
 	sync.Mutex
 
-	control     writeControl
+	throttler   throttler.Throttler
 	target      Target
 	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
@@ -107,12 +108,8 @@ func NewSingleTargetApplier(target Target, cfg *ApplierConfig) (*SingleTargetApp
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	controls, err := newWriteControls([]Target{target}, cfg)
-	if err != nil {
-		return nil, err
-	}
 	return &SingleTargetApplier{
-		control:             controls[0],
+		throttler:           cfg.Throttler,
 		target:              target,
 		dbConfig:            cfg.DBConfig,
 		logger:              cfg.Logger,
@@ -508,10 +505,9 @@ func (a *SingleTargetApplier) writeWorker(ctx context.Context, quit <-chan struc
 // connection and is spent on spirit's own CPU, so Stats() reports it apart from
 // the round trip (see Stats.BuildTimeP50).
 func (a *SingleTargetApplier) writeChunklet(ctx context.Context, chunkletData chunklet) (int64, time.Duration, error) {
-	if err := a.control.acquire(ctx); err != nil {
-		return 0, 0, err
+	if a.throttler != nil {
+		a.throttler.BlockWait(ctx)
 	}
-	defer a.control.release()
 	if len(chunkletData.rows) == 0 {
 		return 0, 0, nil
 	}

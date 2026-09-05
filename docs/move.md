@@ -173,7 +173,9 @@ spirit move --source-dsn=... --target-dsn=... --enable-experimental-autoscaling
 
 For sharded moves, all write pools scale together using the **busiest target host's** utilization. A busy host slows the whole move; idle hosts do not offset its load. This conservative policy also handles skewed shard traffic, though it can leave capacity unused on quieter hosts.
 
-The applier checks that shared load signal before each copy write, so queued chunklets also pause. A fixed concurrency guard per host provides protection between load samples: even if traffic suddenly concentrates on one shard, or retiring workers overlap replacement workers, writes on that host cannot exceed its guard. The guard is derived from the smallest host's capacity and capped by the client CPU budget; it is shared across co-located target schemas and does not grow with observed traffic distribution. Existing chunklet size limits bound each individual write. These controls apply to asynchronous copying; replication draining and under-lock writes retain their existing path.
+The gradual multi-throttler reports the maximum utilization across hosts: all hosts must have headroom to permit growth; any host in the middle band holds scaling steady; any busy host can trigger a reduction. Which host is busiest can change from one sample to the next. Write-thread counts apply per shard. There is no additional fixed host concurrency guard.
+
+The applier checks the shared load signal before each copy write, so queued chunklets also pause. Replication draining and under-lock writes retain their existing path.
 
 Targets sharing a host share one Aurora monitor. Initial counts and ceilings use the smallest target host and divide its budget by the largest number of target shards sharing a host, with at least one worker per shard. The client CPU budget also limits growth. Host identity includes the connection transport and address (including port), independently of database and credentials. Use consistent direct endpoints: DNS aliases and proxies are not resolved to physical hosts.
 

@@ -107,11 +107,10 @@ type Runner struct {
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
 	sourceTableMap map[string]bool    // used when only some tables are to be moved.
 
-	throttlerMu       sync.RWMutex
-	throttler         throttler.Throttler
-	monitorDBs        []*sql.DB
-	autoscale         copier.AutoscaleConfig
-	maxThreadsPerHost int
+	throttlerMu sync.RWMutex
+	throttler   throttler.Throttler
+	monitorDBs  []*sql.DB
+	autoscale   copier.AutoscaleConfig
 
 	applier           applier.Applier
 	copyChunker       table.Chunker
@@ -2303,11 +2302,10 @@ func (r *Runner) createApplier() (applier.Applier, error) {
 	if len(r.targets) == 1 && r.targets[0].KeyRange == "0" {
 		// Single target - use SingleTargetApplier
 		appl, err := applier.NewSingleTargetApplier(r.targets[0], &applier.ApplierConfig{
-			DBConfig:          r.dbConfig,
-			Logger:            r.logger,
-			Threads:           r.move.WriteThreads,
-			Throttler:         r.currentThrottler(),
-			MaxThreadsPerHost: r.maxThreadsPerHost,
+			DBConfig:  r.dbConfig,
+			Logger:    r.logger,
+			Threads:   r.move.WriteThreads,
+			Throttler: r.currentThrottler(),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create SingleTargetApplier: %w", err)
@@ -2323,11 +2321,10 @@ func (r *Runner) createApplier() (applier.Applier, error) {
 	appl, err := applier.NewShardedApplier(
 		r.targets,
 		&applier.ApplierConfig{
-			DBConfig:          r.dbConfig,
-			Logger:            r.logger,
-			Threads:           r.move.WriteThreads,
-			Throttler:         r.currentThrottler(),
-			MaxThreadsPerHost: r.maxThreadsPerHost,
+			DBConfig:  r.dbConfig,
+			Logger:    r.logger,
+			Threads:   r.move.WriteThreads,
+			Throttler: r.currentThrottler(),
 		},
 	)
 	if err != nil {

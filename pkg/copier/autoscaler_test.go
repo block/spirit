@@ -784,3 +784,28 @@ func TestAutoScalerBusiestTarget(t *testing.T) {
 	require.Greater(t, writer.n, 4)
 	require.False(t, composite.IsThrottled())
 }
+
+func TestAutoScalerBusiestHostCanChange(t *testing.T) {
+	first, second := &utilThrottler{}, &utilThrottler{}
+	first.setUtil(0.1)
+	second.setUtil(0.1)
+	signal := throttler.NewMultiThrottler(first, second).(throttler.GradualThrottler)
+	writer := &fakeScaler{n: 4}
+	controller := newAutoScaler(signal, writer, 4, 8, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 5, writer.n, "all hosts have headroom")
+	second.setUtil(0.55)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 5, writer.n, "one host in the middle band prevents growth")
+	second.setUtil(0.8)
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n, "one busy host causes shedding")
+	second.setUtil(0.1)
+	first.setUtil(0.8)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 3, writer.n, "a different busy host continues shedding after cooldown")
+}

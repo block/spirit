@@ -11,7 +11,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,12 +38,7 @@ func TestShardedApplierScaling(t *testing.T) {
 	cfg.Threads = 2
 	pause := newPausedCopyThrottler()
 	cfg.Throttler = throttler.NewMultiThrottler(&throttler.Noop{}, pause)
-	cfg.MaxThreadsPerHost = 2
-	targetConfig, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-	config1, config2 := targetConfig.Clone(), targetConfig.Clone()
-	config1.DBName, config2.DBName = db1, db2
-	a, err := NewShardedApplier([]Target{{DB: target1, Config: config1, KeyRange: "-80"}, {DB: target2, Config: config2, KeyRange: "80-"}}, cfg)
+	a, err := NewShardedApplier([]Target{{DB: target1, KeyRange: "-80"}, {DB: target2, KeyRange: "80-"}}, cfg)
 	require.NoError(t, err)
 	a.SetWriteWorkers(8) // Before Start is harmless.
 	require.Zero(t, a.Stats().ActiveWorkers)
@@ -95,8 +89,8 @@ func TestShardedApplierScaling(t *testing.T) {
 	require.NoError(t, a.Wait(t.Context()))
 	require.EqualValues(t, 100, callbacks.Load())
 	// Sudden skew after balanced traffic and repeated pool resizing: every
-	// row in these larger chunks goes to shard zero, still under the same
-	// fixed host guard (including any retiring workers).
+	// row in these larger chunks goes to shard zero. Each shard continues
+	// to use its own worker pool, with the shared signal governing scaling.
 	for batch := range 5 {
 		rows := make([][]any, 1000)
 		for i := range rows {

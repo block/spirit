@@ -15,6 +15,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 )
 
 // ShardedApplier applies rows to multiple target databases based on a Vitess-style vindex.
@@ -32,6 +33,7 @@ type ShardedApplier struct {
 	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
 	metricsSink metrics.Sink // nil disables the stats emitter
+	throttler   throttler.Throttler
 
 	// Pending work tracking (shared across all shards).
 	//
@@ -77,7 +79,6 @@ type ShardedApplier struct {
 
 // shardTarget represents a single shard with its own connection, key range, and workers
 type shardTarget struct {
-	control             writeControl
 	shardID             int
 	writeDB             *sql.DB
 	keyRange            keyRange // Parsed key range for this shard
@@ -118,10 +119,6 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	controls, err := newWriteControls(targets, cfg)
-	if err != nil {
-		return nil, err
-	}
 	shards := make([]*shardTarget, len(targets))
 	for i, target := range targets {
 		// A nil connection is only discovered when a row routes to this shard,
@@ -138,7 +135,6 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 
 		shards[i] = &shardTarget{
 			shardID:             i,
-			control:             controls[i],
 			writeDB:             target.DB,
 			keyRange:            kr,
 			chunkletBuffer:      make(chan shardedChunklet, defaultBufferSize),
@@ -170,6 +166,7 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 
 	return &ShardedApplier{
 		shards:      shards,
+		throttler:   cfg.Throttler,
 		targets:     targets,
 		dbConfig:    cfg.DBConfig,
 		logger:      cfg.Logger,
@@ -578,10 +575,9 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, qu
 // affected row count and, separately, how long the client-side statement build
 // took — see SingleTargetApplier.writeChunklet.
 func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, chunkletData shardedChunklet) (int64, time.Duration, error) {
-	if err := shard.control.acquire(ctx); err != nil {
-		return 0, 0, err
+	if a.throttler != nil {
+		a.throttler.BlockWait(ctx)
 	}
-	defer shard.control.release()
 	if len(chunkletData.rows) == 0 {
 		return 0, 0, nil
 	}
