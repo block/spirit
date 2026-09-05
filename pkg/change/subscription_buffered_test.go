@@ -1583,27 +1583,38 @@ func TestProcessRowsEventDoesNotDeadlockOnPark(t *testing.T) {
 	require.Equal(t, 2, count)
 }
 
-// parkBinlogReader arranges both rows in a single statement/event: admitting
-// the first reaches the one-change cap, so the second must park. There is no
-// seed/catch-up/reconfigure window and no dependence on row-image byte sizing.
-// These clients have no periodic flusher: only the test's Flush or Close may
-// release the park. Keep real binlog delivery in the lifecycle regression.
+// Real binlog delivery may be delayed on contended CI runners. Keep this test
+// budget independent of production BlockWait tuning.
+const parkWaitTimeout = 30 * time.Second
+
+// requestBinlogPark starts with an empty subscription and inserts two distinct
+// keys in one statement. The first fills the one-change cap; the second must
+// park (an overwrite of the first key would bypass the cap). This also works
+// if MySQL splits the statement across multiple row events.
+func requestBinlogPark(t *testing.T, sub *bufferedMap, src *table.TableInfo) {
+	t.Helper()
+	sub.Lock()
+	sub.softLimitBytes = 0
+	sub.softLimitChanges = 1
+	sub.Unlock()
+	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'seed'), (2, 'parked')", src.QuotedTableName))
+}
+
+// parkBinlogReader requires the caller to keep periodic flushing stopped until
+// it deliberately releases the park via Flush or Close. The entry guard catches
+// an already-running flusher; it does not prevent later starts.
 func parkBinlogReader(t *testing.T, client *binlogClient, sub *bufferedMap, src *table.TableInfo) {
 	t.Helper()
 	client.periodicFlushLock.Lock()
 	flushing := client.periodicFlushCancel != nil
 	client.periodicFlushLock.Unlock()
 	require.False(t, flushing, "a background flusher could release the test's park")
-	sub.Lock()
-	sub.softLimitBytes = 0
-	sub.softLimitChanges = 1
-	sub.Unlock()
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'seed'), (2, 'parked')", src.QuotedTableName))
+	requestBinlogPark(t, sub, src)
 	require.Eventually(t, func() bool {
 		sub.Lock()
 		defer sub.Unlock()
 		return sub.parked && sub.lengthLocked() == 1
-	}, DefaultTimeout, 10*time.Millisecond, "binlog reader must be held at the second row")
+	}, parkWaitTimeout, 10*time.Millisecond, "binlog reader must be held at the second row")
 }
 
 // TestBufferedMapCloseUnblocksParkedHasChanged pins the invariant that

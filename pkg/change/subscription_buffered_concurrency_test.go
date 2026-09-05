@@ -490,19 +490,11 @@ func TestPeriodicFlushRespondsToParkRequest(t *testing.T) {
 	client.StartPeriodicFlush(t.Context(), time.Hour)
 	defer client.StopPeriodicFlush()
 
-	// Seed one buffered change, then clamp the limit so the next
-	// binlog-driven HasChanged parks.
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'seed')", srcTable.QuotedTableName))
-	require.NoError(t, client.BlockWait(t.Context()))
-	sub.Lock()
-	require.Positive(t, sub.sizeBytes, "seed change must be accounted")
-	sub.softLimitBytes = 1
-	sub.Unlock()
-
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (2, 'parked')", srcTable.QuotedTableName))
+	requestBinlogPark(t, sub, srcTable)
+	// The flusher may already have released it, so observe the park counter.
 	require.Eventually(t, func() bool {
 		return sub.timesParked.Load() >= 1
-	}, 10*time.Second, 10*time.Millisecond, "binlog-driven HasChanged should park on soft limit")
+	}, parkWaitTimeout, 10*time.Millisecond, "binlog-driven HasChanged should park on soft limit")
 
 	// The park requested a flush; the periodic goroutine must drain the
 	// seed row promptly — not in an hour — which also unparks the reader.
@@ -590,19 +582,11 @@ func TestPeriodicFlushPrioritizesParkedSubscription(t *testing.T) {
 	// B accumulates pending changes first, so it is a candidate to be
 	// drained ahead of A in an unprioritized all-subscription pass.
 	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'b'), (2, 'b'), (3, 'b')", srcB.QuotedTableName))
-	// Seed A with one buffered change, then clamp its limit so the next
-	// binlog-driven event parks the reader on A.
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (1, 'seed')", srcA.QuotedTableName))
-	require.NoError(t, client.BlockWait(t.Context()))
-	subA.Lock()
-	require.Positive(t, subA.sizeBytes, "seed change must be accounted")
-	subA.softLimitBytes = 1
-	subA.Unlock()
-
-	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (id, name) VALUES (2, 'parked')", srcA.QuotedTableName))
+	requestBinlogPark(t, subA, srcA)
+	// The flusher may already have released it, so observe the park counter.
 	require.Eventually(t, func() bool {
 		return subA.timesParked.Load() >= 1
-	}, 10*time.Second, 10*time.Millisecond, "binlog-driven HasChanged should park on soft limit")
+	}, parkWaitTimeout, 10*time.Millisecond, "binlog-driven HasChanged should park on soft limit")
 
 	// The priority flush drains A; the follow-up pass drains B. Gate on B
 	// specifically rather than on a bare count: the all-subscription pass
