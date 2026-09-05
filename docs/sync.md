@@ -164,7 +164,10 @@ resumes as normal; this only resets a target that is non-empty with no usable
 checkpoint, which would otherwise trip the fresh-sync target-empty guard.
 Unrelated tables in the target database are preserved. Source and target
 connections must refer to different databases, including when `--force` is set.
-Intended for testing/iterating.
+The source table list defines what Sync owns: if a table copied by an earlier
+run has since been dropped from the source, `--force` does not discover or
+remove that stale target table. Remove such tables manually if they are no
+longer wanted. Intended for testing/iterating.
 
 ## GTID auto-detection
 

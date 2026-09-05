@@ -896,7 +896,16 @@ func TestSyncResumeSourceIdentity(t *testing.T) {
 	require.ErrorContains(t, err, "no source identity")
 	require.ErrorContains(t, err, "--force")
 
-	// --force recovers: the unverifiable checkpoint is treated as
+	// A checkpoint with copy progress but no stream position cannot resume a
+	// continuous sync: starting the feed at "now" would miss writes committed
+	// since the checkpoint. It is eligible for explicit --force recovery.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = ''`)
+	err = run(false)
+	require.ErrorContains(t, err, "no saved change-feed position")
+	require.ErrorContains(t, err, "--force")
+
+	// --force recovers: the position-less checkpoint is treated as
 	// non-resumable, the sync-owned tables are wiped, and a fresh copy runs.
 	require.NoError(t, run(true))
 	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
@@ -1488,6 +1497,28 @@ func TestSyncResumeGTIDIdentity(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, pos, got)
 	}
+}
+
+func TestSyncResumeRequiresChangeFeedPosition(t *testing.T) {
+	r := &Runner{sync: &Sync{}}
+	_, err := r.resolveResumePosition("")
+	require.ErrorContains(t, err, "no saved change-feed position")
+	require.ErrorContains(t, err, "--force")
+
+	r.sync.CopyOnly = true
+	got, err := r.resolveResumePosition("")
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func TestSyncResumeExplainsStructuredPositionWithoutIdentity(t *testing.T) {
+	r := &Runner{sync: &Sync{}}
+	wrapped, err := encodeSyncPosition("binlog.000123:456", "", "injected-source")
+	require.NoError(t, err)
+
+	_, err = r.resolveResumePosition(wrapped)
+	require.ErrorContains(t, err, "injected change source")
+	require.NotContains(t, err.Error(), "older spirit version")
 }
 
 func TestSyncResumeSourceIdentityCaseInsensitive(t *testing.T) {

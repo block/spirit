@@ -763,9 +763,17 @@ func (r *Runner) setup(ctx context.Context) error {
 		return err
 	}
 
-	pos, err := r.resolveResumePosition(rawPos)
-	if err != nil {
-		return err
+	pos := rawPos
+	if hasCheckpoint {
+		// An entirely empty first checkpoint is safe: the copier restarts from
+		// the beginning and the feed starts before it. Once copy progress exists,
+		// an empty stream position would leave a gap and must fail closed.
+		if watermark != "" || rawPos != "" {
+			pos, err = r.resolveResumePosition(rawPos)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	// Wire the change source (continuous mode only): injected (e.g. VStream),
@@ -1412,13 +1420,20 @@ func decodeSyncPosition(raw string) (pos syncPosition, ok bool) {
 func (r *Runner) resolveResumePosition(rawPos string) (string, error) {
 	payload, hasIdentity := decodeSyncPosition(rawPos)
 	if payload.Position == "" {
-		return "", nil // no position was saved; the change feed starts fresh
+		if r.sync.CopyOnly {
+			return "", nil
+		}
+		return "", errors.New("checkpoint carries no saved change-feed position, so continuous sync cannot safely resume without missing source writes; re-run with --force to discard it and start a fresh sync")
 	}
 	if r.sync.Source != nil || change.IsGTIDPosition(payload.Position) {
 		return payload.Position, nil
 	}
-	if !hasIdentity || payload.ServerUUID == "" {
+	if !hasIdentity {
 		return "", fmt.Errorf("checkpoint position %q carries no source identity (it was written by an older spirit version), so it cannot be verified to belong to the current source server; re-run with --force to discard it and start a fresh sync",
+			payload.Position)
+	}
+	if payload.ServerUUID == "" {
+		return "", fmt.Errorf("checkpoint position %q was recorded without a source server identity (for example by an injected change source), so the built-in file-position reader cannot verify it belongs to the current source server; re-run with --force to discard it and start a fresh sync",
 			payload.Position)
 	}
 	if !strings.EqualFold(payload.ServerUUID, r.sourceUUID) {
