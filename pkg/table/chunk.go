@@ -91,18 +91,44 @@ func (c *Chunk) String() string {
 }
 
 func (c *Chunk) JSON() string {
-	return fmt.Sprintf(`{"Key":["%s"],"ChunkSize":%d,"LowerBound":%s,"UpperBound":%s}`,
-		strings.Join(c.Key, `","`),
-		c.ChunkSize,
-		c.LowerBound.JSON(),
-		c.UpperBound.JSON(),
-	)
+	out, err := c.marshalJSON()
+	if err != nil {
+		// Keep the historical string-only API for external callers. Production
+		// checkpoint paths use marshalJSON directly and propagate its error.
+		panic(err)
+	}
+	return out
+}
+
+func (c *Chunk) marshalJSON() (string, error) {
+	out, err := json.Marshal(JSONChunk{
+		Key:        c.Key,
+		ChunkSize:  c.ChunkSize,
+		LowerBound: c.LowerBound.jsonBoundary(),
+		UpperBound: c.UpperBound.jsonBoundary(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("could not encode chunk JSON: %w", err)
+	}
+	return string(out), nil
 }
 
 // JSON encodes a boundary as JSON. The values are represented as strings,
 // to avoid JSON float behavior. See Issue #125
 func (b *Boundary) JSON() string {
-	return fmt.Sprintf(`{"Value": [%s],"Inclusive":%t}`, b.valuesString(), b.Inclusive)
+	out, err := json.Marshal(b.jsonBoundary())
+	if err != nil {
+		panic(fmt.Sprintf("could not encode boundary JSON: %v", err))
+	}
+	return string(out)
+}
+
+func (b *Boundary) jsonBoundary() JSONBoundary {
+	values := make([]string, len(b.Value))
+	for i, value := range b.Value {
+		values[i] = jsonDatumString(value)
+	}
+	return JSONBoundary{Value: values, Inclusive: b.Inclusive}
 }
 
 // comparesTo returns true if the boundaries are the same.
@@ -124,8 +150,9 @@ func (b *Boundary) comparesTo(b2 *Boundary) bool {
 	return true
 }
 
-// valuesString renders the boundary values as a comma-separated list of JSON
-// string literals (used inside Boundary.JSON's "Value" array).
+// valuesString renders the boundary values as an injective, comma-separated
+// tuple key for watermarkTracker's out-of-order chunk map. JSON string quoting
+// keeps distinct tuples distinct, including ["a", "b"] versus ["a,b"].
 func (b *Boundary) valuesString() string {
 	vals := make([]string, len(b.Value))
 	for i, v := range b.Value {
@@ -138,12 +165,23 @@ func (b *Boundary) valuesString() string {
 // quoted, properly escaped). Numeric values are quoted to avoid JSON float
 // behavior (#125); binary values are hex-encoded ("0x...", or the empty
 // binary literal for a zero-length value) so they round-trip via
-// datumValFromString. Crucially it uses json.Marshal rather than
-// Datum.String() (which SQL-escapes for WHERE clauses): a string value that is
-// valid in a MySQL string literal but not in JSON — e.g. a VARCHAR PK holding a
-// control byte like 0x16, or an embedded quote — must be JSON-escaped here, or
-// the checkpoint watermark becomes unparseable and resume fails permanently.
+// datumValFromString. Crucially it uses json.Marshal rather than Datum.String()
+// (which SQL-escapes for WHERE clauses), so the tuple representation is
+// injective. Without quoting, distinct boundaries could collide in the
+// watermark map and let one out-of-order chunk overwrite another.
 func jsonQuoteDatum(v Datum) string {
+	s := jsonDatumString(v)
+	// json.Marshal of a (valid-UTF8) string never errors and escapes anything
+	// JSON requires escaped; binary values took the hex branch in
+	// jsonDatumString, so they're ASCII here.
+	out, _ := json.Marshal(s)
+	return string(out)
+}
+
+// jsonDatumString renders a boundary datum as the string value stored in a
+// checkpoint. The enclosing JSON encoder, rather than string interpolation,
+// is responsible for quoting and escaping it.
+func jsonDatumString(v Datum) string {
 	var s string
 	switch {
 	case v.IsNumeric():
@@ -167,11 +205,7 @@ func jsonQuoteDatum(v Datum) string {
 			s = fmt.Sprintf("%v", v.Val)
 		}
 	}
-	// json.Marshal of a (valid-UTF8) string never errors and escapes anything
-	// JSON requires escaped; binary values took the hex branch above so they're
-	// ASCII here.
-	out, _ := json.Marshal(s)
-	return string(out)
+	return s
 }
 
 type JSONChunk struct {

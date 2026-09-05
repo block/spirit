@@ -16,6 +16,7 @@ package sqlescape
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,13 @@ func TestReserveBuffer(t *testing.T) {
 	require.Len(t, res2, 12)
 	require.Equal(t, 15, cap(res2))
 	require.Equal(t, res1, res2[:3])
+
+	require.PanicsWithValue(t, "sqlescape: buffer size overflow", func() {
+		reserveBuffer(make([]byte, 1), math.MaxInt)
+	})
+	require.PanicsWithValue(t, "sqlescape: buffer size overflow", func() {
+		reserveBuffer(nil, -1)
+	})
 }
 
 func TestEscapeBackslash(t *testing.T) {
