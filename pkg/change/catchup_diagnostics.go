@@ -23,7 +23,7 @@ func catchUpDiagnostics(subs []Subscription) string {
 			continue
 		}
 		out = append(out, fmt.Sprintf("subscription[%d]: pending=%d flushing=%d bytes=%d parked=%t parks=%d drain-budget-hit=%t",
-			i, sub.lengthLocked(), sub.flushingCount, sub.sizeBytes, sub.parked, parks, sub.lastDrainHitBudget.Load()))
+			i, len(sub.changes)+len(sub.queue), sub.flushingCount, sub.sizeBytes, sub.parked, parks, sub.lastDrainHitBudget.Load()))
 		sub.Unlock()
 	}
 	if len(out) == 0 {

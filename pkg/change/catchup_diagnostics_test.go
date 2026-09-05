@@ -34,3 +34,16 @@ func TestCatchUpDiagnosticsDoesNotBlockBehindFlush(t *testing.T) {
 		t.Fatal("timeout diagnostics blocked behind subscription lock")
 	}
 }
+
+// A flush swaps entries out of the active stores. Pending and flushing must
+// describe disjoint work so summing them does not double-count that snapshot.
+func TestCatchUpDiagnosticsSeparatesPendingFromFlushing(t *testing.T) {
+	sub := newBareBufferedMap(1024)
+	sub.HasChanged([]any{int32(1)}, []any{int32(1), "seed"}, false)
+	sub.queue = append(sub.queue, queuedChange{})
+	sub.flushingCount = 3
+	require.Contains(t, catchUpDiagnostics([]Subscription{sub}), "pending=2 flushing=3")
+	sub.changes = nil
+	sub.queue = nil
+	require.Contains(t, catchUpDiagnostics([]Subscription{sub}), "pending=0 flushing=3")
+}
