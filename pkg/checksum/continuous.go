@@ -163,15 +163,15 @@ type ContinuousCheckerConfig struct {
 	Recopier Recopier
 
 	// DivergenceIsFatal selects the policy for a confirmed stable divergence,
-	// making explicit the replication-backed vs. copy-only distinction rather
-	// than inferring it from Recopier presence:
+	// making explicit whether the caller should abort or heal rather than
+	// inferring it from Recopier presence:
 	//   - true  (migration's cutover gate): the target is kept in sync by
 	//     replication, so a confirmed difference means something is genuinely
 	//     wrong. Run returns ErrPermanentDivergence and the caller aborts. No
 	//     Recopier is configured.
-	//   - false (datasync, especially --copy-only): the checker's job is to find
-	//     and re-copy diverged rows, so a confirmed difference is repaired via
-	//     Recopier and the run continues.
+	//   - false (datasync): the checker's job is to find and re-copy diverged
+	//     rows, so a confirmed difference is repaired via Recopier and the run
+	//     continues.
 	// When false, a Recopier must be set; without one a divergence is treated as
 	// fatal anyway (there is nothing to heal with).
 	DivergenceIsFatal bool
@@ -898,8 +898,8 @@ func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *wo
 	// FlushUnderTableLock reconciles exactly that lag moments later. Draining
 	// here performs the same reconciliation before we judge, so only a mismatch
 	// that survives a full drain (with the source still unchanged) is treated as
-	// real. The feed is advisory and may be nil (e.g. copy-only sync has no
-	// feed); with nothing to drain, the mismatch is taken at face value.
+	// real. The feed is advisory and may be nil for library callers; with
+	// nothing to drain, the mismatch is taken at face value.
 	if c.feed != nil {
 		if flushErr := c.feed.Flush(ctx); flushErr != nil {
 			res.err = fmt.Errorf("drain change feed before divergence verdict for chunk %s: %w", item.chunk.String(), flushErr)

@@ -57,6 +57,10 @@ source privileges depend on the change feed:
   the source does not have GTIDs enabled (the file+offset reader issues
   `FLUSH BINARY LOGS`)
 
+A source that cannot grant the built-in feed privileges must use a
+programmatically injected `change.Source`; the CLI no longer has a mode that
+runs without a change stream.
+
 ## Configuration
 
 - [source-dsn](#source-dsn)
@@ -66,7 +70,6 @@ source privileges depend on the change feed:
 - [write-threads](#write-threads)
 - [flush-interval](#flush-interval)
 - [defer-secondary-indexes](#defer-secondary-indexes)
-- [copy-only](#copy-only)
 - [force](#force)
 
 ### source-dsn
@@ -125,11 +128,10 @@ the replication-latency vs. batching trade-off.
 
 When set to `true`, the target tables are created **without their regular
 secondary indexes**, and the indexes are added back in a single `ALTER` per
-table once the initial copy has completed (before the continuous phase begins,
-or before the post-copy checksum in `--copy-only` mode). Bulk-loading an
-index-free table is faster and lighter on temporary space; only regular
-secondary indexes are deferred — `PRIMARY`, `UNIQUE`, `FULLTEXT` and `SPATIAL`
-indexes are kept on the initial `CREATE`. This mirrors
+table once the initial copy has completed, before the continuous phase begins.
+Bulk-loading an index-free table is faster and lighter on temporary space; only
+regular secondary indexes are deferred — `PRIMARY`, `UNIQUE`, `FULLTEXT` and
+`SPATIAL` indexes are kept on the initial `CREATE`. This mirrors
 [`move --defer-secondary-indexes`](move.md#defer-secondary-indexes).
 
 Use it only when the target is **not yet serving reads**: the tables briefly
@@ -139,18 +141,6 @@ representative). Adding the indexes also needs enough temporary space on the
 target to build them. The restore is resume-safe and idempotent — a re-run
 (even without the flag) detects any indexes still missing on the target and
 adds them, so an interrupted run finishes the job on the next start.
-
-### copy-only
-
-- Type: Boolean
-- Default value: `false`
-
-Run only the initial copy and then exit — no change capture, no continuous
-replication. Use it for a one-shot snapshot, or when the source cannot provide
-a change feed (e.g. a managed Vitess without binlog/VStream access, or a
-replica lacking the `REPLICATION` privileges the binlog client needs). A
-checkpoint is still written, so a re-run resumes the copy (or no-ops if it had
-already completed) rather than starting over.
 
 ### force
 
@@ -186,5 +176,9 @@ Sync-specific notes:
 - **Resume keeps the checkpoint's scheme.** A file+offset checkpoint resumes
   on the file+offset client even after GTIDs are enabled on the source, and a
   GTID checkpoint fails with a clear error if the source no longer has GTIDs
-  enabled. A [`--copy-only`](#copy-only) checkpoint records no stream
-  position, so a later full sync picks its scheme fresh from the server.
+  enabled.
+- **Legacy copy-only checkpoints have no stream position.** When upgrading a
+  target with one of these checkpoints, Sync warns and starts the change stream
+  at the current source head. Changes made after the old checkpoint are not
+  replayed immediately; the continuous checksum finds and repairs that gap as
+  it walks the target.

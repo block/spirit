@@ -193,17 +193,15 @@ func (r *Runner) runCopy(ctx context.Context) error {
 		if err := r.copier.Run(ctx); err != nil {
 			return fmt.Errorf("copy failed: %w", err)
 		}
-		if !r.sync.CopyOnly {
-			if !r.resuming.Load() {
-				if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
-					return err
-				}
+		if !r.resuming.Load() {
+			if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
+				return err
 			}
-			// Drain the copy-phase backlog so every change observed so far is
-			// applied before steady-state streaming.
-			if err := r.replClient.Flush(ctx); err != nil {
-				return fmt.Errorf("failed to flush after copy: %w", err)
-			}
+		}
+		// Drain the copy-phase backlog so every change observed so far is
+		// applied before steady-state streaming.
+		if err := r.replClient.Flush(ctx); err != nil {
+			return fmt.Errorf("failed to flush after copy: %w", err)
 		}
 		return nil
 	})
@@ -324,7 +322,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// — and finishes immediately if the copy had already completed. The applier
 	// copies with INSERT IGNORE, so re-copying the chunks straddling the
 	// watermark is idempotent.
-	if !r.sync.CopyOnly && !r.resuming.Load() {
+	if !r.resuming.Load() {
 		// Watermark optimization ON during a fresh continuous copy: change
 		// events for keys the copier has not reached yet (above the watermark)
 		// are discarded, because the copier will copy those rows directly.
@@ -358,103 +356,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	// The initial copy is done. Restore any secondary indexes deferred during
-	// table creation now, before the target is consumed (continuous sync) or
-	// the post-copy checksum walks it (copy-only). Always called — it is a
-	// no-op when nothing was deferred and resume-safe; see
-	// restoreSecondaryIndexes.
+	// table creation now, before the target is consumed by continuous sync.
+	// Always called — it is a no-op when nothing was deferred and resume-safe;
+	// see restoreSecondaryIndexes.
 	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
 		return r.restoreSecondaryIndexes(ctx)
 	}); err != nil {
 		return fmt.Errorf("failed to restore secondary indexes: %w", err)
 	}
 
-	// Copy-only past this point: no change capture is configured, but the
-	// post-copy continuous checksum is independent of replication and still
-	// has a job — verify the copy and, if a Recopier is configured, lazily
-	// re-copy diverged rows. Write an intermediate checkpoint marking the
-	// copy as complete (so a crash during the checksum resumes to a copy
-	// no-op instead of re-copying), then block on the checker until ctx is
-	// cancelled.
-	if r.sync.CopyOnly {
-		if err := r.dumpCheckpoint(ctx); err != nil {
-			r.logger.Warn("post-copy checkpoint write failed", "error", err)
-		}
-		r.logger.Info("Copy complete; entering continuous checksum (CopyOnly mode)")
-		return r.status.Do(status.ApplyChangeset, func() error {
-			return r.runCopyOnlyChecksum(ctx)
-		})
-	}
-
 	r.logger.Info("Copy complete; entering continuous sync")
 	return r.status.Do(status.ApplyChangeset, func() error {
 		return r.runContinuous(ctx)
 	})
-}
-
-// runCopyOnlyChecksum runs the post-copy continuous checksum without a
-// change feed. With CopyOnly there's no replication to drive, but the
-// checker still verifies source vs. target convergence (and, with a
-// Recopier configured, lazily re-copies diverged rows). Blocks until ctx
-// is cancelled or the checker hits a permanent failure, then writes a
-// final checkpoint.
-//
-// This is structurally a stripped-down runContinuous: same checker
-// lifecycle and shutdown contract, no replClient calls. The caller brackets
-// it in the ApplyChangeset state.
-func (r *Runner) runCopyOnlyChecksum(ctx context.Context) error {
-	checksumCtx, cancelChecksum := context.WithCancel(ctx)
-	defer cancelChecksum()
-	checksumDone := make(chan struct{})
-	var checksumErr error
-	go func() {
-		defer close(checksumDone)
-		checksumErr = r.runContinuousChecksum(checksumCtx)
-	}()
-
-	r.logger.Info("Continuous checksum running; will run until cancelled")
-
-	select {
-	case <-ctx.Done():
-		// Normal cancellation.
-	case <-checksumDone:
-		// Checker exited on its own — only happens on a real failure
-		// (clean runs return only on ctx-cancel). Trigger the parent ctx
-		// cancellation so the shutdown path proceeds.
-		if checksumErr != nil && ctx.Err() == nil {
-			r.logger.Error("continuous checksum failed; stopping sync", "error", checksumErr)
-			r.progMu.RLock()
-			cancelParent := r.cancelFunc
-			r.progMu.RUnlock()
-			if cancelParent != nil {
-				cancelParent()
-			}
-		}
-	}
-
-	// Ensure the checksum goroutine is fully shut down before we write the
-	// final checkpoint so its in-flight queries don't race the checkpoint.
-	cancelChecksum()
-	<-checksumDone
-
-	r.logger.Info("Copy-only sync stopping; writing final checkpoint")
-	cpCtx, cancelCp := context.WithTimeout(context.WithoutCancel(ctx), shutdownCheckpointTimeout)
-	defer cancelCp()
-	if err := r.dumpCheckpoint(cpCtx); err != nil {
-		r.logger.Warn("Final checkpoint write failed", "error", err)
-	}
-	r.logger.Info("Copy-only sync stopped", "total_time", r.status.TotalElapsed().Round(time.Second).String())
-
-	// A recorded fatal (e.g. a checkpoint-write failure that status.WatchTask
-	// cancelled us for) must surface rather than be masked by the clean
-	// ctx-cancel return below.
-	if ferr := r.fatal(); ferr != nil {
-		return ferr
-	}
-	// A real checksum failure outranks a clean nil — surface it.
-	if checksumErr != nil && !errors.Is(checksumErr, context.Canceled) {
-		return fmt.Errorf("continuous checksum failed: %w", checksumErr)
-	}
-	return nil
 }
 
 // runContinuous creates/maintains the target checkpoint and blocks until
@@ -574,8 +488,7 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 	// Stop closes chunkletBuffer), which leaves any later Apply call
 	// panicking with "send on closed channel". Start is idempotent and
 	// reinitializes the channels on a previously-stopped applier, so
-	// calling it here is the cheapest way to keep the recopier path
-	// working in both fresh and CopyOnly continuous-sync modes.
+	// calling it here is the cheapest way to keep the recopier path working.
 	//
 	// We pass context.WithoutCancel(ctx) to Start so the applier's
 	// worker context is *not* tied to the parent: the recopier uses
@@ -610,9 +523,8 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 			MinPassInterval: checksum.ContinuousMinPassInterval,
 			Recopier:        recopier,
 			Logger:          r.logger,
-			// Sync verifies a target it keeps converging (and under --copy-only
-			// expects to find diverged rows), so a confirmed divergence is
-			// repaired by the Recopier, not fatal.
+			// Sync verifies a target it keeps converging, so a confirmed
+			// divergence is repaired by the Recopier, not fatal.
 			DivergenceIsFatal: false,
 		},
 	)
@@ -743,28 +655,26 @@ func (r *Runner) setup(ctx context.Context) error {
 		return err
 	}
 
-	// Wire the change source (continuous mode only): injected (e.g. VStream),
+	// Wire the change source: injected (e.g. VStream),
 	// or a built-in MySQL client constructed from the source DSN. The built-in
 	// client's coordinate scheme (GTID vs binlog file+position) is selected
 	// automatically: a resumed sync stays in the scheme its checkpointed
 	// position was written in, and a fresh one uses GTIDs whenever the source
 	// has them enabled. Sync replicates a whole schema, so the DDL filter is
-	// by schema only. Copy-only sync constructs no change source.
-	if !r.sync.CopyOnly {
-		if r.sync.Source != nil {
-			r.setReplClient(r.sync.Source)
-		} else {
-			replConfig := change.NewClientDefaultConfig()
-			replConfig.Logger = r.logger
-			replConfig.CancelFunc = r.fatalError
-			replConfig.DDLFilterSchema = r.source.config.DBName
-			replConfig.DBConfig = r.sourceDBConfig
-			client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig, pos)
-			if err != nil {
-				return err
-			}
-			r.setReplClient(client)
+	// by schema only.
+	if r.sync.Source != nil {
+		r.setReplClient(r.sync.Source)
+	} else {
+		replConfig := change.NewClientDefaultConfig()
+		replConfig.Logger = r.logger
+		replConfig.CancelFunc = r.fatalError
+		replConfig.DDLFilterSchema = r.source.config.DBName
+		replConfig.DBConfig = r.sourceDBConfig
+		client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig, pos)
+		if err != nil {
+			return err
 		}
+		r.setReplClient(client)
 	}
 
 	// If a checkpoint exists on the target, resume: open the copier chunker at
@@ -1189,19 +1099,17 @@ func (r *Runner) buildChunkers() ([]table.Chunker, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !r.sync.CopyOnly {
-			if err := r.replClient.AddSubscription(tbl, nil, cc); err != nil {
-				return nil, err
-			}
+		if err := r.replClient.AddSubscription(tbl, nil, cc); err != nil {
+			return nil, err
 		}
 		chunkers = append(chunkers, cc)
 	}
 	return chunkers, nil
 }
 
-// buildCopyPipeline builds the per-table chunkers (and, for continuous sync,
-// their change-feed subscriptions), assembles the multi-chunker, and
-// constructs the buffered copier. The caller opens the chunker afterwards —
+// buildCopyPipeline builds the per-table chunkers and change-feed subscriptions,
+// assembles the multi-chunker, and constructs the buffered copier. The caller
+// opens the chunker afterwards —
 // Open() for a fresh sync, OpenAtWatermark() for a resume.
 func (r *Runner) buildCopyPipeline() error {
 	chunkers, err := r.buildChunkers()
@@ -1225,7 +1133,7 @@ func (r *Runner) buildCopyPipeline() error {
 }
 
 // startFresh creates the target tables, builds the copy pipeline, opens the
-// chunker from the beginning, starts the change feed (continuous only), and
+// chunker from the beginning, starts the change feed, and
 // creates the checkpoint table so copy progress can be recorded from the
 // start of the copy.
 func (r *Runner) startFresh(ctx context.Context) error {
@@ -1238,29 +1146,26 @@ func (r *Runner) startFresh(ctx context.Context) error {
 	if err := r.copyChunker.Open(); err != nil {
 		return err
 	}
-	// Copy-only sync has no change feed to start.
-	if !r.sync.CopyOnly {
-		// The change-feed reader must outlive ctx. On a clean shutdown ctx is
-		// cancelled first, and only then does the drain path (runContinuous)
-		// issue its final Flush. That Flush relies on the reader goroutine to
-		// keep advancing the buffered binlog position so BlockWait can converge;
-		// if the reader were tied to ctx it would already be dead, the buffered
-		// position would be frozen, and the final flush would spin (re-flushing
-		// binary logs) until it burned its entire shutdownFlushTimeout budget.
-		// Tie the reader's lifetime to Close() instead — Close() cancels its own
-		// derived context — by handing it a cancellation-detached ctx here.
-		if err := r.replClient.Start(context.WithoutCancel(ctx)); err != nil {
-			return fmt.Errorf("failed to start change source: %w", err)
-		}
+	// The change-feed reader must outlive ctx. On a clean shutdown ctx is
+	// cancelled first, and only then does the drain path (runContinuous)
+	// issue its final Flush. That Flush relies on the reader goroutine to
+	// keep advancing the buffered binlog position so BlockWait can converge;
+	// if the reader were tied to ctx it would already be dead, the buffered
+	// position would be frozen, and the final flush would spin (re-flushing
+	// binary logs) until it burned its entire shutdownFlushTimeout budget.
+	// Tie the reader's lifetime to Close() instead — Close() cancels its own
+	// derived context — by handing it a cancellation-detached ctx here.
+	if err := r.replClient.Start(context.WithoutCancel(ctx)); err != nil {
+		return fmt.Errorf("failed to start change source: %w", err)
 	}
 	return r.checkpointTbl().Create(ctx)
 }
 
 // startResume rebuilds the copy pipeline and opens the chunker at the
 // checkpointed watermark, so the copier continues a partial copy (or finishes
-// immediately if the copy had completed). For continuous sync it also disables
-// the watermark optimization (every change applies) and opens the feed at the
-// saved position. The target tables already exist (createTargetTables is
+// immediately if the copy had completed). It also disables the watermark
+// optimization (every change applies) and opens the feed at the saved position.
+// The target tables already exist (createTargetTables is
 // idempotent, skipping them) and the target-empty check is skipped.
 func (r *Runner) startResume(ctx context.Context, watermark, pos string) error {
 	if err := r.createTargetTables(ctx); err != nil {
@@ -1283,24 +1188,41 @@ func (r *Runner) startResume(ctx context.Context, watermark, pos string) error {
 			return err
 		}
 	}
-	if !r.sync.CopyOnly {
-		if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
-			return err
-		}
-		// The reader must outlive ctx so the drain-time final Flush can
-		// converge; see the matching comment in startFresh. Close() stops it.
-		streamCtx := context.WithoutCancel(ctx)
-		if pos != "" {
-			if err := r.replClient.StartFromPosition(streamCtx, pos); err != nil {
-				return fmt.Errorf("failed to resume change source from position %q: %w", pos, err)
-			}
-		} else if err := r.replClient.Start(streamCtx); err != nil {
-			// No saved position (prior attempt failed before checkpointing):
-			// start the feed fresh; changes apply with the optimization off.
-			return fmt.Errorf("failed to start change source: %w", err)
-		}
+	if err := r.startResumeChangeSource(ctx, watermark, pos); err != nil {
+		return err
 	}
 	return r.checkpointTbl().Create(ctx)
+}
+
+// startResumeChangeSource disables copy-time filtering and opens the change
+// source at the checkpointed position. A checkpoint can have copy progress but
+// no stream position (notably legacy copy-only checkpoints); those must start
+// at the current head, leaving the continuous checksum to repair changes made
+// since the checkpoint.
+func (r *Runner) startResumeChangeSource(ctx context.Context, watermark, pos string) error {
+	if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
+		return err
+	}
+	// The reader must outlive ctx so the drain-time final Flush can
+	// converge; see the matching comment in startFresh. Close() stops it.
+	streamCtx := context.WithoutCancel(ctx)
+	if pos != "" {
+		if err := r.replClient.StartFromPosition(streamCtx, pos); err != nil {
+			return fmt.Errorf("failed to resume change source from position %q: %w", pos, err)
+		}
+		return nil
+	}
+
+	if watermark != "" {
+		r.logger.Warn("checkpoint has copy progress but no change-stream position; starting the stream at the current source head, so the target may be stale until the continuous checksum repairs changes made since the checkpoint",
+			"watermark", watermark)
+	} else {
+		r.logger.Info("checkpoint has no copy watermark or change-stream position; starting the stream at the current source head")
+	}
+	if err := r.replClient.Start(streamCtx); err != nil {
+		return fmt.Errorf("failed to start change source: %w", err)
+	}
+	return nil
 }
 
 // checkpointTbl returns a handle to datasync's checkpoint table on the target.
@@ -1390,10 +1312,7 @@ func (r *Runner) readCheckpoint(ctx context.Context) (watermark, pos string, ok 
 // periodic checkpoint loop. The checkpoint loop runs for the whole run (copy
 // and continuous), so a restart at any point resumes from the last checkpoint.
 func (r *Runner) startBackgroundRoutines(ctx context.Context) {
-	// Copy-only sync has no change feed, so no periodic flush.
-	if !r.sync.CopyOnly {
-		r.replClient.StartPeriodicFlush(ctx, r.sync.FlushInterval)
-	}
+	r.replClient.StartPeriodicFlush(ctx, r.sync.FlushInterval)
 	// Share the status + checkpoint loop with the migration and move runners
 	// (status.WatchTask); *Runner satisfies status.Task via Progress / Status /
 	// DumpCheckpoint / Cancel. Unlike the previous bespoke loop, a checkpoint
