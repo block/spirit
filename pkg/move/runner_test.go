@@ -745,16 +745,13 @@ func TestConcurrentMoveDoesNotWipeTarget(t *testing.T) {
 	require.Zero(t, artifacts, "a concurrent run must not create a checkpoint table before acquiring the lock")
 }
 
-// TestMoveWithVarcharPK verifies a move on a table with a non-memory-comparable
-// primary key (VARCHAR with a CI collation) — the case from issue #607. The
-// move runs under concurrent writes to exercise the binlog replay path.
-//
-// For non-memory-comparable PKs the bufferedMap subscription uses LWW map
-// dedup during the copy phase and FIFO queue post-copy. The queue replays
-// binlog events in their original order, which is required for collation-
-// sensitive PKs because the map's hash equality ("A" ≠ "a") does not match
-// MySQL's row identity ("A" = "a" under a CI collation). The post-cutover
-// checksum keeps the optimization honest by repairing any divergence.
+// TestMoveWithVarcharPK verifies FIFO replay after copying a table with a
+// non-memory-comparable VARCHAR primary key (issue #607). Concurrent writes
+// run while the sentinel holds cutover, after the switch from LWW map dedup
+// to FIFO. This test does not exercise concurrent writes during map-mode copy;
+// the move checksum is the correctness gate for divergence in that phase.
+// FIFO preserves event order when Go key equality differs from MySQL's CI
+// collation ("A" and "a" identify the same row in MySQL).
 func TestMoveWithVarcharPK(t *testing.T) {
 	srcDB := "source_varcharpk"
 	dstDB := "dest_varcharpk"
@@ -791,7 +788,7 @@ func TestMoveWithVarcharPK(t *testing.T) {
 	// Hold cutover at the sentinel so the finite workload definitely runs
 	// after copy, when VARCHAR primary keys use FIFO replay. The old writers
 	// ran until move.Run returned, so a slow reader could chase them forever.
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	runner, err := NewRunner(&Move{
 		SourceDSN:    sourceDSN,
@@ -802,6 +799,7 @@ func TestMoveWithVarcharPK(t *testing.T) {
 	})
 	require.NoError(t, err)
 	done := make(chan struct{})
+	errCh := make(chan error, 1)
 	var runErr error
 	var wg sync.WaitGroup
 	t.Cleanup(func() {
@@ -816,23 +814,17 @@ func TestMoveWithVarcharPK(t *testing.T) {
 			t.Error("move runner did not stop during cleanup")
 		}
 	})
-	go func() { runErr = runner.Run(ctx); close(done) }()
+	go func() { runErr = runner.Run(ctx); errCh <- runErr; close(done) }()
 
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for runner.status.Get() != status.WaitingOnSentinelTable {
-		select {
-		case <-done:
-			t.Fatalf("move exited before sentinel wait: %v", runErr)
-		case <-ctx.Done():
-			t.Fatalf("waiting for sentinel (state %s): %v", runner.status.Get(), ctx.Err())
-		case <-ticker.C:
-		}
-	}
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
 
 	var writeCount, errorCount atomic.Int64
 	// Four finite writers keep concurrent FIFO apply coverage while guaranteeing
-	// a quiet source for the final drain. Pacing keeps their binlog load bounded.
+	// a quiet source for the final drain (#834). Unbounded writers can produce
+	// binlog faster than a slow CI reader drains it, preventing catch-up forever.
+	// The finite count guarantees convergence; pacing also limits peak pressure.
+	writeCtx, cancelWrites := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancelWrites()
 	const writers, iterations = 4, 25
 	for range writers {
 		wg.Go(func() {
@@ -840,11 +832,11 @@ func TestMoveWithVarcharPK(t *testing.T) {
 			defer pace.Stop()
 			for range iterations {
 				select {
-				case <-ctx.Done():
+				case <-writeCtx.Done():
 					return
 				case <-pace.C:
 				}
-				if err := varcharPKWriteOne(ctx, sourceDB, srcDB); err != nil {
+				if err := varcharPKWriteOne(writeCtx, sourceDB, srcDB); err != nil {
 					errorCount.Add(1)
 				} else {
 					writeCount.Add(1)
@@ -855,12 +847,14 @@ func TestMoveWithVarcharPK(t *testing.T) {
 	wg.Wait()
 	require.Equal(t, int64(0), errorCount.Load())
 	require.Equal(t, int64(writers*iterations), writeCount.Load(), "the test must execute its concurrent write workload")
+	drainCtx, cancelDrain := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancelDrain()
 	testutils.RunSQL(t, "DROP TABLE "+dstDB+"."+sentinel.TableName)
 	select {
 	case <-done:
 		require.NoError(t, runErr, "move on VARCHAR PK table must succeed (issue #607)")
-	case <-ctx.Done():
-		t.Fatalf("move did not finish after finite writes (state %s): %v", runner.status.Get(), ctx.Err())
+	case <-drainCtx.Done():
+		t.Fatalf("move did not finish within the final drain budget (state %s): %v", runner.status.Get(), drainCtx.Err())
 	}
 
 	// Source/target row counts must match. The internal checksum step inside

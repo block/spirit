@@ -410,17 +410,7 @@ func TestShardedMoveVindexUpdateFails(t *testing.T) {
 
 	// Wait until the move blocks on the sentinel: the copy and the initial
 	// checksum are done and the repl client is streaming.
-	deadline := time.Now().Add(2 * time.Minute)
-	for runner.status.Get() != status.WaitingOnSentinelTable {
-		select {
-		case err := <-errCh:
-			t.Fatalf("move finished before reaching the sentinel wait: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the move to reach the sentinel wait")
-		}
-	}
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
 
 	// Change the vindex value of a row. The change feed must treat this as
 	// fatal and cancel the move.

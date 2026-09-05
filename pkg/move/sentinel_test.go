@@ -68,17 +68,7 @@ func TestMoveSentinelDropReleasesCutover(t *testing.T) {
 	go func() { errCh <- runner.Run(context.Background()) }()
 
 	// Wait until the move is blocked on the sentinel.
-	deadline := time.Now().Add(60 * time.Second)
-	for runner.status.Get() != status.WaitingOnSentinelTable {
-		select {
-		case err := <-errCh:
-			t.Fatalf("move finished before reaching the sentinel wait: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the move to reach the sentinel wait")
-		}
-	}
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
 
 	// Drop the sentinel on targets[0] to release the cutover.
 	testutils.RunSQL(t, "DROP TABLE sentrel_dst."+sentinel.TableName)
