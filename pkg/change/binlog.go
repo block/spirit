@@ -1423,6 +1423,12 @@ func (c *binlogClient) runPeriodicFlush(ctx context.Context, interval time.Durat
 // The default timeout is 10 seconds, after which an error will be returned.
 // Satisfies Source interface.
 func (c *binlogClient) BlockWait(ctx context.Context) error {
+	return c.blockWait(ctx, DefaultTimeout)
+}
+
+// blockWait accepts a budget so timeout diagnostics can be exercised without a
+// thirty-second test or mutation of shared configuration.
+func (c *binlogClient) blockWait(ctx context.Context, timeout time.Duration) error {
 	targetPos, err := c.getCurrentBinlogPosition(ctx)
 	if err != nil {
 		return err
@@ -1440,7 +1446,7 @@ func (c *binlogClient) BlockWait(ctx context.Context) error {
 		logCatchUp = c.logger.Info
 	}
 	logCatchUp("waiting to catch up to source position", "target_position", targetPos, "current_position", bufferedPos)
-	timer := time.NewTimer(DefaultTimeout)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
 
 	prevPos := c.getBufferedPos()
@@ -1450,7 +1456,7 @@ func (c *binlogClient) BlockWait(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
+			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v, started at: %v; %s", targetPos, c.getBufferedPos(), bufferedPos, catchUpDiagnostics(c.subs.Snapshot()))
 		default:
 			currPos := c.getBufferedPos()
 			if stalls.observe(prevPos, currPos) {
