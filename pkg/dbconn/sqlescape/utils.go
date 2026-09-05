@@ -26,9 +26,20 @@ import (
 )
 
 func reserveBuffer(buf []byte, appendSize int) []byte {
+	maxInt := int(^uint(0) >> 1)
+	if appendSize < 0 || appendSize > maxInt-len(buf) {
+		panic("sqlescape: buffer size overflow")
+	}
 	newSize := len(buf) + appendSize
 	if cap(buf) < newSize {
-		newBuf := make([]byte, len(buf)*2+appendSize)
+		// Preserve the historical doubling growth strategy when it is safe, but
+		// skip the extra capacity when doubling would overflow int. newSize
+		// itself was checked above.
+		newCapacity := newSize
+		if len(buf) <= maxInt-newSize {
+			newCapacity += len(buf)
+		}
+		newBuf := make([]byte, newCapacity)
 		copy(newBuf, buf)
 		buf = newBuf
 	}
@@ -38,6 +49,10 @@ func reserveBuffer(buf []byte, appendSize int) []byte {
 // escapeBytesBackslash will escape []byte into the buffer, with backslash.
 func escapeBytesBackslash(buf []byte, v []byte) []byte {
 	pos := len(buf)
+	maxInt := int(^uint(0) >> 1)
+	if len(v) > maxInt/2 {
+		panic("sqlescape: buffer size overflow")
+	}
 	buf = reserveBuffer(buf, len(v)*2)
 
 	for _, c := range v {

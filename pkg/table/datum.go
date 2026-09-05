@@ -163,7 +163,7 @@ func datumValFromString(val string, tp datumTp) (any, error) {
 		return strconv.ParseUint(val, 10, 64)
 	case binaryType:
 		// Binary types are hex-encoded ("0x...") in checkpoint JSON via
-		// jsonQuoteDatum, except the empty value, which is serialized as
+		// jsonDatumString, except the empty value, which is serialized as
 		// x'' (there is no zero-digit 0x literal). Decode both back to a
 		// Go string holding the raw bytes: Datum.Val stores binary values
 		// as string, never []byte.

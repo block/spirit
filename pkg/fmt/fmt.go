@@ -29,7 +29,6 @@ import (
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -124,35 +123,41 @@ func formatFile(ctx context.Context, db *sql.DB, path string) (bool, error) {
 }
 
 // parseAndPrepare parses the SQL, validates it is exactly one CREATE TABLE
-// statement, and returns the table name and the SQL to execute. If the
+// statement, and returns the table name, SQL to execute, and whether MySQL's
+// instance-specific AUTO_INCREMENT counter must be reset after creation. If the
 // statement includes a database qualifier (e.g., CREATE TABLE mydb.mytable),
 // it is stripped so the table is created in the connected working database.
 // This also prevents SQL injection since only parsed CREATE TABLE statements
 // are accepted.
-func parseAndPrepare(createSQL string) (tableName string, execSQL string, err error) {
+func parseAndPrepare(createSQL string) (tableName string, execSQL string, resetAutoIncrement bool, err error) {
 	ct, err := statement.ParseCreateTable(createSQL)
 	if err != nil {
-		return "", "", fmt.Errorf("not a valid CREATE TABLE statement: %w", err)
+		return "", "", false, fmt.Errorf("not a valid CREATE TABLE statement: %w", err)
 	}
 
 	tableName = ct.TableName
+	for _, opt := range ct.Raw.Options {
+		if opt.Tp == ast.TableOptionAutoIncrement {
+			resetAutoIncrement = true
+			break
+		}
+	}
 
-	// If there's a schema qualifier, strip it by clearing the schema on the
-	// AST and restoring to SQL. Otherwise use the original SQL directly to
-	// avoid any formatting changes from the parser's Restore.
+	// Restore only when stripping a schema qualifier. In the common case the
+	// exact input is sent to MySQL, including every literal and table option.
 	if ct.Raw.Table.Schema.L != "" {
 		ct.Raw.Table.Schema = ast.CIStr{}
 		var sb strings.Builder
 		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
 		if err := ct.Raw.Restore(rCtx); err != nil {
-			return "", "", fmt.Errorf("failed to restore CREATE TABLE: %w", err)
+			return "", "", false, fmt.Errorf("failed to restore CREATE TABLE: %w", err)
 		}
 		execSQL = sb.String()
 	} else {
 		execSQL = createSQL
 	}
 
-	return tableName, execSQL, nil
+	return tableName, execSQL, resetAutoIncrement, nil
 }
 
 // canonicalize takes a CREATE TABLE statement, applies it to MySQL, reads it
@@ -164,7 +169,7 @@ func parseAndPrepare(createSQL string) (tableName string, execSQL string, err er
 // Any database qualifier is stripped. This prevents SQL injection since only
 // valid CREATE TABLE statements are executed against the MySQL server.
 func canonicalize(ctx context.Context, db *sql.DB, createStmt string) (string, error) {
-	tableName, execSQL, err := parseAndPrepare(createStmt)
+	tableName, execSQL, resetAutoIncrement, err := parseAndPrepare(createStmt)
 	if err != nil {
 		return "", err
 	}
@@ -180,6 +185,14 @@ func canonicalize(ctx context.Context, db *sql.DB, createStmt string) (string, e
 	if _, err := db.ExecContext(ctx, execSQL); err != nil {
 		return "", fmt.Errorf("failed to create table: %w", err)
 	}
+	// Keep all table options and literals intact while applying the input. An
+	// empty table reports no instance-specific counter after resetting it to
+	// the initial value, so SHOW CREATE produces the desired canonical schema.
+	if resetAutoIncrement {
+		if _, err := db.ExecContext(ctx, sqlescape.MustEscapeSQL("ALTER TABLE %n AUTO_INCREMENT = 1", tableName)); err != nil {
+			return "", fmt.Errorf("failed to reset AUTO_INCREMENT counter: %w", err)
+		}
+	}
 
 	// Read back the canonical form via SHOW CREATE TABLE.
 	var tbl, canonical string
@@ -192,9 +205,7 @@ func canonicalize(ctx context.Context, db *sql.DB, createStmt string) (string, e
 		return "", fmt.Errorf("failed to drop table: %w", err)
 	}
 
-	// Strip AUTO_INCREMENT since it's instance-specific.
-	// Ensure trailing newline.
-	canonical = table.StripAutoIncrement(canonical)
+	// Ensure a trailing newline.
 	canonical = strings.TrimRight(canonical, "\n") + "\n"
 	return canonical, nil
 }

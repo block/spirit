@@ -13,8 +13,15 @@ import (
 	"github.com/block/spirit/pkg/utils"
 )
 
+// TargetStateCheckName is the registered name of the target-state check —
+// the one post-setup check that validates target-side state (tables absent,
+// or empty with a matching schema) and therefore the only one that wiping
+// the target can cure. The runner's --force path excludes it (via
+// RunChecksExcluding) when deciding whether a wipe would actually help.
+const TargetStateCheckName = "target_state"
+
 func init() {
-	registerCheck("target_state", targetStateCheck, ScopePostSetup)
+	registerCheck(TargetStateCheckName, targetStateCheck, ScopePostSetup)
 }
 
 // targetStateCheck validates that target databases are ready for the move operation.

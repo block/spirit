@@ -141,6 +141,15 @@ func TestLoadSchemaFromDB_StripAutoIncrement(t *testing.T) {
 	require.Contains(t, tables[0].Schema, "AUTO_INCREMENT")
 }
 
+func TestStripAutoIncrementPreservesLiterals(t *testing.T) {
+	stmt := "CREATE TABLE `counter` (`id` bigint AUTO_INCREMENT PRIMARY KEY, `value` varchar(255) DEFAULT 'AUTO_INCREMENT=42') ENGINE=InnoDB AUTO_INCREMENT=123 COMMENT='keep AUTO_INCREMENT=999'"
+	got := StripAutoIncrement(stmt)
+	require.NotContains(t, got, "AUTO_INCREMENT=123")
+	require.Contains(t, got, "AUTO_INCREMENT=42")
+	require.Contains(t, got, "AUTO_INCREMENT=999")
+	require.Contains(t, got, "`id` BIGINT AUTO_INCREMENT")
+}
+
 func TestLoadSchemaFromDB_CombinedFilters(t *testing.T) {
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (

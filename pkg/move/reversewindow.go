@@ -55,11 +55,10 @@ func targetCurrentPosition(ctx context.Context, r *Runner, tgt *applier.Target) 
 	return src.CurrentPosition(ctx)
 }
 
-// captureReverseWindow runs as the cutover postSwitch hook (under the source
-// lock, after the traffic switch, before the source rename). It records each
-// target's current position — the reverse feeds' start points — and persists
-// that the move has entered its reverse window. The background checkpoint
-// dumper has already been stopped, so this write is authoritative.
+// captureReverseWindow runs under the source locks after the final forward
+// flush, before switching traffic. They are the reverse feeds' start points,
+// so writes committed during the switch are included when those feeds start.
+// On a safe cutover retry they are recaptured after the new final flush.
 func captureReverseWindow(ctx context.Context, r *Runner) error {
 	positions := make(map[string]string, len(r.targets))
 	for i := range r.targets {
@@ -70,9 +69,15 @@ func captureReverseWindow(ctx context.Context, r *Runner) error {
 		positions[targetKey(r.targets[i])] = pos
 	}
 	r.reversePositions = positions
-	r.cutoverAt = time.Now()
+	return nil
+}
 
-	posJSON, err := json.Marshal(positions)
+// persistReverseWindow runs after the traffic switch and before retiring the
+// source. The background checkpoint dumper is already stopped, so this write
+// is authoritative. The window duration starts when the switch completes.
+func persistReverseWindow(ctx context.Context, r *Runner) error {
+	r.cutoverAt = time.Now()
+	posJSON, err := json.Marshal(r.reversePositions)
 	if err != nil {
 		return fmt.Errorf("marshal reverse positions: %w", err)
 	}

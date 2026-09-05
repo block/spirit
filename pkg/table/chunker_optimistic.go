@@ -651,7 +651,11 @@ func (t *chunkerOptimistic) GetLowWatermark() (string, error) {
 		return "", ErrWatermarkNotReady
 	}
 
-	return t.watermark.JSON(), nil
+	watermark, err := t.watermark.marshalJSON()
+	if err != nil {
+		return "", fmt.Errorf("could not serialize watermark: %w", err)
+	}
+	return watermark, nil
 }
 
 func (t *chunkerOptimistic) open() (err error) {

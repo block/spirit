@@ -379,8 +379,12 @@ func (t *chunkerComposite) GetLowWatermark() (string, error) {
 	// into the watermark. This is because progress is determined
 	// based on rowsCopied / estimatedRows (not based on logical
 	// key space).
+	chunkJSON, err := t.watermark.marshalJSON()
+	if err != nil {
+		return "", fmt.Errorf("could not serialize chunk watermark: %w", err)
+	}
 	watermark := compositeWatermark{
-		ChunkJSON:  t.watermark.JSON(),
+		ChunkJSON:  chunkJSON,
 		RowsCopied: atomic.LoadUint64(&t.rowsCopied),
 	}
 	// Serialize to JSON

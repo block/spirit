@@ -3,9 +3,11 @@ package datasync
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,7 +58,8 @@ type sourceInfo struct {
 // Runner executes a Sync: an initial copy followed by continuous
 // replication that runs until the context is cancelled.
 type Runner struct {
-	sync *Sync
+	sourceUUID string // server owning file:position checkpoints
+	sync       *Sync
 
 	source sourceInfo
 	target applier.Target
@@ -302,6 +305,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		r.target = applier.Target{KeyRange: "0", DB: tdb, Config: tcfg}
 		r.ownsTarget = true
+	}
+
+	if err := dbconn.RequireDifferentDatabase(ctx, r.source.db, r.target.DB); err != nil {
+		return err
 	}
 
 	if err := r.setup(ctx); err != nil {
@@ -647,12 +654,38 @@ func (r *Runner) setup(ctx context.Context) error {
 	r.applier = appl
 	r.progMu.Unlock()
 
+	// File:position coordinates belong to the MySQL server that wrote them.
+	// An injected change source owns its own identity and position semantics.
+	if r.sync.Source == nil {
+		if err := r.source.db.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&r.sourceUUID); err != nil {
+			return fmt.Errorf("failed to read @@server_uuid from the source: %w", err)
+		}
+	}
+	if r.sync.Force {
+		if err := r.forceFreshTarget(ctx); err != nil {
+			return err
+		}
+	}
+
 	// Read any checkpoint before wiring the change source: the saved position's
 	// encoding decides which built-in client a resumed sync gets (see
 	// change.NewAutoClient), so the read has to come first.
-	watermark, pos, hasCheckpoint, err := r.readCheckpoint(ctx)
+	watermark, rawPos, hasCheckpoint, err := r.readCheckpoint(ctx)
 	if err != nil {
 		return err
+	}
+
+	pos := rawPos
+	if hasCheckpoint {
+		// An entirely empty first checkpoint is safe: the copier restarts from
+		// the beginning and the feed starts before it. Once copy progress exists,
+		// an empty stream position would leave a gap and must fail closed.
+		if watermark != "" || rawPos != "" {
+			pos, err = r.resolveResumePosition(rawPos)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	// Wire the change source: injected (e.g. VStream),
@@ -794,25 +827,6 @@ func (r *Runner) ensureTargetDatabase(ctx context.Context, cfg *mysql.Config) er
 		return fmt.Errorf("failed to connect to target server to ensure database: %w", err)
 	}
 	defer utils.CloseAndLog(adminDB)
-	// Force: drop and recreate the target database unless a resumable
-	// checkpoint exists. We do this here, on the admin connection (no database
-	// selected) and before r.target.DB is ever queried, so no live connection
-	// has the database selected when it's dropped. A resumable run is left
-	// intact and resumes as normal.
-	if r.sync.Force {
-		resumable, rerr := r.forceTargetResumable(ctx, adminDB, cfg)
-		if rerr != nil {
-			return rerr
-		}
-		if resumable {
-			r.logger.Info("force set, but a resumable checkpoint exists; keeping target and resuming", "database", cfg.DBName)
-		} else {
-			r.logger.Warn("force set and no resumable checkpoint; dropping and recreating target database", "database", cfg.DBName)
-			if err := dbconn.Exec(ctx, adminDB, "DROP DATABASE IF EXISTS %n", cfg.DBName); err != nil {
-				return fmt.Errorf("failed to drop target database %q: %w", cfg.DBName, err)
-			}
-		}
-	}
 	if err := dbconn.Exec(ctx, adminDB, "CREATE DATABASE IF NOT EXISTS %n", cfg.DBName); err != nil {
 		return fmt.Errorf("failed to create target database %q: %w", cfg.DBName, err)
 	}
@@ -820,36 +834,46 @@ func (r *Runner) ensureTargetDatabase(ctx context.Context, cfg *mysql.Config) er
 	return nil
 }
 
-// forceTargetResumable reports whether the target holds a resumable checkpoint,
-// for the --force decision. The checkpoint package keys on the connection's
-// selected schema, but --force runs on a no-database admin connection before
-// r.target.DB is opened — so this confirms the database exists (via the admin
-// connection) and then opens a short-lived connection *to* that schema to
-// inspect the checkpoint. A missing database is trivially not resumable.
-func (r *Runner) forceTargetResumable(ctx context.Context, adminDB *sql.DB, cfg *mysql.Config) (bool, error) {
-	var present int
-	err := adminDB.QueryRowContext(ctx,
-		"SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?", cfg.DBName).Scan(&present)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil // no target database yet → nothing to resume
-	}
+// forceFreshTarget implements --force: when the target cannot resume, wipe the
+// sync-owned objects — the target copies of the source tables plus the sync
+// checkpoint table — so the run starts fresh instead of tripping the
+// fresh-sync target-empty guard. A resumable target (checkpoint with a copier
+// watermark) is kept untouched and resumes as normal.
+//
+// The wipe is deliberately per-object, mirroring move's wipeTargets, never
+// DROP DATABASE: sync's own fresh-run model tolerates a target database shared
+// with unrelated tables (checkTargetEmpty only ever validates tables named
+// after source tables), so --force must not destroy tables the sync never
+// owned. Dropping the checkpoint table erases the resume signal, so the
+// subsequent readCheckpoint sees a fresh target.
+func (r *Runner) forceFreshTarget(ctx context.Context) error {
+	resumable, err := r.hasResumableCheckpoint(ctx)
 	if err != nil {
-		return false, fmt.Errorf("failed to check for target database: %w", err)
+		return err
 	}
-	schemaDB, err := dbconn.New(cfg.FormatDSN(), r.targetDBConfig)
-	if err != nil {
-		return false, fmt.Errorf("failed to connect to target database to check for a checkpoint: %w", err)
+	if resumable {
+		r.logger.Info("force set, but a resumable checkpoint exists; keeping target and resuming", "database", r.target.Config.DBName)
+		return nil
 	}
-	defer utils.CloseAndLog(schemaDB)
-	return r.hasResumableCheckpoint(ctx, schemaDB)
+	r.logger.Warn("force set and no resumable checkpoint; dropping the sync's target tables for a fresh start",
+		"database", r.target.Config.DBName)
+	for _, t := range r.sourceTables {
+		if err := dbconn.Exec(ctx, r.target.DB, "DROP TABLE IF EXISTS %n.%n", r.target.Config.DBName, t.TableName); err != nil {
+			return fmt.Errorf("force: failed to drop target table %q: %w", t.TableName, err)
+		}
+	}
+	if err := r.checkpointTbl().Drop(ctx); err != nil {
+		return fmt.Errorf("force: failed to drop checkpoint table: %w", err)
+	}
+	return nil
 }
 
-// hasResumableCheckpoint reports whether db's selected schema holds a sync
-// checkpoint that can be resumed from (a row carrying a copier watermark). db
-// must be connected to the target schema (the checkpoint package keys on
-// DATABASE()).
-func (r *Runner) hasResumableCheckpoint(ctx context.Context, db *sql.DB) (bool, error) {
-	tbl := checkpoint.NewTable(db, syncCheckpointTableName, checkpoint.Persistent)
+// hasResumableCheckpoint reports whether the target holds a sync checkpoint
+// that can be resumed from (a row carrying a copier watermark). Used by
+// --force to decide between resuming and wiping the sync-owned tables for a
+// fresh start.
+func (r *Runner) hasResumableCheckpoint(ctx context.Context) (bool, error) {
+	tbl := r.checkpointTbl()
 	exists, err := tbl.Exists(ctx)
 	if err != nil {
 		return false, fmt.Errorf("failed to check for checkpoint table: %w", err)
@@ -868,7 +892,18 @@ func (r *Runner) hasResumableCheckpoint(ctx context.Context, db *sql.DB) (bool, 
 	if err != nil {
 		return false, fmt.Errorf("failed to read checkpoint: %w", err)
 	}
-	return rec.CopierWatermark != "", nil
+	if rec.CopierWatermark == "" {
+		return false, nil
+	}
+	// A checkpoint whose position resume would refuse — recorded on a
+	// different source server, or lacking the identity needed to verify it —
+	// is not resumable either: --force should wipe and start fresh rather
+	// than resume into the same hard error.
+	if _, perr := r.resolveResumePosition(rec.Position); perr != nil {
+		r.logger.Warn("force: checkpoint exists but cannot be resumed against this source; treating as non-resumable", "reason", perr)
+		return false, nil
+	}
+	return true, nil
 }
 
 // createTargetTables creates each source table on the target using the
@@ -1195,11 +1230,13 @@ func (r *Runner) startResume(ctx context.Context, watermark, pos string) error {
 }
 
 // startResumeChangeSource disables copy-time filtering and opens the change
-// source at the checkpointed position. A checkpoint can have copy progress but
-// no stream position (notably legacy copy-only checkpoints); those must start
-// at the current head, leaving the continuous checksum to repair changes made
-// since the checkpoint.
+// source at the checkpointed position. Copy progress without a stream position
+// fails closed because starting at the current head would leave an unbounded
+// gap for the checksum to discover later.
 func (r *Runner) startResumeChangeSource(ctx context.Context, watermark, pos string) error {
+	if watermark != "" && pos == "" {
+		return errors.New("checkpoint has copy progress but no saved change-feed position; refusing an unsafe resume")
+	}
 	if err := r.replClient.SetWatermarkOptimization(ctx, false); err != nil {
 		return err
 	}
@@ -1213,12 +1250,7 @@ func (r *Runner) startResumeChangeSource(ctx context.Context, watermark, pos str
 		return nil
 	}
 
-	if watermark != "" {
-		r.logger.Warn("checkpoint has copy progress but no change-stream position; starting the stream at the current source head, so the target may be stale until the continuous checksum repairs changes made since the checkpoint",
-			"watermark", watermark)
-	} else {
-		r.logger.Info("checkpoint has no copy watermark or change-stream position; starting the stream at the current source head")
-	}
+	r.logger.Info("checkpoint has no copy watermark or change-stream position; starting the stream at the current source head")
 	if err := r.replClient.Start(streamCtx); err != nil {
 		return fmt.Errorf("failed to start change source: %w", err)
 	}
@@ -1231,6 +1263,100 @@ func (r *Runner) startResumeChangeSource(ctx context.Context, watermark, pos str
 // It always lives on the target because the source may be read-only.
 func (r *Runner) checkpointTbl() *checkpoint.Table {
 	return checkpoint.NewTable(r.target.DB, syncCheckpointTableName, checkpoint.Persistent)
+}
+
+// syncPositionFormatVersion tags the JSON payload datasync stores in the
+// checkpoint's position column, so a resume can tell the structured payload
+// apart from a legacy bare position string (or an injected source's opaque
+// position that happens to look like JSON).
+const syncPositionFormatVersion = 1
+
+// syncPosition is the payload datasync persists in the checkpoint's Position
+// field: the change source's opaque position, wrapped with the identity of the
+// source server it was observed on.
+//
+// The identity matters because a binlog file:pos position is only meaningful
+// on the server that wrote it: binlog file names are sequential on every
+// server, so after an Aurora/RDS failover behind a stable endpoint, a replica
+// promotion, or a rebuilt source, a file with the checkpointed NAME usually
+// exists on the new server too — and StartFromPosition would succeed there,
+// silently skipping or replaying the wrong events. @@server_uuid changes
+// across all of those transitions, so recording it lets resume hard-fail
+// instead. GTID positions are globally unique and don't need this (see
+// resolveResumePosition). SourceAddr is recorded for diagnostics only: an
+// address can legitimately stay stable across a failover, which is exactly
+// why it cannot be the identity.
+type syncPosition struct {
+	Version    int    `json:"v"`
+	Position   string `json:"position"`
+	ServerUUID string `json:"server_uuid,omitempty"`
+	SourceAddr string `json:"source_addr,omitempty"`
+}
+
+// encodeSyncPosition wraps a change-feed position and the source identity into
+// the JSON payload stored in the checkpoint.
+func encodeSyncPosition(pos, serverUUID, sourceAddr string) (string, error) {
+	b, err := json.Marshal(syncPosition{
+		Version:    syncPositionFormatVersion,
+		Position:   pos,
+		ServerUUID: serverUUID,
+		SourceAddr: sourceAddr,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to encode checkpoint position: %w", err)
+	}
+	return string(b), nil
+}
+
+// decodeSyncPosition parses a persisted checkpoint position. ok reports
+// whether raw carried the structured identity payload; when false, raw is a
+// legacy (pre-identity) or externally-produced bare position, returned
+// verbatim as the Position with no identity attached. Strict decoding
+// (unknown fields rejected + version check) keeps an injected source's opaque
+// position from being misread as our payload even if it is JSON.
+func decodeSyncPosition(raw string) (pos syncPosition, ok bool) {
+	if !strings.HasPrefix(strings.TrimSpace(raw), "{") || !json.Valid([]byte(raw)) {
+		return syncPosition{Position: raw}, false
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var p syncPosition
+	if err := dec.Decode(&p); err != nil || p.Version != syncPositionFormatVersion {
+		return syncPosition{Position: raw}, false
+	}
+	return p, true
+}
+
+// resolveResumePosition unwraps a persisted checkpoint position and, for the
+// built-in file:pos change source, verifies it was recorded against the server
+// we are about to resume from (see syncPosition for why file:pos positions are
+// not portable across servers). On a mismatch — or when the checkpoint
+// predates identity recording, making it unverifiable — it returns an error
+// rather than risking a silent skip/mis-replay. GTID positions are globally
+// unique (a failed-over server rejects a set it doesn't contain), and an
+// injected change.Source owns its own position semantics; both skip
+// verification and just unwrap.
+func (r *Runner) resolveResumePosition(rawPos string) (string, error) {
+	payload, hasIdentity := decodeSyncPosition(rawPos)
+	if payload.Position == "" {
+		return "", errors.New("checkpoint carries no saved change-feed position, so continuous sync cannot safely resume without missing source writes; re-run with --force to discard it and start a fresh sync")
+	}
+	if r.sync.Source != nil || change.IsGTIDPosition(payload.Position) {
+		return payload.Position, nil
+	}
+	if !hasIdentity {
+		return "", fmt.Errorf("checkpoint position %q carries no source identity (it was written by an older spirit version), so it cannot be verified to belong to the current source server; re-run with --force to discard it and start a fresh sync",
+			payload.Position)
+	}
+	if payload.ServerUUID == "" {
+		return "", fmt.Errorf("checkpoint position %q was recorded without a source server identity (for example by an injected change source), so the built-in file-position reader cannot verify it belongs to the current source server; re-run with --force to discard it and start a fresh sync",
+			payload.Position)
+	}
+	if !strings.EqualFold(payload.ServerUUID, r.sourceUUID) {
+		return "", fmt.Errorf("checkpoint position %q was recorded on a different source server (checkpoint server_uuid=%s addr=%s; current source server_uuid=%s addr=%s): a binlog file:position is only valid on the server that wrote it, and resuming here would silently skip or replay the wrong changes (typical after a failover, replica promotion, or source rebuild). Re-run with --force to discard the checkpoint and start a fresh sync",
+			payload.Position, payload.ServerUUID, payload.SourceAddr, r.sourceUUID, r.source.config.Addr)
+	}
+	return payload.Position, nil
 }
 
 // dumpCheckpoint records the copier's low watermark (so a partial copy can
@@ -1258,9 +1384,17 @@ func (r *Runner) dumpCheckpoint(ctx context.Context) error {
 	if repl != nil {
 		pos = repl.Position()
 	}
+	var addr string
+	if r.source.config != nil {
+		addr = r.source.config.Addr
+	}
+	posPayload, err := encodeSyncPosition(pos, r.sourceUUID, addr)
+	if err != nil {
+		return err
+	}
 	if err := r.checkpointTbl().Write(ctx, checkpoint.Record{
 		CopierWatermark: watermark,
-		Position:        pos,
+		Position:        posPayload,
 	}); err != nil {
 		return err
 	}
