@@ -107,6 +107,11 @@ type Runner struct {
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
 	sourceTableMap map[string]bool    // used when only some tables are to be moved.
 
+	throttlerMu sync.RWMutex
+	throttler   throttler.Throttler
+	monitorDBs  []*sql.DB
+	autoscale   copier.AutoscaleConfig
+
 	applier           applier.Applier
 	copyChunker       table.Chunker
 	checksumChunker   table.Chunker
@@ -207,7 +212,7 @@ func NewRunner(m *Move) (*Runner, error) {
 		m.TargetChunkSize = table.DefaultTargetChunkBytes
 	}
 	// WriteThreads has no "0 means auto" meaning any more, so fill in the Kong
-	// default; move does not autoscale, so nothing downstream would. Non-positive
+	// default before optional instance-derived autoscaling is resolved. Non-positive
 	// rather than zero: MaxOpenConnections is Threads + WriteThreads + 2 below, and
 	// a negative count would make that negative, which SetMaxOpenConns reads as
 	// *unlimited*. Warn on an explicit 0, which used to mean "size from the
@@ -264,6 +269,12 @@ func (r *Runner) Close() error {
 	// rest, leaking the remaining repl clients' binlog reader goroutines
 	// and the target DB handles.
 	var errs []error
+	if r.throttler != nil {
+		errs = append(errs, r.throttler.Close())
+	}
+	for _, db := range r.monitorDBs {
+		errs = append(errs, db.Close())
+	}
 	if r.copyChunker != nil {
 		if err := r.copyChunker.Close(); err != nil {
 			errs = append(errs, err)
@@ -532,7 +543,8 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.throttler,
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
@@ -642,10 +654,13 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 // lock before it can destroy the first run's target data.
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
+	if err := r.setupAutoscaling(ctx); err != nil {
+		return err
+	}
 
 	// Grow connection pools to cover both the copy (read) threads and the apply
 	// (write) threads, in case the pool set before connecting was smaller.
-	if poolSize := r.move.Threads + r.move.WriteThreads + 2; poolSize > r.dbConfig.MaxOpenConnections {
+	if poolSize := max(r.move.Threads, r.autoscale.MaxReadThreads) + max(r.move.WriteThreads, r.autoscale.MaxThreads) + 2; poolSize > r.dbConfig.MaxOpenConnections {
 		r.dbConfig.MaxOpenConnections = poolSize
 		for i := range r.sources {
 			dbconn.SetPoolSize(r.sources[i].db, poolSize)
@@ -942,6 +957,7 @@ func (r *Runner) buildReplClients(ctx context.Context, resumePositions map[strin
 		replConfig.DDLFilterSchema = src.config.DBName
 		replConfig.DDLFilterTables = r.move.SourceTables
 		replConfig.DBConfig = r.dbConfig
+		replConfig.UnderLoad = func() bool { return throttler.GradualOnly(r.currentThrottler()).IsThrottled() }
 		client, err := change.NewAutoClient(ctx, src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig, resumePositions[src.sourceKey()])
 		if err != nil {
 			return fmt.Errorf("source %d: %w", i, err)
@@ -1031,7 +1047,8 @@ func (r *Runner) newCopy(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.throttler,
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
@@ -1648,13 +1665,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag, exclude .
 func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 	r.logger.Info("Checking for deferred secondary indexes to restore")
 
-	// Group targets by hostname to enable parallel processing across different hosts
-	// while avoiding overloading any single MySQL instance
-	hostGroups := make(map[string][]int) // hostname -> []targetIdx
-	for idx, target := range r.targets {
-		host := target.Config.Addr // e.g., "host:3306"
-		hostGroups[host] = append(hostGroups[host], idx)
-	}
+	hostGroups := r.targetHosts()
 
 	r.logger.Info("Parallelizing index restoration across hosts",
 		"hostCount", len(hostGroups),
@@ -1662,10 +1673,9 @@ func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 
 	// Process each host group in parallel using errgroup
 	g, gctx := errgroup.WithContext(ctx)
-	for host, targetIndices := range hostGroups {
-		// Shadow loop variables to avoid closure capture issues.
+	for _, group := range hostGroups {
 		g.Go(func() error {
-			return r.restoreIndexesForTargets(gctx, host, targetIndices)
+			return r.restoreIndexesForTargets(gctx, group.Host.String(), group.Indices)
 		})
 	}
 
@@ -1842,6 +1852,9 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.throttler,
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 	})
 	if err != nil {
 		return err
@@ -1994,9 +2007,19 @@ func (r *Runner) Progress() status.Progress {
 		CurrentState: r.status.Get(),
 		Summary:      summary,
 		Resume:       r.usedResumeFromCheckpoint.Load(),
-		// Throttle is deliberately left zero: a move always copies through a
-		// Noop throttler, so there is nothing to report yet. Populate it here
-		// when move learns to throttle (issue #831).
+		Throttle:     r.throttleStatus(r.status.Get()),
+	}
+}
+
+// Only actively paced phases report paused status. Cutover and completed
+// runs must not appear throttled when the monitor's last sample ages out.
+func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
+	switch state { //nolint:exhaustive
+	case status.CopyRows, status.Checksum:
+		paused, reason, util := throttler.Describe(r.currentThrottler())
+		return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
+	default:
+		return status.ThrottleStatus{}
 	}
 }
 
@@ -2030,8 +2053,8 @@ func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 // the move is blocked in WaitingOnSentinelTable.
 //
 // The checker used here is separate from r.checker and uses a fresh chunker
-// so checkpoint state is unaffected. Single-threaded by design — checksum
-// throttling is tracked separately in github.com/block/spirit/issues/831.
+// so checkpoint state is unaffected. Single-threaded
+// in fixed mode; autoscaling uses the same host load signal as the initial pass.
 func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 	chunker, err := r.buildContinuousChunker()
 	if err != nil {
@@ -2049,14 +2072,16 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		feeds[i] = r.sources[i].replClient
 	}
 	checker, err := checksum.NewChecker(sourceDBs, chunker, feeds, &checksum.CheckerConfig{
-		// TODO(#831): once the throttler can size threads dynamically,
-		// replace the hard-coded 1 with the move's thread count.
+		// Keep the fixed-mode single worker; autoscaling can grow it on load feedback.
 		Concurrency:     1,
 		TargetChunkTime: table.ChunkerDefaultTarget,
 		DBConfig:        r.dbConfig,
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.throttler,
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 		// One pass per outer-loop iteration; the continuous-checksum
 		// loop itself supplies the retry, so we don't nest a second
 		// retry loop inside each iteration.

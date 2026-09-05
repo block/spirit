@@ -760,3 +760,27 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 	require.Equal(t, checksumSrc, checksumDst, "checksum mismatch between source and destination")
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS autoscale_src, autoscale_dst")
 }
+
+// A quiet shard must never mask another host's overload. Exercise the actual
+// composite signal and controller so the maximum (not an average) drives both
+// normal shedding and panic, then allows recovery once every host is quiet.
+func TestAutoScalerBusiestTarget(t *testing.T) {
+	var _ writeScaler = (*applier.ShardedApplier)(nil)
+	quiet, busy := &utilThrottler{}, &utilThrottler{}
+	quiet.setUtil(0.1)
+	busy.setUtil(1.2)
+	composite := throttler.NewMultiThrottler(quiet, busy)
+	signal, ok := composite.(throttler.GradualThrottler)
+	require.True(t, ok)
+	writer := &fakeScaler{n: 8}
+	controller := newAutoScaler(signal, writer, 8, 16, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n)
+	require.True(t, composite.IsThrottled())
+	busy.setUtil(0.1)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Greater(t, writer.n, 4)
+	require.False(t, composite.IsThrottled())
+}

@@ -23,6 +23,7 @@ This will copy all tables from the source database to the target database, verif
 - [target-dsn](#target-dsn)
 - [threads](#threads)
 - [write-threads](#write-threads)
+- [enable-experimental-autoscaling](#enable-experimental-autoscaling)
 
 ### checkpoint-max-age
 
@@ -157,7 +158,26 @@ How many chunks to copy in parallel from the source.
 
 How many concurrent write threads to use per target when inserting rows. This controls the fan-out parallelism of the buffered copier's write side.
 
-Move does not support the experimental thread autoscaling available in [`spirit migrate`](migrate.md#enable-experimental-autoscaling), so `--threads` and `--write-threads` are always honored here.
+These counts are overridden when [experimental autoscaling](#enable-experimental-autoscaling) engages.
+
+### enable-experimental-autoscaling
+
+- type: `bool`
+- default: `false`
+
+Derive copy, per-target write and checksum thread counts from Aurora target capacity and adjust them using load feedback:
+
+```sh
+spirit move --source-dsn=... --target-dsn=... --enable-experimental-autoscaling
+```
+
+For sharded moves, all write pools scale together using the **busiest target host's** utilization. A busy host slows the whole move; idle hosts do not offset its load. This conservative policy also handles skewed shard traffic, though it can leave capacity unused on quieter hosts.
+
+Targets sharing a host share one Aurora monitor. Initial counts and ceilings use the smallest target host and divide its budget by the largest number of target shards sharing a host, with at least one worker per shard. The client CPU budget also limits growth. Host identity includes the connection transport and address (including port), independently of database and credentials. Use consistent direct endpoints: DNS aliases and proxies are not resolved to physical hosts.
+
+Every target host must be Aurora with at least four vCPUs. Non-Aurora hosts, small instances or failed Aurora probes retain the configured fixed thread counts. Capacity-query and monitor-startup failures abort setup. Aurora monitoring uses thread utilization and a 100ms commit-latency backstop; stale signals pause copying. The initial and sentinel-wait checksums use the same load signal, and binlog draining narrows under load. Monitor connections are separate from the data pools.
+
+This flag is experimental, as it is for `migrate`. It applies to forward copying and checksums; the reverse window does not acquire new monitors for its write destinations.
 
 ## GTID auto-detection
 
