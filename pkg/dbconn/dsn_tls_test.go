@@ -392,9 +392,11 @@ func TestNewDSNTLSPreservation(t *testing.T) {
 				if tt.config.TLSMode == "REQUIRED" {
 					require.NotEmpty(t, resultCfg.TLSConfig, "Expected TLS config to be set")
 				}
-				// For DISABLED mode, verify that TLS was NOT added
+				// For DISABLED mode, verify that TLS was NOT added. The check
+				// is on the effective setting, not on TLSConfig being empty:
+				// DISABLED writes tls=false on purpose (see newDSN).
 				if tt.config.TLSMode == "DISABLED" {
-					require.Empty(t, resultCfg.TLSConfig, "TLS config should not be set when disabled")
+					require.Nil(t, resultCfg.TLS, "TLS should not be set when disabled")
 				}
 			}
 		})
