@@ -333,7 +333,7 @@ func (c *buffered) Run(ctx context.Context) error {
 
 // autoscalerIfEnabled returns the experimental dual read/write autoscaler to run
 // for this copy, or nil when it should not engage: autoscaling disabled, an
-// applier without dynamic scaling (ShardedApplier), or a throttler without a
+// applier without dynamic scaling, or a throttler without a
 // continuous load signal. Only GradualThrottler implementations (the Aurora
 // throttlers, or a multi-throttler containing one) provide that signal —
 // binary throttlers like replica lag protect via the hard-stop only, and

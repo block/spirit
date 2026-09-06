@@ -50,16 +50,11 @@ type SingleTargetApplier struct {
 	// Worker management. writeWorkersCount is the initial worker count, set at
 	// construction from ApplierConfig.Threads; the *live* count can change at
 	// runtime via SetWriteWorkers (driven by the copier's autoscaler). The
-	// fields below workerIDCounter are all guarded by scaleMu.
+	// resizable worker lifecycle is shared with ShardedApplier through workerPool.
 	writeWorkersCount int32        // initial worker count (start value)
 	workerIDCounter   atomic.Int32 // monotonic worker id, for debug logging only
 
-	scaleMu       sync.Mutex      // guards the worker pool: workerCtx, workerQuits, scalingClosed, and spawn/park
-	workerCtx     context.Context // ctx the workers run under; set in Start
-	workerQuits   []chan struct{} // one quit channel per live worker — closing one parks (exits) that worker
-	activeWorkers atomic.Int32    // current live worker count
-	scalingClosed bool            // set true when Stop begins, to block new spawns
-	workersWg     sync.WaitGroup  // tracks write workers only
+	workers workerPool
 
 	// timings is a rolling window of per-chunklet queue-wait and write
 	// durations, reported by Stats().
@@ -154,15 +149,6 @@ func (a *SingleTargetApplier) Start(ctx context.Context) error {
 	a.started = true
 	a.logger.Debug("starting SingleTargetApplier", "writeWorkers", a.writeWorkersCount)
 
-	// Reset the worker pool bookkeeping and record the context workers run
-	// under, so SetWriteWorkers can spawn more later.
-	a.scaleMu.Lock()
-	a.workerCtx = workerCtx
-	a.workerQuits = nil
-	a.activeWorkers.Store(0)
-	a.scalingClosed = false
-	a.scaleMu.Unlock()
-
 	// Start feedback coordinator before workers so completions are always
 	// drained.
 	a.wg.Add(1)
@@ -176,10 +162,7 @@ func (a *SingleTargetApplier) Start(ctx context.Context) error {
 		})
 	}
 
-	// Spawn the initial worker pool. SetWriteWorkers only takes scaleMu, so
-	// calling it while holding the main lock is safe (no lock nesting on the
-	// same mutex).
-	a.SetWriteWorkers(int(a.writeWorkersCount))
+	a.workers.start(workerCtx, int(a.writeWorkersCount), a.writeWorker)
 
 	return nil
 }
@@ -338,13 +321,7 @@ func (a *SingleTargetApplier) Stop() error {
 	// Release the lock before waiting for workers to finish
 	a.Unlock()
 
-	// Close scaling first and wait out any in-flight SetWriteWorkers, so no new
-	// worker is spawned (no workersWg.Add) after we begin shutdown. Acquiring
-	// scaleMu guarantees any concurrent scale call has finished its Adds before
-	// we Wait below.
-	a.scaleMu.Lock()
-	a.scalingClosed = true
-	a.scaleMu.Unlock()
+	a.workers.seal()
 
 	// Close the chunklet buffer to signal no more work. Workers blocked in their
 	// select see the closed buffer (ok == false) and return; workers mid-write
@@ -355,7 +332,7 @@ func (a *SingleTargetApplier) Stop() error {
 	// This is now the sole owner of that close — decoupled from worker count,
 	// which is what lets the count move at runtime. The coordinator drains any
 	// remaining completions and exits when the channel closes.
-	a.workersWg.Wait()
+	a.workers.wait()
 	close(a.chunkletCompletions)
 	a.wg.Wait()
 
@@ -372,45 +349,12 @@ func (a *SingleTargetApplier) Stop() error {
 // time it returns to its select (after finishing any chunklet currently in
 // flight), so no completion is ever lost.
 func (a *SingleTargetApplier) SetWriteWorkers(n int) {
-	if n < 1 {
-		n = 1
-	}
-	a.scaleMu.Lock()
-	defer a.scaleMu.Unlock()
-
-	// No-op before Start has recorded the worker context (the exported API may
-	// be called too early) or once Stop has begun shutting down. In both states
-	// we must not spawn workers: a nil workerCtx would panic the worker on its
-	// first writeChunklet (ctx.Err()), and post-shutdown spawns would race the
-	// workersWg.Wait() in Stop.
-	if a.workerCtx == nil || a.scalingClosed {
-		return
-	}
-
-	cur := len(a.workerQuits)
-	switch {
-	case n > cur:
-		for range n - cur {
-			quit := make(chan struct{})
-			a.workerQuits = append(a.workerQuits, quit)
-			a.activeWorkers.Add(1)
-			a.workersWg.Add(1)
-			go a.writeWorker(a.workerCtx, quit)
-		}
-		a.logger.Info("scaled write workers up", "from", cur, "to", n)
-	case n < cur:
-		// Park the most-recently-added workers by closing their quit channels.
-		for i := cur - 1; i >= n; i-- {
-			close(a.workerQuits[i])
-		}
-		a.workerQuits = a.workerQuits[:n]
-		a.logger.Info("scaled write workers down", "from", cur, "to", n)
-	}
+	a.workers.resize(n)
 }
 
 // ActiveWriteWorkers returns the current number of live write workers.
 func (a *SingleTargetApplier) ActiveWriteWorkers() int {
-	return int(a.activeWorkers.Load())
+	return a.workers.count()
 }
 
 // Stats returns a point-in-time snapshot of the write pipeline. The embedded
@@ -431,7 +375,7 @@ func (a *SingleTargetApplier) Stats() Stats {
 		QueueDepth:      queueDepth,
 		QueueCap:        queueCap,
 		PendingWork:     pending,
-		ActiveWorkers:   int(a.activeWorkers.Load()),
+		ActiveWorkers:   a.workers.count(),
 		RowsPerChunklet: a.splits.mean(),
 		QueueWaitP50:    t.queueWaitP50,
 		QueueWaitP90:    t.queueWaitP90,
@@ -447,8 +391,6 @@ func (a *SingleTargetApplier) Stats() Stats {
 // writeWorker processes chunklets from the buffer until either its quit channel
 // is closed (scale-down) or the buffer is closed by Stop().
 func (a *SingleTargetApplier) writeWorker(ctx context.Context, quit <-chan struct{}) {
-	defer a.workersWg.Done()
-	defer a.activeWorkers.Add(-1)
 	workerID := a.workerIDCounter.Add(1)
 
 	// Every chunklet that made it into the buffer was already registered in

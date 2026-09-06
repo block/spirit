@@ -42,6 +42,12 @@ func (r *Runner) fitReadThreadsToPools() error {
 	if start != r.move.Threads {
 		r.logger.Info("fitting read threads to the connection pool", "threads", start, "max_connections", r.move.MaxConnections, "reserved", reserve)
 	}
+	// Autoscaling can have a ceiling above its starting count. Checksum
+	// snapshots pin connections for that ceiling, so fit it as well without
+	// changing the fixed pool budget inherited from --max-connections.
+	if r.autoscale.Enabled {
+		r.autoscale.MaxReadThreads = min(max(r.move.Threads, r.autoscale.MaxReadThreads), available)
+	}
 	r.move.Threads = start
 	return nil
 }

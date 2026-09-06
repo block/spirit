@@ -760,3 +760,52 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 	require.Equal(t, checksumSrc, checksumDst, "checksum mismatch between source and destination")
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS autoscale_src, autoscale_dst")
 }
+
+// A quiet shard must never mask another host's overload. Exercise the actual
+// composite signal and controller so the maximum (not an average) drives both
+// normal shedding and panic, then allows recovery once every host is quiet.
+func TestAutoScalerBusiestTarget(t *testing.T) {
+	var _ writeScaler = (*applier.ShardedApplier)(nil)
+	quiet, busy := &utilThrottler{}, &utilThrottler{}
+	quiet.setUtil(0.1)
+	busy.setUtil(1.2)
+	composite := throttler.NewMultiThrottler(quiet, busy)
+	signal, ok := composite.(throttler.GradualThrottler)
+	require.True(t, ok)
+	writer := &fakeScaler{n: 8}
+	controller := newAutoScaler(signal, writer, 8, 16, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n)
+	require.True(t, composite.IsThrottled())
+	busy.setUtil(0.1)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Greater(t, writer.n, 4)
+	require.False(t, composite.IsThrottled())
+}
+
+func TestAutoScalerBusiestHostCanChange(t *testing.T) {
+	first, second := &utilThrottler{}, &utilThrottler{}
+	first.setUtil(0.1)
+	second.setUtil(0.1)
+	signal := throttler.NewMultiThrottler(first, second).(throttler.GradualThrottler)
+	writer := &fakeScaler{n: 4}
+	controller := newAutoScaler(signal, writer, 4, 8, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 5, writer.n, "all hosts have headroom")
+	second.setUtil(0.55)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 5, writer.n, "one host in the middle band prevents growth")
+	second.setUtil(0.8)
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n, "one busy host causes shedding")
+	second.setUtil(0.1)
+	first.setUtil(0.8)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 3, writer.n, "a different busy host continues shedding after cooldown")
+}

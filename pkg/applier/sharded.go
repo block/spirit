@@ -76,16 +76,16 @@ type ShardedApplier struct {
 
 // shardTarget represents a single shard with its own connection, key range, and workers
 type shardTarget struct {
-	shardID              int
-	writeDB              *sql.DB
-	keyRange             keyRange // Parsed key range for this shard
-	chunkletBuffer       chan shardedChunklet
-	chunkletCompletions  chan shardedChunkletCompletion
-	writeWorkersCount    int32
-	writeWorkersFinished int32
-	workerIDCounter      int32
-	logger               *slog.Logger
-	dbConfig             *dbconn.DBConfig
+	shardID             int
+	writeDB             *sql.DB
+	keyRange            keyRange // Parsed key range for this shard
+	chunkletBuffer      chan shardedChunklet
+	chunkletCompletions chan shardedChunkletCompletion
+	writeWorkersCount   int32
+	workers             workerPool
+	workerIDCounter     int32
+	logger              *slog.Logger
+	dbConfig            *dbconn.DBConfig
 }
 
 // shardedChunklet represents a chunklet destined for a specific shard
@@ -177,7 +177,7 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 // by itself shut down the goroutine pipeline — it only aborts in-flight writes.
 // Workers for a shard exit when its chunkletBuffer is closed (by Stop), and the
 // coordinator exits when every shard's chunkletCompletions has been closed
-// (by the last worker's defer per shard). Failing to call Stop() will leak
+// (by Stop after joining each shard's workers). Failing to call Stop() will leak
 // goroutines.
 func (a *ShardedApplier) Start(ctx context.Context) error {
 	a.Lock()
@@ -195,7 +195,6 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 		for _, shard := range a.shards {
 			shard.chunkletBuffer = make(chan shardedChunklet, defaultBufferSize)
 			shard.chunkletCompletions = make(chan shardedChunkletCompletion, defaultBufferSize)
-			shard.writeWorkersFinished = 0
 			shard.workerIDCounter = 0
 		}
 		a.stopped = false
@@ -207,12 +206,9 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 	a.started = true
 	a.logger.Info("starting ShardedApplier", "shardCount", len(a.shards))
 
-	// Start workers for each shard
-	for i := range a.shards {
-		for range a.shards[i].writeWorkersCount {
-			a.wg.Add(1)
-			go a.writeWorker(workerCtx, a.shards[i])
-		}
+	// The configured count is per target, as with fixed pools.
+	for _, shard := range a.shards {
+		shard.workers.start(workerCtx, int(shard.writeWorkersCount), func(ctx context.Context, quit <-chan struct{}) { a.writeWorker(ctx, shard, quit) })
 	}
 
 	// Start a single feedback coordinator for all shards
@@ -431,6 +427,7 @@ func (a *ShardedApplier) Stop() error {
 
 	// Close all shard buffers
 	for _, shard := range a.shards {
+		shard.workers.seal()
 		close(shard.chunkletBuffer)
 	}
 
@@ -441,11 +438,30 @@ func (a *ShardedApplier) Stop() error {
 	// Release the lock before waiting for workers to finish
 	a.Unlock()
 
-	// Wait for all workers to finish
+	// Stop owns completion-channel closure. Retiring workers must never close
+	// it: other workers may still be writing, or the pool may grow again.
+	for _, shard := range a.shards {
+		shard.workers.wait()
+		close(shard.chunkletCompletions)
+	}
 	a.wg.Wait()
 
 	a.logger.Debug("ShardedApplier stopped")
 	return nil
+}
+
+// SetWriteWorkers sets the desired worker count PER SHARD. A controller may
+// drive all shards with the maximum target utilization, so a busy shard slows
+// the entire move. Retirement happens between chunklets; callbacks are never lost.
+func (a *ShardedApplier) SetWriteWorkers(n int) {
+	a.Lock()
+	defer a.Unlock()
+	if !a.started || a.stopped {
+		return
+	}
+	for _, shard := range a.shards {
+		shard.workers.resize(n)
+	}
 }
 
 // Stats returns a point-in-time snapshot of the write pipeline, aggregated
@@ -460,7 +476,7 @@ func (a *ShardedApplier) Stats() Stats {
 		queueDepth += len(shard.chunkletBuffer)
 		queueCap += cap(shard.chunkletBuffer)
 		if a.started {
-			activeWorkers += int(shard.writeWorkersCount - atomic.LoadInt32(&shard.writeWorkersFinished))
+			activeWorkers += shard.workers.count()
 		}
 	}
 	a.Unlock()
@@ -488,22 +504,8 @@ func (a *ShardedApplier) Stats() Stats {
 }
 
 // writeWorker processes chunklets for a specific shard
-func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget) {
-	defer a.wg.Done()
+func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, quit <-chan struct{}) {
 	workerID := atomic.AddInt32(&shard.workerIDCounter, 1)
-
-	defer func() {
-		finishedCount := atomic.AddInt32(&shard.writeWorkersFinished, 1)
-		a.logger.Debug("writeWorker finished", "shardID", shard.shardID, "workerID", workerID,
-			"finishedCount", finishedCount, "totalWorkers", shard.writeWorkersCount)
-
-		// If all write workers for this shard are finished, close its completions channel
-		if finishedCount == shard.writeWorkersCount {
-			a.logger.Debug("writeWorker all workers finished for shard, closing completions channel",
-				"shardID", shard.shardID)
-			close(shard.chunkletCompletions)
-		}
-	}()
 
 	// Drain chunkletBuffer until it is closed by Stop(). We deliberately do not
 	// select on ctx.Done() here: every chunklet that made it into the buffer was
@@ -513,7 +515,17 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget) {
 	// feedbackCoordinator then invokes the callback with the error and clears
 	// pendingWork. Stop() is the canonical shutdown path: it cancels ctx (so
 	// in-flight writes abort) and closes chunkletBuffer (so workers exit).
-	for chunkletData := range shard.chunkletBuffer {
+	for {
+		var chunkletData shardedChunklet
+		select {
+		case <-quit:
+			return
+		case next, ok := <-shard.chunkletBuffer:
+			if !ok {
+				return
+			}
+			chunkletData = next
+		}
 		a.logger.Debug("writeWorker processing chunklet", "shardID", shard.shardID,
 			"workerID", workerID, "workID", chunkletData.workID, "rowCount", len(chunkletData.rows))
 
@@ -534,7 +546,6 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget) {
 		}
 		a.timings.record(queueWait, buildTime, writeTime, time.Since(handoffStart))
 	}
-	a.logger.Debug("writeWorker channel closed, exiting", "shardID", shard.shardID, "workerID", workerID)
 }
 
 // writeChunklet writes a single chunklet to a specific shard. It returns the

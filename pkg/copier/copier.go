@@ -110,7 +110,7 @@ type CopierConfig struct {
 
 // AutoscaleConfig controls the experimental write-thread autoscaler driven by
 // throttler utilization. It only applies when the Applier implements the
-// dynamic-scaling capability (SingleTargetApplier).
+// dynamic-scaling capability (both built-in appliers).
 type AutoscaleConfig struct {
 	// Enabled gates the whole feature (the --enable-experimental-autoscaling
 	// flag). Off by default.

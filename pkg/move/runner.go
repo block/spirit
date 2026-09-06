@@ -99,7 +99,10 @@ func targetKey(t applier.Target) string {
 }
 
 type Runner struct {
-	move            *Move
+	move                     *Move
+	reverseWriteThreads      int // Configured count, unaffected by forward autoscaling.
+	continuousChecksumActive atomic.Bool
+
 	sources         []sourceInfo     // one per source database
 	targets         []applier.Target // Combined DB, Config, and KeyRange
 	status          status.Tracker   // owns the current state and per-state timing
@@ -107,6 +110,11 @@ type Runner struct {
 
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
 	sourceTableMap map[string]bool    // used when only some tables are to be moved.
+
+	throttlerMu sync.RWMutex
+	throttler   throttler.Throttler
+	monitorDBs  []*sql.DB
+	autoscale   copier.AutoscaleConfig
 
 	applier           applier.Applier
 	chunkerMu         sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
@@ -228,9 +236,10 @@ func NewRunner(m *Move) (*Runner, error) {
 		m.WriteThreads = defaultWriteThreads
 	}
 	r := &Runner{
-		move:        m,
-		logger:      slog.Default(),
-		metricsSink: &metrics.NoopSink{},
+		move:                m,
+		reverseWriteThreads: m.WriteThreads,
+		logger:              slog.Default(),
+		metricsSink:         &metrics.NoopSink{},
 	}
 	return r, nil
 }
@@ -272,6 +281,12 @@ func (r *Runner) Close() error {
 	// rest, leaking the remaining repl clients' binlog reader goroutines
 	// and the target DB handles.
 	var errs []error
+	if r.throttler != nil {
+		errs = append(errs, r.throttler.Close())
+	}
+	for _, db := range r.monitorDBs {
+		errs = append(errs, db.Close())
+	}
 	if r.copyChunker != nil {
 		if err := r.copyChunker.Close(); err != nil {
 			errs = append(errs, err)
@@ -542,7 +557,8 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.throttler,
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
@@ -652,6 +668,9 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 // lock before it can destroy the first run's target data.
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
+	if err := r.setupAutoscaling(ctx); err != nil {
+		return err
+	}
 
 	if err := r.fitReadThreadsToPools(); err != nil {
 		return err
@@ -944,6 +963,7 @@ func (r *Runner) buildReplClients(ctx context.Context, resumePositions map[strin
 		replConfig.DDLFilterSchema = src.config.DBName
 		replConfig.DDLFilterTables = r.move.SourceTables
 		replConfig.DBConfig = r.dbConfig
+		replConfig.UnderLoad = func() bool { return throttler.GradualOnly(r.currentThrottler()).IsThrottled() }
 		client, err := change.NewAutoClient(ctx, src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig, resumePositions[src.sourceKey()])
 		if err != nil {
 			return fmt.Errorf("source %d: %w", i, err)
@@ -1035,7 +1055,8 @@ func (r *Runner) newCopy(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.throttler,
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
@@ -1658,13 +1679,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag, exclude .
 func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 	r.logger.Info("Checking for deferred secondary indexes to restore")
 
-	// Group targets by hostname to enable parallel processing across different hosts
-	// while avoiding overloading any single MySQL instance
-	hostGroups := make(map[string][]int) // hostname -> []targetIdx
-	for idx, target := range r.targets {
-		host := target.Config.Addr // e.g., "host:3306"
-		hostGroups[host] = append(hostGroups[host], idx)
-	}
+	hostGroups := r.targetHosts()
 
 	r.logger.Info("Parallelizing index restoration across hosts",
 		"hostCount", len(hostGroups),
@@ -1672,10 +1687,9 @@ func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 
 	// Process each host group in parallel using errgroup
 	g, gctx := errgroup.WithContext(ctx)
-	for host, targetIndices := range hostGroups {
-		// Shadow loop variables to avoid closure capture issues.
+	for _, group := range hostGroups {
 		g.Go(func() error {
-			return r.restoreIndexesForTargets(gctx, host, targetIndices)
+			return r.restoreIndexesForTargets(gctx, group.Host.String(), group.Indices)
 		})
 	}
 
@@ -1852,6 +1866,9 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.throttler,
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 	})
 	if err != nil {
 		return err
@@ -2014,9 +2031,27 @@ func (r *Runner) Progress() status.Progress {
 		ETA:          eta,
 		Checksum:     checksum,
 		Tables:       tables,
-		// Throttle is deliberately zero: move currently uses a Noop throttler.
-		// Populate it when move gains throttling support.
+		Throttle:     r.throttleStatus(state),
 	}
+}
+
+// Sentinel waiting only reports pacing while a continuous checksum is running.
+func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
+	t := r.currentThrottler()
+	switch state { //nolint:exhaustive
+	case status.CopyRows:
+	case status.Checksum:
+		t = throttler.GradualOnly(t)
+	case status.WaitingOnSentinelTable:
+		if !r.continuousChecksumActive.Load() {
+			return status.ThrottleStatus{}
+		}
+		t = throttler.GradualOnly(t)
+	default:
+		return status.ThrottleStatus{}
+	}
+	paused, reason, util := throttler.Describe(t)
+	return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
 }
 
 // invalidateChecksumWatermark blanks the checksum_watermark on the persisted
@@ -2049,8 +2084,8 @@ func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 // the move is blocked in WaitingOnSentinelTable.
 //
 // The checker used here is separate from r.checker and uses a fresh chunker
-// so checkpoint state is unaffected. Single-threaded by design — checksum
-// throttling is tracked separately in github.com/block/spirit/issues/831.
+// so checkpoint state is unaffected. Single-threaded
+// in fixed mode; autoscaling uses the same host load signal as the initial pass.
 func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 	chunker, err := r.buildContinuousChunker()
 	if err != nil {
@@ -2068,14 +2103,16 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		feeds[i] = r.sources[i].replClient
 	}
 	checker, err := checksum.NewChecker(sourceDBs, chunker, feeds, &checksum.CheckerConfig{
-		// TODO(#831): once the throttler can size threads dynamically,
-		// replace the hard-coded 1 with the move's thread count.
+		// Keep the fixed-mode single worker; autoscaling can grow it on load feedback.
 		Concurrency:     1,
 		TargetChunkTime: table.ChunkerDefaultTarget,
 		DBConfig:        r.dbConfig,
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.throttler,
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 		// One pass per outer-loop iteration; the continuous-checksum
 		// loop itself supplies the retry, so we don't nest a second
 		// retry loop inside each iteration.
@@ -2138,7 +2175,9 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		iteration++
 		iterationStart := time.Now()
 		r.logger.Info("continuous checksum iteration starting", "iteration", iteration)
+		r.continuousChecksumActive.Store(true)
 		runErr := checker.Run(ctx)
+		r.continuousChecksumActive.Store(false)
 		if runErr != nil {
 			// Only suppress a `context.Canceled` that came from OUR ctx
 			// being cancelled (the sentinel was dropped while a pass was
