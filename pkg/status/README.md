@@ -125,3 +125,9 @@ A `move` reports no throttling at all — it copies through a `Noop` throttler f
 
 - [pkg/migration](../migration/README.md) - Migration runner that implements the `Task` interface
 - [pkg/move](../move/README.md) - Move runner that implements the `Task` interface
+
+### Structured runner progress
+
+Migration, move and datasync use `TablesFromChunker` to return table progress in a stable order. Multi-source identifiers retain the source qualifier so equally named tables remain distinct. Copy ETA is populated during `CopyRows` and cleared afterwards. Migration and move also expose the finite initial checksum counts; datasync’s continuous verifier has no corresponding finite phase.
+
+All three use multiline status blocks. Datasync includes `copier-time` while copying and `state-time` while restoring indexes or analyzing tables, alongside its existing binlog and checkpoint rows. Sentinel progress polling returns a summary without emitting logs; periodic logging remains the responsibility of `WatchTask`.

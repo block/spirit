@@ -1590,10 +1590,12 @@ func (r *Runner) Progress() status.Progress {
 	r.progMu.RUnlock()
 
 	var summary string
+	var eta status.ETA
 	switch state { //nolint:exhaustive // sync only uses Initial/CopyRows/ApplyChangeset
 	case status.CopyRows:
 		if cp != nil {
 			summary = fmt.Sprintf("%s copyRows ETA %s", cp.GetProgress(), cp.GetETA())
+			eta = cp.GetETAState()
 		} else {
 			summary = "copyRows"
 		}
@@ -1607,39 +1609,14 @@ func (r *Runner) Progress() status.Progress {
 		summary = state.String()
 	}
 
-	// Per-table progress: the multi-chunker reports each table; fall back to
-	// the single-table chunker view if it's not a multi-chunker.
-	var tables []status.TableProgress
-	if mc, ok := chunker.(interface {
-		PerTableProgress() []table.TableProgress
-	}); ok {
-		for _, tp := range mc.PerTableProgress() {
-			tables = append(tables, status.TableProgress{
-				TableName:  tp.TableName,
-				RowsCopied: tp.RowsCopied,
-				RowsTotal:  tp.RowsTotal,
-				IsComplete: tp.IsComplete,
-			})
-		}
-	} else if chunker != nil {
-		rowsCopied, _, rowsTotal := chunker.Progress()
-		name := ""
-		if ts := chunker.Tables(); len(ts) > 0 {
-			name = ts[0].TableName
-		}
-		tables = append(tables, status.TableProgress{
-			TableName:  name,
-			RowsCopied: rowsCopied,
-			RowsTotal:  rowsTotal,
-			IsComplete: chunker.IsRead(),
-		})
-	}
+	tables := status.TablesFromChunker(chunker)
 
 	return status.Progress{
 		CurrentState: state,
 		Summary:      summary,
 		Resume:       r.resuming.Load(),
 		Tables:       tables,
+		ETA:          eta,
 		// Throttle is deliberately left zero: a sync copies through a Noop
 		// throttler, so there is nothing to report yet.
 	}
@@ -1664,7 +1641,7 @@ func (r *Runner) Status() string {
 	}
 	switch state { //nolint:exhaustive // sync only uses Initial/CopyRows/ApplyChangeset
 	case status.CopyRows:
-		b := status.NewBlock("sync status: state=%s total-time=%s", state.String(), elapsed)
+		b := status.NewBlock("sync status: state=%s total-time=%s copier-time=%s", state.String(), elapsed, r.status.Elapsed().Round(time.Second))
 		// The copy pipeline is built asynchronously, so a status tick can land
 		// before there is a copier to report on.
 		if cp != nil {
@@ -1695,6 +1672,11 @@ func (r *Runner) Status() string {
 		// the older point a restart would actually resume from. The gap
 		// between them is how much re-reading a crash would cost.
 		b.Row("binlog", "position=%s  deltas=%d  %s", pos, pending, change.StatusRow(repl))
+		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
+		return b.String()
+	case status.RestoreSecondaryIndexes, status.AnalyzeTable:
+		b := status.NewBlock("sync status: state=%s total-time=%s state-time=%s", state.String(), elapsed, r.status.Elapsed().Round(time.Second))
+		b.Row("binlog", "deltas=%d  %s", pending, change.StatusRow(repl))
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
 		return b.String()
 	default:

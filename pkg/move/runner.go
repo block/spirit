@@ -108,6 +108,7 @@ type Runner struct {
 	sourceTableMap map[string]bool    // used when only some tables are to be moved.
 
 	applier           applier.Applier
+	chunkerMu         sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
 	copyChunker       table.Chunker
 	checksumChunker   table.Chunker
 	copier            copier.Copier
@@ -525,7 +526,9 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	// Then create a multi chunker of all chunkers.
+	r.chunkerMu.Lock()
 	r.copyChunker = table.NewMultiChunker(copyChunkers...)
+	r.chunkerMu.Unlock()
 	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
@@ -1023,7 +1026,9 @@ func (r *Runner) newCopy(ctx context.Context) error {
 		}
 	}
 
+	r.chunkerMu.Lock()
 	r.copyChunker = table.NewMultiChunker(copyChunkers...)
+	r.chunkerMu.Unlock()
 	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
@@ -1967,36 +1972,43 @@ func (r *Runner) SetReverseCutoverWithResult(fn CutoverResultCallback) {
 }
 
 func (r *Runner) Progress() status.Progress {
+	// Read the state once: the phase-specific fields below (summary, ETA,
+	// checksum, throttle) must all describe the same state, not whichever state
+	// each happened to observe.
+	state := r.status.Get()
 	var summary string
-	switch r.status.Get() { //nolint:exhaustive
+	var eta status.ETA
+	var checksum status.ChecksumProgress
+	switch state { //nolint: exhaustive
 	case status.CopyRows:
 		summary = fmt.Sprintf("%v %s ETA %v",
 			r.copier.GetProgress(),
-			r.status.Get().String(),
+			state.String(),
 			r.copier.GetETA(),
 		)
+		eta = r.copier.GetETAState()
 	case status.WaitingOnSentinelTable:
-		r.logger.Info("migration status",
-			"state", r.status.Get().String(),
-			"sentinel-table", fmt.Sprintf("%s.%s", r.targets[0].Config.DBName, sentinel.TableName),
-			"total-time", r.status.TotalElapsed().Round(time.Second).String(),
-			"sentinel-wait-time", r.status.Elapsed().Round(time.Second).String(),
-			"sentinel-max-wait-time", sentinel.WaitLimit.String(),
-		)
+		summary = "Waiting on Sentinel Table"
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.getDeltaLenAll())
 	case status.Checksum:
-		summary = "Checksum Progress=" + r.checker.GetProgress().String()
-	default:
-		summary = ""
+		checksum = r.checker.GetProgress()
+		summary = "Checksum Progress=" + checksum.String()
 	}
+
+	// Get per-table progress from the published copy chunker. Setup and
+	// checkpoint resume may publish it while an API caller polls Progress.
+	r.chunkerMu.RLock()
+	copyChunker := r.copyChunker
+	r.chunkerMu.RUnlock()
+	tables := status.TablesFromChunker(copyChunker)
 	return status.Progress{
-		CurrentState: r.status.Get(),
+		CurrentState: state,
 		Summary:      summary,
 		Resume:       r.usedResumeFromCheckpoint.Load(),
-		// Throttle is deliberately left zero: a move always copies through a
-		// Noop throttler, so there is nothing to report yet. Populate it here
-		// when move learns to throttle (issue #831).
+		ETA:          eta,
+		Checksum:     checksum,
+		Tables:       tables,
 	}
 }
 
