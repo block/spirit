@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/table"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,7 +23,7 @@ func TestCheckpointWriteFailureRecordedAsFatal(t *testing.T) {
 
 	// A closed pool makes the checkpoint write fail deterministically with no
 	// live server (and no retry — the driver reports the pool closed).
-	badDB, err := sql.Open("mysql", "u:p@tcp(127.0.0.1:1)/x")
+	badDB, err := sql.Open("block-mysql", "u:p@tcp(127.0.0.1:1)/x")
 	require.NoError(t, err)
 	require.NoError(t, badDB.Close())
 	r.target = applier.Target{DB: badDB, Config: &mysql.Config{DBName: "x"}}

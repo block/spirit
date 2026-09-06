@@ -8,16 +8,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 )
 
 // LoadSchemaFromDSN connects to a MySQL server and retrieves all CREATE TABLE
 // statements from the connected database, parsed into structured CreateTable objects.
 func LoadSchemaFromDSN(ctx context.Context, dsn string) ([]*statement.CreateTable, error) {
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}

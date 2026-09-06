@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -102,7 +102,7 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	testutils.RunSQL(t, `INSERT INTO source_resume.t1 (val) SELECT RANDOM_BYTES(255) FROM  source_resume.t1 a JOIN  source_resume.t1 b JOIN  source_resume.t1 c LIMIT 100000`)
 
 	// reset the target database.
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	_, err = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS dest_resume")
 	require.NoError(t, err)
@@ -512,7 +512,7 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	// the deferred-index ALTER blocks, keeping postCopyPhase pinned inside
 	// restoreSecondaryIndexes. The dbconn pool sets lock_wait_timeout=30 for
 	// the ALTER's session; the block window below stays well under that.
-	blockerDB, err := sql.Open("mysql", dest.FormatDSN())
+	blockerDB, err := sql.Open("block-mysql", dest.FormatDSN())
 	require.NoError(t, err)
 	blockerTx, err := blockerDB.BeginTx(ctx, nil)
 	require.NoError(t, err)

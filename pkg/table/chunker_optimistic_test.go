@@ -402,7 +402,7 @@ func TestOptimisticResumeProgressAccounting(t *testing.T) {
 }
 
 func TestOptimisticPrefetchChunking(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -646,7 +646,7 @@ func TestOptimisticChunkerPrefetchReservedWord(t *testing.T) {
 		") ENGINE=InnoDB")
 	testutils.RunSQL(t, "INSERT INTO reserved_word_optimistic_t1 (v) VALUES ('a'),('b'),('c'),('d'),('e')")
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -686,7 +686,7 @@ func TestOptimisticChunkerReservedWordTableName(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO `order` (v) VALUES ('a'),('b'),('c'),('d'),('e')")
 	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS `order`") })
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -787,7 +787,7 @@ func TestOptimisticNoPrefetchOnDenseKeySpace(t *testing.T) {
 // ~130-chunk ramp back to the ceiling. Prefetch is only ever entered from the
 // ceiling, so that is the size to come back to.
 func TestOptimisticPrefetchRestoresChunkSize(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {

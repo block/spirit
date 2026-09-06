@@ -4,10 +4,10 @@ import (
 	"database/sql"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,7 +27,7 @@ func getCreateTableStatement(t *testing.T, db *sql.DB, tableName string) *statem
 //
 
 func TestAllowCharsetIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -89,7 +89,7 @@ func TestAllowCharsetIntegration(t *testing.T) {
 
 // TestAllowEngineIntegration tests the AllowEngine linter
 func TestAllowEngineIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -135,7 +135,7 @@ func TestAllowEngineIntegration(t *testing.T) {
 
 // TestHasFKIntegration tests the HasFKLinter
 func TestHasFKIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -175,7 +175,7 @@ func TestHasFKIntegration(t *testing.T) {
 
 // TestHasFloatIntegration tests the HasFloatLinter
 func TestHasFloatIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -222,7 +222,7 @@ func TestHasFloatIntegration(t *testing.T) {
 
 // TestInvisibleIndexIntegration tests the InvisibleIndexBeforeDropLinter
 func TestInvisibleIndexIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -281,7 +281,7 @@ func TestMultipleAlterIntegration(t *testing.T) {
 
 // TestNameCaseIntegration tests the NameCaseLinter
 func TestNameCaseIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -315,7 +315,7 @@ func TestNameCaseIntegration(t *testing.T) {
 
 // TestPrimaryKeyTypeIntegration tests the PrimaryKeyLinter
 func TestPrimaryKeyTypeIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -377,7 +377,7 @@ func TestUnsafeIntegration(t *testing.T) {
 
 // TestZeroDateIntegration tests the ZeroDateLinter
 func TestZeroDateIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -468,7 +468,7 @@ func TestZeroDateIntegration(t *testing.T) {
 
 // TestAutoIncCapacityIntegration tests the AutoIncCapacityLinter
 func TestAutoIncCapacityIntegration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

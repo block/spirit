@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -25,7 +25,7 @@ func TestReplicationThrottlerLiveQuery(t *testing.T) {
 	if replicaDSN == "" {
 		t.Skip("skipping test because REPLICA_DSN not set")
 	}
-	db, err := sql.Open("mysql", replicaDSN)
+	db, err := sql.Open("block-mysql", replicaDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

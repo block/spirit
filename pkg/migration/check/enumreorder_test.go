@@ -5,16 +5,16 @@ import (
 	"log/slog"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
 func TestEnumReorderCheck(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -117,7 +117,7 @@ func TestEnumReorderCheck(t *testing.T) {
 }
 
 func TestEnumReorderCheckVarcharToEnum(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

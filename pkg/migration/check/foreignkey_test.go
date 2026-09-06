@@ -27,7 +27,7 @@ func TestAddForeignKey(t *testing.T) {
 }
 
 func TestHasForeignKey(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 
 	_, err = db.ExecContext(t.Context(), `drop table if exists customers, customer_contacts`)
@@ -83,7 +83,7 @@ func TestHasForeignKey(t *testing.T) {
 // was allowed to proceed and the cutover rename repointed the child's foreign
 // key at the _old table.
 func TestHasForeignKeyCrossSchema(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	// Registered first so it runs last: cleanups are LIFO, and the drop below
 	// still needs the connection.

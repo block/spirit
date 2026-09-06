@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
-	"github.com/go-sql-driver/mysql"
 )
 
 const (

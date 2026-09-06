@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/buildinfo"
 	"github.com/block/spirit/pkg/change"
@@ -30,7 +31,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"golang.org/x/sync/errgroup"
 )
 

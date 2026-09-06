@@ -22,7 +22,7 @@ func TestReplicaHealth(t *testing.T) {
 
 	// use a non-replica. this will return an error identifying which thread
 	// is not running and on which host.
-	nonReplica, err := sql.Open("mysql", testutils.DSN())
+	nonReplica, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	r.Replicas = []*sql.DB{nonReplica}
 	err = replicaHealth(t.Context(), r, slog.Default())
@@ -34,7 +34,7 @@ func TestReplicaHealth(t *testing.T) {
 	if replicaDSN == "" {
 		t.Skip("skipping test because REPLICA_DSN not set")
 	}
-	replicaDB, err := sql.Open("mysql", replicaDSN)
+	replicaDB, err := sql.Open("block-mysql", replicaDSN)
 	require.NoError(t, err)
 	r.Replicas = []*sql.DB{replicaDB}
 	err = replicaHealth(t.Context(), r, slog.Default())
@@ -42,7 +42,7 @@ func TestReplicaHealth(t *testing.T) {
 
 	// use a completely invalid DSN.
 	// golang sql.Open lazy loads, so this is possible.
-	invalidDB, err := sql.Open("mysql", "msandbox:msandbox@tcp(127.0.0.1:22)/test")
+	invalidDB, err := sql.Open("block-mysql", "msandbox:msandbox@tcp(127.0.0.1:22)/test")
 	require.NoError(t, err)
 	r.Replicas = []*sql.DB{invalidDB}
 	err = replicaHealth(t.Context(), r, slog.Default())

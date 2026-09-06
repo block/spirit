@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,7 +33,7 @@ func TestDropArtifactsRespectsDeadline(t *testing.T) {
 }
 
 func TestDropArtifactsReportsErrors(t *testing.T) {
-	db, err := sql.Open("mysql", DSN())
+	db, err := sql.Open("block-mysql", DSN())
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 	tt := &TestTable{Name: "cleanup_closed_pool", DB: db}
@@ -52,7 +52,7 @@ func TestTableCleanupAfterTestContextCancelled(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}) // The subtest's context is cancelled before NewTestTable's cleanup executes.
-	db, err := sql.Open("mysql", DSN())
+	db, err := sql.Open("block-mysql", DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	var count int
@@ -78,7 +78,7 @@ func TestTableCleanupLongName(t *testing.T) {
 		tt = NewTestTable(t, name, "CREATE TABLE "+name+" (id INT PRIMARY KEY)")
 	})
 	require.Error(t, tt.DB.PingContext(t.Context()))
-	db, err := sql.Open("mysql", DSN())
+	db, err := sql.Open("block-mysql", DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	var count int

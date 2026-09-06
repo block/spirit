@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/go-sql-driver/mysql"
 )
 
 // erNoSuchTable is MySQL error 1146 (ER_NO_SUCH_TABLE); erBadFieldError is 1054

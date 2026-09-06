@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -76,7 +76,7 @@ func TestDiscovery(t *testing.T) {
 	testutils.RunSQL(t, table)
 	testutils.RunSQL(t, `insert into discoveryt1 values (1, 'a'), (2, 'b'), (3, 'c')`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -123,7 +123,7 @@ func TestDiscoveryDisableAnalyze(t *testing.T) {
 	// is populated; DisableAnalyze must then read it back without re-analyzing.
 	testutils.RunSQL(t, `ANALYZE TABLE discoverynoanalyze`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -150,7 +150,7 @@ func TestDiscoveryUInt(t *testing.T) {
 	testutils.RunSQL(t, table)
 	testutils.RunSQL(t, `insert into discoveryuintt1 values (1, 'a'), (2, 'b'), (3, 'c')`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -183,7 +183,7 @@ func TestDiscoveryNoKeyColumnsOrNoTable(t *testing.T) {
 	testutils.RunSQL(t, table)
 	testutils.RunSQL(t, `insert into discoverynokeyst1 values (1, 'a'), (2, 'b'), (3, 'c')`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -221,7 +221,7 @@ func TestDiscoveryBalancesTable(t *testing.T) {
 	testutils.RunSQL(t, `drop table if exists balances`)
 	testutils.RunSQL(t, table)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -258,7 +258,7 @@ func TestPrimaryKeyIsMemoryComparableRejectsBIT(t *testing.T) {
 	testutils.RunSQL(t, `CREATE TABLE bitpk (b BIT(8) NOT NULL, v INT NOT NULL, PRIMARY KEY (b))`)
 	testutils.RunSQL(t, `INSERT INTO bitpk (b, v) VALUES (b'00000001', 1), (b'00000010', 2)`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -281,7 +281,7 @@ func TestDiscoveryCompositeNonComparable(t *testing.T) {
 	testutils.RunSQL(t, table)
 	testutils.RunSQL(t, `insert into compnoncomparable values (1, 'a'), (2, 'b'), (3, 'c')`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -304,7 +304,7 @@ func TestDiscoveryCompositeComparable(t *testing.T) {
 	testutils.RunSQL(t, table)
 	testutils.RunSQL(t, `insert into compcomparable values (1, 1), (2, 2), (3, 3)`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -321,7 +321,7 @@ func TestDiscoveryCompositeComparable(t *testing.T) {
 }
 
 func TestStatisticsUpdate(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -361,7 +361,7 @@ func TestStatisticsUpdate(t *testing.T) {
 }
 
 func TestKeyColumnsValuesExtraction(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -409,7 +409,7 @@ func TestDiscoveryGeneratedCols(t *testing.T) {
 	)`
 	testutils.RunSQL(t, table)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {

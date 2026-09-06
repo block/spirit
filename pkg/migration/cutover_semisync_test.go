@@ -79,7 +79,7 @@ func TestCutoverAtomicitySemiSync(t *testing.T) {
 func requireSemiSyncSourceActive(t *testing.T) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
