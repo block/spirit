@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,7 +16,7 @@ func TestMovePrivileges(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "root" // needs grant privilege
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	db, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -37,7 +37,7 @@ func TestMovePrivileges(t *testing.T) {
 	sourceConfig, err := mysql.ParseDSN(fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 
-	lowPrivDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lowPrivDB)
 
@@ -77,7 +77,7 @@ func TestMovePrivileges(t *testing.T) {
 
 	// Reconnect before checking again.
 	require.NoError(t, lowPrivDB.Close())
-	lowPrivDB, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	lowPrivDB, err = sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lowPrivDB)
 	r.Sources = []SourceResource{{DB: lowPrivDB, Config: sourceConfig}}
@@ -100,7 +100,7 @@ func TestMovePrivilegesMultipleSources(t *testing.T) {
 	require.NoError(t, err)
 	config.User = "root" // needs grant privilege
 	rootDSN := fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName)
-	rootDB, err := sql.Open("mysql", rootDSN)
+	rootDB, err := sql.Open("block-mysql", rootDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(rootDB)
 
@@ -127,7 +127,7 @@ func TestMovePrivilegesMultipleSources(t *testing.T) {
 	lowPrivDSN := fmt.Sprintf("testmovemultisrcuser:@tcp(%s)/%s", config.Addr, config.DBName)
 	lowPrivConfig, err := mysql.ParseDSN(lowPrivDSN)
 	require.NoError(t, err)
-	lowPrivDB, err := sql.Open("mysql", lowPrivDSN)
+	lowPrivDB, err := sql.Open("block-mysql", lowPrivDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lowPrivDB)
 
@@ -144,7 +144,7 @@ func TestMovePrivilegesMultipleSources(t *testing.T) {
 	require.Contains(t, err.Error(), "source 1")
 
 	// Verify the check passes when both sources have sufficient privileges.
-	rootDB2, err := sql.Open("mysql", rootDSN)
+	rootDB2, err := sql.Open("block-mysql", rootDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(rootDB2)
 
@@ -167,7 +167,7 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "root"
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	db, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -218,7 +218,7 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	sourceConfig, err := mysql.ParseDSN(fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 
-	lowPrivDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lowPrivDB)
 

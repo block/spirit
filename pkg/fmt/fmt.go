@@ -23,9 +23,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/parser/format"
-	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/statement"
@@ -61,7 +62,7 @@ func (cmd *FmtCmd) Run() error {
 	// Connect to MySQL without a database first so we can create the
 	// working database if it doesn't exist yet.
 	bootstrapDSN := buildDSN(cmd.Username, cmd.Password, cmd.Host, "")
-	bootstrapDB, err := sql.Open("mysql", bootstrapDSN)
+	bootstrapDB, err := sql.Open(dbconn.DriverName, bootstrapDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -77,7 +78,7 @@ func (cmd *FmtCmd) Run() error {
 
 	// Now connect to the working database.
 	dsn := buildDSN(cmd.Username, cmd.Password, cmd.Host, cmd.Database)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(dbconn.DriverName, dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}

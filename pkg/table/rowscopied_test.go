@@ -84,7 +84,7 @@ func TestRowsCopiedCompositeChunker(t *testing.T) {
 	)`)
 	testutils.RunSQL(t, `INSERT INTO rowscopied_composite (a, b) SELECT UUID(), 1 FROM dual`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, db.Close())

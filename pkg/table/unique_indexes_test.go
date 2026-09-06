@@ -30,7 +30,7 @@ func TestUniqueSecondaryIndexes(t *testing.T) {
 		KEY idx_payload (payload)
 	)`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -70,7 +70,7 @@ func TestUniqueSecondaryIndexesSkipsFunctionalIndexes(t *testing.T) {
 		UNIQUE KEY unq_plain (other)
 	)`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 

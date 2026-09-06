@@ -65,7 +65,7 @@ func TestAutoIncrementEmptyTable(t *testing.T) {
 			PRIMARY KEY (id)
 		) ENGINE=InnoDB AUTO_INCREMENT=2979716`, tableName))
 
-	testDB, err := sql.Open("mysql", testutils.DSN())
+	testDB, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(testDB)
 
@@ -151,7 +151,7 @@ func TestAutoIncrementWithRows(t *testing.T) {
 		('user2'),
 		('user3')`, tableName))
 
-	testDB, err := sql.Open("mysql", testutils.DSN())
+	testDB, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(testDB)
 
@@ -251,7 +251,7 @@ func TestModifyAddAutoIncrementPreservesZeroPK(t *testing.T) {
 	defer utils.CloseAndLog(r)
 	require.NoError(t, r.Run(t.Context()))
 
-	testDB, err := sql.Open("mysql", testutils.DSN())
+	testDB, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(testDB)
 

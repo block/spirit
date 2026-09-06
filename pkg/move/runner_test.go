@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
@@ -23,7 +24,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -105,7 +105,7 @@ func testMoveWithConcurrentWrites(t *testing.T, deferSecondaryIndexes bool) {
 	testutils.RunSQL(t, `CREATE DATABASE dest_concurrent`)
 
 	// Open connection to source for concurrent writes
-	sourceDB, err := sql.Open("mysql", sourceDSN)
+	sourceDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
@@ -159,7 +159,7 @@ func testMoveWithConcurrentWrites(t *testing.T, deferSecondaryIndexes bool) {
 	err = sourceDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM source_concurrent.xfers_old").Scan(&sourceCount)
 	require.NoError(t, err)
 
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	err = targetDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM dest_concurrent.xfers").Scan(&targetCount)
@@ -288,7 +288,7 @@ func TestMoveWithNewTableCreation(t *testing.T) {
 	testutils.RunSQL(t, `CREATE DATABASE dest_newtable`)
 
 	// Open connection to source for concurrent writes
-	sourceDB, err := sql.Open("mysql", sourceDSN)
+	sourceDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
@@ -371,7 +371,7 @@ func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
 
 	// Open a dedicated connection with session-level minimal RBR.
 	// DML on this connection will produce minimal row images in the binlog.
-	minimalDB, err := sql.Open("mysql", sourceDSN)
+	minimalDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(minimalDB)
 
@@ -455,7 +455,7 @@ func TestMoveResumeDeletesRecopyRange(t *testing.T) {
 
 	// Batched INSERT..SELECT can leave auto-increment gaps, so read the
 	// actual max id and row count instead of assuming they are equal.
-	sourceDB, err := sql.Open("mysql", sourceDSN)
+	sourceDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 	var srcMaxID, srcCount int
@@ -473,7 +473,7 @@ func TestMoveResumeDeletesRecopyRange(t *testing.T) {
 	// Read back the copier watermark the checkpoint recorded. A single-table
 	// auto-inc move uses the optimistic chunker, whose watermark is the raw
 	// chunk JSON of the last contiguously-completed bounded chunk.
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	var watermark string
@@ -591,7 +591,7 @@ func TestMoveForceWipesUnresumableTarget(t *testing.T) {
 	// With --force: wipe the stale target + checkpoint and copy the source fresh.
 	require.NoError(t, newMove(true).Run())
 
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	var count int
@@ -645,7 +645,7 @@ func TestMoveRetryBeforeFirstCheckpointStartsFresh(t *testing.T) {
 		}
 	}
 
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -732,7 +732,7 @@ func TestConcurrentMoveDoesNotWipeTarget(t *testing.T) {
 
 	// The target must be untouched: the pre-existing row is intact and run B
 	// left no artifacts of a restarted copy (no checkpoint table).
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	var name string
@@ -781,7 +781,7 @@ func TestMoveWithVarcharPK(t *testing.T) {
 			VALUES (UUID(), HEX(RANDOM_BYTES(20)), NOW())`)
 	}
 
-	sourceDB, err := sql.Open("mysql", sourceDSN)
+	sourceDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
@@ -864,7 +864,7 @@ func TestMoveWithVarcharPK(t *testing.T) {
 	require.NoError(t, sourceDB.QueryRowContext(t.Context(),
 		"SELECT COUNT(*) FROM "+srcDB+".items_old").Scan(&sourceCount))
 
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	require.NoError(t, targetDB.QueryRowContext(t.Context(),
@@ -1010,7 +1010,7 @@ func TestResumeFromCheckpointMultiTableE2E(t *testing.T) {
 
 	// After cutover the source tables are renamed *_old. The target must
 	// contain every row.
-	db, err := sql.Open("mysql", targetDSN)
+	db, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	var srcCount, dstCount int
@@ -1071,7 +1071,7 @@ func TestResumeFromCheckpointCompositePKE2E(t *testing.T) {
 	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
 	require.NoError(t, r.Close())
 
-	db, err := sql.Open("mysql", targetDSN)
+	db, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	var srcCount, dstCount int
@@ -1696,7 +1696,7 @@ func TestMoveForcePreservesTargetOnSourceSideFailure(t *testing.T) {
 	require.ErrorContains(t, err, "refusing to wipe")
 	require.ErrorContains(t, err, "t1_old")
 
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	var count int
@@ -1754,10 +1754,10 @@ func testForceRecoversUnresumableCheckpoint(t *testing.T, suffix string, corrupt
 	checkpointAndStop(t, move)
 	corrupt(dstDB)
 
-	sourceDB, err := sql.Open("mysql", sourceDSN)
+	sourceDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
-	targetDB, err := sql.Open("mysql", targetDSN)
+	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	// Capture the expected row count now: the successful --force run below

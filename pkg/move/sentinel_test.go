@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,7 +47,7 @@ func TestMoveSentinelDropReleasesCutover(t *testing.T) {
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sentrel_dst")
 	testutils.RunSQL(t, "CREATE DATABASE sentrel_dst")
 
-	ctl, err := sql.Open("mysql", testutils.DSN())
+	ctl, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(ctl)
 

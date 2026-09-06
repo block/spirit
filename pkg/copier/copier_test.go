@@ -16,9 +16,9 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"go.uber.org/goleak"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 

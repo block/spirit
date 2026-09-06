@@ -6,11 +6,11 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,11 +21,11 @@ func TestTargetStateCheck(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS state_tgt`)
 	testutils.RunSQL(t, `CREATE DATABASE state_tgt`)
 
-	sourceDB, err := sql.Open("mysql", testutils.DSNForDatabase("state_src"))
+	sourceDB, err := sql.Open("block-mysql", testutils.DSNForDatabase("state_src"))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
-	targetDB, err := sql.Open("mysql", testutils.DSNForDatabase("state_tgt"))
+	targetDB, err := sql.Open("block-mysql", testutils.DSNForDatabase("state_tgt"))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 

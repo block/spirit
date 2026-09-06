@@ -24,7 +24,7 @@ func runRenameTest(t *testing.T, tableName, createTable, insertData, alter strin
 	require.NoError(t, m.Run())
 
 	if verifyFunc != nil {
-		db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+		db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 		require.NoError(t, err)
 		defer func() { require.NoError(t, db.Close()) }()
 		verifyFunc(t, db)
@@ -243,7 +243,7 @@ func TestRenameColumnLargerDataset(t *testing.T) {
 		WithStatement(fmt.Sprintf("ALTER TABLE %s RENAME COLUMN old_name TO new_name", tableName)))
 	require.NoError(t, m.Run())
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, db.Close()) }()
 
@@ -428,7 +428,7 @@ func TestRenameColumnForceCopyPath(t *testing.T) {
 		WithStatement(fmt.Sprintf("ALTER TABLE %s CHANGE COLUMN old_name new_name varchar(200) NOT NULL", tableName)))
 	require.NoError(t, m.Run())
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, db.Close()) }()
 

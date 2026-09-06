@@ -207,9 +207,9 @@ func TestCloseRunsAllClosersOnError(t *testing.T) {
 	repl1 := &fakeChangeSource{}
 	repl2 := &fakeChangeSource{}
 
-	db1, err := sql.Open("mysql", testutils.DSN())
+	db1, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
-	db2, err := sql.Open("mysql", testutils.DSN())
+	db2, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 
 	r := &Runner{

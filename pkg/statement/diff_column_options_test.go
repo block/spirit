@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -281,7 +281,7 @@ func openScratchDB(t *testing.T) *sql.DB {
 
 	rootCfg := cfg.Clone()
 	rootCfg.DBName = "" // connect without selecting a database
-	rootDB, err := sql.Open("mysql", rootCfg.FormatDSN())
+	rootDB, err := sql.Open("block-mysql", rootCfg.FormatDSN())
 	require.NoError(t, err)
 	defer func() {
 		_ = rootDB.Close()
@@ -293,7 +293,7 @@ func openScratchDB(t *testing.T) *sql.DB {
 
 	scopedCfg := cfg.Clone()
 	scopedCfg.DBName = scratchDB
-	db, err := sql.Open("mysql", scopedCfg.FormatDSN())
+	db, err := sql.Open("block-mysql", scopedCfg.FormatDSN())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		// t.Context() is already canceled during cleanup, so use Background.

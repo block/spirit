@@ -31,8 +31,8 @@ import (
 	"os"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/parser/ast"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,7 +58,7 @@ func TestCompareReservedWordsWithMySQL(t *testing.T) {
 	if dsn == "" {
 		dsn = "root@tcp(127.0.0.1:3306)/"
 	}
-	db, err := dbsql.Open("mysql", dsn)
+	db, err := dbsql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, db.Close())

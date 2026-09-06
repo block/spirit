@@ -6,10 +6,10 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,7 +17,7 @@ func TestPrivileges(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "root" // needs grant privilege
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	db, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -32,7 +32,7 @@ func TestPrivileges(t *testing.T) {
 	config.User = "testprivsuser"
 	config.Passwd = ""
 
-	lowPrivDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 
 	r := Resources{
@@ -76,7 +76,7 @@ func TestPrivileges(t *testing.T) {
 	// There seems to be a race in MySQL where privileges don't show up immediately
 	// That this can work around.
 	require.NoError(t, lowPrivDB.Close())
-	lowPrivDB, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	lowPrivDB, err = sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lowPrivDB)
 	r.DB = lowPrivDB
@@ -113,7 +113,7 @@ func TestPrivilegesWithRDSSuperuserRole(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "root"
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	db, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -168,7 +168,7 @@ func TestPrivilegesWithRDSSuperuserRole(t *testing.T) {
 	config.User = "testrdsroleuser"
 	config.Passwd = ""
 
-	lowPrivDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lowPrivDB)
 

@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/copier"
@@ -26,7 +27,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -581,7 +581,7 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 
 	// Add cleanup handler to guarantee table cleanup even on failure/timeout
 	t.Cleanup(func() {
-		db, _ := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+		db, _ := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 		defer func() { _ = db.Close() }()
 		_, _ = db.ExecContext(context.Background(), fmt.Sprintf(
 			"DROP TABLE IF EXISTS %s, _%s_new, _%s_old, _%s_chkpnt, _spirit_sentinel",
@@ -701,7 +701,7 @@ func TestResumeFromCheckpointCleanupOnFailure(t *testing.T) {
 	waitForCheckpoint(t, m)
 
 	// Verify the _new table exists (required for the resume path we want to test)
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	var tableName string

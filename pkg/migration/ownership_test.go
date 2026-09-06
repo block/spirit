@@ -7,8 +7,8 @@ import (
 	"io"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/status"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
