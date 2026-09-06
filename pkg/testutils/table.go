@@ -44,7 +44,7 @@ func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 	tt := &TestTable{Name: name}
 
 	// Open a DB connection for this table (used for cleanup and verification).
-	db, err := sql.Open("block-mysql", DSN())
+	db, err := sql.Open(driverName, DSN())
 	require.NoError(t, err)
 	tt.DB = db
 

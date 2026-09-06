@@ -18,6 +18,17 @@ import (
 	"github.com/block/mysql"
 )
 
+// DriverName is the database/sql driver spirit opens every connection with.
+//
+// It is exported because it is part of this package's contract, not an
+// implementation detail: EnhanceDSNWithTLS returns a DSN whose tls= name
+// refers to an entry this package registered, and a driver's TLS registry is
+// a package-level global. A consumer that opens such a DSN with a different
+// driver gets "invalid value / unknown config name: rds" at connect time —
+// an error that says nothing about drivers. Open it with sql.Open(
+// dbconn.DriverName, ...) and that stays correct through any future move.
+const DriverName = "block-mysql"
+
 const (
 	rdsTLSConfigName      = "rds"
 	customTLSConfigName   = "custom"
@@ -386,7 +397,7 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 	// For PREFERRED mode, implement fallback behavior
 	if config.TLSMode == "PREFERRED" {
 		// First try with TLS
-		db, err := sql.Open("block-mysql", dsn)
+		db, err := sql.Open(DriverName, dsn)
 		if err == nil {
 			//nolint: noctx // requires too much refactoring
 			if pingErr := db.Ping(); pingErr == nil {
@@ -424,7 +435,7 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 			return nil, fmt.Errorf("failed to create fallback DSN for %s connection: %w", connectionType, err)
 		}
 
-		db, err = sql.Open("block-mysql", fallbackDSN)
+		db, err = sql.Open(DriverName, fallbackDSN)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open fallback %s connection: %w", connectionType, err)
 		}
@@ -437,7 +448,7 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 	}
 
 	// For all other modes, use standard connection
-	db, err = sql.Open("block-mysql", dsn)
+	db, err = sql.Open(DriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s connection: %w", connectionType, err)
 	}
@@ -453,6 +464,12 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 // if the DSN doesn't already contain TLS parameters.
 // This allows replica connections to inherit TLS settings from the main connection
 // while still respecting explicit TLS configuration in the DSN.
+//
+// The returned DSN names a TLS configuration registered in [DriverName]'s
+// registry. Open it with that driver: a caller that hands the result to a
+// different one fails at connect time with "invalid value / unknown config
+// name", because TLS registries are per-driver package globals rather than
+// anything the DSN carries.
 func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 	// TLSMode is documented as case-insensitive; compare on the upper-cased
 	// value so a lowercase "disabled" is honored here too.
