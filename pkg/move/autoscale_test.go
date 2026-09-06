@@ -72,3 +72,19 @@ func TestMoveThrottleStatus(t *testing.T) {
 	require.Empty(t, r.throttleStatus(status.CutOver))
 	require.Empty(t, r.throttleStatus(status.Close))
 }
+
+func TestMoveAutoscaleFitsFixedPool(t *testing.T) {
+	for _, start := range []int{4, 16} {
+		r, err := NewRunner(&Move{Threads: 2, MaxConnections: 16, WriteThreads: 20})
+		require.NoError(t, err)
+		// Simulate counts resolved by the Aurora probe after flag validation.
+		r.move.Threads = start
+		r.autoscale.Enabled = true
+		r.autoscale.MaxReadThreads = 32
+		require.NoError(t, r.fitReadThreadsToPools())
+		require.Equal(t, min(start, 10), r.move.Threads)
+		require.Equal(t, 10, r.autoscale.MaxReadThreads)
+		require.Equal(t, 16, r.move.MaxConnections)
+		require.Equal(t, 20, r.move.WriteThreads)
+	}
+}

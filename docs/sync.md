@@ -191,3 +191,9 @@ File+offset checkpoints also record the source's `@@server_uuid`. Resume refuses
 coordinates from a different server or an older checkpoint without identity;
 use `--force` to discard the partial copy and start fresh. GTID checkpoints
 remain portable across servers, subject to the normal GTID resume checks.
+
+### max-connections
+
+`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). Worker counts may exceed the budget and wait for connections. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
+
+Sync’s continuous checker uses ordinary reads rather than pinned snapshot pools, and sync has no cutover. It therefore does not require move’s checksum/cutover headroom or lower configured read concurrency to fit that headroom.

@@ -151,6 +151,12 @@ var _ status.Task = (*Runner)(nil)
 // supplies defaults via kong; programmatic callers get the same defaults
 // applied here as a safety net.
 func NewRunner(s *Sync) (*Runner, error) {
+	if err := s.Validate(); err != nil {
+		return nil, err
+	}
+	if s.MaxConnections == 0 {
+		s.MaxConnections = dbconn.DefaultMaxConnections
+	}
 	if s.Source != nil && s.Applier == nil {
 		return nil, errors.New("Sync.Source requires Sync.Applier to also be set; the injected change.Source needs the same applier the copier uses")
 	}
@@ -253,7 +259,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	//     design (e.g. a Vitess/PlanetScale replica), so it must not fire.
 	r.sourceDBConfig.ForceKill = false
 	r.sourceDBConfig.RejectReadOnly = false
-	r.sourceDBConfig.MaxOpenConnections = 100
+	r.sourceDBConfig.MaxOpenConnections = r.sync.MaxConnections
 
 	// The target is written to (table creation, the copy/apply, the
 	// checkpoint, and CREATE DATABASE on the admin connection), so it keeps the
@@ -264,7 +270,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// the source are applied (no cutover here either, so ForceKill is left at
 	// its default but never fires).
 	r.targetDBConfig = dbconn.NewDBConfig()
-	r.targetDBConfig.MaxOpenConnections = 100
+	r.targetDBConfig.MaxOpenConnections = r.sync.MaxConnections
 
 	// Open the source SQL connection. Even when the change feed is an
 	// injected non-MySQL source, spirit still needs SQL access to the
@@ -306,6 +312,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.target = applier.Target{KeyRange: "0", DB: tdb, Config: tcfg}
 		r.ownsTarget = true
 	}
+
+	// Apply the budget to an injected target handle as well. Custom appliers
+	// retain ownership of any additional connections they create.
+	dbconn.SetPoolSize(r.target.DB, r.sync.MaxConnections)
 
 	if err := dbconn.RequireDifferentDatabase(ctx, r.source.db, r.target.DB); err != nil {
 		return err
