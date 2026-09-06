@@ -6,11 +6,16 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
 
 type Move struct {
+	// Each source/target *sql.DB owns a pool at this limit; worker counts do
+	// not grow it. Dedicated monitor/advisory pools are separate.
+	MaxConnections int `name:"max-connections" help:"Size of each source and target connection pool. Workers share the pool and contend for connections." optional:"" default:"128"`
+
 	SourceDSN string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
 	TargetDSN string `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
 	// TargetChunkSize is the in-memory byte budget the buffered copier sizes each
@@ -92,7 +97,11 @@ func (m *Move) Validate() error {
 	if m.ReverseWindow < 0 {
 		return fmt.Errorf("--reverse-window must be non-negative, got %s", m.ReverseWindow)
 	}
-	return nil
+	threads := m.Threads
+	if threads == 0 {
+		threads = defaultThreads
+	}
+	return dbconn.ValidateMaxConnections(m.MaxConnections, threads, minChecksumPhaseReserve)
 }
 
 func (m *Move) Run() error {

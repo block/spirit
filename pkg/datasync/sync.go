@@ -33,6 +33,7 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -41,8 +42,10 @@ import (
 // programmatic callers (e.g. strata's Vitess/PlanetScale import) that
 // inject a non-MySQL change source and/or a custom applier.
 type Sync struct {
-	SourceDSN string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
-	TargetDSN string `name:"target-dsn" help:"Where to sync the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
+	// MaxConnections limits each SQL pool; worker counts do not expand it.
+	MaxConnections int    `name:"max-connections" help:"Size of each source and target SQL connection pool. Workers share the pool and contend for connections." default:"128"`
+	SourceDSN      string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
+	TargetDSN      string `name:"target-dsn" help:"Where to sync the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
 	// TargetChunkSize is the in-memory byte budget the buffered copier sizes each
 	// copy chunk against (see table.DefaultTargetChunkBytes). Sync always uses the
 	// buffered copier. A zero value means "use the default" (the runner fills it
@@ -116,7 +119,7 @@ func (s *Sync) Validate() error {
 	if s.FlushInterval < 0 {
 		return fmt.Errorf("--flush-interval must be non-negative, got %s", s.FlushInterval)
 	}
-	return nil
+	return dbconn.ValidateConnectionLimit(s.MaxConnections)
 }
 
 // Run is the kong CLI entry point. It runs the sync until the process
