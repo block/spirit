@@ -1,6 +1,7 @@
 package move
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -75,4 +78,58 @@ func TestMoveProgressChunkerPublication(t *testing.T) {
 		_ = r.Progress()
 	}
 	wg.Wait()
+}
+
+func TestMoveProgressPolledConcurrently(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	src := cfg.Clone()
+	src.DBName = "progress_source"
+	dest := cfg.Clone()
+	dest.DBName = "progress_dest"
+
+	// Convert src and dest back to DSNs.
+	sourceDSN := src.FormatDSN()
+	targetDSN := dest.FormatDSN()
+
+	// create some data to copy.
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS progress_source`)
+	testutils.RunSQL(t, `CREATE DATABASE progress_source`)
+	testutils.RunSQL(t, `CREATE TABLE progress_source.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `CREATE TABLE progress_source.t2 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO progress_source.t1 (id, val) VALUES (1, 'one'), (2, 'two'), (3, 'three')`)
+	testutils.RunSQL(t, `INSERT INTO progress_source.t2 (id, val) VALUES (4, 'four'), (5, 'five'), (6, 'six')`)
+
+	// reset the target database.
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS progress_dest`)
+	testutils.RunSQL(t, `CREATE DATABASE progress_dest`)
+
+	// test
+	move := &Move{
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      2,
+		WriteThreads: 2,
+		DeferCutOver: false,
+	}
+	runner, err := NewRunner(move)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, runner.Close()) })
+	ctx, cancel := context.WithCancel(t.Context())
+	var pollers sync.WaitGroup
+	pollers.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				_ = runner.Progress()
+			}
+		}
+	})
+	runErr := runner.Run(t.Context())
+	cancel()
+	pollers.Wait()
+	require.NoError(t, runErr)
 }

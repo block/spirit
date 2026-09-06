@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
-	"sync"
 	"testing"
 	"time"
 
@@ -59,25 +58,7 @@ func TestBasicMove(t *testing.T) {
 		WriteThreads: 2,
 		DeferCutOver: false,
 	}
-	runner, err := NewRunner(move)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, runner.Close()) })
-	ctx, cancel := context.WithCancel(t.Context())
-	var pollers sync.WaitGroup
-	pollers.Go(func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				_ = runner.Progress()
-			}
-		}
-	})
-	runErr := runner.Run(t.Context())
-	cancel()
-	pollers.Wait()
-	require.NoError(t, runErr)
+	require.NoError(t, move.Run())
 }
 func TestResumeFromCheckpointE2E(t *testing.T) {
 	t.Run("deferFalse", func(t *testing.T) { // known to race.
