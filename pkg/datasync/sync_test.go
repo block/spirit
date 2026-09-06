@@ -124,11 +124,13 @@ func TestSyncE2E(t *testing.T) {
 	}
 
 	s := &Sync{
-		SourceDSN:     sourceDSN,
-		TargetDSN:     targetDSN,
-		Threads:       2,
-		WriteThreads:  2,
-		FlushInterval: 100 * time.Millisecond,
+		SourceDSN:      sourceDSN,
+		TargetDSN:      targetDSN,
+		Threads:        2,
+		WriteThreads:   16,
+		MaxConnections: 2,
+		Target:         &applier.Target{DB: tgt, Config: dest},
+		FlushInterval:  100 * time.Millisecond,
 	}
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
@@ -162,6 +164,10 @@ func TestSyncE2E(t *testing.T) {
 	case <-time.After(60 * time.Second):
 		t.Fatal("sync did not stop within 60s of cancellation")
 	}
+	require.Equal(t, 2, runner.source.db.Stats().MaxOpenConnections)
+	require.Equal(t, 2, runner.target.DB.Stats().MaxOpenConnections)
+	require.Equal(t, 2, runner.sourceDBConfig.MaxOpenConnections)
+	require.Equal(t, 2, runner.targetDBConfig.MaxOpenConnections)
 	require.NoError(t, runner.Close())
 }
 

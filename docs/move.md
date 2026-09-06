@@ -17,6 +17,7 @@ This will copy all tables from the source database to the target database, verif
 - [defer-cutover](#defer-cutover)
 - [defer-secondary-indexes](#defer-secondary-indexes)
 - [force](#force)
+- [max-connections](#max-connections)
 - [reverse-window](#reverse-window)
 - [source-dsn](#source-dsn)
 - [target-chunk-size](#target-chunk-size)
@@ -74,6 +75,15 @@ When set to `true`, target tables are created without secondary indexes. The ind
 When Move cannot resume from an existing checkpoint — for example the checkpoint was written by an incompatible Spirit version, or the target is in a state the resume path cannot validate — it fails rather than risk corrupting a partially-copied target (see [checkpoint-max-age](#checkpoint-max-age)).
 
 Passing `--force` changes that recovery behaviour: instead of failing, Move wipes the target tables and starts the copy fresh, checking for source-side failures before wiping and re-running the full post-setup checks against the cleaned target. Expired checkpoints and malformed or missing source positions are eligible for forced recovery; transient read or connection failures are not. Source and target must refer to different databases, even if different hostnames or credentials are used. Use it only when the target's current contents can safely be discarded.
+
+### max-connections
+
+- Type: Integer
+- Default value: `128`
+
+Sets the fixed size of each source and target connection pool, matching `migrate`. Read and write workers share these pools; increasing worker counts does not grow them. Dedicated monitoring and advisory-lock connections are separate.
+
+The explicit budget must cover `--threads` plus six connections of checksum headroom. During setup, the reserve grows by one connection per source table beyond the first. For example, 20 tables reserve 25 connections, and a smaller pool lowers read concurrency to a minimum of one, allowing background queries to queue. Reusing a connection handle across targets also requires room for each target’s checksum snapshots and locks. Any reduction in read concurrency is logged at INFO. Write workers may wait for a connection. This is a per-pool limit, not a total across the move.
 
 ### reverse-window
 
