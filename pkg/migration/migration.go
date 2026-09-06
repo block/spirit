@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
-	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
@@ -35,7 +34,7 @@ const defaultThreads = 4
 // This one matters more than most, because it is the pool size itself rather
 // than a knob on one: a programmatic caller that landed somewhere else would be
 // running with a differently-sized pool than the same migration from the CLI.
-const defaultMaxConnections = dbconn.DefaultMaxConnections
+const defaultMaxConnections = 128
 
 var (
 	defaultHost     = "127.0.0.1"
@@ -130,7 +129,7 @@ type Migration struct {
 // Nothing else gets a say. The copy, the checksum and the drain all queue on a
 // small pool and finish eventually, so a low --max-connections is the operator
 // asking for a slow migration, which is theirs to ask for.
-const minPoolSize = dbconn.MinMigrationPoolSize
+const minPoolSize = 5
 
 // Validate is called by Kong after parsing to reject invalid flag values.
 // Zero values mean "use the default" (normalizeOptions fills them in), so they
@@ -154,11 +153,35 @@ func (m *Migration) Validate() error {
 	if m.CheckpointMaxAge < 0 {
 		return fmt.Errorf("--checkpoint-max-age must be non-negative, got %s", m.CheckpointMaxAge)
 	}
-	threads := m.Threads
-	if threads == 0 {
-		threads = defaultThreads
+	if m.MaxConnections < 0 {
+		return fmt.Errorf("--max-connections must be non-negative, got %d", m.MaxConnections)
 	}
-	return dbconn.ValidateMaxConnections(m.MaxConnections, threads, minChecksumPhaseReserve)
+	if m.MaxConnections > 0 {
+		if m.MaxConnections < minPoolSize {
+			return fmt.Errorf("--max-connections must be at least %d for the cutover to run, got %d",
+				minPoolSize, m.MaxConnections)
+		}
+		// The checksum's read transactions each pin a connection for the whole
+		// phase whether or not a worker has one checked out, so the pool has to
+		// hold them *plus* everything that has to keep running alongside them:
+		// the checksum's own off-pool queries, the control plane, and the drain
+		// (see checksumPhaseReserve). A pool that only just fits the
+		// transactions is not a slow checksum, it is a checksum during which the
+		// drain cannot check out a connection at all.
+		//
+		// Threads is read through defaultThreads because zero here means "use
+		// the default" and normalizeOptions has not run yet — validating the 0
+		// would accept a pool that the 4 it becomes cannot run on.
+		threads := m.Threads
+		if threads == 0 {
+			threads = defaultThreads
+		}
+		if pinned := threads + minChecksumPhaseReserve; m.MaxConnections < pinned {
+			return fmt.Errorf("--max-connections (%d) is below what the checksum phase needs: %d pinned read transactions plus %d reserved for off-pool queries, the control plane and the drain; use at least %d, or lower --threads",
+				m.MaxConnections, threads, minChecksumPhaseReserve, pinned)
+		}
+	}
+	return nil
 }
 
 func (m *Migration) Run() error {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
-	"sync"
 	"testing"
 	"time"
 
@@ -53,39 +52,13 @@ func TestBasicMove(t *testing.T) {
 
 	// test
 	move := &Move{
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		Threads:        2,
-		WriteThreads:   16,
-		MaxConnections: 8,
-		DeferCutOver:   false,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      2,
+		WriteThreads: 2,
+		DeferCutOver: false,
 	}
-	runner, err := NewRunner(move)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, runner.Close()) })
-	pollCtx, stopPolling := context.WithCancel(t.Context())
-	var pollers sync.WaitGroup
-	pollers.Go(func() {
-		for {
-			select {
-			case <-pollCtx.Done():
-				return
-			default:
-				_ = runner.Progress()
-			}
-		}
-	})
-	runErr := runner.Run(t.Context())
-	stopPolling()
-	pollers.Wait()
-	require.NoError(t, runErr)
-	require.Equal(t, 8, runner.dbConfig.MaxOpenConnections)
-	for _, source := range runner.sources {
-		require.Equal(t, 8, source.db.Stats().MaxOpenConnections)
-	}
-	for _, target := range runner.targets {
-		require.Equal(t, 8, target.DB.Stats().MaxOpenConnections)
-	}
+	require.NoError(t, move.Run())
 }
 func TestResumeFromCheckpointE2E(t *testing.T) {
 	t.Run("deferFalse", func(t *testing.T) { // known to race.
