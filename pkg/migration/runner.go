@@ -1475,34 +1475,10 @@ func (r *Runner) Progress() status.Progress {
 	// Get per-table progress if available (multi-table migrations).
 	// We hold chunkerMu to synchronize with initChunkers(), which
 	// may be assigning r.copyChunker concurrently during setup.
-	var tables []status.TableProgress
 	r.chunkerMu.RLock()
 	copyChunker := r.copyChunker
 	r.chunkerMu.RUnlock()
-	if mc, ok := copyChunker.(interface{ PerTableProgress() []table.TableProgress }); ok {
-		for _, tp := range mc.PerTableProgress() {
-			tables = append(tables, status.TableProgress{
-				TableName:  tp.TableName,
-				RowsCopied: tp.RowsCopied,
-				RowsTotal:  tp.RowsTotal,
-				IsComplete: tp.IsComplete,
-			})
-		}
-	} else if copyChunker != nil {
-		// Single table migration - get progress from chunker
-		rowsCopied, _, rowsTotal := copyChunker.Progress()
-		tableTables := copyChunker.Tables()
-		tableName := ""
-		if len(tableTables) > 0 {
-			tableName = tableTables[0].TableName
-		}
-		tables = append(tables, status.TableProgress{
-			TableName:  tableName,
-			RowsCopied: rowsCopied,
-			RowsTotal:  rowsTotal,
-			IsComplete: copyChunker.IsRead(),
-		})
-	}
+	tables := status.TablesFromChunker(copyChunker)
 	return status.Progress{
 		CurrentState: state,
 		Summary:      summary,
