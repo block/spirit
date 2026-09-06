@@ -38,6 +38,7 @@ import (
 // Move.WriteThreads, so a programmatic caller that leaves the field unset lands
 // on the same value the CLI does.
 const defaultWriteThreads = 4
+const defaultThreads = 2
 
 var (
 	tableStatUpdateInterval = 5 * time.Minute
@@ -194,6 +195,16 @@ type Runner struct {
 var _ status.Task = (*Runner)(nil)
 
 func NewRunner(m *Move) (*Runner, error) {
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
+	if m.MaxConnections == 0 {
+		m.MaxConnections = dbconn.DefaultMaxConnections
+	}
+	if m.Threads == 0 {
+		m.Threads = defaultThreads
+	}
+
 	// Normalize CheckpointMaxAge here rather than in a Validate hook:
 	// orchestration callers construct Move programmatically (bypassing the
 	// Kong default of 168h), so a zero value means "use the default". This
@@ -208,16 +219,12 @@ func NewRunner(m *Move) (*Runner, error) {
 		m.TargetChunkSize = table.DefaultTargetChunkBytes
 	}
 	// WriteThreads has no "0 means auto" meaning any more, so fill in the Kong
-	// default; move does not autoscale, so nothing downstream would. Non-positive
-	// rather than zero: MaxOpenConnections is Threads + WriteThreads + 2 below, and
-	// a negative count would make that negative, which SetMaxOpenConns reads as
-	// *unlimited*. Warn on an explicit 0, which used to mean "size from the
-	// instance" and would otherwise silently become 4.
-	if m.WriteThreads <= 0 {
-		if m.WriteThreads == 0 {
-			slog.Default().Warn("--write-threads 0 no longer means auto-size; using the default",
-				"write_threads", defaultWriteThreads)
-		}
+	// default for programmatic callers as well. Warn on
+	// an explicit 0, which used to mean "size from the instance" and would
+	// otherwise silently become 4.
+	if m.WriteThreads == 0 {
+		slog.Default().Warn("--write-threads 0 no longer means auto-size; using the default",
+			"write_threads", defaultWriteThreads)
 		m.WriteThreads = defaultWriteThreads
 	}
 	r := &Runner{
@@ -646,16 +653,8 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
 
-	// Grow connection pools to cover both the copy (read) threads and the apply
-	// (write) threads, in case the pool set before connecting was smaller.
-	if poolSize := r.move.Threads + r.move.WriteThreads + 2; poolSize > r.dbConfig.MaxOpenConnections {
-		r.dbConfig.MaxOpenConnections = poolSize
-		for i := range r.sources {
-			dbconn.SetPoolSize(r.sources[i].db, poolSize)
-		}
-		for i := range r.targets {
-			dbconn.SetPoolSize(r.targets[i].DB, poolSize)
-		}
+	if err := r.fitReadThreadsToPools(); err != nil {
+		return err
 	}
 
 	// Create a single applier instance shared by all repl clients and the copier.
@@ -1121,8 +1120,8 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 
 	r.dbConfig = dbconn.NewDBConfig()
 	// ForceKill is now true by default in NewDBConfig(), no need to set explicitly.
-	// Buffered copier needs more connections due to parallel read/write workers
-	r.dbConfig.MaxOpenConnections = r.move.Threads + r.move.WriteThreads + 2
+	// Worker counts do not grow the configured connection pools.
+	r.dbConfig.MaxOpenConnections = r.move.MaxConnections
 
 	// Build the list of source DSNs. If SourceDSNs is set (N:M), use it.
 	// Otherwise, use SourceDSN as the single source (backward compat).
@@ -1187,6 +1186,12 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 			Config:   targetConfig,
 		}}
 		r.logger.Debug("Created single target from TargetDSN")
+	}
+	// Apply the same exact budget to caller-supplied target handles too.
+	for _, target := range r.targets {
+		if target.DB != nil {
+			dbconn.SetPoolSize(target.DB, r.move.MaxConnections)
+		}
 	}
 	// Sort targets by targetKey (addr/dbname/keyrange) for deterministic
 	// ordering. The checkpoint is written to targets[0], so the order must be
@@ -2009,6 +2014,8 @@ func (r *Runner) Progress() status.Progress {
 		ETA:          eta,
 		Checksum:     checksum,
 		Tables:       tables,
+		// Throttle is deliberately zero: move currently uses a Noop throttler.
+		// Populate it when move gains throttling support.
 	}
 }
 

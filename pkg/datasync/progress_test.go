@@ -46,10 +46,8 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	r.status.Set(status.ApplyChangeset)
 	require.Empty(t, r.Progress().ETA)
 	require.Empty(t, r.Progress().Checksum) // The continuous verifier has no finite initial-checksum phase.
-	for _, phase := range []status.State{status.RestoreSecondaryIndexes, status.AnalyzeTable} {
-		r.status.Set(phase)
-		block = r.Status()
-		require.Contains(t, block, "state-time=")
-		require.Contains(t, block, "\n  ckpt")
-	}
+	r.status.Set(status.RestoreSecondaryIndexes)
+	block = r.Status()
+	require.Contains(t, block, "state-time=")
+	require.Contains(t, block, "\n  ckpt")
 }
