@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,4 +40,25 @@ func TestMoveSharedSnapshotPoolBudget(t *testing.T) {
 	require.Equal(t, 1, r.move.Threads)
 	r.targets = append(r.targets, applier.Target{DB: db}, applier.Target{DB: db})
 	require.ErrorContains(t, r.fitReadThreadsToPools(), "checksum snapshot pools")
+}
+
+func TestMoveSharedSnapshotLockReserve(t *testing.T) {
+	r, err := NewRunner(&Move{Threads: 2, MaxConnections: 16})
+	require.NoError(t, err)
+	db := new(sql.DB)
+	for range 5 {
+		r.targets = append(r.targets, applier.Target{DB: db})
+	}
+	// Five locks plus two spare connections reserve seven slots, leaving
+	// nine for five snapshot pools: one reader each, not two.
+	require.NoError(t, r.fitReadThreadsToPools())
+	require.Equal(t, 1, r.move.Threads)
+}
+
+func TestMoveTableStatisticsReserve(t *testing.T) {
+	r, err := NewRunner(&Move{Threads: 4, MaxConnections: 12})
+	require.NoError(t, err) // Parse-time headroom fits, before table discovery.
+	r.sourceTables = make([]*table.TableInfo, 20)
+	require.NoError(t, r.fitReadThreadsToPools())
+	require.Equal(t, 1, r.move.Threads)
 }

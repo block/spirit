@@ -119,6 +119,8 @@ func (s *Sync) Validate() error {
 	if s.FlushInterval < 0 {
 		return fmt.Errorf("--flush-interval must be non-negative, got %s", s.FlushInterval)
 	}
+	// Continuous sync has no cutover or pinned checksum snapshots, so it
+	// only needs the general limit validation, not finite-run headroom.
 	return dbconn.ValidateConnectionLimit(s.MaxConnections)
 }
 

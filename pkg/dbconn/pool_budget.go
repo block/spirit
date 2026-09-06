@@ -30,7 +30,9 @@ func ValidateMaxConnections(maxConnections, readers, reserve int) error {
 
 // ReadBoundsForPool fits BOTH bounds of a reader pool without growing the
 // connection pool. Checksums pre-open a snapshot transaction per ceiling slot:
-// fitting just the ceiling fails because consumers floor it back to the start.
+// fitting just the ceiling fails because consumers floor it back to the start
+// (see checksum.NewChecker and the copier's resolveReadCeiling). Snapshot
+// creation under one table lock is in SingleChecker.initConnPool.
 // The caller supplies its lifecycle-specific reserve. Unresolved connection
 // limits pass through; a small budget retains one reader so it can progress.
 func ReadBoundsForPool(start, ceiling, maxConnections, reserve int) (int, int) {
@@ -43,7 +45,7 @@ func ReadBoundsForPool(start, ceiling, maxConnections, reserve int) (int, int) {
 
 // ValidateConnectionLimit rejects negative limits, which database/sql would
 // otherwise interpret as unlimited. Zero means the runner should apply its
-// default. Continuous syncs do not require cutover or pinned-snapshot headroom.
+// default.
 func ValidateConnectionLimit(limit int) error {
 	if limit < 0 {
 		return fmt.Errorf("--max-connections must be non-negative, got %d", limit)

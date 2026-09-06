@@ -3,8 +3,6 @@ package move
 import (
 	"database/sql"
 	"fmt"
-
-	"github.com/block/spirit/pkg/dbconn"
 )
 
 // As in migration, reserve checksum repair/prefetch, checkpoint/flush polling,
@@ -40,10 +38,9 @@ func (r *Runner) fitReadThreadsToPools() error {
 	// Preserve at least one reader, matching migration; advisory control-plane
 	// queries may queue when the requested budget cannot cover all headroom.
 	available := max(1, (r.move.MaxConnections-reserve)/copies)
-	ceiling := r.move.Threads
-	start, ceiling := dbconn.ReadBoundsForPool(r.move.Threads, ceiling, available, 0)
-	if start != r.move.Threads || ceiling != r.move.Threads {
-		r.logger.Info("fitting read threads to the connection pool", "threads", start, "max_read_threads", ceiling, "max_connections", r.move.MaxConnections, "reserved", reserve)
+	start := min(r.move.Threads, available)
+	if start != r.move.Threads {
+		r.logger.Info("fitting read threads to the connection pool", "threads", start, "max_connections", r.move.MaxConnections, "reserved", reserve)
 	}
 	r.move.Threads = start
 	return nil
