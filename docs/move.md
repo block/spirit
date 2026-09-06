@@ -83,7 +83,7 @@ Passing `--force` changes that recovery behaviour: instead of failing, Move wipe
 
 Sets the fixed size of each source and target connection pool, matching `migrate`. Read and write workers share these pools; increasing worker counts does not grow them. Dedicated monitoring and advisory-lock connections are separate.
 
-The explicit budget must cover `--threads` plus six connections of checksum headroom. During setup, read concurrency are fitted to the pool, accounting for table statistics queries and checksum snapshots. Write workers may wait for a connection. This is a per-pool limit, not a total across the move.
+The explicit budget must cover `--threads` plus six connections of checksum headroom. During setup, read concurrency is fitted to the pool, accounting for table statistics queries and checksum snapshots. Write workers may wait for a connection. This is a per-pool limit, not a total across the move.
 
 ### reverse-window
 
