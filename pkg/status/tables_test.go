@@ -1,6 +1,7 @@
 package status
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
@@ -34,4 +35,31 @@ func TestTablesFromChunkerReportsActualRows(t *testing.T) {
 	rows := TablesFromChunker(table.NewMultiChunker(sparse, other))
 	require.EqualValues(t, 2, rows[1].RowsCopied)
 	require.EqualValues(t, 4, rows[1].RowsTotal)
+}
+
+func TestTablesFromChunkerExcludesShadowEstimate(t *testing.T) {
+	for _, autoInc := range []bool{false, true} {
+		for _, shadow := range []bool{false, true} {
+			name := fmt.Sprintf("autoInc=%v/shadow=%v", autoInc, shadow)
+			t.Run(name, func(t *testing.T) {
+				source := &table.TableInfo{TableName: "items", SchemaName: "test", KeyColumns: []string{"id"}, KeyIsAutoInc: autoInc, EstimatedRows: 100}
+				config := table.ChunkerConfig{}
+				if shadow {
+					config.NewTable = &table.TableInfo{TableName: "_items_new", EstimatedRows: 75}
+				}
+				chunker, err := table.NewChunker(source, config)
+				require.NoError(t, err)
+				require.Len(t, chunker.Tables(), 2)
+				if !shadow {
+					require.Same(t, source, chunker.Tables()[1])
+				}
+				require.EqualValues(t, 100, TablesFromChunker(chunker)[0].RowsTotal)
+				multi := table.NewMultiChunker(chunker, table.NewMockChunker("other", 20))
+				rows := TablesFromChunker(multi)
+				require.Len(t, rows, 2)
+				require.EqualValues(t, 100, rows[0].RowsTotal)
+				require.EqualValues(t, 20, rows[1].RowsTotal)
+			})
+		}
+	}
 }
