@@ -48,8 +48,9 @@ var _ MappedChunker = &MockChunker{}
 // NewMockChunker creates a new mock chunker for testing
 func NewMockChunker(tableName string, totalRows uint64) *MockChunker {
 	tableInfo := &TableInfo{
-		TableName:  tableName,
-		SchemaName: "test",
+		TableName:     tableName,
+		SchemaName:    "test",
+		EstimatedRows: totalRows,
 	}
 
 	return &MockChunker{

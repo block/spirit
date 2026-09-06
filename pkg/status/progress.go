@@ -170,7 +170,7 @@ func fraction(done, total uint64) float64 {
 // TableProgress tracks progress for a single table in the migration.
 type TableProgress struct {
 	TableName  string // name of the table being migrated
-	RowsCopied uint64 // rows copied so far
-	RowsTotal  uint64 // total rows expected
+	RowsCopied uint64 // actual rows settled; may exclude earlier work on resume
+	RowsTotal  uint64 // estimated table cardinality, not an upper bound
 	IsComplete bool   // true if this table's copy is complete
 }

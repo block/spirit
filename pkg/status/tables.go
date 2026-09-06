@@ -16,7 +16,7 @@ func TablesFromChunker(chunker table.Chunker) []TableProgress {
 			rows = append(rows, TableProgress{TableName: tp.TableName, RowsCopied: tp.RowsCopied, RowsTotal: tp.RowsTotal, IsComplete: tp.IsComplete})
 		}
 	} else if chunker != nil {
-		copied, _, total := chunker.Progress()
+		copied, total := table.CopyRowCounts(chunker)
 		name := ""
 		if tables := chunker.Tables(); len(tables) > 0 {
 			name = tables[0].TableName

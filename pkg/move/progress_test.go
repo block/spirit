@@ -119,11 +119,13 @@ func TestMoveProgressPolledConcurrently(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	var pollers sync.WaitGroup
 	pollers.Go(func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-ticker.C:
 				_ = runner.Progress()
 			}
 		}
