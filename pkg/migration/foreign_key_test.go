@@ -21,7 +21,7 @@ import (
 // Spirit does not support foreign keys, so the correct outcome is a refusal.
 func TestForeignKeyCrossSchemaInboundRefused(t *testing.T) {
 	// Not parallel: it creates and drops its own schema.
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() }) //nolint:errcheck // test cleanup
 

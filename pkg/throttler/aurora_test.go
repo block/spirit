@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,7 +22,7 @@ func TestAuroraSetup_NonAuroraReturnsEmpty(t *testing.T) {
 	// Real local MySQL: IsAurora returns false (no AuroraDb_* vars). The
 	// helper must skip and not open a monitor pool — that's the gate we
 	// rely on to keep non-Aurora callers from paying any cost.
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -49,7 +49,7 @@ func TestAuroraSetup_NonAuroraSkipsMonitorEvenWithZeroThreshold(t *testing.T) {
 	// must still probe IsAurora when threshold is 0 — but on a non-Aurora
 	// source it still ends up with no throttlers and must not open a monitor
 	// pool.
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -70,7 +70,7 @@ func TestAuroraSetup_NonAuroraSkipsMonitorEvenWithZeroThreshold(t *testing.T) {
 }
 
 func TestAuroraSetup_RejectsNilRequiredFields(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	openMon := func() (*sql.DB, error) { return nil, nil }
@@ -93,7 +93,7 @@ func TestAuroraSetup_IsAuroraProbeFailureIsNonFatal(t *testing.T) {
 	// The helper logs at Debug and returns a zero result rather than
 	// failing the whole migration; we'd rather skip Aurora throttling
 	// than refuse to migrate on a transient probe failure.
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 

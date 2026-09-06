@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -172,7 +172,7 @@ func TestStatusRowNil(t *testing.T) {
 func TestSingleTargetApplierStatsFresh(t *testing.T) {
 	base, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	db, err := sql.Open("mysql", base.FormatDSN())
+	db, err := sql.Open("block-mysql", base.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -205,13 +205,13 @@ func TestSingleTargetApplierStatsQueueDepth(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "stats_queue_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target := base.Clone()
 	target.DBName = "stats_queue_target"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -294,13 +294,13 @@ func TestSingleTargetApplierStatsRoundTrip(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "stats_rt_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target := base.Clone()
 	target.DBName = "stats_rt_target"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -375,7 +375,7 @@ func TestSplitCounterCountsAtSplitTime(t *testing.T) {
 	require.NoError(t, err)
 	target := base.Clone()
 	target.DBName = "split_count_target"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 

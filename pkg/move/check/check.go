@@ -10,9 +10,9 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/table"
-	"github.com/go-sql-driver/mysql"
 )
 
 // ScopeFlag scopes a check

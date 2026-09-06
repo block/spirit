@@ -4,8 +4,8 @@ import (
 	"database/sql"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,7 +24,7 @@ func TestLoadSchemaFromDB(t *testing.T) {
 		KEY idx_user_id (user_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -48,7 +48,7 @@ func TestLoadSchemaFromDB(t *testing.T) {
 func TestLoadSchemaFromDB_EmptyDatabase(t *testing.T) {
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -66,7 +66,7 @@ func TestLoadSchemaFromDB_PreservesAutoIncrement(t *testing.T) {
 		PRIMARY KEY (id)
 	) ENGINE=InnoDB AUTO_INCREMENT=1000 DEFAULT CHARSET=utf8mb4`)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -83,7 +83,7 @@ func TestLoadSchemaFromDB_FilterUnderscoreTables(t *testing.T) {
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE _vt_shadow (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE _pending_drops (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -106,7 +106,7 @@ func TestLoadSchemaFromDB_FilterArchiveTables(t *testing.T) {
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE orders_archive_2024_01 (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE logs_archive_2024_01_15 (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -129,7 +129,7 @@ func TestLoadSchemaFromDB_StripAutoIncrement(t *testing.T) {
 		PRIMARY KEY (id)
 	) ENGINE=InnoDB AUTO_INCREMENT=1000 DEFAULT CHARSET=utf8mb4`)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -159,7 +159,7 @@ func TestLoadSchemaFromDB_CombinedFilters(t *testing.T) {
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE _shadow (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users_archive_2024 (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(dbName))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 

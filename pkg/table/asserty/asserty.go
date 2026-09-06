@@ -7,8 +7,8 @@ import (
 	"errors"
 	"slices"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
-	_ "github.com/go-sql-driver/mysql"
 )
 
 type Table struct {

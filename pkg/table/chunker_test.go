@@ -17,7 +17,7 @@ func TestCompositeChunker(t *testing.T) {
 	)`
 	testutils.RunSQL(t, table)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -41,7 +41,7 @@ func TestOptimisticChunker(t *testing.T) {
 	)`
 	testutils.RunSQL(t, table)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -67,7 +67,7 @@ func TestNewCompositeChunkerWithKeyAndWhere(t *testing.T) {
 	)`
 	testutils.RunSQL(t, table)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {

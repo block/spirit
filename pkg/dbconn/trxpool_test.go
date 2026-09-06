@@ -7,14 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
 func TestTrxPool(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -75,7 +75,7 @@ func TestTrxPool(t *testing.T) {
 // because a nil (*sql.Tx).ExecContext checks ctx.Done() before it
 // dereferences the receiver.
 func TestTrxPoolBeginError(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(t.Context()))
 	require.NoError(t, db.Close()) // BeginTx now fails with "sql: database is closed"
@@ -91,7 +91,7 @@ func TestTrxPoolBeginError(t *testing.T) {
 // through pool creation, NewTrxPool returns an error and the transactions
 // created by earlier iterations are rolled back (no connection leak).
 func TestTrxPoolBeginErrorMidLoop(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()))
@@ -142,7 +142,7 @@ func TestTrxPoolKeepalive(t *testing.T) {
 	// The server kills connections idle for >6s. The pool reads this back
 	// via @@wait_timeout and pings its idle transactions every 3s.
 	cfg.Params["wait_timeout"] = "6"
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -192,7 +192,7 @@ func TestTrxPoolCloseAfterConnectionLoss(t *testing.T) {
 		cfg.Params = map[string]string{}
 	}
 	cfg.Params["wait_timeout"] = "6"
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -255,7 +255,7 @@ func TestTrxPoolCloseAfterCanceledStatement(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			db, err := sql.Open("mysql", testutils.DSN())
+			db, err := sql.Open("block-mysql", testutils.DSN())
 			require.NoError(t, err)
 			defer utils.CloseAndLog(db)
 

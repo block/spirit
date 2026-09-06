@@ -8,15 +8,15 @@ import (
 	"strings"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := testutils.DSN()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db

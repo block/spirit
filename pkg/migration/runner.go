@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/autoscale"

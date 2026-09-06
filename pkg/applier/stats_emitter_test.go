@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -145,7 +145,7 @@ func TestSingleTargetApplierEmitsStats(t *testing.T) {
 
 	base, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	db, err := sql.Open("mysql", base.FormatDSN())
+	db, err := sql.Open("block-mysql", base.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -174,10 +174,10 @@ func TestShardedApplierEmitsStats(t *testing.T) {
 
 	base, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	db1, err := sql.Open("mysql", base.FormatDSN())
+	db1, err := sql.Open("block-mysql", base.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db1)
-	db2, err := sql.Open("mysql", base.FormatDSN())
+	db2, err := sql.Open("block-mysql", base.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db2)
 
@@ -207,7 +207,7 @@ func TestNilSinkStartsNoEmitter(t *testing.T) {
 
 	base, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	db, err := sql.Open("mysql", base.FormatDSN())
+	db, err := sql.Open("block-mysql", base.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

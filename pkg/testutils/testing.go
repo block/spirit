@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -69,7 +69,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	}
 	rootDSN := baseDSN[:lastSlash+1]
 
-	rootDB, err := sql.Open("mysql", rootDSN)
+	rootDB, err := sql.Open("block-mysql", rootDSN)
 	require.NoError(t, err)
 	defer func() {
 		_ = rootDB.Close()
@@ -78,13 +78,13 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, err)
 
 	// Open a connection scoped to the new database
-	scopedDB, err := sql.Open("mysql", rootDSN+dbName)
+	scopedDB, err := sql.Open("block-mysql", rootDSN+dbName)
 	require.NoError(t, err)
 
 	// Register cleanup to close the connection and drop the database
 	t.Cleanup(func() {
 		_ = scopedDB.Close()
-		cleanupDB, err := sql.Open("mysql", rootDSN)
+		cleanupDB, err := sql.Open("block-mysql", rootDSN)
 		require.NoError(t, err)
 		defer func() {
 			_ = cleanupDB.Close()
@@ -127,7 +127,7 @@ var vectorSupported struct {
 func SkipUnlessVectorSupported(t *testing.T) {
 	t.Helper()
 	vectorSupported.Do(func() {
-		db, err := sql.Open("mysql", DSN())
+		db, err := sql.Open("block-mysql", DSN())
 		if err != nil {
 			vectorSupported.err = err
 			return
@@ -166,7 +166,7 @@ func isUnknownFunctionErr(err error) bool {
 func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 	t.Helper()
 	dsn := DSNForDatabase(dbName)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -177,7 +177,7 @@ func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 
 func RunSQL(t *testing.T, stmt string) {
 	t.Helper()
-	db, err := sql.Open("mysql", DSN())
+	db, err := sql.Open("block-mysql", DSN())
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -193,7 +193,7 @@ func RunSQL(t *testing.T, stmt string) {
 // distinguishable from a Spirit migration bug.
 func WaitForReplicaHealthy(t *testing.T, dsn string, timeout time.Duration) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

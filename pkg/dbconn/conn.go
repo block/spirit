@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 )
 
 const (
@@ -386,7 +386,7 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 	// For PREFERRED mode, implement fallback behavior
 	if config.TLSMode == "PREFERRED" {
 		// First try with TLS
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err == nil {
 			//nolint: noctx // requires too much refactoring
 			if pingErr := db.Ping(); pingErr == nil {
@@ -424,7 +424,7 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 			return nil, fmt.Errorf("failed to create fallback DSN for %s connection: %w", connectionType, err)
 		}
 
-		db, err = sql.Open("mysql", fallbackDSN)
+		db, err = sql.Open("block-mysql", fallbackDSN)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open fallback %s connection: %w", connectionType, err)
 		}
@@ -437,7 +437,7 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 	}
 
 	// For all other modes, use standard connection
-	db, err = sql.Open("mysql", dsn)
+	db, err = sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s connection: %w", connectionType, err)
 	}

@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,7 +44,7 @@ func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 	tt := &TestTable{Name: name}
 
 	// Open a DB connection for this table (used for cleanup and verification).
-	db, err := sql.Open("mysql", DSN())
+	db, err := sql.Open("block-mysql", DSN())
 	require.NoError(t, err)
 	tt.DB = db
 

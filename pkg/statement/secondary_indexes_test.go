@@ -614,7 +614,7 @@ func TestGetMissingSecondaryIndexes_FunctionalIndexes(t *testing.T) {
 // TABLE output is fed into GetMissingSecondaryIndexes and the resulting ALTER
 // is executed on the target.
 func TestGetMissingSecondaryIndexes_FunctionalIndexesLiveMySQL(t *testing.T) {
-	admin, err := sql.Open("mysql", testutils.DSN())
+	admin, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_, err := admin.ExecContext(context.Background(), "DROP DATABASE IF EXISTS test_w2d")
@@ -627,7 +627,7 @@ func TestGetMissingSecondaryIndexes_FunctionalIndexesLiveMySQL(t *testing.T) {
 	_, err = admin.ExecContext(t.Context(), "CREATE DATABASE test_w2d")
 	require.NoError(t, err)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase("test_w2d"))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase("test_w2d"))
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, db.Close())
@@ -753,7 +753,7 @@ func TestGetMissingSecondaryIndexes_DescendingIndexes(t *testing.T) {
 // GetMissingSecondaryIndexes, the generated ALTER is executed on the target,
 // and the target really ends up with a descending index.
 func TestGetMissingSecondaryIndexes_DescendingIndexesLiveMySQL(t *testing.T) {
-	admin, err := sql.Open("mysql", testutils.DSN())
+	admin, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_, err := admin.ExecContext(context.Background(), "DROP DATABASE IF EXISTS test_descidx")
@@ -766,7 +766,7 @@ func TestGetMissingSecondaryIndexes_DescendingIndexesLiveMySQL(t *testing.T) {
 	_, err = admin.ExecContext(t.Context(), "CREATE DATABASE test_descidx")
 	require.NoError(t, err)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase("test_descidx"))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase("test_descidx"))
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, db.Close())

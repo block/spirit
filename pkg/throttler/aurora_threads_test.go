@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -221,7 +221,7 @@ func TestNewAuroraThreadsThrottler_RejectsNilDB(t *testing.T) {
 }
 
 func TestThreadsRunningQuery_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -235,7 +235,7 @@ func TestThreadsRunningQuery_LocalMySQL(t *testing.T) {
 }
 
 func TestRedoAwareThreadsQuery_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -250,7 +250,7 @@ func TestRedoAwareThreadsQuery_LocalMySQL(t *testing.T) {
 }
 
 func TestCanReadRedoAwareThreads_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -279,7 +279,7 @@ func TestResolveMaxWriteThreads(t *testing.T) {
 }
 
 func TestAuroraVCPUs_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -293,7 +293,7 @@ func TestAuroraVCPUs_LocalMySQL(t *testing.T) {
 }
 
 func TestSamplingCancelIsShutdownError(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

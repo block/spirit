@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 )
 

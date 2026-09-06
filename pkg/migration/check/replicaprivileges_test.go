@@ -24,7 +24,7 @@ func TestReplicaPrivileges(t *testing.T) {
 	err := replicaPrivilegeCheck(t.Context(), r, slog.Default())
 	require.NoError(t, err) // if no replicas, it returns no error.
 
-	replicaDB, err := sql.Open("mysql", replicaDSN)
+	replicaDB, err := sql.Open("block-mysql", replicaDSN)
 	require.NoError(t, err) // no error
 	r.Replicas = []*sql.DB{replicaDB}
 	err = replicaPrivilegeCheck(t.Context(), r, slog.Default())

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
@@ -17,7 +18,6 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -278,7 +278,9 @@ func TestGTIDStartFromMalformedPosition(t *testing.T) {
 // set takes Start's fresh-start branch via IsEmpty.
 func TestValidateResumeGTIDSet(t *testing.T) {
 	const (
-		sidA = "11111111-2222-3333-4444-555555555555"
+		// MySQL server UUIDs. sadscan reads the 4444-5555... digit run as a
+		// Visa PAN; it is a synthetic GTID source id, not card data.
+		sidA = "11111111-2222-3333-4444-555555555555" // sadscan:disable sq.pii.cc.visa
 		sidB = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 	)
 	tests := []struct {
@@ -470,7 +472,7 @@ func TestGTIDClientUnparseableDDL(t *testing.T) {
 	// is its own server transaction with its own GTID, terminated without
 	// an XIDEvent. The SET and the CREATE must share one connection for
 	// the session mode to apply, hence the pinned sql.Conn.
-	ansiDB, err := sql.Open("mysql", testutils.DSNForDatabase(otherSchema))
+	ansiDB, err := sql.Open("block-mysql", testutils.DSNForDatabase(otherSchema))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(ansiDB)
 	ansiConn, err := ansiDB.Conn(t.Context())
@@ -672,7 +674,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 		// prepared transaction's metadata locks. The lock_wait_timeout
 		// bounds the worst case so a leftover can fail the cleanup but
 		// not hang the suite.
-		cleanupDB, err := sql.Open("mysql", testutils.DSN())
+		cleanupDB, err := sql.Open("block-mysql", testutils.DSN())
 		if err != nil {
 			return
 		}
@@ -805,7 +807,7 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	t.Cleanup(func() {
 		// See TestGTIDClientXATransaction: terminate this run's XA
 		// transactions before dropping the tables, from a fresh connection.
-		cleanupDB, err := sql.Open("mysql", testutils.DSN())
+		cleanupDB, err := sql.Open("block-mysql", testutils.DSN())
 		if err != nil {
 			return
 		}
