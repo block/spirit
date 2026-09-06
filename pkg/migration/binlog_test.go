@@ -207,7 +207,8 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	m.dbConfig = dbconn.NewDBConfig()
 	require.NoError(t, m.checksum(t.Context()))
 	require.Equal(t, "postChecksum", m.status.Get().String())
-	require.Equal(t, status.Progress{CurrentState: status.PostChecksum, Summary: "Applying Changeset Deltas=0", Tables: []status.TableProgress{{TableName: "e2et1", RowsCopied: 1201, RowsTotal: 1200, IsComplete: true}}}, m.Progress())
+	// The copy reading outlives the copy phase.
+	require.Equal(t, status.Progress{CurrentState: status.PostChecksum, Summary: "Applying Changeset Deltas=0", Copy: status.CopyProgress{RowsCopied: 1201, RowsTotal: 1200}, Tables: []status.TableProgress{{TableName: "e2et1", RowsCopied: 1201, RowsTotal: 1200, IsComplete: true}}}, m.Progress())
 
 	// All done!
 	require.Equal(t, 0, m.db.Stats().InUse) // all connections are returned.

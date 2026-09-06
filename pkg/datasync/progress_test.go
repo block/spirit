@@ -5,23 +5,11 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/copier"
+	"github.com/block/spirit/pkg/copier/copiertest"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/require"
 )
-
-type progressCopier struct{ copier.Copier }
-
-func (progressCopier) GetProgress() string { return "50%" }
-func (progressCopier) GetETA() string      { return "1m" }
-func (progressCopier) GetETAState() status.ETA {
-	return status.ETA{State: status.ETAReady, Duration: time.Minute}
-}
-func (progressCopier) CopyProgress() status.CopyProgress {
-	return status.CopyProgress{RowsCopied: 50, RowsTotal: 100}
-}
-func (progressCopier) ChunkSize() uint64 { return 25 }
 
 type progressApplier struct{ applier.Applier }
 
@@ -32,13 +20,17 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, r.Progress().ETA)
 	r.copyChunker = table.NewMultiChunker(table.NewMockChunker("b", 100), table.NewMockChunker("a", 200))
-	r.copier = progressCopier{}
+	r.copier = copiertest.Stub{
+		ETA:   status.ETA{State: status.ETAReady, Duration: time.Minute},
+		Copy:  status.CopyProgress{RowsCopied: 50, RowsTotal: 100},
+		Chunk: 25,
+	}
 	r.applier = progressApplier{}
 	r.status.Set(status.CopyRows)
 	p := r.Progress()
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
-	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
-	require.Equal(t, "50/100 50.00% copyRows ETA 1m", p.Summary)
+	require.Equal(t, status.CopyProgress{RowsTotal: 300}, p.Copy) // The sum of Tables, not the copier's own measure.
+	require.Equal(t, "0/300 0.00% copyRows ETA 1m0s", p.Summary)
 	require.Len(t, p.Tables, 2)
 	require.Less(t, p.Tables[0].TableName, p.Tables[1].TableName)
 	block := r.Status()
@@ -47,8 +39,8 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	}
 	r.status.Set(status.ApplyChangeset)
 	require.Empty(t, r.Progress().ETA)
-	require.Empty(t, r.Progress().Copy)
-	require.Empty(t, r.Progress().Checksum) // The continuous verifier has no finite initial-checksum phase.
+	require.Equal(t, status.CopyProgress{RowsTotal: 300}, r.Progress().Copy) // The copy reading outlives the copy phase.
+	require.Empty(t, r.Progress().Checksum)                                  // The continuous verifier has no finite initial-checksum phase.
 	r.status.Set(status.RestoreSecondaryIndexes)
 	block = r.Status()
 	require.Contains(t, block, "state-time=")

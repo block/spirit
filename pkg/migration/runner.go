@@ -1452,27 +1452,6 @@ func (r *Runner) Progress() status.Progress {
 	// checksum, throttle) must all describe the same state, not whichever state
 	// each happened to observe.
 	state := r.status.Get()
-	var summary string
-	var eta status.ETA
-	var copyProgress status.CopyProgress
-	var checksum status.ChecksumProgress
-	switch state { //nolint: exhaustive
-	case status.CopyRows:
-		copyProgress = r.copier.CopyProgress()
-		summary = fmt.Sprintf("%v %s ETA %v",
-			copyProgress,
-			state.String(),
-			r.copier.GetETA(),
-		)
-		eta = r.copier.GetETAState()
-	case status.WaitingOnSentinelTable:
-		summary = "Waiting on Sentinel Table"
-	case status.ApplyChangeset, status.PostChecksum:
-		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
-	case status.Checksum:
-		checksum = r.checker.GetProgress()
-		summary = "Checksum Progress=" + checksum.String()
-	}
 
 	// Get per-table progress if available (multi-table migrations).
 	// We hold chunkerMu to synchronize with initChunkers(), which
@@ -1481,6 +1460,29 @@ func (r *Runner) Progress() status.Progress {
 	copyChunker := r.copyChunker
 	r.chunkerMu.RUnlock()
 	tables := status.TablesFromChunker(copyChunker)
+	// The runner-wide copy is the sum of the per-table rows, so it reconciles
+	// with Tables and keeps its final reading once the copy has finished. The
+	// copier's own progress is not used for it: on an auto_increment key that
+	// measures keyspace distance, not rows.
+	copyProgress := status.CopyFromTables(tables)
+
+	var summary string
+	var eta status.ETA
+	var checksum status.ChecksumProgress
+	switch state { //nolint: exhaustive
+	case status.CopyRows:
+		// One copier read, so the ETA in Summary and the ETA field describe
+		// the same instant.
+		eta = r.copier.GetETAState()
+		summary = fmt.Sprintf("%s %s ETA %s", copyProgress.String(), state.String(), eta.String())
+	case status.WaitingOnSentinelTable:
+		summary = "Waiting on Sentinel Table"
+	case status.ApplyChangeset, status.PostChecksum:
+		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.replClient.GetDeltaLen())
+	case status.Checksum:
+		checksum = r.checker.GetProgress()
+		summary = "Checksum Progress=" + checksum.String()
+	}
 	return status.Progress{
 		CurrentState: state,
 		Summary:      summary,

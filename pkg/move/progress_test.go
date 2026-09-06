@@ -8,23 +8,12 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
-	"github.com/block/spirit/pkg/copier"
+	"github.com/block/spirit/pkg/copier/copiertest"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
-
-type progressCopier struct{ copier.Copier }
-
-func (progressCopier) GetProgress() string { return "50%" }
-func (progressCopier) GetETA() string      { return "1m" }
-func (progressCopier) GetETAState() status.ETA {
-	return status.ETA{State: status.ETAReady, Duration: time.Minute}
-}
-func (progressCopier) CopyProgress() status.CopyProgress {
-	return status.CopyProgress{RowsCopied: 50, RowsTotal: 100}
-}
 
 type progressChecker struct{ checksum.Checker }
 
@@ -35,6 +24,7 @@ func (progressChecker) GetProgress() status.ChecksumProgress {
 func TestMoveProgress(t *testing.T) {
 	r := &Runner{}
 	require.Empty(t, r.Progress().Tables)
+	require.Empty(t, r.Progress().Copy)
 	a := table.NewMockChunker("a", 100)
 	b := table.NewMockChunker("b", 200)
 	r.copyChunker = table.NewMultiChunker(a, b)
@@ -46,28 +36,29 @@ func TestMoveProgress(t *testing.T) {
 		require.False(t, row.IsComplete)
 	}
 	require.EqualValues(t, 300, total)
+	require.Equal(t, status.CopyProgress{RowsTotal: 300}, p.Copy) // The sum of Tables, before any state is set.
 	r.copyChunker = a
 	require.Equal(t, []status.TableProgress{{TableName: "a", RowsTotal: 100}}, r.Progress().Tables)
-	r.copier = progressCopier{}
+	r.copier = copiertest.Stub{ETA: status.ETA{State: status.ETAReady, Duration: time.Minute}}
 	r.status.Set(status.CopyRows)
 	p = r.Progress()
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
-	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
-	require.Equal(t, "50/100 50.00% copyRows ETA 1m", p.Summary)
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, p.Copy)
+	require.Equal(t, "0/100 0.00% copyRows ETA 1m0s", p.Summary)
 	r.checker = progressChecker{}
 	r.status.Set(status.Checksum)
 	p = r.Progress()
 	require.Equal(t, status.ChecksumProgress{RowsChecked: 25, RowsTotal: 100}, p.Checksum)
 	require.Equal(t, "Checksum Progress="+p.Checksum.String(), p.Summary)
 	require.Empty(t, p.ETA)
-	require.Empty(t, p.Copy)
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, p.Copy) // The copy reading outlives the copy phase.
 	r.usedResumeFromCheckpoint.Store(true)
 	r.status.Set(status.WaitingOnSentinelTable)
 	p = r.Progress()
 	require.True(t, p.Resume)
 	require.Equal(t, "Waiting on Sentinel Table", p.Summary) // No logging or target access.
 	require.Empty(t, p.ETA)
-	require.Empty(t, p.Copy)
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, p.Copy)
 	require.Empty(t, p.Checksum)
 }
 

@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/copier"
+	"github.com/block/spirit/pkg/copier/copiertest"
 	"github.com/block/spirit/pkg/status"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/require"
@@ -17,32 +18,26 @@ import (
 // reads nothing but the throttler, so the fields under test can be exercised
 // without a live migration.
 
-type progressCopier struct{ copier.Copier }
-
-func (progressCopier) GetETA() string { return "1m" }
-func (progressCopier) GetETAState() status.ETA {
-	return status.ETA{State: status.ETAReady, Duration: time.Minute}
-}
-func (progressCopier) CopyProgress() status.CopyProgress {
-	return status.CopyProgress{RowsCopied: 50, RowsTotal: 100}
-}
-
-// TestProgressReportsCopyDuringCopyRows pins that the row-copy counts are a
-// structured field alongside the ETA, populated only while copying, and that
-// Summary renders from the same reading so the two never disagree.
-func TestProgressReportsCopyDuringCopyRows(t *testing.T) {
-	r := &Runner{copier: progressCopier{}}
+// TestProgressReportsCopyAlongsideTables pins that the runner-wide copy is the
+// sum of Tables: present as soon as the copy chunker exists, kept through the
+// later phases, and rendered into Summary from the same reading together with
+// a single ETA read.
+func TestProgressReportsCopyAlongsideTables(t *testing.T) {
+	r := &Runner{copier: copiertest.Stub{ETA: status.ETA{State: status.ETAReady, Duration: time.Minute}}}
 	require.Empty(t, r.Progress().Copy)
+
+	r.copyChunker = table.NewMockChunker("t1", 100)
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, r.Progress().Copy)
 
 	r.status.Set(status.CopyRows)
 	p := r.Progress()
-	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, p.Copy)
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
-	require.Equal(t, "50/100 50.00% copyRows ETA 1m", p.Summary)
+	require.Equal(t, "0/100 0.00% copyRows ETA 1m0s", p.Summary)
 
 	r.status.Set(status.WaitingOnSentinelTable)
 	p = r.Progress()
-	require.Empty(t, p.Copy)
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, p.Copy)
 	require.Empty(t, p.ETA)
 }
 

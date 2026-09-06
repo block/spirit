@@ -1599,15 +1599,22 @@ func (r *Runner) Progress() status.Progress {
 	repl := r.replClient
 	r.progMu.RUnlock()
 
+	tables := status.TablesFromChunker(chunker)
+	// The runner-wide copy is the sum of the per-table rows, so it reconciles
+	// with Tables and keeps its final reading once the copy has finished. The
+	// copier's own progress is not used for it: on an auto_increment key that
+	// measures keyspace distance, not rows.
+	copyProgress := status.CopyFromTables(tables)
+
 	var summary string
 	var eta status.ETA
-	var copyProgress status.CopyProgress
 	switch state { //nolint:exhaustive // sync does not reach the cutover/checksum states
 	case status.CopyRows:
 		if cp != nil {
-			copyProgress = cp.CopyProgress()
-			summary = fmt.Sprintf("%v copyRows ETA %s", copyProgress, cp.GetETA())
+			// One copier read, so the ETA in Summary and the ETA field
+			// describe the same instant.
 			eta = cp.GetETAState()
+			summary = fmt.Sprintf("%s copyRows ETA %s", copyProgress.String(), eta.String())
 		} else {
 			summary = "copyRows"
 		}
@@ -1620,8 +1627,6 @@ func (r *Runner) Progress() status.Progress {
 	default:
 		summary = state.String()
 	}
-
-	tables := status.TablesFromChunker(chunker)
 
 	return status.Progress{
 		CurrentState: state,
