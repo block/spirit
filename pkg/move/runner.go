@@ -1983,11 +1983,13 @@ func (r *Runner) Progress() status.Progress {
 	state := r.status.Get()
 	var summary string
 	var eta status.ETA
+	var copyProgress status.CopyProgress
 	var checksum status.ChecksumProgress
 	switch state { //nolint: exhaustive
 	case status.CopyRows:
+		copyProgress = r.copier.CopyProgress()
 		summary = fmt.Sprintf("%v %s ETA %v",
-			r.copier.GetProgress(),
+			copyProgress,
 			state.String(),
 			r.copier.GetETA(),
 		)
@@ -2012,6 +2014,7 @@ func (r *Runner) Progress() status.Progress {
 		Summary:      summary,
 		Resume:       r.usedResumeFromCheckpoint.Load(),
 		ETA:          eta,
+		Copy:         copyProgress,
 		Checksum:     checksum,
 		Tables:       tables,
 		// Throttle is deliberately zero: move currently uses a Noop throttler.

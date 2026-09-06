@@ -1601,10 +1601,12 @@ func (r *Runner) Progress() status.Progress {
 
 	var summary string
 	var eta status.ETA
+	var copyProgress status.CopyProgress
 	switch state { //nolint:exhaustive // sync does not reach the cutover/checksum states
 	case status.CopyRows:
 		if cp != nil {
-			summary = fmt.Sprintf("%s copyRows ETA %s", cp.GetProgress(), cp.GetETA())
+			copyProgress = cp.CopyProgress()
+			summary = fmt.Sprintf("%v copyRows ETA %s", copyProgress, cp.GetETA())
 			eta = cp.GetETAState()
 		} else {
 			summary = "copyRows"
@@ -1627,6 +1629,7 @@ func (r *Runner) Progress() status.Progress {
 		Resume:       r.resuming.Load(),
 		Tables:       tables,
 		ETA:          eta,
+		Copy:         copyProgress,
 		// Throttle is deliberately left zero: a sync copies through a Noop
 		// throttler, so there is nothing to report yet.
 	}

@@ -37,6 +37,8 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	r.status.Set(status.CopyRows)
 	p := r.Progress()
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
+	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
+	require.Equal(t, "50/100 50.00% copyRows ETA 1m", p.Summary)
 	require.Len(t, p.Tables, 2)
 	require.Less(t, p.Tables[0].TableName, p.Tables[1].TableName)
 	block := r.Status()
@@ -45,6 +47,7 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	}
 	r.status.Set(status.ApplyChangeset)
 	require.Empty(t, r.Progress().ETA)
+	require.Empty(t, r.Progress().Copy)
 	require.Empty(t, r.Progress().Checksum) // The continuous verifier has no finite initial-checksum phase.
 	r.status.Set(status.RestoreSecondaryIndexes)
 	block = r.Status()

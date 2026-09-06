@@ -3,7 +3,9 @@ package migration
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
@@ -14,6 +16,35 @@ import (
 // Initial state reads neither the copier nor the chunkers, and throttleStatus
 // reads nothing but the throttler, so the fields under test can be exercised
 // without a live migration.
+
+type progressCopier struct{ copier.Copier }
+
+func (progressCopier) GetETA() string { return "1m" }
+func (progressCopier) GetETAState() status.ETA {
+	return status.ETA{State: status.ETAReady, Duration: time.Minute}
+}
+func (progressCopier) CopyProgress() status.CopyProgress {
+	return status.CopyProgress{RowsCopied: 50, RowsTotal: 100}
+}
+
+// TestProgressReportsCopyDuringCopyRows pins that the row-copy counts are a
+// structured field alongside the ETA, populated only while copying, and that
+// Summary renders from the same reading so the two never disagree.
+func TestProgressReportsCopyDuringCopyRows(t *testing.T) {
+	r := &Runner{copier: progressCopier{}}
+	require.Empty(t, r.Progress().Copy)
+
+	r.status.Set(status.CopyRows)
+	p := r.Progress()
+	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
+	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
+	require.Equal(t, "50/100 50.00% copyRows ETA 1m", p.Summary)
+
+	r.status.Set(status.WaitingOnSentinelTable)
+	p = r.Progress()
+	require.Empty(t, p.Copy)
+	require.Empty(t, p.ETA)
+}
 
 func TestProgressReportsResume(t *testing.T) {
 	// Resume exists so a wrapper can tell a recovering run from one that is

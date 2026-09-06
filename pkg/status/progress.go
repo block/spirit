@@ -109,6 +109,12 @@ type Progress struct {
 	// ETA is the structured remaining row-copy estimate and its availability.
 	ETA ETA
 
+	// Copy is the structured progress of the row copy across every table in the
+	// run, populated while CurrentState is CopyRows and zero otherwise. It is the
+	// structured form of the copy progress embedded in Summary. RowsTotal is an
+	// estimate from table statistics, so RowsCopied can exceed it.
+	Copy CopyProgress
+
 	// Checksum is the structured progress of the post-copy checksum phase,
 	// populated while CurrentState is Checksum and zero otherwise. It is the
 	// structured form of the checksum progress embedded in Summary.

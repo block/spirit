@@ -22,6 +22,9 @@ func (progressCopier) GetETA() string      { return "1m" }
 func (progressCopier) GetETAState() status.ETA {
 	return status.ETA{State: status.ETAReady, Duration: time.Minute}
 }
+func (progressCopier) CopyProgress() status.CopyProgress {
+	return status.CopyProgress{RowsCopied: 50, RowsTotal: 100}
+}
 
 type progressChecker struct{ checksum.Checker }
 
@@ -49,18 +52,22 @@ func TestMoveProgress(t *testing.T) {
 	r.status.Set(status.CopyRows)
 	p = r.Progress()
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
+	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
+	require.Equal(t, "50/100 50.00% copyRows ETA 1m", p.Summary)
 	r.checker = progressChecker{}
 	r.status.Set(status.Checksum)
 	p = r.Progress()
 	require.Equal(t, status.ChecksumProgress{RowsChecked: 25, RowsTotal: 100}, p.Checksum)
 	require.Equal(t, "Checksum Progress="+p.Checksum.String(), p.Summary)
 	require.Empty(t, p.ETA)
+	require.Empty(t, p.Copy)
 	r.usedResumeFromCheckpoint.Store(true)
 	r.status.Set(status.WaitingOnSentinelTable)
 	p = r.Progress()
 	require.True(t, p.Resume)
 	require.Equal(t, "Waiting on Sentinel Table", p.Summary) // No logging or target access.
 	require.Empty(t, p.ETA)
+	require.Empty(t, p.Copy)
 	require.Empty(t, p.Checksum)
 }
 
