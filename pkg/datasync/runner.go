@@ -1663,12 +1663,20 @@ func (r *Runner) Status() string {
 	switch state { //nolint:exhaustive // sync does not reach the cutover/checksum states
 	case status.CopyRows:
 		b := status.NewBlock("sync status: state=%s total-time=%s copier-time=%s", state.String(), elapsed, r.status.Elapsed().Round(time.Second))
-		// The copy pipeline is built asynchronously, so a status tick can land
-		// before there is a copier to report on.
-		if cp != nil {
-			// Settled rows, the same measure Progress reports, not the
-			// copier's own keyspace position.
+		// The copy pipeline is built asynchronously, and the chunker is
+		// published a step before the copier, so a status tick can land with
+		// either missing. The figures are settled rows from the chunker, the
+		// same measure Progress reports rather than the copier's own keyspace
+		// position; chunk-size and the ETA come from the copier and read as
+		// nothing claimed and nothing measured until it exists.
+		if chunker != nil {
 			progress := status.CopyFromTables(status.TablesFromChunker(chunker))
+			var chunkSize uint64
+			eta := status.ETA{State: status.ETAMeasuring}
+			if cp != nil {
+				chunkSize = cp.ChunkSize()
+				eta = cp.GetETAState()
+			}
 			// No throttled= here, unlike migrate and move: a sync copies
 			// through a Noop throttler, so the field would be a constant
 			// false.
@@ -1676,8 +1684,8 @@ func (r *Runner) Status() string {
 				progress.Fraction()*100,
 				progress.RowsCopied,
 				progress.RowsTotal,
-				cp.ChunkSize(),
-				cp.GetETA(),
+				chunkSize,
+				eta.String(),
 			)
 		}
 		b.Row("applier", "%s", applier.StatusRow(appl))

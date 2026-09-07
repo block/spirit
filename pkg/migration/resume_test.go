@@ -93,7 +93,8 @@ func TestChangeIntToBigIntPKResumeFromChkPt(t *testing.T) {
 func TestCheckpoint(t *testing.T) {
 	// This test manually steps through the migration process to verify
 	// watermark, checkpoint dump, and restore behavior.
-	// It uses specific INSERT patterns that produce exactly 11040 rows.
+	// It seeds about eleven thousand rows with bulk INSERT ... SELECT, which
+	// leaves auto_increment gaps, so ids are not contiguous.
 	//
 	// It drives the copier's synchronous CopyChunk API (copier.ChunkCopier)
 	// to complete chunks in a controlled order (2, 1, 3) and assert the
@@ -164,7 +165,9 @@ func TestCheckpoint(t *testing.T) {
 	// row counts settled rows against the table's row estimate, which comes
 	// from table statistics, so it is read from the table rather than pinned.
 	estimatedRows := atomic.LoadUint64(&r.changes[0].table.EstimatedRows)
-	require.Positive(t, estimatedRows)
+	var actualRows uint64
+	require.NoError(t, r.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM cpt1").Scan(&actualRows))
+	require.InEpsilon(t, actualRows, estimatedRows, 0.2, "the row estimate must be in the neighbourhood of the true count")
 	require.Contains(t, r.Status(), "migration status: state=copyRows total-time=")
 	require.Contains(t, r.Status(), fmt.Sprintf("\n  copier    0.00%%  0/%d  chunk-size=0  eta=", estimatedRows))
 	// The rows the change feed and the checkpoint dumper used to log for
@@ -218,7 +221,7 @@ func TestCheckpoint(t *testing.T) {
 	// chunk completes), so poll until it reflects all three copied chunks.
 	require.Eventually(t, func() bool {
 		return strings.Contains(r.Status(), wantCopier)
-	}, 10*time.Second, 50*time.Millisecond, "status never reached expected copy progress; last status: %s", r.Status())
+	}, 10*time.Second, 50*time.Millisecond, "status never reached expected copy progress; want %q in: %s", wantCopier, r.Status())
 
 	// The watermark should exist now, because migrateChunk()
 	// gives feedback back to table.

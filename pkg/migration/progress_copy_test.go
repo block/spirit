@@ -69,12 +69,14 @@ func TestProgressCopyReconcilesWithTablesOnAutoIncrementKey(t *testing.T) {
 	// settled.
 	own := m.copier.CopyProgress()
 	require.EqualValues(t, 1000000, own.RowsTotal)
+	require.Equal(t, 2*m.copier.ChunkSize(), own.RowsCopied, "two chunks of the pinned size, counted as ids rather than rows")
 	require.Greater(t, own.RowsCopied, p.Copy.RowsCopied)
 	require.NotEqual(t, p.Copy, own)
 
-	// The log block reports the same measure as the API on the same tick.
+	// The log block reports the same measure as the API on the same tick,
+	// percentage included.
 	block := m.Status()
-	require.Contains(t, block, fmt.Sprintf("%d/%d", p.Copy.RowsCopied, p.Copy.RowsTotal))
+	require.Contains(t, block, fmt.Sprintf("%6.2f%%  %d/%d", p.Copy.Fraction()*100, p.Copy.RowsCopied, p.Copy.RowsTotal))
 	require.NotContains(t, block, fmt.Sprintf("%d/%d", own.RowsCopied, own.RowsTotal))
 
 	m.status.Set(status.WaitingOnSentinelTable)

@@ -36,11 +36,14 @@ The trade-offs are higher network transfer and CPU for serialization, which the 
 type Copier interface {
     Run(ctx context.Context) error
     GetETA() string
+    GetETAState() status.ETA
     GetChunker() table.Chunker
     SetThrottler(throttler throttler.Throttler)
     GetThrottler() throttler.Throttler
     StartTime() time.Time
     GetProgress() string
+    CopyProgress() status.CopyProgress
+    ChunkSize() uint64
 }
 ```
 
@@ -168,7 +171,9 @@ for {
     case <-ctx.Done():
         return
     case <-ticker.C:
-        progress := copier.CopyProgress()
+        // Settled rows against the row estimates, summed over the tables.
+        // CopyProgress() is the copier's own pacing measure, not a row count.
+        progress := status.CopyFromTables(status.TablesFromChunker(copier.GetChunker()))
         eta := copier.GetETAState()
         fmt.Printf("Progress: %s, ETA: %s\n", progress, eta)
     }

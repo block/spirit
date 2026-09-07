@@ -51,6 +51,11 @@ func TestMoveProgress(t *testing.T) {
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
 	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
 	require.Equal(t, "50/100 50.00% copyRows ETA 1m0s", p.Summary)
+	// The log block reports the same copy measure as the API, percentage
+	// included, on the same tick.
+	block := r.Status()
+	require.Contains(t, block, " 50.00%  50/100  chunk-size=0  eta=1m0s  throttled=false")
+	require.NotContains(t, block, "7/9")
 	r.checker = progressChecker{}
 	r.status.Set(status.Checksum)
 	p = r.Progress()
