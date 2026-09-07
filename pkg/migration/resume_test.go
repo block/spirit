@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -159,9 +160,13 @@ func TestCheckpoint(t *testing.T) {
 	require.Equal(t, "copyRows", r.status.Get().String())
 
 	// The status block: a header line, then one row per subsystem. chunk is 0
-	// until the first chunk is claimed, and the bar is empty at 0%.
+	// until the first chunk is claimed, and the bar is empty at 0%. The copier
+	// row counts settled rows against the table's row estimate, which comes
+	// from table statistics, so it is read from the table rather than pinned.
+	estimatedRows := atomic.LoadUint64(&r.changes[0].table.EstimatedRows)
+	require.Positive(t, estimatedRows)
 	require.Contains(t, r.Status(), "migration status: state=copyRows total-time=")
-	require.Contains(t, r.Status(), "\n  copier    0.00%  0/11040  chunk-size=0  eta=")
+	require.Contains(t, r.Status(), fmt.Sprintf("\n  copier    0.00%%  0/%d  chunk-size=0  eta=", estimatedRows))
 	// The rows the change feed and the checkpoint dumper used to log for
 	// themselves, plus the applier pipeline snapshot.
 	// No write worker has started yet, so the applier row is the idle one. Every
@@ -200,10 +205,19 @@ func TestCheckpoint(t *testing.T) {
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk1))
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk3))
 
+	// The copier row counts the rows the three chunks settled. That is not
+	// three chunks' worth of ids: the first chunk is the open lower bound
+	// below the minimum id and copies nothing, and the bulk INSERT ... SELECT
+	// seed leaves auto_increment gaps, so the count is read from the new
+	// table rather than pinned.
+	var settled uint64
+	require.NoError(t, r.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _cpt1_new").Scan(&settled))
+	require.Positive(t, settled)
+	wantCopier := fmt.Sprintf("\n  copier  %6.2f%%  %d/%d  chunk-size=1000  eta=", float64(settled)/float64(estimatedRows)*100, settled, estimatedRows)
 	// The status update is asynchronous (the applier phones home after each
 	// chunk completes), so poll until it reflects all three copied chunks.
 	require.Eventually(t, func() bool {
-		return strings.Contains(r.Status(), "\n  copier   27.17%  3000/11040  chunk-size=1000  eta=")
+		return strings.Contains(r.Status(), wantCopier)
 	}, 10*time.Second, 50*time.Millisecond, "status never reached expected copy progress; last status: %s", r.Status())
 
 	// The watermark should exist now, because migrateChunk()
