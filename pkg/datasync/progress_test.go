@@ -24,9 +24,13 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	b.Feedback(nil, 0, 30) // rows settled by the applier
 	a.Feedback(nil, 0, 40)
 	r.copyChunker = table.NewMultiChunker(b, a)
-	// The chunker is published before the copier, so a status tick in between
-	// still reports the settled rows, with nothing claimed or measured yet.
+	// With a chunker but no copier, the API and the log block agree: settled
+	// rows from the chunker, and an ETA that is not yet measured.
 	r.status.Set(status.CopyRows)
+	p := r.Progress()
+	require.Equal(t, status.CopyProgress{RowsCopied: 70, RowsTotal: 300}, p.Copy)
+	require.Equal(t, status.ETA{State: status.ETAMeasuring}, p.ETA)
+	require.Equal(t, "70/300 23.33% copyRows ETA TBD", p.Summary)
 	require.Contains(t, r.Status(), " 23.33%  70/300  chunk-size=0  eta=TBD")
 	r.copier = copiertest.Stub{
 		ETA: status.ETA{State: status.ETAReady, Duration: time.Minute},
@@ -36,7 +40,7 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	}
 	r.applier = progressApplier{}
 	r.status.Set(status.CopyRows)
-	p := r.Progress()
+	p = r.Progress()
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
 	require.Equal(t, status.CopyProgress{RowsCopied: 70, RowsTotal: 300}, p.Copy) // Both counters summed across Tables.
 	require.Equal(t, "70/300 23.33% copyRows ETA 1m0s", p.Summary)

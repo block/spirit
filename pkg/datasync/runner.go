@@ -1612,14 +1612,16 @@ func (r *Runner) Progress() status.Progress {
 	var eta status.ETA
 	switch state { //nolint:exhaustive // sync does not reach the cutover/checksum states
 	case status.CopyRows:
+		// The copy phase is entered only after the pipeline is built, so the
+		// copier is normally present; without one the estimate is not yet
+		// measured, the same reading Status gives.
+		eta = status.ETA{State: status.ETAMeasuring}
 		if cp != nil {
 			// One copier read, so the ETA in Summary and the ETA field
 			// describe the same instant.
 			eta = cp.GetETAState()
-			summary = fmt.Sprintf("%s copyRows ETA %s", copyProgress.String(), eta.String())
-		} else {
-			summary = "copyRows"
 		}
+		summary = fmt.Sprintf("%s copyRows ETA %s", copyProgress.String(), eta.String())
 	case status.ApplyChangeset:
 		if repl != nil {
 			summary = fmt.Sprintf("continuous sync position=%s pending-changes=%d", repl.Position(), repl.GetDeltaLen())
@@ -1663,12 +1665,13 @@ func (r *Runner) Status() string {
 	switch state { //nolint:exhaustive // sync does not reach the cutover/checksum states
 	case status.CopyRows:
 		b := status.NewBlock("sync status: state=%s total-time=%s copier-time=%s", state.String(), elapsed, r.status.Elapsed().Round(time.Second))
-		// The copy pipeline is built asynchronously, and the chunker is
-		// published a step before the copier, so a status tick can land with
-		// either missing. The figures are settled rows from the chunker, the
-		// same measure Progress reports rather than the copier's own keyspace
-		// position; chunk-size and the ETA come from the copier and read as
-		// nothing claimed and nothing measured until it exists.
+		// The chunker and the copier are published separately while the
+		// pipeline is built, and the copy phase is entered only once both
+		// exist, so these guards are defensive. The figures are settled rows
+		// from the chunker, the same measure Progress reports rather than the
+		// copier's own keyspace position; chunk-size and the ETA come from
+		// the copier and read as nothing claimed and nothing measured without
+		// one, as Progress does.
 		if chunker != nil {
 			progress := status.CopyFromTables(status.TablesFromChunker(chunker))
 			var chunkSize uint64
