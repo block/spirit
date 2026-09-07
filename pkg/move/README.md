@@ -24,6 +24,10 @@ Unlike `migration` which operates on a single table, `move` discovers and copies
 
 When a `ShardingProvider` is configured, each source table is annotated with a sharding column and hash function during discovery. The applier uses this metadata to route rows to the correct target based on key ranges. Without a sharding provider, the operation is a simple 1:1 move to a single target.
 
+### Autoscaling
+
+`EnableExperimentalAutoscaling` enables conservative host-aware scaling for both single-target and sharded moves. `pkg/host` groups target connections independently of schema and credentials; the same groups drive index restoration and Aurora monitor ownership. One monitor per host feeds a maximum-utilization multi-throttler. The copier resizes every shard's write pool together, and both distributed checksums consume the same signal. Bounds account for targets sharing a host and the client CPU budget. See [the flag documentation](../../docs/move.md#enable-experimental-autoscaling) for eligibility, fallback and limitations.
+
 ### Deferred Secondary Indexes
 
 The `DeferSecondaryIndexes` option creates target tables without secondary indexes, adding them back before cutover. This can significantly speed up the bulk copy phase since index maintenance is avoided until the data is in place.
@@ -66,3 +70,5 @@ Two constraints and one resume note:
 - **Unsharded source only** — reverse-window is a 1→M forward move reversed as M→1; a sharded source would need an M:N reverse and is rejected at startup.
 - **Stale-marker guard** — a `_spirit_move_revert` present at pre-flight or pre-cutover aborts the run, so a leftover from an interrupted rollback is never read as a fresh request.
 - **Resume** — the checkpoint gains `move_phase` (`reverse_window` / `reverting`) and `cutover_at` columns, so a move killed during the window resumes back into it rather than re-copying. The `reverting` phase (mid-rollback) is not auto-resumed and must be completed manually.
+
+Reverse-window writes use the configured `WriteThreads` count (including its default), independently of the forward autoscaler’s resolved count. This keeps uninterrupted and resumed reverse windows consistent without applying forward-target capacity assumptions to the reverse destinations.

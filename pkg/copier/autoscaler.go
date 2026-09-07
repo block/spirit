@@ -142,7 +142,7 @@ func resolveReadCeiling(configured, concurrency int) int {
 }
 
 // writeScaler is the optional capability the autoscaler drives. The
-// SingleTargetApplier implements it; the ShardedApplier does not (yet), so the
+// single-target and sharded appliers implement it; the
 // copier type-asserts it and skips autoscaling when it's absent.
 type writeScaler interface {
 	SetWriteWorkers(n int)
