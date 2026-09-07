@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 

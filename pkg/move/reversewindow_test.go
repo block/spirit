@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,7 +41,7 @@ func setupReverseWindowMove(t *testing.T, srcDBName, dstDBName string) (sourceDS
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+dstDBName)
 	testutils.RunSQL(t, "CREATE DATABASE "+dstDBName)
 
-	ctl, err = sql.Open("mysql", testutils.DSN())
+	ctl, err = sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(ctl) })
 	return src.FormatDSN(), dst.FormatDSN(), ctl
@@ -451,7 +451,7 @@ func setupNMReverseFixture(t *testing.T) *nmReverseFixture {
 	}
 	f.sourceKeyRanges = []string{"-80", "80-"}
 
-	ctl, err := sql.Open("mysql", testutils.DSN())
+	ctl, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(ctl) })
 	f.ctl = ctl

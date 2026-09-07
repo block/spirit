@@ -4,8 +4,8 @@ import (
 	"database/sql"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 

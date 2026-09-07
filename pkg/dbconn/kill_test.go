@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -134,7 +134,7 @@ func TestCheckForceKillPrivileges(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "root" // needs grant privilege
-	rootDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	rootDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(rootDB)
 
@@ -151,7 +151,7 @@ func TestCheckForceKillPrivileges(t *testing.T) {
 	require.NoError(t, err)
 
 	connect := func() *sql.DB {
-		db, err := sql.Open("mysql", fmt.Sprintf("testforcekillprobeuser:@tcp(%s)/%s", config.Addr, config.DBName))
+		db, err := sql.Open("block-mysql", fmt.Sprintf("testforcekillprobeuser:@tcp(%s)/%s", config.Addr, config.DBName))
 		require.NoError(t, err)
 		return db
 	}

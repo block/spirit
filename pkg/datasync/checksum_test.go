@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -100,7 +100,7 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 	// Seed a few hundred rows so the checker has real work to do (multiple chunks).
 	// One multi-row INSERT is much faster than 500 round-trips and matches
 	// the intent of the original comment.
-	seedSrc, err := sql.Open("mysql", sourceDSN)
+	seedSrc, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(seedSrc)
 	const seedRows = 500
@@ -142,7 +142,7 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 	// Spawn a background writer that bumps a counter on a random-ish set
 	// of rows. This is what produces target lag at read time — exactly
 	// what the retry path is for.
-	srcDB, err := sql.Open("mysql", sourceDSN)
+	srcDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(srcDB)
 

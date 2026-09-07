@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,13 +30,13 @@ func TestSingleTargetApplierBasic(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "single_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target := base.Clone()
 	target.DBName = "single_target"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -184,7 +184,7 @@ func TestSingleTargetApplierEmptyRows(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_empty_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -243,7 +243,7 @@ func TestSingleTargetApplierLargeDataset(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_large_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -319,7 +319,7 @@ func TestSingleTargetApplierConcurrentApplies(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_concurrent_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -429,7 +429,7 @@ func TestSingleTargetApplierDeleteKeys(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_delete_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -515,7 +515,7 @@ func TestSingleTargetApplierDeleteKeysSeparatorInValues(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_delete_sep_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -588,7 +588,7 @@ func TestSingleTargetApplierDeleteKeysEmpty(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_delete_empty_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -624,7 +624,7 @@ func TestSingleTargetApplierUpsertRows(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -717,7 +717,7 @@ func TestSingleTargetApplierUpsertRowsEmptyBlob(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_emptyblob_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -795,7 +795,7 @@ func TestSingleTargetApplierUpsertRowsWithGeneratedColumns(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_genco_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -857,7 +857,7 @@ func TestSingleTargetApplierUpsertRowsSkipDeleted(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_deleted_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -914,7 +914,7 @@ func TestSingleTargetApplierUpsertRowsEmpty(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_empty_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -950,7 +950,7 @@ func TestSingleTargetApplierContextCancellation(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_cancel_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1045,7 +1045,7 @@ func TestSingleTargetApplierCancelCallbackRace(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_cbrace_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1129,7 +1129,7 @@ func TestSingleTargetApplierWaitTimeout(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_timeout_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1189,7 +1189,7 @@ func TestSingleTargetApplierStartClose(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_lifecycle_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1260,7 +1260,7 @@ func TestSingleTargetApplierDynamicScaling(t *testing.T) {
 	target.DBName = "single_scaling_test"
 	// The pool must cover the peak worker count we scale to.
 	target.Params = map[string]string{}
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	targetDB.SetMaxOpenConns(10)
@@ -1343,7 +1343,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "test_pr4_single_lock"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 

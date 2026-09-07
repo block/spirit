@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checksum"
@@ -17,7 +18,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -104,7 +104,7 @@ func TestSyncE2E(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_dest`)
 	testutils.RunSQL(t, `CREATE DATABASE sync_dest`)
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 
@@ -203,7 +203,7 @@ func TestSyncInitialCopy(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, runner))
 	require.NoError(t, runner.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -352,7 +352,7 @@ func TestSyncResume(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, r1))
 	require.NoError(t, r1.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 
@@ -436,7 +436,7 @@ func TestSyncResumeNoWatermarkRow(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, r2))
 	require.NoError(t, r2.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -486,7 +486,7 @@ func TestSyncForce(t *testing.T) {
 		return rerr
 	}
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	tableExists := func(name string) bool {
@@ -588,7 +588,7 @@ func TestSyncForcePreservesForeignTables(t *testing.T) {
 	// --force recovers by wiping only the sync-owned tables.
 	require.NoError(t, run(true))
 
-	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 
@@ -676,7 +676,7 @@ func TestSyncResumeIncompatibleCheckpoint(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, r3))
 	require.NoError(t, r3.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -773,14 +773,14 @@ func TestSyncResumeSourceIdentity(t *testing.T) {
 	// First run: copies and records a checkpoint carrying the source identity.
 	require.NoError(t, run(false))
 
-	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 
 	// The stored position is the structured payload with the real
 	// @@server_uuid of the source and a non-empty inner position.
 	var realUUID string
-	srcDB, err := sql.Open("mysql", src.FormatDSN())
+	srcDB, err := sql.Open("block-mysql", src.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(srcDB)
 	require.NoError(t, srcDB.QueryRowContext(context.Background(), "SELECT @@server_uuid").Scan(&realUUID))
@@ -884,7 +884,7 @@ func TestSyncFreshTargetSchemaMismatch(t *testing.T) {
 		return r
 	}
 
-	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 
@@ -947,7 +947,7 @@ func TestSyncCreateTableLegacyDefault(t *testing.T) {
 	// The rows themselves carry valid timestamps.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	laxDB, err := sql.Open("mysql", src.FormatDSN())
+	laxDB, err := sql.Open("block-mysql", src.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(laxDB)
 	laxConn, err := laxDB.Conn(ctx)
@@ -969,7 +969,7 @@ func TestSyncCreateTableLegacyDefault(t *testing.T) {
 		targetCfg.Params = map[string]string{}
 	}
 	targetCfg.Params["sql_mode"] = "TRADITIONAL"
-	targetDB, err := sql.Open("mysql", targetCfg.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", targetCfg.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB) // injected target: the runner doesn't own/close it
 	target := applier.Target{DB: targetDB, Config: targetCfg, KeyRange: "0"}
@@ -985,7 +985,7 @@ func TestSyncCreateTableLegacyDefault(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, runner)) // would fail with 1067 without the relaxed-DDL fix
 	require.NoError(t, runner.Close())
 
-	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -1053,11 +1053,11 @@ func TestSyncDeferSecondaryIndexesCreateAndRestore(t *testing.T) {
 	// Wire up the source + target connections the way Run() does, but without
 	// driving the full copy pipeline — we call createTargetTables /
 	// restoreSecondaryIndexes directly.
-	sourceDB, err := sql.Open("mysql", s.SourceDSN)
+	sourceDB, err := sql.Open("block-mysql", s.SourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 	runner.source = sourceInfo{db: sourceDB, config: src, dsn: s.SourceDSN}
-	targetDB, err := sql.Open("mysql", s.TargetDSN)
+	targetDB, err := sql.Open("block-mysql", s.TargetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
@@ -1114,7 +1114,7 @@ func TestSyncDeferSecondaryIndexesE2E(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_deferidx_dest`)
 	testutils.RunSQL(t, `CREATE DATABASE sync_deferidx_dest`)
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	countRows := func() int {
@@ -1386,11 +1386,11 @@ func TestSyncTargetSchemaVerifyIgnoresDeferredIndexes(t *testing.T) {
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
 
-	sourceDB, err := sql.Open("mysql", s.SourceDSN)
+	sourceDB, err := sql.Open("block-mysql", s.SourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 	runner.source = sourceInfo{db: sourceDB, config: src, dsn: s.SourceDSN}
-	targetDB, err := sql.Open("mysql", s.TargetDSN)
+	targetDB, err := sql.Open("block-mysql", s.TargetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}

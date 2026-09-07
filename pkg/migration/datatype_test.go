@@ -581,7 +581,7 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 	tt.SeedRows(t, "INSERT INTO minrbr_buffered (name, val) SELECT CONCAT('seed-', FLOOR(RAND()*99999)), 1", 256)
 
 	// Open a dedicated connection with session-level minimal RBR.
-	minimalDB, err := sql.Open("mysql", testutils.DSN())
+	minimalDB, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(minimalDB)
 	minimalDB.SetMaxOpenConns(1)

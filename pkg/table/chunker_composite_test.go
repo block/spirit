@@ -29,7 +29,7 @@ func TestCompositeChunkerCompositeBinary(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 1000000`) //nolint: dupword
 	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 1000000`) //nolint: dupword
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -134,7 +134,7 @@ func TestCompositeChunkerBinary(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 1000000`)
 	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 1000000`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -224,7 +224,7 @@ func TestCompositeChunkerBinaryHexStringWatermark(t *testing.T) {
 			SELECT 161 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 255
 		) SELECT CONCAT('0x', HEX(n)), n FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -313,7 +313,7 @@ func TestCompositeChunkerInt(t *testing.T) {
 	// remove autoinc before discovery.
 	testutils.RunSQL(t, "ALTER TABLE compositeint_t1 CHANGE COLUMN pk pk int NOT NULL") //nolint: dupword
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -376,7 +376,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO compositewatermark_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositewatermark_t1 a JOIN compositewatermark_t1 b JOIN compositewatermark_t1 c LIMIT 10000`)
 	testutils.RunSQL(t, `INSERT INTO compositewatermark_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositewatermark_t1 a JOIN compositewatermark_t1 b JOIN compositewatermark_t1 c LIMIT 10000`)
 	testutils.RunSQL(t, `INSERT INTO compositewatermark_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositewatermark_t1 a JOIN compositewatermark_t1 b JOIN compositewatermark_t1 c LIMIT 10000`)
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -510,7 +510,7 @@ func TestCompositeSmallTable(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO compositesmall_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM compositesmall_t1 a JOIN compositesmall_t1 b JOIN compositesmall_t1 c LIMIT 10`)
 	testutils.RunSQL(t, `INSERT INTO compositesmall_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM compositesmall_t1 a JOIN compositesmall_t1 b JOIN compositesmall_t1 c LIMIT 10`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -554,7 +554,7 @@ func TestSetKey(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO setkey_t1 SELECT NULL, 1, 1, 'PENDING', NOW(), NOW() FROM setkey_t1 a JOIN setkey_t1 b JOIN setkey_t1 c LIMIT 10000`)
 	testutils.RunSQL(t, `INSERT INTO setkey_t1 SELECT NULL, 1, 1, 'PENDING', NOW(), NOW() FROM setkey_t1 a JOIN setkey_t1 b JOIN setkey_t1 c LIMIT 10000`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -690,7 +690,7 @@ func TestSetKeyCompositeKeyMerge(t *testing.T) {
 			PRIMARY KEY (name,ssn),
 			INDEX dnc (dob,name,city)
 		)`)
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -725,7 +725,7 @@ func TestCompositeChunkerReset(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO compositereset_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositereset_t1 a JOIN compositereset_t1 b JOIN compositereset_t1 c LIMIT 5000`)
 	testutils.RunSQL(t, `INSERT INTO compositereset_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositereset_t1 a JOIN compositereset_t1 b JOIN compositereset_t1 c LIMIT 5000`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -908,7 +908,7 @@ func TestCompositeChunkerWatermarkOptimizations(t *testing.T) {
 		)
 		SELECT 3, n, 1 FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1067,7 +1067,7 @@ func TestCompositeChunkerKeyBelowLowWatermarkInflightFinalChunk(t *testing.T) {
 			SELECT n + %d, 1 FROM seq`, i*1000))
 	}
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1172,7 +1172,7 @@ func TestCompositeChunkerKeyAboveHighWatermarkMultiColumn(t *testing.T) {
 		)
 		SELECT 9, n FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1237,7 +1237,7 @@ func TestCompositeChunkerKeyAboveHighWatermarkSingleColumn(t *testing.T) {
 		)
 		SELECT n FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1301,7 +1301,7 @@ func TestCompositeChunkerWatermarkNonNumeric(t *testing.T) {
 		)
 		SELECT CONCAT('key', LPAD(n, 5, '0')), n FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1380,7 +1380,7 @@ func TestCompositeChunkerWatermarkDateTime(t *testing.T) {
 		)
 		SELECT DATE_ADD('2024-01-01 00:00:00', INTERVAL n HOUR), n FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1475,7 +1475,7 @@ func TestCompositeChunkerCollationDifference(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO compositecollation_t1 VALUES ('Test', 9002)")
 	testutils.RunSQL(t, "INSERT INTO compositecollation_t1 VALUES ('test', 9003)")
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1617,7 +1617,7 @@ func TestCompositeChunkerWatermarkWithOutOfOrderCompletion(t *testing.T) {
 		)
 		SELECT n FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1728,7 +1728,7 @@ func TestCompositeChunkerCheckpointHighPtr(t *testing.T) {
 			SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 500
 		) SELECT n, 1 FROM seq`)
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -1798,7 +1798,7 @@ func TestCompositeChunkerReservedWordPK(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO reserved_word_pk_t1 (osm_id, `key`, `value`) "+
 		"VALUES (1,'amenity','restaurant'),(2,'amenity','cafe'),(3,'shop','grocery')")
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -1858,7 +1858,7 @@ func TestCompositeChunkerReservedWordTableName(t *testing.T) {
 		"VALUES (1,'x','one'),(2,'x','two'),(3,'y','three'),(4,'z','four')")
 	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS `order`") })
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

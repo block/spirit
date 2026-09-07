@@ -22,7 +22,7 @@ import (
 // that the negative branches are exercised only at startup against a
 // real misconfigured server.
 func TestConfiguration(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

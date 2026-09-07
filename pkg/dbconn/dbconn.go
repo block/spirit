@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -39,11 +39,11 @@ const (
 	// both shapes must classify the same way.
 	errClientInteractionTimeout = 4031
 	// errReadOnly (1290), errReadOnlyTransaction (1792) and errReadOnlyMode
-	// (1836) are usually consumed by go-sql-driver when RejectReadOnly is
-	// enabled (the spirit default) and converted to driver.ErrBadConn. They
-	// are kept here for the case where RejectReadOnly is disabled, e.g. the
-	// move runner disables it for read-only sources (see
-	// DBConfig.RejectReadOnly).
+	// (1836) are consumed by the driver and converted to driver.ErrBadConn,
+	// unconditionally now that rejectReadOnly is not an option. They are kept
+	// here for the one case the driver exempts: a transaction the caller
+	// opened with sql.TxOptions{ReadOnly: true}, where the read-only error is
+	// the answer that was asked for and database/sql would not retry anyway.
 	errReadOnly            = 1290
 	errReadOnlyTransaction = 1792 // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
 	errReadOnlyMode        = 1836
@@ -60,17 +60,19 @@ type DBConfig struct {
 	RangeOptimizerMaxMemSize int64
 	InterpolateParams        bool
 	ForceKill                bool // If true, kill locking transactions to acquire metadata locks (default: true)
-	// RejectReadOnly maps to the go-sql-driver rejectReadOnly option: a
-	// statement that fails with a read-only error (1290/1792/1836) is turned
-	// into driver.ErrBadConn so database/sql throws the connection away and
-	// reconnects. This guards against landing on a demoted, now-read-only
-	// Aurora primary after a blue/green deploy or failover (default: true).
+	// There is deliberately no RejectReadOnly here. It used to map to the
+	// driver's rejectReadOnly option and defaulted to true, guarding against
+	// landing on a demoted, now-read-only Aurora primary after a blue/green
+	// deploy or failover. [DriverName] now does that unconditionally and has
+	// removed the option, so there is nothing left to configure.
 	//
-	// An injected, read-only change.Source (e.g. a Vitess/PlanetScale VStream
-	// import) connects to a read-only replica on purpose. With this enabled,
-	// the replica's read-only responses would loop every source statement to
-	// "driver: bad connection", so the move runner disables it for that case.
-	RejectReadOnly bool
+	// The field also carried an opt-out, used by the sync runner for a
+	// read-only source. That turned out to be guarding against an error the
+	// workload cannot raise: 1290/1792/1836 are raised by *writes*, and a
+	// read-only source only reads. Verified against a super_read_only MySQL
+	// 8.0 — SELECT, SHOW TABLES, SHOW CREATE TABLE, SHOW MASTER STATUS, every
+	// session SET newDSN adds, and the binlog client's FLUSH BINARY LOGS all
+	// succeed; an INSERT is what returns 1290.
 	// TLS Configuration
 	TLSMode            string // TLS connection mode (DISABLED, PREFERRED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY)
 	TLSCertificatePath string // Path to custom TLS certificate file
@@ -85,7 +87,6 @@ func NewDBConfig() *DBConfig {
 		RangeOptimizerMaxMemSize: 0,     // default is 8M, we set to unlimited. Not user configurable (may reconsider in the future).
 		InterpolateParams:        false, // default is false
 		ForceKill:                true,  // default is true
-		RejectReadOnly:           true,  // default is true (Aurora failover safety)
 		// TLS defaults
 		TLSMode:            "PREFERRED", // default to PREFERRED mode like MySQL
 		TLSCertificatePath: "",          // no custom certificate by default
@@ -172,9 +173,8 @@ func (e *UnsafeWarningError) Unwrap() error {
 func canRetryError(err error) bool {
 	// Connection-loss errors (driver.ErrBadConn, mysql.ErrInvalidConn, ...)
 	// are retryable: a network blip, a killed connection, or an Aurora
-	// failover with RejectReadOnly enabled (the driver converts read-only
-	// errors 1290/1792/1836 into driver.ErrBadConn and discards the
-	// connection) all qualify. Retrying is safe because each retry starts
+	// failover (the driver converts read-only errors 1290/1792/1836 into
+	// driver.ErrBadConn and discards the connection) all qualify. Retrying is safe because each retry starts
 	// a fresh transaction — database/sql hands BeginTx a new connection if the
 	// old one is dead. Note this function does not itself enforce idempotency;
 	// callers are responsible for routing only idempotent statements through

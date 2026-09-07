@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 )
 
 // MySQL error codes for "you don't have permission" failures. The redo-aware

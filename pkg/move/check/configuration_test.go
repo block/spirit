@@ -12,7 +12,7 @@ import (
 )
 
 func TestConfigurationCheck(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -25,11 +25,11 @@ func TestConfigurationCheck(t *testing.T) {
 }
 
 func TestConfigurationCheckMultipleSources(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	db2, err := sql.Open("mysql", testutils.DSN())
+	db2, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db2)
 

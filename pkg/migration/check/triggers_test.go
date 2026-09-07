@@ -12,7 +12,7 @@ import (
 )
 
 func TestHasTriggers(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 
 	_, err = db.ExecContext(t.Context(), `drop table if exists account`)

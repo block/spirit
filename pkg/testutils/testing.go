@@ -14,14 +14,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
 // dbCounter ensures unique database names when CreateUniqueTestDatabase
 // is called multiple times within the same test.
 var dbCounter atomic.Uint64
+
+// driverName mirrors dbconn.DriverName. It is duplicated rather than imported
+// because dbconn's own tests import this package, so importing dbconn here
+// would be a cycle.
+const driverName = "block-mysql"
 
 func DSN() string {
 	dsn := os.Getenv("MYSQL_DSN")
@@ -69,7 +74,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	}
 	rootDSN := baseDSN[:lastSlash+1]
 
-	rootDB, err := sql.Open("mysql", rootDSN)
+	rootDB, err := sql.Open(driverName, rootDSN)
 	require.NoError(t, err)
 	defer func() {
 		_ = rootDB.Close()
@@ -78,13 +83,13 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, err)
 
 	// Open a connection scoped to the new database
-	scopedDB, err := sql.Open("mysql", rootDSN+dbName)
+	scopedDB, err := sql.Open(driverName, rootDSN+dbName)
 	require.NoError(t, err)
 
 	// Register cleanup to close the connection and drop the database
 	t.Cleanup(func() {
 		_ = scopedDB.Close()
-		cleanupDB, err := sql.Open("mysql", rootDSN)
+		cleanupDB, err := sql.Open(driverName, rootDSN)
 		require.NoError(t, err)
 		defer func() {
 			_ = cleanupDB.Close()
@@ -127,7 +132,7 @@ var vectorSupported struct {
 func SkipUnlessVectorSupported(t *testing.T) {
 	t.Helper()
 	vectorSupported.Do(func() {
-		db, err := sql.Open("mysql", DSN())
+		db, err := sql.Open(driverName, DSN())
 		if err != nil {
 			vectorSupported.err = err
 			return
@@ -166,7 +171,7 @@ func isUnknownFunctionErr(err error) bool {
 func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 	t.Helper()
 	dsn := DSNForDatabase(dbName)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(driverName, dsn)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -177,7 +182,7 @@ func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 
 func RunSQL(t *testing.T, stmt string) {
 	t.Helper()
-	db, err := sql.Open("mysql", DSN())
+	db, err := sql.Open(driverName, DSN())
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -193,7 +198,7 @@ func RunSQL(t *testing.T, stmt string) {
 // distinguishable from a Spirit migration bug.
 func WaitForReplicaHealthy(t *testing.T, dsn string, timeout time.Duration) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(driverName, dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -274,4 +279,24 @@ func EvenOddHasher(colAny any) (uint64, error) {
 		hash = 0x8000000000000000 + uint64(col)
 	}
 	return hash, nil
+}
+
+// RequireNoEffectiveTLS asserts that a DSN yields a connection with no TLS.
+//
+// It deliberately does not assert the DSN omits "tls=". DISABLED writes
+// tls=false, because the driver applies verified TLS to an RDS address whenever
+// the DSN asks for nothing — so an omitted parameter is how DISABLED silently
+// becomes a TLS connection, while an explicit "false" is how it stays off. What
+// matters is the setting the driver ends up with, which is what this reads.
+//
+// It lives here rather than in dbconn's tests because pkg/migration asserts the
+// same property, and two copies of "what counts as no TLS" would let one of
+// them be strengthened while the other silently stayed weak.
+func RequireNoEffectiveTLS(t *testing.T, dsn, description string) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err, description)
+	require.Nil(t, cfg.TLS, "%s: DSN produced a TLS connection", description)
+	require.False(t, cfg.AllowCleartextPasswords,
+		"%s: cleartext passwords allowed with no TLS", description)
 }

@@ -5,12 +5,12 @@ import (
 	"os"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,77 +28,89 @@ func TestReplicaTLSEnhancement(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
+	// expect replaces a shouldEnhance bool, which conflated two properties that
+	// have come apart: "the DSN text is returned byte-identical" and "no TLS
+	// results". DISABLED is now the case where those differ — it writes
+	// tls=false, so the text changes while the effect is still no TLS. A bool
+	// forces one of the two rows below to assert the wrong thing.
+	//
+	// The dropped expectedReplicaTLSMode field was never read by this test; it
+	// looked like an assertion and was not one.
+	type tlsExpectation int
+	const (
+		// Some tls= naming a config that encrypts is added.
+		expectTLSAdded tlsExpectation = iota
+		// Nothing encrypts. Says nothing about the spelling, deliberately:
+		// omitting tls= is how DISABLED silently becomes TLS on an RDS host.
+		expectNoTLS
+		// Returned byte-identical, because the DSN stated its own TLS intent
+		// and that outranks the config.
+		expectUnchanged
+	)
+
 	testCases := []struct {
-		name                   string
-		mainTLSMode            string
-		mainTLSCert            string
-		replicaDSN             string
-		expectedReplicaTLSMode string
-		shouldEnhance          bool
-		description            string
+		name        string
+		mainTLSMode string
+		mainTLSCert string
+		replicaDSN  string
+		expect      tlsExpectation
+		description string
 	}{
 		{
-			name:                   "DISABLED main should not enhance replica DSN",
-			mainTLSMode:            "DISABLED",
-			mainTLSCert:            "",
-			replicaDSN:             "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
-			expectedReplicaTLSMode: "DISABLED",
-			shouldEnhance:          false,
-			description:            "DISABLED main TLS should not add TLS to replica DSN",
+			name:        "DISABLED main leaves the replica with no TLS",
+			mainTLSMode: "DISABLED",
+			mainTLSCert: "",
+			replicaDSN:  "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
+			expect:      expectNoTLS,
+			description: "DISABLED main TLS must leave the replica with no TLS",
 		},
 		{
-			name:                   "PREFERRED main should enhance replica DSN without TLS",
-			mainTLSMode:            "PREFERRED",
-			mainTLSCert:            tempFile.Name(),
-			replicaDSN:             "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
-			expectedReplicaTLSMode: "PREFERRED",
-			shouldEnhance:          true,
-			description:            "PREFERRED main TLS should add custom TLS to replica DSN",
+			name:        "PREFERRED main should enhance replica DSN without TLS",
+			mainTLSMode: "PREFERRED",
+			mainTLSCert: tempFile.Name(),
+			replicaDSN:  "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
+			expect:      expectTLSAdded,
+			description: "PREFERRED main TLS should add custom TLS to replica DSN",
 		},
 		{
-			name:                   "REQUIRED main should enhance replica DSN without TLS",
-			mainTLSMode:            "REQUIRED",
-			mainTLSCert:            tempFile.Name(),
-			replicaDSN:             "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
-			expectedReplicaTLSMode: "REQUIRED",
-			shouldEnhance:          true,
-			description:            "REQUIRED main TLS should add required TLS to replica DSN",
+			name:        "REQUIRED main should enhance replica DSN without TLS",
+			mainTLSMode: "REQUIRED",
+			mainTLSCert: tempFile.Name(),
+			replicaDSN:  "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
+			expect:      expectTLSAdded,
+			description: "REQUIRED main TLS should add required TLS to replica DSN",
 		},
 		{
-			name:                   "VERIFY_CA main should enhance replica DSN without TLS",
-			mainTLSMode:            "VERIFY_CA",
-			mainTLSCert:            tempFile.Name(),
-			replicaDSN:             "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
-			expectedReplicaTLSMode: "VERIFY_CA",
-			shouldEnhance:          true,
-			description:            "VERIFY_CA main TLS should add verify_ca TLS to replica DSN",
+			name:        "VERIFY_CA main should enhance replica DSN without TLS",
+			mainTLSMode: "VERIFY_CA",
+			mainTLSCert: tempFile.Name(),
+			replicaDSN:  "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
+			expect:      expectTLSAdded,
+			description: "VERIFY_CA main TLS should add verify_ca TLS to replica DSN",
 		},
 		{
-			name:                   "VERIFY_IDENTITY main should enhance replica DSN without TLS",
-			mainTLSMode:            "VERIFY_IDENTITY",
-			mainTLSCert:            tempFile.Name(),
-			replicaDSN:             "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
-			expectedReplicaTLSMode: "VERIFY_IDENTITY",
-			shouldEnhance:          true,
-			description:            "VERIFY_IDENTITY main TLS should add verify_identity TLS to replica DSN",
+			name:        "VERIFY_IDENTITY main should enhance replica DSN without TLS",
+			mainTLSMode: "VERIFY_IDENTITY",
+			mainTLSCert: tempFile.Name(),
+			replicaDSN:  "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb",
+			expect:      expectTLSAdded,
+			description: "VERIFY_IDENTITY main TLS should add verify_identity TLS to replica DSN",
 		},
 		{
-			name:                   "Replica DSN with existing TLS should be preserved",
-			mainTLSMode:            "REQUIRED",
-			mainTLSCert:            tempFile.Name(),
-			replicaDSN:             "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb?tls=skip-verify",
-			expectedReplicaTLSMode: "skip-verify", // This will be the preserved TLS setting
-			shouldEnhance:          false,
-			description:            "Replica DSN with existing TLS config should not be modified",
+			name:        "Replica DSN with existing TLS should be preserved",
+			mainTLSMode: "REQUIRED",
+			mainTLSCert: tempFile.Name(),
+			replicaDSN:  "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb?tls=skip-verify",
+			expect:      expectUnchanged,
+			description: "Replica DSN with existing TLS config should not be modified",
 		},
 		{
-			name:                   "RDS replica should get RDS TLS for REQUIRED mode",
-			mainTLSMode:            "REQUIRED",
-			mainTLSCert:            "",
-			replicaDSN:             "replica_user:replica_pass@tcp(replica.us-west-2.rds.amazonaws.com:3306)/testdb",
-			expectedReplicaTLSMode: "REQUIRED",
-			shouldEnhance:          true,
-			description:            "RDS replica with REQUIRED mode should use RDS TLS config",
+			name:        "RDS replica should get RDS TLS for REQUIRED mode",
+			mainTLSMode: "REQUIRED",
+			mainTLSCert: "",
+			replicaDSN:  "replica_user:replica_pass@tcp(replica.us-west-2.rds.amazonaws.com:3306)/testdb",
+			expect:      expectTLSAdded,
+			description: "RDS replica with REQUIRED mode should use RDS TLS config",
 		},
 	}
 
@@ -129,10 +141,13 @@ func TestReplicaTLSEnhancement(t *testing.T) {
 			enhanced, err := dbconn.EnhanceDSNWithTLS(tc.replicaDSN, runner.dbConfig)
 			require.NoError(t, err)
 
-			if tc.shouldEnhance {
+			switch tc.expect {
+			case expectTLSAdded:
 				require.NotEqual(t, tc.replicaDSN, enhanced, tc.description)
 				require.Contains(t, enhanced, "tls=", tc.description)
-			} else {
+			case expectNoTLS:
+				testutils.RequireNoEffectiveTLS(t, enhanced, tc.description)
+			case expectUnchanged:
 				require.Equal(t, tc.replicaDSN, enhanced, tc.description)
 			}
 		})

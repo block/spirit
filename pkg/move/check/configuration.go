@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 )
 
 // erUnknownSystemVariable is MySQL error 1193 (ER_UNKNOWN_SYSTEM_VARIABLE),

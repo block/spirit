@@ -3,8 +3,8 @@ package statement
 import (
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 

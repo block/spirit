@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -160,7 +160,7 @@ func TestReplica_UpdateLagWrapsCause(t *testing.T) {
 	// sql.Open is lazy and does not connect. A pre-canceled context makes
 	// QueryRowContext fail deterministically with context.Canceled before any
 	// dial, letting us assert the cause survives UpdateLag's wrapping.
-	db, err := sql.Open("mysql", "user:pass@tcp(127.0.0.1:0)/test")
+	db, err := sql.Open("block-mysql", "user:pass@tcp(127.0.0.1:0)/test")
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

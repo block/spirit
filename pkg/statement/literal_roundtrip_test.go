@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/testutils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,13 +18,13 @@ const scratchDB = "test_w3e"
 func openScratch(t *testing.T) *sql.DB {
 	t.Helper()
 	// Create the scratch database via a server-scoped connection.
-	rootDB, err := sql.Open("mysql", testutils.DSN())
+	rootDB, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() { _ = rootDB.Close() }()
 	_, err = rootDB.ExecContext(t.Context(), "CREATE DATABASE IF NOT EXISTS "+scratchDB)
 	require.NoError(t, err)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(scratchDB))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(scratchDB))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
