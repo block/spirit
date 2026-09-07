@@ -3,7 +3,7 @@
 // must not treat separate schemas on the same endpoint as separate machines.
 package host
 
-import "github.com/go-sql-driver/mysql"
+import "github.com/block/mysql"
 
 // Host identifies an endpoint independently of schema and credentials. Ports
 // and transports remain distinct. DNS aliases and proxies cannot be resolved

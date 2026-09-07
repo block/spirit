@@ -3,6 +3,7 @@ package move
 import (
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/dbconn"
@@ -10,7 +11,6 @@ import (
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 

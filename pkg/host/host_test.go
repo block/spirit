@@ -3,7 +3,7 @@ package host
 import (
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 )
 

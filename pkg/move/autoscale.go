@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/host"
 	"github.com/block/spirit/pkg/throttler"
-	"github.com/go-sql-driver/mysql"
 )
 
 // moveAutoscaleBounds deliberately uses the smallest target, not the sum of
