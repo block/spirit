@@ -466,7 +466,9 @@ func (a *ShardedApplier) SetWriteWorkers(n int) {
 
 // Stats returns a point-in-time snapshot of the write pipeline, aggregated
 // across shards: queue depth/cap are summed, and active workers is the sum of
-// each shard's live (started minus finished) workers. The embedded mutex is
+// each shard's pool count — goroutines currently running, which during a shrink
+// can briefly exceed the number of quit channels the pool still tracks, since a
+// retired worker is removed from quits before it returns. The embedded mutex is
 // held so the buffer reads cannot race Start()'s channel reinitialization on
 // restart; len/cap on a closed channel are safe.
 func (a *ShardedApplier) Stats() Stats {

@@ -111,6 +111,10 @@ type Runner struct {
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
 	sourceTableMap map[string]bool    // used when only some tables are to be moved.
 
+	// throttler is read from Progress() and the repl feed's UnderLoad closure,
+	// so every access goes through setThrottler/currentThrottler. Reads on the
+	// single-threaded setup path are safe without it, but going through the
+	// accessor everywhere is what makes the guard self-describing.
 	throttlerMu sync.RWMutex
 	throttler   throttler.Throttler
 	monitorDBs  []*sql.DB
@@ -281,8 +285,8 @@ func (r *Runner) Close() error {
 	// rest, leaking the remaining repl clients' binlog reader goroutines
 	// and the target DB handles.
 	var errs []error
-	if r.throttler != nil {
-		errs = append(errs, r.throttler.Close())
+	if t := r.currentThrottler(); t != nil {
+		errs = append(errs, t.Close())
 	}
 	for _, db := range r.monitorDBs {
 		errs = append(errs, db.Close())
@@ -557,7 +561,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   r.throttler,
+		Throttler:   r.currentThrottler(),
 		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
@@ -1055,7 +1059,7 @@ func (r *Runner) newCopy(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   r.throttler,
+		Throttler:   r.currentThrottler(),
 		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
@@ -1866,7 +1870,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
-		Throttler:       r.throttler,
+		Throttler:       r.currentThrottler(),
 		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
 		MetricsSink:     r.metricsSink,
 	})
@@ -2110,7 +2114,7 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
-		Throttler:       r.throttler,
+		Throttler:       r.currentThrottler(),
 		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
 		MetricsSink:     r.metricsSink,
 		// One pass per outer-loop iteration; the continuous-checksum

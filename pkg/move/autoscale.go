@@ -63,8 +63,19 @@ func (r *Runner) setupAutoscaling(ctx context.Context) error {
 	for i, group := range groups {
 		target := r.targets[group.Indices[0]]
 		aurora, err := throttler.IsAurora(ctx, target.DB)
-		if err != nil || !aurora {
-			r.logger.Warn("move autoscaling disabled: every target must provide an Aurora load signal", "target", targetKey(target), "error", err)
+		// The policy is the same either way — all targets or none, since the
+		// controller scales them in lockstep — but the two causes are not. A
+		// probe that failed is something an operator needs to act on (locked-down
+		// perf_schema, an under-granted monitor user); a target that is simply
+		// not Aurora is an ordinary configuration, so it does not warn.
+		switch {
+		case err != nil:
+			r.logger.Warn("move autoscaling disabled: could not determine whether the target is Aurora; thread counts stay as configured",
+				"target", targetKey(target), "error", err.Error())
+			return nil
+		case !aurora:
+			r.logger.Info("move autoscaling disabled: every target must provide an Aurora load signal; thread counts stay as configured",
+				"target", targetKey(target))
 			return nil
 		}
 		vcpus[i], err = throttler.AuroraVCPUs(ctx, target.DB)
