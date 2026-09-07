@@ -209,7 +209,15 @@ func LoadCertificateFromFile(filePath string) ([]byte, error) {
 //
 // The registration survives the driver's own auto-TLS because the name is part
 // of this package's contract, not an internal detail: EnhanceDSNWithTLS returns
-// DSNs carrying tls=rds, and block/schemabot opens them.
+// DSNs carrying tls=rds, so a consumer must open them with [DriverName].
+//
+// That is a requirement, not a reassurance. A TLS registry is a package global
+// of whichever driver package registered it, so a consumer that opens a
+// tls=rds DSN with upstream go-sql-driver fails in ParseDSN with "invalid value
+// / unknown config name: rds" — before any dial, on every RDS host. Since this
+// package moved to github.com/block/mysql, "the same driver" means block/mysql.
+// block/schemabot is the consumer that does this; it is switching to
+// block/mysql alongside this change, which is what keeps it working.
 func initRDSTLS() error {
 	var err error
 	once.Do(func() {
@@ -227,6 +235,16 @@ func initCustomTLS(config *DBConfig) error {
 		certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
 		if err != nil {
 			return err
+		}
+		// An empty file is an error, not a fallback. NewCustomTLSConfig reads
+		// no bytes as "use the RDS roots", which is right for a caller that
+		// named no path but wrong for one that named a path to a truncated or
+		// not-yet-populated private CA: that operator asked to verify against
+		// their own root and would silently get Amazon's instead, with a
+		// connection that succeeds. Only the path is distinguishable from the
+		// bytes, so this has to be caught here.
+		if len(certData) == 0 {
+			return fmt.Errorf("TLS certificate file %q is empty; expected PEM-encoded CA certificates", config.TLSCertificatePath)
 		}
 	}
 	// Otherwise certData stays nil, which NewCustomTLSConfig reads as "use the
@@ -511,9 +529,11 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 // name", because TLS registries are per-driver package globals rather than
 // anything the DSN carries.
 func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
-	// TLSMode is documented as case-insensitive; compare on the upper-cased
-	// value so a lowercase "disabled" is honored here too.
-	if config == nil || strings.ToUpper(config.TLSMode) == "DISABLED" {
+	// A nil config is "the caller said nothing about TLS", which is not the
+	// same as asking for none: leave the DSN alone and let whatever opens it
+	// decide. DISABLED is an explicit request and is handled below, because on
+	// an RDS host it now takes a positive `tls=false` to be honored.
+	if config == nil {
 		return inputDSN, nil
 	}
 
@@ -528,9 +548,24 @@ func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 		return inputDSN, nil //nolint:nilerr // Intentional graceful degradation
 	}
 
-	// If DSN already has TLS configuration, respect it
+	// If DSN already has TLS configuration, respect it. This outranks
+	// DISABLED, matching addTLSParametersToDSN: the DSN is the more specific
+	// statement of intent.
 	if cfg.TLSConfig != "" {
 		return inputDSN, nil
+	}
+
+	// TLSMode is documented as case-insensitive; compare on the upper-cased
+	// value so a lowercase "disabled" is honored here too.
+	//
+	// DISABLED used to return inputDSN untouched. That is no longer the same
+	// thing as "no TLS": the driver applies TLS to an RDS address when the DSN
+	// asked for nothing, so returning a DSN with no `tls=` at all handed
+	// DISABLED callers the opposite of what they requested. Say it positively.
+	// See newDSN, which carries the same fix for the other DSN producer.
+	if strings.ToUpper(config.TLSMode) == "DISABLED" {
+		cfg.TLSConfig = tlsDisabledConfigName
+		return cfg.FormatDSN(), nil
 	}
 
 	// Enhance DSN with TLS settings from main config
@@ -553,7 +588,11 @@ func addTLSParametersToDSN(dsn string, config *DBConfig) (string, error) {
 	var tlsParam string
 	switch strings.ToUpper(config.TLSMode) {
 	case "DISABLED":
-		return dsn, nil // No TLS needed
+		// tls=false, not an untouched DSN: the driver reads "no tls= at all"
+		// as permission to apply RDS auto-TLS, so silence here would enable
+		// TLS on exactly the hosts DISABLED matters for.
+		cfg.TLSConfig = tlsDisabledConfigName
+		return cfg.FormatDSN(), nil
 	case "PREFERRED":
 		// For PREFERRED mode, we need to setup custom TLS config
 		if err := initCustomTLS(config); err != nil {
