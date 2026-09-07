@@ -34,7 +34,7 @@ linters:
         main:
           deny:
             - pkg: github.com/go-sql-driver/mysql
-              desc: 'import github.com/block/mysql instead (registered as driver name "block-mysql"). Two MySQL drivers in one binary define two field-identical but distinct *mysql.MySQLError types, and errors.AsType against one returns false for the other — so the classifiers in pkg/dbconn, pkg/checkpoint and pkg/throttler keep compiling and silently stop recognizing deadlocks, lock-wait timeouts and unknown-system-variable. They also keep separate TLS registries, so dbconn''s "rds" config name would not resolve for a pool opened on the other driver.'
+              desc: 'import github.com/block/mysql instead (registered as driver name "block-mysql"). Two MySQL drivers in one binary define two field-identical but distinct *mysql.MySQLError types, and errors.AsType against one returns false for the other — so every classifier built on it keeps compiling while quietly answering "no". pkg/dbconn stops recognizing 1205 lock-wait and 1213 deadlock, so retries stop happening, and pkg/change''s buffered subscription (which asks dbconn.IsLockContentionError) stops backing off from contention its own flush fan-out causes. pkg/checkpoint''s IsIncompatible stops recognizing 1146/1054, so a checkpoint written by an incompatible version reads as a transient read error and the run asks for a retry that can never succeed. pkg/{migration,move}/check fail loudly rather than silently, gating on `!ok || Number != 1193`, so the configuration check refuses to run at all against MySQL < 8.0.20. The drivers also keep separate TLS registries, so dbconn''s "rds" config name would not resolve for a pool opened on the other driver.'
 formatters:
   enable:
     - gofmt
