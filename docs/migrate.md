@@ -670,9 +670,9 @@ Note that the whole report is a single log record containing newlines. Spirit's 
 | Field | Meaning |
 | --- | --- |
 | `%` | Rows copied out of the estimated total. The total comes from table statistics, so the percentage can drift slightly and is not a row count you should reconcile against. |
-| `n/m` | The figures the percentage is derived from. |
+| `n/m` | The figures the percentage is derived from: rows settled so far and the estimated table cardinality, the same numbers the status API reports per table and as `Copy`. |
 | `chunk-size` | Rows in the most recently claimed chunk. The chunker sizes chunks dynamically to hit the [`--target-chunk-size`](#target-chunk-size) byte budget, so this number moving is normal and healthy — it is how Spirit adapts to row width. A chunk size that has collapsed to its floor and stayed there means the rows are too wide to fit the budget even at the floor, i.e. lower `--target-chunk-size` than the data wants, not a struggling server. |
-| `eta` | Remaining rows divided by the recently measured copy rate. `TBD` for the first minute (no rate measured yet) and `DUE` past 99.99%. It is computed from a single 10-second sample, so early on it swings a lot; treat a large jump as noise unless it persists. |
+| `eta` | Remaining distance through the key range divided by the recently measured copy rate. `TBD` for the first minute (no rate measured yet) and `DUE` past 99.99% of the key range, which on a table whose ids are sparse need not coincide with the `%` column. It is computed from a single 10-second sample, so early on it swings a lot; treat a large jump as noise unless it persists. |
 | `throttled` | Whether the copy is currently paused by a throttler (replica lag, commit latency, or load). A migration that is throttled is behaving as designed — it is protecting the server, not stalling. |
 
 The `checksum` row that replaces this one during the checksum phase has the same shape — including its own `chunk-size`, since the checksum sizes chunks dynamically as well, though against a fixed 5s time budget rather than the byte budget — plus `threads=` and `throttled=` for the checksum's own pacing.

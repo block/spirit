@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/block/spirit/pkg/copier"
@@ -62,9 +63,19 @@ func TestProgressCopyReconcilesWithTablesOnAutoIncrementKey(t *testing.T) {
 	require.Less(t, p.Copy.RowsTotal, uint64(1000000), "the total is the row estimate, not the auto_increment max")
 	require.Equal(t, p.Copy.String()+" copyRows ETA TBD", p.Summary)
 
-	// The copier's own measure is the one Copy must not be: two chunks of
-	// keyspace against the auto_increment max.
-	require.Equal(t, status.CopyProgress{RowsCopied: 2000, RowsTotal: 1000000}, m.copier.CopyProgress())
+	// The copier's own measure is the one Copy must not be: keyspace distance
+	// against the auto_increment max. Its total is the highest id, and its
+	// numerator counts ids the table never had, so it overshoots the rows
+	// settled.
+	own := m.copier.CopyProgress()
+	require.EqualValues(t, 1000000, own.RowsTotal)
+	require.Greater(t, own.RowsCopied, p.Copy.RowsCopied)
+	require.NotEqual(t, p.Copy, own)
+
+	// The log block reports the same measure as the API on the same tick.
+	block := m.Status()
+	require.Contains(t, block, fmt.Sprintf("%d/%d", p.Copy.RowsCopied, p.Copy.RowsTotal))
+	require.NotContains(t, block, fmt.Sprintf("%d/%d", own.RowsCopied, own.RowsTotal))
 
 	m.status.Set(status.WaitingOnSentinelTable)
 	require.Equal(t, p.Copy, m.Progress().Copy)

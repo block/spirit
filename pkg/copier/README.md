@@ -58,7 +58,8 @@ type ChunkCopier interface {
 
 - **`Run(ctx)`**: Starts the copy process and blocks until completion or error. Spawns multiple worker goroutines based on the configured concurrency level.
 - **`GetETA()`**: Returns estimated time to completion as a human-readable string. Returns "TBD" during the initial warmup period (1 minute), "DUE" when >99.99% complete, or a duration like "2h30m15s".
-- **`GetProgress()`**: Returns progress as "copied/total percentage%" (e.g., "1000000/5000000 20.00%").
+- **`GetETAState()`**: The same estimate as a `status.ETA{State, Duration}`, for callers that branch on whether an estimate exists yet. `GetETA()` is its `String()`.
+- **`CopyProgress()`**: Returns the copier's own progress as `status.CopyProgress{RowsCopied, RowsTotal}`. This is the measure the copier paces on: for the optimistic chunker it is keyspace distance against the auto_increment max, not a row count, so the runners report settled rows from the chunker instead (see `status.CopyFromTables`). `GetProgress()` is its rendered form, kept for interface compatibility; Spirit itself no longer calls it.
 - **`GetChunker()`**: Returns the underlying chunker for accessing detailed progress information.
 - **`SetThrottler(throttler)`**: Updates the throttler used to control copy rate.
 - **`GetThrottler()`**: Returns the current throttler.
@@ -167,8 +168,8 @@ for {
     case <-ctx.Done():
         return
     case <-ticker.C:
-        progress := copier.GetProgress()
-        eta := copier.GetETA()
+        progress := copier.CopyProgress()
+        eta := copier.GetETAState()
         fmt.Printf("Progress: %s, ETA: %s\n", progress, eta)
     }
 }

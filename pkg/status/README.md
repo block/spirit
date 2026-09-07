@@ -69,7 +69,7 @@ migration status: state=copyRows total-time=2m6s copier-time=2m0s
 
 | Row | Source | Contents |
 | --- | --- | --- |
-| `copier` | `copier.Copier` | Percentage and counts from `CopyProgress()`, then `chunk-size=` (rows in the most recently claimed chunk — the dynamic chunker's current sizing decision, previously visible only inside the checkpoint line's watermark JSON), the ETA, and whether a throttler is pausing the copy. |
+| `copier` | chunker + `copier.Copier` | Percentage and counts of settled rows against the tables' cardinality estimates — the same figures `Progress().Copy` reports, not the copier's own keyspace measure — then `chunk-size=` (rows in the most recently claimed chunk — the dynamic chunker's current sizing decision, previously visible only inside the checkpoint line's watermark JSON), the ETA, and whether a throttler is pausing the copy. |
 | `applier` | `applier.Stats` | `queue=` is occupancy, not progress: at capacity is the healthy steady state for a copy, and a queue that empties means the pipeline has gone read-limited. See `pkg/applier/README.md` for which fields render and which appear only when they carry a diagnosis. |
 | `binlog` | runner + `change.FeedStats` | `deltas=` is the runner's unapplied-change count; the rest is the feed. `rotations=` replaces go-mysql's per-rotation `rotate to next binlog` line, which spirit now demotes to DEBUG, and `(n forced)` is the subset spirit caused itself by issuing `FLUSH BINARY LOGS` from `BlockWait` when the buffered position stalled. |
 | `ckpt` | `status.LastCheckpoint` | How long ago the checkpoint was persisted and the change-feed coordinate it saved — where a resumed run would restart reading. The pair is what answers whether that point is still within the source's binlog retention. `never` before the first checkpoint; a multi-source move renders `key=position` per source. |
@@ -86,7 +86,13 @@ Two things the block gives up, deliberately: the whole report is one log record 
 
 `Progress` is a struct (not just a string) containing the current state and a summary. It is designed as a struct specifically to allow future expansion for GUI wrappers and external tooling.
 
-Alongside the summary it carries structured fields for the things a wrapper would otherwise have to parse out of prose or scrape from the logs: `ETA`, per-table `Tables` progress, `Checksum` progress, and — from [#844](https://github.com/block/spirit/issues/844) — `Resume` and `Throttle`.
+Alongside the summary it carries structured fields for the things a wrapper would otherwise have to parse out of prose or scrape from the logs: `ETA`, the runner-wide `Copy` counts, per-table `Tables` progress, `Checksum` progress, and — from [#844](https://github.com/block/spirit/issues/844) — `Resume` and `Throttle`.
+
+### `Copy`
+
+`Copy` is the runner-wide row copy as a `CopyProgress{RowsCopied, RowsTotal}`. It is the sum of `Tables`, so the two always reconcile: both count settled rows against the tables' cardinality estimates, and neither is the optimistic chunker's keyspace position, which is what the copier paces on and what the ETA is derived from. It is populated as soon as the copy chunker exists and keeps its final reading through the later phases, so "how much did this run copy" stays answerable after the copy ends.
+
+Two caveats carry over from the per-table counts. `RowsCopied` counts rows settled by this run, so it may exclude work from before a resume (`Resume` is true in the same snapshot). And the ETA's `DUE` is paced on the keyspace, so over a sparse key range `Copy` can read close to complete while the ETA is still counting down, or the reverse; `Summary` carries both halves.
 
 ### `Resume`
 
@@ -128,7 +134,7 @@ A `move` reports no throttling at all — it copies through a `Noop` throttler f
 
 ### Structured runner progress
 
-Migration, move and datasync use `TablesFromChunker` to return table progress in a stable order. Multi-source identifiers retain the source qualifier so equally named tables remain distinct. Copy ETA is populated during `CopyRows` and cleared afterwards. Migration and move also expose the finite initial checksum counts; datasync’s continuous verifier has no corresponding finite phase.
+Migration, move and datasync use `TablesFromChunker` to return table progress in a stable order. Multi-source identifiers retain the source qualifier so equally named tables remain distinct. Copy ETA is populated during `CopyRows` and cleared afterwards; the `Copy` counts persist past it. Migration and move also expose the finite initial checksum counts; datasync’s continuous verifier has no corresponding finite phase.
 
 All three use multiline status blocks. Datasync includes `copier-time` while copying and `state-time` while restoring indexes, alongside its existing binlog and checkpoint rows. Sentinel progress polling returns a summary without emitting logs; periodic logging remains the responsibility of `WatchTask`.
 

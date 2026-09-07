@@ -1447,23 +1447,28 @@ func (r *Runner) Result() status.WorkflowResult {
 	}
 }
 
+// copyTables snapshots the copy chunker and returns the per-table progress.
+// Progress and Status both derive their copy figures from it, so the API and
+// the log block report one measure: settled rows against the tables'
+// cardinality estimates, kept past the end of the copy. The copier's own
+// progress is not used for either, because on an auto_increment key it
+// measures keyspace distance, not rows. The chunker is read under chunkerMu
+// to synchronize with initChunkers(), which may be assigning it concurrently
+// during setup.
+func (r *Runner) copyTables() []status.TableProgress {
+	r.chunkerMu.RLock()
+	copyChunker := r.copyChunker
+	r.chunkerMu.RUnlock()
+	return status.TablesFromChunker(copyChunker)
+}
+
 func (r *Runner) Progress() status.Progress {
 	// Read the state once: the phase-specific fields below (summary, ETA,
 	// checksum, throttle) must all describe the same state, not whichever state
 	// each happened to observe.
 	state := r.status.Get()
 
-	// Get per-table progress if available (multi-table migrations).
-	// We hold chunkerMu to synchronize with initChunkers(), which
-	// may be assigning r.copyChunker concurrently during setup.
-	r.chunkerMu.RLock()
-	copyChunker := r.copyChunker
-	r.chunkerMu.RUnlock()
-	tables := status.TablesFromChunker(copyChunker)
-	// The runner-wide copy is the sum of the per-table rows, so it reconciles
-	// with Tables and keeps its final reading once the copy has finished. The
-	// copier's own progress is not used for it: on an auto_increment key that
-	// measures keyspace distance, not rows.
+	tables := r.copyTables()
 	copyProgress := status.CopyFromTables(tables)
 
 	var summary string
@@ -1986,7 +1991,7 @@ func (r *Runner) Status() string {
 	}
 	switch state { //nolint: exhaustive
 	case status.CopyRows:
-		progress := r.copier.CopyProgress()
+		progress := status.CopyFromTables(r.copyTables())
 		b := status.NewBlock("migration status: state=%s total-time=%s copier-time=%s",
 			state.String(),
 			r.status.TotalElapsed().Round(time.Second),

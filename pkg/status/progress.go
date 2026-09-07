@@ -132,6 +132,14 @@ type Progress struct {
 	// final reading through the later phases, so a caller can read how much
 	// the run copied at any point. RowsTotal is an estimate, so RowsCopied can
 	// exceed it.
+	//
+	// Two consequences of that split follow. RowsCopied counts rows settled by
+	// this run, so like TableProgress.RowsCopied it may exclude work from
+	// before a resume when the checkpoint does not retain row counts; Resume
+	// is true in the same snapshot. And the ETA, including its DUE state, is
+	// paced on the keyspace, so over a sparse key range the copy can read
+	// close to complete here while the ETA is still counting down, or the
+	// reverse. Summary carries both halves.
 	Copy CopyProgress
 
 	// Checksum is the structured progress of the post-copy checksum phase,

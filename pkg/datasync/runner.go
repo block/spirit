@@ -1601,9 +1601,11 @@ func (r *Runner) Progress() status.Progress {
 
 	tables := status.TablesFromChunker(chunker)
 	// The runner-wide copy is the sum of the per-table rows, so it reconciles
-	// with Tables and keeps its final reading once the copy has finished. The
-	// copier's own progress is not used for it: on an auto_increment key that
-	// measures keyspace distance, not rows.
+	// with Tables and keeps its final reading once the copy has finished.
+	// Status derives its copier row the same way, so the API and the log
+	// block report one measure. The copier's own progress is not used for
+	// either: on an auto_increment key that measures keyspace distance, not
+	// rows.
 	copyProgress := status.CopyFromTables(tables)
 
 	var summary string
@@ -1648,6 +1650,7 @@ func (r *Runner) Status() string {
 
 	r.progMu.RLock()
 	cp := r.copier
+	chunker := r.copyChunker
 	repl := r.replClient
 	appl := r.applier
 	r.progMu.RUnlock()
@@ -1663,7 +1666,9 @@ func (r *Runner) Status() string {
 		// The copy pipeline is built asynchronously, so a status tick can land
 		// before there is a copier to report on.
 		if cp != nil {
-			progress := cp.CopyProgress()
+			// Settled rows, the same measure Progress reports, not the
+			// copier's own keyspace position.
+			progress := status.CopyFromTables(status.TablesFromChunker(chunker))
 			// No throttled= here, unlike migrate and move: a sync copies
 			// through a Noop throttler, so the field would be a constant
 			// false.
