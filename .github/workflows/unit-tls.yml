@@ -43,5 +43,11 @@ jobs:
       # DSN-handling tests, which is the safe direction: a new TLS test whose
       # name this misses is silently unprotected, whereas an extra pure test
       # costs a second.
+      #
+      # This is pkg/dbconn only, and that is not the whole TLS surface:
+      # pkg/migration asserts these properties too (TestReplicaTLSEnhancement),
+      # but its TestMain provisions a server, so those stay in the mysql*-docker
+      # matrices. Do not read a green tick here as "the TLS assertions passed" —
+      # it means the ones that need no database did.
       - name: TLS and DSN tests
         run: go test -race -count=1 -run 'TLS|DSN|Certificate|RDS|Verify|Strict|Disabled|Registered' ./pkg/dbconn/

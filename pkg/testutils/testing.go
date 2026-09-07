@@ -280,3 +280,23 @@ func EvenOddHasher(colAny any) (uint64, error) {
 	}
 	return hash, nil
 }
+
+// RequireNoEffectiveTLS asserts that a DSN yields a connection with no TLS.
+//
+// It deliberately does not assert the DSN omits "tls=". DISABLED writes
+// tls=false, because the driver applies verified TLS to an RDS address whenever
+// the DSN asks for nothing — so an omitted parameter is how DISABLED silently
+// becomes a TLS connection, while an explicit "false" is how it stays off. What
+// matters is the setting the driver ends up with, which is what this reads.
+//
+// It lives here rather than in dbconn's tests because pkg/migration asserts the
+// same property, and two copies of "what counts as no TLS" would let one of
+// them be strengthened while the other silently stayed weak.
+func RequireNoEffectiveTLS(t *testing.T, dsn, description string) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err, description)
+	require.Nil(t, cfg.TLS, "%s: DSN produced a TLS connection", description)
+	require.False(t, cfg.AllowCleartextPasswords,
+		"%s: cleartext passwords allowed with no TLS", description)
+}
