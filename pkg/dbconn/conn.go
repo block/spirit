@@ -4,12 +4,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
-	_ "embed"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +33,12 @@ const (
 	requiredTLSConfigName = "required"
 	verifyCATLSConfigName = "verify_ca"
 	verifyIDTLSConfigName = "verify_identity"
+
+	// tlsDisabledConfigName is the DSN's explicit "no TLS" value. Unlike the
+	// names above it is not something this package registers — the driver
+	// understands it directly — and unlike an empty tls= it survives the
+	// driver's RDS auto-TLS. See the DISABLED branch of newDSN.
+	tlsDisabledConfigName = "false"
 )
 
 // maxConnLifetime is the default maximum lifetime for pooled connections.
@@ -68,33 +72,62 @@ func SetPoolSize(db *sql.DB, n int) {
 	}
 }
 
-// rdsAddr matches Amazon RDS hostnames with optional :port suffix.
-// It's used to automatically load the Amazon RDS CA and enable TLS.
-// The leading \. ensures only legitimate *.rds.amazonaws.com subdomains match,
-// preventing subdomain spoofing attacks (e.g., fake-rds.amazonaws.com).
-var (
-	rdsAddr = regexp.MustCompile(`\.rds\.amazonaws\.com(:\d+)?$`)
-	once    sync.Once
-	// https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
-	//go:embed rdsGlobalBundle.pem
-	rdsGlobalBundle []byte
-)
+var once sync.Once
 
+// IsRDSHost reports whether host is an Amazon RDS or Aurora endpoint.
+//
+// [DriverName] applies verified TLS to such a host by itself, so the
+// database/sql paths in this package no longer need to ask. It stays exported
+// and in use for two reasons: [GetTLSConfigForBinlog] serves the go-mysql
+// binlog client, which is not a database/sql connection and so is not covered
+// by the driver; and block/schemabot calls it to decide a TLS mode.
+//
+// Two things changed by delegating. The match is now case-insensitive, which is
+// a fix — DNS is case-insensitive, nothing normalizes the host, and a
+// hostname that arrives uppercased is the same endpoint. And GovCloud and
+// China endpoints now report false, because the bundle behind
+// [NewTLSConfig] contains no roots for either partition, so verifying against
+// it could only ever fail. Reach those with --tls-certificate-path and that
+// partition's own bundle.
 func IsRDSHost(host string) bool {
-	return rdsAddr.MatchString(host)
+	return mysql.IsRDSAddr(host)
 }
 
-// NewTLSConfig creates a TLS config using the embedded RDS global bundle
+// NewTLSConfig returns a TLS config that verifies an Amazon RDS or Aurora
+// server against the RDS root bundle.
+//
+// The bundle and the pool behind this used to be spirit's own — an embedded
+// copy of global-bundle.pem plus an x509.CertPool built from it. Both now come
+// from [DriverName], which carries the same bundle for its own auto-TLS, so
+// there is one copy to refresh instead of two that can drift apart.
+//
+// Each call returns a config with its own RootCAs, so callers may modify the
+// result (GetTLSConfigForBinlog sets ServerName on it). It also pins
+// MinVersion to TLS 1.2, which spirit's version did not.
 func NewTLSConfig() *tls.Config {
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(rdsGlobalBundle)
-	return &tls.Config{RootCAs: caCertPool}
+	return mysql.RDSTLSConfig()
 }
 
-// NewCustomTLSConfig creates a TLS config based on SSL mode and certificate data
+// NewCustomTLSConfig creates a TLS config based on SSL mode and certificate data.
+//
+// An empty certData means "use the RDS roots", which is the fallback for a
+// host that is not recognizably RDS and for which no --tls-certificate-path was
+// given. That fallback is inherited behaviour and is rarely what anyone wants:
+// a non-RDS server will not present an RDS-issued certificate, so VERIFY_CA
+// and VERIFY_IDENTITY against it fail by construction. It is preserved here
+// rather than changed, because tightening it is a behaviour change that
+// belongs in its own commit.
 func NewCustomTLSConfig(certData []byte, sslMode string) *tls.Config {
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(certData)
+	var caCertPool *x509.CertPool
+	if len(certData) == 0 {
+		// The driver's RDS roots, and a private copy of the pool: the switch
+		// below hands it to callers who may append to it, and x509.CertPool has
+		// no copy-on-write.
+		caCertPool = mysql.RDSTLSConfig().RootCAs
+	} else {
+		caCertPool = x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(certData)
+	}
 
 	switch strings.ToUpper(sslMode) {
 	case "DISABLED":
@@ -172,11 +205,19 @@ func LoadCertificateFromFile(filePath string) ([]byte, error) {
 	return os.ReadFile(filePath)
 }
 
-// GetEmbeddedRDSBundle returns the embedded RDS certificate bundle
-func GetEmbeddedRDSBundle() []byte {
-	return rdsGlobalBundle
-}
-
+// initRDSTLS registers the RDS trust store under rdsTLSConfigName.
+//
+// The registration survives the driver's own auto-TLS because the name is part
+// of this package's contract, not an internal detail: EnhanceDSNWithTLS returns
+// DSNs carrying tls=rds, so a consumer must open them with [DriverName].
+//
+// That is a requirement, not a reassurance. A TLS registry is a package global
+// of whichever driver package registered it, so a consumer that opens a
+// tls=rds DSN with upstream go-sql-driver fails in ParseDSN with "invalid value
+// / unknown config name: rds" — before any dial, on every RDS host. Since this
+// package moved to github.com/block/mysql, "the same driver" means block/mysql.
+// block/schemabot is the consumer that does this; it is switching to
+// block/mysql alongside this change, which is what keeps it working.
 func initRDSTLS() error {
 	var err error
 	once.Do(func() {
@@ -195,10 +236,19 @@ func initCustomTLS(config *DBConfig) error {
 		if err != nil {
 			return err
 		}
-	} else {
-		// Use embedded RDS bundle as fallback
-		certData = rdsGlobalBundle
+		// An empty file is an error, not a fallback. NewCustomTLSConfig reads
+		// no bytes as "use the RDS roots", which is right for a caller that
+		// named no path but wrong for one that named a path to a truncated or
+		// not-yet-populated private CA: that operator asked to verify against
+		// their own root and would silently get Amazon's instead, with a
+		// connection that succeeds. Only the path is distinguishable from the
+		// bytes, so this has to be caught here.
+		if len(certData) == 0 {
+			return fmt.Errorf("TLS certificate file %q is empty; expected PEM-encoded CA certificates", config.TLSCertificatePath)
+		}
 	}
+	// Otherwise certData stays nil, which NewCustomTLSConfig reads as "use the
+	// RDS roots" — the same fallback as before, now sourced from the driver.
 
 	tlsConfig := NewCustomTLSConfig(certData, config.TLSMode)
 	if tlsConfig != nil {
@@ -247,8 +297,15 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	if cfg.TLSConfig == "" {
 		switch strings.ToUpper(config.TLSMode) {
 		case "DISABLED":
-			// No TLS - explicitly clear any TLS configuration
-			cfg.TLSConfig = ""
+			// No TLS — and it has to be said out loud rather than left blank.
+			//
+			// [DriverName] applies verified TLS to an RDS address when the DSN
+			// asks for nothing, so leaving TLSConfig empty here would hand
+			// --tls-mode=DISABLED users on RDS a TLS connection: exactly the
+			// opposite of what they asked for, from a driver upgrade, with no
+			// error to notice. "false" is the DSN's explicit off switch, which
+			// the driver honours and its auto-TLS declines to override.
+			cfg.TLSConfig = tlsDisabledConfigName
 
 		case "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY":
 			// TLS with certificate selection - determine which certificate to use
@@ -266,7 +323,7 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 				}
 				cfg.TLSConfig = rdsTLSConfigName
 			default:
-				// Use embedded RDS bundle as fallback for non-RDS hosts
+				// Use the RDS roots as fallback for non-RDS hosts
 				if err = initCustomTLS(config); err != nil {
 					return "", err
 				}
@@ -278,14 +335,14 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 
 		default:
 			// PREFERRED and unknown modes - use permissive TLS behavior
-			// For RDS hosts, use RDS certificate. For others, use embedded RDS bundle as fallback
+			// For RDS hosts, use RDS certificate. For others, use the RDS roots as fallback
 			if IsRDSHost(cfg.Addr) {
 				if err = initRDSTLS(); err != nil {
 					return "", err
 				}
 				cfg.TLSConfig = rdsTLSConfigName
 			} else {
-				// Use embedded RDS bundle as fallback for non-RDS hosts
+				// Use the RDS roots as fallback for non-RDS hosts
 				if err = initCustomTLS(config); err != nil {
 					return "", err
 				}
@@ -330,19 +387,20 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 
 	// Set driver options directly on the config struct.
 	cfg.Collation = "utf8mb4_bin"
-	// So that we recycle the connection if we inadvertently connect to an old primary which is now a read only replica.
-	// This behaviour has been observed during blue/green upgrades and failover on AWS Aurora.
-	// See also: https://github.com/go-sql-driver/mysql?tab=readme-ov-file#rejectreadonly
-	//
-	// Disabled for an injected, read-only change.Source (a Vitess/PlanetScale
-	// VStream import) via DBConfig.RejectReadOnly: that source is a read-only
-	// replica on purpose, and rejectReadOnly would turn its read-only
-	// responses into "driver: bad connection".
-	cfg.RejectReadOnly = config.RejectReadOnly
+	// Note: there is no rejectReadOnly to set. [DriverName] recycles a
+	// connection that reports a read-only error unconditionally — the option
+	// and its default-off are gone — so the blue/green and Aurora-failover
+	// protection spirit used to opt into is now simply how the driver behaves.
 	cfg.InterpolateParams = config.InterpolateParams
-	// Allow cleartext password authentication only when TLS is configured
-	// (required for AWS RDS IAM auth, safe because the connection uses TLS).
-	cfg.AllowCleartextPasswords = cfg.TLSConfig != ""
+	// Allow cleartext password authentication only when the connection is
+	// actually encrypted (required for AWS RDS IAM auth, safe because the
+	// connection uses TLS).
+	//
+	// Checking against tlsDisabledConfigName as well as "" is load-bearing:
+	// DISABLED now writes tls=false rather than leaving the field empty, and a
+	// bare `!= ""` would read that as "TLS is on" and start sending passwords
+	// in the clear over a plaintext connection.
+	cfg.AllowCleartextPasswords = cfg.TLSConfig != "" && cfg.TLSConfig != tlsDisabledConfigName
 	cfg.AllowNativePasswords = true
 
 	return cfg.FormatDSN(), nil
@@ -471,9 +529,11 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 // name", because TLS registries are per-driver package globals rather than
 // anything the DSN carries.
 func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
-	// TLSMode is documented as case-insensitive; compare on the upper-cased
-	// value so a lowercase "disabled" is honored here too.
-	if config == nil || strings.ToUpper(config.TLSMode) == "DISABLED" {
+	// A nil config is "the caller said nothing about TLS", which is not the
+	// same as asking for none: leave the DSN alone and let whatever opens it
+	// decide. DISABLED is an explicit request and is handled below, because on
+	// an RDS host it now takes a positive `tls=false` to be honored.
+	if config == nil {
 		return inputDSN, nil
 	}
 
@@ -488,9 +548,24 @@ func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 		return inputDSN, nil //nolint:nilerr // Intentional graceful degradation
 	}
 
-	// If DSN already has TLS configuration, respect it
+	// If DSN already has TLS configuration, respect it. This outranks
+	// DISABLED, matching addTLSParametersToDSN: the DSN is the more specific
+	// statement of intent.
 	if cfg.TLSConfig != "" {
 		return inputDSN, nil
+	}
+
+	// TLSMode is documented as case-insensitive; compare on the upper-cased
+	// value so a lowercase "disabled" is honored here too.
+	//
+	// DISABLED used to return inputDSN untouched. That is no longer the same
+	// thing as "no TLS": the driver applies TLS to an RDS address when the DSN
+	// asked for nothing, so returning a DSN with no `tls=` at all handed
+	// DISABLED callers the opposite of what they requested. Say it positively.
+	// See newDSN, which carries the same fix for the other DSN producer.
+	if strings.ToUpper(config.TLSMode) == "DISABLED" {
+		cfg.TLSConfig = tlsDisabledConfigName
+		return cfg.FormatDSN(), nil
 	}
 
 	// Enhance DSN with TLS settings from main config
@@ -513,7 +588,11 @@ func addTLSParametersToDSN(dsn string, config *DBConfig) (string, error) {
 	var tlsParam string
 	switch strings.ToUpper(config.TLSMode) {
 	case "DISABLED":
-		return dsn, nil // No TLS needed
+		// tls=false, not an untouched DSN: the driver reads "no tls= at all"
+		// as permission to apply RDS auto-TLS, so silence here would enable
+		// TLS on exactly the hosts DISABLED matters for.
+		cfg.TLSConfig = tlsDisabledConfigName
+		return cfg.FormatDSN(), nil
 	case "PREFERRED":
 		// For PREFERRED mode, we need to setup custom TLS config
 		if err := initCustomTLS(config); err != nil {
@@ -590,8 +669,6 @@ func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 			}
-		} else {
-			certData = GetEmbeddedRDSBundle()
 		}
 		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
 
@@ -612,8 +689,6 @@ func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
 				if err != nil {
 					return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 				}
-			} else {
-				certData = GetEmbeddedRDSBundle()
 			}
 			tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
 		}
@@ -629,8 +704,6 @@ func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 			}
-		} else {
-			certData = GetEmbeddedRDSBundle()
 		}
 		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
 
@@ -645,8 +718,6 @@ func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 			}
-		} else {
-			certData = GetEmbeddedRDSBundle()
 		}
 		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
 
@@ -662,8 +733,6 @@ func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 			}
-		} else {
-			certData = GetEmbeddedRDSBundle()
 		}
 		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
 	}

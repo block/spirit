@@ -95,10 +95,9 @@ type Runner struct {
 	// nothing pays only for the discarded values.
 	metricsSink metrics.Sink
 	cancelFunc  context.CancelFunc
-	// sourceDBConfig connects to the read-only source: ForceKill and
-	// RejectReadOnly are disabled (see Run). targetDBConfig connects to the
-	// writable target and keeps the standard safe defaults — most importantly
-	// RejectReadOnly=true for Aurora-failover safety.
+	// sourceDBConfig connects to the read-only source, with ForceKill disabled
+	// (see Run). targetDBConfig connects to the writable target and keeps the
+	// standard safe defaults.
 	sourceDBConfig *dbconn.DBConfig
 	targetDBConfig *dbconn.DBConfig
 
@@ -250,25 +249,31 @@ func (r *Runner) Run(ctx context.Context) error {
 	// on the source schema; the built-in MySQL binlog client additionally
 	// needs REPLICATION SLAVE/CLIENT (validated on Start) and RELOAD, because
 	// it issues FLUSH BINARY LOGS to establish its start position. Disable the
-	// two dbConfig behaviours that would otherwise demand more:
+	// one dbConfig behaviour that would otherwise demand more:
 	//   - ForceKill needs CONNECTION_ADMIN/PROCESS + performance_schema, and
 	//     is only used to break metadata locks during cutover — which sync
 	//     never does.
-	//   - RejectReadOnly is an Aurora-failover guard that turns a read-only
-	//     server error into driver.ErrBadConn; sync's source is read-only by
-	//     design (e.g. a Vitess/PlanetScale replica), so it must not fire.
+	//
+	// There used to be a second, RejectReadOnly=false, on the grounds that the
+	// source is read-only by design (e.g. a Vitess/PlanetScale replica). That
+	// reasoned from the wrong axis: 1290/1792/1836 are raised by *writes*, not
+	// by connecting to a read-only server, and everything sync sends the source
+	// succeeds against a super_read_only MySQL — including the binlog client's
+	// FLUSH BINARY LOGS. The option is gone from the driver, and its absence
+	// costs sync nothing. If sync ever does write to its source, that is a bug,
+	// and the rejection now surfaces it instead of hiding it.
 	r.sourceDBConfig.ForceKill = false
-	r.sourceDBConfig.RejectReadOnly = false
 	r.sourceDBConfig.MaxOpenConnections = r.sync.MaxConnections
 
 	// The target is written to (table creation, the copy/apply, the
 	// checkpoint, and CREATE DATABASE on the admin connection), so it keeps the
-	// standard safe defaults — crucially RejectReadOnly=true, so that if the
-	// target Aurora fails over and we land on a demoted, now-read-only primary,
-	// writes turn into driver.ErrBadConn and the pool reconnects instead of
-	// silently erroring. Only the relaxations the target genuinely shares with
-	// the source are applied (no cutover here either, so ForceKill is left at
-	// its default but never fires).
+	// standard safe defaults. It is also the side that actually benefits from
+	// the driver's read-only rejection: if the target Aurora fails over and we
+	// land on a demoted, now-read-only primary, those writes turn into
+	// driver.ErrBadConn and the pool reconnects instead of silently erroring.
+	// Only the relaxations the target genuinely shares with the source are
+	// applied (no cutover here either, so ForceKill is left at its default but
+	// never fires).
 	r.targetDBConfig = dbconn.NewDBConfig()
 	r.targetDBConfig.MaxOpenConnections = r.sync.MaxConnections
 

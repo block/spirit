@@ -1,0 +1,53 @@
+name: TLS/DSN unit tests (no database)
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+      - main
+  pull_request:
+permissions:
+  contents: read
+
+# Spirit's TLS and DSN construction decides whether a connection is encrypted
+# and whether its server certificate is verified. Every one of those tests runs
+# against pure functions and needs no database — but until this workflow, the
+# only jobs that ran `go test` at all were the mysql*-docker matrices, so the
+# assertions were gated behind Docker, a MySQL boot, and each of those
+# workflows' documentation-only short-circuit.
+#
+# This job runs them on their own, on every pull request, with nothing to
+# provision. Keep it that way: a test matched by the filter below must not
+# require a server, or this workflow starts failing for reasons that have
+# nothing to do with TLS.
+jobs:
+  tls-dsn:
+    name: tls/dsn
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.26.6"
+          # No module cache. This workflow also runs on release tags, and a
+          # cache restored there could have been written from a lower-trust
+          # context — the cache-poisoning class zizmor flags. linter.yml
+          # disables it for the same reason. The job compiles one package, so
+          # the cache buys almost nothing.
+          cache: false
+
+      # The filter is deliberately broad. It over-matches into neighbouring
+      # DSN-handling tests, which is the safe direction: a new TLS test whose
+      # name this misses is silently unprotected, whereas an extra pure test
+      # costs a second.
+      #
+      # This is pkg/dbconn only, and that is not the whole TLS surface:
+      # pkg/migration asserts these properties too (TestReplicaTLSEnhancement),
+      # but its TestMain provisions a server, so those stay in the mysql*-docker
+      # matrices. Do not read a green tick here as "the TLS assertions passed" —
+      # it means the ones that need no database did.
+      - name: TLS and DSN tests
+        run: go test -race -count=1 -run 'TLS|DSN|Certificate|RDS|Verify|Strict|Disabled|Registered' ./pkg/dbconn/

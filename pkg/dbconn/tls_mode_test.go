@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -316,7 +317,7 @@ func TestNewDSNWithTLSModes(t *testing.T) {
 			if tt.expectedTLS != "" {
 				require.Contains(t, result, tt.expectedTLS)
 			} else {
-				require.NotContains(t, result, "tls=")
+				requireNoEffectiveTLS(t, result, tt.name)
 			}
 		})
 	}
@@ -677,7 +678,6 @@ func TestPREFERREDModeDISABLEDFallback(t *testing.T) {
 		LockWaitTimeout:          60,
 		RangeOptimizerMaxMemSize: 8388608,
 		InterpolateParams:        true,
-		RejectReadOnly:           true, // production default (see NewDBConfig)
 	}
 
 	// Create a fallback config as done in the New() function
@@ -694,7 +694,7 @@ func TestPREFERREDModeDISABLEDFallback(t *testing.T) {
 	// Test fallback DISABLED DSN
 	disabledDSN, err := newDSN(baseDSN, &configCopy)
 	require.NoError(t, err)
-	require.NotContains(t, disabledDSN, "tls=", "DISABLED fallback should not include any TLS config")
+	requireNoEffectiveTLS(t, disabledDSN, "DISABLED fallback")
 
 	// Both should have the same non-TLS parameters
 	expectedParams := []string{
@@ -704,7 +704,8 @@ func TestPREFERREDModeDISABLEDFallback(t *testing.T) {
 		"lock_wait_timeout=60",
 		"charset=utf8mb4",
 		"collation=utf8mb4_bin",
-		"rejectReadOnly=true",
+		// No rejectReadOnly: the driver applies it unconditionally and no
+		// longer accepts the parameter.
 		"interpolateParams=true",
 	}
 
@@ -902,8 +903,7 @@ func TestTLSModeCaseInsensitive(t *testing.T) {
 			require.NoError(t, err)
 
 			if tc.expectedDSN == "" {
-				// DISABLED mode should not contain any TLS parameters
-				require.NotContains(t, resultDSN, "tls=")
+				requireNoEffectiveTLS(t, resultDSN, tc.name)
 			} else {
 				require.Contains(t, resultDSN, tc.expectedDSN)
 			}
@@ -965,4 +965,15 @@ func TestNewCustomTLSConfigCaseInsensitive(t *testing.T) {
 			}
 		})
 	}
+}
+
+// requireNoEffectiveTLS asserts that a DSN yields a connection with no TLS.
+//
+// The definition lives in testutils because pkg/migration asserts the same
+// property; see [testutils.RequireNoEffectiveTLS] for why it reads the driver's
+// resolved setting instead of looking for "tls=" in the DSN text. This stays as
+// a local name only so the call sites in this package read unqualified.
+func requireNoEffectiveTLS(t *testing.T, dsn, description string) {
+	t.Helper()
+	testutils.RequireNoEffectiveTLS(t, dsn, description)
 }

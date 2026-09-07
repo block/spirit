@@ -2,9 +2,7 @@ package dbconn
 
 import (
 	"context"
-	"crypto/x509"
 	"database/sql"
-	"encoding/pem"
 	"fmt"
 	"testing"
 
@@ -27,7 +25,8 @@ func assertDSNConfig(t *testing.T, dsnStr string, user, password, addr, dbName, 
 	require.Equal(t, dbName, cfg.DBName)
 	require.Equal(t, tlsConfig, cfg.TLSConfig)
 	require.True(t, cfg.AllowNativePasswords)
-	require.True(t, cfg.RejectReadOnly)
+	// Nothing to assert about rejectReadOnly: the driver applies it
+	// unconditionally and no longer carries the option (see DBConfig).
 	require.Equal(t, interpolateParams, cfg.InterpolateParams)
 	require.Equal(t, "utf8mb4_bin", cfg.Collation)
 	require.Equal(t, `"NO_AUTO_VALUE_ON_ZERO"`, cfg.Params["sql_mode"])
@@ -129,8 +128,46 @@ func TestNewDSNAllowCleartextPasswords(t *testing.T) {
 	require.NoError(t, err)
 	cfg, err = mysql.ParseDSN(resp)
 	require.NoError(t, err)
-	require.Empty(t, cfg.TLSConfig, "TLS should not be configured in DISABLED mode")
 	require.False(t, cfg.AllowCleartextPasswords, "AllowCleartextPasswords should be false when TLS is disabled")
+}
+
+// TestNewDSNDisabledMode pins what --tls-mode=DISABLED produces, on an RDS
+// address as well as a local one.
+//
+// The RDS row is the whole point. [DriverName] gives an RDS address verified
+// TLS whenever the DSN asks for nothing, so writing an empty tls= for DISABLED
+// — which is what this code did before, and what the sibling test above
+// asserted — hands the user TLS on exactly the connection where they asked for
+// none. It fails silently: the connection works, it is just not the one that
+// was requested, and no local-MySQL test can see it because the driver's
+// auto-TLS only fires on an RDS hostname.
+//
+// So both assertions here are load-bearing, and each fails on its own
+// mutation:
+//
+//   - assert on cfg.TLS (the effective setting) rather than on cfg.TLSConfig
+//     being empty; restoring `cfg.TLSConfig = ""` makes the RDS row fail
+//   - AllowCleartextPasswords must stay false; a bare `cfg.TLSConfig != ""`
+//     reads "false" as "TLS is on" and sends the password in the clear over a
+//     plaintext connection
+func TestNewDSNDisabledMode(t *testing.T) {
+	for _, host := range []string{
+		"db.cxyz.us-east-1.rds.amazonaws.com:3306",
+		"127.0.0.1:3306",
+	} {
+		t.Run(host, func(t *testing.T) {
+			config := NewDBConfig()
+			config.TLSMode = "DISABLED"
+			resp, err := newDSN("root:password@tcp("+host+")/test", config)
+			require.NoError(t, err)
+
+			cfg, err := mysql.ParseDSN(resp)
+			require.NoError(t, err)
+			require.Nil(t, cfg.TLS, "DISABLED produced a TLS connection")
+			require.False(t, cfg.AllowCleartextPasswords,
+				"cleartext passwords allowed on a connection with no TLS")
+		})
+	}
 }
 
 func TestNewConn(t *testing.T) {
@@ -240,21 +277,30 @@ func TestNewConnRejectsReadOnlyConnections(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+// TestValidCertificateBundle used to parse spirit's own embedded
+// global-bundle.pem and assert it held at least one certificate. The bundle now
+// lives in the driver, which has its own parse test, so what is left to check
+// here is the delegation: that spirit's RDS TLS config actually arrives with
+// roots in it. An empty pool is the failure that matters — it does not error,
+// it just fails every RDS handshake at connect time with an x509 message that
+// names nothing in this repository.
 func TestValidCertificateBundle(t *testing.T) {
-	// parse certificate bundle
-	var block *pem.Block
-	foundCertificates := false
-	remaining := rdsGlobalBundle
-	for {
-		block, remaining = pem.Decode(remaining)
-		if block == nil {
-			break
-		}
-		_, err := x509.ParseCertificate(block.Bytes)
-		require.NoError(t, err, "Failed to parse certificate")
-		foundCertificates = true
-	}
+	cfg := NewTLSConfig()
+	require.NotNil(t, cfg)
+	require.NotNil(t, cfg.RootCAs, "RDS TLS config has no root pool")
+	require.NotEmpty(t, cfg.RootCAs.Subjects(), "RDS root pool is empty") //nolint:staticcheck // SA1019: Subjects is fine for a pool we built, and there is no other way to count roots
+	require.False(t, cfg.InsecureSkipVerify, "RDS TLS must verify the server")
 
-	// ensure that at least one certificate was parsed
-	require.True(t, foundCertificates, "No certificates found in bundle")
+	// The pool must be per-call. GetTLSConfigForBinlog mutates what it gets
+	// back (it sets ServerName), and callers may append roots; a shared
+	// *x509.CertPool would widen trust process-wide and race with handshakes.
+	other := NewTLSConfig()
+	require.NotSame(t, cfg.RootCAs, other.RootCAs, "RDS TLS configs share one root pool")
+
+	// An empty certData is the documented "use the RDS roots" fallback, and it
+	// must reach the same place rather than silently building an empty pool.
+	custom := NewCustomTLSConfig(nil, "VERIFY_IDENTITY")
+	require.NotNil(t, custom)
+	require.NotNil(t, custom.RootCAs, "empty certData produced no root pool")
+	require.NotEmpty(t, custom.RootCAs.Subjects(), "empty certData produced an empty root pool") //nolint:staticcheck // SA1019: see above
 }
