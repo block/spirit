@@ -643,3 +643,73 @@ func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
 	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
 	require.Nil(t, stmts)
 }
+
+// A schema file declaring `active BOOLEAN NOT NULL DEFAULT FALSE` and the table
+// MySQL creates from it are the same table, so a diff between them must be
+// empty. MySQL stores the keyword as the integer and reports `tinyint(1) NOT
+// NULL DEFAULT '0'`; a diff that read those two forms as different would emit a
+// MODIFY COLUMN that stores the same '0' and then diff again on the next run,
+// with no apply able to end it.
+func TestDiffIntegrationBooleanKeywordDefaultCreatedAsDeclared(t *testing.T) {
+	const declaredSQL = "CREATE TABLE diff_bool_keyword_default (" +
+		"id bigint unsigned NOT NULL AUTO_INCREMENT, " +
+		"cancel_requested boolean NOT NULL DEFAULT FALSE, " +
+		"is_enabled boolean NOT NULL DEFAULT TRUE, " +
+		"retries int NOT NULL DEFAULT FALSE, " +
+		"PRIMARY KEY (id))"
+
+	tt := testutils.NewTestTable(t, "diff_bool_keyword_default", declaredSQL)
+
+	// MySQL really does report the integer, which is what makes the fold
+	// necessary rather than cosmetic.
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "`cancel_requested` tinyint(1) NOT NULL DEFAULT '0'")
+	require.Contains(t, live, "`is_enabled` tinyint(1) NOT NULL DEFAULT '1'")
+	require.Contains(t, live, "`retries` int NOT NULL DEFAULT '0'")
+
+	// The table was created from this exact declaration, so there is nothing
+	// left to apply.
+	stmts := diffLiveTable(t, tt.DB, tt.Name, declaredSQL)
+	require.Nil(t, stmts)
+}
+
+// Changing a keyword default is a real change, and it converges in one apply:
+// the diff is emitted, MySQL stores the new value, and a re-diff is clean.
+func TestDiffIntegrationBooleanKeywordDefaultChange(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_bool_keyword_change",
+		"CREATE TABLE diff_bool_keyword_change (id int NOT NULL, active boolean NOT NULL DEFAULT FALSE, PRIMARY KEY (id))")
+
+	const targetSQL = "CREATE TABLE diff_bool_keyword_change (id int NOT NULL, active boolean NOT NULL DEFAULT TRUE, PRIMARY KEY (id))"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+
+	execStatements(t, tt.DB, stmts)
+	var columnDefault string
+	err := tt.DB.QueryRowContext(t.Context(),
+		"SELECT COLUMN_DEFAULT FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'active'",
+		tt.Name).Scan(&columnDefault)
+	require.NoError(t, err)
+	require.Equal(t, "1", columnDefault)
+
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+}
+
+// The keyword only folds to 1/0 on integer columns because those are the only
+// types that store it that way. These are the readings that put the other types
+// out of scope: decimal pads the value to its scale and YEAR reads the keyword
+// as a year, so folding either to 1 would claim a convergence that is not one.
+func TestDiffIntegrationBooleanKeywordDefaultOnOtherTypes(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_bool_keyword_other_types",
+		"CREATE TABLE diff_bool_keyword_other_types ("+
+			"scaled decimal(4,2) NOT NULL DEFAULT TRUE, "+
+			"unscaled decimal(4,0) NOT NULL DEFAULT TRUE, "+
+			"yr year NOT NULL DEFAULT TRUE, "+
+			"txt varchar(8) NOT NULL DEFAULT FALSE)")
+
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "`scaled` decimal(4,2) NOT NULL DEFAULT '1.00'")
+	require.Contains(t, live, "`unscaled` decimal(4,0) NOT NULL DEFAULT '1'")
+	require.Contains(t, live, "`yr` year NOT NULL DEFAULT '2001'")
+	require.Contains(t, live, "`txt` varchar(8) NOT NULL DEFAULT '0'")
+}
