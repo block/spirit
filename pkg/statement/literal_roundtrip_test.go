@@ -178,33 +178,17 @@ func TestRoundTrip_KeywordLikeStringDefault(t *testing.T) {
 	})
 
 	t.Run("bare_TRUE_still_boolean", func(t *testing.T) {
-		// A bare keyword default is NOT a string literal, so it must emit
-		// unquoted and store the boolean 1. We don't drive this through
-		// applyAndConverge because MySQL canonicalizes BOOL DEFAULT TRUE to
-		// tinyint(1) DEFAULT '1' (a separate keyword-normalization concern);
-		// instead we assert the emitted ADD COLUMN is unquoted and applies.
-		source, err := ParseCreateTable("CREATE TABLE rt (id INT PRIMARY KEY)")
-		require.NoError(t, err)
+		// A bare keyword default is not a string literal: it is the boolean,
+		// and MySQL stores it as 1.
 		target, err := ParseCreateTable("CREATE TABLE rt (id INT PRIMARY KEY, c BOOL DEFAULT TRUE)")
 		require.NoError(t, err)
-
-		// The parsed default must NOT be flagged as a string literal.
 		col := target.Columns.ByName("c")
 		require.NotNil(t, col)
 		require.False(t, col.DefaultIsString, "bare keyword TRUE must not be flagged as a string literal")
 
-		stmts, err := source.Diff(target, nil)
-		require.NoError(t, err)
-		require.Len(t, stmts, 1)
-		require.Contains(t, stmts[0].Statement, "DEFAULT TRUE", "bare keyword default must emit unquoted")
-
-		_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
-		require.NoError(t, err)
-		_, err = db.ExecContext(t.Context(), "CREATE TABLE rt (id INT PRIMARY KEY)")
-		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt") })
-		_, err = db.ExecContext(t.Context(), stmts[0].Statement)
-		require.NoError(t, err, "emitted ALTER failed: %s", stmts[0].Statement)
+		applyAndConverge(t, db, "rt",
+			"CREATE TABLE rt (id INT PRIMARY KEY)",
+			"CREATE TABLE rt (id INT PRIMARY KEY, c BOOL DEFAULT TRUE)")
 
 		stored, ok := columnDefault(t, db, "rt", "c")
 		require.True(t, ok)
