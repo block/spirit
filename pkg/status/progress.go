@@ -133,13 +133,15 @@ type Progress struct {
 	// the run copied at any point. RowsTotal is an estimate, so RowsCopied can
 	// exceed it.
 	//
-	// Two consequences of that split follow. RowsCopied counts rows settled by
-	// this run, so like TableProgress.RowsCopied it may exclude work from
-	// before a resume when the checkpoint does not retain row counts; Resume
-	// is true in the same snapshot. And the ETA, including its DUE state, is
-	// paced on the keyspace, so over a sparse key range the copy can read
-	// close to complete here while the ETA is still counting down, or the
-	// reverse. Summary carries both halves.
+	// Two consequences of that split follow. RowsCopied counts rows the copy
+	// settled, so a row the binlog applier wrote before the copy reached it
+	// is not counted (the copy inserts with INSERT IGNORE, which reports it
+	// as unaffected), and on a busy table the copy finishes short of
+	// RowsTotal. A resume restores the count from the checkpoint and
+	// continues it. And the ETA, including its DUE state, is paced on the
+	// keyspace for an auto_increment key, so over a sparse key range the copy
+	// can read close to complete here while the ETA is still counting down,
+	// or the reverse. Summary carries both halves.
 	Copy CopyProgress
 
 	// Checksum is the structured progress of the post-copy checksum phase,

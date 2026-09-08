@@ -2381,8 +2381,8 @@ func (r *Runner) flushAllReplClients(ctx context.Context) error {
 func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) error {
 	// The checkpoint watermark format depends on how many chunkers the copy
 	// chunker wraps: a single (source, table) pair stores that chunker's own
-	// watermark (raw chunk JSON for auto-inc PKs, or the composite chunker's
-	// envelope), while multiple pairs store a JSON map keyed by
+	// watermark (the chunk envelope, or a bare chunk from an older
+	// checkpoint), while multiple pairs store a JSON map keyed by
 	// table.QualifiedName(). WatermarkPerTable normalizes every format into
 	// a per-table map of raw chunk JSON.
 	allTables := make([]*table.TableInfo, 0, len(r.sources)*len(r.sourceTables))

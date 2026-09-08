@@ -92,7 +92,7 @@ Alongside the summary it carries structured fields for the things a wrapper woul
 
 `Copy` is the runner-wide row copy as a `CopyProgress{RowsCopied, RowsTotal}`. It is the sum of `Tables`, so the two always reconcile: both count settled rows against the tables' cardinality estimates, and neither is the optimistic chunker's keyspace position, which is what the copier paces on and what the ETA is derived from. It is populated as soon as the copy chunker exists and keeps its final reading through the later phases, so "how much did this run copy" stays answerable after the copy ends.
 
-Two caveats carry over from the per-table counts. `RowsCopied` counts rows settled by this run, so it may exclude work from before a resume (`Resume` is true in the same snapshot). And the ETA's `DUE` is paced on the keyspace, so over a sparse key range `Copy` can read close to complete while the ETA is still counting down, or the reverse; `Summary` carries both halves.
+Two caveats carry over from the per-table counts. `RowsCopied` counts rows the copy settled, so a row the binlog applier wrote before the copy reached it is not counted (the copy inserts with `INSERT IGNORE`, which reports it as unaffected), and on a busy table the copy finishes short of `RowsTotal`; a resume restores the count from the checkpoint and continues it. And on an auto_increment key the ETA's `DUE` is paced on the keyspace, so over a sparse key range `Copy` can read close to complete while the ETA is still counting down, or the reverse; `Summary` carries both halves.
 
 ### `Resume`
 

@@ -227,7 +227,9 @@ func TestCheckpoint(t *testing.T) {
 	// gives feedback back to table.
 	watermark, err := r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	chunkJSON, checkpointed := copierWatermark(t, watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", chunkJSON)
+	require.Equal(t, settled, checkpointed, "the checkpoint carries the settled row count")
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 	// Which the status block now reports in place of the checkpoint's own log
@@ -251,6 +253,12 @@ func TestCheckpoint(t *testing.T) {
 	// the watermark to this point so new watermarks "align" correctly.
 	// So lets now call NextChunk to verify.
 
+	// Before the resumed run copies anything, the API and the log block
+	// report the copy where the checkpoint left it, not from zero.
+	r.status.Set(status.CopyRows)
+	require.Equal(t, settled, r.Progress().Copy.RowsCopied)
+	require.Contains(t, r.Status(), fmt.Sprintf("  %d/%d  chunk-size=", settled, atomic.LoadUint64(&r.changes[0].table.EstimatedRows)))
+
 	ccopier, ok = r.copier.(copier.ChunkCopier)
 	require.True(t, ok)
 
@@ -262,9 +270,13 @@ func TestCheckpoint(t *testing.T) {
 	// It's ideally not typical but you can still dump checkpoint from
 	// a restored checkpoint state. We won't have advanced anywhere from
 	// the last checkpoint because on restore, the LowerBound is taken.
+	// Re-copying a chunk whose rows are already in the new table settles
+	// nothing new, so the count does not double up across the resume.
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	chunkJSON, checkpointed = copierWatermark(t, watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", chunkJSON)
+	require.Equal(t, settled, checkpointed)
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 
@@ -277,7 +289,21 @@ func TestCheckpoint(t *testing.T) {
 
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", watermark)
+	chunkJSON, checkpointed = copierWatermark(t, watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", chunkJSON)
+	require.Greater(t, checkpointed, settled, "rows copied after the resume add to the restored count")
+}
+
+// copierWatermark decodes the copy chunker's checkpoint into the chunk
+// position and the settled row count it carries.
+func copierWatermark(t *testing.T, watermark string) (string, uint64) {
+	var envelope struct {
+		ChunkJSON  string
+		RowsCopied uint64
+	}
+	require.NoError(t, json.Unmarshal([]byte(watermark), &envelope))
+	require.NotEmpty(t, envelope.ChunkJSON)
+	return envelope.ChunkJSON, envelope.RowsCopied
 }
 
 func TestCheckpointRestore(t *testing.T) {

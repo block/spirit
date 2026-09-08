@@ -118,7 +118,7 @@ func TestLowWatermark(t *testing.T) {
 	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err := chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 
 	// Check key w.r.t. watermark
 	require.False(t, chunker.KeyAboveHighWatermark(1000))
@@ -135,7 +135,7 @@ func TestLowWatermark(t *testing.T) {
 	require.True(t, chunker.KeyBelowLowWatermark(1001))
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 
 	chunkAsync1, err := chunker.Next()
 	require.NoError(t, err)
@@ -155,18 +155,18 @@ func TestLowWatermark(t *testing.T) {
 	chunker.Feedback(chunkAsync2, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 
 	chunker.Feedback(chunkAsync3, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 	require.False(t, chunker.KeyBelowLowWatermark(2001))
 
 	chunker.Feedback(chunkAsync1, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 	require.True(t, chunker.KeyBelowLowWatermark(2001))
 	require.True(t, chunker.KeyBelowLowWatermark(5000))
 
@@ -175,12 +175,12 @@ func TestLowWatermark(t *testing.T) {
 	require.Equal(t, "`id` >= 5001 AND `id` < 6001", chunk.String()) // should bump immediately
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 
 	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"5001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"6001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"5001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"6001\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 
 	// Test that we have applied all stored chunks and the map is empty,
 	// as we gave Feedback for all chunks.
@@ -333,7 +333,7 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	watermark, err := chunker.GetLowWatermark()
 	require.NoError(t, err)
 
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":22,\"LowerBound\":{\"Value\": [\"584\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"606\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":22,\"LowerBound\":{\"Value\": [\"584\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"606\"],\"Inclusive\":false}}", watermarkChunkJSON(watermark))
 
 	// Start everything over again as t2.
 	t2 := newTableInfo4Test("test", "t1")
@@ -351,6 +351,9 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	chunker2, err := NewChunker(t2, ChunkerConfig{NewTable: t2, TargetChunkTime: 100})
 	require.NoError(t, err)
 	require.NoError(t, chunker2.OpenAtWatermark(watermark))
+	// The settled row count resumes from the checkpoint rather than from zero.
+	require.Positive(t, chunker.RowsCopied())
+	require.Equal(t, chunker.RowsCopied(), chunker2.RowsCopied())
 
 	// The pointer goes to the lowerbound.value.
 	// It could equally go to the upperbound.value but then
@@ -394,6 +397,9 @@ func TestOptimisticResumeProgressAccounting(t *testing.T) {
 	// the bogus ~53% before the fix).
 	require.Equal(t, uint64(713192535-682769913), rowsCopied)
 	require.Equal(t, uint64(1341021280), total)
+	// A bare chunk watermark predates the settled row count, so that count
+	// starts over.
+	require.Zero(t, chunker.RowsCopied())
 
 	// The reported percentage should be a few percent, nowhere near the ~53%
 	// the bug produced.
@@ -1009,4 +1015,11 @@ func TestOptimisticPrefetchDensityUsesSourceRows(t *testing.T) {
 		affectedOnly.record(MaxDynamicRowSize, 0)
 	}
 	require.True(t, affectedOnly.sparse())
+}
+
+// watermarkChunkJSON returns the chunk position an optimistic watermark
+// carries, without the settled row count recorded beside it.
+func watermarkChunkJSON(watermark string) string {
+	chunkJSON, _ := unwrapWatermark(watermark)
+	return chunkJSON
 }
