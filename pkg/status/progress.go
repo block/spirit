@@ -138,7 +138,9 @@ type Progress struct {
 	// is not counted (the copy inserts with INSERT IGNORE, which reports it
 	// as unaffected), and on a busy table the copy finishes short of
 	// RowsTotal. A resume restores the count from the checkpoint and
-	// continues it. And the ETA, including its DUE state, is paced on the
+	// continues it; a move deletes and re-copies the rows at or above the
+	// resume position, so the rows among them settled before the checkpoint
+	// are counted again. And the ETA, including its DUE state, is paced on the
 	// keyspace for an auto_increment key, so over a sparse key range the copy
 	// can read close to complete here while the ETA is still counting down,
 	// or the reverse. Summary carries both halves.

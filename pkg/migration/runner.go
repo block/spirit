@@ -80,8 +80,9 @@ type Runner struct {
 	// the throttler to report whether the migration is currently paused.
 	throttlerMu sync.RWMutex
 
-	copier      copier.Copier
-	copyChunker table.Chunker // the chunker for copying
+	copier           copier.Copier
+	copyChunker      table.Chunker // the chunker for copying
+	copyRowsAtResume uint64        // settled rows restored from the checkpoint, excluded from this invocation's copy aggregate
 
 	// applier is the shared write layer used by both the copier (buffered
 	// copy) and the replication client (binlog deltas). Kept on the runner
@@ -274,16 +275,17 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The optimistic chunker does not persist its
-// actual-row counter in a checkpoint, so a resumed invocation reports only
-// work settled after it resumed.
+// Runner.Run invocation. The chunker restores its settled count from the
+// checkpoint so that progress continues across a resume; that restored count
+// is subtracted here, so a resumed invocation reports only the rows settled
+// after it resumed, alongside the chunks it copied.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -1686,6 +1688,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	if checksumWatermark != "" {
 		if err := r.checksumChunker.OpenAtWatermark(checksumWatermark); err != nil {

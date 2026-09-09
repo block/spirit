@@ -70,10 +70,11 @@ type Runner struct {
 
 	sourceTables []*table.TableInfo
 
-	applier     applier.Applier
-	replClient  change.Source
-	copyChunker table.Chunker
-	copier      copier.Copier
+	applier          applier.Applier
+	replClient       change.Source
+	copyChunker      table.Chunker
+	copyRowsAtResume uint64 // settled rows restored from the checkpoint, excluded from this invocation's copy aggregate
+	copier           copier.Copier
 
 	// resuming is set when a checkpoint was found on the target: the
 	// initial copy is skipped and the change feed is opened from the
@@ -183,16 +184,17 @@ func NewRunner(s *Sync) (*Runner, error) {
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The optimistic chunker does not persist its
-// actual-row counter in a checkpoint, so a resumed invocation reports only
-// work settled after it resumed.
+// Runner.Run invocation. The chunker restores its settled count from the
+// checkpoint so that progress continues across a resume; that restored count
+// is subtracted here, so a resumed invocation reports only the rows settled
+// after it resumed, alongside the chunks it copied.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -1228,6 +1230,7 @@ func (r *Runner) startResume(ctx context.Context, watermark, pos string) error {
 		if err := r.copyChunker.OpenAtWatermark(watermark); err != nil {
 			return fmt.Errorf("failed to open copier at checkpoint watermark: %w", err)
 		}
+		r.copyRowsAtResume = r.copyChunker.RowsCopied()
 	} else {
 		if err := r.copyChunker.Open(); err != nil {
 			return err

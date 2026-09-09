@@ -24,6 +24,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -270,8 +271,9 @@ func TestCheckpoint(t *testing.T) {
 	// It's ideally not typical but you can still dump checkpoint from
 	// a restored checkpoint state. We won't have advanced anywhere from
 	// the last checkpoint because on restore, the LowerBound is taken.
-	// Re-copying a chunk whose rows are already in the new table settles
-	// nothing new, so the count does not double up across the resume.
+	// In a migration the new table keeps the rows a re-copied chunk carries,
+	// so re-copying it settles nothing new and the count does not double up
+	// across the resume.
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
 	chunkJSON, checkpointed = copierWatermark(t, watermark)
@@ -292,6 +294,33 @@ func TestCheckpoint(t *testing.T) {
 	chunkJSON, checkpointed = copierWatermark(t, watermark)
 	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", chunkJSON)
 	require.Greater(t, checkpointed, settled, "rows copied after the resume add to the restored count")
+
+	// The copy aggregate reported to the metrics sink is per invocation: the
+	// count restored from the checkpoint is excluded, and the chunks are the
+	// eleven this runner copied.
+	sink := &copyAggregateSink{}
+	r.status.SetMetricsSink(sink, r.logger)
+	r.recordCopyCompleted()
+	require.Equal(t, r.copyChunker.RowsCopied()-settled, sink.rows)
+	require.Equal(t, uint64(11), sink.chunks)
+}
+
+// copyAggregateSink records the copy aggregate the runner reports when the
+// copy completes.
+type copyAggregateSink struct {
+	rows, chunks uint64
+}
+
+func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
+	for _, v := range m.Values {
+		switch v.Name {
+		case metrics.CopyRowsCompletedMetricName:
+			s.rows = uint64(v.Value)
+		case metrics.CopyChunksCompletedMetricName:
+			s.chunks = uint64(v.Value)
+		}
+	}
+	return nil
 }
 
 // copierWatermark decodes the copy chunker's checkpoint into the chunk

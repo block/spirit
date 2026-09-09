@@ -111,6 +111,7 @@ type Runner struct {
 	applier           applier.Applier
 	chunkerMu         sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
 	copyChunker       table.Chunker
+	copyRowsAtResume  uint64 // settled rows restored from the checkpoint, excluded from this invocation's copy aggregate
 	checksumChunker   table.Chunker
 	copier            copier.Copier
 	checker           checksum.Checker
@@ -236,16 +237,17 @@ func NewRunner(m *Move) (*Runner, error) {
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The optimistic chunker does not persist its
-// actual-row counter in a checkpoint, so a resumed invocation reports only
-// work settled after it resumed.
+// Runner.Run invocation. The chunker restores its settled count from the
+// checkpoint so that progress continues across a resume; that restored count
+// is subtracted here, so a resumed invocation reports only the rows settled
+// after it resumed, alongside the chunks it copied.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -590,6 +592,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	// Open each source's change feed at its checkpointed position.
 	// OpenFromPosition primes the position and starts streaming in one call.
