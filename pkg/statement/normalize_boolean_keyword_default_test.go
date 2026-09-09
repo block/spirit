@@ -7,10 +7,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A TRUE/FALSE keyword default on an integer column is the same default MySQL
-// stores as 1/0 and reports that way, so the two spellings must reach Diff
+// A TRUE/FALSE keyword default is the same default MySQL stores as 1/0 on every
+// type that stores it as exactly that, so the two spellings must reach Diff
 // already folded together. The declared side below is what an author writes;
-// the live side is the SHOW CREATE TABLE form of the same table.
+// the live side is the SHOW CREATE TABLE form of the same table. Numeric types
+// report the stored value bare and string types report it quoted, and both
+// spellings have to fold to the form their own type reports.
 func TestBooleanKeywordDefaultConverges(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -51,6 +53,26 @@ func TestBooleanKeywordDefaultConverges(t *testing.T) {
 			name:     "unsigned is folded too",
 			declared: "`a` tinyint unsigned NOT NULL DEFAULT FALSE",
 			live:     "`a` tinyint unsigned NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "an unscaled decimal has no scale to pad the value out to",
+			declared: "`a` decimal(4,0) NOT NULL DEFAULT TRUE, `b` decimal NOT NULL DEFAULT FALSE",
+			live:     "`a` decimal(4,0) NOT NULL DEFAULT '1', `b` decimal(10,0) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "the approximate numeric types",
+			declared: "`a` double NOT NULL DEFAULT TRUE, `b` float NOT NULL DEFAULT FALSE",
+			live:     "`a` double NOT NULL DEFAULT '1', `b` float NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "a string column, which reports the stored value quoted",
+			declared: "`a` varchar(8) NOT NULL DEFAULT FALSE, `b` char(8) NOT NULL DEFAULT TRUE",
+			live:     "`a` varchar(8) NOT NULL DEFAULT '0', `b` char(8) NOT NULL DEFAULT '1'",
+		},
+		{
+			name:     "varbinary, which has no width to pad the value out to",
+			declared: "`a` varbinary(8) NOT NULL DEFAULT FALSE",
+			live:     "`a` varbinary(8) NOT NULL DEFAULT '0'",
 		},
 	}
 	for _, tt := range tests {
@@ -93,9 +115,24 @@ func TestBooleanKeywordDefaultLeavesOtherTypesAlone(t *testing.T) {
 			want:   "TRUE",
 		},
 		{
-			name:   "a string column stores the string form",
-			column: "`a` varchar(8) NOT NULL DEFAULT FALSE",
-			want:   "FALSE",
+			name:   "binary pads to the column width with NULs",
+			column: "`a` binary(4) NOT NULL DEFAULT TRUE",
+			want:   "TRUE",
+		},
+		{
+			name:   "bit stores a bit literal this layer cannot emit",
+			column: "`a` bit(1) NOT NULL DEFAULT TRUE",
+			want:   "TRUE",
+		},
+		{
+			name:   "enum reads the keyword as a member index, not a value",
+			column: "`a` enum('0','1') NOT NULL DEFAULT TRUE",
+			want:   "TRUE",
+		},
+		{
+			name:   "set reads the keyword the same way enum does",
+			column: "`a` set('0','1') NOT NULL DEFAULT TRUE",
+			want:   "TRUE",
 		},
 		{
 			name:   "a quoted 'FALSE' is a string value, not the keyword",
@@ -115,27 +152,46 @@ func TestBooleanKeywordDefaultLeavesOtherTypesAlone(t *testing.T) {
 }
 
 // A default that is genuinely different must still diff. The fold changes how
-// two spellings of one value compare, never whether two values do.
+// two spellings of one value compare, never whether two values do. Each case
+// asserts the emitted default and not just that something was emitted, because
+// a statement that names the column is produced either way — what distinguishes
+// a correct fold from one that mangled the value is which default it stores.
 func TestBooleanKeywordDefaultStillDiffsRealChanges(t *testing.T) {
 	tests := []struct {
 		name     string
 		declared string
 		live     string
+		want     string
 	}{
 		{
 			name:     "FALSE against a stored 1",
 			declared: "`a` boolean NOT NULL DEFAULT FALSE",
 			live:     "`a` tinyint(1) NOT NULL DEFAULT '1'",
+			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT 0",
 		},
 		{
 			name:     "TRUE against a stored 0",
 			declared: "`a` boolean NOT NULL DEFAULT TRUE",
 			live:     "`a` tinyint(1) NOT NULL DEFAULT '0'",
+			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT 1",
 		},
 		{
 			name:     "a keyword default added to a column that had none",
 			declared: "`a` boolean NOT NULL DEFAULT FALSE",
 			live:     "`a` tinyint(1) NOT NULL",
+			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT 0",
+		},
+		{
+			name:     "a keyword default on a string column against the other value",
+			declared: "`a` varchar(8) NOT NULL DEFAULT FALSE",
+			live:     "`a` varchar(8) NOT NULL DEFAULT '1'",
+			want:     "MODIFY COLUMN `a` varchar(8) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "a quoted 'FALSE' is not satisfied by a stored 0",
+			declared: "`a` varchar(8) NOT NULL DEFAULT 'FALSE'",
+			live:     "`a` varchar(8) NOT NULL DEFAULT '0'",
+			want:     "MODIFY COLUMN `a` varchar(8) NOT NULL DEFAULT 'FALSE'",
 		},
 	}
 	for _, tt := range tests {
@@ -148,7 +204,7 @@ func TestBooleanKeywordDefaultStillDiffsRealChanges(t *testing.T) {
 			stmts, err := source.Diff(target, nil)
 			require.NoError(t, err)
 			require.Len(t, stmts, 1)
-			assert.Contains(t, stmts[0].Statement, "MODIFY COLUMN `a`")
+			assert.Contains(t, stmts[0].Statement, tt.want)
 		})
 	}
 }
