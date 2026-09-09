@@ -123,7 +123,7 @@ func formatColumnDefinition(col *Column) string {
 	if col.Default != nil && col.GeneratedExpr == nil {
 		defaultVal := *col.Default
 		switch {
-		case col.DefaultIsExpr && col.DefaultIsString:
+		case col.DefaultIsExpr && col.DefaultKind == DefaultKindString:
 			// Expression default whose expression is a string literal,
 			// e.g. DEFAULT ('{}') — the only default form MySQL accepts on
 			// BLOB/TEXT/JSON/GEOMETRY columns. The stored value is raw, so
@@ -132,13 +132,23 @@ func formatColumnDefinition(col *Column) string {
 		case col.DefaultIsExpr:
 			// Expression defaults must be wrapped in parentheses, e.g. DEFAULT (json_object())
 			parts = append(parts, fmt.Sprintf("DEFAULT (%s)", defaultVal))
-		case col.DefaultIsString:
+		case col.DefaultKind == DefaultKindString:
 			// Quoted string literal. The stored value is the true raw value
 			// (unescaped at parse time), so quote+escape exactly once. This
 			// must bypass the needsQuotes heuristic: a literal 'TRUE' or
 			// 'NULL' or '2020' has to stay quoted, otherwise MySQL would
 			// store the keyword/number instead of the string.
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
+		case col.DefaultKind == DefaultKindBitLiteral,
+			col.DefaultKind == DefaultKindNumber,
+			col.DefaultKind == DefaultKindKeywordBool:
+			// A literal MySQL reports and accepts unquoted. The recorded text
+			// is already the canonical spelling of its kind — a bit literal is
+			// restored in the minimal form MySQL reports (b'0101' as b'101'),
+			// and a number carries no quotes of its own. Quoting any of these
+			// would change what MySQL stores; for a bit literal it produces
+			// DDL MySQL rejects, since 'b\'101\'' is not a valid bit value.
+			parts = append(parts, fmt.Sprintf("DEFAULT %s", defaultVal))
 		case needsQuotes(defaultVal):
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
 		default:

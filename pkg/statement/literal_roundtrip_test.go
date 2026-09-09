@@ -179,12 +179,16 @@ func TestRoundTrip_KeywordLikeStringDefault(t *testing.T) {
 
 	t.Run("bare_TRUE_still_boolean", func(t *testing.T) {
 		// A bare keyword default is not a string literal: it is the boolean,
-		// and MySQL stores it as 1.
+		// and MySQL stores it as 1. Parsing folds it to that stored value, so
+		// what arrives is the number 1 rather than either the keyword or a
+		// quoted '1'.
 		target, err := ParseCreateTable("CREATE TABLE rt (id INT PRIMARY KEY, c BOOL DEFAULT TRUE)")
 		require.NoError(t, err)
 		col := target.Columns.ByName("c")
 		require.NotNil(t, col)
-		require.False(t, col.DefaultIsString, "bare keyword TRUE must not be flagged as a string literal")
+		require.Equal(t, DefaultKindNumber, col.DefaultKind, "bare keyword TRUE folds to the number MySQL stores, not to a string literal")
+		require.NotNil(t, col.Default)
+		require.Equal(t, "1", *col.Default)
 
 		applyAndConverge(t, db, "rt",
 			"CREATE TABLE rt (id INT PRIMARY KEY)",
@@ -267,6 +271,50 @@ func TestRoundTrip_NumericDefaultConverges(t *testing.T) {
 			require.Nil(t, stmts, "bare and quoted numeric defaults must converge; got: %+v", stmts)
 		})
 	}
+}
+
+// A bit literal default must be emitted as a bit literal. It reads like a
+// quoted string — b'101' — but quoting it produces DEFAULT 'b\'101\”, which
+// MySQL rejects with "Invalid default value", so a bit column carrying a
+// default could not be applied at all. The column's recorded DefaultKind is
+// what keeps it unquoted.
+//
+// MySQL also reports a bit literal in its minimal form, independent of the
+// column's width: b'0101' comes back as b'101' and bit(8) DEFAULT b'00000001'
+// as b'1'. The parser restores the same minimal form, so the two spellings of
+// one default converge.
+func TestRoundTrip_BitLiteralDefault(t *testing.T) {
+	db := openScratch(t)
+
+	t.Run("emitted_alter_applies", func(t *testing.T) {
+		applyAndConverge(t, db, "rt",
+			"CREATE TABLE rt (id INT PRIMARY KEY)",
+			"CREATE TABLE rt (id INT PRIMARY KEY, flags bit(4) NOT NULL DEFAULT b'101')")
+
+		live := showCreate(t, db, "rt")
+		require.Contains(t, live, "`flags` bit(4) NOT NULL DEFAULT b'101'")
+	})
+
+	t.Run("leading_zeros_converge", func(t *testing.T) {
+		const targetSQL = "CREATE TABLE rt (id INT PRIMARY KEY, flags bit(4) NOT NULL DEFAULT b'0101')"
+
+		_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
+		require.NoError(t, err)
+		_, err = db.ExecContext(t.Context(), targetSQL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
+		})
+
+		live, err := ParseCreateTable(showCreate(t, db, "rt"))
+		require.NoError(t, err)
+		target, err := ParseCreateTable(targetSQL)
+		require.NoError(t, err)
+
+		stmts, err := live.Diff(target, nil)
+		require.NoError(t, err)
+		require.Nil(t, stmts, "b'0101' and the reported b'101' are the same default; got: %+v", stmts)
+	})
 }
 
 // TestRoundTrip_PartitionStringValuesWithQuotes verifies that LIST COLUMNS

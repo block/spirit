@@ -745,7 +745,7 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	// For nullable columns, nil and the NULL *keyword* are semantically
 	// equivalent. User might write `VARCHAR(255) NULL` but MySQL outputs
 	// `VARCHAR(255) DEFAULT NULL`. A quoted string literal 'NULL'
-	// (DefaultIsString) is NOT the keyword and must not collapse — it is a
+	// (DefaultKindString) is NOT the keyword and must not collapse — it is a
 	// real default that differs from no-default.
 	//
 	// Each side is normalized on its OWN nullability. Until
@@ -758,10 +758,10 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	// option exists to suppress.
 	sourceDefault := a.Default
 	targetDefault := b.Default
-	if a.Nullable && sourceDefault != nil && *sourceDefault == "NULL" && !a.DefaultIsString {
+	if a.Nullable && sourceDefault != nil && *sourceDefault == "NULL" && a.DefaultKind != DefaultKindString {
 		sourceDefault = nil
 	}
-	if b.Nullable && targetDefault != nil && *targetDefault == "NULL" && !b.DefaultIsString {
+	if b.Nullable && targetDefault != nil && *targetDefault == "NULL" && b.DefaultKind != DefaultKindString {
 		targetDefault = nil
 	}
 	if !ptrEqual(sourceDefault, targetDefault) {
@@ -775,11 +775,15 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	}
 	// On a string column a quoted string literal default ('TRUE') is a
 	// different value than the same text as a keyword/number default (TRUE),
-	// so quotedness is part of column identity. On a numeric column it is not:
-	// MySQL always renders the default quoted, so `DEFAULT 0` (bare) and
+	// so the literal form is part of column identity. On a numeric column it is
+	// not: MySQL always renders the default quoted, so `DEFAULT 0` (bare) and
 	// `DEFAULT '0'` (the SHOW CREATE TABLE form) are the same default and must
 	// compare equal — the value itself is already compared above.
-	if a.DefaultIsString != b.DefaultIsString && !isNumericColumnType(a.Type) {
+	//
+	// Two spellings of one default reach here already folded to the same kind
+	// (see the normalization rules), so a kind difference at this point is a
+	// difference in the default itself.
+	if a.DefaultKind != b.DefaultKind && !isNumericColumnType(a.Type) {
 		return false
 	}
 	if !opts.IgnoreColumnAutoIncrement && a.AutoInc != b.AutoInc {

@@ -147,10 +147,13 @@ func isIntegerColumnType(typeName string) bool {
 // literals and parseable numerics are emitted bare; everything else is
 // quoted as a string literal.
 //
-// Caveat: this is heuristic — there's no AST-level "literal kind" tag
-// available at this point, so a bit literal like b'01' or a hex literal
-// like 0x1A is misquoted as a string. The right fix is to thread a
-// DefaultIsLiteral / kind tag through Column from the parser.
+// This is a heuristic over the value's text and is only the fallback: a default
+// whose literal form the parser recorded is emitted from that form instead (see
+// [DefaultKind] and formatColumnDefinition), which is what a text heuristic
+// cannot get right. A hex literal such as 0x1A still reaches here and is
+// misquoted as a string; MySQL never reports a hex literal back, so converging
+// one means converting it to the value the column's type stores rather than
+// recording a form for it.
 func needsQuotes(value string) bool {
 	// Common SQL functions/expressions that don't need quotes
 	upper := strings.ToUpper(value)
