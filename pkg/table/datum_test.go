@@ -182,6 +182,61 @@ func TestDatumInt64ToUnsigned(t *testing.T) {
 	require.Equal(t, uint64(math.MaxInt64), d3.Val)
 }
 
+func TestDatumBoolToInt(t *testing.T) {
+	// Test that bool values are correctly converted to integer datums.
+	// This simulates MySQL binlog sending BOOLEAN (tinyint(1)) columns as Go bools.
+
+	d1, err := NewDatum(true, signedType)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), d1.Val)
+	require.Equal(t, "1", d1.String())
+
+	d2, err := NewDatum(false, signedType)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), d2.Val)
+	require.Equal(t, "0", d2.String())
+
+	// An unsigned tinyint column reaches the unsignedType arm instead.
+	d3, err := NewDatum(true, unsignedType)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), d3.Val)
+	require.Equal(t, "1", d3.String())
+
+	d4, err := NewDatum(false, unsignedType)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), d4.Val)
+	require.Equal(t, "0", d4.String())
+
+	// The applier resolves the column type from the table definition, so
+	// exercise the same entry point it uses. tinyint(1) is signed.
+	d5, err := NewDatumFromValue(true, "tinyint(1)")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), d5.Val)
+	require.Equal(t, "1", d5.String())
+
+	d6, err := NewDatumFromValue(false, "tinyint(1)")
+	require.NoError(t, err)
+	require.Equal(t, int64(0), d6.Val)
+	require.Equal(t, "0", d6.String())
+
+	d7, err := NewDatumFromValue(true, "tinyint(1) unsigned")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), d7.Val)
+	require.Equal(t, "1", d7.String())
+}
+
+func TestDatumConversionErrorReportsValue(t *testing.T) {
+	// A value that genuinely cannot be converted must name itself in the
+	// error, so the offending input is identifiable from the message alone.
+	_, err := NewDatum("not-a-number", signedType)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "value=not-a-number")
+
+	_, err = NewDatum("not-a-number", unsignedType)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "value=not-a-number")
+}
+
 func TestKeyBelowLowWatermarkWithNegativeInt32(t *testing.T) {
 	ti := &TableInfo{
 		SchemaName:        "test",
