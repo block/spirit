@@ -97,9 +97,10 @@ func NewDatum(val any, tp datumTp) (Datum, error) {
 		case int:
 			val = int64(v)
 		default:
-			val, err = strconv.ParseInt(fmt.Sprint(val), 10, 64)
+			original := val
+			val, err = strconv.ParseInt(fmt.Sprint(original), 10, 64)
 			if err != nil {
-				return Datum{}, fmt.Errorf("could not convert datum to int64: value=%v, error=%w", val, err)
+				return Datum{}, fmt.Errorf("could not convert datum to int64: value=%v, error=%w", original, err)
 			}
 		}
 	case unsignedType:
@@ -121,9 +122,10 @@ func NewDatum(val any, tp datumTp) (Datum, error) {
 			// and the underlying bit pattern is preserved without additional sign extension.
 			val = uint64(v)
 		default:
-			val, err = strconv.ParseUint(fmt.Sprint(val), 10, 64)
+			original := val
+			val, err = strconv.ParseUint(fmt.Sprint(original), 10, 64)
 			if err != nil {
-				return Datum{}, fmt.Errorf("could not convert datum to uint64: value=%v, error=%w", val, err)
+				return Datum{}, fmt.Errorf("could not convert datum to uint64: value=%v, error=%w", original, err)
 			}
 		}
 	case binaryType, unknownType:

@@ -392,6 +392,16 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	// and its default-off are gone — so the blue/green and Aurora-failover
 	// protection spirit used to opt into is now simply how the driver behaves.
 	cfg.InterpolateParams = config.InterpolateParams
+	// Report tinyint(1) as an integer rather than a bool. The (1) is a display
+	// width, not a range — the column holds the whole signed tinyint range —
+	// but the driver maps every signed tinyint(1) to a Go bool by default,
+	// collapsing any non-zero value to true. The copier reads rows back into
+	// Go to build its INSERT, so that collapse would write 1 in place of a
+	// stored 2, and the information is gone by the time spirit sees the value:
+	// no amount of care further up can recover it.
+	if err := cfg.Apply(mysql.TinyInt1IsBool(false)); err != nil {
+		return "", fmt.Errorf("could not disable tinyInt1IsBool: %w", err)
+	}
 	// Allow cleartext password authentication only when the connection is
 	// actually encrypted (required for AWS RDS IAM auth, safe because the
 	// connection uses TLS).
@@ -528,6 +538,12 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 // different one fails at connect time with "invalid value / unknown config
 // name", because TLS registries are per-driver package globals rather than
 // anything the DSN carries.
+//
+// This settles TLS and nothing else. The settings a spirit connection also
+// needs — interpolation, cleartext-password gating, integer tinyint(1) — are
+// applied by newDSN, so they reach a connection only via [New]. Spirit's own
+// replica path passes this result to [NewWithConnectionType] for exactly that
+// reason; a consumer that opens the result directly owns the rest itself.
 func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 	// A nil config is "the caller said nothing about TLS", which is not the
 	// same as asking for none: leave the DSN alone and let whatever opens it
