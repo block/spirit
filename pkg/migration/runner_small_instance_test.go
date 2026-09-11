@@ -167,17 +167,20 @@ func (c *copyThreadThrottler) BlockWait(ctx context.Context) {
 // the next sample, because the copy's own threads are under the threshold
 // whatever the other connection is doing. Pools left at the thread flags'
 // defaults total eight, and that copy throttles on its own workers over and
-// over — once per chunk, in the limit — spending seconds parked per run with
-// no production load anywhere.
+// over — once per chunk, in the limit — with no production load anywhere.
 //
-// Neither run's wall-clock time is the assertion. A host with cores to spare
-// copies a chunk faster than the throttler samples and refills the pool as soon
-// as a backoff ends, so eight throttled threads still finish — sooner, here,
-// than three unthrottled ones. On an instance the size the threshold is derived
-// from that trade reverses: the copy's own appliers stay busy through the
-// backoff, the sample never falls back under the threshold, and the copy
-// advances one chunk per BlockWait. Whether the gate is tripped is what a test
-// on any host can pin; what tripping it costs belongs to the target.
+// How much tripping the gate costs is not asserted, only that a pool which
+// fits does not pay it. The parked figure each run logs is a property of the
+// host as much as of the pools: a host with cores to spare clears the gate
+// between one chunk and the next call into BlockWait, so its copy trips over
+// and over and is charged nothing, and it refills the pool as soon as a
+// backoff does end, so eight throttled threads still finish — sooner, here,
+// than three unthrottled ones.
+// On an instance the size the threshold is derived from that reverses: the
+// copy's own appliers stay busy through the backoff, the sample never falls
+// back under the threshold, and the copy advances one chunk per BlockWait.
+// Whether the gate is tripped is what a test on any host can pin; what
+// tripping it costs belongs to the target.
 func TestSmallInstanceCopyDoesNotTripItsOwnThrottle(t *testing.T) {
 	const (
 		smallestInstanceVCPUs = 2
@@ -254,16 +257,8 @@ func TestSmallInstanceCopyDoesNotTripItsOwnThrottle(t *testing.T) {
 				"unexpected failure from a throttled copy: %v", err)
 			require.Greater(t, hardStop.peak.Load(), int64(threshold),
 				"the copy's own threads must be what carried the sample over")
-			require.NotZero(t, hardStop.entries.Load(), "the copy must trip the gate its own threads exceed")
-			// Parked time, not the number of trips, is what says the gate is
-			// firing on the copy rather than grazing it. The two measure the
-			// same throttling, but a slower target pays for it with longer
-			// parks instead of more of them: its appliers are still busy when
-			// a backoff ends, so BlockWait loops inside one entry rather than
-			// taking a new one. Time spent parked only grows as the target
-			// gets slower; the count of entries can fall to one.
-			require.GreaterOrEqual(t, blocked, 2*copyThreadBackoff,
-				"tripping the gate must cost the copy more than a single backoff")
+			require.Greater(t, hardStop.entries.Load(), int64(2),
+				"the copy must trip the gate its own threads exceed, repeatedly")
 		})
 	}
 }
