@@ -42,13 +42,13 @@ type Column struct {
 	SetValues       []string          `json:"set_values,omitempty"`  // Permitted values for SET type
 	Nullable        bool              `json:"nullable"`
 	Default         *string           `json:"default,omitempty"`
-	DefaultIsExpr   bool              `json:"default_is_expr,omitempty"`   // true when default is an expression (needs parens), e.g. DEFAULT (json_object())
-	DefaultIsString bool              `json:"default_is_string,omitempty"` // true when the default is a quoted string literal (so it must be re-quoted on emission, even if it looks like a keyword/number)
-	OnUpdate        *string           `json:"on_update,omitempty"`         // ON UPDATE expression for TIMESTAMP/DATETIME, e.g. "current_timestamp"
-	GeneratedExpr   *string           `json:"generated_expr,omitempty"`    // Expression for GENERATED ALWAYS AS (...) columns
-	GeneratedStored bool              `json:"generated_stored,omitempty"`  // true = STORED, false = VIRTUAL (only meaningful when GeneratedExpr is set)
-	Check           *string           `json:"check,omitempty"`             // Column-level CHECK (...) constraint expression
-	SRID            *uint32           `json:"srid,omitempty"`              // SRID attribute for spatial columns
+	DefaultIsExpr   bool              `json:"default_is_expr,omitempty"`  // true when default is an expression (needs parens), e.g. DEFAULT (json_object())
+	DefaultKind     DefaultKind       `json:"default_kind,omitempty"`     // the literal form the default was written as, read off the AST — see DefaultKind
+	OnUpdate        *string           `json:"on_update,omitempty"`        // ON UPDATE expression for TIMESTAMP/DATETIME, e.g. "current_timestamp"
+	GeneratedExpr   *string           `json:"generated_expr,omitempty"`   // Expression for GENERATED ALWAYS AS (...) columns
+	GeneratedStored bool              `json:"generated_stored,omitempty"` // true = STORED, false = VIRTUAL (only meaningful when GeneratedExpr is set)
+	Check           *string           `json:"check,omitempty"`            // Column-level CHECK (...) constraint expression
+	SRID            *uint32           `json:"srid,omitempty"`             // SRID attribute for spatial columns
 	AutoInc         bool              `json:"auto_increment"`
 	PrimaryKey      bool              `json:"primary_key"`
 	Unique          bool              `json:"unique"`
@@ -507,14 +507,21 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 				// them, e.g. DEFAULT ('{}') stores the string {}.
 				defaultExpr := unwrapParenExpr(opt.Expr)
 
+				// Record which literal form the default was written as while
+				// the AST is still in hand. Restoring it to text collapses
+				// distinctions the characters cannot carry — the TRUE keyword
+				// against the 1 it aliases, a bit literal against a string
+				// that happens to spell one — and both emission and the
+				// normalization rules need them back.
+				column.DefaultKind = classifyDefaultLiteral(defaultExpr)
+
 				if literal, isStr := stringLiteralValue(defaultExpr); isStr {
 					// Quoted string literal default. Store the true, raw
-					// (fully-unescaped) value off the AST and remember it
-					// was a string so we re-quote it on emission — even if
-					// the value looks like a keyword (TRUE/NULL) or a
-					// number. Escaping happens exactly once, at emit time.
+					// (fully-unescaped) value off the AST; the recorded kind
+					// is what re-quotes it on emission — even if the value
+					// looks like a keyword (TRUE/NULL) or a number. Escaping
+					// happens exactly once, at emit time.
 					column.Default = &literal
-					column.DefaultIsString = true
 				} else {
 					// Non-string defaults (numeric, functions, expressions):
 					// keep the Restored text representation. Only a

@@ -75,7 +75,7 @@ func (functionAliasNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		col := &ct.Columns[i]
 		// A string-literal default holds a value, not an expression, even in
 		// the parenthesized DEFAULT ('{}') form.
-		if col.DefaultIsExpr && !col.DefaultIsString {
+		if col.DefaultIsExpr && col.DefaultKind != DefaultKindString {
 			canonicalizeFuncAliases(p, col.Default, restoreExprDefaultText)
 		}
 		canonicalizeFuncAliases(p, col.GeneratedExpr, restoreExpressionText)
