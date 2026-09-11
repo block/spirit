@@ -3,17 +3,50 @@ package migration
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/block/spirit/pkg/copier/copiertest"
 	"github.com/block/spirit/pkg/status"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/require"
 )
 
-// The tests here use a minimal hand-constructed Runner. Progress() in the
-// Initial state reads neither the copier nor the chunkers, and throttleStatus
+// The tests here use a minimal hand-constructed Runner. Progress() reads the
+// copier only during the copy, tolerates a missing chunker, and throttleStatus
 // reads nothing but the throttler, so the fields under test can be exercised
 // without a live migration.
+
+// TestProgressReportsCopyAlongsideTables pins that the runner-wide copy is the
+// sum of Tables: present as soon as the copy chunker exists, counting settled
+// rows rather than the copier's own measure, kept through the later phases,
+// and rendered into Summary from the same reading together with a single ETA
+// read.
+func TestProgressReportsCopyAlongsideTables(t *testing.T) {
+	r := &Runner{copier: copiertest.Stub{
+		ETA: status.ETA{State: status.ETAReady, Duration: time.Minute},
+		// The copier's own measure, which Copy must never report.
+		Copy: status.CopyProgress{RowsCopied: 7, RowsTotal: 9},
+	}}
+	require.Empty(t, r.Progress().Copy)
+
+	c := table.NewMockChunker("t1", 100)
+	r.copyChunker = c
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, r.Progress().Copy)
+
+	c.Feedback(nil, 0, 40) // rows settled by the applier
+	r.status.Set(status.CopyRows)
+	p := r.Progress()
+	require.Equal(t, status.CopyProgress{RowsCopied: 40, RowsTotal: 100}, p.Copy)
+	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
+	require.Equal(t, "40/100 40.00% copyRows ETA 1m0s", p.Summary)
+
+	r.status.Set(status.WaitingOnSentinelTable)
+	p = r.Progress()
+	require.Equal(t, status.CopyProgress{RowsCopied: 40, RowsTotal: 100}, p.Copy)
+	require.Empty(t, p.ETA)
+}
 
 func TestProgressReportsResume(t *testing.T) {
 	// Resume exists so a wrapper can tell a recovering run from one that is

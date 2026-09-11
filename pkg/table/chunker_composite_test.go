@@ -260,7 +260,7 @@ func TestCompositeChunkerBinaryHexStringWatermark(t *testing.T) {
 	require.NoError(t, err)
 	// The boundary value must be serialized as a hex literal of the ASCII
 	// string "0xAB" (0x30784142), not as the plain string "0xAB".
-	var compositeWM compositeWatermark
+	var compositeWM watermarkEnvelope
 	require.NoError(t, json.Unmarshal([]byte(watermark), &compositeWM))
 	require.Contains(t, compositeWM.ChunkJSON, `0x30784142`)
 	require.NotContains(t, compositeWM.ChunkJSON, `"0xAB"`)
@@ -424,7 +424,7 @@ func TestCompositeLowWatermark(t *testing.T) {
 	watermark, err := chunker.GetLowWatermark()
 	require.NoError(t, err)
 	// The watermark can be divided into the chunkJSON and the rows.
-	var compositeWM compositeWatermark
+	var compositeWM watermarkEnvelope
 	require.NoError(t, json.Unmarshal([]byte(watermark), &compositeWM))
 	require.JSONEq(t, "{\"Key\":[\"pk\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1008\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2032\"],\"Inclusive\":false}}", compositeWM.ChunkJSON)
 

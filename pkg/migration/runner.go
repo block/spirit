@@ -80,8 +80,9 @@ type Runner struct {
 	// the throttler to report whether the migration is currently paused.
 	throttlerMu sync.RWMutex
 
-	copier      copier.Copier
-	copyChunker table.Chunker // the chunker for copying
+	copier           copier.Copier
+	copyChunker      table.Chunker // the chunker for copying
+	copyRowsAtResume uint64        // settled rows restored from the checkpoint, excluded from this invocation's copy aggregate
 
 	// applier is the shared write layer used by both the copier (buffered
 	// copy) and the replication client (binlog deltas). Kept on the runner
@@ -274,16 +275,17 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The optimistic chunker does not persist its
-// actual-row counter in a checkpoint, so a resumed invocation reports only
-// work settled after it resumed.
+// Runner.Run invocation. The chunker restores its settled count from the
+// checkpoint so that progress continues across a resume; that restored count
+// is subtracted here, so a resumed invocation reports only the rows settled
+// after it resumed, alongside the chunks it copied.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -1447,22 +1449,39 @@ func (r *Runner) Result() status.WorkflowResult {
 	}
 }
 
+// copyTables snapshots the copy chunker and returns the per-table progress.
+// Progress and Status both derive their copy figures from it, so the API and
+// the log block report one measure: settled rows against the tables'
+// cardinality estimates, kept past the end of the copy. The copier's own
+// progress is not used for either, because on an auto_increment key it
+// measures keyspace distance, not rows. The chunker is read under chunkerMu
+// to synchronize with initChunkers(), which may be assigning it concurrently
+// during setup.
+func (r *Runner) copyTables() []status.TableProgress {
+	r.chunkerMu.RLock()
+	copyChunker := r.copyChunker
+	r.chunkerMu.RUnlock()
+	return status.TablesFromChunker(copyChunker)
+}
+
 func (r *Runner) Progress() status.Progress {
 	// Read the state once: the phase-specific fields below (summary, ETA,
 	// checksum, throttle) must all describe the same state, not whichever state
 	// each happened to observe.
 	state := r.status.Get()
+
+	tables := r.copyTables()
+	copyProgress := status.CopyFromTables(tables)
+
 	var summary string
 	var eta status.ETA
 	var checksum status.ChecksumProgress
 	switch state { //nolint: exhaustive
 	case status.CopyRows:
-		summary = fmt.Sprintf("%v %s ETA %v",
-			r.copier.GetProgress(),
-			state.String(),
-			r.copier.GetETA(),
-		)
+		// One copier read, so the ETA in Summary and the ETA field describe
+		// the same instant.
 		eta = r.copier.GetETAState()
+		summary = fmt.Sprintf("%s %s ETA %s", copyProgress.String(), state.String(), eta.String())
 	case status.WaitingOnSentinelTable:
 		summary = "Waiting on Sentinel Table"
 	case status.ApplyChangeset, status.PostChecksum:
@@ -1471,20 +1490,13 @@ func (r *Runner) Progress() status.Progress {
 		checksum = r.checker.GetProgress()
 		summary = "Checksum Progress=" + checksum.String()
 	}
-
-	// Get per-table progress if available (multi-table migrations).
-	// We hold chunkerMu to synchronize with initChunkers(), which
-	// may be assigning r.copyChunker concurrently during setup.
-	r.chunkerMu.RLock()
-	copyChunker := r.copyChunker
-	r.chunkerMu.RUnlock()
-	tables := status.TablesFromChunker(copyChunker)
 	return status.Progress{
 		CurrentState: state,
 		Summary:      summary,
 		Resume:       r.usedResumeFromCheckpoint.Load(),
 		Throttle:     r.throttleStatus(state),
 		ETA:          eta,
+		Copy:         copyProgress,
 		Checksum:     checksum,
 		Tables:       tables,
 	}
@@ -1676,6 +1688,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	if checksumWatermark != "" {
 		if err := r.checksumChunker.OpenAtWatermark(checksumWatermark); err != nil {
@@ -1981,7 +1994,7 @@ func (r *Runner) Status() string {
 	}
 	switch state { //nolint: exhaustive
 	case status.CopyRows:
-		progress := r.copier.CopyProgress()
+		progress := status.CopyFromTables(r.copyTables())
 		b := status.NewBlock("migration status: state=%s total-time=%s copier-time=%s",
 			state.String(),
 			r.status.TotalElapsed().Round(time.Second),

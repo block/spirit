@@ -37,6 +37,21 @@ type ETA struct {
 	Duration time.Duration
 }
 
+// String renders the ETA the way the copy summary shows it: "TBD" while the
+// rate is still being measured, "DUE" once the copy has reached its estimated
+// end, and otherwise the remaining duration.
+func (e ETA) String() string {
+	switch e.State {
+	case ETADue:
+		return "DUE"
+	case ETAMeasuring:
+		return "TBD"
+	case ETAReady, ETANone:
+		return e.Duration.String()
+	}
+	return e.Duration.String()
+}
+
 // ThrottleStatus reports whether the current phase is paused by a throttler,
 // and why. Before this, throttling was only visible in the logs, so a wrapper
 // polling status saw a migration that had gone quiet with no way to say why
@@ -108,6 +123,28 @@ type Progress struct {
 
 	// ETA is the structured remaining row-copy estimate and its availability.
 	ETA ETA
+
+	// Copy is the runner-wide row copy: the sum of Tables, so the two reconcile
+	// by construction. Both count settled rows against the tables' cardinality
+	// estimates, never the chunker's keyspace position, which is what the
+	// copier itself paces on for an auto_increment key and what the ETA is
+	// derived from. Copy is zero until the copy chunker exists and keeps its
+	// final reading through the later phases, so a caller can read how much
+	// the run copied at any point. RowsTotal is an estimate, so RowsCopied can
+	// exceed it.
+	//
+	// Two consequences of that split follow. RowsCopied counts rows the copy
+	// settled, so a row the binlog applier wrote before the copy reached it
+	// is not counted (the copy inserts with INSERT IGNORE, which reports it
+	// as unaffected), and on a busy table the copy finishes short of
+	// RowsTotal. A resume restores the count from the checkpoint and
+	// continues it; a move deletes and re-copies the rows at or above the
+	// resume position, so the rows among them settled before the checkpoint
+	// are counted again. And the ETA, including its DUE state, is paced on the
+	// keyspace for an auto_increment key, so over a sparse key range the copy
+	// can read close to complete here while the ETA is still counting down,
+	// or the reverse. Summary carries both halves.
+	Copy CopyProgress
 
 	// Checksum is the structured progress of the post-copy checksum phase,
 	// populated while CurrentState is Checksum and zero otherwise. It is the

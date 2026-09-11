@@ -8,20 +8,12 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
-	"github.com/block/spirit/pkg/copier"
+	"github.com/block/spirit/pkg/copier/copiertest"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
-
-type progressCopier struct{ copier.Copier }
-
-func (progressCopier) GetProgress() string { return "50%" }
-func (progressCopier) GetETA() string      { return "1m" }
-func (progressCopier) GetETAState() status.ETA {
-	return status.ETA{State: status.ETAReady, Duration: time.Minute}
-}
 
 type progressChecker struct{ checksum.Checker }
 
@@ -32,8 +24,11 @@ func (progressChecker) GetProgress() status.ChecksumProgress {
 func TestMoveProgress(t *testing.T) {
 	r := &Runner{}
 	require.Empty(t, r.Progress().Tables)
+	require.Empty(t, r.Progress().Copy)
 	a := table.NewMockChunker("a", 100)
 	b := table.NewMockChunker("b", 200)
+	a.Feedback(nil, 0, 50) // rows settled by the applier
+	b.Feedback(nil, 0, 20)
 	r.copyChunker = table.NewMultiChunker(a, b)
 	p := r.Progress()
 	require.Len(t, p.Tables, 2)
@@ -43,24 +38,38 @@ func TestMoveProgress(t *testing.T) {
 		require.False(t, row.IsComplete)
 	}
 	require.EqualValues(t, 300, total)
+	require.Equal(t, status.CopyProgress{RowsCopied: 70, RowsTotal: 300}, p.Copy) // Both counters summed across Tables, before any state is set.
 	r.copyChunker = a
-	require.Equal(t, []status.TableProgress{{TableName: "a", RowsTotal: 100}}, r.Progress().Tables)
-	r.copier = progressCopier{}
+	require.Equal(t, []status.TableProgress{{TableName: "a", RowsCopied: 50, RowsTotal: 100}}, r.Progress().Tables)
+	r.copier = copiertest.Stub{
+		ETA: status.ETA{State: status.ETAReady, Duration: time.Minute},
+		// The copier's own measure, which Copy must never report.
+		Copy: status.CopyProgress{RowsCopied: 7, RowsTotal: 9},
+	}
 	r.status.Set(status.CopyRows)
 	p = r.Progress()
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
+	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
+	require.Equal(t, "50/100 50.00% copyRows ETA 1m0s", p.Summary)
+	// The log block reports the same copy measure as the API, percentage
+	// included, on the same tick.
+	block := r.Status()
+	require.Contains(t, block, " 50.00%  50/100  chunk-size=0  eta=1m0s  throttled=false")
+	require.NotContains(t, block, "7/9")
 	r.checker = progressChecker{}
 	r.status.Set(status.Checksum)
 	p = r.Progress()
 	require.Equal(t, status.ChecksumProgress{RowsChecked: 25, RowsTotal: 100}, p.Checksum)
 	require.Equal(t, "Checksum Progress="+p.Checksum.String(), p.Summary)
 	require.Empty(t, p.ETA)
+	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy) // The copy reading outlives the copy phase.
 	r.usedResumeFromCheckpoint.Store(true)
 	r.status.Set(status.WaitingOnSentinelTable)
 	p = r.Progress()
 	require.True(t, p.Resume)
 	require.Equal(t, "Waiting on Sentinel Table", p.Summary) // No logging or target access.
 	require.Empty(t, p.ETA)
+	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
 	require.Empty(t, p.Checksum)
 }
 
