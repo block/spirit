@@ -161,10 +161,14 @@ func (c *copyThreadThrottler) BlockWait(ctx context.Context) {
 //
 // Both runs copy the same rows under the same gate, and the thread counts are
 // the only difference between them. Pools sized from the instance total three
-// against a threshold of three and never trip it: no sample goes over, no
-// worker is ever parked, and the ALTER completes. Pools left at the thread
-// flags' defaults total eight, and that copy throttles on its own workers over
-// and over, spending seconds parked per run with no production load anywhere.
+// against a threshold of three, so the copy cannot carry a sample over on its
+// own: it runs to the end, and the gate trips at most once, when a spirit
+// connection outside the copy pool is caught mid-query. Such a trip clears at
+// the next sample, because the copy's own threads are under the threshold
+// whatever the other connection is doing. Pools left at the thread flags'
+// defaults total eight, and that copy throttles on its own workers over and
+// over — once per chunk, in the limit — spending seconds parked per run with
+// no production load anywhere.
 //
 // Wall-clock time is deliberately not the assertion. A host with cores to spare
 // copies a chunk faster than the throttler samples and refills the pool as soon
@@ -225,20 +229,25 @@ func TestSmallInstanceCopyDoesNotTripItsOwnThrottle(t *testing.T) {
 
 			if tc.fits {
 				require.NoError(t, err, "a copy that fits under the hard-stop has no reason to miss its deadline")
-				require.LessOrEqual(t, hardStop.peak.Load(), int64(threshold),
-					"the copy's own threads must stay within the threshold that gates them")
-				require.Zero(t, hardStop.entries.Load(), "the copy must not throttle on itself")
-				require.Zero(t, blocked, "a copy that never throttles is never parked")
+				// The copy's own three threads cannot reach the threshold, so a
+				// sample only goes over when a connection outside the copy pool
+				// is caught mid-query, and only until the next sample. What must
+				// not happen is the copy throttling on itself, chunk after chunk.
+				require.LessOrEqual(t, hardStop.entries.Load(), int64(1),
+					"a copy that fits must not throttle on itself, whatever else is briefly running")
+				require.Less(t, blocked, 5*copyThreadBackoff,
+					"a copy that fits must not spend its time parked")
 				return
 			}
 			// Either it paid the backoff and finished, or it ran out of clock
 			// doing so. Both are the gate firing on spirit's own copy.
 			require.True(t, err == nil || errors.Is(err, context.DeadlineExceeded),
 				"unexpected failure from a throttled copy: %v", err)
-			require.Positive(t, hardStop.entries.Load(), "the copy must trip the gate its own threads exceed")
+			require.Greater(t, hardStop.entries.Load(), int64(2),
+				"the copy must trip the gate its own threads exceed, repeatedly")
 			require.Greater(t, hardStop.peak.Load(), int64(threshold),
 				"the copy's own threads must be what carried the sample over")
-			require.Positive(t, blocked, "tripping the gate must cost the copy time")
+			require.GreaterOrEqual(t, blocked, copyThreadBackoff, "tripping the gate must cost the copy time")
 		})
 	}
 }
