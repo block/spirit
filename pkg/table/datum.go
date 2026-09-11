@@ -96,14 +96,6 @@ func NewDatum(val any, tp datumTp) (Datum, error) {
 			// do nothing
 		case int:
 			val = int64(v)
-		case bool:
-			// BOOLEAN is an alias for tinyint(1), and the binlog surfaces such
-			// columns as Go bools. MySQL stores TRUE as 1 and FALSE as 0.
-			if v {
-				val = int64(1)
-			} else {
-				val = int64(0)
-			}
 		default:
 			original := val
 			val, err = strconv.ParseInt(fmt.Sprint(original), 10, 64)
@@ -129,14 +121,6 @@ func NewDatum(val any, tp datumTp) (Datum, error) {
 			// For int64, a direct cast to uint64 is safe because both are 64-bit types
 			// and the underlying bit pattern is preserved without additional sign extension.
 			val = uint64(v)
-		case bool:
-			// BOOLEAN is an alias for tinyint(1), and the binlog surfaces such
-			// columns as Go bools. MySQL stores TRUE as 1 and FALSE as 0.
-			if v {
-				val = uint64(1)
-			} else {
-				val = uint64(0)
-			}
 		default:
 			original := val
 			val, err = strconv.ParseUint(fmt.Sprint(original), 10, 64)

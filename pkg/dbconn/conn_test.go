@@ -111,6 +111,32 @@ func TestNewDSNAllowNativePasswords(t *testing.T) {
 		"DSN must not contain allowNativePasswords=false")
 }
 
+func TestNewDSNDisablesTinyInt1IsBool(t *testing.T) {
+	// The driver maps a signed tinyint(1) to a Go bool by default, which
+	// collapses every non-zero value to true. The copier reads rows back into
+	// Go to build its INSERT, so spirit must always ask for integers: a stored
+	// 2 would otherwise be written as 1, and the value is unrecoverable by the
+	// time spirit sees it.
+	dsn := "root:password@tcp(127.0.0.1:3306)/test"
+
+	for _, tlsMode := range []string{"PREFERRED", "DISABLED"} {
+		t.Run(tlsMode, func(t *testing.T) {
+			config := NewDBConfig()
+			config.TLSMode = tlsMode
+			resp, err := newDSN(dsn, config)
+			require.NoError(t, err)
+			require.Contains(t, resp, "tinyInt1IsBool=false",
+				"DSN must disable the driver's tinyint(1)-to-bool mapping")
+
+			// Round-trip it: the flag has to survive parsing, since that is how
+			// the driver actually receives it.
+			cfg, err := mysql.ParseDSN(resp)
+			require.NoError(t, err)
+			require.Contains(t, cfg.FormatDSN(), "tinyInt1IsBool=false")
+		})
+	}
+}
+
 func TestNewDSNAllowCleartextPasswords(t *testing.T) {
 	// With TLS enabled (default PREFERRED mode), AllowCleartextPasswords should be true
 	dsn := "root:password@tcp(127.0.0.1:3306)/test"

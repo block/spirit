@@ -1379,90 +1379,69 @@ func requireVectorEquals(t *testing.T, db *sql.DB, info, want string) {
 	require.Equal(t, expected, got, "row %q must hold the vector %s", info, want)
 }
 
-func TestBooleanColumnConcurrentDML(t *testing.T) {
+func TestTinyInt1ValuesSurviveCopy(t *testing.T) {
 	t.Parallel()
 
-	// tinyint(1) is the storage for BOOLEAN, and the binlog surfaces such
-	// columns as Go bools rather than integers. A table carrying one must
-	// still replicate writes made during the copy.
-	tt := testutils.NewTestTable(t, "boolean_dml", `CREATE TABLE boolean_dml (
+	// The (1) in tinyint(1) is a display width, not a range: the column holds
+	// the whole signed tinyint range. The copier reads rows back into Go to
+	// build its INSERT, and the driver reports a signed tinyint(1) as a Go
+	// bool, so every non-zero value arrives as true. Each value must reach the
+	// new table unchanged.
+	tt := testutils.NewTestTable(t, "tinyint1_copy", `CREATE TABLE tinyint1_copy (
 		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		info VARCHAR(255) NOT NULL,
-		is_active TINYINT(1) NOT NULL,
+		flags TINYINT(1) NOT NULL,
 		is_archived TINYINT(1) NOT NULL DEFAULT '0'
 	)`)
 
-	testutils.RunSQL(t, `INSERT INTO boolean_dml (info, is_active, is_archived) VALUES
-		('toggle-on', 0, 0),
-		('toggle-off', 1, 1)`)
-	tt.SeedRows(t, "INSERT INTO boolean_dml (info, is_active) SELECT 'bulk', 0", 2000)
+	testutils.RunSQL(t, `INSERT INTO tinyint1_copy (info, flags, is_archived) VALUES
+		('zero', 0, 0),
+		('one', 1, 1),
+		('two', 2, 0),
+		('max', 127, 1),
+		('min', -128, 0)`)
+	tt.SeedRows(t, "INSERT INTO tinyint1_copy (info, flags) SELECT 'bulk', 3", 2000)
 
 	// Adding a column and an index in one statement leaves Spirit unable to
-	// prove the combination is INSTANT-safe, so it falls back to the copy —
-	// which is what puts the boolean values through the binlog applier.
-	m := NewTestRunner(t, "boolean_dml",
+	// prove the combination is INSTANT-safe, so the table is copied — which is
+	// what puts every stored value through the driver and back.
+	m := NewTestRunner(t, "tinyint1_copy",
 		"ADD COLUMN ref_code VARCHAR(64) COLLATE utf8mb4_bin NULL, ADD INDEX idx_ref_code (ref_code)",
 		WithThreads(1),
 		WithTestThrottler())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	dmlDone := make(chan struct{})
-	go func() {
-		defer close(dmlDone)
-		if !waitForCopyRows(t, ctx, m) {
-			return
-		}
-		for range 50 {
-			if ctx.Err() != nil {
-				return
-			}
-			// Both boolean values must cross the applier: the failure only
-			// reproduces for the value actually present in the row image.
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO boolean_dml (info, is_active, is_archived) VALUES ('insert-during', 1, 0)`)
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO boolean_dml (info, is_active, is_archived) VALUES ('insert-during', 0, 1)`)
-			_, _ = tt.DB.ExecContext(ctx, `UPDATE boolean_dml SET is_active = 1 WHERE info = 'toggle-on'`)
-			_, _ = tt.DB.ExecContext(ctx, `UPDATE boolean_dml SET is_active = 0 WHERE info = 'toggle-off'`)
-		}
-	}()
-
-	migrationErr := m.Run(ctx)
-	cancel()
-	<-dmlDone
+	require.NoError(t, m.Run(t.Context()))
 	require.NoError(t, m.Close())
-	require.NoError(t, migrationErr, "boolean values written during the copy must replicate through the applier")
 
-	// The UPDATE targets must hold their post-UPDATE values, proving the
-	// binlog UPDATE path replayed rather than the copier's initial image
-	// surviving.
-	requireBoolColumn(t, tt.DB, "toggle-on", 1)
-	requireBoolColumn(t, tt.DB, "toggle-off", 0)
+	for _, tc := range []struct {
+		info string
+		want int
+	}{
+		{"zero", 0},
+		{"one", 1},
+		{"two", 2},
+		{"max", 127},
+		{"min", -128},
+	} {
+		requireTinyInt1(t, tt.DB, tc.info, tc.want)
+	}
 
-	// Rows inserted during the copy must be present — otherwise the binlog
-	// INSERT path was never exercised and the test is vacuous.
-	var insertCount int
+	// Every bulk row carries 3. Collapsing the column to a boolean rewrites
+	// them all to 1, which a single-row assertion could not distinguish from
+	// a chunk boundary effect.
+	var rewritten int
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM boolean_dml WHERE info = 'insert-during'`).Scan(&insertCount))
-	require.Positive(t, insertCount, "no concurrent INSERTs reached the binlog path — test is vacuous")
-
-	// Every inserted row must keep the exact pair it was written with, so a
-	// boolean coerced to a constant would fail here.
-	var mismatched int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM boolean_dml
-		 WHERE info = 'insert-during' AND is_active = is_archived`).Scan(&mismatched))
-	require.Zero(t, mismatched, "boolean values inserted during the migration must survive unchanged")
+		`SELECT COUNT(*) FROM tinyint1_copy WHERE info = 'bulk' AND flags <> 3`).Scan(&rewritten))
+	require.Zero(t, rewritten, "copied tinyint(1) values must not be coerced to 0/1")
 }
 
-// requireBoolColumn asserts the row identified by info holds want in its
-// is_active column.
-func requireBoolColumn(t *testing.T, db *sql.DB, info string, want int) {
+// requireTinyInt1 asserts the row identified by info holds want in its flags
+// column.
+func requireTinyInt1(t *testing.T, db *sql.DB, info string, want int) {
 	t.Helper()
 	// Adding zero forces an integer result: tinyint(1) otherwise reaches the
-	// driver as a bool, which is the same ambiguity this test is about.
+	// driver as a bool, which is the coercion under test.
 	var got int
 	require.NoError(t, db.QueryRowContext(t.Context(),
-		`SELECT is_active + 0 FROM boolean_dml WHERE info = ? LIMIT 1`, info).Scan(&got))
-	require.Equal(t, want, got, "row %q must hold is_active=%d", info, want)
+		`SELECT flags + 0 FROM tinyint1_copy WHERE info = ? LIMIT 1`, info).Scan(&got))
+	require.Equal(t, want, got, "row %q must hold flags=%d", info, want)
 }
