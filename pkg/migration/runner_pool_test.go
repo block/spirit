@@ -181,6 +181,52 @@ func TestSmallestInstancePoolsNeverOutgrowTheHardStop(t *testing.T) {
 		"the thread flag defaults must not be mistaken for a size that fits the smallest instance")
 }
 
+// TestEveryPhasePoolFitsTheHardStopOnTheSmallestInstance is the sibling test
+// widened from the copy phase to every phase that holds threads open against
+// the target, because fitting under the hard-stop is only worth anything if it
+// holds for all of them. A phase that does not fit puts the copy back in the
+// regime the sizing exists to leave: its threads carry the sample over, nothing
+// sheds one below MinVCPUs, and the run pays the backoff per loop.
+//
+// The counts are the ones the runner installs, not restatements of them — the
+// derived read count becomes the copier's worker count and the checksum's
+// Concurrency, and the derived write count becomes the applier's, which both the
+// copy and a checksum repair write through.
+//
+// A new phase with its own pool belongs in this table. Two things deliberately
+// stay out of it:
+//
+//   - The change-feed drain, which is a cap on the batches one flush keeps in
+//     flight rather than a resident pool (see change.ClientConfig.FlushConcurrency),
+//     so it holds threads only while there are pending changes to apply. Its
+//     agreement with the change package's own default is pinned by
+//     TestFlushBoundsPreservesChangeDefaults.
+//   - Spirit's monitoring connections, which are what the mode headroom in the
+//     threshold is for.
+func TestEveryPhasePoolFitsTheHardStopOnTheSmallestInstance(t *testing.T) {
+	const smallestInstanceVCPUs = 2
+	threshold := throttler.MinThreadsThrottleThreshold(smallestInstanceVCPUs)
+	pools, growable := sizePoolsFromInstance(smallestInstanceVCPUs, autoscale.ClientCeiling())
+	require.False(t, growable, "nothing steers the pools at this size")
+
+	for _, phase := range []struct {
+		name    string
+		threads int
+	}{
+		// The copy runs its read workers and the applier's write workers at
+		// the same time.
+		{"copy", pools.read + pools.write},
+		// The checksum's own workers, plus the applier a mismatched chunk is
+		// repaired through. The copier has stopped by then, so these do not
+		// add to the copy's.
+		{"checksum", pools.read + pools.write},
+	} {
+		require.LessOrEqualf(t, phase.threads, threshold,
+			"%s phase: %d threads against a hard-stop that trips above %d",
+			phase.name, phase.threads, threshold)
+	}
+}
+
 // TestPoolSizeIsExactlyMaxConnections is the property an operator budgets
 // against: spirit's main pool is --max-connections and stays there, so a user
 // with a max_user_connections can subtract one number and be done.

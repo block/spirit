@@ -108,6 +108,97 @@ func TestSmallInstancePoolsFitTheThreshold(t *testing.T) {
 	require.Equal(t, 4, MinThreadsThrottleThreshold(3))
 }
 
+// TestSmallInstancePoolsLeaveNoBackoffTerm is the fit test's consequence, driven
+// through the real hard-stop rather than computed: what a copy pays per chunk.
+//
+// The cost of throttling is not proportional to how far over the threshold a
+// pool is. BlockWait parks a caller in blockWaitInterval steps for up to 60 of
+// them, and the sample it waits on is the copy's own thread count, so the pool
+// size decides which of two regimes a copy is in:
+//
+//   - A pool that fits is never throttled by its own threads, so BlockWait
+//     returns without waiting out a single interval. There is no backoff term
+//     in the per-chunk cost at all.
+//   - A pool that does not fit is throttled by its own threads, and nothing
+//     sheds one below MinVCPUs. The sample therefore stays over for as long as
+//     the copy runs, and every chunk pays the backoff — bounded only by the
+//     poll count, so up to a minute per copy loop.
+//
+// That second regime is what makes an oversized pool a stall rather than a
+// slowdown, and it does not depend on the host, the storage, or the table: it
+// is a property of the state machine, which is why this is asserted here
+// against the real one rather than measured against a server.
+func TestSmallInstancePoolsLeaveNoBackoffTerm(t *testing.T) {
+	require.Equal(t, time.Second, blockWaitInterval,
+		"the per-chunk backoff step the regimes below are stated in")
+
+	for _, mode := range []threadsMode{redoAwareMode, globalStatusMode} {
+		for vCPUs := 2; vCPUs < autoscale.MinVCPUs; vCPUs++ {
+			readStart, _ := autoscale.ReadBounds(vCPUs)
+			writeStart := autoscale.WriteStart(vCPUs)
+			a := newTestAuroraThreads(t, int64(vCPUs), mode)
+
+			// Spirit's own copy is the entire sample: the condition a bootstrap
+			// copy runs in, with no production load on the target. Repeated,
+			// because a steady state is what it has to survive — a pool that
+			// fits does not drift over by running for longer.
+			for range 3 {
+				a.applySample(int64(readStart + writeStart))
+			}
+			require.Falsef(t, a.IsThrottled(),
+				"%s at %d vCPUs: %d read + %d write threads must not throttle themselves",
+				mode.label, vCPUs, readStart, writeStart)
+			requireBlockWaitReturns(t, a, "a copy that fits must not park at all")
+		}
+	}
+
+	// The other regime, at the smallest instance and the tighter signal: one
+	// thread over the threshold, and the copy parks until something outside it
+	// changes. Not the sample — the copy's own threads are what carry it over,
+	// and below MinVCPUs nothing sheds one.
+	a := newTestAuroraThreads(t, 2, redoAwareMode)
+	a.applySample(a.throttleThreshold() + 1)
+	require.True(t, a.IsThrottled(), "a pool over the threshold throttles")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		a.BlockWait(ctx)
+	}()
+	select {
+	case <-returned:
+		t.Fatal("a throttled copy must park, not proceed")
+	case <-time.After(blockWaitInterval / 10):
+	}
+
+	// Only the signal falling back under the threshold, the poll count running
+	// out, or the run being cancelled ends the wait. Cancellation is the one a
+	// test can reach without spending the other two.
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(blockWaitInterval):
+		t.Fatal("BlockWait must abandon the backoff when the run is cancelled")
+	}
+}
+
+// requireBlockWaitReturns fails unless BlockWait returns without waiting out a
+// backoff step, which is what an unthrottled copy must do on every chunk.
+func requireBlockWaitReturns(t *testing.T, a *AuroraThreads, msg string) {
+	t.Helper()
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		a.BlockWait(t.Context())
+	}()
+	select {
+	case <-returned:
+	case <-time.After(blockWaitInterval):
+		t.Fatal(msg)
+	}
+}
+
 func TestAuroraThreads_HeadroomSparesSmallInstance(t *testing.T) {
 	// Regression for the "allowing one copy loop to make progress" flood on small
 	// Aurora instances: at vCPUs=2 spirit's own monitoring footprint pushes the
