@@ -727,9 +727,8 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 	// the same source in the same setup phase, used only to size maxWrite here.
 	redoAware := false
 	// readCeiling is the upper bound for the read side (the copier's read workers
-	// and the checksum's workers). It stays zero unless it was derived from the
-	// instance below, which is also the marker for "nothing can grow" — see the
-	// maxRead fallback.
+	// and the checksum's workers). It stays zero when nothing can grow it, which
+	// is the marker the maxRead fallback below reads.
 	readCeiling := 0
 	// flushConcurrency and flushBatchSize shape the change-feed drain. Like
 	// readCeiling they stay zero unless derived from the instance below, and zero
@@ -740,18 +739,17 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 	// point.
 	flushConcurrency, flushBatchSize := 0, 0
 	// Aurora is the one place the autoscaler can engage at all: it needs the
-	// continuous signal only the Aurora throttlers provide. Below
-	// autoscale.MinVCPUs it must not engage even there — one thread is half or
-	// more of the dead band, so the controller could only oscillate.
+	// continuous signal only the Aurora throttlers provide.
 	//
 	// A probe failure disables autoscaling rather than falling through. It is a
 	// separate, uncached query from the one AuroraSetup.Build runs later, so a
 	// blip here does not stop the throttler from selecting a GradualThrottler
 	// that the copier would then scale against — with the flag-relative bounds
 	// this function exists to replace, and with both guards below skipped (the
-	// MinVCPUs check, and redoAware staying false so an unguarded redo log gets
-	// the 2x ceiling instead of the capped one). Autoscaling is an optimization
-	// and the guards are not, so an unreadable instance means fixed pools.
+	// MinVCPUs bar on growth, and redoAware staying false so an unguarded redo
+	// log gets the 2x ceiling instead of the capped one). Autoscaling is an
+	// optimization and the guards are not, so an unreadable instance means
+	// fixed pools.
 	if autoscaleEnabled {
 		isAurora, err := throttler.IsAurora(ctx, r.db)
 		switch {
@@ -770,65 +768,38 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 			if err != nil {
 				return err
 			}
-			if vCPUs < autoscale.MinVCPUs {
-				r.logger.Warn("autoscaling disabled: instance is too small for the utilization signal to guide scaling; thread counts stay as configured",
-					"vcpus", vCPUs, "min_vcpus", autoscale.MinVCPUs,
-					"threads", r.migration.Threads,
-					"write_threads", r.migration.WriteThreads)
-				autoscaleEnabled = false
-				break
-			}
-			redoAware = throttler.CanReadRedoAwareThreads(ctx, r.db) == nil
-			// Autoscaling has engaged, so it owns the thread counts: --threads
-			// and --write-threads are ignored and both pools are sized from the
+			// The flag owns the thread counts either way: --threads and
+			// --write-threads are ignored and both pools are sized from the
 			// instance instead. The alternative — honoring the flags as starting
 			// points — makes the outcome depend on a number the caller usually
 			// left at its default, and that default is what capped the checksum
 			// at 8 workers on a 24xlarge no matter how much headroom the signal
 			// reported. A controller that is told to find the right size should
-			// not also be told where to stop.
+			// not also be told where to stop; and on an instance too small to
+			// steer, the flag's default is a number for a much larger box, which
+			// is the case the sizing matters most in.
 			//
-			// The log line reports only the derived counts: this function runs
-			// twice when a resume attempt fails and falls back to a fresh
-			// migration, and by the second call the fields below hold the first
-			// call's derived values rather than anything the caller configured.
-			// The derivation is idempotent (same instance, same numbers), so the
-			// second line agreeing with the first is correct.
-			var readStart int
-			readStart, readCeiling = autoscale.ReadBounds(vCPUs)
-			writeStart := autoscale.WriteStart(vCPUs)
-
-			// Both derivations above size the pools from the target. That
-			// assumes a worker is mostly waiting on the server, which stops
-			// being true when spirit's own host is small — a worker also builds
-			// its statement locally, which is pure client CPU. Take the client
-			// ceiling so a small pod cannot derive a thread count it has no
-			// cores to run: the excess would add queueing and latency, and
-			// nothing on the target side can see it (its CPU and commit latency
-			// both read idle while spirit is the one saturated).
-			//
-			// Applied to the derived numbers only. An explicitly configured
-			// --threads/--write-threads above this is the caller's decision and
-			// is warned about, not overridden, below.
+			// So both pools are sized from the instance at every instance size,
+			// and only the controller that then moves them needs one big enough
+			// to steer on. sizePoolsFromInstance holds both decisions and
+			// explains why they are separate.
 			clientCeiling := autoscale.ClientCeiling()
-			cappedRead, cappedWrite := min(readStart, clientCeiling), min(writeStart, clientCeiling)
-			if cappedRead != readStart || cappedWrite != writeStart {
+			pools, growable := sizePoolsFromInstance(vCPUs, clientCeiling)
+			if growable {
+				redoAware = throttler.CanReadRedoAwareThreads(ctx, r.db) == nil
+			} else {
+				r.logger.Warn("autoscaling disabled: instance is too small for the utilization signal to guide scaling; both pools hold at the size derived from it",
+					"vcpus", vCPUs, "min_vcpus", autoscale.MinVCPUs)
+				autoscaleEnabled = false
+			}
+			readCeiling = pools.readCeiling
+			if pools.hostBound() {
 				r.logger.Warn("thread counts capped by this host's CPU count: the target would justify more workers than spirit has cores to run them on. Give spirit more CPU to use the target's full capacity",
 					"gomaxprocs", runtime.GOMAXPROCS(0),
 					"client_ceiling", clientCeiling,
-					"read_threads", cappedRead, "instance_read_threads", readStart,
-					"write_threads", cappedWrite, "instance_write_threads", writeStart)
-				readStart, writeStart = cappedRead, cappedWrite
+					"read_threads", pools.read, "instance_read_threads", pools.instanceRead,
+					"write_threads", pools.write, "instance_write_threads", pools.instanceWrite)
 			}
-			// The read ceiling is capped too, so the checksum does not
-			// pre-create transactions under the table lock for workers this
-			// host cannot drive — that ceiling is paid in lock time whether or
-			// not scaling reaches it. Unconditionally, not just when a start was
-			// clipped: with today's formulas the ceiling cannot exceed the
-			// client ceiling while both starts fit (that would need vCPUs <
-			// MinVCPUs), but that invariant lives in another package, and the
-			// write side's ceiling below is capped unconditionally too.
-			readCeiling = max(min(readCeiling, clientCeiling), readStart)
 
 			// Size the change-feed drain from the instance too. This is the one
 			// derivation here that is not a thread count: it returns a
@@ -850,13 +821,20 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 				flushConcurrency = clientCeiling
 				flushBatchSize = autoscale.FlushBatchSize(flushConcurrency)
 			}
-			r.logger.Info("autoscaling engaged: thread counts are derived from the instance; --threads and --write-threads are ignored",
+			// The log line reports only the derived counts: this function runs
+			// twice when a resume attempt fails and falls back to a fresh
+			// migration, and by the second call the configured fields hold the
+			// first call's derived values rather than anything the caller
+			// configured. The derivation is idempotent (same instance, same
+			// numbers), so the second line agreeing with the first is correct.
+			r.logger.Info("thread counts are derived from the instance; --threads and --write-threads are ignored",
 				"vcpus", vCPUs,
-				"read_threads", readStart, "max_read_threads", readCeiling,
-				"write_threads", writeStart,
+				"autoscaling", growable,
+				"read_threads", pools.read, "max_read_threads", max(pools.readCeiling, pools.read),
+				"write_threads", pools.write,
 				"flush_concurrency", flushConcurrency, "flush_batch_size", flushBatchSize)
-			r.migration.Threads = readStart
-			r.migration.WriteThreads = writeStart
+			r.migration.Threads = pools.read
+			r.migration.WriteThreads = pools.write
 		}
 	}
 	// Resolve the autoscaler's upper bound. When autoscaling is disabled this
@@ -1009,6 +987,79 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 	return err
 }
 
+// poolSizes is the thread counts one target instance implies.
+type poolSizes struct {
+	// read and write are the starting sizes of the read side (the copier's read
+	// workers and the checksum's workers) and of the apply pool, already bounded
+	// by this host's own CPU.
+	read, write int
+	// readCeiling is how far the read side may grow, or zero when it may not —
+	// see the maxRead fallback in setupCopierCheckerAndReplClient.
+	readCeiling int
+	// instanceRead and instanceWrite are those starting sizes before the host
+	// bound was applied. They differ from read and write only on a host too
+	// small to drive what the target would justify, which is the case the caller
+	// warns about.
+	instanceRead, instanceWrite int
+}
+
+// hostBound reports whether this host's CPU count, rather than the target,
+// decided a starting size.
+func (p poolSizes) hostBound() bool {
+	return p.read != p.instanceRead || p.write != p.instanceWrite
+}
+
+// sizePoolsFromInstance is the whole of the instance-derived sizing: the thread
+// counts a migration that asked for it runs with on an instance of the given
+// vCPU count, and whether the autoscaling controller may engage there.
+//
+// The two answers are independent, and keeping them in one function is the
+// point — the instance size gates them for unrelated reasons. growable is about
+// a feedback loop: re-sizing a pool on the utilization signal needs an instance
+// where one thread is a small enough share of the whole for the dead band to be
+// somewhere to rest, which is what autoscale.MinVCPUs says, and below it the
+// controller could only oscillate. The sizes are about a comparison: the threads
+// throttler hard-stops the copy when the running-thread count passes a
+// threshold derived from this same vCPU count
+// (throttler.MinThreadsThrottleThreshold), so a pool sized from a constant is
+// measured against a number it has no relation to. On a small instance the
+// constant is the larger of the two, and the copy throttles on its own threads
+// with nothing else running on the box — at any table size, a few hundred rows
+// included. Arriving at a size is arithmetic and is defined everywhere.
+//
+// readCeiling is the one output growable decides, because it is the controller's
+// room to move and there is none without one.
+//
+// Both derivations size the pools from the target, which assumes a worker is
+// mostly waiting on the server. That stops being true when spirit's own host is
+// small — a worker also builds its statement locally, which is pure client CPU
+// — so clientCeiling (autoscale.ClientCeiling) bounds them: a small pod must
+// not derive a thread count it has no cores to run, since the excess adds
+// queueing and latency that nothing on the target side can see (its CPU and
+// commit latency both read idle while spirit is the one saturated). It applies
+// to the derived numbers only: a configured --threads/--write-threads above the
+// client ceiling is the caller's decision, and setupCopierCheckerAndReplClient
+// warns about it rather than overriding it.
+//
+// The read ceiling takes the same bound, so the checksum does not pre-create
+// transactions under the table lock for workers this host cannot drive — that
+// ceiling is paid in lock time whether or not scaling reaches it. It is floored
+// back at the starting size, which a pool cannot be controlled beneath.
+func sizePoolsFromInstance(vCPUs, clientCeiling int) (p poolSizes, growable bool) {
+	instanceRead, instanceCeiling := autoscale.ReadBounds(vCPUs)
+	instanceWrite := autoscale.WriteStart(vCPUs)
+	p = poolSizes{
+		read:         min(instanceRead, clientCeiling),
+		write:        min(instanceWrite, clientCeiling),
+		instanceRead: instanceRead, instanceWrite: instanceWrite,
+	}
+	growable = vCPUs >= autoscale.MinVCPUs
+	if growable {
+		p.readCeiling = max(min(instanceCeiling, clientCeiling), p.read)
+	}
+	return p, growable
+}
+
 // newMigration is called when resumeFromCheckpoint has failed.
 // It performs all the initial steps to prepare for a fresh migration.
 func (r *Runner) newMigration(ctx context.Context) error {
@@ -1072,6 +1123,16 @@ func (r *Runner) closeReplicas() error {
 	}
 	r.replicas = nil
 	return errors.Join(errs...)
+}
+
+// installCopierThrottler publishes a substituted throttler and hands it to the
+// copy phase alone, leaving the checksum on the no-op it starts with. Only the
+// test substitutions above use it; the real path publishes through
+// setThrottlerOnPhases so every phase throttles.
+func (r *Runner) installCopierThrottler(ctx context.Context, t throttler.Throttler) error {
+	r.setThrottler(t)
+	r.copier.SetThrottler(r.currentThrottler())
+	return r.currentThrottler().Open(ctx)
 }
 
 // setThrottler publishes the resolved throttler. It is written once during
@@ -1181,9 +1242,13 @@ func (r *Runner) setupThrottler(ctx context.Context) error {
 		// Handing it to the checksum as well would add a second per checksum
 		// chunk to every test that uses it — real wall-clock cost, no extra
 		// coverage. Checksum throttling is covered directly in pkg/checksum.
-		r.setThrottler(&throttler.Mock{})
-		r.copier.SetThrottler(r.currentThrottler())
-		return r.currentThrottler().Open(ctx)
+		return r.installCopierThrottler(ctx, &throttler.Mock{})
+	}
+	if r.migration.testThrottler != nil {
+		// A test is supplying the signal itself, to drive the copy's throttle
+		// path against a target that cannot produce the real one. Copier-only
+		// for the same reason the mock is.
+		return r.installCopierThrottler(ctx, r.migration.testThrottler)
 	}
 
 	var throttlers []throttler.Throttler

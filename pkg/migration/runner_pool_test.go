@@ -7,8 +7,10 @@ import (
 
 	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,15 +31,17 @@ func TestControlPlaneConns(t *testing.T) {
 }
 
 // TestAutoscalingLeavesThreadFlagsAloneWhenItCannotEngage is the other half of
-// "autoscaling owns the thread counts": it only owns them when it can actually
-// steer. Asking for autoscaling against a target with no continuous load signal
-// (any non-Aurora server, which is what the test suite runs against) must leave
-// --threads and --write-threads exactly as configured, because the pools will
-// run fixed at those values for the whole migration.
+// "autoscaling owns the thread counts": it only owns them when there is an
+// instance to size them from. Asking for autoscaling against a target with no
+// continuous load signal (any non-Aurora server, which is what the test suite
+// runs against) must leave --threads and --write-threads exactly as configured,
+// because nothing read a vCPU count and the pools will run fixed at those
+// values for the whole migration.
 //
-// The engaged path cannot be exercised here — it needs a real Aurora instance to
-// read a vCPU count from. autoscale.ReadBounds covers the sizing it derives, and
-// the assertion below covers the branch that decides whether to apply it.
+// The sized path cannot be exercised here — it needs a real Aurora instance to
+// read a vCPU count from. sizePoolsFromInstance covers the numbers it derives
+// and autoscale.ReadBounds the bounds underneath them; the assertion below
+// covers the branch that decides whether there is an instance at all.
 func TestAutoscalingLeavesThreadFlagsAloneWhenItCannotEngage(t *testing.T) {
 	testutils.NewTestTable(t, "autoscale_flags",
 		`CREATE TABLE autoscale_flags (id INT NOT NULL PRIMARY KEY, pad VARCHAR(32))`)
@@ -60,6 +64,121 @@ func TestAutoscalingLeavesThreadFlagsAloneWhenItCannotEngage(t *testing.T) {
 	// ceilings the copier scales its own workers against, not the pool they
 	// check connections out of.
 	require.Equal(t, defaultMaxConnections, m.dbConfig.MaxOpenConnections)
+}
+
+// TestSizePoolsFromInstance covers the two answers the instance size decides,
+// and that they are decided separately.
+//
+// Whether the pools may be *re-sized* on the utilization signal needs an
+// instance the signal can resolve, which is what MinVCPUs is. What size they
+// start at is arithmetic, and it is what keeps them under the hard-stop
+// threshold the same instance sets (throttler.MinThreadsThrottleThreshold, and
+// TestSmallInstancePoolsFitTheThreshold over there). A small instance is where
+// that matters most: a pool left at a constant while its threshold comes from
+// the box holds more threads than the threshold allows, and the copy throttles
+// on nothing but its own workers — at any table size, a few hundred rows
+// included. So the sizing applies below MinVCPUs as well as above it, and only
+// the ceiling the controller would grow into goes away.
+func TestSizePoolsFromInstance(t *testing.T) {
+	// Far above anything these instances derive, so what is under test is the
+	// instance arithmetic and not this host's core count.
+	const clientCeiling = 1000
+
+	// Every instance size too small for the controller: Aurora's smallest is 2
+	// vCPUs, and the write side floors at one thread rather than deriving zero.
+	for vCPUs := 2; vCPUs < autoscale.MinVCPUs; vCPUs++ {
+		pools, growable := sizePoolsFromInstance(vCPUs, clientCeiling)
+
+		require.Falsef(t, growable, "at %d vCPUs the utilization signal is too coarse to steer on", vCPUs)
+		require.Zerof(t, pools.readCeiling,
+			"at %d vCPUs nothing moves the read pool, so it must not reserve room to grow into", vCPUs)
+
+		// Both sides are still sized from the instance, and the total fits under
+		// the threshold that instance sets.
+		require.LessOrEqualf(t, pools.read+pools.write, throttler.MinThreadsThrottleThreshold(vCPUs),
+			"at %d vCPUs: %d read + %d write threads against a hard-stop that trips above %d",
+			vCPUs, pools.read, pools.write, throttler.MinThreadsThrottleThreshold(vCPUs))
+
+		// They land on their floors at these sizes: two readers, the smallest
+		// start that overlaps read and apply work from the first chunk, against a
+		// single write thread.
+		require.Equalf(t, autoscale.MinReadStartThreads, pools.read, "at %d vCPUs", vCPUs)
+		require.Equalf(t, 1, pools.write, "at %d vCPUs", vCPUs)
+		require.Falsef(t, pools.hostBound(), "at %d vCPUs nothing was capped by the client ceiling", vCPUs)
+	}
+
+	// At MinVCPUs the controller engages and the read side gets a ceiling. Its
+	// bounds meet at 2 there, which is the intended reading of a 4-vCPU
+	// instance: two readers is already half of it.
+	pools, growable := sizePoolsFromInstance(autoscale.MinVCPUs, clientCeiling)
+	require.True(t, growable)
+	require.Equal(t, 2, pools.read)
+	require.Equal(t, 2, pools.readCeiling)
+	require.Equal(t, autoscale.MinVCPUs-autoscale.VCPUReserve, pools.write)
+
+	// A client too small to drive what the target would justify: the starting
+	// sizes come down to it and the caller is told which numbers the target
+	// would have supported.
+	pools, _ = sizePoolsFromInstance(96, 3)
+	require.True(t, pools.hostBound())
+	require.Equal(t, 3, pools.read)
+	require.Equal(t, 3, pools.write)
+	require.Equal(t, 24, pools.instanceRead)
+	require.Equal(t, 94, pools.instanceWrite)
+	require.Equal(t, 3, pools.readCeiling,
+		"the ceiling is bounded by the client too, but never below the start")
+}
+
+// TestSmallestInstancePoolsNeverOutgrowTheHardStop is the case the sizing
+// exists for, taken through to the counts the copy actually runs with: on the
+// smallest instance spirit meets, the threads hard-stop trips at a lower count
+// than either thread flag's default supplies, so pools that are not sized from
+// that instance cannot fit under it.
+//
+// Everything the pools can ever reach has to fit, not only the size they start
+// at. No controller engages below MinVCPUs, so nothing sheds a thread that does
+// not fit: a pool over the threshold is over it for the whole copy, every
+// sample trips the hard-stop, and each chunk then waits out BlockWait before
+// the next one starts. A copy that advances roughly a chunk a minute does not
+// finish inside a deadline of minutes however few rows the table holds — which
+// is why the symptom is a stalled copy rather than a slow one, on a table a
+// native ALTER would have finished in well under a second.
+//
+// The ceilings are resolved here rather than assumed, over both privilege-probe
+// answers that feed them, because those answers are settled after the pools are
+// sized and must not be able to widen one past the threshold.
+//
+// Scope is the copy's own pools. The change-feed drain floors at
+// MinFlushConcurrency — the historical default, which the derivation does not
+// size down — so it can exceed this threshold on an instance this small, but
+// only with binlog changes to apply. This test does not claim otherwise.
+func TestSmallestInstancePoolsNeverOutgrowTheHardStop(t *testing.T) {
+	const smallestInstanceVCPUs = 2
+	threshold := throttler.MinThreadsThrottleThreshold(smallestInstanceVCPUs)
+
+	pools, growable := sizePoolsFromInstance(smallestInstanceVCPUs, autoscale.ClientCeiling())
+	require.False(t, growable, "nothing steers the pools at this size")
+	require.Zero(t, pools.readCeiling, "the marker that says nothing can grow the read pool")
+
+	for _, redoAware := range []bool{false, true} {
+		for _, commitLatency := range []bool{false, true} {
+			// The zero ceiling above is the marker the runner's maxRead
+			// fallback reads, so this is the branch it takes here.
+			maxRead := copier.ResolveMaxReadThreads(pools.read, growable)
+			maxWrite := throttler.ResolveMaxWriteThreads(pools.write, growable, redoAware, commitLatency)
+
+			require.LessOrEqualf(t, maxRead+maxWrite, threshold,
+				"redo_aware=%t commit_latency=%t: %d read + %d write threads at their widest, against a hard-stop that trips above %d",
+				redoAware, commitLatency, maxRead, maxWrite, threshold)
+		}
+	}
+
+	// The other half of the comparison, and the reason the derivation has to run
+	// at this size: what the pools hold when nothing sizes them from the
+	// instance is a pair of defaults written for a much larger one, and that
+	// total does not fit.
+	require.Greater(t, defaultThreads+defaultWriteThreads, threshold,
+		"the thread flag defaults must not be mistaken for a size that fits the smallest instance")
 }
 
 // TestPoolSizeIsExactlyMaxConnections is the property an operator budgets

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -58,6 +59,53 @@ func TestAuroraThreads_RedoAwareHeadroom(t *testing.T) {
 
 	a.applySample(a.throttleThreshold() + 1)
 	require.True(t, a.IsThrottled(), "one over the threshold must throttle")
+}
+
+// TestSmallInstancePoolsFitTheThreshold is the cross-package agreement neither
+// package can assert alone: the thread counts derived from an instance vCPU
+// count have to fit under the hard-stop threshold derived from that same vCPU
+// count. pkg/autoscale cannot see this threshold (the import runs the other
+// way), so the agreement is pinned here.
+//
+// It matters below MinVCPUs specifically, because there the starting sizes are
+// the final ones — no controller engages, so a pool that starts over the
+// threshold stays over it, and the copy throttles on its own workers with
+// nothing else running on the box, at any table size. Above MinVCPUs the write
+// pool deliberately runs wider than the instance (redo-log waiters are IO-bound,
+// which is what the redo-aware signal excludes) and the controller can shed what
+// does not fit, so the same arithmetic is not expected to hold and is not
+// asserted.
+//
+// Both signals, because which one a copy gets is a privilege probe's answer
+// reached after the pools are sized. Sizes start at 2: that is Aurora's smallest
+// instance, and at 1 vCPU MinReadStartThreads alone is wider than the tighter
+// threshold.
+func TestSmallInstancePoolsFitTheThreshold(t *testing.T) {
+	for _, mode := range []threadsMode{redoAwareMode, globalStatusMode} {
+		for vCPUs := 2; vCPUs < autoscale.MinVCPUs; vCPUs++ {
+			readStart, _ := autoscale.ReadBounds(vCPUs)
+			writeStart := autoscale.WriteStart(vCPUs)
+			threshold := newTestAuroraThreads(t, int64(vCPUs), mode).throttleThreshold()
+
+			require.LessOrEqualf(t, int64(readStart+writeStart), threshold,
+				"%s at %d vCPUs: %d read + %d write threads against a hard-stop that trips above %d",
+				mode.label, vCPUs, readStart, writeStart, threshold)
+		}
+	}
+
+	// MinThreadsThrottleThreshold is what a caller sizing pools reads, so it has
+	// to be the tighter of the two thresholds above at every size.
+	for vCPUs := 1; vCPUs <= 128; vCPUs++ {
+		redoAware := newTestAuroraThreads(t, int64(vCPUs), redoAwareMode).throttleThreshold()
+		globalStatus := newTestAuroraThreads(t, int64(vCPUs), globalStatusMode).throttleThreshold()
+		require.Equalf(t, min(redoAware, globalStatus), int64(MinThreadsThrottleThreshold(vCPUs)),
+			"at %d vCPUs: redo-aware trips above %d, threads-running above %d", vCPUs, redoAware, globalStatus)
+	}
+
+	// The smallest instance, spelled out: redo-aware carries 1 of headroom and
+	// threads-running 2, so the tighter threshold is vCPUs + 1.
+	require.Equal(t, 3, MinThreadsThrottleThreshold(2))
+	require.Equal(t, 4, MinThreadsThrottleThreshold(3))
 }
 
 func TestAuroraThreads_HeadroomSparesSmallInstance(t *testing.T) {

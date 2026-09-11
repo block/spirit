@@ -183,6 +183,27 @@ func AuroraVCPUs(ctx context.Context, db *sql.DB) (int, error) {
 	return vCPUs, nil
 }
 
+// MinThreadsThrottleThreshold returns the tightest thread count the threads
+// hard-stop can trip above on an instance of the given vCPU count: the vCPU
+// count plus the smallest self-monitoring headroom any of the signals carries.
+//
+// It exists for callers that size thread pools from the same vCPU count, which
+// is the other half of the comparison the hard-stop makes. A pool whose total
+// exceeds this throttles on spirit's own threads with nothing else running on
+// the box, at any table size — so a pool sized from the instance and a
+// threshold sized from the instance have to be derived from the same number,
+// and this is how a sizing caller reads the threshold.
+//
+// It is the tightest rather than the mode's own because the mode is a privilege
+// probe's answer, made later and independently (AuroraSetup.Build), so the
+// count is not known at sizing time. Fitting under the tightest fits under
+// either. Note that globalStatusMode's threshold is the looser of the two only
+// because its signal also counts spirit's monitoring threads, which the pool
+// total does not include — fitting under it is necessary there, not sufficient.
+func MinThreadsThrottleThreshold(vCPUs int) int {
+	return vCPUs + int(min(redoAwareMode.headroom, globalStatusMode.headroom))
+}
+
 // ResolveMaxWriteThreads resolves the upper bound the write-thread autoscaler
 // may scale to: autoscale.Ceiling (start when scaling is off, 2 × start when on
 // — deliberately not configurable for now, to keep the experimental surface

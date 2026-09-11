@@ -14,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -52,8 +53,8 @@ type Migration struct {
 	Password     *string `name:"password" help:"Password" optional:""`
 	Database     string  `name:"database" help:"Database" optional:""`
 	ConfFile     string  `name:"conf" help:"MySQL conf file" optional:"" type:"existingfile"`
-	Threads      int     `name:"threads" help:"Number of concurrent threads for copy and checksum tasks. Ignored when --enable-experimental-autoscaling engages" optional:"" default:"4"`
-	WriteThreads int     `name:"write-threads" help:"Number of concurrent apply (write) threads. Ignored when --enable-experimental-autoscaling engages" optional:"" default:"4"`
+	Threads      int     `name:"threads" help:"Number of concurrent threads for copy and checksum tasks. Ignored when --enable-experimental-autoscaling sizes the pools from the instance" optional:"" default:"4"`
+	WriteThreads int     `name:"write-threads" help:"Number of concurrent apply (write) threads. Ignored when --enable-experimental-autoscaling sizes the pools from the instance" optional:"" default:"4"`
 
 	// MaxConnections is the size of the main connection pool, set verbatim and
 	// never recomputed (see the MaxOpenConnections assignment in Runner.Run).
@@ -73,13 +74,16 @@ type Migration struct {
 	// value too small for the migration to finish on; see minPoolSize.
 	MaxConnections int `name:"max-connections" help:"Size of the main connection pool. Copier, applier and flush workers all share it, and contend for connections rather than each being guaranteed one" optional:"" default:"128"`
 
-	// EnableExperimentalAutoscaling turns on dynamic thread scaling driven by
-	// throttler feedback. When it engages (an Aurora target with at least
-	// autoscale.MinVCPUs) it takes over both thread counts: Threads and
-	// WriteThreads are ignored, and each pool's starting size and ceiling are
-	// derived from the instance instead — see the override in
-	// setupCopierCheckerAndReplClient and autoscale.ReadBounds. See issue #831.
-	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: size the copy, apply and checksum thread pools from the instance and scale them on throttler feedback. Overrides --threads and --write-threads. Requires an Aurora target" optional:"" default:"false"`
+	// EnableExperimentalAutoscaling asks for thread counts derived from the
+	// target instance, and for dynamic scaling of them on throttler feedback.
+	//
+	// On any Aurora target it takes over both thread counts: Threads and
+	// WriteThreads are ignored, and each pool's starting size comes from the
+	// instance instead — see sizePoolsFromInstance and autoscale.ReadBounds. The
+	// scaling half additionally needs an instance of at least autoscale.MinVCPUs
+	// for the utilization signal to be worth steering on; below that the derived
+	// sizes are fixed for the whole migration. See issue #831.
+	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: size the copy, apply and checksum thread pools from the instance, and scale them on throttler feedback where the instance is large enough to steer on. Overrides --threads and --write-threads. Requires an Aurora target" optional:"" default:"false"`
 	// TargetChunkSize is the in-memory byte budget the copier sizes each copy
 	// chunk against (the memory signal; see table.DefaultTargetChunkBytes and
 	// pkg/table/README.md). A zero value means "use the default"
@@ -117,6 +121,11 @@ type Migration struct {
 	// useTestCutover is a test-only cutover
 	useTestCutover   bool
 	useTestThrottler bool
+	// testThrottler substitutes the throttler the runner would otherwise build,
+	// so a test can drive the copy's throttle path from a signal it controls
+	// rather than from a live target. useTestThrottler's mock is always
+	// throttled and exists to pace a copy; this one decides when to throttle.
+	testThrottler throttler.Throttler
 }
 
 // minPoolSize is the smallest --max-connections a migration can complete on.

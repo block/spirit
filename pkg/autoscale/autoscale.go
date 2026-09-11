@@ -67,6 +67,10 @@ const (
 	// The migration runner enforces it once, at setup, by disabling autoscaling
 	// for the whole migration; the controllers themselves never see a small
 	// instance.
+	//
+	// It bars the controller and nothing else. The derivations below (ReadBounds,
+	// WriteStart, FlushBounds) are pure functions of the instance size and stay
+	// in force underneath it — see ReadBounds.
 	MinVCPUs = 4
 
 	// VCPUReserve is how many vCPUs a pool sized from the instance leaves free,
@@ -237,8 +241,11 @@ func WriteStart(vCPUs int) int {
 // ReadBounds returns the starting size and ceiling for a read-side pool — the
 // copier's read workers and the checksum's workers — on an instance of the given
 // vCPU count: start at about a quarter of the instance, grow to at most half of
-// it. Callers must have already established that the instance is at least
-// MinVCPUs; below that no controller engages at all.
+// it. Both bounds are defined at every instance size. MinVCPUs is a bar on the
+// *controller* — on whether a pool may be re-sized on the utilization signal,
+// which is a feedback loop that needs a dead band to rest in — not on deriving
+// a size from the instance, which is arithmetic. A caller below MinVCPUs takes
+// the starting size and leaves the ceiling alone, since nothing will move it.
 //
 // This is deliberately not the write side's shape (start at vCPUs-VCPUReserve,
 // grow to 2x that), because the two pools are limited by different things. Write
@@ -292,10 +299,11 @@ func ReadBounds(vCPUs int) (start, ceiling int) {
 // (TestReplaceContendsOnlyOnUniqueIndexes in pkg/applier establishes the
 // premise: PK-adjacent rows do not contend, UNIQUE-secondary-adjacent rows do.)
 //
-// Callers must have already established that the instance is at least MinVCPUs;
-// below that they should not call this at all and the change package's defaults
-// apply. Small instances get today's values anyway, because the concurrency
-// floor is the historical default.
+// Like ReadBounds this is defined at every instance size, and for the same
+// reason: the drain is not steered by the utilization band, so MinVCPUs has
+// nothing to say about it. An instance small enough to hit the floors gets
+// exactly the change package's defaults, because the concurrency floor *is* the
+// historical default — pinned by TestFlushBoundsPreservesChangeDefaults.
 func FlushBounds(vCPUs int) (concurrency, batchSize int) {
 	concurrency = min(max(MinFlushConcurrency, WriteStart(vCPUs)), MaxFlushConcurrency)
 	return concurrency, FlushBatchSize(concurrency)

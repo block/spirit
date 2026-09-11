@@ -12,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/require"
 )
 
@@ -353,4 +354,22 @@ func NewTestRunnerFromStatement(t *testing.T, statement string, opts ...RunnerOp
 func NewTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	t.Helper()
 	return newTestMigration(t, opts...)
+}
+
+// WithThrottler substitutes the throttler the runner would build for itself, so
+// a test can drive the copy's throttle path from a signal it controls. Unlike
+// WithTestThrottler's always-throttled mock, this one decides when to throttle.
+func WithThrottler(t throttler.Throttler) RunnerOption {
+	return func(m *Migration) {
+		m.testThrottler = t
+	}
+}
+
+// WithTargetChunkSize sets the in-memory byte budget the copier sizes each copy
+// chunk against. Tests use a small value to hold the copy at many small chunks,
+// where the worker pool stays busy rather than draining between chunks.
+func WithTargetChunkSize(bytes uint64) RunnerOption {
+	return func(m *Migration) {
+		m.TargetChunkSize = bytes
+	}
 }
