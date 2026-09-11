@@ -117,24 +117,72 @@ func TestNewDSNDisablesTinyInt1IsBool(t *testing.T) {
 	// Go to build its INSERT, so spirit must always ask for integers: a stored
 	// 2 would otherwise be written as 1, and the value is unrecoverable by the
 	// time spirit sees it.
-	dsn := "root:password@tcp(127.0.0.1:3306)/test"
+	//
+	// Assert on the presence of tinyInt1IsBool=false rather than the absence of
+	// =true: the driver's default is true, so FormatDSN only writes the
+	// parameter when it is false. An untouched DSN carries no parameter at all,
+	// which reads as "bool mapping on".
+	inputs := []struct {
+		name string
+		dsn  string
+	}{
+		{"unset", "root:password@tcp(127.0.0.1:3306)/test"},
+		// Spirit requires exact values, so it overrides a caller who asked for
+		// the bool mapping rather than deferring to them.
+		{"caller_asked_for_bool", "root:password@tcp(127.0.0.1:3306)/test?tinyInt1IsBool=true"},
+	}
 
 	for _, tlsMode := range []string{"PREFERRED", "DISABLED"} {
-		t.Run(tlsMode, func(t *testing.T) {
-			config := NewDBConfig()
-			config.TLSMode = tlsMode
-			resp, err := newDSN(dsn, config)
-			require.NoError(t, err)
-			require.Contains(t, resp, "tinyInt1IsBool=false",
-				"DSN must disable the driver's tinyint(1)-to-bool mapping")
+		for _, input := range inputs {
+			t.Run(tlsMode+"/"+input.name, func(t *testing.T) {
+				config := NewDBConfig()
+				config.TLSMode = tlsMode
+				resp, err := newDSN(input.dsn, config)
+				require.NoError(t, err)
+				require.Contains(t, resp, "tinyInt1IsBool=false",
+					"DSN must disable the driver's tinyint(1)-to-bool mapping")
 
-			// Round-trip it: the flag has to survive parsing, since that is how
-			// the driver actually receives it.
-			cfg, err := mysql.ParseDSN(resp)
-			require.NoError(t, err)
-			require.Contains(t, cfg.FormatDSN(), "tinyInt1IsBool=false")
-		})
+				// Round-trip it: the flag has to survive parsing, since that is
+				// how the driver actually receives it.
+				cfg, err := mysql.ParseDSN(resp)
+				require.NoError(t, err)
+				require.Contains(t, cfg.FormatDSN(), "tinyInt1IsBool=false")
+			})
+		}
 	}
+}
+
+// TestConnectionReadsTinyInt1AsInteger proves the setting changes what the
+// driver returns, not just what the DSN says. The assertions above check the
+// DSN text; this checks the behavior every connection spirit opens gets, since
+// New is the single door onto newDSN.
+func TestConnectionReadsTinyInt1AsInteger(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS conn_tinyint1_scan")
+	testutils.RunSQL(t, "CREATE TABLE conn_tinyint1_scan (id INT NOT NULL PRIMARY KEY, flags TINYINT(1) NOT NULL)")
+	testutils.RunSQL(t, "INSERT INTO conn_tinyint1_scan VALUES (1, 0), (2, 1), (3, 2), (4, 127), (5, -128)")
+
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	rows, err := db.QueryContext(t.Context(), "SELECT id, flags FROM conn_tinyint1_scan ORDER BY id")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+
+	// Scan into any: a bool here means the driver collapsed the value, which is
+	// exactly what the copier cannot tolerate.
+	want := map[int]int64{1: 0, 2: 1, 3: 2, 4: 127, 5: -128}
+	seen := 0
+	for rows.Next() {
+		var id int
+		var flags any
+		require.NoError(t, rows.Scan(&id, &flags))
+		require.IsType(t, int64(0), flags, "tinyint(1) came back as %T, not an integer", flags)
+		require.Equal(t, want[id], flags, "tinyint(1) value changed for id=%d", id)
+		seen++
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, want, seen, "not every seeded row was read back")
 }
 
 func TestNewDSNAllowCleartextPasswords(t *testing.T) {

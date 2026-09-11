@@ -538,6 +538,12 @@ func NewWithConnectionType(inputDSN string, config *DBConfig, connectionType str
 // different one fails at connect time with "invalid value / unknown config
 // name", because TLS registries are per-driver package globals rather than
 // anything the DSN carries.
+//
+// This settles TLS and nothing else. The settings a spirit connection also
+// needs — interpolation, cleartext-password gating, integer tinyint(1) — are
+// applied by newDSN, so they reach a connection only via [New]. Spirit's own
+// replica path passes this result to [NewWithConnectionType] for exactly that
+// reason; a consumer that opens the result directly owns the rest itself.
 func EnhanceDSNWithTLS(inputDSN string, config *DBConfig) (string, error) {
 	// A nil config is "the caller said nothing about TLS", which is not the
 	// same as asking for none: leave the DSN alone and let whatever opens it
