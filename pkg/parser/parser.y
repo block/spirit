@@ -1342,7 +1342,7 @@ type likeEscapeSpec struct {
 	UserSpecList                           "Username and auth option list"
 	AlterUserSpec                          "ALTER USER username with optional auth option and dual-password clause"
 	AlterUserSpecList                      "ALTER USER spec list"
-	AuthOptionWithPassword                 "Auth option carrying a cleartext password (BY form), for RETAIN CURRENT PASSWORD"
+	AuthOptionWithPassword                 "Auth option that sets a new password (BY forms or WITH plugin AS hash), for RETAIN CURRENT PASSWORD"
 	UserVariableList                       "User defined variable name list"
 	UserToUser                             "rename user to user"
 	UserToUserList                         "rename user to user by list"
@@ -14171,9 +14171,11 @@ UserSpecList:
  * dual-password clauses (RETAIN CURRENT PASSWORD / DISCARD OLD PASSWORD)
  * alongside an auth option, with grammar-level enforcement of MySQL's
  * restrictions:
- *   - RETAIN attaches only to BY-form auth options (IDENTIFIED BY 'plain'
- *     or IDENTIFIED WITH plugin BY 'plain'). The hashed AS-form and the
- *     bare-plugin form are NOT accepted with RETAIN.
+ *   - RETAIN attaches only to auth options that set a new password: the
+ *     BY forms (IDENTIFIED BY 'plain', IDENTIFIED WITH plugin BY 'plain')
+ *     and the hashed IDENTIFIED WITH plugin AS '<hash>' form, which is what
+ *     MySQL's binlog rewrite emits. The bare-plugin form and the no-auth
+ *     form are NOT accepted with RETAIN. See AuthOptionWithPassword.
  *   - DISCARD OLD PASSWORD is a standalone clause; no auth option may
  *     accompany it on the same spec.
  *   - RETAIN / DISCARD are NOT exposed via UserSpec, so CREATE USER
