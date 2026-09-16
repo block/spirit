@@ -325,12 +325,23 @@ func TestExtractTablesFromAccountManagementDDL(t *testing.T) {
 		`ALTER USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$4` + "`" + `9\ZEe,SQp-jNF\Z2%prqVsmV8vllDVahK7UkkNl2yu/PDX95cYRuFQefimNhB' RETAIN CURRENT PASSWORD`,
 		// Rewritten from: SET PASSWORD = 'new' REPLACE 'old' RETAIN CURRENT PASSWORD
 		`ALTER USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$q8Ih3aX[gy||6|d33N0edvsEELBLTt9HE9XBFyrpVXVxuGIxzl6OgGsD.' RETAIN CURRENT PASSWORD`,
+		// Rewritten from: ALTER USER 'app_user' IDENTIFIED BY 'new'
+		// RETAIN CURRENT PASSWORD PASSWORD EXPIRE NEVER, which is what rotating
+		// a service account in one statement emits. This composes two
+		// productions rather than varying one: RETAIN CURRENT PASSWORD is
+		// consumed inside AlterUserSpec, which has no trailing options, while
+		// PASSWORD EXPIRE NEVER is consumed by the statement-level
+		// PasswordOrLockOptions after the spec list.
+		`ALTER USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$|:m(]TuDn{6H*` + "`" + `0(nwg37zRcPi4VGib7LCDS/912c3ha6GhIATk62f91fx9' RETAIN CURRENT PASSWORD PASSWORD EXPIRE NEVER`,
 		// Logged verbatim, without a rewrite.
 		`ALTER USER 'app_user'@'%' DISCARD OLD PASSWORD`,
+		`ALTER USER 'app_user'@'%' PASSWORD EXPIRE`,
+		`ALTER USER 'app_user'@'%' ACCOUNT LOCK`,
 		`CREATE USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$B\\Z>a4h:I|7\\"d{V69}zRA6wKA6c5HDj4R9qqZR84CMBwhkqcSXBSFXpOVjm3.'`,
 		`DROP USER IF EXISTS 'app_user'@'%'`,
 		`GRANT USAGE ON *.* TO 'app_user'@'%'`,
 		`GRANT APPLICATION_PASSWORD_ADMIN ON *.* TO 'app_user'@'%'`,
+		`REVOKE SELECT ON *.* FROM 'app_user'@'%'`,
 	}
 	for _, statement := range statements {
 		t.Run(statement, func(t *testing.T) {
