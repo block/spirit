@@ -14235,11 +14235,23 @@ AlterUserSpecList:
 	}
 
 /*
- * AuthOptionWithPassword is the subset of AuthOption that carries an explicit
- * cleartext password, i.e. the BY forms. RETAIN CURRENT PASSWORD is only
- * valid after one of these per MySQL 8.0 semantics (not with the WITH plugin
- * AS '<hash>' form, the bare IDENTIFIED WITH plugin form, or with no auth
- * option at all).
+ * AuthOptionWithPassword is the subset of AuthOption that supplies a new
+ * password for the primary slot, so RETAIN CURRENT PASSWORD has something to
+ * demote the old password beneath. That is the BY forms plus the
+ * WITH plugin AS '<hash>' form; the bare IDENTIFIED WITH plugin form and the
+ * no-auth-option form are excluded (MySQL rejects both with 1064).
+ *
+ * The AS '<hash>' form matters beyond hand-written SQL: MySQL rewrites every
+ * ALTER USER / SET PASSWORD that sets a password into this canonical shape
+ * before writing it to the binary log, preserving RETAIN CURRENT PASSWORD.
+ * A SET PASSWORD ... REPLACE ... RETAIN CURRENT PASSWORD is logged as
+ *   ALTER USER 'u'@'h' IDENTIFIED WITH 'caching_sha2_password'
+ *     AS '<hash>' RETAIN CURRENT PASSWORD
+ * so pkg/change must parse it to extract table names from Query events.
+ *
+ * Note the AS form takes no ReplacePasswordOpt: MySQL rejects both
+ * AS '<hash>' REPLACE '<old>' and AS '<hash>' DISCARD OLD PASSWORD with 1064,
+ * and its own binlog rewrite drops the REPLACE clause.
  */
 AuthOptionWithPassword:
 	"IDENTIFIED" "BY" AuthString ReplacePasswordOpt
@@ -14287,6 +14299,14 @@ AuthOptionWithPassword:
 			opt.ReplaceString = $7.(string)
 		}
 		$$ = opt
+	}
+|	"IDENTIFIED" "WITH" AuthPlugin "AS" HashString
+	{
+		$$ = &ast.AuthOption{
+			AuthPlugin:   $3,
+			HashString:   $5,
+			ByHashString: true,
+		}
 	}
 
 ConnectionOptions:

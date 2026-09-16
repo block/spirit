@@ -1752,13 +1752,22 @@ func TestDualPassword(t *testing.T) {
 		{"ALTER USER 'u1'@'%' DISCARD OLD PASSWORD, 'u2'@'%'", true, "ALTER USER `u1`@`%` DISCARD OLD PASSWORD, `u2`@`%`"},
 		{"SET PASSWORD = 'new' RETAIN CURRENT PASSWORD", true, "SET PASSWORD='new' RETAIN CURRENT PASSWORD"},
 		{"SET PASSWORD FOR 'u1'@'%' = 'new' RETAIN CURRENT PASSWORD", true, "SET PASSWORD FOR `u1`@`%`='new' RETAIN CURRENT PASSWORD"},
+		{"SET PASSWORD = 'new' REPLACE 'old' RETAIN CURRENT PASSWORD", true, "SET PASSWORD='new' REPLACE 'old' RETAIN CURRENT PASSWORD"},
 		// The current-user (USER()) form accepts both clauses.
 		{"ALTER USER USER() IDENTIFIED BY 'p1' RETAIN CURRENT PASSWORD", true, "ALTER USER USER() IDENTIFIED BY 'p1' RETAIN CURRENT PASSWORD"},
 		{"ALTER USER USER() DISCARD OLD PASSWORD", true, "ALTER USER USER() DISCARD OLD PASSWORD"},
 		{"ALTER USER IF EXISTS USER() IDENTIFIED BY 'p1' RETAIN CURRENT PASSWORD", true, "ALTER USER IF EXISTS USER() IDENTIFIED BY 'p1' RETAIN CURRENT PASSWORD"},
-		// Negative: RETAIN needs a cleartext password to promote, so the hashed
-		// AS-form, the bare plugin form, and the no-auth form are all rejected.
-		{"ALTER USER 'u1'@'%' IDENTIFIED WITH 'mysql_native_password' AS '*B50FBDB37F1256824274912F2A1CE648082C3F1F' RETAIN CURRENT PASSWORD", false, ""},
+		// The hashed AS-form accepts RETAIN CURRENT PASSWORD. This is the shape
+		// MySQL rewrites every password-setting ALTER USER / SET PASSWORD into
+		// before writing it to the binary log, so pkg/change depends on it.
+		{"ALTER USER 'u1'@'%' IDENTIFIED WITH 'mysql_native_password' AS '*B50FBDB37F1256824274912F2A1CE648082C3F1F' RETAIN CURRENT PASSWORD", true, "ALTER USER `u1`@`%` IDENTIFIED WITH 'mysql_native_password' AS '*B50FBDB37F1256824274912F2A1CE648082C3F1F' RETAIN CURRENT PASSWORD"},
+		{"ALTER USER 'u1'@'%' IDENTIFIED WITH caching_sha2_password AS '$A$005$hash' RETAIN CURRENT PASSWORD", true, "ALTER USER `u1`@`%` IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$hash' RETAIN CURRENT PASSWORD"},
+		{"ALTER USER IF EXISTS 'u1'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$hash' RETAIN CURRENT PASSWORD", true, "ALTER USER IF EXISTS `u1`@`%` IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$hash' RETAIN CURRENT PASSWORD"},
+		// Negative: the AS-form takes no REPLACE and no DISCARD (MySQL: 1064).
+		{"ALTER USER 'u1'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$hash' REPLACE 'old' RETAIN CURRENT PASSWORD", false, ""},
+		{"ALTER USER 'u1'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$hash' DISCARD OLD PASSWORD", false, ""},
+		// Negative: RETAIN needs a new password for the primary slot, so the
+		// bare plugin form and the no-auth form are rejected.
 		{"ALTER USER 'u1'@'%' IDENTIFIED WITH 'mysql_native_password' RETAIN CURRENT PASSWORD", false, ""},
 		{"ALTER USER 'u1'@'%' RETAIN CURRENT PASSWORD", false, ""},
 		// Negative: CREATE USER does not accept either clause per MySQL grammar.
