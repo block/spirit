@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -92,7 +94,8 @@ func TestChangeIntToBigIntPKResumeFromChkPt(t *testing.T) {
 func TestCheckpoint(t *testing.T) {
 	// This test manually steps through the migration process to verify
 	// watermark, checkpoint dump, and restore behavior.
-	// It uses specific INSERT patterns that produce exactly 11040 rows.
+	// It seeds about eleven thousand rows with bulk INSERT ... SELECT, which
+	// leaves auto_increment gaps, so ids are not contiguous.
 	//
 	// It drives the copier's synchronous CopyChunk API (copier.ChunkCopier)
 	// to complete chunks in a controlled order (2, 1, 3) and assert the
@@ -159,9 +162,15 @@ func TestCheckpoint(t *testing.T) {
 	require.Equal(t, "copyRows", r.status.Get().String())
 
 	// The status block: a header line, then one row per subsystem. chunk is 0
-	// until the first chunk is claimed, and the bar is empty at 0%.
+	// until the first chunk is claimed, and the bar is empty at 0%. The copier
+	// row counts settled rows against the table's row estimate, which comes
+	// from table statistics, so it is read from the table rather than pinned.
+	estimatedRows := atomic.LoadUint64(&r.changes[0].table.EstimatedRows)
+	var actualRows uint64
+	require.NoError(t, r.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM cpt1").Scan(&actualRows))
+	require.InEpsilon(t, actualRows, estimatedRows, 0.2, "the row estimate must be in the neighbourhood of the true count")
 	require.Contains(t, r.Status(), "migration status: state=copyRows total-time=")
-	require.Contains(t, r.Status(), "\n  copier    0.00%  0/11040  chunk-size=0  eta=")
+	require.Contains(t, r.Status(), fmt.Sprintf("\n  copier    0.00%%  0/%d  chunk-size=0  eta=", estimatedRows))
 	// The rows the change feed and the checkpoint dumper used to log for
 	// themselves, plus the applier pipeline snapshot.
 	// No write worker has started yet, so the applier row is the idle one. Every
@@ -200,17 +209,28 @@ func TestCheckpoint(t *testing.T) {
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk1))
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk3))
 
+	// The copier row counts the rows the three chunks settled. That is not
+	// three chunks' worth of ids: the first chunk is the open lower bound
+	// below the minimum id and copies nothing, and the bulk INSERT ... SELECT
+	// seed leaves auto_increment gaps, so the count is read from the new
+	// table rather than pinned.
+	var settled uint64
+	require.NoError(t, r.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _cpt1_new").Scan(&settled))
+	require.Positive(t, settled)
+	wantCopier := fmt.Sprintf("\n  copier  %6.2f%%  %d/%d  chunk-size=1000  eta=", float64(settled)/float64(estimatedRows)*100, settled, estimatedRows)
 	// The status update is asynchronous (the applier phones home after each
 	// chunk completes), so poll until it reflects all three copied chunks.
 	require.Eventually(t, func() bool {
-		return strings.Contains(r.Status(), "\n  copier   27.17%  3000/11040  chunk-size=1000  eta=")
-	}, 10*time.Second, 50*time.Millisecond, "status never reached expected copy progress; last status: %s", r.Status())
+		return strings.Contains(r.Status(), wantCopier)
+	}, 10*time.Second, 50*time.Millisecond, "status never reached expected copy progress; want %q in: %s", wantCopier, r.Status())
 
 	// The watermark should exist now, because migrateChunk()
 	// gives feedback back to table.
 	watermark, err := r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	chunkJSON, checkpointed := copierWatermark(t, watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", chunkJSON)
+	require.Equal(t, settled, checkpointed, "the checkpoint carries the settled row count")
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 	// Which the status block now reports in place of the checkpoint's own log
@@ -234,6 +254,12 @@ func TestCheckpoint(t *testing.T) {
 	// the watermark to this point so new watermarks "align" correctly.
 	// So lets now call NextChunk to verify.
 
+	// Before the resumed run copies anything, the API and the log block
+	// report the copy where the checkpoint left it, not from zero.
+	r.status.Set(status.CopyRows)
+	require.Equal(t, settled, r.Progress().Copy.RowsCopied)
+	require.Contains(t, r.Status(), fmt.Sprintf("  %d/%d  chunk-size=", settled, atomic.LoadUint64(&r.changes[0].table.EstimatedRows)))
+
 	ccopier, ok = r.copier.(copier.ChunkCopier)
 	require.True(t, ok)
 
@@ -245,9 +271,14 @@ func TestCheckpoint(t *testing.T) {
 	// It's ideally not typical but you can still dump checkpoint from
 	// a restored checkpoint state. We won't have advanced anywhere from
 	// the last checkpoint because on restore, the LowerBound is taken.
+	// In a migration the new table keeps the rows a re-copied chunk carries,
+	// so re-copying it settles nothing new and the count does not double up
+	// across the resume.
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	chunkJSON, checkpointed = copierWatermark(t, watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", chunkJSON)
+	require.Equal(t, settled, checkpointed)
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 
@@ -260,7 +291,48 @@ func TestCheckpoint(t *testing.T) {
 
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", watermark)
+	chunkJSON, checkpointed = copierWatermark(t, watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", chunkJSON)
+	require.Greater(t, checkpointed, settled, "rows copied after the resume add to the restored count")
+
+	// The copy aggregate reported to the metrics sink is per invocation: the
+	// count restored from the checkpoint is excluded, and the chunks are the
+	// eleven this runner copied.
+	sink := &copyAggregateSink{}
+	r.status.SetMetricsSink(sink, r.logger)
+	r.recordCopyCompleted()
+	require.Equal(t, r.copyChunker.RowsCopied()-settled, sink.rows)
+	require.Equal(t, uint64(11), sink.chunks)
+}
+
+// copyAggregateSink records the copy aggregate the runner reports when the
+// copy completes.
+type copyAggregateSink struct {
+	rows, chunks uint64
+}
+
+func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
+	for _, v := range m.Values {
+		switch v.Name {
+		case metrics.CopyRowsCompletedMetricName:
+			s.rows = uint64(v.Value)
+		case metrics.CopyChunksCompletedMetricName:
+			s.chunks = uint64(v.Value)
+		}
+	}
+	return nil
+}
+
+// copierWatermark decodes the copy chunker's checkpoint into the chunk
+// position and the settled row count it carries.
+func copierWatermark(t *testing.T, watermark string) (string, uint64) {
+	var envelope struct {
+		ChunkJSON  string
+		RowsCopied uint64
+	}
+	require.NoError(t, json.Unmarshal([]byte(watermark), &envelope))
+	require.NotEmpty(t, envelope.ChunkJSON)
+	return envelope.ChunkJSON, envelope.RowsCopied
 }
 
 func TestCheckpointRestore(t *testing.T) {

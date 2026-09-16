@@ -5,23 +5,11 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/copier"
+	"github.com/block/spirit/pkg/copier/copiertest"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/require"
 )
-
-type progressCopier struct{ copier.Copier }
-
-func (progressCopier) GetProgress() string { return "50%" }
-func (progressCopier) GetETA() string      { return "1m" }
-func (progressCopier) GetETAState() status.ETA {
-	return status.ETA{State: status.ETAReady, Duration: time.Minute}
-}
-func (progressCopier) CopyProgress() status.CopyProgress {
-	return status.CopyProgress{RowsCopied: 50, RowsTotal: 100}
-}
-func (progressCopier) ChunkSize() uint64 { return 25 }
 
 type progressApplier struct{ applier.Applier }
 
@@ -31,21 +19,44 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	r, err := NewRunner(&Sync{})
 	require.NoError(t, err)
 	require.Empty(t, r.Progress().ETA)
-	r.copyChunker = table.NewMultiChunker(table.NewMockChunker("b", 100), table.NewMockChunker("a", 200))
-	r.copier = progressCopier{}
-	r.applier = progressApplier{}
+	b := table.NewMockChunker("b", 100)
+	a := table.NewMockChunker("a", 200)
+	b.Feedback(nil, 0, 30) // rows settled by the applier
+	a.Feedback(nil, 0, 40)
+	r.copyChunker = table.NewMultiChunker(b, a)
+	// With a chunker but no copier, the API and the log block agree: settled
+	// rows from the chunker, and an ETA that is not yet measured.
 	r.status.Set(status.CopyRows)
 	p := r.Progress()
+	require.Equal(t, status.CopyProgress{RowsCopied: 70, RowsTotal: 300}, p.Copy)
+	require.Equal(t, status.ETA{State: status.ETAMeasuring}, p.ETA)
+	require.Equal(t, "70/300 23.33% copyRows ETA TBD", p.Summary)
+	require.Contains(t, r.Status(), " 23.33%  70/300  chunk-size=0  eta=TBD")
+	r.copier = copiertest.Stub{
+		ETA: status.ETA{State: status.ETAReady, Duration: time.Minute},
+		// The copier's own measure, which neither Progress nor Status may report.
+		Copy:  status.CopyProgress{RowsCopied: 7, RowsTotal: 9},
+		Chunk: 25,
+	}
+	r.applier = progressApplier{}
+	r.status.Set(status.CopyRows)
+	p = r.Progress()
 	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
+	require.Equal(t, status.CopyProgress{RowsCopied: 70, RowsTotal: 300}, p.Copy) // Both counters summed across Tables.
+	require.Equal(t, "70/300 23.33% copyRows ETA 1m0s", p.Summary)
 	require.Len(t, p.Tables, 2)
 	require.Less(t, p.Tables[0].TableName, p.Tables[1].TableName)
 	block := r.Status()
 	for _, text := range []string{"copier-time=", "\n  copier", "\n  applier", "\n  binlog", "\n  ckpt"} {
 		require.Contains(t, block, text)
 	}
+	// The log block reports the same copy measure as the API, on the same tick.
+	require.Contains(t, block, " 23.33%  70/300  chunk-size=25  eta=1m0s")
+	require.NotContains(t, block, "7/9")
 	r.status.Set(status.ApplyChangeset)
 	require.Empty(t, r.Progress().ETA)
-	require.Empty(t, r.Progress().Checksum) // The continuous verifier has no finite initial-checksum phase.
+	require.Equal(t, status.CopyProgress{RowsCopied: 70, RowsTotal: 300}, r.Progress().Copy) // The copy reading outlives the copy phase.
+	require.Empty(t, r.Progress().Checksum)                                                  // The continuous verifier has no finite initial-checksum phase.
 	r.status.Set(status.RestoreSecondaryIndexes)
 	block = r.Status()
 	require.Contains(t, block, "state-time=")

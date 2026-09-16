@@ -26,3 +26,16 @@ func TablesFromChunker(chunker table.Chunker) []TableProgress {
 	slices.SortFunc(rows, func(a, b TableProgress) int { return strings.Compare(a.TableName, b.TableName) })
 	return rows
 }
+
+// CopyFromTables sums a per-table snapshot into the runner-wide copy progress.
+// Deriving it from the same snapshot is what lets Progress.Copy and
+// Progress.Tables reconcile: both count settled rows against the tables'
+// cardinality estimates, whichever chunker is doing the copying.
+func CopyFromTables(tables []TableProgress) CopyProgress {
+	var c CopyProgress
+	for _, t := range tables {
+		c.RowsCopied += t.RowsCopied
+		c.RowsTotal += t.RowsTotal
+	}
+	return c
+}

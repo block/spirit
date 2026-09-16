@@ -8,6 +8,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// CopyFromTables sums both counters across every table, so a multi-table
+// aggregate cannot quietly follow a single table.
+func TestCopyFromTables(t *testing.T) {
+	require.Equal(t, CopyProgress{}, CopyFromTables(nil))
+	require.Equal(t, CopyProgress{RowsCopied: 50, RowsTotal: 100},
+		CopyFromTables([]TableProgress{{TableName: "a", RowsCopied: 50, RowsTotal: 100}}))
+	require.Equal(t, CopyProgress{RowsCopied: 271, RowsTotal: 350}, CopyFromTables([]TableProgress{
+		{TableName: "a", RowsCopied: 50, RowsTotal: 100},
+		{TableName: "b", RowsCopied: 20, RowsTotal: 200},
+		{TableName: "c", RowsCopied: 201, RowsTotal: 50, IsComplete: true}, // settled rows may exceed the estimate
+	}))
+}
+
 func TestTablesFromChunker(t *testing.T) {
 	require.Empty(t, TablesFromChunker(nil))
 	a := table.NewMockChunker("items", 100)

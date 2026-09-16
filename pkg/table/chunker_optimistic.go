@@ -2,6 +2,7 @@ package table
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -337,7 +338,8 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string) error {
 		}
 		t.checkpointHighPtr = checkpointHighPtr
 	}
-	chunk, err := newChunkFromJSON(t.Ti, cp)
+	chunkJSON, settled := unwrapWatermark(cp)
+	chunk, err := newChunkFromJSON(t.Ti, chunkJSON)
 	if err != nil {
 		return err
 	}
@@ -369,6 +371,10 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string) error {
 		ptrVal -= minVal
 	}
 	t.rowsCopied = ptrVal
+	// Settled rows cannot be derived from the key space, so they are
+	// restored from the checkpoint. A watermark written before the count
+	// was recorded carries none, and the count restarts at zero.
+	t.actualRowsCopied.Store(settled)
 	return nil
 }
 
@@ -651,11 +657,21 @@ func (t *chunkerOptimistic) GetLowWatermark() (string, error) {
 		return "", ErrWatermarkNotReady
 	}
 
-	watermark, err := t.watermark.marshalJSON()
+	chunkJSON, err := t.watermark.marshalJSON()
 	if err != nil {
 		return "", fmt.Errorf("could not serialize watermark: %w", err)
 	}
-	return watermark, nil
+	// The settled row count travels with the position so a resumed run
+	// reports the copy where it left off. The keyspace position needs no
+	// such record: OpenAtWatermark re-derives it from the chunk pointer.
+	watermark, err := json.Marshal(watermarkEnvelope{
+		ChunkJSON:  chunkJSON,
+		RowsCopied: t.actualRowsCopied.Load(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("could not serialize watermark envelope: %w", err)
+	}
+	return string(watermark), nil
 }
 
 func (t *chunkerOptimistic) open() (err error) {

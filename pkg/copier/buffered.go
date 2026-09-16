@@ -643,20 +643,9 @@ func (c *buffered) ChunkSize() uint64 {
 	return c.chunkSize.Load()
 }
 
+// GetETA renders GetETAState for the status block.
 func (c *buffered) GetETA() string {
-	c.Lock()
-	defer c.Unlock()
-	copiedRows, totalRows, pct := c.getCopyStats()
-	estimate, st := etaEstimate(copiedRows, totalRows, pct, c.rowsPerSecond.Load(), c.startTime)
-	switch st {
-	case status.ETADue:
-		return "DUE"
-	case status.ETAMeasuring:
-		return "TBD"
-	case status.ETAReady, status.ETANone:
-		// A ready estimate is formatted below; ETANone cannot occur during copy.
-	}
-	return estimate.String()
+	return c.GetETAState().String()
 }
 
 func (c *buffered) GetETAState() status.ETA {
