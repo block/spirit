@@ -58,6 +58,12 @@ type sourceInfo struct {
 // Runner executes a Sync: an initial copy followed by continuous
 // replication that runs until the context is cancelled.
 type Runner struct {
+	// Published before background work starts; external feeds read the signal
+	// through TargetUnderLoad, which uses progMu.
+	loadSignal throttler.Throttler
+	monitorDB  *sql.DB
+	autoscale  copier.AutoscaleConfig
+
 	sourceUUID string // server owning file:position checkpoints
 	sync       *Sync
 
@@ -530,6 +536,11 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		}
 	}()
 
+	// The copy controller has exited. Keep write scaling alive for repairs
+	// during continuous verification, and join it before stopping the applier.
+	stopScaling := copier.StartWriteAutoscaler(ctx, r.currentLoadSignal(), r.applier, r.autoscale, r.logger, r.metricsSink)
+	defer stopScaling()
+
 	// Construct the recopier — invoked by the checker when retry detects
 	// stable target divergence. Without one configured, the checker would
 	// instead return ErrPermanentDivergence and abort the sync.
@@ -542,6 +553,8 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		r.source.db, r.target.DB, chunker, r.replClient,
 		checksum.ContinuousCheckerConfig{
 			Concurrency:     r.sync.Threads,
+			Throttler:       r.currentLoadSignal(),
+			Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
 			MinPassInterval: checksum.ContinuousMinPassInterval,
 			Recopier:        recopier,
 			Logger:          r.logger,
@@ -658,6 +671,10 @@ func (r *Runner) setup(ctx context.Context) error {
 		return nil
 	}
 
+	if err := r.setupAutoscaling(ctx); err != nil {
+		return err
+	}
+
 	r.logger.Info("Creating applier")
 	appl, err := r.createApplier()
 	if err != nil {
@@ -718,6 +735,7 @@ func (r *Runner) setup(ctx context.Context) error {
 		replConfig.CancelFunc = r.fatalError
 		replConfig.DDLFilterSchema = r.source.config.DBName
 		replConfig.DBConfig = r.sourceDBConfig
+		replConfig.UnderLoad = r.TargetUnderLoad
 		client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig, pos)
 		if err != nil {
 			return err
@@ -1170,7 +1188,8 @@ func (r *Runner) buildCopyPipeline() error {
 	cp, err := copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.sync.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.currentLoadSignal(),
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.sourceDBConfig,
 		Applier:     r.applier,
@@ -1543,6 +1562,12 @@ func (r *Runner) Close() error {
 	// The individual close calls are independent enough that running them
 	// all does no harm.
 	var errs []error
+	if r.loadSignal != nil {
+		errs = append(errs, r.loadSignal.Close())
+	}
+	if r.monitorDB != nil {
+		errs = append(errs, r.monitorDB.Close())
+	}
 	if r.copyChunker != nil {
 		if err := r.copyChunker.Close(); err != nil {
 			errs = append(errs, err)
@@ -1632,8 +1657,7 @@ func (r *Runner) Progress() status.Progress {
 		Resume:       r.resuming.Load(),
 		Tables:       tables,
 		ETA:          eta,
-		// Throttle is deliberately left zero: a sync copies through a Noop
-		// throttler, so there is nothing to report yet.
+		Throttle:     r.throttleStatus(state),
 	}
 }
 
@@ -1662,15 +1686,13 @@ func (r *Runner) Status() string {
 		// before there is a copier to report on.
 		if cp != nil {
 			progress := cp.CopyProgress()
-			// No throttled= here, unlike migrate and move: a sync copies
-			// through a Noop throttler, so the field would be a constant
-			// false.
-			b.Row("copier", "%6.2f%%  %d/%d  chunk-size=%d  eta=%s",
+			b.Row("copier", "%6.2f%%  %d/%d  chunk-size=%d  eta=%s  throttled=%t",
 				progress.Fraction()*100,
 				progress.RowsCopied,
 				progress.RowsTotal,
 				cp.ChunkSize(),
 				cp.GetETA(),
+				r.TargetUnderLoad(),
 			)
 		}
 		b.Row("applier", "%s", applier.StatusRow(appl))

@@ -14,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1136,4 +1137,70 @@ func TestHotChunkExactAttemptLimit(t *testing.T) {
 			require.Equal(t, stats.MismatchesThisPass, stats.PassedSecondAttemptThisPass+stats.PassedUnder5AttemptsThisPass+stats.PassedUnder10AttemptsThisPass+stats.RecopiesThisPass+stats.HotChunksDeferredThisPass)
 		})
 	}
+}
+
+func TestContinuousAutoscaleConcurrency(t *testing.T) {
+	old := csTick
+	csTick = 2 * time.Millisecond
+	defer func() { csTick = old }()
+	cfg := fastConfig()
+	cfg.Concurrency = 1
+	cfg.Autoscale = AutoscaleConfig{Enabled: true, MaxThreads: 3}
+	cfg.Throttler = &gradualStub{util: 0.1}
+	entered := make(chan struct{}, 10)
+	release := make(chan struct{})
+	c := newTestChecker(t, newTestChunker(20), cfg, func(ctx context.Context, _ *table.Chunk, _ int) (int64, int64, uint64, error) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return 1, 1, 1, ctx.Err()
+	})
+	stop, _ := runUntil(t, c)
+	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
+	for range 3 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("controller did not grow checksum concurrency")
+		}
+	}
+	select {
+	case <-entered:
+		t.Fatal("exceeded checksum ceiling")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+type blockingContinuousLoad struct {
+	throttler.Noop
+	entered chan struct{}
+}
+
+func (b *blockingContinuousLoad) BlockWait(ctx context.Context) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+}
+
+func TestContinuousThrottleCancellation(t *testing.T) {
+	cfg := fastConfig()
+	load := &blockingContinuousLoad{entered: make(chan struct{}, 1)}
+	cfg.Throttler = load
+	var reads atomic.Int64
+	c := newTestChecker(t, newTestChunker(10), cfg, func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+		reads.Add(1)
+		return 1, 1, 1, nil
+	})
+	stop, _ := runUntil(t, c)
+	select {
+	case <-load.entered:
+	case <-time.After(time.Second):
+		t.Fatal("checker did not consult throttler")
+	}
+	require.ErrorIs(t, stop(), context.Canceled)
+	require.Zero(t, reads.Load())
 }

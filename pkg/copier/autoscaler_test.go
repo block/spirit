@@ -809,3 +809,31 @@ func TestAutoScalerBusiestHostCanChange(t *testing.T) {
 	}
 	require.Equal(t, 3, writer.n, "a different busy host continues shedding after cooldown")
 }
+
+// This is the injected-applier path: its constructor count need not match the
+// instance-derived count, and Start resets it on every phase transition.
+func TestWriteAutoscalerLifecycle(t *testing.T) {
+	tt := testutils.NewTestTable(t, "write_autoscaler_lifecycle", "CREATE TABLE write_autoscaler_lifecycle (id INT PRIMARY KEY)")
+	cfg := applier.NewApplierDefaultConfig()
+	cfg.Threads = 16
+	a, err := applier.NewSingleTargetApplier(applier.Target{DB: tt.DB}, cfg)
+	require.NoError(t, err)
+	logger := slog.New(slog.DiscardHandler)
+	signal := &utilThrottler{}
+	signal.setUtil(1.2)
+	old := acTick
+	acTick = 2 * time.Millisecond
+	defer func() { acTick = old }()
+	for range 2 {
+		require.NoError(t, a.Start(t.Context()))
+		stop := StartWriteAutoscaler(t.Context(), signal, a, AutoscaleConfig{Enabled: true, StartThreads: 4, MaxThreads: 8}, logger, nil)
+		require.Eventually(t, func() bool { return a.ActiveWriteWorkers() <= 2 }, time.Second, time.Millisecond)
+		stop()
+		signal.setUtil(0.1)
+		stop = StartWriteAutoscaler(t.Context(), signal, a, AutoscaleConfig{Enabled: true, StartThreads: 4, MaxThreads: 8}, logger, nil)
+		require.Eventually(t, func() bool { return a.ActiveWriteWorkers() == 8 }, time.Second, time.Millisecond)
+		stop()
+		require.NoError(t, a.Stop())
+		signal.setUtil(1.2)
+	}
+}
