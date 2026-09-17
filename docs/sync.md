@@ -197,3 +197,24 @@ remain portable across servers, subject to the normal GTID resume checks.
 `--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). Worker counts may exceed the budget and wait for connections. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
 
 Sync’s continuous checker uses ordinary reads rather than pinned snapshot pools, and sync has no cutover. It therefore does not require move’s checksum/cutover headroom or lower configured read concurrency to fit that headroom.
+
+## Verification of hot ranges
+
+When a mismatching checksum range changes on two successive retries, sync
+splits it around an existing source primary key: a lower range, that key alone,
+and an upper range. The surrounding ranges remain covered even where the source
+currently has no rows, so target-only rows and missing inserts are not skipped.
+Composite and textual keys use MySQL's ordering rather than numeric midpoints.
+
+Children are independently verified in the same pass, without restarting ranges
+that already passed or inheriting their parent's checksum. Split children do not
+feed the main chunker's walk-progress estimate. Status logs show `hot-split`;
+emitted counts include both split parents and their children, while passed
+counts exclude split parents.
+
+Splitting is bounded to 32 levels and 1,024 split attempts per pass. A single-row
+range, an empty source range, or an exhausted split budget continues through the
+normal bounded retry/deferral path. A deferred range still prevents the pass
+from being verified. This improves convergence when a large range contains a few
+hot rows; it does not establish a common source/target stream position for a row
+that changes continuously.

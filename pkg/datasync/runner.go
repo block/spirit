@@ -542,6 +542,7 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		r.source.db, r.target.DB, chunker, r.replClient,
 		checksum.ContinuousCheckerConfig{
 			Concurrency:     r.sync.Threads,
+			SplitHotChunks:  true,
 			MinPassInterval: checksum.ContinuousMinPassInterval,
 			Recopier:        recopier,
 			Logger:          r.logger,
@@ -1690,7 +1691,7 @@ func (r *Runner) Status() string {
 		b.Row("binlog", "position=%s  deltas=%d  %s", pos, pending, change.StatusRow(repl))
 		if checker != nil {
 			stats := checker.Stats()
-			b.Row("verify", "pass=%d  estimated-progress=%.1f%%  passed=%d  emitted=%d  retry-queue=%d  hot=%d  in-flight=%d  mismatches=%d  recopies=%d  hot-deferred=%d  walker-stalls=%d  permanent-failures=%d",
+			b.Row("verify", "pass=%d  estimated-progress=%.1f%%  passed=%d  emitted=%d  retry-queue=%d  hot=%d  in-flight=%d  mismatches=%d  recopies=%d  hot-deferred=%d  hot-split=%d  walker-stalls=%d  permanent-failures=%d",
 				stats.CurrentPass,
 				float64(stats.ProgressBasisPoints)/100,
 				stats.ChunksPassedThisPass,
@@ -1701,6 +1702,7 @@ func (r *Runner) Status() string {
 				stats.MismatchesThisPass,
 				stats.RecopiesThisPass,
 				stats.HotChunksDeferredThisPass,
+				stats.HotChunksSplitThisPass,
 				stats.WalkerStalls,
 				stats.PermanentFailures,
 			)
