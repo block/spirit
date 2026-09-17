@@ -45,7 +45,7 @@ func TestHotSplitCoverage(t *testing.T) {
 					require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+p.String()).Scan(&count))
 					children, err := splitHotChunk(t.Context(), db, p, count)
 					require.NoError(t, err)
-					if count == 0 {
+					if count <= 1 {
 						require.Empty(t, children)
 						continue
 					}
@@ -101,7 +101,7 @@ func TestHotSplitKeepsEmptyGaps(t *testing.T) {
 	require.Empty(t, children)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err = splitHotChunk(ctx, db, parent, 1)
+	_, err = splitHotChunk(ctx, db, parent, 2)
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -186,15 +186,15 @@ func TestHotSplitLimitsAndErrors(t *testing.T) {
 		{splitDepth: hotSplitDepthLimit, consecutiveSrcChanged: 2},
 		{consecutiveSrcChanged: 0},
 	} {
-		require.False(t, c.trySplitHot(t.Context(), &workResult{item: item}))
+		require.False(t, c.trySplitHot(t.Context(), &workResult{item: item, newSrc: chunkSig{count: 2}}))
 	}
 	require.Zero(t, calls)
-	res := &workResult{item: &workItem{consecutiveSrcChanged: 2}}
+	res := &workResult{item: &workItem{consecutiveSrcChanged: 2}, newSrc: chunkSig{count: 2}}
 	require.True(t, c.trySplitHot(t.Context(), res))
 	require.ErrorIs(t, res.err, boom)
 	require.ErrorIs(t, c.handleResult(res, nil), boom)
 	c.splitAttempts.Store(hotSplitPassLimit)
-	require.False(t, c.trySplitHot(t.Context(), &workResult{item: &workItem{consecutiveSrcChanged: 2}}))
+	require.False(t, c.trySplitHot(t.Context(), &workResult{item: &workItem{consecutiveSrcChanged: 2}, newSrc: chunkSig{count: 2}}))
 	require.Equal(t, 1, calls)
 }
 
@@ -278,4 +278,42 @@ func TestHotSplitRecursesToRow(t *testing.T) {
 	require.Equal(t, uint64(7), stats.ChunksPassedThisPass)
 	require.Equal(t, uint64(10), stats.ChunksThisPass)
 	require.Zero(t, stats.HotChunksDeferredThisPass)
+}
+
+func TestHotSplitSmallRangesKeepRetryEvidence(t *testing.T) {
+	for _, rows := range []uint64{0, 1} {
+		t.Run(fmt.Sprint(rows), func(t *testing.T) {
+			// Neither helper may query or consume budget for an observed small range.
+			children, err := splitHotChunk(t.Context(), nil, nil, rows)
+			require.NoError(t, err)
+			require.Empty(t, children)
+			cfg := fastConfig()
+			cfg.SplitHotChunks = true
+			cfg.RetryDelay = time.Millisecond
+			cfg.MinPassInterval = time.Hour
+			cfg.MaxHotAttempts = 4
+			var reads atomic.Int64
+			c := newTestChecker(t, newTestChunker(1), cfg, func(_ context.Context, _ *table.Chunk, attempt int) (int64, int64, uint64, error) {
+				reads.Add(1)
+				return int64(attempt * 100), -1, rows, nil
+			})
+			c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) {
+				return nil, errors.New("small range must not try splitting")
+			}
+			stop, _ := runUntil(t, c)
+			defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
+			require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, time.Second, time.Millisecond)
+			stats := c.Stats()
+			require.Zero(t, c.splitAttempts.Load())
+			require.Zero(t, stats.HotChunksSplitThisPass)
+			require.Zero(t, stats.ChunksPassedThisPass)
+			require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
+			require.Equal(t, int64(cfg.MaxHotAttempts), reads.Load())
+			select {
+			case <-c.FirstCleanPass():
+				t.Fatal("unresolved small range must not verify")
+			default:
+			}
+		})
+	}
 }

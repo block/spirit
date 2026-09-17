@@ -909,7 +909,7 @@ func (c *ContinuousChecker) worker(
 // unbounded. A failed SQL query fails verification, never marks a range clean.
 func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bool {
 	item := res.item
-	if !c.cfg.SplitHotChunks || item.point || item.splitDepth >= hotSplitDepthLimit || item.consecutiveSrcChanged < 1 {
+	if !c.cfg.SplitHotChunks || item.point || res.newSrc.count <= 1 || item.splitDepth >= hotSplitDepthLimit || item.consecutiveSrcChanged < 1 {
 		return false
 	}
 	if c.splitAttempts.Add(1) > hotSplitPassLimit {

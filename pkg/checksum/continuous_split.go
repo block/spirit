@@ -16,6 +16,11 @@ const hotSplitQueryTimeout = 30 * time.Second
 // currently present. Actual SQL key ordering supports composite, textual, and
 // binary keys without inventing a numeric midpoint or comparing keys in Go.
 func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows uint64) ([]*table.Chunk, error) {
+	// Counts come from the latest checksum read. Singleton and empty ranges
+	// retain their retry evidence rather than creating empty siblings.
+	if rows <= 1 {
+		return nil, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, hotSplitQueryTimeout)
 	defer cancel()
 	if len(parent.Key) == 0 || parent.Table == nil {
