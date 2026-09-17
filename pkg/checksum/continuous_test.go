@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -1065,4 +1066,74 @@ func TestStatsReportsInFlightWork(t *testing.T) {
 	require.Eventually(t, func() bool { return c.Stats().InFlight == 0 }, time.Second, time.Millisecond)
 	err := stop()
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
+}
+
+// Distinct units ensure progress cannot accidentally use emitted chunks.
+type estimateChunker struct {
+	*testChunker
+	progress, emitted, total uint64
+}
+
+func (c *estimateChunker) Progress() (uint64, uint64, uint64) {
+	return c.progress, c.emitted, c.total
+}
+
+func TestProgressEstimateUnitsAndBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		progress, total, want uint64
+	}{
+		{"quarter", 250, 1000, 2500},
+		{"overestimate", 1500, 1000, 10000},
+		{"unknown total", 250, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunker := &estimateChunker{newTestChunker(4), tc.progress, 3, tc.total}
+			c := newTestChecker(t, chunker, fastConfig(), nil)
+			require.Equal(t, tc.want, c.Stats().ProgressBasisPoints)
+		})
+	}
+}
+
+func TestDeferredHotChunkDoesNotBlockLaterCleanPass(t *testing.T) {
+	cfg := fastConfig()
+	cfg.MaxHotAttempts = 3
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(_ context.Context, _ *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			if attempt <= 3 {
+				return int64(attempt), 0, 1000, nil
+			}
+			return 42, 42, 1000, nil
+		})
+	stop, _ := runUntil(t, c)
+	t.Cleanup(func() { _ = stop() })
+	select {
+	case <-c.FirstCleanPass():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no clean pass after hot chunk settled: %+v", c.Stats())
+	}
+	require.GreaterOrEqual(t, c.Stats().PassesCompleted, uint64(2))
+	require.Zero(t, c.Stats().HotChunksDeferredThisPass)
+}
+
+func TestHotChunkExactAttemptLimit(t *testing.T) {
+	for _, limit := range []int{1, 2, 3, 5} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			cfg := fastConfig()
+			cfg.MaxHotAttempts = limit
+			cfg.MinPassInterval = time.Hour
+			var reads atomic.Int64
+			c := newTestChecker(t, newTestChunker(1), cfg,
+				func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+					return reads.Add(1), 0, 1000, nil
+				})
+			stop, _ := runUntil(t, c)
+			t.Cleanup(func() { _ = stop() })
+			require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, 2*time.Second, time.Millisecond)
+			require.Equal(t, int64(max(2, limit)), reads.Load())
+			stats := c.Stats()
+			require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
+			require.Equal(t, stats.MismatchesThisPass, stats.PassedSecondAttemptThisPass+stats.PassedUnder5AttemptsThisPass+stats.PassedUnder10AttemptsThisPass+stats.RecopiesThisPass+stats.HotChunksDeferredThisPass)
+		})
+	}
 }

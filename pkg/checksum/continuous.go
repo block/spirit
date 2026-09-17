@@ -164,7 +164,9 @@ type ContinuousCheckerConfig struct {
 	// MaxHotAttempts is the number of observations allowed for a chunk whose
 	// source signature keeps changing. Once reached, the chunk is deferred to
 	// the next pass rather than holding the current pass open forever. Default
-	// 10. Deferral never counts as verification and makes the pass not clean.
+	// 10; a positive value below 2 is clamped to 2 because detecting a source
+	// change requires an initial read and a retry. Deferral never counts as
+	// verification and makes the pass not clean.
 	MaxHotAttempts int
 
 	// Recopier is invoked when the retry path detects stable target
@@ -233,10 +235,11 @@ type ContinuousCheckerStats struct {
 
 	// MismatchesThisPass is how many chunks mismatched on their initial
 	// (fresh-walk) read in the current pass and were enqueued for retry.
-	// On a clean pass this equals PassedSecondAttemptThisPass +
+	// At the end of a completed pass this equals PassedSecondAttemptThisPass +
 	// PassedUnder5AttemptsThisPass + PassedUnder10AttemptsThisPass +
-	// RecopiesThisPass — i.e. every chunk that needed at least one retry
-	// to converge. Resets each pass.
+	// RecopiesThisPass + HotChunksDeferredThisPass. A completed pass may
+	// contain repairs or deferrals and therefore need not be clean. Resets
+	// each pass.
 	MismatchesThisPass uint64
 
 	// Per-pass histogram of attempts-to-converge. "attempts" counts every
@@ -475,6 +478,7 @@ func NewContinuousChecker(
 	if cfg.MaxHotAttempts <= 0 {
 		cfg.MaxHotAttempts = DefaultContinuousMaxHotAttempts
 	}
+	cfg.MaxHotAttempts = max(2, cfg.MaxHotAttempts)
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}

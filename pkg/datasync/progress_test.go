@@ -54,6 +54,8 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	block = r.Status()
 	require.Contains(t, block, "\n  verify")
 	require.Contains(t, block, "retry-queue=0  hot=0  in-flight=0")
+	require.Contains(t, block, "estimated-progress=0.0%  passed=0  emitted=0")
+	require.Contains(t, block, "walker-stalls=0  permanent-failures=0")
 	r.status.Set(status.RestoreSecondaryIndexes)
 	block = r.Status()
 	require.Contains(t, block, "state-time=")

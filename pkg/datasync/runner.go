@@ -1690,7 +1690,7 @@ func (r *Runner) Status() string {
 		b.Row("binlog", "position=%s  deltas=%d  %s", pos, pending, change.StatusRow(repl))
 		if checker != nil {
 			stats := checker.Stats()
-			b.Row("verify", "pass=%d  progress=%.2f%%  clean=%d/%d  retry-queue=%d  hot=%d  in-flight=%d  mismatches=%d  recopies=%d  hot-deferred=%d",
+			b.Row("verify", "pass=%d  estimated-progress=%.1f%%  passed=%d  emitted=%d  retry-queue=%d  hot=%d  in-flight=%d  mismatches=%d  recopies=%d  hot-deferred=%d  walker-stalls=%d  permanent-failures=%d",
 				stats.CurrentPass,
 				float64(stats.ProgressBasisPoints)/100,
 				stats.ChunksPassedThisPass,
@@ -1701,6 +1701,8 @@ func (r *Runner) Status() string {
 				stats.MismatchesThisPass,
 				stats.RecopiesThisPass,
 				stats.HotChunksDeferredThisPass,
+				stats.WalkerStalls,
+				stats.PermanentFailures,
 			)
 		}
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
