@@ -242,6 +242,9 @@ feed the main chunker's walk-progress estimate. Status logs show `hot-split`;
 emitted counts include both split parents and their children, while passed
 counts exclude split parents.
 
+A failed split query logs a warning and retains the normal bounded retries;
+it cannot mark a range verified. Cancelling the sync still stops verification.
+
 Splitting is bounded to 32 levels and 1,024 split attempts per pass. A single-row
 range, an empty source range, or an exhausted split budget continues through the
 normal bounded retry/deferral path. A deferred range still prevents the pass

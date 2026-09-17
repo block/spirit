@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
@@ -50,6 +51,9 @@ func TestHotSplitCoverage(t *testing.T) {
 						continue
 					}
 					require.Len(t, children, 3)
+					var leftRows uint64
+					require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+children[0].String()).Scan(&leftRows))
+					require.Equal(t, count/2, leftRows, "split pivot must be the median")
 					var predicates []string
 					for _, ch := range children {
 						require.Same(t, p.Table, ch.Table)
@@ -190,12 +194,18 @@ func TestHotSplitLimitsAndErrors(t *testing.T) {
 	}
 	require.Zero(t, calls)
 	res := &workResult{item: &workItem{consecutiveSrcChanged: 2}, newSrc: chunkSig{count: 2}}
-	require.True(t, c.trySplitHot(t.Context(), res))
-	require.ErrorIs(t, res.err, boom)
-	require.ErrorIs(t, c.handleResult(res, nil), boom)
+	require.False(t, c.trySplitHot(t.Context(), res))
+	require.NoError(t, res.err)
+	require.Empty(t, res.children)
+	// The second successive change already qualifies, not a retry later.
+	c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) {
+		calls++
+		return []*table.Chunk{newTestChunk(0, 1)}, nil
+	}
+	require.True(t, c.trySplitHot(t.Context(), &workResult{item: &workItem{consecutiveSrcChanged: 1}, newSrc: chunkSig{count: 2}}))
 	c.splitAttempts.Store(hotSplitPassLimit)
 	require.False(t, c.trySplitHot(t.Context(), &workResult{item: &workItem{consecutiveSrcChanged: 2}, newSrc: chunkSig{count: 2}}))
-	require.Equal(t, 1, calls)
+	require.Equal(t, 2, calls)
 }
 
 func TestHotSplitReadback(t *testing.T) {
@@ -277,6 +287,8 @@ func TestHotSplitRecursesToRow(t *testing.T) {
 	require.Equal(t, uint64(3), stats.HotChunksSplitThisPass)
 	require.Equal(t, uint64(7), stats.ChunksPassedThisPass)
 	require.Equal(t, uint64(10), stats.ChunksThisPass)
+	require.Equal(t, stats.MismatchesThisPass, stats.PassedSecondAttemptThisPass+stats.PassedUnder5AttemptsThisPass+stats.PassedUnder10AttemptsThisPass+stats.RecopiesThisPass+stats.HotChunksDeferredThisPass+stats.HotChunksSplitThisPass)
+
 	require.Zero(t, stats.HotChunksDeferredThisPass)
 }
 
@@ -316,4 +328,79 @@ func TestHotSplitSmallRangesKeepRetryEvidence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHotSplitTemporalKeys(t *testing.T) {
+	for _, parseTime := range []bool{false, true} {
+		for _, kind := range []string{"DATE", "DATETIME(6)", "TIMESTAMP(6)"} {
+			t.Run(fmt.Sprintf("%s_%t", strings.Split(kind, "(")[0], parseTime), func(t *testing.T) {
+				schema, _ := testutils.CreateUniqueTestDatabase(t)
+				cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(schema))
+				require.NoError(t, err)
+				cfg.ParseTime = parseTime
+				if cfg.Params == nil {
+					cfg.Params = make(map[string]string)
+				}
+				cfg.Params["sql_mode"] = "'NO_ENGINE_SUBSTITUTION'"
+				cfg.Params["time_zone"] = "'+00:00'"
+				db, err := sql.Open("block-mysql", cfg.FormatDSN())
+				require.NoError(t, err)
+				defer func() { require.NoError(t, db.Close()) }()
+				_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id "+kind+", n INT, PRIMARY KEY(id,n))")
+				require.NoError(t, err)
+				values := "('0000-00-00',0),('2026-01-01',1),('2026-01-02',2)"
+				if kind != "DATE" {
+					values = "('0000-00-00 00:00:00',0),('2026-01-01 01:02:03.123456',1),('2026-01-01 01:02:03.123457',2)"
+				}
+				_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES "+values)
+				require.NoError(t, err)
+				ti := table.NewTableInfo(db, schema, "t")
+				require.NoError(t, ti.SetInfo(t.Context()))
+				parent := &table.Chunk{Key: []string{"id", "n"}, Table: ti}
+				for _, count := range []uint64{3, 1000} { // median and stale-count fallback to zero date
+					children, err := splitHotChunk(t.Context(), db, parent, count)
+					require.NoError(t, err)
+					require.Len(t, children, 3)
+					var terms []string
+					for _, ch := range children {
+						terms = append(terms, "("+ch.String()+")")
+					}
+					var bad, point int
+					require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE ("+strings.Join(terms, "+")+") <> 1").Scan(&bad))
+					require.Zero(t, bad)
+					require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+children[1].String()).Scan(&point))
+					require.Equal(t, 1, point)
+				}
+			})
+		}
+	}
+}
+
+func TestHotSplitFailureDefersWithoutVerification(t *testing.T) {
+	cfg := fastConfig()
+	cfg.SplitHotChunks = true
+	cfg.MaxHotAttempts = 4
+	cfg.RetryDelay = time.Millisecond
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg, func(_ context.Context, _ *table.Chunk, n int) (int64, int64, uint64, error) {
+		return int64(n * 100), -1, 10, nil
+	})
+	c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) {
+		return nil, context.DeadlineExceeded
+	}
+	stop, _ := runUntil(t, c)
+	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
+	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, time.Second, time.Millisecond)
+	require.Equal(t, uint64(1), c.Stats().HotChunksDeferredThisPass)
+	require.Zero(t, c.Stats().ChunksPassedThisPass)
+	select {
+	case <-c.FirstCleanPass():
+		t.Fatal("failed split cannot verify")
+	default:
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	res := &workResult{item: &workItem{consecutiveSrcChanged: 1}, newSrc: chunkSig{count: 2}}
+	require.True(t, c.trySplitHot(ctx, res))
+	require.ErrorIs(t, res.err, context.Canceled)
 }

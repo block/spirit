@@ -939,7 +939,8 @@ func (c *ContinuousChecker) worker(
 
 // trySplitHot only runs after two successive source changes. Splits are bounded
 // independently of retries, so resetting child evidence cannot make a pass
-// unbounded. A failed SQL query fails verification, never marks a range clean.
+// unbounded. A failed split keeps the normal retry/deferral policy; splitting
+// is optional and never grants verification. Parent cancellation still aborts.
 func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bool {
 	item := res.item
 	if !c.cfg.SplitHotChunks || item.point || res.newSrc.count <= 1 || item.splitDepth >= hotSplitDepthLimit || item.consecutiveSrcChanged < 1 {
@@ -949,7 +950,16 @@ func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bo
 		return false
 	}
 	res.children, res.err = c.splitChunk(ctx, item.chunk, res.newSrc.count)
-	return res.err != nil || len(res.children) != 0
+	if res.err != nil {
+		if ctx.Err() != nil {
+			res.err = ctx.Err()
+			return true
+		}
+		c.cfg.Logger.Warn("continuous checksum: split failed; retaining bounded retries", "error", res.err)
+		res.children, res.err = nil, nil
+		return false
+	}
+	return len(res.children) != 0
 }
 
 // executeWork runs the source+target read for a single workItem and applies

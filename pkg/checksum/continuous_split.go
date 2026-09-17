@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
@@ -27,7 +28,22 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 		return nil, errors.New("hot range has no source key metadata")
 	}
 	keys := table.QuoteColumns(parent.Key)
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1 OFFSET ?", keys, parent.Table.QuotedTableName, parent.String(), keys)
+	// Preserve the server's temporal representation even with parseTime=true,
+	// including fractional seconds and zero dates. Ordering remains on native keys.
+	projections := make([]string, len(parent.Key))
+	for i, name := range parent.Key {
+		projections[i] = table.QuoteColumns([]string{name})
+		tp, ok := parent.Table.GetColumnMySQLType(name)
+		if !ok {
+			return nil, fmt.Errorf("missing split key type for %s", name)
+		}
+		base, _, _ := strings.Cut(strings.ToUpper(tp), "(")
+		switch base {
+		case "DATE", "DATETIME", "TIMESTAMP", "TIME":
+			projections[i] = "CAST(" + projections[i] + " AS CHAR)"
+		}
+	}
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1 OFFSET ?", strings.Join(projections, ","), parent.Table.QuotedTableName, parent.String(), keys)
 	values := make([]any, len(parent.Key))
 	pointers := make([]any, len(values))
 	for i := range values {
@@ -36,7 +52,7 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 	err := db.QueryRowContext(ctx, query, rows/2).Scan(pointers...)
 	// The count came from a prior read: deletes may have removed the median.
 	// Retry at the first existing key; an empty source is left to normal retry.
-	if errors.Is(err, sql.ErrNoRows) && rows/2 > 0 {
+	if errors.Is(err, sql.ErrNoRows) {
 		err = db.QueryRowContext(ctx, query, 0).Scan(pointers...)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
