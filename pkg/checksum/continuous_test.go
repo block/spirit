@@ -676,6 +676,41 @@ func TestDivergenceIsFatalReconcilesApplyLag(t *testing.T) {
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
 }
 
+func TestHotChunkDuringFeedDrainIsBounded(t *testing.T) {
+	var sourceCRC atomic.Int64
+	sourceCRC.Store(100)
+	feed := &fakeFeed{flushFn: func(context.Context) error {
+		sourceCRC.Add(1)
+		return nil
+	}}
+	cfg := fastConfig()
+	cfg.DivergenceIsFatal = true
+	cfg.MaxHotAttempts = 3
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+			// Stable between retries, changing only inside Flush. Every retry
+			// must take the post-drain hot-chunk branch.
+			return sourceCRC.Load(), 99, 1000, nil
+		})
+	c.feed = feed
+	stop, _ := runUntil(t, c)
+	t.Cleanup(func() { _ = stop() })
+	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 },
+		2*time.Second, time.Millisecond)
+	stats := c.Stats()
+	require.Equal(t, int64(2), feed.flushes.Load())
+	require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
+	require.Zero(t, stats.ChunksPassedThisPass)
+	require.Zero(t, stats.PermanentFailures)
+	require.Zero(t, stats.RetryQueueDepth)
+	select {
+	case <-c.FirstCleanPass():
+		t.Fatal("a deferred chunk must not establish a clean pass")
+	default:
+	}
+}
+
 // TestDivergenceIsFatalStillAbortsAfterDrain guards the fix above: a genuine
 // divergence — one the feed drain does NOT reconcile — must still return
 // ErrPermanentDivergence. The drain rules out apply lag; it must not mask real

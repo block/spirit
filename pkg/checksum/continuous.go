@@ -981,9 +981,9 @@ func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *wo
 			return res
 		}
 		if newSrc != item.originalSrc {
-			// The source changed again while we drained — treat it as a hot
-			// chunk and re-enqueue (handleResult re-queues a retry result that
-			// is neither passed nor permanent) instead of declaring divergence.
+			// Apply the same hot-chunk bound as the pre-drain comparison:
+			// changes observed only during Flush must not bypass the limit.
+			res.deferHot = item.attempts+1 >= c.cfg.MaxHotAttempts
 			return res
 		}
 		// Source still unchanged and target still wrong after a full drain →
