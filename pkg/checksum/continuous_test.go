@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -354,6 +355,35 @@ func TestHotChunkConverges(t *testing.T) {
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
 }
 
+// TestPermanentlyHotChunkDefersToNextPass covers the tail-stall case: one
+// continuously changing chunk cannot grow the retry queue, so without a
+// per-chunk bound it would keep pass 1 open forever. Deferral completes the
+// pass without claiming the chunk was verified or firing FirstCleanPass.
+func TestPermanentlyHotChunkDefersToNextPass(t *testing.T) {
+	chunker := newTestChunker(1)
+	cfg := fastConfig()
+	cfg.MaxHotAttempts = 3
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, chunker, cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return int64(attempt), 0, 1000, nil
+		},
+	)
+
+	stop, _ := runUntil(t, c)
+	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, 2*time.Second, time.Millisecond)
+	stats := c.Stats()
+	require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
+	require.Equal(t, uint64(0), stats.ChunksPassedThisPass)
+	select {
+	case <-c.FirstCleanPass():
+		t.Fatal("FirstCleanPass fired for a pass that deferred a hot chunk")
+	default:
+	}
+	err := stop()
+	require.True(t, errors.Is(err, context.Canceled) || err == nil)
+}
+
 // TestPermanentDivergence: chunk mismatches initially; on retry, source CRC
 // unchanged but target CRC still wrong ⇒ ErrPermanentDivergence.
 func TestPermanentDivergence(t *testing.T) {
@@ -645,6 +675,41 @@ func TestDivergenceIsFatalReconcilesApplyLag(t *testing.T) {
 
 	err := stop()
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
+}
+
+func TestHotChunkDuringFeedDrainIsBounded(t *testing.T) {
+	var sourceCRC atomic.Int64
+	sourceCRC.Store(100)
+	feed := &fakeFeed{flushFn: func(context.Context) error {
+		sourceCRC.Add(1)
+		return nil
+	}}
+	cfg := fastConfig()
+	cfg.DivergenceIsFatal = true
+	cfg.MaxHotAttempts = 3
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+			// Stable between retries, changing only inside Flush. Every retry
+			// must take the post-drain hot-chunk branch.
+			return sourceCRC.Load(), 99, 1000, nil
+		})
+	c.feed = feed
+	stop, _ := runUntil(t, c)
+	t.Cleanup(func() { _ = stop() })
+	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 },
+		2*time.Second, time.Millisecond)
+	stats := c.Stats()
+	require.Equal(t, int64(2), feed.flushes.Load())
+	require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
+	require.Zero(t, stats.ChunksPassedThisPass)
+	require.Zero(t, stats.PermanentFailures)
+	require.Zero(t, stats.RetryQueueDepth)
+	select {
+	case <-c.FirstCleanPass():
+		t.Fatal("a deferred chunk must not establish a clean pass")
+	default:
+	}
 }
 
 // TestDivergenceIsFatalStillAbortsAfterDrain guards the fix above: a genuine
@@ -955,4 +1020,120 @@ func TestMultiplePassesResetCounters(t *testing.T) {
 	resets := chunker.resets
 	chunker.mu.Unlock()
 	require.GreaterOrEqual(t, resets, 1, "chunker should have been reset between passes")
+}
+
+func TestStatsReportsChunkerProgress(t *testing.T) {
+	chunker := newTestChunker(4)
+	c := newTestChecker(t, chunker, fastConfig(),
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return 42, 42, 1000, nil
+		},
+	)
+
+	_, err := chunker.Next()
+	require.NoError(t, err)
+	require.Equal(t, uint64(2500), c.Stats().ProgressBasisPoints)
+
+	for range 3 {
+		_, err = chunker.Next()
+		require.NoError(t, err)
+	}
+	require.Equal(t, uint64(10000), c.Stats().ProgressBasisPoints)
+}
+
+func TestStatsReportsInFlightWork(t *testing.T) {
+	chunker := newTestChunker(1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cfg := fastConfig()
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, chunker, cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			close(started)
+			select {
+			case <-ctx.Done():
+				return 0, 0, 0, ctx.Err()
+			case <-release:
+				return 42, 42, 1000, nil
+			}
+		},
+	)
+
+	stop, _ := runUntil(t, c)
+	<-started
+	require.Equal(t, 1, c.Stats().InFlight)
+	close(release)
+	require.Eventually(t, func() bool { return c.Stats().InFlight == 0 }, time.Second, time.Millisecond)
+	err := stop()
+	require.True(t, errors.Is(err, context.Canceled) || err == nil)
+}
+
+// Distinct units ensure progress cannot accidentally use emitted chunks.
+type estimateChunker struct {
+	*testChunker
+	progress, emitted, total uint64
+}
+
+func (c *estimateChunker) Progress() (uint64, uint64, uint64) {
+	return c.progress, c.emitted, c.total
+}
+
+func TestProgressEstimateUnitsAndBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		progress, total, want uint64
+	}{
+		{"quarter", 250, 1000, 2500},
+		{"overestimate", 1500, 1000, 10000},
+		{"unknown total", 250, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunker := &estimateChunker{newTestChunker(4), tc.progress, 3, tc.total}
+			c := newTestChecker(t, chunker, fastConfig(), nil)
+			require.Equal(t, tc.want, c.Stats().ProgressBasisPoints)
+		})
+	}
+}
+
+func TestDeferredHotChunkDoesNotBlockLaterCleanPass(t *testing.T) {
+	cfg := fastConfig()
+	cfg.MaxHotAttempts = 3
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(_ context.Context, _ *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			if attempt <= 3 {
+				return int64(attempt), 0, 1000, nil
+			}
+			return 42, 42, 1000, nil
+		})
+	stop, _ := runUntil(t, c)
+	t.Cleanup(func() { _ = stop() })
+	select {
+	case <-c.FirstCleanPass():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no clean pass after hot chunk settled: %+v", c.Stats())
+	}
+	require.GreaterOrEqual(t, c.Stats().PassesCompleted, uint64(2))
+	require.Zero(t, c.Stats().HotChunksDeferredThisPass)
+}
+
+func TestHotChunkExactAttemptLimit(t *testing.T) {
+	for _, limit := range []int{1, 2, 3, 5} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			cfg := fastConfig()
+			cfg.MaxHotAttempts = limit
+			cfg.MinPassInterval = time.Hour
+			var reads atomic.Int64
+			c := newTestChecker(t, newTestChunker(1), cfg,
+				func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+					return reads.Add(1), 0, 1000, nil
+				})
+			stop, _ := runUntil(t, c)
+			t.Cleanup(func() { _ = stop() })
+			require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, 2*time.Second, time.Millisecond)
+			require.Equal(t, int64(max(2, limit)), reads.Load())
+			stats := c.Stats()
+			require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
+			require.Equal(t, stats.MismatchesThisPass, stats.PassedSecondAttemptThisPass+stats.PassedUnder5AttemptsThisPass+stats.PassedUnder10AttemptsThisPass+stats.RecopiesThisPass+stats.HotChunksDeferredThisPass)
+		})
+	}
 }

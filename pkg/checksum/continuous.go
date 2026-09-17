@@ -43,9 +43,11 @@
 //       full drain returns ErrPermanentDivergence.
 //
 // Hot chunks slow but do not block pass completion: they cycle to the back
-// of the FIFO while other entries resolve. A genuinely permanently-hot row
-// will eventually fill the retry queue; the configurable MaxQueueSize then
-// trips an error rather than letting the verifier silently fall behind.
+// of the FIFO while other entries resolve. After MaxHotAttempts observations,
+// a still-changing chunk is deferred to the next pass. The pass is not clean
+// and the chunk is never reported as verified, but a small number of hot rows
+// cannot leave one pass open forever. MaxQueueSize independently applies
+// backpressure when many chunks are awaiting retries.
 //
 // # First-clean-pass signal
 //
@@ -119,6 +121,11 @@ type Recopier interface {
 const (
 	DefaultContinuousConcurrency  = 4
 	DefaultContinuousMaxQueueSize = 1024
+	// DefaultContinuousMaxHotAttempts bounds how long one continuously
+	// changing chunk can hold a pass open. The initial read counts as attempt
+	// one. A deferred hot chunk makes the pass ineligible to be clean and is
+	// visited again from a fresh chunk walk on the next pass.
+	DefaultContinuousMaxHotAttempts = 10
 )
 
 // Shared continuous-checksum pacing. Vars (not consts) so tests can shorten
@@ -153,6 +160,14 @@ type ContinuousCheckerConfig struct {
 	// exceeded, Run returns an error rather than silently falling behind on
 	// verification. Default 1024.
 	MaxQueueSize int
+
+	// MaxHotAttempts is the number of observations allowed for a chunk whose
+	// source signature keeps changing. Once reached, the chunk is deferred to
+	// the next pass rather than holding the current pass open forever. Default
+	// 10; a positive value below 2 is clamped to 2 because detecting a source
+	// change requires an initial read and a retry. Deferral never counts as
+	// verification and makes the pass not clean.
+	MaxHotAttempts int
 
 	// Recopier is invoked when the retry path detects stable target
 	// divergence (src CRC unchanged across a retry window, target still
@@ -193,7 +208,8 @@ type ContinuousCheckerConfig struct {
 // fields are point-in-time; for monotonic totals, sample successively.
 type ContinuousCheckerStats struct {
 	// PassesCompleted is the number of passes finished so far. A pass
-	// completes when every chunk has resolved (READ-verified or recopied);
+	// completes when every chunk has resolved (READ-verified, recopied, or
+	// explicitly deferred as continuously hot);
 	// only a pass with zero recopies counts as clean for the
 	// FirstCleanPass signal.
 	PassesCompleted uint64
@@ -210,12 +226,20 @@ type ContinuousCheckerStats struct {
 	// current pass (either initially or via retry).
 	ChunksPassedThisPass uint64
 
+	// ProgressBasisPoints estimates how far the chunker has walked through the
+	// current pass, from 0 to 10000. Chunk sizes adapt while the pass runs, so
+	// ChunksThisPass is only the number emitted so far and can never be an
+	// honest denominator. Chunker.Progress supplies a stable-enough fraction
+	// over keyspace distance or estimated rows, depending on the chunker.
+	ProgressBasisPoints uint64
+
 	// MismatchesThisPass is how many chunks mismatched on their initial
 	// (fresh-walk) read in the current pass and were enqueued for retry.
-	// On a clean pass this equals PassedSecondAttemptThisPass +
+	// At the end of a completed pass this equals PassedSecondAttemptThisPass +
 	// PassedUnder5AttemptsThisPass + PassedUnder10AttemptsThisPass +
-	// RecopiesThisPass — i.e. every chunk that needed at least one retry
-	// to converge. Resets each pass.
+	// RecopiesThisPass + HotChunksDeferredThisPass. A completed pass may
+	// contain repairs or deferrals and therefore need not be clean. Resets
+	// each pass.
 	MismatchesThisPass uint64
 
 	// Per-pass histogram of attempts-to-converge. "attempts" counts every
@@ -237,6 +261,11 @@ type ContinuousCheckerStats struct {
 	// pass before FirstCleanPass can fire.
 	RecopiesThisPass uint64
 
+	// HotChunksDeferredThisPass is the number of continuously changing chunks
+	// deferred after MaxHotAttempts. They are not counted as passed; any value
+	// greater than zero makes this pass ineligible for FirstCleanPass.
+	HotChunksDeferredThisPass uint64
+
 	// RetryQueueDepth is the current size of the delayed-retry queue.
 	RetryQueueDepth int
 
@@ -244,6 +273,11 @@ type ContinuousCheckerStats struct {
 	// with consecutiveSrcChanged >= 2 — i.e. a chunk that has been observed
 	// changing on the source across multiple retry windows.
 	HotChunkCount int
+
+	// InFlight is the number of checksum reads or recopies currently executing.
+	// Together with RetryQueueDepth it distinguishes work waiting for another
+	// observation from a slow query that has not returned yet.
+	InFlight int
 
 	// WalkerStalls is the lifetime count of times the dispatcher refused
 	// to read a fresh chunk from the walker because the retry queue was
@@ -300,10 +334,12 @@ type ContinuousChecker struct {
 	passedUnder5AttemptsThisPass  atomic.Uint64 // 3-4 attempts
 	passedUnder10AttemptsThisPass atomic.Uint64 // 5+ attempts via retry
 	recopiesThisPass              atomic.Uint64 // chunks rewritten by Recopier
+	hotChunksDeferredThisPass     atomic.Uint64 // unstable chunks revisited next pass
 
 	permanentFailures atomic.Uint64
 	retryQueueDepth   atomic.Int64
 	hotChunkCount     atomic.Int64
+	inFlight          atomic.Int64
 	walkerStalls      atomic.Uint64
 
 	statsMu          sync.RWMutex
@@ -400,6 +436,11 @@ type workResult struct {
 	// with no self-heal path. Run will exit with ErrPermanentDivergence.
 	permanent bool
 
+	// deferHot is true when a continuously changing chunk reached the bounded
+	// attempt limit. It resolves the work item for this pass without claiming
+	// the chunk passed; the next pass walks it again from scratch.
+	deferHot bool
+
 	// err is set on any read or query failure (or a Recopy failure); the
 	// dispatcher returns it from Run.
 	err error
@@ -434,6 +475,10 @@ func NewContinuousChecker(
 	if cfg.MaxQueueSize <= 0 {
 		cfg.MaxQueueSize = DefaultContinuousMaxQueueSize
 	}
+	if cfg.MaxHotAttempts <= 0 {
+		cfg.MaxHotAttempts = DefaultContinuousMaxHotAttempts
+	}
+	cfg.MaxHotAttempts = max(2, cfg.MaxHotAttempts)
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -526,6 +571,8 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 		c.passedUnder5AttemptsThisPass.Store(0)
 		c.passedUnder10AttemptsThisPass.Store(0)
 		c.recopiesThisPass.Store(0)
+		c.hotChunksDeferredThisPass.Store(0)
+		c.inFlight.Store(0)
 
 		// Debug-level so production logs aren't swamped on a many-pass
 		// steady state — the pass-complete line at Info is the summary
@@ -550,12 +597,21 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 		// once a full pass needs no repairs at all. This mirrors the
 		// differencesFound == 0 follow-up-pass rule in SingleChecker /
 		// DistributedChecker.
-		if recopies := c.recopiesThisPass.Load(); recopies == 0 {
+		recopies := c.recopiesThisPass.Load()
+		deferredHot := c.hotChunksDeferredThisPass.Load()
+		if recopies == 0 && deferredHot == 0 {
 			c.signalFirstCleanPass()
-		} else {
+		}
+		if recopies > 0 {
 			c.cfg.Logger.Info("continuous checksum: pass contained recopies; repaired chunks will be re-verified next pass",
 				"pass_number", passNum,
 				"recopies", recopies,
+			)
+		}
+		if deferredHot > 0 {
+			c.cfg.Logger.Info("continuous checksum: pass contained continuously changing chunks; they will be retried next pass",
+				"pass_number", passNum,
+				"hot_chunks_deferred", deferredHot,
 			)
 		}
 		c.cfg.Logger.Info("continuous checksum pass complete",
@@ -566,6 +622,7 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 			"under_5_attempts", c.passedUnder5AttemptsThisPass.Load(),
 			"under_10_attempts", c.passedUnder10AttemptsThisPass.Load(),
 			"recopies", c.recopiesThisPass.Load(),
+			"hot_chunks_deferred", deferredHot,
 			"duration", time.Since(passStart).Round(time.Millisecond).String(),
 		)
 	}
@@ -720,6 +777,7 @@ func (c *ContinuousChecker) runOnePass(ctx context.Context, workCh chan<- *workI
 				}
 			}
 			inFlight++
+			c.inFlight.Store(int64(inFlight))
 
 		case item, ok := <-walkRecv:
 			if dueTimer != nil {
@@ -745,6 +803,7 @@ func (c *ContinuousChecker) runOnePass(ctx context.Context, workCh chan<- *workI
 				dueTimer.Stop()
 			}
 			inFlight--
+			c.inFlight.Store(int64(inFlight))
 			if err := c.handleResult(res, enqueueRetry); err != nil {
 				return err
 			}
@@ -861,7 +920,12 @@ func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *wo
 	}
 	if newSrc != item.originalSrc {
 		// Hot chunk — source kept changing. Re-enqueued with new state by
-		// the dispatcher; res.passed stays false, res.permanent stays false.
+		// the dispatcher until the bounded attempt limit. At that point defer
+		// it to the next pass without claiming it verified; a small number of
+		// permanently hot chunks must not hold one pass open forever.
+		if item.attempts+1 >= c.cfg.MaxHotAttempts {
+			res.deferHot = true
+		}
 		return res
 	}
 
@@ -921,9 +985,9 @@ func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *wo
 			return res
 		}
 		if newSrc != item.originalSrc {
-			// The source changed again while we drained — treat it as a hot
-			// chunk and re-enqueue (handleResult re-queues a retry result that
-			// is neither passed nor permanent) instead of declaring divergence.
+			// Apply the same hot-chunk bound as the pre-drain comparison:
+			// changes observed only during Flush must not bypass the limit.
+			res.deferHot = item.attempts+1 >= c.cfg.MaxHotAttempts
 			return res
 		}
 		// Source still unchanged and target still wrong after a full drain →
@@ -944,6 +1008,18 @@ func (c *ContinuousChecker) handleResult(res *workResult, enqueueRetry func(*ret
 	if res.passed {
 		c.chunksPassedThisPass.Add(1)
 		c.bucketPassed(res.item, res.recopied)
+		return nil
+	}
+	if res.deferHot {
+		c.hotChunksDeferredThisPass.Add(1)
+		c.cfg.Logger.Info("continuous checksum: hot chunk deferred to next pass",
+			"chunk", res.item.chunk.String(),
+			"attempts", res.item.attempts+1,
+			"sourceCRC", res.newSrc.crc,
+			"targetCRC", res.newTgt.crc,
+			"sourceCount", res.newSrc.count,
+			"targetCount", res.newTgt.count,
+		)
 		return nil
 	}
 	if res.permanent {
@@ -1107,19 +1183,27 @@ func (c *ContinuousChecker) Stats() ContinuousCheckerStats {
 	c.statsMu.RLock()
 	firstAt := c.firstCleanPassAt
 	c.statsMu.RUnlock()
+	progress, _, total := c.chunker.Progress()
+	var progressBasisPoints uint64
+	if total > 0 {
+		progressBasisPoints = min(uint64(float64(progress)/float64(total)*10000), 10000)
+	}
 	return ContinuousCheckerStats{
 		PassesCompleted:               c.passesCompleted.Load(),
 		CurrentPass:                   c.currentPass.Load(),
 		ChunksThisPass:                c.chunksThisPass.Load(),
 		ChunksPassedThisPass:          c.chunksPassedThisPass.Load(),
+		ProgressBasisPoints:           progressBasisPoints,
 		MismatchesThisPass:            c.mismatchesThisPass.Load(),
 		PassedFirstAttemptThisPass:    c.passedFirstAttemptThisPass.Load(),
 		PassedSecondAttemptThisPass:   c.passedSecondAttemptThisPass.Load(),
 		PassedUnder5AttemptsThisPass:  c.passedUnder5AttemptsThisPass.Load(),
 		PassedUnder10AttemptsThisPass: c.passedUnder10AttemptsThisPass.Load(),
 		RecopiesThisPass:              c.recopiesThisPass.Load(),
+		HotChunksDeferredThisPass:     c.hotChunksDeferredThisPass.Load(),
 		RetryQueueDepth:               int(c.retryQueueDepth.Load()),
 		HotChunkCount:                 int(c.hotChunkCount.Load()),
+		InFlight:                      int(c.inFlight.Load()),
 		WalkerStalls:                  c.walkerStalls.Load(),
 		MismatchesDetected:            c.mismatchesDetected.Load(),
 		PermanentFailures:             c.permanentFailures.Load(),
