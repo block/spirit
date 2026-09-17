@@ -61,6 +61,36 @@ A source that cannot grant the built-in feed privileges must use a
 programmatically injected `change.Source`; the CLI no longer has a mode that
 runs without a change stream.
 
+## Autoscaling
+
+`--enable-experimental-autoscaling` enables target-aware concurrency control
+for Aurora targets with at least four vCPUs. Eligible targets override
+`--threads` and `--write-threads`; other targets retain those configured counts.
+The target's load and commit latency are sampled through a separate two-connection
+monitor pool. Source load is not measured.
+
+During the initial copy, the shared copier controller adjusts read and write
+workers using target load and the applier queue. After copying, the continuous
+checksum controller adjusts concurrent checks using target load and change-feed
+backlog. Target overload pauses new checks, while in-flight repairs finish.
+A write controller also remains active for checksum repairs. Cancellation joins
+these controllers before the applier is stopped.
+
+Replication flushes are separate from the applier's copy/repair worker pool.
+The built-in change feed uses the target load signal to narrow its flushes under
+load; it continues making progress rather than pausing replication. Injected
+feeds must use `Runner.TargetUnderLoad` as their `ClientConfig.UnderLoad` callback
+and set the matching capacity-derived `FlushConcurrency`/`BatchSize` to get the
+same behavior. That method is safe to call before `Run`. An injected
+`SingleTargetApplier` using the supplied target is supported; custom or sharded
+appliers retain their configured concurrency.
+
+Worker ceilings are derived at startup from target capacity, client CPU capacity,
+and the fixed `--max-connections` budget. Fresh and resumed runs use the same
+setup. Restart the sync after changing the target instance size to rederive
+those ceilings and monitoring thresholds. Independent syncs sharing a host each
+observe its load but do not share a single worker budget.
+
 ## Configuration
 
 - [source-dsn](#source-dsn)
@@ -194,7 +224,7 @@ remain portable across servers, subject to the normal GTID resume checks.
 
 ### max-connections
 
-`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). Worker counts may exceed the budget and wait for connections. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
+`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). With autoscaling disabled, worker counts may exceed the budget and wait for connections. Autoscaling partitions the target pool between checksum reads and repair writes, reserving the derived replication flush width plus six connections for checkpoints and metadata. Pools too small for that reservation keep configured concurrency. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
 
 Sync’s continuous checker uses ordinary reads rather than pinned snapshot pools, and sync has no cutover. It therefore does not require move’s checksum/cutover headroom or lower configured read concurrency to fit that headroom.
 

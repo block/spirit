@@ -42,6 +42,10 @@ import (
 // programmatic callers (e.g. strata's Vitess/PlanetScale import) that
 // inject a non-MySQL change source and/or a custom applier.
 type Sync struct {
+	// EnableExperimentalAutoscaling derives bounded copy/checksum concurrency
+	// from the Aurora target and adapts it to target load throughout the sync.
+	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: scale copy, write and checksum concurrency using Aurora target load. Overrides --threads and --write-threads when the target qualifies." default:"false"`
+
 	// MaxConnections limits each SQL pool; worker counts do not expand it.
 	MaxConnections int    `name:"max-connections" help:"Size of each source and target SQL connection pool. Workers share the pool and contend for connections." default:"128"`
 	SourceDSN      string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`

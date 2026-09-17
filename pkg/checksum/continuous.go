@@ -91,8 +91,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -161,6 +163,10 @@ type ContinuousCheckerConfig struct {
 	// SplitHotChunks subdivides repeatedly changing ranges before deferring
 	// them. Each child is independently read; parent signatures are not reused.
 	SplitHotChunks bool
+	// Throttler pauses new checks under target load; in-flight repairs finish.
+	Throttler throttler.Throttler
+	// Autoscale bounds live checks using target load and change-feed backlog.
+	Autoscale AutoscaleConfig
 
 	// RetryDelay is the minimum wait between attempts for any given chunk —
 	// measured from the *last* attempt of that chunk, not from the original
@@ -538,17 +544,22 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 	// Workers and dispatcher communicate through these channels; both are
 	// buffered to Concurrency so the dispatcher's send/recv loop doesn't
 	// stall on small lock-step delays.
-	workCh := make(chan *workItem, c.cfg.Concurrency)
-	resultCh := make(chan *workResult, c.cfg.Concurrency)
+	workers := c.cfg.Concurrency
+	if c.cfg.Autoscale.Enabled {
+		workers = max(workers, c.cfg.Autoscale.MaxThreads)
+	}
+	limiter := autoscale.NewLimiter(c.cfg.Concurrency)
+	workCh := make(chan *workItem, workers)
+	resultCh := make(chan *workResult, workers)
 
 	// Cancellable sub-context so worker goroutines can be torn down on
 	// Run return without depending on the parent ctx being cancelled.
 	workerCtx, workerCancel := context.WithCancel(ctx)
 
 	var workerWG sync.WaitGroup
-	for i := 0; i < c.cfg.Concurrency; i++ {
+	for i := 0; i < workers; i++ {
 		workerWG.Add(1)
-		go c.worker(workerCtx, &workerWG, workCh, resultCh)
+		go c.worker(workerCtx, &workerWG, workCh, resultCh, limiter)
 	}
 	// Shutdown order matters on early error returns (ErrPermanentDivergence,
 	// walker error): a worker that has just produced a result may be
@@ -566,6 +577,16 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 		close(workCh)
 		workerWG.Wait()
 	}()
+
+	if c.cfg.Autoscale.Enabled {
+		var backlog func() (int, int)
+		if c.feed != nil {
+			backlog = c.feed.FlushResidual
+		}
+		workerWG.Go(func() {
+			newChecksumScaler(c.cfg.Throttler, limiter, backlog, c.cfg.Concurrency, workers, c.cfg.Logger, nil).run(workerCtx)
+		})
+	}
 
 	var lastPassStart time.Time
 	for passNum := uint64(1); ; passNum++ {
@@ -884,6 +905,7 @@ func (c *ContinuousChecker) worker(
 	wg *sync.WaitGroup,
 	workCh <-chan *workItem,
 	resultCh chan<- *workResult,
+	limiter *autoscale.Limiter,
 ) {
 	defer wg.Done()
 	for {
@@ -894,7 +916,18 @@ func (c *ContinuousChecker) worker(
 			if !ok {
 				return
 			}
+			if err := limiter.Acquire(ctx); err != nil {
+				return
+			}
+			if c.cfg.Throttler != nil {
+				c.cfg.Throttler.BlockWait(ctx)
+			}
+			if ctx.Err() != nil {
+				limiter.Release()
+				return
+			}
 			res := c.executeWork(ctx, item)
+			limiter.Release()
 			select {
 			case <-ctx.Done():
 				return

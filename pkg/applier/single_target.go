@@ -340,6 +340,16 @@ func (a *SingleTargetApplier) Stop() error {
 	return nil
 }
 
+// SetInitialWriteWorkers configures subsequent starts without spawning workers.
+// Call before Start (or after Stop has returned). A running applier is unchanged.
+func (a *SingleTargetApplier) SetInitialWriteWorkers(n int) {
+	a.Lock()
+	defer a.Unlock()
+	if !a.started {
+		a.writeWorkersCount = int32(max(1, n))
+	}
+}
+
 // SetWriteWorkers reconciles the live write-worker count to n, spawning new
 // workers or parking existing ones as needed. It is idempotent and safe to call
 // repeatedly from the autoscaler. n is clamped to a minimum of 1 so the applier
