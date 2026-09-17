@@ -132,6 +132,11 @@ const (
 	DefaultContinuousMaxHotAttempts = 10
 )
 
+const (
+	hotSplitDepthLimit = 32
+	hotSplitPassLimit  = 1024
+)
+
 // Shared continuous-checksum pacing. Vars (not consts) so tests can shorten
 // them; production never overrides them. Keeping them here makes the pacing
 // identical across every caller (migrate, sync).
@@ -897,6 +902,21 @@ func (c *ContinuousChecker) worker(
 			}
 		}
 	}
+}
+
+// trySplitHot only runs after two successive source changes. Splits are bounded
+// independently of retries, so resetting child evidence cannot make a pass
+// unbounded. A failed SQL query fails verification, never marks a range clean.
+func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bool {
+	item := res.item
+	if !c.cfg.SplitHotChunks || item.point || item.splitDepth >= hotSplitDepthLimit || item.consecutiveSrcChanged < 1 {
+		return false
+	}
+	if c.splitAttempts.Add(1) > hotSplitPassLimit {
+		return false
+	}
+	res.children, res.err = c.splitChunk(ctx, item.chunk, res.newSrc.count)
+	return res.err != nil || len(res.children) != 0
 }
 
 // executeWork runs the source+target read for a single workItem and applies
