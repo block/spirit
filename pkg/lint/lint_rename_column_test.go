@@ -150,3 +150,34 @@ func TestRenameColumnLinter_String(t *testing.T) {
 	linter := &RenameColumnLinter{}
 	require.Contains(t, linter.String(), "rename_column")
 }
+
+// MySQL compares column identifiers case-insensitively, so a CHANGE COLUMN
+// that restates a name in another case renames nothing: every query and ORM
+// mapping that referenced the column still resolves to it. Such a clause is a
+// redefinition, and reporting it would fail a plan over a no-op.
+func TestRenameColumnLinter_ChangeColumnRestatingNameInAnotherCase(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE users CHANGE COLUMN phone PHONE VARCHAR(40)",
+		"ALTER TABLE users CHANGE COLUMN PHONE phone VARCHAR(40)",
+		"ALTER TABLE users CHANGE COLUMN `phone` `PhOnE` VARCHAR(40) NOT NULL",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			stmts, err := statement.New(sql)
+			require.NoError(t, err)
+
+			require.Empty(t, (&RenameColumnLinter{}).Lint(nil, stmts))
+		})
+	}
+}
+
+// A CHANGE COLUMN whose new name differs by more than case is still a rename.
+func TestRenameColumnLinter_ChangeColumnDifferingByMoreThanCase(t *testing.T) {
+	stmts, err := statement.New("ALTER TABLE users CHANGE COLUMN phone PHONE_NUMBER VARCHAR(40)")
+	require.NoError(t, err)
+
+	violations := (&RenameColumnLinter{}).Lint(nil, stmts)
+	require.Len(t, violations, 1)
+	require.Equal(t, SeverityError, violations[0].Severity)
+	require.Contains(t, violations[0].Message, "phone")
+	require.Contains(t, violations[0].Message, "PHONE_NUMBER")
+}

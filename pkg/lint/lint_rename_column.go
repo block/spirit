@@ -2,6 +2,7 @@ package lint
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/statement"
@@ -68,11 +69,16 @@ func (l *RenameColumnLinter) Lint(_ []*statement.CreateTable, changes []*stateme
 				})
 			case ast.AlterTableChangeColumn:
 				// ALTER TABLE t1 CHANGE COLUMN old_name new_name <type>
-				// This is a rename if old name != new name
+				// This is a rename if old name != new name. Names are compared
+				// the way MySQL compares column identifiers, case-insensitively:
+				// restating a name in another case changes only the case the
+				// name is stored in, and every query and ORM mapping that
+				// referenced the column still resolves to it. Such a clause is
+				// a redefinition, which this linter has no opinion about.
 				if spec.OldColumnName != nil && len(spec.NewColumns) > 0 {
 					oldName := spec.OldColumnName.Name.O
 					newName := spec.NewColumns[0].Name.Name.O
-					if oldName != newName {
+					if !strings.EqualFold(oldName, newName) {
 						violations = append(violations, Violation{
 							Linter: l,
 							Location: &Location{
