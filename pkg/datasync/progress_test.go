@@ -1,10 +1,12 @@
 package datasync
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -46,6 +48,12 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	r.status.Set(status.ApplyChangeset)
 	require.Empty(t, r.Progress().ETA)
 	require.Empty(t, r.Progress().Checksum) // The continuous verifier has no finite initial-checksum phase.
+	checker, err := checksum.NewContinuousChecker(&sql.DB{}, &sql.DB{}, table.NewMockChunker("verify", 100), nil, checksum.ContinuousCheckerConfig{})
+	require.NoError(t, err)
+	r.continuousChecker = checker
+	block = r.Status()
+	require.Contains(t, block, "\n  verify")
+	require.Contains(t, block, "retry-queue=0  hot=0  in-flight=0")
 	r.status.Set(status.RestoreSecondaryIndexes)
 	block = r.Status()
 	require.Contains(t, block, "state-time=")

@@ -1647,6 +1647,7 @@ func (r *Runner) Status() string {
 	cp := r.copier
 	repl := r.replClient
 	appl := r.applier
+	checker := r.continuousChecker
 	r.progMu.RUnlock()
 
 	elapsed := r.status.TotalElapsed().Round(time.Second)
@@ -1687,6 +1688,21 @@ func (r *Runner) Status() string {
 		// the older point a restart would actually resume from. The gap
 		// between them is how much re-reading a crash would cost.
 		b.Row("binlog", "position=%s  deltas=%d  %s", pos, pending, change.StatusRow(repl))
+		if checker != nil {
+			stats := checker.Stats()
+			b.Row("verify", "pass=%d  progress=%.2f%%  clean=%d/%d  retry-queue=%d  hot=%d  in-flight=%d  mismatches=%d  recopies=%d  hot-deferred=%d",
+				stats.CurrentPass,
+				float64(stats.ProgressBasisPoints)/100,
+				stats.ChunksPassedThisPass,
+				stats.ChunksThisPass,
+				stats.RetryQueueDepth,
+				stats.HotChunkCount,
+				stats.InFlight,
+				stats.MismatchesThisPass,
+				stats.RecopiesThisPass,
+				stats.HotChunksDeferredThisPass,
+			)
+		}
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
 		return b.String()
 	case status.RestoreSecondaryIndexes:

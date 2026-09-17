@@ -354,6 +354,35 @@ func TestHotChunkConverges(t *testing.T) {
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
 }
 
+// TestPermanentlyHotChunkDefersToNextPass covers the tail-stall case: one
+// continuously changing chunk cannot grow the retry queue, so without a
+// per-chunk bound it would keep pass 1 open forever. Deferral completes the
+// pass without claiming the chunk was verified or firing FirstCleanPass.
+func TestPermanentlyHotChunkDefersToNextPass(t *testing.T) {
+	chunker := newTestChunker(1)
+	cfg := fastConfig()
+	cfg.MaxHotAttempts = 3
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, chunker, cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return int64(attempt), 0, 1000, nil
+		},
+	)
+
+	stop, _ := runUntil(t, c)
+	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, 2*time.Second, time.Millisecond)
+	stats := c.Stats()
+	require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
+	require.Equal(t, uint64(0), stats.ChunksPassedThisPass)
+	select {
+	case <-c.FirstCleanPass():
+		t.Fatal("FirstCleanPass fired for a pass that deferred a hot chunk")
+	default:
+	}
+	err := stop()
+	require.True(t, errors.Is(err, context.Canceled) || err == nil)
+}
+
 // TestPermanentDivergence: chunk mismatches initially; on retry, source CRC
 // unchanged but target CRC still wrong ⇒ ErrPermanentDivergence.
 func TestPermanentDivergence(t *testing.T) {
@@ -955,4 +984,50 @@ func TestMultiplePassesResetCounters(t *testing.T) {
 	resets := chunker.resets
 	chunker.mu.Unlock()
 	require.GreaterOrEqual(t, resets, 1, "chunker should have been reset between passes")
+}
+
+func TestStatsReportsChunkerProgress(t *testing.T) {
+	chunker := newTestChunker(4)
+	c := newTestChecker(t, chunker, fastConfig(),
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return 42, 42, 1000, nil
+		},
+	)
+
+	_, err := chunker.Next()
+	require.NoError(t, err)
+	require.Equal(t, uint64(2500), c.Stats().ProgressBasisPoints)
+
+	for range 3 {
+		_, err = chunker.Next()
+		require.NoError(t, err)
+	}
+	require.Equal(t, uint64(10000), c.Stats().ProgressBasisPoints)
+}
+
+func TestStatsReportsInFlightWork(t *testing.T) {
+	chunker := newTestChunker(1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cfg := fastConfig()
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, chunker, cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			close(started)
+			select {
+			case <-ctx.Done():
+				return 0, 0, 0, ctx.Err()
+			case <-release:
+				return 42, 42, 1000, nil
+			}
+		},
+	)
+
+	stop, _ := runUntil(t, c)
+	<-started
+	require.Equal(t, 1, c.Stats().InFlight)
+	close(release)
+	require.Eventually(t, func() bool { return c.Stats().InFlight == 0 }, time.Second, time.Millisecond)
+	err := stop()
+	require.True(t, errors.Is(err, context.Canceled) || err == nil)
 }
