@@ -151,33 +151,60 @@ func TestRenameColumnLinter_String(t *testing.T) {
 	require.Contains(t, linter.String(), "rename_column")
 }
 
-// MySQL compares column identifiers case-insensitively, so a CHANGE COLUMN
-// that restates a name in another case renames nothing: every query and ORM
-// mapping that referenced the column still resolves to it. Such a clause is a
-// redefinition, and reporting it would fail a plan over a no-op.
-func TestRenameColumnLinter_ChangeColumnRestatingNameInAnotherCase(t *testing.T) {
+// A new name differing only in case is reported apart from a rename, in both
+// grammars that can give a column a new name. MySQL resolves the identifier
+// either way, so no query stops matching; what changes is the name in
+// result-set metadata, which a client indexing rows by column name in a
+// case-sensitive language stops finding. That is a narrower exposure than a
+// rename, so it is a warning with its own message — never silent, and never
+// the rename message, whose advice about atomicity across pods does not apply.
+func TestRenameColumnLinter_CaseChangeIsAWarning(t *testing.T) {
+	for _, tt := range []struct {
+		sql  string
+		from string
+		to   string
+	}{
+		{sql: "ALTER TABLE users CHANGE COLUMN phone PHONE VARCHAR(40)", from: "phone", to: "PHONE"},
+		{sql: "ALTER TABLE users CHANGE COLUMN PHONE phone VARCHAR(40)", from: "PHONE", to: "phone"},
+		{sql: "ALTER TABLE users CHANGE COLUMN `phone` `PhOnE` VARCHAR(40) NOT NULL", from: "phone", to: "PhOnE"},
+		{sql: "ALTER TABLE users RENAME COLUMN phone TO PHONE", from: "phone", to: "PHONE"},
+	} {
+		t.Run(tt.sql, func(t *testing.T) {
+			stmts, err := statement.New(tt.sql)
+			require.NoError(t, err)
+
+			violations := (&RenameColumnLinter{}).Lint(nil, stmts)
+			require.Len(t, violations, 1)
+			require.Equal(t, SeverityWarning, violations[0].Severity)
+			require.Contains(t, violations[0].Message, "case change")
+			require.NotContains(t, violations[0].Message, "Column rename detected")
+			require.Contains(t, violations[0].Message, tt.from)
+			require.Contains(t, violations[0].Message, tt.to)
+			require.NotNil(t, violations[0].Suggestion)
+			require.Equal(t, "users", violations[0].Location.Table)
+			require.NotNil(t, violations[0].Location.Column)
+			require.Equal(t, tt.from, *violations[0].Location.Column)
+		})
+	}
+}
+
+// A new name differing by more than case is still a rename, and still an error,
+// in both grammars.
+func TestRenameColumnLinter_NameDifferingByMoreThanCaseStaysAnError(t *testing.T) {
 	for _, sql := range []string{
-		"ALTER TABLE users CHANGE COLUMN phone PHONE VARCHAR(40)",
-		"ALTER TABLE users CHANGE COLUMN PHONE phone VARCHAR(40)",
-		"ALTER TABLE users CHANGE COLUMN `phone` `PhOnE` VARCHAR(40) NOT NULL",
+		"ALTER TABLE users CHANGE COLUMN phone PHONE_NUMBER VARCHAR(40)",
+		"ALTER TABLE users RENAME COLUMN phone TO PHONE_NUMBER",
 	} {
 		t.Run(sql, func(t *testing.T) {
 			stmts, err := statement.New(sql)
 			require.NoError(t, err)
 
-			require.Empty(t, (&RenameColumnLinter{}).Lint(nil, stmts))
+			violations := (&RenameColumnLinter{}).Lint(nil, stmts)
+			require.Len(t, violations, 1)
+			require.Equal(t, SeverityError, violations[0].Severity)
+			require.Contains(t, violations[0].Message, "Column rename detected")
+			require.Contains(t, violations[0].Message, "phone")
+			require.Contains(t, violations[0].Message, "PHONE_NUMBER")
 		})
 	}
-}
-
-// A CHANGE COLUMN whose new name differs by more than case is still a rename.
-func TestRenameColumnLinter_ChangeColumnDifferingByMoreThanCase(t *testing.T) {
-	stmts, err := statement.New("ALTER TABLE users CHANGE COLUMN phone PHONE_NUMBER VARCHAR(40)")
-	require.NoError(t, err)
-
-	violations := (&RenameColumnLinter{}).Lint(nil, stmts)
-	require.Len(t, violations, 1)
-	require.Equal(t, SeverityError, violations[0].Severity)
-	require.Contains(t, violations[0].Message, "phone")
-	require.Contains(t, violations[0].Message, "PHONE_NUMBER")
 }
