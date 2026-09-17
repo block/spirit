@@ -684,9 +684,14 @@ ALTER TABLE users RENAME TO `table`;
 
 Detects unsafe operations that can cause data loss or service disruption, such as DROP COLUMN, DROP TABLE, TRUNCATE, and DROP DATABASE.
 
+By default "unsafe" means the operation destroys rows. Removals and renames that lose no data are safe under that definition, even though each one removes something a reader may depend on. `includeNonLossyRemovals` selects the wider definition, for callers whose exposure is availability rather than data: dropping an index that live queries plan around loses no rows and can still take a database down, and because the drop is metadata-only it completes in milliseconds with nothing looking wrong. A rename is a drop and an add to every client still reading the old name.
+
+Table options (`ENGINE`, `CHARACTER SET`, `ROW_FORMAT` and the rest) remove nothing, so the wider definition leaves them safe. A differ emits them for routine convergence, and reporting them would strand a schema on a property mismatch.
+
 **Configuration Options:**
 
 - `allowUnsafe` (string): Set to `"true"` to disable this linter. Default: `"false"`.
+- `includeNonLossyRemovals` (string): Set to `"true"` to also report removals and renames that lose no data. Default: `"false"`.
 
 **Examples:**
 
@@ -705,6 +710,26 @@ ALTER TABLE users ADD COLUMN email VARCHAR(255);
 ALTER TABLE users ADD INDEX idx_email (email);
 ```
 
+With `includeNonLossyRemovals` set to `"true"`, removals and renames that lose no data are reported as well. The violation names the object under its own kind, so a caller can report what a reader loses access to:
+
+```sql
+-- ❌ Violation (removes an index live queries may plan around)
+ALTER TABLE users DROP INDEX idx_email;
+
+-- ❌ Violation (stops enforcing a constraint a client may rely on)
+ALTER TABLE users DROP FOREIGN KEY fk_org;
+ALTER TABLE users DROP CHECK chk_age;
+
+-- ❌ Violation (a drop and an add to every client reading the old name)
+ALTER TABLE users RENAME COLUMN email TO mail;
+ALTER TABLE users RENAME INDEX idx_email TO idx_mail;
+RENAME TABLE users TO people;
+
+-- ✅ Still safe: removes nothing
+ALTER TABLE users ENGINE=InnoDB;
+ALTER TABLE users ALTER INDEX idx_email INVISIBLE;
+```
+
 **Configuration Example:**
 
 ```go
@@ -716,6 +741,8 @@ violations, err := lint.RunLinters(tables, stmts, lint.Config{
     },
 })
 ```
+
+`allowUnsafe` is the whole linter's switch, not the switch for one definition: a caller that sets it to `"true"` is opted out of the wider definition too.
 
 ---
 

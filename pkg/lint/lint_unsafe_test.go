@@ -627,3 +627,170 @@ func TestUnsafeLinter_AlterTableRowFormat(t *testing.T) {
 	// Changing row format is safe
 	require.Empty(t, violations)
 }
+
+// strictUnsafeLinter returns a linter configured with the wider definition of
+// unsafe, through Configure so the tests exercise the same path a caller uses.
+func strictUnsafeLinter(t *testing.T) *UnsafeLinter {
+	t.Helper()
+
+	linter := &UnsafeLinter{}
+	require.NoError(t, linter.Configure(map[string]string{"includeNonLossyRemovals": "true"}))
+
+	return linter
+}
+
+func lintOne(t *testing.T, linter *UnsafeLinter, sql string) []Violation {
+	t.Helper()
+
+	stmts, err := statement.New(sql)
+	require.NoError(t, err)
+
+	return linter.Lint(nil, stmts)
+}
+
+// Removals and renames that lose no data are violations only under the wider
+// definition of unsafe. Under the default definition every one of them stays
+// safe, which is what every existing caller of this linter relies on.
+func TestUnsafeLinter_NonLossyRemovals(t *testing.T) {
+	cases := []struct {
+		name      string
+		sql       string
+		operation string
+		// object is the location field the clause identifies its target under,
+		// and target the name expected in it.
+		object string
+		target string
+	}{
+		{name: "drop index", sql: "ALTER TABLE users DROP INDEX idx_email", operation: "DROP INDEX `idx_email`", object: "index", target: "idx_email"},
+		{name: "drop key", sql: "ALTER TABLE users DROP KEY idx_email", operation: "DROP INDEX `idx_email`", object: "index", target: "idx_email"},
+		{name: "rename index", sql: "ALTER TABLE users RENAME INDEX idx_email TO idx_mail", operation: "RENAME INDEX `idx_email`", object: "index", target: "idx_email"},
+		{name: "drop foreign key", sql: "ALTER TABLE users DROP FOREIGN KEY fk_org", operation: "DROP FOREIGN KEY `fk_org`", object: "constraint", target: "fk_org"},
+		{name: "drop check", sql: "ALTER TABLE users DROP CHECK chk_age", operation: "DROP CHECK `chk_age`", object: "constraint", target: "chk_age"},
+		{name: "drop constraint", sql: "ALTER TABLE users DROP CONSTRAINT chk_age", operation: "DROP CONSTRAINT `chk_age`", object: "constraint", target: "chk_age"},
+		{name: "rename column", sql: "ALTER TABLE users RENAME COLUMN email TO mail", operation: "RENAME COLUMN `email`", object: "column", target: "email"},
+		{name: "rename table via alter", sql: "ALTER TABLE users RENAME TO people", operation: "RENAME TABLE `people`"},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Empty(t, lintOne(t, &UnsafeLinter{}, tt.sql),
+				"the default definition of unsafe is about data, and this loses none")
+
+			violations := lintOne(t, strictUnsafeLinter(t), tt.sql)
+			require.Len(t, violations, 1)
+			require.Equal(t, "unsafe", violations[0].Linter.Name())
+			require.Equal(t, SeverityError, violations[0].Severity)
+			require.Equal(t, `Unsafe operation detected: "`+tt.operation+`"`, violations[0].Message)
+			require.Equal(t, "users", violations[0].Location.Table)
+
+			// The clause's target is reported under the kind of object it is, so
+			// a caller can say what a reader loses access to.
+			switch tt.object {
+			case "index":
+				require.NotNil(t, violations[0].Location.Index)
+				require.Equal(t, tt.target, *violations[0].Location.Index)
+			case "constraint":
+				require.NotNil(t, violations[0].Location.Constraint)
+				require.Equal(t, tt.target, *violations[0].Location.Constraint)
+			case "column":
+				require.NotNil(t, violations[0].Location.Column)
+				require.Equal(t, tt.target, *violations[0].Location.Column)
+			default:
+				require.Nil(t, violations[0].Location.Index)
+				require.Nil(t, violations[0].Location.Constraint)
+				require.Nil(t, violations[0].Location.Column)
+			}
+		})
+	}
+}
+
+// A statement-level removal or rename is reported under the wider definition
+// too, whether or not the parser rewrites it into the equivalent ALTER clause.
+func TestUnsafeLinter_NonLossyRemovalStatements(t *testing.T) {
+	for _, sql := range []string{
+		"DROP INDEX idx_email ON users",
+		"RENAME TABLE users TO people",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			require.Empty(t, lintOne(t, &UnsafeLinter{}, sql))
+
+			violations := lintOne(t, strictUnsafeLinter(t), sql)
+			require.Len(t, violations, 1)
+			require.Equal(t, SeverityError, violations[0].Severity)
+			require.Contains(t, violations[0].Message, "Unsafe operation detected")
+		})
+	}
+}
+
+// A table option removes nothing, so the wider definition leaves it safe. A
+// differ emits these for routine convergence on engine, charset or row format,
+// and reporting them would strand a schema on a property mismatch.
+func TestUnsafeLinter_NonLossyRemovalsLeaveTableOptionsSafe(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER TABLE users ENGINE=InnoDB",
+		"ALTER TABLE users CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci",
+		"ALTER TABLE users ROW_FORMAT=DYNAMIC",
+		"ALTER TABLE users COMMENT='people'",
+		"ALTER TABLE users AUTO_INCREMENT=1000",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			require.Empty(t, lintOne(t, strictUnsafeLinter(t), sql))
+		})
+	}
+}
+
+// Additive work is safe under both definitions, so widening the definition
+// cannot make a schema that only grows fail to lint.
+func TestUnsafeLinter_NonLossyRemovalsLeaveAdditiveWorkSafe(t *testing.T) {
+	for _, sql := range []string{
+		"CREATE TABLE users (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255))",
+		"ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+		"ALTER TABLE users ADD INDEX idx_email (email)",
+		"ALTER TABLE users ADD CONSTRAINT chk_age CHECK (age > 0)",
+		"ALTER TABLE users MODIFY COLUMN email VARCHAR(500)",
+		"ALTER TABLE users ALTER INDEX idx_email INVISIBLE",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			require.Empty(t, lintOne(t, strictUnsafeLinter(t), sql))
+		})
+	}
+}
+
+// One ALTER can carry an additive clause beside a removal. Each removal is
+// reported on its own, and the additive clause is not, so a caller that refuses
+// the statement can name every reason it refused.
+func TestUnsafeLinter_NonLossyRemovalsInMixedAlter(t *testing.T) {
+	violations := lintOne(t, strictUnsafeLinter(t),
+		"ALTER TABLE users ADD COLUMN caller VARCHAR(64), DROP INDEX idx_email, DROP FOREIGN KEY fk_org")
+
+	require.Len(t, violations, 2)
+	require.Equal(t, "Unsafe operation detected: \"DROP INDEX `idx_email`\"", violations[0].Message)
+	require.Equal(t, "Unsafe operation detected: \"DROP FOREIGN KEY `fk_org`\"", violations[1].Message)
+}
+
+// A caller that has opted out of unsafe checks altogether is opted out of the
+// wider definition too: allowUnsafe is the whole linter's switch, not the
+// switch for one definition of unsafe.
+func TestUnsafeLinter_AllowUnsafeSuppressesNonLossyRemovals(t *testing.T) {
+	linter := &UnsafeLinter{}
+	require.NoError(t, linter.Configure(map[string]string{
+		"allowUnsafe":             "true",
+		"includeNonLossyRemovals": "true",
+	}))
+
+	require.Empty(t, lintOne(t, linter, "ALTER TABLE users DROP INDEX idx_email"))
+	require.Empty(t, lintOne(t, linter, "ALTER TABLE users DROP COLUMN email"))
+}
+
+// Both definitions are selectable through the documented default config, and a
+// value that is not a boolean is an error rather than a silent default.
+func TestUnsafeLinter_NonLossyRemovalsConfig(t *testing.T) {
+	require.Equal(t, map[string]string{
+		"allowUnsafe":             "false",
+		"includeNonLossyRemovals": "false",
+	}, (&UnsafeLinter{}).DefaultConfig())
+
+	err := (&UnsafeLinter{}).Configure(map[string]string{"includeNonLossyRemovals": "yes"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "includeNonLossyRemovals")
+}
