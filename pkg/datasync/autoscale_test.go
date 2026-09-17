@@ -1,9 +1,12 @@
 package datasync
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -29,7 +32,12 @@ func TestSyncAutoscaleBounds(t *testing.T) {
 	require.Equal(t, 8, cfg.MaxReadThreads)
 	for _, connections := range []int{1, 6, 8, 128} {
 		read, cfg = syncAutoscaleBounds(128, 4, connections)
+		if connections < 12 {
+			require.False(t, cfg.Enabled)
+			continue
+		}
 		budget := min(4, max(1, connections-6))
+		require.LessOrEqual(t, cfg.MaxReadThreads+cfg.MaxThreads+4+6, connections)
 		require.Positive(t, read)
 		require.LessOrEqual(t, read, cfg.MaxReadThreads)
 		require.LessOrEqual(t, cfg.MaxReadThreads, budget)
@@ -194,4 +202,61 @@ func TestSyncAutoscaleInjectedApplierResume(t *testing.T) {
 		require.Equal(t, 1, signal.closes)
 		require.Zero(t, a.ActiveWriteWorkers())
 	}
+}
+
+func TestInjectedApplierMustUseMonitoredTarget(t *testing.T) {
+	a, err := applier.NewSingleTargetApplier(applier.Target{DB: &sql.DB{}}, applier.NewApplierDefaultConfig())
+	require.NoError(t, err)
+	r, err := NewRunner(&Sync{Threads: 3, WriteThreads: 5, EnableExperimentalAutoscaling: true, Applier: a})
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	r.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	const dsn = "u:p@tcp(127.0.0.1:1)/monitored"
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	db, err := sql.Open(dbconn.DriverName, dsn)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	r.target = applier.Target{DB: db, Config: cfg}
+	require.NoError(t, r.setupAutoscaling(t.Context()))
+	require.False(t, r.autoscale.Enabled)
+	require.Contains(t, logs.String(), "injected applier must use the monitored single target")
+}
+
+func TestAutoscalingPreservesCallerConfig(t *testing.T) {
+	cfg := &Sync{Threads: 3, WriteThreads: 5}
+	original := *cfg
+	r, err := NewRunner(cfg)
+	require.NoError(t, err)
+	signal := &syncOwnedSignal{}
+	require.NoError(t, r.engageAutoscaling(t.Context(), throttler.AuroraResult{Throttlers: []throttler.Throttler{signal}}, 2, copier.AutoscaleConfig{Enabled: true, StartThreads: 6}))
+	require.Equal(t, original, *cfg)
+	next, err := NewRunner(cfg)
+	require.NoError(t, err)
+	require.Equal(t, 3, next.sync.Threads)
+	require.Equal(t, 5, next.sync.WriteThreads)
+	require.NoError(t, r.Close())
+}
+
+func TestSyncSharedTargetBudget(t *testing.T) {
+	for _, cores := range []int{4, 16, 192} {
+		for _, client := range []int{1, 4, 64, 256} {
+			for _, connections := range []int{8, 16, 128, 256} {
+				read, cfg := syncAutoscaleBounds(cores, client, connections)
+				if !cfg.Enabled {
+					continue
+				}
+				flush, _ := syncFlushBounds(cores, client)
+				require.LessOrEqual(t, cfg.MaxReadThreads+cfg.MaxThreads+flush+6, connections)
+				require.LessOrEqual(t, read, cfg.MaxReadThreads)
+				require.LessOrEqual(t, cfg.StartThreads, cfg.MaxThreads)
+			}
+		}
+	}
+	width, batch := syncFlushBounds(16, 64)
+	require.Equal(t, 14, width)
+	require.Equal(t, 571, batch)
+	width, batch = syncFlushBounds(16, 4)
+	require.Equal(t, 4, width)
+	require.Equal(t, 2000, batch)
 }

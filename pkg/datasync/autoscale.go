@@ -14,19 +14,34 @@ import (
 	"github.com/block/spirit/pkg/throttler"
 )
 
+const syncCommitLatencyThreshold = 100 * time.Millisecond
+
+func syncFlushBounds(vcpus, clientCeiling int) (int, int) {
+	width, _ := autoscale.FlushBounds(vcpus)
+	width = min(width, max(1, clientCeiling))
+	return width, autoscale.FlushBatchSize(width)
+}
+
 func syncAutoscaleBounds(vcpus, clientCeiling, connections int) (int, copier.AutoscaleConfig) {
 	if vcpus < autoscale.MinVCPUs {
 		return 0, copier.AutoscaleConfig{}
 	}
-	// Leave room for replication, checkpoints, and metadata queries in each
-	// fixed SQL pool. Worker resizing never expands that pool.
-	budget := min(max(1, clientCeiling), max(1, connections-6))
+	// Verification reads and repair writes share the target pool. Reserve
+	// the entire change-feed flush plus six checkpoint/metadata connections,
+	// then partition the remainder so both worker ceilings fit simultaneously.
+	flush, _ := syncFlushBounds(vcpus, clientCeiling)
+	available := connections - flush - 6
+	if available < 2 {
+		return 0, copier.AutoscaleConfig{}
+	}
+	readBudget := min(max(1, clientCeiling), available/2)
+	writeBudget := min(max(1, clientCeiling), available-available/2)
 	readStart, readMax := autoscale.ReadBounds(vcpus)
-	writeStart := min(autoscale.WriteStart(vcpus), budget)
-	return min(readStart, budget), copier.AutoscaleConfig{
+	writeStart := min(autoscale.WriteStart(vcpus), writeBudget)
+	return min(readStart, readBudget), copier.AutoscaleConfig{
 		Enabled: true, StartThreads: writeStart,
-		MaxThreads:     min(autoscale.Ceiling(writeStart, true), budget),
-		MaxReadThreads: min(readMax, budget),
+		MaxThreads:     min(throttler.ResolveMaxWriteThreads(writeStart, true, true, syncCommitLatencyThreshold > 0), writeBudget),
+		MaxReadThreads: min(readMax, readBudget),
 	}
 }
 
@@ -72,13 +87,19 @@ func (r *Runner) setupAutoscaling(ctx context.Context) error {
 			cfg.MaxOpenConnections = 2
 			return dbconn.NewWithConnectionType(r.target.Config.FormatDSN(), &cfg, "sync target monitor")
 		},
-		CommitLatencyThreshold: 100 * time.Millisecond,
+		CommitLatencyThreshold: syncCommitLatencyThreshold,
 		Logger:                 r.logger,
 	}).Build(ctx)
 	if err != nil {
 		return err
 	}
-	return r.engageAutoscaling(ctx, result, readStart, config)
+	if err := r.engageAutoscaling(ctx, result, readStart, config); err != nil {
+		return err
+	}
+	if r.autoscale.Enabled {
+		r.flushConcurrency, r.flushBatchSize = syncFlushBounds(vcpus, autoscale.ClientCeiling())
+	}
+	return nil
 }
 
 // engageAutoscaling takes ownership of the new monitor, including on failure.

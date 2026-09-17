@@ -1204,3 +1204,32 @@ func TestContinuousThrottleCancellation(t *testing.T) {
 	require.ErrorIs(t, stop(), context.Canceled)
 	require.Zero(t, reads.Load())
 }
+
+// The permit must cover the read, not only dispatch to a ceiling-sized pool.
+func TestChecksumLimiterBoundsInFlightReads(t *testing.T) {
+	old := csTick
+	csTick = 2 * time.Millisecond
+	defer func() { csTick = old }()
+	cfg := fastConfig()
+	cfg.Concurrency = 1
+	cfg.Autoscale = AutoscaleConfig{Enabled: true, MaxThreads: 3}
+	cfg.Throttler = &gradualStub{util: 1.5}
+	entered := make(chan struct{}, 10)
+	c := newTestChecker(t, newTestChunker(20), cfg, func(ctx context.Context, _ *table.Chunk, _ int) (int64, int64, uint64, error) {
+		entered <- struct{}{}
+		<-ctx.Done()
+		return 1, 1, 1, ctx.Err()
+	})
+	stop, _ := runUntil(t, c)
+	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("no chunk was read")
+	}
+	select {
+	case <-entered:
+		t.Fatal("second read started with limit 1")
+	case <-time.After(200 * time.Millisecond):
+	}
+}

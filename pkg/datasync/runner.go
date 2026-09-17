@@ -60,9 +60,10 @@ type sourceInfo struct {
 type Runner struct {
 	// Published before background work starts; external feeds read the signal
 	// through TargetUnderLoad, which uses progMu.
-	loadSignal throttler.Throttler
-	monitorDB  *sql.DB
-	autoscale  copier.AutoscaleConfig
+	loadSignal                       throttler.Throttler
+	monitorDB                        *sql.DB
+	autoscale                        copier.AutoscaleConfig
+	flushConcurrency, flushBatchSize int
 
 	sourceUUID string // server owning file:position checkpoints
 	sync       *Sync
@@ -156,6 +157,8 @@ var _ status.Task = (*Runner)(nil)
 // supplies defaults via kong; programmatic callers get the same defaults
 // applied here as a safety net.
 func NewRunner(s *Sync) (*Runner, error) {
+	config := *s
+	s = &config // Defaults and derived concurrency belong to this runner.
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
@@ -684,6 +687,11 @@ func (r *Runner) setup(ctx context.Context) error {
 	// goroutine to render the applier row.
 	r.progMu.Lock()
 	r.applier = appl
+	if r.autoscale.Enabled {
+		if a, ok := appl.(*applier.SingleTargetApplier); ok {
+			a.SetInitialWriteWorkers(r.autoscale.StartThreads)
+		}
+	}
 	r.progMu.Unlock()
 
 	// File:position coordinates belong to the MySQL server that wrote them.
@@ -736,6 +744,7 @@ func (r *Runner) setup(ctx context.Context) error {
 		replConfig.DDLFilterSchema = r.source.config.DBName
 		replConfig.DBConfig = r.sourceDBConfig
 		replConfig.UnderLoad = r.TargetUnderLoad
+		replConfig.FlushConcurrency, replConfig.BatchSize = r.flushConcurrency, r.flushBatchSize
 		client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig, pos)
 		if err != nil {
 			return err

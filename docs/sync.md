@@ -80,7 +80,8 @@ Replication flushes are separate from the applier's copy/repair worker pool.
 The built-in change feed uses the target load signal to narrow its flushes under
 load; it continues making progress rather than pausing replication. Injected
 feeds must use `Runner.TargetUnderLoad` as their `ClientConfig.UnderLoad` callback
-to get the same behavior. That method is safe to call before `Run`. An injected
+and set the matching capacity-derived `FlushConcurrency`/`BatchSize` to get the
+same behavior. That method is safe to call before `Run`. An injected
 `SingleTargetApplier` using the supplied target is supported; custom or sharded
 appliers retain their configured concurrency.
 
@@ -223,6 +224,6 @@ remain portable across servers, subject to the normal GTID resume checks.
 
 ### max-connections
 
-`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). Worker counts may exceed the budget and wait for connections. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
+`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). With autoscaling disabled, worker counts may exceed the budget and wait for connections. Autoscaling partitions the target pool between checksum reads and repair writes, reserving the derived replication flush width plus six connections for checkpoints and metadata. Pools too small for that reservation keep configured concurrency. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
 
 Sync’s continuous checker uses ordinary reads rather than pinned snapshot pools, and sync has no cutover. It therefore does not require move’s checksum/cutover headroom or lower configured read concurrency to fit that headroom.
