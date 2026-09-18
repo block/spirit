@@ -979,6 +979,18 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 		}
 	}
 
+	if r.migration.EnableExperimentalLocklessChecksum {
+		r.checker = &locklessChecker{
+			db: r.db, chunker: r.checksumChunker, feed: r.replClient,
+			cfg: checksum.ContinuousCheckerConfig{
+				Concurrency:    r.migration.Threads,
+				Autoscale:      checksum.AutoscaleConfig{Enabled: autoscaleEnabled, MaxThreads: maxRead},
+				SplitHotChunks: true, DivergenceIsFatal: true, Logger: r.logger,
+			},
+		}
+		r.logger.Warn("experimental lockless checksum enabled; verification uses optimistic reads, cutover locking is unchanged")
+		return nil
+	}
 	r.checker, err = checksum.NewChecker([]*sql.DB{r.db}, r.checksumChunker, []change.Source{r.replClient}, &checksum.CheckerConfig{
 		Concurrency:     r.migration.Threads,
 		TargetChunkTime: table.ChunkerDefaultTarget,
@@ -1138,7 +1150,7 @@ func (r *Runner) flushUnderLoad() bool {
 // setThrottlerOnPhases hands the resolved throttler to every phase that paces
 // itself against it. The copier always accepts one; the checksum does so via
 // the optional checksum.ThrottleAware capability (test doubles and the
-// continuous checker do not implement it, and do not need to).
+// sentinel-wait checker do not implement it, and do not need to).
 //
 // Both phases get the same composite, but they do not react to the same parts of
 // it: the copier writes and so honours every signal in it, while the checksum
@@ -1677,7 +1689,9 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
-	if checksumWatermark != "" {
+	// An experimental run must also ignore watermarks saved by a previous
+	// run that used the traditional snapshot checker.
+	if checksumWatermark != "" && !r.migration.EnableExperimentalLocklessChecksum {
 		if err := r.checksumChunker.OpenAtWatermark(checksumWatermark); err != nil {
 			return err
 		}
@@ -1816,7 +1830,7 @@ func (r *Runner) initChunkers() error {
 	return nil
 }
 
-// checksum creates the checksum which opens the read view
+// checksum runs the selected verification gate before the final binlog drain.
 func (r *Runner) checksum(ctx context.Context) error {
 	if err := r.status.Do(status.Checksum, func() error {
 		// Run the checksum with internal retry logic.
@@ -1927,7 +1941,9 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	// while BOTH checkers are clean (or the continuous one doesn't exist
 	// yet).
 	var checksumWatermark string
-	if r.status.Get() >= status.Checksum {
+	// Optimistic retries are not represented by the walker watermark. Always
+	// restart experimental verification from the beginning, even after a clean pass.
+	if r.status.Get() >= status.Checksum && !r.migration.EnableExperimentalLocklessChecksum {
 		wm, wmErr := checksumChunker.GetLowWatermark()
 		if wmErr != nil {
 			return status.ErrWatermarkNotReady
@@ -2057,6 +2073,10 @@ func (r *Runner) Status() string {
 			progress.RowsTotal,
 			checksum.StatusSuffix(r.checker),
 		)
+		if checker, ok := r.checker.(*locklessChecker); ok {
+			stats := checker.Stats()
+			b.Row("verify", "experimental lockless: pass=%d scan≈%.1f%% scan-complete=%t retrying=%d in-flight=%d deferred=%d", stats.CurrentPass, float64(stats.ProgressBasisPoints)/100, stats.ScanComplete, stats.RetryQueueDepth, stats.InFlight, stats.HotChunksDeferredThisPass)
+		}
 		b.Row("binlog", "deltas=%d  %s", r.replClient.GetDeltaLen(), change.StatusRow(r.replClient))
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
 		return b.String()

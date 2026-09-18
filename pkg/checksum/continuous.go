@@ -559,6 +559,17 @@ func NewContinuousChecker(
 // room. The walker blocks on its send; workers continue draining.
 // WalkerStalls in the stats snapshot counts how often this has fired.
 func (c *ContinuousChecker) Run(ctx context.Context) error {
+	return c.run(ctx, false)
+}
+
+// RunUntilClean returns only after a complete pass has no repairs or deferred
+// ranges. It joins all workers before returning. Cancellation is an error,
+// never evidence of verification. Like Run, it must not be called concurrently.
+func (c *ContinuousChecker) RunUntilClean(ctx context.Context) error {
+	return c.run(ctx, true)
+}
+
+func (c *ContinuousChecker) run(ctx context.Context, untilClean bool) error {
 	// Workers and dispatcher communicate through these channels; both are
 	// buffered to Concurrency so the dispatcher's send/recv loop doesn't
 	// stall on small lock-step delays.
@@ -703,6 +714,9 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 			"hot_chunks_split", c.hotChunksSplitThisPass.Load(),
 			"duration", time.Since(passStart).Round(time.Millisecond).String(),
 		)
+		if untilClean && recopies == 0 && deferredHot == 0 {
+			return ctx.Err()
+		}
 	}
 }
 

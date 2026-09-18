@@ -737,3 +737,30 @@ Two more fields appear **only when they have something to say**, so their presen
 | `handoff-p50` | Handoff reaches 1ms | Write workers are backing up behind the single goroutine that publishes completions, rather than behind the target. Adding write threads will not help here either. |
 
 Everything Spirit measures about the write path — including the fields not rendered here, such as pending work, mean rows per chunklet, and the remaining p90s — is still emitted to the metrics sink, which is the better source for dashboards.
+
+
+### enable-experimental-lockless-checksum
+
+Default: `false`.
+
+Use `--enable-experimental-lockless-checksum` to replace the main migration
+checksum with optimistic source/shadow-table reads and bounded retries. This
+experimental mode takes no checksum setup lock (`FTWRL` or table lock) and opens
+no long-lived `REPEATABLE READ` snapshots. It uses the same column mappings as
+the normal checksum, including renamed columns, and supports checksum load
+throttling and experimental autoscaling.
+
+Cutover still requires a complete clean pass. Hot ranges are split; unresolved
+ranges remain on retries or are revisited in another pass. Completing a scan or
+deferring a hot range does not authorize cutover. Stable divergence aborts the
+migration instead of repairing the shadow table. Persistently hot workloads can
+therefore prevent completion; cancel the run or resume with the default checker.
+
+This is optimistic verification, not a comparison at one common source/target
+snapshot. Use it to evaluate the experimental algorithm before adopting it
+broadly. The final replication drain and cutover locking are unchanged.
+
+Copy checkpoints are preserved, but experimental checksum progress is neither
+saved nor resumed: verification starts from the beginning after a restart,
+including when resuming a checkpoint created by the default checker.
+`--checksum-yield-timeout` applies only to the default snapshot checksum.

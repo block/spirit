@@ -1308,3 +1308,57 @@ func TestContinuousNextPassSchedule(t *testing.T) {
 	_ = stop()
 	require.True(t, c.Stats().NextPassAt.IsZero())
 }
+
+func TestRunUntilClean(t *testing.T) {
+	for _, mode := range []string{"clean", "hot", "divergent", "repaired"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := fastConfig()
+			cfg.RetryDelay = time.Millisecond
+			cfg.MaxHotAttempts = 2
+			cfg.MinPassInterval = time.Hour
+			if mode == "repaired" {
+				cfg.Recopier = &fakeRecopier{}
+			}
+			c := newTestChecker(t, newTestChunker(1), cfg,
+				func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+					switch mode {
+					case "clean":
+						return 1, 1, 10, nil
+					case "hot":
+						return int64(attempt), 0, 10, nil
+					default:
+						return 1, 0, 10, nil
+					}
+				})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			var err error
+			if mode == "hot" || mode == "repaired" {
+				done := make(chan error, 1)
+				go func() { done <- c.RunUntilClean(ctx) }()
+				require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, 2*time.Second, time.Millisecond)
+				select {
+				case early := <-done:
+					t.Fatalf("unverified pass returned early: %v", early)
+				default:
+				}
+				cancel()
+				err = <-done
+			} else {
+				err = c.RunUntilClean(ctx)
+			}
+			switch mode {
+			case "clean":
+				require.NoError(t, err)
+				require.Equal(t, uint64(1), c.Stats().PassesCompleted)
+				require.False(t, c.Stats().FirstCleanPassAt.IsZero())
+			case "divergent":
+				require.ErrorIs(t, err, ErrPermanentDivergence)
+			default:
+				require.ErrorIs(t, err, context.Canceled)
+				require.Equal(t, uint64(1), c.Stats().PassesCompleted)
+				require.True(t, c.Stats().FirstCleanPassAt.IsZero(), "a completed pass with deferred or repaired chunks cannot authorize cutover")
+			}
+		})
+	}
+}
