@@ -879,3 +879,63 @@ func TestRemoveSecondaryIndexes_ErrorCases(t *testing.T) {
 		})
 	}
 }
+
+// Deferral must leave InnoDB a key whose first column is AUTO_INCREMENT.
+func TestRemoveSecondaryIndexesAutoIncrement(t *testing.T) {
+	for _, tc := range []struct {
+		name, ddl string
+		regular   int
+	}{
+		{"secondary", "id INT AUTO_INCREMENT, p INT PRIMARY KEY, KEY ai(id), KEY extra(p)", 1},
+		{"composite primary suffix", "id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id,p), KEY extra(p)", 1},
+		{"primary", "id INT AUTO_INCREMENT PRIMARY KEY, p INT, KEY redundant(id), KEY extra(p)", 0},
+		{"unique", "id INT AUTO_INCREMENT, p INT PRIMARY KEY, KEY redundant(id), UNIQUE KEY ai(id), KEY extra(p)", 0},
+		{"inline unique", "id INT AUTO_INCREMENT UNIQUE, p INT PRIMARY KEY, KEY redundant(id), KEY extra(p)", 0},
+		{"multiple supporting", "id INT AUTO_INCREMENT, p INT PRIMARY KEY, KEY ai(id), KEY redundant(id,p), KEY extra(p)", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, db := testutils.CreateUniqueTestDatabase(t)
+			original := "CREATE TABLE t (" + tc.ddl + ") ENGINE=InnoDB"
+			_, err := db.ExecContext(t.Context(), original)
+			require.NoError(t, err)
+			var name, source string
+			require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE t").Scan(&name, &source))
+			_, err = db.ExecContext(t.Context(), "DROP TABLE t")
+			require.NoError(t, err)
+			// Use the original DDL as well as SHOW CREATE to exercise inline keys.
+			for _, ddl := range []string{original, source} {
+				stripped, err := RemoveSecondaryIndexes(ddl)
+				require.NoError(t, err)
+				_, err = db.ExecContext(t.Context(), stripped)
+				require.NoError(t, err, "deferred table must remain valid")
+				ct, err := ParseCreateTable(stripped)
+				require.NoError(t, err)
+				count := 0
+				for _, idx := range ct.GetIndexes() {
+					if idx.Type == "INDEX" {
+						count++
+					}
+				}
+				require.Equal(t, tc.regular, count)
+				_, err = db.ExecContext(t.Context(), "INSERT INTO t (p) VALUES (1)")
+				require.NoError(t, err)
+				var id int
+				require.NoError(t, db.QueryRowContext(t.Context(), "SELECT id FROM t").Scan(&id))
+				require.Positive(t, id)
+				var target string
+				require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE t").Scan(&name, &target))
+				restore, err := GetMissingSecondaryIndexes(source, target, "t")
+				require.NoError(t, err)
+				require.NotEmpty(t, restore)
+				_, err = db.ExecContext(t.Context(), restore)
+				require.NoError(t, err)
+				require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE t").Scan(&name, &target))
+				restore, err = GetMissingSecondaryIndexes(source, target, "t")
+				require.NoError(t, err)
+				require.Empty(t, restore)
+				_, err = db.ExecContext(t.Context(), "DROP TABLE t")
+				require.NoError(t, err)
+			}
+		})
+	}
+}

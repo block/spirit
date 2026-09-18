@@ -15,11 +15,26 @@ import (
 
 // RemoveSecondaryIndexes takes a CREATE TABLE statement and returns a modified version
 // without secondary indexes (regular INDEX only). PRIMARY KEY, UNIQUE, and FULLTEXT
-// indexes are preserved.
+// indexes are preserved, as is an index needed to support AUTO_INCREMENT.
 func RemoveSecondaryIndexes(createStmt string) (string, error) {
 	ct, err := ParseCreateTable(createStmt)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse CREATE TABLE: %w", err)
+	}
+
+	// InnoDB requires AUTO_INCREMENT to lead an index. Retained primary
+	// and unique keys can satisfy it; otherwise keep one supporting regular
+	// index. GetIndexes also includes inline PRIMARY KEY and UNIQUE clauses.
+	needsIndex := make(map[string]bool)
+	for _, column := range ct.GetColumns() {
+		if column.AutoInc {
+			needsIndex[strings.ToLower(column.Name)] = true
+		}
+	}
+	for _, index := range ct.GetIndexes() {
+		if (index.Type == "PRIMARY KEY" || index.Type == "UNIQUE") && len(index.ColumnList) > 0 {
+			delete(needsIndex, strings.ToLower(index.ColumnList[0].Name))
+		}
 	}
 
 	// Filter out regular INDEX entries from the constraints
@@ -28,8 +43,15 @@ func RemoveSecondaryIndexes(createStmt string) (string, error) {
 		// Keep everything except regular INDEX
 		switch constraint.Tp { //nolint:exhaustive
 		case ast.ConstraintKey, ast.ConstraintIndex:
-			// Skip regular indexes
-			continue
+			if len(constraint.Keys) == 0 || constraint.Keys[0].Column == nil {
+				continue
+			}
+			name := strings.ToLower(constraint.Keys[0].Column.Name.O)
+			if !needsIndex[name] {
+				continue
+			}
+			delete(needsIndex, name)
+			filteredConstraints = append(filteredConstraints, constraint)
 		default:
 			// Keep PRIMARY KEY, UNIQUE, FULLTEXT, SPATIAL, etc.
 			filteredConstraints = append(filteredConstraints, constraint)
