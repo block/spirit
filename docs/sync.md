@@ -240,9 +240,23 @@ Composite and textual keys use MySQL's ordering rather than numeric midpoints.
 
 Children are independently verified in the same pass, without restarting ranges
 that already passed or inheriting their parent's checksum. Split children do not
-feed the main chunker's walk-progress estimate. Status logs show `hot-split`;
-emitted counts include both split parents and their children, while passed
-counts exclude split parents.
+feed the main chunker's walk-progress estimate. Status separates the scan from
+remaining verification, for example:
+
+```text
+verify  pass=1  scan complete
+        remaining: 1 retrying (0 hot), 0 in flight, 0 deferred
+        pass activity: 63 chunks mismatched: 49 split, 0 recopied
+```
+
+The mismatch count records each chunk's initial mismatch once; split and recopy
+counts describe outcomes within that count. Raw `ChunksThisPass` includes split
+parents and children, while `ChunksPassedThisPass` excludes split parents, so
+they are not a completion ratio. Estimated scan progress can reach 100% before
+the walker finishes, and finishing the scan does not verify unresolved ranges.
+Between passes, status shows the completed pass and scheduled next start.
+`first clean pass` reports historical verification evidence when available;
+repairs and deferred ranges still require verification in a later pass.
 
 A failed split query logs a warning and retains the normal bounded retries;
 it cannot mark a range verified. Cancelling the sync still stops verification.
