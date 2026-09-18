@@ -133,6 +133,22 @@ algorithm; how long the caller runs it does not change its correctness criteria.
 
 `LocklessChecker` verifies a target that is still converging toward the source over a live replication feed, so a first-attempt mismatch is *expected* (the target simply hasn't caught up yet) rather than alarming. It runs in **passes**: each pass walks every chunk once and then drains a delayed-retry queue until empty. A mismatched chunk is re-read after a short delay and passes once the target's CRC matches a source CRC the checker has witnessed. A chunk whose source keeps changing (a "hot chunk") cycles to the back of the queue without blocking the pass.
 
+### Current limitation: continuously updated hot rows
+
+Workloads that continuously update the same rows are not currently supported
+reliably by the lockless algorithm. Even with `SplitHotChunks` and
+`SnapshotHotChunks`, a frozen source row image may be superseded before a target
+read observes it. Splitting to a single row cannot guarantee convergence. Deletes
+before verification can also leave frozen images unresolved. These ranges remain
+unverified and can prevent `RunUntilClean` from completing; they are not accepted
+as clean merely because replication is active.
+
+The finite snapshot fallback can help append-heavy tails because later inserts
+do not expand its work set. It does not solve the continuously updated hot-row
+case. Replication-applier integration using change-stream row images and their
+application is planned to address that case, but is not implemented yet. For
+migrations with these workloads, use the default snapshot-based checksum.
+
 When a chunk's source CRC is stable across the retry window but the target still disagrees, that is a **stable divergence**. How the checker reacts is governed by two config fields:
 
 - **`Recopier`** — when set, a stable divergence is *repaired* by recopying that chunk from the source: `DELETE` the key range on the target, re-`SELECT` from the source, and re-apply through the same write path the change feed uses. `MySQLRecopier` is the production implementation used by `spirit sync`. Recopies are serialized and run under a cancellation-detached, time-bounded (10 minute) context, so a chunk is never left deleted-but-not-rewritten.

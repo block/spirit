@@ -755,8 +755,17 @@ snapshot drain: read target keys first, freeze source PK/CRC32 images once, and
 retry target reads until each frozen image has matched and every observed
 target-only key is absent. Later inserts do not expand the frozen work set, so
 an append-heavy tail can converge. There are no stream-backed or soft passes.
-A continuously modified row whose frozen image is never read back equal remains
-unresolved, as does a source row deleted before its image could be verified.
+**Current limitation:** workloads that continuously update the same rows are not
+currently supported reliably by the lockless algorithm. Splitting down to a
+single row does not resolve this: its frozen source image may be superseded
+before a target read observes it. A source row deleted before its image can be
+verified can remain unresolved for the same reason. The snapshot fallback helps
+append-heavy tails, but does not guarantee convergence for these hot-row workloads.
+
+Replication-applier integration is planned to address this limitation by using
+change-stream row images and their application to reconcile unresolved rows.
+That support is not implemented; the current checker requires matching target
+reads and does not accept unverified rows to complete the checksum.
 
 Each side is limited to 128 rows, with a combined 64 KiB key-data budget;
 oversized ranges stay on normal splitting/retries. Snapshot reads have a
