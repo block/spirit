@@ -1781,11 +1781,18 @@ func appendVerificationStatus(b *status.Block, stats checksum.ContinuousCheckerS
 	if stats.ScanComplete {
 		scan = "scan complete"
 	}
-	b.Row("verify", "pass=%d  %s", stats.CurrentPass, scan)
+	if !stats.NextPassAt.IsZero() {
+		b.Row("verify", "pass=%d complete; next pass at %s", stats.CurrentPass, stats.NextPassAt.UTC().Format(time.RFC3339))
+	} else {
+		b.Row("verify", "pass=%d  %s", stats.CurrentPass, scan)
+	}
+	if !stats.FirstCleanPassAt.IsZero() {
+		b.Row("", "first clean pass: %s", stats.FirstCleanPassAt.UTC().Format(time.RFC3339))
+	}
 	b.Row("", "remaining: %d retrying (%d hot), %d in flight, %d deferred",
 		stats.RetryQueueDepth, stats.HotChunkCount, stats.InFlight, stats.HotChunksDeferredThisPass)
-	b.Row("", "activity this pass: %d splits, %d mismatch observations, %d recopies",
-		stats.HotChunksSplitThisPass, stats.MismatchesThisPass, stats.RecopiesThisPass)
+	b.Row("", "pass activity: %d chunks mismatched: %d split, %d recopied",
+		stats.MismatchesThisPass, stats.HotChunksSplitThisPass, stats.RecopiesThisPass)
 	if stats.RecopiesThisPass > 0 {
 		b.Row("", "repaired ranges need verification in the next pass")
 	}

@@ -74,10 +74,12 @@ func TestVerificationStatusAfterHotSplits(t *testing.T) {
 		appendVerificationStatus(b, stats)
 		text := b.String()
 		require.Contains(t, text, "remaining: 1 retrying (0 hot), 0 in flight, 0 deferred")
-		require.Contains(t, text, "49 splits, 63 mismatch observations, 0 recopies")
+		require.Contains(t, text, "63 chunks mismatched: 49 split, 0 recopied")
 		require.NotContains(t, text, "passed=")
 		require.NotContains(t, text, "emitted=")
 		require.NotContains(t, text, "verified")
+		require.NotContains(t, text, "repaired ranges")
+		require.NotContains(t, text, "first clean pass")
 		if complete {
 			require.Contains(t, text, "scan complete")
 			require.NotContains(t, text, "100.0%")
@@ -93,4 +95,17 @@ func TestVerificationStatusAfterHotSplits(t *testing.T) {
 	appendVerificationStatus(b, stats)
 	require.Contains(t, b.String(), "0 in flight, 2 deferred")
 	require.Contains(t, b.String(), "repaired ranges need verification in the next pass")
+}
+
+func TestVerificationStatusBetweenPasses(t *testing.T) {
+	stats := checksum.ContinuousCheckerStats{CurrentPass: 1, PassesCompleted: 1, ScanComplete: true,
+		NextPassAt: time.Date(2026, 9, 18, 16, 0, 0, 0, time.UTC)}
+	b := status.NewBlock("status")
+	appendVerificationStatus(b, stats)
+	require.Contains(t, b.String(), "pass=1 complete; next pass at 2026-09-18T16:00:00Z")
+	require.NotContains(t, b.String(), "first clean pass")
+	stats.FirstCleanPassAt = stats.NextPassAt.Add(-time.Hour)
+	b = status.NewBlock("status")
+	appendVerificationStatus(b, stats)
+	require.Contains(t, b.String(), "first clean pass: 2026-09-18T15:00:00Z")
 }

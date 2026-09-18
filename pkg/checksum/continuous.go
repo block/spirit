@@ -232,16 +232,20 @@ type ContinuousCheckerStats struct {
 	// FirstCleanPass signal.
 	PassesCompleted uint64
 
-	// CurrentPass is the 1-indexed pass number in flight (0 before the
-	// first pass starts).
+	// CurrentPass is the 1-indexed active or most recently completed pass
+	// (0 before the first pass starts).
 	CurrentPass uint64
+
+	// NextPassAt is the scheduled start while waiting between passes; zero otherwise.
+	NextPassAt time.Time
 
 	// ChunksThisPass is how many chunks the walker has emitted in the
 	// current pass, including split parents and their subsequently emitted children.
 	ChunksThisPass uint64
 
 	// ChunksPassedThisPass is how many chunks have gone clean in the
-	// current pass (either initially or via retry).
+	// current pass (either initially or via retry). Split parents are excluded,
+	// so this is not a completion numerator over ChunksThisPass.
 	ChunksPassedThisPass uint64
 
 	// ProgressBasisPoints estimates how far the chunker has walked through the
@@ -374,6 +378,7 @@ type ContinuousChecker struct {
 
 	statsMu          sync.RWMutex
 	firstCleanPassAt time.Time
+	nextPassAt       time.Time
 
 	firstCleanPassOnce sync.Once
 	firstCleanPassCh   chan struct{}
@@ -603,13 +608,22 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 			if wait := c.cfg.MinPassInterval - time.Since(lastPassStart); wait > 0 {
 				c.cfg.Logger.Debug("continuous checksum waiting before next pass",
 					"pass_number", passNum, "wait", wait.Round(time.Second).String())
+				c.statsMu.Lock()
+				c.nextPassAt = lastPassStart.Add(c.cfg.MinPassInterval)
+				c.statsMu.Unlock()
 				timer := time.NewTimer(wait)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
+					c.statsMu.Lock()
+					c.nextPassAt = time.Time{}
+					c.statsMu.Unlock()
 					return ctx.Err()
 				case <-timer.C:
 				}
+				c.statsMu.Lock()
+				c.nextPassAt = time.Time{}
+				c.statsMu.Unlock()
 			}
 			if err := c.chunker.Reset(); err != nil {
 				return fmt.Errorf("reset chunker for pass %d: %w", passNum, err)
@@ -1307,6 +1321,7 @@ func (c *ContinuousChecker) signalFirstCleanPass() {
 func (c *ContinuousChecker) Stats() ContinuousCheckerStats {
 	c.statsMu.RLock()
 	firstAt := c.firstCleanPassAt
+	nextAt := c.nextPassAt
 	c.statsMu.RUnlock()
 	progress, _, total := c.chunker.Progress()
 	var progressBasisPoints uint64
@@ -1335,6 +1350,7 @@ func (c *ContinuousChecker) Stats() ContinuousCheckerStats {
 		MismatchesDetected:            c.mismatchesDetected.Load(),
 		PermanentFailures:             c.permanentFailures.Load(),
 		FirstCleanPassAt:              firstAt,
+		NextPassAt:                    nextAt,
 	}
 }
 

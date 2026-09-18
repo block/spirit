@@ -1286,3 +1286,25 @@ func TestScanCompleteResetsAndExcludesWalkerFailure(t *testing.T) {
 	require.ErrorContains(t, <-done, "scan failed")
 	require.False(t, c.Stats().ScanComplete)
 }
+
+func TestContinuousNextPassSchedule(t *testing.T) {
+	cfg := fastConfig()
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return 7, 7, 100, nil
+		})
+	require.True(t, c.Stats().NextPassAt.IsZero())
+	start := time.Now()
+	stop, _ := runUntil(t, c)
+	stop = sync.OnceValue(stop)
+	t.Cleanup(func() { _ = stop() })
+	require.Eventually(t, func() bool { return !c.Stats().NextPassAt.IsZero() }, time.Second, time.Millisecond)
+	stats := c.Stats()
+	require.Equal(t, uint64(1), stats.CurrentPass)
+	require.Equal(t, uint64(1), stats.PassesCompleted)
+	require.False(t, stats.FirstCleanPassAt.IsZero())
+	require.WithinDuration(t, start.Add(time.Hour), stats.NextPassAt, time.Second)
+	_ = stop()
+	require.True(t, c.Stats().NextPassAt.IsZero())
+}
