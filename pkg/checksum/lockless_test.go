@@ -1362,3 +1362,32 @@ func TestRunUntilClean(t *testing.T) {
 		})
 	}
 }
+
+func TestHotSnapshotAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		enabled        bool
+		source, target uint64
+		depth, changes int
+		want           bool
+	}{
+		{"disabled", false, 1, 1, 1, 0, false},
+		{"source oversized", true, 129, 1, 1, 0, false},
+		{"target oversized", true, 1, 129, 1, 0, false},
+		{"first root retry", true, 1, 1, 0, 0, false},
+		{"proven hot root", true, 128, 128, 0, 1, true},
+		{"small descendant", true, 128, 128, 1, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			c := &LocklessChecker{cfg: LocklessCheckerConfig{SnapshotHotChunks: tc.enabled}}
+			c.snapshotChunk = func(context.Context, *table.Chunk) (*hotSnapshot, error) {
+				called = true
+				return nil, nil // capture declined; admission is what this test checks
+			}
+			result := &workResult{item: &workItem{splitDepth: tc.depth, consecutiveSrcChanged: tc.changes}, newSrc: chunkSig{count: tc.source}, newTgt: chunkSig{count: tc.target}}
+			require.False(t, c.tryHotSnapshot(t.Context(), result))
+			require.Equal(t, tc.want, called)
+		})
+	}
+}

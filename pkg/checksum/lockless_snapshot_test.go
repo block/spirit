@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -207,4 +209,57 @@ func TestHotSnapshotColumnMapping(t *testing.T) {
 	passed, err := snapshot.check(t.Context())
 	require.NoError(t, err)
 	require.True(t, passed)
+}
+
+func TestHotSnapshotTargetCensusOverflow(t *testing.T) {
+	db, chunk := snapshotTestTables(t, "id INT PRIMARY KEY, value INT", []string{"id"})
+	snapshotExec(t, db, "INSERT INTO src VALUES (1,10),(2,20)")
+	var values []string
+	for i := 1; i <= 200; i++ {
+		values = append(values, fmt.Sprintf("(%d,%d)", i, i*10))
+	}
+	snapshotExec(t, db, "INSERT INTO dst VALUES "+strings.Join(values, ","))
+	snapshot, err := captureHotSnapshot(t.Context(), db, db, chunk)
+	require.NoError(t, err)
+	require.Nil(t, snapshot, "a target census over the row budget cannot truncate orphan evidence")
+}
+
+func TestHotSnapshotTemporalParseTime(t *testing.T) {
+	for _, parseTime := range []bool{false, true} {
+		t.Run(fmt.Sprint(parseTime), func(t *testing.T) {
+			schema, _ := testutils.CreateUniqueTestDatabase(t)
+			cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(schema))
+			require.NoError(t, err)
+			cfg.ParseTime = parseTime
+			if cfg.Params == nil {
+				cfg.Params = make(map[string]string)
+			}
+			cfg.Params["sql_mode"] = "'NO_ENGINE_SUBSTITUTION'"
+			cfg.Params["time_zone"] = "'+00:00'"
+			db, err := sql.Open("block-mysql", cfg.FormatDSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			for _, name := range []string{"src", "dst"} {
+				_, err = db.ExecContext(t.Context(), "CREATE TABLE "+name+" (id DATETIME(6) PRIMARY KEY, value INT)")
+				require.NoError(t, err)
+			}
+			_, err = db.ExecContext(t.Context(),
+				"INSERT INTO src VALUES ('0000-00-00 00:00:00',0),('2026-09-18 01:02:03.123456',10)")
+			require.NoError(t, err)
+			source, target := table.NewTableInfo(db, schema, "src"), table.NewTableInfo(db, schema, "dst")
+			require.NoError(t, source.SetInfo(t.Context()))
+			require.NoError(t, target.SetInfo(t.Context()))
+			chunk := &table.Chunk{Key: []string{"id"}, Table: source, NewTable: target,
+				ColumnMapping: table.NewColumnMapping(source, target, nil)}
+			snapshot, err := captureHotSnapshot(t.Context(), db, db, chunk)
+			require.NoError(t, err)
+			require.NotNil(t, snapshot)
+			require.Len(t, snapshot.pending, 2)
+			_, err = db.ExecContext(t.Context(), "INSERT INTO dst SELECT * FROM src")
+			require.NoError(t, err)
+			passed, err := snapshot.check(t.Context())
+			require.NoError(t, err)
+			require.True(t, passed, "temporal obligations must resolve regardless of parseTime")
+		})
+	}
 }

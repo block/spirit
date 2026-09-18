@@ -16,9 +16,10 @@ import (
 const hotSnapshotMaxBytes = 64 * 1024
 
 // hotSnapshot is finite evidence, not a long-lived database transaction. Target
-// membership is read BEFORE the source images so an already-present orphan is
-// not hidden by checking only source rows. Later changes remain replication's
-// responsibility, just as they do after an ordinary chunk has passed.
+// membership and source images are independent point-in-time samples. The
+// target census captures target-only keys; neither read order closes the window
+// for changes between samples. Later changes remain replication's responsibility,
+// just as they do after an ordinary chunk has passed.
 // One worker owns the snapshot at a time; retries carry it through the queue.
 type hotSnapshot struct {
 	pending       map[string]hotSnapshotRow
@@ -83,6 +84,8 @@ func (s *hotSnapshot) check(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// Point predicates bound row count, but changed key representations can
+	// still exceed the byte budget. Never drop evidence on overflow.
 	if oversized {
 		return false, nil
 	}
@@ -162,6 +165,8 @@ func readHotSnapshotRows(ctx context.Context, db *sql.DB, chunk *table.Chunk, in
 				return nil, size, false, err
 			}
 		}
+		// Unique keys should make this impossible; reject an invariant violation
+		// rather than overwrite evidence if that contract ever changes.
 		if _, exists := result[string(identity)]; exists {
 			return nil, size, false, fmt.Errorf("duplicate snapshot key")
 		}

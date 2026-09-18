@@ -771,7 +771,8 @@ reads and does not accept unverified rows to complete the checksum.
 
 Each side is limited to 128 rows, with a combined 64 KiB key-data budget;
 oversized ranges stay on normal splitting/retries. Snapshot reads have a
-30-second timeout. Snapshot retries use the ordinary retry delay and bounded
+30-second timeout per capture or target-check call, not for the entire drain.
+Snapshot retries use the ordinary retry delay and bounded
 hot-attempt count, then defer without authorizing cutover. Unresolved ranges
 are revisited in another pass. Completing a scan or
 deferring a hot range does not authorize cutover. Stable divergence aborts the
@@ -785,4 +786,8 @@ broadly. The final replication drain and cutover locking are unchanged.
 Copy checkpoints are preserved, but experimental checksum progress is neither
 saved nor resumed: verification starts from the beginning after a restart,
 including when resuming a checkpoint created by the default checker.
-`--checksum-yield-timeout` applies only to the default snapshot checksum.
+`--checksum-yield-timeout` applies only to the default snapshot checksum. There
+is no equivalent overall deadline for the experimental gate: unresolved hot
+ranges can keep it running until cancelled. The status line's `deferred` count
+covers only the current pass, not the lifetime of the run; use the timestamped
+hot-range and pass-completion logs to investigate repeated deferrals.
