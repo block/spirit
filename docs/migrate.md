@@ -142,7 +142,7 @@ If you start a migration and realize that you forgot to set defer-cutover, worry
 When `defer-cutover` is in use Spirit runs two checksums:
 
 1. The **initial checksum** runs after copy-rows completes and before Spirit starts waiting on the sentinel. This is the correctness gate; the cutover will not proceed unless the initial checksum succeeds.
-2. The **lockless checksum** runs in a loop *while* Spirit is waiting on the sentinel to be dropped. It is a best-effort consistency re-check so that the data is re-verified close to the moment of cutover, even if the sentinel sits for hours. The continuous loop is interrupted as soon as the sentinel is dropped, and Spirit proceeds to cutover. One exception: if a pass had already detected a mismatch and is mid-recopy, the in-flight repair runs to completion (bounded by an internal per-chunk timeout) before cutover continues, since cancelling between the DELETE and re-insert would leave the chunk inconsistent. A real repair error surfaced this way aborts the run instead of proceeding to cutover.
+2. The **lockless checksum** runs in a loop *while* Spirit is waiting on the sentinel to be dropped. It rechecks consistency during a long sentinel wait. Dropping the sentinel cancels this background check and allows cutover to proceed without requiring another complete clean pass. A confirmed stable divergence aborts the migration; this checker does not repair mismatches.
 
 Migration order (with `defer-cutover`):
 
@@ -150,9 +150,11 @@ Migration order (with `defer-cutover`):
 copy rows → initial checksum → wait on sentinel (lockless checksum loop) → cutover
 ```
 
-The lockless checksum runs single-threaded today (see [block/spirit#831](https://github.com/block/spirit/issues/831) for dynamic thread tuning) and shares the same yield behavior as the initial pass. The first lockless-checksum iteration starts **one hour after the initial checksum completes** — without this delay, small tables would re-acquire the table lock back-to-back with the initial pass. Subsequent iterations run **at most once per hour**: after each pass finishes, Spirit waits one hour minus the duration of the just-finished pass before starting the next one (so passes that themselves take longer than an hour proceed immediately). The wait is interrupted immediately when the sentinel is dropped. It is enabled automatically whenever the sentinel is in effect — there is no separate flag.
+The sentinel checker runs single-threaded using ordinary reads, with no checksum setup lock or long-lived snapshot. Its first iteration starts one hour after the initial checksum completes, and subsequent iterations start at least one hour apart (a pass lasting longer than an hour needs no extra wait). Dropping the sentinel interrupts the wait. The checker is enabled automatically whenever the sentinel is in effect; there is no separate flag.
 
-Each lockless-checksum pass runs once with no internal retry (the loop itself is the retry mechanism). If a pass detects a difference, the affected chunk is recopied via `FixDifferences` and the migration is aborted with a "checksum found differences" error. The fix is durable on disk, so the operator can re-run the migration and it will resume from the checkpoint and succeed if the drift has been addressed. The intent is "fail loud, investigate" — since the initial checksum already passed, any difference detected during the sentinel wait is unexpected.
+Within each pass, mismatched chunks enter a delayed-retry queue. A retry can pass when the target matches a witnessed source signature. Continuously changing chunks are retried up to a bounded attempt count, then deferred for a later pass without being marked verified. If the source is stable but the target still differs, the checker drains replication and rechecks before declaring a fatal divergence. Confirmed divergence aborts rather than recopying the affected range.
+
+The [experimental initial lockless checksum](#enable-experimental-lockless-checksum) additionally enables hot-range splitting and bounded per-row snapshot retries. Unlike the sentinel background check, it must complete a clean pass with no deferred ranges before the migration can proceed.
 
 ### host
 
