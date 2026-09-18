@@ -156,12 +156,14 @@ the replication-latency vs. batching trade-off.
 - Type: Boolean
 - Default value: `false`
 
-When set to `true`, the target tables are created **without their regular
-secondary indexes**, and the indexes are added back in a single `ALTER` per
+When set to `true`, the target tables are created **with deferrable regular
+secondary indexes omitted**, and the indexes are added back in a single `ALTER` per
 table once the initial copy has completed, before the continuous phase begins.
-Bulk-loading an index-free table is faster and lighter on temporary space; only
+Bulk-loading a table with fewer indexes is faster and lighter on temporary space; only
 regular secondary indexes are deferred — `PRIMARY`, `UNIQUE`, `FULLTEXT` and
-`SPATIAL` indexes are kept on the initial `CREATE`. This mirrors
+`SPATIAL` indexes are kept on the initial `CREATE`. If no retained primary or
+unique key starts with the `AUTO_INCREMENT` column, one regular supporting
+index is also kept, preferring the fewest key parts. This mirrors
 [`move --defer-secondary-indexes`](move.md#defer-secondary-indexes).
 
 Use it only when the target is **not yet serving reads**: the tables briefly
@@ -231,21 +233,43 @@ Sync’s continuous checker uses ordinary reads rather than pinned snapshot pool
 ## Verification of hot ranges
 
 When a mismatching checksum range changes on two successive retries, sync
-splits it around an existing source primary key: a lower range, that key alone,
-and an upper range. The surrounding ranges remain covered even where the source
+splits it around observed source primary keys. Large ranges produce up to eleven
+children: five point reads and six surrounding ranges. The last pivot is the
+observed tuple maximum, leaving an initially empty tail for future inserts.
+Mismatching descendants above 128 source rows subdivide immediately without
+waiting for more source-change observations; smaller descendants use normal
+verification and retries. Small roots retain a three-child split. The surrounding ranges remain covered even where the source
 currently has no rows, so target-only rows and missing inserts are not skipped.
 Composite and textual keys use MySQL's ordering rather than numeric midpoints.
 
 Children are independently verified in the same pass, without restarting ranges
 that already passed or inheriting their parent's checksum. Split children do not
-feed the main chunker's walk-progress estimate. Status logs show `hot-split`;
-emitted counts include both split parents and their children, while passed
-counts exclude split parents.
+feed the main chunker's walk-progress estimate. Status separates the scan from
+remaining verification, for example:
+
+```text
+verify  pass=1  scan complete
+        remaining: 1 retrying (0 hot), 0 in flight, 0 deferred
+        pass activity: 63 chunks mismatched: 49 split, 0 recopied
+```
+
+The mismatch count records each chunk's initial mismatch once; split and recopy
+counts describe outcomes within that count. Raw `ChunksThisPass` includes split
+parents and children, while `ChunksPassedThisPass` excludes split parents, so
+they are not a completion ratio. Estimated scan progress can reach 100% before
+the walker finishes, and finishing the scan does not verify unresolved ranges.
+Between passes, status shows the completed pass and scheduled next start.
+`first clean pass` reports historical verification evidence when available;
+repairs and deferred ranges still require verification in a later pass.
 
 A failed split query logs a warning and retains the normal bounded retries;
 it cannot mark a range verified. Cancelling the sync still stops verification.
 
-Splitting is bounded to 32 levels and 1,024 split attempts per pass. A single-row
+Splitting is bounded to 32 levels, 128 attempts per original walker range
+(shared by all its descendants), and 1,024 attempts per pass. A large lagging
+range therefore cannot consume the entire pass budget. Each pivot lookup,
+including its stale-count fallback, has a 30-second timeout; a wide split can
+perform up to five such lookups, all cancellable by the parent context. A single-row
 range, an empty source range, or an exhausted split budget continues through the
 normal bounded retry/deferral path. A deferred range still prevents the pass
 from being verified. This improves convergence when a large range contains a few

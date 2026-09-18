@@ -70,7 +70,7 @@ type IndexColumn struct {
 type Index struct {
 	Raw          *ast.Constraint   `json:"-"`
 	Name         string            `json:"name"`
-	Type         string            `json:"type"`                  // PRIMARY, UNIQUE, INDEX, FULLTEXT, SPATIAL
+	Type         string            `json:"type"`                  // PRIMARY KEY, UNIQUE, INDEX, FULLTEXT, SPATIAL
 	Columns      []string          `json:"columns"`               // Deprecated: use ColumnList for full details
 	ColumnList   []IndexColumn     `json:"column_list,omitempty"` // Full column specifications including prefix/expression
 	Invisible    *bool             `json:"invisible,omitempty"`

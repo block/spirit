@@ -109,7 +109,7 @@ func TestHotSplitKeepsEmptyGaps(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
-func TestContinuousHotSplit(t *testing.T) {
+func TestLocklessHotSplit(t *testing.T) {
 	for _, hotLeaf := range []bool{false, true} {
 		t.Run(fmt.Sprint(hotLeaf), func(t *testing.T) {
 			chunker := newTestChunker(1)
@@ -230,7 +230,7 @@ func TestHotSplitReadback(t *testing.T) {
 			cfg := fastConfig()
 			cfg.SplitHotChunks = true
 			cfg.RetryDelay = time.Millisecond
-			c, err := NewContinuousChecker(source, target, chunker, nil, cfg)
+			c, err := NewLocklessChecker(source, target, chunker, nil, cfg)
 			require.NoError(t, err)
 			read := c.readChunk
 			var attempts atomic.Int64
@@ -253,8 +253,8 @@ func TestHotSplitReadback(t *testing.T) {
 	}
 }
 
-func TestHotSplitRecursesToRow(t *testing.T) {
-	root := newTestChunk(0, 16)
+func TestHotSplitRecursesToSmallRanges(t *testing.T) {
+	root := newTestChunk(0, 1600)
 	chunker := &testChunker{chunks: []*table.Chunk{root}}
 	cfg := fastConfig()
 	cfg.SplitHotChunks = true
@@ -264,8 +264,8 @@ func TestHotSplitRecursesToRow(t *testing.T) {
 		lo := ch.LowerBound.Value[0].Val.(uint64)
 		hi := ch.UpperBound.Value[0].Val.(uint64)
 		// The broad range cannot match while writes continue. Once isolated,
-		// the hot row can be observed equal without rescanning passed siblings.
-		if lo <= 15 && hi > 15 && hi-lo > 1 {
+		// a small range can be observed equal without rescanning passed siblings.
+		if lo <= 1599 && hi > 1599 && hi-lo > hotSplitTargetRows {
 			return int64(n * 100), -1, hi - lo, nil
 		}
 		return 7, 7, hi - lo, nil
@@ -284,9 +284,9 @@ func TestHotSplitRecursesToRow(t *testing.T) {
 		t.Fatalf("did not converge: %+v", c.Stats())
 	}
 	stats := c.Stats()
-	require.Equal(t, uint64(3), stats.HotChunksSplitThisPass)
-	require.Equal(t, uint64(7), stats.ChunksPassedThisPass)
-	require.Equal(t, uint64(10), stats.ChunksThisPass)
+	require.Equal(t, uint64(4), stats.HotChunksSplitThisPass)
+	require.Equal(t, uint64(9), stats.ChunksPassedThisPass)
+	require.Equal(t, uint64(13), stats.ChunksThisPass)
 	require.Equal(t, stats.MismatchesThisPass, stats.PassedSecondAttemptThisPass+stats.PassedUnder5AttemptsThisPass+stats.PassedUnder10AttemptsThisPass+stats.RecopiesThisPass+stats.HotChunksDeferredThisPass+stats.HotChunksSplitThisPass)
 
 	require.Zero(t, stats.HotChunksDeferredThisPass)
@@ -360,7 +360,8 @@ func TestHotSplitTemporalKeys(t *testing.T) {
 				for _, count := range []uint64{3, 1000} { // median and stale-count fallback to zero date
 					children, err := splitHotChunk(t.Context(), db, parent, count)
 					require.NoError(t, err)
-					require.Len(t, children, 3)
+					require.GreaterOrEqual(t, len(children), 3)
+					require.LessOrEqual(t, len(children), 11)
 					var terms []string
 					for _, ch := range children {
 						terms = append(terms, "("+ch.String()+")")
@@ -403,4 +404,228 @@ func TestHotSplitFailureDefersWithoutVerification(t *testing.T) {
 	res := &workResult{item: &workItem{consecutiveSrcChanged: 1}, newSrc: chunkSig{count: 2}}
 	require.True(t, c.trySplitHot(ctx, res))
 	require.ErrorIs(t, res.err, context.Canceled)
+}
+
+// TestHotSplitDoesNotPrepareOffset guards the Vitess path where
+// a prepared LIMIT offset can reach the tablet as NULL. Check real MySQL's
+// session counters so both lookups must use the text protocol.
+func TestHotSplitDoesNotPrepareOffset(t *testing.T) {
+	schema, setupDB := testutils.CreateUniqueTestDatabase(t)
+	_, err := setupDB.ExecContext(t.Context(), "CREATE TABLE t (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = setupDB.ExecContext(t.Context(), "INSERT INTO t VALUES (10),(20),(30)")
+	require.NoError(t, err)
+
+	cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(schema))
+	require.NoError(t, err)
+	// Keep bound arguments on the prepared path; client-side interpolation
+	// would hide a regression by leaving Com_stmt_prepare unchanged.
+	cfg.InterpolateParams = false
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	ti := table.NewTableInfo(db, schema, "t")
+	require.NoError(t, ti.SetInfo(t.Context()))
+	parent := &table.Chunk{Key: []string{"id"}, Table: ti, NewTable: ti, AdditionalConditions: "1=1"}
+	prepares := func() uint64 {
+		var name string
+		var count uint64
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			"SHOW SESSION STATUS LIKE 'Com_stmt_prepare'").Scan(&name, &count))
+		return count
+	}
+	for _, tc := range []struct {
+		name  string
+		rows  uint64
+		pivot int
+	}{
+		{"median", 3, 20},
+		{"stale count fallback", 1000, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := prepares()
+			children, err := splitHotChunk(t.Context(), db, parent, tc.rows)
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, len(children), 3)
+			require.LessOrEqual(t, len(children), 11)
+			require.Equal(t, before, prepares(), "split lookups must not prepare LIMIT parameters")
+			var pivot int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT id FROM t WHERE "+children[1].String()).Scan(&pivot))
+			require.Equal(t, tc.pivot, pivot)
+		})
+	}
+}
+
+func TestWideHotSplitCoverageAndTail(t *testing.T) {
+	schema, db := testutils.CreateUniqueTestDatabase(t)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE t (a INT, b VARCHAR(20), PRIMARY KEY(a,b))")
+	require.NoError(t, err)
+	values := make([]string, 0, 1000)
+	for i := 1; i <= 991; i++ {
+		values = append(values, fmt.Sprintf("(%d,'key')", i*2))
+	}
+	// The maximum leading key has varying suffixes: descending only the
+	// first column must fail the empty-tail assertion below.
+	for i := range 9 {
+		values = append(values, fmt.Sprintf("(2000,'z%d')", i))
+	}
+	_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES "+strings.Join(values, ","))
+	require.NoError(t, err)
+	ti := table.NewTableInfo(db, schema, "t")
+	require.NoError(t, ti.SetInfo(t.Context()))
+	parent := &table.Chunk{Key: []string{"a", "b"}, Table: ti, NewTable: ti, AdditionalConditions: "a > 0"}
+	children, err := splitHotChunk(t.Context(), db, parent, 1000)
+	require.NoError(t, err)
+	require.Len(t, children, 11)
+	var predicates []string
+	for i, child := range children {
+		require.Same(t, ti, child.Table)
+		require.Equal(t, parent.AdditionalConditions, child.AdditionalConditions)
+		predicates = append(predicates, "("+child.String()+")")
+		var count int
+		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+child.String()).Scan(&count))
+		if i%2 == 1 {
+			require.Equal(t, 1, count)
+		} else {
+			require.LessOrEqual(t, count, 200)
+		}
+	}
+	tail := children[len(children)-1]
+	require.Nil(t, tail.UpperBound)
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+tail.String()).Scan(&count))
+	require.Zero(t, count, "last pivot should be the observed maximum, not another median")
+	// Later inserts into gaps and beyond the observed maximum stay covered.
+	_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (1,'gap'),(401,'gap'),(2001,'tail'),(-1,'outside')")
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE ("+strings.Join(predicates, "+")+") <> ("+parent.String()+")").Scan(&count))
+	require.Zero(t, count)
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+tail.String()).Scan(&count))
+	require.Equal(t, 1, count)
+}
+
+func TestHotSplitDescendantsDoNotWaitForHotness(t *testing.T) {
+	cfg := fastConfig()
+	cfg.SplitHotChunks = true
+	rows := uint64(10000)
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) { return 1, 2, rows, nil })
+	children := make([]*table.Chunk, 11)
+	for i := range children {
+		children[i] = newTestChunk(uint64(i), uint64(i+1))
+	}
+	calls := 0
+	c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) {
+		calls++
+		return children, nil
+	}
+	item := &workItem{chunk: newTestChunk(0, 100000), splitDepth: 1}
+	res := c.executeWork(t.Context(), item) // fresh descendant: no retry history
+	require.NoError(t, res.err)
+	require.Len(t, res.children, 11)
+	var queued []*retryEntry
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { queued = append(queued, e); return nil }))
+	require.Len(t, queued, 11)
+	for i, e := range queued {
+		require.True(t, e.fresh)
+		require.Equal(t, i%2 == 1, e.point)
+		require.Equal(t, 2, e.splitDepth)
+		require.Same(t, item.splitBudget, e.splitBudget)
+		require.WithinDuration(t, time.Now(), e.notBefore, time.Second)
+	}
+	require.Equal(t, uint64(1), c.Stats().MismatchesThisPass)
+	require.Zero(t, c.Stats().ChunksPassedThisPass)
+
+	rows = hotSplitTargetRows
+	res = c.executeWork(t.Context(), item)
+	require.Empty(t, res.children)
+	require.False(t, res.passed, "small is not verified")
+	require.Equal(t, 1, calls)
+
+	rows = hotSplitTargetRows + 1
+	c.splitAttempts.Store(hotSplitPassLimit)
+	require.Empty(t, c.executeWork(t.Context(), item).children)
+	require.Equal(t, 1, calls, "fast subdivision must honor the shared pass budget")
+	c.splitAttempts.Store(0)
+	item.splitDepth = hotSplitDepthLimit
+	require.Empty(t, c.executeWork(t.Context(), item).children)
+	require.Equal(t, 1, calls)
+}
+
+// A stale row count models a suffix deleted since the checksum read. Once
+// several pivots have been found, an empty lookup must not discard the tail.
+func TestWideHotSplitRetainsEmptySuffix(t *testing.T) {
+	for _, bounded := range []bool{false, true} {
+		t.Run(fmt.Sprint(bounded), func(t *testing.T) {
+			schema, db := testutils.CreateUniqueTestDatabase(t)
+			_, err := db.ExecContext(t.Context(), "CREATE TABLE t (id INT PRIMARY KEY)")
+			require.NoError(t, err)
+			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (10),(20),(30)")
+			require.NoError(t, err)
+			ti := table.NewTableInfo(db, schema, "t")
+			require.NoError(t, ti.SetInfo(t.Context()))
+			parent := &table.Chunk{Key: []string{"id"}, Table: ti, NewTable: ti, AdditionalConditions: "id <> 25"}
+			if bounded {
+				bound, err := table.NewDatumFromValue(int64(100), "INT")
+				require.NoError(t, err)
+				parent.UpperBound = &table.Boundary{Value: []table.Datum{bound}, Inclusive: false}
+			}
+			children, err := splitHotChunk(t.Context(), db, parent, 1000)
+			require.NoError(t, err)
+			require.Len(t, children, 7, "three pivots plus the still-covered empty suffix")
+			tail := children[len(children)-1]
+			require.Equal(t, parent.UpperBound, tail.UpperBound)
+			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (-1),(15),(25),(35),(99),(100),(101)")
+			require.NoError(t, err)
+			var predicates []string
+			for _, child := range children {
+				predicates = append(predicates, "("+child.String()+")")
+			}
+			var uncovered int
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE ("+strings.Join(predicates, "+")+") <> ("+parent.String()+")").Scan(&uncovered))
+			require.Zero(t, uncovered, "every parent row, including future tail inserts, belongs to exactly one child")
+			_, err = db.ExecContext(t.Context(), "DELETE FROM t")
+			require.NoError(t, err)
+			children, err = splitHotChunk(t.Context(), db, parent, 1000)
+			require.NoError(t, err)
+			require.Nil(t, children, "an empty parent must remain on normal retries")
+		})
+	}
+}
+
+func TestHotSplitBudgetIsSharedPerRoot(t *testing.T) {
+	cfg := fastConfig()
+	cfg.SplitHotChunks = true
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) { return 1, 2, 400000, nil })
+	c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) {
+		return []*table.Chunk{newTestChunk(0, 10), newTestChunk(10, 11), newTestChunk(11, 100)}, nil
+	}
+	first := &workItem{chunk: newTestChunk(0, 100), splitDepth: 1}
+	res := c.executeWork(t.Context(), first)
+	require.Len(t, res.children, 3)
+	var descendants []*retryEntry
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { descendants = append(descendants, e); return nil }))
+	sibling := &workItem{chunk: descendants[0].chunk, splitDepth: 2, splitBudget: descendants[0].splitBudget}
+	for range hotSplitRootLimit - 1 {
+		require.Len(t, c.executeWork(t.Context(), sibling).children, 3)
+	}
+	require.Empty(t, c.executeWork(t.Context(), first).children, "siblings must share the root's cap")
+	require.Equal(t, uint64(hotSplitRootLimit), c.splitAttempts.Load(), "denied root attempts must not charge the shared pass budget")
+	second := &workItem{chunk: newTestChunk(100, 200), splitDepth: 1}
+	require.Len(t, c.executeWork(t.Context(), second).children, 3, "another root retains its split allowance")
+	require.Equal(t, uint64(hotSplitRootLimit+1), c.splitAttempts.Load())
+	// Ordinary retries must keep the lineage budget rather than resetting it.
+	first.isRetry = true
+	first.originalSrc = chunkSig{crc: 9, count: 400000}
+	first.attempts = 1
+	res = c.executeWork(t.Context(), first)
+	var retry *retryEntry
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { retry = e; return nil }))
+	require.NotNil(t, retry)
+	require.Same(t, first.splitBudget, retry.splitBudget)
+	require.False(t, res.passed)
 }

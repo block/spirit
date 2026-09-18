@@ -16,7 +16,7 @@ import (
 )
 
 // MySQLRecopier is the production Recopier used by `spirit sync`. Given a
-// chunk that the continuous checker has identified as stably diverged
+// chunk that the lockless checker has identified as stably diverged
 // (source CRC unchanged across the retry window, target still wrong), it
 // rewrites the chunk's rows on the target from the source.
 //
@@ -88,7 +88,7 @@ func (r *MySQLRecopier) Recopy(ctx context.Context, chunk *table.Chunk) error {
 	defer r.recopyLock.Unlock()
 
 	start := time.Now()
-	r.logger.Warn("continuous checksum: recopying chunk via DELETE + Apply", "chunk", chunk.String())
+	r.logger.Warn("lockless checksum: recopying chunk via DELETE + Apply", "chunk", chunk.String())
 
 	// Detach from parent cancellation between DELETE and Apply (see
 	// struct doc). The 10m timeout matches fixChunkTimeout used by the
@@ -145,7 +145,7 @@ func (r *MySQLRecopier) Recopy(ctx context.Context, chunk *table.Chunk) error {
 	// DELETE on its own is sufficient — Apply with zero rows would still
 	// fire callbacks but does no real work, so we just skip it.
 	if len(rowData) == 0 {
-		r.logger.Info("continuous checksum: recopy deleted target chunk; source range is empty", "chunk", chunk.String())
+		r.logger.Info("lockless checksum: recopy deleted target chunk; source range is empty", "chunk", chunk.String())
 		return nil
 	}
 
@@ -155,7 +155,7 @@ func (r *MySQLRecopier) Recopy(ctx context.Context, chunk *table.Chunk) error {
 			done <- applyErr
 			return
 		}
-		r.logger.Debug("continuous checksum: recopy applier write complete",
+		r.logger.Debug("lockless checksum: recopy applier write complete",
 			"chunk", chunk.String(),
 			"affected_rows", affectedRows,
 		)
@@ -172,7 +172,7 @@ func (r *MySQLRecopier) Recopy(ctx context.Context, chunk *table.Chunk) error {
 		return fixCtx.Err()
 	}
 
-	r.logger.Info("continuous checksum: chunk recopied",
+	r.logger.Info("lockless checksum: chunk recopied",
 		"chunk", chunk.String(),
 		"row_count", len(rowData),
 		"elapsed", time.Since(start).Round(time.Millisecond).String(),

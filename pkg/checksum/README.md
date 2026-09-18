@@ -35,11 +35,11 @@ The checksum package contains three implementations:
 
 1. **SingleChecker** - Compares two tables on the same MySQL server (for schema changes, or 1:1 moves)
 2. **DistributedChecker** - Compares a source table against multiple distributed target databases (for sharded scenarios)
-3. **ContinuousChecker** - A lock-free, *eventually-consistent* verifier that runs indefinitely against a live system where the target lags the source by a small replication delay (used by `spirit sync`, and by `spirit migrate` while waiting on a deferred cutover)
+3. **LocklessChecker** - An optimistic verifier using ordinary reads and retries, with either a finite clean-pass gate (`RunUntilClean`) or repeated passes (`Run`). Used by `spirit sync`, experimental lockless migrations, and migration deferred-cutover verification.
 
-`SingleChecker` and `DistributedChecker` take a brief table lock to establish a consistent `REPEATABLE READ` snapshot; `ContinuousChecker` deliberately does not (see [Continuous checksum](#continuous-checksum) below).
+`SingleChecker` and `DistributedChecker` take a brief table lock to establish a consistent `REPEATABLE READ` snapshot; `LocklessChecker` deliberately does not (see [Lockless checksum](#lockless-checksum) below).
 
-All three use the same underlying checksum algorithm: **CRC32 with XOR aggregation**. This technique computes a checksum for each chunk of rows and can efficiently detect differences without comparing individual rows.
+All three use **CRC32 with XOR aggregation** for chunk comparison. The lockless checker can additionally drain a bounded per-row PK/CRC32 snapshot for unresolved hot ranges.
 
 ## Checksum Algorithm
 
@@ -121,13 +121,33 @@ Concurrency is gated by a resizable `autoscale.Limiter` rather than `errgroup.Se
 
 One constraint shapes all of this: the `REPEATABLE READ` transaction pool **cannot grow** once the table lock is released. Every transaction takes its snapshot under that lock, so they all see one point in time; a transaction started later would read a newer snapshot and could compare a chunk against changes its siblings cannot see. The pool is therefore provisioned at the autoscale ceiling up front, whether or not scaling is enabled. Over-provisioning costs one connection per idle transaction and no extra history retention, since every read view pins from the same instant. What it does cost is lock-window time: each transaction is started serially under the lock, so the ceiling lengthens that window in direct proportion. That cost is why `autoscale.ReadBounds` caps the read side at half the instance rather than all of it — for this pool a ceiling is not a hypothesis, it is spent whether or not scaling reaches it.
 
-`ContinuousChecker` is not covered by any of this: it manages its own pacing through `MinPassInterval` and its retry queue, and takes no table lock or snapshot pool.
+`LocklessChecker` uses ordinary reads rather than a pinned snapshot pool. It supports load throttling and autoscaling through its worker limiter; `MinPassInterval` and its retry queue govern pass/retry pacing.
 
 Each pass logs a `checksum chunk size distribution` line (chunk count, duration p50/p90/max, row p50/max, and how many chunks hit `table.MaxDynamicRowSize`). The row-capped count is the useful one: the checksum aggregates server-side and returns one row per chunk, so its chunks are far cheaper than the copier's, and if most are pinned at the row ceiling then that — not the `table.ChunkerDefaultTarget` time budget — is what bounds them.
 
-## Continuous checksum
+## Lockless checksum
 
-`ContinuousChecker` verifies a target that is still converging toward the source over a live replication feed, so a first-attempt mismatch is *expected* (the target simply hasn't caught up yet) rather than alarming. It runs in **passes**: each pass walks every chunk once and then drains a delayed-retry queue until empty. A mismatched chunk is re-read after a short delay and passes once the target's CRC matches a source CRC the checker has witnessed. A chunk whose source keeps changing (a "hot chunk") cycles to the back of the queue without blocking the pass.
+`RunUntilClean` returns only after a complete pass with no repairs or deferred
+ranges. `Run` keeps checking until cancelled. Both use the same verification
+algorithm; how long the caller runs it does not change its correctness criteria.
+
+`LocklessChecker` verifies a target that is still converging toward the source over a live replication feed, so a first-attempt mismatch is *expected* (the target simply hasn't caught up yet) rather than alarming. It runs in **passes**: each pass walks every chunk once and then drains a delayed-retry queue until empty. A mismatched chunk is re-read after a short delay and passes once the target's CRC matches a source CRC the checker has witnessed. A chunk whose source keeps changing (a "hot chunk") cycles to the back of the queue without blocking the pass.
+
+### Current limitation: continuously updated hot rows
+
+Workloads that continuously update the same rows are not currently supported
+reliably by the lockless algorithm. Even with `SplitHotChunks` and
+`SnapshotHotChunks`, a frozen source row image may be superseded before a target
+read observes it. Splitting to a single row cannot guarantee convergence. Deletes
+before verification can also leave frozen images unresolved. These ranges remain
+unverified and can prevent `RunUntilClean` from completing; they are not accepted
+as clean merely because replication is active.
+
+The finite snapshot fallback can help append-heavy tails because later inserts
+do not expand its work set. It does not solve the continuously updated hot-row
+case. Replication-applier integration using change-stream row images and their
+application is planned to address that case, but is not implemented yet. For
+migrations with these workloads, use the default snapshot-based checksum.
 
 When a chunk's source CRC is stable across the retry window but the target still disagrees, that is a **stable divergence**. How the checker reacts is governed by two config fields:
 

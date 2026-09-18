@@ -142,17 +142,19 @@ If you start a migration and realize that you forgot to set defer-cutover, worry
 When `defer-cutover` is in use Spirit runs two checksums:
 
 1. The **initial checksum** runs after copy-rows completes and before Spirit starts waiting on the sentinel. This is the correctness gate; the cutover will not proceed unless the initial checksum succeeds.
-2. The **continuous checksum** runs in a loop *while* Spirit is waiting on the sentinel to be dropped. It is a best-effort consistency re-check so that the data is re-verified close to the moment of cutover, even if the sentinel sits for hours. The continuous loop is interrupted as soon as the sentinel is dropped, and Spirit proceeds to cutover. One exception: if a pass had already detected a mismatch and is mid-recopy, the in-flight repair runs to completion (bounded by an internal per-chunk timeout) before cutover continues, since cancelling between the DELETE and re-insert would leave the chunk inconsistent. A real repair error surfaced this way aborts the run instead of proceeding to cutover.
+2. The **lockless checksum** runs in a loop *while* Spirit is waiting on the sentinel to be dropped. It rechecks consistency during a long sentinel wait. Dropping the sentinel cancels this background check and allows cutover to proceed without requiring another complete clean pass. A confirmed stable divergence aborts the migration; this checker does not repair mismatches.
 
 Migration order (with `defer-cutover`):
 
 ```
-copy rows → initial checksum → wait on sentinel (continuous checksum loop) → cutover
+copy rows → initial checksum → wait on sentinel (lockless checksum loop) → cutover
 ```
 
-The continuous checksum runs single-threaded today (see [block/spirit#831](https://github.com/block/spirit/issues/831) for dynamic thread tuning) and shares the same yield behavior as the initial pass. The first continuous-checksum iteration starts **one hour after the initial checksum completes** — without this delay, small tables would re-acquire the table lock back-to-back with the initial pass. Subsequent iterations run **at most once per hour**: after each pass finishes, Spirit waits one hour minus the duration of the just-finished pass before starting the next one (so passes that themselves take longer than an hour proceed immediately). The wait is interrupted immediately when the sentinel is dropped. It is enabled automatically whenever the sentinel is in effect — there is no separate flag.
+The sentinel checker runs single-threaded using ordinary reads, with no checksum setup lock or long-lived snapshot. Its first iteration starts one hour after the initial checksum completes, and subsequent iterations start at least one hour apart (a pass lasting longer than an hour needs no extra wait). Dropping the sentinel interrupts the wait. The checker is enabled automatically whenever the sentinel is in effect; there is no separate flag.
 
-Each continuous-checksum pass runs once with no internal retry (the loop itself is the retry mechanism). If a pass detects a difference, the affected chunk is recopied via `FixDifferences` and the migration is aborted with a "checksum found differences" error. The fix is durable on disk, so the operator can re-run the migration and it will resume from the checkpoint and succeed if the drift has been addressed. The intent is "fail loud, investigate" — since the initial checksum already passed, any difference detected during the sentinel wait is unexpected.
+Within each pass, mismatched chunks enter a delayed-retry queue. A retry can pass when the target matches a witnessed source signature. Continuously changing chunks are retried up to a bounded attempt count, then deferred for a later pass without being marked verified. If the source is stable but the target still differs, the checker drains replication and rechecks before declaring a fatal divergence. Confirmed divergence aborts rather than recopying the affected range.
+
+The [experimental initial lockless checksum](#enable-experimental-lockless-checksum) additionally enables hot-range splitting and bounded per-row snapshot retries. Unlike the sentinel background check, it must complete a clean pass with no deferred ranges before the migration can proceed.
 
 ### host
 
@@ -737,3 +739,55 @@ Two more fields appear **only when they have something to say**, so their presen
 | `handoff-p50` | Handoff reaches 1ms | Write workers are backing up behind the single goroutine that publishes completions, rather than behind the target. Adding write threads will not help here either. |
 
 Everything Spirit measures about the write path — including the fields not rendered here, such as pending work, mean rows per chunklet, and the remaining p90s — is still emitted to the metrics sink, which is the better source for dashboards.
+
+
+### enable-experimental-lockless-checksum
+
+Default: `false`.
+
+Use `--enable-experimental-lockless-checksum` to replace the main migration
+checksum with optimistic source/shadow-table reads and bounded retries. This
+experimental mode takes no checksum setup lock (`FTWRL` or table lock) and opens
+no long-lived `REPEATABLE READ` snapshots. It uses the same column mappings as
+the normal checksum, including renamed columns, and supports checksum load
+throttling and experimental autoscaling.
+
+Cutover still requires a complete clean pass. Hot ranges are split. Small unresolved ranges then use a finite per-row
+snapshot drain: read target keys first, freeze source PK/CRC32 images once, and
+retry target reads until each frozen image has matched and every observed
+target-only key is absent. Later inserts do not expand the frozen work set, so
+an append-heavy tail can converge. There are no stream-backed or soft passes.
+**Current limitation:** workloads that continuously update the same rows are not
+currently supported reliably by the lockless algorithm. Splitting down to a
+single row does not resolve this: its frozen source image may be superseded
+before a target read observes it. A source row deleted before its image can be
+verified can remain unresolved for the same reason. The snapshot fallback helps
+append-heavy tails, but does not guarantee convergence for these hot-row workloads.
+
+Replication-applier integration is planned to address this limitation by using
+change-stream row images and their application to reconcile unresolved rows.
+That support is not implemented; the current checker requires matching target
+reads and does not accept unverified rows to complete the checksum.
+
+Each side is limited to 128 rows, with a combined 64 KiB key-data budget;
+oversized ranges stay on normal splitting/retries. Snapshot reads have a
+30-second timeout per capture or target-check call, not for the entire drain.
+Snapshot retries use the ordinary retry delay and bounded
+hot-attempt count, then defer without authorizing cutover. Unresolved ranges
+are revisited in another pass. Completing a scan or
+deferring a hot range does not authorize cutover. Stable divergence aborts the
+migration instead of repairing the shadow table. Persistently hot workloads can
+therefore prevent completion; cancel the run or resume with the default checker.
+
+This is optimistic verification, not a comparison at one common source/target
+snapshot. Use it to evaluate the experimental algorithm before adopting it
+broadly. The final replication drain and cutover locking are unchanged.
+
+Copy checkpoints are preserved, but experimental checksum progress is neither
+saved nor resumed: verification starts from the beginning after a restart,
+including when resuming a checkpoint created by the default checker.
+`--checksum-yield-timeout` applies only to the default snapshot checksum. There
+is no equivalent overall deadline for the experimental gate: unresolved hot
+ranges can keep it running until cancelled. The status line's `deferred` count
+covers only the current pass, not the lifetime of the run; use the timestamped
+hot-range and pass-completion logs to investigate repeated deferrals.

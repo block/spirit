@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -161,7 +162,7 @@ func TestDumpCheckpointSuppressesWatermarkWithDifferences(t *testing.T) {
 }
 
 // TestDumpCheckpointSuppressesWatermarkWithContinuousDifferences pins the
-// sentinel-wait half of the invariant: the continuous checker is a separate
+// sentinel-wait half of the invariant: the lockless checker is a separate
 // object from r.checker, so DumpCheckpoint must consult it too. Once it has
 // repaired any chunk, checkpoints must stop carrying a checksum_watermark —
 // even though the initial checker is still clean — or the operator's re-run
@@ -177,36 +178,36 @@ func TestDumpCheckpointSuppressesWatermarkWithContinuousDifferences(t *testing.T
 	r.checker = &mockChecker{}
 	r.status.Set(status.WaitingOnSentinelTable)
 
-	// --- Case 1: no continuous checker yet (just entered the wait). ---
+	// --- Case 1: no lockless checker yet (just entered the wait). ---
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 	copierWM, checksumWM := latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, copierWM, "copier_watermark should always be persisted")
 	require.NotEmpty(t, checksumWM,
-		"checksum_watermark must be persisted while no continuous checker exists")
+		"checksum_watermark must be persisted while no lockless checker exists")
 
-	// --- Case 2: continuous checker exists and is clean. ---
+	// --- Case 2: lockless checker exists and is clean. ---
 	cont := &mockChecker{}
-	r.continuousChecker = cont
+	r.locklessChecker = cont
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 	_, checksumWM = latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, checksumWM,
-		"checksum_watermark must be persisted while the continuous checker is clean")
+		"checksum_watermark must be persisted while the lockless checker is clean")
 
-	// --- Case 3: continuous checker has repaired a chunk. ---
+	// --- Case 3: lockless checker has repaired a chunk. ---
 	cont.differencesFound.Store(1)
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 	copierWM, checksumWM = latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, copierWM)
 	require.Empty(t, checksumWM,
-		"checksum_watermark must be empty once the continuous checker found differences, even with a clean initial checker")
+		"checksum_watermark must be empty once the lockless checker found differences, even with a clean initial checker")
 }
 
-// TestInvalidateChecksumWatermarkAfterContinuousDivergence pins the
+// TestInvalidateChecksumWatermarkAfterLocklessDivergence pins the
 // race-closing half of the sentinel-wait fix: a checkpoint row that was
-// persisted WITH a watermark before the continuous checker recorded its
+// persisted WITH a watermark before the lockless checker recorded its
 // difference must be blanked by invalidateChecksumWatermark on the abort
 // path, because resume reads the latest row.
-func TestInvalidateChecksumWatermarkAfterContinuousDivergence(t *testing.T) {
+func TestInvalidateChecksumWatermarkAfterLocklessDivergence(t *testing.T) {
 	t.Parallel()
 	r := setupRunnerForChecksumTest(t, "chkpt_cont_invalidate")
 	advanceRunnerToChecksumWatermarks(t, r)
@@ -221,17 +222,17 @@ func TestInvalidateChecksumWatermarkAfterContinuousDivergence(t *testing.T) {
 	_, checksumWM := latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, checksumWM)
 
-	// No continuous checker, or a clean one: invalidate must be a no-op.
+	// No lockless checker, or a clean one: invalidate must be a no-op.
 	require.NoError(t, r.invalidateChecksumWatermark(t.Context()))
 	_, checksumWM = latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, checksumWM,
-		"invalidate must not touch the watermark when no continuous checker exists")
+		"invalidate must not touch the watermark when no lockless checker exists")
 	cont := &mockChecker{}
-	r.continuousChecker = cont
+	r.locklessChecker = cont
 	require.NoError(t, r.invalidateChecksumWatermark(t.Context()))
 	_, checksumWM = latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, checksumWM,
-		"invalidate must not touch the watermark while the continuous checker is clean")
+		"invalidate must not touch the watermark while the lockless checker is clean")
 
 	// Continuous checker found (and repaired) a difference: the
 	// already-persisted watermark row must be rewritten to empty.
@@ -248,21 +249,21 @@ func TestInvalidateChecksumWatermarkAfterContinuousDivergence(t *testing.T) {
 	require.Zero(t, stale, "no checkpoint row may carry a checksum_watermark after invalidation")
 }
 
-// TestContinuousChecksumDivergenceClearsCheckpointWatermark is the E2E
+// TestLocklessChecksumDivergenceClearsCheckpointWatermark is the E2E
 // version: a defer-cutover migration reaches the sentinel wait, a row in the
-// _new table is corrupted externally, the continuous checksum detects the
+// _new table is corrupted externally, the lockless checksum detects the
 // divergence and deliberately aborts the run — and the final on-disk
 // checkpoint state must carry NO checksum_watermark anywhere, so the
 // operator's re-run re-verifies the whole table instead of silently
-// resuming past the diverged chunk. (The ContinuousChecker is configured
+// resuming past the diverged chunk. (The LocklessChecker is configured
 // without a Recopier, so a confirmed divergence surfaces as
 // ErrPermanentDivergence and aborts rather than self-healing.)
 //
-// Not parallel: it relies on the short continuous-checksum pacing / retry delay
-// set once in TestMain (checksum.ContinuousMinPassInterval = 2s,
-// checksum.DefaultContinuousRetryDelay = 1s) so the divergence is detected and
+// Not parallel: it relies on the short lockless-checksum pacing / retry delay
+// set once in TestMain (checksum.LocklessMinPassInterval = 2s,
+// checksum.DefaultLocklessRetryDelay = 1s) so the divergence is detected and
 // confirmed promptly.
-func TestContinuousChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
+func TestLocklessChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
 	tableName := "cont_chk_clear"
 	tt := testutils.NewTestTable(t, tableName, `CREATE TABLE cont_chk_clear (
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -292,14 +293,14 @@ func TestContinuousChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
 		"expected a checkpoint row with a checksum_watermark during the sentinel wait")
 
 	// Corrupt a row in the new table behind spirit's back. A subsequent
-	// continuous-checksum pass detects the divergence, confirms it on retry
+	// lockless-checksum pass detects the divergence, confirms it on retry
 	// (source unchanged, target still wrong), and aborts the run rather than
 	// allowing cutover.
 	testutils.RunSQL(t, fmt.Sprintf("UPDATE `%s` SET val = 'corrupted' WHERE id = 1", utils.NewTableName(tableName)))
 
 	runErr := running.wait(t)
 	require.Error(t, runErr)
-	require.ErrorContains(t, runErr, "continuous checksum")
+	require.ErrorIs(t, runErr, checksum.ErrPermanentDivergence)
 
 	// The deliberate abort must leave a checkpoint (resume is allowed) ...
 	require.True(t, checkpointTableExists(t, m),
@@ -316,7 +317,7 @@ func TestContinuousChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
 		"SELECT COUNT(*) FROM `%s` WHERE checksum_watermark <> ''", checkpointTable)).Scan(&stale))
 	require.Zero(t, stale,
-		"no checkpoint row may carry a checksum_watermark after the continuous-checksum abort")
+		"no checkpoint row may carry a checksum_watermark after the lockless-checksum abort")
 }
 
 // advanceRunnerToChecksumWatermarks seeds the runner's table and brings both

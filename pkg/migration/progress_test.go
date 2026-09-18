@@ -3,7 +3,9 @@ package migration
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
@@ -65,7 +67,7 @@ func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
 // Reporting the composite in these phases would be actively misleading rather
 // than merely imprecise. The sentinel wait is the pointed case — a human is
 // watching that screen to decide when to cut over, and the only work running is
-// the continuous checker, which takes no throttler at all. Worse, the replica
+// the lockless checker, which takes no throttler at all. Worse, the replica
 // throttler fails closed on a stale signal and Close() stops its poll loop
 // without changing IsThrottled, so a *finished* migration would start reporting
 // itself as paused on replica lag once the signal aged out.
@@ -154,4 +156,24 @@ func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
 	p := m.Progress()
 	require.False(t, p.Resume)
 	require.Equal(t, status.ThrottleStatus{}, p.Throttle)
+}
+
+func TestLocklessProgressSummary(t *testing.T) {
+	stats := checksum.LocklessCheckerStats{CurrentPass: 1, ProgressBasisPoints: 1780, ChunksPassedThisPass: 40, InFlight: 8}
+	require.Contains(t, locklessProgressSummary(stats), "scanning scan≈17.8% passed=40")
+	stats.ProgressBasisPoints = 10000
+	stats.ScanComplete = true
+	stats.InFlight = 0
+	stats.RetryQueueDepth = 1
+	stats.ChunksPassedThisPass = 263
+	summary := locklessProgressSummary(stats)
+	require.Contains(t, summary, "waiting for verification")
+	require.Contains(t, summary, "scan≈100.0% passed=263 retrying=1")
+	require.NotContains(t, summary, "verified")
+	stats.RetryQueueDepth = 0
+	stats.HotChunksDeferredThisPass = 1
+	require.Contains(t, locklessProgressSummary(stats), "waiting for verification")
+	stats.HotChunksDeferredThisPass = 0
+	stats.FirstCleanPassAt = time.Now()
+	require.Contains(t, locklessProgressSummary(stats), "lockless: verified")
 }

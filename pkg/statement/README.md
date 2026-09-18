@@ -379,7 +379,7 @@ Normalization is an **offline, best-effort** approximation of what MySQL does: i
 
 ### RemoveSecondaryIndexes
 
-Removes regular secondary indexes from a CREATE TABLE statement while preserving PRIMARY KEY, UNIQUE, and FULLTEXT indexes:
+Removes regular secondary indexes from a CREATE TABLE statement while preserving PRIMARY KEY, UNIQUE, FULLTEXT, and SPATIAL indexes, plus one regular index if required to support AUTO_INCREMENT. Among supporting regular indexes, it prefers the fewest key parts:
 
 ```go
 original := `CREATE TABLE t1 (
@@ -398,12 +398,21 @@ modified, err := statement.RemoveSecondaryIndexes(original)
 **What's Preserved:**
 - PRIMARY KEY (fundamental to table structure)
 - UNIQUE indexes (enforce data integrity constraints)
-- FULLTEXT indexes (different index type with special requirements)
+- FULLTEXT and SPATIAL indexes (specialized index types)
+- One regular index leading with AUTO_INCREMENT when no retained PRIMARY or UNIQUE key already supports it
 
 **What's Removed:**
-- Regular INDEX (non-unique secondary indexes)
+- Regular INDEX (non-unique secondary indexes), except the required AUTO_INCREMENT support index
 
 This functionality is used by move tables operations to defer regular index creation until after data is copied, improving copy performance.
+
+For example, `PRIMARY KEY(p), KEY wide(id,p), KEY narrow(id)` on a table with
+`id INT AUTO_INCREMENT` retains `narrow` and defers `wide`.
+
+`RemoveSecondaryIndexesForComparison` removes **all** regular indexes so schema
+comparisons can ignore equivalent AUTO_INCREMENT support under different names
+or with different trailing columns. Its output is for comparison only and may
+not be executable DDL.
 
 ### GetMissingSecondaryIndexes
 

@@ -441,7 +441,7 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 	// serialization on recopyLock above still keeps two repairs from overlapping.
 	//
 	// If the parent ctx is cancelled after the DELETE, the target chunk would be
-	// left with rows deleted but not yet rewritten. The continuous-checksum
+	// left with rows deleted but not yet rewritten. The lockless-checksum
 	// loop's cancellation on sentinel drop hits this race, so the whole repair
 	// runs under a context that ignores the parent's cancellation. The bounded
 	// timeout still protects against a hung repair — and because the applier's
@@ -638,7 +638,7 @@ func (c *SingleChecker) ExecTime() time.Duration {
 
 // DifferencesFound returns the number of chunks where a source/target
 // mismatch was detected in the most recent (or in-flight) pass. Used by
-// the continuous-checksum loop to decide whether a cancellation swallow
+// the lockless-checksum loop to decide whether a cancellation swallow
 // is safe.
 func (c *SingleChecker) DifferencesFound() uint64 {
 	return c.differencesFound.Load()

@@ -5,13 +5,18 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
 )
 
-const hotSplitQueryTimeout = 30 * time.Second
+const (
+	hotSplitQueryTimeout        = 30 * time.Second
+	hotSplitTargetRows   uint64 = 128
+	hotSplitPivotCount   uint64 = 5
+)
 
 // splitHotChunk partitions the complete parent predicate, not just the rows
 // currently present. Actual SQL key ordering supports composite, textual, and
@@ -22,12 +27,58 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 	if rows <= 1 {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, hotSplitQueryTimeout)
-	defer cancel()
 	if len(parent.Key) == 0 || parent.Table == nil {
 		return nil, errors.New("hot range has no source key metadata")
 	}
+	if rows <= hotSplitTargetRows {
+		return splitHotChunkAt(ctx, db, parent, rows, rows/2, false)
+	}
+	// Four approximate quantiles and the observed maximum create up to
+	// eleven children. Each lookup is restricted to the remaining suffix,
+	// so SQL ordering guarantees increasing pivots even under concurrent DML.
+	stride := max(uint64(1), rows/hotSplitPivotCount)
+	tail := parent
+	var children []*table.Chunk
+	for i := range hotSplitPivotCount {
+		last := i == hotSplitPivotCount-1
+		offset := stride - 1
+		if last {
+			offset = 0
+		}
+		parts, err := splitHotChunkAt(ctx, db, tail, stride, offset, last)
+		if err != nil {
+			return nil, err
+		}
+		if len(parts) == 0 {
+			// Keep the unsplit suffix: the return below appends tail even
+			// when a later lookup is empty. An empty parent still returns nil.
+			break
+		}
+		children = append(children, parts[0], parts[1])
+		tail = parts[2]
+	}
+	if len(children) == 0 {
+		return nil, nil
+	}
+	return append(children, tail), nil
+}
+
+// splitHotChunkAt isolates one ordered key; the two surrounding predicates
+// preserve gaps and future inserts. The last lookup uses descending order to
+// separate the observed maximum from the still-unbounded tail.
+func splitHotChunkAt(ctx context.Context, db *sql.DB, parent *table.Chunk, rows, offset uint64, descending bool) ([]*table.Chunk, error) {
+	// Each pivot (including its stale-count fallback) gets a bounded query
+	// budget; earlier OFFSET scans do not consume later pivots' time allowance.
+	ctx, cancel := context.WithTimeout(ctx, hotSplitQueryTimeout)
+	defer cancel()
 	keys := table.QuoteColumns(parent.Key)
+	if descending {
+		order := make([]string, len(parent.Key))
+		for i, name := range parent.Key {
+			order[i] = table.QuoteColumns([]string{name}) + " DESC"
+		}
+		keys = strings.Join(order, ",")
+	}
 	// Preserve the server's temporal representation even with parseTime=true,
 	// including fractional seconds and zero dates. Ordering remains on native keys.
 	projections := make([]string, len(parent.Key))
@@ -43,17 +94,20 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 			projections[i] = "CAST(" + projections[i] + " AS CHAR)"
 		}
 	}
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1 OFFSET ?", strings.Join(projections, ","), parent.Table.QuotedTableName, parent.String(), keys)
+	queryPrefix := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1 OFFSET ", strings.Join(projections, ","), parent.Table.QuotedTableName, parent.String(), keys)
 	values := make([]any, len(parent.Key))
 	pointers := make([]any, len(values))
 	for i := range values {
 		pointers[i] = &values[i]
 	}
-	err := db.QueryRowContext(ctx, query, rows/2).Scan(pointers...)
+	// Vitess can lose a prepared LIMIT parameter and send NULL
+	// to MySQL. The offset is an internal uint64, so a decimal literal avoids
+	// that path without interpolating any untrusted SQL.
+	err := db.QueryRowContext(ctx, queryPrefix+strconv.FormatUint(offset, 10)).Scan(pointers...)
 	// The count came from a prior read: deletes may have removed the median.
 	// Retry at the first existing key; an empty source is left to normal retry.
 	if errors.Is(err, sql.ErrNoRows) {
-		err = db.QueryRowContext(ctx, query, 0).Scan(pointers...)
+		err = db.QueryRowContext(ctx, queryPrefix+"0").Scan(pointers...)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

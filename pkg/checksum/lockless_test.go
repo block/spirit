@@ -109,14 +109,14 @@ func (c *testChunker) Tables() []*table.TableInfo { return nil }
 //
 // We pass nil DB pointers (allowed because readChunk is swapped) but the
 // constructor requires non-nil, so use minimal sentinel values.
-func newTestChecker(t *testing.T, chunker table.Chunker, cfg ContinuousCheckerConfig,
+func newTestChecker(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, tgtCount uint64, err error),
-) *ContinuousChecker {
+) *LocklessChecker {
 	t.Helper()
 	// Constructor demands non-nil DBs; we pass empty *sql.DB pointers — they
 	// are never used because readChunk is swapped before Run.
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewContinuousChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -142,12 +142,12 @@ func newTestChecker(t *testing.T, chunker table.Chunker, cfg ContinuousCheckerCo
 // signatures (CRC + count) for source and target independently, so tests can
 // exercise row-count divergence with matching CRCs (the defense-in-depth gap
 // this comparison closes).
-func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg ContinuousCheckerConfig,
+func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, srcCount, tgtCount uint64, err error),
-) *ContinuousChecker {
+) *LocklessChecker {
 	t.Helper()
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewContinuousChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -167,7 +167,7 @@ func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg ContinuousChecke
 // runUntil starts ctr.Run in a goroutine and returns:
 //   - a stop function that cancels and waits for Run to exit
 //   - a channel that receives Run's return value
-func runUntil(t *testing.T, c *ContinuousChecker) (stop func() error, errCh <-chan error) {
+func runUntil(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	out := make(chan error, 1)
@@ -187,8 +187,8 @@ func runUntil(t *testing.T, c *ContinuousChecker) (stop func() error, errCh <-ch
 
 // fastConfig is a default config tuned for fast tests: 50ms retry delay,
 // silent logger.
-func fastConfig() ContinuousCheckerConfig {
-	return ContinuousCheckerConfig{
+func fastConfig() LocklessCheckerConfig {
+	return LocklessCheckerConfig{
 		Concurrency:  4,
 		RetryDelay:   50 * time.Millisecond,
 		MaxQueueSize: 16,
@@ -205,13 +205,13 @@ func (testWriter) Write(p []byte) (int, error) { return len(p), nil }
 // Tests
 // ---------------------------------------------------------------------------
 
-// TestContinuousMinPassIntervalPacesPasses verifies MinPassInterval throttles
+// TestLocklessMinPassIntervalPacesPasses verifies MinPassInterval throttles
 // the gap between passes: the first pass runs immediately, then each subsequent
 // pass waits until MinPassInterval has elapsed since the previous pass started.
 // With an always-clean table, reaching 3 passes therefore cannot happen before
 // 2*MinPassInterval. Only the lower bound is asserted (the upper bound would be
 // timing-flaky).
-func TestContinuousMinPassIntervalPacesPasses(t *testing.T) {
+func TestLocklessMinPassIntervalPacesPasses(t *testing.T) {
 	const interval = 100 * time.Millisecond
 	cfg := fastConfig()
 	cfg.MinPassInterval = interval
@@ -449,7 +449,7 @@ func TestQueueCapBackpressure(t *testing.T) {
 	// 2*Concurrency bound flake at depth 7.) The test cares that the queue
 	// stays bounded near MaxQueueSize, not unbounded — anything dramatically
 	// larger would be the symptom of a real back-pressure failure. See
-	// enqueueRetry's doc comment in continuous.go.
+	// enqueueRetry's doc comment in lockless.go.
 	require.LessOrEqual(t, stats.RetryQueueDepth, cfg.MaxQueueSize+2*cfg.Concurrency+1,
 		"queue depth should stay bounded under back-pressure")
 }
@@ -601,7 +601,7 @@ func TestDivergenceIsFatalAbortsDespiteRecopier(t *testing.T) {
 	require.Positive(t, c.Stats().PermanentFailures)
 }
 
-// fakeFeed is a minimal change.Source double for continuous-checksum tests.
+// fakeFeed is a minimal change.Source double for lockless-checksum tests.
 // Only Flush carries behaviour — it runs flushFn so a test can simulate the
 // target catching up as buffered changes are applied (apply lag draining).
 // Every other method is an inert no-op.
@@ -928,7 +928,7 @@ func TestRecopyNotCalledForHotChunk(t *testing.T) {
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
 }
 
-// TestRecopyOnRowCountMismatch is the continuous-checker analog of the
+// TestRecopyOnRowCountMismatch is the lockless-checker analog of the
 // defense-in-depth fix: the source and target CRCs MATCH on every read, but
 // the row counts differ and stay stable. Before the fix this passed silently
 // (CRC equality alone). Now the count divergence is treated like a checksum
@@ -977,7 +977,7 @@ func TestRecopyOnRowCountMismatch(t *testing.T) {
 }
 
 // TestPermanentDivergenceOnRowCount: with matching CRCs but a stable row-count
-// difference and NO Recopier, the continuous checker must surface
+// difference and NO Recopier, the lockless checker must surface
 // ErrPermanentDivergence — the count mismatch is a real divergence, not a
 // silent pass.
 func TestPermanentDivergenceOnRowCount(t *testing.T) {
@@ -1139,7 +1139,7 @@ func TestHotChunkExactAttemptLimit(t *testing.T) {
 	}
 }
 
-func TestContinuousAutoscaleConcurrency(t *testing.T) {
+func TestLocklessAutoscaleConcurrency(t *testing.T) {
 	old := csTick
 	csTick = 2 * time.Millisecond
 	defer func() { csTick = old }()
@@ -1173,12 +1173,12 @@ func TestContinuousAutoscaleConcurrency(t *testing.T) {
 	}
 }
 
-type blockingContinuousLoad struct {
+type blockingLocklessLoad struct {
 	throttler.Noop
 	entered chan struct{}
 }
 
-func (b *blockingContinuousLoad) BlockWait(ctx context.Context) {
+func (b *blockingLocklessLoad) BlockWait(ctx context.Context) {
 	select {
 	case b.entered <- struct{}{}:
 	default:
@@ -1186,9 +1186,9 @@ func (b *blockingContinuousLoad) BlockWait(ctx context.Context) {
 	<-ctx.Done()
 }
 
-func TestContinuousThrottleCancellation(t *testing.T) {
+func TestLocklessThrottleCancellation(t *testing.T) {
 	cfg := fastConfig()
-	load := &blockingContinuousLoad{entered: make(chan struct{}, 1)}
+	load := &blockingLocklessLoad{entered: make(chan struct{}, 1)}
 	cfg.Throttler = load
 	var reads atomic.Int64
 	c := newTestChecker(t, newTestChunker(10), cfg, func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
@@ -1231,5 +1231,163 @@ func TestChecksumLimiterBoundsInFlightReads(t *testing.T) {
 	case <-entered:
 		t.Fatal("second read started with limit 1")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestScanCompleteWithOutstandingRetry(t *testing.T) {
+	cfg := fastConfig()
+	cfg.RetryDelay = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+			return 1, 2, 100, nil
+		})
+	require.False(t, c.Stats().ScanComplete)
+	stop, _ := runUntil(t, c)
+	defer func() { _ = stop() }()
+	require.Eventually(t, func() bool {
+		s := c.Stats()
+		return s.ScanComplete && s.RetryQueueDepth == 1 && s.InFlight == 0
+	}, 5*time.Second, time.Millisecond)
+	require.Zero(t, c.Stats().PassesCompleted)
+	select {
+	case <-c.FirstCleanPass():
+		t.Fatal("finishing the scan with an unresolved range must not verify the pass")
+	default:
+	}
+}
+
+type blockedFailingScan struct {
+	table.Chunker
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockedFailingScan) IsRead() bool { return false }
+func (c *blockedFailingScan) Next() (*table.Chunk, error) {
+	close(c.started)
+	<-c.release
+	return nil, errors.New("scan failed")
+}
+
+func TestScanCompleteResetsAndExcludesWalkerFailure(t *testing.T) {
+	chunker := newTestChunker(1)
+	c := newTestChecker(t, chunker, fastConfig(),
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+			return 1, 1, 100, nil
+		})
+	blocked := &blockedFailingScan{Chunker: chunker, started: make(chan struct{}), release: make(chan struct{})}
+	c.chunker = blocked
+	c.scanComplete.Store(true) // Completion from the preceding pass must reset.
+	done := make(chan error, 1)
+	go func() { done <- c.Run(t.Context()) }()
+	<-blocked.started
+	require.False(t, c.Stats().ScanComplete)
+	close(blocked.release)
+	require.ErrorContains(t, <-done, "scan failed")
+	require.False(t, c.Stats().ScanComplete)
+}
+
+func TestLocklessNextPassSchedule(t *testing.T) {
+	cfg := fastConfig()
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return 7, 7, 100, nil
+		})
+	require.True(t, c.Stats().NextPassAt.IsZero())
+	start := time.Now()
+	stop, _ := runUntil(t, c)
+	stop = sync.OnceValue(stop)
+	t.Cleanup(func() { _ = stop() })
+	require.Eventually(t, func() bool { return !c.Stats().NextPassAt.IsZero() }, time.Second, time.Millisecond)
+	stats := c.Stats()
+	require.Equal(t, uint64(1), stats.CurrentPass)
+	require.Equal(t, uint64(1), stats.PassesCompleted)
+	require.False(t, stats.FirstCleanPassAt.IsZero())
+	require.WithinDuration(t, start.Add(time.Hour), stats.NextPassAt, time.Second)
+	_ = stop()
+	require.True(t, c.Stats().NextPassAt.IsZero())
+}
+
+func TestRunUntilClean(t *testing.T) {
+	for _, mode := range []string{"clean", "hot", "divergent", "repaired"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := fastConfig()
+			cfg.RetryDelay = time.Millisecond
+			cfg.MaxHotAttempts = 2
+			cfg.MinPassInterval = time.Hour
+			if mode == "repaired" {
+				cfg.Recopier = &fakeRecopier{}
+			}
+			c := newTestChecker(t, newTestChunker(1), cfg,
+				func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+					switch mode {
+					case "clean":
+						return 1, 1, 10, nil
+					case "hot":
+						return int64(attempt), 0, 10, nil
+					default:
+						return 1, 0, 10, nil
+					}
+				})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			var err error
+			if mode == "hot" || mode == "repaired" {
+				done := make(chan error, 1)
+				go func() { done <- c.RunUntilClean(ctx) }()
+				require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, 2*time.Second, time.Millisecond)
+				select {
+				case early := <-done:
+					t.Fatalf("unverified pass returned early: %v", early)
+				default:
+				}
+				cancel()
+				err = <-done
+			} else {
+				err = c.RunUntilClean(ctx)
+			}
+			switch mode {
+			case "clean":
+				require.NoError(t, err)
+				require.Equal(t, uint64(1), c.Stats().PassesCompleted)
+				require.False(t, c.Stats().FirstCleanPassAt.IsZero())
+			case "divergent":
+				require.ErrorIs(t, err, ErrPermanentDivergence)
+			default:
+				require.ErrorIs(t, err, context.Canceled)
+				require.Equal(t, uint64(1), c.Stats().PassesCompleted)
+				require.True(t, c.Stats().FirstCleanPassAt.IsZero(), "a completed pass with deferred or repaired chunks cannot authorize cutover")
+			}
+		})
+	}
+}
+
+func TestHotSnapshotAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		enabled        bool
+		source, target uint64
+		depth, changes int
+		want           bool
+	}{
+		{"disabled", false, 1, 1, 1, 0, false},
+		{"source oversized", true, 129, 1, 1, 0, false},
+		{"target oversized", true, 1, 129, 1, 0, false},
+		{"first root retry", true, 1, 1, 0, 0, false},
+		{"proven hot root", true, 128, 128, 0, 1, true},
+		{"small descendant", true, 128, 128, 1, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			c := &LocklessChecker{cfg: LocklessCheckerConfig{SnapshotHotChunks: tc.enabled}}
+			c.snapshotChunk = func(context.Context, *table.Chunk) (*hotSnapshot, error) {
+				called = true
+				return nil, nil // capture declined; admission is what this test checks
+			}
+			result := &workResult{item: &workItem{splitDepth: tc.depth, consecutiveSrcChanged: tc.changes}, newSrc: chunkSig{count: tc.source}, newTgt: chunkSig{count: tc.target}}
+			require.False(t, c.tryHotSnapshot(t.Context(), result))
+			require.Equal(t, tc.want, called)
+		})
 	}
 }

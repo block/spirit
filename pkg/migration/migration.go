@@ -79,6 +79,8 @@ type Migration struct {
 	// WriteThreads are ignored, and each pool's starting size and ceiling are
 	// derived from the instance instead — see the override in
 	// setupCopierCheckerAndReplClient and autoscale.ReadBounds. See issue #831.
+	EnableExperimentalLocklessChecksum bool `name:"enable-experimental-lockless-checksum" help:"EXPERIMENTAL: verify with optimistic reads and retries instead of checksum locks and long-lived snapshots. Cutover locking is unchanged." default:"false"`
+
 	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: size the copy, apply and checksum thread pools from the instance and scale them on throttler feedback. Overrides --threads and --write-threads. Requires an Aurora target" optional:"" default:"false"`
 	// TargetChunkSize is the in-memory byte budget the copier sizes each copy
 	// chunk against (the memory signal; see table.DefaultTargetChunkBytes and

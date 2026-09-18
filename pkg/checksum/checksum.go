@@ -160,7 +160,7 @@ type AutoscaleConfig struct {
 // throttlers are open, so they type-assert for this and wire it later.
 //
 // It is an optional interface rather than part of Checker so that test doubles
-// and the continuous checker (which manages its own pacing) do not have to
+// and the lockless checker (which manages its own pacing) do not have to
 // carry a method they have no use for.
 type ThrottleAware interface {
 	SetThrottler(t throttler.Throttler)
