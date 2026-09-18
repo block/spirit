@@ -2235,6 +2235,19 @@ const (
 )
 
 // TableOption is used for parsing table option from SQL.
+//
+// OriginTextPosition and OriginalText give the option's span in the statement
+// text: the option runs from OriginTextPosition() for len(OriginalText()) bytes,
+// so a caller rewriting the text can cut or replace it exactly. Only
+// TableOptionAutoIncrement carries them. Every other option type leaves the
+// position at 0 and the text empty, and a position of 0 is indistinguishable
+// from an option at the start of the statement, so check Tp before trusting it.
+//
+// Extending this to another option type means recording both ends in that
+// option's grammar rule, each anchored on a terminal. goyacc gives a reduce
+// action no position of its own — $$ starts as a copy of $1, so a nonterminal's
+// offset is its first symbol's, and an empty $1 leaves whatever the previous
+// token wrote. See the AUTO_INCREMENT rule in parser.y for how that is done.
 type TableOption struct {
 	node
 	Tp            TableOptionType

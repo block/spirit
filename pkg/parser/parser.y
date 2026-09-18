@@ -12280,7 +12280,27 @@ TableOption:
 	}
 |	ForceOpt "AUTO_INCREMENT" EqOpt LengthNum
 	{
-		$$ = &ast.TableOption{Tp: ast.TableOptionAutoIncrement, UintValue: $4.(uint64), BoolValue: $1.(bool)}
+		opt := &ast.TableOption{Tp: ast.TableOptionAutoIncrement, UintValue: $4.(uint64), BoolValue: $1.(bool)}
+		// Record the option's span in the statement text. A caller rewriting
+		// the text — stripping the instance-specific counter out of a schema
+		// file, say — then gets the bytes to cut from the parser, instead of
+		// searching for the keyword, which would mean re-implementing MySQL's
+		// quoting and comment rules outside the parser.
+		//
+		// Both ends sit on a terminal. goyacc gives a reduce action no position
+		// of its own: $$ starts as a copy of $1, so a nonterminal's offset is
+		// its first symbol's, and an empty $1 leaves whatever the previous
+		// token wrote. $1 here is ForceOpt, empty unless FORCE was given, so
+		// the start comes off FORCE when present and off the keyword when not.
+		// $4 is LengthNum -> NUM -> intLit, single-symbol productions that
+		// never rewrite ident, so it still carries the literal's own text.
+		start := parser.startOffset(&yyS[yypt-2])
+		if $1.(bool) {
+			start = parser.startOffset(&yyS[yypt-3])
+		}
+		opt.SetOriginTextPosition(start)
+		parser.setNodeText(opt, parser.src[start:parser.literalEndOffset(&yyS[yypt])])
+		$$ = opt
 	}
 |	"AVG_ROW_LENGTH" EqOpt LengthNum
 	{
