@@ -50,7 +50,7 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 	for i := range values {
 		pointers[i] = &values[i]
 	}
-	// PlanetScale/Vitess can lose a prepared LIMIT parameter and send NULL
+	// Vitess can lose a prepared LIMIT parameter and send NULL
 	// to MySQL. The offset is an internal uint64, so a decimal literal avoids
 	// that path without interpolating any untrusted SQL.
 	err := db.QueryRowContext(ctx, query+strconv.FormatUint(rows/2, 10)).Scan(pointers...)

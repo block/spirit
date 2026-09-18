@@ -405,7 +405,7 @@ func TestHotSplitFailureDefersWithoutVerification(t *testing.T) {
 	require.ErrorIs(t, res.err, context.Canceled)
 }
 
-// TestHotSplitDoesNotPrepareOffset guards the PlanetScale/Vitess path where
+// TestHotSplitDoesNotPrepareOffset guards the Vitess path where
 // a prepared LIMIT offset can reach the tablet as NULL. Check real MySQL's
 // session counters so both lookups must use the text protocol.
 func TestHotSplitDoesNotPrepareOffset(t *testing.T) {
