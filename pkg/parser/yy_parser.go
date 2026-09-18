@@ -279,6 +279,16 @@ func (*Parser) startOffset(v *yySymType) int {
 	return v.offset
 }
 
+// literalEndOffset returns the offset just past the token text a symbol carries.
+// endOffset locates a construct's end from the symbol that follows it, so it is
+// no help for the last symbol of a production; this measures the symbol itself.
+// It holds only for a symbol that still carries a terminal's text: a token, or a
+// nonterminal reached from one through single-symbol productions whose actions
+// leave ident alone.
+func (*Parser) literalEndOffset(v *yySymType) int {
+	return v.offset + len(v.ident)
+}
+
 func (parser *Parser) endOffset(v *yySymType) int {
 	offset := v.offset
 	for offset > 0 && unicode.IsSpace(rune(parser.src[offset-1])) {

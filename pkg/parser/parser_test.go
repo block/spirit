@@ -1778,3 +1778,137 @@ func TestDualPassword(t *testing.T) {
 	}
 	RunTest(t, table, false)
 }
+
+// TestTableOptionOriginTextSpan pins the span the parser records for the
+// AUTO_INCREMENT table option: the option runs from OriginTextPosition() for
+// len(OriginalText()) bytes. Callers that rewrite the statement text — such as
+// stripping the instance-specific counter out of a schema file — cut that range,
+// rather than re-deriving it by scanning, which would mean re-implementing
+// MySQL's quoting and comment rules outside the parser.
+//
+// The keyword also appears in column attributes, string literals, comments and
+// quoted identifiers, and the option itself may carry a FORCE prefix, spacing
+// around the `=`, or a comment before its value. The span must cover the whole
+// option and nothing else, which is the property these cases check.
+func TestTableOptionOriginTextSpan(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string // exact option text the recorded span must cover
+	}{
+		{
+			name: "between other options",
+			sql:  "CREATE TABLE `t` (`id` bigint NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB AUTO_INCREMENT=500 DEFAULT CHARSET=utf8mb4",
+			want: "AUTO_INCREMENT=500",
+		},
+		{
+			name: "last option",
+			sql:  "CREATE TABLE `t` (`id` bigint) ENGINE=InnoDB AUTO_INCREMENT=42",
+			want: "AUTO_INCREMENT=42",
+		},
+		{
+			name: "lowercase and no equals sign",
+			sql:  "CREATE TABLE `t` (`id` bigint) ENGINE=InnoDB auto_increment 77 DEFAULT CHARSET=utf8mb4",
+			want: "auto_increment 77",
+		},
+		{
+			name: "spaced out equals sign and a leading zero",
+			sql:  "CREATE TABLE `t` (`id` bigint) AUTO_INCREMENT   =   018 DEFAULT CHARSET=utf8mb4",
+			want: "AUTO_INCREMENT   =   018",
+		},
+		{
+			name: "FORCE prefix",
+			sql:  "CREATE TABLE `t` (`id` bigint) ENGINE=InnoDB FORCE AUTO_INCREMENT = 100 DEFAULT CHARSET=utf8mb4",
+			want: "FORCE AUTO_INCREMENT = 100",
+		},
+		{
+			name: "comment before the value",
+			sql:  "CREATE TABLE `t` (`id` bigint) AUTO_INCREMENT=/* reset me */ 9 DEFAULT CHARSET=utf8mb4",
+			want: "AUTO_INCREMENT=/* reset me */ 9",
+		},
+		{
+			name: "value at the limit of uint64",
+			sql:  "CREATE TABLE `t` (`id` bigint) AUTO_INCREMENT=18446744073709551615",
+			want: "AUTO_INCREMENT=18446744073709551615",
+		},
+		{
+			name: "past a decoy in a table comment",
+			sql:  "CREATE TABLE `t` (`id` bigint) ENGINE=InnoDB COMMENT='rolls over at auto_increment=999' AUTO_INCREMENT=500",
+			want: "AUTO_INCREMENT=500",
+		},
+		{
+			name: "past a decoy in the table name",
+			sql:  "CREATE TABLE `AUTO_INCREMENT=1` (`id` bigint) ENGINE=InnoDB AUTO_INCREMENT=500",
+			want: "AUTO_INCREMENT=500",
+		},
+		{
+			name: "past a decoy in a column default",
+			sql:  "CREATE TABLE `t` (`n` varchar(64) DEFAULT 'AUTO_INCREMENT=123') ENGINE=InnoDB AUTO_INCREMENT=500",
+			want: "AUTO_INCREMENT=500",
+		},
+		{
+			name: "multi-line, as SHOW CREATE TABLE emits it",
+			sql:  "CREATE TABLE `t` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=900 DEFAULT CHARSET=utf8mb4",
+			want: "AUTO_INCREMENT=900",
+		},
+		{
+			name: "option on a line of its own",
+			sql:  "CREATE TABLE `t` (`id` bigint) ENGINE=InnoDB\n  AUTO_INCREMENT=7\n  DEFAULT CHARSET=utf8mb4",
+			want: "AUTO_INCREMENT=7",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			opts := autoIncrementOptions(t, c.sql)
+			require.Len(t, opts, 1, "statement must carry one AUTO_INCREMENT table option")
+			requireSpan(t, c.sql, opts[0], c.want)
+		})
+	}
+}
+
+// Each AUTO_INCREMENT option gets its own span, so a statement repeating the
+// option does not have both point at the first one.
+func TestTableOptionOriginTextSpanRepeated(t *testing.T) {
+	sql := "CREATE TABLE `t` (`id` bigint) AUTO_INCREMENT=1 ENGINE=InnoDB AUTO_INCREMENT=2"
+	opts := autoIncrementOptions(t, sql)
+	require.Len(t, opts, 2)
+	requireSpan(t, sql, opts[0], "AUTO_INCREMENT=1")
+	requireSpan(t, sql, opts[1], "AUTO_INCREMENT=2")
+}
+
+// A table with no AUTO_INCREMENT option records nothing, so a zero offset is not
+// mistaken for an option sitting at the start of the statement.
+func TestTableOptionOriginTextSpanAbsent(t *testing.T) {
+	stmt, err := parser.New().ParseOneStmt("CREATE TABLE `t` (`id` bigint) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", "", "")
+	require.NoError(t, err)
+	for _, opt := range stmt.(*ast.CreateTableStmt).Options {
+		require.NotEqual(t, ast.TableOptionAutoIncrement, opt.Tp)
+	}
+}
+
+func autoIncrementOptions(t *testing.T, sql string) []*ast.TableOption {
+	t.Helper()
+	stmt, err := parser.New().ParseOneStmt(sql, "", "")
+	require.NoError(t, err)
+	create, ok := stmt.(*ast.CreateTableStmt)
+	require.True(t, ok)
+	var found []*ast.TableOption
+	for _, opt := range create.Options {
+		if opt.Tp == ast.TableOptionAutoIncrement {
+			found = append(found, opt)
+		}
+	}
+	return found
+}
+
+// requireSpan checks that the option's span covers want and that it sits where
+// the parser says it does, rather than merely holding the right text.
+func requireSpan(t *testing.T, sql string, opt *ast.TableOption, want string) {
+	t.Helper()
+	require.Equal(t, want, opt.OriginalText())
+	start := opt.OriginTextPosition()
+	require.GreaterOrEqual(t, start, 0)
+	require.LessOrEqual(t, start+len(want), len(sql))
+	require.Equal(t, want, sql[start:start+len(want)])
+}

@@ -5,13 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
-	"github.com/block/spirit/pkg/parser"
-	"github.com/block/spirit/pkg/parser/ast"
-	"github.com/block/spirit/pkg/parser/format"
 )
 
 // TableSchema represents a table's name and its raw CREATE TABLE DDL statement.
@@ -37,8 +33,15 @@ const (
 	WithoutArchiveTables
 
 	// WithStrippedAutoIncrement removes the AUTO_INCREMENT=N table option from
-	// CREATE TABLE statements. This is useful when comparing schemas to avoid
-	// spurious diffs caused by differing auto-increment counters.
+	// CREATE TABLE statements, leaving every other byte as MySQL emitted it, so
+	// a table that carries a counter and one that does not come back in the same
+	// format. Use it when the DDL text is itself the output — a schema file, a
+	// stored snapshot — and one instance's counter must not be baked into it.
+	//
+	// It is not needed to compare two schemas. statement.Diff already ignores
+	// the counter, via DiffOptions.IgnoreAutoIncrement (default true).
+	//
+	// See StripAutoIncrement.
 	WithStrippedAutoIncrement
 )
 
@@ -51,32 +54,6 @@ var archiveTableRegexp = regexp.MustCompile(`^.*_archive_[0-9]{4}(_[0-9]{2}(_[0-
 // <name>_archive_YYYY_MM_DD.
 func IsArchiveTable(name string) bool {
 	return archiveTableRegexp.MatchString(name)
-}
-
-// StripAutoIncrement removes the AUTO_INCREMENT=N table option from a
-// CREATE TABLE statement. This is useful when comparing schemas to avoid
-// spurious diffs caused by differing auto-increment counters.
-func StripAutoIncrement(stmt string) string {
-	node, err := parser.New().ParseOneStmt(stmt, "", "")
-	if err != nil {
-		return stmt
-	}
-	create, ok := node.(*ast.CreateTableStmt)
-	if !ok {
-		return stmt
-	}
-	originalCount := len(create.Options)
-	create.Options = slices.DeleteFunc(create.Options, func(opt *ast.TableOption) bool {
-		return opt.Tp == ast.TableOptionAutoIncrement
-	})
-	if len(create.Options) == originalCount {
-		return stmt
-	}
-	var restored strings.Builder
-	if err := create.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &restored)); err != nil {
-		return stmt
-	}
-	return restored.String()
 }
 
 // LoadSchemaFromDB retrieves all table schemas from the database using the
@@ -118,7 +95,10 @@ func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]
 			return nil, fmt.Errorf("failed to get CREATE TABLE for %s: %w", name, err)
 		}
 		if optSet[WithStrippedAutoIncrement] {
-			createStmt = StripAutoIncrement(createStmt)
+			createStmt, err = StripAutoIncrement(createStmt)
+			if err != nil {
+				return nil, fmt.Errorf("failed to strip AUTO_INCREMENT from CREATE TABLE for %s: %w", name, err)
+			}
 		}
 		tables = append(tables, TableSchema{Name: tbl, Schema: createStmt})
 	}
