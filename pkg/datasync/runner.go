@@ -1721,22 +1721,7 @@ func (r *Runner) Status() string {
 		// between them is how much re-reading a crash would cost.
 		b.Row("binlog", "position=%s  deltas=%d  %s", pos, pending, change.StatusRow(repl))
 		if checker != nil {
-			stats := checker.Stats()
-			b.Row("verify", "pass=%d  estimated-progress=%.1f%%  passed=%d  emitted=%d  retry-queue=%d  hot=%d  in-flight=%d  mismatches=%d  recopies=%d  hot-deferred=%d  hot-split=%d  walker-stalls=%d  permanent-failures=%d",
-				stats.CurrentPass,
-				float64(stats.ProgressBasisPoints)/100,
-				stats.ChunksPassedThisPass,
-				stats.ChunksThisPass,
-				stats.RetryQueueDepth,
-				stats.HotChunkCount,
-				stats.InFlight,
-				stats.MismatchesThisPass,
-				stats.RecopiesThisPass,
-				stats.HotChunksDeferredThisPass,
-				stats.HotChunksSplitThisPass,
-				stats.WalkerStalls,
-				stats.PermanentFailures,
-			)
+			appendVerificationStatus(b, checker.Stats())
 		}
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
 		return b.String()
@@ -1787,4 +1772,22 @@ func (r *Runner) Cancel() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// appendVerificationStatus separates traversal from unresolved verification.
+// Split parents are retired work, so passed/emitted is not a completion ratio.
+func appendVerificationStatus(b *status.Block, stats checksum.ContinuousCheckerStats) {
+	scan := fmt.Sprintf("scan≈%.1f%%", float64(stats.ProgressBasisPoints)/100)
+	if stats.ScanComplete {
+		scan = "scan complete"
+	}
+	b.Row("verify", "pass=%d  %s", stats.CurrentPass, scan)
+	b.Row("", "remaining: %d retrying (%d hot), %d in flight, %d deferred",
+		stats.RetryQueueDepth, stats.HotChunkCount, stats.InFlight, stats.HotChunksDeferredThisPass)
+	b.Row("", "activity this pass: %d splits, %d mismatch observations, %d recopies",
+		stats.HotChunksSplitThisPass, stats.MismatchesThisPass, stats.RecopiesThisPass)
+	if stats.RecopiesThisPass > 0 {
+		b.Row("", "repaired ranges need verification in the next pass")
+	}
+	b.Row("", "permanent failures: %d  walker stalls: %d", stats.PermanentFailures, stats.WalkerStalls)
 }

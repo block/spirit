@@ -251,6 +251,11 @@ type ContinuousCheckerStats struct {
 	// over keyspace distance or estimated rows, depending on the chunker.
 	ProgressBasisPoints uint64
 
+	// ScanComplete means the walker exhausted the current pass successfully.
+	// Retries, in-flight reads, repairs, or deferred ranges may still prevent
+	// verification; an estimate of 100% does not imply ScanComplete.
+	ScanComplete bool
+
 	// MismatchesThisPass is how many chunks mismatched on their initial
 	// (fresh-walk) read in the current pass and were enqueued for retry.
 	// At the end of a completed pass this equals PassedSecondAttemptThisPass +
@@ -338,6 +343,7 @@ type ContinuousChecker struct {
 
 	// atomically-updated counters. The "ThisPass" counters reset at the
 	// start of each pass; lifetime counters accumulate forever.
+	scanComplete           atomic.Bool
 	passesCompleted        atomic.Uint64
 	currentPass            atomic.Uint64
 	chunksThisPass         atomic.Uint64
@@ -609,6 +615,7 @@ func (c *ContinuousChecker) Run(ctx context.Context) error {
 				return fmt.Errorf("reset chunker for pass %d: %w", passNum, err)
 			}
 		}
+		c.scanComplete.Store(false)
 		c.currentPass.Store(passNum)
 		c.chunksThisPass.Store(0)
 		c.hotChunksSplitThisPass.Store(0)
@@ -848,6 +855,9 @@ func (c *ContinuousChecker) runOnePass(ctx context.Context, workCh chan<- *workI
 						return err
 					}
 				default:
+				}
+				if ctx.Err() == nil {
+					c.scanComplete.Store(true)
 				}
 				continue
 			}
@@ -1309,6 +1319,7 @@ func (c *ContinuousChecker) Stats() ContinuousCheckerStats {
 		ChunksThisPass:                c.chunksThisPass.Load(),
 		ChunksPassedThisPass:          c.chunksPassedThisPass.Load(),
 		ProgressBasisPoints:           progressBasisPoints,
+		ScanComplete:                  c.scanComplete.Load(),
 		MismatchesThisPass:            c.mismatchesThisPass.Load(),
 		PassedFirstAttemptThisPass:    c.passedFirstAttemptThisPass.Load(),
 		PassedSecondAttemptThisPass:   c.passedSecondAttemptThisPass.Load(),
