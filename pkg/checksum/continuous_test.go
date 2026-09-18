@@ -1233,3 +1233,78 @@ func TestChecksumLimiterBoundsInFlightReads(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+func TestScanCompleteWithOutstandingRetry(t *testing.T) {
+	cfg := fastConfig()
+	cfg.RetryDelay = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+			return 1, 2, 100, nil
+		})
+	require.False(t, c.Stats().ScanComplete)
+	stop, _ := runUntil(t, c)
+	defer func() { _ = stop() }()
+	require.Eventually(t, func() bool {
+		s := c.Stats()
+		return s.ScanComplete && s.RetryQueueDepth == 1 && s.InFlight == 0
+	}, 5*time.Second, time.Millisecond)
+	require.Zero(t, c.Stats().PassesCompleted)
+	select {
+	case <-c.FirstCleanPass():
+		t.Fatal("finishing the scan with an unresolved range must not verify the pass")
+	default:
+	}
+}
+
+type blockedFailingScan struct {
+	table.Chunker
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockedFailingScan) IsRead() bool { return false }
+func (c *blockedFailingScan) Next() (*table.Chunk, error) {
+	close(c.started)
+	<-c.release
+	return nil, errors.New("scan failed")
+}
+
+func TestScanCompleteResetsAndExcludesWalkerFailure(t *testing.T) {
+	chunker := newTestChunker(1)
+	c := newTestChecker(t, chunker, fastConfig(),
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+			return 1, 1, 100, nil
+		})
+	blocked := &blockedFailingScan{Chunker: chunker, started: make(chan struct{}), release: make(chan struct{})}
+	c.chunker = blocked
+	c.scanComplete.Store(true) // Completion from the preceding pass must reset.
+	done := make(chan error, 1)
+	go func() { done <- c.Run(t.Context()) }()
+	<-blocked.started
+	require.False(t, c.Stats().ScanComplete)
+	close(blocked.release)
+	require.ErrorContains(t, <-done, "scan failed")
+	require.False(t, c.Stats().ScanComplete)
+}
+
+func TestContinuousNextPassSchedule(t *testing.T) {
+	cfg := fastConfig()
+	cfg.MinPassInterval = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return 7, 7, 100, nil
+		})
+	require.True(t, c.Stats().NextPassAt.IsZero())
+	start := time.Now()
+	stop, _ := runUntil(t, c)
+	stop = sync.OnceValue(stop)
+	t.Cleanup(func() { _ = stop() })
+	require.Eventually(t, func() bool { return !c.Stats().NextPassAt.IsZero() }, time.Second, time.Millisecond)
+	stats := c.Stats()
+	require.Equal(t, uint64(1), stats.CurrentPass)
+	require.Equal(t, uint64(1), stats.PassesCompleted)
+	require.False(t, stats.FirstCleanPassAt.IsZero())
+	require.WithinDuration(t, start.Add(time.Hour), stats.NextPassAt, time.Second)
+	_ = stop()
+	require.True(t, c.Stats().NextPassAt.IsZero())
+}
