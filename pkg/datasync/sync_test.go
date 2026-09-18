@@ -1220,6 +1220,16 @@ func TestSyncVerifyExistingTargetTableRequiresExactSchema(t *testing.T) {
 		wantDiff string // empty means the target must be accepted
 	}{
 		{
+			name:   "different AUTO_INCREMENT supporting names",
+			source: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id))",
+			target: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY target_ai(id))",
+		},
+		{
+			name:   "different AUTO_INCREMENT supporting widths",
+			source: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id))",
+			target: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id,p))",
+		},
+		{
 			name:   "identical",
 			source: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
 			target: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",

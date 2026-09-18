@@ -1083,17 +1083,17 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 // disagreeing. TestSyncVerifyExistingTargetTableRequiresExactSchema pins it.
 //
 // Regular secondary indexes are excluded from the comparison on both sides.
-// With DeferSecondaryIndexes the target is deliberately created without them,
+// With DeferSecondaryIndexes the target omits deferrable regular indexes,
 // and an attempt that died mid-copy leaves it that way; restoreSecondaryIndexes
 // re-derives whatever is missing once the copy completes. UNIQUE, FULLTEXT and
 // SPATIAL indexes are kept on the initial CREATE, so those are still compared,
 // as are columns, the primary key, constraints and table options.
 func (r *Runner) verifyExistingTargetTable(tableName, sourceCreate, targetCreate string) error {
-	sourceCmp, err := statement.RemoveSecondaryIndexes(sourceCreate)
+	sourceCmp, err := statement.RemoveSecondaryIndexesForComparison(sourceCreate)
 	if err != nil {
 		return fmt.Errorf("failed to parse CREATE TABLE for source %s: %w", tableName, err)
 	}
-	targetCmp, err := statement.RemoveSecondaryIndexes(targetCreate)
+	targetCmp, err := statement.RemoveSecondaryIndexesForComparison(targetCreate)
 	if err != nil {
 		return fmt.Errorf("failed to parse CREATE TABLE for target %s: %w", tableName, err)
 	}

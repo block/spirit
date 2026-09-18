@@ -62,15 +62,15 @@ type Sync struct {
 	// batching trade-off. Defaults to change.DefaultFlushInterval.
 	FlushInterval time.Duration `name:"flush-interval" help:"How often to flush buffered changes to the target during continuous sync." default:"30s"`
 
-	// DeferSecondaryIndexes creates the target tables without their secondary
+	// DeferSecondaryIndexes creates the target tables without their deferrable regular
 	// indexes, then adds the indexes back once the initial copy has completed.
-	// Bulk-loading an index-free table is faster and lighter on temporary
+	// Bulk-loading a table with fewer indexes is faster and lighter on temporary
 	// space; the indexes are rebuilt in one ALTER per table afterwards. Only
 	// safe when the target is not yet serving reads, because the tables briefly
 	// lack their secondary indexes. UNIQUE/FULLTEXT/SPATIAL indexes are kept on
-	// the initial CREATE (only regular secondary indexes are deferred), the
+	// the initial CREATE, as is a regular index required by AUTO_INCREMENT, the
 	// same as `move --defer-secondary-indexes`.
-	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Create target tables without secondary indexes, then add them after the initial copy." default:"false"`
+	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Defer regular indexes until after the initial copy, preserving required AUTO_INCREMENT support." default:"false"`
 
 	// Force, when set, makes the runner wipe the sync-owned objects on the
 	// target at startup — the target copies of the source tables plus the sync

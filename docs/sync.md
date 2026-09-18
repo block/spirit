@@ -156,12 +156,14 @@ the replication-latency vs. batching trade-off.
 - Type: Boolean
 - Default value: `false`
 
-When set to `true`, the target tables are created **without their regular
-secondary indexes**, and the indexes are added back in a single `ALTER` per
+When set to `true`, the target tables are created **with deferrable regular
+secondary indexes omitted**, and the indexes are added back in a single `ALTER` per
 table once the initial copy has completed, before the continuous phase begins.
-Bulk-loading an index-free table is faster and lighter on temporary space; only
+Bulk-loading a table with fewer indexes is faster and lighter on temporary space; only
 regular secondary indexes are deferred — `PRIMARY`, `UNIQUE`, `FULLTEXT` and
-`SPATIAL` indexes are kept on the initial `CREATE`. This mirrors
+`SPATIAL` indexes are kept on the initial `CREATE`. If no retained primary or
+unique key starts with the `AUTO_INCREMENT` column, one regular supporting
+index is also kept, preferring the fewest key parts. This mirrors
 [`move --defer-secondary-indexes`](move.md#defer-secondary-indexes).
 
 Use it only when the target is **not yet serving reads**: the tables briefly

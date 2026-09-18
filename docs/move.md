@@ -66,7 +66,7 @@ Each continuous-checksum pass runs once with no internal retry (the loop itself 
 - Type: Boolean
 - Default value: `false`
 
-When set to `true`, target tables are created without secondary indexes. The indexes are restored from the source schema just before cutover. This can significantly speed up the initial data load for tables with many secondary indexes.
+When set to `true`, target tables are created without deferrable regular secondary indexes. PRIMARY, UNIQUE, FULLTEXT, and SPATIAL indexes are preserved, as is one regular index needed to support AUTO_INCREMENT (preferring the fewest key parts). The deferred indexes are restored from the source schema just before cutover. This can significantly speed up the initial data load for tables with many secondary indexes.
 
 ### force
 

@@ -15,23 +15,60 @@ import (
 
 // RemoveSecondaryIndexes takes a CREATE TABLE statement and returns a modified version
 // without secondary indexes (regular INDEX only). PRIMARY KEY, UNIQUE, and FULLTEXT
-// indexes are preserved.
+// indexes are preserved, as is an index needed to support AUTO_INCREMENT.
 func RemoveSecondaryIndexes(createStmt string) (string, error) {
+	return removeSecondaryIndexes(createStmt, true)
+}
+
+// RemoveSecondaryIndexesForComparison removes every regular index, including
+// AUTO_INCREMENT support. Its output is for schema comparison, not execution.
+func RemoveSecondaryIndexesForComparison(createStmt string) (string, error) {
+	return removeSecondaryIndexes(createStmt, false)
+}
+
+func removeSecondaryIndexes(createStmt string, preserveAutoIncrement bool) (string, error) {
 	ct, err := ParseCreateTable(createStmt)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse CREATE TABLE: %w", err)
 	}
 
-	// Filter out regular INDEX entries from the constraints
+	// InnoDB requires AUTO_INCREMENT to lead an index. Retained primary
+	// and unique keys can satisfy it; otherwise keep one supporting regular
+	// index. ParseCreateTable normalizes inline PRIMARY KEY and UNIQUE clauses.
+	needsIndex := make(map[string]bool)
+	for _, column := range ct.GetColumns() {
+		if preserveAutoIncrement && column.AutoInc {
+			needsIndex[strings.ToLower(column.Name)] = true
+		}
+	}
+	for _, index := range ct.GetIndexes() {
+		if (index.Type == "PRIMARY KEY" || index.Type == "UNIQUE") && len(index.ColumnList) > 0 {
+			delete(needsIndex, strings.ToLower(index.ColumnList[0].Name))
+		}
+	}
+
+	// Prefer the fewest key parts; ties retain source declaration order.
+	support := make(map[string]*ast.Constraint)
+	for _, constraint := range ct.Raw.Constraints {
+		if constraint.Tp != ast.ConstraintKey && constraint.Tp != ast.ConstraintIndex {
+			continue
+		}
+		if len(constraint.Keys) == 0 || constraint.Keys[0].Column == nil {
+			continue
+		}
+		name := strings.ToLower(constraint.Keys[0].Column.Name.O)
+		if needsIndex[name] && (support[name] == nil || len(constraint.Keys) < len(support[name].Keys)) {
+			support[name] = constraint
+		}
+	}
 	filteredConstraints := make([]*ast.Constraint, 0)
 	for _, constraint := range ct.Raw.Constraints {
-		// Keep everything except regular INDEX
 		switch constraint.Tp { //nolint:exhaustive
 		case ast.ConstraintKey, ast.ConstraintIndex:
-			// Skip regular indexes
-			continue
+			if len(constraint.Keys) > 0 && constraint.Keys[0].Column != nil && support[strings.ToLower(constraint.Keys[0].Column.Name.O)] == constraint {
+				filteredConstraints = append(filteredConstraints, constraint)
+			}
 		default:
-			// Keep PRIMARY KEY, UNIQUE, FULLTEXT, SPATIAL, etc.
 			filteredConstraints = append(filteredConstraints, constraint)
 		}
 	}
@@ -67,12 +104,20 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 
 	// Build a map of existing indexes on the target (all secondary indexes)
 	targetIndexes := make(map[string]bool)
+	targetDefinitions := make(map[string]bool)
 	for _, constraint := range targetCT.Raw.Constraints {
 		// Skip PRIMARY KEY, but include all other index types
 		if constraint.Tp == ast.ConstraintPrimaryKey {
 			continue
 		}
-		targetIndexes[constraint.Name] = true
+		if constraint.Name != "" {
+			targetIndexes[constraint.Name] = true
+		}
+		definition, err := unnamedIndexDefinition(constraint)
+		if err != nil {
+			return "", err
+		}
+		targetDefinitions[definition] = true
 	}
 
 	// Find missing indexes from source
@@ -95,7 +140,15 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 		}
 
 		// Check if this index exists on target
-		if !targetIndexes[constraint.Name] {
+		exists := targetIndexes[constraint.Name]
+		if constraint.Name == "" {
+			definition, err := unnamedIndexDefinition(constraint)
+			if err != nil {
+				return "", err
+			}
+			exists = targetDefinitions[definition]
+		}
+		if !exists {
 			missingIndexes = append(missingIndexes, constraint)
 		}
 	}
@@ -195,4 +248,22 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 	}
 	// Combine all ADD INDEX clauses into a single ALTER TABLE statement
 	return fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(tableName), strings.Join(alterClauses, ", ")), nil
+}
+
+// unnamedIndexDefinition compares unnamed indexes by their full definition,
+// including key order, expressions, prefix lengths, and options.
+func unnamedIndexDefinition(constraint *ast.Constraint) (string, error) {
+	copy := *constraint
+	copy.Name = ""
+	switch copy.Tp { //nolint:exhaustive
+	case ast.ConstraintKey:
+		copy.Tp = ast.ConstraintIndex
+	case ast.ConstraintUniq, ast.ConstraintUniqKey:
+		copy.Tp = ast.ConstraintUniqIndex
+	}
+	var sb strings.Builder
+	if err := copy.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)); err != nil {
+		return "", fmt.Errorf("failed to restore index definition: %w", err)
+	}
+	return sb.String(), nil
 }
