@@ -1482,6 +1482,9 @@ func (r *Runner) Progress() status.Progress {
 	case status.Checksum:
 		checksum = r.checker.GetProgress()
 		summary = "Checksum Progress=" + checksum.String()
+		if checker, ok := r.checker.(*locklessChecker); ok {
+			summary = locklessProgressSummary(checker.Stats())
+		}
 	}
 
 	// Get per-table progress if available (multi-table migrations).
@@ -2067,15 +2070,15 @@ func (r *Runner) Status() string {
 		// threads/throttled mirror the copier row's throttled=: without them a
 		// checksum that is deliberately paused or scaled down looks identical
 		// to one that is simply slow.
-		b.Row("checksum", "%6.2f%%  %d/%d%s",
-			progress.Fraction()*100,
-			progress.RowsChecked,
-			progress.RowsTotal,
-			checksum.StatusSuffix(r.checker),
-		)
 		if checker, ok := r.checker.(*locklessChecker); ok {
-			stats := checker.Stats()
-			b.Row("verify", "experimental lockless: pass=%d scan≈%.1f%% scan-complete=%t retrying=%d in-flight=%d deferred=%d", stats.CurrentPass, float64(stats.ProgressBasisPoints)/100, stats.ScanComplete, stats.RetryQueueDepth, stats.InFlight, stats.HotChunksDeferredThisPass)
+			b.Row("checksum", "%s", locklessProgressSummary(checker.Stats()))
+		} else {
+			b.Row("checksum", "%6.2f%%  %d/%d%s",
+				progress.Fraction()*100,
+				progress.RowsChecked,
+				progress.RowsTotal,
+				checksum.StatusSuffix(r.checker),
+			)
 		}
 		b.Row("binlog", "deltas=%d  %s", r.replClient.GetDeltaLen(), change.StatusRow(r.replClient))
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())

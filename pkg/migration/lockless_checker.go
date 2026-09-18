@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"time"
 
@@ -86,4 +87,17 @@ func (c *locklessChecker) ExecTime() time.Duration {
 		return c.elapsed
 	}
 	return time.Since(c.started)
+}
+
+// locklessProgressSummary separates estimated traversal from the clean-pass
+// gate. Exhausting the walker does not mean outstanding reads/retries passed.
+func locklessProgressSummary(stats checksum.LocklessCheckerStats) string {
+	phase := "scanning"
+	if stats.ScanComplete {
+		phase = "waiting for verification"
+	}
+	if !stats.FirstCleanPassAt.IsZero() {
+		phase = "verified"
+	}
+	return fmt.Sprintf("experimental lockless: %s pass=%d scan≈%.1f%% passed=%d retrying=%d in-flight=%d deferred=%d", phase, stats.CurrentPass, float64(stats.ProgressBasisPoints)/100, stats.ChunksPassedThisPass, stats.RetryQueueDepth, stats.InFlight, stats.HotChunksDeferredThisPass)
 }
