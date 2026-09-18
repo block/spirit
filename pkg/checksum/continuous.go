@@ -48,6 +48,13 @@
 // Every child needs fresh verification. Split parents never count as passed.
 // Depth, per-root (shared by descendants), and per-pass budgets bound work.
 //
+// With SnapshotHotChunks, small unresolved hot ranges freeze a finite source
+// PK/CRC image after a target-key census. Retries require actual matching target
+// reads for those images and absence for observed target-only keys. Later inserts
+// do not expand this work set. No stream-backed matches are accepted. Snapshots
+// that exceed their row/byte budget fall back to normal retries; unresolved
+// snapshots defer without making the pass clean.
+//
 // Hot chunks slow but do not block pass completion: they cycle to the back
 // of the FIFO while other entries resolve. After MaxHotAttempts observations,
 // a still-changing chunk is deferred to the next pass. The pass is not clean
@@ -168,6 +175,9 @@ type ContinuousCheckerConfig struct {
 	// subdivide immediately until at most 128 source rows are observed. Each
 	// child is independently read; parent signatures are not reused.
 	SplitHotChunks bool
+	// SnapshotHotChunks freezes bounded per-row evidence for small hot ranges.
+	// Target reads must satisfy every obligation; stream images are not accepted.
+	SnapshotHotChunks bool
 	// Throttler pauses new checks under target load; in-flight repairs finish.
 	Throttler throttler.Throttler
 	// Autoscale bounds live checks using target load and change-feed backlog.
@@ -388,6 +398,9 @@ type ContinuousChecker struct {
 	firstCleanPassOnce sync.Once
 	firstCleanPassCh   chan struct{}
 
+	// snapshotChunk captures bounded per-row evidence for a proven-hot range.
+	snapshotChunk func(context.Context, *table.Chunk) (*hotSnapshot, error)
+
 	// readChunk performs the source+target CRC read for a single chunk and
 	// returns the new source CRC, new target CRC, source row count, and
 	// target row count. The two counts are compared as a defense-in-depth
@@ -414,6 +427,7 @@ type chunkSig struct {
 // originalSrc is updated each time we observe the source change while the
 // chunk is still pending — see the "hot chunk" path in the package doc.
 type retryEntry struct {
+	snapshot    *hotSnapshot
 	splitBudget *atomic.Uint64 // shared by all descendants of one walker range
 	chunk       *table.Chunk
 	fresh       bool
@@ -440,6 +454,7 @@ type retryEntry struct {
 // the fresh-walk path (where a mismatch enqueues a new retryEntry) from
 // the retry path (where the policy of pkg-doc step 2 applies).
 type workItem struct {
+	snapshot    *hotSnapshot
 	splitBudget *atomic.Uint64
 	chunk       *table.Chunk
 	splitDepth  int
@@ -457,6 +472,7 @@ type workItem struct {
 // workResult is what workers send back to the dispatcher. The driver then
 // applies pass/retry policy and updates counters.
 type workResult struct {
+	snapshot *hotSnapshot
 	item     *workItem
 	children []*table.Chunk
 
@@ -536,6 +552,9 @@ func NewContinuousChecker(
 		chunker:          chunker,
 		feed:             feed,
 		firstCleanPassCh: make(chan struct{}),
+	}
+	c.snapshotChunk = func(ctx context.Context, chunk *table.Chunk) (*hotSnapshot, error) {
+		return captureHotSnapshot(ctx, sourceDB, targetDB, chunk)
 	}
 	c.readChunk = readChunkCRC2(sourceDB, targetDB)
 	c.splitChunk = func(ctx context.Context, chunk *table.Chunk, rows uint64) ([]*table.Chunk, error) {
@@ -789,6 +808,7 @@ func (c *ContinuousChecker) runOnePass(ctx context.Context, workCh chan<- *workI
 					dueHead = e
 					emit = &workItem{
 						chunk:                 e.chunk,
+						snapshot:              e.snapshot,
 						isRetry:               !e.fresh,
 						splitDepth:            e.splitDepth,
 						splitBudget:           e.splitBudget,
@@ -995,8 +1015,8 @@ func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bo
 	}
 	// Descendants already belong to a proven-hot range. Do not make each
 	// level wait through another pair of hotness retries. Small descendants
-	// retain normal verification/retry handling until stream-aware comparison
-	// is available; neither size nor ancestry can make a range pass.
+	// use ordinary retries or the opt-in per-row snapshot drain; neither size
+	// nor ancestry can make a range pass.
 	if item.splitDepth > 0 {
 		if res.newSrc.count <= hotSplitTargetRows {
 			return false
@@ -1028,11 +1048,51 @@ func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bo
 	return len(res.children) != 0
 }
 
+// tryHotSnapshot is reached only after aggregate reads establish a changing
+// range and splitting declines it. Oversized ranges retain ordinary retries.
+func (c *ContinuousChecker) tryHotSnapshot(ctx context.Context, res *workResult) bool {
+	if !c.cfg.SnapshotHotChunks || res.newSrc.count > hotSplitTargetRows || res.newTgt.count > hotSplitTargetRows {
+		return false
+	}
+	if res.item.splitDepth == 0 && res.item.consecutiveSrcChanged < 1 {
+		return false
+	}
+	snapshot, err := c.snapshotChunk(ctx, res.item.chunk)
+	if err != nil {
+		res.err = fmt.Errorf("capture hot range snapshot: %w", err)
+		return true
+	}
+	if snapshot == nil {
+		return false
+	}
+	c.cfg.Logger.Info("continuous checksum: draining hot range snapshot", "chunk", res.item.chunk.String(), "rows", len(snapshot.pending))
+	c.checkHotSnapshot(ctx, res, snapshot)
+	return true
+}
+
+func (c *ContinuousChecker) checkHotSnapshot(ctx context.Context, res *workResult, snapshot *hotSnapshot) {
+	res.snapshot = snapshot
+	res.passed, res.err = snapshot.check(ctx)
+	if res.err != nil {
+		res.err = fmt.Errorf("verify hot range snapshot: %w", res.err)
+	}
+	res.deferHot = !res.passed && snapshot.attempts >= c.cfg.MaxHotAttempts
+	if res.passed {
+		c.cfg.Logger.Info("continuous checksum: hot range snapshot verified", "chunk", res.item.chunk.String(), "attempts", snapshot.attempts)
+	} else if res.err == nil {
+		c.cfg.Logger.Debug("continuous checksum: hot range snapshot pending", "chunk", res.item.chunk.String(), "rows_remaining", len(snapshot.pending), "attempts", snapshot.attempts)
+	}
+}
+
 // executeWork runs the source+target read for a single workItem and applies
 // the pass criterion, returning a result that the dispatcher can act on
 // without re-reading state.
 func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *workResult {
 	res := &workResult{item: item}
+	if item.snapshot != nil {
+		c.checkHotSnapshot(ctx, res, item.snapshot)
+		return res
+	}
 
 	start := time.Now()
 	srcCRC, tgtCRC, srcCount, tgtCount, err := c.readChunk(ctx, item.chunk)
@@ -1085,6 +1145,9 @@ func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *wo
 		// it to the next pass without claiming it verified; a small number of
 		// permanently hot chunks must not hold one pass open forever.
 		if c.trySplitHot(ctx, res) {
+			return res
+		}
+		if c.tryHotSnapshot(ctx, res) {
 			return res
 		}
 		if item.attempts+1 >= c.cfg.MaxHotAttempts {
@@ -1154,6 +1217,9 @@ func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *wo
 			if c.trySplitHot(ctx, res) {
 				return res
 			}
+			if c.tryHotSnapshot(ctx, res) {
+				return res
+			}
 			res.deferHot = item.attempts+1 >= c.cfg.MaxHotAttempts
 			return res
 		}
@@ -1195,6 +1261,9 @@ func (c *ContinuousChecker) handleResult(res *workResult, enqueueRetry func(*ret
 		return nil
 	}
 	if res.deferHot {
+		if res.snapshot != nil {
+			c.cfg.Logger.Info("continuous checksum: unresolved snapshot deferred", "chunk", res.item.chunk.String(), "rows_remaining", len(res.snapshot.pending), "attempts", res.snapshot.attempts)
+		}
 		c.hotChunksDeferredThisPass.Add(1)
 		c.cfg.Logger.Info("continuous checksum: hot chunk deferred to next pass",
 			"chunk", res.item.chunk.String(),
@@ -1205,6 +1274,11 @@ func (c *ContinuousChecker) handleResult(res *workResult, enqueueRetry func(*ret
 			"targetCount", res.newTgt.count,
 		)
 		return nil
+	}
+	if res.snapshot != nil {
+		return enqueueRetry(&retryEntry{chunk: res.item.chunk, snapshot: res.snapshot, splitBudget: res.item.splitBudget,
+			splitDepth: res.item.splitDepth, point: res.item.point, attempts: res.item.attempts + 1,
+			consecutiveSrcChanged: max(2, res.item.consecutiveSrcChanged), notBefore: time.Now().Add(c.cfg.RetryDelay)})
 	}
 	if res.permanent {
 		c.permanentFailures.Add(1)

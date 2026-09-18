@@ -750,8 +750,19 @@ no long-lived `REPEATABLE READ` snapshots. It uses the same column mappings as
 the normal checksum, including renamed columns, and supports checksum load
 throttling and experimental autoscaling.
 
-Cutover still requires a complete clean pass. Hot ranges are split; unresolved
-ranges remain on retries or are revisited in another pass. Completing a scan or
+Cutover still requires a complete clean pass. Hot ranges are split. Small unresolved ranges then use a finite per-row
+snapshot drain: read target keys first, freeze source PK/CRC32 images once, and
+retry target reads until each frozen image has matched and every observed
+target-only key is absent. Later inserts do not expand the frozen work set, so
+an append-heavy tail can converge. There are no stream-backed or soft passes.
+A continuously modified row whose frozen image is never read back equal remains
+unresolved, as does a source row deleted before its image could be verified.
+
+Each side is limited to 128 rows, with a combined 64 KiB key-data budget;
+oversized ranges stay on normal splitting/retries. Snapshot reads have a
+30-second timeout. Snapshot retries use the ordinary retry delay and bounded
+hot-attempt count, then defer without authorizing cutover. Unresolved ranges
+are revisited in another pass. Completing a scan or
 deferring a hot range does not authorize cutover. Stable divergence aborts the
 migration instead of repairing the shadow table. Persistently hot workloads can
 therefore prevent completion; cancel the run or resume with the default checker.

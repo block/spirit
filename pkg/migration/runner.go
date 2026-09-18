@@ -985,7 +985,7 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 			cfg: checksum.ContinuousCheckerConfig{
 				Concurrency:    r.migration.Threads,
 				Autoscale:      checksum.AutoscaleConfig{Enabled: autoscaleEnabled, MaxThreads: maxRead},
-				SplitHotChunks: true, DivergenceIsFatal: true, Logger: r.logger,
+				SplitHotChunks: true, SnapshotHotChunks: true, DivergenceIsFatal: true, Logger: r.logger,
 			},
 		}
 		r.logger.Warn("experimental lockless checksum enabled; verification uses optimistic reads, cutover locking is unchanged")
