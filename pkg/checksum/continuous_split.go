@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,17 +44,20 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 			projections[i] = "CAST(" + projections[i] + " AS CHAR)"
 		}
 	}
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1 OFFSET ?", strings.Join(projections, ","), parent.Table.QuotedTableName, parent.String(), keys)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1 OFFSET ", strings.Join(projections, ","), parent.Table.QuotedTableName, parent.String(), keys)
 	values := make([]any, len(parent.Key))
 	pointers := make([]any, len(values))
 	for i := range values {
 		pointers[i] = &values[i]
 	}
-	err := db.QueryRowContext(ctx, query, rows/2).Scan(pointers...)
+	// PlanetScale/Vitess can lose a prepared LIMIT parameter and send NULL
+	// to MySQL. The offset is an internal uint64, so a decimal literal avoids
+	// that path without interpolating any untrusted SQL.
+	err := db.QueryRowContext(ctx, query+strconv.FormatUint(rows/2, 10)).Scan(pointers...)
 	// The count came from a prior read: deletes may have removed the median.
 	// Retry at the first existing key; an empty source is left to normal retry.
 	if errors.Is(err, sql.ErrNoRows) {
-		err = db.QueryRowContext(ctx, query, 0).Scan(pointers...)
+		err = db.QueryRowContext(ctx, query+"0").Scan(pointers...)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

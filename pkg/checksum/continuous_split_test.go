@@ -404,3 +404,53 @@ func TestHotSplitFailureDefersWithoutVerification(t *testing.T) {
 	require.True(t, c.trySplitHot(ctx, res))
 	require.ErrorIs(t, res.err, context.Canceled)
 }
+
+// TestHotSplitDoesNotPrepareOffset guards the PlanetScale/Vitess path where
+// a prepared LIMIT offset can reach the tablet as NULL. Check real MySQL's
+// session counters so both lookups must use the text protocol.
+func TestHotSplitDoesNotPrepareOffset(t *testing.T) {
+	schema, setupDB := testutils.CreateUniqueTestDatabase(t)
+	_, err := setupDB.ExecContext(t.Context(), "CREATE TABLE t (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = setupDB.ExecContext(t.Context(), "INSERT INTO t VALUES (10),(20),(30)")
+	require.NoError(t, err)
+
+	cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(schema))
+	require.NoError(t, err)
+	cfg.InterpolateParams = false
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	ti := table.NewTableInfo(db, schema, "t")
+	require.NoError(t, ti.SetInfo(t.Context()))
+	parent := &table.Chunk{Key: []string{"id"}, Table: ti, NewTable: ti, AdditionalConditions: "1=1"}
+	prepares := func() uint64 {
+		var name string
+		var count uint64
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			"SHOW SESSION STATUS LIKE 'Com_stmt_prepare'").Scan(&name, &count))
+		return count
+	}
+	for _, tc := range []struct {
+		name  string
+		rows  uint64
+		pivot int
+	}{
+		{"median", 3, 20},
+		{"stale count fallback", 1000, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := prepares()
+			children, err := splitHotChunk(t.Context(), db, parent, tc.rows)
+			require.NoError(t, err)
+			require.Len(t, children, 3)
+			require.Equal(t, before, prepares(), "split lookups must not prepare LIMIT parameters")
+			var pivot int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT id FROM t WHERE "+children[1].String()).Scan(&pivot))
+			require.Equal(t, tc.pivot, pivot)
+		})
+	}
+}
