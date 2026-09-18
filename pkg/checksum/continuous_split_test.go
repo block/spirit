@@ -548,3 +548,44 @@ func TestHotSplitDescendantsDoNotWaitForHotness(t *testing.T) {
 	require.Empty(t, c.executeWork(t.Context(), item).children)
 	require.Equal(t, 1, calls)
 }
+
+// A stale row count models a suffix deleted since the checksum read. Once
+// several pivots have been found, an empty lookup must not discard the tail.
+func TestWideHotSplitRetainsEmptySuffix(t *testing.T) {
+	for _, bounded := range []bool{false, true} {
+		t.Run(fmt.Sprint(bounded), func(t *testing.T) {
+			schema, db := testutils.CreateUniqueTestDatabase(t)
+			_, err := db.ExecContext(t.Context(), "CREATE TABLE t (id INT PRIMARY KEY)")
+			require.NoError(t, err)
+			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (10),(20),(30)")
+			require.NoError(t, err)
+			ti := table.NewTableInfo(db, schema, "t")
+			require.NoError(t, ti.SetInfo(t.Context()))
+			parent := &table.Chunk{Key: []string{"id"}, Table: ti, NewTable: ti, AdditionalConditions: "id <> 25"}
+			if bounded {
+				bound, err := table.NewDatumFromValue(int64(100), "INT")
+				require.NoError(t, err)
+				parent.UpperBound = &table.Boundary{Value: []table.Datum{bound}, Inclusive: false}
+			}
+			children, err := splitHotChunk(t.Context(), db, parent, 1000)
+			require.NoError(t, err)
+			require.Len(t, children, 7, "three pivots plus the still-covered empty suffix")
+			tail := children[len(children)-1]
+			require.Equal(t, parent.UpperBound, tail.UpperBound)
+			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (-1),(15),(25),(35),(99),(100),(101)")
+			require.NoError(t, err)
+			var predicates []string
+			for _, child := range children {
+				predicates = append(predicates, "("+child.String()+")")
+			}
+			var uncovered int
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE ("+strings.Join(predicates, "+")+") <> ("+parent.String()+")").Scan(&uncovered))
+			require.Zero(t, uncovered, "every parent row, including future tail inserts, belongs to exactly one child")
+			_, err = db.ExecContext(t.Context(), "DELETE FROM t")
+			require.NoError(t, err)
+			children, err = splitHotChunk(t.Context(), db, parent, 1000)
+			require.NoError(t, err)
+			require.Nil(t, children, "an empty parent must remain on normal retries")
+		})
+	}
+}

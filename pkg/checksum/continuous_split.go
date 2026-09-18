@@ -52,6 +52,8 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 			return nil, err
 		}
 		if len(parts) == 0 {
+			// Keep the unsplit suffix: the return below appends tail even
+			// when a later lookup is empty. An empty parent still returns nil.
 			break
 		}
 		children = append(children, parts[0], parts[1])
