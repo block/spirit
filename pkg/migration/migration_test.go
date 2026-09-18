@@ -36,8 +36,8 @@ func TestMain(m *testing.M) {
 	// can't race the many t.Parallel() tests. Only the divergence test depends
 	// on these; the defer-cutover tests drop the sentinel well before the first
 	// inter-pass interval, so they run a single pass regardless of the value.
-	checksum.ContinuousMinPassInterval = 2 * time.Second
-	checksum.DefaultContinuousRetryDelay = 1 * time.Second
+	checksum.LocklessMinPassInterval = 2 * time.Second
+	checksum.DefaultLocklessRetryDelay = 1 * time.Second
 	goleak.VerifyTestMain(m)
 }
 

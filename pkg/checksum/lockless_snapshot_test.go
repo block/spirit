@@ -129,7 +129,7 @@ func TestHotSnapshotBoundsAndBudget(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
-func TestContinuousHotSnapshotGate(t *testing.T) {
+func TestLocklessHotSnapshotGate(t *testing.T) {
 	for _, converge := range []bool{true, false} {
 		t.Run(fmt.Sprint(converge), func(t *testing.T) {
 			db, chunk := snapshotTestTables(t, "id INT PRIMARY KEY, value INT", []string{"id"})

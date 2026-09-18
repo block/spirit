@@ -109,14 +109,14 @@ func (c *testChunker) Tables() []*table.TableInfo { return nil }
 //
 // We pass nil DB pointers (allowed because readChunk is swapped) but the
 // constructor requires non-nil, so use minimal sentinel values.
-func newTestChecker(t *testing.T, chunker table.Chunker, cfg ContinuousCheckerConfig,
+func newTestChecker(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, tgtCount uint64, err error),
-) *ContinuousChecker {
+) *LocklessChecker {
 	t.Helper()
 	// Constructor demands non-nil DBs; we pass empty *sql.DB pointers — they
 	// are never used because readChunk is swapped before Run.
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewContinuousChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -142,12 +142,12 @@ func newTestChecker(t *testing.T, chunker table.Chunker, cfg ContinuousCheckerCo
 // signatures (CRC + count) for source and target independently, so tests can
 // exercise row-count divergence with matching CRCs (the defense-in-depth gap
 // this comparison closes).
-func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg ContinuousCheckerConfig,
+func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, srcCount, tgtCount uint64, err error),
-) *ContinuousChecker {
+) *LocklessChecker {
 	t.Helper()
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewContinuousChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -167,7 +167,7 @@ func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg ContinuousChecke
 // runUntil starts ctr.Run in a goroutine and returns:
 //   - a stop function that cancels and waits for Run to exit
 //   - a channel that receives Run's return value
-func runUntil(t *testing.T, c *ContinuousChecker) (stop func() error, errCh <-chan error) {
+func runUntil(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	out := make(chan error, 1)
@@ -187,8 +187,8 @@ func runUntil(t *testing.T, c *ContinuousChecker) (stop func() error, errCh <-ch
 
 // fastConfig is a default config tuned for fast tests: 50ms retry delay,
 // silent logger.
-func fastConfig() ContinuousCheckerConfig {
-	return ContinuousCheckerConfig{
+func fastConfig() LocklessCheckerConfig {
+	return LocklessCheckerConfig{
 		Concurrency:  4,
 		RetryDelay:   50 * time.Millisecond,
 		MaxQueueSize: 16,
@@ -205,13 +205,13 @@ func (testWriter) Write(p []byte) (int, error) { return len(p), nil }
 // Tests
 // ---------------------------------------------------------------------------
 
-// TestContinuousMinPassIntervalPacesPasses verifies MinPassInterval throttles
+// TestLocklessMinPassIntervalPacesPasses verifies MinPassInterval throttles
 // the gap between passes: the first pass runs immediately, then each subsequent
 // pass waits until MinPassInterval has elapsed since the previous pass started.
 // With an always-clean table, reaching 3 passes therefore cannot happen before
 // 2*MinPassInterval. Only the lower bound is asserted (the upper bound would be
 // timing-flaky).
-func TestContinuousMinPassIntervalPacesPasses(t *testing.T) {
+func TestLocklessMinPassIntervalPacesPasses(t *testing.T) {
 	const interval = 100 * time.Millisecond
 	cfg := fastConfig()
 	cfg.MinPassInterval = interval
@@ -449,7 +449,7 @@ func TestQueueCapBackpressure(t *testing.T) {
 	// 2*Concurrency bound flake at depth 7.) The test cares that the queue
 	// stays bounded near MaxQueueSize, not unbounded — anything dramatically
 	// larger would be the symptom of a real back-pressure failure. See
-	// enqueueRetry's doc comment in continuous.go.
+	// enqueueRetry's doc comment in lockless.go.
 	require.LessOrEqual(t, stats.RetryQueueDepth, cfg.MaxQueueSize+2*cfg.Concurrency+1,
 		"queue depth should stay bounded under back-pressure")
 }
@@ -601,7 +601,7 @@ func TestDivergenceIsFatalAbortsDespiteRecopier(t *testing.T) {
 	require.Positive(t, c.Stats().PermanentFailures)
 }
 
-// fakeFeed is a minimal change.Source double for continuous-checksum tests.
+// fakeFeed is a minimal change.Source double for lockless-checksum tests.
 // Only Flush carries behaviour — it runs flushFn so a test can simulate the
 // target catching up as buffered changes are applied (apply lag draining).
 // Every other method is an inert no-op.
@@ -928,7 +928,7 @@ func TestRecopyNotCalledForHotChunk(t *testing.T) {
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
 }
 
-// TestRecopyOnRowCountMismatch is the continuous-checker analog of the
+// TestRecopyOnRowCountMismatch is the lockless-checker analog of the
 // defense-in-depth fix: the source and target CRCs MATCH on every read, but
 // the row counts differ and stay stable. Before the fix this passed silently
 // (CRC equality alone). Now the count divergence is treated like a checksum
@@ -977,7 +977,7 @@ func TestRecopyOnRowCountMismatch(t *testing.T) {
 }
 
 // TestPermanentDivergenceOnRowCount: with matching CRCs but a stable row-count
-// difference and NO Recopier, the continuous checker must surface
+// difference and NO Recopier, the lockless checker must surface
 // ErrPermanentDivergence — the count mismatch is a real divergence, not a
 // silent pass.
 func TestPermanentDivergenceOnRowCount(t *testing.T) {
@@ -1139,7 +1139,7 @@ func TestHotChunkExactAttemptLimit(t *testing.T) {
 	}
 }
 
-func TestContinuousAutoscaleConcurrency(t *testing.T) {
+func TestLocklessAutoscaleConcurrency(t *testing.T) {
 	old := csTick
 	csTick = 2 * time.Millisecond
 	defer func() { csTick = old }()
@@ -1173,12 +1173,12 @@ func TestContinuousAutoscaleConcurrency(t *testing.T) {
 	}
 }
 
-type blockingContinuousLoad struct {
+type blockingLocklessLoad struct {
 	throttler.Noop
 	entered chan struct{}
 }
 
-func (b *blockingContinuousLoad) BlockWait(ctx context.Context) {
+func (b *blockingLocklessLoad) BlockWait(ctx context.Context) {
 	select {
 	case b.entered <- struct{}{}:
 	default:
@@ -1186,9 +1186,9 @@ func (b *blockingContinuousLoad) BlockWait(ctx context.Context) {
 	<-ctx.Done()
 }
 
-func TestContinuousThrottleCancellation(t *testing.T) {
+func TestLocklessThrottleCancellation(t *testing.T) {
 	cfg := fastConfig()
-	load := &blockingContinuousLoad{entered: make(chan struct{}, 1)}
+	load := &blockingLocklessLoad{entered: make(chan struct{}, 1)}
 	cfg.Throttler = load
 	var reads atomic.Int64
 	c := newTestChecker(t, newTestChunker(10), cfg, func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
@@ -1287,7 +1287,7 @@ func TestScanCompleteResetsAndExcludesWalkerFailure(t *testing.T) {
 	require.False(t, c.Stats().ScanComplete)
 }
 
-func TestContinuousNextPassSchedule(t *testing.T) {
+func TestLocklessNextPassSchedule(t *testing.T) {
 	cfg := fastConfig()
 	cfg.MinPassInterval = time.Hour
 	c := newTestChecker(t, newTestChunker(1), cfg,

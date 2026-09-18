@@ -48,9 +48,9 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 	r.status.Set(status.ApplyChangeset)
 	require.Empty(t, r.Progress().ETA)
 	require.Empty(t, r.Progress().Checksum) // The continuous verifier has no finite initial-checksum phase.
-	checker, err := checksum.NewContinuousChecker(&sql.DB{}, &sql.DB{}, table.NewMockChunker("verify", 100), nil, checksum.ContinuousCheckerConfig{})
+	checker, err := checksum.NewLocklessChecker(&sql.DB{}, &sql.DB{}, table.NewMockChunker("verify", 100), nil, checksum.LocklessCheckerConfig{})
 	require.NoError(t, err)
-	r.continuousChecker = checker
+	r.locklessChecker = checker
 	block = r.Status()
 	require.Contains(t, block, "\n  verify")
 	require.Contains(t, block, "remaining: 0 retrying (0 hot), 0 in flight, 0 deferred")
@@ -63,7 +63,7 @@ func TestSyncProgressAndLogFormat(t *testing.T) {
 }
 
 func TestVerificationStatusAfterHotSplits(t *testing.T) {
-	stats := checksum.ContinuousCheckerStats{
+	stats := checksum.LocklessCheckerStats{
 		CurrentPass: 1, ProgressBasisPoints: 10000,
 		ChunksPassedThisPass: 1347, ChunksThisPass: 1397,
 		RetryQueueDepth: 1, MismatchesThisPass: 63, HotChunksSplitThisPass: 49,
@@ -98,7 +98,7 @@ func TestVerificationStatusAfterHotSplits(t *testing.T) {
 }
 
 func TestVerificationStatusBetweenPasses(t *testing.T) {
-	stats := checksum.ContinuousCheckerStats{CurrentPass: 1, PassesCompleted: 1, ScanComplete: true,
+	stats := checksum.LocklessCheckerStats{CurrentPass: 1, PassesCompleted: 1, ScanComplete: true,
 		NextPassAt: time.Date(2026, 9, 18, 16, 0, 0, 0, time.UTC)}
 	b := status.NewBlock("status")
 	appendVerificationStatus(b, stats)

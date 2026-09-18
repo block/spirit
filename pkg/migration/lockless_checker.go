@@ -13,16 +13,16 @@ import (
 	"github.com/block/spirit/pkg/throttler"
 )
 
-// locklessChecker adapts continuous verification to the finite migration gate.
+// locklessChecker adapts lockless verification to the finite migration gate.
 // No repair is allowed: stable divergence fails closed, and hot deferrals must
 // eventually be read equal in a complete pass before cutover can proceed.
 type locklessChecker struct {
 	db       *sql.DB
 	chunker  table.Chunker
 	feed     change.Source
-	cfg      checksum.ContinuousCheckerConfig
+	cfg      checksum.LocklessCheckerConfig
 	mu       sync.RWMutex
-	checker  *checksum.ContinuousChecker
+	checker  *checksum.LocklessChecker
 	started  time.Time
 	elapsed  time.Duration
 	finished bool
@@ -35,7 +35,7 @@ var _ checksum.ThrottleAware = (*locklessChecker)(nil)
 func (c *locklessChecker) SetThrottler(t throttler.Throttler) { c.cfg.Throttler = t }
 
 func (c *locklessChecker) Run(ctx context.Context) error {
-	checker, err := checksum.NewContinuousChecker(c.db, c.db, c.chunker, c.feed, c.cfg)
+	checker, err := checksum.NewLocklessChecker(c.db, c.db, c.chunker, c.feed, c.cfg)
 	if err != nil {
 		return err
 	}
@@ -54,12 +54,12 @@ func (c *locklessChecker) Run(ctx context.Context) error {
 	return checker.RunUntilClean(ctx)
 }
 
-func (c *locklessChecker) Stats() checksum.ContinuousCheckerStats {
+func (c *locklessChecker) Stats() checksum.LocklessCheckerStats {
 	c.mu.RLock()
 	checker := c.checker
 	c.mu.RUnlock()
 	if checker == nil {
-		return checksum.ContinuousCheckerStats{}
+		return checksum.LocklessCheckerStats{}
 	}
 	return checker.Stats()
 }

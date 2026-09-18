@@ -56,7 +56,7 @@ var (
 	// continuous-checksum iterations during the sentinel wait. Without it,
 	// small tables would re-acquire the table lock back-to-back since each
 	// pass finishes in seconds. (Move still drives its own checksum loop; this
-	// stays local until move adopts checksum.ContinuousChecker.)
+	// stays local until move adopts checksum.LocklessChecker.)
 	continuousChecksumMinInterval = 1 * time.Hour
 )
 

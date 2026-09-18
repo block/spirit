@@ -65,7 +65,7 @@ func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
 // Reporting the composite in these phases would be actively misleading rather
 // than merely imprecise. The sentinel wait is the pointed case — a human is
 // watching that screen to decide when to cut over, and the only work running is
-// the continuous checker, which takes no throttler at all. Worse, the replica
+// the lockless checker, which takes no throttler at all. Worse, the replica
 // throttler fails closed on a stale signal and Close() stops its poll loop
 // without changing IsThrottled, so a *finished* migration would start reporting
 // itself as paused on replica lag once the signal aged out.

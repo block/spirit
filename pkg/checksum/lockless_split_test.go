@@ -109,7 +109,7 @@ func TestHotSplitKeepsEmptyGaps(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
-func TestContinuousHotSplit(t *testing.T) {
+func TestLocklessHotSplit(t *testing.T) {
 	for _, hotLeaf := range []bool{false, true} {
 		t.Run(fmt.Sprint(hotLeaf), func(t *testing.T) {
 			chunker := newTestChunker(1)
@@ -230,7 +230,7 @@ func TestHotSplitReadback(t *testing.T) {
 			cfg := fastConfig()
 			cfg.SplitHotChunks = true
 			cfg.RetryDelay = time.Millisecond
-			c, err := NewContinuousChecker(source, target, chunker, nil, cfg)
+			c, err := NewLocklessChecker(source, target, chunker, nil, cfg)
 			require.NoError(t, err)
 			read := c.readChunk
 			var attempts atomic.Int64

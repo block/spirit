@@ -14,7 +14,7 @@ import (
 )
 
 // TestSyncContinuousChecksumFirstCleanPass drives a sync against a quiet
-// table and asserts that the continuous checksum FirstCleanPass signal
+// table and asserts that the lockless checksum FirstCleanPass signal
 // fires after the initial copy completes — i.e. the eventually-consistent
 // verifier observes the target matching the source on its first pass.
 func TestSyncContinuousChecksumFirstCleanPass(t *testing.T) {
@@ -80,7 +80,7 @@ func TestSyncContinuousChecksumFirstCleanPass(t *testing.T) {
 
 // TestSyncContinuousChecksumWithBackgroundWrites drives a sync while a
 // background workload generator inserts/updates/deletes rows on the
-// source. The continuous checksum must still converge to a first clean
+// source. The lockless checksum must still converge to a first clean
 // pass — replication keeps the target close enough behind that the
 // retry path (target catches up to a witnessed source version) closes
 // out drift before it accumulates.
@@ -173,7 +173,7 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 
 	// First clean pass must still fire — give it a generous window to
 	// account for the per-chunk retry delay (default 1m, see
-	// checksum.DefaultContinuousRetryDelay).
+	// checksum.DefaultLocklessRetryDelay).
 	select {
 	case <-runner.FirstCleanPass():
 		t.Logf("FirstCleanPass fired; stats=%+v", runner.ChecksumStats())
