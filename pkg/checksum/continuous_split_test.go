@@ -417,6 +417,8 @@ func TestHotSplitDoesNotPrepareOffset(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(schema))
 	require.NoError(t, err)
+	// Keep bound arguments on the prepared path; client-side interpolation
+	// would hide a regression by leaving Com_stmt_prepare unchanged.
 	cfg.InterpolateParams = false
 	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
