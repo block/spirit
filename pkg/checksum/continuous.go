@@ -42,9 +42,11 @@
 //       lag) reconciles here and passes, so only a mismatch that survives a
 //       full drain returns ErrPermanentDivergence.
 //
-// With SplitHotChunks, two successive source changes subdivide a range into
-// two surrounding ranges and a point read, each with fresh evidence. Split
-// parents are never counted as passed. Depth and per-pass budgets bound work.
+// With SplitHotChunks, two successive source changes trigger subdivision.
+// Large ranges yield up to eleven children; mismatching descendants above 128
+// rows subdivide immediately without waiting for new source-change evidence.
+// Every child needs fresh verification. Split parents never count as passed.
+// Depth, per-root (shared by descendants), and per-pass budgets bound work.
 //
 // Hot chunks slow but do not block pass completion: they cycle to the back
 // of the FIFO while other entries resolve. After MaxHotAttempts observations,
@@ -137,6 +139,7 @@ const (
 const (
 	hotSplitDepthLimit = 32
 	hotSplitPassLimit  = 1024
+	hotSplitRootLimit  = 128
 )
 
 // Shared continuous-checksum pacing. Vars (not consts) so tests can shorten
@@ -411,10 +414,11 @@ type chunkSig struct {
 // originalSrc is updated each time we observe the source change while the
 // chunk is still pending — see the "hot chunk" path in the package doc.
 type retryEntry struct {
-	chunk      *table.Chunk
-	fresh      bool
-	splitDepth int
-	point      bool
+	splitBudget *atomic.Uint64 // shared by all descendants of one walker range
+	chunk       *table.Chunk
+	fresh       bool
+	splitDepth  int
+	point       bool
 
 	originalSrc chunkSig
 	originalTgt chunkSig
@@ -436,9 +440,10 @@ type retryEntry struct {
 // the fresh-walk path (where a mismatch enqueues a new retryEntry) from
 // the retry path (where the policy of pkg-doc step 2 applies).
 type workItem struct {
-	chunk      *table.Chunk
-	splitDepth int
-	point      bool
+	splitBudget *atomic.Uint64
+	chunk       *table.Chunk
+	splitDepth  int
+	point       bool
 
 	isRetry bool
 
@@ -772,6 +777,7 @@ func (c *ContinuousChecker) runOnePass(ctx context.Context, workCh chan<- *workI
 						chunk:                 e.chunk,
 						isRetry:               !e.fresh,
 						splitDepth:            e.splitDepth,
+						splitBudget:           e.splitBudget,
 						point:                 e.point,
 						originalSrc:           e.originalSrc,
 						originalTgt:           e.originalTgt,
@@ -964,8 +970,8 @@ func (c *ContinuousChecker) worker(
 }
 
 // trySplitHot starts after two successive source changes, then immediately
-// subdivides oversized descendants using their newly observed row counts. Splits are bounded
-// independently of retries, so resetting child evidence cannot make a pass
+// subdivides oversized descendants using their newly observed row counts.
+// Splits are bounded independently of retries, so resetting child evidence cannot make a pass
 // unbounded. A failed split keeps the normal retry/deferral policy; splitting
 // is optional and never grants verification. Parent cancellation still aborts.
 func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bool {
@@ -982,6 +988,14 @@ func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bo
 			return false
 		}
 	} else if item.consecutiveSrcChanged < 1 {
+		return false
+	}
+	if item.splitBudget == nil {
+		item.splitBudget = &atomic.Uint64{}
+	}
+	// A lagging or divergent lineage must not spend the whole pass budget.
+	// Charge failed attempts too; siblings share this counter across workers.
+	if item.splitBudget.Add(1) > hotSplitRootLimit {
 		return false
 	}
 	if c.splitAttempts.Add(1) > hotSplitPassLimit {
@@ -1154,7 +1168,7 @@ func (c *ContinuousChecker) handleResult(res *workResult, enqueueRetry func(*ret
 		// The parent is recorded as split, never as passed.
 		c.cfg.Logger.Info("continuous checksum: splitting hot range", "chunk", res.item.chunk.String(), "depth", res.item.splitDepth+1, "children", len(res.children))
 		for i, child := range res.children {
-			if err := enqueueRetry(&retryEntry{chunk: child, fresh: true, splitDepth: res.item.splitDepth + 1, point: i%2 == 1, notBefore: time.Now()}); err != nil {
+			if err := enqueueRetry(&retryEntry{chunk: child, fresh: true, splitBudget: res.item.splitBudget, splitDepth: res.item.splitDepth + 1, point: i%2 == 1, notBefore: time.Now()}); err != nil {
 				return err
 			}
 		}
@@ -1210,6 +1224,7 @@ func (c *ContinuousChecker) handleResult(res *workResult, enqueueRetry func(*ret
 		return enqueueRetry(&retryEntry{
 			chunk:       res.item.chunk,
 			splitDepth:  res.item.splitDepth,
+			splitBudget: res.item.splitBudget,
 			point:       res.item.point,
 			originalSrc: res.newSrc,
 			originalTgt: res.newTgt,
@@ -1235,6 +1250,7 @@ func (c *ContinuousChecker) handleResult(res *workResult, enqueueRetry func(*ret
 	return enqueueRetry(&retryEntry{
 		chunk:                 res.item.chunk,
 		splitDepth:            res.item.splitDepth,
+		splitBudget:           res.item.splitBudget,
 		point:                 res.item.point,
 		originalSrc:           res.newSrc,
 		originalTgt:           res.newTgt,

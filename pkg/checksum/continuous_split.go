@@ -27,8 +27,6 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 	if rows <= 1 {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, hotSplitQueryTimeout)
-	defer cancel()
 	if len(parent.Key) == 0 || parent.Table == nil {
 		return nil, errors.New("hot range has no source key metadata")
 	}
@@ -69,6 +67,10 @@ func splitHotChunk(ctx context.Context, db *sql.DB, parent *table.Chunk, rows ui
 // preserve gaps and future inserts. The last lookup uses descending order to
 // separate the observed maximum from the still-unbounded tail.
 func splitHotChunkAt(ctx context.Context, db *sql.DB, parent *table.Chunk, rows, offset uint64, descending bool) ([]*table.Chunk, error) {
+	// Each pivot (including its stale-count fallback) gets a bounded query
+	// budget; earlier OFFSET scans do not consume later pivots' time allowance.
+	ctx, cancel := context.WithTimeout(ctx, hotSplitQueryTimeout)
+	defer cancel()
 	keys := table.QuoteColumns(parent.Key)
 	if descending {
 		order := make([]string, len(parent.Key))

@@ -463,9 +463,14 @@ func TestWideHotSplitCoverageAndTail(t *testing.T) {
 	schema, db := testutils.CreateUniqueTestDatabase(t)
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE t (a INT, b VARCHAR(20), PRIMARY KEY(a,b))")
 	require.NoError(t, err)
-	values := make([]string, 1000)
-	for i := range values {
-		values[i] = fmt.Sprintf("(%d,'key')", (i+1)*2)
+	values := make([]string, 0, 1000)
+	for i := 1; i <= 991; i++ {
+		values = append(values, fmt.Sprintf("(%d,'key')", i*2))
+	}
+	// The maximum leading key has varying suffixes: descending only the
+	// first column must fail the empty-tail assertion below.
+	for i := range 9 {
+		values = append(values, fmt.Sprintf("(2000,'z%d')", i))
 	}
 	_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES "+strings.Join(values, ","))
 	require.NoError(t, err)
@@ -528,6 +533,7 @@ func TestHotSplitDescendantsDoNotWaitForHotness(t *testing.T) {
 		require.True(t, e.fresh)
 		require.Equal(t, i%2 == 1, e.point)
 		require.Equal(t, 2, e.splitDepth)
+		require.Same(t, item.splitBudget, e.splitBudget)
 		require.WithinDuration(t, time.Now(), e.notBefore, time.Second)
 	}
 	require.Equal(t, uint64(1), c.Stats().MismatchesThisPass)
@@ -588,4 +594,38 @@ func TestWideHotSplitRetainsEmptySuffix(t *testing.T) {
 			require.Nil(t, children, "an empty parent must remain on normal retries")
 		})
 	}
+}
+
+func TestHotSplitBudgetIsSharedPerRoot(t *testing.T) {
+	cfg := fastConfig()
+	cfg.SplitHotChunks = true
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) { return 1, 2, 400000, nil })
+	c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) {
+		return []*table.Chunk{newTestChunk(0, 10), newTestChunk(10, 11), newTestChunk(11, 100)}, nil
+	}
+	first := &workItem{chunk: newTestChunk(0, 100), splitDepth: 1}
+	res := c.executeWork(t.Context(), first)
+	require.Len(t, res.children, 3)
+	var descendants []*retryEntry
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { descendants = append(descendants, e); return nil }))
+	sibling := &workItem{chunk: descendants[0].chunk, splitDepth: 2, splitBudget: descendants[0].splitBudget}
+	for range hotSplitRootLimit - 1 {
+		require.Len(t, c.executeWork(t.Context(), sibling).children, 3)
+	}
+	require.Empty(t, c.executeWork(t.Context(), first).children, "siblings must share the root's cap")
+	require.Equal(t, uint64(hotSplitRootLimit), c.splitAttempts.Load(), "denied root attempts must not charge the shared pass budget")
+	second := &workItem{chunk: newTestChunk(100, 200), splitDepth: 1}
+	require.Len(t, c.executeWork(t.Context(), second).children, 3, "another root retains its split allowance")
+	require.Equal(t, uint64(hotSplitRootLimit+1), c.splitAttempts.Load())
+	// Ordinary retries must keep the lineage budget rather than resetting it.
+	first.isRetry = true
+	first.originalSrc = chunkSig{crc: 9, count: 400000}
+	first.attempts = 1
+	res = c.executeWork(t.Context(), first)
+	var retry *retryEntry
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { retry = e; return nil }))
+	require.NotNil(t, retry)
+	require.Same(t, first.splitBudget, retry.splitBudget)
+	require.False(t, res.passed)
 }

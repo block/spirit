@@ -233,8 +233,12 @@ Sync’s continuous checker uses ordinary reads rather than pinned snapshot pool
 ## Verification of hot ranges
 
 When a mismatching checksum range changes on two successive retries, sync
-splits it around an existing source primary key: a lower range, that key alone,
-and an upper range. The surrounding ranges remain covered even where the source
+splits it around observed source primary keys. Large ranges produce up to eleven
+children: five point reads and six surrounding ranges. The last pivot is the
+observed tuple maximum, leaving an initially empty tail for future inserts.
+Mismatching descendants above 128 source rows subdivide immediately without
+waiting for more source-change observations; smaller descendants use normal
+verification and retries. Small roots retain a three-child split. The surrounding ranges remain covered even where the source
 currently has no rows, so target-only rows and missing inserts are not skipped.
 Composite and textual keys use MySQL's ordering rather than numeric midpoints.
 
@@ -261,7 +265,11 @@ repairs and deferred ranges still require verification in a later pass.
 A failed split query logs a warning and retains the normal bounded retries;
 it cannot mark a range verified. Cancelling the sync still stops verification.
 
-Splitting is bounded to 32 levels and 1,024 split attempts per pass. A single-row
+Splitting is bounded to 32 levels, 128 attempts per original walker range
+(shared by all its descendants), and 1,024 attempts per pass. A large lagging
+range therefore cannot consume the entire pass budget. Each pivot lookup,
+including its stale-count fallback, has a 30-second timeout; a wide split can
+perform up to five such lookups, all cancellable by the parent context. A single-row
 range, an empty source range, or an exhausted split budget continues through the
 normal bounded retry/deferral path. A deferred range still prevents the pass
 from being verified. This improves convergence when a large range contains a few
