@@ -160,7 +160,7 @@ func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
 
 func TestLocklessProgressSummary(t *testing.T) {
 	stats := checksum.LocklessCheckerStats{CurrentPass: 1, ProgressBasisPoints: 1780, ChunksPassedThisPass: 40, InFlight: 8}
-	require.Contains(t, locklessProgressSummary(stats), "scanning pass=1 scan≈17.8% passed=40")
+	require.Contains(t, locklessProgressSummary(stats), "scanning scan≈17.8% passed=40")
 	stats.ProgressBasisPoints = 10000
 	stats.ScanComplete = true
 	stats.InFlight = 0

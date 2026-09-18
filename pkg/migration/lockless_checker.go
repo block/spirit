@@ -99,5 +99,5 @@ func locklessProgressSummary(stats checksum.LocklessCheckerStats) string {
 	if !stats.FirstCleanPassAt.IsZero() {
 		phase = "verified"
 	}
-	return fmt.Sprintf("experimental lockless: %s pass=%d scan≈%.1f%% passed=%d retrying=%d in-flight=%d deferred=%d", phase, stats.CurrentPass, float64(stats.ProgressBasisPoints)/100, stats.ChunksPassedThisPass, stats.RetryQueueDepth, stats.InFlight, stats.HotChunksDeferredThisPass)
+	return fmt.Sprintf("experimental lockless: %s scan≈%.1f%% passed=%d retrying=%d in-flight=%d deferred=%d", phase, float64(stats.ProgressBasisPoints)/100, stats.ChunksPassedThisPass, stats.RetryQueueDepth, stats.InFlight, stats.HotChunksDeferredThisPass)
 }
