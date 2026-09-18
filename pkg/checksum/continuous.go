@@ -161,7 +161,9 @@ type ContinuousCheckerConfig struct {
 	// Concurrency is the number of worker goroutines. Default 4.
 	Concurrency int
 	// SplitHotChunks subdivides repeatedly changing ranges before deferring
-	// them. Each child is independently read; parent signatures are not reused.
+	// them. Large ranges produce up to eleven children; oversized descendants
+	// subdivide immediately until at most 128 source rows are observed. Each
+	// child is independently read; parent signatures are not reused.
 	SplitHotChunks bool
 	// Throttler pauses new checks under target load; in-flight repairs finish.
 	Throttler throttler.Throttler
@@ -937,13 +939,25 @@ func (c *ContinuousChecker) worker(
 	}
 }
 
-// trySplitHot only runs after two successive source changes. Splits are bounded
+// trySplitHot starts after two successive source changes, then immediately
+// subdivides oversized descendants using their newly observed row counts. Splits are bounded
 // independently of retries, so resetting child evidence cannot make a pass
 // unbounded. A failed split keeps the normal retry/deferral policy; splitting
 // is optional and never grants verification. Parent cancellation still aborts.
 func (c *ContinuousChecker) trySplitHot(ctx context.Context, res *workResult) bool {
 	item := res.item
-	if !c.cfg.SplitHotChunks || item.point || res.newSrc.count <= 1 || item.splitDepth >= hotSplitDepthLimit || item.consecutiveSrcChanged < 1 {
+	if !c.cfg.SplitHotChunks || item.point || res.newSrc.count <= 1 || item.splitDepth >= hotSplitDepthLimit {
+		return false
+	}
+	// Descendants already belong to a proven-hot range. Do not make each
+	// level wait through another pair of hotness retries. Small descendants
+	// retain normal verification/retry handling until stream-aware comparison
+	// is available; neither size nor ancestry can make a range pass.
+	if item.splitDepth > 0 {
+		if res.newSrc.count <= hotSplitTargetRows {
+			return false
+		}
+	} else if item.consecutiveSrcChanged < 1 {
 		return false
 	}
 	if c.splitAttempts.Add(1) > hotSplitPassLimit {
@@ -998,6 +1012,9 @@ func (c *ContinuousChecker) executeWork(ctx context.Context, item *workItem) *wo
 
 	// Mismatch. Branch on whether this is the initial read or a retry.
 	if !item.isRetry {
+		if item.splitDepth > 0 && c.trySplitHot(ctx, res) {
+			return res
+		}
 		// Will be enqueued as a new retry by the dispatcher.
 		return res
 	}
@@ -1105,11 +1122,15 @@ func (c *ContinuousChecker) handleResult(res *workResult, enqueueRetry func(*ret
 	}
 	if len(res.children) != 0 {
 		c.hotChunksSplitThisPass.Add(1)
+		if !res.item.isRetry {
+			c.mismatchesDetected.Add(1)
+			c.mismatchesThisPass.Add(1)
+		}
 		// Replace the unresolved parent with independently verified leaves.
 		// The parent is recorded as split, never as passed.
 		c.cfg.Logger.Info("continuous checksum: splitting hot range", "chunk", res.item.chunk.String(), "depth", res.item.splitDepth+1, "children", len(res.children))
 		for i, child := range res.children {
-			if err := enqueueRetry(&retryEntry{chunk: child, fresh: true, splitDepth: res.item.splitDepth + 1, point: i == 1, notBefore: time.Now()}); err != nil {
+			if err := enqueueRetry(&retryEntry{chunk: child, fresh: true, splitDepth: res.item.splitDepth + 1, point: i%2 == 1, notBefore: time.Now()}); err != nil {
 				return err
 			}
 		}

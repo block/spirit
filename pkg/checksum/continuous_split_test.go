@@ -253,8 +253,8 @@ func TestHotSplitReadback(t *testing.T) {
 	}
 }
 
-func TestHotSplitRecursesToRow(t *testing.T) {
-	root := newTestChunk(0, 16)
+func TestHotSplitRecursesToSmallRanges(t *testing.T) {
+	root := newTestChunk(0, 1600)
 	chunker := &testChunker{chunks: []*table.Chunk{root}}
 	cfg := fastConfig()
 	cfg.SplitHotChunks = true
@@ -264,8 +264,8 @@ func TestHotSplitRecursesToRow(t *testing.T) {
 		lo := ch.LowerBound.Value[0].Val.(uint64)
 		hi := ch.UpperBound.Value[0].Val.(uint64)
 		// The broad range cannot match while writes continue. Once isolated,
-		// the hot row can be observed equal without rescanning passed siblings.
-		if lo <= 15 && hi > 15 && hi-lo > 1 {
+		// a small range can be observed equal without rescanning passed siblings.
+		if lo <= 1599 && hi > 1599 && hi-lo > hotSplitTargetRows {
 			return int64(n * 100), -1, hi - lo, nil
 		}
 		return 7, 7, hi - lo, nil
@@ -284,9 +284,9 @@ func TestHotSplitRecursesToRow(t *testing.T) {
 		t.Fatalf("did not converge: %+v", c.Stats())
 	}
 	stats := c.Stats()
-	require.Equal(t, uint64(3), stats.HotChunksSplitThisPass)
-	require.Equal(t, uint64(7), stats.ChunksPassedThisPass)
-	require.Equal(t, uint64(10), stats.ChunksThisPass)
+	require.Equal(t, uint64(4), stats.HotChunksSplitThisPass)
+	require.Equal(t, uint64(9), stats.ChunksPassedThisPass)
+	require.Equal(t, uint64(13), stats.ChunksThisPass)
 	require.Equal(t, stats.MismatchesThisPass, stats.PassedSecondAttemptThisPass+stats.PassedUnder5AttemptsThisPass+stats.PassedUnder10AttemptsThisPass+stats.RecopiesThisPass+stats.HotChunksDeferredThisPass+stats.HotChunksSplitThisPass)
 
 	require.Zero(t, stats.HotChunksDeferredThisPass)
@@ -360,7 +360,8 @@ func TestHotSplitTemporalKeys(t *testing.T) {
 				for _, count := range []uint64{3, 1000} { // median and stale-count fallback to zero date
 					children, err := splitHotChunk(t.Context(), db, parent, count)
 					require.NoError(t, err)
-					require.Len(t, children, 3)
+					require.GreaterOrEqual(t, len(children), 3)
+					require.LessOrEqual(t, len(children), 11)
 					var terms []string
 					for _, ch := range children {
 						terms = append(terms, "("+ch.String()+")")
@@ -447,7 +448,8 @@ func TestHotSplitDoesNotPrepareOffset(t *testing.T) {
 			before := prepares()
 			children, err := splitHotChunk(t.Context(), db, parent, tc.rows)
 			require.NoError(t, err)
-			require.Len(t, children, 3)
+			require.GreaterOrEqual(t, len(children), 3)
+			require.LessOrEqual(t, len(children), 11)
 			require.Equal(t, before, prepares(), "split lookups must not prepare LIMIT parameters")
 			var pivot int
 			require.NoError(t, db.QueryRowContext(t.Context(),
@@ -455,4 +457,94 @@ func TestHotSplitDoesNotPrepareOffset(t *testing.T) {
 			require.Equal(t, tc.pivot, pivot)
 		})
 	}
+}
+
+func TestWideHotSplitCoverageAndTail(t *testing.T) {
+	schema, db := testutils.CreateUniqueTestDatabase(t)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE t (a INT, b VARCHAR(20), PRIMARY KEY(a,b))")
+	require.NoError(t, err)
+	values := make([]string, 1000)
+	for i := range values {
+		values[i] = fmt.Sprintf("(%d,'key')", (i+1)*2)
+	}
+	_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES "+strings.Join(values, ","))
+	require.NoError(t, err)
+	ti := table.NewTableInfo(db, schema, "t")
+	require.NoError(t, ti.SetInfo(t.Context()))
+	parent := &table.Chunk{Key: []string{"a", "b"}, Table: ti, NewTable: ti, AdditionalConditions: "a > 0"}
+	children, err := splitHotChunk(t.Context(), db, parent, 1000)
+	require.NoError(t, err)
+	require.Len(t, children, 11)
+	var predicates []string
+	for i, child := range children {
+		require.Same(t, ti, child.Table)
+		require.Equal(t, parent.AdditionalConditions, child.AdditionalConditions)
+		predicates = append(predicates, "("+child.String()+")")
+		var count int
+		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+child.String()).Scan(&count))
+		if i%2 == 1 {
+			require.Equal(t, 1, count)
+		} else {
+			require.LessOrEqual(t, count, 200)
+		}
+	}
+	tail := children[len(children)-1]
+	require.Nil(t, tail.UpperBound)
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+tail.String()).Scan(&count))
+	require.Zero(t, count, "last pivot should be the observed maximum, not another median")
+	// Later inserts into gaps and beyond the observed maximum stay covered.
+	_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (1,'gap'),(401,'gap'),(2001,'tail'),(-1,'outside')")
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE ("+strings.Join(predicates, "+")+") <> ("+parent.String()+")").Scan(&count))
+	require.Zero(t, count)
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t WHERE "+tail.String()).Scan(&count))
+	require.Equal(t, 1, count)
+}
+
+func TestHotSplitDescendantsDoNotWaitForHotness(t *testing.T) {
+	cfg := fastConfig()
+	cfg.SplitHotChunks = true
+	rows := uint64(10000)
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) { return 1, 2, rows, nil })
+	children := make([]*table.Chunk, 11)
+	for i := range children {
+		children[i] = newTestChunk(uint64(i), uint64(i+1))
+	}
+	calls := 0
+	c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) {
+		calls++
+		return children, nil
+	}
+	item := &workItem{chunk: newTestChunk(0, 100000), splitDepth: 1}
+	res := c.executeWork(t.Context(), item) // fresh descendant: no retry history
+	require.NoError(t, res.err)
+	require.Len(t, res.children, 11)
+	var queued []*retryEntry
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { queued = append(queued, e); return nil }))
+	require.Len(t, queued, 11)
+	for i, e := range queued {
+		require.True(t, e.fresh)
+		require.Equal(t, i%2 == 1, e.point)
+		require.Equal(t, 2, e.splitDepth)
+		require.WithinDuration(t, time.Now(), e.notBefore, time.Second)
+	}
+	require.Equal(t, uint64(1), c.Stats().MismatchesThisPass)
+	require.Zero(t, c.Stats().ChunksPassedThisPass)
+
+	rows = hotSplitTargetRows
+	res = c.executeWork(t.Context(), item)
+	require.Empty(t, res.children)
+	require.False(t, res.passed, "small is not verified")
+	require.Equal(t, 1, calls)
+
+	rows = hotSplitTargetRows + 1
+	c.splitAttempts.Store(hotSplitPassLimit)
+	require.Empty(t, c.executeWork(t.Context(), item).children)
+	require.Equal(t, 1, calls, "fast subdivision must honor the shared pass budget")
+	c.splitAttempts.Store(0)
+	item.splitDepth = hotSplitDepthLimit
+	require.Empty(t, c.executeWork(t.Context(), item).children)
+	require.Equal(t, 1, calls)
 }
