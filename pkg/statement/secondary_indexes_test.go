@@ -892,6 +892,8 @@ func TestRemoveSecondaryIndexesAutoIncrement(t *testing.T) {
 		{"unique", "id INT AUTO_INCREMENT, p INT PRIMARY KEY, KEY redundant(id), UNIQUE KEY ai(id), KEY extra(p)", 0},
 		{"inline unique", "id INT AUTO_INCREMENT UNIQUE, p INT PRIMARY KEY, KEY redundant(id), KEY extra(p)", 0},
 		{"multiple supporting", "id INT AUTO_INCREMENT, p INT PRIMARY KEY, KEY ai(id), KEY redundant(id,p), KEY extra(p)", 1},
+		{"wide declared first", "id INT AUTO_INCREMENT, p INT PRIMARY KEY, KEY redundant(id,p), KEY ai(id), KEY extra(p)", 1},
+		{"functional", "id INT AUTO_INCREMENT, p INT PRIMARY KEY, b VARCHAR(32), KEY ai(id), KEY fn((lower(b)))", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, db := testutils.CreateUniqueTestDatabase(t)
@@ -914,6 +916,7 @@ func TestRemoveSecondaryIndexesAutoIncrement(t *testing.T) {
 				for _, idx := range ct.GetIndexes() {
 					if idx.Type == "INDEX" {
 						count++
+						require.Equal(t, "ai", idx.Name)
 					}
 				}
 				require.Equal(t, tc.regular, count)
@@ -938,4 +941,23 @@ func TestRemoveSecondaryIndexesAutoIncrement(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMissingUnnamedSecondaryIndexes(t *testing.T) {
+	source := "CREATE TABLE t (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p), KEY (id), KEY (p))"
+	stripped, err := RemoveSecondaryIndexes(source)
+	require.NoError(t, err)
+	restore, err := GetMissingSecondaryIndexes(source, stripped, "t")
+	require.NoError(t, err)
+	require.Equal(t, "ALTER TABLE `t` ADD INDEX (`p`)", restore)
+	_, db := testutils.CreateUniqueTestDatabase(t)
+	_, err = db.ExecContext(t.Context(), stripped)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), restore)
+	require.NoError(t, err)
+	var name, target string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE t").Scan(&name, &target))
+	restore, err = GetMissingSecondaryIndexes(source, target, "t")
+	require.NoError(t, err)
+	require.Empty(t, restore)
 }
