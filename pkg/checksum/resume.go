@@ -11,11 +11,20 @@ import (
 // mismatch counter from another. Repair increments the counter before advancing
 // the chunker's watermark; retries reset the chunker before clearing the counter.
 // Capture must be atomic with respect to that reset, not just read in that order.
-type snapshotResume struct{ mu sync.Mutex }
+type snapshotResume struct {
+	mu         sync.Mutex
+	continuous atomic.Bool
+	active     atomic.Bool
+	// Never reset: cancellation must see mismatches across retries.
+	observed atomic.Uint64
+}
 
 func (s *snapshotResume) capture(chunker table.Chunker, differences *atomic.Uint64) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.continuous.Load() {
+		return "", nil
+	}
 	wm, err := chunker.GetLowWatermark()
 	if differences.Load() != 0 {
 		return "", nil

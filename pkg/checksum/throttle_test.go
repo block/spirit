@@ -372,6 +372,9 @@ func TestStatusSuffixEmptyForUnpacedChecker(t *testing.T) {
 // unpacedChecker is a Checker that does not report pacing through Paced.
 type unpacedChecker struct{}
 
+func (unpacedChecker) RunContinuous(context.Context) error { return nil }
+func (unpacedChecker) ContinuousActive() bool              { return false }
+
 func (unpacedChecker) Run(context.Context) error            { return nil }
 func (unpacedChecker) GetProgress() status.ChecksumProgress { return status.ChecksumProgress{} }
 func (unpacedChecker) StartTime() time.Time                 { return time.Time{} }

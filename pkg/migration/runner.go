@@ -37,21 +37,10 @@ var (
 	tableStatUpdateInterval = 5 * time.Minute
 	checkpointTableName     = "_spirit_checkpoint" // const for multi-migration checkpoints.
 	// Sentinel-wait timing lives in pkg/sentinel (sentinel.WaitLimit /
-	// sentinel.CheckInterval / sentinel.TableName) and lockless-checksum
+	// sentinel.CheckInterval / sentinel.TableName) and continuous-checksum
 	// pacing in pkg/checksum (checksum.LocklessMinPassInterval /
 	// checksum.DefaultLocklessRetryDelay), so they are shared with move/sync.
 )
-
-// locklessDivergenceReporter is the minimal view of the sentinel-wait
-// lockless checker that the checkpoint machinery needs: "has this checker
-// observed any divergence?". Both the production *checksum.LocklessChecker
-// and the test checksum.MockChecker satisfy it. Keeping the field this narrow lets the
-// lockless checksum use checksum.LocklessChecker (which is intentionally
-// not a checksum.Checker) without changing DumpCheckpoint /
-// invalidateChecksumWatermark, which only consult DifferencesFound().
-type locklessDivergenceReporter interface {
-	DifferencesFound() uint64
-}
 
 type Runner struct {
 	migration *Migration
@@ -93,30 +82,14 @@ type Runner struct {
 
 	chunkerMu sync.RWMutex // protects copyChunker and checksumChunker from concurrent access
 
-	// locklessChecker is the sentinel-wait re-verification checker built
-	// by runLocklessChecksum. It is deliberately separate from r.checker
-	// (fresh chunker, not wired into resume), but DumpCheckpoint must
-	// consult it: once it has repaired any chunk, the initial checksum's
-	// watermark no longer proves the table clean, so persisting it would
-	// let a resumed run skip re-verifying the repaired range. Written once
-	// by the lockless-checksum goroutine and read by the checkpoint
-	// dumper goroutine — both under checkpointMu.
-	locklessChecker locklessDivergenceReporter
-
 	// lastCheckpoint is when the checkpoint was last persisted and the binlog
 	// position it saved, reported together on the ckpt row of the status
 	// block. The checkpoint itself no longer logs at INFO on every dump
 	// (#329).
 	lastCheckpoint status.LastCheckpoint
 
-	// checkpointMu serializes checkpoint persistence (DumpCheckpoint's
-	// watermark-condition evaluation + INSERT) against the sentinel-abort
-	// path that blanks the persisted checksum_watermark
-	// (invalidateChecksumWatermark). Without it, a periodic dump that
-	// evaluated its conditions just before the lockless checker recorded
-	// a difference could INSERT a stale-watermark row *after* the abort
-	// path's UPDATE, resurrecting the watermark on the latest row — the
-	// row resume reads. It also guards locklessChecker (see above).
+	// checkpointMu serializes periodic dumps with clearing checksum evidence
+	// before continuous verification, so an older dump cannot restore it.
 	checkpointMu sync.Mutex
 
 	// Used by the test-suite and some post-migration output.
@@ -490,26 +463,19 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	// Block on the sentinel table (if defer-cutover is in use). While we
-	// wait, waitOnSentinelTable also runs a "lockless checksum" loop in
-	// the background — see docs/migrate.md for the two-checksum model.
-	// The initial checksum above is the correctness gate; the continuous
-	// checksum opportunistically re-verifies data so that on sentinel drop
-	// we have high confidence even if the wait lasted hours.
-	//
-	// This is invoked even if DeferCutOver is false because it's possible
-	// that the sentinel table was created manually after the migration
-	// started.
+	// Reuse the configured checker while waiting for a sentinel, including one
+	// created manually. The completed initial checksum remains the cutover gate.
 	if r.migration.RespectSentinel {
-		// Block on the sentinel via the shared sentinel.Wait (poll/timeout timing
-		// lives in the sentinel package). The lockless-checksum lifecycle and
-		// watermark invalidation are migration-specific — invalidateChecksumWatermark
-		// scopes its UPDATE by statement because the checkpoint table is shared in
-		// multi-table mode — so they are injected as callbacks. See pkg/sentinel.
 		if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
 			return sentinel.Wait(ctx, sentinel.WaitConfig{
-				Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
-				RunChecksum:         r.runLocklessChecksum,
+				Exists: func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
+				RunChecksum: func(ctx context.Context) error {
+					// Clear evidence before background work, including on a hard crash.
+					if err := r.invalidateChecksumWatermark(context.WithoutCancel(ctx)); err != nil {
+						return err
+					}
+					return r.checker.RunContinuous(ctx)
+				},
 				InvalidateWatermark: r.invalidateChecksumWatermark,
 				Logger:              r.logger,
 			})
@@ -1487,32 +1453,19 @@ func (r *Runner) Progress() status.Progress {
 	}
 }
 
-// throttleStatus reports how the phase named by state is currently being paced,
-// reading only the signals that phase actually honours so that Throttled means
-// the same thing in every phase: this phase is paused right now.
-//
-// Only two phases pace themselves against a throttler — they are the only
-// callers of SetThrottler:
-//
-//   - CopyRows: the copier writes, so it honours every signal in the composite.
-//   - Checksum: narrowed to the load signals, exactly as checksum's
-//     loadOnlyThrottler does (a read-only snapshot pass cannot cause replica
-//     lag, so pausing it on lag would only hold the snapshot open for longer).
-//
-// Every other phase reports the zero value, because nothing there consults a
-// throttler: the sentinel wait runs the lockless checker, which takes no
-// throttler at all, and the changeset applies and cutover are not paced. Those
-// phases previously reported the composite, which made Throttled mean "the
-// server is loaded" there and "this phase is paused" in the two above — and
-// since the replica throttler fails closed on a stale signal and Close() stops
-// its poll loop without changing IsThrottled, a *finished* migration would
-// start reporting itself as paused on replica lag once the signal aged out.
+// throttleStatus reports only signals honored by the work currently running.
+// Checksum passes honor load signals; interval waits and cutover are unpaced.
 func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
 	var t throttler.Throttler
-	switch state { //nolint:exhaustive // only the two paced phases report throttling
+	switch state { //nolint:exhaustive // only paced phases report throttling
 	case status.CopyRows:
 		t = r.currentThrottler()
 	case status.Checksum:
+		t = throttler.GradualOnly(r.currentThrottler())
+	case status.WaitingOnSentinelTable:
+		if r.checker == nil || !r.checker.ContinuousActive() {
+			return status.ThrottleStatus{}
+		}
 		t = throttler.GradualOnly(r.currentThrottler())
 	default:
 		return status.ThrottleStatus{}
@@ -1862,10 +1815,7 @@ func (r *Runner) addsUniqueIndex() bool {
 // would always restart at the copier, but it can now also resume at
 // the checksum phase.
 func (r *Runner) DumpCheckpoint(ctx context.Context) error {
-	// Serialize the whole dump (condition evaluation + INSERT) against
-	// invalidateChecksumWatermark, so the sentinel-abort path can never be
-	// overtaken by an in-flight dump that read its conditions before the
-	// lockless checker recorded a difference. See checkpointMu.
+	// Serialize condition evaluation and persistence with watermark invalidation.
 	r.checkpointMu.Lock()
 	defer r.checkpointMu.Unlock()
 	// Check if replication client and copier are initialized (nil if called before setup completes).
@@ -1884,17 +1834,15 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 		return status.ErrWatermarkNotReady // it might not be ready, we can try again.
 	}
 	// The checker owns verification evidence: traversal alone may include
-	// unresolved retries or repairs. Any mismatch during sentinel verification
-	// also invalidates the initial gate's evidence, forcing a full recheck.
+	// unresolved retries or repairs. Sentinel waiting discards checksum evidence
+	// before the background checker starts, including the gap before its call.
 	var checksumWatermark string
-	if r.status.Get() >= status.Checksum && r.checker != nil {
+	if state := r.status.Get(); state >= status.Checksum && state < status.WaitingOnSentinelTable && r.checker != nil {
 		wm, wmErr := r.checker.ResumeWatermark()
 		if wmErr != nil {
 			return status.ErrWatermarkNotReady
 		}
-		if r.locklessChecker == nil || r.locklessChecker.DifferencesFound() == 0 {
-			checksumWatermark = wm
-		}
+		checksumWatermark = wm
 	}
 
 	// Debug, not Info: the status block's ckpt row reports it instead, so
@@ -1970,6 +1918,12 @@ func (r *Runner) Status() string {
 			r.status.Elapsed().Round(time.Second),
 			sentinel.WaitLimit,
 		)
+		if r.checker != nil && r.checker.ContinuousActive() {
+			b.Row("checksum", "%s", checksum.StatusRow(r.checker))
+			if throttle := r.throttleStatus(state); throttle.Throttled {
+				b.Row("throttle", "%s", throttle.Reason)
+			}
+		}
 		b.Row("binlog", "deltas=%d  %s", r.replClient.GetDeltaLen(), change.StatusRow(r.replClient))
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
 		return b.String()
@@ -2018,136 +1972,17 @@ func (r *Runner) Status() string {
 	return ""
 }
 
-// invalidateChecksumWatermark blanks the checksum_watermark on this
-// migration's persisted checkpoint rows if (and only if) the sentinel-wait
-// lockless checker recorded any repaired chunks. Called from the
-// sentinel-abort path: the periodic dumper already refuses to persist a
-// watermark once the difference counter is non-zero, but the difference can
-// be recorded between a dump's condition read and its INSERT — this UPDATE,
-// serialized against the dumper via checkpointMu, runs strictly after any
-// such in-flight INSERT and guarantees resume re-verifies from the start of
-// the checksum phase. Scoped by statement because in multi-table mode the
-// checkpoint table is shared with other concurrently-running migrations in
-// the same schema (resume filters on statement the same way).
+// invalidateChecksumWatermark serializes with periodic dumps to clear previously
+// persisted evidence when background verification has invalidated it.
 func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 	r.checkpointMu.Lock()
 	defer r.checkpointMu.Unlock()
-	if r.locklessChecker == nil || r.locklessChecker.DifferencesFound() == 0 {
-		return nil
-	}
-	r.logger.Warn("lockless checksum found differences; clearing persisted checksum watermark so the next run re-verifies from the start of the checksum phase")
 	return dbconn.Exec(ctx, r.db, "UPDATE %n.%n SET checksum_watermark = %? WHERE statement = %?",
 		r.checkpointTable.SchemaName,
 		r.checkpointTable.TableName,
 		"",
 		r.migration.Statement,
 	)
-}
-
-// runLocklessChecksum drives a checksum.LocklessChecker over the source/new
-// tables for as long as ctx is alive. It is the "continuous" half of the
-// two-checksum model (see docs/migrate.md) and is only called while the
-// migration is blocked in WaitingOnSentinelTable.
-//
-// It shares the implementation datasync uses (#979). No Recopier is configured:
-// migration treats the lockless checksum as a cutover GATE, so a stable
-// divergence surfaces as checksum.ErrPermanentDivergence and aborts the cutover.
-// The previous SingleChecker did this via FixDifferences + MaxRetries=1, but it
-// also aborted on rows that were merely mid-replication; the LocklessChecker's
-// retry / hot-chunk logic distinguishes transient lag from real divergence, so
-// it is both safer and quieter. The checker reads the original table and the
-// _new shadow table on the same connection (r.db for both source and target —
-// the chunk carries the column mapping). It uses a fresh chunker so checkpoint
-// state is unaffected. Single-threaded by design — checksum throttling is
-// tracked separately in github.com/block/spirit/issues/831.
-func (r *Runner) runLocklessChecksum(ctx context.Context) error {
-	chunker, err := r.buildLocklessChunker()
-	if err != nil {
-		return fmt.Errorf("failed to build lockless-checksum chunker: %w", err)
-	}
-	if err := chunker.Open(); err != nil {
-		return fmt.Errorf("failed to open lockless-checksum chunker: %w", err)
-	}
-	defer utils.CloseAndLog(chunker)
-
-	checker, err := checksum.NewLocklessChecker(
-		r.db, r.db, chunker, r.replClient,
-		checksum.LocklessCheckerConfig{
-			// TODO(#831): once the throttler can size threads dynamically,
-			// replace the hard-coded 1 with the migration's thread count.
-			Concurrency:     1,
-			MinPassInterval: checksum.LocklessMinPassInterval,
-			// RetryDelay omitted: the constructor defaults it to
-			// checksum.DefaultLocklessRetryDelay.
-			Logger: r.logger,
-			// Replication keeps _new in sync, so a confirmed divergence means a
-			// real problem: abort the cutover (no Recopier, no self-heal).
-			DivergenceIsFatal: true,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create lockless checker: %w", err)
-	}
-	// Publish the checker so DumpCheckpoint (on the WatchTask goroutine) can
-	// consult its DifferencesFound() when deciding whether the persisted
-	// checksum_watermark is still trustworthy. Published before Run so there is
-	// no window where a difference could be recorded while the dumper still
-	// believes the table clean — the checker increments its mismatch counter
-	// atomically as soon as a chunk's initial read mismatches.
-	r.checkpointMu.Lock()
-	r.locklessChecker = checker
-	r.checkpointMu.Unlock()
-
-	// Keep binlog deltas drained for the whole continuous phase (including the
-	// inter-pass waits inside Run) so the cutover does not inherit a large
-	// backlog that must be applied under the table lock.
-	r.replClient.StartPeriodicFlush(ctx, change.DefaultFlushInterval)
-	defer r.replClient.StopPeriodicFlush()
-
-	runErr := checker.Run(ctx)
-	// Suppress a clean cancellation (the sentinel was dropped, or the parent ctx
-	// was cancelled, while a pass was in flight): LocklessChecker.Run returns
-	// ctx.Err() on cancel.
-	//
-	// We deliberately do NOT also gate this on DifferencesFound()==0 (as move's
-	// older distributed-checker loop does), for two reasons:
-	//  1. By the time runErr is context.Canceled, a *confirmed* divergence has
-	//     provably not happened: Run returns ErrPermanentDivergence (a
-	//     non-Canceled error, handled below) the instant it confirms a stable
-	//     divergence, so a real problem aborts the cutover before we reach here.
-	//  2. LocklessChecker.DifferencesFound() is a LIFETIME count of
-	//     first-attempt mismatches, which by design include the transient
-	//     replication lag the retry loop reconciles. Under writes during the
-	//     wait it is routinely >0, so gating on it would abort the cutover on
-	//     nearly every sentinel-drop.
-	// Whether a *confirmed* divergence aborts or self-heals is the explicit
-	// DivergenceIsFatal policy: migration sets it true (replication-backed, so a
-	// stable divergence becomes ErrPermanentDivergence and aborts here), while
-	// datasync sets it false and heals via its Recopier.
-	if ctx.Err() != nil && errors.Is(runErr, context.Canceled) {
-		return nil
-	}
-	return runErr
-}
-
-// buildLocklessChunker builds a fresh chunker for the lockless-checksum
-// loop. It is deliberately not wired into r.checksumChunker / checkpoint.
-func (r *Runner) buildLocklessChunker() (table.Chunker, error) {
-	chunkers := make([]table.Chunker, 0, len(r.changes))
-	for _, change := range r.changes {
-		columnRenames := change.stmt.ColumnRenameMap()
-		columnMapping := table.NewColumnMapping(change.table, change.newTable, columnRenames)
-		c, err := table.NewChunker(change.table, table.ChunkerConfig{
-			NewTable:      change.newTable,
-			Logger:        r.logger,
-			ColumnMapping: columnMapping,
-		})
-		if err != nil {
-			return nil, err
-		}
-		chunkers = append(chunkers, c)
-	}
-	return table.NewMultiChunker(chunkers...), nil
 }
 
 func (r *Runner) Cancel() {

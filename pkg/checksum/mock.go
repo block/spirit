@@ -17,9 +17,21 @@ type MockChecker struct {
 	Chunker          table.Chunker
 	RunError         error
 	differencesFound atomic.Uint64
+	continuous       atomic.Bool
 }
 
 var _ Checker = (*MockChecker)(nil)
+
+func (*MockChecker) ContinuousActive() bool { return false }
+
+func (m *MockChecker) RunContinuous(ctx context.Context) error {
+	m.continuous.Store(true)
+	if m.RunError != nil {
+		return m.RunError
+	}
+	<-ctx.Done()
+	return nil
+}
 
 func (m *MockChecker) Run(context.Context) error          { return m.RunError }
 func (*MockChecker) SetThrottler(throttler.Throttler)     {}
@@ -30,7 +42,7 @@ func (m *MockChecker) DifferencesFound() uint64           { return m.differences
 func (m *MockChecker) SetDifferencesFound(n uint64)       { m.differencesFound.Store(n) }
 
 func (m *MockChecker) ResumeWatermark() (string, error) {
-	if m.Chunker == nil {
+	if m.continuous.Load() || m.Chunker == nil {
 		return "", nil
 	}
 	wm, err := m.Chunker.GetLowWatermark()

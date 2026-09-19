@@ -364,7 +364,7 @@ func TestCheckpointRestoreBinaryPK(t *testing.T) {
 	require.NoError(t, m2.Close())
 }
 
-func TestCheckpointResumeDuringChecksum(t *testing.T) {
+func TestCheckpointResumeAfterContinuousChecksum(t *testing.T) {
 	t.Parallel()
 	// Create unique database for this test
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
@@ -385,21 +385,22 @@ func TestCheckpointResumeDuringChecksum(t *testing.T) {
 		WithThreads(4),
 		WithRespectSentinel())
 
-	// Call r.Run() with our context in a go-routine.
-	// When we see that we are waiting on the sentinel table,
-	// we then manually start the first bits of checksum, and then close()
-	// We should be able to resume from the checkpoint into the checksum state.
+	// Exercise the real lifecycle. Never invoke the initial gate concurrently
+	// with continuous verification: both phases now share the checker/chunker.
 	running := startTestRun(t, r.Run, r.Close)
-	// Wait for the migration to block on the sentinel table.
 	waitForStatus(t, r, status.WaitingOnSentinelTable, running)
-
-	require.NoError(t, r.checksum(t.Context()))       // run the checksum, the original Run is blocked on sentinel.
-	require.NoError(t, r.DumpCheckpoint(t.Context())) // dump a checkpoint with the watermark.
+	require.NoError(t, r.DumpCheckpoint(t.Context()))
+	copyWM, checksumWM := latestCheckpointWatermarks(t, r)
+	require.NotEmpty(t, copyWM)
+	require.Empty(t, checksumWM, "sentinel waiting discards checksum resume evidence")
 	// Cancel + wait for Run to fully return before Close. See
 	// TestChangeIntToBigIntPKResumeFromChkPt for the rationale.
 	running.cancel()                  // unblocks the goroutine that was waiting on sentinel.
 	require.Error(t, running.wait(t)) // context cancelled
 	require.NoError(t, r.Close())
+
+	// Corruption below the old completed watermark must be found on restart.
+	testutils.RunSQLInDatabase(t, dbName, `UPDATE _cptresume_new SET id2 = -1 WHERE id = 1`)
 
 	// drop the sentinel table.
 	testutils.RunSQLInDatabase(t, dbName, `DROP TABLE _spirit_sentinel`)
@@ -415,6 +416,9 @@ func TestCheckpointResumeDuringChecksum(t *testing.T) {
 	require.NoError(t, r2.Run(t.Context()))
 	defer utils.CloseAndLog(r2)
 	require.True(t, r2.usedResumeFromCheckpoint.Load())
+	var value int
+	require.NoError(t, r2.db.QueryRowContext(t.Context(), "SELECT id2 FROM cptresume WHERE id = 1").Scan(&value))
+	require.Equal(t, 1, value, "restart verifies and repairs rows below the initial checksum watermark")
 }
 
 func TestCheckpointDifferentRestoreOptions(t *testing.T) {

@@ -35,15 +35,15 @@ The checksum package contains three implementations:
 
 1. **SingleChecker** - Compares two tables on the same MySQL server (for schema changes, or 1:1 moves)
 2. **DistributedChecker** - Compares a source table against multiple distributed target databases (for sharded scenarios)
-3. **LocklessChecker** - An optimistic verifier using ordinary reads and retries, with either a finite clean-pass gate (`RunUntilClean`) or repeated passes (`Run`). Used by `spirit sync`, experimental lockless migrations, and migration deferred-cutover verification.
+3. **LocklessChecker** - An optimistic verifier using ordinary reads and retries, with either a finite clean-pass gate (`RunUntilClean`) or repeated passes (`Run`). Used by `spirit sync`, experimental lockless migrations, and deferred-cutover verification when lockless mode is selected.
 
 `SingleChecker` and `DistributedChecker` take a brief table lock to establish a consistent `REPEATABLE READ` snapshot; `LocklessChecker` deliberately does not (see [Lockless checksum](#lockless-checksum) below).
 
 All three use **CRC32 with XOR aggregation** for chunk comparison. The lockless checker can additionally drain a bounded per-row PK/CRC32 snapshot for unresolved hot ranges.
 
-## Finite checker contract
+## Checker contract
 
-`NewChecker` returns a finite `Checker`: `Run` succeeds only after verification
+`NewChecker` returns a `Checker`: its finite `Run` succeeds only after verification
 completes. Set `CheckerConfig.Lockless` to select optimistic verification on a
 single server, leave it nil for the existing snapshot checkers. Supplying the
 distributed `Applier` and `Lockless` together is rejected.
@@ -55,7 +55,18 @@ conflicting nonzero `Lockless.Concurrency` is rejected. Direct continuous caller
 set `LocklessCheckerConfig.Concurrency` instead. Snapshot settings (`FixDifferences`,
 `RepairApplier`, `MaxRetries`, and `YieldTimeout`) do not control lockless behavior.
 Migration explicitly selects fatal divergence; selecting the algorithm alone does
-not select a repair policy. Continuous callers still use `NewLocklessChecker.Run`.
+not select a repair policy. Migration reuses the factory result through `Checker.RunContinuous`, which owns pacing, chunker resets, feed flushing, and safe
+cancellation. `ContinuousActive` reports whether a pass is running rather than
+waiting for the next interval, so callers can report throttling accurately. Snapshot passes use the same configured repair/retry policy as the
+initial gate. Lockless passes retain their optimistic retry/defer behavior.
+
+Once `RunContinuous` starts, `ResumeWatermark` stays empty, including after a
+clean background pass. Copy progress is retained, but a restarted migration must
+repeat initial verification. This avoids interpreting a reset background walker
+or a cleared per-pass mismatch counter as resume evidence.
+
+Direct lockless callers such as datasync still use `NewLocklessChecker.Run`;
+they own their cross-server feed and repair-applier lifecycles.
 
 Callers open the chunker before construction unless supplying a nonempty
 `CheckerConfig.Watermark`. In that case the factory opens it: snapshot checkers

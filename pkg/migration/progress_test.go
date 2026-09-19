@@ -58,18 +58,7 @@ func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
 	require.Empty(t, checksumThrottle.Reason)
 }
 
-// TestThrottleStatusIsZeroInUnpacedPhases pins the rule that makes Throttled
-// mean one thing everywhere: only the copy and the checksum pace themselves
-// against a throttler (they are the only SetThrottler callers), so every other
-// phase must report the zero value however loaded the server is.
-//
-// Reporting the composite in these phases would be actively misleading rather
-// than merely imprecise. The sentinel wait is the pointed case — a human is
-// watching that screen to decide when to cut over, and the only work running is
-// the lockless checker, which takes no throttler at all. Worse, the replica
-// throttler fails closed on a stale signal and Close() stops its poll loop
-// without changing IsThrottled, so a *finished* migration would start reporting
-// itself as paused on replica lag once the signal aged out.
+// Inactive sentinel waiting and non-checksum phases never report load throttling.
 func TestThrottleStatusIsZeroInUnpacedPhases(t *testing.T) {
 	r := &Runner{}
 	r.setThrottler(&throttler.Mock{}) // always throttled
@@ -175,4 +164,24 @@ func TestSetThrottlerOnPhasesReachesChecker(t *testing.T) {
 	r.throttlerMu.Unlock()
 	r.setThrottlerOnPhases()
 	require.Same(t, resolved, checker.got, "resolved throttler must reach the checksum phase")
+}
+
+type activeContinuousChecker struct {
+	checksum.MockChecker
+	active bool
+}
+
+func (c *activeContinuousChecker) ContinuousActive() bool { return c.active }
+
+func TestContinuousChecksumThrottleStatus(t *testing.T) {
+	checker := &activeContinuousChecker{}
+	r := &Runner{checker: checker}
+	r.setThrottler(&gradualTestThrottler{throttled: true})
+	require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(status.WaitingOnSentinelTable))
+	checker.active = true
+	require.True(t, r.throttleStatus(status.WaitingOnSentinelTable).Throttled)
+	r.setThrottler(&throttler.Mock{})
+	require.False(t, r.throttleStatus(status.WaitingOnSentinelTable).Throttled, "replica/binary signals do not pace checksum")
+	checker.active = false
+	require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(status.WaitingOnSentinelTable))
 }

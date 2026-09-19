@@ -130,6 +130,15 @@ type Checker interface {
 	// Run performs finite verification. A nil result authorizes completion;
 	// deferred ranges and repairs alone are not verification.
 	Run(ctx context.Context) error
+	// RunContinuous reuses a successfully completed checker for background
+	// verification. Calls to Run and RunContinuous must be sequential. A nil
+	// return means cancellation was safe, not that the interrupted pass verified
+	// every row. Other errors abort cutover. Once started, ResumeWatermark stays
+	// empty: restarting requires full initial verification.
+	RunContinuous(context.Context) error
+	// ContinuousActive distinguishes a running pass from interval pacing.
+	// It is safe to query concurrently with RunContinuous.
+	ContinuousActive() bool
 	// GetProgress returns the structured checksum progress — rows verified so far
 	// and the total to verify. Call String() on the result for the display form.
 	GetProgress() status.ChecksumProgress
@@ -372,4 +381,56 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		repairApplier:   config.RepairApplier,
 		yieldTimeout:    config.YieldTimeout,
 	}, nil
+}
+
+// Flush during pacing, but stop before Run acquires snapshot setup locks.
+// Each finite Run owns flushing after those locks have been released.
+func runContinuousSnapshot(ctx context.Context, checker Checker, feeds []change.Source, resume *snapshotResume, reset func() error) error {
+	var duration time.Duration
+	for {
+		for _, feed := range feeds {
+			feed.StartPeriodicFlush(ctx, change.DefaultFlushInterval)
+		}
+		ready := waitForChecksum(ctx, LocklessMinPassInterval-duration)
+		for _, feed := range feeds {
+			feed.StopPeriodicFlush()
+		}
+		if !ready {
+			return nil
+		}
+		if err := reset(); err != nil {
+			return fmt.Errorf("reset continuous checksum: %w", err)
+		}
+		before := resume.observed.Load()
+		started := time.Now()
+		resume.active.Store(true)
+		err := checker.Run(ctx)
+		resume.active.Store(false)
+		if err != nil {
+			// A retry can reset DifferencesFound even after a repair was interrupted.
+			// Use the monotonic observation count for this entire Run instead.
+			if ctx.Err() != nil && checksumCanceled(err) && resume.observed.Load() == before {
+				return nil
+			}
+			return err
+		}
+		duration = time.Since(started)
+	}
+}
+
+func waitForChecksum(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(max(0, delay))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
+	}
+}
+
+// Accept wrapped cancellation, but not a joined cancellation plus a real error.
+func checksumCanceled(err error) bool {
+	var joined interface{ Unwrap() []error }
+	return !errors.As(err, &joined) && errors.Is(err, context.Canceled)
 }
