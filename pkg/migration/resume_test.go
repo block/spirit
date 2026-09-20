@@ -89,6 +89,21 @@ func TestChangeIntToBigIntPKResumeFromChkPt(t *testing.T) {
 	require.NoError(t, m2.Close())
 }
 
+// watermarkChunkJSON returns the chunk portion of a watermark, dropping the
+// fields the chunker persists alongside it. It lets a test pin the exact chunk
+// the watermark points at without also pinning the row count, which depends on
+// how much of the binlog the applier had already written to the new table when
+// the chunk was copied.
+func watermarkChunkJSON(t *testing.T, watermark string) string {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(watermark), &fields))
+	delete(fields, "RowsCopied")
+	out, err := json.Marshal(fields)
+	require.NoError(t, err)
+	return string(out)
+}
+
 func TestCheckpoint(t *testing.T) {
 	// This test manually steps through the migration process to verify
 	// watermark, checkpoint dump, and restore behavior.
@@ -210,7 +225,7 @@ func TestCheckpoint(t *testing.T) {
 	// gives feedback back to table.
 	watermark, err := r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 	// Which the status block now reports in place of the checkpoint's own log
@@ -247,7 +262,7 @@ func TestCheckpoint(t *testing.T) {
 	// the last checkpoint because on restore, the LowerBound is taken.
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 
@@ -260,7 +275,7 @@ func TestCheckpoint(t *testing.T) {
 
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
 }
 
 func TestCheckpointRestore(t *testing.T) {
