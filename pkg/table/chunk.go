@@ -100,13 +100,20 @@ func (c *Chunk) JSON() string {
 	return out
 }
 
-func (c *Chunk) marshalJSON() (string, error) {
-	out, err := json.Marshal(JSONChunk{
+// jsonChunk is the serializable form of the chunk, as it appears in a
+// watermark. A chunker that persists more than the bounds embeds this so its
+// own fields sit alongside the chunk's rather than wrapping them.
+func (c *Chunk) jsonChunk() JSONChunk {
+	return JSONChunk{
 		Key:        c.Key,
 		ChunkSize:  c.ChunkSize,
 		LowerBound: c.LowerBound.jsonBoundary(),
 		UpperBound: c.UpperBound.jsonBoundary(),
-	})
+	}
+}
+
+func (c *Chunk) marshalJSON() (string, error) {
+	out, err := json.Marshal(c.jsonChunk())
 	if err != nil {
 		return "", fmt.Errorf("could not encode chunk JSON: %w", err)
 	}
@@ -341,7 +348,10 @@ func WatermarkRecopyClause(ti *TableInfo, watermarkJSON string) (string, error) 
 //   - multiChunker (used for two or more chunkers): a JSON map keyed by
 //     QualifiedName, where each value is the child chunker's own watermark.
 //   - chunkerComposite: an envelope {"ChunkJSON": "...", "RowsCopied": N}.
-//   - chunkerOptimistic: the raw chunk JSON itself.
+//   - chunkerOptimistic: the chunk JSON itself, with a "RowsCopied" field
+//     alongside the chunk's own (see optimisticWatermark). Unlike the
+//     composite envelope this needs no unwrapping, because the chunk is
+//     already at the top level.
 //
 // The tables argument is required to attribute single-chunker watermarks
 // (which carry no table name) to their table: those formats are only produced
