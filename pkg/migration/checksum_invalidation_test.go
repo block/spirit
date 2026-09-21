@@ -319,10 +319,15 @@ func TestContinuousSnapshotRepairsBeforeCutover(t *testing.T) {
 	checker := m.checker
 	require.IsType(t, &checksum.SingleChecker{}, checker)
 	testutils.RunSQLInDatabase(t, dbName, "UPDATE _continuous_repair_new SET val = 0 WHERE id = 1")
+	// A repair is not verification, so wait for the pass that repaired to
+	// finish rather than for the repaired value alone: DifferencesFound is
+	// reset between attempts, so it reads zero in the window after the repair
+	// and before the re-verification that proves it, and a sentinel dropped in
+	// that window is refused rather than filtered.
 	require.Eventually(t, func() bool {
 		var value int
 		err := m.db.QueryRowContext(t.Context(), "SELECT val FROM _continuous_repair_new WHERE id = 1").Scan(&value)
-		return err == nil && value == 42 && checker.DifferencesFound() == 0
+		return err == nil && value == 42 && checker.DifferencesFound() == 0 && !checker.ContinuousActive()
 	}, 30*time.Second, 50*time.Millisecond)
 	wm, err := checker.ResumeWatermark()
 	require.NoError(t, err)

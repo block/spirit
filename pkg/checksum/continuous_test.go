@@ -78,7 +78,12 @@ func TestContinuousSnapshotLifecycle(t *testing.T) {
 				switch outcome {
 				case "failure", "joined-cancel":
 					require.ErrorIs(t, err, failure)
-				case "repair-cancel", "foreign-cancel":
+				case "repair-cancel":
+					// The pass observed a mismatch and was cancelled before it
+					// could re-verify the repair, so the cancellation is
+					// refused as unverified rather than filtered to nil.
+					require.ErrorIs(t, err, ErrRepairUnverified)
+				case "foreign-cancel":
 					require.ErrorIs(t, err, context.Canceled)
 				default:
 					require.NoError(t, err)
