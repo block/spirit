@@ -97,11 +97,12 @@ type optimisticWatermark struct {
 	// RowsCopied is the count as it stood when the checkpoint was written,
 	// which is not the count as of the chunk the watermark points at: chunks
 	// that completed out of order, ahead of the watermark, are included. A
-	// resume re-copies those rows and counts them again, so the total can
-	// exceed the table's rows by up to the in-flight window. This matches the
-	// composite chunker, whose envelope stores its count the same way, and it
-	// is why RowsCopied is documented as rows settled rather than as rows
-	// present in the new table.
+	// resume re-copies those rows and counts them again, and every further
+	// resume does so afresh, so the count is settled work including replay
+	// rather than a running total of the rows present in the new table. This
+	// matches the composite chunker, whose envelope stores its count the same
+	// way, and it is why completion is tested with IsComplete rather than by
+	// comparing the count against the table's rows.
 	RowsCopied uint64
 }
 
