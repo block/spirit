@@ -71,6 +71,9 @@ type Runner struct {
 
 	copier      copier.Copier
 	copyChunker table.Chunker // the chunker for copying
+	// copyRowsAtResume is the settled row count the chunker restored from the
+	// checkpoint, excluded from this invocation's copy aggregate.
+	copyRowsAtResume uint64
 
 	// applier is the shared write layer used by both the copier (buffered
 	// copy) and the replication client (binlog deltas). Kept on the runner
@@ -247,16 +250,16 @@ func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The optimistic chunker does not persist its
-// actual-row counter in a checkpoint, so a resumed invocation reports only
-// work settled after it resumed.
+// Runner.Run invocation. The chunker restores its settled row count from the
+// checkpoint, while its chunk count starts afresh, so the restored rows are
+// subtracted here to keep the two figures on the same invocation.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -1630,6 +1633,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	// With saved evidence, the factory opens the chunker according to the
 	// selected verification policy. Otherwise start at the beginning.

@@ -23,6 +23,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -243,6 +244,10 @@ func TestCheckpoint(t *testing.T) {
 	// Start the binary log feed just before copy rows starts.
 	// replClient.Start() is already called in resumeFromCheckpoint.
 	require.NoError(t, r.resumeFromCheckpoint(t.Context()))
+	// The rows the watermark carried forward, before this invocation has
+	// settled any of its own.
+	restored := r.copyChunker.RowsCopied()
+	require.Positive(t, restored, "the checkpoint should restore the rows the first runner settled")
 	disableDynamicChunking(t, r.copyChunker)
 	// This opens the table at the checkpoint (table.OpenAtWatermark())
 	// which sets the chunkPtr at the LowerBound. It also has to position
@@ -276,6 +281,34 @@ func TestCheckpoint(t *testing.T) {
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
 	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
+
+	// The copy aggregate reported to the metrics sink covers one invocation:
+	// the rows restored from the checkpoint are excluded, so they stay on the
+	// same footing as the chunks, which the chunker counts from zero on a
+	// resume.
+	sink := &copyAggregateSink{}
+	r.status.SetMetricsSink(sink, r.logger)
+	r.recordCopyCompleted()
+	require.Equal(t, r.copyChunker.RowsCopied()-restored, sink.rows)
+	require.Equal(t, uint64(11), sink.chunks, "the eleven chunks this runner copied after resuming")
+}
+
+// copyAggregateSink records the copy aggregate the runner reports when the
+// copy completes.
+type copyAggregateSink struct {
+	rows, chunks uint64
+}
+
+func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
+	for _, v := range m.Values {
+		switch v.Name {
+		case metrics.CopyRowsCompletedMetricName:
+			s.rows = uint64(v.Value)
+		case metrics.CopyChunksCompletedMetricName:
+			s.chunks = uint64(v.Value)
+		}
+	}
+	return nil
 }
 
 func TestCheckpointRestore(t *testing.T) {

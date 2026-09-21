@@ -120,9 +120,12 @@ type Runner struct {
 	monitorDBs  []*sql.DB
 	autoscale   copier.AutoscaleConfig
 
-	applier           applier.Applier
-	chunkerMu         sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
-	copyChunker       table.Chunker
+	applier     applier.Applier
+	chunkerMu   sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
+	copyChunker table.Chunker
+	// copyRowsAtResume is the settled row count the chunker restored from the
+	// checkpoint, excluded from this invocation's copy aggregate.
+	copyRowsAtResume  uint64
 	checksumChunker   table.Chunker
 	copier            copier.Copier
 	checker           checksum.Checker
@@ -249,16 +252,19 @@ func NewRunner(m *Move) (*Runner, error) {
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The optimistic chunker does not persist its
-// actual-row counter in a checkpoint, so a resumed invocation reports only
-// work settled after it resumed.
+// Runner.Run invocation. The chunker restores its settled row count from the
+// checkpoint, while its chunk count starts afresh, so the restored rows are
+// subtracted here to keep the two figures on the same invocation.
+//
+// A move resume deletes the rows at or above the resume position and copies
+// them again, so those rows are settled twice and counted in both invocations.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -610,6 +616,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	// Open each source's change feed at its checkpointed position.
 	// OpenFromPosition primes the position and starts streaming in one call.
