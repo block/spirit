@@ -26,9 +26,9 @@ func TestMain(m *testing.M) {
 	// Tick the status logger fast. Continuous-replication latency is set
 	// per-test via Sync.FlushInterval.
 	status.StatusInterval = 100 * time.Millisecond
-	// Run continuous-checksum passes back-to-back in tests so FirstCleanPass /
+	// Run lockless-checksum passes back-to-back in tests so FirstCleanPass /
 	// convergence assertions don't wait on the 1h production pacing.
-	checksum.ContinuousMinPassInterval = 0
+	checksum.LocklessMinPassInterval = 0
 	goleak.VerifyTestMain(m)
 }
 
@@ -852,7 +852,7 @@ func TestSyncResumeSourceIdentity(t *testing.T) {
 // before any row is copied. The copy and continuous replication write with
 // REPLACE/INSERT IGNORE, so a collation difference — the dangerous case being
 // on a primary-key column — would silently collapse case-distinct rows and
-// the continuous checksum would never converge. An identical pre-created
+// the lockless checksum would never converge. An identical pre-created
 // table must still be accepted (the declarative pre-created-schema workflow).
 func TestSyncFreshTargetSchemaMismatch(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
@@ -1220,6 +1220,16 @@ func TestSyncVerifyExistingTargetTableRequiresExactSchema(t *testing.T) {
 		wantDiff string // empty means the target must be accepted
 	}{
 		{
+			name:   "different AUTO_INCREMENT supporting names",
+			source: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id))",
+			target: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY target_ai(id))",
+		},
+		{
+			name:   "different AUTO_INCREMENT supporting widths",
+			source: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id))",
+			target: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id,p))",
+		},
+		{
 			name:   "identical",
 			source: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
 			target: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
@@ -1270,7 +1280,7 @@ func TestSyncVerifyExistingTargetTableRequiresExactSchema(t *testing.T) {
 // between attempts must not be silently copied past. The target table exists
 // from the first run, so createTargetTables does not recreate it; without a
 // schema check the column added on the source falls out of the copy's
-// source/target column intersection — and out of the continuous checksum built
+// source/target column intersection — and out of the lockless checksum built
 // from that same intersection — so the sync converges "clean" with the target
 // missing the column. The re-run must fail instead, naming the reconciling
 // ALTER.

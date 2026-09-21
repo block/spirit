@@ -35,11 +35,56 @@ The checksum package contains three implementations:
 
 1. **SingleChecker** - Compares two tables on the same MySQL server (for schema changes, or 1:1 moves)
 2. **DistributedChecker** - Compares a source table against multiple distributed target databases (for sharded scenarios)
-3. **ContinuousChecker** - A lock-free, *eventually-consistent* verifier that runs indefinitely against a live system where the target lags the source by a small replication delay (used by `spirit sync`, and by `spirit migrate` while waiting on a deferred cutover)
+3. **LocklessChecker** - An optimistic verifier using ordinary reads and retries, with either a finite clean-pass gate (`RunUntilClean`) or repeated passes (`Run`). Used by `spirit sync`, experimental lockless migrations, and deferred-cutover verification when lockless mode is selected.
 
-`SingleChecker` and `DistributedChecker` take a brief table lock to establish a consistent `REPEATABLE READ` snapshot; `ContinuousChecker` deliberately does not (see [Continuous checksum](#continuous-checksum) below).
+`SingleChecker` and `DistributedChecker` take a brief table lock to establish a consistent `REPEATABLE READ` snapshot; `LocklessChecker` deliberately does not (see [Lockless checksum](#lockless-checksum) below).
 
-All three use the same underlying checksum algorithm: **CRC32 with XOR aggregation**. This technique computes a checksum for each chunk of rows and can efficiently detect differences without comparing individual rows.
+All three use **CRC32 with XOR aggregation** for chunk comparison. The lockless checker can additionally drain a bounded per-row PK/CRC32 snapshot for unresolved hot ranges.
+
+## Checker contract
+
+`NewChecker` returns a `Checker`: its finite `Run` succeeds only after verification
+completes. Set `CheckerConfig.Lockless` to select optimistic verification on a
+single server, leave it nil for the existing snapshot checkers. Supplying the
+distributed `Applier` and `Lockless` together is rejected.
+
+For lockless verification, common concurrency, autoscaling, throttler, metrics sink, and logger
+settings come from `CheckerConfig`; retry, splitting, and divergence policy come
+from its `Lockless` configuration. Set finite concurrency on `CheckerConfig`; a
+conflicting nonzero `Lockless.Concurrency` is rejected. Direct continuous callers
+set `LocklessCheckerConfig.Concurrency` instead. Snapshot settings (`FixDifferences`,
+`RepairApplier`, `MaxRetries`, and `YieldTimeout`) do not control lockless behavior.
+Migration explicitly selects fatal divergence; selecting the algorithm alone does
+not select a repair policy. Migration reuses the factory result through `Checker.RunContinuous`, which owns pacing, chunker resets, feed flushing, and safe
+cancellation. `ContinuousActive` reports whether a pass is running rather than
+waiting for the next interval, so callers can report throttling accurately. Snapshot passes use the same configured repair/retry policy as the
+initial gate. Lockless passes retain their optimistic retry/defer behavior.
+
+Once `RunContinuous` starts, `ResumeWatermark` stays empty, including after a
+clean background pass. Copy progress is retained, but a restarted migration must
+repeat initial verification. This avoids interpreting a reset background walker
+or a cleared per-pass mismatch counter as resume evidence.
+
+Direct lockless callers such as datasync still use `NewLocklessChecker.Run`;
+they own their cross-server feed and repair-applier lifecycles.
+
+Callers open the chunker before construction unless supplying a nonempty
+`CheckerConfig.Watermark`. In that case the factory opens it: snapshot checkers
+restore verification progress, while lockless ignores the saved evidence and
+opens from the beginning. Persist `Checker.ResumeWatermark()`, never the chunker's traversal
+watermark. Snapshot checkers suppress evidence after differences; lockless returns
+an empty watermark because unresolved retries are not represented by traversal.
+This preserves safe migration resume but does **not** yet provide partial checksum
+resume for lockless verification.
+
+`Checker.SetThrottler` is required for every finite implementation. Tests can use
+the shared `checksum.MockChecker`, whose throttler setter is a no-op and whose
+mismatch count can be changed safely while a runner is active.
+
+The optional `StatusReporter` capability exposes a structured `ChecksumStatus`.
+`StatusSummary` and `StatusRow` format it, falling back to basic progress and pacing
+for checkers without that capability. Runners need no concrete checker assertions.
+Optimistic status distinguishes scan completion from verification completion.
 
 ## Checksum Algorithm
 
@@ -88,7 +133,7 @@ The read is not synchronized with the change feed: a row deleted on the source a
 
 `SingleChecker` and `DistributedChecker` pace themselves against the same throttler the copier uses. Two things are separate here:
 
-- **The hard stop** is not opt-in, but it reacts only to *load*. Before dispatching each chunk the checker calls `Throttler.BlockWait`, so a checksum pauses when server load says to. Chunks already in flight are never interrupted: the checksum stops *dispatching* rather than abandoning work, because an aborted chunk is wasted I/O that must be redone from the same watermark. Wire the throttler with `SetThrottler` (the `ThrottleAware` capability) — runners build the checker before their throttlers are open.
+- **The hard stop** is not opt-in, but it reacts only to *load*. Before dispatching each chunk the checker calls `Throttler.BlockWait`, so a checksum pauses when server load says to. Chunks already in flight are never interrupted: the checksum stops *dispatching* rather than abandoning work, because an aborted chunk is wasted I/O that must be redone from the same watermark. Wire the throttler with `Checker.SetThrottler` — runners build the checker before their throttlers are open.
 
   Whatever throttler a checker is given is narrowed by `loadOnlyThrottler` to the children implementing `throttler.GradualThrottler` — in practice the Aurora signals. Binary signals, meaning replica lag, are dropped, and a checker given only those runs unpaced. This is not a shortcut but a correctness point: a checksum reads inside a `REPEATABLE READ` snapshot and writes nothing to the binlog, so it cannot be the cause of replica lag and pausing it cannot reduce that lag — while the pause extends the pass, holding the snapshot open and pinning undo the purge thread cannot advance past. The lag throttler also fails closed on stale polling, so an unreachable replica would stall dispatch until the yield timeout with the snapshot still held. Load is different in kind: a checksum does add read load to the primary, so backing off on load both works and is warranted.
 
@@ -121,13 +166,33 @@ Concurrency is gated by a resizable `autoscale.Limiter` rather than `errgroup.Se
 
 One constraint shapes all of this: the `REPEATABLE READ` transaction pool **cannot grow** once the table lock is released. Every transaction takes its snapshot under that lock, so they all see one point in time; a transaction started later would read a newer snapshot and could compare a chunk against changes its siblings cannot see. The pool is therefore provisioned at the autoscale ceiling up front, whether or not scaling is enabled. Over-provisioning costs one connection per idle transaction and no extra history retention, since every read view pins from the same instant. What it does cost is lock-window time: each transaction is started serially under the lock, so the ceiling lengthens that window in direct proportion. That cost is why `autoscale.ReadBounds` caps the read side at half the instance rather than all of it — for this pool a ceiling is not a hypothesis, it is spent whether or not scaling reaches it.
 
-`ContinuousChecker` is not covered by any of this: it manages its own pacing through `MinPassInterval` and its retry queue, and takes no table lock or snapshot pool.
+`LocklessChecker` uses ordinary reads rather than a pinned snapshot pool. It supports load throttling and autoscaling through its worker limiter; `MinPassInterval` and its retry queue govern pass/retry pacing.
 
 Each pass logs a `checksum chunk size distribution` line (chunk count, duration p50/p90/max, row p50/max, and how many chunks hit `table.MaxDynamicRowSize`). The row-capped count is the useful one: the checksum aggregates server-side and returns one row per chunk, so its chunks are far cheaper than the copier's, and if most are pinned at the row ceiling then that — not the `table.ChunkerDefaultTarget` time budget — is what bounds them.
 
-## Continuous checksum
+## Lockless checksum
 
-`ContinuousChecker` verifies a target that is still converging toward the source over a live replication feed, so a first-attempt mismatch is *expected* (the target simply hasn't caught up yet) rather than alarming. It runs in **passes**: each pass walks every chunk once and then drains a delayed-retry queue until empty. A mismatched chunk is re-read after a short delay and passes once the target's CRC matches a source CRC the checker has witnessed. A chunk whose source keeps changing (a "hot chunk") cycles to the back of the queue without blocking the pass.
+`RunUntilClean` returns only after a complete pass with no repairs or deferred
+ranges. `Run` keeps checking until cancelled. Both use the same verification
+algorithm; how long the caller runs it does not change its correctness criteria.
+
+`LocklessChecker` verifies a target that is still converging toward the source over a live replication feed, so a first-attempt mismatch is *expected* (the target simply hasn't caught up yet) rather than alarming. It runs in **passes**: each pass walks every chunk once and then drains a delayed-retry queue until empty. A mismatched chunk is re-read after a short delay and passes once the target's CRC matches a source CRC the checker has witnessed. A chunk whose source keeps changing (a "hot chunk") cycles to the back of the queue without blocking the pass.
+
+### Current limitation: continuously updated hot rows
+
+Workloads that continuously update the same rows are not currently supported
+reliably by the lockless algorithm. Even with `SplitHotChunks` and
+`SnapshotHotChunks`, a frozen source row image may be superseded before a target
+read observes it. Splitting to a single row cannot guarantee convergence. Deletes
+before verification can also leave frozen images unresolved. These ranges remain
+unverified and can prevent `RunUntilClean` from completing; they are not accepted
+as clean merely because replication is active.
+
+The finite snapshot fallback can help append-heavy tails because later inserts
+do not expand its work set. It does not solve the continuously updated hot-row
+case. Replication-applier integration using change-stream row images and their
+application is planned to address that case, but is not implemented yet. For
+migrations with these workloads, use the default snapshot-based checksum.
 
 When a chunk's source CRC is stable across the retry window but the target still disagrees, that is a **stable divergence**. How the checker reacts is governed by two config fields:
 

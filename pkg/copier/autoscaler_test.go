@@ -760,3 +760,80 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 	require.Equal(t, checksumSrc, checksumDst, "checksum mismatch between source and destination")
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS autoscale_src, autoscale_dst")
 }
+
+// A quiet shard must never mask another host's overload. Exercise the actual
+// composite signal and controller so the maximum (not an average) drives both
+// normal shedding and panic, then allows recovery once every host is quiet.
+func TestAutoScalerBusiestTarget(t *testing.T) {
+	var _ writeScaler = (*applier.ShardedApplier)(nil)
+	quiet, busy := &utilThrottler{}, &utilThrottler{}
+	quiet.setUtil(0.1)
+	busy.setUtil(1.2)
+	composite := throttler.NewMultiThrottler(quiet, busy)
+	signal, ok := composite.(throttler.GradualThrottler)
+	require.True(t, ok)
+	writer := &fakeScaler{n: 8}
+	controller := newAutoScaler(signal, writer, 8, 16, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n)
+	require.True(t, composite.IsThrottled())
+	busy.setUtil(0.1)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Greater(t, writer.n, 4)
+	require.False(t, composite.IsThrottled())
+}
+
+func TestAutoScalerBusiestHostCanChange(t *testing.T) {
+	first, second := &utilThrottler{}, &utilThrottler{}
+	first.setUtil(0.1)
+	second.setUtil(0.1)
+	signal := throttler.NewMultiThrottler(first, second).(throttler.GradualThrottler)
+	writer := &fakeScaler{n: 4}
+	controller := newAutoScaler(signal, writer, 4, 8, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 5, writer.n, "all hosts have headroom")
+	second.setUtil(0.55)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 5, writer.n, "one host in the middle band prevents growth")
+	second.setUtil(0.8)
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n, "one busy host causes shedding")
+	second.setUtil(0.1)
+	first.setUtil(0.8)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 3, writer.n, "a different busy host continues shedding after cooldown")
+}
+
+// This is the injected-applier path: its constructor count need not match the
+// instance-derived count, and Start resets it on every phase transition.
+func TestWriteAutoscalerLifecycle(t *testing.T) {
+	tt := testutils.NewTestTable(t, "write_autoscaler_lifecycle", "CREATE TABLE write_autoscaler_lifecycle (id INT PRIMARY KEY)")
+	cfg := applier.NewApplierDefaultConfig()
+	cfg.Threads = 16
+	a, err := applier.NewSingleTargetApplier(applier.Target{DB: tt.DB}, cfg)
+	require.NoError(t, err)
+	logger := slog.New(slog.DiscardHandler)
+	signal := &utilThrottler{}
+	signal.setUtil(1.2)
+	old := acTick
+	acTick = 2 * time.Millisecond
+	defer func() { acTick = old }()
+	for range 2 {
+		require.NoError(t, a.Start(t.Context()))
+		stop := StartWriteAutoscaler(t.Context(), signal, a, AutoscaleConfig{Enabled: true, StartThreads: 4, MaxThreads: 8}, logger, nil)
+		require.Eventually(t, func() bool { return a.ActiveWriteWorkers() <= 2 }, time.Second, time.Millisecond)
+		stop()
+		signal.setUtil(0.1)
+		stop = StartWriteAutoscaler(t.Context(), signal, a, AutoscaleConfig{Enabled: true, StartThreads: 4, MaxThreads: 8}, logger, nil)
+		require.Eventually(t, func() bool { return a.ActiveWriteWorkers() == 8 }, time.Second, time.Millisecond)
+		stop()
+		require.NoError(t, a.Stop())
+		signal.setUtil(1.2)
+	}
+}

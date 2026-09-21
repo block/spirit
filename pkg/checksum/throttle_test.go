@@ -3,6 +3,7 @@ package checksum
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -148,9 +150,7 @@ func TestChecksumConsultsThrottler(t *testing.T) {
 	checker := checksumFixture(t, "checksum_throttle_counts", 4096, NewCheckerDefaultConfig())
 
 	thr := &countingThrottler{}
-	aware, ok := checker.(ThrottleAware)
-	require.True(t, ok, "SingleChecker must expose the ThrottleAware capability")
-	aware.SetThrottler(thr)
+	checker.SetThrottler(thr)
 
 	require.NoError(t, checker.Run(t.Context()))
 	// Before this existed the checksum ignored throttling entirely, so a
@@ -167,7 +167,7 @@ func TestChecksumIgnoresBinaryThrottler(t *testing.T) {
 	checker := checksumFixture(t, "checksum_ignores_binary_throttler", 4096, NewCheckerDefaultConfig())
 
 	lag := &binaryThrottler{}
-	checker.(ThrottleAware).SetThrottler(lag)
+	checker.SetThrottler(lag)
 	require.NoError(t, checker.Run(t.Context()))
 	assert.Zero(t, lag.calls.Load(), "must not wait on a signal it cannot influence")
 	assert.False(t, checker.(Paced).IsThrottled(), "a dropped signal must not show as throttled")
@@ -180,7 +180,7 @@ func TestChecksumThrottlerKeepsLoadDropsLagFromAComposite(t *testing.T) {
 
 	lag := &binaryThrottler{}
 	load := &alwaysLoaded{}
-	checker.(ThrottleAware).SetThrottler(throttler.NewMultiThrottler(lag, load))
+	checker.SetThrottler(throttler.NewMultiThrottler(lag, load))
 
 	require.NoError(t, checker.Run(t.Context()))
 	assert.Positive(t, load.calls.Load(), "the load signal must still pace the checksum")
@@ -190,7 +190,7 @@ func TestChecksumThrottlerKeepsLoadDropsLagFromAComposite(t *testing.T) {
 func TestChecksumThrottlerBlocksDispatch(t *testing.T) {
 	checker := checksumFixture(t, "checksum_throttle_blocks", 4096, NewCheckerDefaultConfig())
 	thr := newGateThrottler()
-	checker.(ThrottleAware).SetThrottler(thr)
+	checker.SetThrottler(thr)
 
 	done := make(chan error, 1)
 	go func() { done <- checker.Run(t.Context()) }()
@@ -216,7 +216,7 @@ func TestChecksumThrottlerBlocksDispatch(t *testing.T) {
 func TestChecksumThrottledPassIsCancellable(t *testing.T) {
 	checker := checksumFixture(t, "checksum_throttle_cancel", 1024, NewCheckerDefaultConfig())
 	thr := newGateThrottler() // never released
-	checker.(ThrottleAware).SetThrottler(thr)
+	checker.SetThrottler(thr)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -244,7 +244,7 @@ func TestChecksumCancelledWhileThrottledNeverReportsPass(t *testing.T) {
 	// Without the chunker.IsRead() guard in runChecksum this returns nil.
 	checker := checksumFixture(t, "checksum_cancel_no_false_pass", 8192, NewCheckerDefaultConfig())
 	thr := newGateThrottler() // never released, so not one chunk is dispatched
-	checker.(ThrottleAware).SetThrottler(thr)
+	checker.SetThrottler(thr)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -359,7 +359,7 @@ func TestStatusSuffixReportsPacing(t *testing.T) {
 	// A throttled checker must say so, which is the whole point of the field.
 	// The stub carries a continuous signal because a checksum only reacts to
 	// load throttlers; throttler.Mock is binary and would be narrowed away.
-	checker.(ThrottleAware).SetThrottler(&alwaysLoaded{})
+	checker.SetThrottler(&alwaysLoaded{})
 	assert.Contains(t, StatusSuffix(checker), "throttled=true")
 }
 
@@ -369,11 +369,86 @@ func TestStatusSuffixEmptyForUnpacedChecker(t *testing.T) {
 	assert.Empty(t, StatusSuffix(unpacedChecker{}))
 }
 
-// unpacedChecker is a Checker that implements neither Paced nor ThrottleAware.
+// unpacedChecker is a Checker that does not report pacing through Paced.
 type unpacedChecker struct{}
+
+func (unpacedChecker) RunContinuous(context.Context) error { return nil }
+func (unpacedChecker) ContinuousActive() bool              { return false }
 
 func (unpacedChecker) Run(context.Context) error            { return nil }
 func (unpacedChecker) GetProgress() status.ChecksumProgress { return status.ChecksumProgress{} }
 func (unpacedChecker) StartTime() time.Time                 { return time.Time{} }
 func (unpacedChecker) ExecTime() time.Duration              { return 0 }
 func (unpacedChecker) DifferencesFound() uint64             { return 0 }
+
+func (unpacedChecker) ResumeWatermark() (string, error) { return "", nil }
+
+func (unpacedChecker) SetThrottler(throttler.Throttler) {}
+
+func TestFiniteLocklessThrottleWiring(t *testing.T) {
+	for _, setter := range []bool{false, true} {
+		for _, composite := range []bool{false, true} {
+			name := fmt.Sprintf("setter=%v/composite=%v", setter, composite)
+			t.Run(name, func(t *testing.T) {
+				cfg := NewCheckerDefaultConfig()
+				cfg.Lockless = &LocklessCheckerConfig{DivergenceIsFatal: true}
+				lag, load := &binaryThrottler{}, &alwaysLoaded{}
+				var signal throttler.Throttler = lag
+				if composite {
+					signal = throttler.NewMultiThrottler(lag, load)
+				}
+				if !setter {
+					cfg.Throttler = signal
+				}
+				checker := checksumFixture(t, "lockless_throttle_wiring", 4096, cfg)
+				if setter {
+					checker.SetThrottler(signal)
+				}
+				require.NoError(t, checker.Run(t.Context()))
+				assert.Zero(t, lag.calls.Load(), "binary lag signals must not pace verification")
+				if composite {
+					assert.Positive(t, load.calls.Load(), "configured load signal must reach verification")
+				}
+			})
+		}
+	}
+}
+
+type checksumGaugeSink struct{ received chan *metrics.Metrics }
+
+func (s *checksumGaugeSink) Send(_ context.Context, m *metrics.Metrics) error {
+	select {
+	case s.received <- m:
+	default:
+	}
+	return nil
+}
+
+func TestFiniteLocklessEmitsConfiguredMetrics(t *testing.T) {
+	cfg := NewCheckerDefaultConfig()
+	cfg.Lockless = &LocklessCheckerConfig{DivergenceIsFatal: true}
+	cfg.Autoscale.Enabled = true
+	sink := &checksumGaugeSink{received: make(chan *metrics.Metrics, 1)}
+	cfg.MetricsSink = sink
+	gate := newGateThrottler()
+	cfg.Throttler = gate
+	checker := checksumFixture(t, "lockless_metrics_wiring", 4096, cfg)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- checker.Run(ctx) }()
+	defer func() { cancel(); require.ErrorIs(t, <-done, context.Canceled) }()
+	gate.waitEntered(t)
+	select {
+	case m := <-sink.received:
+		var found bool
+		for _, v := range m.Values {
+			if v.Name == metrics.ChecksumThreadsMetricName {
+				found = true
+				require.Positive(t, v.Value)
+			}
+		}
+		require.True(t, found, "live checksum worker gauge must reach the configured sink")
+	case <-time.After(3 * csTick):
+		t.Fatal("no checksum metrics reached configured sink")
+	}
+}

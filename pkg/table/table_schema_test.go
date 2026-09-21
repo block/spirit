@@ -173,3 +173,66 @@ func TestLoadSchemaFromDB_CombinedFilters(t *testing.T) {
 	require.Equal(t, "users", filtered[0].Name)
 	require.NotContains(t, filtered[0].Schema, "AUTO_INCREMENT=")
 }
+
+func TestLoadSchemaAndExcludedTablesFromDB(t *testing.T) {
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (
+		id bigint unsigned NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	) ENGINE=InnoDB AUTO_INCREMENT=500 DEFAULT CHARSET=utf8mb4`)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE _shadow (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users_archive_2024 (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	tables, excluded, err := LoadSchemaAndExcludedTablesFromDB(t.Context(), db,
+		WithoutUnderscoreTables,
+		WithoutArchiveTables,
+		WithStrippedAutoIncrement,
+	)
+	require.NoError(t, err)
+	require.Len(t, tables, 1)
+	require.Equal(t, "users", tables[0].Name)
+	require.NotContains(t, tables[0].Schema, "AUTO_INCREMENT=")
+
+	// Each excluded table is named alongside the option that excluded it, so a
+	// caller can word the two exclusions differently.
+	require.Equal(t, []ExcludedTable{
+		{Name: "_shadow", Filter: WithoutUnderscoreTables},
+		{Name: "users_archive_2024", Filter: WithoutArchiveTables},
+	}, excluded)
+}
+
+func TestLoadSchemaAndExcludedTablesFromDB_NoFilters(t *testing.T) {
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE _shadow (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users_archive_2024 (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	tables, excluded, err := LoadSchemaAndExcludedTablesFromDB(t.Context(), db)
+	require.NoError(t, err)
+	require.Len(t, tables, 3)
+	require.Empty(t, excluded)
+}
+
+func TestLoadSchemaAndExcludedTablesFromDB_ReportsFirstMatchingFilter(t *testing.T) {
+	// A name matching both conventions is excluded once, under the first
+	// option that matched, so a caller never discloses one table twice.
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE _users_archive_2024 (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	tables, excluded, err := LoadSchemaAndExcludedTablesFromDB(t.Context(), db, WithoutUnderscoreTables, WithoutArchiveTables)
+	require.NoError(t, err)
+	require.Empty(t, tables)
+	require.Equal(t, []ExcludedTable{{Name: "_users_archive_2024", Filter: WithoutUnderscoreTables}}, excluded)
+}

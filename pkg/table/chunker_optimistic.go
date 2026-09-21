@@ -81,6 +81,31 @@ type chunkerOptimistic struct {
 
 var _ MappedChunker = &chunkerOptimistic{}
 
+// optimisticWatermark is the optimistic chunker's checkpoint format: the chunk
+// JSON with the settled row count alongside it, so that RowsCopied survives a
+// resume instead of restarting from zero.
+//
+// The count is a sibling of the chunk's own fields rather than an envelope
+// around them, which keeps the watermark a plain chunk to every reader.
+// newChunkFromJSON and WatermarkRecopyClause parse it unchanged, and a reader
+// that predates the field ignores it and resumes from the bounds exactly as
+// before — so a checkpoint written by one version is readable by the other in
+// both directions.
+type optimisticWatermark struct {
+	JSONChunk
+
+	// RowsCopied is the count as it stood when the checkpoint was written,
+	// which is not the count as of the chunk the watermark points at: chunks
+	// that completed out of order, ahead of the watermark, are included. A
+	// resume re-copies those rows and counts them again, and every further
+	// resume does so afresh, so the count is settled work including replay
+	// rather than a running total of the rows present in the new table. This
+	// matches the composite chunker, whose envelope stores its count the same
+	// way, and it is why completion is tested with IsComplete rather than by
+	// comparing the count against the table's rows.
+	RowsCopied uint64
+}
+
 // maxPrefetchRejections is how many prefetch episodes may be abandoned on their
 // first chunk before the chunker gives up on prefetch for the rest of the run.
 // See chunkerOptimistic.prefetchRejections.
@@ -338,8 +363,7 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string) error {
 		}
 		t.checkpointHighPtr = checkpointHighPtr
 	}
-	chunkJSON, settled := unwrapWatermark(cp)
-	chunk, err := newChunkFromJSON(t.Ti, chunkJSON)
+	chunk, err := newChunkFromJSON(t.Ti, cp)
 	if err != nil {
 		return err
 	}
@@ -371,10 +395,16 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string) error {
 		ptrVal -= minVal
 	}
 	t.rowsCopied = ptrVal
-	// Settled rows cannot be derived from the key space, so they are
-	// restored from the checkpoint. A watermark written before the count
-	// was recorded carries none, and the count restarts at zero.
-	t.actualRowsCopied.Store(settled)
+
+	// actualRowsCopied is a real count, so unlike rowsCopied above it cannot be
+	// derived from the key space — it is restored from the watermark or not at
+	// all. A watermark written before the count was persisted carries no
+	// RowsCopied and resumes at zero, which is what it has always reported.
+	var restored optimisticWatermark
+	if err := json.Unmarshal([]byte(cp), &restored); err != nil {
+		return fmt.Errorf("could not read rows copied from watermark: %w", err)
+	}
+	t.actualRowsCopied.Store(restored.RowsCopied)
 	return nil
 }
 
@@ -657,21 +687,14 @@ func (t *chunkerOptimistic) GetLowWatermark() (string, error) {
 		return "", ErrWatermarkNotReady
 	}
 
-	chunkJSON, err := t.watermark.marshalJSON()
-	if err != nil {
-		return "", fmt.Errorf("could not serialize watermark: %w", err)
-	}
-	// The settled row count travels with the position so a resumed run
-	// reports the copy where it left off. The keyspace position needs no
-	// such record: OpenAtWatermark re-derives it from the chunk pointer.
-	watermark, err := json.Marshal(watermarkEnvelope{
-		ChunkJSON:  chunkJSON,
+	out, err := json.Marshal(optimisticWatermark{
+		JSONChunk:  t.watermark.jsonChunk(),
 		RowsCopied: t.actualRowsCopied.Load(),
 	})
 	if err != nil {
-		return "", fmt.Errorf("could not serialize watermark envelope: %w", err)
+		return "", fmt.Errorf("could not serialize watermark: %w", err)
 	}
-	return string(watermark), nil
+	return string(out), nil
 }
 
 func (t *chunkerOptimistic) open() (err error) {

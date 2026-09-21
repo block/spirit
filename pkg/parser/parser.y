@@ -1342,7 +1342,7 @@ type likeEscapeSpec struct {
 	UserSpecList                           "Username and auth option list"
 	AlterUserSpec                          "ALTER USER username with optional auth option and dual-password clause"
 	AlterUserSpecList                      "ALTER USER spec list"
-	AuthOptionWithPassword                 "Auth option carrying a cleartext password (BY form), for RETAIN CURRENT PASSWORD"
+	AuthOptionWithPassword                 "Auth option that sets a new password (BY forms or WITH plugin AS hash), for RETAIN CURRENT PASSWORD"
 	UserVariableList                       "User defined variable name list"
 	UserToUser                             "rename user to user"
 	UserToUserList                         "rename user to user by list"
@@ -14171,9 +14171,11 @@ UserSpecList:
  * dual-password clauses (RETAIN CURRENT PASSWORD / DISCARD OLD PASSWORD)
  * alongside an auth option, with grammar-level enforcement of MySQL's
  * restrictions:
- *   - RETAIN attaches only to BY-form auth options (IDENTIFIED BY 'plain'
- *     or IDENTIFIED WITH plugin BY 'plain'). The hashed AS-form and the
- *     bare-plugin form are NOT accepted with RETAIN.
+ *   - RETAIN attaches only to auth options that set a new password: the
+ *     BY forms (IDENTIFIED BY 'plain', IDENTIFIED WITH plugin BY 'plain')
+ *     and the hashed IDENTIFIED WITH plugin AS '<hash>' form, which is what
+ *     MySQL's binlog rewrite emits. The bare-plugin form and the no-auth
+ *     form are NOT accepted with RETAIN. See AuthOptionWithPassword.
  *   - DISCARD OLD PASSWORD is a standalone clause; no auth option may
  *     accompany it on the same spec.
  *   - RETAIN / DISCARD are NOT exposed via UserSpec, so CREATE USER
@@ -14235,11 +14237,23 @@ AlterUserSpecList:
 	}
 
 /*
- * AuthOptionWithPassword is the subset of AuthOption that carries an explicit
- * cleartext password, i.e. the BY forms. RETAIN CURRENT PASSWORD is only
- * valid after one of these per MySQL 8.0 semantics (not with the WITH plugin
- * AS '<hash>' form, the bare IDENTIFIED WITH plugin form, or with no auth
- * option at all).
+ * AuthOptionWithPassword is the subset of AuthOption that supplies a new
+ * password for the primary slot, so RETAIN CURRENT PASSWORD has something to
+ * demote the old password beneath. That is the BY forms plus the
+ * WITH plugin AS '<hash>' form; the bare IDENTIFIED WITH plugin form and the
+ * no-auth-option form are excluded (MySQL rejects both with 1064).
+ *
+ * The AS '<hash>' form matters beyond hand-written SQL: MySQL rewrites every
+ * ALTER USER / SET PASSWORD that sets a password into this canonical shape
+ * before writing it to the binary log, preserving RETAIN CURRENT PASSWORD.
+ * A SET PASSWORD ... REPLACE ... RETAIN CURRENT PASSWORD is logged as
+ *   ALTER USER 'u'@'h' IDENTIFIED WITH 'caching_sha2_password'
+ *     AS '<hash>' RETAIN CURRENT PASSWORD
+ * so pkg/change must parse it to extract table names from Query events.
+ *
+ * Note the AS form takes no ReplacePasswordOpt: MySQL rejects both
+ * AS '<hash>' REPLACE '<old>' and AS '<hash>' DISCARD OLD PASSWORD with 1064,
+ * and its own binlog rewrite drops the REPLACE clause.
  */
 AuthOptionWithPassword:
 	"IDENTIFIED" "BY" AuthString ReplacePasswordOpt
@@ -14287,6 +14301,14 @@ AuthOptionWithPassword:
 			opt.ReplaceString = $7.(string)
 		}
 		$$ = opt
+	}
+|	"IDENTIFIED" "WITH" AuthPlugin "AS" HashString
+	{
+		$$ = &ast.AuthOption{
+			AuthPlugin:   $3,
+			HashString:   $5,
+			ByHashString: true,
+		}
 	}
 
 ConnectionOptions:

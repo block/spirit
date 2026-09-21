@@ -24,7 +24,6 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -89,6 +88,21 @@ func TestChangeIntToBigIntPKResumeFromChkPt(t *testing.T) {
 	// and cannot infer recovery from CurrentState (issue #844).
 	require.True(t, m2.Progress().Resume)
 	require.NoError(t, m2.Close())
+}
+
+// watermarkChunkJSON returns the chunk portion of a watermark, dropping the
+// fields the chunker persists alongside it. It lets a test pin the exact chunk
+// the watermark points at without also pinning the row count, which depends on
+// how much of the binlog the applier had already written to the new table when
+// the chunk was copied.
+func watermarkChunkJSON(t *testing.T, watermark string) string {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(watermark), &fields))
+	delete(fields, "RowsCopied")
+	out, err := json.Marshal(fields)
+	require.NoError(t, err)
+	return string(out)
 }
 
 func TestCheckpoint(t *testing.T) {
@@ -228,9 +242,7 @@ func TestCheckpoint(t *testing.T) {
 	// gives feedback back to table.
 	watermark, err := r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	chunkJSON, checkpointed := copierWatermark(t, watermark)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", chunkJSON)
-	require.Equal(t, settled, checkpointed, "the checkpoint carries the settled row count")
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 	// Which the status block now reports in place of the checkpoint's own log
@@ -271,14 +283,9 @@ func TestCheckpoint(t *testing.T) {
 	// It's ideally not typical but you can still dump checkpoint from
 	// a restored checkpoint state. We won't have advanced anywhere from
 	// the last checkpoint because on restore, the LowerBound is taken.
-	// In a migration the new table keeps the rows a re-copied chunk carries,
-	// so re-copying it settles nothing new and the count does not double up
-	// across the resume.
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	chunkJSON, checkpointed = copierWatermark(t, watermark)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", chunkJSON)
-	require.Equal(t, settled, checkpointed)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
 	// Dump a checkpoint
 	require.NoError(t, r.DumpCheckpoint(t.Context()))
 
@@ -291,48 +298,7 @@ func TestCheckpoint(t *testing.T) {
 
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
-	chunkJSON, checkpointed = copierWatermark(t, watermark)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", chunkJSON)
-	require.Greater(t, checkpointed, settled, "rows copied after the resume add to the restored count")
-
-	// The copy aggregate reported to the metrics sink is per invocation: the
-	// count restored from the checkpoint is excluded, and the chunks are the
-	// eleven this runner copied.
-	sink := &copyAggregateSink{}
-	r.status.SetMetricsSink(sink, r.logger)
-	r.recordCopyCompleted()
-	require.Equal(t, r.copyChunker.RowsCopied()-settled, sink.rows)
-	require.Equal(t, uint64(11), sink.chunks)
-}
-
-// copyAggregateSink records the copy aggregate the runner reports when the
-// copy completes.
-type copyAggregateSink struct {
-	rows, chunks uint64
-}
-
-func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
-	for _, v := range m.Values {
-		switch v.Name {
-		case metrics.CopyRowsCompletedMetricName:
-			s.rows = uint64(v.Value)
-		case metrics.CopyChunksCompletedMetricName:
-			s.chunks = uint64(v.Value)
-		}
-	}
-	return nil
-}
-
-// copierWatermark decodes the copy chunker's checkpoint into the chunk
-// position and the settled row count it carries.
-func copierWatermark(t *testing.T, watermark string) (string, uint64) {
-	var envelope struct {
-		ChunkJSON  string
-		RowsCopied uint64
-	}
-	require.NoError(t, json.Unmarshal([]byte(watermark), &envelope))
-	require.NotEmpty(t, envelope.ChunkJSON)
-	return envelope.ChunkJSON, envelope.RowsCopied
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
 }
 
 func TestCheckpointRestore(t *testing.T) {
@@ -436,7 +402,7 @@ func TestCheckpointRestoreBinaryPK(t *testing.T) {
 	require.NoError(t, m2.Close())
 }
 
-func TestCheckpointResumeDuringChecksum(t *testing.T) {
+func TestCheckpointResumeAfterContinuousChecksum(t *testing.T) {
 	t.Parallel()
 	// Create unique database for this test
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
@@ -457,21 +423,22 @@ func TestCheckpointResumeDuringChecksum(t *testing.T) {
 		WithThreads(4),
 		WithRespectSentinel())
 
-	// Call r.Run() with our context in a go-routine.
-	// When we see that we are waiting on the sentinel table,
-	// we then manually start the first bits of checksum, and then close()
-	// We should be able to resume from the checkpoint into the checksum state.
+	// Exercise the real lifecycle. Never invoke the initial gate concurrently
+	// with continuous verification: both phases now share the checker/chunker.
 	running := startTestRun(t, r.Run, r.Close)
-	// Wait for the migration to block on the sentinel table.
 	waitForStatus(t, r, status.WaitingOnSentinelTable, running)
-
-	require.NoError(t, r.checksum(t.Context()))       // run the checksum, the original Run is blocked on sentinel.
-	require.NoError(t, r.DumpCheckpoint(t.Context())) // dump a checkpoint with the watermark.
+	require.NoError(t, r.DumpCheckpoint(t.Context()))
+	copyWM, checksumWM := latestCheckpointWatermarks(t, r)
+	require.NotEmpty(t, copyWM)
+	require.Empty(t, checksumWM, "sentinel waiting discards checksum resume evidence")
 	// Cancel + wait for Run to fully return before Close. See
 	// TestChangeIntToBigIntPKResumeFromChkPt for the rationale.
 	running.cancel()                  // unblocks the goroutine that was waiting on sentinel.
 	require.Error(t, running.wait(t)) // context cancelled
 	require.NoError(t, r.Close())
+
+	// Corruption below the old completed watermark must be found on restart.
+	testutils.RunSQLInDatabase(t, dbName, `UPDATE _cptresume_new SET id2 = -1 WHERE id = 1`)
 
 	// drop the sentinel table.
 	testutils.RunSQLInDatabase(t, dbName, `DROP TABLE _spirit_sentinel`)
@@ -487,6 +454,9 @@ func TestCheckpointResumeDuringChecksum(t *testing.T) {
 	require.NoError(t, r2.Run(t.Context()))
 	defer utils.CloseAndLog(r2)
 	require.True(t, r2.usedResumeFromCheckpoint.Load())
+	var value int
+	require.NoError(t, r2.db.QueryRowContext(t.Context(), "SELECT id2 FROM cptresume WHERE id = 1").Scan(&value))
+	require.Equal(t, 1, value, "restart verifies and repairs rows below the initial checksum watermark")
 }
 
 func TestCheckpointDifferentRestoreOptions(t *testing.T) {

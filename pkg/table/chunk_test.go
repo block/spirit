@@ -302,8 +302,7 @@ func TestWatermarkPerTable(t *testing.T) {
 	rawChunk := `{"Key":["id"],"ChunkSize":1000,"LowerBound":{"Value":["50"],"Inclusive":true},"UpperBound":{"Value":["100"],"Inclusive":false}}`
 	compositeEnvelope := `{"ChunkJSON":"{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\":[\"50\"],\"Inclusive\":true},\"UpperBound\":{\"Value\":[\"100\"],\"Inclusive\":false}}","RowsCopied":50}`
 
-	// Bare chunk format (single table), as optimistic chunker checkpoints held
-	// before the settled row count was recorded.
+	// Optimistic chunker raw chunk format (single table).
 	wms, err := WatermarkPerTable(rawChunk, t1)
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{"localhost:3306.test.t1": rawChunk}, wms)

@@ -306,6 +306,53 @@ func TestExtractTablesFromDDLStmtsComplex(t *testing.T) {
 	}
 }
 
+// TestExtractTablesFromAccountManagementDDL covers account-management DDL that
+// appears in the binary log as a Query event. These statements reference no
+// table, so the contract is that they parse cleanly and yield no tables: a
+// parse error here aborts the migration's binlog subscriber.
+//
+// The password-setting forms are the ones MySQL rewrites before logging. Both
+//
+//	ALTER USER 'u'@'h' IDENTIFIED BY 'new' RETAIN CURRENT PASSWORD
+//	SET PASSWORD = 'new' REPLACE 'old' RETAIN CURRENT PASSWORD
+//
+// reach the binary log as a canonical ALTER USER carrying the hashed password
+// via IDENTIFIED WITH ... AS '<hash>', with RETAIN CURRENT PASSWORD preserved
+// and REPLACE dropped. The literals below are verbatim MySQL 8.0.45 output.
+func TestExtractTablesFromAccountManagementDDL(t *testing.T) {
+	statements := []string{
+		// Rewritten from: ALTER USER 'app_user' IDENTIFIED BY 'new' RETAIN CURRENT PASSWORD
+		`ALTER USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$4` + "`" + `9\ZEe,SQp-jNF\Z2%prqVsmV8vllDVahK7UkkNl2yu/PDX95cYRuFQefimNhB' RETAIN CURRENT PASSWORD`,
+		// Rewritten from: SET PASSWORD = 'new' REPLACE 'old' RETAIN CURRENT PASSWORD
+		`ALTER USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$q8Ih3aX[gy||6|d33N0edvsEELBLTt9HE9XBFyrpVXVxuGIxzl6OgGsD.' RETAIN CURRENT PASSWORD`,
+		// Rewritten from: ALTER USER 'app_user' IDENTIFIED BY 'new'
+		// RETAIN CURRENT PASSWORD PASSWORD EXPIRE NEVER, which is what rotating
+		// a service account in one statement emits. This composes two
+		// productions rather than varying one: RETAIN CURRENT PASSWORD is
+		// consumed inside AlterUserSpec, which has no trailing options, while
+		// PASSWORD EXPIRE NEVER is consumed by the statement-level
+		// PasswordOrLockOptions after the spec list.
+		`ALTER USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$|:m(]TuDn{6H*` + "`" + `0(nwg37zRcPi4VGib7LCDS/912c3ha6GhIATk62f91fx9' RETAIN CURRENT PASSWORD PASSWORD EXPIRE NEVER`,
+		// Logged verbatim, without a rewrite.
+		`ALTER USER 'app_user'@'%' DISCARD OLD PASSWORD`,
+		`ALTER USER 'app_user'@'%' PASSWORD EXPIRE`,
+		`ALTER USER 'app_user'@'%' ACCOUNT LOCK`,
+		`CREATE USER 'app_user'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$B\\Z>a4h:I|7\\"d{V69}zRA6wKA6c5HDj4R9qqZR84CMBwhkqcSXBSFXpOVjm3.'`,
+		`DROP USER IF EXISTS 'app_user'@'%'`,
+		`GRANT USAGE ON *.* TO 'app_user'@'%'`,
+		`GRANT APPLICATION_PASSWORD_ADMIN ON *.* TO 'app_user'@'%'`,
+		`REVOKE SELECT ON *.* FROM 'app_user'@'%'`,
+	}
+	for _, statement := range statements {
+		t.Run(statement, func(t *testing.T) {
+			tables, opensTransaction, err := extractTablesFromDDLStmts("test", statement)
+			require.NoError(t, err)
+			require.Empty(t, tables)
+			require.False(t, opensTransaction)
+		})
+	}
+}
+
 // TestPkChanged exercises the helper that decides whether the before- and
 // after-image of a binlog UPDATE event represent a primary key update.
 // Values arrive in []any from the binlog row image with concrete types

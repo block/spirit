@@ -230,7 +230,7 @@ func TestFixCorruptWithApplier(t *testing.T) {
 // DistributedChecker.Run returns hard errors immediately (no retry
 // continue), so the poisoned-retry path is reached by reusing the checker
 // for a subsequent Run — the same reuse pattern as move's
-// continuous-checksum loop. The second Run must fail again on the
+// lockless-checksum loop. The second Run must fail again on the
 // still-divergent data, not return nil.
 func TestDistributedRetryDoesNotVacuouslyPass(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())

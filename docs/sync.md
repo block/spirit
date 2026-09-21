@@ -61,6 +61,36 @@ A source that cannot grant the built-in feed privileges must use a
 programmatically injected `change.Source`; the CLI no longer has a mode that
 runs without a change stream.
 
+## Autoscaling
+
+`--enable-experimental-autoscaling` enables target-aware concurrency control
+for Aurora targets with at least four vCPUs. Eligible targets override
+`--threads` and `--write-threads`; other targets retain those configured counts.
+The target's load and commit latency are sampled through a separate two-connection
+monitor pool. Source load is not measured.
+
+During the initial copy, the shared copier controller adjusts read and write
+workers using target load and the applier queue. After copying, the continuous
+checksum controller adjusts concurrent checks using target load and change-feed
+backlog. Target overload pauses new checks, while in-flight repairs finish.
+A write controller also remains active for checksum repairs. Cancellation joins
+these controllers before the applier is stopped.
+
+Replication flushes are separate from the applier's copy/repair worker pool.
+The built-in change feed uses the target load signal to narrow its flushes under
+load; it continues making progress rather than pausing replication. Injected
+feeds must use `Runner.TargetUnderLoad` as their `ClientConfig.UnderLoad` callback
+and set the matching capacity-derived `FlushConcurrency`/`BatchSize` to get the
+same behavior. That method is safe to call before `Run`. An injected
+`SingleTargetApplier` using the supplied target is supported; custom or sharded
+appliers retain their configured concurrency.
+
+Worker ceilings are derived at startup from target capacity, client CPU capacity,
+and the fixed `--max-connections` budget. Fresh and resumed runs use the same
+setup. Restart the sync after changing the target instance size to rederive
+those ceilings and monitoring thresholds. Independent syncs sharing a host each
+observe its load but do not share a single worker budget.
+
 ## Configuration
 
 - [source-dsn](#source-dsn)
@@ -126,12 +156,14 @@ the replication-latency vs. batching trade-off.
 - Type: Boolean
 - Default value: `false`
 
-When set to `true`, the target tables are created **without their regular
-secondary indexes**, and the indexes are added back in a single `ALTER` per
+When set to `true`, the target tables are created **with deferrable regular
+secondary indexes omitted**, and the indexes are added back in a single `ALTER` per
 table once the initial copy has completed, before the continuous phase begins.
-Bulk-loading an index-free table is faster and lighter on temporary space; only
+Bulk-loading a table with fewer indexes is faster and lighter on temporary space; only
 regular secondary indexes are deferred — `PRIMARY`, `UNIQUE`, `FULLTEXT` and
-`SPATIAL` indexes are kept on the initial `CREATE`. This mirrors
+`SPATIAL` indexes are kept on the initial `CREATE`. If no retained primary or
+unique key starts with the `AUTO_INCREMENT` column, one regular supporting
+index is also kept, preferring the fewest key parts. This mirrors
 [`move --defer-secondary-indexes`](move.md#defer-secondary-indexes).
 
 Use it only when the target is **not yet serving reads**: the tables briefly
@@ -194,6 +226,52 @@ remain portable across servers, subject to the normal GTID resume checks.
 
 ### max-connections
 
-`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). Worker counts may exceed the budget and wait for connections. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
+`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). With autoscaling disabled, worker counts may exceed the budget and wait for connections. Autoscaling partitions the target pool between checksum reads and repair writes, reserving the derived replication flush width plus six connections for checkpoints and metadata. Pools too small for that reservation keep configured concurrency. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
 
 Sync’s continuous checker uses ordinary reads rather than pinned snapshot pools, and sync has no cutover. It therefore does not require move’s checksum/cutover headroom or lower configured read concurrency to fit that headroom.
+
+## Verification of hot ranges
+
+When a mismatching checksum range changes on two successive retries, sync
+splits it around observed source primary keys. Large ranges produce up to eleven
+children: five point reads and six surrounding ranges. The last pivot is the
+observed tuple maximum, leaving an initially empty tail for future inserts.
+Mismatching descendants above 128 source rows subdivide immediately without
+waiting for more source-change observations; smaller descendants use normal
+verification and retries. Small roots retain a three-child split. The surrounding ranges remain covered even where the source
+currently has no rows, so target-only rows and missing inserts are not skipped.
+Composite and textual keys use MySQL's ordering rather than numeric midpoints.
+
+Children are independently verified in the same pass, without restarting ranges
+that already passed or inheriting their parent's checksum. Split children do not
+feed the main chunker's walk-progress estimate. Status separates the scan from
+remaining verification, for example:
+
+```text
+verify  pass=1  scan complete
+        remaining: 1 retrying (0 hot), 0 in flight, 0 deferred
+        pass activity: 63 chunks mismatched: 49 split, 0 recopied
+```
+
+The mismatch count records each chunk's initial mismatch once; split and recopy
+counts describe outcomes within that count. Raw `ChunksThisPass` includes split
+parents and children, while `ChunksPassedThisPass` excludes split parents, so
+they are not a completion ratio. Estimated scan progress can reach 100% before
+the walker finishes, and finishing the scan does not verify unresolved ranges.
+Between passes, status shows the completed pass and scheduled next start.
+`first clean pass` reports historical verification evidence when available;
+repairs and deferred ranges still require verification in a later pass.
+
+A failed split query logs a warning and retains the normal bounded retries;
+it cannot mark a range verified. Cancelling the sync still stops verification.
+
+Splitting is bounded to 32 levels, 128 attempts per original walker range
+(shared by all its descendants), and 1,024 attempts per pass. A large lagging
+range therefore cannot consume the entire pass budget. Each pivot lookup,
+including its stale-count fallback, has a 30-second timeout; a wide split can
+perform up to five such lookups, all cancellable by the parent context. A single-row
+range, an empty source range, or an exhausted split budget continues through the
+normal bounded retry/deferral path. A deferred range still prevents the pass
+from being verified. This improves convergence when a large range contains a few
+hot rows; it does not establish a common source/target stream position for a row
+that changes continuously.

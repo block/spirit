@@ -42,6 +42,10 @@ import (
 // programmatic callers (e.g. strata's Vitess/PlanetScale import) that
 // inject a non-MySQL change source and/or a custom applier.
 type Sync struct {
+	// EnableExperimentalAutoscaling derives bounded copy/checksum concurrency
+	// from the Aurora target and adapts it to target load throughout the sync.
+	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: scale copy, write and checksum concurrency using Aurora target load. Overrides --threads and --write-threads when the target qualifies." default:"false"`
+
 	// MaxConnections limits each SQL pool; worker counts do not expand it.
 	MaxConnections int    `name:"max-connections" help:"Size of each source and target SQL connection pool. Workers share the pool and contend for connections." default:"128"`
 	SourceDSN      string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
@@ -58,15 +62,15 @@ type Sync struct {
 	// batching trade-off. Defaults to change.DefaultFlushInterval.
 	FlushInterval time.Duration `name:"flush-interval" help:"How often to flush buffered changes to the target during continuous sync." default:"30s"`
 
-	// DeferSecondaryIndexes creates the target tables without their secondary
+	// DeferSecondaryIndexes creates the target tables without their deferrable regular
 	// indexes, then adds the indexes back once the initial copy has completed.
-	// Bulk-loading an index-free table is faster and lighter on temporary
+	// Bulk-loading a table with fewer indexes is faster and lighter on temporary
 	// space; the indexes are rebuilt in one ALTER per table afterwards. Only
 	// safe when the target is not yet serving reads, because the tables briefly
 	// lack their secondary indexes. UNIQUE/FULLTEXT/SPATIAL indexes are kept on
-	// the initial CREATE (only regular secondary indexes are deferred), the
+	// the initial CREATE, as is a regular index required by AUTO_INCREMENT, the
 	// same as `move --defer-secondary-indexes`.
-	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Create target tables without secondary indexes, then add them after the initial copy." default:"false"`
+	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Defer regular indexes until after the initial copy, preserving required AUTO_INCREMENT support." default:"false"`
 
 	// Force, when set, makes the runner wipe the sync-owned objects on the
 	// target at startup — the target copies of the source tables plus the sync

@@ -3,6 +3,7 @@ package checksum
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -556,35 +557,61 @@ func TestYieldTimeout(t *testing.T) {
 }
 
 func TestFromWatermark(t *testing.T) {
-	testutils.RunSQL(t, "DROP TABLE IF EXISTS tfromwatermark, _tfromwatermark_new, _tfromwatermark_chkpnt")
-	testutils.RunSQL(t, "CREATE TABLE tfromwatermark (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "CREATE TABLE _tfromwatermark_new (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	tt := testutils.NewTestTable(t, "tfromwatermark", "CREATE TABLE tfromwatermark (a INT NOT NULL PRIMARY KEY, b INT, c INT)")
+	testutils.NewTestTable(t, "_tfromwatermark_new", "CREATE TABLE _tfromwatermark_new LIKE tfromwatermark")
+	db := tt.DB
 	testutils.RunSQL(t, "INSERT INTO tfromwatermark VALUES (1, 2, 3)")
-	testutils.RunSQL(t, "INSERT INTO _tfromwatermark_new VALUES (1, 2, 3)")
-
-	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
+	// The non-auto-increment key selects the composite chunker. Seed enough
+	// rows to obtain a bounded watermark after the initial unbounded chunk.
+	for offset := 1; offset < 4096; offset *= 2 {
+		testutils.RunSQL(t, fmt.Sprintf("INSERT INTO tfromwatermark SELECT a + %d, b, c FROM tfromwatermark", offset))
+	}
+	testutils.RunSQL(t, "INSERT INTO _tfromwatermark_new SELECT * FROM tfromwatermark")
 
 	t1 := table.NewTableInfo(db, "test", "tfromwatermark")
 	require.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "_tfromwatermark_new")
 	require.NoError(t, t2.SetInfo(t.Context()))
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
+	defer utils.CloseAndLog(chunker)
+	var lastChunk *table.Chunk
+	for range 2 {
+		lastChunk, err = chunker.Next()
+		require.NoError(t, err)
+		chunker.Feedback(lastChunk, time.Millisecond, 0)
+	}
+	require.NotNil(t, lastChunk.LowerBound)
+	require.NotNil(t, lastChunk.UpperBound)
+	watermark, err := chunker.GetLowWatermark()
+	require.NoError(t, err)
+	require.NotEmpty(t, watermark)
 
+	// Restore through the factory into a fresh, unopened chunker. Use the
+	// chunker's serialized evidence, not hand-written chunk JSON: composite
+	// watermarks wrap that JSON together with progress metadata.
+	resumed, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(resumed)
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
 	defer feed.Close()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
-	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(t1, t2, resumed))
 	require.NoError(t, feed.Start(t.Context()))
-	require.NoError(t, chunker.Open())
-
 	config := newTestCheckerConfig(t, db)
-	config.Watermark = "{\"Key\":[\"a\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"2\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"3\"],\"Inclusive\":false}}"
-	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
+	config.Watermark = watermark
+	checker, err := NewChecker([]*sql.DB{db}, resumed, []change.Source{feed}, config)
 	require.NoError(t, err)
+	restored, err := checker.ResumeWatermark()
+	require.NoError(t, err)
+	require.JSONEq(t, watermark, restored)
+	next, err := resumed.Next()
+	require.NoError(t, err)
+	require.Equal(t, lastChunk.LowerBound, next.LowerBound, "resume must start at the saved range, not the beginning")
+	// Rewind the inspected chunk so Run verifies it as well as the suffix.
+	require.NoError(t, resumed.OpenAtWatermark(watermark))
 	require.NoError(t, checker.Run(t.Context()))
 }
 

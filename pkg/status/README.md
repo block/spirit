@@ -36,7 +36,7 @@ Every runner passes its existing `metrics.Sink` to `Tracker`. Generic sinks rece
 
 The typed capability deliberately extends `metrics.Sink` rather than creating another observer mechanism. A runner with the default `metrics.NoopSink` disables transition delivery entirely and adds no transition allocations. Sink calls happen outside the tracker's timing mutex, their latency is excluded from phase duration, and a panic in a typed callback is recovered so telemetry cannot change migration behavior.
 
-Copy totals count work settled during the current `Run` invocation and are emitted even when the copy attempt fails or is cancelled. The chunker restores its settled count from the checkpoint so that `Progress` continues across a resume, and the runner subtracts that restored count from the aggregate, so a resumed invocation reports only the rows and chunks it settled itself.
+Copy totals count work settled during the current `Run` invocation and are emitted even when the copy attempt fails or is cancelled. The optimistic chunker does not persist its actual-row counter, so a resumed invocation reports only rows and chunks settled after resume.
 
 Durable mutation and physical ownership are correctness facts, not metrics. `migration.Runner.Result` and `move.Runner.Result` return `status.WorkflowResult` after `Run`; failures also preserve machine-checkable `status.ErrDurableMutation` and `status.ErrOwnershipAmbiguous` markers through `errors.Is`. Result-bearing forward and reverse cutover callbacks carry the same two independent facts, so a caller can report a confirmed partial write without inventing ownership ambiguity.
 
@@ -138,6 +138,6 @@ Migration, move and datasync use `TablesFromChunker` to return table progress in
 
 All three use multiline status blocks. Datasync includes `copier-time` while copying and `state-time` while restoring indexes, alongside its existing binlog and checkpoint rows. Sentinel progress polling returns a summary without emitting logs; periodic logging remains the responsibility of `WatchTask`.
 
-Per-table `RowsCopied` is the actual settled row count from chunk feedback; `RowsTotal` is the estimated table cardinality, which may change and is not an upper bound. These are not the optimistic chunker’s keyspace-distance counters. Resumed copies may exclude work from before the checkpoint when the watermark does not retain row counts; use `IsComplete` for completion rather than requiring equality of the two counts.
+Per-table `RowsCopied` is the actual settled row count from chunk feedback; `RowsTotal` is the estimated table cardinality, which may change and is not an upper bound. These are not the optimistic chunker’s keyspace-distance counters. The chunkers carry the count forward in their watermark, so a resumed copy includes the work done before the checkpoint; a watermark written before a chunker persisted its count resumes at zero. Use `IsComplete` for completion rather than requiring equality of the two counts.
 
 `Summary` remains runner-specific: move and migration leave it empty in some phases (such as index restoration), while datasync falls back to the state name. Structured fields and multiline status formatting are aligned; summary text is not a shared API format.

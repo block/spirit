@@ -20,9 +20,7 @@ func (integerDisplayWidthNormalizer) Name() string { return "integer-display-wid
 func (integerDisplayWidthNormalizer) Normalize(ct *CreateTable) *CreateTable {
 	for i := range ct.Columns {
 		c := &ct.Columns[i]
-		switch c.Type {
-		case "tinyint", "smallint", "mediumint", "int", "bigint":
-		default:
+		if !isIntegerColumnType(c.Type) {
 			continue // not an integer type
 		}
 		if c.Zerofill != nil && *c.Zerofill {

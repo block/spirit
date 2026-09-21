@@ -79,10 +79,34 @@ func StripAutoIncrement(stmt string) string {
 	return restored.String()
 }
 
+// ExcludedTable is a table a filter option kept out of the schema
+// LoadSchemaAndExcludedTablesFromDB returned, paired with the option that
+// excluded it.
+type ExcludedTable struct {
+	Name   string       // Table name
+	Filter FilterOption // The filter option that excluded the table
+}
+
 // LoadSchemaFromDB retrieves all table schemas from the database using the
 // provided connection. The returned tables and DDL are filtered according to
 // the supplied options. With no options the raw DDL is returned unmodified.
 func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]TableSchema, error) {
+	tables, _, err := LoadSchemaAndExcludedTablesFromDB(ctx, db, opts...)
+	return tables, err
+}
+
+// LoadSchemaAndExcludedTablesFromDB is LoadSchemaFromDB, additionally
+// reporting every table the filter options excluded and which option excluded
+// it. A caller that has to account for what is missing from the schema it
+// loaded — a declarative tool disclosing the tables it is declining to look
+// at, say — cannot recover those names from the returned schema, and
+// recovering them by re-implementing the predicates puts a second copy of them
+// outside this package, to drift the next time a filter changes.
+//
+// A table is reported once, under the first option that excluded it, and the
+// exclusions keep the order SHOW TABLES returned them in. WithStrippedAutoIncrement
+// rewrites DDL rather than excluding a table, so it never appears.
+func LoadSchemaAndExcludedTablesFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]TableSchema, []ExcludedTable, error) {
 	optSet := make(map[FilterOption]bool, len(opts))
 	for _, o := range opts {
 		optSet[o] = true
@@ -90,37 +114,40 @@ func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]
 
 	rows, err := db.QueryContext(ctx, "SHOW TABLES")
 	if err != nil {
-		return nil, fmt.Errorf("failed to list tables: %w", err)
+		return nil, nil, fmt.Errorf("failed to list tables: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	var tableNames []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("failed to scan table name: %w", err)
+			return nil, nil, fmt.Errorf("failed to scan table name: %w", err)
 		}
 		tableNames = append(tableNames, name)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating tables: %w", err)
+		return nil, nil, fmt.Errorf("error iterating tables: %w", err)
 	}
 	var tables []TableSchema
+	var excluded []ExcludedTable
 	for _, name := range tableNames {
 		if optSet[WithoutUnderscoreTables] && strings.HasPrefix(name, "_") {
+			excluded = append(excluded, ExcludedTable{Name: name, Filter: WithoutUnderscoreTables})
 			continue
 		}
 		if optSet[WithoutArchiveTables] && IsArchiveTable(name) {
+			excluded = append(excluded, ExcludedTable{Name: name, Filter: WithoutArchiveTables})
 			continue
 		}
 		var tbl, createStmt string
 		err := db.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE %s", sqlescape.EscapeIdentifier(name))).Scan(&tbl, &createStmt)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get CREATE TABLE for %s: %w", name, err)
+			return nil, nil, fmt.Errorf("failed to get CREATE TABLE for %s: %w", name, err)
 		}
 		if optSet[WithStrippedAutoIncrement] {
 			createStmt = StripAutoIncrement(createStmt)
 		}
 		tables = append(tables, TableSchema{Name: tbl, Schema: createStmt})
 	}
-	return tables, nil
+	return tables, excluded, nil
 }

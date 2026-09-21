@@ -16,6 +16,9 @@ type Move struct {
 	// not grow it. Dedicated monitor/advisory pools are separate.
 	MaxConnections int `name:"max-connections" help:"Size of each source and target connection pool. Workers share the pool and contend for connections." optional:"" default:"128"`
 
+	// Autoscaling uses the busiest target host to scale all shards together.
+	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: scale copy, per-target write and checksum threads using the busiest Aurora target host. Overrides --threads and --write-threads when all target hosts qualify." default:"false"`
+
 	SourceDSN string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
 	TargetDSN string `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
 	// TargetChunkSize is the in-memory byte budget the buffered copier sizes each
@@ -26,7 +29,7 @@ type Move struct {
 	Threads               int           `name:"threads" help:"How many chunks to copy in parallel" default:"2"`
 	WriteThreads          int           `name:"write-threads" help:"How many concurrent write threads to use per target" default:"4"`
 	DeferCutOver          bool          `name:"defer-cutover" help:"Defer cutover (and continuous checksum) until the sentinel table on the first target database is dropped" default:"false"`
-	DeferSecondaryIndexes bool          `name:"defer-secondary-indexes" help:"Create target tables without secondary indexes, add them before cutover" default:"false"`
+	DeferSecondaryIndexes bool          `name:"defer-secondary-indexes" help:"Defer regular indexes until before cutover, preserving required AUTO_INCREMENT support" default:"false"`
 	CheckpointMaxAge      time.Duration `name:"checkpoint-max-age" help:"Maximum age of a checkpoint before refusing to resume from it" optional:"" default:"168h"`
 	// Force makes the runner wipe the target tables and start the copy fresh when
 	// it cannot resume from a checkpoint (e.g. the checkpoint is from an

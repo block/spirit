@@ -58,6 +58,13 @@ type sourceInfo struct {
 // Runner executes a Sync: an initial copy followed by continuous
 // replication that runs until the context is cancelled.
 type Runner struct {
+	// Published before background work starts; external feeds read the signal
+	// through TargetUnderLoad, which uses progMu.
+	loadSignal                       throttler.Throttler
+	monitorDB                        *sql.DB
+	autoscale                        copier.AutoscaleConfig
+	flushConcurrency, flushBatchSize int
+
 	sourceUUID string // server owning file:position checkpoints
 	sync       *Sync
 
@@ -70,11 +77,10 @@ type Runner struct {
 
 	sourceTables []*table.TableInfo
 
-	applier          applier.Applier
-	replClient       change.Source
-	copyChunker      table.Chunker
-	copyRowsAtResume uint64 // settled rows restored from the checkpoint, excluded from this invocation's copy aggregate
-	copier           copier.Copier
+	applier     applier.Applier
+	replClient  change.Source
+	copyChunker table.Chunker
+	copier      copier.Copier
 
 	// resuming is set when a checkpoint was found on the target: the
 	// initial copy is skipped and the change feed is opened from the
@@ -96,10 +102,9 @@ type Runner struct {
 	// nothing pays only for the discarded values.
 	metricsSink metrics.Sink
 	cancelFunc  context.CancelFunc
-	// sourceDBConfig connects to the read-only source: ForceKill and
-	// RejectReadOnly are disabled (see Run). targetDBConfig connects to the
-	// writable target and keeps the standard safe defaults — most importantly
-	// RejectReadOnly=true for Aurora-failover safety.
+	// sourceDBConfig connects to the read-only source, with ForceKill disabled
+	// (see Run). targetDBConfig connects to the writable target and keeps the
+	// standard safe defaults.
 	sourceDBConfig *dbconn.DBConfig
 	targetDBConfig *dbconn.DBConfig
 
@@ -123,13 +128,13 @@ type Runner struct {
 	// read concurrently from a separate monitoring goroutine.
 	progMu sync.RWMutex
 
-	// continuousChecker is constructed in runContinuous (after the initial
+	// locklessChecker is constructed in runContinuous (after the initial
 	// copy and post-copy flush) and runs in a sibling goroutine until ctx
 	// cancels. Programmatic callers can read FirstCleanPass / ChecksumStats
 	// through accessors on Runner. nil before runContinuous.
 	//
-	// continuousReadyCh closes once the checker has been constructed (the
-	// initial copy + post-copy flush have completed and runContinuousChecksum
+	// locklessReadyCh closes once the checker has been constructed (the
+	// initial copy + post-copy flush have completed and runLocklessChecksum
 	// has started). Callers can wait on ChecksumReady() to gate on
 	// checker availability.
 	//
@@ -138,12 +143,12 @@ type Runner struct {
 	// keeps the FirstCleanPass accessor non-blocking — callers can grab it
 	// before Run starts and select on it without deadlocking. It stays
 	// open if the run exits without observing a clean pass.
-	continuousChecker         *checksum.ContinuousChecker
-	continuousChunker         table.Chunker
-	continuousReadyCh         chan struct{}
-	firstCleanPassCh          chan struct{}
-	continuousCheckerInitOnce sync.Once
-	firstCleanPassInitOnce    sync.Once
+	locklessChecker         *checksum.LocklessChecker
+	locklessChunker         table.Chunker
+	locklessReadyCh         chan struct{}
+	firstCleanPassCh        chan struct{}
+	locklessCheckerInitOnce sync.Once
+	firstCleanPassInitOnce  sync.Once
 }
 
 var _ status.Task = (*Runner)(nil)
@@ -152,6 +157,8 @@ var _ status.Task = (*Runner)(nil)
 // supplies defaults via kong; programmatic callers get the same defaults
 // applied here as a safety net.
 func NewRunner(s *Sync) (*Runner, error) {
+	config := *s
+	s = &config // Defaults and derived concurrency belong to this runner.
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
@@ -174,27 +181,26 @@ func NewRunner(s *Sync) (*Runner, error) {
 		s.FlushInterval = change.DefaultFlushInterval
 	}
 	r := &Runner{
-		sync:              s,
-		logger:            slog.Default(),
-		metricsSink:       &metrics.NoopSink{},
-		continuousReadyCh: make(chan struct{}),
-		firstCleanPassCh:  make(chan struct{}),
+		sync:             s,
+		logger:           slog.Default(),
+		metricsSink:      &metrics.NoopSink{},
+		locklessReadyCh:  make(chan struct{}),
+		firstCleanPassCh: make(chan struct{}),
 	}
 	return r, nil
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The chunker restores its settled count from the
-// checkpoint so that progress continues across a resume; that restored count
-// is subtracted here, so a resumed invocation reports only the rows settled
-// after it resumed, alongside the chunks it copied.
+// Runner.Run invocation. The optimistic chunker does not persist its
+// actual-row counter in a checkpoint, so a resumed invocation reports only
+// work settled after it resumed.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -252,25 +258,31 @@ func (r *Runner) Run(ctx context.Context) error {
 	// on the source schema; the built-in MySQL binlog client additionally
 	// needs REPLICATION SLAVE/CLIENT (validated on Start) and RELOAD, because
 	// it issues FLUSH BINARY LOGS to establish its start position. Disable the
-	// two dbConfig behaviours that would otherwise demand more:
+	// one dbConfig behaviour that would otherwise demand more:
 	//   - ForceKill needs CONNECTION_ADMIN/PROCESS + performance_schema, and
 	//     is only used to break metadata locks during cutover — which sync
 	//     never does.
-	//   - RejectReadOnly is an Aurora-failover guard that turns a read-only
-	//     server error into driver.ErrBadConn; sync's source is read-only by
-	//     design (e.g. a Vitess/PlanetScale replica), so it must not fire.
+	//
+	// There used to be a second, RejectReadOnly=false, on the grounds that the
+	// source is read-only by design (e.g. a Vitess/PlanetScale replica). That
+	// reasoned from the wrong axis: 1290/1792/1836 are raised by *writes*, not
+	// by connecting to a read-only server, and everything sync sends the source
+	// succeeds against a super_read_only MySQL — including the binlog client's
+	// FLUSH BINARY LOGS. The option is gone from the driver, and its absence
+	// costs sync nothing. If sync ever does write to its source, that is a bug,
+	// and the rejection now surfaces it instead of hiding it.
 	r.sourceDBConfig.ForceKill = false
-	r.sourceDBConfig.RejectReadOnly = false
 	r.sourceDBConfig.MaxOpenConnections = r.sync.MaxConnections
 
 	// The target is written to (table creation, the copy/apply, the
 	// checkpoint, and CREATE DATABASE on the admin connection), so it keeps the
-	// standard safe defaults — crucially RejectReadOnly=true, so that if the
-	// target Aurora fails over and we land on a demoted, now-read-only primary,
-	// writes turn into driver.ErrBadConn and the pool reconnects instead of
-	// silently erroring. Only the relaxations the target genuinely shares with
-	// the source are applied (no cutover here either, so ForceKill is left at
-	// its default but never fires).
+	// standard safe defaults. It is also the side that actually benefits from
+	// the driver's read-only rejection: if the target Aurora fails over and we
+	// land on a demoted, now-read-only primary, those writes turn into
+	// driver.ErrBadConn and the pool reconnects instead of silently erroring.
+	// Only the relaxations the target genuinely shares with the source are
+	// applied (no cutover here either, so ForceKill is left at its default but
+	// never fires).
 	r.targetDBConfig = dbconn.NewDBConfig()
 	r.targetDBConfig.MaxOpenConnections = r.sync.MaxConnections
 
@@ -359,7 +371,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		// key can be observed on the change stream — and discarded — while
 		// the copier's later read of that key on the replica still returns
 		// the pre-update (stale) value, silently losing it. The safety net is
-		// the post-copy continuous checksum, which repairs divergence only
+		// the post-copy lockless checksum, which repairs divergence only
 		// lazily, and isn't usable at all on the read-only import source yet
 		// (it needs privileges that credential lacks). So this optimization
 		// trades a small, environment-dependent divergence risk for initial
@@ -393,7 +405,7 @@ func (r *Runner) Run(ctx context.Context) error {
 // runContinuous creates/maintains the target checkpoint and blocks until
 // the context is cancelled, while the periodic flush (started in
 // startBackgroundRoutines) keeps applying buffered changes. In parallel,
-// the continuous (eventually-consistent) checksum walks the data and
+// the lockless checksum walks the data and
 // surfaces a FirstCleanPass signal for callers that gate on
 // "data is known consistent". On a clean cancellation it drains the final
 // backlog and returns nil; on a fatal source event or a checksum failure
@@ -407,7 +419,7 @@ func (r *Runner) runContinuous(ctx context.Context) error {
 	// continuous — resumes from the last checkpoint.
 	r.logger.Info("Continuous sync running; will run until cancelled")
 
-	// Spawn the continuous checksum. It uses a separate chunker so
+	// Spawn the lockless checksum. It uses a separate chunker so
 	// checkpoint state is unaffected. The change feed keeps applying via
 	// the periodic-flush loop already running from startBackgroundRoutines;
 	// the checker is purely an observer of the resulting source/target
@@ -418,7 +430,7 @@ func (r *Runner) runContinuous(ctx context.Context) error {
 	var checksumErr error
 	go func() {
 		defer close(checksumDone)
-		checksumErr = r.runContinuousChecksum(checksumCtx)
+		checksumErr = r.runLocklessChecksum(checksumCtx)
 	}()
 
 	// Wait for either ctx cancellation (the normal shutdown path) or the
@@ -434,7 +446,7 @@ func (r *Runner) runContinuous(ctx context.Context) error {
 		// also need to cancel the parent ctx so the drain doesn't sit
 		// waiting on a healthy change feed.
 		if checksumErr != nil && ctx.Err() == nil {
-			r.logger.Error("continuous checksum failed; stopping sync", "error", checksumErr)
+			r.logger.Error("lockless checksum failed; stopping sync", "error", checksumErr)
 			// Trigger the drain + shutdown path with a context cancellation.
 			r.progMu.RLock()
 			cancelParent := r.cancelFunc
@@ -482,23 +494,23 @@ func (r *Runner) runContinuous(ctx context.Context) error {
 	// caller (and exit code) reflect the underlying problem rather than
 	// just "ctx cancelled."
 	if checksumErr != nil && !errors.Is(checksumErr, context.Canceled) {
-		return fmt.Errorf("continuous checksum failed: %w", checksumErr)
+		return fmt.Errorf("lockless checksum failed: %w", checksumErr)
 	}
 	return nil
 }
 
-// runContinuousChecksum builds a separate continuous-checksum chunker over
-// the source tables and drives a ContinuousChecker until ctx is cancelled
+// runLocklessChecksum builds a separate lockless-checksum chunker over
+// the source tables and drives a LocklessChecker until ctx is cancelled
 // or a permanent failure surfaces. The checker uses READ COMMITTED reads
 // (no table lock, no TrxPool), so it can run against a live system; see
-// pkg/checksum/continuous.go for the convergence model.
-func (r *Runner) runContinuousChecksum(ctx context.Context) error {
-	chunker, err := r.buildContinuousChunker()
+// pkg/checksum/lockless.go for the convergence model.
+func (r *Runner) runLocklessChecksum(ctx context.Context) error {
+	chunker, err := r.buildLocklessChunker()
 	if err != nil {
-		return fmt.Errorf("build continuous-checksum chunker: %w", err)
+		return fmt.Errorf("build lockless-checksum chunker: %w", err)
 	}
 	if err := chunker.Open(); err != nil {
-		return fmt.Errorf("open continuous-checksum chunker: %w", err)
+		return fmt.Errorf("open lockless-checksum chunker: %w", err)
 	}
 	defer utils.CloseAndLog(chunker)
 
@@ -519,27 +531,36 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 	// runs only after checker.Run has waited for all its workers
 	// (recopier included) to finish, so the chunklet always lands.
 	if err := r.applier.Start(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("restart applier for continuous checksum: %w", err)
+		return fmt.Errorf("restart applier for lockless checksum: %w", err)
 	}
 	defer func() {
 		if cerr := r.applier.Stop(); cerr != nil {
-			r.logger.Warn("continuous checksum: applier stop failed", "error", cerr)
+			r.logger.Warn("lockless checksum: applier stop failed", "error", cerr)
 		}
 	}()
+
+	// The copy controller has exited. Keep write scaling alive for repairs
+	// during continuous verification, and join it before stopping the applier.
+	stopScaling := copier.StartWriteAutoscaler(ctx, r.currentLoadSignal(), r.applier, r.autoscale, r.logger, r.metricsSink)
+	defer stopScaling()
 
 	// Construct the recopier — invoked by the checker when retry detects
 	// stable target divergence. Without one configured, the checker would
 	// instead return ErrPermanentDivergence and abort the sync.
 	recopier, err := checksum.NewMySQLRecopier(r.source.db, r.target.DB, r.applier, r.targetDBConfig, r.logger)
 	if err != nil {
-		return fmt.Errorf("construct continuous-checksum recopier: %w", err)
+		return fmt.Errorf("construct lockless-checksum recopier: %w", err)
 	}
 
-	checker, err := checksum.NewContinuousChecker(
+	checker, err := checksum.NewLocklessChecker(
 		r.source.db, r.target.DB, chunker, r.replClient,
-		checksum.ContinuousCheckerConfig{
+		checksum.LocklessCheckerConfig{
 			Concurrency:     r.sync.Threads,
-			MinPassInterval: checksum.ContinuousMinPassInterval,
+			SplitHotChunks:  true,
+			Throttler:       r.currentLoadSignal(),
+			MetricsSink:     r.metricsSink,
+			Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+			MinPassInterval: checksum.LocklessMinPassInterval,
 			Recopier:        recopier,
 			Logger:          r.logger,
 			// Sync verifies a target it keeps converging, so a confirmed
@@ -548,17 +569,17 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("construct continuous checker: %w", err)
+		return fmt.Errorf("construct lockless checker: %w", err)
 	}
 
 	// Publish the checker + chunker so accessors (FirstCleanPass,
 	// ChecksumStats) can observe state from other goroutines. Close
-	// continuousReadyCh exactly once, so callers can block on it.
+	// locklessReadyCh exactly once, so callers can block on it.
 	r.progMu.Lock()
-	r.continuousChecker = checker
-	r.continuousChunker = chunker
+	r.locklessChecker = checker
+	r.locklessChunker = chunker
 	r.progMu.Unlock()
-	r.continuousCheckerInitOnce.Do(func() { close(r.continuousReadyCh) })
+	r.locklessCheckerInitOnce.Do(func() { close(r.locklessReadyCh) })
 
 	// Forward the checker's first-clean-pass signal to the Runner-owned
 	// channel that the FirstCleanPass accessor returns. This decouples
@@ -579,19 +600,19 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 	return runErr
 }
 
-// buildContinuousChunker constructs a multi-chunker covering every source
+// buildLocklessChunker constructs a multi-chunker covering every source
 // table. Unlike the copy chunker, this one isn't wired into the change
 // feed (the checker doesn't need watermark filtering — every event has
 // already been applied by the live replication path before the checker
 // reads each chunk).
-func (r *Runner) buildContinuousChunker() (table.Chunker, error) {
+func (r *Runner) buildLocklessChunker() (table.Chunker, error) {
 	chunkers := make([]table.Chunker, 0, len(r.sourceTables))
 	for _, tbl := range r.sourceTables {
 		cc, err := table.NewChunker(tbl, table.ChunkerConfig{
 			Logger: r.logger,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("new continuous-checksum chunker for %s: %w", tbl.TableName, err)
+			return nil, fmt.Errorf("new lockless-checksum chunker for %s: %w", tbl.TableName, err)
 		}
 		chunkers = append(chunkers, cc)
 	}
@@ -599,7 +620,7 @@ func (r *Runner) buildContinuousChunker() (table.Chunker, error) {
 }
 
 // FirstCleanPass returns a channel that is closed the first time the
-// continuous checksum completes a clean pass — i.e. every chunk was
+// lockless checksum completes a clean pass — i.e. every chunk was
 // READ-verified equal (on its initial read or via retry) and no chunk
 // needed a recopy. A pass that repaired chunks via recopy does not
 // qualify; the repaired ranges are re-verified by the following pass
@@ -615,23 +636,23 @@ func (r *Runner) FirstCleanPass() <-chan struct{} {
 	return r.firstCleanPassCh
 }
 
-// ChecksumReady returns a channel that is closed once the continuous
+// ChecksumReady returns a channel that is closed once the lockless
 // checker has been constructed — that is, when the initial copy and the
-// post-copy flush have completed and runContinuousChecksum has started.
+// post-copy flush have completed and runLocklessChecksum has started.
 func (r *Runner) ChecksumReady() <-chan struct{} {
-	return r.continuousReadyCh
+	return r.locklessReadyCh
 }
 
-// ChecksumStats returns a point-in-time snapshot of continuous-checksum
+// ChecksumStats returns a point-in-time snapshot of lockless-checksum
 // counters. Returns the zero value when the checker has not yet been
 // constructed (initial copy still running).
-func (r *Runner) ChecksumStats() checksum.ContinuousCheckerStats {
+func (r *Runner) ChecksumStats() checksum.LocklessCheckerStats {
 	r.progMu.RLock()
 	defer r.progMu.RUnlock()
-	if r.continuousChecker == nil {
-		return checksum.ContinuousCheckerStats{}
+	if r.locklessChecker == nil {
+		return checksum.LocklessCheckerStats{}
 	}
-	return r.continuousChecker.Stats()
+	return r.locklessChecker.Stats()
 }
 
 // setup discovers the source tables, builds the applier and change
@@ -655,6 +676,10 @@ func (r *Runner) setup(ctx context.Context) error {
 		return nil
 	}
 
+	if err := r.setupAutoscaling(ctx); err != nil {
+		return err
+	}
+
 	r.logger.Info("Creating applier")
 	appl, err := r.createApplier()
 	if err != nil {
@@ -664,6 +689,11 @@ func (r *Runner) setup(ctx context.Context) error {
 	// goroutine to render the applier row.
 	r.progMu.Lock()
 	r.applier = appl
+	if r.autoscale.Enabled {
+		if a, ok := appl.(*applier.SingleTargetApplier); ok {
+			a.SetInitialWriteWorkers(r.autoscale.StartThreads)
+		}
+	}
 	r.progMu.Unlock()
 
 	// File:position coordinates belong to the MySQL server that wrote them.
@@ -715,6 +745,8 @@ func (r *Runner) setup(ctx context.Context) error {
 		replConfig.CancelFunc = r.fatalError
 		replConfig.DDLFilterSchema = r.source.config.DBName
 		replConfig.DBConfig = r.sourceDBConfig
+		replConfig.UnderLoad = r.TargetUnderLoad
+		replConfig.FlushConcurrency, replConfig.BatchSize = r.flushConcurrency, r.flushBatchSize
 		client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, replConfig, pos)
 		if err != nil {
 			return err
@@ -1016,7 +1048,7 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 // its source, returning an actionable error when the two have diverged.
 //
 // The copy column list is the *intersection* of the source and target columns
-// (table.ColumnMapping), and the continuous checksum compares that same
+// (table.ColumnMapping), and the lockless checksum compares that same
 // intersection. So a target left behind by an earlier attempt of this sync,
 // against a source that has since been ALTERed, drops the differing columns
 // from both the copy and the verification: the sync converges "clean" while the
@@ -1052,17 +1084,17 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 // disagreeing. TestSyncVerifyExistingTargetTableRequiresExactSchema pins it.
 //
 // Regular secondary indexes are excluded from the comparison on both sides.
-// With DeferSecondaryIndexes the target is deliberately created without them,
+// With DeferSecondaryIndexes the target omits deferrable regular indexes,
 // and an attempt that died mid-copy leaves it that way; restoreSecondaryIndexes
 // re-derives whatever is missing once the copy completes. UNIQUE, FULLTEXT and
 // SPATIAL indexes are kept on the initial CREATE, so those are still compared,
 // as are columns, the primary key, constraints and table options.
 func (r *Runner) verifyExistingTargetTable(tableName, sourceCreate, targetCreate string) error {
-	sourceCmp, err := statement.RemoveSecondaryIndexes(sourceCreate)
+	sourceCmp, err := statement.RemoveSecondaryIndexesForComparison(sourceCreate)
 	if err != nil {
 		return fmt.Errorf("failed to parse CREATE TABLE for source %s: %w", tableName, err)
 	}
-	targetCmp, err := statement.RemoveSecondaryIndexes(targetCreate)
+	targetCmp, err := statement.RemoveSecondaryIndexesForComparison(targetCreate)
 	if err != nil {
 		return fmt.Errorf("failed to parse CREATE TABLE for target %s: %w", tableName, err)
 	}
@@ -1138,7 +1170,7 @@ func (r *Runner) buildChunkers() ([]table.Chunker, error) {
 		// Sync always uses the buffered copier, which reads rows into client
 		// memory; size the copy chunker by an in-memory byte budget rather than
 		// copy time, whose signal collapses under write-side backpressure. The
-		// continuous checksum runs server-side and keeps the time signal.
+		// lockless checksum runs server-side and keeps the time signal.
 		cc, err := table.NewChunker(tbl, table.ChunkerConfig{
 			TargetChunkBytes: r.sync.TargetChunkSize,
 			Logger:           r.logger,
@@ -1167,7 +1199,8 @@ func (r *Runner) buildCopyPipeline() error {
 	cp, err := copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.sync.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.currentLoadSignal(),
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.sourceDBConfig,
 		Applier:     r.applier,
@@ -1230,7 +1263,6 @@ func (r *Runner) startResume(ctx context.Context, watermark, pos string) error {
 		if err := r.copyChunker.OpenAtWatermark(watermark); err != nil {
 			return fmt.Errorf("failed to open copier at checkpoint watermark: %w", err)
 		}
-		r.copyRowsAtResume = r.copyChunker.RowsCopied()
 	} else {
 		if err := r.copyChunker.Open(); err != nil {
 			return err
@@ -1541,6 +1573,12 @@ func (r *Runner) Close() error {
 	// The individual close calls are independent enough that running them
 	// all does no harm.
 	var errs []error
+	if r.loadSignal != nil {
+		errs = append(errs, r.loadSignal.Close())
+	}
+	if r.monitorDB != nil {
+		errs = append(errs, r.monitorDB.Close())
+	}
 	if r.copyChunker != nil {
 		if err := r.copyChunker.Close(); err != nil {
 			errs = append(errs, err)
@@ -1642,8 +1680,7 @@ func (r *Runner) Progress() status.Progress {
 		Tables:       tables,
 		ETA:          eta,
 		Copy:         copyProgress,
-		// Throttle is deliberately left zero: a sync copies through a Noop
-		// throttler, so there is nothing to report yet.
+		Throttle:     r.throttleStatus(state),
 	}
 }
 
@@ -1658,6 +1695,7 @@ func (r *Runner) Status() string {
 	chunker := r.copyChunker
 	repl := r.replClient
 	appl := r.applier
+	checker := r.locklessChecker
 	r.progMu.RUnlock()
 
 	elapsed := r.status.TotalElapsed().Round(time.Second)
@@ -1683,15 +1721,13 @@ func (r *Runner) Status() string {
 				chunkSize = cp.ChunkSize()
 				eta = cp.GetETAState()
 			}
-			// No throttled= here, unlike migrate and move: a sync copies
-			// through a Noop throttler, so the field would be a constant
-			// false.
-			b.Row("copier", "%6.2f%%  %d/%d  chunk-size=%d  eta=%s",
+			b.Row("copier", "%6.2f%%  %d/%d  chunk-size=%d  eta=%s  throttled=%t",
 				progress.Fraction()*100,
 				progress.RowsCopied,
 				progress.RowsTotal,
 				chunkSize,
 				eta.String(),
+				r.TargetUnderLoad(),
 			)
 		}
 		b.Row("applier", "%s", applier.StatusRow(appl))
@@ -1709,6 +1745,9 @@ func (r *Runner) Status() string {
 		// the older point a restart would actually resume from. The gap
 		// between them is how much re-reading a crash would cost.
 		b.Row("binlog", "position=%s  deltas=%d  %s", pos, pending, change.StatusRow(repl))
+		if checker != nil {
+			appendVerificationStatus(b, checker.Stats())
+		}
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
 		return b.String()
 	case status.RestoreSecondaryIndexes:
@@ -1758,4 +1797,29 @@ func (r *Runner) Cancel() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// appendVerificationStatus separates traversal from unresolved verification.
+// Split parents are retired work, so passed/emitted is not a completion ratio.
+func appendVerificationStatus(b *status.Block, stats checksum.LocklessCheckerStats) {
+	scan := fmt.Sprintf("scan≈%.1f%%", float64(stats.ProgressBasisPoints)/100)
+	if stats.ScanComplete {
+		scan = "scan complete"
+	}
+	if !stats.NextPassAt.IsZero() {
+		b.Row("verify", "pass=%d complete; next pass at %s", stats.CurrentPass, stats.NextPassAt.UTC().Format(time.RFC3339))
+	} else {
+		b.Row("verify", "pass=%d  %s", stats.CurrentPass, scan)
+	}
+	if !stats.FirstCleanPassAt.IsZero() {
+		b.Row("", "first clean pass: %s", stats.FirstCleanPassAt.UTC().Format(time.RFC3339))
+	}
+	b.Row("", "remaining: %d retrying (%d hot), %d in flight, %d deferred",
+		stats.RetryQueueDepth, stats.HotChunkCount, stats.InFlight, stats.HotChunksDeferredThisPass)
+	b.Row("", "pass activity: %d chunks mismatched: %d split, %d recopied",
+		stats.MismatchesThisPass, stats.HotChunksSplitThisPass, stats.RecopiesThisPass)
+	if stats.RecopiesThisPass > 0 {
+		b.Row("", "repaired ranges need verification in the next pass")
+	}
+	b.Row("", "permanent failures: %d  walker stalls: %d", stats.PermanentFailures, stats.WalkerStalls)
 }

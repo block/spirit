@@ -142,7 +142,7 @@ func resolveReadCeiling(configured, concurrency int) int {
 }
 
 // writeScaler is the optional capability the autoscaler drives. The
-// SingleTargetApplier implements it; the ShardedApplier does not (yet), so the
+// single-target and sharded appliers implement it; the
 // copier type-asserts it and skips autoscaling when it's absent.
 type writeScaler interface {
 	SetWriteWorkers(n int)
@@ -422,4 +422,28 @@ func (a *autoScaler) emit(ctx context.Context, util float64) {
 			metrics.MetricValue{Name: metrics.ReadThreadsMetricName, Type: metrics.GAUGE, Value: float64(a.readCurrent)})
 	}
 	autoscale.Emit(ctx, a.metricsSink, a.logger, values...)
+}
+
+// StartWriteAutoscaler runs the shared write-only controller after a copy has
+// finished. The applier must already be started. The returned stop function
+// cancels and joins the controller before the caller stops/restarts the applier.
+// Unsupported appliers or load signals leave configured concurrency unchanged.
+func StartWriteAutoscaler(ctx context.Context, signal throttler.Throttler, target applier.Applier, config AutoscaleConfig, logger *slog.Logger, sink metrics.Sink) func() {
+	scaler, scalable := target.(writeScaler)
+	gradual, measured := signal.(throttler.GradualThrottler)
+	if !config.Enabled || !scalable || !measured {
+		return func() {}
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	config.StartThreads = max(1, config.StartThreads)
+	scaler.SetWriteWorkers(config.StartThreads)
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		newAutoScaler(gradual, scaler, config.StartThreads, config.MaxThreads, logger, sink).run(ctx)
+	}()
+	return func() { cancel(); <-done }
 }

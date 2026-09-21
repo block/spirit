@@ -479,10 +479,8 @@ func TestMoveResumeDeletesRecopyRange(t *testing.T) {
 	var watermark string
 	require.NoError(t, targetDB.QueryRowContext(t.Context(),
 		"SELECT copier_watermark FROM "+checkpointTableName+" ORDER BY id DESC LIMIT 1").Scan(&watermark))
-	var envelope struct{ ChunkJSON string }
-	require.NoError(t, json.Unmarshal([]byte(watermark), &envelope))
 	var chunk table.JSONChunk
-	require.NoError(t, json.Unmarshal([]byte(envelope.ChunkJSON), &chunk))
+	require.NoError(t, json.Unmarshal([]byte(watermark), &chunk))
 	require.Len(t, chunk.LowerBound.Value, 1)
 	lower, err := strconv.Atoi(chunk.LowerBound.Value[0])
 	require.NoError(t, err)

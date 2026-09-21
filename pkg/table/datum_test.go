@@ -182,6 +182,18 @@ func TestDatumInt64ToUnsigned(t *testing.T) {
 	require.Equal(t, uint64(math.MaxInt64), d3.Val)
 }
 
+func TestDatumConversionErrorReportsValue(t *testing.T) {
+	// A value that genuinely cannot be converted must name itself in the
+	// error, so the offending input is identifiable from the message alone.
+	_, err := NewDatum("not-a-number", signedType)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "value=not-a-number")
+
+	_, err = NewDatum("not-a-number", unsignedType)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "value=not-a-number")
+}
+
 func TestKeyBelowLowWatermarkWithNegativeInt32(t *testing.T) {
 	ti := &TableInfo{
 		SchemaName:        "test",

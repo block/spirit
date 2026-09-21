@@ -53,6 +53,7 @@ type SingleChecker struct {
 	logger           *slog.Logger
 	fixDifferences   bool
 	differencesFound atomic.Uint64
+	resume           snapshotResume
 	// repairApplier is the write path a mismatched chunk is rewritten through
 	// (see replaceChunk). It is started and stopped around each repair rather
 	// than for the checker's lifetime, because repairs are rare and serialized:
@@ -114,9 +115,8 @@ func (c *SingleChecker) currentLimiter() *autoscale.Limiter {
 }
 
 var (
-	_ Checker       = (*SingleChecker)(nil)
-	_ ThrottleAware = (*SingleChecker)(nil)
-	_ Paced         = (*SingleChecker)(nil)
+	_ Checker = (*SingleChecker)(nil)
+	_ Paced   = (*SingleChecker)(nil)
 )
 
 // Threads reports the live worker count: the limiter's current limit while a
@@ -205,6 +205,7 @@ func (c *SingleChecker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPo
 	if mismatch := compareChunk(sourceChecksum, targetChecksum, sourceCount, targetCount); mismatch.mismatched() {
 		// The source and target do not match, so we first need
 		// to inspect closely and report on the differences.
+		c.resume.observed.Add(1)
 		c.differencesFound.Add(1)
 		c.logger.Warn("chunk verification failed", "chunk", chunk.String(), "reason", mismatch.reason(sourceCount, targetCount), "sourceChecksum", sourceChecksum, "targetChecksum", targetChecksum, "sourceCount", sourceCount, "targetCount", targetCount)
 		if err := c.inspectDifferences(ctx, trx, chunk); err != nil {
@@ -441,7 +442,7 @@ func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) er
 	// serialization on recopyLock above still keeps two repairs from overlapping.
 	//
 	// If the parent ctx is cancelled after the DELETE, the target chunk would be
-	// left with rows deleted but not yet rewritten. The continuous-checksum
+	// left with rows deleted but not yet rewritten. The lockless-checksum
 	// loop's cancellation on sentinel drop hits this race, so the whole repair
 	// runs under a context that ignores the parent's cancellation. The bounded
 	// timeout still protects against a hung repair — and because the applier's
@@ -638,7 +639,7 @@ func (c *SingleChecker) ExecTime() time.Duration {
 
 // DifferencesFound returns the number of chunks where a source/target
 // mismatch was detected in the most recent (or in-flight) pass. Used by
-// the continuous-checksum loop to decide whether a cancellation swallow
+// the lockless-checksum loop to decide whether a cancellation swallow
 // is safe.
 func (c *SingleChecker) DifferencesFound() uint64 {
 	return c.differencesFound.Load()
@@ -707,7 +708,9 @@ func (c *SingleChecker) Run(ctx context.Context) error {
 	c.Unlock()
 
 	defer func() {
+		c.Lock()
 		c.execTime = time.Since(startTime)
+		c.Unlock()
 	}()
 
 	// A previous Run may have left the checker poisoned (isInvalid=true from
@@ -728,27 +731,30 @@ func (c *SingleChecker) Run(ctx context.Context) error {
 			// error after repairs) still restarts from the beginning, so the
 			// "clean pass over the whole table" guarantee after repairs is
 			// unchanged.
-			resumed := false
-			if lastErr != nil && c.differencesFound.Load() == 0 {
-				if watermark, wmErr := c.chunker.GetLowWatermark(); wmErr == nil {
-					if openErr := c.chunker.OpenAtWatermark(watermark); openErr == nil {
-						resumed = true
-						c.logger.Error("checksum failed, retrying from low watermark",
-							"attempt", attempt, "maxRetries", c.maxRetries, "watermark", watermark)
-					} else {
-						c.logger.Warn("failed to resume checksum at watermark, restarting from beginning", "error", openErr)
+			if err := c.resume.restart(&c.differencesFound, func() error {
+				resumed := false
+				if lastErr != nil && c.differencesFound.Load() == 0 {
+					if watermark, wmErr := c.chunker.GetLowWatermark(); wmErr == nil {
+						if openErr := c.chunker.OpenAtWatermark(watermark); openErr == nil {
+							resumed = true
+							c.logger.Error("checksum failed, retrying from low watermark",
+								"attempt", attempt, "maxRetries", c.maxRetries, "watermark", watermark)
+						} else {
+							c.logger.Warn("failed to resume checksum at watermark, restarting from beginning", "error", openErr)
+						}
 					}
 				}
-			}
-			if !resumed {
-				c.logger.Error("checksum failed, retrying", "attempt", attempt, "maxRetries", c.maxRetries)
-				// Reset the chunker to start from the beginning
-				if err := c.chunker.Reset(); err != nil {
-					return fmt.Errorf("failed to reset chunker for retry: %w", err)
+				if !resumed {
+					c.logger.Error("checksum failed, retrying", "attempt", attempt, "maxRetries", c.maxRetries)
+					// Reset the chunker to start from the beginning
+					if err := c.chunker.Reset(); err != nil {
+						return fmt.Errorf("failed to reset chunker for retry: %w", err)
+					}
 				}
+				return nil
+			}); err != nil {
+				return err
 			}
-			// Reset differences found counter
-			c.differencesFound.Store(0)
 			// Reset the invalid flag left set by the failed attempt: it makes
 			// isHealthy() false, which would skip every chunk and turn this
 			// retry into a vacuous pass.
@@ -984,4 +990,20 @@ func (c *SingleChecker) runChecksum(ctx context.Context) error {
 		return errors.New("checksum stopped before the table was fully verified")
 	}
 	return nil
+}
+
+// ResumeWatermark returns evidence from one attempt, synchronized with retries.
+func (c *SingleChecker) ResumeWatermark() (string, error) {
+	return c.resume.capture(c.chunker, &c.differencesFound)
+}
+
+var _ Checker = (*SingleChecker)(nil)
+
+func (c *SingleChecker) ContinuousActive() bool { return c.resume.active.Load() }
+
+func (c *SingleChecker) RunContinuous(ctx context.Context) error {
+	c.resume.continuous.Store(true)
+	return runContinuousSnapshot(ctx, c, []change.Source{c.feed}, &c.resume, func() error {
+		return c.resume.restart(&c.differencesFound, c.chunker.Reset)
+	})
 }

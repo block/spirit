@@ -42,6 +42,11 @@ type chunkerComposite struct {
 	logger *slog.Logger
 }
 
+type compositeWatermark struct {
+	ChunkJSON  string
+	RowsCopied uint64
+}
+
 var _ MappedChunker = &chunkerComposite{}
 
 func (t *chunkerComposite) additionalConditionsSQL(whereSent bool) string {
@@ -238,7 +243,7 @@ func (t *chunkerComposite) OpenAtWatermark(checkpnt string) error {
 	t.Lock()
 	defer t.Unlock()
 
-	var watermark watermarkEnvelope
+	var watermark compositeWatermark
 	if err := json.Unmarshal([]byte(checkpnt), &watermark); err != nil {
 		return fmt.Errorf("could not parse composite watermark: %w", err)
 	}
@@ -378,7 +383,7 @@ func (t *chunkerComposite) GetLowWatermark() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not serialize chunk watermark: %w", err)
 	}
-	watermark := watermarkEnvelope{
+	watermark := compositeWatermark{
 		ChunkJSON:  chunkJSON,
 		RowsCopied: atomic.LoadUint64(&t.rowsCopied),
 	}

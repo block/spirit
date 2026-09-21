@@ -61,6 +61,7 @@ type DistributedChecker struct {
 	logger           *slog.Logger
 	fixDifferences   bool
 	differencesFound atomic.Uint64
+	resume           snapshotResume
 	recopyLock       sync.Mutex
 	maxRetries       int
 	yieldTimeout     time.Duration
@@ -71,9 +72,8 @@ type DistributedChecker struct {
 }
 
 var (
-	_ Checker       = (*DistributedChecker)(nil)
-	_ ThrottleAware = (*DistributedChecker)(nil)
-	_ Paced         = (*DistributedChecker)(nil)
+	_ Checker = (*DistributedChecker)(nil)
+	_ Paced   = (*DistributedChecker)(nil)
 )
 
 // Threads reports the live worker count. See the SingleChecker equivalent.
@@ -281,6 +281,7 @@ func (c *DistributedChecker) ChecksumChunk(ctx context.Context, chunk *table.Chu
 	if mismatch := compareChunk(sourceChecksum, targetChecksum, sourceCount, targetCount); mismatch.mismatched() {
 		// The source and target do not match, so we first need
 		// to inspect closely and report on the differences.
+		c.resume.observed.Add(1)
 		c.differencesFound.Add(1)
 		c.logger.Warn("chunk verification failed", "chunk", chunk.String(),
 			"reason", mismatch.reason(sourceCount, targetCount),
@@ -328,7 +329,7 @@ func (c *DistributedChecker) replaceChunk(ctx context.Context, chunk *table.Chun
 	// The fix is split into DELETE-from-targets and Apply-from-sources. If the
 	// parent ctx is cancelled between or during these steps, the target side
 	// would be left with rows DELETEd but not yet reapplied. The
-	// continuous-checksum loop's cancellation on sentinel drop hits this race,
+	// lockless-checksum loop's cancellation on sentinel drop hits this race,
 	// so we run the fix under a context that ignores the parent's
 	// cancellation. The bounded timeout still protects against a hung apply.
 	fixCtx, fixCancel := context.WithTimeout(context.WithoutCancel(ctx), fixChunkTimeout)
@@ -404,9 +405,9 @@ func (c *DistributedChecker) replaceChunk(ctx context.Context, chunk *table.Chun
 	// (see Run() below), so a parent cancellation between the DELETEs above
 	// and the worker writes does not by itself cancel the inserts. The
 	// remaining limitation is that workers stop when the deferred Stop() at
-	// the end of Run runs — if Run returns due to a continuous-checksum
+	// the end of Run runs — if Run returns due to a lockless-checksum
 	// cancel while writes are queued, those inserts may be dropped. The
-	// continuous-checksum loop's DifferencesFound() gate keeps cutover
+	// lockless-checksum loop's DifferencesFound() gate keeps cutover
 	// aborting in that case so the broken state stays internal and is
 	// recopied on resume; a tighter fix would scope a worker context to
 	// the repair window only.
@@ -462,7 +463,7 @@ func (c *DistributedChecker) ExecTime() time.Duration {
 
 // DifferencesFound returns the number of chunks where a source/target
 // mismatch was detected in the most recent (or in-flight) pass. Used by
-// the continuous-checksum loop to decide whether a cancellation swallow
+// the lockless-checksum loop to decide whether a cancellation swallow
 // is safe.
 func (c *DistributedChecker) DifferencesFound() uint64 {
 	return c.differencesFound.Load()
@@ -626,7 +627,7 @@ func (c *DistributedChecker) Run(ctx context.Context) error {
 	// This is only really used if there are checksum failures
 	// and chunks need to be recopied. We start the applier under a context
 	// that is decoupled from `ctx` so that a parent-ctx cancellation in the
-	// middle of a recopy (e.g. a sentinel drop during the continuous-checksum
+	// middle of a recopy (e.g. a sentinel drop during the lockless-checksum
 	// loop) does not abort the applier's worker writes between the DELETE
 	// step in replaceChunk and the actual reapply: replaceChunk builds its
 	// own fixCtx via context.WithoutCancel, but the workers would otherwise
@@ -637,7 +638,9 @@ func (c *DistributedChecker) Run(ctx context.Context) error {
 	}
 
 	defer func() {
+		c.Lock()
 		c.execTime = time.Since(startTime)
+		c.Unlock()
 		_ = c.applier.Stop()
 	}()
 
@@ -649,12 +652,9 @@ func (c *DistributedChecker) Run(ctx context.Context) error {
 	for attempt := 1; attempt <= c.maxRetries; attempt++ {
 		if attempt > 1 {
 			c.logger.Error("checksum failed, retrying", "attempt", attempt, "maxRetries", c.maxRetries)
-			// Reset the chunker to start from the beginning
-			if err := c.chunker.Reset(); err != nil {
+			if err := c.resume.restart(&c.differencesFound, c.chunker.Reset); err != nil {
 				return fmt.Errorf("failed to reset chunker for retry: %w", err)
 			}
-			// Reset differences found counter
-			c.differencesFound.Store(0)
 			// Reset the invalid flag left set by a failed attempt: it makes
 			// isHealthy() false, which would skip every chunk and turn this
 			// retry into a vacuous pass.
@@ -858,4 +858,20 @@ func (c *DistributedChecker) runChecksum(ctx context.Context) error {
 		return errors.New("checksum stopped before the table was fully verified")
 	}
 	return nil
+}
+
+// ResumeWatermark returns evidence from one attempt, synchronized with retries.
+func (c *DistributedChecker) ResumeWatermark() (string, error) {
+	return c.resume.capture(c.chunker, &c.differencesFound)
+}
+
+var _ Checker = (*DistributedChecker)(nil)
+
+func (c *DistributedChecker) ContinuousActive() bool { return c.resume.active.Load() }
+
+func (c *DistributedChecker) RunContinuous(ctx context.Context) error {
+	c.resume.continuous.Store(true)
+	return runContinuousSnapshot(ctx, c, c.feeds, &c.resume, func() error {
+		return c.resume.restart(&c.differencesFound, c.chunker.Reset)
+	})
 }

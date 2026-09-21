@@ -56,7 +56,7 @@ var (
 	// continuous-checksum iterations during the sentinel wait. Without it,
 	// small tables would re-acquire the table lock back-to-back since each
 	// pass finishes in seconds. (Move still drives its own checksum loop; this
-	// stays local until move adopts checksum.ContinuousChecker.)
+	// stays local until move adopts checksum.LocklessChecker.)
 	continuousChecksumMinInterval = 1 * time.Hour
 )
 
@@ -99,7 +99,10 @@ func targetKey(t applier.Target) string {
 }
 
 type Runner struct {
-	move            *Move
+	move                     *Move
+	reverseWriteThreads      int // Configured count, unaffected by forward autoscaling.
+	continuousChecksumActive atomic.Bool
+
 	sources         []sourceInfo     // one per source database
 	targets         []applier.Target // Combined DB, Config, and KeyRange
 	status          status.Tracker   // owns the current state and per-state timing
@@ -108,10 +111,18 @@ type Runner struct {
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
 	sourceTableMap map[string]bool    // used when only some tables are to be moved.
 
+	// throttler is read from Progress() and the repl feed's UnderLoad closure,
+	// so every access goes through setThrottler/currentThrottler. Reads on the
+	// single-threaded setup path are safe without it, but going through the
+	// accessor everywhere is what makes the guard self-describing.
+	throttlerMu sync.RWMutex
+	throttler   throttler.Throttler
+	monitorDBs  []*sql.DB
+	autoscale   copier.AutoscaleConfig
+
 	applier           applier.Applier
 	chunkerMu         sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
 	copyChunker       table.Chunker
-	copyRowsAtResume  uint64 // settled rows restored from the checkpoint, excluded from this invocation's copy aggregate
 	checksumChunker   table.Chunker
 	copier            copier.Copier
 	checker           checksum.Checker
@@ -229,25 +240,25 @@ func NewRunner(m *Move) (*Runner, error) {
 		m.WriteThreads = defaultWriteThreads
 	}
 	r := &Runner{
-		move:        m,
-		logger:      slog.Default(),
-		metricsSink: &metrics.NoopSink{},
+		move:                m,
+		reverseWriteThreads: m.WriteThreads,
+		logger:              slog.Default(),
+		metricsSink:         &metrics.NoopSink{},
 	}
 	return r, nil
 }
 
 // recordCopyCompleted reports the copy aggregate settled during this
-// Runner.Run invocation. The chunker restores its settled count from the
-// checkpoint so that progress continues across a resume; that restored count
-// is subtracted here, so a resumed invocation reports only the rows settled
-// after it resumed, alongside the chunks it copied.
+// Runner.Run invocation. The optimistic chunker does not persist its
+// actual-row counter in a checkpoint, so a resumed invocation reports only
+// work settled after it resumed.
 func (r *Runner) recordCopyCompleted() {
 	chunker := r.copier.GetChunker()
 	if chunker == nil {
 		return
 	}
 	_, chunks, _ := chunker.Progress()
-	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
+	r.status.RecordCopyCompleted(chunker.RowsCopied(), chunks)
 }
 
 func (r *Runner) runCopy(ctx context.Context) error {
@@ -274,6 +285,12 @@ func (r *Runner) Close() error {
 	// rest, leaking the remaining repl clients' binlog reader goroutines
 	// and the target DB handles.
 	var errs []error
+	if t := r.currentThrottler(); t != nil {
+		errs = append(errs, t.Close())
+	}
+	for _, db := range r.monitorDBs {
+		errs = append(errs, db.Close())
+	}
 	if r.copyChunker != nil {
 		if err := r.copyChunker.Close(); err != nil {
 			errs = append(errs, err)
@@ -544,7 +561,8 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.currentThrottler(),
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
@@ -592,7 +610,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
-	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	// Open each source's change feed at its checkpointed position.
 	// OpenFromPosition primes the position and starts streaming in one call.
@@ -655,6 +672,9 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 // lock before it can destroy the first run's target data.
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
+	if err := r.setupAutoscaling(ctx); err != nil {
+		return err
+	}
 
 	if err := r.fitReadThreadsToPools(); err != nil {
 		return err
@@ -947,6 +967,7 @@ func (r *Runner) buildReplClients(ctx context.Context, resumePositions map[strin
 		replConfig.DDLFilterSchema = src.config.DBName
 		replConfig.DDLFilterTables = r.move.SourceTables
 		replConfig.DBConfig = r.dbConfig
+		replConfig.UnderLoad = func() bool { return throttler.GradualOnly(r.currentThrottler()).IsThrottled() }
 		client, err := change.NewAutoClient(ctx, src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig, resumePositions[src.sourceKey()])
 		if err != nil {
 			return fmt.Errorf("source %d: %w", i, err)
@@ -1038,7 +1059,8 @@ func (r *Runner) newCopy(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
 		Concurrency: r.move.Threads,
 		Logger:      r.logger,
-		Throttler:   &throttler.Noop{},
+		Throttler:   r.currentThrottler(),
+		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
 		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
@@ -1584,18 +1606,12 @@ func (r *Runner) Status() string {
 		return b.String()
 	case status.Checksum:
 		// This could take a while if it's a large table.
-		progress := r.checker.GetProgress()
 		b := status.NewBlock("migration status: state=%s total-time=%s checksum-time=%s",
 			state.String(),
 			r.status.TotalElapsed().Round(time.Second),
 			r.status.Elapsed().Round(time.Second),
 		)
-		b.Row("checksum", "%6.2f%%  %d/%d%s",
-			progress.Fraction()*100,
-			progress.RowsChecked,
-			progress.RowsTotal,
-			checksum.StatusSuffix(r.checker),
-		)
+		b.Row("checksum", "%s", checksum.StatusRow(r.checker))
 		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
 		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
 		return b.String()
@@ -1661,13 +1677,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag, exclude .
 func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 	r.logger.Info("Checking for deferred secondary indexes to restore")
 
-	// Group targets by hostname to enable parallel processing across different hosts
-	// while avoiding overloading any single MySQL instance
-	hostGroups := make(map[string][]int) // hostname -> []targetIdx
-	for idx, target := range r.targets {
-		host := target.Config.Addr // e.g., "host:3306"
-		hostGroups[host] = append(hostGroups[host], idx)
-	}
+	hostGroups := r.targetHosts()
 
 	r.logger.Info("Parallelizing index restoration across hosts",
 		"hostCount", len(hostGroups),
@@ -1675,10 +1685,9 @@ func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 
 	// Process each host group in parallel using errgroup
 	g, gctx := errgroup.WithContext(ctx)
-	for host, targetIndices := range hostGroups {
-		// Shadow loop variables to avoid closure capture issues.
+	for _, group := range hostGroups {
 		g.Go(func() error {
-			return r.restoreIndexesForTargets(gctx, host, targetIndices)
+			return r.restoreIndexesForTargets(gctx, group.Host.String(), group.Indices)
 		})
 	}
 
@@ -1855,6 +1864,9 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.currentThrottler(),
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 	})
 	if err != nil {
 		return err
@@ -2004,7 +2016,7 @@ func (r *Runner) Progress() status.Progress {
 
 	var summary string
 	var eta status.ETA
-	var checksum status.ChecksumProgress
+	var checksumProgress status.ChecksumProgress
 	switch state { //nolint: exhaustive
 	case status.CopyRows:
 		// One copier read, so the ETA in Summary and the ETA field describe
@@ -2016,8 +2028,8 @@ func (r *Runner) Progress() status.Progress {
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.getDeltaLenAll())
 	case status.Checksum:
-		checksum = r.checker.GetProgress()
-		summary = "Checksum Progress=" + checksum.String()
+		checksumProgress = r.checker.GetProgress()
+		summary = checksum.StatusSummary(r.checker)
 	}
 	return status.Progress{
 		CurrentState: state,
@@ -2025,11 +2037,29 @@ func (r *Runner) Progress() status.Progress {
 		Resume:       r.usedResumeFromCheckpoint.Load(),
 		ETA:          eta,
 		Copy:         copyProgress,
-		Checksum:     checksum,
+		Checksum:     checksumProgress,
 		Tables:       tables,
-		// Throttle is deliberately zero: move currently uses a Noop throttler.
-		// Populate it when move gains throttling support.
+		Throttle:     r.throttleStatus(state),
 	}
+}
+
+// Sentinel waiting only reports pacing while a continuous checksum is running.
+func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
+	t := r.currentThrottler()
+	switch state { //nolint:exhaustive
+	case status.CopyRows:
+	case status.Checksum:
+		t = throttler.GradualOnly(t)
+	case status.WaitingOnSentinelTable:
+		if !r.continuousChecksumActive.Load() {
+			return status.ThrottleStatus{}
+		}
+		t = throttler.GradualOnly(t)
+	default:
+		return status.ThrottleStatus{}
+	}
+	paused, reason, util := throttler.Describe(t)
+	return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
 }
 
 // invalidateChecksumWatermark blanks the checksum_watermark on the persisted
@@ -2062,8 +2092,8 @@ func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 // the move is blocked in WaitingOnSentinelTable.
 //
 // The checker used here is separate from r.checker and uses a fresh chunker
-// so checkpoint state is unaffected. Single-threaded by design — checksum
-// throttling is tracked separately in github.com/block/spirit/issues/831.
+// so checkpoint state is unaffected. Single-threaded
+// in fixed mode; autoscaling uses the same host load signal as the initial pass.
 func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 	chunker, err := r.buildContinuousChunker()
 	if err != nil {
@@ -2081,14 +2111,16 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		feeds[i] = r.sources[i].replClient
 	}
 	checker, err := checksum.NewChecker(sourceDBs, chunker, feeds, &checksum.CheckerConfig{
-		// TODO(#831): once the throttler can size threads dynamically,
-		// replace the hard-coded 1 with the move's thread count.
+		// Keep the fixed-mode single worker; autoscaling can grow it on load feedback.
 		Concurrency:     1,
 		TargetChunkTime: table.ChunkerDefaultTarget,
 		DBConfig:        r.dbConfig,
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.currentThrottler(),
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 		// One pass per outer-loop iteration; the continuous-checksum
 		// loop itself supplies the retry, so we don't nest a second
 		// retry loop inside each iteration.
@@ -2151,7 +2183,9 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		iteration++
 		iterationStart := time.Now()
 		r.logger.Info("continuous checksum iteration starting", "iteration", iteration)
+		r.continuousChecksumActive.Store(true)
 		runErr := checker.Run(ctx)
+		r.continuousChecksumActive.Store(false)
 		if runErr != nil {
 			// Only suppress a `context.Canceled` that came from OUR ctx
 			// being cancelled (the sentinel was dropped while a pass was
@@ -2223,33 +2257,16 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	if err != nil {
 		return status.ErrWatermarkNotReady // it might not be ready, we can try again.
 	}
-	// Safety invariant: only persist the checksum_watermark if the current
-	// checksum pass has had zero differences. The chunker advances its
-	// low-watermark past every chunk it sees Feedback() for, including
-	// chunks that needed a recopy — but a recopy isn't a verification.
-	// Reading DifferencesFound() *after* the watermark catches any chunk
-	// in the watermark that was repaired (the per-chunk path increments
-	// differencesFound strictly before chunker.Feedback). When set,
-	// suppress the watermark so a restart re-validates from the start of
-	// the checksum phase. See pkg/migration/runner.go DumpCheckpoint for
-	// the full rationale.
-	//
-	// The same invariant applies to the sentinel-wait continuous checker
-	// (a separate object from r.checker — see continuousChecker): once it
-	// has repaired any chunk, the watermark here is the stale
-	// end-of-initial-checksum one, and resuming from it would verify only
-	// the trailing chunks — silently neutralizing the deliberate abort the
-	// continuous checksum triggers on divergence. So the watermark is
-	// persisted only while BOTH checkers are clean (or the continuous one
-	// doesn't exist yet).
+	// The checker excludes repaired or otherwise unverified ranges from its
+	// resume evidence. Sentinel-check differences also invalidate the initial
+	// gate's watermark, so a restart rechecks the whole range.
 	var checksumWatermark string
 	if r.status.Get() >= status.Checksum && r.checker != nil {
-		wm, wmErr := r.checksumChunker.GetLowWatermark()
+		wm, wmErr := r.checker.ResumeWatermark()
 		if wmErr != nil {
 			return status.ErrWatermarkNotReady
 		}
-		if r.checker.DifferencesFound() == 0 &&
-			(r.continuousChecker == nil || r.continuousChecker.DifferencesFound() == 0) {
+		if r.continuousChecker == nil || r.continuousChecker.DifferencesFound() == 0 {
 			checksumWatermark = wm
 		}
 	}
@@ -2384,8 +2401,8 @@ func (r *Runner) flushAllReplClients(ctx context.Context) error {
 func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) error {
 	// The checkpoint watermark format depends on how many chunkers the copy
 	// chunker wraps: a single (source, table) pair stores that chunker's own
-	// watermark (the chunk envelope, or a bare chunk from an older
-	// checkpoint), while multiple pairs store a JSON map keyed by
+	// watermark (raw chunk JSON for auto-inc PKs, or the composite chunker's
+	// envelope), while multiple pairs store a JSON map keyed by
 	// table.QualifiedName(). WatermarkPerTable normalizes every format into
 	// a per-table map of raw chunk JSON.
 	allTables := make([]*table.TableInfo, 0, len(r.sources)*len(r.sourceTables))

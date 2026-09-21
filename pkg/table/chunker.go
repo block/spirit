@@ -71,10 +71,10 @@ type Chunker interface {
 	// nothing like a row count. Use Progress to render a percentage, and this
 	// to report how much data was copied.
 	//
-	// The watermark carries the count beside the position, so a resumed run
-	// continues from the rows the previous run settled rather than from zero.
-	// A bare chunk watermark from before the count was recorded resumes at
-	// zero.
+	// A resumed run carries the count forward from the watermark, so it
+	// reports the work of every run that contributed to the copy rather than
+	// only what this chunker has seen. A watermark written before a chunker
+	// persisted its count resumes at zero.
 	RowsCopied() uint64
 	OpenAtWatermark(watermark string) error
 	GetLowWatermark() (watermark string, err error)

@@ -1445,3 +1445,19 @@ func TestSingleTargetApplierSetWriteWorkersBeforeStart(t *testing.T) {
 	require.NotPanics(t, func() { a.SetWriteWorkers(4) })
 	require.Equal(t, 0, a.ActiveWriteWorkers(), "no workers should be spawned before Start")
 }
+
+func TestInitialWriteWorkersOnStartAndRestart(t *testing.T) {
+	cfg := NewApplierDefaultConfig()
+	cfg.Threads = 16
+	a, err := NewSingleTargetApplier(Target{DB: &sql.DB{}}, cfg)
+	require.NoError(t, err)
+	for _, n := range []int{2, 3} {
+		a.SetInitialWriteWorkers(n)
+		require.Zero(t, a.ActiveWriteWorkers())
+		require.NoError(t, a.Start(t.Context()))
+		require.Equal(t, n, a.ActiveWriteWorkers())
+		a.SetInitialWriteWorkers(12) // Cannot change a running pool.
+		require.Equal(t, n, a.ActiveWriteWorkers())
+		require.NoError(t, a.Stop())
+	}
+}

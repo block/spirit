@@ -349,6 +349,7 @@ Two layers of canonicalization apply:
    | `functionAliasNormalizer` | rewrites a function name to the one MySQL stores, in expression `DEFAULT`s, generated columns, `CHECK`s, functional indexes and partition expressions: `STRING_TO_VECTOR` → `to_vector`, `LCASE` → `lower`, `SUBSTRING`/`MID` → `substr`, `DAY` → `dayofmonth`, and the timestamp family inside an expression default → `now()` |
    | `binaryAttributeNormalizer` | resolves the legacy `BINARY` column attribute to the column charset's `_bin` collation |
    | `integerDisplayWidthNormalizer` | strips deprecated integer display widths (`int(11)` → `int`), keeping `tinyint(1)` and `ZEROFILL` |
+   | `booleanKeywordDefaultNormalizer` | folds a bare `TRUE`/`FALSE` keyword `DEFAULT` on an integer column to the `1`/`0` MySQL stores (`BOOLEAN NOT NULL DEFAULT FALSE` → `tinyint(1) NOT NULL DEFAULT '0'`). Only integer columns fold: `decimal` pads the value to its scale and `YEAR` reads the keyword as a year, and on a string column the bare and quoted spellings are different values |
    | `vectorDimensionNormalizer` | fills in the default dimension of a `VECTOR` column declared without one (`vector` → `vector(2048)`, MySQL 9.7+) |
    | `charsetlessTypeNormalizer` | drops charset/collation from the types that cannot carry one (`VECTOR`, spatial) — both the parser's synthetic `binary` charset and one an author wrote by hand, which MySQL accepts and silently discards |
    | `partitionCommentNormalizer` | pushes a partition-level `COMMENT` down onto explicitly named subpartitions that have none, and clears it from the partition — what MySQL stores for `PARTITION p0 ... COMMENT 'c' (SUBPARTITION s0, SUBPARTITION s1)`. A partition comment on implicit subpartitions (`SUBPARTITIONS n`) stays on the partition |
@@ -378,7 +379,7 @@ Normalization is an **offline, best-effort** approximation of what MySQL does: i
 
 ### RemoveSecondaryIndexes
 
-Removes regular secondary indexes from a CREATE TABLE statement while preserving PRIMARY KEY, UNIQUE, and FULLTEXT indexes:
+Removes regular secondary indexes from a CREATE TABLE statement while preserving PRIMARY KEY, UNIQUE, FULLTEXT, and SPATIAL indexes, plus one regular index if required to support AUTO_INCREMENT. Among supporting regular indexes, it prefers the fewest key parts:
 
 ```go
 original := `CREATE TABLE t1 (
@@ -397,12 +398,21 @@ modified, err := statement.RemoveSecondaryIndexes(original)
 **What's Preserved:**
 - PRIMARY KEY (fundamental to table structure)
 - UNIQUE indexes (enforce data integrity constraints)
-- FULLTEXT indexes (different index type with special requirements)
+- FULLTEXT and SPATIAL indexes (specialized index types)
+- One regular index leading with AUTO_INCREMENT when no retained PRIMARY or UNIQUE key already supports it
 
 **What's Removed:**
-- Regular INDEX (non-unique secondary indexes)
+- Regular INDEX (non-unique secondary indexes), except the required AUTO_INCREMENT support index
 
 This functionality is used by move tables operations to defer regular index creation until after data is copied, improving copy performance.
+
+For example, `PRIMARY KEY(p), KEY wide(id,p), KEY narrow(id)` on a table with
+`id INT AUTO_INCREMENT` retains `narrow` and defers `wide`.
+
+`RemoveSecondaryIndexesForComparison` removes **all** regular indexes so schema
+comparisons can ignore equivalent AUTO_INCREMENT support under different names
+or with different trailing columns. Its output is for comparison only and may
+not be executable DDL.
 
 ### GetMissingSecondaryIndexes
 

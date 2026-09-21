@@ -284,7 +284,12 @@ func TestTLSInheritanceBehavior(t *testing.T) {
 			require.NoError(t, err)
 
 			if tt.expectedConfig == "" {
-				require.NotContains(t, result, "tls=", tt.description)
+				// "No TLS" is a property of the resolved connection, not of
+				// whether the DSN spells "tls=". DISABLED now writes tls=false
+				// precisely so that an RDS replica gets no TLS, which the old
+				// NotContains assertion would have called a failure while the
+				// silent DSN it preferred was the one that got TLS.
+				requireNoEffectiveTLS(t, result, tt.description)
 			} else {
 				require.Contains(t, result, tt.expectedConfig, tt.description)
 			}

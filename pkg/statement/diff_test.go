@@ -805,19 +805,19 @@ func TestDiff(t *testing.T) {
 			name:     "BooleanDefaultFalse",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL DEFAULT FALSE)",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT FALSE",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT 0",
 		},
 		{
 			name:     "BooleanDefaultTrue",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL DEFAULT TRUE)",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT TRUE",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT 1",
 		},
 		{
 			name:     "AddBooleanColumnWithDefault",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_instant BOOL DEFAULT FALSE)",
-			expected: "ALTER TABLE `t1` ADD COLUMN `is_instant` tinyint(1) NULL DEFAULT FALSE",
+			expected: "ALTER TABLE `t1` ADD COLUMN `is_instant` tinyint(1) NULL DEFAULT 0",
 		},
 		{
 			name:     "AddColumnFirst",

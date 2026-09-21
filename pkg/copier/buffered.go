@@ -268,7 +268,10 @@ func (c *buffered) Run(ctx context.Context) error {
 	// AND the throttler provides a continuous load signal (GradualThrottler);
 	// otherwise the pool stays fixed.
 	if as := c.autoscalerIfEnabled(); as != nil {
-		go as.run(ctx)
+		scaleCtx, cancelScale := context.WithCancel(ctx)
+		scaleDone := make(chan struct{})
+		go func() { defer close(scaleDone); as.run(scaleCtx) }()
+		defer func() { cancelScale(); <-scaleDone }()
 	}
 
 	// Start the read-worker pool. It starts at c.concurrency and can be
@@ -333,7 +336,7 @@ func (c *buffered) Run(ctx context.Context) error {
 
 // autoscalerIfEnabled returns the experimental dual read/write autoscaler to run
 // for this copy, or nil when it should not engage: autoscaling disabled, an
-// applier without dynamic scaling (ShardedApplier), or a throttler without a
+// applier without dynamic scaling, or a throttler without a
 // continuous load signal. Only GradualThrottler implementations (the Aurora
 // throttlers, or a multi-throttler containing one) provide that signal —
 // binary throttlers like replica lag protect via the hard-stop only, and
@@ -356,6 +359,7 @@ func (c *buffered) autoscalerIfEnabled() *autoScaler {
 	c.logger.Info("starting experimental autoscaler: write-thread scaling engaged",
 		"start", c.autoscale.StartThreads, "max", c.autoscale.MaxThreads,
 		"low_watermark", autoscale.LowWatermark, "high_watermark", autoscale.HighWatermark)
+	scaler.SetWriteWorkers(c.autoscale.StartThreads)
 	as := newAutoScaler(gradual, scaler, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
 	// Read scaling engages whenever the write side does: the copier's own
 	// reader pool is runtime-resizable (SetReadWorkers) and every applier

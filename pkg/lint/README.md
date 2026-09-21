@@ -770,11 +770,23 @@ Detects redundant indexes where one index is a prefix of another (e.g., INDEX(a)
 
 ### rename_column
 
-**Severity**: Error  
+**Severity**: Error (rename), Warning (case change)  
 **Configurable**: No  
 **Checks**: ALTER TABLE
 
 Detects column renames via RENAME COLUMN or CHANGE COLUMN. Column renames cannot be done atomically across application pods and break ORMs that generate column names at compile time. Recommends using ADD COLUMN + DROP COLUMN instead.
+
+A new name differing only in case is reported apart from a rename, as a warning with its own message. MySQL resolves the column identifier under either case, so no query stops matching, but result-set metadata returns the new case: a client that indexes returned rows by column name in a language whose keys are case-sensitive stops finding the column under the name it asked for. That is a narrower exposure than a rename no client resolves at all, and the rename advice about atomicity across pods does not apply to it.
+
+```sql
+-- ❌ Error (no client resolves the old name)
+ALTER TABLE users RENAME COLUMN phone TO phone_number;
+ALTER TABLE users CHANGE COLUMN phone phone_number VARCHAR(40);
+
+-- ⚠️ Warning (queries keep matching; returned column name changes)
+ALTER TABLE users CHANGE COLUMN phone PHONE VARCHAR(40);
+ALTER TABLE users RENAME COLUMN phone TO PHONE;
+```
 
 ---
 
@@ -795,7 +807,7 @@ Detects column renames via RENAME COLUMN or CHANGE COLUMN. Column renames cannot
 | `name_case` | ❌ | ✅ | ✅ | Warning |
 | `primary_key` | ✅ | ✅ | ❌ | Warning (existing) / Error (new) |
 | `redundant_indexes` | ❌ | ✅ | ❌ | Warning |
-| `rename_column` | ❌ | ❌ | ✅ | Error |
+| `rename_column` | ❌ | ❌ | ✅ | Error (rename) / Warning (case change) |
 | `reserved_words` | ❌ | ✅ | ✅ | Warning |
 | `type_pedantic` | ✅ | ✅ | ✅ | Warning |
 | `unsafe` | ✅ | ❌ | ✅ | Warning |

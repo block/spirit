@@ -123,6 +123,25 @@ func isNumericColumnType(typeName string) bool {
 	return numericColumnTypes[strings.ToLower(typeName)]
 }
 
+// integerColumnTypes are the integer column types, in the parser's canonical
+// spelling (types.TypeStr) — BOOL/BOOLEAN arrive as tinyint and INTEGER as int,
+// so only these spellings appear. They are the numeric types whose stored value
+// is exact: no scale is applied and no type-specific interpretation intervenes,
+// unlike decimal (which pads to its scale) or year.
+var integerColumnTypes = map[string]bool{
+	"tinyint":   true,
+	"smallint":  true,
+	"mediumint": true,
+	"int":       true,
+	"bigint":    true,
+}
+
+// isIntegerColumnType reports whether a column type is one of MySQL's integer
+// types. See integerColumnTypes.
+func isIntegerColumnType(typeName string) bool {
+	return integerColumnTypes[strings.ToLower(typeName)]
+}
+
 // needsQuotes decides whether a column DEFAULT value needs to be wrapped
 // in single quotes when emitted. SQL functions / boolean / NULL
 // literals and parseable numerics are emitted bare; everything else is

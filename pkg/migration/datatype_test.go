@@ -1378,3 +1378,70 @@ func requireVectorEquals(t *testing.T, db *sql.DB, info, want string) {
 		want, info).Scan(&got, &expected))
 	require.Equal(t, expected, got, "row %q must hold the vector %s", info, want)
 }
+
+func TestTinyInt1ValuesSurviveCopy(t *testing.T) {
+	t.Parallel()
+
+	// The (1) in tinyint(1) is a display width, not a range: the column holds
+	// the whole signed tinyint range. The copier reads rows back into Go to
+	// build its INSERT, and the driver reports a signed tinyint(1) as a Go
+	// bool, so every non-zero value arrives as true. Each value must reach the
+	// new table unchanged.
+	tt := testutils.NewTestTable(t, "tinyint1_copy", `CREATE TABLE tinyint1_copy (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		info VARCHAR(255) NOT NULL,
+		flags TINYINT(1) NOT NULL,
+		is_archived TINYINT(1) NOT NULL DEFAULT '0'
+	)`)
+
+	testutils.RunSQL(t, `INSERT INTO tinyint1_copy (info, flags, is_archived) VALUES
+		('zero', 0, 0),
+		('one', 1, 1),
+		('two', 2, 0),
+		('max', 127, 1),
+		('min', -128, 0)`)
+	tt.SeedRows(t, "INSERT INTO tinyint1_copy (info, flags) SELECT 'bulk', 3", 2000)
+
+	// Adding a column and an index in one statement leaves Spirit unable to
+	// prove the combination is INSTANT-safe, so the table is copied — which is
+	// what puts every stored value through the driver and back.
+	m := NewTestRunner(t, "tinyint1_copy",
+		"ADD COLUMN ref_code VARCHAR(64) COLLATE utf8mb4_bin NULL, ADD INDEX idx_ref_code (ref_code)",
+		WithThreads(1),
+		WithTestThrottler())
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	for _, tc := range []struct {
+		info string
+		want int
+	}{
+		{"zero", 0},
+		{"one", 1},
+		{"two", 2},
+		{"max", 127},
+		{"min", -128},
+	} {
+		requireTinyInt1(t, tt.DB, tc.info, tc.want)
+	}
+
+	// Every bulk row carries 3. Collapsing the column to a boolean rewrites
+	// them all to 1, which a single-row assertion could not distinguish from
+	// a chunk boundary effect.
+	var rewritten int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM tinyint1_copy WHERE info = 'bulk' AND flags <> 3`).Scan(&rewritten))
+	require.Zero(t, rewritten, "copied tinyint(1) values must not be coerced to 0/1")
+}
+
+// requireTinyInt1 asserts the row identified by info holds want in its flags
+// column.
+func requireTinyInt1(t *testing.T, db *sql.DB, info string, want int) {
+	t.Helper()
+	// Adding zero forces an integer result: tinyint(1) otherwise reaches the
+	// driver as a bool, which is the coercion under test.
+	var got int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT flags + 0 FROM tinyint1_copy WHERE info = ? LIMIT 1`, info).Scan(&got))
+	require.Equal(t, want, got, "row %q must hold flags=%d", info, want)
+}

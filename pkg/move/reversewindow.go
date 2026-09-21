@@ -264,7 +264,7 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 		TargetTables: targetTables,
 		Logger:       r.logger,
 		DBConfig:     r.dbConfig,
-		Threads:      r.move.WriteThreads,
+		Threads:      r.reverseWriteThreads,
 	}
 	if sharded {
 		revTargets := make([]applier.Target, len(r.sources))
