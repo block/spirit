@@ -1,6 +1,7 @@
 package checksum
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -882,4 +883,71 @@ func TestChecksumRetryResetsAfterDifferences(t *testing.T) {
 	defer chunker.Unlock()
 	require.Zero(t, chunker.wmResumes, "retry after repairs must not skip re-verification")
 	require.GreaterOrEqual(t, chunker.resets, 1, "retry after repairs should reset to the beginning")
+}
+
+// cancellingApplier cancels the run the first time the checksum repairs a
+// chunk, so the cancellation lands inside an attempt — after chunks are in
+// flight — rather than between two attempts, where Run's own pre-attempt
+// check would absorb it.
+type cancellingApplier struct {
+	applier.Applier
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancellingApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback applier.ApplyCallback) error {
+	c.once.Do(c.cancel)
+	return c.Applier.Apply(ctx, chunk, rows, callback)
+}
+
+// A continuous verification pass is cancelled when the operator drops the
+// sentinel and the deferred cutover proceeds. sentinel.Wait requires its
+// callback to render that shutdown as a benign cancellation, because any other
+// error aborts the run — so a pass interrupted part-way through its final
+// attempt must report the cancellation itself, not wrap it in a verification
+// failure that a caller cannot tell apart from a genuine one.
+func TestChecksumCancelledMidAttemptReportsCancellation(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS cancelmid_t1, _cancelmid_t1_new, _cancelmid_t1_chkpnt")
+	testutils.RunSQL(t, "CREATE TABLE cancelmid_t1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE _cancelmid_t1_new (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE _cancelmid_t1_chkpnt (a INT)") // for binlog advancement
+	testutils.RunSQL(t, "INSERT INTO cancelmid_t1 VALUES (1, 2, 3)")
+	testutils.RunSQL(t, "INSERT INTO _cancelmid_t1_new VALUES (1, 2, 4)") // diverged, so the chunk is repaired
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	t1 := table.NewTableInfo(db, "test", "cancelmid_t1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "_cancelmid_t1_new")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	defer feed.Close()
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.Start(t.Context()))
+	require.NoError(t, chunker.Open())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	config := newTestCheckerConfig(t, db)
+	config.FixDifferences = true
+	// One attempt, so the cancellation is necessarily in the last one: the
+	// pre-attempt check cannot absorb it and the retry loop runs to its end.
+	config.MaxRetries = 1
+	config.RepairApplier = &cancellingApplier{Applier: applier.NewSingleTargetForTest(t, db), cancel: cancel}
+	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
+	require.NoError(t, err)
+
+	err = checker.Run(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, checksumCanceled(err),
+		"a cancelled pass must be filterable as a benign shutdown, not reported as a verification failure")
+	require.NotErrorIs(t, err, ErrAttemptsExhausted)
+	require.NotErrorIs(t, err, ErrDifferencesExhausted)
 }

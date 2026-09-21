@@ -794,6 +794,16 @@ func (c *SingleChecker) Run(ctx context.Context) error {
 		lastErr = nil
 	}
 
+	// A cancellation that lands inside the final attempt leaves the loop here
+	// rather than at the pre-attempt check above, which is the only reason
+	// that check is not sufficient on its own. Return the cancellation cause
+	// directly for the same reason that one does: the run stopped because the
+	// caller asked it to, and a caller that has to tell a clean shutdown from
+	// a verification failure can only do so if the shutdown says so plainly.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Retries exhausted. There are two distinct shapes of failure here:
 	//
 	//   1. Every attempt returned an error (lastErr != nil) — e.g. a
