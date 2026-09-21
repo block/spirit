@@ -616,7 +616,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
-	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	// Open each source's change feed at its checkpointed position.
 	// OpenFromPosition primes the position and starts streaming in one call.
@@ -628,6 +627,11 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	r.checkpointTable = table.NewTableInfo(tgt0.DB, tgt0.Config.DBName, checkpointTableName)
+	// The baseline is taken only here, past every step that can still send
+	// setup down the fresh-copy path: the fresh chunker starts at zero, and a
+	// baseline left over from an abandoned resume would underflow the
+	// unsigned subtraction in recordCopyCompleted.
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 	r.usedResumeFromCheckpoint.Store(true)
 	return nil
 }
@@ -721,11 +725,12 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 				return fmt.Errorf("resume validation passed but checkpoint resume failed: %w", resumeErr)
 			}
 			r.logger.Warn("force set and checkpoint is definitively unresumable; starting fresh", "reason", resumeErr)
-			// resumeFromCheckpoint assigns this only after every definitive
-			// validation. Clear it explicitly before the fresh path so a future
-			// force-eligible failure added after that boundary cannot leak stale
-			// checkpoint state into newCopy.
+			// resumeFromCheckpoint assigns these only after every definitive
+			// validation. Clear them explicitly before the fresh path so a
+			// future force-eligible failure added after that boundary cannot
+			// leak stale checkpoint state into newCopy.
 			r.checksumWatermark = ""
+			r.copyRowsAtResume = 0
 		case resumeFreshOwned:
 			r.logger.Warn("target holds an empty checkpoint table: a prior move attempt stopped before writing its first checkpoint; wiping target tables and starting fresh")
 		case resumeNone:

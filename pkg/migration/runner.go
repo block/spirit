@@ -988,6 +988,9 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 // newMigration is called when resumeFromCheckpoint has failed.
 // It performs all the initial steps to prepare for a fresh migration.
 func (r *Runner) newMigration(ctx context.Context) error {
+	// A resume that got far enough to take a baseline and then failed
+	// definitively lands here; the fresh chunker counts from zero.
+	r.copyRowsAtResume = 0
 	// This is the non-resume path, so we need to create each of the new tables
 	// And apply the alters. This doesn't apply to resume.
 	for _, change := range r.changes {
@@ -1633,7 +1636,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
-	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 
 	// With saved evidence, the factory opens the chunker according to the
 	// selected verification policy. Otherwise start at the beginning.
@@ -1675,6 +1677,11 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		"checksum-watermark", checksumWatermark,
 		"position", resumePosition,
 	)
+	// The baseline is taken only here, past every step that can still send
+	// setup down the fresh-copy path: the fresh chunker starts at zero, and a
+	// baseline left over from an abandoned resume would underflow the
+	// unsigned subtraction in recordCopyCompleted.
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 	r.usedResumeFromCheckpoint.Store(true)
 	return nil
 }

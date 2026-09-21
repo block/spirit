@@ -1266,7 +1266,6 @@ func (r *Runner) startResume(ctx context.Context, watermark, pos string) error {
 		if err := r.copyChunker.OpenAtWatermark(watermark); err != nil {
 			return fmt.Errorf("failed to open copier at checkpoint watermark: %w", err)
 		}
-		r.copyRowsAtResume = r.copyChunker.RowsCopied()
 	} else {
 		if err := r.copyChunker.Open(); err != nil {
 			return err
@@ -1275,6 +1274,11 @@ func (r *Runner) startResume(ctx context.Context, watermark, pos string) error {
 	if err := r.startResumeChangeSource(ctx, watermark, pos); err != nil {
 		return err
 	}
+	// The baseline is taken only here, past every step that can still send
+	// setup down the fresh-copy path: the fresh chunker starts at zero, and a
+	// baseline left over from an abandoned resume would underflow the
+	// unsigned subtraction in recordCopyCompleted.
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
 	return r.checkpointTbl().Create(ctx)
 }
 

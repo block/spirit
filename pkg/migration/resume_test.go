@@ -163,8 +163,12 @@ func TestCheckpoint(t *testing.T) {
 	// Which first checks if the table can be restored from checkpoint.
 	// Because this is the first run, it can't.
 	require.Error(t, r.resumeFromCheckpoint(t.Context()))
-	// So we proceed with the initial steps.
+	// So we proceed with the initial steps. A resume that reached its copy
+	// baseline and only then failed definitively arrives here too, and the
+	// fresh chunker counts from zero, so the baseline must not survive.
+	r.copyRowsAtResume = 1234
 	require.NoError(t, r.newMigration(t.Context()))
+	require.Zero(t, r.copyRowsAtResume, "the fresh path starts the copy aggregate from zero")
 	disableDynamicChunking(t, r.copyChunker)
 
 	// Now we are ready to start copying rows.
@@ -248,6 +252,7 @@ func TestCheckpoint(t *testing.T) {
 	// settled any of its own.
 	restored := r.copyChunker.RowsCopied()
 	require.Positive(t, restored, "the checkpoint should restore the rows the first runner settled")
+	require.Equal(t, restored, r.copyRowsAtResume, "a completed resume records the restored rows as this invocation's baseline")
 	disableDynamicChunking(t, r.copyChunker)
 	// This opens the table at the checkpoint (table.OpenAtWatermark())
 	// which sets the chunkPtr at the LowerBound. It also has to position
