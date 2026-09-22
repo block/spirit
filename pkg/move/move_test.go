@@ -10,6 +10,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -168,8 +169,37 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	testutils.RunSQL(t, `ALTER TABLE dest_resume.t1 DROP COLUMN extra_col`)
 	r, err = NewRunner(move)
 	require.NoError(t, err)
+	// The copy aggregate a resumed move reports covers this invocation only.
+	// The chunker restores the rows the previous invocation settled but counts
+	// chunks from zero, so the restored rows are subtracted to keep the two
+	// figures on the same footing.
+	sink := &copyAggregateSink{}
+	r.SetMetricsSink(sink)
 	require.NoError(t, r.Run(t.Context()))
+	// Without a restored baseline the subtraction below holds for free, so
+	// assert the resume actually carried one before relying on it.
+	require.Positive(t, r.copyRowsAtResume, "the resume must restore a settled row count")
+	require.Equal(t, r.copyChunker.RowsCopied()-r.copyRowsAtResume, sink.rows)
+	require.Less(t, sink.rows, r.copyChunker.RowsCopied(), "the rows the previous invocation settled must not be reported again")
 	require.NoError(t, r.Close())
+}
+
+// copyAggregateSink records the copy aggregate the runner reports when the
+// copy completes.
+type copyAggregateSink struct {
+	rows, chunks uint64
+}
+
+func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
+	for _, v := range m.Values {
+		switch v.Name {
+		case metrics.CopyRowsCompletedMetricName:
+			s.rows = uint64(v.Value)
+		case metrics.CopyChunksCompletedMetricName:
+			s.chunks = uint64(v.Value)
+		}
+	}
+	return nil
 }
 
 // TestEmptyDatabaseMove tests that a move operation succeeds when the source database has no tables.
