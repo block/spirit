@@ -140,14 +140,19 @@ func startRun(t *testing.T, runner *Runner) *runHandle {
 	return h
 }
 
-// poll re-evaluates cond until it holds, the run returns, or the budget runs
-// out. cond runs on the test goroutine, so it may use t and require freely —
-// but it owes the deadline a return, which is what waitQueryTimeout is for.
-// describe supplies the timeout message, so each caller reports what it last
-// saw rather than the bare fact that it waited.
-func (h *runHandle) poll(cond func() bool, describe func() string) {
+// poll re-evaluates cond until it holds, the run returns, or deadline passes.
+// cond runs on the test goroutine, so it may use t and require freely — but it
+// owes the deadline a return, which is what waitQueryTimeout is for. describe
+// supplies the timeout message, so each caller reports what it last saw rather
+// than the bare fact that it waited; poll adds the timing.
+//
+// The deadline is a parameter rather than a budget poll starts for itself,
+// because waits get composed: see awaitReverseWindow.
+func (h *runHandle) poll(deadline time.Time, cond func() bool, describe func() string) {
 	h.t.Helper()
-	deadline := time.After(waitTimeout)
+	start := time.Now()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	tick := time.NewTicker(waitPollInterval)
 	defer tick.Stop()
 	for {
@@ -158,8 +163,9 @@ func (h *runHandle) poll(cond func() bool, describe func() string) {
 		case err := <-h.done:
 			h.returned, h.runErr = true, err
 			h.t.Fatalf("move returned before the wait was satisfied: err=%v; %s", err, describe())
-		case <-deadline:
-			h.t.Fatal(describe())
+		case <-timer.C:
+			h.t.Fatalf("%s (gave up after %s, %s budget)",
+				describe(), time.Since(start).Round(time.Millisecond), waitTimeout)
 		case <-tick.C:
 		}
 	}
@@ -170,32 +176,40 @@ func (h *runHandle) poll(cond func() bool, describe func() string) {
 // get there. The state is checked first because it is in-process and cannot be
 // blocked by the server, so a checkpoint read that then fails is reported
 // against a window we already know is open, with the read's own error attached.
+//
+// Both halves share one deadline. Giving each its own would make the composite
+// wait 2×waitTimeout, past the 30s reverse window these tests configure — and
+// the phase half could then still be polling after the terminal action had
+// dropped the very checkpoint row it is looking for. That is precisely the
+// misleading timeout this harness exists to remove, so it must not be
+// reintroduced by composing two waits that each look safe alone.
 func (h *runHandle) awaitReverseWindow(db *sql.DB, dbName string) {
 	h.t.Helper()
-	h.awaitState(status.ReverseWindow)
-	h.awaitCheckpointPhase(db, dbName, phaseReverseWindow)
+	deadline := time.Now().Add(waitTimeout)
+	h.awaitState(deadline, status.ReverseWindow)
+	h.awaitCheckpointPhase(deadline, db, dbName, phaseReverseWindow)
 }
 
 // awaitState blocks until the runner reports want.
-func (h *runHandle) awaitState(want status.State) {
+func (h *runHandle) awaitState(deadline time.Time, want status.State) {
 	h.t.Helper()
 	var last status.State
-	h.poll(func() bool {
+	h.poll(deadline, func() bool {
 		last = h.runner.Progress().CurrentState
 		return last == want
 	}, func() string {
-		return fmt.Sprintf("move did not reach state %s within %s; last state=%s", want, waitTimeout, last)
+		return fmt.Sprintf("move did not reach state %s; last state=%s", want, last)
 	})
 }
 
 // awaitCheckpointPhase blocks until the checkpoint row on targets[0] (dbName)
 // reports want.
-func (h *runHandle) awaitCheckpointPhase(db *sql.DB, dbName, want string) {
+func (h *runHandle) awaitCheckpointPhase(deadline time.Time, db *sql.DB, dbName, want string) {
 	h.t.Helper()
 	var lastPhase string
 	var lastErr error
 	var blocked int
-	h.poll(func() bool {
+	h.poll(deadline, func() bool {
 		ctx, cancel := context.WithTimeout(h.t.Context(), waitQueryTimeout)
 		defer cancel()
 		var phase string
@@ -220,18 +234,25 @@ func (h *runHandle) awaitCheckpointPhase(db *sql.DB, dbName, want string) {
 			return false
 		}
 	}, func() string {
-		return fmt.Sprintf("checkpoint phase on %s never became %q within %s; last phase=%q, last read error=%v, blocked reads=%d, runner state=%s",
-			dbName, want, waitTimeout, lastPhase, lastErr, blocked, h.runner.Progress().CurrentState)
+		return fmt.Sprintf("checkpoint phase on %s never became %q; last phase=%q, last read error=%v, blocked reads=%d, runner state=%s",
+			dbName, want, lastPhase, lastErr, blocked, h.runner.Progress().CurrentState)
 	})
 }
 
 // awaitTable blocks until schema.name exists. Used to synchronize on a rename
 // that lands shortly after another observable signal.
+//
+// Unlike awaitReverseWindow's two halves this starts its own budget, because
+// nothing it waits for expires: the renames it watches for are made by the
+// cutover and by completing the window forward, so a window that elapses
+// underneath this wait can only make the table more likely to appear, never
+// less. A caller that then expects the window to still be open — the kill
+// tests — is told so by its own assertion on Run's error, not by a timeout
+// here.
 func (h *runHandle) awaitTable(db *sql.DB, schema, name string) {
 	h.t.Helper()
-	h.poll(func() bool { return tableExists(h.t, db, schema, name) }, func() string {
-		return fmt.Sprintf("%s.%s did not appear within %s; runner state=%s",
-			schema, name, waitTimeout, h.runner.Progress().CurrentState)
+	h.poll(time.Now().Add(waitTimeout), func() bool { return tableExists(h.t, db, schema, name) }, func() string {
+		return fmt.Sprintf("%s.%s did not appear; runner state=%s", schema, name, h.runner.Progress().CurrentState)
 	})
 }
 
