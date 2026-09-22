@@ -24,6 +24,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -302,6 +303,36 @@ func TestCheckpoint(t *testing.T) {
 	watermark, err = r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
 	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"11001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"12001\"],\"Inclusive\":false}}", watermarkChunkJSON(t, watermark))
+
+	// The aggregate reported to the metrics sink is per invocation, and the
+	// two halves have to agree about which invocation that is. RowsCopied()
+	// spans both runs because the chunker restores it from the watermark;
+	// the chunk count does not, because no chunker restores it. Subtracting
+	// the restored rows is what keeps the pair describing the same run — the
+	// eleven chunks this runner copied, and the rows those chunks settled.
+	sink := &copyAggregateSink{}
+	r.status.SetMetricsSink(sink, r.logger)
+	r.recordCopyCompleted()
+	require.Equal(t, r.copyChunker.RowsCopied()-settled, sink.rows)
+	require.Equal(t, uint64(11), sink.chunks)
+}
+
+// copyAggregateSink records the copy aggregate a runner reports when the copy
+// completes, so a test can assert the figures rather than the call.
+type copyAggregateSink struct {
+	rows, chunks uint64
+}
+
+func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
+	for _, v := range m.Values {
+		switch v.Name {
+		case metrics.CopyRowsCompletedMetricName:
+			s.rows = uint64(v.Value)
+		case metrics.CopyChunksCompletedMetricName:
+			s.chunks = uint64(v.Value)
+		}
+	}
+	return nil
 }
 
 func TestCheckpointRestore(t *testing.T) {
