@@ -471,8 +471,8 @@ func TestMoveResumeDeletesRecopyRange(t *testing.T) {
 	checkpointAndStop(t, move)
 
 	// Read back the copier watermark the checkpoint recorded. A single-table
-	// auto-inc move uses the optimistic chunker, whose watermark is the raw
-	// chunk JSON of the last contiguously-completed bounded chunk.
+	// auto-inc move uses the optimistic chunker, whose watermark carries the
+	// last contiguously-completed bounded chunk beside the settled row count.
 	targetDB, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)

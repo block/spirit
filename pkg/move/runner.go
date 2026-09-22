@@ -1573,7 +1573,7 @@ func (r *Runner) Status() string {
 	}
 	switch state { //nolint:exhaustive
 	case status.CopyRows:
-		progress := r.copier.CopyProgress()
+		progress := status.CopyFromTables(r.copyTables())
 		b := status.NewBlock("migration status: state=%s total-time=%s copier-time=%s",
 			state.String(),
 			r.status.TotalElapsed().Round(time.Second),
@@ -2003,22 +2003,38 @@ func (r *Runner) SetReverseCutoverWithResult(fn CutoverResultCallback) {
 	r.reverseCutoverResultFunc = fn
 }
 
+// copyTables snapshots the published copy chunker and returns the per-table
+// progress. Progress and Status both derive their copy figures from it, so
+// the API and the log block report one measure: settled rows against the
+// tables' cardinality estimates, kept past the end of the copy. The copier's
+// own progress is not used for either, because on an auto_increment key it
+// measures keyspace distance, not rows. The chunker is read under chunkerMu
+// because setup and checkpoint resume may publish it while a caller polls.
+func (r *Runner) copyTables() []status.TableProgress {
+	r.chunkerMu.RLock()
+	copyChunker := r.copyChunker
+	r.chunkerMu.RUnlock()
+	return status.TablesFromChunker(copyChunker)
+}
+
 func (r *Runner) Progress() status.Progress {
 	// Read the state once: the phase-specific fields below (summary, ETA,
 	// checksum, throttle) must all describe the same state, not whichever state
 	// each happened to observe.
 	state := r.status.Get()
+
+	tables := r.copyTables()
+	copyProgress := status.CopyFromTables(tables)
+
 	var summary string
 	var eta status.ETA
 	var checksumProgress status.ChecksumProgress
 	switch state { //nolint: exhaustive
 	case status.CopyRows:
-		summary = fmt.Sprintf("%v %s ETA %v",
-			r.copier.GetProgress(),
-			state.String(),
-			r.copier.GetETA(),
-		)
+		// One copier read, so the ETA in Summary and the ETA field describe
+		// the same instant.
 		eta = r.copier.GetETAState()
+		summary = fmt.Sprintf("%s %s ETA %s", copyProgress.String(), state.String(), eta.String())
 	case status.WaitingOnSentinelTable:
 		summary = "Waiting on Sentinel Table"
 	case status.ApplyChangeset, status.PostChecksum:
@@ -2027,18 +2043,12 @@ func (r *Runner) Progress() status.Progress {
 		checksumProgress = r.checker.GetProgress()
 		summary = checksum.StatusSummary(r.checker)
 	}
-
-	// Get per-table progress from the published copy chunker. Setup and
-	// checkpoint resume may publish it while an API caller polls Progress.
-	r.chunkerMu.RLock()
-	copyChunker := r.copyChunker
-	r.chunkerMu.RUnlock()
-	tables := status.TablesFromChunker(copyChunker)
 	return status.Progress{
 		CurrentState: state,
 		Summary:      summary,
 		Resume:       r.usedResumeFromCheckpoint.Load(),
 		ETA:          eta,
+		Copy:         copyProgress,
 		Checksum:     checksumProgress,
 		Tables:       tables,
 		Throttle:     r.throttleStatus(state),

@@ -65,9 +65,13 @@ type Copier interface {
 	GetThrottler() throttler.Throttler
 	StartTime() time.Time
 	GetProgress() string
-	// CopyProgress returns the same progress as GetProgress in numeric form,
-	// which the status block needs in order to lay the percentage and the
-	// row counts out as separate fields.
+	// CopyProgress returns the copier's own measure of the copy in numeric
+	// form: the chunker's Progress, which for the optimistic chunker is
+	// keyspace distance against the auto_increment max rather than rows. It
+	// is the measure the ETA is paced on. Callers reporting rows to a human
+	// or a wrapper should sum the chunker's per-table settled counts instead
+	// (status.CopyFromTables), which is what the runners do. GetProgress is
+	// this value rendered.
 	CopyProgress() status.CopyProgress
 	// ChunkSize returns the row count of the most recently claimed chunk, or
 	// 0 before the first one. This is the dynamic chunker's current sizing

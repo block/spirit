@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,7 +109,8 @@ func watermarkChunkJSON(t *testing.T, watermark string) string {
 func TestCheckpoint(t *testing.T) {
 	// This test manually steps through the migration process to verify
 	// watermark, checkpoint dump, and restore behavior.
-	// It uses specific INSERT patterns that produce exactly 11040 rows.
+	// It seeds about eleven thousand rows with bulk INSERT ... SELECT, which
+	// leaves auto_increment gaps, so ids are not contiguous.
 	//
 	// It drives the copier's synchronous CopyChunk API (copier.ChunkCopier)
 	// to complete chunks in a controlled order (2, 1, 3) and assert the
@@ -179,9 +181,18 @@ func TestCheckpoint(t *testing.T) {
 	require.Equal(t, "copyRows", r.status.Get().String())
 
 	// The status block: a header line, then one row per subsystem. chunk is 0
-	// until the first chunk is claimed, and the bar is empty at 0%.
+	// until the first chunk is claimed, and the bar is empty at 0%. The copier
+	// row counts settled rows against the table's row estimate, which comes
+	// from table statistics, so it is read from the table rather than pinned.
+	estimatedRows := atomic.LoadUint64(&r.changes[0].table.EstimatedRows)
+	var actualRows uint64
+	require.NoError(t, r.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM cpt1").Scan(&actualRows))
+	require.InEpsilon(t, actualRows, estimatedRows, 0.2, "the row estimate must be in the neighbourhood of the true count")
 	require.Contains(t, r.Status(), "migration status: state=copyRows total-time=")
-	require.Contains(t, r.Status(), "\n  copier    0.00%  0/11040  chunk-size=0  eta=")
+	// eta reads TBD, not a duration: no copy rate has been measured yet. The
+	// word itself is the assertion, since the log block renders the ETA's
+	// availability rather than a zero duration.
+	require.Contains(t, r.Status(), fmt.Sprintf("\n  copier    0.00%%  0/%d  chunk-size=0  eta=TBD", estimatedRows))
 	// The rows the change feed and the checkpoint dumper used to log for
 	// themselves, plus the applier pipeline snapshot.
 	// No write worker has started yet, so the applier row is the idle one. Every
@@ -220,11 +231,20 @@ func TestCheckpoint(t *testing.T) {
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk1))
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk3))
 
+	// The copier row counts the rows the three chunks settled. That is not
+	// three chunks' worth of ids: the first chunk is the open lower bound
+	// below the minimum id and copies nothing, and the bulk INSERT ... SELECT
+	// seed leaves auto_increment gaps, so the count is read from the new
+	// table rather than pinned.
+	var settled uint64
+	require.NoError(t, r.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _cpt1_new").Scan(&settled))
+	require.Positive(t, settled)
+	wantCopier := fmt.Sprintf("\n  copier  %6.2f%%  %d/%d  chunk-size=1000  eta=", float64(settled)/float64(estimatedRows)*100, settled, estimatedRows)
 	// The status update is asynchronous (the applier phones home after each
 	// chunk completes), so poll until it reflects all three copied chunks.
 	require.Eventually(t, func() bool {
-		return strings.Contains(r.Status(), "\n  copier   27.17%  3000/11040  chunk-size=1000  eta=")
-	}, 10*time.Second, 50*time.Millisecond, "status never reached expected copy progress; last status: %s", r.Status())
+		return strings.Contains(r.Status(), wantCopier)
+	}, 10*time.Second, 50*time.Millisecond, "status never reached expected copy progress; want %q in: %s", wantCopier, r.Status())
 
 	// The watermark should exist now, because migrateChunk()
 	// gives feedback back to table.
@@ -258,6 +278,12 @@ func TestCheckpoint(t *testing.T) {
 	// which sets the chunkPtr at the LowerBound. It also has to position
 	// the watermark to this point so new watermarks "align" correctly.
 	// So lets now call NextChunk to verify.
+
+	// Before the resumed run copies anything, the API and the log block
+	// report the copy where the checkpoint left it, not from zero.
+	r.status.Set(status.CopyRows)
+	require.Equal(t, settled, r.Progress().Copy.RowsCopied)
+	require.Contains(t, r.Status(), fmt.Sprintf("  %d/%d  chunk-size=", settled, atomic.LoadUint64(&r.changes[0].table.EstimatedRows)))
 
 	ccopier, ok = r.copier.(copier.ChunkCopier)
 	require.True(t, ok)
