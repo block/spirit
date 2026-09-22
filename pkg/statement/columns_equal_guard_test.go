@@ -30,7 +30,7 @@ var columnFieldsCompared = map[string]struct{}{
 	"Nullable":        {},
 	"Default":         {},
 	"DefaultIsExpr":   {},
-	"DefaultIsString": {},
+	"DefaultKind":     {},
 	"OnUpdate":        {},
 	"GeneratedExpr":   {},
 	"GeneratedStored": {},
@@ -119,7 +119,7 @@ func TestColumnsEqualAllFieldsAccounted(t *testing.T) {
 // non-nil value so that flipping any single attribute is a detectable change.
 // GeneratedExpr is non-nil so that GeneratedStored is meaningful (it is only
 // compared when a generation expression is present). Type is a non-numeric type
-// so that DefaultIsString participates in the comparison.
+// so that DefaultKind participates in the comparison.
 func baseColumn() Column {
 	return Column{
 		Name:            "c",
@@ -134,7 +134,7 @@ func baseColumn() Column {
 		Nullable:        false,
 		Default:         new("foo"),
 		DefaultIsExpr:   true,
-		DefaultIsString: true,
+		DefaultKind:     DefaultKindString,
 		OnUpdate:        new("current_timestamp"),
 		GeneratedExpr:   new("(1 + 1)"),
 		GeneratedStored: true,
@@ -171,7 +171,7 @@ func everyComparedFieldMutation() []struct {
 		{"Nullable", func(c *Column) { c.Nullable = true }},
 		{"Default", func(c *Column) { c.Default = new("bar") }},
 		{"DefaultIsExpr", func(c *Column) { c.DefaultIsExpr = false }},
-		{"DefaultIsString", func(c *Column) { c.DefaultIsString = false }},
+		{"DefaultKind", func(c *Column) { c.DefaultKind = DefaultKindNumber }},
 		{"OnUpdate", func(c *Column) { c.OnUpdate = new("now()") }},
 		{"GeneratedExpr", func(c *Column) { c.GeneratedExpr = new("(2 + 2)") }},
 		{"GeneratedStored", func(c *Column) { c.GeneratedStored = false }},
