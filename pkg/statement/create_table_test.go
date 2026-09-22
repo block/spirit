@@ -1480,7 +1480,7 @@ func TestParenthesizedLiteralDefaultRoundTrip(t *testing.T) {
 	require.NotNil(t, col.Default)
 	require.Equal(t, "{}", *col.Default)
 	require.True(t, col.DefaultIsExpr)
-	require.True(t, col.DefaultIsString)
+	require.Equal(t, DefaultKindString, col.DefaultKind)
 	require.Contains(t, formatColumnDefinition(col), "DEFAULT ('{}')")
 
 	// MySQL's SHOW CREATE TABLE renders the same default with a charset
@@ -1493,7 +1493,7 @@ func TestParenthesizedLiteralDefaultRoundTrip(t *testing.T) {
 	require.NotNil(t, colLive.Default)
 	require.Equal(t, "{}", *colLive.Default)
 	require.True(t, colLive.DefaultIsExpr)
-	require.True(t, colLive.DefaultIsString)
+	require.Equal(t, DefaultKindString, colLive.DefaultKind)
 
 	// The bare and parenthesized forms of the same literal are different
 	// defaults and must not compare equal.
