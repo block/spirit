@@ -55,47 +55,242 @@ func shortenReverseWindowPolling(t *testing.T) {
 	t.Cleanup(func() { reverseWindowPollInterval = old })
 }
 
+// Timing for the wait helpers below.
+const (
+	waitPollInterval = 50 * time.Millisecond
+	// waitQueryTimeout bounds every query a wait helper issues. A wait that
+	// evaluates its condition inline is only as bounded as the condition, so an
+	// unbounded read against a loaded CI server can spend the entire budget
+	// inside a single call and still report nothing but "timed out".
+	waitQueryTimeout = 5 * time.Second
+	// waitTimeout is the budget for reaching a state or a durable side effect.
+	// It stays well under the 30s reverse window these tests configure: once the
+	// window elapses the terminal action drops the checkpoint, and a phase that
+	// is no longer there can never be observed.
+	waitTimeout = 20 * time.Second
+)
+
+// erNoSuchTable is MySQL error 1146 (ER_NO_SUCH_TABLE).
+const erNoSuchTable = 1146
+
 func tableExists(t *testing.T, db *sql.DB, schema, name string) bool {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), waitQueryTimeout)
+	defer cancel()
 	var one int
-	err := db.QueryRowContext(t.Context(),
+	err := db.QueryRowContext(ctx,
 		"SELECT 1 FROM information_schema.tables WHERE table_schema=? AND table_name=?", schema, name).Scan(&one)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false
 	}
 	require.NoError(t, err)
 	return true
 }
 
-// waitForTable polls until a table exists (or the deadline passes). Used to
-// synchronize on a rename that lands shortly after another observable signal.
-func waitForTable(t *testing.T, db *sql.DB, schema, name string) {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if tableExists(t, db, schema, name) {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+// checkpointNotYet reports whether err is one of the two ways a checkpoint read
+// legitimately says "not yet": the table does not exist (it has not been
+// created, or the read fell between the DROP and the CREATE of a fresh run), or
+// it holds no row. Every other error is a real failure that will not fix itself
+// — the control connection refused, the schema gone, a lock wait — and the
+// polls must not swallow it.
+func checkpointNotYet(err error) bool {
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
 	}
-	t.Fatalf("timed out waiting for %s.%s to exist", schema, name)
+	myErr, ok := errors.AsType[*mysql.MySQLError](err)
+	return ok && myErr.Number == erNoSuchTable
 }
 
-// waitForReverseWindow polls the checkpoint until the move has entered its
-// reverse window (move_phase = reverse_window), i.e. cutover has happened.
-func waitForReverseWindow(t *testing.T, db *sql.DB, dstDBName string) {
+// runHandle drives a reverse-window Runner from a test that waits on one of the
+// move's observable effects — the runner's state, the checkpoint phase, a
+// rename — rather than on Run itself.
+//
+// Waiting on those effects alone makes every early failure look identical: Run
+// returns, nothing ever reaches the awaited effect, and the test reports a bare
+// timeout carrying no error text. The checkpoint wait is worse still, because it
+// reads over the control connection: when that connection is the thing that is
+// broken, every poll fails the same way and the timeout says nothing about it.
+// That is what issue #1239 cost us — a CI failure whose cause is unrecoverable
+// from the logs, even though the runner had plainly logged the window open.
+//
+// So every wait here also selects on the run result, bounds its queries, and
+// reports what it last saw.
+type runHandle struct {
+	t      *testing.T
+	runner *Runner
+	cancel context.CancelFunc
+	done   chan error
+
+	returned bool  // Run has returned and its result is in runErr
+	runErr   error // valid once returned
+	closed   bool
+}
+
+// startRun starts runner.Run on its own goroutine. The run is cancelled,
+// drained and closed by the end of the test; call kill or awaitDone to do it
+// earlier and inspect Run's error.
+func startRun(t *testing.T, runner *Runner) *runHandle {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		var phase string
-		err := db.QueryRowContext(t.Context(),
-			"SELECT move_phase FROM "+dstDBName+"."+checkpointTableName+" WHERE id=1").Scan(&phase)
-		if err == nil && phase == phaseReverseWindow {
+	// Not t.Context(): these runs must outlive the test body's own teardown,
+	// and the handle owns the cancellation.
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &runHandle{t: t, runner: runner, cancel: cancel, done: make(chan error, 1)}
+	go func() { h.done <- runner.Run(ctx) }()
+	t.Cleanup(h.close)
+	return h
+}
+
+// poll re-evaluates cond until it holds, the run returns, or the budget runs
+// out. cond runs on the test goroutine, so it may use t and require freely —
+// but it owes the deadline a return, which is what waitQueryTimeout is for.
+// describe supplies the timeout message, so each caller reports what it last
+// saw rather than the bare fact that it waited.
+func (h *runHandle) poll(cond func() bool, describe func() string) {
+	h.t.Helper()
+	deadline := time.After(waitTimeout)
+	tick := time.NewTicker(waitPollInterval)
+	defer tick.Stop()
+	for {
+		if cond() {
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case err := <-h.done:
+			h.returned, h.runErr = true, err
+			h.t.Fatalf("move returned before the wait was satisfied: err=%v; %s", err, describe())
+		case <-deadline:
+			h.t.Fatal(describe())
+		case <-tick.C:
+		}
 	}
-	t.Fatal("timed out waiting for the reverse window to open")
+}
+
+// awaitReverseWindow blocks until the move is holding its reverse window, seen
+// from both sides: the runner's own state, and the checkpoint phase it wrote to
+// get there. The state is checked first because it is in-process and cannot be
+// blocked by the server, so a checkpoint read that then fails is reported
+// against a window we already know is open, with the read's own error attached.
+func (h *runHandle) awaitReverseWindow(db *sql.DB, dbName string) {
+	h.t.Helper()
+	h.awaitState(status.ReverseWindow)
+	h.awaitCheckpointPhase(db, dbName, phaseReverseWindow)
+}
+
+// awaitState blocks until the runner reports want.
+func (h *runHandle) awaitState(want status.State) {
+	h.t.Helper()
+	var last status.State
+	h.poll(func() bool {
+		last = h.runner.Progress().CurrentState
+		return last == want
+	}, func() string {
+		return fmt.Sprintf("move did not reach state %s within %s; last state=%s", want, waitTimeout, last)
+	})
+}
+
+// awaitCheckpointPhase blocks until the checkpoint row on targets[0] (dbName)
+// reports want.
+func (h *runHandle) awaitCheckpointPhase(db *sql.DB, dbName, want string) {
+	h.t.Helper()
+	var lastPhase string
+	var lastErr error
+	var blocked int
+	h.poll(func() bool {
+		ctx, cancel := context.WithTimeout(h.t.Context(), waitQueryTimeout)
+		defer cancel()
+		var phase string
+		err := db.QueryRowContext(ctx,
+			"SELECT move_phase FROM "+dbName+"."+checkpointTableName+" WHERE id=1").Scan(&phase)
+		switch {
+		case err == nil:
+			lastPhase, lastErr = phase, nil
+			return phase == want
+		case errors.Is(err, context.DeadlineExceeded):
+			// A read that outlives waitQueryTimeout is pathological but not by
+			// itself proof of failure on a loaded server: count it and retry, so
+			// a timeout can report that the reads were blocked rather than wrong.
+			blocked++
+			lastErr = err
+			return false
+		case checkpointNotYet(err):
+			lastErr = err
+			return false
+		default:
+			h.t.Fatalf("reading the checkpoint phase from %s.%s: %v", dbName, checkpointTableName, err)
+			return false
+		}
+	}, func() string {
+		return fmt.Sprintf("checkpoint phase on %s never became %q within %s; last phase=%q, last read error=%v, blocked reads=%d, runner state=%s",
+			dbName, want, waitTimeout, lastPhase, lastErr, blocked, h.runner.Progress().CurrentState)
+	})
+}
+
+// awaitTable blocks until schema.name exists. Used to synchronize on a rename
+// that lands shortly after another observable signal.
+func (h *runHandle) awaitTable(db *sql.DB, schema, name string) {
+	h.t.Helper()
+	h.poll(func() bool { return tableExists(h.t, db, schema, name) }, func() string {
+		return fmt.Sprintf("%s.%s did not appear within %s; runner state=%s",
+			schema, name, waitTimeout, h.runner.Progress().CurrentState)
+	})
+}
+
+// waitFor blocks for Run to return and yields its error. what names what the
+// run was expected to finish, for the failure message.
+func (h *runHandle) waitFor(timeout time.Duration, what string) error {
+	h.t.Helper()
+	if h.returned {
+		return h.runErr
+	}
+	select {
+	case err := <-h.done:
+		h.returned, h.runErr = true, err
+		return err
+	case <-time.After(timeout):
+		h.t.Fatalf("timed out after %s waiting for %s; runner state=%s",
+			timeout, what, h.runner.Progress().CurrentState)
+		return nil
+	}
+}
+
+// awaitDone blocks for the run to finish on its own and asserts it returned
+// cleanly.
+func (h *runHandle) awaitDone(timeout time.Duration, what string) {
+	h.t.Helper()
+	require.NoError(h.t, h.waitFor(timeout, what))
+}
+
+// kill cancels the run and returns Run's error — for a cancellation landing in
+// the window loop, context.Canceled. The runner is left open so the caller can
+// inspect the interrupted state.
+func (h *runHandle) kill() error {
+	h.t.Helper()
+	h.cancel()
+	return h.waitFor(waitTimeout, "the killed move to return")
+}
+
+// close cancels the run, drains it and closes the runner. Idempotent, and
+// registered as a t.Cleanup so a fatal wait still tears the runner down instead
+// of leaking its change feeds and connection pools into the rest of the package.
+func (h *runHandle) close() {
+	if h.closed {
+		return
+	}
+	h.closed = true
+	h.cancel()
+	if !h.returned {
+		select {
+		case err := <-h.done:
+			h.returned, h.runErr = true, err
+		case <-time.After(waitTimeout):
+			// Runner.Close is safe only once Run has returned, so a run that will
+			// not stop is left open: closing its pools and change feeds underneath
+			// it would trade this diagnosis for a race somewhere further out.
+			h.t.Errorf("move did not stop within %s of cancellation; leaving the runner open", waitTimeout)
+			return
+		}
+	}
+	utils.CloseAndLog(h.runner)
 }
 
 // TestMoveReverseWindowCompleteForward: with a reverse window and no revert, the
@@ -147,28 +342,21 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
-	defer utils.CloseAndLog(runner)
 
 	var reverseCutoverCalled bool
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- runner.Run(context.Background()) }()
+	h := startRun(t, runner)
 
 	// Once the window is open, a write to the target and then a revert request.
 	// The revert is triggered the way the operator's revert command will:
 	// create the revert marker on targets[0] (here, rwrv_dst).
-	waitForReverseWindow(t, ctl, "rwrv_dst")
+	h.awaitReverseWindow(ctl, "rwrv_dst")
 	testutils.RunSQL(t, "INSERT INTO rwrv_dst.t1 (id, val) VALUES (99,'late')")
 	testutils.RunSQL(t, "CREATE TABLE rwrv_dst."+revertMarkerName+" (id INT)")
 
-	select {
-	case err := <-errCh:
-		require.NoError(t, err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the reverse cutover to complete")
-	}
+	h.awaitDone(30*time.Second, "the reverse cutover to complete")
 
 	require.True(t, reverseCutoverCalled, "reverse cutover func must run on revert")
 	// Source un-retired and serving, with the window's write flowed back.
@@ -201,22 +389,18 @@ func runRevertingMove(t *testing.T, sourceDSN, targetDSN string, ctl *sql.DB, ds
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
-	defer utils.CloseAndLog(runner)
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { return nil })
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- runner.Run(context.Background()) }()
+	h := startRun(t, runner)
 
-	waitForReverseWindow(t, ctl, dstDBName)
+	h.awaitReverseWindow(ctl, dstDBName)
 	testutils.RunSQL(t, "CREATE TABLE "+dstDBName+"."+revertMarkerName+" (id INT)")
 
-	select {
-	case err := <-errCh:
-		require.NoError(t, err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the reverse cutover to complete")
-	}
+	h.awaitDone(30*time.Second, "the reverse cutover to complete")
+	// Each attempt must be fully torn down before the next one starts on the
+	// same source and target, so this cannot wait for the test's cleanup.
+	h.close()
 }
 
 // TestMoveReverseWindowRevertIdempotentAcrossRetries: running move+revert twice
@@ -250,20 +434,20 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 	})
 	require.NoError(t, err)
 	run1.SetCutover(func(context.Context) error { return nil })
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	run1Done := make(chan struct{})
-	go func() { _ = run1.Run(ctx1); close(run1Done) }()
+	h1 := startRun(t, run1)
 
-	waitForReverseWindow(t, ctl, "rwrk_dst")
+	h1.awaitReverseWindow(ctl, "rwrk_dst")
 	// The checkpoint (phase=reverse_window) is written under the source lock
 	// just BEFORE the source rename to _old, so observing the phase alone races
 	// the rename. Wait for the retire to actually land before "killing" the
 	// process, so run 1 is interrupted in the state this test means to resume
 	// from: source retired to _old, target serving.
-	waitForTable(t, ctl, "rwrk_src", "t1_old")
-	cancel1() // "kill" the process mid-window
-	<-run1Done
-	utils.CloseAndLog(run1)
+	h1.awaitTable(ctl, "rwrk_src", "t1_old")
+	// The only acceptable outcome of the kill is our own cancellation: any other
+	// error means run 1 died on its own and the resume below would be testing
+	// recovery from the wrong state.
+	require.ErrorIs(t, h1.kill(), context.Canceled, "run 1 must die from the kill, not an earlier failure")
+	h1.close()
 
 	// The interrupted state: source retired to _old, target serving, checkpoint present.
 	require.True(t, tableExists(t, ctl, "rwrk_src", "t1_old"), "source should be retired to _old mid-window")
@@ -279,7 +463,6 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
-	defer utils.CloseAndLog(run2)
 	run2.SetCutover(func(context.Context) error {
 		t.Error("resume must NOT run the forward cutover again (it re-copied instead of resuming)")
 		return nil
@@ -287,18 +470,12 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 	var reverseCutoverCalled bool
 	run2.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- run2.Run(context.Background()) }()
+	h2 := startRun(t, run2)
 
-	waitForReverseWindow(t, ctl, "rwrk_dst") // already reverse_window from run 1
+	h2.awaitReverseWindow(ctl, "rwrk_dst") // already reverse_window from run 1
 	testutils.RunSQL(t, "CREATE TABLE rwrk_dst."+revertMarkerName+" (id INT)")
 
-	select {
-	case err := <-errCh:
-		require.NoError(t, err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the resumed reverse window to roll back")
-	}
+	h2.awaitDone(30*time.Second, "the resumed reverse window to roll back")
 
 	require.True(t, reverseCutoverCalled, "resumed window must be able to roll back")
 	require.True(t, tableExists(t, ctl, "rwrk_src", "t1"), "source un-retired after rollback")
@@ -327,18 +504,12 @@ func TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence(t *testing.T) 
 
 	run1 := newRunner()
 	run1.SetCutover(func(context.Context) error { return nil })
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	run1Err := make(chan error, 1)
-	go func() { run1Err <- run1.Run(ctx1) }()
+	h1 := startRun(t, run1)
 
-	waitForReverseWindow(t, ctl, "rwamb_dst")
-	waitForTable(t, ctl, "rwamb_src", "t1_old")
-	require.Eventually(t, func() bool {
-		return run1.Progress().CurrentState == status.ReverseWindow
-	}, 30*time.Second, 50*time.Millisecond)
-	cancel1()
-	require.ErrorIs(t, <-run1Err, context.Canceled)
-	utils.CloseAndLog(run1)
+	h1.awaitReverseWindow(ctl, "rwamb_dst")
+	h1.awaitTable(ctl, "rwamb_src", "t1_old")
+	require.ErrorIs(t, h1.kill(), context.Canceled)
+	h1.close()
 
 	testutils.RunSQL(t, "UPDATE rwamb_dst."+checkpointTableName+
 		" SET move_phase='"+phaseReverting+"' WHERE id=1")
@@ -522,16 +693,14 @@ func TestMoveReverseWindowRevertNM(t *testing.T) {
 	shortenReverseWindowPolling(t)
 	f := setupNMReverseFixture(t)
 	runner := f.newRunner(t, 30*time.Second) // long; the revert ends it early
-	defer utils.CloseAndLog(runner)
 
 	var reverseCutoverCalled bool
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- runner.Run(context.Background()) }()
+	h := startRun(t, runner)
 
-	waitForReverseWindow(t, f.ctl, f.checkpointDBName)
+	h.awaitReverseWindow(f.ctl, f.checkpointDBName)
 	// Window-time app writes, placed on the target shard that serves each row.
 	testutils.RunSQL(t, "INSERT INTO "+f.tgtEvenName+".users VALUES (8,'eight')")
 	testutils.RunSQL(t, "INSERT INTO "+f.tgtOddName+".users VALUES (9,'nine')")
@@ -539,12 +708,7 @@ func TestMoveReverseWindowRevertNM(t *testing.T) {
 	testutils.RunSQL(t, "DELETE FROM "+f.tgtOddName+".users WHERE id=1")
 	testutils.RunSQL(t, "CREATE TABLE "+f.checkpointDBName+"."+revertMarkerName+" (id INT)")
 
-	select {
-	case err := <-errCh:
-		require.NoError(t, err)
-	case <-time.After(60 * time.Second):
-		t.Fatal("timed out waiting for the N:M reverse cutover to complete")
-	}
+	h.awaitDone(60*time.Second, "the N:M reverse cutover to complete")
 	require.True(t, reverseCutoverCalled, "reverse cutover func must run on revert")
 
 	// Every source shard un-retired and holding exactly its own rows, with the
@@ -574,32 +738,26 @@ func TestMoveReverseWindowNMResumesAfterKill(t *testing.T) {
 
 	run1 := f.newRunner(t, 30*time.Second)
 	run1.SetCutover(func(context.Context) error { return nil })
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	run1Err := make(chan error, 1)
-	go func() { run1Err <- run1.Run(ctx1) }()
+	h1 := startRun(t, run1)
 
-	waitForReverseWindow(t, f.ctl, f.checkpointDBName)
+	// The checkpoint phase and the renames land during cutover, before the
+	// window loop starts; awaitReverseWindow waits on the runner's own state
+	// too, so the kill below hits the loop itself and surfaces as a clean
+	// context.Canceled.
+	h1.awaitReverseWindow(f.ctl, f.checkpointDBName)
 	// Wait for the source retire to land on BOTH source shards before killing,
 	// so run 2 resumes from the fully-cutover state.
-	waitForTable(t, f.ctl, f.srcEvenName, "users_old")
-	waitForTable(t, f.ctl, f.srcOddName, "users_old")
-	// The checkpoint phase and the renames land during cutover, before the
-	// window loop starts; wait for the runner to report ReverseWindow so the
-	// kill hits the loop itself and surfaces as a clean context.Canceled.
-	require.Eventually(t, func() bool {
-		return run1.Progress().CurrentState == status.ReverseWindow
-	}, 30*time.Second, 50*time.Millisecond, "run 1 must reach the reverse-window state")
-	cancel1()
+	h1.awaitTable(f.ctl, f.srcEvenName, "users_old")
+	h1.awaitTable(f.ctl, f.srcOddName, "users_old")
 	// The only acceptable outcome of the kill is our own cancellation — any
 	// other error means run 1 died on its own and the "resume" below would be
 	// testing recovery from the wrong state.
-	require.ErrorIs(t, <-run1Err, context.Canceled, "run 1 must die from the kill, not an earlier failure")
-	utils.CloseAndLog(run1)
+	require.ErrorIs(t, h1.kill(), context.Canceled, "run 1 must die from the kill, not an earlier failure")
+	h1.close()
 
 	require.True(t, tableExists(t, f.ctl, f.checkpointDBName, checkpointTableName), "checkpoint must survive the kill")
 
 	run2 := f.newRunner(t, 30*time.Second)
-	defer utils.CloseAndLog(run2)
 	run2.SetCutover(func(context.Context) error {
 		t.Error("resume must NOT run the forward cutover again (it re-copied instead of resuming)")
 		return nil
@@ -607,20 +765,14 @@ func TestMoveReverseWindowNMResumesAfterKill(t *testing.T) {
 	var reverseCutoverCalled bool
 	run2.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- run2.Run(context.Background()) }()
+	h2 := startRun(t, run2)
 
-	waitForReverseWindow(t, f.ctl, f.checkpointDBName)
+	h2.awaitReverseWindow(f.ctl, f.checkpointDBName)
 	// A write made while the resumed window is live, then the revert.
 	testutils.RunSQL(t, "INSERT INTO "+f.tgtOddName+".users VALUES (11,'eleven')")
 	testutils.RunSQL(t, "CREATE TABLE "+f.checkpointDBName+"."+revertMarkerName+" (id INT)")
 
-	select {
-	case err := <-errCh:
-		require.NoError(t, err)
-	case <-time.After(60 * time.Second):
-		t.Fatal("timed out waiting for the resumed N:M window to roll back")
-	}
+	h2.awaitDone(60*time.Second, "the resumed N:M window to roll back")
 	require.True(t, reverseCutoverCalled, "resumed window must be able to roll back")
 
 	require.Equal(t, map[int64]string{2: "two", 4: "four"}, f.rows(t, f.srcEvenName))
