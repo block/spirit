@@ -274,10 +274,16 @@ func TestRoundTrip_NumericDefaultConverges(t *testing.T) {
 }
 
 // A bit literal default must be emitted as a bit literal. It reads like a
-// quoted string — b'101' — but quoting it produces DEFAULT 'b\'101\”, which
-// MySQL rejects with "Invalid default value", so a bit column carrying a
-// default could not be applied at all. The column's recorded DefaultKind is
-// what keeps it unquoted.
+// quoted string — b'101' — so a text heuristic wraps and escapes it:
+//
+//	DEFAULT 'b\'101\'
+//
+// with a closing quote after that. MySQL rejects it with "Invalid default
+// value", so a bit column carrying a default could not be applied at all. The
+// column's recorded DefaultKind is what keeps it unquoted.
+//
+// The escaped form sits in a code block on purpose: in prose, gofmt rewrites a
+// pair of single quotes into a typographic closing quote.
 //
 // MySQL also reports a bit literal in its minimal form, independent of the
 // column's width: b'0101' comes back as b'101' and bit(8) DEFAULT b'00000001'

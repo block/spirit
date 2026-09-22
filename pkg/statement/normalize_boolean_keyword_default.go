@@ -15,12 +15,15 @@ func init() { registerNormalizer(booleanKeywordDefaultNormalizer{}) }
 // The parser already folds the BOOLEAN type itself to tinyint(1) (see the
 // package comment in normalize.go), which is why only the default is left here.
 //
-// How MySQL reports the stored value depends on the type, so the fold sets the
-// default's kind as well as its value (see [storedKeywordForm]): bare on a
-// numeric column, quoted on a string column, and as a bit literal on a bit
-// column. Setting the kind is what makes the two sides compare equal —
-// [columnsEqual] treats the literal form as part of column identity, so folding
-// the value alone would still diff on the form.
+// The fold sets the default's kind as well as its value (see
+// [storedKeywordForm]), which is what Spirit emits the default from: a bare
+// number on a numeric column, a quoted string on a string column, a bit literal
+// on a bit column. That is the emitted form, not MySQL's reporting — SHOW
+// CREATE TABLE quotes the value on numeric and string columns alike, and only
+// bit reports a literal of its own. Setting the kind is what makes the two
+// sides compare equal on the types where the form is load-bearing:
+// [columnsEqual] treats the literal form as part of column identity except on a
+// numeric column, so folding the value alone would still diff on the form.
 //
 // A type only folds if it stores the keyword as exactly 1/0. Deliberately left
 // alone, each reading taken from a live server:
@@ -32,10 +35,15 @@ func init() { registerNormalizer(booleanKeywordDefaultNormalizer{}) }
 //     year DEFAULT TRUE stores '2001', not 1.
 //   - binary, which pads to the column width with NULs: binary(4) DEFAULT TRUE
 //     stores '1\0\0\0'. varbinary has nothing to pad and does fold.
-//   - enum and set, where the keyword is read as a member index rather than a
-//     value: enum('0','1') DEFAULT TRUE stores '0', the member at index 1, and
-//     DEFAULT FALSE is rejected outright because no member sits at index 0.
-//     Folding TRUE to 1 would silently mean a different member.
+//   - enum and set, which resolve the keyword differently depending on the
+//     server version, so there is no single value to fold to. Through 8.4 it
+//     is read numerically, as a member index: enum('0','1') DEFAULT TRUE
+//     stores '0' (the member at index 1), enum('a','1') DEFAULT TRUE stores
+//     'a', and DEFAULT FALSE is rejected outright because no member sits at
+//     index 0. From 9.7 it is read as the string '1'/'0' and matched against
+//     the member list, so both of those columns store '1' and DEFAULT FALSE
+//     is accepted. The two readings disagree silently, and folding TRUE to 1
+//     would mean a different member on one of them.
 type booleanKeywordDefaultNormalizer struct{}
 
 func (booleanKeywordDefaultNormalizer) Name() string { return "boolean-keyword-default" }

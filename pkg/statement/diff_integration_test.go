@@ -695,10 +695,11 @@ func TestDiffIntegrationBooleanKeywordDefaultChange(t *testing.T) {
 	requireConverged(t, tt.DB, tt.Name, targetSQL)
 }
 
-// Every type that stores the keyword as exactly 1/0 folds, whether MySQL
-// reports the stored value bare or quoted. Each column here is created from the
-// declaration under test, so the reading is the server's own and the table has
-// nothing left to apply.
+// Every type that stores the keyword as exactly 1/0 folds. MySQL quotes the
+// stored value on all of them except bit, which reports a bit literal, so what
+// the fold records is the form Spirit emits rather than the one the server
+// prints. Each column here is created from the declaration under test, so the
+// reading is the server's own and the table has nothing left to apply.
 func TestDiffIntegrationBooleanKeywordDefaultAcrossFoldingTypes(t *testing.T) {
 	const declaredSQL = "CREATE TABLE diff_bool_keyword_folding_types (" +
 		"unscaled decimal(4,0) NOT NULL DEFAULT TRUE, " +
@@ -731,27 +732,32 @@ func TestDiffIntegrationBooleanKeywordDefaultAcrossFoldingTypes(t *testing.T) {
 // Asserting the leftover diff alongside the reading is deliberate: a reading on
 // its own does not say whether the exclusion it justifies is the right one, and
 // these three are excluded for reasons this layer cannot fix — scale and width
-// padding belong to numeric and string canonicalization, and on enum the
-// keyword names a member index rather than a value.
+// padding belong to numeric and string canonicalization.
+//
+// enum and set are excluded too but are deliberately not fixtures here. They
+// have no single reading to record: through 8.4 the keyword resolves to a
+// member index and from 9.7 to a member value, so enum('0','1') DEFAULT TRUE
+// stores '0' on one and '1' on the other. A fixture would have to assert one
+// of the two and fail on the rest of the supported matrix. That the fold
+// skips them is pinned without a server in
+// TestBooleanKeywordDefaultLeavesOtherTypesAlone.
 func TestDiffIntegrationBooleanKeywordDefaultOnExcludedTypes(t *testing.T) {
 	const declaredSQL = "CREATE TABLE diff_bool_keyword_excluded_types (" +
 		"scaled decimal(4,2) NOT NULL DEFAULT TRUE, " +
 		"yr year NOT NULL DEFAULT TRUE, " +
-		"bin binary(4) NOT NULL DEFAULT TRUE, " +
-		"choice enum('0','1') NOT NULL DEFAULT TRUE)"
+		"bin binary(4) NOT NULL DEFAULT TRUE)"
 	tt := testutils.NewTestTable(t, "diff_bool_keyword_excluded_types", declaredSQL)
 
 	live := showCreateTable(t, tt.DB, tt.Name)
 	require.Contains(t, live, "`scaled` decimal(4,2) NOT NULL DEFAULT '1.00'")
 	require.Contains(t, live, "`yr` year NOT NULL DEFAULT '2001'")
 	require.Contains(t, live, "`bin` binary(4) NOT NULL DEFAULT '1\\0\\0\\0'")
-	require.Contains(t, live, "`choice` enum('0','1') NOT NULL DEFAULT '0'")
 
 	// The table was created from this very declaration, so every statement here
 	// re-stores a value the column already holds.
 	stmts := diffLiveTable(t, tt.DB, tt.Name, declaredSQL)
 	require.Len(t, stmts, 1)
-	for _, col := range []string{"scaled", "yr", "bin", "choice"} {
+	for _, col := range []string{"scaled", "yr", "bin"} {
 		require.Contains(t, stmts[0].Statement, "MODIFY COLUMN `"+col+"`")
 	}
 }

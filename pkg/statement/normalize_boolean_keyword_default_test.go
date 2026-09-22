@@ -10,9 +10,11 @@ import (
 // A TRUE/FALSE keyword default is the same default MySQL stores as 1/0 on every
 // type that stores it as exactly that, so the two spellings must reach Diff
 // already folded together. The declared side below is what an author writes;
-// the live side is the SHOW CREATE TABLE form of the same table. Numeric types
-// report the stored value bare and string types report it quoted, and both
-// spellings have to fold to the form their own type reports.
+// the live side is the SHOW CREATE TABLE form of the same table. MySQL quotes
+// the stored value on numeric and string columns alike, and only bit reports a
+// literal of its own; the fold records the form Spirit emits, which is bare on
+// a numeric column. That difference does not keep the two apart, because
+// quotedness is not part of column identity on a numeric column.
 func TestBooleanKeywordDefaultConverges(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -130,12 +132,12 @@ func TestBooleanKeywordDefaultLeavesOtherTypesAlone(t *testing.T) {
 			want:   "TRUE",
 		},
 		{
-			name:   "enum reads the keyword as a member index, not a value",
+			name:   "enum resolves the keyword to a member index before 9.7 and to a member value from 9.7",
 			column: "`a` enum('0','1') NOT NULL DEFAULT TRUE",
 			want:   "TRUE",
 		},
 		{
-			name:   "set reads the keyword the same way enum does",
+			name:   "set splits across versions the same way enum does",
 			column: "`a` set('0','1') NOT NULL DEFAULT TRUE",
 			want:   "TRUE",
 		},
