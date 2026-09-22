@@ -685,16 +685,6 @@ func (c *DistributedChecker) Run(ctx context.Context) error {
 		}
 	}
 
-	// A cancellation that lands inside the final attempt leaves the loop here
-	// rather than at the pre-attempt check above, which is the only reason
-	// that check is not sufficient on its own. Return the cancellation cause
-	// directly for the same reason that one does: the run stopped because the
-	// caller asked it to, and a caller that has to tell a clean shutdown from
-	// a verification failure can only do so if the shutdown says so plainly.
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
 	// Retries exhausted:
 	// This used to say "checksum failed, this should never happen" but that's not entirely true.
 	// If the user attempts a lossy schema change such as adding a UNIQUE INDEX to non-unique data,

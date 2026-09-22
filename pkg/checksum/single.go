@@ -796,12 +796,18 @@ func (c *SingleChecker) Run(ctx context.Context) error {
 
 	// A cancellation that lands inside the final attempt leaves the loop here
 	// rather than at the pre-attempt check above, which is the only reason
-	// that check is not sufficient on its own. Return the cancellation cause
-	// directly for the same reason that one does: the run stopped because the
-	// caller asked it to, and a caller that has to tell a clean shutdown from
-	// a verification failure can only do so if the shutdown says so plainly.
-	if err := ctx.Err(); err != nil {
-		return err
+	// that check is not sufficient on its own. Report it the way that check
+	// does, so a caller can tell a clean shutdown from a verification failure.
+	//
+	// Only when the attempt failed *because* of the cancellation, though:
+	// checksumCanceled is the same predicate the caller filters with, so
+	// anything it would not accept from this function is not collapsed into a
+	// cancellation here either. A real error, or a cancellation joined to one,
+	// keeps the exhausted-retries error below, and differences found on every
+	// attempt (lastErr == nil) keep theirs. Those outcomes say something about
+	// the data that a cancellation does not.
+	if ctx.Err() != nil && checksumCanceled(lastErr) {
+		return ctx.Err()
 	}
 
 	// Retries exhausted. There are two distinct shapes of failure here:
