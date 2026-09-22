@@ -44,6 +44,13 @@ var (
 	// attempt's error, which is the one worth triaging.
 	ErrAttemptsExhausted = errors.New("checksum errored on every attempt")
 
+	// ErrRepairUnverified is returned by RunContinuous when a pass repaired a
+	// mismatch and was cancelled before it could re-verify the rewritten rows.
+	// A repair is not verification, so the target is unproven and cutover must
+	// not proceed on the strength of that pass. It is distinct from an ordinary
+	// cancellation, which a continuous pass filters to nil.
+	ErrRepairUnverified = errors.New("checksum cancelled with a repair unverified")
+
 	// DefaultYieldTimeout is the default maximum duration for a single checksum
 	// pass before yielding to release long-running REPEATABLE READ transactions.
 	DefaultYieldTimeout = 24 * time.Hour
@@ -409,8 +416,16 @@ func runContinuousSnapshot(ctx context.Context, checker Checker, feeds []change.
 		if err != nil {
 			// A retry can reset DifferencesFound even after a repair was interrupted.
 			// Use the monotonic observation count for this entire Run instead.
-			if ctx.Err() != nil && checksumCanceled(err) && resume.observed.Load() == before {
-				return nil
+			if ctx.Err() != nil && checksumCanceled(err) {
+				if resume.observed.Load() == before {
+					return nil
+				}
+				// A repair is not verification: the rewritten rows were never
+				// observed equal. Cancelling before the pass could re-verify
+				// them leaves the target unproven, so the cancellation is
+				// refused rather than filtered. Say which of the two it is —
+				// a bare "context canceled" reads as the shutdown working.
+				return fmt.Errorf("%w: cancelled after repairing a mismatch and before re-verifying it", ErrRepairUnverified)
 			}
 			return err
 		}

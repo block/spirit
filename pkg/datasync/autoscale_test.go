@@ -173,25 +173,10 @@ func TestSyncAutoscaleInjectedApplierResume(t *testing.T) {
 		// Aurora monitoring so this test runs in the standard MySQL CI matrix.
 		signal := &syncOwnedSignal{}
 		require.NoError(t, r.engageAutoscaling(t.Context(), throttler.AuroraResult{Throttlers: []throttler.Throttler{signal}}, 2, copier.AutoscaleConfig{Enabled: true, StartThreads: 3, MaxThreads: 3, MaxReadThreads: 2}))
-		ctx, cancel := context.WithCancel(t.Context())
-		done := make(chan error, 1)
-		go func() { done <- r.Run(ctx) }()
+		h := startRunner(t, r)
 		func() {
-			defer func() {
-				cancel()
-				select {
-				case err := <-done:
-					require.NoError(t, err)
-				case <-time.After(30 * time.Second):
-					t.Fatal("sync did not stop")
-				}
-				require.NoError(t, r.Close())
-			}()
-			select {
-			case <-r.FirstCleanPass():
-			case <-time.After(30 * time.Second):
-				t.Fatal("no clean pass")
-			}
+			defer h.stop()
+			h.await(r.FirstCleanPass(), 30*time.Second, "FirstCleanPass")
 			require.Eventually(t, func() bool { return a.ActiveWriteWorkers() == 3 }, time.Second, time.Millisecond)
 			require.Equal(t, attempt == 1, r.Progress().Resume)
 			require.Equal(t, r.currentLoadSignal(), r.copier.GetThrottler())
