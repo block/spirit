@@ -184,7 +184,10 @@ func TestCheckpoint(t *testing.T) {
 	require.NoError(t, r.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM cpt1").Scan(&actualRows))
 	require.InEpsilon(t, actualRows, estimatedRows, 0.2, "the row estimate must be in the neighbourhood of the true count")
 	require.Contains(t, r.Status(), "migration status: state=copyRows total-time=")
-	require.Contains(t, r.Status(), fmt.Sprintf("\n  copier    0.00%%  0/%d  chunk-size=0  eta=", estimatedRows))
+	// eta reads TBD, not a duration: no copy rate has been measured yet. The
+	// word itself is the assertion, since the log block renders the ETA's
+	// availability rather than a zero duration.
+	require.Contains(t, r.Status(), fmt.Sprintf("\n  copier    0.00%%  0/%d  chunk-size=0  eta=TBD", estimatedRows))
 	// The rows the change feed and the checkpoint dumper used to log for
 	// themselves, plus the applier pipeline snapshot.
 	// No write worker has started yet, so the applier row is the idle one. Every
