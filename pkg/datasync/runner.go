@@ -1640,16 +1640,29 @@ func (r *Runner) Progress() status.Progress {
 	repl := r.replClient
 	r.progMu.RUnlock()
 
+	tables := status.TablesFromChunker(chunker)
+	// The runner-wide copy is the sum of the per-table rows, so it reconciles
+	// with Tables and keeps its final reading once the copy has finished.
+	// Status derives its copier row the same way, so the API and the log
+	// block report one measure. The copier's own progress is not used for
+	// either: on an auto_increment key that measures keyspace distance, not
+	// rows.
+	copyProgress := status.CopyFromTables(tables)
+
 	var summary string
 	var eta status.ETA
 	switch state { //nolint:exhaustive // sync does not reach the cutover/checksum states
 	case status.CopyRows:
+		// The copy phase is entered only after the pipeline is built, so the
+		// copier is normally present; without one the estimate is not yet
+		// measured, the same reading Status gives.
+		eta = status.ETA{State: status.ETAMeasuring}
 		if cp != nil {
-			summary = fmt.Sprintf("%s copyRows ETA %s", cp.GetProgress(), cp.GetETA())
+			// One copier read, so the ETA in Summary and the ETA field
+			// describe the same instant.
 			eta = cp.GetETAState()
-		} else {
-			summary = "copyRows"
 		}
+		summary = fmt.Sprintf("%s copyRows ETA %s", copyProgress.String(), eta.String())
 	case status.ApplyChangeset:
 		if repl != nil {
 			summary = fmt.Sprintf("continuous sync position=%s pending-changes=%d", repl.Position(), repl.GetDeltaLen())
@@ -1660,14 +1673,13 @@ func (r *Runner) Progress() status.Progress {
 		summary = state.String()
 	}
 
-	tables := status.TablesFromChunker(chunker)
-
 	return status.Progress{
 		CurrentState: state,
 		Summary:      summary,
 		Resume:       r.resuming.Load(),
 		Tables:       tables,
 		ETA:          eta,
+		Copy:         copyProgress,
 		Throttle:     r.throttleStatus(state),
 	}
 }
@@ -1680,6 +1692,7 @@ func (r *Runner) Status() string {
 
 	r.progMu.RLock()
 	cp := r.copier
+	chunker := r.copyChunker
 	repl := r.replClient
 	appl := r.applier
 	checker := r.locklessChecker
@@ -1693,16 +1706,27 @@ func (r *Runner) Status() string {
 	switch state { //nolint:exhaustive // sync does not reach the cutover/checksum states
 	case status.CopyRows:
 		b := status.NewBlock("sync status: state=%s total-time=%s copier-time=%s", state.String(), elapsed, r.status.Elapsed().Round(time.Second))
-		// The copy pipeline is built asynchronously, so a status tick can land
-		// before there is a copier to report on.
-		if cp != nil {
-			progress := cp.CopyProgress()
+		// The chunker and the copier are published separately while the
+		// pipeline is built, and the copy phase is entered only once both
+		// exist, so these guards are defensive. The figures are settled rows
+		// from the chunker, the same measure Progress reports rather than the
+		// copier's own keyspace position; chunk-size and the ETA come from
+		// the copier and read as nothing claimed and nothing measured without
+		// one, as Progress does.
+		if chunker != nil {
+			progress := status.CopyFromTables(status.TablesFromChunker(chunker))
+			var chunkSize uint64
+			eta := status.ETA{State: status.ETAMeasuring}
+			if cp != nil {
+				chunkSize = cp.ChunkSize()
+				eta = cp.GetETAState()
+			}
 			b.Row("copier", "%6.2f%%  %d/%d  chunk-size=%d  eta=%s  throttled=%t",
 				progress.Fraction()*100,
 				progress.RowsCopied,
 				progress.RowsTotal,
-				cp.ChunkSize(),
-				cp.GetETA(),
+				chunkSize,
+				eta.String(),
 				r.TargetUnderLoad(),
 			)
 		}
