@@ -860,13 +860,24 @@ func TestDiffIntegrationPrimaryKeyImplicitNotNull(t *testing.T) {
 		require.Nil(t, diffLiveTable(t, tt.DB, tt.Name, authored))
 	})
 
+	// The expression default (NULL) is not a NULL declaration: MySQL accepts
+	// it on a key column and stores the column NOT NULL.
+	t.Run("ExpressionDefaultNull", func(t *testing.T) {
+		const authored = "CREATE TABLE diff_pk_expr_default_null (a int DEFAULT (NULL), b int, PRIMARY KEY (a))"
+		tt := testutils.NewTestTable(t, "diff_pk_expr_default_null", authored)
+		require.Contains(t, showCreateTable(t, tt.DB, tt.Name), "`a` int NOT NULL DEFAULT (NULL)")
+		require.Nil(t, diffLiveTable(t, tt.DB, tt.Name, authored))
+	})
+
 	// An explicit NULL or DEFAULT NULL on a key column is not implicit: MySQL
-	// refuses to create the table, and DeclarativeToImperative rejects it as
-	// a desired schema rather than planning toward it.
+	// refuses to create the table, even when NOT NULL follows the NULL, and
+	// DeclarativeToImperative rejects it as a desired schema rather than
+	// planning toward it.
 	for name, desired := range map[string]string{
 		"ExplicitNullRejected":            "CREATE TABLE diff_pk_explicit_null (a int NULL, b int, PRIMARY KEY (a))",
 		"DefaultNullRejected":             "CREATE TABLE diff_pk_explicit_null (a int DEFAULT NULL, b int, PRIMARY KEY (a))",
 		"ExplicitNullInCompositeRejected": "CREATE TABLE diff_pk_explicit_null (a int, b int NULL, PRIMARY KEY (a, b))",
+		"ExplicitNullThenNotNullRejected": "CREATE TABLE diff_pk_explicit_null (a int NULL NOT NULL, b int, PRIMARY KEY (a))",
 	} {
 		t.Run(name, func(t *testing.T) {
 			testutils.RunSQL(t, "DROP TABLE IF EXISTS diff_pk_explicit_null")
@@ -877,7 +888,7 @@ func TestDiffIntegrationPrimaryKeyImplicitNotNull(t *testing.T) {
 			require.ErrorContains(t, err, "Error 1171")
 
 			_, err = DeclarativeToImperative(nil, []table.TableSchema{{Name: "diff_pk_explicit_null", Schema: desired}}, nil)
-			require.ErrorContains(t, err, "error 1171")
+			require.ErrorContains(t, err, "is part of the PRIMARY KEY but declares NULL")
 		})
 	}
 }

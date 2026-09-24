@@ -343,7 +343,7 @@ Two layers of canonicalization apply:
    | Rule (`normalize_*.go`) | Canonicalization |
    |---|---|
    | `primaryKeyNormalizer` | inline `id INT PRIMARY KEY` → table-level `PRIMARY KEY` index |
-   | `primaryKeyNotNullNormalizer` | marks every primary key column `NOT NULL`, as MySQL stores it: `a INT, PRIMARY KEY (a)` → `a int NOT NULL`. The promotion is implicit only: a key column that explicitly declares `NULL` or `DEFAULT NULL`, which MySQL refuses to create (error 1171), stays nullable, and `DeclarativeToImperative` rejects a desired schema in that state |
+   | `primaryKeyNotNullNormalizer` | marks every primary key column `NOT NULL`, as MySQL stores it: `a INT, PRIMARY KEY (a)` → `a int NOT NULL`. The promotion is implicit only: a key column that explicitly declares `NULL` or `DEFAULT NULL`, which MySQL refuses to create (error 1171), stays nullable, and `Diff` and `DeclarativeToImperative` reject a target schema in that state |
    | `indexNormalizer` | inline `c INT UNIQUE` → table-level `UNIQUE KEY`; assigns MySQL's default names to unnamed indexes |
    | `columnCheckNormalizer` | hoists a column-level `CHECK` into a table-level constraint |
    | `expressionParenNormalizer` | rewrites `CHECK` and generated-column expressions into a canonical parenthesization, keeping only the parentheses the expression's own precedence does not already imply: MySQL stores them fully parenthesized and the parser preserves input parens verbatim, so `CHECK ((a=1) OR ((b=2) AND (c=3)))` and `CHECK (a=1 OR b=2 AND c=3)` both canonicalize to the latter |

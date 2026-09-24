@@ -28,8 +28,14 @@ func TestPrimaryKeyNotNull(t *testing.T) {
 		{"ExplicitNullBeforeInlineKey", "CREATE TABLE t (a INT NULL PRIMARY KEY, b INT)", []bool{true, true}},
 		{"ExplicitNullAfterInlineKey", "CREATE TABLE t (a INT PRIMARY KEY NULL, b INT)", []bool{true, true}},
 		{"ExplicitNullInComposite", "CREATE TABLE t (a INT, b INT NULL, PRIMARY KEY (a, b))", []bool{false, true}},
-		// A non-NULL default is not a NULL declaration.
+		// MySQL rejects a NULL attribute on a key column even when NOT NULL
+		// follows it, so the last attribute does not win here.
+		{"ExplicitNullThenNotNull", "CREATE TABLE t (a INT NULL NOT NULL, b INT, PRIMARY KEY (a))", []bool{true, true}},
+		// A non-NULL default is not a NULL declaration, and neither is the
+		// expression default (NULL), which MySQL stores on a NOT NULL key column.
 		{"NonNullDefault", "CREATE TABLE t (a INT DEFAULT 0, b INT, PRIMARY KEY (a))", []bool{false, true}},
+		{"ExpressionDefaultNull", "CREATE TABLE t (a INT DEFAULT (NULL), b INT, PRIMARY KEY (a))", []bool{false, true}},
+		{"NotNullExpressionDefaultNull", "CREATE TABLE t (a INT NOT NULL DEFAULT (NULL), b INT, PRIMARY KEY (a))", []bool{false, true}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,6 +68,11 @@ func TestPrimaryKeyNotNullConverges(t *testing.T) {
 			live:     "CREATE TABLE t (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b))",
 			authored: "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))",
 		},
+		{
+			name:     "ExpressionDefaultNull",
+			live:     "CREATE TABLE t (a int NOT NULL DEFAULT (NULL), b int DEFAULT NULL, PRIMARY KEY (a))",
+			authored: "CREATE TABLE t (a INT DEFAULT (NULL), b INT, PRIMARY KEY (a))",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -73,6 +84,32 @@ func TestPrimaryKeyNotNullConverges(t *testing.T) {
 			stmts, err := live.Diff(authored, nil)
 			require.NoError(t, err)
 			assert.Nil(t, stmts)
+		})
+	}
+}
+
+// TestPrimaryKeyNotNullDiffRejectsDeclaredNull: Diff refuses a target whose
+// primary key column declares NULL, a table MySQL refuses to create, rather
+// than emitting a MODIFY ... NULL that MySQL rejects too. The source is not
+// checked, since it is normally read from a live table.
+func TestPrimaryKeyNotNullDiffRejectsDeclaredNull(t *testing.T) {
+	live, err := ParseCreateTable("CREATE TABLE t (a int NOT NULL, b int DEFAULT NULL, PRIMARY KEY (a))")
+	require.NoError(t, err)
+	for _, target := range []string{
+		"CREATE TABLE t (a INT NULL PRIMARY KEY, b INT)",
+		"CREATE TABLE t (a INT DEFAULT NULL, b INT, PRIMARY KEY (a))",
+		"CREATE TABLE t (a INT NULL NOT NULL, b INT, PRIMARY KEY (a))",
+	} {
+		t.Run(target, func(t *testing.T) {
+			desired, err := ParseCreateTable(target)
+			require.NoError(t, err)
+			stmts, err := live.Diff(desired, nil)
+			require.ErrorContains(t, err, `column "a" is part of the PRIMARY KEY but declares NULL`)
+			assert.Nil(t, stmts)
+
+			// Reversed, the invalid table is the source and is not checked.
+			_, err = desired.Diff(live, nil)
+			require.NoError(t, err)
 		})
 	}
 }

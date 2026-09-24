@@ -1,6 +1,7 @@
 package statement
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/block/spirit/pkg/parser/ast"
@@ -19,7 +20,7 @@ func init() { registerNormalizer(primaryKeyNotNullNormalizer{}) }
 // The promotion is implicit only. A key column that explicitly declares NULL
 // or DEFAULT NULL is one MySQL refuses to create (error 1171), so it is left
 // nullable, whichever way the key is spelled, rather than silently accepted.
-// DeclarativeToImperative rejects a desired schema in that state.
+// Diff and DeclarativeToImperative reject a target schema in that state.
 //
 // It reads both the table-level PRIMARY KEY index and the inline PrimaryKey
 // flag, so it is order-independent with respect to primaryKeyNormalizer.
@@ -56,9 +57,14 @@ func primaryKeyColumnSet(ct *CreateTable) map[string]bool {
 }
 
 // declaresNull reports whether the column definition explicitly permits NULL,
-// with a NULL attribute or a DEFAULT NULL. It reads the AST because Nullable
-// cannot tell an explicit NULL apart from an omitted NOT NULL. A column built
-// without a Raw definition declares nothing.
+// with a NULL attribute or a literal DEFAULT NULL. It reads the AST because
+// Nullable cannot tell an explicit NULL apart from an omitted NOT NULL. A
+// column built without a Raw definition declares nothing.
+//
+// Any NULL attribute counts, even one followed by NOT NULL: MySQL rejects
+// `a INT NULL NOT NULL` in a primary key rather than letting the last attribute
+// win. An expression default, DEFAULT (NULL), does not count: MySQL accepts it
+// on a key column and stores the column NOT NULL.
 func (c *Column) declaresNull() bool {
 	if c.Raw == nil {
 		return false
@@ -68,10 +74,26 @@ func (c *Column) declaresNull() bool {
 		case ast.ColumnOptionNull:
 			return true
 		case ast.ColumnOptionDefaultValue:
-			if v, ok := unwrapParenExpr(opt.Expr).(*ast.ValueExpr); ok && v.Kind() == ast.KindNull {
+			if v, ok := opt.Expr.(*ast.ValueExpr); ok && v.Kind() == ast.KindNull {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// checkPrimaryKeyNullability rejects a table whose primary key column
+// explicitly declares NULL or DEFAULT NULL, which MySQL refuses to create.
+// Such a column is left nullable by primaryKeyNotNullNormalizer, so a diff
+// toward it would emit a MODIFY ... NULL that MySQL rejects too; failing
+// early reports it at plan time instead.
+func checkPrimaryKeyNullability(ct *CreateTable) error {
+	pkColumns := primaryKeyColumnSet(ct)
+	for i := range ct.Columns {
+		col := &ct.Columns[i]
+		if pkColumns[strings.ToLower(col.Name)] && col.declaresNull() {
+			return fmt.Errorf("column %q is part of the PRIMARY KEY but declares NULL, which MySQL rejects; remove NULL or DEFAULT NULL from its definition, or use a UNIQUE key if it must allow NULL", col.Name)
+		}
+	}
+	return nil
 }

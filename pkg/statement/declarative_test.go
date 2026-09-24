@@ -180,9 +180,9 @@ func TestDeclarativeToImperativeWithOptions(t *testing.T) {
 
 // TestDeclarativeToImperative_PrimaryKeyDeclaresNull: a desired primary key
 // column that explicitly declares NULL or DEFAULT NULL is a table MySQL refuses
-// to create (error 1171), so it is rejected at plan time for new and existing
-// tables alike. A key column that merely omits NOT NULL is implicitly NOT NULL
-// and is accepted.
+// to create, so it is rejected at plan time for new and existing tables alike.
+// A key column that merely omits NOT NULL is implicitly NOT NULL and is
+// accepted, as is the expression default (NULL).
 func TestDeclarativeToImperative_PrimaryKeyDeclaresNull(t *testing.T) {
 	const current = "CREATE TABLE t1 (a int NOT NULL, b int DEFAULT NULL, PRIMARY KEY (a))"
 	tests := []struct {
@@ -195,6 +195,9 @@ func TestDeclarativeToImperative_PrimaryKeyDeclaresNull(t *testing.T) {
 		{"DefaultNull", "CREATE TABLE t1 (a INT DEFAULT NULL, b INT, PRIMARY KEY (a))", true},
 		{"ExplicitNullInline", "CREATE TABLE t1 (a INT NULL PRIMARY KEY, b INT)", true},
 		{"ExplicitNullInComposite", "CREATE TABLE t1 (a INT, b INT NULL, PRIMARY KEY (a, b))", true},
+		{"ExplicitNullThenNotNull", "CREATE TABLE t1 (a INT NULL NOT NULL, b INT, PRIMARY KEY (a))", true},
+		{"NotNullDefaultNull", "CREATE TABLE t1 (a INT NOT NULL DEFAULT NULL, b INT, PRIMARY KEY (a))", true},
+		{"ExpressionDefaultNull", "CREATE TABLE t1 (a INT DEFAULT (NULL), b INT, PRIMARY KEY (a))", false},
 		// Moving the key off a column frees it to declare NULL.
 		{"FormerKeyColumnDeclaresNull", "CREATE TABLE t1 (a INT NULL, b INT NOT NULL, PRIMARY KEY (b))", false},
 	}
@@ -212,9 +215,7 @@ func TestDeclarativeToImperative_PrimaryKeyDeclaresNull(t *testing.T) {
 					require.NoError(t, err)
 					return
 				}
-				require.Error(t, err)
-				require.ErrorContains(t, err, `invalid desired schema for table "t1"`)
-				require.ErrorContains(t, err, "error 1171")
+				require.ErrorContains(t, err, "is part of the PRIMARY KEY but declares NULL")
 			})
 		}
 	}

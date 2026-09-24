@@ -99,6 +99,8 @@ func NewDiffOptions() *DiffOptions {
 // Most changes produce a single statement, but some (e.g. changing partition type)
 // require multiple sequential statements.
 // Returns nil if the tables are identical.
+// Returns an error if target has a primary key column that declares NULL, a
+// table MySQL refuses to create.
 // If opts is nil, NewDiffOptions() defaults are used.
 func (ct *CreateTable) Diff(target *CreateTable, opts *DiffOptions) ([]*AbstractStatement, error) {
 	if opts == nil {
@@ -106,6 +108,9 @@ func (ct *CreateTable) Diff(target *CreateTable, opts *DiffOptions) ([]*Abstract
 	}
 	if ct.TableName != target.TableName {
 		return nil, fmt.Errorf("cannot diff tables with different names: %s vs %s", ct.TableName, target.TableName)
+	}
+	if err := checkPrimaryKeyNullability(target); err != nil {
+		return nil, fmt.Errorf("invalid target table %q: %w", target.TableName, err)
 	}
 
 	var alterClauses []string
