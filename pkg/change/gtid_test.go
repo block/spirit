@@ -1061,7 +1061,7 @@ func TestGTIDProcessQueryEventXAGuard(t *testing.T) {
 		"ROLLBACK TO `sp1`",
 		"RELEASE SAVEPOINT `sp1`",
 		"CREATE TABLE xa_lookalike (a INT NOT NULL PRIMARY KEY)",
-		"DROP TABLE `xa`", // a table named xa is not an XA statement: the guard needs the keyword plus a space
+		"DROP TABLE `xa`", // a table named xa is not an XA statement
 	} {
 		require.NoError(t, c.processQueryEvent(queryEvent(q)), "statement %q must not be refused", q)
 	}

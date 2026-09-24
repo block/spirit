@@ -774,6 +774,13 @@ func (c *binlogClient) readStream(ctx context.Context) {
 				return
 			}
 		case *replication.QueryEvent:
+			info, err := parseQueryEvent(string(event.Schema), string(event.Query))
+			if err != nil {
+				// An unparseable statement may use a SQL mode or syntax newer
+				// than the parser. Do not log the query: it may contain data.
+				c.logger.Error("Skipping query that was unable to parse", "file", currentLogName, "pos", ev.Header.LogPos)
+				continue
+			}
 			// Any XA statement fails the stream: spirit does not support
 			// XA workloads. An XA transaction's row events are binlogged
 			// at XA PREPARE time, before its outcome is known — applying
@@ -783,26 +790,14 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			// guarantees none of them are ever buffered, let alone flushed.
 			// See the matching guard in the GTID client's processQueryEvent
 			// for the full rationale and group shape.
-			if isXAStatement(strings.TrimSpace(string(event.Query))) {
+			if info.xa {
 				c.logger.Error("fatal error processing binlog query event", "error", errXAUnsupported)
 				c.fatalError(FatalReasonStreamError)
 				return
 			}
 			// Query event, check if it is a DDL statement,
 			// in which case we need to notify the caller.
-			ddlTables, _, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
-			if err != nil {
-				// The parser does not understand all syntax — the
-				// remaining classes are mode-dependent SQL (ANSI_QUOTES
-				// quoting) and syntax newer than the grammar.
-				// This behavior is copied from canal:
-				// https://github.com/go-mysql-org/go-mysql/blob/ee9447d96b48783abb05ab76a12501e5f1161e47/canal/sync.go#L144C1-L150C1
-				// We can't print the statement because it could contain user-data.
-				// We instead rely on file + pos being useful.
-				c.logger.Error("Skipping query that was unable to parse", "file", currentLogName, "pos", ev.Header.LogPos)
-				continue
-			}
-			for _, ddlTable := range ddlTables {
+			for _, ddlTable := range info.tables {
 				c.processDDLNotification(ddlTable.schema, ddlTable.table)
 			}
 		case *replication.TransactionPayloadEvent:
@@ -1067,23 +1062,23 @@ func (c *binlogClient) processTransactionPayload(e *replication.TransactionPaylo
 				return err
 			}
 		case *replication.QueryEvent:
-			// XA statements fail the payload before any of its row events
-			// are buffered — see the guard in readStream's QueryEvent case.
-			// A compressed XA prepare group opens with an inner "XA START"
-			// QueryEvent, so this fires ahead of the group's RowsEvents.
-			if isXAStatement(strings.TrimSpace(string(innerEvent.Query))) {
-				return errXAUnsupported
-			}
-			// Usually the transaction's BEGIN, which parses cleanly and
-			// yields no DDL tables. Unparseable statements are skipped the
-			// same way readStream skips them.
-			ddlTables, _, err := extractTablesFromDDLStmts(string(innerEvent.Schema), string(innerEvent.Query))
+			info, err := parseQueryEvent(string(innerEvent.Schema), string(innerEvent.Query))
 			if err != nil {
 				c.logger.Error("Skipping query inside transaction payload that was unable to parse",
 					"file", payloadPos.Name, "pos", payloadPos.Pos)
 				continue
 			}
-			for _, ddlTable := range ddlTables {
+			// XA statements fail the payload before any of its row events
+			// are buffered — see the guard in readStream's QueryEvent case.
+			// A compressed XA prepare group opens with an inner "XA START"
+			// QueryEvent, so this fires ahead of the group's RowsEvents.
+			if info.xa {
+				return errXAUnsupported
+			}
+			// Usually the transaction's BEGIN, which parses cleanly and
+			// yields no DDL tables. Unparseable statements are skipped the
+			// same way readStream skips them.
+			for _, ddlTable := range info.tables {
 				c.processDDLNotification(ddlTable.schema, ddlTable.table)
 			}
 		case *replication.TableMapEvent, *replication.XIDEvent:

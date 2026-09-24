@@ -7,6 +7,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestParseQueryEventClassification(t *testing.T) {
+	tests := []struct {
+		query string
+		want  queryEventInfo
+	}{
+		{"  xa begin 'x'  ", queryEventInfo{xa: true}},
+		{"XA COMMIT X'78' ONE PHASE", queryEventInfo{xa: true}},
+		{"XA ROLLBACK X'78'", queryEventInfo{xa: true}},
+		{"BEGIN", queryEventInfo{opensTransaction: true}},
+		{"START TRANSACTION", queryEventInfo{opensTransaction: true}},
+		{"SAVEPOINT `s`", queryEventInfo{keepsTransactionOpen: true}},
+		{"ROLLBACK TO `s`", queryEventInfo{keepsTransactionOpen: true}},
+		{"RELEASE SAVEPOINT `s`", queryEventInfo{keepsTransactionOpen: true}},
+		{"COMMIT", queryEventInfo{endsTransaction: true}},
+		{"ROLLBACK", queryEventInfo{endsTransaction: true}},
+		{"CREATE TABLE xa_lookalike (id INT PRIMARY KEY)", queryEventInfo{tables: []schemaTable{{"test", "xa_lookalike"}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			got, err := parseQueryEvent("test", tt.query)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestEncodeSchemaTable(t *testing.T) {
 	tests := []struct {
 		name     string

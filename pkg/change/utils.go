@@ -42,6 +42,74 @@ type schemaTable struct {
 	table  string
 }
 
+// queryEventInfo describes the statements in one binlog QueryEvent.
+type queryEventInfo struct {
+	tables               []schemaTable
+	opensTransaction     bool
+	keepsTransactionOpen bool
+	endsTransaction      bool
+	xa                   bool
+}
+
+// parseQueryEvent classifies transaction control and extracts DDL table names
+// from the same parse, so every consumer sees the same statement semantics.
+func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err error) {
+	p := parser.New()
+	stmts, _, err := p.Parse(statements, "", "")
+	if err != nil {
+		return queryEventInfo{}, err
+	}
+	for _, stmt := range stmts {
+		switch t := stmt.(type) {
+		case *ast.XAStmt:
+			info.xa = true
+		case *ast.BeginStmt:
+			info.opensTransaction = true
+		case *ast.SavepointStmt, *ast.ReleaseSavepointStmt:
+			info.keepsTransactionOpen = true
+		case *ast.RollbackStmt:
+			if t.SavepointName != "" {
+				info.keepsTransactionOpen = true
+			} else {
+				info.endsTransaction = true
+			}
+		case *ast.CommitStmt:
+			info.endsTransaction = true
+		case *ast.RenameTableStmt:
+			for _, tableInfo := range t.TableToTables {
+				schema, table := getTableIdentity(defaultSchema, tableInfo.OldTable)
+				info.tables = append(info.tables, schemaTable{schema, table})
+			}
+		case *ast.DropTableStmt:
+			for _, table := range t.Tables {
+				schema, tableName := getTableIdentity(defaultSchema, table)
+				info.tables = append(info.tables, schemaTable{schema, tableName})
+			}
+		case *ast.AlterTableStmt, *ast.CreateTableStmt, *ast.TruncateTableStmt,
+			*ast.CreateIndexStmt, *ast.DropIndexStmt:
+			var tableNode *ast.TableName
+			switch n := t.(type) {
+			case *ast.AlterTableStmt:
+				tableNode = n.Table
+			case *ast.CreateTableStmt:
+				tableNode = n.Table
+				if n.StartTransaction {
+					info.opensTransaction = true
+				}
+			case *ast.TruncateTableStmt:
+				tableNode = n.Table
+			case *ast.CreateIndexStmt:
+				tableNode = n.Table
+			case *ast.DropIndexStmt:
+				tableNode = n.Table
+			}
+			schema, table := getTableIdentity(defaultSchema, tableNode)
+			info.tables = append(info.tables, schemaTable{schema, table})
+		}
+	}
+	return info, nil
+}
+
 // extractTablesFromDDLStmts extracts table names from DDL statements.
 // The logic is based on canal: https://github.com/go-mysql-org/go-mysql/blob/34b6b0998dde44e51dff0bbcc1ac88339f57f830/canal/sync.go#L195-L245
 //
@@ -53,48 +121,11 @@ type schemaTable struct {
 // promotion must wait for the group's real terminator (see
 // gtidClient.processQueryEvent).
 func extractTablesFromDDLStmts(defaultSchema string, statements string) (tables []schemaTable, opensTransaction bool, err error) {
-	p := parser.New()
-	stmts, _, err := p.Parse(statements, "", "")
+	info, err := parseQueryEvent(defaultSchema, statements)
 	if err != nil {
 		return nil, false, err
 	}
-	for _, stmt := range stmts {
-		switch t := stmt.(type) {
-		case *ast.BeginStmt:
-			opensTransaction = true
-		case *ast.RenameTableStmt:
-			for _, tableInfo := range t.TableToTables {
-				schema, table := getTableIdentity(defaultSchema, tableInfo.OldTable)
-				tables = append(tables, schemaTable{schema, table})
-			}
-		case *ast.DropTableStmt:
-			for _, table := range t.Tables {
-				schema, tableName := getTableIdentity(defaultSchema, table)
-				tables = append(tables, schemaTable{schema, tableName})
-			}
-		case *ast.AlterTableStmt, *ast.CreateTableStmt, *ast.TruncateTableStmt,
-			*ast.CreateIndexStmt, *ast.DropIndexStmt:
-			var tableNode *ast.TableName
-			switch n := t.(type) {
-			case *ast.AlterTableStmt:
-				tableNode = n.Table
-			case *ast.CreateTableStmt:
-				tableNode = n.Table
-				if n.StartTransaction {
-					opensTransaction = true
-				}
-			case *ast.TruncateTableStmt:
-				tableNode = n.Table
-			case *ast.CreateIndexStmt:
-				tableNode = n.Table
-			case *ast.DropIndexStmt:
-				tableNode = n.Table
-			}
-			schema, table := getTableIdentity(defaultSchema, tableNode)
-			tables = append(tables, schemaTable{schema, table})
-		}
-	}
-	return tables, opensTransaction, nil
+	return info.tables, info.opensTransaction, nil
 }
 
 // toSet converts a string slice to a set (map[string]struct{}) for O(1) lookups.
@@ -203,16 +234,6 @@ func checkImmutableColumn(tbl *table.TableInfo, ordinal int, beforeRow, afterRow
 // change clients treat this as a fatal stream error, aborting before
 // any of the XA transaction's row events are buffered.
 var errXAUnsupported = errors.New("XA transactions detected in the binlog stream: spirit does not support XA workloads")
-
-// isXAStatement reports whether q (a binlogged statement, whitespace
-// already trimmed) begins with the XA keyword. MySQL normally writes
-// "XA START", "XA END", "XA COMMIT", and "XA ROLLBACK" as QueryEvents;
-// two-phase "XA PREPARE" is logged as an XA_PREPARE_LOG_EVENT. Matching
-// any XA statement also refuses new QueryEvent forms safely. The server
-// rewrites XA BEGIN 'x' as "XA START" with a hex-encoded xid.
-func isXAStatement(q string) bool {
-	return hasPrefixFold(q, "XA ")
-}
 
 // isMinimalRowImage returns true if the RowsEvent contains a minimal row image,
 // i.e. some columns were skipped. This happens when binlog_row_image=MINIMAL or NOBLOB.
