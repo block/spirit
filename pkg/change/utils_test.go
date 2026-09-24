@@ -582,8 +582,40 @@ func TestLogPosTracker(t *testing.T) {
 		// carry LogPos=0.
 		var tr logPosTracker
 		require.False(t, tr.observe(mkEvent(1000)))
-		require.False(t, tr.observe(mkEvent(0)))
+		fde := &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.FORMAT_DESCRIPTION_EVENT, LogPos: 0},
+			Event:  &replication.FormatDescriptionEvent{},
+		}
+		require.False(t, tr.observe(fde))
 		require.Equal(t, uint32(1000), tr.last, "a zero position must not rewind the tracker")
+	})
+
+	t.Run("a row-bearing event at position zero is a wrap", func(t *testing.T) {
+		// The one wrapped end offset that collides with "no position": an
+		// event ending exactly on 2^32 reports zero. Reading it as
+		// positionless would let the replay guard skip its rows and, if the
+		// file rotated next, reset the tracker with the wrap unreported.
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(4294967000)))
+		require.True(t, tr.observe(mkEvent(0)))
+
+		var tr2 logPosTracker
+		require.False(t, tr2.observe(mkEvent(4294967000)))
+		payload := &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.TRANSACTION_PAYLOAD_EVENT, LogPos: 0},
+			Event:  &replication.TransactionPayloadEvent{},
+		}
+		require.True(t, tr2.observe(payload))
+	})
+
+	t.Run("a row-bearing event at position zero before any real position is not a wrap", func(t *testing.T) {
+		// Nothing has been seen in this file yet, so zero cannot be a step
+		// backwards from anything.
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(0)))
+		require.False(t, tr.observe(mkEvent(1000)))
+		tr.rotated()
+		require.False(t, tr.observe(mkEvent(0)))
 	})
 
 	t.Run("artificial events are ignored", func(t *testing.T) {

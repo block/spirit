@@ -310,11 +310,6 @@ func (t *logPosTracker) rotated() {
 // observe records ev's end position and reports whether it moved backwards
 // within the current file, i.e. whether LogPos wrapped.
 func (t *logPosTracker) observe(ev *replication.BinlogEvent) bool {
-	if ev.Header.LogPos == 0 {
-		// Housekeeping events (FormatDescriptionEvent and the artificial
-		// rotate that opens a dump) carry no position.
-		return false
-	}
 	if ev.Header.Flags&replication.LOG_EVENT_ARTIFICIAL_F != 0 {
 		return false
 	}
@@ -322,6 +317,27 @@ func (t *logPosTracker) observe(ev *replication.BinlogEvent) bool {
 		// Belt and braces: heartbeats are artificial, but the flag is set
 		// by the server and we would rather not depend on it for the one
 		// event type whose LogPos routinely names another file.
+		return false
+	}
+	if ev.Header.LogPos == 0 {
+		// Usually a positionless housekeeping event (FormatDescriptionEvent
+		// and friends), which readStream also excludes from position
+		// tracking. But an event whose end offset lands exactly on 2^32
+		// reports zero too — the wrap, landing on the one value that is
+		// indistinguishable from "no position". Reading every zero as
+		// positionless would let that event be skipped as a replay and, if
+		// the file rotated before the next real position arrived, would
+		// reset the tracker without the wrap ever being reported.
+		//
+		// Only events that carry row changes are worth the ambiguity: a
+		// dropped housekeeping event costs nothing, while a dropped
+		// RowsEvent is the data loss this guard exists to prevent. t.last
+		// must already be nonzero, i.e. a real position has been seen in
+		// this file, for zero to be a step backwards at all.
+		switch ev.Event.(type) {
+		case *replication.RowsEvent, *replication.TransactionPayloadEvent:
+			return t.last > 0
+		}
 		return false
 	}
 	if ev.Header.LogPos < t.last {
