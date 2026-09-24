@@ -1818,3 +1818,63 @@ func TestGTIDProcessDDLNotificationMoveStyle(t *testing.T) {
 	c.processDDLNotification(dbName, "orders")
 	require.True(t, cancelled, "should cancel on DDL matching the subscribed table")
 }
+
+// TestGTIDProcessRowsEventUnknownSubtype is the GTID client's twin of
+// TestBinlogProcessRowsEventUnknownSubtype: a rows-event subtype
+// parseEventType does not recognize must fail the stream rather than have
+// its rows dropped with only an error log. go-mysql parses
+// PARTIAL_UPDATE_ROWS_EVENT (emitted once binlog_row_value_options=
+// PARTIAL_JSON is set, which can happen after preflight has read the
+// global) into a plain *replication.RowsEvent, so it reaches
+// processRowsEvent carrying real row changes.
+func TestGTIDProcessRowsEventUnknownSubtype(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS gtidunknownsubt1, gtidunknownsubt2")
+	testutils.RunSQL(t, "CREATE TABLE gtidunknownsubt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE gtidunknownsubt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "gtidunknownsubt1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "gtidunknownsubt2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	defer client.Close()
+
+	mkEvent := func(et replication.EventType, tbl string, pk int32) (*replication.BinlogEvent, *replication.RowsEvent) {
+		rows := &replication.RowsEvent{
+			Table: &replication.TableMapEvent{Schema: []byte("test"), Table: []byte(tbl)},
+			Rows:  [][]any{{pk, int32(0), int32(0)}},
+		}
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: et, LogPos: 1000},
+			Event:  rows,
+		}, rows
+	}
+
+	// Sanity: a recognized subtype flows through and buffers the row.
+	ev, rows := mkEvent(replication.WRITE_ROWS_EVENTv2, "gtidunknownsubt1", 1)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, client.GetDeltaLen())
+
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, "gtidunknownsubt1", 2)
+	err = client.processRowsEvent(ev, rows)
+	require.ErrorIs(t, err, errUnsupportedRowsEvent)
+	require.ErrorContains(t, err, "PartialUpdateRowsEvent")
+	require.ErrorContains(t, err, fmt.Sprintf("0x%02x", uint8(replication.PARTIAL_UPDATE_ROWS_EVENT)))
+	require.ErrorContains(t, err, "gtidunknownsubt1")
+	require.Equal(t, 1, client.GetDeltaLen(), "the unsupported event must not buffer rows")
+
+	// Unsubscribed tables stay ignored regardless of subtype.
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, "not_subscribed", 3)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, client.GetDeltaLen())
+}

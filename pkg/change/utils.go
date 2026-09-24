@@ -244,11 +244,91 @@ func checkImmutableColumn(tbl *table.TableInfo, ordinal int, beforeRow, afterRow
 // any of the XA transaction's row events are buffered.
 var errXAUnsupported = errors.New("XA transactions detected in the binlog stream: spirit does not support XA workloads")
 
+// errLogPosWrapped is the fatal error produced when a binlog file's
+// 4-byte LogPos wraps past 4GiB. A binlog file only rotates on a
+// transaction boundary, so one transaction writing more than 4GiB of row
+// images past the max_binlog_size point grows the file beyond what a
+// uint32 end position can address, and positions restart near zero.
+// MySQL documents the consequence under max_binlog_cache_size: with
+// gtid_mode off, "the maximum recommended value is 4GB, because in that
+// case MySQL cannot work with binary log positions greater than 4GB".
+//
+// Past the wrap, file+offset no longer identifies a unique point in the
+// stream: setBufferedPos's monotonicity freezes bufferedPos just under
+// the wrap, every later event compares at or below it, and
+// shouldSkipReplayedEvent classifies live row events as post-reconnect
+// replays and discards them. The checkpoint stops advancing at the same
+// moment. Rather than guess which events are live — the two cases are not
+// distinguishable from a 32-bit position alone — spirit refuses the
+// stream, the same posture as errXAUnsupported. Only the binlog (file +
+// position) client is affected; the GTID client does not use positions to
+// deduplicate, which is why MySQL's own caveat is scoped to gtid_mode
+// being off.
+var errLogPosWrapped = errors.New("binlog LogPos wrapped past 4GiB within a single file: spirit cannot track file+position coordinates past the wrap (enable GTIDs, or lower max_binlog_cache_size so no transaction can grow a binlog file beyond 4GiB)")
+
 func fatalReasonForStreamError(err error) FatalReason {
-	if errors.Is(err, errXAUnsupported) {
+	switch {
+	case errors.Is(err, errXAUnsupported):
 		return FatalReasonUnsupportedXA
+	case errors.Is(err, errLogPosWrapped):
+		return FatalReasonLogPosWrapped
+	default:
+		return FatalReasonStreamError
 	}
-	return FatalReasonStreamError
+}
+
+// logPosTracker detects uint32 LogPos wraparound by watching for an event
+// end position that moves backwards within a single binlog file. Within a
+// file, LogPos is the byte offset of the end of each event and the server
+// writes events sequentially, so it only ever increases — the one way it
+// can decrease is the 4-byte field wrapping past 4GiB (see
+// errLogPosWrapped). That makes the detection exact rather than a
+// threshold heuristic, provided the two sources of positions that are not
+// real offsets into the file we are reading are excluded:
+//
+//   - A rotate resets the tracker. The server opens every dump with an
+//     artificial RotateEvent, so a reconnect that restarts the file at
+//     position 4 (recreateStreamer) resets here too and its replay is not
+//     mistaken for a wrap.
+//   - Artificial events carry a LogPos the server synthesized rather than
+//     read from the file. Heartbeats are the case that matters: they
+//     report the dump thread's own position, which may name a different
+//     file than the one we are still reading.
+//
+// A wrap that happens entirely while disconnected is still caught: the
+// reconnect restarts the file at position 4 and replays forward into the
+// same oversized transaction, where the backwards step reappears.
+type logPosTracker struct {
+	last uint32
+}
+
+// rotated resets the tracker for a new (or re-opened) binlog file.
+func (t *logPosTracker) rotated() {
+	t.last = 0
+}
+
+// observe records ev's end position and reports whether it moved backwards
+// within the current file, i.e. whether LogPos wrapped.
+func (t *logPosTracker) observe(ev *replication.BinlogEvent) bool {
+	if ev.Header.LogPos == 0 {
+		// Housekeeping events (FormatDescriptionEvent and the artificial
+		// rotate that opens a dump) carry no position.
+		return false
+	}
+	if ev.Header.Flags&replication.LOG_EVENT_ARTIFICIAL_F != 0 {
+		return false
+	}
+	if _, isHeartbeat := ev.Event.(*replication.HeartbeatEvent); isHeartbeat {
+		// Belt and braces: heartbeats are artificial, but the flag is set
+		// by the server and we would rather not depend on it for the one
+		// event type whose LogPos routinely names another file.
+		return false
+	}
+	if ev.Header.LogPos < t.last {
+		return true
+	}
+	t.last = ev.Header.LogPos
+	return false
 }
 
 // isMinimalRowImage returns true if the RowsEvent contains a minimal row image,

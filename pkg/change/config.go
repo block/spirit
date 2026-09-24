@@ -27,6 +27,13 @@ const (
 	// Replaying the checkpoint would hit the same group, so finite runs
 	// must discard their checkpoint and start fresh after XA activity stops.
 	FatalReasonUnsupportedXA
+	// FatalReasonLogPosWrapped means a binlog file grew past 4GiB and the
+	// 4-byte LogPos wrapped, so file+offset coordinates no longer identify
+	// a unique point in the stream. Replaying the checkpoint would stream
+	// forward into the same oversized transaction and wrap again, so finite
+	// runs must discard their checkpoint; a fresh run started after the
+	// file rotates gets usable coordinates again.
+	FatalReasonLogPosWrapped
 )
 
 // String implements fmt.Stringer for logging.
@@ -38,6 +45,8 @@ func (f FatalReason) String() string {
 		return "stream-error"
 	case FatalReasonUnsupportedXA:
 		return "unsupported-xa"
+	case FatalReasonLogPosWrapped:
+		return "logpos-wrapped"
 	default:
 		return fmt.Sprintf("unknown-fatal-reason(%d)", int(f))
 	}
@@ -52,8 +61,10 @@ type ClientConfig struct {
 	// It is called when a DDL change is detected on a subscribed table
 	// (FatalReasonSchemaChange), or when a fatal stream error occurs, such as
 	// minimal RBR detection or exhausted streamer recreation attempts
-	// (FatalReasonStreamError), or when XA is detected
-	// (FatalReasonUnsupportedXA). The caller is expected to handle cancellation
+	// (FatalReasonStreamError), when XA is detected
+	// (FatalReasonUnsupportedXA), or when a binlog file's 4-byte LogPos wraps
+	// past 4GiB (FatalReasonLogPosWrapped).
+	// The caller is expected to handle cancellation
 	// and cleanup, using reason to decide whether persisted resume state
 	// (e.g. a checkpoint) must be invalidated (schema change) or is still
 	// safe to resume from (stream error).
