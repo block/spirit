@@ -714,6 +714,14 @@ func TestDiff(t *testing.T) {
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(10) NULL, DROP PRIMARY KEY",
 		},
 		{
+			// The new key column omits NOT NULL, which the key implies, so
+			// the diff makes it NOT NULL alongside relaxing the old one.
+			name:     "ColumnLeavesPrimaryKeyAndRelaxesWhenNewKeyColumnOmitsNotNull",
+			source:   "CREATE TABLE t1 (a VARCHAR(10) NOT NULL, b VARCHAR(10), PRIMARY KEY (a))",
+			target:   "CREATE TABLE t1 (a VARCHAR(10), b VARCHAR(10), PRIMARY KEY (b))",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(10) NULL, MODIFY COLUMN `b` varchar(10) NOT NULL, DROP PRIMARY KEY, ADD PRIMARY KEY (`b`)",
+		},
+		{
 			name:     "AutoIncrementColumnLeavesPrimaryKeyAndRelaxes",
 			source:   "CREATE TABLE t1 (id INT NOT NULL AUTO_INCREMENT, b VARCHAR(10) NOT NULL, PRIMARY KEY (id))",
 			target:   "CREATE TABLE t1 (id INT, b VARCHAR(10) NOT NULL, PRIMARY KEY (b))",

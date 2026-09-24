@@ -784,6 +784,11 @@ func TestDiffIntegrationColumnLeavesPrimaryKeyAndRelaxes(t *testing.T) {
 			target: "CREATE TABLE %s (a varchar(10) DEFAULT NULL, b varchar(10) NOT NULL, PRIMARY KEY (b))",
 		},
 		{
+			name:   "PrimaryKeyMovesToColumnOmittingNotNull",
+			source: "CREATE TABLE %s (a varchar(10) NOT NULL, b varchar(10) DEFAULT NULL, PRIMARY KEY (a))",
+			target: "CREATE TABLE %s (a varchar(10) DEFAULT NULL, b varchar(10), PRIMARY KEY (b))",
+		},
+		{
 			name:   "PrimaryKeyDropped",
 			source: "CREATE TABLE %s (a varchar(10) NOT NULL, b varchar(10) DEFAULT NULL, PRIMARY KEY (a))",
 			target: "CREATE TABLE %s (a varchar(10) DEFAULT NULL, b varchar(10) DEFAULT NULL)",
