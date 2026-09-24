@@ -9,10 +9,10 @@ func init() { registerNormalizer(primaryKeyNormalizer{}) }
 // reports every PK, named or not, with an empty index name), so diff can treat
 // the inline and table-level spellings identically without special-casing.
 //
-// The column keeps whatever nullability the parser assigned: an inline-PK
-// column already arrives NOT NULL, exactly as a table-level PK column declared
-// NOT NULL would. Only the PrimaryKey flag is cleared; the column definition is
-// otherwise untouched.
+// Only the PrimaryKey flag is cleared; the column definition is otherwise
+// untouched. Nullability is left to primaryKeyNotNullNormalizer, which marks
+// primary key columns NOT NULL, whichever way the key was spelled, unless they
+// explicitly declare NULL.
 type primaryKeyNormalizer struct{}
 
 func (primaryKeyNormalizer) Name() string { return "primary-key" }

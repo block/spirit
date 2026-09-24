@@ -1,11 +1,13 @@
 package statement
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -807,17 +809,70 @@ func TestDiffIntegrationColumnLeavesPrimaryKeyAndRelaxes(t *testing.T) {
 			_, err = tt.DB.ExecContext(t.Context(), stmts[0].Statement)
 			require.NoError(t, err)
 
+			// Check nullability on the parsed table rather than the rendered
+			// text, whose column clauses vary across server builds.
 			postAlter := showCreateTable(t, tt.DB, tt.Name)
-			require.Contains(t, postAlter, "`a` varchar(10) DEFAULT NULL")
+			source, err = ParseCreateTable(postAlter)
+			require.NoError(t, err)
+			require.Equal(t, "a", source.Columns[0].Name)
+			require.True(t, source.Columns[0].Nullable, "`a` must be nullable after the ALTER")
 			want := strings.Replace(showCreateTable(t, ref.DB, ref.Name), "`"+refName+"`", "`"+name+"`", 1)
 			require.Equal(t, want, postAlter)
 
 			// Re-diff: the schemas now converge.
-			source, err = ParseCreateTable(postAlter)
-			require.NoError(t, err)
 			stmts, err = source.Diff(target, nil)
 			require.NoError(t, err)
 			require.Nil(t, stmts)
+		})
+	}
+}
+
+// TestDiffIntegrationPrimaryKeyImplicitNotNull verifies that a primary key
+// column authored without NOT NULL matches what MySQL stores. MySQL makes every
+// primary key column NOT NULL, so diffing the live table against the authored
+// one must not emit a MODIFY COLUMN ... NULL, which MySQL rejects with error
+// 1171. Adding a primary key to such a column must converge in one round.
+func TestDiffIntegrationPrimaryKeyImplicitNotNull(t *testing.T) {
+	t.Run("PrimaryKeyUnchanged", func(t *testing.T) {
+		const authored = "CREATE TABLE diff_pk_implicit_nn (a int, b int, PRIMARY KEY (a))"
+		tt := testutils.NewTestTable(t, "diff_pk_implicit_nn", authored)
+		require.Contains(t, showCreateTable(t, tt.DB, tt.Name), "`a` int NOT NULL")
+		require.Nil(t, diffLiveTable(t, tt.DB, tt.Name, authored))
+	})
+
+	t.Run("AddPrimaryKey", func(t *testing.T) {
+		tt := testutils.NewTestTable(t, "diff_pk_implicit_nn_add", "CREATE TABLE diff_pk_implicit_nn_add (a int, b int)")
+		ref := testutils.NewTestTable(t, "diff_pk_implicit_nn_add_ref", "CREATE TABLE diff_pk_implicit_nn_add_ref (a int, b int, PRIMARY KEY (a))")
+		const authored = "CREATE TABLE diff_pk_implicit_nn_add (a int, b int, PRIMARY KEY (a))"
+
+		stmts := diffLiveTable(t, tt.DB, tt.Name, authored)
+		require.Len(t, stmts, 1)
+		_, err := tt.DB.ExecContext(t.Context(), stmts[0].Statement)
+		require.NoError(t, err)
+
+		want := strings.Replace(showCreateTable(t, ref.DB, ref.Name), "`"+ref.Name+"`", "`"+tt.Name+"`", 1)
+		require.Equal(t, want, showCreateTable(t, tt.DB, tt.Name))
+		require.Nil(t, diffLiveTable(t, tt.DB, tt.Name, authored))
+	})
+
+	// An explicit NULL or DEFAULT NULL on a key column is not implicit: MySQL
+	// refuses to create the table, and DeclarativeToImperative rejects it as
+	// a desired schema rather than planning toward it.
+	for name, desired := range map[string]string{
+		"ExplicitNullRejected":            "CREATE TABLE diff_pk_explicit_null (a int NULL, b int, PRIMARY KEY (a))",
+		"DefaultNullRejected":             "CREATE TABLE diff_pk_explicit_null (a int DEFAULT NULL, b int, PRIMARY KEY (a))",
+		"ExplicitNullInCompositeRejected": "CREATE TABLE diff_pk_explicit_null (a int, b int NULL, PRIMARY KEY (a, b))",
+	} {
+		t.Run(name, func(t *testing.T) {
+			testutils.RunSQL(t, "DROP TABLE IF EXISTS diff_pk_explicit_null")
+			db, err := sql.Open("block-mysql", testutils.DSN())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+			_, err = db.ExecContext(t.Context(), desired)
+			require.ErrorContains(t, err, "Error 1171")
+
+			_, err = DeclarativeToImperative(nil, []table.TableSchema{{Name: "diff_pk_explicit_null", Schema: desired}}, nil)
+			require.ErrorContains(t, err, "error 1171")
 		})
 	}
 }

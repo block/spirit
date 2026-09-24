@@ -676,10 +676,13 @@ func TestDiff(t *testing.T) {
 		},
 		// Composite Primary Key
 		{
+			// Primary key columns are implicitly NOT NULL, so the target's
+			// `a` and `b` normalize to NOT NULL and the diff states that
+			// explicitly.
 			name:     "CompositePrimaryKey",
 			source:   "CREATE TABLE t1 (a INT, b INT)",
 			target:   "CREATE TABLE t1 (a INT, b INT, PRIMARY KEY (a, b))",
-			expected: "ALTER TABLE `t1` ADD PRIMARY KEY (`a`, `b`)",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` int NOT NULL, MODIFY COLUMN `b` int NOT NULL, ADD PRIMARY KEY (`a`, `b`)",
 		},
 		{
 			// The inline PRIMARY KEY made `id` NOT NULL, and DROP PRIMARY KEY
@@ -709,6 +712,12 @@ func TestDiff(t *testing.T) {
 			source:   "CREATE TABLE t1 (a VARCHAR(10) NOT NULL, b VARCHAR(10), PRIMARY KEY (a))",
 			target:   "CREATE TABLE t1 (a VARCHAR(10), b VARCHAR(10))",
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(10) NULL, DROP PRIMARY KEY",
+		},
+		{
+			name:     "AutoIncrementColumnLeavesPrimaryKeyAndRelaxes",
+			source:   "CREATE TABLE t1 (id INT NOT NULL AUTO_INCREMENT, b VARCHAR(10) NOT NULL, PRIMARY KEY (id))",
+			target:   "CREATE TABLE t1 (id INT, b VARCHAR(10) NOT NULL, PRIMARY KEY (b))",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `id` int NULL, DROP PRIMARY KEY, ADD PRIMARY KEY (`b`)",
 		},
 		{
 			// Every attribute change on the former PK column is emitted, not

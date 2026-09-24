@@ -178,6 +178,48 @@ func TestDeclarativeToImperativeWithOptions(t *testing.T) {
 	require.Empty(t, changes, "AUTO_INCREMENT differences should be ignored with default options")
 }
 
+// TestDeclarativeToImperative_PrimaryKeyDeclaresNull: a desired primary key
+// column that explicitly declares NULL or DEFAULT NULL is a table MySQL refuses
+// to create (error 1171), so it is rejected at plan time for new and existing
+// tables alike. A key column that merely omits NOT NULL is implicitly NOT NULL
+// and is accepted.
+func TestDeclarativeToImperative_PrimaryKeyDeclaresNull(t *testing.T) {
+	const current = "CREATE TABLE t1 (a int NOT NULL, b int DEFAULT NULL, PRIMARY KEY (a))"
+	tests := []struct {
+		name    string
+		desired string
+		wantErr bool
+	}{
+		{"ImplicitNotNull", "CREATE TABLE t1 (a INT, b INT, PRIMARY KEY (a))", false},
+		{"ExplicitNull", "CREATE TABLE t1 (a INT NULL, b INT, PRIMARY KEY (a))", true},
+		{"DefaultNull", "CREATE TABLE t1 (a INT DEFAULT NULL, b INT, PRIMARY KEY (a))", true},
+		{"ExplicitNullInline", "CREATE TABLE t1 (a INT NULL PRIMARY KEY, b INT)", true},
+		{"ExplicitNullInComposite", "CREATE TABLE t1 (a INT, b INT NULL, PRIMARY KEY (a, b))", true},
+		// Moving the key off a column frees it to declare NULL.
+		{"FormerKeyColumnDeclaresNull", "CREATE TABLE t1 (a INT NULL, b INT NOT NULL, PRIMARY KEY (b))", false},
+	}
+	for _, tt := range tests {
+		for _, existing := range []bool{true, false} {
+			name := tt.name + "/NewTable"
+			var cur []table.TableSchema
+			if existing {
+				name = tt.name + "/ExistingTable"
+				cur = []table.TableSchema{{Name: "t1", Schema: current}}
+			}
+			t.Run(name, func(t *testing.T) {
+				_, err := DeclarativeToImperative(cur, []table.TableSchema{{Name: "t1", Schema: tt.desired}}, nil)
+				if !tt.wantErr {
+					require.NoError(t, err)
+					return
+				}
+				require.Error(t, err)
+				require.ErrorContains(t, err, `invalid desired schema for table "t1"`)
+				require.ErrorContains(t, err, "error 1171")
+			})
+		}
+	}
+}
+
 func TestDeclarativeToImperative_OrderingCreateAlterBeforeDrop(t *testing.T) {
 	// Verify the correctness property: statements are ordered as
 	// CREATE → ALTER → DROP. This ensures safe sequential execution (e.g.

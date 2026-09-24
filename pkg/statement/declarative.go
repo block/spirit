@@ -54,6 +54,18 @@ func DeclarativeToImperative(current, desired []table.TableSchema, opts *DiffOpt
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse CREATE TABLE for new table %q: %w", name, err)
 			}
+			for _, stmt := range stmts {
+				if !stmt.IsCreateTable() {
+					continue
+				}
+				ct, err := stmt.ParseCreateTable()
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse CREATE TABLE for new table %q: %w", name, err)
+				}
+				if err := checkPrimaryKeyNullability(ct); err != nil {
+					return nil, fmt.Errorf("invalid desired schema for table %q: %w", name, err)
+				}
+			}
 			creates = append(creates, stmts...)
 			continue
 		}
@@ -105,6 +117,9 @@ func diffTable(name, currentSchema, desiredSchema string, opts *DiffOptions) (st
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse desired schema for table %q: %w", name, err)
 	}
+	if err := checkPrimaryKeyNullability(b); err != nil {
+		return nil, fmt.Errorf("invalid desired schema for table %q: %w", name, err)
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -118,6 +133,22 @@ func diffTable(name, currentSchema, desiredSchema string, opts *DiffOptions) (st
 		return nil, fmt.Errorf("failed to diff table %q: %w", name, diffErr)
 	}
 	return diffs, nil
+}
+
+// checkPrimaryKeyNullability rejects a desired table whose primary key column
+// explicitly declares NULL or DEFAULT NULL. MySQL refuses to create such a
+// table (error 1171). Such a column is left nullable by
+// primaryKeyNotNullNormalizer, so a diff toward it would emit a MODIFY ... NULL
+// that MySQL rejects too; failing here reports it at plan time instead.
+func checkPrimaryKeyNullability(ct *CreateTable) error {
+	pkColumns := primaryKeyColumnSet(ct)
+	for i := range ct.Columns {
+		col := &ct.Columns[i]
+		if pkColumns[strings.ToLower(col.Name)] && col.declaresNull() {
+			return fmt.Errorf("column %q is part of the PRIMARY KEY but declares NULL, which MySQL rejects (error 1171); remove NULL or DEFAULT NULL from its definition, or use a UNIQUE key if it must allow NULL", col.Name)
+		}
+	}
+	return nil
 }
 
 // ToTableSchema converts a parsed CreateTable back to a table.TableSchema
