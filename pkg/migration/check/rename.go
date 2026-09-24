@@ -7,18 +7,22 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
+	"github.com/block/spirit/pkg/parser/ast"
 )
 
+// Not tagged ScopeStatement: renames are metadata-only, so MySQL's native DDL,
+// which Spirit attempts before preflight for a single-table change, can complete
+// the shapes refused here, making them unsafe for a caller to report as refusals
+// ahead of an apply. It still refuses here when that attempt does not take the
+// statement — for a multi-table change Spirit skips the attempt entirely, and an
+// older server may not rename the column instantly.
 func init() {
-	registerCheck("rename", renameCheck, ScopePreflight|ScopeStatement)
+	registerCheck("rename", renameCheck, ScopePreflight)
 }
 
 // renameCheck validates rename operations in ALTER TABLE statements.
 // Table renames are always blocked. Column renames are allowed for
-// non-PK columns in both the buffered and unbuffered copier paths.
-// PK renames are blocked. Additionally, it blocks dangerous patterns
+// non-PK columns; PK renames are blocked. Additionally, it blocks dangerous patterns
 // where a rename's old or new name overlaps with an added column
 // name, which could cause data corruption.
 func renameCheck(ctx context.Context, r Resources, logger *slog.Logger) error {

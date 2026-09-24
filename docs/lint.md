@@ -61,6 +61,7 @@ These linters detect issues that could cause problems during online schema chang
 | Linter | Description |
 |--------|-------------|
 | `has_foreign_key` | Foreign keys can block online schema changes and cause replication issues |
+| `index_visibility_mixed` | Index visibility changes combined with a table rebuild make the experiment hard to interpret |
 | `invisible_index_before_drop` | Dropping indexes without first making them invisible is risky |
 | `multiple_alter_table` | Multiple ALTERs on the same table should be combined for efficiency |
 | `rename_column` | Column renames break ORMs and can't be deployed atomically with application changes |
@@ -90,7 +91,7 @@ These linters enforce organizational standards and best practices:
 | `name_case` | Ensures table names are lowercase |
 | `redundant_indexes` | Detects duplicate or unnecessary indexes |
 | `reserved_words` | Warns about MySQL reserved words in identifiers |
-| `type_pedantic` | Enforces cross-table type consistency for same-name columns and inferred `{table}_id` foreign keys |
+| `type_pedantic` | Enforces cross-table type and collation consistency for same-name columns and inferred `{table}_id` foreign keys |
 
 ## Violation Severity
 
@@ -102,7 +103,8 @@ Each violation has one of three severity levels:
 | **Warning** | Best practice violation or potential issue | `0` |
 | **Info** | Suggestion or style preference | `0` |
 
+Severity is decided per-linter. Note that `invisible_index_before_drop` reports at **Error** severity by default, so dropping an index that was not first made invisible fails the command with exit code `1`.
+
 ## See Also
 
 - [`spirit diff`](diff.md) — compare two schemas and lint the changes
-- [`spirit migrate --lint`](migrate.md#lint) — run lint checks inline as part of `spirit migrate`

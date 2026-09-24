@@ -1,8 +1,8 @@
 package statement
 
 import (
-	"github.com/pingcap/tidb/pkg/parser"
-	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser"
+	"github.com/block/spirit/pkg/parser/ast"
 )
 
 // StatementType represents the type of a SQL statement.

@@ -40,12 +40,12 @@ func TestBufferedCopier(t *testing.T) {
 	}
 	cfg.Applier, err = applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	require.NoError(t, copier.Run(t.Context())) // works.
 
@@ -65,11 +65,12 @@ func TestBufferedCopier(t *testing.T) {
 // TestBufferedCopierCharsetConversion tests that the buffered copier
 // handles charset conversions correctly.
 //
-// In the unbuffered copier, we don't really have to worry about this because
-// MySQL can infer source and dest charset from the INSERT.. SELECT
-// and do any conversion that is required.
+// With a server-side INSERT .. SELECT (how the legacy unbuffered copier
+// wrote), charsets never leave the server: MySQL infers source and dest
+// charset and converts as required.
 //
-// In the buffered copier, we need to set the connection charset to utf8mb4.
+// In the buffered copier, rows pass through the client, so we need to set
+// the connection charset to utf8mb4.
 // For this test, what this means is that on *read* of charsetsrc, the characters
 // will be converted from latin1 to utf8mb4 by the MySQL server. We then insert
 // into charsetdst as utf8mb4 characters.
@@ -97,12 +98,12 @@ func TestBufferedCopierCharsetConversion(t *testing.T) {
 	cfg := NewCopierDefaultConfig()
 	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 
 	// The copy should succeed because we set the connection charset to utf8mb4
@@ -113,9 +114,9 @@ func TestBufferedCopierCharsetConversion(t *testing.T) {
 	// Reverse the copy to show the other direction works too
 	// Start by emptying the "src" table, which is our intended destination.
 	testutils.RunSQL(t, "TRUNCATE TABLE charsetsrc")
-	chunker, err = table.NewChunker(t2, table.ChunkerConfig{NewTable: t1, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err = table.NewChunker(t2, table.ChunkerConfig{NewTable: t1, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
-	copier, err = NewCopier(db, chunker, cfg)
+	copier, err = NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
 	err = copier.Run(t.Context())
@@ -151,15 +152,16 @@ func TestBufferedCopierDataTypeConversionError(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
-	cfg.TargetChunkTime = 10 // Small chunk time to create more chunks
 	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	// Absurdly tiny chunk-time target (10ns) so the chunker creates many
+	// small chunks.
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: 10 * time.Nanosecond, Logger: cfg.Logger})
 	require.NoError(t, err)
 
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 
 	// Run the copier - should fail with conversion error.
@@ -249,7 +251,7 @@ func TestBufferedCopierChunkTimingIncludesCallbackDelay(t *testing.T) {
 	cfg.Concurrency = 1 // Single worker for predictable behavior
 
 	// Create the copier via the public constructor to match production configuration
-	copier, err := NewCopier(db, wrappedChunker, cfg)
+	copier, err := NewCopier(wrappedChunker, cfg)
 	require.NoError(t, err)
 
 	// Run the copier with a context that won't timeout during the delay
@@ -327,6 +329,10 @@ type delayedCallbackApplier struct {
 
 func (d *delayedCallbackApplier) Start(ctx context.Context) error {
 	return d.realApplier.Start(ctx)
+}
+
+func (d *delayedCallbackApplier) Stats() applier.Stats {
+	return d.realApplier.Stats()
 }
 
 func (d *delayedCallbackApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback applier.ApplyCallback) error {
@@ -410,13 +416,13 @@ func TestBufferedCopierGeometry(t *testing.T) {
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
 		NewTable:        t2,
-		TargetChunkTime: cfg.TargetChunkTime,
+		TargetChunkTime: time.Second,
 		Logger:          cfg.Logger,
 	})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
 
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 	require.NoError(t, copier.Run(t.Context()))
 
@@ -427,4 +433,146 @@ func TestBufferedCopierGeometry(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		"SELECT BIT_XOR(CRC32(CONCAT(id, name, ST_AsText(location)))) FROM geomdst").Scan(&checksumDst))
 	require.Equal(t, checksumSrc, checksumDst, "geometry data checksum mismatch after buffered copy")
+}
+
+// gateThrottler gives tests deterministic control over where read workers
+// park. BlockWait blocks until either one token is received on allow (waking
+// exactly one reader for one loop iteration) or open is closed (the gate is
+// permanently open and BlockWait returns immediately from then on).
+type gateThrottler struct {
+	allow chan struct{}
+	open  chan struct{}
+}
+
+func (g *gateThrottler) Open(_ context.Context) error      { return nil }
+func (g *gateThrottler) Close() error                      { return nil }
+func (g *gateThrottler) IsThrottled() bool                 { return false }
+func (g *gateThrottler) UpdateLag(_ context.Context) error { return nil }
+func (g *gateThrottler) BlockWait(ctx context.Context) {
+	select {
+	case <-g.allow:
+	case <-g.open:
+	case <-ctx.Done():
+	}
+}
+
+// TestBufferedCopierReadWorkerScaling exercises SetReadWorkers /
+// ActiveReadWorkers: the runtime read-side counterpart of the applier's
+// SetWriteWorkers. Readers idle inside throttler.BlockWait, so the gate
+// throttler holds them parked while we scale the pool and releases them
+// one loop iteration at a time to observe parking deterministically.
+func TestBufferedCopierReadWorkerScaling(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS readscalesrc, readscaledst")
+	testutils.RunSQL(t, "CREATE TABLE readscalesrc (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARBINARY(1024) NOT NULL)")
+	testutils.RunSQL(t, "CREATE TABLE readscaledst (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARBINARY(1024) NOT NULL)")
+
+	// Seed ~16k rows of ~1KiB each by doubling, so with a small chunk byte
+	// budget the copy has hundreds of chunks — the token phase below consumes
+	// a handful and must not exhaust the chunker.
+	testutils.RunSQL(t, "INSERT INTO readscalesrc (pad) VALUES (RANDOM_BYTES(1024))")
+	for range 14 {
+		testutils.RunSQL(t, "INSERT INTO readscalesrc (pad) SELECT RANDOM_BYTES(1024) FROM readscalesrc")
+	}
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	t1 := table.NewTableInfo(db, "test", "readscalesrc")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "readscaledst")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	gate := &gateThrottler{
+		// allow is buffered so the test's non-blocking token sends don't
+		// depend on a reader being mid-receive at that exact instant (the
+		// send site has a default case, so at most one token is in flight).
+		allow: make(chan struct{}, 1),
+		open:  make(chan struct{}),
+	}
+	cfg := NewCopierDefaultConfig()
+	cfg.Concurrency = 4
+	cfg.Throttler = gate
+	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
+	require.NoError(t, err)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
+		NewTable:         t2,
+		TargetChunkTime:  time.Second,
+		TargetChunkBytes: 64 * 1024, // keep chunks small so the copy has many
+		Logger:           cfg.Logger,
+	})
+	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
+
+	copier, err := NewCopier(chunker, cfg)
+	require.NoError(t, err)
+	b := copier.(*buffered)
+
+	// Before Run the pool does not exist: the setter is a no-op.
+	b.SetReadWorkers(8)
+	require.Equal(t, 0, b.ActiveReadWorkers())
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- b.Run(t.Context())
+	}()
+
+	// The initial pool comes up at Concurrency and parks at the gate. Drain
+	// runErr while polling so an early Run failure surfaces as its real error
+	// instead of an opaque Eventually timeout.
+	var earlyRunErr error
+	runReturnedEarly := false
+	require.Eventually(t, func() bool {
+		select {
+		case earlyRunErr = <-runErr:
+			runReturnedEarly = true
+			return true // fail fast below; Run should still be copying
+		default:
+		}
+		return b.ActiveReadWorkers() == 4
+	}, 10*time.Second, 10*time.Millisecond)
+	require.NoError(t, earlyRunErr)
+	require.False(t, runReturnedEarly, "Run returned before the gate released the copy")
+	require.Equal(t, 4, b.ActiveReadWorkers())
+
+	// Scale up: spawning is synchronous, the new readers park at the gate too.
+	b.SetReadWorkers(6)
+	require.Equal(t, 6, b.ActiveReadWorkers())
+
+	// Scale down to 0, which clamps to 1: five quit channels close, but a
+	// parked reader only observes quit once BlockWait releases it. Feed one
+	// token at a time; each wakes one reader — a parked one exits without
+	// claiming a chunk, the survivor copies one chunk and re-parks.
+	b.SetReadWorkers(0)
+	require.Eventually(t, func() bool {
+		select {
+		case gate.allow <- struct{}{}:
+		default:
+		}
+		return b.ActiveReadWorkers() == 1
+	}, 10*time.Second, 10*time.Millisecond)
+
+	// Scale back up mid-copy.
+	b.SetReadWorkers(3)
+	require.Equal(t, 3, b.ActiveReadWorkers())
+
+	// Open the gate permanently and let the copy finish.
+	close(gate.open)
+	select {
+	case err := <-runErr:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("copy did not complete in time")
+	}
+
+	// The pool has drained and scaling is closed: the setter is a no-op again.
+	require.Equal(t, 0, b.ActiveReadWorkers())
+	b.SetReadWorkers(5)
+	require.Equal(t, 0, b.ActiveReadWorkers())
+
+	// All rows made it across.
+	var srcRows, dstRows int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM readscalesrc").Scan(&srcRows))
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM readscaledst").Scan(&dstRows))
+	require.Equal(t, srcRows, dstRows)
 }

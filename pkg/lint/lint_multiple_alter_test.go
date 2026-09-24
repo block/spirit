@@ -32,7 +32,7 @@ func TestMultipleAlterTableLinter_TwoAltersOnSameTable(t *testing.T) {
 	require.Len(t, violations, 1)
 	require.Equal(t, "multiple_alter_table", violations[0].Linter.Name())
 	require.Equal(t, SeverityInfo, violations[0].Severity)
-	require.Contains(t, violations[0].Message, "2 separate ALTER TABLE statements")
+	require.Equal(t, `Table "users" has 2 separate ALTER TABLE statements that could be combined into one for better performance`, violations[0].Message)
 	require.Equal(t, "users", violations[0].Location.Table)
 	require.NotNil(t, violations[0].Suggestion)
 	require.Contains(t, *violations[0].Suggestion, "Combine into")

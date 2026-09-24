@@ -103,7 +103,7 @@ func NewAdvisoryLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 			// against; surface it as a connection failure instead.
 			return nil, errors.New("connection factory returned a nil database")
 		}
-		db.SetMaxOpenConns(1)
+		SetPoolSize(db, 1)
 		db.SetConnMaxLifetime(0) // see comment above; keepalive is the refresh ticker
 		return db, nil
 	}

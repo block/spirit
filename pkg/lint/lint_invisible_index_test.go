@@ -19,7 +19,7 @@ func TestInvisibleIndexBeforeDropLinter_DropWithoutInvisible(t *testing.T) {
 	require.Len(t, violations, 1)
 	require.Equal(t, "invisible_index_before_drop", violations[0].Linter.Name())
 	require.Equal(t, SeverityWarning, violations[0].Severity)
-	require.Contains(t, violations[0].Message, "should be made invisible before dropping")
+	require.Equal(t, `Index "idx_email" should be made invisible before dropping to ensure it's not needed`, violations[0].Message)
 	require.Equal(t, "users", violations[0].Location.Table)
 	require.NotNil(t, violations[0].Location.Index)
 	require.Equal(t, "idx_email", *violations[0].Location.Index)

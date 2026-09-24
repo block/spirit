@@ -4,17 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
 // TestSyncContinuousChecksumFirstCleanPass drives a sync against a quiet
-// table and asserts that the continuous checksum FirstCleanPass signal
+// table and asserts that the lockless checksum FirstCleanPass signal
 // fires after the initial copy completes — i.e. the eventually-consistent
 // verifier observes the target matching the source on its first pass.
 func TestSyncContinuousChecksumFirstCleanPass(t *testing.T) {
@@ -34,54 +35,33 @@ func TestSyncContinuousChecksumFirstCleanPass(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_checksum_dest`)
 
 	s := &Sync{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
-		FlushInterval:   100 * time.Millisecond,
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       2,
+		WriteThreads:  2,
+		FlushInterval: 100 * time.Millisecond,
 	}
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
+	h := startRunner(t, runner)
 
 	// Wait for the checker to be constructed (post-copy + post-flush).
-	select {
-	case <-runner.ChecksumReady():
-	case <-time.After(60 * time.Second):
-		cancel()
-		t.Fatal("ChecksumReady did not fire within 60s")
-	}
-
+	h.await(runner.ChecksumReady(), 60*time.Second, "ChecksumReady")
 	// On a quiet table, the first clean pass should be quick.
-	select {
-	case <-runner.FirstCleanPass():
-	case <-time.After(30 * time.Second):
-		cancel()
-		t.Fatalf("FirstCleanPass did not fire within 30s; stats=%+v", runner.ChecksumStats())
-	}
+	h.await(runner.FirstCleanPass(), 30*time.Second, "FirstCleanPass")
 
 	stats := runner.ChecksumStats()
 	require.GreaterOrEqual(t, stats.PassesCompleted, uint64(1), "at least one pass should have completed")
 	require.False(t, stats.FirstCleanPassAt.IsZero(), "FirstCleanPassAt should be set")
 	require.Equal(t, uint64(0), stats.PermanentFailures, "no permanent failures expected on a quiet table")
 
-	cancel()
-	select {
-	case runErr := <-done:
-		require.NoError(t, runErr)
-	case <-time.After(60 * time.Second):
-		t.Fatal("sync did not stop within 60s of cancellation")
-	}
-	require.NoError(t, runner.Close())
+	h.stop()
 }
 
 // TestSyncContinuousChecksumWithBackgroundWrites drives a sync while a
 // background workload generator inserts/updates/deletes rows on the
-// source. The continuous checksum must still converge to a first clean
+// source. The lockless checksum must still converge to a first clean
 // pass — replication keeps the target close enough behind that the
 // retry path (target catches up to a witnessed source version) closes
 // out drift before it accumulates.
@@ -101,7 +81,7 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 	// Seed a few hundred rows so the checker has real work to do (multiple chunks).
 	// One multi-row INSERT is much faster than 500 round-trips and matches
 	// the intent of the original comment.
-	seedSrc, err := sql.Open("mysql", sourceDSN)
+	seedSrc, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(seedSrc)
 	const seedRows = 500
@@ -119,34 +99,29 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_checksum_busy_dest`)
 
 	s := &Sync{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
-		FlushInterval:   100 * time.Millisecond,
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       2,
+		WriteThreads:  2,
+		FlushInterval: 100 * time.Millisecond,
 	}
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
+	h := startRunner(t, runner)
 
 	// Wait for the checker to exist.
-	select {
-	case <-runner.ChecksumReady():
-	case <-time.After(60 * time.Second):
-		cancel()
-		t.Fatal("ChecksumReady did not fire within 60s")
-	}
+	h.await(runner.ChecksumReady(), 60*time.Second, "ChecksumReady")
 
 	// Spawn a background writer that bumps a counter on a random-ish set
 	// of rows. This is what produces target lag at read time — exactly
 	// what the retry path is for.
-	srcDB, err := sql.Open("mysql", sourceDSN)
+	srcDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
-	defer utils.CloseAndLog(srcDB)
+	// Cleanups, not defers: a t.Fatal below has to stop and join the writer
+	// before the connection it writes on is closed, and defers all run ahead
+	// of cleanups. Registration order is the reverse of teardown order.
+	t.Cleanup(func() { utils.CloseAndLog(srcDB) })
 
 	// Writer cancellation is via writerCtx; ticker drives the rate.
 	// Errors are surfaced via t.Logf — silently swallowing them would
@@ -154,6 +129,11 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 	// Cancellation-induced errors are filtered (expected on shutdown).
 	writerCtx, stopWriter := context.WithCancel(context.Background())
 	writerDone := make(chan struct{})
+	stopWriting := sync.OnceFunc(func() {
+		stopWriter()
+		<-writerDone
+	})
+	t.Cleanup(stopWriting)
 	go func() {
 		defer close(writerDone)
 		tick := time.NewTicker(50 * time.Millisecond)
@@ -175,16 +155,9 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 
 	// First clean pass must still fire — give it a generous window to
 	// account for the per-chunk retry delay (default 1m, see
-	// checksum.DefaultContinuousRetryDelay).
-	select {
-	case <-runner.FirstCleanPass():
-		t.Logf("FirstCleanPass fired; stats=%+v", runner.ChecksumStats())
-	case <-time.After(120 * time.Second):
-		stopWriter()
-		<-writerDone
-		cancel()
-		t.Fatalf("FirstCleanPass did not fire within 120s under load; stats=%+v", runner.ChecksumStats())
-	}
+	// checksum.DefaultLocklessRetryDelay).
+	h.await(runner.FirstCleanPass(), 120*time.Second, "FirstCleanPass")
+	t.Logf("FirstCleanPass fired; stats=%+v", runner.ChecksumStats())
 
 	stats := runner.ChecksumStats()
 	// Under active writes we expect at least some chunks to mismatch on
@@ -193,14 +166,6 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 	// recovered without surfacing permanent failures.
 	require.Equal(t, uint64(0), stats.PermanentFailures, "should not see permanent failures with normal replication")
 
-	stopWriter()
-	<-writerDone
-	cancel()
-	select {
-	case runErr := <-done:
-		require.NoError(t, runErr)
-	case <-time.After(60 * time.Second):
-		t.Fatal("sync did not stop within 60s of cancellation")
-	}
-	require.NoError(t, runner.Close())
+	stopWriting()
+	h.stop()
 }

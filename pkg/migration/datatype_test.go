@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -172,26 +171,15 @@ func TestTpConversion(t *testing.T) {
 	require.NoError(t, m.Close())
 }
 
-// TestEnumReorder verifies that ENUM reordering ALTERs are refused at preflight
-// in both unbuffered and buffered modes.
+// TestEnumReorder verifies that ENUM reordering ALTERs are refused at preflight.
 //
-// The binlog replay path (bufferedMap) is now used for any memory-comparable PK
-// regardless of copy mode, and it represents ENUM values as int64 ordinals from
-// the binlog. Reordering the ENUM definition makes those ordinals point at
+// The binlog replay path (bufferedMap) represents ENUM values as int64
+// ordinals from the binlog. Reordering the ENUM definition makes those ordinals point at
 // different strings in the target, which would corrupt rows. The preflight
 // check refuses these ALTERs unconditionally — it's better to fail fast than
 // to corrupt data.
 func TestEnumReorder(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testEnumReorder(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testEnumReorder(t, true)
-	})
-}
-
-func testEnumReorder(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "enumreorder", `CREATE TABLE enumreorder (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		status ENUM('active', 'inactive', 'pending') NOT NULL
@@ -204,8 +192,6 @@ func testEnumReorder(t *testing.T, enableBuffered bool) {
 
 	m := NewTestRunner(t, "enumreorder", "MODIFY COLUMN status ENUM('pending', 'active', 'inactive') NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	// Concurrent DML during copy phase to exercise binlog replay.
@@ -215,7 +201,7 @@ func testEnumReorder(t *testing.T, enableBuffered bool) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := range 50 {
@@ -241,19 +227,10 @@ func testEnumReorder(t *testing.T, enableBuffered bool) {
 }
 
 // TestSetReorder mirrors TestEnumReorder but for SET columns.
-// Both buffered and unbuffered modes refuse SET reordering because the string
-// representation changes cause checksum failures.
+// SET reordering is refused because the string representation changes
+// cause checksum failures.
 func TestSetReorder(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testSetReorder(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testSetReorder(t, true)
-	})
-}
-
-func testSetReorder(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "setreorder", `CREATE TABLE setreorder (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		perms SET('read', 'write', 'execute') NOT NULL
@@ -262,8 +239,6 @@ func testSetReorder(t *testing.T, enableBuffered bool) {
 
 	m := NewTestRunner(t, "setreorder", "MODIFY COLUMN perms SET('execute', 'read', 'write') NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	// Concurrent DML during copy phase.
@@ -273,7 +248,7 @@ func testSetReorder(t *testing.T, enableBuffered bool) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := range 50 {
@@ -307,34 +282,13 @@ func testSetReorder(t *testing.T, enableBuffered bool) {
 // original string and MySQL maps them onto the new (smaller) enum without
 // data corruption.
 //
-// The matrix covers both copy modes (buffered/unbuffered) and both change
-// sources (binlog file+position and GTID). The decode happens in
-// TableInfo.DecodeBinlogRow, which both pkg/change clients call, but we
-// exercise them separately so a future divergence between the two source
-// implementations can't silently break ENUM drops on one of them.
+// The change source (binlog file+position vs GTID) is auto-detected from the
+// server, so each CI server configuration exercises its own source
+// implementation; the decode happens in TableInfo.DecodeBinlogRow, which both
+// pkg/change clients call.
 func TestEnumDrop(t *testing.T) {
 	t.Parallel()
-	for _, useGTID := range []bool{false, true} {
-		source := "binlog"
-		if useGTID {
-			source = "gtid"
-		}
-		t.Run(source, func(t *testing.T) {
-			t.Run("unbuffered", func(t *testing.T) {
-				testEnumDrop(t, false, useGTID)
-			})
-			t.Run("buffered", func(t *testing.T) {
-				testEnumDrop(t, true, useGTID)
-			})
-		})
-	}
-}
-
-func testEnumDrop(t *testing.T, enableBuffered, useGTID bool) {
-	// Unique table per matrix cell so the four combinations stay independent.
-	tableName := fmt.Sprintf("enumdrop_%s_%s",
-		map[bool]string{true: "gtid", false: "binlog"}[useGTID],
-		map[bool]string{true: "buf", false: "unbuf"}[enableBuffered])
+	tableName := "enumdrop"
 	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf(`CREATE TABLE %s (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		status ENUM('active', 'inactive', 'pending', 'archived') NOT NULL
@@ -352,9 +306,6 @@ func testEnumDrop(t *testing.T, enableBuffered, useGTID bool) {
 
 	m := NewTestRunner(t, tableName, "MODIFY COLUMN status ENUM('active', 'pending', 'archived') NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
-		WithGTID(useGTID),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -363,7 +314,7 @@ func testEnumDrop(t *testing.T, enableBuffered, useGTID bool) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		// Concurrent DML uses only retained values; binlog ordinals for
@@ -419,7 +370,6 @@ func TestEnumDropWithDroppedValueInData(t *testing.T) {
 
 	m := NewTestRunner(t, "enumdrop_unsafe", "MODIFY COLUMN status ENUM('active', 'pending') NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
 		WithTestThrottler())
 
 	err = m.Run(t.Context())
@@ -446,8 +396,6 @@ func TestEnumToVarchar(t *testing.T) {
 
 	m := NewTestRunner(t, "enumtovarchar", "MODIFY COLUMN status VARCHAR(32) NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	// Concurrent DML during the copy phase exercises the binlog replay
@@ -459,7 +407,7 @@ func TestEnumToVarchar(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := 1; i <= 100; i++ {
@@ -518,8 +466,6 @@ func TestSetToVarchar(t *testing.T) {
 
 	m := NewTestRunner(t, "settovarchar", "MODIFY COLUMN perms VARCHAR(64) NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -528,7 +474,7 @@ func TestSetToVarchar(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := 1; i <= 50; i++ {
@@ -578,8 +524,6 @@ func TestEnumToSet(t *testing.T) {
 	m := NewTestRunner(t, "enumtoset_mig",
 		"MODIFY COLUMN status SET('active', 'inactive', 'pending') NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -588,7 +532,7 @@ func TestEnumToSet(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for i := 1; i <= 100; i++ {
@@ -637,7 +581,7 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 	tt.SeedRows(t, "INSERT INTO minrbr_buffered (name, val) SELECT CONCAT('seed-', FLOOR(RAND()*99999)), 1", 256)
 
 	// Open a dedicated connection with session-level minimal RBR.
-	minimalDB, err := sql.Open("mysql", testutils.DSN())
+	minimalDB, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(minimalDB)
 	minimalDB.SetMaxOpenConns(1)
@@ -649,19 +593,12 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 
 	m := NewTestRunner(t, "minrbr_buffered", "ENGINE=InnoDB",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	// Run the migration in a goroutine so we can inject minimal-RBR writes.
-	var migrationErr error
-	migrationDone := make(chan struct{})
-	go func() {
-		defer close(migrationDone)
-		migrationErr = m.Run(ctx)
-	}()
+	running := startTestRun(t, m.Run, m.Close)
 
-	waitForStatus(t, m, status.CopyRows)
+	waitForStatus(t, m, status.CopyRows, running)
 
 	// Continuously write using the minimal-RBR session during the copy phase.
 	var writerWg sync.WaitGroup
@@ -676,10 +613,9 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 		}
 	})
 
-	<-migrationDone
+	migrationErr := running.wait(t)
 	cancel()
 	writerWg.Wait()
-	require.NoError(t, m.Close())
 
 	require.Error(t, migrationErr)
 }
@@ -690,13 +626,6 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 
 func TestAlterPKIntToBigInt(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigInt(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigInt(t, true)
-	})
-}
-
-func testAlterPKIntToBigInt(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_int2big", `CREATE TABLE altpk_int2big (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(255) NOT NULL,
@@ -704,8 +633,7 @@ func testAlterPKIntToBigInt(t *testing.T, enableBuffered bool) {
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_int2big (name, val) SELECT 'a', 1", 3)
 
-	m := NewTestRunner(t, "altpk_int2big", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_int2big", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT")
 	require.NoError(t, m.Run(t.Context()))
 	require.False(t, m.usedInstantDDL)
 	require.NoError(t, m.Close())
@@ -723,21 +651,13 @@ func testAlterPKIntToBigInt(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKIntToBigIntUnsigned(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntUnsigned(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigIntUnsigned(t, true)
-	})
-}
-
-func testAlterPKIntToBigIntUnsigned(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_int2bigu", `CREATE TABLE altpk_int2bigu (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(255) NOT NULL
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_int2bigu (name) SELECT 'a'", 5)
 
-	m := NewTestRunner(t, "altpk_int2bigu", "MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_int2bigu", "MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT")
 	require.NoError(t, m.Run(t.Context()))
 	require.False(t, m.usedInstantDDL)
 	require.NoError(t, m.Close())
@@ -751,21 +671,13 @@ func testAlterPKIntToBigIntUnsigned(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKTinyIntToInt(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKTinyIntToInt(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKTinyIntToInt(t, true)
-	})
-}
-
-func testAlterPKTinyIntToInt(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_tiny2int", `CREATE TABLE altpk_tiny2int (
 		id tinyint unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		data varchar(100) NOT NULL
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_tiny2int (data) SELECT 'test'", 50)
 
-	m := NewTestRunner(t, "altpk_tiny2int", "MODIFY COLUMN id INT UNSIGNED NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_tiny2int", "MODIFY COLUMN id INT UNSIGNED NOT NULL AUTO_INCREMENT")
 	require.NoError(t, m.Run(t.Context()))
 	require.False(t, m.usedInstantDDL)
 	require.NoError(t, m.Close())
@@ -779,13 +691,6 @@ func testAlterPKTinyIntToInt(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKIntToBigIntWithDML(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntWithDML(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigIntWithDML(t, true)
-	})
-}
-
-func testAlterPKIntToBigIntWithDML(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_dml", `CREATE TABLE altpk_dml (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(255) NOT NULL,
@@ -793,12 +698,11 @@ func testAlterPKIntToBigIntWithDML(t *testing.T, enableBuffered bool) {
 	)`)
 	tt.SeedRows(t, "INSERT INTO altpk_dml (name, val) SELECT 'seed', 1", 4096)
 	m := NewTestRunner(t, "altpk_dml", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT",
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if !waitForCopyRows(t.Context(), m) {
+		if !waitForCopyRows(t, t.Context(), m) {
 			return
 		}
 		for i := range 100 {
@@ -821,13 +725,6 @@ func testAlterPKIntToBigIntWithDML(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKCompositeDatatypeChange(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKCompositeDatatypeChange(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKCompositeDatatypeChange(t, true)
-	})
-}
-
-func testAlterPKCompositeDatatypeChange(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_comp", `CREATE TABLE altpk_comp (
 		id1 int NOT NULL,
 		id2 int NOT NULL,
@@ -839,8 +736,7 @@ func testAlterPKCompositeDatatypeChange(t *testing.T, enableBuffered bool) {
 		testutils.RunSQL(t, fmt.Sprintf("INSERT INTO altpk_comp (id1, id2, data) VALUES (%d, %d, 'row%d')", i/10, i%10, i))
 	}
 
-	m := NewTestRunner(t, "altpk_comp", "MODIFY COLUMN id1 BIGINT NOT NULL",
-		WithBuffered(enableBuffered))
+	m := NewTestRunner(t, "altpk_comp", "MODIFY COLUMN id1 BIGINT NOT NULL")
 	require.NoError(t, m.Run(t.Context()))
 	require.NoError(t, m.Close())
 
@@ -857,13 +753,6 @@ func testAlterPKCompositeDatatypeChange(t *testing.T, enableBuffered bool) {
 
 func TestAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) { testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t, false) })
-	t.Run("buffered", func(t *testing.T) {
-		testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t, true)
-	})
-}
-
-func testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T, enableBuffered bool) {
 	tt := testutils.NewTestTable(t, "altpk_multi", `CREATE TABLE altpk_multi (
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name varchar(100) NOT NULL,
@@ -874,13 +763,11 @@ func testAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T, enable
 	m := NewTestRunner(t, "altpk_multi",
 		"MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT, MODIFY COLUMN name VARCHAR(255) NOT NULL",
 		WithThreads(2),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(enableBuffered),
 		WithTestThrottler())
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if !waitForCopyRows(t.Context(), m) {
+		if !waitForCopyRows(t, t.Context(), m) {
 			return
 		}
 		for i := range 50 {
@@ -980,8 +867,6 @@ func TestBinaryToVarbinaryConcurrentDML(t *testing.T) {
 
 	m := NewTestRunner(t, "bin2varbin", "MODIFY data VARBINARY(32) NOT NULL",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -990,7 +875,7 @@ func TestBinaryToVarbinaryConcurrentDML(t *testing.T) {
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		for range 50 {
@@ -1163,8 +1048,6 @@ func runBitDMLTest(t *testing.T, tableName, colName, colDef string, values []uin
 
 	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(true),
 		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -1173,7 +1056,7 @@ func runBitDMLTest(t *testing.T, tableName, colName, colDef string, values []uin
 	dmlDone := make(chan struct{})
 	go func() {
 		defer close(dmlDone)
-		if !waitForCopyRows(ctx, m) {
+		if !waitForCopyRows(t, ctx, m) {
 			return
 		}
 		// UPDATE the marker rows mid-migration. Each update produces a
@@ -1226,4 +1109,339 @@ func runBitDMLTest(t *testing.T, tableName, colName, colDef string, values []uin
 			"marker id=%d expected %s value 0x%016x but got 0x%016x",
 			mk.id, colDef, mk.val, got)
 	}
+}
+
+// The VECTOR type (MySQL 9.7+) is a packed array of 4-byte little-endian
+// floats. Spirit sees it as raw bytes on every path — the copier's SELECT, the
+// binlog row image, and the checksum's CAST — and MySQL only accepts those
+// bytes back as a binary-charset literal:
+//
+//	INSERT ... VALUES (0x0000c03f...)         -- accepted
+//	INSERT ... VALUES ("<the same 12 bytes>") -- ER_INVALID_CAST_TO_VECTOR
+//	                                             "Value of type 'string, size: 12'
+//	                                              cannot be converted to 'vector' type"
+//
+// so a VECTOR value must be classified as a binary type in table.Datum rather
+// than left to the "hex-encode whatever isn't valid UTF-8" fallback: the
+// all-zeros vector [0,0,0] *is* valid UTF-8 and would be emitted as the second
+// form, aborting the copy or the binlog flush. The checksum has the mirror
+// constraint — a VECTOR cannot be cast to char at all (ER_WRONG_ARGUMENTS,
+// "Incorrect arguments to cast_as_char"), so castableTp must map it to binary.
+//
+// The tests below cover the three write paths end to end: row copy, binlog
+// replay of concurrent DML, and the checksum that gates cutover.
+
+// vectorSeedValues are the values every test in this file seeds. The first is
+// the all-zeros vector — the value whose byte image is valid UTF-8 and which
+// therefore fails on any path that hex-encodes only "binary-looking" data.
+var vectorSeedValues = []string{
+	"[0,0,0]",
+	"[1.5,-2,0.0003]",
+	"[1e30,-1e-5,123456789.5]",
+	"[0,1,0]",
+}
+
+// hexVectors reads id -> HEX(col) for the whole table, which is how these
+// tests compare vector contents: HEX() is exact (VECTOR_TO_STRING rounds to
+// 5 decimal places) and works the same before and after a migration.
+func hexVectors(t *testing.T, db *sql.DB, table, col string) map[int]string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(),
+		fmt.Sprintf("SELECT id, IFNULL(HEX(%s), 'NULL') FROM %s", col, table))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	out := make(map[int]string)
+	for rows.Next() {
+		var id int
+		var hexVal string
+		require.NoError(t, rows.Scan(&id, &hexVal))
+		out[id] = hexVal
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+// TestVectorE2ECopy migrates a table holding VECTOR columns through the copy
+// path and asserts every value survives byte-for-byte. The migration also runs
+// the checksum, so this covers the CAST side too: before castableTp knew about
+// VECTOR the checksum query itself failed with "Incorrect arguments to
+// cast_as_char".
+func TestVectorE2ECopy(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_copy", `CREATE TABLE vector_copy (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		pad VARCHAR(64) NOT NULL,
+		embedding VECTOR(3) NOT NULL,
+		optional_embedding VECTOR(4) NULL,
+		default_dim VECTOR NULL
+	)`)
+
+	for _, v := range vectorSeedValues {
+		testutils.RunSQL(t, fmt.Sprintf(`INSERT INTO vector_copy (pad, embedding, optional_embedding, default_dim)
+			VALUES ('seed', STRING_TO_VECTOR('%s'), NULL, STRING_TO_VECTOR('[0,0]'))`, v))
+	}
+	testutils.RunSQL(t, `INSERT INTO vector_copy (pad, embedding, optional_embedding, default_dim)
+		VALUES ('nulls', STRING_TO_VECTOR('[0,0,0]'), STRING_TO_VECTOR('[0,0,0,0]'), NULL)`)
+	// Bulk rows so the copier does real chunked work rather than a single
+	// chunk of 5 rows.
+	tt.SeedRows(t, "INSERT INTO vector_copy (pad, embedding, optional_embedding, default_dim) SELECT 'bulk', STRING_TO_VECTOR('[0,0,0]'), STRING_TO_VECTOR('[1,2,3,4]'), STRING_TO_VECTOR('[0]')", 2000)
+
+	before := hexVectors(t, tt.DB, "vector_copy", "embedding")
+	beforeOptional := hexVectors(t, tt.DB, "vector_copy", "optional_embedding")
+	require.GreaterOrEqual(t, len(before), 2000)
+
+	// MODIFY of a VARCHAR across the 255-byte length-prefix boundary is not
+	// INSTANT or INPLACE, so this forces the copy path.
+	m := NewTestRunner(t, "vector_copy", "MODIFY COLUMN pad VARCHAR(300) NOT NULL", WithThreads(2))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.False(t, m.usedInstantDDL)
+	require.False(t, m.usedInplaceDDL)
+
+	require.Equal(t, before, hexVectors(t, tt.DB, "vector_copy", "embedding"),
+		"copied VECTOR values must be byte-identical to the source")
+	require.Equal(t, beforeOptional, hexVectors(t, tt.DB, "vector_copy", "optional_embedding"),
+		"copied nullable VECTOR values (including NULLs) must be preserved")
+
+	// The stored values must still be readable as vectors — a corrupted
+	// byte image would either fail VECTOR_DIM or report the wrong width.
+	var badDims int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_copy WHERE VECTOR_DIM(embedding) <> 3`).Scan(&badDims))
+	require.Zero(t, badDims, "every copied embedding must still be a 3-dimension vector")
+}
+
+// TestVectorE2EDimensionChange widens a VECTOR column's declared dimension.
+// The stored images do not change (a VECTOR is only as wide as the value
+// written into it), but source and target column types now differ, which is
+// the case where the checksum's CAST type comes from the *target* table —
+// exercising the VECTOR arm of castableTp on a genuine type change.
+func TestVectorE2EDimensionChange(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_widen", `CREATE TABLE vector_widen (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		embedding VECTOR(3) NOT NULL
+	)`)
+	for _, v := range vectorSeedValues {
+		testutils.RunSQL(t, fmt.Sprintf(
+			"INSERT INTO vector_widen (embedding) VALUES (STRING_TO_VECTOR('%s'))", v))
+	}
+	tt.SeedRows(t, "INSERT INTO vector_widen (embedding) SELECT STRING_TO_VECTOR('[0,0,0]')", 1000)
+	before := hexVectors(t, tt.DB, "vector_widen", "embedding")
+
+	m := NewTestRunner(t, "vector_widen", "MODIFY COLUMN embedding VECTOR(8) NOT NULL", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	var colType string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT column_type FROM information_schema.columns
+		 WHERE table_schema=DATABASE() AND table_name='vector_widen' AND column_name='embedding'`).Scan(&colType))
+	require.Equal(t, "vector(8)", colType)
+
+	require.Equal(t, before, hexVectors(t, tt.DB, "vector_widen", "embedding"),
+		"widening the declared dimension must not alter the stored vectors")
+}
+
+// TestVectorE2EAddColumn adds a VECTOR column to an existing table. The new
+// column only exists on the target, so the copier writes its DEFAULT and the
+// checksum compares the intersected columns — a cheap guard that a VECTOR
+// column present on one side only does not break either.
+func TestVectorE2EAddColumn(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_add", `CREATE TABLE vector_add (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		pad VARCHAR(64) NOT NULL
+	)`)
+	tt.SeedRows(t, "INSERT INTO vector_add (pad) SELECT 'bulk'", 1000)
+
+	m := NewTestRunner(t, "vector_add",
+		"ADD COLUMN embedding VECTOR(3) NULL, MODIFY COLUMN pad VARCHAR(300) NOT NULL",
+		WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	var nonNull int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_add WHERE embedding IS NOT NULL`).Scan(&nonNull))
+	require.Zero(t, nonNull, "the added VECTOR column has no source data, so every row must be NULL")
+
+	// The column must be usable afterwards.
+	testutils.RunSQL(t, "UPDATE vector_add SET embedding = STRING_TO_VECTOR('[0,0,0]') WHERE id = 1")
+	var dim int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT VECTOR_DIM(embedding) FROM vector_add WHERE id = 1`).Scan(&dim))
+	require.Equal(t, 3, dim)
+}
+
+// TestVectorConcurrentDML is the binlog-capture half of the issue: rows
+// written *while* the migration is copying reach the target through the
+// buffered subscription and the applier's REPLACE INTO, not through the
+// copier. Every concurrent write here carries an all-zeros vector, the value
+// whose byte image is valid UTF-8 — before the Datum fix the applier emitted
+// it as a quoted string literal and the flush failed with
+// ER_INVALID_CAST_TO_VECTOR, aborting the migration.
+func TestVectorConcurrentDML(t *testing.T) {
+	t.Parallel()
+	testutils.SkipUnlessVectorSupported(t)
+
+	tt := testutils.NewTestTable(t, "vector_dml", `CREATE TABLE vector_dml (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		info VARCHAR(64) NOT NULL,
+		embedding VECTOR(3) NOT NULL
+	)`)
+
+	// Rows the concurrent UPDATEs target. They start with a non-zero vector
+	// so a missed UPDATE leaves the row-copied value behind and the
+	// assertions below can tell the two apart.
+	testutils.RunSQL(t, `INSERT INTO vector_dml (info, embedding) VALUES
+		('update-target-1', STRING_TO_VECTOR('[1.5,-2,0.0003]')),
+		('update-target-2', STRING_TO_VECTOR('[1e30,-1e-5,123456789.5]')),
+		('delete-target', STRING_TO_VECTOR('[9,9,9]'))`)
+	tt.SeedRows(t, "INSERT INTO vector_dml (info, embedding) SELECT 'bulk', STRING_TO_VECTOR('[0,0,0]')", 2000)
+
+	m := NewTestRunner(t, "vector_dml", "MODIFY COLUMN info VARCHAR(300) NOT NULL",
+		WithThreads(1),
+		WithTestThrottler())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	dmlDone := make(chan struct{})
+	go func() {
+		defer close(dmlDone)
+		if !waitForCopyRows(t, ctx, m) {
+			return
+		}
+		// The DELETE happens once, up front, so the row is gone from the
+		// source before the copier necessarily reached it.
+		_, _ = tt.DB.ExecContext(ctx, `DELETE FROM vector_dml WHERE info = 'delete-target'`)
+		for range 50 {
+			if ctx.Err() != nil {
+				return
+			}
+			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO vector_dml (info, embedding) VALUES ('insert-during', STRING_TO_VECTOR('[0,0,0]'))`)
+			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO vector_dml (info, embedding) VALUES ('insert-during', STRING_TO_VECTOR('[0,1,0]'))`)
+			// UPDATE to the all-zeros vector: the full after-image drags the
+			// value back through the applier.
+			_, _ = tt.DB.ExecContext(ctx, `UPDATE vector_dml SET embedding = STRING_TO_VECTOR('[0,0,0]') WHERE info = 'update-target-1'`)
+			_, _ = tt.DB.ExecContext(ctx, `UPDATE vector_dml SET embedding = STRING_TO_VECTOR('[0,0,1e-5]') WHERE info = 'update-target-2'`)
+		}
+	}()
+
+	migrationErr := m.Run(ctx)
+	cancel()
+	<-dmlDone
+	require.NoError(t, m.Close())
+	require.NoError(t, migrationErr, "VECTOR values written during the copy must replicate through the applier")
+
+	// The UPDATE targets must hold their post-UPDATE values, proving the
+	// binlog UPDATE path replayed rather than the copier's initial image
+	// surviving.
+	requireVectorEquals(t, tt.DB, "update-target-1", "[0,0,0]")
+	requireVectorEquals(t, tt.DB, "update-target-2", "[0,0,1e-5]")
+
+	// The DELETE must have replayed too.
+	var deleted int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_dml WHERE info = 'delete-target'`).Scan(&deleted))
+	require.Zero(t, deleted, "the row deleted during the migration must not reappear on the target")
+
+	// Rows inserted during the copy must be present and intact — otherwise
+	// the binlog INSERT path was never exercised and the test is vacuous.
+	var insertCount int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_dml WHERE info = 'insert-during'`).Scan(&insertCount))
+	require.Positive(t, insertCount, "no concurrent INSERTs reached the binlog path — test is vacuous")
+
+	var badRows int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM vector_dml
+		 WHERE info = 'insert-during' AND (VECTOR_DIM(embedding) <> 3 OR OCTET_LENGTH(embedding) <> 12)`).Scan(&badRows))
+	require.Zero(t, badRows, "vectors inserted during the migration must keep their exact byte image")
+}
+
+// requireVectorEquals asserts the row identified by info holds exactly the
+// vector described by the given STRING_TO_VECTOR literal, compared as raw
+// bytes.
+func requireVectorEquals(t *testing.T, db *sql.DB, info, want string) {
+	t.Helper()
+	var got, expected string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT HEX(embedding), HEX(STRING_TO_VECTOR(?)) FROM vector_dml WHERE info = ? LIMIT 1`,
+		want, info).Scan(&got, &expected))
+	require.Equal(t, expected, got, "row %q must hold the vector %s", info, want)
+}
+
+func TestTinyInt1ValuesSurviveCopy(t *testing.T) {
+	t.Parallel()
+
+	// The (1) in tinyint(1) is a display width, not a range: the column holds
+	// the whole signed tinyint range. The copier reads rows back into Go to
+	// build its INSERT, and the driver reports a signed tinyint(1) as a Go
+	// bool, so every non-zero value arrives as true. Each value must reach the
+	// new table unchanged.
+	tt := testutils.NewTestTable(t, "tinyint1_copy", `CREATE TABLE tinyint1_copy (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		info VARCHAR(255) NOT NULL,
+		flags TINYINT(1) NOT NULL,
+		is_archived TINYINT(1) NOT NULL DEFAULT '0'
+	)`)
+
+	testutils.RunSQL(t, `INSERT INTO tinyint1_copy (info, flags, is_archived) VALUES
+		('zero', 0, 0),
+		('one', 1, 1),
+		('two', 2, 0),
+		('max', 127, 1),
+		('min', -128, 0)`)
+	tt.SeedRows(t, "INSERT INTO tinyint1_copy (info, flags) SELECT 'bulk', 3", 2000)
+
+	// Adding a column and an index in one statement leaves Spirit unable to
+	// prove the combination is INSTANT-safe, so the table is copied — which is
+	// what puts every stored value through the driver and back.
+	m := NewTestRunner(t, "tinyint1_copy",
+		"ADD COLUMN ref_code VARCHAR(64) COLLATE utf8mb4_bin NULL, ADD INDEX idx_ref_code (ref_code)",
+		WithThreads(1),
+		WithTestThrottler())
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	for _, tc := range []struct {
+		info string
+		want int
+	}{
+		{"zero", 0},
+		{"one", 1},
+		{"two", 2},
+		{"max", 127},
+		{"min", -128},
+	} {
+		requireTinyInt1(t, tt.DB, tc.info, tc.want)
+	}
+
+	// Every bulk row carries 3. Collapsing the column to a boolean rewrites
+	// them all to 1, which a single-row assertion could not distinguish from
+	// a chunk boundary effect.
+	var rewritten int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM tinyint1_copy WHERE info = 'bulk' AND flags <> 3`).Scan(&rewritten))
+	require.Zero(t, rewritten, "copied tinyint(1) values must not be coerced to 0/1")
+}
+
+// requireTinyInt1 asserts the row identified by info holds want in its flags
+// column.
+func requireTinyInt1(t *testing.T, db *sql.DB, info string, want int) {
+	t.Helper()
+	// Adding zero forces an integer result: tinyint(1) otherwise reaches the
+	// driver as a bool, which is the coercion under test.
+	var got int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT flags + 0 FROM tinyint1_copy WHERE info = ? LIMIT 1`, info).Scan(&got))
+	require.Equal(t, want, got, "row %q must hold flags=%d", info, want)
 }

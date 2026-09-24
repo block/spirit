@@ -4,13 +4,13 @@ import (
 	"testing"
 	"time"
 
+	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/replication"
-	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,6 +91,7 @@ func TestImmutableColumnUpdateFatal(t *testing.T) {
 // TestImmutableColumnUpdateFatalGTID mirrors TestImmutableColumnUpdateFatal
 // for the GTID-backed change source.
 func TestImmutableColumnUpdateFatalGTID(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)

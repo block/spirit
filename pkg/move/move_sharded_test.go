@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/sentinel"
@@ -14,7 +15,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,7 +49,7 @@ func TestShardedMove(t *testing.T) {
 
 	// Insert test data - we'll use user_id as the sharding column
 	// Insert enough rows to ensure both shards get data
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -84,7 +84,6 @@ func TestShardedMove(t *testing.T) {
 	// Configure the move with multiple targets
 	move := &Move{
 		SourceDSN:        sourceDSN,
-		TargetChunkTime:  5 * time.Second,
 		Threads:          2,
 		WriteThreads:     2,
 		ShardingProvider: shardingProvider,
@@ -193,12 +192,11 @@ func TestNtoMShardedMove(t *testing.T) {
 	}
 
 	move := &Move{
-		SourceDSNs:      []string{src0DSN, src1DSN},
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
-		Targets:         targets,
-		SourceTables:    []string{"users"},
+		SourceDSNs:   []string{src0DSN, src1DSN},
+		Threads:      2,
+		WriteThreads: 2,
+		Targets:      targets,
+		SourceTables: []string{"users"},
 		ShardingProvider: &testShardingProvider{
 			shardingColumn: "id",
 			hashFunc:       testutils.EvenOddHasher,
@@ -318,12 +316,11 @@ func TestNtoMShardedMoveCheckpointDeterminism(t *testing.T) {
 	}
 
 	move := &Move{
-		SourceDSNs:      reversedDSNs,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
-		Targets:         reversedTargets,
-		SourceTables:    []string{"users"},
+		SourceDSNs:   reversedDSNs,
+		Threads:      2,
+		WriteThreads: 2,
+		Targets:      reversedTargets,
+		SourceTables: []string{"users"},
 		ShardingProvider: &testShardingProvider{
 			shardingColumn: "id",
 			hashFunc:       testutils.EvenOddHasher,
@@ -387,13 +384,12 @@ func TestShardedMoveVindexUpdateFails(t *testing.T) {
 	require.NoError(t, err)
 
 	move := &Move{
-		SourceDSN:       testutils.DSNForDatabase(srcName),
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
+		SourceDSN:    testutils.DSNForDatabase(srcName),
+		Threads:      2,
+		WriteThreads: 2,
 		// The sentinel blocks the move before cutover, giving the test a
 		// deterministic window in which the repl client is streaming.
-		CreateSentinel: true,
+		DeferCutOver: true,
 		ShardingProvider: &testShardingProvider{
 			shardingColumn: "user_id",
 			hashFunc:       testutils.EvenOddHasher,
@@ -414,17 +410,7 @@ func TestShardedMoveVindexUpdateFails(t *testing.T) {
 
 	// Wait until the move blocks on the sentinel: the copy and the initial
 	// checksum are done and the repl client is streaming.
-	deadline := time.Now().Add(2 * time.Minute)
-	for runner.status.Get() != status.WaitingOnSentinelTable {
-		select {
-		case err := <-errCh:
-			t.Fatalf("move finished before reaching the sentinel wait: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the move to reach the sentinel wait")
-		}
-	}
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
 
 	// Change the vindex value of a row. The change feed must treat this as
 	// fatal and cancel the move.

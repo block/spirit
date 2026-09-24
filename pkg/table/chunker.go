@@ -23,8 +23,18 @@ const (
 	// is 50ms, an actual time 250ms+ will cause the dynamic chunk size to immediately be reduced.
 	DynamicPanicFactor = 5
 
-	// ChunkerDefaultTarget is the default chunker target
-	ChunkerDefaultTarget = 100 * time.Millisecond
+	// ChunkerDefaultTarget is the wall-clock budget the dynamic chunker sizes a
+	// chunk against whenever it uses the time signal: the checksum (a
+	// server-side CRC), and any copy chunker that isn't given a byte budget.
+	// It is deliberately a constant rather than a flag. It was previously
+	// settable per-run as --target-chunk-time, but that flag read as a copier
+	// knob and wasn't one — the copier sizes chunks by DefaultTargetChunkBytes.
+	//
+	// 5s is the top of the range the old flag accepted. Note to future self: if
+	// you increase it, extend the lock timeouts in dbconn/dbconn.go too,
+	// otherwise you will encounter problems. See
+	// https://github.com/block/spirit/issues/96 for an example.
+	ChunkerDefaultTarget = 5 * time.Second
 
 	// DefaultTargetChunkBytes is the in-memory byte budget the buffered copier
 	// sizes each chunk against (see dynamicChunkSizer.TargetChunkBytes). Because
@@ -53,6 +63,19 @@ type Chunker interface {
 	Next() (*Chunk, error)
 	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)
 	Progress() (rowsRead uint64, chunksCopied uint64, totalRowsExpected uint64)
+	// RowsCopied returns the number of rows the applier has actually settled,
+	// summed from the actualRows reported to Feedback. It is deliberately not
+	// Progress's first return: the optimistic chunker measures progress as
+	// distance travelled through the auto-increment key space (so that it can
+	// be compared against the auto-increment max), which on a sparse table is
+	// nothing like a row count. Use Progress to render a percentage, and this
+	// to report how much data was copied.
+	//
+	// A resumed run carries the count forward from the watermark, so it
+	// reports the work of every run that contributed to the copy rather than
+	// only what this chunker has seen. A watermark written before a chunker
+	// persisted its count resumes at zero.
+	RowsCopied() uint64
 	OpenAtWatermark(watermark string) error
 	GetLowWatermark() (watermark string, err error)
 	// Reset resets the chunker to start from the beginning, as if Open() was just called.
@@ -77,6 +100,20 @@ type MappedChunker interface {
 	ColumnMapping() *ColumnMapping
 	KeyAboveHighWatermark(key0 any) bool
 	KeyBelowLowWatermark(key0 any) bool
+	// KeyNotYetDispatched reports whether the chunker has definitely not yet
+	// handed out a chunk covering key0. When true, no copier read for that key
+	// is in flight, so a buffered change for it can be flushed immediately:
+	// the copier's later read of the covering chunk observes a source state at
+	// least as new as the change, and overwrites it. It is the flush-time
+	// counterpart of KeyBelowLowWatermark ("already copied and committed") —
+	// between them sits the in-flight band, which is the only region a flush
+	// must defer.
+	//
+	// TRUE means the caller will flush, so any ambiguity must return FALSE.
+	// Unlike KeyAboveHighWatermark this is NOT a discard decision, so it
+	// deliberately ignores checkpointHighPtr: a key copied by a *previous*
+	// run has no read in flight in this one.
+	KeyNotYetDispatched(key0 any) bool
 }
 
 // ChunkerConfig holds optional configuration for creating a Chunker.
@@ -89,10 +126,10 @@ type ChunkerConfig struct {
 	// TargetChunkTime is the target duration for each chunk. Defaults to ChunkerDefaultTarget.
 	TargetChunkTime time.Duration
 	// TargetChunkBytes, when non-zero, switches the dynamic chunker from the
-	// wall-clock signal to an in-memory byte-budget signal (the buffered-copier
-	// default, table.DefaultTargetChunkBytes). Only meaningful for the buffered
-	// copier, which reads full rows into memory; the unbuffered and checksum
-	// paths never see row bytes and keep the time signal. See
+	// wall-clock signal to an in-memory byte-budget signal (the copier
+	// default, table.DefaultTargetChunkBytes). Only meaningful for the
+	// copier, which reads full rows into memory; the checksum path never
+	// sees row bytes and keeps the time signal. See
 	// dynamicChunkSizer.TargetChunkBytes.
 	TargetChunkBytes uint64
 	// Logger is the structured logger. Defaults to slog.Default().

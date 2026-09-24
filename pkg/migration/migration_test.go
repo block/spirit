@@ -17,8 +17,7 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 
-	"github.com/go-sql-driver/mysql"
-	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -37,8 +36,8 @@ func TestMain(m *testing.M) {
 	// can't race the many t.Parallel() tests. Only the divergence test depends
 	// on these; the defer-cutover tests drop the sentinel well before the first
 	// inter-pass interval, so they run a single pass regardless of the value.
-	checksum.ContinuousMinPassInterval = 2 * time.Second
-	checksum.DefaultContinuousRetryDelay = 1 * time.Second
+	checksum.LocklessMinPassInterval = 2 * time.Second
+	checksum.DefaultLocklessRetryDelay = 1 * time.Second
 	goleak.VerifyTestMain(m)
 }
 
@@ -49,7 +48,7 @@ func TestE2ENullAlterEmpty(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("t1e2e"), WithAlter("ENGINE=InnoDB"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1e2e ENGINE=InnoDB"))
 	require.NoError(t, m.Run())
 }
 
@@ -61,8 +60,8 @@ func TestE2EExplicitAutoIncrementInAlter(t *testing.T) {
 		PRIMARY KEY (id)
 	) ENGINE=InnoDB AUTO_INCREMENT=1000`)
 
-	m := NewTestMigration(t, WithTable("t1explicit_autoinc"),
-		WithAlter("ADD COLUMN test_col VARCHAR(255), AUTO_INCREMENT=5000"))
+	m := NewTestMigration(t,
+		WithStatement("ALTER TABLE t1explicit_autoinc ADD COLUMN test_col VARCHAR(255), AUTO_INCREMENT=5000"))
 	require.NoError(t, m.Run())
 
 	// Verify that new inserts start from 5000
@@ -72,17 +71,27 @@ func TestE2EExplicitAutoIncrementInAlter(t *testing.T) {
 	require.Equal(t, int64(5000), insertedID, "User-specified AUTO_INCREMENT=5000 should be preserved")
 }
 
-func TestMissingAlter(t *testing.T) {
+func TestMissingStatement(t *testing.T) {
 	t.Parallel()
-	testutils.NewTestTable(t, "t1missing", `CREATE TABLE t1missing (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	m := NewTestMigration(t, WithTable("t1missing"), WithAlter(""))
+	// --statement is the only way to describe the change, so an empty one
+	// must be rejected before we touch the database.
+	m := NewTestMigration(t)
 	err := m.Run()
 	require.Error(t, err)
-	require.ErrorContains(t, err, "alter statement is required")
+	require.ErrorContains(t, err, "--statement is required")
+
+	// A statement that is not a schema change at all is rejected too.
+	m = NewTestMigration(t, WithStatement("SELECT 1"))
+	err = m.Run()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "not a supported statement type")
+
+	// An ALTER TABLE that does not say what to alter. MySQL rejects this as a
+	// syntax error; our parser accepts it, so it is rejected downstream.
+	m = NewTestMigration(t, WithStatement("ALTER TABLE t1missing"))
+	err = m.Run()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "does not specify any changes")
 }
 
 func TestBadDatabaseCredentials(t *testing.T) {
@@ -92,7 +101,7 @@ func TestBadDatabaseCredentials(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("t1bad"), WithAlter("ENGINE=InnoDB"), WithHost("127.0.0.1:9999"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1bad ENGINE=InnoDB"), WithHost("127.0.0.1:9999"))
 	err := m.Run()
 	require.Error(t, err)
 	require.ErrorContains(t, err, "connect: connection refused")
@@ -106,7 +115,7 @@ func TestE2ENullAlter1Row(t *testing.T) {
 		PRIMARY KEY (id)
 	)`)
 	testutils.RunSQL(t, `INSERT INTO t1nullalter (id, name) VALUES (1, 'aaa')`)
-	m := NewTestMigration(t, WithTable("t1nullalter"), WithAlter("ENGINE=InnoDB"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1nullalter ENGINE=InnoDB"))
 	require.NoError(t, m.Run())
 }
 
@@ -125,7 +134,7 @@ func TestE2EAutoscalingEnabled(t *testing.T) {
 		PRIMARY KEY (id)
 	)`)
 	testutils.RunSQL(t, `INSERT INTO t1autoscale (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')`)
-	m := NewTestMigration(t, WithTable("t1autoscale"), WithAlter("ENGINE=InnoDB"),
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1autoscale ENGINE=InnoDB"),
 		WithWriteThreads(2), WithAutoscaling())
 	require.NoError(t, m.Run())
 
@@ -146,7 +155,7 @@ func TestE2ENullAlterWithReplicas(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("replicatest"), WithAlter("ENGINE=InnoDB"),
+	m := NewTestMigration(t, WithStatement("ALTER TABLE replicatest ENGINE=InnoDB"),
 		WithReplicaDSN(replicaDSN), WithReplicaMaxLag(10*time.Second))
 	require.NoError(t, m.Run())
 }
@@ -162,21 +171,12 @@ func TestRenameInMySQL80(t *testing.T) {
 		name varchar(255) NOT NULL,
 		PRIMARY KEY (id)
 	)`)
-	m := NewTestMigration(t, WithTable("renamet1"), WithAlter("CHANGE name nameNew varchar(255) not null"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE renamet1 CHANGE name nameNew varchar(255) not null"))
 	require.NoError(t, m.Run())
 }
 
 func TestGeneratedColumns(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testGeneratedColumns(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testGeneratedColumns(t, true)
-	})
-}
-
-func testGeneratedColumns(t *testing.T, enableBuffered bool) {
 	testutils.NewTestTable(t, "t1generated", `CREATE TABLE t1generated (
 		id int not null primary key auto_increment,
 		b int not null,
@@ -184,21 +184,12 @@ func testGeneratedColumns(t *testing.T, enableBuffered bool) {
 		d int
 	)`)
 	testutils.RunSQL(t, `INSERT INTO t1generated (b, d) VALUES (1, 10), (2, 20), (3, 30)`)
-	m := NewTestMigration(t, WithTable("t1generated"), WithAlter("ENGINE=InnoDB"), WithBuffered(enableBuffered))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE t1generated ENGINE=InnoDB"))
 	require.NoError(t, m.Run())
 }
 
 func TestStoredGeneratedColumns(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testStoredGeneratedColumns(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testStoredGeneratedColumns(t, true)
-	})
-}
-
-func testStoredGeneratedColumns(t *testing.T, enableBuffered bool) {
 	testutils.NewTestTable(t, "t1stored", `CREATE TABLE t1stored (
 		id bigint NOT NULL AUTO_INCREMENT,
 		pa bigint DEFAULT NULL,
@@ -217,7 +208,7 @@ func testStoredGeneratedColumns(t *testing.T, enableBuffered bool) {
 		(1, 1, 0, 95), (1, 0, 1, 94), (1, 0, 0, 93), (1, NULL, 0, 92),
 		(1, 0, NULL, 91), (1, NULL, NULL, 90), (NULL, NULL, NULL, 89)`)
 
-	m := NewTestMigration(t, WithBuffered(enableBuffered),
+	m := NewTestMigration(t,
 		WithStatement(`ALTER TABLE t1stored MODIFY COLUMN s4 TINYINT(1) GENERATED ALWAYS AS (IF(pa <> p2 OR (pa IS NULL AND p2 IS NOT NULL) OR (pa IS NOT NULL AND p2 IS NULL), 1, NULL)) STORED`))
 	require.NoError(t, m.Run())
 }
@@ -232,15 +223,6 @@ type testcase struct {
 // without an intermediate cast.
 func TestBinaryChecksum(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testBinaryChecksum(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testBinaryChecksum(t, true)
-	})
-}
-
-func testBinaryChecksum(t *testing.T, enableBuffered bool) {
 	tests := []testcase{
 		{"binary(50)", "varbinary(100)"},
 		{"binary(50)", "binary(100)"},
@@ -260,8 +242,8 @@ func testBinaryChecksum(t *testing.T, enableBuffered bool) {
 		)`, test.OldType))
 		testutils.RunSQL(t, `INSERT INTO t1varbin VALUES (null, 'abcdefg')`)
 
-		m := NewTestMigration(t, WithTable("t1varbin"), WithBuffered(enableBuffered),
-			WithAlter(fmt.Sprintf("CHANGE b b %s not null", test.NewType))) //nolint: dupword
+		m := NewTestMigration(t,
+			WithStatement(fmt.Sprintf("ALTER TABLE t1varbin CHANGE b b %s not null", test.NewType))) //nolint: dupword
 		require.NoError(t, m.Run())
 	}
 }
@@ -271,29 +253,20 @@ func testBinaryChecksum(t *testing.T, enableBuffered bool) {
 // checksum correctly against their multi-byte utf8mb4 representations
 func TestConvertCharset(t *testing.T) {
 	t.Parallel()
-	t.Run("unbuffered", func(t *testing.T) {
-		testConvertCharset(t, false)
-	})
-	t.Run("buffered", func(t *testing.T) {
-		testConvertCharset(t, true)
-	})
-}
-
-func testConvertCharset(t *testing.T, enableBuffered bool) {
 	testutils.NewTestTable(t, "t1charset", `CREATE TABLE t1charset (
 		id int not null primary key auto_increment,
 		b varchar(100) not null
 	) charset=latin1`)
 	testutils.RunSQL(t, `INSERT INTO t1charset VALUES (null, 'à'), (null, '€')`)
 
-	m := NewTestMigration(t, WithTable("t1charset"), WithBuffered(enableBuffered),
-		WithAlter("CONVERT TO CHARACTER SET UTF8MB4"))
+	m := NewTestMigration(t,
+		WithStatement("ALTER TABLE t1charset CONVERT TO CHARACTER SET UTF8MB4"))
 	require.NoError(t, m.Run())
 
 	// Because utf8mb4 is the superset, it doesn't matter that that's
 	// what the checksum casts to. We should be able to convert back as well.
-	m = NewTestMigration(t, WithTable("t1charset"), WithBuffered(enableBuffered),
-		WithAlter("CONVERT TO CHARACTER SET latin1"))
+	m = NewTestMigration(t,
+		WithStatement("ALTER TABLE t1charset CONVERT TO CHARACTER SET latin1"))
 	require.NoError(t, m.Run())
 }
 
@@ -369,8 +342,7 @@ func TestLargeNumberOfMultiChanges(t *testing.T) {
 		}
 	})
 
-	m := NewTestMigration(t, WithTargetChunkTime(2*time.Second),
-		WithStatement(strings.Join(alterStmts, "; ")))
+	m := NewTestMigration(t, WithStatement(strings.Join(alterStmts, "; ")))
 	require.NoError(t, m.Run())
 }
 
@@ -392,7 +364,7 @@ func TestBufferedMultiTableMigration(t *testing.T) {
 		WITH RECURSIVE seq_cte AS (SELECT 0 AS seq UNION ALL SELECT seq+1 FROM seq_cte WHERE seq < 99)
 		SELECT seq FROM seq_cte) t`)
 
-	m := NewTestMigration(t, WithBuffered(true),
+	m := NewTestMigration(t,
 		WithStatement("ALTER TABLE bmt_t1 ADD COLUMN extra int DEFAULT 0; ALTER TABLE bmt_t2 ADD COLUMN extra int DEFAULT 0"))
 	require.NoError(t, m.Run())
 
@@ -408,7 +380,7 @@ func TestBufferedMultiTableMigration(t *testing.T) {
 
 func TestMigrationParamsDefaultsUsed(t *testing.T) {
 	t.Parallel()
-	migration := &Migration{Table: "test_table", Alter: "ENGINE=INNODB"}
+	migration := &Migration{Statement: "ALTER TABLE test_table ENGINE=INNODB"}
 
 	_, err := migration.normalizeOptions()
 	require.NoError(t, err)
@@ -446,8 +418,7 @@ func TestMigrationParamsCLIUsed(t *testing.T) {
 		Username:           "cli-user",
 		Password:           new("cli-password"),
 		Database:           "cli-db",
-		Table:              "testtable",
-		Alter:              "ENGINE=InnoDB",
+		Statement:          "ALTER TABLE testtable ENGINE=InnoDB",
 		TLSMode:            "VERIFY_CA",
 		TLSCertificatePath: "/path/to/ca",
 	}
@@ -466,9 +437,8 @@ func TestMigrationParamsCLIUsed(t *testing.T) {
 func TestMigrationParamsEmptyPasswordUsedIfProvided(t *testing.T) {
 	t.Parallel()
 	migration := &Migration{
-		Password: new(""),
-		Table:    "test_table",
-		Alter:    "ENGINE=INNODB",
+		Password:  new(""),
+		Statement: "ALTER TABLE test_table ENGINE=INNODB",
 	}
 
 	_, err := migration.normalizeOptions()
@@ -485,13 +455,12 @@ func TestMigrationParamsEmptyPasswordUsedIfProvided(t *testing.T) {
 func TestMigrationParamsIniFileInvalidFile(t *testing.T) {
 	t.Parallel()
 	migration := &Migration{
-		Host:     "localhost:3306",
-		Username: "defaultuser",
-		Password: new("defaultpass"),
-		Database: "testdb",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: "/nonexistent/file.cnf",
+		Host:      "localhost:3306",
+		Username:  "defaultuser",
+		Password:  new("defaultpass"),
+		Database:  "testdb",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  "/nonexistent/file.cnf",
 	}
 
 	_, err := migration.normalizeOptions()
@@ -516,8 +485,7 @@ tls-ca = /path/from/file
 		Username:           "cli-user",
 		Password:           new("cli-password"),
 		Database:           "cli-db",
-		Table:              "testtable",
-		Alter:              "ENGINE=InnoDB",
+		Statement:          "ALTER TABLE testtable ENGINE=InnoDB",
 		ConfFile:           confPath,
 		TLSMode:            "REQUIRED",
 		TLSCertificatePath: "/path/to/cert",
@@ -547,9 +515,8 @@ tls-ca = /path/to/cert
 `)
 
 	migration := &Migration{
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -575,9 +542,8 @@ tls-ca = /path/to/another/ca
 `)
 
 	migration := &Migration{
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -599,12 +565,11 @@ user = fileuser
 `)
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Password: new("cli-pass"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Password:  new("cli-pass"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -625,12 +590,11 @@ password = filepass
 `)
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -652,12 +616,11 @@ password =
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -679,13 +642,12 @@ password =
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Password: new("cli-password"),
-		Username: "cli-user",
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Password:  new("cli-password"),
+		Username:  "cli-user",
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -707,13 +669,12 @@ port=1234
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host",
-		Username: "cli-user",
-		Password: new("cli-password"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -735,13 +696,12 @@ func TestMigrationParamsIniFileEmptyClientSection(t *testing.T) {
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Password: new("cli-password"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -765,13 +725,12 @@ password = mysqlpass
 	// File will be cleaned up by t.TempDir()
 
 	migration := &Migration{
-		Host:     "cli-host:3306",
-		Username: "cli-user",
-		Password: new("cli-password"),
-		Database: "cli-db",
-		Table:    "testtable",
-		Alter:    "ENGINE=InnoDB",
-		ConfFile: confPath,
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
 	}
 
 	_, err := migration.normalizeOptions()
@@ -792,22 +751,24 @@ func TestBadOptions(t *testing.T) {
 	t.Parallel()
 	_, err := NewRunner(&Migration{})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "table name is required")
+	require.ErrorContains(t, err, "--statement is required")
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
 	_, err = NewRunner(&Migration{Host: cfg.Addr})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "table name is required")
+	require.ErrorContains(t, err, "--statement is required")
 
-	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mytable"})
+	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mydatabase"})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "table name is required")
+	require.ErrorContains(t, err, "--statement is required")
 
-	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mydatabase", Table: "mytable"})
+	// The schema in the statement must match --database.
+	_, err = NewRunner(&Migration{Host: cfg.Addr, Database: "mydatabase",
+		Statement: "ALTER TABLE otherdb.mytable ENGINE=InnoDB"})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "alter statement is required")
+	require.ErrorContains(t, err, "does not match --database")
 }
 
 // TestBadAlter tests various invalid ALTER statement scenarios.
@@ -825,7 +786,7 @@ func TestBadAlter(t *testing.T) {
 	)`)
 
 	// Completely invalid ALTER — should fail at parse time.
-	m := NewTestMigration(t, WithTable("bot1"), WithAlter("badalter"))
+	m := NewTestMigration(t, WithStatement("ALTER TABLE bot1 badalter"))
 	r, err := NewRunner(m)
 	require.Nil(t, r)
 	require.Error(t, err)
@@ -860,13 +821,12 @@ func TestBadAlter(t *testing.T) {
 func TestDefaultPort(t *testing.T) {
 	t.Parallel()
 	m, err := NewRunner(&Migration{
-		Host:     "localhost",
-		Username: "root",
-		Password: new("mypassword"),
-		Database: "test",
-		Threads:  2,
-		Table:    "t1",
-		Alter:    "DROP COLUMN b, ENGINE=InnoDB",
+		Host:      "localhost",
+		Username:  "root",
+		Password:  new("mypassword"),
+		Database:  "test",
+		Threads:   2,
+		Statement: "ALTER TABLE t1 DROP COLUMN b, ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	require.Equal(t, "localhost:3306", m.migration.Host)
@@ -921,22 +881,10 @@ func TestDSN(t *testing.T) {
 	}
 }
 
-// TestE2EGTIDChangeSource exercises the experimental --gtid path end-to-end.
-// Same shape as TestE2ENullAlterEmpty but with the GTID change source wired in.
-func TestE2EGTIDChangeSource(t *testing.T) {
-	t.Parallel()
-	testutils.NewTestTable(t, "t1e2egtid", `CREATE TABLE t1e2egtid (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	m := NewTestMigration(t, WithTable("t1e2egtid"), WithAlter("ENGINE=InnoDB"), WithGTID(true))
-	require.NoError(t, m.Run())
-}
-
-// TestMigrationValidate covers the Kong Validate() hook: invalid flag
-// combinations and explicitly-negative numeric/duration flags are rejected,
-// while zero values (meaning "use the default") pass.
+// TestMigrationValidate covers the Kong Validate() hook: explicitly-negative
+// numeric/duration flags are rejected, while zero values (meaning "use the
+// default") pass. Validate() has no cross-flag combination checks today; add a
+// case here alongside the first one.
 func TestMigrationValidate(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -948,19 +896,13 @@ func TestMigrationValidate(t *testing.T) {
 		{name: "typical values are valid", m: Migration{
 			Threads:          4,
 			WriteThreads:     4,
-			TargetChunkTime:  500 * time.Millisecond,
 			ReplicaMaxLag:    120 * time.Second,
 			CheckpointMaxAge: 168 * time.Hour,
-			Lint:             true,
 		}},
-		{name: "lint and lint-only together", m: Migration{Lint: true, LintOnly: true},
-			wantErr: "--lint and --lint-only cannot be used together"},
 		{name: "negative threads", m: Migration{Threads: -5},
 			wantErr: "--threads must be non-negative, got -5"},
 		{name: "negative write-threads", m: Migration{WriteThreads: -1},
 			wantErr: "--write-threads must be non-negative, got -1"},
-		{name: "negative target-chunk-time", m: Migration{TargetChunkTime: -time.Second},
-			wantErr: "--target-chunk-time must be non-negative, got -1s"},
 		{name: "negative replica-max-lag", m: Migration{ReplicaMaxLag: -time.Minute},
 			wantErr: "--replica-max-lag must be non-negative, got -1m0s"},
 		{name: "negative checkpoint-max-age", m: Migration{CheckpointMaxAge: -time.Hour},

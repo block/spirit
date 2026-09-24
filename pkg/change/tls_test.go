@@ -98,9 +98,9 @@ func TestTLSConfigurationLogic(t *testing.T) {
 				if dbconn.IsRDSHost(client.host) {
 					tlsConfig = dbconn.NewTLSConfig()
 				} else {
-					// For testing, use embedded RDS bundle since we don't have actual cert files
-					certData := dbconn.GetEmbeddedRDSBundle()
-					tlsConfig = dbconn.NewCustomTLSConfig(certData, client.dbConfig.TLSMode)
+					// nil cert data means "use the RDS roots", which is what
+					// this test wants: it has no cert files of its own.
+					tlsConfig = dbconn.NewCustomTLSConfig(nil, client.dbConfig.TLSMode)
 				}
 
 				if tlsConfig != nil {

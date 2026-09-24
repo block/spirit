@@ -16,12 +16,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -82,7 +83,7 @@ func newFanInFeed(t *testing.T, positions []string) (*ReverseFeed, *sql.DB) {
 		}
 	}
 
-	feed, err := NewReverseFeed(ReverseFeedConfig{
+	feed, err := NewReverseFeed(t.Context(), ReverseFeedConfig{
 		Sources:      []ReverseSource{mkSource("poc_rf_s0", 0), mkSource("poc_rf_s1", 1)},
 		Target:       applier.Target{DB: uDB, KeyRange: "0"},
 		TargetTables: map[string]*table.TableInfo{"t1": uTbl},
@@ -199,4 +200,175 @@ func TestReverseFeedStartCleanupOnPartialFailure(t *testing.T) {
 	err := feed.Start(t.Context())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "start source 1", "the second source must be the one that fails")
+}
+
+// --- Sharded (M:N) reverse feed ---
+//
+// Layout for the sharded variant: poc_rfnm_u0 / poc_rfnm_u1 = the former
+// SOURCE shards (reverse targets), holding their post-cutover retired t1_old
+// tables split by id parity (EvenOddHasher: even → "-80" → u0, odd → "80-" →
+// u1). poc_rfnm_s0 / poc_rfnm_s1 = the former move targets (reverse sources),
+// watched under their real t1 names, with the source keyspace's sharding
+// metadata attached — the reverse feed routes each row back to the source
+// shard whose key range contains its hash.
+
+// setupFanOut builds the post-forward-cutover state of a 2:2 move.
+func setupFanOut(t *testing.T) {
+	t.Helper()
+	for _, s := range []string{"poc_rfnm_u0", "poc_rfnm_u1"} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+s)
+		testutils.RunSQL(t, "CREATE DATABASE "+s)
+		testutils.RunSQL(t, "CREATE TABLE "+s+".t1_old (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
+	}
+	for _, s := range []string{"poc_rfnm_s0", "poc_rfnm_s1"} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+s)
+		testutils.RunSQL(t, "CREATE DATABASE "+s)
+		testutils.RunSQL(t, "CREATE TABLE "+s+".t1 (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
+	}
+	// Source shards split by id parity; the former targets split by id range
+	// (any distribution works — the feed only cares where rows land, not where
+	// they come from).
+	testutils.RunSQL(t, "INSERT INTO poc_rfnm_u0.t1_old VALUES (2,'two'),(4,'four'),(6,'six')")
+	testutils.RunSQL(t, "INSERT INTO poc_rfnm_u1.t1_old VALUES (1,'one'),(3,'three'),(5,'five')")
+	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s0.t1 VALUES (1,'one'),(2,'two'),(3,'three')")
+	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s1.t1 VALUES (4,'four'),(5,'five'),(6,'six')")
+}
+
+// newFanOutFeed wires the sharded reverse feed s0,s1 → u0 ("-80"), u1 ("80-").
+func newFanOutFeed(t *testing.T) (*ReverseFeed, *sql.DB) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	u0DB := openSchemaConn(t, "poc_rfnm_u0")
+	u1DB := openSchemaConn(t, "poc_rfnm_u1")
+	// One shared _old mapping TableInfo: the name is unqualified, so each
+	// shard's own connection determines the database written to.
+	oldTbl := reverseTableInfo(t, u0DB, "poc_rfnm_u0", "t1_old")
+
+	mkSource := func(schema string) ReverseSource {
+		sDB := openSchemaConn(t, schema)
+		wt := reverseTableInfo(t, sDB, schema, "t1")
+		wt.ShardingColumn = "id"
+		wt.HashFunc = testutils.EvenOddHasher
+		return ReverseSource{
+			DB:       sDB,
+			Addr:     cfg.Addr,
+			User:     cfg.User,
+			Password: cfg.Passwd,
+			Tables:   []*table.TableInfo{wt},
+		}
+	}
+
+	feed, err := NewReverseFeed(t.Context(), ReverseFeedConfig{
+		Sources: []ReverseSource{mkSource("poc_rfnm_s0"), mkSource("poc_rfnm_s1")},
+		Targets: []applier.Target{
+			{DB: u0DB, KeyRange: "-80"},
+			{DB: u1DB, KeyRange: "80-"},
+		},
+		TargetTables: map[string]*table.TableInfo{"t1": oldTbl},
+	})
+	require.NoError(t, err)
+	return feed, u0DB
+}
+
+// TestReverseFeedFanOutRoutesByShard: writes on BOTH former targets flow back
+// to the source SHARD owning each row (by the source vindex), into its t1_old
+// table. This is the M:N reverse the 1:N fan-in tests above cannot cover.
+func TestReverseFeedFanOutRoutesByShard(t *testing.T) {
+	setupFanOut(t)
+	feed, ctl := newFanOutFeed(t)
+	defer feed.Close()
+	require.NoError(t, feed.Start(t.Context()))
+
+	// "App writes" landing on each former target after cutover.
+	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s0.t1 VALUES (7,'seven')")  // odd  → u1
+	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s1.t1 VALUES (8,'eight')")  // even → u0
+	testutils.RunSQL(t, "UPDATE poc_rfnm_s0.t1 SET val='TWO' WHERE id=2") // even → u0
+	testutils.RunSQL(t, "DELETE FROM poc_rfnm_s1.t1 WHERE id=5")          // broadcast delete
+
+	require.NoError(t, feed.Flush(t.Context()))
+
+	require.Equal(t,
+		[]string{"2=TWO", "4=four", "6=six", "8=eight"},
+		dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_u0.t1_old ORDER BY id"),
+		"u0 must hold exactly the even rows")
+	require.Equal(t,
+		[]string{"1=one", "3=three", "7=seven"},
+		dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_u1.t1_old ORDER BY id"),
+		"u1 must hold exactly the odd rows")
+	union := dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_s0.t1 UNION ALL SELECT id,val FROM poc_rfnm_s1.t1 ORDER BY id")
+	got := dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_u0.t1_old UNION ALL SELECT id,val FROM poc_rfnm_u1.t1_old ORDER BY id")
+	require.Equal(t, union, got, "the source shards' union must equal the former targets' union")
+}
+
+// TestReverseFeedShardedConfigValidation: the sharded target form fails fast on
+// a config that could not route (both target forms set, or watched tables
+// without sharding metadata).
+func TestReverseFeedShardedConfigValidation(t *testing.T) {
+	setupFanOut(t)
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	u0DB := openSchemaConn(t, "poc_rfnm_u0")
+	u1DB := openSchemaConn(t, "poc_rfnm_u1")
+	oldTbl := reverseTableInfo(t, u0DB, "poc_rfnm_u0", "t1_old")
+	sDB := openSchemaConn(t, "poc_rfnm_s0")
+	bare := reverseTableInfo(t, sDB, "poc_rfnm_s0", "t1") // no sharding metadata
+	src := ReverseSource{
+		DB: sDB, Addr: cfg.Addr, User: cfg.User, Password: cfg.Passwd,
+		Tables: []*table.TableInfo{bare},
+	}
+	targets := []applier.Target{{DB: u0DB, KeyRange: "-80"}, {DB: u1DB, KeyRange: "80-"}}
+
+	_, err = NewReverseFeed(t.Context(), ReverseFeedConfig{
+		Sources:      []ReverseSource{src},
+		Target:       applier.Target{DB: u0DB},
+		Targets:      targets,
+		TargetTables: map[string]*table.TableInfo{"t1": oldTbl},
+	})
+	require.ErrorContains(t, err, "mutually exclusive")
+
+	_, err = NewReverseFeed(t.Context(), ReverseFeedConfig{
+		Sources:      []ReverseSource{src},
+		Targets:      targets,
+		TargetTables: map[string]*table.TableInfo{"t1": oldTbl},
+	})
+	require.ErrorContains(t, err, "no sharding metadata")
+
+	// A nil shard connection would otherwise only surface when a row happened
+	// to route to that shard, mid-window.
+	_, err = NewReverseFeed(t.Context(), ReverseFeedConfig{
+		Sources:      []ReverseSource{src},
+		Targets:      []applier.Target{{DB: u0DB, KeyRange: "-80"}, {DB: nil, KeyRange: "80-"}},
+		TargetTables: map[string]*table.TableInfo{"t1": oldTbl},
+	})
+	require.ErrorContains(t, err, "target 1 DB must be non-nil")
+}
+
+// TestReverseFeedAllChangesFlushed pins the check the reverse cutover depends
+// on before it discards the buffer.
+//
+// The reverse cutover flushes, then Closes the feed — and Close discards
+// pending changes rather than applying them — then renames the source's _old
+// tables back into service. So anything still buffered at that point is a
+// target-era write that is lost. A nil error from Flush does not rule that out:
+// a drain can decline to finish (lock contention it could not resolve in its
+// budget, or a drain cut short to bound how long it holds the flush mutex) and
+// reports that by leaving the changes buffered, and Flush's own loop exits on a
+// *trivial* backlog rather than an empty one.
+func TestReverseFeedAllChangesFlushed(t *testing.T) {
+	clean := &fakeChangeSource{}
+	stuck := &fakeChangeSource{}
+	stuck.notFlushed.Store(true)
+
+	require.True(t, (&ReverseFeed{clients: []change.Source{clean}}).AllChangesFlushed())
+	require.True(t, (&ReverseFeed{clients: []change.Source{clean, clean}}).AllChangesFlushed())
+
+	// One feed holding changes is enough: the renames put every source's _old
+	// tables back, so a single un-applied shard loses writes.
+	require.False(t, (&ReverseFeed{clients: []change.Source{clean, stuck}}).AllChangesFlushed(),
+		"one feed still holding changes must fail the check")
+	require.False(t, (&ReverseFeed{clients: []change.Source{stuck, clean}}).AllChangesFlushed(),
+		"order must not matter")
 }

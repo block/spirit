@@ -10,10 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,7 +32,7 @@ func createW3DDatabase(t *testing.T) (string, *sql.DB) {
 	require.GreaterOrEqual(t, lastSlash, 0, "could not parse DSN")
 	rootDSN := baseDSN[:lastSlash+1]
 
-	rootDB, err := sql.Open("mysql", rootDSN)
+	rootDB, err := sql.Open("block-mysql", rootDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(rootDB)
 	_, err = rootDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+dbName)
@@ -40,11 +40,11 @@ func createW3DDatabase(t *testing.T) (string, *sql.DB) {
 	_, err = rootDB.ExecContext(t.Context(), "CREATE DATABASE "+dbName)
 	require.NoError(t, err)
 
-	scopedDB, err := sql.Open("mysql", rootDSN+dbName)
+	scopedDB, err := sql.Open("block-mysql", rootDSN+dbName)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = scopedDB.Close()
-		cleanupDB, err := sql.Open("mysql", rootDSN)
+		cleanupDB, err := sql.Open("block-mysql", rootDSN)
 		require.NoError(t, err)
 		defer func() { _ = cleanupDB.Close() }()
 		_, _ = cleanupDB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+dbName)

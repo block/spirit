@@ -19,12 +19,30 @@ type Chunk struct {
 	ColumnMapping        *ColumnMapping // Column relationship between source and target, including renames
 
 	// ActualBytes is a transient measurement, not part of the chunk's identity
-	// or its checkpoint/watermark JSON (see JSON()). The buffered copier sets it
-	// to the in-memory size of the rows it read for this chunk, so the chunker's
+	// or its checkpoint/watermark JSON (see JSON()). The copier sets it to the
+	// in-memory size of the rows it read for this chunk, so the chunker's
 	// Feedback() can size the next chunk against a byte budget instead of wall
 	// time when dynamicChunkSizer.TargetChunkBytes is set. Zero for the
-	// unbuffered/checksum paths, which read server-side and never see the bytes.
+	// checksum path, which reads server-side and never sees the bytes.
 	ActualBytes uint64
+
+	// SourceRows is the companion of ActualBytes: the number of rows the
+	// producer actually read from the source for this chunk. Like ActualBytes it
+	// is transient and absent from the checkpoint JSON.
+	//
+	// It exists because the row count reaching Feedback() is not the rows
+	// *present*. On the copy path that argument is the applier's affected-row
+	// count from `INSERT IGNORE`, which skips any row the binlog applier had
+	// already written to the new table — so a fully dense chunk can report far
+	// fewer rows than it holds, or zero. The optimistic chunker's key-space
+	// density signal needs rows present, not rows written, or it reads an
+	// insert-hot region as a gap (see chunkerOptimistic.recordKeyDensity).
+	//
+	// Zero from producers that never hold the rows themselves — the checksum
+	// aggregates its CRC server-side — which is also what an empty chunk
+	// reports, and the two are interchangeable for density purposes because an
+	// empty chunk's affected-row count is zero too.
+	SourceRows uint64
 }
 
 // Boundary is used by chunk for lower or upper boundary
@@ -73,18 +91,51 @@ func (c *Chunk) String() string {
 }
 
 func (c *Chunk) JSON() string {
-	return fmt.Sprintf(`{"Key":["%s"],"ChunkSize":%d,"LowerBound":%s,"UpperBound":%s}`,
-		strings.Join(c.Key, `","`),
-		c.ChunkSize,
-		c.LowerBound.JSON(),
-		c.UpperBound.JSON(),
-	)
+	out, err := c.marshalJSON()
+	if err != nil {
+		// Keep the historical string-only API for external callers. Production
+		// checkpoint paths use marshalJSON directly and propagate its error.
+		panic(err)
+	}
+	return out
+}
+
+// jsonChunk is the serializable form of the chunk, as it appears in a
+// watermark. A chunker that persists more than the bounds embeds this so its
+// own fields sit alongside the chunk's rather than wrapping them.
+func (c *Chunk) jsonChunk() JSONChunk {
+	return JSONChunk{
+		Key:        c.Key,
+		ChunkSize:  c.ChunkSize,
+		LowerBound: c.LowerBound.jsonBoundary(),
+		UpperBound: c.UpperBound.jsonBoundary(),
+	}
+}
+
+func (c *Chunk) marshalJSON() (string, error) {
+	out, err := json.Marshal(c.jsonChunk())
+	if err != nil {
+		return "", fmt.Errorf("could not encode chunk JSON: %w", err)
+	}
+	return string(out), nil
 }
 
 // JSON encodes a boundary as JSON. The values are represented as strings,
 // to avoid JSON float behavior. See Issue #125
 func (b *Boundary) JSON() string {
-	return fmt.Sprintf(`{"Value": [%s],"Inclusive":%t}`, b.valuesString(), b.Inclusive)
+	out, err := json.Marshal(b.jsonBoundary())
+	if err != nil {
+		panic(fmt.Sprintf("could not encode boundary JSON: %v", err))
+	}
+	return string(out)
+}
+
+func (b *Boundary) jsonBoundary() JSONBoundary {
+	values := make([]string, len(b.Value))
+	for i, value := range b.Value {
+		values[i] = jsonDatumString(value)
+	}
+	return JSONBoundary{Value: values, Inclusive: b.Inclusive}
 }
 
 // comparesTo returns true if the boundaries are the same.
@@ -106,8 +157,9 @@ func (b *Boundary) comparesTo(b2 *Boundary) bool {
 	return true
 }
 
-// valuesString renders the boundary values as a comma-separated list of JSON
-// string literals (used inside Boundary.JSON's "Value" array).
+// valuesString renders the boundary values as an injective, comma-separated
+// tuple key for watermarkTracker's out-of-order chunk map. JSON string quoting
+// keeps distinct tuples distinct, including ["a", "b"] versus ["a,b"].
 func (b *Boundary) valuesString() string {
 	vals := make([]string, len(b.Value))
 	for i, v := range b.Value {
@@ -118,13 +170,25 @@ func (b *Boundary) valuesString() string {
 
 // jsonQuoteDatum renders a boundary datum as a JSON string literal (always
 // quoted, properly escaped). Numeric values are quoted to avoid JSON float
-// behavior (#125); binary values are hex-encoded ("0x...") so they round-trip
-// via datumValFromString. Crucially it uses json.Marshal rather than
-// Datum.String() (which SQL-escapes for WHERE clauses): a string value that is
-// valid in a MySQL string literal but not in JSON — e.g. a VARCHAR PK holding a
-// control byte like 0x16, or an embedded quote — must be JSON-escaped here, or
-// the checkpoint watermark becomes unparseable and resume fails permanently.
+// behavior (#125); binary values are hex-encoded ("0x...", or the empty
+// binary literal for a zero-length value) so they round-trip via
+// datumValFromString. Crucially it uses json.Marshal rather than Datum.String()
+// (which SQL-escapes for WHERE clauses), so the tuple representation is
+// injective. Without quoting, distinct boundaries could collide in the
+// watermark map and let one out-of-order chunk overwrite another.
 func jsonQuoteDatum(v Datum) string {
+	s := jsonDatumString(v)
+	// json.Marshal of a (valid-UTF8) string never errors and escapes anything
+	// JSON requires escaped; binary values took the hex branch in
+	// jsonDatumString, so they're ASCII here.
+	out, _ := json.Marshal(s)
+	return string(out)
+}
+
+// jsonDatumString renders a boundary datum as the string value stored in a
+// checkpoint. The enclosing JSON encoder, rather than string interpolation,
+// is responsible for quoting and escaping it.
+func jsonDatumString(v Datum) string {
 	var s string
 	switch {
 	case v.IsNumeric():
@@ -135,7 +199,10 @@ func jsonQuoteDatum(v Datum) string {
 			bs = fmt.Sprintf("%v", v.Val)
 		}
 		if len(bs) == 0 {
-			s = "0x00" // MySQL binary string needs at least one character
+			// Matches Datum.String(): x'' is the zero-length binary value.
+			// It must not be 0x00 (a one-byte NUL — a different value);
+			// datumValFromString decodes x'' back to the empty string.
+			s = "x''"
 		} else {
 			s = fmt.Sprintf("%#x", bs)
 		}
@@ -145,11 +212,7 @@ func jsonQuoteDatum(v Datum) string {
 			s = fmt.Sprintf("%v", v.Val)
 		}
 	}
-	// json.Marshal of a (valid-UTF8) string never errors and escapes anything
-	// JSON requires escaped; binary values took the hex branch above so they're
-	// ASCII here.
-	out, _ := json.Marshal(s)
-	return string(out)
+	return s
 }
 
 type JSONChunk struct {
@@ -285,7 +348,10 @@ func WatermarkRecopyClause(ti *TableInfo, watermarkJSON string) (string, error) 
 //   - multiChunker (used for two or more chunkers): a JSON map keyed by
 //     QualifiedName, where each value is the child chunker's own watermark.
 //   - chunkerComposite: an envelope {"ChunkJSON": "...", "RowsCopied": N}.
-//   - chunkerOptimistic: the raw chunk JSON itself.
+//   - chunkerOptimistic: the chunk JSON itself, with a "RowsCopied" field
+//     alongside the chunk's own (see optimisticWatermark). Unlike the
+//     composite envelope this needs no unwrapping, because the chunk is
+//     already at the top level.
 //
 // The tables argument is required to attribute single-chunker watermarks
 // (which carry no table name) to their table: those formats are only produced

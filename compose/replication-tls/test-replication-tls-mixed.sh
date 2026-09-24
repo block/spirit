@@ -189,8 +189,7 @@ main() {
       --password="rootpassword" \
       --database="test" \
       --tls-mode="DISABLED" \
-      --table="users" \
-      --alter="CHANGE COLUMN name name VARCHAR(150) NOT NULL" \
+      --statement="ALTER TABLE users CHANGE COLUMN name name VARCHAR(150) NOT NULL" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3421)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -218,8 +217,7 @@ main() {
       --password="rootpassword" \
       --database="test" \
       --tls-mode="REQUIRED" \
-      --table="users" \
-      --alter="MODIFY COLUMN id BIGINT AUTO_INCREMENT" \
+      --statement="ALTER TABLE users MODIFY COLUMN id BIGINT AUTO_INCREMENT" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3421)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -249,8 +247,7 @@ main() {
       --password="rootpassword" \
       --database="test" \
       --tls-mode="PREFERRED" \
-      --table="users" \
-      --alter="MODIFY COLUMN name VARCHAR(100) CHARACTER SET latin1" \
+      --statement="ALTER TABLE users MODIFY COLUMN name VARCHAR(100) CHARACTER SET latin1" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3421)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -280,8 +277,7 @@ main() {
       --password="rootpassword" \
       --database="test" \
       --tls-mode="REQUIRED" \
-      --table="users" \
-      --alter="CHANGE COLUMN updated_at updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" \
+      --statement="ALTER TABLE users CHANGE COLUMN updated_at updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3421)/test?tls=false" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -310,8 +306,7 @@ main() {
       --password="rootpassword" \
       --database="test" \
       --tls-mode="REQUIRED" \
-      --table="users" \
-      --alter="ADD INDEX idx_name_email (name, email)" \
+      --statement="ALTER TABLE users ADD INDEX idx_name_email (name, email)" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3421)/test?tls=preferred" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -340,8 +335,7 @@ main() {
       --password="rootpassword" \
       --database="test" \
       --tls-mode="REQUIRED" \
-      --table="users" \
-      --alter="CHANGE COLUMN created_at created_at DATETIME DEFAULT CURRENT_TIMESTAMP" \
+      --statement="ALTER TABLE users CHANGE COLUMN created_at created_at DATETIME DEFAULT CURRENT_TIMESTAMP" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3421)/test?tls=skip-verify" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s

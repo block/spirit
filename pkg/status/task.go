@@ -49,7 +49,11 @@ func continuallyDumpStatus(ctx context.Context, task Task, logger *slog.Logger) 
 			if state > CutOver {
 				return
 			}
-			logger.Info(task.Status()) // call the task to write the status
+			// Skip states that report nothing rather than logging a bare
+			// INFO with an empty message.
+			if s := task.Status(); s != "" {
+				logger.Info(s)
+			}
 		}
 	}
 }
@@ -72,8 +76,13 @@ func continuallyDumpCheckpoint(ctx context.Context, task Task, logger *slog.Logg
 					logger.Warn("could not write checkpoint yet, watermark not ready")
 					continue
 				}
-				// If the error is context canceled, that's fine too.
-				if errors.Is(err, context.Canceled) {
+				// If our context was canceled while the dump was in flight, the
+				// task is stopping us on purpose (e.g. the reverse-window flow
+				// stops the dumper right before cutover). The killed write can
+				// surface as any driver error, not necessarily context.Canceled,
+				// so check the context itself — going fatal here would Cancel()
+				// the very task that is shutting us down cleanly.
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 					return
 				}
 				if task.Progress().CurrentState >= CutOver {

@@ -2,14 +2,16 @@ package migration
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,13 +42,98 @@ func mkIniFile(t *testing.T, content string) string {
 // The timeout is generous because the runner must finish the copy and
 // checksum phases before it reaches the later states (e.g.
 // WaitingOnSentinelTable); under CI load those phases can starve and a
-// tighter budget produces spurious timeouts (see issue #946).
-func waitForStatus(t *testing.T, m *Runner, target status.State) {
+// tighter budget produces spurious timeouts (see issue #946). Each checksum
+// attempt alone can legitimately spend up to change.DefaultTimeout (30s) on
+// binlog catch-up plus 30s acquiring the table lock, and the runner retries
+// the checksum up to 3 times, so the budget must cover at least two full
+// attempts.
+func waitForStatus(t *testing.T, m *Runner, target status.State, run *testRun) {
 	t.Helper()
-	require.Eventually(t, func() bool {
-		return m.status.Get() >= target
-	}, 60*time.Second, 10*time.Millisecond,
-		"timeout waiting for status >= %s, last status: %s", target, m.status.Get())
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	require.NotNil(t, run)
+	require.NoError(t, awaitTestStatus(ctx, m, target, run))
+}
+
+func awaitTestStatus(ctx context.Context, m *Runner, target status.State, run *testRun) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var done <-chan struct{}
+	if run != nil {
+		done = run.done
+	}
+	for {
+		// Run may fail without ever publishing a later state. Its completion is
+		// authoritative, and closing done publishes its error to this goroutine.
+		select {
+		case <-done:
+			return fmt.Errorf("runner exited before waiting for %s completed: %w", target, run.result())
+		default:
+		}
+		current := m.status.Get()
+		if current >= status.Close {
+			return fmt.Errorf("runner entered terminal state %s while waiting for %s", current, target)
+		}
+		if current >= target {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for %s (last state %s): %w", target, m.status.Get(), ctx.Err())
+		case <-done:
+		case <-ticker.C:
+		}
+	}
+}
+
+// testRun owns a runner until Run has exited and Close has finished. Cleanup is
+// installed before launch, so FailNow anywhere in the test cannot strand a
+// result send or race table cleanup against the runner.
+type testRun struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	err    error // published by closing done
+}
+
+func startTestRun(t *testing.T, run func(context.Context) error, closeRunner func() error) *testRun {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	running := &testRun{done: make(chan struct{}), cancel: cancel}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-running.done:
+			// Close only after Run has stopped touching the runner's fields.
+			if err := closeRunner(); err != nil {
+				t.Errorf("closing test runner: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Error("runner did not stop during cleanup")
+		}
+	})
+	go func() {
+		running.err = run(ctx)
+		close(running.done)
+	}()
+	return running
+}
+
+func (r *testRun) result() error {
+	if r.err != nil {
+		return r.err
+	}
+	return fmt.Errorf("runner completed")
+}
+
+func (r *testRun) wait(t *testing.T) error {
+	t.Helper()
+	select {
+	case <-r.done:
+		return r.err
+	case <-time.After(3 * time.Minute):
+		t.Fatal("runner did not complete")
+		return nil
+	}
 }
 
 // waitForCopyRows blocks until the runner reaches the CopyRows state (returning
@@ -57,15 +144,26 @@ func waitForStatus(t *testing.T, m *Runner, target status.State) {
 // copy phase may never begin. It avoids testify so it is safe to call off the
 // test goroutine (require would call runtime.Goexit — testifylint go-require);
 // callers should return when it reports false.
-func waitForCopyRows(ctx context.Context, m *Runner) bool {
+func waitForCopyRows(t *testing.T, ctx context.Context, m *Runner) bool {
+	t.Helper()
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if m.status.Get() >= status.CopyRows {
+		current := m.status.Get()
+		if err := ctx.Err(); err != nil {
+			t.Logf("load generator skipped: context ended before observing CopyRows (state %s): %v", current, err)
+			return false
+		}
+		if current >= status.Close {
+			t.Logf("load generator skipped: runner reached terminal state %s before CopyRows was observed", current)
+			return false
+		}
+		if current >= status.CopyRows {
 			return true
 		}
 		select {
 		case <-ctx.Done():
+			t.Logf("load generator skipped: context ended before observing CopyRows (state %s): %v", m.status.Get(), ctx.Err())
 			return false
 		case <-ticker.C:
 		}
@@ -89,25 +187,21 @@ func WithWriteThreads(n int) RunnerOption {
 	}
 }
 
-// WithAutoscaling enables the experimental write-thread autoscaler.
-// WriteThreads acts as the starting value; the cap is fixed at 2x that.
+// WithMaxConnections sets the size of the main connection pool. It is the pool
+// size verbatim, not a ceiling on a computed one — see the MaxOpenConnections
+// assignment in (*Runner).Run.
+func WithMaxConnections(n int) RunnerOption {
+	return func(m *Migration) {
+		m.MaxConnections = n
+	}
+}
+
+// WithAutoscaling enables the experimental thread autoscaler. Note that it only
+// engages against an Aurora target, and when it does it overrides both Threads
+// and WriteThreads (see setupCopierCheckerAndReplClient).
 func WithAutoscaling() RunnerOption {
 	return func(m *Migration) {
 		m.EnableExperimentalAutoscaling = true
-	}
-}
-
-// WithTable sets the table name for the migration.
-func WithTable(name string) RunnerOption {
-	return func(m *Migration) {
-		m.Table = name
-	}
-}
-
-// WithAlter sets the ALTER clause for the migration.
-func WithAlter(a string) RunnerOption {
-	return func(m *Migration) {
-		m.Alter = a
 	}
 }
 
@@ -115,29 +209,6 @@ func WithAlter(a string) RunnerOption {
 func WithStatement(s string) RunnerOption {
 	return func(m *Migration) {
 		m.Statement = s
-	}
-}
-
-// WithTargetChunkTime sets the target chunk time.
-func WithTargetChunkTime(d time.Duration) RunnerOption {
-	return func(m *Migration) {
-		m.TargetChunkTime = d
-	}
-}
-
-// WithBuffered enables (b=true) or disables (b=false) the buffered copier.
-// Buffered copy is the default, so this sets the inverse Unbuffered field;
-// WithBuffered(false) opts a test back into the legacy unbuffered copier.
-func WithBuffered(b bool) RunnerOption {
-	return func(m *Migration) {
-		m.Unbuffered = !b
-	}
-}
-
-// WithGTID enables the experimental GTID-based change source.
-func WithGTID(b bool) RunnerOption {
-	return func(m *Migration) {
-		m.EnableExperimentalGTID = b
 	}
 }
 
@@ -167,20 +238,6 @@ func WithDBName(name string) RunnerOption {
 func WithRespectSentinel() RunnerOption {
 	return func(m *Migration) {
 		m.RespectSentinel = true
-	}
-}
-
-// WithLint enables linting during migration.
-func WithLint() RunnerOption {
-	return func(m *Migration) {
-		m.Lint = true
-	}
-}
-
-// WithLintOnly enables lint-only mode (no migration).
-func WithLintOnly() RunnerOption {
-	return func(m *Migration) {
-		m.LintOnly = true
 	}
 }
 
@@ -214,7 +271,7 @@ func WithSkipDropAfterCutover() RunnerOption {
 
 // newTestMigration creates a Migration with sensible defaults for integration tests.
 // It parses the test DSN and fills in Host/Username/Password/Database.
-// Callers must set either Table+Alter or Statement before calling Run().
+// Callers must set Statement before calling Run().
 func newTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	t.Helper()
 
@@ -235,9 +292,13 @@ func newTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	return migration
 }
 
-// NewTestRunner creates a Runner for a Table+Alter migration with sensible defaults.
+// NewTestRunner creates a Runner with sensible defaults, composing the table
+// and alter arguments into a full ALTER TABLE statement so tests exercise the
+// same --statement path as production callers.
 //
-// Defaults: Threads=2, TargetChunkTime=500ms (the production default).
+// Defaults: Threads=2, WriteThreads=2. Copy chunk sizing uses the production
+// byte budget (table.DefaultTargetChunkBytes) and the checksum's time budget is
+// the constant table.ChunkerDefaultTarget; neither is settable per-test here.
 //
 // Example:
 //
@@ -247,15 +308,13 @@ func newTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 //
 //	m := NewTestRunner(t, "mytable", "ADD INDEX idx_a (a)",
 //	    WithThreads(1),
-//	    WithTargetChunkTime(100*time.Millisecond),
-//	    WithBuffered(true),
+//	    WithTestThrottler(),
 //	)
 func NewTestRunner(t *testing.T, table, alter string, opts ...RunnerOption) *Runner {
 	t.Helper()
 
 	migration := newTestMigration(t, opts...)
-	migration.Table = table
-	migration.Alter = alter
+	migration.Statement = fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(table), alter)
 
 	runner, err := NewRunner(migration)
 	require.NoError(t, err)
@@ -263,8 +322,9 @@ func NewTestRunner(t *testing.T, table, alter string, opts ...RunnerOption) *Run
 }
 
 // NewTestRunnerFromStatement creates a Runner for a Statement-based migration
-// with sensible defaults. Use this for tests that use full SQL statements
-// (ALTER TABLE, CREATE INDEX, etc.) rather than Table+Alter.
+// with sensible defaults. Use this for tests that need the raw statement form
+// (CREATE INDEX, CREATE TABLE, etc.) rather than the composed ALTER TABLE of
+// NewTestRunner.
 //
 // Example:
 //
@@ -288,7 +348,7 @@ func NewTestRunnerFromStatement(t *testing.T, statement string, opts ...RunnerOp
 //
 // Example:
 //
-//	m := NewTestMigration(t, WithTable("mytable"), WithAlter("ENGINE=InnoDB"))
+//	m := NewTestMigration(t, WithStatement("ALTER TABLE mytable ENGINE=InnoDB"))
 //	require.NoError(t, m.Run())
 func NewTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	t.Helper()

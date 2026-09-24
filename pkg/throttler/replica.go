@@ -30,7 +30,7 @@ type Replica struct {
 	lagTolerance   time.Duration
 	currentLagInMs atomic.Int64
 	logger         *slog.Logger
-	isClosed       atomic.Bool
+	poller         monitorLoop
 
 	// stale guards against the cached lag freezing at a healthy value when
 	// polling fails persistently: IsThrottled() fails closed while the
@@ -63,7 +63,7 @@ const MySQL8LagQuery = `WITH applier_latency AS (
    SELECT IFNULL(IF(queue_status='IDLE',0,CEIL(GREATEST(applier_latency_ms, queue_latency_ms))),0) as lagMs FROM applier_latency, queue_latency
 `
 
-var _ Throttler = &Replica{}
+var _ ReasonedThrottler = &Replica{}
 
 // Open starts the lag monitor. This is not gh-ost. The lag monitor is primitive
 // because the requirement is only for DR, and not for up-to-date read-replicas.
@@ -71,31 +71,36 @@ var _ Throttler = &Replica{}
 // We only check the replica every 5 seconds, and typically allow up to 120s
 // of replica lag, which is a lot.
 func (l *Replica) Open(ctx context.Context) error {
+	if err := l.poller.checkOpen(); err != nil {
+		return err
+	}
 	if err := l.UpdateLag(ctx); err != nil {
 		return err
 	}
-	go func() {
-		ticker := time.NewTicker(loopInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if l.isClosed.Load() {
-					return
+	return l.poller.start(ctx, l.run)
+}
+
+func (l *Replica) run(ctx context.Context) {
+	ticker := time.NewTicker(loopInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := l.UpdateLag(ctx); err != nil {
+				if isShutdownError(ctx, err) {
+					return // teardown cancelled the in-flight poll; not a monitoring failure
 				}
-				if err := l.UpdateLag(ctx); err != nil {
-					l.logger.Error("error getting lag", "error", err)
-				}
+				l.logger.Error("error polling replica lag; keeping the last reading (throttling fails closed if polling stays stale)",
+					"error", err)
 			}
 		}
-	}()
-	return nil
+	}
 }
 
 func (l *Replica) Close() error {
-	l.isClosed.Store(true)
+	l.poller.close()
 	return nil
 }
 
@@ -113,6 +118,26 @@ func (l *Replica) IsThrottled() bool {
 		return true
 	}
 	return l.currentLagInMs.Load() >= l.lagTolerance.Milliseconds()
+}
+
+// ThrottleReason implements ReasonedThrottler. It names the lag comparison that
+// tripped, or — for the fail-closed stale case, which has no trustworthy lag
+// number to quote — how long lag has been unobservable.
+//
+// It is itself side-effect-free: it re-derives staleness with gapExceeds rather
+// than check(), so asking for a reason never consumes the warn-once that
+// IsThrottled logs on entering a stale period. Note this makes the *method*
+// pure, not the status path — Describe calls IsThrottled first, so a status poll
+// can still be what logs that warning.
+func (l *Replica) ThrottleReason() string {
+	if l.stale.gapExceeds(staleSignalThreshold) {
+		return "replica-lag unobservable for " + l.stale.age().Round(time.Second).String() + " (failing closed)"
+	}
+	lagMs := l.currentLagInMs.Load()
+	if lagMs < l.lagTolerance.Milliseconds() {
+		return ""
+	}
+	return fmt.Sprintf("replica-lag %dms >= %dms", lagMs, l.lagTolerance.Milliseconds())
 }
 
 // Replica deliberately does NOT implement GradualThrottler: replication lag

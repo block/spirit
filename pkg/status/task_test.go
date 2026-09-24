@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // fakeTask is a minimal Task implementation for driving WatchTask and the
@@ -22,6 +24,33 @@ type fakeTask struct {
 	cancelCh        chan struct{}
 	statusCount     atomic.Int64
 	checkpointCount atomic.Int64
+	// emptyStatus makes Status() report nothing, as a runner does for a state
+	// it has no block for.
+	emptyStatus atomic.Bool
+}
+
+// recordingHandler captures the messages a logger emits.
+type recordingHandler struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.messages = append(h.messages, r.Message)
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *recordingHandler) recorded() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.messages...)
 }
 
 func newFakeTask(state State) *fakeTask {
@@ -45,6 +74,9 @@ func (f *fakeTask) Status() string {
 	select {
 	case f.statusCh <- struct{}{}:
 	default:
+	}
+	if f.emptyStatus.Load() {
+		return ""
 	}
 	return "fake status"
 }
@@ -159,6 +191,43 @@ func TestContinuallyDumpStatusStopsWhenStateAdvances(t *testing.T) {
 	waitSignal(t, done, "status loop exit after state advanced past CutOver")
 }
 
+// A state the runner has no report for must produce no log line at all. The
+// loop used to log whatever Status() returned, so an empty status arrived as a
+// bare INFO with an empty message (#329).
+func TestContinuallyDumpStatusSkipsEmpty(t *testing.T) {
+	setTestIntervals(t, 2*time.Millisecond, time.Hour)
+	task := newFakeTask(CopyRows)
+	task.emptyStatus.Store(true)
+	handler := &recordingHandler{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		continuallyDumpStatus(ctx, task, slog.New(handler))
+	}()
+
+	waitSignal(t, task.statusCh, "first status dump")
+	waitSignal(t, task.statusCh, "second status dump")
+	cancel()
+	waitSignal(t, done, "status loop exit after cancel")
+	require.Empty(t, handler.recorded(), "an empty status must not be logged")
+
+	// The same loop does log a status that has something to say.
+	task = newFakeTask(CopyRows)
+	handler = &recordingHandler{}
+	ctx, cancel = context.WithCancel(t.Context())
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		continuallyDumpStatus(ctx, task, slog.New(handler))
+	}()
+	waitSignal(t, task.statusCh, "status dump")
+	cancel()
+	waitSignal(t, done, "status loop exit after cancel")
+	require.Contains(t, handler.recorded(), "fake status")
+}
+
 // TestContinuallyDumpCheckpointWatermarkNotReady verifies that
 // ErrWatermarkNotReady is non-fatal: the loop logs, continues ticking,
 // and never calls task.Cancel.
@@ -252,5 +321,39 @@ func TestContinuallyDumpCheckpointErrorDuringCutover(t *testing.T) {
 	waitSignal(t, done, "checkpoint loop exit after error during cutover")
 	if task.cancelled() {
 		t.Fatal("a checkpoint error after reaching CutOver must not cancel the task")
+	}
+}
+
+// TestContinuallyDumpCheckpointCanceledMidDump reproduces the
+// stop-while-writing race: the loop's context is canceled while a dump is
+// in flight (the reverse-window flow stops the dumper right before
+// cutover), and the killed write surfaces as an arbitrary driver error —
+// NOT context.Canceled. The loop must recognize its own context is done
+// and exit quietly instead of fatally cancelling the task it belongs to.
+func TestContinuallyDumpCheckpointCanceledMidDump(t *testing.T) {
+	setTestIntervals(t, time.Hour, 2*time.Millisecond)
+	task := newFakeTask(CopyRows)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	// The dump itself observes the stop signal mid-write: the caller
+	// cancels, then the interrupted write returns a non-context error.
+	task.dumpErr = func() error {
+		cancel()
+		return errors.New("invalid connection")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		continuallyDumpCheckpoint(ctx, task, slog.Default())
+	}()
+
+	waitSignal(t, done, "checkpoint loop exit after canceled-mid-dump error")
+	if task.cancelled() {
+		t.Fatal("a dump error caused by our own cancellation must not cancel the task")
+	}
+	if n := task.checkpointCount.Load(); n != 1 {
+		t.Fatalf("expected exactly 1 checkpoint attempt, got %d", n)
 	}
 }

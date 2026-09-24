@@ -79,10 +79,11 @@ type WaitConfig struct {
 	RunChecksum func(ctx context.Context) error
 
 	// InvalidateWatermark is invoked exactly once, after the continuous
-	// checksum goroutine has fully stopped, to blank any persisted checksum
-	// watermark if the checksum repaired a difference (so a resume re-verifies
-	// from the start of the checksum phase). It runs even when the parent
-	// context was cancelled.
+	// checksum goroutine has fully stopped, to apply the caller's resume policy.
+	// Migration clears checksum evidence unconditionally; move clears it when
+	// verification observed differences. It runs even when the parent context
+	// was cancelled. Callers needing crash safety before background work must
+	// also invalidate evidence before starting that work in RunChecksum.
 	InvalidateWatermark func(ctx context.Context) error
 
 	Logger *slog.Logger
@@ -97,10 +98,8 @@ type WaitConfig struct {
 // Otherwise it runs RunChecksum in the background for the lifetime of the wait,
 // and on every subsequent return path (sentinel dropped, timeout, checksum
 // failure, or parent-context cancellation) it stops that goroutine and then
-// calls InvalidateWatermark: if the continuous checksum repaired a chunk, the
-// run is about to abort, and the persisted checksum_watermark must be blanked so
-// a resume re-verifies rather than trusting a watermark recorded just before the
-// difference was found.
+// calls InvalidateWatermark to reconcile persisted resume evidence according to
+// the caller's policy. Checker ownership and checkpoint reuse are caller-specific.
 //
 // Exists, RunChecksum and InvalidateWatermark are required (Wait returns an
 // error if any is nil); a nil Logger defaults to slog.Default().
@@ -123,9 +122,7 @@ func Wait(ctx context.Context, cfg WaitConfig) (retErr error) {
 		"wait-limit", WaitLimit.String(),
 	)
 
-	// Spawn the continuous checksum. It uses its own checker + chunker and is
-	// not wired into the checkpoint — so a crash during sentinel wait does
-	// not add mandatory checksum time on resume.
+	// Spawn the caller's continuous verification and join it before cleanup.
 	continuousCtx, cancelContinuous := context.WithCancel(ctx)
 	continuousDone := make(chan struct{})
 	var continuousErr error
@@ -144,17 +141,10 @@ func Wait(ctx context.Context, cfg WaitConfig) (retErr error) {
 		if retErr == nil && continuousErr != nil && ctx.Err() == nil {
 			retErr = fmt.Errorf("continuous checksum failed: %w", continuousErr)
 		}
-		// If the continuous checker repaired any chunk, this run is about to
-		// abort. The periodic dumper stops persisting a checksum_watermark the
-		// instant the difference is recorded, but a dump whose conditions were
-		// read just before that instant can still land a stale watermark row
-		// afterwards. Rewrite the persisted rows here — strictly after the
-		// continuous goroutine has exited (see <-continuousDone above) — so the
-		// on-disk state after the abort forces full checksum re-verification on
-		// resume. WithoutCancel: this cleanup must run even when the parent ctx
-		// was already cancelled.
+		// Apply the caller's resume policy after verification has stopped, even
+		// when the parent context is canceled.
 		if err := cfg.InvalidateWatermark(context.WithoutCancel(ctx)); err != nil {
-			cfg.Logger.Error("failed to clear persisted checksum watermark after continuous checksum divergence", "error", err)
+			cfg.Logger.Error("failed to clear persisted checksum watermark after continuous checksum", "error", err)
 			// Join rather than suppress, even when the continuous-checksum abort
 			// already set retErr: a failed invalidation means a stale
 			// checksum_watermark may remain on disk, letting a resume skip the

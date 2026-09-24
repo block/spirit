@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,13 +30,13 @@ func TestSingleTargetApplierBasic(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "single_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target := base.Clone()
 	target.DBName = "single_target"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -129,8 +129,14 @@ func TestSingleTargetApplierBasic(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 4, count, "Should have 4 rows in target")
 
-	// Verify specific rows
-	rows, err := targetDB.QueryContext(t.Context(), "SELECT id, name, value, binaryvalue FROM test_table ORDER BY id")
+	// Verify specific rows. The blob assertions check nullness and length
+	// explicitly: bytes.Equal (which testify uses for []byte) treats nil and
+	// []byte{} as equal, but NULL, the empty string, and a one-byte NUL are
+	// three distinct values and the applier must preserve each exactly.
+	// Regression: the empty value used to be written as 0x00 (a one-byte
+	// NUL), silently corrupting empty blobs applied via the binlog feed.
+	rows, err := targetDB.QueryContext(t.Context(),
+		"SELECT id, name, value, binaryvalue, binaryvalue IS NULL, COALESCE(LENGTH(binaryvalue), -1) FROM test_table ORDER BY id")
 	require.NoError(t, err)
 	defer utils.CloseAndLog(rows)
 
@@ -139,24 +145,29 @@ func TestSingleTargetApplierBasic(t *testing.T) {
 		name        string
 		value       int64
 		binaryvalue []byte
+		isNull      bool
+		length      int64
 	}{
-		{1, "Alice", 100, []byte{0x00}},
-		{2, "Bob", 200, nil},
-		{3, "Charlie", 300, []byte{0x62, 0x72, 0x6F, 0x77, 0x6E}},
-		{4, "Dan", 400, []byte{0x00}},
+		{1, "Alice", 100, []byte{0x00}, false, 1},
+		{2, "Bob", 200, nil, true, -1},
+		{3, "Charlie", 300, []byte{0x62, 0x72, 0x6F, 0x77, 0x6E}, false, 5},
+		{4, "Dan", 400, []byte{}, false, 0},
 	}
 
 	i := 0
 	for rows.Next() {
-		var id, value int64
+		var id, value, length int64
 		var name string
 		var binaryvalue []byte
-		err = rows.Scan(&id, &name, &value, &binaryvalue)
+		var isNull bool
+		err = rows.Scan(&id, &name, &value, &binaryvalue, &isNull, &length)
 		require.NoError(t, err)
 		require.Equal(t, expected[i].id, id)
 		require.Equal(t, expected[i].name, name)
 		require.Equal(t, expected[i].value, value)
 		require.Equal(t, expected[i].binaryvalue, binaryvalue)
+		require.Equal(t, expected[i].isNull, isNull, "row id=%d nullness", id)
+		require.Equal(t, expected[i].length, length, "row id=%d blob length", id)
 		i++
 	}
 	require.NoError(t, rows.Err())
@@ -173,7 +184,7 @@ func TestSingleTargetApplierEmptyRows(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_empty_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -232,7 +243,7 @@ func TestSingleTargetApplierLargeDataset(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_large_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -308,7 +319,7 @@ func TestSingleTargetApplierConcurrentApplies(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_concurrent_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -418,7 +429,7 @@ func TestSingleTargetApplierDeleteKeys(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_delete_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -504,7 +515,7 @@ func TestSingleTargetApplierDeleteKeysSeparatorInValues(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_delete_sep_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -577,7 +588,7 @@ func TestSingleTargetApplierDeleteKeysEmpty(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_delete_empty_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -613,7 +624,7 @@ func TestSingleTargetApplierUpsertRows(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -687,6 +698,84 @@ func TestSingleTargetApplierUpsertRows(t *testing.T) {
 	require.Equal(t, 3, i)
 }
 
+// TestSingleTargetApplierUpsertRowsEmptyBlob is a regression test for the
+// binlog-apply path corrupting empty (zero-length, non-NULL) binary values.
+// Under row-based replication any update to a row produces a full row image,
+// so UpsertRows rewrites every column — including blobs the application never
+// touched. The empty value used to serialize as 0x00 — a one-byte NUL, a
+// different value — so on tables that store empty strings (e.g. zero-length
+// serialized protos) every feed-touched row produced a checksum mismatch,
+// was recopied byte-exact, and then re-minted on the row's next update: a
+// checksum that never converges, and real corruption for rows whose last
+// update lands after the final checksum pass.
+func TestSingleTargetApplierUpsertRowsEmptyBlob(t *testing.T) {
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS single_upsert_emptyblob_test")
+	testutils.RunSQL(t, "CREATE DATABASE single_upsert_emptyblob_test")
+
+	base, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	target := base.Clone()
+	target.DBName = "single_upsert_emptyblob_test"
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+
+	_, err = targetDB.ExecContext(t.Context(),
+		"CREATE TABLE transfers (id INT PRIMARY KEY, state VARCHAR(20), instrument_proto BLOB)")
+	require.NoError(t, err)
+
+	// The copy phase wrote these rows byte-exact (server-side INSERT..SELECT).
+	_, err = targetDB.ExecContext(t.Context(),
+		"INSERT INTO transfers VALUES (1, 'pending', ''), (2, 'pending', NULL), (3, 'pending', 0x00)")
+	require.NoError(t, err)
+
+	targetTable := table.NewTableInfo(targetDB, target.DBName, "transfers")
+	require.NoError(t, targetTable.SetInfo(t.Context()))
+
+	applier, err := NewSingleTargetApplier(Target{DB: targetDB, Config: target, KeyRange: "0"}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+
+	// The application updates only `state`; the binlog row images still carry
+	// the full row, so the blobs are rewritten with their existing values.
+	upsertRows := []LogicalRow{
+		{RowImage: []any{int64(1), "settled", []byte{}}},
+		{RowImage: []any{int64(2), "settled", nil}},
+		{RowImage: []any{int64(3), "settled", []byte{0x00}}},
+	}
+	_, err = applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), upsertRows, nil)
+	require.NoError(t, err)
+
+	// The REPLACE must preserve all three distinct values: empty, NULL, and a
+	// one-byte NUL.
+	rows, err := targetDB.QueryContext(t.Context(),
+		"SELECT id, state, instrument_proto IS NULL, COALESCE(LENGTH(instrument_proto), -1) FROM transfers ORDER BY id")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+
+	expected := []struct {
+		isNull bool
+		length int64
+	}{
+		{false, 0}, // id=1: empty string stays zero-length, NOT 0x00
+		{true, -1}, // id=2: NULL stays NULL
+		{false, 1}, // id=3: a real one-byte NUL stays one byte
+	}
+	i := 0
+	for rows.Next() {
+		var id, length int64
+		var state string
+		var isNull bool
+		require.NoError(t, rows.Scan(&id, &state, &isNull, &length))
+		require.Equal(t, "settled", state)
+		require.Equal(t, expected[i].isNull, isNull, "row id=%d nullness", id)
+		require.Equal(t, expected[i].length, length, "row id=%d blob length", id)
+		i++
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, 3, i)
+}
+
 // TestSingleTargetApplierUpsertRowsWithGeneratedColumns is a regression test
 // for the bug where UpsertRows indexed RowImage via NonGeneratedColumns
 // positions, causing values from the wrong source columns to be inserted when
@@ -706,7 +795,7 @@ func TestSingleTargetApplierUpsertRowsWithGeneratedColumns(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_genco_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -768,7 +857,7 @@ func TestSingleTargetApplierUpsertRowsSkipDeleted(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_deleted_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -825,7 +914,7 @@ func TestSingleTargetApplierUpsertRowsEmpty(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_upsert_empty_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -861,7 +950,7 @@ func TestSingleTargetApplierContextCancellation(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_cancel_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -956,7 +1045,7 @@ func TestSingleTargetApplierCancelCallbackRace(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_cbrace_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1040,7 +1129,7 @@ func TestSingleTargetApplierWaitTimeout(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_timeout_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1100,7 +1189,7 @@ func TestSingleTargetApplierStartClose(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "single_lifecycle_test"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1171,7 +1260,7 @@ func TestSingleTargetApplierDynamicScaling(t *testing.T) {
 	target.DBName = "single_scaling_test"
 	// The pool must cover the peak worker count we scale to.
 	target.Params = map[string]string{}
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	targetDB.SetMaxOpenConns(10)
@@ -1254,7 +1343,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 
 	target := base.Clone()
 	target.DBName = "test_pr4_single_lock"
-	targetDB, err := sql.Open("mysql", target.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", target.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -1355,4 +1444,20 @@ func TestSingleTargetApplierSetWriteWorkersBeforeStart(t *testing.T) {
 	}
 	require.NotPanics(t, func() { a.SetWriteWorkers(4) })
 	require.Equal(t, 0, a.ActiveWriteWorkers(), "no workers should be spawned before Start")
+}
+
+func TestInitialWriteWorkersOnStartAndRestart(t *testing.T) {
+	cfg := NewApplierDefaultConfig()
+	cfg.Threads = 16
+	a, err := NewSingleTargetApplier(Target{DB: &sql.DB{}}, cfg)
+	require.NoError(t, err)
+	for _, n := range []int{2, 3} {
+		a.SetInitialWriteWorkers(n)
+		require.Zero(t, a.ActiveWriteWorkers())
+		require.NoError(t, a.Start(t.Context()))
+		require.Equal(t, n, a.ActiveWriteWorkers())
+		a.SetInitialWriteWorkers(12) // Cannot change a running pool.
+		require.Equal(t, n, a.ActiveWriteWorkers())
+		require.NoError(t, a.Stop())
+	}
 }

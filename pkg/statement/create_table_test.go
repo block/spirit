@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1436,6 +1436,20 @@ func TestExpressionDefaultParsing(t *testing.T) {
 			expectedDefault: "uuid()",
 			expectedIsExpr:  true,
 		},
+		{
+			name:            "parenthesized string literal is an expression default",
+			sql:             "CREATE TABLE t1 (id INT PRIMARY KEY, j JSON DEFAULT ('{}'))",
+			columnName:      "j",
+			expectedDefault: "{}",
+			expectedIsExpr:  true,
+		},
+		{
+			name:            "parenthesized numeric literal is an expression default",
+			sql:             "CREATE TABLE t1 (id INT PRIMARY KEY, n INT DEFAULT (1))",
+			columnName:      "n",
+			expectedDefault: "1",
+			expectedIsExpr:  true,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1450,6 +1464,56 @@ func TestExpressionDefaultParsing(t *testing.T) {
 			require.Equal(t, tc.expectedIsExpr, col.DefaultIsExpr, "DefaultIsExpr mismatch for %q", tc.columnName)
 		})
 	}
+}
+
+// TestParenthesizedLiteralDefaultRoundTrip covers the declarative side of
+// https://github.com/block/spirit/issues/542: DEFAULT ('{}') must extract as
+// a string-valued expression default and emit back with exactly one set of
+// parentheses and quotes. It must also compare different from the bare
+// literal form DEFAULT '{}' (they are different DDL: BLOB/TEXT/JSON columns
+// only accept the parenthesized one).
+func TestParenthesizedLiteralDefaultRoundTrip(t *testing.T) {
+	ct, err := ParseCreateTable("CREATE TABLE t1 (id INT PRIMARY KEY, j JSON DEFAULT ('{}'))")
+	require.NoError(t, err)
+	col := ct.Columns.ByName("j")
+	require.NotNil(t, col)
+	require.NotNil(t, col.Default)
+	require.Equal(t, "{}", *col.Default)
+	require.True(t, col.DefaultIsExpr)
+	require.Equal(t, DefaultKindString, col.DefaultKind)
+	require.Contains(t, formatColumnDefinition(col), "DEFAULT ('{}')")
+
+	// MySQL's SHOW CREATE TABLE renders the same default with a charset
+	// introducer; both forms must extract identically so the desired and
+	// live definitions converge.
+	ctLive, err := ParseCreateTable("CREATE TABLE t1 (id INT PRIMARY KEY, j JSON DEFAULT (_utf8mb4'{}'))")
+	require.NoError(t, err)
+	colLive := ctLive.Columns.ByName("j")
+	require.NotNil(t, colLive)
+	require.NotNil(t, colLive.Default)
+	require.Equal(t, "{}", *colLive.Default)
+	require.True(t, colLive.DefaultIsExpr)
+	require.Equal(t, DefaultKindString, colLive.DefaultKind)
+
+	// The bare and parenthesized forms of the same literal are different
+	// defaults and must not compare equal.
+	ctBare, err := ParseCreateTable("CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(10) DEFAULT 'x')")
+	require.NoError(t, err)
+	ctParen, err := ParseCreateTable("CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(10) DEFAULT ('x'))")
+	require.NoError(t, err)
+	bare := ctBare.Columns.ByName("v")
+	paren := ctParen.Columns.ByName("v")
+	require.False(t, bare.DefaultIsExpr)
+	require.True(t, paren.DefaultIsExpr)
+	require.Equal(t, "DEFAULT 'x'", lastDefaultClause(t, formatColumnDefinition(bare)))
+	require.Equal(t, "DEFAULT ('x')", lastDefaultClause(t, formatColumnDefinition(paren)))
+}
+
+func lastDefaultClause(t *testing.T, columnDef string) string {
+	t.Helper()
+	idx := strings.Index(columnDef, "DEFAULT ")
+	require.GreaterOrEqual(t, idx, 0, "no DEFAULT clause in %q", columnDef)
+	return columnDef[idx:]
 }
 
 // TestBinaryTypeDetection tests that binary types are correctly detected and converted

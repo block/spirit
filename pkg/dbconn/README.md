@@ -6,6 +6,14 @@ The `dbconn` package provides MySQL database connection management and locking u
 
 When creating a new connection, Spirit appends standardized DSN parameters to ensure consistent behavior across all connections. These include setting `sql_mode=""` (to be able to copy legacy data like `0000-00-00`), `time_zone=+00:00`, `transaction_isolation=read-committed`, `charset=utf8mb4`, `collation=utf8mb4_bin`, and `rejectReadOnly=true` (for Aurora failover resilience). This means that regardless of the server's global configuration, Spirit connections behave predictably.
 
+## Pool sizing
+
+Use `SetPoolSize(db, n)` rather than `db.SetMaxOpenConns(n)` directly. It sets the open and idle limits together, and they must stay together: `database/sql` closes a connection returned to a pool whose free list already holds `MaxIdleConns` entries, so an idle limit below the open limit turns every release past that point into a close and every subsequent acquire into a fresh dial, TLS handshake and MySQL auth. The copy phase — hundreds of read and write workers cycling connections continuously — is exactly that workload, and the churn is invisible on the status block, which does not report pool internals at all.
+
+Holding the connections idle instead costs nothing that was not already reserved: the open limit is the budget, and matching the idle limit to it only stops the pool from discarding what it is entitled to keep. Several call sites ratchet a pool's size after it was created (the migration runner once thread counts are final, the checksum, cutover), which is why this lives in a helper rather than at construction only.
+
+Connections are still recycled on `maxConnLifetime` (3 minutes), which pool sizing does not affect. With a large pool in steady use, that lifetime — not the idle limit — is the dominant source of reconnects.
+
 ## TLS
 
 Spirit supports five TLS modes: DISABLED, PREFERRED, REQUIRED, VERIFY_CA, and VERIFY_IDENTITY. The default is PREFERRED, which first attempts a TLS connection and falls back to plaintext if it fails. RDS hosts are auto-detected via hostname pattern matching (`*.rds.amazonaws.com`), and an embedded RDS CA bundle is used automatically.
@@ -18,7 +26,7 @@ An important subtlety is that `RetryableTransaction` inspects `SHOW WARNINGS` af
 
 ## Force Kill
 
-Both `ForceExec` and `NewTableLock` implement a timer-based force-kill pattern. They wait for 90% of `LockWaitTimeout`, then query `performance_schema` to identify and kill transactions that are blocking metadata lock acquisition. This is enabled by default and can be disabled with Spirit's `--skip-force-kill` flag.
+Both `ForceExec` and `NewTableLock` implement a timer-based force-kill pattern. They wait for `DBConfig.ForceKillAfter` (zero defaults to 90% of `LockWaitTimeout`), then query `performance_schema` to identify and kill transactions that are blocking metadata lock acquisition. `ForceExec` always arms the kill timer; for `NewTableLock` it is gated on `DBConfig.ForceKill` (default true), which programmatic callers such as datasync's read-only source disable for connections that must never kill.
 
 There are two important safety constraints:
 

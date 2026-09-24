@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pingcap/tidb/pkg/parser"
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/format"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
-	"github.com/pingcap/tidb/pkg/parser/types"
+	"github.com/block/spirit/pkg/parser"
+	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/format"
+	"github.com/block/spirit/pkg/parser/mysql"
+	"github.com/block/spirit/pkg/parser/types"
 )
 
 // CreateTable represents a parsed CREATE TABLE statement with structured data
@@ -42,13 +42,13 @@ type Column struct {
 	SetValues       []string          `json:"set_values,omitempty"`  // Permitted values for SET type
 	Nullable        bool              `json:"nullable"`
 	Default         *string           `json:"default,omitempty"`
-	DefaultIsExpr   bool              `json:"default_is_expr,omitempty"`   // true when default is an expression (needs parens), e.g. DEFAULT (json_object())
-	DefaultIsString bool              `json:"default_is_string,omitempty"` // true when the default is a quoted string literal (so it must be re-quoted on emission, even if it looks like a keyword/number)
-	OnUpdate        *string           `json:"on_update,omitempty"`         // ON UPDATE expression for TIMESTAMP/DATETIME, e.g. "current_timestamp"
-	GeneratedExpr   *string           `json:"generated_expr,omitempty"`    // Expression for GENERATED ALWAYS AS (...) columns
-	GeneratedStored bool              `json:"generated_stored,omitempty"`  // true = STORED, false = VIRTUAL (only meaningful when GeneratedExpr is set)
-	Check           *string           `json:"check,omitempty"`             // Column-level CHECK (...) constraint expression
-	SRID            *uint32           `json:"srid,omitempty"`              // SRID attribute for spatial columns
+	DefaultIsExpr   bool              `json:"default_is_expr,omitempty"`  // true when default is an expression (needs parens), e.g. DEFAULT (json_object())
+	DefaultKind     DefaultKind       `json:"default_kind,omitempty"`     // the literal form the default was written as, read off the AST — see DefaultKind
+	OnUpdate        *string           `json:"on_update,omitempty"`        // ON UPDATE expression for TIMESTAMP/DATETIME, e.g. "current_timestamp"
+	GeneratedExpr   *string           `json:"generated_expr,omitempty"`   // Expression for GENERATED ALWAYS AS (...) columns
+	GeneratedStored bool              `json:"generated_stored,omitempty"` // true = STORED, false = VIRTUAL (only meaningful when GeneratedExpr is set)
+	Check           *string           `json:"check,omitempty"`            // Column-level CHECK (...) constraint expression
+	SRID            *uint32           `json:"srid,omitempty"`             // SRID attribute for spatial columns
 	AutoInc         bool              `json:"auto_increment"`
 	PrimaryKey      bool              `json:"primary_key"`
 	Unique          bool              `json:"unique"`
@@ -70,7 +70,7 @@ type IndexColumn struct {
 type Index struct {
 	Raw          *ast.Constraint   `json:"-"`
 	Name         string            `json:"name"`
-	Type         string            `json:"type"`                  // PRIMARY, UNIQUE, INDEX, FULLTEXT, SPATIAL
+	Type         string            `json:"type"`                  // PRIMARY KEY, UNIQUE, INDEX, FULLTEXT, SPATIAL
 	Columns      []string          `json:"columns"`               // Deprecated: use ColumnList for full details
 	ColumnList   []IndexColumn     `json:"column_list,omitempty"` // Full column specifications including prefix/expression
 	Invisible    *bool             `json:"invisible,omitempty"`
@@ -131,7 +131,7 @@ type TableOptions struct {
 
 // PartitionOptions represents table partitioning configuration
 type PartitionOptions struct {
-	Type         string                `json:"type"`                   // RANGE, LIST, HASH, KEY, SYSTEM_TIME
+	Type         string                `json:"type"`                   // RANGE, LIST, HASH, KEY
 	Expression   *string               `json:"expression,omitempty"`   // For HASH and RANGE
 	Columns      []string              `json:"columns,omitempty"`      // For KEY, RANGE COLUMNS, LIST COLUMNS
 	Linear       bool                  `json:"linear,omitempty"`       // For LINEAR HASH/KEY
@@ -459,15 +459,14 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 
 	// Extract charset and collation from the type itself
 	// (they may be overridden by column options later).
-	// Spatial types are skipped: the parser assigns them a synthetic
-	// "binary" charset/collation, which is not valid SQL to emit.
-	if col.Tp.GetType() != mysql.TypeGeometry {
-		if charset := col.Tp.GetCharset(); charset != "" {
-			column.Charset = &charset
-		}
-		if collation := col.Tp.GetCollate(); collation != "" {
-			column.Collation = &collation
-		}
+	// Spatial and VECTOR types carry a synthetic "binary" charset/collation
+	// here that is not valid SQL to emit; charsetlessTypeNormalizer strips
+	// it — along with any the author wrote by hand — once parsing is done.
+	if charset := col.Tp.GetCharset(); charset != "" {
+		column.Charset = &charset
+	}
+	if collation := col.Tp.GetCollate(); collation != "" {
+		column.Collation = &collation
 	}
 
 	// Extract ENUM/SET permitted values
@@ -502,18 +501,35 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 				// We track this so we can reproduce the correct syntax when generating ALTERs.
 				column.DefaultIsExpr = isExpressionDefault(opt.Expr)
 
-				if literal, isStr := stringLiteralValue(opt.Expr); isStr {
+				// The parenthesized/bare distinction is captured above;
+				// extract the value from inside any parentheses so emission
+				// (which re-adds parens from DefaultIsExpr) doesn't double
+				// them, e.g. DEFAULT ('{}') stores the string {}.
+				defaultExpr := unwrapParenExpr(opt.Expr)
+
+				// Record which literal form the default was written as while
+				// the AST is still in hand. Restoring it to text collapses
+				// distinctions the characters cannot carry — the TRUE keyword
+				// against the 1 it aliases, a bit literal against a string
+				// that happens to spell one — and both emission and the
+				// normalization rules need them back.
+				column.DefaultKind = classifyDefaultLiteral(defaultExpr)
+
+				if literal, isStr := stringLiteralValue(defaultExpr); isStr {
 					// Quoted string literal default. Store the true, raw
-					// (fully-unescaped) value off the AST and remember it
-					// was a string so we re-quote it on emission — even if
-					// the value looks like a keyword (TRUE/NULL) or a
-					// number. Escaping happens exactly once, at emit time.
+					// (fully-unescaped) value off the AST; the recorded kind
+					// is what re-quotes it on emission — even if the value
+					// looks like a keyword (TRUE/NULL) or a number. Escaping
+					// happens exactly once, at emit time.
 					column.Default = &literal
-					column.DefaultIsString = true
 				} else {
 					// Non-string defaults (numeric, functions, expressions):
-					// keep the Restored text representation.
-					defaultRaw := fmt.Sprintf("%v", ct.parseExpression(opt.Expr))
+					// keep the Restored text representation. Only a
+					// literal-style default takes MySQL's bare-keyword
+					// spelling of CURRENT_TIMESTAMP; inside the parentheses of
+					// an expression default the call form is canonical (MySQL
+					// stores DEFAULT (CURRENT_TIMESTAMP) as DEFAULT (now())).
+					defaultRaw := fmt.Sprintf("%v", restoreValueExprText(defaultExpr, !column.DefaultIsExpr))
 					column.Default = &defaultRaw
 				}
 			}
@@ -674,13 +690,14 @@ func (ct *CreateTable) parseConstraint(constraint *ast.Constraint) Constraint {
 		constr.NotEnforced = !constraint.Enforced
 
 		if constraint.Expr != nil {
-			// Use restoreExpressionText (not parseExpression) so the stored
-			// expression has any balanced outer parentheses stripped. MySQL's
-			// SHOW CREATE TABLE wraps the CHECK body in an extra set of parens
-			// (e.g. CHECK ((`age` >= 0))) while user-written DDL usually does
-			// not (CHECK (age >= 0)). Normalizing both to the unwrapped form
-			// (`age`>=0) lets the two compare equal so a re-diff converges
-			// instead of emitting a spurious DROP+ADD.
+			// Use restoreExpressionText (not parseExpression) because CHECK
+			// expressions may contain case-sensitive string literals: the
+			// result is not lowercased and literals keep their quotes. The
+			// stored text is then rewritten into canonical parenthesization
+			// by expressionParenNormalizer when the normalization rules run,
+			// so MySQL's fully-parenthesized SHOW CREATE TABLE form and
+			// user-written DDL compare equal when — and only when — the
+			// expressions are structurally identical.
 			if exprStr, ok := restoreExpressionText(constraint.Expr); ok {
 				constr.Expression = &exprStr
 				// Generate definition string
@@ -878,8 +895,6 @@ func (ct *CreateTable) parsePartitionOptions(partition *ast.PartitionOptions) *P
 		partOpts.Type = "KEY"
 	case ast.PartitionTypeList:
 		partOpts.Type = "LIST"
-	case ast.PartitionTypeSystemTime:
-		partOpts.Type = "SYSTEM_TIME"
 	default:
 		partOpts.Type = fmt.Sprintf("UNKNOWN_%d", partition.Tp)
 	}
@@ -1007,12 +1022,6 @@ func (ct *CreateTable) parsePartitionClause(clause ast.PartitionDefinitionClause
 		}
 
 		return values
-	case *ast.PartitionDefinitionClauseHistory:
-		if c.Current {
-			return &PartitionValues{Type: "CURRENT", Values: []any{}}
-		} else {
-			return &PartitionValues{Type: "HISTORY", Values: []any{}}
-		}
 	default:
 		return nil
 	}
@@ -1107,57 +1116,9 @@ func (ct *CreateTable) parseSubPartitionDefinition(sub *ast.SubPartitionDefiniti
 	return subDef
 }
 
-// parseExpression converts an expression to a string representation
+// parseExpression converts an expression to a string representation, in the
+// form MySQL reports for a literal-style DEFAULT / ON UPDATE / partition
+// expression. See restoreValueExprText for the bare-keyword caveat.
 func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
-	if expr == nil {
-		return nil
-	}
-
-	// Handle different expression types
-	switch e := expr.(type) {
-	case *ast.FuncCallExpr:
-		// Handle function calls like CURRENT_TIMESTAMP, CURRENT_TIMESTAMP(3), UUID(), etc.
-		// We use Restore to preserve function arguments (e.g. precision in CURRENT_TIMESTAMP(3)).
-		// RestoreKeyWordLowercase renders the function name and any keywords
-		// inside its arguments in lowercase — matching MySQL's canonical
-		// SHOW CREATE TABLE form (e.g. DEFAULT (concat(...))) so that
-		// function-name case never causes a spurious diff — while leaving
-		// string-literal arguments byte-exact. The previous strings.ToLower
-		// over the whole Restored text corrupted literal case:
-		// DEFAULT (concat('A')) round-tripped to concat('a'), emitting a
-		// different default value and making defaults that differ only in
-		// literal case compare equal.
-		var sb strings.Builder
-		rCtx := format.NewRestoreCtx(format.RestoreStringSingleQuotes|format.RestoreKeyWordLowercase|
-			format.RestoreNameBackQuotes|format.RestoreStringWithoutCharset, &sb)
-		if err := e.Restore(rCtx); err != nil {
-			return e.FnName.L // fallback to function name on error
-		}
-		restored := sb.String()
-		// Normalize: MySQL's canonical SHOW CREATE TABLE uses "CURRENT_TIMESTAMP" (no parens)
-		// when there is no fractional seconds precision, but the parser's Restore always adds "()".
-		// We only strip parens for timestamp-family functions; other functions like json_object()
-		// need to keep their parens as they represent actual function calls.
-		name := strings.ToUpper(e.FnName.L)
-		isTimestampFunc := name == "CURRENT_TIMESTAMP" || name == "NOW" ||
-			name == "LOCALTIME" || name == "LOCALTIMESTAMP" || name == "UTC_TIMESTAMP"
-		if isTimestampFunc && len(e.Args) == 0 && strings.HasSuffix(restored, "()") {
-			restored = strings.TrimSuffix(restored, "()")
-		}
-		return restored
-	default:
-		// For other types, fall back to text representation
-		var sb strings.Builder
-		sb.Reset()
-		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags|format.RestoreStringWithoutCharset, &sb)
-		if err := expr.Restore(rCtx); err != nil {
-			return "<error>"
-		}
-		str := sb.String()
-		// if the string is quoted, remove quotes
-		if strings.HasPrefix(str, "'") && strings.HasSuffix(str, "'") {
-			str = str[1 : len(str)-1]
-		}
-		return str
-	}
+	return restoreValueExprText(expr, true)
 }

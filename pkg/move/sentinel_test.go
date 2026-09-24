@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,7 +26,7 @@ func sentinelTestTableExists(t *testing.T, db *sql.DB, schema, name string) bool
 	return true
 }
 
-// TestMoveSentinelDropReleasesCutover: with --create-sentinel, dropping the
+// TestMoveSentinelDropReleasesCutover: with --defer-cutover, dropping the
 // sentinel must RELEASE the cutover and let the move finish — not be seen as a
 // schema change that cancels it. The sentinel lives on targets[0], so the drop
 // is a target-side DDL that the source-watching change feed must ignore. Uses a
@@ -47,17 +47,16 @@ func TestMoveSentinelDropReleasesCutover(t *testing.T) {
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sentrel_dst")
 	testutils.RunSQL(t, "CREATE DATABASE sentrel_dst")
 
-	ctl, err := sql.Open("mysql", testutils.DSN())
+	ctl, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(ctl)
 
 	m := &Move{
-		SourceDSN:       src.FormatDSN(),
-		TargetDSN:       dst.FormatDSN(),
-		TargetChunkTime: time.Second,
-		Threads:         1,
-		WriteThreads:    1,
-		CreateSentinel:  true,
+		SourceDSN:    src.FormatDSN(),
+		TargetDSN:    dst.FormatDSN(),
+		Threads:      1,
+		WriteThreads: 1,
+		DeferCutOver: true,
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
@@ -69,17 +68,7 @@ func TestMoveSentinelDropReleasesCutover(t *testing.T) {
 	go func() { errCh <- runner.Run(context.Background()) }()
 
 	// Wait until the move is blocked on the sentinel.
-	deadline := time.Now().Add(60 * time.Second)
-	for runner.status.Get() != status.WaitingOnSentinelTable {
-		select {
-		case err := <-errCh:
-			t.Fatalf("move finished before reaching the sentinel wait: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the move to reach the sentinel wait")
-		}
-	}
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
 
 	// Drop the sentinel on targets[0] to release the cutover.
 	testutils.RunSQL(t, "DROP TABLE sentrel_dst."+sentinel.TableName)

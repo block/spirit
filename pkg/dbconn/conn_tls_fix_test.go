@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -129,7 +129,11 @@ func TestNewWithConnectionTypeCaseInsensitivePool(t *testing.T) {
 			dsn, err := newDSN(nonRDSHost, cfg)
 			require.NoError(t, err)
 			if tc.expectTLS == "" {
-				require.NotContains(t, dsn, "tls=", tc.description)
+				// DISABLED writes tls=false rather than omitting tls=, so
+				// assert the effect: the driver must not give this connection
+				// TLS. Omitting the parameter would let the driver's RDS
+				// auto-TLS turn DISABLED into a TLS connection on an RDS host.
+				requireNoEffectiveTLS(t, dsn, tc.description)
 			} else {
 				require.Contains(t, dsn, tc.expectTLS, tc.description)
 			}

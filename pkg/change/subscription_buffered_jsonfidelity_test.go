@@ -22,14 +22,17 @@ import (
 // textual spelling interacts badly with MySQL's JSON parser, plus the
 // zero-value temporal opaques whose spelling go-mysql gets wrong.
 //
-// STATUS: the fail-today cases below are RED BY DESIGN on the current
-// go-mysql pin (v1.15.1-0.20260526024741-088eb1fbf0ea). They assert
-// correct behavior (source == destination); a go-mysql fix for
-// formatMySQLDouble (replication/json_mysql_text.go:102-111) is being
-// prepared and will turn the huge-double class green, with the
-// zero-temporal class covered by a separate follow-up
-// (replication/json_binary.go:539 and :561-563). Do not weaken these
-// assertions to make them pass.
+// STATUS: the go.mod pin (github.com/morgo/go-mysql
+// v1.16.1-0.20260723231236-3aced1dddcf4, the TEMP replace in go.mod)
+// carries the formatMySQLDouble my_gcvt-parity fix
+// (replication/json_mysql_text.go) and the zero-temporal opaque fix
+// (replication/json_binary.go), so the huge-double and zero-temporal
+// classes assert green and gate the pin: dropping the replace for an
+// upstream go-mysql without those fixes turns every CI job red here.
+// seventeen_digit_mantissa stays skipped BY DESIGN — MySQL's own JSON
+// text parser misrounds that class (bugs #116160/#112904), which no
+// client-side renderer can compensate; do not unskip it, and do not
+// weaken any assertions to make them pass.
 //
 // Every case asserts two per-row fingerprints between source and
 // destination:
@@ -71,19 +74,23 @@ type jsonFidelityCase struct {
 
 func jsonFidelityCases() []jsonFidelityCase {
 	return []jsonFidelityCase{
-		// ---- FAIL TODAY: huge integral doubles ------------------------
-		// go-mysql's formatMySQLDouble (replication/json_mysql_text.go:
-		// 102-111 at pin v1.15.1-0.20260526024741-088eb1fbf0ea) renders
-		// whole-number doubles with strconv.FormatFloat(f, 'f', 1, 64):
-		// the FULL decimal expansion, not MySQL's shortest round-trip
-		// spelling. MySQL reparses the applier's text with rapidjson's
+		// ---- PIN-GATED: huge integral doubles -------------------------
+		// Green under the current fork pin; red if the pin is dropped for
+		// an unfixed upstream go-mysql. Upstream's formatMySQLDouble
+		// (replication/json_mysql_text.go:102-111 at
+		// v1.15.1-0.20260526024741-088eb1fbf0ea) rendered whole-number
+		// doubles with strconv.FormatFloat(f, 'f', 1, 64): the FULL
+		// decimal expansion, not MySQL's shortest round-trip spelling.
+		// MySQL reparses the applier's text with rapidjson's
 		// normal-precision path, which is NOT correctly rounded (MySQL
 		// bugs #116160 / #112904), so long expansions can land on a
 		// different double than the source stored. The source values here
 		// are built with SQL DOUBLE constructors, which go through
-		// my_strtod and ARE correctly rounded.
+		// my_strtod and ARE correctly rounded. The pinned fork renders
+		// my_gcvt-parity shortest forms instead, which reparse exactly.
 		//
-		// Verified against MySQL 8.0.45; per-key expectations today:
+		// Verified against MySQL 8.0.45; per-key expectations under the
+		// UNFIXED upstream renderer (what this case guards against):
 		//
 		//   'a' 1e16:    applier writes "10000000000000000.0" where MySQL
 		//        renders "1e16" — but the expansion reparses exactly, so
@@ -115,17 +122,18 @@ func jsonFidelityCases() []jsonFidelityCase {
 			assertStrict: true,
 		},
 
-		// ---- FAIL TODAY: zero-value temporal opaques ------------------
-		// go-mysql renders the zero TIME as "00:00:00"
-		// (replication/json_binary.go:539) and the zero DATETIME as
-		// "0000-00-00 00:00:00" (json_binary.go:563), but MySQL's render
-		// of the temporal opaques always carries the 6-digit fraction:
-		// "00:00:00.000000" / "0000-00-00 00:00:00.000000". The applier's
-		// text write therefore persists a JSON STRING with the shorter
-		// spelling on the destination — a difference no reparse can heal,
-		// so STRICT and RELAXED both fail. NOT fixed by the
-		// formatMySQLDouble change (separate go-mysql follow-up); the
-		// assertions still state the correct behavior.
+		// ---- PIN-GATED: zero-value temporal opaques -------------------
+		// Green under the current fork pin; red if the pin is dropped for
+		// an unfixed upstream go-mysql. Upstream renders the zero TIME as
+		// "00:00:00" (replication/json_binary.go:539) and the zero
+		// DATETIME as "0000-00-00 00:00:00" (json_binary.go:563), but
+		// MySQL's render of the temporal opaques always carries the
+		// 6-digit fraction: "00:00:00.000000" /
+		// "0000-00-00 00:00:00.000000". An applier text write with the
+		// shorter spelling persists a differing JSON STRING on the
+		// destination — a difference no reparse can heal (STRICT and
+		// RELAXED would both fail). The pinned fork renders the fractions
+		// MySQL-identically.
 		{
 			// Midnight TIME is a valid value under strict sql_mode.
 			name:         "zero_time_opaque",

@@ -45,11 +45,15 @@ applies it through the applier interface:
 - Higher memory usage than a key-only map: stores full row data for each changed key.
 - Watermark optimizations (`KeyAboveHighWatermark` and `KeyBelowLowWatermark`) are available on `MappedChunker` implementations (both optimistic and composite chunkers). They work correctly for numeric, binary, and temporal primary key types. For `VARCHAR`/`TEXT` columns with collations, Go's byte-order comparison may differ from MySQL's collation order; any discrepancies are caught by the checksum phase (see [issue #479](https://github.com/block/spirit/issues/479)).
 
-**Map iteration order is irrelevant** because the applier issues
+**Map iteration order is irrelevant to correctness** because the applier issues
 `REPLACE INTO target VALUES (...)`, which deletes any row that conflicts
 on PRIMARY KEY or any UNIQUE index before each insert. That makes the
 multi-row VALUES list order-independent — see "Applier idempotence via
 REPLACE INTO" below.
+
+It is not irrelevant to *lock contention*, which is a separate matter and the
+reason a drain no longer batches in iteration order — see
+[Flush partitioning by unique secondary index](#flush-partitioning-by-unique-secondary-index).
 
 **Example scenario:**
 ```
@@ -198,16 +202,102 @@ The copier maintains a "watermark" representing its progress. The replication cl
 - **Low watermark**: Skip changes for rows that are currently being copied (avoid races with the copier, which may cause deadlocks/lock waits)
 
 ```go
+// Ingest time (HasChanged): drop what the copier is guaranteed to pick up.
 if chunker.KeyAboveHighWatermark(key[0]) {
     return  // Skip, copier will handle this
 }
 
-if !chunker.KeyBelowLowWatermark(key[0]) {
+// Flush time (bufferedMap.mustDeferKey): defer only the in-flight band.
+if !chunker.KeyBelowLowWatermark(key[0]) && !chunker.KeyNotYetDispatched(key[0]) {
     continue  // Skip, copier is actively working on this range
 }
 ```
 
+Note the flush-time filter has two halves. A buffered change is safe to apply
+both when the copier has already committed its key (`KeyBelowLowWatermark`)
+**and** when the copier has not yet dispatched a chunk covering it
+(`KeyNotYetDispatched`) — in the latter case the copier's later read observes a
+source state at least as new as the change and overwrites it. Only the band
+between them, where a chunk read is genuinely in flight, has to wait.
+
+Deferring the not-yet-dispatched region too (the behaviour before
+[#1167](https://github.com/block/spirit/pull/1167)) pinned the checkpoint's
+binlog position for entire copies: `KeyAboveHighWatermark` returns `false`
+until the first chunk is dispatched, so every change in the window between
+`SetWatermarkOptimization(true)` and the first `chunker.Next()` — a window the
+throttler can stretch arbitrarily — was buffered, including changes to rows at
+the top of the key space. Those entries stay above the low watermark until the
+copier physically reaches their key, and a single one is enough to make every
+flush report `allChangesFlushed=false`.
+
 **Important:** The watermark optimization is disabled before the final cutover to ensure all changes are applied regardless of the copier's position.
+
+#### Above-watermark discard vs. binlog visibility
+
+The high-watermark discard in `HasChanged` ([`subscription_buffered.go`](subscription_buffered.go)) is only safe if:
+
+> For every discarded event `E` (transaction `T`, key `K` above the high watermark at discard time), the copier's later read of the chunk covering `K` opens a snapshot that includes `T`.
+
+The copier reads each chunk with a plain autocommit `SELECT` on a pooled connection, i.e. a fresh snapshot at read time, so the invariant reduces to *read-after-delivery visibility*: a snapshot opened after delivery of `E` must see `T`.
+
+**MySQL does not guarantee that.** Group commit runs flush → **sync** (fsync; dump threads may send from here; semi-sync `AFTER_SYNC` waits for the replica ACK here) → **engine commit** (InnoDB makes rows visible). Binlog subscribers — spirit included — receive a transaction's events at the sync stage, before its rows are readable on the source. `binlog_order_commits=ON` (required by preflight since #818) only fixes the *order* of engine commits; it does not close that window. The gap is sub-millisecond on a healthy primary, but it widens to:
+
+- the semi-sync ACK round trip, or the full `rpl_semi_sync_source_timeout` with `AFTER_SYNC` — that ordering is the entire point of "lossless" semi-sync: data reaches replicas *before* it is visible locally;
+- elevated commit latency on Aurora under load;
+- the full replication lag when the change feed and the copier read from a replica (the `spirit sync` import case).
+
+So the race is:
+
+1. `T` (INSERT of key `K`) reaches the sync stage; spirit receives its row events now. `T`'s engine commit completes later, at `t_visible`.
+2. `KeyAboveHighWatermark(K)` is true → the event is **discarded** (`keys_dropped_above_high`).
+3. A copier read worker dispatches the chunk covering `K` and opens its snapshot before `t_visible`. The chunk is copied without `T` (missing row for an INSERT; stale image for an UPDATE; for a discarded DELETE the still-visible row is copied, leaving a phantom).
+4. `T`'s GTID went into `bufferedGTID` at step 1, so the next flush publishes `flushedGTID ⊇ T` — the resume coordinate claims `T` is handled. The file/offset client advances `flushedPos` identically.
+
+End state: the change exists on the source, is absent from the target, is in no buffer, and no resume re-fetches it. Steps 2→3 race at every chunk boundary — `KeyAboveHighWatermark` compares against the dispatch-time upper bound and read workers dispatch continuously — so "key just above the watermark, covering chunk dispatched milliseconds later" is ordinary, not pathological.
+
+This is the same mechanism as [issue #746](https://github.com/block/spirit/issues/746), already fixed for the applier path (inline row images instead of `REPLACE INTO … SELECT`) and for the pre-first-chunk window (`KeyAboveHighWatermark` returns `false` until a chunk has been dispatched). The general above-watermark discard is the remaining path whose safety depends on read-after-delivery.
+
+**What is *not* a problem here:**
+
+- **Crash/resume does not add loss.** Copy resumes from the checkpointed *low* watermark, which is ≤ the high watermark at any earlier discard, so discarded-key chunks are re-read long after `t_visible` (and the `checkpointHighPtr` guard suppresses the discard up to the new table's max key). Only the *live* interleaving in step 3 loses data.
+- **Holding back the GTID/flushed position would not help.** Deferring the resume coordinate past discarded events only changes the crash path, which re-copy already heals; in the no-crash path the live stream is past `T` and never redelivers it.
+- **The checkpoint format is irrelevant.** GTID and file/offset advance identically, so disabling the optimization only under GTID mode would be misdirected.
+
+**Why the shipped flows are safe today:** a repairing checksum stands behind the copy. That backstop is load-bearing, not incidental:
+
+| Flow | Backstop | Net effect today |
+|---|---|---|
+| `migrate`, `move` | Mandatory pre-cutover checksum with `FixDifferences=true` | Repaired before cutover. Cost: `differencesFound > 0`, a chunk recopy, and a "checksum found differences" signal that looks alarming |
+| `sync` (continuous) | Continuous checksum + `MySQLRecopier`, *lazy* | Real exposure: the target can serve a missing/stale/phantom row from copy time until a later checksum pass covers that chunk |
+| Library consumers of pkg/copier + pkg/change with no checksum | None | Silent data loss |
+
+This is the same reliance already accepted knowingly for collation-imprecise key comparisons ([issue #479](https://github.com/block/spirit/issues/479), "checksum will fix any discrepancies") — except the visibility window affects every key type, not just collated strings.
+
+**Field signature:** a run that hit the race shows `keys_dropped_above_high > 0` in the watermark-toggle log line **and** non-zero checksum differences. Semi-sync sources, Aurora under heavy commit load, and replica-fed syncs should expect that correlation to be reproducible.
+
+**If we want to stop relying on the checksum**, the options are:
+
+- **Buffer instead of discard.** Keep the low-watermark flush deferral, stop dropping above-high-watermark events. Airtight and simple, but the memory cost lands exactly on the workload the optimization exists for: on append-heavy tables every tail insert is buffered for the rest of the copy, and the soft limit then parks the binlog reader.
+- **Visibility-proof deferred drop.** Buffer above-watermark events and drop them at flush time once dropping is provably safe: still above the high watermark (covering chunk still undispatched) **and** the transaction is contained in `gtid_executed` (one `SELECT @@gtid_executed` per flush). Containment implies engine commit, so any later chunk read sees the row. Bounded residency (~one flush interval) preserves the memory profile, but it needs per-entry transaction identity plumbed into the subscription, and a time-dwell fallback on non-GTID sources.
+- **Copier-side visibility barrier.** Before each chunk read, `WAIT_FOR_EXECUTED_GTID_SET` on the change feed's delivered set — holds reads instead of events. Clean and usually free, but it couples the copier to the change source's position (deliberately decoupled today) and has no file/offset equivalent.
+- **Disable the discard where no synchronous checksum gate exists** (`pkg/datasync` fresh copies). One line, costs sync initial-copy throughput on hot tables, and swaps in a smaller DELETE-only hazard that sync's resume path already accepts.
+
+**Repro:** `TestKeyAboveWatermarkVisibilityWindow` ([`gtid_visibility_race_test.go`](gtid_visibility_race_test.go)) demonstrates the whole chain deterministically, using the semi-sync source plugin with **no replica** so the first commit after arming stalls for the full timeout between binlog sync and engine commit:
+
+```sh
+# once, on a scratch server:
+#   INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
+MYSQL_DSN="root:...@tcp(127.0.0.1:3306)/test" \
+  go test ./pkg/change/ -run TestKeyAboveWatermarkVisibilityWindow -v
+```
+
+Observed on MySQL 8.0.43: the row event is delivered and discarded ~15ms into a 3000ms commit stall, the covering chunk read (the copier's statement shape) does not contain the row, a flush during the window publishes a GTID position that already covers the transaction, and the target never receives it. The test self-skips without the plugin, without the privileges to arm the window, or when a semi-sync replica is attached — which means it skips in both CI lanes (the default lane has no plugin; the semi-sync lane has an ACKing replica) and is a scratch-server tool.
+
+### Skipping row decode for unsubscribed tables
+
+While the copy runs, the binlog is dominated by spirit's **own writes** — the multi-row `INSERT`s into the `_new` table. The stream client has no subscription for `_new`, so those events are no-ops, but they still have to move through the parser, and decoding every column of every row image (including JSON rendering) just to discard the event by table name is the single largest cost in the stream path. On a fast copy the reader falls behind its own migration and repays the gap after the copy as a long catch-up phase that is almost entirely no-ops.
+
+Both clients therefore install a `RowsEventDecodeFunc` on the syncer (see `newRowsEventDecodeFunc`): the event *header* is always decoded — that is where the table name and stream position come from — but the row images are decoded only when the table has a subscription. This is the same hook go-mysql's canal uses for its table filters. It is safe because the `Source` lifecycle requires all subscriptions to be added before `Start`; `processRowsEvent` enforces that with a hard error if a subscribed table's event ever arrives undecoded, rather than silently treating it as empty.
 
 ### Checkpointing
 
@@ -250,6 +340,82 @@ if !client.AllChangesFlushed() {
 ```
 
 The `client.Flush()` will retry in a loop until the number of pending changes is considered trivial (currently <10K). It is important to handle errors correctly here, because `FlushUnderTableLock` may fail if it can't flush the pending changes fast enough. This is your cue to abandon the cutover operation for now, and try again when the server is under less load.
+
+### Flush partitioning by unique secondary index
+
+A map-mode drain splits its rows into batches and runs several through the
+applier at once. Those batches are disjoint by primary key — a map holds one
+image per key — and for a long time that was assumed to be enough. It is not.
+
+Two concurrent `REPLACE` statements on PK-disjoint rows can still deadlock, and
+in [issue #1168](https://github.com/block/spirit/issues/1168) they did: the
+InnoDB cycle inverted between the clustered index and a `UNIQUE` secondary
+index. `REPLACE`'s duplicate detection takes a **next-key** lock on each unique
+secondary index — the gap below the record included — so two batches collide
+whenever any of their rows land in *adjacent* slots of any such index. Secondary
+key order is unrelated to primary key order, so PK disjointness says nothing
+about it.
+
+The conflict surface is therefore exactly **the set of `UNIQUE` secondary
+indexes**, and that is a precise claim rather than a cautious one. It is
+established against a real server by `TestReplaceContendsOnlyOnUniqueIndexes`
+in `pkg/applier`:
+
+| Two rows are… | Contend? | Why |
+| --- | --- | --- |
+| adjacent in the PRIMARY KEY | **no** | a `REPLACE`'s clustered-index conflict is with the row bearing that exact PK, so under `READ COMMITTED` it takes a record lock and no gap |
+| equal in a *non-unique* secondary index | **no** | those records are keyed `(indexed columns, PK)`, so PK-disjoint rows always occupy distinct records |
+| adjacent in a *`UNIQUE`* secondary index | **yes** | duplicate detection takes a next-key lock, gap included |
+
+So primary-key separation buys nothing, and an earlier attempt at PK-sorting the
+drain was aimed at the wrong index. The drain instead:
+
+1. **Chooses** the unique secondary index whose values are most *clustered*
+   across this drain's own rows — measured, not configured, because whether a
+   key correlates with anything is a property of the workload rather than of the
+   schema. A repeating leading column means physically adjacent sibling records
+   and a near-certain collision; a uniformly distributed key has an adjacency
+   probability of roughly `n²/N` per drain (about 0.3 for 50,000 rows in 8.5
+   billion) and needs no help.
+2. **Sorts** by that index and cuts **contiguous** batches, nudging cut points
+   to fall where the leading key value changes so a run of siblings is not split
+   across two batches. Range partitioning, not hashing: hashing spreads
+   equal-ish values across buckets, which is the arrangement that collides.
+3. **Stripes** the batches into evens and odds, running one group at a time, so
+   no two batches in flight together are neighbours in the sort order. Handing
+   the sorted list straight to the limiter would undo most of the benefit — the
+   in-flight window is roughly contiguous, so neighbours would run together and
+   every batch boundary would become a candidate collision.
+
+Rows that are close together in the chosen index end up in the *same* statement,
+where they cannot conflict, and statements that do run together are separated by
+at least one whole batch of intervening rows. Note that the separation is
+measured in **rows**, not in value distance: whether two values are adjacent in
+the B-tree depends on the whole table, not on the drain, so no value-space
+margin would mean anything.
+
+**Getting it wrong costs throughput, never correctness.** Batches remain
+disjoint by key and map mode makes no cross-key ordering promises, so a
+misordered sort or a poorly chosen index simply reproduces the old collision
+behaviour, which the AIMD contention controller still catches. That is what
+makes it acceptable to sort row images with a best-effort comparator.
+
+The controller therefore stays, and covers what partitioning cannot:
+
+- **Deletes.** A buffered delete keeps only its primary key (the before image is
+  discarded at buffer time), so there is no way to know where it sits in a
+  unique secondary index. Deleted rows are grouped at the tail.
+- **Second and subsequent unique indexes.** Sorting by one says nothing about
+  the others.
+- **`REPLACE`'s out-of-partition deletion cascade.** A `REPLACE` deletes any row
+  conflicting on any unique index, including primary keys not in the batch,
+  whose other unique values are unknowable from here.
+
+Partitioning is automatic, has no flag, and turns itself off when there is
+nothing to do: a table with no usable unique secondary index has no conflict
+surface between PK-disjoint batches at all, so the sort would be pure cost. A
+`flush partitioning enabled` line at Info reports the candidates once per
+subscription.
 
 ### Memory backpressure
 

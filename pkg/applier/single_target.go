@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -20,9 +21,10 @@ import (
 type SingleTargetApplier struct {
 	sync.Mutex
 
-	target   Target
-	dbConfig *dbconn.DBConfig
-	logger   *slog.Logger
+	target      Target
+	dbConfig    *dbconn.DBConfig
+	logger      *slog.Logger
+	metricsSink metrics.Sink // nil disables the stats emitter
 
 	// Internal chunklet processing
 	chunkletBuffer      chan chunklet
@@ -48,20 +50,22 @@ type SingleTargetApplier struct {
 	// Worker management. writeWorkersCount is the initial worker count, set at
 	// construction from ApplierConfig.Threads; the *live* count can change at
 	// runtime via SetWriteWorkers (driven by the copier's autoscaler). The
-	// fields below workerIDCounter are all guarded by scaleMu.
+	// resizable worker lifecycle is shared with ShardedApplier through workerPool.
 	writeWorkersCount int32        // initial worker count (start value)
 	workerIDCounter   atomic.Int32 // monotonic worker id, for debug logging only
 
-	scaleMu       sync.Mutex      // guards the worker pool: workerCtx, workerQuits, scalingClosed, and spawn/park
-	workerCtx     context.Context // ctx the workers run under; set in Start
-	workerQuits   []chan struct{} // one quit channel per live worker — closing one parks (exits) that worker
-	activeWorkers atomic.Int32    // current live worker count
-	scalingClosed bool            // set true when Stop begins, to block new spawns
-	workersWg     sync.WaitGroup  // tracks write workers only
+	workers workerPool
+
+	// timings is a rolling window of per-chunklet queue-wait and write
+	// durations, reported by Stats().
+	timings timingRing
+
+	// splits accumulates the chunklet/row counts behind Stats.RowsPerChunklet.
+	splits splitCounter
 
 	// Context management
 	cancelFunc context.CancelFunc
-	wg         sync.WaitGroup // tracks the feedbackCoordinator goroutine only
+	wg         sync.WaitGroup // tracks the feedbackCoordinator and stats-emitter goroutines
 
 	// State management to make Start/Stop idempotent
 	started bool
@@ -71,9 +75,10 @@ type SingleTargetApplier struct {
 // chunklet represents a small batch of rows for internal processing
 // Limited by either chunkletMaxRows or MaxStatementSizeBytes, whichever is reached first
 type chunklet struct {
-	workID int64        // ID of the parent work
-	chunk  *table.Chunk // Original chunk for column info
-	rows   []rowData    // Batch of rows limited by row count or size
+	workID     int64        // ID of the parent work
+	chunk      *table.Chunk // Original chunk for column info
+	rows       []rowData    // Batch of rows limited by row count or size
+	enqueuedAt time.Time    // when Apply() offered this chunklet to the buffer; queue wait = dequeue - enqueuedAt
 }
 
 // chunkletCompletion represents a completed chunklet
@@ -100,6 +105,7 @@ func NewSingleTargetApplier(target Target, cfg *ApplierConfig) (*SingleTargetApp
 		target:              target,
 		dbConfig:            cfg.DBConfig,
 		logger:              cfg.Logger,
+		metricsSink:         cfg.MetricsSink,
 		chunkletBuffer:      make(chan chunklet, defaultBufferSize),
 		chunkletCompletions: make(chan chunkletCompletion, defaultBufferSize),
 		pendingWork:         make(map[int64]*pendingWork),
@@ -143,24 +149,20 @@ func (a *SingleTargetApplier) Start(ctx context.Context) error {
 	a.started = true
 	a.logger.Debug("starting SingleTargetApplier", "writeWorkers", a.writeWorkersCount)
 
-	// Reset the worker pool bookkeeping and record the context workers run
-	// under, so SetWriteWorkers can spawn more later.
-	a.scaleMu.Lock()
-	a.workerCtx = workerCtx
-	a.workerQuits = nil
-	a.activeWorkers.Store(0)
-	a.scalingClosed = false
-	a.scaleMu.Unlock()
-
 	// Start feedback coordinator before workers so completions are always
 	// drained.
 	a.wg.Add(1)
 	go a.feedbackCoordinator(workerCtx)
 
-	// Spawn the initial worker pool. SetWriteWorkers only takes scaleMu, so
-	// calling it while holding the main lock is safe (no lock nesting on the
-	// same mutex).
-	a.SetWriteWorkers(int(a.writeWorkersCount))
+	// Report pipeline gauges for the applier's lifetime. Exits on Stop()'s
+	// context cancellation; joined via a.wg like the coordinator.
+	if a.metricsSink != nil {
+		a.wg.Go(func() {
+			emitStatsLoop(workerCtx, a, a.metricsSink, a.logger)
+		})
+	}
+
+	a.workers.start(workerCtx, int(a.writeWorkersCount), a.writeWorker)
 
 	return nil
 }
@@ -185,6 +187,7 @@ func (a *SingleTargetApplier) Apply(ctx context.Context, chunk *table.Chunk, row
 	// Split into chunklets based on both row count and size thresholds
 	// Then convert row batches into chunklets with metadata
 	rowBatches := splitRowsIntoChunklets(rowDataList)
+	a.splits.record(len(rowBatches), len(rowDataList))
 	chunklets := make([]chunklet, len(rowBatches))
 	for i, batch := range rowBatches {
 		chunklets[i] = chunklet{
@@ -217,6 +220,10 @@ func (a *SingleTargetApplier) Apply(ctx context.Context, chunk *table.Chunk, row
 	// coordinator already claimed the work (e.g. an error completion raced
 	// this cancellation), `exists` is false and we return without invoking.
 	for _, chunkletData := range chunklets {
+		// Stamp before the send so queue wait includes send-side
+		// backpressure: when the buffer is full, time blocked here is
+		// exactly "waiting for a write worker".
+		chunkletData.enqueuedAt = time.Now()
 		select {
 		case a.chunkletBuffer <- chunkletData:
 		case <-ctx.Done():
@@ -314,13 +321,7 @@ func (a *SingleTargetApplier) Stop() error {
 	// Release the lock before waiting for workers to finish
 	a.Unlock()
 
-	// Close scaling first and wait out any in-flight SetWriteWorkers, so no new
-	// worker is spawned (no workersWg.Add) after we begin shutdown. Acquiring
-	// scaleMu guarantees any concurrent scale call has finished its Adds before
-	// we Wait below.
-	a.scaleMu.Lock()
-	a.scalingClosed = true
-	a.scaleMu.Unlock()
+	a.workers.seal()
 
 	// Close the chunklet buffer to signal no more work. Workers blocked in their
 	// select see the closed buffer (ok == false) and return; workers mid-write
@@ -331,12 +332,22 @@ func (a *SingleTargetApplier) Stop() error {
 	// This is now the sole owner of that close — decoupled from worker count,
 	// which is what lets the count move at runtime. The coordinator drains any
 	// remaining completions and exits when the channel closes.
-	a.workersWg.Wait()
+	a.workers.wait()
 	close(a.chunkletCompletions)
 	a.wg.Wait()
 
 	a.logger.Debug("SingleTargetApplier stopped")
 	return nil
+}
+
+// SetInitialWriteWorkers configures subsequent starts without spawning workers.
+// Call before Start (or after Stop has returned). A running applier is unchanged.
+func (a *SingleTargetApplier) SetInitialWriteWorkers(n int) {
+	a.Lock()
+	defer a.Unlock()
+	if !a.started {
+		a.writeWorkersCount = int32(max(1, n))
+	}
 }
 
 // SetWriteWorkers reconciles the live write-worker count to n, spawning new
@@ -348,52 +359,48 @@ func (a *SingleTargetApplier) Stop() error {
 // time it returns to its select (after finishing any chunklet currently in
 // flight), so no completion is ever lost.
 func (a *SingleTargetApplier) SetWriteWorkers(n int) {
-	if n < 1 {
-		n = 1
-	}
-	a.scaleMu.Lock()
-	defer a.scaleMu.Unlock()
-
-	// No-op before Start has recorded the worker context (the exported API may
-	// be called too early) or once Stop has begun shutting down. In both states
-	// we must not spawn workers: a nil workerCtx would panic the worker on its
-	// first writeChunklet (ctx.Err()), and post-shutdown spawns would race the
-	// workersWg.Wait() in Stop.
-	if a.workerCtx == nil || a.scalingClosed {
-		return
-	}
-
-	cur := len(a.workerQuits)
-	switch {
-	case n > cur:
-		for range n - cur {
-			quit := make(chan struct{})
-			a.workerQuits = append(a.workerQuits, quit)
-			a.activeWorkers.Add(1)
-			a.workersWg.Add(1)
-			go a.writeWorker(a.workerCtx, quit)
-		}
-		a.logger.Info("scaled write workers up", "from", cur, "to", n)
-	case n < cur:
-		// Park the most-recently-added workers by closing their quit channels.
-		for i := cur - 1; i >= n; i-- {
-			close(a.workerQuits[i])
-		}
-		a.workerQuits = a.workerQuits[:n]
-		a.logger.Info("scaled write workers down", "from", cur, "to", n)
-	}
+	a.workers.resize(n)
 }
 
 // ActiveWriteWorkers returns the current number of live write workers.
 func (a *SingleTargetApplier) ActiveWriteWorkers() int {
-	return int(a.activeWorkers.Load())
+	return a.workers.count()
+}
+
+// Stats returns a point-in-time snapshot of the write pipeline. The embedded
+// mutex is held so the buffer read cannot race Start()'s channel
+// reinitialization on restart; len/cap on a closed channel are safe.
+func (a *SingleTargetApplier) Stats() Stats {
+	a.Lock()
+	queueDepth := len(a.chunkletBuffer)
+	queueCap := cap(a.chunkletBuffer)
+	a.Unlock()
+
+	a.pendingMutex.Lock()
+	pending := len(a.pendingWork)
+	a.pendingMutex.Unlock()
+
+	t := a.timings.percentiles()
+	return Stats{
+		QueueDepth:      queueDepth,
+		QueueCap:        queueCap,
+		PendingWork:     pending,
+		ActiveWorkers:   a.workers.count(),
+		RowsPerChunklet: a.splits.mean(),
+		QueueWaitP50:    t.queueWaitP50,
+		QueueWaitP90:    t.queueWaitP90,
+		BuildTimeP50:    t.buildP50,
+		BuildTimeP90:    t.buildP90,
+		WriteTimeP50:    t.writeP50,
+		WriteTimeP90:    t.writeP90,
+		HandoffP50:      t.handoffP50,
+		HandoffP90:      t.handoffP90,
+	}
 }
 
 // writeWorker processes chunklets from the buffer until either its quit channel
 // is closed (scale-down) or the buffer is closed by Stop().
 func (a *SingleTargetApplier) writeWorker(ctx context.Context, quit <-chan struct{}) {
-	defer a.workersWg.Done()
-	defer a.activeWorkers.Add(-1)
 	workerID := a.workerIDCounter.Add(1)
 
 	// Every chunklet that made it into the buffer was already registered in
@@ -417,29 +424,47 @@ func (a *SingleTargetApplier) writeWorker(ctx context.Context, quit <-chan struc
 			}
 			a.logger.Debug("writeWorker processing chunklet", "workerID", workerID, "workID", chunkletData.workID, "rowCount", len(chunkletData.rows))
 
-			affectedRows, err := a.writeChunklet(ctx, chunkletData)
+			queueWait := time.Since(chunkletData.enqueuedAt)
+			writeStart := time.Now()
+			affectedRows, buildTime, err := a.writeChunklet(ctx, chunkletData)
+			writeTime := time.Since(writeStart)
 
+			// Timed separately from the write: a worker blocked here is waiting
+			// on the single feedbackCoordinator (which invokes the chunk
+			// callback inline), not on the target, and while blocked it is not
+			// pulling from chunkletBuffer either. Folding it into writeTime
+			// would attribute a completion-path stall to the database, and
+			// leaving it untimed — as it was — hides it from the status block
+			// altogether, which is the shape of "more write workers changed
+			// nothing" that is otherwise very hard to see.
+			handoffStart := time.Now()
 			a.chunkletCompletions <- chunkletCompletion{
 				workID:       chunkletData.workID,
 				affectedRows: affectedRows,
 				err:          err,
 			}
+			a.timings.record(queueWait, buildTime, writeTime, time.Since(handoffStart))
 		}
 	}
 }
 
-// writeChunklet writes a single chunklet (up to chunkletMaxRows or MaxStatementSizeBytes)
-func (a *SingleTargetApplier) writeChunklet(ctx context.Context, chunkletData chunklet) (int64, error) {
+// writeChunklet writes a single chunklet (up to chunkletMaxRows or
+// MaxStatementSizeBytes). It returns the affected row count and, separately,
+// how long the client-side statement build took — that portion holds no
+// connection and is spent on spirit's own CPU, so Stats() reports it apart from
+// the round trip (see Stats.BuildTimeP50).
+func (a *SingleTargetApplier) writeChunklet(ctx context.Context, chunkletData chunklet) (int64, time.Duration, error) {
 	if len(chunkletData.rows) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
+	buildStart := time.Now()
 
 	// Fast path on shutdown: if ctx is already cancelled, fail the chunklet
 	// without building the (potentially large) INSERT statement or burning
 	// retries against a dead context. writeWorker relies on chunklets failing
 	// quickly after cancellation so Stop() can drain the buffer promptly.
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, time.Since(buildStart), err
 	}
 
 	// The intersected source and target column lists are parallel — row.values[i]
@@ -450,33 +475,46 @@ func (a *SingleTargetApplier) writeChunklet(ctx context.Context, chunkletData ch
 	_, targetColumnList := mapping.Columns()
 	sourceColumnNames, _ := mapping.ColumnsSlice()
 
+	// Resolve each column's type once per chunklet, not once per value. The
+	// type is a property of the column, so the inner loop was re-doing a map
+	// lookup and a type-string parse for every value of every row — measured
+	// as ~14x the cost of the whole build on a 12-column row, and the reason
+	// applier-build-p50 dominates applier-write-p50 on wide tables.
+	// deleteKeysInClause does the same hoist for the same reason.
+	//
+	// Type lookup uses the source table by the source column name — the value
+	// came from a source SELECT, and MySQL coerces on the destination INSERT
+	// if the target column type has widened.
+	sourceTable := mapping.SourceTable()
+	colTypes := make([]table.ColumnType, len(sourceColumnNames))
+	for i, colName := range sourceColumnNames {
+		typeStr, ok := sourceTable.GetColumnMySQLType(colName)
+		if !ok {
+			return 0, time.Since(buildStart), fmt.Errorf("column %s not found in source table info", colName)
+		}
+		colTypes[i] = table.NewColumnType(typeStr)
+	}
+
 	// Build VALUES clauses for all rows in the chunklet
-	var valuesClauses []string
+	valuesClauses := make([]string, 0, len(chunkletData.rows))
+	values := make([]string, len(sourceColumnNames))
 	for _, row := range chunkletData.rows {
 		if len(sourceColumnNames) != len(row.values) {
-			return 0, fmt.Errorf("column count mismatch: chunk %s has %d columns, but chunklet has %d values",
+			return 0, time.Since(buildStart), fmt.Errorf("column count mismatch: chunk %s has %d columns, but chunklet has %d values",
 				chunkletData.chunk.String(), len(sourceColumnNames), len(row.values))
 		}
-		var values []string
 		for i, value := range row.values {
-			// Type lookup uses the source table by the source column name —
-			// the value came from a source SELECT, and MySQL coerces on the
-			// destination INSERT if the target column type has widened.
-			columnType, ok := mapping.SourceTable().GetColumnMySQLType(sourceColumnNames[i])
-			if !ok {
-				return 0, fmt.Errorf("column %s not found in source table info", sourceColumnNames[i])
-			}
-			datum, err := table.NewDatumFromValue(value, columnType)
+			datum, err := table.NewDatumFromValueWithType(value, colTypes[i])
 			if err != nil {
-				return 0, fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)
+				return 0, time.Since(buildStart), fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)
 			}
 			// datum.String() returns a complete pre-escaped SQL literal
 			// (NULL, a numeric, 0x… hex, or a "..."-quoted string). Safe
 			// to concatenate into the VALUES clause as-is — see the
 			// contract on Datum.String.
-			values = append(values, datum.String())
+			values[i] = datum.String()
 		}
-		valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
+		valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 	}
 
 	// Build the INSERT statement — target columns, with renames applied.
@@ -486,15 +524,17 @@ func (a *SingleTargetApplier) writeChunklet(ctx context.Context, chunkletData ch
 		strings.Join(valuesClauses, ", "),
 	)
 
+	buildTime := time.Since(buildStart)
+
 	a.logger.Debug("writing chunklet", "rowCount", len(chunkletData.rows), "table", chunkletData.chunk.ColumnMapping.TargetTable().TableName)
 
 	// Execute the batch insert
 	result, err := dbconn.RetryableTransaction(ctx, a.target.DB, dbconn.IgnoreDupKeyWarnings, a.dbConfig, query)
 	if err != nil {
-		return 0, fmt.Errorf("failed to execute chunklet insert: %w", err)
+		return 0, buildTime, fmt.Errorf("failed to execute chunklet insert: %w", err)
 	}
 
-	return result, nil
+	return result, buildTime, nil
 }
 
 // feedbackCoordinator tracks chunklet completions and invokes callbacks when work is done.
@@ -707,25 +747,34 @@ func (a *SingleTargetApplier) UpsertRows(ctx context.Context, mapping *table.Col
 	// The sharded applier does the same; see sharded.go.
 	intersectedColumns := mapping.SourceOrdinalIndices()
 
+	// Resolve each column's type once, not once per value. In order to create
+	// a datum we need to know the MySQL type, which we get from the source
+	// table. This matters more here than on the copy path: an upsert batch can
+	// be a handful of rows, so there is far less to amortize the resolution
+	// over, and the final flush runs under the table lock at cutover.
+	sourceTable := mapping.SourceTable()
+	colTypes := make([]table.ColumnType, len(intersectedColumns))
+	for i := range intersectedColumns {
+		typeStr, ok := sourceTable.GetColumnMySQLType(sourceColumnNames[i])
+		if !ok {
+			return 0, fmt.Errorf("column %s not found in table info", sourceColumnNames[i])
+		}
+		colTypes[i] = table.NewColumnType(typeStr)
+	}
+
 	// Build the VALUES clause from the row images
-	var valuesClauses []string
+	valuesClauses := make([]string, 0, len(rows))
+	values := make([]string, len(intersectedColumns))
 	for _, logicalRow := range rows {
 		if logicalRow.IsDeleted {
 			continue // Skip deleted rows
 		}
 		// Convert the row image to a VALUES clause
-		var values []string
 		for i, colIndex := range intersectedColumns {
 			if colIndex >= len(logicalRow.RowImage) {
 				return 0, fmt.Errorf("column index %d exceeds row image length %d", colIndex, len(logicalRow.RowImage))
 			}
-			// In order to create a datum we need to know the MySQL type,
-			// which we can get from the source table.
-			columnType, ok := mapping.SourceTable().GetColumnMySQLType(sourceColumnNames[i])
-			if !ok {
-				return 0, fmt.Errorf("column %s not found in table info", sourceColumnNames[i])
-			}
-			datum, err := table.NewDatumFromValue(logicalRow.RowImage[colIndex], columnType)
+			datum, err := table.NewDatumFromValueWithType(logicalRow.RowImage[colIndex], colTypes[i])
 			if err != nil {
 				return 0, fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)
 			}
@@ -733,9 +782,9 @@ func (a *SingleTargetApplier) UpsertRows(ctx context.Context, mapping *table.Col
 			// (NULL, a numeric, 0x… hex, or a "..."-quoted string). Safe
 			// to concatenate into the VALUES clause as-is — see the
 			// contract on Datum.String.
-			values = append(values, datum.String())
+			values[i] = datum.String()
 		}
-		valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
+		valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 	}
 
 	if len(valuesClauses) == 0 {

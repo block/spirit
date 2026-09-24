@@ -1,0 +1,134 @@
+// Copyright 2015 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package mysql
+
+// MySQL type information.
+const (
+	TypeUnspecified byte = 0
+	TypeTiny        byte = 1 // TINYINT
+	TypeShort       byte = 2 // SMALLINT
+	TypeLong        byte = 3 // INT
+	TypeFloat       byte = 4
+	TypeDouble      byte = 5
+	TypeNull        byte = 6
+	TypeTimestamp   byte = 7
+	TypeLonglong    byte = 8 // BIGINT
+	TypeInt24       byte = 9 // MEDIUMINT
+	TypeDate        byte = 10
+	/* TypeDuration original name was TypeTime, renamed to TypeDuration to resolve the conflict with Go type Time.*/
+	TypeDuration byte = 11
+	TypeDatetime byte = 12
+	TypeYear     byte = 13
+	TypeNewDate  byte = 14
+	TypeVarchar  byte = 15
+	TypeBit      byte = 16
+
+	TypeVector     byte = 0xf2 // VECTOR (MySQL 9.0+), MYSQL_TYPE_VECTOR
+	TypeJSON       byte = 0xf5
+	TypeNewDecimal byte = 0xf6
+	TypeEnum       byte = 0xf7
+	TypeSet        byte = 0xf8
+	TypeTinyBlob   byte = 0xf9
+	TypeMediumBlob byte = 0xfa
+	TypeLongBlob   byte = 0xfb
+	TypeBlob       byte = 0xfc
+	TypeVarString  byte = 0xfd
+	TypeString     byte = 0xfe /* TypeString is char type */
+	TypeGeometry   byte = 0xff
+)
+
+// Flag information.
+const (
+	NotNullFlag        uint = 1 << 0  /* Field can't be NULL */
+	PriKeyFlag         uint = 1 << 1  /* Field is part of a primary key */
+	UniqueKeyFlag      uint = 1 << 2  /* Field is part of a unique key */
+	MultipleKeyFlag    uint = 1 << 3  /* Field is part of a key */
+	BlobFlag           uint = 1 << 4  /* Field is a blob */
+	UnsignedFlag       uint = 1 << 5  /* Field is unsigned */
+	ZerofillFlag       uint = 1 << 6  /* Field is zerofill */
+	BinaryFlag         uint = 1 << 7  /* Field is binary   */
+	EnumFlag           uint = 1 << 8  /* Field is an enum */
+	AutoIncrementFlag  uint = 1 << 9  /* Field is an auto increment field */
+	TimestampFlag      uint = 1 << 10 /* Field is a timestamp */
+	SetFlag            uint = 1 << 11 /* Field is a set */
+	NoDefaultValueFlag uint = 1 << 12 /* Field doesn't have a default value */
+	OnUpdateNowFlag    uint = 1 << 13 /* Field is set to NOW on UPDATE */
+	PartKeyFlag        uint = 1 << 14 /* Intern: Part of some keys */
+	SridFlag           uint = 1 << 15 /* Field has a SRID */
+
+	UniqueFlag            uint = 1 << 16 /* Internal: Used by sql_yacc */
+	BinCmpFlag            uint = 1 << 17 /* Internal: Used by sql_yacc */
+	ParseToJSONFlag       uint = 1 << 18 /* Internal: Used when we want to parse string to JSON in CAST */
+	IsBooleanFlag         uint = 1 << 19 /* Internal: Used for telling boolean literal from integer */
+	PreventNullInsertFlag uint = 1 << 20 /* Prevent this Field from inserting NULL values */
+	EnumSetAsIntFlag      uint = 1 << 21 /* Internal: Used for inferring enum eval type. */
+	DropColumnIndexFlag   uint = 1 << 22 /* Internal: Used for indicate the column is being dropped with index */
+	GeneratedColumnFlag   uint = 1 << 23 /* Internal: marks a generated column */
+	UnderScoreCharsetFlag uint = 1 << 24 /* Internal: Indicate whether charset is specified by underscore like _latin1'abc' */
+)
+
+// HasNotNullFlag checks if NotNullFlag is set.
+func HasNotNullFlag(flag uint) bool {
+	return (flag & NotNullFlag) > 0
+}
+
+// HasNoDefaultValueFlag checks if NoDefaultValueFlag is set.
+func HasNoDefaultValueFlag(flag uint) bool {
+	return (flag & NoDefaultValueFlag) > 0
+}
+
+// HasAutoIncrementFlag checks if AutoIncrementFlag is set.
+func HasAutoIncrementFlag(flag uint) bool {
+	return (flag & AutoIncrementFlag) > 0
+}
+
+// HasUnsignedFlag checks if UnsignedFlag is set.
+func HasUnsignedFlag(flag uint) bool {
+	return (flag & UnsignedFlag) > 0
+}
+
+// HasZerofillFlag checks if ZerofillFlag is set.
+func HasZerofillFlag(flag uint) bool {
+	return (flag & ZerofillFlag) > 0
+}
+
+// HasBinaryFlag checks if BinaryFlag is set.
+func HasBinaryFlag(flag uint) bool {
+	return (flag & BinaryFlag) > 0
+}
+
+// HasPriKeyFlag checks if PriKeyFlag is set.
+func HasPriKeyFlag(flag uint) bool {
+	return (flag & PriKeyFlag) > 0
+}
+
+// HasUniKeyFlag checks if UniqueKeyFlag is set.
+func HasUniKeyFlag(flag uint) bool {
+	return (flag & UniqueKeyFlag) > 0
+}
+
+// HasMultipleKeyFlag checks if MultipleKeyFlag is set.
+func HasMultipleKeyFlag(flag uint) bool {
+	return (flag & MultipleKeyFlag) > 0
+}
+
+// HasTimestampFlag checks if HasTimestampFlag is set.
+func HasTimestampFlag(flag uint) bool {
+	return (flag & TimestampFlag) > 0
+}
+
+// HasOnUpdateNowFlag checks if OnUpdateNowFlag is set.
+func HasOnUpdateNowFlag(flag uint) bool {
+	return (flag & OnUpdateNowFlag) > 0
+}

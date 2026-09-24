@@ -3,7 +3,7 @@ set -e
 
 make build
 
-params=(--host="$HOST" --username="$USERNAME" --password="$PASSWORD" --database="$DATABASE" --table="$TABLE" --alter="engine=innodb")
+params=(--host="$HOST" --username="$USERNAME" --password="$PASSWORD" --database="$DATABASE" --statement="ALTER TABLE \`$TABLE\` ENGINE=InnoDB")
 
 if [ -n "$REPLICA_DSN" ]; then
   params+=(--replica-dsn="$REPLICA_DSN")

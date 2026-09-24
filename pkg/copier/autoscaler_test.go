@@ -9,14 +9,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,12 +51,51 @@ type fakeScalingApplier struct {
 	fakeScaler
 }
 
+// fakeReadScaler records SetReadWorkers calls, mirroring fakeScaler.
+type fakeReadScaler struct {
+	n int
+}
+
+func (f *fakeReadScaler) SetReadWorkers(n int) { f.n = n }
+
+// stubStats is a statsProvider whose snapshot is scripted by the test.
+type stubStats struct {
+	s applier.Stats
+}
+
+func (p *stubStats) Stats() applier.Stats { return p.s }
+
+// Queue snapshots for the three arbitration states. Occupancy and wait/write
+// relationships are chosen well inside each zone, away from the thresholds
+// (TestClassifyQueue pins the boundaries).
+func starvedStats() applier.Stats {
+	return applier.Stats{QueueDepth: 0, QueueCap: 128, QueueWaitP90: 0, WriteTimeP90: 5 * time.Millisecond}
+}
+
+func fullStats() applier.Stats {
+	return applier.Stats{QueueDepth: 120, QueueCap: 128, QueueWaitP90: 50 * time.Millisecond, WriteTimeP90: 5 * time.Millisecond}
+}
+
+func balancedStats() applier.Stats {
+	return applier.Stats{QueueDepth: 64, QueueCap: 128, QueueWaitP90: 2 * time.Millisecond, WriteTimeP90: 5 * time.Millisecond}
+}
+
 func newTestScaler(start, max int) (*autoScaler, *fakeScaler, *utilThrottler) {
 	fs := &fakeScaler{n: start}
 	ut := &utilThrottler{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	as := newAutoScaler(ut, fs, start, max, logger, &metrics.NoopSink{})
 	return as, fs, ut
+}
+
+// newTestDualScaler builds a controller with read scaling engaged: the dual
+// law with a scripted queue snapshot arbitrating.
+func newTestDualScaler(wStart, wMax, rStart, rMax int) (*autoScaler, *fakeScaler, *fakeReadScaler, *stubStats, *utilThrottler) {
+	as, fs, ut := newTestScaler(wStart, wMax)
+	fr := &fakeReadScaler{n: rStart}
+	st := &stubStats{s: balancedStats()}
+	as.enableReadScaling(fr, st, rStart, rMax)
+	return as, fs, fr, st, ut
 }
 
 func TestAutoScaler_IncreasesBelowLowWatermarkAfterCooldown(t *testing.T) {
@@ -193,12 +233,12 @@ func TestAutoScaler_DeadBandBoundaries(t *testing.T) {
 		util float64
 		want int // expected current after one tick, starting from 4
 	}{
-		{"just below low increases", acLowWatermark - eps, 5},
-		{"exactly low holds", acLowWatermark, 4},
-		{"just below high holds", acHighWatermark - eps, 4},
-		{"exactly high sheds one", acHighWatermark, 3},
-		{"just below panic sheds one", acPanicThreshold - eps, 3},
-		{"exactly panic halves", acPanicThreshold, 2},
+		{"just below low increases", autoscale.LowWatermark - eps, 5},
+		{"exactly low holds", autoscale.LowWatermark, 4},
+		{"just below high holds", autoscale.HighWatermark - eps, 4},
+		{"exactly high sheds one", autoscale.HighWatermark, 3},
+		{"just below panic sheds one", autoscale.PanicThreshold - eps, 3},
+		{"exactly panic halves", autoscale.PanicThreshold, 2},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -217,9 +257,9 @@ func TestAutoScaler_DeadBandBoundaries(t *testing.T) {
 // than ramping it to the cap or shrinking it to 1. If either side moves and
 // breaks the relationship, this fails loudly.
 func TestAutoScaler_StaleHoldValueParksInDeadBand(t *testing.T) {
-	require.GreaterOrEqual(t, throttler.StaleUtilizationHold, acLowWatermark,
+	require.GreaterOrEqual(t, throttler.StaleUtilizationHold, autoscale.LowWatermark,
 		"stale hold below the low watermark would scale up blind on a dead signal")
-	require.Less(t, throttler.StaleUtilizationHold, acHighWatermark,
+	require.Less(t, throttler.StaleUtilizationHold, autoscale.HighWatermark,
 		"stale hold at/above the high watermark would halve on a dead signal")
 
 	as, _, ut := newTestScaler(4, 16)
@@ -261,12 +301,290 @@ func TestAutoScaler_ConvergesOnSelfInducedSignal(t *testing.T) {
 		"steady state parks just above the low watermark: 4 threads / 8 vCPUs = 0.5")
 }
 
-func TestCeilDiv(t *testing.T) {
-	require.Equal(t, 1, ceilDiv(1, 2))
-	require.Equal(t, 1, ceilDiv(2, 2))
-	require.Equal(t, 2, ceilDiv(3, 2))
-	require.Equal(t, 2, ceilDiv(4, 2))
-	require.Equal(t, 3, ceilDiv(5, 2))
+// TestResolveMaxReadThreads pins the pool-size formula the migration runner
+// budgets connections with: dropping the doubling would silently queue
+// scaled-up readers on the sql.DB pool (the runner and the copier's reader
+// cap must agree, and both call this).
+func TestResolveMaxReadThreads(t *testing.T) {
+	// Autoscaling disabled: the pool cannot move, so the cap is the start.
+	require.Equal(t, 4, ResolveMaxReadThreads(4, false))
+	require.Equal(t, 1, ResolveMaxReadThreads(1, false))
+	// Autoscaling enabled: 2x the start, mirroring ResolveMaxWriteThreads.
+	require.Equal(t, 8, ResolveMaxReadThreads(4, true))
+	require.Equal(t, 2, ResolveMaxReadThreads(1, true))
+	// A zero/invalid start clamps to the pool's real floor of one reader
+	// (SetReadWorkers and enableReadScaling clamp identically), so the cap
+	// never under-budgets the connection pool.
+	require.Equal(t, 1, ResolveMaxReadThreads(0, false))
+	require.Equal(t, 2, ResolveMaxReadThreads(0, true))
+	require.Equal(t, 2, ResolveMaxReadThreads(-3, true))
+}
+
+// TestResolveReadCeiling covers the two sources of a read ceiling: an
+// instance-derived one supplied by the migration runner, and the
+// Concurrency-relative fallback for callers that have none.
+func TestResolveReadCeiling(t *testing.T) {
+	// Supplied: honored as-is, whether it is above or below what the fallback
+	// would have derived. autoscale.ReadBounds anchors the ceiling to the
+	// instance, not to the start, so the two do not track each other in general
+	// even though they coincide at most real instance sizes.
+	require.Equal(t, 48, resolveReadCeiling(48, 24))
+	require.Equal(t, 3, resolveReadCeiling(3, 2))
+	// Not supplied: the Concurrency-relative fallback (2x).
+	require.Equal(t, 8, resolveReadCeiling(0, 4))
+	require.Equal(t, 8, resolveReadCeiling(-1, 4))
+	// A supplied ceiling below the start would leave the pool above its own cap
+	// with nowhere to go but down; floor it at the start instead.
+	require.Equal(t, 4, resolveReadCeiling(2, 4))
+}
+
+// TestEnableReadScalingClamps pins the defensive clamps: a start below 1 is
+// raised to 1 (the copy must keep making progress) and a cap below the start
+// is raised to the start (mirroring newAutoScaler's write-side clamp).
+func TestEnableReadScalingClamps(t *testing.T) {
+	as, _, _ := newTestScaler(2, 4)
+	as.enableReadScaling(&fakeReadScaler{}, &stubStats{}, 0, 0)
+	require.Equal(t, 1, as.readCurrent, "start must clamp up to 1")
+	require.Equal(t, 1, as.readMin)
+	require.Equal(t, 1, as.readMax, "cap must clamp up to the (clamped) start")
+
+	as, _, _ = newTestScaler(2, 4)
+	as.enableReadScaling(&fakeReadScaler{}, &stubStats{}, 4, 2)
+	require.Equal(t, 4, as.readCurrent)
+	require.Equal(t, 4, as.readMax, "cap below start must be raised to start")
+}
+
+// TestClassifyQueue pins the arbitration thresholds and their boundary
+// semantics: starved needs occupancy <= acQueueStarvedOccupancy AND
+// queue-wait strictly under the epsilon; full needs occupancy >=
+// acQueueFullOccupancy AND queue-wait at/above write time AND at least one
+// completed write as evidence (both-zero percentiles must not read as full);
+// a zero-cap snapshot (applier not started) must read balanced, never starved.
+func TestClassifyQueue(t *testing.T) {
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	tests := []struct {
+		name string
+		s    applier.Stats
+		want queueState
+	}{
+		{"zero cap is balanced", applier.Stats{QueueDepth: 0, QueueCap: 0}, queueBalanced},
+		{"empty queue zero wait is starved", applier.Stats{QueueDepth: 0, QueueCap: 100, QueueWaitP90: 0}, queueStarved},
+		{"exactly starved occupancy is starved", applier.Stats{QueueDepth: 10, QueueCap: 100, QueueWaitP90: 0}, queueStarved},
+		{"above starved occupancy is balanced", applier.Stats{QueueDepth: 11, QueueCap: 100, QueueWaitP90: 0}, queueBalanced},
+		{"empty queue but wait at epsilon is balanced", applier.Stats{QueueDepth: 0, QueueCap: 100, QueueWaitP90: acQueueWaitEpsilon}, queueBalanced},
+		{"exactly full occupancy with wait >= write is full", applier.Stats{QueueDepth: 80, QueueCap: 100, QueueWaitP90: ms(10), WriteTimeP90: ms(10)}, queueFull},
+		{"full occupancy with zero write evidence is balanced", applier.Stats{QueueDepth: 100, QueueCap: 100, QueueWaitP90: 0, WriteTimeP90: 0}, queueBalanced},
+		{"full occupancy with waits but no completed write is balanced", applier.Stats{QueueDepth: 100, QueueCap: 100, QueueWaitP90: ms(50), WriteTimeP90: 0}, queueBalanced},
+		{"below full occupancy is balanced", applier.Stats{QueueDepth: 79, QueueCap: 100, QueueWaitP90: ms(50), WriteTimeP90: ms(10)}, queueBalanced},
+		{"full occupancy but wait below write is balanced", applier.Stats{QueueDepth: 90, QueueCap: 100, QueueWaitP90: ms(5), WriteTimeP90: ms(10)}, queueBalanced},
+		{"mid occupancy is balanced", applier.Stats{QueueDepth: 50, QueueCap: 100, QueueWaitP90: ms(3), WriteTimeP90: ms(5)}, queueBalanced},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, classifyQueue(tc.s))
+		})
+	}
+}
+
+func TestDualAutoScaler_StarvedGrowsReaders(t *testing.T) {
+	as, fs, fr, st, ut := newTestDualScaler(2, 4, 2, 4)
+	ut.setUtil(0.2) // headroom: the queue decides which pool grows
+	st.s = starvedStats()
+
+	// Tick 1: starved observed but not yet persisted → hold.
+	as.tick(t.Context())
+	require.Equal(t, 2, as.readCurrent, "unconfirmed queue state must not arbitrate")
+	require.Equal(t, 2, as.current)
+
+	// Tick 2: starved confirmed → grow the read pool, not the write pool.
+	as.tick(t.Context())
+	require.Equal(t, 3, as.readCurrent)
+	require.Equal(t, 3, fr.n, "SetReadWorkers must be driven")
+	require.Equal(t, 2, as.current, "write pool must not grow on a starved queue")
+	require.Equal(t, 2, fs.n)
+
+	// Cooldown, then grow again.
+	as.tick(t.Context())
+	as.tick(t.Context())
+	require.Equal(t, 3, as.readCurrent, "cooldown must space reader increases")
+	as.tick(t.Context())
+	require.Equal(t, 4, as.readCurrent)
+}
+
+func TestDualAutoScaler_FullGrowsWriters(t *testing.T) {
+	as, _, fr, st, ut := newTestDualScaler(2, 4, 2, 4)
+	ut.setUtil(0.2)
+	st.s = fullStats()
+
+	as.tick(t.Context()) // observe, unconfirmed → hold
+	require.Equal(t, 2, as.current)
+	as.tick(t.Context()) // confirmed → +1 writer
+	require.Equal(t, 3, as.current)
+	require.Equal(t, 2, as.readCurrent, "read pool must not grow on a full queue")
+	require.Equal(t, 2, fr.n)
+}
+
+func TestDualAutoScaler_BalancedHoldsDespiteHeadroom(t *testing.T) {
+	// With read scaling engaged, a balanced queue holds both pools even under
+	// utilization headroom — growing either side of a balanced pipeline just
+	// moves the queue off its equilibrium. (Write-only mode keeps growing;
+	// TestAutoScaler_IncreasesBelowLowWatermarkAfterCooldown pins that.)
+	as, _, _, st, ut := newTestDualScaler(2, 8, 2, 8)
+	ut.setUtil(0.1)
+	st.s = balancedStats()
+
+	for range 6 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 2, as.current, "balanced queue must hold the write pool")
+	require.Equal(t, 2, as.readCurrent, "balanced queue must hold the read pool")
+}
+
+func TestDualAutoScaler_FlappingStateNeverArbitrates(t *testing.T) {
+	// A queue state must persist acQueueStatePersistTicks consecutive ticks
+	// before it acts. Alternating starved/full every tick — transient
+	// chunk-size swings — must leave both pools untouched.
+	as, _, _, st, ut := newTestDualScaler(2, 8, 2, 8)
+	ut.setUtil(0.1)
+
+	for i := range 10 {
+		if i%2 == 0 {
+			st.s = starvedStats()
+		} else {
+			st.s = fullStats()
+		}
+		as.tick(t.Context())
+	}
+	require.Equal(t, 2, as.current)
+	require.Equal(t, 2, as.readCurrent)
+}
+
+func TestDualAutoScaler_ShedBlamesStarvedReadSide(t *testing.T) {
+	// Soft overload with a starved queue: the writers are idle, so the load
+	// is coming from the read side — shed a reader, not a writer. The state
+	// is confirmed in the dead band first (observeQueue runs every tick,
+	// whatever the utilization zone).
+	as, fs, fr, st, ut := newTestDualScaler(4, 8, 4, 8)
+	st.s = starvedStats()
+	ut.setUtil(0.55) // dead band: confirm the state without acting
+	as.tick(t.Context())
+	as.tick(t.Context())
+	require.Equal(t, 4, as.current)
+	require.Equal(t, 4, as.readCurrent)
+
+	ut.setUtil(0.8)
+	as.tick(t.Context())
+	require.Equal(t, 3, as.readCurrent, "starved queue blames the read side")
+	require.Equal(t, 3, fr.n)
+	require.Equal(t, 4, as.current, "write pool must be untouched")
+	require.Equal(t, 4, fs.n)
+}
+
+func TestDualAutoScaler_ShedDefaultsToWriteSide(t *testing.T) {
+	// Soft overload with a balanced (or unconfirmed) queue sheds a writer —
+	// the write-only default.
+	as, _, fr, st, ut := newTestDualScaler(4, 8, 4, 8)
+	st.s = balancedStats()
+	ut.setUtil(0.8)
+
+	as.tick(t.Context())
+	require.Equal(t, 3, as.current)
+	require.Equal(t, 4, as.readCurrent)
+	require.Equal(t, 4, fr.n)
+}
+
+func TestDualAutoScaler_ShedFallsThroughAtReaderFloor(t *testing.T) {
+	// Soft overload with a confirmed-starved queue but the read pool already
+	// at its floor: blaming the reader would clamp into a no-op that still
+	// burns the cooldowns — a phantom action. The blame must fall through to
+	// the writer so the zone actually sheds a thread.
+	as, fs, fr, st, ut := newTestDualScaler(4, 8, 1, 8)
+	st.s = starvedStats()
+	ut.setUtil(0.55) // dead band: confirm the state without acting
+	as.tick(t.Context())
+	as.tick(t.Context())
+
+	ut.setUtil(0.8)
+	as.tick(t.Context())
+	require.Equal(t, 1, as.readCurrent, "read pool must hold at its floor")
+	require.Equal(t, 1, fr.n)
+	require.Equal(t, 3, as.current, "shed must fall through to the write pool")
+	require.Equal(t, 3, fs.n)
+}
+
+func TestDualAutoScaler_ShedUnconfirmedStarvedShedsWriter(t *testing.T) {
+	// Soft overload on the very first starved observation: the state has not
+	// persisted yet, so it must not arbitrate — the shed lands on the writer
+	// (the write-only default), not the reader.
+	as, _, fr, st, ut := newTestDualScaler(4, 8, 4, 8)
+	st.s = starvedStats()
+	ut.setUtil(0.8)
+
+	as.tick(t.Context())
+	require.Equal(t, 3, as.current, "unconfirmed starved state must shed a writer")
+	require.Equal(t, 4, as.readCurrent, "read pool must be untouched")
+	require.Equal(t, 4, fr.n)
+}
+
+func TestDualAutoScaler_PanicHalvesBothPools(t *testing.T) {
+	as, fs, fr, st, ut := newTestDualScaler(8, 16, 6, 12)
+	st.s = balancedStats()
+	ut.setUtil(1.2)
+
+	as.tick(t.Context())
+	require.Equal(t, 4, as.current, "write pool halves at panic")
+	require.Equal(t, 4, fs.n)
+	require.Equal(t, 3, as.readCurrent, "read pool halves at panic")
+	require.Equal(t, 3, fr.n)
+
+	// Cooldown-spaced like the write-only law.
+	as.tick(t.Context())
+	as.tick(t.Context())
+	require.Equal(t, 3, as.readCurrent)
+	as.tick(t.Context())
+	require.Equal(t, 2, as.readCurrent)
+	require.Equal(t, 2, as.current)
+}
+
+func TestDualAutoScaler_ReaderBounds(t *testing.T) {
+	// Sustained starvation with maximum headroom climbs the read pool to its
+	// cap and stops; sustained panic floors both pools at 1.
+	as, _, fr, st, ut := newTestDualScaler(2, 4, 2, 4)
+	st.s = starvedStats()
+	ut.setUtil(0.0)
+	for range 30 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 4, as.readCurrent, "read pool must clamp at its cap")
+	require.Equal(t, 4, fr.n)
+	require.Equal(t, 2, as.current, "write pool never grows while starved")
+
+	ut.setUtil(1.5)
+	for range 10 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 1, as.readCurrent, "read pool must never drop below 1")
+	require.Equal(t, 1, as.current, "write pool must never drop below 1")
+}
+
+func TestDualAutoScaler_SharedCooldownAcrossPools(t *testing.T) {
+	// The up cooldown is shared: a reader increase delays a subsequent writer
+	// increase just like another reader increase — one action per window,
+	// whichever side it lands on.
+	as, _, _, st, ut := newTestDualScaler(2, 8, 2, 8)
+	ut.setUtil(0.1)
+	st.s = starvedStats()
+	as.tick(t.Context()) // observe starved (unconfirmed)
+	as.tick(t.Context()) // confirmed → +1 reader, upCooldown starts
+	require.Equal(t, 3, as.readCurrent)
+
+	st.s = fullStats()
+	as.tick(t.Context()) // full unconfirmed; cooldown 2→1
+	as.tick(t.Context()) // full confirmed but cooldown 1→0: hold
+	require.Equal(t, 2, as.current, "writer increase must wait out the reader increase's cooldown")
+	as.tick(t.Context()) // cooldown elapsed → +1 writer
+	require.Equal(t, 3, as.current)
+	require.Equal(t, 3, as.readCurrent, "read pool unchanged by the writer increase")
 }
 
 // TestAutoscalerIfEnabled_Gating covers the three conditions that must all
@@ -279,16 +597,20 @@ func TestAutoscalerIfEnabled_Gating(t *testing.T) {
 	scalingApplier := &fakeScalingApplier{}
 
 	// Disabled (the default): no autoscaler.
-	c := &buffered{logger: logger, throttler: gradual, applier: scalingApplier}
+	c := &buffered{logger: logger, throttler: gradual, applier: scalingApplier, concurrency: 3}
 	require.Nil(t, c.autoscalerIfEnabled())
 
 	// Enabled + scaling applier + gradual throttler: engages with the
-	// configured bounds.
+	// configured bounds — and read scaling engages alongside, bounded at
+	// 2x the copier's read concurrency.
 	c.autoscale = AutoscaleConfig{Enabled: true, StartThreads: 2, MaxThreads: 4}
 	as := c.autoscalerIfEnabled()
 	require.NotNil(t, as)
 	require.Equal(t, 2, as.current)
 	require.Equal(t, 4, as.max)
+	require.NotNil(t, as.reader, "read scaling must engage with the write side")
+	require.Equal(t, 3, as.readCurrent)
+	require.Equal(t, 6, as.readMax)
 
 	// Binary-only throttler (Noop here; replica lag and Mock behave the same):
 	// no continuous signal to control on, so the pool stays fixed.
@@ -320,10 +642,13 @@ func (g *gatedUtilThrottler) BlockWait(ctx context.Context) {
 
 // TestAutoScalerIntegrationEngaged runs the autoscaler for real: a buffered
 // copy of a real table through a real SingleTargetApplier, with the
-// autoscaler goroutine (run/tick on a ticker) driving SetWriteWorkers from a
-// test-controlled utilization signal. It asserts the live worker pool grows
-// under low utilization, halves at the panic threshold, and that the copy
-// then completes correctly. goleak in TestMain verifies nothing leaks.
+// autoscaler goroutine (run/tick on a ticker) driving the dual control law
+// from a test-controlled utilization signal. The gated throttler parks the
+// readers, so the applier queue stays empty (read-starved): under low
+// utilization the controller must grow the live READ-worker pool to its cap
+// while leaving the write pool alone, and at the panic threshold it must
+// halve both pools. It then asserts the copy completes correctly. goleak in
+// TestMain verifies nothing leaks.
 func TestAutoScalerIntegrationEngaged(t *testing.T) {
 	// Shorten the control-loop tick (production default 5s) so scaling
 	// happens in milliseconds. Copier tests do not run in parallel, so
@@ -370,30 +695,44 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 	cfg.Concurrency = 2
 	cfg.Autoscale = AutoscaleConfig{Enabled: true, StartThreads: start, MaxThreads: maxThreads}
 
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: cfg.TargetChunkTime, Logger: cfg.Logger})
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	copier, err := NewCopier(db, chunker, cfg)
+	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
 
 	copyDone := make(chan error, 1)
 	go func() { copyDone <- copier.Run(t.Context()) }()
+	buf, ok := copier.(*buffered)
+	require.True(t, ok)
 
-	// Phase 1: sustained low utilization → additive +1 per cooldown until the
-	// live worker pool reaches the cap. ActiveWriteWorkers observes the real
-	// goroutine pool, so this proves run() drove SetWriteWorkers on the
-	// applier (not just controller-internal state).
-	require.Eventually(t, func() bool { return app.ActiveWriteWorkers() == maxThreads },
+	// Phase 1: sustained low utilization with a read-starved queue (readers
+	// parked in BlockWait, so no chunklets ever reach the applier) → the
+	// queue arbitrates the headroom to the READ pool: additive +1 per
+	// cooldown until it reaches its cap (2x the starting concurrency).
+	// ActiveReadWorkers observes the real goroutine pool, so this proves
+	// run() drove SetReadWorkers on the copier (not just controller-internal
+	// state). Newly spawned readers park in BlockWait alongside the others.
+	const maxReadThreads = 2 * 2 // mirrors autoscalerIfEnabled: 2x Concurrency
+	require.Eventually(t, func() bool { return buf.ActiveReadWorkers() == maxReadThreads },
 		10*time.Second, 5*time.Millisecond,
-		"autoscaler should grow the live worker pool to the cap under low utilization")
+		"autoscaler should grow the live read-worker pool to the cap under low utilization with a starved queue")
+	// The write pool must not have grown: the starved queue blames the read
+	// side, and balanced/unconfirmed states hold.
+	require.Equal(t, start, app.ActiveWriteWorkers(),
+		"write pool must stay at its starting size while the queue is read-starved")
 
 	// Phase 2: utilization at/above the panic threshold → multiplicative
-	// backoff. Parked workers exit asynchronously, so wait for convergence.
-	// (Sustained overload may halve again, cooldown-spaced, hence <=.)
+	// backoff of BOTH pools. Parked write workers exit asynchronously, so
+	// wait for convergence. (Sustained overload may halve again,
+	// cooldown-spaced, hence <=.) The reader halve is issued too, but parked
+	// readers cannot exit while the throttler gate holds them in BlockWait —
+	// their prompt exit-on-park is pinned by the PR 1 pool tests — so the
+	// observable assertion here is on the write pool.
 	gated.setUtil(1.2)
-	require.Eventually(t, func() bool { return app.ActiveWriteWorkers() <= maxThreads/2 },
+	require.Eventually(t, func() bool { return app.ActiveWriteWorkers() <= autoscale.CeilDiv(start, 2) },
 		10*time.Second, 5*time.Millisecond,
-		"autoscaler should halve the live worker pool at the panic threshold")
+		"autoscaler should halve the live write-worker pool at the panic threshold")
 
 	// Park the signal in the dead band and release the gate: the copy now
 	// proceeds to completion with the scaled-down pool.
@@ -420,4 +759,81 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 		"SELECT BIT_XOR(CRC32(CONCAT(id, val))) FROM autoscale_dst").Scan(&checksumDst))
 	require.Equal(t, checksumSrc, checksumDst, "checksum mismatch between source and destination")
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS autoscale_src, autoscale_dst")
+}
+
+// A quiet shard must never mask another host's overload. Exercise the actual
+// composite signal and controller so the maximum (not an average) drives both
+// normal shedding and panic, then allows recovery once every host is quiet.
+func TestAutoScalerBusiestTarget(t *testing.T) {
+	var _ writeScaler = (*applier.ShardedApplier)(nil)
+	quiet, busy := &utilThrottler{}, &utilThrottler{}
+	quiet.setUtil(0.1)
+	busy.setUtil(1.2)
+	composite := throttler.NewMultiThrottler(quiet, busy)
+	signal, ok := composite.(throttler.GradualThrottler)
+	require.True(t, ok)
+	writer := &fakeScaler{n: 8}
+	controller := newAutoScaler(signal, writer, 8, 16, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n)
+	require.True(t, composite.IsThrottled())
+	busy.setUtil(0.1)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Greater(t, writer.n, 4)
+	require.False(t, composite.IsThrottled())
+}
+
+func TestAutoScalerBusiestHostCanChange(t *testing.T) {
+	first, second := &utilThrottler{}, &utilThrottler{}
+	first.setUtil(0.1)
+	second.setUtil(0.1)
+	signal := throttler.NewMultiThrottler(first, second).(throttler.GradualThrottler)
+	writer := &fakeScaler{n: 4}
+	controller := newAutoScaler(signal, writer, 4, 8, slog.Default(), &metrics.NoopSink{})
+	controller.tick(t.Context())
+	require.Equal(t, 5, writer.n, "all hosts have headroom")
+	second.setUtil(0.55)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 5, writer.n, "one host in the middle band prevents growth")
+	second.setUtil(0.8)
+	controller.tick(t.Context())
+	require.Equal(t, 4, writer.n, "one busy host causes shedding")
+	second.setUtil(0.1)
+	first.setUtil(0.8)
+	for range autoscale.CooldownTicks + 1 {
+		controller.tick(t.Context())
+	}
+	require.Equal(t, 3, writer.n, "a different busy host continues shedding after cooldown")
+}
+
+// This is the injected-applier path: its constructor count need not match the
+// instance-derived count, and Start resets it on every phase transition.
+func TestWriteAutoscalerLifecycle(t *testing.T) {
+	tt := testutils.NewTestTable(t, "write_autoscaler_lifecycle", "CREATE TABLE write_autoscaler_lifecycle (id INT PRIMARY KEY)")
+	cfg := applier.NewApplierDefaultConfig()
+	cfg.Threads = 16
+	a, err := applier.NewSingleTargetApplier(applier.Target{DB: tt.DB}, cfg)
+	require.NoError(t, err)
+	logger := slog.New(slog.DiscardHandler)
+	signal := &utilThrottler{}
+	signal.setUtil(1.2)
+	old := acTick
+	acTick = 2 * time.Millisecond
+	defer func() { acTick = old }()
+	for range 2 {
+		require.NoError(t, a.Start(t.Context()))
+		stop := StartWriteAutoscaler(t.Context(), signal, a, AutoscaleConfig{Enabled: true, StartThreads: 4, MaxThreads: 8}, logger, nil)
+		require.Eventually(t, func() bool { return a.ActiveWriteWorkers() <= 2 }, time.Second, time.Millisecond)
+		stop()
+		signal.setUtil(0.1)
+		stop = StartWriteAutoscaler(t.Context(), signal, a, AutoscaleConfig{Enabled: true, StartThreads: 4, MaxThreads: 8}, logger, nil)
+		require.Eventually(t, func() bool { return a.ActiveWriteWorkers() == 8 }, time.Second, time.Millisecond)
+		stop()
+		require.NoError(t, a.Stop())
+		signal.setUtil(1.2)
+	}
 }

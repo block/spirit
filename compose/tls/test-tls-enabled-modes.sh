@@ -30,8 +30,7 @@ set +e  # Allow this to fail
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="DISABLED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_disabled VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_disabled VARCHAR(50)"
 DISABLED_RESULT=$?
 set -e
 
@@ -50,8 +49,7 @@ echo "------------------------------------------------------------------"
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="REQUIRED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_required VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_required VARCHAR(50)"
 
 echo ""
 echo "🔍 Testing TLS Mode: VERIFY_CA (should work with server certificates)"
@@ -65,8 +63,7 @@ if [ -f "mysql-certs/ca.pem" ]; then
       --database="$MYSQL_DATABASE" \
       --tls-mode="VERIFY_CA" \
       --tls-ca="mysql-certs/ca.pem" \
-      --table="test_table" \
-      --alter="ADD COLUMN test_col_verify_ca VARCHAR(50)"
+      --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_ca VARCHAR(50)"
 else
     echo "⚠️  No MySQL CA certificate found, testing without custom certificate"
     ./spirit migrate \
@@ -75,8 +72,7 @@ else
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="VERIFY_CA" \
-      --table="test_table" \
-      --alter="ADD COLUMN test_col_verify_ca VARCHAR(50)"
+      --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_ca VARCHAR(50)"
 fi
 
 echo ""
@@ -92,8 +88,7 @@ if [ -f "mysql-certs/ca.pem" ]; then
       --database="$MYSQL_DATABASE" \
       --tls-mode="VERIFY_IDENTITY" \
       --tls-ca="mysql-certs/ca.pem" \
-      --table="test_table" \
-      --alter="ADD COLUMN test_col_verify_identity_ip_fail VARCHAR(50)"
+      --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_identity_ip_fail VARCHAR(50)"
     IP_RESULT=$?
     set -e
     
@@ -116,8 +111,7 @@ if [ -f "mysql-certs/ca.pem" ]; then
       --database="$MYSQL_DATABASE" \
       --tls-mode="VERIFY_IDENTITY" \
       --tls-ca="mysql-certs/ca.pem" \
-      --table="test_table" \
-      --alter="ADD COLUMN test_col_verify_identity VARCHAR(50)"
+      --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_identity VARCHAR(50)"
     HOSTNAME_RESULT=$?
     set -e
     
@@ -137,8 +131,7 @@ else
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="VERIFY_IDENTITY" \
-      --table="test_table" \
-      --alter="ADD COLUMN test_col_verify_identity_ip_fail VARCHAR(50)"
+      --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_identity_ip_fail VARCHAR(50)"
     IP_RESULT=$?
     set -e
     
@@ -151,8 +144,7 @@ else
           --password="$MYSQL_PASSWORD" \
           --database="$MYSQL_DATABASE" \
           --tls-mode="VERIFY_IDENTITY" \
-          --table="test_table" \
-          --alter="ADD COLUMN test_col_verify_identity_hostname_fail VARCHAR(50)" 2>/dev/null || echo "✅ VERIFY_IDENTITY with hostname also failed (expected - MySQL needs proper certificate configuration)"
+          --statement="ALTER TABLE test_table ADD COLUMN test_col_verify_identity_hostname_fail VARCHAR(50)" 2>/dev/null || echo "✅ VERIFY_IDENTITY with hostname also failed (expected - MySQL needs proper certificate configuration)"
     fi
 fi
 
@@ -165,8 +157,7 @@ echo "-------------------------------------------------------------"
   --password="$MYSQL_PASSWORD" \
   --database="$MYSQL_DATABASE" \
   --tls-mode="PREFERRED" \
-  --table="test_table" \
-  --alter="ADD COLUMN test_col_preferred_tls VARCHAR(50)"
+  --statement="ALTER TABLE test_table ADD COLUMN test_col_preferred_tls VARCHAR(50)"
 
 echo ""
 echo "✅ TLS-Enabled Mode Testing Complete!"

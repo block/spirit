@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/pingcap/tidb/pkg/parser/mysql"
-	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
+	"github.com/block/spirit/pkg/parser/mysql"
 )
 
 func init() {
-	registerCheck("setReorder", setReorderCheck, ScopePreflight)
+	registerCheck("setReorder", setReorderCheck, ScopePreflight|ScopeStatement)
 }
 
 // setReorderCheck prevents SET value reordering in all modes.
@@ -29,6 +28,13 @@ func init() {
 // Adding new SET values at the end of the list is always safe. The new list must
 // start with the existing values as a prefix.
 func setReorderCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
+	haveTypes, err := requireCurrentColumnTypes(r, logger, "setReorder")
+	if err != nil {
+		return err
+	}
+	if !haveTypes {
+		return nil
+	}
 	for _, col := range findModifiedEnumSetColumns(*r.Statement.StmtNode) {
 		if col.ColDef.Tp.GetType() != mysql.TypeSet {
 			continue // handled by enumReorderCheck
@@ -41,7 +47,7 @@ func setReorderCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 
 		existingType, ok := r.Table.GetColumnMySQLType(col.LookupName)
 		if !ok {
-			return fmt.Errorf("unable to validate SET reorder for column %q: existing column type not found in TableInfo", col.LookupName)
+			return cannotClassify("unable to validate SET reorder for column %q: existing column type not found in table metadata", col.LookupName)
 		}
 
 		// The SET reorder check only applies when the existing column is
@@ -54,7 +60,7 @@ func setReorderCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 
 		existingElems, err := parseEnumSetValues(existingType)
 		if err != nil {
-			return fmt.Errorf("unable to validate SET reorder for column %q: %w", col.LookupName, err)
+			return cannotClassify("unable to validate SET reorder for column %q: %w", col.LookupName, err)
 		}
 		if len(existingElems) == 0 {
 			continue

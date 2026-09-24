@@ -9,9 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
-	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -22,9 +23,20 @@ const (
 	// batch against it: the copy path splits chunks into chunklets
 	// (splitRowsIntoChunklets) and the binlog-apply path cuts flush
 	// batches (pkg/change) so a REPLACE/DELETE can't grow unbounded with
-	// wide rows. Deliberately far below the typical 64 MiB
-	// max_allowed_packet because the size estimates are rough; a single
-	// row larger than the budget still goes in its own statement.
+	// wide rows. Still far below the typical 64 MiB max_allowed_packet
+	// because the size estimates are rough — estimateValueSize is
+	// deliberately biased low (hex encoding, string escaping and wide
+	// integers all under-measure; see its doc) and leans on that ~64x
+	// headroom — and a single row larger than the budget still goes in
+	// its own statement.
+	//
+	// One bound to respect when changing this: chunklets must keep the write
+	// pool fed, so chunks-in-flight x chunklets-per-chunk has to stay above the
+	// write worker count. At a 16 MiB target chunk, ~22 chunks in flight and a
+	// write ceiling of 188 that means >= ~8.5 chunklets per chunk, i.e. the
+	// budget can only roughly double before the largest pools start starving.
+	// (When chunkletMaxRows binds instead, chunklets-per-chunk is set by the
+	// row count and this bound is much looser.)
 	MaxStatementSizeBytes = 1024 * 1024
 
 	defaultBufferSize   = 128              // Size of the shared buffer channel for chunklets
@@ -66,6 +78,13 @@ type Applier interface {
 	// For the copier: callback will call chunker.Feedback()
 	// For the subscription: callback will update binlog coordinates
 	Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback ApplyCallback) error
+
+	// Stats returns a point-in-time snapshot of the write pipeline: queue
+	// occupancy, pending work, live workers, mean rows per chunklet, and
+	// rolling percentiles of the four per-chunklet phases (queue-wait, build,
+	// write, handoff). Safe to call concurrently with Apply; values are
+	// approximate. See the Stats type for field semantics.
+	Stats() Stats
 
 	// DeleteKeys deletes rows by their key values synchronously. Each entry
 	// in keys is one key tuple of the original (typed) column values, in
@@ -159,6 +178,10 @@ type ApplierConfig struct {
 	ChunkletMaxSize int
 	Logger          *slog.Logger
 	DBConfig        *dbconn.DBConfig
+	// MetricsSink, when non-nil, makes the applier periodically report its
+	// Stats() snapshot as gauges (see pkg/metrics applier_* names). Nil
+	// disables emission entirely — no goroutine is started.
+	MetricsSink metrics.Sink
 }
 
 // NewApplierDefaultConfig returns a default config for the applier.
@@ -194,19 +217,84 @@ func (cfg *ApplierConfig) Validate() error {
 	return nil
 }
 
-// estimateRowSize estimates the size in bytes of a row's values.
-// This is a simple heuristic based on string representation length.
-// Since we use a conservative 1 MiB threshold vs typical 64 MiB max_allowed_packet,
-// we don't need precise measurements. This is much better than
-// just hoping 1000 rows will fit under max_allowed_packet.
-func estimateRowSize(values []any) int {
-	size := 2 // minimal overhead for parentheses
+// EstimateRowSize estimates the size in bytes of a row's values as they will
+// be rendered into a VALUES clause. It does not need to be precise: the budget
+// it feeds (MaxStatementSizeBytes, 1 MiB) sits ~64x below a typical
+// max_allowed_packet, so the estimate only has to be the right order of
+// magnitude to keep a statement well clear of the wire limit.
+//
+// It is exported for callers that batch rows before handing them to Apply and
+// so need to bound a batch by the same measure the applier itself uses — the
+// checksum's chunk repair does this.
+//
+// It does need to be cheap. It runs on every value of every copied row, once
+// per row on top of the rendering writeChunklet does anyway, so it is pure
+// overhead on the hottest client-side path. The previous implementation
+// measured len(fmt.Sprintf("%v", value)), which was neither cheap nor
+// accurate: a text-protocol Scan into *any hands back []byte for essentially
+// every column, and %v renders a []byte as "[49 50 51 …]" — roughly four
+// characters per byte. That cost ~2.2us and ~12 allocations per row and
+// over-estimated by ~2.7x, so chunklets were being cut well short of the
+// budget they were supposed to fill. A type switch is ~290x cheaper, allocates
+// nothing, and lands much closer to what datum.String() actually emits.
+func EstimateRowSize(values []any) int {
+	size := 2 // the tuple's parentheses
 	for _, value := range values {
-		// Estimate size based on string representation
-		// +2 bytes for quotes and 2 bytes for comma/separator
-		size += len(fmt.Sprintf("%v", value)) + 4
+		// +2 for the ", " separator. That over-counts by one separator per
+		// row (values are joined, not terminated), which exactly covers the
+		// ", " between this row's tuple and the next in the statement. Quote
+		// characters are estimateValueSize's job, not counted here.
+		size += estimateValueSize(value) + 2
 	}
 	return size
+}
+
+// estimateValueSize approximates the rendered length of one value.
+//
+// Two cases deliberately under-estimate rather than pad: a []byte bound to a
+// binary column renders as 0x-hex (two characters per byte), and a string
+// containing quotes or backslashes grows by escaping. Both are bounded by the
+// 64x headroom above, and padding for them would penalise the common text case
+// the way the old %v behaviour did — an over-estimate is not free, it shrinks
+// every chunklet.
+func estimateValueSize(value any) int {
+	switch v := value.(type) {
+	case nil:
+		return 4 // NULL
+	case []byte:
+		// +2 for the surrounding quotes. Slightly over for the numeric column
+		// types (which the text protocol also delivers as []byte but which
+		// render unquoted); telling them apart would need the column type,
+		// which this deliberately doesn't take.
+		return len(v) + 2
+	case string:
+		return len(v) + 2 // +2 for the surrounding quotes
+	case time.Time:
+		return 28 // '2026-07-30 15:12:27.123456' — quoted, unlike numerics
+	case float32, float64:
+		// Typical rather than worst case: a float64 can render as wide as 24
+		// ("-1.7976931348623157e+308") but usually lands around 6-9 ("3.14159",
+		// "-2.71828"). Same bias as the two cases above — under-estimating is
+		// covered by the headroom, over-estimating shrinks every chunklet on a
+		// table of DOUBLE columns. DECIMAL arrives as []byte on the copy path
+		// and is measured exactly; this branch is mostly the binlog path.
+		return 8
+	case bool:
+		return 1
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		// Typical, not worst case, on the same bias as above: 10 digits covers
+		// an ordinary ID exactly, and a full-width int64 (19-20 characters)
+		// under-estimates by about 2x. Counting the digits instead is exact and
+		// costs ~22ns per row, but it buys nothing where it matters — the copy
+		// path receives integers as []byte from the text protocol and measures
+		// them exactly in the branch above, so this case only fires on the
+		// binlog path, where batches are a handful of rows.
+		return 10
+	default:
+		// Not produced by either the SQL driver or the binlog reader today.
+		// Cheap and slightly generous rather than reflective.
+		return 32
+	}
 }
 
 // rowData represents a single row with all its column values
@@ -229,7 +317,7 @@ func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 	currentSize := 0
 
 	for _, row := range rows {
-		rowSize := estimateRowSize(row.values)
+		rowSize := EstimateRowSize(row.values)
 		// Check if adding this row would exceed either threshold
 		if len(currentChunklet) >= chunkletMaxRows ||
 			(len(currentChunklet) > 0 && currentSize+rowSize > MaxStatementSizeBytes) {

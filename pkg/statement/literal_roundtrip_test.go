@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/testutils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,13 +18,13 @@ const scratchDB = "test_w3e"
 func openScratch(t *testing.T) *sql.DB {
 	t.Helper()
 	// Create the scratch database via a server-scoped connection.
-	rootDB, err := sql.Open("mysql", testutils.DSN())
+	rootDB, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() { _ = rootDB.Close() }()
 	_, err = rootDB.ExecContext(t.Context(), "CREATE DATABASE IF NOT EXISTS "+scratchDB)
 	require.NoError(t, err)
 
-	db, err := sql.Open("mysql", testutils.DSNForDatabase(scratchDB))
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(scratchDB))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
@@ -178,33 +178,21 @@ func TestRoundTrip_KeywordLikeStringDefault(t *testing.T) {
 	})
 
 	t.Run("bare_TRUE_still_boolean", func(t *testing.T) {
-		// A bare keyword default is NOT a string literal, so it must emit
-		// unquoted and store the boolean 1. We don't drive this through
-		// applyAndConverge because MySQL canonicalizes BOOL DEFAULT TRUE to
-		// tinyint(1) DEFAULT '1' (a separate keyword-normalization concern);
-		// instead we assert the emitted ADD COLUMN is unquoted and applies.
-		source, err := ParseCreateTable("CREATE TABLE rt (id INT PRIMARY KEY)")
-		require.NoError(t, err)
+		// A bare keyword default is not a string literal: it is the boolean,
+		// and MySQL stores it as 1. Parsing folds it to that stored value, so
+		// what arrives is the number 1 rather than either the keyword or a
+		// quoted '1'.
 		target, err := ParseCreateTable("CREATE TABLE rt (id INT PRIMARY KEY, c BOOL DEFAULT TRUE)")
 		require.NoError(t, err)
-
-		// The parsed default must NOT be flagged as a string literal.
 		col := target.Columns.ByName("c")
 		require.NotNil(t, col)
-		require.False(t, col.DefaultIsString, "bare keyword TRUE must not be flagged as a string literal")
+		require.Equal(t, DefaultKindNumber, col.DefaultKind, "bare keyword TRUE folds to the number MySQL stores, not to a string literal")
+		require.NotNil(t, col.Default)
+		require.Equal(t, "1", *col.Default)
 
-		stmts, err := source.Diff(target, nil)
-		require.NoError(t, err)
-		require.Len(t, stmts, 1)
-		require.Contains(t, stmts[0].Statement, "DEFAULT TRUE", "bare keyword default must emit unquoted")
-
-		_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
-		require.NoError(t, err)
-		_, err = db.ExecContext(t.Context(), "CREATE TABLE rt (id INT PRIMARY KEY)")
-		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt") })
-		_, err = db.ExecContext(t.Context(), stmts[0].Statement)
-		require.NoError(t, err, "emitted ALTER failed: %s", stmts[0].Statement)
+		applyAndConverge(t, db, "rt",
+			"CREATE TABLE rt (id INT PRIMARY KEY)",
+			"CREATE TABLE rt (id INT PRIMARY KEY, c BOOL DEFAULT TRUE)")
 
 		stored, ok := columnDefault(t, db, "rt", "c")
 		require.True(t, ok)
@@ -283,6 +271,56 @@ func TestRoundTrip_NumericDefaultConverges(t *testing.T) {
 			require.Nil(t, stmts, "bare and quoted numeric defaults must converge; got: %+v", stmts)
 		})
 	}
+}
+
+// A bit literal default must be emitted as a bit literal. It reads like a
+// quoted string — b'101' — so a text heuristic wraps and escapes it:
+//
+//	DEFAULT 'b\'101\'
+//
+// with a closing quote after that. MySQL rejects it with "Invalid default
+// value", so a bit column carrying a default could not be applied at all. The
+// column's recorded DefaultKind is what keeps it unquoted.
+//
+// The escaped form sits in a code block on purpose: in prose, gofmt rewrites a
+// pair of single quotes into a typographic closing quote.
+//
+// MySQL also reports a bit literal in its minimal form, independent of the
+// column's width: b'0101' comes back as b'101' and bit(8) DEFAULT b'00000001'
+// as b'1'. The parser restores the same minimal form, so the two spellings of
+// one default converge.
+func TestRoundTrip_BitLiteralDefault(t *testing.T) {
+	db := openScratch(t)
+
+	t.Run("emitted_alter_applies", func(t *testing.T) {
+		applyAndConverge(t, db, "rt",
+			"CREATE TABLE rt (id INT PRIMARY KEY)",
+			"CREATE TABLE rt (id INT PRIMARY KEY, flags bit(4) NOT NULL DEFAULT b'101')")
+
+		live := showCreate(t, db, "rt")
+		require.Contains(t, live, "`flags` bit(4) NOT NULL DEFAULT b'101'")
+	})
+
+	t.Run("leading_zeros_converge", func(t *testing.T) {
+		const targetSQL = "CREATE TABLE rt (id INT PRIMARY KEY, flags bit(4) NOT NULL DEFAULT b'0101')"
+
+		_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
+		require.NoError(t, err)
+		_, err = db.ExecContext(t.Context(), targetSQL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
+		})
+
+		live, err := ParseCreateTable(showCreate(t, db, "rt"))
+		require.NoError(t, err)
+		target, err := ParseCreateTable(targetSQL)
+		require.NoError(t, err)
+
+		stmts, err := live.Diff(target, nil)
+		require.NoError(t, err)
+		require.Nil(t, stmts, "b'0101' and the reported b'101' are the same default; got: %+v", stmts)
+	})
 }
 
 // TestRoundTrip_PartitionStringValuesWithQuotes verifies that LIST COLUMNS

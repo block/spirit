@@ -14,7 +14,7 @@ type multiThrottler struct {
 	throttlers []Throttler
 }
 
-var _ Throttler = &multiThrottler{}
+var _ ReasonedThrottler = &multiThrottler{}
 
 // gradualMultiThrottler is the multiThrottler variant returned when at least
 // one child implements GradualThrottler, so that asserting GradualThrottler on
@@ -95,6 +95,13 @@ func (m *multiThrottler) IsThrottled() bool {
 		}
 	}
 	return false
+}
+
+// ThrottleReason implements ReasonedThrottler by naming every child currently
+// throttling, joined with "; " — a copy held up by both replica lag and commit
+// latency should say so, since clearing only one of them will not resume it.
+func (m *multiThrottler) ThrottleReason() string {
+	return joinReasons(m.throttlers)
 }
 
 // BlockWait blocks until all child throttlers are unthrottled.

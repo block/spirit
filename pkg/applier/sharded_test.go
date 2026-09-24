@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,19 +37,19 @@ func TestShardedApplierIntegration(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "sharded_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target1 := base.Clone()
 	target1.DBName = "sharded_target1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "sharded_target2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -242,19 +242,19 @@ func TestShardedApplierWaitWaitsForCallbacks(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "sharded_waitcb_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target1 := base.Clone()
 	target1.DBName = "sharded_waitcb_target1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "sharded_waitcb_target2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -359,19 +359,19 @@ func TestShardedApplierDeleteKeys(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "sharded_delete_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target1 := base.Clone()
 	target1.DBName = "sharded_delete_target1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "sharded_delete_target2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -476,13 +476,13 @@ func TestShardedApplierDeleteKeysEmpty(t *testing.T) {
 
 	target1 := base.Clone()
 	target1.DBName = "sharded_delete_empty_test1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "sharded_delete_empty_test2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -528,19 +528,19 @@ func TestShardedApplierUpsertRows(t *testing.T) {
 
 	source := base.Clone()
 	source.DBName = "sharded_upsert_source"
-	sourceDB, err := sql.Open("mysql", source.FormatDSN())
+	sourceDB, err := sql.Open("block-mysql", source.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
 	target1 := base.Clone()
 	target1.DBName = "sharded_upsert_target1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "sharded_upsert_target2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -693,13 +693,13 @@ func TestShardedApplierUpsertRowsSkipDeleted(t *testing.T) {
 
 	target1 := base.Clone()
 	target1.DBName = "sharded_upsert_deleted_test1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "sharded_upsert_deleted_test2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -768,13 +768,13 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 
 	target1 := base.Clone()
 	target1.DBName = "overlap_test1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "overlap_test2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -827,7 +827,7 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 	t.Run("three shards with overlap", func(t *testing.T) {
 		target3 := base.Clone()
 		target3.DBName = "overlap_test1" // Reuse existing DB
-		target3DB, err := sql.Open("mysql", target3.FormatDSN())
+		target3DB, err := sql.Open("block-mysql", target3.FormatDSN())
 		require.NoError(t, err)
 		defer utils.CloseAndLog(target3DB)
 
@@ -848,7 +848,7 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 	t.Run("three adjacent non-overlapping ranges", func(t *testing.T) {
 		target3 := base.Clone()
 		target3.DBName = "overlap_test1" // Reuse existing DB
-		target3DB, err := sql.Open("mysql", target3.FormatDSN())
+		target3DB, err := sql.Open("block-mysql", target3.FormatDSN())
 		require.NoError(t, err)
 		defer utils.CloseAndLog(target3DB)
 
@@ -875,13 +875,13 @@ func TestShardedApplierUpsertRowsEmpty(t *testing.T) {
 
 	target1 := base.Clone()
 	target1.DBName = "sharded_upsert_empty_test1"
-	target1DB, err := sql.Open("mysql", target1.FormatDSN())
+	target1DB, err := sql.Open("block-mysql", target1.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target1DB)
 
 	target2 := base.Clone()
 	target2.DBName = "sharded_upsert_empty_test2"
-	target2DB, err := sql.Open("mysql", target2.FormatDSN())
+	target2DB, err := sql.Open("block-mysql", target2.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(target2DB)
 
@@ -933,7 +933,7 @@ func setupShardedUnderLockTest(t *testing.T, prefix string) (sourceTable, target
 	openDB := func(dbName string) *sql.DB {
 		cfg := base.Clone()
 		cfg.DBName = dbName
-		db, err := sql.Open("mysql", cfg.FormatDSN())
+		db, err := sql.Open("block-mysql", cfg.FormatDSN())
 		require.NoError(t, err)
 		t.Cleanup(func() { utils.CloseAndLog(db) })
 		return db
@@ -1156,4 +1156,143 @@ func TestShardedApplierCallbackPanicDecrements(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	require.NoError(t, a.Wait(ctx))
+}
+
+// A nil shard connection is otherwise only discovered when a row happens to
+// route to that shard — possibly long after construction, as a nil-pointer
+// panic in the write path.
+func TestShardedApplierRejectsNilTargetDB(t *testing.T) {
+	_, err := NewShardedApplier([]Target{{DB: nil, KeyRange: "-80"}}, NewApplierDefaultConfig())
+	require.ErrorContains(t, err, "shard 0: target DB must be non-nil")
+}
+
+// TestShardedApplierRenamedTarget covers the rename support used by the
+// reverse feed of a sharded-source move: the watched table is the (former
+// move target's) real table, but writes land on the former source shards'
+// retired `_old` tables. Upserts must go to the mapping's target name and
+// still route by the SOURCE table's sharding metadata; DeleteKeys must
+// broadcast to the explicit target name, and a nil targetTable must keep
+// the forward-move behavior (same name as the source).
+func TestShardedApplierRenamedTarget(t *testing.T) {
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sharded_renamed_watched")
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sharded_renamed_shard1")
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sharded_renamed_shard2")
+	testutils.RunSQL(t, "CREATE DATABASE sharded_renamed_watched")
+	testutils.RunSQL(t, "CREATE DATABASE sharded_renamed_shard1")
+	testutils.RunSQL(t, "CREATE DATABASE sharded_renamed_shard2")
+
+	base, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	watched := base.Clone()
+	watched.DBName = "sharded_renamed_watched"
+	watchedDB, err := sql.Open("block-mysql", watched.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(watchedDB)
+
+	shard1 := base.Clone()
+	shard1.DBName = "sharded_renamed_shard1"
+	shard1DB, err := sql.Open("block-mysql", shard1.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(shard1DB)
+
+	shard2 := base.Clone()
+	shard2.DBName = "sharded_renamed_shard2"
+	shard2DB, err := sql.Open("block-mysql", shard2.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(shard2DB)
+
+	const createT1 = `CREATE TABLE t1 (
+		id INT PRIMARY KEY,
+		user_id INT NOT NULL,
+		name VARCHAR(100)
+	)`
+	const createT1Old = `CREATE TABLE t1_old (
+		id INT PRIMARY KEY,
+		user_id INT NOT NULL,
+		name VARCHAR(100)
+	)`
+
+	ctx := t.Context()
+	_, err = watchedDB.ExecContext(ctx, createT1)
+	require.NoError(t, err)
+	// The shards deliberately have ONLY t1_old at first: if a write ignored the
+	// mapping's target name and used the source name, it would fail loudly.
+	for _, db := range []*sql.DB{shard1DB, shard2DB} {
+		_, err = db.ExecContext(ctx, createT1Old)
+		require.NoError(t, err)
+	}
+
+	// The watched table carries the sharding metadata used for routing.
+	sourceTable := table.NewTableInfo(watchedDB, watched.DBName, "t1")
+	require.NoError(t, sourceTable.SetInfo(ctx))
+	sourceTable.ShardingColumn = "user_id"
+	sourceTable.HashFunc = testutils.EvenOddHasher
+
+	// One shared _old TableInfo: QuotedTableName is unqualified, so each
+	// shard's own connection determines the database it lands in.
+	oldTable := table.NewTableInfo(shard1DB, shard1.DBName, "t1_old")
+	require.NoError(t, oldTable.SetInfo(ctx))
+
+	applier, err := NewShardedApplier([]Target{
+		{DB: shard1DB, KeyRange: "-80"}, // even user_ids
+		{DB: shard2DB, KeyRange: "80-"}, // odd user_ids
+	}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+
+	renamed := table.NewColumnMapping(sourceTable, oldTable, nil)
+	rows := []LogicalRow{
+		{RowImage: []any{int64(1), int64(101), "odd-one"}},
+		{RowImage: []any{int64(2), int64(102), "even-two"}},
+		{RowImage: []any{int64(3), int64(103), "odd-three"}},
+	}
+	affected, err := applier.UpsertRows(ctx, renamed, rows, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), affected)
+
+	rowNames := func(db *sql.DB, tableName string) map[int64]string {
+		out := make(map[int64]string)
+		res, qerr := db.QueryContext(ctx, "SELECT id, name FROM "+tableName+" ORDER BY id")
+		require.NoError(t, qerr)
+		defer utils.CloseAndLog(res)
+		for res.Next() {
+			var id int64
+			var name string
+			require.NoError(t, res.Scan(&id, &name))
+			out[id] = name
+		}
+		require.NoError(t, res.Err())
+		return out
+	}
+
+	// Rows routed by the source's sharding metadata, written to t1_old.
+	require.Equal(t, map[int64]string{2: "even-two"}, rowNames(shard1DB, "t1_old"))
+	require.Equal(t, map[int64]string{1: "odd-one", 3: "odd-three"}, rowNames(shard2DB, "t1_old"))
+
+	// DeleteKeys with an explicit renamed target broadcasts to t1_old.
+	affected, err = applier.DeleteKeys(ctx, sourceTable, oldTable, [][]any{{int64(1)}, {int64(2)}}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), affected)
+	require.Empty(t, rowNames(shard1DB, "t1_old"))
+	require.Equal(t, map[int64]string{3: "odd-three"}, rowNames(shard2DB, "t1_old"))
+
+	// nil targetTable (the forward-move path) still writes to the source's own
+	// name. Create t1 on the shards now and run the same flow un-renamed.
+	for _, db := range []*sql.DB{shard1DB, shard2DB} {
+		_, err = db.ExecContext(ctx, createT1)
+		require.NoError(t, err)
+	}
+	forward := table.NewColumnMapping(sourceTable, nil, nil)
+	affected, err = applier.UpsertRows(ctx, forward, rows, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), affected)
+	require.Equal(t, map[int64]string{2: "even-two"}, rowNames(shard1DB, "t1"))
+	require.Equal(t, map[int64]string{1: "odd-one", 3: "odd-three"}, rowNames(shard2DB, "t1"))
+
+	affected, err = applier.DeleteKeys(ctx, sourceTable, nil, [][]any{{int64(3)}}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected)
+	require.Equal(t, map[int64]string{1: "odd-one"}, rowNames(shard2DB, "t1"))
+	// The renamed tables are untouched by the un-renamed flow.
+	require.Equal(t, map[int64]string{3: "odd-three"}, rowNames(shard2DB, "t1_old"))
 }

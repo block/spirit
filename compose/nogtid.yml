@@ -1,0 +1,15 @@
+# Overlay that boots the standalone MySQL *without* GTIDs. The change-source
+# coordinate scheme is auto-detected (pkg/change/auto.go): a server with
+# gtid_mode=ON + enforce_gtid_consistency=ON gets the GTID client, anything
+# else gets the binlog file+offset client. The base compose.yml boots GTID-on,
+# so every runner would otherwise exercise only the GTID path — runners that
+# add this overlay cover the file+offset path end-to-end instead. Compose
+# overlays replace the `command` key wholesale, which is what flips the two
+# flags back off here.
+#
+# The replication stacks (replication-tls/, semisync.yml) must NOT use this
+# overlay: their replicas connect with SOURCE_AUTO_POSITION=1, which requires
+# GTIDs on.
+services:
+  mysql:
+    command: --gtid-mode=off --enforce-gtid-consistency=off

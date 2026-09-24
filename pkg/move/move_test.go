@@ -7,13 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -52,14 +53,24 @@ func TestBasicMove(t *testing.T) {
 
 	// test
 	move := &Move{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 5 * time.Second,
-		Threads:         2,
-		WriteThreads:    2,
-		CreateSentinel:  false,
+		SourceDSN:      sourceDSN,
+		TargetDSN:      targetDSN,
+		Threads:        2,
+		WriteThreads:   16,
+		MaxConnections: 8,
+		DeferCutOver:   false,
 	}
-	require.NoError(t, move.Run())
+	runner, err := NewRunner(move)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, runner.Close()) })
+	require.NoError(t, runner.Run(t.Context()))
+	require.Equal(t, 8, runner.dbConfig.MaxOpenConnections)
+	for _, source := range runner.sources {
+		require.Equal(t, 8, source.db.Stats().MaxOpenConnections)
+	}
+	for _, target := range runner.targets {
+		require.Equal(t, 8, target.DB.Stats().MaxOpenConnections)
+	}
 }
 func TestResumeFromCheckpointE2E(t *testing.T) {
 	t.Run("deferFalse", func(t *testing.T) { // known to race.
@@ -92,7 +103,7 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	testutils.RunSQL(t, `INSERT INTO source_resume.t1 (val) SELECT RANDOM_BYTES(255) FROM  source_resume.t1 a JOIN  source_resume.t1 b JOIN  source_resume.t1 c LIMIT 100000`)
 
 	// reset the target database.
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	_, err = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS dest_resume")
 	require.NoError(t, err)
@@ -103,7 +114,6 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	move := &Move{
 		SourceDSN:             sourceDSN,
 		TargetDSN:             targetDSN,
-		TargetChunkTime:       100 * time.Millisecond,
 		Threads:               1,
 		WriteThreads:          1,
 		DeferSecondaryIndexes: deferSecondaryIndexes,
@@ -155,13 +165,41 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	require.NoError(t, r.Close())
 
 	// Drop the additional column, we should be able to resume now.
-	move.TargetChunkTime = 5 * time.Second
 	move.Threads = 4
 	testutils.RunSQL(t, `ALTER TABLE dest_resume.t1 DROP COLUMN extra_col`)
 	r, err = NewRunner(move)
 	require.NoError(t, err)
+	// The copy aggregate a resumed move reports covers this invocation only.
+	// The chunker restores the rows the previous invocation settled but counts
+	// chunks from zero, so the restored rows are subtracted to keep the two
+	// figures on the same footing.
+	sink := &copyAggregateSink{}
+	r.SetMetricsSink(sink)
 	require.NoError(t, r.Run(t.Context()))
+	// Without a restored baseline the subtraction below holds for free, so
+	// assert the resume actually carried one before relying on it.
+	require.Positive(t, r.copyRowsAtResume, "the resume must restore a settled row count")
+	require.Equal(t, r.copyChunker.RowsCopied()-r.copyRowsAtResume, sink.rows)
+	require.Less(t, sink.rows, r.copyChunker.RowsCopied(), "the rows the previous invocation settled must not be reported again")
 	require.NoError(t, r.Close())
+}
+
+// copyAggregateSink records the copy aggregate the runner reports when the
+// copy completes.
+type copyAggregateSink struct {
+	rows, chunks uint64
+}
+
+func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
+	for _, v := range m.Values {
+		switch v.Name {
+		case metrics.CopyRowsCompletedMetricName:
+			s.rows = uint64(v.Value)
+		case metrics.CopyChunksCompletedMetricName:
+			s.chunks = uint64(v.Value)
+		}
+	}
+	return nil
 }
 
 // TestEmptyDatabaseMove tests that a move operation succeeds when the source database has no tables.
@@ -195,12 +233,11 @@ func TestEmptyDatabaseMove(t *testing.T) {
 
 	// Run move with empty source
 	move := &Move{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 5 * time.Second,
-		Threads:         4,
-		WriteThreads:    4,
-		CreateSentinel:  false,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      4,
+		WriteThreads: 4,
+		DeferCutOver: false,
 	}
 
 	runner, err := NewRunner(move)
@@ -257,12 +294,11 @@ func TestMoveReservedWordPK(t *testing.T) {
 		") ENGINE=InnoDB")
 
 	move := &Move{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 5 * time.Second,
-		Threads:         2,
-		WriteThreads:    2,
-		CreateSentinel:  false,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      2,
+		WriteThreads: 2,
+		DeferCutOver: false,
 	}
 	require.NoError(t, move.Run())
 }
@@ -302,12 +338,11 @@ func TestMoveReservedWordTableName(t *testing.T) {
 		") ENGINE=InnoDB")
 
 	move := &Move{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 5 * time.Second,
-		Threads:         2,
-		WriteThreads:    2,
-		CreateSentinel:  false,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      2,
+		WriteThreads: 2,
+		DeferCutOver: false,
 	}
 	require.NoError(t, move.Run())
 }
@@ -344,11 +379,10 @@ func TestPostCopyAnalyzeTargetSchema(t *testing.T) {
 	})
 
 	move := &Move{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 5 * time.Second,
-		Threads:         1,
-		WriteThreads:    1,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      1,
+		WriteThreads: 1,
 	}
 	r, err := NewRunner(move)
 	require.NoError(t, err)
@@ -447,7 +481,6 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	move := &Move{
 		SourceDSN:             src.FormatDSN(),
 		TargetDSN:             dest.FormatDSN(),
-		TargetChunkTime:       100 * time.Millisecond,
 		Threads:               1,
 		WriteThreads:          1,
 		DeferSecondaryIndexes: true,
@@ -509,7 +542,7 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	// the deferred-index ALTER blocks, keeping postCopyPhase pinned inside
 	// restoreSecondaryIndexes. The dbconn pool sets lock_wait_timeout=30 for
 	// the ALTER's session; the block window below stays well under that.
-	blockerDB, err := sql.Open("mysql", dest.FormatDSN())
+	blockerDB, err := sql.Open("block-mysql", dest.FormatDSN())
 	require.NoError(t, err)
 	blockerTx, err := blockerDB.BeginTx(ctx, nil)
 	require.NoError(t, err)
@@ -623,8 +656,9 @@ func TestAnalyzeTableMissingTargetIsError(t *testing.T) {
 
 // TestMoveValidate covers the Kong Validate() hook: explicitly-negative
 // numeric/duration flags are rejected before they can flow into the copier
-// Concurrency and connection pool-size math, while zero values (meaning
-// "use the default" / auto-size) pass. Mirrors migration.Migration.Validate.
+// Concurrency and connection pool-size math, while zero values (meaning "use
+// the default", which NewRunner fills in) pass. Mirrors
+// migration.Migration.Validate.
 func TestMoveValidate(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -633,16 +667,13 @@ func TestMoveValidate(t *testing.T) {
 	}{
 		{name: "zero values are valid"},
 		{name: "typical values are valid", m: Move{
-			Threads:         2,
-			WriteThreads:    4,
-			TargetChunkTime: 5 * time.Second,
+			Threads:      2,
+			WriteThreads: 4,
 		}},
 		{name: "negative threads", m: Move{Threads: -5},
 			wantErr: "--threads must be non-negative, got -5"},
 		{name: "negative write-threads", m: Move{WriteThreads: -1},
 			wantErr: "--write-threads must be non-negative, got -1"},
-		{name: "negative target-chunk-time", m: Move{TargetChunkTime: -time.Second},
-			wantErr: "--target-chunk-time must be non-negative, got -1s"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

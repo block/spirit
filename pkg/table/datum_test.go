@@ -182,6 +182,18 @@ func TestDatumInt64ToUnsigned(t *testing.T) {
 	require.Equal(t, uint64(math.MaxInt64), d3.Val)
 }
 
+func TestDatumConversionErrorReportsValue(t *testing.T) {
+	// A value that genuinely cannot be converted must name itself in the
+	// error, so the offending input is identifiable from the message alone.
+	_, err := NewDatum("not-a-number", signedType)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "value=not-a-number")
+
+	_, err = NewDatum("not-a-number", unsignedType)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "value=not-a-number")
+}
+
 func TestKeyBelowLowWatermarkWithNegativeInt32(t *testing.T) {
 	ti := &TableInfo{
 		SchemaName:        "test",
@@ -300,17 +312,20 @@ func TestNewDatumFromValue(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "0xfffefd", d.String())
 
-	// Test empty binary values - must NOT serialize as "0x" because
-	// MySQL parses that as an identifier, not a hex literal.
+	// A one-byte NUL serializes as its hex value.
 	d, err = NewDatumFromValue([]byte{0x00}, "MEDIUMBLOB")
 	require.NoError(t, err)
 	require.Equal(t, "0x00", d.String())
+	// Empty binary values must NOT serialize as "0x" (MySQL parses that as
+	// an identifier, not a hex literal) — and must NOT serialize as "0x00"
+	// either: a one-byte NUL is a different value, and emitting it here
+	// silently corrupted empty blobs applied via the binlog feed.
 	d, err = NewDatumFromValue([]byte{}, "VARBINARY(255)")
 	require.NoError(t, err)
-	require.Equal(t, "0x00", d.String())
+	require.Equal(t, "x''", d.String())
 	d, err = NewDatumFromValue("", "BLOB")
 	require.NoError(t, err)
-	require.Equal(t, "0x00", d.String())
+	require.Equal(t, "x''", d.String())
 	d, err = NewDatumFromValue(nil, "BLOB")
 	require.NoError(t, err)
 	require.Equal(t, "NULL", d.String())
@@ -473,4 +488,79 @@ func TestDatumCompareTypeMismatch(t *testing.T) {
 	gt, err := goodSigned.GreaterThan(Datum{Val: int64(0), Tp: signedType})
 	require.NoError(t, err)
 	require.True(t, gt)
+}
+
+// TestEmptyBinaryDatumRoundTrip is a regression test for empty (zero-length,
+// non-NULL) binary values. These used to serialize as 0x00 — a one-byte NUL,
+// a *different* value — so every binlog-applied REPLACE rewrote empty blobs
+// as \x00 in the target. On tables where the application stores empty strings
+// (e.g. zero-length serialized protos), the checksum then flagged every
+// feed-touched row, recopied it (which fixed it, byte-exact), and the next
+// application update re-minted the difference: a checksum that never
+// converges, plus real corruption for any row not re-verified after its last
+// update. The empty value must round-trip through both serialization paths:
+// Datum.String() (SQL literals for the applier and WHERE clauses) and
+// jsonQuoteDatum/datumValFromString (checkpoint watermarks).
+func TestEmptyBinaryDatumRoundTrip(t *testing.T) {
+	empty, err := NewDatumFromValue([]byte{}, "BLOB")
+	require.NoError(t, err)
+
+	// SQL literal path: x'' is MySQL's zero-length binary literal.
+	require.Equal(t, "x''", empty.String())
+
+	// Checkpoint JSON path: emit, then decode back to the empty string.
+	require.Equal(t, `"x''"`, jsonQuoteDatum(empty))
+	val, err := datumValFromString("x''", binaryType)
+	require.NoError(t, err)
+	decoded, ok := val.(string)
+	require.True(t, ok, "decoded empty binary should be a string, got %T", val)
+	require.Empty(t, decoded)
+
+	// A one-byte NUL is a distinct value and must stay 0x00 on both paths.
+	nul, err := NewDatumFromValue([]byte{0x00}, "BLOB")
+	require.NoError(t, err)
+	require.Equal(t, "0x00", nul.String())
+	require.Equal(t, `"0x00"`, jsonQuoteDatum(nul))
+	val, err = datumValFromString("0x00", binaryType)
+	require.NoError(t, err)
+	require.Equal(t, "\x00", val)
+
+	// NULL is also distinct from empty.
+	require.Equal(t, "NULL", NewNilDatum(binaryType).String())
+}
+
+// TestVectorDatumIsBinary covers the VECTOR type (MySQL 9.7+). A VECTOR value
+// arrives from both the driver and the binlog as raw bytes — a packed array of
+// 4-byte little-endian floats — and MySQL will only take it back as a
+// binary-charset literal: a character-set string of the correct byte length is
+// rejected with "Value of type 'string, size: 12' cannot be converted to
+// 'vector' type".
+//
+// So the type must classify as binaryType rather than fall through to the
+// unknownType path, whose IsBinaryString() heuristic only hex-encodes values
+// that are *not* valid UTF-8. The all-zeros vector [0,0,0] is the counterexample
+// that broke the copier and the binlog applier: 12 NUL bytes are perfectly
+// valid UTF-8, so it was emitted as a quoted string and the write failed.
+func TestVectorDatumIsBinary(t *testing.T) {
+	require.Equal(t, binaryType, mySQLTypeToDatumTp("vector"))
+	require.Equal(t, binaryType, mySQLTypeToDatumTp("vector(3)"))
+	require.Equal(t, binaryType, mySQLTypeToDatumTp("VECTOR(2048)"))
+
+	// [0,0,0]: valid UTF-8, and must still be emitted as a hex literal.
+	zeros, err := NewDatumFromValue(make([]byte, 12), "vector(3)")
+	require.NoError(t, err)
+	require.True(t, zeros.IsBinaryString())
+	require.Equal(t, "0x000000000000000000000000", zeros.String())
+
+	// [1.5,-2,0.0003]: high bytes, not valid UTF-8, same literal form.
+	v, err := NewDatumFromValue([]byte{
+		0x00, 0x00, 0xc0, 0x3f,
+		0x00, 0x00, 0x00, 0xc0,
+		0x52, 0x49, 0x9d, 0x39,
+	}, "vector(3)")
+	require.NoError(t, err)
+	require.Equal(t, "0x0000c03f000000c052499d39", v.String())
+
+	// NULL round-trips as NULL, not as an empty vector.
+	require.Equal(t, "NULL", NewNilDatum(mySQLTypeToDatumTp("vector(3)")).String())
 }

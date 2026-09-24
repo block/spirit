@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/buildinfo"
 	"github.com/block/spirit/pkg/change"
@@ -28,9 +31,14 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"golang.org/x/sync/errgroup"
 )
+
+// defaultWriteThreads must match the `default:"4"` kong tag on
+// Move.WriteThreads, so a programmatic caller that leaves the field unset lands
+// on the same value the CLI does.
+const defaultWriteThreads = 4
+const defaultThreads = 2
 
 var (
 	tableStatUpdateInterval = 5 * time.Minute
@@ -48,9 +56,16 @@ var (
 	// continuous-checksum iterations during the sentinel wait. Without it,
 	// small tables would re-acquire the table lock back-to-back since each
 	// pass finishes in seconds. (Move still drives its own checksum loop; this
-	// stays local until move adopts checksum.ContinuousChecker.)
+	// stays local until move adopts checksum.LocklessChecker.)
 	continuousChecksumMinInterval = 1 * time.Hour
 )
+
+// Only definitive checkpoint failures permit --force to discard a partial copy.
+var errCheckpointUnresumable = errors.New("checkpoint is not resumable")
+
+func isDefinitivelyUnresumable(err error) bool {
+	return errors.Is(err, status.ErrCheckpointTooOld) || errors.Is(err, errCheckpointUnresumable)
+}
 
 // sourceInfo holds per-source connection state for N:M moves.
 type sourceInfo struct {
@@ -59,6 +74,11 @@ type sourceInfo struct {
 	dsn        string
 	replClient change.Source
 	tables     []*table.TableInfo // this source's TableInfo objects (bound to this source's db)
+	// keyRange is this source shard's Vitess-style key range (from
+	// Move.SourceKeyRanges, attached before the sources are sorted so it stays
+	// with its DSN). Only set — and only needed — for a reverse-window move
+	// with a sharded source, where the reverse feed routes rows back by range.
+	keyRange string
 }
 
 // sourceKey returns a stable identifier for a source, used for checkpoint
@@ -79,17 +99,33 @@ func targetKey(t applier.Target) string {
 }
 
 type Runner struct {
-	move            *Move
+	move                     *Move
+	reverseWriteThreads      int // Configured count, unaffected by forward autoscaling.
+	continuousChecksumActive atomic.Bool
+
 	sources         []sourceInfo     // one per source database
 	targets         []applier.Target // Combined DB, Config, and KeyRange
-	status          status.State     // must use atomic to get/set
+	status          status.Tracker   // owns the current state and per-state timing
 	checkpointTable *table.TableInfo
 
 	sourceTables   []*table.TableInfo // canonical table list (from sources[0])
 	sourceTableMap map[string]bool    // used when only some tables are to be moved.
 
-	applier           applier.Applier
-	copyChunker       table.Chunker
+	// throttler is read from Progress() and the repl feed's UnderLoad closure,
+	// so every access goes through setThrottler/currentThrottler. Reads on the
+	// single-threaded setup path are safe without it, but going through the
+	// accessor everywhere is what makes the guard self-describing.
+	throttlerMu sync.RWMutex
+	throttler   throttler.Throttler
+	monitorDBs  []*sql.DB
+	autoscale   copier.AutoscaleConfig
+
+	applier     applier.Applier
+	chunkerMu   sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
+	copyChunker table.Chunker
+	// copyRowsAtResume is the settled row count the chunker restored from the
+	// checkpoint, excluded from this invocation's copy aggregate.
+	copyRowsAtResume  uint64
 	checksumChunker   table.Chunker
 	copier            copier.Copier
 	checker           checksum.Checker
@@ -105,6 +141,11 @@ type Runner struct {
 	// dumper goroutine — both under checkpointMu. Mirrors pkg/migration.
 	continuousChecker checksum.Checker
 
+	// lastCheckpoint is when the checkpoint was last persisted and the
+	// position(s) it saved, reported together on the ckpt row of the status
+	// block. Mirrors pkg/migration (#329).
+	lastCheckpoint status.LastCheckpoint
+
 	// checkpointMu serializes checkpoint persistence (DumpCheckpoint's
 	// watermark-condition evaluation + INSERT) against the sentinel-abort
 	// path that blanks the persisted checksum_watermark
@@ -115,27 +156,36 @@ type Runner struct {
 	// row resume reads. It also guards continuousChecker (see above).
 	checkpointMu sync.Mutex
 
-	// Track some key statistics.
-	startTime                time.Time
-	sentinelWaitStartTime    time.Time
-	usedResumeFromCheckpoint bool
+	// Track some key statistics. usedResumeFromCheckpoint is atomic because it
+	// is also reported to API callers as Progress().Resume, which they poll from
+	// their own goroutine while setup is still writing it.
+	usedResumeFromCheckpoint atomic.Bool
 
-	cutoverFunc func(ctx context.Context) error
-	// reverseCutoverFunc is the reverse-window rollback's traffic switch (route
-	// back to the source). Set via SetReverseCutover; used only when
-	// move.ReverseWindow > 0 and a revert is requested during the window.
-	reverseCutoverFunc func(ctx context.Context) error
-	// reversePositions holds each target's binlog position captured at cutover
-	// (keyed by targetKey) — the start points for the reverse feeds. cutoverAt
-	// is when the forward cutover completed (the reverse-window deadline is
-	// measured from it). Both are set by the cutover postSwitch hook when
-	// move.ReverseWindow > 0.
+	cutoverFunc       func(ctx context.Context) error
+	cutoverResultFunc CutoverResultCallback
+	// reverseCutoverFunc and reverseCutoverResultFunc are the mutually
+	// exclusive reverse-window rollback traffic switches.
+	reverseCutoverFunc       func(ctx context.Context) error
+	reverseCutoverResultFunc CutoverResultCallback
+
+	// workflow result evidence is atomic so callers may safely inspect Result
+	// immediately after a Run goroutine returns.
+	durableMutation   atomic.Bool
+	terminalOwnership atomic.Uint32
+	// reversePositions holds each target's binlog position captured by the
+	// pre-switch hook (keyed by targetKey) — the start points for the reverse
+	// feeds. cutoverAt is set by the post-switch hook when the forward cutover
+	// completes, and the reverse-window deadline is measured from it.
 	reversePositions map[string]string
 	cutoverAt        time.Time
 
-	logger     *slog.Logger
-	cancelFunc context.CancelFunc
-	dbConfig   *dbconn.DBConfig
+	logger *slog.Logger
+	// metricsSink receives the copier's per-chunk metrics and the tracker's
+	// phase transitions. It defaults to a NoopSink, so a caller that installs
+	// nothing pays only for the discarded values.
+	metricsSink metrics.Sink
+	cancelFunc  context.CancelFunc
+	dbConfig    *dbconn.DBConfig
 
 	// fatalOnce makes fatalError idempotent. Move wires N repl clients
 	// (one per source) to the same fatalError callback, so a concurrent
@@ -160,6 +210,16 @@ type Runner struct {
 var _ status.Task = (*Runner)(nil)
 
 func NewRunner(m *Move) (*Runner, error) {
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
+	if m.MaxConnections == 0 {
+		m.MaxConnections = dbconn.DefaultMaxConnections
+	}
+	if m.Threads == 0 {
+		m.Threads = defaultThreads
+	}
+
 	// Normalize CheckpointMaxAge here rather than in a Validate hook:
 	// orchestration callers construct Move programmatically (bypassing the
 	// Kong default of 168h), so a zero value means "use the default". This
@@ -173,11 +233,45 @@ func NewRunner(m *Move) (*Runner, error) {
 	if m.TargetChunkSize == 0 {
 		m.TargetChunkSize = table.DefaultTargetChunkBytes
 	}
+	// WriteThreads has no "0 means auto" meaning any more, so fill in the Kong
+	// default for programmatic callers as well. Warn on
+	// an explicit 0, which used to mean "size from the instance" and would
+	// otherwise silently become 4.
+	if m.WriteThreads == 0 {
+		slog.Default().Warn("--write-threads 0 no longer means auto-size; using the default",
+			"write_threads", defaultWriteThreads)
+		m.WriteThreads = defaultWriteThreads
+	}
 	r := &Runner{
-		move:   m,
-		logger: slog.Default(),
+		move:                m,
+		reverseWriteThreads: m.WriteThreads,
+		logger:              slog.Default(),
+		metricsSink:         &metrics.NoopSink{},
 	}
 	return r, nil
+}
+
+// recordCopyCompleted reports the copy aggregate settled during this
+// Runner.Run invocation. The chunker restores its settled row count from the
+// checkpoint, while its chunk count starts afresh, so the restored rows are
+// subtracted here to keep the two figures on the same invocation.
+//
+// A move resume deletes the rows at or above the resume position and copies
+// them again, so those rows are settled twice and counted in both invocations.
+func (r *Runner) recordCopyCompleted() {
+	chunker := r.copier.GetChunker()
+	if chunker == nil {
+		return
+	}
+	_, chunks, _ := chunker.Progress()
+	r.status.RecordCopyCompleted(chunker.RowsCopied()-r.copyRowsAtResume, chunks)
+}
+
+func (r *Runner) runCopy(ctx context.Context) error {
+	defer r.recordCopyCompleted()
+	return r.status.Do(status.CopyRows, func() error {
+		return r.copier.Run(ctx)
+	})
 }
 
 func (r *Runner) Close() error {
@@ -197,6 +291,12 @@ func (r *Runner) Close() error {
 	// rest, leaking the remaining repl clients' binlog reader goroutines
 	// and the target DB handles.
 	var errs []error
+	if t := r.currentThrottler(); t != nil {
+		errs = append(errs, t.Close())
+	}
+	for _, db := range r.monitorDBs {
+		errs = append(errs, db.Close())
+	}
 	if r.copyChunker != nil {
 		if err := r.copyChunker.Close(); err != nil {
 			errs = append(errs, err)
@@ -349,17 +449,78 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 }
 
 func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
+	// Read checkpoint from targets[0] by convention. This happens first
+	// because the checkpointed per-source positions decide which change
+	// source implementation each source gets (buildReplClients below). A
+	// checkpoint table written by an incompatible spirit version (e.g.
+	// missing or renamed a column) fails the read and aborts the move; we do
+	// not support cross-version resume.
+	tgt0 := &r.targets[0]
+	rec, err := r.checkpointTbl().ReadLatest(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read from checkpoint table '%s' on target: %w", checkpointTableName, err)
+	}
+	// A checkpoint past the forward cutover (a reverse-window phase) is resumed
+	// earlier by maybeResumeReverseWindow, before discovery/locks — it should
+	// never reach this copy-path resume. This is a defensive backstop: getting
+	// here with a non-empty phase means that earlier handoff was bypassed, so
+	// fail loudly rather than re-run the copy and cutover (which would re-invoke
+	// the traffic switch and rename the already-retired tables).
+	if rec.Phase != "" {
+		return fmt.Errorf("cannot resume move down the copy path: checkpoint is past cutover (phase=%q); a reverse-window resume is handled earlier (see maybeResumeReverseWindow)", rec.Phase)
+	}
+
+	// Check if the checkpoint is too old to safely resume — replaying many
+	// days of binary logs can be slower than re-copying, and the binlogs may
+	// have been purged anyway. This must happen before any destructive step
+	// (deleteRecopyRange below modifies the targets). Unlike migrate,
+	// move cannot silently fall back to a fresh copy: the target tables are
+	// non-empty (that is exactly why setupUnderLocks() chose the resume path), so we
+	// fail loudly and leave the decision to the operator.
+	if checkpointAge := rec.Age(); checkpointAge >= r.move.CheckpointMaxAge {
+		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or re-run with --force to wipe the target tables (including '%s') and restart the move from scratch",
+			status.ErrCheckpointTooOld,
+			checkpointAge.Round(time.Second),
+			r.move.CheckpointMaxAge,
+			checkpointTableName,
+		)
+	}
+
+	// Parse per-source positions (opaque strings owned by the source impl),
+	// keyed by sourceKey (addr/dbname).
+	var positions map[string]string
+	if err := json.Unmarshal([]byte(rec.Position), &positions); err != nil {
+		return fmt.Errorf("%w: could not parse binlog positions from checkpoint: %w", errCheckpointUnresumable, err)
+	}
+	for i := range r.sources {
+		if pos, ok := positions[r.sources[i].sourceKey()]; !ok || pos == "" {
+			return fmt.Errorf("%w: checkpoint missing binlog position for source %s", errCheckpointUnresumable, r.sources[i].sourceKey())
+		}
+	}
+
+	// All definitive validation has passed before changing runner or target state.
+	copierWatermark := rec.CopierWatermark
+	r.checksumWatermark = rec.ChecksumWatermark
+
+	// Build each source's change source in the coordinate scheme its
+	// checkpointed position was written in (a GTID set resumes through the
+	// GTID client and requires the server to still have GTIDs enabled; a
+	// binlog file:offset position resumes through the binlog client).
+	if err := r.buildReplClients(ctx, positions); err != nil {
+		return err
+	}
+
 	copyChunkers := make([]table.Chunker, 0, len(r.sources)*len(r.sourceTables))
 	checksumChunkers := make([]table.Chunker, 0, len(r.sources)*len(r.sourceTables))
-	var err error
 
 	// For each source and each table, create a chunker and add a subscription
 	// to that source's repl client.
 	for i := range r.sources {
 		for _, tbl := range r.sources[i].tables {
+			// TargetChunkTime is left unset: the time signal is a constant
+			// (table.ChunkerDefaultTarget), not a per-run knob.
 			chunkerCfg := table.ChunkerConfig{
-				TargetChunkTime: r.move.TargetChunkTime,
-				Logger:          r.logger,
+				Logger: r.logger,
 			}
 			// Move always uses the buffered copier, which reads rows into client
 			// memory; size the copy chunker by an in-memory byte budget rather than
@@ -397,59 +558,23 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	// Then create a multi chunker of all chunkers.
+	r.chunkerMu.Lock()
 	r.copyChunker = table.NewMultiChunker(copyChunkers...)
+	r.chunkerMu.Unlock()
 	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
-	r.copier, err = copier.NewCopier(r.sources[0].db, r.copyChunker, &copier.CopierConfig{
-		Concurrency:     r.move.Threads,
-		TargetChunkTime: r.move.TargetChunkTime,
-		Logger:          r.logger,
-		Throttler:       &throttler.Noop{},
-		MetricsSink:     &metrics.NoopSink{},
-		DBConfig:        r.dbConfig,
-		Applier:         r.applier, // Use the shared applier
-		Unbuffered:      false,     // move always uses the buffered copier
+	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
+		Concurrency: r.move.Threads,
+		Logger:      r.logger,
+		Throttler:   r.currentThrottler(),
+		Autoscale:   r.autoscale,
+		MetricsSink: r.metricsSink,
+		DBConfig:    r.dbConfig,
+		Applier:     r.applier, // Use the shared applier
 	})
 	if err != nil {
 		return err
-	}
-
-	// Read checkpoint from targets[0] by convention. A checkpoint table written
-	// by an incompatible spirit version (e.g. missing or renamed a column) fails
-	// the read and aborts the move; we do not support cross-version resume.
-	tgt0 := &r.targets[0]
-	rec, err := r.checkpointTbl().ReadLatest(ctx)
-	if err != nil {
-		return fmt.Errorf("could not read from checkpoint table '%s' on target: %w", checkpointTableName, err)
-	}
-	// A checkpoint past the forward cutover (a reverse-window phase) is resumed
-	// earlier by maybeResumeReverseWindow, before discovery/locks — it should
-	// never reach this copy-path resume. This is a defensive backstop: getting
-	// here with a non-empty phase means that earlier handoff was bypassed, so
-	// fail loudly rather than re-run the copy and cutover (which would re-invoke
-	// the traffic switch and rename the already-retired tables).
-	if rec.Phase != "" {
-		return fmt.Errorf("cannot resume move down the copy path: checkpoint is past cutover (phase=%q); a reverse-window resume is handled earlier (see maybeResumeReverseWindow)", rec.Phase)
-	}
-	copierWatermark := rec.CopierWatermark
-	r.checksumWatermark = rec.ChecksumWatermark
-	binlogPositionsJSON := rec.Position
-
-	// Check if the checkpoint is too old to safely resume — replaying many
-	// days of binary logs can be slower than re-copying, and the binlogs may
-	// have been purged anyway. This must happen before any destructive step
-	// (deleteRecopyRange below modifies the targets). Unlike migrate,
-	// move cannot silently fall back to a fresh copy: the target tables are
-	// non-empty (that is exactly why setupUnderLocks() chose the resume path), so we
-	// fail loudly and leave the decision to the operator.
-	if checkpointAge := rec.Age(); checkpointAge >= r.move.CheckpointMaxAge {
-		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or wipe the target tables (including '%s') and restart the move from scratch",
-			status.ErrCheckpointTooOld,
-			checkpointAge.Round(time.Second),
-			r.move.CheckpointMaxAge,
-			checkpointTableName,
-		)
 	}
 
 	// With multiple sources, a persisted checksum watermark cannot be trusted.
@@ -471,18 +596,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 			"reason", "deleteRecopyRange may remove rows below other sources' watermarks; only a from-scratch checksum re-verifies and repairs them",
 			"sources", len(r.sources))
 		r.checksumWatermark = ""
-	}
-
-	// Parse per-source positions (opaque strings owned by the source impl),
-	// keyed by sourceKey (addr/dbname).
-	var positions map[string]string
-	if err := json.Unmarshal([]byte(binlogPositionsJSON), &positions); err != nil {
-		return fmt.Errorf("could not parse binlog positions from checkpoint: %w", err)
-	}
-	for i := range r.sources {
-		if _, ok := positions[r.sources[i].sourceKey()]; !ok {
-			return fmt.Errorf("checkpoint missing binlog position for source %s", r.sources[i].sourceKey())
-		}
 	}
 
 	// Delete rows at/above the copier's resume position (the watermark
@@ -514,7 +627,12 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	r.checkpointTable = table.NewTableInfo(tgt0.DB, tgt0.Config.DBName, checkpointTableName)
-	r.usedResumeFromCheckpoint = true
+	// The baseline is taken only here, past every step that can still send
+	// setup down the fresh-copy path: the fresh chunker starts at zero, and a
+	// baseline left over from an abandoned resume would underflow the
+	// unsigned subtraction in recordCopyCompleted.
+	r.copyRowsAtResume = r.copyChunker.RowsCopied()
+	r.usedResumeFromCheckpoint.Store(true)
 	return nil
 }
 
@@ -565,26 +683,12 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 // lock before it can destroy the first run's target data.
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
-
-	// Resolve the number of apply (write) threads against the target now that
-	// it is connected. WriteThreads==0 means "auto-size": on Aurora it becomes
-	// the instance vCPU count; on non-Aurora there is no reliable vCPU signal
-	// to size from, so it falls back to the default.
-	r.move.WriteThreads, err = throttler.ResolveWriteThreads(ctx, r.targets[0].DB, r.move.WriteThreads, r.logger)
-	if err != nil {
+	if err := r.setupAutoscaling(ctx); err != nil {
 		return err
 	}
-	// Now that write threads are known, grow connection pools to cover both the
-	// copy (read) threads and the apply (write) threads. The initial pool (set
-	// before connecting) used the requested value, which may have been 0.
-	if poolSize := r.move.Threads + r.move.WriteThreads + 2; poolSize > r.dbConfig.MaxOpenConnections {
-		r.dbConfig.MaxOpenConnections = poolSize
-		for i := range r.sources {
-			r.sources[i].db.SetMaxOpenConns(poolSize)
-		}
-		for i := range r.targets {
-			r.targets[i].DB.SetMaxOpenConns(poolSize)
-		}
+
+	if err := r.fitReadThreadsToPools(); err != nil {
+		return err
 	}
 
 	// Create a single applier instance shared by all repl clients and the copier.
@@ -594,25 +698,11 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		return err
 	}
 
-	// Create one repl client per source, all sharing the same applier.
-	r.logger.Debug("Setting up repl clients", "sourceCount", len(r.sources))
-	if r.move.EnableExperimentalGTID {
-		r.logger.Info("EXPERIMENTAL: using GTID-based change source")
-	}
-	for i := range r.sources {
-		src := &r.sources[i]
-		replConfig := change.NewClientDefaultConfig()
-		replConfig.Logger = r.logger
-		replConfig.CancelFunc = r.fatalError
-		replConfig.DDLFilterSchema = src.config.DBName
-		replConfig.DDLFilterTables = r.move.SourceTables
-		replConfig.DBConfig = r.dbConfig
-		if r.move.EnableExperimentalGTID {
-			src.replClient = change.NewGTIDClient(src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig)
-		} else {
-			src.replClient = change.NewBinlogClient(src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig)
-		}
-	}
+	// The repl clients are NOT built here: their coordinate scheme (GTID vs
+	// binlog file+position) depends on whether we start fresh (probe each
+	// source; see change.NewAutoClient) or resume (the checkpointed
+	// position's encoding decides). buildReplClients is called from newCopy
+	// and resumeFromCheckpoint once that is known.
 
 	// Run post-setup checks
 	if err = r.runChecks(ctx, check.ScopePostSetup); err != nil {
@@ -626,11 +716,21 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		}
 		switch decision {
 		case resumeCheckpoint:
-			if resumeErr := r.resumeFromCheckpoint(ctx); resumeErr != nil {
+			resumeErr := r.resumeFromCheckpoint(ctx)
+			if resumeErr == nil {
+				r.logger.Info("Successfully resumed move from existing checkpoint")
+				return nil
+			}
+			if !r.move.Force || !isDefinitivelyUnresumable(resumeErr) {
 				return fmt.Errorf("resume validation passed but checkpoint resume failed: %w", resumeErr)
 			}
-			r.logger.Info("Successfully resumed move from existing checkpoint")
-			return nil
+			r.logger.Warn("force set and checkpoint is definitively unresumable; starting fresh", "reason", resumeErr)
+			// resumeFromCheckpoint assigns these only after every definitive
+			// validation. Clear them explicitly before the fresh path so a
+			// future force-eligible failure added after that boundary cannot
+			// leak stale checkpoint state into newCopy.
+			r.checksumWatermark = ""
+			r.copyRowsAtResume = 0
 		case resumeFreshOwned:
 			r.logger.Warn("target holds an empty checkpoint table: a prior move attempt stopped before writing its first checkpoint; wiping target tables and starting fresh")
 		case resumeNone:
@@ -638,6 +738,11 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 				return fmt.Errorf("target state is invalid for both new copy and resume (re-run with --force to wipe the target and start fresh): %w", err)
 			}
 			r.logger.Warn("force set and the target cannot resume; wiping target tables and starting fresh")
+		}
+		// A wipe only cures target state. Validate all other checks first,
+		// including when an empty checkpoint proves this is a prior attempt.
+		if preErr := r.runChecks(ctx, check.ScopePostSetup, check.TargetStateCheckName); preErr != nil {
+			return fmt.Errorf("refusing to wipe the target because a check that wiping cannot fix is failing: %w", preErr)
 		}
 		if werr := r.wipeTargets(ctx); werr != nil {
 			return fmt.Errorf("failed to wipe target before a fresh copy: %w", werr)
@@ -647,8 +752,7 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 		// source_schema_consistency, ...). Re-run them against the now-wiped
 		// target (target_state passes for the absent tables, exactly as a fresh
 		// move); abort if anything still fails rather than copying into a state
-		// that would only fail at cutover. RunChecks iterates a map, so the
-		// original failure was not necessarily target_state.
+		// that would only fail at cutover.
 		if err := r.runChecks(ctx, check.ScopePostSetup); err != nil {
 			return fmt.Errorf("target still fails post-setup checks after wiping: %w", err)
 		}
@@ -754,8 +858,10 @@ func (r *Runner) dropStaleRevertTables(ctx context.Context) error {
 // owns the run.
 //
 // Not yet handled: an interrupted reverse *cutover* (phase "reverting") leaves
-// an ambiguous half-renamed state, so that surfaces as an error for manual
-// completion rather than an unsafe auto-resume.
+// an ambiguous half-renamed state, so that surfaces as an ownership-ambiguous
+// error for manual completion rather than an unsafe auto-resume. Phase
+// "reverse_finalized" is different: ownership is already definitively back on
+// the source and only idempotent cleanup remains, so it is retried.
 func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 	rec, err := r.checkpointTbl().ReadLatest(ctx)
 	if err != nil {
@@ -769,7 +875,15 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 		r.logger.Warn("resuming an interrupted reverse window from checkpoint", "cutover_at", rec.CutoverAt)
 		return true, r.resumeReverseWindow(ctx, rec)
 	case phaseReverting:
-		return true, fmt.Errorf("a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually", rec.Phase)
+		return true, fmt.Errorf("%w: a reverse cutover was interrupted (checkpoint phase=%q); resuming a partial rollback is not yet supported — complete it manually",
+			status.ErrOwnershipAmbiguous, rec.Phase)
+	case phaseReverseFinalized:
+		// Ownership is already definitive: every former target was retired
+		// before this phase was written. Only the idempotent cleanup that
+		// follows it can have failed, so repeat exactly that.
+		r.logger.Warn("resuming cleanup of a completed reverse cutover", "cutover_at", rec.CutoverAt)
+		r.cutoverAt = rec.CutoverAt
+		return true, newReverseWindow(r).finalizeReverse(ctx)
 	default:
 		return false, nil // phase "" (copy) — the normal flow handles resume/fresh
 	}
@@ -798,15 +912,19 @@ func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record)
 	if len(logical) == 0 {
 		return fmt.Errorf("resume reverse window: found no retired (_old) source tables to resume from")
 	}
-	src := &r.sources[0] // reverse-window is single-source (guarded at cutover)
-	src.tables = make([]*table.TableInfo, 0, len(logical))
-	for _, name := range logical {
-		// Only the name is read downstream (buildFeed derives the _old source
-		// and real target TableInfos itself), so no SetInfo — the logical table
-		// no longer exists on the source under this name.
-		src.tables = append(src.tables, table.NewTableInfo(src.db, src.config.DBName, name))
+	// Rebuild every source's table list (all source shards hold the same
+	// logical tables; sources[0] was the canonical one the names came from).
+	for si := range r.sources {
+		src := &r.sources[si]
+		src.tables = make([]*table.TableInfo, 0, len(logical))
+		for _, name := range logical {
+			// Only the name is read downstream (buildFeed derives the _old source
+			// and real target TableInfos itself), so no SetInfo — the logical table
+			// no longer exists on the source under this name.
+			src.tables = append(src.tables, table.NewTableInfo(src.db, src.config.DBName, name))
+		}
 	}
-	r.sourceTables = src.tables
+	r.sourceTables = r.sources[0].tables
 
 	return newReverseWindow(r).run(ctx)
 }
@@ -843,8 +961,41 @@ func (r *Runner) reverseWindowLogicalTables(ctx context.Context) ([]string, erro
 	return logical, rows.Err()
 }
 
+// buildReplClients constructs one change source per source server, all
+// sharing r.applier. resumePositions is the checkpoint's per-source position
+// map when resuming (keyed by sourceKey), or nil for a fresh copy. Each
+// source's client is selected by change.NewAutoClient: a resumed source stays
+// in the coordinate scheme its checkpointed position was written in, and a
+// fresh one uses GTIDs whenever that server has them enabled. The selection
+// is per source, so an N:M move whose shards disagree on GTID support simply
+// runs each shard's feed in that shard's own scheme.
+func (r *Runner) buildReplClients(ctx context.Context, resumePositions map[string]string) error {
+	r.logger.Debug("Setting up repl clients", "sourceCount", len(r.sources))
+	for i := range r.sources {
+		src := &r.sources[i]
+		replConfig := change.NewClientDefaultConfig()
+		replConfig.Logger = r.logger
+		replConfig.CancelFunc = r.fatalError
+		replConfig.DDLFilterSchema = src.config.DBName
+		replConfig.DDLFilterTables = r.move.SourceTables
+		replConfig.DBConfig = r.dbConfig
+		replConfig.UnderLoad = func() bool { return throttler.GradualOnly(r.currentThrottler()).IsThrottled() }
+		client, err := change.NewAutoClient(ctx, src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, replConfig, resumePositions[src.sourceKey()])
+		if err != nil {
+			return fmt.Errorf("source %d: %w", i, err)
+		}
+		src.replClient = client
+	}
+	return nil
+}
+
 func (r *Runner) newCopy(ctx context.Context) error {
-	// Starting fresh. Clear any leftover _revert tables from an earlier
+	// Starting fresh: build each source's change source by probing the server
+	// (no checkpoint positions to inherit a coordinate scheme from).
+	if err := r.buildReplClients(ctx, nil); err != nil {
+		return err
+	}
+	// Clear any leftover _revert tables from an earlier
 	// reverse-window rollback on these targets, so this run's own reverse
 	// cutover can retire the targets without colliding (and so they don't
 	// linger). Only on the fresh path — a resume must not drop tables.
@@ -858,9 +1009,14 @@ func (r *Runner) newCopy(ctx context.Context) error {
 
 	// Create the sentinel on targets[0], alongside the checkpoint, so all of
 	// move's coordination tables live in one place (the source tables are
-	// renamed out of the way at cutover). Idempotent (CREATE IF NOT EXISTS) so a
-	// resume recreates it and a concurrent existence probe never sees it absent.
-	if r.move.CreateSentinel {
+	// renamed out of the way at cutover). Only the fresh-copy path creates it;
+	// a resume never does, and does not need to — the sentinel lives on the
+	// target, so it simply survives, and the existence-driven sentinel.Wait
+	// below blocks again. (If the operator dropped it before the resume, the
+	// resumed move cuts over without waiting, matching migrate.) Creation is
+	// idempotent (CREATE IF NOT EXISTS) so that a concurrent existence probe
+	// never sees it absent — see TestCreateSentinelTableIdempotent.
+	if r.move.DeferCutOver {
 		if err := sentinel.Create(ctx, r.targets[0].DB); err != nil {
 			return err
 		}
@@ -878,9 +1034,10 @@ func (r *Runner) newCopy(ctx context.Context) error {
 	// to that source's repl client.
 	for i := range r.sources {
 		for _, tbl := range r.sources[i].tables {
+			// TargetChunkTime is left unset: the time signal is a constant
+			// (table.ChunkerDefaultTarget), not a per-run knob.
 			chunkerCfg := table.ChunkerConfig{
-				TargetChunkTime: r.move.TargetChunkTime,
-				Logger:          r.logger,
+				Logger: r.logger,
 			}
 			// Move always uses the buffered copier, which reads rows into client
 			// memory; size the copy chunker by an in-memory byte budget rather than
@@ -904,20 +1061,21 @@ func (r *Runner) newCopy(ctx context.Context) error {
 		}
 	}
 
+	r.chunkerMu.Lock()
 	r.copyChunker = table.NewMultiChunker(copyChunkers...)
+	r.chunkerMu.Unlock()
 	r.checksumChunker = table.NewMultiChunker(checksumChunkers...)
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
 	var err error
-	r.copier, err = copier.NewCopier(r.sources[0].db, r.copyChunker, &copier.CopierConfig{
-		Concurrency:     r.move.Threads,
-		TargetChunkTime: r.move.TargetChunkTime,
-		Logger:          r.logger,
-		Throttler:       &throttler.Noop{},
-		MetricsSink:     &metrics.NoopSink{},
-		DBConfig:        r.dbConfig,
-		Applier:         r.applier, // Use the shared applier
-		Unbuffered:      false,     // move always uses the buffered copier
+	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
+		Concurrency: r.move.Threads,
+		Logger:      r.logger,
+		Throttler:   r.currentThrottler(),
+		Autoscale:   r.autoscale,
+		MetricsSink: r.metricsSink,
+		DBConfig:    r.dbConfig,
+		Applier:     r.applier, // Use the shared applier
 	})
 	if err != nil {
 		return err
@@ -960,10 +1118,16 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runner) Run(ctx context.Context) error {
+func (r *Runner) Run(ctx context.Context) (retErr error) {
 	ctx, r.cancelFunc = context.WithCancel(ctx)
 	defer r.cancelFunc()
-	r.startTime = time.Now()
+	r.status.SetMetricsSink(r.metricsSink, r.logger)
+	r.status.Begin()
+	r.durableMutation.Store(false)
+	r.terminalOwnership.Store(uint32(status.WorkflowTerminalOwnershipNone))
+	defer func() {
+		r.recordWorkflowError(retErr)
+	}()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting table move",
 		"version", bi.Version,
@@ -974,17 +1138,27 @@ func (r *Runner) Run(ctx context.Context) error {
 	)
 
 	if r.move.ReverseWindow > 0 && len(r.move.SourceDSNs) > 1 {
-		// Reverse-window is only defined for an unsharded source (1 source →
-		// M targets ⇒ an M:1 reverse). A sharded source would need an M:N
-		// reverse with a reverse sharding provider, which is out of scope.
-		return fmt.Errorf("--reverse-window requires an unsharded (single) source, got %d source shards", len(r.move.SourceDSNs))
+		// A sharded source reverses as an M:N feed: rows flowing back from the
+		// targets are routed to the source shard whose key range contains the
+		// row's hash. That routing needs the source shard layout and the source
+		// keyspace's sharding metadata, so both are required up front — failing
+		// here, before any copy, rather than after the forward cutover when the
+		// reverse feed is actually built.
+		if r.move.ReverseShardingProvider == nil {
+			return fmt.Errorf("--reverse-window with a sharded source (%d source shards) requires a ReverseShardingProvider to route reverse writes", len(r.move.SourceDSNs))
+		}
+		if len(r.move.SourceKeyRanges) != len(r.move.SourceDSNs) {
+			return fmt.Errorf("--reverse-window with a sharded source requires one SourceKeyRanges entry per source DSN, got %d ranges for %d sources", len(r.move.SourceKeyRanges), len(r.move.SourceDSNs))
+		}
+		if err := applier.ValidateKeyRanges(r.move.SourceKeyRanges); err != nil {
+			return fmt.Errorf("--reverse-window source key ranges are invalid: %w", err)
+		}
 	}
 
-	var err error
 	r.dbConfig = dbconn.NewDBConfig()
 	// ForceKill is now true by default in NewDBConfig(), no need to set explicitly.
-	// Buffered copier needs more connections due to parallel read/write workers
-	r.dbConfig.MaxOpenConnections = r.move.Threads + r.move.WriteThreads + 2
+	// Worker counts do not grow the configured connection pools.
+	r.dbConfig.MaxOpenConnections = r.move.MaxConnections
 
 	// Build the list of source DSNs. If SourceDSNs is set (N:M), use it.
 	// Otherwise, use SourceDSN as the single source (backward compat).
@@ -1005,6 +1179,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			return fmt.Errorf("failed to parse source DSN %d: %w", i, err)
 		}
 		r.sources[i] = sourceInfo{db: db, config: cfg, dsn: dsn}
+		// Attach this shard's key range BEFORE the sort below, so it stays
+		// with its DSN (SourceKeyRanges is parallel to the caller's SourceDSNs
+		// order, not the sorted order).
+		if i < len(r.move.SourceKeyRanges) {
+			r.sources[i].keyRange = r.move.SourceKeyRanges[i]
+		}
 	}
 	// Sort sources by sourceKey (addr/dbname) for deterministic ordering.
 	// sources[0] is the canonical source we read the table list and SHOW
@@ -1044,6 +1224,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		}}
 		r.logger.Debug("Created single target from TargetDSN")
 	}
+	// Apply the same exact budget to caller-supplied target handles too.
+	for _, target := range r.targets {
+		if target.DB != nil {
+			dbconn.SetPoolSize(target.DB, r.move.MaxConnections)
+		}
+	}
 	// Sort targets by targetKey (addr/dbname/keyrange) for deterministic
 	// ordering. The checkpoint is written to targets[0], so the order must be
 	// stable across runs even if the caller constructed Targets from a map.
@@ -1052,6 +1238,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	slices.SortFunc(r.targets, func(a, b applier.Target) int {
 		return strings.Compare(targetKey(a), targetKey(b))
 	})
+
+	sourceDBs := make([]*sql.DB, len(r.sources))
+	for i := range r.sources {
+		sourceDBs[i] = r.sources[i].db
+	}
+	targetDBs := make([]*sql.DB, len(r.targets))
+	for i := range r.targets {
+		targetDBs[i] = r.targets[i].DB
+	}
+	if err := dbconn.RequireDifferentDatabases(ctx, sourceDBs, targetDBs); err != nil {
+		return err
+	}
 
 	// If a prior run reached the reverse window (or a reverse cutover), resume
 	// that here instead of the normal discovery/copy path. The forward cutover
@@ -1090,11 +1288,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		// But the caller will still want their cutoverFunc called. So we do that
 		// and then exit.
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
-		r.status.Set(status.CutOver)
-		if r.cutoverFunc != nil {
-			if err := r.cutoverFunc(ctx); err != nil {
-				return err
+		if err := r.status.Do(status.CutOver, func() error {
+			if r.cutoverFunc == nil {
+				return nil
 			}
+			return r.cutoverFunc(ctx)
+		}); err != nil {
+			return err
 		}
 		r.logger.Info("Move operation complete.")
 		return nil
@@ -1137,8 +1337,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	r.status.Set(status.CopyRows)
-	if err := r.copier.Run(ctx); err != nil {
+	if err := r.runCopy(ctx); err != nil {
 		return err
 	}
 
@@ -1164,18 +1363,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logger.Info("Initial checksum completed successfully")
 
-	r.sentinelWaitStartTime = time.Now()
-	r.status.Set(status.WaitingOnSentinelTable)
 	// Block on the sentinel via the shared sentinel.Wait (poll/timeout timing
 	// lives in the sentinel package). The continuous-checksum lifecycle and
 	// watermark invalidation are move-specific (multi-source feeds;
 	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
 	// so they are injected as callbacks. See pkg/sentinel.
-	if err := sentinel.Wait(ctx, sentinel.WaitConfig{
-		Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
-		RunChecksum:         r.runContinuousChecksum,
-		InvalidateWatermark: r.invalidateChecksumWatermark,
-		Logger:              r.logger,
+	if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
+		return sentinel.Wait(ctx, sentinel.WaitConfig{
+			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
+			RunChecksum:         r.runContinuousChecksum,
+			InvalidateWatermark: r.invalidateChecksumWatermark,
+			Logger:              r.logger,
+		})
 	}); err != nil {
 		return err
 	}
@@ -1188,32 +1387,40 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logger.Info("Sentinel released, starting cutover")
 	// Create a cutover.
-	r.status.Set(status.CutOver)
-	cutoverSources := make([]CutOverSource, len(r.sources))
-	for i := range r.sources {
-		cutoverSources[i] = CutOverSource{
-			DB:         r.sources[i].db,
-			ReplClient: r.sources[i].replClient,
-			Tables:     r.sources[i].tables,
+	if err := r.status.Do(status.CutOver, func() error {
+		cutoverSources := make([]CutOverSource, len(r.sources))
+		for i := range r.sources {
+			cutoverSources[i] = CutOverSource{
+				DB:         r.sources[i].db,
+				ReplClient: r.sources[i].replClient,
+				Tables:     r.sources[i].tables,
+			}
 		}
-	}
-	cutover, err := NewCutOver(cutoverSources, r.cutoverFunc, r.dbConfig, r.logger)
-	if err != nil {
-		return err
-	}
-	if r.move.ReverseWindow > 0 {
-		// Under the cutover lock, right after the traffic switch, capture the
-		// reverse-feed start positions and record that the move has entered its
-		// reverse window (see captureReverseWindow). The source rename still runs.
-		cutover.SetPostSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
-	}
-	// Pre-cutover: refuse to switch traffic if a revert has been requested (a
-	// marker appeared on targets[0] during the copy). Cutting over only to
-	// immediately roll back is pointless — abort while the source is still live.
-	if err := r.assertNoRevertMarker(ctx, "pre-cutover"); err != nil {
-		return err
-	}
-	if err = cutover.Run(ctx); err != nil {
+		cutover, err := NewCutOver(cutoverSources, nil, r.dbConfig, r.logger)
+		if err != nil {
+			return err
+		}
+		if r.cutoverResultFunc != nil || r.cutoverFunc != nil {
+			cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
+		}
+		if r.move.ReverseWindow > 0 {
+			// Capture before the switch can accept target writes, then persist
+			// the captured positions once the traffic switch succeeds.
+			cutover.SetPreSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
+			cutover.SetPostSwitch(func(ctx context.Context) error { return persistReverseWindow(ctx, r) })
+		}
+		// Pre-cutover: refuse to switch traffic if a revert has been requested (a
+		// marker appeared on targets[0] during the copy). Cutting over only to
+		// immediately roll back is pointless — abort while the source is still live.
+		if err := r.assertNoRevertMarker(ctx, "pre-cutover"); err != nil {
+			return err
+		}
+		if err := cutover.Run(ctx); err != nil {
+			return err
+		}
+		r.durableMutation.Store(true)
+		return nil
+	}); err != nil {
 		return err
 	}
 
@@ -1221,7 +1428,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		// Hold the reverse window keeping the source current, then complete
 		// forward (retire the source) or roll back. The checkpoint is dropped by
 		// the terminal action, not here.
-		return newReverseWindow(r).run(ctx)
+		err := newReverseWindow(r).run(ctx)
+		return err
 	}
 
 	// Delete checkpoint table from targets[0].
@@ -1354,6 +1562,10 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 	return true
 }
 
+// Status returns the periodic report on the whole move: a header line plus one
+// indented row per subsystem (see status.Block). It deliberately absorbs what
+// used to be separate periodic lines from the change feeds (flushes, rotations)
+// and the checkpoint dumper — see github.com/block/spirit/issues/329.
 func (r *Runner) Status() string {
 	state := r.status.Get()
 	if state > status.CutOver {
@@ -1361,45 +1573,72 @@ func (r *Runner) Status() string {
 	}
 	switch state { //nolint:exhaustive
 	case status.CopyRows:
-		// Status for copy rows
-		return fmt.Sprintf("migration status: state=%s copy-progress=%s binlog-deltas=%v total-time=%s copier-time=%s copier-remaining-time=%v copier-is-throttled=%v",
-			r.status.Get().String(),
-			r.copier.GetProgress(),
-			r.getDeltaLenAll(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.copier.StartTime()).Round(time.Second),
+		progress := status.CopyFromTables(r.copyTables())
+		b := status.NewBlock("migration status: state=%s total-time=%s copier-time=%s",
+			state.String(),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
+		)
+		b.Row("copier", "%6.2f%%  %d/%d  chunk-size=%d  eta=%s  throttled=%v",
+			progress.Fraction()*100,
+			progress.RowsCopied,
+			progress.RowsTotal,
+			r.copier.ChunkSize(),
 			r.copier.GetETA(),
 			r.copier.GetThrottler().IsThrottled(),
 		)
+		b.Row("applier", "%s", applier.StatusRow(r.applier))
+		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
+		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
+		return b.String()
 	case status.WaitingOnSentinelTable:
-		return fmt.Sprintf("migration status: state=%s total-time=%s sentinel-wait-time=%s sentinel-max-wait-time=%s",
-			r.status.Get().String(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.sentinelWaitStartTime).Round(time.Second),
+		b := status.NewBlock("migration status: state=%s total-time=%s",
+			state.String(),
+			r.status.TotalElapsed().Round(time.Second),
+		)
+		b.Row("sentinel", "waiting=%s  max-wait=%s",
+			r.status.Elapsed().Round(time.Second),
 			sentinel.WaitLimit,
 		)
+		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
+		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
+		return b.String()
 	case status.ApplyChangeset, status.PostChecksum:
 		// We've finished copying rows, and we are now trying to reduce the number of binlog deltas before
 		// proceeding to the checksum and then the final cutover.
-		return fmt.Sprintf("migration status: state=%s binlog-deltas=%v total-time=%s",
-			r.status.Get().String(),
-			r.getDeltaLenAll(),
-			time.Since(r.startTime).Round(time.Second),
+		b := status.NewBlock("migration status: state=%s total-time=%s",
+			state.String(),
+			r.status.TotalElapsed().Round(time.Second),
 		)
+		b.Row("applier", "%s", applier.StatusRow(r.applier))
+		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
+		// See pkg/migration: the dumper keeps checkpointing during the drain,
+		// so the resume position is still worth watching here.
+		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
+		return b.String()
 	case status.Checksum:
 		// This could take a while if it's a large table.
-		return fmt.Sprintf("migration status: state=%s checksum-progress=%s binlog-deltas=%v total-time=%s checksum-time=%s",
-			r.status.Get().String(),
-			r.checker.GetProgress().String(),
-			r.getDeltaLenAll(),
-			time.Since(r.startTime).Round(time.Second),
-			time.Since(r.checker.StartTime()).Round(time.Second),
+		b := status.NewBlock("migration status: state=%s total-time=%s checksum-time=%s",
+			state.String(),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 		)
-	case status.RestoreSecondaryIndexes:
-		return fmt.Sprintf("migration status: state=%s total-time=%s",
-			r.status.Get().String(),
-			time.Since(r.startTime).Round(time.Second),
+		b.Row("checksum", "%s", checksum.StatusRow(r.checker))
+		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
+		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
+		return b.String()
+	case status.RestoreSecondaryIndexes, status.AnalyzeTable:
+		// Neither phase has progress to report, but both can block for a long
+		// time on a busy server, and with the per-dump checkpoint line now at
+		// DEBUG this is the only INFO output they produce. See pkg/migration.
+		b := status.NewBlock("migration status: state=%s total-time=%s state-time=%s",
+			state.String(),
+			r.status.TotalElapsed().Round(time.Second),
+			r.status.Elapsed().Round(time.Second),
 		)
+		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
+		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
+		return b.String()
 	default:
 		return ""
 	}
@@ -1409,8 +1648,18 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
 }
 
-// runChecks wraps around check.RunChecks and adds the context of this move operation
-func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
+// SetMetricsSink installs the destination for this run's metrics, including
+// the workflow phase transitions reported by status.Tracker. It must be called
+// before Run; a nil sink is ignored.
+func (r *Runner) SetMetricsSink(sink metrics.Sink) {
+	if sink == nil {
+		return
+	}
+	r.metricsSink = sink
+}
+
+// checkResources describes this move for both full and pre-wipe validation.
+func (r *Runner) checkResources() check.Resources {
 	sources := make([]check.SourceResource, len(r.sources))
 	for i := range r.sources {
 		sources[i] = check.SourceResource{
@@ -1419,14 +1668,17 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			DSN:    r.sources[i].dsn,
 		}
 	}
-	return check.RunChecks(ctx, check.Resources{
+	return check.Resources{
 		Sources:        sources,
 		Targets:        r.targets,
 		SourceTables:   r.sourceTables,
-		CreateSentinel: r.move.CreateSentinel,
-		GTID:           r.move.EnableExperimentalGTID,
+		DeferCutOver:   r.move.DeferCutOver,
 		MoveEverything: len(r.move.SourceTables) == 0,
-	}, r.logger, scope)
+	}
+}
+
+func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag, exclude ...string) error {
+	return check.RunChecks(ctx, r.checkResources(), r.logger, scope, exclude...)
 }
 
 // restoreSecondaryIndexes restores any secondary indexes that were deferred during table creation.
@@ -1437,13 +1689,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 	r.logger.Info("Checking for deferred secondary indexes to restore")
 
-	// Group targets by hostname to enable parallel processing across different hosts
-	// while avoiding overloading any single MySQL instance
-	hostGroups := make(map[string][]int) // hostname -> []targetIdx
-	for idx, target := range r.targets {
-		host := target.Config.Addr // e.g., "host:3306"
-		hostGroups[host] = append(hostGroups[host], idx)
-	}
+	hostGroups := r.targetHosts()
 
 	r.logger.Info("Parallelizing index restoration across hosts",
 		"hostCount", len(hostGroups),
@@ -1451,10 +1697,9 @@ func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 
 	// Process each host group in parallel using errgroup
 	g, gctx := errgroup.WithContext(ctx)
-	for host, targetIndices := range hostGroups {
-		// Shadow loop variables to avoid closure capture issues.
+	for _, group := range hostGroups {
 		g.Go(func() error {
-			return r.restoreIndexesForTargets(gctx, host, targetIndices)
+			return r.restoreIndexesForTargets(gctx, group.Host.String(), group.Indices)
 		})
 	}
 
@@ -1537,7 +1782,7 @@ func (r *Runner) restoreIndexesForTargets(ctx context.Context, host string, targ
 // postCopyPhase runs the work that happens between copy-rows and the
 // sentinel wait: drain the binlog backlog, restore secondary indexes
 // (if deferred), run ANALYZE TABLE, and perform the initial checksum.
-// When create-sentinel is not in use this is also the last phase
+// When defer-cutover is not in use this is also the last phase
 // before cutover.
 func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// Flush all pending events, but leave the periodic flush running until
@@ -1552,16 +1797,18 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// pkg/change/subscription_buffered.go), unread binlog would pile up
 	// server-side, and a source purging binlogs past the reader's position
 	// during an hours-long index build would fail the move fatally.
-	r.status.Set(status.ApplyChangeset)
-	if err := r.flushAllReplClients(ctx); err != nil {
+	if err := r.status.Do(status.ApplyChangeset, func() error {
+		return r.flushAllReplClients(ctx)
+	}); err != nil {
 		return err
 	}
 
 	// Restore secondary indexes if they were deferred during table creation.
 	// This is always called (not conditional on DeferSecondaryIndexes) to handle
 	// checkpoint resume scenarios where indexes may have been deferred in a previous run.
-	r.status.Set(status.RestoreSecondaryIndexes)
-	if err := r.restoreSecondaryIndexes(ctx); err != nil {
+	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
+		return r.restoreSecondaryIndexes(ctx)
+	}); err != nil {
 		return err
 	}
 
@@ -1569,17 +1816,21 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	r.status.Set(status.AnalyzeTable)
-	r.logger.Info("Running ANALYZE TABLE")
-	for _, target := range r.targets {
-		for _, tbl := range r.sourceTables {
-			// Unqualified on target.DB: the old code qualified with the source
-			// schema, which doesn't exist on a cross-cluster target (and breaks
-			// through a vtgate). See analyzeTable.
-			if err := r.analyzeTable(ctx, target.DB, tbl.TableName); err != nil {
-				return err
+	if err := r.status.Do(status.AnalyzeTable, func() error {
+		r.logger.Info("Running ANALYZE TABLE")
+		for _, target := range r.targets {
+			for _, tbl := range r.sourceTables {
+				// Unqualified on target.DB: the old code qualified with the source
+				// schema, which doesn't exist on a cross-cluster target (and breaks
+				// through a vtgate). See analyzeTable.
+				if err := r.analyzeTable(ctx, target.DB, tbl.TableName); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Now stop the periodic flush: the checksum requires it. The checker
@@ -1620,16 +1871,18 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	var err error
 	r.checker, err = checksum.NewChecker(sourceDBs, r.checksumChunker, feeds, &checksum.CheckerConfig{
 		Concurrency:     r.move.Threads,
-		TargetChunkTime: r.move.TargetChunkTime,
+		TargetChunkTime: table.ChunkerDefaultTarget,
 		DBConfig:        r.dbConfig,
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.currentThrottler(),
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 	})
 	if err != nil {
 		return err
 	}
-	r.status.Set(status.Checksum)
 	// On a checker error we just propagate. The DumpCheckpoint invariant
 	// guarantees that any persisted checksum_watermark describes only
 	// verified-clean chunks, so a resumed run either replays the checksum
@@ -1637,7 +1890,9 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// repair) or resumes safely from a watermark that came from a clean
 	// pass. See pkg/migration/runner.go DumpCheckpoint for the full
 	// rationale.
-	return r.checker.Run(ctx)
+	return r.status.Do(status.Checksum, func() error {
+		return r.checker.Run(ctx)
+	})
 }
 
 // analyzeTable runs ANALYZE TABLE for tableName on db, unqualified: db is
@@ -1679,45 +1934,144 @@ func (r *Runner) analyzeTable(ctx context.Context, db *sql.DB, tableName string)
 	return rows.Err()
 }
 
+// runForwardCutoverCallback invokes whichever mutually exclusive callback was
+// configured and converts the legacy form into the result-bearing contract.
+func (r *Runner) runForwardCutoverCallback(ctx context.Context) (CutoverResult, error) {
+	var result CutoverResult
+	var err error
+	switch {
+	case r.cutoverResultFunc != nil:
+		result, err = r.cutoverResultFunc(ctx)
+	case r.cutoverFunc != nil:
+		err = r.cutoverFunc(ctx)
+		if err != nil {
+			// The legacy callback cannot report whether it mutated before
+			// failing. Treat its ownership outcome as unknown and never retry.
+			result.OwnershipAmbiguous = true
+		}
+	}
+	if result.DurableMutation {
+		r.durableMutation.Store(true)
+	}
+	if result.OwnershipAmbiguous {
+		r.terminalOwnership.Store(uint32(status.WorkflowTerminalOwnershipAmbiguous))
+	}
+	return result, err
+}
+
+func (r *Runner) recordWorkflowError(err error) {
+	if errors.Is(err, status.ErrDurableMutation) {
+		r.durableMutation.Store(true)
+	}
+	if errors.Is(err, status.ErrOwnershipAmbiguous) {
+		r.terminalOwnership.Store(uint32(status.WorkflowTerminalOwnershipAmbiguous))
+	}
+}
+
+// Result returns correctness evidence retained from the most recent Run
+// invocation. It is intentionally separate from phase metrics.
+func (r *Runner) Result() status.WorkflowResult {
+	return status.WorkflowResult{
+		DurableMutation:   r.durableMutation.Load(),
+		TerminalOwnership: status.WorkflowTerminalOwnership(r.terminalOwnership.Load()),
+	}
+}
+
 func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {
+	r.cutoverResultFunc = nil
 	r.cutoverFunc = cutover
 }
 
-// SetReverseCutover registers the rollback traffic switch used if a revert is
-// requested during the reverse window (route back to the source). It mirrors
-// SetCutover and is only consulted when move.ReverseWindow > 0.
+// SetCutoverWithResult installs a result-bearing forward cutover callback.
+// It is mutually exclusive with SetCutover; the most recent setter wins.
+func (r *Runner) SetCutoverWithResult(cutover CutoverResultCallback) {
+	r.cutoverFunc = nil
+	r.cutoverResultFunc = cutover
+}
+
+// SetReverseCutover registers the legacy rollback traffic switch used if a
+// revert is requested during the reverse window.
 func (r *Runner) SetReverseCutover(fn func(ctx context.Context) error) {
+	r.reverseCutoverResultFunc = nil
 	r.reverseCutoverFunc = fn
 }
 
+// SetReverseCutoverWithResult installs the result-bearing reverse cutover
+// callback. It is mutually exclusive with SetReverseCutover.
+func (r *Runner) SetReverseCutoverWithResult(fn CutoverResultCallback) {
+	r.reverseCutoverFunc = nil
+	r.reverseCutoverResultFunc = fn
+}
+
+// copyTables snapshots the published copy chunker and returns the per-table
+// progress. Progress and Status both derive their copy figures from it, so
+// the API and the log block report one measure: settled rows against the
+// tables' cardinality estimates, kept past the end of the copy. The copier's
+// own progress is not used for either, because on an auto_increment key it
+// measures keyspace distance, not rows. The chunker is read under chunkerMu
+// because setup and checkpoint resume may publish it while a caller polls.
+func (r *Runner) copyTables() []status.TableProgress {
+	r.chunkerMu.RLock()
+	copyChunker := r.copyChunker
+	r.chunkerMu.RUnlock()
+	return status.TablesFromChunker(copyChunker)
+}
+
 func (r *Runner) Progress() status.Progress {
+	// Read the state once: the phase-specific fields below (summary, ETA,
+	// checksum, throttle) must all describe the same state, not whichever state
+	// each happened to observe.
+	state := r.status.Get()
+
+	tables := r.copyTables()
+	copyProgress := status.CopyFromTables(tables)
+
 	var summary string
-	switch r.status.Get() { //nolint:exhaustive
+	var eta status.ETA
+	var checksumProgress status.ChecksumProgress
+	switch state { //nolint: exhaustive
 	case status.CopyRows:
-		summary = fmt.Sprintf("%v %s ETA %v",
-			r.copier.GetProgress(),
-			r.status.Get().String(),
-			r.copier.GetETA(),
-		)
+		// One copier read, so the ETA in Summary and the ETA field describe
+		// the same instant.
+		eta = r.copier.GetETAState()
+		summary = fmt.Sprintf("%s %s ETA %s", copyProgress.String(), state.String(), eta.String())
 	case status.WaitingOnSentinelTable:
-		r.logger.Info("migration status",
-			"state", r.status.Get().String(),
-			"sentinel-table", fmt.Sprintf("%s.%s", r.targets[0].Config.DBName, sentinel.TableName),
-			"total-time", time.Since(r.startTime).Round(time.Second).String(),
-			"sentinel-wait-time", time.Since(r.sentinelWaitStartTime).Round(time.Second).String(),
-			"sentinel-max-wait-time", sentinel.WaitLimit.String(),
-		)
+		summary = "Waiting on Sentinel Table"
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.getDeltaLenAll())
 	case status.Checksum:
-		summary = "Checksum Progress=" + r.checker.GetProgress().String()
-	default:
-		summary = ""
+		checksumProgress = r.checker.GetProgress()
+		summary = checksum.StatusSummary(r.checker)
 	}
 	return status.Progress{
-		CurrentState: r.status.Get(),
+		CurrentState: state,
 		Summary:      summary,
+		Resume:       r.usedResumeFromCheckpoint.Load(),
+		ETA:          eta,
+		Copy:         copyProgress,
+		Checksum:     checksumProgress,
+		Tables:       tables,
+		Throttle:     r.throttleStatus(state),
 	}
+}
+
+// Sentinel waiting only reports pacing while a continuous checksum is running.
+func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
+	t := r.currentThrottler()
+	switch state { //nolint:exhaustive
+	case status.CopyRows:
+	case status.Checksum:
+		t = throttler.GradualOnly(t)
+	case status.WaitingOnSentinelTable:
+		if !r.continuousChecksumActive.Load() {
+			return status.ThrottleStatus{}
+		}
+		t = throttler.GradualOnly(t)
+	default:
+		return status.ThrottleStatus{}
+	}
+	paused, reason, util := throttler.Describe(t)
+	return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
 }
 
 // invalidateChecksumWatermark blanks the checksum_watermark on the persisted
@@ -1750,8 +2104,8 @@ func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 // the move is blocked in WaitingOnSentinelTable.
 //
 // The checker used here is separate from r.checker and uses a fresh chunker
-// so checkpoint state is unaffected. Single-threaded by design — checksum
-// throttling is tracked separately in github.com/block/spirit/issues/831.
+// so checkpoint state is unaffected. Single-threaded
+// in fixed mode; autoscaling uses the same host load signal as the initial pass.
 func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 	chunker, err := r.buildContinuousChunker()
 	if err != nil {
@@ -1769,14 +2123,16 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		feeds[i] = r.sources[i].replClient
 	}
 	checker, err := checksum.NewChecker(sourceDBs, chunker, feeds, &checksum.CheckerConfig{
-		// TODO(#831): once the throttler can size threads dynamically,
-		// replace the hard-coded 1 with the move's thread count.
+		// Keep the fixed-mode single worker; autoscaling can grow it on load feedback.
 		Concurrency:     1,
-		TargetChunkTime: r.move.TargetChunkTime,
+		TargetChunkTime: table.ChunkerDefaultTarget,
 		DBConfig:        r.dbConfig,
 		Logger:          r.logger,
 		Applier:         r.applier,
 		FixDifferences:  true,
+		Throttler:       r.currentThrottler(),
+		Autoscale:       checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		MetricsSink:     r.metricsSink,
 		// One pass per outer-loop iteration; the continuous-checksum
 		// loop itself supplies the retry, so we don't nest a second
 		// retry loop inside each iteration.
@@ -1839,7 +2195,9 @@ func (r *Runner) runContinuousChecksum(ctx context.Context) error {
 		iteration++
 		iterationStart := time.Now()
 		r.logger.Info("continuous checksum iteration starting", "iteration", iteration)
+		r.continuousChecksumActive.Store(true)
 		runErr := checker.Run(ctx)
+		r.continuousChecksumActive.Store(false)
 		if runErr != nil {
 			// Only suppress a `context.Canceled` that came from OUR ctx
 			// being cancelled (the sentinel was dropped while a pass was
@@ -1869,9 +2227,10 @@ func (r *Runner) buildContinuousChunker() (table.Chunker, error) {
 	chunkers := make([]table.Chunker, 0)
 	for i := range r.sources {
 		for _, tbl := range r.sources[i].tables {
+			// TargetChunkTime is left unset: the time signal is a constant
+			// (table.ChunkerDefaultTarget), not a per-run knob.
 			chunkerCfg := table.ChunkerConfig{
-				TargetChunkTime: r.move.TargetChunkTime,
-				Logger:          r.logger,
+				Logger: r.logger,
 			}
 			c, err := table.NewChunker(tbl, chunkerCfg)
 			if err != nil {
@@ -1910,41 +2269,27 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	if err != nil {
 		return status.ErrWatermarkNotReady // it might not be ready, we can try again.
 	}
-	// Safety invariant: only persist the checksum_watermark if the current
-	// checksum pass has had zero differences. The chunker advances its
-	// low-watermark past every chunk it sees Feedback() for, including
-	// chunks that needed a recopy — but a recopy isn't a verification.
-	// Reading DifferencesFound() *after* the watermark catches any chunk
-	// in the watermark that was repaired (the per-chunk path increments
-	// differencesFound strictly before chunker.Feedback). When set,
-	// suppress the watermark so a restart re-validates from the start of
-	// the checksum phase. See pkg/migration/runner.go DumpCheckpoint for
-	// the full rationale.
-	//
-	// The same invariant applies to the sentinel-wait continuous checker
-	// (a separate object from r.checker — see continuousChecker): once it
-	// has repaired any chunk, the watermark here is the stale
-	// end-of-initial-checksum one, and resuming from it would verify only
-	// the trailing chunks — silently neutralizing the deliberate abort the
-	// continuous checksum triggers on divergence. So the watermark is
-	// persisted only while BOTH checkers are clean (or the continuous one
-	// doesn't exist yet).
+	// The checker excludes repaired or otherwise unverified ranges from its
+	// resume evidence. Sentinel-check differences also invalidate the initial
+	// gate's watermark, so a restart rechecks the whole range.
 	var checksumWatermark string
 	if r.status.Get() >= status.Checksum && r.checker != nil {
-		wm, wmErr := r.checksumChunker.GetLowWatermark()
+		wm, wmErr := r.checker.ResumeWatermark()
 		if wmErr != nil {
 			return status.ErrWatermarkNotReady
 		}
-		if r.checker.DifferencesFound() == 0 &&
-			(r.continuousChecker == nil || r.continuousChecker.DifferencesFound() == 0) {
+		if r.continuousChecker == nil || r.continuousChecker.DifferencesFound() == 0 {
 			checksumWatermark = wm
 		}
 	}
+	// Debug, not Info: the status block's ckpt row reports it instead —
+	// see pkg/migration's DumpCheckpoint (#329).
+	//
 	// Note: when we dump the lowWatermark to the log, we are exposing the PK values,
 	// when using the composite chunker are based on actual user-data.
 	// We believe this is OK but may change it in the future. Please do not
 	// add any other fields to this log line.
-	r.logger.Info("checkpoint",
+	r.logger.Debug("checkpoint",
 		"low-watermark", copierWatermark,
 		"binlog-positions", string(positionsJSON))
 	// Statement and OriginalTableName are unused by move; Position carries the
@@ -1954,9 +2299,33 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 		ChecksumWatermark: checksumWatermark,
 		Position:          string(positionsJSON),
 	}); err != nil {
-		return status.ErrCouldNotWriteCheckpoint
+		// Keep the cause: the WatchTask dumper distinguishes a benign
+		// canceled-mid-write (it is being stopped) from a genuinely broken
+		// checkpoint table, which is fatal.
+		return fmt.Errorf("%w: %w", status.ErrCouldNotWriteCheckpoint, err)
 	}
+	r.lastCheckpoint.Record(renderCheckpointPosition(positions))
 	return nil
+}
+
+// renderCheckpointPosition turns the per-source position map that gets
+// persisted as JSON into something readable on a single status row. A
+// single-source move (the common case) renders the bare position, so it reads
+// exactly like pkg/migration's; a multi-source move renders key=position for
+// every source, sorted, because the sources advance independently and the
+// question the field answers — is any of these too far behind to still be
+// resumable? — has to be asked of each one.
+func renderCheckpointPosition(positions map[string]string) string {
+	if len(positions) == 1 {
+		for _, pos := range positions {
+			return pos
+		}
+	}
+	parts := make([]string, 0, len(positions))
+	for _, key := range slices.Sorted(maps.Keys(positions)) {
+		parts = append(parts, key+"="+positions[key])
+	}
+	return strings.Join(parts, ",")
 }
 
 func (r *Runner) Cancel() {
@@ -2121,6 +2490,17 @@ func (r *Runner) getDeltaLenAll() int {
 		total += r.sources[i].replClient.GetDeltaLen()
 	}
 	return total
+}
+
+// feedStatusRow renders the change-feed fields for the status block's binlog
+// row across every source. change.StatusRow merges them into one set of fields
+// (see there for how), so a 16-shard move does not print 16 rows.
+func (r *Runner) feedStatusRow() string {
+	srcs := make([]change.Source, 0, len(r.sources))
+	for i := range r.sources {
+		srcs = append(srcs, r.sources[i].replClient)
+	}
+	return change.StatusRow(srcs...)
 }
 
 // stopPeriodicFlushAll stops periodic flushing on all replication clients.

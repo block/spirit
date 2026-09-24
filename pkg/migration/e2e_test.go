@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/migration/check"
@@ -340,19 +338,10 @@ func TestPreventConcurrentRuns(t *testing.T) {
 		WithDBName(dbName),
 		WithDeferCutOver(),
 		WithRespectSentinel())
-	defer utils.CloseAndLog(m)
-
-	wg := sync.WaitGroup{}
-	wg.Go(func() {
-		err := m.Run(t.Context())
-		require.Error(t, err)
-		if !errors.Is(err, context.Canceled) {
-			require.ErrorContains(t, err, "timed out waiting for sentinel table to be dropped")
-		}
-	})
+	running := startTestRun(t, m.Run, m.Close)
 
 	// Wait until m has reached the sentinel wait phase before starting m2.
-	waitForStatus(t, m, status.WaitingOnSentinelTable)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 
 	m2 := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 		WithDBName(dbName),
@@ -362,8 +351,12 @@ func TestPreventConcurrentRuns(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorContains(t, err, "could not acquire advisory lock")
 
-	m.Cancel()
-	wg.Wait()
+	running.cancel()
+	err = running.wait(t)
+	require.Error(t, err)
+	if !errors.Is(err, context.Canceled) {
+		require.ErrorContains(t, err, "timed out waiting for sentinel table to be dropped")
+	}
 }
 
 // TestMigrationCancelledFromTableModification tests that a migration detects
@@ -378,23 +371,16 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	tt.SeedRows(t, "INSERT INTO t1modification (col1, col2) SELECT RANDOM_BYTES(1024), RANDOM_BYTES(1024)", 100000)
 
 	m := NewTestRunnerFromStatement(t, "ALTER TABLE t1modification ENGINE=InnoDB",
-		WithThreads(1),
-		WithTargetChunkTime(100*time.Millisecond))
+		WithThreads(1))
 
-	wg := sync.WaitGroup{}
-	var gErr error
-	wg.Go(func() {
-		gErr = m.Run(t.Context())
-	})
+	running := startTestRun(t, m.Run, m.Close)
 
-	waitForStatus(t, m, status.CopyRows)
+	waitForStatus(t, m, status.CopyRows, running)
 
 	// Apply instant DDL — migration should detect this and cancel itself.
 	testutils.RunSQL(t, "ALTER TABLE t1modification ADD col3 INT")
 
-	wg.Wait()
-	require.Error(t, gErr)
-	require.NoError(t, m.Close())
+	require.Error(t, running.wait(t))
 }
 
 // TestReservedWordPKMigration is a regression test for issue #828.

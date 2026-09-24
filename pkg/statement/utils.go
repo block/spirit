@@ -123,15 +123,37 @@ func isNumericColumnType(typeName string) bool {
 	return numericColumnTypes[strings.ToLower(typeName)]
 }
 
+// integerColumnTypes are the integer column types, in the parser's canonical
+// spelling (types.TypeStr) — BOOL/BOOLEAN arrive as tinyint and INTEGER as int,
+// so only these spellings appear. They are the numeric types whose stored value
+// is exact: no scale is applied and no type-specific interpretation intervenes,
+// unlike decimal (which pads to its scale) or year.
+var integerColumnTypes = map[string]bool{
+	"tinyint":   true,
+	"smallint":  true,
+	"mediumint": true,
+	"int":       true,
+	"bigint":    true,
+}
+
+// isIntegerColumnType reports whether a column type is one of MySQL's integer
+// types. See integerColumnTypes.
+func isIntegerColumnType(typeName string) bool {
+	return integerColumnTypes[strings.ToLower(typeName)]
+}
+
 // needsQuotes decides whether a column DEFAULT value needs to be wrapped
 // in single quotes when emitted. SQL functions / boolean / NULL
 // literals and parseable numerics are emitted bare; everything else is
 // quoted as a string literal.
 //
-// Caveat: this is heuristic — there's no AST-level "literal kind" tag
-// available at this point, so a bit literal like b'01' or a hex literal
-// like 0x1A is misquoted as a string. The right fix is to thread a
-// DefaultIsLiteral / kind tag through Column from the parser.
+// This is a heuristic over the value's text and is only the fallback: a default
+// whose literal form the parser recorded is emitted from that form instead (see
+// [DefaultKind] and formatColumnDefinition), which is what a text heuristic
+// cannot get right. A hex literal such as 0x1A still reaches here and is
+// misquoted as a string; MySQL never reports a hex literal back, so converging
+// one means converting it to the value the column's type stores rather than
+// recording a form for it.
 func needsQuotes(value string) bool {
 	// Common SQL functions/expressions that don't need quotes
 	upper := strings.ToUpper(value)

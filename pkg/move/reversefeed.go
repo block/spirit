@@ -48,30 +48,44 @@ type ReverseSource struct {
 	Password string             // binlog syncer password
 	Tables   []*table.TableInfo // S-side tables to watch, built on DB
 	// Position is the opaque change.Source position to resume from (captured at
-	// cutover). Empty means start from the source's current head.
+	// cutover). Empty means start from the source's current head. Its encoding
+	// also selects the change-source coordinate scheme, exactly like a
+	// checkpoint resume (see change.NewAutoClient): a GTID set resumes through
+	// the GTID client (and requires the server to still have GTIDs enabled), a
+	// file:offset position through the binlog client, and the empty head-start
+	// case probes the server so the scheme matches what a cutover capture on
+	// that server would have produced.
 	Position string
 }
 
 // ReverseFeedConfig configures a ReverseFeed.
 type ReverseFeedConfig struct {
 	Sources []ReverseSource
-	// Target is the U side (single, unsharded). Target.DB's default database
-	// MUST be U's schema (see ReverseSource.DB).
+	// Target is the U side when the former move source was a single database.
+	// Target.DB's default database MUST be U's schema (see ReverseSource.DB).
+	// Mutually exclusive with Targets.
 	Target applier.Target
+	// Targets is the U side when the former move source was SHARDED: one entry
+	// per former source shard, each with its Vitess-style key range set. Rows
+	// are routed by the WATCHED table's sharding metadata, so every
+	// ReverseSource table must have ShardingColumn and HashFunc set (the source
+	// keyspace's vindex) — NewReverseFeed fails otherwise. Each Targets[i].DB's
+	// default database MUST be that shard's schema (see ReverseSource.DB).
+	// Mutually exclusive with Target.
+	Targets []applier.Target
 	// TargetTables maps each watched (reverse-source) table NAME to the U-side
-	// TableInfo it is written to, built on Target.DB. It is a map, not a slice,
-	// because the names can differ: after a forward cutover the source tables are
-	// renamed to their _old form, so a watched "t1" is written to "t1_old".
+	// TableInfo it is written to, built on Target.DB (with Targets, on any one
+	// shard: the schemas are identical and the name is unqualified, so each
+	// shard's own connection determines where the write lands). It is a map,
+	// not a slice, because the names can differ: after a forward cutover the
+	// source tables are renamed to their _old form, so a watched "t1" is
+	// written to "t1_old".
 	TargetTables map[string]*table.TableInfo
 
 	Logger        *slog.Logger
 	DBConfig      *dbconn.DBConfig
 	Threads       int           // applier write threads; 0 => default (4)
 	FlushInterval time.Duration // 0 => change.DefaultFlushInterval
-	// GTID selects the GTID-based change source (matching the forward move's
-	// --enable-experimental-gtid) instead of binlog file+offset, so the reverse
-	// feed uses the same coordinate scheme the operator chose for the move.
-	GTID bool
 }
 
 // ReverseFeed is a running change-only reverse feed: one change.Source per
@@ -95,16 +109,40 @@ type ReverseFeed struct {
 }
 
 // NewReverseFeed wires the feeds and their shared applier. It does not open any
-// binlog stream; call Start or Run for that.
-func NewReverseFeed(cfg ReverseFeedConfig) (_ *ReverseFeed, err error) {
+// binlog stream — call Start or Run for that — but it does query each source
+// server once: change.NewAutoClient selects (and validates) the change-source
+// coordinate scheme per source, so e.g. a GTID-set Position on a server that no
+// longer has GTIDs enabled fails here with a clear error rather than as a
+// stream failure at Start.
+func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed, err error) {
 	if len(cfg.Sources) == 0 {
 		return nil, errors.New("reverse feed: at least one source is required")
 	}
-	if cfg.Target.DB == nil {
+	if len(cfg.Targets) > 0 && cfg.Target.DB != nil {
+		return nil, errors.New("reverse feed: Target and Targets are mutually exclusive")
+	}
+	if len(cfg.Targets) == 0 && cfg.Target.DB == nil {
 		return nil, errors.New("reverse feed: target DB must be non-nil")
 	}
 	if len(cfg.TargetTables) == 0 {
 		return nil, errors.New("reverse feed: at least one target table is required")
+	}
+	if len(cfg.Targets) > 0 {
+		for ti := range cfg.Targets {
+			if cfg.Targets[ti].DB == nil {
+				return nil, fmt.Errorf("reverse feed: target %d DB must be non-nil", ti)
+			}
+		}
+		// Sharded reverse target: routing decisions come from the watched
+		// tables' sharding metadata, so its absence would strand every row —
+		// fail here rather than fatally at first apply.
+		for si, src := range cfg.Sources {
+			for _, t := range src.Tables {
+				if t.ShardingColumn == "" || t.HashFunc == nil {
+					return nil, fmt.Errorf("reverse feed: source %d table %q has no sharding metadata; a sharded reverse target requires ShardingColumn and HashFunc on every watched table", si, t.TableName)
+				}
+			}
+		}
 	}
 
 	logger := cfg.Logger
@@ -124,12 +162,20 @@ func NewReverseFeed(cfg ReverseFeedConfig) (_ *ReverseFeed, err error) {
 		threads = 4
 	}
 
-	// One applier writing to U, shared across all source feeds.
-	appl, err := applier.NewSingleTargetApplier(cfg.Target, &applier.ApplierConfig{
+	// One applier writing to U, shared across all source feeds. With a sharded
+	// U (Targets), the applier routes each row to the shard whose key range
+	// contains its hash — the exact mirror of the forward move's fan-out.
+	applCfg := &applier.ApplierConfig{
 		DBConfig: dbCfg,
 		Logger:   logger,
 		Threads:  threads,
-	})
+	}
+	var appl applier.Applier
+	if len(cfg.Targets) > 0 {
+		appl, err = applier.NewShardedApplier(cfg.Targets, applCfg)
+	} else {
+		appl, err = applier.NewSingleTargetApplier(cfg.Target, applCfg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reverse feed: create applier: %w", err)
 	}
@@ -164,11 +210,20 @@ func NewReverseFeed(cfg ReverseFeedConfig) (_ *ReverseFeed, err error) {
 			DBConfig:   dbCfg,
 			CancelFunc: rf.onFatal,
 		}
-		var client change.Source
-		if cfg.GTID {
-			client = change.NewGTIDClient(src.DB, src.Addr, src.User, src.Password, appl, clientCfg)
-		} else {
-			client = change.NewBinlogClient(src.DB, src.Addr, src.User, src.Password, appl, clientCfg)
+		// The captured start position's own encoding selects the change
+		// source implementation: it was captured by targetCurrentPosition in
+		// this server's auto-detected coordinate scheme (GTID when the server
+		// has GTIDs enabled), and Start hands it back via StartFromPosition,
+		// so classifying it here guarantees the round-trip parses. Routing
+		// through NewAutoClient (rather than classifying locally) adds the
+		// same validation a checkpoint resume gets — a GTID position on a
+		// server that lost GTIDs is a purpose-built error now, not a stream
+		// failure later — and makes the empty head-start case (Position "",
+		// see ReverseSource) probe the server instead of silently defaulting
+		// to the file+offset scheme.
+		client, cerr := change.NewAutoClient(ctx, src.DB, src.Addr, src.User, src.Password, appl, clientCfg, src.Position)
+		if cerr != nil {
+			return nil, fmt.Errorf("reverse feed: source %d: %w", si, cerr)
 		}
 		// Track the client now so the deferred cleanup closes it — and every
 		// earlier client — if a later subscription or source fails to wire up.
@@ -247,6 +302,29 @@ func (rf *ReverseFeed) Flush(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// AllChangesFlushed reports whether every feed has applied its whole buffer.
+//
+// Flush returning nil is not the same question, and callers that are about to
+// discard the buffer must ask this one instead. A drain may decline to finish —
+// lock contention it could not resolve in its budget, or a drain cut short to
+// bound how long it holds the flush mutex — and reports that by leaving the
+// changes buffered rather than by erroring, because for the periodic flusher
+// "try again next tick" is the right response and failing the whole change is
+// not. Flush's own loop compounds it: it exits once the backlog is merely
+// *trivial*, not empty, so a residual below that threshold returns nil by
+// design.
+//
+// Mirrors the forward cutover's check in cutover.go, which pairs the two calls
+// for exactly this reason.
+func (rf *ReverseFeed) AllChangesFlushed() bool {
+	for _, client := range rf.clients {
+		if !client.AllChangesFlushed() {
+			return false
+		}
+	}
+	return true
 }
 
 // Positions returns each source's current safe-to-resume position, in the same

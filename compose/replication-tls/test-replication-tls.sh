@@ -155,8 +155,7 @@ main() {
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="REQUIRED" \
-      --table="test_table" \
-      --alter="MODIFY COLUMN id BIGINT AUTO_INCREMENT" \
+      --statement="ALTER TABLE test_table MODIFY COLUMN id BIGINT AUTO_INCREMENT" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -179,8 +178,7 @@ main() {
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="DISABLED" \
-      --table="test_table" \
-      --alter="CHANGE COLUMN name name VARCHAR(150) NOT NULL" \
+      --statement="ALTER TABLE test_table CHANGE COLUMN name name VARCHAR(150) NOT NULL" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -207,8 +205,7 @@ main() {
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="SKIP_VERIFY" \
-      --table="test_table" \
-      --alter="MODIFY COLUMN name VARCHAR(100) CHARACTER SET latin1" \
+      --statement="ALTER TABLE test_table MODIFY COLUMN name VARCHAR(100) CHARACTER SET latin1" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -231,8 +228,7 @@ main() {
       --database="$MYSQL_DATABASE" \
       --tls-mode="VERIFY_CA" \
       --tls-ca="mysql-certs/combined-ca.pem" \
-      --table="test_table" \
-      --alter="CHANGE COLUMN created_at created_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" \
+      --statement="ALTER TABLE test_table CHANGE COLUMN created_at created_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -263,8 +259,7 @@ main() {
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="VERIFY_IDENTITY" \
-      --table="test_table" \
-      --alter="ADD INDEX idx_name_email (name, created_at)" \
+      --statement="ALTER TABLE test_table ADD INDEX idx_name_email (name, created_at)" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -291,8 +286,7 @@ main() {
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="PREFERRED" \
-      --table="test_table" \
-      --alter="ADD INDEX idx_preferred_test (created_at)" \
+      --statement="ALTER TABLE test_table ADD INDEX idx_preferred_test (created_at)" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -314,8 +308,7 @@ main() {
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="REQUIRED" \
-      --table="test_table" \
-      --alter="MODIFY COLUMN name TEXT" \
+      --statement="ALTER TABLE test_table MODIFY COLUMN name TEXT" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test?tls=false" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s
@@ -336,8 +329,7 @@ main() {
       --password="$MYSQL_PASSWORD" \
       --database="$MYSQL_DATABASE" \
       --tls-mode="SKIP_VERIFY" \
-      --table="test_table" \
-      --alter="ADD INDEX idx_created_at (created_at)" \
+      --statement="ALTER TABLE test_table ADD INDEX idx_created_at (created_at)" \
       --replica-dsn="root:rootpassword@tcp(127.0.0.1:3401)/test?tls=skip-verify" \
       --replica-max-lag=10s \
       --lock-wait-timeout=2s

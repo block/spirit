@@ -30,7 +30,7 @@ func init() {
 // created in newCopy.
 //
 // Two things are validated for each source 1..N-1:
-//  1. Table set: when moving everything (no explicit --table list), the source
+//  1. Table set: when moving everything (no explicit SourceTables list), the source
 //     must expose exactly the same set of tables as sources[0]. An extra or
 //     missing table is drift. When only a named subset is moved, tables outside
 //     that subset are irrelevant and ignored.

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -232,7 +232,7 @@ func TestCommitLatency_BlockWaitReturnsWhenThrottlingClears(t *testing.T) {
 }
 
 func TestIsAurora_LocalMySQLReturnsFalse(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -254,7 +254,7 @@ func TestNewCommitLatencyThrottler_RejectsBadInputs(t *testing.T) {
 	// constructing the throttler at all when MaxCommitLatency is 0. Use a
 	// non-nil *sql.DB so the error must come from the threshold check, not
 	// the nil-DB guard. sql.Open is lazy and does not actually connect.
-	db, openErr := sql.Open("mysql", "user:pass@tcp(127.0.0.1:0)/db")
+	db, openErr := sql.Open("block-mysql", "user:pass@tcp(127.0.0.1:0)/db")
 	require.NoError(t, openErr)
 	defer utils.CloseAndLog(db)
 

@@ -1,0 +1,255 @@
+package migration
+
+import (
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/copier/copiertest"
+	"github.com/block/spirit/pkg/status"
+	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
+	"github.com/stretchr/testify/require"
+)
+
+// The tests here use a minimal hand-constructed Runner. Progress() reads the
+// copier only during the copy, tolerates a missing chunker, and throttleStatus
+// reads nothing but the throttler, so the fields under test can be exercised
+// without a live migration.
+
+// TestProgressReportsCopyAlongsideTables pins that the runner-wide copy is the
+// sum of Tables: present as soon as the copy chunker exists, counting settled
+// rows rather than the copier's own measure, kept through the later phases,
+// and rendered into Summary from the same reading together with a single ETA
+// read.
+func TestProgressReportsCopyAlongsideTables(t *testing.T) {
+	r := &Runner{copier: copiertest.Stub{
+		ETA: status.ETA{State: status.ETAReady, Duration: time.Minute},
+		// The copier's own measure, which Copy must never report.
+		Copy: status.CopyProgress{RowsCopied: 7, RowsTotal: 9},
+	}}
+	require.Empty(t, r.Progress().Copy)
+
+	c := table.NewMockChunker("t1", 100)
+	r.copyChunker = c
+	require.Equal(t, status.CopyProgress{RowsTotal: 100}, r.Progress().Copy)
+
+	c.Feedback(nil, 0, 40) // rows settled by the applier
+	r.status.Set(status.CopyRows)
+	p := r.Progress()
+	require.Equal(t, status.CopyProgress{RowsCopied: 40, RowsTotal: 100}, p.Copy)
+	require.Equal(t, status.ETA{State: status.ETAReady, Duration: time.Minute}, p.ETA)
+	require.Equal(t, "40/100 40.00% copyRows ETA 1m0s", p.Summary)
+
+	r.status.Set(status.WaitingOnSentinelTable)
+	p = r.Progress()
+	require.Equal(t, status.CopyProgress{RowsCopied: 40, RowsTotal: 100}, p.Copy)
+	require.Empty(t, p.ETA)
+}
+
+func TestProgressReportsResume(t *testing.T) {
+	// Resume exists so a wrapper can tell a recovering run from one that is
+	// starting over — a resumed run walks the whole state machine again, so
+	// CurrentState alone cannot distinguish them (issue #844).
+	r := &Runner{}
+	require.False(t, r.Progress().Resume)
+
+	r.usedResumeFromCheckpoint.Store(true)
+	require.True(t, r.Progress().Resume)
+}
+
+func TestThrottleStatusReportsReasonDuringCopy(t *testing.T) {
+	r := &Runner{}
+
+	// No throttler resolved yet (setup has not reached setupThrottler, or found
+	// nothing to throttle on): not throttled, and no invented load reading.
+	ts := r.throttleStatus(status.CopyRows)
+	require.False(t, ts.Throttled)
+	require.Empty(t, ts.Reason)
+	require.Zero(t, ts.Utilization)
+
+	r.setThrottler(&throttler.Mock{})
+	ts = r.throttleStatus(status.CopyRows)
+	require.True(t, ts.Throttled)
+	require.Equal(t, "mock throttler (always throttled)", ts.Reason)
+}
+
+func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
+	// The checksum only honours load signals (see checksum's loadOnlyThrottler),
+	// so status must not report it as paused on a binary signal it is ignoring.
+	// The mock is binary-only, so it throttles the copy but not the checksum.
+	r := &Runner{}
+	r.setThrottler(&throttler.Mock{})
+
+	require.True(t, r.throttleStatus(status.CopyRows).Throttled)
+
+	checksumThrottle := r.throttleStatus(status.Checksum)
+	require.False(t, checksumThrottle.Throttled,
+		"a checksum must not be reported as throttled by a signal it does not honour")
+	require.Empty(t, checksumThrottle.Reason)
+}
+
+// Inactive sentinel waiting and non-checksum phases never report load throttling.
+func TestThrottleStatusIsZeroInUnpacedPhases(t *testing.T) {
+	r := &Runner{}
+	r.setThrottler(&throttler.Mock{}) // always throttled
+
+	unpaced := []status.State{
+		status.Initial,
+		status.ApplyChangeset,
+		status.RestoreSecondaryIndexes,
+		status.AnalyzeTable,
+		status.PostChecksum,
+		status.WaitingOnSentinelTable,
+		status.CutOver,
+		status.ReverseWindow,
+		status.Close,
+		status.ErrCleanup,
+	}
+	for _, state := range unpaced {
+		t.Run(state.String(), func(t *testing.T) {
+			require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(state),
+				"nothing paces itself against a throttler in %s, so status must not report it as paused", state)
+		})
+	}
+}
+
+// TestProgressPolledConcurrentlyWithRun covers the seam the new Progress fields
+// opened up: an API caller polls Progress() from its own goroutine while setup is
+// still writing the state those fields report. Under -race this fails if the
+// throttler is read unsynchronized (hence throttlerMu) — the resume flag is
+// atomic for the same reason, written by resumeFromCheckpoint during setup.
+//
+// WithTestThrottler is what makes the write side real: without any replica DSN
+// and off Aurora, setupThrottler finds nothing to throttle on and never assigns,
+// so there would be no concurrent write to race with. It also lets the test
+// assert that a throttled copy reports its reason through the API.
+func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
+	tt := testutils.NewTestTable(t, "progresspoll",
+		`CREATE TABLE progresspoll (
+			id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			pad VARCHAR(100)
+		)`)
+	// A handful of rows is enough: the test is about the polling seam, and the
+	// test throttler paces the copy at a second per chunk.
+	tt.SeedRows(t, "INSERT INTO progresspoll (pad) SELECT 'a'", 8)
+
+	m := NewTestRunner(t, "progresspoll", "ENGINE=InnoDB", WithTestThrottler())
+
+	// Recorded off the test goroutine, so assert on them after the join rather
+	// than calling require here (testifylint go-require).
+	var sawThrottledCopy, sawReason atomic.Bool
+	done := make(chan struct{})
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				p := m.Progress()
+				if p.CurrentState == status.CopyRows && p.Throttle.Throttled {
+					sawThrottledCopy.Store(true)
+					if p.Throttle.Reason == "mock throttler (always throttled)" {
+						sawReason.Store(true)
+					}
+				}
+				_ = m.Status()
+			}
+		}
+	}()
+
+	runErr := m.Run(t.Context())
+	close(done)
+	<-pollDone
+	require.NoError(t, runErr)
+	require.NoError(t, m.Close())
+
+	require.True(t, sawThrottledCopy.Load(),
+		"a copy paced by the always-throttled test throttler must report Throttled through the API")
+	require.True(t, sawReason.Load(), "and must carry the throttler's reason with it")
+
+	// After the run, nothing is being paced: the status API must not describe a
+	// finished migration as paused, however the throttler answers.
+	p := m.Progress()
+	require.False(t, p.Resume)
+	require.Equal(t, status.ThrottleStatus{}, p.Throttle)
+}
+
+type recordingChecker struct {
+	checksum.MockChecker
+	got throttler.Throttler
+}
+
+func (c *recordingChecker) SetThrottler(t throttler.Throttler) { c.got = t }
+
+func TestSetThrottlerOnPhasesReachesChecker(t *testing.T) {
+	r := setupRunnerForChecksumTest(t, "throttler_wiring")
+	advanceRunnerToChecksumWatermarks(t, r)
+	checker := &recordingChecker{}
+	r.checker = checker
+	resolved := &throttler.Noop{}
+	r.throttlerMu.Lock()
+	r.throttler = resolved
+	r.throttlerMu.Unlock()
+	r.setThrottlerOnPhases()
+	require.Same(t, resolved, checker.got, "resolved throttler must reach the checksum phase")
+}
+
+type activeContinuousChecker struct {
+	checksum.MockChecker
+	active bool
+}
+
+func (c *activeContinuousChecker) ContinuousActive() bool { return c.active }
+
+func TestContinuousChecksumThrottleStatus(t *testing.T) {
+	checker := &activeContinuousChecker{}
+	r := &Runner{checker: checker}
+	r.setThrottler(&gradualTestThrottler{throttled: true})
+	require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(status.WaitingOnSentinelTable))
+	checker.active = true
+	require.True(t, r.throttleStatus(status.WaitingOnSentinelTable).Throttled)
+	r.setThrottler(&throttler.Mock{})
+	require.False(t, r.throttleStatus(status.WaitingOnSentinelTable).Throttled, "replica/binary signals do not pace checksum")
+	checker.active = false
+	require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(status.WaitingOnSentinelTable))
+}
+
+type statusOnlyFeed struct{ change.Source }
+
+func (*statusOnlyFeed) GetDeltaLen() int { return 0 }
+func (*activeContinuousChecker) GetProgress() status.ChecksumProgress {
+	return status.ChecksumProgress{RowsChecked: 25, RowsTotal: 100}
+}
+
+type explainedLoadThrottler struct{ gradualTestThrottler }
+
+func (*explainedLoadThrottler) ThrottleReason() string { return "server load" }
+
+func TestContinuousChecksumStatusSurfaces(t *testing.T) {
+	checker := &activeContinuousChecker{}
+	r := &Runner{checker: checker, replClient: &statusOnlyFeed{}, changes: []*tableChange{{table: &table.TableInfo{SchemaName: "test"}}}}
+	r.setThrottler(&explainedLoadThrottler{gradualTestThrottler{throttled: true}})
+	r.status.Set(status.WaitingOnSentinelTable)
+	for _, active := range []bool{false, true, false} {
+		checker.active = active
+		progress, block := r.Progress(), r.Status()
+		require.Equal(t, active, progress.Throttle.Throttled)
+		if active {
+			require.Equal(t, checker.GetProgress(), progress.Checksum)
+			require.Contains(t, progress.Summary, "25/100")
+			require.Contains(t, block, "checksum")
+			require.Contains(t, block, "throttle")
+		} else {
+			require.Zero(t, progress.Checksum)
+			require.Equal(t, "Waiting on Sentinel Table", progress.Summary)
+			require.NotContains(t, block, "checksum")
+			require.NotContains(t, block, "throttle")
+		}
+	}
+}

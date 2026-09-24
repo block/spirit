@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -221,7 +221,7 @@ func TestNewAuroraThreadsThrottler_RejectsNilDB(t *testing.T) {
 }
 
 func TestThreadsRunningQuery_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -235,7 +235,7 @@ func TestThreadsRunningQuery_LocalMySQL(t *testing.T) {
 }
 
 func TestRedoAwareThreadsQuery_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -250,64 +250,13 @@ func TestRedoAwareThreadsQuery_LocalMySQL(t *testing.T) {
 }
 
 func TestCanReadRedoAwareThreads_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
 	// The test user has SELECT on performance_schema.*, so the probe succeeds —
 	// this is the path AuroraSetup.Build takes to pick the redo-aware signal.
 	require.NoError(t, CanReadRedoAwareThreads(t.Context(), db))
-}
-
-func TestResolveWriteThreads_PassThroughPositive(t *testing.T) {
-	// A positive value is returned unchanged without touching the DB, so a
-	// nil DB is safe here.
-	n, err := ResolveWriteThreads(t.Context(), nil, 8, discardLogger())
-	require.NoError(t, err)
-	require.Equal(t, 8, n)
-}
-
-func TestResolveWriteThreads_RejectsNegative(t *testing.T) {
-	_, err := ResolveWriteThreads(t.Context(), nil, -1, discardLogger())
-	require.ErrorContains(t, err, "non-negative")
-}
-
-func TestResolveWriteThreads_NilDBWhenAutoSizing(t *testing.T) {
-	// Auto-sizing (requested==0) must reject a nil DB rather than panic.
-	_, err := ResolveWriteThreads(t.Context(), nil, 0, discardLogger())
-	require.ErrorContains(t, err, "no database connection")
-}
-
-func TestResolveWriteThreads_NonAuroraUsesDefault_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	// 0 means "auto-size". On a stock (non-Aurora) MySQL there is no reliable
-	// vCPU signal, so auto-sizing falls back to the default rather than guess
-	// or fail.
-	n, err := ResolveWriteThreads(t.Context(), db, 0, discardLogger())
-	require.NoError(t, err)
-	require.Equal(t, DefaultWriteThreads, n)
-}
-
-func TestWriteThreadVCPUReserve(t *testing.T) {
-	// Auto-sizing on Aurora resolves to max(1, vCPUs - WriteThreadVCPUReserve).
-	// The Aurora probe needs a real Aurora instance, so this pins the reserve
-	// and the resulting vCPU->threads mapping (including the floor at 1) that the
-	// auto-size branch of ResolveWriteThreads applies.
-	require.Equal(t, 2, WriteThreadVCPUReserve, "reserve is documented as 2 vCPUs in migrate.md/move.md and the flag help")
-	for _, tc := range []struct {
-		vCPUs, want int
-	}{
-		{1, 1}, // floors at 1
-		{2, 1}, // r6g.large: 2 vCPUs -> 1 applier
-		{3, 1},
-		{4, 2},
-		{8, 6},
-	} {
-		require.Equalf(t, tc.want, max(1, tc.vCPUs-WriteThreadVCPUReserve), "vCPUs=%d", tc.vCPUs)
-	}
 }
 
 func TestResolveMaxWriteThreads(t *testing.T) {
@@ -330,15 +279,36 @@ func TestResolveMaxWriteThreads(t *testing.T) {
 }
 
 func TestAuroraVCPUs_LocalMySQL(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
 	// @@innodb_buffer_pool_instances exists on stock MySQL too (it just isn't
 	// pinned to the vCPU count there). The query and positive-value check should
-	// still succeed — this guards the shared helper used by both the
-	// threads throttler and write-thread auto-sizing.
+	// still succeed — this guards the shared helper used by both the threads
+	// throttler and the autoscaler's instance-derived thread counts.
 	vCPUs, err := AuroraVCPUs(t.Context(), db)
 	require.NoError(t, err)
 	require.Positive(t, vCPUs)
+}
+
+func TestSamplingCancelIsShutdownError(t *testing.T) {
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	// Pin the exact error shape the poll loop sees at teardown: a cancelled
+	// context makes UpdateLag fail with context.Canceled wrapped inside the
+	// "sampling Aurora threads" message, and isShutdownError must classify it
+	// as shutdown so run() exits quietly instead of logging at Error level
+	// (which monitoring pipelines surface as an incident).
+	a := newTestAuroraThreads(t, 8, redoAwareMode)
+	a.db = db
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err = a.UpdateLag(ctx)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "sampling Aurora threads (redo-aware)")
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, isShutdownError(ctx, err))
 }

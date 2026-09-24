@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	mysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,6 +35,7 @@ func (a *noopDistributedApplier) UpsertRows(context.Context, *table.ColumnMappin
 
 func (a *noopDistributedApplier) Wait(context.Context) error { return nil }
 func (a *noopDistributedApplier) Stop() error                { return nil }
+func (a *noopDistributedApplier) Stats() applier.Stats       { return applier.Stats{} }
 func (a *noopDistributedApplier) GetTargets() []applier.Target {
 	return nil
 }
@@ -54,16 +55,19 @@ func (s *noopChangeSource) FlushUnderTableLock(context.Context, []*dbconn.TableL
 }
 func (s *noopChangeSource) BlockWait(context.Context) error { return nil }
 func (s *noopChangeSource) GetDeltaLen() int                { return 0 }
+
+func (s *noopChangeSource) FlushResidual() (int, int) { return 0, 0 }
 func (s *noopChangeSource) SetWatermarkOptimization(context.Context, bool) error {
 	return nil
 }
 func (s *noopChangeSource) StartPeriodicFlush(context.Context, time.Duration) {}
 func (s *noopChangeSource) StopPeriodicFlush()                                {}
 func (s *noopChangeSource) AllChangesFlushed() bool                           { return true }
+func (s *noopChangeSource) Stop()                                             {}
 func (s *noopChangeSource) Close()                                            {}
 
 func TestDistributedCheckerHonorsYieldTimeoutConfig(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -226,7 +230,7 @@ func TestFixCorruptWithApplier(t *testing.T) {
 // DistributedChecker.Run returns hard errors immediately (no retry
 // continue), so the poisoned-retry path is reached by reusing the checker
 // for a subsequent Run — the same reuse pattern as move's
-// continuous-checksum loop. The second Run must fail again on the
+// lockless-checksum loop. The second Run must fail again on the
 // still-divergent data, not return nil.
 func TestDistributedRetryDoesNotVacuouslyPass(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())

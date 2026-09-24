@@ -3,8 +3,8 @@ package statement
 import (
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -460,4 +460,304 @@ func TestDiffIntegrationDescIndex(t *testing.T) {
 	stmts, err = source.Diff(target, nil)
 	require.NoError(t, err)
 	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationSubpartitionNoSpuriousDiff verifies that a subpartitioned
+// table does not diff against the definition it was created from. The live
+// definition differs cosmetically in two ways Diff has to absorb: the partition
+// expression comes back lowercased and backtick-quoted, and every partition
+// carries an `ENGINE = InnoDB` clause the authored SQL never wrote.
+//
+// This is a regression test. Comparing the per-partition ENGINE made every
+// partitioned table repartition itself on every run — and because the emitted
+// PARTITION BY had no SUBPARTITION BY clause, applying that "no-op" silently
+// dropped the table's subpartitioning.
+func TestDiffIntegrationSubpartitionNoSpuriousDiff(t *testing.T) {
+	const authoredSQL = "CREATE TABLE diff_subpart (dt date NOT NULL, PRIMARY KEY (dt)) " +
+		"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (dayofmonth(dt)) SUBPARTITIONS 2 " +
+		"(PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)"
+	tt := testutils.NewTestTable(t, "diff_subpart", authoredSQL)
+
+	target, err := ParseCreateTable(authoredSQL)
+	require.NoError(t, err)
+
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "SUBPARTITION BY HASH", "precondition: the table is subpartitioned")
+	require.Contains(t, live, "ENGINE = InnoDB", "precondition: MySQL prints per-partition ENGINE")
+
+	source, err := ParseCreateTable(live)
+	require.NoError(t, err)
+	stmts, err := source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts, "live definition must not diff against the SQL it was created from")
+
+	requireNoSelfDiff(t, tt.DB, tt.Name)
+}
+
+// TestDiffIntegrationSubpartitionChange verifies that a genuine subpartitioning
+// change is emitted in full and actually applies: the REMOVE PARTITIONING +
+// PARTITION BY pair must carry the SUBPARTITION BY clause, or the table comes
+// back partitioned but no longer subpartitioned. The re-diff then converges.
+func TestDiffIntegrationSubpartitionChange(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_subpart_chg",
+		"CREATE TABLE diff_subpart_chg (dt date NOT NULL, PRIMARY KEY (dt)) "+
+			"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (dayofmonth(dt)) SUBPARTITIONS 2 "+
+			"(PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)")
+
+	const targetSQL = "CREATE TABLE diff_subpart_chg (dt date NOT NULL, PRIMARY KEY (dt)) " +
+		"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (dayofmonth(dt)) SUBPARTITIONS 4 " +
+		"(PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)"
+	target, err := ParseCreateTable(targetSQL)
+	require.NoError(t, err)
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 2, "a subpartitioning change needs REMOVE PARTITIONING first")
+	require.Equal(t, "ALTER TABLE `diff_subpart_chg` REMOVE PARTITIONING", stmts[0].Statement)
+	require.Equal(t,
+		"ALTER TABLE `diff_subpart_chg` PARTITION BY RANGE (YEAR(`dt`)) "+
+			"SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 4 "+
+			"(PARTITION `p0` VALUES LESS THAN (2020), PARTITION `p1` VALUES LESS THAN MAXVALUE)",
+		stmts[1].Statement)
+
+	// Execute exactly what Diff emitted, as the Runner would.
+	for _, stmt := range stmts {
+		_, err = tt.DB.ExecContext(t.Context(), stmt.Statement)
+		require.NoError(t, err)
+	}
+	postAlter := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, postAlter, "SUBPARTITION BY HASH (dayofmonth(`dt`))", "subpartitioning must survive")
+	require.Contains(t, postAlter, "SUBPARTITIONS 4")
+
+	// Re-diff: the schemas now converge.
+	source, err := ParseCreateTable(postAlter)
+	require.NoError(t, err)
+	stmts, err = source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationSubpartitionNamesAndComments verifies the high-fidelity
+// shape: explicitly named subpartitions plus partition/subpartition comments.
+// MySQL echoes explicit subpartition names back from SHOW CREATE TABLE, and
+// pushes a partition-level comment down onto the subpartitions that lack one,
+// so both sides have to model that to converge — and a repartition has to
+// re-emit the names and comments rather than silently reset them.
+func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
+	const authoredSQL = "CREATE TABLE diff_subpart_named (dt date NOT NULL, PRIMARY KEY (dt)) " +
+		"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY KEY (dt) " +
+		"(PARTITION p0 VALUES LESS THAN (2020) COMMENT 'pc0' (SUBPARTITION s0 COMMENT 'sc0', SUBPARTITION s1), " +
+		"PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))"
+	tt := testutils.NewTestTable(t, "diff_subpart_named", authoredSQL)
+
+	target, err := ParseCreateTable(authoredSQL)
+	require.NoError(t, err)
+	source, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+	require.NoError(t, err)
+	stmts, err := source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts, "named subpartitions and comments must not diff against themselves")
+
+	// Now move p0's boundary. The repartition has to carry every subpartition
+	// name and comment through, or they are silently lost.
+	const movedSQL = "CREATE TABLE diff_subpart_named (dt date NOT NULL, PRIMARY KEY (dt)) " +
+		"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY KEY (dt) " +
+		"(PARTITION p0 VALUES LESS THAN (2030) COMMENT 'pc0' (SUBPARTITION s0 COMMENT 'sc0', SUBPARTITION s1), " +
+		"PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))"
+	moved, err := ParseCreateTable(movedSQL)
+	require.NoError(t, err)
+
+	stmts = diffLiveTable(t, tt.DB, tt.Name, movedSQL)
+	require.Len(t, stmts, 2)
+	for _, stmt := range stmts {
+		_, err = tt.DB.ExecContext(t.Context(), stmt.Statement)
+		require.NoError(t, err)
+	}
+	postAlter := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, postAlter, "SUBPARTITION BY KEY")
+	require.Contains(t, postAlter, "SUBPARTITION s0 COMMENT = 'sc0'")
+	require.Contains(t, postAlter, "SUBPARTITION s1 COMMENT = 'pc0'")
+	require.Contains(t, postAlter, "VALUES LESS THAN (2030)")
+
+	// Re-diff: the schemas now converge.
+	source, err = ParseCreateTable(postAlter)
+	require.NoError(t, err)
+	stmts, err = source.Diff(moved, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationTableCollationChangeConverges verifies that changing a
+// table's default collation converges in a single apply when a column
+// inherits the live table's default. MySQL's table-level DEFAULT COLLATE
+// clause only affects columns added later, so the diff must include a MODIFY
+// COLUMN for the inheriting column alongside the table-option change — a diff
+// that emits only the table option leaves the column on the old collation and
+// the same drift resurfaces on the next plan.
+func TestDiffIntegrationTableCollationChangeConverges(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_collation_converge",
+		"CREATE TABLE diff_collation_converge (id varchar(512) NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	const targetSQL = "CREATE TABLE diff_collation_converge (id varchar(512) COLLATE utf8mb4_general_ci NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_converge` MODIFY COLUMN `id` varchar(512) COLLATE utf8mb4_general_ci NOT NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	var collation string
+	err := tt.DB.QueryRowContext(t.Context(),
+		"SELECT COLLATION_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'id'",
+		tt.Name).Scan(&collation)
+	require.NoError(t, err)
+	require.Equal(t, "utf8mb4_general_ci", collation)
+
+	// Re-diff: converged in one apply — nothing left over.
+	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationInheritedColumnFollowsNewTableCollation verifies the
+// same convergence when the target column also inherits its table default:
+// the emitted MODIFY carries no explicit COLLATE, and MySQL resolves it
+// against the new table default set by the table-option clause in the same
+// ALTER, so the column lands on the target collation in one apply.
+func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_collation_inherit",
+		"CREATE TABLE diff_collation_inherit (id int NOT NULL, name varchar(100), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	const targetSQL = "CREATE TABLE diff_collation_inherit (id int NOT NULL, name varchar(100), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_inherit` MODIFY COLUMN `name` varchar(100) NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	var collation string
+	err := tt.DB.QueryRowContext(t.Context(),
+		"SELECT COLLATION_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'name'",
+		tt.Name).Scan(&collation)
+	require.NoError(t, err)
+	require.Equal(t, "utf8mb4_general_ci", collation)
+
+	// Re-diff: converged in one apply — nothing left over.
+	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Nil(t, stmts)
+}
+
+// A schema file declaring `active BOOLEAN NOT NULL DEFAULT FALSE` and the table
+// MySQL creates from it are the same table, so a diff between them must be
+// empty. MySQL stores the keyword as the integer and reports `tinyint(1) NOT
+// NULL DEFAULT '0'`; a diff that read those two forms as different would emit a
+// MODIFY COLUMN that stores the same '0' and then diff again on the next run,
+// with no apply able to end it.
+func TestDiffIntegrationBooleanKeywordDefaultCreatedAsDeclared(t *testing.T) {
+	const declaredSQL = "CREATE TABLE diff_bool_keyword_default (" +
+		"id bigint unsigned NOT NULL AUTO_INCREMENT, " +
+		"cancel_requested boolean NOT NULL DEFAULT FALSE, " +
+		"is_enabled boolean NOT NULL DEFAULT TRUE, " +
+		"retries int NOT NULL DEFAULT FALSE, " +
+		"PRIMARY KEY (id))"
+
+	tt := testutils.NewTestTable(t, "diff_bool_keyword_default", declaredSQL)
+
+	// MySQL really does report the integer, which is what makes the fold
+	// necessary rather than cosmetic.
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "`cancel_requested` tinyint(1) NOT NULL DEFAULT '0'")
+	require.Contains(t, live, "`is_enabled` tinyint(1) NOT NULL DEFAULT '1'")
+	require.Contains(t, live, "`retries` int NOT NULL DEFAULT '0'")
+
+	// The table was created from this exact declaration, so there is nothing
+	// left to apply.
+	stmts := diffLiveTable(t, tt.DB, tt.Name, declaredSQL)
+	require.Nil(t, stmts)
+}
+
+// Changing a keyword default is a real change, and it converges in one apply:
+// the diff is emitted, MySQL stores the new value, and a re-diff is clean.
+func TestDiffIntegrationBooleanKeywordDefaultChange(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_bool_keyword_change",
+		"CREATE TABLE diff_bool_keyword_change (id int NOT NULL, active boolean NOT NULL DEFAULT FALSE, PRIMARY KEY (id))")
+
+	const targetSQL = "CREATE TABLE diff_bool_keyword_change (id int NOT NULL, active boolean NOT NULL DEFAULT TRUE, PRIMARY KEY (id))"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+
+	execStatements(t, tt.DB, stmts)
+	var columnDefault string
+	err := tt.DB.QueryRowContext(t.Context(),
+		"SELECT COLUMN_DEFAULT FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'active'",
+		tt.Name).Scan(&columnDefault)
+	require.NoError(t, err)
+	require.Equal(t, "1", columnDefault)
+
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+}
+
+// Every type that stores the keyword as exactly 1/0 folds. MySQL quotes the
+// stored value on all of them except bit, which reports a bit literal, so what
+// the fold records is the form Spirit emits rather than the one the server
+// prints. Each column here is created from the declaration under test, so the
+// reading is the server's own and the table has nothing left to apply.
+func TestDiffIntegrationBooleanKeywordDefaultAcrossFoldingTypes(t *testing.T) {
+	const declaredSQL = "CREATE TABLE diff_bool_keyword_folding_types (" +
+		"unscaled decimal(4,0) NOT NULL DEFAULT TRUE, " +
+		"dbl double NOT NULL DEFAULT TRUE, " +
+		"flt float NOT NULL DEFAULT FALSE, " +
+		"txt varchar(8) NOT NULL DEFAULT FALSE, " +
+		"fixed char(8) NOT NULL DEFAULT TRUE, " +
+		"vbin varbinary(8) NOT NULL DEFAULT FALSE, " +
+		"bits bit(1) NOT NULL DEFAULT TRUE, " +
+		"widebits bit(8) NOT NULL DEFAULT FALSE)"
+	tt := testutils.NewTestTable(t, "diff_bool_keyword_folding_types", declaredSQL)
+
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "`unscaled` decimal(4,0) NOT NULL DEFAULT '1'")
+	require.Contains(t, live, "`dbl` double NOT NULL DEFAULT '1'")
+	require.Contains(t, live, "`flt` float NOT NULL DEFAULT '0'")
+	require.Contains(t, live, "`txt` varchar(8) NOT NULL DEFAULT '0'")
+	require.Contains(t, live, "`fixed` char(8) NOT NULL DEFAULT '1'")
+	require.Contains(t, live, "`vbin` varbinary(8) NOT NULL DEFAULT '0'")
+	// A bit column reports the value as a bit literal in its minimal form,
+	// independent of the column's width.
+	require.Contains(t, live, "`bits` bit(1) NOT NULL DEFAULT b'1'")
+	require.Contains(t, live, "`widebits` bit(8) NOT NULL DEFAULT b'0'")
+
+	require.Nil(t, diffLiveTable(t, tt.DB, tt.Name, declaredSQL))
+}
+
+// The types that store the keyword as something other than 1/0, with the
+// reading that puts each out of scope and the diff it still emits as a result.
+// Asserting the leftover diff alongside the reading is deliberate: a reading on
+// its own does not say whether the exclusion it justifies is the right one, and
+// these three are excluded for reasons this layer cannot fix — scale and width
+// padding belong to numeric and string canonicalization.
+//
+// enum and set are excluded too but are deliberately not fixtures here. They
+// have no single reading to record: through 8.4 the keyword resolves to a
+// member index and from 9.7 to a member value, so enum('0','1') DEFAULT TRUE
+// stores '0' on one and '1' on the other. A fixture would have to assert one
+// of the two and fail on the rest of the supported matrix. That the fold
+// skips them is pinned without a server in
+// TestBooleanKeywordDefaultLeavesOtherTypesAlone.
+func TestDiffIntegrationBooleanKeywordDefaultOnExcludedTypes(t *testing.T) {
+	const declaredSQL = "CREATE TABLE diff_bool_keyword_excluded_types (" +
+		"scaled decimal(4,2) NOT NULL DEFAULT TRUE, " +
+		"yr year NOT NULL DEFAULT TRUE, " +
+		"bin binary(4) NOT NULL DEFAULT TRUE)"
+	tt := testutils.NewTestTable(t, "diff_bool_keyword_excluded_types", declaredSQL)
+
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "`scaled` decimal(4,2) NOT NULL DEFAULT '1.00'")
+	require.Contains(t, live, "`yr` year NOT NULL DEFAULT '2001'")
+	require.Contains(t, live, "`bin` binary(4) NOT NULL DEFAULT '1\\0\\0\\0'")
+
+	// The table was created from this very declaration, so every statement here
+	// re-stores a value the column already holds.
+	stmts := diffLiveTable(t, tt.DB, tt.Name, declaredSQL)
+	require.Len(t, stmts, 1)
+	for _, col := range []string{"scaled", "yr", "bin"} {
+		require.Contains(t, stmts[0].Statement, "MODIFY COLUMN `"+col+"`")
+	}
 }

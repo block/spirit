@@ -9,12 +9,26 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The suite runs twice: once against the GTID-enabled base compose.yml
+      # and once with the nogtid.yml overlay. The change-source coordinate
+      # scheme is auto-detected from the server, so the two runs exercise the
+      # resume/checkpoint paths over both schemes (GTID set, and binlog
+      # file+offset).
+      matrix:
+        include:
+          - name: gtid
+            compose-files: -f compose.yml
+          - name: nogtid
+            compose-files: -f compose.yml -f nogtid.yml
+    name: build (${{ matrix.name }})
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
       - name: Detect non-docs changes
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           predicate-quantifier: 'every'
@@ -24,14 +38,16 @@ jobs:
               - '!docs/**'
 
       # Runs the version-agnostic "single-version" suite
-      # (pkg/migration/{resume,singleversion,lint}_test.go, behind
-      # `//go:build singleversion`) once, against the base 8.0.45 image. The
+      # (pkg/migration/{resume,singleversion}_test.go, behind
+      # `//go:build singleversion`) against the base 8.0.45 image. The
       # other version-matrix jobs omit the `singleversion` build tag and so skip
       # these files. See the singleversion-test service in compose/compose.yml
       # and the header of singleversion_test.go.
       - name: Single-version suite
         if: steps.filter.outputs.code == 'true'
-        run: docker compose -f compose.yml up mysql singleversion-test --abort-on-container-exit --exit-code-from singleversion-test
+        env:
+          COMPOSE_FILES: ${{ matrix.compose-files }}
+        run: docker compose $COMPOSE_FILES up mysql singleversion-test --abort-on-container-exit --exit-code-from singleversion-test
         working-directory: compose
 
       - name: Skip — documentation-only change

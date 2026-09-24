@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/format"
+	"github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/format"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
 )
 
 type ZeroDateLinter struct{}
@@ -64,10 +64,20 @@ func (l *ZeroDateLinter) checkColumnZeroDate(column *ast.ColumnDef, tableName st
 			nullable = true
 		case ast.ColumnOptionDefaultValue:
 			if option.Expr != nil {
+				// Unwrap the expression-default parentheses so
+				// DEFAULT ('0000-00-00') is inspected like DEFAULT '0000-00-00'.
+				expr := option.Expr
+				for {
+					paren, ok := expr.(*ast.ParenthesesExpr)
+					if !ok {
+						break
+					}
+					expr = paren.Expr
+				}
 				// Extract default value from expression using Restore
 				var sb strings.Builder
 				rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags|format.RestoreStringWithoutCharset, &sb)
-				err := option.Expr.Restore(rCtx)
+				err := expr.Restore(rCtx)
 				if err == nil {
 					val := sb.String()
 					// Remove surrounding quotes if present for string literals
@@ -94,7 +104,7 @@ func (l *ZeroDateLinter) checkColumnZeroDate(column *ast.ColumnDef, tableName st
 					Column: &columnName,
 				},
 				Severity: SeverityWarning,
-				Message:  fmt.Sprintf("column %s with type %q has a zero default value", columnName, column.Tp.String()),
+				Message:  fmt.Sprintf("column %q with type %q has a zero default value", columnName, column.Tp.String()),
 			}
 		}
 	}

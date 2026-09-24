@@ -2,11 +2,34 @@ package check
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/mysql"
 )
+
+// requireCurrentColumnTypes reports whether Resources carries the table metadata
+// the ENUM/SET checks need to compare a redeclared column against its current
+// definition.
+//
+// A ScopeStatement caller may not have the table's DDL to build it from, so the
+// check is skipped rather than guessing at the current type (see
+// ScopeStatement). Every other scope runs inside a migration, which loads the
+// table before it runs any check: metadata missing there means these three
+// guards against a data-corrupting ENUM/SET change would not run at all, so the
+// check fails rather than passing quietly.
+func requireCurrentColumnTypes(r Resources, logger *slog.Logger, checkName string) (bool, error) {
+	if r.Table != nil {
+		return true, nil
+	}
+	if r.scope&ScopeStatement != 0 {
+		logger.Debug("skipping check: no table metadata supplied, cannot compare against the current column types",
+			"check", checkName)
+		return false, nil
+	}
+	return false, fmt.Errorf("check %s cannot run: the table's current column types were not loaded", checkName)
+}
 
 // isEnumOrSetType returns true if the MySQL type string represents an ENUM or SET type.
 func isEnumOrSetType(mysqlType string) bool {

@@ -50,7 +50,7 @@ func TestDatetimeIndexPositionLinter_CreateTable_TimestampNotLast(t *testing.T) 
 
 	require.Len(t, violations, 1)
 	require.Equal(t, SeverityWarning, violations[0].Severity)
-	require.Contains(t, violations[0].Message, "TIMESTAMP")
+	require.Contains(t, violations[0].Message, `"TIMESTAMP" column "created_at"`)
 	require.Equal(t, "created_at", *violations[0].Location.Column)
 }
 
@@ -257,12 +257,12 @@ func TestDatetimeIndexPositionLinter_AlterAddUnnamedBadIndex(t *testing.T) {
 
 	require.Len(t, violations, 1)
 	require.Equal(t, SeverityWarning, violations[0].Severity)
-	require.Contains(t, violations[0].Message, "Unnamed index on (updated_at, attempt)")
+	require.Contains(t, violations[0].Message, `Unnamed index on ("updated_at", "attempt")`)
 	require.NotContains(t, violations[0].Message, `Index ""`)
 	require.Nil(t, violations[0].Location.Index, "Location.Index should be nil when the index has no name")
 	require.Equal(t, "updated_at", *violations[0].Location.Column)
 	require.NotNil(t, violations[0].Suggestion)
-	require.Contains(t, *violations[0].Suggestion, "unnamed index on (updated_at, attempt)")
+	require.Contains(t, *violations[0].Suggestion, `unnamed index on ("updated_at", "attempt")`)
 }
 
 func TestDatetimeIndexPositionLinter_AlterAddGoodIndex(t *testing.T) {

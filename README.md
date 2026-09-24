@@ -6,7 +6,7 @@ It is similar to gh-ost except:
 - It only supports MySQL 8.0 and higher
 - It is multi-threaded in both the row-copying and the binlog applying phase
 
-The goal of Spirit is to apply schema changes much faster than gh-ost. This makes it unsuitable in the following scenarios:
+The goal of Spirit is to apply schema changes as fast as possible, while also preserving safety. This makes it unsuitable in the following scenarios:
 - You require read replicas to be less than 10s behind the writer
 - You require support for older versions of MySQL
 
@@ -20,16 +20,14 @@ Quick Links:
 
 ## Optimizations
 
-The following are some of the optimizations that make Spirit faster than gh-ost:
+The following are some of the optimizations that make Spirit fast:
 
 ### Dynamic Chunking
 
 Rather than accept a fixed chunk size (such as 1000 rows), Spirit dynamically adjusts the chunk size against a target. This is both safer for very wide tables with a lot of indexes and faster for smaller tables. The target depends on the copier:
 
-- The **default buffered copier** reads full rows into memory, so it sizes each chunk against an in-memory **byte budget** (`--target-chunk-size`, default 16 MiB). Time is a poor signal here — the buffered copier's measured chunk time includes waiting behind the write queue, which inflates under load independently of chunk size — whereas a byte budget is a stable property of the data and keeps chunks large enough to engage InnoDB/Aurora read-ahead.
-- The **checksum** and the legacy `--unbuffered` copier size each chunk against a **target time** (such as 500ms), configured via [`--target-chunk-time`](docs/migrate.md#target-chunk-time).
-
-500ms is quite "high" for traditional MySQL environments, but remember _Spirit does not support read-replicas_. This helps it copy chunks as efficiently as possible.
+- The **copier** reads full rows into memory, so it sizes each chunk against an in-memory **byte budget** (`--target-chunk-size`, default 16 MiB). Time is a poor signal here — the copier's measured chunk time includes waiting behind the write queue, which inflates under load independently of chunk size — whereas a byte budget is a stable property of the data and keeps chunks large enough to engage InnoDB/Aurora read-ahead.
+- The **checksum** aggregates its CRC server-side, so it sizes each chunk against a **target time** instead. That target is a fixed 5s (`table.ChunkerDefaultTarget`), not a flag.
 
 ### Ignore Key Above Watermark
 
@@ -67,6 +65,12 @@ When you consider that many migrations are best measured in _days_, this feature
 
 **Note:** [This feature](https://github.com/github/gh-ost/blob/master/doc/resume.md) is now available in gh-ost.
 
+## Auto-throttling and Autoscaling for Aurora targets
+
+When Spirit detects that it is being run against an Aurora instance, it will automatically throttle itself based on signals from the target: whether the number of running threads is too high for the number of vCPUs the instance has, or whether average commit latency has exceeded [max-commit-latency](docs/migrate.md#max-commit-latency). The threads signal prefers a redo-aware `performance_schema` count that excludes redo-log waiters, and falls back to `Threads_running` when Spirit does not have the grants to read it.
+
+When [enable-experimental-autoscaling](docs/migrate.md#enable-experimental-autoscaling) is set, the same signals drive continuous scaling rather than a binary stop. Spirit sizes the copy read, replication write and checksum thread pools from the instance, then grows or sheds them one thread at a time to hold utilization inside a target band. This helps you take advantage of off-peak windows and complete schema changes much faster, while backing off on its own when the primary workload picks up. Note that the flag takes over the thread counts: `--threads` and `--write-threads` are ignored when it engages.
+
 ## Atomic Multi-table changes
 
 Spirit supports cutting over multiple schema changes at once using the `--statement` option.
@@ -78,32 +82,31 @@ Only one atomic multi-table migration may run at a time **per schema**: they all
 Our internal goal for Spirit is to be able to migrate a 10TiB table in under 5 days. We believe we are able to achieve this in most-cases, but it depends on:
 - How many secondary indexes the table has.
 - How many active changes are being made to the table.
-- The `threads` and `target-chunk-time` that is used.
+- The `threads`, `write-threads` and `target-chunk-size` settings.
 - If any replication throttler is used.
-- If the MySQL server becomes significantly IO bound (at this point, the migration might slow down a lot)
+- If the MySQL server becomes significantly CPU or IO bound (at this point, the migration might slow down a lot)
 
-For proof that it is possible, here is the final output from a migration on a 10TiB `finch.xfers` table on Aurora v3:
+For proof of how fast Spirit is, here is the final output from a 1.43 TiB `finch.xfers` table on an `r8g.8xlarge` Aurora instance using `--enable-experimental-autoscaling`, which sized the pools from the instance's 32 vCPUs (write threads `30 → 60`, read threads `8 → 16`):
 
 ```
-time="2023-04-21T07:08:24Z" level=info msg="apply complete: instant-ddl=false inplace-ddl=false total-chunks=926661 copy-rows-time=59h27m9.285730804s checksum-time=6h11m2.244079686s total-time=65h38m12.790047338s"
+2026/07/31 05:01:03 INFO apply complete instant-ddl=false inplace-ddl=false total-chunks=76593 copy-rows-time=5h55m44s checksum-time=39m34s total-time=6h35m54s
 ```
 
-This table does [include some secondary indexes](https://github.com/square/finch/blob/65fef3da97cfb24892ef283bc93ab8f09c4fb732/test/workload/xfer/schema.sql#L39-L62), but the table was idle and no replication throttler was used. The configuration used `threads=8` and `target-chunk-time=2s`, which is on the higher end of normal. We attempted to run a comparison with gh-ost (w/a 10K chunk-size), but canceled it after 10 days.
+That works out to about 247 GiB/hour of copying and 2,200 GiB/hour of checksumming, on a table that [has some secondary indexes](https://github.com/square/finch/blob/65fef3da97cfb24892ef283bc93ab8f09c4fb732/test/workload/xfer/schema.sql#L39-L62) and was under light write load throughout.
 
-For a non-idle table, the performance delta is even greater. Consider the following microbench performed on a m1 mac with 10 cores and MySQL 8.0.31 using defaults:
+For back of napkin calculations we typically recommend estimating 100 GiB/hour. This is deliberately conservative against the factors above, and it is where the 10TiB in 5 days goal comes from.
 
-| Table/Scenario                               | Gh-ost   | spirit  |
-| -------------------------------------------- | -------- | ------- |
-| finch.balances (800MB/1M rows), idle load    | 28.720s  | 11.197s |
-| finch.balances (800MB/1M rows), during bench | 2:50m+   | ~15-18s |
-
-This scenario is kind of a worst case for gh-ost since it prioritizes replication over row-copying and the benchmark never lets up. The spirit time also includes a checksum.
+Larger instances can typically perform schema changes much faster, because they have more CPUs and a larger buffer pool. If you are in a cloud environment consider scaling up your database for a schema change, and scaling it down afterwards. With autoscaling enabled Spirit sizes its thread pools from the instance, so it will make use of the extra capacity without any retuning.
 
 ## Unsupported Features
 
 - **`RENAME` column**. Some rename operations are intentionally not supported for now. For example, renaming a column and then reusing the same column name in adding a column. These are not impossible to support, but it's easy to get these wrong leading to data corruption. This is why (for now) we do not intend to support all cases.
 - **`ALTER`/NO PRIMARY KEY**. Spirit requires the table to have a primary key, and the primary key can not be altered by the schema change. There might be some flexibility to support UNIQUE keys and some modifications of the primary key in future, but it is not a priority for now.
 - **Lossy conversions**. Spirit does not support adding a `UNIQUE` index on non unique data, shortening a `VARCHAR` to a size less than the longest value, or adding a new `NOT NULL` column without a default value. To perform these changes you must fix the data, and then run the migration.
+- **Some `ENUM` and `SET` modifications**. Spirit's replication path receives these values from the binary log as integer ordinals and bitmasks, and its checksum compares their string form. A change that alters the meaning or the rendering of an existing value can not be supported:
+  - **`ENUM`**: appending values to the end of the list is supported, and so is dropping values from anywhere in the list. Reordering the values that are kept, or inserting a new value ahead of one that is kept, is not.
+  - **`SET`**: only appending values to the end of the list is supported. The new list must begin with the existing list, so reordering or removing members is not supported.
+  - **Type conversions**: converting `ENUM`/`SET` to a string type (`VARCHAR`, `CHAR`, `TEXT`, `BLOB`, etc.) is supported, and so is `ENUM` to `SET`. `SET` to `ENUM` is not, because a `SET` value can hold several members where an `ENUM` holds at most one. `ENUM`/`SET` to a numeric type is not, because the value would be coerced from its string form and lost.
 - **`FOREIGN KEYS`** or **`TRIGGERS`**. Spirit does not support migrating tables that have `FOREIGN KEYS` or `TRIGGERS`.
 
 ## Requirements
@@ -126,7 +129,7 @@ Spirit requires an account with these privileges:
 * `ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE` on the schema where the table is being migrated.
 * Either `SUPER, REPLICATION SLAVE on *.*` or `REPLICATION CLIENT, REPLICATION SLAVE on *.*`.
 * The `RELOAD` privilege.
-* `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is enabled by default. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover. These privileges can be omitted if `--skip-force-kill` is used.
+* `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover.
 
 For replica throttling, Spirit requires:
 
@@ -142,7 +145,7 @@ Writing a new data migration tool is scary, since bugs have real consequences (d
 
 We have also tried to balance making Spirit _as fast as possible_ while still being safe to run on production systems that are running existing workloads. Sometimes this means spirit might venture into creating slow downs in application performance. If it does, please file an issue and help us make improvements.
 
-We make extensive use of the TiDB parser. If a DDL statement can not be parsed by TiDB, it will not be possible to execute it. Usually this is not a problem, but there can be [edge-cases](https://github.com/pingcap/tidb/issues/54700).
+We make extensive use of a SQL parser (see [pkg/parser](pkg/parser/README.md), a MySQL-only fork of the TiDB parser). If a DDL statement cannot be parsed, it will not be possible to execute it. Usually this is not a problem, but there can be edge-cases with unusual syntax.
 
 ## Development
 

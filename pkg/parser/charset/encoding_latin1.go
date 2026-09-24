@@ -1,0 +1,61 @@
+// Copyright 2021 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package charset
+
+import (
+	"bytes"
+
+	"golang.org/x/text/encoding"
+)
+
+// EncodingLatin1Impl is the instance of encodingLatin1.
+// latin1 is handled with the utf8 implementation (a no-op transform) for
+// backward compatibility.
+var EncodingLatin1Impl = &encodingLatin1{encodingUTF8{encodingBase{enc: encoding.Nop}}}
+
+func init() {
+	EncodingLatin1Impl.self = EncodingLatin1Impl
+}
+
+// encodingLatin1 is a transparent (no-transform) encoding for latin1.
+type encodingLatin1 struct {
+	encodingUTF8
+}
+
+// Name implements Encoding interface.
+func (*encodingLatin1) Name() string {
+	return CharsetLatin1
+}
+
+// Peek implements Encoding interface.
+func (*encodingLatin1) Peek(src []byte) []byte {
+	if len(src) == 0 {
+		return src
+	}
+	return src[:1]
+}
+
+// IsValid implements Encoding interface.
+func (*encodingLatin1) IsValid(_ []byte) bool {
+	return true
+}
+
+// Tp implements Encoding interface.
+func (*encodingLatin1) Tp() EncodingTp {
+	return EncodingTpLatin1
+}
+
+func (*encodingLatin1) Transform(_ *bytes.Buffer, src []byte, _ Op) ([]byte, error) {
+	return src, nil
+}

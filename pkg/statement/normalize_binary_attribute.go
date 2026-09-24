@@ -1,6 +1,6 @@
 package statement
 
-import "github.com/pingcap/tidb/pkg/parser/mysql"
+import "github.com/block/spirit/pkg/parser/mysql"
 
 func init() { registerNormalizer(binaryAttributeNormalizer{}) }
 

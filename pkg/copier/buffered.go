@@ -2,7 +2,6 @@ package copier
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,13 +10,13 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
-	"golang.org/x/sync/errgroup"
 )
 
 // The buffered copier implements a producer/consumer pattern
@@ -29,25 +28,112 @@ import (
 type buffered struct {
 	sync.Mutex
 
-	db               *sql.DB
-	applier          applier.Applier
-	chunker          table.Chunker
-	concurrency      int
-	rowsPerSecond    atomic.Uint64
-	isInvalid        atomic.Bool
-	errMu            sync.Mutex // guards firstErr
-	firstErr         error      // first error that invalidated the copy (any goroutine)
-	startTime        time.Time
-	throttler        throttler.Throttler
-	dbConfig         *dbconn.DBConfig
-	logger           *slog.Logger
-	metricsSink      metrics.Sink
-	copierEtaHistory *copierEtaHistory
-	autoscale        AutoscaleConfig
+	applier       applier.Applier
+	chunker       table.Chunker
+	concurrency   int
+	rowsPerSecond atomic.Uint64
+	chunkSize     atomic.Uint64 // size of the most recently claimed chunk; see Copier.ChunkSize
+	isInvalid     atomic.Bool
+	errMu         sync.Mutex // guards firstErr
+	firstErr      error      // first error that invalidated the copy (any goroutine)
+	startTime     time.Time
+	throttler     throttler.Throttler
+	dbConfig      *dbconn.DBConfig
+	logger        *slog.Logger
+	metricsSink   metrics.Sink
+	autoscale     AutoscaleConfig
+
+	// Read-worker pool management, symmetric with the applier's write-worker
+	// pool (SetWriteWorkers/ActiveWriteWorkers). concurrency above is the
+	// initial reader count; the *live* count can change at runtime via
+	// SetReadWorkers. Unlike write workers, readers also exit naturally when
+	// the chunker is exhausted, so instead of a WaitGroup (whose Add would
+	// race Wait once the count hits zero) the pool is a mutex-guarded count
+	// with a condition variable: Run waits for liveReaders to reach zero and
+	// closes scaling under the same mutex, so no reader can be spawned after
+	// the drain has been observed.
+	readScaleMu       sync.Mutex         // guards the fields below and spawn/park
+	readersDone       *sync.Cond         // signalled on every reader exit; created in Run
+	readerCtx         context.Context    // ctx readers run under; set in Run
+	readerCancel      context.CancelFunc // cancels readerCtx; used to abort siblings on reader error
+	readerQuits       []chan struct{}    // one quit channel per live reader — closing one parks (exits) that reader
+	liveReaders       int                // current live reader count
+	readScalingClosed bool               // set true when the pool has drained, to block new spawns
 }
 
-// Assert that buffered implements the Copier interface
-var _ Copier = (*buffered)(nil)
+// Assert that buffered implements the Copier interface, and ChunkCopier for
+// the tests that step through the copy one chunk at a time.
+var (
+	_ Copier      = (*buffered)(nil)
+	_ ChunkCopier = (*buffered)(nil)
+)
+
+// CopyChunk copies a single chunk synchronously: it reads the chunk's rows,
+// writes them through the applier, and blocks until the write has completed
+// and chunker feedback has been sent. It exists for tests that need to drive
+// the copy deterministically (see ChunkCopier); Run does not use it.
+//
+// It starts the applier if needed (Start is idempotent, so this composes with
+// a later Run on the same copier). It does not stop it: write workers stay up
+// for the next call, and the runner's Close (or Run's own Stop) tears them
+// down.
+//
+// If ctx is cancelled while waiting for the applier, CopyChunk returns
+// ctx.Err() without waiting for the callback — and if the apply then
+// completes anyway, the callback still runs later on the applier's
+// coordinator goroutine, feeding the chunker for a chunk whose caller was
+// told it failed. The in-tree appliers make that branch unreachable (they
+// guarantee callback delivery on every path, including cancellation); it
+// exists as defense against a non-conforming applier.
+func (c *buffered) CopyChunk(ctx context.Context, chunk *table.Chunk) error {
+	if err := c.applier.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start applier: %w", err)
+	}
+	c.throttler.BlockWait(ctx)
+	c.chunkSize.Store(chunk.ChunkSize)
+	startTime := time.Now()
+	rows, err := c.readChunkData(ctx, chunk)
+	if err != nil {
+		return fmt.Errorf("failed to read chunk data: %w", err)
+	}
+	chunk.ActualBytes = rowsByteSize(rows)
+	chunk.SourceRows = uint64(len(rows))
+	// The callback runs on the applier's feedback coordinator goroutine; done
+	// closes only after feedback and metrics are sent, so both have completed
+	// before CopyChunk returns. Empty chunks take the same path — the applier
+	// invokes the callback immediately.
+	done := make(chan struct{})
+	var applyErr error
+	callback := func(affectedRows int64, err error) {
+		defer close(done)
+		if err != nil {
+			applyErr = err
+			return
+		}
+		totalTime := time.Since(startTime)
+		c.chunker.Feedback(chunk, totalTime, uint64(affectedRows))
+		if metricsErr := c.sendMetrics(ctx, totalTime, chunk.ChunkSize, uint64(affectedRows)); metricsErr != nil {
+			// Metrics failures don't fail the copy; log and continue.
+			c.logger.Error("error sending metrics from copier", "error", metricsErr)
+		}
+	}
+	if err := c.applier.Apply(ctx, chunk, rows, callback); err != nil {
+		return fmt.Errorf("failed to apply rows: %w", err)
+	}
+	// The applier guarantees the callback is invoked exactly once per Apply
+	// that returned nil: worker errors and cancellation are delivered as
+	// error completions, and its feedback coordinator drains until the
+	// completions channel closes rather than exiting on ctx.Done(). The ctx
+	// branch below is defense-in-depth against a non-conforming future
+	// applier; if it fires, the callback (chunker feedback + metrics) may
+	// still run later on the coordinator goroutine.
+	select {
+	case <-done:
+		return applyErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // readChunkData reads all rows from a chunk into memory
 func (c *buffered) readChunkData(ctx context.Context, chunk *table.Chunk) ([][]any, error) {
@@ -158,6 +244,11 @@ func (c *buffered) StartTime() time.Time {
 	return c.startTime
 }
 
+// Run copies all rows from the source to the target table, blocking until
+// the copy completes or fails. Run must not be called more than once per
+// copier instance: it resets the read-worker pool state that SetReadWorkers
+// reconciles against, so a second concurrent Run would corrupt the first's
+// pool accounting.
 func (c *buffered) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -171,26 +262,53 @@ func (c *buffered) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start applier: %w", err)
 	}
 
-	// Experimental: start the write-thread autoscaler. It runs for the lifetime
+	// Experimental: start the dual read/write autoscaler. It runs for the lifetime
 	// of the copy and stops when ctx is cancelled (deferred above). It only
 	// engages when the applier supports dynamic scaling (SingleTargetApplier)
 	// AND the throttler provides a continuous load signal (GradualThrottler);
 	// otherwise the pool stays fixed.
 	if as := c.autoscalerIfEnabled(); as != nil {
-		go as.run(ctx)
+		scaleCtx, cancelScale := context.WithCancel(ctx)
+		scaleDone := make(chan struct{})
+		go func() { defer close(scaleDone); as.run(scaleCtx) }()
+		defer func() { cancelScale(); <-scaleDone }()
 	}
 
-	// Start read workers
-	g, errGrpCtx := errgroup.WithContext(ctx)
+	// Start the read-worker pool. It starts at c.concurrency and can be
+	// resized at runtime via SetReadWorkers. readerCtx replaces the old
+	// errgroup context: a reader that fails cancels it so sibling readers
+	// abort their in-flight reads promptly.
+	readerCtx, readerCancel := context.WithCancel(ctx)
+	defer readerCancel()
+	c.readScaleMu.Lock()
+	if c.readersDone == nil {
+		c.readersDone = sync.NewCond(&c.readScaleMu)
+	}
+	c.readerCtx = readerCtx
+	c.readerCancel = readerCancel
+	c.readerQuits = nil
+	c.liveReaders = 0
+	c.readScalingClosed = false
+	c.readScaleMu.Unlock()
 	c.logger.Debug("starting read workers", "count", c.concurrency)
-	for range c.concurrency {
-		g.Go(func() error {
-			return c.readWorker(errGrpCtx)
-		})
-	}
+	c.SetReadWorkers(c.concurrency)
 
-	// Wait for all read workers to finish
-	err := g.Wait()
+	// Wait for the reader pool to drain (chunker exhausted, error, or ctx
+	// cancelled). Observing zero and closing scaling happen under the same
+	// mutex, so a concurrent SetReadWorkers cannot spawn a reader after the
+	// drain has been observed.
+	c.readScaleMu.Lock()
+	for c.liveReaders > 0 {
+		c.readersDone.Wait()
+	}
+	c.readScalingClosed = true
+	c.readerQuits = nil
+	c.readScaleMu.Unlock()
+
+	// Reader errors are recorded via setInvalid (first error wins) rather
+	// than returned through an errgroup, so pick them up here. They take
+	// precedence over applier.Wait/Stop errors below, as before.
+	err := c.getFirstErr()
 
 	// Wait for the applier to finish processing all pending work
 	// This ensures all callbacks have been invoked before we return
@@ -206,20 +324,19 @@ func (c *buffered) Run(ctx context.Context) error {
 
 	// A failure inside an async applier callback (e.g. a chunklet the target
 	// rejected with a warning) is reported to the callback in the applier's own
-	// goroutine — it never flows through errGrp or applier.Wait, both of which
-	// return nil in that case. Surface the first captured error so callers get
-	// the real root cause instead of a generic "copy failed" message (or, worse,
-	// a nil error that looks like success). Read/apply errors that already came
-	// back through errGrp take precedence and leave this untouched.
+	// goroutine, which may run after the reader pool drained — too late for the
+	// getFirstErr read above — and applier.Wait returns nil in that case.
+	// Re-check so callers get the real root cause instead of a generic "copy
+	// failed" message (or, worse, a nil error that looks like success).
 	if err == nil {
 		err = c.getFirstErr()
 	}
 	return err
 }
 
-// autoscalerIfEnabled returns the experimental write-thread autoscaler to run
+// autoscalerIfEnabled returns the experimental dual read/write autoscaler to run
 // for this copy, or nil when it should not engage: autoscaling disabled, an
-// applier without dynamic scaling (ShardedApplier), or a throttler without a
+// applier without dynamic scaling, or a throttler without a
 // continuous load signal. Only GradualThrottler implementations (the Aurora
 // throttlers, or a multi-throttler containing one) provide that signal —
 // binary throttlers like replica lag protect via the hard-stop only, and
@@ -239,18 +356,47 @@ func (c *buffered) autoscalerIfEnabled() *autoScaler {
 			"write_threads", c.autoscale.StartThreads)
 		return nil
 	}
-	c.logger.Info("starting experimental write-thread autoscaler",
+	c.logger.Info("starting experimental autoscaler: write-thread scaling engaged",
 		"start", c.autoscale.StartThreads, "max", c.autoscale.MaxThreads,
-		"low_watermark", acLowWatermark, "high_watermark", acHighWatermark)
-	return newAutoScaler(gradual, scaler, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
+		"low_watermark", autoscale.LowWatermark, "high_watermark", autoscale.HighWatermark)
+	scaler.SetWriteWorkers(c.autoscale.StartThreads)
+	as := newAutoScaler(gradual, scaler, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
+	// Read scaling engages whenever the write side does: the copier's own
+	// reader pool is runtime-resizable (SetReadWorkers) and every applier
+	// reports the queue snapshot (Stats) the arbiter needs.
+	maxRead := resolveReadCeiling(c.autoscale.MaxReadThreads, c.concurrency)
+	c.logger.Info("read-worker scaling engaged",
+		"start", c.concurrency, "max", maxRead)
+	as.enableReadScaling(c, c.applier, c.concurrency, maxRead)
+	return as
 }
 
-// readWorker reads chunks and sends them to the applier
-func (c *buffered) readWorker(ctx context.Context) error {
+// readWorker reads chunks and sends them to the applier. It exits when the
+// chunker is exhausted, the copy is invalidated, or its quit channel is closed
+// (scale-down via SetReadWorkers). The quit check sits right after BlockWait —
+// the spot where an idle reader parks — so a parked reader exits as soon as
+// the throttler releases it, without claiming another chunk.
+func (c *buffered) readWorker(ctx context.Context, quit <-chan struct{}) error {
 	c.logger.Debug("readWorker started", "isRead", c.chunker.IsRead())
 
 	for !c.chunker.IsRead() && c.isHealthy(ctx) {
 		c.throttler.BlockWait(ctx)
+
+		select {
+		case <-quit:
+			c.logger.Debug("readWorker parked (scale-down), exiting")
+			return nil
+		default:
+		}
+
+		// Re-check health after BlockWait: a reader can sit blocked in the
+		// throttler for a long time, and the copy may have been cancelled or
+		// invalidated while it waited. Exit here rather than claiming one
+		// more chunk against a dead copy.
+		if !c.isHealthy(ctx) {
+			c.logger.Debug("readWorker unhealthy after BlockWait, exiting")
+			return nil
+		}
 
 		c.logger.Debug("readWorker calling chunker.Next()")
 		chunk, err := c.chunker.Next()
@@ -264,6 +410,7 @@ func (c *buffered) readWorker(ctx context.Context) error {
 			return err
 		}
 		c.logger.Debug("readWorker got chunk", "chunk", chunk.String())
+		c.chunkSize.Store(chunk.ChunkSize)
 
 		// Start timing from the beginning of the chunk processing (read + write)
 		chunkStartTime := time.Now()
@@ -278,6 +425,7 @@ func (c *buffered) readWorker(ctx context.Context) error {
 		// size the next chunk against a byte budget (memory-based dynamic
 		// chunking). Harmless when the chunker is in time mode — it ignores it.
 		chunk.ActualBytes = rowsByteSize(rows)
+		chunk.SourceRows = uint64(len(rows))
 
 		// Handle empty chunks immediately
 		if len(rows) == 0 {
@@ -345,6 +493,102 @@ func (c *buffered) readWorker(ctx context.Context) error {
 	return nil
 }
 
+// SetReadWorkers reconciles the live read-worker count to n, spawning new
+// readers or parking existing ones as needed. It is the read-side counterpart
+// of SingleTargetApplier.SetWriteWorkers: idempotent, safe to call repeatedly,
+// and n is clamped to a minimum of 1 so the copy always makes progress. Calls
+// before Run has started the pool or after it has drained are no-ops.
+//
+// Parking is cooperative: closing a reader's quit channel makes it exit right
+// after its next BlockWait returns, so a chunk already claimed is always read
+// and submitted to the applier — no chunk is ever lost.
+//
+// Parking latency differs from the write pool: write workers observe quit
+// inside their blocking select and park immediately, but a parked reader
+// stays live (and counted by ActiveReadWorkers) until its in-flight
+// BlockWait returns — up to the throttler's full block duration (~60s for
+// the replica throttler). Scaling down and back up within that window
+// briefly overlaps parked readers with their replacements: the overlap is
+// bounded by the previous pool size, self-drains, and parked readers do no
+// chunk work.
+func (c *buffered) SetReadWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	c.readScaleMu.Lock()
+	defer c.readScaleMu.Unlock()
+
+	// No-op before Run has recorded the reader context or once the pool has
+	// drained. In both states we must not spawn: before Run a nil readerCtx
+	// would panic the reader, and post-drain spawns would race Run's
+	// drain-wait, which has already observed zero.
+	if c.readerCtx == nil || c.readScalingClosed {
+		return
+	}
+
+	cur := len(c.readerQuits)
+	switch {
+	case n > cur:
+		for range n - cur {
+			c.spawnReadWorkerLocked()
+		}
+		c.logger.Info("scaled read workers up", "from", cur, "to", n)
+	case n < cur:
+		// Park the most-recently-added readers by closing their quit channels.
+		for i := cur - 1; i >= n; i-- {
+			close(c.readerQuits[i])
+		}
+		c.readerQuits = c.readerQuits[:n]
+		c.logger.Info("scaled read workers down", "from", cur, "to", n)
+	}
+}
+
+// ActiveReadWorkers returns the current number of live read workers. This
+// includes readers parked by SetReadWorkers that are still waiting for their
+// in-flight BlockWait to return (see SetReadWorkers), so it can briefly
+// exceed the requested worker count after a scale-down.
+func (c *buffered) ActiveReadWorkers() int {
+	c.readScaleMu.Lock()
+	defer c.readScaleMu.Unlock()
+	return c.liveReaders
+}
+
+// spawnReadWorkerLocked starts one read worker. Callers must hold readScaleMu.
+func (c *buffered) spawnReadWorkerLocked() {
+	quit := make(chan struct{})
+	c.readerQuits = append(c.readerQuits, quit)
+	c.liveReaders++
+	ctx := c.readerCtx
+	cancel := c.readerCancel
+	go func() {
+		defer c.readerExited(quit)
+		if err := c.readWorker(ctx, quit); err != nil {
+			// The error itself was already recorded by setInvalid inside
+			// readWorker; cancelling the shared reader context aborts sibling
+			// readers' in-flight reads promptly (errgroup parity).
+			cancel()
+		}
+	}()
+}
+
+// readerExited is the bookkeeping counterpart of spawnReadWorkerLocked, run as
+// every reader's exit path. It removes the reader's quit channel from the pool
+// (present only when the reader exited naturally — a parked reader's entry was
+// already trimmed by SetReadWorkers), decrements the live count, and wakes
+// Run's drain-wait.
+func (c *buffered) readerExited(quit chan struct{}) {
+	c.readScaleMu.Lock()
+	defer c.readScaleMu.Unlock()
+	for i, q := range c.readerQuits {
+		if q == quit {
+			c.readerQuits = append(c.readerQuits[:i], c.readerQuits[i+1:]...)
+			break
+		}
+	}
+	c.liveReaders--
+	c.readersDone.Broadcast()
+}
+
 // setInvalid marks the copy as failed and records the first error that caused
 // it. It is called from the read workers and from async applier callbacks, so
 // it captures only the first error and is safe for concurrent use.
@@ -387,30 +631,25 @@ func (c *buffered) getCopyStats() (uint64, uint64, float64) {
 
 // GetProgress returns the progress of the copier
 func (c *buffered) GetProgress() string {
-	c.Lock()
-	defer c.Unlock()
-	copied, total, pct := c.getCopyStats()
-	return fmt.Sprintf("%d/%d %.2f%%", copied, total, pct)
+	return c.CopyProgress().String()
 }
 
-func (c *buffered) GetETA() string {
+// CopyProgress satisfies Copier.
+func (c *buffered) CopyProgress() status.CopyProgress {
 	c.Lock()
 	defer c.Unlock()
-	copiedRows, totalRows, pct := c.getCopyStats()
-	estimate, st := etaEstimate(copiedRows, totalRows, pct, c.rowsPerSecond.Load(), c.startTime)
-	switch st {
-	case status.ETADue:
-		return "DUE"
-	case status.ETAMeasuring:
-		return "TBD"
-	case status.ETAReady, status.ETANone:
-		// A ready estimate is formatted below; ETANone cannot occur during copy.
-	}
-	comparison := c.copierEtaHistory.addCurrentEstimateAndCompare(estimate)
-	if comparison != "" {
-		return fmt.Sprintf("%s (%s)", estimate.String(), comparison)
-	}
-	return estimate.String()
+	copied, total, _ := c.getCopyStats()
+	return status.CopyProgress{RowsCopied: copied, RowsTotal: total}
+}
+
+// ChunkSize satisfies Copier.
+func (c *buffered) ChunkSize() uint64 {
+	return c.chunkSize.Load()
+}
+
+// GetETA renders GetETAState for the status block.
+func (c *buffered) GetETA() string {
+	return c.GetETAState().String()
 }
 
 func (c *buffered) GetETAState() status.ETA {

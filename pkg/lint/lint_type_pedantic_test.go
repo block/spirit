@@ -356,7 +356,7 @@ func TestTypePedantic_SameName_TieEmitsInconsistentForAll(t *testing.T) {
 	tables_seen := map[string]bool{}
 	for _, v := range violations {
 		require.Contains(t, v.Message, "inconsistent across schema")
-		require.Contains(t, v.Message, "types in use")
+		require.Contains(t, v.Message, `types in use: "int(11)", "int(11) unsigned"`)
 		require.NotNil(t, v.Context["conflicting_types"])
 		tables_seen[v.Location.Table] = true
 	}
@@ -605,6 +605,304 @@ func TestTypePedantic_Configure_PartialDoesNotResetOtherFields(t *testing.T) {
 	require.NoError(t, l.Configure(map[string]string{"requireIndexed": "false"}))
 	require.True(t, l.checkSameName)
 	require.False(t, l.requireIndexed)
+}
+
+func TestTypePedantic_SameName_CollationMismatchAgainstImpliedDefault(t *testing.T) {
+	// The motivating case: SHOW CREATE TABLE omits COLLATE when it is the
+	// charset default, so `DEFAULT CHARSET=utf8mb4` (utf8mb4_0900_ai_ci) has to
+	// compare unequal to an explicit utf8mb4_general_ci. Types match exactly,
+	// so only the collation rule fires.
+	tables := parseTables(t,
+		`CREATE TABLE users (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE profiles (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE legacy (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+	)
+	violations := newTypePedantic(t).Lint(tables, nil)
+	require.Empty(t, filterRule(violations, "same_name"), "types are identical")
+
+	flagged := filterRule(violations, "same_name_collation")
+	require.Len(t, flagged, 1)
+	v := flagged[0]
+	require.Equal(t, SeverityWarning, v.Severity)
+	require.Equal(t, "legacy", v.Location.Table)
+	require.Equal(t, "email", *v.Location.Column)
+	require.Equal(t, "utf8mb4_general_ci", v.Context["current_collation"])
+	require.Equal(t, "utf8mb4_0900_ai_ci", v.Context["expected_collation"])
+	require.Equal(t, false, v.Context["charset_differs"])
+	require.Contains(t, v.Message, "ERROR 1267", "same charset, different collation is a hard error, not just slow")
+	require.NotContains(t, v.Message, "different charsets", "the charsets match here")
+}
+
+func TestTypePedantic_SameName_CharsetMismatchWording(t *testing.T) {
+	// Different charsets: the consequence is an implicit conversion that
+	// prevents index use, not ERROR 1267.
+	tables := parseTables(t,
+		`CREATE TABLE users (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE profiles (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE legacy (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=latin1`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 1)
+	v := flagged[0]
+	require.Equal(t, "legacy", v.Location.Table)
+	require.Equal(t, "latin1", v.Context["current_charset"])
+	require.Equal(t, "utf8mb4", v.Context["expected_charset"])
+	require.Equal(t, true, v.Context["charset_differs"])
+	require.Contains(t, v.Message, "prevents index use")
+	require.NotNil(t, v.Suggestion)
+	require.Contains(t, *v.Suggestion, "CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci")
+}
+
+func TestTypePedantic_SameName_CollationUndeclaredTablesAgree(t *testing.T) {
+	// No DEFAULT CHARSET anywhere: both tables take the assumed default, so
+	// they agree and nothing is reported.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email))`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email))`,
+	)
+	require.Empty(t, filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation"))
+}
+
+func TestTypePedantic_SameName_CollationUndeclaredTableUsesAssumedCharset(t *testing.T) {
+	// Regression: hand-written DDL that omits DEFAULT CHARSET used to drop out
+	// of the vote, which made *deleting* a charset line silence the warning
+	// the schema had before — the group was left with a single determined
+	// column and nothing to disagree about.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=latin1`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email))`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2, "1-vs-1 is a tie, so both sides are reported")
+	for _, v := range flagged {
+		require.Equal(t,
+			[]string{"latin1_swedish_ci", "utf8mb4_0900_ai_ci"},
+			v.Context["conflicting_collations"],
+			"the undeclared table should compare as utf8mb4",
+		)
+	}
+}
+
+func TestTypePedantic_SameName_CollationAssumeCharsetConfigurable(t *testing.T) {
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=latin1`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email))`,
+	)
+
+	// A schema whose real default is latin1: the undeclared table now agrees
+	// with the declared one.
+	l := &TypePedanticLinter{}
+	require.NoError(t, l.Configure(map[string]string{"assumeCharset": "latin1"}))
+	require.Empty(t, filterRule(l.Lint(tables, nil), "same_name_collation"))
+
+	// Empty restores the strict mode: compare only what the DDL states.
+	strict := &TypePedanticLinter{}
+	require.NoError(t, strict.Configure(map[string]string{"assumeCharset": ""}))
+	require.Empty(t, filterRule(strict.Lint(tables, nil), "same_name_collation"))
+
+	// ...and in strict mode two undeclared tables are skipped rather than
+	// being assumed to match.
+	undeclared := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255) COLLATE utf8mb4_bin, KEY k (email))`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email))`,
+	)
+	require.Empty(t, filterRule(strict.Lint(undeclared, nil), "same_name_collation"))
+	require.Len(t, filterRule(newTypePedantic(t).Lint(undeclared, nil), "same_name_collation"), 2,
+		"with the default assumption the explicit utf8mb4_bin column disagrees")
+}
+
+func TestTypePedantic_Configure_RejectsUnknownAssumeCharset(t *testing.T) {
+	l := &TypePedanticLinter{}
+	err := l.Configure(map[string]string{"assumeCharset": "utf8mb5"})
+	require.ErrorContains(t, err, "assumeCharset")
+	require.ErrorContains(t, err, "not a known character set")
+}
+
+func TestTypePedantic_InferredFK_CollationUndeclaredTargetUsesAssumedCharset(t *testing.T) {
+	// Same regression on the FK rule: the target table declares nothing, the
+	// referencing table declares a non-default collation.
+	tables := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64) NOT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "inferred_fk_collation")
+	require.Len(t, flagged, 1)
+	require.Equal(t, "utf8mb4_0900_ai_ci", flagged[0].Context["expected_collation"])
+}
+
+func TestTypePedantic_SameName_CollationIgnoresNonTextColumns(t *testing.T) {
+	// A table charset says nothing about how integers compare.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, qty INT, KEY k (qty)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, qty INT, KEY k (qty)) DEFAULT CHARSET=latin1`,
+	)
+	require.Empty(t, newTypePedantic(t).Lint(tables, nil))
+}
+
+func TestTypePedantic_SameName_CollationColumnLevelOverrideConverges(t *testing.T) {
+	// Column-level COLLATE wins over the table default on both sides, and both
+	// resolve to the same collation — nothing to report even though the table
+	// options differ.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255) COLLATE utf8mb4_0900_ai_ci, KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+	)
+	require.Empty(t, filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation"))
+}
+
+func TestTypePedantic_SameName_CollationUTF8MB3Alias(t *testing.T) {
+	// utf8 and utf8mb3 are the same charset spelled two ways, and utf8_bin is
+	// the same collation as utf8mb3_bin.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb3`,
+		`CREATE TABLE c (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255) COLLATE utf8_general_ci, KEY k (email)) DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_bin`,
+	)
+	require.Empty(t, filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation"))
+}
+
+func TestTypePedantic_SameName_CollationRespectsRequireIndexed(t *testing.T) {
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, note VARCHAR(255)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, note VARCHAR(255)) DEFAULT CHARSET=latin1`,
+	)
+	require.Empty(t, filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation"))
+
+	l := &TypePedanticLinter{}
+	require.NoError(t, l.Configure(map[string]string{"requireIndexed": "false"}))
+	// 1-vs-1 is a tie, so both occurrences are reported.
+	require.Len(t, filterRule(l.Lint(tables, nil), "same_name_collation"), 2)
+}
+
+func TestTypePedantic_SameName_CollationTieEmitsForAll(t *testing.T) {
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=latin1`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2)
+	for _, v := range flagged {
+		require.Contains(t, v.Message, "inconsistent across schema")
+		require.Contains(t, v.Message, "different charsets",
+			"a tie is the most common mixed-charset shape; it needs the consequence too")
+		require.Contains(t, v.Message, "ERROR 1267")
+		require.Equal(t,
+			[]string{"latin1_swedish_ci", "utf8mb4_0900_ai_ci"},
+			v.Context["conflicting_collations"],
+		)
+	}
+}
+
+func TestTypePedantic_SameName_CollationTieSameCharsetConsequence(t *testing.T) {
+	// Tied, but both sides are utf8mb4: only the ERROR 1267 outcome applies.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2)
+	for _, v := range flagged {
+		require.Contains(t, v.Message, "ERROR 1267")
+		require.NotContains(t, v.Message, "different charsets")
+	}
+}
+
+func TestTypePedantic_SameName_NonConvertibleCharsetsAreNotUnderstated(t *testing.T) {
+	// latin1 and latin2: neither is a superset of the other, so MySQL has
+	// nothing to convert to and the join fails with ERROR 1267 rather than
+	// merely losing an index. Verified on 8.0.46. The wording has to name
+	// that outcome, not just the index-degradation one.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, code VARCHAR(64), KEY k (code)) DEFAULT CHARSET=latin1`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, code VARCHAR(64), KEY k (code)) DEFAULT CHARSET=latin2`,
+		`CREATE TABLE c (id BIGINT UNSIGNED PRIMARY KEY, code VARCHAR(64), KEY k (code)) DEFAULT CHARSET=latin2`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 1, "latin1 is the minority")
+	v := flagged[0]
+	require.Equal(t, "a", v.Location.Table)
+	require.Equal(t, true, v.Context["charset_differs"])
+	require.Contains(t, v.Message, "ERROR 1267",
+		"latin1/latin2 do not convert, so this is a hard failure — not a performance nit")
+	require.Contains(t, v.Message, "prevents index use on the narrower side")
+}
+
+func TestTypePedantic_InferredFK_CollationMismatch(t *testing.T) {
+	// Identical types, so only the collation rule fires — the case the type
+	// comparison alone cannot see.
+	tables := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64) NOT NULL, KEY k (customer_id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+	)
+	violations := newTypePedantic(t).Lint(tables, nil)
+	require.Empty(t, filterRule(violations, "inferred_fk"), "types are identical")
+
+	flagged := filterRule(violations, "inferred_fk_collation")
+	require.Len(t, flagged, 1)
+	v := flagged[0]
+	require.Equal(t, SeverityWarning, v.Severity)
+	require.Equal(t, "orders", v.Location.Table)
+	require.Equal(t, "customer_id", *v.Location.Column)
+	require.Equal(t, "customers", v.Context["referenced_table"])
+	require.Equal(t, "utf8mb4_general_ci", v.Context["current_collation"])
+	require.Equal(t, "utf8mb4_0900_ai_ci", v.Context["expected_collation"])
+	require.Contains(t, v.Message, "ERROR 1267")
+}
+
+func TestTypePedantic_InferredFK_CollationAndTypeBothFlagged(t *testing.T) {
+	// A column can be wrong on both axes. Each violation stays precise about
+	// its own axis rather than being folded into one message.
+	tables := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(32) NOT NULL) DEFAULT CHARSET=latin1`,
+	)
+	violations := newTypePedantic(t).Lint(tables, nil)
+	require.Len(t, filterRule(violations, "inferred_fk"), 1)
+	collation := filterRule(violations, "inferred_fk_collation")
+	require.Len(t, collation, 1)
+	require.Contains(t, collation[0].Message, "prevents index use")
+}
+
+func TestTypePedantic_InferredFK_CollationMatch(t *testing.T) {
+	tables := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64) NOT NULL COLLATE utf8mb4_general_ci) DEFAULT CHARSET=utf8mb4`,
+	)
+	require.Empty(t, newTypePedantic(t).Lint(tables, nil))
+}
+
+func TestTypePedantic_Collation_DisabledViaConfig(t *testing.T) {
+	tables := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64) NOT NULL, KEY k (customer_id)) DEFAULT CHARSET=latin1`,
+	)
+	l := &TypePedanticLinter{}
+	require.NoError(t, l.Configure(map[string]string{"checkCollation": "false"}))
+	require.Empty(t, l.Lint(tables, nil))
+}
+
+func TestTypePedantic_Collation_ConfigurableSeverity(t *testing.T) {
+	tables := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64) NOT NULL, KEY k (customer_id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+	)
+	l := &TypePedanticLinter{}
+	require.NoError(t, l.Configure(map[string]string{"collationSeverity": "error"}))
+	flagged := filterRule(l.Lint(tables, nil), "inferred_fk_collation")
+	require.Len(t, flagged, 1)
+	require.Equal(t, SeverityError, flagged[0].Severity)
+}
+
+func TestTypePedantic_Collation_PostStateAlterConvergesCollation(t *testing.T) {
+	existing := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64) NOT NULL, KEY k (customer_id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+	)
+	require.Len(t, filterRule(newTypePedantic(t).Lint(existing, nil), "inferred_fk_collation"), 1)
+
+	changes, err := statement.New(`ALTER TABLE orders MODIFY COLUMN customer_id VARCHAR(64) NOT NULL COLLATE utf8mb4_0900_ai_ci`)
+	require.NoError(t, err)
+	require.Empty(t, filterRule(newTypePedantic(t).Lint(existing, changes), "inferred_fk_collation"))
 }
 
 func TestTypePedantic_RegisteredAndDescribed(t *testing.T) {

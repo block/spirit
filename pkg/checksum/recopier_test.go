@@ -7,12 +7,12 @@ import (
 	"sync"
 	"testing"
 
+	mysql "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	mysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -20,7 +20,7 @@ import (
 // MySQL: a source table in the DSN database, an identical target table in
 // a unique throwaway database, TableInfos for both sides, and a started
 // SingleTargetApplier pointed at the target. This mirrors the production
-// wiring in datasync.Runner.runContinuousChecksum.
+// wiring in datasync.Runner.runLocklessChecksum.
 type recopierHarness struct {
 	srcDB        *sql.DB
 	dstDB        *sql.DB
@@ -99,7 +99,7 @@ func newRecopierHarness(t *testing.T, tableName string) *recopierHarness {
 }
 
 // chunk builds a [lo, hi) chunk over the harness tables, the same shape
-// the continuous-checksum chunker hands to the Recopier.
+// the lockless-checksum chunker hands to the Recopier.
 func (h *recopierHarness) chunk(t *testing.T, lo, hi int) *table.Chunk {
 	t.Helper()
 	loDatum, err := table.NewDatumFromValue(lo, "int")
@@ -174,7 +174,7 @@ func TestMySQLRecopierEmptySourceRange(t *testing.T) {
 }
 
 // TestMySQLRecopierConcurrent locks in the Recopier interface contract
-// from continuous.go: "Recopy must be safe to call concurrently from
+// from lockless.go: "Recopy must be safe to call concurrently from
 // multiple worker goroutines". Two goroutines recopy adjacent diverged
 // chunks; the internal mutex serializes them and both must succeed.
 // Run with -race.

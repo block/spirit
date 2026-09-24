@@ -200,8 +200,8 @@ func TestPlanChanges_DropColumnsHaveColumnDetails(t *testing.T) {
 		columnMessages[*violation.Location.Column] = violation.Message
 	}
 	require.Equal(t, map[string]string{
-		"email": "Unsafe operation detected: DROP COLUMN `email`",
-		"phone": "Unsafe operation detected: DROP COLUMN `phone`",
+		"email": "Unsafe operation detected: \"DROP COLUMN `email`\"",
+		"phone": "Unsafe operation detected: \"DROP COLUMN `phone`\"",
 	}, columnMessages)
 }
 

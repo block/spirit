@@ -83,7 +83,7 @@ func TestCalculateNewTargetChunkSize(t *testing.T) {
 }
 
 const highChunkMsg = "INFO:high chunk processing time"
-const pinnedMsg = "WARN:chunk size pinned at minimum; rows may be too wide to meet target-chunk-time"
+const pinnedMsg = "WARN:chunk size pinned at minimum; rows may be too wide to meet the chunk time budget"
 
 // TestPanicShrinkAboveFloorLogs verifies that while the chunk size can still
 // shrink, panicShrink emits the per-shrink "high chunk processing time" line

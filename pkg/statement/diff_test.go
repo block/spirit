@@ -537,6 +537,45 @@ func TestDiff(t *testing.T) {
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, age INT, CONSTRAINT chk_v2 CHECK (age >= 18))",
 			expected: "ALTER TABLE `t1` DROP CHECK `chk_v1`, ADD CONSTRAINT `chk_v2` CHECK (`age`>=18)",
 		},
+		{
+			// MySQL rewrites stored CHECK expressions into a fully
+			// parenthesized canonical form, so SHOW CREATE TABLE (the source
+			// here) never returns the expression as the user wrote it (the
+			// target). The two must converge with no diff.
+			name:     "CheckConstraintMySQLCanonicalParensNoDiff",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref CHECK ((((`kind` = _utf8mb4'x') and (`ref_x` is not null) and (`ref_y` is null)) or ((`kind` = _utf8mb4'y') and (`ref_y` is not null) and (`ref_x` is null)))))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref CHECK ((kind = 'x' AND ref_x IS NOT NULL AND ref_y IS NULL) OR (kind = 'y' AND ref_y IS NOT NULL AND ref_x IS NULL)))",
+			expected: "",
+		},
+		{
+			// CHECK constraint names are schema-scoped, so creating a shadow
+			// table renames them; after cutover the live table carries a
+			// different name AND MySQL's canonical parenthesization. The
+			// cross-name expression matching must still converge with no diff.
+			name:     "CheckConstraintRenamedAndCanonicalParensNoDiff",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref_renamed CHECK ((((`kind` = _utf8mb4'x') and (`ref_x` is not null)) or ((`kind` = _utf8mb4'y') and (`ref_y` is not null)))))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, kind enum('x','y') NOT NULL, ref_x INT, ref_y INT, CONSTRAINT chk_kind_ref CHECK ((kind = 'x' AND ref_x IS NOT NULL) OR (kind = 'y' AND ref_y IS NOT NULL)))",
+			expected: "",
+		},
+		{
+			// Parentheses that change operator binding are semantic, not
+			// cosmetic: (a OR b) AND c is a different constraint from
+			// a OR b AND c, and normalization must keep them distinct.
+			name:     "CheckConstraintMovedParensStillDiffs",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT, c INT, CONSTRAINT chk_expr CHECK ((a = 1 OR b = 2) AND c = 3))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT, c INT, CONSTRAINT chk_expr CHECK (a = 1 OR b = 2 AND c = 3))",
+			expected: "ALTER TABLE `t1` DROP CHECK `chk_expr`, ADD CONSTRAINT `chk_expr` CHECK (`a`=1 OR `b`=2 AND `c`=3)",
+		},
+		{
+			// Same distinctness for non-binary operators: NOT and IS NULL
+			// render without connecting parentheses, so only explicit
+			// parenthesization of each operator keeps (NOT a) IS NULL apart
+			// from NOT (a IS NULL).
+			name:     "CheckConstraintUnaryIsNullParensStillDiffs",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, CONSTRAINT chk_expr CHECK (NOT (a IS NULL)))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, CONSTRAINT chk_expr CHECK ((NOT a) IS NULL))",
+			expected: "ALTER TABLE `t1` DROP CHECK `chk_expr`, ADD CONSTRAINT `chk_expr` CHECK ((NOT `a`) IS NULL)",
+		},
 		// CHECK constraint enforcement ([NOT] ENFORCED)
 		{
 			// MySQL's SHOW CREATE TABLE renders NOT ENFORCED inside a
@@ -681,6 +720,53 @@ func TestDiff(t *testing.T) {
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_bin) CHARSET utf8mb4",
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) COLLATE utf8mb4_bin NULL",
 		},
+		// A table-level DEFAULT CHARSET/COLLATE change only affects columns
+		// added later, so when the table defaults differ, a column that
+		// inherits its table default must still be MODIFYed to converge in a
+		// single ALTER — even against a target column that (explicitly or by
+		// inheritance) matches the target table's different default.
+		{
+			name:     "TableCollationChangeModifiesInheritingColumn_ExplicitTarget",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) COLLATE utf8mb4_general_ci NULL, COLLATE=utf8mb4_general_ci",
+		},
+		{
+			name:     "TableCollationChangeModifiesInheritingColumn_InheritedTarget",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) NULL, COLLATE=utf8mb4_general_ci",
+		},
+		{
+			name:     "TableCharsetChangeModifiesInheritingColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=latin1 COLLATE=latin1_swedish_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) NULL, DEFAULT CHARSET=latin1, COLLATE=latin1_swedish_ci",
+		},
+		// When both tables share the same defaults, a column that inherits
+		// them and a column that explicitly restates them are the same
+		// column — no MODIFY in either direction.
+		{
+			name:     "SameTableDefaults_InheritedVsExplicitColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "",
+		},
+		{
+			name:     "SameTableDefaults_ExplicitVsInheritedColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "",
+		},
+		// A column already carrying the target's collation explicitly does
+		// not need a MODIFY when only the table default changes: the
+		// table-option clause alone converges.
+		{
+			name:     "TableCollationChangeSkipsAlreadyMatchingColumn",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			expected: "ALTER TABLE `t1` COLLATE=utf8mb4_general_ci",
+		},
 		// Nil TableOptions tests - verifies no panic when TableOptions is nil
 		// This can happen when CREATE TABLE has no explicit ENGINE/CHARSET clause
 		{
@@ -719,19 +805,19 @@ func TestDiff(t *testing.T) {
 			name:     "BooleanDefaultFalse",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL DEFAULT FALSE)",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT FALSE",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT 0",
 		},
 		{
 			name:     "BooleanDefaultTrue",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_active BOOL DEFAULT TRUE)",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT TRUE",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `is_active` tinyint(1) NULL DEFAULT 1",
 		},
 		{
 			name:     "AddBooleanColumnWithDefault",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, is_instant BOOL DEFAULT FALSE)",
-			expected: "ALTER TABLE `t1` ADD COLUMN `is_instant` tinyint(1) NULL DEFAULT FALSE",
+			expected: "ALTER TABLE `t1` ADD COLUMN `is_instant` tinyint(1) NULL DEFAULT 0",
 		},
 		{
 			name:     "AddColumnFirst",
@@ -1264,6 +1350,89 @@ func TestDiff(t *testing.T) {
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, B INT NOT NULL, A INT NOT NULL)",
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `B` int NOT NULL AFTER `id`, MODIFY COLUMN `A` int NOT NULL AFTER `B`",
 		},
+		// Partitioning. The sources below are shaped like SHOW CREATE TABLE
+		// output, which always prints a per-partition `ENGINE = InnoDB` that
+		// human-authored SQL omits; that clause must not register as a change
+		// (it cannot differ from the table engine) or every partitioned table
+		// would repartition itself on every run.
+		{
+			name:     "NoChanges_PartitionedEngineClauseOnly",
+			source:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2020) ENGINE = InnoDB, PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB)",
+			target:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			expected: "",
+		},
+		{
+			name:     "NoChanges_Subpartitioned",
+			source:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2020) ENGINE = InnoDB, PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB)",
+			target:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (dayofmonth(dt)) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			expected: "",
+		},
+		{
+			// SUBPARTITION BY with neither a count nor explicit names is legal
+			// (MySQL defaults to one subpartition per partition and reports no
+			// SUBPARTITIONS line), so no count must be invented on emission.
+			name:     "NoChanges_SubpartitionedWithoutCount",
+			source:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) SUBPARTITION BY HASH (dayofmonth(`dt`)) (PARTITION p0 VALUES LESS THAN (2020) ENGINE = InnoDB, PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB)",
+			target:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (dayofmonth(dt)) (PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			expected: "",
+		},
+		{
+			name:     "NoChanges_SubpartitionsNamedExplicitly",
+			source:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) SUBPARTITION BY KEY (dt) (PARTITION p0 VALUES LESS THAN (2020) (SUBPARTITION s0 COMMENT = 'sc0' ENGINE = InnoDB, SUBPARTITION s1 ENGINE = InnoDB), PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2 ENGINE = InnoDB, SUBPARTITION s3 ENGINE = InnoDB))",
+			target:   "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY KEY (dt) (PARTITION p0 VALUES LESS THAN (2020) (SUBPARTITION s0 COMMENT 'sc0', SUBPARTITION s1), PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))",
+			expected: "",
+		},
+		// A real subpartitioning change must round-trip the whole clause,
+		// including SUBPARTITION BY: the second statement replaces the
+		// partitioning wholesale, so anything it omits is dropped.
+		{
+			name:   "ChangeSubpartitionCount",
+			source: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2020) ENGINE = InnoDB, PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB)",
+			target: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (dayofmonth(dt)) SUBPARTITIONS 4 (PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` REMOVE PARTITIONING",
+				"ALTER TABLE `t1` PARTITION BY RANGE (YEAR(`dt`)) SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 4 (PARTITION `p0` VALUES LESS THAN (2020), PARTITION `p1` VALUES LESS THAN MAXVALUE)",
+			},
+		},
+		{
+			name:   "AddSubpartitioning",
+			source: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) (PARTITION p0 VALUES LESS THAN (2020) ENGINE = InnoDB, PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB)",
+			target: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY LINEAR KEY (dt) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` REMOVE PARTITIONING",
+				"ALTER TABLE `t1` PARTITION BY RANGE (YEAR(`dt`)) SUBPARTITION BY LINEAR KEY (`dt`) SUBPARTITIONS 2 (PARTITION `p0` VALUES LESS THAN (2020), PARTITION `p1` VALUES LESS THAN MAXVALUE)",
+			},
+		},
+		{
+			name:   "RemoveSubpartitioning",
+			source: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2020) ENGINE = InnoDB, PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB)",
+			target: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` REMOVE PARTITIONING",
+				"ALTER TABLE `t1` PARTITION BY RANGE (YEAR(`dt`)) (PARTITION `p0` VALUES LESS THAN (2020), PARTITION `p1` VALUES LESS THAN MAXVALUE)",
+			},
+		},
+		{
+			name:   "RepartitionCarriesSubpartitionNamesAndComments",
+			source: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) SUBPARTITION BY KEY (dt) (PARTITION p0 VALUES LESS THAN (2020) (SUBPARTITION s0 COMMENT = 'sc0' ENGINE = InnoDB, SUBPARTITION s1 ENGINE = InnoDB))",
+			target: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY KEY (dt) (PARTITION p0 VALUES LESS THAN (2030) (SUBPARTITION s0 COMMENT 'sc0', SUBPARTITION s1))",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` REMOVE PARTITIONING",
+				"ALTER TABLE `t1` PARTITION BY RANGE (YEAR(`dt`)) SUBPARTITION BY KEY (`dt`) SUBPARTITIONS 2 (PARTITION `p0` VALUES LESS THAN (2030) (SUBPARTITION `s0` COMMENT = 'sc0', SUBPARTITION `s1`))",
+			},
+		},
+		// A partition comment is part of the definition and has to survive a
+		// repartition too — the emitted PARTITION BY is the only definition
+		// MySQL will see.
+		{
+			name:   "RepartitionCarriesPartitionComment",
+			source: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (year(`dt`)) (PARTITION p0 VALUES LESS THAN (2020) COMMENT = 'keep me' ENGINE = InnoDB)",
+			target: "CREATE TABLE t1 (dt DATE NOT NULL, PRIMARY KEY (dt)) PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (dayofmonth(dt)) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2020) COMMENT 'keep me')",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` REMOVE PARTITIONING",
+				"ALTER TABLE `t1` PARTITION BY RANGE (YEAR(`dt`)) SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 2 (PARTITION `p0` VALUES LESS THAN (2020) COMMENT = 'keep me')",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1474,6 +1643,21 @@ func TestDiff_DiffOptions(t *testing.T) {
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `b` varchar(100) NULL",
 		},
 
+		// IgnoreNotNullRelaxation is covered by
+		// TestDiff_IgnoreNotNullRelaxation instead of here. It is the one
+		// directional option, and this table's "source"/"target" fields are
+		// Diff's receiver and parameter — the opposite order to the reference
+		// and validated schemas every consumer passes to DiffCreateTables — so
+		// stating its direction in these names would read backwards. The
+		// dedicated test asserts it in the orientation consumers see.
+		{
+			name:     "DefaultDetectsNullability",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NULL)",
+			opts:     nil, // nil uses NewDiffOptions(): IgnoreNotNullRelaxation=false
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `customer_id` bigint NULL",
+		},
+
 		// IgnoreCharsetCollation
 		{
 			name:     "IgnoreCharsetCollation_Charset",
@@ -1595,6 +1779,114 @@ func TestDiff_DiffOptions(t *testing.T) {
 				require.Len(t, stmts, 1)
 				require.Equal(t, tt.expected, stmts[0].Statement)
 			}
+		})
+	}
+}
+
+// TestDiff_IgnoreNotNullRelaxation covers the one directional DiffOption, and
+// deliberately drives it through DiffCreateTables rather than Diff, because
+// only that orientation reads the way consumers use it.
+//
+// Diff compares got->want (DiffCreateTables calls got.Diff(want, opts)), so the
+// receiver is the schema being validated and the parameter is the reference it
+// is validated against. Naming a direction in terms of Diff's own arguments
+// therefore inverts it. Here "reference" and "validated" are named for their
+// roles, and move-tables' use of them is spelled out per case: the reference is
+// the move SOURCE, the validated schema is the physical TARGET, and the rule
+// being asserted is that a target may be *stricter* than its source (NOT NULL
+// where the source permits NULL) but never looser. See
+// move/check.TargetSchemaDiff.
+func TestDiff_IgnoreNotNullRelaxation(t *testing.T) {
+	tests := []struct {
+		name string
+		// reference is the source of truth — the move's SOURCE table.
+		reference string
+		// validated is the schema checked against it — the move's TARGET.
+		validated string
+		relax     bool
+		// expected is the ALTER that would turn validated into reference,
+		// i.e. what a consumer reports as a mismatch. Empty means the two are
+		// equivalent and the check passes.
+		expected string
+	}{
+		{
+			// Without the option a stricter target is a mismatch, which is why
+			// the option has to exist for a sharded move at all.
+			name:      "DefaultRejectsStricterTarget",
+			reference: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NULL)",
+			validated: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			relax:     false,
+			expected:  "ALTER TABLE `t1` MODIFY COLUMN `customer_id` bigint NULL",
+		},
+		{
+			// The move-tables case: the source column still permits NULL, the
+			// sharded target declares NOT NULL because a primary vindex cannot
+			// map NULL to a keyspace id. Accepted.
+			name:      "StricterTargetAccepted",
+			reference: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NULL)",
+			validated: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			relax:     true,
+			expected:  "",
+		},
+		{
+			// Same case in the form SHOW CREATE TABLE actually reports a
+			// nullable column, which is what the move checks feed in: the
+			// rendered `DEFAULT NULL` must not read as a default difference
+			// against the NOT NULL side's absent default.
+			name:      "StricterTargetAccepted_SourceRendersDefaultNull",
+			reference: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
+			validated: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			relax:     true,
+			expected:  "",
+		},
+		{
+			// The direction that matters for safety: a target that LOST a
+			// NOT NULL its source had is still a mismatch, so the option can
+			// never quietly accept a looser target.
+			name:      "LooserTargetStillRejected",
+			reference: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			validated: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NULL)",
+			relax:     true,
+			expected:  "ALTER TABLE `t1` MODIFY COLUMN `customer_id` bigint NOT NULL",
+		},
+		{
+			// Forgiving one column's nullability does not stop the diff
+			// reporting a different column's change.
+			name:      "OtherColumnChangesStillDetected",
+			reference: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NULL, b INT)",
+			validated: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NOT NULL, b VARCHAR(100))",
+			relax:     true,
+			expected:  "ALTER TABLE `t1` MODIFY COLUMN `b` int NULL",
+		},
+		{
+			// The relaxation is scoped to nullability alone: a column that also
+			// changes type is still reported, so the option cannot smuggle a
+			// type change past a consumer's check.
+			name:      "TypeChangeStillDetected",
+			reference: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NULL)",
+			validated: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id INT NOT NULL)",
+			relax:     true,
+			expected:  "ALTER TABLE `t1` MODIFY COLUMN `customer_id` bigint NULL",
+		},
+		{
+			// Only the bare NULL keyword collapses to "no default", so a real
+			// default the target lacks is still reported.
+			name:      "ExplicitDefaultStillDetected",
+			reference: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NULL DEFAULT '0')",
+			validated: "CREATE TABLE t1 (id INT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			relax:     true,
+			expected:  "ALTER TABLE `t1` MODIFY COLUMN `customer_id` bigint NULL DEFAULT '0'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := NewDiffOptions()
+			opts.IgnoreNotNullRelaxation = tt.relax
+
+			diff, err := DiffCreateTables("t1", tt.reference, tt.validated, opts)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, diff)
 		})
 	}
 }

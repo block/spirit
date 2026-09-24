@@ -5,12 +5,12 @@ import (
 	"log/slog"
 	"testing"
 
+	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -96,5 +96,6 @@ func TestBinlogFlushUnderTableLockErrors(t *testing.T) {
 }
 
 func TestGTIDFlushUnderTableLockErrors(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	runFlushUnderTableLockErrorBranches(t, true, "gtidflushlockerrt1", "gtidflushlockerrt2")
 }

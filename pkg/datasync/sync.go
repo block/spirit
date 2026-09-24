@@ -33,6 +33,7 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -41,9 +42,14 @@ import (
 // programmatic callers (e.g. strata's Vitess/PlanetScale import) that
 // inject a non-MySQL change source and/or a custom applier.
 type Sync struct {
-	SourceDSN       string        `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
-	TargetDSN       string        `name:"target-dsn" help:"Where to sync the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
-	TargetChunkTime time.Duration `name:"target-chunk-time" help:"Target time for each checksum chunk. The copy phase is sized by an in-memory byte budget and does not use this." default:"5s"`
+	// EnableExperimentalAutoscaling derives bounded copy/checksum concurrency
+	// from the Aurora target and adapts it to target load throughout the sync.
+	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: scale copy, write and checksum concurrency using Aurora target load. Overrides --threads and --write-threads when the target qualifies." default:"false"`
+
+	// MaxConnections limits each SQL pool; worker counts do not expand it.
+	MaxConnections int    `name:"max-connections" help:"Size of each source and target SQL connection pool. Workers share the pool and contend for connections." default:"128"`
+	SourceDSN      string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
+	TargetDSN      string `name:"target-dsn" help:"Where to sync the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
 	// TargetChunkSize is the in-memory byte budget the buffered copier sizes each
 	// copy chunk against (see table.DefaultTargetChunkBytes). Sync always uses the
 	// buffered copier. A zero value means "use the default" (the runner fills it
@@ -56,40 +62,27 @@ type Sync struct {
 	// batching trade-off. Defaults to change.DefaultFlushInterval.
 	FlushInterval time.Duration `name:"flush-interval" help:"How often to flush buffered changes to the target during continuous sync." default:"30s"`
 
-	// DeferSecondaryIndexes creates the target tables without their secondary
+	// DeferSecondaryIndexes creates the target tables without their deferrable regular
 	// indexes, then adds the indexes back once the initial copy has completed.
-	// Bulk-loading an index-free table is faster and lighter on temporary
+	// Bulk-loading a table with fewer indexes is faster and lighter on temporary
 	// space; the indexes are rebuilt in one ALTER per table afterwards. Only
 	// safe when the target is not yet serving reads, because the tables briefly
 	// lack their secondary indexes. UNIQUE/FULLTEXT/SPATIAL indexes are kept on
-	// the initial CREATE (only regular secondary indexes are deferred), the
+	// the initial CREATE, as is a regular index required by AUTO_INCREMENT, the
 	// same as `move --defer-secondary-indexes`.
-	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Create target tables without secondary indexes, then add them after the initial copy." default:"false"`
+	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Defer regular indexes until after the initial copy, preserving required AUTO_INCREMENT support." default:"false"`
 
-	// CopyOnly performs only the initial copy and then returns — no change
-	// capture and no continuous replication, so no change.Source is
-	// constructed or required. Useful for a one-shot snapshot, or when the
-	// source cannot provide a change feed (e.g. a managed Vitess without
-	// binlog/VStream access, or a replica lacking the REPLICATION privileges
-	// the built-in binlog client needs). A final checkpoint is still written,
-	// so a later run resumes the copy from there (or no-ops if it had already
-	// completed) rather than starting over.
-	CopyOnly bool `name:"copy-only" help:"Only run the initial copy, then exit (no continuous change capture)." default:"false"`
-
-	// Force, when set, makes the runner drop and recreate the target database
-	// at startup *unless* a resumable checkpoint exists — i.e. it only nukes
-	// the target when the copy could not have resumed anyway. A resumable
-	// run (checkpoint present) is left intact and resumes as normal. Intended
-	// for testing/iterating, where a previous partial run can leave the target
-	// non-empty with no usable checkpoint, otherwise tripping the fresh-sync
-	// target-empty guard.
-	Force bool `name:"force" help:"Drop and recreate the target database when the copy cannot resume from a checkpoint." default:"false"`
-
-	// GTID switches the built-in change source from binlog file+position to
-	// MySQL GTIDs. EXPERIMENTAL — see pkg/change/gtid.go. Ignored when a
-	// pre-constructed Source is injected. Requires gtid_mode=ON and
-	// enforce_gtid_consistency=ON on the source.
-	GTID bool `name:"gtid" help:"EXPERIMENTAL: use GTID-based change source instead of binlog file+position" default:"false"`
+	// Force, when set, makes the runner wipe the sync-owned objects on the
+	// target at startup — the target copies of the source tables plus the sync
+	// checkpoint table — *unless* a resumable checkpoint exists, i.e. it only
+	// wipes when the copy could not have resumed anyway. A resumable run
+	// (checkpoint present) is left intact and resumes as normal. The wipe is
+	// per-table, never DROP DATABASE: sync tolerates a target database shared
+	// with unrelated tables, and --force must not destroy tables the sync
+	// never owned. Intended for testing/iterating, where a previous partial
+	// run can leave the target non-empty with no usable checkpoint, otherwise
+	// tripping the fresh-sync target-empty guard.
+	Force bool `name:"force" help:"Drop and recreate the sync's target tables (never the whole target database) when the copy cannot resume from a checkpoint." default:"false"`
 
 	// Source optionally provides a pre-constructed change.Source to use
 	// for replication instead of constructing a built-in MySQL-binlog
@@ -127,13 +120,12 @@ func (s *Sync) Validate() error {
 	if s.WriteThreads < 0 {
 		return fmt.Errorf("--write-threads must be non-negative, got %d", s.WriteThreads)
 	}
-	if s.TargetChunkTime < 0 {
-		return fmt.Errorf("--target-chunk-time must be non-negative, got %s", s.TargetChunkTime)
-	}
 	if s.FlushInterval < 0 {
 		return fmt.Errorf("--flush-interval must be non-negative, got %s", s.FlushInterval)
 	}
-	return nil
+	// Continuous sync has no cutover or pinned checksum snapshots, so it
+	// only needs the general limit validation, not finite-run headroom.
+	return dbconn.ValidateConnectionLimit(s.MaxConnections)
 }
 
 // Run is the kong CLI entry point. It runs the sync until the process

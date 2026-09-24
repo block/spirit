@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
@@ -18,7 +19,6 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -32,19 +32,92 @@ import (
 // client previously omitted TimestampStringLocation, silently corrupting
 // TIMESTAMP columns under --gtid on non-UTC hosts.
 func TestSyncerConfigDecodeOptions(t *testing.T) {
+	// subs is initialized like the real constructors do: the config's
+	// RowsEventDecodeFunc closes over it, so a nil registry here would make
+	// the wiring under test unrepresentative (and the func a latent panic).
 	configs := map[string]replication.BinlogSyncerConfig{
-		"binlog": (&binlogClient{serverID: 123}).buildSyncerConfig("127.0.0.1", 3306),
-		"gtid":   (&gtidClient{serverID: 123}).buildSyncerConfig("127.0.0.1", 3306),
+		"binlog": (&binlogClient{serverID: 123, subs: newSubscriptionRegistry()}).buildSyncerConfig("127.0.0.1", 3306),
+		"gtid":   (&gtidClient{serverID: 123, subs: newSubscriptionRegistry()}).buildSyncerConfig("127.0.0.1", 3306),
 	}
 	for name, cfg := range configs {
 		require.Equal(t, time.UTC, cfg.TimestampStringLocation, "%s client must decode TIMESTAMP values in UTC", name)
 		require.True(t, cfg.RenderJSONAsMySQLText, "%s client must render JSON as MySQL text", name)
+		require.NotNil(t, cfg.RowsEventDecodeFunc, "%s client must skip row-image decoding for unsubscribed tables (see newRowsEventDecodeFunc)", name)
+	}
+}
+
+// TestRowsEventDecodeFuncSkipsUnsubscribed drives the decode filter directly:
+// events for tables without a subscription must get their header decoded (the
+// table name and LogPos come from there) but not their row images, and the
+// stopped flag must short-circuit everything. This is the fast path that keeps
+// the stream from re-decoding spirit's own _new-table writes during the copy.
+func TestRowsEventDecodeFuncSkipsUnsubscribed(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS decodefilter_t1, decodefilter_t2, decodefilter_noise")
+	testutils.RunSQL(t, "CREATE TABLE decodefilter_t1 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE decodefilter_t2 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+	// decodefilter_noise stands in for the _new table: high write volume with
+	// no subscription.
+	testutils.RunSQL(t, "CREATE TABLE decodefilter_noise (a INT NOT NULL AUTO_INCREMENT, b VARCHAR(255), PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "decodefilter_t1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "decodefilter_t2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	for _, mode := range []string{"binlog", "gtid"} {
+		t.Run(mode, func(t *testing.T) {
+			if mode == "gtid" {
+				skipUnlessGTIDEnabled(t)
+			}
+			// Each mode replays the same statements; start from empty tables —
+			// the noise table included, or its INSERT ... SELECT doublings
+			// compound across modes and the workload depends on run order.
+			testutils.RunSQL(t, "DELETE FROM decodefilter_t1")
+			testutils.RunSQL(t, "DELETE FROM decodefilter_t2")
+			testutils.RunSQL(t, "DELETE FROM decodefilter_noise")
+			var client Source
+			if mode == "gtid" {
+				client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
+			} else {
+				client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
+			}
+			chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+			require.NoError(t, err)
+			require.NoError(t, client.AddSubscription(t1, t2, chunker))
+			require.NoError(t, client.Start(t.Context()))
+			defer client.Close()
+
+			// Interleave unsubscribed noise around subscribed changes. The
+			// noise events must be skipped without desyncing the stream:
+			// position keeps advancing and the t1 deltas still flush.
+			testutils.RunSQL(t, "INSERT INTO decodefilter_noise (b) VALUES (REPEAT('x', 200)), (REPEAT('y', 200))")
+			testutils.RunSQL(t, "INSERT INTO decodefilter_t1 (a, b) VALUES (1, 1)")
+			testutils.RunSQL(t, "INSERT INTO decodefilter_noise (b) SELECT b FROM decodefilter_noise")
+			testutils.RunSQL(t, "UPDATE decodefilter_t1 SET b = 2 WHERE a = 1")
+			testutils.RunSQL(t, "INSERT INTO decodefilter_noise (b) SELECT b FROM decodefilter_noise")
+
+			require.NoError(t, client.BlockWait(t.Context()))
+			require.Equal(t, 1, client.GetDeltaLen(), "t1's insert+update collapse to one key")
+			require.NoError(t, client.Flush(t.Context()))
+
+			var b int
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT b FROM decodefilter_t2 WHERE a = 1").Scan(&b))
+			require.Equal(t, 2, b, "the subscribed table's latest image must flush despite surrounding skipped events")
+		})
 	}
 }
 
 // TestGTIDClient mirrors TestReplClient but uses the GTID-backed change
 // source. Verifies the basic INSERT → buffer → flush loop end-to-end.
 func TestGTIDClient(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -90,6 +163,7 @@ func TestGTIDClient(t *testing.T) {
 // lose the deltas AND leave bufferedGTID permanently behind gtid_executed,
 // so the BlockWait calls below would time out.
 func TestGTIDClientTransactionCompression(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -205,7 +279,9 @@ func TestGTIDStartFromMalformedPosition(t *testing.T) {
 // set takes Start's fresh-start branch via IsEmpty.
 func TestValidateResumeGTIDSet(t *testing.T) {
 	const (
-		sidA = "11111111-2222-3333-4444-555555555555"
+		// MySQL server UUIDs. sadscan reads the 4444-5555... digit run as a
+		// Visa PAN; it is a synthetic GTID source id, not card data.
+		sidA = "11111111-2222-3333-4444-555555555555" // sadscan:disable sq.pii.cc.visa
 		sidB = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 	)
 	tests := []struct {
@@ -292,6 +368,7 @@ func TestValidateResumeGTIDSet(t *testing.T) {
 // mutation: gtid_executed only ever grows, so a synthetic future GTID
 // stays unexecuted no matter what concurrent tests commit.
 func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -341,19 +418,26 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 }
 
 // TestGTIDClientUnparseableDDL is a regression test: a QueryEvent the
-// TiDB parser cannot parse (CREATE TRIGGER, stored procedure bodies,
-// certain ALTER USER variants, ...) must still promote the
-// transaction's pending GTID into bufferedGTID. (XA statements are also
-// unparseable but never reach the parser — they fail the stream
-// outright, since spirit does not support XA workloads; see
+// parser cannot parse (mode-dependent SQL — here DDL logged under
+// ANSI_QUOTES, which the server binlogs verbatim with its double-quoted
+// identifiers) must still get the transaction's
+// pending GTID into bufferedGTID — not at the QueryEvent itself (it
+// could sit mid-group; see
+// TestGTIDClientQueryPromotionOrdering), but at the next
+// GTIDEvent, which proves the group ended. (XA statements are also
+// unparseable but never reach the parser — they fail the stream; see
 // TestGTIDClientXAGuardStream.) Every QueryEvent on
 // the entire server flows through the parser — the schema filter only
 // applies after parsing — so before the fix a single unparseable
 // statement in a *completely unrelated schema* left bufferedGTID
 // permanently behind gtid_executed: BlockWait timed out forever, Flush
 // looped indefinitely, and a GTID-mode migration was wedged until
-// cancelled.
+// cancelled. The trigger DDL after it doubles as the next-GTIDEvent
+// promotion for the deferred GTID (stored programs parse nowadays, so
+// the trigger's own group promotes at its QueryEvent — the prompt path
+// — keeping both paths covered end-to-end here).
 func TestGTIDClientUnparseableDDL(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -383,10 +467,25 @@ func TestGTIDClientUnparseableDDL(t *testing.T) {
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
-	// CREATE TRIGGER is binlogged as a QueryEvent that the TiDB parser
-	// rejects (it is also recorded with a DEFINER clause, which fails the
-	// parse on its own). The statement is its own server transaction with
-	// its own GTID, terminated without an XIDEvent.
+	// The parser always runs with default quoting, so this statement is
+	// binlogged verbatim (double quotes and all) and fails to parse. It
+	// is its own server transaction with its own GTID, terminated without
+	// an XIDEvent. The SET and the CREATE must share one connection for
+	// the session mode to apply, hence the pinned sql.Conn.
+	ansiDB, err := sql.Open("block-mysql", testutils.DSNForDatabase(otherSchema))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(ansiDB)
+	ansiConn, err := ansiDB.Conn(t.Context())
+	require.NoError(t, err)
+	_, err = ansiConn.ExecContext(t.Context(), "SET SESSION sql_mode = 'ANSI_QUOTES'")
+	require.NoError(t, err)
+	_, err = ansiConn.ExecContext(t.Context(), `CREATE TABLE "unrelated2" ("a" int)`)
+	require.NoError(t, err)
+	require.NoError(t, ansiConn.Close())
+
+	// Stored program DDL parses these days: this group promotes at its
+	// own QueryEvent, and its GTIDEvent is also what proves the
+	// ANSI_QUOTES group above ended, promoting the deferred GTID.
 	testutils.RunSQLInDatabase(t, otherSchema,
 		"CREATE TRIGGER gtidunparse_trg BEFORE INSERT ON unrelated FOR EACH ROW SET @gtid_unparse_test = 1")
 
@@ -412,6 +511,7 @@ func TestGTIDClientUnparseableDDL(t *testing.T) {
 // COMMIT/ROLLBACK early-out used to `continue` without promoting the
 // pending GTID, leaving bufferedGTID permanently behind gtid_executed.
 func TestGTIDClientNonXIDCommit(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -547,6 +647,7 @@ func rollbackDanglingXATestTxns(t *testing.T, db *sql.DB, knownXIDs ...string) {
 // stragglers from hard-killed runs leak in isolation instead of wedging
 // future runs; graceful failures are reclaimed by the cleanup below.
 func TestGTIDClientXATransaction(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -573,7 +674,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 		// prepared transaction's metadata locks. The lock_wait_timeout
 		// bounds the worst case so a leftover can fail the cleanup but
 		// not hang the suite.
-		cleanupDB, err := sql.Open("mysql", testutils.DSN())
+		cleanupDB, err := sql.Open("block-mysql", testutils.DSN())
 		if err != nil {
 			return
 		}
@@ -688,6 +789,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 // Unique xids and per-run table names for the same reasons documented on
 // TestGTIDClientXATransaction.
 func TestGTIDClientXATransactionCompression(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -706,7 +808,7 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	t.Cleanup(func() {
 		// See TestGTIDClientXATransaction: terminate this run's XA
 		// transactions before dropping the tables, from a fresh connection.
-		cleanupDB, err := sql.Open("mysql", testutils.DSN())
+		cleanupDB, err := sql.Open("block-mysql", testutils.DSN())
 		if err != nil {
 			return
 		}
@@ -1044,6 +1146,7 @@ func TestGTIDProcessTransactionPayloadXAGuard(t *testing.T) {
 // GetDeltaLen reflects a row event, every event injected before it has
 // been processed.
 func TestGTIDClientSavepointPromotionOrdering(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1183,6 +1286,7 @@ func TestGTIDClientSavepointPromotionOrdering(t *testing.T) {
 // after the savepoints must replicate, while the rolled-back row must
 // not.
 func TestGTIDClientSavepointTransaction(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1259,6 +1363,260 @@ func TestGTIDClientSavepointTransaction(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "1,2,4", pks,
 		"the row inserted between SAVEPOINT and ROLLBACK TO SAVEPOINT must not replicate; the rows before and after must")
+}
+
+// TestGTIDClientQueryPromotionOrdering is the mid-group-DDL twin of
+// TestGTIDClientSavepointPromotionOrdering. A DDL QueryEvent used to
+// promote the pending GTID unconditionally, on the assumption that a DDL
+// statement is always a standalone single-statement transaction. It is
+// not: since 8.0.21 the server logs CREATE TABLE ... SELECT as
+// GTIDEvent → Query(BEGIN) → Query("CREATE TABLE ... START TRANSACTION")
+// → row events → XIDEvent (shape verified against MySQL 8.0.45), putting
+// the CREATE TABLE mid-group with its row events still to come. A
+// promotion fired there let a flush in that window publish a resume
+// coordinate that already covered the transaction (and recreateStreamer
+// resumed past it after a mere stream hiccup), so its remaining events
+// were silently lost.
+//
+// Both parser outcomes for such a statement must defer. The parser now
+// understands the START TRANSACTION suffix, so the parsed path defers via
+// extractTablesFromDDLStmts's opensTransaction (group 1 below); the GTID
+// advances at the group's own terminator, the XIDEvent. An unparseable
+// QueryEvent (group 2: ANSI_QUOTES DDL, which the parser does not
+// parse) never promotes either, because it could equally sit mid-group;
+// for a genuinely standalone statement the next GTIDEvent, which proves
+// the group ended, promotes instead.
+//
+// Events are injected through a synthetic go-mysql BinlogStreamer for the
+// same reason as in the XA and savepoint tests: the server writes the
+// whole group to the binlog in one burst at commit, so wall-clock timing
+// cannot reliably observe the stream state between the mid-group
+// QueryEvent and the group terminator of the same burst. Row events for a
+// subscribed table are inert to the promotion logic and serve as ordering
+// barriers: events are consumed strictly in order, so once GetDeltaLen
+// reflects a row event, every event injected before it has been
+// processed. (In a real CTAS group the row events target the created —
+// unsubscribed — table; a subscribed table stands in for any group tail.)
+func TestGTIDClientQueryPromotionOrdering(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	// Real tables so TableInfo has genuine column/PK metadata; the event
+	// stream itself is synthetic and never touches the server.
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS gtidunpsyn1, gtidunpsyn2")
+	testutils.RunSQL(t, "CREATE TABLE gtidunpsyn1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE gtidunpsyn2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "gtidunpsyn1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "gtidunpsyn2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+
+	// Wire readStream to a synthetic streamer instead of client.Start().
+	empty, err := mysql.ParseMysqlGTIDSet("")
+	require.NoError(t, err)
+	streamer := replication.NewBinlogStreamer()
+	ctx, cancel := context.WithCancel(t.Context())
+	client.streamer = streamer
+	client.bufferedGTID = empty
+	client.flushedGTID = empty.Clone()
+	client.cancelFunc = cancel
+	client.streamWG.Add(1)
+	go client.readStream(ctx)
+	defer client.Close()
+
+	const sid = "aaaaaaaa-bbbb-cccc-dddd-000000000000"
+	sidUUID := uuid.MustParse(sid)
+	gtidEvent := func(gno int64) *replication.BinlogEvent {
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.GTID_EVENT},
+			Event:  &replication.GTIDEvent{SID: sidUUID[:], GNO: gno},
+		}
+	}
+	queryEvent := func(q string) *replication.BinlogEvent {
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.QUERY_EVENT},
+			Event:  &replication.QueryEvent{Schema: []byte("test"), Query: []byte(q)},
+		}
+	}
+	rowEvent := func(pk int32) *replication.BinlogEvent {
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2},
+			Event: &replication.RowsEvent{
+				Table: &replication.TableMapEvent{Schema: []byte("test"), Table: []byte("gtidunpsyn1")},
+				Rows:  [][]any{{pk, int32(0), int32(0)}},
+			},
+		}
+	}
+	inject := func(evs ...*replication.BinlogEvent) {
+		t.Helper()
+		for _, ev := range evs {
+			require.NoError(t, streamer.AddEventToStreamer(ev))
+		}
+	}
+	buffered := func(gno int64) bool {
+		target, err := mysql.ParseMysqlGTIDSet(fmt.Sprintf("%s:%d", sid, gno))
+		require.NoError(t, err)
+		return client.getBufferedGTID().Contain(target)
+	}
+
+	// Group 1: the CREATE TABLE ... SELECT shape, exactly as the server
+	// writes it (query text taken verbatim from a MySQL 8.0.45 binlog).
+	// The statement parses, and its StartTransaction form marks it as the
+	// group opener. The row event after it is the group tail the
+	// premature promotion used to put at risk.
+	inject(gtidEvent(300), queryEvent("BEGIN"),
+		queryEvent("CREATE TABLE `ctas1` (\n  `a` int NOT NULL,\n  `b` int DEFAULT NULL\n) START TRANSACTION"),
+		rowEvent(1))
+	require.Eventually(t, func() bool { return client.GetDeltaLen() == 1 },
+		5*time.Second, 5*time.Millisecond, "row event after the CTAS statement was not processed")
+	require.False(t, buffered(300),
+		"the GTID must not be promoted at a transaction-opening QueryEvent: the group's remaining events are not buffered yet")
+	client.mu.Lock()
+	pendingGNO := client.pendingGNO
+	client.mu.Unlock()
+	require.EqualValues(t, 300, pendingGNO, "the CTAS transaction's GTID must still be pending after its opening statement")
+
+	// The XIDEvent terminates the group; only now may the GTID enter the
+	// buffered (resume) set.
+	inject(&replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.XID_EVENT},
+		Event:  &replication.XIDEvent{XID: 1},
+	})
+	require.Eventually(t, func() bool { return buffered(300) },
+		5*time.Second, 5*time.Millisecond, "the XIDEvent must promote the pending GTID")
+
+	// Group 2: a genuinely standalone unparseable statement. The server
+	// binlogs DDL verbatim, so under ANSI_QUOTES the double-quoted
+	// identifiers reach the parser (which always runs with default
+	// quoting) and fail. Its QueryEvent is its group terminator, but an
+	// unparseable statement could equally sit mid-group (as the CTAS form
+	// did before the parser understood it), so it must not promote
+	// either. (The row event is purely an ordering barrier — a real
+	// standalone-DDL group has none.)
+	inject(gtidEvent(301),
+		queryEvent(`CREATE TABLE "gtidunpsyn1" ("a" int)`),
+		rowEvent(2))
+	require.Eventually(t, func() bool { return client.GetDeltaLen() == 2 },
+		5*time.Second, 5*time.Millisecond, "row event after the trigger DDL was not processed")
+	require.False(t, buffered(301),
+		"a standalone unparseable statement must not promote at the QueryEvent: it is indistinguishable from a mid-group one")
+
+	// Liveness: the next GTIDEvent proves group 301 ended and must
+	// promote it before stashing its own — dropping it instead would
+	// leave bufferedGTID permanently behind gtid_executed.
+	inject(gtidEvent(302))
+	require.Eventually(t, func() bool { return buffered(301) },
+		5*time.Second, 5*time.Millisecond, "the next GTIDEvent must promote the deferred standalone statement's GTID")
+
+	// And the new group's own lifecycle is undisturbed by the leftover
+	// promotion: it still promotes at its XIDEvent, not before.
+	inject(queryEvent("BEGIN"), rowEvent(3))
+	require.Eventually(t, func() bool { return client.GetDeltaLen() == 3 },
+		5*time.Second, 5*time.Millisecond, "row event in the follow-up transaction was not processed")
+	require.False(t, buffered(302), "the follow-up transaction must not be promoted before its XIDEvent")
+	inject(&replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.XID_EVENT},
+		Event:  &replication.XIDEvent{XID: 2},
+	})
+	require.Eventually(t, func() bool { return buffered(302) },
+		5*time.Second, 5*time.Millisecond, "the follow-up transaction's XIDEvent must promote its GTID")
+
+	// Group 4: stored program DDL now parses (CREATE TRIGGER here), so it
+	// takes the parsed non-transaction-opening path and promotes at its
+	// own QueryEvent — no follow-up event needed. This is the prompt
+	// variant of the deferred promotion group 2 exercised.
+	inject(gtidEvent(303),
+		queryEvent("CREATE DEFINER=`root`@`localhost` TRIGGER trg BEFORE INSERT ON gtidunpsyn1 FOR EACH ROW SET @x = 1"))
+	require.Eventually(t, func() bool { return buffered(303) },
+		5*time.Second, 5*time.Millisecond, "parsed standalone DDL must promote at its own QueryEvent")
+}
+
+// TestGTIDClientCreateTableAsSelect drives a real CREATE TABLE ... SELECT
+// through the feed end-to-end. Since 8.0.21 the server logs it as a
+// single transaction — GTIDEvent → Query(BEGIN) → Query("CREATE TABLE ...
+// START TRANSACTION") → row events → XIDEvent — whose CREATE TABLE
+// statement sits mid-group (it parses, and its StartTransaction form
+// defers promotion).
+//
+// The premature-promotion window itself cannot be observed end-to-end
+// (the server writes the whole group in one burst at commit; that is what
+// TestGTIDClientQueryPromotionOrdering covers
+// deterministically). What this test pins is liveness with the real
+// binlog shape: deferring promotion at the opening statement must not
+// suppress the promotion the group gets from its own XIDEvent — if it
+// did, bufferedGTID would fall permanently behind gtid_executed and the
+// BlockWait right after the CTAS would time out, with no later traffic to
+// bail it out.
+func TestGTIDClientCreateTableAsSelect(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS gtidctast1, gtidctast2")
+	testutils.RunSQL(t, "CREATE TABLE gtidctast1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE gtidctast2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+
+	// A separate schema for the CTAS, as for the unparseable-DDL test:
+	// the parse happens before any schema filtering.
+	otherSchema, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, otherSchema, "CREATE TABLE ctas_src (a INT NOT NULL PRIMARY KEY, b INT)")
+	testutils.RunSQLInDatabase(t, otherSchema, "INSERT INTO ctas_src VALUES (1, 1), (2, 2)")
+
+	t1 := table.NewTableInfo(db, "test", "gtidctast1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "gtidctast2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.Start(t.Context()))
+	defer client.Close()
+
+	testutils.RunSQLInDatabase(t, otherSchema, "CREATE TABLE ctas_dst AS SELECT * FROM ctas_src")
+
+	// Captured right after the CTAS (and before BlockWait) so the
+	// containment assertion below is deterministic even with unrelated
+	// concurrent load advancing gtid_executed on a shared server.
+	var executed string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@GLOBAL.gtid_executed").Scan(&executed))
+	executedSet, err := mysql.ParseMysqlGTIDSet(normalizeGTIDString(executed))
+	require.NoError(t, err)
+
+	// The CTAS group's own XIDEvent must promote its (deferred) GTID.
+	require.NoError(t, client.BlockWait(t.Context()))
+
+	// A normal tracked-table write still replicates afterwards.
+	testutils.RunSQL(t, "INSERT INTO gtidctast1 (a, b, c) VALUES (1, 2, 3)")
+	require.NoError(t, client.BlockWait(t.Context()))
+	require.Equal(t, 1, client.GetDeltaLen())
+	require.NoError(t, client.Flush(t.Context()))
+
+	// The resume coordinate must cover the CTAS transaction: resuming
+	// from it must not re-request (or skip) any part of it.
+	flushedSet, err := mysql.ParseMysqlGTIDSet(normalizeGTIDString(client.Position()))
+	require.NoError(t, err)
+	require.True(t, flushedSet.Contain(executedSet),
+		"flushed position %s must cover the executed set %s (including the CTAS GTID)", flushedSet.String(), executedSet.String())
+
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM gtidctast2").Scan(&count))
+	require.Equal(t, 1, count)
 }
 
 // TestGTIDPromotePendingGTID unit-tests the promotion helper directly
@@ -1362,6 +1720,7 @@ func TestFlushedGTIDIsMonotonicAcrossOverlappingFlushes(t *testing.T) {
 // TestGTIDRoundtripPosition verifies that the opaque Position string
 // emitted after Start parses back into a GTIDSet (i.e. format round-trips).
 func TestGTIDRoundtripPosition(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -1406,6 +1765,7 @@ func TestGTIDRoundtripPosition(t *testing.T) {
 // readStream goroutine on any DDL notification for a non-subscribed
 // table.
 func TestGTIDProcessDDLNotificationMoveStyle(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	dbName, db := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE orders (id INT NOT NULL PRIMARY KEY)")
 

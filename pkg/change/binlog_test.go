@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
@@ -20,7 +21,6 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -103,7 +103,7 @@ func TestReplClientComplex(t *testing.T) {
 	require.NoError(t, chunker.Open())
 	copierCfg := copier.NewCopierDefaultConfig()
 	copierCfg.Applier = applier.NewSingleTargetForTest(t, db)
-	_, err = copier.NewCopier(db, chunker, copierCfg)
+	_, err = copier.NewCopier(chunker, copierCfg)
 	require.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
 	require.NoError(t, client.AddSubscription(t1, t2, chunker))
@@ -290,7 +290,7 @@ func TestReplClientResumeFromImpossible(t *testing.T) {
 }
 
 func TestReplClientResumeFromPoint(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -514,7 +514,7 @@ func TestReplClientQueue(t *testing.T) {
 	require.NoError(t, chunker.Open())
 	copierCfg := copier.NewCopierDefaultConfig()
 	copierCfg.Applier = applier.NewSingleTargetForTest(t, db)
-	_, err = copier.NewCopier(db, chunker, copierCfg)
+	_, err = copier.NewCopier(chunker, copierCfg)
 	require.NoError(t, err)
 	// Attach chunker's keyabovewatermark to the repl client
 	require.NoError(t, client.AddSubscription(t1, t2, chunker))
@@ -586,29 +586,11 @@ func TestBlockWait(t *testing.T) {
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
-	// We test that BlockWait does not flush the binlog if the buffered position is advancing by
-	// 1. kicking off a go-routine that inserts into an unrelated table
-	// 2. verifying that flushedBinlogs is still 0 at the end of BlockWait
-	ctx, cancel := context.WithCancel(t.Context())
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		i := 1
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				_, _ = db.ExecContext(ctx, fmt.Sprintf("INSERT INTO blockwaitt3 (a, b, c) VALUES (%d, %d, %d)", i, i, i))
-				i++
-			}
-		}
-	})
-	time.Sleep(3 * time.Second) // should be enough for BlockWait to block for 1 iteration before catching up, but not guaranteed
-	client.flushedBinlogs.Store(0)
+	// Unrelated-table events must not prevent the reader catching up. Whether
+	// a real reader briefly stalls is scheduler-dependent; the exact rotation
+	// policy is covered by TestBlockWaitStalls using controlled progress.
+	testutils.RunSQL(t, "INSERT INTO blockwaitt3 (a, b, c) VALUES (1, 1, 1)")
 	require.NoError(t, client.BlockWait(t.Context()))
-	cancel()
-	wg.Wait() // ensure goroutine exits before test completes
-	require.Equal(t, int64(0), client.flushedBinlogs.Load())
 
 	// Insert into t1.
 	testutils.RunSQL(t, "INSERT INTO blockwaitt1 (a, b, c) VALUES (1, 2, 3)")
@@ -1618,4 +1600,54 @@ func TestProcessDDLNotification(t *testing.T) {
 			c.processDDLNotification("mydb", "some_table")
 		})
 	})
+}
+
+func TestFlushResidual(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS residt1, residt2")
+	testutils.RunSQL(t, "CREATE TABLE residt1 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE residt2 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "residt1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "residt2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.Start(t.Context()))
+	defer client.Close()
+
+	// Nothing has been flushed yet, so there is no residual to report. The
+	// checksum autoscaler relies on this: it treats a zero flush count as "no
+	// comparison possible yet" rather than as a residual of zero.
+	residual, flushes := client.FlushResidual()
+	require.Equal(t, 0, residual)
+	require.Equal(t, 0, flushes)
+
+	testutils.RunSQL(t, "INSERT INTO residt1 (a, b) VALUES (1, 2), (3, 4)")
+	require.NoError(t, client.BlockWait(t.Context()))
+	require.Equal(t, 2, client.GetDeltaLen())
+
+	// A flush that drains everything leaves a zero residual, and this is the
+	// property the autoscaler's backlog veto keys on: a feed that is keeping up
+	// reports ~0 here no matter how large GetDeltaLen grew in between.
+	require.NoError(t, client.Flush(t.Context()))
+	residual, flushes = client.FlushResidual()
+	require.Equal(t, 0, residual)
+	require.Positive(t, flushes, "a completed flush must be counted")
+
+	// The counter is monotonic across flushes, which is what lets a caller
+	// compare residuals only once per flush rather than once per poll.
+	before := flushes
+	require.NoError(t, client.Flush(t.Context()))
+	_, flushes = client.FlushResidual()
+	require.Greater(t, flushes, before)
 }

@@ -7,11 +7,10 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
-	"github.com/pingcap/tidb/pkg/parser"
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/format"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
-	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
+	"github.com/block/spirit/pkg/parser"
+	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/format"
+	"github.com/block/spirit/pkg/parser/mysql"
 )
 
 type AbstractStatement struct {
@@ -29,9 +28,15 @@ var (
 	ErrNoStatements            = errors.New("could not find any compatible statements to execute")
 	ErrMixMatchMultiStatements = errors.New("when performing atomic schema changes, all statements must be of type ALTER TABLE")
 	ErrUnsafeForInplace        = errors.New("statement contains operations that are not safe for INPLACE algorithm")
+	ErrAlterNoSpecs            = errors.New("ALTER TABLE does not specify any changes to make")
 	ErrMultipleAlterClauses    = errors.New("ALTER contains multiple clauses. Combinations of INSTANT and INPLACE operations cannot be detected safely. Consider executing these as separate ALTER statements")
 	ErrAlterContainsUnique     = errors.New("ALTER contains adding a unique index")
 )
+
+// rewritePlaceholderTable is the table name used while re-parsing an ALTER's
+// clauses into a private AST (see AlterWithRenamedCheckConstraints). It is never
+// sent to MySQL: only the clauses that follow the table name are read back out.
+const rewritePlaceholderTable = "_spirit_rewrite"
 
 // Options configures the behavior of statement parsing.
 type Options struct {
@@ -64,21 +69,14 @@ func NewWithOptions(statement string, opts Options) ([]*AbstractStatement, error
 			// if the schema name is included it could be different from the --database
 			// specified, which causes all sorts of problems. The easiest way to handle this
 			// it just to not permit it.
-			var sb strings.Builder
-			sb.Reset()
-			rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-			if err = alterStmt.Restore(rCtx); err != nil {
-				return nil, fmt.Errorf("could not restore alter clause statement: %w", err)
-			}
-			normalizedStmt := sb.String()
-			trimLen := len(alterStmt.Table.Name.String()) + 15 // len ALTER TABLE + quotes
-			if len(alterStmt.Table.Schema.String()) > 0 {
-				trimLen += len(alterStmt.Table.Schema.String()) + 3 // len schema + quotes and dot.
+			alterClause, err := alterClauses(alterStmt, format.DefaultRestoreFlags)
+			if err != nil {
+				return nil, err
 			}
 			stmts = append(stmts, &AbstractStatement{
 				Schema:    alterStmt.Table.Schema.String(),
 				Table:     alterStmt.Table.Name.String(),
-				Alter:     normalizedStmt[trimLen:],
+				Alter:     alterClause,
 				Statement: statement,
 				StmtNode:  &stmtNodes[i],
 			})
@@ -153,6 +151,51 @@ func NewWithOptions(statement string, opts Options) ([]*AbstractStatement, error
 	}
 
 	return stmts, nil
+}
+
+// alterClauses returns just the alter clauses of an ALTER TABLE statement,
+// i.e. the "ADD COLUMN ..." in "ALTER TABLE `t` ADD COLUMN ...".
+//
+// AlterTableStmt.Restore writes "ALTER TABLE " + the table reference + " " +
+// the comma-separated specs (see its implementation in pkg/parser/ast/ddl.go),
+// so the clauses are whatever follows that prefix. Both the statement and the
+// prefix are restored here, from one flags value and through the same writer
+// calls Restore itself uses, so the two cannot render differently: whatever
+// flags do to keyword case or identifier quoting, they do to both sides.
+//
+// Counting characters off the raw identifier is not a workable substitute:
+// restore back-quotes identifiers and doubles any embedded back-quote, so a
+// name containing one restores longer than it is raw.
+//
+// A statement with no specs at all has no prefix to trim. MySQL rejects
+// "ALTER TABLE t" as a syntax error but our parser accepts it, so reject it
+// here rather than returning an empty alter — downstream an empty Alter means
+// "not a schema change" (see the CREATE TABLE case in NewWithOptions), which
+// would silently do the wrong thing.
+func alterClauses(alterStmt *ast.AlterTableStmt, flags format.RestoreFlags) (string, error) {
+	var stmtSB strings.Builder
+	if err := alterStmt.Restore(format.NewRestoreCtx(flags, &stmtSB)); err != nil {
+		return "", fmt.Errorf("could not restore alter clause statement: %w", err)
+	}
+	if len(alterStmt.Specs) == 0 {
+		return "", fmt.Errorf("%w: %s", ErrAlterNoSpecs, stmtSB.String())
+	}
+	// Mirror the opening of AlterTableStmt.Restore exactly: the keyword, the
+	// table reference, then the single space before the first spec.
+	var prefixSB strings.Builder
+	prefixCtx := format.NewRestoreCtx(flags, &prefixSB)
+	prefixCtx.WriteKeyWord("ALTER TABLE ")
+	if err := alterStmt.Table.Restore(prefixCtx); err != nil {
+		return "", fmt.Errorf("could not restore alter table name: %w", err)
+	}
+	prefixCtx.WritePlain(" ")
+	alterClause, ok := strings.CutPrefix(stmtSB.String(), prefixSB.String())
+	if !ok {
+		// Unreachable unless AlterTableStmt.Restore changes the shape this
+		// mirrors; fail loudly rather than cutting at a guessed offset.
+		return "", fmt.Errorf("could not find the alter clauses in restored statement: %s", stmtSB.String())
+	}
+	return alterClause, nil
 }
 
 // MustNew is like New but panics if the statement cannot be parsed.
@@ -236,7 +279,7 @@ func (a *AbstractStatement) AlgorithmInplaceConsideredSafe() error {
 			// AlterTableOption also covers rebuild-class options (ENGINE=,
 			// ROW_FORMAT=, AUTO_INCREMENT=, ...), so only treat it as safe when
 			// every option in this spec is COMMENT.
-			if allOptionsComment(spec) {
+			if SpecOnlyChangesComment(spec) {
 				continue
 			}
 			unsafeClauses++
@@ -252,8 +295,7 @@ func (a *AbstractStatement) AlgorithmInplaceConsideredSafe() error {
 			// which can block replicas. A NOT NULL redeclaration can't be proven
 			// unchanged from the statement alone (we don't have the current
 			// nullability here), so it conservatively routes to the copy process.
-			if spec.NewColumns[0].Tp != nil && spec.NewColumns[0].Tp.GetType() == mysql.TypeVarchar &&
-				!columnReordered(spec) && !columnDeclaredNotNull(spec.NewColumns[0]) {
+			if ModifyColumnIsMetadataOnly(spec) {
 				continue
 			}
 			unsafeClauses++
@@ -270,12 +312,28 @@ func (a *AbstractStatement) AlgorithmInplaceConsideredSafe() error {
 	return nil
 }
 
-// allOptionsComment returns true if every table option in an AlterTableOption
-// spec is a COMMENT change. A table comment change is in-place and
-// metadata-only, but other table options (ENGINE=, ROW_FORMAT=,
+// ModifyColumnIsMetadataOnly returns true if a MODIFY/CHANGE COLUMN spec only
+// changes metadata: a VARCHAR redeclaration that neither reorders the column
+// nor declares NOT NULL. Both of those are accepted by MySQL under
+// ALGORITHM=INPLACE but performed with a full table rebuild.
+//
+// This is a statement-level judgement: without the current column definition we
+// can't tell a VARCHAR length change from an INT-to-VARCHAR conversion, so a
+// true result means "not provably a rebuild" rather than "provably not".
+func ModifyColumnIsMetadataOnly(spec *ast.AlterTableSpec) bool {
+	if len(spec.NewColumns) == 0 || spec.NewColumns[0].Tp == nil {
+		return false
+	}
+	return spec.NewColumns[0].Tp.GetType() == mysql.TypeVarchar &&
+		!columnReordered(spec) && !columnDeclaredNotNull(spec.NewColumns[0])
+}
+
+// SpecOnlyChangesComment returns true if every table option in an
+// AlterTableOption spec is a COMMENT change. A table comment change is in-place
+// and metadata-only, but other table options (ENGINE=, ROW_FORMAT=,
 // AUTO_INCREMENT=, ...) can force a table rebuild, so a spec that mixes any of
 // them in is not safe for INPLACE.
-func allOptionsComment(spec *ast.AlterTableSpec) bool {
+func SpecOnlyChangesComment(spec *ast.AlterTableSpec) bool {
 	if len(spec.Options) == 0 {
 		return false
 	}
@@ -386,6 +444,135 @@ func (a *AbstractStatement) ColumnRenameMap() map[string]string {
 		}
 	}
 	return renames
+}
+
+// CheckConstraintsReferenced returns the check constraint names this ALTER
+// refers to by name, i.e. the names in its DROP CHECK / DROP CONSTRAINT and
+// ALTER CHECK clauses. It returns nil for a statement that is not an ALTER
+// TABLE, or one that names no check constraints.
+//
+// Note that MySQL's DROP CONSTRAINT is not specific to check constraints - it
+// also drops a foreign key or a unique constraint of that name - so a name it
+// contributes here is only a candidate. Callers match it against the check
+// constraints that the table actually has.
+func (a *AbstractStatement) CheckConstraintsReferenced() []string {
+	alterStmt, ok := a.AsAlterTable()
+	if !ok {
+		return nil
+	}
+	var names []string
+	for _, spec := range alterStmt.Specs {
+		switch spec.Tp { //nolint:exhaustive
+		case ast.AlterTableDropCheck, ast.AlterTableDropConstraint, ast.AlterTableAlterCheck:
+			if spec.Constraint != nil && spec.Constraint.Name != "" {
+				names = append(names, spec.Constraint.Name)
+			}
+		}
+	}
+	return names
+}
+
+// GenericConstraintDrops returns the names in this ALTER's DROP CONSTRAINT
+// clauses - the subset of CheckConstraintsReferenced that does not say which
+// kind of constraint it means. DROP CHECK and ALTER CHECK do say, so they are
+// not returned.
+//
+// MySQL resolves such a name against the table's CHECK, FOREIGN KEY, UNIQUE and
+// PRIMARY KEY constraints, which are separate namespaces, and refuses the ALTER
+// when more than one of them holds it: "Table has multiple constraints with the
+// name 'x'. Please use constraint specific 'DROP' clause" (error 3939). A caller
+// that resolves the name itself has to reproduce that rather than pick one.
+func (a *AbstractStatement) GenericConstraintDrops() []string {
+	alterStmt, ok := a.AsAlterTable()
+	if !ok {
+		return nil
+	}
+	var names []string
+	for _, spec := range alterStmt.Specs {
+		if spec.Tp == ast.AlterTableDropConstraint &&
+			spec.Constraint != nil && spec.Constraint.Name != "" {
+			names = append(names, spec.Constraint.Name)
+		}
+	}
+	return names
+}
+
+// AlterWithRenamedCheckConstraints returns this ALTER's clauses with its check
+// constraint symbols rewritten for a table other than the one the user named:
+// the copy algorithm's _new table, which holds the same check constraints under
+// different names because check constraint names are unique per schema rather
+// than per table.
+//
+// renames maps a lower-cased check constraint name on the user's table to the
+// name the same constraint has on the table the ALTER will be applied to. Names
+// in DROP CHECK / DROP CONSTRAINT and ALTER CHECK clauses are translated
+// through it; a name that is not in the map is left alone, so MySQL still
+// reports it as missing rather than spirit guessing at what was meant.
+//
+// A named check constraint being added by this same ALTER under a name it also
+// drops (the "widen this constraint" idiom: DROP CHECK c, ADD CONSTRAINT c
+// CHECK (...)) has its symbol removed, because the user's table still owns that
+// name for as long as it exists, and adding it to a second table in the schema
+// is an error. MySQL generates a name instead - the same outcome the copy
+// algorithm already produces for every check constraint it copies, and the
+// resolution recommended in issue #418. Those names are returned so the caller
+// can report them.
+func (a *AbstractStatement) AlterWithRenamedCheckConstraints(renames map[string]string) (string, []string, error) {
+	if !a.IsAlterTable() {
+		return "", nil, ErrNotAlterTable
+	}
+	// Re-parse the clauses to get an AST this function can rewrite. Editing the
+	// statement's own AST would also change what the direct-DDL attempts send to
+	// the user's table, and what error messages quote back to them.
+	copied, err := New(fmt.Sprintf("ALTER TABLE %s %s",
+		sqlescape.EscapeIdentifier(rewritePlaceholderTable), a.TrimAlter()))
+	if err != nil {
+		return "", nil, fmt.Errorf("could not re-parse ALTER to rewrite check constraint names: %w", err)
+	}
+	alterStmt, ok := copied[0].AsAlterTable()
+	if !ok {
+		return "", nil, ErrNotAlterTable
+	}
+
+	dropped := make(map[string]struct{})
+	for _, spec := range alterStmt.Specs {
+		if spec.Tp == ast.AlterTableDropCheck || spec.Tp == ast.AlterTableDropConstraint {
+			if spec.Constraint != nil {
+				dropped[strings.ToLower(spec.Constraint.Name)] = struct{}{}
+			}
+		}
+	}
+
+	var unnamed []string
+	for _, spec := range alterStmt.Specs {
+		switch spec.Tp { //nolint:exhaustive
+		case ast.AlterTableDropCheck, ast.AlterTableDropConstraint, ast.AlterTableAlterCheck:
+			if spec.Constraint == nil {
+				continue
+			}
+			if renamed, ok := renames[strings.ToLower(spec.Constraint.Name)]; ok {
+				spec.Constraint.Name = renamed
+			}
+		case ast.AlterTableAddConstraint:
+			if spec.Constraint == nil || spec.Constraint.Tp != ast.ConstraintCheck || spec.Constraint.Name == "" {
+				continue
+			}
+			if _, ok := dropped[strings.ToLower(spec.Constraint.Name)]; !ok {
+				// The name is not being freed up by this ALTER. Leave it: if it
+				// is in use elsewhere in the schema, MySQL rejecting it is the
+				// same answer the user would get running the ALTER themselves.
+				continue
+			}
+			unnamed = append(unnamed, spec.Constraint.Name)
+			spec.Constraint.Name = ""
+		}
+	}
+
+	alter, err := alterClauses(alterStmt, format.DefaultRestoreFlags)
+	if err != nil {
+		return "", nil, err
+	}
+	return alter, unnamed, nil
 }
 
 func (a *AbstractStatement) TrimAlter() string {

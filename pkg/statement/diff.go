@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
-	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/block/spirit/pkg/parser"
 )
 
 // DiffOptions controls the behavior of the Diff operation.
@@ -26,6 +26,40 @@ type DiffOptions struct {
 	// AUTO_INCREMENT in favor of a Vitess sequence: the difference does not
 	// affect copy correctness and must not block the move.
 	IgnoreColumnAutoIncrement bool
+
+	// IgnoreNotNullRelaxation lets the schema being validated be STRICTER than
+	// its reference on nullability, and only stricter: a validated column
+	// declared NOT NULL where the reference permits NULL is accepted, while one
+	// that permits NULL where the reference is NOT NULL remains a real
+	// difference. The option therefore can never quietly accept a schema that
+	// lost a NOT NULL the reference had.
+	//
+	// Default: false (via NewDiffOptions) — for general schema diffing a column
+	// gaining or losing NOT NULL is a real change.
+	//
+	// It is enabled by the move-tables target checks (see
+	// move/check.TargetSchemaDiff), where the reference is the move's SOURCE and
+	// the validated schema is its physical TARGET. What that permits is a target
+	// column declared NOT NULL where the source still permits NULL — an
+	// unsharded source moving into a sharded target whose shard key must be
+	// NOT NULL, because a Vitess primary vindex cannot map NULL to a keyspace
+	// id.
+	//
+	// In terms of Diff's own arguments the reference is the parameter and the
+	// validated schema is the receiver, because DiffCreateTables diffs
+	// got->want. Stating the direction that way inverts it, which is why the
+	// wording above and TestDiff_IgnoreNotNullRelaxation both name the two
+	// schemas by role instead.
+	//
+	// That is safe for a move because nullability is metadata, not row bytes:
+	// the copy and the checksum compare values, and every column's NULL-ness is
+	// compared explicitly (see ColumnMapping.ChecksumExprs, which emits an
+	// ISNULL() digit per column). A tightened column whose source data holds no
+	// NULLs is therefore identical on both sides, and this option hides nothing
+	// about the rows themselves. One that does hold a NULL fails the move
+	// instead of being accepted, and fails before the checksum ever runs — see
+	// move/check.TargetSchemaDiff for where and why.
+	IgnoreNotNullRelaxation bool
 
 	// IgnoreEngine skips diffing the ENGINE table option.
 	// Default: true (via NewDiffOptions).
@@ -52,6 +86,7 @@ func NewDiffOptions() *DiffOptions {
 	return &DiffOptions{
 		IgnoreAutoIncrement:       true,
 		IgnoreColumnAutoIncrement: false,
+		IgnoreNotNullRelaxation:   false,
 		IgnoreEngine:              true,
 		IgnoreCharsetCollation:    false,
 		IgnorePartitioning:        false,
@@ -221,6 +256,11 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 			// belonged to (a PK column is NOT NULL; once the PK is gone the
 			// target can declare it NULL). The PK drop itself is emitted by
 			// diffIndexes.
+			//
+			// This is the same predicate IgnoreNotNullRelaxation applies in
+			// columnsEqualWithContext, gated on PK membership rather than on
+			// the option — so with that option on, this case is subsumed.
+			// Change one and check the other.
 			lower := strings.ToLower(targetCol.Name)
 			pkDroppedNullabilityChange := sourcePKColumns[lower] && !targetPKColumns[lower] &&
 				!sourceCol.Nullable && targetCol.Nullable
@@ -656,9 +696,10 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 	return clauses
 }
 
-// columnsEqualWithContext checks if two columns are equal, considering table context for charset/collation
-// If a column's charset is nil, it inherits from the table. If it's explicitly set to the same as the table,
-// it's considered equal to nil (no explicit charset needed).
+// columnsEqualWithContext checks if two columns are equal, considering table
+// context for charset/collation: a column with no explicit charset/collation
+// inherits its owning table's defaults, so those attributes are compared on
+// their resolved values (see charsetCollationEqual).
 func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable, opts *DiffOptions) bool {
 	// Column names are case-insensitive in MySQL, so `id` and `ID` refer
 	// to the same column.
@@ -683,24 +724,45 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	if !ptrEqual(a.Zerofill, b.Zerofill) {
 		return false
 	}
+	// A nullability difference is normally a real change. With
+	// IgnoreNotNullRelaxation it is forgiven in exactly one direction: `a` is
+	// NOT NULL and `b` permits NULL, so the only thing the MODIFY would do is
+	// weaken the column (the same NOT NULL -> NULL relaxation diffColumns
+	// already suppresses for a dropped primary key). The opposite direction —
+	// a difference the MODIFY would need to *tighten* — stays a real change.
+	//
+	// `a` belongs to the receiver and `b` to the diffed-to table, which for a
+	// DiffCreateTables caller means `a` is the schema under validation and `b`
+	// the reference: this forgives a validated schema that is stricter, which
+	// is the direction the option documents.
 	if a.Nullable != b.Nullable {
-		return false
+		forgivenRelaxation := opts.IgnoreNotNullRelaxation && !a.Nullable && b.Nullable
+		if !forgivenRelaxation {
+			return false
+		}
 	}
 	// Normalize default values for nullable columns:
 	// For nullable columns, nil and the NULL *keyword* are semantically
 	// equivalent. User might write `VARCHAR(255) NULL` but MySQL outputs
 	// `VARCHAR(255) DEFAULT NULL`. A quoted string literal 'NULL'
-	// (DefaultIsString) is NOT the keyword and must not collapse — it is a
+	// (DefaultKindString) is NOT the keyword and must not collapse — it is a
 	// real default that differs from no-default.
+	//
+	// Each side is normalized on its OWN nullability. Until
+	// IgnoreNotNullRelaxation existed the two were always equal here (the check
+	// above returned early otherwise), so this is the same normalization as
+	// before for every other comparison. It matters for a forgiven relaxation:
+	// there the nullable side renders `DEFAULT NULL` while the NOT NULL side
+	// carries no default, and gating on one side's nullability alone would
+	// report that as a default difference — reintroducing the very MODIFY the
+	// option exists to suppress.
 	sourceDefault := a.Default
 	targetDefault := b.Default
-	if a.Nullable {
-		if sourceDefault != nil && *sourceDefault == "NULL" && !a.DefaultIsString {
-			sourceDefault = nil
-		}
-		if targetDefault != nil && *targetDefault == "NULL" && !b.DefaultIsString {
-			targetDefault = nil
-		}
+	if a.Nullable && sourceDefault != nil && *sourceDefault == "NULL" && a.DefaultKind != DefaultKindString {
+		sourceDefault = nil
+	}
+	if b.Nullable && targetDefault != nil && *targetDefault == "NULL" && b.DefaultKind != DefaultKindString {
+		targetDefault = nil
 	}
 	if !ptrEqual(sourceDefault, targetDefault) {
 		return false
@@ -713,11 +775,15 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	}
 	// On a string column a quoted string literal default ('TRUE') is a
 	// different value than the same text as a keyword/number default (TRUE),
-	// so quotedness is part of column identity. On a numeric column it is not:
-	// MySQL always renders the default quoted, so `DEFAULT 0` (bare) and
+	// so the literal form is part of column identity. On a numeric column it is
+	// not: MySQL always renders the default quoted, so `DEFAULT 0` (bare) and
 	// `DEFAULT '0'` (the SHOW CREATE TABLE form) are the same default and must
 	// compare equal — the value itself is already compared above.
-	if a.DefaultIsString != b.DefaultIsString && !isNumericColumnType(a.Type) {
+	//
+	// Two spellings of one default reach here already folded to the same kind
+	// (see the normalization rules), so a kind difference at this point is a
+	// difference in the default itself.
+	if a.DefaultKind != b.DefaultKind && !isNumericColumnType(a.Type) {
 		return false
 	}
 	if !opts.IgnoreColumnAutoIncrement && a.AutoInc != b.AutoInc {
@@ -736,37 +802,7 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 		return false
 	}
 
-	// Charset comparison with table context
-	// If column charset is nil, it inherits from table
-	// If column charset equals table charset, it's redundant (same as nil)
-	sourceCharset := a.Charset
-	targetCharset := b.Charset
-
-	// Normalize: if charset equals table charset, treat as nil
-	if sourceCharset != nil && ct.TableOptions != nil && ct.TableOptions.Charset != nil && *sourceCharset == *ct.TableOptions.Charset {
-		sourceCharset = nil
-	}
-	if targetCharset != nil && target.TableOptions != nil && target.TableOptions.Charset != nil && *targetCharset == *target.TableOptions.Charset {
-		targetCharset = nil
-	}
-
-	if !ptrEqual(sourceCharset, targetCharset) {
-		return false
-	}
-
-	// Collation comparison with table context
-	sourceCollation := a.Collation
-	targetCollation := b.Collation
-
-	// Normalize: if collation equals table collation, treat as nil
-	if sourceCollation != nil && ct.TableOptions != nil && ct.TableOptions.Collation != nil && *sourceCollation == *ct.TableOptions.Collation {
-		sourceCollation = nil
-	}
-	if targetCollation != nil && target.TableOptions != nil && target.TableOptions.Collation != nil && *targetCollation == *target.TableOptions.Collation {
-		targetCollation = nil
-	}
-
-	if !ptrEqual(sourceCollation, targetCollation) {
+	if !charsetCollationEqual(a, b, ct, target, opts) {
 		return false
 	}
 
@@ -777,6 +813,135 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 		return false
 	}
 	return true
+}
+
+// charsetCarryingTypes are the column types that store text and therefore
+// carry a real charset/collation, inheriting the owning table's defaults when
+// the column declares neither. Type names are the parser's canonical
+// spellings. Binary and JSON types are excluded: they carry only a synthetic
+// "binary" charset that is identical on both sides of a same-type compare,
+// and spatial/vector types have theirs stripped by charsetlessTypeNormalizer.
+var charsetCarryingTypes = map[string]bool{
+	"char":       true,
+	"varchar":    true,
+	"tinytext":   true,
+	"text":       true,
+	"mediumtext": true,
+	"longtext":   true,
+	"enum":       true,
+	"set":        true,
+}
+
+// charsetOfCollation returns the character set a collation name belongs to.
+// MySQL collation names are the owning charset name followed by an
+// underscore-separated suffix (utf8mb4_general_ci -> utf8mb4); the sole
+// exception is "binary", which is both a charset and its only collation.
+func charsetOfCollation(collation string) string {
+	if idx := strings.IndexByte(collation, '_'); idx > 0 {
+		return collation[:idx]
+	}
+	return collation
+}
+
+// resolvedCharsetCollation returns the charset and collation a column
+// actually uses, following MySQL's resolution rules: explicit column values
+// win; an explicit column collation implies its charset; a column with
+// neither inherits the owning table's defaults, where a table collation
+// likewise implies the table charset. A value that cannot be determined from
+// the statement alone is returned as "": a column or table with a charset
+// but no collation uses that charset's *default* collation, and a table with
+// neither option uses the server defaults — both depend on server version
+// and configuration.
+func resolvedCharsetCollation(col *Column, table *CreateTable) (charset, collation string) {
+	switch {
+	case col.Collation != nil:
+		collation = strings.ToLower(*col.Collation)
+		if col.Charset != nil {
+			charset = strings.ToLower(*col.Charset)
+		} else {
+			charset = charsetOfCollation(collation)
+		}
+	case col.Charset != nil:
+		// An explicit column charset without a collation selects the
+		// charset's default collation — not the table's collation.
+		charset = strings.ToLower(*col.Charset)
+	default:
+		if tableCollation := table.TableOptions.getCollation(); tableCollation != nil {
+			collation = strings.ToLower(*tableCollation)
+		}
+		if tableCharset := table.TableOptions.getCharset(); tableCharset != nil {
+			charset = strings.ToLower(*tableCharset)
+		} else if collation != "" {
+			charset = charsetOfCollation(collation)
+		}
+	}
+	return charset, collation
+}
+
+// explicitUnlessTableDefault returns a column-level charset/collation value
+// with the redundant spelling of the owning table's default normalized to
+// nil, so an explicit value that merely restates the table default compares
+// equal to an inherited (nil) one.
+func explicitUnlessTableDefault(value, tableDefault *string) *string {
+	if value != nil && tableDefault != nil && *value == *tableDefault {
+		return nil
+	}
+	return value
+}
+
+// charsetCollationEqual reports whether two columns have the same effective
+// charset and collation given their owning tables' defaults. Equality is
+// decided on the RESOLVED values, not the written ones: a column that
+// inherits its table default and a column that matches a *different* default
+// on the other table are genuinely different columns, and since a
+// table-level DEFAULT CHARSET / COLLATE clause only affects columns added
+// later, converging them requires a MODIFY COLUMN in the same ALTER as the
+// table-option change.
+//
+// Each attribute is compared strictly when both sides resolve to a concrete
+// value. When a side is underdetermined (see resolvedCharsetCollation), that
+// attribute falls back to comparing the written values with redundant
+// table-default spellings normalized away — an unexpressed preference is
+// treated as a match rather than guessed at, which keeps the diff from
+// emitting a MODIFY it could never prove converged.
+func charsetCollationEqual(a, b *Column, source, target *CreateTable, opts *DiffOptions) bool {
+	if !charsetCarryingTypes[strings.ToLower(a.Type)] {
+		// Non-character types have no table default to inherit, so compare
+		// the written values directly.
+		return ptrEqual(a.Charset, b.Charset) && ptrEqual(a.Collation, b.Collation)
+	}
+
+	// IgnoreCharsetCollation suppresses the table-option diff, so the table
+	// defaults it ignores must not leak into the column comparison through
+	// resolution either — a column inheriting a difference between the two
+	// (ignored) table defaults is not a column change in this mode. Explicit
+	// column-level differences are still compared by the written-value
+	// comparisons below.
+	sourceCharset, sourceCollation := "", ""
+	targetCharset, targetCollation := "", ""
+	if !opts.IgnoreCharsetCollation {
+		sourceCharset, sourceCollation = resolvedCharsetCollation(a, source)
+		targetCharset, targetCollation = resolvedCharsetCollation(b, target)
+	}
+
+	if sourceCharset != "" && targetCharset != "" {
+		if sourceCharset != targetCharset {
+			return false
+		}
+	} else if !ptrEqual(
+		explicitUnlessTableDefault(a.Charset, source.TableOptions.getCharset()),
+		explicitUnlessTableDefault(b.Charset, target.TableOptions.getCharset()),
+	) {
+		return false
+	}
+
+	if sourceCollation != "" && targetCollation != "" {
+		return sourceCollation == targetCollation
+	}
+	return ptrEqual(
+		explicitUnlessTableDefault(a.Collation, source.TableOptions.getCollation()),
+		explicitUnlessTableDefault(b.Collation, target.TableOptions.getCollation()),
+	)
 }
 
 // getPrimaryKeyIndex returns the PRIMARY KEY index if it exists (table-level PK), nil otherwise

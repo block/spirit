@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
 )
 
 type DatetimeIndexPositionLinter struct{}
@@ -115,7 +115,7 @@ func (l *DatetimeIndexPositionLinter) violation(tableName string, idx statement.
 		Linter:   l,
 		Severity: SeverityWarning,
 		Message: fmt.Sprintf(
-			"%s has %s column %q in position %d of %d. %s columns are typically "+
+			"%s has %q column %q in position %d of %d. %q columns are typically "+
 				"queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a "+
 				"non-last index column prevents the optimizer from using subsequent columns "+
 				"for sorted access.",
@@ -142,7 +142,7 @@ func indexLabel(idx statement.Index) string {
 	if idx.Name != "" {
 		return fmt.Sprintf("index %q", idx.Name)
 	}
-	return fmt.Sprintf("unnamed index on (%s)", strings.Join(idx.Columns, ", "))
+	return "unnamed index on " + quotedList(idx.Columns)
 }
 
 func capitalize(s string) string {

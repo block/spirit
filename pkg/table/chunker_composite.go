@@ -379,8 +379,12 @@ func (t *chunkerComposite) GetLowWatermark() (string, error) {
 	// into the watermark. This is because progress is determined
 	// based on rowsCopied / estimatedRows (not based on logical
 	// key space).
+	chunkJSON, err := t.watermark.marshalJSON()
+	if err != nil {
+		return "", fmt.Errorf("could not serialize chunk watermark: %w", err)
+	}
 	watermark := compositeWatermark{
-		ChunkJSON:  t.watermark.JSON(),
+		ChunkJSON:  chunkJSON,
 		RowsCopied: atomic.LoadUint64(&t.rowsCopied),
 	}
 	// Serialize to JSON
@@ -431,6 +435,13 @@ func (t *chunkerComposite) IsRead() bool {
 // wants to do that. For the composite chunker we use
 // the actualRows copied (from feedback) over the estimated
 // rows (from table statistics)
+// RowsCopied returns the rows settled by the applier. For the composite
+// chunker this is the same counter Progress reports, because it already
+// accumulates the actualRows from Feedback.
+func (t *chunkerComposite) RowsCopied() uint64 {
+	return atomic.LoadUint64(&t.rowsCopied)
+}
+
 func (t *chunkerComposite) Progress() (uint64, uint64, uint64) {
 	return atomic.LoadUint64(&t.rowsCopied), t.chunksCopied.Load(), atomic.LoadUint64(&t.Ti.EstimatedRows)
 }
@@ -587,6 +598,31 @@ func (t *chunkerComposite) KeyBelowLowWatermark(key0 any) bool {
 		return false
 	}
 	return below
+}
+
+// KeyNotYetDispatched satisfies MappedChunker. See the interface docs.
+func (t *chunkerComposite) KeyNotYetDispatched(key0 any) bool {
+	t.Lock()
+	defer t.Unlock()
+	if t.finalChunkSent {
+		return false
+	}
+	if len(t.chunkPtrs) == 0 {
+		return true
+	}
+	keyDatum, err := NewDatum(key0, t.chunkPtrs[0].Tp)
+	if err != nil {
+		t.logger.Error("failed to create keyDatum in KeyNotYetDispatched", "key", key0, "error", err)
+		return false
+	}
+	// Only a strictly greater key[0] guarantees the whole tuple sorts above
+	// every dispatched chunk — same reasoning as KeyAboveHighWatermark.
+	above, err := keyDatum.GreaterThan(t.chunkPtrs[0])
+	if err != nil {
+		t.logger.Error("comparing chunkPtrs[0] in KeyNotYetDispatched", "error", err)
+		return false
+	}
+	return above
 }
 
 // SetKey allows you to chunk on a secondary index, and not the primary key.

@@ -121,7 +121,8 @@ const checksumSeparator = ", '#', "
 // CONCAT()) for source and target, wrapping each column in IFNULL(), ISNULL()
 // and CAST, with a '#' separator literal between every value (see
 // checksumSeparator). The CAST type always comes from the target table's type
-// definition. When there are no renames, both expressions are identical.
+// definition, but the cast itself is side-dependent for JSON columns (see
+// castExpr), so the two expressions can differ even without renames.
 func (m *ColumnMapping) ChecksumExprs() (source, target string, err error) {
 	sourceExprs := make([]string, len(m.sourceColumns))
 	targetExprs := make([]string, len(m.targetColumns))
@@ -130,11 +131,11 @@ func (m *ColumnMapping) ChecksumExprs() (source, target string, err error) {
 		// so that type conversions (e.g. INT→BIGINT) are applied consistently.
 		// For source: SQL references the old column name, type from target's new column name.
 		// For target: both SQL reference and type lookup use the new column name.
-		srcCast, err := m.targetTable.wrapCastTypeAs(m.sourceColumns[i], m.targetColumns[i])
+		srcCast, err := m.targetTable.wrapCastTypeAs(m.sourceColumns[i], m.targetColumns[i], castSource)
 		if err != nil {
 			return "", "", err
 		}
-		tgtCast, err := m.targetTable.wrapCastType(m.targetColumns[i])
+		tgtCast, err := m.targetTable.wrapCastType(m.targetColumns[i], castTarget)
 		if err != nil {
 			return "", "", err
 		}

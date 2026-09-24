@@ -81,7 +81,7 @@ func (l *AllowEngine) Lint(existingTables []*statement.CreateTable, changes []*s
 			Location:   &Location{Table: ct.TableName},
 			Message:    fmt.Sprintf("Table %q uses an unsupported engine %q", ct.TableName, engineName),
 			Severity:   SeverityWarning,
-			Suggestion: new("Use a supported storage engine: " + strings.Join(slices.Sorted(maps.Keys(l.allowedEngines)), ", ")),
+			Suggestion: new("Use a supported storage engine: " + quoteJoin(slices.Sorted(maps.Keys(l.allowedEngines)))),
 		})
 	}
 	return violations

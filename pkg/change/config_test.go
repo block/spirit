@@ -39,3 +39,28 @@ func TestNewClientDefaultConfigServerIDIsFresh(t *testing.T) {
 	require.NotEqual(t, a.ServerID, b.ServerID,
 		"two NewClientDefaultConfig calls must produce different ServerIDs")
 }
+
+// TestResolveFlushShape pins both drain knobs' 0-means-default handling.
+// Both are set together by the migration runner from autoscale.FlushBounds,
+// and both are left zero by every other caller — so the zero case is the one
+// that matters most: it is what a non-Aurora target, a too-small instance, and
+// every out-of-tree change.Source get.
+func TestResolveFlushShape(t *testing.T) {
+	cfg := NewClientDefaultConfig()
+	require.Zero(t, cfg.FlushConcurrency, "left zero so the client applies the default")
+	require.Zero(t, cfg.BatchSize, "left zero so the client applies the default")
+	require.Equal(t, DefaultFlushConcurrency, cfg.resolveFlushConcurrency())
+	require.Equal(t, DefaultBatchSize, cfg.resolveBatchSize())
+
+	// The derived pair a large instance produces, carried through unchanged.
+	cfg.FlushConcurrency, cfg.BatchSize = 32, 250
+	require.Equal(t, 32, cfg.resolveFlushConcurrency())
+	require.Equal(t, 250, cfg.resolveBatchSize())
+
+	// Negative is an explicit opt-out to a serial drain on the concurrency
+	// knob. There is no analogous opt-out for a batch size — a batch of no
+	// rows is not a thing to ask for — so it clamps to a statement per row.
+	cfg.FlushConcurrency, cfg.BatchSize = -1, -1
+	require.Equal(t, 1, cfg.resolveFlushConcurrency())
+	require.Equal(t, 1, cfg.resolveBatchSize())
+}

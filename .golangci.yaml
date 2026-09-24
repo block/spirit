@@ -14,6 +14,27 @@ linters:
     - exhaustive      # missing switch cases (we already suppress some)
     - rowserrcheck    # check rows.Err() after iterating
     - testifylint     # idiomatic testify assertions
+    - depguard        # banned imports (see settings)
+  settings:
+    # Spirit links exactly one MySQL driver. The deny list is what keeps that
+    # true, because nothing about a second one fails to compile and both of the
+    # ways it breaks are silent.
+    #
+    # The registry half is the one that bit a consumer. A tls= DSN value is a
+    # *name*, and a name only resolves inside the TLS registry of the driver
+    # *package* that registered it — registries are per-package globals and
+    # nothing about them travels in the DSN. dbconn registers "rds" into
+    # block/mysql (pkg/dbconn/conn.go) and hands that name out in every enhanced
+    # DSN, including to consumers that reuse EnhanceDSNWithTLS, so a pool dialing
+    # through any other MySQL driver cannot resolve it and fails to open against
+    # an RDS host at all. That is host-shaped breakage: invisible to a suite that
+    # never points at an *.rds.amazonaws.com address.
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: github.com/go-sql-driver/mysql
+              desc: 'import github.com/block/mysql instead (registered as driver name "block-mysql"). Two MySQL drivers in one binary define two field-identical but distinct *mysql.MySQLError types, and errors.AsType against one returns false for the other — so every classifier built on it keeps compiling while quietly answering "no". pkg/dbconn stops recognizing 1205 lock-wait and 1213 deadlock, so retries stop happening, and pkg/change''s buffered subscription (which asks dbconn.IsLockContentionError) stops backing off from contention its own flush fan-out causes. pkg/checkpoint''s IsIncompatible stops recognizing 1146/1054, so a checkpoint written by an incompatible version reads as a transient read error and the run asks for a retry that can never succeed. pkg/{migration,move}/check fail loudly rather than silently, gating on `!ok || Number != 1193`, so the configuration check refuses to run at all against MySQL < 8.0.20. The drivers also keep separate TLS registries, so dbconn''s "rds" config name would not resolve for a pool opened on the other driver.'
 formatters:
   enable:
     - gofmt

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // Severity represents the severity level of a linting violation
@@ -67,6 +68,38 @@ func (v Violation) String() string {
 	}
 
 	return msg
+}
+
+// quoteJoin renders a list of SQL tokens (type names, collations, engine
+// names) for a violation message, quoting each element the same way %q quotes
+// a single identifier so lists follow the same convention as standalone
+// tokens.
+func quoteJoin(items []string) string {
+	quoted := make([]string, len(items))
+	for i, item := range items {
+		quoted[i] = fmt.Sprintf("%q", item)
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// quotedList renders SQL tokens for message prose with number agreement: a
+// single token stands alone like any quoted identifier, and only a real list
+// earns parentheses — `"a"` versus `("a", "b")`.
+func quotedList(items []string) string {
+	if len(items) == 1 {
+		return fmt.Sprintf("%q", items[0])
+	}
+	return "(" + quoteJoin(items) + ")"
+}
+
+// columnsPhrase renders a column list with its noun in number agreement —
+// `column "a"` versus `columns ("a", "b")` — so messages never read
+// `columns ("a")` for a single column.
+func columnsPhrase(items []string) string {
+	if len(items) == 1 {
+		return "column " + fmt.Sprintf("%q", items[0])
+	}
+	return "columns (" + quoteJoin(items) + ")"
 }
 
 // Location provides information about where a violation occurred

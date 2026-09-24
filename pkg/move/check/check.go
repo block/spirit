@@ -6,11 +6,13 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/table"
-	"github.com/go-sql-driver/mysql"
 )
 
 // ScopeFlag scopes a check
@@ -33,14 +35,10 @@ type SourceResource struct {
 
 // Resources contains the resources needed for move checks
 type Resources struct {
-	Sources        []SourceResource
-	Targets        []applier.Target
-	SourceTables   []*table.TableInfo
-	CreateSentinel bool
-	// GTID, when true, opts the move into the experimental GTID-based change
-	// source. The configuration check uses this to additionally validate
-	// gtid_mode and enforce_gtid_consistency on every source.
-	GTID bool
+	Sources      []SourceResource
+	Targets      []applier.Target
+	SourceTables []*table.TableInfo
+	DeferCutOver bool
 	// MoveEverything is true when no explicit table list was supplied (i.e.
 	// move.SourceTables is empty), so every table in each source database is
 	// being moved. The source_schema_consistency check uses this to decide
@@ -70,10 +68,21 @@ func registerCheck(name string, callback func(context.Context, Resources, *slog.
 	checks[name] = check{callback: callback, scope: scope}
 }
 
-// RunChecks runs all checks that are registered for the given scope
-func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, scope ScopeFlag) error {
-	for _, check := range checks {
-		if check.scope != scope {
+// RunChecks runs all checks registered for the given scope except
+// those named in exclude. The runner's --force recovery path uses it to
+// re-run the post-setup checks minus the target-state check before wiping
+// the target: wiping only cures target-side state, so a failure in any other
+// (source-side) check must surface before the target is destroyed. New
+// checks are deliberately included by default — excluding too little only
+// blocks a wipe, excluding too much could green-light one.
+func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, scope ScopeFlag, exclude ...string) error {
+	lock.Lock()
+	registered := maps.Clone(checks)
+	lock.Unlock()
+	names := slices.Sorted(maps.Keys(registered))
+	for _, name := range names {
+		check := registered[name]
+		if check.scope != scope || slices.Contains(exclude, name) {
 			continue
 		}
 		err := check.callback(ctx, r, logger)

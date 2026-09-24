@@ -5,17 +5,37 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
-	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/pingcap/tidb/pkg/parser"
 )
+
+// defaultWriteThreads must match the `default:"4"` kong tag on
+// Migration.WriteThreads, so a programmatic caller that leaves the field unset
+// lands on the same value the CLI does. Move keeps its own copy against its own
+// tag (pkg/move), since the two flags are independently defaulted.
+const defaultWriteThreads = 4
+
+// defaultThreads must match the `default:"4"` kong tag on Migration.Threads, for
+// the same reason defaultWriteThreads does. Validate reads it because it runs
+// before normalizeOptions, so a programmatic caller's zero has to be resolved to
+// the number the migration will actually use before it can be checked.
+const defaultThreads = 4
+
+// defaultMaxConnections must match the `default:"128"` kong tag on
+// Migration.MaxConnections, for the same reason defaultWriteThreads does: a
+// programmatic caller that leaves the field unset must land where the CLI does.
+// This one matters more than most, because it is the pool size itself rather
+// than a knob on one: a programmatic caller that landed somewhere else would be
+// running with a differently-sized pool than the same migration from the CLI.
+const defaultMaxConnections = dbconn.DefaultMaxConnections
 
 var (
 	defaultHost     = "127.0.0.1"
@@ -32,56 +52,54 @@ type Migration struct {
 	Password     *string `name:"password" help:"Password" optional:""`
 	Database     string  `name:"database" help:"Database" optional:""`
 	ConfFile     string  `name:"conf" help:"MySQL conf file" optional:"" type:"existingfile"`
-	Table        string  `name:"table" help:"Table" optional:""`
-	Alter        string  `name:"alter" help:"The alter statement to run on the table" optional:""`
-	Threads      int     `name:"threads" help:"Number of concurrent threads for copy and checksum tasks" optional:"" default:"4"`
-	WriteThreads int     `name:"write-threads" help:"Number of concurrent apply (write) threads. 0 = auto: on Aurora this is set to the instance vCPU count minus 2 (min 1), leaving CPU headroom; on non-Aurora targets it falls back to the default" optional:"" default:"4"`
+	Threads      int     `name:"threads" help:"Number of concurrent threads for copy and checksum tasks. Ignored when --enable-experimental-autoscaling engages" optional:"" default:"4"`
+	WriteThreads int     `name:"write-threads" help:"Number of concurrent apply (write) threads. Ignored when --enable-experimental-autoscaling engages" optional:"" default:"4"`
 
-	// EnableExperimentalAutoscaling turns on dynamic write-thread scaling driven
-	// by throttler feedback; WriteThreads becomes the starting value and the
-	// cap is fixed at 2x that (deliberately not configurable for now, to keep
-	// the experimental surface small). See issue #831.
-	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: dynamically scale write threads between the starting value and 2x that, based on throttler feedback" optional:"" default:"false"`
-	// TargetChunkTime sizes chunks for the time-based signal: the checksum
-	// (server-side CRC) and the legacy --unbuffered copier. The default buffered
-	// copier ignores it and sizes chunks by an in-memory byte budget
-	// (table.DefaultTargetChunkBytes), because its fed-back time measures
-	// read + applier-queue-wait + write/commit — a signal that is
-	// size-independent under backpressure and collapses the chunk size.
-	TargetChunkTime time.Duration `name:"target-chunk-time" help:"Target time per chunk for the checksum and the legacy --unbuffered copier. The default buffered copier ignores it and sizes chunks by memory." optional:"" default:"500ms"`
-	// TargetChunkSize is the in-memory byte budget the default buffered copier
-	// sizes each copy chunk against (the memory signal; see
-	// table.DefaultTargetChunkBytes and pkg/table/README.md). It has no effect
-	// with --unbuffered, which sizes copy chunks by --target-chunk-time. A zero
-	// value means "use the default" (normalizeOptions fills it in), so callers
-	// that construct Migration programmatically don't have to set it.
+	// MaxConnections is the size of the main connection pool, set verbatim and
+	// never recomputed (see the MaxOpenConnections assignment in Runner.Run).
+	//
+	// The connections it spends are the server's max_connections, shared with
+	// the production workload, so this is spirit's claim on someone else's
+	// budget rather than a description of what spirit could use. Ask for more
+	// than the server can spare and the copy does not slow down, it dies on
+	// `Error 1040: Too many connections`.
+	//
+	// The thread ceilings bound how far the copier scales its own workers and
+	// can exceed this. When they do, the workers contend for connections instead
+	// of each being guaranteed one, which costs throughput and nothing else.
+	//
+	// Zero means "use the default" (normalizeOptions fills it in), matching
+	// Threads and WriteThreads. Negative is rejected by Validate, as is any
+	// value too small for the migration to finish on; see minPoolSize.
+	MaxConnections int `name:"max-connections" help:"Size of the main connection pool. Copier, applier and flush workers all share it, and contend for connections rather than each being guaranteed one" optional:"" default:"128"`
+
+	// EnableExperimentalAutoscaling turns on dynamic thread scaling driven by
+	// throttler feedback. When it engages (an Aurora target with at least
+	// autoscale.MinVCPUs) it takes over both thread counts: Threads and
+	// WriteThreads are ignored, and each pool's starting size and ceiling are
+	// derived from the instance instead — see the override in
+	// setupCopierCheckerAndReplClient and autoscale.ReadBounds. See issue #831.
+	EnableExperimentalLocklessChecksum bool `name:"enable-experimental-lockless-checksum" help:"EXPERIMENTAL: verify with optimistic reads and retries instead of checksum locks and long-lived snapshots. Cutover locking is unchanged." default:"false"`
+
+	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: size the copy, apply and checksum thread pools from the instance and scale them on throttler feedback. Overrides --threads and --write-threads. Requires an Aurora target" optional:"" default:"false"`
+	// TargetChunkSize is the in-memory byte budget the copier sizes each copy
+	// chunk against (the memory signal; see table.DefaultTargetChunkBytes and
+	// pkg/table/README.md). A zero value means "use the default"
+	// (normalizeOptions fills it in), so callers that construct Migration
+	// programmatically don't have to set it.
 	// The Kong default below must stay equal to table.DefaultTargetChunkBytes.
-	TargetChunkSize      uint64        `name:"target-chunk-size" help:"In-memory byte budget per copy chunk for the default buffered copier (in bytes). No effect with --unbuffered." optional:"" default:"16777216"`
+	TargetChunkSize      uint64        `name:"target-chunk-size" help:"In-memory byte budget per copy chunk (in bytes)" optional:"" default:"16777216"`
 	ReplicaDSN           string        `name:"replica-dsn" help:"DSN(s) for replica(s) used for lag checking. Multiple replicas can be comma-separated; Spirit throttles on the slowest." optional:""`
 	ReplicaMaxLag        time.Duration `name:"replica-max-lag" help:"The maximum lag allowed on the replica before the migration throttles. If lag becomes unobservable (lag polling keeps failing) the migration pauses (fails closed) until polling recovers; remove --replica-dsn to proceed without lag protection." optional:"" default:"120s"`
+	ForceKillAfter       time.Duration `name:"force-kill-after" help:"Delay before killing transactions blocking DDL or table locks; 0 uses 90% of lock-wait-timeout" optional:"" default:"0s"`
 	LockWaitTimeout      time.Duration `name:"lock-wait-timeout" help:"The DDL lock_wait_timeout required for checksum and cutover" optional:"" default:"30s"`
 	SkipDropAfterCutover bool          `name:"skip-drop-after-cutover" help:"Keep old table after completing cutover" optional:"" default:"false"`
 	DeferCutOver         bool          `name:"defer-cutover" help:"Defer cutover (and checksum) until sentinel table is dropped" optional:"" default:"false"`
-	SkipForceKill        bool          `name:"skip-force-kill" help:"Disable killing long-running transactions in order to acquire metadata lock (MDL) at checksum and cutover time" optional:"" default:"false"`
-	Statement            string        `name:"statement" help:"The SQL statement to run (replaces --table and --alter)" optional:"" default:""`
-	Lint                 bool          `name:"lint" help:"Run lint checks before running migration" optional:""`
-	LintOnly             bool          `name:"lint-only" help:"Run lint checks and exit without performing migration" optional:""`
+	Statement            string        `name:"statement" help:"The SQL statement to run" required:""`
 
 	// TLS Configuration
 	TLSMode            string `name:"tls-mode" help:"TLS connection mode (case insensitive): DISABLED, PREFERRED (default), REQUIRED, VERIFY_CA, VERIFY_IDENTITY" optional:""`
 	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
-
-	// Buffered copy (the default) uses the DBLog algorithm for copying and
-	// replication applying. It reads rows from the source and inserts them into
-	// the target, rather than using INSERT IGNORE .. SELECT, and is also required
-	// for cross-server moves. Unbuffered opts back into the legacy
-	// INSERT IGNORE .. SELECT copier.
-	Unbuffered bool `name:"unbuffered" help:"Use the legacy unbuffered copier (INSERT IGNORE .. SELECT) instead of the default buffered DBLog copier" optional:"" default:"false"`
-
-	// EnableExperimentalGTID switches the change source from binlog file+position to MySQL GTIDs.
-	// EXPERIMENTAL — see pkg/change/gtid.go. Requires gtid_mode=ON and
-	// enforce_gtid_consistency=ON on the source.
-	EnableExperimentalGTID bool `name:"enable-experimental-gtid" help:"EXPERIMENTAL: use GTID-based change source instead of binlog file+position" optional:"" default:"false"`
 
 	CheckpointMaxAge     time.Duration `name:"checkpoint-max-age" help:"Maximum age of a checkpoint before refusing to resume from it" optional:"" default:"168h"`
 	ChecksumYieldTimeout time.Duration `name:"checksum-yield-timeout" help:"Maximum duration for a single checksum pass before yielding to release long-running REPEATABLE READ transactions (reduces InnoDB HLL growth)" optional:"" default:"24h"`
@@ -104,13 +122,40 @@ type Migration struct {
 	useTestThrottler bool
 }
 
-// Validate is called by Kong after parsing to check for invalid flag combinations.
+// minPoolSize is the smallest --max-connections a migration can complete on.
+//
+// The cutover sets the number: it needs the LOCK TABLES connection, the RENAME
+// TABLE connection and the flush threads, and unlike every other phase it
+// cannot trade connections for time — below the minimum it does not run slower,
+// it cannot run. See CutOver.Run, which holds the same number and will raise a
+// pool that arrives under it.
+//
+// Nothing else gets a say. The copy, the checksum and the drain all queue on a
+// small pool and finish eventually, so a low --max-connections is the operator
+// asking for a slow migration, which is theirs to ask for.
+const minPoolSize = dbconn.MinMigrationPoolSize
+
+func (m *Migration) validateForceKillAfter() error {
+	config := dbconn.NewDBConfig()
+	if m.LockWaitTimeout > 0 {
+		config.LockWaitTimeout = int(m.LockWaitTimeout.Seconds())
+	}
+	config.ForceKillAfter = m.ForceKillAfter
+	return config.ValidateForceKillAfter()
+}
+
+// Validate is called by Kong after parsing to reject invalid flag values.
 // Zero values mean "use the default" (normalizeOptions fills them in), so they
 // are not rejected here; only explicitly-negative or otherwise invalid values
 // are caught.
+//
+// Cross-flag checks include ForceKillAfter and MaxConnections. The latter is here
+// because it has nowhere else to be: the pool is set to that number verbatim
+// and never recomputed, so a number too small to work is a migration that
+// stalls somewhere in the middle rather than one that fails at startup.
 func (m *Migration) Validate() error {
-	if m.Lint && m.LintOnly {
-		return errors.New("--lint and --lint-only cannot be used together")
+	if err := m.validateForceKillAfter(); err != nil {
+		return err
 	}
 	if m.Threads < 0 {
 		return fmt.Errorf("--threads must be non-negative, got %d", m.Threads)
@@ -118,16 +163,17 @@ func (m *Migration) Validate() error {
 	if m.WriteThreads < 0 {
 		return fmt.Errorf("--write-threads must be non-negative, got %d", m.WriteThreads)
 	}
-	if m.TargetChunkTime < 0 {
-		return fmt.Errorf("--target-chunk-time must be non-negative, got %s", m.TargetChunkTime)
-	}
 	if m.ReplicaMaxLag < 0 {
 		return fmt.Errorf("--replica-max-lag must be non-negative, got %s", m.ReplicaMaxLag)
 	}
 	if m.CheckpointMaxAge < 0 {
 		return fmt.Errorf("--checkpoint-max-age must be non-negative, got %s", m.CheckpointMaxAge)
 	}
-	return nil
+	threads := m.Threads
+	if threads == 0 {
+		threads = defaultThreads
+	}
+	return dbconn.ValidateMaxConnections(m.MaxConnections, threads, minChecksumPhaseReserve)
 }
 
 func (m *Migration) Run() error {
@@ -146,19 +192,33 @@ func (m *Migration) Run() error {
 }
 
 // normalizeOptions does some validation and sets defaults.
-// for example, it validates that only --statement or --table and --alter are specified,
-// and when --statement is not specified, it generates it
-// so the rest of the code can use --statement as the canonical
-// source of truth for what's happening.
+// --statement is the only way to describe the change, and it is the canonical
+// source of truth for the rest of the code.
 func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, err error) {
-	if m.TargetChunkTime == 0 {
-		m.TargetChunkTime = table.ChunkerDefaultTarget
+	if err := m.validateForceKillAfter(); err != nil {
+		return nil, err
 	}
 	if m.TargetChunkSize == 0 {
 		m.TargetChunkSize = table.DefaultTargetChunkBytes
 	}
 	if m.Threads == 0 {
-		m.Threads = 4
+		m.Threads = defaultThreads
+	}
+	// A non-positive WriteThreads is filled in rather than rejected, matching
+	// Threads above. Zero used to mean "auto-size from the instance", so anyone
+	// who adopted that opt-in would otherwise see their apply pool quietly drop
+	// from the instance vCPU count to 4 — warn, and name the flag that replaced
+	// it. (Kong's default is 4, so a literal 0 was either passed explicitly or
+	// left unset by a programmatic caller.)
+	if m.WriteThreads <= 0 {
+		if m.WriteThreads == 0 {
+			slog.Default().Warn("--write-threads 0 no longer means auto-size; using the default. Pass --enable-experimental-autoscaling for instance-derived thread counts",
+				"write_threads", defaultWriteThreads)
+		}
+		m.WriteThreads = defaultWriteThreads
+	}
+	if m.MaxConnections == 0 {
+		m.MaxConnections = defaultMaxConnections
 	}
 	if m.ReplicaMaxLag == 0 {
 		m.ReplicaMaxLag = 120 * time.Second
@@ -174,49 +234,23 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		return nil, err
 	}
 
-	if m.Statement != "" { // statement is specified
-		if m.Table != "" || m.Alter != "" {
-			return nil, errors.New("only --statement or --table and --alter can be specified")
+	if m.Statement == "" {
+		return nil, errors.New("--statement is required")
+	}
+	// extract the table and alter from the statement.
+	// if it is a CREATE INDEX statement, we rewrite it to an alter statement.
+	// This also returns the StmtNode.
+	stmts, err = statement.New(m.Statement)
+	if err != nil {
+		// The error could be a parser error, or it might be something
+		// specific like mixed ALTER + non alter statements.
+		return nil, err
+	}
+	for _, stmt := range stmts {
+		if stmt.Schema != "" && stmt.Schema != m.Database {
+			return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
 		}
-		// extract the table and alter from the statement.
-		// if it is a CREATE INDEX statement, we rewrite it to an alter statement.
-		// This also returns the StmtNode.
-		stmts, err = statement.New(m.Statement)
-		if err != nil {
-			// The error could be a parser error, or it might be something
-			// specific like mixed ALTER + non alter statements.
-			return nil, err
-		}
-		for _, stmt := range stmts {
-			if stmt.Schema != "" && stmt.Schema != m.Database {
-				return nil, errors.New("schema name in statement (`schema`.`table`) does not match --database")
-			}
-			stmt.Schema = m.Database
-		}
-	} else { // --alter and --table are specified
-		if m.Table == "" {
-			return nil, errors.New("table name is required")
-		}
-		if m.Alter == "" {
-			return nil, errors.New("alter statement is required")
-		}
-		// Trim whitespace and remove trailing semicolon. Without this, the attemptInstantDDL and attemptInplaceDDL functions will fail.
-		m.Alter = strings.TrimSpace(m.Alter)
-		m.Alter = strings.TrimSuffix(m.Alter, ";")
-		fullStatement := fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(m.Table), m.Alter)
-		m.Statement = fullStatement // used in resume from checkpoint
-		p := parser.New()
-		stmtNodes, _, err := p.Parse(fullStatement, "", "")
-		if err != nil {
-			return nil, errors.New("could not parse SQL statement: " + fullStatement)
-		}
-		stmts = append(stmts, &statement.AbstractStatement{
-			Schema:    m.Database,
-			Table:     m.Table,
-			Alter:     m.Alter,
-			Statement: fullStatement,
-			StmtNode:  &stmtNodes[0],
-		})
+		stmt.Schema = m.Database
 	}
 	return stmts, err
 }

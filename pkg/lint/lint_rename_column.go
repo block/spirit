@@ -2,9 +2,10 @@ package lint
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/pingcap/tidb/pkg/parser/ast"
 )
 
 // RenameColumnLinter detects column renames in ALTER TABLE statements.
@@ -56,37 +57,56 @@ func (l *RenameColumnLinter) Lint(_ []*statement.CreateTable, changes []*stateme
 				if spec.NewColumnName != nil {
 					newName = spec.NewColumnName.Name.O
 				}
-				violations = append(violations, Violation{
-					Linter: l,
-					Location: &Location{
-						Table:  change.Table,
-						Column: new(oldName),
-					},
-					Message:    fmt.Sprintf("Column rename detected in table %q: %q to %q. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled", change.Table, oldName, newName),
-					Severity:   SeverityError,
-					Suggestion: new("Use ADD COLUMN + DROP COLUMN instead of RENAME COLUMN. This is the only safe approach"),
-				})
+				violations = append(violations, renameColumnViolation(l, change.Table, oldName, newName, "RENAME COLUMN"))
 			case ast.AlterTableChangeColumn:
 				// ALTER TABLE t1 CHANGE COLUMN old_name new_name <type>
-				// This is a rename if old name != new name
+				// This is a rename if old name != new name. A clause that
+				// restates the same name only changes the definition, which
+				// this linter has no opinion about.
 				if spec.OldColumnName != nil && len(spec.NewColumns) > 0 {
 					oldName := spec.OldColumnName.Name.O
 					newName := spec.NewColumns[0].Name.Name.O
 					if oldName != newName {
-						violations = append(violations, Violation{
-							Linter: l,
-							Location: &Location{
-								Table:  change.Table,
-								Column: new(oldName),
-							},
-							Message:    fmt.Sprintf("Column rename detected in table %q: %q to %q via CHANGE COLUMN. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled", change.Table, oldName, newName),
-							Severity:   SeverityError,
-							Suggestion: new("Use ADD COLUMN + DROP COLUMN instead of RENAME COLUMN. This is the only safe approach"),
-						})
+						violations = append(violations, renameColumnViolation(l, change.Table, oldName, newName, "CHANGE COLUMN"))
 					}
 				}
 			}
 		}
 	}
 	return violations
+}
+
+// renameColumnViolation renders the violation for a clause that gives a column a
+// new name, in one of the two grammars that can.
+//
+// A new name differing only in case is reported apart from a true rename,
+// because what breaks differs. MySQL resolves the identifier either way, so no
+// query stops matching. What changes is the name in result-set metadata: a
+// client that indexes rows by the column name the server returned, in a
+// language whose keys are case-sensitive, stops finding the column under the
+// name it asked for. That is a narrower and less certain exposure than a rename
+// no client resolves at all, so it is a warning with its own message rather than
+// an error, and never silent.
+func renameColumnViolation(l *RenameColumnLinter, table, oldName, newName, grammar string) Violation {
+	violation := Violation{
+		Linter: l,
+		Location: &Location{
+			Table:  table,
+			Column: new(oldName),
+		},
+		Severity: SeverityError,
+	}
+
+	if strings.EqualFold(oldName, newName) {
+		violation.Severity = SeverityWarning
+		violation.Message = fmt.Sprintf("Column name case change detected in table %q: %q to %q via %s. MySQL resolves the column under either case, so queries keep matching, but result-set metadata returns the new case: a client that indexes returned rows by column name in a case-sensitive language stops finding it", table, oldName, newName, grammar)
+		violation.Suggestion = new("If the case change is not intended, restate the column's existing case. If it is, confirm no client indexes result rows by the returned column name")
+
+		return violation
+	}
+
+	violation.Message = fmt.Sprintf("Column rename detected in table %q: %q to %q via %s. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled", table, oldName, newName, grammar)
+	violation.Suggestion = new("Use ADD COLUMN + DROP COLUMN instead of RENAME COLUMN. This is the only safe approach")
+
+	return violation
 }

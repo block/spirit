@@ -5,37 +5,23 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
-
-// mockChecker is a checksum.Checker stand-in whose Run and DifferencesFound
-// are scripted by the test. Mirror of the migration-package helper — see
-// pkg/migration/checksum_invalidation_test.go for the parent rationale.
-type mockChecker struct {
-	runErr           error
-	differencesFound atomic.Uint64
-}
-
-func (m *mockChecker) Run(ctx context.Context) error        { return m.runErr }
-func (m *mockChecker) GetProgress() status.ChecksumProgress { return status.ChecksumProgress{} }
-func (m *mockChecker) StartTime() time.Time                 { return time.Now() }
-func (m *mockChecker) ExecTime() time.Duration              { return 0 }
-func (m *mockChecker) DifferencesFound() uint64             { return m.differencesFound.Load() }
 
 // setupRunnerForChecksumTest builds a move.Runner up to the point where the
 // checkpoint table exists on the first target, the copier has produced a watermark,
 // and the checksum chunker is open with a watermark too. r.checker is the
-// caller's responsibility to set — tests swap in a mockChecker.
+// caller's responsibility to set — tests swap in a checksum.MockChecker.
 //
 // Mirrors setupRunnerForChecksumTest in pkg/migration/. Stops short of
 // running the full Run() loop so the tests can directly drive DumpCheckpoint
@@ -71,12 +57,11 @@ func setupRunnerForChecksumTest(t *testing.T, dbSuffix string) (*Runner, context
 	})
 
 	move := &Move{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         1,
-		WriteThreads:    1,
-		CreateSentinel:  false,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      1,
+		WriteThreads: 1,
+		DeferCutOver: false,
 	}
 	r, err := NewRunner(move)
 	require.NoError(t, err)
@@ -163,7 +148,7 @@ func TestChecksumErrorPreservesCheckpoint(t *testing.T) {
 			// Drive only the checker.Run() line from postCopyPhase. The
 			// rest of postCopyPhase (ANALYZE TABLE, secondary-index restore)
 			// is not on this invariant's hot path.
-			r.checker = &mockChecker{runErr: tc.err}
+			r.checker = &checksum.MockChecker{RunError: tc.err}
 			r.status.Set(status.Checksum)
 
 			err := r.checker.Run(ctx)
@@ -187,12 +172,12 @@ func TestChecksumErrorPreservesCheckpoint(t *testing.T) {
 func TestDumpCheckpointSuppressesWatermarkWithDifferences(t *testing.T) {
 	r, ctx := setupRunnerForChecksumTest(t, "invariant")
 
-	mock := &mockChecker{}
+	mock := &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.checker = mock
 	r.status.Set(status.Checksum)
 
 	// --- Case 1: current pass has had differences. Watermark must be "". ---
-	mock.differencesFound.Store(1)
+	mock.SetDifferencesFound(1)
 	require.NoError(t, r.DumpCheckpoint(ctx))
 	copierWM, checksumWM := latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, copierWM, "copier_watermark should always be persisted")
@@ -200,7 +185,7 @@ func TestDumpCheckpointSuppressesWatermarkWithDifferences(t *testing.T) {
 		"checksum_watermark must be empty while DifferencesFound > 0")
 
 	// --- Case 2: counter reset (next pass starts clean). Watermark restored. ---
-	mock.differencesFound.Store(0)
+	mock.SetDifferencesFound(0)
 	require.NoError(t, r.DumpCheckpoint(ctx))
 	copierWM, checksumWM = latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, copierWM)
@@ -221,7 +206,7 @@ func TestDumpCheckpointSuppressesWatermarkWithContinuousDifferences(t *testing.T
 
 	// The initial checksum completed clean; the move is now blocked in the
 	// sentinel wait (which is >= Checksum, so watermarks are dumped).
-	r.checker = &mockChecker{}
+	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.status.Set(status.WaitingOnSentinelTable)
 
 	// --- Case 1: no continuous checker yet (just entered the wait). ---
@@ -232,7 +217,7 @@ func TestDumpCheckpointSuppressesWatermarkWithContinuousDifferences(t *testing.T
 		"checksum_watermark must be persisted while no continuous checker exists")
 
 	// --- Case 2: continuous checker exists and is clean. ---
-	cont := &mockChecker{}
+	cont := &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.continuousChecker = cont
 	require.NoError(t, r.DumpCheckpoint(ctx))
 	_, checksumWM = latestCheckpointWatermarks(t, r)
@@ -240,7 +225,7 @@ func TestDumpCheckpointSuppressesWatermarkWithContinuousDifferences(t *testing.T
 		"checksum_watermark must be persisted while the continuous checker is clean")
 
 	// --- Case 3: continuous checker has repaired a chunk. ---
-	cont.differencesFound.Store(1)
+	cont.SetDifferencesFound(1)
 	require.NoError(t, r.DumpCheckpoint(ctx))
 	copierWM, checksumWM = latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, copierWM)
@@ -257,7 +242,7 @@ func TestDumpCheckpointSuppressesWatermarkWithContinuousDifferences(t *testing.T
 func TestInvalidateChecksumWatermarkAfterContinuousDivergence(t *testing.T) {
 	r, ctx := setupRunnerForChecksumTest(t, "cont_invalidate")
 
-	r.checker = &mockChecker{}
+	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.status.Set(status.WaitingOnSentinelTable)
 
 	// Persist a checkpoint while everything is believed clean — this is the
@@ -272,7 +257,7 @@ func TestInvalidateChecksumWatermarkAfterContinuousDivergence(t *testing.T) {
 	_, checksumWM = latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, checksumWM,
 		"invalidate must not touch the watermark when no continuous checker exists")
-	cont := &mockChecker{}
+	cont := &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.continuousChecker = cont
 	require.NoError(t, r.invalidateChecksumWatermark(ctx))
 	_, checksumWM = latestCheckpointWatermarks(t, r)
@@ -281,7 +266,7 @@ func TestInvalidateChecksumWatermarkAfterContinuousDivergence(t *testing.T) {
 
 	// Continuous checker found (and repaired) a difference: the
 	// already-persisted watermark row must be rewritten to empty.
-	cont.differencesFound.Store(1)
+	cont.SetDifferencesFound(1)
 	require.NoError(t, r.invalidateChecksumWatermark(ctx))
 	copierWM, checksumWM := latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, copierWM, "copier_watermark must survive invalidation")

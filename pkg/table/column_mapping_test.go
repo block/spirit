@@ -192,3 +192,34 @@ func TestColumnMappingTargetNil(t *testing.T) {
 	require.Equal(t, "`a`, `b`, `c`", tgt)
 	require.Equal(t, t1, m.TargetTable())
 }
+
+func TestColumnMappingChecksumExprsJSONAsymmetric(t *testing.T) {
+	// JSON columns are checksummed asymmetrically (see castExpr): the source
+	// expression predicts the one-text-round-trip image the copier/applier
+	// writes, while the target expression renders the stored document
+	// strictly — so the two sides differ even without renames.
+	t1 := NewTableInfo(nil, "test", "t1")
+	t1new := NewTableInfo(nil, "test", "t1_new")
+	t1.NonGeneratedColumns = []string{"id", "j"}
+	t1new.NonGeneratedColumns = []string{"id", "j"}
+	t1new.columnsMySQLTps = map[string]string{"id": "int", "j": "json"}
+
+	m := NewColumnMapping(t1, t1new, nil)
+	src, tgt, err := m.ChecksumExprs()
+	require.NoError(t, err)
+	require.Contains(t, src, "CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)")
+	require.Contains(t, tgt, "CAST(`j` AS json)")
+	require.NotContains(t, tgt, "CAST(CAST(`j`")
+	// Non-JSON columns cast identically on both sides.
+	require.Contains(t, src, "CAST(`id` AS signed)")
+	require.Contains(t, tgt, "CAST(`id` AS signed)")
+
+	// With a rename the source expression references the old name but the
+	// asymmetry is unchanged.
+	t1.NonGeneratedColumns = []string{"id", "old_j"}
+	m = NewColumnMapping(t1, t1new, map[string]string{"old_j": "j"})
+	src, tgt, err = m.ChecksumExprs()
+	require.NoError(t, err)
+	require.Contains(t, src, "CAST(CAST(`old_j` AS char CHARACTER SET utf8mb4) AS json)")
+	require.Contains(t, tgt, "CAST(`j` AS json)")
+}

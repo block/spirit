@@ -4,9 +4,25 @@ package throttler
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"time"
 )
+
+// isShutdownError reports whether a sampling failure inside a background poll
+// loop is teardown noise rather than a monitoring problem. When the context a
+// throttler was opened with is cancelled (migration finished, cancelled, or
+// failed elsewhere), any in-flight sample query errors out — typically
+// "context canceled" — and the loop is about to exit anyway. Logging that at
+// Error level pages people about a migration that simply stopped, so the poll
+// loops return quietly instead (issue seen as a Sentry alert:
+// "sampling Aurora threads (redo-aware): context canceled").
+//
+// The errors.Is check catches the race where the query was cancelled but the
+// loop observes the error before it observes ctx.Done().
+func isShutdownError(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
+}
 
 type Throttler interface {
 	Open(ctx context.Context) error

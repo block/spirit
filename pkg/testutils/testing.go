@@ -5,13 +5,16 @@ package testutils
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -19,6 +22,11 @@ import (
 // dbCounter ensures unique database names when CreateUniqueTestDatabase
 // is called multiple times within the same test.
 var dbCounter atomic.Uint64
+
+// driverName mirrors dbconn.DriverName. It is duplicated rather than imported
+// because dbconn's own tests import this package, so importing dbconn here
+// would be a cycle.
+const driverName = "block-mysql"
 
 func DSN() string {
 	dsn := os.Getenv("MYSQL_DSN")
@@ -66,7 +74,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	}
 	rootDSN := baseDSN[:lastSlash+1]
 
-	rootDB, err := sql.Open("mysql", rootDSN)
+	rootDB, err := sql.Open(driverName, rootDSN)
 	require.NoError(t, err)
 	defer func() {
 		_ = rootDB.Close()
@@ -75,13 +83,13 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, err)
 
 	// Open a connection scoped to the new database
-	scopedDB, err := sql.Open("mysql", rootDSN+dbName)
+	scopedDB, err := sql.Open(driverName, rootDSN+dbName)
 	require.NoError(t, err)
 
 	// Register cleanup to close the connection and drop the database
 	t.Cleanup(func() {
 		_ = scopedDB.Close()
-		cleanupDB, err := sql.Open("mysql", rootDSN)
+		cleanupDB, err := sql.Open(driverName, rootDSN)
 		require.NoError(t, err)
 		defer func() {
 			_ = cleanupDB.Close()
@@ -93,11 +101,77 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	return dbName, scopedDB
 }
 
+// Error numbers a server without the VECTOR type returns for the probe below.
+// A missing built-in is looked up as a stored function, so what comes back
+// depends on the connecting user's privileges: root sees "does not exist",
+// while a user without EXECUTE on the schema (the CI test user) is denied
+// first and never learns the function is missing.
+const (
+	erSpDoesNotExist   = 1305 // FUNCTION test.VECTOR_DIM does not exist
+	erProcAccessDenied = 1370 // execute command denied ... for routine 'test.VECTOR_DIM'
+)
+
+// vectorSupported caches the one-time capability probe behind
+// SkipUnlessVectorSupported. err holds an infrastructure failure (see below),
+// which is reported to every caller rather than silently skipping them.
+var vectorSupported struct {
+	sync.Once
+	ok  bool
+	err error
+}
+
+// SkipUnlessVectorSupported skips the test unless the server understands the
+// VECTOR data type (MySQL 9.7+). It probes for the feature rather than parsing
+// version(), so a fork or a future version that renames itself still gets the
+// coverage. The probe result is cached for the life of the test binary.
+//
+// Only an "unknown function" answer from the server counts as unsupported.
+// Anything else — an unreachable host, a bad DSN, an auth failure, any other
+// server error — fails the test instead, so a broken environment cannot
+// masquerade as a whole suite of quietly skipped tests.
+func SkipUnlessVectorSupported(t *testing.T) {
+	t.Helper()
+	vectorSupported.Do(func() {
+		db, err := sql.Open(driverName, DSN())
+		if err != nil {
+			vectorSupported.err = err
+			return
+		}
+		defer utils.CloseAndLog(db)
+		var dim int
+		// STRING_TO_VECTOR/VECTOR_DIM exist only where the type does.
+		err = db.QueryRowContext(context.Background(),
+			`SELECT VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))`).Scan(&dim)
+		switch {
+		case err == nil:
+			vectorSupported.ok = true
+			if dim != 3 {
+				vectorSupported.err = fmt.Errorf("VECTOR probe returned dimension %d, want 3", dim)
+			}
+		case isUnknownFunctionErr(err):
+			// Server predates the VECTOR type; callers skip.
+		default:
+			vectorSupported.err = err
+		}
+	})
+	require.NoError(t, vectorSupported.err, "probing the server for VECTOR support failed")
+	if !vectorSupported.ok {
+		t.Skip("skipping: server does not support the VECTOR type (requires MySQL 9.7+)")
+	}
+}
+
+// isUnknownFunctionErr reports whether err is the server telling us a function
+// does not exist — in either of the two forms described above.
+func isUnknownFunctionErr(err error) bool {
+	myErr, ok := errors.AsType[*mysql.MySQLError](err)
+	return ok && (myErr.Number == erSpDoesNotExist || myErr.Number == erProcAccessDenied)
+}
+
 // RunSQLInDatabase runs SQL in a specific database
 func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 	t.Helper()
 	dsn := DSNForDatabase(dbName)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(driverName, dsn)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -108,7 +182,7 @@ func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 
 func RunSQL(t *testing.T, stmt string) {
 	t.Helper()
-	db, err := sql.Open("mysql", DSN())
+	db, err := sql.Open(driverName, DSN())
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
@@ -124,7 +198,7 @@ func RunSQL(t *testing.T, stmt string) {
 // distinguishable from a Spirit migration bug.
 func WaitForReplicaHealthy(t *testing.T, dsn string, timeout time.Duration) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(driverName, dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -205,4 +279,24 @@ func EvenOddHasher(colAny any) (uint64, error) {
 		hash = 0x8000000000000000 + uint64(col)
 	}
 	return hash, nil
+}
+
+// RequireNoEffectiveTLS asserts that a DSN yields a connection with no TLS.
+//
+// It deliberately does not assert the DSN omits "tls=". DISABLED writes
+// tls=false, because the driver applies verified TLS to an RDS address whenever
+// the DSN asks for nothing — so an omitted parameter is how DISABLED silently
+// becomes a TLS connection, while an explicit "false" is how it stays off. What
+// matters is the setting the driver ends up with, which is what this reads.
+//
+// It lives here rather than in dbconn's tests because pkg/migration asserts the
+// same property, and two copies of "what counts as no TLS" would let one of
+// them be strengthened while the other silently stayed weak.
+func RequireNoEffectiveTLS(t *testing.T, dsn, description string) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(dsn)
+	require.NoError(t, err, description)
+	require.Nil(t, cfg.TLS, "%s: DSN produced a TLS connection", description)
+	require.False(t, cfg.AllowCleartextPasswords,
+		"%s: cleartext passwords allowed with no TLS", description)
 }

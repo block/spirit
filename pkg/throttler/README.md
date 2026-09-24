@@ -47,6 +47,29 @@ type GradualThrottler interface {
 
 The copier's write-thread autoscaler type-asserts for this and only engages when it is present. The two Aurora throttlers implement it; the replication-lag throttler deliberately does **not** — lag is an SLO-style budget, not a load gauge, so steering on it would park replicas behind. Binary-signal throttlers protect only via the `IsThrottled()` / `BlockWait()` hard-stop.
 
+The distinction also decides *who is allowed to pause whom*. `GradualOnly(t)` returns a view of a composite that keeps only its gradual children, for consumers that cannot cause what a binary throttler protects: the checksum reads inside a `REPEATABLE READ` snapshot and emits no binlog events, so pausing it on replica lag cannot reduce that lag, while the pause holds the snapshot open and retains undo. The view is read-only — its `Open`, `Close` and `UpdateLag` are no-ops, because the composite it came from is still what gets opened, polled and closed.
+
+### `ReasonedThrottler` (optional extension)
+
+Throttlers that can explain *why* they are throttling implement `ReasonedThrottler` ([#844](https://github.com/block/spirit/issues/844)):
+
+```go
+type ReasonedThrottler interface {
+    Throttler
+    // ThrottleReason names the signal and the comparison that tripped it,
+    // e.g. "commit-latency 128ms >= 100ms". "" when not throttling.
+    ThrottleReason() string
+}
+```
+
+This exists for the status API: throttling used to be visible only in the logs, so a wrapper polling `status.Progress` saw a migration that had gone quiet with no way to say why. Every throttler in this package implements it, and the composite names *every* currently-throttling child (joined with `"; "`) because clearing only one of them will not resume the copy. It is optional, so a custom throttler that omits it still works — it just reports being throttled without a reason.
+
+`Describe(t)` is the accessor the runners use, folding the two optional extensions and a nil throttler into the three values `status.Progress.Throttle` carries: `throttled`, `reason`, and `utilization`. Note the asymmetry: `reason` is only read while throttling, whereas `utilization` is always read — a load reading below the throttle point is exactly what makes "running at 40% of the limit" reportable before anything pauses.
+
+Implementations of `ThrottleReason` must not disturb the signal they report on: asking for a reason should never change what the throttle path will log. `Replica.ThrottleReason` uses `gapExceeds` rather than `check` for this reason, so it cannot consume the warn-once staleness logging.
+
+Note this is a requirement on the *method*, not a claim about the status path: `Describe` calls `IsThrottled` first to get the field it reports, so a status poll can still be what logs that stale-signal warning. The `CompareAndSwap` behind it means the warning is still logged exactly once per stale period — only the attribution moves.
+
 ## Implementations
 
 ### Noop Throttler
@@ -111,10 +134,10 @@ Both throttlers require an `IsAurora()` probe — which confirms `performance_sc
 Throttlers are integrated into the copier and automatically pause chunk copying when the system is under stress:
 
 ```go
-copier := &copier.Unbuffered{
-    Throttler: throttler,
-    // ... other config
-}
+config := copier.NewCopierDefaultConfig()
+config.Throttler = throttler
+config.Applier = rowApplier // required (non-nil); see pkg/applier
+c, err := copier.NewCopier(chunker, config)
 ```
 
 During migration, the copier calls `throttler.BlockWait(ctx)` before each chunk, pausing operations if `IsThrottled()` returns true.
@@ -128,6 +151,7 @@ To implement a custom throttler (e.g., for Freno integration):
 3. Update throttling state based on your metrics
 4. Return the current state in `IsThrottled()`
 5. Block appropriately in `BlockWait()` with context support
+6. Optionally implement `ThrottleReason()` so the status API can explain your pauses to a GUI
 
 Example structure:
 
@@ -164,6 +188,7 @@ func (t *CustomThrottler) BlockWait(ctx context.Context) {
 
 ## See Also
 
+- [pkg/autoscale](../autoscale/README.md) - What the `GradualThrottler` signal drives: the shared zone law and cooldown gate
 - [MySQL 8.0 Replication Lag Implementation](https://github.com/block/spirit/issues/286)
 - [Freno - Throttling Service](https://github.com/github/freno)
 - [Doorman - Global Distributed Client Side Rate Limiting](https://github.com/youtube/doorman)

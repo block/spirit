@@ -24,10 +24,11 @@ import (
 // Compile-time assertion that the GTID-backed Client satisfies Source.
 var _ Source = (*gtidClient)(nil)
 
-// gtidClient is an experimental change.Source that uses MySQL GTIDs as the
-// resume coordinate instead of (binlog-file, offset). It is a parallel
-// implementation to binlogClient; nothing is shared with it directly so the
-// binlog client can be kept untouched while this one matures.
+// gtidClient is a change.Source that uses MySQL GTIDs as the resume
+// coordinate instead of (binlog-file, offset). It is selected automatically
+// (see NewAutoClient) whenever the source server has GTIDs enabled. It is a
+// parallel implementation to binlogClient; nothing is shared with it directly
+// so the binlog client can be kept untouched while this one matures.
 //
 // Wire protocol: COM_BINLOG_DUMP_GTID via go-mysql's
 // BinlogSyncer.StartSyncGTID. The server requires gtid_mode=ON and
@@ -53,6 +54,9 @@ type gtidClient struct {
 	ddlFilterSchema  string
 	ddlFilterTables  map[string]struct{}
 
+	// stopped mirrors binlogClient.stopped; see Stop.
+	stopped atomic.Bool
+
 	serverID uint32
 
 	// bufferedGTID is everything we have seen from the stream and either
@@ -73,6 +77,34 @@ type gtidClient struct {
 	pendingSID   []byte
 	pendingGNO   int64
 
+	// flushResidual is the pending-change count observed at the end of the
+	// most recent flush, and flushCount how many flushes have completed. Both
+	// guarded by mu. See Source.FlushResidual.
+	flushResidual int
+	flushCount    int
+
+	// lastFlush* describe the most recently completed flush, for FeedStats.
+	// Guarded by mu. See binlogClient for why every flush is recorded, not
+	// just the periodic one.
+	lastFlushAt       time.Time
+	lastFlushDuration time.Duration
+	lastFlushRows     int
+	// lastFlushComplete is that flush's allChangesFlushed result: whether
+	// every subscription drained everything it held. Flush reads it, alongside
+	// each subscription's LastDrainHitBudget, to tell a backlog it can work
+	// through from one it cannot — see backlogWorthDraining.
+	lastFlushComplete bool
+
+	// rotations counts binlog rotations seen on the stream. Position
+	// tracking here is by GTID, so this is reported for diagnostics only.
+	rotations atomic.Int64
+
+	// lastEventTime is the source's own wall-clock timestamp on the newest
+	// binlog event the reader has seen, as unix seconds. Written by
+	// recordEventTime from the read loop, read back by eventTime; see
+	// FeedStats.BufferedEventAt.
+	lastEventTime atomic.Int64
+
 	periodicFlushLock   sync.Mutex
 	periodicFlushCancel context.CancelFunc
 	periodicFlushDone   chan struct{}
@@ -83,13 +115,39 @@ type gtidClient struct {
 	streamWG   sync.WaitGroup
 
 	subscriptionSoftLimitBytes int64
+
+	// subscriptionSoftLimitChanges is the per-subscription change-count
+	// cap, applied alongside the byte cap. Zero disables it. See
+	// DefaultSubscriptionSoftLimitChanges.
+	subscriptionSoftLimitChanges int
+
+	// flushConcurrency is the map-mode flush batch concurrency passed
+	// to each subscription on construction. See DefaultFlushConcurrency.
+	flushConcurrency int
+
+	// batchSize is the map-mode flush batch size passed to each
+	// subscription on construction. It travels with flushConcurrency:
+	// the two together set the rows a drain has in flight. See
+	// DefaultBatchSize.
+	batchSize int
+
+	// underLoad is ClientConfig.UnderLoad, handed to every subscription so the
+	// drain can narrow itself when the target is loaded. Nil disables it.
+	underLoad func() bool
+
+	// flushRequests receives the subscription that parked on its soft
+	// memory limit; runPeriodicFlush selects on it and flushes that
+	// subscription first, then runs the normal all-subscription pass.
+	// See the binlog client's field of the same name.
+	flushRequests chan Subscription
 }
 
 // NewGTIDClient constructs the GTID-backed change.Source. It mirrors
 // NewBinlogClient: config.Applier (passed via appl) is required.
 //
-// EXPERIMENTAL. See docs in pkg/migration and pkg/move for the --gtid
-// flag.
+// Most callers should use NewAutoClient instead, which selects between this
+// and the binlog client based on the server's GTID support (fresh runs) or
+// the checkpointed position's encoding (resumes).
 func NewGTIDClient(db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig) Source {
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig()
@@ -100,20 +158,31 @@ func NewGTIDClient(db *sql.DB, host string, username, password string, appl appl
 	} else if softLimit < 0 {
 		softLimit = 0
 	}
+	softLimitChanges := config.SubscriptionSoftLimitChanges
+	if softLimitChanges == 0 {
+		softLimitChanges = DefaultSubscriptionSoftLimitChanges
+	} else if softLimitChanges < 0 {
+		softLimitChanges = 0
+	}
 	return &gtidClient{
-		db:                         db,
-		dbConfig:                   config.DBConfig,
-		host:                       host,
-		username:                   username,
-		password:                   password,
-		logger:                     config.Logger,
-		subs:                       newSubscriptionRegistry(),
-		callerCancelFunc:           config.CancelFunc,
-		ddlFilterSchema:            config.DDLFilterSchema,
-		ddlFilterTables:            toSet(config.DDLFilterTables),
-		serverID:                   config.ServerID,
-		applier:                    appl,
-		subscriptionSoftLimitBytes: softLimit,
+		db:                           db,
+		dbConfig:                     config.DBConfig,
+		host:                         host,
+		username:                     username,
+		password:                     password,
+		logger:                       config.Logger,
+		subs:                         newSubscriptionRegistry(),
+		callerCancelFunc:             config.CancelFunc,
+		ddlFilterSchema:              config.DDLFilterSchema,
+		ddlFilterTables:              toSet(config.DDLFilterTables),
+		serverID:                     config.ServerID,
+		applier:                      appl,
+		subscriptionSoftLimitBytes:   softLimit,
+		subscriptionSoftLimitChanges: softLimitChanges,
+		flushConcurrency:             config.resolveFlushConcurrency(),
+		batchSize:                    config.resolveBatchSize(),
+		underLoad:                    config.UnderLoad,
+		flushRequests:                make(chan Subscription, 1),
 	}
 }
 
@@ -121,12 +190,17 @@ func NewGTIDClient(db *sql.DB, host string, username, password string, appl appl
 func (c *gtidClient) AddSubscription(currentTable, newTable *table.TableInfo, chunker table.MappedChunker) error {
 	subKey := encodeSchemaTable(currentTable.SchemaName, currentTable.TableName)
 	sub, err := NewBufferedSubscription(BufferedSubscriptionConfig{
-		CurrentTable:   currentTable,
-		NewTable:       newTable,
-		Applier:        c.applier,
-		Chunker:        chunker,
-		Logger:         c.logger,
-		SoftLimitBytes: c.subscriptionSoftLimitBytes,
+		CurrentTable:     currentTable,
+		NewTable:         newTable,
+		Applier:          c.applier,
+		Chunker:          chunker,
+		Logger:           c.logger,
+		SoftLimitBytes:   c.subscriptionSoftLimitBytes,
+		SoftLimitChanges: c.subscriptionSoftLimitChanges,
+		FlushRequest:     c.flushRequests,
+		FlushConcurrency: c.flushConcurrency,
+		BatchSize:        c.batchSize,
+		UnderLoad:        c.underLoad,
 	})
 	if err != nil {
 		return fmt.Errorf("could not build subscription for table %s.%s: %w", currentTable.SchemaName, currentTable.TableName, err)
@@ -239,10 +313,12 @@ func (c *gtidClient) getBufferedGTID() mysql.GTIDSet {
 // a no-op when there is no pending GTID (e.g. right after a reconnect).
 //
 // This must be called when — and only when — the current transaction's
-// binlog group ends: XIDEvent (InnoDB commit), a COMMIT or ROLLBACK
-// QueryEvent (non-transactional engines / mixed-engine rollbacks), or a
-// standalone statement that is its own transaction (DDL, statements the
-// TiDB parser cannot parse such as CREATE TRIGGER or stored procedures).
+// binlog group has ended: XIDEvent (InnoDB commit), a COMMIT or ROLLBACK
+// QueryEvent (non-transactional engines / mixed-engine rollbacks), a
+// parsed standalone statement that is its own transaction (DDL), or the
+// next group's GTIDEvent — which proves the previous group ended and
+// advances statements with no terminator we can recognize (see
+// processQueryEvent). XA events fail the stream before promotion.
 // Every GTIDEvent the server streams corresponds to an entry in its
 // gtid_executed, so any path that drops a pending GTID instead of
 // promoting it leaves bufferedGTID permanently behind gtid_executed and
@@ -254,10 +330,11 @@ func (c *gtidClient) getBufferedGTID() mysql.GTIDSet {
 // and its row events are silently lost. This is why a mid-group QueryEvent
 // must not promote. Regular transactions have no mid-group QueryEvents
 // besides BEGIN and the SAVEPOINT family ("SAVEPOINT `x`", plus
-// "ROLLBACK TO `x`" in mixed-engine transactions). XA transactions log
-// mid-group QueryEvents too ("XA START"/"XA END"), but any XA statement
-// now fails the stream outright instead of adjusting pending-GTID state —
-// see the XA guard in processQueryEvent.
+// "ROLLBACK TO `x`" in mixed-engine transactions), but two group shapes
+// do: CREATE TABLE ... SELECT carries its unparseable CREATE TABLE
+// statement mid-group (see processQueryEvent), and XA transactions log
+// "XA START"/"XA END" around their row events. XA events fail the stream
+// before any row event is buffered; see the guard in processQueryEvent.
 func (c *gtidClient) promotePendingGTID() {
 	c.mu.Lock()
 	pendingSID := c.pendingSID
@@ -352,7 +429,9 @@ func (c *gtidClient) buildSyncerConfig(host string, port uint16) replication.Bin
 		Port:     port,
 		User:     c.username,
 		Password: c.password,
-		Logger:   c.logger,
+		// Demote go-mysql's per-rotation INFO line the same way the binlog
+		// client does — see syncerQuietMessages.
+		Logger: newDemotingLogger(c.logger, syncerQuietMessages),
 		// Render JSON the same way the binlog client does — see the
 		// rationale on NewBinlogClient.
 		RenderJSONAsMySQLText: true,
@@ -362,6 +441,9 @@ func (c *gtidClient) buildSyncerConfig(host string, port uint16) replication.Bin
 		// writes over time_zone='+00:00' connections, silently shifting
 		// stored TIMESTAMP values on any non-UTC host.
 		TimestampStringLocation: time.UTC,
+		// Decode row images only for subscribed tables, the same way the
+		// binlog client does — see newRowsEventDecodeFunc.
+		RowsEventDecodeFunc: newRowsEventDecodeFunc(c.subs, &c.stopped),
 	}
 }
 
@@ -476,6 +558,11 @@ func (c *gtidClient) readStream(ctx context.Context) {
 	backoffDuration := initialBackoffDuration
 	lastErrorTime := time.Time{}
 	var recentErrors []string
+	// Tracked only to de-duplicate rotate events for the rotation counter;
+	// this client resumes by GTID, never by file name. Empty means "no rotate
+	// seen yet" — see countRotation, which is what keeps the dump's opening
+	// artificial rotate from counting.
+	currentLogName := ""
 
 	c.logger.Debug("readStream started for GTID position", "gtid", c.getBufferedGTID().String())
 
@@ -572,11 +659,26 @@ func (c *gtidClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		// Stamp before the switch, not inside it: several cases below
+		// `continue` out, and one call site per client is what keeps the two
+		// clients from drifting on this. The published position is at most one
+		// transaction behind the event stamped here.
+		recordEventTime(&c.lastEventTime, ev.Header.Timestamp)
 		switch event := ev.Event.(type) {
 		case *replication.GTIDEvent:
 			// The server emits a GTIDEvent at the start of every
-			// transaction. Stash its {SID,GNO} so we can promote it to
-			// bufferedGTID only after the matching XIDEvent.
+			// transaction, which also proves the previous group ended:
+			// groups never interleave within a binlog stream. A GTID
+			// still pending here belongs to that finished group — its
+			// terminator was not one we recognize (the QueryEvent of a
+			// standalone statement the parser cannot parse; see
+			// processQueryEvent) — and every one of its events has been
+			// processed by now, so promote it rather than dropping it,
+			// which would leave bufferedGTID permanently behind
+			// gtid_executed and wedge BlockWait/Flush forever. Then
+			// stash the new {SID,GNO} so the matching group terminator
+			// can promote it.
+			c.promotePendingGTID()
 			c.mu.Lock()
 			c.pendingSID = append(c.pendingSID[:0], event.SID...)
 			c.pendingGNO = event.GNO
@@ -612,10 +714,14 @@ func (c *gtidClient) readStream(ctx context.Context) {
 				c.fatalError(FatalReasonStreamError)
 				return
 			}
+		case *replication.RotateEvent:
+			// Stream housekeeping: position tracking advances via
+			// GTIDEvent/XIDEvent above, not via rotations. We only count
+			// them, for the runner status block.
+			currentLogName = c.countRotation(currentLogName, string(event.NextLogName))
 		case *replication.TableMapEvent,
 			*replication.FormatDescriptionEvent,
-			*replication.PreviousGTIDsEvent,
-			*replication.RotateEvent:
+			*replication.PreviousGTIDsEvent:
 			// Stream housekeeping events. Position tracking advances via
 			// GTIDEvent/XIDEvent above, not via these.
 		case *replication.GenericEvent:
@@ -725,11 +831,11 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) error {
 	if isXAStatement(q) {
 		return errXAUnsupported
 	}
-	ddlTables, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
+	ddlTables, opensTransaction, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
 	if err != nil {
-		// The TiDB parser does not understand all syntax (CREATE/DROP
-		// TRIGGER, certain ALTER USER variants, etc.) — these are
-		// expected misses, not bugs. We include the parser error and
+		// The parser does not understand all syntax (mode-dependent SQL
+		// such as ANSI_QUOTES quoting, or syntax newer than the grammar)
+		// — these are expected misses, not bugs. We include the parser error and
 		// the schema so an operator can diagnose unexpected payloads,
 		// but deliberately omit the query itself: it can contain user
 		// data and ends up in logs. (Same rationale as the binlog
@@ -738,14 +844,31 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) error {
 			"error", err,
 			"schema", string(event.Schema),
 			"gtid", c.getBufferedGTID().String())
-		// The statement was still a complete server transaction with
-		// its own GTID — promote it even though we could not parse
-		// it, otherwise bufferedGTID falls permanently behind
-		// gtid_executed and BlockWait/Flush never complete. Note the
-		// schema filter only applies after parsing, so *any*
-		// unparseable statement on the server (e.g. a stored
-		// procedure deploy in an unrelated schema) takes this path.
-		c.promotePendingGTID()
+		// An unparseable statement is usually a standalone
+		// single-statement transaction (e.g. DDL logged under
+		// ANSI_QUOTES) whose QueryEvent is also its group
+		// terminator — but not always: since 8.0.21 the server logs
+		// CREATE TABLE ... SELECT as GTIDEvent → Query(BEGIN) →
+		// Query("CREATE TABLE ... START TRANSACTION") → row events →
+		// XIDEvent (verified against MySQL 8.0.45), putting the
+		// unparseable statement mid-group with its row events still
+		// to come. We cannot tell the two shapes apart, so treat it
+		// like the other mid-group statements above and leave the
+		// pending GTID pending: promoting it here would let a
+		// concurrent flush publish it as a resume coordinate (and
+		// recreateStreamer resume past it after a stream hiccup)
+		// before the group's remaining events are buffered, silently
+		// losing them. The GTID is promoted by the group's own
+		// terminator if one follows (the XIDEvent, in the CTAS shape)
+		// or by the next GTIDEvent, which proves the group ended (see
+		// readStream). If such a statement is the very last thing the
+		// server executes, bufferedGTID trails gtid_executed by that
+		// one GTID until the next transaction arrives, so BlockWait
+		// can time out — loud and retryable, unlike a corrupted
+		// resume coordinate. Note the schema filter only applies
+		// after parsing, so *any* unparseable statement on the server
+		// (e.g. ANSI_QUOTES DDL in an unrelated schema) takes this
+		// path.
 		return nil
 	}
 	// MySQL emits a synthetic GTID for DDL statements too, but the
@@ -754,7 +877,18 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) error {
 	// set. This is best-effort — if the caller cancels on DDL we
 	// won't actually resume, but the position is consistent for
 	// non-cancelling filters.
-	c.promotePendingGTID()
+	//
+	// The exception is a statement that *opens* its group: the parsed
+	// CREATE TABLE ... START TRANSACTION form of CTAS (its row events
+	// are still to come, exactly like BEGIN above — the XIDEvent that
+	// ends the group promotes), or a hypothetical spelled-out
+	// START TRANSACTION the BEGIN fast-path above didn't catch.
+	// Promoting here would let a concurrent flush publish the GTID as
+	// a resume coordinate before the group's row events are buffered,
+	// silently losing them on resume.
+	if !opensTransaction {
+		c.promotePendingGTID()
+	}
 	for _, ddlTable := range ddlTables {
 		c.processDDLNotification(ddlTable.schema, ddlTable.table)
 	}
@@ -813,6 +947,10 @@ func (c *gtidClient) processTransactionPayload(e *replication.TransactionPayload
 
 // processDDLNotification mirrors binlogClient.processDDLNotification.
 func (c *gtidClient) processDDLNotification(schema, table string) {
+	if c.stopped.Load() {
+		// Post-cutover; see Source.Stop.
+		return
+	}
 	if c.ddlFilterSchema != "" {
 		if schema != c.ddlFilterSchema {
 			return
@@ -854,10 +992,19 @@ func (c *gtidClient) processDDLNotification(schema, table string) {
 
 // processRowsEvent mirrors binlogClient.processRowsEvent.
 func (c *gtidClient) processRowsEvent(ev *replication.BinlogEvent, e *replication.RowsEvent) error {
+	if c.stopped.Load() {
+		// Post-cutover; see Source.Stop and binlogClient.processRowsEvent.
+		return nil
+	}
 	subName := encodeSchemaTable(string(e.Table.Schema), string(e.Table.Table))
 	sub, ok := c.subs.Get(subName)
 	if !ok {
 		return nil
+	}
+	if e.Rows == nil {
+		// Decode-time filter skipped a now-subscribed table's event; see the
+		// equivalent check in binlogClient.processRowsEvent.
+		return fmt.Errorf("rows event for subscribed table %s arrived with undecoded rows: subscriptions must be added before Start (see Source lifecycle)", subName)
 	}
 
 	if isMinimalRowImage(e) {
@@ -924,6 +1071,14 @@ func (c *gtidClient) processRowsEvent(ev *replication.BinlogEvent, e *replicatio
 	return nil
 }
 
+// Stop mirrors binlogClient.Stop; see Source.Stop.
+func (c *gtidClient) Stop() {
+	if c.stopped.Swap(true) {
+		return
+	}
+	c.logger.Debug("change stream stopped; further events will not be dispatched")
+}
+
 // fatalError mirrors binlogClient.fatalError; see the doc comment there.
 func (c *gtidClient) fatalError(reason FatalReason) bool {
 	if c.callerCancelFunc != nil {
@@ -955,6 +1110,10 @@ func (c *gtidClient) Close() {
 		sub.Close()
 	}
 
+	// Join the independently cancellable writer too. Both background loops
+	// must finish before Close returns; neither join depends on the other.
+	c.StopPeriodicFlush()
+
 	c.streamWG.Wait()
 
 	if c.syncer != nil {
@@ -983,6 +1142,11 @@ func (c *gtidClient) FlushUnderTableLock(ctx context.Context, locks []*dbconn.Ta
 }
 
 func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []*dbconn.TableLock) error {
+	// Sampled before the flush starts: this is the batch size the flush is
+	// about to work through. GetDeltaLen takes no lock of its own, so it is
+	// called before acquiring c.mu.
+	start := time.Now()
+	batch := c.GetDeltaLen()
 	c.mu.Lock()
 	newFlushedGTID := c.bufferedGTID.Clone()
 	c.mu.Unlock()
@@ -1011,14 +1175,104 @@ func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []*dbconn.
 		}
 		c.mu.Unlock()
 	}
+	c.recordFlush(start, batch, allChangesFlushed)
 	return nil
+}
+
+// recordFlush captures what this flush left behind (for FlushResidual) and
+// how long it took on how many changes (for FeedStats). Recorded whether or
+// not every change could be flushed: a flush that could not drain everything
+// is exactly the case a caller watching for a feed losing ground needs to see.
+//
+// GetDeltaLen takes no lock of its own, so it is called before acquiring c.mu.
+func (c *gtidClient) recordFlush(start time.Time, batch int, complete bool) {
+	residual := c.GetDeltaLen()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushResidual = residual
+	c.flushCount++
+	c.lastFlushAt = time.Now()
+	c.lastFlushDuration = time.Since(start)
+	c.lastFlushRows = batch
+	c.lastFlushComplete = complete
+}
+
+// lastFlushWasComplete reports whether the most recent flush drained every
+// subscription. Flush uses it to decide whether re-draining a backlog
+// immediately would make progress or just re-defer the same keys.
+func (c *gtidClient) lastFlushWasComplete() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastFlushComplete
+}
+
+// FlushResidual satisfies Source.
+func (c *gtidClient) FlushResidual() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flushResidual, c.flushCount
+}
+
+// countRotation folds one rotate event into the rotation counter and returns
+// the file name to compare the next one against.
+//
+// Two kinds of rotate event have to be ignored. The server prefaces every
+// binlog dump with an artificial rotate naming the file it is about to read,
+// and it sends a real rotate followed by an artificial one carrying the same
+// position; recreateStreamer re-opening the current file produces the first
+// kind again. binlogClient dedups both by seeding from the position it is
+// resuming at (see its readStream), but this client resumes by GTID and has no
+// file name to seed from — so an empty currentLogName means "nothing seen yet"
+// and the first rotate only seeds the comparison.
+func (c *gtidClient) countRotation(currentLogName, nextLogName string) string {
+	if nextLogName == "" || nextLogName == currentLogName {
+		return currentLogName
+	}
+	if currentLogName != "" {
+		c.rotations.Add(1)
+	}
+	return nextLogName
+}
+
+// FeedStats satisfies StatsReporter. ForcedRotations is always zero: this
+// client never issues `FLUSH BINARY LOGS` — BlockWait polls
+// @@GLOBAL.gtid_executed instead of chasing a file offset.
+func (c *gtidClient) FeedStats() FeedStats {
+	// Collected before c.mu is taken: these lock each subscription, and the
+	// subscriptions take c.mu on their flush paths.
+	var stats FeedStats
+	subs := c.subs.Snapshot()
+	mergeParkStats(&stats, subs)
+	mergeFlushShapes(&stats, subs)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stats.LastFlushAt = c.lastFlushAt
+	stats.LastFlushDuration = c.lastFlushDuration
+	stats.LastFlushRows = c.lastFlushRows
+	stats.Rotations = c.rotations.Load()
+	stats.BufferedEventAt = eventTime(&c.lastEventTime)
+	// Already under c.mu, which is what guards bufferedGTID.
+	if c.bufferedGTID != nil && !c.bufferedGTID.IsEmpty() {
+		stats.BufferedPosition = c.bufferedGTID.String()
+	}
+	return stats
 }
 
 // Flush satisfies Source. Same shape as binlogClient.Flush.
 func (c *gtidClient) Flush(ctx context.Context) error {
 	for {
+		subs := c.subs.Snapshot()
+		parks := watchParks(subs)
 		if err := c.flush(ctx, false, nil); err != nil {
 			return err
+		}
+		pending := c.GetDeltaLen()
+		redrainCanProgress := c.lastFlushWasComplete() || drainHitBudget(subs)
+		if backlogWorthDraining(pending, parks.readerWasBlocked(subs), redrainCanProgress) {
+			c.logger.Debug("reader is not keeping up, draining again instead of waiting on it",
+				"pending", pending)
+			continue
 		}
 		if err := c.BlockWait(ctx); err != nil {
 			c.logger.Warn("error waiting for GTID reader to catch up", "error", err)
@@ -1049,9 +1303,14 @@ func (c *gtidClient) StopPeriodicFlush() {
 	<-done
 }
 
-// StartPeriodicFlush satisfies Source.
+// StartPeriodicFlush satisfies Source. Calls after Close are ignored.
 func (c *gtidClient) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
 	c.periodicFlushLock.Lock()
+	if c.isClosed.Load() {
+		c.periodicFlushLock.Unlock()
+		c.logger.Debug("ignoring periodic flush start on a closed client")
+		return
+	}
 	if c.periodicFlushCancel != nil {
 		c.periodicFlushLock.Unlock()
 		return
@@ -1070,29 +1329,63 @@ func (c *gtidClient) runPeriodicFlush(ctx context.Context, interval time.Duratio
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		trigger := "interval"
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			startLoop := time.Now()
-			c.logger.Debug("starting periodic flush of GTID changeset")
-			if err := c.flush(ctx, false, nil); err != nil {
-				c.logger.Error("error flushing GTID changeset", "error", err)
+		case parked := <-c.flushRequests:
+			// A subscription parked on its soft memory limit. Flush now:
+			// the parked reader stalls GTID ingestion, and waiting out
+			// the remainder of the interval burns retention headroom.
+			// Flush the parked subscription first — the all-subscription
+			// pass below visits the registry in nondeterministic order,
+			// and draining another saturated subscription first would
+			// leave the reader parked for that entire drain. The full
+			// pass still runs afterwards for position advancement.
+			trigger = "soft-limit-park"
+			if _, err := parked.Flush(ctx, false, nil); err != nil {
+				if periodicFlushStopping(ctx) {
+					return
+				}
+				c.logger.Error("error flushing parked subscription", "error", err)
 			}
-			c.logger.Info("finished periodic flush of GTID changeset", "total-duration", time.Since(startLoop).String())
+		case <-ticker.C:
 		}
+		startLoop := time.Now()
+		c.logger.Debug("starting periodic flush of GTID changeset", "trigger", trigger)
+		if err := c.flush(ctx, false, nil); err != nil {
+			if periodicFlushStopping(ctx) {
+				return
+			}
+			c.logger.Error("error flushing GTID changeset", "error", err)
+		}
+		// Debug, not Info — see binlogClient.runPeriodicFlush (#329).
+		c.logger.Debug("finished periodic flush of GTID changeset", "total-duration", time.Since(startLoop).String(), "trigger", trigger)
 	}
 }
 
 // BlockWait satisfies Source. Reads the source's @@GLOBAL.gtid_executed
 // and waits until our buffered set is a superset of it.
 func (c *gtidClient) BlockWait(ctx context.Context) error {
+	return c.blockWait(ctx, DefaultTimeout)
+}
+
+// blockWait accepts a budget so timeout diagnostics can be exercised without a
+// thirty-second test or mutation of shared configuration.
+func (c *gtidClient) blockWait(ctx context.Context, timeout time.Duration) error {
 	targetGTID, err := c.getCurrentGTIDSet(ctx)
 	if err != nil {
 		return err
 	}
-	c.logger.Info("waiting to catch up to source GTID", "target", targetGTID.String(), "current", c.getBufferedGTID().String())
-	timer := time.NewTimer(DefaultTimeout)
+	// Info only when there is actually a gap to close — see
+	// binlogClient.BlockWait (#329).
+	bufferedGTID := c.getBufferedGTID()
+	logCatchUp := c.logger.Debug
+	if !bufferedGTID.Contain(targetGTID) {
+		logCatchUp = c.logger.Info
+	}
+	logCatchUp("waiting to catch up to source GTID", "target", targetGTID.String(), "current", bufferedGTID.String())
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	for {
@@ -1100,7 +1393,7 @@ func (c *gtidClient) BlockWait(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting to catch up to source GTID: %s, current: %s", targetGTID.String(), c.getBufferedGTID().String())
+			return fmt.Errorf("timed out waiting to catch up to source GTID: %s, current: %s, started at: %s; %s", targetGTID.String(), c.getBufferedGTID().String(), bufferedGTID.String(), catchUpDiagnostics(c.subs.Snapshot()))
 		default:
 			if c.getBufferedGTID().Contain(targetGTID) {
 				return nil

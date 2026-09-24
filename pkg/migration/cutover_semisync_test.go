@@ -51,18 +51,15 @@ func TestCutoverAtomicitySemiSync(t *testing.T) {
 		name      string
 		tableName string
 		schema    string
-		buffered  bool
 	}{
-		{"optimistic_unbuffered", "t1semisync_oub", cutoverAtomicityOptimisticSchema, false},
-		{"optimistic_buffered", "t1semisync_obu", cutoverAtomicityOptimisticSchema, true},
-		{"composite_unbuffered", "t1semisync_cub", cutoverAtomicityCompositeSchema, false},
-		{"composite_buffered", "t1semisync_cbu", cutoverAtomicityCompositeSchema, true},
+		{"optimistic", "t1semisync_opt", cutoverAtomicityOptimisticSchema},
+		{"composite", "t1semisync_comp", cutoverAtomicityCompositeSchema},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			runCutoverAtomicityTest(t, tc.tableName, tc.schema, tc.buffered)
+			runCutoverAtomicityTest(t, tc.tableName, tc.schema)
 		})
 	}
 }
@@ -82,7 +79,7 @@ func TestCutoverAtomicitySemiSync(t *testing.T) {
 func requireSemiSyncSourceActive(t *testing.T) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 

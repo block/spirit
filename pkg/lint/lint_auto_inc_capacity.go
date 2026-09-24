@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
 )
 
 func init() {
@@ -123,7 +123,7 @@ func (l *AutoIncCapacityLinter) Lint(existingTables []*statement.CreateTable, ch
 
 			// Suggest BIGINT if not already BIGINT
 			if strings.ToUpper(col.Type) != "BIGINT" {
-				suggestions = append(suggestions, "consider using BIGINT for auto-increment columns")
+				suggestions = append(suggestions, `consider using "BIGINT" for auto-increment columns`)
 			}
 
 			// Check if auto_increment value exceeds threshold. The product
@@ -145,7 +145,7 @@ func (l *AutoIncCapacityLinter) Lint(existingTables []*statement.CreateTable, ch
 						Table:  ct.TableName,
 						Column: &col.Name,
 					},
-					Message:    fmt.Sprintf("AUTO_INCREMENT value %d is above %d%% of the capacity (%d) of the auto-inc column's %s data type", autoInc, l.threshold, maxValue, col.Type),
+					Message:    fmt.Sprintf("AUTO_INCREMENT value %d is above %d%% of the capacity (%d) of the auto-inc column's %q data type", autoInc, l.threshold, maxValue, col.Type),
 					Suggestion: new(strings.Join(suggestions, ". ")),
 				})
 			}

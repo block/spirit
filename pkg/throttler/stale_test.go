@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/stretchr/testify/require"
 )
 
@@ -92,4 +93,21 @@ func TestStaleGuard_NewStalePeriodWarnsAgain(t *testing.T) {
 	stale, entering := g.check(time.Second)
 	require.True(t, stale)
 	require.True(t, entering)
+}
+
+// TestStaleThresholdBoundsBlindAutoscalerSteps pins the cross-package
+// relationship staleSignalThreshold's doc comment claims. The threshold itself
+// is three poll intervals — that is what it measures — but it also has to be
+// short enough that a frozen signal is declared stale before the autoscaler can
+// take more than one blind step on it. The autoscaler's increases are spaced
+// (CooldownTicks+1) ticks apart, so that spacing is the bound.
+//
+// This is the same guard as TestAutoScaler_StaleHoldValueParksInDeadBand, which
+// pins the sibling constant StaleUtilizationHold against the dead band: if
+// either side of the relationship moves, one of these fails loudly rather than
+// leaving a comment quietly asserting something untrue.
+func TestStaleThresholdBoundsBlindAutoscalerSteps(t *testing.T) {
+	increaseSpacing := time.Duration(autoscale.CooldownTicks+1) * autoscale.Tick
+	require.LessOrEqual(t, staleSignalThreshold, increaseSpacing,
+		"a stale signal must be caught within one autoscaler increase interval, or the controller ramps blind on a frozen value")
 }

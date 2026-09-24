@@ -13,8 +13,15 @@ import (
 	"github.com/block/spirit/pkg/utils"
 )
 
+// TargetStateCheckName is the registered name of the target-state check —
+// the one post-setup check that validates target-side state (tables absent,
+// or empty with a matching schema) and therefore the only one that wiping
+// the target can cure. The runner's --force path excludes it (via
+// RunChecksExcluding) when deciding whether a wipe would actually help.
+const TargetStateCheckName = "target_state"
+
 func init() {
-	registerCheck("target_state", targetStateCheck, ScopePostSetup)
+	registerCheck(TargetStateCheckName, targetStateCheck, ScopePostSetup)
 }
 
 // targetStateCheck validates that target databases are ready for the move operation.
@@ -100,9 +107,11 @@ func validateExistingTargetTable(ctx context.Context, target applier.Target, tab
 	// source utf8mb4_bin vs target utf8mb4_0900_ai_ci): REPLACE/INSERT IGNORE
 	// would then collapse rows that differ only by case, and the mismatch would
 	// surface only much later at checksum time (or never, on a resume whose
-	// watermark already covers the affected chunk). schemaDiff compares column
-	// types, charset, collation, indexes and constraints while ignoring
-	// instance-specific noise like AUTO_INCREMENT counters.
+	// watermark already covers the affected chunk). TargetSchemaDiff compares
+	// column types, charset, collation, indexes and constraints while ignoring
+	// instance-specific noise like AUTO_INCREMENT counters, and forgiving the
+	// ways a sharded target is deliberately stricter than its unsharded source
+	// (no column-level AUTO_INCREMENT, a NOT NULL shard key).
 	sourceCreate, err := showCreateTable(ctx, sourceTable.DB(), sourceTable.SchemaName, sourceTable.TableName)
 	if err != nil {
 		return fmt.Errorf("failed to read source schema for table '%s': %w", tableName, err)
@@ -111,7 +120,7 @@ func validateExistingTargetTable(ctx context.Context, target applier.Target, tab
 	if err != nil {
 		return fmt.Errorf("failed to read target %d schema for table '%s': %w", targetIndex, tableName, err)
 	}
-	diff, err := schemaDiff(tableName, sourceCreate, targetCreate)
+	diff, err := TargetSchemaDiff(tableName, sourceCreate, targetCreate)
 	if err != nil {
 		return fmt.Errorf("failed to compare schema for table '%s' on target %d: %w", tableName, targetIndex, err)
 	}

@@ -72,6 +72,14 @@ func TestCastableTp(t *testing.T) {
 		{"enum('a', 'b', 'c')", "char CHARACTER SET utf8mb4"},
 		{"set('a', 'b', 'c')", "char CHARACTER SET utf8mb4"},
 		{"decimal(6,2)", "decimal(6,2)"},
+		// VECTOR (MySQL 9.7+) has no char cast at all — the server rejects
+		// CAST(v AS char) with ER_WRONG_ARGUMENTS, which would fail the
+		// checksum query for any table holding one. Binary is exact, and
+		// unlike binary(N) it must not carry the width: the declared
+		// dimension is a maximum, not a padded length.
+		{"vector", "binary"},
+		{"vector(3)", "binary"},
+		{"vector(2048)", "binary"},
 	}
 	for _, tp := range tps {
 		require.Equal(t, tp.expected, castableTp(tp.tp), "tp failed: %s, expected: %s", tp.tp, tp.expected)
@@ -79,15 +87,18 @@ func TestCastableTp(t *testing.T) {
 }
 
 func TestCastExpr(t *testing.T) {
-	// JSON is normalized through a text round-trip so that scalar types
-	// unexpressible in JSON text (DECIMAL, temporal/binary opaques) hash the
-	// same as the text-degraded form the copier/applier writes. Everything
-	// else is a single CAST to castableTp.
-	require.Equal(t, "CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)", castExpr("j", "json"))
-	require.Equal(t, "CAST(`id` AS signed)", castExpr("id", "int(11)"))
-	require.Equal(t, "CAST(`name` AS char CHARACTER SET utf8mb4)", castExpr("name", "varchar(100)"))
-	require.Equal(t, "CAST(`b` AS binary(16))", castExpr("b", "binary(16)"))
-	require.Equal(t, "CAST(`d` AS decimal(6,2))", castExpr("d", "decimal(6,2)"))
+	// JSON casts are side-dependent (the "text-image contract", see castExpr):
+	// the source side is normalized through a text round-trip — predicting
+	// the text-degraded form the copier/applier writes — while the target
+	// side renders the stored document strictly, so it is never re-parsed.
+	// Everything else is a single CAST to castableTp on both sides.
+	require.Equal(t, "CAST(CAST(`j` AS char CHARACTER SET utf8mb4) AS json)", castExpr("j", "json", castSource))
+	require.Equal(t, "CAST(`j` AS json)", castExpr("j", "json", castTarget))
+	require.Equal(t, "CAST(`id` AS signed)", castExpr("id", "int(11)", castSource))
+	require.Equal(t, "CAST(`id` AS signed)", castExpr("id", "int(11)", castTarget))
+	require.Equal(t, "CAST(`name` AS char CHARACTER SET utf8mb4)", castExpr("name", "varchar(100)", castSource))
+	require.Equal(t, "CAST(`b` AS binary(16))", castExpr("b", "binary(16)", castTarget))
+	require.Equal(t, "CAST(`d` AS decimal(6,2))", castExpr("d", "decimal(6,2)", castSource))
 }
 
 func TestQuoteCols(t *testing.T) {
@@ -138,4 +149,31 @@ func TestExpandRowConstructorComparison(t *testing.T) {
 		expandRowConstructorComparison([]string{"id1", "id2", "id3", "id4"},
 			OpGreaterThan,
 			[]Datum{{Val: 2, Tp: signedType}, {Val: 2, Tp: signedType}, {Val: 4, Tp: signedType}, {Val: 5, Tp: signedType}}))
+}
+
+// TestWidthRegexpsAreCompiledOnce guards a cost that is invisible from the
+// call site. removeWidth reads like a schema-time helper, but NewColumnType
+// reaches it for every value of every row on the copy path, so compiling the
+// pattern inside the function made type resolution ~14x the cost of building
+// an INSERT statement — visible only as applier-build-p50 dominating
+// applier-write-p50 on a wide table.
+//
+// The exact counts are not the contract; the order of magnitude is. Compiling
+// a pattern per call costs ~40 extra allocations, so these bounds catch a
+// regression without breaking on an unrelated allocation being added or saved.
+func TestWidthRegexpsAreCompiledOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   func()
+	}{
+		{"removeWidth", func() { _ = removeWidth("varchar(255)") }},
+		{"removeDecimalWidth", func() { _ = removeDecimalWidth("decimal(20,6)") }},
+		{"NewColumnType", func() { _ = NewColumnType("varchar(255)") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(200, tc.fn)
+			require.Less(t, allocs, 15.0,
+				"%s looks like it is compiling a regexp per call (was ~48 allocs before the patterns moved to package level)", tc.name)
+		})
+	}
 }

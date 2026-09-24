@@ -286,6 +286,14 @@ func isPartitionCountOnlyChange(source, target *PartitionOptions) (bool, int) {
 		return false, 0
 	}
 
+	// Subpartitioning cannot be reached by ADD/COALESCE PARTITION. MySQL only
+	// allows subpartitions under RANGE/LIST, so this is unreachable today; the
+	// guard is here so a subpartitioning difference can never be silently
+	// swallowed by a partition-count ALTER.
+	if source.SubPartition != nil || target.SubPartition != nil {
+		return false, 0
+	}
+
 	// Only the partition count differs
 	if source.Partitions == target.Partitions {
 		return false, 0
@@ -363,12 +371,36 @@ func partitionDefinitionEqual(a, b *PartitionDefinition) bool {
 		return false
 	}
 
-	// Compare engine
-	if !ptrEqual(a.Engine, b.Engine) {
+	// The per-partition ENGINE clause is deliberately not compared. MySQL
+	// requires every partition to use the table's storage engine, so the clause
+	// carries no information beyond the table-level ENGINE — but SHOW CREATE
+	// TABLE always prints it (`PARTITION p0 VALUES LESS THAN (2020) ENGINE =
+	// InnoDB`) while human-authored SQL almost never does. Comparing it made
+	// every partitioned table diff against its own live definition, emitting a
+	// REMOVE PARTITIONING + PARTITION BY pair on every run.
+
+	// Compare explicitly named subpartitions. This is symmetric: MySQL echoes
+	// subpartition names back from SHOW CREATE TABLE when, and only when, they
+	// were named explicitly, so a named-on-both-sides table compares names and
+	// an auto-named one compares empty lists.
+	if len(a.SubPartitions) != len(b.SubPartitions) {
 		return false
 	}
 
+	for i := range a.SubPartitions {
+		if !subPartitionDefinitionEqual(&a.SubPartitions[i], &b.SubPartitions[i]) {
+			return false
+		}
+	}
+
 	return true
+}
+
+// subPartitionDefinitionEqual checks if two named subpartitions are equal. Like
+// partitions, a subpartition's ENGINE is not compared (see
+// partitionDefinitionEqual).
+func subPartitionDefinitionEqual(a, b *SubPartitionDefinition) bool {
+	return a.Name == b.Name && ptrEqual(a.Comment, b.Comment)
 }
 
 // partitionValuesEqual checks if two partition values are equal

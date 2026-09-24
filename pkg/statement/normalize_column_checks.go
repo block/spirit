@@ -3,7 +3,7 @@ package statement
 import (
 	"fmt"
 
-	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/ast"
 )
 
 func init() { registerNormalizer(columnCheckNormalizer{}) }

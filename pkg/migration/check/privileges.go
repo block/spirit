@@ -91,26 +91,25 @@ func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 	// those privileges directly.
 	skipRolePrivilegeCheck := hasRole(grantedRoles, "rds_superuser_role") && activateAllRolesOnLogin(ctx, r.DB, logger)
 
-	if r.ForceKill {
-		var errs []error
-		// Parsing performance_schema grants seems really hard, so we just probe
-		// the tables the force-kill queries read and see if it succeeds. This is
-		// a privilege probe only: it selects zero rows and logs nothing. The
-		// actual lock detection (which does log) runs during cutover.
-		if err := dbconn.CheckForceKillPrivileges(ctx, r.DB); err != nil {
-			errs = append(errs, err)
+	// Force-kill is always enabled, so its privileges are always required.
+	var errs []error
+	// Parsing performance_schema grants seems really hard, so we just probe
+	// the tables the force-kill queries read and see if it succeeds. This is
+	// a privilege probe only: it selects zero rows and logs nothing. The
+	// actual lock detection (which does log) runs during cutover.
+	if err := dbconn.CheckForceKillPrivileges(ctx, r.DB); err != nil {
+		errs = append(errs, err)
+	}
+	if !skipRolePrivilegeCheck {
+		if !foundConnectionAdmin && !foundSuper {
+			errs = append(errs, errors.New("missing CONNECTION_ADMIN privilege"))
 		}
-		if !skipRolePrivilegeCheck {
-			if !foundConnectionAdmin && !foundSuper {
-				errs = append(errs, errors.New("missing CONNECTION_ADMIN privilege"))
-			}
-			if !foundProcess {
-				errs = append(errs, errors.New("missing PROCESS privilege"))
-			}
+		if !foundProcess {
+			errs = append(errs, errors.New("missing PROCESS privilege"))
 		}
-		if len(errs) > 0 {
-			return fmt.Errorf("insufficient privileges to run a migration with force-kill enabled (disable with --skip-force-kill). Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", errors.Join(errs...))
-		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("insufficient privileges to run a migration with force-kill. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", errors.Join(errs...))
 	}
 
 	if foundSuper && foundReplicationSlave && foundDBAll {

@@ -28,7 +28,7 @@ var ErrPositionNotFound = errors.New("change.Source: cannot resume from position
 //
 // Lifecycle: construct → AddSubscription(...)* → Start(ctx) OR
 // StartFromPosition(ctx, pos) → Flush / BlockWait /
-// FlushUnderTableLock as needed → Close().
+// FlushUnderTableLock as needed → Stop() → Close().
 //
 // Events flow PUSH-style: when a row event matching one of the
 // subscribed tables arrives, the source implementation looks up the
@@ -120,6 +120,28 @@ type Source interface {
 	// the backlog is small enough to consider cutover.
 	GetDeltaLen() int
 
+	// FlushResidual reports what the most recently completed flush left
+	// behind: residual is the pending-change count observed immediately
+	// after that flush, and flushes is a monotonic count of completed
+	// flushes. Both are 0 before the first flush completes.
+	//
+	// This is the quantity that says whether the feed is keeping up, and it
+	// has to be sampled here rather than polled by the caller. GetDeltaLen
+	// is a sawtooth: it climbs on every sample between flushes and drops
+	// when one lands, so a poller observes the residual plus however many
+	// writes arrived since the flush. That second term is large enough on a
+	// busy table to swamp the residual itself, and it does not average out
+	// — a polling ticker and the flush ticker hold a fixed phase
+	// relationship whenever their intervals are commensurate, which at the
+	// defaults (30s flush) they are for any poll interval that divides it.
+	//
+	// A caller watching for a feed that is losing ground should compare
+	// residuals only across distinct flushes, which is what flushes is for.
+	// A residual that stays near zero means the feed is keeping up however
+	// heavy the write load; one that climbs flush over flush means work is
+	// surviving flushes and accumulating.
+	FlushResidual() (residual, flushes int)
+
 	// SetWatermarkOptimization toggles the high/low watermark
 	// optimization across all subscriptions. Disabled before
 	// checksum/cutover to ensure all changes are flushed regardless of
@@ -129,7 +151,7 @@ type Source interface {
 	// StartPeriodicFlush spawns a background goroutine that flushes the
 	// changeset at the given interval. Used by the migrator to advance
 	// the safe-flushed position. Calling Start while a periodic flush
-	// is already running is a no-op.
+	// is already running or after Close has been called is a no-op.
 	StartPeriodicFlush(ctx context.Context, interval time.Duration)
 
 	// StopPeriodicFlush stops the goroutine started by
@@ -143,6 +165,22 @@ type Source interface {
 	// "have all received events been applied?".
 	AllChangesFlushed() bool
 
-	// Close releases all resources. Safe to call more than once.
+	// Stop ends delivery of events to subscriptions. Everything else stays
+	// live: the source keeps reading and tracking its position, and Flush /
+	// BlockWait / AllChangesFlushed / Position keep working. Close, not Stop,
+	// releases resources. One-way and idempotent.
+	//
+	// Cutover calls it once the tables are renamed and while it still holds
+	// the exclusive lock, so no write can be in flight — after UNLOCK TABLES
+	// the first post-cutover write is a race, and those events no longer
+	// decode against the subscriptions' TableInfo (see cutover.go). Hence two
+	// requirements: Stop must not block, because every write to the table is
+	// stalled behind it, and it must leave the source flushable, because a
+	// rename that fails ambiguously is retried via Flush and BlockWait.
+	Stop()
+
+	// Close releases all resources, cancelling and joining the reader and any
+	// periodic flush loop. Subsequent StartPeriodicFlush calls are no-ops.
+	// Safe to call more than once.
 	Close()
 }

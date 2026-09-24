@@ -62,8 +62,8 @@ import (
 	"maps"
 	"os"
 
+	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/pingcap/tidb/pkg/parser/ast"
 )
 
 // Config holds linter configuration
@@ -324,6 +324,8 @@ func AlterTableTypeToString(tp ast.AlterTableType) string {
 		return "ALTER CHECK"
 	case ast.AlterTableDropCheck:
 		return "DROP CHECK"
+	case ast.AlterTableDropConstraint:
+		return "DROP CONSTRAINT"
 	case ast.AlterTableImportTablespace:
 		return "IMPORT TABLESPACE"
 	case ast.AlterTableDiscardTablespace:
@@ -332,8 +334,6 @@ func AlterTableTypeToString(tp ast.AlterTableType) string {
 		return "ALTER INDEX INVISIBLE"
 	case ast.AlterTableOrderByColumns:
 		return "ORDER BY"
-	case ast.AlterTableSetTiFlashReplica:
-		return "SET TIFLASH REPLICA"
 	default:
 		return fmt.Sprintf("ALTER TABLE (type %d)", tp)
 	}

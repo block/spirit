@@ -16,6 +16,7 @@ package sqlescape
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -33,8 +34,15 @@ func TestReserveBuffer(t *testing.T) {
 
 	res2 := reserveBuffer(res1, 9)
 	require.Len(t, res2, 12)
-	require.Equal(t, 15, cap(res2))
+	require.GreaterOrEqual(t, cap(res2), len(res2))
 	require.Equal(t, res1, res2[:3])
+
+	require.PanicsWithValue(t, "sqlescape: buffer size overflow", func() {
+		reserveBuffer(make([]byte, 1), math.MaxInt)
+	})
+	require.PanicsWithValue(t, "sqlescape: buffer size overflow", func() {
+		reserveBuffer(nil, -1)
+	})
 }
 
 func TestEscapeBackslash(t *testing.T) {
@@ -422,6 +430,31 @@ func TestEscapeSQL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEscapeSQLRawVerb(t *testing.T) {
+	// %r splices its argument verbatim: %-sequences inside it are data, not
+	// format specifiers, and string quoting is not applied.
+	r, err := EscapeSQL("ALTER TABLE %n ALGORITHM=INSTANT, %r", "t1",
+		RawSQL("ADD COLUMN b VARCHAR(20) DEFAULT '50%% off' COMMENT '100%new, a%?b'"))
+	require.NoError(t, err)
+	require.Equal(t, "ALTER TABLE `t1` ALGORITHM=INSTANT, ADD COLUMN b VARCHAR(20) DEFAULT '50%% off' COMMENT '100%new, a%?b'", r)
+
+	// %r composes with other verbs, in either order.
+	r, err = EscapeSQL("%r WHERE c = %?", RawSQL("SELECT 1 FROM t1"), 5)
+	require.NoError(t, err)
+	require.Equal(t, "SELECT 1 FROM t1 WHERE c = 5", r)
+
+	// A missing argument is an error, same as %n / %?.
+	_, err = EscapeSQL("%r")
+	require.ErrorContains(t, err, "missing arguments")
+
+	// Only RawSQL can be spliced: a plain string is rejected so that every
+	// raw splice is an explicit, greppable RawSQL() conversion.
+	_, err = EscapeSQL("%r", "SELECT 1 FROM t1")
+	require.ErrorContains(t, err, "expect sqlescape.RawSQL for %r, got string")
+	_, err = EscapeSQL("%r", 42)
+	require.ErrorContains(t, err, "expect sqlescape.RawSQL for %r, got int")
 }
 
 func TestMustUtils(t *testing.T) {

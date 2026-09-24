@@ -5,17 +5,16 @@ import (
 	"log/slog"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 	"github.com/stretchr/testify/require"
 )
 
 func TestEnumSetRemovalCheckEnumToVarchar(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -38,7 +37,7 @@ func TestEnumSetRemovalCheckEnumToVarchar(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckEnumToText(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -60,7 +59,7 @@ func TestEnumSetRemovalCheckEnumToText(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckEnumToInt(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -86,7 +85,7 @@ func TestEnumSetRemovalCheckEnumToInt(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckSetToVarchar(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -109,7 +108,7 @@ func TestEnumSetRemovalCheckSetToVarchar(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckChangeColumn(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -131,7 +130,7 @@ func TestEnumSetRemovalCheckChangeColumn(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckEnumToEnum(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -154,7 +153,7 @@ func TestEnumSetRemovalCheckEnumToEnum(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckNonEnumColumn(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -177,7 +176,7 @@ func TestEnumSetRemovalCheckNonEnumColumn(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckEnumToSet(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -206,7 +205,7 @@ func TestEnumSetRemovalCheckEnumToSet(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckEnumToSetMissingElement(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -232,7 +231,7 @@ func TestEnumSetRemovalCheckEnumToSetMissingElement(t *testing.T) {
 }
 
 func TestEnumSetRemovalCheckSetToEnum(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

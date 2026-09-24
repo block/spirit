@@ -162,6 +162,9 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 // failed.
 type fakeChangeSource struct {
 	closed atomic.Bool
+	// notFlushed makes AllChangesFlushed report a feed still holding buffered
+	// changes. Defaults to false so the zero value is a healthy feed.
+	notFlushed atomic.Bool
 }
 
 func (f *fakeChangeSource) AddSubscription(_, _ *table.TableInfo, _ table.MappedChunker) error {
@@ -177,12 +180,15 @@ func (f *fakeChangeSource) FlushUnderTableLock(_ context.Context, _ []*dbconn.Ta
 }
 func (f *fakeChangeSource) BlockWait(_ context.Context) error { return nil }
 func (f *fakeChangeSource) GetDeltaLen() int                  { return 0 }
+
+func (f *fakeChangeSource) FlushResidual() (int, int) { return 0, 0 }
 func (f *fakeChangeSource) SetWatermarkOptimization(_ context.Context, _ bool) error {
 	return nil
 }
 func (f *fakeChangeSource) StartPeriodicFlush(_ context.Context, _ time.Duration) {}
 func (f *fakeChangeSource) StopPeriodicFlush()                                    {}
-func (f *fakeChangeSource) AllChangesFlushed() bool                               { return true }
+func (f *fakeChangeSource) AllChangesFlushed() bool                               { return !f.notFlushed.Load() }
+func (f *fakeChangeSource) Stop()                                                 {}
 func (f *fakeChangeSource) Close()                                                { f.closed.Store(true) }
 
 // TestCloseRunsAllClosersOnError pins the Close() aggregation contract:
@@ -201,9 +207,9 @@ func TestCloseRunsAllClosersOnError(t *testing.T) {
 	repl1 := &fakeChangeSource{}
 	repl2 := &fakeChangeSource{}
 
-	db1, err := sql.Open("mysql", testutils.DSN())
+	db1, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
-	db2, err := sql.Open("mysql", testutils.DSN())
+	db2, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 
 	r := &Runner{

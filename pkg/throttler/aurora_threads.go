@@ -9,6 +9,8 @@ import (
 	"math"
 	"sync/atomic"
 	"time"
+
+	"github.com/block/spirit/pkg/autoscale"
 )
 
 // The Aurora "threads" throttler — the second Aurora signal, from issue #831.
@@ -166,14 +168,6 @@ var (
 	globalStatusMode = threadsMode{query: threadsRunningQuery, headroom: selfMonitoringHeadroom, label: "threads-running"}
 )
 
-// DefaultWriteThreads is the fallback apply (write) thread count used when
-// auto-sizing is requested (write-threads=0) but the target offers no reliable
-// vCPU signal to size from — i.e. a non-Aurora server. It must match the
-// `default:"4"` kong tags on the WriteThreads CLI flags (see Migration and
-// Move), so that requesting auto-sizing on non-Aurora lands on the same value
-// as not requesting it at all.
-const DefaultWriteThreads = 4
-
 // AuroraVCPUs reads the instance vCPU count from @@innodb_buffer_pool_instances,
 // which Aurora pins to the vCPU count (issue #831). It returns an error if the
 // value is non-positive. This is only meaningful on Aurora — callers should gate
@@ -189,85 +183,23 @@ func AuroraVCPUs(ctx context.Context, db *sql.DB) (int, error) {
 	return vCPUs, nil
 }
 
-// WriteThreadVCPUReserve is the number of vCPUs auto-sizing leaves free when
-// sizing the apply (write) thread pool on Aurora, so the pool does not consume
-// the whole instance: the copier's read side, the checksum, and the server's
-// own work need room too. Auto-sizing resolves to max(1, vCPUs - this). On 4+
-// vCPU instances it is the autoscaler's starting value (the controller can grow
-// back up under spare capacity); below MinAutoscaleVCPUs it is the fixed size.
-const WriteThreadVCPUReserve = 2
-
-// ResolveWriteThreads resolves the number of apply (write) threads to use
-// against a target. A positive requested value is returned unchanged. Zero
-// means "auto-size": on Aurora it resolves to max(1, vCPUs -
-// WriteThreadVCPUReserve) from @@innodb_buffer_pool_instances (reserving vCPUs
-// for the rest of the workload); on non-Aurora there is no reliable vCPU signal
-// to size from, so it falls back to DefaultWriteThreads (logging that it did
-// so). A negative value is rejected.
-func ResolveWriteThreads(ctx context.Context, db *sql.DB, requested int, logger *slog.Logger) (int, error) {
-	if requested < 0 {
-		return 0, fmt.Errorf("write threads must be non-negative, got %d", requested)
-	}
-	if requested > 0 {
-		return requested, nil
-	}
-	// Auto-sizing requires probing the server, so a usable DB is mandatory
-	// here (a positive requested value above never reaches this point).
-	if db == nil {
-		return 0, errors.New("cannot auto-size write threads: no database connection provided (set write-threads to a positive value)")
-	}
-	isAurora, err := IsAurora(ctx, db)
-	if err != nil {
-		return 0, err
-	}
-	if !isAurora {
-		// No reliable vCPU signal off Aurora, so we can't honor auto-sizing.
-		// Rather than fail, fall back to the default the user would have got
-		// had they not asked to auto-size at all.
-		logger.Info("write-threads=0 requested auto-sizing, but the target is not Aurora (no reliable vCPU signal); using the default instead",
-			"write_threads", DefaultWriteThreads)
-		return DefaultWriteThreads, nil
-	}
-	vCPUs, err := AuroraVCPUs(ctx, db)
-	if err != nil {
-		return 0, err
-	}
-	return max(1, vCPUs-WriteThreadVCPUReserve), nil
-}
-
-// MinAutoscaleVCPUs is the smallest instance size (in vCPUs) on which the
-// write-thread autoscaler is allowed to engage. Below this the utilization
-// signal is too coarse to control on: one thread is half or a third of the
-// whole scale, so there is no dead band wide enough to rest in and the
-// controller can only oscillate. Observed in staging on r6g.large (2 vCPUs):
-// the thread count ping-ponged 1↔2 indefinitely (issue #831). At 4+ vCPUs the
-// worst-case per-thread utilization step (0.25) fits inside the autoscaler's
-// dead band.
-const MinAutoscaleVCPUs = 4
-
 // ResolveMaxWriteThreads resolves the upper bound the write-thread autoscaler
-// may scale to. When autoscaling is disabled the cap equals start, so the
-// thread count cannot move. When enabled the cap is fixed at 2 × start —
-// deliberately not configurable for now, to keep the experimental surface
-// small. See issue #831.
+// may scale to: autoscale.Ceiling (start when scaling is off, 2 × start when on
+// — deliberately not configurable for now, to keep the experimental surface
+// small), plus one rule that is specific to the write side. See issue #831.
 //
-// Scaling above the starting value additionally requires the commit-latency
-// throttler when the redo-aware signal is in use: that signal deliberately
-// ignores threads parked on redo-log waits — which is what makes oversubscribing
-// the log safe to attempt — so it will not self-limit if the extra write threads
-// saturate the log, and commit-latency is then the only signal that would
-// notice. Without that backstop the cap stays at start (the autoscaler may
-// still shed threads under CPU pressure, but never adds any). The Threads_running
-// fallback counts redo-log waiters as load, so it self-limits and needs no such
-// backstop.
+// That rule: scaling above the starting value additionally requires the
+// commit-latency throttler when the redo-aware signal is in use. That signal
+// deliberately ignores threads parked on redo-log waits — which is what makes
+// oversubscribing the log safe to attempt — so it will not self-limit if the
+// extra write threads saturate the log, and commit-latency is then the only
+// signal that would notice. Without that backstop the cap stays at start (the
+// autoscaler may still shed threads under CPU pressure, but never adds any). The
+// Threads_running fallback counts redo-log waiters as load, so it self-limits and
+// needs no such backstop.
 func ResolveMaxWriteThreads(start int, autoscaleEnabled, redoAware, commitLatencyEnabled bool) int {
-	if !autoscaleEnabled {
-		return start
-	}
-	if redoAware && !commitLatencyEnabled {
-		return start
-	}
-	return 2 * start
+	unguardedRedo := redoAware && !commitLatencyEnabled
+	return autoscale.Ceiling(start, autoscaleEnabled && !unguardedRedo)
 }
 
 // threadsRunningPollInterval mirrors commitLatencyPollInterval — fast enough to
@@ -324,7 +256,7 @@ type AuroraThreads struct {
 	vCPUs int64
 
 	isThrottled atomic.Bool
-	isClosed    atomic.Bool
+	poller      monitorLoop
 
 	// lastSample holds the most recent observation for logging and the raw
 	// hard-stop comparison.
@@ -343,6 +275,7 @@ type AuroraThreads struct {
 }
 
 var _ GradualThrottler = (*AuroraThreads)(nil)
+var _ ReasonedThrottler = (*AuroraThreads)(nil)
 
 // newAuroraThreadsThrottler returns a throttler that polls the given mode's
 // signal and throttles when it exceeds the instance vCPU count (plus the mode's
@@ -361,6 +294,9 @@ func newAuroraThreadsThrottler(db *sql.DB, mode threadsMode, logger *slog.Logger
 }
 
 func (a *AuroraThreads) Open(ctx context.Context) error {
+	if err := a.poller.checkOpen(); err != nil {
+		return err
+	}
 	vCPUs, err := AuroraVCPUs(ctx, a.db)
 	if err != nil {
 		return err
@@ -371,8 +307,7 @@ func (a *AuroraThreads) Open(ctx context.Context) error {
 	if err := a.UpdateLag(ctx); err != nil {
 		return err
 	}
-	go a.run(ctx)
-	return nil
+	return a.poller.start(ctx, a.run)
 }
 
 func (a *AuroraThreads) run(ctx context.Context) {
@@ -383,23 +318,35 @@ func (a *AuroraThreads) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if a.isClosed.Load() {
-				return
-			}
 			if err := a.UpdateLag(ctx); err != nil {
-				a.logger.Error("error sampling Aurora threads", "mode", a.mode.label, "error", err)
+				if isShutdownError(ctx, err) {
+					return // teardown cancelled the in-flight sample; not a monitoring failure
+				}
+				a.logger.Error("error sampling Aurora threads; keeping the last reading (the autoscaler holds steady if sampling stays stale)",
+					"mode", a.mode.label, "error", err)
 			}
 		}
 	}
 }
 
 func (a *AuroraThreads) Close() error {
-	a.isClosed.Store(true)
+	a.poller.close()
 	return nil
 }
 
 func (a *AuroraThreads) IsThrottled() bool {
 	return a.isThrottled.Load()
+}
+
+// ThrottleReason implements ReasonedThrottler. It quotes the raw sample against
+// the hard-stop threshold — the comparison applySample actually throttles on —
+// not the EWMA that Utilization reports, and names the mode so the reason says
+// which signal was read ("redo-aware 24 > 17", "threads-running 24 > 20").
+func (a *AuroraThreads) ThrottleReason() string {
+	if !a.isThrottled.Load() {
+		return ""
+	}
+	return fmt.Sprintf("%s %d > %d", a.mode.label, a.lastSample.Load(), a.throttleThreshold())
 }
 
 // Utilization reports the smoothed (EWMA) thread count as a fraction of the

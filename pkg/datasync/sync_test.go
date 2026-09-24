@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checksum"
@@ -17,7 +18,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -26,9 +26,9 @@ func TestMain(m *testing.M) {
 	// Tick the status logger fast. Continuous-replication latency is set
 	// per-test via Sync.FlushInterval.
 	status.StatusInterval = 100 * time.Millisecond
-	// Run continuous-checksum passes back-to-back in tests so FirstCleanPass /
+	// Run lockless-checksum passes back-to-back in tests so FirstCleanPass /
 	// convergence assertions don't wait on the 1h production pacing.
-	checksum.ContinuousMinPassInterval = 0
+	checksum.LocklessMinPassInterval = 0
 	goleak.VerifyTestMain(m)
 }
 
@@ -61,13 +61,137 @@ func runUntilCopied(t *testing.T, runner *Runner) error {
 	}
 }
 
+// runHandle drives a Runner from a test that has to wait on one of the
+// runner's signal channels (ChecksumReady, FirstCleanPass) rather than on Run
+// itself.
+//
+// Waiting on a signal channel and a timer alone makes every setup-time failure
+// look identical: Run returns an error, nothing ever closes the signal, and the
+// test reports a bare "did not fire within Ns" with no error text. That is what
+// issue #1260 cost us — a CI failure whose actual cause is unrecoverable from
+// the logs. Every wait here also selects on the run result, and a failed test
+// still tears the runner down instead of leaking its binlog syncer and
+// connection pools into the rest of the package.
+type runHandle struct {
+	t        *testing.T
+	runner   *Runner
+	cancel   context.CancelFunc
+	done     chan error
+	returned bool  // Run has returned and its result is in runErr
+	reported bool  // a wait already failed the test with runErr
+	runErr   error // valid once returned
+	stopped  bool
+}
+
+// startRunner starts runner.Run on its own goroutine. The run is always
+// cancelled and closed by the end of the test; call stop to do it earlier and
+// assert that Run returned cleanly.
+func startRunner(t *testing.T, runner *Runner) *runHandle {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	h := &runHandle{t: t, runner: runner, cancel: cancel, done: make(chan error, 1)}
+	go func() { h.done <- runner.Run(ctx) }()
+	t.Cleanup(h.close)
+	return h
+}
+
+// await blocks until signal fires. If Run returns first the test fails with
+// that error; if neither happens within timeout it fails with the checksum
+// stats. what names the signal, for the failure message.
+func (h *runHandle) await(signal <-chan struct{}, timeout time.Duration, what string) {
+	h.t.Helper()
+	select {
+	case <-signal:
+	case err := <-h.done:
+		h.returned, h.runErr, h.reported = true, err, true
+		h.t.Fatalf("Run returned before %s fired: err=%v; checksum stats=%+v", what, err, h.runner.ChecksumStats())
+	case <-time.After(timeout):
+		h.t.Fatalf("%s did not fire within %s; checksum stats=%+v", what, timeout, h.runner.ChecksumStats())
+	}
+}
+
+// eventually is require.Eventually under the same guard as await: a Run that
+// returns while the condition is still false fails with that error rather than
+// spending the whole window polling for something nothing will satisfy. what
+// names the expectation, for the failure message.
+//
+// cond runs on the test goroutine, unlike require.Eventually's, so it may use
+// t and require freely — but it owes the deadline a return: a cond that blocks
+// blocks this helper, and go test's whole-package timeout is a far worse
+// report than the named failure below. Anything it queries therefore needs a
+// bounded context, because these conditions read pools the runner holds
+// (TestSyncE2E shares a two-connection target pool with the applier) and an
+// exhausted pool is one of the failures they exist to catch.
+func (h *runHandle) eventually(cond func() bool, timeout time.Duration, what string) {
+	h.t.Helper()
+	deadline := time.After(timeout)
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if cond() {
+			return
+		}
+		select {
+		case err := <-h.done:
+			h.returned, h.runErr, h.reported = true, err, true
+			h.t.Fatalf("Run returned before %s: err=%v", what, err)
+		case <-deadline:
+			h.t.Fatalf("%s: not true within %s", what, timeout)
+		case <-tick.C:
+		}
+	}
+}
+
+// stop cancels the run, waits for it to drain, closes the runner, and asserts
+// Run returned no error. A wait that already failed the test with that error
+// does not get to report it a second time: stop runs from a defer in tests
+// whose teardown has to land before their own post-run assertions, and
+// testify's second report arrives with a runtime panic frame on top of it,
+// because the goroutine is unwinding from the first.
+func (h *runHandle) stop() {
+	h.t.Helper()
+	h.close()
+	if h.reported {
+		return
+	}
+	require.NoError(h.t, h.runErr)
+}
+
+// close is the teardown half of stop, without the assertion on the run result:
+// it also runs as a t.Cleanup, where a test that has already failed must not be
+// told a second time. Idempotent.
+func (h *runHandle) close() {
+	if h.stopped {
+		return
+	}
+	h.stopped = true
+	h.cancel()
+	if !h.returned {
+		select {
+		case err := <-h.done:
+			h.returned, h.runErr = true, err
+		case <-time.After(60 * time.Second):
+			// Close is documented safe only once Run has returned, so a run
+			// that will not stop is left open: closing its pools and change
+			// source underneath it would trade this diagnosis for a race or a
+			// panic somewhere further out. The t.Error is the whole signal —
+			// goleak does not add one here, since VerifyTestMain only looks
+			// for leaks when the suite exited zero.
+			h.t.Error("sync did not stop within 60s of cancellation; leaving the runner open")
+			return
+		}
+	}
+	if err := h.runner.Close(); err != nil {
+		h.t.Errorf("runner.Close: %v", err)
+	}
+}
+
 func TestNewRunnerValidation(t *testing.T) {
 	// Defaults are applied for zero-valued knobs.
 	r, err := NewRunner(&Sync{})
 	require.NoError(t, err)
 	require.Equal(t, 4, r.sync.Threads)
 	require.Equal(t, 4, r.sync.WriteThreads)
-	require.Equal(t, 5*time.Second, r.sync.TargetChunkTime)
 	require.Equal(t, uint64(table.DefaultTargetChunkBytes), r.sync.TargetChunkSize)
 	require.Positive(t, r.sync.FlushInterval)
 }
@@ -105,66 +229,78 @@ func TestSyncE2E(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_dest`)
 	testutils.RunSQL(t, `CREATE DATABASE sync_dest`)
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 
+	// Both read the pool this test hands the runner as its target, capped to
+	// MaxConnections below and shared with 16 applier write threads. A bounded
+	// context is what keeps an exhausted pool a failed assertion instead of a
+	// wait with no end: these run inside h.eventually, on the test goroutine.
+	query := func(f func(ctx context.Context) error) error {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		return f(ctx)
+	}
 	countRows := func() int {
 		var n int
-		if err := tgt.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM t1`).Scan(&n); err != nil {
+		if err := query(func(ctx context.Context) error {
+			return tgt.QueryRowContext(ctx, `SELECT COUNT(*) FROM t1`).Scan(&n)
+		}); err != nil {
 			return -1 // table may not exist yet
 		}
 		return n
 	}
 	valOf := func(id int) string {
 		var v string
-		if err := tgt.QueryRowContext(context.Background(), `SELECT val FROM t1 WHERE id = ?`, id).Scan(&v); err != nil {
+		if err := query(func(ctx context.Context) error {
+			return tgt.QueryRowContext(ctx, `SELECT val FROM t1 WHERE id = ?`, id).Scan(&v)
+		}); err != nil {
 			return ""
 		}
 		return v
 	}
 
 	s := &Sync{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
-		FlushInterval:   100 * time.Millisecond,
+		SourceDSN:      sourceDSN,
+		TargetDSN:      targetDSN,
+		Threads:        2,
+		WriteThreads:   16,
+		MaxConnections: 2,
+		Target:         &applier.Target{DB: tgt, Config: dest},
+		FlushInterval:  100 * time.Millisecond,
 	}
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
+	h := startRunner(t, runner)
 
 	// Initial copy lands all three rows.
-	require.Eventually(t, func() bool { return countRows() == 3 },
-		30*time.Second, 100*time.Millisecond, "initial copy should replicate 3 rows")
+	h.eventually(func() bool { return countRows() == 3 },
+		30*time.Second, "initial copy should replicate 3 rows")
 
 	// Continuous: an INSERT replicates.
 	testutils.RunSQL(t, `INSERT INTO sync_src.t1 VALUES (4,'four')`)
-	require.Eventually(t, func() bool { return countRows() == 4 },
-		30*time.Second, 100*time.Millisecond, "continuous sync should replicate the INSERT")
+	h.eventually(func() bool { return countRows() == 4 },
+		30*time.Second, "continuous sync should replicate the INSERT")
 
 	// Continuous: an UPDATE and a DELETE replicate.
 	testutils.RunSQL(t, `UPDATE sync_src.t1 SET val='ONE' WHERE id=1`)
 	testutils.RunSQL(t, `DELETE FROM sync_src.t1 WHERE id=2`)
-	require.Eventually(t, func() bool { return countRows() == 3 && valOf(1) == "ONE" },
-		30*time.Second, 100*time.Millisecond, "continuous sync should replicate the UPDATE + DELETE")
+	h.eventually(func() bool { return countRows() == 3 && valOf(1) == "ONE" },
+		30*time.Second, "continuous sync should replicate the UPDATE + DELETE")
+
+	// The pool budget is a configured limit, so it reads the same live as it
+	// would after the drain.
+	require.Equal(t, 2, runner.source.db.Stats().MaxOpenConnections)
+	require.Equal(t, 2, runner.target.DB.Stats().MaxOpenConnections)
+	require.Equal(t, 2, runner.sourceDBConfig.MaxOpenConnections)
+	require.Equal(t, 2, runner.targetDBConfig.MaxOpenConnections)
 
 	// Cancellation drains and returns cleanly. The drain is bounded by the
 	// runner's short shutdown budgets, so this wait only needs enough margin to
 	// absorb CI scheduling jitter on a busy server.
-	cancel()
-	select {
-	case runErr := <-done:
-		require.NoError(t, runErr)
-	case <-time.After(60 * time.Second):
-		t.Fatal("sync did not stop within 60s of cancellation")
-	}
-	require.NoError(t, runner.Close())
+	h.stop()
 }
 
 // TestSyncInitialCopy verifies the initial copy: the snapshot is copied to the
@@ -188,11 +324,10 @@ func TestSyncInitialCopy(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_initialcopy_dest`)
 
 	s := &Sync{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Threads:      2,
+		WriteThreads: 2,
 	}
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
@@ -200,79 +335,7 @@ func TestSyncInitialCopy(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, runner))
 	require.NoError(t, runner.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(tgt)
-	var n int
-	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
-	require.Equal(t, 3, n)
-	var v string
-	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT val FROM t1 WHERE id = 2").Scan(&v))
-	require.Equal(t, "two", v)
-}
-
-// TestSyncCopyOnly verifies the CopyOnly path: initial copy runs (no
-// change source constructed, so no REPLICATION/RELOAD privileges
-// required), then the continuous checksum keeps running until the
-// context is cancelled. FirstCleanPass is signalled once the checker
-// observes source == target; that gates the cancel. A clean ctx-cancel
-// returns nil and the snapshot remains on the target.
-func TestSyncCopyOnly(t *testing.T) {
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-	src := cfg.Clone()
-	src.DBName = "sync_copyonly_src"
-	dest := cfg.Clone()
-	dest.DBName = "sync_copyonly_dest"
-	sourceDSN := src.FormatDSN()
-	targetDSN := dest.FormatDSN()
-
-	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_copyonly_src`)
-	testutils.RunSQL(t, `CREATE DATABASE sync_copyonly_src`)
-	testutils.RunSQL(t, `CREATE TABLE sync_copyonly_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
-	testutils.RunSQL(t, `INSERT INTO sync_copyonly_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
-	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_copyonly_dest`)
-
-	s := &Sync{
-		SourceDSN:       sourceDSN,
-		TargetDSN:       targetDSN,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
-		CopyOnly:        true,
-	}
-	runner, err := NewRunner(s)
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	runDone := make(chan error, 1)
-	go func() { runDone <- runner.Run(ctx) }()
-
-	// Wait for the checker to publish a first clean pass — that's the
-	// signal that source and target are known consistent. With a quiescent
-	// source this should happen well within the test deadline.
-	select {
-	case <-runner.FirstCleanPass():
-	case err := <-runDone:
-		t.Fatalf("Run returned before FirstCleanPass: %v", err)
-	case <-ctx.Done():
-		t.Fatalf("timed out waiting for FirstCleanPass: %v", ctx.Err())
-	}
-
-	// Run is still going after the clean pass — it's supposed to block
-	// until cancelled. Cancel now and expect a clean nil return.
-	cancel()
-	select {
-	case err := <-runDone:
-		require.NoError(t, err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run did not return after ctx cancellation")
-	}
-	require.NoError(t, runner.Close())
-
-	// Snapshot landed on target with the right values.
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -301,11 +364,10 @@ func TestRunnerStatusTask(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_statustask_dest`)
 
 	s := &Sync{
-		SourceDSN:       src.FormatDSN(),
-		TargetDSN:       dest.FormatDSN(),
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
+		SourceDSN:    src.FormatDSN(),
+		TargetDSN:    dest.FormatDSN(),
+		Threads:      2,
+		WriteThreads: 2,
 	}
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
@@ -409,11 +471,10 @@ func TestSyncResume(t *testing.T) {
 
 	newSync := func() *Sync {
 		return &Sync{
-			SourceDSN:       sourceDSN,
-			TargetDSN:       targetDSN,
-			TargetChunkTime: 100 * time.Millisecond,
-			Threads:         2,
-			WriteThreads:    2,
+			SourceDSN:    sourceDSN,
+			TargetDSN:    targetDSN,
+			Threads:      2,
+			WriteThreads: 2,
 		}
 	}
 
@@ -423,7 +484,7 @@ func TestSyncResume(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, r1))
 	require.NoError(t, r1.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 
@@ -448,6 +509,10 @@ func TestSyncResume(t *testing.T) {
 	r2, err := NewRunner(newSync())
 	require.NoError(t, err)
 	require.NoError(t, runUntilCopied(t, r2))
+	// The resume must also be visible to API callers, who cannot infer it from
+	// CurrentState — a resumed run walks the same states as a fresh one
+	// (issue #844).
+	require.True(t, r2.Progress().Resume)
 	require.NoError(t, r2.Close())
 
 	require.Equal(t, 3, countRows("t1"), "resume must not duplicate or drop rows")
@@ -479,11 +544,10 @@ func TestSyncResumeNoWatermarkRow(t *testing.T) {
 
 	newSync := func() *Sync {
 		return &Sync{
-			SourceDSN:       sourceDSN,
-			TargetDSN:       targetDSN,
-			TargetChunkTime: 100 * time.Millisecond,
-			Threads:         2,
-			WriteThreads:    2,
+			SourceDSN:    sourceDSN,
+			TargetDSN:    targetDSN,
+			Threads:      2,
+			WriteThreads: 2,
 		}
 	}
 
@@ -504,7 +568,7 @@ func TestSyncResumeNoWatermarkRow(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, r2))
 	require.NoError(t, r2.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -516,8 +580,9 @@ func TestSyncResumeNoWatermarkRow(t *testing.T) {
 
 // TestSyncForce verifies the Force flag: when a resumable checkpoint exists the
 // target is kept and resumed (no drop); when it can't resume (no checkpoint but
-// a non-empty target) the target database is dropped and recreated so the copy
-// can proceed instead of tripping the fresh-sync target-empty guard.
+// a non-empty target) the sync-owned target tables are dropped and recreated so
+// the copy can proceed instead of tripping the fresh-sync target-empty guard —
+// while tables that don't belong to the sync survive.
 func TestSyncForce(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
@@ -538,12 +603,11 @@ func TestSyncForce(t *testing.T) {
 
 	newSync := func(force bool) *Sync {
 		return &Sync{
-			SourceDSN:       sourceDSN,
-			TargetDSN:       targetDSN,
-			TargetChunkTime: 100 * time.Millisecond,
-			Threads:         2,
-			WriteThreads:    2,
-			Force:           force,
+			SourceDSN:    sourceDSN,
+			TargetDSN:    targetDSN,
+			Threads:      2,
+			WriteThreads: 2,
+			Force:        force,
 		}
 	}
 	run := func(force bool) error {
@@ -554,7 +618,7 @@ func TestSyncForce(t *testing.T) {
 		return rerr
 	}
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	tableExists := func(name string) bool {
@@ -567,8 +631,8 @@ func TestSyncForce(t *testing.T) {
 	// First copy completes and writes a checkpoint.
 	require.NoError(t, run(false))
 
-	// Sentinel table not present in the source: survives a resume, vanishes
-	// on a force drop+recreate.
+	// Sentinel table not present in the source: not owned by the sync, so it
+	// survives both a resume and a per-table force wipe.
 	testutils.RunSQL(t, `CREATE TABLE sync_force_dest._keep_me (id INT PRIMARY KEY)`)
 
 	// Force with a resumable checkpoint present: must NOT drop — the sentinel
@@ -584,15 +648,99 @@ func TestSyncForce(t *testing.T) {
 	// Without force this would fail the target-empty guard.
 	require.Error(t, run(false), "a non-empty target with no checkpoint must fail without force")
 
-	// With force it drops + recreates: the sentinel is gone and the data is
-	// freshly re-copied.
+	// With force the sync-owned tables are dropped + recreated and the data is
+	// freshly re-copied; the foreign table is untouched (the wipe is per-table,
+	// never DROP DATABASE).
 	require.NoError(t, run(true))
-	require.False(t, tableExists("_keep_me"), "force must drop+recreate when it cannot resume")
+	require.True(t, tableExists("_keep_me"), "force must not touch tables the sync does not own")
 	var n int
 	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sync_force_dest.t1").Scan(&n))
 	require.Equal(t, 3, n)
 	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM sync_force_dest.t2").Scan(&n))
 	require.Equal(t, 2, n)
+}
+
+// TestSyncForcePreservesForeignTables is the safety regression test for the
+// --force wipe scope: a target database shared with a table the sync never
+// owned (a "foreign" table), holding a stale non-resumable checkpoint (present
+// but without a copier watermark) plus leftover junk in a source-named table.
+// --force must recover by wiping only the sync-owned objects: the foreign
+// table and its rows survive, the source-named tables are recreated with
+// exactly the source's data, and the checkpoint is recreated. Before the
+// per-table wipe, --force executed DROP DATABASE and destroyed the foreign
+// table.
+func TestSyncForcePreservesForeignTables(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_forcewipe_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_forcewipe_dest"
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_forcewipe_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_forcewipe_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_forcewipe_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `CREATE TABLE sync_forcewipe_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_src.t2 VALUES (10,'ten'),(20,'twenty')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_forcewipe_dest`)
+
+	newSync := func(force bool) *Sync {
+		return &Sync{
+			SourceDSN: src.FormatDSN(),
+			TargetDSN: dest.FormatDSN(),
+
+			Threads:      2,
+			WriteThreads: 2,
+			Force:        force,
+		}
+	}
+	run := func(force bool) error {
+		r, nerr := NewRunner(newSync(force))
+		require.NoError(t, nerr)
+		rerr := runUntilCopied(t, r)
+		require.NoError(t, r.Close())
+		return rerr
+	}
+
+	// First run copies everything and writes a current-schema checkpoint.
+	require.NoError(t, run(false))
+
+	// An unrelated reporting table shares the target database. It must survive
+	// any --force recovery.
+	testutils.RunSQL(t, `CREATE TABLE sync_forcewipe_dest.reporting (id INT PRIMARY KEY, note VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_dest.reporting VALUES (1,'keep'),(2,'me')`)
+
+	// Make the checkpoint stale/non-resumable (present, but no copier
+	// watermark) and plant junk in a source-named table, simulating a prior
+	// run that died before its first watermark write.
+	testutils.RunSQL(t, `UPDATE sync_forcewipe_dest._spirit_sync_checkpoint SET copier_watermark = ''`)
+	testutils.RunSQL(t, `INSERT INTO sync_forcewipe_dest.t1 VALUES (999,'junk')`)
+
+	// --force recovers by wiping only the sync-owned tables.
+	require.NoError(t, run(true))
+
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(tgt)
+
+	// The foreign table and its rows survive.
+	var n int
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM reporting").Scan(&n))
+	require.Equal(t, 2, n, "a table the sync never owned must survive --force")
+
+	// The source-named tables were recreated with exactly the source's data.
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n, "t1 must be recreated with the source's rows")
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1 WHERE id = 999").Scan(&n))
+	require.Zero(t, n, "junk from the prior partial run must be gone")
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t2").Scan(&n))
+	require.Equal(t, 2, n)
+
+	// The checkpoint table was recreated by the fresh run.
+	require.NoError(t, tgt.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE table_schema='sync_forcewipe_dest' AND table_name='_spirit_sync_checkpoint'").Scan(&n))
+	require.Equal(t, 1, n)
 }
 
 // TestSyncResumeIncompatibleCheckpoint covers recovery when the target carries a
@@ -618,12 +766,11 @@ func TestSyncResumeIncompatibleCheckpoint(t *testing.T) {
 
 	newSync := func(force bool) *Sync {
 		return &Sync{
-			SourceDSN:       sourceDSN,
-			TargetDSN:       targetDSN,
-			TargetChunkTime: 100 * time.Millisecond,
-			Threads:         2,
-			WriteThreads:    2,
-			Force:           force,
+			SourceDSN:    sourceDSN,
+			TargetDSN:    targetDSN,
+			Threads:      2,
+			WriteThreads: 2,
+			Force:        force,
 		}
 	}
 
@@ -661,7 +808,7 @@ func TestSyncResumeIncompatibleCheckpoint(t *testing.T) {
 	require.NoError(t, runUntilCopied(t, r3))
 	require.NoError(t, r3.Close())
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -673,6 +820,241 @@ func TestSyncResumeIncompatibleCheckpoint(t *testing.T) {
 	require.NoError(t, tgt.QueryRowContext(context.Background(),
 		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE table_schema='sync_incompat_dest' AND table_name='_spirit_sync_checkpoint' AND column_name='binlog_position'").Scan(&n2))
 	require.Equal(t, 1, n2, "force must recreate the checkpoint table with the current schema")
+}
+
+// TestSyncPositionEncodeDecode covers the checkpoint-position payload codec:
+// round-tripping preserves position + identity, and anything that is not our
+// structured payload (legacy bare positions, empty strings, foreign JSON,
+// wrong versions) decodes as a legacy position with no identity attached.
+func TestSyncPositionEncodeDecode(t *testing.T) {
+	// Round trip.
+	raw, err := encodeSyncPosition("binlog.000123:456", "6d1f6f10-0000-1111-2222-333344445555", "db1:3306")
+	require.NoError(t, err)
+	p, ok := decodeSyncPosition(raw)
+	require.True(t, ok, "an encoded payload must decode as structured")
+	require.Equal(t, "binlog.000123:456", p.Position)
+	require.Equal(t, "6d1f6f10-0000-1111-2222-333344445555", p.ServerUUID)
+	require.Equal(t, "db1:3306", p.SourceAddr)
+
+	// Empty identity still round-trips (injected sources record no identity).
+	raw, err = encodeSyncPosition("vgtid-opaque", "", "")
+	require.NoError(t, err)
+	p, ok = decodeSyncPosition(raw)
+	require.True(t, ok)
+	require.Equal(t, "vgtid-opaque", p.Position)
+	require.Empty(t, p.ServerUUID)
+
+	// Legacy / foreign inputs: returned verbatim as the position, not ours.
+	for _, legacy := range []string{
+		"",                        // no saved position
+		"binlog.000042:4",         // pre-identity file:pos checkpoint
+		"uuid:1-100",              // pre-identity GTID checkpoint
+		`{"foo":"bar"}`,           // JSON, but not our payload (unknown fields)
+		`{"v":99,"position":"x"}`, // future/unknown version
+		`{not json`,               // malformed
+	} {
+		p, ok = decodeSyncPosition(legacy)
+		require.False(t, ok, "input %q must not decode as a structured payload", legacy)
+		require.Equal(t, legacy, p.Position)
+		require.Empty(t, p.ServerUUID)
+	}
+}
+
+// TestSyncResumeSourceIdentity verifies that a file:pos resume is gated on the
+// recorded source identity. Binlog file names are sequential on every server,
+// so after a failover/replica promotion/source rebuild behind the same
+// endpoint, a checkpointed position usually "exists" on the new server and
+// would silently skip or replay the wrong events. The checkpoint therefore
+// records @@server_uuid, and resume must hard-error when it doesn't match —
+// while a matching identity resumes normally, and --force recovers by
+// starting fresh.
+func TestSyncResumeSourceIdentity(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_identity_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_identity_dest"
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_identity_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_identity_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_identity_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_identity_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `CREATE TABLE sync_identity_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_identity_src.t2 VALUES (10,'ten'),(20,'twenty')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_identity_dest`)
+
+	newSync := func(force bool) *Sync {
+		return &Sync{
+			SourceDSN: src.FormatDSN(),
+			TargetDSN: dest.FormatDSN(),
+
+			Threads:      2,
+			WriteThreads: 2,
+			Force:        force,
+		}
+	}
+	run := func(force bool) error {
+		r, nerr := NewRunner(newSync(force))
+		require.NoError(t, nerr)
+		rerr := runUntilCopied(t, r)
+		require.NoError(t, r.Close())
+		return rerr
+	}
+
+	// First run: copies and records a checkpoint carrying the source identity.
+	require.NoError(t, run(false))
+
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(tgt)
+
+	// The stored position is the structured payload with the real
+	// @@server_uuid of the source and a non-empty inner position.
+	var realUUID string
+	srcDB, err := sql.Open("block-mysql", src.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(srcDB)
+	require.NoError(t, srcDB.QueryRowContext(context.Background(), "SELECT @@server_uuid").Scan(&realUUID))
+	var storedUUID, storedPos string
+	require.NoError(t, tgt.QueryRowContext(context.Background(),
+		`SELECT JSON_UNQUOTE(JSON_EXTRACT(binlog_position, '$.server_uuid')),
+		        JSON_UNQUOTE(JSON_EXTRACT(binlog_position, '$.position'))
+		 FROM _spirit_sync_checkpoint`).Scan(&storedUUID, &storedPos))
+	require.Equal(t, realUUID, storedUUID, "the checkpoint must record the source's @@server_uuid")
+	require.NotEmpty(t, storedPos, "the checkpoint must record a change-feed position")
+
+	// Pin this checkpoint to file:position even on GTID-enabled test servers.
+	// GTIDs deliberately remain portable; file coordinates require identity.
+	binlog := change.NewBinlogClient(srcDB, src.Addr, src.User, src.Passwd, nil, change.NewClientDefaultConfig())
+	defer binlog.Close()
+	filePosition, err := binlog.CurrentPosition(t.Context())
+	require.NoError(t, err)
+	_, err = tgt.ExecContext(t.Context(), "UPDATE _spirit_sync_checkpoint SET binlog_position = JSON_SET(binlog_position, '$.position', ?)", filePosition)
+	require.NoError(t, err)
+
+	// Simulate a replaced source behind the same endpoint: same position, a
+	// different server_uuid. The inner position still names a binlog file
+	// that exists on this server, so before the identity check this resume
+	// would have succeeded silently.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = JSON_SET(binlog_position, '$.server_uuid', '00000000-dead-beef-0000-000000000000')`)
+	err = run(false)
+	require.Error(t, err, "a checkpoint recorded on a different source server must not resume")
+	require.ErrorContains(t, err, "different source server")
+	require.ErrorContains(t, err, "--force")
+
+	// Restore the real identity: the resume proceeds normally, data intact.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = JSON_SET(binlog_position, '$.server_uuid', '`+realUUID+`')`)
+	require.NoError(t, run(false), "a matching source identity must resume normally")
+	var n int
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n)
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t2").Scan(&n))
+	require.Equal(t, 2, n)
+
+	// A legacy checkpoint (bare position, no identity — written by an older
+	// spirit) is unverifiable and must refuse to resume, pointing at --force.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = JSON_UNQUOTE(JSON_EXTRACT(binlog_position, '$.position'))`)
+	err = run(false)
+	require.Error(t, err, "an identity-less legacy checkpoint must not silently resume")
+	require.ErrorContains(t, err, "no source identity")
+	require.ErrorContains(t, err, "--force")
+
+	// A checkpoint with copy progress but no stream position cannot resume a
+	// continuous sync: starting the feed at "now" would miss writes committed
+	// since the checkpoint. It is eligible for explicit --force recovery.
+	testutils.RunSQL(t, `UPDATE sync_identity_dest._spirit_sync_checkpoint
+		SET binlog_position = ''`)
+	err = run(false)
+	require.ErrorContains(t, err, "no saved change-feed position")
+	require.ErrorContains(t, err, "--force")
+
+	// --force recovers: the position-less checkpoint is treated as
+	// non-resumable, the sync-owned tables are wiped, and a fresh copy runs.
+	require.NoError(t, run(true))
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n)
+}
+
+// TestSyncFreshTargetSchemaMismatch verifies that a fresh sync refuses a
+// pre-existing (empty) target table whose schema differs from the source,
+// before any row is copied. The copy and continuous replication write with
+// REPLACE/INSERT IGNORE, so a collation difference — the dangerous case being
+// on a primary-key column — would silently collapse case-distinct rows and
+// the lockless checksum would never converge. An identical pre-created
+// table must still be accepted (the declarative pre-created-schema workflow).
+func TestSyncFreshTargetSchemaMismatch(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_schemachk_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_schemachk_dest"
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_schemachk_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_schemachk_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_schemachk_src.t1 (
+		id INT PRIMARY KEY,
+		val VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+	)`)
+	testutils.RunSQL(t, `INSERT INTO sync_schemachk_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_schemachk_dest`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_schemachk_dest`)
+
+	newRunner := func() *Runner {
+		r, nerr := NewRunner(&Sync{
+			SourceDSN: src.FormatDSN(),
+			TargetDSN: dest.FormatDSN(),
+
+			Threads:      2,
+			WriteThreads: 2,
+		})
+		require.NoError(t, nerr)
+		return r
+	}
+
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(tgt)
+
+	// Pre-create the target table EMPTY but with a different collation on the
+	// val column. Before the schema check, this passed the fresh-sync
+	// target-empty guard with zero schema comparison.
+	testutils.RunSQL(t, `CREATE TABLE sync_schemachk_dest.t1 (
+		id INT PRIMARY KEY,
+		val VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+	)`)
+
+	r1 := newRunner()
+	err = runUntilCopied(t, r1)
+	require.NoError(t, r1.Close())
+	require.Error(t, err, "a pre-existing target table with a mismatched schema must be rejected")
+	require.ErrorContains(t, err, "schema has diverged from the source")
+	require.ErrorContains(t, err, "t1")
+
+	// The sync failed during setup: nothing was copied and no checkpoint was
+	// created that would claim ownership of the target.
+	var n int
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Zero(t, n, "the sync must error before copying any rows")
+	require.NoError(t, tgt.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE table_schema='sync_schemachk_dest' AND table_name='_spirit_sync_checkpoint'").Scan(&n))
+	require.Zero(t, n, "the sync must error before creating its checkpoint table")
+
+	// An identical pre-created table passes and the copy proceeds.
+	testutils.RunSQL(t, `DROP TABLE sync_schemachk_dest.t1`)
+	testutils.RunSQL(t, `CREATE TABLE sync_schemachk_dest.t1 (
+		id INT PRIMARY KEY,
+		val VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+	)`)
+	r2 := newRunner()
+	require.NoError(t, runUntilCopied(t, r2), "an identical pre-created table must be accepted")
+	require.NoError(t, r2.Close())
+	require.NoError(t, tgt.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n)
 }
 
 // TestSyncCreateTableLegacyDefault verifies that target tables are created with
@@ -697,7 +1079,7 @@ func TestSyncCreateTableLegacyDefault(t *testing.T) {
 	// The rows themselves carry valid timestamps.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	laxDB, err := sql.Open("mysql", src.FormatDSN())
+	laxDB, err := sql.Open("block-mysql", src.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(laxDB)
 	laxConn, err := laxDB.Conn(ctx)
@@ -719,24 +1101,23 @@ func TestSyncCreateTableLegacyDefault(t *testing.T) {
 		targetCfg.Params = map[string]string{}
 	}
 	targetCfg.Params["sql_mode"] = "TRADITIONAL"
-	targetDB, err := sql.Open("mysql", targetCfg.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", targetCfg.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB) // injected target: the runner doesn't own/close it
 	target := applier.Target{DB: targetDB, Config: targetCfg, KeyRange: "0"}
 
 	s := &Sync{
-		SourceDSN:       src.FormatDSN(),
-		Target:          &target,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         2,
-		WriteThreads:    2,
+		SourceDSN:    src.FormatDSN(),
+		Target:       &target,
+		Threads:      2,
+		WriteThreads: 2,
 	}
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
 	require.NoError(t, runUntilCopied(t, runner)) // would fail with 1067 without the relaxed-DDL fix
 	require.NoError(t, runner.Close())
 
-	tgt, err := sql.Open("mysql", dest.FormatDSN())
+	tgt, err := sql.Open("block-mysql", dest.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
 	var n int
@@ -750,7 +1131,11 @@ func TestSyncCreateTableLegacyDefault(t *testing.T) {
 // require.ElementsMatch, which is order-independent.
 func secondaryIndexNames(t *testing.T, db *sql.DB, schema, table string) []string {
 	t.Helper()
-	rows, err := db.QueryContext(context.Background(),
+	// Bounded: this runs inside h.eventually, on the test goroutine, and reads
+	// information_schema for a table the runner may be adding indexes to.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx,
 		`SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
 		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME <> 'PRIMARY'`, schema, table)
 	require.NoError(t, err)
@@ -804,11 +1189,11 @@ func TestSyncDeferSecondaryIndexesCreateAndRestore(t *testing.T) {
 	// Wire up the source + target connections the way Run() does, but without
 	// driving the full copy pipeline — we call createTargetTables /
 	// restoreSecondaryIndexes directly.
-	sourceDB, err := sql.Open("mysql", s.SourceDSN)
+	sourceDB, err := sql.Open("block-mysql", s.SourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 	runner.source = sourceInfo{db: sourceDB, config: src, dsn: s.SourceDSN}
-	targetDB, err := sql.Open("mysql", s.TargetDSN)
+	targetDB, err := sql.Open("block-mysql", s.TargetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
@@ -865,12 +1250,16 @@ func TestSyncDeferSecondaryIndexesE2E(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_deferidx_dest`)
 	testutils.RunSQL(t, `CREATE DATABASE sync_deferidx_dest`)
 
-	tgt, err := sql.Open("mysql", targetDSN)
+	tgt, err := sql.Open("block-mysql", targetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(tgt)
+	// Bounded, as in TestSyncE2E: this runs inside h.eventually on the test
+	// goroutine, and the table it counts is one the runner is adding indexes to.
 	countRows := func() int {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
 		var n int
-		if err := tgt.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM t1`).Scan(&n); err != nil {
+		if err := tgt.QueryRowContext(ctx, `SELECT COUNT(*) FROM t1`).Scan(&n); err != nil {
 			return -1
 		}
 		return n
@@ -879,7 +1268,6 @@ func TestSyncDeferSecondaryIndexesE2E(t *testing.T) {
 	s := &Sync{
 		SourceDSN:             sourceDSN,
 		TargetDSN:             targetDSN,
-		TargetChunkTime:       100 * time.Millisecond,
 		Threads:               2,
 		WriteThreads:          2,
 		FlushInterval:         100 * time.Millisecond,
@@ -888,35 +1276,25 @@ func TestSyncDeferSecondaryIndexesE2E(t *testing.T) {
 	runner, err := NewRunner(s)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runner.Run(ctx) }()
+	h := startRunner(t, runner)
 
 	// Initial copy lands all three rows.
-	require.Eventually(t, func() bool { return countRows() == 3 },
-		30*time.Second, 100*time.Millisecond, "initial copy should replicate 3 rows")
+	h.eventually(func() bool { return countRows() == 3 },
+		30*time.Second, "initial copy should replicate 3 rows")
 
 	// The deferred secondary indexes are restored before the continuous phase.
-	require.Eventually(t, func() bool {
-		got := secondaryIndexNames(t, tgt, dest.DBName, "t1")
-		return len(got) == 3
-	}, 30*time.Second, 100*time.Millisecond, "deferred indexes should be restored")
+	h.eventually(func() bool {
+		return len(secondaryIndexNames(t, tgt, dest.DBName, "t1")) == 3
+	}, 30*time.Second, "deferred indexes should be restored")
 	require.ElementsMatch(t, []string{"uq_u", "idx_a", "idx_b"},
 		secondaryIndexNames(t, tgt, dest.DBName, "t1"))
 
 	// Continuous replication still works against the now-indexed target.
 	testutils.RunSQL(t, `INSERT INTO sync_deferidx_src.t1 VALUES (4,'four',40,400)`)
-	require.Eventually(t, func() bool { return countRows() == 4 },
-		30*time.Second, 100*time.Millisecond, "continuous sync should replicate the INSERT")
+	h.eventually(func() bool { return countRows() == 4 },
+		30*time.Second, "continuous sync should replicate the INSERT")
 
-	cancel()
-	select {
-	case runErr := <-done:
-		require.NoError(t, runErr)
-	case <-time.After(60 * time.Second):
-		t.Fatal("sync did not stop within 60s of cancellation")
-	}
-	require.NoError(t, runner.Close())
+	h.stop()
 }
 
 // TestSyncValidate covers the Kong Validate() hook: explicitly-negative
@@ -931,17 +1309,14 @@ func TestSyncValidate(t *testing.T) {
 	}{
 		{name: "zero values are valid"},
 		{name: "typical values are valid", s: Sync{
-			Threads:         4,
-			WriteThreads:    4,
-			TargetChunkTime: 5 * time.Second,
-			FlushInterval:   30 * time.Second,
+			Threads:       4,
+			WriteThreads:  4,
+			FlushInterval: 30 * time.Second,
 		}},
 		{name: "negative threads", s: Sync{Threads: -5},
 			wantErr: "--threads must be non-negative, got -5"},
 		{name: "negative write-threads", s: Sync{WriteThreads: -1},
 			wantErr: "--write-threads must be non-negative, got -1"},
-		{name: "negative target-chunk-time", s: Sync{TargetChunkTime: -time.Second},
-			wantErr: "--target-chunk-time must be non-negative, got -1s"},
 		{name: "negative flush-interval", s: Sync{FlushInterval: -time.Minute},
 			wantErr: "--flush-interval must be non-negative, got -1m0s"},
 	}
@@ -955,4 +1330,302 @@ func TestSyncValidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSyncVerifyExistingTargetTableRequiresExactSchema pins sync's deliberate
+// divergence from move: move's source->target check forgives a target that
+// drops the source's column-level AUTO_INCREMENT or is stricter about NULL,
+// because it has already established the target is empty and vets the copy with
+// an unconditional pre-cutover checksum. Sync's gate fires on a target that may
+// be half-copied from an earlier attempt, so it requires an exact match — see
+// verifyExistingTargetTable for the full reasoning. If this is ever relaxed, it
+// should be because someone decided to, not because move's options got reused.
+func TestSyncVerifyExistingTargetTableRequiresExactSchema(t *testing.T) {
+	r := &Runner{target: applier.Target{Config: &mysql.Config{DBName: "sync_dest"}}}
+
+	tests := []struct {
+		name     string
+		source   string
+		target   string
+		wantDiff string // empty means the target must be accepted
+	}{
+		{
+			name:   "different AUTO_INCREMENT supporting names",
+			source: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id))",
+			target: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY target_ai(id))",
+		},
+		{
+			name:   "different AUTO_INCREMENT supporting widths",
+			source: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id))",
+			target: "CREATE TABLE t1 (id INT AUTO_INCREMENT, p INT, PRIMARY KEY(p,id), KEY ai(id,p))",
+		},
+		{
+			name:   "identical",
+			source: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
+			target: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
+		},
+		{
+			// This is the state after applying the ALTER named by a prior
+			// schema-divergence error. Pin that the reconciled target passes the
+			// gate even though replaying the historical DDL prevents the old
+			// end-to-end test from continuing in always-streaming mode.
+			name:   "target reconciled with suggested ALTER",
+			source: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL, added VARCHAR(64) NOT NULL DEFAULT 'x')",
+			target: "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL, added VARCHAR(64) NOT NULL DEFAULT 'x')",
+		},
+		{
+			// Accepted by move — a sharded target's shard key cannot be NULL —
+			// and rejected here.
+			name:     "target stricter about NULL",
+			source:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT DEFAULT NULL)",
+			target:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY, customer_id BIGINT NOT NULL)",
+			wantDiff: "MODIFY COLUMN `customer_id`",
+		},
+		{
+			// Also accepted by move — a sharded target takes its ids from a
+			// Vitess sequence — and rejected here.
+			name:     "target drops column AUTO_INCREMENT",
+			source:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY AUTO_INCREMENT, val VARCHAR(64) DEFAULT NULL)",
+			target:   "CREATE TABLE t1 (id BIGINT PRIMARY KEY, val VARCHAR(64) DEFAULT NULL)",
+			wantDiff: "MODIFY COLUMN `id`",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := r.verifyExistingTargetTable("t1", tt.source, tt.target)
+			if tt.wantDiff == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "schema has diverged from the source")
+			require.Contains(t, err.Error(), tt.wantDiff,
+				"the error must carry the ALTER that reconciles the target")
+		})
+	}
+}
+
+// TestSyncResumeSourceSchemaChanged covers issue #1165: a source DDL that lands
+// between attempts must not be silently copied past. The target table exists
+// from the first run, so createTargetTables does not recreate it; without a
+// schema check the column added on the source falls out of the copy's
+// source/target column intersection — and out of the lockless checksum built
+// from that same intersection — so the sync converges "clean" with the target
+// missing the column. The re-run must fail instead, naming the reconciling
+// ALTER.
+func TestSyncResumeSourceSchemaChanged(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_ddl_drift_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_ddl_drift_dest"
+	sourceDSN := src.FormatDSN()
+	targetDSN := dest.FormatDSN()
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_ddl_drift_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_ddl_drift_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_ddl_drift_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_ddl_drift_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `CREATE TABLE sync_ddl_drift_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_ddl_drift_src.t2 VALUES (10,'ten'),(20,'twenty')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_ddl_drift_dest`)
+
+	newSync := func() *Sync {
+		return &Sync{
+			SourceDSN:    sourceDSN,
+			TargetDSN:    targetDSN,
+			Threads:      2,
+			WriteThreads: 2,
+		}
+	}
+
+	// First run: copies both tables and leaves a resumable checkpoint.
+	r1, err := NewRunner(newSync())
+	require.NoError(t, err)
+	require.NoError(t, runUntilCopied(t, r1))
+	require.NoError(t, r1.Close())
+
+	// The source gains a column while the sync is not running — the shape a
+	// retry of an errored sync sees when the DDL is what aborted it.
+	testutils.RunSQL(t, `ALTER TABLE sync_ddl_drift_src.t1 ADD COLUMN added VARCHAR(64) NOT NULL DEFAULT 'x'`)
+
+	r2, err := NewRunner(newSync())
+	require.NoError(t, err)
+	runErr := runUntilCopied(t, r2)
+	require.NoError(t, r2.Close())
+	require.Error(t, runErr, "a resume against a stale target schema must fail, not copy a column short")
+	require.Contains(t, runErr.Error(), "t1")
+	require.Contains(t, runErr.Error(), "ADD COLUMN `added`",
+		"the error should carry the ALTER that reconciles the target")
+
+	// The unchanged table must not be implicated in the failure.
+	require.NotContains(t, runErr.Error(), "t2")
+}
+
+type resumeSource struct {
+	change.Source
+	started               bool
+	watermarkOptimization bool
+}
+
+func (s *resumeSource) SetWatermarkOptimization(_ context.Context, enabled bool) error {
+	s.watermarkOptimization = enabled
+	return nil
+}
+
+func (s *resumeSource) Start(context.Context) error {
+	s.started = true
+	return nil
+}
+
+func TestStartResumeChangeSourceRejectsCopyProgressWithoutStreamPosition(t *testing.T) {
+	source := &resumeSource{watermarkOptimization: true}
+	r := &Runner{
+		replClient: source,
+	}
+
+	require.ErrorContains(t, r.startResumeChangeSource(t.Context(), "finished-watermark", ""), "refusing an unsafe resume")
+	require.False(t, source.started)
+	require.True(t, source.watermarkOptimization)
+}
+
+// TestSyncTargetSchemaVerifyIgnoresDeferredIndexes guards the resume-time schema
+// check against the false positive that would break --defer-secondary-indexes:
+// an attempt that died between the deferred CREATE and restoreSecondaryIndexes
+// leaves the target legitimately missing its regular secondary indexes, and the
+// resume must proceed (and restore them) rather than report a schema mismatch.
+// UNIQUE indexes are kept on the deferred CREATE, so dropping one *is* a
+// mismatch and must still be caught.
+func TestSyncTargetSchemaVerifyIgnoresDeferredIndexes(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_deferidx_verify_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_deferidx_verify_dest"
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_deferidx_verify_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_deferidx_verify_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_deferidx_verify_src.t1 (
+		id INT PRIMARY KEY,
+		u VARCHAR(36) NOT NULL,
+		a INT,
+		UNIQUE KEY uq_u (u),
+		KEY idx_a (a)
+	)`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_deferidx_verify_dest`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_deferidx_verify_dest`)
+
+	s := &Sync{
+		SourceDSN:             src.FormatDSN(),
+		TargetDSN:             dest.FormatDSN(),
+		DeferSecondaryIndexes: true,
+	}
+	runner, err := NewRunner(s)
+	require.NoError(t, err)
+
+	sourceDB, err := sql.Open("block-mysql", s.SourceDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(sourceDB)
+	runner.source = sourceInfo{db: sourceDB, config: src, dsn: s.SourceDSN}
+	targetDB, err := sql.Open("block-mysql", s.TargetDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
+
+	ctx := context.Background()
+	tables, err := runner.getTables(ctx)
+	require.NoError(t, err)
+	runner.sourceTables = tables
+
+	// Deferred create: target is index-free apart from PRIMARY + UNIQUE.
+	require.NoError(t, runner.createTargetTables(ctx))
+	require.ElementsMatch(t, []string{"uq_u"},
+		secondaryIndexNames(t, targetDB, dest.DBName, "t1"))
+
+	// A resume in that state must not be read as a schema mismatch.
+	require.NoError(t, runner.createTargetTables(ctx),
+		"a target still missing its deferred secondary indexes must resume")
+	require.NoError(t, runner.restoreSecondaryIndexes(ctx))
+
+	// A fully-restored target is equally acceptable.
+	require.NoError(t, runner.createTargetTables(ctx))
+
+	// A dropped UNIQUE index is not deferrable, so it is real drift.
+	testutils.RunSQL(t, `ALTER TABLE sync_deferidx_verify_dest.t1 DROP INDEX uq_u`)
+	err = runner.createTargetTables(ctx)
+	require.Error(t, err, "a missing UNIQUE index is drift, not deferral")
+	require.Contains(t, err.Error(), "uq_u")
+
+	// So is a dropped column.
+	testutils.RunSQL(t, `ALTER TABLE sync_deferidx_verify_dest.t1 ADD UNIQUE KEY uq_u (u)`)
+	testutils.RunSQL(t, `ALTER TABLE sync_deferidx_verify_dest.t1 DROP COLUMN a`)
+	err = runner.createTargetTables(ctx)
+	require.Error(t, err, "a column the target lacks would be silently dropped from the copy")
+	require.Contains(t, err.Error(), "ADD COLUMN `a`")
+}
+
+func TestSyncForceSourceAlias(t *testing.T) {
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE precious (id INT PRIMARY KEY, val INT)")
+	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO precious VALUES (1,42)")
+	for _, force := range []bool{false, true} {
+		r, err := NewRunner(&Sync{SourceDSN: testutils.DSNForDatabase(dbName), TargetDSN: testutils.DSNForDatabase(dbName), Force: force})
+		require.NoError(t, err)
+		require.ErrorContains(t, r.Run(t.Context()), "same database")
+		require.NoError(t, r.Close())
+		var val int
+		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT val FROM precious WHERE id=1").Scan(&val))
+		require.Equal(t, 42, val)
+	}
+}
+
+func TestSyncResumeGTIDIdentity(t *testing.T) {
+	pos := "6d1f6f10-0000-1111-2222-333344445555:1-100"
+	r := &Runner{sync: &Sync{}, sourceUUID: "a-different-server"}
+	wrapped, err := encodeSyncPosition(pos, "original-server", "old-host:3306")
+	require.NoError(t, err)
+	for _, saved := range []string{pos, wrapped} {
+		got, err := r.resolveResumePosition(saved)
+		require.NoError(t, err)
+		require.Equal(t, pos, got)
+	}
+}
+
+func TestSyncResumeRequiresChangeFeedPosition(t *testing.T) {
+	r := &Runner{sync: &Sync{}}
+	_, err := r.resolveResumePosition("")
+	require.ErrorContains(t, err, "no saved change-feed position")
+	require.ErrorContains(t, err, "--force")
+
+}
+
+func TestSyncResumeExplainsStructuredPositionWithoutIdentity(t *testing.T) {
+	r := &Runner{sync: &Sync{}}
+	wrapped, err := encodeSyncPosition("binlog.000123:456", "", "injected-source")
+	require.NoError(t, err)
+
+	_, err = r.resolveResumePosition(wrapped)
+	require.ErrorContains(t, err, "injected change source")
+	require.NotContains(t, err.Error(), "older spirit version")
+}
+
+func TestSyncResumeSourceIdentityCaseInsensitive(t *testing.T) {
+	r := &Runner{
+		sync:       &Sync{},
+		sourceUUID: "abcdef01-2345-6789-abcd-ef0123456789",
+	}
+	position := "binlog.000123:456"
+	wrapped, err := encodeSyncPosition(
+		position,
+		"ABCDEF01-2345-6789-ABCD-EF0123456789",
+		"old-host:3306",
+	)
+	require.NoError(t, err)
+
+	got, err := r.resolveResumePosition(wrapped)
+	require.NoError(t, err)
+	require.Equal(t, position, got)
 }

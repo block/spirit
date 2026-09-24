@@ -55,11 +55,11 @@ func (d *dynamicChunkSizer) panicShrink(logger *slog.Logger, dur time.Duration) 
 	newTarget := uint64(float64(d.chunkSize) / float64(DynamicPanicFactor*2))
 	if d.chunkSize <= MinDynamicRowSize {
 		if !d.pinnedAtFloor {
-			logger.Warn("chunk size pinned at minimum; rows may be too wide to meet target-chunk-time",
+			logger.Warn("chunk size pinned at minimum; rows may be too wide to meet the chunk time budget",
 				"time", dur,
 				"threshold", d.ChunkerTarget*DynamicPanicFactor,
 				"min-rows", MinDynamicRowSize,
-				"target-ms", d.ChunkerTarget,
+				"target-time", d.ChunkerTarget,
 			)
 			d.pinnedAtFloor = true
 		}
@@ -68,7 +68,7 @@ func (d *dynamicChunkSizer) panicShrink(logger *slog.Logger, dur time.Duration) 
 			"time", dur,
 			"threshold", d.ChunkerTarget*DynamicPanicFactor,
 			"target-rows", d.chunkSize,
-			"target-ms", d.ChunkerTarget,
+			"target-time", d.ChunkerTarget,
 			"new-target-rows", newTarget,
 		)
 	}
@@ -76,18 +76,19 @@ func (d *dynamicChunkSizer) panicShrink(logger *slog.Logger, dur time.Duration) 
 }
 
 // feedbackTime incorporates a wall-clock duration for one completed chunk. It
-// is the time-signal path (unbuffered copier, checksum, and the buffered copier
-// when TargetChunkBytes is unset), shared by both the composite and optimistic
-// chunkers.
+// is the time-signal path (the checksum, and the copier when TargetChunkBytes
+// is unset), shared by both the composite and optimistic chunkers.
 //
 // beforeUpdate, if non-nil, is called with the freshly computed target and p90
 // just before the new chunk size is applied — a seam for chunker-specific
 // behavior. The optimistic chunker uses it to switch to prefetch mode (see
 // chunkerOptimistic.maybeSwitchToPrefetch); the composite chunker passes nil.
+// Returning true means the hook has taken ownership of the chunk size and the
+// computed target must not be applied on top of it.
 //
 // Caller must hold the chunker's mutex and have already screened stale/disabled
 // feedback.
-func (d *dynamicChunkSizer) feedbackTime(logger *slog.Logger, dur time.Duration, beforeUpdate func(newTarget uint64, p90 time.Duration)) {
+func (d *dynamicChunkSizer) feedbackTime(logger *slog.Logger, dur time.Duration, beforeUpdate func(newTarget uint64, p90 time.Duration) bool) {
 	// If any chunk takes 5x the target we reduce immediately and don't wait
 	// for more feedback.
 	if dur > d.ChunkerTarget*DynamicPanicFactor {
@@ -97,8 +98,8 @@ func (d *dynamicChunkSizer) feedbackTime(logger *slog.Logger, dur time.Duration,
 	d.chunkTimingInfo = append(d.chunkTimingInfo, dur)
 	if len(d.chunkTimingInfo) > 10 {
 		newTarget, p90 := d.calculateNewTargetChunkSize()
-		if beforeUpdate != nil {
-			beforeUpdate(newTarget, p90)
+		if beforeUpdate != nil && beforeUpdate(newTarget, p90) {
+			return
 		}
 		d.updateChunkerTarget(newTarget)
 	}
@@ -119,9 +120,10 @@ func (d *dynamicChunkSizer) feedbackTime(logger *slog.Logger, dur time.Duration,
 //
 // beforeUpdate, if non-nil, is called with the freshly computed target and the
 // p90 byte size just before the new chunk size is applied — the byte-signal
-// twin of feedbackTime's hook. Caller must hold the chunker's mutex and have
-// already screened stale/disabled feedback.
-func (d *dynamicChunkSizer) feedbackBytes(logger *slog.Logger, bytes uint64, beforeUpdate func(newTarget uint64, p90Bytes uint64)) {
+// twin of feedbackTime's hook, including its true-means-skip-the-update
+// contract. Caller must hold the chunker's mutex and have already screened
+// stale/disabled feedback.
+func (d *dynamicChunkSizer) feedbackBytes(logger *slog.Logger, bytes uint64, beforeUpdate func(newTarget uint64, p90Bytes uint64) bool) {
 	if bytes > d.TargetChunkBytes*DynamicPanicFactor {
 		d.panicShrinkBytes(logger, bytes)
 		return
@@ -129,8 +131,8 @@ func (d *dynamicChunkSizer) feedbackBytes(logger *slog.Logger, bytes uint64, bef
 	d.chunkByteInfo = append(d.chunkByteInfo, bytes)
 	if len(d.chunkByteInfo) > 10 {
 		newTarget, p90 := d.calculateNewTargetChunkBytes()
-		if beforeUpdate != nil {
-			beforeUpdate(newTarget, p90)
+		if beforeUpdate != nil && beforeUpdate(newTarget, p90) {
+			return
 		}
 		d.updateChunkerTarget(newTarget)
 	}
@@ -198,6 +200,25 @@ func (d *dynamicChunkSizer) updateChunkerTarget(newTarget uint64) {
 	}
 	// Reset whichever history feeds the active signal. Clearing both is safe:
 	// the inactive slice is always already empty.
+	d.chunkTimingInfo = []time.Duration{}
+	d.chunkByteInfo = []uint64{}
+}
+
+// setChunkSize applies a chunk size directly — clamped to the dynamic bounds
+// but bypassing the per-step growth cap — and clears the feedback history so
+// the next window measures the size that is now in effect.
+//
+// It exists for the optimistic chunker's prefetch transitions, where the growth
+// cap must not apply because the *meaning* of chunkSize changes across the
+// boundary (a key-space width outside prefetch mode, a row offset inside it).
+// Carrying either the old history or the old growth path across such a
+// transition would be measuring one mode with the other's yardstick. Caller
+// must hold the chunker's mutex.
+func (d *dynamicChunkSizer) setChunkSize(newSize uint64) {
+	d.chunkSize = min(max(newSize, MinDynamicRowSize), MaxDynamicRowSize)
+	if d.chunkSize > MinDynamicRowSize {
+		d.pinnedAtFloor = false
+	}
 	d.chunkTimingInfo = []time.Duration{}
 	d.chunkByteInfo = []uint64{}
 }

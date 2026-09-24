@@ -1,0 +1,209 @@
+// Copyright 2015 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package charset
+
+import (
+	"math/rand"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func testValidCharset(t *testing.T, charset string, collation string, expect bool) {
+	b := ValidCharsetAndCollation(charset, collation)
+	require.Equal(t, expect, b)
+}
+
+func TestValidCharset(t *testing.T) {
+	tests := []struct {
+		cs   string
+		co   string
+		succ bool
+	}{
+		{"utf8", "utf8_general_ci", true},
+		{"", "utf8_general_ci", true},
+		{"utf8mb4", "utf8mb4_bin", true},
+		{"latin1", "latin1_bin", true},
+		{"utf8", "utf8_invalid_ci", false},
+		{"utf16", "utf16_bin", true},
+		{"gb2312", "gb2312_chinese_ci", true},
+		{"nosuch", "nosuch_bin", false},
+		{"utf8", "utf8mb3_danish_ci", true},
+		{"utf8mb4", "utf8mb4_nb_0900_ai_ci", true},
+		{"utf8mb4", "utf8mb4_mn_cyrl_0900_as_cs", true},
+		{"UTF8", "UTF8_BIN", true},
+		{"UTF8", "utf8_bin", true},
+		{"UTF8MB4", "utf8mb4_bin", true},
+		{"UTF8MB4", "UTF8MB4_bin", true},
+		{"UTF8MB4", "UTF8MB4_general_ci", true},
+		{"Utf8", "uTf8_bIN", true},
+		{"utf8mb3", "", true},
+		{"utf8mb3", "utf8mb3_bin", true},
+		{"utf8mb3", "utf8mb3_general_ci", true},
+		{"utf8mb3", "utf8mb3_unicode_ci", true},
+	}
+	for _, tt := range tests {
+		testValidCharset(t, tt.cs, tt.co, tt.succ)
+	}
+}
+
+func testGetDefaultCollation(t *testing.T, charset string, expectCollation string, succ bool) {
+	b, err := GetDefaultCollation(charset)
+	if !succ {
+		require.Error(t, err)
+		return
+	}
+	require.Equal(t, expectCollation, b)
+}
+
+func TestGetDefaultCollation(t *testing.T) {
+	tests := []struct {
+		cs   string
+		co   string
+		succ bool
+	}{
+		{"utf8", "utf8_bin", true},
+		{"UTF8", "utf8_bin", true},
+		{"utf8mb4", "utf8mb4_bin", true},
+		{"ascii", "ascii_bin", true},
+		{"binary", "binary", true},
+		{"latin1", "latin1_bin", true},
+		{"utf16", "utf16_general_ci", true},
+		{"latin2", "latin2_general_ci", true},
+		{"invalid_cs", "", false},
+		{"", "utf8_bin", false},
+	}
+	for _, tt := range tests {
+		testGetDefaultCollation(t, tt.cs, tt.co, tt.succ)
+	}
+
+	// Test the consistency of collations table and charset desc table
+	charsetNum := 0
+	for _, collate := range collations {
+		if collate.IsDefault {
+			if desc, ok := CharacterSetInfos[collate.CharsetName]; ok {
+				require.Equal(t, desc.DefaultCollation, collate.Name)
+				charsetNum++
+			}
+		}
+	}
+	require.Equal(t, len(CharacterSetInfos), charsetNum)
+}
+
+func TestGetCharsetDesc(t *testing.T) {
+	tests := []struct {
+		cs     string
+		result string
+		succ   bool
+	}{
+		{"utf8", "utf8", true},
+		{"UTF8", "utf8", true},
+		{"utf8mb4", "utf8mb4", true},
+		{"ascii", "ascii", true},
+		{"binary", "binary", true},
+		{"latin1", "latin1", true},
+		{"invalid_cs", "", false},
+		{"", "utf8_bin", false},
+	}
+	for _, tt := range tests {
+		desc, err := GetCharsetInfo(tt.cs)
+		if !tt.succ {
+			require.Error(t, err)
+		} else {
+			require.Equal(t, tt.result, desc.Name)
+		}
+	}
+}
+
+func TestGetCollationByName(t *testing.T) {
+	for _, collation := range collations {
+		coll, err := GetCollationByName(collation.Name)
+		require.NoError(t, err)
+		require.Equal(t, collation, coll)
+	}
+
+	_, err := GetCollationByName("non_exist")
+	require.EqualError(t, err, "[ddl:1273]Unknown collation: 'non_exist'")
+}
+
+func TestInvalidCollation(t *testing.T) {
+	testValidCharset(t, "utf8", "utf8_invalid_ci", false)
+}
+
+func TestUTF8MB3(t *testing.T) {
+	colname, err := GetDefaultCollationLegacy("utf8mb3")
+	require.NoError(t, err)
+	require.Equal(t, "utf8_bin", colname)
+
+	csinfo, err := GetCharsetInfo("utf8mb3")
+	require.NoError(t, err)
+	require.Equal(t, "utf8", csinfo.Name)
+
+	tests := []struct {
+		cs    string
+		alias string
+	}{
+		{"utf8mb3_bin", "utf8_bin"},
+		{"utf8mb3_general_ci", "utf8_general_ci"},
+		{"utf8mb3_unicode_ci", "utf8_unicode_ci"},
+		// The alias is by prefix: every utf8mb3_* collation MySQL knows maps
+		// to the registry's utf8_* spelling.
+		{"utf8mb3_danish_ci", "utf8_danish_ci"},
+		{"utf8mb3_unicode_520_ci", "utf8_unicode_520_ci"},
+		{"utf8mb3_general_mysql500_ci", "utf8_general_mysql500_ci"},
+		{"utf8mb3_tolower_ci", "utf8_tolower_ci"},
+	}
+	for _, tt := range tests {
+		col, err := GetCollationByName(tt.cs)
+		require.NoError(t, err)
+		require.Equal(t, col.Name, tt.alias)
+	}
+}
+
+func BenchmarkGetCharsetDesc(b *testing.B) {
+	b.ResetTimer()
+	charsets := []string{CharsetUTF8, CharsetUTF8MB4, CharsetASCII, CharsetLatin1, CharsetBin}
+	index := rand.Intn(len(charsets))
+	cs := charsets[index]
+
+	for i := 0; i < b.N; i++ {
+		_, _ = GetCharsetInfo(cs)
+	}
+}
+
+func TestMySQLDefaultCollation(t *testing.T) {
+	tests := []struct {
+		cs string
+		co string
+		ok bool
+	}{
+		// Where it deliberately differs from GetDefaultCollation, which
+		// reports this parser's legacy *_bin defaults.
+		{"utf8mb4", "utf8mb4_0900_ai_ci", true},
+		{"UTF8MB4", "utf8mb4_0900_ai_ci", true},
+		{"latin1", "latin1_swedish_ci", true},
+		{"ascii", "ascii_general_ci", true},
+		{"utf8", "utf8_general_ci", true},
+		{"utf8mb3", "utf8_general_ci", true},
+		{"binary", "binary", true},
+		{"utf16", "utf16_general_ci", true},
+		{"invalid_cs", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		co, ok := MySQLDefaultCollation(tt.cs)
+		require.Equal(t, tt.ok, ok, "charset %q", tt.cs)
+		require.Equal(t, tt.co, co, "charset %q", tt.cs)
+	}
+}

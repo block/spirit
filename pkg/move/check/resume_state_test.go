@@ -6,11 +6,11 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,11 +21,11 @@ func TestResumeStateCheck(t *testing.T) {
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS resume_tgt`)
 	testutils.RunSQL(t, `CREATE DATABASE resume_tgt`)
 
-	sourceDB, err := sql.Open("mysql", testutils.DSNForDatabase("resume_src"))
+	sourceDB, err := sql.Open("block-mysql", testutils.DSNForDatabase("resume_src"))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
 
-	targetDB, err := sql.Open("mysql", testutils.DSNForDatabase("resume_tgt"))
+	targetDB, err := sql.Open("block-mysql", testutils.DSNForDatabase("resume_tgt"))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 
@@ -171,7 +171,7 @@ func TestResumeStateCheck(t *testing.T) {
 		testutils.RunSQL(t, `DROP DATABASE IF EXISTS resume_tgt2`)
 		testutils.RunSQL(t, `CREATE DATABASE resume_tgt2`)
 
-		targetDB2, err := sql.Open("mysql", testutils.DSNForDatabase("resume_tgt2"))
+		targetDB2, err := sql.Open("block-mysql", testutils.DSNForDatabase("resume_tgt2"))
 		require.NoError(t, err)
 		defer utils.CloseAndLog(targetDB2)
 
@@ -216,7 +216,7 @@ func TestResumeStateCheck(t *testing.T) {
 		testutils.RunSQL(t, `DROP DATABASE IF EXISTS resume_tgt3`)
 		testutils.RunSQL(t, `CREATE DATABASE resume_tgt3`)
 
-		targetDB3, err := sql.Open("mysql", testutils.DSNForDatabase("resume_tgt3"))
+		targetDB3, err := sql.Open("block-mysql", testutils.DSNForDatabase("resume_tgt3"))
 		require.NoError(t, err)
 		defer utils.CloseAndLog(targetDB3)
 

@@ -118,7 +118,7 @@ func TestLowWatermark(t *testing.T) {
 	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err := chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false},\"RowsCopied\":2}", watermark)
 
 	// Check key w.r.t. watermark
 	require.False(t, chunker.KeyAboveHighWatermark(1000))
@@ -135,7 +135,7 @@ func TestLowWatermark(t *testing.T) {
 	require.True(t, chunker.KeyBelowLowWatermark(1001))
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":3}", watermark)
 
 	chunkAsync1, err := chunker.Next()
 	require.NoError(t, err)
@@ -155,18 +155,18 @@ func TestLowWatermark(t *testing.T) {
 	chunker.Feedback(chunkAsync2, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":4}", watermark)
 
 	chunker.Feedback(chunkAsync3, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":5}", watermark)
 	require.False(t, chunker.KeyBelowLowWatermark(2001))
 
 	chunker.Feedback(chunkAsync1, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false},\"RowsCopied\":6}", watermark)
 	require.True(t, chunker.KeyBelowLowWatermark(2001))
 	require.True(t, chunker.KeyBelowLowWatermark(5000))
 
@@ -175,12 +175,12 @@ func TestLowWatermark(t *testing.T) {
 	require.Equal(t, "`id` >= 5001 AND `id` < 6001", chunk.String()) // should bump immediately
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false},\"RowsCopied\":6}", watermark)
 
 	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"5001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"6001\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"5001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"6001\"],\"Inclusive\":false},\"RowsCopied\":7}", watermark)
 
 	// Test that we have applied all stored chunks and the map is empty,
 	// as we gave Feedback for all chunks.
@@ -333,7 +333,7 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	watermark, err := chunker.GetLowWatermark()
 	require.NoError(t, err)
 
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":22,\"LowerBound\":{\"Value\": [\"584\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"606\"],\"Inclusive\":false}}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":22,\"LowerBound\":{\"Value\": [\"584\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"606\"],\"Inclusive\":false},\"RowsCopied\":35}", watermark)
 
 	// Start everything over again as t2.
 	t2 := newTableInfo4Test("test", "t1")
@@ -401,8 +401,122 @@ func TestOptimisticResumeProgressAccounting(t *testing.T) {
 	require.Less(t, pct, 10.0)
 }
 
+// newOptimisticChunker4Test returns a chunker over a table the optimistic
+// chunker accepts -- a single auto-increment bigint key over a 1..1000000 key
+// space -- with dynamic chunking off so chunk boundaries are predictable.
+func newOptimisticChunker4Test(t *testing.T) (*TableInfo, *chunkerOptimistic) {
+	t.Helper()
+	ti := newTableInfo4Test("test", "t1")
+	ti.minValue = Datum{Val: int64(1), Tp: signedType}
+	ti.maxValue = Datum{Val: int64(1000000), Tp: signedType}
+	ti.EstimatedRows = 1000000
+	ti.KeyColumns = []string{"id"}
+	ti.keyColumnsMySQLTp = []string{"bigint"}
+	ti.keyDatums = []datumTp{signedType}
+	ti.KeyIsAutoInc = true
+	ti.Columns = []string{"id", "name"}
+	ti.columnsMySQLTps = map[string]string{"id": "bigint"}
+	require.NoError(t, ti.PrimaryKeyIsMemoryComparable())
+
+	chunker := &chunkerOptimistic{
+		Ti:                ti,
+		dynamicChunkSizer: dynamicChunkSizer{ChunkerTarget: ChunkerDefaultTarget},
+		watermarkTracker:  watermarkTracker{lowerBoundWatermarkMap: make(map[string]*Chunk)},
+		logger:            slog.Default(),
+	}
+	chunker.SetDynamicChunking(false)
+	return ti, chunker
+}
+
+// A copy that stops and resumes reports the rows settled by every run that
+// contributed to it, not just the rows the resumed chunker itself saw. The
+// count is a real row count, so unlike the progress percentage it cannot be
+// re-derived from the key space on resume -- it has to travel in the
+// watermark.
+func TestOptimisticWatermarkCarriesRowsCopied(t *testing.T) {
+	_, chunker := newOptimisticChunker4Test(t)
+	require.NoError(t, chunker.Open())
+
+	// Copy three chunks. The key space is 1000 keys per chunk but the rows
+	// actually settled are far fewer, which is the whole reason the two
+	// counters are distinct.
+	const settledPerChunk = 137
+	for range 3 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunker.Feedback(chunk, time.Second, settledPerChunk)
+	}
+	require.Equal(t, uint64(3*settledPerChunk), chunker.RowsCopied())
+
+	watermark, err := chunker.GetLowWatermark()
+	require.NoError(t, err)
+
+	// Resume in a fresh chunker, as a restarted copy does.
+	_, resumed := newOptimisticChunker4Test(t)
+	require.NoError(t, resumed.OpenAtWatermark(watermark))
+
+	// The checkpoint records the count as it stood when the checkpoint was
+	// written, so the resumed run starts from everything settled up to that
+	// point rather than from zero.
+	require.Equal(t, uint64(3*settledPerChunk), resumed.RowsCopied())
+
+	// And the resumed run adds to that total rather than restarting it.
+	chunk, err := resumed.Next()
+	require.NoError(t, err)
+	resumed.Feedback(chunk, time.Second, settledPerChunk)
+	require.Equal(t, uint64(4*settledPerChunk), resumed.RowsCopied())
+}
+
+// A watermark written before the count was persisted carries only the bounds.
+// It still resumes from the right key, and reports the count it has always
+// reported: only what this run settles.
+func TestOptimisticWatermarkWithoutRowsCopied(t *testing.T) {
+	_, chunker := newOptimisticChunker4Test(t)
+
+	watermark := `{"Key":["id"],"ChunkSize":1000,"LowerBound":{"Value":["3001"],"Inclusive":true},"UpperBound":{"Value":["4001"],"Inclusive":false}}`
+	require.NoError(t, chunker.OpenAtWatermark(watermark))
+
+	require.Zero(t, chunker.RowsCopied())
+	chunk, err := chunker.Next()
+	require.NoError(t, err)
+	require.Equal(t, "3001", chunk.LowerBound.Value[0].String())
+}
+
+// The count sits alongside the chunk's own fields rather than wrapping them,
+// so the watermark is still a plain chunk to every reader -- including a
+// reader that predates the count and knows nothing about it.
+func TestOptimisticWatermarkIsAPlainChunk(t *testing.T) {
+	t1, chunker := newOptimisticChunker4Test(t)
+	require.NoError(t, chunker.Open())
+
+	for range 3 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunker.Feedback(chunk, time.Second, 137)
+	}
+	watermark, err := chunker.GetLowWatermark()
+	require.NoError(t, err)
+	require.Positive(t, chunker.RowsCopied())
+
+	// The chunk parser reads it directly: no envelope to unwrap.
+	chunk, err := newChunkFromJSON(t1, watermark)
+	require.NoError(t, err)
+	require.Equal(t, []string{"id"}, chunk.Key)
+	require.Equal(t, "1001", chunk.LowerBound.Value[0].String())
+
+	// So do the watermark helpers the copier and the move path use to find the
+	// range a resume re-copies.
+	clause, err := WatermarkRecopyClause(t1, watermark)
+	require.NoError(t, err)
+	require.Equal(t, "`id` >= 1001", clause)
+
+	perTable, err := WatermarkPerTable(watermark, t1)
+	require.NoError(t, err)
+	require.Equal(t, watermark, perTable[t1.QualifiedName()])
+}
+
 func TestOptimisticPrefetchChunking(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -450,12 +564,53 @@ func TestOptimisticPrefetchChunking(t *testing.T) {
 	require.NoError(t, chunker.Open())
 	require.False(t, chunker.chunkPrefetchingEnabled)
 
+	// Feed back the REAL row count for each chunk, not a placeholder: that is
+	// what the prefetch entry gate reads, so a hardcoded value would make this
+	// test pass without saying anything about a 300B gap. Cost the chunk in
+	// proportion to the rows it really held, the way the checksum's server-side
+	// CRC does.
+	episodes, prefetchChunks, chunks := 0, 0, 0
+	wasPrefetching := false
 	for !chunker.finalChunkSent {
 		chunk, err := chunker.Next()
 		require.NoError(t, err)
-		chunker.Feedback(chunk, 100*time.Millisecond, 1) // way too short.
+		chunks++
+		if wasPrefetching {
+			prefetchChunks++
+		}
+		if chunker.chunkPrefetchingEnabled && !wasPrefetching {
+			episodes++
+		}
+		wasPrefetching = chunker.chunkPrefetchingEnabled
+
+		var rows uint64
+		countQuery := "SELECT COUNT(*) FROM tprefetch WHERE " + chunk.String()
+		require.NoError(t, db.QueryRowContext(t.Context(), countQuery).Scan(&rows))
+		chunker.Feedback(chunk, time.Duration(rows)*8*time.Microsecond, rows)
 	}
 	require.True(t, chunker.chunkPrefetchingEnabled)
+
+	// One prefetch episode per gap in the fixture (300B, 600B, 900B), each
+	// entered off measured emptiness rather than off a cheap chunk.
+	require.Equal(t, 3, episodes)
+	require.Positive(t, prefetchChunks)
+
+	// The gap crossings are real crossings, not entry/exit flaps, so none of
+	// them counted against the rejection backstop.
+	require.Zero(t, chunker.prefetchRejections)
+
+	// And the whole table is covered in fewer chunks than the flapping chunker
+	// needed (430 on this fixture), because an episode no longer ends with a
+	// reset to StartingChunkSize.
+	//
+	// The margin here is deliberately modest. On a gapped table the restore is
+	// the last size proven against real rows, which for this fixture is earned
+	// on the 11k-row dense prefix and so is small — resuming at the ceiling the
+	// *empty* gap chunks bought would cover the table in ~192 chunks but would
+	// hand the buffered copier an unmeasured 100k-row read (see
+	// TestOptimisticPrefetchRestoreIsMeasured). This bound is here to catch a
+	// regression back to per-episode re-ramping, not to pin a golden number.
+	require.Less(t, chunks, 400, "prefetch episodes must not each cost a full re-ramp")
 }
 
 func TestOptimisticChunkerReset(t *testing.T) {
@@ -605,7 +760,7 @@ func TestOptimisticChunkerPrefetchReservedWord(t *testing.T) {
 		") ENGINE=InnoDB")
 	testutils.RunSQL(t, "INSERT INTO reserved_word_optimistic_t1 (v) VALUES ('a'),('b'),('c'),('d'),('e')")
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -645,7 +800,7 @@ func TestOptimisticChunkerReservedWordTableName(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO `order` (v) VALUES ('a'),('b'),('c'),('d'),('e')")
 	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS `order`") })
 
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -677,4 +832,295 @@ func TestOptimisticChunkerReservedWordTableName(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, opt.Close())
+}
+
+// denseChunkerForTest returns an optimistic chunker over a synthetic table with
+// a wide, gap-free BIGINT key space, using the time signal and the production
+// chunk time target.
+func denseChunkerForTest(t *testing.T) *chunkerOptimistic {
+	t.Helper()
+	ti := &TableInfo{
+		minValue:          Datum{Val: int64(1), Tp: signedType},
+		maxValue:          Datum{Val: int64(1_000_000_000), Tp: signedType},
+		EstimatedRows:     1_000_000_000,
+		SchemaName:        "test",
+		TableName:         "dense",
+		QuotedTableName:   "`dense`",
+		KeyColumns:        []string{"id"},
+		keyColumnsMySQLTp: []string{"bigint"},
+		keyDatums:         []datumTp{signedType},
+		KeyIsAutoInc:      true,
+		Columns:           []string{"id", "name"},
+	}
+	ti.statisticsLastUpdated = time.Now()
+	chunker := &chunkerOptimistic{
+		Ti:                ti,
+		dynamicChunkSizer: dynamicChunkSizer{ChunkerTarget: ChunkerDefaultTarget},
+		watermarkTracker:  watermarkTracker{lowerBoundWatermarkMap: make(map[string]*Chunk)},
+		logger:            slog.Default(),
+	}
+	chunker.SetDynamicChunking(true)
+	require.NoError(t, chunker.Open())
+	return chunker
+}
+
+// TestOptimisticNoPrefetchOnDenseKeySpace is a regression test for the prefetch
+// flap. On a dense table every healthy chunk satisfies the old prefetch-entry
+// condition — the sizer is pinned at MaxDynamicRowSize and still wants to grow
+// while the p90 sits well inside the chunk time target — because a chunk being
+// cheap says nothing about whether the key space has gaps. That is the normal
+// state of a checksum chunk (a server-side CRC against a 5s budget), so the
+// chunker switched to prefetch, immediately discovered the key space was dense,
+// switched back with the chunk size reset to StartingChunkSize, and had to ramp
+// ~130 chunks back to the ceiling — forever.
+func TestOptimisticNoPrefetchOnDenseKeySpace(t *testing.T) {
+	chunker := denseChunkerForTest(t)
+
+	// Walk the table, feeding back what a dense table really reports: the chunk
+	// covered as many rows as it was wide, and it cost time in proportion to
+	// those rows. 8us/row puts a full 100k-row chunk at 800ms, which is inside
+	// a fifth of the 5s target — the shape observed in production, where a
+	// 100k-row checksum chunk lands either side of 1s.
+	for range 200 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		rows := chunk.ChunkSize
+		chunker.Feedback(chunk, time.Duration(rows)*8*time.Microsecond, rows)
+		require.False(t, chunker.chunkPrefetchingEnabled,
+			"must not switch to prefetch on a gap-free key space")
+	}
+
+	// And having found nothing to slow it down, the sizer should be parked at
+	// the ceiling rather than endlessly re-ramping from StartingChunkSize.
+	require.Equal(t, uint64(MaxDynamicRowSize), chunker.chunkSize)
+}
+
+// TestOptimisticPrefetchRestoresChunkSize covers the other half of the prefetch
+// flap: leaving prefetch mode used to reset the chunk size to
+// StartingChunkSize, so even a legitimate gap crossing was paid for with a
+// ~130-chunk ramp back to the ceiling. Prefetch is only ever entered from the
+// ceiling, so that is the size to come back to.
+func TestOptimisticPrefetchRestoresChunkSize(t *testing.T) {
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS tprefetch_dense`)
+	testutils.RunSQL(t, `CREATE TABLE tprefetch_dense (
+		id BIGINT NOT NULL AUTO_INCREMENT,
+		pad VARCHAR(10) NULL,
+		PRIMARY KEY (id)
+	)`)
+	// ~11K rows with no gaps at all, so the prefetch query's OFFSET lands well
+	// inside MaxDynamicRowSize keys and prefetch is abandoned immediately.
+	testutils.RunSQL(t, `INSERT INTO tprefetch_dense (pad) VALUES (NULL)`)
+	for range 3 {
+		testutils.RunSQL(t, `INSERT INTO tprefetch_dense (pad) SELECT NULL FROM tprefetch_dense a JOIN tprefetch_dense b JOIN tprefetch_dense c`)
+	}
+	testutils.RunSQL(t, `INSERT INTO tprefetch_dense (pad) SELECT NULL FROM tprefetch_dense a JOIN tprefetch_dense b LIMIT 10000`)
+
+	t1 := newTableInfo4Test("test", "tprefetch_dense")
+	t1.db = db
+	require.NoError(t, t1.SetInfo(t.Context()))
+	chunker := &chunkerOptimistic{
+		Ti:                t1,
+		dynamicChunkSizer: dynamicChunkSizer{ChunkerTarget: ChunkerDefaultTarget},
+		watermarkTracker:  watermarkTracker{lowerBoundWatermarkMap: make(map[string]*Chunk)},
+		logger:            slog.Default(),
+	}
+	chunker.SetDynamicChunking(true)
+	require.NoError(t, chunker.Open())
+
+	// Prove a chunk size against real rows first — only a measured size is
+	// eligible to be restored (see prePrefetchChunkSize).
+	chunker.chunkSize = MaxDynamicRowSize
+	proven := &Chunk{
+		ChunkSize:  MaxDynamicRowSize,
+		Key:        t1.KeyColumns,
+		LowerBound: &Boundary{[]Datum{{Val: int64(1), Tp: signedType}}, true},
+		UpperBound: &Boundary{[]Datum{{Val: int64(1 + MaxDynamicRowSize), Tp: signedType}}, false},
+		Table:      t1,
+	}
+	chunker.Feedback(proven, time.Second, MaxDynamicRowSize)
+	require.Equal(t, uint64(MaxDynamicRowSize), chunker.lastDenseChunkSize)
+
+	// Enter prefetch the way the sizer does, from the ceiling.
+	chunker.chunkSize = MaxDynamicRowSize
+	chunker.switchToPrefetch()
+	require.True(t, chunker.chunkPrefetchingEnabled)
+	require.Equal(t, uint64(StartingChunkSize), chunker.chunkSize)
+
+	// One prefetch chunk is enough to discover the key space is dense.
+	chunker.chunkPtr = Datum{Val: int64(1), Tp: signedType}
+	chunk, err := chunker.nextChunkByPrefetching()
+	require.NoError(t, err)
+	require.False(t, chunker.chunkPrefetchingEnabled)
+	require.Equal(t, uint64(MaxDynamicRowSize), chunker.chunkSize,
+		"leaving prefetch must restore the measured chunk size, not ramp from scratch")
+
+	// The chunk that triggered the exit is labelled with the offset that built
+	// it, not with the size the next chunk will use.
+	require.Equal(t, uint64(StartingChunkSize), chunk.ChunkSize)
+
+	// The episode was abandoned on its first chunk, so it counts as a
+	// rejection, and re-entry is closed until fresh density evidence has
+	// accumulated under the restored chunk size.
+	require.Equal(t, 1, chunker.prefetchRejections)
+	require.False(t, chunker.prefetchWouldHelp(MaxDynamicRowSize+1))
+
+	// After maxPrefetchRejections the chunker stops trying at all, so the log
+	// stays quiet even on a table that sits on the boundary between the entry
+	// gate and prefetch's own exit test.
+	chunker.prefetchRejections = maxPrefetchRejections
+	for range keySpaceDensityWindow {
+		chunker.keyDensity.record(MaxDynamicRowSize, 0) // as sparse as it gets
+	}
+	require.True(t, chunker.keyDensity.sparse())
+	require.False(t, chunker.prefetchWouldHelp(MaxDynamicRowSize+1))
+}
+
+// TestOptimisticPrefetchRestoreIsMeasured covers the memory bound on the
+// restore. Reaching MaxDynamicRowSize is not evidence the table can sustain
+// 100k-row chunks: over a gap the chunks are empty, and empty chunks are
+// exactly what drive the size to the ceiling (a zero-byte p90 deliberately
+// returns a target above it so prefetch can fire). Restoring the entry-time
+// size would therefore hand the buffered copier a 100k-row read on a table of
+// 16KB rows — ~1.6GB per worker — before any ActualBytes feedback could shrink
+// it. The restore must be a size real rows were measured under.
+func TestOptimisticPrefetchRestoreIsMeasured(t *testing.T) {
+	chunker := denseChunkerForTest(t)
+	chunker.TargetChunkBytes = DefaultTargetChunkBytes // buffered copier: byte signal
+
+	const wideRowBytes = 16 * 1024 // 16KB rows: ~1000 of them fill the budget
+
+	// Phase 1: wide rows. The sizer settles on a row count that fits the byte
+	// budget, and every one of those chunks is validated against real rows.
+	for range 60 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunk.SourceRows = chunk.ChunkSize
+		chunk.ActualBytes = chunk.ChunkSize * wideRowBytes
+		chunker.Feedback(chunk, time.Millisecond, chunk.ChunkSize)
+	}
+	measured := chunker.lastDenseChunkSize
+	require.NotZero(t, measured)
+	require.Less(t, measured, uint64(MaxDynamicRowSize),
+		"16KB rows cannot fit the byte budget at the row ceiling")
+
+	// Phase 2: a large empty gap. Zero-byte chunks walk the row target up to the
+	// ceiling and the density window fills with genuine emptiness, so prefetch
+	// legitimately engages.
+	for range 400 {
+		if chunker.chunkPrefetchingEnabled {
+			break
+		}
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunk.SourceRows = 0
+		chunk.ActualBytes = 0
+		chunker.Feedback(chunk, time.Microsecond, 0)
+	}
+	// Entry implies the gap carried the row target to the ceiling — that is a
+	// precondition in prefetchWouldHelp — and switchToPrefetch has since reset
+	// the live size to the prefetch offset, so the ceiling is not observable
+	// here. What matters is what the episode will restore.
+	require.True(t, chunker.chunkPrefetchingEnabled, "a real gap must still engage prefetch")
+
+	// It restores the wide-row size measured before the gap, not the ceiling the
+	// empty chunks bought.
+	require.Equal(t, measured, chunker.prePrefetchChunkSize)
+	require.Less(t, chunker.prePrefetchChunkSize, uint64(MaxDynamicRowSize))
+}
+
+// TestOptimisticPrefetchRestoreIgnoresSparseChunks is the same memory bound as
+// TestOptimisticPrefetchRestoreIsMeasured over the gap that is sparse rather
+// than empty — the case a `rows > 0` test for "was this size measured?" lets
+// through.
+//
+// A chunk holding a handful of rows across its whole width measures the cost of
+// those few rows, not of a full chunk of that size. And thinly-populated chunks
+// are precisely what carry the sizer to the ceiling, so accepting them records
+// the ceiling as measured from the very evidence that makes prefetch fire: one
+// row per chunk is enough to "prove" a 100k-row chunk no full chunk was ever
+// read at. The restore then hands the buffered copier the ~1.6GB read that
+// prePrefetchChunkSize exists to prevent.
+func TestOptimisticPrefetchRestoreIgnoresSparseChunks(t *testing.T) {
+	chunker := denseChunkerForTest(t)
+	chunker.TargetChunkBytes = DefaultTargetChunkBytes // buffered copier: byte signal
+
+	const wideRowBytes = 16 * 1024 // 16KB rows: ~1000 of them fill the budget
+
+	// Phase 1: full chunks of wide rows, as in the empty-gap case.
+	for range 60 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunk.SourceRows = chunk.ChunkSize
+		chunk.ActualBytes = chunk.ChunkSize * wideRowBytes
+		chunker.Feedback(chunk, time.Millisecond, chunk.ChunkSize)
+	}
+	measured := chunker.lastDenseChunkSize
+	require.NotZero(t, measured)
+	require.Less(t, measured, uint64(MaxDynamicRowSize))
+
+	// Phase 2: a sparse gap. Every chunk carries a few real rows no matter how
+	// wide it gets, so it stays far enough under the byte budget to keep the
+	// sizer growing and to pass the entry gate, while the density window sees
+	// well over minKeysPerRowForPrefetch keys per row.
+	const sparseRows = 150
+	require.Less(t, uint64(sparseRows*wideRowBytes)*5, uint64(DefaultTargetChunkBytes),
+		"a sparse chunk has to stay under the prefetch entry gate")
+	for range 400 {
+		if chunker.chunkPrefetchingEnabled {
+			break
+		}
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunk.SourceRows = sparseRows
+		chunk.ActualBytes = sparseRows * wideRowBytes
+		chunker.Feedback(chunk, time.Millisecond, sparseRows)
+	}
+	require.True(t, chunker.chunkPrefetchingEnabled, "a sparse gap must still engage prefetch")
+
+	// The sparse chunks are not evidence of anything the copier can afford, so
+	// the restore is still the size phase 1 measured.
+	require.Equal(t, measured, chunker.prePrefetchChunkSize,
+		"a chunk that came back nearly empty must not count as a measured size")
+	require.LessOrEqual(t, chunker.prePrefetchChunkSize*wideRowBytes,
+		uint64(DefaultTargetChunkBytes),
+		"the restored size must fit the byte budget it was measured against")
+}
+
+// TestOptimisticPrefetchDensityUsesSourceRows covers the other half of the
+// signal's fidelity. On the copy path the row count reaching Feedback is the
+// applier's affected-row count from `INSERT IGNORE`, which does not count a row
+// the binlog applier already wrote to the new table. In an insert-hot tail every
+// row of a chunk can already be present, so affectedRows is 0 on a fully dense
+// chunk — which would read as a gap and enter prefetch on dense data. The
+// producer's own count of rows read takes precedence.
+func TestOptimisticPrefetchDensityUsesSourceRows(t *testing.T) {
+	chunker := denseChunkerForTest(t)
+
+	for range 200 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		// Dense chunk, but the binlog applier got there first: nothing was
+		// newly inserted, so INSERT IGNORE reports zero affected rows.
+		chunk.SourceRows = chunk.ChunkSize
+		chunker.Feedback(chunk, time.Duration(chunk.ChunkSize)*8*time.Microsecond, 0)
+		require.False(t, chunker.chunkPrefetchingEnabled,
+			"rows already written by the binlog applier are not a gap")
+	}
+	require.Equal(t, uint64(MaxDynamicRowSize), chunker.chunkSize)
+
+	// Sanity check the fixture really is the dangerous one: with only the
+	// affected-row count to go on, the same chunks read as pure gap.
+	var affectedOnly keySpaceDensity
+	for range keySpaceDensityWindow {
+		affectedOnly.record(MaxDynamicRowSize, 0)
+	}
+	require.True(t, affectedOnly.sparse())
 }

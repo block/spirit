@@ -6,8 +6,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
 )
 
 func init() {
@@ -229,7 +229,7 @@ func (l *PrimaryKeyLinter) checkColumnType(tableName string, column *statement.C
 			Table:  tableName,
 			Column: &column.Name,
 		},
-		Suggestion: new(fmt.Sprintf("Change column %q to a supported column type (%s)", column.Name, strings.Join(keys, ","))),
+		Suggestion: new(fmt.Sprintf("Change column %q to a supported column type (%s)", column.Name, quoteJoin(keys))),
 		Context: map[string]any{
 			"current_type": column.Type,
 		},

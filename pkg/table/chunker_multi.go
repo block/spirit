@@ -184,6 +184,16 @@ func (m *multiChunker) Feedback(chunk *Chunk, duration time.Duration, actualRows
 }
 
 // Progress returns aggregate progress across all chunkers
+func (m *multiChunker) RowsCopied() uint64 {
+	m.Lock()
+	defer m.Unlock()
+	var total uint64
+	for _, chunker := range m.chunkers {
+		total += chunker.RowsCopied()
+	}
+	return total
+}
+
 func (m *multiChunker) Progress() (uint64, uint64, uint64) {
 	m.Lock()
 	defer m.Unlock()
@@ -203,8 +213,8 @@ func (m *multiChunker) Progress() (uint64, uint64, uint64) {
 // TableProgress contains progress information for a single table
 type TableProgress struct {
 	TableName  string
-	RowsCopied uint64
-	RowsTotal  uint64
+	RowsCopied uint64 // Actual settled rows; see Chunker.RowsCopied for resume semantics.
+	RowsTotal  uint64 // Estimated table cardinality, not keyspace size.
 	IsComplete bool
 }
 
@@ -216,7 +226,7 @@ func (m *multiChunker) PerTableProgress() []TableProgress {
 
 	result := make([]TableProgress, 0, len(m.chunkers))
 	for tableName, chunker := range m.chunkers {
-		rowsCopied, _, rowsExpected := chunker.Progress()
+		rowsCopied, rowsExpected := CopyRowCounts(chunker)
 		result = append(result, TableProgress{
 			TableName:  tableName,
 			RowsCopied: rowsCopied,

@@ -2,7 +2,7 @@
 
 Spirit automatically checkpoints progress during a migration, allowing it to resume from where it left off if the process is killed or restarted. This is useful for long-running migrations on large tables, where restarting from scratch would be expensive.
 
-As noted in the [threads](../docs/migrate.md#threads) and [target-chunk-time](../docs/migrate.md#target-chunk-time) documentation, the recommended way to adjust these settings mid-migration is to kill the Spirit process and restart it with new values. Spirit will resume from the checkpoint automatically.
+As noted in the [threads](../docs/migrate.md#threads) and [target-chunk-size](../docs/migrate.md#target-chunk-size) documentation, the recommended way to adjust these settings mid-migration is to kill the Spirit process and restart it with new values. Spirit will resume from the checkpoint automatically.
 
 ## How checkpointing works
 

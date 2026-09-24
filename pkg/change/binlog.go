@@ -64,9 +64,43 @@ type binlogClient struct {
 	ddlFilterSchema  string
 	ddlFilterTables  map[string]struct{}
 
+	// stopped is set once by Stop and read by the stream reader on every event
+	// it would otherwise deliver. Atomic because the two are different
+	// goroutines. Distinct from isClosed, which tears the reader down.
+	stopped atomic.Bool
+
 	serverID    uint32         // server ID for the binlog reader
 	bufferedPos mysql.Position // buffered position
 	flushedPos  mysql.Position // safely written to new table
+
+	// flushResidual is the pending-change count observed at the end of the
+	// most recent flush, and flushCount how many flushes have completed. Both
+	// guarded by mu. See Source.FlushResidual.
+	flushResidual int
+	flushCount    int
+
+	// lastFlush* describe the most recently completed flush, for FeedStats.
+	// Guarded by mu. Recorded for every flush, not just the periodic one, so
+	// the status block's "flushed X ago" answers "when did the position last
+	// advance?" rather than "when did the ticker last fire?".
+	lastFlushAt       time.Time
+	lastFlushDuration time.Duration
+	lastFlushRows     int
+	// lastFlushComplete is that flush's allChangesFlushed result: whether
+	// every subscription drained everything it held. Flush reads it, alongside
+	// each subscription's LastDrainHitBudget, to tell a backlog it can work
+	// through from one it cannot — see backlogWorthDraining.
+	lastFlushComplete bool
+
+	// rotations counts binlog rotations followed by the reader. See
+	// FeedStats.Rotations.
+	rotations atomic.Int64
+
+	// lastEventTime is the source's own wall-clock timestamp on the newest
+	// binlog event the reader has seen, as unix seconds. Written by
+	// recordEventTime from the read loop, read back by eventTime; see
+	// FeedStats.BufferedEventAt.
+	lastEventTime atomic.Int64
 
 	// periodicFlushLock protects the cancel/done pair below. The cancel
 	// signals the periodic-flush goroutine to exit; the done channel is
@@ -89,7 +123,36 @@ type binlogClient struct {
 	// cap. See DefaultSubscriptionSoftLimitBytes.
 	subscriptionSoftLimitBytes int64
 
-	flushedBinlogs atomic.Int64 // for testing binlog flushing frequency
+	// subscriptionSoftLimitChanges is the per-subscription change-count
+	// cap, applied alongside the byte cap. Zero disables it. See
+	// DefaultSubscriptionSoftLimitChanges.
+	subscriptionSoftLimitChanges int
+
+	// flushConcurrency is the map-mode flush batch concurrency passed
+	// to each subscription on construction. See DefaultFlushConcurrency.
+	flushConcurrency int
+
+	// batchSize is the map-mode flush batch size passed to each
+	// subscription on construction. It travels with flushConcurrency:
+	// the two together set the rows a drain has in flight. See
+	// DefaultBatchSize.
+	batchSize int
+
+	// underLoad is ClientConfig.UnderLoad, handed to every subscription so the
+	// drain can narrow itself when the target is loaded. Nil disables it.
+	underLoad func() bool
+
+	// flushRequests receives the subscription that parked on its soft
+	// memory limit. runPeriodicFlush selects on it and flushes that
+	// subscription first — the all-subscription pass visits the
+	// registry in nondeterministic order, and draining another
+	// saturated subscription first would leave the binlog reader parked
+	// for that entire drain. Buffered (cap 1); only one subscription
+	// can be parked at a time (the single reader goroutine is what
+	// parks), so requests never queue behind each other.
+	flushRequests chan Subscription
+
+	flushedBinlogs atomic.Int64 // stall-triggered rotations reported as FeedStats.ForcedRotations
 }
 
 // NewBinlogClient constructs the binlog-backed change.Source. The
@@ -106,20 +169,31 @@ func NewBinlogClient(db *sql.DB, host string, username, password string, appl ap
 	} else if softLimit < 0 {
 		softLimit = 0 // explicit opt-out
 	}
+	softLimitChanges := config.SubscriptionSoftLimitChanges
+	if softLimitChanges == 0 {
+		softLimitChanges = DefaultSubscriptionSoftLimitChanges
+	} else if softLimitChanges < 0 {
+		softLimitChanges = 0 // explicit opt-out
+	}
 	return &binlogClient{
-		db:                         db,
-		dbConfig:                   config.DBConfig,
-		host:                       host,
-		username:                   username,
-		password:                   password,
-		logger:                     config.Logger,
-		subs:                       newSubscriptionRegistry(),
-		callerCancelFunc:           config.CancelFunc,
-		ddlFilterSchema:            config.DDLFilterSchema,
-		ddlFilterTables:            toSet(config.DDLFilterTables),
-		serverID:                   config.ServerID,
-		applier:                    appl,
-		subscriptionSoftLimitBytes: softLimit,
+		db:                           db,
+		dbConfig:                     config.DBConfig,
+		host:                         host,
+		username:                     username,
+		password:                     password,
+		logger:                       config.Logger,
+		subs:                         newSubscriptionRegistry(),
+		callerCancelFunc:             config.CancelFunc,
+		ddlFilterSchema:              config.DDLFilterSchema,
+		ddlFilterTables:              toSet(config.DDLFilterTables),
+		serverID:                     config.ServerID,
+		applier:                      appl,
+		subscriptionSoftLimitBytes:   softLimit,
+		subscriptionSoftLimitChanges: softLimitChanges,
+		flushConcurrency:             config.resolveFlushConcurrency(),
+		batchSize:                    config.resolveBatchSize(),
+		underLoad:                    config.UnderLoad,
+		flushRequests:                make(chan Subscription, 1),
 	}
 }
 
@@ -136,12 +210,17 @@ func (c *binlogClient) AddSubscription(currentTable, newTable *table.TableInfo, 
 	// like a FIFO queue, which is required because of collation edge cases
 	// (A == a on the server, but not in our map).
 	sub, err := NewBufferedSubscription(BufferedSubscriptionConfig{
-		CurrentTable:   currentTable,
-		NewTable:       newTable,
-		Applier:        c.applier,
-		Chunker:        chunker,
-		Logger:         c.logger,
-		SoftLimitBytes: c.subscriptionSoftLimitBytes,
+		CurrentTable:     currentTable,
+		NewTable:         newTable,
+		Applier:          c.applier,
+		Chunker:          chunker,
+		Logger:           c.logger,
+		SoftLimitBytes:   c.subscriptionSoftLimitBytes,
+		SoftLimitChanges: c.subscriptionSoftLimitChanges,
+		FlushRequest:     c.flushRequests,
+		FlushConcurrency: c.flushConcurrency,
+		BatchSize:        c.batchSize,
+		UnderLoad:        c.underLoad,
 	})
 	if err != nil {
 		return fmt.Errorf("could not build subscription for table %s.%s: %w", currentTable.SchemaName, currentTable.TableName, err)
@@ -236,9 +315,10 @@ func (c *binlogClient) StartFromPosition(ctx context.Context, pos string) error 
 		return errors.New("StartFromPosition: empty position; use Start instead for a fresh start")
 	}
 	// Parse failures are wrapped with ErrPositionNotFound, mirroring the
-	// GTID client: an unparseable position (e.g. a GTID-set checkpoint from
-	// a --gtid run) can never become resumable by retrying, so callers
-	// should treat it the same as a purged binlog and start fresh.
+	// GTID client: an unparseable position (e.g. a GTID-set checkpoint fed
+	// to this client directly, bypassing NewAutoClient's classification)
+	// can never become resumable by retrying, so callers should treat it
+	// the same as a purged binlog and start fresh.
 	parsed, err := parseBinlogPositionString(pos)
 	if err != nil {
 		return fmt.Errorf("%w: StartFromPosition: %w", ErrPositionNotFound, err)
@@ -312,6 +392,52 @@ func (c *binlogClient) CurrentPosition(ctx context.Context) (string, error) {
 	return formatBinlogPosition(pos), nil
 }
 
+// newRowsEventDecodeFunc returns the RowsEventDecodeFunc both clients install
+// on their syncer: decode a rows event's header (cheap — fixed-size fields and
+// a table-map lookup that resolves the schema/table name), then skip decoding
+// the row images entirely unless the table has a subscription.
+//
+// This is where most of the stream's volume goes during a migration: spirit's
+// own INSERTs into the _new table dominate the binlog while the copy runs, and
+// every one of them used to be fully decoded — every column of every row,
+// including JSON rendering — only for processRowsEvent to drop the event by
+// table name. On a fast copy the stream cannot keep up, and the gap is repaid
+// after the copy as a long catch-up phase that is ~all no-ops. Skipping the
+// row-image decode leaves header parsing and network transfer as the only
+// per-event costs for unsubscribed tables. (canal's table filter uses the
+// same hook for the same reason.)
+//
+// Correctness leans on the Source lifecycle (construct → AddSubscription* →
+// Start): the subscription set is complete before the first event is decoded,
+// so a decode-time check is equivalent to processRowsEvent's consumption-time
+// check, just earlier. processRowsEvent enforces this with a hard error if a
+// subscribed table's event arrives undecoded (Rows == nil — DecodeData always
+// allocates, so nil is unambiguous). Skipped events still advance the stream
+// position: the header, including LogPos, is parsed as usual.
+//
+// The stopped flag extends the same shortcut past cutover: Stop() means no
+// subscription's TableInfo is valid anymore and processRowsEvent drops
+// everything, so there is nothing worth decoding.
+//
+// The registry has its own lock (this runs on the syncer's parse goroutine,
+// not readStream). A DecodeHeader error is returned unchanged — the default
+// Decode path would surface the identical error.
+func newRowsEventDecodeFunc(subs *subscriptionRegistry, stopped *atomic.Bool) func(*replication.RowsEvent, []byte) error {
+	return func(e *replication.RowsEvent, data []byte) error {
+		pos, err := e.DecodeHeader(data)
+		if err != nil {
+			return err
+		}
+		if stopped.Load() {
+			return nil
+		}
+		if _, ok := subs.Get(encodeSchemaTable(string(e.Table.Schema), string(e.Table.Table))); !ok {
+			return nil // no subscription: leave e.Rows nil, the row images are never read
+		}
+		return e.DecodeData(pos, data)
+	}
+}
+
 // buildSyncerConfig returns the BinlogSyncerConfig used by Start. Split
 // out (mirroring gtidClient.buildSyncerConfig) so tests can assert the
 // decode options below stay in sync between the two clients.
@@ -323,7 +449,10 @@ func (c *binlogClient) buildSyncerConfig(host string, port uint16) replication.B
 		Port:     port,
 		User:     c.username,
 		Password: c.password,
-		Logger:   c.logger,
+		// Wrapped so go-mysql's per-rotation INFO line does not dominate the
+		// log; we report rotations on the status block instead. See
+		// syncerQuietMessages.
+		Logger: newDemotingLogger(c.logger, syncerQuietMessages),
 		// Render JSON columns directly from the JSONB byte stream in the
 		// same textual form MySQL produces from SELECT json_col. The
 		// default decoder goes through Go intermediate values + json.Marshal
@@ -344,6 +473,10 @@ func (c *binlogClient) buildSyncerConfig(host string, port uint16) replication.B
 		// UTC. Pinning the decoder to UTC keeps the binlog replay path
 		// consistent with the UTC-pinned copier connections.
 		TimestampStringLocation: time.UTC,
+		// Decode row images only for subscribed tables. During the copy the
+		// binlog is dominated by spirit's own writes to the _new table; see
+		// newRowsEventDecodeFunc.
+		RowsEventDecodeFunc: newRowsEventDecodeFunc(c.subs, &c.stopped),
 	}
 }
 
@@ -599,10 +732,23 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		// Stamp before the switch, not inside it: RotateEvent `continue`s out
+		// below, and one call site per client is what keeps the two clients
+		// from drifting on this. The published position is at most one
+		// transaction behind the event stamped here.
+		recordEventTime(&c.lastEventTime, ev.Header.Timestamp)
 		// Handle the event.
 		switch event := ev.Event.(type) {
 		case *replication.RotateEvent:
 			// Rotate event, update the current log name.
+			// Count only real rotations: the server sends the rotate event
+			// from the binlog followed by an artificial one carrying the
+			// same position, and recreateStreamer re-opens the current file
+			// with another synthetic rotate. Comparing against the file we
+			// are already reading collapses all of those to one count.
+			if string(event.NextLogName) != currentLogName {
+				c.rotations.Add(1)
+			}
 			currentLogName = string(event.NextLogName)
 			// For RotateEvent, we must use event.Position (the position in the NEW log)
 			// not ev.Header.LogPos (which is the position in the OLD log).
@@ -644,11 +790,11 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			}
 			// Query event, check if it is a DDL statement,
 			// in which case we need to notify the caller.
-			ddlTables, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
+			ddlTables, _, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
 			if err != nil {
-				// The parser does not understand all syntax.
-				// For example, it won't parse [CREATE|DROP] TRIGGER statements *or*
-				// ALTER USER x IDENTIFIED WITH x RETAIN CURRENT PASSWORD
+				// The parser does not understand all syntax — the
+				// remaining classes are mode-dependent SQL (ANSI_QUOTES
+				// quoting) and syntax newer than the grammar.
 				// This behavior is copied from canal:
 				// https://github.com/go-mysql-org/go-mysql/blob/ee9447d96b48783abb05ab76a12501e5f1161e47/canal/sync.go#L144C1-L150C1
 				// We can't print the statement because it could contain user-data.
@@ -738,6 +884,11 @@ func (c *binlogClient) readStream(ctx context.Context) {
 // specific tables within the schema triggers cancellation — this is used for partial
 // moves where only a subset of tables from a schema are being moved.
 func (c *binlogClient) processDDLNotification(schema, table string) {
+	if c.stopped.Load() {
+		// Post-cutover, where spirit's own RENAME TABLE is the DDL we would
+		// otherwise be reporting on ourselves. See Source.Stop.
+		return
+	}
 	if c.ddlFilterSchema != "" {
 		// Schema-level filtering: cancel on DDL in the specified schema.
 		if schema != c.ddlFilterSchema {
@@ -798,10 +949,26 @@ func (c *binlogClient) processDDLNotification(schema, table string) {
 // works the same way for all event types and no reconstruction is needed.
 // If a MINIMAL image slips through we error out.
 func (c *binlogClient) processRowsEvent(ev *replication.BinlogEvent, e *replication.RowsEvent) error {
+	if c.stopped.Load() {
+		// Post-cutover. The subscription's TableInfo no longer describes the
+		// table this event's name resolves to, so decoding it would fail on a
+		// row image that is perfectly valid for the table that produced it.
+		// See Source.Stop.
+		return nil
+	}
 	subName := encodeSchemaTable(string(e.Table.Schema), string(e.Table.Table))
 	sub, ok := c.subs.Get(subName)
 	if !ok {
 		return nil // ignore event, it could be to a _new table.
+	}
+	if e.Rows == nil {
+		// The decode-time filter (newRowsEventDecodeFunc) skipped this event's
+		// row images because the table had no subscription when the event was
+		// parsed — yet one exists now. That means AddSubscription was called
+		// after Start, violating the Source lifecycle, and silently treating
+		// the event as empty would lose rows. DecodeData always allocates
+		// e.Rows, so nil cannot be a legitimately decoded event.
+		return fmt.Errorf("rows event for subscribed table %s arrived with undecoded rows: subscriptions must be added before Start (see Source lifecycle)", subName)
 	}
 
 	if isMinimalRowImage(e) {
@@ -910,7 +1077,7 @@ func (c *binlogClient) processTransactionPayload(e *replication.TransactionPaylo
 			// Usually the transaction's BEGIN, which parses cleanly and
 			// yields no DDL tables. Unparseable statements are skipped the
 			// same way readStream skips them.
-			ddlTables, err := extractTablesFromDDLStmts(string(innerEvent.Schema), string(innerEvent.Query))
+			ddlTables, _, err := extractTablesFromDDLStmts(string(innerEvent.Schema), string(innerEvent.Query))
 			if err != nil {
 				c.logger.Error("Skipping query inside transaction payload that was unable to parse",
 					"file", payloadPos.Name, "pos", payloadPos.Pos)
@@ -959,6 +1126,16 @@ func (c *binlogClient) fatalError(reason FatalReason) bool {
 	return false
 }
 
+// Stop satisfies Source. The reader goroutine keeps running — Close owns
+// teardown — but stops delivering events to subscriptions, which is what makes
+// it cheap enough to call inside cutover's lock window.
+func (c *binlogClient) Stop() {
+	if c.stopped.Swap(true) {
+		return
+	}
+	c.logger.Debug("change stream stopped; further events will not be dispatched")
+}
+
 func (c *binlogClient) Close() {
 	c.isClosed.Store(true)
 
@@ -984,6 +1161,10 @@ func (c *binlogClient) Close() {
 
 	// Wait for the readStream goroutine to exit cleanly. This prevents
 	// goroutine leaks detected by goleak in tests.
+	// Join the independently cancellable writer too. Both background loops
+	// must finish before Close returns; neither join depends on the other.
+	c.StopPeriodicFlush()
+
 	c.streamWG.Wait()
 
 	// streamWG.Wait has returned, so readStream has exited and c.syncer
@@ -1031,6 +1212,11 @@ func (c *binlogClient) FlushUnderTableLock(ctx context.Context, locks []*dbconn.
 // the end of the flush. That's OK, we only set the flushed position to the known
 // safe buffered position taken at the start.
 func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []*dbconn.TableLock) error {
+	// Sampled before the flush starts: this is the batch size the flush is
+	// about to work through. GetDeltaLen takes no lock of its own, so it is
+	// called before acquiring c.mu.
+	start := time.Now()
+	batch := c.GetDeltaLen()
 	c.mu.Lock()
 	newFlushedPos := c.bufferedPos
 	c.mu.Unlock()
@@ -1069,7 +1255,67 @@ func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []*dbcon
 		}
 		c.mu.Unlock()
 	}
+	c.recordFlush(start, batch, allChangesFlushed)
 	return nil
+}
+
+// recordFlush captures what this flush left behind (for FlushResidual) and
+// how long it took on how many changes (for FeedStats). Recorded whether or
+// not every change could be flushed: a flush that could not drain everything
+// is exactly the case a caller watching for a feed losing ground needs to see.
+//
+// GetDeltaLen takes no lock of its own, so it is called before acquiring c.mu.
+func (c *binlogClient) recordFlush(start time.Time, batch int, complete bool) {
+	residual := c.GetDeltaLen()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushResidual = residual
+	c.flushCount++
+	c.lastFlushAt = time.Now()
+	c.lastFlushDuration = time.Since(start)
+	c.lastFlushRows = batch
+	c.lastFlushComplete = complete
+}
+
+// lastFlushWasComplete reports whether the most recent flush drained every
+// subscription. Flush uses it to decide whether re-draining a backlog
+// immediately would make progress or just re-defer the same keys.
+func (c *binlogClient) lastFlushWasComplete() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastFlushComplete
+}
+
+// FlushResidual satisfies Source.
+func (c *binlogClient) FlushResidual() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flushResidual, c.flushCount
+}
+
+// FeedStats satisfies StatsReporter, so the runner can fold the feed's
+// activity into the binlog row of its periodic status block.
+func (c *binlogClient) FeedStats() FeedStats {
+	// Collected before c.mu is taken: these lock each subscription, and the
+	// subscriptions take c.mu on their flush paths.
+	var stats FeedStats
+	subs := c.subs.Snapshot()
+	mergeParkStats(&stats, subs)
+	mergeFlushShapes(&stats, subs)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stats.LastFlushAt = c.lastFlushAt
+	stats.LastFlushDuration = c.lastFlushDuration
+	stats.LastFlushRows = c.lastFlushRows
+	stats.Rotations = c.rotations.Load()
+	stats.ForcedRotations = c.flushedBinlogs.Load()
+	stats.BufferedEventAt = eventTime(&c.lastEventTime)
+	// Already under c.mu, which is what guards bufferedPos.
+	if c.bufferedPos.Name != "" {
+		stats.BufferedPosition = formatBinlogPosition(c.bufferedPos)
+	}
+	return stats
 }
 
 // Flush empties the changeset in a loop until the amount of changes is considered "trivial".
@@ -1077,8 +1323,25 @@ func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []*dbcon
 func (c *binlogClient) Flush(ctx context.Context) error {
 	for {
 		// Repeat in a loop until the changeset length is trivial
+		subs := c.subs.Snapshot()
+		parks := watchParks(subs)
 		if err := c.flush(ctx, false, nil); err != nil {
 			return err
+		}
+		// Skip the wait entirely while the reader is not keeping up: draining
+		// is both productive and the precondition for the wait ever
+		// succeeding. See backlogWorthDraining — this is the case the comment
+		// below used to describe as merely "a lot to do", which turned out to
+		// cost 30s of idling per drain.
+		//
+		// pending is sampled once, so the logged figure is the one the branch
+		// was decided on rather than a second reading taken next to it.
+		pending := c.GetDeltaLen()
+		redrainCanProgress := c.lastFlushWasComplete() || drainHitBudget(subs)
+		if backlogWorthDraining(pending, parks.readerWasBlocked(subs), redrainCanProgress) {
+			c.logger.Debug("reader is not keeping up, draining again instead of waiting on it",
+				"pending", pending)
+			continue
 		}
 		// BlockWait to ensure we've read everything from the server
 		// into our buffer. This can timeout, in which case we start
@@ -1130,10 +1393,15 @@ func (c *binlogClient) StopPeriodicFlush() {
 // StopPeriodicFlush is guaranteed to observe the registration. Callers
 // MUST NOT prefix with `go` — the loop is spawned internally.
 //
-// Calling Start while a flush is already running is a no-op.
+// Calling Start while a flush is already running or after Close is a no-op.
 // Satisfies Source interface.
 func (c *binlogClient) StartPeriodicFlush(ctx context.Context, interval time.Duration) {
 	c.periodicFlushLock.Lock()
+	if c.isClosed.Load() {
+		c.periodicFlushLock.Unlock()
+		c.logger.Debug("ignoring periodic flush start on a closed client")
+		return
+	}
 	if c.periodicFlushCancel != nil {
 		c.periodicFlushLock.Unlock()
 		return
@@ -1152,20 +1420,44 @@ func (c *binlogClient) runPeriodicFlush(ctx context.Context, interval time.Durat
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		trigger := "interval"
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			startLoop := time.Now()
-			c.logger.Debug("starting periodic flush of binary log")
-			// The periodic flush does not respect the throttler since we want to advance the binlog position
-			// we allow this to run, and then expect that if it is under load the throttler
-			// will kick in and slow down the copy-rows.
-			if err := c.flush(ctx, false, nil); err != nil {
-				c.logger.Error("error flushing binary log", "error", err)
+		case parked := <-c.flushRequests:
+			// A subscription parked on its soft memory limit. Flush now:
+			// the parked reader stalls binlog ingestion, and waiting out
+			// the remainder of the interval burns retention headroom.
+			// Flush the parked subscription first — the all-subscription
+			// pass below visits the registry in nondeterministic order,
+			// and draining another saturated subscription first would
+			// leave the reader parked for that entire drain. The full
+			// pass still runs afterwards for position advancement.
+			trigger = "soft-limit-park"
+			if _, err := parked.Flush(ctx, false, nil); err != nil {
+				if periodicFlushStopping(ctx) {
+					return
+				}
+				c.logger.Error("error flushing parked subscription", "error", err)
 			}
-			c.logger.Info("finished periodic flush of binary log", "total-duration", time.Since(startLoop).String())
+		case <-ticker.C:
 		}
+		startLoop := time.Now()
+		c.logger.Debug("starting periodic flush of binary log", "trigger", trigger)
+		// The periodic flush does not respect the throttler since we want to advance the binlog position
+		// we allow this to run, and then expect that if it is under load the throttler
+		// will kick in and slow down the copy-rows.
+		if err := c.flush(ctx, false, nil); err != nil {
+			if periodicFlushStopping(ctx) {
+				return
+			}
+			c.logger.Error("error flushing binary log", "error", err)
+		}
+		// Debug, not Info: the runner reports the same information (when the
+		// last flush was, how long it took, how many rows) on its periodic
+		// status block, and this loop runs often enough that logging it here
+		// was one of the top contributors to log volume (#329).
+		c.logger.Debug("finished periodic flush of binary log", "total-duration", time.Since(startLoop).String(), "trigger", trigger)
 	}
 }
 
@@ -1177,44 +1469,50 @@ func (c *binlogClient) runPeriodicFlush(ctx context.Context, interval time.Durat
 // The default timeout is 10 seconds, after which an error will be returned.
 // Satisfies Source interface.
 func (c *binlogClient) BlockWait(ctx context.Context) error {
+	return c.blockWait(ctx, DefaultTimeout)
+}
+
+// blockWait accepts a budget so timeout diagnostics can be exercised without a
+// thirty-second test or mutation of shared configuration.
+func (c *binlogClient) blockWait(ctx context.Context, timeout time.Duration) error {
 	targetPos, err := c.getCurrentBinlogPosition(ctx)
 	if err != nil {
 		return err
 	}
-	c.logger.Info("waiting to catch up to source position", "target_position", targetPos, "current_position", c.getBufferedPos())
-	timer := time.NewTimer(DefaultTimeout)
+	// Info only when there is actually a gap to close. Flush() calls BlockWait
+	// in a loop until the delta count is trivial, and most of those calls find
+	// the buffered position already at or past the target — at Info those
+	// printed several times per second during applyChangeset, every one of
+	// them reporting target_position == current_position and so carrying no
+	// information (#329). A real wait still says so at Info, which is the
+	// reading this line is kept for.
+	bufferedPos := c.getBufferedPos()
+	logCatchUp := c.logger.Debug
+	if bufferedPos.Compare(targetPos) < 0 {
+		logCatchUp = c.logger.Info
+	}
+	logCatchUp("waiting to catch up to source position", "target_position", targetPos, "current_position", bufferedPos)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop() // Ensure timer is always stopped to prevent goroutine leak
 
 	prevPos := c.getBufferedPos()
-	first := true
-	stallCount := 0
+	stalls := blockWaitStalls{}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v", targetPos, c.getBufferedPos())
+			return fmt.Errorf("timed out waiting to catch up to source position: %v, current position is: %v, started at: %v; %s", targetPos, c.getBufferedPos(), bufferedPos, catchUpDiagnostics(c.subs.Snapshot()))
 		default:
 			currPos := c.getBufferedPos()
-			if currPos.Compare(prevPos) <= 0 && !first {
-				// Position hasn't advanced. Only flush after multiple consecutive
-				// stalls to avoid unnecessary flushes when the binlog syncer is
-				// just slightly behind (e.g., under CI load). getCurrentBinlogPosition
-				// already flushes once at the start, so a brief stall is expected.
-				stallCount++
-				if stallCount >= blockWaitStallThreshold {
-					c.logger.Debug("buffered position has not advanced, flushing binary logs")
-					if err := dbconn.Exec(ctx, c.db, "FLUSH BINARY LOGS"); err != nil {
-						return err // it could be context cancelled, return it
-					}
-					c.flushedBinlogs.Add(1)
-					stallCount = 0
+			if stalls.observe(prevPos, currPos) {
+				c.logger.Debug("buffered position has not advanced, flushing binary logs")
+				if err := dbconn.Exec(ctx, c.db, "FLUSH BINARY LOGS"); err != nil {
+					return err
 				}
-			} else {
-				stallCount = 0
+				c.flushedBinlogs.Add(1)
 			}
 			prevPos = currPos
-			first = false
 
 			if c.getBufferedPos().Compare(targetPos) >= 0 {
 				return nil // we are up to date!

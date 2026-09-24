@@ -5,12 +5,12 @@ import (
 	"sync/atomic"
 	"testing"
 
+	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,6 +41,7 @@ func killGTIDSyncer(t *testing.T, client *gtidClient) {
 //     which includes the new transaction).
 //  4. Flush and assert both rows landed on the target table.
 func TestGTIDRecreateStreamerRecovers(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -100,6 +101,7 @@ func TestGTIDRecreateStreamerRecovers(t *testing.T) {
 // maxRecreateAttempts (lowered to 3 in TestMain), signal a fatal error
 // through the caller's CancelFunc, and exit cleanly.
 func TestGTIDMaxRecreateAttemptsError(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)

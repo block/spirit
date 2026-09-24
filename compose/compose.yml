@@ -17,10 +17,11 @@ services:
     volumes:
       - mysql-standalone-data-dir:/var/lib/mysql
       - ./bootstrap.sql:/docker-entrypoint-initdb.d/bootstrap.sql
-    # gtid-mode + enforce-gtid-consistency are required by the experimental
-    # --gtid change source (pkg/change/gtid.go). The migration/move preflight
-    # configurationCheck rejects --gtid runs when these are OFF, so CI must
-    # boot with them ON to exercise the GTID path end-to-end. Version
+    # The change-source coordinate scheme is auto-detected per server
+    # (pkg/change/auto.go): GTID set when gtid-mode + enforce-gtid-consistency
+    # are ON, binlog file+offset otherwise. Booting GTID-on makes this the
+    # GTID-path configuration; runners that should exercise the file+offset
+    # path add the nogtid.yml overlay, which overrides this command. Version
     # overlays (8.0.28.yml, 8.0.43.yml, 9.7.yml) only override image/ports
     # so they inherit this command automatically.
     command: --gtid-mode=on --enforce-gtid-consistency=on
@@ -36,17 +37,19 @@ services:
       MYSQL_DSN: tsandbox:msandbox@tcp(mysql)/test
 
   # Dedicated runner for the version-agnostic "single-version" suite
-  # (pkg/migration/{resume,singleversion,lint}_test.go, behind
+  # (pkg/migration/{resume,singleversion}_test.go, behind
   # `//go:build singleversion`). It is gated to this one service so it isn't
   # re-run against every MySQL version in the matrix — these tests exercise
   # Spirit's own logic and don't vary by server version. Invoked by
   # .github/workflows/mysql8.0.45-singleversion-docker.yml against the base
-  # 8.0.45 image (GTID enabled above, for the GTID resume tests). The -run filter
-  # restricts the run to the suite's tests; see singleversion_test.go.
+  # 8.0.45 image, twice: once GTID-on (this file's mysql command) and once
+  # with the nogtid.yml overlay, so the resume/checkpoint paths cover both
+  # auto-detected coordinate schemes. The -run filter restricts the run to
+  # the suite's tests; see singleversion_test.go.
   singleversion-test:
     build:
       context: ../
-    command: bash -c "go test -json -race -v -tags singleversion -run 'Resume|Checkpoint|UniqueOnNonUniqueData|ChunkerPrefetching|Unparsable|Lint' -timeout=10m -parallel=4 ./pkg/migration/... | tee /proc/1/fd/1 | tparse -all"
+    command: bash -c "go test -json -race -v -tags singleversion -run 'Resume|Checkpoint|UniqueOnNonUniqueData|ChunkerPrefetching|Unparsable' -timeout=10m -parallel=4 ./pkg/migration/... | tee /proc/1/fd/1 | tparse -all"
     depends_on:
       mysql:
         condition: service_healthy

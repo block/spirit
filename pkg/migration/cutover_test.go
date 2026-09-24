@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
@@ -19,7 +20,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -80,6 +80,114 @@ func TestCutOver(t *testing.T) {
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _cutovert1_old").Scan(&count))
 	require.Equal(t, 2, count)
+}
+
+// errorCountingHandler counts ERROR-level records and keeps their messages.
+type errorCountingHandler struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *errorCountingHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= slog.LevelError
+}
+
+func (h *errorCountingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+
+func (h *errorCountingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *errorCountingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *errorCountingHandler) errors() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.msgs...)
+}
+
+// TestCutoverStopsFeedDispatchUnderLock is the regression test for a shrinking
+// ALTER's post-cutover writes.
+//
+// The change stream is not stopped by cutover itself — nothing stops it until
+// Close() — and subscriptions are keyed by the *source* table name. So after the
+// rename, `<table>` resolves to the post-ALTER table while the subscription
+// still holds the pre-ALTER TableInfo, and the next application write arrives
+// with a row image that is short of the old column count:
+//
+//	PrimaryKeyValues: row has 2 values, fewer than the 3 table columns
+//
+// which used to kill the stream and log at Error on a migration that had
+// already succeeded. Cutover now retires the feed while it still holds the
+// exclusive lock, so those events are never dispatched.
+//
+// The write below lands after UNLOCK TABLES, which is precisely the window the
+// stop has to beat, so a stop placed after the lock rather than under it fails
+// this test intermittently rather than cleanly.
+func TestCutoverStopsFeedDispatchUnderLock(t *testing.T) {
+	t.Parallel()
+	testutils.NewTestTable(t, "dispatchstop1", `CREATE TABLE dispatchstop1 (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		dropme varchar(255) NOT NULL DEFAULT '',
+		PRIMARY KEY (id)
+	)`)
+	// The shape of "ALTER TABLE dispatchstop1 DROP COLUMN dropme": one column
+	// fewer than the table the subscription was built from.
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS _dispatchstop1_new`)
+	testutils.RunSQL(t, `CREATE TABLE _dispatchstop1_new (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	t1 := table.NewTableInfo(db, cfg.DBName, "dispatchstop1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	require.Len(t, t1.Columns, 3)
+	t1new := table.NewTableInfo(db, cfg.DBName, "_dispatchstop1_new")
+	require.NoError(t, t1new.SetInfo(t.Context()))
+
+	errLog := &errorCountingHandler{}
+	clientCfg := change.NewClientDefaultConfig()
+	clientCfg.Logger = slog.New(errLog)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd,
+		applier.NewSingleTargetForTest(t, db), clientCfg)
+	defer feed.Close()
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
+	require.NoError(t, err)
+	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
+	require.NoError(t, feed.Start(t.Context()))
+
+	cutover, err := NewCutOver(db, []*cutoverConfig{{
+		table:        t1,
+		newTable:     t1new,
+		oldTableName: "_dispatchstop1_old",
+	}}, feed, dbconn.NewDBConfig(), slog.New(errLog))
+	require.NoError(t, err)
+	require.NoError(t, cutover.Run(t.Context()))
+
+	// A post-cutover application write: 2 values against the subscription's
+	// 3-column TableInfo. This is the event that used to be fatal.
+	testutils.RunSQL(t, `INSERT INTO dispatchstop1 (name) VALUES ('after-cutover')`)
+
+	// BlockWait proves the reader goroutine is still alive: it waits for the
+	// buffered position to reach the server's head, which only advances while
+	// readStream is running. Bounded so a dead reader fails fast rather than
+	// waiting out change.DefaultTimeout.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	require.NoError(t, feed.BlockWait(ctx), "the stream must survive post-cutover writes")
+
+	require.Empty(t, errLog.errors(), "a post-cutover write must not produce any Error-level log")
+	require.Zero(t, feed.GetDeltaLen(), "post-cutover events must not be buffered for apply")
 }
 
 // TestCutoverRenameCompletedDetection unit-tests the renameCompleted helper
@@ -161,50 +269,7 @@ func TestCutoverRenameCompletedDetection(t *testing.T) {
 // retrying into ER_NO_SUCH_TABLE failures.
 func TestCutoverConnectionLossAfterRenameCommitted(t *testing.T) {
 	t.Parallel()
-	testutils.NewTestTable(t, "cutoverconnloss", `CREATE TABLE cutoverconnloss (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	testutils.RunSQL(t, `CREATE TABLE _cutoverconnloss_new (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	testutils.RunSQL(t, `CREATE TABLE _cutoverconnloss_chkpnt (a int)`) // for binlog advancement
-	// Two rows in the original table so post-cutover state is distinguishable.
-	testutils.RunSQL(t, `INSERT INTO cutoverconnloss VALUES (1, 2), (2, 2)`)
-
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-
-	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	t1 := table.NewTableInfo(db, cfg.DBName, "cutoverconnloss")
-	require.NoError(t, t1.SetInfo(t.Context()))
-	t1new := table.NewTableInfo(db, cfg.DBName, "_cutoverconnloss_new")
-	logger := slog.Default()
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
-	defer feed.Close()
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
-	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
-	require.NoError(t, feed.Start(t.Context()))
-
-	cutover, err := NewCutOver(db, []*cutoverConfig{
-		{
-			table:        t1,
-			newTable:     t1new,
-			oldTableName: "_cutoverconnloss_old",
-		},
-	}, feed, dbconn.NewDBConfig(), logger)
-	require.NoError(t, err)
-	// Simulate the server committing the rename while the client's
-	// connection dies before the OK packet is read. mysql.ErrInvalidConn is
-	// exactly what go-sql-driver returns when a connection dies mid-statement.
-	cutover.testInjectRenameError = mysql.ErrInvalidConn
+	cutover, db, dbName := newConnectionLossCutover(t, "cutoverconnloss")
 
 	require.NoError(t, cutover.Run(t.Context()),
 		"a rename committed by the server must be reported as success despite the connection loss")
@@ -219,8 +284,73 @@ func TestCutoverConnectionLossAfterRenameCommitted(t *testing.T) {
 	require.Equal(t, 2, count)
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = '_cutoverconnloss_new'",
-		cfg.DBName).Scan(&count))
+		dbName).Scan(&count))
 	require.Equal(t, 0, count)
+}
+
+func TestCutoverConnectionLossWithUnavailableOwnershipCheck(t *testing.T) {
+	t.Parallel()
+	cutover, _, _ := newConnectionLossCutover(t, "cutoverconnunknown")
+	ctx, cancel := context.WithCancel(t.Context())
+	cutover.testAfterRenameError = cancel
+
+	err := cutover.Run(ctx)
+
+	require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func newConnectionLossCutover(t *testing.T, tableName string) (*CutOver, *sql.DB, string) {
+	t.Helper()
+	newTableName := "_" + tableName + "_new"
+	oldTableName := "_" + tableName + "_old"
+	checkpointTableName := "_" + tableName + "_chkpnt"
+	testutils.NewTestTable(t, tableName, fmt.Sprintf(`CREATE TABLE %s (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`, tableName))
+	testutils.RunSQL(t, fmt.Sprintf(`CREATE TABLE %s (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`, newTableName))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a int)", checkpointTableName))
+	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s VALUES (1, 2), (2, 2)", tableName))
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+
+	original := table.NewTableInfo(db, cfg.DBName, tableName)
+	require.NoError(t, original.SetInfo(t.Context()))
+	replacement := table.NewTableInfo(db, cfg.DBName, newTableName)
+	feed := change.NewBinlogClient(
+		db,
+		cfg.Addr,
+		cfg.User,
+		cfg.Passwd,
+		applier.NewSingleTargetForTest(t, db),
+		change.NewClientDefaultConfig(),
+	)
+	t.Cleanup(feed.Close)
+	chunker, err := table.NewChunker(original, table.ChunkerConfig{NewTable: replacement})
+	require.NoError(t, err)
+	require.NoError(t, feed.AddSubscription(original, replacement, chunker))
+	require.NoError(t, feed.Start(t.Context()))
+
+	cutover, err := NewCutOver(db, []*cutoverConfig{{
+		table:        original,
+		newTable:     replacement,
+		oldTableName: oldTableName,
+	}}, feed, dbconn.NewDBConfig(), slog.Default())
+	require.NoError(t, err)
+	// Simulate the server committing the rename while the client's connection
+	// dies before the OK packet is read.
+	cutover.testInjectRenameError = mysql.ErrInvalidConn
+	return cutover, db, cfg.DBName
 }
 
 // TestCutoverDeterministicErrorDoesNotVerify is the negative counterpart of
@@ -472,9 +602,7 @@ const cutoverAtomicityCompositeSchema = `CREATE TABLE %s (
 // This test proves that the window does not introduce inconsistency, even when
 // there are concurrent writes happening that are trying to introduce it.
 //
-// The test runs four times — across the cross product of:
-//   - chunker selection (optimistic vs composite)
-//   - copier mode (unbuffered vs buffered)
+// The test runs twice, once per chunker selection (optimistic vs composite).
 //
 // The optimistic chunker is selected automatically for single-column
 // auto_increment PKs; the composite chunker covers everything else (here we
@@ -500,8 +628,8 @@ const cutoverAtomicityCompositeSchema = `CREATE TABLE %s (
 // binlog/visibility race documented in #746 violates under sufficient
 // parallel-commit load. In production this is harmless because the
 // checksum's repair pass (FixDifferences=true) re-copies any missed rows
-// before cutover; in the test it surfaced as a CI flake on the
-// composite_unbuffered variant. We accept that FixDifferences=true masks
+// before cutover; in the test it surfaced as a CI flake on the composite
+// variant of the since-removed unbuffered copier. We accept that FixDifferences=true masks
 // algorithmic bugs in the copy/applier path here: the production cutover
 // path has the same masking, so probing without it was probing a stricter
 // invariant than spirit actually offers.
@@ -512,27 +640,24 @@ func TestCutoverAtomicityWithConcurrentWrites(t *testing.T) {
 		name      string
 		tableName string
 		schema    string
-		buffered  bool
 	}{
-		{"optimistic_unbuffered", "t1concurrent_oub", cutoverAtomicityOptimisticSchema, false},
-		{"optimistic_buffered", "t1concurrent_obu", cutoverAtomicityOptimisticSchema, true},
-		{"composite_unbuffered", "t1concurrent_cub", cutoverAtomicityCompositeSchema, false},
-		{"composite_buffered", "t1concurrent_cbu", cutoverAtomicityCompositeSchema, true},
+		{"optimistic", "t1concurrent_opt", cutoverAtomicityOptimisticSchema},
+		{"composite", "t1concurrent_comp", cutoverAtomicityCompositeSchema},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			runCutoverAtomicityTest(t, tc.tableName, tc.schema, tc.buffered)
+			runCutoverAtomicityTest(t, tc.tableName, tc.schema)
 		})
 	}
 }
 
 // runCutoverAtomicityTest runs the body of the cutover-atomicity probe
-// against an arbitrary table/schema pair, in either unbuffered or buffered
-// copier mode. tableName must be unique per call so the four variants can
-// run in parallel without conflicting on `_<name>_old`/`_<name>_new`.
-func runCutoverAtomicityTest(t *testing.T, tableName, schemaTmpl string, buffered bool) {
+// against an arbitrary table/schema pair. tableName must be unique per call
+// so the variants can run in parallel without conflicting on
+// `_<name>_old`/`_<name>_new`.
+func runCutoverAtomicityTest(t *testing.T, tableName, schemaTmpl string) {
 	t.Helper()
 
 	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf(schemaTmpl, tableName))
@@ -563,9 +688,8 @@ func runCutoverAtomicityTest(t *testing.T, tableName, schemaTmpl string, buffere
 
 	// Create and configure the migration with a custom cutover algorithm
 	// that intentionally fails after renaming the original table.
-	migration := NewTestMigration(t, WithTable(tableName), WithAlter("ENGINE=InnoDB"),
-		WithThreads(2), WithTargetChunkTime(100*time.Millisecond),
-		WithBuffered(buffered))
+	migration := NewTestMigration(t, WithStatement(fmt.Sprintf("ALTER TABLE %s ENGINE=InnoDB", tableName)),
+		WithThreads(2))
 	migration.useTestCutover = true
 
 	// Run the migration — we expect it to fail with our intentional error.
@@ -863,15 +987,9 @@ func TestDeferCutOver(t *testing.T) {
 		WithDeferCutOver(),
 		WithRespectSentinel())
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		err := m.Run(t.Context())
-		require.Error(t, err)
-		require.ErrorContains(t, err, "timed out waiting for sentinel table to be dropped")
-	})
-
-	waitForStatus(t, m, status.WaitingOnSentinelTable)
-	wg.Wait()
+	running := startTestRun(t, m.Run, m.Close)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
+	require.ErrorContains(t, running.wait(t), "timed out waiting for sentinel table to be dropped")
 
 	newName := fmt.Sprintf("_%s_new", tableName)
 	var tableCount int
@@ -899,10 +1017,7 @@ func TestDeferCutOverE2E(t *testing.T) {
 		WithDeferCutOver(),
 		WithRespectSentinel())
 
-	c := make(chan error)
-	go func() {
-		c <- m.Run(t.Context())
-	}()
+	running := startTestRun(t, m.Run, m.Close)
 
 	// Wait until the sentinel table exists.
 	db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
@@ -920,7 +1035,7 @@ func TestDeferCutOverE2E(t *testing.T) {
 	// Drop the sentinel table — migration should complete.
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
 
-	err = <-c
+	err = running.wait(t)
 	require.NoError(t, err)
 
 	// Old table should be dropped (SkipDropAfterCutover is false).
@@ -929,7 +1044,6 @@ func TestDeferCutOverE2E(t *testing.T) {
 		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES 
 		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='%s'`, m.changes[0].oldTableName())).Scan(&tableCount))
 	require.Equal(t, 0, tableCount)
-	require.NoError(t, m.Close())
 }
 
 // TestDeferCutOverE2EBinlogAdvance tests that during the sentinel wait phase,
@@ -949,16 +1063,13 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 		WithDeferCutOver(),
 		WithRespectSentinel())
 
-	c := make(chan error)
-	go func() {
-		c <- m.Run(t.Context())
-	}()
+	running := startTestRun(t, m.Run, m.Close)
 
 	db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	waitForStatus(t, m, status.WaitingOnSentinelTable)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 
 	// Verify the source position advances while waiting. Position() is an
 	// opaque string and the binlogClient's internal setBufferedPos enforces
@@ -975,7 +1086,7 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
 
-	err = <-c
+	err = running.wait(t)
 	require.NoError(t, err)
 
 	var tableCount int
@@ -983,7 +1094,6 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
 		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='%s'`, m.changes[0].oldTableName())).Scan(&tableCount))
 	require.Equal(t, 0, tableCount)
-	require.NoError(t, m.Close())
 }
 
 // TestSentinelCreateNeverObservedAbsent verifies that createSentinelTable is
@@ -1070,11 +1180,8 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 		WithDBName(dbName),
 		WithDeferCutOver(),
 		WithRespectSentinel())
-	cA := make(chan error)
-	go func() {
-		cA <- mA.Run(t.Context())
-	}()
-	waitForStatus(t, mA, status.WaitingOnSentinelTable)
+	runningA := startTestRun(t, mA.Run, mA.Close)
+	waitForStatus(t, mA, status.WaitingOnSentinelTable, runningA)
 
 	// Migration B starts fresh in the same schema while A is blocked on the
 	// sentinel, and re-creates the shared sentinel during its setup.
@@ -1082,11 +1189,8 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 		WithDBName(dbName),
 		WithDeferCutOver(),
 		WithRespectSentinel())
-	cB := make(chan error)
-	go func() {
-		cB <- mB.Run(t.Context())
-	}()
-	waitForStatus(t, mB, status.WaitingOnSentinelTable)
+	runningB := startTestRun(t, mB.Run, mB.Close)
+	waitForStatus(t, mB, status.WaitingOnSentinelTable, runningB)
 
 	// Give A several sentinel poll intervals to (incorrectly) notice any
 	// sentinel gap left by B's setup. It must still be waiting: the operator
@@ -1098,10 +1202,8 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 	// Operator approves: drop the shared sentinel once; both migrations
 	// proceed to cutover.
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
-	require.NoError(t, <-cA)
-	require.NoError(t, <-cB)
-	require.NoError(t, mA.Close())
-	require.NoError(t, mB.Close())
+	require.NoError(t, runningA.wait(t))
+	require.NoError(t, runningB.wait(t))
 }
 
 // TestMultiTableMigrationBlockedPerSchema verifies that only one atomic
@@ -1124,9 +1226,8 @@ func TestMultiTableMigrationBlockedPerSchema(t *testing.T) {
 	stmtA := "ALTER TABLE mt_lock_a1 ENGINE=InnoDB; ALTER TABLE mt_lock_a2 ENGINE=InnoDB"
 	mA := NewTestRunnerFromStatement(t, stmtA, WithDBName(dbName), WithDeferCutOver(), WithRespectSentinel())
 	require.Len(t, mA.changes, 2)
-	cA := make(chan error, 1) // buffered: mA's goroutine never blocks on send if an assertion fails first
-	go func() { cA <- mA.Run(t.Context()) }()
-	waitForStatus(t, mA, status.WaitingOnSentinelTable)
+	runningA := startTestRun(t, mA.Run, mA.Close)
+	waitForStatus(t, mA, status.WaitingOnSentinelTable, runningA)
 
 	// A second atomic multi-table migration in the same schema must be blocked
 	// fast, with an error that names the cause.
@@ -1140,6 +1241,5 @@ func TestMultiTableMigrationBlockedPerSchema(t *testing.T) {
 
 	// Operator approves A; it finishes and releases the schema lock.
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
-	require.NoError(t, <-cA)
-	require.NoError(t, mA.Close())
+	require.NoError(t, runningA.wait(t))
 }

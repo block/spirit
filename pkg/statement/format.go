@@ -11,11 +11,27 @@ import (
 // SQL fragments used to build ALTER TABLE clauses. They are free functions; the
 // CreateTable receivers that assemble the statements live in diff.go.
 
-// formatColumnDefinition formats a column definition for ALTER TABLE
-func formatColumnDefinition(col *Column) string {
-	var parts []string
+// formatColumnType renders a column's data type for emission in an ALTER TABLE
+// clause: the type name with its length/precision/element list, followed by the
+// unsigned and zerofill display attributes. Charset and collation are excluded —
+// formatColumnDefinition emits those separately.
+func formatColumnType(col *Column) string {
+	return columnType(col, sqlescape.EscapeString)
+}
 
-	// Column name and type
+// formatColumnTypeAsMetadata renders a column's data type the way MySQL reports
+// it in information_schema.columns.column_type. It differs from formatColumnType
+// only in how ENUM/SET elements are escaped: MySQL's metadata doubles an embedded
+// single quote, where the SQL Spirit emits backslash-escapes it. Both are valid
+// SQL, but the parsers that read an element list back out of column_type accept
+// only the doubled form.
+func formatColumnTypeAsMetadata(col *Column) string {
+	return columnType(col, func(s string) string { return strings.ReplaceAll(s, "'", "''") })
+}
+
+// columnType renders a column's data type, escaping ENUM/SET elements with the
+// supplied escaper.
+func columnType(col *Column, escapeElement func(string) string) string {
 	typeDef := col.Type
 
 	// Determine the full type definition including length/precision/values
@@ -23,13 +39,13 @@ func formatColumnDefinition(col *Column) string {
 	case col.Type == "enum" && len(col.EnumValues) > 0:
 		var values []string
 		for _, v := range col.EnumValues {
-			values = append(values, fmt.Sprintf("'%s'", sqlescape.EscapeString(v)))
+			values = append(values, fmt.Sprintf("'%s'", escapeElement(v)))
 		}
 		typeDef = fmt.Sprintf("enum(%s)", strings.Join(values, ","))
 	case col.Type == "set" && len(col.SetValues) > 0:
 		var values []string
 		for _, v := range col.SetValues {
-			values = append(values, fmt.Sprintf("'%s'", sqlescape.EscapeString(v)))
+			values = append(values, fmt.Sprintf("'%s'", escapeElement(v)))
 		}
 		typeDef = fmt.Sprintf("set(%s)", strings.Join(values, ","))
 	case col.Precision != nil && col.Scale != nil:
@@ -52,7 +68,15 @@ func formatColumnDefinition(col *Column) string {
 		typeDef += " zerofill"
 	}
 
-	parts = append(parts, fmt.Sprintf("%s %s", sqlescape.EscapeIdentifier(col.Name), typeDef))
+	return typeDef
+}
+
+// formatColumnDefinition formats a column definition for ALTER TABLE
+func formatColumnDefinition(col *Column) string {
+	var parts []string
+
+	// Column name and type
+	parts = append(parts, fmt.Sprintf("%s %s", sqlescape.EscapeIdentifier(col.Name), formatColumnType(col)))
 
 	// Charset and collation (skip for binary types and JSON)
 	isBinaryType := col.Type == "varbinary" || col.Type == "binary" ||
@@ -99,16 +123,32 @@ func formatColumnDefinition(col *Column) string {
 	if col.Default != nil && col.GeneratedExpr == nil {
 		defaultVal := *col.Default
 		switch {
+		case col.DefaultIsExpr && col.DefaultKind == DefaultKindString:
+			// Expression default whose expression is a string literal,
+			// e.g. DEFAULT ('{}') — the only default form MySQL accepts on
+			// BLOB/TEXT/JSON/GEOMETRY columns. The stored value is raw, so
+			// quote+escape it inside the parentheses.
+			parts = append(parts, fmt.Sprintf("DEFAULT ('%s')", sqlescape.EscapeString(defaultVal)))
 		case col.DefaultIsExpr:
 			// Expression defaults must be wrapped in parentheses, e.g. DEFAULT (json_object())
 			parts = append(parts, fmt.Sprintf("DEFAULT (%s)", defaultVal))
-		case col.DefaultIsString:
+		case col.DefaultKind == DefaultKindString:
 			// Quoted string literal. The stored value is the true raw value
 			// (unescaped at parse time), so quote+escape exactly once. This
 			// must bypass the needsQuotes heuristic: a literal 'TRUE' or
 			// 'NULL' or '2020' has to stay quoted, otherwise MySQL would
 			// store the keyword/number instead of the string.
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
+		case col.DefaultKind == DefaultKindBitLiteral,
+			col.DefaultKind == DefaultKindNumber,
+			col.DefaultKind == DefaultKindKeywordBool:
+			// A literal MySQL reports and accepts unquoted. The recorded text
+			// is already the canonical spelling of its kind — a bit literal is
+			// restored in the minimal form MySQL reports (b'0101' as b'101'),
+			// and a number carries no quotes of its own. Quoting any of these
+			// would change what MySQL stores; for a bit literal it produces
+			// DDL MySQL rejects, since 'b\'101\'' is not a valid bit value.
+			parts = append(parts, fmt.Sprintf("DEFAULT %s", defaultVal))
 		case needsQuotes(defaultVal):
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
 		default:
@@ -335,6 +375,16 @@ func formatPartitionOptions(partOpts *PartitionOptions) string {
 		parts = append(parts, fmt.Sprintf("PARTITIONS %d", partOpts.Partitions))
 	}
 
+	// Add the subpartitioning clause. MySQL's grammar places SUBPARTITION BY
+	// (and its SUBPARTITIONS count) after the partition method and before the
+	// partition definition list. Emitting it is not optional: the only way Diff
+	// changes a partitioned table's layout is REMOVE PARTITIONING followed by a
+	// fresh PARTITION BY, so a missing clause silently drops the table's
+	// subpartitioning.
+	if partOpts.SubPartition != nil {
+		parts = append(parts, formatSubPartitionOptions(partOpts.SubPartition))
+	}
+
 	// Add partition definitions if present
 	if len(partOpts.Definitions) > 0 {
 		var defParts []string
@@ -342,6 +392,49 @@ func formatPartitionOptions(partOpts *PartitionOptions) string {
 			defParts = append(defParts, formatPartitionDefinition(&def))
 		}
 		parts = append(parts, fmt.Sprintf("(%s)", strings.Join(defParts, ", ")))
+	}
+
+	return strings.Join(parts, " ")
+}
+
+// formatSubPartitionOptions formats the SUBPARTITION BY clause of a
+// partitioned table, including its SUBPARTITIONS count. MySQL only supports
+// HASH and KEY subpartitioning, optionally LINEAR.
+//
+// The count is emitted whenever it is known, even when the partition
+// definitions spell their subpartitions out by name: MySQL accepts the
+// redundant SUBPARTITIONS n as long as it agrees with the lists (verified
+// against MySQL 9.7), and the count is the only representation of
+// subpartitioning for the far more common form where SHOW CREATE TABLE reports
+// SUBPARTITIONS n and leaves the auto-generated subpartition names implicit.
+func formatSubPartitionOptions(subOpts *SubPartitionOptions) string {
+	parts := []string{"SUBPARTITION BY"}
+
+	if subOpts.Linear {
+		parts = append(parts, "LINEAR")
+	}
+
+	parts = append(parts, subOpts.Type)
+
+	switch subOpts.Type {
+	case "HASH":
+		if subOpts.Expression != nil {
+			parts = append(parts, fmt.Sprintf("(%s)", *subOpts.Expression))
+		} else if len(subOpts.Columns) > 0 {
+			// HASH can also use column names directly
+			parts = append(parts, fmt.Sprintf("(%s)", quoteIdentList(subOpts.Columns, ", ")))
+		}
+	case "KEY":
+		if len(subOpts.Columns) > 0 {
+			parts = append(parts, fmt.Sprintf("(%s)", quoteIdentList(subOpts.Columns, ", ")))
+		} else {
+			// KEY() with empty columns uses the primary key
+			parts = append(parts, "()")
+		}
+	}
+
+	if subOpts.Count > 0 {
+		parts = append(parts, fmt.Sprintf("SUBPARTITIONS %d", subOpts.Count))
 	}
 
 	return strings.Join(parts, " ")
@@ -372,6 +465,38 @@ func formatPartitionDefinition(def *PartitionDefinition) string {
 		case "MAXVALUE":
 			parts = append(parts, "VALUES LESS THAN MAXVALUE")
 		}
+	}
+
+	// Partition comment. Emitted in the `COMMENT = 'x'` form SHOW CREATE TABLE
+	// prints. Without it a repartition would silently drop the comment.
+	if def.Comment != nil {
+		parts = append(parts, fmt.Sprintf("COMMENT = '%s'", sqlescape.EscapeString(*def.Comment)))
+	}
+
+	// Explicitly named subpartitions, when the definition carries them. MySQL
+	// only reports subpartition names from SHOW CREATE TABLE when they were
+	// named explicitly at CREATE time — otherwise it reports SUBPARTITIONS n
+	// alone and auto-names them — so passing them through keeps the names
+	// stable across a repartition.
+	if len(def.SubPartitions) > 0 {
+		subParts := make([]string, 0, len(def.SubPartitions))
+		for i := range def.SubPartitions {
+			subParts = append(subParts, formatSubPartitionDefinition(&def.SubPartitions[i]))
+		}
+		parts = append(parts, fmt.Sprintf("(%s)", strings.Join(subParts, ", ")))
+	}
+
+	return strings.Join(parts, " ")
+}
+
+// formatSubPartitionDefinition formats a single named subpartition. Only the
+// name and comment are emitted; a subpartition's ENGINE always matches the
+// table's (see partitionDefinitionEqual) and is therefore not diffed.
+func formatSubPartitionDefinition(sub *SubPartitionDefinition) string {
+	parts := []string{"SUBPARTITION " + sqlescape.EscapeIdentifier(sub.Name)}
+
+	if sub.Comment != nil {
+		parts = append(parts, fmt.Sprintf("COMMENT = '%s'", sqlescape.EscapeString(*sub.Comment)))
 	}
 
 	return strings.Join(parts, " ")

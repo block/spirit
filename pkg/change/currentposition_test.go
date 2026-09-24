@@ -4,12 +4,12 @@ import (
 	"database/sql"
 	"testing"
 
+	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
-	mysql2 "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -79,5 +79,6 @@ func TestBinlogCurrentPosition(t *testing.T) {
 // TestGTIDCurrentPosition covers gtidClient.CurrentPosition
 // (@@GLOBAL.gtid_executed). Requires gtid_mode=ON, like the rest of gtid_test.go.
 func TestGTIDCurrentPosition(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
 	currentPositionRoundTrip(t, "curposgtid", NewGTIDClient)
 }

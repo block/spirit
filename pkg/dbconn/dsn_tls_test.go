@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,16 +29,21 @@ func TestEnhanceDSNWithTLS(t *testing.T) {
 		description    string
 	}{
 		{
-			name:     "DISABLED mode should not modify DSN",
+			name:     "DISABLED mode writes tls=false",
 			inputDSN: "user:pass@tcp(localhost:3306)/db",
 			config: func() *DBConfig {
 				cfg := NewDBConfig()
 				cfg.TLSMode = "DISABLED"
 				return cfg
 			}(),
-			expectedResult: "user:pass@tcp(localhost:3306)/db",
+			// Not the untouched DSN. A DSN carrying no tls= is exactly what the
+			// driver reads as permission to apply RDS auto-TLS, so DISABLED has
+			// to say "no TLS" positively. This row pins the spelling;
+			// TestDisabledModeProducesNoTLSFromEitherDSNProducer pins the
+			// effect on an RDS host, where the difference is observable.
+			expectedResult: "user:pass@tcp(localhost:3306)/db?tls=false",
 			expectError:    false,
-			description:    "DISABLED mode should return original DSN unchanged",
+			description:    "DISABLED mode should request no TLS explicitly",
 		},
 		{
 			name:     "DSN with tls=false should be preserved",
@@ -261,16 +266,19 @@ func TestAddTLSParametersToDSN(t *testing.T) {
 		description    string
 	}{
 		{
-			name:     "DISABLED mode returns original DSN",
+			name:     "DISABLED mode writes tls=false",
 			inputDSN: "user:pass@tcp(localhost:3306)/db",
 			config: func() *DBConfig {
 				cfg := NewDBConfig()
 				cfg.TLSMode = "DISABLED"
 				return cfg
 			}(),
-			expectedResult: "user:pass@tcp(localhost:3306)/db",
+			// See the matching row in TestEnhanceDSNWithTLS: both DSN
+			// producers now state "no TLS" rather than staying silent, because
+			// silence is what lets the driver add it back on an RDS host.
+			expectedResult: "user:pass@tcp(localhost:3306)/db?tls=false",
 			expectError:    false,
-			description:    "DISABLED mode should not add TLS parameters",
+			description:    "DISABLED mode should request no TLS explicitly",
 		},
 		{
 			name:     "Unknown TLS mode defaults to PREFERRED",
@@ -392,9 +400,11 @@ func TestNewDSNTLSPreservation(t *testing.T) {
 				if tt.config.TLSMode == "REQUIRED" {
 					require.NotEmpty(t, resultCfg.TLSConfig, "Expected TLS config to be set")
 				}
-				// For DISABLED mode, verify that TLS was NOT added
+				// For DISABLED mode, verify that TLS was NOT added. The check
+				// is on the effective setting, not on TLSConfig being empty:
+				// DISABLED writes tls=false on purpose (see newDSN).
 				if tt.config.TLSMode == "DISABLED" {
-					require.Empty(t, resultCfg.TLSConfig, "TLS config should not be set when disabled")
+					require.Nil(t, resultCfg.TLS, "TLS should not be set when disabled")
 				}
 			}
 		})

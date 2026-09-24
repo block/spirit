@@ -13,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/move/check"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -27,6 +28,17 @@ var renameRetryWait = 1 * time.Second
 // that state cannot converge, so the retry loop aborts immediately.
 var errRenameRollbackFailed = errors.New("rename rollback failed")
 
+// CutoverResult reports authoritative evidence from a caller-owned cutover
+// callback, including failures after a durable mutation and failures whose
+// ownership outcome cannot be determined.
+type CutoverResult struct {
+	DurableMutation    bool
+	OwnershipAmbiguous bool
+}
+
+// CutoverResultCallback is the result-bearing cutover callback form.
+type CutoverResultCallback func(context.Context) (CutoverResult, error)
+
 // CutOverSource holds per-source state needed for the cutover.
 type CutOverSource struct {
 	DB         *sql.DB
@@ -35,33 +47,49 @@ type CutOverSource struct {
 }
 
 type CutOver struct {
-	sources     []CutOverSource
-	cutoverFunc func(ctx context.Context) error
-	dbConfig    *dbconn.DBConfig
-	logger      *slog.Logger
-	// cutoverFuncSucceeded tracks whether cutoverFunc has been invoked and
-	// returned nil. The cutover function is a caller-supplied traffic switch
-	// (e.g. a Vitess routing change) and is not assumed to be idempotent:
-	// once it has succeeded it must never be invoked again, and retrying
-	// any later step must not reopen the window where straggler writes to
-	// the (now stale) source could be replayed over newer rows on the target.
+	sources              []CutOverSource
+	cutoverFunc          func(ctx context.Context) error
+	cutoverResultFunc    CutoverResultCallback
+	cutoverFuncMutated   bool
+	cutoverFuncAmbiguous bool
+	dbConfig             *dbconn.DBConfig
+	logger               *slog.Logger
+	// cutoverFuncSucceeded tracks whether the cutover callback has returned nil.
+	// The callback is a caller-supplied traffic switch (e.g. a Vitess routing
+	// change) and is not assumed to be idempotent: once it has succeeded,
+	// reported a durable mutation, or reported ambiguity it must never be
+	// invoked again.
 	cutoverFuncSucceeded bool
 
-	// postSwitch, when set, runs once under the source locks after the traffic
-	// switch (cutoverFunc) succeeds and before the sources are renamed out of
-	// the way. The reverse-window move uses it to capture each target's binlog
-	// position and persist that the move has entered its reverse window, while
-	// the sources are quiescent (writes switched away, replication flushed) so
-	// the captured positions cleanly bound the post-cutover writes. Like
-	// cutoverFunc it must run at most once; postSwitchDone guards that.
+	// preSwitch runs under the source locks after the final flush and before
+	// traffic can reach the target. Reverse moves capture their start positions
+	// here so writes committed during the switch are included. It runs again
+	// on a safe retry, after that attempt's final flush.
+	preSwitch func(ctx context.Context) error
+
+	// postSwitch persists the captured positions after the switch succeeds,
+	// before the source rename. It must run at most once.
 	postSwitch     func(ctx context.Context) error
 	postSwitchDone bool
+}
+
+// SetPreSwitch registers a hook after the final source flush and before the
+// traffic switch, under the source locks. See CutOver.preSwitch.
+func (c *CutOver) SetPreSwitch(fn func(ctx context.Context) error) {
+	c.preSwitch = fn
 }
 
 // SetPostSwitch registers a hook to run once under the source locks, after the
 // traffic switch and before the source rename. See CutOver.postSwitch.
 func (c *CutOver) SetPostSwitch(fn func(ctx context.Context) error) {
 	c.postSwitch = fn
+}
+
+// SetCutoverWithResult installs a result-bearing forward cutover callback.
+// It is mutually exclusive with the legacy error-only callback.
+func (c *CutOver) SetCutoverWithResult(fn CutoverResultCallback) {
+	c.cutoverFunc = nil
+	c.cutoverResultFunc = fn
 }
 
 // NewCutOver creates a new CutOver that handles multiple sources.
@@ -103,11 +131,7 @@ func NewCutOver(sources []CutOverSource, cutoverFunc func(ctx context.Context) e
 }
 
 func (c *CutOver) Run(ctx context.Context) error {
-	var err error
-	for attempt := range c.dbConfig.MaxRetries {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	return c.runWithRetries(ctx, func(attempt int) error {
 		// Flush all sources before attempting the cutover.
 		for i, src := range c.sources {
 			if err := src.ReplClient.Flush(ctx); err != nil {
@@ -117,21 +141,61 @@ func (c *CutOver) Run(ctx context.Context) error {
 		c.logger.Warn("Attempting final cut over operation",
 			"attempt", attempt+1,
 			"max-retries", c.dbConfig.MaxRetries)
-		err = c.algorithmCutover(ctx)
+		return c.algorithmCutover(ctx)
+	})
+}
+
+// runWithRetries owns the cutover retry policy: which failures may be tried
+// again from the top, and which have left table ownership in a state that a
+// retry could make worse. runAttempt is a parameter so the policy can be
+// tested without a live topology.
+func (c *CutOver) runWithRetries(ctx context.Context, runAttempt func(attempt int) error) error {
+	var err error
+	for attempt := range c.dbConfig.MaxRetries {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err = runAttempt(attempt)
 		if err != nil {
+			if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, status.ErrOwnershipAmbiguous) {
+				c.logger.Error("cutover rename left ownership unresolved; not retrying",
+					"error", err.Error())
+				ownershipErr := fmt.Errorf("%w: cutover rename left ownership unresolved: %w",
+					status.ErrOwnershipAmbiguous, err)
+				if c.cutoverFuncMutated {
+					return errors.Join(status.ErrDurableMutation, ownershipErr)
+				}
+				return ownershipErr
+			}
+			if c.cutoverFuncAmbiguous && !c.cutoverFuncSucceeded {
+				c.logger.Error("cutover callback failed with ambiguous ownership; not retrying",
+					"error", err.Error())
+				ownershipErr := fmt.Errorf("%w: cutover callback left ownership ambiguous: %w",
+					status.ErrOwnershipAmbiguous, err)
+				if c.cutoverFuncMutated {
+					return errors.Join(status.ErrDurableMutation, ownershipErr)
+				}
+				return ownershipErr
+			}
+			if c.cutoverFuncMutated && !c.cutoverFuncSucceeded {
+				c.logger.Error("cutover callback failed after reporting a durable mutation; not retrying",
+					"error", err.Error())
+				return fmt.Errorf("%w: cutover callback failed after a durable mutation: %w",
+					status.ErrDurableMutation, err)
+			}
 			if c.cutoverFuncSucceeded {
-				// The traffic switch has already succeeded, so traffic may be
-				// on the target. Another attempt would have released the
-				// source table locks in between, reopening the window where
-				// straggler writes to the source could be replayed over newer
-				// rows on the target. The rename has already been retried
-				// while the locks were held (see algorithmCutover), so do not
-				// retry from the top: surface the error instead.
+				// Traffic may already be on the target. Retrying from the top
+				// would release the source locks and could replay straggler
+				// writes over newer target rows.
 				c.logger.Error("cutover failed after the cutover function had already succeeded; not retrying",
 					"error", err.Error())
-				return fmt.Errorf("cutover failed after the cutover function succeeded; "+
-					"source tables are unlocked and not fully renamed (the rename may have "+
-					"partially applied), manual intervention required: %w", err)
+				ownershipErr := fmt.Errorf("%w: cutover failed after the cutover function succeeded; "+
+					"source tables are unlocked and not fully renamed; manual intervention required: %w",
+					status.ErrOwnershipAmbiguous, err)
+				if c.cutoverFuncMutated {
+					return errors.Join(status.ErrDurableMutation, ownershipErr)
+				}
+				return ownershipErr
 			}
 			c.logger.Warn("cutover failed", "error", err.Error())
 			continue
@@ -141,6 +205,32 @@ func (c *CutOver) Run(ctx context.Context) error {
 	}
 	c.logger.Error("cutover failed, and retries exhausted")
 	return err
+}
+
+func (c *CutOver) runCutoverCallback(ctx context.Context) error {
+	if c.cutoverFuncSucceeded || (c.cutoverResultFunc == nil && c.cutoverFunc == nil) {
+		return nil
+	}
+	c.logger.Info("Running cutover function")
+	if c.cutoverResultFunc != nil {
+		result, err := c.cutoverResultFunc(ctx)
+		c.cutoverFuncMutated = c.cutoverFuncMutated || result.DurableMutation
+		c.cutoverFuncAmbiguous = c.cutoverFuncAmbiguous || result.OwnershipAmbiguous
+		if result.OwnershipAmbiguous && err == nil {
+			err = status.ErrOwnershipAmbiguous
+		}
+		if err != nil {
+			return err
+		}
+	} else if err := c.cutoverFunc(ctx); err != nil {
+		// The legacy callback cannot report whether it mutated before failing.
+		// Do not retry an unknown traffic-switch outcome.
+		c.cutoverFuncAmbiguous = true
+		return err
+	}
+	c.cutoverFuncSucceeded = true
+	c.logger.Info("Cutover function complete")
+	return nil
 }
 
 func (c *CutOver) algorithmCutover(ctx context.Context) error {
@@ -177,20 +267,21 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 		}
 	}
 
-	// Run the cutover function (Vitess coordination). It is invoked at most
-	// once per CutOver: the traffic switch is not assumed to be idempotent,
-	// so if a later step fails the retry must never re-run it.
-	if c.cutoverFunc != nil && !c.cutoverFuncSucceeded {
-		c.logger.Info("Running cutover function")
-		if err := c.cutoverFunc(ctx); err != nil {
-			return err
+	if c.preSwitch != nil {
+		if err := c.preSwitch(ctx); err != nil {
+			return fmt.Errorf("reverse-window pre-switch hook failed: %w", err)
 		}
-		c.cutoverFuncSucceeded = true
-		c.logger.Info("Cutover function complete")
+	}
+
+	// Run the caller-owned traffic switch at most once. Result-bearing callers
+	// retain durable-mutation and ambiguity evidence even when they return an
+	// error; the legacy callback is conservatively ambiguous on any error.
+	if err := c.runCutoverCallback(ctx); err != nil {
+		return err
 	}
 
 	// Reverse-window hook: after the traffic switch and before retiring the
-	// sources, capture the reverse-feed start positions and record that the
+	// sources, persist the captured reverse-feed positions and record that the
 	// move has entered its reverse window. Runs once, under the source locks,
 	// while the sources are quiescent. If it fails the cutover fails: the
 	// routing switch has already succeeded, so (like a rename failure past that
@@ -222,15 +313,33 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 			}
 		}
 		if err = c.renameAllSources(ctx, sourceLocks); err == nil {
+			// Every source is renamed and the source locks are still held, so no
+			// write can be in flight. Stop the forward feeds inside that window
+			// rather than after the deferred unlock, where the first straggler
+			// write races us. A reverse window is unaffected: its feeds are
+			// separate clients (ReverseFeed) reading the targets, and its start
+			// positions were captured by preSwitch above. See change.Source's
+			// Stop.
+			c.stopSourceFeeds()
 			return nil
 		}
-		if errors.Is(err, errRenameRollbackFailed) {
-			// The sources are partially renamed; retrying cannot converge.
+		if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, status.ErrOwnershipAmbiguous) {
+			// The sources are partially renamed, or a rename's outcome is
+			// unknown; retrying cannot converge on either.
 			return err
 		}
 		c.logger.Warn("rename failed", "error", err.Error())
 	}
 	return fmt.Errorf("rename failed after %d attempts under lock: %w", c.dbConfig.MaxRetries, err)
+}
+
+// stopSourceFeeds tells every source feed that its subscriptions have stopped
+// describing reality. Called once the rename has fully succeeded, while the
+// source locks are still held.
+func (c *CutOver) stopSourceFeeds() {
+	for _, src := range c.sources {
+		src.ReplClient.Stop()
+	}
 }
 
 // renameAllSources renames the tables on every source to their _old names,
@@ -269,6 +378,15 @@ func (c *CutOver) renameAllSources(ctx context.Context, sourceLocks []*dbconn.Ta
 			if len(rollbackErrors) > 0 {
 				return fmt.Errorf("%w: rename failed on source %d and rollback also failed (%s): %w",
 					errRenameRollbackFailed, i, strings.Join(rollbackErrors, "; "), err)
+			}
+			if dbconn.IsConnectionLossError(err) {
+				// The connection died, so the server may have committed this
+				// source's rename before the OK packet was lost. The earlier
+				// sources have definitively been rolled back, but this one's
+				// state is unknown: retrying the whole rename could retire a
+				// source that is already retired.
+				return fmt.Errorf("%w: rename outcome unknown on source %d, rolled back %d completed renames: %w",
+					status.ErrOwnershipAmbiguous, i, len(completedRenames), err)
 			}
 			return fmt.Errorf("rename failed on source %d, rolled back %d completed renames: %w",
 				i, len(completedRenames), err)

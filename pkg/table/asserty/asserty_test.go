@@ -9,7 +9,7 @@ import (
 )
 
 func TestBasicUsage(t *testing.T) {
-	db, err := sql.Open("mysql", testutils.DSN())
+	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()

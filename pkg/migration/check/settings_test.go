@@ -11,17 +11,13 @@ import (
 
 func TestSettings(t *testing.T) {
 	r := Resources{
-		Table:           &table.TableInfo{TableName: "test", SchemaName: "test"},
-		Threads:         2,
-		TargetChunkTime: time.Second * 5,
-		ReplicaMaxLag:   time.Hour,
+		Table:         &table.TableInfo{TableName: "test", SchemaName: "test"},
+		Threads:       2,
+		ReplicaMaxLag: time.Hour,
 	}
 
 	// 0 means "use default". This is a bit of a hack,
 	// but the test suite depends on it.
-	if r.TargetChunkTime == 0 {
-		r.TargetChunkTime = time.Millisecond * 500
-	}
 	if r.ReplicaMaxLag == 0 {
 		r.ReplicaMaxLag = time.Second * 120
 	}
@@ -41,11 +37,6 @@ func TestSettings(t *testing.T) {
 	err = settingsCheck(t.Context(), r, slog.Default())
 	require.NoError(t, err) // all looks good
 
-	r.TargetChunkTime = time.Second * 6
-	err = settingsCheck(t.Context(), r, slog.Default())
-	require.Error(t, err)
-
-	r.TargetChunkTime = time.Second * 4
 	r.ReplicaMaxLag = time.Second * 5
 	err = settingsCheck(t.Context(), r, slog.Default())
 	require.Error(t, err)

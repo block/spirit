@@ -34,13 +34,17 @@ import (
 //     IsThrottled() reports true, pausing the copy until polling recovers.
 const (
 	// staleSignalThreshold is how old the last successful sample may be
-	// before the cached value is no longer trusted. Three poll intervals
+	// before the cached value is no longer trusted. It is three poll intervals
 	// (commitLatencyPollInterval, threadsRunningPollInterval and the replica
-	// throttler's loopInterval are all 5s): one or two failed or slow polls —
-	// a brief failover blip, one stalled status query — don't flap the guard,
-	// but the signal is declared stale before the autoscaler can take more
-	// than one blind step, since its increases are spaced
-	// (acCooldownTicks+1)*acTick = 15s apart.
+	// throttler's loopInterval are all 5s), so one or two failed or slow polls —
+	// a brief failover blip, one stalled status query — don't flap the guard.
+	//
+	// It is deliberately NOT derived from the autoscaler's cooldown, because the
+	// poll interval is what it measures. But it does have to stay short enough
+	// that the signal is declared stale before the autoscaler can take more than
+	// one blind step on the frozen value, which bounds it by the spacing of the
+	// autoscaler's increases — see TestStaleThresholdBoundsBlindAutoscalerSteps,
+	// which pins that relationship so moving either side fails loudly.
 	staleSignalThreshold = 15 * time.Second
 
 	// StaleUtilizationHold is the utilization reported while the signal is

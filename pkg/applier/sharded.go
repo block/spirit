@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -26,10 +27,11 @@ import (
 type ShardedApplier struct {
 	sync.Mutex
 
-	shards   []*shardTarget
-	targets  []Target // Original target configurations
-	dbConfig *dbconn.DBConfig
-	logger   *slog.Logger
+	shards      []*shardTarget
+	targets     []Target // Original target configurations
+	dbConfig    *dbconn.DBConfig
+	logger      *slog.Logger
+	metricsSink metrics.Sink // nil disables the stats emitter
 
 	// Pending work tracking (shared across all shards).
 	//
@@ -52,6 +54,21 @@ type ShardedApplier struct {
 	cancelFunc context.CancelFunc
 	wg         sync.WaitGroup
 
+	// timings is a rolling window of per-chunklet queue-wait and write
+	// durations across all shards, reported by Stats(). A single shared ring
+	// is deliberate: the bottleneck question ("is the write side saturated?")
+	// does not need per-shard attribution.
+	timings timingRing
+
+	// splits accumulates the chunklet/row counts behind Stats.RowsPerChunklet.
+	// The caps (chunkletMaxRows/MaxStatementSizeBytes) are global, but the
+	// splitting itself happens per shard: Apply routes rows to shards first and
+	// then calls splitRowsIntoChunklets on each shard's share, so one chunk
+	// yields more, shorter chunklets than it would unsharded. The counter sums
+	// those per-shard splits, and the mean is correspondingly lower — see the
+	// caveat on Stats.RowsPerChunklet.
+	splits splitCounter
+
 	// State management to make Start/Stop idempotent
 	stopped bool
 	started bool
@@ -59,24 +76,25 @@ type ShardedApplier struct {
 
 // shardTarget represents a single shard with its own connection, key range, and workers
 type shardTarget struct {
-	shardID              int
-	writeDB              *sql.DB
-	keyRange             keyRange // Parsed key range for this shard
-	chunkletBuffer       chan shardedChunklet
-	chunkletCompletions  chan shardedChunkletCompletion
-	writeWorkersCount    int32
-	writeWorkersFinished int32
-	workerIDCounter      int32
-	logger               *slog.Logger
-	dbConfig             *dbconn.DBConfig
+	shardID             int
+	writeDB             *sql.DB
+	keyRange            keyRange // Parsed key range for this shard
+	chunkletBuffer      chan shardedChunklet
+	chunkletCompletions chan shardedChunkletCompletion
+	writeWorkersCount   int32
+	workers             workerPool
+	workerIDCounter     int32
+	logger              *slog.Logger
+	dbConfig            *dbconn.DBConfig
 }
 
 // shardedChunklet represents a chunklet destined for a specific shard
 type shardedChunklet struct {
-	workID  int64        // ID of the parent work
-	shardID int          // Which shard this belongs to
-	chunk   *table.Chunk // Original chunk for column info
-	rows    []rowData    // Rows for this shard
+	workID     int64        // ID of the parent work
+	shardID    int          // Which shard this belongs to
+	chunk      *table.Chunk // Original chunk for column info
+	rows       []rowData    // Rows for this shard
+	enqueuedAt time.Time    // when Apply() offered this chunklet to the shard buffer; queue wait = dequeue - enqueuedAt
 }
 
 // shardedChunkletCompletion represents a completed sharded chunklet
@@ -98,6 +116,12 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 	}
 	shards := make([]*shardTarget, len(targets))
 	for i, target := range targets {
+		// A nil connection is only discovered when a row routes to this shard,
+		// which may be long after construction (and never in a test that only
+		// exercises other shards) — fail here instead.
+		if target.DB == nil {
+			return nil, fmt.Errorf("shard %d: target DB must be non-nil", i)
+		}
 		// Parse the key range
 		kr, err := parseKeyRange(target.KeyRange)
 		if err != nil {
@@ -120,9 +144,9 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 	for i := range shards {
 		for j := i + 1; j < len(shards); j++ {
 			if shards[i].keyRange.overlaps(shards[j].keyRange) {
-				return nil, fmt.Errorf("key ranges overlap: shard %d (%s: [0x%016x, 0x%016x)) and shard %d (%s: [0x%016x, 0x%016x))",
-					i, targets[i].KeyRange, shards[i].keyRange.start, shards[i].keyRange.end,
-					j, targets[j].KeyRange, shards[j].keyRange.start, shards[j].keyRange.end)
+				return nil, fmt.Errorf("key ranges overlap: shard %d (%s: %s) and shard %d (%s: %s)",
+					i, targets[i].KeyRange, shards[i].keyRange,
+					j, targets[j].KeyRange, shards[j].keyRange)
 			}
 		}
 	}
@@ -132,8 +156,7 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 		cfg.Logger.Info("parsed key range for shard",
 			"shardID", i,
 			"keyRange", targets[i].KeyRange,
-			"start", fmt.Sprintf("0x%016x", shard.keyRange.start),
-			"end", fmt.Sprintf("0x%016x", shard.keyRange.end))
+			"parsed", shard.keyRange.String())
 	}
 
 	return &ShardedApplier{
@@ -141,6 +164,7 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 		targets:     targets,
 		dbConfig:    cfg.DBConfig,
 		logger:      cfg.Logger,
+		metricsSink: cfg.MetricsSink,
 		pendingWork: make(map[int64]*pendingWork),
 	}, nil
 }
@@ -153,7 +177,7 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 // by itself shut down the goroutine pipeline — it only aborts in-flight writes.
 // Workers for a shard exit when its chunkletBuffer is closed (by Stop), and the
 // coordinator exits when every shard's chunkletCompletions has been closed
-// (by the last worker's defer per shard). Failing to call Stop() will leak
+// (by Stop after joining each shard's workers). Failing to call Stop() will leak
 // goroutines.
 func (a *ShardedApplier) Start(ctx context.Context) error {
 	a.Lock()
@@ -171,7 +195,6 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 		for _, shard := range a.shards {
 			shard.chunkletBuffer = make(chan shardedChunklet, defaultBufferSize)
 			shard.chunkletCompletions = make(chan shardedChunkletCompletion, defaultBufferSize)
-			shard.writeWorkersFinished = 0
 			shard.workerIDCounter = 0
 		}
 		a.stopped = false
@@ -183,17 +206,22 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 	a.started = true
 	a.logger.Info("starting ShardedApplier", "shardCount", len(a.shards))
 
-	// Start workers for each shard
-	for i := range a.shards {
-		for range a.shards[i].writeWorkersCount {
-			a.wg.Add(1)
-			go a.writeWorker(workerCtx, a.shards[i])
-		}
+	// The configured count is per target, as with fixed pools.
+	for _, shard := range a.shards {
+		shard.workers.start(workerCtx, int(shard.writeWorkersCount), func(ctx context.Context, quit <-chan struct{}) { a.writeWorker(ctx, shard, quit) })
 	}
 
 	// Start a single feedback coordinator for all shards
 	a.wg.Add(1)
 	go a.feedbackCoordinator(workerCtx)
+
+	// Report pipeline gauges (aggregated across shards) for the applier's
+	// lifetime. Exits on Stop()'s context cancellation; joined via a.wg.
+	if a.metricsSink != nil {
+		a.wg.Go(func() {
+			emitStatsLoop(workerCtx, a, a.metricsSink, a.logger)
+		})
+	}
 
 	return nil
 }
@@ -276,6 +304,7 @@ func (a *ShardedApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][
 		// Use shared helper to split rows into chunklets
 		// Then convert row batches into sharded chunklets with metadata
 		rowBatches := splitRowsIntoChunklets(rows)
+		a.splits.record(len(rowBatches), len(rows))
 		for _, batch := range rowBatches {
 			allChunklets = append(allChunklets, shardedChunklet{
 				workID:  workID,
@@ -309,6 +338,10 @@ func (a *ShardedApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][
 	// coordinator already claimed the work (e.g. an error completion raced
 	// this cancellation), `exists` is false and we return without invoking.
 	for _, chunkletData := range allChunklets {
+		// Stamp before the send so queue wait includes send-side
+		// backpressure: when the shard buffer is full, time blocked here is
+		// exactly "waiting for a write worker".
+		chunkletData.enqueuedAt = time.Now()
 		select {
 		case a.shards[chunkletData.shardID].chunkletBuffer <- chunkletData:
 		case <-ctx.Done():
@@ -394,6 +427,7 @@ func (a *ShardedApplier) Stop() error {
 
 	// Close all shard buffers
 	for _, shard := range a.shards {
+		shard.workers.seal()
 		close(shard.chunkletBuffer)
 	}
 
@@ -404,30 +438,76 @@ func (a *ShardedApplier) Stop() error {
 	// Release the lock before waiting for workers to finish
 	a.Unlock()
 
-	// Wait for all workers to finish
+	// Stop owns completion-channel closure. Retiring workers must never close
+	// it: other workers may still be writing, or the pool may grow again.
+	for _, shard := range a.shards {
+		shard.workers.wait()
+		close(shard.chunkletCompletions)
+	}
 	a.wg.Wait()
 
 	a.logger.Debug("ShardedApplier stopped")
 	return nil
 }
 
-// writeWorker processes chunklets for a specific shard
-func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget) {
-	defer a.wg.Done()
-	workerID := atomic.AddInt32(&shard.workerIDCounter, 1)
+// SetWriteWorkers sets the desired worker count PER SHARD. A controller may
+// drive all shards with the maximum target utilization, so a busy shard slows
+// the entire move. Retirement happens between chunklets; callbacks are never lost.
+func (a *ShardedApplier) SetWriteWorkers(n int) {
+	a.Lock()
+	defer a.Unlock()
+	if !a.started || a.stopped {
+		return
+	}
+	for _, shard := range a.shards {
+		shard.workers.resize(n)
+	}
+}
 
-	defer func() {
-		finishedCount := atomic.AddInt32(&shard.writeWorkersFinished, 1)
-		a.logger.Debug("writeWorker finished", "shardID", shard.shardID, "workerID", workerID,
-			"finishedCount", finishedCount, "totalWorkers", shard.writeWorkersCount)
-
-		// If all write workers for this shard are finished, close its completions channel
-		if finishedCount == shard.writeWorkersCount {
-			a.logger.Debug("writeWorker all workers finished for shard, closing completions channel",
-				"shardID", shard.shardID)
-			close(shard.chunkletCompletions)
+// Stats returns a point-in-time snapshot of the write pipeline, aggregated
+// across shards: queue depth/cap are summed, and active workers is the sum of
+// each shard's pool count — goroutines currently running, which during a shrink
+// can briefly exceed the number of quit channels the pool still tracks, since a
+// retired worker is removed from quits before it returns. The embedded mutex is
+// held so the buffer reads cannot race Start()'s channel reinitialization on
+// restart; len/cap on a closed channel are safe.
+func (a *ShardedApplier) Stats() Stats {
+	a.Lock()
+	var queueDepth, queueCap, activeWorkers int
+	for _, shard := range a.shards {
+		queueDepth += len(shard.chunkletBuffer)
+		queueCap += cap(shard.chunkletBuffer)
+		if a.started {
+			activeWorkers += shard.workers.count()
 		}
-	}()
+	}
+	a.Unlock()
+
+	a.pendingMutex.Lock()
+	pending := len(a.pendingWork)
+	a.pendingMutex.Unlock()
+
+	t := a.timings.percentiles()
+	return Stats{
+		QueueDepth:      queueDepth,
+		QueueCap:        queueCap,
+		PendingWork:     pending,
+		ActiveWorkers:   activeWorkers,
+		RowsPerChunklet: a.splits.mean(),
+		QueueWaitP50:    t.queueWaitP50,
+		QueueWaitP90:    t.queueWaitP90,
+		BuildTimeP50:    t.buildP50,
+		BuildTimeP90:    t.buildP90,
+		WriteTimeP50:    t.writeP50,
+		WriteTimeP90:    t.writeP90,
+		HandoffP50:      t.handoffP50,
+		HandoffP90:      t.handoffP90,
+	}
+}
+
+// writeWorker processes chunklets for a specific shard
+func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, quit <-chan struct{}) {
+	workerID := atomic.AddInt32(&shard.workerIDCounter, 1)
 
 	// Drain chunkletBuffer until it is closed by Stop(). We deliberately do not
 	// select on ctx.Done() here: every chunklet that made it into the buffer was
@@ -437,34 +517,54 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget) {
 	// feedbackCoordinator then invokes the callback with the error and clears
 	// pendingWork. Stop() is the canonical shutdown path: it cancels ctx (so
 	// in-flight writes abort) and closes chunkletBuffer (so workers exit).
-	for chunkletData := range shard.chunkletBuffer {
+	for {
+		var chunkletData shardedChunklet
+		select {
+		case <-quit:
+			return
+		case next, ok := <-shard.chunkletBuffer:
+			if !ok {
+				return
+			}
+			chunkletData = next
+		}
 		a.logger.Debug("writeWorker processing chunklet", "shardID", shard.shardID,
 			"workerID", workerID, "workID", chunkletData.workID, "rowCount", len(chunkletData.rows))
 
-		affectedRows, err := a.writeChunklet(ctx, shard, chunkletData)
+		queueWait := time.Since(chunkletData.enqueuedAt)
+		writeStart := time.Now()
+		affectedRows, buildTime, err := a.writeChunklet(ctx, shard, chunkletData)
+		writeTime := time.Since(writeStart)
 
+		// Timed separately from the write — see the equivalent comment in
+		// SingleTargetApplier.writeWorker. A worker blocked publishing its
+		// completion is waiting on the feedbackCoordinator, not the shard.
+		handoffStart := time.Now()
 		shard.chunkletCompletions <- shardedChunkletCompletion{
 			workID:       chunkletData.workID,
 			shardID:      shard.shardID,
 			affectedRows: affectedRows,
 			err:          err,
 		}
+		a.timings.record(queueWait, buildTime, writeTime, time.Since(handoffStart))
 	}
-	a.logger.Debug("writeWorker channel closed, exiting", "shardID", shard.shardID, "workerID", workerID)
 }
 
-// writeChunklet writes a single chunklet to a specific shard
-func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, chunkletData shardedChunklet) (int64, error) {
+// writeChunklet writes a single chunklet to a specific shard. It returns the
+// affected row count and, separately, how long the client-side statement build
+// took — see SingleTargetApplier.writeChunklet.
+func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, chunkletData shardedChunklet) (int64, time.Duration, error) {
 	if len(chunkletData.rows) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
+	buildStart := time.Now()
 
 	// Fast path on shutdown: if ctx is already cancelled, fail the chunklet
 	// without building the (potentially large) INSERT statement or burning
 	// retries against a dead context. writeWorker relies on chunklets failing
 	// quickly after cancellation so Stop() can drain the buffer promptly.
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, time.Since(buildStart), err
 	}
 
 	// Create a context with timeout for the entire operation
@@ -475,30 +575,39 @@ func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, 
 	columnList, _ := chunkletData.chunk.ColumnMapping.Columns()
 	columnNames, _ := chunkletData.chunk.ColumnMapping.ColumnsSlice()
 
+	// Resolve each column's type once per chunklet, not once per value — the
+	// type is a property of the column, and the parse dominated the build.
+	// See the SingleTargetApplier's writeChunklet for the measurement.
+	targetTable := chunkletData.chunk.ColumnMapping.TargetTable()
+	colTypes := make([]table.ColumnType, len(columnNames))
+	for i, colName := range columnNames {
+		typeStr, ok := targetTable.GetColumnMySQLType(colName)
+		if !ok {
+			return 0, time.Since(buildStart), fmt.Errorf("column %s not found in table info", colName)
+		}
+		colTypes[i] = table.NewColumnType(typeStr)
+	}
+
 	// Build VALUES clauses for all rows in the chunklet
-	var valuesClauses []string
+	valuesClauses := make([]string, 0, len(chunkletData.rows))
+	values := make([]string, len(columnNames))
 	for _, row := range chunkletData.rows {
 		if len(columnNames) != len(row.values) {
-			return 0, fmt.Errorf("column count mismatch: chunk %s has %d columns, but chunklet has %d values",
+			return 0, time.Since(buildStart), fmt.Errorf("column count mismatch: chunk %s has %d columns, but chunklet has %d values",
 				chunkletData.chunk.String(), len(columnNames), len(row.values))
 		}
-		var values []string
 		for i, value := range row.values {
-			columnType, ok := chunkletData.chunk.ColumnMapping.TargetTable().GetColumnMySQLType(columnNames[i])
-			if !ok {
-				return 0, fmt.Errorf("column %s not found in table info", columnNames[i])
-			}
-			datum, err := table.NewDatumFromValue(value, columnType)
+			datum, err := table.NewDatumFromValueWithType(value, colTypes[i])
 			if err != nil {
-				return 0, fmt.Errorf("failed to convert value to datum for column %s: %w", columnNames[i], err)
+				return 0, time.Since(buildStart), fmt.Errorf("failed to convert value to datum for column %s: %w", columnNames[i], err)
 			}
 			// datum.String() returns a complete pre-escaped SQL literal
 			// (NULL, a numeric, 0x… hex, or a "..."-quoted string). Safe
 			// to concatenate into the VALUES clause as-is — see the
 			// contract on Datum.String.
-			values = append(values, datum.String())
+			values[i] = datum.String()
 		}
-		valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
+		valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 	}
 
 	// Build the INSERT statement
@@ -510,16 +619,18 @@ func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, 
 		strings.Join(valuesClauses, ", "),
 	)
 
+	buildTime := time.Since(buildStart)
+
 	a.logger.Debug("writing chunklet to shard", "shardID", shard.shardID,
 		"rowCount", len(chunkletData.rows), "table", chunkletData.chunk.ColumnMapping.TargetTable().TableName)
 
 	// Execute the batch insert on this shard's database
 	result, err := dbconn.RetryableTransaction(ctx, shard.writeDB, dbconn.IgnoreDupKeyWarnings, shard.dbConfig, query)
 	if err != nil {
-		return 0, fmt.Errorf("failed to execute chunklet insert on shard %d: %w", shard.shardID, err)
+		return 0, buildTime, fmt.Errorf("failed to execute chunklet insert on shard %d: %w", shard.shardID, err)
 	}
 
-	return result, nil
+	return result, buildTime, nil
 }
 
 // feedbackCoordinator tracks chunklet completions from all shards and invokes callbacks when work is done.
@@ -674,12 +785,17 @@ func (a *ShardedApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*
 // the deletes to all shards. The vindex value is considered immutable, and we will
 // error if it changes on an update.
 //
-// Note: the sharded applier does not allow any transformations!
-// The targetTable argument is intentionally ignored.
-// This also means that table names between source and target must be the same.
-func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, _ *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+// Note: the sharded applier supports renaming the table (targetTable, nil =>
+// same name as sourceTable) but no column transformations. The rename exists
+// for the reverse feed of a sharded-source move, which writes back to the
+// source's retired `_old` tables.
+func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
+	}
+	// For move operations, targetTable may be nil - use sourceTable for both
+	if targetTable == nil {
+		targetTable = sourceTable
 	}
 	// Resolve which lock belongs to which shard before executing anything,
 	// so a missing lock fails loudly instead of partially applying.
@@ -703,7 +819,7 @@ func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, _ *table.T
 	// Use just the table name, not the fully qualified name, because
 	// the database connection (shard.writeDB) already determines which database to write to
 	deleteStmt := fmt.Sprintf("DELETE FROM %s WHERE (%s) IN (%s)",
-		sourceTable.QuotedTableName,
+		targetTable.QuotedTableName,
 		table.QuoteColumns(sourceTable.KeyColumns),
 		inClause,
 	)
@@ -784,9 +900,12 @@ func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, _ *table.T
 // This is likely not too big of a limitation, as Vitess itself recommends that vindex columns be immutable.
 // If it turns out to be a problem, we can revisit tracking by other columns later.
 //
-// Note: the sharded applier does not allow any transformations!
-// The targetTable argument is intentionally ignored.
-// This also means that table names between source and target must be the same.
+// Note: the sharded applier supports renaming the table (mapping's target,
+// which defaults to the source when no NewTable is set) but no column
+// transformations. The rename exists for the reverse feed of a sharded-source
+// move, which writes back to the source's retired `_old` tables. The sharding
+// column and hash always come from the mapping's SOURCE table — the watched
+// table whose row images we are routing.
 func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
@@ -815,6 +934,7 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 	// (since RowImage from binlog contains ALL columns, including generated ones)
 	shardingOrdinal := slices.Index(sourceTable.Columns, sourceTable.ShardingColumn)
 	sourceOrdinal := mapping.SourceOrdinalIndices()
+	sourceColumnNames, _ := mapping.ColumnsSlice()
 	if shardingOrdinal == -1 {
 		return 0, fmt.Errorf("sharding column %s not found in columns", sourceTable.ShardingColumn)
 	}
@@ -862,8 +982,24 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 	results := make(chan result, shardsToCopy)
 	defer close(results)
 
-	// Build column list for the upsert statement
-	columnList := table.QuoteColumns(sourceTable.NonGeneratedColumns)
+	// Build the column list for the upsert statement from the mapping so a
+	// renamed target (e.g. the reverse feed's `_old` tables) uses its own
+	// column list. With no rename the mapping's target IS the source table,
+	// so this is identical to the previous NonGeneratedColumns list.
+	_, columnList := mapping.Columns()
+
+	// Resolve each column's type once for the whole fan-out. Doing it inside
+	// the loop made every shard's goroutine re-parse the same type string for
+	// every value, so the cost scaled with shards as well as rows. colTypes is
+	// only read from here on, so sharing it across the goroutines is safe.
+	colTypes := make([]table.ColumnType, len(sourceOrdinal))
+	for i := range sourceOrdinal {
+		typeStr, ok := sourceTable.GetColumnMySQLType(sourceColumnNames[i])
+		if !ok {
+			return 0, fmt.Errorf("column %s not found in table info", sourceColumnNames[i])
+		}
+		colTypes[i] = table.NewColumnType(typeStr)
+	}
 
 	for shardID, rows := range shardRows {
 		if len(rows) == 0 {
@@ -872,33 +1008,26 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 		}
 		go func(sid int, r []LogicalRow) {
 			// Build the VALUES clause
-			var valuesClauses []string
+			valuesClauses := make([]string, 0, len(r))
+			values := make([]string, len(sourceOrdinal))
 			for _, logicalRow := range r {
-				var values []string
 				for i, colIdx := range sourceOrdinal {
 					if colIdx >= len(logicalRow.RowImage) {
 						results <- result{err: fmt.Errorf("column index %d exceeds row image length %d", colIdx, len(logicalRow.RowImage))}
 						return
 					}
-					value := logicalRow.RowImage[colIdx]
-					col := sourceTable.NonGeneratedColumns[i]
-					columnType, ok := sourceTable.GetColumnMySQLType(col)
-					if !ok {
-						results <- result{err: fmt.Errorf("column %s not found in table info", col)}
-						return
-					}
-					datum, err := table.NewDatumFromValue(value, columnType)
+					datum, err := table.NewDatumFromValueWithType(logicalRow.RowImage[colIdx], colTypes[i])
 					if err != nil {
-						results <- result{err: fmt.Errorf("failed to convert value to datum for column %s: %w", col, err)}
+						results <- result{err: fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)}
 						return
 					}
 					// datum.String() returns a complete pre-escaped SQL
 					// literal (NULL, a numeric, 0x… hex, or a "..."-quoted
 					// string). Safe to concatenate into the VALUES clause
 					// as-is — see the contract on Datum.String.
-					values = append(values, datum.String())
+					values[i] = datum.String()
 				}
-				valuesClauses = append(valuesClauses, fmt.Sprintf("(%s)", strings.Join(values, ", ")))
+				valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 			}
 
 			// See ShardedApplier.UpsertRows (and SingleTargetApplier.UpsertRows)
@@ -906,14 +1035,14 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 			// implications. Just the table name here — the per-shard DB
 			// connection already determines which database to write to.
 			upsertStmt := fmt.Sprintf("REPLACE INTO %s (%s) VALUES %s",
-				sourceTable.QuotedTableName,
+				mapping.TargetTable().QuotedTableName,
 				columnList,
 				strings.Join(valuesClauses, ", "),
 			)
 			a.logger.Debug("executing upsert on shard",
 				"shardID", sid,
 				"rowCount", len(valuesClauses),
-				"table", sourceTable.TableName,
+				"table", mapping.TargetTable().TableName,
 			)
 			var affected int64
 			var err error

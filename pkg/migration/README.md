@@ -48,11 +48,9 @@ To answer this question, we need to understand that there are two types of locks
 1. **Data locks**, aka InnoDB row-level locks. These are configurable via `innodb_lock_wait_timeout`: the server default is 50s, but spirit overwrites this to 3s.
 2. **Metadata locks** (MDL). These are configurable via `lock_wait_timeout`: the server default is 1 year(!), but spirit overwrites this to 30s (configurable by `--lock-wait-timeout`).
 
-**By default, Spirit takes no data locks on the source table.** The default buffered copier reads rows into Spirit and writes them to `_new` through the applier (`REPLACE INTO _new VALUES (...)`), and the change source is likewise always buffered — it applies binlog row images and never runs `SELECT FROM original`. Neither path holds shared row locks on the source, so there is no copier-vs-OLTP contention on hot rows. (The applier's `REPLACE INTO` does take locks, but only on `_new`, which nothing else touches.) See [pkg/change/README.md](../change/README.md) for the subscription design.
+**Spirit takes no data locks on the source table.** The copier reads rows into Spirit and writes them to `_new` through the applier (`REPLACE INTO _new VALUES (...)`), and the change source is likewise buffered — it applies binlog row images and never runs `SELECT FROM original`. The checksum's chunk repair works the same way (see [pkg/checksum/README.md](../checksum/README.md#chunk-repair)): it reads the chunk into Spirit and rewrites it through the applier, rather than the `REPLACE INTO _new ... SELECT FROM original` it used historically, whose `SELECT` half did take shared row locks on the source. None of these paths hold shared row locks on the source, so there is no contention with production workloads on hot rows. (The applier's writes do take locks, but only on `_new`, which nothing else touches.) See [pkg/change/README.md](../change/README.md) for the subscription design.
 
-Data locks only re-enter the picture if you opt into the legacy `--unbuffered` copier, which issues `INSERT IGNORE INTO _new ... SELECT FROM original`. The `SELECT` side takes shared row locks rather than using MVCC, so it can contend with production workloads touching the same rows. When using `--unbuffered`, the main knob to mitigate this is `target-chunk-time`: smaller chunks mean each copy statement holds locks for less time.
-
-So the locking that *does* apply by default is **metadata locks**. When we describe Spirit as a "non-blocking schema change tool" that is a bit of a white lie: we don't hold an MDL for the entire 10h schema change, as built-in MySQL DDL often does, but we do need a brief exclusive MDL at a few points:
+So the locking that *does* apply is **metadata locks**. When we describe Spirit as a "non-blocking schema change tool" that is a bit of a white lie: we don't hold an MDL for the entire 10h schema change, as built-in MySQL DDL often does, but we do need a brief exclusive MDL at a few points:
 
 * Spirit initially attempts INSTANT/INPLACE DDL. If this is compatible, it requires an exclusive metadata lock on the table.
 * Starting a checksum requires an initial exclusive metadata lock to ensure that all data is synchronized between the checksum threads.
@@ -62,7 +60,7 @@ What causes all metadata lock issues? (hint: it's not spirit)
 
 Any open transactions will have shared metadata locks on any of the tables that you are modifying. If you have long transactions that have not yet committed/rolled back, Spirit's exclusive lock will be queued waiting for them to finish. This then looks like a Spirit problem because any shared lock requests that arrive after Spirit's exclusive lock request will then be queued behind Spirit. So the solution is to keep your transactions as short as possible.
 
-The _fix_ for Spirit, is that it will by default `force-kill` the specific connections that are blocking it from acquiring an exclusive lock. This can be disabled with `--skip-force-kill` if needed.
+The _fix_ for Spirit is that it will `force-kill` the specific connections that are blocking it from acquiring an exclusive lock. This is always enabled: retrying MDL acquisition over and over while blocked is more dangerous to production systems than targeted killing of the blockers.
 
 ## Using Spirit `migration` as a Go package
 
@@ -79,7 +77,6 @@ func (sm *Spirit) Execute(ctx context.Context, m *ExecutableTask) error {
 		Password:          &m.Cluster.Password,
 		Database:          m.Cluster.DatabaseName,
 		Statement:         m.Statement,
-		TargetChunkTime:   m.TargetChunkTime,
 		Threads:           m.Concurrency,
 		LockWaitTimeout:   m.LockWaitTimeout,
 		InterpolateParams: true,

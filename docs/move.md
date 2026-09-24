@@ -14,17 +14,17 @@ This will copy all tables from the source database to the target database, verif
 ## Configuration
 
 - [checkpoint-max-age](#checkpoint-max-age)
-- [create-sentinel](#create-sentinel)
+- [defer-cutover](#defer-cutover)
 - [defer-secondary-indexes](#defer-secondary-indexes)
-- [enable-experimental-gtid](#enable-experimental-gtid)
 - [force](#force)
+- [max-connections](#max-connections)
 - [reverse-window](#reverse-window)
 - [source-dsn](#source-dsn)
-- [target-chunk-time](#target-chunk-time)
 - [target-chunk-size](#target-chunk-size)
 - [target-dsn](#target-dsn)
 - [threads](#threads)
 - [write-threads](#write-threads)
+- [enable-experimental-autoscaling](#enable-experimental-autoscaling)
 
 ### checkpoint-max-age
 
@@ -33,11 +33,11 @@ This will copy all tables from the source database to the target database, verif
 
 The maximum age of a checkpoint before Move refuses to resume from it. Replaying many days of accumulated binary logs can be slower than re-copying, and the binary logs may have been purged in the meantime.
 
-Unlike [migrate](migrate.md#checkpoint-max-age), Move does **not** fall back to a fresh copy when the checkpoint is too old: the target tables already contain rows (which is why the resume path was selected), so silently restarting is not possible. Instead the move fails with a `checkpoint is too old to safely resume` error. To proceed, either re-run with a larger `--checkpoint-max-age`, or wipe the target tables (including the `_spirit_checkpoint` table) and restart the move from scratch.
+Unlike [migrate](migrate.md#checkpoint-max-age), Move does **not** fall back to a fresh copy when the checkpoint is too old: the target tables already contain rows (which is why the resume path was selected), so silently restarting is not possible. Instead the move fails with a `checkpoint is too old to safely resume` error. To proceed, either re-run with a larger `--checkpoint-max-age`, or wipe the target tables (including the `_spirit_move_checkpoint` table) and restart the move from scratch.
 
 The same caveats about [resuming across Spirit binary versions](migrate.md#resuming-across-spirit-binary-versions) apply to Move, with one difference: where migrate silently discards an unreadable checkpoint and starts fresh, Move fails the run.
 
-### create-sentinel
+### defer-cutover
 
 - Type: Boolean
 - Default value: `false`
@@ -46,12 +46,12 @@ When set to `true`, a sentinel table (`_spirit_sentinel`) is created on the firs
 
 #### Two-checksum model
 
-When `create-sentinel` is in use Move runs two checksums:
+When `defer-cutover` is in use Move runs two checksums:
 
 1. The **initial checksum** runs after copy-rows completes and before Move starts waiting on the sentinel. This is the correctness gate; the cutover will not proceed unless the initial checksum succeeds.
 2. The **continuous checksum** runs in a loop *while* Move is waiting on the sentinel to be dropped. It is a best-effort consistency re-check so that the data is re-verified close to the moment of cutover, even if the sentinel sits for hours. The continuous loop is interrupted as soon as the sentinel is dropped, and Move proceeds to cutover. One exception: if a pass had already detected a mismatch and is mid-recopy, the in-flight repair runs to completion (bounded by an internal per-chunk timeout) before cutover continues, since cancelling between the DELETE on targets and the re-apply from sources would leave the chunk inconsistent. A real repair error surfaced this way aborts the run instead of proceeding to cutover.
 
-Move order (with `create-sentinel`):
+Move order (with `defer-cutover`):
 
 ```
 copy rows → initial checksum → wait on sentinel (continuous checksum loop) → cutover
@@ -66,7 +66,7 @@ Each continuous-checksum pass runs once with no internal retry (the loop itself 
 - Type: Boolean
 - Default value: `false`
 
-When set to `true`, target tables are created without secondary indexes. The indexes are restored from the source schema just before cutover. This can significantly speed up the initial data load for tables with many secondary indexes.
+When set to `true`, target tables are created without deferrable regular secondary indexes. PRIMARY, UNIQUE, FULLTEXT, and SPATIAL indexes are preserved, as is one regular index needed to support AUTO_INCREMENT (preferring the fewest key parts). The deferred indexes are restored from the source schema just before cutover. This can significantly speed up the initial data load for tables with many secondary indexes.
 
 ### force
 
@@ -75,38 +75,16 @@ When set to `true`, target tables are created without secondary indexes. The ind
 
 When Move cannot resume from an existing checkpoint — for example the checkpoint was written by an incompatible Spirit version, or the target is in a state the resume path cannot validate — it fails rather than risk corrupting a partially-copied target (see [checkpoint-max-age](#checkpoint-max-age)).
 
-Passing `--force` changes that recovery behaviour: instead of failing, Move wipes the target tables and starts the copy fresh, re-running the post-setup safety checks against the cleaned target rather than bypassing them. Use it only when the target's current contents can safely be discarded.
+Passing `--force` changes that recovery behaviour: instead of failing, Move wipes the target tables and starts the copy fresh, checking for source-side failures before wiping and re-running the full post-setup checks against the cleaned target. Expired checkpoints and malformed or missing source positions are eligible for forced recovery; transient read or connection failures are not. Source and target must refer to different databases, even if different hostnames or credentials are used. Use it only when the target's current contents can safely be discarded.
 
-### enable-experimental-gtid
+### max-connections
 
-- Type: Boolean
-- Default value: `false`
+- Type: Integer
+- Default value: `128`
 
-> **⚠️ Experimental.** See the full caveats and on-disk-format warning in the
-> [migrate `--enable-experimental-gtid` documentation](migrate.md#enable-experimental-gtid).
+Sets the fixed size of each source and target connection pool, matching `migrate`. Read and write workers share these pools; increasing worker counts does not grow them. Dedicated monitoring and advisory-lock connections are separate.
 
-When set to `true`, Move switches each source's replication change feed from
-the default binlog **file + offset** coordinate to a MySQL **GTID set**
-coordinate. Behaviour is identical to [`spirit migrate --enable-experimental-gtid`](migrate.md#enable-experimental-gtid)
-in every other respect — the copier, applier, checksum, sentinel wait, cutover,
-and checkpoint contract are unchanged.
-
-For N:M moves (multiple `SourceDSNs`) the flag is applied uniformly to **every**
-source — Move does not support mixing GTID and file+offset across sources in a
-single run. Each source's checkpointed coordinate is stored independently in the
-checkpoint table's `binlog_positions` JSON, keyed by source address+database, so
-a partial failure on one source still resumes the others from their own GTID sets.
-
-**Requirements (on every source):**
-
-- `gtid_mode = ON`
-- `enforce_gtid_consistency = ON`
-
-```bash
-spirit move --enable-experimental-gtid \
-            --source-dsn "user:pass@tcp(source-host:3306)/mydb" \
-            --target-dsn "user:pass@tcp(target-host:3306)/mydb"
-```
+The explicit budget must cover `--threads` plus six connections of checksum headroom. During setup, the reserve grows by one connection per source table beyond the first. For example, 20 tables reserve 25 connections, and a smaller pool lowers read concurrency to a minimum of one, allowing background queries to queue. Reusing a connection handle across targets also requires room for each target’s checksum snapshots and locks. Any reduction in read concurrency is logged at INFO. Write workers may wait for a connection. This is a per-pool limit, not a total across the move.
 
 ### reverse-window
 
@@ -115,7 +93,7 @@ spirit move --enable-experimental-gtid \
 
 A normal Move ends with a one-way cutover: traffic moves to the target and the source tables are renamed to `_old`. `--reverse-window` makes that cutover **reversible** for a bounded period. Given a non-zero duration, Move does not exit after cutover — it stays running and, in change-only mode, streams writes from the target(s) *back* to the source's now-retired `_old` tables, keeping the source current so the move can be rolled back.
 
-While the window is open the run reports the `reverseWindow` state. The reverse feed uses the same change-source coordinate (binlog file+offset, or GTID with [`--enable-experimental-gtid`](#enable-experimental-gtid)) as the forward move. One of three things ends the window:
+While the window is open the run reports the `reverseWindow` state. The reverse feed streams from the target servers, so its change-source coordinate (binlog file+offset vs. GTID) is auto-detected from each *target*, independently of the forward move (see [GTID auto-detection](#gtid-auto-detection)). One of three things ends the window:
 
 1. **It elapses.** Move finalizes forward exactly as a normal cutover would — the source stays retired as `_old`, the checkpoint is dropped — and exits.
 2. **A rollback is requested** (see below). Move rolls back to the source and exits.
@@ -151,19 +129,12 @@ spirit move --reverse-window 30m \
 
 A Go MySQL DSN for the source database. All tables in this database will be copied.
 
-### target-chunk-time
-
-- Type: Duration
-- Default value: `5s`
-
-The target time for each **checksum** chunk. The copy phase always uses the buffered copier, which sizes its chunks against an in-memory byte budget rather than a target time, so this flag does not affect the copy. See the [migrate documentation](migrate.md#target-chunk-time) for a detailed explanation of how chunk timing (and the buffered copier's byte budget) works.
-
 ### target-chunk-size
 
 - Type: Integer (bytes)
 - Default value: `16777216` (16 MiB)
 
-The in-memory byte budget the buffered copier sizes each copy chunk against. Move always uses the buffered copier, so this is the knob that governs copy chunk sizing (the copy phase does not use [target-chunk-time](#target-chunk-time)). See the [migrate documentation](migrate.md#target-chunk-size) for details. Most users should not need to change it.
+The in-memory byte budget the buffered copier sizes each copy chunk against. Move always uses the buffered copier, so this is the knob that governs copy chunk sizing. See the [migrate documentation](migrate.md#target-chunk-size) for details. Most users should not need to change it.
 
 ### target-dsn
 
@@ -171,6 +142,17 @@ The in-memory byte budget the buffered copier sizes each copy chunk against. Mov
 - Default value: `spirit:spirit@tcp(127.0.0.1:3306)/dest`
 
 A Go MySQL DSN for the target database. Tables will be created here automatically from the source schema.
+
+A table that already exists on the target is used as-is, provided it is empty and its schema matches the source. "Matches" permits the target to be *stricter* in two specific ways, so a declaratively-managed target does not have to mirror artifacts of its unsharded source:
+
+- the source's column-level `AUTO_INCREMENT` may be absent on the target (its ids come from elsewhere, e.g. a Vitess sequence);
+- a column the source declares nullable may be `NOT NULL` on the target — for example a shard key, which cannot be NULL in a sharded keyspace.
+
+The reverse of either — a target looser than its source — is still a mismatch and fails pre-flight, as does any other difference (column types, charset, collation, indexes, constraints). The error reports the `ALTER` that would reconcile the target.
+
+A `NOT NULL` target column does not make Move filter or rewrite source rows. If the source data does contain a NULL there, the move fails rather than silently substituting a value — at row-hashing time for a sharded target, and otherwise on the copy batch carrying the row: MySQL coerces the NULL to the column's implicit default and raises a warning, and Move fails on warnings it does not explicitly tolerate, precisely because on an `INSERT IGNORE` the warning is the only evidence a row was not stored as read.
+
+The failure is therefore immediate, but it still arrives later than it needs to: not until the copy reaches the chunk holding that row, which on a table large enough to be worth moving this way is hours, and reported as a MySQL warning code against a batch rather than as "this column has NULLs". A single `SELECT 1 FROM <table> WHERE <column> IS NULL LIMIT 1` per tightened column answers it up front. Confirm the column holds no NULLs before starting the copy.
 
 ### threads
 
@@ -186,6 +168,49 @@ How many chunks to copy in parallel from the source.
 
 How many concurrent write threads to use per target when inserting rows. This controls the fan-out parallelism of the buffered copier's write side.
 
-A value of `0` means **auto**: on Aurora, the value is set to the target instance's vCPU count minus 2 (minimum 1), read from `@@innodb_buffer_pool_instances`. The reserved vCPUs leave headroom for the read side and the server's own work. On non-Aurora targets there is no reliable vCPU signal, so the default of `4` is used instead. Because the default is already `4`, you only opt into auto-sizing by explicitly passing `--write-threads 0`.
+These counts are overridden when [experimental autoscaling](#enable-experimental-autoscaling) engages.
 
-Move does not support the experimental write-thread autoscaling available in [`spirit migrate`](migrate.md#enable-experimental-autoscaling).
+### enable-experimental-autoscaling
+
+- type: `bool`
+- default: `false`
+
+Derive copy, per-target write and checksum thread counts from Aurora target capacity and adjust them using load feedback:
+
+```sh
+spirit move --source-dsn=... --target-dsn=... --enable-experimental-autoscaling
+```
+
+For sharded moves, all write pools scale together using the **busiest target host's** utilization. A busy host slows the whole move; idle hosts do not offset its load. This conservative policy also handles skewed shard traffic, though it can leave capacity unused on quieter hosts.
+
+The gradual multi-throttler reports the maximum utilization across hosts: all hosts must have headroom to permit growth; any host in the middle band holds scaling steady; any busy host can trigger a reduction. Which host is busiest can change from one sample to the next. Write-thread counts apply per shard. There is no additional fixed host concurrency guard.
+
+As in migration, the copier owns throttling: it pauses before reading another chunk and its autoscaler adjusts the applier through `SetWriteWorkers`. Already-read and queued work continues draining. Moving throttler ownership into the applier is outside this change.
+
+Targets sharing a host share one Aurora monitor. Initial counts and ceilings use the smallest target host and divide its budget by the largest number of target shards sharing a host, with at least one worker per shard. The client CPU budget also limits growth. Host identity includes the connection transport and address (including port), independently of database and credentials. Use consistent direct endpoints: DNS aliases and proxies are not resolved to physical hosts.
+
+Every target host must be Aurora with at least four vCPUs. Non-Aurora hosts, small instances or failed Aurora probes retain the configured fixed thread counts. Capacity-query and monitor-startup failures abort setup. Aurora monitoring uses thread utilization and a 100ms commit-latency backstop; stale signals pause copying. The initial and sentinel-wait checksums use the same load signal, and binlog draining narrows under load. Monitor connections are separate from the data pools.
+
+This flag is experimental, as it is for `migrate`. It applies to forward copying and checksums; the reverse window does not acquire new monitors for its write destinations.
+
+## GTID auto-detection
+
+Like `migrate`, Move selects each replication feed's coordinate scheme
+automatically: a source with GTIDs enabled (`gtid_mode=ON` and
+`enforce_gtid_consistency=ON`) is followed by GTID set, and one without by
+binlog file+offset. See the
+[migrate GTID auto-detection documentation](migrate.md#gtid-auto-detection)
+for the behavioural differences and the resume rules (a checkpointed position
+always resumes in the scheme it was written in, and a GTID checkpoint requires
+the server to still have GTIDs enabled).
+
+Move-specific notes:
+
+- The selection is **per source**: an N:M move whose sources disagree on GTID
+  support simply mixes schemes, since each source's coordinate is stored
+  independently in the checkpoint table's `binlog_positions` JSON (keyed by
+  source address+database) and classified independently on resume.
+- During a [`--reverse-window`](#reverse-window), the reverse feed streams
+  from the *targets*, so its scheme is auto-detected from each target server —
+  a move from a non-GTID source to a GTID-enabled target reverses over GTIDs,
+  and vice versa.

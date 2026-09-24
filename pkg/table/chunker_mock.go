@@ -21,6 +21,7 @@ type MockChunker struct {
 	// State
 	isOpen          bool
 	currentPosition uint64
+	rowsCopied      uint64
 	isComplete      bool
 
 	// Control behavior
@@ -47,8 +48,9 @@ var _ MappedChunker = &MockChunker{}
 // NewMockChunker creates a new mock chunker for testing
 func NewMockChunker(tableName string, totalRows uint64) *MockChunker {
 	tableInfo := &TableInfo{
-		TableName:  tableName,
-		SchemaName: "test",
+		TableName:     tableName,
+		SchemaName:    "test",
+		EstimatedRows: totalRows,
 	}
 
 	return &MockChunker{
@@ -173,6 +175,7 @@ func (m *MockChunker) Reset() error {
 
 	// Reset to initial state
 	m.currentPosition = 0
+	m.rowsCopied = 0
 	m.isComplete = false
 	m.feedbackCalls = make([]FeedbackCall, 0)
 	m.nextCalls = 0
@@ -242,6 +245,7 @@ func (m *MockChunker) Feedback(chunk *Chunk, duration time.Duration, actualRows 
 		ActualRows: actualRows,
 		Timestamp:  time.Now(),
 	})
+	m.rowsCopied += actualRows
 }
 
 // KeyAboveHighWatermark returns true if the given key is above the current watermark
@@ -299,6 +303,47 @@ func (m *MockChunker) KeyBelowLowWatermark(key any) bool {
 	// Key is below low watermark if it's less than current position
 	// This means the copier has already passed this key
 	return keyPos < m.currentPosition
+}
+
+// KeyNotYetDispatched reports whether the mock chunker has yet to hand out a
+// chunk covering key. Non-numeric keys return false so the caller keeps
+// deferring.
+//
+// The strict `>` is deliberate, and differs from chunkerOptimistic's `>=`.
+// The real chunkers track the dispatched-but-uncommitted band with two
+// independent cursors (watermark.UpperBound and chunkPtr); this mock has only
+// currentPosition, which it uses for both. Pairing `>` here with
+// KeyBelowLowWatermark's `keyPos < currentPosition` leaves exactly one key —
+// currentPosition itself — in the in-flight band, which is what lets
+// mock-driven tests exercise the deferral branch of bufferedMap.mustDeferKey
+// at all. With `>=` the two predicates would partition the key space with no
+// gap and no MockChunker test could ever reach that branch.
+//
+// Tests that need the key to stop being deferred advance the chunker
+// (SimulateProgress / SetPosition); the live-MySQL tests in pkg/change cover
+// the real boundary semantics against real chunkers.
+func (m *MockChunker) KeyNotYetDispatched(key any) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var keyPos uint64
+	switch v := key.(type) {
+	case int:
+		keyPos = uint64(v)
+	case uint64:
+		keyPos = v
+	case int64:
+		keyPos = uint64(v)
+	default:
+		return false
+	}
+	return keyPos > m.currentPosition
+}
+
+func (m *MockChunker) RowsCopied() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rowsCopied
 }
 
 func (m *MockChunker) Progress() (uint64, uint64, uint64) {
