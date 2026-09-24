@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,8 @@ import (
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -689,6 +692,197 @@ func TestDDLNotificationTransactionCompression(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, FatalReasonSchemaChange, <-cancelled)
+}
+
+// TestBinlogClientXATransactionGuard is the binlog (file/offset) client's
+// twin of TestGTIDClientXATransaction: the non-GTID path buffers and
+// applies XA prepare-time row images exactly the same way, so it carries
+// the same guard. A real two-phase XA transaction's first group —
+// Query("XA START ..."), the row events, Query("XA END ...") and the
+// terminating XA_PREPARE_LOG_EVENT — is written to the binlog in one
+// burst at XA PREPARE time; the guard must fail the stream at the
+// opening "XA START" QueryEvent, before any of the row events after it
+// are buffered, and classify the abort as an unsupported-XA
+// reason. Unique xids and per-run table names for the reasons
+// documented on TestGTIDClientXATransaction.
+func TestBinlogClientXATransactionGuard(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	xid := xaTestXIDPrefix + "_binlog_" + uuid.NewString()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	srcTable := "binlogxat1_" + suffix
+	dstTable := "binlogxat2_" + suffix
+
+	// Best-effort sweep of stragglers from prior interrupted runs (a
+	// logged no-op without XA_RECOVER_ADMIN).
+	rollbackDanglingXATestTxns(t, db)
+	testutils.RunSQL(t, fmt.Sprintf("DROP TABLE IF EXISTS %s, %s", srcTable, dstTable))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", srcTable))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", dstTable))
+	t.Cleanup(func() {
+		// See TestGTIDClientXATransaction: terminate this run's XA
+		// transactions before dropping the tables, from a fresh connection.
+		cleanupDB, err := sql.Open("mysql", testutils.DSN())
+		if err != nil {
+			return
+		}
+		defer utils.CloseAndLog(cleanupDB)
+		rollbackDanglingXATestTxns(t, cleanupDB, xid)
+		_, _ = cleanupDB.ExecContext(context.Background(), "SET SESSION lock_wait_timeout=5")
+		_, _ = cleanupDB.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s, %s", srcTable, dstTable))
+	})
+
+	t1 := table.NewTableInfo(db, "test", srcTable)
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", dstTable)
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	var gotReason atomic.Int64
+	gotReason.Store(-1)
+	clientConfig := NewClientDefaultConfig()
+	clientConfig.CancelFunc = func(reason FatalReason) bool {
+		gotReason.Store(int64(reason))
+		return true
+	}
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.Start(t.Context()))
+	defer client.Close()
+
+	// XA transactions are session-scoped between XA START and XA
+	// PREPARE: pin a single connection for the whole two-phase dance.
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	xaExec := func(stmt string) {
+		t.Helper()
+		_, err := conn.ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+
+	xaExec(fmt.Sprintf("XA START '%s'", xid))
+	xaExec(fmt.Sprintf("INSERT INTO %s (a, b, c) VALUES (1, 2, 3)", srcTable))
+	xaExec(fmt.Sprintf("INSERT INTO %s (a, b, c) VALUES (2, 3, 4)", srcTable))
+	xaExec(fmt.Sprintf("XA END '%s'", xid))
+
+	// Before XA PREPARE nothing of the transaction exists in the binary
+	// log, so no row events can have streamed and the guard cannot have
+	// fired.
+	require.NoError(t, client.BlockWait(t.Context()))
+	require.Equal(t, 0, client.GetDeltaLen(), "row events must not stream before XA PREPARE")
+	require.Equal(t, int64(-1), gotReason.Load(), "the guard must not fire before the XA group is binlogged")
+
+	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "XA PREPARE must report unsupported XA")
+	client.streamWG.Wait() // reader fully exited: buffering is final
+	require.Equal(t, 0, client.GetDeltaLen(), "no prepared row events may be buffered once the guard fires")
+
+	// Roll the prepared transaction back and verify the target never saw
+	// the prepared rows — the divergence the guard exists to prevent.
+	xaExec(fmt.Sprintf("XA ROLLBACK '%s'", xid))
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", dstTable)).Scan(&count))
+	require.Equal(t, 0, count, "prepared-then-rolled-back rows must never reach the target")
+}
+
+// TestBinlogProcessTransactionPayloadXAGuard is the binlog client's twin
+// of TestGTIDProcessTransactionPayloadXAGuard: an inner "XA START"
+// QueryEvent must fail a compressed payload before the row events after
+// it are buffered, and an inner XA_PREPARE_LOG_EVENT (the
+// defense-in-depth branch) must fail it too.
+func TestBinlogProcessTransactionPayloadXAGuard(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	// Real tables so the subscription would buffer the inner row event
+	// if the guard failed to fire first.
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS binlogxapayt1, binlogxapayt2")
+	testutils.RunSQL(t, "CREATE TABLE binlogxapayt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE binlogxapayt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "binlogxapayt1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "binlogxapayt2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	defer client.Close()
+
+	// A compressed XA prepare group as go-mysql decompresses it: the
+	// inner "XA START" QueryEvent precedes the inner row events.
+	xaGroup := &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
+		{
+			Header: &replication.EventHeader{EventType: replication.QUERY_EVENT},
+			Event:  &replication.QueryEvent{Schema: []byte("test"), Query: []byte("XA START X'78',X'',1")},
+		},
+		{
+			Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2},
+			Event: &replication.RowsEvent{
+				Table: &replication.TableMapEvent{Schema: []byte("test"), Table: []byte("binlogxapayt1")},
+				Rows:  [][]any{{int32(1), int32(0), int32(0)}},
+			},
+		},
+	}}
+	require.ErrorIs(t, client.processTransactionPayload(xaGroup, mysql.Position{Name: "binlog.000001", Pos: 4}), errXAUnsupported)
+	require.Equal(t, 0, client.GetDeltaLen(), "the inner row events after XA START must not be buffered")
+
+	// Defense in depth: an inner XA_PREPARE_LOG_EVENT without its
+	// opening "XA START".
+	prepareOnly := &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
+		{
+			Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
+			Event:  &replication.GenericEvent{},
+		},
+	}}
+	require.ErrorIs(t, client.processTransactionPayload(prepareOnly, mysql.Position{Name: "binlog.000001", Pos: 4}), errXAUnsupported)
+	require.Equal(t, 0, client.GetDeltaLen())
+}
+
+// A lone XA_PREPARE_LOG_EVENT must trigger the uncompressed stream guard,
+// even if a future server version omits the opening XA QueryEvent.
+func TestBinlogClientXAPrepareEventGuard(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	var gotReason atomic.Int64
+	gotReason.Store(-1)
+	clientConfig := NewClientDefaultConfig()
+	clientConfig.CancelFunc = func(reason FatalReason) bool {
+		gotReason.Store(int64(reason))
+		return true
+	}
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	streamer := replication.NewBinlogStreamer()
+	ctx, cancel := context.WithCancel(t.Context())
+	client.streamer = streamer
+	client.cancelFunc = cancel
+	client.streamWG.Add(1)
+	go client.readStream(ctx)
+	defer client.Close()
+
+	require.NoError(t, streamer.AddEventToStreamer(&replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
+		Event:  &replication.GenericEvent{},
+	}))
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "a lone XA_PREPARE_LOG_EVENT must report unsupported XA")
 }
 
 // TestCompositePKUpdate tests that we correctly handle
@@ -1489,4 +1683,179 @@ func TestFlushResidual(t *testing.T) {
 	require.NoError(t, client.Flush(t.Context()))
 	_, flushes = client.FlushResidual()
 	require.Greater(t, flushes, before)
+}
+
+// mkRowsEventForTest builds a rows event for the given table at the given
+// file offset. Used by the LogPos-wraparound and unknown-subtype guards
+// below, which both need to drive processRowsEvent without a real server.
+func mkRowsEventForTest(et replication.EventType, logPos uint32, schema, tbl string, pk int32) (*replication.BinlogEvent, *replication.RowsEvent) {
+	rows := &replication.RowsEvent{
+		Table: &replication.TableMapEvent{Schema: []byte(schema), Table: []byte(tbl)},
+		Rows:  [][]any{{pk, int32(0), int32(0)}},
+	}
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: et, LogPos: logPos},
+		Event:  rows,
+	}, rows
+}
+
+// newWraparoundTestClient builds a binlog client subscribed to a real pair
+// of tables, with its streamer injected so readStream can be fed a
+// synthetic position sequence. It returns the client, the streamer, and a
+// handle on the fatal reason the client reported (-1 until it reports one).
+func newWraparoundTestClient(t *testing.T, srcName, dstName string) (*binlogClient, *replication.BinlogStreamer, *atomic.Int64) {
+	t.Helper()
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+
+	testutils.RunSQL(t, fmt.Sprintf("DROP TABLE IF EXISTS %s, %s", srcName, dstName))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", srcName))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", dstName))
+
+	t1 := table.NewTableInfo(db, "test", srcName)
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", dstName)
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	gotReason := &atomic.Int64{}
+	gotReason.Store(-1)
+	clientConfig := NewClientDefaultConfig()
+	clientConfig.CancelFunc = func(reason FatalReason) bool {
+		gotReason.Store(int64(reason))
+		return true
+	}
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+
+	streamer := replication.NewBinlogStreamer()
+	client.streamer = streamer
+	return client, streamer, gotReason
+}
+
+// rotateTo is the event the server sends when it starts serving a file —
+// both on a real rotation and, artificially, at the head of every dump
+// (including the one recreateStreamer opens).
+func rotateTo(file string, pos uint64) *replication.BinlogEvent {
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.ROTATE_EVENT},
+		Event:  &replication.RotateEvent{NextLogName: []byte(file), Position: pos},
+	}
+}
+
+// TestBinlogClientLogPosWraparoundGuard drives readStream through a binlog
+// file whose 4-byte LogPos wraps past 4GiB — the state one transaction
+// larger than 4GiB leaves behind, since a file only rotates on a
+// transaction boundary. Past the wrap, file+position stops identifying a
+// unique point in the stream: setBufferedPos freezes just under the wrap
+// and shouldSkipReplayedEvent would discard every later row event as a
+// replay. The stream must fail with FatalReasonLogPosWrapped (which tells
+// the runner to invalidate its checkpoint) rather than buffer events from
+// a coordinate space it can no longer track.
+func TestBinlogClientLogPosWraparoundGuard(t *testing.T) {
+	client, streamer, gotReason := newWraparoundTestClient(t, "logposwrapt1", "logposwrapt2")
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	client.cancelFunc = cancel
+	client.streamWG.Add(1)
+	go client.readStream(ctx)
+
+	require.NoError(t, streamer.AddEventToStreamer(rotateTo("binlog.000042", 4)))
+	// The last event that still fits in a uint32 offset.
+	preWrap, _ := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, 4294967000, "test", "logposwrapt1", 1)
+	require.NoError(t, streamer.AddEventToStreamer(preWrap))
+	// The next event ends past 2^32, so its reported offset restarts near
+	// zero. No rotate separates the two: the file is still the same one.
+	postWrap, _ := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, 500, "test", "logposwrapt1", 2)
+	require.NoError(t, streamer.AddEventToStreamer(postWrap))
+
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonLogPosWrapped) },
+		5*time.Second, 5*time.Millisecond, "a backwards LogPos within one file must report wraparound")
+	client.streamWG.Wait() // reader fully exited: buffering is final
+	require.Equal(t, 1, client.GetDeltaLen(),
+		"only the pre-wrap event may be buffered; nothing past the wrap")
+	require.Equal(t, mysql.Position{Name: "binlog.000042", Pos: 4294967000}, client.getBufferedPos(),
+		"the position must not advance into the wrapped space")
+}
+
+// TestBinlogClientReplayIsNotAWraparound is the false-positive guard for
+// the test above. recreateStreamer recovers from a stream error by
+// re-opening the current file at position 4, and the server prefaces that
+// dump with an artificial rotate — so the reader legitimately sees low
+// positions again after a high-water mark. That replay must not be
+// mistaken for wraparound and abort a healthy recovery.
+func TestBinlogClientReplayIsNotAWraparound(t *testing.T) {
+	client, streamer, gotReason := newWraparoundTestClient(t, "logposreplayt1", "logposreplayt2")
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	client.cancelFunc = cancel
+	client.streamWG.Add(1)
+	go client.readStream(ctx)
+
+	require.NoError(t, streamer.AddEventToStreamer(rotateTo("binlog.000042", 4)))
+	high, _ := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, 4294967000, "test", "logposreplayt1", 1)
+	require.NoError(t, streamer.AddEventToStreamer(high))
+
+	// The stream drops and recreateStreamer re-opens the same file at
+	// position 4, replaying what we already buffered.
+	require.NoError(t, streamer.AddEventToStreamer(rotateTo("binlog.000042", 4)))
+	for _, pos := range []uint32{120, 900, 4000} {
+		replayed, _ := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, pos, "test", "logposreplayt1", 1)
+		require.NoError(t, streamer.AddEventToStreamer(replayed))
+	}
+	// The replay catches up and delivers a genuinely new event. Once this
+	// one is buffered, every decision before it is final.
+	caughtUp, _ := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, 4294967100, "test", "logposreplayt1", 2)
+	require.NoError(t, streamer.AddEventToStreamer(caughtUp))
+
+	require.Eventually(t, func() bool { return client.GetDeltaLen() == 2 },
+		5*time.Second, 5*time.Millisecond, "the post-replay event must be buffered")
+	require.Equal(t, int64(-1), gotReason.Load(),
+		"a post-reconnect replay must not be reported as LogPos wraparound")
+	cancel()
+	client.streamWG.Wait()
+}
+
+// TestBinlogProcessRowsEventUnknownSubtype asserts that a rows-event
+// subtype parseEventType does not recognize is a hard error, not a logged
+// skip. go-mysql parses PARTIAL_UPDATE_ROWS_EVENT — which the server emits
+// once binlog_row_value_options=PARTIAL_JSON is set, and the global can
+// change after preflight has read it — into a plain *replication.RowsEvent,
+// so it reaches processRowsEvent carrying real row changes. Dropping it
+// with only logger.Error loses those changes silently; they surface, if at
+// all, as a checksum mismatch at the end of the run.
+func TestBinlogProcessRowsEventUnknownSubtype(t *testing.T) {
+	client, _, _ := newWraparoundTestClient(t, "unknownsubt1", "unknownsubt2")
+	defer client.Close()
+
+	// Sanity: a recognized subtype flows through and buffers the row.
+	ev, rows := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, 1000, "test", "unknownsubt1", 1)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, client.GetDeltaLen())
+
+	// An unrecognized subtype for a subscribed table must hard-error,
+	// naming the event type (string form and header byte) and the table.
+	ev, rows = mkRowsEventForTest(replication.PARTIAL_UPDATE_ROWS_EVENT, 1000, "test", "unknownsubt1", 2)
+	err := client.processRowsEvent(ev, rows)
+	require.ErrorIs(t, err, errUnsupportedRowsEvent)
+	require.ErrorContains(t, err, "PartialUpdateRowsEvent")
+	require.ErrorContains(t, err, fmt.Sprintf("0x%02x", uint8(replication.PARTIAL_UPDATE_ROWS_EVENT)))
+	require.ErrorContains(t, err, "unknownsubt1")
+	require.Equal(t, 1, client.GetDeltaLen(), "the unsupported event must not buffer rows")
+
+	// It is a stream error, not an XA or schema-change one, so the caller
+	// keeps its checkpoint.
+	require.Equal(t, FatalReasonStreamError, fatalReasonForStreamError(err))
+
+	// Events for tables without a subscription stay ignored regardless of
+	// subtype — that is how writes to the _new table are filtered out.
+	ev, rows = mkRowsEventForTest(replication.PARTIAL_UPDATE_ROWS_EVENT, 1000, "test", "not_subscribed", 3)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, client.GetDeltaLen())
 }

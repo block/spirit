@@ -1534,6 +1534,16 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 			// changed, so the checkpoint remains valid. Keep it and tell the
 			// operator how to recover.
 			r.logger.Error("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the move from it")
+		case change.FatalReasonUnsupportedXA, change.FatalReasonLogPosWrapped:
+			// Both reasons leave a checkpoint that is technically readable
+			// but useless: resuming from it streams straight back into the
+			// condition that killed the run.
+			if reason == change.FatalReasonUnsupportedXA {
+				r.logger.Error("XA transaction detected; the checkpoint will be invalidated — stop XA activity and start a fresh move")
+			} else {
+				r.logger.Error("binlog LogPos wrapped past 4GiB; the checkpoint will be invalidated — enable GTIDs (or lower max_binlog_cache_size so no transaction can grow a binlog file beyond 4GiB) and start a fresh move")
+			}
+			fallthrough
 		default:
 			// Schema change — and, defensively, any future reason we don't
 			// recognize (invalidating is the safe default: it costs a restart,

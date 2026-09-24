@@ -3,7 +3,9 @@ package change
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/parser/ast"
@@ -41,6 +43,82 @@ type schemaTable struct {
 	table  string
 }
 
+// queryEventInfo describes the statements in one binlog QueryEvent.
+type queryEventInfo struct {
+	tables               []schemaTable
+	opensTransaction     bool
+	keepsTransactionOpen bool
+	endsTransaction      bool
+	xa                   bool
+}
+
+// QueryEvents include BEGIN for nearly every transaction. Reuse parser
+// instances to avoid allocating the parser's grammar cache for each event.
+var queryEventParsers = sync.Pool{New: func() any { return parser.New() }}
+
+// parseQueryEvent classifies transaction control and extracts DDL table names
+// from the same parse, so every consumer sees the same statement semantics.
+func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err error) {
+	p := queryEventParsers.Get().(*parser.Parser)
+	defer func() {
+		p.Reset()
+		queryEventParsers.Put(p)
+	}()
+	stmts, _, err := p.Parse(statements, "", "")
+	if err != nil {
+		return queryEventInfo{}, err
+	}
+	for _, stmt := range stmts {
+		switch t := stmt.(type) {
+		case *ast.XAStmt:
+			info.xa = true
+		case *ast.BeginStmt:
+			info.opensTransaction = true
+		case *ast.SavepointStmt, *ast.ReleaseSavepointStmt:
+			info.keepsTransactionOpen = true
+		case *ast.RollbackStmt:
+			if t.SavepointName != "" {
+				info.keepsTransactionOpen = true
+			} else {
+				info.endsTransaction = true
+			}
+		case *ast.CommitStmt:
+			info.endsTransaction = true
+		case *ast.RenameTableStmt:
+			for _, tableInfo := range t.TableToTables {
+				schema, table := getTableIdentity(defaultSchema, tableInfo.OldTable)
+				info.tables = append(info.tables, schemaTable{schema, table})
+			}
+		case *ast.DropTableStmt:
+			for _, table := range t.Tables {
+				schema, tableName := getTableIdentity(defaultSchema, table)
+				info.tables = append(info.tables, schemaTable{schema, tableName})
+			}
+		case *ast.AlterTableStmt, *ast.CreateTableStmt, *ast.TruncateTableStmt,
+			*ast.CreateIndexStmt, *ast.DropIndexStmt:
+			var tableNode *ast.TableName
+			switch n := t.(type) {
+			case *ast.AlterTableStmt:
+				tableNode = n.Table
+			case *ast.CreateTableStmt:
+				tableNode = n.Table
+				if n.StartTransaction {
+					info.opensTransaction = true
+				}
+			case *ast.TruncateTableStmt:
+				tableNode = n.Table
+			case *ast.CreateIndexStmt:
+				tableNode = n.Table
+			case *ast.DropIndexStmt:
+				tableNode = n.Table
+			}
+			schema, table := getTableIdentity(defaultSchema, tableNode)
+			info.tables = append(info.tables, schemaTable{schema, table})
+		}
+	}
+	return info, nil
+}
+
 // extractTablesFromDDLStmts extracts table names from DDL statements.
 // The logic is based on canal: https://github.com/go-mysql-org/go-mysql/blob/34b6b0998dde44e51dff0bbcc1ac88339f57f830/canal/sync.go#L195-L245
 //
@@ -52,48 +130,11 @@ type schemaTable struct {
 // promotion must wait for the group's real terminator (see
 // gtidClient.processQueryEvent).
 func extractTablesFromDDLStmts(defaultSchema string, statements string) (tables []schemaTable, opensTransaction bool, err error) {
-	p := parser.New()
-	stmts, _, err := p.Parse(statements, "", "")
+	info, err := parseQueryEvent(defaultSchema, statements)
 	if err != nil {
 		return nil, false, err
 	}
-	for _, stmt := range stmts {
-		switch t := stmt.(type) {
-		case *ast.BeginStmt:
-			opensTransaction = true
-		case *ast.RenameTableStmt:
-			for _, tableInfo := range t.TableToTables {
-				schema, table := getTableIdentity(defaultSchema, tableInfo.OldTable)
-				tables = append(tables, schemaTable{schema, table})
-			}
-		case *ast.DropTableStmt:
-			for _, table := range t.Tables {
-				schema, tableName := getTableIdentity(defaultSchema, table)
-				tables = append(tables, schemaTable{schema, tableName})
-			}
-		case *ast.AlterTableStmt, *ast.CreateTableStmt, *ast.TruncateTableStmt,
-			*ast.CreateIndexStmt, *ast.DropIndexStmt:
-			var tableNode *ast.TableName
-			switch n := t.(type) {
-			case *ast.AlterTableStmt:
-				tableNode = n.Table
-			case *ast.CreateTableStmt:
-				tableNode = n.Table
-				if n.StartTransaction {
-					opensTransaction = true
-				}
-			case *ast.TruncateTableStmt:
-				tableNode = n.Table
-			case *ast.CreateIndexStmt:
-				tableNode = n.Table
-			case *ast.DropIndexStmt:
-				tableNode = n.Table
-			}
-			schema, table := getTableIdentity(defaultSchema, tableNode)
-			tables = append(tables, schemaTable{schema, table})
-		}
-	}
-	return tables, opensTransaction, nil
+	return info.tables, info.opensTransaction, nil
 }
 
 // toSet converts a string slice to a set (map[string]struct{}) for O(1) lookups.
@@ -188,6 +229,122 @@ func checkImmutableColumn(tbl *table.TableInfo, ordinal int, beforeRow, afterRow
 			tbl.SchemaName, tbl.TableName, tbl.Columns[ordinal], key)
 	}
 	return nil
+}
+
+// errXAUnsupported is the fatal error produced when XA transaction
+// activity is observed in the binlog stream. An XA transaction's row
+// events are written to the binary log at XA PREPARE time, before the
+// transaction's outcome is known: applying them treats the prepare as a
+// commit, and a later XA ROLLBACK has no binlog representation that
+// could undo them, so the target would diverge permanently. Rather than
+// tracking prepared XIDs and buffering until the outcome (full XA
+// support), spirit refuses XA workloads outright — the same posture as
+// the preflight refusal of non-empty binlog_row_value_options. Both
+// change clients treat this as a fatal stream error, aborting before
+// any of the XA transaction's row events are buffered.
+var errXAUnsupported = errors.New("XA transactions detected in the binlog stream: spirit does not support XA workloads")
+
+// errLogPosWrapped is the fatal error produced when a binlog file's
+// 4-byte LogPos wraps past 4GiB. A binlog file only rotates on a
+// transaction boundary, so one transaction writing more than 4GiB of row
+// images past the max_binlog_size point grows the file beyond what a
+// uint32 end position can address, and positions restart near zero.
+// MySQL documents the consequence under max_binlog_cache_size: with
+// gtid_mode off, "the maximum recommended value is 4GB, because in that
+// case MySQL cannot work with binary log positions greater than 4GB".
+//
+// Past the wrap, file+offset no longer identifies a unique point in the
+// stream: setBufferedPos's monotonicity freezes bufferedPos just under
+// the wrap, every later event compares at or below it, and
+// shouldSkipReplayedEvent classifies live row events as post-reconnect
+// replays and discards them. The checkpoint stops advancing at the same
+// moment. Rather than guess which events are live — the two cases are not
+// distinguishable from a 32-bit position alone — spirit refuses the
+// stream, the same posture as errXAUnsupported. Only the binlog (file +
+// position) client is affected; the GTID client does not use positions to
+// deduplicate, which is why MySQL's own caveat is scoped to gtid_mode
+// being off.
+var errLogPosWrapped = errors.New("binlog LogPos wrapped past 4GiB within a single file: spirit cannot track file+position coordinates past the wrap (enable GTIDs, or lower max_binlog_cache_size so no transaction can grow a binlog file beyond 4GiB)")
+
+func fatalReasonForStreamError(err error) FatalReason {
+	switch {
+	case errors.Is(err, errXAUnsupported):
+		return FatalReasonUnsupportedXA
+	case errors.Is(err, errLogPosWrapped):
+		return FatalReasonLogPosWrapped
+	default:
+		return FatalReasonStreamError
+	}
+}
+
+// logPosTracker detects uint32 LogPos wraparound by watching for an event
+// end position that moves backwards within a single binlog file. Within a
+// file, LogPos is the byte offset of the end of each event and the server
+// writes events sequentially, so it only ever increases — the one way it
+// can decrease is the 4-byte field wrapping past 4GiB (see
+// errLogPosWrapped). That makes the detection exact rather than a
+// threshold heuristic, provided the two sources of positions that are not
+// real offsets into the file we are reading are excluded:
+//
+//   - A rotate resets the tracker. The server opens every dump with an
+//     artificial RotateEvent, so a reconnect that restarts the file at
+//     position 4 (recreateStreamer) resets here too and its replay is not
+//     mistaken for a wrap.
+//   - Artificial events carry a LogPos the server synthesized rather than
+//     read from the file. Heartbeats are the case that matters: they
+//     report the dump thread's own position, which may name a different
+//     file than the one we are still reading.
+//
+// A wrap that happens entirely while disconnected is still caught: the
+// reconnect restarts the file at position 4 and replays forward into the
+// same oversized transaction, where the backwards step reappears.
+type logPosTracker struct {
+	last uint32
+}
+
+// rotated resets the tracker for a new (or re-opened) binlog file.
+func (t *logPosTracker) rotated() {
+	t.last = 0
+}
+
+// observe records ev's end position and reports whether it moved backwards
+// within the current file, i.e. whether LogPos wrapped.
+func (t *logPosTracker) observe(ev *replication.BinlogEvent) bool {
+	if ev.Header.Flags&replication.LOG_EVENT_ARTIFICIAL_F != 0 {
+		return false
+	}
+	if _, isHeartbeat := ev.Event.(*replication.HeartbeatEvent); isHeartbeat {
+		// Belt and braces: heartbeats are artificial, but the flag is set
+		// by the server and we would rather not depend on it for the one
+		// event type whose LogPos routinely names another file.
+		return false
+	}
+	if ev.Header.LogPos == 0 {
+		// Usually a positionless housekeeping event (FormatDescriptionEvent
+		// and friends), which readStream also excludes from position
+		// tracking. But an event whose end offset lands exactly on 2^32
+		// reports zero too — the wrap, landing on the one value that is
+		// indistinguishable from "no position". Reading every zero as
+		// positionless would let that event be skipped as a replay and, if
+		// the file rotated before the next real position arrived, would
+		// reset the tracker without the wrap ever being reported.
+		//
+		// Only events that carry row changes are worth the ambiguity: a
+		// dropped housekeeping event costs nothing, while a dropped
+		// RowsEvent is the data loss this guard exists to prevent. t.last
+		// must already be nonzero, i.e. a real position has been seen in
+		// this file, for zero to be a step backwards at all.
+		switch ev.Event.(type) {
+		case *replication.RowsEvent, *replication.TransactionPayloadEvent:
+			return t.last > 0
+		}
+		return false
+	}
+	if ev.Header.LogPos < t.last {
+		return true
+	}
+	t.last = ev.Header.LogPos
+	return false
 }
 
 // isMinimalRowImage returns true if the RowsEvent contains a minimal row image,

@@ -155,6 +155,15 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		require.True(t, checkpointTableExists(t, r),
 			"a stream-error fatal must preserve the checkpoint table so the move can resume")
 	})
+
+	t.Run("UnsupportedXADropsCheckpoint", func(t *testing.T) {
+		r, cancelCalls := makeRunner(t)
+		require.True(t, r.fatalError(change.FatalReasonUnsupportedXA))
+		require.Equal(t, status.ErrCleanup, r.status.Get())
+		require.Equal(t, int32(1), cancelCalls.Load())
+		require.False(t, checkpointTableExists(t, r),
+			"a checkpoint that replays the refused XA group cannot be resumed")
+	})
 }
 
 // fakeChangeSource is a minimal change.Source used to observe that

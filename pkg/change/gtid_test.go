@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -423,10 +424,8 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 // pending GTID into bufferedGTID — not at the QueryEvent itself (it
 // could sit mid-group; see
 // TestGTIDClientQueryPromotionOrdering), but at the next
-// GTIDEvent, which proves the group ended. (XA statements are also
-// unparseable but never reach the parser — they get explicit handling
-// in readStream because promoting mid-XA-group would be incorrect; see
-// TestGTIDClientXAPromotionOrdering.) Every QueryEvent on
+// GTIDEvent, which proves the group ended. XA statements parse as
+// *ast.XAStmt and fail the stream; see TestGTIDClientXAGuardStream. Every QueryEvent on
 // the entire server flows through the parser — the schema filter only
 // applies after parsing — so before the fix a single unparseable
 // statement in a *completely unrelated schema* left bufferedGTID
@@ -622,19 +621,19 @@ func rollbackDanglingXATestTxns(t *testing.T, db *sql.DB, knownXIDs ...string) {
 }
 
 // TestGTIDClientXATransaction drives a real two-phase XA transaction
-// (plus a one-phase variant) through the feed end-to-end. The binlog
-// shape, verified against MySQL 8.0: nothing is written until XA
-// PREPARE, at which point the entire first group — GTIDEvent(g1),
-// Query("XA START ..."), the row events, Query("XA END ...") and the
-// terminating XA_PREPARE_LOG_EVENT — is flushed at once, and g1 enters
-// the server's gtid_executed. The terminal XA COMMIT (or XA ROLLBACK)
-// arrives later as its own single-statement transaction under its own
-// GTID (g2), with no row events.
-//
-// The BlockWait calls double as promotion-liveness assertions: BlockWait
-// only returns once bufferedGTID covers the server's gtid_executed, so a
-// handler that failed to promote at the XA prepare (or at the terminal
-// XA COMMIT) would time out here.
+// (plus a one-phase variant) against the feed end-to-end and asserts the
+// XA guard fails the stream before any of the transaction's row events
+// are buffered or applied. The binlog shape, verified against MySQL 8.0:
+// nothing is written until XA PREPARE, at which point the entire first
+// group — GTIDEvent(g1), Query("XA START ..."), the row events,
+// Query("XA END ...") and the terminating XA_PREPARE_LOG_EVENT — is
+// flushed at once. Spirit refuses the group at its opening "XA START"
+// QueryEvent: prepare-time row images are written before the
+// transaction's outcome is known, so applying them treats the prepare as
+// a commit, and the XA ROLLBACK issued below would leave the target
+// permanently diverged (nothing in the binlog undoes a rolled-back
+// prepare). The abort is reported as an unsupported-XA reason so the caller
+// invalidates its checkpoint and requires a fresh start.
 //
 // Both the xids and the table names are unique per run. Unique xids
 // because XA START against a hard-coded xid fails with XAER_DUPID if an
@@ -692,11 +691,25 @@ func TestGTIDClientXATransaction(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
-	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
-	require.NoError(t, client.Start(t.Context()))
+	// newGuardClient builds and starts a client whose CancelFunc records
+	// the fatal reason, mimicking the runner's cancellation callback.
+	newGuardClient := func() (*gtidClient, *atomic.Int64) {
+		var gotReason atomic.Int64
+		gotReason.Store(-1)
+		clientConfig := NewClientDefaultConfig()
+		clientConfig.CancelFunc = func(reason FatalReason) bool {
+			gotReason.Store(int64(reason))
+			return true
+		}
+		client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
+		chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+		require.NoError(t, err)
+		require.NoError(t, client.AddSubscription(t1, t2, chunker))
+		require.NoError(t, client.Start(t.Context()))
+		return client, &gotReason
+	}
+
+	client, gotReason := newGuardClient()
 	defer client.Close()
 
 	// XA transactions are session-scoped between XA START and XA
@@ -716,73 +729,61 @@ func TestGTIDClientXATransaction(t *testing.T) {
 	xaExec(fmt.Sprintf("XA END '%s'", xid))
 
 	// Before XA PREPARE nothing of the transaction exists in the binary
-	// log — no GTID has been assigned yet, so it cannot be in the
-	// buffered set, and no row events can have streamed.
+	// log — no GTID has been assigned yet, so no row events can have
+	// streamed and the guard cannot have fired.
 	require.NoError(t, client.BlockWait(t.Context()))
 	require.Equal(t, 0, client.GetDeltaLen(), "row events must not stream before XA PREPARE")
+	require.Equal(t, int64(-1), gotReason.Load(), "the guard must not fire before the XA group is binlogged")
 
+	// The prepare writes the whole group; the guard must fail the stream
+	// at its opening "XA START" QueryEvent — ahead of the row events —
+	// and classify it as an unsupported-XA reason.
 	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "XA PREPARE must fail the stream as unsupported XA")
+	client.streamWG.Wait() // reader fully exited: buffering is final
+	require.Equal(t, 0, client.GetDeltaLen(), "no prepared row events may be buffered once the guard fires")
 
-	// The prepare flushes the whole group and terminates it.
-	require.NoError(t, client.BlockWait(t.Context()))
-	require.Equal(t, 2, client.GetDeltaLen(), "both row events must be buffered once XA PREPARE flushes the group")
-
-	// The buffered images can flush before the XA COMMIT ever happens.
-	// (Known pre-existing property, shared with the binlog client: row
-	// images are applied from the prepare-time group, so a later XA
-	// ROLLBACK of the prepared transaction would not be compensated.)
-	require.NoError(t, client.Flush(t.Context()))
+	// Roll the prepared transaction back — the outcome spirit could never
+	// have seen coming. The target must not contain the prepared rows:
+	// applying them is exactly the permanent divergence the guard exists
+	// to prevent.
+	xaExec(fmt.Sprintf("XA ROLLBACK '%s'", xid))
 	var count int
 	err = db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", dstTable)).Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, 2, count)
+	require.Equal(t, 0, count, "prepared-then-rolled-back rows must never reach the target")
 
-	xaExec(fmt.Sprintf("XA COMMIT '%s'", xid))
+	// One-phase variant: `XA COMMIT ... ONE PHASE` commits atomically (a
+	// single group terminated by an XA_PREPARE_LOG_EVENT rather than a
+	// QueryEvent), but it is still an XA workload and the one-phase
+	// outcome is unknowable at the group's "XA START" — a fresh client
+	// must refuse it the same way. (Started after the rollback above, so
+	// the new stream — which begins at the current gtid_executed — only
+	// sees the one-phase group.)
+	client2, gotReason2 := newGuardClient()
+	defer client2.Close()
 
-	// Capture gtid_executed right after the commit: it necessarily
-	// includes both the prepare-group GTID (g1) and the commit GTID (g2).
-	// Captured before BlockWait/Flush so the containment assertion below
-	// is deterministic even with unrelated concurrent load advancing
-	// gtid_executed on a shared server.
-	var executed string
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@GLOBAL.gtid_executed").Scan(&executed))
-	executedSet, err := mysql.ParseMysqlGTIDSet(normalizeGTIDString(executed))
-	require.NoError(t, err)
-
-	require.NoError(t, client.BlockWait(t.Context()))
-	require.NoError(t, client.Flush(t.Context()))
-
-	// The resume coordinate must cover both XA GTIDs: resuming from it
-	// must not re-request (or worse, skip) any part of the XA transaction.
-	flushedSet, err := mysql.ParseMysqlGTIDSet(normalizeGTIDString(client.Position()))
-	require.NoError(t, err)
-	require.True(t, flushedSet.Contain(executedSet),
-		"flushed position %s must cover the executed set %s (both XA GTIDs)", flushedSet.String(), executedSet.String())
-
-	// One-phase variant: `XA COMMIT ... ONE PHASE` is a single group
-	// terminated by an XA_PREPARE_LOG_EVENT rather than a QueryEvent.
 	xaExec(fmt.Sprintf("XA START '%s'", xid1p))
 	xaExec(fmt.Sprintf("INSERT INTO %s (a, b, c) VALUES (3, 4, 5)", srcTable))
 	xaExec(fmt.Sprintf("XA END '%s'", xid1p))
 	xaExec(fmt.Sprintf("XA COMMIT '%s' ONE PHASE", xid1p))
 
-	require.NoError(t, client.BlockWait(t.Context()))
-	require.NoError(t, client.Flush(t.Context()))
-	err = db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", dstTable)).Scan(&count)
-	require.NoError(t, err)
-	require.Equal(t, 3, count)
+	require.Eventually(t, func() bool { return gotReason2.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "one-phase XA must fail the stream too")
+	client2.streamWG.Wait()
+	require.Equal(t, 0, client2.GetDeltaLen(), "no one-phase XA row events may be buffered")
 }
 
-// TestGTIDClientXATransactionCompression re-runs the XA two-phase dance
-// with binlog_transaction_compression=ON on the XA session. The entire XA
+// TestGTIDClientXATransactionCompression re-runs the XA guard dance with
+// binlog_transaction_compression=ON on the XA session. The entire XA
 // first group — Query("XA START"), row events, Query("XA END") and the
 // terminating XA_PREPARE_LOG_EVENT — arrives inside one compressed
 // Transaction_payload event (verified against MySQL 8.0.43); only the
-// terminal XA COMMIT QueryEvent stays outside, under its own GTID. The
-// BlockWait after the prepare is the promotion-liveness assertion: it only
-// returns if processTransactionPayload promoted the pending GTID at the
-// inner XA_PREPARE_LOG_EVENT, and the delta count proves the inner row
-// events were buffered rather than dropped.
+// terminal XA COMMIT / XA ROLLBACK QueryEvent stays outside, under its
+// own GTID. The inner "XA START" QueryEvent must fail the payload before
+// the row events after it are buffered, surfacing exactly like the
+// uncompressed abort: an unsupported-XA reason.
 //
 // Unique xids and per-run table names for the same reasons documented on
 // TestGTIDClientXATransaction.
@@ -793,7 +794,6 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	defer utils.CloseAndLog(db)
 
 	xid := xaTestXIDPrefix + "_comp_" + uuid.NewString()
-	xid1p := xaTestXIDPrefix + "_comp1p_" + uuid.NewString()
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
 	srcTable := "gtidxacompt1_" + suffix
 	dstTable := "gtidxacompt2_" + suffix
@@ -812,7 +812,7 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 			return
 		}
 		defer utils.CloseAndLog(cleanupDB)
-		rollbackDanglingXATestTxns(t, cleanupDB, xid, xid1p)
+		rollbackDanglingXATestTxns(t, cleanupDB, xid)
 		_, _ = cleanupDB.ExecContext(context.Background(), "SET SESSION lock_wait_timeout=5")
 		_, _ = cleanupDB.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s, %s", srcTable, dstTable))
 	})
@@ -825,7 +825,14 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	var gotReason atomic.Int64
+	gotReason.Store(-1)
+	clientConfig := NewClientDefaultConfig()
+	clientConfig.CancelFunc = func(reason FatalReason) bool {
+		gotReason.Store(int64(reason))
+		return true
+	}
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
 	require.NoError(t, client.AddSubscription(t1, t2, chunker))
@@ -847,51 +854,38 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	xaExec(fmt.Sprintf("XA END '%s'", xid))
 	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
 
-	// The prepare flushes the whole group as one compressed payload. A
-	// handler that dropped the payload (or failed to promote at the inner
-	// XA_PREPARE_LOG_EVENT) would time out here.
-	require.NoError(t, client.BlockWait(t.Context()))
-	require.Equal(t, 2, client.GetDeltaLen(), "row events inside the compressed XA group must be buffered")
+	// The prepare flushes the whole group as one compressed payload; the
+	// guard must fail it at the inner "XA START" QueryEvent, ahead of the
+	// inner row events.
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "a compressed XA group must fail the stream as unsupported XA")
+	client.streamWG.Wait() // reader fully exited: buffering is final
+	require.Equal(t, 0, client.GetDeltaLen(), "no row events inside the compressed XA group may be buffered")
 
-	xaExec(fmt.Sprintf("XA COMMIT '%s'", xid))
-	require.NoError(t, client.BlockWait(t.Context()))
-	require.NoError(t, client.Flush(t.Context()))
+	// Roll the prepared transaction back and verify the target never saw
+	// the prepared rows — the divergence the guard exists to prevent.
+	xaExec(fmt.Sprintf("XA ROLLBACK '%s'", xid))
 	var count int
 	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", dstTable)).Scan(&count))
-	require.Equal(t, 2, count)
-
-	// One-phase variant: a single compressed group, likewise terminated by
-	// an XA_PREPARE_LOG_EVENT.
-	xaExec(fmt.Sprintf("XA START '%s'", xid1p))
-	xaExec(fmt.Sprintf("INSERT INTO %s (a, b, c) VALUES (3, 4, 5)", srcTable))
-	xaExec(fmt.Sprintf("XA END '%s'", xid1p))
-	xaExec(fmt.Sprintf("XA COMMIT '%s' ONE PHASE", xid1p))
-
-	require.NoError(t, client.BlockWait(t.Context()))
-	require.NoError(t, client.Flush(t.Context()))
-	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", dstTable)).Scan(&count))
-	require.Equal(t, 3, count)
+	require.Equal(t, 0, count, "prepared-then-rolled-back rows must never reach the target")
 }
 
-// TestGTIDClientXAPromotionOrdering is the deterministic regression test
-// for the premature-promotion bug: the "XA START" QueryEvent used to
-// fall through to the parser path (the TiDB parser cannot parse XA
-// syntax) and promote the pending GTID before the transaction's row
-// events had been buffered. A flush in that window published a resume
-// coordinate that already covered the transaction, so a crash before
-// the next flush resumed past it and silently lost its rows.
+// TestGTIDClientXAGuardStream deterministically exercises the XA guard's
+// readStream wiring: any XA event must fail the stream via
+// CancelFunc(FatalReasonUnsupportedXA) — before the XA transaction's row
+// events are buffered, and without promoting its GTID into the resume
+// set (the refused group is never treated as applied).
 //
-// Events are injected through a synthetic go-mysql BinlogStreamer
-// rather than a real server because the server writes an XA
-// transaction's entire first group to the binlog in one burst at XA
-// PREPARE time (see TestGTIDClientXATransaction): wall-clock timing
-// cannot reliably observe the stream state between the "XA START"
-// QueryEvent and the XA_PREPARE_LOG_EVENT of the same burst. Row events
-// for a subscribed table are used as ordering barriers: events are
-// consumed strictly in order, so once GetDeltaLen reflects a row event,
-// every event injected before it has been processed.
-func TestGTIDClientXAPromotionOrdering(t *testing.T) {
-	skipUnlessGTIDEnabled(t)
+// Events are injected through a synthetic go-mysql BinlogStreamer rather
+// than a real server because the server writes an XA transaction's
+// entire first group to the binlog in one burst at XA PREPARE time (see
+// TestGTIDClientXATransaction): wall-clock timing cannot reliably
+// observe the stream state between the "XA START" QueryEvent and the
+// row events of the same burst. Injection also reaches shapes a real
+// 8.0 server never streams to us — a lone XA_PREPARE_LOG_EVENT without
+// its opening "XA START" (the defense-in-depth branch), and a terminal
+// XA COMMIT for a transaction prepared before we connected.
+func TestGTIDClientXAGuardStream(t *testing.T) {
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -909,23 +903,6 @@ func TestGTIDClientXAPromotionOrdering(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
-	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
-	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
-
-	// Wire readStream to a synthetic streamer instead of client.Start().
-	empty, err := mysql.ParseMysqlGTIDSet("")
-	require.NoError(t, err)
-	streamer := replication.NewBinlogStreamer()
-	ctx, cancel := context.WithCancel(t.Context())
-	client.streamer = streamer
-	client.bufferedGTID = empty
-	client.flushedGTID = empty.Clone()
-	client.cancelFunc = cancel
-	client.streamWG.Add(1)
-	go client.readStream(ctx)
-	defer client.Close()
 
 	const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	sidUUID := uuid.MustParse(sid)
@@ -950,63 +927,228 @@ func TestGTIDClientXAPromotionOrdering(t *testing.T) {
 			},
 		}
 	}
-	inject := func(evs ...*replication.BinlogEvent) {
+	xaPrepareEvent := func() *replication.BinlogEvent {
+		// go-mysql has no dedicated decoder for XA_PREPARE_LOG_EVENT, so
+		// it surfaces as a GenericEvent identified only by the header
+		// type — as in readStream itself.
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
+			Event:  &replication.GenericEvent{},
+		}
+	}
+
+	// newSyntheticClient wires readStream to a synthetic streamer instead
+	// of client.Start(), with a CancelFunc that records the fatal reason.
+	newSyntheticClient := func(t *testing.T) (*gtidClient, *replication.BinlogStreamer, *atomic.Int64) {
+		var gotReason atomic.Int64
+		gotReason.Store(-1)
+		clientConfig := NewClientDefaultConfig()
+		clientConfig.CancelFunc = func(reason FatalReason) bool {
+			gotReason.Store(int64(reason))
+			return true
+		}
+		client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
+		chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+		require.NoError(t, err)
+		require.NoError(t, client.AddSubscription(t1, t2, chunker))
+
+		empty, err := mysql.ParseMysqlGTIDSet("")
+		require.NoError(t, err)
+		streamer := replication.NewBinlogStreamer()
+		ctx, cancel := context.WithCancel(t.Context())
+		client.streamer = streamer
+		client.bufferedGTID = empty
+		client.flushedGTID = empty.Clone()
+		client.cancelFunc = cancel
+		client.streamWG.Add(1)
+		go client.readStream(ctx)
+		t.Cleanup(client.Close)
+		return client, streamer, &gotReason
+	}
+	inject := func(t *testing.T, streamer *replication.BinlogStreamer, evs ...*replication.BinlogEvent) {
 		t.Helper()
 		for _, ev := range evs {
 			require.NoError(t, streamer.AddEventToStreamer(ev))
 		}
 	}
-	buffered := func(gno int64) bool {
+	// expectAbort waits for the guard to fire as unsupported XA and for
+	// readStream to fully exit, then verifies nothing was buffered: no
+	// row events, and no XA GTID in the resume set.
+	expectAbort := func(t *testing.T, client *gtidClient, gotReason *atomic.Int64, gno int64) {
+		t.Helper()
+		require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+			5*time.Second, 5*time.Millisecond, "the XA guard must fail the stream as unsupported XA")
+		client.streamWG.Wait() // reader fully exited: buffering is final
+		require.Equal(t, 0, client.GetDeltaLen(), "no row events may be buffered once the guard fires")
 		target, err := mysql.ParseMysqlGTIDSet(fmt.Sprintf("%s:%d", sid, gno))
 		require.NoError(t, err)
-		return client.getBufferedGTID().Contain(target)
+		require.False(t, client.getBufferedGTID().Contain(target),
+			"the XA GTID must not enter the resume set")
 	}
 
 	// The XA transaction's first group, exactly as the server writes it
-	// at XA PREPARE time. The row event doubles as the ordering barrier
-	// for the "XA START" QueryEvent before it.
-	inject(gtidEvent(100), queryEvent("XA START X'78',X'',1"), rowEvent(1))
-	require.Eventually(t, func() bool { return client.GetDeltaLen() == 1 },
-		5*time.Second, 5*time.Millisecond, "row event after XA START was not processed")
-	require.False(t, buffered(100),
-		"the GTID must not be promoted at XA START: the transaction's row events are not buffered yet")
-
-	// XA END does not terminate the group either. The second row event
-	// is the ordering barrier — the real group has none in this spot,
-	// but row events are inert to the promotion logic.
-	inject(queryEvent("XA END X'78',X'',1"), rowEvent(2))
-	require.Eventually(t, func() bool { return client.GetDeltaLen() == 2 },
-		5*time.Second, 5*time.Millisecond, "row event after XA END was not processed")
-	require.False(t, buffered(100),
-		"the GTID must not be promoted at XA END: the group ends at the XA prepare event")
-	client.mu.Lock()
-	pendingGNO := client.pendingGNO
-	client.mu.Unlock()
-	require.EqualValues(t, 100, pendingGNO, "the XA transaction's GTID must still be pending after XA END")
-
-	// The XA_PREPARE_LOG_EVENT terminates the group. go-mysql has no
-	// dedicated decoder for it, so it surfaces as a GenericEvent
-	// identified only by the header type — as in readStream itself.
-	inject(&replication.BinlogEvent{
-		Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
-		Event:  &replication.GenericEvent{},
+	// at XA PREPARE time. The guard must fire at the opening "XA START"
+	// QueryEvent; the row event injected after it must never be consumed.
+	t.Run("XA START", func(t *testing.T) {
+		client, streamer, gotReason := newSyntheticClient(t)
+		inject(t, streamer, gtidEvent(100), queryEvent("XA START X'78',X'',1"), rowEvent(1))
+		expectAbort(t, client, gotReason, 100)
 	})
-	require.Eventually(t, func() bool { return buffered(100) },
-		5*time.Second, 5*time.Millisecond, "the XA prepare event must promote the pending GTID")
 
-	// The terminal XA COMMIT arrives later under its own GTID, with no
-	// row events. Same for an XA ROLLBACK outcome.
-	inject(gtidEvent(101), queryEvent("XA COMMIT X'78',X'',1"))
-	require.Eventually(t, func() bool { return buffered(101) },
-		5*time.Second, 5*time.Millisecond, "XA COMMIT must promote its own GTID")
+	// A terminal XA COMMIT with no preceding "XA START" in-stream: the
+	// transaction was prepared before we connected, so its row events
+	// were never streamed and an applied commit would silently lose
+	// them. It must be refused, not promoted. Same for XA ROLLBACK.
+	t.Run("terminal XA COMMIT", func(t *testing.T) {
+		client, streamer, gotReason := newSyntheticClient(t)
+		inject(t, streamer, gtidEvent(101), queryEvent("XA COMMIT X'78',X'',1"))
+		expectAbort(t, client, gotReason, 101)
+	})
+	t.Run("terminal XA ROLLBACK", func(t *testing.T) {
+		client, streamer, gotReason := newSyntheticClient(t)
+		inject(t, streamer, gtidEvent(102), queryEvent("XA ROLLBACK X'79',X'',1"))
+		expectAbort(t, client, gotReason, 102)
+	})
 
-	inject(gtidEvent(102), queryEvent("XA ROLLBACK X'79',X'',1"))
-	require.Eventually(t, func() bool { return buffered(102) },
-		5*time.Second, 5*time.Millisecond, "XA ROLLBACK must promote its own GTID")
+	// The defense-in-depth branch: an XA_PREPARE_LOG_EVENT arriving
+	// without its group's "XA START" (no MySQL 8.0 server streams this
+	// shape today; the branch protects against a future regrouping).
+	t.Run("XA_PREPARE_LOG_EVENT", func(t *testing.T) {
+		client, streamer, gotReason := newSyntheticClient(t)
+		inject(t, streamer, gtidEvent(103), xaPrepareEvent())
+		expectAbort(t, client, gotReason, 103)
+	})
+}
+
+// TestGTIDProcessQueryEventXAGuard unit-tests processQueryEvent's
+// statement classification directly: every XA statement the server
+// binlogs as a QueryEvent must be refused with errXAUnsupported, while
+// the non-XA transaction-control statements and DDL keep flowing
+// through their existing nil-error paths (including statements that
+// merely mention xa as an identifier).
+func TestGTIDProcessQueryEventXAGuard(t *testing.T) {
+	empty, err := mysql.ParseMysqlGTIDSet("")
+	require.NoError(t, err)
+	c := &gtidClient{
+		logger:       slog.Default(),
+		subs:         newSubscriptionRegistry(),
+		bufferedGTID: empty,
+		flushedGTID:  empty.Clone(),
+	}
+	queryEvent := func(q string) *replication.QueryEvent {
+		return &replication.QueryEvent{Schema: []byte("test"), Query: []byte(q)}
+	}
+	// The canonical server-rewritten forms (XA BEGIN 'x' is binlogged
+	// with a hex-encoded xid), plus case and whitespace variations.
+	for _, q := range []string{
+		"XA START X'78',X'',1",
+		"XA END X'78',X'',1",
+		"XA COMMIT X'78',X'',1",
+		"XA ROLLBACK X'78',X'',1",
+		"xa start X'78',X'',1",
+		"  XA COMMIT X'78',X'',1  ",
+	} {
+		require.ErrorIs(t, c.processQueryEvent(queryEvent(q)), errXAUnsupported, "statement %q must be refused", q)
+	}
+	// Non-XA statements keep their existing behavior (no error).
+	for _, q := range []string{
+		"BEGIN",
+		"COMMIT",
+		"ROLLBACK",
+		"SAVEPOINT `sp1`",
+		"ROLLBACK TO `sp1`",
+		"RELEASE SAVEPOINT `sp1`",
+		"CREATE TABLE xa_lookalike (a INT NOT NULL PRIMARY KEY)",
+		"DROP TABLE `xa`", // a table named xa is not an XA statement
+	} {
+		require.NoError(t, c.processQueryEvent(queryEvent(q)), "statement %q must not be refused", q)
+	}
+}
+
+// A CTAS QueryEvent opens a transaction group: its GTID must stay pending,
+// while its CREATE TABLE must still cancel a whole-schema subscriber.
+func TestGTIDClientCTASNotifiesSchemaFilter(t *testing.T) {
+	empty, err := mysql.ParseMysqlGTIDSet("")
+	require.NoError(t, err)
+	sid := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	var got []FatalReason
+	c := &gtidClient{
+		logger:           slog.Default(),
+		subs:             newSubscriptionRegistry(),
+		bufferedGTID:     empty,
+		flushedGTID:      empty.Clone(),
+		ddlFilterSchema:  "test",
+		callerCancelFunc: func(r FatalReason) bool { got = append(got, r); return true },
+		pendingSID:       sid[:],
+		pendingGNO:       7,
+	}
+	require.NoError(t, c.processQueryEvent(&replication.QueryEvent{Schema: []byte("test"),
+		Query: []byte("CREATE TABLE `ctas1` (`a` int NOT NULL) START TRANSACTION")}))
+	require.Equal(t, []FatalReason{FatalReasonSchemaChange}, got)
+	require.Equal(t, int64(7), c.pendingGNO, "CTAS must leave its GTID pending until XIDEvent")
+	require.Empty(t, c.getBufferedGTID().String(), "CTAS must not promote its GTID before row events")
+}
+
+// TestGTIDProcessTransactionPayloadXAGuard unit-tests the compressed
+// path directly: an inner "XA START" QueryEvent must fail the payload
+// before the row events after it are buffered, and an inner
+// XA_PREPARE_LOG_EVENT (the defense-in-depth branch) must fail it too.
+func TestGTIDProcessTransactionPayloadXAGuard(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	// Real tables so the subscription would buffer the inner row event
+	// if the guard failed to fire first.
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS gtidxapayt1, gtidxapayt2")
+	testutils.RunSQL(t, "CREATE TABLE gtidxapayt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE gtidxapayt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "gtidxapayt1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "gtidxapayt2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	defer client.Close()
+
+	// A compressed XA prepare group as go-mysql decompresses it: the
+	// inner "XA START" QueryEvent precedes the inner row events.
+	xaGroup := &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
+		{
+			Header: &replication.EventHeader{EventType: replication.QUERY_EVENT},
+			Event:  &replication.QueryEvent{Schema: []byte("test"), Query: []byte("XA START X'78',X'',1")},
+		},
+		{
+			Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2},
+			Event: &replication.RowsEvent{
+				Table: &replication.TableMapEvent{Schema: []byte("test"), Table: []byte("gtidxapayt1")},
+				Rows:  [][]any{{int32(1), int32(0), int32(0)}},
+			},
+		},
+	}}
+	require.ErrorIs(t, client.processTransactionPayload(xaGroup), errXAUnsupported)
+	require.Equal(t, 0, client.GetDeltaLen(), "the inner row events after XA START must not be buffered")
+
+	// Defense in depth: an inner XA_PREPARE_LOG_EVENT without its
+	// opening "XA START".
+	prepareOnly := &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
+		{
+			Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
+			Event:  &replication.GenericEvent{},
+		},
+	}}
+	require.ErrorIs(t, client.processTransactionPayload(prepareOnly), errXAUnsupported)
+	require.Equal(t, 0, client.GetDeltaLen())
 }
 
 // TestGTIDClientSavepointPromotionOrdering is the savepoint twin of
-// TestGTIDClientXAPromotionOrdering. MySQL logs "SAVEPOINT `sp1`" (and, in
+// TestGTIDClientXAGuardStream. MySQL logs "SAVEPOINT `sp1`" (and, in
 // mixed-engine transactions, "ROLLBACK TO `sp1`") as a QueryEvent in the
 // *middle* of a row-format transaction group — verified against MySQL 8.0:
 // GTIDEvent → Query(BEGIN) → row events → Query("SAVEPOINT `sp1`") → more
@@ -1675,4 +1817,64 @@ func TestGTIDProcessDDLNotificationMoveStyle(t *testing.T) {
 	// DDL on the subscribed table still cancels.
 	c.processDDLNotification(dbName, "orders")
 	require.True(t, cancelled, "should cancel on DDL matching the subscribed table")
+}
+
+// TestGTIDProcessRowsEventUnknownSubtype is the GTID client's twin of
+// TestBinlogProcessRowsEventUnknownSubtype: a rows-event subtype
+// parseEventType does not recognize must fail the stream rather than have
+// its rows dropped with only an error log. go-mysql parses
+// PARTIAL_UPDATE_ROWS_EVENT (emitted once binlog_row_value_options=
+// PARTIAL_JSON is set, which can happen after preflight has read the
+// global) into a plain *replication.RowsEvent, so it reaches
+// processRowsEvent carrying real row changes.
+func TestGTIDProcessRowsEventUnknownSubtype(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS gtidunknownsubt1, gtidunknownsubt2")
+	testutils.RunSQL(t, "CREATE TABLE gtidunknownsubt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE gtidunknownsubt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
+
+	t1 := table.NewTableInfo(db, "test", "gtidunknownsubt1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "gtidunknownsubt2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	defer client.Close()
+
+	mkEvent := func(et replication.EventType, tbl string, pk int32) (*replication.BinlogEvent, *replication.RowsEvent) {
+		rows := &replication.RowsEvent{
+			Table: &replication.TableMapEvent{Schema: []byte("test"), Table: []byte(tbl)},
+			Rows:  [][]any{{pk, int32(0), int32(0)}},
+		}
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: et, LogPos: 1000},
+			Event:  rows,
+		}, rows
+	}
+
+	// Sanity: a recognized subtype flows through and buffers the row.
+	ev, rows := mkEvent(replication.WRITE_ROWS_EVENTv2, "gtidunknownsubt1", 1)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, client.GetDeltaLen())
+
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, "gtidunknownsubt1", 2)
+	err = client.processRowsEvent(ev, rows)
+	require.ErrorIs(t, err, errUnsupportedRowsEvent)
+	require.ErrorContains(t, err, "PartialUpdateRowsEvent")
+	require.ErrorContains(t, err, fmt.Sprintf("0x%02x", uint8(replication.PARTIAL_UPDATE_ROWS_EVENT)))
+	require.ErrorContains(t, err, "gtidunknownsubt1")
+	require.Equal(t, 1, client.GetDeltaLen(), "the unsupported event must not buffer rows")
+
+	// Unsubscribed tables stay ignored regardless of subtype.
+	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, "not_subscribed", 3)
+	require.NoError(t, client.processRowsEvent(ev, rows))
+	require.Equal(t, 1, client.GetDeltaLen())
 }

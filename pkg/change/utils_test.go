@@ -1,11 +1,39 @@
 package change
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/stretchr/testify/require"
 )
+
+func TestParseQueryEventClassification(t *testing.T) {
+	tests := []struct {
+		query string
+		want  queryEventInfo
+	}{
+		{"  xa begin 'x'  ", queryEventInfo{xa: true}},
+		{"XA COMMIT X'78' ONE PHASE", queryEventInfo{xa: true}},
+		{"XA ROLLBACK X'78'", queryEventInfo{xa: true}},
+		{"BEGIN", queryEventInfo{opensTransaction: true}},
+		{"START TRANSACTION", queryEventInfo{opensTransaction: true}},
+		{"SAVEPOINT `s`", queryEventInfo{keepsTransactionOpen: true}},
+		{"ROLLBACK TO `s`", queryEventInfo{keepsTransactionOpen: true}},
+		{"RELEASE SAVEPOINT `s`", queryEventInfo{keepsTransactionOpen: true}},
+		{"COMMIT", queryEventInfo{endsTransaction: true}},
+		{"ROLLBACK", queryEventInfo{endsTransaction: true}},
+		{"CREATE TABLE xa_lookalike (id INT PRIMARY KEY)", queryEventInfo{tables: []schemaTable{{"test", "xa_lookalike"}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			got, err := parseQueryEvent("test", tt.query)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
 
 func TestEncodeSchemaTable(t *testing.T) {
 	tests := []struct {
@@ -482,4 +510,145 @@ func TestIsMinimalRowImage(t *testing.T) {
 		e := &replication.RowsEvent{SkippedColumns: [][]int{{1, 2, 3}}}
 		require.True(t, isMinimalRowImage(e))
 	})
+}
+
+// TestLogPosTracker covers the wraparound detector in isolation. Within a
+// binlog file, an event's LogPos (its end offset) only ever increases, so a
+// backwards step is the signature of the 4-byte field wrapping past 4GiB —
+// provided positions that are not real offsets into the file being read are
+// excluded. Those exclusions are what keep a post-reconnect replay, which
+// restarts the file at position 4, from being misread as a wrap.
+func TestLogPosTracker(t *testing.T) {
+	// mkEvent builds a minimal event carrying just a header position.
+	mkEvent := func(logPos uint32) *replication.BinlogEvent {
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2, LogPos: logPos},
+			Event:  &replication.RowsEvent{},
+		}
+	}
+
+	t.Run("ascending positions never report a wrap", func(t *testing.T) {
+		var tr logPosTracker
+		for _, pos := range []uint32{4, 100, 1000, 1 << 20, 1 << 31, 4294967000} {
+			require.False(t, tr.observe(mkEvent(pos)), "pos %d", pos)
+		}
+	})
+
+	t.Run("a repeated position is not a wrap", func(t *testing.T) {
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(1000)))
+		require.False(t, tr.observe(mkEvent(1000)),
+			"only a strictly backwards step is a wrap; equal positions must not abort a healthy stream")
+	})
+
+	t.Run("a backwards step reports a wrap", func(t *testing.T) {
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(4294967000)))
+		// The first event past 4GiB: its real end offset is just over 2^32,
+		// so the 4-byte field reports what is left after the wrap.
+		require.True(t, tr.observe(mkEvent(500)))
+	})
+
+	t.Run("a small backwards step reports a wrap too", func(t *testing.T) {
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(1000)))
+		require.True(t, tr.observe(mkEvent(999)),
+			"no threshold: within a file, positions are sequential, so any backwards step is anomalous")
+	})
+
+	t.Run("a wrap does not advance the tracker", func(t *testing.T) {
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(4294967000)))
+		require.True(t, tr.observe(mkEvent(500)))
+		require.Equal(t, uint32(4294967000), tr.last,
+			"the pre-wrap position is what the fatal log line reports")
+	})
+
+	t.Run("rotating resets, so a replay from position 4 is not a wrap", func(t *testing.T) {
+		// recreateStreamer re-opens the current file at position 4 and the
+		// server prefaces the dump with an artificial rotate. Without the
+		// reset the replayed low positions would look like a wrap and abort
+		// a perfectly healthy recovery.
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(4294967000)))
+		tr.rotated()
+		for _, pos := range []uint32{4, 120, 900} {
+			require.False(t, tr.observe(mkEvent(pos)), "replayed pos %d", pos)
+		}
+	})
+
+	t.Run("positionless events are ignored", func(t *testing.T) {
+		// FormatDescriptionEvent and the artificial rotate that opens a dump
+		// carry LogPos=0.
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(1000)))
+		fde := &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.FORMAT_DESCRIPTION_EVENT, LogPos: 0},
+			Event:  &replication.FormatDescriptionEvent{},
+		}
+		require.False(t, tr.observe(fde))
+		require.Equal(t, uint32(1000), tr.last, "a zero position must not rewind the tracker")
+	})
+
+	t.Run("a row-bearing event at position zero is a wrap", func(t *testing.T) {
+		// The one wrapped end offset that collides with "no position": an
+		// event ending exactly on 2^32 reports zero. Reading it as
+		// positionless would let the replay guard skip its rows and, if the
+		// file rotated next, reset the tracker with the wrap unreported.
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(4294967000)))
+		require.True(t, tr.observe(mkEvent(0)))
+
+		var tr2 logPosTracker
+		require.False(t, tr2.observe(mkEvent(4294967000)))
+		payload := &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.TRANSACTION_PAYLOAD_EVENT, LogPos: 0},
+			Event:  &replication.TransactionPayloadEvent{},
+		}
+		require.True(t, tr2.observe(payload))
+	})
+
+	t.Run("a row-bearing event at position zero before any real position is not a wrap", func(t *testing.T) {
+		// Nothing has been seen in this file yet, so zero cannot be a step
+		// backwards from anything.
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(0)))
+		require.False(t, tr.observe(mkEvent(1000)))
+		tr.rotated()
+		require.False(t, tr.observe(mkEvent(0)))
+	})
+
+	t.Run("artificial events are ignored", func(t *testing.T) {
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(1000)))
+		artificial := mkEvent(4)
+		artificial.Header.Flags |= replication.LOG_EVENT_ARTIFICIAL_F
+		require.False(t, tr.observe(artificial),
+			"an artificial event's LogPos was synthesized by the server, not read from the file")
+		require.Equal(t, uint32(1000), tr.last)
+	})
+
+	t.Run("heartbeats are ignored", func(t *testing.T) {
+		// A heartbeat reports the dump thread's own position, which can name
+		// a file we have not rotated into yet.
+		var tr logPosTracker
+		require.False(t, tr.observe(mkEvent(1_000_000)))
+		heartbeat := &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.HEARTBEAT_EVENT, LogPos: 4},
+			Event:  &replication.HeartbeatEvent{},
+		}
+		require.False(t, tr.observe(heartbeat))
+		require.Equal(t, uint32(1_000_000), tr.last)
+	})
+}
+
+// TestFatalReasonForStreamError pins the error-to-reason mapping the readers
+// use to tell the caller whether its checkpoint survives.
+func TestFatalReasonForStreamError(t *testing.T) {
+	require.Equal(t, FatalReasonUnsupportedXA, fatalReasonForStreamError(errXAUnsupported))
+	require.Equal(t, FatalReasonLogPosWrapped, fatalReasonForStreamError(errLogPosWrapped))
+	require.Equal(t, FatalReasonLogPosWrapped,
+		fatalReasonForStreamError(fmt.Errorf("wrapping context: %w", errLogPosWrapped)))
+	require.Equal(t, FatalReasonStreamError, fatalReasonForStreamError(errors.New("some other failure")))
+	require.Equal(t, "logpos-wrapped", FatalReasonLogPosWrapped.String())
 }

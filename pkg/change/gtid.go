@@ -279,12 +279,6 @@ func normalizeGTIDString(s string) string {
 	}, s)
 }
 
-// hasPrefixFold reports whether s begins with prefix, matched
-// case-insensitively (strings.HasPrefix + strings.EqualFold).
-func hasPrefixFold(s, prefix string) bool {
-	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
-}
-
 // setBufferedGTID adds gtid to bufferedGTID under c.mu. The set grows
 // monotonically — there is no "rewind" in GTID semantics.
 func (c *gtidClient) setBufferedGTID(sid []byte, gno int64) {
@@ -315,11 +309,10 @@ func (c *gtidClient) getBufferedGTID() mysql.GTIDSet {
 // This must be called when — and only when — the current transaction's
 // binlog group has ended: XIDEvent (InnoDB commit), a COMMIT or ROLLBACK
 // QueryEvent (non-transactional engines / mixed-engine rollbacks), a
-// parsed standalone statement that is its own transaction (DDL), an
-// XA_PREPARE_LOG_EVENT, an XA COMMIT / XA ROLLBACK QueryEvent, or the
-// next group's GTIDEvent — which proves the previous group ended, and is
-// what advances statements with no terminator we can recognize, such as
-// those the TiDB parser cannot parse (see processQueryEvent).
+// parsed standalone statement that is its own transaction (DDL), or the
+// next group's GTIDEvent — which proves the previous group ended and
+// advances statements with no terminator we can recognize (see
+// processQueryEvent). XA events fail the stream before promotion.
 // Every GTIDEvent the server streams corresponds to an entry in its
 // gtid_executed, so any path that drops a pending GTID instead of
 // promoting it leaves bufferedGTID permanently behind gtid_executed and
@@ -333,19 +326,9 @@ func (c *gtidClient) getBufferedGTID() mysql.GTIDSet {
 // besides BEGIN and the SAVEPOINT family ("SAVEPOINT `x`", plus
 // "ROLLBACK TO `x`" in mixed-engine transactions), but two group shapes
 // do: CREATE TABLE ... SELECT carries its unparseable CREATE TABLE
-// statement mid-group (see processQueryEvent), and XA transactions —
-// their first group is written to
-// the binlog in one piece at XA PREPARE time, shaped as (verified against
-// MySQL 8.0):
-//
-//	GTIDEvent(g1) → Query("XA START x") → row events →
-//	Query("XA END x") → XA_PREPARE_LOG_EVENT
-//
-// with the terminal XA COMMIT or XA ROLLBACK arriving any amount of time
-// later as a QueryEvent under its own GTID (g2), with no row events.
-// (`XA COMMIT ... ONE PHASE` is instead logged as the XA_PREPARE_LOG_EVENT
-// terminator of the first group, so both group shapes end at either an
-// XA_PREPARE_LOG_EVENT or a plain QueryEvent terminator.)
+// statement mid-group (see processQueryEvent), and XA transactions log
+// "XA START"/"XA END" around their row events. XA events fail the stream
+// before any row event is buffered; see the guard in processQueryEvent.
 func (c *gtidClient) promotePendingGTID() {
 	c.mu.Lock()
 	pendingSID := c.pendingSID
@@ -705,7 +688,11 @@ func (c *gtidClient) readStream(ctx context.Context) {
 				return
 			}
 		case *replication.QueryEvent:
-			c.processQueryEvent(event)
+			if err = c.processQueryEvent(event); err != nil {
+				c.logger.Error("fatal error processing GTID query event", "error", err)
+				c.fatalError(fatalReasonForStreamError(err))
+				return
+			}
 		case *replication.TransactionPayloadEvent:
 			// binlog_transaction_compression=ON wraps the whole transaction
 			// (BEGIN QueryEvent, TableMapEvents, row events, XIDEvent) in one
@@ -718,7 +705,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 			// wedging BlockWait/Flush forever.
 			if err = c.processTransactionPayload(event); err != nil {
 				c.logger.Error("fatal error processing GTID transaction payload event", "error", err)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(fatalReasonForStreamError(err))
 				return
 			}
 		case *replication.RotateEvent:
@@ -736,14 +723,16 @@ func (c *gtidClient) readStream(ctx context.Context) {
 			// GenericEvent; the header carries the real type. The one we
 			// must act on is XA_PREPARE_LOG_EVENT: it terminates an XA
 			// transaction's first binlog group (it is also how the server
-			// logs `XA COMMIT ... ONE PHASE`). All of the transaction's row
-			// events precede it in the group and have been buffered, and
-			// the server records the GTID in gtid_executed at prepare time,
-			// so this — not the earlier "XA START"/"XA END" QueryEvents —
-			// is the point where the pending GTID is safe to promote.
+			// logs `XA COMMIT ... ONE PHASE`), and spirit does not support
+			// XA workloads — see the guard in processQueryEvent. That guard
+			// already fails the stream at the group's opening "XA START"
+			// QueryEvent, before any of its row events are buffered, so
+			// this branch is defense in depth in case a future server
+			// version reshapes the group.
 			if ev.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
-				c.promotePendingGTID()
-				continue
+				c.logger.Error("fatal error processing GTID stream", "error", errXAUnsupported)
+				c.fatalError(FatalReasonUnsupportedXA)
+				return
 			}
 			c.logger.Debug("Received unknown event type", "type", ev.Header.EventType.String())
 		default:
@@ -754,83 +743,13 @@ func (c *gtidClient) readStream(ctx context.Context) {
 
 // processQueryEvent handles a QueryEvent, whether read directly from the
 // stream or decompressed from a transaction payload. Transaction-control
-// statements adjust the pending-GTID state; everything else goes through
-// DDL extraction. See promotePendingGTID for the group shapes that dictate
-// which statements promote and which must leave the pending GTID pending.
-func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) {
-	// A "BEGIN" QueryEvent inside a transaction is not DDL — skip
-	// it cheaply rather than handing it to the parser. The pending
-	// GTID must stay pending: the transaction's row events have not
-	// been buffered yet.
-	q := strings.TrimSpace(string(event.Query))
-	if strings.EqualFold(q, "BEGIN") {
-		return
-	}
-	// MySQL also logs SAVEPOINT statements as QueryEvents in the
-	// *middle* of a row-format transaction (verified against MySQL
-	// 8.0: GTIDEvent → Query(BEGIN) → row events →
-	// Query("SAVEPOINT `sp1`") → more row events → XIDEvent).
-	// "ROLLBACK TO `sp1`" appears mid-group the same way when
-	// non-transactional writes after the savepoint prevent the
-	// server from simply truncating its binlog cache. Neither
-	// terminates the group — it still ends at the XIDEvent or
-	// COMMIT/ROLLBACK QueryEvent that follows — so, exactly like
-	// BEGIN and "XA START"/"XA END", the pending GTID must stay
-	// pending: falling through to the parser path below would
-	// promote on both of its branches, letting a concurrent flush
-	// publish the GTID as a resume coordinate before the rest of
-	// the transaction's row events are buffered. A crash before the
-	// next flush would then resume past the transaction and
-	// silently lose its tail. The server rewrites these statements
-	// with backtick-quoted identifiers ("ROLLBACK TO `sp1`" — no
-	// SAVEPOINT keyword), so keyword prefix matches are exact.
-	// "ROLLBACK TO " is matched here, above the terminator check
-	// below, so it can never be taken for a transaction-ending
-	// ROLLBACK; "RELEASE SAVEPOINT " is matched defensively (MySQL
-	// does not binlog it today) since releasing a savepoint never
-	// ends a transaction either.
-	if hasPrefixFold(q, "SAVEPOINT ") || hasPrefixFold(q, "ROLLBACK TO ") || hasPrefixFold(q, "RELEASE SAVEPOINT ") {
-		return
-	}
-	// COMMIT/ROLLBACK QueryEvents end a transaction that involved a
-	// non-transactional engine (these get a QueryEvent terminator
-	// instead of an XIDEvent; a logged ROLLBACK is the mixed-engine
-	// case where the non-transactional writes survived the rollback).
-	// Either way the server has recorded the GTID in gtid_executed
-	// and we have buffered all of the transaction's row events, so
-	// promote — exactly as the XIDEvent path does. Skipping the
-	// promotion here would wedge BlockWait forever.
-	if strings.EqualFold(q, "COMMIT") || strings.EqualFold(q, "ROLLBACK") {
-		c.promotePendingGTID()
-		return
-	}
-	// XA statements must not fall through to the parser path below
-	// (which promotes): see the XA group shape documented on
-	// promotePendingGTID. "XA START" opens the group exactly like
-	// BEGIN — its row events have not been buffered yet — and
-	// "XA END" is not a terminator either (the group ends at the
-	// XA_PREPARE_LOG_EVENT that follows), so for both the pending
-	// GTID must stay pending. Promoting here would let a concurrent
-	// flush publish g1 as a resume coordinate before its row events
-	// are buffered; a crash before the next flush then resumes past
-	// g1 and silently loses its rows. The server rewrites these
-	// statements canonically (`XA BEGIN 'x'` is binlogged as
-	// "XA START X'78',X'',1"), so a keyword prefix match is exact.
-	if hasPrefixFold(q, "XA START ") || hasPrefixFold(q, "XA END ") {
-		return
-	}
-	// XA COMMIT / XA ROLLBACK (the two-phase outcome, decided after
-	// the prepare) are each their own single-statement transaction:
-	// own GTID, no row events. Promote, same as COMMIT/ROLLBACK
-	// above. (The one-phase variant `XA COMMIT ... ONE PHASE` never
-	// takes this path — it is logged as an XA_PREPARE_LOG_EVENT,
-	// handled by readStream's GenericEvent case for uncompressed
-	// groups and by processTransactionPayload for compressed ones.)
-	if hasPrefixFold(q, "XA COMMIT ") || hasPrefixFold(q, "XA ROLLBACK ") {
-		c.promotePendingGTID()
-		return
-	}
-	ddlTables, opensTransaction, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
+// statements adjust the pending-GTID state, XA statements fail the stream,
+// and DDL statements notify subscribers. See promotePendingGTID for
+// the group shapes that dictate which statements promote and which must
+// leave the pending GTID pending. A returned error is fatal: the caller
+// must tear the stream down without buffering anything further.
+func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) error {
+	info, err := parseQueryEvent(string(event.Schema), string(event.Query))
 	if err != nil {
 		// The parser does not understand all syntax (mode-dependent SQL
 		// such as ANSI_QUOTES quoting, or syntax newer than the grammar)
@@ -868,29 +787,36 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) {
 		// after parsing, so *any* unparseable statement on the server
 		// (e.g. ANSI_QUOTES DDL in an unrelated schema) takes this
 		// path.
-		return
+		return nil
 	}
-	// MySQL emits a synthetic GTID for DDL statements too, but the
-	// DDL is its own transaction (no XIDEvent). Promote any pending
-	// GTID now so a DDL-as-last-event still ends up in the resume
-	// set. This is best-effort — if the caller cancels on DDL we
-	// won't actually resume, but the position is consistent for
-	// non-cancelling filters.
-	//
-	// The exception is a statement that *opens* its group: the parsed
-	// CREATE TABLE ... START TRANSACTION form of CTAS (its row events
-	// are still to come, exactly like BEGIN above — the XIDEvent that
-	// ends the group promotes), or a hypothetical spelled-out
-	// START TRANSACTION the BEGIN fast-path above didn't catch.
-	// Promoting here would let a concurrent flush publish the GTID as
-	// a resume coordinate before the group's row events are buffered,
-	// silently losing them on resume.
-	if !opensTransaction {
+	// A parsed XA statement is unsafe even when it is a terminal COMMIT or
+	// ROLLBACK from a transaction prepared before this stream connected.
+	// The XA prepare group can expose row events before the outcome is known.
+	if info.xa {
+		return errXAUnsupported
+	}
+	// SAVEPOINT and ROLLBACK TO SAVEPOINT leave the group open without
+	// naming a DDL table. Its row events must precede GTID promotion.
+	if info.keepsTransactionOpen {
+		return nil
+	}
+	// Mixed-engine transactions use a COMMIT/ROLLBACK QueryEvent in place
+	// of XIDEvent. The transaction is complete at this point.
+	if info.endsTransaction {
+		c.promotePendingGTID()
+		return nil
+	}
+	// Ordinary DDL is its own transaction. A statement that opens a group,
+	// such as BEGIN or CREATE TABLE ... START TRANSACTION, must wait for its
+	// terminator before promotion. The CREATE TABLE still needs to notify
+	// DDL subscribers now, even though its GTID remains pending.
+	if !info.opensTransaction {
 		c.promotePendingGTID()
 	}
-	for _, ddlTable := range ddlTables {
+	for _, ddlTable := range info.tables {
 		c.processDDLNotification(ddlTable.schema, ddlTable.table)
 	}
+	return nil
 }
 
 // processTransactionPayload processes the events decompressed from a
@@ -898,10 +824,10 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) {
 // per-session by any client regardless of the global value the preflight
 // checks). The payload carries the whole transaction except its GTID
 // event, so the pending {SID,GNO} stashed by the preceding (uncompressed)
-// GTIDEvent is promoted here, by the inner group terminator — XIDEvent,
-// COMMIT/ROLLBACK QueryEvent, or XA_PREPARE_LOG_EVENT — after the
-// transaction's row events have been buffered, keeping
-// promotePendingGTID's per-transaction resume contract intact.
+// GTIDEvent is promoted here, by the inner group terminator — XIDEvent or
+// COMMIT/ROLLBACK QueryEvent — after the transaction's row events have
+// been buffered, keeping promotePendingGTID's per-transaction resume
+// contract intact.
 func (c *gtidClient) processTransactionPayload(e *replication.TransactionPayloadEvent) error {
 	for _, inner := range e.Events {
 		switch innerEvent := inner.Event.(type) {
@@ -913,7 +839,9 @@ func (c *gtidClient) processTransactionPayload(e *replication.TransactionPayload
 				return err
 			}
 		case *replication.QueryEvent:
-			c.processQueryEvent(innerEvent)
+			if err := c.processQueryEvent(innerEvent); err != nil {
+				return err
+			}
 		case *replication.TableMapEvent:
 			// Already consumed by go-mysql's inner parser to decode the
 			// RowsEvents above.
@@ -922,13 +850,13 @@ func (c *gtidClient) processTransactionPayload(e *replication.TransactionPayload
 			// 8.0.43): the first binlog group — XA START, row events, XA END,
 			// XA_PREPARE_LOG_EVENT — arrives inside a payload, with only the
 			// terminal XA COMMIT / XA ROLLBACK QueryEvent outside under its
-			// own GTID. The XA_PREPARE_LOG_EVENT (surfaced as a GenericEvent)
-			// terminates that first group, so promote exactly as readStream's
-			// GenericEvent case does — the group's row events have all been
-			// buffered by this point.
+			// own GTID. Spirit does not support XA workloads: the inner
+			// "XA START" QueryEvent above already fails the payload before
+			// any of its row events are buffered, so this branch — the
+			// XA_PREPARE_LOG_EVENT surfacing as a GenericEvent — is defense
+			// in depth, mirroring readStream's GenericEvent case.
 			if inner.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
-				c.promotePendingGTID()
-				continue
+				return errXAUnsupported
 			}
 			c.logger.Debug("Received unknown event type inside transaction payload", "type", inner.Header.EventType.String())
 		default:
@@ -1007,8 +935,15 @@ func (c *gtidClient) processRowsEvent(ev *replication.BinlogEvent, e *replicatio
 		return fmt.Errorf("received a minimal RBR event for table %s.%s, but we require binlog_row_image=FULL on the source server", string(e.Table.Schema), string(e.Table.Table))
 	}
 
-	tbl := sub.Tables()[0]
 	eventType := parseEventType(ev.Header.EventType)
+	if eventType == eventTypeUnknown {
+		// Hard-fail, mirroring the minimal-row-image check above — see the
+		// matching guard in binlogClient.processRowsEvent for why an
+		// unrecognized rows-event subtype must not be dropped.
+		return fmt.Errorf("%w for table %s.%s", unsupportedRowsEventError(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
+	}
+
+	tbl := sub.Tables()[0]
 
 	// Decode ENUM/SET integers and re-pad BINARY(N) values before key
 	// extraction and buffering — see the matching block in binlog.go's
@@ -1061,7 +996,9 @@ func (c *gtidClient) processRowsEvent(ev *replication.BinlogEvent, e *replicatio
 		case eventTypeDelete:
 			sub.HasChanged(key, nil, true)
 		default:
-			c.logger.Error("unknown event type", "type", ev.Header.EventType)
+			// Unreachable; kept as a hard error for the same reason as the
+			// matching branch in binlogClient.processRowsEvent.
+			return fmt.Errorf("%w for table %s.%s", unsupportedRowsEventError(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
 		}
 	}
 	return nil

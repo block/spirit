@@ -1514,10 +1514,16 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 // CancelFunc contract (change.ClientConfig), it fires for DDL detected on a
 // synced table (change.FatalReasonSchemaChange) AND for fatal stream errors
 // such as minimal RBR detection or exhausted streamer recreation attempts
-// (change.FatalReasonStreamError). The reason names the trigger class in the
+// (change.FatalReasonStreamError), unsupported XA
+// (change.FatalReasonUnsupportedXA), or a wrapped binlog LogPos
+// (change.FatalReasonLogPosWrapped). The reason names the trigger class in the
 // recorded error; the change client's logs carry the details. Unlike
-// migration/move, no resume state is invalidated for either reason: the
-// datasync checkpoint is Persistent and the caller decides fresh-vs-resume.
+// migration/move, no resume state is invalidated for any reason: the datasync
+// checkpoint is Persistent and the caller decides fresh-vs-resume. That
+// distinction matters most for the two reasons migration/move do invalidate
+// for — XA and a wrapped LogPos both recur on a resume from the same
+// coordinate — so a caller restarting a sync after either must start it
+// fresh rather than resume.
 //
 // fatalError is safe to call concurrently: it is invoked from the change
 // client's stream goroutine, so cancelFunc (written by Run under progMu)

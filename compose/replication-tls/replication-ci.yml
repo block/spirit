@@ -47,7 +47,8 @@ services:
   test:
     build:
       context: ../../.
-    command: go test -race -timeout=10m -parallel=4  ./...
+    # XA tests run on their own MySQL server in mysql-xa-docker.yml.
+    command: go test -race -skip XA -timeout=10m -parallel=4 ./...
     depends_on:
       mysql:
         condition: service_healthy

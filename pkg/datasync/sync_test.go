@@ -445,6 +445,13 @@ func TestFatalErrorConcurrentWithRunSetup(t *testing.T) {
 	require.LessOrEqual(t, cancelCalls.Load(), int64(1))
 }
 
+func TestFatalErrorUnsupportedXAReason(t *testing.T) {
+	runner, err := NewRunner(&Sync{})
+	require.NoError(t, err)
+	require.True(t, runner.fatalError(change.FatalReasonUnsupportedXA))
+	require.ErrorContains(t, runner.fatal(), "unsupported-xa")
+}
+
 // TestSyncResume verifies that the initial copy writes a copier-watermark
 // checkpoint and that a second run against the same (non-empty) target detects
 // it and resumes — opening the chunker at the saved watermark instead of

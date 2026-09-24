@@ -267,6 +267,12 @@ func (c *binlogClient) getBufferedPos() mysql.Position {
 // stale image. No replay flag is needed: bufferedPos is monotonic and the
 // live stream always runs ahead of it, so only a replay compares <=. The
 // (file, pos) Compare is rotation-safe.
+//
+// "The live stream always runs ahead of it" is what stops holding once a
+// binlog file grows past 4GiB: wrapped positions make live events compare
+// at or below the frozen bufferedPos, and this function would classify
+// every one of them as a replay. readStream refuses the stream before any
+// such event gets here — see logPosTracker and errLogPosWrapped.
 func shouldSkipReplayedEvent(eventPos, bufferedPos mysql.Position) bool {
 	return eventPos.Compare(bufferedPos) <= 0
 }
@@ -612,6 +618,10 @@ func (c *binlogClient) readStream(ctx context.Context) {
 	backoffDuration := initialBackoffDuration
 	lastErrorTime := time.Time{}
 	var recentErrors []string // Track recent errors for debugging
+	// Watches for the 4-byte LogPos wrapping past 4GiB within one file,
+	// which would make every later event compare below bufferedPos and be
+	// discarded as a replay. See logPosTracker and errLogPosWrapped.
+	var logPos logPosTracker
 
 	c.logger.Debug("readStream started for binlog position", "position", startPos, "log_name", currentLogName)
 
@@ -737,6 +747,20 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		// from drifting on this. The published position is at most one
 		// transaction behind the event stamped here.
 		recordEventTime(&c.lastEventTime, ev.Header.Timestamp)
+		// Check for LogPos wraparound before the event is acted on, so no
+		// row event from beyond the wrap is ever buffered: past the wrap
+		// the replay-skip guard below cannot tell a live event from a
+		// replayed one, and the position we would checkpoint is no longer
+		// a coordinate we could resume from.
+		if logPos.observe(ev) {
+			c.logger.Error("fatal error reading binlog stream", "error", errLogPosWrapped,
+				"file", currentLogName,
+				"event_log_pos", ev.Header.LogPos,
+				"previous_log_pos", logPos.last,
+				"buffered_position", c.getBufferedPos())
+			c.fatalError(FatalReasonLogPosWrapped)
+			return
+		}
 		// Handle the event.
 		switch event := ev.Event.(type) {
 		case *replication.RotateEvent:
@@ -750,6 +774,11 @@ func (c *binlogClient) readStream(ctx context.Context) {
 				c.rotations.Add(1)
 			}
 			currentLogName = string(event.NextLogName)
+			// Positions restart in the file we are rotating into, and the
+			// server opens every dump (including recreateStreamer's) with
+			// an artificial rotate — so this is also what keeps a replay
+			// from position 4 from looking like LogPos wraparound.
+			logPos.rotated()
 			// For RotateEvent, we must use event.Position (the position in the NEW log)
 			// not ev.Header.LogPos (which is the position in the OLD log).
 			// Update position immediately and skip the generic position update at the end.
@@ -774,21 +803,30 @@ func (c *binlogClient) readStream(ctx context.Context) {
 				return
 			}
 		case *replication.QueryEvent:
-			// Query event, check if it is a DDL statement,
-			// in which case we need to notify the caller.
-			ddlTables, _, err := extractTablesFromDDLStmts(string(event.Schema), string(event.Query))
+			info, err := parseQueryEvent(string(event.Schema), string(event.Query))
 			if err != nil {
-				// The parser does not understand all syntax — the
-				// remaining classes are mode-dependent SQL (ANSI_QUOTES
-				// quoting) and syntax newer than the grammar.
-				// This behavior is copied from canal:
-				// https://github.com/go-mysql-org/go-mysql/blob/ee9447d96b48783abb05ab76a12501e5f1161e47/canal/sync.go#L144C1-L150C1
-				// We can't print the statement because it could contain user-data.
-				// We instead rely on file + pos being useful.
+				// An unparseable statement may use a SQL mode or syntax newer
+				// than the parser. Do not log the query: it may contain data.
 				c.logger.Error("Skipping query that was unable to parse", "file", currentLogName, "pos", ev.Header.LogPos)
 				continue
 			}
-			for _, ddlTable := range ddlTables {
+			// Any XA statement fails the stream: spirit does not support
+			// XA workloads. An XA transaction's row events are binlogged
+			// at XA PREPARE time, before its outcome is known — applying
+			// them treats the prepare as a commit, and a later XA ROLLBACK
+			// has no binlog representation that could undo them. "XA START"
+			// opens the group ahead of its row events, so failing here
+			// guarantees none of them are ever buffered, let alone flushed.
+			// See the matching guard in the GTID client's processQueryEvent
+			// for the full rationale and group shape.
+			if info.xa {
+				c.logger.Error("fatal error processing binlog query event", "error", errXAUnsupported)
+				c.fatalError(FatalReasonUnsupportedXA)
+				return
+			}
+			// Query event, check if it is a DDL statement,
+			// in which case we need to notify the caller.
+			for _, ddlTable := range info.tables {
 				c.processDDLNotification(ddlTable.schema, ddlTable.table)
 			}
 		case *replication.TransactionPayloadEvent:
@@ -817,7 +855,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			}
 			if err = c.processTransactionPayload(event, eventPos); err != nil {
 				c.logger.Error("fatal error processing binlog transaction payload event", "error", err)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(fatalReasonForStreamError(err))
 				return
 			}
 		case *replication.GTIDEvent,
@@ -831,6 +869,22 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			// default can keep logging genuinely unknown event types — a future
 			// row-event variant we don't recognize could otherwise cause silent
 			// data loss.
+		case *replication.GenericEvent:
+			// Event types without a dedicated go-mysql decoder surface as
+			// GenericEvent; the header carries the real type. An
+			// XA_PREPARE_LOG_EVENT terminates an XA transaction's first
+			// binlog group (it is also how the server logs
+			// `XA COMMIT ... ONE PHASE`), and spirit does not support XA
+			// workloads. The QueryEvent guard above already fails the
+			// stream at the group's opening "XA START", before any of its
+			// row events are buffered, so this branch is defense in depth
+			// in case a future server version reshapes the group.
+			if ev.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
+				c.logger.Error("fatal error processing binlog stream", "error", errXAUnsupported)
+				c.fatalError(FatalReasonUnsupportedXA)
+				return
+			}
+			c.logger.Debug("Received unknown event type", "type", ev.Header.EventType.String())
 		default:
 			c.logger.Debug("Received unknown event type", "type", fmt.Sprintf("%T", ev.Event))
 		}
@@ -945,8 +999,21 @@ func (c *binlogClient) processRowsEvent(ev *replication.BinlogEvent, e *replicat
 		return fmt.Errorf("received a minimal RBR event for table %s.%s, but we require binlog_row_image=FULL on the source server", string(e.Table.Schema), string(e.Table.Table))
 	}
 
-	tbl := sub.Tables()[0]
 	eventType := parseEventType(ev.Header.EventType)
+	if eventType == eventTypeUnknown {
+		// Hard-fail, mirroring the minimal-row-image check above. go-mysql
+		// parses several rows-event subtypes we don't recognize into a
+		// plain *replication.RowsEvent — PARTIAL_UPDATE_ROWS_EVENT, which
+		// the server emits once binlog_row_value_options=PARTIAL_JSON is
+		// set, is the live one (the preflight check reads the global, and
+		// the global can change afterwards). Such an event still carries
+		// row changes for a table we are subscribed to, so dropping it with
+		// only an error log loses them silently; they would surface, if at
+		// all, as a checksum mismatch at the end of the run.
+		return fmt.Errorf("%w for table %s.%s", unsupportedRowsEventError(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
+	}
+
+	tbl := sub.Tables()[0]
 
 	// Decode ENUM ordinals / SET bitmasks back to their string form and
 	// re-pad BINARY(N) values (MySQL strips trailing 0x00 from the row
@@ -1010,7 +1077,10 @@ func (c *binlogClient) processRowsEvent(ev *replication.BinlogEvent, e *replicat
 		case eventTypeDelete:
 			sub.HasChanged(key, nil, true)
 		default:
-			c.logger.Error("unknown event type", "type", ev.Header.EventType)
+			// Unreachable today: eventTypeUnknown is rejected above and
+			// eventTypeUpdate returned earlier. Kept as a hard error so a
+			// future eventType addition cannot silently drop rows here.
+			return fmt.Errorf("%w for table %s.%s", unsupportedRowsEventError(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
 		}
 	}
 	return nil
@@ -1037,16 +1107,23 @@ func (c *binlogClient) processTransactionPayload(e *replication.TransactionPaylo
 				return err
 			}
 		case *replication.QueryEvent:
-			// Usually the transaction's BEGIN, which parses cleanly and
-			// yields no DDL tables. Unparseable statements are skipped the
-			// same way readStream skips them.
-			ddlTables, _, err := extractTablesFromDDLStmts(string(innerEvent.Schema), string(innerEvent.Query))
+			info, err := parseQueryEvent(string(innerEvent.Schema), string(innerEvent.Query))
 			if err != nil {
 				c.logger.Error("Skipping query inside transaction payload that was unable to parse",
 					"file", payloadPos.Name, "pos", payloadPos.Pos)
 				continue
 			}
-			for _, ddlTable := range ddlTables {
+			// XA statements fail the payload before any of its row events
+			// are buffered — see the guard in readStream's QueryEvent case.
+			// A compressed XA prepare group opens with an inner "XA START"
+			// QueryEvent, so this fires ahead of the group's RowsEvents.
+			if info.xa {
+				return errXAUnsupported
+			}
+			// Usually the transaction's BEGIN, which parses cleanly and
+			// yields no DDL tables. Unparseable statements are skipped the
+			// same way readStream skips them.
+			for _, ddlTable := range info.tables {
 				c.processDDLNotification(ddlTable.schema, ddlTable.table)
 			}
 		case *replication.TableMapEvent, *replication.XIDEvent:
@@ -1054,6 +1131,15 @@ func (c *binlogClient) processTransactionPayload(e *replication.TransactionPaylo
 			// already consumed by go-mysql's inner parser to decode the
 			// RowsEvents above; position tracking advances via the outer
 			// event only.
+		case *replication.GenericEvent:
+			// An inner XA_PREPARE_LOG_EVENT terminates a compressed XA
+			// prepare group. The inner "XA START" QueryEvent above already
+			// fails the payload before its row events are buffered; this is
+			// defense in depth, mirroring readStream's GenericEvent case.
+			if inner.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
+				return errXAUnsupported
+			}
+			c.logger.Debug("Received unknown event type inside transaction payload", "type", inner.Header.EventType.String())
 		default:
 			// Same rationale as readStream's default case: log genuinely
 			// unknown inner event types so a future row-event variant can't
