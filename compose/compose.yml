@@ -29,7 +29,21 @@ services:
   test:
     build:
       context: ../
-    command: bash -c "go test -json -race -v  -timeout=10m -parallel=4  ./... | tee /proc/1/fd/1 | tparse -all"
+    # XA tests write prepare/commit events visible to every change stream on
+    # this server. Run them in xa-test's isolated CI job instead.
+    command: bash -c "go test -json -race -v -skip XA -timeout=10m -parallel=4 ./... | tee /proc/1/fd/1 | tparse -all"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_DSN: tsandbox:msandbox@tcp(mysql)/test
+
+  xa-test:
+    profiles: [xa]
+    build:
+      context: ../
+    # The XA job starts its own MySQL container and runs no other tests on it.
+    command: go test -race -count=1 -timeout=10m -parallel=1 -p=1 -run XA ./...
     depends_on:
       mysql:
         condition: service_healthy

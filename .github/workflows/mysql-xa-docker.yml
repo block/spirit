@@ -1,0 +1,34 @@
+name: MySQL XA guard (isolated) /w docker-compose
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Detect non-docs changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!docs/**'
+
+      - name: Test XA stream guards
+        if: steps.filter.outputs.code == 'true'
+        run: docker compose -f compose.yml --profile xa up mysql xa-test --abort-on-container-exit --exit-code-from xa-test
+        working-directory: compose
+
+      - name: Skip — documentation-only change
+        if: steps.filter.outputs.code != 'true'
+        run: echo "Documentation-only change detected; skipping tests."
