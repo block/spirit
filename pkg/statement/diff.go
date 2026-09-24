@@ -209,14 +209,6 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 		targetColumns[strings.ToLower(target.Columns[i].Name)] = &target.Columns[i]
 	}
 
-	// Adding or dropping the PRIMARY KEY itself is emitted by diffIndexes (the
-	// PK is always a table-level index after normalization). We only need the
-	// source/target PK column sets here to recognize the implicit NOT NULL ->
-	// NULL relaxation that dropping a PK produces, and suppress the redundant
-	// MODIFY COLUMN it would otherwise generate.
-	sourcePKColumns := pkColumnSet(ct.getPrimaryKeyIndex())
-	targetPKColumns := pkColumnSet(target.getPrimaryKeyIndex())
-
 	// Collect DROP operations and sort by name for deterministic output
 	var dropClauses []string
 	for _, sourceCol := range ct.Columns {
@@ -251,28 +243,19 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 			// If it's the last column, omit AFTER clause (implicit)
 			clauses = append(clauses, clause)
 		} else {
-			// Suppress the MODIFY when a column's only change is the implicit
-			// NOT NULL -> NULL relaxation from dropping the primary key it
-			// belonged to (a PK column is NOT NULL; once the PK is gone the
-			// target can declare it NULL). The PK drop itself is emitted by
-			// diffIndexes.
-			//
-			// This is the same predicate IgnoreNotNullRelaxation applies in
-			// columnsEqualWithContext, gated on PK membership rather than on
-			// the option — so with that option on, this case is subsumed.
-			// Change one and check the other.
-			lower := strings.ToLower(targetCol.Name)
-			pkDroppedNullabilityChange := sourcePKColumns[lower] && !targetPKColumns[lower] &&
-				!sourceCol.Nullable && targetCol.Nullable
-
 			// MODIFY existing column if:
-			// 1. Column definition changed (and not just the PK-drop nullability relaxation)
+			// 1. Column definition changed
 			// 2. Column needs explicit positioning
 			// needsExplicitPosition is keyed by lowercased column name, so
 			// look up with the same normalization to avoid missing a
 			// position-only change when the target's spelling is in mixed
 			// or upper case.
-			needsModify := (!ct.columnsEqualWithContext(sourceCol, &targetCol, target, opts) && !pkDroppedNullabilityChange) ||
+			//
+			// A column leaving the primary key gets no special case: adding a
+			// PRIMARY KEY implicitly makes its columns NOT NULL, but DROP
+			// PRIMARY KEY never reverts that, so a former PK column the target
+			// declares nullable needs its own MODIFY.
+			needsModify := !ct.columnsEqualWithContext(sourceCol, &targetCol, target, opts) ||
 				needsExplicitPosition[strings.ToLower(targetCol.Name)]
 
 			if needsModify {
@@ -727,9 +710,8 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	// A nullability difference is normally a real change. With
 	// IgnoreNotNullRelaxation it is forgiven in exactly one direction: `a` is
 	// NOT NULL and `b` permits NULL, so the only thing the MODIFY would do is
-	// weaken the column (the same NOT NULL -> NULL relaxation diffColumns
-	// already suppresses for a dropped primary key). The opposite direction —
-	// a difference the MODIFY would need to *tighten* — stays a real change.
+	// weaken the column. The opposite direction — a difference the MODIFY
+	// would need to *tighten* — stays a real change.
 	//
 	// `a` belongs to the receiver and `b` to the diffed-to table, which for a
 	// DiffCreateTables caller means `a` is the schema under validation and `b`

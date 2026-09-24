@@ -467,18 +467,3 @@ func subPartitionOptionsEqual(a, b *SubPartitionOptions) bool {
 
 	return true
 }
-
-// pkColumnSet returns the lowercased set of columns in the given PRIMARY KEY
-// index, or nil if idx is nil. Names are lowercased because MySQL column
-// identifiers are case-insensitive. Reading a missing key from the returned
-// (possibly nil) map yields false, so callers can index it directly.
-func pkColumnSet(idx *Index) map[string]bool {
-	if idx == nil {
-		return nil
-	}
-	set := make(map[string]bool, len(idx.Columns))
-	for _, c := range idx.Columns {
-		set[strings.ToLower(c)] = true
-	}
-	return set
-}

@@ -682,16 +682,41 @@ func TestDiff(t *testing.T) {
 			expected: "ALTER TABLE `t1` ADD PRIMARY KEY (`a`, `b`)",
 		},
 		{
+			// The inline PRIMARY KEY made `id` NOT NULL, and DROP PRIMARY KEY
+			// does not revert that, so the nullable target needs the MODIFY.
 			name:     "DropPrimaryKey",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY)",
 			target:   "CREATE TABLE t1 (id INT)",
-			expected: "ALTER TABLE `t1` DROP PRIMARY KEY",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `id` int NULL, DROP PRIMARY KEY",
 		},
 		{
 			name:     "DropPrimaryKeyCanonicalForm",
 			source:   "CREATE TABLE `t1` (`id` int NOT NULL,  PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 			target:   "CREATE TABLE t1 (id INT NOT NULL)",
 			expected: "ALTER TABLE `t1` DROP PRIMARY KEY",
+		},
+		// A column leaving the primary key keeps its NOT NULL (DROP PRIMARY
+		// KEY never relaxes it), so a target that declares it nullable gets a
+		// MODIFY like any other column.
+		{
+			name:     "ColumnLeavesPrimaryKeyAndRelaxesWhenPrimaryKeyMoves",
+			source:   "CREATE TABLE t1 (a VARCHAR(10) NOT NULL, b VARCHAR(10), PRIMARY KEY (a))",
+			target:   "CREATE TABLE t1 (a VARCHAR(10), b VARCHAR(10) NOT NULL, PRIMARY KEY (b))",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(10) NULL, MODIFY COLUMN `b` varchar(10) NOT NULL, DROP PRIMARY KEY, ADD PRIMARY KEY (`b`)",
+		},
+		{
+			name:     "ColumnLeavesPrimaryKeyAndRelaxesWhenPrimaryKeyDropped",
+			source:   "CREATE TABLE t1 (a VARCHAR(10) NOT NULL, b VARCHAR(10), PRIMARY KEY (a))",
+			target:   "CREATE TABLE t1 (a VARCHAR(10), b VARCHAR(10))",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(10) NULL, DROP PRIMARY KEY",
+		},
+		{
+			// Every attribute change on the former PK column is emitted, not
+			// just the nullability.
+			name:     "ColumnLeavesPrimaryKeyAndChangesTypeCommentAndNullability",
+			source:   "CREATE TABLE t1 (a VARCHAR(10) NOT NULL, b VARCHAR(10), PRIMARY KEY (a))",
+			target:   "CREATE TABLE t1 (a BIGINT COMMENT 'reshaped', b VARCHAR(10) NOT NULL, PRIMARY KEY (b))",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` bigint NULL COMMENT 'reshaped', MODIFY COLUMN `b` varchar(10) NOT NULL, DROP PRIMARY KEY, ADD PRIMARY KEY (`b`)",
 		},
 
 		// Multi-column Indexes
