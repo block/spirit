@@ -702,8 +702,8 @@ func TestDDLNotificationTransactionCompression(t *testing.T) {
 // terminating XA_PREPARE_LOG_EVENT — is written to the binlog in one
 // burst at XA PREPARE time; the guard must fail the stream at the
 // opening "XA START" QueryEvent, before any of the row events after it
-// are buffered, and classify the abort as a checkpoint-preserving
-// stream error. Unique xids and per-run table names for the reasons
+// are buffered, and classify the abort as an unsupported-XA
+// reason. Unique xids and per-run table names for the reasons
 // documented on TestGTIDClientXATransaction.
 func TestBinlogClientXATransactionGuard(t *testing.T) {
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
@@ -780,8 +780,8 @@ func TestBinlogClientXATransactionGuard(t *testing.T) {
 	require.Equal(t, int64(-1), gotReason.Load(), "the guard must not fire before the XA group is binlogged")
 
 	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonStreamError) },
-		5*time.Second, 5*time.Millisecond, "XA PREPARE must fail the stream as a stream error")
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "XA PREPARE must report unsupported XA")
 	client.streamWG.Wait() // reader fully exited: buffering is final
 	require.Equal(t, 0, client.GetDeltaLen(), "no prepared row events may be buffered once the guard fires")
 
@@ -850,6 +850,39 @@ func TestBinlogProcessTransactionPayloadXAGuard(t *testing.T) {
 	}}
 	require.ErrorIs(t, client.processTransactionPayload(prepareOnly, mysql.Position{Name: "binlog.000001", Pos: 4}), errXAUnsupported)
 	require.Equal(t, 0, client.GetDeltaLen())
+}
+
+// A lone XA_PREPARE_LOG_EVENT must trigger the uncompressed stream guard,
+// even if a future server version omits the opening XA QueryEvent.
+func TestBinlogClientXAPrepareEventGuard(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	var gotReason atomic.Int64
+	gotReason.Store(-1)
+	clientConfig := NewClientDefaultConfig()
+	clientConfig.CancelFunc = func(reason FatalReason) bool {
+		gotReason.Store(int64(reason))
+		return true
+	}
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	streamer := replication.NewBinlogStreamer()
+	ctx, cancel := context.WithCancel(t.Context())
+	client.streamer = streamer
+	client.cancelFunc = cancel
+	client.streamWG.Add(1)
+	go client.readStream(ctx)
+	defer client.Close()
+
+	require.NoError(t, streamer.AddEventToStreamer(&replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
+		Event:  &replication.GenericEvent{},
+	}))
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "a lone XA_PREPARE_LOG_EVENT must report unsupported XA")
 }
 
 // TestCompositePKUpdate tests that we correctly handle

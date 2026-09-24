@@ -690,7 +690,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 		case *replication.QueryEvent:
 			if err = c.processQueryEvent(event); err != nil {
 				c.logger.Error("fatal error processing GTID query event", "error", err)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(fatalReasonForStreamError(err))
 				return
 			}
 		case *replication.TransactionPayloadEvent:
@@ -705,7 +705,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 			// wedging BlockWait/Flush forever.
 			if err = c.processTransactionPayload(event); err != nil {
 				c.logger.Error("fatal error processing GTID transaction payload event", "error", err)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(fatalReasonForStreamError(err))
 				return
 			}
 		case *replication.RotateEvent:
@@ -731,7 +731,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 			// version reshapes the group.
 			if ev.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
 				c.logger.Error("fatal error processing GTID stream", "error", errXAUnsupported)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(FatalReasonUnsupportedXA)
 				return
 			}
 			c.logger.Debug("Received unknown event type", "type", ev.Header.EventType.String())
@@ -795,9 +795,9 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) error {
 	if info.xa {
 		return errXAUnsupported
 	}
-	// BEGIN, SAVEPOINT, and ROLLBACK TO SAVEPOINT leave the group open.
-	// Its row events must be buffered before the pending GTID is promoted.
-	if info.opensTransaction || info.keepsTransactionOpen {
+	// SAVEPOINT and ROLLBACK TO SAVEPOINT leave the group open without
+	// naming a DDL table. Its row events must precede GTID promotion.
+	if info.keepsTransactionOpen {
 		return nil
 	}
 	// Mixed-engine transactions use a COMMIT/ROLLBACK QueryEvent in place
@@ -806,14 +806,13 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) error {
 		c.promotePendingGTID()
 		return nil
 	}
-	// MySQL emits a synthetic GTID for DDL statements too, but the
-	// DDL is its own transaction (no XIDEvent). Promote any pending
-	// GTID now so a DDL-as-last-event still ends up in the resume
-	// set. This is best-effort — if the caller cancels on DDL we
-	// won't actually resume, but the position is consistent for
-	// non-cancelling filters.
-	//
-	c.promotePendingGTID()
+	// Ordinary DDL is its own transaction. A statement that opens a group,
+	// such as BEGIN or CREATE TABLE ... START TRANSACTION, must wait for its
+	// terminator before promotion. The CREATE TABLE still needs to notify
+	// DDL subscribers now, even though its GTID remains pending.
+	if !info.opensTransaction {
+		c.promotePendingGTID()
+	}
 	for _, ddlTable := range info.tables {
 		c.processDDLNotification(ddlTable.schema, ddlTable.table)
 	}

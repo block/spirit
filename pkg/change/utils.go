@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/parser/ast"
@@ -51,10 +52,18 @@ type queryEventInfo struct {
 	xa                   bool
 }
 
+// QueryEvents include BEGIN for nearly every transaction. Reuse parser
+// instances to avoid allocating the parser's grammar cache for each event.
+var queryEventParsers = sync.Pool{New: func() any { return parser.New() }}
+
 // parseQueryEvent classifies transaction control and extracts DDL table names
 // from the same parse, so every consumer sees the same statement semantics.
 func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err error) {
-	p := parser.New()
+	p := queryEventParsers.Get().(*parser.Parser)
+	defer func() {
+		p.Reset()
+		queryEventParsers.Put(p)
+	}()
 	stmts, _, err := p.Parse(statements, "", "")
 	if err != nil {
 		return queryEventInfo{}, err
@@ -234,6 +243,13 @@ func checkImmutableColumn(tbl *table.TableInfo, ordinal int, beforeRow, afterRow
 // change clients treat this as a fatal stream error, aborting before
 // any of the XA transaction's row events are buffered.
 var errXAUnsupported = errors.New("XA transactions detected in the binlog stream: spirit does not support XA workloads")
+
+func fatalReasonForStreamError(err error) FatalReason {
+	if errors.Is(err, errXAUnsupported) {
+		return FatalReasonUnsupportedXA
+	}
+	return FatalReasonStreamError
+}
 
 // isMinimalRowImage returns true if the RowsEvent contains a minimal row image,
 // i.e. some columns were skipped. This happens when binlog_row_image=MINIMAL or NOBLOB.

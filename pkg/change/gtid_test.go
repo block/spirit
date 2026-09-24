@@ -424,9 +424,8 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 // pending GTID into bufferedGTID — not at the QueryEvent itself (it
 // could sit mid-group; see
 // TestGTIDClientQueryPromotionOrdering), but at the next
-// GTIDEvent, which proves the group ended. (XA statements are also
-// unparseable but never reach the parser — they fail the stream; see
-// TestGTIDClientXAGuardStream.) Every QueryEvent on
+// GTIDEvent, which proves the group ended. XA statements parse as
+// *ast.XAStmt and fail the stream; see TestGTIDClientXAGuardStream. Every QueryEvent on
 // the entire server flows through the parser — the schema filter only
 // applies after parsing — so before the fix a single unparseable
 // statement in a *completely unrelated schema* left bufferedGTID
@@ -633,8 +632,8 @@ func rollbackDanglingXATestTxns(t *testing.T, db *sql.DB, knownXIDs ...string) {
 // transaction's outcome is known, so applying them treats the prepare as
 // a commit, and the XA ROLLBACK issued below would leave the target
 // permanently diverged (nothing in the binlog undoes a rolled-back
-// prepare). The abort is reported as a stream error so the caller
-// preserves its checkpoint.
+// prepare). The abort is reported as an unsupported-XA reason so the caller
+// invalidates its checkpoint and requires a fresh start.
 //
 // Both the xids and the table names are unique per run. Unique xids
 // because XA START against a hard-coded xid fails with XAER_DUPID if an
@@ -738,10 +737,10 @@ func TestGTIDClientXATransaction(t *testing.T) {
 
 	// The prepare writes the whole group; the guard must fail the stream
 	// at its opening "XA START" QueryEvent — ahead of the row events —
-	// and classify it as a checkpoint-preserving stream error.
+	// and classify it as an unsupported-XA reason.
 	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonStreamError) },
-		5*time.Second, 5*time.Millisecond, "XA PREPARE must fail the stream as a stream error")
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "XA PREPARE must fail the stream as unsupported XA")
 	client.streamWG.Wait() // reader fully exited: buffering is final
 	require.Equal(t, 0, client.GetDeltaLen(), "no prepared row events may be buffered once the guard fires")
 
@@ -770,7 +769,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 	xaExec(fmt.Sprintf("XA END '%s'", xid1p))
 	xaExec(fmt.Sprintf("XA COMMIT '%s' ONE PHASE", xid1p))
 
-	require.Eventually(t, func() bool { return gotReason2.Load() == int64(FatalReasonStreamError) },
+	require.Eventually(t, func() bool { return gotReason2.Load() == int64(FatalReasonUnsupportedXA) },
 		5*time.Second, 5*time.Millisecond, "one-phase XA must fail the stream too")
 	client2.streamWG.Wait()
 	require.Equal(t, 0, client2.GetDeltaLen(), "no one-phase XA row events may be buffered")
@@ -784,7 +783,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 // terminal XA COMMIT / XA ROLLBACK QueryEvent stays outside, under its
 // own GTID. The inner "XA START" QueryEvent must fail the payload before
 // the row events after it are buffered, surfacing exactly like the
-// uncompressed abort: a checkpoint-preserving stream error.
+// uncompressed abort: an unsupported-XA reason.
 //
 // Unique xids and per-run table names for the same reasons documented on
 // TestGTIDClientXATransaction.
@@ -858,8 +857,8 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	// The prepare flushes the whole group as one compressed payload; the
 	// guard must fail it at the inner "XA START" QueryEvent, ahead of the
 	// inner row events.
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonStreamError) },
-		5*time.Second, 5*time.Millisecond, "a compressed XA group must fail the stream as a stream error")
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		5*time.Second, 5*time.Millisecond, "a compressed XA group must fail the stream as unsupported XA")
 	client.streamWG.Wait() // reader fully exited: buffering is final
 	require.Equal(t, 0, client.GetDeltaLen(), "no row events inside the compressed XA group may be buffered")
 
@@ -873,10 +872,9 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 
 // TestGTIDClientXAGuardStream deterministically exercises the XA guard's
 // readStream wiring: any XA event must fail the stream via
-// CancelFunc(FatalReasonStreamError) — before the XA transaction's row
+// CancelFunc(FatalReasonUnsupportedXA) — before the XA transaction's row
 // events are buffered, and without promoting its GTID into the resume
-// set (a resume must replay, and re-refuse, the XA group rather than
-// skip it).
+// set (the refused group is never treated as applied).
 //
 // Events are injected through a synthetic go-mysql BinlogStreamer rather
 // than a real server because the server writes an XA transaction's
@@ -973,19 +971,19 @@ func TestGTIDClientXAGuardStream(t *testing.T) {
 			require.NoError(t, streamer.AddEventToStreamer(ev))
 		}
 	}
-	// expectAbort waits for the guard to fire as a stream error and for
+	// expectAbort waits for the guard to fire as unsupported XA and for
 	// readStream to fully exit, then verifies nothing was buffered: no
 	// row events, and no XA GTID in the resume set.
 	expectAbort := func(t *testing.T, client *gtidClient, gotReason *atomic.Int64, gno int64) {
 		t.Helper()
-		require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonStreamError) },
-			5*time.Second, 5*time.Millisecond, "the XA guard must fail the stream as a stream error")
+		require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+			5*time.Second, 5*time.Millisecond, "the XA guard must fail the stream as unsupported XA")
 		client.streamWG.Wait() // reader fully exited: buffering is final
 		require.Equal(t, 0, client.GetDeltaLen(), "no row events may be buffered once the guard fires")
 		target, err := mysql.ParseMysqlGTIDSet(fmt.Sprintf("%s:%d", sid, gno))
 		require.NoError(t, err)
 		require.False(t, client.getBufferedGTID().Contain(target),
-			"the XA GTID must not enter the resume set: a resume must replay (and re-refuse) the XA group")
+			"the XA GTID must not enter the resume set")
 	}
 
 	// The XA transaction's first group, exactly as the server writes it
@@ -1065,6 +1063,30 @@ func TestGTIDProcessQueryEventXAGuard(t *testing.T) {
 	} {
 		require.NoError(t, c.processQueryEvent(queryEvent(q)), "statement %q must not be refused", q)
 	}
+}
+
+// A CTAS QueryEvent opens a transaction group: its GTID must stay pending,
+// while its CREATE TABLE must still cancel a whole-schema subscriber.
+func TestGTIDClientCTASNotifiesSchemaFilter(t *testing.T) {
+	empty, err := mysql.ParseMysqlGTIDSet("")
+	require.NoError(t, err)
+	sid := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	var got []FatalReason
+	c := &gtidClient{
+		logger:           slog.Default(),
+		subs:             newSubscriptionRegistry(),
+		bufferedGTID:     empty,
+		flushedGTID:      empty.Clone(),
+		ddlFilterSchema:  "test",
+		callerCancelFunc: func(r FatalReason) bool { got = append(got, r); return true },
+		pendingSID:       sid[:],
+		pendingGNO:       7,
+	}
+	require.NoError(t, c.processQueryEvent(&replication.QueryEvent{Schema: []byte("test"),
+		Query: []byte("CREATE TABLE `ctas1` (`a` int NOT NULL) START TRANSACTION")}))
+	require.Equal(t, []FatalReason{FatalReasonSchemaChange}, got)
+	require.Equal(t, int64(7), c.pendingGNO, "CTAS must leave its GTID pending until XIDEvent")
+	require.Empty(t, c.getBufferedGTID().String(), "CTAS must not promote its GTID before row events")
 }
 
 // TestGTIDProcessTransactionPayloadXAGuard unit-tests the compressed

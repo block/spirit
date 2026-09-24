@@ -1375,6 +1375,9 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 			// changed, so the checkpoint remains valid. Keep it and tell the
 			// operator how to recover.
 			r.logger.Error("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the migration from it")
+		case change.FatalReasonUnsupportedXA:
+			r.logger.Error("XA transaction detected; the checkpoint will be invalidated — stop XA activity and start a fresh migration")
+			fallthrough
 		default:
 			// Schema change — and, defensively, any future reason we don't
 			// recognize (invalidating is the safe default: it costs a restart,

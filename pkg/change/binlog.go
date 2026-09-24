@@ -792,7 +792,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			// for the full rationale and group shape.
 			if info.xa {
 				c.logger.Error("fatal error processing binlog query event", "error", errXAUnsupported)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(FatalReasonUnsupportedXA)
 				return
 			}
 			// Query event, check if it is a DDL statement,
@@ -826,7 +826,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			}
 			if err = c.processTransactionPayload(event, eventPos); err != nil {
 				c.logger.Error("fatal error processing binlog transaction payload event", "error", err)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(fatalReasonForStreamError(err))
 				return
 			}
 		case *replication.GTIDEvent,
@@ -852,7 +852,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			// in case a future server version reshapes the group.
 			if ev.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
 				c.logger.Error("fatal error processing binlog stream", "error", errXAUnsupported)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(FatalReasonUnsupportedXA)
 				return
 			}
 			c.logger.Debug("Received unknown event type", "type", ev.Header.EventType.String())

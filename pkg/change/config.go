@@ -23,6 +23,10 @@ const (
 	// processed). The watched tables are not known to have changed, so
 	// persisted resume state remains valid and a retry can resume from it.
 	FatalReasonStreamError
+	// FatalReasonUnsupportedXA means an XA group was found in the stream.
+	// Replaying the checkpoint would hit the same group, so finite runs
+	// must discard their checkpoint and start fresh after XA activity stops.
+	FatalReasonUnsupportedXA
 )
 
 // String implements fmt.Stringer for logging.
@@ -32,6 +36,8 @@ func (f FatalReason) String() string {
 		return "schema-change"
 	case FatalReasonStreamError:
 		return "stream-error"
+	case FatalReasonUnsupportedXA:
+		return "unsupported-xa"
 	default:
 		return fmt.Sprintf("unknown-fatal-reason(%d)", int(f))
 	}
@@ -46,7 +52,8 @@ type ClientConfig struct {
 	// It is called when a DDL change is detected on a subscribed table
 	// (FatalReasonSchemaChange), or when a fatal stream error occurs, such as
 	// minimal RBR detection or exhausted streamer recreation attempts
-	// (FatalReasonStreamError). The caller is expected to handle cancellation
+	// (FatalReasonStreamError), or when XA is detected
+	// (FatalReasonUnsupportedXA). The caller is expected to handle cancellation
 	// and cleanup, using reason to decide whether persisted resume state
 	// (e.g. a checkpoint) must be invalidated (schema change) or is still
 	// safe to resume from (stream error).

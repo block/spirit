@@ -1514,7 +1514,8 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 // CancelFunc contract (change.ClientConfig), it fires for DDL detected on a
 // synced table (change.FatalReasonSchemaChange) AND for fatal stream errors
 // such as minimal RBR detection or exhausted streamer recreation attempts
-// (change.FatalReasonStreamError). The reason names the trigger class in the
+// (change.FatalReasonStreamError), or unsupported XA
+// (change.FatalReasonUnsupportedXA). The reason names the trigger class in the
 // recorded error; the change client's logs carry the details. Unlike
 // migration/move, no resume state is invalidated for either reason: the
 // datasync checkpoint is Persistent and the caller decides fresh-vs-resume.
