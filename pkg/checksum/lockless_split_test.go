@@ -151,7 +151,8 @@ func TestLocklessHotSplit(t *testing.T) {
 				}
 			}
 			chunker.mu.Lock()
-			require.Len(t, chunker.feedback, 1, "child feedback must not inflate walk progress")
+			require.Empty(t, chunker.feedback,
+				"a split parent never resolves as itself, and its synthetic children were never handed out by the chunker")
 			chunker.mu.Unlock()
 		})
 	}
@@ -230,7 +231,7 @@ func TestHotSplitReadback(t *testing.T) {
 			cfg := fastConfig()
 			cfg.SplitHotChunks = true
 			cfg.RetryDelay = time.Millisecond
-			c, err := NewLocklessChecker(source, target, chunker, nil, cfg)
+			c, err := NewLocklessChecker(source, target, chunker, nil, &cfg)
 			require.NoError(t, err)
 			read := c.readChunk
 			var attempts atomic.Int64

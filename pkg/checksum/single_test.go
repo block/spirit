@@ -661,10 +661,10 @@ func TestColumnBoundaryShift(t *testing.T) {
 
 // TestChecksumChunkReleasesTrxDuringRepair reproduces the production failure
 // mode where checksum transactions died to wait_timeout DESPITE the pool
-// keepalive: repairs serialize on recopyLock, so a worker that hit a mismatch
+// keepalive: repairs serialize on the repairer's lock, so a worker that hit a mismatch
 // could park for many minutes holding its transaction — checked out and
 // therefore invisible to the keepalive. The fix returns the transaction to
-// the pool the moment the snapshot reads are done. This test holds recopyLock
+// the pool the moment the snapshot reads are done. This test holds the repairer's lock
 // (simulating another slow repair), drives a mismatched chunk through
 // ChecksumChunk, and requires the full pool to be available while the repair
 // is still queued.
@@ -710,14 +710,14 @@ func TestChecksumChunkReleasesTrxDuringRepair(t *testing.T) {
 	defer func() { require.NoError(t, pool.Close()) }()
 
 	// Simulate another worker's long-running repair.
-	checker.recopyLock.Lock()
+	checker.repairer.recopyLock.Lock()
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- checker.ChecksumChunk(t.Context(), pool, chunk)
 	}()
 
 	// Once the mismatch has been inspected, the transaction must be back in
-	// the pool even though the repair is still queued on recopyLock. The
+	// the pool even though the repair is still queued on the repairer's lock. The
 	// differencesFound guard ensures we don't probe before the worker has
 	// taken (and must have returned) its transaction.
 	require.Eventually(t, func() bool {
@@ -738,14 +738,14 @@ func TestChecksumChunkReleasesTrxDuringRepair(t *testing.T) {
 		return true
 	}, 30*time.Second, 25*time.Millisecond, "transaction was not returned to the pool while the repair was queued")
 
-	// The repair itself must still be blocked on recopyLock.
+	// The repair itself must still be blocked on the repairer's lock.
 	select {
 	case err := <-errCh:
-		t.Fatalf("ChecksumChunk returned while recopyLock was held: %v", err)
+		t.Fatalf("ChecksumChunk returned while the repairer's lock was held: %v", err)
 	default:
 	}
 
-	checker.recopyLock.Unlock()
+	checker.repairer.recopyLock.Unlock()
 	require.NoError(t, <-errCh)
 
 	// And the repair actually repaired.

@@ -77,6 +77,12 @@ const (
 	// accounting the applier uses to cut its own statements.
 	repairBatchRows  = 1000
 	repairBatchBytes = applier.MaxStatementSizeBytes
+
+	// defaultMaxRetries is how many whole-run attempts every algorithm makes
+	// before giving up. Retrying is for transient infrastructure failures, so
+	// the useful range is small: a third attempt that fails the way the first
+	// two did is not going to be fixed by a fourth.
+	defaultMaxRetries = 3
 )
 
 // chunkMismatch describes why a chunk's source and target disagreed. It is
@@ -228,12 +234,16 @@ func StatusSuffix(c Checker) string {
 }
 
 type CheckerConfig struct {
-	// Lockless selects finite optimistic verification on one server. Common
-	// concurrency, throttling, autoscaling and logging fields below apply;
-	// retry/splitting and divergence policy come from this configuration.
-	// Snapshot repair and yield settings do not apply. Watermark is ignored
-	// until optimistic verification supports durable resume evidence.
-	Lockless    *LocklessCheckerConfig
+	// Lockless selects optimistic verification on one server instead of a
+	// snapshot checker. Everything in the common section below applies to it;
+	// the lockless section further down applies only to it, and YieldTimeout
+	// does not apply at all (optimistic reads hold no snapshot to yield).
+	//
+	// Recopier and DivergenceIsFatal are owned by the factory when this is set:
+	// they are derived from FixDifferences so that a caller does not have to
+	// know which algorithm it selected to say whether a divergence should be
+	// healed or should abort.
+	Lockless    bool
 	Concurrency int
 	// TargetChunkTime is reporting-only: it is the target the chunk-size
 	// distribution summary is compared against at the end of each pass, so it
@@ -244,9 +254,18 @@ type CheckerConfig struct {
 	DBConfig        *dbconn.DBConfig
 	Logger          *slog.Logger
 	FixDifferences  bool
-	Watermark       string // optional verification watermark; leave the chunker unopened when supplying it
-	MaxRetries      int
-	Applier         applier.Applier // optional; indicates it is a distributed checker
+	// Watermark is verification evidence from a previous run: every row below
+	// it was read on both sides and observed equal. Supplying it makes the
+	// factory open the chunker there, so verification resumes rather than
+	// restarting; leave the chunker unopened when supplying it. Every algorithm
+	// honours it — the claim it encodes does not depend on which checker
+	// observed it. Take it from Checker.ResumeWatermark, never from the
+	// chunker's traversal watermark.
+	Watermark string
+	// MaxRetries bounds whole-run attempts for every algorithm: a transient
+	// infrastructure failure costs an attempt rather than the migration.
+	MaxRetries int
+	Applier    applier.Applier // optional; indicates it is a distributed checker
 	// RepairApplier is the write path the single-server checker rewrites a
 	// mismatched chunk through (see SingleChecker.replaceChunk). Required for
 	// that checker, whether or not FixDifferences is set — a checker that cannot
@@ -266,6 +285,80 @@ type CheckerConfig struct {
 	Autoscale AutoscaleConfig
 	// MetricsSink is where the control loop reports its gauges. Optional.
 	MetricsSink metrics.Sink
+
+	// ---------------------------------------------------------------------
+	// Lockless-only. Ignored unless Lockless is set (or the checker was built
+	// through NewLocklessChecker, which is the cross-server entry point).
+	// ---------------------------------------------------------------------
+
+	// SplitHotChunks subdivides repeatedly changing ranges before deferring
+	// them. Large ranges produce up to eleven children; oversized descendants
+	// subdivide immediately until at most 128 source rows are observed. Each
+	// child is independently read; parent signatures are not reused.
+	SplitHotChunks bool
+
+	// SnapshotHotChunks freezes bounded per-row evidence for small hot ranges.
+	// Target reads must satisfy every obligation; stream images are not accepted.
+	SnapshotHotChunks bool
+
+	// RetryDelay is the minimum wait between attempts for any given chunk —
+	// measured from the *last* attempt of that chunk, not from the original
+	// failure. Default 1m, because changes are queued in the replication
+	// applier for 30s by default. It is also what paces the re-walk between
+	// finite passes, which is the same "give the target a moment to catch up"
+	// wait.
+	RetryDelay time.Duration
+
+	// MaxQueueSize is the cap on entries in the delayed-retry queue. Reaching
+	// it stalls the walker until retries drain rather than failing the run.
+	// Default 1024.
+	MaxQueueSize int
+
+	// MaxHotAttempts is the number of observations allowed for a chunk whose
+	// source signature keeps changing. Once reached, the chunk is deferred to
+	// the next pass rather than holding the current pass open forever. Default
+	// 10; a positive value below 2 is clamped to 2 because detecting a source
+	// change requires an initial read and a retry. Deferral never counts as
+	// verification and makes the pass not clean.
+	MaxHotAttempts int
+
+	// MinPassInterval is the minimum wall-clock time between the start of one
+	// pass and the start of the next, measured from the previous pass's start
+	// (a pass that already ran longer incurs no extra wait). Zero means passes
+	// run back-to-back, which is convenient for tests but heavy in production:
+	// RunContinuous substitutes LocklessMinPassInterval (1h) so a small table
+	// whose pass finishes in seconds does not re-scan continuously, and the
+	// finite gate substitutes RetryDelay. The wait honours cancellation.
+	MinPassInterval time.Duration
+
+	// MaxPasses bounds Run and RunUntilClean: once this many passes have
+	// completed without one of them being clean, verification gives up with
+	// ErrVerificationUnresolved rather than walking the table again. Zero means
+	// unbounded, which is what RunContinuous always is; NewChecker defaults the
+	// finite gate to DefaultLocklessMaxPasses.
+	MaxPasses int
+
+	// Recopier is invoked when the retry path detects stable target divergence
+	// (source CRC unchanged across a retry window, target still wrong) and
+	// DivergenceIsFatal is false. When nil, that condition surfaces as
+	// ErrPermanentDivergence — useful for tests and for callers that prefer to
+	// halt rather than self-heal. Rejected by NewChecker, which derives it from
+	// FixDifferences; cross-server callers set it through NewLocklessChecker.
+	Recopier Recopier
+
+	// DivergenceIsFatal selects the policy for a confirmed stable divergence,
+	// making explicit whether the caller should abort or heal rather than
+	// inferring it from Recopier presence:
+	//   - true: the target is kept in sync by some other mechanism, so a
+	//     confirmed difference means something is genuinely wrong.
+	//     Verification returns ErrPermanentDivergence and the caller aborts.
+	//     No Recopier is configured.
+	//   - false: the checker's job is to find and re-copy diverged rows, so a
+	//     confirmed difference is repaired via Recopier and the run continues.
+	// When false, a Recopier must be set; without one a divergence is treated
+	// as fatal anyway (there is nothing to heal with). Rejected by NewChecker
+	// for the same reason as Recopier.
+	DivergenceIsFatal bool
 }
 
 func NewCheckerDefaultConfig() *CheckerConfig {
@@ -275,7 +368,7 @@ func NewCheckerDefaultConfig() *CheckerConfig {
 		DBConfig:        dbconn.NewDBConfig(),
 		Logger:          slog.Default(),
 		FixDifferences:  false,
-		MaxRetries:      3,
+		MaxRetries:      defaultMaxRetries,
 		YieldTimeout:    DefaultYieldTimeout,
 	}
 }
@@ -283,10 +376,11 @@ func NewCheckerDefaultConfig() *CheckerConfig {
 // NewChecker creates a new checksum object.
 // sourceDBs contains the source database connections (one for single-source migrations,
 // multiple for N:M moves). The distributed checker aggregates checksums across all sources.
-// The single checker uses sourceDBs[0]. Lockless selects a finite optimistic
-// checker for one source/target server; continuous verification uses
-// NewLocklessChecker directly. Open the chunker before construction unless
-// supplying Watermark, in which case the factory opens it according to policy.
+// The single checker uses sourceDBs[0]. Lockless selects optimistic verification
+// against one server, which serves both the finite and the continuous contract;
+// cross-server callers construct it through NewLocklessChecker instead. Open the
+// chunker before construction unless supplying Watermark, in which case the
+// factory opens it according to policy.
 func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Source, config *CheckerConfig) (Checker, error) {
 	if config == nil {
 		return nil, errors.New("config must be non-nil")
@@ -300,34 +394,64 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 	if chunker == nil {
 		return nil, errors.New("chunker must be non-nil")
 	}
-	if config.Lockless != nil {
+	if config.DBConfig == nil {
+		return nil, errors.New("dbconfig must be non-nil")
+	}
+	if config.MaxRetries == 0 {
+		config.MaxRetries = defaultMaxRetries
+	}
+	if config.Lockless {
 		if len(sourceDBs) != 1 || len(feeds) != 1 || config.Applier != nil {
 			return nil, errors.New("lockless verification requires one source, one feed, and no distributed applier")
 		}
 		if sourceDBs[0] == nil || feeds[0] == nil {
 			return nil, errors.New("lockless verification requires non-nil source and feed")
 		}
-		if config.Lockless.Concurrency != 0 && config.Lockless.Concurrency != config.Concurrency {
-			return nil, errors.New("Lockless.Concurrency conflicts with CheckerConfig.Concurrency; configure finite checker concurrency on CheckerConfig")
+		if config.Recopier != nil || config.DivergenceIsFatal {
+			return nil, errors.New("Recopier and DivergenceIsFatal are owned by the factory; select repairs with CheckerConfig.FixDifferences")
 		}
-		// Snapshot watermarks cannot represent pending optimistic retries.
-		// A resumed optimistic checker opens the whole range instead.
+		// A watermark is verification evidence, whichever algorithm produced
+		// it: every row below it was observed equal and the change feed has
+		// kept it that way since. Optimistic verification only publishes one
+		// for a prefix it has actually resolved (see
+		// LocklessChecker.ResumeWatermark), so resuming at it is the same trade
+		// the snapshot checkers make.
 		if config.Watermark != "" {
-			if err := chunker.Open(); err != nil {
+			if err := chunker.OpenAtWatermark(config.Watermark); err != nil {
 				return nil, err
 			}
 		}
-		cfg := *config.Lockless
-		cfg.Concurrency, cfg.Autoscale = config.Concurrency, config.Autoscale
-		cfg.Throttler, cfg.Logger = loadOnlyThrottler(config.Throttler), config.Logger
-		cfg.MetricsSink = config.MetricsSink
-		return &locklessChecker{db: sourceDBs[0], chunker: chunker, feed: feeds[0], cfg: cfg}, nil
-	}
-	if config.DBConfig == nil {
-		return nil, errors.New("dbconfig must be non-nil")
-	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = 3
+		cfg := *config
+		cfg.Throttler = loadOnlyThrottler(config.Throttler)
+		// Repair policy comes from the same field for both algorithms, so a
+		// caller does not have to know which one it selected to say whether a
+		// divergence should be healed or should abort. FixDifferences is what
+		// the migration runner sets; datasync configures its cross-server
+		// Recopier through NewLocklessChecker instead.
+		if config.FixDifferences {
+			if config.RepairApplier == nil {
+				return nil, errors.New("repair applier must be non-nil")
+			}
+			cfg.Recopier = newChunkRepairer(sourceDBs[0], config.RepairApplier, config.DBConfig, config.Logger)
+			cfg.DivergenceIsFatal = false
+		} else {
+			cfg.DivergenceIsFatal = true
+		}
+		// Only the finite gate is bounded. A caller that goes on to
+		// RunContinuous is unbounded by design, and that path ignores MaxPasses.
+		if cfg.MaxPasses == 0 {
+			cfg.MaxPasses = DefaultLocklessMaxPasses
+		}
+		checker, err := NewLocklessChecker(sourceDBs[0], sourceDBs[0], chunker, feeds[0], &cfg)
+		if err != nil {
+			return nil, err
+		}
+		// Every checker this factory builds owns the feed's periodic flush for
+		// the duration of a run, the same as the snapshot checkers do. Callers
+		// that construct through NewLocklessChecker run their own flush loop
+		// (datasync does) and must not have it stopped from under them.
+		checker.ownsFeedFlush = true
+		return checker, nil
 	}
 	if config.YieldTimeout == 0 {
 		config.YieldTimeout = DefaultYieldTimeout
@@ -372,6 +496,7 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		return nil, errors.New("repair applier must be non-nil")
 	}
 	return &SingleChecker{
+		repairer:        newChunkRepairer(sourceDBs[0], config.RepairApplier, config.DBConfig, config.Logger),
 		concurrency:     concurrency,
 		maxConcurrency:  maxConcurrency,
 		autoscale:       config.Autoscale.Enabled,
@@ -385,7 +510,6 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		logger:          config.Logger,
 		fixDifferences:  config.FixDifferences,
 		maxRetries:      config.MaxRetries,
-		repairApplier:   config.RepairApplier,
 		yieldTimeout:    config.YieldTimeout,
 	}, nil
 }

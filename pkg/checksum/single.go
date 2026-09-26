@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
@@ -54,12 +53,10 @@ type SingleChecker struct {
 	fixDifferences   bool
 	differencesFound atomic.Uint64
 	resume           snapshotResume
-	// repairApplier is the write path a mismatched chunk is rewritten through
-	// (see replaceChunk). It is started and stopped around each repair rather
-	// than for the checker's lifetime, because repairs are rare and serialized:
-	// see the lifecycle note in replaceChunk.
-	repairApplier   applier.Applier
-	recopyLock      sync.Mutex
+	// repairer is the write path a mismatched chunk is rewritten through (see
+	// replaceChunk). It is shared with the lockless checker's Recopier so both
+	// algorithms repair identically.
+	repairer        *chunkRepairer
 	maxRetries      int
 	yieldTimeout    time.Duration
 	yieldsPerformed atomic.Uint64 // number of yield/resume cycles performed
@@ -150,9 +147,9 @@ func (c *SingleChecker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPo
 	// The transaction is only needed for the snapshot reads: the two checksum
 	// queries and (on mismatch) the row-level inspection. It must go back to
 	// the pool the moment those are done, not at function exit: the repair
-	// path below serializes on recopyLock and can park for many minutes
-	// behind other repairs, and a checked-out transaction is invisible to the
-	// pool's keepalive — holding it there idled connections past Aurora's
+	// path below serializes on the shared repairer's lock and can park for
+	// many minutes behind other repairs, and a checked-out transaction is
+	// invisible to the pool's keepalive — holding it there idled connections past the server's
 	// wait_timeout in production and killed the whole pool. Guarded so the
 	// early call and the deferred one compose to exactly one Put.
 	trxReturned := false
@@ -214,7 +211,7 @@ func (c *SingleChecker) ChecksumChunk(ctx context.Context, trxPool *dbconn.TrxPo
 		// The snapshot reads are done. The repair below reads current data
 		// through the pooled connections (deliberately outside the snapshot),
 		// so return the transaction now and let the keepalive cover it while
-		// this worker queues on recopyLock.
+		// this worker queues for the repairer's lock.
 		putTrx()
 		// Are we allowed to fix the differences? If not, return an error.
 		// This is mostly used by the test-suite.
@@ -238,382 +235,20 @@ func (c *SingleChecker) GetProgress() status.ChecksumProgress {
 	return status.ChecksumProgress{RowsChecked: rowsProcessed, RowsTotal: totalRows}
 }
 
-// inspectDifferences looks at the chunk and tries to find differences.
-// For cross-database scenarios, it queries each database separately and compares in memory.
+// inspectDifferences logs a line per diverged row in the chunk, reading inside
+// the snapshot transaction the mismatch was detected under. The implementation
+// is shared with the lockless checker — see inspectDifferences in inspect.go.
 func (c *SingleChecker) inspectDifferences(ctx context.Context, trx *sql.Tx, chunk *table.Chunk) error {
 	c.logger.Info("inspecting differences for chunk", "chunk", chunk.String())
-
-	sourceChecksumCols, targetChecksumCols, err := chunk.ColumnMapping.ChecksumExprs()
-	if err != nil {
-		return err
-	}
-	sourceRows, err := trx.QueryContext(ctx, fmt.Sprintf(queryTemplate,
-		sourceChecksumCols,
-		table.QuoteColumns(chunk.Table.KeyColumns),
-		chunk.Table.QuotedTableName,
-		chunk.String(),
-	))
-	if err != nil {
-		return fmt.Errorf("failed to query source rows: %w", err)
-	}
-	defer utils.CloseAndLog(sourceRows)
-
-	// Build map of source checksums
-	sourceChecksums := make(map[string]string) // pk -> checksum
-	for sourceRows.Next() {
-		var checksum, pk string
-		if err := sourceRows.Scan(&checksum, &pk); err != nil {
-			return fmt.Errorf("failed to scan source row: %w", err)
-		}
-		sourceChecksums[pk] = checksum
-	}
-	if err := sourceRows.Err(); err != nil {
-		return fmt.Errorf("error iterating source rows: %w", err)
-	}
-
-	targetRows, err := trx.QueryContext(ctx, fmt.Sprintf(queryTemplate,
-		targetChecksumCols,
-		table.QuoteColumns(chunk.NewTable.KeyColumns),
-		chunk.NewTable.QuotedTableName,
-		chunk.String(),
-	))
-	if err != nil {
-		return fmt.Errorf("failed to query target rows: %w", err)
-	}
-	defer utils.CloseAndLog(targetRows)
-
-	// Build map of target checksums and compare
-	targetChecksums := make(map[string]string) // pk -> checksum
-	for targetRows.Next() {
-		var checksum, pk string
-		if err := targetRows.Scan(&checksum, &pk); err != nil {
-			return fmt.Errorf("failed to scan target row: %w", err)
-		}
-		targetChecksums[pk] = checksum
-
-		// Check if this row exists in source and has different checksum
-		if sourceChecksum, exists := sourceChecksums[pk]; exists {
-			if sourceChecksum != checksum {
-				c.logger.Warn("inspection revealed row checksum mismatch", "pk", pk, "sourceChecksum", sourceChecksum, "targetChecksum", checksum)
-			}
-		} else {
-			c.logger.Warn("inspection revealed row does not exist in source", "pk", pk)
-		}
-	}
-	if err := targetRows.Err(); err != nil {
-		return fmt.Errorf("error iterating target rows: %w", err)
-	}
-
-	// Check for rows that exist in source but not in target
-	for pk, sourceChecksum := range sourceChecksums {
-		if _, exists := targetChecksums[pk]; !exists {
-			c.logger.Warn("inspection revealed row does not exist in target", "pk", pk, "sourceChecksum", sourceChecksum)
-		}
-	}
-
-	return nil // managed to inspect differences
+	return inspectDifferences(ctx, trx, chunk, c.logger)
 }
 
-// replaceChunk recopies the data from table to newTable for a given chunk: the
-// chunk's key range is DELETEd on the target, then the source rows are read into
-// the client and rewritten through the applier — the same buffered write path
-// the copier and the binlog apply use.
-//
-// This deliberately does NOT use `REPLACE INTO newTable ... SELECT FROM table`,
-// which is what it did historically. That statement is a single unbuffered
-// server-side operation, and it locks in two ways that scale with the chunk:
-//
-//   - The SELECT half takes shared next-key locks on every source row it reads
-//     (it is a locking read, because it feeds a write), so application UPDATEs
-//     to the *original* table block behind a repair for the whole statement.
-//   - The write half holds its row locks on the target for the same duration.
-//
-// Reading into the client is a plain consistent read that locks nothing, and the
-// applier splits the write into bounded statements (see applier chunklets), so
-// neither half's lock footprint grows with the chunk any more. That is what makes
-// a large checksum chunk safe to repair without splitting it first
-// (block/spirit#1130). Rows are streamed in batches rather than materialized
-// whole: the client holds one batch (repairBatchRows/repairBatchBytes) plus
-// whatever the applier has accepted and not yet written, which its chunklet
-// buffer bounds. Neither bound grows with the chunk, which is the property that
-// matters here — it is not one batch's worth of memory.
-//
-// Note that the chunk is dynamically sized based on the target-time that it took
-// to *read* data in the checksum. This could be substantially longer than the time
-// that it takes to copy the data.
-//
-// Two behaviours worth knowing about, both inherited from the applier and shared
-// with the other repair paths (DistributedChecker.replaceChunk, MySQLRecopier):
-//
-//   - The applier writes with INSERT IGNORE, not REPLACE. Rows inside the key
-//     range were just deleted so there is nothing to conflict with there; a row
-//     that collides on a UNIQUE secondary key with a row *outside* the range is
-//     skipped rather than clobbering the other row. The repair then leaves the
-//     chunk still diverged, which the next attempt re-flags and Run eventually
-//     surfaces as a hard error — the correct outcome for e.g. a lossy ALTER that
-//     adds a UNIQUE index to non-unique data. The skipped-rows count is logged.
-//   - JSON columns are read bare, with no round-trip cast. The read+write pair
-//     is already text-mediated (the SELECT renders each document to text and the
-//     applier writes it back as a SQL literal the target re-parses), so the
-//     repaired row lands as exactly the one-text-round-trip image the checksum's
-//     source side predicts. Casting on top would apply parse∘render twice, which
-//     does not converge for misparsed doubles — see castExpr in pkg/table.
-//   - The read is not synchronized with the binlog feed, so a row deleted on the
-//     source *after* it is read here is written back if the feed has already
-//     applied that DELETE to the target. The chunk then stays diverged, the next
-//     attempt re-flags it, and the repair converges as soon as the churn on that
-//     key range stops. Cutover is gated on a pass that finds no differences at
-//     all, so the cost is attempts, never a bad cutover. The window is wider than
-//     the old locking read's (which held the source rows still for the duration
-//     of its own statement) but it was never closed, and the other repair paths
-//     have the same shape.
+// replaceChunk recopies a mismatched chunk from the source table onto the
+// target. The implementation is shared with the lockless checker's repair path
+// — see chunkRepairer, which documents the operation, its locking, and the two
+// behaviours it inherits from the applier.
 func (c *SingleChecker) replaceChunk(ctx context.Context, chunk *table.Chunk) error {
-	start := time.Now()
-	c.logger.Warn("recopying chunk via DELETE + Apply", "chunk", chunk.String())
-
-	// We further prevent the chance of deadlocks from the recopying process by only re-copying one chunk at a time.
-	// We may revisit this in future, but since conflicts are expected to be low, it should be fine for now.
-	c.recopyLock.Lock()
-	defer c.recopyLock.Unlock()
-
-	// Construct a delete statement to remove existing rows in the target chunk
-	deleteStmt := "DELETE FROM " + chunk.NewTable.QuotedTableName + " WHERE " + chunk.String()
-
-	// The DELETE and the rewrite are two separate operations, and the historical
-	// reason for that is the deadlock documented below.
-	//
-	// Note: historically this process has caused deadlocks between the DELETE statement
-	// in one replaceChunk and the REPLACE statement of another chunk. Inspection of
-	// SHOW ENGINE INNODB STATUS shows that this is not caused by locks on the PRIMARY KEY,
-	// but a unique secondary key (in our case an idempotence key):
-	//
-	// ------------------------
-	// LATEST DETECTED DEADLOCK
-	// ------------------------
-	// 2024-06-11 18:34:21 70676106989440
-	// *** (1) TRANSACTION:
-	// TRANSACTION 15106308424, ACTIVE 4 sec updating or deleting
-	// mysql tables in use 1, locked 1
-	// LOCK WAIT 620 lock struct(s), heap size 73848, 49663 row lock(s), undo log entries 49661
-	// MySQL thread id 540806, OS thread handle 70369444421504, query id 409280999 10.137.84.232 <snip> updating
-	// DELETE FROM `<snip>`.`_<snip>_new` WHERE `id` >= 1108588365 AND `id` < 1108688365
-	//
-	// *** (1) HOLDS THE LOCK(S):
-	// RECORD LOCKS space id 1802 page no 26277057 n bits 232 index idempotence_key_idx of table `<snip>`.`_<snip>_new` trx id 15106308424 lock_mode X locks rec but not gap
-	// Record lock, heap no 163 PHYSICAL RECORD: n_fields 2; compact format; info bits 32
-	// 0: len 30; hex <snip>; asc <snip>; (total 62 bytes);
-	// 1: len 8; hex <snip>; asc     <snip>;;
-	//
-	//
-	// *** (1) WAITING FOR THIS LOCK TO BE GRANTED:
-	// RECORD LOCKS space id 1802 page no 1945840 n bits 280 index idempotence_key_idx of table `<snip>`.`_<snip>_new` trx id 15106308424 lock_mode X locks rec but not gap waiting
-	// Record lock, heap no 75 PHYSICAL RECORD: n_fields 2; compact format; info bits 0
-	// 0: len 30; hex <snip>; asc <snip>; (total 62 bytes);
-	// 1: len 8; hex <snip>; asc     <snip>;;
-	//
-	//
-	// *** (2) TRANSACTION:
-	// TRANSACTION 15106301192, ACTIVE 58 sec inserting
-	// mysql tables in use 2, locked 1
-	// LOCK WAIT 220020 lock struct(s), heap size 27680888, 409429 row lock(s), undo log entries 162834
-	// MySQL thread id 540264, OS thread handle 70369485823872, query id 409127061 10.137.84.232 <snip> executing
-	// REPLACE INTO `<snip>`.`_<snip>_new` (`id`, <snip> FROM `<snip>`.`<snip>` WHERE `id` >= 1106488365 AND `id` < 1106588365
-	//
-	// *** (2) HOLDS THE LOCK(S):
-	// RECORD LOCKS space id 1802 page no 1945840 n bits 280 index idempotence_key_idx of table `<snip>`.`_<snip>_new` trx id 15106301192 lock_mode X
-	// Record lock, heap no 75 PHYSICAL RECORD: n_fields 2; compact format; info bits 0
-	// 0: len 30; hex <snip>; asc <snip>; (total 62 bytes);
-	// 1: len 8; hex <snip>; asc     B yI;;
-	//
-	//
-	// *** (2) WAITING FOR THIS LOCK TO BE GRANTED:
-	// RECORD LOCKS space id 1802 page no 26277057 n bits 232 index idempotence_key_idx of table `<snip>`.`_<snip>_new` trx id 15106301192 lock_mode X waiting
-	// Record lock, heap no 163 PHYSICAL RECORD: n_fields 2; compact format; info bits 32
-	// 0: len 30; hex <snip>; asc <snip>; (total 62 bytes);
-	// 1: len 8; hex <snip>; asc     <snip>;;
-	//
-	// *** WE ROLL BACK TRANSACTION (1)
-	//
-	// We don't need this to be an atomic transaction. We just need to delete from the _new table
-	// first so that any since-deleted rows (which wouldn't get removed by replace) are removed first.
-	// By doing this as two transactions we should be able to remove
-	// the opportunity for deadlocks. The rewrite is now many small transactions
-	// rather than one, which shrinks the lock footprint further, and the
-	// serialization on recopyLock above still keeps two repairs from overlapping.
-	//
-	// If the parent ctx is cancelled after the DELETE, the target chunk would be
-	// left with rows deleted but not yet rewritten. The lockless-checksum
-	// loop's cancellation on sentinel drop hits this race, so the whole repair
-	// runs under a context that ignores the parent's cancellation. The bounded
-	// timeout still protects against a hung repair — and because the applier's
-	// workers are started under fixCtx too (below), that bound covers the writes
-	// as well: a cancelled parent cannot strand queued inserts.
-	fixCtx, fixCancel := context.WithTimeout(context.WithoutCancel(ctx), fixChunkTimeout)
-	defer fixCancel()
-	if _, err := dbconn.RetryableTransaction(fixCtx, c.db, dbconn.ErrorOnDupKey, c.dbConfig, deleteStmt); err != nil {
-		return fmt.Errorf("failed to delete existing rows: %w", err)
-	}
-
-	// The applier is started per repair rather than for the checker's lifetime.
-	// Repairs are rare and serialized by recopyLock, so the goroutine churn is
-	// irrelevant next to the work itself, and in exchange the repair is fully
-	// self-contained: the workers live under fixCtx, and the Stop() below joins
-	// them, so no write can outlive (or be dropped by) the repair that queued it.
-	// The start is deferred until there is actually something to write — a source
-	// range that is entirely empty is repaired by the DELETE alone.
-	applierStarted := false
-	defer func() {
-		if !applierStarted {
-			return
-		}
-		if err := c.repairApplier.Stop(); err != nil {
-			c.logger.Warn("failed to stop repair applier", "error", err)
-		}
-	}()
-
-	// Read the source rows for the chunk. This is deliberately a plain,
-	// non-locking consistent read of *current* data — not a read inside the
-	// checksum's snapshot: by the time we repair, the snapshot is stale and what
-	// the target needs is the source as it is now.
-	//
-	// The column list is the source/target intersection (with renames applied on
-	// the target side), which is exactly what the applier expects: row values are
-	// positional, values[i] belongs to sourceColumns[i].
-	//
-	// FORCE INDEX (PRIMARY) for the same reason the copier's read of this shape
-	// does (pkg/copier/buffered.go): the predicate is a range over the primary
-	// key, and misleading statistics on a wide table can otherwise talk the
-	// optimizer into a scan.
-	sourceColumns, _ := chunk.ColumnMapping.ColumnsSlice()
-	sourceColumnList, _ := chunk.ColumnMapping.Columns()
-	query := fmt.Sprintf("SELECT %s FROM %s FORCE INDEX (PRIMARY) WHERE %s",
-		sourceColumnList,
-		chunk.Table.QuotedTableName,
-		chunk.String(),
-	)
-	rows, err := c.db.QueryContext(fixCtx, query)
-	if err != nil {
-		return fmt.Errorf("failed to read source chunk: %w", err)
-	}
-	// Closed early on the success path (see below) to hand the connection back
-	// before waiting on the writers; this covers the early returns until then.
-	defer func() {
-		if rows != nil {
-			utils.CloseAndLog(rows)
-		}
-	}()
-
-	// Apply() is asynchronous: it hands the batch to the write workers and
-	// returns, so reads and writes pipeline. Callbacks run on the applier's
-	// coordinator goroutine, hence the mutex; they must never block, so results
-	// are accumulated here and inspected after Wait().
-	var (
-		resultMu      sync.Mutex
-		firstApplyErr error
-		appliedRows   int64
-	)
-	callback := func(affectedRows int64, applyErr error) {
-		resultMu.Lock()
-		defer resultMu.Unlock()
-		appliedRows += affectedRows
-		if applyErr != nil && firstApplyErr == nil {
-			firstApplyErr = applyErr
-		}
-	}
-
-	var (
-		batch      [][]any
-		batchBytes int
-		sourceRows int64
-	)
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		if !applierStarted {
-			if err := c.repairApplier.Start(fixCtx); err != nil {
-				return fmt.Errorf("failed to start repair applier: %w", err)
-			}
-			applierStarted = true
-		}
-		if err := c.repairApplier.Apply(fixCtx, chunk, batch, callback); err != nil {
-			return fmt.Errorf("failed to submit rows for rewrite: %w", err)
-		}
-		// The applier owns the batch now (it keeps the slices), so start a fresh
-		// one rather than reusing the backing array.
-		batch, batchBytes = nil, 0
-		return nil
-	}
-	for rows.Next() {
-		values := make([]any, len(sourceColumns))
-		valuePtrs := make([]any, len(sourceColumns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return fmt.Errorf("failed to scan source row: %w", err)
-		}
-		batch = append(batch, values)
-		batchBytes += applier.EstimateRowSize(values)
-		sourceRows++
-		if len(batch) >= repairBatchRows || batchBytes >= repairBatchBytes {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed to read source chunk: %w", err)
-	}
-	if err := flush(); err != nil {
-		return err
-	}
-	// Return the read connection before waiting on the writers. They take their
-	// connections from the same pool, so holding this one across the wait would
-	// be one connection of headroom given up for nothing. Nil it out so the
-	// deferred close does not close it a second time.
-	utils.CloseAndLog(rows)
-	rows = nil
-
-	// Wait for every submitted batch to be written and its callback to have run.
-	// Repairs are serialized on recopyLock, so on the private applier there is no
-	// other pending work this could be waiting on; on a shared one (the migration
-	// runner passes the applier the copy phase used) the copy has long finished
-	// and the binlog feed only uses the synchronous write methods, which do not
-	// register pending work.
-	if applierStarted {
-		if err := c.repairApplier.Wait(fixCtx); err != nil {
-			return fmt.Errorf("failed waiting for chunk rewrite: %w", err)
-		}
-	}
-	resultMu.Lock()
-	defer resultMu.Unlock()
-	if firstApplyErr != nil {
-		return fmt.Errorf("failed to rewrite chunk data: %w", firstApplyErr)
-	}
-	if appliedRows < sourceRows {
-		// INSERT IGNORE skipped rows: see the note on UNIQUE secondary keys in
-		// the function doc. The chunk is still diverged, so this is reported
-		// rather than swallowed — the next attempt re-flags it.
-		//
-		// One-directional: appliedRows is a sum of SQL rows-affected, and
-		// dbconn.RetryableTransaction accumulates that across its retry attempts
-		// (a statement that succeeded but whose COMMIT was then retried counts
-		// twice), so an inflated count can hide this warning. That costs a log
-		// line, not correctness — the divergence itself is caught by the next
-		// attempt's checksum either way.
-		c.logger.Warn("recopying chunk did not rewrite every source row; a UNIQUE key conflict outside the chunk range is the usual cause",
-			"chunk", chunk.String(),
-			"sourceRows", sourceRows,
-			"writtenRows", appliedRows,
-		)
-	}
-	c.logger.Info("chunk recopied",
-		"chunk", chunk.String(),
-		"rowCount", sourceRows,
-		"elapsed", time.Since(start).Round(time.Millisecond).String(),
-	)
-	return nil
+	return c.repairer.Recopy(ctx, chunk)
 }
 
 func (c *SingleChecker) isHealthy(ctx context.Context) bool {

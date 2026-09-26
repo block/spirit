@@ -222,6 +222,12 @@ const drainReserveConns = 1
 // own off-pool queries (checksumOffPoolConns), the control-plane queries, and
 // the drain. The copier and applier are not in the reserve because they have
 // finished by the time the checksum starts.
+//
+// Lockless verification pins nothing — it borrows a connection per read and
+// gives it straight back — so the reserve is strictly conservative for it and
+// is deliberately not narrowed: the flag is experimental, and an over-reserved
+// pool costs read concurrency while an under-reserved one costs a stalled
+// migration.
 func (r *Runner) checksumPhaseReserve() int {
 	return checksumOffPoolConns + r.controlPlaneConns() + drainReserveConns
 }
@@ -949,22 +955,26 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 		}
 	}
 
-	var lockless *checksum.LocklessCheckerConfig
-	if r.migration.EnableExperimentalLocklessChecksum {
-		lockless = &checksum.LocklessCheckerConfig{SplitHotChunks: true, SnapshotHotChunks: true, DivergenceIsFatal: true}
+	lockless := r.migration.EnableExperimentalLocklessChecksum
+	if lockless {
 		r.logger.Warn("experimental lockless checksum enabled; verification uses optimistic reads, cutover locking is unchanged")
 	}
 	r.checker, err = checksum.NewChecker([]*sql.DB{r.db}, r.checksumChunker, []change.Source{r.replClient}, &checksum.CheckerConfig{
-		Lockless:        lockless,
-		Watermark:       checksumWatermark,
-		Concurrency:     r.migration.Threads,
-		TargetChunkTime: table.ChunkerDefaultTarget,
-		DBConfig:        r.dbConfig,
-		Logger:          r.logger,
-		FixDifferences:  true,
-		MaxRetries:      3,
-		YieldTimeout:    r.migration.ChecksumYieldTimeout,
-		MetricsSink:     r.metricsSink,
+		// Repair policy is not set here: NewChecker derives it from
+		// FixDifferences below, so both checkers answer a divergence the same
+		// way (repair it, re-verify next pass, fail if it keeps coming back).
+		Lockless:          lockless,
+		SplitHotChunks:    true,
+		SnapshotHotChunks: true,
+		Watermark:         checksumWatermark,
+		Concurrency:       r.migration.Threads,
+		TargetChunkTime:   table.ChunkerDefaultTarget,
+		DBConfig:          r.dbConfig,
+		Logger:            r.logger,
+		FixDifferences:    true,
+		MaxRetries:        3,
+		YieldTimeout:      r.migration.ChecksumYieldTimeout,
+		MetricsSink:       r.metricsSink,
 		// Repairing a mismatched chunk writes through the same applier the copy
 		// and binlog-apply phases use, so a repair inherits the configured write
 		// concurrency instead of standing up a second write path. The copier has

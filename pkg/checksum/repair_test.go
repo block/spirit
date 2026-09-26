@@ -244,8 +244,8 @@ func TestRepairEmptySourceRange(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO _repairempty_t1_new VALUES (1, 'stale', 1), (2, 'stale', 2)")
 
 	checker, chunk, db := newRepairFixture(t, "repairempty_t1", "_repairempty_t1_new", nil)
-	spy := &spyApplier{Applier: checker.repairApplier}
-	checker.repairApplier = spy
+	spy := &spyApplier{Applier: checker.repairer.applier}
+	checker.repairer.applier = spy
 
 	require.NoError(t, checker.replaceChunk(t.Context(), chunk))
 
@@ -271,8 +271,8 @@ func TestRepairRestartsApplierBetweenRepairs(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO _repairtwice_t1_new VALUES (1, 'one', 999)") // wrong, and row 2 missing
 
 	checker, chunk, db := newRepairFixture(t, "repairtwice_t1", "_repairtwice_t1_new", nil)
-	spy := &spyApplier{Applier: checker.repairApplier}
-	checker.repairApplier = spy
+	spy := &spyApplier{Applier: checker.repairer.applier}
+	checker.repairer.applier = spy
 
 	require.NoError(t, checker.replaceChunk(t.Context(), chunk))
 	requireTablesMatch(t, db, "repairtwice_t1", "_repairtwice_t1_new")
@@ -313,9 +313,9 @@ func TestRepairSurfacesApplierErrors(t *testing.T) {
 			testutils.RunSQL(t, "INSERT INTO repairerr_t1 VALUES (1, 'one', 1), (2, 'two', 2)")
 
 			checker, chunk, _ := newRepairFixture(t, "repairerr_t1", "_repairerr_t1_new", nil)
-			spy := &spyApplier{Applier: checker.repairApplier}
+			spy := &spyApplier{Applier: checker.repairer.applier}
 			tc.inject(spy)
-			checker.repairApplier = spy
+			checker.repairer.applier = spy
 
 			err := checker.replaceChunk(t.Context(), chunk)
 			require.ErrorContains(t, err, tc.wantErr)

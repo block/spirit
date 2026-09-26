@@ -103,20 +103,32 @@ func (c *testChunker) Reset() error {
 }
 func (c *testChunker) Tables() []*table.TableInfo { return nil }
 
+func (c *testChunker) resetCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.resets
+}
+
+func (c *testChunker) feedbackCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.feedback)
+}
+
 // newTestChecker builds a checker with a swapped readChunk hook. The hook
 // receives the chunk and an attempt counter (incremented each call for the
 // same chunk pointer) so tests can express "fail twice, then pass" etc.
 //
 // We pass nil DB pointers (allowed because readChunk is swapped) but the
 // constructor requires non-nil, so use minimal sentinel values.
-func newTestChecker(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
+func newTestChecker(t *testing.T, chunker table.Chunker, cfg CheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, tgtCount uint64, err error),
 ) *LocklessChecker {
 	t.Helper()
 	// Constructor demands non-nil DBs; we pass empty *sql.DB pointers — they
 	// are never used because readChunk is swapped before Run.
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, &cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -142,12 +154,12 @@ func newTestChecker(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConf
 // signatures (CRC + count) for source and target independently, so tests can
 // exercise row-count divergence with matching CRCs (the defense-in-depth gap
 // this comparison closes).
-func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
+func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg CheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, srcCount, tgtCount uint64, err error),
 ) *LocklessChecker {
 	t.Helper()
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, &cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -172,7 +184,14 @@ func runUntil(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan
 	ctx, cancel := context.WithCancel(context.Background())
 	out := make(chan error, 1)
 	go func() {
-		out <- c.Run(ctx)
+		// RunContinuous is the unbounded pass loop: these tests drive the
+		// checker until they cancel it. It filters cancellation to nil, so the
+		// helper reports ctx.Err() instead — the tests assert on it.
+		if err := c.RunContinuous(ctx); err != nil {
+			out <- err
+			return
+		}
+		out <- ctx.Err()
 	}()
 	return func() error {
 		cancel()
@@ -185,14 +204,35 @@ func runUntil(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan
 	}, out
 }
 
+// runUntilClean is runUntil for the finite contract: it drives RunUntilClean,
+// which keeps passing until a pass needs nothing (or MaxPasses gives up).
+func runUntilClean(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan error, 1)
+	go func() { out <- c.RunUntilClean(ctx) }()
+	return func() error {
+		cancel()
+		select {
+		case err := <-out:
+			return err
+		case <-time.After(5 * time.Second):
+			return errors.New("RunUntilClean did not return within 5s of cancel")
+		}
+	}, out
+}
+
 // fastConfig is a default config tuned for fast tests: 50ms retry delay,
 // silent logger.
-func fastConfig() LocklessCheckerConfig {
-	return LocklessCheckerConfig{
-		Concurrency:  4,
-		RetryDelay:   50 * time.Millisecond,
-		MaxQueueSize: 16,
-		Logger:       slog.New(slog.NewTextHandler(testWriter{}, &slog.HandlerOptions{Level: slog.LevelError})),
+func fastConfig() CheckerConfig {
+	return CheckerConfig{
+		Concurrency: 4,
+		RetryDelay:  50 * time.Millisecond,
+		// Back-to-back passes. A zero here means "let the mode pick", which in
+		// continuous mode is an hour.
+		MinPassInterval: time.Millisecond,
+		MaxQueueSize:    16,
+		Logger:          slog.New(slog.NewTextHandler(testWriter{}, &slog.HandlerOptions{Level: slog.LevelError})),
 	}
 }
 
@@ -1279,7 +1319,9 @@ func TestScanCompleteResetsAndExcludesWalkerFailure(t *testing.T) {
 	c.chunker = blocked
 	c.scanComplete.Store(true) // Completion from the preceding pass must reset.
 	done := make(chan error, 1)
-	go func() { done <- c.Run(t.Context()) }()
+	// One attempt: the walker's failure is not retryable-in-this-test (the
+	// stub can only fail once), and Run's retry loop would call it again.
+	go func() { done <- c.RunUntilClean(t.Context()) }()
 	<-blocked.started
 	require.False(t, c.Stats().ScanComplete)
 	close(blocked.release)
@@ -1363,6 +1405,220 @@ func TestRunUntilClean(t *testing.T) {
 	}
 }
 
+// MaxPasses bounds RunUntilClean. Without it a range that never converges keeps
+// the caller in a full-table re-walk loop with no error and no end, which reads
+// to an operator as a migration that has simply stopped making progress.
+//
+// The chunk here is permanently hot: its source CRC changes on every read, so
+// it is deferred at the end of every pass and no pass is ever clean.
+func TestRunUntilCleanHonoursMaxPasses(t *testing.T) {
+	cfg := fastConfig()
+	cfg.RetryDelay = time.Millisecond
+	cfg.MinPassInterval = time.Millisecond
+	cfg.MaxHotAttempts = 2
+	cfg.MaxPasses = 3
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(_ context.Context, _ *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return int64(attempt), 0, 10, nil
+		})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	err := c.RunUntilClean(ctx)
+
+	require.ErrorIs(t, err, ErrVerificationUnresolved)
+	require.NotErrorIs(t, err, ErrPermanentDivergence,
+		"nothing is proven about an unresolved range; that is a different verdict from divergence")
+	require.NoError(t, ctx.Err(), "it must terminate on the pass budget, not on the deadline")
+	require.Equal(t, uint64(3), c.Stats().PassesCompleted, "exactly MaxPasses passes run")
+	require.True(t, c.Stats().FirstCleanPassAt.IsZero())
+}
+
+// MaxPasses does not apply to continuous verification, which is unbounded by
+// design: Run keeps passing until its caller cancels it.
+func TestRunIgnoresMaxPasses(t *testing.T) {
+	cfg := fastConfig()
+	cfg.RetryDelay = time.Millisecond
+	cfg.MinPassInterval = time.Millisecond
+	cfg.MaxHotAttempts = 2
+	cfg.MaxPasses = 2
+	c := newTestChecker(t, newTestChunker(1), cfg,
+		func(_ context.Context, _ *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return int64(attempt), 0, 10, nil
+		})
+	stop, _ := runUntil(t, c)
+	require.Eventually(t, func() bool { return c.Stats().PassesCompleted > 4 }, 5*time.Second, time.Millisecond,
+		"continuous passes must not stop at MaxPasses")
+	require.ErrorIs(t, stop(), context.Canceled)
+}
+
+// watermarkChunker models the part of the real chunker's watermark bookkeeping
+// that matters here: the low watermark exists only once a chunk has been fed
+// back, and Reset() clears it because the next walk starts at the table again.
+type watermarkChunker struct {
+	*testChunker
+	mu   sync.Mutex
+	done map[*table.Chunk]bool
+}
+
+func newWatermarkChunker(n int) *watermarkChunker {
+	return &watermarkChunker{testChunker: newTestChunker(n), done: map[*table.Chunk]bool{}}
+}
+
+func (c *watermarkChunker) Feedback(chunk *table.Chunk, d time.Duration, rows uint64) {
+	c.mu.Lock()
+	c.done[chunk] = true
+	c.mu.Unlock()
+	c.testChunker.Feedback(chunk, d, rows)
+}
+
+// GetLowWatermark reports the contiguous fed-back prefix, like the real
+// tracker: a gap anywhere below a chunk keeps that chunk out of the answer.
+func (c *watermarkChunker) GetLowWatermark() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	wm := ""
+	for _, chunk := range c.chunks {
+		if !c.done[chunk] {
+			break
+		}
+		wm = chunk.String()
+	}
+	if wm == "" {
+		return "", errors.New("no watermark available")
+	}
+	return wm, nil
+}
+
+func (c *watermarkChunker) Reset() error {
+	c.mu.Lock()
+	c.done = map[*table.Chunk]bool{}
+	c.mu.Unlock()
+	return c.testChunker.Reset()
+}
+
+// A chunk the checker repaired is not verified evidence. The repair happened
+// after the read that condemned it, so nothing has compared source and target
+// since; publishing it would let a resume skip a range no one has checked.
+func TestRepairedChunkIsNotResumeEvidence(t *testing.T) {
+	cfg := fastConfig()
+	cfg.Concurrency = 1
+	cfg.MinPassInterval = time.Millisecond
+	cfg.MaxPasses = 1 // stop after the pass that repairs
+	cfg.Recopier = &fakeRecopier{}
+	chunker := newWatermarkChunker(3)
+	bad := chunker.chunks[0]
+	c := newTestChecker(t, chunker, cfg,
+		func(_ context.Context, chunk *table.Chunk, _ int) (int64, int64, uint64, error) {
+			if chunk == bad {
+				return 1, 2, 10, nil // diverged: repaired, never re-read this pass
+			}
+			return 1, 1, 10, nil
+		})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	require.ErrorIs(t, c.RunUntilClean(ctx), ErrVerificationUnresolved)
+
+	require.Equal(t, 1, cfg.Recopier.(*fakeRecopier).callCount())
+	require.Len(t, chunker.feedback, 2, "the two clean chunks resolved; the repaired one did not")
+	for _, fb := range chunker.feedback {
+		require.NotSame(t, bad, fb.Chunk)
+	}
+	wm, err := c.ResumeWatermark()
+	require.NoError(t, err)
+	require.Empty(t, wm, "the repaired chunk is the first, so no prefix is verified")
+}
+
+// Resume evidence describes the walk in progress, and nothing else. A second
+// pass re-walks from the start of the table, so it resets the watermark rather
+// than carrying the first pass's answer forward.
+//
+// Carrying it forward would be unsound: the only way a re-walk fails to
+// re-verify a prefix it already verified is that the prefix stopped being
+// equal, which is exactly when a resume must not skip it.
+//
+// The watermark is polled during pass 1 the way the migration runner polls it
+// for checkpointing — an implementation that caches what it last reported has
+// to be asked at least once before the cache can go stale.
+func TestResumeWatermarkTracksCurrentWalkOnly(t *testing.T) {
+	cfg := fastConfig()
+	cfg.Concurrency = 1
+	cfg.RetryDelay = time.Millisecond
+	cfg.MinPassInterval = time.Millisecond
+	cfg.MaxHotAttempts = 2
+	chunker := newWatermarkChunker(3)
+	// The first two chunks verify; the last is permanently hot, so it is
+	// deferred and no pass is ever clean.
+	hot := chunker.chunks[2]
+	// Two gates hold the walk still at the two points the test inspects it, so
+	// neither observation depends on winning a race with the pass loop:
+	// holdPass1 keeps pass 1 from ending, and holdPass2 keeps pass 2 from
+	// re-verifying anything.
+	holdPass1, holdPass2 := make(chan struct{}), make(chan struct{})
+	wait := func(ctx context.Context, gate chan struct{}) error {
+		select {
+		case <-gate:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	c := newTestChecker(t, chunker, cfg,
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			switch {
+			case chunk == hot && attempt == 1:
+				if err := wait(ctx, holdPass1); err != nil {
+					return 0, 0, 0, err
+				}
+			case chunk == chunker.chunks[0] && attempt == 2:
+				if err := wait(ctx, holdPass2); err != nil {
+					return 0, 0, 0, err
+				}
+			}
+			if chunk == hot {
+				return int64(attempt), 0, 10, nil
+			}
+			return 1, 1, 10, nil
+		})
+
+	// The finite contract is what publishes resume evidence, so drive that.
+	// The hot chunk keeps it from ever converging, which is what gives this
+	// test a pass 2 to look at.
+	stop, _ := runUntilClean(t, c)
+	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
+
+	// Pass 1 publishes the prefix its two clean chunks cover. It cannot end
+	// while the hot chunk is held, so this is an observation of pass 1.
+	require.Eventually(t, func() bool {
+		wm, err := c.ResumeWatermark()
+		return err == nil && wm != ""
+	}, 30*time.Second, time.Millisecond, "the verified prefix must be published")
+	close(holdPass1)
+
+	// Pass 1 ends without converging, so the checker resets the chunker and
+	// re-walks. holdPass2 keeps the re-walk on its first chunk, so the state
+	// below is examined at rest.
+	require.Eventually(t, func() bool {
+		return chunker.resetCount() > 0
+	}, 30*time.Second, time.Millisecond, "the pass must end and re-walk")
+
+	require.GreaterOrEqual(t, chunker.feedbackCount(), 2,
+		"pass 1 verified a prefix, so there is an answer available to carry forward")
+	wm, err := c.ResumeWatermark()
+	require.NoError(t, err)
+	require.Empty(t, wm, "a new pass must not republish the previous walk's evidence")
+
+	// Releasing the re-walk republishes the prefix on its own evidence, which
+	// is what makes the assertion above a real constraint rather than a stub
+	// that can never produce a watermark.
+	close(holdPass2)
+	require.Eventually(t, func() bool {
+		wm, err := c.ResumeWatermark()
+		return err == nil && wm != ""
+	}, 30*time.Second, time.Millisecond, "the re-walk publishes its own verified prefix")
+}
+
 func TestHotSnapshotAdmission(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -1380,7 +1636,7 @@ func TestHotSnapshotAdmission(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			called := false
-			c := &LocklessChecker{cfg: LocklessCheckerConfig{SnapshotHotChunks: tc.enabled}}
+			c := &LocklessChecker{cfg: CheckerConfig{SnapshotHotChunks: tc.enabled}}
 			c.snapshotChunk = func(context.Context, *table.Chunk) (*hotSnapshot, error) {
 				called = true
 				return nil, nil // capture declined; admission is what this test checks

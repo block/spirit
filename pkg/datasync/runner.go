@@ -557,7 +557,7 @@ func (r *Runner) runLocklessChecksum(ctx context.Context) error {
 
 	checker, err := checksum.NewLocklessChecker(
 		r.source.db, r.target.DB, chunker, r.replClient,
-		checksum.LocklessCheckerConfig{
+		&checksum.CheckerConfig{
 			Concurrency:     r.sync.Threads,
 			SplitHotChunks:  true,
 			Throttler:       r.currentLoadSignal(),
@@ -598,9 +598,9 @@ func (r *Runner) runLocklessChecksum(ctx context.Context) error {
 		}
 	}()
 
-	runErr := checker.Run(ctx)
-	// A clean ctx-cancel run returns ctx.Err(); upstream filters that.
-	return runErr
+	// Continuous verification: passes keep running until ctx is cancelled.
+	// RunContinuous reports a cancellation as nil; any other error is real.
+	return checker.RunContinuous(ctx)
 }
 
 // buildLocklessChunker constructs a multi-chunker covering every source

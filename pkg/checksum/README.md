@@ -35,7 +35,7 @@ The checksum package contains three implementations:
 
 1. **SingleChecker** - Compares two tables on the same MySQL server (for schema changes, or 1:1 moves)
 2. **DistributedChecker** - Compares a source table against multiple distributed target databases (for sharded scenarios)
-3. **LocklessChecker** - An optimistic verifier using ordinary reads and retries, with either a finite clean-pass gate (`RunUntilClean`) or repeated passes (`Run`). Used by `spirit sync`, experimental lockless migrations, and deferred-cutover verification when lockless mode is selected.
+3. **LocklessChecker** - An optimistic verifier using ordinary reads and retries. One checker serves both halves of the contract over the same pass loop: `Run` returns once a pass has verified the whole table, and `RunContinuous` keeps passing in the background. Used by `spirit sync`, experimental lockless migrations, and deferred-cutover verification when lockless mode is selected.
 
 `SingleChecker` and `DistributedChecker` take a brief table lock to establish a consistent `REPEATABLE READ` snapshot; `LocklessChecker` deliberately does not (see [Lockless checksum](#lockless-checksum) below).
 
@@ -45,18 +45,26 @@ All three use **CRC32 with XOR aggregation** for chunk comparison. The lockless 
 
 `NewChecker` returns a `Checker`: its finite `Run` succeeds only after verification
 completes. Set `CheckerConfig.Lockless` to select optimistic verification on a
-single server, leave it nil for the existing snapshot checkers. Supplying the
+single server, leave it false for the existing snapshot checkers. Supplying the
 distributed `Applier` and `Lockless` together is rejected.
 
-For lockless verification, common concurrency, autoscaling, throttler, metrics sink, and logger
-settings come from `CheckerConfig`; retry, splitting, and divergence policy come
-from its `Lockless` configuration. Set finite concurrency on `CheckerConfig`; a
-conflicting nonzero `Lockless.Concurrency` is rejected. Direct continuous callers
-set `LocklessCheckerConfig.Concurrency` instead. Snapshot settings (`FixDifferences`,
-`RepairApplier`, `MaxRetries`, and `YieldTimeout`) do not control lockless behavior.
-Migration explicitly selects fatal divergence; selecting the algorithm alone does
-not select a repair policy. Migration reuses the factory result through `Checker.RunContinuous`, which owns pacing, chunker resets, feed flushing, and safe
-cancellation. `ContinuousActive` reports whether a pass is running rather than
+Every algorithm is configured from the one `CheckerConfig`. The fields common to
+all of them (concurrency, autoscaling, throttler, metrics sink, logger,
+`MaxRetries`, `Watermark`) apply whichever is selected; the rest are documented
+with the algorithm they belong to, and are ignored by the others. `YieldTimeout`
+is snapshot-only — lockless reads are short by construction and hold no snapshot
+to yield — and the retry, splitting and pacing fields are lockless-only.
+
+Repair policy is **not** the caller's to set when going through the factory: `FixDifferences` selects it for both algorithms, so a caller does
+not have to know which one it picked to say whether a divergence should be healed
+or should abort. With `FixDifferences` set, the factory builds the same
+single-server repair path the snapshot checker uses (`RepairApplier` is then
+required) and a confirmed divergence is repaired; without it, a confirmed
+divergence returns `ErrPermanentDivergence`. Supplying `Recopier` or
+`DivergenceIsFatal` to the factory is rejected rather than silently overridden.
+`MaxRetries` bounds whole-run attempts for both. Migration reuses the factory
+result through `Checker.RunContinuous`, which owns pacing, chunker resets, feed
+flushing, and safe cancellation. `ContinuousActive` reports whether a pass is running rather than
 waiting for the next interval, so callers can report throttling accurately. Snapshot passes use the same configured repair/retry policy as the
 initial gate. Lockless passes retain their optimistic retry/defer behavior.
 
@@ -65,17 +73,30 @@ clean background pass. Copy progress is retained, but a restarted migration must
 repeat initial verification. This avoids interpreting a reset background walker
 or a cleared per-pass mismatch counter as resume evidence.
 
-Direct lockless callers such as datasync still use `NewLocklessChecker.Run`;
-they own their cross-server feed and repair-applier lifecycles.
+Cross-server callers such as datasync construct through `NewLocklessChecker` and
+drive `RunContinuous` directly. They own their feed and repair-applier
+lifecycles, including the feed's periodic flush — only a checker built by
+`NewChecker` starts and stops that itself — and they set `Recopier` and
+`DivergenceIsFatal` themselves, since there is no `FixDifferences` to derive them
+from.
 
 Callers open the chunker before construction unless supplying a nonempty
-`CheckerConfig.Watermark`. In that case the factory opens it: snapshot checkers
-restore verification progress, while lockless ignores the saved evidence and
-opens from the beginning. Persist `Checker.ResumeWatermark()`, never the chunker's traversal
-watermark. Snapshot checkers suppress evidence after differences; lockless returns
-an empty watermark because unresolved retries are not represented by traversal.
-This preserves safe migration resume but does **not** yet provide partial checksum
-resume for lockless verification.
+`CheckerConfig.Watermark`. In that case the factory opens it at that watermark,
+for every algorithm: a watermark means the prefix below it was read on both sides
+and observed equal, which is the same claim whichever checker observed it.
+
+Persist `Checker.ResumeWatermark()`, never the chunker's traversal watermark.
+Snapshot checkers suppress evidence after differences. Lockless verification has
+no equivalent gate and does not need one — optimistic reads mismatch routinely on
+a table taking writes and almost all of those resolve on retry, so gating on the
+mismatch counter would discard the watermark on essentially every real migration.
+What makes the prefix trustworthy instead is that a chunk is reported to the
+chunker only once it has resolved clean, so a chunk that was repaired, deferred
+as hot, or split parks the watermark below itself and a resumed run re-verifies
+from there. The published answer never moves backwards: a retried attempt, and
+the second pass within an attempt, both re-walk from the start of the table, and
+the further-along prefix stays valid because the change feed has been keeping it
+equal.
 
 `Checker.SetThrottler` is required for every finite implementation. Tests can use
 the shared `checksum.MockChecker`, whose throttler setter is a no-op and whose
@@ -172,9 +193,11 @@ Each pass logs a `checksum chunk size distribution` line (chunk count, duration 
 
 ## Lockless checksum
 
-`RunUntilClean` returns only after a complete pass with no repairs or deferred
-ranges. `Run` keeps checking until cancelled. Both use the same verification
-algorithm; how long the caller runs it does not change its correctness criteria.
+`Run` returns only after a complete pass with no repairs and no deferred ranges
+(retrying the whole run on transient failure; `RunUntilClean` is one such
+attempt). `RunContinuous` keeps checking until cancelled. All of them drive the
+same pass loop; how long the caller runs it does not change its correctness
+criteria.
 
 `LocklessChecker` verifies a target that is still converging toward the source over a live replication feed, so a first-attempt mismatch is *expected* (the target simply hasn't caught up yet) rather than alarming. It runs in **passes**: each pass walks every chunk once and then drains a delayed-retry queue until empty. A mismatched chunk is re-read after a short delay and passes once the target's CRC matches a source CRC the checker has witnessed. A chunk whose source keeps changing (a "hot chunk") cycles to the back of the queue without blocking the pass.
 
@@ -201,4 +224,6 @@ When a chunk's source CRC is stable across the retry window but the target still
   - `true` (e.g. `spirit migrate`'s deferred-cutover check): replication keeps the new table in sync, so a confirmed stable divergence is a real bug. `Run` returns `ErrPermanentDivergence` and the caller aborts the cutover. No `Recopier` is configured.
   - `false` (e.g. `spirit sync`): the target is expected to converge, so divergences self-heal via the `Recopier`. A `Recopier` is **required** in this mode; without one, divergence is treated as fatal.
 
-The two are decoupled: `DivergenceIsFatal: true` aborts even if a `Recopier` is supplied. Passes are paced by `MinPassInterval` so a small table is not re-checksummed back-to-back. `FirstCleanPass` exposes a channel that closes the first time a pass completes with every chunk read-verified equal and zero recopies — the signal that the target is known consistent.
+The two are decoupled: `DivergenceIsFatal: true` aborts even if a `Recopier` is supplied. Before either policy acts, the change feed is drained and the chunk re-read, so a target that was merely behind on applying buffered changes is not mistaken for a diverged one. On a confirmed divergence the checker logs a line per differing row (mismatched, missing on the target, missing on the source), the same diagnostic the snapshot checker emits.
+
+Passes are paced by `MinPassInterval` so a small table is not re-checksummed back-to-back; the finite gate substitutes `RetryDelay` for an unset interval rather than the continuous default, because a cut-over is waiting on the answer. `MaxPasses` bounds the finite gate: a range that never converges returns `ErrVerificationUnresolved` instead of keeping the caller in an endless re-walk with no error and no end. `FirstCleanPass` exposes a channel that closes the first time a pass completes with every chunk read-verified equal and zero recopies — the signal that the target is known consistent.
