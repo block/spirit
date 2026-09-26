@@ -28,7 +28,7 @@ type parkedEvent struct {
 // the real clients. Each call to VerifyRowAtNextChange consumes the scripted event whose
 // key the watch recognises — order-independent, because which row the settler
 // asks about first is map iteration order — and runs the feed's flush before
-// handing it to the verifier, in the order change.verifyRowAtNextChange does.
+// handing it to the verifier, in the order change.RowParker.Verify does.
 //
 // Scripting no event at all is the row that went quiet: nothing arrives and the
 // caller's budget ends the wait, which is the real shape of that case rather

@@ -79,8 +79,8 @@ type parkGate struct {
 }
 
 // park arms the gate. Calling it while already parked is a no-op, so a caller
-// that parks from inside a dispatch (see rowWaiter) cannot deadlock against one
-// parking from outside.
+// that parks from inside a dispatch (see ParkedRow.Release) cannot deadlock
+// against one parking from outside.
 func (g *parkGate) park() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -275,7 +275,7 @@ func flushParked(ctx context.Context, flush func(context.Context) error, allFlus
 // in the buffer), and nothing past the watched event may be admitted while the
 // target is read.
 //
-// The three built-in and out-of-tree Sources share this rather than each
+// The two built-in Sources and the out-of-tree ones share this rather than each
 // reimplementing it, because every one of those steps is a silent correctness
 // bug when it is out of order and none of them fails a test that uses a fake
 // feed. See the comment at the top of this file for what the mechanism is for.

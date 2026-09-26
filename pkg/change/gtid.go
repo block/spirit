@@ -1358,7 +1358,8 @@ func (c *gtidClient) SetWatermarkOptimization(ctx context.Context, newVal bool) 
 // armed verification (see park.go). All three steps are ordered, and each one
 // is wrong anywhere else:
 //
-//   - watchRow runs first, so a rewrite of the watched row is counted before it
+//   - RowParker.Watch runs first, so a rewrite of the watched row is counted
+//     before it
 //     can be buffered, and therefore before any flush could carry it;
 //   - the change is buffered next, so the flush the verification runs puts it on
 //     the target;
