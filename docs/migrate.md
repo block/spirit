@@ -150,11 +150,13 @@ Spirit uses the same configured checker in two phases:
 copy rows → initial checksum → wait on sentinel (continuous verification) → cutover
 ```
 
-By default both phases use the snapshot checker, including its brief setup locks, repair-and-reverify policy, configured thread count, throttling, and autoscaling. With [`--enable-experimental-lockless-checksum`](#enable-experimental-lockless-checksum), both phases use optimistic reads with hot-range splitting and bounded retries. Confirmed stable divergence is fatal in lockless mode. Background lockless passes may defer changing ranges; the initial gate must verify a complete clean pass.
+By default both phases use the snapshot checker, including its brief setup locks, repair-and-reverify policy, configured thread count, throttling, and autoscaling. With [`--enable-experimental-lockless-checksum`](#enable-experimental-lockless-checksum), both phases use optimistic reads with hot-range splitting and bounded retries. Repair policy is the same either way: a confirmed stable divergence is repaired from the source and re-verified on a later pass, and a range that never verifies clean fails the migration rather than cutting over. Background lockless passes may defer changing ranges; the initial gate must verify a complete clean pass.
 
 The first background pass starts one hour after continuous verification begins; subsequent passes start at least one hour apart. Replication continues flushing between passes. Continuous verification runs automatically whenever a sentinel causes Spirit to wait. While a pass is active, the status block includes checksum progress and reports load throttling. Interval waits are not reported as throttled.
 
 Once continuous verification starts, checksum resume progress is discarded. After an interruption, Spirit keeps its copy checkpoint but repeats the full initial checksum, even if background verification found no differences. Background walker positions are never treated as proof of completed verification.
+
+Before continuous verification starts, an interrupted *initial* checksum does resume from where it got to, under either algorithm. The persisted watermark covers only the prefix that was read on both sides and observed equal: a range that had to be repaired, or that was still unresolved, parks the watermark below itself so the resumed run re-verifies it.
 
 ### enable-experimental-lockless-checksum
 

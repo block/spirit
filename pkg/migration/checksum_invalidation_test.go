@@ -11,6 +11,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -167,21 +168,22 @@ func TestContinuousChecksumClearsCheckpointWatermark(t *testing.T) {
 	require.Empty(t, wm, "later dumps cannot resurrect the initial watermark")
 }
 
-// TestLocklessChecksumDivergenceClearsCheckpointWatermark is the E2E
-// version: a defer-cutover migration reaches the sentinel wait, a row in the
-// _new table is corrupted externally, the lockless checksum detects the
-// divergence and deliberately aborts the run — and the final on-disk
-// checkpoint state must carry NO checksum_watermark anywhere, so the
-// operator's re-run re-verifies the whole table instead of silently
-// resuming past the diverged chunk. (The LocklessChecker is configured
-// without a Recopier, so a confirmed divergence surfaces as
-// ErrPermanentDivergence and aborts rather than self-healing.)
+// TestLocklessChecksumRepairsDivergenceBeforeCutover is the E2E parity case: a
+// defer-cutover migration reaches the sentinel wait, a row in the _new table is
+// corrupted externally, and the lockless checksum detects the divergence,
+// repairs it from the source, re-verifies on the following pass, and lets the
+// migration complete. That is exactly what the default snapshot checker does;
+// the lockless checker used to abort the migration instead.
+//
+// The repaired range is never reported to the chunker, so no checksum_watermark
+// can be published from below it either — asserted here because the cost of
+// getting that wrong is a resumed run silently skipping the diverged chunk.
 //
 // Not parallel: it relies on the short lockless-checksum pacing / retry delay
 // set once in TestMain (checksum.LocklessMinPassInterval = 2s,
 // checksum.DefaultLocklessRetryDelay = 1s) so the divergence is detected and
-// confirmed promptly.
-func TestLocklessChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
+// repaired promptly.
+func TestLocklessChecksumRepairsDivergenceBeforeCutover(t *testing.T) {
 	tableName := "cont_chk_clear"
 	tt := testutils.NewTestTable(t, tableName, `CREATE TABLE cont_chk_clear (
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -199,32 +201,40 @@ func TestLocklessChecksumDivergenceClearsCheckpointWatermark(t *testing.T) {
 	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 
 	checkpointTable := utils.CheckpointTableName(tableName)
-	// Corrupt a row in the new table behind spirit's back. A subsequent
-	// lockless-checksum pass detects the divergence, confirms it on retry
-	// (source unchanged, target still wrong), and aborts the run rather than
-	// allowing cutover.
-	testutils.RunSQL(t, fmt.Sprintf("UPDATE `%s` SET val = 'corrupted' WHERE id = 1", utils.NewTableName(tableName)))
+	// Corrupt a row in the new table behind spirit's back, then let the
+	// migration proceed. A lockless-checksum pass detects the divergence,
+	// confirms it on retry (source unchanged, target still wrong) and repairs
+	// it; the next pass verifies clean and the cutover runs.
+	newTable := utils.NewTableName(tableName)
+	testutils.RunSQL(t, fmt.Sprintf("UPDATE `%s` SET val = 'corrupted' WHERE id = 1", newTable))
 
-	runErr := running.wait(t)
-	require.Error(t, runErr)
-	require.ErrorIs(t, runErr, checksum.ErrPermanentDivergence)
+	// Hold the sentinel until the background checksum has actually repaired the
+	// row, so the assertion below is about the repair and not about a cutover
+	// that raced it.
+	require.Eventually(t, func() bool {
+		var val string
+		if err := tt.DB.QueryRowContext(t.Context(),
+			"SELECT val FROM `"+newTable+"` WHERE id = 1").Scan(&val); err != nil {
+			return false
+		}
+		return val == "a"
+	}, 60*time.Second, 250*time.Millisecond, "the diverged row must be repaired from the source")
 
-	// The deliberate abort must leave a checkpoint (resume is allowed) ...
-	require.True(t, checkpointTableExists(t, m),
-		"checkpoint must be preserved so the operator can re-run")
-	var copierWM string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
-		"SELECT copier_watermark FROM `%s` ORDER BY id DESC LIMIT 1", checkpointTable)).Scan(&copierWM))
-	require.NotEmpty(t, copierWM, "copier_watermark must survive the abort")
-
-	// ... but the checkpoint must not still carry a checksum_watermark — both
-	// the suppression on dumps after the difference was recorded and the
-	// abort-path UPDATE keep the (single, REPLACE-overwritten) row blank.
+	// No checkpoint written from here on may carry a checksum_watermark: the
+	// diverged chunk is the first one, so nothing below it is verified.
 	var stale int
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
 		"SELECT COUNT(*) FROM `%s` WHERE checksum_watermark <> ''", checkpointTable)).Scan(&stale))
-	require.Zero(t, stale,
-		"no checkpoint row may carry a checksum_watermark after the lockless-checksum abort")
+	require.Zero(t, stale, "a repaired first chunk leaves no verified prefix to publish")
+
+	testutils.RunSQL(t, "DROP TABLE "+sentinel.TableName)
+	require.NoError(t, running.wait(t))
+
+	// The corruption was repaired from the source rather than cut over.
+	var val string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT val FROM `"+tableName+"` WHERE id = 1").Scan(&val))
+	require.Equal(t, "a", val)
 }
 
 // advanceRunnerToChecksumWatermarks seeds the runner's table and brings both

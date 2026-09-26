@@ -29,17 +29,18 @@
 //       newSrcCRC, increment consecutiveSrcChanged, re-enqueue at the tail
 //       with a fresh not-before of now+RetryDelay.
 //     - Else (newSrcCRC == originalSrcCRC, target still wrong) → stable
-//       divergence. With a Recopier configured (production case), invoke
-//       it to overwrite the chunk on the target from the source; on
-//       success the chunk counts as resolved for pass-completion purposes
-//       (in the per-pass "recopies" bucket), but the pass is no longer
-//       clean — the repaired rows were never observed equal, so they are
-//       re-verified by the next pass's fresh walk. Without a Recopier (or
-//       when DivergenceIsFatal is set) the divergence is fatal — but first,
-//       if a change feed is present, the checker drains it (Flush) and
-//       re-reads: a target merely behind on applying buffered changes (apply
-//       lag) reconciles here and passes, so only a mismatch that survives a
-//       full drain returns ErrPermanentDivergence.
+//       divergence. Before acting on it, if a change feed is present, the
+//       checker drains it (Flush) and re-reads: a target merely behind on
+//       applying buffered changes (apply lag) reconciles here and passes, so
+//       only a mismatch that survives a full drain is acted on at all. With a
+//       Recopier configured (production case), the checker then logs the
+//       differing rows and invokes it to overwrite the chunk on the target
+//       from the source; on success the chunk counts as resolved for
+//       pass-completion purposes (in the per-pass "recopies" bucket), but the
+//       pass is no longer clean — the repaired rows were never observed equal,
+//       so they are re-verified by the next pass's fresh walk. Without a
+//       Recopier (or when DivergenceIsFatal is set) it returns
+//       ErrPermanentDivergence.
 //
 // With SplitHotChunks, two successive source changes trigger subdivision.
 // Large ranges yield up to eleven children; mismatching descendants above 128
@@ -119,6 +120,17 @@ import (
 // observed them yet. The retry delay defaults to 1 minute for that reason.
 var ErrPermanentDivergence = errors.New("checksum: permanent divergence detected")
 
+// ErrVerificationUnresolved is returned by RunUntilClean when MaxPasses passes
+// have completed and none of them was clean — every pass still ended with
+// ranges that were repaired, or that were changing too fast to verify. Nothing
+// is proven about those ranges, so the caller must not cut over; but neither is
+// a divergence proven, so this is deliberately distinct from
+// ErrPermanentDivergence. It is the optimistic counterpart of
+// ErrDifferencesExhausted: a bound that makes the run terminate instead of
+// re-walking the table forever, which is what a continuously updated hot row
+// would otherwise cause (see the hot-row limitation in the package README).
+var ErrVerificationUnresolved = errors.New("checksum: verification did not converge within the pass budget")
+
 // Recopier knows how to overwrite a single chunk's worth of data on the
 // target from the source. It is invoked when the lockless checker's
 // retry path detects stable target divergence — i.e. the source CRC is
@@ -141,6 +153,13 @@ const (
 	// one. A deferred hot chunk makes the pass ineligible to be clean and is
 	// visited again from a fresh chunk walk on the next pass.
 	DefaultLocklessMaxHotAttempts = 10
+	// DefaultLocklessMaxPasses bounds RunUntilClean. Ten full walks is well
+	// past the point where a table that is going to converge has converged —
+	// the common case is one pass, and a repair costs one more — so reaching
+	// the bound means the table is not converging rather than that it needs
+	// longer. Only the finite gate is bounded; continuous Run passes forever
+	// by design.
+	DefaultLocklessMaxPasses = 10
 )
 
 const (
@@ -233,10 +252,19 @@ type LocklessCheckerConfig struct {
 	// (a pass that already ran longer than MinPassInterval incurs no extra
 	// wait). The very first pass always runs immediately. Zero means passes
 	// run back-to-back, which is convenient for tests but heavy in production:
-	// the migration and datasync runners both pass LocklessMinPassInterval
-	// (1h) so a small table whose pass finishes in seconds does not re-scan
-	// continuously. The wait honours context cancellation.
+	// continuous verification defaults to LocklessMinPassInterval (1h) so a
+	// small table whose pass finishes in seconds does not re-scan continuously.
+	// The finite gate defaults to RetryDelay instead — it only re-walks to
+	// re-verify what the previous pass repaired or deferred, and a cut-over is
+	// waiting on the answer. The wait honours context cancellation.
 	MinPassInterval time.Duration
+
+	// MaxPasses bounds RunUntilClean: once this many passes have completed
+	// without one of them being clean, it gives up with
+	// ErrVerificationUnresolved rather than walking the table again. Zero means
+	// unbounded, which is what continuous Run always is; NewChecker defaults
+	// the finite gate to DefaultLocklessMaxPasses.
+	MaxPasses int
 
 	Logger *slog.Logger
 }
@@ -452,6 +480,13 @@ type retryEntry struct {
 
 	// attempts counts completed observations and bounds hot retries.
 	attempts int
+
+	// readDuration and readRows are the fresh-walk read's cost and size. They
+	// travel with the entry so the chunker's sizing feedback still describes
+	// the initial read even though it is now delivered when the chunk
+	// resolves — see feedbackResolved.
+	readDuration time.Duration
+	readRows     uint64
 }
 
 // workItem is what the dispatcher hands to workers. isRetry distinguishes
@@ -471,6 +506,8 @@ type workItem struct {
 	originalTgt           chunkSig
 	consecutiveSrcChanged int
 	attempts              int
+	readDuration          time.Duration
+	readRows              uint64
 }
 
 // workResult is what workers send back to the dispatcher. The driver then
@@ -497,6 +534,11 @@ type workResult struct {
 	// the driver to populate a re-enqueued retryEntry on the hot-chunk path.
 	newSrc chunkSig
 	newTgt chunkSig
+
+	// readDuration is how long this read took, for the chunker's sizing
+	// feedback. Zero for a snapshot-drain result, which issues no aggregate
+	// read.
+	readDuration time.Duration
 
 	// permanent is true iff this is a retry that failed with the source
 	// CRC unchanged AND no Recopier is configured — i.e. real divergence
@@ -666,6 +708,10 @@ func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
 				c.nextPassAt = time.Time{}
 				c.statsMu.Unlock()
 			}
+			// Note that this discards the resume evidence published so far:
+			// ResumeWatermark reports the current walk's verified prefix, and
+			// the new pass has not verified anything yet. That is deliberate —
+			// see ResumeWatermark.
 			if err := c.chunker.Reset(); err != nil {
 				return fmt.Errorf("reset chunker for pass %d: %w", passNum, err)
 			}
@@ -739,6 +785,15 @@ func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
 		)
 		if untilClean && recopies == 0 && deferredHot == 0 {
 			return ctx.Err()
+		}
+		// Bound the finite gate. Without this a range that never converges —
+		// the continuously-updated hot row the algorithm cannot yet verify —
+		// keeps the caller in a full-table re-walk loop with no error and no
+		// end, which reads to an operator as a migration that has simply
+		// stopped making progress.
+		if untilClean && c.cfg.MaxPasses > 0 && passNum >= uint64(c.cfg.MaxPasses) {
+			return fmt.Errorf("%w: %d passes, last had %d repaired and %d unresolved range(s)",
+				ErrVerificationUnresolved, passNum, recopies, deferredHot)
 		}
 	}
 }
@@ -821,6 +876,8 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 						originalTgt:           e.originalTgt,
 						consecutiveSrcChanged: e.consecutiveSrcChanged,
 						attempts:              e.attempts,
+						readDuration:          e.readDuration,
+						readRows:              e.readRows,
 					}
 				}
 			}
@@ -1108,15 +1165,11 @@ func (c *LocklessChecker) executeWork(ctx context.Context, item *workItem) *work
 	newTgt := chunkSig{crc: tgtCRC, count: tgtCount}
 	res.newSrc = newSrc
 	res.newTgt = newTgt
-
-	// Feed chunker stats for fresh-walk reads so chunk sizing adapts. We
-	// deliberately skip retry reads — they re-evaluate the same chunk and
-	// would skew the feedback signal toward the slower retry path. Time is
-	// measured by the worker (not the dispatcher) so we time the actual
-	// read, not the queue wait.
-	if !item.isRetry && item.splitDepth == 0 {
-		c.chunker.Feedback(item.chunk, time.Since(start), tgtCount)
-	}
+	// Time is measured by the worker (not the dispatcher) so we time the actual
+	// read, not the queue wait. The dispatcher decides what to do with it: only
+	// the fresh-walk read of a walked chunk feeds the chunker, and only once
+	// that chunk has resolved (see feedbackResolved).
+	res.readDuration = time.Since(start)
 
 	// Compare the full signatures (CRC AND row count), not the CRC alone.
 	// A row-count mismatch is treated identically to a checksum mismatch:
@@ -1160,41 +1213,17 @@ func (c *LocklessChecker) executeWork(ctx context.Context, item *workItem) *work
 		return res
 	}
 
-	// Source unchanged, target still wrong → stable divergence. Self-heal by
-	// recopying the chunk when a Recopier is configured and the caller has not
-	// declared divergence fatal; otherwise surface ErrPermanentDivergence so the
-	// caller (e.g. migration's cutover gate) aborts.
-	if c.cfg.Recopier != nil && !c.cfg.DivergenceIsFatal {
-		if err := c.cfg.Recopier.Recopy(ctx, item.chunk); err != nil {
-			res.err = fmt.Errorf("recopy chunk %s: %w", item.chunk.String(), err)
-			return res
-		}
-		// The Recopier already logs the user-facing "chunk recopied" line
-		// (with row count + elapsed). Add a Debug companion with the CRC +
-		// count + attempt context that the recopier doesn't see.
-		c.cfg.Logger.Debug("lockless checksum: recopy completed",
-			"chunk", item.chunk.String(),
-			"sourceCRC", srcCRC,
-			"targetCRC", tgtCRC,
-			"sourceCount", srcCount,
-			"targetCount", tgtCount,
-			"attempts_before_recopy", item.attempts+1,
-		)
-		res.passed = true
-		res.recopied = true
-		return res
-	}
-
-	// Fatal-divergence path (no Recopier, or DivergenceIsFatal — e.g. the
-	// migration cutover gate). Before declaring a permanent divergence, drain
-	// the change feed and re-read the chunk. A target that is merely behind on
-	// applying buffered changes (apply lag) would otherwise be misclassified as
-	// divergence and abort the cutover — even though the cutover's own
-	// FlushUnderTableLock reconciles exactly that lag moments later. Draining
-	// here performs the same reconciliation before we judge, so only a mismatch
-	// that survives a full drain (with the source still unchanged) is treated as
-	// real. The feed is advisory and may be nil for library callers; with
-	// nothing to drain, the mismatch is taken at face value.
+	// Source unchanged, target still wrong → stable divergence.
+	//
+	// Before acting on it, drain the change feed and re-read the chunk. A target
+	// that is merely behind on applying buffered changes (apply lag) would
+	// otherwise be misclassified — as a divergence that aborts the cutover, even
+	// though the cutover's own FlushUnderTableLock reconciles exactly that lag
+	// moments later, or as one that costs a needless recopy. Draining here
+	// performs the same reconciliation before we judge, so only a mismatch that
+	// survives a full drain (with the source still unchanged) is acted on at
+	// all. The feed is advisory and may be nil for library callers; with nothing
+	// to drain, the mismatch is taken at face value.
 	if c.feed != nil {
 		if flushErr := c.feed.Flush(ctx); flushErr != nil {
 			res.err = fmt.Errorf("drain change feed before divergence verdict for chunk %s: %w", item.chunk.String(), flushErr)
@@ -1230,8 +1259,61 @@ func (c *LocklessChecker) executeWork(ctx context.Context, item *workItem) *work
 		// Source still unchanged and target still wrong after a full drain →
 		// genuine divergence. Fall through.
 	}
+
+	// Confirmed stable divergence. Self-heal by recopying the chunk when a
+	// Recopier is configured and the caller has not declared divergence fatal;
+	// otherwise surface ErrPermanentDivergence so the caller (a library user
+	// running a read-only verification) sees it as an error.
+	if c.cfg.Recopier != nil && !c.cfg.DivergenceIsFatal {
+		c.logRowDifferences(ctx, item.chunk, "recopying diverged chunk")
+		if err := c.cfg.Recopier.Recopy(ctx, item.chunk); err != nil {
+			res.err = fmt.Errorf("recopy chunk %s: %w", item.chunk.String(), err)
+			return res
+		}
+		// The Recopier already logs the user-facing "chunk recopied" line
+		// (with row count + elapsed). Add a Debug companion with the CRC +
+		// count + attempt context that the recopier doesn't see.
+		c.cfg.Logger.Debug("lockless checksum: recopy completed",
+			"chunk", item.chunk.String(),
+			"sourceCRC", newSrc.crc,
+			"targetCRC", newTgt.crc,
+			"sourceCount", newSrc.count,
+			"targetCount", newTgt.count,
+			"attempts_before_recopy", item.attempts+1,
+		)
+		res.passed = true
+		res.recopied = true
+		return res
+	}
+
+	c.logRowDifferences(ctx, item.chunk, "chunk has diverged")
 	res.permanent = true
 	return res
+}
+
+// logRowDifferences logs one line per diverged row in the chunk, so an operator
+// sees *which* rows are wrong and not merely that a range is. The snapshot
+// checker does the same thing before it repairs or fails (see
+// SingleChecker.inspectDifferences) and the two share an implementation.
+//
+// Best-effort and diagnostic only: the verdict has already been reached, so an
+// inspection that itself fails is logged and dropped rather than turned into
+// the error the caller sees.
+//
+// Unlike the snapshot checker's call, this read is not inside any snapshot, so
+// rows that are merely changing concurrently can be reported. That is log noise
+// on a path that only runs after a change-feed drain proved the range stable.
+func (c *LocklessChecker) logRowDifferences(ctx context.Context, chunk *table.Chunk, reason string) {
+	c.cfg.Logger.Info("inspecting differences for chunk", "chunk", chunk.String(), "reason", reason)
+	if c.sourceDB != c.targetDB {
+		// Cross-server (`spirit sync`): the inspector compares both sides
+		// within one query session, which does not exist across two servers.
+		// The aggregate mismatch has already been logged by the caller.
+		return
+	}
+	if err := inspectDifferences(ctx, c.sourceDB, chunk, c.cfg.Logger); err != nil {
+		c.cfg.Logger.Warn("failed to inspect row differences", "chunk", chunk.String(), "error", err)
+	}
 }
 
 // handleResult applies pass/retry policy in the dispatcher goroutine. enqueueRetry
@@ -1262,6 +1344,9 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 	if res.passed {
 		c.chunksPassedThisPass.Add(1)
 		c.bucketPassed(res.item, res.recopied)
+		if !res.recopied {
+			c.feedbackResolved(res)
+		}
 		return nil
 	}
 	if res.deferHot {
@@ -1282,6 +1367,7 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 	if res.snapshot != nil {
 		return enqueueRetry(&retryEntry{chunk: res.item.chunk, snapshot: res.snapshot, splitBudget: res.item.splitBudget,
 			splitDepth: res.item.splitDepth, point: res.item.point, attempts: res.item.attempts + 1,
+			readDuration: res.item.readDuration, readRows: res.item.readRows,
 			consecutiveSrcChanged: max(2, res.item.consecutiveSrcChanged), notBefore: time.Now().Add(c.cfg.RetryDelay)})
 	}
 	if res.permanent {
@@ -1314,14 +1400,16 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 			"targetCount", res.newTgt.count,
 		)
 		return enqueueRetry(&retryEntry{
-			chunk:       res.item.chunk,
-			splitDepth:  res.item.splitDepth,
-			splitBudget: res.item.splitBudget,
-			point:       res.item.point,
-			originalSrc: res.newSrc,
-			originalTgt: res.newTgt,
-			notBefore:   time.Now().Add(c.cfg.RetryDelay),
-			attempts:    1,
+			chunk:        res.item.chunk,
+			splitDepth:   res.item.splitDepth,
+			splitBudget:  res.item.splitBudget,
+			point:        res.item.point,
+			originalSrc:  res.newSrc,
+			originalTgt:  res.newTgt,
+			notBefore:    time.Now().Add(c.cfg.RetryDelay),
+			attempts:     1,
+			readDuration: res.readDuration,
+			readRows:     res.newTgt.count,
 		})
 	}
 
@@ -1349,7 +1437,58 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 		notBefore:             time.Now().Add(c.cfg.RetryDelay),
 		consecutiveSrcChanged: newConsecutive,
 		attempts:              res.item.attempts + 1,
+		readDuration:          res.item.readDuration,
+		readRows:              res.item.readRows,
 	})
+}
+
+// feedbackResolved reports a resolved chunk to the chunker. It is the hinge the
+// resume watermark hangs on: the chunker's watermark tracker advances over the
+// contiguous prefix of chunks it has been given feedback for, so reporting a
+// chunk only once it has been READ-verified makes chunker.GetLowWatermark()
+// mean "every row below here was observed equal", which is exactly the evidence
+// a resumed run may skip. A chunk that was repaired, deferred as hot, or split
+// is deliberately never reported, so the watermark stops below it and a resume
+// re-verifies from there. (Reporting at read time, as this did before, advanced
+// the watermark over chunks that were still queued for retry.)
+//
+// Only walked chunks are reported. Split children are synthetic ranges the
+// chunker never handed out, and feeding them back would corrupt its
+// bookkeeping; splitting therefore parks the watermark at the parent, which is
+// the conservative answer.
+//
+// The duration and row count are the fresh-walk read's, carried on the entry,
+// so chunk sizing still sees the initial read rather than the slower retry
+// path — just delivered later.
+func (c *LocklessChecker) feedbackResolved(res *workResult) {
+	if res.item.splitDepth != 0 {
+		return
+	}
+	duration, rows := res.item.readDuration, res.item.readRows
+	if duration == 0 {
+		duration, rows = res.readDuration, res.newTgt.count
+	}
+	c.chunker.Feedback(res.item.chunk, duration, rows)
+}
+
+// ResumeWatermark returns the verified-clean prefix of the table for the walk
+// now in progress: every row below it was read on both sides and observed
+// equal, so a resumed run may start there instead of at the beginning. It is
+// the direct consequence of feedbackResolved — see that method for why the
+// chunker's low watermark carries this meaning at all.
+//
+// A second pass resets the chunker and so resets this to nothing. The prefix
+// the first pass verified is deliberately not carried over: the second pass
+// exists because the first one repaired or deferred something, and if it now
+// fails to re-verify a range the first pass verified, that range stopped being
+// equal — exactly the case where reporting the older, further-along answer
+// would let a resume skip the damage.
+//
+// A watermark that is not yet available (no chunk has resolved) surfaces as
+// table.ErrWatermarkNotReady from the chunker, which the caller treats as
+// "nothing to persist".
+func (c *LocklessChecker) ResumeWatermark() (string, error) {
+	return c.chunker.GetLowWatermark()
 }
 
 // bucketPassed records a passed chunk into the per-pass attempts histogram.

@@ -42,19 +42,24 @@ func TestFactoryVerificationResume(t *testing.T) {
 			case "distributed":
 				cfg.Applier = &spyApplier{}
 			case "lockless":
-				cfg.Lockless = &LocklessCheckerConfig{DivergenceIsFatal: true}
+				cfg.Lockless = &LocklessCheckerConfig{}
 			}
 			checker, err := NewChecker([]*sql.DB{{}}, chunker, []change.Source{&fakeFeed{}}, cfg)
 			require.NoError(t, err)
 			wm, err := checker.ResumeWatermark()
 			require.NoError(t, err)
-			if mode == "lockless" {
-				require.Empty(t, chunker.opened, "snapshot evidence must not skip optimistic verification")
-				require.Empty(t, wm)
-				return
-			}
+			// Saved evidence is honoured by every algorithm: a watermark means
+			// the prefix below it was observed equal, whichever checker
+			// observed it.
 			require.Equal(t, "saved-prefix", chunker.opened)
 			require.Equal(t, "verified-prefix", wm)
+			if mode == "lockless" {
+				// Optimistic verification has no per-attempt difference counter
+				// to invalidate evidence with; what keeps the watermark honest
+				// is that a repaired chunk is never fed back at all. See
+				// TestLocklessRepairParksResumeWatermark.
+				return
+			}
 			switch c := checker.(type) {
 			case *SingleChecker:
 				c.differencesFound.Add(1)
@@ -74,14 +79,17 @@ func TestFactoryLocklessConfigAndLifecycle(t *testing.T) {
 	cfg := NewCheckerDefaultConfig()
 	cfg.Concurrency = 2
 	cfg.Autoscale = AutoscaleConfig{MaxThreads: 3}
-	options := &LocklessCheckerConfig{SplitHotChunks: true, SnapshotHotChunks: true, DivergenceIsFatal: true}
+	options := &LocklessCheckerConfig{SplitHotChunks: true, SnapshotHotChunks: true}
 	cfg.Lockless = options
 	checker, err := NewChecker([]*sql.DB{{}}, chunker, []change.Source{feed}, cfg)
 	require.NoError(t, err)
 	finite := checker.(*locklessChecker)
 	require.Equal(t, 2, finite.cfg.Concurrency)
 	require.Equal(t, cfg.Autoscale, finite.cfg.Autoscale)
+	// FixDifferences was not set, so a confirmed divergence is an error rather
+	// than something to repair, and no Recopier was built.
 	require.True(t, finite.cfg.DivergenceIsFatal)
+	require.Nil(t, finite.cfg.Recopier)
 	require.True(t, finite.cfg.SplitHotChunks)
 	require.True(t, finite.cfg.SnapshotHotChunks)
 	require.Zero(t, options.Concurrency, "factory must not mutate supplied lockless policy")
@@ -97,6 +105,43 @@ func TestFactoryLocklessConfigAndLifecycle(t *testing.T) {
 	require.Equal(t, 1, chunker.resets)
 	require.Equal(t, 2, feed.starts)
 	require.Equal(t, feed.starts, feed.stops)
+}
+
+// Repair policy is derived from FixDifferences, not configured on the lockless
+// options, so both checkers answer a divergence the same way. Supplying either
+// of the two derived fields is rejected rather than silently overridden.
+func TestFactoryDerivesLocklessRepairPolicy(t *testing.T) {
+	newCfg := func() *CheckerConfig {
+		cfg := NewCheckerDefaultConfig()
+		cfg.Lockless = &LocklessCheckerConfig{}
+		return cfg
+	}
+
+	cfg := newCfg()
+	cfg.FixDifferences = true
+	cfg.RepairApplier = &spyApplier{}
+	checker, err := NewChecker([]*sql.DB{{}}, newTestChunker(0), []change.Source{&fakeFeed{}}, cfg)
+	require.NoError(t, err)
+	finite := checker.(*locklessChecker)
+	require.False(t, finite.cfg.DivergenceIsFatal)
+	require.NotNil(t, finite.cfg.Recopier)
+	require.Positive(t, finite.cfg.MaxPasses, "the until-clean loop must be bounded")
+
+	cfg = newCfg()
+	cfg.FixDifferences = true
+	_, err = NewChecker([]*sql.DB{{}}, newTestChunker(0), []change.Source{&fakeFeed{}}, cfg)
+	require.ErrorContains(t, err, "repair applier must be non-nil")
+
+	for _, field := range []string{"recopier", "fatal"} {
+		cfg = newCfg()
+		if field == "recopier" {
+			cfg.Lockless.Recopier = &fakeRecopier{}
+		} else {
+			cfg.Lockless.DivergenceIsFatal = true
+		}
+		_, err = NewChecker([]*sql.DB{{}}, newTestChunker(0), []change.Source{&fakeFeed{}}, cfg)
+		require.ErrorContains(t, err, "owned by the factory")
+	}
 }
 
 func TestFactoryRejectsUnsupportedLocklessTopology(t *testing.T) {
@@ -160,7 +205,7 @@ func TestFactoryResumeWithoutChildWatermarks(t *testing.T) {
 			cfg.Watermark = "{}"
 			cfg.RepairApplier = &spyApplier{}
 			if optimistic {
-				cfg.Lockless = &LocklessCheckerConfig{DivergenceIsFatal: true}
+				cfg.Lockless = &LocklessCheckerConfig{}
 			}
 			_, err := NewChecker([]*sql.DB{{}}, chunker, []change.Source{&fakeFeed{}}, cfg)
 			require.NoError(t, err)

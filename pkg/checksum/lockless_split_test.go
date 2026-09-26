@@ -151,7 +151,8 @@ func TestLocklessHotSplit(t *testing.T) {
 				}
 			}
 			chunker.mu.Lock()
-			require.Len(t, chunker.feedback, 1, "child feedback must not inflate walk progress")
+			require.Empty(t, chunker.feedback,
+				"a split parent never resolves as itself, and its synthetic children were never handed out by the chunker")
 			chunker.mu.Unlock()
 		})
 	}

@@ -229,10 +229,12 @@ func StatusSuffix(c Checker) string {
 
 type CheckerConfig struct {
 	// Lockless selects finite optimistic verification on one server. Common
-	// concurrency, throttling, autoscaling and logging fields below apply;
-	// retry/splitting and divergence policy come from this configuration.
-	// Snapshot repair and yield settings do not apply. Watermark is ignored
-	// until optimistic verification supports durable resume evidence.
+	// concurrency, throttling, autoscaling and logging fields below apply, and
+	// so do FixDifferences, RepairApplier, MaxRetries and Watermark — see each
+	// field. Retry and splitting policy come from this configuration; repair
+	// policy does not (Recopier and DivergenceIsFatal are derived from
+	// FixDifferences and are rejected here). YieldTimeout does not apply:
+	// optimistic reads hold no snapshot to yield.
 	Lockless    *LocklessCheckerConfig
 	Concurrency int
 	// TargetChunkTime is reporting-only: it is the target the chunk-size
@@ -244,9 +246,18 @@ type CheckerConfig struct {
 	DBConfig        *dbconn.DBConfig
 	Logger          *slog.Logger
 	FixDifferences  bool
-	Watermark       string // optional verification watermark; leave the chunker unopened when supplying it
-	MaxRetries      int
-	Applier         applier.Applier // optional; indicates it is a distributed checker
+	// Watermark is verification evidence from a previous run: every row below
+	// it was read on both sides and observed equal. Supplying it makes the
+	// factory open the chunker there, so verification resumes rather than
+	// restarting; leave the chunker unopened when supplying it. Every algorithm
+	// honours it — the claim it encodes does not depend on which checker
+	// observed it. Take it from Checker.ResumeWatermark, never from the
+	// chunker's traversal watermark.
+	Watermark string
+	// MaxRetries bounds whole-run attempts for every algorithm: a transient
+	// infrastructure failure costs an attempt rather than the migration.
+	MaxRetries int
+	Applier    applier.Applier // optional; indicates it is a distributed checker
 	// RepairApplier is the write path the single-server checker rewrites a
 	// mismatched chunk through (see SingleChecker.replaceChunk). Required for
 	// that checker, whether or not FixDifferences is set — a checker that cannot
@@ -300,6 +311,12 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 	if chunker == nil {
 		return nil, errors.New("chunker must be non-nil")
 	}
+	if config.DBConfig == nil {
+		return nil, errors.New("dbconfig must be non-nil")
+	}
+	if config.MaxRetries == 0 {
+		config.MaxRetries = 3
+	}
 	if config.Lockless != nil {
 		if len(sourceDBs) != 1 || len(feeds) != 1 || config.Applier != nil {
 			return nil, errors.New("lockless verification requires one source, one feed, and no distributed applier")
@@ -310,10 +327,17 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		if config.Lockless.Concurrency != 0 && config.Lockless.Concurrency != config.Concurrency {
 			return nil, errors.New("Lockless.Concurrency conflicts with CheckerConfig.Concurrency; configure finite checker concurrency on CheckerConfig")
 		}
-		// Snapshot watermarks cannot represent pending optimistic retries.
-		// A resumed optimistic checker opens the whole range instead.
+		if config.Lockless.Recopier != nil || config.Lockless.DivergenceIsFatal {
+			return nil, errors.New("Lockless.Recopier and Lockless.DivergenceIsFatal are owned by the factory; select repairs with CheckerConfig.FixDifferences")
+		}
+		// A watermark is verification evidence, whichever algorithm produced
+		// it: every row below it was observed equal and the change feed has
+		// kept it that way since. Optimistic verification only publishes one
+		// for a prefix it has actually resolved (see locklessChecker.
+		// ResumeWatermark), so resuming at it is the same trade the snapshot
+		// checkers make.
 		if config.Watermark != "" {
-			if err := chunker.Open(); err != nil {
+			if err := chunker.OpenAtWatermark(config.Watermark); err != nil {
 				return nil, err
 			}
 		}
@@ -321,13 +345,30 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		cfg.Concurrency, cfg.Autoscale = config.Concurrency, config.Autoscale
 		cfg.Throttler, cfg.Logger = loadOnlyThrottler(config.Throttler), config.Logger
 		cfg.MetricsSink = config.MetricsSink
-		return &locklessChecker{db: sourceDBs[0], chunker: chunker, feed: feeds[0], cfg: cfg}, nil
-	}
-	if config.DBConfig == nil {
-		return nil, errors.New("dbconfig must be non-nil")
-	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = 3
+		// Repair policy comes from the same field for both algorithms, so a
+		// caller does not have to know which one it selected to say whether a
+		// divergence should be healed or should abort. FixDifferences is what
+		// the migration runner sets; datasync configures its cross-server
+		// Recopier through NewLocklessChecker instead.
+		if config.FixDifferences {
+			if config.RepairApplier == nil {
+				return nil, errors.New("repair applier must be non-nil")
+			}
+			cfg.Recopier = newChunkRepairer(sourceDBs[0], config.RepairApplier, config.DBConfig, config.Logger)
+			cfg.DivergenceIsFatal = false
+		} else {
+			cfg.DivergenceIsFatal = true
+		}
+		if cfg.MaxPasses == 0 {
+			cfg.MaxPasses = DefaultLocklessMaxPasses
+		}
+		return &locklessChecker{
+			db:         sourceDBs[0],
+			chunker:    chunker,
+			feed:       feeds[0],
+			cfg:        cfg,
+			maxRetries: config.MaxRetries,
+		}, nil
 	}
 	if config.YieldTimeout == 0 {
 		config.YieldTimeout = DefaultYieldTimeout
@@ -372,6 +413,7 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		return nil, errors.New("repair applier must be non-nil")
 	}
 	return &SingleChecker{
+		repairer:        newChunkRepairer(sourceDBs[0], config.RepairApplier, config.DBConfig, config.Logger),
 		concurrency:     concurrency,
 		maxConcurrency:  maxConcurrency,
 		autoscale:       config.Autoscale.Enabled,
@@ -385,7 +427,6 @@ func NewChecker(sourceDBs []*sql.DB, chunker table.Chunker, feeds []change.Sourc
 		logger:          config.Logger,
 		fixDifferences:  config.FixDifferences,
 		maxRetries:      config.MaxRetries,
-		repairApplier:   config.RepairApplier,
 		yieldTimeout:    config.YieldTimeout,
 	}, nil
 }
