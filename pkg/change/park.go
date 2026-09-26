@@ -262,7 +262,11 @@ func flushParked(ctx context.Context, flush func(context.Context) error, allFlus
 //	dispatch:     row := p.Watch(tbl, key, image, deleted)
 //	              sub.HasChanged(key, image, deleted)
 //	              row.Release()
-//	the method:   return p.Verify(ctx, watch, verify, drain, p.AllChangesFlushed)
+//	the method:   return p.Verify(ctx, watch, verify, s.drain, s.AllChangesFlushed)
+//
+// The last two arguments are the Source's own, not the parker's: the drain is
+// its inner flush (not its exported Flush — see Verify), and allFlushed is its
+// report of whether that drain landed everything.
 //
 // That ordering is the whole contract, which is why it lives here and not in
 // each Source: the watch must see the change before it is buffered (so the
