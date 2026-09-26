@@ -68,7 +68,13 @@ syntax. Forking lets us:
   REPLACE), and the spatial constructors (`linestring()`, `polygon()`,
   `multipoint()`, ...) parse as function calls in every expression
   context — as keyword tokens they previously only worked as column
-  types (block/spirit#1128).
+  types (block/spirit#1128). Quoted string literals restore as valid,
+  single-line MySQL literals with the same value: `RestoreCtx.WriteString`
+  backslash-escapes `\`, NUL, LF, CR, and SUB whenever a quoting flag is
+  set (upstream only doubles the quote character, so `'a\\b'` restored
+  as `'a\b'` and a COMMENT containing a newline restored across two
+  lines). `RestoreStringEscapeBackslash` now only affects unquoted
+  output.
 
 The AST (`ast` package), `format` restore machinery, `charset`, `mysql`
 constants, `opcode`, and `types` packages keep their upstream shapes, so

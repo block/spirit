@@ -399,20 +399,49 @@ func (ctx *RestoreCtx) WriteKeyWord(keyWord string) {
 	_, _ = ctx.In.WriteString(keyWord)
 }
 
+// quotedStringEscaper escapes the characters that MySQL cannot take
+// literally inside a quoted string. It is the same set mysql_real_escape_string
+// handles, minus the quote characters, which WriteString doubles instead:
+// a backslash (otherwise the following character is re-interpreted as an
+// escape sequence) and the control characters NUL, LF, CR, and SUB.
+//
+// The value of a string literal is already unescaped once it is in the AST, so
+// emitting it raw would produce a literal with a different value (`'a\\b'`
+// parses to a\b and would be restored as `'a\b'`, which MySQL reads as
+// a<BACKSPACE>) or a statement that spans several lines (a COMMENT containing
+// a newline). Callers that execute the restored SQL line-by-line, or diff it,
+// need every literal restored as a single-line, value-preserving token.
+var quotedStringEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	"\x00", `\0`,
+	"\n", `\n`,
+	"\r", `\r`,
+	"\x1a", `\Z`,
+)
+
 // WriteString writes the string into writer
 // `str` may be wrapped in quotes and escaped according to RestoreFlags.
+//
+// When a quoting flag is set the string is always emitted as a valid MySQL
+// literal with the same value: backslashes and control characters are
+// backslash-escaped (see quotedStringEscaper) and the quote character is
+// doubled. RestoreStringEscapeBackslash only matters for unquoted output,
+// where it doubles backslashes and nothing else.
 func (ctx *RestoreCtx) WriteString(str string) {
-	if ctx.Flags.HasStringEscapeBackslashFlag() {
-		str = strings.ReplaceAll(str, `\`, `\\`)
-	}
 	quotes := ""
 	switch {
 	case ctx.Flags.HasStringSingleQuotesFlag():
+		str = quotedStringEscaper.Replace(str)
 		str = strings.ReplaceAll(str, `'`, `''`)
 		quotes = `'`
 	case ctx.Flags.HasStringDoubleQuotesFlag():
+		str = quotedStringEscaper.Replace(str)
 		str = strings.ReplaceAll(str, `"`, `""`)
 		quotes = `"`
+	default:
+		if ctx.Flags.HasStringEscapeBackslashFlag() {
+			str = strings.ReplaceAll(str, `\`, `\\`)
+		}
 	}
 	_, _ = ctx.In.WriteString(quotes)
 	_, _ = ctx.In.WriteString(str)

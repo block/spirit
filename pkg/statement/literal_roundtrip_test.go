@@ -6,6 +6,7 @@ import (
 
 	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -158,6 +159,71 @@ func TestRoundTrip_CommentQuotedString(t *testing.T) {
 		"CREATE TABLE rt (id INT PRIMARY KEY, c VARCHAR(20) COMMENT 'x''y')")
 
 	require.Equal(t, "x'y", columnComment(t, db, "rt", "c"))
+}
+
+// TestRoundTrip_NewTableControlCharsAndBackslashes covers the new-table path
+// (`spirit diff` on a table that does not exist yet): the desired CREATE is
+// parsed, restored via ToTableSchema, and emitted verbatim by
+// DeclarativeToImperative. The emitted CREATE must be a single line — callers
+// such as Misk execute schema files line-by-line — and MySQL must store the
+// literals with their original values: a newline in the COMMENT, a backslash
+// in the DEFAULT. It then converges against the live table.
+func TestRoundTrip_NewTableControlCharsAndBackslashes(t *testing.T) {
+	db := openScratch(t)
+	_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt") })
+
+	desired, err := ParseCreateTable(`CREATE TABLE rt (id INT PRIMARY KEY, c VARCHAR(20) DEFAULT 'a\\b' COMMENT 'line one\nline two')`)
+	require.NoError(t, err)
+	ts, err := desired.ToTableSchema()
+	require.NoError(t, err)
+
+	stmts, err := DeclarativeToImperative(nil, []table.TableSchema{ts}, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.True(t, stmts[0].IsCreateTable())
+	require.NotContains(t, stmts[0].Statement, "\n", "emitted CREATE must be a single line")
+
+	_, err = db.ExecContext(t.Context(), stmts[0].Statement)
+	require.NoError(t, err, "emitted CREATE failed to apply: %s", stmts[0].Statement)
+
+	require.Equal(t, "line one\nline two", columnComment(t, db, "rt", "c"))
+	stored, ok := columnDefault(t, db, "rt", "c")
+	require.True(t, ok)
+	require.Equal(t, `a\b`, stored)
+
+	live, err := ParseCreateTable(showCreate(t, db, "rt"))
+	require.NoError(t, err)
+	converge, err := live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Nil(t, converge, "expected convergence (nil diff) after creating; got: %+v", converge)
+}
+
+// TestRoundTrip_AlterClauseControlCharsAndBackslashes covers the imperative
+// path: `spirit migrate` executes the ALTER clause that New() restores from the
+// AST, not the user's original text, so the restored literals must keep their
+// values when MySQL applies them.
+func TestRoundTrip_AlterClauseControlCharsAndBackslashes(t *testing.T) {
+	db := openScratch(t)
+	_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE rt (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS rt") })
+
+	stmts, err := New(`ALTER TABLE rt ADD COLUMN c VARCHAR(20) DEFAULT 'a\\b' COMMENT 'line one\nline two'`)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.NotContains(t, stmts[0].Alter, "\n", "restored ALTER clause must be a single line")
+
+	_, err = db.ExecContext(t.Context(), "ALTER TABLE rt "+stmts[0].Alter)
+	require.NoError(t, err, "restored ALTER failed to apply: %s", stmts[0].Alter)
+
+	require.Equal(t, "line one\nline two", columnComment(t, db, "rt", "c"))
+	stored, ok := columnDefault(t, db, "rt", "c")
+	require.True(t, ok)
+	require.Equal(t, `a\b`, stored)
 }
 
 // TestRoundTrip_KeywordLikeStringDefault verifies that a string literal that

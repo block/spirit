@@ -289,3 +289,39 @@ func TestToTableSchema(t *testing.T) {
 	require.Contains(t, ts.Schema, "id")
 	require.Contains(t, ts.Schema, "name")
 }
+
+// A restored CREATE TABLE must be one line and keep every literal's value.
+// Before the fix a newline inside a COMMENT was emitted raw (so a consumer that
+// executes the schema line-by-line split the statement mid-literal) and a
+// backslash inside a DEFAULT was emitted unescaped (so 'a\\b' came back as
+// 'a\b', which MySQL reads as a<BACKSPACE>).
+func TestToTableSchema_EscapesControlCharsAndBackslashes(t *testing.T) {
+	ct, err := ParseCreateTable("CREATE TABLE t1 (" +
+		"id INT PRIMARY KEY, " +
+		`c VARCHAR(20) DEFAULT 'a\\b' COMMENT 'line one\nline two', ` +
+		"KEY idx_c (c) COMMENT 'idx\\rcomment'" +
+		") COMMENT 'tbl\\ncomment'")
+	require.NoError(t, err)
+
+	ts, err := ct.ToTableSchema()
+	require.NoError(t, err)
+	require.NotContains(t, ts.Schema, "\n", "restored schema must be a single line")
+	require.NotContains(t, ts.Schema, "\r", "restored schema must be a single line")
+	require.Contains(t, ts.Schema, `'a\\b'`)
+	require.Contains(t, ts.Schema, `'line one\nline two'`)
+	require.Contains(t, ts.Schema, `'idx\rcomment'`)
+	require.Contains(t, ts.Schema, `'tbl\ncomment'`)
+
+	// The escaped form parses back to the same values...
+	again, err := ParseCreateTable(ts.Schema)
+	require.NoError(t, err)
+	require.Equal(t, `a\b`, *again.Columns[1].Default)
+	require.Equal(t, "line one\nline two", *again.Columns[1].Comment)
+	require.Equal(t, "idx\rcomment", *again.Indexes[0].Comment)
+	require.Equal(t, "tbl\ncomment", *again.TableOptions.Comment)
+
+	// ...so a re-diff of the two is a no-op.
+	diff, err := ct.Diff(again, nil)
+	require.NoError(t, err)
+	require.Nil(t, diff)
+}

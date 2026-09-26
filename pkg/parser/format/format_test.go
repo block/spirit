@@ -54,8 +54,8 @@ func TestRestoreCtx(t *testing.T) {
 		expect string
 	}{
 		{0, "key`.'\"Word\\ str`.'\"ing\\ na`.'\"Me\\"},
-		{RestoreStringSingleQuotes, "key`.'\"Word\\ 'str`.''\"ing\\' na`.'\"Me\\"},
-		{RestoreStringDoubleQuotes, "key`.'\"Word\\ \"str`.'\"\"ing\\\" na`.'\"Me\\"},
+		{RestoreStringSingleQuotes, "key`.'\"Word\\ 'str`.''\"ing\\\\' na`.'\"Me\\"},
+		{RestoreStringDoubleQuotes, "key`.'\"Word\\ \"str`.'\"\"ing\\\\\" na`.'\"Me\\"},
 		{RestoreStringEscapeBackslash, "key`.'\"Word\\ str`.'\"ing\\\\ na`.'\"Me\\"},
 		{RestoreKeyWordUppercase, "KEY`.'\"WORD\\ str`.'\"ing\\ na`.'\"Me\\"},
 		{RestoreKeyWordLowercase, "key`.'\"word\\ str`.'\"ing\\ na`.'\"Me\\"},
@@ -63,8 +63,8 @@ func TestRestoreCtx(t *testing.T) {
 		{RestoreNameLowercase, "key`.'\"Word\\ str`.'\"ing\\ na`.'\"me\\"},
 		{RestoreNameDoubleQuotes, "key`.'\"Word\\ str`.'\"ing\\ \"na`.'\"\"Me\\\""},
 		{RestoreNameBackQuotes, "key`.'\"Word\\ str`.'\"ing\\ `na``.'\"Me\\`"},
-		{DefaultRestoreFlags, "KEY`.'\"WORD\\ 'str`.''\"ing\\' `na``.'\"Me\\`"},
-		{RestoreStringSingleQuotes | RestoreStringDoubleQuotes, "key`.'\"Word\\ 'str`.''\"ing\\' na`.'\"Me\\"},
+		{DefaultRestoreFlags, "KEY`.'\"WORD\\ 'str`.''\"ing\\\\' `na``.'\"Me\\`"},
+		{RestoreStringSingleQuotes | RestoreStringDoubleQuotes, "key`.'\"Word\\ 'str`.''\"ing\\\\' na`.'\"Me\\"},
 		{RestoreKeyWordUppercase | RestoreKeyWordLowercase, "KEY`.'\"WORD\\ str`.'\"ing\\ na`.'\"Me\\"},
 		{RestoreNameUppercase | RestoreNameLowercase, "key`.'\"Word\\ str`.'\"ing\\ NA`.'\"ME\\"},
 		{RestoreNameDoubleQuotes | RestoreNameBackQuotes, "key`.'\"Word\\ str`.'\"ing\\ \"na`.'\"\"Me\\\""},
@@ -78,6 +78,30 @@ func TestRestoreCtx(t *testing.T) {
 		ctx.WriteString("str`.'\"ing\\")
 		ctx.WritePlain(" ")
 		ctx.WriteName("na`.'\"Me\\")
+		require.Equalf(t, testCase.expect, sb.String(), "case: %#v", testCase)
+	}
+}
+
+// A quoted string must come out as one valid MySQL literal with the same
+// value: control characters and backslashes are backslash-escaped, quotes are
+// doubled, and nothing else is touched (a tab stays a tab). Unquoted output is
+// raw so callers building their own literal are not double-escaped.
+func TestRestoreCtxWriteStringEscapesControlChars(t *testing.T) {
+	const value = "a\x00b\nc\rd\x1ae\\f'g\"h\ti"
+	testCases := []struct {
+		flag   RestoreFlags
+		expect string
+	}{
+		{RestoreStringSingleQuotes, `'a\0b\nc\rd\Ze\\f''g"h	i'`},
+		{RestoreStringDoubleQuotes, `"a\0b\nc\rd\Ze\\f'g""h	i"`},
+		{RestoreStringSingleQuotes | RestoreStringEscapeBackslash, `'a\0b\nc\rd\Ze\\f''g"h	i'`},
+		{0, value},
+		{RestoreStringEscapeBackslash, "a\x00b\nc\rd\x1ae\\\\f'g\"h\ti"},
+	}
+	var sb strings.Builder
+	for _, testCase := range testCases {
+		sb.Reset()
+		NewRestoreCtx(testCase.flag, &sb).WriteString(value)
 		require.Equalf(t, testCase.expect, sb.String(), "case: %#v", testCase)
 	}
 }
