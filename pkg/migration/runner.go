@@ -955,25 +955,26 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 		}
 	}
 
-	var lockless *checksum.LocklessCheckerConfig
-	if r.migration.EnableExperimentalLocklessChecksum {
-		// Repair policy is not set here: NewChecker derives it from
-		// FixDifferences below, so both checkers answer a divergence the same
-		// way (repair it, re-verify next pass, fail if it keeps coming back).
-		lockless = &checksum.LocklessCheckerConfig{SplitHotChunks: true, SnapshotHotChunks: true}
+	lockless := r.migration.EnableExperimentalLocklessChecksum
+	if lockless {
 		r.logger.Warn("experimental lockless checksum enabled; verification uses optimistic reads, cutover locking is unchanged")
 	}
 	r.checker, err = checksum.NewChecker([]*sql.DB{r.db}, r.checksumChunker, []change.Source{r.replClient}, &checksum.CheckerConfig{
-		Lockless:        lockless,
-		Watermark:       checksumWatermark,
-		Concurrency:     r.migration.Threads,
-		TargetChunkTime: table.ChunkerDefaultTarget,
-		DBConfig:        r.dbConfig,
-		Logger:          r.logger,
-		FixDifferences:  true,
-		MaxRetries:      3,
-		YieldTimeout:    r.migration.ChecksumYieldTimeout,
-		MetricsSink:     r.metricsSink,
+		// Repair policy is not set here: NewChecker derives it from
+		// FixDifferences below, so both checkers answer a divergence the same
+		// way (repair it, re-verify next pass, fail if it keeps coming back).
+		Lockless:          lockless,
+		SplitHotChunks:    true,
+		SnapshotHotChunks: true,
+		Watermark:         checksumWatermark,
+		Concurrency:       r.migration.Threads,
+		TargetChunkTime:   table.ChunkerDefaultTarget,
+		DBConfig:          r.dbConfig,
+		Logger:            r.logger,
+		FixDifferences:    true,
+		MaxRetries:        3,
+		YieldTimeout:      r.migration.ChecksumYieldTimeout,
+		MetricsSink:       r.metricsSink,
 		// Repairing a mismatched chunk writes through the same applier the copy
 		// and binlog-apply phases use, so a repair inherits the configured write
 		// concurrency instead of standing up a second write path. The copier has

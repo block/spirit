@@ -42,7 +42,7 @@ func TestFactoryVerificationResume(t *testing.T) {
 			case "distributed":
 				cfg.Applier = &spyApplier{}
 			case "lockless":
-				cfg.Lockless = &LocklessCheckerConfig{}
+				cfg.Lockless = true
 			}
 			checker, err := NewChecker([]*sql.DB{{}}, chunker, []change.Source{&fakeFeed{}}, cfg)
 			require.NoError(t, err)
@@ -79,11 +79,12 @@ func TestFactoryLocklessConfigAndLifecycle(t *testing.T) {
 	cfg := NewCheckerDefaultConfig()
 	cfg.Concurrency = 2
 	cfg.Autoscale = AutoscaleConfig{MaxThreads: 3}
-	options := &LocklessCheckerConfig{SplitHotChunks: true, SnapshotHotChunks: true}
-	cfg.Lockless = options
+	cfg.Lockless = true
+	cfg.SplitHotChunks = true
+	cfg.SnapshotHotChunks = true
 	checker, err := NewChecker([]*sql.DB{{}}, chunker, []change.Source{feed}, cfg)
 	require.NoError(t, err)
-	finite := checker.(*locklessChecker)
+	finite := checker.(*LocklessChecker)
 	require.Equal(t, 2, finite.cfg.Concurrency)
 	require.Equal(t, cfg.Autoscale, finite.cfg.Autoscale)
 	// FixDifferences was not set, so a confirmed divergence is an error rather
@@ -92,7 +93,8 @@ func TestFactoryLocklessConfigAndLifecycle(t *testing.T) {
 	require.Nil(t, finite.cfg.Recopier)
 	require.True(t, finite.cfg.SplitHotChunks)
 	require.True(t, finite.cfg.SnapshotHotChunks)
-	require.Zero(t, options.Concurrency, "factory must not mutate supplied lockless policy")
+	require.False(t, cfg.DivergenceIsFatal, "factory must not mutate the caller's config")
+	require.Nil(t, cfg.Recopier, "factory must not mutate the caller's config")
 	checker.SetThrottler(&throttler.Noop{})
 	require.Contains(t, StatusRow(checker), "scanning")
 	for range 2 {
@@ -113,7 +115,7 @@ func TestFactoryLocklessConfigAndLifecycle(t *testing.T) {
 func TestFactoryDerivesLocklessRepairPolicy(t *testing.T) {
 	newCfg := func() *CheckerConfig {
 		cfg := NewCheckerDefaultConfig()
-		cfg.Lockless = &LocklessCheckerConfig{}
+		cfg.Lockless = true
 		return cfg
 	}
 
@@ -122,7 +124,7 @@ func TestFactoryDerivesLocklessRepairPolicy(t *testing.T) {
 	cfg.RepairApplier = &spyApplier{}
 	checker, err := NewChecker([]*sql.DB{{}}, newTestChunker(0), []change.Source{&fakeFeed{}}, cfg)
 	require.NoError(t, err)
-	finite := checker.(*locklessChecker)
+	finite := checker.(*LocklessChecker)
 	require.False(t, finite.cfg.DivergenceIsFatal)
 	require.NotNil(t, finite.cfg.Recopier)
 	require.Positive(t, finite.cfg.MaxPasses, "the until-clean loop must be bounded")
@@ -135,9 +137,9 @@ func TestFactoryDerivesLocklessRepairPolicy(t *testing.T) {
 	for _, field := range []string{"recopier", "fatal"} {
 		cfg = newCfg()
 		if field == "recopier" {
-			cfg.Lockless.Recopier = &fakeRecopier{}
+			cfg.Recopier = &fakeRecopier{}
 		} else {
-			cfg.Lockless.DivergenceIsFatal = true
+			cfg.DivergenceIsFatal = true
 		}
 		_, err = NewChecker([]*sql.DB{{}}, newTestChunker(0), []change.Source{&fakeFeed{}}, cfg)
 		require.ErrorContains(t, err, "owned by the factory")
@@ -148,7 +150,7 @@ func TestFactoryRejectsUnsupportedLocklessTopology(t *testing.T) {
 	for _, mode := range []string{"sources", "feeds", "distributed", "nil-source", "nil-feed"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg := NewCheckerDefaultConfig()
-			cfg.Lockless = &LocklessCheckerConfig{}
+			cfg.Lockless = true
 			sources := []*sql.DB{{}}
 			feeds := []change.Source{&fakeFeed{}}
 			switch mode {
@@ -205,7 +207,7 @@ func TestFactoryResumeWithoutChildWatermarks(t *testing.T) {
 			cfg.Watermark = "{}"
 			cfg.RepairApplier = &spyApplier{}
 			if optimistic {
-				cfg.Lockless = &LocklessCheckerConfig{}
+				cfg.Lockless = true
 			}
 			_, err := NewChecker([]*sql.DB{{}}, chunker, []change.Source{&fakeFeed{}}, cfg)
 			require.NoError(t, err)
@@ -214,15 +216,5 @@ func TestFactoryResumeWithoutChildWatermarks(t *testing.T) {
 				require.NoError(t, err, "every child must be open from the beginning")
 			}
 		})
-	}
-}
-
-func TestFactoryRejectsConflictingLocklessConcurrency(t *testing.T) {
-	for _, concurrency := range []int{0, 2} {
-		cfg := NewCheckerDefaultConfig()
-		cfg.Concurrency = concurrency
-		cfg.Lockless = &LocklessCheckerConfig{Concurrency: 99}
-		_, err := NewChecker([]*sql.DB{{}}, newTestChunker(0), []change.Source{&fakeFeed{}}, cfg)
-		require.ErrorContains(t, err, "Concurrency conflicts")
 	}
 }

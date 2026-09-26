@@ -391,7 +391,7 @@ func TestFiniteLocklessThrottleWiring(t *testing.T) {
 			name := fmt.Sprintf("setter=%v/composite=%v", setter, composite)
 			t.Run(name, func(t *testing.T) {
 				cfg := NewCheckerDefaultConfig()
-				cfg.Lockless = &LocklessCheckerConfig{}
+				cfg.Lockless = true
 				lag, load := &binaryThrottler{}, &alwaysLoaded{}
 				var signal throttler.Throttler = lag
 				if composite {
@@ -426,7 +426,7 @@ func (s *checksumGaugeSink) Send(_ context.Context, m *metrics.Metrics) error {
 
 func TestFiniteLocklessEmitsConfiguredMetrics(t *testing.T) {
 	cfg := NewCheckerDefaultConfig()
-	cfg.Lockless = &LocklessCheckerConfig{}
+	cfg.Lockless = true
 	cfg.Autoscale.Enabled = true
 	sink := &checksumGaugeSink{received: make(chan *metrics.Metrics, 1)}
 	cfg.MetricsSink = sink

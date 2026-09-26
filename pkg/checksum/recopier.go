@@ -15,6 +15,18 @@ import (
 	"github.com/block/spirit/pkg/utils"
 )
 
+// Recopier knows how to overwrite a single chunk's worth of data on the
+// target from the source. It is invoked when the lockless checker's
+// retry path detects stable target divergence — i.e. the source CRC is
+// unchanged across a retry window but the target CRC is still wrong.
+//
+// Recopy must be safe to call concurrently from multiple worker
+// goroutines; implementations are expected to serialize internally where
+// needed (see MySQLRecopier for the production implementation).
+type Recopier interface {
+	Recopy(ctx context.Context, chunk *table.Chunk) error
+}
+
 // MySQLRecopier is the production Recopier used by `spirit sync`. Given a
 // chunk that the lockless checker has identified as stably diverged
 // (source CRC unchanged across the retry window, target still wrong), it

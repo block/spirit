@@ -231,7 +231,7 @@ func TestHotSplitReadback(t *testing.T) {
 			cfg := fastConfig()
 			cfg.SplitHotChunks = true
 			cfg.RetryDelay = time.Millisecond
-			c, err := NewLocklessChecker(source, target, chunker, nil, cfg)
+			c, err := NewLocklessChecker(source, target, chunker, nil, &cfg)
 			require.NoError(t, err)
 			read := c.readChunk
 			var attempts atomic.Int64

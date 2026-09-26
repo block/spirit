@@ -89,16 +89,15 @@ func (f *parityFixture) checker(t *testing.T, lockless bool, opts ...func(*Check
 	config.FixDifferences = true
 	config.RepairApplier = applier.NewSingleTargetForTest(t, f.db)
 	if lockless {
-		config.Lockless = &LocklessCheckerConfig{
-			SplitHotChunks:    true,
-			SnapshotHotChunks: true,
-			// Repair policy is deliberately not set: the factory derives it
-			// from FixDifferences, which is the whole point of these tests.
-			//
-			// Production uses DefaultLocklessRetryDelay (1 minute). Shortened
-			// here so a confirmed divergence surfaces within the test budget.
-			RetryDelay: 100 * time.Millisecond,
-		}
+		config.Lockless = true
+		config.SplitHotChunks = true
+		config.SnapshotHotChunks = true
+		// Repair policy is deliberately not set: the factory derives it from
+		// FixDifferences, which is the whole point of these tests.
+		//
+		// Production uses DefaultLocklessRetryDelay (1 minute). Shortened here
+		// so a confirmed divergence surfaces within the test budget.
+		config.RetryDelay = 100 * time.Millisecond
 	}
 	for _, opt := range opts {
 		opt(config)
@@ -178,7 +177,8 @@ func TestParityDivergenceWithoutRepair(t *testing.T) {
 			// use. Supplied for both so the two differ in policy alone.
 			config.RepairApplier = applier.NewSingleTargetForTest(t, f.db)
 			if lockless {
-				config.Lockless = &LocklessCheckerConfig{RetryDelay: 100 * time.Millisecond}
+				config.Lockless = true
+				config.RetryDelay = 100 * time.Millisecond
 			}
 			checker, err := NewChecker([]*sql.DB{f.db}, f.chunker, []change.Source{f.feed}, config)
 			require.NoError(t, err)
@@ -260,7 +260,7 @@ func TestLocklessRepairIsNotResumeEvidence(t *testing.T) {
 	testutils.RunSQL(t, fmt.Sprintf("UPDATE %s SET b = 99 WHERE id = 1", utils.NewTableName(name)))
 	f.start(t, name)
 
-	checker := f.checker(t, true, func(c *CheckerConfig) { c.Lockless.MaxPasses = 1 })
+	checker := f.checker(t, true, func(c *CheckerConfig) { c.MaxPasses = 1 })
 	require.ErrorIs(t, checker.Run(t.Context()), ErrVerificationUnresolved,
 		"the repairing pass is not clean, and the budget stops the re-verification")
 

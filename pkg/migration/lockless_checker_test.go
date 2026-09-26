@@ -75,7 +75,7 @@ func TestLocklessCheckpointPersistsChecksumWatermark(t *testing.T) {
 	_, watermark := latestCheckpointWatermarks(t, r)
 	require.NotEmpty(t, watermark, "control: traditional checksum persists a clean watermark")
 	cfg := checksum.NewCheckerDefaultConfig()
-	cfg.Lockless = &checksum.LocklessCheckerConfig{}
+	cfg.Lockless = true
 	var err error
 	r.checker, err = checksum.NewChecker([]*sql.DB{r.db}, r.checksumChunker, []change.Source{r.replClient}, cfg)
 	require.NoError(t, err)

@@ -121,14 +121,14 @@ func (c *testChunker) feedbackCount() int {
 //
 // We pass nil DB pointers (allowed because readChunk is swapped) but the
 // constructor requires non-nil, so use minimal sentinel values.
-func newTestChecker(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
+func newTestChecker(t *testing.T, chunker table.Chunker, cfg CheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, tgtCount uint64, err error),
 ) *LocklessChecker {
 	t.Helper()
 	// Constructor demands non-nil DBs; we pass empty *sql.DB pointers — they
 	// are never used because readChunk is swapped before Run.
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, &cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -154,12 +154,12 @@ func newTestChecker(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConf
 // signatures (CRC + count) for source and target independently, so tests can
 // exercise row-count divergence with matching CRCs (the defense-in-depth gap
 // this comparison closes).
-func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg LocklessCheckerConfig,
+func newTestCheckerSig(t *testing.T, chunker table.Chunker, cfg CheckerConfig,
 	read func(ctx context.Context, chunk *table.Chunk, attempt int) (srcCRC, tgtCRC int64, srcCount, tgtCount uint64, err error),
 ) *LocklessChecker {
 	t.Helper()
 	srcDB, tgtDB := &sql.DB{}, &sql.DB{}
-	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, cfg)
+	c, err := NewLocklessChecker(srcDB, tgtDB, chunker, nil, &cfg)
 	require.NoError(t, err)
 
 	attempts := sync.Map{}
@@ -184,7 +184,14 @@ func runUntil(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan
 	ctx, cancel := context.WithCancel(context.Background())
 	out := make(chan error, 1)
 	go func() {
-		out <- c.Run(ctx)
+		// RunContinuous is the unbounded pass loop: these tests drive the
+		// checker until they cancel it. It filters cancellation to nil, so the
+		// helper reports ctx.Err() instead — the tests assert on it.
+		if err := c.RunContinuous(ctx); err != nil {
+			out <- err
+			return
+		}
+		out <- ctx.Err()
 	}()
 	return func() error {
 		cancel()
@@ -197,14 +204,35 @@ func runUntil(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan
 	}, out
 }
 
+// runUntilClean is runUntil for the finite contract: it drives RunUntilClean,
+// which keeps passing until a pass needs nothing (or MaxPasses gives up).
+func runUntilClean(t *testing.T, c *LocklessChecker) (stop func() error, errCh <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan error, 1)
+	go func() { out <- c.RunUntilClean(ctx) }()
+	return func() error {
+		cancel()
+		select {
+		case err := <-out:
+			return err
+		case <-time.After(5 * time.Second):
+			return errors.New("RunUntilClean did not return within 5s of cancel")
+		}
+	}, out
+}
+
 // fastConfig is a default config tuned for fast tests: 50ms retry delay,
 // silent logger.
-func fastConfig() LocklessCheckerConfig {
-	return LocklessCheckerConfig{
-		Concurrency:  4,
-		RetryDelay:   50 * time.Millisecond,
-		MaxQueueSize: 16,
-		Logger:       slog.New(slog.NewTextHandler(testWriter{}, &slog.HandlerOptions{Level: slog.LevelError})),
+func fastConfig() CheckerConfig {
+	return CheckerConfig{
+		Concurrency: 4,
+		RetryDelay:  50 * time.Millisecond,
+		// Back-to-back passes. A zero here means "let the mode pick", which in
+		// continuous mode is an hour.
+		MinPassInterval: time.Millisecond,
+		MaxQueueSize:    16,
+		Logger:          slog.New(slog.NewTextHandler(testWriter{}, &slog.HandlerOptions{Level: slog.LevelError})),
 	}
 }
 
@@ -1291,7 +1319,9 @@ func TestScanCompleteResetsAndExcludesWalkerFailure(t *testing.T) {
 	c.chunker = blocked
 	c.scanComplete.Store(true) // Completion from the preceding pass must reset.
 	done := make(chan error, 1)
-	go func() { done <- c.Run(t.Context()) }()
+	// One attempt: the walker's failure is not retryable-in-this-test (the
+	// stub can only fail once), and Run's retry loop would call it again.
+	go func() { done <- c.RunUntilClean(t.Context()) }()
 	<-blocked.started
 	require.False(t, c.Stats().ScanComplete)
 	close(blocked.release)
@@ -1495,8 +1525,9 @@ func TestRepairedChunkIsNotResumeEvidence(t *testing.T) {
 	for _, fb := range chunker.feedback {
 		require.NotSame(t, bad, fb.Chunk)
 	}
-	_, err := c.ResumeWatermark()
-	require.Error(t, err, "the repaired chunk is the first, so no prefix is verified")
+	wm, err := c.ResumeWatermark()
+	require.NoError(t, err)
+	require.Empty(t, wm, "the repaired chunk is the first, so no prefix is verified")
 }
 
 // Resume evidence describes the walk in progress, and nothing else. A second
@@ -1551,7 +1582,10 @@ func TestResumeWatermarkTracksCurrentWalkOnly(t *testing.T) {
 			return 1, 1, 10, nil
 		})
 
-	stop, _ := runUntil(t, c)
+	// The finite contract is what publishes resume evidence, so drive that.
+	// The hot chunk keeps it from ever converging, which is what gives this
+	// test a pass 2 to look at.
+	stop, _ := runUntilClean(t, c)
 	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
 
 	// Pass 1 publishes the prefix its two clean chunks cover. It cannot end
@@ -1571,8 +1605,9 @@ func TestResumeWatermarkTracksCurrentWalkOnly(t *testing.T) {
 
 	require.GreaterOrEqual(t, chunker.feedbackCount(), 2,
 		"pass 1 verified a prefix, so there is an answer available to carry forward")
-	_, err := c.ResumeWatermark()
-	require.Error(t, err, "a new pass must not republish the previous walk's evidence")
+	wm, err := c.ResumeWatermark()
+	require.NoError(t, err)
+	require.Empty(t, wm, "a new pass must not republish the previous walk's evidence")
 
 	// Releasing the re-walk republishes the prefix on its own evidence, which
 	// is what makes the assertion above a real constraint rather than a stub
@@ -1601,7 +1636,7 @@ func TestHotSnapshotAdmission(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			called := false
-			c := &LocklessChecker{cfg: LocklessCheckerConfig{SnapshotHotChunks: tc.enabled}}
+			c := &LocklessChecker{cfg: CheckerConfig{SnapshotHotChunks: tc.enabled}}
 			c.snapshotChunk = func(context.Context, *table.Chunk) (*hotSnapshot, error) {
 				called = true
 				return nil, nil // capture declined; admission is what this test checks

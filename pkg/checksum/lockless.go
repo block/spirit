@@ -1,10 +1,15 @@
 // Package checksum — lockless (optimistic) checker.
 //
 // LocklessChecker verifies live source/target tables with optimistic reads
-// and retries. Run repeats passes until cancelled; RunUntilClean returns after
-// a complete clean pass. Unlike SingleChecker / DistributedChecker, it does
-// not acquire a table lock or hold a long-lived REPEATABLE READ snapshot. All reads are plain READ COMMITTED, issued directly through the
-// source and target connections.
+// and retries. Unlike SingleChecker / DistributedChecker, it does not acquire a
+// table lock or hold a long-lived REPEATABLE READ snapshot. All reads are plain
+// READ COMMITTED, issued directly through the source and target connections.
+//
+// One checker serves both halves of the Checker contract, over the same pass
+// loop: Run returns once a pass has verified the whole table (retrying the run
+// on transient failure, and bounded by MaxPasses when it will not converge),
+// and RunContinuous keeps passing in the background until it is cancelled.
+// RunUntilClean is a single attempt of Run, without the retry loop.
 //
 // # Convergence model
 //
@@ -102,7 +107,7 @@ import (
 
 	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
-	"github.com/block/spirit/pkg/metrics"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
 	"golang.org/x/sync/errgroup"
@@ -130,18 +135,6 @@ var ErrPermanentDivergence = errors.New("checksum: permanent divergence detected
 // re-walking the table forever, which is what a continuously updated hot row
 // would otherwise cause (see the hot-row limitation in the package README).
 var ErrVerificationUnresolved = errors.New("checksum: verification did not converge within the pass budget")
-
-// Recopier knows how to overwrite a single chunk's worth of data on the
-// target from the source. It is invoked when the lockless checker's
-// retry path detects stable target divergence — i.e. the source CRC is
-// unchanged across a retry window but the target CRC is still wrong.
-//
-// Recopy must be safe to call concurrently from multiple worker
-// goroutines; implementations are expected to serialize internally where
-// needed (see MySQLRecopier for the production implementation).
-type Recopier interface {
-	Recopy(ctx context.Context, chunk *table.Chunk) error
-}
 
 // Default values applied by NewLocklessChecker for zero-valued config
 // fields. Exported so callers can reference them when tuning.
@@ -184,213 +177,47 @@ var (
 	DefaultLocklessRetryDelay = time.Minute
 )
 
-// LocklessCheckerConfig configures a LocklessChecker. See Default for
-// the runtime defaults applied by the constructor when fields are zero.
-type LocklessCheckerConfig struct {
-	// Concurrency is the number of worker goroutines. Default 4. Through
-	// NewChecker, set CheckerConfig.Concurrency; a conflicting nonzero value
-	// here is rejected. NewLocklessChecker uses this field directly.
-	Concurrency int
-	// SplitHotChunks subdivides repeatedly changing ranges before deferring
-	// them. Large ranges produce up to eleven children; oversized descendants
-	// subdivide immediately until at most 128 source rows are observed. Each
-	// child is independently read; parent signatures are not reused.
-	SplitHotChunks bool
-	// SnapshotHotChunks freezes bounded per-row evidence for small hot ranges.
-	// Target reads must satisfy every obligation; stream images are not accepted.
-	SnapshotHotChunks bool
-	// Throttler pauses new checks under target load; in-flight repairs finish.
-	Throttler throttler.Throttler
-	// Autoscale bounds live checks using target load and change-feed backlog.
-	Autoscale AutoscaleConfig
-	// MetricsSink receives autoscaling gauges. NewChecker uses CheckerConfig.MetricsSink.
-	MetricsSink metrics.Sink
+var (
+	_ Checker        = (*LocklessChecker)(nil)
+	_ StatusReporter = (*LocklessChecker)(nil)
+)
 
-	// RetryDelay is the minimum wait between attempts for any given chunk —
-	// measured from the *last* attempt of that chunk, not from the original
-	// failure. Default 1m, because changes are queued in the replication
-	// applier for 30s by default.
-	RetryDelay time.Duration
-
-	// MaxQueueSize is the cap on entries in the delayed-retry queue. When
-	// exceeded, Run returns an error rather than silently falling behind on
-	// verification. Default 1024.
-	MaxQueueSize int
-
-	// MaxHotAttempts is the number of observations allowed for a chunk whose
-	// source signature keeps changing. Once reached, the chunk is deferred to
-	// the next pass rather than holding the current pass open forever. Default
-	// 10; a positive value below 2 is clamped to 2 because detecting a source
-	// change requires an initial read and a retry. Deferral never counts as
-	// verification and makes the pass not clean.
-	MaxHotAttempts int
-
-	// Recopier is invoked when the retry path detects stable target
-	// divergence (src CRC unchanged across a retry window, target still
-	// wrong) and DivergenceIsFatal is false. When nil, that condition
-	// surfaces as ErrPermanentDivergence from Run — useful for tests and
-	// for callers that prefer to halt rather than self-heal. Production
-	// sync callers should provide MySQLRecopier.
-	Recopier Recopier
-
-	// DivergenceIsFatal selects the policy for a confirmed stable divergence,
-	// making explicit whether the caller should abort or heal rather than
-	// inferring it from Recopier presence:
-	//   - true  (migration's cutover gate): the target is kept in sync by
-	//     replication, so a confirmed difference means something is genuinely
-	//     wrong. Run returns ErrPermanentDivergence and the caller aborts. No
-	//     Recopier is configured.
-	//   - false (datasync): the checker's job is to find and re-copy diverged
-	//     rows, so a confirmed difference is repaired via Recopier and the run
-	//     continues.
-	// When false, a Recopier must be set; without one a divergence is treated as
-	// fatal anyway (there is nothing to heal with).
-	DivergenceIsFatal bool
-
-	// MinPassInterval is the minimum wall-clock time between the start of one
-	// pass and the start of the next, measured from the previous pass's start
-	// (a pass that already ran longer than MinPassInterval incurs no extra
-	// wait). The very first pass always runs immediately. Zero means passes
-	// run back-to-back, which is convenient for tests but heavy in production:
-	// continuous verification defaults to LocklessMinPassInterval (1h) so a
-	// small table whose pass finishes in seconds does not re-scan continuously.
-	// The finite gate defaults to RetryDelay instead — it only re-walks to
-	// re-verify what the previous pass repaired or deferred, and a cut-over is
-	// waiting on the answer. The wait honours context cancellation.
-	MinPassInterval time.Duration
-
-	// MaxPasses bounds RunUntilClean: once this many passes have completed
-	// without one of them being clean, it gives up with
-	// ErrVerificationUnresolved rather than walking the table again. Zero means
-	// unbounded, which is what continuous Run always is; NewChecker defaults
-	// the finite gate to DefaultLocklessMaxPasses.
-	MaxPasses int
-
-	Logger *slog.Logger
-}
-
-// LocklessCheckerStats is a snapshot of the checker's counters. All
-// fields are point-in-time; for monotonic totals, sample successively.
-type LocklessCheckerStats struct {
-	// PassesCompleted is the number of passes finished so far. A pass
-	// completes when every chunk has resolved (READ-verified, recopied, or
-	// explicitly deferred as continuously hot);
-	// only a pass with zero recopies counts as clean for the
-	// FirstCleanPass signal.
-	PassesCompleted uint64
-
-	// CurrentPass is the 1-indexed active or most recently completed pass
-	// (0 before the first pass starts).
-	CurrentPass uint64
-
-	// NextPassAt is the scheduled start while waiting between passes; zero otherwise.
-	NextPassAt time.Time
-
-	// ChunksThisPass is how many chunks the walker has emitted in the
-	// current pass, including split parents and their subsequently emitted children.
-	ChunksThisPass uint64
-
-	// ChunksPassedThisPass is how many chunks have gone clean in the
-	// current pass (either initially or via retry). Split parents are excluded,
-	// so this is not a completion numerator over ChunksThisPass.
-	ChunksPassedThisPass uint64
-
-	// ProgressBasisPoints estimates how far the chunker has walked through the
-	// current pass, from 0 to 10000. Chunk sizes adapt while the pass runs, so
-	// ChunksThisPass is only the number emitted so far and can never be an
-	// honest denominator. Chunker.Progress supplies a stable-enough fraction
-	// over keyspace distance or estimated rows, depending on the chunker.
-	ProgressBasisPoints uint64
-
-	// ScanComplete means the walker exhausted the current pass successfully.
-	// Retries, in-flight reads, repairs, or deferred ranges may still prevent
-	// verification; an estimate of 100% does not imply ScanComplete.
-	ScanComplete bool
-
-	// MismatchesThisPass is how many chunks mismatched on their initial
-	// (fresh-walk) read in the current pass and were enqueued for retry.
-	// At the end of a completed pass this equals PassedSecondAttemptThisPass +
-	// PassedUnder5AttemptsThisPass + PassedUnder10AttemptsThisPass +
-	// RecopiesThisPass + HotChunksDeferredThisPass + HotChunksSplitThisPass.
-	// A completed pass may contain repairs or deferrals and need not be clean. Resets
-	// each pass.
-	MismatchesThisPass uint64
-
-	// Per-pass histogram of attempts-to-converge. "attempts" counts every
-	// read of the chunk (initial fresh-walk + each retry). Buckets are
-	// non-overlapping; their sum equals ChunksPassedThisPass on a clean
-	// pass. All reset each pass.
-	PassedFirstAttemptThisPass    uint64 // 1 attempt (no retry needed)
-	PassedSecondAttemptThisPass   uint64 // 2 attempts (1 retry)
-	PassedUnder5AttemptsThisPass  uint64 // 3-4 attempts
-	PassedUnder10AttemptsThisPass uint64 // 5-9 attempts
-	// RecopiesThisPass is the count of chunks that were recopied this
-	// pass — i.e. retry detected stable target divergence (source CRC
-	// unchanged across the retry window, target still wrong) and the
-	// configured Recopier rewrote the chunk from source. Zero when no
-	// Recopier is configured (those failures surface as
-	// ErrPermanentDivergence and abort the run instead). A pass with
-	// RecopiesThisPass > 0 cannot be the first clean pass — recopied
-	// chunks are repaired, not verified, and are re-read on the next
-	// pass before FirstCleanPass can fire.
-	RecopiesThisPass uint64
-
-	// HotChunksDeferredThisPass is the number of continuously changing chunks
-	// deferred after MaxHotAttempts. They are not counted as passed; any value
-	// greater than zero makes this pass ineligible for FirstCleanPass.
-	HotChunksDeferredThisPass uint64
-	// HotChunksSplitThisPass counts parents replaced by child ranges. A split
-	// is not a verification result; all children must resolve independently.
-	HotChunksSplitThisPass uint64
-
-	// RetryQueueDepth is the current size of the delayed-retry queue.
-	RetryQueueDepth int
-
-	// HotChunkCount is the number of entries currently in the retry queue
-	// with consecutiveSrcChanged >= 2 — i.e. a chunk that has been observed
-	// changing on the source across multiple retry windows.
-	HotChunkCount int
-
-	// InFlight is the number of checksum reads or recopies currently executing.
-	// Together with RetryQueueDepth it distinguishes work waiting for another
-	// observation from a slow query that has not returned yet.
-	InFlight int
-
-	// WalkerStalls is the lifetime count of times the dispatcher refused
-	// to read a fresh chunk from the walker because the retry queue was
-	// already at MaxQueueSize. Each stall represents the checker holding
-	// back the walker until existing retries drain enough to make room —
-	// it does not abort the run. A persistently rising value means source
-	// churn is outpacing the verifier (consider tuning MaxQueueSize,
-	// Concurrency, or RetryDelay).
-	WalkerStalls uint64
-
-	// MismatchesDetected is the lifetime count of initial-read mismatches
-	// (does not include re-failures within a single retry sequence).
-	MismatchesDetected uint64
-
-	// PermanentFailures is the lifetime count of chunks that failed twice
-	// in a row with the source CRC unchanged. Run returns on the first such
-	// event; this counter is bumped immediately before the error returns.
-	PermanentFailures uint64
-
-	// FirstCleanPassAt is the wall-clock time at which the first clean
-	// pass completed (zero before that).
-	FirstCleanPassAt time.Time
-}
-
-// LocklessChecker is the eventually-consistent checker. Construct via
-// NewLocklessChecker; use Run to drive it until ctx is cancelled or a
-// permanent failure surfaces. Concurrent calls to Stats and FirstCleanPass
-// are safe at any time.
+// LocklessChecker is the optimistic checker. It satisfies the whole Checker
+// contract natively: Run verifies the table once and returns, RunContinuous
+// verifies it forever in the background, and both drive the same pass loop.
+// Construct via NewChecker for a single-server migration, or NewLocklessChecker
+// to verify across two servers.
+//
+// Run and RunContinuous must not overlap; everything else — Stats,
+// FirstCleanPass, ResumeWatermark, the status accessors — is safe to call
+// concurrently with either.
 type LocklessChecker struct {
-	cfg        LocklessCheckerConfig
+	cfg        CheckerConfig
 	splitChunk func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error)
 
 	sourceDB *sql.DB
 	targetDB *sql.DB
 	chunker  table.Chunker
 	feed     change.Source
+
+	// ownsFeedFlush makes a run start and stop the feed's periodic flush, the
+	// way the snapshot checkers do. Set by NewChecker. It is off by default
+	// because a caller that constructs the checker itself generally runs its
+	// own flush loop for the whole process (datasync does), and stopping that
+	// on the way out of a run would be stopping someone else's goroutine.
+	ownsFeedFlush bool
+
+	// hasRun records that a run has already driven this checker, which decides
+	// two things a first run must not do: re-walking from wherever the previous
+	// run left the chunker, and pacing the first continuous pass as though it
+	// followed one.
+	hasRun atomic.Bool
+
+	// continuous is sticky, unlike continuousActive: once the caller has
+	// selected background verification there is no run to resume, so no resume
+	// evidence may be published even between passes.
+	continuous       atomic.Bool
+	continuousActive atomic.Bool
 
 	// atomically-updated counters. The "ThisPass" counters reset at the
 	// start of each pass; lifetime counters accumulate forever.
@@ -426,6 +253,11 @@ type LocklessChecker struct {
 	statsMu          sync.RWMutex
 	firstCleanPassAt time.Time
 	nextPassAt       time.Time
+	// started/elapsed/finished time the current (or last) run, for the
+	// StartTime and ExecTime accessors the Checker contract requires.
+	started  time.Time
+	elapsed  time.Duration
+	finished bool
 
 	firstCleanPassOnce sync.Once
 	firstCleanPassCh   chan struct{}
@@ -444,127 +276,25 @@ type LocklessChecker struct {
 	readChunk func(ctx context.Context, chunk *table.Chunk) (srcCRC, tgtCRC int64, srcCount, tgtCount uint64, err error)
 }
 
-// chunkSig is the comparison identity for one side of a chunk: its CRC AND
-// its row count. The lockless checker compares whole signatures rather than
-// CRCs alone so a row-count mismatch is caught even when the CRC happens to
-// match (a row whose CRC32 is 0 is invisible to the BIT_XOR but moves the
-// count). "source changed" / "target caught up" decisions all operate on
-// signatures.
-type chunkSig struct {
-	crc   int64
-	count uint64
-}
-
-// retryEntry tracks one chunk that failed and is awaiting re-verification.
-// originalSrc is updated each time we observe the source change while the
-// chunk is still pending — see the "hot chunk" path in the package doc.
-type retryEntry struct {
-	snapshot    *hotSnapshot
-	splitBudget *atomic.Uint64 // shared by all descendants of one walker range
-	chunk       *table.Chunk
-	fresh       bool
-	splitDepth  int
-	point       bool
-
-	originalSrc chunkSig
-	originalTgt chunkSig
-
-	// notBefore is the earliest wall-clock time this entry may be retried.
-	// Set to now + RetryDelay on enqueue and on each re-enqueue.
-	notBefore time.Time
-
-	// consecutiveSrcChanged counts retries on which the source signature
-	// differed from the previous attempt. Surfaced as Stats.HotChunkCount
-	// when >=2.
-	consecutiveSrcChanged int
-
-	// attempts counts completed observations and bounds hot retries.
-	attempts int
-
-	// readDuration and readRows are the fresh-walk read's cost and size. They
-	// travel with the entry so the chunker's sizing feedback still describes
-	// the initial read even though it is now delivered when the chunk
-	// resolves — see feedbackResolved.
-	readDuration time.Duration
-	readRows     uint64
-}
-
-// workItem is what the dispatcher hands to workers. isRetry distinguishes
-// the fresh-walk path (where a mismatch enqueues a new retryEntry) from
-// the retry path (where the policy of pkg-doc step 2 applies).
-type workItem struct {
-	snapshot    *hotSnapshot
-	splitBudget *atomic.Uint64
-	chunk       *table.Chunk
-	splitDepth  int
-	point       bool
-
-	isRetry bool
-
-	// Only valid when isRetry is true:
-	originalSrc           chunkSig
-	originalTgt           chunkSig
-	consecutiveSrcChanged int
-	attempts              int
-	readDuration          time.Duration
-	readRows              uint64
-}
-
-// workResult is what workers send back to the dispatcher. The driver then
-// applies pass/retry policy and updates counters.
-type workResult struct {
-	snapshot *hotSnapshot
-	item     *workItem
-	children []*table.Chunk
-
-	// passed is true iff the chunk resolved for pass-completion purposes
-	// (initial match, retry match against the original or new source
-	// signature, or a successful recopy). Note a recopy "passes" only in
-	// the sense that the pass can finish — it also marks the pass
-	// ineligible to fire FirstCleanPass (see recopied below).
-	passed bool
-
-	// recopied is true iff this result represents a successful Recopy
-	// (passed=true also set). Distinguishes "passed via retry" from
-	// "repaired via recopy" in the per-pass histogram; any recopy makes
-	// the containing pass not-clean for the FirstCleanPass criterion.
-	recopied bool
-
-	// newSrc / newTgt are the signatures (CRC + count) just read. Used by
-	// the driver to populate a re-enqueued retryEntry on the hot-chunk path.
-	newSrc chunkSig
-	newTgt chunkSig
-
-	// readDuration is how long this read took, for the chunker's sizing
-	// feedback. Zero for a snapshot-drain result, which issues no aggregate
-	// read.
-	readDuration time.Duration
-
-	// permanent is true iff this is a retry that failed with the source
-	// CRC unchanged AND no Recopier is configured — i.e. real divergence
-	// with no self-heal path. Run will exit with ErrPermanentDivergence.
-	permanent bool
-
-	// deferHot is true when a continuously changing chunk reached the bounded
-	// attempt limit. It resolves the work item for this pass without claiming
-	// the chunk passed; the next pass walks it again from scratch.
-	deferHot bool
-
-	// err is set on any read or query failure (or a Recopy failure); the
-	// dispatcher returns it from Run.
-	err error
-}
-
 // NewLocklessChecker constructs a checker with the given dependencies and
 // config. sourceDB and targetDB must be distinct connections to the source
-// and target databases respectively. chunker must be Open before Run; the
-// checker Resets it between passes but does not close it.
+// and target databases respectively; a single-server caller passes the same
+// handle twice, which is what NewChecker does. chunker must be Open before a
+// run; the checker Resets it between passes but does not close it.
+//
+// Only the fields documented as applying to lockless verification are read —
+// the snapshot-only ones (YieldTimeout, RepairApplier, Applier) are ignored.
+// Unlike NewChecker this does not derive repair policy: set Recopier and
+// DivergenceIsFatal directly.
 func NewLocklessChecker(
 	sourceDB, targetDB *sql.DB,
 	chunker table.Chunker,
 	feed change.Source,
-	cfg LocklessCheckerConfig,
+	config *CheckerConfig,
 ) (*LocklessChecker, error) {
+	if config == nil {
+		return nil, errors.New("config must be non-nil")
+	}
 	if sourceDB == nil {
 		return nil, errors.New("sourceDB must be non-nil")
 	}
@@ -574,6 +304,7 @@ func NewLocklessChecker(
 	if chunker == nil {
 		return nil, errors.New("chunker must be non-nil")
 	}
+	cfg := *config
 	// feed is allowed to be nil — it's advisory.
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = DefaultLocklessConcurrency
@@ -588,6 +319,9 @@ func NewLocklessChecker(
 		cfg.MaxHotAttempts = DefaultLocklessMaxHotAttempts
 	}
 	cfg.MaxHotAttempts = max(2, cfg.MaxHotAttempts)
+	if cfg.MaxRetries <= 0 {
+		cfg.MaxRetries = defaultMaxRetries
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -609,32 +343,205 @@ func NewLocklessChecker(
 	return c, nil
 }
 
-// Run drives the checker until ctx is cancelled or a permanent failure is
-// detected. On ctx cancellation Run returns ctx.Err() (typically
-// context.Canceled or context.DeadlineExceeded); callers that want to
-// treat a clean shutdown as nil should filter that themselves (see how
-// datasync.Runner.runContinuous does it). A permanent failure — a chunk
-// that mismatched twice in a row with the source CRC unchanged and no
-// Recopier was configured — returns ErrPermanentDivergence. Errors from
-// the chunker walker (chunker.Next failures) are wrapped and returned.
+// SetThrottler installs pacing before a run. It is called during runner setup,
+// because a runner usually opens its throttlers after it builds the checker.
+func (c *LocklessChecker) SetThrottler(t throttler.Throttler) {
+	c.cfg.Throttler = loadOnlyThrottler(t)
+}
+
+// Run verifies the whole table and returns, which is the finite half of the
+// Checker contract. A nil result authorizes completion: it means a pass walked
+// every chunk and needed no repairs and deferred nothing. Repairs and deferred
+// ranges are not verification, so a pass containing either is followed by
+// another one (bounded by MaxPasses, after which it gives up with
+// ErrVerificationUnresolved).
+//
+// A failed attempt is retried up to MaxRetries times when a fresh attempt could
+// plausibly survive the failure. This mirrors SingleChecker.Run, and for the
+// same reason: a checksum is the last thing standing between a migration and a
+// cut-over, and a pool of connections killed mid-pass (or any other transient
+// infrastructure failure) should not fail the migration outright. The two
+// verdicts that are *about the data* — ErrPermanentDivergence and
+// ErrVerificationUnresolved — are not retried, because repeating the read would
+// reach the same conclusion.
+func (c *LocklessChecker) Run(ctx context.Context) error {
+	var lastErr error
+	for attempt := 1; attempt <= c.cfg.MaxRetries; attempt++ {
+		// A context that is already cancelled makes every remaining attempt
+		// fail identically at the first ctx-aware call. Report the real reason
+		// rather than the exhausted-attempts wrapper.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if attempt > 1 {
+			c.cfg.Logger.Error("lockless checksum failed, retrying",
+				"attempt", attempt, "maxRetries", c.cfg.MaxRetries, "error", lastErr)
+		}
+		err := c.RunUntilClean(ctx)
+		if err == nil {
+			return nil
+		}
+		if !locklessRetryable(err) {
+			return err
+		}
+		lastErr = err
+	}
+	// A cancellation that lands inside the final attempt leaves the loop here
+	// rather than at the pre-attempt check above. Report it the way that check
+	// does, so a caller can tell a clean shutdown from a verification failure.
+	if ctx.Err() != nil && checksumCanceled(lastErr) {
+		return ctx.Err()
+	}
+	return fmt.Errorf("%w (%d/%d); last error: %w", ErrAttemptsExhausted, c.cfg.MaxRetries, c.cfg.MaxRetries, lastErr)
+}
+
+// locklessRetryable reports whether a failed attempt is worth repeating. Only
+// the verdicts that describe the *data* are excluded: they are reproducible by
+// construction, so retrying spends the whole table's worth of reads to reach
+// the same answer.
+func locklessRetryable(err error) bool {
+	switch {
+	case errors.Is(err, ErrPermanentDivergence):
+		return false
+	case errors.Is(err, ErrVerificationUnresolved):
+		return false
+	default:
+		return true
+	}
+}
+
+// RunUntilClean is one attempt of Run: it returns as soon as a complete pass
+// has no repairs and no deferred ranges, without the whole-run retry loop. It
+// joins all workers before returning. Cancellation is an error, never evidence
+// of verification.
+func (c *LocklessChecker) RunUntilClean(ctx context.Context) error {
+	return c.run(ctx, true)
+}
+
+// RunContinuous verifies the table in the background for as long as ctx lives,
+// which is the continuous half of the Checker contract. It is the same pass
+// loop as Run with two differences: there is no pass budget, because the point
+// is to keep verifying; and a cancellation is reported as nil, because a
+// background verifier being shut down is not a failure. Any other error —
+// including ErrPermanentDivergence — is returned and should abort a cutover.
+//
+// Following a finite run, the first continuous pass waits MinPassInterval
+// rather than re-walking the table immediately behind the pass that just
+// verified it.
+func (c *LocklessChecker) RunContinuous(ctx context.Context) error {
+	c.continuous.Store(true)
+	return c.run(ctx, false)
+}
+
+// ContinuousActive distinguishes a running pass from the interval pacing
+// between passes.
+func (c *LocklessChecker) ContinuousActive() bool {
+	if !c.continuousActive.Load() {
+		return false
+	}
+	return c.Stats().NextPassAt.IsZero()
+}
+
+// run drives the pass loop for either mode. untilClean is the finite contract:
+// stop at the first pass that needs nothing, and stop with an error once
+// MaxPasses passes have failed to produce one.
+//
+// On cancellation this returns ctx.Err() (typically context.Canceled or
+// context.DeadlineExceeded) for a finite run, and nil for a continuous one.
+// A permanent failure — a chunk that mismatched twice in a row with the source
+// CRC unchanged and no Recopier configured — returns ErrPermanentDivergence.
+// Errors from the chunker walker (chunker.Next failures) are wrapped.
 //
 // MaxQueueSize is a soft backpressure threshold rather than a hard cap:
 // when the retry queue reaches it, the dispatcher stops reading fresh
 // chunks from the walker until existing retries drain enough to make
 // room. The walker blocks on its send; workers continue draining.
 // WalkerStalls in the stats snapshot counts how often this has fired.
-func (c *LocklessChecker) Run(ctx context.Context) error {
-	return c.run(ctx, false)
-}
-
-// RunUntilClean returns only after a complete pass has no repairs or deferred
-// ranges. It joins all workers before returning. Cancellation is an error,
-// never evidence of verification. Like Run, it must not be called concurrently.
-func (c *LocklessChecker) RunUntilClean(ctx context.Context) error {
-	return c.run(ctx, true)
-}
-
 func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
+	continuous := !untilClean
+	// Sequential runs each require a complete pass, so never reuse the walker
+	// position left by a previous clean, interrupted, or failed one.
+	firstRun := !c.hasRun.Swap(true)
+	if !firstRun {
+		if err := c.chunker.Reset(); err != nil {
+			return err
+		}
+	}
+	c.resetRunCounters()
+	c.statsMu.Lock()
+	c.started = time.Now()
+	c.finished = false
+	c.elapsed = 0
+	c.statsMu.Unlock()
+	defer func() {
+		c.statsMu.Lock()
+		c.elapsed = time.Since(c.started)
+		c.finished = true
+		c.statsMu.Unlock()
+	}()
+
+	if c.ownsFeedFlush && c.feed != nil {
+		c.feed.StartPeriodicFlush(ctx, change.DefaultFlushInterval)
+		defer c.feed.StopPeriodicFlush()
+	}
+
+	minPassInterval := c.passInterval(continuous)
+	if continuous {
+		// A continuous run that follows a finite one is re-verifying a table
+		// that was just verified, so it waits out the interval before its first
+		// pass instead of re-walking back-to-back. A checker whose first run is
+		// continuous (cross-server sync) has nothing to wait for.
+		if !firstRun && !waitForChecksum(ctx, minPassInterval) {
+			return nil
+		}
+		c.continuousActive.Store(true)
+		defer c.continuousActive.Store(false)
+	}
+
+	err := c.runPasses(ctx, untilClean, minPassInterval)
+	if continuous && ctx.Err() != nil && checksumCanceled(err) {
+		// The pass loop joins repairs before returning cancellation, so a
+		// wrapped cancellation here is benign. Never hide joined errors.
+		return nil
+	}
+	return err
+}
+
+// passInterval is how long the pass loop waits between passes. Zero in the
+// configuration means back-to-back, which is useful in tests and far too heavy
+// in production, so each mode substitutes the interval that suits it: the
+// continuous gate uses LocklessMinPassInterval, and the finite gate uses
+// RetryDelay. The finite gate re-walks only to re-verify what the previous pass
+// repaired or deferred, and something is waiting on the answer (the cut-over),
+// so pacing it in minutes would stall a migration that is otherwise ready.
+// RetryDelay is the interval the algorithm already uses for "give the target a
+// moment to catch up", which is the same thing being waited on here.
+func (c *LocklessChecker) passInterval(continuous bool) time.Duration {
+	if c.cfg.MinPassInterval != 0 {
+		return c.cfg.MinPassInterval
+	}
+	if continuous {
+		return LocklessMinPassInterval
+	}
+	return c.cfg.RetryDelay
+}
+
+// resetRunCounters clears the counters a run owns. Sequential runs each start
+// from nothing, so a retried attempt does not inherit the counts of the attempt
+// that failed. The first-clean-pass signal is deliberately not reset: it
+// records something that happened to this table, not to one run, and a caller
+// may already be waiting on the channel.
+func (c *LocklessChecker) resetRunCounters() {
+	c.passesCompleted.Store(0)
+	c.currentPass.Store(0)
+	c.mismatchesDetected.Store(0)
+	c.permanentFailures.Store(0)
+	c.walkerStalls.Store(0)
+	c.retryQueueDepth.Store(0)
+	c.hotChunkCount.Store(0)
+}
+
+func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPassInterval time.Duration) error {
 	// Workers and dispatcher communicate through these channels; both are
 	// buffered to Concurrency so the dispatcher's send/recv loop doesn't
 	// stall on small lock-step delays.
@@ -688,11 +595,11 @@ func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
 			// Pace passes: wait until MinPassInterval has elapsed since the
 			// previous pass STARTED (a pass that already ran longer incurs no
 			// extra wait). The first pass is never delayed. 0 = back-to-back.
-			if wait := c.cfg.MinPassInterval - time.Since(lastPassStart); wait > 0 {
+			if wait := minPassInterval - time.Since(lastPassStart); wait > 0 {
 				c.cfg.Logger.Debug("lockless checksum waiting before next pass",
 					"pass_number", passNum, "wait", wait.Round(time.Second).String())
 				c.statsMu.Lock()
-				c.nextPassAt = lastPassStart.Add(c.cfg.MinPassInterval)
+				c.nextPassAt = lastPassStart.Add(minPassInterval)
 				c.statsMu.Unlock()
 				timer := time.NewTimer(wait)
 				select {
@@ -1484,11 +1391,29 @@ func (c *LocklessChecker) feedbackResolved(res *workResult) {
 // equal — exactly the case where reporting the older, further-along answer
 // would let a resume skip the damage.
 //
-// A watermark that is not yet available (no chunk has resolved) surfaces as
-// table.ErrWatermarkNotReady from the chunker, which the caller treats as
-// "nothing to persist".
+// Continuous verification reports nothing: it never finishes, so there is no
+// run to resume, and a restart requires full initial verification.
+//
+// Unlike the snapshot checker there is no "any difference found ⇒ no evidence"
+// gate here, and there does not need to be. Optimistic reads mismatch routinely
+// on a table taking writes, and almost all of those resolve on retry; gating on
+// the mismatch counter would discard the watermark on essentially every real
+// migration. What makes the prefix trustworthy instead is that a chunk is
+// reported to the chunker only once it has resolved clean.
+//
+// A watermark that is not yet available (no chunk has resolved) is reported as
+// an empty string rather than an error: nothing has resolved, so there is
+// nothing to persist, and that must not stop the caller writing the rest of its
+// checkpoint.
 func (c *LocklessChecker) ResumeWatermark() (string, error) {
-	return c.chunker.GetLowWatermark()
+	if c.continuous.Load() {
+		return "", nil
+	}
+	wm, err := c.chunker.GetLowWatermark()
+	if err != nil {
+		return "", nil
+	}
+	return wm, nil
 }
 
 // bucketPassed records a passed chunk into the per-pass attempts histogram.
@@ -1645,4 +1570,43 @@ func (c *LocklessChecker) DifferencesFound() uint64 {
 // concurrently with Run.
 func (c *LocklessChecker) FirstCleanPass() <-chan struct{} {
 	return c.firstCleanPassCh
+}
+
+// StartTime is when the current (or last) run began.
+func (c *LocklessChecker) StartTime() time.Time {
+	c.statsMu.RLock()
+	defer c.statsMu.RUnlock()
+	return c.started
+}
+
+// ExecTime is how long the current run has been going, or how long the last
+// one took.
+func (c *LocklessChecker) ExecTime() time.Duration {
+	c.statsMu.RLock()
+	defer c.statsMu.RUnlock()
+	if c.started.IsZero() || c.finished {
+		return c.elapsed
+	}
+	return time.Since(c.started)
+}
+
+func (c *LocklessChecker) GetProgress() status.ChecksumProgress {
+	return c.ChecksumStatus().Progress
+}
+
+// ChecksumStatus reports rows verified rather than rows walked. The chunker
+// advances on feedback, and this checker gives feedback only for a chunk that
+// resolved clean (see feedbackResolved), so its progress is verification
+// progress. Before that was so, this reported 0 until the first clean pass and
+// then jumped to the whole table, which read as a stalled checksum for the
+// entire run.
+func (c *LocklessChecker) ChecksumStatus() ChecksumStatus {
+	stats := c.Stats()
+	verified, _, total := c.chunker.Progress()
+	if !stats.FirstCleanPassAt.IsZero() {
+		// A completed clean pass verified everything, including the ranges that
+		// were repaired or deferred and so never fed back.
+		verified = total
+	}
+	return ChecksumStatus{Progress: status.ChecksumProgress{RowsChecked: verified, RowsTotal: total}, Optimistic: &stats}
 }
