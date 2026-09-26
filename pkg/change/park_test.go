@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -49,13 +50,14 @@ func TestParkGate(t *testing.T) {
 	require.ErrorIs(t, g.wait(ctx), context.Canceled)
 }
 
-// TestRowWaiterObserve: the waiter is what decides an event is *the* event, and
-// it has to keep counting after it fires. A multi-row event goes on dispatching
+// TestParkedRowObserve: the parked row is what decides an event is *the* event,
+// and it has to keep counting after it fires. A multi-row event goes on dispatching
 // after the gate is armed, so a second change to the same key can still land —
 // and the flush that follows would carry it, making the captured image stale.
-func TestRowWaiterObserve(t *testing.T) {
+func TestParkedRowObserve(t *testing.T) {
 	matches := func(key []any) bool { return key[0] == int64(1) }
-	w := newRowWaiter(RowWatch{Schema: "test", Table: "t1", Match: matches})
+	var g parkGate
+	w := newParkedRow(RowWatch{Schema: "test", Table: "t1", Match: matches}, &g)
 
 	require.False(t, w.observe("test", "t2", []any{int64(1)}, []any{int64(1)}, false), "wrong table")
 	require.False(t, w.observe("other", "t1", []any{int64(1)}, []any{int64(1)}, false), "wrong schema")
@@ -72,10 +74,10 @@ func TestRowWaiterObserve(t *testing.T) {
 		t.Fatal("observe must not wake the verification: the change is not buffered yet")
 	default:
 	}
-	var g parkGate
-	w.parkAndRelease(&g)
-	w.parkAndRelease(&g) // the caller cannot know it is the first; twice is safe
+	w.Release()
+	w.Release() // the caller cannot know it is the first; twice is safe
 	require.True(t, gateIsParked(&g), "the firing change must hold the reader")
+	(*ParkedRow)(nil).Release() // nil is the common case, and must be a no-op
 	<-w.ch
 	key, image, deleted, rewritten := w.result()
 	require.Equal(t, []any{int64(1)}, key)
@@ -90,16 +92,15 @@ func TestRowWaiterObserve(t *testing.T) {
 	require.True(t, rewritten, "the caller must be told the image it holds is stale")
 
 	// A watch with no matcher matches nothing rather than everything.
-	require.False(t, newRowWaiter(RowWatch{Schema: "test", Table: "t1"}).
+	require.False(t, newParkedRow(RowWatch{Schema: "test", Table: "t1"}, &g).
 		observe("test", "t1", []any{int64(1)}, nil, false))
 }
 
-// verifyHarness drives verifyRowAtNextChange without a server: it stands in for
-// the reader goroutine, so the test controls exactly when the watched change is
+// verifyHarness drives RowParker.Verify without a server: it stands in for the
+// reader goroutine, so the test controls exactly when the watched change is
 // dispatched and can see whether the gate held afterwards.
 type verifyHarness struct {
-	gate parkGate
-	slot atomic.Pointer[rowWaiter]
+	parker RowParker
 	// armed closes once the watch is live. Dispatching before that would
 	// deliver the change with nobody listening, which is the ordering bug the
 	// arm-before-unpark step exists to prevent — so the harness must not
@@ -122,28 +123,37 @@ func newVerifyHarness() *verifyHarness {
 }
 
 func (h *verifyHarness) run(ctx context.Context, watch RowWatch, verify RowVerifier) error {
-	return verifyRowAtNextChange(ctx, &h.gate,
-		func(w *rowWaiter) { h.slot.Store(w); h.once.Do(func() { close(h.armed) }) },
-		func() { h.slot.Store(nil) },
+	// Arming is internal to Verify, so the harness watches for it rather than
+	// hooking it. Bounded, because a Verify that returns before the watcher
+	// observes the slot would otherwise leave this goroutine spinning for the
+	// rest of the run; closing armed unarmed just makes the test fail on its
+	// own assertion instead.
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for h.parker.slot.Load() == nil && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		h.once.Do(func() { close(h.armed) })
+	}()
+	return h.parker.Verify(ctx, watch, verify,
 		func(ctx context.Context) error {
 			h.flushes.Add(1)
 			if h.flushFn != nil {
 				return h.flushFn(ctx)
 			}
 			return nil
-		}, watch, verify)
+		},
+		func() bool { return true })
 }
 
 // dispatch is what a client's dispatchRow does, in the same order.
 func (h *verifyHarness) dispatch(key, image []any, deleted bool) {
-	watched := watchRow(&h.slot, &table.TableInfo{SchemaName: "test", TableName: "t1"}, key, image, deleted)
+	watched := h.parker.Watch(&table.TableInfo{SchemaName: "test", TableName: "t1"}, key, image, deleted)
 	if h.blockBuffer != nil {
 		h.blockBuffer()
 	}
 	h.buffered = append(h.buffered, key)
-	if watched != nil {
-		watched.parkAndRelease(&h.gate)
-	}
+	watched.Release()
 }
 
 // readerParked reports whether a reader arriving at the gate right now would be
@@ -152,7 +162,7 @@ func (h *verifyHarness) dispatch(key, image []any, deleted bool) {
 func (h *verifyHarness) readerParked() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	return h.gate.wait(ctx) != nil
+	return h.parker.Wait(ctx) != nil
 }
 
 func gateIsParked(g *parkGate) bool {
@@ -189,7 +199,7 @@ func TestVerifyRowAtNextChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []any{int64(1), "image"}, sawImage)
 	require.False(t, h.readerParked(), "the reader must be released once the verification is done")
-	require.Nil(t, h.slot.Load(), "the watch must be disarmed")
+	require.Nil(t, h.parker.slot.Load(), "the watch must be disarmed")
 }
 
 // TestVerifyRowAtNextChangeFailures: every way this can fail has to leave the
@@ -252,12 +262,12 @@ func TestVerifyRowAtNextChangeFailures(t *testing.T) {
 			require.ErrorIs(t, h.run(ctx, anyRow, verify), tc.wantErr)
 			wg.Wait()
 			require.False(t, h.readerParked(), "the reader must be released on every failure path")
-			require.Nil(t, h.slot.Load())
+			require.Nil(t, h.parker.slot.Load())
 		})
 	}
 }
 
-// TestRowWaiterAbandon pins the rule that makes the park safe to arm from
+// TestParkedRowAbandon pins the rule that makes the park safe to arm from
 // inside a dispatch: only a live verification's waiter may hold the reader.
 //
 // A dispatch and the verification that armed it run on different goroutines,
@@ -265,24 +275,24 @@ func TestVerifyRowAtNextChangeFailures(t *testing.T) {
 // while a dispatch is still on its way to parking. Parking for a verification
 // that is gone stops replication for the rest of the run, because the only
 // thing that would have unparked it is the verification itself.
-func TestRowWaiterAbandon(t *testing.T) {
+func TestParkedRowAbandon(t *testing.T) {
 	var g parkGate
-	w := newRowWaiter(anyRow)
+	w := newParkedRow(anyRow, &g)
 
 	// A dispatch that lands while the verification is live parks the reader.
 	require.True(t, w.observe("test", "t1", []any{int64(1)}, nil, false))
-	w.parkAndRelease(&g)
+	w.Release()
 	require.True(t, gateIsParked(&g))
 	<-w.ch
 
 	// Abandoning releases whatever that dispatch parked: the verification is
 	// the only thing that can, and it is leaving.
-	w.abandon(&g)
+	w.abandon()
 	require.False(t, gateIsParked(&g))
 
-	// And no dispatch still in flight on the same waiter can park it again.
-	w.parkAndRelease(&g)
-	require.False(t, gateIsParked(&g), "an abandoned waiter must not park the reader")
+	// And no dispatch still in flight on the same row can park it again.
+	w.Release()
+	require.False(t, gateIsParked(&g), "an abandoned row must not park the reader")
 }
 
 // TestVerifyRowAtNextChangeAbandonsInFlightDispatch is the same rule end to
@@ -314,7 +324,7 @@ func TestVerifyRowAtNextChangeAbandonsInFlightDispatch(t *testing.T) {
 	wg.Wait()
 	require.False(t, h.readerParked(),
 		"a dispatch that finishes after the verification gave up must not park the reader")
-	require.Nil(t, h.slot.Load())
+	require.Nil(t, h.parker.slot.Load())
 }
 
 // TestFlushParked: the parked drain answers "did everything land", because that
@@ -354,22 +364,24 @@ func TestFlushParked(t *testing.T) {
 // moved past and calls it a divergence.
 func TestDispatchRowOrdering(t *testing.T) {
 	tbl := &table.TableInfo{SchemaName: "test", TableName: "t1"}
-	for name, dispatch := range map[string]func(sub Subscription, watch *rowWaiter) *parkGate{
-		"binlog": func(sub Subscription, watch *rowWaiter) *parkGate {
+	for name, newClient := range map[string]func() (*RowParker, func(Subscription)){
+		"binlog": func() (*RowParker, func(Subscription)) {
 			c := &binlogClient{subs: newSubscriptionRegistry()}
-			c.rowWatch.Store(watch)
-			c.dispatchRow(sub, tbl, []any{int64(1)}, []any{int64(1)}, false)
-			return &c.park
+			return &c.parker, func(sub Subscription) {
+				c.dispatchRow(sub, tbl, []any{int64(1)}, []any{int64(1)}, false)
+			}
 		},
-		"gtid": func(sub Subscription, watch *rowWaiter) *parkGate {
+		"gtid": func() (*RowParker, func(Subscription)) {
 			c := &gtidClient{subs: newSubscriptionRegistry()}
-			c.rowWatch.Store(watch)
-			c.dispatchRow(sub, tbl, []any{int64(1)}, []any{int64(1)}, false)
-			return &c.park
+			return &c.parker, func(sub Subscription) {
+				c.dispatchRow(sub, tbl, []any{int64(1)}, []any{int64(1)}, false)
+			}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			watch := newRowWaiter(anyRow)
+			parker, dispatch := newClient()
+			watch := newParkedRow(anyRow, &parker.gate)
+			parker.slot.Store(watch)
 
 			// The firing change: it must be buffered before anything wakes the
 			// verification, or the flush would run without it.
@@ -380,9 +392,9 @@ func TestDispatchRowOrdering(t *testing.T) {
 				default:
 				}
 			}}
-			gate := dispatch(first, watch)
+			dispatch(first)
 			require.Equal(t, 1, first.changes, "the change must reach the subscription")
-			require.True(t, gateIsParked(gate), "the matching change must park the reader")
+			require.True(t, gateIsParked(&parker.gate), "the matching change must park the reader")
 			<-watch.ch
 
 			// A rewrite: counted before it is buffered, so a flush cannot carry
@@ -391,7 +403,7 @@ func TestDispatchRowOrdering(t *testing.T) {
 				_, _, _, rewritten := watch.result()
 				require.True(t, rewritten, "a rewrite must be counted before it can be buffered")
 			}}
-			dispatch(second, watch)
+			dispatch(second)
 			require.Equal(t, 1, second.changes)
 		})
 	}
@@ -488,7 +500,7 @@ func TestVerifyRowAtNextChangeLive(t *testing.T) {
 
 	// And the stream keeps moving afterwards: a verification releases the
 	// reader whatever happened.
-	require.False(t, gateIsParked(&client.park), "a verification must release the reader")
+	require.False(t, gateIsParked(&client.parker.gate), "a verification must release the reader")
 }
 
 // TestVerifyRowAtNextChangeRewrittenDuringVerify pins the second read of the

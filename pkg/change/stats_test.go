@@ -549,3 +549,51 @@ func TestStatusRowMergesFlushShapes(t *testing.T) {
 	require.Contains(t, row, "flush=1x125 (of 8x1000)")
 	require.Equal(t, row, StatusRow(narrow, wide), "order must not matter")
 }
+
+// parkingShapeStub reports both kinds of per-subscription figure, which is what
+// a real bufferedMap does — the point of MergeSubscriptions is that one call
+// collects them.
+type parkingShapeStub struct {
+	Subscription
+	parks      int64
+	parked     bool
+	effective  FlushShape
+	configured FlushShape
+}
+
+func (s *parkingShapeStub) ParkStats() (int64, bool) { return s.parks, s.parked }
+func (s *parkingShapeStub) FlushShapes() (FlushShape, FlushShape) {
+	return s.effective, s.configured
+}
+
+// MergeSubscriptions is the one call an out-of-tree Source makes to fill the
+// subscription-derived half of its FeedStats. It has to collect both kinds of
+// figure, on their own merge rules — a Source that got only one of them would
+// render a status block that silently drops the other.
+func TestMergeSubscriptionsCollectsBothKinds(t *testing.T) {
+	var stats FeedStats
+	stats.MergeSubscriptions([]Subscription{
+		&parkingShapeStub{
+			parks:      3,
+			effective:  FlushShape{Concurrency: 8, BatchSize: 1000},
+			configured: FlushShape{Concurrency: 8, BatchSize: 1000},
+		},
+		&parkingShapeStub{
+			parks:      4,
+			parked:     true,
+			effective:  FlushShape{Concurrency: 2, BatchSize: 250},
+			configured: FlushShape{Concurrency: 8, BatchSize: 1000},
+		},
+	})
+	require.Equal(t, int64(7), stats.Parks, "parks sum")
+	require.True(t, stats.IsParked, "one parked subscription stalls the reader")
+	require.Equal(t, FlushShape{Concurrency: 2, BatchSize: 250}, stats.FlushShape, "narrowest wins")
+	require.Equal(t, FlushShape{Concurrency: 8, BatchSize: 1000}, stats.ConfiguredFlushShape)
+
+	// Nothing to merge leaves the stats alone rather than zeroing what the
+	// Source already filled in.
+	stats = FeedStats{Parks: 9, FlushShape: FlushShape{Concurrency: 1, BatchSize: 1}}
+	stats.MergeSubscriptions(nil)
+	require.Equal(t, int64(9), stats.Parks)
+	require.Equal(t, FlushShape{Concurrency: 1, BatchSize: 1}, stats.FlushShape)
+}

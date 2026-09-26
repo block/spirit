@@ -434,26 +434,35 @@ Override via `ClientConfig.SubscriptionSoftLimitBytes`; pass a negative value to
 Such a row cannot be verified by reading both sides. Any SQL comparison is between a source image at one position and a target state at a later one, and closing that window means stopping the writes. But with `binlog_row_image=FULL`, an event's after-image **is** the source's value for that row at that position, so the verification becomes:
 
 ```
-VerifyRowAtNextChange(ctx, watch, verify):
+RowParker.Verify(ctx, watch, verify, drain, allFlushed):
   arm the watch, then release the reader
   on a change matching watch, dispatchRow does, in this order:
-      record it against the watch
+      RowParker.Watch records it against the watch
       buffer it into the subscription
-      park the reader and release the verification (unless it has given up)
+      ParkedRow.Release parks the reader and wakes the verification
+                        (unless the verification has given up)
   drain the buffer (not Flush — see below), so the target holds exactly that image
   call verify(key, image, deleted) with the reader still parked
   re-check for a rewrite, then disarm and unpark, whatever happened
 ```
 
+All of this is `RowParker`, which any `Source` — in-tree or out — embeds by value
+and wires into three places: `Wait(ctx)` in the read loop (after the event is
+read, before it is acted on), `Watch` / `Release` around the buffering step in
+the dispatch, and `Verify` from the interface method. A `Source` supplies only
+its own inner drain and its `AllChangesFlushed`. It is shared rather than
+reimplemented because every step below is a silent correctness bug when it is
+out of order, and none of them fails a test that uses a fake feed.
+
 Five details carry the correctness:
 
 - **The gate is checked after the event is read from the stream but before it is acted on**, so parking never consumes and discards an event. Dispatch resumes with it.
 - **The drain is not `Flush`.** `Flush` ends in `BlockWait`, which waits for the reader to reach the source's *current* position — and the reader is parked, by us, precisely so nothing past the watched event is admitted. That wait could never succeed. `flushParked` applies what is buffered, stops, and returns `ErrFlushIncomplete` if the buffer will not empty; the caller must then retry rather than treat a target difference as a divergence.
-- **A multi-row event keeps dispatching after the gate arms**, so a second change to the same key can still land. The waiter counts those, and the verification checks the count twice — once after the drain (which would otherwise carry the newer image) and once after `verify` returns, because the verifier reads a target that a periodic flush is still free to write to. Either check returns `ErrRowRewritten` rather than a verdict reached against a target that moved.
+- **A multi-row event keeps dispatching after the gate arms**, so a second change to the same key can still land. The parked row counts those, and the verification checks the count twice — once after the drain (which would otherwise carry the newer image) and once after `verify` returns, because the verifier reads a target that a periodic flush is still free to write to. Either check returns `ErrRowRewritten` rather than a verdict reached against a target that moved.
 - **Each of `dispatchRow`'s three steps is wrong anywhere else.** The verification reads the rewrite count *after* its flush, so a rewrite must be recorded before it can be buffered — otherwise a flush could carry the newer image to the target while the count still read zero, and the comparison would report a divergence against an image the target had already moved past. Equally, the verification must not be released until after the change is buffered, or the flush would run without it. `TestDispatchRowOrdering` pins both.
-- **Only a live verification's waiter may park the reader.** A dispatch and the verification that armed it are on different goroutines, and the verification can be gone by the time the dispatch reaches the park. Parking then stops the feed for the rest of the run, because that verification was the only thing that would have unparked it. `rowWaiter.parkAndRelease` and `rowWaiter.abandon` serialize on the waiter's mutex, so either the park is skipped or `abandon` undoes it.
+- **Only a live verification's row may park the reader.** A dispatch and the verification that armed it are on different goroutines, and the verification can be gone by the time the dispatch reaches the park. Parking then stops the feed for the rest of the run, because that verification was the only thing that would have unparked it. `ParkedRow.Release` and `ParkedRow.abandon` serialize on the row's mutex, so either the park is skipped or `abandon` undoes it. Disarming the watch first is not enough on its own: a dispatch already holds the pointer it loaded from the slot.
 
-One verification runs at a time (`verifyMu`), which is what makes a single watch slot enough.
+One verification runs at a time (`RowParker.verifyMu`), which is what makes a single watch slot enough.
 
 This park is unrelated to the [memory backpressure](#memory-backpressure) park, which blocks inside `HasChanged`. The two interact in exactly one place: a watch is offered the change *before* `HasChanged`, so it does fire while a subscription is over its soft limit — but the verification is not woken until the change is buffered, so it times out and defers, and the dispatch arrives at the park long after the verification is gone. That is the case `abandon` exists for.
 
@@ -461,6 +470,24 @@ This park is unrelated to the [memory backpressure](#memory-backpressure) park, 
 
 - **Automatic recovery**: Handles transient errors and reconnects to the binlog stream without data loss
 - **DDL detection**: Monitors for schema changes and notifies the migration coordinator. This is used to abandon any schema changes if the table was externally modified.
+
+## Implementing a Source
+
+`Source` is a wide interface, but two of its methods are shared machinery rather
+than per-backend work, and an implementation that rolls its own gets them subtly
+wrong in ways no test catches:
+
+- **`VerifyRowAtNextChange`** — embed a [`RowParker`](#parking-at-a-row-change-verifyrowatnextchange)
+  by value and wire it into the read loop, the dispatch and the method. Supply
+  only the backend's inner drain and its `AllChangesFlushed`.
+- **`FeedStats`** — fill the fields the backend knows (last flush, buffered
+  position and event time, and whatever its own reader counts), then call
+  `stats.MergeSubscriptions(subs)` for the rest. The rules for combining the
+  per-subscription figures are not guessable: parks sum while `IsParked` ORs,
+  and the flush shape is the *narrowest* effective one paired with the
+  configured width it is narrow relative to. A field a backend genuinely has no
+  analogue for — binlog rotations, on a source with no binlog files — stays
+  zero, and the status row prints it as zero rather than hiding the feed.
 
 ## Testing against a Source
 

@@ -150,6 +150,24 @@ type ParkReporter interface {
 	ParkStats() (parks int64, parked bool)
 }
 
+// MergeSubscriptions folds the per-subscription figures — the park counters and
+// the flush shapes — into stats. Every Source calls it from FeedStats with its
+// own subscriptions.
+//
+// It is one call rather than each Source walking its subscriptions itself
+// because the rules for combining them are not guessable: parks sum while
+// IsParked ORs, and the flush shape is the *narrowest* effective one paired
+// with the configured width it is narrow relative to. Getting either wrong
+// renders a status block that misreports which feed is struggling, and nothing
+// fails.
+//
+// Callers must not hold their own mutex: this reaches into each subscription's
+// lock, and subscriptions take the Source's lock on their flush paths.
+func (s *FeedStats) MergeSubscriptions(subs []Subscription) {
+	mergeParkStats(s, subs)
+	mergeFlushShapes(s, subs)
+}
+
 // mergeParkStats folds the park stats of subs into stats. Parks sum because
 // each subscription throttles the shared reader independently; IsParked ORs
 // because one parked subscription is enough to stall it.
