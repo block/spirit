@@ -285,7 +285,7 @@ func (c *SingleChecker) initConnPool(ctx context.Context) error {
 	if err := c.feed.Flush(ctx); err != nil {
 		return err
 	}
-	// Lock the source and target table in a trx
+	// Lock the source and target tables on a dedicated connection
 	// so the connection is not used by others
 	c.logger.Info("starting checksum operation, this will require a table lock")
 

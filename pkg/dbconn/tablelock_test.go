@@ -63,7 +63,7 @@ func TestExecUnderLock(t *testing.T) {
 	err = lock.ExecUnderLock(t.Context(), "INSERT INTO testunderlock VALUES (1, 1)", "", "INSERT INTO testunderlock VALUES (2, 2)")
 	require.NoError(t, err) // pass, under write lock.
 
-	// Try to execute a statement that is not in the lock transaction though
+	// Try to write to the locked table through a different connection.
 	// It is expected to fail.
 	err = Exec(t.Context(), db, "INSERT INTO testunderlock VALUES (3, 3)")
 	require.Error(t, err)
@@ -294,7 +294,9 @@ func TestTableLockCleanup(t *testing.T) {
 			require.NoError(t, lock.Close(cleanupCtx))
 			require.ErrorIs(t, lock.ExecUnderLock(t.Context(), "SELECT 1"), sql.ErrConnDone)
 
-			probeCtx, cancelProbe := context.WithTimeout(t.Context(), 5*time.Second)
+			// The server may take time to notice a disconnected client during SLEEP.
+			// Leave room for lock release plus the subsequent probes on loaded CI.
+			probeCtx, cancelProbe := context.WithTimeout(t.Context(), 15*time.Second)
 			defer cancelProbe()
 			_, err = tt.DB.ExecContext(probeCtx, "INSERT INTO tablelock_cleanup VALUES (1)")
 			require.NoError(t, err, "other sessions must no longer be blocked")

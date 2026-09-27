@@ -836,7 +836,7 @@ func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTabl
 			var affected int64
 			var err error
 			// Execute under this shard's own lock if locks were provided.
-			// The lock transaction is the only connection allowed to write
+			// The lock connection is the only connection allowed to write
 			// to this shard's table while LOCK TABLES is held.
 			if shardLocks != nil {
 				if err = shardLocks[shard.shardID].ExecUnderLock(ctx, deleteStmt); err != nil {
@@ -1048,7 +1048,7 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 			var err error
 
 			// Execute under this shard's own lock if locks were provided.
-			// The lock transaction is the only connection allowed to write
+			// The lock connection is the only connection allowed to write
 			// to this shard's table while LOCK TABLES is held.
 			if shardLocks != nil {
 				if err = shardLocks[sid].ExecUnderLock(ctx, upsertStmt); err != nil {

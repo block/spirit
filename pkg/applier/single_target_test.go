@@ -1330,7 +1330,7 @@ func TestSingleTargetApplierDynamicScaling(t *testing.T) {
 }
 
 // TestSingleTargetApplierUnderLock verifies the under-lock write path:
-// with one lock the statements execute on the lock's own transaction, and
+// with one lock the statements execute on the lock's own connection, and
 // supplying more than one lock is rejected (the single-target applier
 // writes through exactly one server, so multiple locks indicate a caller
 // bug such as per-shard locks being passed to the wrong applier).
@@ -1370,7 +1370,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 		[][]any{{int64(1)}}, []*dbconn.TableLock{lock, lock})
 	require.ErrorContains(t, err, "at most one table lock")
 
-	// A single lock executes on the lock transaction.
+	// A single lock executes on the lock connection.
 	affected, err := applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
 		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock})
 	require.NoError(t, err)
