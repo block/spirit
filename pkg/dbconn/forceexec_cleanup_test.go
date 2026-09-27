@@ -66,16 +66,17 @@ func TestWaitForKilledTransactionsHonorsCancellation(t *testing.T) {
 	db, err := New(testutils.DSN(), NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
-	blocker, err := db.BeginTx(t.Context(), nil)
+	// This test needs a live session, not a transaction or a metadata lock.
+	conn, err := db.Conn(t.Context())
 	require.NoError(t, err)
-	defer func() { _ = blocker.Rollback() }()
+	defer utils.CloseAndLog(conn)
 	var pid int
-	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
+	require.NoError(t, conn.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	require.ErrorIs(t, waitForKilledTransactions(ctx, db, []int{pid}), context.DeadlineExceeded)
 	var alive int
-	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT 1").Scan(&alive))
+	require.NoError(t, conn.QueryRowContext(t.Context(), "SELECT 1").Scan(&alive))
 	require.Equal(t, 1, alive, "waiting must never kill a session")
 	// Already-gone sessions and the empty set do not wait on unrelated sessions.
 	require.NoError(t, waitForKilledTransactions(t.Context(), db, nil))
@@ -93,6 +94,7 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				db, err := New(testutils.DSN(), config)
 				require.NoError(t, err)
 				defer utils.CloseAndLog(db)
+				// Keep the SELECT's metadata lock until Rollback so ALTER TABLE blocks.
 				blocker, err := tt.DB.BeginTx(t.Context(), nil)
 				require.NoError(t, err)
 				defer func() { _ = blocker.Rollback() }()
@@ -158,6 +160,7 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
+	// Keep the SELECT's metadata lock until Rollback so ALTER TABLE blocks.
 	blocker, err := tt.DB.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	defer func() { _ = blocker.Rollback() }()
@@ -201,6 +204,7 @@ func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {
 	defer utils.CloseAndLog(db)
 	SetPoolSize(db, 1)
 
+	// Keep the SELECT's metadata lock until Rollback so ALTER TABLE blocks.
 	blocker, err := tt.DB.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	defer func() { _ = blocker.Rollback() }()
