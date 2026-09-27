@@ -45,6 +45,8 @@ Lock names are deterministic hashes of `schema.table`, truncated with a SHA1 suf
 
 Table locks are session-scoped, so the helper reserves a dedicated `sql.Conn` until `Close`. A transaction cannot provide that ownership: cancellation can automatically roll it back and return its connection to the pool while table locks remain held. Callers must defer `Close` after successful acquisition. It ignores the caller's cancellation and starts its own 30-second cleanup timeout when invoked. A successful unlock returns the connection to the pool; a failed unlock or failed acquisition discards the connection. This does not depend on driver session-reset support.
 
+Discarding prevents reuse of the session, but does not guarantee that server-side locks have been released when `Close` returns. If a statement was interrupted, MySQL may retain the session and its locks until that statement detects the disconnected client or finishes.
+
 ## Transaction Pool
 
 `TrxPool` pre-creates a pool of `REPEATABLE READ` transactions with `START TRANSACTION WITH CONSISTENT SNAPSHOT`. This ensures all worker threads see the same point-in-time data, which is essential for parallel checksum verification.

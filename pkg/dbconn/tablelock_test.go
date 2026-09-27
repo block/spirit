@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -338,4 +339,34 @@ func TestTableLockAcquisitionFailureReleasesConnection(t *testing.T) {
 	var after int
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&after))
 	require.NotEqual(t, before, after, "failed acquisition must discard the session")
+}
+
+func TestTableLockCloseDuringExecUnderLock(t *testing.T) {
+	testutils.NewTestTable(t, "tablelock_concurrent", "CREATE TABLE tablelock_concurrent (id INT PRIMARY KEY)")
+	cfg := testConfig()
+	cfg.ForceKill = false
+	db, err := New(testutils.DSN(), cfg)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	lock, err := NewTableLock(t.Context(), db, []*table.TableInfo{{TableName: "tablelock_concurrent"}}, cfg, slog.Default())
+	require.NoError(t, err)
+	defer utils.CloseAndLogWithContext(t.Context(), lock)
+
+	started := make(chan struct{})
+	execErr := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		close(started)
+		execErr <- lock.ExecUnderLock(t.Context(), "SELECT SLEEP(0.2)")
+	})
+	<-started
+	closeErr := lock.Close(t.Context())
+	wg.Wait()
+	require.NoError(t, closeErr)
+	// Either execution owns the connection first, or Close finishes first.
+	// Both orderings must be safe, including under the race detector.
+	if err := <-execErr; err != nil {
+		require.ErrorIs(t, err, sql.ErrConnDone)
+	}
+	require.Zero(t, db.Stats().InUse)
 }
