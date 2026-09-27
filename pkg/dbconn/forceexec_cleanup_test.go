@@ -94,6 +94,8 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				db, err := New(testutils.DSN(), config)
 				require.NoError(t, err)
 				defer utils.CloseAndLog(db)
+				// The retry must reuse the reserved session, not borrow a second one.
+				SetPoolSize(db, 1)
 				// Keep the SELECT's metadata lock until Rollback so ALTER TABLE blocks.
 				blocker, err := tt.DB.BeginTx(t.Context(), nil)
 				require.NoError(t, err)
