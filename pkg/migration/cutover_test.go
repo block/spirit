@@ -1243,3 +1243,52 @@ func TestMultiTableMigrationBlockedPerSchema(t *testing.T) {
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
 	require.NoError(t, runningA.wait(t))
 }
+
+type cancelFlushSource struct {
+	change.MockSource
+	cancel context.CancelFunc
+}
+
+func (s *cancelFlushSource) FlushUnderTableLock(ctx context.Context, _ []*dbconn.TableLock) error {
+	s.cancel()
+	return ctx.Err()
+}
+
+func TestCutoverCancellationReleasesTableLocks(t *testing.T) {
+	tt := testutils.NewTestTable(t, "cutover_cancel_cleanup", "CREATE TABLE cutover_cancel_cleanup (id INT PRIMARY KEY)")
+	testutils.RunSQL(t, "CREATE TABLE _cutover_cancel_cleanup_new (id INT PRIMARY KEY)")
+	testutils.NewTestTable(t, "cutover_cancel_unrelated", "CREATE TABLE cutover_cancel_unrelated (id INT PRIMARY KEY)")
+	cfg := dbconn.NewDBConfig()
+	cfg.ForceKill = false
+	db, err := dbconn.New(testutils.DSN(), cfg)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	dbconn.SetPoolSize(db, 1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := &CutOver{
+		db: db, dbConfig: cfg, logger: slog.Default(),
+		feed: &cancelFlushSource{cancel: cancel},
+	}
+	err = c.executeRenameUnderLock(ctx, []*table.TableInfo{
+		{TableName: "cutover_cancel_cleanup"},
+		{TableName: "_cutover_cancel_cleanup_new"},
+	}, []string{
+		"cutover_cancel_cleanup TO _cutover_cancel_cleanup_old",
+		"_cutover_cancel_cleanup_new TO cutover_cancel_cleanup",
+	}, true)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, db.Stats().InUse)
+	probeCtx, cancelProbe := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelProbe()
+	// An independent writer must be unblocked, and the next pool borrower
+	// must be able to access an unrelated table without error 1100.
+	_, err = tt.DB.ExecContext(probeCtx, "INSERT INTO cutover_cancel_cleanup VALUES (1)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(probeCtx, "INSERT INTO cutover_cancel_unrelated VALUES (1)")
+	require.NoError(t, err)
+	// The failed flush must not have reached the rename.
+	_, err = db.ExecContext(probeCtx, "INSERT INTO _cutover_cancel_cleanup_new VALUES (1)")
+	require.NoError(t, err)
+}

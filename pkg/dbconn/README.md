@@ -41,7 +41,9 @@ Lock names are deterministic hashes of `schema.table`, truncated with a SHA1 suf
 
 ## Table Lock
 
-`TableLock` wraps MySQL's `LOCK TABLES ... WRITE` statement. It integrates with the force-kill mechanism to automatically kill blocking transactions if the lock cannot be acquired within the timeout. This is used during the cutover phase.
+`TableLock` wraps MySQL's `LOCK TABLES ... WRITE` statement. It integrates with the force-kill mechanism to automatically kill blocking transactions if the lock cannot be acquired within the timeout. This is used during checksum setup and cutover.
+
+Table locks are session-scoped, so the helper reserves a dedicated `sql.Conn` until `Close`. A transaction cannot provide that ownership: cancellation can automatically roll it back and return its connection to the pool while table locks remain held. Callers must defer `Close` after successful acquisition. It ignores the caller's cancellation and starts its own 30-second cleanup timeout when invoked. A successful unlock returns the connection to the pool; a failed unlock or failed acquisition discards the connection. This does not depend on driver session-reset support.
 
 ## Transaction Pool
 

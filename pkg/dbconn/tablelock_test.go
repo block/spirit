@@ -1,10 +1,13 @@
 package dbconn
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -56,6 +59,7 @@ func TestExecUnderLock(t *testing.T) {
 	tbl := &table.TableInfo{SchemaName: "test", TableName: "testunderlock", QuotedTableName: "`testunderlock`"}
 	lock, err := NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), slog.Default())
 	require.NoError(t, err)
+	defer utils.CloseAndLogWithContext(t.Context(), lock)
 	err = lock.ExecUnderLock(t.Context(), "INSERT INTO testunderlock VALUES (1, 1)", "", "INSERT INTO testunderlock VALUES (2, 2)")
 	require.NoError(t, err) // pass, under write lock.
 
@@ -228,4 +232,108 @@ func TestTableLockCrossSchema(t *testing.T) {
 			require.Equal(t, 2, id1)
 		})
 	}
+}
+
+// TestTableLockCleanup verifies both sides of session cleanup: other sessions
+// can write to the locked table, and the next borrower can use unrelated tables.
+func TestTableLockCleanup(t *testing.T) {
+	for _, mode := range []string{"normal", "cancel_acquisition_context", "cancel_cleanup_context", "expired_cleanup_context", "lost_connection", "cancel_inflight_query", "discard_locked_session"} {
+		t.Run(mode, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "tablelock_cleanup", "CREATE TABLE tablelock_cleanup (id INT PRIMARY KEY)")
+			testutils.NewTestTable(t, "tablelock_unrelated", "CREATE TABLE tablelock_unrelated (id INT PRIMARY KEY)")
+			cfg := testConfig()
+			cfg.ForceKill = false
+			db, err := New(testutils.DSN(), cfg)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			db.SetMaxOpenConns(1)
+			db.SetMaxIdleConns(1)
+			var before int
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&before))
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			lock, err := NewTableLock(ctx, db, []*table.TableInfo{{TableName: "tablelock_cleanup"}}, cfg, slog.Default())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = lock.Close(context.Background()) })
+			cleanupCtx := t.Context()
+			switch mode {
+			case "cancel_acquisition_context":
+				cancel()
+				cleanupCtx = ctx
+				// Cancellation while idle must not give the locked session away.
+				require.Equal(t, 1, db.Stats().InUse)
+			case "cancel_cleanup_context":
+				var cancelCleanup context.CancelFunc
+				cleanupCtx, cancelCleanup = context.WithCancel(t.Context())
+				cancelCleanup()
+			case "expired_cleanup_context":
+				var cancelCleanup context.CancelFunc
+				cleanupCtx, cancelCleanup = context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+				defer cancelCleanup()
+			case "cancel_inflight_query":
+				queryCtx, cancelQuery := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				err = lock.ExecUnderLock(queryCtx, "SELECT SLEEP(10)")
+				cancelQuery()
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+			case "lost_connection":
+				_, err = tt.DB.ExecContext(t.Context(), fmt.Sprintf("KILL CONNECTION %d", before))
+				require.NoError(t, err)
+			case "discard_locked_session":
+				// Exercise the error-path discard on a live locked session:
+				// merely calling Conn.Close would leak this lock into the pool.
+				require.NoError(t, discardTableLockConn(lock.lockConn))
+			}
+			err = lock.Close(cleanupCtx)
+			if mode == "lost_connection" || mode == "cancel_inflight_query" || mode == "discard_locked_session" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Zero(t, db.Stats().InUse)
+			require.NoError(t, lock.Close(cleanupCtx))
+			require.ErrorIs(t, lock.ExecUnderLock(t.Context(), "SELECT 1"), sql.ErrConnDone)
+
+			probeCtx, cancelProbe := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancelProbe()
+			_, err = tt.DB.ExecContext(probeCtx, "INSERT INTO tablelock_cleanup VALUES (1)")
+			require.NoError(t, err, "other sessions must no longer be blocked")
+			_, err = db.ExecContext(probeCtx, "INSERT INTO tablelock_unrelated VALUES (1)")
+			require.NoError(t, err, "the next borrower must not inherit table locks")
+			var after int
+			require.NoError(t, db.QueryRowContext(probeCtx, "SELECT CONNECTION_ID()").Scan(&after))
+			if mode == "lost_connection" || mode == "cancel_inflight_query" || mode == "discard_locked_session" {
+				require.NotEqual(t, before, after)
+			} else {
+				require.Equal(t, before, after, "successful unlock should preserve the session")
+			}
+		})
+	}
+}
+
+func TestTableLockAcquisitionFailureReleasesConnection(t *testing.T) {
+	tt := testutils.NewTestTable(t, "tablelock_acquisition", "CREATE TABLE tablelock_acquisition (id INT PRIMARY KEY)")
+	cfg := testConfig()
+	cfg.ForceKill = false
+	db, err := New(testutils.DSN(), cfg)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	var before int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&before))
+	// The second name is absent, so acquiring the set must fail.
+	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{
+		{TableName: "tablelock_acquisition"},
+		{TableName: "tablelock_acquisition_missing"},
+	}, cfg, slog.Default())
+	require.Error(t, err)
+	require.Zero(t, db.Stats().InUse)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err = tt.DB.ExecContext(ctx, "INSERT INTO tablelock_acquisition VALUES (1)")
+	require.NoError(t, err)
+	var after int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&after))
+	require.NotEqual(t, before, after, "failed acquisition must discard the session")
 }

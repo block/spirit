@@ -3,6 +3,8 @@ package dbconn
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -12,11 +14,13 @@ import (
 	"github.com/block/spirit/pkg/table"
 )
 
+const tableUnlockTimeout = 30 * time.Second
+
 type TableLock struct {
-	db      *sql.DB // the connection pool the lock was acquired on
-	tables  []*table.TableInfo
-	lockTxn *sql.Tx
-	logger  *slog.Logger
+	db       *sql.DB // the connection pool the lock was acquired on
+	mu       sync.Mutex
+	lockConn *sql.Conn
+	logger   *slog.Logger
 }
 
 // NewTableLock creates a new server wide lock on multiple tables.
@@ -34,8 +38,6 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	if err := config.ValidateForceKillAfter(); err != nil {
 		return nil, err
 	}
-	var err error
-	var lockTxn *sql.Tx
 	var builder strings.Builder
 	builder.WriteString("LOCK TABLES ")
 	// Build the LOCK TABLES statement
@@ -47,19 +49,24 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	}
 	lockStmt := builder.String()
 
-	// Try and acquire the lock. No retries are permitted here.
-	lockTxn, pid, err := BeginStandardTrx(ctx, db, nil)
+	// Table locks belong to the session, not a transaction. A cancelled
+	// BeginTx context can return its connection to the pool without unlocking.
+	// Reserve the connection until Close has unlocked it or discarded it.
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
+	acquired := false
 	defer func() {
-		// Before we return an error, we need to now ensure that
-		// we rollback the transaction if it was opened,
-		// this helps prevent a connection leak.
-		if err != nil {
-			_ = lockTxn.Rollback()
+		if !acquired {
+			// A failed LOCK response may leave the server's lock state unknown.
+			_ = discardTableLockConn(conn)
 		}
 	}()
+	var pid int
+	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&pid); err != nil {
+		return nil, err
+	}
 	if config.ForceKill {
 		threshold := config.forceKillDelay()
 		var wg sync.WaitGroup
@@ -86,7 +93,7 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	// We need to lock all the tables we intend to write to while we have the lock.
 	// For each table, we need to lock both the main table and its _new table.
 	logger.Warn("trying to acquire table locks", "timeout", config.LockWaitTimeout)
-	_, err = lockTxn.ExecContext(ctx, lockStmt)
+	_, err = conn.ExecContext(ctx, lockStmt)
 	if err != nil {
 		logger.Warn("failed to acquire table lock(s)", "error", err)
 		return nil, err
@@ -95,17 +102,17 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	// Otherwise we are successful, we still log because
 	// it's a critical function.
 	logger.Warn("table lock(s) acquired")
+	acquired = true
 	return &TableLock{
-		db:      db,
-		tables:  tables,
-		lockTxn: lockTxn,
-		logger:  logger,
+		db:       db,
+		lockConn: conn,
+		logger:   logger,
 	}, nil
 }
 
 // DB returns the database connection pool this lock was acquired on.
 // Because LOCK TABLES ... WRITE blocks writes from every other connection,
-// any write to a locked table must go through this lock's own transaction.
+// any write to a locked table must go through this lock's own connection.
 // Callers holding locks on multiple servers (e.g. one per shard) use this
 // to match each lock to the target it belongs to.
 func (s *TableLock) DB() *sql.DB {
@@ -114,11 +121,16 @@ func (s *TableLock) DB() *sql.DB {
 
 // ExecUnderLock executes a set of statements under a table lock.
 func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lockConn == nil {
+		return sql.ErrConnDone
+	}
 	for _, stmt := range stmts {
 		if stmt == "" {
 			continue
 		}
-		_, err := s.lockTxn.ExecContext(ctx, stmt)
+		_, err := s.lockConn.ExecContext(ctx, stmt)
 		if err != nil {
 			return err
 		}
@@ -126,16 +138,40 @@ func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 	return nil
 }
 
-// Close closes the table lock
+// Close releases the table lock even if the caller's context has expired.
+// The cleanup budget starts here, after all work under the lock has finished.
+// A session whose unlock fails is discarded, never returned to the pool.
 func (s *TableLock) Close(ctx context.Context) error {
-	_, err := s.lockTxn.ExecContext(ctx, "UNLOCK TABLES")
-	if err != nil {
-		return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lockConn == nil {
+		return nil
 	}
-	err = s.lockTxn.Rollback()
-	if err != nil {
-		return err
+	conn := s.lockConn
+	s.lockConn = nil
+
+	unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tableUnlockTimeout)
+	defer cancel()
+	if _, err := conn.ExecContext(unlockCtx, "UNLOCK TABLES"); err != nil {
+		return errors.Join(err, discardTableLockConn(conn))
 	}
-	s.logger.Warn("table lock released")
-	return nil
+	err := conn.Close()
+	if err == nil {
+		s.logger.Warn("table lock released")
+	}
+	return err
+}
+
+// sql.Conn.Close alone returns the session to the pool. ErrBadConn through Raw
+// instructs database/sql to close the underlying connection instead.
+func discardTableLockConn(conn *sql.Conn) error {
+	err := conn.Raw(func(any) error { return driver.ErrBadConn })
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		err = nil
+	}
+	closeErr := conn.Close()
+	if errors.Is(closeErr, sql.ErrConnDone) {
+		closeErr = nil
+	}
+	return errors.Join(err, closeErr)
 }
