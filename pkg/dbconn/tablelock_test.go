@@ -365,8 +365,12 @@ func TestTableLockCloseDuringExecUnderLock(t *testing.T) {
 	require.NoError(t, closeErr)
 	// Either execution owns the connection first, or Close finishes first.
 	// Both orderings must be safe, including under the race detector.
+	// TestTableLockCleanup also checks execution after close deterministically.
 	if err := <-execErr; err != nil {
 		require.ErrorIs(t, err, sql.ErrConnDone)
+		t.Log("Close finished before ExecUnderLock acquired the connection")
+	} else {
+		t.Log("ExecUnderLock finished before Close released the connection")
 	}
 	require.Zero(t, db.Stats().InUse)
 }

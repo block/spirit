@@ -974,7 +974,7 @@ func setupShardedUnderLockTest(t *testing.T, prefix string) (sourceTable, target
 
 // TestShardedApplierUpsertRowsUnderLock is a regression test: when table
 // locks are supplied (one per shard), each shard's REPLACE must execute on
-// the transaction holding THAT shard's lock. Previously every shard's
+// the connection holding THAT shard's lock. Previously every shard's
 // statement was executed through the single supplied lock connection, so
 // all rows were written to one server and the other shards received
 // nothing.
@@ -1029,7 +1029,7 @@ func TestShardedApplierUpsertRowsUnderLock(t *testing.T) {
 
 // TestShardedApplierDeleteKeysUnderLock is a regression test: DeleteKeys
 // broadcasts to all shards, and when table locks are supplied each shard's
-// DELETE must execute on the transaction holding THAT shard's lock.
+// DELETE must execute on the connection holding THAT shard's lock.
 // Previously the DELETE was executed once per shard through the single
 // supplied lock connection, so only one server saw the deletes (N times)
 // and the other shards kept their rows.

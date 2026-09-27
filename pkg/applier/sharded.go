@@ -747,7 +747,7 @@ func (a *ShardedApplier) feedbackCoordinator(ctx context.Context) {
 // resolveShardLocks maps each shard to the table lock that was acquired on
 // that shard's own database connection. A LOCK TABLES ... WRITE held on a
 // shard blocks writes from every other connection, so each shard's
-// statements MUST execute on the transaction holding that shard's lock —
+// statements MUST execute on the connection holding that shard's lock —
 // executing them on another shard's lock connection would silently write
 // the rows to the wrong server.
 //
