@@ -54,7 +54,7 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 				_ = blocker.Rollback()
 			})
 			return []int{pid}, nil
-		}, waitForKilledTransactions)
+		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls, "must not kill a fresh set of blockers on retry")
 	var column string
@@ -129,7 +129,7 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 							return nil, fail()
 						}
 						return []int{pid}, nil
-					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail() })
+					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail() }, nil)
 				require.Equal(t, 1, killCalls)
 				if stage == "cleanup" {
 					require.Equal(t, 1, cleanupCalls)
@@ -183,7 +183,7 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 			case <-timer.C:
 			}
 			return nil, blocker.Rollback()
-		}, waitForKilledTransactions)
+		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
 	var count int
@@ -218,6 +218,7 @@ func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseWorker) }) }
 	result := make(chan error, 1)
+	statementDone := make(chan error, 1)
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		result <- forceExec(ctx, db, cfg, slog.Default(),
@@ -226,7 +227,7 @@ func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {
 				workerStarted <- pid
 				<-releaseWorker
 				return nil, nil
-			}, waitForKilledTransactions)
+			}, waitForKilledTransactions, func(err error) { statementDone <- err })
 	})
 	defer func() { release(); wg.Wait() }()
 
@@ -237,18 +238,14 @@ func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {
 		t.Fatal("force-kill worker did not start")
 	}
 	require.NoError(t, blocker.Rollback())
-	// Observe completion on the server instead of guessing when DDL finishes.
-	require.Eventually(t, func() bool {
-		var idle int
-		err := tt.DB.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM information_schema.processlist
-			 WHERE ID = ? AND COMMAND = 'Sleep'
-			 AND EXISTS (
-				SELECT 1 FROM information_schema.columns
-				WHERE table_schema = DATABASE() AND table_name = 'forceexec_session_owner' AND column_name = 'c'
-			 )`, pid).Scan(&idle)
-		return err == nil && idle == 1
-	}, 5*time.Second, 10*time.Millisecond)
+	// Server-side Sleep does not prove the client consumed the OK packet.
+	// Cancel only after ExecContext has returned and stopped its watcher.
+	select {
+	case err := <-statementDone:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal("DDL did not complete on the client")
+	}
 
 	cancel()
 	borrowCtx, cancelBorrow := context.WithTimeout(t.Context(), 200*time.Millisecond)

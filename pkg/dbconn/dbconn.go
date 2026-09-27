@@ -381,12 +381,14 @@ func ForceExec(ctx context.Context, db *sql.DB, tables []*table.TableInfo, dbCon
 	}
 	return forceExec(ctx, db, dbConfig, logger, stmt, func(ctx context.Context, connID int) ([]int, error) {
 		return killLockingTransactions(ctx, db, tables, dbConfig, logger, []int{connID})
-	}, waitForKilledTransactions)
+	}, waitForKilledTransactions, nil)
 }
 
 // forceExec receives the kill and cleanup operations so tests can control their
 // failures while exercising the statement and retry against real MySQL.
-func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog.Logger, stmt string, kill func(context.Context, int) ([]int, error), waitForCleanup func(context.Context, *sql.DB, []int) error) error {
+// afterExec, when provided by a test, observes the first client-side statement
+// result before the kill-worker join; production callers leave it nil.
+func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog.Logger, stmt string, kill func(context.Context, int) ([]int, error), waitForCleanup func(context.Context, *sql.DB, []int) error, afterExec func(error)) error {
 	if err := dbConfig.ValidateForceKillAfter(); err != nil {
 		return err
 	}
@@ -415,6 +417,9 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 		killed, killErr = kill(ctx, connID)
 	})
 	_, err = conn.ExecContext(ctx, stmt)
+	if afterExec != nil {
+		afterExec(err)
+	}
 	if timer.Stop() {
 		// Timer was stopped before it fired, so the goroutine never started.
 		// We need to manually decrement the WaitGroup.
