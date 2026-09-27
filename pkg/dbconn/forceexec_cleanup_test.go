@@ -27,7 +27,7 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 	require.NoError(t, err)
 	blockerDB.SetMaxIdleConns(0) // Rollback also closes the physical session.
 	t.Cleanup(func() { _ = blockerDB.Close() })
-	blocker, pid, err := BeginStandardTrx(t.Context(), blockerDB, nil)
+	blocker, err := blockerDB.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	// Simulate the interval between KILL's acknowledgement and server cleanup,
 	// using a real MDL-holding transaction. Release later than the old retry's
@@ -35,6 +35,8 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	var workers sync.WaitGroup
 	t.Cleanup(func() { cancel(); workers.Wait(); _ = blocker.Rollback() })
+	var pid int
+	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
 	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_delayed_cleanup")
 	require.NoError(t, err)
 	calls := 0
@@ -64,9 +66,11 @@ func TestWaitForKilledTransactionsHonorsCancellation(t *testing.T) {
 	db, err := New(testutils.DSN(), NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
-	blocker, pid, err := BeginStandardTrx(t.Context(), db, nil)
+	blocker, err := db.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	defer func() { _ = blocker.Rollback() }()
+	var pid int
+	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	require.ErrorIs(t, waitForKilledTransactions(ctx, db, []int{pid}), context.DeadlineExceeded)
@@ -89,9 +93,11 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				db, err := New(testutils.DSN(), config)
 				require.NoError(t, err)
 				defer utils.CloseAndLog(db)
-				blocker, pid, err := BeginStandardTrx(t.Context(), tt.DB, nil)
+				blocker, err := tt.DB.BeginTx(t.Context(), nil)
 				require.NoError(t, err)
 				defer func() { _ = blocker.Rollback() }()
+				var pid int
+				require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
 				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 				defer cancel()
 				_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_ancillary_failure")
@@ -152,7 +158,7 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
-	blocker, _, err := BeginStandardTrx(t.Context(), tt.DB, nil)
+	blocker, err := tt.DB.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	defer func() { _ = blocker.Rollback() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)

@@ -476,21 +476,6 @@ func TestForceExecBadFormatString(t *testing.T) {
 	require.ErrorContains(t, err, "missing arguments")
 }
 
-func TestStandardTrx(t *testing.T) {
-	config := NewDBConfig()
-	db, err := New(testutils.DSN(), config)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	trx, connID, err := BeginStandardTrx(t.Context(), db, nil)
-	require.NoError(t, err)
-	defer func() { _ = trx.Rollback() }()
-	var observedConnID int
-	err = trx.QueryRowContext(t.Context(), "SELECT connection_id()").Scan(&observedConnID)
-	require.NoError(t, err)
-	require.Equal(t, connID, observedConnID)
-}
-
 // TestRangeOptimizerRefusal covers the errCapacityExceeded (3170) branch of
 // the warning inspection: when range_optimizer_max_mem_size is too low MySQL
 // silently falls back to a table scan, so RetryableTransaction refuses the

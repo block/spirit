@@ -28,7 +28,7 @@ An important subtlety is that `RetryableTransaction` inspects `SHOW WARNINGS` af
 
 Both `ForceExec` and `NewTableLock` implement a timer-based force-kill pattern. They wait for `DBConfig.ForceKillAfter` (zero defaults to 90% of `LockWaitTimeout`), then query `performance_schema` to identify and kill transactions that are blocking metadata lock acquisition. `ForceExec` always arms the kill timer; for `NewTableLock` it is gated on `DBConfig.ForceKill` (default true), which programmatic callers such as datasync's read-only source disable for connections that must never kill.
 
-`ForceExec` reserves a `sql.Conn` for the connection ID lookup, DDL, kill-worker join, and optional retry. Cancellation cannot return an idle session to the pool while its kill worker still runs. DDL is not wrapped in a transaction; MySQL implicitly commits `ALTER TABLE`. Use `BeginStandardTrx` only when a real transaction is needed.
+`ForceExec` reserves a `sql.Conn` for the connection ID lookup, DDL, kill-worker join, and optional retry. Cancellation cannot return an idle session to the pool while its kill worker still runs. DDL is not wrapped in a transaction; MySQL implicitly commits `ALTER TABLE`. Use `sql.DB.BeginTx` when a real transaction is needed.
 
 There are two important safety constraints:
 

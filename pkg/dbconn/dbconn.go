@@ -469,20 +469,3 @@ func Exec(ctx context.Context, db *sql.DB, stmt string, args ...any) error {
 	_, err = db.ExecContext(ctx, stmt)
 	return err
 }
-
-// BeginStandardTrx is like db.BeginTx but returns the connection id.
-func BeginStandardTrx(ctx context.Context, db *sql.DB, opts *sql.TxOptions) (*sql.Tx, int, error) {
-	trx, err := db.BeginTx(ctx, opts)
-	if err != nil {
-		return nil, 0, err
-	}
-	// get the connection id.
-	var connectionID int
-	err = trx.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connectionID)
-	if err != nil {
-		// The caller never receives trx on failure, so we must release it.
-		_ = trx.Rollback()
-		return nil, 0, err
-	}
-	return trx, connectionID, nil
-}
