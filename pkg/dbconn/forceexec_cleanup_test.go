@@ -182,3 +182,78 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_no_kill' AND column_name = 'c'").Scan(&count))
 	require.Equal(t, 1, count)
 }
+
+// Cancellation after DDL has completed must not return the session to the pool
+// while the force-kill worker is still using its identity.
+func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_session_owner", "CREATE TABLE forceexec_session_owner (id INT PRIMARY KEY)")
+	cfg := NewDBConfig()
+	cfg.LockWaitTimeout = 5
+	cfg.ForceKillAfter = time.Millisecond
+	db, err := New(testutils.DSN(), cfg)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	SetPoolSize(db, 1)
+
+	blocker, err := tt.DB.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(t.Context(), "SELECT * FROM forceexec_session_owner")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	workerStarted := make(chan int, 1)
+	releaseWorker := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseWorker) }) }
+	result := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		result <- forceExec(ctx, db, cfg, slog.Default(),
+			"ALTER TABLE forceexec_session_owner ADD COLUMN c INT, ALGORITHM=INSTANT",
+			func(_ context.Context, pid int) ([]int, error) {
+				workerStarted <- pid
+				<-releaseWorker
+				return nil, nil
+			}, waitForKilledTransactions)
+	})
+	defer func() { release(); wg.Wait() }()
+
+	var pid int
+	select {
+	case pid = <-workerStarted:
+	case <-ctx.Done():
+		t.Fatal("force-kill worker did not start")
+	}
+	require.NoError(t, blocker.Rollback())
+	// Observe completion on the server instead of guessing when DDL finishes.
+	require.Eventually(t, func() bool {
+		var idle int
+		err := tt.DB.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM information_schema.processlist
+			 WHERE ID = ? AND COMMAND = 'Sleep'
+			 AND EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = DATABASE() AND table_name = 'forceexec_session_owner' AND column_name = 'c'
+			 )`, pid).Scan(&idle)
+		return err == nil && idle == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	cancel()
+	borrowCtx, cancelBorrow := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancelBorrow()
+	borrowed, borrowErr := db.Conn(borrowCtx)
+	if borrowed != nil {
+		_ = borrowed.Close()
+	}
+	require.ErrorIs(t, borrowErr, context.DeadlineExceeded,
+		"the session must remain reserved until the kill worker exits")
+	release()
+	wg.Wait()
+	require.NoError(t, <-result, "completed DDL must retain its successful result")
+	require.Zero(t, db.Stats().InUse)
+	var after int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&after))
+	require.Equal(t, pid, after, "the same session can be reused after the worker exits")
+}

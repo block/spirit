@@ -390,21 +390,18 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 	if err := dbConfig.ValidateForceKillAfter(); err != nil {
 		return err
 	}
-	trx, connId, err := BeginStandardTrx(ctx, db, nil)
+	// DDL needs session affinity for the connection ID and retry, not a
+	// transaction (ALTER TABLE implicitly commits). Keep ownership through
+	// the kill-worker join even if the caller cancels while the session is idle.
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		// We need to ensure we always clean up the transaction.
-		// In the typically case we are using this for non-transactional
-		// statements (and could rollback either way), but just to be safe
-		// we check the error and commit on-nil.
-		if err != nil {
-			_ = trx.Rollback()
-		} else {
-			_ = trx.Commit()
-		}
-	}()
+	defer utils.CloseAndLog(conn)
+	var connID int
+	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+		return err
+	}
 
 	duration := dbConfig.forceKillDelay()
 	var wg sync.WaitGroup
@@ -415,9 +412,9 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 	timer := time.AfterFunc(duration, func() {
 		defer wg.Done()
 		killTimerFired.Store(true)
-		killed, killErr = kill(ctx, connId)
+		killed, killErr = kill(ctx, connID)
 	})
-	_, err = trx.ExecContext(ctx, stmt)
+	_, err = conn.ExecContext(ctx, stmt)
 	if timer.Stop() {
 		// Timer was stopped before it fired, so the goroutine never started.
 		// We need to manually decrement the WaitGroup.
@@ -444,7 +441,7 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 			}
 		}
 		logger.Warn("retrying statement after lock wait timeout because force-kill timer fired", "error", err)
-		_, err = trx.ExecContext(ctx, stmt)
+		_, err = conn.ExecContext(ctx, stmt)
 	}
 	return err
 }
@@ -483,6 +480,8 @@ func BeginStandardTrx(ctx context.Context, db *sql.DB, opts *sql.TxOptions) (*sq
 	var connectionID int
 	err = trx.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connectionID)
 	if err != nil {
+		// The caller never receives trx on failure, so we must release it.
+		_ = trx.Rollback()
 		return nil, 0, err
 	}
 	return trx, connectionID, nil

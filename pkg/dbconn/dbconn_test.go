@@ -484,6 +484,7 @@ func TestStandardTrx(t *testing.T) {
 
 	trx, connID, err := BeginStandardTrx(t.Context(), db, nil)
 	require.NoError(t, err)
+	defer func() { _ = trx.Rollback() }()
 	var observedConnID int
 	err = trx.QueryRowContext(t.Context(), "SELECT connection_id()").Scan(&observedConnID)
 	require.NoError(t, err)
