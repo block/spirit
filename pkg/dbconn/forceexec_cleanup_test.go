@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -102,7 +103,8 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				defer func() { _ = blocker.Rollback() }()
 				var pid int
 				require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
-				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				// The blocked case runs every attempt at ~1.25s each.
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()
 				_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_ancillary_failure")
 				require.NoError(t, err)
@@ -132,9 +134,16 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 						}
 						return []int{pid}, nil
 					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail() }, nil)
-				require.Equal(t, 1, killCalls)
+				// Released: the retry succeeds before its own timer fires.
+				// Blocked: every attempt times out and re-arms the kill.
+				expectedCalls := 1
+				if !release {
+					expectedCalls = config.MaxRetries
+				}
+				require.Equal(t, expectedCalls, killCalls)
 				if stage == "cleanup" {
-					require.Equal(t, 1, cleanupCalls)
+					// The final attempt's failure is returned without a cleanup wait.
+					require.Equal(t, min(expectedCalls, config.MaxRetries-1), cleanupCalls)
 					require.Contains(t, logs.String(), "waiting for killed sessions")
 				}
 				require.Contains(t, logs.String(), "retrying statement anyway")
@@ -153,8 +162,8 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 	}
 }
 
-// A blocker can disappear without being killed. Preserve ForceExec's existing
-// single retry in that case; the empty PID set only makes cleanup waiting a no-op.
+// A blocker can disappear without being killed. ForceExec still retries in
+// that case; the empty PID set only makes cleanup waiting a no-op.
 func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_no_kill", "CREATE TABLE forceexec_no_kill (id INT PRIMARY KEY)")
 	config := NewDBConfig()
@@ -192,6 +201,109 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_no_kill' AND column_name = 'c'").Scan(&count))
 	require.Equal(t, 1, count)
+}
+
+// A retry is only as good as its own kill timer. The first blocker outlives the
+// first attempt's lock budget and a fresh blocker takes its place before the
+// retry runs. The retry must arm a new timer and kill the fresh blocker; a
+// retry without a timer times out again and the caller falls back to a copy.
+func TestForceExecRetryKillsFreshBlocker(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_fresh_blocker", "CREATE TABLE forceexec_fresh_blocker (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var schema string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT DATABASE()").Scan(&schema))
+	tables := []*table.TableInfo{{SchemaName: schema, TableName: "forceexec_fresh_blocker", QuotedTableName: "`forceexec_fresh_blocker`"}}
+
+	// Keep the SELECT's metadata lock until Rollback so ALTER TABLE blocks.
+	first, err := tt.DB.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = first.Rollback() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err = first.ExecContext(ctx, "SELECT * FROM forceexec_fresh_blocker")
+	require.NoError(t, err)
+
+	var second *sql.Tx
+	defer func() {
+		if second != nil {
+			_ = second.Rollback()
+		}
+	}()
+	attempts := 0
+	start := time.Now()
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_fresh_blocker ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(ctx context.Context, connID int) ([]int, error) {
+			attempts++
+			if attempts > 1 {
+				// The retry's timer fired: the real kill must find the fresh blocker.
+				return killLockingTransactions(ctx, db, tables, config, slog.Default(), []int{connID})
+			}
+			// The timer fires at 900ms. Hold the first blocker past the
+			// one-second lock budget so the first attempt definitely fails,
+			// then swap in a fresh blocker before the retry can run. With
+			// the first attempt's request withdrawn nothing queues ahead
+			// of the fresh SELECT's shared lock.
+			timer := time.NewTimer(250 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			if err := first.Rollback(); err != nil {
+				return nil, err
+			}
+			second, err = tt.DB.BeginTx(ctx, nil)
+			if err != nil {
+				return nil, err
+			}
+			_, err = second.ExecContext(ctx, "SELECT * FROM forceexec_fresh_blocker")
+			return nil, err
+		}, waitForKilledTransactions, nil)
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts, "the retry must arm and fire its own kill timer")
+	require.GreaterOrEqual(t, time.Since(start), 2*config.forceKillDelay(), "each attempt keeps the grace period")
+	_, err = second.ExecContext(ctx, "SELECT 1")
+	require.Error(t, err, "the fresh blocker must have been killed")
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_fresh_blocker' AND column_name = 'c'").Scan(&count))
+	require.Equal(t, 1, count)
+}
+
+// The loop is bounded: a blocker that survives every attempt yields the last
+// attempt's lock wait timeout, not an endless retry.
+func TestForceExecGivesUpAfterMaxRetries(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_max_retries", "CREATE TABLE forceexec_max_retries (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	config.MaxRetries = 2
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	blocker, err := tt.DB.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_max_retries")
+	require.NoError(t, err)
+	attempts := 0
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_max_retries ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(context.Context, int) ([]int, error) {
+			attempts++
+			return nil, nil // the blocker is never released
+		}, waitForKilledTransactions, nil)
+	var ddlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &ddlErr)
+	require.EqualValues(t, 1205, ddlErr.Number)
+	require.Equal(t, config.MaxRetries, attempts)
 }
 
 // Cancellation after DDL has completed must not return the session to the pool

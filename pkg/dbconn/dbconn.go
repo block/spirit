@@ -405,18 +405,64 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 		return err
 	}
 
-	duration := dbConfig.forceKillDelay()
+	// Each attempt arms its own kill timer. A single retry with no timer is
+	// only as good as the first kill: a blocker that rolls back slowly, or a
+	// fresh blocker that arrives between attempts, makes the retry time out
+	// too and sends the migration into a table copy. Bound the loop with
+	// MaxRetries, the same budget cutover uses for its LOCK TABLES attempts.
+	attempts := max(1, dbConfig.MaxRetries)
+	for attempt := 1; ; attempt++ {
+		result := execWithKillTimer(ctx, conn, connID, dbConfig.forceKillDelay(), stmt, kill, afterExec)
+		if !shouldRetryForceExecAfterKill(result.err, result.killTimerFired) || attempt == attempts {
+			return result.err
+		}
+		// These operations use other connections. Their errors must not enter
+		// the statement's error tree: callers use it to detect ambiguous DDL.
+		if result.killErr != nil {
+			logger.Warn("force-kill failed; retrying statement anyway", "error", result.killErr)
+		}
+		// MySQL KILL is asynchronous. Wait only for sessions already signalled.
+		if len(result.killed) > 0 {
+			logger.Debug("waiting for killed sessions to exit", "pids", result.killed)
+			cleanupCtx, cancel := context.WithTimeout(ctx, forceKillCleanupTimeout)
+			cleanupErr := waitForCleanup(cleanupCtx, db, result.killed)
+			cancel()
+			if cleanupErr != nil {
+				logger.Warn("killed-session cleanup failed; retrying statement anyway", "pids", result.killed, "error", cleanupErr)
+			}
+		}
+		logger.Warn("retrying statement after lock wait timeout because force-kill timer fired",
+			"attempt", attempt,
+			"max_attempts", attempts,
+			"error", result.err,
+		)
+	}
+}
+
+// forceExecAttempt is the outcome of one statement execution under a kill timer.
+type forceExecAttempt struct {
+	err            error
+	killTimerFired bool
+	killed         []int
+	killErr        error
+}
+
+// execWithKillTimer runs stmt on conn once. If it has not returned after delay,
+// kill is invoked for the blockers of connID. The kill worker is always joined
+// before returning, so a late kill can never target sessions that a later
+// attempt or the caller is already using.
+func execWithKillTimer(ctx context.Context, conn *sql.Conn, connID int, delay time.Duration, stmt string, kill func(context.Context, int) ([]int, error), afterExec func(error)) forceExecAttempt {
 	var wg sync.WaitGroup
 	var killTimerFired atomic.Bool
 	var killed []int
 	var killErr error
 	wg.Add(1)
-	timer := time.AfterFunc(duration, func() {
+	timer := time.AfterFunc(delay, func() {
 		defer wg.Done()
 		killTimerFired.Store(true)
 		killed, killErr = kill(ctx, connID)
 	})
-	_, err = conn.ExecContext(ctx, stmt)
+	_, err := conn.ExecContext(ctx, stmt)
 	if afterExec != nil {
 		afterExec(err)
 	}
@@ -429,26 +475,7 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 	// This prevents a race where the goroutine kills connections that
 	// are now being used for subsequent operations.
 	wg.Wait()
-	if shouldRetryForceExecAfterKill(err, killTimerFired.Load()) {
-		// These operations use other connections. Their errors must not enter
-		// the statement's error tree: callers use it to detect ambiguous DDL.
-		if killErr != nil {
-			logger.Warn("force-kill failed; retrying statement anyway", "error", killErr)
-		}
-		// MySQL KILL is asynchronous. Wait only for sessions already signalled.
-		if len(killed) > 0 {
-			logger.Debug("waiting for killed sessions to exit", "pids", killed)
-			cleanupCtx, cancel := context.WithTimeout(ctx, forceKillCleanupTimeout)
-			cleanupErr := waitForCleanup(cleanupCtx, db, killed)
-			cancel()
-			if cleanupErr != nil {
-				logger.Warn("killed-session cleanup failed; retrying statement anyway", "pids", killed, "error", cleanupErr)
-			}
-		}
-		logger.Warn("retrying statement after lock wait timeout because force-kill timer fired", "error", err)
-		_, err = conn.ExecContext(ctx, stmt)
-	}
-	return err
+	return forceExecAttempt{err: err, killTimerFired: killTimerFired.Load(), killed: killed, killErr: killErr}
 }
 
 func shouldRetryForceExecAfterKill(err error, killTimerFired bool) bool {

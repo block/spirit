@@ -64,7 +64,7 @@ func (c *DBConfig) forceKillDelay() time.Duration {
 }
 
 // Rollback can outlast lock acquisition, so this budget is independent of
-// LockWaitTimeout. It adds at most 30 seconds before the single statement retry.
+// LockWaitTimeout. It adds at most 30 seconds before each statement retry.
 const forceKillCleanupTimeout = 30 * time.Second
 
 const (

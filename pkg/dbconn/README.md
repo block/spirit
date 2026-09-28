@@ -28,7 +28,9 @@ An important subtlety is that `RetryableTransaction` inspects `SHOW WARNINGS` af
 
 Both `ForceExec` and `NewTableLock` implement a timer-based force-kill pattern. They wait for `DBConfig.ForceKillAfter` (zero defaults to 90% of `LockWaitTimeout`), then query `performance_schema` to identify and kill transactions that are blocking metadata lock acquisition. `ForceExec` always arms the kill timer; for `NewTableLock` it is gated on `DBConfig.ForceKill` (default true), which programmatic callers such as datasync's read-only source disable for connections that must never kill.
 
-`ForceExec` reserves a `sql.Conn` for the connection ID lookup, DDL, kill-worker join, and optional retry. Cancellation cannot return an idle session to the pool while its kill worker still runs. DDL is not wrapped in a transaction; MySQL implicitly commits `ALTER TABLE`. Use `sql.DB.BeginTx` when a real transaction is needed.
+`ForceExec` retries a statement that hits a lock wait timeout after its kill timer fired, up to `DBConfig.MaxRetries` attempts in total (the same budget cutover uses). Every attempt arms a fresh kill timer, so a blocker that rolls back slowly or a new blocker that arrives between attempts is killed as well, instead of the retry timing out and the migration falling into a table copy. Between attempts it waits (bounded by 30 seconds) for the killed sessions to leave `performance_schema.threads`, because `KILL` is asynchronous. Errors from the kill and cleanup steps are logged but never joined into the statement's error: callers inspect that error to detect ambiguous DDL. Any error other than a lock wait timeout, or a timeout on which the kill timer never fired, is returned immediately.
+
+`ForceExec` reserves a `sql.Conn` for the connection ID lookup, DDL, kill-worker join, and retries. Cancellation cannot return an idle session to the pool while its kill worker still runs. DDL is not wrapped in a transaction; MySQL implicitly commits `ALTER TABLE`. Use `sql.DB.BeginTx` when a real transaction is needed.
 
 There are two important safety constraints:
 
