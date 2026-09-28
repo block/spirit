@@ -42,7 +42,9 @@ func TestPrimaryKeyCollation(t *testing.T) {
 			name:    "order-equivalent collation change",
 			oldCols: "id varchar(32) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin NOT NULL PRIMARY KEY",
 			newCols: "id varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY",
-			wantErr: `changing the collation of primary key column "id" from utf8mb3_bin to utf8mb4_bin is not supported`,
+			// MySQL before 8.0.30 reports utf8mb3_bin as utf8_bin, so the
+			// expected text stops short of the old collation's name.
+			wantErr: `changing the collation of primary key column "id" from utf8`,
 		},
 		{
 			name:    "collation change",
