@@ -26,8 +26,11 @@ const (
 	ScopeCutover     ScopeFlag = 1 << 3
 	ScopePostCutover ScopeFlag = 1 << 4
 	ScopeTesting     ScopeFlag = 1 << 5
-	// ScopeStatement marks preflight checks a caller can run ahead of an apply
-	// to learn that Spirit will refuse a statement. Callers run them via
+	// ScopeStatement marks checks a caller can run ahead of an apply to learn
+	// that Spirit will refuse a statement. Most are preflight checks that also
+	// run as part of a migration; a check registered only here predicts, from
+	// the statement, a refusal a later scope makes for every statement it
+	// refuses. Callers run them via
 	// RunChecks with Resources.Statement set and, optionally,
 	// Resources.Table — the table's current metadata, which widens coverage to
 	// the checks that compare the statement against the existing column

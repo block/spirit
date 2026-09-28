@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -1541,6 +1543,11 @@ func TestIssue1282PKCollationChange(t *testing.T) {
 // takes the table default, and CONVERT TO CHARACTER SET takes the character
 // set's default collation. A change between a string and a non-string type
 // adds or removes a collation.
+//
+// Each shape is also classified ahead of the run, the way a caller asks
+// whether Spirit will refuse a statement. The prediction must agree with the
+// run: refusing a shape the run accepts would block a change that succeeds,
+// and passing one it refuses would hide the refusal until setup.
 func TestPKCollationChange(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1580,6 +1587,34 @@ func TestPKCollationChange(t *testing.T) {
 			refused: true,
 		},
 		{
+			name:    "order-equivalent charset upgrade",
+			create:  "id varchar(32) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin NOT NULL PRIMARY KEY",
+			alter:   "MODIFY id varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+			refused: true,
+		},
+		{
+			name:    "default collation changed by the same statement",
+			create:  "id varchar(32) NOT NULL PRIMARY KEY",
+			alter:   "DEFAULT COLLATE = utf8mb4_bin, MODIFY id varchar(32) NOT NULL",
+			refused: true,
+		},
+		{
+			name:    "convert to another collation of the same character set",
+			create:  "id varchar(32) NOT NULL PRIMARY KEY",
+			alter:   "CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+			refused: true,
+		},
+		{
+			name:   "wider integer",
+			create: "id int NOT NULL PRIMARY KEY",
+			alter:  "MODIFY id bigint NOT NULL",
+		},
+		{
+			name:   "convert to the collation the key already has",
+			create: "id varchar(32) NOT NULL PRIMARY KEY, b varchar(32) CHARACTER SET latin1",
+			alter:  "CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci",
+		},
+		{
 			name:   "wider varchar, same collation",
 			create: "id varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL PRIMARY KEY",
 			alter:  "MODIFY id varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL",
@@ -1599,9 +1634,14 @@ func TestPKCollationChange(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			tbl := fmt.Sprintf("pkcoll%d", i)
-			testutils.NewTestTable(t, tbl, fmt.Sprintf("CREATE TABLE %s (%s) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", tbl, test.create))
+			tt := testutils.NewTestTable(t, tbl, fmt.Sprintf("CREATE TABLE %s (%s) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", tbl, test.create))
+			_, predicted, err := check.StatementRefusal(t.Context(), "ALTER TABLE "+tbl+" "+test.alter,
+				showCreateTable(t, tt.DB, tbl), slog.New(slog.DiscardHandler))
+			require.NoError(t, err)
+			require.Equal(t, test.refused, predicted, "the statement-scope verdict must match the run")
+
 			m := NewTestRunner(t, tbl, test.alter)
-			err := m.Run(t.Context())
+			err = m.Run(t.Context())
 			if test.refused {
 				require.ErrorContains(t, err, "spirit chunks on primary key ranges, and the collation decides which rows fall in each range")
 				require.Zero(t, m.status.Duration(status.CopyRows), "the change must be refused before any rows are copied")

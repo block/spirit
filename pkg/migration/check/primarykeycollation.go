@@ -14,6 +14,10 @@ func init() {
 	registerCheck("primarykeycollation", primaryKeyCollationCheck, ScopePostSetup)
 }
 
+// primaryKeyCollationUnsupported explains why a change to the collation of a
+// primary key column is refused.
+const primaryKeyCollationUnsupported = "spirit chunks on primary key ranges, and the collation decides which rows fall in each range"
+
 // primaryKeyCollationCheck refuses an ALTER that changes the collation of a
 // primary key column (issue #1282).
 //
@@ -59,9 +63,8 @@ func primaryKeyCollationCheck(ctx context.Context, r Resources, logger *slog.Log
 		if oldCol.collation == newCol.collation {
 			continue
 		}
-		return fmt.Errorf("changing the collation of primary key column %q from %s to %s is not supported: "+
-			"spirit chunks on primary key ranges, and the collation decides which rows fall in each range",
-			oldCol.name, oldCol.collationString(), newCol.collationString())
+		return fmt.Errorf("changing the collation of primary key column %q from %s to %s is not supported: %s",
+			oldCol.name, oldCol.collationString(), newCol.collationString(), primaryKeyCollationUnsupported)
 	}
 	return nil
 }

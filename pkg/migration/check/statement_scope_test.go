@@ -38,6 +38,7 @@ func TestStatementScopeMembership(t *testing.T) {
 		"enumSetRemoval",
 		"illegalClause",
 		"primarykey",
+		"primarykeycollationstatement",
 		"primarykeyexists",
 		"setReorder",
 	}, ChecksInScope(ScopeStatement))
