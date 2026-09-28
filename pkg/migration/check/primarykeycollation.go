@@ -32,6 +32,11 @@ func init() {
 // the character set's default collation. A change between a string and a
 // non-string type (VARCHAR to INT, VARCHAR to VARBINARY) adds or removes a
 // collation, so it is refused as well.
+//
+// Any change of collation is refused, including one between two collations
+// that happen to order keys the same way (utf8mb3_bin to utf8mb4_bin). Telling
+// those apart would copy MySQL's collation rules into Spirit, which is what
+// reading the result from MySQL avoids.
 func primaryKeyCollationCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	if r.Table == nil || r.NewTable == nil {
 		return errors.New("check primarykeycollation cannot run: the table and the new table were not loaded")
@@ -44,6 +49,8 @@ func primaryKeyCollationCheck(ctx context.Context, r Resources, logger *slog.Log
 	if err != nil {
 		return err
 	}
+	// The primarykey check already refuses DROP PRIMARY KEY, so the key's
+	// columns can not change today. This is a defence in case that changes.
 	if len(oldKey) != len(newKey) {
 		return fmt.Errorf("changing the columns of the primary key of table %q is not supported", r.Table.TableName)
 	}

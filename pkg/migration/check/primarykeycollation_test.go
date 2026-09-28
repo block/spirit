@@ -32,6 +32,19 @@ func TestPrimaryKeyCollation(t *testing.T) {
 			newCols: "id int NOT NULL PRIMARY KEY, b varchar(32) COLLATE utf8mb4_bin",
 		},
 		{
+			// Spirit chunks on the primary key only, so a UNIQUE key column is
+			// not compared. Also pins the CONSTRAINT_NAME filter in the query.
+			name:    "collation change on a unique non-key column",
+			oldCols: "id int NOT NULL PRIMARY KEY, b varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL, UNIQUE KEY b (b)",
+			newCols: "id int NOT NULL PRIMARY KEY, b varchar(32) COLLATE utf8mb4_bin NOT NULL, UNIQUE KEY b (b)",
+		},
+		{
+			name:    "order-equivalent collation change",
+			oldCols: "id varchar(32) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin NOT NULL PRIMARY KEY",
+			newCols: "id varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY",
+			wantErr: `changing the collation of primary key column "id" from utf8mb3_bin to utf8mb4_bin is not supported`,
+		},
+		{
 			name:    "collation change",
 			oldCols: "id varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL PRIMARY KEY",
 			newCols: "id varchar(32) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY",
