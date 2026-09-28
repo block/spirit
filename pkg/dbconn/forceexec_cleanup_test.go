@@ -306,6 +306,36 @@ func TestForceExecGivesUpAfterMaxRetries(t *testing.T) {
 	require.Equal(t, config.MaxRetries, attempts)
 }
 
+// A DBConfig with no retry budget still makes exactly one attempt: the loop
+// bound never falls to zero, which would retry, and kill, without end.
+func TestForceExecWithoutRetryBudgetMakesOneAttempt(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_no_budget", "CREATE TABLE forceexec_no_budget (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	config.MaxRetries = 0
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	blocker, err := tt.DB.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_no_budget")
+	require.NoError(t, err)
+	attempts := 0
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_no_budget ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(context.Context, int) ([]int, error) {
+			attempts++
+			return nil, nil // the blocker is never released
+		}, waitForKilledTransactions, nil)
+	var ddlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &ddlErr)
+	require.EqualValues(t, 1205, ddlErr.Number)
+	require.Equal(t, 1, attempts)
+}
+
 // Cancellation after DDL has completed must not return the session to the pool
 // while the force-kill worker is still using its identity.
 func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {

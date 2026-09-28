@@ -56,7 +56,7 @@ type DBConfig struct {
 	ForceKillAfter           time.Duration // Zero preserves the default: 90% of LockWaitTimeout.
 	LockWaitTimeout          int
 	InnodbLockWaitTimeout    int
-	MaxRetries               int
+	MaxRetries               int // Total attempts, not retries after the first: 1 means a single attempt.
 	MaxOpenConnections       int
 	RangeOptimizerMaxMemSize int64
 	InterpolateParams        bool
