@@ -634,6 +634,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			DB:            r.db,
 			Replicas:      r.replicas,
 			Table:         change.table,
+			NewTable:      change.newTable,
 			Statement:     change.stmt,
 			Threads:       r.migration.Threads,
 			ReplicaMaxLag: r.migration.ReplicaMaxLag,

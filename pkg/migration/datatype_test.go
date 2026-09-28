@@ -1445,3 +1445,107 @@ func requireTinyInt1(t *testing.T, db *sql.DB, info string, want int) {
 		`SELECT flags + 0 FROM tinyint1_copy WHERE info = ? LIMIT 1`, info).Scan(&got))
 	require.Equal(t, want, got, "row %q must hold flags=%d", info, want)
 }
+
+// TestIssue1282PKCollationChange checks that changing the collation of a
+// primary key column is refused before any rows are copied. The checksum
+// evaluates each chunk's key range on both tables, so a key that sorts
+// differently on the new table would select different rows on each side
+// (issue #1282).
+func TestIssue1282PKCollationChange(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "pkcoll1282",
+		`CREATE TABLE pkcoll1282 (
+			id varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL PRIMARY KEY
+		)`)
+	testutils.RunSQL(t, "INSERT INTO pkcoll1282 VALUES ('a'), ('B'), ('c'), ('D')")
+
+	m := NewTestRunner(t, "pkcoll1282", "MODIFY id varchar(32) COLLATE utf8mb4_bin NOT NULL")
+	err := m.Run(t.Context())
+	require.ErrorContains(t, err, `changing the collation of primary key column "id" from utf8mb4_0900_ai_ci to utf8mb4_bin is not supported`)
+	require.Zero(t, m.status.Duration(status.CopyRows), "the change must be refused before any rows are copied")
+	require.NoError(t, m.Close())
+
+	var collation string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='pkcoll1282' AND COLUMN_NAME='id'",
+	).Scan(&collation))
+	require.Equal(t, "utf8mb4_0900_ai_ci", collation, "the source table must be unchanged")
+}
+
+// TestPKCollationChange covers the ALTER shapes that change the collation of a
+// primary key column (refused) and ones that leave it unchanged (allowed). The
+// refused shapes include ones only MySQL can resolve: a MODIFY without COLLATE
+// takes the table default, and CONVERT TO CHARACTER SET takes the character
+// set's default collation. A change between a string and a non-string type
+// adds or removes a collation.
+func TestPKCollationChange(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		create  string
+		alter   string
+		refused bool
+	}{
+		{
+			name:    "composite key, explicit collation",
+			create:  "a varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL, b varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL, PRIMARY KEY (a, b)",
+			alter:   "MODIFY b varchar(32) COLLATE utf8mb4_bin NOT NULL",
+			refused: true,
+		},
+		{
+			name:    "convert to character set",
+			create:  "id varchar(32) CHARACTER SET latin1 NOT NULL PRIMARY KEY",
+			alter:   "CONVERT TO CHARACTER SET utf8mb4",
+			refused: true,
+		},
+		{
+			name:    "modify without collate takes the table default",
+			create:  "id varchar(32) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY",
+			alter:   "MODIFY id varchar(32) NOT NULL",
+			refused: true,
+		},
+		{
+			name:    "string to binary",
+			create:  "id varchar(32) NOT NULL PRIMARY KEY",
+			alter:   "MODIFY id varbinary(128) NOT NULL",
+			refused: true,
+		},
+		{
+			name:    "integer to string",
+			create:  "id int NOT NULL PRIMARY KEY",
+			alter:   "MODIFY id varchar(32) NOT NULL",
+			refused: true,
+		},
+		{
+			name:   "wider varchar, same collation",
+			create: "id varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL PRIMARY KEY",
+			alter:  "MODIFY id varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL",
+		},
+		{
+			name:   "table default collation only",
+			create: "id varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL PRIMARY KEY, b varchar(32) NOT NULL",
+			alter:  "DEFAULT COLLATE = utf8mb4_bin, ENGINE=InnoDB",
+		},
+		{
+			name:   "collation change on a non-key column",
+			create: "id int NOT NULL PRIMARY KEY, b varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL",
+			alter:  "MODIFY b varchar(32) COLLATE utf8mb4_bin NOT NULL",
+		},
+	}
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			tbl := fmt.Sprintf("pkcoll%d", i)
+			testutils.NewTestTable(t, tbl, fmt.Sprintf("CREATE TABLE %s (%s) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", tbl, test.create))
+			m := NewTestRunner(t, tbl, test.alter)
+			err := m.Run(t.Context())
+			if test.refused {
+				require.ErrorContains(t, err, "spirit chunks on primary key ranges, and the collation decides which rows fall in each range")
+				require.Zero(t, m.status.Duration(status.CopyRows), "the change must be refused before any rows are copied")
+			} else {
+				require.NoError(t, err)
+			}
+			require.NoError(t, m.Close())
+		})
+	}
+}

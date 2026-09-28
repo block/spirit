@@ -66,6 +66,7 @@ type Resources struct {
 	DB                   *sql.DB
 	Replicas             []*sql.DB
 	Table                *table.TableInfo
+	NewTable             *table.TableInfo // the altered shadow table; set from ScopePostSetup onwards
 	Statement            *statement.AbstractStatement
 	Threads              int
 	ReplicaMaxLag        time.Duration
