@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -285,7 +286,7 @@ func TestStripeBatchesSeparatesNeighbours(t *testing.T) {
 			total += len(stripe)
 			for i, a := range stripe {
 				for _, b := range stripe[i+1:] {
-					require.Greater(t, abs(position[a]-position[b]), 1,
+					require.Greater(t, utils.Abs(position[a]-position[b]), 1,
 						"batches %d and %d may run concurrently but are adjacent (n=%d)",
 						position[a], position[b], n)
 				}
@@ -298,13 +299,6 @@ func TestStripeBatchesSeparatesNeighbours(t *testing.T) {
 	one := []*mapFlushBatch{{keys: []string{"only"}}}
 	require.Len(t, stripeBatches(one), 1)
 	require.Empty(t, stripeBatches(nil)[0])
-}
-
-func abs(n int) int {
-	if n < 0 {
-		return -n
-	}
-	return n
 }
 
 // TestCutAtValueBoundaryAlwaysAdvances sweeps the cut over adversarial row
