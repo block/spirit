@@ -1,7 +1,9 @@
 package change
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -18,9 +20,9 @@ import (
 
 // newStartedClientForFlushTest builds a Source of the requested kind
 // (binlog or gtid) subscribed to srcName -> dstName tables, starts it,
-// and registers cleanup. Used to exercise the FlushUnderTableLock error
-// branches identically for both implementations.
-func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName string) (Source, *sql.DB, *table.TableInfo, *table.TableInfo) {
+// and registers cleanup. Used to exercise the flush error branches identically
+// for both implementations. A nil clientCfg uses NewClientDefaultConfig.
+func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName string, clientCfg *ClientConfig) (Source, *sql.DB, *table.TableInfo, *table.TableInfo) {
 	t.Helper()
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
@@ -38,11 +40,14 @@ func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName s
 	t2 := table.NewTableInfo(db, cfg.DBName, dstName)
 	require.NoError(t, t2.SetInfo(t.Context()))
 
+	if clientCfg == nil {
+		clientCfg = NewClientDefaultConfig()
+	}
 	var client Source
 	if useGTID {
-		client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
+		client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
 	} else {
-		client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
+		client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
 	}
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
@@ -63,7 +68,7 @@ func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName s
 //     target table before flushing, so the subscription's REPLACE fails.
 func runFlushUnderTableLockErrorBranches(t *testing.T, useGTID bool, srcName, dstName string) {
 	t.Helper()
-	client, db, t1, _ := newStartedClientForFlushTest(t, useGTID, srcName, dstName)
+	client, db, t1, _ := newStartedClientForFlushTest(t, useGTID, srcName, dstName, nil)
 
 	// Branch 1: no locks supplied.
 	err := client.FlushUnderTableLock(t.Context(), nil)
@@ -165,4 +170,55 @@ func TestBinlogPeriodicFlushErrorIsFatal(t *testing.T) {
 func TestGTIDPeriodicFlushErrorIsFatal(t *testing.T) {
 	skipUnlessGTIDEnabled(t)
 	runPeriodicFlushErrorIsFatal(t, true, "gtidpflusherrt1", "gtidpflusherrt2")
+}
+
+// failingParkedSubscription stands in for a subscription that parked on its
+// soft memory limit and whose flush then fails.
+type failingParkedSubscription struct {
+	stubSubscription
+}
+
+func (*failingParkedSubscription) Flush(context.Context, bool, []*dbconn.TableLock) (bool, error) {
+	return false, errors.New("injected parked flush failure")
+}
+
+// runParkedFlushErrorIsFatal checks that the periodic flush reports
+// FatalReasonFlushError when flushing a parked subscription fails. The real
+// subscription is healthy, so the full pass that follows the parked flush
+// succeeds: only the parked-flush branch can report the failure. The interval
+// is an hour, so the ticker never fires during the test.
+func runParkedFlushErrorIsFatal(t *testing.T, useGTID bool, srcName, dstName string) {
+	t.Helper()
+	reasons := make(chan FatalReason, 8)
+	clientCfg := NewClientDefaultConfig()
+	clientCfg.CancelFunc = func(reason FatalReason) bool {
+		reasons <- reason
+		return true
+	}
+	client, _, _, _ := newStartedClientForFlushTest(t, useGTID, srcName, dstName, clientCfg)
+	var requests chan Subscription
+	if useGTID {
+		requests = client.(*gtidClient).flushRequests
+	} else {
+		requests = client.(*binlogClient).flushRequests
+	}
+
+	client.StartPeriodicFlush(t.Context(), time.Hour)
+	defer client.StopPeriodicFlush()
+	requests <- &failingParkedSubscription{}
+	select {
+	case reason := <-reasons:
+		require.Equal(t, FatalReasonFlushError, reason)
+	case <-time.After(10 * time.Second):
+		t.Fatal("a failed flush of a parked subscription must be reported to the caller as fatal")
+	}
+}
+
+func TestBinlogParkedFlushErrorIsFatal(t *testing.T) {
+	runParkedFlushErrorIsFatal(t, false, "parkflusherrt1", "parkflusherrt2")
+}
+
+func TestGTIDParkedFlushErrorIsFatal(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
+	runParkedFlushErrorIsFatal(t, true, "gtidparkflusherrt1", "gtidparkflusherrt2")
 }
