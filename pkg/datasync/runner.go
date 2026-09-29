@@ -1707,6 +1707,9 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 // that status.WatchTask is about to cancel us for) makes Run return the cause
 // instead of a bare ctx-cancel that the shutdown paths map to nil.
 func (r *Runner) recordFatal(err error) {
+	// Marked with status.ErrFatalAbort (message unchanged) so a phase stopped
+	// by the cancellation below returns it (see status.AbortCause).
+	err = status.FatalAbort(err)
 	r.fatalOnce.Do(func() {
 		r.fatalMu.Lock()
 		r.fatalErr = err

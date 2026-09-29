@@ -1444,7 +1444,7 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 				}
 			}
 		}
-		r.cancel(fmt.Errorf("migration aborted: fatal change feed condition (%s); see the preceding log lines for details", reason))
+		r.cancel(status.FatalAbort(fmt.Errorf("migration aborted: fatal change feed condition (%s); see the preceding log lines for details", reason)))
 	})
 	return true
 }

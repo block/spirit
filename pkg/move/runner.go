@@ -1797,7 +1797,7 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 		// cancelFunc can be nil during early setup or in test paths that
 		// bypass Run; nil-check before calling.
 		if r.cancelFunc != nil {
-			r.cancelFunc(fmt.Errorf("move aborted: fatal change feed condition (%s); see the preceding log lines for details", reason))
+			r.cancelFunc(status.FatalAbort(fmt.Errorf("move aborted: fatal change feed condition (%s); see the preceding log lines for details", reason)))
 		}
 	})
 	return true

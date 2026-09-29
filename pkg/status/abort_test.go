@@ -10,11 +10,13 @@ import (
 )
 
 func TestAbortCause(t *testing.T) {
-	fatal := errors.New("fatal condition")
+	fatal := FatalAbort(errors.New("fatal condition"))
 	aborted, abort := context.WithCancelCause(t.Context())
 	abort(fatal)
 	cancelled, cancel := context.WithCancelCause(t.Context())
 	cancel(nil)
+	unmarked, cancelUnmarked := context.WithCancelCause(t.Context())
+	cancelUnmarked(errors.New("caller's own cause"))
 	live := t.Context()
 	other := errors.New("some other failure")
 	ambiguous := errors.Join(ErrOwnershipAmbiguous, context.Canceled)
@@ -33,6 +35,7 @@ func TestAbortCause(t *testing.T) {
 		{name: "OwnershipEvidenceKept", ctx: aborted, err: ambiguous, want: ambiguous},
 		{name: "DurableMutationKept", ctx: aborted, err: durable, want: durable},
 		{name: "PlainCancellationKept", ctx: cancelled, err: context.Canceled, want: context.Canceled},
+		{name: "UnmarkedCauseKept", ctx: unmarked, err: context.Canceled, want: context.Canceled},
 		{name: "LiveContextKept", ctx: live, err: context.Canceled, want: context.Canceled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -42,10 +45,10 @@ func TestAbortCause(t *testing.T) {
 }
 
 // TestDoContextRecordsAbortAsFailed checks that a phase stopped by a
-// cancellation with a cause returns the cause and is recorded as failed, while
-// a plain cancellation is still recorded as cancelled.
+// cancellation with a fatal-abort cause returns the cause and is recorded as
+// failed, while a plain cancellation is still recorded as cancelled.
 func TestDoContextRecordsAbortAsFailed(t *testing.T) {
-	fatal := errors.New("fatal condition")
+	fatal := FatalAbort(errors.New("fatal condition"))
 	aborted, abort := context.WithCancelCause(t.Context())
 	abort(fatal)
 	cancelled, cancel := context.WithCancelCause(t.Context())
@@ -65,4 +68,27 @@ func TestDoContextRecordsAbortAsFailed(t *testing.T) {
 		{state: CopyRows, outcome: WorkflowPhaseOutcomeFailed},
 		{state: Checksum, outcome: WorkflowPhaseOutcomeCancelled},
 	}, finished)
+}
+
+// A caller that stops a run by cancelling its own context with a cause is an
+// operator cancellation: the run returns context.Canceled, not the cause.
+func TestAbortCauseKeepsCallerCancellation(t *testing.T) {
+	parent, stop := context.WithCancelCause(t.Context())
+	runCtx, runCancel := context.WithCancelCause(parent) // the runner's own context
+	defer runCancel(nil)
+	stop(errors.New("service shutting down"))
+	require.ErrorIs(t, AbortCause(runCtx, runCtx.Err()), context.Canceled)
+}
+
+// TestFatalAbortKeepsMessageAndChain checks that marking a cause with
+// FatalAbort changes neither its message nor what it wraps.
+func TestFatalAbortKeepsMessageAndChain(t *testing.T) {
+	inner := errors.New("disk full")
+	cause := fmt.Errorf("checkpoint write failed: %w", inner)
+	marked := FatalAbort(cause)
+	require.Equal(t, cause.Error(), marked.Error())
+	require.ErrorIs(t, marked, ErrFatalAbort)
+	require.ErrorIs(t, marked, cause)
+	require.ErrorIs(t, marked, inner)
+	require.NotErrorIs(t, marked, context.Canceled)
 }
