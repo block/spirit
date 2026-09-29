@@ -258,7 +258,7 @@ At 90% of the `lock-wait-timeout` (i.e. after 27 seconds with the default of 30 
 - It refuses to kill connections if they have a transaction open that has modified a large number of rows (>1 million).
 - It refuses to kill connections that hold an explicit `LOCK TABLE`, since unlike transactions these are not always retryable.
 
-While Spirit holds the lock, it lowers the lock session's `wait_timeout` to three times the `lock-wait-timeout`, and to no less than two minutes. If Spirit stops responding while it holds the lock (the process is frozen, or its network to the server is lost without the connection being closed), MySQL closes the idle session and releases the lock after that time, rather than after the server's `wait_timeout` (8 hours by default).
+While Spirit holds the lock, it lowers the lock session's `wait_timeout` to three times the `lock-wait-timeout`, with a floor of two minutes. It never raises the session's existing `wait_timeout`: if the server's value is already lower than that (for example 10 seconds), Spirit keeps the lower value, so the lock session can be closed after less than two minutes of idle time. If Spirit stops responding while it holds the lock (the process is frozen, or its network to the server is lost without the connection being closed), MySQL closes the idle session and releases the lock after that time, rather than after the server's `wait_timeout` (8 hours by default).
 
 This force-kill behavior is always enabled and cannot be disabled. Attempting to acquire MDL locks over and over while they are being blocked is not safe — it can bring down production systems. The force-kill behavior of _targeted killing_ is safer for real systems.
 
