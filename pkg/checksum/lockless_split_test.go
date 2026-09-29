@@ -128,7 +128,7 @@ func TestLocklessHotSplit(t *testing.T) {
 			c.splitChunk = func(context.Context, *table.Chunk, uint64) ([]*table.Chunk, error) { return children, nil }
 			stop, _ := runUntil(t, c)
 			defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
-			require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, time.Second, time.Millisecond)
+			waitFirstPassDecided(t, c, time.Second)
 			stats := c.Stats()
 			require.Equal(t, uint64(1), stats.HotChunksSplitThisPass)
 			require.Equal(t, uint64(4), stats.ChunksThisPass)
@@ -143,8 +143,6 @@ func TestLocklessHotSplit(t *testing.T) {
 				}
 			} else {
 				require.Equal(t, uint64(3), stats.ChunksPassedThisPass)
-				// PassesCompleted is incremented before FirstCleanPass is
-				// signalled, so wait for the signal rather than polling it.
 				select {
 				case <-c.FirstCleanPass():
 				case <-time.After(time.Second):
@@ -311,7 +309,7 @@ func TestHotSplitSmallRangesKeepRetryEvidence(t *testing.T) {
 			}
 			stop, _ := runUntil(t, c)
 			defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
-			require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, time.Second, time.Millisecond)
+			waitFirstPassDecided(t, c, time.Second)
 			stats := c.Stats()
 			require.Zero(t, c.splitAttempts.Load())
 			require.Zero(t, stats.HotChunksSplitThisPass)
@@ -387,7 +385,7 @@ func TestHotSplitFailureDefersWithoutVerification(t *testing.T) {
 	}
 	stop, _ := runUntil(t, c)
 	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
-	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, time.Second, time.Millisecond)
+	waitFirstPassDecided(t, c, time.Second)
 	require.Equal(t, uint64(1), c.Stats().HotChunksDeferredThisPass)
 	require.Zero(t, c.Stats().ChunksPassedThisPass)
 	select {

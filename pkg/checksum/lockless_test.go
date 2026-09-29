@@ -234,6 +234,20 @@ func runUntilClean(t *testing.T, c *LocklessChecker) (stop func() error, errCh <
 	}, out
 }
 
+// waitFirstPassDecided waits until pass 1 has completed and Run has decided
+// whether to signal FirstCleanPass. PassesCompleted is incremented before that
+// decision, so waiting on it alone lets a non-blocking FirstCleanPass read land
+// in the gap. NextPassAt is set at the top of the next iteration, after the
+// decision, but only while waiting between passes, so the checker must use a
+// long MinPassInterval (e.g. time.Hour).
+func waitFirstPassDecided(t *testing.T, c *LocklessChecker, timeout time.Duration) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		s := c.Stats()
+		return s.PassesCompleted == 1 && !s.NextPassAt.IsZero()
+	}, timeout, time.Millisecond)
+}
+
 // fastConfig is a default config tuned for fast tests: 50ms retry delay,
 // silent logger.
 func fastConfig() CheckerConfig {
@@ -424,7 +438,7 @@ func TestPermanentlyHotChunkDefersToNextPass(t *testing.T) {
 	)
 
 	stop, _ := runUntil(t, c)
-	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 }, 2*time.Second, time.Millisecond)
+	waitFirstPassDecided(t, c, 2*time.Second)
 	stats := c.Stats()
 	require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
 	require.Equal(t, uint64(0), stats.ChunksPassedThisPass)
@@ -689,8 +703,7 @@ func TestHotChunkDuringFeedDrainIsBounded(t *testing.T) {
 	c.feeds = []change.Source{feed}
 	stop, _ := runUntil(t, c)
 	t.Cleanup(func() { _ = stop() })
-	require.Eventually(t, func() bool { return c.Stats().PassesCompleted == 1 },
-		2*time.Second, time.Millisecond)
+	waitFirstPassDecided(t, c, 2*time.Second)
 	stats := c.Stats()
 	require.Equal(t, 2, feed.Flushes())
 	require.Equal(t, uint64(1), stats.HotChunksDeferredThisPass)
