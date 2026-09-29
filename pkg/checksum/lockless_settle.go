@@ -190,7 +190,16 @@ func (s *rowSettler) settleRow(ctx, parent context.Context, snapshot *hotSnapsho
 		return settleUnavailable, nil
 	}
 	want, err := binlogKey(ctx, db, chunk.Table, chunk.Key, row.key)
-	if err != nil {
+	switch {
+	case parent.Err() != nil:
+		return settleUnavailable, parent.Err()
+	case err != nil && ctx.Err() != nil:
+		// The key conversion ran into our own budget, which is a deferral
+		// like any other, not a checksum failure.
+		s.logger.Debug("lockless checksum: settle budget ran out while converting the watched key; deferring",
+			"chunk", chunk.String())
+		return settleUnavailable, nil
+	case err != nil:
 		return settleUnavailable, err
 	}
 	matcher, err := keyMatcher(chunk.Table, chunk.Key, want)

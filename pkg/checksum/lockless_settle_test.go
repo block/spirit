@@ -294,6 +294,27 @@ func TestSettleHotSnapshotPropagatesCancellation(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+// TestSettleRowKeyConversionBudgetDefers: a non-UTF-8 key is converted by a
+// query that runs under the settle budget. That budget running out is a
+// deferral, like every other internal timeout, and must not fail the checksum.
+func TestSettleRowKeyConversionBudgetDefers(t *testing.T) {
+	db, chunk := snapshotTestTables(t, "id VARCHAR(10) CHARACTER SET latin1 PRIMARY KEY, value INT", []string{"id"})
+	snapshotExec(t, db, "INSERT INTO src VALUES ('a',10),('é',20)")
+	snapshotExec(t, db, "INSERT INTO dst VALUES ('a',10),('é',99)")
+	snapshot := pendingSnapshot(t, db, chunk, 1)
+
+	var row hotSnapshotRow
+	for _, r := range snapshot.pending {
+		row = r
+	}
+	parent := t.Context()
+	budget, cancel := context.WithDeadline(parent, time.Now().Add(-time.Second))
+	defer cancel()
+	verdict, err := settleTestSettler(t, db, &parkingFeed{}).settleRow(budget, parent, snapshot, row)
+	require.NoError(t, err)
+	require.Equal(t, settleUnavailable, verdict)
+}
+
 // TestExpectedImageCRCMatchesRealRow is the load-bearing claim of the whole
 // design: evaluating the checksum expressions over a row *image* gives the same
 // answer as evaluating them over the row. If it did not, every settle verdict

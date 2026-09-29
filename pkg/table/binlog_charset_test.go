@@ -125,7 +125,8 @@ func TestBinlogCharsetLiteralRoundTrip(t *testing.T) {
 			require.NoError(t, ti.SetInfo(t.Context()))
 			ct, err := ti.BinlogColumnType("c")
 			require.NoError(t, err)
-			if cs == "utf8mb4" || cs == "utf8mb3" {
+			// MySQL before 8.0.30 lists utf8mb3 as utf8.
+			if cs == "utf8mb4" || cs == "utf8mb3" || cs == "utf8" {
 				require.Empty(t, ti.BinlogCharset("c"))
 			} else {
 				require.Equal(t, cs, ti.BinlogCharset("c"))
