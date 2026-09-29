@@ -108,7 +108,11 @@ type Runner struct {
 	// phase transitions. It defaults to a NoopSink, so a caller that installs
 	// nothing pays only for the discarded values.
 	metricsSink metrics.Sink
-	cancelFunc  context.CancelFunc
+	// cancelFunc cancels the run context with a cause. recordFatal passes the
+	// fatal error, which Run then returns (see status.AbortCause) in place of
+	// the context.Canceled error the copy or any other phase observes.
+	// Cancel, Close and the checksum-failure path pass a nil cause.
+	cancelFunc context.CancelCauseFunc
 	// sourceDBConfig connects to the read-only source, with ForceKill disabled
 	// (see Run). targetDBConfig connects to the writable target and keeps the
 	// standard safe defaults.
@@ -231,7 +235,7 @@ func (r *Runner) recordCopyCompleted() {
 
 func (r *Runner) runCopy(ctx context.Context) error {
 	defer r.recordCopyCompleted()
-	return r.status.Do(status.CopyRows, func() error {
+	return r.status.DoContext(ctx, status.CopyRows, func() error {
 		r.logger.Info("Starting copy", "resuming", r.resuming.Load())
 		if err := r.copier.Run(ctx); err != nil {
 			return fmt.Errorf("copy failed: %w", err)
@@ -267,9 +271,14 @@ func (r *Runner) SetMetricsSink(sink metrics.Sink) {
 // Run performs the initial copy and then streams changes continuously
 // until ctx is cancelled. A clean cancellation returns nil; a fatal
 // source event (e.g. DDL) returns an error.
-func (r *Runner) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (r *Runner) Run(ctx context.Context) (retErr error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	// Registered after cancel so it runs first: a fatal abort returns the
+	// recorded fatal error, not the copy's context.Canceled.
+	defer func() {
+		retErr = status.AbortCause(ctx, retErr)
+	}()
 	r.progMu.Lock()
 	r.cancelFunc = cancel
 	r.progMu.Unlock()
@@ -416,14 +425,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	// table creation now, before the target is consumed by continuous sync.
 	// Always called — it is a no-op when nothing was deferred and resume-safe;
 	// see restoreSecondaryIndexes.
-	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
+	if err := r.status.DoContext(ctx, status.RestoreSecondaryIndexes, func() error {
 		return r.restoreSecondaryIndexes(ctx)
 	}); err != nil {
 		return fmt.Errorf("failed to restore secondary indexes: %w", err)
 	}
 
 	r.logger.Info("Copy complete; entering continuous sync")
-	return r.status.Do(status.ApplyChangeset, func() error {
+	return r.status.DoContext(ctx, status.ApplyChangeset, func() error {
 		return r.runContinuous(ctx)
 	})
 }
@@ -478,7 +487,7 @@ func (r *Runner) runContinuous(ctx context.Context) error {
 			cancelParent := r.cancelFunc
 			r.progMu.RUnlock()
 			if cancelParent != nil {
-				cancelParent()
+				cancelParent(nil)
 			}
 		}
 	}
@@ -1698,6 +1707,9 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 // that status.WatchTask is about to cancel us for) makes Run return the cause
 // instead of a bare ctx-cancel that the shutdown paths map to nil.
 func (r *Runner) recordFatal(err error) {
+	// Marked with status.ErrFatalAbort (message unchanged) so a phase stopped
+	// by the cancellation below returns it (see status.AbortCause).
+	err = status.FatalAbort(err)
 	r.fatalOnce.Do(func() {
 		r.fatalMu.Lock()
 		r.fatalErr = err
@@ -1706,9 +1718,10 @@ func (r *Runner) recordFatal(err error) {
 		cancel := r.cancelFunc
 		r.progMu.RUnlock()
 		// cancelFunc can be nil if this fires before Run has set it (e.g. test
-		// paths that bypass Run); nil-check before calling.
+		// paths that bypass Run); nil-check before calling. err is the cause,
+		// so a phase stopped by this cancellation returns err.
 		if cancel != nil {
-			cancel()
+			cancel(err)
 		}
 	})
 }
@@ -1727,7 +1740,7 @@ func (r *Runner) fatal() error {
 // runner's reference.
 func (r *Runner) Close() error {
 	if r.cancelFunc != nil {
-		r.cancelFunc()
+		r.cancelFunc(nil)
 	}
 	// Wait for the status + checkpoint goroutines (status.WatchTask) to exit
 	// before tearing down connections, so a late DumpCheckpoint can't run
@@ -1975,7 +1988,7 @@ func (r *Runner) Cancel() {
 	cancel := r.cancelFunc
 	r.progMu.RUnlock()
 	if cancel != nil {
-		cancel()
+		cancel(nil)
 	}
 }
 

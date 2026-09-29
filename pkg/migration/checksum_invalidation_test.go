@@ -95,7 +95,7 @@ func TestChecksumErrorPreservesCheckpoint(t *testing.T) {
 			var cancelled bool
 			ctx, cancel := context.WithCancel(t.Context())
 			t.Cleanup(cancel)
-			r.cancelFunc = func() { cancelled = true; cancel() }
+			r.cancelFunc = func(error) { cancelled = true; cancel() }
 			r.checker = &checksum.MockChecker{RunError: tc.err}
 
 			err := r.checksum(ctx)

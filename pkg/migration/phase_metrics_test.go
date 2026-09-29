@@ -30,6 +30,38 @@ func (s *phaseSink) Send(_ context.Context, m *metrics.Metrics) error {
 	return nil
 }
 
+// outcomeSink is a phaseSink that also implements status.WorkflowMetricsSink,
+// recording the outcome of every finished phase.
+type outcomeSink struct {
+	*phaseSink
+	finished map[status.State][]status.WorkflowPhaseOutcome
+}
+
+func newOutcomeSink() *outcomeSink {
+	return &outcomeSink{phaseSink: newPhaseSink(), finished: map[status.State][]status.WorkflowPhaseOutcome{}}
+}
+
+func (s *outcomeSink) RecordWorkflowPhaseStarted(status.State) {}
+
+func (s *outcomeSink) RecordWorkflowPhaseFinished(state status.State, outcome status.WorkflowPhaseOutcome) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finished[state] = append(s.finished[state], outcome)
+}
+
+func (s *outcomeSink) RecordWorkflowCopyCompleted(uint64, uint64) {}
+
+// outcomes returns the outcome of every finished phase, in no particular order.
+func (s *outcomeSink) outcomes() []status.WorkflowPhaseOutcome {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var all []status.WorkflowPhaseOutcome
+	for _, o := range s.finished {
+		all = append(all, o...)
+	}
+	return all
+}
+
 func (s *phaseSink) get(name string) []float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()

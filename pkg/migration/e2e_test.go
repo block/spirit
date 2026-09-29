@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/status"
@@ -372,6 +374,8 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 
 	m := NewTestRunnerFromStatement(t, "ALTER TABLE t1modification ENGINE=InnoDB",
 		WithThreads(1))
+	sink := newOutcomeSink()
+	m.SetMetricsSink(sink)
 
 	running := startTestRun(t, m.Run, m.Close)
 
@@ -380,7 +384,162 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	// Apply instant DDL — migration should detect this and cancel itself.
 	testutils.RunSQL(t, "ALTER TABLE t1modification ADD col3 INT")
 
-	require.Error(t, running.wait(t))
+	// The abort must come back as the failure it is, not as the
+	// context.Canceled every phase observes once the migration is stopped:
+	// callers (and the phase metrics) tell an operator cancellation from a
+	// failure by exactly that.
+	err := running.wait(t)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, change.FatalReasonSchemaChange.String())
+	outcomes := sink.outcomes()
+	require.Contains(t, outcomes, status.WorkflowPhaseOutcomeFailed, "the phase that observed the abort must be recorded as failed")
+	require.NotContains(t, outcomes, status.WorkflowPhaseOutcomeCancelled, "no phase may be recorded as cancelled")
+}
+
+// TestMigrationFailsOnPeriodicFlushError checks that a change the periodic
+// flush cannot apply stops the migration. The failed change stays buffered and
+// the checkpoint's binlog position stops advancing, so a migration that only
+// logged the error kept copying for as long as the copy took, while its only
+// resume point fell out of the binlog retention window.
+func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "flushapplyerr", `CREATE TABLE flushapplyerr (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	tt.SeedRows(t, "INSERT INTO flushapplyerr (b) SELECT 'abc'", 100000)
+
+	// Small chunks and the test throttler keep the copy running for far
+	// longer than the first periodic flush takes to fire.
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE flushapplyerr MODIFY b VARCHAR(10) NOT NULL",
+		WithThreads(1), WithTestThrottler(), func(m *Migration) { m.TargetChunkSize = 8192 })
+	running := startTestRun(t, m.Run, m.Close)
+	waitForStatus(t, m, status.CopyRows, running)
+
+	// Once the first row has been copied, give it a value the new column
+	// cannot hold. The change reaches _flushapplyerr_new only through the
+	// binlog, and applying it fails in strict mode.
+	var minID int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT MIN(id) FROM flushapplyerr").Scan(&minID))
+	require.Eventually(t, func() bool {
+		var n int
+		err := tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _flushapplyerr_new WHERE id = ?", minID).Scan(&n)
+		return err == nil && n == 1
+	}, time.Minute, 100*time.Millisecond, "the first row was never copied")
+	_, err := tt.DB.ExecContext(t.Context(), "UPDATE flushapplyerr SET b = REPEAT('x', 50) WHERE id = ?", minID)
+	require.NoError(t, err)
+
+	select {
+	case <-running.done:
+	case <-time.After(change.DefaultFlushInterval + time.Minute):
+		t.Fatalf("migration still running (state %s) after the periodic flush failed", m.status.Get())
+	}
+	require.Error(t, running.err)
+	// The synchronous flush after the copy would fail on the same change,
+	// but with the bare apply error: the reason shows it was the periodic
+	// flush, during the copy, that stopped the migration.
+	require.ErrorContains(t, running.err, change.FatalReasonFlushError.String())
+	require.True(t, checkpointTableExists(t, m), "the checkpoint is still valid and must be preserved")
+}
+
+// TestBacktickColumnNameMigration migrates a table with backticks in column
+// names, including a primary key column, through the copy and the checksum.
+// The checksum used to quote column names by hand, which made its query a
+// syntax error.
+func TestBacktickColumnNameMigration(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "backtick_col_migrate", "CREATE TABLE backtick_col_migrate ("+
+		"`i``d` INT NOT NULL AUTO_INCREMENT PRIMARY KEY, "+
+		"`na``me` VARCHAR(64) NOT NULL, "+
+		"`val``ue` INT NULL"+
+		")")
+	tt.SeedRows(t, "INSERT INTO backtick_col_migrate (`na``me`, `val``ue`) SELECT 'a', 1", 4096)
+	var seeded int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM backtick_col_migrate").Scan(&seeded))
+
+	m := NewTestRunner(t, "backtick_col_migrate", "ENGINE=InnoDB")
+	require.NoError(t, m.Run(t.Context()))
+	require.False(t, m.usedInstantDDL)
+	require.False(t, m.usedInplaceDDL)
+	require.NoError(t, m.Close())
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM backtick_col_migrate WHERE `na``me` = 'a' AND `val``ue` = 1").Scan(&count))
+	require.Equal(t, seeded, count)
+}
+
+// TestBitPrimaryKeyRefused refuses a table with a BIT in its primary key, even
+// for an ALTER MySQL could apply as INSTANT, and changing a primary key column
+// to a BIT. The chunkers cannot read BIT key values back from the table, so
+// such a migration used to set up its tables and then fail on the first chunk
+// of the copy.
+func TestBitPrimaryKeyRefused(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "bit_pk", `CREATE TABLE bit_pk (
+		b BIT(16) NOT NULL PRIMARY KEY,
+		v INT NOT NULL
+	)`)
+	// Enough rows that the copy needs more than one chunk, so it has to read
+	// a chunk boundary back from the table.
+	testutils.RunSQL(t, `INSERT INTO bit_pk (b, v)
+		WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3000)
+		SELECT /*+ SET_VAR(cte_max_recursion_depth = 10000) */ n, n FROM seq`)
+	// ADD COLUMN is INSTANT on every supported server: the refusal has to
+	// come from the statement-scope checks the runner runs before it
+	// attempts native DDL.
+	for _, alter := range []string{"ADD COLUMN c INT", "ENGINE=InnoDB"} {
+		m := NewTestRunner(t, "bit_pk", alter)
+		err := m.Run(t.Context())
+		require.NoError(t, m.Close())
+		require.ErrorContains(t, err, `primary key column "b" of table "bit_pk" is a BIT, which is not supported`)
+		require.False(t, m.usedInstantDDL)
+		var n int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_bit_pk_new'").Scan(&n))
+		require.Zero(t, n, "the table must be refused before the new table is created")
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bit_pk' AND COLUMN_NAME = 'c'").Scan(&n))
+		require.Zero(t, n, "the refused ALTER must not change the table")
+	}
+
+	tt = testutils.NewTestTable(t, "int_to_bit_pk", `CREATE TABLE int_to_bit_pk (
+		id INT UNSIGNED NOT NULL PRIMARY KEY,
+		v INT NOT NULL
+	)`)
+	testutils.RunSQL(t, "INSERT INTO int_to_bit_pk VALUES (1, 1), (2, 2)")
+	m := NewTestRunner(t, "int_to_bit_pk", "MODIFY id BIT(32) NOT NULL")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, `changing primary key column "id" of table "int_to_bit_pk" to a BIT is not supported`)
+	var tp string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'int_to_bit_pk' AND COLUMN_NAME = 'id'").Scan(&tp))
+	require.Equal(t, "int", tp, "the refused ALTER must not change the table")
+}
+
+// TestBitPrimaryKeyRefusedAfterKeyChange refuses an ALTER that replaces the
+// primary key with one that includes a BIT column, which no MODIFY or CHANGE
+// of a key column spells out. The primarykey check refuses the DROP PRIMARY
+// KEY before native DDL is attempted; primarykeybit would refuse the new
+// table at post-setup if that ever stopped being the case.
+func TestBitPrimaryKeyRefusedAfterKeyChange(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "bit_pk_swap", `CREATE TABLE bit_pk_swap (
+		id INT NOT NULL,
+		b BIT(16) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	testutils.RunSQL(t, "INSERT INTO bit_pk_swap VALUES (1, 1), (2, 2)")
+	m := NewTestRunner(t, "bit_pk_swap", "DROP PRIMARY KEY, ADD PRIMARY KEY (b)")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, "dropping primary key is not supported")
+	var key string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bit_pk_swap' AND CONSTRAINT_NAME = 'PRIMARY'").Scan(&key))
+	require.Equal(t, "id", key, "the refused ALTER must not change the table")
 }
 
 // TestReservedWordPKMigration is a regression test for issue #828.

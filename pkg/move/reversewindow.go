@@ -35,6 +35,10 @@ const (
 // request, feed death, or the deadline. A var so tests can shorten it.
 var reverseWindowPollInterval = 1 * time.Second
 
+// reverseFeedFlushInterval is the reverse feed's periodic flush interval. A var
+// so tests can shorten it.
+var reverseFeedFlushInterval = change.DefaultFlushInterval
+
 // targetCurrentPosition reads target tgt's current head position in the change
 // feed's coordinate scheme — auto-detected from that target server (GTIDs when
 // it has them enabled), the same way NewReverseFeed later classifies the
@@ -143,7 +147,7 @@ func (w *reverseWindow) run(ctx context.Context) error {
 		revertMarkerName, revertLoc),
 		"window", r.move.ReverseWindow, "deadline", deadline, "reverse_sources", len(r.targets))
 
-	return r.status.Do(status.ReverseWindow, func() error {
+	return r.status.DoContext(ctx, status.ReverseWindow, func() error {
 		ticker := time.NewTicker(reverseWindowPollInterval)
 		defer ticker.Stop()
 		for {
@@ -260,11 +264,12 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 	}
 
 	cfg := ReverseFeedConfig{
-		Sources:      sources,
-		TargetTables: targetTables,
-		Logger:       r.logger,
-		DBConfig:     r.dbConfig,
-		Threads:      r.reverseWriteThreads,
+		Sources:       sources,
+		TargetTables:  targetTables,
+		Logger:        r.logger,
+		DBConfig:      r.dbConfig,
+		Threads:       r.reverseWriteThreads,
+		FlushInterval: reverseFeedFlushInterval,
 	}
 	if sharded {
 		revTargets := make([]applier.Target, len(r.sources))

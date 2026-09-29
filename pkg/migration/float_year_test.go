@@ -247,18 +247,26 @@ func TestYear0000SurvivesMigration(t *testing.T) {
 // survive the cutover.
 func TestFloatPrimaryKeyRefused(t *testing.T) {
 	t.Parallel()
-	testutils.NewTestTable(t, "float_pk", `CREATE TABLE float_pk (
+	tt := testutils.NewTestTable(t, "float_pk", `CREATE TABLE float_pk (
 		id INT NOT NULL,
 		f FLOAT NOT NULL,
 		PRIMARY KEY (id, f)
 	)`)
 	testutils.RunSQL(t, "INSERT INTO float_pk VALUES (1, 0.1), (2, 0.2)")
+	// ADD COLUMN is INSTANT on every supported server: the refusal has to
+	// come from the statement-scope checks the runner runs before it
+	// attempts native DDL.
 	m := NewTestRunner(t, "float_pk", "ADD COLUMN c INT")
 	err := m.Run(t.Context())
 	require.NoError(t, m.Close())
 	require.ErrorContains(t, err, `primary key column "f" of table "float_pk" is a FLOAT, which is not supported`)
+	require.False(t, m.usedInstantDDL)
+	var n int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'float_pk' AND COLUMN_NAME = 'c'").Scan(&n))
+	require.Zero(t, n, "the refused ALTER must not change the table")
 
-	tt := testutils.NewTestTable(t, "double_pk", `CREATE TABLE double_pk (
+	tt = testutils.NewTestTable(t, "double_pk", `CREATE TABLE double_pk (
 		id INT NOT NULL,
 		d DOUBLE NOT NULL,
 		PRIMARY KEY (id, d)
@@ -267,11 +275,34 @@ func TestFloatPrimaryKeyRefused(t *testing.T) {
 	m = NewTestRunner(t, "double_pk", "MODIFY d FLOAT NOT NULL")
 	err = m.Run(t.Context())
 	require.NoError(t, m.Close())
-	require.ErrorContains(t, err, "is a FLOAT, which is not supported")
+	require.ErrorContains(t, err, `changing primary key column "d" of table "double_pk" to a FLOAT is not supported`)
 	var tp string
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 		"SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'double_pk' AND COLUMN_NAME = 'd'").Scan(&tp))
 	require.Equal(t, "double", tp, "the refused ALTER must not change the table")
+}
+
+// TestFloatPrimaryKeyRefusedAfterKeyChange refuses an ALTER that replaces the
+// primary key with one that includes a FLOAT column, which no MODIFY or
+// CHANGE of a key column spells out. The primarykey check refuses the DROP
+// PRIMARY KEY before native DDL is attempted; primarykeyfloat would refuse
+// the new table at post-setup if that ever stopped being the case.
+func TestFloatPrimaryKeyRefusedAfterKeyChange(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "float_pk_swap", `CREATE TABLE float_pk_swap (
+		id INT NOT NULL,
+		f FLOAT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	testutils.RunSQL(t, "INSERT INTO float_pk_swap VALUES (1, 0.1), (2, 0.2)")
+	m := NewTestRunner(t, "float_pk_swap", "DROP PRIMARY KEY, ADD PRIMARY KEY (f)")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, "dropping primary key is not supported")
+	var key string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'float_pk_swap' AND CONSTRAINT_NAME = 'PRIMARY'").Scan(&key))
+	require.Equal(t, "id", key, "the refused ALTER must not change the table")
 }
 
 // TestNarrowToFloat changes DOUBLE, VARCHAR, DECIMAL and BIGINT columns to

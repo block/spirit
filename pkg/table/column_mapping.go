@@ -232,8 +232,8 @@ func (m *ColumnMapping) ChecksumExprs() (source, target string, err error) {
 		// new one; both are cast to the same type.
 		srcCast := castExpr(m.sourceColumns[i], castTps[i], castSource)
 		tgtCast := castExpr(m.targetColumns[i], castTps[i], castTarget)
-		sourceExprs[i] = "IFNULL(" + srcCast + ",'')" + checksumSeparator + "ISNULL(`" + m.sourceColumns[i] + "`)"
-		targetExprs[i] = "IFNULL(" + tgtCast + ",'')" + checksumSeparator + "ISNULL(`" + m.targetColumns[i] + "`)"
+		sourceExprs[i] = "IFNULL(" + srcCast + ",'')" + checksumSeparator + "ISNULL(" + sqlescape.EscapeIdentifier(m.sourceColumns[i]) + ")"
+		targetExprs[i] = "IFNULL(" + tgtCast + ",'')" + checksumSeparator + "ISNULL(" + sqlescape.EscapeIdentifier(m.targetColumns[i]) + ")"
 	}
 	return strings.Join(sourceExprs, checksumSeparator), strings.Join(targetExprs, checksumSeparator), nil
 }

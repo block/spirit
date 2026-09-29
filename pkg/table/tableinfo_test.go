@@ -271,6 +271,57 @@ func TestPrimaryKeyIsMemoryComparableRejectsBIT(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "bitpk")
 	require.NoError(t, t1.SetInfo(t.Context()))
 	require.ErrorIs(t, t1.PrimaryKeyIsMemoryComparable(), ErrUnsupportedPKType)
+	// SetInfo describes the table; refusing it is left to the checks, which
+	// use BitPrimaryKeyError.
+	require.ErrorContains(t, t1.BitPrimaryKeyError(), `primary key column "b" of table "bitpk" is a BIT, which is not supported`)
+}
+
+func TestBitPrimaryKeyError(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		columns []ColumnMeta
+		key     []string
+		wantErr bool
+	}{
+		{"bit pk", []ColumnMeta{{Name: "b", MySQLType: "bit(8)"}}, []string{"b"}, true},
+		{"bit in composite pk", []ColumnMeta{{Name: "id", MySQLType: "int"}, {Name: "b", MySQLType: "bit(16)"}}, []string{"id", "b"}, true},
+		{"int pk", []ColumnMeta{{Name: "id", MySQLType: "int unsigned"}}, []string{"id"}, false},
+		{"bit non-key column", []ColumnMeta{{Name: "id", MySQLType: "int"}, {Name: "b", MySQLType: "bit(16)"}}, []string{"id"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ti, err := NewTableInfoFromMeta("test", "t1", tc.columns, tc.key)
+			require.NoError(t, err)
+			err = ti.BitPrimaryKeyError()
+			if tc.wantErr {
+				require.ErrorContains(t, err, `of table "t1" is a BIT, which is not supported`)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestFloatPrimaryKeySetInfo checks that SetInfo describes a table whose
+// primary key has a FLOAT column rather than refusing it: the migration and
+// move checks refuse it, with FloatPrimaryKeyError.
+func TestFloatPrimaryKeySetInfo(t *testing.T) {
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS floatpk`)
+	testutils.RunSQL(t, `CREATE TABLE floatpk (id INT NOT NULL, f FLOAT NOT NULL, PRIMARY KEY (id, f))`)
+	testutils.RunSQL(t, `INSERT INTO floatpk (id, f) VALUES (1, 0.1), (2, 0.2)`)
+	t.Cleanup(func() { testutils.RunSQL(t, `DROP TABLE IF EXISTS floatpk`) })
+
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	t1 := NewTableInfo(db, "test", "floatpk")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	require.Equal(t, []string{"id", "f"}, t1.KeyColumns)
+	require.ErrorContains(t, t1.FloatPrimaryKeyError(), `primary key column "f" of table "floatpk" is a FLOAT, which is not supported`)
 }
 
 func TestDiscoveryCompositeNonComparable(t *testing.T) {

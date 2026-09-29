@@ -22,7 +22,9 @@ func init() {
 //
 // primarykeycollation stays the authority. It reads the collation MySQL
 // actually resolved on the new table, and it refuses every run this check
-// refuses, so the prediction is not registered for a run of its own. This check
+// refuses, so the prediction is not registered at any other scope. The
+// migration runner runs it with the other statement-scope checks before it
+// attempts native DDL, which only moves the refusal earlier. This check
 // only refuses when it knows the key column's collation both now and once the
 // statement applies, or knows that the column's charset changes, which changes
 // its collation whichever one each side takes. When the answer depends on a

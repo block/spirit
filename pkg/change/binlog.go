@@ -1487,6 +1487,9 @@ func (c *binlogClient) runPeriodicFlush(ctx context.Context, interval time.Durat
 					return
 				}
 				c.logger.Error("error flushing parked subscription", "error", err)
+				if c.fatalError(FatalReasonFlushError) {
+					return
+				}
 			}
 		case <-ticker.C:
 		}
@@ -1500,6 +1503,13 @@ func (c *binlogClient) runPeriodicFlush(ctx context.Context, interval time.Durat
 				return
 			}
 			c.logger.Error("error flushing binary log", "error", err)
+			// The failed changes stay buffered and the flushed position
+			// stays where it is, so every later pass would fail the same
+			// way while the checkpoint falls further behind the binlog
+			// retention window. Stop the caller rather than carry on.
+			if c.fatalError(FatalReasonFlushError) {
+				return
+			}
 		}
 		// Debug, not Info: the runner reports the same information (when the
 		// last flush was, how long it took, how many rows) on its periodic

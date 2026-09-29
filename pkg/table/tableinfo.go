@@ -579,7 +579,7 @@ func (t *TableInfo) setPrimaryKey(ctx context.Context) error {
 			t.KeyIsAutoInc = (extra == "auto_increment")
 		}
 	}
-	return t.FloatPrimaryKeyError()
+	return nil
 }
 
 // FloatPrimaryKeyError returns an error if a primary key column is a FLOAT,
@@ -592,13 +592,36 @@ func (t *TableInfo) setPrimaryKey(ctx context.Context) error {
 // during the migration is still in the table after cutover; and a chunk
 // boundary on a value shared by many rows never advances.
 //
-// The table is refused on setup, before MySQL's native DDL is attempted, so
-// the refusal holds for every statement on every server.
+// SetInfo does not call it: a TableInfo describes any table, and refusing one
+// is for the caller to decide. The migration and move checks refuse such a
+// table with it.
 func (t *TableInfo) FloatPrimaryKeyError() error {
 	for _, col := range t.KeyColumns {
 		if tp, ok := t.GetColumnMySQLType(col); ok && isFloatColumnType(tp) {
 			return fmt.Errorf("primary key column %q of table %q is a FLOAT, which is not supported: "+
 				"a FLOAT does not compare equal to its text form, so rows cannot be located by key", col, t.TableName)
+		}
+	}
+	return nil
+}
+
+// BitPrimaryKeyError returns an error if a primary key column is a BIT, which
+// Spirit does not support.
+//
+// Spirit handles a BIT key value as an unsigned integer: binlog rows carry it
+// as one, and it is written into chunk predicates and DELETEs as a numeric
+// literal. But the chunkers read chunk boundaries and the key range back from
+// the table with plain SELECTs, which return a BIT as raw big-endian bytes that
+// cannot be parsed as a number, so the copy failed on its first chunk, after
+// the migration had already set up its tables.
+//
+// SetInfo does not call it: a TableInfo describes any table, and refusing one
+// is for the caller to decide. The migration and move checks refuse such a
+// table with it.
+func (t *TableInfo) BitPrimaryKeyError() error {
+	for _, col := range t.KeyColumns {
+		if tp, ok := t.GetColumnMySQLType(col); ok && isBITType(tp) {
+			return fmt.Errorf("primary key column %q of table %q is a BIT, which is not supported", col, t.TableName)
 		}
 	}
 	return nil
@@ -622,8 +645,9 @@ func (t *TableInfo) PrimaryKeyIsMemoryComparable() error {
 	// returns BIT as raw big-endian bytes, and the chunker's
 	// newDatumFromMySQL path parses those as decimal strings — which
 	// fails or produces wrong bounds. Until the min/max read path knows
-	// how to decode BIT bytes, reject BIT PKs upfront with the same error
-	// they returned before BIT got its own datumTp.
+	// how to decode BIT bytes, reject BIT PKs with the same error they
+	// returned before BIT got its own datumTp. The migration and move
+	// checks refuse them before any copy (see BitPrimaryKeyError).
 	if slices.ContainsFunc(t.keyColumnsMySQLTp, isBITType) {
 		return ErrUnsupportedPKType
 	}
@@ -641,9 +665,10 @@ func (t *TableInfo) setMinMax(ctx context.Context) error {
 	// BIT is classified as unsignedType so the applier emits the value as
 	// a numeric literal, but `SELECT min(bit_col)` returns raw big-endian
 	// bytes that newDatumFromMySQL can't parse as decimal. BIT primary
-	// keys are rejected upfront by PrimaryKeyIsMemoryComparable; skip
-	// here so SetInfo can complete and the rejection can fire on a
-	// well-formed TableInfo.
+	// keys are rejected by PrimaryKeyIsMemoryComparable, and by the
+	// migration and move checks (see BitPrimaryKeyError); skip here so
+	// SetInfo can complete and the rejection can fire on a well-formed
+	// TableInfo.
 	if isBITType(t.keyColumnsMySQLTp[0]) {
 		return nil
 	}

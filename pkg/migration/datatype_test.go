@@ -1526,7 +1526,10 @@ func TestIssue1282PKCollationChange(t *testing.T) {
 
 	m := NewTestRunner(t, "pkcoll1282", "MODIFY id varchar(32) COLLATE utf8mb4_bin NOT NULL")
 	err := m.Run(t.Context())
-	require.ErrorContains(t, err, `changing the collation of primary key column "id" from utf8mb4_0900_ai_ci to utf8mb4_bin is not supported`)
+	// The statement-scope prediction (primarykeycollationstatement) refuses
+	// it before native DDL is attempted, ahead of primarykeycollation at
+	// post-setup.
+	require.ErrorContains(t, err, `changing the collation of primary key column "id" is not supported`)
 	require.Zero(t, m.status.Duration(status.CopyRows), "the change must be refused before any rows are copied")
 	require.NoError(t, m.Close())
 

@@ -1,6 +1,7 @@
 package move
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log/slog"
@@ -38,7 +39,7 @@ func TestFatalErrorIsIdempotent(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 
 	require.True(t, r.fatalError(change.FatalReasonSchemaChange), "first call must return true")
@@ -62,7 +63,7 @@ func TestFatalErrorConcurrentRace(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 
 	const goroutines = 32
@@ -89,7 +90,7 @@ func TestFatalErrorPastCutoverIsNoop(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 	r.status.Set(status.CutOver)
 
@@ -111,6 +112,21 @@ func TestFatalErrorSafeWithoutCancelFunc(t *testing.T) {
 	})
 }
 
+// TestFatalErrorCancelsWithCause pins that fatalError cancels the move
+// context with an error naming the reason, not with a bare cancellation: Run
+// returns that cause, so the abort is reported and recorded as a failure.
+func TestFatalErrorCancelsWithCause(t *testing.T) {
+	var cause error
+	r := &Runner{
+		logger:     slog.Default(),
+		cancelFunc: func(err error) { cause = err },
+	}
+	require.True(t, r.fatalError(change.FatalReasonFlushError))
+	require.Error(t, cause)
+	require.NotErrorIs(t, cause, context.Canceled)
+	require.ErrorContains(t, cause, change.FatalReasonFlushError.String())
+}
+
 // TestFatalErrorReasonCheckpointHandling pins the cause-aware checkpoint
 // policy, mirroring the migration-runner test of the same name: a
 // schema-change fatal (foreign DDL on a source table) must DROP the
@@ -127,7 +143,7 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		var cancelCalls atomic.Int32
 		r := &Runner{
 			logger:          slog.Default(),
-			cancelFunc:      func() { cancelCalls.Add(1) },
+			cancelFunc:      func(error) { cancelCalls.Add(1) },
 			targets:         []applier.Target{{KeyRange: "0", DB: db}},
 			checkpointTable: table.NewTableInfo(db, dbName, checkpointTableName),
 		}
@@ -151,6 +167,15 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		require.Equal(t, int32(1), cancelCalls.Load(), "must still cancel the move")
 		require.True(t, checkpointTableExists(t, r),
 			"a stream-error fatal must preserve the checkpoint table so the move can resume")
+	})
+
+	t.Run("FlushErrorPreservesCheckpoint", func(t *testing.T) {
+		r, cancelCalls := makeRunner(t)
+		require.True(t, r.fatalError(change.FatalReasonFlushError))
+		require.Equal(t, status.ErrCleanup, r.status.Get())
+		require.Equal(t, int32(1), cancelCalls.Load(), "must still cancel the move")
+		require.True(t, checkpointTableExists(t, r),
+			"a flush-error fatal must preserve the checkpoint table so the move can resume")
 	})
 
 	t.Run("UnsupportedXADropsCheckpoint", func(t *testing.T) {
