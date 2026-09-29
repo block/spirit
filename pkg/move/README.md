@@ -59,6 +59,8 @@ The cutover is split into two parts: a caller-provided function and a table rena
 
 This separation allows orchestration systems to perform routing changes, such as updating a DNS server or Vitess topology server as part of the atomic cutover.
 
+Before the caller's function runs (still under the source locks, after the final flush), each target table's `AUTO_INCREMENT` counter is raised to at least the highest counter among the sources. The copy and the change feed only carry rows, so without this a target would issue again any id the source had issued above the highest row it copied, e.g. rows inserted and deleted during the move. A reverse-window rollback does the same in the other direction before the source's `_old` tables are put back into service. Tables without an `AUTO_INCREMENT` column are skipped.
+
 ### Reverse Window
 
 `ReverseWindow` (the `--reverse-window` flag) makes a cutover reversible for a bounded period. Instead of exiting after the cutover rename, the runner stands up a **change-only reverse feed** — the former targets become change sources and the source's now-retired `_old` tables become the write target (`reversefeed.go`, from the reverse-feed foundations) — and holds it for the window (`reversewindow.go`). The feed's start position is captured in the cutover's `postSwitch` hook, under the source lock, so no target write is missed.

@@ -1,11 +1,13 @@
 package migration
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -266,6 +268,121 @@ func TestModifyAddAutoIncrementPreservesZeroPK(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 	require.Equal(t, []int64{0, 1, 2}, ids, "row with gid=0 must survive the MODIFY ... AUTO_INCREMENT migration")
+}
+
+// insertedID inserts one row with a generated id and returns that id.
+func insertedID(t *testing.T, db *sql.DB, tableName string) int64 {
+	t.Helper()
+	res, err := db.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO `%s` (v) VALUES (0)", tableName))
+	require.NoError(t, err)
+	id, err := res.LastInsertId()
+	require.NoError(t, err)
+	return id
+}
+
+// TestCutOverCarriesAutoIncrement regresses the AUTO_INCREMENT counter going
+// backwards across the cutover. Rows inserted and then deleted at the top of
+// the id range while the migration runs never reach the new table (their
+// changes merge into nothing), so its counter follows its own MAX(id)+1. Unless
+// the cutover carries the original table's counter over, those ids are issued
+// a second time - which a native ALTER TABLE never does. Queue-style tables
+// (insert, process, delete) hit this all the time.
+//
+// Two tables are migrated together so every table in a multi-table cutover
+// is covered.
+func TestCutOverCarriesAutoIncrement(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	for _, tbl := range []string{"autoinc_queue", "autoinc_queue2"} {
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)", tbl))
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (v) VALUES (1), (2), (3)", tbl))
+	}
+	m := NewTestRunnerFromStatement(t,
+		"ALTER TABLE autoinc_queue MODIFY v BIGINT NOT NULL; ALTER TABLE autoinc_queue2 MODIFY v BIGINT NOT NULL",
+		WithDBName(dbName), WithThreads(1), WithDeferCutOver(), WithRespectSentinel())
+	running := startTestRun(t, m.Run, m.Close)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
+
+	// Ids 4..8 (4..12 on the second table) are issued and deleted before cutover.
+	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO autoinc_queue (v) VALUES (4), (5), (6), (7), (8)")
+	testutils.RunSQLInDatabase(t, dbName, "DELETE FROM autoinc_queue WHERE id > 3")
+	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO autoinc_queue2 (v) VALUES (4), (5), (6), (7), (8), (9), (10), (11), (12)")
+	testutils.RunSQLInDatabase(t, dbName, "DELETE FROM autoinc_queue2 WHERE id > 3")
+	require.Contains(t, showCreateTable(t, db, "autoinc_queue"), "AUTO_INCREMENT=9")
+	require.Contains(t, showCreateTable(t, db, "autoinc_queue2"), "AUTO_INCREMENT=13")
+
+	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE _spirit_sentinel")
+	require.NoError(t, running.wait(t))
+
+	ddl := showCreateTable(t, db, "autoinc_queue")
+	require.Contains(t, ddl, "bigint", "the ALTER was not applied")
+	require.Contains(t, ddl, "AUTO_INCREMENT=9", "AUTO_INCREMENT went backwards across the cutover")
+	require.Equal(t, int64(9), insertedID(t, db, "autoinc_queue"))
+	require.Contains(t, showCreateTable(t, db, "autoinc_queue2"), "AUTO_INCREMENT=13")
+	require.Equal(t, int64(13), insertedID(t, db, "autoinc_queue2"))
+}
+
+// TestCutOverHonorsExplicitAutoIncrement checks that an AUTO_INCREMENT=N in the
+// ALTER is not overridden by the cutover carrying the original counter over.
+// A native ALTER lowers the counter to N when no row is at or above it, so
+// spirit must not raise it back.
+func TestCutOverHonorsExplicitAutoIncrement(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE autoinc_explicit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL) AUTO_INCREMENT=1000")
+	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO autoinc_explicit (id, v) VALUES (1, 1), (2, 2)")
+
+	m := NewTestRunner(t, "autoinc_explicit", "MODIFY v BIGINT NOT NULL, AUTO_INCREMENT=500", WithDBName(dbName))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	require.Contains(t, showCreateTable(t, db, "autoinc_explicit"), "AUTO_INCREMENT=500")
+	require.Equal(t, int64(500), insertedID(t, db, "autoinc_explicit"))
+}
+
+// TestRaiseAutoIncrementOnlyRaises: a new table whose counter is already
+// ahead of the original's keeps it. InnoDB honors a lower AUTO_INCREMENT = n
+// down to MAX(id)+1, so an unconditional ALTER would move it backwards.
+func TestRaiseAutoIncrementOnlyRaises(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE autoinc_src (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=9")
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE autoinc_dst (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=50")
+
+	src := table.NewTableInfo(db, dbName, "autoinc_src")
+	dst := table.NewTableInfo(db, dbName, "autoinc_dst")
+	_, raised, err := raiseAutoIncrement(t.Context(), db, src, dst, func(ctx context.Context, stmt string) error {
+		_, err := db.ExecContext(ctx, stmt)
+		return err
+	})
+	require.NoError(t, err)
+	require.False(t, raised)
+	require.Contains(t, showCreateTable(t, db, "autoinc_dst"), "AUTO_INCREMENT=50")
+}
+
+// TestCutOverAutoIncrementAttributeChanges covers ALTERs that add or remove the
+// AUTO_INCREMENT attribute, where there is no counter to carry over on one side.
+func TestCutOverAutoIncrementAttributeChanges(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+
+	// Removed: the new table has no counter, and nothing should try to set one.
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE autoinc_removed (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)")
+	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO autoinc_removed (v) VALUES (1), (2), (3)")
+	testutils.RunSQLInDatabase(t, dbName, "DELETE FROM autoinc_removed WHERE id = 3")
+	m := NewTestRunner(t, "autoinc_removed", "MODIFY id INT NOT NULL", WithDBName(dbName))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.NotContains(t, showCreateTable(t, db, "autoinc_removed"), "AUTO_INCREMENT")
+
+	// Added: the original table has no counter, so the new one follows its
+	// data (MAX(id)+1), as it would after a native ALTER.
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE autoinc_added (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO autoinc_added (id, v) VALUES (1, 1), (7, 7)")
+	m = NewTestRunner(t, "autoinc_added", "MODIFY id INT NOT NULL AUTO_INCREMENT", WithDBName(dbName))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.Equal(t, int64(8), insertedID(t, db, "autoinc_added"))
 }
 
 func TestOldTableNameTruncation(t *testing.T) {

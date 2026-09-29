@@ -140,14 +140,17 @@ func formatColumnDefinition(col *Column) string {
 			// store the keyword/number instead of the string.
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
 		case col.DefaultKind == DefaultKindBitLiteral,
+			col.DefaultKind == DefaultKindHexLiteral,
 			col.DefaultKind == DefaultKindNumber,
 			col.DefaultKind == DefaultKindKeywordBool:
 			// A literal MySQL reports and accepts unquoted. The recorded text
 			// is already the canonical spelling of its kind — a bit literal is
 			// restored in the minimal form MySQL reports (b'0101' as b'101'),
-			// and a number carries no quotes of its own. Quoting any of these
-			// would change what MySQL stores; for a bit literal it produces
-			// DDL MySQL rejects, since 'b\'101\'' is not a valid bit value.
+			// a hex literal as x'1a', and a number carries no quotes of its
+			// own. Quoting any of these would change what MySQL stores; for a
+			// bit literal it produces DDL MySQL rejects, since 'b\'101\'' is
+			// not a valid bit value, and a quoted hex literal is the text
+			// x'1a' rather than the byte it spells.
 			parts = append(parts, fmt.Sprintf("DEFAULT %s", defaultVal))
 		case needsQuotes(defaultVal):
 			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", sqlescape.EscapeString(defaultVal)))
