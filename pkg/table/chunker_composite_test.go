@@ -1917,3 +1917,26 @@ func TestCompositeOpenAtWatermarkConcurrentProgress(t *testing.T) {
 
 	require.Equal(t, uint64(200), comp.RowsCopied())
 }
+
+// A composite checkpoint carries the settled row count in its envelope, so a
+// chunker resumed from one must write the count back out in its own
+// watermark. Otherwise the next resume restarts progress at zero.
+func TestCompositeWatermarkRoundTripsRowsCopied(t *testing.T) {
+	ti := newTableInfo4Test("test", "t1")
+	ti.EstimatedRows = 1000
+	ti.KeyColumns = []string{"a", "b"}
+	ti.keyColumnsMySQLTp = []string{"int", "int"}
+	ti.keyDatums = []datumTp{signedType, signedType}
+	ti.Columns = []string{"a", "b"}
+	ti.columnsMySQLTps = map[string]string{"a": "int", "b": "int"}
+	chunker, err := NewChunker(ti, ChunkerConfig{})
+	require.NoError(t, err)
+	watermark := `{"ChunkJSON":"{\"Key\":[\"a\",\"b\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\":[\"100\",\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\":[\"200\",\"1\"],\"Inclusive\":false}}","RowsCopied":200}`
+	require.NoError(t, chunker.OpenAtWatermark(watermark))
+
+	got, err := chunker.GetLowWatermark()
+	require.NoError(t, err)
+	var wm compositeWatermark
+	require.NoError(t, json.Unmarshal([]byte(got), &wm))
+	require.Equal(t, uint64(200), wm.RowsCopied)
+}
