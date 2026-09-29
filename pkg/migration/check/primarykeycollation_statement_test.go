@@ -162,6 +162,12 @@ func TestPrimaryKeyCollationStatementRefusal(t *testing.T) {
 			wantReason: "converting the table's character set changes the collation of its primary key, which is not supported",
 		},
 		{
+			name:       "an NVARCHAR key, utf8mb3 under any table default, changed to utf8mb4",
+			stmt:       "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+			current:    "CREATE TABLE ledger (owner_token nvarchar(64) NOT NULL, PRIMARY KEY (owner_token)) DEFAULT CHARSET=utf8mb4",
+			wantReason: `changing the collation of primary key column "owner_token" is not supported`,
+		},
+		{
 			name:       "an integer key given a character type under a utf8mb4 default",
 			stmt:       "ALTER TABLE orders MODIFY COLUMN id varchar(20) NOT NULL",
 			current:    "CREATE TABLE orders (id bigint NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4",
@@ -200,6 +206,12 @@ func TestPrimaryKeyCollationStatementRefusal(t *testing.T) {
 			name:    "a collation within the charset of a utf8mb4 key of unknown collation",
 			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) COLLATE utf8mb4_bin NOT NULL",
 			current: "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token)) DEFAULT CHARSET=utf8mb4",
+		},
+		{
+			// NVARCHAR is utf8mb3 under any table default.
+			name:    "restating the charset of an NVARCHAR key under a utf8mb4 default",
+			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) CHARACTER SET utf8mb3 NOT NULL",
+			current: "CREATE TABLE ledger (owner_token nvarchar(64) NOT NULL, PRIMARY KEY (owner_token)) DEFAULT CHARSET=utf8mb4",
 		},
 		{
 			name:    "naming utf8mb4 without a collation",

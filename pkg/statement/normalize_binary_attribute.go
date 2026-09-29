@@ -43,8 +43,9 @@ func init() { registerNormalizer(binaryAttributeNormalizer{}) }
 //	  -> char(5) CHARACTER SET utf8mb3 COLLATE utf8mb3_unicode_ci
 //
 // If neither the column nor the table declares a charset or a collation the
-// attribute cannot be resolved (the effective charset is a server default only known at
-// runtime); the column keeps its character type and no collation is invented.
+// attribute cannot be resolved (the effective charset is a server default only
+// known at runtime); the column keeps its character type and no collation is
+// invented.
 type binaryAttributeNormalizer struct{}
 
 func (binaryAttributeNormalizer) Name() string { return "binary-attribute" }
