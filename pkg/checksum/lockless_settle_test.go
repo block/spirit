@@ -367,6 +367,19 @@ func TestExpectedImageCRCMatchesRealRowForBinlogTypes(t *testing.T) {
 			"INSERT INTO src VALUES (1, NULL, NULL)",
 			[]any{int32(1), nil, nil},
 		},
+		// A string column in another charset carries its own bytes: bound as
+		// a plain parameter they would be read as utf8mb4, so latin1 C3 A9
+		// ('Ã©') would render as 'é' and utf16 00 4D ('M') as two characters.
+		{
+			"id INT PRIMARY KEY, l1 VARCHAR(20) CHARACTER SET latin1, t TEXT CHARACTER SET latin1, gb VARCHAR(20) CHARACTER SET gbk, u16 VARCHAR(20) CHARACTER SET utf16, e ENUM('café') CHARACTER SET latin1",
+			"INSERT INTO src VALUES (1, X'C3A9', X'636166E9', X'D0B0', X'004D', 'café')",
+			[]any{int32(1), "\xc3\xa9", []byte("caf\xe9"), "\xd0\xb0", "\x00M", "café"},
+		},
+		{
+			"id INT PRIMARY KEY, l1 VARCHAR(20) CHARACTER SET latin1, u16 VARCHAR(20) CHARACTER SET utf16",
+			"INSERT INTO src VALUES (1, '', '')",
+			[]any{int32(1), "", ""},
+		},
 	} {
 		t.Run(tc.ddl, func(t *testing.T) {
 			db, chunk := snapshotTestTables(t, tc.ddl, []string{"id"})
@@ -422,6 +435,9 @@ func TestExpectedImageCRCMatchesRealRowAcrossConversions(t *testing.T) {
 		// string source into a BIT target: cast to binary, bound as-is
 		{"varchar to bit", "id INT PRIMARY KEY, b VARCHAR(8)", "id INT PRIMARY KEY, b BIT(8)",
 			"INSERT INTO src VALUES (1, '5')", []any{int32(1), "5"}},
+		// a charset conversion: the image carries latin1 bytes, not utf8mb4
+		{"latin1 to utf8mb4", "id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET latin1", "id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET utf8mb4",
+			"INSERT INTO src VALUES (1, X'C3A920E9')", []any{int32(1), "\xc3\xa9 \xe9"}},
 		// cast to the wider fractional precision, datetime(6)
 		{"datetime narrowing", "id INT PRIMARY KEY, d DATETIME(6)", "id INT PRIMARY KEY, d DATETIME",
 			"INSERT INTO src VALUES (1, '2026-01-01 10:00:00.999999')", []any{int32(1), "2026-01-01 10:00:00.999999"}},
@@ -554,6 +570,34 @@ func TestKeyMatcher(t *testing.T) {
 	require.Error(t, err, "a snapshot key that does not fit the chunk key is a bug, not a miss")
 	_, err = keyMatcher(chunk.Table, []string{"nosuch"}, want[:1])
 	require.Error(t, err)
+}
+
+// TestKeyMatcherNonUTF8Key: the snapshot reads a latin1 key back as utf8mb4,
+// and the stream decodes it as the column's own bytes, so latin1 'é' is C3 A9
+// on one side and E9 on the other. binlogKey converts the snapshot's side to
+// the column's charset so the two can match; without it the watched row never
+// matches and every settle of it defers.
+func TestKeyMatcherNonUTF8Key(t *testing.T) {
+	db, chunk := snapshotTestTables(t, "id VARCHAR(10) CHARACTER SET latin1 PRIMARY KEY, n INT, u16 VARCHAR(10) CHARACTER SET utf16, value INT", []string{"id", "n", "u16"})
+	snapshotExec(t, db, "INSERT INTO src VALUES (X'E9', 1, 'M', 1)")
+
+	rows, _, _, err := readHotSnapshotRows(t.Context(), db, chunk, chunk.Table, "value", chunk.String(), 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	var snapshotKey []table.Datum
+	for _, row := range rows {
+		snapshotKey = row.key
+	}
+	require.Equal(t, "é", snapshotKey[0].Val, "the snapshot reads the key as utf8mb4")
+
+	want, err := binlogKey(t.Context(), db, chunk.Table, chunk.Key, snapshotKey)
+	require.NoError(t, err)
+	require.Equal(t, "é", snapshotKey[0].Val, "the snapshot key is still what pointPredicate needs")
+	match, err := keyMatcher(chunk.Table, chunk.Key, want)
+	require.NoError(t, err)
+	require.True(t, match([]any{"\xe9", int64(1), "\x00M"}), "the stream's bytes must match")
+	require.False(t, match([]any{"é", int64(1), "\x00M"}), "utf8mb4 bytes are a different latin1 key")
+	require.False(t, match([]any{"\xe9", int64(1), "M"}))
 }
 
 // TestCheckHotSnapshotEscalatesOnlyWhenExhausted: settling parks the change
