@@ -70,7 +70,7 @@ type chunkerOptimistic struct {
 	// Progress tracking: the implementation here is up to the chunker,
 	// and for the optimistic chunker it is based on the progress
 	// through the auto_increment counter.
-	rowsCopied uint64 // The sum of chunkSize: distance travelled, not a row count
+	rowsCopied atomic.Uint64 // The sum of chunkSize: distance travelled, not a row count
 	// actualRowsCopied is the sum of the actualRows reported to Feedback, i.e.
 	// the rows the applier really settled. rowsCopied above cannot serve this
 	// purpose: it advances by the chunk's key-space width so that it can be
@@ -396,7 +396,7 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string) error {
 	if minVal, minErr := strconv.ParseUint(t.Ti.MinValue().String(), 10, 64); minErr == nil && ptrVal >= minVal {
 		ptrVal -= minVal
 	}
-	t.rowsCopied = ptrVal
+	t.rowsCopied.Store(ptrVal)
 
 	// actualRowsCopied is a real count, so unlike rowsCopied above it cannot be
 	// derived from the key space — it is restored from the watermark or not at
@@ -441,7 +441,7 @@ func (t *chunkerOptimistic) Reset() error {
 	t.prefetchRejections = 0
 
 	// Reset progress tracking
-	atomic.StoreUint64(&t.rowsCopied, 0)
+	t.rowsCopied.Store(0)
 	t.actualRowsCopied.Store(0)
 	t.chunksCopied.Store(0)
 
@@ -468,7 +468,7 @@ func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration, actualRows u
 	// the actualRows. This differs from the composite chunker, which doesn't have an
 	// auto_inc max so it takes the table estimate and compares it to the actual
 	// rows copied.
-	atomic.AddUint64(&t.rowsCopied, chunk.ChunkSize)
+	t.rowsCopied.Add(chunk.ChunkSize)
 	t.chunksCopied.Add(1)
 
 	t.recordKeyDensity(chunk, actualRows)
@@ -730,7 +730,7 @@ func (t *chunkerOptimistic) open() (err error) {
 	// just called" on a fresh chunker.
 
 	// Initialize progress tracking
-	atomic.StoreUint64(&t.rowsCopied, 0)
+	t.rowsCopied.Store(0)
 	t.actualRowsCopied.Store(0)
 
 	// Make sure min/max value are always specified
@@ -759,7 +759,7 @@ func (t *chunkerOptimistic) Progress() (uint64, uint64, uint64) {
 	if err != nil {
 		maxValue = atomic.LoadUint64(&t.Ti.EstimatedRows) // should not be needed.
 	}
-	return atomic.LoadUint64(&t.rowsCopied), t.chunksCopied.Load(), maxValue
+	return t.rowsCopied.Load(), t.chunksCopied.Load(), maxValue
 }
 
 // KeyAboveHighWatermark returns true if the key is above the high watermark.

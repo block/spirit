@@ -38,7 +38,7 @@ type chunkerComposite struct {
 	// Progress tracking is up to the chunker implementation
 	// For the composite chunker, we use the actual copied
 	// rows as returned from Feedback()
-	rowsCopied   uint64
+	rowsCopied   atomic.Uint64
 	chunksCopied atomic.Uint64
 
 	logger *slog.Logger
@@ -300,7 +300,7 @@ func (t *chunkerComposite) OpenAtWatermark(checkpnt string) error {
 	// from the chunk.LowerBound.
 	t.watermark = chunk
 	t.chunkPtrs = chunk.LowerBound.Value
-	t.rowsCopied = watermark.RowsCopied
+	t.rowsCopied.Store(watermark.RowsCopied)
 	return nil
 }
 
@@ -328,7 +328,7 @@ func (t *chunkerComposite) Reset() error {
 	t.chunkTimingInfo = []time.Duration{}
 
 	// Reset progress tracking
-	atomic.StoreUint64(&t.rowsCopied, 0)
+	t.rowsCopied.Store(0)
 	t.chunksCopied.Store(0)
 
 	return nil
@@ -344,7 +344,7 @@ func (t *chunkerComposite) Feedback(chunk *Chunk, d time.Duration, actualRows ui
 	t.bumpWatermark(chunk, t.logger)
 
 	// Update progress tracking - add the actual rows processed
-	atomic.AddUint64(&t.rowsCopied, actualRows)
+	t.rowsCopied.Add(actualRows)
 	t.chunksCopied.Add(1)
 
 	// Check if the feedback is based on an earlier chunker size.
@@ -387,7 +387,7 @@ func (t *chunkerComposite) GetLowWatermark() (string, error) {
 	}
 	watermark := compositeWatermark{
 		ChunkJSON:  chunkJSON,
-		RowsCopied: atomic.LoadUint64(&t.rowsCopied),
+		RowsCopied: t.rowsCopied.Load(),
 	}
 	// Serialize to JSON
 	jsonBytes, err := json.Marshal(watermark)
@@ -421,7 +421,7 @@ func (t *chunkerComposite) open() (err error) {
 	t.checkpointHighPtr = Datum{} // reset checkpoint high pointer
 
 	// Initialize progress tracking
-	atomic.StoreUint64(&t.rowsCopied, 0)
+	t.rowsCopied.Store(0)
 
 	return nil
 }
@@ -441,11 +441,11 @@ func (t *chunkerComposite) IsRead() bool {
 // chunker this is the same counter Progress reports, because it already
 // accumulates the actualRows from Feedback.
 func (t *chunkerComposite) RowsCopied() uint64 {
-	return atomic.LoadUint64(&t.rowsCopied)
+	return t.rowsCopied.Load()
 }
 
 func (t *chunkerComposite) Progress() (uint64, uint64, uint64) {
-	return atomic.LoadUint64(&t.rowsCopied), t.chunksCopied.Load(), atomic.LoadUint64(&t.Ti.EstimatedRows)
+	return t.rowsCopied.Load(), t.chunksCopied.Load(), atomic.LoadUint64(&t.Ti.EstimatedRows)
 }
 
 // KeyAboveHighWatermark checks if a key is above the high watermark (chunkPtr).

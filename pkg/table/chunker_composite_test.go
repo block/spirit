@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1881,4 +1882,42 @@ func TestCompositeChunkerReservedWordTableName(t *testing.T) {
 		require.NotNil(t, chunk)
 	}
 	require.NoError(t, chunker.Close())
+}
+
+// A continuous checksum restarts its chunker with OpenAtWatermark while the
+// status dumper polls Progress from another goroutine, so the progress
+// counters must be safe to read concurrently with a resume. Run with -race.
+func TestCompositeOpenAtWatermarkConcurrentProgress(t *testing.T) {
+	ti := newTableInfo4Test("test", "t1")
+	ti.EstimatedRows = 1000
+	ti.KeyColumns = []string{"a", "b"}
+	ti.keyColumnsMySQLTp = []string{"int", "int"}
+	ti.keyDatums = []datumTp{signedType, signedType}
+	ti.Columns = []string{"a", "b"}
+	ti.columnsMySQLTps = map[string]string{"a": "int", "b": "int"}
+	chunker, err := NewChunker(ti, ChunkerConfig{})
+	require.NoError(t, err)
+	comp := chunker.(*chunkerComposite)
+	watermark := `{"ChunkJSON":"{\"Key\":[\"a\",\"b\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\":[\"100\",\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\":[\"200\",\"1\"],\"Inclusive\":false}}","RowsCopied":200}`
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				comp.Progress()
+				comp.RowsCopied()
+			}
+		}
+	})
+	for range 100 {
+		require.NoError(t, comp.OpenAtWatermark(watermark))
+	}
+	close(done)
+	wg.Wait()
+
+	require.Equal(t, uint64(200), comp.RowsCopied())
 }

@@ -3,6 +3,7 @@ package table
 import (
 	"database/sql"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -1123,4 +1124,35 @@ func TestOptimisticPrefetchDensityUsesSourceRows(t *testing.T) {
 		affectedOnly.record(MaxDynamicRowSize, 0)
 	}
 	require.True(t, affectedOnly.sparse())
+}
+
+// A continuous checksum restarts its chunker with OpenAtWatermark while the
+// status dumper polls Progress from another goroutine, so the progress
+// counters must be safe to read concurrently with a resume. Run with -race.
+func TestOptimisticOpenAtWatermarkConcurrentProgress(t *testing.T) {
+	_, chunker := newOptimisticChunker4Test(t)
+	watermark := `{"Key":["id"],"ChunkSize":1000,"LowerBound":{"Value":["3001"],"Inclusive":true},"UpperBound":{"Value":["4001"],"Inclusive":false},"RowsCopied":137}`
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				chunker.Progress()
+				chunker.RowsCopied()
+			}
+		}
+	})
+	for range 100 {
+		require.NoError(t, chunker.OpenAtWatermark(watermark))
+	}
+	close(done)
+	wg.Wait()
+
+	rowsCopied, _, _ := chunker.Progress()
+	require.Equal(t, uint64(3000), rowsCopied)
+	require.Equal(t, uint64(137), chunker.RowsCopied())
 }
