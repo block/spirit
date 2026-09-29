@@ -470,6 +470,47 @@ func TestBacktickColumnNameMigration(t *testing.T) {
 	require.Equal(t, seeded, count)
 }
 
+// TestBitPrimaryKeyRefused refuses a table with a BIT in its primary key, and
+// changing a primary key column to a BIT, when the tables are set up. The
+// chunkers cannot read BIT key values back from the table, so such a migration
+// used to set up its tables and then fail on the first chunk of the copy.
+func TestBitPrimaryKeyRefused(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "bit_pk", `CREATE TABLE bit_pk (
+		b BIT(16) NOT NULL PRIMARY KEY,
+		v INT NOT NULL
+	)`)
+	// Enough rows that the copy needs more than one chunk, so it has to read
+	// a chunk boundary back from the table.
+	testutils.RunSQL(t, `INSERT INTO bit_pk (b, v)
+		WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3000)
+		SELECT /*+ SET_VAR(cte_max_recursion_depth = 10000) */ n, n FROM seq`)
+	for _, alter := range []string{"ENGINE=InnoDB", "ADD COLUMN c INT"} {
+		m := NewTestRunner(t, "bit_pk", alter)
+		err := m.Run(t.Context())
+		require.NoError(t, m.Close())
+		require.ErrorContains(t, err, `primary key column "b" of table "bit_pk" is a BIT, which is not supported`)
+		var n int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_bit_pk_new'").Scan(&n))
+		require.Zero(t, n, "the table must be refused before the new table is created")
+	}
+
+	tt = testutils.NewTestTable(t, "int_to_bit_pk", `CREATE TABLE int_to_bit_pk (
+		id INT UNSIGNED NOT NULL PRIMARY KEY,
+		v INT NOT NULL
+	)`)
+	testutils.RunSQL(t, "INSERT INTO int_to_bit_pk VALUES (1, 1), (2, 2)")
+	m := NewTestRunner(t, "int_to_bit_pk", "MODIFY id BIT(32) NOT NULL")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, "is a BIT, which is not supported")
+	var tp string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'int_to_bit_pk' AND COLUMN_NAME = 'id'").Scan(&tp))
+	require.Equal(t, "int", tp, "the refused ALTER must not change the table")
+}
+
 // TestReservedWordPKMigration is a regression test for issue #828.
 // Migrating a table whose primary key includes columns named with MySQL
 // reserved words (like `key`/`value`) used to fail with a SQL syntax error
