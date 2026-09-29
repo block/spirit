@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -337,6 +338,26 @@ func TestCutOverHonorsExplicitAutoIncrement(t *testing.T) {
 
 	require.Contains(t, showCreateTable(t, db, "autoinc_explicit"), "AUTO_INCREMENT=500")
 	require.Equal(t, int64(500), insertedID(t, db, "autoinc_explicit"))
+}
+
+// TestRaiseAutoIncrementOnlyRaises: a new table whose counter is already
+// ahead of the original's keeps it. InnoDB honors a lower AUTO_INCREMENT = n
+// down to MAX(id)+1, so an unconditional ALTER would move it backwards.
+func TestRaiseAutoIncrementOnlyRaises(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE autoinc_src (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=9")
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE autoinc_dst (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=50")
+
+	src := table.NewTableInfo(db, dbName, "autoinc_src")
+	dst := table.NewTableInfo(db, dbName, "autoinc_dst")
+	_, raised, err := raiseAutoIncrement(t.Context(), db, src, dst, func(ctx context.Context, stmt string) error {
+		_, err := db.ExecContext(ctx, stmt)
+		return err
+	})
+	require.NoError(t, err)
+	require.False(t, raised)
+	require.Contains(t, showCreateTable(t, db, "autoinc_dst"), "AUTO_INCREMENT=50")
 }
 
 // TestCutOverAutoIncrementAttributeChanges covers ALTERs that add or remove the

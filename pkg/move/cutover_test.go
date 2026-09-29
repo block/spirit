@@ -490,6 +490,25 @@ func nextAutoIncrement(t *testing.T, schema, tableName string) uint64 {
 	return next
 }
 
+// TestCarryAutoIncrementOnlyRaises: a destination whose counter is already
+// ahead of every source keeps it. InnoDB would honor a lower
+// AUTO_INCREMENT = n down to MAX(id)+1, so an unconditional ALTER would move
+// it backwards.
+func TestCarryAutoIncrementOnlyRaises(t *testing.T) {
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	dstName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE jobs (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=9`)
+	testutils.RunSQLInDatabase(t, dstName, `CREATE TABLE jobs (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=50`)
+
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, carryAutoIncrement(t.Context(), slog.Default(),
+		[]autoIncrementTable{{db: db, schema: srcName, name: "jobs"}},
+		[]autoIncrementTable{{db: db, schema: dstName, name: "jobs"}}))
+	require.Equal(t, uint64(50), nextAutoIncrement(t, dstName, "jobs"))
+}
+
 // TestMoveCarriesAutoIncrement regresses the AUTO_INCREMENT counter going
 // backwards when traffic moves to the target. Rows inserted and then deleted
 // at the top of the id range during the move never reach the target (their
