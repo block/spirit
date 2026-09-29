@@ -666,3 +666,66 @@ func TestCopyChunkApplyError(t *testing.T) {
 	require.ErrorContains(t, err, "chunkerr2") // the injected failure, not something incidental
 	require.Equal(t, feedbacksBefore, recorder.feedbacks.Load(), "a failed chunk must not send feedback")
 }
+
+// byteRecorder sums the ActualBytes of every chunk fed back to the chunker.
+type byteRecorder struct {
+	table.Chunker
+	bytes atomic.Uint64
+}
+
+func (b *byteRecorder) Feedback(chunk *table.Chunk, d time.Duration, actualRows uint64) {
+	b.bytes.Add(chunk.ActualBytes)
+	b.Chunker.Feedback(chunk, d, actualRows)
+}
+
+// TestCopierReportsRenderedChunkBytes pins that both copy paths (CopyChunk and
+// the Run read worker) report each chunk's rows to the chunker as
+// utils.EstimateRenderedChunkSize, which the byte-budget sizer servos on.
+// The driver scans INT as int64 (a flat 10) and VARCHAR as []byte, so five
+// rows of (INT, 'abc') estimate at 2 + (10+2) + (5+2) = 21 bytes each: 105 in
+// total.
+func TestCopierReportsRenderedChunkBytes(t *testing.T) {
+	const want = 5 * 21
+	require.Equal(t, uint64(21), utils.EstimateRenderedChunkSize([][]any{{int64(1), []byte("abc")}}))
+
+	setup := func(t *testing.T) (*byteRecorder, Copier, *CopierConfig) {
+		testutils.RunSQL(t, "DROP TABLE IF EXISTS rbytes1, rbytes2")
+		testutils.RunSQL(t, "CREATE TABLE rbytes1 (a INT NOT NULL AUTO_INCREMENT, b VARCHAR(10), PRIMARY KEY (a))")
+		testutils.RunSQL(t, "CREATE TABLE rbytes2 (a INT NOT NULL AUTO_INCREMENT, b VARCHAR(10), PRIMARY KEY (a))")
+		testutils.RunSQL(t, "INSERT INTO rbytes1 (b) VALUES ('abc'),('abc'),('abc'),('abc'),('abc')")
+		db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+		require.NoError(t, err)
+		t.Cleanup(func() { utils.CloseAndLog(db) })
+		t1 := table.NewTableInfo(db, "test", "rbytes1")
+		require.NoError(t, t1.SetInfo(t.Context()))
+		t2 := table.NewTableInfo(db, "test", "rbytes2")
+		require.NoError(t, t2.SetInfo(t.Context()))
+		cfg := bufferedConfig(t, db)
+		chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkBytes: table.DefaultTargetChunkBytes, Logger: cfg.Logger})
+		require.NoError(t, err)
+		require.NoError(t, chunker.Open())
+		rec := &byteRecorder{Chunker: chunker}
+		c, err := NewCopier(rec, cfg)
+		require.NoError(t, err)
+		return rec, c, cfg
+	}
+
+	t.Run("CopyChunk", func(t *testing.T) {
+		rec, c, cfg := setup(t)
+		defer func() { require.NoError(t, cfg.Applier.Stop()) }()
+		stepper, ok := c.(ChunkCopier)
+		require.True(t, ok)
+		for range 2 { // the empty `a < 1` chunk, then the five rows
+			chunk, err := rec.Next()
+			require.NoError(t, err)
+			require.NoError(t, stepper.CopyChunk(t.Context(), chunk))
+		}
+		require.Equal(t, uint64(want), rec.bytes.Load())
+	})
+
+	t.Run("Run", func(t *testing.T) {
+		rec, c, _ := setup(t)
+		require.NoError(t, c.Run(t.Context()))
+		require.Equal(t, uint64(want), rec.bytes.Load())
+	})
+}

@@ -37,9 +37,9 @@ func EstimateRenderedChunkSize(rows [][]any) uint64 {
 // per row on top of the rendering writeChunklet does anyway, so it is pure
 // overhead on the hottest client-side path. The previous implementation
 // measured len(fmt.Sprintf("%v", value)), which was neither cheap nor
-// accurate: a text-protocol Scan into *any hands back []byte for essentially
-// every column, and %v renders a []byte as "[49 50 51 …]" — roughly four
-// characters per byte. That cost ~2.2us and ~12 allocations per row and
+// accurate: a text-protocol Scan into *any hands back []byte for string,
+// temporal and DECIMAL columns, and %v renders a []byte as "[49 50 51 …]" —
+// roughly four characters per byte. That cost ~2.2us and ~12 allocations per row and
 // over-estimated by ~2.7x, so chunklets were being cut well short of the
 // budget they were supposed to fill. A type switch is ~290x cheaper, allocates
 // nothing, and lands much closer to what datum.String() actually emits.
@@ -68,10 +68,10 @@ func estimateRenderedValueSize(value any) int {
 	case nil:
 		return 4 // NULL
 	case []byte:
-		// +2 for the surrounding quotes. Slightly over for the numeric column
-		// types (which the text protocol also delivers as []byte but which
-		// render unquoted); telling them apart would need the column type,
-		// which this deliberately doesn't take.
+		// +2 for the surrounding quotes. Slightly over for DECIMAL (which the
+		// text protocol delivers as []byte but which renders unquoted);
+		// telling them apart would need the column type, which this
+		// deliberately doesn't take.
 		return len(v) + 2
 	case string:
 		return len(v) + 2 // +2 for the surrounding quotes
@@ -82,19 +82,23 @@ func estimateRenderedValueSize(value any) int {
 		// ("-1.7976931348623157e+308") but usually lands around 6-9 ("3.14159",
 		// "-2.71828"). Same bias as the two cases above — under-estimating is
 		// covered by the headroom, over-estimating shrinks every chunklet on a
-		// table of DOUBLE columns. DECIMAL arrives as []byte on the copy path
-		// and is measured exactly; this branch is mostly the binlog path.
+		// table of DOUBLE columns. FLOAT and DOUBLE arrive as float64 on both
+		// the copy path and the binlog path; DECIMAL arrives as []byte and is
+		// measured by the branch above.
 		return 8
 	case bool:
 		return 1
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		// Typical, not worst case, on the same bias as above: 10 digits covers
 		// an ordinary ID exactly, and a full-width int64 (19-20 characters)
-		// under-estimates by about 2x. Counting the digits instead is exact and
-		// costs ~22ns per row, but it buys nothing where it matters — the copy
-		// path receives integers as []byte from the text protocol and measures
-		// them exactly in the branch above, so this case only fires on the
-		// binlog path, where batches are a handful of rows.
+		// under-estimates by about 2x. Integers arrive as native Go integers on
+		// both the copy path (the driver parses them on the text protocol) and
+		// the binlog path, so this branch runs on every integer column of
+		// every copied row. Counting the digits would be exact but costs ~22ns
+		// per row there, and it buys nothing either consumer needs: the
+		// statement cut is covered by the headroom above, and the chunk sizer
+		// servos on the relative size of chunks, which a flat width per
+		// integer column keeps consistent.
 		return 10
 	default:
 		// Not produced by either the SQL driver or the binlog reader today.

@@ -248,15 +248,16 @@ func TestSplitRowsIntoChunklets(t *testing.T) {
 //
 // The previous implementation measured len(fmt.Sprintf("%v", v)), which drifted
 // badly once you account for how values actually arrive: a text-protocol Scan
-// into *any returns []byte for every column, and %v renders a []byte as
-// "[49 50 51 …]" — about four characters per byte. That over-estimated by
+// into *any returns []byte for string, temporal and DECIMAL columns, and %v
+// renders a []byte as "[49 50 51 …]" — about four characters per byte. That over-estimated by
 // ~2.7x, so chunklets were cut well short of the budget they were sized for,
 // and nothing failed because an over-estimate is safe. This pins the direction
 // as well as the magnitude.
 func TestEstimateRenderedRowSizeTracksRenderedSize(t *testing.T) {
-	// Exactly what the driver hands back for a text-protocol row.
+	// Exactly what the driver hands back for a text-protocol row: it parses
+	// integer columns to int64 and leaves the rest as []byte.
 	values := []any{
-		[]byte("298801139"), []byte("4211"), []byte("settled"),
+		int64(298801139), int64(4211), []byte("settled"),
 		[]byte("2026-07-30 15:12:27"), []byte("1234.560000"),
 		[]byte("405b6747-605e-3aa4-909d-69e049a6ed19"), nil,
 	}
