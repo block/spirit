@@ -127,9 +127,9 @@ func TestBooleanKeywordDefaultLeavesOtherTypesAlone(t *testing.T) {
 			want:   "TRUE",
 		},
 		{
-			name:   "binary pads to the column width with NULs",
+			name:   "binary pads to the column width with NULs, which binaryDefaultBytesNormalizer folds",
 			column: "`a` binary(4) NOT NULL DEFAULT TRUE",
-			want:   "TRUE",
+			want:   "1\x00\x00\x00",
 		},
 		{
 			name:   "enum resolves the keyword to a member index before 9.7 and to a member value from 9.7",
