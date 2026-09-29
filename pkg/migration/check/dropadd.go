@@ -24,6 +24,12 @@ func init() {
 // The actual implementation is a bit simpler:
 //   - We only allow a column name to be mentioned once across all
 //     DROP and ADD parts of the alter statement.
+//
+// Names are compared case-insensitively, as MySQL compares them, because
+// ColumnName.String() returns the lowercased name: DROP COLUMN c, ADD COLUMN
+// C is refused too. The copy maps source to target columns by name without
+// regard to case, so it would otherwise copy the old c into the new C, where
+// MySQL's ALTER fills the new column with its default.
 func dropAddCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	alterStmt, ok := (*r.Statement.StmtNode).(*ast.AlterTableStmt)
 	if !ok {

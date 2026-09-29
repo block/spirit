@@ -168,3 +168,26 @@ func TestGeneratedColumnVirtualToRegular(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM gencol_v2r WHERE NOT (v <=> 9)").Scan(&bad))
 	require.Zero(t, bad)
 }
+
+// TestGeneratedColumnDropAddCaseOnly drops a generated column and adds a
+// regular column whose name differs only in case. MySQL treats that as a new
+// column, which its ALTER fills with NULL. Because the column mapping includes
+// generated source columns, a copy would map the old s onto the new S and copy
+// the generated values, so the statement must be refused (the dropadd check
+// compares names case-insensitively). ENGINE=InnoDB keeps
+// MySQL's native DDL from applying it, so the statement reaches the checks.
+func TestGeneratedColumnDropAddCaseOnly(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "gencol_dropadd", fmt.Sprintf(genColTable, "gencol_dropadd"))
+	tt.SeedRows(t, "INSERT INTO gencol_dropadd (a, r) SELECT 3, 1", 100)
+
+	m := NewTestRunner(t, "gencol_dropadd", "DROP COLUMN s, ADD COLUMN S INT, ENGINE=InnoDB")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, "column s is mentioned 2 times in the same statement")
+
+	var genExpr string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gencol_dropadd' AND COLUMN_NAME = 's'").Scan(&genExpr))
+	require.NotEmpty(t, genExpr, "the refused ALTER must not change the table")
+}
