@@ -443,6 +443,33 @@ func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
 	require.True(t, checkpointTableExists(t, m), "the checkpoint is still valid and must be preserved")
 }
 
+// TestBacktickColumnNameMigration migrates a table with backticks in column
+// names, including a primary key column, through the copy and the checksum.
+// The checksum used to quote column names by hand, which made its query a
+// syntax error.
+func TestBacktickColumnNameMigration(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "backtick_col_migrate", "CREATE TABLE backtick_col_migrate ("+
+		"`i``d` INT NOT NULL AUTO_INCREMENT PRIMARY KEY, "+
+		"`na``me` VARCHAR(64) NOT NULL, "+
+		"`val``ue` INT NULL"+
+		")")
+	tt.SeedRows(t, "INSERT INTO backtick_col_migrate (`na``me`, `val``ue`) SELECT 'a', 1", 4096)
+	var seeded int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM backtick_col_migrate").Scan(&seeded))
+
+	m := NewTestRunner(t, "backtick_col_migrate", "ENGINE=InnoDB")
+	require.NoError(t, m.Run(t.Context()))
+	require.False(t, m.usedInstantDDL)
+	require.False(t, m.usedInplaceDDL)
+	require.NoError(t, m.Close())
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM backtick_col_migrate WHERE `na``me` = 'a' AND `val``ue` = 1").Scan(&count))
+	require.Equal(t, seeded, count)
+}
+
 // TestReservedWordPKMigration is a regression test for issue #828.
 // Migrating a table whose primary key includes columns named with MySQL
 // reserved words (like `key`/`value`) used to fail with a SQL syntax error
