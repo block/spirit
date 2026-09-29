@@ -1400,24 +1400,6 @@ func TestBufferedMapSoftLimitOversizedRowAdmitted(t *testing.T) {
 	require.Equal(t, int64(1), sub.timesParked.Load())
 }
 
-func TestEstimateRowSizeCharacterizes(t *testing.T) {
-	// Empty
-	require.Equal(t, int64(0), estimateRowSize(nil))
-	require.Equal(t, int64(0), estimateRowSize([]any{}))
-
-	// Variable-width values dominate the estimate.
-	wideRow := []any{int32(1), make([]byte, 4096), "short"}
-	narrowRow := []any{int32(1), int32(2), int32(3)}
-	require.Greater(t, estimateRowSize(wideRow), estimateRowSize(narrowRow)+4000,
-		"byte-slice contents must be reflected in the estimate")
-
-	// String len matters: a 1000-byte longer string must add ~1000 to the estimate.
-	short := estimateRowSize([]any{"hi"})
-	long := estimateRowSize([]any{"hi" + string(make([]byte, 1000))})
-	require.GreaterOrEqual(t, long-short, int64(1000),
-		"string len must be reflected in the estimate")
-}
-
 // TestBufferedMapRealFlushWakesParked exercises the full HasChanged →
 // park → real Flush → broadcast → resume cycle against a live DB-backed
 // subscription. The bare-helper tests above broadcast by hand; this one
@@ -1839,13 +1821,12 @@ func TestBufferedMapFlushByteCapSplitsUpserts(t *testing.T) {
 	fake := &applier.MockApplier{}
 	sub := newByteCapBufferedMap(fake, false)
 
-	// Five rows sized so each estimates to ~40% of the budget rendered
-	// (strings are counted at 2x for worst-case escaping / hex expansion).
+	// Five rows sized so each estimates to ~40% of the budget rendered.
 	// Two fit under the budget, a third does not, so the flush must emit
 	// ceil(5/2) = 3 statements instead of one statement of ~2x the budget.
 	// Derived from the constant so retuning it cannot silently turn this into
 	// a single-statement case that asserts nothing.
-	payload := strings.Repeat("x", applier.MaxStatementSizeBytes/5)
+	payload := strings.Repeat("x", 2*applier.MaxStatementSizeBytes/5)
 	for i := range 5 {
 		sub.HasChanged([]any{int32(i)}, []any{int32(i), payload}, false)
 	}
@@ -1861,7 +1842,7 @@ func TestBufferedMapFlushByteCapSplitsUpserts(t *testing.T) {
 	for _, call := range calls {
 		var callBytes int64
 		for _, row := range call {
-			callBytes += estimateRenderedBytes(row.RowImage)
+			callBytes += int64(utils.EstimateRenderedRowSize(row.RowImage))
 		}
 		require.LessOrEqual(t, callBytes, int64(applier.MaxStatementSizeBytes),
 			"each multi-row statement must stay under the byte budget")
@@ -1909,7 +1890,7 @@ func TestBufferedMapFlushByteCapOversizedRowAlone(t *testing.T) {
 
 	small := strings.Repeat("s", 1024)
 	// Estimates to ~2x the budget rendered, so it is over by itself.
-	big := strings.Repeat("b", applier.MaxStatementSizeBytes)
+	big := strings.Repeat("b", 2*applier.MaxStatementSizeBytes)
 	sub.HasChanged([]any{"k1"}, []any{"k1", small}, false)
 	sub.HasChanged([]any{"k2"}, []any{"k2", big}, false)
 	sub.HasChanged([]any{"k3"}, []any{"k3", small}, false)
@@ -1940,7 +1921,7 @@ func TestBufferedMapFlushByteCapSplitsDeletes(t *testing.T) {
 
 	// 100 deletes whose string PKs render to ~2x the total budget in
 	// aggregate, so the flush must split regardless of what the budget is.
-	keyLen := applier.MaxStatementSizeBytes / 100
+	keyLen := 2 * applier.MaxStatementSizeBytes / 100
 	for i := range 100 {
 		key := fmt.Sprintf("%03d-", i) + strings.Repeat("k", keyLen)
 		sub.HasChanged([]any{key}, nil, true)
@@ -1957,7 +1938,7 @@ func TestBufferedMapFlushByteCapSplitsDeletes(t *testing.T) {
 	for _, call := range calls {
 		var callBytes int64
 		for _, key := range call {
-			callBytes += estimateRenderedBytes(key)
+			callBytes += int64(utils.EstimateRenderedRowSize(key))
 		}
 		require.LessOrEqual(t, callBytes, int64(applier.MaxStatementSizeBytes),
 			"each DELETE statement's key list must stay under the byte budget")
@@ -2028,7 +2009,7 @@ func TestBufferedMapWideRowsFlushSplitsStatements(t *testing.T) {
 	for _, call := range calls {
 		var callBytes int64
 		for _, row := range call {
-			callBytes += estimateRenderedBytes(row.RowImage)
+			callBytes += int64(utils.EstimateRenderedRowSize(row.RowImage))
 		}
 		if len(call) > 1 {
 			require.LessOrEqual(t, callBytes, int64(applier.MaxStatementSizeBytes),
