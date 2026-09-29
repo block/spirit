@@ -150,3 +150,30 @@ func TestBinlogCharsetLiteralRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// TestTableInfoRefusesUnsafeCharsetName: a column's charset is spliced into
+// SQL as an introducer and as a CONVERT target, and its collation as a COLLATE
+// clause, so a name that is not a plausible charset or collation name is
+// refused when the table is built.
+func TestTableInfoRefusesUnsafeCharsetName(t *testing.T) {
+	for _, cs := range []string{"latin1 0x00) --", "latin1'", "lat-in1"} {
+		_, err := NewTableInfoFromMeta("test", "t", []ColumnMeta{
+			{Name: "id", MySQLType: "int"},
+			{Name: "s", MySQLType: "varchar(10)", Charset: cs, Collation: "latin1_swedish_ci"},
+		}, []string{"id"})
+		require.ErrorContains(t, err, "unexpected charset name", cs)
+	}
+	for _, coll := range []string{"latin1_swedish_ci --", "latin1_bin'", "latin1-bin"} {
+		_, err := NewTableInfoFromMeta("test", "t", []ColumnMeta{
+			{Name: "id", MySQLType: "int"},
+			{Name: "s", MySQLType: "varchar(10)", Charset: "latin1", Collation: coll},
+		}, []string{"id"})
+		require.ErrorContains(t, err, "unexpected collation name", coll)
+	}
+	ti, err := NewTableInfoFromMeta("test", "t", []ColumnMeta{
+		{Name: "id", MySQLType: "int"},
+		{Name: "s", MySQLType: "varchar(10)", Charset: "LATIN1", Collation: "latin1_swedish_ci"},
+	}, []string{"id"})
+	require.NoError(t, err)
+	require.Equal(t, "latin1", ti.BinlogCharset("s"))
+}

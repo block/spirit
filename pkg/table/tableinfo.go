@@ -331,6 +331,11 @@ func (t *TableInfo) addColumn(col ColumnMeta) error {
 		// refused rather than emitted.
 		return fmt.Errorf("column %s.%s.%s has unexpected charset name %q", t.SchemaName, t.TableName, name, charset)
 	}
+	if collation != "" && !isCollationName(collation) {
+		// The collation is spliced into SQL as a COLLATE clause (see the
+		// lockless checksum's image values), so it is checked the same way.
+		return fmt.Errorf("column %s.%s.%s has unexpected collation name %q", t.SchemaName, t.TableName, name, collation)
+	}
 	switch {
 	case col.CollationUnknown && charset == "":
 		t.unknownCharsets[name] = true
@@ -398,6 +403,18 @@ func isCharsetName(charset string) bool {
 		}
 	}
 	return charset != ""
+}
+
+// isCollationName reports whether collation is lower-case letters, digits and
+// underscores, as every MySQL collation name is once canonicalCollationName
+// has lower-cased it.
+func isCollationName(collation string) bool {
+	for _, r := range collation {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return false
+		}
+	}
+	return collation != ""
 }
 
 // DescIndex describes the columns in an index.

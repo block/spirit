@@ -426,7 +426,10 @@ func imageValueExpr(tp, castTp string, v any) (string, any, error) {
 //     charset.
 //
 // Either way the merge is the column's charset with the column's charset, as
-// in the real row.
+// in the real row. The value also takes the column's collation: CONVERT gives
+// it the charset's default collation, and in the UNION that meets the real
+// column's, two different IMPLICIT collations of one charset are an illegal
+// mix (1271) unless one of them is _bin.
 func charsetImageValueExpr(info *table.TableInfo, column string, v any) (string, any, bool) {
 	var b []byte
 	switch s := v.(type) {
@@ -437,15 +440,19 @@ func charsetImageValueExpr(info *table.TableInfo, column string, v any) (string,
 	default:
 		return "", nil, false
 	}
+	collate := ""
+	if collation, ok := info.GetColumnCollation(column); ok && collation != "" {
+		collate = " COLLATE " + collation
+	}
 	if charset := info.BinlogCharset(column); charset != "" {
-		return "CONVERT(UNHEX(?) USING " + charset + ")", hex.EncodeToString(b), true
+		return "CONVERT(UNHEX(?) USING " + charset + ")" + collate, hex.EncodeToString(b), true
 	}
 	tp, _ := info.GetColumnMySQLType(column)
 	charset, _ := info.GetColumnCharset(column)
 	if !utils.IsEnumOrSetType(tp) || charset == "" || charset == "utf8mb4" || charset == "utf8mb3" {
 		return "", nil, false
 	}
-	return "CONVERT(? USING " + charset + ")", string(b), true
+	return "CONVERT(? USING " + charset + ")" + collate, string(b), true
 }
 
 // baseColumnType strips a declared type's width, so "bit(8)" and

@@ -315,6 +315,39 @@ func TestSettleRowKeyConversionBudgetDefers(t *testing.T) {
 	require.Equal(t, settleUnavailable, verdict)
 }
 
+// TestExpectedImageCRCNonDefaultCollation: a string column whose collation is
+// not its charset's default (and not _bin) must still evaluate. The image
+// value merges with the column in a UNION, where two IMPLICIT collations of
+// one charset are an illegal mix.
+func TestExpectedImageCRCNonDefaultCollation(t *testing.T) {
+	for _, tc := range []struct {
+		name, ddl, insert string
+		image             []any
+	}{
+		{"latin1_general_ci", "id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_general_ci",
+			"INSERT INTO src VALUES (1, 'abc')", []any{int32(1), "abc"}},
+		{"latin1_german1_ci", "id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_german1_ci",
+			"INSERT INTO src VALUES (1, X'E9')", []any{int32(1), "\xe9"}},
+		{"utf16_unicode_ci", "id INT PRIMARY KEY, s VARCHAR(20) CHARACTER SET utf16 COLLATE utf16_unicode_ci",
+			"INSERT INTO src VALUES (1, X'004D')", []any{int32(1), "\x00M"}},
+		{"enum_latin1_general_ci", "id INT PRIMARY KEY, e ENUM('x','y') CHARACTER SET latin1 COLLATE latin1_general_ci",
+			"INSERT INTO src VALUES (1, 'y')", []any{int32(1), "y"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, chunk := snapshotTestTables(t, tc.ddl, []string{"id"})
+			snapshotExec(t, db, tc.insert)
+			sourceExprs, _, err := chunk.ColumnMapping.ChecksumExprs()
+			require.NoError(t, err)
+			var want uint64
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT CRC32(CONCAT("+sourceExprs+")) FROM src WHERE id=1").Scan(&want))
+			got, err := expectedImageCRC(t.Context(), db, chunk, tc.image)
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+		})
+	}
+}
+
 // TestExpectedImageCRCMatchesRealRow is the load-bearing claim of the whole
 // design: evaluating the checksum expressions over a row *image* gives the same
 // answer as evaluating them over the row. If it did not, every settle verdict
