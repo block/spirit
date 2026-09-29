@@ -273,3 +273,44 @@ func TestFloatPrimaryKeyRefused(t *testing.T) {
 		"SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'double_pk' AND COLUMN_NAME = 'd'").Scan(&tp))
 	require.Equal(t, "double", tp, "the refused ALTER must not change the table")
 }
+
+// TestNarrowToFloat changes DOUBLE, VARCHAR, DECIMAL and BIGINT columns to
+// FLOAT. MySQL's ALTER rounds each value to the nearest FLOAT, so the checksum
+// must compare the source at FLOAT precision rather than report the rounding
+// as a difference. The values include ones that need rounding, a tie that
+// rounds to even (16777217), a subnormal and a value next to a power of two.
+func TestNarrowToFloat(t *testing.T) {
+	t.Parallel()
+	values := []string{"0.1", "1.5", "0.123456789", "16777217", "-8388608.5", "1.1754942106924411e-38", "0.9999999701976776", "0"}
+	for _, tc := range []struct{ name, srcType, quote string }{
+		{"double", "DOUBLE", ""},
+		{"varchar", "VARCHAR(40)", "'"},
+		{"decimal", "DECIMAL(65,30)", ""},
+		{"bigint", "BIGINT", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tbl := "narrow_to_float_" + tc.name
+			tt := testutils.NewTestTable(t, tbl, fmt.Sprintf("CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, f %s NULL)", tbl, tc.srcType))
+			for _, v := range values {
+				if (tc.name == "bigint" && strings.ContainsAny(v, ".e")) || (tc.name == "decimal" && strings.Contains(v, "e")) {
+					continue // does not fit the source type
+				}
+				testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (f) VALUES (%s%s%s)", tbl, tc.quote, v, tc.quote))
+			}
+			testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (f) VALUES (NULL)", tbl))
+
+			// The expected values are what MySQL stores in a FLOAT column.
+			expTbl := tbl + "_expected"
+			testutils.NewTestTable(t, expTbl, "CREATE TABLE "+expTbl+" (id INT NOT NULL PRIMARY KEY, f FLOAT NULL)")
+			testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s SELECT id, f FROM %s", expTbl, tbl))
+			want := exactValues(t, tt.DB, expTbl, "f + 0E0")
+
+			m := NewTestRunner(t, tbl, "MODIFY f FLOAT NULL", WithThreads(1))
+			err := m.Run(t.Context())
+			require.NoError(t, m.Close())
+			require.NoError(t, err)
+			require.Equal(t, want, exactValues(t, tt.DB, tbl, "f + 0E0"))
+		})
+	}
+}

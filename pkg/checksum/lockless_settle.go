@@ -403,7 +403,7 @@ func baseColumnType(tp string) string {
 // isNumericCast reports whether a checksum cast type (see
 // table.ColumnMapping.ChecksumCastTypes) renders a number rather than bytes.
 func isNumericCast(castTp string) bool {
-	return castTp == "signed" || castTp == "unsigned" || castTp == "double" || strings.HasPrefix(castTp, "decimal")
+	return castTp == "signed" || castTp == "unsigned" || castTp == "double" || castTp == "float" || strings.HasPrefix(castTp, "decimal")
 }
 
 // bitWidth reads N out of "bit(N)". A BIT column with no width is BIT(1).

@@ -107,6 +107,9 @@ func TestCastExpr(t *testing.T) {
 	// DOUBLE from MySQL 8.0.17.
 	require.Equal(t, "(`f` + 0E0)", castExpr("f", "double", castSource))
 	require.Equal(t, "(`f` + 0E0)", castExpr("f", "double", castTarget))
+	// A narrowing to FLOAT rounds the source to FLOAT precision.
+	require.Equal(t, roundToFloatExpr("(`d` + 0E0)"), castExpr("d", "float", castSource))
+	require.Equal(t, "(`d` + 0E0)", castExpr("d", "float", castTarget))
 }
 
 func TestChecksumCastTp(t *testing.T) {
@@ -154,6 +157,16 @@ func TestChecksumCastTp(t *testing.T) {
 		{"enum('a','b')", "bit(8)", "unsigned"},
 		{"set('a','b')", "bit(8)", "unsigned"},
 		{"time", "bit(64)", "unsigned"},
+		// A FLOAT target with any other source is a narrowing, compared at
+		// FLOAT precision; FLOAT with FLOAT, or into DOUBLE, is exact.
+		{"double", "float", "float"},
+		{"varchar(20)", "float", "float"},
+		{"decimal(10,4)", "float unsigned", "float"},
+		{"bigint", "float(7,4)", "float"},
+		{"float", "float", "double"},
+		{"float unsigned", "float", "double"},
+		{"float", "double", "double"},
+		{"double", "double", "double"},
 		// The exception is only for a BIT target.
 		{"varchar(8)", "int", "signed"},
 	} {
