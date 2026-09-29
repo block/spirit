@@ -22,6 +22,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 )
 
@@ -186,8 +187,8 @@ func (t *Table) Write(ctx context.Context, rec Record) error {
 // error, so resume fails safely rather than silently misreading.
 func (t *Table) ReadLatest(ctx context.Context) (Record, error) {
 	query := fmt.Sprintf(
-		"SELECT copier_watermark, checksum_watermark, binlog_position, statement, original_table_name, move_phase, cutover_at, created_at FROM `%s` ORDER BY id DESC LIMIT 1",
-		t.name)
+		"SELECT copier_watermark, checksum_watermark, binlog_position, statement, original_table_name, move_phase, cutover_at, created_at FROM %s ORDER BY id DESC LIMIT 1",
+		sqlescape.EscapeIdentifier(t.name))
 
 	var rec Record
 	var createdAt string
