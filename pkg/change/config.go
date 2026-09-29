@@ -34,6 +34,13 @@ const (
 	// runs must discard their checkpoint; a fresh run started after the
 	// file rotates gets usable coordinates again.
 	FatalReasonLogPosWrapped
+	// FatalReasonFlushError means the periodic flush failed to apply buffered
+	// changes to the target, after the applier's own retries. The failed
+	// changes stay buffered and the resume coordinate stops advancing, so
+	// carrying on only spends binlog retention until the checkpoint can no
+	// longer be resumed. The watched tables are not known to have changed,
+	// so persisted resume state remains valid.
+	FatalReasonFlushError
 )
 
 // String implements fmt.Stringer for logging.
@@ -47,6 +54,8 @@ func (f FatalReason) String() string {
 		return "unsupported-xa"
 	case FatalReasonLogPosWrapped:
 		return "logpos-wrapped"
+	case FatalReasonFlushError:
+		return "flush-error"
 	default:
 		return fmt.Sprintf("unknown-fatal-reason(%d)", int(f))
 	}
@@ -63,7 +72,8 @@ type ClientConfig struct {
 	// minimal RBR detection or exhausted streamer recreation attempts
 	// (FatalReasonStreamError), when XA is detected
 	// (FatalReasonUnsupportedXA), or when a binlog file's 4-byte LogPos wraps
-	// past 4GiB (FatalReasonLogPosWrapped).
+	// past 4GiB (FatalReasonLogPosWrapped), or when the periodic flush fails
+	// to apply changes (FatalReasonFlushError).
 	// The caller is expected to handle cancellation
 	// and cleanup, using reason to decide whether persisted resume state
 	// (e.g. a checkpoint) must be invalidated (schema change) or is still

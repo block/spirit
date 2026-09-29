@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
@@ -98,4 +99,70 @@ func TestBinlogFlushUnderTableLockErrors(t *testing.T) {
 func TestGTIDFlushUnderTableLockErrors(t *testing.T) {
 	skipUnlessGTIDEnabled(t)
 	runFlushUnderTableLockErrorBranches(t, true, "gtidflushlockerrt1", "gtidflushlockerrt2")
+}
+
+// runPeriodicFlushErrorIsFatal checks that a periodic flush which cannot apply
+// the buffered changes reports FatalReasonFlushError to the caller. The failed
+// changes stay buffered and the flushed position stops advancing, so a caller
+// that is never told keeps running while its resume position falls out of the
+// binlog retention window. The failure here is a value the target column
+// cannot hold, which no retry can fix.
+func runPeriodicFlushErrorIsFatal(t *testing.T, useGTID bool, srcName, dstName string) {
+	t.Helper()
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	testutils.RunSQL(t, fmt.Sprintf("DROP TABLE IF EXISTS %s, %s", srcName, dstName))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, PRIMARY KEY (a))", srcName))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b TINYINT, PRIMARY KEY (a))", dstName))
+	t1 := table.NewTableInfo(db, cfg.DBName, srcName)
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, cfg.DBName, dstName)
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	reasons := make(chan FatalReason, 8)
+	clientCfg := NewClientDefaultConfig()
+	clientCfg.CancelFunc = func(reason FatalReason) bool {
+		reasons <- reason
+		return true
+	}
+	var client Source
+	if useGTID {
+		client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
+	} else {
+		client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
+	}
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.Start(t.Context()))
+	t.Cleanup(client.Close)
+	require.NoError(t, client.SetWatermarkOptimization(t.Context(), false))
+
+	// 1000 does not fit in the target's TINYINT.
+	testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (a, b) VALUES (1, 1000)", srcName))
+	require.NoError(t, client.BlockWait(t.Context()))
+	require.Equal(t, 1, client.GetDeltaLen())
+
+	client.StartPeriodicFlush(t.Context(), 100*time.Millisecond)
+	defer client.StopPeriodicFlush()
+	select {
+	case reason := <-reasons:
+		require.Equal(t, FatalReasonFlushError, reason)
+	case <-time.After(30 * time.Second):
+		t.Fatal("a failed periodic flush must be reported to the caller as fatal")
+	}
+	require.Equal(t, 1, client.GetDeltaLen(), "the change that failed to apply stays buffered")
+}
+
+func TestBinlogPeriodicFlushErrorIsFatal(t *testing.T) {
+	runPeriodicFlushErrorIsFatal(t, false, "pflusherrt1", "pflusherrt2")
+}
+
+func TestGTIDPeriodicFlushErrorIsFatal(t *testing.T) {
+	skipUnlessGTIDEnabled(t)
+	runPeriodicFlushErrorIsFatal(t, true, "gtidpflusherrt1", "gtidpflusherrt2")
 }

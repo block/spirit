@@ -1289,6 +1289,9 @@ func (c *gtidClient) runPeriodicFlush(ctx context.Context, interval time.Duratio
 					return
 				}
 				c.logger.Error("error flushing parked subscription", "error", err)
+				if c.fatalError(FatalReasonFlushError) {
+					return
+				}
 			}
 		case <-ticker.C:
 		}
@@ -1299,6 +1302,13 @@ func (c *gtidClient) runPeriodicFlush(ctx context.Context, interval time.Duratio
 				return
 			}
 			c.logger.Error("error flushing GTID changeset", "error", err)
+			// The failed changes stay buffered and the flushed position
+			// stays where it is, so every later pass would fail the same
+			// way while the checkpoint falls further behind the binlog
+			// retention window. Stop the caller rather than carry on.
+			if c.fatalError(FatalReasonFlushError) {
+				return
+			}
 		}
 		// Debug, not Info — see binlogClient.runPeriodicFlush (#329).
 		c.logger.Debug("finished periodic flush of GTID changeset", "total-duration", time.Since(startLoop).String(), "trigger", trigger)

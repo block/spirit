@@ -651,4 +651,5 @@ func TestFatalReasonForStreamError(t *testing.T) {
 		fatalReasonForStreamError(fmt.Errorf("wrapping context: %w", errLogPosWrapped)))
 	require.Equal(t, FatalReasonStreamError, fatalReasonForStreamError(errors.New("some other failure")))
 	require.Equal(t, "logpos-wrapped", FatalReasonLogPosWrapped.String())
+	require.Equal(t, "flush-error", FatalReasonFlushError.String())
 }

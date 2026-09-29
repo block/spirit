@@ -1368,8 +1368,9 @@ func (r *Runner) setup(ctx context.Context) error {
 
 // fatalError is the callback provided to the replication client.
 // It is called when a DDL change is detected on a subscribed table
-// (change.FatalReasonSchemaChange), or when a fatal stream error occurs
-// (change.FatalReasonStreamError). The replication client is
+// (change.FatalReasonSchemaChange), when a fatal stream error occurs
+// (change.FatalReasonStreamError), or when the periodic flush fails to apply
+// changes (change.FatalReasonFlushError). The replication client is
 // responsible for any logging related to these errors.
 // It returns true if the error was acted upon (migration cancelled),
 // or false if it was ignored (e.g. because the migration is already
@@ -1396,6 +1397,12 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 			// changed, so the checkpoint remains valid. Keep it and tell the
 			// operator how to recover.
 			r.logger.Error("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the migration from it")
+		case change.FatalReasonFlushError:
+			// Applying buffered changes failed, so the checkpoint's binlog
+			// position has stopped advancing. The table has not changed and
+			// the checkpoint is still valid, but a resume replays the same
+			// changes: the cause (logged just before) must be fixed first.
+			r.logger.Error("fatal error applying binlog changes; the checkpoint has been preserved — fix the cause of the error and re-run spirit to resume the migration from it")
 		case change.FatalReasonUnsupportedXA, change.FatalReasonLogPosWrapped:
 			// Both reasons leave a checkpoint that is technically readable
 			// but useless: resuming from it streams straight back into the

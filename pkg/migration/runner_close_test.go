@@ -137,6 +137,19 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 			"a stream-error fatal must preserve the checkpoint table so the migration can resume")
 	})
 
+	t.Run("FlushErrorPreservesCheckpoint", func(t *testing.T) {
+		t.Parallel()
+		r := setupRunnerForChecksumTest(t, "fatal_reason_flush")
+		var cancelCalls atomic.Int32
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
+
+		require.True(t, r.fatalError(change.FatalReasonFlushError))
+		require.Equal(t, status.ErrCleanup, r.status.Get())
+		require.Equal(t, int32(1), cancelCalls.Load(), "must still cancel the migration")
+		require.True(t, checkpointTableExists(t, r),
+			"a flush-error fatal must preserve the checkpoint table so the migration can resume")
+	})
+
 	t.Run("UnsupportedXADropsCheckpoint", func(t *testing.T) {
 		t.Parallel()
 		r := setupRunnerForChecksumTest(t, "fatal_reason_xa")

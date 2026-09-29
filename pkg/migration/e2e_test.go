@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
@@ -394,6 +395,52 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	outcomes := sink.outcomes()
 	require.Contains(t, outcomes, status.WorkflowPhaseOutcomeFailed, "the phase that observed the abort must be recorded as failed")
 	require.NotContains(t, outcomes, status.WorkflowPhaseOutcomeCancelled, "no phase may be recorded as cancelled")
+}
+
+// TestMigrationFailsOnPeriodicFlushError checks that a change the periodic
+// flush cannot apply stops the migration. The failed change stays buffered and
+// the checkpoint's binlog position stops advancing, so a migration that only
+// logged the error kept copying for as long as the copy took, while its only
+// resume point fell out of the binlog retention window.
+func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "flushapplyerr", `CREATE TABLE flushapplyerr (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	tt.SeedRows(t, "INSERT INTO flushapplyerr (b) SELECT 'abc'", 100000)
+
+	// Small chunks and the test throttler keep the copy running for far
+	// longer than the first periodic flush takes to fire.
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE flushapplyerr MODIFY b VARCHAR(10) NOT NULL",
+		WithThreads(1), WithTestThrottler(), func(m *Migration) { m.TargetChunkSize = 8192 })
+	running := startTestRun(t, m.Run, m.Close)
+	waitForStatus(t, m, status.CopyRows, running)
+
+	// Once the first row has been copied, give it a value the new column
+	// cannot hold. The change reaches _flushapplyerr_new only through the
+	// binlog, and applying it fails in strict mode.
+	var minID int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT MIN(id) FROM flushapplyerr").Scan(&minID))
+	require.Eventually(t, func() bool {
+		var n int
+		err := tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _flushapplyerr_new WHERE id = ?", minID).Scan(&n)
+		return err == nil && n == 1
+	}, time.Minute, 100*time.Millisecond, "the first row was never copied")
+	_, err := tt.DB.ExecContext(t.Context(), "UPDATE flushapplyerr SET b = REPEAT('x', 50) WHERE id = ?", minID)
+	require.NoError(t, err)
+
+	select {
+	case <-running.done:
+	case <-time.After(change.DefaultFlushInterval + time.Minute):
+		t.Fatalf("migration still running (state %s) after the periodic flush failed", m.status.Get())
+	}
+	require.Error(t, running.err)
+	// The synchronous flush after the copy would fail on the same change,
+	// but with the bare apply error: the reason shows it was the periodic
+	// flush, during the copy, that stopped the migration.
+	require.ErrorContains(t, running.err, change.FatalReasonFlushError.String())
+	require.True(t, checkpointTableExists(t, m), "the checkpoint is still valid and must be preserved")
 }
 
 // TestReservedWordPKMigration is a regression test for issue #828.

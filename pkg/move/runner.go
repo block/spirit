@@ -1683,8 +1683,9 @@ func (r *Runner) assertNoRevertMarker(ctx context.Context, phase string) error {
 
 // fatalError is the callback provided to the replication client.
 // It is called when a DDL change is detected on a subscribed table
-// (change.FatalReasonSchemaChange), or when a fatal stream error occurs
-// (change.FatalReasonStreamError). The replication client may perform
+// (change.FatalReasonSchemaChange), when a fatal stream error occurs
+// (change.FatalReasonStreamError), or when the periodic flush fails to apply
+// changes (change.FatalReasonFlushError). The replication client may perform
 // its own logging either before or after invoking this callback, and DDL
 // logging may be skipped entirely if this callback returns false.
 //
@@ -1717,6 +1718,12 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 			// changed, so the checkpoint remains valid. Keep it and tell the
 			// operator how to recover.
 			r.logger.Error("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the move from it")
+		case change.FatalReasonFlushError:
+			// Applying buffered changes failed, so the checkpoint's positions
+			// have stopped advancing. The source tables have not changed and
+			// the checkpoint is still valid, but a resume replays the same
+			// changes: the cause (logged just before) must be fixed first.
+			r.logger.Error("fatal error applying replicated changes; the checkpoint has been preserved — fix the cause of the error and re-run spirit to resume the move from it")
 		case change.FatalReasonUnsupportedXA, change.FatalReasonLogPosWrapped:
 			// Both reasons leave a checkpoint that is technically readable
 			// but useless: resuming from it streams straight back into the
