@@ -2211,6 +2211,9 @@ func (r *Runner) Result() status.WorkflowResult {
 	}
 }
 
+// SetCutover installs the caller-owned forward traffic switch. It runs under
+// the source table locks and, together with the final flush, must complete
+// within 10 minutes (see CutoverResultCallback).
 func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {
 	r.cutoverResultFunc = nil
 	r.cutoverFunc = cutover
@@ -2224,7 +2227,9 @@ func (r *Runner) SetCutoverWithResult(cutover CutoverResultCallback) {
 }
 
 // SetReverseCutover registers the legacy rollback traffic switch used if a
-// revert is requested during the reverse window.
+// revert is requested during the reverse window. It runs under the target
+// table locks and, together with the reverse feed's final flush and the
+// source renames, must complete within 10 minutes (see CutoverResultCallback).
 func (r *Runner) SetReverseCutover(fn func(ctx context.Context) error) {
 	r.reverseCutoverResultFunc = nil
 	r.reverseCutoverFunc = fn

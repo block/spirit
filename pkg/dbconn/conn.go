@@ -52,10 +52,15 @@ var maxConnLifetime = time.Minute * 3
 // connection. The server default is 8 hours, so a spirit process that froze or
 // lost its network while holding LOCK TABLES could keep the tables locked that
 // long. With 10 minutes MySQL closes the idle session, and releases its locks,
-// much sooner. Every idle connection spirit keeps open is refreshed well within
-// it: pooled connections are recycled after maxConnLifetime, the checksum's
-// snapshot transactions ping at an interval derived from wait_timeout (see
-// NewTrxPool), and the advisory lock is refreshed every minute.
+// much sooner. Pooled connections are recycled after maxConnLifetime, the
+// checksum's snapshot transactions ping at an interval derived from
+// wait_timeout (see NewTrxPool), and the advisory lock is refreshed every
+// minute. A TableLock session is not refreshed: it is idle from LOCK TABLES
+// until the next statement sent on it. A move's cutover sends nothing on its
+// source lock sessions while it flushes the change feeds and runs the caller's
+// traffic switch, and the reverse cutover does the same with its target locks.
+// If that takes longer than 10 minutes, MySQL closes the session and releases
+// the locks. This limit is documented on move's cutover callbacks.
 const sessionWaitTimeout = 600
 
 // SetPoolSize sets a pool's connection limit, keeping the idle limit equal to
