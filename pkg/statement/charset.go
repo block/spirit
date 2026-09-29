@@ -87,3 +87,34 @@ func normalizeCollationName(collation string) string {
 	}
 	return collation
 }
+
+// determinedCharsetCollation returns the charset and collation the column
+// compares under, each "" when the definition does not decide it. It differs
+// from EffectiveCharsetCollation in one respect: where the definition names
+// only a charset, it supplies that charset's default collation only when every
+// server agrees on it (see charsetDefaultCollationIsFixed). A caller that
+// refuses a statement on the strength of the answer needs that certainty; a
+// linter does not.
+func (c *Column) determinedCharsetCollation(table *CreateTable) (cs, collation string) {
+	cs, collation = resolvedCharsetCollation(c, table)
+	cs = normalizeCharsetName(cs)
+	if collation != "" {
+		return cs, normalizeCollationName(collation)
+	}
+	if !charsetDefaultCollationIsFixed(cs) {
+		return cs, ""
+	}
+	if _, def, ok := DefaultCollationForCharset(cs); ok {
+		return cs, def
+	}
+	return cs, ""
+}
+
+// charsetDefaultCollationIsFixed reports whether a charset named without a
+// collation takes the same collation on every server. utf8mb4's is the
+// server's default_collation_for_utf8mb4, which a server can set to
+// utf8mb4_general_ci, so naming utf8mb4 alone does not decide its collation.
+// An empty charset is one the definition does not name.
+func charsetDefaultCollationIsFixed(cs string) bool {
+	return cs != "" && !strings.EqualFold(cs, charset.CharsetUTF8MB4)
+}

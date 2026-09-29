@@ -134,6 +134,35 @@ func TestPrimaryKeyCollationStatementRefusal(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, refused)
 	assert.Empty(t, reason)
+
+	// Statements whose effect on the key's collation depends on a default the
+	// inputs do not carry are left to setup, which reads what MySQL resolved.
+	for _, tt := range []struct {
+		name, stmt, current string
+	}{
+		{
+			name:    "a key whose current collation is the schema's default",
+			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) COLLATE utf8mb4_bin NOT NULL",
+			current: "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token))",
+		},
+		{
+			name:    "naming utf8mb4 without a collation",
+			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) CHARACTER SET utf8mb4 NOT NULL",
+			current: "CREATE TABLE `ledger` (\n  `owner_token` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,\n  PRIMARY KEY (`owner_token`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		},
+		{
+			name:    "converting to utf8mb4 without a collation",
+			stmt:    "ALTER TABLE ledger CONVERT TO CHARACTER SET utf8mb4",
+			current: "CREATE TABLE `ledger` (\n  `owner_token` varchar(64) NOT NULL,\n  PRIMARY KEY (`owner_token`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused, err := StatementRefusal(t.Context(), tt.stmt, tt.current, discardLogger())
+			require.NoError(t, err)
+			assert.False(t, refused)
+			assert.Empty(t, reason)
+		})
+	}
 }
 
 // TestPrimaryKeyCollationReasonNamesOnlyTheStatement pins what a refusal

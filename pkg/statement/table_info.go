@@ -26,7 +26,8 @@ func (ct *CreateTable) ToTableInfo(schemaName string) (*table.TableInfo, error) 
 			Generated: col.GeneratedExpr != nil,
 		}
 		if col.CarriesCharset() {
-			_, meta.Collation = col.EffectiveCharsetCollation(ct)
+			_, meta.Collation = col.determinedCharsetCollation(ct)
+			meta.CollationUnknown = meta.Collation == ""
 		}
 		columns = append(columns, meta)
 	}

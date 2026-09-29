@@ -53,10 +53,10 @@ var collationCases = []struct {
 	},
 	{
 		name:           "MODIFY declaring only a charset takes its default collation",
-		create:         "CREATE TABLE %s (a varchar(20) NOT NULL, PRIMARY KEY (a)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-		alter:          "ALTER TABLE %s MODIFY COLUMN a varchar(20) CHARACTER SET utf8mb4 NOT NULL",
+		create:         "CREATE TABLE %s (a varchar(20) NOT NULL, PRIMARY KEY (a)) DEFAULT CHARSET=latin1 COLLATE=latin1_bin",
+		alter:          "ALTER TABLE %s MODIFY COLUMN a varchar(20) CHARACTER SET latin1 NOT NULL",
 		column:         "a",
-		wantAfter:      "utf8mb4_0900_ai_ci",
+		wantAfter:      "latin1_swedish_ci",
 		wantChanged:    true,
 		wantDeclaredAs: "a",
 	},
@@ -88,10 +88,10 @@ var collationCases = []struct {
 	},
 	{
 		name:        "CONVERT TO without a collation takes the charset's default",
-		create:      "CREATE TABLE %s (a varchar(20) COLLATE utf8mb4_bin NOT NULL, PRIMARY KEY (a)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-		alter:       "ALTER TABLE %s CONVERT TO CHARACTER SET utf8mb4",
+		create:      "CREATE TABLE %s (a varchar(20) COLLATE latin1_bin NOT NULL, PRIMARY KEY (a)) DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci",
+		alter:       "ALTER TABLE %s CONVERT TO CHARACTER SET latin1",
 		column:      "a",
-		wantAfter:   "utf8mb4_0900_ai_ci",
+		wantAfter:   "latin1_swedish_ci",
 		wantChanged: true,
 	},
 	{
@@ -241,6 +241,13 @@ func TestColumnCollationChangeUndetermined(t *testing.T) {
 			name:  "redeclaration inheriting an unknown table default",
 			alter: "ALTER TABLE t MODIFY COLUMN a varchar(20) NOT NULL",
 		},
+		{
+			// The table default the statement sets is the server's
+			// default_collation_for_utf8mb4.
+			name:           "redeclaration inheriting a utf8mb4 default the same statement sets",
+			alter:          "ALTER TABLE t DEFAULT CHARSET=utf8mb4, MODIFY COLUMN a varchar(20) NOT NULL",
+			tableCollation: "utf8mb4_bin",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -250,12 +257,76 @@ func TestColumnCollationChangeUndetermined(t *testing.T) {
 		})
 	}
 
+	for _, alter := range utf8mb4WithoutCollation {
+		t.Run(alter, func(t *testing.T) {
+			_, determined, err := MustNew(strings.ReplaceAll(alter, "%s", "t"))[0].ColumnCollationChange("a", "utf8mb4_general_ci", "utf8mb4_0900_ai_ci")
+			require.NoError(t, err)
+			assert.False(t, determined)
+
+			// Whichever utf8mb4 collation the server picks, it is not a latin1
+			// column's.
+			change, determined, err := MustNew(strings.ReplaceAll(alter, "%s", "t"))[0].ColumnCollationChange("a", "latin1_swedish_ci", "latin1_swedish_ci")
+			require.NoError(t, err)
+			require.True(t, determined)
+			assert.True(t, change.Changed())
+			assert.Equal(t, "utf8mb4", change.AfterCharset)
+			assert.Empty(t, change.After)
+		})
+	}
+
+	// A key that carries no charset gains a collation, whichever one the
+	// server picks.
+	change, determined, err := MustNew("ALTER TABLE t MODIFY COLUMN a varchar(20) CHARACTER SET utf8mb4 NOT NULL")[0].
+		ColumnCollationChange("a", "", "utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	require.True(t, determined)
+	assert.True(t, change.Changed())
+
 	// A redeclaration that spells its collation out needs no default.
-	change, determined, err := MustNew("ALTER TABLE t MODIFY COLUMN a varchar(20) COLLATE utf8mb4_bin NOT NULL")[0].
+	change, determined, err = MustNew("ALTER TABLE t MODIFY COLUMN a varchar(20) COLLATE utf8mb4_bin NOT NULL")[0].
 		ColumnCollationChange("a", "utf8mb4_0900_ai_ci", "")
 	require.NoError(t, err)
 	require.True(t, determined)
 	assert.True(t, change.Changed())
+}
+
+// utf8mb4WithoutCollation are ALTERs that name utf8mb4 but no collation, so the
+// collation they give the key column is the server's
+// default_collation_for_utf8mb4.
+var utf8mb4WithoutCollation = []string{
+	"ALTER TABLE %s MODIFY COLUMN a varchar(20) CHARACTER SET utf8mb4 NOT NULL",
+	"ALTER TABLE %s CONVERT TO CHARACTER SET utf8mb4",
+}
+
+// TestUTF8MB4DefaultCollationIsTheServers runs each statement in
+// utf8mb4WithoutCollation against a key under utf8mb4_general_ci, once for each
+// value a server can give default_collation_for_utf8mb4. One server changes the
+// key's collation and the other leaves it alone, which is what makes reporting
+// the statements as undetermined, rather than assuming utf8mb4_0900_ai_ci, the
+// correct answer.
+func TestUTF8MB4DefaultCollationIsTheServers(t *testing.T) {
+	for _, alter := range utf8mb4WithoutCollation {
+		t.Run(alter, func(t *testing.T) {
+			var results []string
+			for _, serverDefault := range []string{"utf8mb4_0900_ai_ci", "utf8mb4_general_ci"} {
+				const name = "utf8mb4default"
+				tt := testutils.NewTestTable(t, name, "CREATE TABLE "+name+" (a varchar(20) COLLATE utf8mb4_general_ci NOT NULL, PRIMARY KEY (a)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+				conn, err := tt.DB.Conn(t.Context())
+				require.NoError(t, err)
+				_, err = conn.ExecContext(t.Context(), "SET SESSION default_collation_for_utf8mb4 = ?", serverDefault)
+				require.NoError(t, err)
+				_, err = conn.ExecContext(t.Context(), strings.ReplaceAll(alter, "%s", name))
+				require.NoError(t, err)
+				var collation string
+				require.NoError(t, conn.QueryRowContext(t.Context(),
+					"SELECT collation_name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name='a'",
+					name).Scan(&collation))
+				require.NoError(t, conn.Close())
+				results = append(results, collation)
+			}
+			assert.Equal(t, []string{"utf8mb4_0900_ai_ci", "utf8mb4_general_ci"}, results)
+		})
+	}
 }
 
 // TestColumnCollationChangeNotAlter rejects a statement that is not an ALTER
@@ -267,11 +338,12 @@ func TestColumnCollationChangeNotAlter(t *testing.T) {
 
 // TestTableDefaultCollation reads the collation a column declared without one
 // takes: the table's COLLATE, or its charset's default collation when only the
-// charset is declared.
+// charset is declared and every server agrees on that default.
 func TestTableDefaultCollation(t *testing.T) {
 	tests := map[string]string{
 		"CREATE TABLE t (a int) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin": "utf8mb4_bin",
 		"CREATE TABLE t (a int) DEFAULT CHARSET=latin1":                      "latin1_swedish_ci",
+		"CREATE TABLE t (a int) DEFAULT CHARSET=utf8mb4":                     "",
 		"CREATE TABLE t (a int) DEFAULT CHARSET=utf8 COLLATE=utf8_bin":       "utf8mb3_bin",
 		"CREATE TABLE t (a int)":                                             "",
 	}
@@ -282,6 +354,38 @@ func TestTableDefaultCollation(t *testing.T) {
 			assert.Equal(t, want, ct.TableDefaultCollation())
 		})
 	}
+}
+
+// TestToTableInfoUnknownCollation builds table metadata from hand-written
+// definitions that leave a character column's collation to a default the
+// definition does not carry. The collation must be reported as unknown, not as
+// the empty collation of a column that carries no charset.
+func TestToTableInfoUnknownCollation(t *testing.T) {
+	for _, create := range []string{
+		"CREATE TABLE t (a varchar(20) NOT NULL, n int, PRIMARY KEY (a))",
+		"CREATE TABLE t (a varchar(20) NOT NULL, n int, PRIMARY KEY (a)) DEFAULT CHARSET=utf8mb4",
+		"CREATE TABLE t (a varchar(20) CHARACTER SET utf8mb4 NOT NULL, n int, PRIMARY KEY (a)) DEFAULT CHARSET=latin1",
+	} {
+		t.Run(create, func(t *testing.T) {
+			ct, err := ParseCreateTable(create)
+			require.NoError(t, err)
+			info, err := ct.ToTableInfo("test")
+			require.NoError(t, err)
+			_, ok := info.GetColumnCollation("a")
+			assert.False(t, ok)
+			collation, ok := info.GetColumnCollation("n")
+			require.True(t, ok)
+			assert.Empty(t, collation)
+		})
+	}
+
+	ct, err := ParseCreateTable("CREATE TABLE t (a varchar(20) NOT NULL, PRIMARY KEY (a)) DEFAULT CHARSET=latin1")
+	require.NoError(t, err)
+	info, err := ct.ToTableInfo("test")
+	require.NoError(t, err)
+	collation, ok := info.GetColumnCollation("a")
+	require.True(t, ok)
+	assert.Equal(t, "latin1_swedish_ci", collation, "latin1 takes the same default collation on every server")
 }
 
 // TestToTableInfoCollationsMatchSetInfo reads one live table both ways: from
@@ -318,6 +422,6 @@ func TestToTableInfoCollationsMatchSetInfo(t *testing.T) {
 		require.True(t, ok)
 		got, ok := fromDDL.GetColumnCollation(column)
 		require.True(t, ok)
-		assert.Equal(t, normalizeCollationName(want), got, column)
+		assert.Equal(t, want, got, column)
 	}
 }

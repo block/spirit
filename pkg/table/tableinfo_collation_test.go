@@ -55,6 +55,8 @@ func TestNewTableInfoFromMetaCollations(t *testing.T) {
 	ti, err := NewTableInfoFromMeta("mydb", "t1", []ColumnMeta{
 		{Name: "token", MySQLType: "varchar(64)", Collation: "UTF8MB4_BIN"},
 		{Name: "amount", MySQLType: "bigint"},
+		{Name: "legacy", MySQLType: "varchar(10)", Collation: "utf8_general_ci"},
+		{Name: "note", MySQLType: "varchar(100)", CollationUnknown: true},
 	}, []string{"token"})
 	require.NoError(t, err)
 
@@ -64,5 +66,10 @@ func TestNewTableInfoFromMetaCollations(t *testing.T) {
 	collation, ok = ti.GetColumnCollation("amount")
 	require.True(t, ok)
 	assert.Empty(t, collation)
+	collation, ok = ti.GetColumnCollation("legacy")
+	require.True(t, ok)
+	assert.Equal(t, "utf8mb3_general_ci", collation, "MySQL releases before 8.0.30 spell utf8mb3 collations utf8_")
+	_, ok = ti.GetColumnCollation("note")
+	assert.False(t, ok, "a collation the definition does not determine is not reported as no collation")
 	assert.Empty(t, ti.DefaultCollation, "a table built from column definitions has no default until the caller sets one")
 }

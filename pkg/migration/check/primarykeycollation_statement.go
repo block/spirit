@@ -21,10 +21,11 @@ func init() {
 // primarykeycollation stays the authority. It reads the collation MySQL
 // actually resolved on the new table, and it refuses every run this check
 // refuses, so the prediction is not registered for a run of its own. This check
-// only refuses when the statement determines the key column's collation
-// afterwards; when that depends on a default the table metadata does not carry
-// (CONVERT TO CHARACTER SET DEFAULT takes the schema's), it stays silent and
-// leaves the refusal to setup.
+// only refuses when it knows the key column's collation both now and once the
+// statement applies. When either depends on a default the inputs do not carry —
+// a hand-written definition with no DEFAULT CHARSET takes the schema's, CONVERT
+// TO CHARACTER SET DEFAULT does too, and naming utf8mb4 without a collation
+// takes the server's — it stays silent and leaves the refusal to setup.
 //
 // MySQL's native DDL cannot complete the statement ahead of setup: changing a
 // primary key column's collation, or changing it between a string and a
@@ -47,7 +48,12 @@ func primaryKeyCollationStatementCheck(ctx context.Context, r Resources, logger 
 		if !ok {
 			return cannotClassify("unable to validate collation change for primary key column %q: column not found in table metadata", key)
 		}
-		current, _ := r.Table.GetColumnCollation(column)
+		current, known := r.Table.GetColumnCollation(column)
+		if !known {
+			logger.Debug("skipping primary key collation prediction for column: the table metadata does not determine its current collation",
+				"table", r.Table.TableName, "column", column)
+			continue
+		}
 		change, determined, err := r.Statement.ColumnCollationChange(column, current, r.Table.DefaultCollation)
 		if err != nil {
 			return fmt.Errorf("resolve the collation of primary key column %q after the statement: %w", key, err)
