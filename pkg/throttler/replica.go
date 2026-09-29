@@ -41,8 +41,19 @@ type Replica struct {
 // MySQL8LagQuery is a query that is used to get the lag between the source and the replica.
 // The implementation is described in https://github.com/block/spirit/issues/286
 // It uses performance_schema instead of a heartbeat injection or seconds_behind_source.
+//
+// The commit timestamps have microsecond precision, so both TIMESTAMPDIFF calls
+// compare them against NOW(6): a lower-precision NOW() truncates the current
+// second and makes a transaction from that second look like it committed in the
+// future. The result is clamped at 0 because the source and replica clocks can
+// still differ slightly (see https://github.com/block/spirit/issues/1326).
+//
+// applier_latency_ms is NULL when no worker is mid-transaction (the applying
+// timestamp is a zero date). Each latency is IFNULL'd before GREATEST, so an
+// idle applier with a growing queue (SQL thread stopped, IO thread still
+// queueing) reports the queue latency instead of collapsing the reading to 0.
 const MySQL8LagQuery = `WITH applier_latency AS (
-	SELECT MAX(TIMESTAMPDIFF(MICROSECOND, APPLYING_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP, NOW())/1000 ) AS applier_latency_ms
+	SELECT MAX(TIMESTAMPDIFF(MICROSECOND, APPLYING_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP, NOW(6))/1000 ) AS applier_latency_ms
 	FROM performance_schema.replication_applier_status_by_worker
    ), queue_latency AS (
 	SELECT MIN(
@@ -53,14 +64,14 @@ const MySQL8LagQuery = `WITH applier_latency AS (
 	  GTID_SUBTRACT(LAST_QUEUED_TRANSACTION, LAST_APPLIED_TRANSACTION) = ''
 	 THEN 0
 	  ELSE
-	  TIMESTAMPDIFF(MICROSECOND, LAST_APPLIED_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP, NOW(3))/1000
+	  TIMESTAMPDIFF(MICROSECOND, LAST_APPLIED_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP, NOW(6))/1000
 	END
    ) AS queue_latency_ms,
    IF(MIN(TIMESTAMPDIFF(MINUTE, LAST_QUEUED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP, NOW()))>1,'IDLE','ACTIVE') as queue_status
    FROM performance_schema.replication_applier_status_by_worker w
    JOIN performance_schema.replication_connection_status s ON s.channel_name = w.channel_name
    )
-   SELECT IFNULL(IF(queue_status='IDLE',0,CEIL(GREATEST(applier_latency_ms, queue_latency_ms))),0) as lagMs FROM applier_latency, queue_latency
+   SELECT IFNULL(IF(queue_status='IDLE',0,CEIL(GREATEST(IFNULL(applier_latency_ms, 0), IFNULL(queue_latency_ms, 0), 0))),0) as lagMs FROM applier_latency, queue_latency
 `
 
 var _ ReasonedThrottler = &Replica{}
