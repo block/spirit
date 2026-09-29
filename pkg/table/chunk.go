@@ -20,7 +20,8 @@ type Chunk struct {
 
 	// ActualBytes is a transient measurement, not part of the chunk's identity
 	// or its checkpoint/watermark JSON (see JSON()). The copier sets it to the
-	// in-memory size of the rows it read for this chunk, so the chunker's
+	// estimated size of the rows it read for this chunk
+	// (utils.EstimateRenderedChunkSize), so the chunker's
 	// Feedback() can size the next chunk against a byte budget instead of wall
 	// time when dynamicChunkSizer.TargetChunkBytes is set. Zero for the
 	// checksum path, which reads server-side and never sees the bytes.

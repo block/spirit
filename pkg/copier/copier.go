@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"math"
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
@@ -18,33 +17,7 @@ import (
 	"github.com/block/spirit/pkg/throttler"
 )
 
-const (
-	copyEstimateInterval   = 10 * time.Second // how frequently to re-estimate copy speed
-	copyETAInitialWaitTime = 1 * time.Minute  // how long to wait before first estimating copy speed (to allow for fast start)
-)
-
-// etaEstimate returns the estimated remaining copy time and the state of that
-// estimate. The duration is meaningful only when the state is status.ETAReady.
-// No estimate is available before a copy rate has been measured (the first
-// copyETAInitialWaitTime, or while no rows have been timed; status.ETAMeasuring)
-// or once the copy is essentially complete (pct > 99.99; status.ETADue) — the
-// callers present each case (GetETA renders "TBD"/"DUE", GetETAState returns the
-// state and 0 seconds).
-func etaEstimate(copiedRows, totalRows uint64, pct float64, rowsPerSecond uint64, startTime time.Time) (time.Duration, status.ETAState) {
-	if pct > 99.99 {
-		return 0, status.ETADue
-	}
-	if rowsPerSecond == 0 || time.Since(startTime) < copyETAInitialWaitTime {
-		return 0, status.ETAMeasuring
-	}
-	// Divide the remaining rows by how many rows we copied in the last interval
-	// per second. "remainingRows" might be the actual rows or the logical rows
-	// since getCopyStats() and rowsPerSecond change estimation method when the PK
-	// is auto-inc.
-	remainingRows := totalRows - copiedRows
-	remainingSeconds := math.Floor(float64(remainingRows) / float64(rowsPerSecond))
-	return time.Duration(remainingSeconds * float64(time.Second)), status.ETAReady
-}
+const copyEstimateInterval = 10 * time.Second // how frequently to re-estimate copy speed
 
 // Copier is the interface which copiers use. The single implementation
 // streams rows from the source through an applier to the target (the

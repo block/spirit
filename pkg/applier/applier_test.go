@@ -23,194 +23,24 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func TestEstimateRowSize(t *testing.T) {
-	tests := []struct {
-		name    string
-		values  []any
-		minSize int // minimum expected size
-		maxSize int // maximum expected size (for flexibility)
-	}{
-		{
-			name:    "empty row",
-			values:  []any{},
-			minSize: 2, // just parentheses
-			maxSize: 2,
-		},
-		{
-			name:    "single integer",
-			values:  []any{int64(123)},
-			minSize: 6,
-			maxSize: 20, // flat 10-digit assumption + overhead, not the rendered "123"
-		},
-		{
-			name:    "single string",
-			values:  []any{"hello"},
-			minSize: 7, // "hello" + overhead
-			maxSize: 15,
-		},
-		{
-			name:    "nil value",
-			values:  []any{nil},
-			minSize: 6, // "<nil>" + overhead
-			maxSize: 12,
-		},
-		{
-			name:    "mixed types",
-			values:  []any{int64(42), "test", nil, true, 3.14},
-			minSize: 20, // sum of all values + overhead
-			maxSize: 60,
-		},
-		{
-			name:    "large string",
-			values:  []any{"this is a very long string that represents a TEXT column with lots of data"},
-			minSize: 75,
-			maxSize: 100,
-		},
-		{
-			name:    "byte slice",
-			values:  []any{[]byte("binary data")},
-			minSize: 11,
-			maxSize: 50,
-		},
-		{
-			name:    "multiple columns",
-			values:  []any{int64(1), "Alice", "alice@example.com", int64(25), true},
-			minSize: 30,
-			maxSize: 80,
-		},
-		{
-			// A full-width int64 is the case the flat integer estimate
-			// deliberately under-measures: ~20 rendered characters estimated as
-			// 10. See TestEstimateRowSizeUnderestimateStaysSafe for why that is
-			// acceptable, and estimateValueSize for why it is preferred to
-			// over-estimating every ordinary ID.
-			name:    "large integers",
-			values:  []any{int64(9223372036854775807), int64(-9223372036854775808)},
-			minSize: 20,
-			maxSize: 60,
-		},
-		{
-			name:    "floating point numbers",
-			values:  []any{3.14159, -2.71828, 0.0},
-			minSize: 15,
-			maxSize: 40,
-		},
+// A ~900 KB row must still estimate under MaxStatementSizeBytes, so it fits
+// in a single chunklet.
+func TestEstimateRenderedRowSizeUnderStatementBudget(t *testing.T) {
+	// Create a row that's close to 1MB
+	largeData := make([]byte, 900000) // 900KB
+	for i := range largeData {
+		largeData[i] = 'x'
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			size := EstimateRowSize(tt.values)
-			assert.GreaterOrEqual(t, size, tt.minSize, "size should be at least minSize")
-			assert.LessOrEqual(t, size, tt.maxSize, "size should not exceed maxSize")
-			t.Logf("Estimated size for %s: %d bytes", tt.name, size)
-		})
+	values := []any{
+		int64(1),
+		string(largeData),
+		"metadata",
 	}
-}
-
-func TestEstimateRowSizeRealistic(t *testing.T) {
-	// Test with realistic table data
-	t.Run("users table row", func(t *testing.T) {
-		// id, username, email, created_at, is_active
-		values := []any{
-			int64(12345),
-			"john_doe_2024",
-			"john.doe@example.com",
-			"2024-01-15 10:30:00",
-			true,
-		}
-		size := EstimateRowSize(values)
-		// Should be reasonable size, not too large
-		require.Greater(t, size, 40, "should account for all fields")
-		require.Less(t, size, 150, "should not be excessively large")
-		t.Logf("Users table row size: %d bytes", size)
-	})
-
-	t.Run("blog posts with TEXT column", func(t *testing.T) {
-		// id, title, content (large TEXT), author_id
-		largeContent := make([]byte, 10000) // 10KB of content
-		for i := range largeContent {
-			largeContent[i] = 'a'
-		}
-		values := []any{
-			int64(1),
-			"My Blog Post Title",
-			string(largeContent),
-			int64(42),
-		}
-		size := EstimateRowSize(values)
-		// Should be roughly 10KB + overhead
-		require.Greater(t, size, 10000, "should account for large content")
-		require.Less(t, size, 11000, "overhead should be reasonable")
-		t.Logf("Blog post row size: %d bytes", size)
-	})
-
-	t.Run("row approaching MaxStatementSizeBytes", func(t *testing.T) {
-		// Create a row that's close to 1MB
-		largeData := make([]byte, 900000) // 900KB
-		for i := range largeData {
-			largeData[i] = 'x'
-		}
-		values := []any{
-			int64(1),
-			string(largeData),
-			"metadata",
-		}
-		size := EstimateRowSize(values)
-		// Should be close to but not exceed our threshold
-		require.Greater(t, size, 900000, "should account for large data")
-		require.Less(t, size, MaxStatementSizeBytes, "single row should fit in a chunklet")
-		t.Logf("Large row size: %d bytes (threshold: %d)", size, MaxStatementSizeBytes)
-	})
-}
-
-func TestEstimateRowSizeConsistency(t *testing.T) {
-	// Test that the same input produces the same output
-	values := []any{int64(123), "test", true, 3.14}
-
-	size1 := EstimateRowSize(values)
-	size2 := EstimateRowSize(values)
-	size3 := EstimateRowSize(values)
-
-	require.Equal(t, size1, size2, "should be consistent")
-	require.Equal(t, size2, size3, "should be consistent")
-}
-
-func TestEstimateRowSizeZeroValues(t *testing.T) {
-	// Test with zero/empty values
-	tests := []struct {
-		name   string
-		values []any
-	}{
-		{
-			name:   "zero integer",
-			values: []any{int64(0)},
-		},
-		{
-			name:   "empty string",
-			values: []any{""},
-		},
-		{
-			name:   "zero float",
-			values: []any{0.0},
-		},
-		{
-			name:   "false boolean",
-			values: []any{false},
-		},
-		{
-			name:   "empty byte slice",
-			values: []any{[]byte{}},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			size := EstimateRowSize(tt.values)
-			// Should have some size even for zero values
-			require.Positive(t, size, "should have non-zero size")
-			t.Logf("%s size: %d bytes", tt.name, size)
-		})
-	}
+	size := utils.EstimateRenderedRowSize(values)
+	// Should be close to but not exceed our threshold
+	require.Greater(t, size, 900000, "should account for large data")
+	require.Less(t, size, MaxStatementSizeBytes, "single row should fit in a chunklet")
+	t.Logf("Large row size: %d bytes (threshold: %d)", size, MaxStatementSizeBytes)
 }
 
 func TestSplitRowsIntoChunklets(t *testing.T) {
@@ -282,7 +112,7 @@ func TestSplitRowsIntoChunklets(t *testing.T) {
 		for i, chunklet := range chunklets {
 			totalSize := 0
 			for _, row := range chunklet {
-				totalSize += EstimateRowSize(row.values)
+				totalSize += utils.EstimateRenderedRowSize(row.values)
 			}
 			// Allow some overhead, but should be reasonably close to limit
 			require.LessOrEqual(t, totalSize, MaxStatementSizeBytes+10000,
@@ -377,7 +207,7 @@ func TestSplitRowsIntoChunklets(t *testing.T) {
 		require.Len(t, chunklets[0], 1, "chunklet should have the one oversized row")
 
 		// Verify the row size does exceed our threshold
-		rowSize := EstimateRowSize(rows[0].values)
+		rowSize := utils.EstimateRenderedRowSize(rows[0].values)
 		require.Greater(t, rowSize, MaxStatementSizeBytes, "row should exceed MaxStatementSizeBytes")
 		t.Logf("Single row size: %d bytes (exceeds threshold of %d bytes)", rowSize, MaxStatementSizeBytes)
 		t.Logf("Note: This relies on max_allowed_packet being large enough (typically 64 MiB)")
@@ -412,7 +242,7 @@ func TestSplitRowsIntoChunklets(t *testing.T) {
 	})
 }
 
-// TestEstimateRowSizeTracksRenderedSize is the property that matters: the
+// TestEstimateRenderedRowSizeTracksRenderedSize is the property that matters: the
 // estimate feeds MaxStatementSizeBytes, so it has to stay in the same
 // ballpark as what datum.String() actually emits into the VALUES clause.
 //
@@ -423,7 +253,7 @@ func TestSplitRowsIntoChunklets(t *testing.T) {
 // ~2.7x, so chunklets were cut well short of the budget they were sized for,
 // and nothing failed because an over-estimate is safe. This pins the direction
 // as well as the magnitude.
-func TestEstimateRowSizeTracksRenderedSize(t *testing.T) {
+func TestEstimateRenderedRowSizeTracksRenderedSize(t *testing.T) {
 	// Exactly what the driver hands back for a text-protocol row.
 	values := []any{
 		[]byte("298801139"), []byte("4211"), []byte("settled"),
@@ -446,7 +276,7 @@ func TestEstimateRowSizeTracksRenderedSize(t *testing.T) {
 	}
 	rendered := len("(" + strings.Join(literals, ", ") + ")")
 
-	estimated := EstimateRowSize(values)
+	estimated := utils.EstimateRenderedRowSize(values)
 	ratio := float64(estimated) / float64(rendered)
 	assert.InDelta(t, 1.0, ratio, 0.5,
 		"estimate %d vs rendered %d (%.2fx) — the estimate has drifted from what is actually emitted",
@@ -454,11 +284,11 @@ func TestEstimateRowSizeTracksRenderedSize(t *testing.T) {
 
 	// And it must not allocate: this runs on every value of every copied row,
 	// on top of the rendering writeChunklet does anyway.
-	assert.Zero(t, testing.AllocsPerRun(100, func() { _ = EstimateRowSize(values) }),
-		"EstimateRowSize should not allocate")
+	assert.Zero(t, testing.AllocsPerRun(100, func() { _ = utils.EstimateRenderedRowSize(values) }),
+		"EstimateRenderedRowSize should not allocate")
 }
 
-// TestEstimateRowSizeUnderestimateStaysSafe pins the safety argument behind
+// TestEstimateRenderedRowSizeUnderestimateStaysSafe pins the safety argument behind
 // three deliberate under-estimates: a []byte bound to a binary column renders
 // as 0x-hex (2 chars/byte), a string grows under escaping, and an integer is
 // assumed to be 10 digits when an int64 can render 20.
@@ -468,7 +298,7 @@ func TestEstimateRowSizeTracksRenderedSize(t *testing.T) {
 // safe is headroom: MaxStatementSizeBytes sits ~64x below a typical
 // max_allowed_packet, so even all three compounding on one pathological row
 // leaves a wide margin.
-func TestEstimateRowSizeUnderestimateStaysSafe(t *testing.T) {
+func TestEstimateRenderedRowSizeUnderestimateStaysSafe(t *testing.T) {
 	// A row built to hit every under-estimating branch at once.
 	worst := []any{
 		int64(math.MaxInt64),                       // 19 rendered, 10 estimated
@@ -476,7 +306,7 @@ func TestEstimateRowSizeUnderestimateStaysSafe(t *testing.T) {
 		[]byte("\x00\x01\x02\x03\x04\x05\x06\x07"), // hex-renders at 2x
 		`a string with "quotes" and \backslashes\ that escaping will grow`,
 	}
-	estimated := EstimateRowSize(worst)
+	estimated := utils.EstimateRenderedRowSize(worst)
 	require.Positive(t, estimated)
 
 	// Worst-case compounding is bounded by ~2x per value, so a full statement
@@ -485,12 +315,6 @@ func TestEstimateRowSizeUnderestimateStaysSafe(t *testing.T) {
 	const typicalMaxAllowedPacket = 64 * 1024 * 1024
 	assert.Less(t, MaxStatementSizeBytes*compoundingFactor, typicalMaxAllowedPacket,
 		"the byte budget no longer leaves room for the estimate to under-measure")
-
-	// And the estimate must never return zero or negative for a non-empty row,
-	// which would let splitRowsIntoChunklets build an unbounded statement.
-	for _, v := range worst {
-		assert.Positive(t, estimateValueSize(v), "value %v estimated non-positively", v)
-	}
 }
 
 // TestApplierTimeoutScope pins which writes chunkTaskTimeout bounds, for both

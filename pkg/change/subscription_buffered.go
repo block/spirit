@@ -450,7 +450,7 @@ func sizeOfQueuedChange(c queuedChange) int64 {
 // strings can double under escaping, so variable-width values are counted at
 // twice their in-memory length; scalars render as short literals. Feeds the
 // same applier.MaxStatementSizeBytes budget as the copy path's estimator
-// (pkg/applier estimateValueSize) but with the opposite bias: that one counts
+// (utils.EstimateRenderedRowSize) but with the opposite bias: that one counts
 // variable-width values at 1x and leans on the budget's ~64x headroom below
 // max_allowed_packet, while this one stays pessimistic — a flush batch cut
 // short only costs an extra statement, and the binlog path has no throughput
