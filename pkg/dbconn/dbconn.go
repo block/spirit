@@ -445,9 +445,9 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 			return result.err
 		}
 		// The kill step never ends a LOCK TABLES session, so another attempt
-		// meets the same lock and queues its exclusive metadata lock request
-		// for a full lock wait timeout again, blocking reads and writes to
-		// the table behind it for no chance of success.
+		// succeeds only if that session happens to unlock in time. Until
+		// then its exclusive metadata lock request queues for a full lock
+		// wait timeout again, blocking reads and writes to the table.
 		if errors.Is(result.killErr, ErrTableLockFound) {
 			logger.Warn("not retrying statement after lock wait timeout: an explicit table lock blocks it, and force-kill does not end LOCK TABLES sessions",
 				"attempt", attempt,
