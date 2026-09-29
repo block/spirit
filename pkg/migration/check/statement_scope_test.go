@@ -40,6 +40,7 @@ func TestStatementScopeMembership(t *testing.T) {
 		"primarykey",
 		"primarykeycollationstatement",
 		"primarykeyexists",
+		"primarykeyfloat",
 		"setReorder",
 	}, ChecksInScope(ScopeStatement))
 }

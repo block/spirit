@@ -50,8 +50,13 @@ func TestCastableTp(t *testing.T) {
 		{"datetime(6)", "datetime(6)"},
 		{"datetime(1)", "datetime(1)"},
 		{"year", "char CHARACTER SET utf8mb4"},
-		{"float", "char"},
-		{"double", "char"},
+		// FLOAT and DOUBLE compare as their exact DOUBLE value: a char cast
+		// renders a FLOAT with 6 significant digits.
+		{"float", "double"},
+		{"double", "double"},
+		{"float unsigned", "double"},
+		{"double unsigned", "double"},
+		{"float(7,4) zerofill", "double"},
 		{"json", "json"},
 		{"int(11)", "signed"},
 		{"int(11) unsigned", "unsigned"},
@@ -98,6 +103,10 @@ func TestCastExpr(t *testing.T) {
 	require.Equal(t, "CAST(`b` AS binary(16))", castExpr("b", "binary(16)", castTarget))
 	require.Equal(t, "CAST(`d` AS decimal(6,2))", castExpr("d", "decimal(6,2)", castSource))
 	require.Equal(t, "CAST(`ts` AS datetime(6))", castExpr("ts", "datetime(6)", castTarget))
+	// DOUBLE is rendered as an addition, not a CAST, which only accepts
+	// DOUBLE from MySQL 8.0.17.
+	require.Equal(t, "(`f` + 0E0)", castExpr("f", "double", castSource))
+	require.Equal(t, "(`f` + 0E0)", castExpr("f", "double", castTarget))
 }
 
 func TestChecksumCastTp(t *testing.T) {

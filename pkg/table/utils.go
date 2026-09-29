@@ -56,8 +56,12 @@ func castableTp(tp string) string {
 		//    to zero bytes, which would make the checksum blind to the column's
 		//    contents entirely.
 		return tp
-	case "float", "double": // required for MySQL 5.7
-		return "char"
+	case "float", "double", "float unsigned", "double unsigned":
+		// FLOAT and DOUBLE are compared as their exact DOUBLE value (see
+		// castExpr). CAST(... AS char) renders a FLOAT with 6 significant
+		// digits, which cannot tell 0.12345679 from 0.123457, and so hid
+		// the copier writing the 6-digit text form into the new table.
+		return "double"
 	case "json":
 		// castExpr casts json differently depending on which side of the
 		// comparison it is building; see the comment there.
@@ -225,6 +229,13 @@ const (
 // add a round-trip cast on top of that.
 func castExpr(col, castTp string, side castSide) string {
 	quotedCol := sqlescape.EscapeIdentifier(col)
+	if castTp == "double" {
+		// Adding a DOUBLE zero converts the column to DOUBLE without a CAST,
+		// which only accepts DOUBLE from MySQL 8.0.17. A FLOAT widens to its
+		// exact value, and the text form of that is distinct for every
+		// distinct FLOAT.
+		return "(" + quotedCol + " + 0E0)"
+	}
 	if castTp == "json" {
 		if side == castSource {
 			return textRoundTripCast(quotedCol)

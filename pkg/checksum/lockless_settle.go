@@ -331,10 +331,11 @@ func expectedImageCRC(ctx context.Context, sourceDB *sql.DB, chunk *table.Chunk,
 // wider type into the merge, and the checksum's cast then renders it the way
 // that wider type would be rendered rather than the way the column is.
 //
-//   - FLOAT is decoded as a float32, and database/sql widens every float to a
-//     float64 before binding. Merged with the column that is a DOUBLE, and
-//     CAST(... AS char) renders 0.1 as "0.10000000149011612" where the real row
-//     gives "0.1". Casting the parameter back to FLOAT restores the column's
+//   - FLOAT is bound as a float64 (DecodeBinlogRow widens the binlog's
+//     float32, and database/sql widens every float before binding). Merged
+//     with the column that is a DOUBLE, and a char cast (a FLOAT -> VARCHAR
+//     change) renders 0.1 as "0.10000000149011612" where the real row gives
+//     "0.1". Casting the parameter back to FLOAT restores the column's
 //     precision, so the merge is FLOAT with FLOAT.
 //   - BIT is decoded as an int64, and what the real column renders depends on
 //     the cast. A numeric cast (BIT -> BIT is cast to unsigned, BIT -> INT to
@@ -402,7 +403,7 @@ func baseColumnType(tp string) string {
 // isNumericCast reports whether a checksum cast type (see
 // table.ColumnMapping.ChecksumCastTypes) renders a number rather than bytes.
 func isNumericCast(castTp string) bool {
-	return castTp == "signed" || castTp == "unsigned" || strings.HasPrefix(castTp, "decimal")
+	return castTp == "signed" || castTp == "unsigned" || castTp == "double" || strings.HasPrefix(castTp, "decimal")
 }
 
 // bitWidth reads N out of "bit(N)". A BIT column with no width is BIT(1).
