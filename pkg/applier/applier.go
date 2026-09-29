@@ -142,18 +142,22 @@ type LogicalRow struct {
 // deleteKeysInClause renders key value tuples into the element list of a
 // `(keycols) IN (...)` clause. Values go through table.Datum so binary
 // keys are hex-encoded; a quoted non-UTF-8 literal would trip MySQL's
-// utf8mb4 warning (block/spirit#948). Single-column keys render as a bare
+// utf8mb4 warning (block/spirit#948). String keys in a charset other than
+// utf8mb4 are emitted with their charset introducer, so a latin1 key
+// matches its own row rather than the one its bytes spell in utf8mb4. Single-column keys render as a bare
 // literal, composite keys as a parenthesized tuple.
 func deleteKeysInClause(sourceTable *table.TableInfo, keys [][]any) (string, error) {
 	// Resolve each key column's type once, not per key: parsing the type
-	// string is the dominant cost of building a Datum.
+	// string is the dominant cost of building a Datum. The keys come from
+	// binlog row images, so a string key in a charset other than utf8mb4
+	// carries the column's own bytes (see TableInfo.BinlogColumnType).
 	colTypes := make([]table.ColumnType, len(sourceTable.KeyColumns))
 	for j, colName := range sourceTable.KeyColumns {
-		typeStr, ok := sourceTable.GetColumnMySQLType(colName)
-		if !ok {
-			return "", fmt.Errorf("key column %s not found in table %s", colName, sourceTable.TableName)
+		ct, err := sourceTable.BinlogColumnType(colName)
+		if err != nil {
+			return "", fmt.Errorf("key column %s: %w", colName, err)
 		}
-		colTypes[j] = table.NewColumnType(typeStr)
+		colTypes[j] = ct
 	}
 
 	pkValues := make([]string, 0, len(keys))
