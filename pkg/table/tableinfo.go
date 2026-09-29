@@ -43,7 +43,9 @@ type TableInfo struct {
 	NonGeneratedColumns         []string          // all the non-generated column names
 	Indexes                     []string          // all the index names
 	columnsMySQLTps             map[string]string // map from column name to MySQL type
+	columnCharsets              map[string]string // map from column name to the charset it carries; only present for columns that carry one whose charset is known
 	columnCollations            map[string]string // map from column name to the collation it compares under; only present for columns that carry a charset
+	unknownCharsets             map[string]bool   // columns that carry a charset the table definition does not determine
 	unknownCollations           map[string]bool   // columns that carry a charset whose collation the table definition does not determine
 	enumSetElements             map[int][]string  // parsed ENUM/SET element list, keyed by column ordinal; only present for ENUM/SET columns
 	binaryColumnWidths          map[int]int       // declared width of BINARY(N) columns, keyed by column ordinal; only present for fixed-width BINARY columns
@@ -66,9 +68,12 @@ type TableInfo struct {
 	// which only needs SELECT. Set before calling SetInfo.
 	DisableAnalyze bool
 
-	// DefaultCollation is the table's default collation, which a column
-	// declared without a charset or collation takes. Empty when it is not
-	// known, which only a table built from hand-written DDL can be.
+	// DefaultCharset and DefaultCollation are the table's default charset and
+	// collation, which a column declared without either takes. Each is empty
+	// when it is not known. Only a TableInfo built from a table definition
+	// carries them: SetInfo does not read them, so they are always empty on a
+	// TableInfo it populates.
+	DefaultCharset   string
 	DefaultCollation string
 
 	// Host is an optional identifier for the MySQL server this table belongs to.
@@ -118,17 +123,22 @@ func NewTableInfo(db *sql.DB, schema, table string) *TableInfo {
 // ColumnMeta describes one column the way a table definition declares it: the
 // column name, its information_schema `column_type` text (e.g. "enum('a','b')",
 // "varchar(100)", "int unsigned"), whether it is a generated column, and the
-// collation it compares under — information_schema's `collation_name`, empty
-// for a column that carries no charset (numeric, temporal, binary string, ...).
+// charset and collation it compares under — information_schema's
+// `character_set_name` and `collation_name`, both empty for a column that
+// carries no charset (numeric, temporal, binary string, ...). A Charset left
+// empty beside a Collation is taken from the collation, whose name leads with
+// its charset's.
 //
 // CollationUnknown marks a column that carries a charset when the definition it
 // was read from does not determine its collation. A hand-written definition can
 // leave it to the schema's or the server's default, which information_schema
-// always resolves.
+// always resolves. Charset still names the column's charset when the definition
+// determines that much, and is empty when it does not.
 type ColumnMeta struct {
 	Name             string
 	MySQLType        string
 	Generated        bool
+	Charset          string
 	Collation        string
 	CollationUnknown bool
 }
@@ -192,9 +202,6 @@ func (t *TableInfo) SetInfo(ctx context.Context) error {
 	if err := t.setColumns(ctx); err != nil {
 		return err
 	}
-	if err := t.setDefaultCollation(ctx); err != nil {
-		return err
-	}
 	if err := t.setPrimaryKey(ctx); err != nil {
 		return err
 	}
@@ -232,22 +239,6 @@ func (t *TableInfo) setRowEstimate(ctx context.Context) error {
 	return nil
 }
 
-// setDefaultCollation reads the collation a column declared without a charset
-// or collation takes, which the preflight checks need to resolve what an ALTER
-// redeclaring a column will compare under.
-func (t *TableInfo) setDefaultCollation(ctx context.Context) error {
-	var collation sql.NullString
-	err := t.db.QueryRowContext(ctx, "SELECT table_collation FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?", t.TableName).Scan(&collation)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("table %s.%s does not exist", t.SchemaName, t.TableName)
-		}
-		return fmt.Errorf("reading the default collation of %s.%s: %w", t.SchemaName, t.TableName, err)
-	}
-	t.DefaultCollation = collation.String
-	return nil
-}
-
 func (t *TableInfo) setIndexes(ctx context.Context) error {
 	rows, err := t.db.QueryContext(ctx, "SELECT DISTINCT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE table_schema=DATABASE() AND table_name=? AND index_name != 'PRIMARY'",
 		t.TableName,
@@ -275,7 +266,7 @@ func (t *TableInfo) setIndexes(ctx context.Context) error {
 }
 
 func (t *TableInfo) setColumns(ctx context.Context) error {
-	rows, err := t.db.QueryContext(ctx, "SELECT column_name, column_type, GENERATION_EXPRESSION, IFNULL(collation_name, '') FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? ORDER BY ORDINAL_POSITION",
+	rows, err := t.db.QueryContext(ctx, "SELECT column_name, column_type, GENERATION_EXPRESSION, IFNULL(character_set_name, ''), IFNULL(collation_name, '') FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? ORDER BY ORDINAL_POSITION",
 		t.TableName,
 	)
 	if err != nil {
@@ -288,11 +279,11 @@ func (t *TableInfo) setColumns(ctx context.Context) error {
 	}()
 	t.resetColumns()
 	for rows.Next() {
-		var col, tp, expression, collation string
-		if err := rows.Scan(&col, &tp, &expression, &collation); err != nil {
+		var col, tp, expression, charset, collation string
+		if err := rows.Scan(&col, &tp, &expression, &charset, &collation); err != nil {
 			return err
 		}
-		if err := t.addColumn(ColumnMeta{Name: col, MySQLType: tp, Generated: expression != "", Collation: collation}); err != nil {
+		if err := t.addColumn(ColumnMeta{Name: col, MySQLType: tp, Generated: expression != "", Charset: charset, Collation: collation}); err != nil {
 			return err
 		}
 	}
@@ -309,7 +300,9 @@ func (t *TableInfo) resetColumns() {
 	t.Columns = []string{}
 	t.NonGeneratedColumns = []string{}
 	t.columnsMySQLTps = make(map[string]string)
+	t.columnCharsets = make(map[string]string)
 	t.columnCollations = make(map[string]string)
+	t.unknownCharsets = make(map[string]bool)
 	t.unknownCollations = make(map[string]bool)
 	t.enumSetElements = nil
 	t.binaryColumnWidths = nil
@@ -323,11 +316,21 @@ func (t *TableInfo) addColumn(col ColumnMeta) error {
 	name, mysqlType := col.Name, col.MySQLType
 	t.Columns = append(t.Columns, name)
 	t.columnsMySQLTps[name] = mysqlType
+	collation := canonicalCollationName(col.Collation)
+	charset := canonicalCharsetName(col.Charset)
+	if charset == "" && collation != "" {
+		charset, _, _ = strings.Cut(collation, "_")
+	}
 	switch {
-	case col.CollationUnknown:
+	case col.CollationUnknown && charset == "":
+		t.unknownCharsets[name] = true
 		t.unknownCollations[name] = true
-	case col.Collation != "":
-		t.columnCollations[name] = canonicalCollationName(col.Collation)
+	case col.CollationUnknown:
+		t.columnCharsets[name] = charset
+		t.unknownCollations[name] = true
+	case collation != "":
+		t.columnCharsets[name] = charset
+		t.columnCollations[name] = collation
 	}
 	if !col.Generated {
 		t.NonGeneratedColumns = append(t.NonGeneratedColumns, name)
@@ -705,6 +708,21 @@ func (t *TableInfo) GetColumnCollation(col string) (collation string, ok bool) {
 	return t.columnCollations[col], true
 }
 
+// GetColumnCharset returns the charset a column carries, spelled as
+// GetColumnCollation spells collations. It is empty for a column that carries
+// no charset. ok is false when the table has no such column, or when the
+// definition the table was built from does not determine the column's charset.
+// A column's charset can be known when its collation is not.
+func (t *TableInfo) GetColumnCharset(col string) (charset string, ok bool) {
+	if _, ok := t.columnsMySQLTps[col]; !ok {
+		return "", false
+	}
+	if t.unknownCharsets[col] {
+		return "", false
+	}
+	return t.columnCharsets[col], true
+}
+
 // canonicalCollationName spells a collation the way GetColumnCollation reports
 // it. MySQL releases before 8.0.30 name the 3-byte UTF-8 collations utf8_*;
 // later ones name the same collations utf8mb3_*.
@@ -714,6 +732,16 @@ func canonicalCollationName(collation string) string {
 		return "utf8mb3_" + rest
 	}
 	return collation
+}
+
+// canonicalCharsetName is canonicalCollationName for the charset: MySQL
+// releases before 8.0.30 name the 3-byte UTF-8 charset utf8.
+func canonicalCharsetName(charset string) string {
+	charset = strings.ToLower(charset)
+	if charset == "utf8" {
+		return "utf8mb3"
+	}
+	return charset
 }
 
 // HasEnumOrSetColumns reports whether any column on this table is an

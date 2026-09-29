@@ -26,8 +26,9 @@ import (
 // SHOW CREATE TABLE. It must describe the table stmt alters. Pass an empty
 // string when it is not available: coverage then narrows to the checks that need
 // only the statement — the ENUM/SET checks, which compare a redeclared column
-// against its current type, and the missing-primary-key refusal, which reads
-// the current key definition, are skipped. The definition must also reflect
+// against its current type, the missing-primary-key refusal, which reads the
+// current key definition, and the primary key collation prediction, which
+// reads the key columns' current charsets and collations, are skipped. The definition must also reflect
 // the table's true key set: SHOW CREATE TABLE output collected with
 // show_gipk_in_create_table_and_information_schema disabled omits a generated
 // invisible primary key and misreports the table as unkeyed.

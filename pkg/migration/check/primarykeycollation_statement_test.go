@@ -135,6 +135,47 @@ func TestPrimaryKeyCollationStatementRefusal(t *testing.T) {
 	assert.False(t, refused)
 	assert.Empty(t, reason)
 
+	// A hand-written definition can name a key's charset but leave its
+	// collation to the server. A change to another charset, or to a binary
+	// or non-string type, still changes the collation, whichever one the key
+	// has now. So does giving a non-string key a character type that
+	// inherits the table's utf8mb4 default.
+	for _, tt := range []struct {
+		name, stmt, current, wantReason string
+	}{
+		{
+			name:       "a utf8mb4 key of unknown collation changed to a binary string type",
+			stmt:       "ALTER TABLE ledger MODIFY COLUMN owner_token varbinary(64) NOT NULL",
+			current:    "CREATE TABLE ledger (owner_token varchar(64) CHARACTER SET utf8mb4 NOT NULL, PRIMARY KEY (owner_token)) DEFAULT CHARSET=latin1",
+			wantReason: `changing the collation of primary key column "owner_token" is not supported`,
+		},
+		{
+			name:       "a utf8mb4 key of unknown collation changed to another charset",
+			stmt:       "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) CHARACTER SET latin1 NOT NULL",
+			current:    "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token)) DEFAULT CHARSET=utf8mb4",
+			wantReason: `changing the collation of primary key column "owner_token" is not supported`,
+		},
+		{
+			name:       "a utf8mb4 key of unknown collation converted to another charset",
+			stmt:       "ALTER TABLE ledger CONVERT TO CHARACTER SET latin1",
+			current:    "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token)) DEFAULT CHARSET=utf8mb4",
+			wantReason: "converting the table's character set changes the collation of its primary key, which is not supported",
+		},
+		{
+			name:       "an integer key given a character type under a utf8mb4 default",
+			stmt:       "ALTER TABLE orders MODIFY COLUMN id varchar(20) NOT NULL",
+			current:    "CREATE TABLE orders (id bigint NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4",
+			wantReason: `changing the collation of primary key column "id" is not supported`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused, err := StatementRefusal(t.Context(), tt.stmt, tt.current, discardLogger())
+			require.NoError(t, err)
+			require.True(t, refused)
+			assert.Contains(t, reason, tt.wantReason)
+		})
+	}
+
 	// Statements whose effect on the key's collation depends on a default the
 	// inputs do not carry are left to setup, which reads what MySQL resolved.
 	for _, tt := range []struct {
@@ -144,6 +185,21 @@ func TestPrimaryKeyCollationStatementRefusal(t *testing.T) {
 			name:    "a key whose current collation is the schema's default",
 			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) COLLATE utf8mb4_bin NOT NULL",
 			current: "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token))",
+		},
+		{
+			name:    "restating the collation of a key with no declared charset",
+			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL",
+			current: "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token))",
+		},
+		{
+			name:    "naming the charset of a key with no declared charset",
+			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) CHARACTER SET utf8mb4 NOT NULL",
+			current: "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token))",
+		},
+		{
+			name:    "a collation within the charset of a utf8mb4 key of unknown collation",
+			stmt:    "ALTER TABLE ledger MODIFY COLUMN owner_token varchar(64) COLLATE utf8mb4_bin NOT NULL",
+			current: "CREATE TABLE ledger (owner_token varchar(64) NOT NULL, PRIMARY KEY (owner_token)) DEFAULT CHARSET=utf8mb4",
 		},
 		{
 			name:    "naming utf8mb4 without a collation",

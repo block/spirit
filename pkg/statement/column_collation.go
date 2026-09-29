@@ -6,19 +6,40 @@ import (
 	"github.com/block/spirit/pkg/parser/ast"
 )
 
+// CharsetCollation is a charset and a collation of it. Collation is empty when
+// only the charset is known: a definition that names utf8mb4 without a
+// collation leaves it to the server's default_collation_for_utf8mb4.
+type CharsetCollation struct {
+	Charset, Collation string
+}
+
+// normalized spells both names the way this package compares them, and takes
+// the charset from the collation when only the collation is given: every
+// collation belongs to one charset, which its name leads with.
+func (c CharsetCollation) normalized() CharsetCollation {
+	collation := normalizeCollationName(strings.ToLower(c.Collation))
+	charset := normalizeCharsetName(strings.ToLower(c.Charset))
+	if charset == "" {
+		charset = charsetOfCollation(collation)
+	}
+	return CharsetCollation{Charset: charset, Collation: collation}
+}
+
+// collationKnown reports whether c names its collation, or carries no charset
+// and so has none.
+func (c CharsetCollation) collationKnown() bool {
+	return c.Collation != "" || c.Charset == ""
+}
+
 // ColumnCollationChange is how an ALTER TABLE changes the collation one
 // existing column compares under.
 type ColumnCollationChange struct {
-	// Before is the collation the column compares under now, and After the
-	// one it compares under once the statement applies. Either is empty when
-	// the column carries no charset at that point (numeric, temporal, binary
-	// string, ...). After is also empty when the statement names the column's
-	// charset but leaves its collation to the server; AfterCharset is set then.
-	Before, After string
-
-	// AfterCharset is the charset the column carries once the statement
-	// applies, empty when it carries none.
-	AfterCharset string
+	// Before is what the column compares under now, and After what it
+	// compares under once the statement applies. Either is the zero value
+	// when the column carries no charset at that point (numeric, temporal,
+	// binary string, ...), and either can know its charset but not its
+	// collation.
+	Before, After CharsetCollation
 
 	// DeclaredAs is the column's name as the statement spells it, or empty
 	// when the statement changes the column without naming it — a
@@ -29,36 +50,26 @@ type ColumnCollationChange struct {
 // Changed reports whether the column compares under a different collation
 // once the statement applies, so the same values may sort, and compare equal,
 // differently. Gaining or losing a collation counts: a change between a
-// character type and a binary or non-string type is one. When the server picks
-// After, only a change of charset decides it: every collation belongs to one
-// charset.
+// character type and a binary or non-string type is one. When either side's
+// collation is not known, a change of charset still decides it, since no two
+// charsets share a collation.
 func (c ColumnCollationChange) Changed() bool {
-	if c.serverPicksCollation() {
-		return charsetOfCollation(c.Before) != c.AfterCharset
+	if c.Before.collationKnown() && c.After.collationKnown() {
+		return c.Before != c.After
 	}
-	return c.Before != c.After
+	return c.Before.Charset != c.After.Charset
 }
 
-// serverPicksCollation reports whether the statement names the column's charset
-// but leaves its collation to the server.
-func (c ColumnCollationChange) serverPicksCollation() bool {
-	return c.After == "" && c.AfterCharset != ""
-}
-
-// resolveTo records what the statement leaves the column under, and reports
-// whether that decides Changed. An unknown charset decides nothing. A known
-// charset without its collation decides it only when it differs from the
-// column's current one.
-func (c ColumnCollationChange) resolveTo(charset, collation string) (ColumnCollationChange, bool) {
-	c.AfterCharset, c.After = charset, collation
-	switch {
-	case collation != "":
-		return c, true
-	case charset == "":
+// resolveTo records what the statement leaves a column that carries a charset
+// under, and reports whether that decides Changed. A charset that is not known
+// decides nothing, and a collation that is not known decides it only when the
+// charset changes.
+func (c ColumnCollationChange) resolveTo(after CharsetCollation) (ColumnCollationChange, bool) {
+	c.After = after
+	if after.Charset == "" {
 		return c, false
-	default:
-		return c, charsetOfCollation(c.Before) != charset
 	}
+	return c, (c.Before.collationKnown() && c.After.collationKnown()) || c.Before.Charset != c.After.Charset
 }
 
 // ColumnCollationChange resolves the collation column compares under once the
@@ -75,113 +86,103 @@ func (c ColumnCollationChange) resolveTo(charset, collation string) (ColumnColla
 //     changes.
 //   - Any other column keeps the collation it has.
 //
-// currentCollation is the collation the column compares under now, empty for
-// a column that carries no charset, and tableCollation the table's current
-// default collation, empty when it is not known.
+// current is what the column compares under now: the zero value for a column
+// that carries no charset, and a charset without a collation when only the
+// charset is known. A column whose charset is not known either cannot be
+// described here, and a caller must not classify it. tableDefault is the
+// table's current default, the zero value when it is not known.
 //
 // determined is false when whether the collation changes depends on a default
 // the inputs do not carry: CONVERT TO CHARACTER SET DEFAULT uses the schema's
-// default, a redeclaration that inherits the table default needs
-// tableCollation, and naming utf8mb4 without a collation takes the server's
-// default for it — which decides nothing unless the column is under another
-// charset now.
-func (a *AbstractStatement) ColumnCollationChange(column, currentCollation, tableCollation string) (change ColumnCollationChange, determined bool, err error) {
+// default, a redeclaration that inherits the table default needs tableDefault,
+// and naming utf8mb4 without a collation takes the server's default for it —
+// which decides nothing unless the column is under another charset now.
+func (a *AbstractStatement) ColumnCollationChange(column string, current, tableDefault CharsetCollation) (change ColumnCollationChange, determined bool, err error) {
 	alter, ok := a.AsAlterTable()
 	if !ok {
 		return ColumnCollationChange{}, false, ErrNotAlterTable
 	}
-	change.Before = normalizeCollationName(strings.ToLower(currentCollation))
+	change.Before = current.normalized()
 	change.After = change.Before
-	change.AfterCharset = charsetOfCollation(change.Before)
 
-	defaults, convert := alteredTableDefaults(alter, normalizeCollationName(strings.ToLower(tableCollation)))
+	defaults, convert := alteredTableDefaults(alter, tableDefault.normalized())
 
 	if colDef, spelledAs := redeclaredColumn(alter, column); colDef != nil {
 		change.DeclaredAs = spelledAs
-		ct := &CreateTable{TableOptions: defaults.tableOptions()}
+		ct := &CreateTable{TableOptions: tableOptionsFor(defaults)}
 		ct.Columns = Columns{ct.parseColumn(colDef)}
 		binaryAttributeNormalizer{}.Normalize(ct)
 		redeclared := &ct.Columns[0]
 		if !redeclared.CarriesCharset() {
-			change.After, change.AfterCharset = "", ""
+			change.After = CharsetCollation{}
 			return change, true, nil
 		}
 		if convert {
-			change, determined = change.resolveTo(defaults.charset, defaults.collation)
+			change, determined = change.resolveTo(defaults)
 			return change, determined, nil
 		}
-		change, determined = change.resolveTo(redeclared.determinedCharsetCollation(ct))
+		var after CharsetCollation
+		after.Charset, after.Collation = redeclared.determinedCharsetCollation(ct)
+		change, determined = change.resolveTo(after.normalized())
 		return change, determined, nil
 	}
 
-	if convert && change.Before != "" {
-		change, determined = change.resolveTo(defaults.charset, defaults.collation)
+	if convert && change.Before.Charset != "" {
+		change, determined = change.resolveTo(defaults)
 		return change, determined, nil
 	}
 	return change, true, nil
 }
 
-// tableDefaults is a table's default charset and collation. determined is
-// false when the collation is not known; the charset can be known without it,
-// when the statement names utf8mb4 alone.
-type tableDefaults struct {
-	charset, collation string
-	determined         bool
-}
-
-// defaultsForCollation is the table default a collation implies. Every
-// collation belongs to exactly one charset, which its name leads with.
-func defaultsForCollation(collation string) tableDefaults {
-	if collation == "" {
-		return tableDefaults{}
-	}
-	return tableDefaults{charset: charsetOfCollation(collation), collation: collation, determined: true}
-}
-
-// tableOptions renders the defaults as the options of a CREATE TABLE, so a
-// column resolved against them follows the same rules as one parsed from a
-// table definition. An unknown default is left unset, which is how a table
-// definition that does not declare one reads.
-func (d tableDefaults) tableOptions() *TableOptions {
+// tableOptionsFor renders a table default as the options of a CREATE TABLE, so
+// a column resolved against it follows the same rules as one parsed from a
+// table definition. What is not known is left unset, which is how a table
+// definition that does not declare it reads.
+func tableOptionsFor(d CharsetCollation) *TableOptions {
 	options := &TableOptions{}
-	if d.charset != "" {
-		charset := d.charset
+	if d.Charset != "" {
+		charset := d.Charset
 		options.Charset = &charset
 	}
-	if d.determined {
-		collation := d.collation
+	if d.Collation != "" {
+		collation := d.Collation
 		options.Collation = &collation
 	}
 	return options
 }
 
-// TableDefaultCollation returns the collation a column declared without a
-// charset or collation takes in this table, or "" when the definition does not
-// determine it: a hand-written definition that declares no DEFAULT CHARSET
-// inherits the schema's default, and one that declares only
-// DEFAULT CHARSET=utf8mb4 takes the server's default for it. SHOW CREATE TABLE
-// always spells the collation out.
-func (ct *CreateTable) TableDefaultCollation() string {
+// TableDefault returns the charset and collation a column declared without
+// either takes in this table. The collation is empty when the definition does
+// not determine it — DEFAULT CHARSET=utf8mb4 alone takes the server's default
+// for it — and both are empty when the definition declares no default at all,
+// which leaves it to the schema. SHOW CREATE TABLE always spells both out.
+func (ct *CreateTable) TableDefault() CharsetCollation {
+	var d CharsetCollation
 	if collation := ct.TableOptions.getCollation(); collation != nil {
-		return normalizeCollationName(strings.ToLower(*collation))
+		d.Collation = *collation
 	}
-	if charset := ct.TableOptions.getCharset(); charset != nil && charsetDefaultCollationIsFixed(*charset) {
-		if _, collation, ok := DefaultCollationForCharset(*charset); ok {
-			return collation
+	if charset := ct.TableOptions.getCharset(); charset != nil {
+		d.Charset = *charset
+	}
+	d = d.normalized()
+	if d.Collation == "" && charsetDefaultCollationIsFixed(d.Charset) {
+		if _, collation, ok := DefaultCollationForCharset(d.Charset); ok {
+			d.Collation = collation
 		}
 	}
-	return ""
+	return d
 }
 
 // alteredTableDefaults returns the table's default charset and collation as
 // the ALTER leaves them, and whether it converts the existing columns to that
-// default (CONVERT TO CHARACTER SET). tableCollation is the current default,
-// empty when it is not known.
+// default (CONVERT TO CHARACTER SET). current is the default now, normalized,
+// the zero value when it is not known. The result's collation is empty when
+// it is not known, and its charset too when neither is.
 //
 // MySQL resolves the table options of a statement together, so the order they
 // are written in does not matter: an explicit collation wins, and a charset
 // written without one selects that charset's default collation.
-func alteredTableDefaults(alter *ast.AlterTableStmt, tableCollation string) (defaults tableDefaults, convert bool) {
+func alteredTableDefaults(alter *ast.AlterTableStmt, current CharsetCollation) (defaults CharsetCollation, convert bool) {
 	var charset, collation string
 	charsetIsSchemaDefault := false
 	for _, spec := range alter.Specs {
@@ -208,20 +209,20 @@ func alteredTableDefaults(alter *ast.AlterTableStmt, tableCollation string) (def
 	}
 	switch {
 	case collation != "":
-		return defaultsForCollation(collation), convert
+		return CharsetCollation{Collation: collation}.normalized(), convert
 	case charsetIsSchemaDefault:
-		return tableDefaults{}, convert
+		return CharsetCollation{}, convert
 	case charset != "":
 		if !charsetDefaultCollationIsFixed(charset) {
-			return tableDefaults{charset: normalizeCharsetName(charset)}, convert
+			return CharsetCollation{Charset: charset}.normalized(), convert
 		}
 		cs, def, ok := DefaultCollationForCharset(charset)
 		if !ok {
-			return tableDefaults{}, convert
+			return CharsetCollation{}, convert
 		}
-		return tableDefaults{charset: cs, collation: def, determined: true}, convert
+		return CharsetCollation{Charset: cs, Collation: def}, convert
 	default:
-		return defaultsForCollation(tableCollation), convert
+		return current, convert
 	}
 }
 

@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestDiscoveryCollations reads the collation each column compares under, and
-// the table's default, from a live table. Only columns that carry a charset
-// have a collation; every other column reports an empty one.
+// TestDiscoveryCollations reads the charset and collation each column compares
+// under from a live table. Only columns that carry a charset have them; every
+// other column reports both empty.
 func TestDiscoveryCollations(t *testing.T) {
 	testutils.RunSQL(t, `DROP TABLE IF EXISTS discoverycollationt1`)
 	testutils.RunSQL(t, `CREATE TABLE discoverycollationt1 (
@@ -32,20 +32,26 @@ func TestDiscoveryCollations(t *testing.T) {
 	t1 := NewTableInfo(db, "test", "discoverycollationt1")
 	require.NoError(t, t1.SetInfo(t.Context()))
 
-	assert.Equal(t, "utf8mb4_0900_ai_ci", t1.DefaultCollation)
-	for column, want := range map[string]string{
-		"token":  "utf8mb4_0900_ai_ci",
-		"code":   "utf8mb4_bin",
-		"raw":    "",
-		"legacy": "latin1_swedish_ci",
-		"amount": "",
+	for column, want := range map[string][2]string{
+		"token":  {"utf8mb4", "utf8mb4_0900_ai_ci"},
+		"code":   {"utf8mb4", "utf8mb4_bin"},
+		"raw":    {"", ""},
+		"legacy": {"latin1", "latin1_swedish_ci"},
+		"amount": {"", ""},
 	} {
+		charset, ok := t1.GetColumnCharset(column)
+		assert.True(t, ok, column)
+		assert.Equal(t, want[0], charset, column)
 		collation, ok := t1.GetColumnCollation(column)
 		assert.True(t, ok, column)
-		assert.Equal(t, want, collation, column)
+		assert.Equal(t, want[1], collation, column)
 	}
 	_, ok := t1.GetColumnCollation("missing")
 	assert.False(t, ok)
+	_, ok = t1.GetColumnCharset("missing")
+	assert.False(t, ok)
+	assert.Empty(t, t1.DefaultCharset, "SetInfo does not read the table's defaults")
+	assert.Empty(t, t1.DefaultCollation, "SetInfo does not read the table's defaults")
 }
 
 // TestNewTableInfoFromMetaCollations builds the same collation metadata from
@@ -56,7 +62,8 @@ func TestNewTableInfoFromMetaCollations(t *testing.T) {
 		{Name: "token", MySQLType: "varchar(64)", Collation: "UTF8MB4_BIN"},
 		{Name: "amount", MySQLType: "bigint"},
 		{Name: "legacy", MySQLType: "varchar(10)", Collation: "utf8_general_ci"},
-		{Name: "note", MySQLType: "varchar(100)", CollationUnknown: true},
+		{Name: "note", MySQLType: "varchar(100)", Charset: "UTF8MB4", CollationUnknown: true},
+		{Name: "memo", MySQLType: "varchar(100)", CollationUnknown: true},
 	}, []string{"token"})
 	require.NoError(t, err)
 
@@ -71,5 +78,21 @@ func TestNewTableInfoFromMetaCollations(t *testing.T) {
 	assert.Equal(t, "utf8mb3_general_ci", collation, "MySQL releases before 8.0.30 spell utf8mb3 collations utf8_")
 	_, ok = ti.GetColumnCollation("note")
 	assert.False(t, ok, "a collation the definition does not determine is not reported as no collation")
+	_, ok = ti.GetColumnCollation("memo")
+	assert.False(t, ok)
+
+	for column, want := range map[string]string{
+		"token":  "utf8mb4",
+		"amount": "",
+		"legacy": "utf8mb3",
+		"note":   "utf8mb4",
+	} {
+		charset, ok := ti.GetColumnCharset(column)
+		assert.True(t, ok, column)
+		assert.Equal(t, want, charset, "%s: a charset is taken from the collation when only the collation is given", column)
+	}
+	_, ok = ti.GetColumnCharset("memo")
+	assert.False(t, ok, "a charset the definition does not determine is not reported as no charset")
+	assert.Empty(t, ti.DefaultCharset, "a table built from column definitions has no default until the caller sets one")
 	assert.Empty(t, ti.DefaultCollation, "a table built from column definitions has no default until the caller sets one")
 }
