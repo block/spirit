@@ -2,6 +2,7 @@ package copier
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -538,4 +539,68 @@ func TestBufferedCopierReadWorkerScaling(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM readscalesrc").Scan(&srcRows))
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM readscaledst").Scan(&dstRows))
 	require.Equal(t, srcRows, dstRows)
+}
+
+// TestBufferedCopierCancelWhileThrottled cancels the copy while every read
+// worker is parked in throttler.BlockWait. Run must report the cancellation
+// (its cause) rather than returning nil: a nil return is indistinguishable
+// from a completed copy, so callers would record the copy as successful and
+// only notice the cancellation in a later step.
+func TestBufferedCopierCancelWhileThrottled(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS cancelthrottledsrc, cancelthrottleddst")
+	testutils.RunSQL(t, "CREATE TABLE cancelthrottledsrc (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARBINARY(64) NOT NULL)")
+	testutils.RunSQL(t, "CREATE TABLE cancelthrottleddst (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARBINARY(64) NOT NULL)")
+	testutils.RunSQL(t, "INSERT INTO cancelthrottledsrc (pad) VALUES (RANDOM_BYTES(64)), (RANDOM_BYTES(64)), (RANDOM_BYTES(64))")
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	t1 := table.NewTableInfo(db, "test", "cancelthrottledsrc")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "cancelthrottleddst")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	// The gate is never opened: every reader stays parked in BlockWait until
+	// the context is cancelled.
+	gate := &gateThrottler{allow: make(chan struct{}), open: make(chan struct{})}
+	cfg := NewCopierDefaultConfig()
+	cfg.Concurrency = 2
+	cfg.Throttler = gate
+	cfg.Applier, err = applier.New([]applier.Target{{DB: db}}, applier.NewApplierDefaultConfig())
+	require.NoError(t, err)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
+		NewTable:        t2,
+		TargetChunkTime: time.Second,
+		Logger:          cfg.Logger,
+	})
+	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
+
+	copier, err := NewCopier(chunker, cfg)
+	require.NoError(t, err)
+	b := copier.(*buffered)
+
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- b.Run(ctx)
+	}()
+
+	// Wait for the whole pool to be parked at the gate.
+	require.Eventually(t, func() bool {
+		return b.ActiveReadWorkers() == 2
+	}, 10*time.Second, 10*time.Millisecond)
+
+	errAbort := errors.New("copy aborted by test")
+	cancel(errAbort)
+
+	select {
+	case err := <-runErr:
+		require.ErrorIs(t, err, errAbort)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	require.False(t, chunker.IsRead(), "no chunk should have been claimed while throttled")
 }
