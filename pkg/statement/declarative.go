@@ -4,10 +4,8 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
-	"github.com/block/spirit/pkg/parser/format"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -129,19 +127,4 @@ func diffTable(name, currentSchema, desiredSchema string, opts *DiffOptions) (st
 		return nil, fmt.Errorf("failed to diff table %q: %w", name, diffErr)
 	}
 	return diffs, nil
-}
-
-// ToTableSchema converts a parsed CreateTable back to a table.TableSchema
-// by restoring the AST to SQL. This is useful when callers have already parsed
-// schemas (e.g. for linting) but need to pass them to DeclarativeToImperative.
-func (ct *CreateTable) ToTableSchema() (table.TableSchema, error) {
-	var sb strings.Builder
-	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-	if err := ct.Raw.Restore(rCtx); err != nil {
-		return table.TableSchema{}, fmt.Errorf("failed to restore CREATE TABLE for %q: %w", ct.TableName, err)
-	}
-	return table.TableSchema{
-		Name:   ct.TableName,
-		Schema: sb.String(),
-	}, nil
 }

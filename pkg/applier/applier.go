@@ -44,7 +44,7 @@ const (
 )
 
 // chunkTaskTimeout bounds one copy-path write (a chunklet INSERT), retries
-// included, in both appliers. A var only so tests can shorten it.
+// included. A var only so tests can shorten it.
 //
 // It deliberately does not bound DeleteKeys or UpsertRows. Those run the
 // change feed's flushes, and pkg/change relies on no spirit-owned deadline
@@ -57,11 +57,11 @@ var chunkTaskTimeout = time.Second * 60
 
 // Target represents a shard target with its database connection, configuration, and key range.
 // Key ranges are expressed as Vitess-style strings (e.g., "-80", "80-", "80-c0").
-// An empty string or "0" means all key space (unsharded).
+// An empty string, "0" or "-" means all key space (unsharded).
 type Target struct {
 	DB       *sql.DB
 	Config   *mysql.Config
-	KeyRange string // Vitess-style key range: "-80", "80-", "80-c0", or "0" for unsharded
+	KeyRange string // Vitess-style key range: "-80", "80-", "80-c0"; "", "0" or "-" for unsharded
 }
 
 // ApplyCallback is invoked when rows have been safely flushed to the target(s).
@@ -70,8 +70,8 @@ type Target struct {
 type ApplyCallback func(affectedRows int64, err error)
 
 // Applier is an interface for applying rows to one or more target databases.
-// Implementations can apply to a single target (SingleTargetApplier) or fan out to
-// multiple targets based on a hash function (ShardedApplier).
+// MySQLApplier is the implementation: it writes to a single target, or fans out
+// to multiple targets based on a hash function.
 //
 // The Applier is responsible for:
 // - Batching/splitting rows into optimal write sizes
@@ -102,13 +102,11 @@ type Applier interface {
 	// sourceTable.KeyColumns order.
 	// An empty locks slice means no under-lock flush: the delete runs on the
 	// regular write connection(s). When locks is non-empty, the delete is
-	// executed under the supplied table lock(s):
-	//   - Single-target implementations accept zero or one lock. Zero means no
-	//     under-lock flush; more than one lock is a caller bug and is an error.
-	//   - Multi-target (sharded) implementations expect one lock per target,
-	//     each acquired on that target's own connection, and execute each
-	//     target's statements under that target's lock (matched by connection
-	//     identity). A missing lock for any shard is an error.
+	// executed under the supplied table lock(s): one lock per target, each
+	// acquired on that target's own connection (the same *sql.DB as
+	// Target.DB). Each target's statements run under that target's lock,
+	// matched by connection identity. A missing lock for any target, or a lock
+	// that matches no target, is an error.
 	// Returns the number of rows affected and any error.
 	DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error)
 
@@ -116,8 +114,7 @@ type Applier interface {
 	// The rows are LogicalRow structs containing the row images.
 	// An empty locks slice means no under-lock flush; when locks is non-empty
 	// the upsert is executed under the supplied table lock(s). See DeleteKeys
-	// for the per-implementation lock contract (single-target accepts zero or
-	// one lock; sharded expects one lock per shard).
+	// for the lock contract (one lock per target).
 	// Returns the number of rows affected and any error.
 	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error)
 
@@ -129,8 +126,6 @@ type Applier interface {
 
 	// GetTargets returns target information for direct database access.
 	// This is used by operations like checksum that need to query targets directly.
-	// For SingleTargetApplier, this returns a single target.
-	// For ShardedApplier, this returns all shards.
 	GetTargets() []Target
 }
 

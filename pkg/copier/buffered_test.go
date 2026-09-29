@@ -38,7 +38,7 @@ func TestBufferedCopier(t *testing.T) {
 		DB:       db,
 		KeyRange: "0",
 	}
-	cfg.Applier, err = applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	cfg.Applier, err = applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
@@ -96,7 +96,7 @@ func TestBufferedCopierCharsetConversion(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
-	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
+	cfg.Applier, err = applier.New([]applier.Target{{DB: db}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
@@ -152,7 +152,7 @@ func TestBufferedCopierDataTypeConversionError(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
-	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
+	cfg.Applier, err = applier.New([]applier.Target{{DB: db}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	// Absurdly tiny chunk-time target (10ns) so the chunker creates many
 	// small chunks.
@@ -236,8 +236,8 @@ func TestBufferedCopierChunkTimingIncludesCallbackDelay(t *testing.T) {
 	stubApplier := &delayedCallbackApplier{delay: callbackDelay}
 
 	// Create the real applier
-	realApplier, err := applier.NewSingleTargetApplier(
-		applier.Target{DB: db, KeyRange: "0"},
+	realApplier, err := applier.New(
+		[]applier.Target{{DB: db, KeyRange: "0"}},
 		applier.NewApplierDefaultConfig(),
 	)
 	require.NoError(t, err)
@@ -375,7 +375,7 @@ func TestBufferedCopierGeometry(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	cfg := NewCopierDefaultConfig()
-	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
+	cfg.Applier, err = applier.New([]applier.Target{{DB: db}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
 		NewTable:        t2,
@@ -456,7 +456,7 @@ func TestBufferedCopierReadWorkerScaling(t *testing.T) {
 	cfg := NewCopierDefaultConfig()
 	cfg.Concurrency = 4
 	cfg.Throttler = gate
-	cfg.Applier, err = applier.NewSingleTargetApplier(applier.Target{DB: db}, applier.NewApplierDefaultConfig())
+	cfg.Applier, err = applier.New([]applier.Target{{DB: db}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
 		NewTable:         t2,

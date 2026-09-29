@@ -562,7 +562,7 @@ func TestPeriodicFlushPrioritizesParkedSubscription(t *testing.T) {
 	defer utils.CloseAndLog(db)
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	realApplier, err := applier.NewSingleTargetApplier(applier.Target{DB: db, KeyRange: "0", Config: cfg}, applier.NewApplierDefaultConfig())
+	realApplier, err := applier.New([]applier.Target{{DB: db, KeyRange: "0", Config: cfg}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	rec := &orderRecordingApplier{Applier: realApplier}
 	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, rec, NewClientDefaultConfig()).(*binlogClient)

@@ -556,10 +556,10 @@ func TestApplierTimeoutScope(t *testing.T) {
 		new  func() (Applier, error)
 	}{
 		{"single", func() (Applier, error) {
-			return NewSingleTargetApplier(Target{DB: targetDB}, NewApplierDefaultConfig())
+			return New([]Target{{DB: targetDB}}, NewApplierDefaultConfig())
 		}},
 		{"sharded", func() (Applier, error) {
-			return NewShardedApplier([]Target{{DB: targetDB, KeyRange: "-"}}, NewApplierDefaultConfig())
+			return New([]Target{{DB: targetDB, KeyRange: "-"}}, NewApplierDefaultConfig())
 		}},
 	}
 	for _, tc := range appliers {

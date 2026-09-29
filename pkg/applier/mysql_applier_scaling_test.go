@@ -35,7 +35,7 @@ func TestShardedApplierScaling(t *testing.T) {
 	chunk := &table.Chunk{Table: src, NewTable: dst, ColumnMapping: table.NewColumnMapping(src, dst, nil)}
 	cfg := NewApplierDefaultConfig()
 	cfg.Threads = 2
-	a, err := NewShardedApplier([]Target{{DB: target1, KeyRange: "-80"}, {DB: target2, KeyRange: "80-"}}, cfg)
+	a, err := New([]Target{{DB: target1, KeyRange: "-80"}, {DB: target2, KeyRange: "80-"}}, cfg)
 	require.NoError(t, err)
 	a.SetWriteWorkers(8) // Before Start is harmless.
 	require.Zero(t, a.Stats().ActiveWorkers)

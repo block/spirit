@@ -231,7 +231,7 @@ func TestReplicationClientTLSConfig(t *testing.T) {
 			defer utils.CloseAndLog(db)
 
 			// Create replication client
-			appl, err := applier.NewSingleTargetApplier(applier.Target{DB: db}, &applier.ApplierConfig{
+			appl, err := applier.New([]applier.Target{{DB: db}}, &applier.ApplierConfig{
 				Logger:   slog.Default(),
 				DBConfig: tlsConfig,
 				Threads:  1,

@@ -18,7 +18,7 @@ type CharsetCollation struct {
 // collation belongs to one charset, which its name leads with.
 func (c CharsetCollation) normalized() CharsetCollation {
 	collation := normalizeCollationName(strings.ToLower(c.Collation))
-	charset := normalizeCharsetName(strings.ToLower(c.Charset))
+	charset := NormalizeCharsetName(c.Charset)
 	if charset == "" {
 		charset = charsetOfCollation(collation)
 	}
@@ -72,68 +72,6 @@ func (c ColumnCollationChange) resolveTo(after CharsetCollation) (ColumnCollatio
 	return c, (c.Before.collationKnown() && c.After.collationKnown()) || c.Before.Charset != c.After.Charset
 }
 
-// ColumnCollationChange resolves the collation column compares under once the
-// ALTER TABLE applies, following MySQL's rules:
-//
-//   - CONVERT TO CHARACTER SET re-collates every column that carries a
-//     charset once the statement applies, overriding a collation the same
-//     statement declares on the column.
-//   - A MODIFY or CHANGE COLUMN resolves the redeclared definition the way a
-//     CREATE TABLE would, against the table's defaults as the statement
-//     leaves them. A redeclaration that omits COLLATE therefore drops a
-//     collation the column declared explicitly, and one that omits both
-//     CHARACTER SET and COLLATE picks up a default the same statement
-//     changes.
-//   - Any other column keeps the collation it has.
-//
-// current is what the column compares under now: the zero value for a column
-// that carries no charset, and a charset without a collation when only the
-// charset is known. A column whose charset is not known either cannot be
-// described here, and a caller must not classify it. tableDefault is the
-// table's current default, the zero value when it is not known.
-//
-// determined is false when whether the collation changes depends on a default
-// the inputs do not carry: CONVERT TO CHARACTER SET DEFAULT uses the schema's
-// default, a redeclaration that inherits the table default needs tableDefault,
-// and naming utf8mb4 without a collation takes the server's default for it —
-// which decides nothing unless the column is under another charset now.
-func (a *AbstractStatement) ColumnCollationChange(column string, current, tableDefault CharsetCollation) (change ColumnCollationChange, determined bool, err error) {
-	alter, ok := a.AsAlterTable()
-	if !ok {
-		return ColumnCollationChange{}, false, ErrNotAlterTable
-	}
-	change.Before = current.normalized()
-	change.After = change.Before
-
-	defaults, convert := alteredTableDefaults(alter, tableDefault.normalized())
-
-	if colDef, spelledAs := redeclaredColumn(alter, column); colDef != nil {
-		change.DeclaredAs = spelledAs
-		ct := &CreateTable{TableOptions: tableOptionsFor(defaults)}
-		ct.Columns = Columns{ct.parseColumn(colDef)}
-		binaryAttributeNormalizer{}.Normalize(ct)
-		redeclared := &ct.Columns[0]
-		if !redeclared.CarriesCharset() {
-			change.After = CharsetCollation{}
-			return change, true, nil
-		}
-		if convert {
-			change, determined = change.resolveTo(defaults)
-			return change, determined, nil
-		}
-		var after CharsetCollation
-		after.Charset, after.Collation = redeclared.determinedCharsetCollation(ct)
-		change, determined = change.resolveTo(after.normalized())
-		return change, determined, nil
-	}
-
-	if convert && change.Before.Charset != "" {
-		change, determined = change.resolveTo(defaults)
-		return change, determined, nil
-	}
-	return change, true, nil
-}
-
 // tableOptionsFor renders a table default as the options of a CREATE TABLE, so
 // a column resolved against it follows the same rules as one parsed from a
 // table definition. What is not known is left unset, which is how a table
@@ -149,28 +87,6 @@ func tableOptionsFor(d CharsetCollation) *TableOptions {
 		options.Collation = &collation
 	}
 	return options
-}
-
-// TableDefault returns the charset and collation a column declared without
-// either takes in this table. The collation is empty when the definition does
-// not determine it — DEFAULT CHARSET=utf8mb4 alone takes the server's default
-// for it — and both are empty when the definition declares no default at all,
-// which leaves it to the schema. SHOW CREATE TABLE always spells both out.
-func (ct *CreateTable) TableDefault() CharsetCollation {
-	var d CharsetCollation
-	if collation := ct.TableOptions.getCollation(); collation != nil {
-		d.Collation = *collation
-	}
-	if charset := ct.TableOptions.getCharset(); charset != nil {
-		d.Charset = *charset
-	}
-	d = d.normalized()
-	if d.Collation == "" && charsetDefaultCollationIsFixed(d.Charset) {
-		if _, collation, ok := DefaultCollationForCharset(d.Charset); ok {
-			d.Collation = collation
-		}
-	}
-	return d
 }
 
 // alteredTableDefaults returns the table's default charset and collation as

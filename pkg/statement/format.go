@@ -9,7 +9,7 @@ import (
 
 // This file holds the helpers that render parsed schema elements back into the
 // SQL fragments used to build ALTER TABLE clauses. They are free functions; the
-// CreateTable receivers that assemble the statements live in diff.go.
+// CreateTable receivers that assemble the statements live in create_table.go.
 
 // formatColumnType renders a column's data type for emission in an ALTER TABLE
 // clause: the type name with its length/precision/element list, followed by the

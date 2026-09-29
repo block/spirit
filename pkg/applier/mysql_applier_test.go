@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSingleTargetApplierBasic tests basic functionality of SingleTargetApplier
+// TestSingleTargetApplierBasic tests basic functionality of single-target MySQLApplier
 func TestSingleTargetApplierBasic(t *testing.T) {
 	// Setup test databases
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS single_source")
@@ -70,7 +70,7 @@ func TestSingleTargetApplierBasic(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Start the applier
@@ -203,7 +203,7 @@ func TestSingleTargetApplierEmptyRows(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	err = applier.Start(t.Context())
@@ -262,7 +262,7 @@ func TestSingleTargetApplierLargeDataset(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	err = applier.Start(t.Context())
@@ -338,7 +338,7 @@ func TestSingleTargetApplierConcurrentApplies(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	err = applier.Start(t.Context())
@@ -452,7 +452,7 @@ func TestSingleTargetApplierDeleteKeys(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Delete keys 2 and 4
@@ -535,7 +535,7 @@ func TestSingleTargetApplierDeleteKeysSeparatorInValues(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	keysToDelete := [][]any{
@@ -605,7 +605,7 @@ func TestSingleTargetApplierDeleteKeysEmpty(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Delete with empty keys
@@ -647,7 +647,7 @@ func TestSingleTargetApplierUpsertRows(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Upsert rows: update id=1, insert id=3
@@ -733,7 +733,7 @@ func TestSingleTargetApplierUpsertRowsEmptyBlob(t *testing.T) {
 	targetTable := table.NewTableInfo(targetDB, target.DBName, "transfers")
 	require.NoError(t, targetTable.SetInfo(t.Context()))
 
-	applier, err := NewSingleTargetApplier(Target{DB: targetDB, Config: target, KeyRange: "0"}, NewApplierDefaultConfig())
+	applier, err := New([]Target{{DB: targetDB, Config: target, KeyRange: "0"}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// The application updates only `state`; the binlog row images still carry
@@ -823,7 +823,7 @@ func TestSingleTargetApplierUpsertRowsWithGeneratedColumns(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// RowImage has all columns including the generated one (position 2),
@@ -874,7 +874,7 @@ func TestSingleTargetApplierUpsertRowsSkipDeleted(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Upsert with deleted rows mixed in
@@ -931,7 +931,7 @@ func TestSingleTargetApplierUpsertRowsEmpty(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Upsert with empty rows
@@ -967,7 +967,7 @@ func TestSingleTargetApplierContextCancellation(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Create a cancellable context
@@ -1079,7 +1079,7 @@ func TestSingleTargetApplierCancelCallbackRace(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cfg := NewApplierDefaultConfig()
 		cfg.Threads = 1 // slow consumption so Apply stays blocked mid-send
-		applier, err := NewSingleTargetApplier(Target{DB: targetDB, Config: target}, cfg)
+		applier, err := New([]Target{{DB: targetDB, Config: target}}, cfg)
 		require.NoError(t, err)
 		require.NoError(t, applier.Start(ctx))
 
@@ -1146,7 +1146,7 @@ func TestSingleTargetApplierWaitTimeout(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	err = applier.Start(t.Context())
@@ -1206,7 +1206,7 @@ func TestSingleTargetApplierStartClose(t *testing.T) {
 		Config:   target,
 		KeyRange: "0",
 	}
-	applier, err := NewSingleTargetApplier(tar, NewApplierDefaultConfig())
+	applier, err := New([]Target{tar}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Start the applier
@@ -1274,7 +1274,7 @@ func TestSingleTargetApplierDynamicScaling(t *testing.T) {
 	tar := Target{DB: targetDB, Config: target, KeyRange: "0"}
 	cfg := NewApplierDefaultConfig()
 	cfg.Threads = 2 // start value
-	appl, err := NewSingleTargetApplier(tar, cfg)
+	appl, err := New([]Target{tar}, cfg)
 	require.NoError(t, err)
 
 	require.NoError(t, appl.Start(t.Context()))
@@ -1329,11 +1329,12 @@ func TestSingleTargetApplierDynamicScaling(t *testing.T) {
 	require.Equal(t, 2000, count)
 }
 
-// TestSingleTargetApplierUnderLock verifies the under-lock write path:
-// with one lock the statements execute on the lock's own connection, and
-// supplying more than one lock is rejected (the single-target applier
-// writes through exactly one server, so multiple locks indicate a caller
-// bug such as per-shard locks being passed to the wrong applier).
+// TestSingleTargetApplierUnderLock verifies the under-lock write path with
+// one target: with one lock the statements execute on the lock's own
+// connection. Two locks, or a lock acquired on a connection other than the
+// target's, are rejected before anything executes: the applier writes through
+// exactly one server, so either indicates a caller bug such as a lock taken on
+// the wrong server.
 func TestSingleTargetApplierUnderLock(t *testing.T) {
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS test_pr4_single_lock")
 	testutils.RunSQL(t, "CREATE DATABASE test_pr4_single_lock")
@@ -1356,7 +1357,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	targetTable := table.NewTableInfo(targetDB, target.DBName, "test_table")
 	require.NoError(t, targetTable.SetInfo(ctx))
 
-	applier, err := NewSingleTargetApplier(Target{DB: targetDB, Config: target, KeyRange: "0"}, NewApplierDefaultConfig())
+	applier, err := New([]Target{{DB: targetDB, Config: target, KeyRange: "0"}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	lock, err := dbconn.NewTableLock(ctx, targetDB, []*table.TableInfo{targetTable}, dbconn.NewDBConfig(), slog.Default())
@@ -1365,10 +1366,10 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	// More than one lock must be rejected before executing anything.
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
 		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock, lock})
-	require.ErrorContains(t, err, "at most one table lock")
+	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
 		[][]any{{int64(1)}}, []*dbconn.TableLock{lock, lock})
-	require.ErrorContains(t, err, "at most one table lock")
+	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 
 	// A single lock executes on the lock connection.
 	affected, err := applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
@@ -1380,6 +1381,22 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, lock.Close(ctx))
+
+	// A lock taken through a different *sql.DB is rejected too, even though it
+	// points at the same server: the applier matches locks to targets by
+	// connection identity, so it cannot tell this lock belongs to its target.
+	otherDB, err := sql.Open("block-mysql", target.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(otherDB)
+	otherLock, err := dbconn.NewTableLock(ctx, otherDB, []*table.TableInfo{targetTable}, dbconn.NewDBConfig(), slog.Default())
+	require.NoError(t, err)
+	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
+		[]LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []*dbconn.TableLock{otherLock})
+	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
+	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
+		[][]any{{int64(1)}}, []*dbconn.TableLock{otherLock})
+	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
+	require.NoError(t, otherLock.Close(ctx))
 
 	var ids []int64
 	rows, err := targetDB.QueryContext(ctx, "SELECT id FROM test_table ORDER BY id")
@@ -1399,7 +1416,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 // cannot wedge Wait() forever. invokeCallback must balance the counter on every
 // exit path, not just normal return.
 func TestSingleTargetApplierCallbackPanicDecrements(t *testing.T) {
-	a := &SingleTargetApplier{
+	a := &MySQLApplier{
 		logger:      slog.New(slog.DiscardHandler),
 		pendingWork: make(map[int64]*pendingWork),
 	}
@@ -1439,9 +1456,11 @@ func TestSingleTargetApplierCallbackPanicDecrements(t *testing.T) {
 // still nil, so spawning a worker would panic on its first writeChunklet
 // (ctx.Err()). It must spawn nothing rather than panic.
 func TestSingleTargetApplierSetWriteWorkersBeforeStart(t *testing.T) {
-	a := &SingleTargetApplier{
-		logger: slog.New(slog.DiscardHandler),
-	}
+	a, err := New([]Target{{DB: &sql.DB{}}}, &ApplierConfig{
+		Logger:   slog.New(slog.DiscardHandler),
+		DBConfig: dbconn.NewDBConfig(),
+	})
+	require.NoError(t, err)
 	require.NotPanics(t, func() { a.SetWriteWorkers(4) })
 	require.Equal(t, 0, a.ActiveWriteWorkers(), "no workers should be spawned before Start")
 }
@@ -1449,7 +1468,7 @@ func TestSingleTargetApplierSetWriteWorkersBeforeStart(t *testing.T) {
 func TestInitialWriteWorkersOnStartAndRestart(t *testing.T) {
 	cfg := NewApplierDefaultConfig()
 	cfg.Threads = 16
-	a, err := NewSingleTargetApplier(Target{DB: &sql.DB{}}, cfg)
+	a, err := New([]Target{{DB: &sql.DB{}}}, cfg)
 	require.NoError(t, err)
 	for _, n := range []int{2, 3} {
 		a.SetInitialWriteWorkers(n)
@@ -1460,4 +1479,155 @@ func TestInitialWriteWorkersOnStartAndRestart(t *testing.T) {
 		require.Equal(t, n, a.ActiveWriteWorkers())
 		require.NoError(t, a.Stop())
 	}
+}
+
+// TestNewTargetValidation covers the constructor's topology rules: at least
+// one target, and a single target skips routing only when its key range is
+// the whole key space. A single target that owns part of the key space still
+// routes, so a row outside its range fails instead of silently landing there.
+func TestNewTargetValidation(t *testing.T) {
+	_, err := New(nil, NewApplierDefaultConfig())
+	require.ErrorContains(t, err, "at least one target")
+
+	for _, kr := range []string{"", "0", "-"} {
+		a, err := New([]Target{{DB: &sql.DB{}, KeyRange: kr}}, NewApplierDefaultConfig())
+		require.NoError(t, err, "key range %q", kr)
+		require.True(t, a.unsharded, "key range %q covers the whole key space", kr)
+	}
+
+	// An open upper range is unbounded but does not start at zero, so it is
+	// not the whole key space either.
+	a, err := New([]Target{{DB: &sql.DB{}, KeyRange: "80-"}}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+	require.False(t, a.unsharded)
+
+	a, err = New([]Target{{DB: &sql.DB{}, KeyRange: "-80"}}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+	require.False(t, a.unsharded)
+
+	// No ShardingColumn configured: a partial-range target must refuse to
+	// guess, on both the copy path and the change-feed path. Both fail before
+	// any statement is sent, so the placeholder *sql.DB is never used.
+	tbl := table.NewTableInfo(nil, "test", "t1")
+	tbl.Columns = []string{"id", "name"}
+	tbl.NonGeneratedColumns = []string{"id", "name"}
+	chunk := &table.Chunk{Table: tbl, NewTable: tbl, ColumnMapping: table.NewColumnMapping(tbl, tbl, nil)}
+	err = a.Apply(t.Context(), chunk, [][]any{{int64(1), "a"}}, func(int64, error) {})
+	require.ErrorContains(t, err, "ShardingColumn not configured")
+	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []LogicalRow{{RowImage: []any{int64(1), "a"}}}, nil)
+	require.ErrorContains(t, err, "ShardingColumn not configured")
+}
+
+// TestUnderLockRejectsNilLock verifies that a nil entry in locks is refused on
+// both under-lock paths, rather than dereferenced inside the cutover flush.
+func TestUnderLockRejectsNilLock(t *testing.T) {
+	a, err := New([]Target{{DB: &sql.DB{}}}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+	tbl := table.NewTableInfo(nil, "test", "t1")
+	tbl.Columns = []string{"id"}
+	tbl.KeyColumns = []string{"id"}
+	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
+		[]LogicalRow{{RowImage: []any{int64(1)}}}, []*dbconn.TableLock{nil})
+	require.ErrorContains(t, err, "table lock 0 is nil")
+	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []*dbconn.TableLock{nil})
+	require.ErrorContains(t, err, "table lock 0 is nil")
+}
+
+// TestSingleTargetPartialRangeRejectsUnownedRow verifies that a single target
+// that owns only part of the key space refuses a row it does not own, on the
+// copy path and the change-feed path, rather than write it or drop it.
+func TestSingleTargetPartialRangeRejectsUnownedRow(t *testing.T) {
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS test_partial_range")
+	testutils.RunSQL(t, "CREATE DATABASE test_partial_range")
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.DBName = "test_partial_range"
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE t1 (id BIGINT PRIMARY KEY, name VARCHAR(10))")
+	require.NoError(t, err)
+	tbl := table.NewTableInfo(db, cfg.DBName, "t1")
+	require.NoError(t, tbl.SetInfo(t.Context()))
+	tbl.ShardingColumn = "id"
+	tbl.HashFunc = testutils.EvenOddHasher // even -> "-80", odd -> "80-"
+
+	a, err := New([]Target{{DB: db, Config: cfg, KeyRange: "-80"}}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+	require.NoError(t, a.Start(t.Context()))
+	defer func() { require.NoError(t, a.Stop()) }()
+
+	chunk := &table.Chunk{Table: tbl, NewTable: tbl, ColumnMapping: table.NewColumnMapping(tbl, tbl, nil)}
+	var called atomic.Bool
+	err = a.Apply(t.Context(), chunk, [][]any{{int64(2), "own"}, {int64(1), "unowned"}}, func(int64, error) { called.Store(true) })
+	require.ErrorContains(t, err, "no shard found")
+	require.NoError(t, a.Wait(t.Context()))
+	require.False(t, called.Load(), "a rejected Apply must not report the chunk as written")
+
+	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []LogicalRow{{RowImage: []any{int64(3), "unowned"}}}, nil)
+	require.ErrorContains(t, err, "no shard found")
+
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 0, n)
+}
+
+// TestUnderLockSharedConnection verifies that shards which share one *sql.DB
+// also share the one table lock taken on it, and that a second lock on that
+// connection is refused as ambiguous.
+func TestUnderLockSharedConnection(t *testing.T) {
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS test_shared_conn_lock")
+	testutils.RunSQL(t, "CREATE DATABASE test_shared_conn_lock")
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.DBName = "test_shared_conn_lock"
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx := t.Context()
+	_, err = db.ExecContext(ctx, "CREATE TABLE t1 (id BIGINT PRIMARY KEY, name VARCHAR(10))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO t1 VALUES (1, 'a'), (2, 'b')")
+	require.NoError(t, err)
+	tbl := table.NewTableInfo(db, cfg.DBName, "t1")
+	require.NoError(t, tbl.SetInfo(ctx))
+	tbl.ShardingColumn = "id"
+	tbl.HashFunc = testutils.EvenOddHasher
+
+	a, err := New([]Target{
+		{DB: db, Config: cfg, KeyRange: "-80"},
+		{DB: db, Config: cfg, KeyRange: "80-"},
+	}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+
+	lock, err := dbconn.NewTableLock(ctx, db, []*table.TableInfo{tbl}, dbconn.NewDBConfig(), slog.Default())
+	require.NoError(t, err)
+	defer utils.CloseAndLogWithContext(ctx, lock)
+	mapping := table.NewColumnMapping(tbl, tbl, nil)
+
+	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{{RowImage: []any{int64(3), "c"}}}, []*dbconn.TableLock{lock, lock})
+	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
+
+	// One lock covers both shards: an even row routes to shard 0, an odd row
+	// to shard 1, and the delete broadcasts to both.
+	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{
+		{RowImage: []any{int64(3), "c"}},
+		{RowImage: []any{int64(4), "d"}},
+	}, []*dbconn.TableLock{lock})
+	require.NoError(t, err)
+	_, err = a.DeleteKeys(ctx, tbl, tbl, [][]any{{int64(1)}}, []*dbconn.TableLock{lock})
+	require.NoError(t, err)
+	require.NoError(t, lock.Close(ctx))
+
+	var ids []int64
+	rows, err := db.QueryContext(ctx, "SELECT id FROM t1 ORDER BY id")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var id int64
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []int64{2, 3, 4}, ids)
 }

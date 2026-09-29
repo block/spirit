@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// columnsEqualWithContext (in diff.go) field-by-field compares the parsed
+// columnsEqualWithContext (in create_table.go) field-by-field compares the parsed
 // Column struct to decide whether a column differs between the source and
 // target schema. If a newly added Column field is NOT wired into that
 // comparison, two columns that differ only in that field are silently treated
@@ -57,7 +57,7 @@ var columnFieldsNotCompared = map[string]string{
 	// explicitly. It is currently NOT compared by either columnsEqual function.
 	// If you start populating Options with semantically meaningful data, it must
 	// be added to both comparisons and removed from this list.
-	"Options": "catch-all map for unmodeled options; currently not compared by diff.go",
+	"Options": "catch-all map for unmodeled options; currently not compared by Diff",
 	// Column-level UNIQUE is representation, not state: MySQL canonicalizes it
 	// into a table-level UNIQUE KEY, and MODIFY COLUMN cannot express it. It is
 	// materialized into a table-level index by indexNormalizer and diffed by
@@ -72,7 +72,7 @@ var columnFieldsNotCompared = map[string]string{
 // decides how the comparison logic should treat it.
 //
 // IF THIS FAILS BECAUSE A FIELD WAS ADDED TO Column:
-// update columnsEqualWithContext in diff.go (plus columnExtendedAttributesEqual
+// update columnsEqualWithContext in create_table.go (plus columnExtendedAttributesEqual
 // for extended attributes) to compare the new field, then add it to
 // columnFieldsCompared. If the new field is intentionally NOT part of column
 // equality (like Raw / Check / Options), add it to columnFieldsNotCompared with
@@ -94,7 +94,7 @@ func TestColumnsEqualAllFieldsAccounted(t *testing.T) {
 			"Column field %q is listed as both compared and not-compared; fix this guard", name)
 		require.True(t, compared || notCompared,
 			"Column field %q is not accounted for. Wire it into BOTH columnsEqual functions "+
-				"in diff.go and add it to columnFieldsCompared, or add it to "+
+				"in create_table.go and add it to columnFieldsCompared, or add it to "+
 				"columnFieldsNotCompared with a reason.", name)
 	}
 
@@ -217,7 +217,7 @@ func TestColumnsEqualWithContextDetectsEveryField(t *testing.T) {
 			m.mutate(&tgt)
 			require.False(t, ct.columnsEqualWithContext(&src, &tgt, target, opts),
 				"columnsEqualWithContext must return false when %s differs; "+
-					"if you added field %s, make sure diff.go compares it", m.name, m.name)
+					"if you added field %s, make sure columnsEqualWithContext compares it", m.name, m.name)
 		})
 	}
 }

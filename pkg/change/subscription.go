@@ -46,7 +46,7 @@ type Subscription interface {
 	// image of an UPDATE, or -1 when no such column is configured.
 	//
 	// This backs the sharded applier's vindex contract (see
-	// applier.ShardedApplier.UpsertRows): modifications are tracked by
+	// applier.MySQLApplier.UpsertRows): modifications are tracked by
 	// PRIMARY KEY only, so an UPDATE that changed the sharding column
 	// would flush the new row image to its new shard while the old shard
 	// silently kept a stale copy. The change source is expected to treat

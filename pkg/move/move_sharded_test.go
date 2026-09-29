@@ -351,7 +351,7 @@ func TestNtoMShardedMoveCheckpointDeterminism(t *testing.T) {
 }
 
 // TestShardedMoveVindexUpdateFails verifies the end-to-end wiring of the
-// sharding-column immutability contract (see applier.ShardedApplier.UpsertRows
+// sharding-column immutability contract (see applier.MySQLApplier.UpsertRows
 // and change.Subscription.ImmutableColumnOrdinal): changes are tracked by
 // PRIMARY KEY only, so an UPDATE that changes a row's vindex value mid-move
 // must fail the whole move — otherwise the new row image would land on its

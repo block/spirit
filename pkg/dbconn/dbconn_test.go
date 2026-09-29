@@ -228,7 +228,7 @@ func TestIsLockContentionError(t *testing.T) {
 	require.True(t, IsLockContentionError(&mysql.MySQLError{Number: 1213})) // deadlock
 
 	// Wrapped variants must also be detected. This is the shape the real caller
-	// sees: flushBatch wraps single_target.go's upsert, which wraps the error
+	// sees: flushBatch wraps mysql_applier.go's upsert, which wraps the error
 	// RetryableTransaction returned bare after exhausting MaxRetries. If any
 	// link in that chain is ever changed to %v, the contention path goes
 	// silently inert, so pin the depth the production chain actually has.

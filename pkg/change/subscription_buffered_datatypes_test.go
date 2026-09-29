@@ -287,7 +287,7 @@ func startBufferedSubscriptionFor(t *testing.T, srcTable, dstTable *table.TableI
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	appl, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	appl, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, appl, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})

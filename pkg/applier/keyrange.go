@@ -1,7 +1,6 @@
 package applier
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -42,11 +41,13 @@ func parseKeyRangeBound(side, bound string) (uint64, error) {
 
 // parseKeyRange parses a Vitess-style key range string into a keyRange struct.
 // Examples: "-80" -> [0, 0x80...], "80-" -> [0x80..., 0xff...], "80-c0" -> [0x80..., 0xc0...]
+//
+// "", "0" and "-" all mean the whole key space. "0" is the Vitess name of the
+// only shard of an unsharded keyspace; "" is what a caller with a single,
+// unsharded target leaves unset.
 func parseKeyRange(kr string) (keyRange, error) {
-	if kr == "" {
-		// We don't support empty key ranges right now to simplify testing.
-		// Although this could be interpreted as an unsharded/full key range.
-		return keyRange{}, errors.New("key range cannot be empty string")
+	if kr == "" || kr == "0" {
+		return keyRange{unbounded: true}, nil
 	}
 	parts := strings.Split(kr, "-")
 	if len(parts) != 2 {
@@ -88,6 +89,11 @@ func (kr keyRange) contains(hash uint64) bool {
 	return hash >= kr.start && (kr.unbounded || hash < kr.end)
 }
 
+// coversAll reports whether the range is the whole key space.
+func (kr keyRange) coversAll() bool {
+	return kr.start == 0 && kr.unbounded
+}
+
 // String renders the parsed range for logs and errors.
 func (kr keyRange) String() string {
 	if kr.unbounded {
@@ -96,8 +102,18 @@ func (kr keyRange) String() string {
 	return fmt.Sprintf("[0x%016x, 0x%016x)", kr.start, kr.end)
 }
 
+// IsFullKeyRange reports whether kr is a valid Vitess-style key range that
+// covers the whole key space ("", "0", "-", "0-"). A one-target applier with
+// such a range writes every row without routing; any other range routes, so
+// rows outside it are refused. Callers that write one logical target use this
+// to reject a partial range before setup.
+func IsFullKeyRange(kr string) bool {
+	parsed, err := parseKeyRange(kr)
+	return err == nil && parsed.coversAll()
+}
+
 // ValidateKeyRanges parses each Vitess-style key range and checks that no two
-// overlap — the same rules NewShardedApplier enforces at construction. It
+// overlap — the same rules New enforces at construction. It
 // exists so callers can fail fast on a bad shard layout before doing any work
 // (e.g. move validates reverse-window source key ranges before the copy, since
 // the sharded reverse applier is only constructed after the forward cutover).

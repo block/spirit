@@ -1326,6 +1326,12 @@ func TestSyncValidate(t *testing.T) {
 			wantErr: "--write-threads must be non-negative, got -1"},
 		{name: "negative flush-interval", s: Sync{FlushInterval: -time.Minute},
 			wantErr: "--flush-interval must be non-negative, got -1m0s"},
+		{name: "full-range target", s: Sync{Target: &applier.Target{KeyRange: "0"}}},
+		{name: "empty-range target", s: Sync{Target: &applier.Target{KeyRange: ""}}},
+		{name: "partial-range target", s: Sync{Target: &applier.Target{KeyRange: "-80"}},
+			wantErr: `target key range "-80" does not cover the whole key space: sync writes one logical target, so use "", "0" or "-"`},
+		{name: "malformed-range target", s: Sync{Target: &applier.Target{KeyRange: "zz"}},
+			wantErr: `target key range "zz" does not cover the whole key space: sync writes one logical target, so use "", "0" or "-"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

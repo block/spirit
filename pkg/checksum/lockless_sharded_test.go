@@ -19,7 +19,7 @@ import (
 
 // shardedFixture is N source schemas and M target schemas on the test server,
 // each holding table t1, wired the way pkg/move wires them: one feed and one
-// chunker per source, a MultiChunker over the chunkers, and one ShardedApplier
+// chunker per source, a MultiChunker over the chunkers, and one sharded MySQLApplier
 // routing even ids to the first target and odd ids to the last.
 type shardedFixture struct {
 	sources, targets []*sql.DB
@@ -61,7 +61,7 @@ func newShardedFixture(t *testing.T, sourceSQL, targetSQL []string) *shardedFixt
 		f.targets = append(f.targets, db)
 		targets = append(targets, applier.Target{DB: db, KeyRange: ranges[i], Config: dbCfg})
 	}
-	app, err := applier.NewShardedApplier(targets, applier.NewApplierDefaultConfig())
+	app, err := applier.New(targets, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	f.applier = app
 
@@ -216,7 +216,7 @@ func sharedTargetHandleFixture(t *testing.T, targetRows string) *shardedFixture 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	require.NoError(t, f.targets[0].QueryRowContext(t.Context(), "SELECT DATABASE()").Scan(&cfg.DBName))
-	f.applier, err = applier.NewShardedApplier([]applier.Target{
+	f.applier, err = applier.New([]applier.Target{
 		{DB: f.targets[0], KeyRange: "-80", Config: cfg},
 		{DB: f.targets[0], KeyRange: "80-", Config: cfg},
 	}, applier.NewApplierDefaultConfig())

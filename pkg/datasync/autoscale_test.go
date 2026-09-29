@@ -168,7 +168,7 @@ func TestSyncAutoscaleInjectedApplierResume(t *testing.T) {
 	for attempt := range 2 {
 		cfg := applier.NewApplierDefaultConfig()
 		cfg.Threads = 16 // GAP's injected pool starts at an unrelated fixed count.
-		a, err := applier.NewSingleTargetApplier(target, cfg)
+		a, err := applier.New([]applier.Target{target}, cfg)
 		require.NoError(t, err)
 		r, err := NewRunner(&Sync{SourceDSN: testutils.DSNForDatabase(sourceName), TargetDSN: targetConfig.FormatDSN(), Target: &target, Applier: a, FlushInterval: 10 * time.Millisecond})
 		require.NoError(t, err)
@@ -194,7 +194,7 @@ func TestSyncAutoscaleInjectedApplierResume(t *testing.T) {
 }
 
 func TestInjectedApplierMustUseMonitoredTarget(t *testing.T) {
-	a, err := applier.NewSingleTargetApplier(applier.Target{DB: &sql.DB{}}, applier.NewApplierDefaultConfig())
+	a, err := applier.New([]applier.Target{{DB: &sql.DB{}}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	r, err := NewRunner(&Sync{Threads: 3, WriteThreads: 5, EnableExperimentalAutoscaling: true, Applier: a})
 	require.NoError(t, err)

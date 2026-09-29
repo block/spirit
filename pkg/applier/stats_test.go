@@ -155,7 +155,7 @@ func TestSingleTargetApplierStatsFresh(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	a, err := NewSingleTargetApplier(Target{DB: db, Config: base, KeyRange: "0"}, NewApplierDefaultConfig())
+	a, err := New([]Target{{DB: db, Config: base, KeyRange: "0"}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	stats := a.Stats()
@@ -205,7 +205,7 @@ func TestSingleTargetApplierStatsQueueDepth(t *testing.T) {
 	targetTable := table.NewTableInfo(targetDB, target.DBName, "t1")
 	require.NoError(t, targetTable.SetInfo(t.Context()))
 
-	a, err := NewSingleTargetApplier(Target{DB: targetDB, Config: target, KeyRange: "0"}, NewApplierDefaultConfig())
+	a, err := New([]Target{{DB: targetDB, Config: target, KeyRange: "0"}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 	// Deliberately NOT started: no worker drains the buffer, so enqueued
 	// chunklets stay visible.
@@ -294,7 +294,7 @@ func TestSingleTargetApplierStatsRoundTrip(t *testing.T) {
 	targetTable := table.NewTableInfo(targetDB, target.DBName, "t1")
 	require.NoError(t, targetTable.SetInfo(t.Context()))
 
-	a, err := NewSingleTargetApplier(Target{DB: targetDB, Config: target, KeyRange: "0"}, NewApplierDefaultConfig())
+	a, err := New([]Target{{DB: targetDB, Config: target, KeyRange: "0"}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 	require.NoError(t, a.Start(t.Context()))
 	defer func() {
@@ -363,7 +363,7 @@ func TestSplitCounterCountsAtSplitTime(t *testing.T) {
 	tbl := table.NewTableInfo(targetDB, target.DBName, "t1")
 	require.NoError(t, tbl.SetInfo(t.Context()))
 
-	a, err := NewSingleTargetApplier(Target{DB: targetDB, Config: target, KeyRange: "0"}, NewApplierDefaultConfig())
+	a, err := New([]Target{{DB: targetDB, Config: target, KeyRange: "0"}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 	// Deliberately NOT started, so nothing has been written.
 

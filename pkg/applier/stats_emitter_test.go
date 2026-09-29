@@ -152,7 +152,7 @@ func TestSingleTargetApplierEmitsStats(t *testing.T) {
 	sink := &captureSink{}
 	cfg := NewApplierDefaultConfig()
 	cfg.MetricsSink = sink
-	a, err := NewSingleTargetApplier(Target{DB: db, Config: base, KeyRange: "0"}, cfg)
+	a, err := New([]Target{{DB: db, Config: base, KeyRange: "0"}}, cfg)
 	require.NoError(t, err)
 	require.NoError(t, a.Start(t.Context()))
 
@@ -167,7 +167,7 @@ func TestSingleTargetApplierEmitsStats(t *testing.T) {
 	require.Equal(t, n, sink.count(), "emitter still sending after Stop")
 }
 
-// TestShardedApplierEmitsStats is the ShardedApplier counterpart: one
+// TestShardedApplierEmitsStats is the sharded MySQLApplier counterpart: one
 // aggregated emitter, started with the applier and joined on Stop.
 func TestShardedApplierEmitsStats(t *testing.T) {
 	shortenStatsTick(t)
@@ -184,7 +184,7 @@ func TestShardedApplierEmitsStats(t *testing.T) {
 	sink := &captureSink{}
 	cfg := NewApplierDefaultConfig()
 	cfg.MetricsSink = sink
-	a, err := NewShardedApplier([]Target{
+	a, err := New([]Target{
 		{DB: db1, KeyRange: "-80"},
 		{DB: db2, KeyRange: "80-"},
 	}, cfg)
@@ -211,7 +211,7 @@ func TestNilSinkStartsNoEmitter(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	a, err := NewSingleTargetApplier(Target{DB: db, Config: base, KeyRange: "0"}, NewApplierDefaultConfig())
+	a, err := New([]Target{{DB: db, Config: base, KeyRange: "0"}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 	require.NoError(t, a.Start(t.Context()))
 	time.Sleep(30 * time.Millisecond) // several ticks' worth

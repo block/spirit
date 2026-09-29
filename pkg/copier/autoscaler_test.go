@@ -45,7 +45,7 @@ func (u *utilThrottler) BlockWait(context.Context)       {}
 func (u *utilThrottler) UpdateLag(context.Context) error { return nil }
 
 // fakeScalingApplier satisfies applier.Applier (embedded, never called) plus
-// the writeScaler capability, mimicking the SingleTargetApplier for gate tests.
+// the writeScaler capability, mimicking the single-target MySQLApplier for gate tests.
 type fakeScalingApplier struct {
 	applier.Applier
 	fakeScaler
@@ -641,7 +641,7 @@ func (g *gatedUtilThrottler) BlockWait(ctx context.Context) {
 }
 
 // TestAutoScalerIntegrationEngaged runs the autoscaler for real: a buffered
-// copy of a real table through a real SingleTargetApplier, with the
+// copy of a real table through a real single-target MySQLApplier, with the
 // autoscaler goroutine (run/tick on a ticker) driving the dual control law
 // from a test-controlled utilization signal. The gated throttler parks the
 // readers, so the applier queue stays empty (read-starved): under low
@@ -683,7 +683,7 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 
 	applierCfg := applier.NewApplierDefaultConfig()
 	applierCfg.Threads = start
-	app, err := applier.NewSingleTargetApplier(applier.Target{DB: db, KeyRange: "0"}, applierCfg)
+	app, err := applier.New([]applier.Target{{DB: db, KeyRange: "0"}}, applierCfg)
 	require.NoError(t, err)
 
 	gated := &gatedUtilThrottler{gate: make(chan struct{})}
@@ -765,7 +765,7 @@ func TestAutoScalerIntegrationEngaged(t *testing.T) {
 // composite signal and controller so the maximum (not an average) drives both
 // normal shedding and panic, then allows recovery once every host is quiet.
 func TestAutoScalerBusiestTarget(t *testing.T) {
-	var _ writeScaler = (*applier.ShardedApplier)(nil)
+	var _ writeScaler = (*applier.MySQLApplier)(nil)
 	quiet, busy := &utilThrottler{}, &utilThrottler{}
 	quiet.setUtil(0.1)
 	busy.setUtil(1.2)
@@ -816,7 +816,7 @@ func TestWriteAutoscalerLifecycle(t *testing.T) {
 	tt := testutils.NewTestTable(t, "write_autoscaler_lifecycle", "CREATE TABLE write_autoscaler_lifecycle (id INT PRIMARY KEY)")
 	cfg := applier.NewApplierDefaultConfig()
 	cfg.Threads = 16
-	a, err := applier.NewSingleTargetApplier(applier.Target{DB: tt.DB}, cfg)
+	a, err := applier.New([]applier.Target{{DB: tt.DB}}, cfg)
 	require.NoError(t, err)
 	logger := slog.New(slog.DiscardHandler)
 	signal := &utilThrottler{}

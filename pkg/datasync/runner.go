@@ -14,6 +14,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/checksum"
@@ -730,7 +731,7 @@ func (r *Runner) setup(ctx context.Context) error {
 	r.progMu.Lock()
 	r.applier = appl
 	if r.autoscale.Enabled {
-		if a, ok := appl.(*applier.SingleTargetApplier); ok {
+		if a, ok := appl.(*applier.MySQLApplier); ok {
 			a.SetInitialWriteWorkers(r.autoscale.StartThreads)
 		}
 	}
@@ -805,6 +806,133 @@ func (r *Runner) setup(ctx context.Context) error {
 	return r.startFresh(ctx)
 }
 
+// setupThrottling builds the target's Aurora load throttlers — the same
+// commit-latency and threads throttlers migration builds on its source — and
+// publishes them as the load signal. It runs whether or not autoscaling is
+// enabled: the copy pauses on an overloaded target and the change feed narrows
+// its flush either way. Autoscaling then reads the same probe result, so the
+// signal it scales against is the one throttling the sync.
+func (r *Runner) setupThrottling(ctx context.Context) error {
+	// Only the single target we monitor may be throttled or scaled. A
+	// custom/sharded applier could write elsewhere, where this signal would
+	// offer no protection and would pause the sync for unrelated load.
+	if injected := r.sync.Applier; injected != nil {
+		a, ok := injected.(*applier.MySQLApplier)
+		if !ok || len(a.GetTargets()) != 1 || a.GetTargets()[0].DB != r.target.DB {
+			if r.sync.EnableExperimentalAutoscaling {
+				r.logger.Warn("sync autoscaling disabled: injected applier must use the monitored single target")
+			}
+			return nil
+		}
+	}
+	if r.target.Config == nil {
+		if r.sync.EnableExperimentalAutoscaling {
+			r.logger.Warn("sync autoscaling disabled: target connection config unavailable")
+		}
+		return nil
+	}
+	result, err := r.buildAurora(ctx, throttler.AuroraSetup{
+		Source: r.target.DB,
+		OpenMonitor: func() (*sql.DB, error) {
+			cfg := *r.targetDBConfig
+			cfg.MaxOpenConnections = 2
+			return dbconn.NewWithConnectionType(r.target.Config.FormatDSN(), &cfg, "sync target monitor")
+		},
+		CommitLatencyThreshold: r.sync.MaxCommitLatency,
+		Logger:                 r.logger,
+	})
+	if err != nil {
+		return err
+	}
+	return r.applyAuroraResult(ctx, result)
+}
+
+// applyAuroraResult publishes the target's load signal and then sizes
+// autoscaling from the same result. It takes ownership of the result's
+// throttlers and monitor pool, including on failure.
+func (r *Runner) applyAuroraResult(ctx context.Context, result throttler.AuroraResult) error {
+	if err := r.openLoadSignal(ctx, result); err != nil {
+		return err
+	}
+	return r.setupAutoscaling(ctx, result)
+}
+
+// openLoadSignal takes ownership of the new monitor, including on failure.
+func (r *Runner) openLoadSignal(ctx context.Context, result throttler.AuroraResult) error {
+	if len(result.Throttlers) == 0 {
+		return nil
+	}
+	signal := throttler.NewMultiThrottler(result.Throttlers...)
+	if err := signal.Open(ctx); err != nil {
+		_ = signal.Close()
+		if result.MonitorDB != nil {
+			_ = result.MonitorDB.Close()
+		}
+		return err
+	}
+	r.progMu.Lock()
+	r.loadSignal = signal
+	r.progMu.Unlock()
+	r.monitorDB = result.MonitorDB
+	return nil
+}
+
+// setupAutoscaling derives thread counts from the target when autoscaling is
+// enabled and the target provides a load signal. result is the probe that
+// built that signal.
+func (r *Runner) setupAutoscaling(ctx context.Context, result throttler.AuroraResult) error {
+	if !r.sync.EnableExperimentalAutoscaling {
+		return nil
+	}
+	switch {
+	case result.ProbeErr != nil:
+		r.logger.Warn("sync autoscaling disabled: target detection failed", "error", result.ProbeErr)
+		return nil
+	case len(result.Throttlers) == 0:
+		r.logger.Info("sync autoscaling disabled: target is not Aurora")
+		return nil
+	}
+	vcpus, err := r.auroraVCPUs(ctx, r.target.DB)
+	if err != nil {
+		return fmt.Errorf("sync target CPU capacity: %w", err)
+	}
+	readStart, config := syncAutoscaleBounds(vcpus, autoscale.ClientCeiling(), r.sync.MaxConnections, result.RedoAware, r.sync.MaxCommitLatency > 0)
+	if !config.Enabled {
+		r.logger.Info("sync autoscaling disabled: target too small", "vcpus", vcpus)
+		return nil
+	}
+	r.engageAutoscaling(readStart, config)
+	r.flushConcurrency, r.flushBatchSize = syncFlushBounds(vcpus, autoscale.ClientCeiling())
+	return nil
+}
+
+// engageAutoscaling hands the thread counts to the controllers. The load
+// signal must already be open (openLoadSignal).
+func (r *Runner) engageAutoscaling(readStart int, config copier.AutoscaleConfig) {
+	r.autoscale = config
+	r.sync.Threads, r.sync.WriteThreads = readStart, config.StartThreads
+	r.logger.Info("sync autoscaling engaged; configured thread counts overridden",
+		"threads", readStart, "max_read_threads", config.MaxReadThreads,
+		"write_threads", config.StartThreads, "max_write_threads", config.MaxThreads)
+}
+
+func (r *Runner) currentLoadSignal() throttler.Throttler {
+	r.progMu.RLock()
+	defer r.progMu.RUnlock()
+	if r.loadSignal == nil {
+		return &throttler.Noop{}
+	}
+	return r.loadSignal
+}
+
+// TargetUnderLoad is safe before and during Run. Injected change sources can
+// use it as their ClientConfig.UnderLoad callback, matching the built-in feed's
+// adaptive flush control. Synchronous replication writes do not use the
+// applier worker queue, so resizing that queue alone cannot control flushes.
+func (r *Runner) TargetUnderLoad() bool {
+	return throttler.GradualOnly(r.currentLoadSignal()).IsThrottled()
+}
+
 // getTables discovers all tables in the source schema. Sync operates on a
 // whole schema at a time. Each table's metadata is populated via SetInfo.
 func (r *Runner) getTables(ctx context.Context) ([]*table.TableInfo, error) {
@@ -864,7 +992,7 @@ func (r *Runner) checkTargetEmpty(ctx context.Context) error {
 }
 
 // createApplier returns the caller-injected applier, or constructs a
-// MySQL SingleTargetApplier for the target. The applier is not started
+// single-target MySQLApplier for the target. The applier is not started
 // here — the copier starts its async workers for the initial copy and
 // stops them when it finishes; the subscription flush path uses the
 // applier's synchronous UpsertRows/DeleteKeys, which do not require the
@@ -874,13 +1002,13 @@ func (r *Runner) createApplier() (applier.Applier, error) {
 		r.logger.Info("Using caller-provided applier")
 		return r.sync.Applier, nil
 	}
-	appl, err := applier.NewSingleTargetApplier(r.target, &applier.ApplierConfig{
+	appl, err := applier.New([]applier.Target{r.target}, &applier.ApplierConfig{
 		DBConfig: r.targetDBConfig,
 		Logger:   r.logger,
 		Threads:  r.sync.WriteThreads,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create SingleTargetApplier: %w", err)
+		return nil, fmt.Errorf("failed to create applier: %w", err)
 	}
 	return appl, nil
 }
@@ -1726,6 +1854,14 @@ func (r *Runner) Progress() status.Progress {
 		Copy:         copyProgress,
 		Throttle:     r.throttleStatus(state),
 	}
+}
+
+func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
+	if state != status.CopyRows && state != status.ApplyChangeset {
+		return status.ThrottleStatus{}
+	}
+	paused, reason, util := throttler.Describe(r.currentLoadSignal())
+	return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
 }
 
 // Status returns the periodic human-readable report for logging: a header line

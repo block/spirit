@@ -130,41 +130,6 @@ func resolvePartitionIndexes(ctx context.Context, sourceTable, newTable *table.T
 	return out, nil
 }
 
-// partitionIndexes returns the resolved candidates, resolving them on first
-// use. A failure is cached as "no candidates": the query is against
-// information_schema on the same connection the drain is about to use, so if it
-// fails the drain has bigger problems, and partitioning is an optimization that
-// must never be the reason a flush fails.
-func (s *bufferedMap) partitionIndexes(ctx context.Context) []partitionIndex {
-	s.partitioner.once.Do(func() {
-		candidates, err := resolvePartitionIndexes(ctx, s.table, s.newTable)
-		if err != nil {
-			s.logger.Warn("could not read unique indexes for flush partitioning; flush batches will be partitioned by primary key only",
-				"table", s.table.SchemaName+"."+s.table.TableName,
-				"error", err.Error())
-			return
-		}
-		s.partitioner.candidates = candidates
-		switch len(candidates) {
-		case 0:
-			// Not a warning. No unique secondary index means there is no
-			// conflict surface to partition: the clustered index takes record
-			// locks without gaps, so PK-disjoint batches already cannot collide.
-			s.logger.Debug("flush partitioning inactive: no usable unique secondary index",
-				"table", s.table.SchemaName+"."+s.table.TableName)
-		default:
-			names := make([]string, len(candidates))
-			for i, c := range candidates {
-				names[i] = c.name
-			}
-			s.logger.Info("flush partitioning enabled: batches will be cut into contiguous ranges of a unique secondary index",
-				"table", s.table.SchemaName+"."+s.table.TableName,
-				"candidate_indexes", names)
-		}
-	})
-	return s.partitioner.candidates
-}
-
 // drainRow is one snapshot entry with its map key, so the sort can carry both.
 type drainRow struct {
 	key    string

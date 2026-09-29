@@ -66,7 +66,7 @@ func TestBufferedMapSwapPairFlushesViaReplace(t *testing.T) {
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	client := &binlogClient{
@@ -176,7 +176,7 @@ func TestSwapPairEndToEndViaReplace(t *testing.T) {
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applierInstance, NewClientDefaultConfig()).(*binlogClient)

@@ -903,8 +903,8 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 	//
 	// The same applier is handed to the copier, so the copy and the binlog
 	// replay share one write pipeline.
-	appl, err := applier.NewSingleTargetApplier(
-		applier.Target{DB: r.db},
+	appl, err := applier.New(
+		[]applier.Target{{DB: r.db}},
 		&applier.ApplierConfig{
 			Logger:      r.logger,
 			DBConfig:    r.dbConfig,

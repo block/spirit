@@ -12,7 +12,7 @@
 // The source is either a built-in MySQL binlog client (constructed from
 // SourceDSN) or a caller-injected change.Source — e.g. a Vitess /
 // PlanetScale VStream. The target is written through an applier; today
-// that is a MySQL SingleTargetApplier, but the applier abstraction is
+// that is a single-target MySQLApplier, but the applier abstraction is
 // what makes the sync heterogeneous: a future Postgres applier would
 // let this sync MySQL → Postgres without changing the runner.
 //
@@ -102,7 +102,7 @@ type Sync struct {
 
 	// Applier optionally provides a pre-constructed applier.Applier. When
 	// set, the runner uses this instead of constructing a MySQL
-	// SingleTargetApplier from the target. Required when Source is set: the
+	// single-target MySQLApplier from the target. Required when Source is set: the
 	// injected change.Source needs the same applier instance the copier
 	// uses, so all writes flow through one logical apply path.
 	Applier applier.Applier `kong:"-"`
@@ -127,6 +127,12 @@ func (s *Sync) Validate() error {
 	}
 	if s.FlushInterval < 0 {
 		return fmt.Errorf("--flush-interval must be non-negative, got %s", s.FlushInterval)
+	}
+	// Sync writes one logical target. A partial key range would make the
+	// applier route rows and refuse every row outside it on the first write,
+	// long after setup; reject it here instead.
+	if s.Target != nil && !applier.IsFullKeyRange(s.Target.KeyRange) {
+		return fmt.Errorf("target key range %q does not cover the whole key space: sync writes one logical target, so use \"\", \"0\" or \"-\"", s.Target.KeyRange)
 	}
 	// Continuous sync has no cutover or pinned checksum snapshots, so it
 	// only needs the general limit validation, not finite-run headroom.

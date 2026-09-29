@@ -1,6 +1,7 @@
 package change
 
 import (
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -18,7 +19,7 @@ import (
 // (binlog or gtid) subscribed to srcName -> dstName tables, starts it,
 // and registers cleanup. Used to exercise the FlushUnderTableLock error
 // branches identically for both implementations.
-func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName string) (Source, *table.TableInfo, *table.TableInfo) {
+func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName string) (Source, *sql.DB, *table.TableInfo, *table.TableInfo) {
 	t.Helper()
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
@@ -47,7 +48,7 @@ func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName s
 	require.NoError(t, client.AddSubscription(t1, t2, chunker))
 	require.NoError(t, client.Start(t.Context()))
 	t.Cleanup(client.Close)
-	return client, t1, t2
+	return client, db, t1, t2
 }
 
 // runFlushUnderTableLockErrorBranches covers the two uncovered error
@@ -61,7 +62,7 @@ func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName s
 //     target table before flushing, so the subscription's REPLACE fails.
 func runFlushUnderTableLockErrorBranches(t *testing.T, useGTID bool, srcName, dstName string) {
 	t.Helper()
-	client, t1, _ := newStartedClientForFlushTest(t, useGTID, srcName, dstName)
+	client, db, t1, _ := newStartedClientForFlushTest(t, useGTID, srcName, dstName)
 
 	// Branch 1: no locks supplied.
 	err := client.FlushUnderTableLock(t.Context(), nil)
@@ -75,12 +76,11 @@ func runFlushUnderTableLockErrorBranches(t *testing.T, useGTID bool, srcName, ds
 	testutils.RunSQL(t, "DROP TABLE "+dstName)
 
 	// Lock only the source table (locking the now-dropped target would
-	// fail), as a stand-in for the cutover's table locks. The under-lock
+	// fail), as a stand-in for the cutover's table locks. The lock is taken
+	// through the applier's own *sql.DB, as the migration cutover does: the
+	// applier matches locks to targets by connection identity. The under-lock
 	// flush REPLACEs into the dropped target table and must error.
-	lockDB, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(lockDB) })
-	lock, err := dbconn.NewTableLock(t.Context(), lockDB, []*table.TableInfo{t1}, dbconn.NewDBConfig(), slog.Default())
+	lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{t1}, dbconn.NewDBConfig(), slog.Default())
 	require.NoError(t, err)
 	// defer, not t.Cleanup: t.Context() is canceled before Cleanup callbacks
 	// run, which would fail the UNLOCK and leave the lock held into teardown.
