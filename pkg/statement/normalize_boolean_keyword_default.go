@@ -34,7 +34,11 @@ func init() { registerNormalizer(booleanKeywordDefaultNormalizer{}) }
 //   - year, which puts the keyword through YEAR's own interpretation:
 //     year DEFAULT TRUE stores '2001', not 1.
 //   - binary, which pads to the column width with NULs: binary(4) DEFAULT TRUE
-//     stores '1\0\0\0'. varbinary has nothing to pad and does fold.
+//     stores '1\0\0\0'. [binaryDefaultBytesNormalizer] folds it to that
+//     padded value instead. varbinary has nothing to pad and does fold here.
+//     This includes a char column stored as binary because its charset
+//     resolves to binary: char(3) DEFAULT TRUE under DEFAULT CHARSET=binary
+//     stores '1\0\0'.
 //   - enum and set, which resolve the keyword differently depending on the
 //     server version, so there is no single value to fold to. Through 8.4 it
 //     is read numerically, as a member index: enum('0','1') DEFAULT TRUE
@@ -69,7 +73,7 @@ func (booleanKeywordDefaultNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		default:
 			continue // the keyword has no other spelling
 		}
-		form := storedKeywordForm(c)
+		form := storedKeywordForm(c, ct)
 		if form == DefaultKindUnknown {
 			continue // a type that converts the keyword to something else
 		}
@@ -87,11 +91,16 @@ func (booleanKeywordDefaultNormalizer) Normalize(ct *CreateTable) *CreateTable {
 // default as on this column's type, or DefaultKindUnknown where the type puts
 // the keyword through a conversion of its own. See
 // [booleanKeywordDefaultNormalizer] for the types that excludes and why.
-func storedKeywordForm(c *Column) DefaultKind {
-	if isIntegerColumnType(c.Type) {
+//
+// The type is the one MySQL stores the column as (see [storedColumnType]), not
+// the written one: under a binary table default char(3) is stored as
+// binary(3), which pads the keyword, so it must not fold as a char would.
+func storedKeywordForm(c *Column, ct *CreateTable) DefaultKind {
+	typ := storedColumnType(c, ct)
+	if isIntegerColumnType(typ) {
 		return DefaultKindNumber
 	}
-	switch strings.ToLower(c.Type) {
+	switch strings.ToLower(typ) {
 	case "double", "float":
 		return DefaultKindNumber
 	case "decimal":

@@ -662,21 +662,12 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 	// MySQL canonicalizes it to the binary collation of the column's
 	// charset (varchar(100) COLLATE utf8mb4_bin). That case is resolved by
 	// binaryAttributeNormalizer once table options are known; converting it
-	// here would emit a destructive varchar -> varbinary type change.
+	// here would emit a destructive varchar -> varbinary type change. A
+	// column that inherits a binary table default, or writes COLLATE binary,
+	// is converted by binaryCharsetNormalizer.
 	if mysql.HasBinaryFlag(col.Tp.GetFlag()) && col.Tp.GetCharset() == "binary" {
-		switch column.Type {
-		case "varchar":
-			column.Type = "varbinary"
-		case "char":
-			column.Type = "binary"
-		case "text":
-			column.Type = "blob"
-		case "tinytext":
-			column.Type = "tinyblob"
-		case "mediumtext":
-			column.Type = "mediumblob"
-		case "longtext":
-			column.Type = "longblob"
+		if binType, ok := binaryTypeOf(column.Type); ok {
+			column.Type = binType
 		}
 	}
 

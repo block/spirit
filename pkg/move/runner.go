@@ -1595,10 +1595,20 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		if r.cutoverResultFunc != nil || r.cutoverFunc != nil {
 			cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
 		}
+		cutover.SetPreSwitch(func(ctx context.Context) error {
+			// Carry the counters over before the reverse-feed positions are
+			// captured, so a reverse feed never reads spirit's own ALTER.
+			if err := r.carryAutoIncrementsToTargets(ctx); err != nil {
+				return err
+			}
+			if r.move.ReverseWindow > 0 {
+				// Capture before the switch can accept target writes.
+				return captureReverseWindow(ctx, r)
+			}
+			return nil
+		})
 		if r.move.ReverseWindow > 0 {
-			// Capture before the switch can accept target writes, then persist
-			// the captured positions once the traffic switch succeeds.
-			cutover.SetPreSwitch(func(ctx context.Context) error { return captureReverseWindow(ctx, r) })
+			// Persist the captured positions once the traffic switch succeeds.
 			cutover.SetPostSwitch(func(ctx context.Context) error { return persistReverseWindow(ctx, r) })
 		}
 		// Pre-cutover: refuse to switch traffic if a revert has been requested (a
@@ -1630,6 +1640,28 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		return err
 	}
 	r.logger.Info("Move operation complete.")
+	return nil
+}
+
+// carryAutoIncrementsToTargets raises each target table's AUTO_INCREMENT
+// counter to at least the source's, so the target does not reissue ids the
+// source has already issued once traffic moves to it. It runs under the source
+// locks, after the final flush and before the traffic switch. See
+// carryAutoIncrement.
+func (r *Runner) carryAutoIncrementsToTargets(ctx context.Context) error {
+	for _, t := range r.sourceTables {
+		from := make([]autoIncrementTable, len(r.sources))
+		for i, src := range r.sources {
+			from[i] = autoIncrementTable{db: src.db, schema: src.config.DBName, name: t.TableName}
+		}
+		to := make([]autoIncrementTable, len(r.targets))
+		for i, target := range r.targets {
+			to[i] = autoIncrementTable{db: target.DB, schema: target.Config.DBName, name: t.TableName}
+		}
+		if err := carryAutoIncrement(ctx, r.logger, from, to); err != nil {
+			return fmt.Errorf("carry AUTO_INCREMENT of %s to the targets: %w", t.TableName, err)
+		}
+	}
 	return nil
 }
 

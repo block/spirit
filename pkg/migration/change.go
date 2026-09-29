@@ -89,9 +89,6 @@ func (c *tableChange) alterNewTable(ctx context.Context) error {
 	}
 
 	// Preserve AUTO_INCREMENT value from the original table AFTER the ALTER.
-	// CREATE TABLE LIKE doesn't copy AUTO_INCREMENT, and ALTER with ALGORITHM=COPY
-	// can reset it. For empty tables, INSERT SELECT won't trigger MySQL's automatic
-	// adjustment, so we explicitly set it to prevent new inserts from restarting at 1.
 	return c.preserveAutoIncrement(ctx)
 }
 
@@ -302,45 +299,64 @@ func checkConstraintsMatch(a, b statement.Constraint) bool {
 	return *a.Expression == *b.Expression
 }
 
+// preserveAutoIncrement gives the new table the original table's
+// AUTO_INCREMENT counter once the ALTER has been applied to it. CREATE TABLE
+// LIKE doesn't copy the counter, and ALTER with ALGORITHM=COPY can reset it.
+//
+// The counter keeps moving while the rows are copied, so this is only a
+// starting point: the cutover raises the counter again under the table lock
+// (see CutOver.carryAutoIncrements), which is what makes the final value
+// correct. Setting it here as well keeps the new table plausible in the
+// meantime, e.g. for an operator inspecting it.
 func (c *tableChange) preserveAutoIncrement(ctx context.Context) error {
-	// Get AUTO_INCREMENT from the original table.
-	var originalAutoInc sql.NullInt64
-	err := c.runner.db.QueryRowContext(ctx,
-		"SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
-		c.table.TableName).Scan(&originalAutoInc)
-	if err != nil {
-		return fmt.Errorf("failed to get AUTO_INCREMENT value from original table: %w", err)
-	}
-
-	// If the original table doesn't have a meaningful AUTO_INCREMENT, nothing to preserve.
-	if !originalAutoInc.Valid || originalAutoInc.Int64 <= 1 {
+	if c.stmt.SetsAutoIncrement() {
+		// The ALTER set the counter explicitly, as a native ALTER would honor.
 		return nil
 	}
-
-	// Get AUTO_INCREMENT from the new table to detect if it was explicitly set by the ALTER.
-	var newTableAutoInc sql.NullInt64
-	err = c.runner.db.QueryRowContext(ctx,
-		"SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
-		c.newTable.TableName).Scan(&newTableAutoInc)
+	exec := func(ctx context.Context, stmt string) error {
+		_, err := c.runner.db.ExecContext(ctx, stmt)
+		return err
+	}
+	raisedTo, raised, err := raiseAutoIncrement(ctx, c.runner.db, c.table, c.newTable, exec)
 	if err != nil {
-		return fmt.Errorf("failed to get AUTO_INCREMENT value from new table: %w", err)
+		return err
 	}
-
-	// Only override AUTO_INCREMENT on the new table if it doesn't appear to have been explicitly set.
-	// If the new table's AUTO_INCREMENT is different from the original, the user explicitly changed it.
-	if newTableAutoInc.Valid && newTableAutoInc.Int64 > 1 && newTableAutoInc.Int64 != originalAutoInc.Int64 {
-		// Respect the explicitly configured AUTO_INCREMENT on the new table.
-		return nil
+	if raised {
+		c.runner.logger.Info("preserved AUTO_INCREMENT value",
+			"table", c.table.TableName,
+			"auto_increment", raisedTo)
 	}
-
-	if err := dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n AUTO_INCREMENT = %?",
-		c.newTable.TableName, originalAutoInc.Int64); err != nil {
-		return fmt.Errorf("failed to set AUTO_INCREMENT on new table: %w", err)
-	}
-	c.runner.logger.Info("preserved AUTO_INCREMENT value",
-		"table", c.table.TableName,
-		"auto_increment", originalAutoInc.Int64)
 	return nil
+}
+
+// raiseAutoIncrement makes dst's next AUTO_INCREMENT value at least src's, so
+// that dst never issues an id that src has already issued - including ids of
+// rows that were since deleted, which never reach dst and so do not move its
+// counter. Both counters are read live (see table.NextAutoIncrement).
+//
+// It only ever raises the counter. InnoDB lowers the counter to any value
+// above the table's current maximum, so an unconditional ALTER could move dst
+// backwards. Nothing is done when either table has no AUTO_INCREMENT column:
+// if the ALTER adds the attribute, dst's counter already follows its data as
+// a native ALTER's would, and if it removes it there is no counter to carry.
+//
+// exec runs the ALTER: on a pool connection, or on the session that holds the
+// table lock during the cutover, where no other session may alter dst.
+// ALTER TABLE .. AUTO_INCREMENT on InnoDB changes metadata only; it does not
+// rebuild the table.
+func raiseAutoIncrement(ctx context.Context, db *sql.DB, src, dst *table.TableInfo, exec func(context.Context, string) error) (raisedTo uint64, raised bool, err error) {
+	srcNext, ok, err := table.NextAutoIncrement(ctx, db, src.SchemaName, src.TableName)
+	if err != nil || !ok || srcNext <= 1 {
+		return 0, false, err
+	}
+	dstNext, ok, err := table.NextAutoIncrement(ctx, db, dst.SchemaName, dst.TableName)
+	if err != nil || !ok || dstNext >= srcNext {
+		return 0, false, err
+	}
+	if err := exec(ctx, sqlescape.MustEscapeSQL("ALTER TABLE %n AUTO_INCREMENT = %?", dst.TableName, srcNext)); err != nil {
+		return 0, false, fmt.Errorf("failed to set AUTO_INCREMENT on %s: %w", dst.TableName, err)
+	}
+	return srcNext, true, nil
 }
 
 func (c *tableChange) dropOldTable(ctx context.Context) error {
