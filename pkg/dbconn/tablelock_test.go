@@ -374,3 +374,57 @@ func TestTableLockCloseDuringExecUnderLock(t *testing.T) {
 	}
 	require.Zero(t, db.Stats().InUse)
 }
+
+func TestTableLockIdleTimeout(t *testing.T) {
+	floor := int(minTableLockIdleTimeout / time.Second)
+	require.Equal(t, floor, tableLockIdleTimeout(1, 28800), "short lock waits use the floor")
+	require.Equal(t, 300, tableLockIdleTimeout(100, 28800), "long lock waits use three times the lock wait timeout")
+	require.Equal(t, 10, tableLockIdleTimeout(30, 10), "never raise a session wait_timeout that is already lower")
+	require.Equal(t, floor, tableLockIdleTimeout(1, 0), "an unreadable session value does not disable the bound")
+}
+
+// A spirit process that freezes, or loses its network without the TCP
+// connection closing, while it holds LOCK TABLES ... WRITE must not keep the
+// tables locked for the server's default wait_timeout (8 hours). The lock
+// session's wait_timeout bounds it, and it is restored before the connection
+// goes back to the pool.
+func TestTableLockIdleSessionIsBounded(t *testing.T) {
+	tt := testutils.NewTestTable(t, "tablelock_idle", "CREATE TABLE tablelock_idle (id INT PRIMARY KEY)")
+	orig := minTableLockIdleTimeout
+	minTableLockIdleTimeout = 2 * time.Second
+	t.Cleanup(func() { minTableLockIdleTimeout = orig })
+
+	cfg := testConfig() // lock_wait_timeout=1: the session bound is 3s.
+	cfg.ForceKill = false
+	cfg.MaxOpenConnections = 1 // Close must hand the lock session back to the pool.
+	db, err := New(testutils.DSN(), cfg)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var poolWaitTimeout int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@SESSION.wait_timeout").Scan(&poolWaitTimeout))
+
+	tbl := &table.TableInfo{TableName: "tablelock_idle", QuotedTableName: "`tablelock_idle`"}
+	lock, err := NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, slog.Default())
+	require.NoError(t, err)
+	var lockWaitTimeout int
+	require.NoError(t, lock.lockConn.QueryRowContext(t.Context(), "SELECT @@SESSION.wait_timeout").Scan(&lockWaitTimeout))
+	require.Equal(t, 3, lockWaitTimeout)
+	require.NoError(t, lock.Close(t.Context()))
+	var restored int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@SESSION.wait_timeout").Scan(&restored))
+	require.Equal(t, poolWaitTimeout, restored, "the lowered wait_timeout must not leak into the pool")
+
+	// Now abandon a lock: never use or close the session, as a frozen process
+	// would not. The server must close it and release the table.
+	lock, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, cfg, slog.Default())
+	require.NoError(t, err)
+	defer utils.CloseAndLogWithContext(t.Context(), lock) // Fails harmlessly: the session is gone.
+	time.Sleep(5 * time.Second)
+	writer, err := tt.DB.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(writer)
+	_, err = writer.ExecContext(t.Context(), "SET SESSION lock_wait_timeout = 1")
+	require.NoError(t, err)
+	_, err = writer.ExecContext(t.Context(), "INSERT INTO tablelock_idle VALUES (1)")
+	require.NoError(t, err, "the server must release the lock of an idle lock session")
+}
