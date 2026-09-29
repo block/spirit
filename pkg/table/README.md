@@ -59,9 +59,9 @@ It provides:
 - `ColumnsSlice()` — returns the column lists as slices
 - `ChecksumExprs()` — returns expressions for CRC32-based checksum comparison, handling type casting and renamed columns
 - `SourceTable()` / `TargetTable()` — returns the source/target `TableInfo`
-- `SourceColumnIndices()` / `SourceOrdinalIndices()` — returns column index maps for binlog row processing
+- `SourceOrdinalIndices()` — returns the position of each mapped source column in the full column list, for indexing binlog row images
 
-When no renames are specified, `ColumnMapping` produces identical output to the previous `IntersectNonGeneratedColumns` approach. With renames, it correctly maps old column names in the source to new column names in the target for all SQL generation.
+The mapped columns are the target's non-generated columns that have a source counterpart (by name, or through a rename). The source counterpart may itself be a generated column: `MODIFY g INT` on a `STORED` generated column makes it a regular column that keeps its values, so its values are copied, replayed from the binlog and checksummed. A column that is generated on the target is never written. With renames, the mapping maps old column names in the source to new column names in the target for all SQL generation.
 
 ## Multi Chunker
 

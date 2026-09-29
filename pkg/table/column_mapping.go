@@ -18,7 +18,7 @@ type ColumnMapping struct {
 	renames     map[string]string // old→new, may be nil
 
 	// Pre-computed intersection results
-	sourceColumns []string // non-generated source columns that exist in target
+	sourceColumns []string // source columns (generated or not) whose target column is not generated
 	targetColumns []string // corresponding target column names (renamed where applicable)
 }
 
@@ -39,6 +39,19 @@ func NewColumnMapping(source, target *TableInfo, renames map[string]string) *Col
 }
 
 // computeIntersection calculates the column intersection between source and target.
+//
+// Only non-generated target columns can be written, so they define the
+// intersection. The source side is every source column, generated ones
+// included: a column that is generated on the source but regular on the
+// target (ALTER TABLE ... MODIFY g INT, where g was GENERATED ... STORED) keeps
+// its values under MySQL's own ALTER, so Spirit must copy, replay and checksum
+// it like any other column. Leaving it out silently set every value to NULL
+// (or the column DEFAULT) at cutover. Reading a generated column is safe on
+// every path: the copier and the checksum SELECT it, and the binlog row image
+// carries its value (binlog_row_image=FULL logs generated columns, STORED and
+// VIRTUAL alike). A column that is generated on the target is still never
+// written, whether or not it was generated on the source.
+//
 // MySQL column identifiers are case-insensitive, so all matching is performed
 // on lower-cased names: the rename map comes from the user's ALTER statement
 // and may use different case than the columns were declared with. The returned
@@ -65,7 +78,7 @@ func (m *ColumnMapping) computeIntersection() ([]string, []string) {
 	}
 
 	var srcCols, tgtCols []string
-	for _, srcCol := range m.sourceTable.NonGeneratedColumns {
+	for _, srcCol := range m.sourceTable.Columns {
 		srcLower := strings.ToLower(srcCol)
 		// Check if this column was renamed
 		if newName, ok := renames[srcLower]; ok {
@@ -156,21 +169,6 @@ func (m *ColumnMapping) ChecksumCastTypes() ([]string, error) {
 		castTps[i] = checksumCastTp(srcTp, tgtTp)
 	}
 	return castTps, nil
-}
-
-// SourceColumnIndices returns the indices into sourceTable.NonGeneratedColumns
-// for each intersected column. This is used when row data only contains
-// non-generated columns (e.g., from SELECT statements).
-func (m *ColumnMapping) SourceColumnIndices() []int {
-	indexMap := make(map[string]int, len(m.sourceTable.NonGeneratedColumns))
-	for i, col := range m.sourceTable.NonGeneratedColumns {
-		indexMap[col] = i
-	}
-	indices := make([]int, len(m.sourceColumns))
-	for i, col := range m.sourceColumns {
-		indices[i] = indexMap[col]
-	}
-	return indices
 }
 
 // SourceOrdinalIndices returns the indices into sourceTable.Columns (all columns,

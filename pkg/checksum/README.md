@@ -4,7 +4,7 @@ Checksums validate data consistency between two tables. During schema changes, t
 
 ## Key Features
 
-- **Column mapping**: The checksum uses `ColumnMapping` to determine which columns to compare between source and target tables. This handles the intersection of non-generated columns, column renames, and type casting automatically.
+- **Column mapping**: The checksum uses `ColumnMapping` to determine which columns to compare between source and target tables. This handles the intersection of columns (every non-generated target column with a source counterpart, including a source column that was generated and is now regular), column renames, and type casting automatically.
 - **Type normalization**: A `CAST` operation converts columns to a comparable type before comparison. This enables comparisons when data types have changed and their string representations differ (e.g., `TIMESTAMP` vs. `TIMESTAMP(6)`).
 - **Automatic repair**: When inconsistencies are detected, the checksum automatically repairs differences by recopying affected chunks.
 - **Parallel execution**: Checksums process chunks concurrently across multiple threads for efficient handling of large tables. The worker count is resizable while a pass runs — see [Pacing and scaling](#pacing-and-scaling).
