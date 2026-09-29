@@ -188,7 +188,7 @@ for {
 The copier is tightly integrated with the chunker in `pkg/table` (see `pkg/table/chunker.go` and related files):
 
 1. **Chunk Requests**: The copier calls `chunker.Next()` to get the next chunk to process.
-2. **Feedback Loop**: After a chunk is committed, the copier calls `chunker.Feedback(chunk, processingTime, affectedRows)`. It also records the in-memory size of the rows it read on `chunk.ActualBytes`, which the chunker reads when it is sizing by memory.
+2. **Feedback Loop**: After a chunk is committed, the copier calls `chunker.Feedback(chunk, processingTime, affectedRows)`. It also records the estimated size of the rows it read on `chunk.ActualBytes` (`utils.EstimateRenderedChunkSize`: their rendered SQL length, a cheap approximation of their size in memory), which the chunker reads when it is sizing by bytes.
 3. **Dynamic Sizing**: The chunker uses feedback to adjust chunk sizes, aiming for either an in-memory byte budget (the copier's default) or a target chunk time (the checksum's signal). See [`pkg/table`](../table/README.md#about-chunkers).
 4. **Progress Tracking**: The copier delegates progress calculation to the chunker via `chunker.Progress()`.
 

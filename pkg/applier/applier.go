@@ -13,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/utils"
 )
 
 const (
@@ -24,7 +25,7 @@ const (
 	// (splitRowsIntoChunklets) and the binlog-apply path cuts flush
 	// batches (pkg/change) so a REPLACE/DELETE can't grow unbounded with
 	// wide rows. Still far below the typical 64 MiB max_allowed_packet
-	// because the size estimates are rough — estimateValueSize is
+	// because the size estimates are rough — utils.EstimateRenderedRowSize is
 	// deliberately biased low (hex encoding, string escaping and wide
 	// integers all under-measure; see its doc) and leans on that ~64x
 	// headroom — and a single row larger than the budget still goes in
@@ -141,18 +142,22 @@ type LogicalRow struct {
 // deleteKeysInClause renders key value tuples into the element list of a
 // `(keycols) IN (...)` clause. Values go through table.Datum so binary
 // keys are hex-encoded; a quoted non-UTF-8 literal would trip MySQL's
-// utf8mb4 warning (block/spirit#948). Single-column keys render as a bare
+// utf8mb4 warning (block/spirit#948). String keys in a charset other than
+// utf8mb4 are emitted with their charset introducer, so a latin1 key
+// matches its own row rather than the one its bytes spell in utf8mb4. Single-column keys render as a bare
 // literal, composite keys as a parenthesized tuple.
 func deleteKeysInClause(sourceTable *table.TableInfo, keys [][]any) (string, error) {
 	// Resolve each key column's type once, not per key: parsing the type
-	// string is the dominant cost of building a Datum.
+	// string is the dominant cost of building a Datum. The keys come from
+	// binlog row images, so a string key in a charset other than utf8mb4
+	// carries the column's own bytes (see TableInfo.BinlogColumnType).
 	colTypes := make([]table.ColumnType, len(sourceTable.KeyColumns))
 	for j, colName := range sourceTable.KeyColumns {
-		typeStr, ok := sourceTable.GetColumnMySQLType(colName)
-		if !ok {
-			return "", fmt.Errorf("key column %s not found in table %s", colName, sourceTable.TableName)
+		ct, err := sourceTable.BinlogColumnType(colName)
+		if err != nil {
+			return "", fmt.Errorf("key column %s: %w", colName, err)
 		}
-		colTypes[j] = table.NewColumnType(typeStr)
+		colTypes[j] = ct
 	}
 
 	pkValues := make([]string, 0, len(keys))
@@ -223,86 +228,6 @@ func (cfg *ApplierConfig) Validate() error {
 	return nil
 }
 
-// EstimateRowSize estimates the size in bytes of a row's values as they will
-// be rendered into a VALUES clause. It does not need to be precise: the budget
-// it feeds (MaxStatementSizeBytes, 1 MiB) sits ~64x below a typical
-// max_allowed_packet, so the estimate only has to be the right order of
-// magnitude to keep a statement well clear of the wire limit.
-//
-// It is exported for callers that batch rows before handing them to Apply and
-// so need to bound a batch by the same measure the applier itself uses — the
-// checksum's chunk repair does this.
-//
-// It does need to be cheap. It runs on every value of every copied row, once
-// per row on top of the rendering writeChunklet does anyway, so it is pure
-// overhead on the hottest client-side path. The previous implementation
-// measured len(fmt.Sprintf("%v", value)), which was neither cheap nor
-// accurate: a text-protocol Scan into *any hands back []byte for essentially
-// every column, and %v renders a []byte as "[49 50 51 …]" — roughly four
-// characters per byte. That cost ~2.2us and ~12 allocations per row and
-// over-estimated by ~2.7x, so chunklets were being cut well short of the
-// budget they were supposed to fill. A type switch is ~290x cheaper, allocates
-// nothing, and lands much closer to what datum.String() actually emits.
-func EstimateRowSize(values []any) int {
-	size := 2 // the tuple's parentheses
-	for _, value := range values {
-		// +2 for the ", " separator. That over-counts by one separator per
-		// row (values are joined, not terminated), which exactly covers the
-		// ", " between this row's tuple and the next in the statement. Quote
-		// characters are estimateValueSize's job, not counted here.
-		size += estimateValueSize(value) + 2
-	}
-	return size
-}
-
-// estimateValueSize approximates the rendered length of one value.
-//
-// Two cases deliberately under-estimate rather than pad: a []byte bound to a
-// binary column renders as 0x-hex (two characters per byte), and a string
-// containing quotes or backslashes grows by escaping. Both are bounded by the
-// 64x headroom above, and padding for them would penalise the common text case
-// the way the old %v behaviour did — an over-estimate is not free, it shrinks
-// every chunklet.
-func estimateValueSize(value any) int {
-	switch v := value.(type) {
-	case nil:
-		return 4 // NULL
-	case []byte:
-		// +2 for the surrounding quotes. Slightly over for the numeric column
-		// types (which the text protocol also delivers as []byte but which
-		// render unquoted); telling them apart would need the column type,
-		// which this deliberately doesn't take.
-		return len(v) + 2
-	case string:
-		return len(v) + 2 // +2 for the surrounding quotes
-	case time.Time:
-		return 28 // '2026-07-30 15:12:27.123456' — quoted, unlike numerics
-	case float32, float64:
-		// Typical rather than worst case: a float64 can render as wide as 24
-		// ("-1.7976931348623157e+308") but usually lands around 6-9 ("3.14159",
-		// "-2.71828"). Same bias as the two cases above — under-estimating is
-		// covered by the headroom, over-estimating shrinks every chunklet on a
-		// table of DOUBLE columns. DECIMAL arrives as []byte on the copy path
-		// and is measured exactly; this branch is mostly the binlog path.
-		return 8
-	case bool:
-		return 1
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		// Typical, not worst case, on the same bias as above: 10 digits covers
-		// an ordinary ID exactly, and a full-width int64 (19-20 characters)
-		// under-estimates by about 2x. Counting the digits instead is exact and
-		// costs ~22ns per row, but it buys nothing where it matters — the copy
-		// path receives integers as []byte from the text protocol and measures
-		// them exactly in the branch above, so this case only fires on the
-		// binlog path, where batches are a handful of rows.
-		return 10
-	default:
-		// Not produced by either the SQL driver or the binlog reader today.
-		// Cheap and slightly generous rather than reflective.
-		return 32
-	}
-}
-
 // rowData represents a single row with all its column values
 type rowData struct {
 	values []any
@@ -323,7 +248,7 @@ func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 	currentSize := 0
 
 	for _, row := range rows {
-		rowSize := EstimateRowSize(row.values)
+		rowSize := utils.EstimateRenderedRowSize(row.values)
 		// Check if adding this row would exceed either threshold
 		if len(currentChunklet) >= chunkletMaxRows ||
 			(len(currentChunklet) > 0 && currentSize+rowSize > MaxStatementSizeBytes) {

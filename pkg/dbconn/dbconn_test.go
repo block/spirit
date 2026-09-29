@@ -561,3 +561,26 @@ func TestRetryableTransactionUnsafeWarningCarriesCode(t *testing.T) {
 	assert.Equal(t, uint16(1048), warning.Warning.Number)
 	assert.Contains(t, err.Error(), "unsafe warning 1048:")
 }
+
+// A deprecation warning (1287) is not about the rows written, so it does not
+// stop the transaction. The binlog applier raises one whenever it writes a
+// value of a column in a charset MySQL has deprecated, such as ucs2, because
+// it labels the value with the column's charset introducer.
+func TestRetryableTransactionAllowsDeprecationWarning(t *testing.T) {
+	config := NewDBConfig()
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, Exec(t.Context(), db, "DROP TABLE IF EXISTS test.deprecatedwarn1"))
+	require.NoError(t, Exec(t.Context(), db,
+		"CREATE TABLE test.deprecatedwarn1 (a INT NOT NULL PRIMARY KEY, b VARCHAR(10) CHARACTER SET ucs2 NOT NULL)"))
+
+	affected, err := RetryableTransaction(t.Context(), db, ErrorOnDupKey, config,
+		"REPLACE INTO test.deprecatedwarn1 (a, b) VALUES (1, _ucs2 0x004D)")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), affected)
+	var got string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT HEX(b) FROM test.deprecatedwarn1 WHERE a = 1").Scan(&got))
+	assert.Equal(t, "004D", got)
+}

@@ -2,6 +2,7 @@ package status
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -50,6 +51,33 @@ func (e ETA) String() string {
 		return e.Duration.String()
 	}
 	return e.Duration.String()
+}
+
+// etaInitialWaitTime is how long to wait before first estimating the copy
+// ETA (to allow for fast start).
+const etaInitialWaitTime = 1 * time.Minute
+
+// EstimateETA returns the estimated remaining copy time and the state of that
+// estimate. The duration is meaningful only when the state is ETAReady.
+// No estimate is available before a copy rate has been measured (the first
+// etaInitialWaitTime, or while no rows have been timed; ETAMeasuring) or once
+// the copy is essentially complete (pct > 99.99; ETADue) — the callers present
+// each case (GetETA renders "TBD"/"DUE", GetETAState returns the state and 0
+// seconds).
+func EstimateETA(copiedRows, totalRows uint64, pct float64, rowsPerSecond uint64, startTime time.Time) ETA {
+	if pct > 99.99 {
+		return ETA{State: ETADue}
+	}
+	if rowsPerSecond == 0 || time.Since(startTime) < etaInitialWaitTime {
+		return ETA{State: ETAMeasuring}
+	}
+	// Divide the remaining rows by how many rows we copied in the last interval
+	// per second. "remainingRows" might be the actual rows or the logical rows
+	// since the copier's getCopyStats() and rowsPerSecond change estimation
+	// method when the PK is auto-inc.
+	remainingRows := totalRows - copiedRows
+	remainingSeconds := math.Floor(float64(remainingRows) / float64(rowsPerSecond))
+	return ETA{State: ETAReady, Duration: time.Duration(remainingSeconds * float64(time.Second))}
 }
 
 // ThrottleStatus reports whether the current phase is paused by a throttler,

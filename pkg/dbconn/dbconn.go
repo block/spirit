@@ -50,6 +50,7 @@ const (
 	errQueryInterrupted    = 1317 // ER_QUERY_INTERRUPTED: query was killed (e.g. KILL QUERY)
 	errCapacityExceeded    = 3170
 	errFoundDuppKey        = 1062 // yes I know there's a typo
+	errDeprecatedSyntax    = 1287 // ER_WARN_DEPRECATED_SYNTAX: "'%s' is deprecated and will be removed in a future release"
 )
 
 type DBConfig struct {
@@ -317,6 +318,14 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 					switch {
 					case code == errFoundDuppKey && dupKeyHandling == IgnoreDupKeyWarnings:
 						continue // ignore duplicate key warnings
+					case code == errDeprecatedSyntax:
+						// A deprecation notice, raised when the statement is
+						// parsed; it says nothing about the rows written. The
+						// binlog applier emits the charset introducer of a
+						// column's own charset (see table.Datum.String), and
+						// naming one MySQL has deprecated (ucs2, macroman,
+						// macce, dec8, hp8) in any form raises this warning.
+						continue
 					case code == errCapacityExceeded:
 						// "Memory capacity of 8388608 bytes for 'range_optimizer_max_mem_size' exceeded.
 						// Range optimization was not done for this query."
