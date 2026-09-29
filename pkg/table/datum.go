@@ -25,6 +25,7 @@ type Datum struct {
 	Val            any
 	Tp             datumTp // signed, unsigned, binary
 	forceHexEncode bool    // when true, always hex-encode the value in String()
+	charset        string  // when set, Val holds bytes in this charset, and String() emits them with its introducer; see ColumnType
 }
 
 // isBITType reports whether the given MySQL column type is a BIT(N) type.
@@ -231,6 +232,12 @@ func newDatumFromMySQL(val string, mysqlTp string) (Datum, error) {
 type ColumnType struct {
 	tp    datumTp
 	isBit bool
+	// charset is the character set a string value's bytes are in, when
+	// that is not one MySQL can read as the connection's utf8mb4. It is
+	// only set by TableInfo.BinlogColumnType: the driver returns every
+	// string converted to the connection charset, but a binlog row image
+	// carries the column's own bytes.
+	charset string
 }
 
 // NewColumnType resolves a MySQL column type string (e.g. "int",
@@ -277,10 +284,22 @@ func NewDatumFromValueWithType(value any, ct ColumnType) (Datum, error) {
 	// and marks binaryType datums with forceHexEncode so binary data is
 	// always hex-encoded in SQL output — even data that is valid UTF-8
 	// (which IsBinaryString() would not catch).
-	if b, ok := value.([]byte); ok {
-		value = string(b)
+	isString := false
+	switch v := value.(type) {
+	case []byte:
+		value = string(v)
+		isString = true
+	case string:
+		isString = true
 	}
-	return NewDatum(value, tp)
+	d, err := NewDatum(value, tp)
+	if err != nil {
+		return Datum{}, err
+	}
+	if isString && tp == unknownType {
+		d.charset = ct.charset
+	}
+	return d, nil
 }
 
 func NewNilDatum(tp datumTp) Datum {
@@ -359,6 +378,8 @@ func (d Datum) Range(d2 Datum) (uint64, error) {
 //
 //   - NULL                            for IsNil()
 //   - the numeric literal (e.g. 42)   for IsNumeric()
+//   - _charset 0x... literal          for a string whose bytes are in a
+//     charset other than utf8mb4/utf8mb3 (see ColumnType.charset)
 //   - 0x... hex literal               for IsBinaryString()
 //     (a zero-length value uses the empty binary literal instead — see below)
 //   - "..." with backslash escapes    for everything else
@@ -388,6 +409,22 @@ func (d Datum) String() string {
 	s, ok := d.Val.(string)
 	if !ok {
 		s = fmt.Sprintf("%v", d.Val)
+	}
+	if d.charset != "" {
+		// The bytes are in the column's charset (a binlog row image of a
+		// latin1, gbk, utf16, ... column). A quoted string would be read
+		// in the connection charset (utf8mb4) and converted: latin1 C3 A9
+		// ("Ã©") is valid UTF-8 for "é" and would be stored as latin1 E9,
+		// and utf16 00 4D ('M') would become two characters. A binary hex
+		// literal is not right either: a latin1 -> utf8mb4 change would
+		// reject latin1 E9 as an invalid utf8mb4 string. The introducer
+		// labels the bytes with their charset, so MySQL stores them
+		// unchanged in a column of that charset and converts them
+		// correctly into any other.
+		if len(s) == 0 {
+			return "_" + d.charset + " x''"
+		}
+		return fmt.Sprintf("_%s %#x", d.charset, s)
 	}
 	if d.IsBinaryString() {
 		// The empty value still needs a valid SQL literal: %#x renders ""
