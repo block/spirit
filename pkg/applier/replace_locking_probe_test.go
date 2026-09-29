@@ -270,16 +270,16 @@ func TestReplaceContendsOnlyOnUniqueIndexes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Guard the premise of each scenario rather than trusting the strides.
 			if tc.name == "adjacent in unq_group" {
-				require.Greater(t, abs(lp.tokenPosOf[tc.a]-lp.tokenPosOf[tc.b]), 10, "must be distant in unq_token")
-				require.Greater(t, abs(tc.a-tc.b), 10, "must be distant in the PK")
+				require.Greater(t, utils.Abs(lp.tokenPosOf[tc.a]-lp.tokenPosOf[tc.b]), 10, "must be distant in unq_token")
+				require.Greater(t, utils.Abs(tc.a-tc.b), 10, "must be distant in the PK")
 			}
 			if tc.name == "adjacent in unq_token" {
-				require.Greater(t, abs(lp.groupPosOf[tc.a]-lp.groupPosOf[tc.b]), 10, "must be distant in unq_group")
-				require.Greater(t, abs(tc.a-tc.b), 10, "must be distant in the PK")
+				require.Greater(t, utils.Abs(lp.groupPosOf[tc.a]-lp.groupPosOf[tc.b]), 10, "must be distant in unq_group")
+				require.Greater(t, utils.Abs(tc.a-tc.b), 10, "must be distant in the PK")
 			}
 			if tc.name == "adjacent in the primary key" {
-				require.Greater(t, abs(lp.groupPosOf[tc.a]-lp.groupPosOf[tc.b]), 10, "must be distant in unq_group")
-				require.Greater(t, abs(lp.tokenPosOf[tc.a]-lp.tokenPosOf[tc.b]), 10, "must be distant in unq_token")
+				require.Greater(t, utils.Abs(lp.groupPosOf[tc.a]-lp.groupPosOf[tc.b]), 10, "must be distant in unq_group")
+				require.Greater(t, utils.Abs(lp.tokenPosOf[tc.a]-lp.tokenPosOf[tc.b]), 10, "must be distant in unq_token")
 			}
 			got := lp.blocks(t, lp.replace(tc.a), lp.replace(tc.b))
 			require.Equal(t, tc.expect, got, tc.why)
@@ -328,11 +328,4 @@ func TestUniqueKeyRangePartitioningRemovesContention(t *testing.T) {
 	require.False(t, partitioned,
 		"two batches holding disjoint, separated ranges of unq_group must not "+
 			"contend — this is the property the whole design rests on")
-}
-
-func abs(n int) int {
-	if n < 0 {
-		return -n
-	}
-	return n
 }
