@@ -48,6 +48,16 @@ const (
 // see NewAdvisoryLock.
 var maxConnLifetime = time.Minute * 3
 
+// sessionWaitTimeout is the wait_timeout, in seconds, set on every spirit
+// connection. The server default is 8 hours, so a spirit process that froze or
+// lost its network while holding LOCK TABLES could keep the tables locked that
+// long. With 10 minutes MySQL closes the idle session, and releases its locks,
+// much sooner. Every idle connection spirit keeps open is refreshed well within
+// it: pooled connections are recycled after maxConnLifetime, the checksum's
+// snapshot transactions ping at an interval derived from wait_timeout (see
+// NewTrxPool), and the advisory lock is refreshed every minute.
+const sessionWaitTimeout = 600
+
 // SetPoolSize sets a pool's connection limit, keeping the idle limit equal to
 // it. Both must move together: database/sql closes a connection returned to a
 // pool whose free list already holds MaxIdleConns entries, so an idle limit
@@ -381,6 +391,7 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	cfg.Params["lock_wait_timeout"] = strconv.Itoa(config.LockWaitTimeout)
 	cfg.Params["range_optimizer_max_mem_size"] = strconv.FormatInt(config.RangeOptimizerMaxMemSize, 10)
 	cfg.Params["transaction_isolation"] = `"read-committed"`
+	cfg.Params["wait_timeout"] = strconv.Itoa(sessionWaitTimeout)
 	// go driver charset option, sets:
 	// character_set_client, character_set_connection, character_set_results
 	cfg.Params["charset"] = "utf8mb4"

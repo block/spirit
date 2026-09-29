@@ -77,6 +77,10 @@ func TestLockWaitTimeouts(t *testing.T) {
 	innodbLockWaitTimeout, err := getVariable(trx, "innodb_lock_wait_timeout", true)
 	require.NoError(t, err)
 	require.Equal(t, strconv.Itoa(config.InnodbLockWaitTimeout), innodbLockWaitTimeout)
+
+	waitTimeout, err := getVariable(trx, "wait_timeout", true)
+	require.NoError(t, err)
+	require.Equal(t, "600", waitTimeout)
 	require.NoError(t, trx.Rollback())
 }
 
