@@ -2,6 +2,7 @@ package datasync
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -126,4 +128,49 @@ func TestSyncFatalAbortDuringCopy(t *testing.T) {
 			require.NotContains(t, outcomes, status.WorkflowPhaseOutcomeCancelled, "no phase may be recorded as cancelled")
 		})
 	}
+}
+
+// TestSyncFatalAbortBeforeFirstPhase checks that a fatal abort that stops Run
+// before any phase has started still returns the fatal error rather than
+// context.Canceled or nil. No phase is running to substitute the cause, so
+// this is what Run's own status.AbortCause is for. The fatal fires as Run logs
+// its first line, and the setup's next query then sees the cancelled context.
+func TestSyncFatalAbortBeforeFirstPhase(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	dstName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQL(t, "CREATE TABLE "+srcName+".t1 (id INT PRIMARY KEY, val VARCHAR(255))")
+	src := cfg.Clone()
+	src.DBName = srcName
+	dst := cfg.Clone()
+	dst.DBName = dstName
+
+	runner, err := NewRunner(&Sync{
+		SourceDSN:    src.FormatDSN(),
+		TargetDSN:    dst.FormatDSN(),
+		Threads:      1,
+		WriteThreads: 1,
+	})
+	require.NoError(t, err)
+	runner.logger = slog.New(testutils.NewOnLogHandler(slog.Default().Handler(), "Starting sync", func() {
+		assert.True(t, runner.fatalError(change.FatalReasonStreamError))
+	}))
+	sink := &outcomeSink{}
+	runner.SetMetricsSink(sink)
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(t.Context()) }()
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("sync did not return after the fatal abort")
+	}
+	require.NoError(t, runner.Close())
+
+	require.Error(t, runErr)
+	require.NotErrorIs(t, runErr, context.Canceled, "a fatal abort is not an operator cancellation")
+	require.ErrorContains(t, runErr, change.FatalReasonStreamError.String())
+	require.Empty(t, sink.outcomes(), "Run must stop before its first phase")
 }
