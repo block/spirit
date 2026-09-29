@@ -1105,13 +1105,18 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 	// amortize the resolution over, and the final flush runs under the table
 	// lock at cutover. colTypes is only read from here on, so sharing it
 	// across the goroutines is safe.
+	//
+	// The values are binlog row images, not query results: a string column in
+	// a charset other than utf8mb4 carries its own bytes, which must be emitted
+	// with the column's charset introducer instead of quoted (see
+	// TableInfo.BinlogColumnType).
 	colTypes := make([]table.ColumnType, len(sourceOrdinal))
 	for i := range sourceOrdinal {
-		typeStr, ok := sourceTable.GetColumnMySQLType(sourceColumnNames[i])
-		if !ok {
-			return 0, fmt.Errorf("column %s not found in table info", sourceColumnNames[i])
+		ct, err := sourceTable.BinlogColumnType(sourceColumnNames[i])
+		if err != nil {
+			return 0, fmt.Errorf("column %s: %w", sourceColumnNames[i], err)
 		}
-		colTypes[i] = table.NewColumnType(typeStr)
+		colTypes[i] = ct
 	}
 
 	for shardID, rows := range shardRows {

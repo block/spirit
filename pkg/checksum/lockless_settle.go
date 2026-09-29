@@ -3,9 +3,11 @@ package checksum
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // A hot range is one whose source keeps changing under the reader. The snapshot
@@ -186,7 +189,20 @@ func (s *rowSettler) settleRow(ctx, parent context.Context, snapshot *hotSnapsho
 			"chunk", chunk.String())
 		return settleUnavailable, nil
 	}
-	matcher, err := keyMatcher(chunk.Table, chunk.Key, row.key)
+	want, err := binlogKey(ctx, db, chunk.Table, chunk.Key, row.key)
+	switch {
+	case parent.Err() != nil:
+		return settleUnavailable, parent.Err()
+	case err != nil && ctx.Err() != nil:
+		// The key conversion ran into our own budget, which is a deferral
+		// like any other, not a checksum failure.
+		s.logger.Debug("lockless checksum: settle budget ran out while converting the watched key; deferring",
+			"chunk", chunk.String())
+		return settleUnavailable, nil
+	case err != nil:
+		return settleUnavailable, err
+	}
+	matcher, err := keyMatcher(chunk.Table, chunk.Key, want)
 	if err != nil {
 		return settleUnavailable, err
 	}
@@ -304,6 +320,10 @@ func expectedImageCRC(ctx context.Context, sourceDB *sql.DB, chunk *table.Chunk,
 		if ordinal >= len(image) {
 			return 0, fmt.Errorf("binlog row image has %d columns, need ordinal %d", len(image), ordinal)
 		}
+		if expr, val, ok := charsetImageValueExpr(chunk.Table, columns[i], image[ordinal]); ok {
+			placeholders[i], values[i] = expr, val
+			continue
+		}
 		tp, _ := chunk.Table.GetColumnMySQLType(columns[i])
 		placeholders[i], values[i], err = imageValueExpr(tp, castTps[i], image[ordinal])
 		if err != nil {
@@ -388,6 +408,53 @@ func imageValueExpr(tp, castTp string, v any) (string, any, error) {
 	return "?", v, nil
 }
 
+// charsetImageValueExpr renders a string value of a binlog row image for a
+// column in a charset other than utf8mb4 or utf8mb3. ok is false for any other
+// column or value, which imageValueExpr renders.
+//
+// A plain parameter is utf8mb4 text. Merged with such a column it is either
+// the wrong value or an error: MySQL converts it to the column's charset, and
+// refuses to (1267, illegal mix of collations) when it is not ASCII.
+//
+//   - A CHAR, VARCHAR or TEXT value is the column's own bytes (see
+//     table.TableInfo.BinlogCharset). Read as utf8mb4, latin1 C3 A9 ('Ã©')
+//     would be 'é', and a utf16 value would not be text at all. The bytes are
+//     bound as hex and relabelled with their charset, which UNHEX's binary
+//     result takes without conversion.
+//   - An ENUM or SET value is the element text DecodeBinlogRow took from the
+//     column definition, which is utf8mb4. It is converted to the column's
+//     charset.
+//
+// Either way the merge is the column's charset with the column's charset, as
+// in the real row. The value also takes the column's collation: CONVERT gives
+// it the charset's default collation, and in the UNION that meets the real
+// column's, two different IMPLICIT collations of one charset are an illegal
+// mix (1271) unless one of them is _bin.
+func charsetImageValueExpr(info *table.TableInfo, column string, v any) (string, any, bool) {
+	var b []byte
+	switch s := v.(type) {
+	case string:
+		b = []byte(s)
+	case []byte:
+		b = s
+	default:
+		return "", nil, false
+	}
+	collate := ""
+	if collation, ok := info.GetColumnCollation(column); ok && collation != "" {
+		collate = " COLLATE " + collation
+	}
+	if charset := info.BinlogCharset(column); charset != "" {
+		return "CONVERT(UNHEX(?) USING " + charset + ")" + collate, hex.EncodeToString(b), true
+	}
+	tp, _ := info.GetColumnMySQLType(column)
+	charset, _ := info.GetColumnCharset(column)
+	if !utils.IsEnumOrSetType(tp) || charset == "" || charset == "utf8mb4" || charset == "utf8mb3" {
+		return "", nil, false
+	}
+	return "CONVERT(? USING " + charset + ")" + collate, string(b), true
+}
+
 // baseColumnType strips a declared type's width, so "bit(8)" and
 // "float(10,2) unsigned" reduce to what imageValueExpr switches on.
 func baseColumnType(tp string) string {
@@ -464,6 +531,44 @@ func keyMatcher(info *table.TableInfo, keyColumns []string, want []table.Datum) 
 		}
 		return true
 	}, nil
+}
+
+// binlogKey returns key, a snapshot key read back from MySQL, as the stream
+// decodes it, for keyMatcher. They differ only for a string key column in a
+// charset other than utf8mb4 (see table.TableInfo.BinlogCharset): the read
+// returns it converted to utf8mb4, and a binlog row image carries the column's
+// own bytes, so latin1 "é" is C3 A9 on one side and E9 on the other and would
+// never match. Those values are converted to the column's charset by the
+// server, the only party that knows every charset. key itself is not changed:
+// it is still what pointPredicate needs.
+func binlogKey(ctx context.Context, db *sql.DB, info *table.TableInfo, keyColumns []string, key []table.Datum) ([]table.Datum, error) {
+	var converted []table.Datum
+	for i, column := range keyColumns {
+		charset := info.BinlogCharset(column)
+		if charset == "" || i >= len(key) {
+			continue
+		}
+		s, ok := key[i].Val.(string)
+		if !ok {
+			continue
+		}
+		var hexBytes string
+		if err := db.QueryRowContext(ctx, "SELECT HEX(CONVERT(? USING "+charset+"))", s).Scan(&hexBytes); err != nil {
+			return nil, fmt.Errorf("convert key column %s to %s: %w", column, charset, err)
+		}
+		raw, err := hex.DecodeString(hexBytes)
+		if err != nil {
+			return nil, fmt.Errorf("convert key column %s to %s: %w", column, charset, err)
+		}
+		if converted == nil {
+			converted = slices.Clone(key)
+		}
+		converted[i].Val = string(raw)
+	}
+	if converted == nil {
+		return key, nil
+	}
+	return converted, nil
 }
 
 // pointPredicate renders a single key as a chunk predicate, which is how every
