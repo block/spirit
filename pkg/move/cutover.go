@@ -62,9 +62,10 @@ type CutOver struct {
 	cutoverFuncSucceeded bool
 
 	// preSwitch runs under the source locks after the final flush and before
-	// traffic can reach the target. Reverse moves capture their start positions
-	// here so writes committed during the switch are included. It runs again
-	// on a safe retry, after that attempt's final flush.
+	// traffic can reach the target. The runner carries the AUTO_INCREMENT
+	// counters over to the targets here, and reverse moves capture their start
+	// positions here so writes committed during the switch are included. It
+	// runs again on a safe retry, after that attempt's final flush.
 	preSwitch func(ctx context.Context) error
 
 	// postSwitch persists the captured positions after the switch succeeds,
@@ -269,7 +270,7 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 
 	if c.preSwitch != nil {
 		if err := c.preSwitch(ctx); err != nil {
-			return fmt.Errorf("reverse-window pre-switch hook failed: %w", err)
+			return fmt.Errorf("pre-switch hook failed: %w", err)
 		}
 	}
 
@@ -392,6 +393,76 @@ func (c *CutOver) renameAllSources(ctx context.Context, sourceLocks []*dbconn.Ta
 				i, len(completedRenames), err)
 		}
 		completedRenames = append(completedRenames, i)
+	}
+	return nil
+}
+
+// autoIncrementTable is one copy of a table whose AUTO_INCREMENT counter
+// carryAutoIncrement reads or raises.
+type autoIncrementTable struct {
+	db     *sql.DB
+	schema string
+	name   string
+}
+
+// carryAutoIncrement raises the AUTO_INCREMENT counter of every table in to
+// to at least the highest counter among the tables in from, so that no copy
+// in to ever issues an id that a copy in from has issued.
+//
+// Rows only carry ids. A destination's counter follows the highest id it has
+// received, so any id issued above that on the source - rows inserted and then
+// deleted before they were copied (their changes merge away), rolled back
+// inserts, INSERT IGNORE and upsert gaps - would be issued again once traffic
+// moves. The counter a target table was created with is stale by the time of
+// the cutover.
+//
+// The caller must guarantee nothing can advance a counter in from after it has
+// been read (the sources are locked and flushed) and that nothing but spirit
+// writes to to yet (traffic has not been switched).
+//
+// With several copies on either side (a sharded source or target), every
+// destination gets the maximum of all the source counters. That is the only
+// value that rules out reissuing any id a source has issued, whichever shard
+// a row lands on. It does not make per-shard counters globally unique between
+// destinations: sharded tables need an external sequence (such as a Vitess
+// sequence) for that, and those typically have no AUTO_INCREMENT column, in
+// which case there is nothing to carry.
+//
+// Counters are only raised: InnoDB lowers the counter to any value above the
+// table's current maximum, so an unconditional ALTER could move one backwards.
+// Tables without an AUTO_INCREMENT column are skipped on either side. The
+// cost is one SHOW CREATE TABLE per copy, plus a metadata-only ALTER TABLE ..
+// AUTO_INCREMENT (no table rebuild) for each destination that is behind.
+func carryAutoIncrement(ctx context.Context, logger *slog.Logger, from, to []autoIncrementTable) error {
+	var maxNext uint64
+	for _, t := range from {
+		next, ok, err := table.NextAutoIncrement(ctx, t.db, t.schema, t.name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			maxNext = max(maxNext, next)
+		}
+	}
+	if maxNext <= 1 {
+		return nil // no AUTO_INCREMENT column, or no id issued yet
+	}
+	for _, t := range to {
+		next, ok, err := table.NextAutoIncrement(ctx, t.db, t.schema, t.name)
+		if err != nil {
+			return err
+		}
+		if !ok || next >= maxNext {
+			continue
+		}
+		if err := dbconn.Exec(ctx, t.db, "ALTER TABLE %n.%n AUTO_INCREMENT = %?", t.schema, t.name, maxNext); err != nil {
+			return fmt.Errorf("failed to set AUTO_INCREMENT on %s.%s: %w", t.schema, t.name, err)
+		}
+		logger.Info("raised AUTO_INCREMENT so that ids the other side has issued are not issued again",
+			"schema", t.schema,
+			"table", t.name,
+			"from", next,
+			"auto_increment", maxNext)
 	}
 	return nil
 }

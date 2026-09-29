@@ -360,6 +360,15 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	}
 	w.feed.Close()
 
+	// The mirror of the forward cutover's carryAutoIncrementsToTargets: ids the
+	// targets issued during the window and have since deleted never reached
+	// the source's _old tables, so without this the source would issue them
+	// again once traffic returns. The targets are locked and the feed is
+	// drained, so neither side's counter can move now.
+	if err := w.carryAutoIncrementsToSource(ctx); err != nil {
+		return fmt.Errorf("reverse cutover: %w", err)
+	}
+
 	// Persist the ownership boundary immediately before the first rename that
 	// moves ownership, and fail closed if it cannot be written. Everything up
 	// to here is reversible; from the next statement on, a crash leaves the
@@ -411,6 +420,27 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	}
 
 	return w.finalizeReverse(ctx)
+}
+
+// carryAutoIncrementsToSource raises each of the source's retired (_old)
+// tables' AUTO_INCREMENT counters to at least the highest counter among the
+// targets. See carryAutoIncrement.
+func (w *reverseWindow) carryAutoIncrementsToSource(ctx context.Context) error {
+	r := w.r
+	for _, t := range r.sourceTables {
+		from := make([]autoIncrementTable, len(r.targets))
+		for i, target := range r.targets {
+			from[i] = autoIncrementTable{db: target.DB, schema: target.Config.DBName, name: t.TableName}
+		}
+		to := make([]autoIncrementTable, len(r.sources))
+		for i, src := range r.sources {
+			to[i] = autoIncrementTable{db: src.db, schema: src.config.DBName, name: check.CutoverOldName(t.TableName)}
+		}
+		if err := carryAutoIncrement(ctx, r.logger, from, to); err != nil {
+			return fmt.Errorf("carry AUTO_INCREMENT of %s back to the source: %w", t.TableName, err)
+		}
+	}
+	return nil
 }
 
 func (w *reverseWindow) runReverseCutoverCallback(ctx context.Context) error {

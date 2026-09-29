@@ -41,8 +41,9 @@ func init() { registerNormalizer(defaultCollationNormalizer{}) }
 // utf8mb4 is excluded: its default depends on the server version and on
 // default_collation_for_utf8mb4, so it stays underdetermined. binary is left
 // alone: the parser already turns `CHAR(3) CHARACTER SET binary` into BINARY(3)
-// with the binary collation, as MySQL does, and a binary table default has no
-// other collation to be confused with.
+// with the binary collation, as MySQL does, binaryCharsetNormalizer does the
+// same for a column that inherits a binary table default, and a binary table
+// default has no other collation to be confused with.
 //
 // A column with the BINARY attribute is left to binaryAttributeNormalizer,
 // which selects the charset's _bin collation for it. Filling in the default

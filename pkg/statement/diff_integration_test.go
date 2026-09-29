@@ -1040,3 +1040,64 @@ func TestDiffIntegrationColumnCharsetConverges(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, stmts, "re-diff after applying the MODIFY must converge")
 }
+
+// TestDiffIntegrationBinaryCharset verifies that a character column whose
+// charset resolves to binary, through the table default or its own COLLATE
+// binary, matches its live form, which MySQL stores as the binary type
+// (varchar -> varbinary, char -> binary, text -> blob). enum and set keep their
+// type, and a column that declares its own charset or collation is not
+// rewritten. Without the rewrite the diff emits a MODIFY back to the written
+// type on every run.
+func TestDiffIntegrationBinaryCharset(t *testing.T) {
+	for _, tc := range []struct{ name, ddl string }{
+		{"diff_binary_default", "CREATE TABLE diff_binary_default (id int NOT NULL, a varchar(3), PRIMARY KEY (id)) DEFAULT CHARSET=binary"},
+		{"diff_binary_default_all", "CREATE TABLE diff_binary_default_all (id int NOT NULL, a varchar(3), b char(3), c text, d tinytext, e mediumtext, f longtext, g enum('x','y'), h set('x'), i varchar(3) CHARACTER SET latin1, j varchar(3) BINARY, k varchar(3) COLLATE utf8mb4_bin, l varchar(3) DEFAULT 'ab', m NVARCHAR(3), n char, o varchar(3) CHARACTER SET binary, p varchar(6) GENERATED ALWAYS AS (concat(a,a)) VIRTUAL, PRIMARY KEY (id)) DEFAULT CHARSET=binary"},
+		{"diff_binary_default_collate", "CREATE TABLE diff_binary_default_collate (id int NOT NULL, a varchar(3), c text, PRIMARY KEY (id)) DEFAULT COLLATE=binary"},
+		{"diff_binary_default_both", "CREATE TABLE diff_binary_default_both (id int NOT NULL, a varchar(3), PRIMARY KEY (id)) DEFAULT CHARSET=BINARY COLLATE=BINARY"},
+		{"diff_binary_column_collate", "CREATE TABLE diff_binary_column_collate (id int NOT NULL, a varchar(3) COLLATE binary, b text COLLATE binary, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, tc.name, tc.ddl)
+			desired, err := ParseCreateTable(tc.ddl)
+			require.NoError(t, err)
+			live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+			require.NoError(t, err)
+			stmts, err := live.Diff(desired, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "a column with the binary charset must match its live form")
+			stmts, err = desired.Diff(live, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "the live form must match a column with the binary charset")
+		})
+	}
+}
+
+// TestDiffIntegrationBinaryCharsetConverges verifies that converting a utf8mb4
+// table to DEFAULT CHARSET=binary emits an ALTER that MySQL applies, which
+// converts the column inheriting the default to its binary type, after which a
+// re-diff converges to nil.
+func TestDiffIntegrationBinaryCharsetConverges(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_binary_converge",
+		"CREATE TABLE diff_binary_converge (id int NOT NULL, a varchar(3), b text, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	desired, err := ParseCreateTable(
+		"CREATE TABLE diff_binary_converge (id int NOT NULL, a varchar(3), b text, PRIMARY KEY (id)) DEFAULT CHARSET=binary")
+	require.NoError(t, err)
+
+	live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+	require.NoError(t, err)
+	stmts, err := live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	testutils.RunSQL(t, stmts[0].Statement)
+
+	var columnType string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT column_type FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'a'", tt.Name).Scan(&columnType))
+	require.Equal(t, "varbinary(3)", columnType)
+
+	live, err = ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+	require.NoError(t, err)
+	stmts, err = live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
+}

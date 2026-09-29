@@ -446,6 +446,27 @@ func (a *AbstractStatement) ColumnRenameMap() map[string]string {
 	return renames
 }
 
+// SetsAutoIncrement reports whether this ALTER TABLE sets the table's
+// AUTO_INCREMENT counter explicitly (a table option such as AUTO_INCREMENT=N).
+// It returns false for any statement that is not an ALTER TABLE.
+func (a *AbstractStatement) SetsAutoIncrement() bool {
+	alterStmt, ok := a.AsAlterTable()
+	if !ok {
+		return false
+	}
+	for _, spec := range alterStmt.Specs {
+		if spec.Tp != ast.AlterTableOption {
+			continue
+		}
+		for _, opt := range spec.Options {
+			if opt.Tp == ast.TableOptionAutoIncrement {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // CheckConstraintsReferenced returns the check constraint names this ALTER
 // refers to by name, i.e. the names in its DROP CHECK / DROP CONSTRAINT and
 // ALTER CHECK clauses. It returns nil for a statement that is not an ALTER
