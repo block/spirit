@@ -33,11 +33,14 @@ func TestCheckpointWriteFailureRecordedAsFatal(t *testing.T) {
 	r.copyChunker = table.NewMockChunker("t1", 100)
 
 	var cancelled bool
-	r.cancelFunc = func() { cancelled = true }
+	var cause error
+	r.cancelFunc = func(err error) { cancelled = true; cause = err }
 
 	err = r.DumpCheckpoint(context.Background())
 	require.Error(t, err, "a failed checkpoint write must return an error to WatchTask")
 	require.ErrorContains(t, r.fatal(), "checkpoint write failed",
 		"the failure must be recorded as fatal so Run surfaces it instead of exit 0")
 	require.True(t, cancelled, "recordFatal must cancel the run")
+	require.Equal(t, r.fatal(), cause,
+		"the run must be cancelled with the fatal error as the cause, so a phase it stops returns that error and not context.Canceled")
 }

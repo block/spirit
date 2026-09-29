@@ -2,8 +2,6 @@ package migration
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -177,34 +175,4 @@ func TestFatalErrorCancelsWithCause(t *testing.T) {
 	require.Error(t, cause)
 	require.NotErrorIs(t, cause, context.Canceled)
 	require.ErrorContains(t, cause, change.FatalReasonSchemaChange.String())
-}
-
-func TestAbortCause(t *testing.T) {
-	fatal := errors.New("fatal condition")
-	aborted, abort := context.WithCancelCause(t.Context())
-	abort(fatal)
-	cancelled, cancel := context.WithCancelCause(t.Context())
-	cancel(nil)
-	live := t.Context()
-	other := errors.New("some other failure")
-	ambiguous := errors.Join(status.ErrOwnershipAmbiguous, context.Canceled)
-
-	for _, tc := range []struct {
-		name string
-		ctx  context.Context
-		err  error
-		want error
-	}{
-		{name: "NoError", ctx: aborted, err: nil, want: nil},
-		{name: "CancellationReplacedByCause", ctx: aborted, err: context.Canceled, want: fatal},
-		{name: "WrappedCancellationReplacedByCause", ctx: aborted, err: fmt.Errorf("copy: %w", context.Canceled), want: fatal},
-		{name: "OtherErrorKept", ctx: aborted, err: other, want: other},
-		{name: "OwnershipEvidenceKept", ctx: aborted, err: ambiguous, want: ambiguous},
-		{name: "PlainCancellationKept", ctx: cancelled, err: context.Canceled, want: context.Canceled},
-		{name: "LiveContextKept", ctx: live, err: context.Canceled, want: context.Canceled},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, abortCause(tc.ctx, tc.err))
-		})
-	}
 }

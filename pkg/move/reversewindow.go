@@ -143,7 +143,7 @@ func (w *reverseWindow) run(ctx context.Context) error {
 		revertMarkerName, revertLoc),
 		"window", r.move.ReverseWindow, "deadline", deadline, "reverse_sources", len(r.targets))
 
-	return r.status.Do(status.ReverseWindow, func() error {
+	return r.status.DoContext(ctx, status.ReverseWindow, func() error {
 		ticker := time.NewTicker(reverseWindowPollInterval)
 		defer ticker.Stop()
 		for {
