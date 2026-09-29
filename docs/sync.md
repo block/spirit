@@ -84,8 +84,8 @@ load; it continues making progress rather than pausing replication. Injected
 feeds must use `Runner.TargetUnderLoad` as their `ClientConfig.UnderLoad` callback
 and set the matching capacity-derived `FlushConcurrency`/`BatchSize` to get the
 same behavior. That method is safe to call before `Run`. An injected
-`SingleTargetApplier` using the supplied target is supported; custom or sharded
-appliers retain their configured concurrency.
+single-target `MySQLApplier` using the supplied target is supported; custom or
+multi-target appliers retain their configured concurrency.
 
 Worker ceilings are derived at startup from target capacity, client CPU capacity,
 and the fixed `--max-connections` budget. Fresh and resumed runs use the same

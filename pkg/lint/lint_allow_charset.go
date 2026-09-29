@@ -35,7 +35,12 @@ func (l *AllowCharset) Configure(config map[string]string) error {
 	for k, v := range config {
 		switch k {
 		case "charsets":
-			l.charsets = strings.Split(v, ",")
+			l.charsets = nil
+			for cs := range strings.SplitSeq(v, ",") {
+				if cs = strings.TrimSpace(cs); cs != "" {
+					l.charsets = append(l.charsets, cs)
+				}
+			}
 		default:
 			return fmt.Errorf("unknown configuration key for %q: %s", l.Name(), k)
 		}
@@ -59,17 +64,17 @@ func (l *AllowCharset) DefaultConfig() map[string]string {
 //     columns and columns inside a new CREATE TABLE.
 func (l *AllowCharset) Lint(createTables []*statement.CreateTable, changes []*statement.AbstractStatement) (violations []Violation) {
 	// TODO: do we care about supporting character sets that are valid for MySQL but not valid for the TiDB parser? For example big5
-	suggestion := "Use a supported character set: " + strings.Join(l.charsets, ", ")
+	suggestion := l.suggestion()
 	pre := PreStateColumns(createTables)
 	newTables := newTablesInChanges(changes)
 	modified := columnsModifiedInChanges(changes)
 
 	for _, ct := range PostState(createTables, changes) {
-		if ct.TableOptions != nil && ct.TableOptions.Charset != nil && !slices.Contains(l.charsets, *ct.TableOptions.Charset) {
+		if ct.TableOptions != nil && ct.TableOptions.Charset != nil && !l.allows(*ct.TableOptions.Charset) {
 			violations = append(violations, Violation{
 				Linter:     l,
 				Location:   &Location{Table: ct.TableName},
-				Message:    fmt.Sprintf("Character set %q given for table %q is not allowed", *ct.TableOptions.Charset, ct.TableName),
+				Message:    fmt.Sprintf("Character set %q given for table %q is not allowed", statement.NormalizeCharsetName(*ct.TableOptions.Charset), ct.TableName),
 				Severity:   SeverityWarning,
 				Suggestion: &suggestion,
 			})
@@ -102,9 +107,9 @@ func (l *AllowCharset) Lint(createTables []*statement.CreateTable, changes []*st
 }
 
 func (l *AllowCharset) checkColumnCharset(column *ast.ColumnDef, message string) *Violation {
-	suggestion := "Use a supported character set: " + strings.Join(l.charsets, ", ")
-	charset := column.Tp.GetCharset()
-	if charset != "" && !slices.Contains(l.charsets, charset) {
+	suggestion := l.suggestion()
+	charset := statement.NormalizeCharsetName(column.Tp.GetCharset())
+	if charset != "" && !l.allows(charset) {
 		return &Violation{
 			Linter: l,
 			Location: &Location{
@@ -116,4 +121,24 @@ func (l *AllowCharset) checkColumnCharset(column *ast.ColumnDef, message string)
 		}
 	}
 	return nil
+}
+
+// allows reports whether cs is in the allow list. Both sides go through
+// statement.NormalizeCharsetName, because the parser spells utf8mb3 as "utf8"
+// for table options, column types and NCHAR/NVARCHAR, while a user may list
+// either spelling.
+func (l *AllowCharset) allows(cs string) bool {
+	cs = statement.NormalizeCharsetName(cs)
+	return slices.ContainsFunc(l.charsets, func(allowed string) bool {
+		return statement.NormalizeCharsetName(allowed) == cs
+	})
+}
+
+// suggestion lists the allowed charsets in the spelling the messages use.
+func (l *AllowCharset) suggestion() string {
+	names := make([]string, len(l.charsets))
+	for i, cs := range l.charsets {
+		names[i] = statement.NormalizeCharsetName(cs)
+	}
+	return "Use a supported character set: " + strings.Join(names, ", ")
 }

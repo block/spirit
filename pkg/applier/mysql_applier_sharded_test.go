@@ -17,11 +17,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestShardedApplierIntegration tests the ShardedApplier with real MySQL databases
+// TestShardedApplierIntegration tests the sharded MySQLApplier with real MySQL databases
 // This test demonstrates:
 // 1. Creating multiple target databases (shards)
 // 2. Creating tables in each shard
-// 3. Creating a ShardedApplier with a test hash function
+// 3. Creating a sharded MySQLApplier with a test hash function
 // 4. Sending rows through the applier
 // 5. Verifying rows are correctly distributed across shards based on the hash function
 func TestShardedApplierIntegration(t *testing.T) {
@@ -88,14 +88,14 @@ func TestShardedApplierIntegration(t *testing.T) {
 	err = shard1Table.SetInfo(ctx)
 	require.NoError(t, err)
 
-	// Create ShardedApplier with key ranges
+	// Create sharded MySQLApplier with key ranges
 	// Shard 0: "-80" (0x0000000000000000 - 0x7fffffffffffffff)
 	// Shard 1: "80-" (0x8000000000000000 - 0xffffffffffffffff)
 	targets := []Target{
 		{DB: target1DB, KeyRange: "-80"}, // Lower half of key space
 		{DB: target2DB, KeyRange: "80-"}, // Upper half of key space
 	}
-	applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+	applier, err := New(targets, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Start the applier
@@ -300,7 +300,7 @@ func TestShardedApplierWaitWaitsForCallbacks(t *testing.T) {
 			{DB: target1DB, KeyRange: "-80"},
 			{DB: target2DB, KeyRange: "80-"},
 		}
-		applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+		applier, err := New(targets, NewApplierDefaultConfig())
 		require.NoError(t, err)
 		require.NoError(t, applier.Start(t.Context()))
 		defer func() {
@@ -418,12 +418,12 @@ func TestShardedApplierDeleteKeys(t *testing.T) {
 	err = target1Table.SetInfo(ctx)
 	require.NoError(t, err)
 
-	// Create ShardedApplier
+	// Create sharded MySQLApplier
 	targets := []Target{
 		{DB: target1DB, KeyRange: "-80"},
 		{DB: target2DB, KeyRange: "80-"},
 	}
-	applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+	applier, err := New(targets, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Delete keys by PRIMARY KEY (id=2 and id=4)
@@ -505,7 +505,7 @@ func TestShardedApplierDeleteKeysEmpty(t *testing.T) {
 		{DB: target1DB, KeyRange: "-80"},
 		{DB: target2DB, KeyRange: "80-"},
 	}
-	applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+	applier, err := New(targets, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Delete with empty keys
@@ -576,12 +576,12 @@ func TestShardedApplierUpsertRows(t *testing.T) {
 	target1Table := table.NewTableInfo(target1DB, target1.DBName, "users")
 	err = target1Table.SetInfo(ctx)
 	require.NoError(t, err)
-	// Create ShardedApplier
+	// Create sharded MySQLApplier
 	targets := []Target{
 		{DB: target1DB, KeyRange: "-80"}, // Even user_ids
 		{DB: target2DB, KeyRange: "80-"}, // Odd user_ids
 	}
-	applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+	applier, err := New(targets, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Upsert rows:
@@ -722,7 +722,7 @@ func TestShardedApplierUpsertRowsSkipDeleted(t *testing.T) {
 		{DB: target1DB, KeyRange: "-80"},
 		{DB: target2DB, KeyRange: "80-"},
 	}
-	applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+	applier, err := New(targets, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Upsert with deleted rows mixed in
@@ -787,7 +787,7 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 			{DB: target1DB, KeyRange: "-80"},
 			{DB: target2DB, KeyRange: "40-c0"},
 		}
-		_, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+		_, err := New(targets, NewApplierDefaultConfig())
 		require.Error(t, err, "Should error on overlapping key ranges")
 		require.Contains(t, err.Error(), "overlap", "Error message should mention overlap")
 	})
@@ -801,7 +801,7 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 			{DB: target1DB, KeyRange: "40-80"},
 			{DB: target2DB, KeyRange: "60-a0"},
 		}
-		_, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+		_, err := New(targets, NewApplierDefaultConfig())
 		require.Error(t, err, "Should error on overlapping key ranges")
 		require.Contains(t, err.Error(), "overlap", "Error message should mention overlap")
 	})
@@ -814,7 +814,7 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 			{DB: target1DB, KeyRange: "-80"},
 			{DB: target2DB, KeyRange: "80-"},
 		}
-		applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+		applier, err := New(targets, NewApplierDefaultConfig())
 		require.NoError(t, err, "Should not error on non-overlapping key ranges")
 		require.NotNil(t, applier)
 	})
@@ -836,7 +836,7 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 			{DB: target2DB, KeyRange: "40-80"},
 			{DB: target3DB, KeyRange: "60-"},
 		}
-		_, err = NewShardedApplier(targets, NewApplierDefaultConfig())
+		_, err = New(targets, NewApplierDefaultConfig())
 		require.Error(t, err, "Should error when any two shards overlap")
 		require.Contains(t, err.Error(), "overlap", "Error message should mention overlap")
 	})
@@ -857,7 +857,7 @@ func TestKeyRangesMustBeNonOverlapping(t *testing.T) {
 			{DB: target2DB, KeyRange: "40-80"},
 			{DB: target3DB, KeyRange: "80-"},
 		}
-		applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+		applier, err := New(targets, NewApplierDefaultConfig())
 		require.NoError(t, err, "Should not error on adjacent non-overlapping ranges")
 		require.NotNil(t, applier)
 	})
@@ -904,7 +904,7 @@ func TestShardedApplierUpsertRowsEmpty(t *testing.T) {
 		{DB: target1DB, KeyRange: "-80"},
 		{DB: target2DB, KeyRange: "80-"},
 	}
-	applier, err := NewShardedApplier(targets, NewApplierDefaultConfig())
+	applier, err := New(targets, NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	// Upsert with empty rows
@@ -915,9 +915,9 @@ func TestShardedApplierUpsertRowsEmpty(t *testing.T) {
 
 // setupShardedUnderLockTest creates a source database and two shard databases
 // (prefixed with the given name), a `users` table in each, TableInfos with the
-// even/odd test vindex, and a ShardedApplier over the two shards.
+// even/odd test vindex, and a sharded MySQLApplier over the two shards.
 // Shard 0 (KeyRange "-80") receives even user_ids, shard 1 ("80-") odd user_ids.
-func setupShardedUnderLockTest(t *testing.T, prefix string) (sourceTable, target1Table *table.TableInfo, target1DB, target2DB *sql.DB, applier *ShardedApplier) {
+func setupShardedUnderLockTest(t *testing.T, prefix string) (sourceTable, target1Table *table.TableInfo, target1DB, target2DB *sql.DB, applier *MySQLApplier) {
 	t.Helper()
 	sourceName := prefix + "_source"
 	target1Name := prefix + "_target1"
@@ -967,7 +967,7 @@ func setupShardedUnderLockTest(t *testing.T, prefix string) (sourceTable, target
 		{DB: target1DB, KeyRange: "-80"}, // Even user_ids
 		{DB: target2DB, KeyRange: "80-"}, // Odd user_ids
 	}
-	applier, err = NewShardedApplier(targets, NewApplierDefaultConfig())
+	applier, err = New(targets, NewApplierDefaultConfig())
 	require.NoError(t, err)
 	return sourceTable, target1Table, target1DB, target2DB, applier
 }
@@ -1058,7 +1058,7 @@ func TestShardedApplierDeleteKeysUnderLock(t *testing.T) {
 	affected, err := applier.DeleteKeys(ctx, sourceTable, target1Table, keysToDelete, []*dbconn.TableLock{lock1, lock2})
 	require.NoError(t, err)
 	// Under lock the per-shard counts are unknown, so the key count is
-	// reported — once, not once per shard — matching SingleTargetApplier.
+	// reported — once, not once per shard — matching single-target MySQLApplier.
 	require.Equal(t, int64(len(keysToDelete)), affected)
 
 	require.NoError(t, lock1.Close(ctx))
@@ -1128,7 +1128,7 @@ func TestShardedApplierUnderLockMissingShardLock(t *testing.T) {
 // Wait() forever. invokeCallback must balance the counter on every exit path,
 // not just normal return.
 func TestShardedApplierCallbackPanicDecrements(t *testing.T) {
-	a := &ShardedApplier{
+	a := &MySQLApplier{
 		logger:      slog.New(slog.DiscardHandler),
 		pendingWork: make(map[int64]*pendingWork),
 	}
@@ -1167,7 +1167,7 @@ func TestShardedApplierCallbackPanicDecrements(t *testing.T) {
 // route to that shard — possibly long after construction, as a nil-pointer
 // panic in the write path.
 func TestShardedApplierRejectsNilTargetDB(t *testing.T) {
-	_, err := NewShardedApplier([]Target{{DB: nil, KeyRange: "-80"}}, NewApplierDefaultConfig())
+	_, err := New([]Target{{DB: nil, KeyRange: "-80"}}, NewApplierDefaultConfig())
 	require.ErrorContains(t, err, "shard 0: target DB must be non-nil")
 }
 
@@ -1239,7 +1239,7 @@ func TestShardedApplierRenamedTarget(t *testing.T) {
 	oldTable := table.NewTableInfo(shard1DB, shard1.DBName, "t1_old")
 	require.NoError(t, oldTable.SetInfo(ctx))
 
-	applier, err := NewShardedApplier([]Target{
+	applier, err := New([]Target{
 		{DB: shard1DB, KeyRange: "-80"}, // even user_ids
 		{DB: shard2DB, KeyRange: "80-"}, // odd user_ids
 	}, NewApplierDefaultConfig())
@@ -1343,7 +1343,7 @@ func TestShardedApplierApplyRenamedColumn(t *testing.T) {
 	targetTable := table.NewTableInfo(shard1DB, "sharded_rencol_shard1", "t1")
 	require.NoError(t, targetTable.SetInfo(ctx))
 
-	applier, err := NewShardedApplier([]Target{
+	applier, err := New([]Target{
 		{DB: shard1DB, KeyRange: "-80"}, // even user_ids
 		{DB: shard2DB, KeyRange: "80-"}, // odd user_ids
 	}, NewApplierDefaultConfig())

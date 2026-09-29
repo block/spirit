@@ -19,7 +19,7 @@ import (
 // recopierHarness wires up everything mysqlRecopier needs against real
 // MySQL: a source table in the DSN database, an identical target table in
 // a unique throwaway database, TableInfos for both sides, and a started
-// SingleTargetApplier pointed at the target. This mirrors the production
+// single-target MySQLApplier pointed at the target. This mirrors the production
 // wiring in datasync.Runner.runChecksum.
 type recopierHarness struct {
 	srcDB        *sql.DB
@@ -75,11 +75,11 @@ func newRecopierHarness(t *testing.T, tableName string) *recopierHarness {
 	dstTable := table.NewTableInfo(dstDB, targetDBName, tableName)
 	require.NoError(t, dstTable.SetInfo(t.Context()))
 
-	app, err := applier.NewSingleTargetApplier(applier.Target{
+	app, err := applier.New([]applier.Target{{
 		DB:       dstDB,
 		Config:   dstCfg,
 		KeyRange: "0",
-	}, applier.NewApplierDefaultConfig())
+	}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	require.NoError(t, app.Start(t.Context()))
 	t.Cleanup(func() { require.NoError(t, app.Stop()) })
@@ -239,7 +239,7 @@ func TestNewMySQLRecopierValidation(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(srcDB)
 
-	app, err := applier.NewSingleTargetApplier(applier.Target{DB: srcDB}, applier.NewApplierDefaultConfig())
+	app, err := applier.New([]applier.Target{{DB: srcDB}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	_, err = newMySQLRecopier(nil, srcDB, app, nil, nil)

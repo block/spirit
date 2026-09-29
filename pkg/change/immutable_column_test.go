@@ -15,7 +15,7 @@ import (
 )
 
 // These tests cover the sharding-column immutability contract documented on
-// applier.ShardedApplier.UpsertRows: modifications are tracked by PRIMARY
+// applier.MySQLApplier.UpsertRows: modifications are tracked by PRIMARY
 // KEY only, so an UPDATE that changes a row's sharding (vindex) column must
 // fail the change source fatally — otherwise the new row image would be
 // flushed to its new shard while the old shard kept a stale copy.

@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 )
 
-// workerPool is the common resize/retire/join mechanism for both appliers.
+// workerPool is the resize/retire/join mechanism for one target of a MySQLApplier.
 // Workers own no completion channels: the applier seals scaling, closes its
 // input queue, joins the pool, then closes completions. Retirement is cooperative
 // through quit, so workers finish any accepted chunklet before exiting.

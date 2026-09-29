@@ -141,9 +141,9 @@ func resolveReadCeiling(configured, concurrency int) int {
 	return ResolveMaxReadThreads(concurrency, true)
 }
 
-// writeScaler is the optional capability the autoscaler drives. The
-// single-target and sharded appliers implement it; the
-// copier type-asserts it and skips autoscaling when it's absent.
+// writeScaler is the optional capability the autoscaler drives. MySQLApplier
+// implements it; the copier type-asserts it and skips autoscaling when it's
+// absent.
 type writeScaler interface {
 	SetWriteWorkers(n int)
 }

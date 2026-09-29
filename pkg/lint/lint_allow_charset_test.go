@@ -652,7 +652,8 @@ func TestEmptyCharsetsList(t *testing.T) {
 
 // TestNationalCharacterSetColumn: NCHAR/NVARCHAR always use the national
 // character set (utf8mb3, which the parser spells "utf8"), so the column is
-// checked against the allow list like one declared CHARACTER SET utf8mb3.
+// checked against the allow list like one declared CHARACTER SET utf8mb3, and
+// reported in the utf8mb3 spelling.
 func TestNationalCharacterSetColumn(t *testing.T) {
 	sql := `CREATE TABLE t1 (
 		id INT PRIMARY KEY,
@@ -663,8 +664,103 @@ func TestNationalCharacterSetColumn(t *testing.T) {
 
 	violations := (&AllowCharset{charsets: []string{"utf8mb4"}}).Lint(nil, stmts)
 	require.Len(t, violations, 1)
-	require.Contains(t, violations[0].Message, `Column "name" has unsupported character set: "utf8"`)
+	require.Contains(t, violations[0].Message, `Column "name" has unsupported character set: "utf8mb3"`)
 
 	violations = (&AllowCharset{charsets: []string{"utf8mb4", "utf8"}}).Lint(nil, stmts)
 	require.Empty(t, violations)
+}
+
+// TestUTF8MB3Spellings: utf8 and utf8mb3 name the same charset, and the parser
+// reports "utf8" for both (and for NCHAR/NVARCHAR). An allow list in either
+// spelling must accept the table and columns in either spelling, and a
+// violation must report the utf8mb3 spelling.
+func TestUTF8MB3Spellings(t *testing.T) {
+	schemas := map[string]string{
+		"utf8": `CREATE TABLE t1 (
+			id INT PRIMARY KEY,
+			a VARCHAR(3) CHARACTER SET utf8
+		) CHARACTER SET utf8`,
+		"utf8mb3": `CREATE TABLE t1 (
+			id INT PRIMARY KEY,
+			a VARCHAR(3) CHARACTER SET utf8mb3
+		) CHARACTER SET utf8mb3`,
+		"upper case": `CREATE TABLE t1 (
+			id INT PRIMARY KEY,
+			a VARCHAR(3) CHARACTER SET UTF8MB3
+		) CHARACTER SET UTF8MB3`,
+		"nvarchar": `CREATE TABLE t1 (
+			id INT PRIMARY KEY,
+			a NVARCHAR(3)
+		) CHARACTER SET utf8mb4`,
+		"nchar": `CREATE TABLE t1 (
+			id INT PRIMARY KEY,
+			a NCHAR(3)
+		) CHARACTER SET utf8mb4`,
+	}
+	for name, sql := range schemas {
+		t.Run(name, func(t *testing.T) {
+			stmts, err := statement.New(sql)
+			require.NoError(t, err)
+
+			for _, allowed := range [][]string{
+				{"utf8mb4", "utf8mb3"},
+				{"utf8mb4", "utf8"},
+				{"utf8mb4", "UTF8MB3"},
+			} {
+				violations := (&AllowCharset{charsets: allowed}).Lint(nil, stmts)
+				require.Empty(t, violations, "allow list %v", allowed)
+			}
+
+			violations := (&AllowCharset{charsets: []string{"utf8mb4"}}).Lint(nil, stmts)
+			require.NotEmpty(t, violations)
+			for _, v := range violations {
+				require.Contains(t, v.Message, `"utf8mb3"`)
+				require.NotContains(t, v.Message, `"utf8"`)
+			}
+		})
+	}
+}
+
+// TestUTF8MB3SpellingsConfigure covers the allow list as set through
+// Configure, and the suggestion's spelling of it.
+func TestUTF8MB3SpellingsConfigure(t *testing.T) {
+	stmts, err := statement.New(`CREATE TABLE t1 (
+		id INT PRIMARY KEY,
+		a VARCHAR(3) CHARACTER SET utf8mb3,
+		b NVARCHAR(3),
+		c VARCHAR(3) CHARACTER SET latin1
+	) CHARACTER SET utf8mb3`)
+	require.NoError(t, err)
+
+	for _, charsets := range []string{"utf8mb4,utf8mb3", "utf8mb4,utf8"} {
+		t.Run(charsets, func(t *testing.T) {
+			linter := AllowCharset{}
+			require.NoError(t, linter.Configure(map[string]string{"charsets": charsets}))
+
+			violations := linter.Lint(nil, stmts)
+			require.Len(t, violations, 1)
+			require.Equal(t, "c", *violations[0].Location.Column)
+			require.Contains(t, violations[0].Message, `"latin1"`)
+			require.Equal(t, "Use a supported character set: utf8mb4, utf8mb3", *violations[0].Suggestion)
+		})
+	}
+}
+
+// TestConfigureCharsetsWithSpaces: entries are trimmed, so a list written
+// with spaces after the commas matches, and the suggestion has no stray space.
+func TestConfigureCharsetsWithSpaces(t *testing.T) {
+	stmts, err := statement.New(`CREATE TABLE t1 (
+		id INT PRIMARY KEY,
+		a VARCHAR(3) CHARACTER SET utf8mb3,
+		b VARCHAR(3) CHARACTER SET latin1
+	) CHARACTER SET utf8mb4`)
+	require.NoError(t, err)
+
+	linter := AllowCharset{}
+	require.NoError(t, linter.Configure(map[string]string{"charsets": " utf8mb4, utf8mb3 ,"}))
+
+	violations := linter.Lint(nil, stmts)
+	require.Len(t, violations, 1)
+	require.Equal(t, "b", *violations[0].Location.Column)
+	require.Equal(t, "Use a supported character set: utf8mb4, utf8mb3", *violations[0].Suggestion)
 }

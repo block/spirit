@@ -114,7 +114,7 @@ func setupBufferedTest(t *testing.T) (*sql.DB, *binlogClient, *table.TableInfo, 
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	applier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applier, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})

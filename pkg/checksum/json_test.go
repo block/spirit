@@ -174,7 +174,7 @@ func TestDistributedJSONChecksumTextImage(t *testing.T) {
 	require.NoError(t, t2.SetInfo(t.Context()))
 
 	target := applier.Target{DB: dest, KeyRange: "0", Config: destCfg}
-	app, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	app, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	feed := change.NewBinlogClient(src, cfg.Addr, cfg.User, cfg.Passwd, app, change.NewClientDefaultConfig())

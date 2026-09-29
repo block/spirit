@@ -9,13 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// NewSingleTargetForTest builds a SingleTargetApplier suitable for use as the
+// NewSingleTargetForTest builds a single-target MySQLApplier suitable for use as the
 // repl client's applier. The repl client requires a non-nil applier — every
 // memory-comparable PK routes through bufferedMap, which calls
 // Applier.UpsertRows / DeleteKeys. See issue #746.
 func NewSingleTargetForTest(t *testing.T, db *sql.DB) Applier {
 	t.Helper()
-	a, err := NewSingleTargetApplier(Target{DB: db}, &ApplierConfig{
+	a, err := New([]Target{{DB: db}}, &ApplierConfig{
 		Logger:   slog.Default(),
 		DBConfig: dbconn.NewDBConfig(),
 		Threads:  1,

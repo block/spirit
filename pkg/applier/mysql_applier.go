@@ -18,14 +18,17 @@ import (
 	"github.com/block/spirit/pkg/table"
 )
 
-// ShardedApplier applies rows to multiple target databases based on a Vitess-style vindex.
-// It extracts a specific column value from each row, applies a hash function to it,
-// and routes the row to the appropriate shard based on the hash value and key ranges.
+// MySQLApplier applies rows to one or more MySQL targets. Each target owns a
+// key range, its own write connection and its own pool of write workers.
 //
-// The sharding column and hash function are configured per-table in the TableInfo.ShardingColumn
-// and TableInfo.HashFunc fields. This allows different tables to use different sharding keys
-// in multi-table migrations.
-type ShardedApplier struct {
+// With one target covering the whole key space (the migration, datasync and
+// unsharded-move case) every row goes to that target and no routing happens.
+// With several targets (a move to a Vitess-style sharded destination) each row
+// is routed by hashing its sharding column and picking the target whose key
+// range contains the hash. The sharding column and hash function are
+// configured per table in TableInfo.ShardingColumn and TableInfo.HashFunc, so
+// different tables in one multi-table move can use different sharding keys.
+type MySQLApplier struct {
 	sync.Mutex
 
 	shards      []*shardTarget
@@ -33,6 +36,11 @@ type ShardedApplier struct {
 	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
 	metricsSink metrics.Sink // nil disables the stats emitter
+
+	// unsharded is true when there is exactly one target and it covers the
+	// whole key space. Every row then belongs to shards[0], so routing is
+	// skipped and tables need no ShardingColumn/HashFunc.
+	unsharded bool
 
 	// Pending work tracking (shared across all shards).
 	//
@@ -53,7 +61,7 @@ type ShardedApplier struct {
 
 	// Context management
 	cancelFunc context.CancelFunc
-	wg         sync.WaitGroup
+	wg         sync.WaitGroup // tracks the feedbackCoordinator and stats-emitter goroutines
 
 	// timings is a rolling window of per-chunklet queue-wait and write
 	// durations across all shards, reported by Stats(). A single shared ring
@@ -64,10 +72,10 @@ type ShardedApplier struct {
 	// splits accumulates the chunklet/row counts behind Stats.RowsPerChunklet.
 	// The caps (chunkletMaxRows/MaxStatementSizeBytes) are global, but the
 	// splitting itself happens per shard: Apply routes rows to shards first and
-	// then calls splitRowsIntoChunklets on each shard's share, so one chunk
-	// yields more, shorter chunklets than it would unsharded. The counter sums
-	// those per-shard splits, and the mean is correspondingly lower — see the
-	// caveat on Stats.RowsPerChunklet.
+	// then calls splitRowsIntoChunklets on each shard's share, so with several
+	// shards one chunk yields more, shorter chunklets than it would unsharded.
+	// The counter sums those per-shard splits, and the mean is correspondingly
+	// lower — see the caveat on Stats.RowsPerChunklet.
 	splits splitCounter
 
 	// State management to make Start/Stop idempotent
@@ -75,22 +83,27 @@ type ShardedApplier struct {
 	started bool
 }
 
-// shardTarget represents a single shard with its own connection, key range, and workers
+// shardTarget represents a single target with its own connection, key range,
+// and workers.
 type shardTarget struct {
 	shardID             int
 	writeDB             *sql.DB
 	keyRange            keyRange // Parsed key range for this shard
-	chunkletBuffer      chan shardedChunklet
-	chunkletCompletions chan shardedChunkletCompletion
-	writeWorkersCount   int32
-	workers             workerPool
-	workerIDCounter     int32
-	logger              *slog.Logger
-	dbConfig            *dbconn.DBConfig
+	chunkletBuffer      chan chunklet
+	chunkletCompletions chan chunkletCompletion
+	// writeWorkersCount is the worker count the next Start spawns, set at
+	// construction from ApplierConfig.Threads or by SetInitialWriteWorkers.
+	// The *live* count can change at runtime via SetWriteWorkers.
+	writeWorkersCount int32
+	workers           workerPool
+	workerIDCounter   atomic.Int32 // monotonic worker id, for debug logging only
+	logger            *slog.Logger
+	dbConfig          *dbconn.DBConfig
 }
 
-// shardedChunklet represents a chunklet destined for a specific shard
-type shardedChunklet struct {
+// chunklet is a small batch of rows destined for one shard, limited by either
+// chunkletMaxRows or MaxStatementSizeBytes, whichever is reached first.
+type chunklet struct {
 	workID     int64        // ID of the parent work
 	shardID    int          // Which shard this belongs to
 	chunk      *table.Chunk // Original chunk for column info
@@ -98,22 +111,34 @@ type shardedChunklet struct {
 	enqueuedAt time.Time    // when Apply() offered this chunklet to the shard buffer; queue wait = dequeue - enqueuedAt
 }
 
-// shardedChunkletCompletion represents a completed sharded chunklet
-type shardedChunkletCompletion struct {
+// chunkletCompletion represents a completed chunklet
+type chunkletCompletion struct {
 	workID       int64 // ID of the parent work
 	shardID      int   // Which shard this came from
 	affectedRows int64 // Rows affected by this chunklet
 	err          error // Error if any
 }
 
-// NewShardedApplier creates a new ShardedApplier with multiple target databases.
+// pendingWork tracks a set of rows that are being processed
+type pendingWork struct {
+	callback           ApplyCallback
+	totalChunklets     int   // Total number of chunklets for this work
+	completedChunklets int   // Number of completed chunklets
+	totalAffectedRows  int64 // Sum of affected rows from all chunklets
+}
+
+// New creates a MySQLApplier that writes to targets. There must be at least
+// one target, and no two key ranges may overlap. A single target may leave
+// KeyRange empty (or "0"): it then covers the whole key space.
 //
-// The sharding column and hash function are configured per-table in the TableInfo.ShardingColumn
-// and TableInfo.HashFunc fields. This allows different tables to use different sharding keys
-// in multi-table migrations.
-func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, error) {
+// ApplierConfig.Threads is the write-worker count for EACH target, not a total
+// divided between them (see pkg/move/move.go:WriteThreads).
+func New(targets []Target, cfg *ApplierConfig) (*MySQLApplier, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if len(targets) == 0 {
+		return nil, errors.New("at least one target must be provided")
 	}
 	shards := make([]*shardTarget, len(targets))
 	for i, target := range targets {
@@ -133,9 +158,9 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 			shardID:             i,
 			writeDB:             target.DB,
 			keyRange:            kr,
-			chunkletBuffer:      make(chan shardedChunklet, defaultBufferSize),
-			chunkletCompletions: make(chan shardedChunkletCompletion, defaultBufferSize),
-			writeWorkersCount:   int32(cfg.Threads), // threads are not "divided" per shard, but are each shard. This is documented in pkg/move/move.go:WriteThreads.
+			chunkletBuffer:      make(chan chunklet, defaultBufferSize),
+			chunkletCompletions: make(chan chunkletCompletion, defaultBufferSize),
+			writeWorkersCount:   int32(cfg.Threads),
 			logger:              cfg.Logger,
 			dbConfig:            cfg.DBConfig,
 		}
@@ -152,51 +177,60 @@ func NewShardedApplier(targets []Target, cfg *ApplierConfig) (*ShardedApplier, e
 		}
 	}
 
-	// Log the parsed key ranges for debugging
+	// Log the target-to-range mapping. With several targets it is the first
+	// thing an operator checks when rows land on the wrong shard, so it is
+	// logged at Info; a single target adds nothing worth an Info line.
+	logLevel := slog.LevelDebug
+	if len(shards) > 1 {
+		logLevel = slog.LevelInfo
+	}
 	for i, shard := range shards {
-		cfg.Logger.Info("parsed key range for shard",
+		cfg.Logger.Log(context.Background(), logLevel, "parsed key range for shard",
 			"shardID", i,
 			"keyRange", targets[i].KeyRange,
 			"parsed", shard.keyRange.String())
 	}
 
-	return &ShardedApplier{
+	return &MySQLApplier{
 		shards:      shards,
 		targets:     targets,
 		dbConfig:    cfg.DBConfig,
 		logger:      cfg.Logger,
 		metricsSink: cfg.MetricsSink,
+		unsharded:   len(shards) == 1 && shards[0].keyRange.coversAll(),
 		pendingWork: make(map[int64]*pendingWork),
 	}, nil
 }
 
 // Start initializes all shard workers and begins processing.
+// This does not control the synchronous methods like UpsertRows/DeleteKeys.
 // This method is idempotent and can restart the applier after Stop() is called.
 //
 // Lifecycle: callers MUST call Stop() to terminate the per-shard write workers
 // and the single feedbackCoordinator. Cancelling the ctx passed here does NOT
 // by itself shut down the goroutine pipeline — it only aborts in-flight writes.
-// Workers for a shard exit when its chunkletBuffer is closed (by Stop), and the
-// coordinator exits when every shard's chunkletCompletions has been closed
-// (by Stop after joining each shard's workers). Failing to call Stop() will leak
+// Workers for a shard exit when its chunkletBuffer is closed (by Stop) or when
+// their quit channel is closed (by SetWriteWorkers scaling down), and the
+// coordinator exits when every shard's chunkletCompletions has been closed (by
+// Stop after joining each shard's workers). Failing to call Stop() will leak
 // goroutines.
-func (a *ShardedApplier) Start(ctx context.Context) error {
+func (a *MySQLApplier) Start(ctx context.Context) error {
 	a.Lock()
 	defer a.Unlock()
 
 	// If already started, return without error
 	if a.started {
-		a.logger.Debug("ShardedApplier already started, skipping")
+		a.logger.Debug("MySQLApplier already started, skipping")
 		return nil
 	}
 
 	// If previously stopped, we need to reinitialize channels
 	if a.stopped {
-		a.logger.Info("restarting ShardedApplier after previous stop")
+		a.logger.Info("restarting MySQLApplier after previous stop")
 		for _, shard := range a.shards {
-			shard.chunkletBuffer = make(chan shardedChunklet, defaultBufferSize)
-			shard.chunkletCompletions = make(chan shardedChunkletCompletion, defaultBufferSize)
-			shard.workerIDCounter = 0
+			shard.chunkletBuffer = make(chan chunklet, defaultBufferSize)
+			shard.chunkletCompletions = make(chan chunkletCompletion, defaultBufferSize)
+			shard.workerIDCounter.Store(0)
 		}
 		a.stopped = false
 	}
@@ -205,14 +239,10 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 	a.cancelFunc = cancelFunc
 
 	a.started = true
-	a.logger.Info("starting ShardedApplier", "shardCount", len(a.shards))
+	a.logger.Debug("starting MySQLApplier", "shardCount", len(a.shards))
 
-	// The configured count is per target, as with fixed pools.
-	for _, shard := range a.shards {
-		shard.workers.start(workerCtx, int(shard.writeWorkersCount), func(ctx context.Context, quit <-chan struct{}) { a.writeWorker(ctx, shard, quit) })
-	}
-
-	// Start a single feedback coordinator for all shards
+	// Start a single feedback coordinator for all shards, before the workers,
+	// so completions are always drained.
 	a.wg.Add(1)
 	go a.feedbackCoordinator(workerCtx)
 
@@ -224,90 +254,62 @@ func (a *ShardedApplier) Start(ctx context.Context) error {
 		})
 	}
 
+	// The configured count is per target, as with fixed pools.
+	for _, shard := range a.shards {
+		shard.workers.start(workerCtx, int(shard.writeWorkersCount), func(ctx context.Context, quit <-chan struct{}) { a.writeWorker(ctx, shard, quit) })
+	}
+
 	return nil
 }
 
-// Apply sends rows to be written to the appropriate target shards.
-// Rows are distributed across shards based on the sharding column and hash function
+// shardForHash returns the index of the shard whose key range contains hash,
+// or -1 if none does.
+func (a *MySQLApplier) shardForHash(hash uint64) int {
+	for i, shard := range a.shards {
+		if shard.keyRange.contains(hash) {
+			return i
+		}
+	}
+	return -1
+}
+
+// Apply sends rows to be written to the target(s). With several targets, rows
+// are distributed across them based on the sharding column and hash function
 // configured in the chunk's Table.ShardingColumn and Table.HashFunc.
-func (a *ShardedApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback ApplyCallback) error {
+func (a *MySQLApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]any, callback ApplyCallback) error {
 	if len(rows) == 0 {
 		// No rows to apply, invoke callback immediately
 		callback(0, nil)
 		return nil
 	}
 
-	// Extract sharding configuration from the table
-	shardingColumn := chunk.Table.ShardingColumn
-	hashFunc := chunk.Table.HashFunc
-
-	if shardingColumn == "" {
-		return errors.New("ShardingColumn not configured in TableInfo")
-	}
-	if hashFunc == nil {
-		return errors.New("HashFunc not configured in TableInfo")
-	}
-
-	a.logger.Debug("Apply called", "rowCount", len(rows), "shardingColumn", shardingColumn, "table", chunk.Table.TableName)
-
-	// Find the ordinal position of the sharding column within non-generated columns.
-	// This is important because the rows passed to Apply() only contain non-generated columns
-	// (they come from SELECT queries that exclude generated columns).
-	shardingOrdinal, err := chunk.Table.GetNonGeneratedColumnOrdinal(shardingColumn)
-	if err != nil {
+	// Group rows by shard
+	shardRows := make([][]rowData, len(a.shards))
+	if a.unsharded {
+		shardRows[0] = make([]rowData, len(rows))
+		for i, row := range rows {
+			shardRows[0][i] = rowData{values: row}
+		}
+	} else if err := a.routeRows(chunk, rows, shardRows); err != nil {
 		return err
 	}
-
-	a.logger.Debug("Found sharding column", "shardingColumn", shardingColumn, "ordinal", shardingOrdinal)
 
 	// Assign a work ID for tracking
 	workID := a.nextWorkID.Add(1)
 
-	// Group rows by shard
-	shardRows := make([][]rowData, len(a.shards))
-	for _, row := range rows {
-		// Extract the sharding column value
-		if shardingOrdinal >= len(row) {
-			return fmt.Errorf("sharding column ordinal %d exceeds row length %d", shardingOrdinal, len(row))
-		}
-		shardingValue := row[shardingOrdinal]
-
-		// Apply the hash function to get the hash value
-		hashValue, err := hashFunc(shardingValue)
-		if err != nil {
-			return fmt.Errorf("hash function error: %w", err)
-		}
-
-		// Find which shard's key range contains this hash value
-		shardID := -1
-		for i, shard := range a.shards {
-			if shard.keyRange.contains(hashValue) {
-				shardID = i
-				break
-			}
-		}
-		if shardID == -1 {
-			return fmt.Errorf("no shard found for hash value %x (sharding column: %s, value: %v)",
-				hashValue, shardingColumn, shardingValue)
-		}
-
-		// Add to the appropriate shard's row list
-		shardRows[shardID] = append(shardRows[shardID], rowData{values: row})
-	}
-
 	// Split rows into chunklets based on both row count and size thresholds
-	var allChunklets []shardedChunklet
+	var allChunklets []chunklet
 	for shardID, rows := range shardRows {
 		if len(rows) == 0 {
 			continue
 		}
 
 		// Use shared helper to split rows into chunklets
-		// Then convert row batches into sharded chunklets with metadata
+		// Then convert row batches into chunklets with metadata
 		rowBatches := splitRowsIntoChunklets(rows)
 		a.splits.record(len(rowBatches), len(rows))
 		for _, batch := range rowBatches {
-			allChunklets = append(allChunklets, shardedChunklet{
+			allChunklets = append(allChunklets, chunklet{
 				workID:  workID,
 				shardID: shardID,
 				chunk:   chunk,
@@ -362,11 +364,50 @@ func (a *ShardedApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][
 	return nil
 }
 
+// routeRows distributes copied rows across shardRows by hashing each row's
+// sharding column. The rows passed to Apply come from a SELECT that excludes
+// generated columns, so the sharding column is located by its ordinal among
+// the non-generated columns.
+func (a *MySQLApplier) routeRows(chunk *table.Chunk, rows [][]any, shardRows [][]rowData) error {
+	shardingColumn := chunk.Table.ShardingColumn
+	hashFunc := chunk.Table.HashFunc
+	if shardingColumn == "" {
+		return errors.New("ShardingColumn not configured in TableInfo")
+	}
+	if hashFunc == nil {
+		return errors.New("HashFunc not configured in TableInfo")
+	}
+	shardingOrdinal, err := chunk.Table.GetNonGeneratedColumnOrdinal(shardingColumn)
+	if err != nil {
+		return err
+	}
+	a.logger.Debug("routing rows", "rowCount", len(rows), "shardingColumn", shardingColumn,
+		"ordinal", shardingOrdinal, "table", chunk.Table.TableName)
+
+	for _, row := range rows {
+		if shardingOrdinal >= len(row) {
+			return fmt.Errorf("sharding column ordinal %d exceeds row length %d", shardingOrdinal, len(row))
+		}
+		shardingValue := row[shardingOrdinal]
+		hashValue, err := hashFunc(shardingValue)
+		if err != nil {
+			return fmt.Errorf("hash function error: %w", err)
+		}
+		shardID := a.shardForHash(hashValue)
+		if shardID == -1 {
+			return fmt.Errorf("no shard found for hash value %x (sharding column: %s, value: %v)",
+				hashValue, shardingColumn, shardingValue)
+		}
+		shardRows[shardID] = append(shardRows[shardID], rowData{values: row})
+	}
+	return nil
+}
+
 // invokeCallback runs the callback for work the caller has already claimed
 // (deleted from pendingWork and counted in callbacksInFlight while holding
 // pendingMutex), then decrements callbacksInFlight. Must be called WITHOUT
 // pendingMutex held. See the completion invariant on pendingWork.
-func (a *ShardedApplier) invokeCallback(callback ApplyCallback, affectedRows int64, err error) {
+func (a *MySQLApplier) invokeCallback(callback ApplyCallback, affectedRows int64, err error) {
 	// Decrement in a defer so callbacksInFlight is balanced on every exit path,
 	// including a panicking callback. Without this, a recovered panic upstream
 	// would leave callbacksInFlight stuck above zero and wedge Wait() forever.
@@ -383,7 +424,7 @@ func (a *ShardedApplier) invokeCallback(callback ApplyCallback, affectedRows int
 // Checking callbacksInFlight in addition to len(pendingWork) is what upholds
 // the "all callbacks have been invoked" half of the contract: claimed work has
 // already left the map, but its callback may still be running (#765).
-func (a *ShardedApplier) Wait(ctx context.Context) error {
+func (a *MySQLApplier) Wait(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -409,24 +450,30 @@ func (a *ShardedApplier) Wait(ctx context.Context) error {
 	}
 }
 
-// Stop signals the applier to shut down gracefully
-func (a *ShardedApplier) Stop() error {
+// Stop signals the applier to shut down gracefully.
+// This does not control the synchronous methods like UpsertRows/DeleteKeys,
+// which can continue after Stop() is called.
+// This method is idempotent - calling it multiple times is safe.
+func (a *MySQLApplier) Stop() error {
 	a.Lock()
 
 	// If already stopped or never started, return without error
 	if a.stopped || !a.started {
 		a.Unlock()
-		a.logger.Debug("ShardedApplier already stopped or never started, skipping")
+		a.logger.Debug("MySQLApplier already stopped or never started, skipping")
 		return nil
 	}
 
-	a.logger.Debug("Stopping ShardedApplier")
+	a.logger.Debug("stopping MySQLApplier")
 
+	// Cancel the context to signal workers to stop
 	if a.cancelFunc != nil {
 		a.cancelFunc()
 	}
 
-	// Close all shard buffers
+	// Close all shard buffers. Workers blocked in their select see the closed
+	// buffer (ok == false) and return; workers mid-write finish, send their
+	// completion, then return.
 	for _, shard := range a.shards {
 		shard.workers.seal()
 		close(shard.chunkletBuffer)
@@ -447,22 +494,50 @@ func (a *ShardedApplier) Stop() error {
 	}
 	a.wg.Wait()
 
-	a.logger.Debug("ShardedApplier stopped")
+	a.logger.Debug("MySQLApplier stopped")
 	return nil
 }
 
-// SetWriteWorkers sets the desired worker count PER SHARD. A controller may
-// drive all shards with the maximum target utilization, so a busy shard slows
-// the entire move. Retirement happens between chunklets; callbacks are never lost.
-func (a *ShardedApplier) SetWriteWorkers(n int) {
+// SetInitialWriteWorkers sets the per-target worker count that subsequent
+// starts spawn, without spawning workers. Call before Start (or after Stop has
+// returned). A running applier is unchanged.
+func (a *MySQLApplier) SetInitialWriteWorkers(n int) {
 	a.Lock()
 	defer a.Unlock()
-	if !a.started || a.stopped {
+	if a.started {
 		return
 	}
 	for _, shard := range a.shards {
+		shard.writeWorkersCount = int32(max(1, n))
+	}
+}
+
+// SetWriteWorkers reconciles the live write-worker count of EACH target to n,
+// spawning new workers or parking existing ones as needed. It is idempotent
+// and safe to call repeatedly from an autoscaler. n is clamped to a minimum of
+// 1 so every target always makes some progress. Calls before Start or after
+// Stop() begins are no-ops.
+//
+// Parking is cooperative: closing a worker's quit channel makes it exit the
+// next time it returns to its select (after finishing any chunklet currently
+// in flight), so no completion is ever lost. With several targets a controller
+// may drive all of them from the busiest target's load, so a busy shard slows
+// the entire move.
+func (a *MySQLApplier) SetWriteWorkers(n int) {
+	for _, shard := range a.shards {
 		shard.workers.resize(n)
 	}
+}
+
+// ActiveWriteWorkers returns the number of live write workers summed across
+// all targets. SetWriteWorkers is per target, so with N targets this is N
+// times the count SetWriteWorkers asked for.
+func (a *MySQLApplier) ActiveWriteWorkers() int {
+	var n int
+	for _, shard := range a.shards {
+		n += shard.workers.count()
+	}
+	return n
 }
 
 // Stats returns a point-in-time snapshot of the write pipeline, aggregated
@@ -472,15 +547,12 @@ func (a *ShardedApplier) SetWriteWorkers(n int) {
 // retired worker is removed from quits before it returns. The embedded mutex is
 // held so the buffer reads cannot race Start()'s channel reinitialization on
 // restart; len/cap on a closed channel are safe.
-func (a *ShardedApplier) Stats() Stats {
+func (a *MySQLApplier) Stats() Stats {
 	a.Lock()
-	var queueDepth, queueCap, activeWorkers int
+	var queueDepth, queueCap int
 	for _, shard := range a.shards {
 		queueDepth += len(shard.chunkletBuffer)
 		queueCap += cap(shard.chunkletBuffer)
-		if a.started {
-			activeWorkers += shard.workers.count()
-		}
 	}
 	a.Unlock()
 
@@ -493,7 +565,7 @@ func (a *ShardedApplier) Stats() Stats {
 		QueueDepth:      queueDepth,
 		QueueCap:        queueCap,
 		PendingWork:     pending,
-		ActiveWorkers:   activeWorkers,
+		ActiveWorkers:   a.ActiveWriteWorkers(),
 		RowsPerChunklet: a.splits.mean(),
 		QueueWaitP50:    t.queueWaitP50,
 		QueueWaitP90:    t.queueWaitP90,
@@ -506,9 +578,10 @@ func (a *ShardedApplier) Stats() Stats {
 	}
 }
 
-// writeWorker processes chunklets for a specific shard
-func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, quit <-chan struct{}) {
-	workerID := atomic.AddInt32(&shard.workerIDCounter, 1)
+// writeWorker processes chunklets for a specific shard until either its quit
+// channel is closed (scale-down) or the shard's buffer is closed by Stop().
+func (a *MySQLApplier) writeWorker(ctx context.Context, shard *shardTarget, quit <-chan struct{}) {
+	workerID := shard.workerIDCounter.Add(1)
 
 	// Drain chunkletBuffer until it is closed by Stop(). We deliberately do not
 	// select on ctx.Done() here: every chunklet that made it into the buffer was
@@ -517,14 +590,18 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, qu
 	// quickly with ctx.Err() and we forward that as an error completion — the
 	// feedbackCoordinator then invokes the callback with the error and clears
 	// pendingWork. Stop() is the canonical shutdown path: it cancels ctx (so
-	// in-flight writes abort) and closes chunkletBuffer (so workers exit).
+	// in-flight writes abort) and closes chunkletBuffer (so workers exit). The
+	// quit channel is the scale-down path: a parked worker stops pulling new
+	// chunklets but any chunklet already in flight still completes.
 	for {
-		var chunkletData shardedChunklet
+		var chunkletData chunklet
 		select {
 		case <-quit:
+			a.logger.Debug("writeWorker parked (scale-down), exiting", "shardID", shard.shardID, "workerID", workerID)
 			return
 		case next, ok := <-shard.chunkletBuffer:
 			if !ok {
+				a.logger.Debug("writeWorker channel closed, exiting", "shardID", shard.shardID, "workerID", workerID)
 				return
 			}
 			chunkletData = next
@@ -537,11 +614,16 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, qu
 		affectedRows, buildTime, err := a.writeChunklet(ctx, shard, chunkletData)
 		writeTime := time.Since(writeStart)
 
-		// Timed separately from the write — see the equivalent comment in
-		// SingleTargetApplier.writeWorker. A worker blocked publishing its
-		// completion is waiting on the feedbackCoordinator, not the shard.
+		// Timed separately from the write: a worker blocked here is waiting
+		// on the single feedbackCoordinator (which invokes the chunk
+		// callback inline), not on the target, and while blocked it is not
+		// pulling from chunkletBuffer either. Folding it into writeTime
+		// would attribute a completion-path stall to the database, and
+		// leaving it untimed hides it from the status block altogether,
+		// which is the shape of "more write workers changed nothing" that is
+		// otherwise very hard to see.
 		handoffStart := time.Now()
-		shard.chunkletCompletions <- shardedChunkletCompletion{
+		shard.chunkletCompletions <- chunkletCompletion{
 			workID:       chunkletData.workID,
 			shardID:      shard.shardID,
 			affectedRows: affectedRows,
@@ -551,10 +633,12 @@ func (a *ShardedApplier) writeWorker(ctx context.Context, shard *shardTarget, qu
 	}
 }
 
-// writeChunklet writes a single chunklet to a specific shard. It returns the
-// affected row count and, separately, how long the client-side statement build
-// took — see SingleTargetApplier.writeChunklet.
-func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, chunkletData shardedChunklet) (int64, time.Duration, error) {
+// writeChunklet writes a single chunklet (up to chunkletMaxRows or
+// MaxStatementSizeBytes) to a specific shard. It returns the affected row
+// count and, separately, how long the client-side statement build took — that
+// portion holds no connection and is spent on spirit's own CPU, so Stats()
+// reports it apart from the round trip (see Stats.BuildTimeP50).
+func (a *MySQLApplier) writeChunklet(ctx context.Context, shard *shardTarget, chunkletData chunklet) (int64, time.Duration, error) {
 	if len(chunkletData.rows) == 0 {
 		return 0, 0, nil
 	}
@@ -568,28 +652,34 @@ func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, 
 		return 0, time.Since(buildStart), err
 	}
 
-	// Create a context with timeout for the entire operation
+	// Bound the write, retries included — see chunkTaskTimeout.
 	ctx, cancel := context.WithTimeout(ctx, chunkTaskTimeout)
 	defer cancel()
 
-	// The intersected source and target column lists are parallel: the
-	// INSERT names the target columns (renames applied), and each value is
-	// rendered using its source column's type, since the value came from a
-	// source SELECT. Same as SingleTargetApplier.writeChunklet and this
-	// applier's own UpsertRows.
+	// The intersected source and target column lists are parallel — row.values[i]
+	// is a value for source column sourceColumnNames[i], which corresponds to
+	// target column at the same ordinal in targetColumnList. With column renames
+	// the two lists differ; without renames they are identical.
 	mapping := chunkletData.chunk.ColumnMapping
 	_, targetColumnList := mapping.Columns()
 	sourceColumnNames, _ := mapping.ColumnsSlice()
 
-	// Resolve each column's type once per chunklet, not once per value — the
-	// type is a property of the column, and the parse dominated the build.
-	// See the SingleTargetApplier's writeChunklet for the measurement.
+	// Resolve each column's type once per chunklet, not once per value. The
+	// type is a property of the column, so the inner loop was re-doing a map
+	// lookup and a type-string parse for every value of every row — measured
+	// as ~14x the cost of the whole build on a 12-column row, and the reason
+	// applier-build-p50 dominates applier-write-p50 on wide tables.
+	// deleteKeysInClause does the same hoist for the same reason.
+	//
+	// Type lookup uses the source table by the source column name — the value
+	// came from a source SELECT, and MySQL coerces on the destination INSERT
+	// if the target column type has widened.
 	sourceTable := mapping.SourceTable()
 	colTypes := make([]table.ColumnType, len(sourceColumnNames))
 	for i, colName := range sourceColumnNames {
 		typeStr, ok := sourceTable.GetColumnMySQLType(colName)
 		if !ok {
-			return 0, time.Since(buildStart), fmt.Errorf("column %s not found in table info", colName)
+			return 0, time.Since(buildStart), fmt.Errorf("column %s not found in source table info", colName)
 		}
 		colTypes[i] = table.NewColumnType(typeStr)
 	}
@@ -642,12 +732,12 @@ func (a *ShardedApplier) writeChunklet(ctx context.Context, shard *shardTarget, 
 // feedbackCoordinator tracks chunklet completions from all shards and invokes callbacks when work is done.
 // ctx is the worker context; once it is cancelled, completions for already-cleaned-up
 // work are an expected part of shutdown rather than a bug (see Apply's ctx-cancel cleanup).
-func (a *ShardedApplier) feedbackCoordinator(ctx context.Context) {
+func (a *MySQLApplier) feedbackCoordinator(ctx context.Context) {
 	defer a.wg.Done()
 	a.logger.Debug("feedbackCoordinator started")
 
 	// processCompletion handles a single chunklet completion.
-	processCompletion := func(completion shardedChunkletCompletion) {
+	processCompletion := func(completion chunkletCompletion) {
 		a.logger.Debug("feedbackCoordinator received chunklet completion",
 			"workID", completion.workID, "shardID", completion.shardID)
 
@@ -673,11 +763,12 @@ func (a *ShardedApplier) feedbackCoordinator(ctx context.Context) {
 		// the completion invariant on pendingWork) is atomic under
 		// pendingMutex so that:
 		//  (a) Apply's ctx-cancel cleanup cannot find the entry and invoke
-		//      the callback a second time.
+		//      the callback a second time. The original #765 fix released
+		//      the lock between invoking the callback and deleting the
+		//      entry, which opened exactly that double-invocation window.
 		//  (b) Wait() — which requires pendingWork empty AND
 		//      callbacksInFlight zero — cannot return until the callback
-		//      has finished running (#765; the single-target applier was
-		//      fixed first, this mirrors it).
+		//      has finished running.
 		if completion.err != nil {
 			callback := pending.callback
 			delete(a.pendingWork, completion.workID)
@@ -715,8 +806,17 @@ func (a *ShardedApplier) feedbackCoordinator(ctx context.Context) {
 		}
 	}
 
+	// With one shard, read its completions directly: no merge goroutines.
+	if len(a.shards) == 1 {
+		for completion := range a.shards[0].chunkletCompletions {
+			processCompletion(completion)
+		}
+		a.logger.Debug("feedbackCoordinator chunklet completions channel closed, exiting")
+		return
+	}
+
 	// Create a merged channel to receive completions from all shards
-	mergedCompletions := make(chan shardedChunkletCompletion, defaultBufferSize)
+	mergedCompletions := make(chan chunkletCompletion, defaultBufferSize)
 
 	// Start goroutines to forward completions from each shard to the merged channel.
 	// These use a simple range loop (no ctx.Done select) to ensure all completions
@@ -724,13 +824,11 @@ func (a *ShardedApplier) feedbackCoordinator(ctx context.Context) {
 	// write workers for that shard finish, which is the authoritative signal.
 	var forwardWg sync.WaitGroup
 	for _, shard := range a.shards {
-		forwardWg.Add(1)
-		go func(s *shardTarget) {
-			defer forwardWg.Done()
-			for completion := range s.chunkletCompletions {
+		forwardWg.Go(func() {
+			for completion := range shard.chunkletCompletions {
 				mergedCompletions <- completion
 			}
-		}(shard)
+		})
 	}
 
 	// Close merged channel when all shard channels are closed
@@ -758,23 +856,39 @@ func (a *ShardedApplier) feedbackCoordinator(ctx context.Context) {
 // the rows to the wrong server.
 //
 // Returns nil if no locks were supplied (callers then use the regular
-// per-shard write connections). If locks were supplied but any shard has
-// no matching lock, an error is returned before anything is executed.
-func (a *ShardedApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*dbconn.TableLock, error) {
+// per-shard write connections). Otherwise each distinct shard connection must
+// receive exactly one lock (shards that share a connection share its lock) and
+// every lock must belong to a shard; anything else is a caller bug (typically a
+// lock taken on a different server than this applier writes to) and is an
+// error returned before anything is executed.
+func (a *MySQLApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*dbconn.TableLock, error) {
 	if len(locks) == 0 {
 		return nil, nil
 	}
+	// Index the locks by the connection they were acquired on. Several shards
+	// may share one connection (and so one lock); two locks on one connection
+	// are ambiguous and refused.
+	lockByDB := make(map[*sql.DB]*dbconn.TableLock, len(locks))
+	for i, lock := range locks {
+		if lock == nil {
+			return nil, fmt.Errorf("table lock %d is nil", i)
+		}
+		shardID := slices.IndexFunc(a.shards, func(s *shardTarget) bool { return s.writeDB == lock.DB() })
+		if shardID == -1 {
+			return nil, fmt.Errorf("table lock %d was not acquired on any target's connection", i)
+		}
+		if lockByDB[lock.DB()] != nil {
+			return nil, fmt.Errorf("more than one table lock supplied for shard %d", shardID)
+		}
+		lockByDB[lock.DB()] = lock
+	}
 	shardLocks := make(map[int]*dbconn.TableLock, len(a.shards))
 	for _, shard := range a.shards {
-		for _, lock := range locks {
-			if lock != nil && lock.DB() == shard.writeDB {
-				shardLocks[shard.shardID] = lock
-				break
-			}
-		}
-		if shardLocks[shard.shardID] == nil {
+		lock := lockByDB[shard.writeDB]
+		if lock == nil {
 			return nil, fmt.Errorf("no table lock supplied for shard %d: writing under lock requires one lock per shard, acquired on that shard's connection", shard.shardID)
 		}
+		shardLocks[shard.shardID] = lock
 	}
 	return shardLocks, nil
 }
@@ -791,11 +905,10 @@ func (a *ShardedApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*
 // the deletes to all shards. The vindex value is considered immutable, and we will
 // error if it changes on an update.
 //
-// Note: the sharded applier supports renaming the table (targetTable, nil =>
-// same name as sourceTable) but no column transformations. The rename exists
-// for the reverse feed of a sharded-source move, which writes back to the
-// source's retired `_old` tables.
-func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+// targetTable may be nil, meaning the same name as sourceTable. A different
+// name is used by migrations (the `_new` table) and by the reverse feed of a
+// sharded-source move, which writes back to the source's retired `_old` tables.
+func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
@@ -824,6 +937,8 @@ func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTabl
 		sqlescape.EscapeIdentifierList(sourceTable.KeyColumns),
 		inClause,
 	)
+
+	a.logger.Debug("executing delete", "keyCount", len(keys), "table", targetTable.TableName, "shardCount", len(a.shards))
 
 	// Execute deletes on all shards in parallel (broadcast)
 	type result struct {
@@ -871,31 +986,61 @@ func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTabl
 		return 0, errors.Join(errs...)
 	}
 	if shardLocks != nil {
-		// Under lock the per-shard counts are unknown. Report the key count,
-		// as SingleTargetApplier does: each key lives on at most one shard,
-		// so it is the upper bound on rows deleted across the broadcast.
+		// Under lock the per-shard counts are unknown. Report the key count:
+		// each key lives on at most one shard, so it is the upper bound on
+		// rows deleted across the broadcast.
 		return int64(len(keys)), nil
 	}
 	return totalAffected, nil
 }
 
-// UpsertRows performs upserts synchronously, distributing across shards.
-// The rows are LogicalRow structs containing inline row images from the
-// binlog. Each shard issues `REPLACE INTO target (cols) VALUES (...)`;
-// the REPLACE semantics — and their eventual-consistency implications
-// for callers — are documented on SingleTargetApplier.UpsertRows. The
-// short version: REPLACE may delete rows whose PKs are not in the
-// `rows` argument (via the unique-key conflict resolution) and those
-// rows are re-inserted by their own events in subsequent batches.
+// UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously,
+// distributing rows across shards. The rows are LogicalRow structs containing
+// inline row images from the binlog. If locks is non-empty, each shard's
+// upsert is executed under the table lock that was acquired on that shard's
+// own connection (one lock per shard, matched via resolveShardLocks).
 //
-// If locks is non-empty, each shard's upsert is executed under the table lock
-// that was acquired on that shard's own connection (one lock per shard,
-// matched via resolveShardLocks).
+// REPLACE semantics, and why we use them:
 //
-// Note: we only track modifications by PRIMARY KEY, not be shard key (aka primary vindex).
-// For this reason we could get in trouble if there was a PK update that mutated the vindex column.
-// This is because we would only see the last operation (modification) and not know to DELETE
-// from one of the shards.
+// MySQL's `REPLACE INTO target (cols) VALUES (...)` treats each value
+// tuple as an INSERT, except that for any row in `target` that conflicts
+// with the new row on PRIMARY KEY *or any UNIQUE index*, the old row is
+// deleted before the new row is inserted. Per the docs, conflicts on
+// multiple unique indexes can lead to multiple deletions for a single
+// new row.
+//
+// Two implications matter for callers reading this code:
+//
+//  1. A single REPLACE may delete rows whose PKs are *not* in the
+//     `rows` argument. If row B's image collides on a unique key with
+//     some other row A currently in the destination (because A was the
+//     previous holder of that unique value), REPLACE deletes A while
+//     inserting B. A is then transiently missing from the destination
+//     until its own event arrives in a later flush (or a later batch in
+//     the same flush) and re-inserts it. This is what restores the
+//     order-independence the pre-#821 deltaMap had with `REPLACE INTO
+//     ... SELECT`. See block/spirit#847.
+//
+//  2. Eventual consistency. Between the moment REPLACE deletes A and
+//     the moment A's image is re-applied, the destination is not a
+//     valid snapshot of source — it has fewer rows. Spirit relies on
+//     the bufferedMap being an *up-to-date and disjoint* representation
+//     of pending changes (each PK appears at most once, holding the
+//     latest row image) so that every transiently-deleted row will be
+//     re-inserted as flushes progress. The destination converges back
+//     to source's current state once the last unflushed event for each
+//     affected PK has been applied. The post-cutover checksum (with
+//     `FixDifferences=true`) is the backstop that catches any
+//     divergence that survives.
+//
+// We supply inline row images rather than `REPLACE INTO ... SELECT FROM
+// source`, so the read-after-commit race that motivated #746 does not
+// apply.
+//
+// Sharding: we only track modifications by PRIMARY KEY, not by shard key (aka
+// primary vindex). For this reason we could get in trouble if there was a PK
+// update that mutated the vindex column. This is because we would only see the
+// last operation (modification) and not know to DELETE from one of the shards.
 //
 // The way we address this, is we consider the vindex column immutable. The replication client is told
 // that it should error if there are any updates to it, and the entire operation is canceled.
@@ -906,13 +1051,9 @@ func (a *ShardedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTabl
 // This is likely not too big of a limitation, as Vitess itself recommends that vindex columns be immutable.
 // If it turns out to be a problem, we can revisit tracking by other columns later.
 //
-// Note: the sharded applier supports renaming the table (mapping's target,
-// which defaults to the source when no NewTable is set) but no column
-// transformations. The rename exists for the reverse feed of a sharded-source
-// move, which writes back to the source's retired `_old` tables. The sharding
-// column and hash always come from the mapping's SOURCE table — the watched
-// table whose row images we are routing.
-func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+// The sharding column and hash always come from the mapping's SOURCE table —
+// the watched table whose row images we are routing.
+func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
@@ -925,54 +1066,22 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 	}
 
 	sourceTable := mapping.SourceTable()
-	if sourceTable.ShardingColumn == "" {
-		return 0, errors.New("ShardingColumn not configured in TableInfo")
-	}
-	if sourceTable.HashFunc == nil {
-		return 0, errors.New("HashFunc not configured in TableInfo")
-	}
-
-	// Find the ordinal position of the sharding column within ALL columns
-	// (since RowImage from binlog contains ALL columns, including generated ones)
-	shardingOrdinal := slices.Index(sourceTable.Columns, sourceTable.ShardingColumn)
+	// RowImage from the binlog contains ALL columns, including STORED
+	// generated columns, so we must index it via ordinal positions in
+	// the full column list — not via positions in NonGeneratedColumns.
 	sourceOrdinal := mapping.SourceOrdinalIndices()
 	sourceColumnNames, _ := mapping.ColumnsSlice()
-	if shardingOrdinal == -1 {
-		return 0, fmt.Errorf("sharding column %s not found in columns", sourceTable.ShardingColumn)
-	}
 
 	// Group rows by shard
 	shardRows := make([][]LogicalRow, len(a.shards))
-	for _, row := range rows {
-		if row.IsDeleted {
-			continue // Skip deleted rows
-		}
-
-		// Extract the sharding column value from the row image
-		if shardingOrdinal >= len(row.RowImage) {
-			return 0, fmt.Errorf("sharding column ordinal %d exceeds row image length %d", shardingOrdinal, len(row.RowImage))
-		}
-		shardingValue := row.RowImage[shardingOrdinal]
-
-		// Apply the hash function to get the hash value
-		hashValue, err := sourceTable.HashFunc(shardingValue)
-		if err != nil {
-			return 0, fmt.Errorf("hash function error: %w", err)
-		}
-
-		// Find which shard's key range contains this hash value
-		shardID := -1
-		for i, shard := range a.shards {
-			if shard.keyRange.contains(hashValue) {
-				shardID = i
-				break
+	if a.unsharded {
+		for _, row := range rows {
+			if !row.IsDeleted {
+				shardRows[0] = append(shardRows[0], row)
 			}
 		}
-		if shardID == -1 {
-			return 0, fmt.Errorf("no shard found for hash value %x (sharding column: %s, value: %v)",
-				hashValue, sourceTable.ShardingColumn, shardingValue)
-		}
-		shardRows[shardID] = append(shardRows[shardID], row)
+	} else if err := a.routeRowImages(sourceTable, rows, shardRows); err != nil {
+		return 0, err
 	}
 
 	// Execute upserts on each shard in parallel
@@ -985,15 +1094,17 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 	defer close(results)
 
 	// Build the column list for the upsert statement from the mapping so a
-	// renamed target (e.g. the reverse feed's `_old` tables) uses its own
-	// column list. With no rename the mapping's target IS the source table,
-	// so this is identical to the previous NonGeneratedColumns list.
+	// renamed target (a migration's `_new` table, or the reverse feed's `_old`
+	// tables) uses its own column list.
 	_, columnList := mapping.Columns()
 
-	// Resolve each column's type once for the whole fan-out. Doing it inside
-	// the loop made every shard's goroutine re-parse the same type string for
-	// every value, so the cost scaled with shards as well as rows. colTypes is
-	// only read from here on, so sharing it across the goroutines is safe.
+	// Resolve each column's type once for the whole fan-out, not once per
+	// value. In order to create a datum we need to know the MySQL type, which
+	// we get from the source table. This matters more here than on the copy
+	// path: an upsert batch can be a handful of rows, so there is far less to
+	// amortize the resolution over, and the final flush runs under the table
+	// lock at cutover. colTypes is only read from here on, so sharing it
+	// across the goroutines is safe.
 	colTypes := make([]table.ColumnType, len(sourceOrdinal))
 	for i := range sourceOrdinal {
 		typeStr, ok := sourceTable.GetColumnMySQLType(sourceColumnNames[i])
@@ -1032,10 +1143,10 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 				valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 			}
 
-			// See ShardedApplier.UpsertRows (and SingleTargetApplier.UpsertRows)
-			// for the REPLACE rationale and the eventual-consistency
-			// implications. Just the table name here — the per-shard DB
-			// connection already determines which database to write to.
+			// See the function-level doc for the REPLACE rationale and the
+			// eventual-consistency implications. Just the table name here —
+			// the per-shard DB connection already determines which database
+			// to write to.
 			upsertStmt := fmt.Sprintf("REPLACE INTO %s (%s) VALUES %s",
 				mapping.TargetTable().QuotedTableName,
 				columnList,
@@ -1056,6 +1167,8 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 				if err = shardLocks[sid].ExecUnderLock(ctx, upsertStmt); err != nil {
 					err = fmt.Errorf("failed to execute upsert under lock on shard %d: %w", sid, err)
 				} else {
+					// ExecUnderLock does not report affected rows, so return
+					// the row count.
 					affected = int64(len(valuesClauses))
 				}
 			} else {
@@ -1086,8 +1199,45 @@ func (a *ShardedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMa
 	return totalAffected, nil
 }
 
+// routeRowImages distributes the non-deleted binlog row images in rows across
+// shardRows by hashing each image's sharding column. A binlog row image holds
+// ALL columns, generated ones included, so the sharding column is located by
+// its ordinal in the full column list.
+func (a *MySQLApplier) routeRowImages(sourceTable *table.TableInfo, rows []LogicalRow, shardRows [][]LogicalRow) error {
+	if sourceTable.ShardingColumn == "" {
+		return errors.New("ShardingColumn not configured in TableInfo")
+	}
+	if sourceTable.HashFunc == nil {
+		return errors.New("HashFunc not configured in TableInfo")
+	}
+	shardingOrdinal := slices.Index(sourceTable.Columns, sourceTable.ShardingColumn)
+	if shardingOrdinal == -1 {
+		return fmt.Errorf("sharding column %s not found in columns", sourceTable.ShardingColumn)
+	}
+	for _, row := range rows {
+		if row.IsDeleted {
+			continue // Skip deleted rows
+		}
+		if shardingOrdinal >= len(row.RowImage) {
+			return fmt.Errorf("sharding column ordinal %d exceeds row image length %d", shardingOrdinal, len(row.RowImage))
+		}
+		shardingValue := row.RowImage[shardingOrdinal]
+		hashValue, err := sourceTable.HashFunc(shardingValue)
+		if err != nil {
+			return fmt.Errorf("hash function error: %w", err)
+		}
+		shardID := a.shardForHash(hashValue)
+		if shardID == -1 {
+			return fmt.Errorf("no shard found for hash value %x (sharding column: %s, value: %v)",
+				hashValue, sourceTable.ShardingColumn, shardingValue)
+		}
+		shardRows[shardID] = append(shardRows[shardID], row)
+	}
+	return nil
+}
+
 // GetTargets returns the target database configurations for direct access.
 // This is used by operations like checksum that need to query targets directly.
-func (a *ShardedApplier) GetTargets() []Target {
+func (a *MySQLApplier) GetTargets() []Target {
 	return a.targets
 }

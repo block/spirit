@@ -170,12 +170,11 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 		Logger:   logger,
 		Threads:  threads,
 	}
-	var appl applier.Applier
-	if len(cfg.Targets) > 0 {
-		appl, err = applier.NewShardedApplier(cfg.Targets, applCfg)
-	} else {
-		appl, err = applier.NewSingleTargetApplier(cfg.Target, applCfg)
+	targets := cfg.Targets
+	if len(targets) == 0 {
+		targets = []applier.Target{cfg.Target}
 	}
+	appl, err := applier.New(targets, applCfg)
 	if err != nil {
 		return nil, fmt.Errorf("reverse feed: create applier: %w", err)
 	}

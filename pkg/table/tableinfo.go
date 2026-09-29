@@ -82,7 +82,7 @@ type TableInfo struct {
 	// When empty, the multi-chunker keys by SchemaName.TableName only.
 	Host string
 
-	// Sharding configuration (for ShardedApplier)
+	// Sharding configuration (read by MySQLApplier to route rows across several targets)
 	// These are set per-table when using multi-table migrations with different sharding keys
 	ShardingColumn string   // Column name to extract and hash (e.g., "user_id")
 	HashFunc       HashFunc // Hash function: value -> uint64

@@ -44,25 +44,6 @@ func forceKillGracePeriod(lockWaitTimeout int) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
 }
 
-// ValidateForceKillAfter rejects delays that cannot leave time for lock acquisition.
-// LockWaitTimeout is in whole seconds, matching MySQL's session variable.
-func (c *DBConfig) ValidateForceKillAfter() error {
-	if c.ForceKillAfter < 0 {
-		return fmt.Errorf("force-kill-after must be non-negative")
-	}
-	if c.ForceKillAfter > 0 && c.ForceKillAfter >= time.Duration(c.LockWaitTimeout)*time.Second {
-		return fmt.Errorf("force-kill-after must be less than lock-wait-timeout (%ds)", c.LockWaitTimeout)
-	}
-	return nil
-}
-
-func (c *DBConfig) forceKillDelay() time.Duration {
-	if c.ForceKillAfter > 0 {
-		return c.ForceKillAfter
-	}
-	return forceKillGracePeriod(c.LockWaitTimeout)
-}
-
 // Rollback can outlast lock acquisition, so this budget is independent of
 // LockWaitTimeout. It adds at most 30 seconds before each statement retry.
 const forceKillCleanupTimeout = 30 * time.Second

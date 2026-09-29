@@ -9,7 +9,7 @@ import (
 // This file holds the comparison helpers used by Diff to decide whether two
 // parsed schema elements (columns, indexes, constraints, partitions) are
 // equivalent. They are free functions rather than CreateTable methods; the
-// CreateTable receivers that drive the diff live in diff.go.
+// CreateTable receivers that drive the diff live in create_table.go.
 
 // columnExtendedAttributesEqual compares the column attributes beyond the
 // basic type/nullability/default set: ON UPDATE (TIMESTAMP/DATETIME

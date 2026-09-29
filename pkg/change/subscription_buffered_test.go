@@ -93,7 +93,7 @@ func TestBufferedMapVariableColumns(t *testing.T) {
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	applier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applier, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
@@ -143,7 +143,7 @@ func TestBufferedMapIllegalValues(t *testing.T) {
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	applier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applier, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
@@ -215,7 +215,7 @@ func TestBufferedMapFlushUnderLockBypassesWatermark(t *testing.T) {
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	client := &binlogClient{
@@ -346,7 +346,7 @@ func TestBufferedMapFlushWithoutLockRespectsWatermark(t *testing.T) {
 		KeyRange: "0",
 		Config:   cfg,
 	}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	client := &binlogClient{
@@ -516,7 +516,7 @@ func TestBufferedMapQueueModeFlush(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -597,7 +597,7 @@ func TestBufferedMapQueueModeFIFOOrder(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -662,7 +662,7 @@ func TestBufferedMapTransitionDrainsOutgoing(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -747,7 +747,7 @@ func TestBufferedMapToggleDrainFailureLeavesFlagUnchanged(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -1076,7 +1076,7 @@ func TestBufferedMapQueueFlushEmpty(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -1130,7 +1130,7 @@ func TestBufferedMapQueueFlushUnderLock(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -1208,7 +1208,7 @@ func TestBufferedMapQueueConcurrentFlush(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -1749,7 +1749,7 @@ func TestBufferedMapSeparatorInPKValues(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	applierInstance, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
 	mockChunker := table.NewMockChunker(srcTable.TableName, 1000)
@@ -1971,7 +1971,7 @@ func TestBufferedMapFlushByteCapSplitsDeletes(t *testing.T) {
 // TestBufferedMapWideRowsFlushSplitsStatements is the end-to-end regression
 // test for unbounded binlog-apply statement size: LONGTEXT rows of a few
 // hundred KiB are captured from the real binlog and flushed through a real
-// SingleTargetApplier. Pre-fix, all six rows rendered into ONE ~2.4 MiB
+// single-target MySQLApplier. Pre-fix, all six rows rendered into ONE ~2.4 MiB
 // REPLACE (and 1000 such buffered rows into a multi-GiB one) — over any
 // max_allowed_packet-sized limit this is a deterministic, non-retryable
 // failure. Post-fix the flush splits on the 1 MiB rendered-byte budget and
@@ -1997,7 +1997,7 @@ func TestBufferedMapWideRowsFlushSplitsStatements(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	target := applier.Target{DB: db, KeyRange: "0", Config: cfg}
-	realApplier, err := applier.NewSingleTargetApplier(target, applier.NewApplierDefaultConfig())
+	realApplier, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	counting := &applier.MockApplier{Inner: realApplier}
 

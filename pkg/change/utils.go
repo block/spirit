@@ -203,7 +203,7 @@ func pkValueEqual(a, b any) bool {
 // -1 (no immutable column configured) makes the check a no-op.
 //
 // This enforces the sharded applier's vindex contract (see
-// applier.ShardedApplier.UpsertRows): modifications are tracked by PRIMARY
+// applier.MySQLApplier.UpsertRows): modifications are tracked by PRIMARY
 // KEY only, so an UPDATE that moved a row's sharding-column value would
 // flush the new row image to its new shard while the old shard silently
 // kept a stale copy of the row. Both processRowsEvent implementations treat

@@ -130,7 +130,7 @@ if err := chunker.Open(); err != nil {
 
 // Create an applier: it owns the write side of the pipeline.
 applierConfig := applier.NewApplierDefaultConfig()
-rowApplier, err := applier.NewSingleTargetApplier(applier.Target{DB: targetDB}, applierConfig)
+rowApplier, err := applier.New([]applier.Target{{DB: targetDB}}, applierConfig)
 if err != nil {
     return err
 }

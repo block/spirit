@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/buildinfo"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
@@ -23,6 +24,7 @@ import (
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/host"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/move/check"
 	"github.com/block/spirit/pkg/sentinel"
@@ -39,6 +41,11 @@ import (
 // on the same value the CLI does.
 const defaultWriteThreads = 4
 const defaultThreads = 2
+
+// As in migration, reserve checksum repair/prefetch, checkpoint/flush polling,
+// at least one statistics query, and a drain connection. The runtime reserve
+// adds the remaining per-table statistics queries on each source pool.
+const minChecksumPhaseReserve = 6
 
 var (
 	tableStatUpdateInterval = 5 * time.Minute
@@ -776,6 +783,161 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	return r.newCopy(ctx)
 }
 
+// setupThrottling is shared by fresh and resumed moves. Every Aurora target
+// gets the load throttlers migration builds on its source — commit latency
+// and threads — whether or not autoscaling is enabled, and they are combined
+// into one signal: the copy pauses when any target is overloaded. Autoscaling
+// then reads the same probe results, so the signal it scales against is the
+// one throttling the move.
+func (r *Runner) setupThrottling(ctx context.Context) error {
+	r.setThrottler(&throttler.Noop{})
+	groups := r.targetHosts()
+	results := make([]throttler.AuroraResult, len(groups))
+	for i, group := range groups {
+		target := r.targets[group.Indices[0]]
+		result, err := r.buildAurora(ctx, throttler.AuroraSetup{
+			Source: target.DB,
+			OpenMonitor: func() (*sql.DB, error) {
+				cfg := *r.dbConfig
+				cfg.MaxOpenConnections = 2
+				return dbconn.NewWithConnectionType(target.Config.FormatDSN(), &cfg, "move target monitor")
+			},
+			CommitLatencyThreshold: r.move.MaxCommitLatency,
+			Logger:                 r.logger.With("target", targetKey(target)),
+		})
+		if err != nil {
+			closeAuroraResults(results[:i])
+			return err
+		}
+		results[i] = result
+	}
+	return r.applyAuroraResults(ctx, groups, results)
+}
+
+// applyAuroraResults installs the targets' combined load signal and then
+// sizes autoscaling from the same results. It takes ownership of every
+// result's throttlers and monitor pool, including on failure.
+func (r *Runner) applyAuroraResults(ctx context.Context, groups []host.Group, results []throttler.AuroraResult) error {
+	var signals []throttler.Throttler
+	var monitors []*sql.DB
+	for _, result := range results {
+		signals = append(signals, result.Throttlers...)
+		if result.MonitorDB != nil {
+			monitors = append(monitors, result.MonitorDB)
+		}
+	}
+	if len(signals) > 0 {
+		composite := throttler.NewMultiThrottler(signals...)
+		if err := composite.Open(ctx); err != nil {
+			closeAuroraResults(results)
+			return err
+		}
+		r.setThrottler(composite)
+		r.monitorDBs = monitors
+	}
+	return r.setupAutoscaling(ctx, groups, results)
+}
+
+// setupAutoscaling derives thread counts from the targets. results holds each
+// host group's probe from setupThrottling. All targets must supply a usable
+// signal before we override the configured thread counts; move's only policy
+// difference from migration is conservative, lockstep scaling across targets
+// (#1212).
+func (r *Runner) setupAutoscaling(ctx context.Context, groups []host.Group, results []throttler.AuroraResult) error {
+	if !r.move.EnableExperimentalAutoscaling {
+		return nil
+	}
+	redoAware := false
+	for i, group := range groups {
+		target := r.targets[group.Indices[0]]
+		// The policy is the same either way — all targets or none, since the
+		// controller scales them in lockstep — but the two causes are not. A
+		// probe that failed is something an operator needs to act on (locked-down
+		// perf_schema, an under-granted monitor user); a target that is simply
+		// not Aurora is an ordinary configuration, so it does not warn.
+		switch {
+		case results[i].ProbeErr != nil:
+			r.logger.Warn("move autoscaling disabled: could not determine whether the target is Aurora; thread counts stay as configured",
+				"target", targetKey(target), "error", results[i].ProbeErr.Error())
+			return nil
+		case len(results[i].Throttlers) == 0:
+			r.logger.Info("move autoscaling disabled: every target must provide an Aurora load signal; thread counts stay as configured",
+				"target", targetKey(target))
+			return nil
+		}
+		// One redo-aware target is enough to need the backstop: the composite
+		// signal cannot see that target's redo log oversubscribed.
+		redoAware = redoAware || results[i].RedoAware
+	}
+	vcpus := make([]int, len(groups))
+	for i, group := range groups {
+		target := r.targets[group.Indices[0]]
+		var err error
+		vcpus[i], err = r.auroraVCPUs(ctx, target.DB)
+		if err != nil {
+			return fmt.Errorf("target %s CPU capacity: %w", targetKey(target), err)
+		}
+	}
+	readStart, config := moveAutoscaleBounds(vcpus, groups, autoscale.ClientCeiling(), redoAware, r.move.MaxCommitLatency > 0)
+	if !config.Enabled {
+		r.logger.Warn("move autoscaling disabled: target too small", "vcpus", vcpus, "min_vcpus", autoscale.MinVCPUs)
+		return nil
+	}
+	r.autoscale = config
+	r.move.Threads = readStart
+	r.move.WriteThreads = config.StartThreads
+	r.flushConcurrency, r.flushBatchSize = moveFlushBounds(vcpus, groups, len(r.sources), autoscale.ClientCeiling())
+	r.logger.Info("move autoscaling engaged: busiest target controls all shard pools; --threads and --write-threads are ignored",
+		"threads", readStart, "max_read_threads", config.MaxReadThreads,
+		"write_threads_per_target", config.StartThreads, "max_write_threads_per_target", config.MaxThreads,
+		"flush_concurrency", r.flushConcurrency, "flush_batch_size", r.flushBatchSize)
+	return nil
+}
+
+func (r *Runner) fitReadThreadsToPools() error {
+	if r.move.MaxConnections <= 0 {
+		return nil
+	}
+	reserve := minChecksumPhaseReserve + max(0, len(r.sourceTables)-1)
+	// Usually each source/target owns a distinct *sql.DB, even when hosts are
+	// shared. A checksum worker reads a chunk from every source and every
+	// distinct target handle at once, so a handle that serves as both a source
+	// and a target is held twice by each worker. Targets reusing one handle
+	// count once: the checker reads each distinct target handle once.
+	uses := make(map[*sql.DB]int)
+	for _, source := range r.sources {
+		uses[source.db]++
+	}
+	targetHandles := make(map[*sql.DB]bool)
+	for _, target := range r.targets {
+		if !targetHandles[target.DB] {
+			targetHandles[target.DB] = true
+			uses[target.DB]++
+		}
+	}
+	copies := 1
+	for db, n := range uses {
+		if db != nil {
+			copies = max(copies, n)
+		}
+	}
+	// Preserve at least one reader, matching migration; advisory control-plane
+	// queries may queue when the requested budget cannot cover all headroom.
+	available := max(1, (r.move.MaxConnections-reserve)/copies)
+	start := min(r.move.Threads, available)
+	if start != r.move.Threads {
+		r.logger.Info("fitting read threads to the connection pool", "threads", start, "max_connections", r.move.MaxConnections, "reserved", reserve)
+	}
+	// Autoscaling can have a ceiling above its starting count. Checksum
+	// workers draw connections up to that ceiling, so fit it as well without
+	// changing the fixed pool budget inherited from --max-connections.
+	if r.autoscale.Enabled {
+		r.autoscale.MaxReadThreads = min(max(r.move.Threads, r.autoscale.MaxReadThreads), available)
+	}
+	r.move.Threads = start
+	return nil
+}
+
 // resumeDecision is decideResume's verdict on a target that failed the
 // new-copy (post-setup) checks.
 type resumeDecision int
@@ -1254,7 +1416,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// Sort targets by targetKey (addr/dbname/keyrange) for deterministic
 	// ordering. The checkpoint is written to targets[0], so the order must be
 	// stable across runs even if the caller constructed Targets from a map.
-	// The ShardedApplier routes by key range, so slice order is otherwise
+	// The applier routes by key range, so slice order is otherwise
 	// irrelevant to which target a row lands on.
 	slices.SortFunc(r.targets, func(a, b applier.Target) int {
 		return strings.Compare(targetKey(a), targetKey(b))
@@ -2098,6 +2260,27 @@ func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
 	return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
 }
 
+// targetHosts is the common host view for monitoring and DDL scheduling.
+func (r *Runner) targetHosts() []host.Group {
+	configs := make([]*mysql.Config, len(r.targets))
+	for i, target := range r.targets {
+		configs[i] = target.Config
+	}
+	return host.GroupConfigs(configs)
+}
+
+func (r *Runner) setThrottler(t throttler.Throttler) {
+	r.throttlerMu.Lock()
+	defer r.throttlerMu.Unlock()
+	r.throttler = t
+}
+
+func (r *Runner) currentThrottler() throttler.Throttler {
+	r.throttlerMu.RLock()
+	defer r.throttlerMu.RUnlock()
+	return r.throttler
+}
+
 // invalidateChecksumWatermark blanks the checksum_watermark on the persisted
 // checkpoint rows if (and only if) the sentinel-wait continuous checker
 // confirmed any divergence (see continuousVerifier). Called from the sentinel-abort path: the
@@ -2351,39 +2534,19 @@ func (r *Runner) Cancel() {
 	r.cancelFunc()
 }
 
-// createApplier creates the appropriate applier based on the number of targets.
+// createApplier creates the applier that writes to the targets. With several
+// targets it routes each row to the target whose key range contains its hash.
 // Note: The applier is NOT started here. The copier will start it when it begins copying.
 func (r *Runner) createApplier() (applier.Applier, error) {
-	if len(r.targets) == 1 && r.targets[0].KeyRange == "0" {
-		// Single target - use SingleTargetApplier
-		appl, err := applier.NewSingleTargetApplier(r.targets[0], &applier.ApplierConfig{
-			DBConfig: r.dbConfig,
-			Logger:   r.logger,
-			Threads:  r.move.WriteThreads,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SingleTargetApplier: %w", err)
-		}
-		r.logger.Debug("Created SingleTargetApplier")
-		return appl, nil
-	}
-
-	// Multiple targets - use ShardedApplier
-	r.logger.Info("Creating ShardedApplier", "targetCount", len(r.targets))
-
-	// Create the ShardedApplier
-	appl, err := applier.NewShardedApplier(
-		r.targets,
-		&applier.ApplierConfig{
-			DBConfig: r.dbConfig,
-			Logger:   r.logger,
-			Threads:  r.move.WriteThreads,
-		},
-	)
+	appl, err := applier.New(r.targets, &applier.ApplierConfig{
+		DBConfig: r.dbConfig,
+		Logger:   r.logger,
+		Threads:  r.move.WriteThreads,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create ShardedApplier: %w", err)
+		return nil, fmt.Errorf("failed to create applier: %w", err)
 	}
-	r.logger.Info("ShardedApplier created successfully")
+	r.logger.Debug("created applier", "targetCount", len(r.targets))
 	return appl, nil
 }
 

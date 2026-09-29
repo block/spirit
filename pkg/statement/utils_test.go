@@ -53,9 +53,9 @@ func TestFormatPartitionValue(t *testing.T) {
 	}
 }
 
-// TestHelperFunctions tests the helper functions used by diff.go that
+// TestHelperFunctions tests the helper functions used by Diff that
 // live in utils.go. The getPrimaryKeyIndex subtest tests a method on
-// *CreateTable (defined in diff.go) but is grouped here with the other
+// *CreateTable (defined in create_table.go) but is grouped here with the other
 // helper-style tests for proximity.
 func TestHelperFunctions(t *testing.T) {
 	t.Run("ptrEqual_string", func(t *testing.T) {

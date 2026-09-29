@@ -3,8 +3,6 @@ package statement
 import (
 	"fmt"
 	"strings"
-
-	"github.com/block/spirit/pkg/parser/ast"
 )
 
 func init() { registerNormalizer(primaryKeyNotNullNormalizer{}) }
@@ -54,32 +52,6 @@ func primaryKeyColumnSet(ct *CreateTable) map[string]bool {
 		}
 	}
 	return set
-}
-
-// declaresNull reports whether the column definition explicitly permits NULL,
-// with a NULL attribute or a literal DEFAULT NULL. It reads the AST because
-// Nullable cannot tell an explicit NULL apart from an omitted NOT NULL. A
-// column built without a Raw definition declares nothing.
-//
-// Any NULL attribute counts, even one followed by NOT NULL: MySQL rejects
-// `a INT NULL NOT NULL` in a primary key rather than letting the last attribute
-// win. An expression default, DEFAULT (NULL), does not count: MySQL accepts it
-// on a key column and stores the column NOT NULL.
-func (c *Column) declaresNull() bool {
-	if c.Raw == nil {
-		return false
-	}
-	for _, opt := range c.Raw.Options {
-		switch opt.Tp { //nolint:exhaustive
-		case ast.ColumnOptionNull:
-			return true
-		case ast.ColumnOptionDefaultValue:
-			if v, ok := opt.Expr.(*ast.ValueExpr); ok && v.Kind() == ast.KindNull {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // checkPrimaryKeyNullability rejects a table whose primary key column

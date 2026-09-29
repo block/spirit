@@ -94,6 +94,25 @@ func NewDBConfig() *DBConfig {
 	}
 }
 
+// ValidateForceKillAfter rejects delays that cannot leave time for lock acquisition.
+// LockWaitTimeout is in whole seconds, matching MySQL's session variable.
+func (c *DBConfig) ValidateForceKillAfter() error {
+	if c.ForceKillAfter < 0 {
+		return fmt.Errorf("force-kill-after must be non-negative")
+	}
+	if c.ForceKillAfter > 0 && c.ForceKillAfter >= time.Duration(c.LockWaitTimeout)*time.Second {
+		return fmt.Errorf("force-kill-after must be less than lock-wait-timeout (%ds)", c.LockWaitTimeout)
+	}
+	return nil
+}
+
+func (c *DBConfig) forceKillDelay() time.Duration {
+	if c.ForceKillAfter > 0 {
+		return c.ForceKillAfter
+	}
+	return forceKillGracePeriod(c.LockWaitTimeout)
+}
+
 // IsConnectionLossError reports whether err indicates that the connection to
 // MySQL failed or was lost, meaning the client cannot know whether the last
 // statement it sent was executed by the server. Connection-level failures

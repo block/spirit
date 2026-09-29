@@ -264,7 +264,7 @@ func (c *buffered) Run(ctx context.Context) error {
 
 	// Experimental: start the dual read/write autoscaler. It runs for the lifetime
 	// of the copy and stops when ctx is cancelled (deferred above). It only
-	// engages when the applier supports dynamic scaling (SingleTargetApplier)
+	// engages when the applier supports dynamic scaling (MySQLApplier)
 	// AND the throttler provides a continuous load signal (GradualThrottler);
 	// otherwise the pool stays fixed.
 	if as := c.autoscalerIfEnabled(); as != nil {
@@ -495,7 +495,7 @@ func (c *buffered) readWorker(ctx context.Context, quit <-chan struct{}) error {
 
 // SetReadWorkers reconciles the live read-worker count to n, spawning new
 // readers or parking existing ones as needed. It is the read-side counterpart
-// of SingleTargetApplier.SetWriteWorkers: idempotent, safe to call repeatedly,
+// of MySQLApplier.SetWriteWorkers: idempotent, safe to call repeatedly,
 // and n is clamped to a minimum of 1 so the copy always makes progress. Calls
 // before Run has started the pool or after it has drained are no-ops.
 //
