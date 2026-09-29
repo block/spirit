@@ -54,7 +54,7 @@ So the locking that *does* apply is **metadata locks**. When we describe Spirit 
 
 * Spirit initially attempts INSTANT/INPLACE DDL. If this is compatible, it requires an exclusive metadata lock on the table.
 * Starting a checksum requires an initial exclusive metadata lock to ensure that all data is synchronized between the checksum threads.
-* The cutover operation requires an exclusive metadata lock. While it holds the lock, and after the final flush, it raises the new table's `AUTO_INCREMENT` counter to the original table's if it is behind (a metadata-only `ALTER TABLE .. AUTO_INCREMENT`), so ids issued during the copy for rows that were since deleted are not issued again.
+* The cutover operation requires an exclusive metadata lock. While it holds the lock, and after the final flush, it raises the new table's `AUTO_INCREMENT` counter to the original table's if it is behind (a metadata-only `ALTER TABLE .. AUTO_INCREMENT`), so ids issued during the copy for rows that were since deleted are not issued again. The exception is an ALTER that sets `AUTO_INCREMENT=N` explicitly: the requested value takes precedence over the original table's counter and is left as is, as a native ALTER would do.
 
 What causes all metadata lock issues? (hint: it's not spirit)
 
