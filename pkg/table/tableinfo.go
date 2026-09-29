@@ -524,10 +524,7 @@ func (t *TableInfo) setPrimaryKey(ctx context.Context) error {
 			t.KeyIsAutoInc = (extra == "auto_increment")
 		}
 	}
-	if err := t.FloatPrimaryKeyError(); err != nil {
-		return err
-	}
-	return t.BitPrimaryKeyError()
+	return nil
 }
 
 // FloatPrimaryKeyError returns an error if a primary key column is a FLOAT,
@@ -540,8 +537,9 @@ func (t *TableInfo) setPrimaryKey(ctx context.Context) error {
 // during the migration is still in the table after cutover; and a chunk
 // boundary on a value shared by many rows never advances.
 //
-// The table is refused on setup, before MySQL's native DDL is attempted, so
-// the refusal holds for every statement on every server.
+// SetInfo does not call it: a TableInfo describes any table, and refusing one
+// is for the caller to decide. The migration and move checks refuse such a
+// table with it.
 func (t *TableInfo) FloatPrimaryKeyError() error {
 	for _, col := range t.KeyColumns {
 		if tp, ok := t.GetColumnMySQLType(col); ok && isFloatColumnType(tp) {
@@ -562,8 +560,9 @@ func (t *TableInfo) FloatPrimaryKeyError() error {
 // cannot be parsed as a number, so the copy failed on its first chunk, after
 // the migration had already set up its tables.
 //
-// The table is refused on setup, before MySQL's native DDL is attempted, so
-// the refusal holds for every statement on every server.
+// SetInfo does not call it: a TableInfo describes any table, and refusing one
+// is for the caller to decide. The migration and move checks refuse such a
+// table with it.
 func (t *TableInfo) BitPrimaryKeyError() error {
 	for _, col := range t.KeyColumns {
 		if tp, ok := t.GetColumnMySQLType(col); ok && isBITType(tp) {
@@ -587,9 +586,13 @@ func (t *TableInfo) PrimaryKeyIsMemoryComparable() error {
 	}
 	// BIT is classified as unsignedType so the binlog applier emits the
 	// value as a numeric literal (see mySQLTypeToDatumTp), but BIT primary
-	// keys are not supported end-to-end (see BitPrimaryKeyError). SetInfo
-	// already refuses them; this keeps a TableInfo built another way from
-	// passing as comparable.
+	// keys are not supported end-to-end: setMinMax issues a SELECT that
+	// returns BIT as raw big-endian bytes, and the chunker's
+	// newDatumFromMySQL path parses those as decimal strings — which
+	// fails or produces wrong bounds. Until the min/max read path knows
+	// how to decode BIT bytes, reject BIT PKs with the same error they
+	// returned before BIT got its own datumTp. The migration and move
+	// checks refuse them before any copy (see BitPrimaryKeyError).
 	if slices.ContainsFunc(t.keyColumnsMySQLTp, isBITType) {
 		return ErrUnsupportedPKType
 	}
@@ -606,9 +609,11 @@ func (t *TableInfo) setMinMax(ctx context.Context) error {
 	}
 	// BIT is classified as unsignedType so the applier emits the value as
 	// a numeric literal, but `SELECT min(bit_col)` returns raw big-endian
-	// bytes that newDatumFromMySQL can't parse as decimal. setPrimaryKey
-	// refuses BIT primary keys (see BitPrimaryKeyError) before this runs;
-	// the skip keeps setMinMax itself from failing on one regardless.
+	// bytes that newDatumFromMySQL can't parse as decimal. BIT primary
+	// keys are rejected by PrimaryKeyIsMemoryComparable, and by the
+	// migration and move checks (see BitPrimaryKeyError); skip here so
+	// SetInfo can complete and the rejection can fire on a well-formed
+	// TableInfo.
 	if isBITType(t.keyColumnsMySQLTp[0]) {
 		return nil
 	}

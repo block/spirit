@@ -248,16 +248,17 @@ func TestDiscoveryBalancesTable(t *testing.T) {
 	require.Equal(t, "0", t1.maxValue.String())
 }
 
-// TestBitPrimaryKeyRefused checks that a table whose primary key has a BIT
-// column is refused on setup. The chunkers read key values back with plain
-// SELECTs, which return a BIT as raw bytes that cannot be parsed as a number,
-// so such a migration used to fail on its first chunk instead.
-func TestBitPrimaryKeyRefused(t *testing.T) {
-	testutils.RunSQL(t, `DROP TABLE IF EXISTS bitpk, bitpk2`)
+// TestPrimaryKeyIsMemoryComparableRejectsBIT regresses a gap exposed when
+// BIT was reclassified from unknownType to unsignedType in
+// mySQLTypeToDatumTp: the change makes BIT-keyed tables pass the original
+// unknownType check, but the chunker's setMinMax path returns BIT as raw
+// big-endian bytes that newDatumFromMySQL can't parse as decimal. Until
+// the min/max read path is BIT-aware, BIT primary keys must be rejected
+// upfront with ErrUnsupportedPKType.
+func TestPrimaryKeyIsMemoryComparableRejectsBIT(t *testing.T) {
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS bitpk`)
 	testutils.RunSQL(t, `CREATE TABLE bitpk (b BIT(8) NOT NULL, v INT NOT NULL, PRIMARY KEY (b))`)
 	testutils.RunSQL(t, `INSERT INTO bitpk (b, v) VALUES (b'00000001', 1), (b'00000010', 2)`)
-	testutils.RunSQL(t, `CREATE TABLE bitpk2 (id INT NOT NULL, b BIT(16) NOT NULL, PRIMARY KEY (id, b))`)
-	t.Cleanup(func() { testutils.RunSQL(t, `DROP TABLE IF EXISTS bitpk, bitpk2`) })
 
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
@@ -267,15 +268,60 @@ func TestBitPrimaryKeyRefused(t *testing.T) {
 		}
 	}()
 
-	err = NewTableInfo(db, "test", "bitpk").SetInfo(t.Context())
-	require.ErrorContains(t, err, `primary key column "b" of table "bitpk" is a BIT, which is not supported`)
-	err = NewTableInfo(db, "test", "bitpk2").SetInfo(t.Context())
-	require.ErrorContains(t, err, `primary key column "b" of table "bitpk2" is a BIT, which is not supported`)
+	t1 := NewTableInfo(db, "test", "bitpk")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	require.ErrorIs(t, t1.PrimaryKeyIsMemoryComparable(), ErrUnsupportedPKType)
+	// SetInfo describes the table; refusing it is left to the checks, which
+	// use BitPrimaryKeyError.
+	require.ErrorContains(t, t1.BitPrimaryKeyError(), `primary key column "b" of table "bitpk" is a BIT, which is not supported`)
+}
 
-	// A BIT outside the primary key is supported.
-	testutils.RunSQL(t, `DROP TABLE bitpk2`)
-	testutils.RunSQL(t, `CREATE TABLE bitpk2 (id INT NOT NULL PRIMARY KEY, b BIT(16) NOT NULL)`)
-	require.NoError(t, NewTableInfo(db, "test", "bitpk2").SetInfo(t.Context()))
+func TestBitPrimaryKeyError(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		columns []ColumnMeta
+		key     []string
+		wantErr bool
+	}{
+		{"bit pk", []ColumnMeta{{Name: "b", MySQLType: "bit(8)"}}, []string{"b"}, true},
+		{"bit in composite pk", []ColumnMeta{{Name: "id", MySQLType: "int"}, {Name: "b", MySQLType: "bit(16)"}}, []string{"id", "b"}, true},
+		{"int pk", []ColumnMeta{{Name: "id", MySQLType: "int unsigned"}}, []string{"id"}, false},
+		{"bit non-key column", []ColumnMeta{{Name: "id", MySQLType: "int"}, {Name: "b", MySQLType: "bit(16)"}}, []string{"id"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ti, err := NewTableInfoFromMeta("test", "t1", tc.columns, tc.key)
+			require.NoError(t, err)
+			err = ti.BitPrimaryKeyError()
+			if tc.wantErr {
+				require.ErrorContains(t, err, `of table "t1" is a BIT, which is not supported`)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestFloatPrimaryKeySetInfo checks that SetInfo describes a table whose
+// primary key has a FLOAT column rather than refusing it: the migration and
+// move checks refuse it, with FloatPrimaryKeyError.
+func TestFloatPrimaryKeySetInfo(t *testing.T) {
+	testutils.RunSQL(t, `DROP TABLE IF EXISTS floatpk`)
+	testutils.RunSQL(t, `CREATE TABLE floatpk (id INT NOT NULL, f FLOAT NOT NULL, PRIMARY KEY (id, f))`)
+	testutils.RunSQL(t, `INSERT INTO floatpk (id, f) VALUES (1, 0.1), (2, 0.2)`)
+	t.Cleanup(func() { testutils.RunSQL(t, `DROP TABLE IF EXISTS floatpk`) })
+
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("failed to close db: %v", err)
+		}
+	}()
+
+	t1 := NewTableInfo(db, "test", "floatpk")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	require.Equal(t, []string{"id", "f"}, t1.KeyColumns)
+	require.ErrorContains(t, t1.FloatPrimaryKeyError(), `primary key column "f" of table "floatpk" is a FLOAT, which is not supported`)
 }
 
 func TestDiscoveryCompositeNonComparable(t *testing.T) {

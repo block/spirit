@@ -391,6 +391,16 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		}
 		tables = append(tables, change.table)
 	}
+	// Run the statement-scope checks before MySQL's native DDL is attempted.
+	// A ScopeStatement failure is documented as a refusal a caller can report
+	// as certain (see check.StatementRefusal), so the runner must refuse
+	// exactly those statements, including ones the native DDL could complete.
+	// Run later, as preflight is, they would only apply when the native
+	// attempt fails: an INSTANT ADD COLUMN on a table with a FLOAT or BIT in
+	// its primary key would succeed where a planning tool reported a refusal.
+	if err := r.runChecks(ctx, check.ScopeStatement); err != nil {
+		return err
+	}
 
 	// Take a single advisory lock for all tables to prevent concurrent DDL.
 	// This uses a single DB connection instead of one per table.

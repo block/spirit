@@ -3,6 +3,7 @@ package move
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -690,6 +691,62 @@ func TestMoveValidate(t *testing.T) {
 			} else {
 				require.EqualError(t, err, tt.wantErr)
 			}
+		})
+	}
+}
+
+// TestMoveRefusesFloatAndBitPrimaryKeys checks that a source table whose
+// primary key includes a FLOAT or a BIT column is refused before anything is
+// created or copied on the target. A FLOAT key cannot be located by its text
+// form, so a replayed DELETE would miss; a BIT key cannot be read back as a
+// number, so the copy cannot compute its chunk boundaries.
+func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, create, insert, want string }{
+		{
+			name:   "float",
+			create: "CREATE TABLE %s.readings (id INT NOT NULL, f FLOAT NOT NULL, PRIMARY KEY (id, f))",
+			insert: "INSERT INTO %s.readings VALUES (1, 0.1), (2, 0.2)",
+			want:   `primary key column "f" of table "readings" is a FLOAT, which is not supported`,
+		},
+		{
+			name:   "bit",
+			create: "CREATE TABLE %s.readings (b BIT(16) NOT NULL PRIMARY KEY, v INT)",
+			insert: "INSERT INTO %s.readings VALUES (1, 1), (2, 2)",
+			want:   `primary key column "b" of table "readings" is a BIT, which is not supported`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcDB, destDB := "source_"+tc.name+"_pk", "dest_"+tc.name+"_pk"
+			for _, db := range []string{srcDB, destDB} {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+				testutils.RunSQL(t, "CREATE DATABASE "+db)
+			}
+			t.Cleanup(func() {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+destDB)
+			})
+			testutils.RunSQL(t, fmt.Sprintf(tc.create, srcDB))
+			testutils.RunSQL(t, fmt.Sprintf(tc.insert, srcDB))
+
+			src, dest := cfg.Clone(), cfg.Clone()
+			src.DBName, dest.DBName = srcDB, destDB
+			move := &Move{
+				SourceDSN:    src.FormatDSN(),
+				TargetDSN:    dest.FormatDSN(),
+				Threads:      2,
+				WriteThreads: 2,
+			}
+			require.ErrorContains(t, move.Run(), tc.want)
+
+			db, err := sql.Open("block-mysql", dest.FormatDSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			var n int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+			require.Zero(t, n, "nothing may be created on the target")
 		})
 	}
 }

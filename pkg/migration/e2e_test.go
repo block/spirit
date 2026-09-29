@@ -470,10 +470,11 @@ func TestBacktickColumnNameMigration(t *testing.T) {
 	require.Equal(t, seeded, count)
 }
 
-// TestBitPrimaryKeyRefused refuses a table with a BIT in its primary key, and
-// changing a primary key column to a BIT, when the tables are set up. The
-// chunkers cannot read BIT key values back from the table, so such a migration
-// used to set up its tables and then fail on the first chunk of the copy.
+// TestBitPrimaryKeyRefused refuses a table with a BIT in its primary key, even
+// for an ALTER MySQL could apply as INSTANT, and changing a primary key column
+// to a BIT. The chunkers cannot read BIT key values back from the table, so
+// such a migration used to set up its tables and then fail on the first chunk
+// of the copy.
 func TestBitPrimaryKeyRefused(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "bit_pk", `CREATE TABLE bit_pk (
@@ -485,15 +486,22 @@ func TestBitPrimaryKeyRefused(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO bit_pk (b, v)
 		WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3000)
 		SELECT /*+ SET_VAR(cte_max_recursion_depth = 10000) */ n, n FROM seq`)
-	for _, alter := range []string{"ENGINE=InnoDB", "ADD COLUMN c INT"} {
+	// ADD COLUMN is INSTANT on every supported server: the refusal has to
+	// come from the statement-scope checks the runner runs before it
+	// attempts native DDL.
+	for _, alter := range []string{"ADD COLUMN c INT", "ENGINE=InnoDB"} {
 		m := NewTestRunner(t, "bit_pk", alter)
 		err := m.Run(t.Context())
 		require.NoError(t, m.Close())
 		require.ErrorContains(t, err, `primary key column "b" of table "bit_pk" is a BIT, which is not supported`)
+		require.False(t, m.usedInstantDDL)
 		var n int
 		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_bit_pk_new'").Scan(&n))
 		require.Zero(t, n, "the table must be refused before the new table is created")
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bit_pk' AND COLUMN_NAME = 'c'").Scan(&n))
+		require.Zero(t, n, "the refused ALTER must not change the table")
 	}
 
 	tt = testutils.NewTestTable(t, "int_to_bit_pk", `CREATE TABLE int_to_bit_pk (
@@ -504,11 +512,34 @@ func TestBitPrimaryKeyRefused(t *testing.T) {
 	m := NewTestRunner(t, "int_to_bit_pk", "MODIFY id BIT(32) NOT NULL")
 	err := m.Run(t.Context())
 	require.NoError(t, m.Close())
-	require.ErrorContains(t, err, "is a BIT, which is not supported")
+	require.ErrorContains(t, err, `changing primary key column "id" of table "int_to_bit_pk" to a BIT is not supported`)
 	var tp string
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 		"SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'int_to_bit_pk' AND COLUMN_NAME = 'id'").Scan(&tp))
 	require.Equal(t, "int", tp, "the refused ALTER must not change the table")
+}
+
+// TestBitPrimaryKeyRefusedAfterKeyChange refuses an ALTER that replaces the
+// primary key with one that includes a BIT column, which no MODIFY or CHANGE
+// of a key column spells out. The primarykey check refuses the DROP PRIMARY
+// KEY before native DDL is attempted; primarykeybit would refuse the new
+// table at post-setup if that ever stopped being the case.
+func TestBitPrimaryKeyRefusedAfterKeyChange(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "bit_pk_swap", `CREATE TABLE bit_pk_swap (
+		id INT NOT NULL,
+		b BIT(16) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	testutils.RunSQL(t, "INSERT INTO bit_pk_swap VALUES (1, 1), (2, 2)")
+	m := NewTestRunner(t, "bit_pk_swap", "DROP PRIMARY KEY, ADD PRIMARY KEY (b)")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, "dropping primary key is not supported")
+	var key string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bit_pk_swap' AND CONSTRAINT_NAME = 'PRIMARY'").Scan(&key))
+	require.Equal(t, "id", key, "the refused ALTER must not change the table")
 }
 
 // TestReservedWordPKMigration is a regression test for issue #828.

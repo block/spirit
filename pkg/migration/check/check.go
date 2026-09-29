@@ -41,12 +41,15 @@ const (
 	//
 	// A failure here is a refusal the caller can report as certain, so the
 	// scope only carries checks that no earlier stage can bypass on any
-	// server. Spirit attempts MySQL's native DDL — ALGORITHM=INSTANT, then a
-	// safe-INPLACE subset — before it runs preflight checks, and MySQL decides
-	// what that completes, which varies with the server version and the table.
-	// A preflight check the native DDL may complete (dropadd, rename) is
-	// deliberately excluded: claiming those as refusals would report failure
-	// for an apply that succeeds.
+	// server. The migration runner runs this scope itself, once it has loaded
+	// the tables and before it attempts MySQL's native DDL, so it refuses
+	// every statement these checks refuse. Spirit attempts that native DDL —
+	// ALGORITHM=INSTANT, then a safe-INPLACE subset — before it runs
+	// preflight checks, and MySQL decides what that completes, which varies
+	// with the server version and the table. A preflight check the native DDL
+	// may complete (dropadd, rename) is deliberately excluded: claiming those
+	// as refusals would report failure for an apply that succeeds, and the
+	// runner, running them here, would then make it fail.
 	//
 	// That exclusion only ever under-reports, which is the safe direction:
 	// passing these checks is not a promise Spirit will accept the statement,

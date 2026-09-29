@@ -52,7 +52,7 @@ func TestPrimaryKeyBit(t *testing.T) {
 // TestStatementRefusalBitPrimaryKey classifies statements the way a planning
 // tool does. Every ALTER on a table with a BIT in its primary key is refused,
 // including a metadata-only change and the change that would fix the key,
-// because the runner refuses the table on setup before attempting native DDL.
+// because the runner runs this check before it attempts native DDL.
 // Changing a primary key column to a BIT is refused too.
 func TestStatementRefusalBitPrimaryKey(t *testing.T) {
 	for _, stmt := range []string{
@@ -100,4 +100,42 @@ func TestStatementRefusalBitPrimaryKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, refused, "the check must skip without table metadata")
 	assert.Empty(t, reason)
+}
+
+// TestPrimaryKeyBitPostSetup covers the post-setup half of the check: the new
+// table, which MySQL has already altered, is refused when its primary key
+// includes a BIT, even when the statement does not spell that out as a MODIFY
+// or CHANGE of a key column.
+func TestPrimaryKeyBitPostSetup(t *testing.T) {
+	require.Contains(t, ChecksInScope(ScopePostSetup), "primarykeybit")
+	stmt := statement.MustNew("ALTER TABLE `flags` DROP PRIMARY KEY, ADD PRIMARY KEY (`group_id`, `bits`)")[0]
+	current := newTableInfo(t, "CREATE TABLE `flags` (\n"+
+		"  `group_id` int NOT NULL,\n"+
+		"  `mask` int unsigned NOT NULL,\n"+
+		"  `bits` bit(16) NOT NULL,\n"+
+		"  PRIMARY KEY (`group_id`,`mask`)\n"+
+		") ENGINE=InnoDB")
+	altered := newTableInfo(t, "CREATE TABLE `_flags_new` (\n"+
+		"  `group_id` int NOT NULL,\n"+
+		"  `mask` int unsigned NOT NULL,\n"+
+		"  `bits` bit(16) NOT NULL,\n"+
+		"  PRIMARY KEY (`group_id`,`bits`)\n"+
+		") ENGINE=InnoDB")
+
+	require.NoError(t, runAtScope(t, primaryKeyBitCheck, Resources{Statement: stmt, Table: current}, ScopeStatement))
+
+	err := runAtScope(t, primaryKeyBitCheck, Resources{Statement: stmt, Table: current, NewTable: altered}, ScopePostSetup)
+	require.ErrorContains(t, err, `altering table "flags" so that its primary key includes a BIT is not supported`)
+	require.ErrorContains(t, err, `primary key column "bits" of table "_flags_new" is a BIT, which is not supported`)
+
+	unchanged := newTableInfo(t, "CREATE TABLE `_flags_new` (\n"+
+		"  `group_id` int NOT NULL,\n"+
+		"  `mask` int unsigned NOT NULL,\n"+
+		"  `bits` bit(16) NOT NULL,\n"+
+		"  PRIMARY KEY (`group_id`,`mask`)\n"+
+		") ENGINE=InnoDB")
+	require.NoError(t, runAtScope(t, primaryKeyBitCheck, Resources{Statement: stmt, Table: current, NewTable: unchanged}, ScopePostSetup))
+
+	err = runAtScope(t, primaryKeyBitCheck, Resources{Statement: stmt, Table: current}, ScopePostSetup)
+	require.ErrorContains(t, err, "check primarykeybit cannot run")
 }
