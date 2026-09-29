@@ -408,3 +408,75 @@ func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&after))
 	require.Equal(t, pid, after, "the same session can be reused after the worker exits")
 }
+
+// A kill that finds an explicit table lock ends the retry loop. The kill step
+// never ends a LOCK TABLES session, so another attempt would queue behind the
+// same lock for a full lock wait timeout and block the table's traffic again.
+func TestForceExecStopsWhenKillFindsTableLock(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_table_lock_found", "CREATE TABLE forceexec_table_lock_found (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	require.Greater(t, config.MaxRetries, 1)
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	// Keep the SELECT's metadata lock until Rollback so ALTER TABLE blocks.
+	blocker, err := tt.DB.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_table_lock_found")
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	killCalls := 0
+	err = forceExec(ctx, db, config, logger,
+		"ALTER TABLE forceexec_table_lock_found ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(context.Context, int) ([]int, error) {
+			killCalls++
+			return nil, ErrTableLockFound
+		}, waitForKilledTransactions, nil)
+	var ddlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &ddlErr)
+	require.EqualValues(t, 1205, ddlErr.Number)
+	// The kill outcome stays out of the statement's error tree.
+	require.NotErrorIs(t, err, ErrTableLockFound)
+	require.Equal(t, 1, killCalls)
+	require.Contains(t, logs.String(), "not retrying statement after lock wait timeout")
+	require.NotContains(t, logs.String(), "retrying statement anyway")
+}
+
+// A session holding LOCK TABLES on the target table makes ForceExec give up
+// after one attempt, leaving the locking session connected.
+func TestForceExecMakesOneAttemptAgainstLockTables(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_lock_tables", "CREATE TABLE forceexec_lock_tables (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	require.Greater(t, config.MaxRetries, 1)
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	locker, err := tt.DB.Conn(ctx)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(locker)
+	_, err = locker.ExecContext(ctx, "LOCK TABLES forceexec_lock_tables READ")
+	require.NoError(t, err)
+	defer func() { _, _ = locker.ExecContext(context.WithoutCancel(ctx), "UNLOCK TABLES") }()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	tbl := table.NewTableInfo(db, "test", "forceexec_lock_tables")
+	err = ForceExec(ctx, db, []*table.TableInfo{tbl}, config, logger,
+		"ALTER TABLE forceexec_lock_tables ADD COLUMN c INT, ALGORITHM=INSTANT")
+	var ddlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &ddlErr)
+	require.EqualValues(t, 1205, ddlErr.Number)
+	require.Contains(t, logs.String(), "found explicit table lock")
+	require.Contains(t, logs.String(), "not retrying statement after lock wait timeout")
+	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout because force-kill timer fired")
+	// The locking session was not killed.
+	_, err = locker.ExecContext(ctx, "UNLOCK TABLES")
+	require.NoError(t, err)
+}
