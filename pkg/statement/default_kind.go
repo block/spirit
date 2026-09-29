@@ -13,9 +13,10 @@ import (
 // `DEFAULT '1'` all restore to a numeric-looking string, and `DEFAULT b'1'`
 // restores to text that reads like a quoted string but must be emitted bare.
 // The AST distinguishes all of them — the boolean keyword carries
-// [mysql.IsBooleanFlag], a string literal is [ast.KindString], a bit literal is
-// [ast.KindBinaryLiteral] — so the kind is recorded here at parse time and
-// every later decision reads it instead of guessing from the characters.
+// [mysql.IsBooleanFlag], a string literal is [ast.KindString], a bit or hex
+// literal is [ast.KindBinaryLiteral] — so the kind is recorded here at parse
+// time and every later decision reads it instead of guessing from the
+// characters.
 //
 // Two things depend on it. Emission needs to know whether to quote (see
 // formatColumnDefinition): a bit literal quoted as a string produces DDL MySQL
@@ -27,8 +28,7 @@ type DefaultKind uint8
 
 const (
 	// DefaultKindUnknown is a default whose literal form is not modelled here
-	// — NULL, a function default such as CURRENT_TIMESTAMP, a hex literal, an
-	// expression. Emission falls back to the [needsQuotes] text heuristic, as
+	// — NULL, a function default such as CURRENT_TIMESTAMP, an expression. Emission falls back to the [needsQuotes] text heuristic, as
 	// it did for every kind before this classification existed.
 	DefaultKindUnknown DefaultKind = iota
 	// DefaultKindNumber is a numeric literal: 0, -1, 1.5, a decimal. MySQL
@@ -49,6 +49,13 @@ const (
 	// column's width), which is the form the parser restores, so the recorded
 	// text is already canonical and must be emitted bare.
 	DefaultKindBitLiteral
+	// DefaultKindHexLiteral is a hex literal such as 0x1A or x'1a', which the
+	// parser restores as x'1a'. MySQL converts it to whatever the column's
+	// type stores (an integer column reports 0x1A as 26), and reports it back
+	// as hex only on a binary or varbinary column whose value is not valid
+	// utf8mb3 (see [binaryDefaultBytesNormalizer]). It must be emitted bare:
+	// quoted, it is the string "x'1a'" rather than the byte 0x1a.
+	DefaultKindHexLiteral
 )
 
 // classifyDefaultLiteral reports the literal form of a column DEFAULT
@@ -97,13 +104,9 @@ func classifyValueExpr(v *ast.ValueExpr) DefaultKind {
 		return DefaultKindNumber
 	case ast.KindBinaryLiteral:
 		// Bit and hex literals share this kind and are told apart by the flag
-		// the parser's own Restore switches on. Only the bit form is modelled:
-		// MySQL reports a bit literal back as a bit literal, while a hex
-		// literal is converted to whatever the column's type stores (an
-		// integer column reports 0x1A as 26) and is never reported as hex, so
-		// converging it is a per-type conversion rather than a literal form.
+		// the parser's own Restore switches on.
 		if v.Type.GetFlag()&mysql.UnsignedFlag != 0 {
-			return DefaultKindUnknown
+			return DefaultKindHexLiteral
 		}
 		return DefaultKindBitLiteral
 	default:

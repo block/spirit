@@ -58,8 +58,9 @@ func TestBinaryCharsetNormalizer(t *testing.T) {
 // TestBinaryCharsetBooleanDefaultOrderIndependent: booleanKeywordDefaultNormalizer
 // folds a TRUE/FALSE default on char but not on binary, which pads it with
 // NULs. Under a binary table default char(3) is stored as binary(3), so the
-// keyword must be left alone whether that rule runs before or after the type
-// rewrite. varchar is stored as varbinary, which folds either way.
+// keyword must be padded by binaryDefaultBytesNormalizer, not folded to '1',
+// whether the rules run before or after the type rewrite. varchar is stored as
+// varbinary, which folds either way.
 func TestBinaryCharsetBooleanDefaultOrderIndependent(t *testing.T) {
 	registered := normalizers
 	t.Cleanup(func() { normalizers = registered })
@@ -67,8 +68,8 @@ func TestBinaryCharsetBooleanDefaultOrderIndependent(t *testing.T) {
 	for _, tc := range []struct {
 		sql, typ, dflt string
 	}{
-		{"CREATE TABLE t (c char(3) DEFAULT TRUE) DEFAULT CHARSET=binary", "binary", "TRUE"},
-		{"CREATE TABLE t (c char(3) COLLATE binary DEFAULT FALSE) DEFAULT CHARSET=utf8mb4", "binary", "FALSE"},
+		{"CREATE TABLE t (c char(3) DEFAULT TRUE) DEFAULT CHARSET=binary", "binary", "1\x00\x00"},
+		{"CREATE TABLE t (c char(3) COLLATE binary DEFAULT FALSE) DEFAULT CHARSET=utf8mb4", "binary", "0\x00\x00"},
 		{"CREATE TABLE t (c varchar(3) DEFAULT TRUE) DEFAULT CHARSET=binary", "varbinary", "1"},
 		{"CREATE TABLE t (c char(3) DEFAULT TRUE) DEFAULT CHARSET=utf8mb4", "char", "1"},
 	} {
