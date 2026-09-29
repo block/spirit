@@ -158,16 +158,22 @@ func TestFloatBinlogDML(t *testing.T) {
 			require.True(t, updated, "the updates must run during the migration")
 
 			// Each target must hold what MySQL's own conversion of the FLOAT
-			// gives: its exact value, or for a string its 6-digit text.
-			wantExpr, gotExpr := "CAST(%s AS FLOAT) + 0E0", "f + 0E0"
-			if tc.name == "varchar" {
-				wantExpr, gotExpr = "CAST(CAST(%s AS FLOAT) AS CHAR)", "f"
+			// gives: its exact value, or for a string its 6-digit text. The
+			// expected values are read back from a FLOAT column, because
+			// CAST(... AS FLOAT) does not round to FLOAT on every 8.0 version.
+			expTbl := tbl + "_expected"
+			testutils.NewTestTable(t, expTbl, "CREATE TABLE "+expTbl+" (id INT NOT NULL PRIMARY KEY, f FLOAT NULL)")
+			for i, v := range floatTestValues {
+				testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s VALUES (%d, %s)", expTbl, i, v))
 			}
-			var want []string
-			for _, v := range floatTestValues {
-				var s string
-				require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT CONCAT("+fmt.Sprintf(wantExpr, v)+")").Scan(&s))
-				want = append(want, s)
+			wantExpr, gotExpr := "f + 0E0", "f + 0E0"
+			if tc.name == "varchar" {
+				wantExpr, gotExpr = "CAST(f AS CHAR)", "f"
+			}
+			wantByIdx := exactValues(t, tt.DB, expTbl, wantExpr)
+			want := make([]string, len(floatTestValues))
+			for i := range floatTestValues {
+				want[i] = wantByIdx[i]
 			}
 			got := exactValues(t, tt.DB, tbl, gotExpr)
 			for i, id := range markers {
