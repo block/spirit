@@ -1,10 +1,13 @@
 package table
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"slices"
 	"strings"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/parser/format"
@@ -136,4 +139,58 @@ func trimSpacingBefore(s string, i int) int {
 		i--
 	}
 	return i
+}
+
+// NextAutoIncrement returns the value MySQL will assign to the next row
+// inserted into schema.tableName without an explicit id, and whether the table
+// has an AUTO_INCREMENT column at all. When it does not, next is 0.
+//
+// The counter is read from SHOW CREATE TABLE, which asks the storage engine
+// for its in-memory value. information_schema.TABLES.AUTO_INCREMENT is not a
+// substitute: MySQL 8.0 caches it for information_schema_stats_expiry seconds
+// (86400 by default), so any earlier read of the table's statistics - a
+// monitoring query, a previous run - pins a value that can be arbitrarily far
+// behind. Lowering that session variable to 0 would also return the live
+// value, but it changes session state on a pooled connection; SHOW CREATE TABLE
+// needs no session state and does not wait for a LOCK TABLES ... WRITE held by
+// another session.
+//
+// MySQL omits the AUTO_INCREMENT=N table option while the counter is 1 (no id
+// has been generated yet), so a table with an AUTO_INCREMENT column and no
+// option reports 1.
+func NextAutoIncrement(ctx context.Context, db *sql.DB, schema, tableName string) (next uint64, hasColumn bool, err error) {
+	var name, createTable string
+	if err := db.QueryRowContext(ctx, sqlescape.MustEscapeSQL("SHOW CREATE TABLE %n.%n", schema, tableName)).Scan(&name, &createTable); err != nil {
+		return 0, false, fmt.Errorf("read the AUTO_INCREMENT counter of %s.%s: %w", schema, tableName, err)
+	}
+	next, hasColumn, err = nextAutoIncrementFromCreateTable(createTable)
+	if err != nil {
+		return 0, false, fmt.Errorf("read the AUTO_INCREMENT counter of %s.%s: %w", schema, tableName, err)
+	}
+	return next, hasColumn, nil
+}
+
+// nextAutoIncrementFromCreateTable is NextAutoIncrement's parsing half. It
+// uses the parser rather than searching the text, so the keyword inside a
+// COMMENT, a default or an identifier cannot be mistaken for the counter.
+func nextAutoIncrementFromCreateTable(createTable string) (next uint64, hasColumn bool, err error) {
+	create, err := parseCreateTable(createTable)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, col := range create.Cols {
+		for _, opt := range col.Options {
+			if opt.Tp == ast.ColumnOptionAutoIncrement {
+				hasColumn = true
+			}
+		}
+	}
+	if !hasColumn {
+		return 0, false, nil
+	}
+	next = 1
+	if i := slices.IndexFunc(create.Options, isAutoIncrementOption); i >= 0 && create.Options[i].UintValue > 1 {
+		next = create.Options[i].UintValue
+	}
+	return next, true, nil
 }

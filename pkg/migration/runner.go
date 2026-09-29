@@ -507,6 +507,8 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 				newTable:       change.newTable,
 				oldTableName:   change.oldTableName(),
 				useTestCutover: r.migration.useTestCutover, // indicates we want the test cutover
+				// An AUTO_INCREMENT=N in the ALTER is honored, as by a native ALTER.
+				keepNewAutoIncrement: change.stmt.SetsAutoIncrement(),
 			})
 		}
 		cutover, err := NewCutOver(r.db, cutoverCfg, r.replClient, r.dbConfig, r.logger)

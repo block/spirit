@@ -50,6 +50,11 @@ type cutoverConfig struct {
 	newTable       *table.TableInfo
 	oldTableName   string
 	useTestCutover bool
+	// keepNewAutoIncrement leaves the new table's AUTO_INCREMENT counter as
+	// it is instead of raising it to the original table's (see
+	// carryAutoIncrements). It is set when the ALTER sets the counter
+	// explicitly, which a native ALTER would honor.
+	keepNewAutoIncrement bool
 }
 
 // NewCutOver contains the logic to perform the final cut over. It can cutover multiple tables
@@ -320,6 +325,9 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	if !c.feed.AllChangesFlushed() {
 		return fmt.Errorf("%w, final flush might be broken", change.ErrChangesNotFlushed)
 	}
+	if err := c.carryAutoIncrements(ctx, tableLock); err != nil {
+		return err
+	}
 
 	renameStatement := "RENAME TABLE " + strings.Join(renameFragments, ", ")
 	if err := tableLock.ExecUnderLock(ctx, renameStatement); err != nil {
@@ -341,6 +349,47 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 			c.testAfterRenameError()
 		}
 		return c.testInjectRenameError
+	}
+	return nil
+}
+
+// carryAutoIncrements raises each new table's AUTO_INCREMENT counter to at
+// least the original table's, so the table does not start reissuing ids when
+// the new table takes over its name.
+//
+// The copy and the change feed only carry rows. The new table's counter
+// follows the highest id it has received, so any id the original table
+// issued above that - rows inserted and then deleted before they were copied
+// (their changes merge away), rolled back inserts, INSERT IGNORE and upsert
+// gaps - would be issued again after the cutover. The counter preserved when
+// the new table was created (preserveAutoIncrement) is stale by now.
+//
+// This must run with the table lock held and after the final flush, so no
+// insert can advance the original table's counter after it has been read.
+// The cost under the lock is two SHOW CREATE TABLE reads per table (one when
+// the table has no AUTO_INCREMENT column), plus a metadata-only ALTER TABLE
+// .. AUTO_INCREMENT when the new table is behind. The ALTER runs on the
+// locking session, which keeps its locks through it.
+//
+// DDL on the new table while the feed is still running would normally be
+// reported as a schema change, but the runner ignores those from the start
+// of the cutover (Runner.fatalError), just as it does for the RENAME.
+func (c *CutOver) carryAutoIncrements(ctx context.Context, tableLock *dbconn.TableLock) error {
+	for _, cfg := range c.config {
+		if cfg.keepNewAutoIncrement {
+			continue
+		}
+		raisedTo, raised, err := raiseAutoIncrement(ctx, c.db, cfg.table, cfg.newTable, func(ctx context.Context, stmt string) error {
+			return tableLock.ExecUnderLock(ctx, stmt)
+		})
+		if err != nil {
+			return err
+		}
+		if raised {
+			c.logger.Info("raised AUTO_INCREMENT on new table to match the original table",
+				"table", cfg.table.TableName,
+				"auto_increment", raisedTo)
+		}
 	}
 	return nil
 }

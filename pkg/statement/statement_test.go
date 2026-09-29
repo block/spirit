@@ -463,6 +463,21 @@ ALTER TABLE t1 ADD INDEX idx_a (a)`)
 	require.ErrorIs(t, err, ErrNoStatements)
 }
 
+func TestSetsAutoIncrement(t *testing.T) {
+	for stmt, want := range map[string]bool{
+		"ALTER TABLE t1 AUTO_INCREMENT=5000":                                   true,
+		"ALTER TABLE t1 ADD COLUMN c INT, AUTO_INCREMENT = 10":                 true,
+		"ALTER TABLE t1 ENGINE=InnoDB AUTO_INCREMENT=10":                       true,
+		"ALTER TABLE t1 ADD COLUMN c INT":                                      false,
+		"ALTER TABLE t1 MODIFY id BIGINT NOT NULL AUTO_INCREMENT":              false, // column attribute, not the counter
+		"ALTER TABLE t1 COMMENT 'AUTO_INCREMENT=5'":                            false,
+		"ALTER TABLE t1 ENGINE=InnoDB":                                         false,
+		"CREATE TABLE t1 (id INT AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=5": false,
+	} {
+		require.Equal(t, want, MustNew(stmt)[0].SetsAutoIncrement(), stmt)
+	}
+}
+
 func TestColumnRenameMap(t *testing.T) {
 	// RENAME COLUMN syntax
 	stmts := MustNew("ALTER TABLE t1 RENAME COLUMN a TO b")
