@@ -445,6 +445,41 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	require.False(t, tableExists(t, ctl, "rwrv_dst", checkpointTableName), "checkpoint should be dropped")
 }
 
+// TestMoveReverseWindowRevertCarriesAutoIncrement: ids the target issues and
+// deletes during the window never flow back to the source, so the revert must
+// carry the target's AUTO_INCREMENT counter back or the source would issue
+// them again. Mirrors TestMoveCarriesAutoIncrement for the reverse cutover.
+func TestMoveReverseWindowRevertCarriesAutoIncrement(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	srcName, ctl := testutils.CreateUniqueTestDatabase(t)
+	dstName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE jobs (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)")
+	testutils.RunSQLInDatabase(t, srcName, "INSERT INTO jobs (v) VALUES (1), (2), (3)")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:     testutils.DSNForDatabase(srcName),
+		TargetDSN:     testutils.DSNForDatabase(dstName),
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second, // long; the revert ends it early
+	})
+	require.NoError(t, err)
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { return nil })
+	h := startRun(t, runner)
+
+	h.awaitReverseWindow(ctl, dstName)
+	testutils.RunSQLInDatabase(t, dstName, "INSERT INTO jobs (v) VALUES (4), (5), (6), (7), (8)")
+	testutils.RunSQLInDatabase(t, dstName, "DELETE FROM jobs WHERE id > 3")
+	require.Equal(t, uint64(9), nextAutoIncrement(t, dstName, "jobs"))
+	testutils.RunSQLInDatabase(t, dstName, "CREATE TABLE "+revertMarkerName+" (id INT)")
+	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete")
+
+	require.True(t, tableExists(t, ctl, srcName, "jobs"), "source should be un-retired")
+	require.Equal(t, uint64(9), nextAutoIncrement(t, srcName, "jobs"),
+		"the source's AUTO_INCREMENT is behind the target's after the revert")
+}
+
 // runRevertingMove runs one reverse-window move against the given DSNs and, once
 // the window opens, requests a revert (creates the marker), returning when the
 // reverse cutover has completed. Fails the test on any error. The change

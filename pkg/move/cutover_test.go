@@ -2,6 +2,7 @@ package move
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,8 +10,10 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -455,4 +458,123 @@ func TestCutOverSuccessfulCallbackDoesNotInventDurableMutation(t *testing.T) {
 			require.Equal(t, tt.wantDurable, errors.Is(err, status.ErrDurableMutation))
 		})
 	}
+}
+
+// runDeferredMove starts runner, waits for it to block on the sentinel, runs
+// duringSentinel, releases the sentinel on targets[0] and waits for the move
+// to finish.
+func runDeferredMove(t *testing.T, runner *Runner, sentinelDB string, duringSentinel func()) {
+	t.Helper()
+	errCh := make(chan error, 1)
+	go func() { errCh <- runner.Run(t.Context()) }()
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
+	duringSentinel()
+	testutils.RunSQL(t, fmt.Sprintf("DROP TABLE `%s`.%s", sentinelDB, sentinel.TableName))
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("move did not complete after the sentinel was dropped")
+	}
+}
+
+// nextAutoIncrement returns the table's live AUTO_INCREMENT counter.
+func nextAutoIncrement(t *testing.T, schema, tableName string) uint64 {
+	t.Helper()
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	next, ok, err := table.NextAutoIncrement(t.Context(), db, schema, tableName)
+	require.NoError(t, err)
+	require.True(t, ok, "%s.%s has no AUTO_INCREMENT column", schema, tableName)
+	return next
+}
+
+// TestMoveCarriesAutoIncrement regresses the AUTO_INCREMENT counter going
+// backwards when traffic moves to the target. Rows inserted and then deleted
+// at the top of the id range during the move never reach the target (their
+// changes merge into nothing), and the counter the target table was created
+// with is stale by the cutover, so without carrying the source's counter over
+// the target would issue ids 4..8 again.
+func TestMoveCarriesAutoIncrement(t *testing.T) {
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	dstName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE jobs (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)`)
+	testutils.RunSQLInDatabase(t, srcName, `INSERT INTO jobs (v) VALUES (1), (2), (3)`)
+	// A table without an AUTO_INCREMENT column is moved alongside and skipped.
+	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE settings (name VARCHAR(20) NOT NULL PRIMARY KEY, v INT NOT NULL)`)
+	testutils.RunSQLInDatabase(t, srcName, `INSERT INTO settings VALUES ('a', 1)`)
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:    testutils.DSNForDatabase(srcName),
+		TargetDSN:    testutils.DSNForDatabase(dstName),
+		Threads:      1,
+		WriteThreads: 1,
+		DeferCutOver: true,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+
+	runDeferredMove(t, runner, dstName, func() {
+		testutils.RunSQLInDatabase(t, srcName, `INSERT INTO jobs (v) VALUES (4), (5), (6), (7), (8)`)
+		testutils.RunSQLInDatabase(t, srcName, `DELETE FROM jobs WHERE id > 3`)
+		require.Equal(t, uint64(9), nextAutoIncrement(t, srcName, "jobs"))
+	})
+
+	require.Equal(t, uint64(9), nextAutoIncrement(t, dstName, "jobs"),
+		"the target's AUTO_INCREMENT is behind the source's after cutover")
+}
+
+// TestNtoMShardedMoveCarriesAutoIncrement checks the sharded case: every
+// target gets the highest counter among the sources, so no target can issue
+// an id that any source has issued, whichever shard the row would land on.
+func TestNtoMShardedMoveCarriesAutoIncrement(t *testing.T) {
+	src0Name, _ := testutils.CreateUniqueTestDatabase(t)
+	src1Name, _ := testutils.CreateUniqueTestDatabase(t)
+	tgt0Name, _ := testutils.CreateUniqueTestDatabase(t)
+	tgt1Name, _ := testutils.CreateUniqueTestDatabase(t)
+	for _, dbName := range []string{src0Name, src1Name} {
+		testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL)`)
+	}
+	testutils.RunSQLInDatabase(t, src0Name, `INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b')`)
+	testutils.RunSQLInDatabase(t, src1Name, `INSERT INTO users (id, name) VALUES (3, 'c'), (4, 'd')`)
+
+	dbConfig := dbconn.NewDBConfig()
+	var targets []applier.Target
+	for i, name := range []string{tgt0Name, tgt1Name} {
+		db, err := dbconn.New(testutils.DSNForDatabase(name), dbConfig)
+		require.NoError(t, err)
+		cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(name))
+		require.NoError(t, err)
+		targets = append(targets, applier.Target{KeyRange: []string{"-80", "80-"}[i], DB: db, Config: cfg})
+	}
+	runner, err := NewRunner(&Move{
+		SourceDSNs:   []string{testutils.DSNForDatabase(src0Name), testutils.DSNForDatabase(src1Name)},
+		Targets:      targets,
+		Threads:      1,
+		WriteThreads: 1,
+		SourceTables: []string{"users"},
+		DeferCutOver: true,
+		ShardingProvider: &testShardingProvider{
+			shardingColumn: "id",
+			hashFunc:       testutils.EvenOddHasher,
+		},
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+
+	// Wherever the sentinel lives, it is on the first target by sort order.
+	sentinelDB := tgt0Name
+	if targetKey(targets[1]) < targetKey(targets[0]) {
+		sentinelDB = tgt1Name
+	}
+	runDeferredMove(t, runner, sentinelDB, func() {
+		// Source 1 issues id 1000 and deletes it again: its counter moves to
+		// 1001, while no row above 4 reaches either target.
+		testutils.RunSQLInDatabase(t, src1Name, `INSERT INTO users (id, name) VALUES (1000, 'z')`)
+		testutils.RunSQLInDatabase(t, src1Name, `DELETE FROM users WHERE id = 1000`)
+	})
+
+	require.Equal(t, uint64(1001), nextAutoIncrement(t, tgt0Name, "users"))
+	require.Equal(t, uint64(1001), nextAutoIncrement(t, tgt1Name, "users"))
 }
