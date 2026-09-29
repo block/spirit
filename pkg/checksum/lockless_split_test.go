@@ -143,9 +143,11 @@ func TestLocklessHotSplit(t *testing.T) {
 				}
 			} else {
 				require.Equal(t, uint64(3), stats.ChunksPassedThisPass)
+				// PassesCompleted is incremented before FirstCleanPass is
+				// signalled, so wait for the signal rather than polling it.
 				select {
 				case <-c.FirstCleanPass():
-				default:
+				case <-time.After(time.Second):
 					t.Fatal("all children verified but parent unresolved")
 				}
 			}
