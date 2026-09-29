@@ -411,6 +411,14 @@ func TestExpectedImageCRCMatchesRealRowAcrossConversions(t *testing.T) {
 			"INSERT INTO src VALUES (1, b'00000101')", []any{int32(1), int64(5)}},
 		{"bit17 to varbinary", "id INT PRIMARY KEY, b BIT(17)", "id INT PRIMARY KEY, b VARBINARY(20)",
 			"INSERT INTO src VALUES (1, 131071)", []any{int32(1), int64(131071)}},
+		// cast to double and float: CAST(x'05' AS ...) would not be 5
+		{"bit to double", "id INT PRIMARY KEY, b BIT(8)", "id INT PRIMARY KEY, b DOUBLE",
+			"INSERT INTO src VALUES (1, b'00000101')", []any{int32(1), int64(5)}},
+		{"bit to float", "id INT PRIMARY KEY, b BIT(8)", "id INT PRIMARY KEY, b FLOAT",
+			"INSERT INTO src VALUES (1, b'00000101')", []any{int32(1), int64(5)}},
+		// narrowing to FLOAT: the source is rounded to FLOAT precision
+		{"double to float", "id INT PRIMARY KEY, d DOUBLE", "id INT PRIMARY KEY, d FLOAT",
+			"INSERT INTO src VALUES (1, 0.123456789)", []any{int32(1), float64(0.123456789)}},
 		// string source into a BIT target: cast to binary, bound as-is
 		{"varchar to bit", "id INT PRIMARY KEY, b VARCHAR(8)", "id INT PRIMARY KEY, b BIT(8)",
 			"INSERT INTO src VALUES (1, '5')", []any{int32(1), "5"}},

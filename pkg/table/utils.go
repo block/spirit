@@ -56,8 +56,12 @@ func castableTp(tp string) string {
 		//    to zero bytes, which would make the checksum blind to the column's
 		//    contents entirely.
 		return tp
-	case "float", "double": // required for MySQL 5.7
-		return "char"
+	case "float", "double", "float unsigned", "double unsigned":
+		// FLOAT and DOUBLE are compared as their exact DOUBLE value (see
+		// castExpr). CAST(... AS char) renders a FLOAT with 6 significant
+		// digits, which cannot tell 0.12345679 from 0.123457, and so hid
+		// the copier writing the 6-digit text form into the new table.
+		return "double"
 	case "json":
 		// castExpr casts json differently depending on which side of the
 		// comparison it is building; see the comment there.
@@ -117,8 +121,17 @@ func castableTp(tp string) string {
 // The source type only widens a temporal target cast when the source is
 // itself DATETIME/TIMESTAMP; for any other source type (e.g. VARCHAR ->
 // DATETIME) the target's own cast is used, as before.
+//
+// A FLOAT target with a source that is not FLOAT (DOUBLE -> FLOAT, VARCHAR ->
+// FLOAT) is a narrowing: MySQL rounds each value to the nearest FLOAT. The
+// exact "double" comparison would report that rounding as a difference on
+// every row, so these use the "float" cast, which rounds the source to FLOAT
+// precision (see castExpr).
 func checksumCastTp(sourceTp, targetTp string) string {
 	castTp := castableTp(targetTp)
+	if castTp == "double" && isFloatColumnType(targetTp) && !isFloatColumnType(sourceTp) {
+		return "float"
+	}
 	if removeWidth(targetTp) == "bit" && isByteStoredInBit(sourceTp) {
 		return "binary"
 	}
@@ -169,6 +182,25 @@ const (
 	castSource castSide = iota
 	castTarget
 )
+
+// roundToFloatExpr rounds the DOUBLE expression x to the nearest FLOAT, the way
+// MySQL stores a value in a FLOAT column: to 24 significant bits, with ties to
+// even, and to a fixed 2^-149 step below the smallest normal FLOAT. CAST(x AS
+// FLOAT) can not be used: it needs MySQL 8.0.17, and does not round on every
+// 8.0 version (on 8.0.28 CAST(0.1E0 AS FLOAT) + 0E0 is 0.1).
+//
+// The binary exponent is FLOOR(LOG2(|x|)), corrected by one where LOG2 is
+// inexact next to a power of two. The step 2^(e-23) is a power of two, so the
+// division is exact, and ROUND of a DOUBLE rounds ties to even. x must not be
+// beyond FLT_MAX, which a copy into a FLOAT column refuses anyway.
+func roundToFloatExpr(x string) string {
+	abs := "ABS(" + x + ")"
+	exp := "FLOOR(LOG2(" + abs + "))"
+	exp = "GREATEST(" + exp + " + (" + abs + " >= POW(2, " + exp + " + 1)) - (" + abs + " < POW(2, " + exp + ")), -126)"
+	step := "POW(2, " + exp + " - 23)"
+	return "(CASE WHEN " + x + " IS NULL OR " + x + " = 0 THEN " + x +
+		" ELSE ROUND(" + x + " / " + step + ") * " + step + " END)"
+}
 
 // castExpr builds the CAST expression that the checksum uses for a single
 // column (see ColumnMapping.ChecksumExprs). col is the column referenced in
@@ -225,6 +257,19 @@ const (
 // add a round-trip cast on top of that.
 func castExpr(col, castTp string, side castSide) string {
 	quotedCol := sqlescape.EscapeIdentifier(col)
+	if castTp == "double" {
+		// Adding a DOUBLE zero converts the column to DOUBLE without a CAST,
+		// which only accepts DOUBLE from MySQL 8.0.17. A FLOAT widens to its
+		// exact value, and the text form of that is distinct for every
+		// distinct FLOAT.
+		return "(" + quotedCol + " + 0E0)"
+	}
+	if castTp == "float" {
+		if side == castSource {
+			return roundToFloatExpr("(" + quotedCol + " + 0E0)")
+		}
+		return "(" + quotedCol + " + 0E0)"
+	}
 	if castTp == "json" {
 		if side == castSource {
 			return textRoundTripCast(quotedCol)

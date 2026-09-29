@@ -106,6 +106,94 @@ func (m *ColumnMapping) Columns() (source, target string) {
 	return sqlescape.EscapeIdentifierList(m.sourceColumns), sqlescape.EscapeIdentifierList(m.targetColumns)
 }
 
+// SourceSelectList returns the comma-separated expressions a copy path SELECTs
+// from the source to write into the target: the source column list of
+// Columns(), except that a FLOAT copied into a numeric column is read as a
+// DOUBLE (see copyReadExpr). Rows read with it are positional in the same
+// order as Columns().
+func (m *ColumnMapping) SourceSelectList() string {
+	return selectList(m.sourceColumns, m.targetColumns, m.sourceTable, m.targetTable)
+}
+
+// SourceSelectList is ColumnMapping.SourceSelectList for callers that copy a
+// list of columns into a target table where each column keeps its name.
+func SourceSelectList(columns []string, source, target *TableInfo) string {
+	return selectList(columns, columns, source, target)
+}
+
+func selectList(sourceColumns, targetColumns []string, source, target *TableInfo) string {
+	exprs := make([]string, len(sourceColumns))
+	for i, col := range sourceColumns {
+		sourceTp, _ := source.GetColumnMySQLType(col)
+		targetTp, _ := target.GetColumnMySQLType(targetColumns[i])
+		exprs[i] = copyReadExpr(col, sourceTp, targetTp)
+	}
+	return strings.Join(exprs, ", ")
+}
+
+// copyReadExpr returns the expression that reads one source column for a copy
+// into a column of targetTp.
+//
+// MySQL sends a FLOAT to the client as text with 6 significant digits, so a
+// plain SELECT turns 0.12345679 into 0.123457 and 16777216 into 16777200, and
+// the driver hands the copier a float32 parsed from that text. Two targets
+// need something else:
+//
+//   - A numeric target is read with a DOUBLE zero added, which widens the FLOAT
+//     to its exact value. A FLOAT or DOUBLE target stores that exactly, and a
+//     DECIMAL or integer target converts from the same value, as ALTER TABLE
+//     does.
+//   - A string target is read as CAST(... AS char), which is the text ALTER
+//     TABLE stores. The float32 would be re-formatted by Go instead, which
+//     writes 16777200 as 1.67772e+07 and 3.40282e38 as 3.40282e+38.
+//
+// Any other target (BIT, ENUM, temporal) is read as before.
+func copyReadExpr(col, sourceTp, targetTp string) string {
+	quotedCol := sqlescape.EscapeIdentifier(col)
+	if !isFloatColumnType(sourceTp) {
+		return quotedCol
+	}
+	switch {
+	case isNumericColumnType(targetTp):
+		return "(" + quotedCol + " + 0E0)"
+	case isStringColumnType(targetTp):
+		return "CAST(" + quotedCol + " AS char)"
+	default:
+		return quotedCol
+	}
+}
+
+// isStringColumnType reports whether tp is a character or binary string
+// column type: CHAR, VARCHAR, BINARY, VARBINARY, or a TEXT or BLOB type.
+func isStringColumnType(tp string) bool {
+	base := strings.ToLower(strings.TrimSpace(tp))
+	if before, _, found := strings.Cut(base, "("); found {
+		base = before
+	}
+	base, _, _ = strings.Cut(base, " ")
+	switch base {
+	case "char", "varchar", "binary", "varbinary",
+		"tinytext", "text", "mediumtext", "longtext",
+		"tinyblob", "blob", "mediumblob", "longblob":
+		return true
+	}
+	return false
+}
+
+// isNumericColumnType reports whether tp is an integer, DECIMAL, FLOAT or
+// DOUBLE column type.
+func isNumericColumnType(tp string) bool {
+	if tp == "" || isBITType(tp) {
+		return false
+	}
+	switch castTp := castableTp(tp); castTp {
+	case "signed", "unsigned", "double":
+		return true
+	default:
+		return strings.HasPrefix(castTp, "decimal")
+	}
+}
+
 // ColumnsSlice returns parallel slices of source and target column names.
 // sourceColumns[i] corresponds to targetColumns[i].
 func (m *ColumnMapping) ColumnsSlice() (sourceColumns, targetColumns []string) {

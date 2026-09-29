@@ -49,6 +49,7 @@ type TableInfo struct {
 	unknownCollations           map[string]bool   // columns that carry a charset whose collation the table definition does not determine
 	enumSetElements             map[int][]string  // parsed ENUM/SET element list, keyed by column ordinal; only present for ENUM/SET columns
 	binaryColumnWidths          map[int]int       // declared width of BINARY(N) columns, keyed by column ordinal; only present for fixed-width BINARY columns
+	floatColumns                []int             // ordinals of FLOAT columns, whose binlog values DecodeBinlogRow widens to float64
 	KeyColumns                  []string          // the column names of the primaryKey
 	keyColumnsMySQLTp           []string          // the MySQL types of the primaryKey
 	KeyIsAutoInc                bool              // if pk[0] is an auto_increment column
@@ -306,6 +307,7 @@ func (t *TableInfo) resetColumns() {
 	t.unknownCollations = make(map[string]bool)
 	t.enumSetElements = nil
 	t.binaryColumnWidths = nil
+	t.floatColumns = nil
 }
 
 // addColumn records one column's metadata, caching the parsed ENUM/SET element
@@ -353,6 +355,9 @@ func (t *TableInfo) addColumn(col ColumnMeta) error {
 			}
 			t.binaryColumnWidths[ordinal] = width
 		}
+	}
+	if isFloatColumnType(mysqlType) {
+		t.floatColumns = append(t.floatColumns, ordinal)
 	}
 	return nil
 }
@@ -517,6 +522,28 @@ func (t *TableInfo) setPrimaryKey(ctx context.Context) error {
 		t.keyDatums = append(t.keyDatums, mySQLTypeToDatumTp(pkType))
 		if i == 0 {
 			t.KeyIsAutoInc = (extra == "auto_increment")
+		}
+	}
+	return t.FloatPrimaryKeyError()
+}
+
+// FloatPrimaryKeyError returns an error if a primary key column is a FLOAT,
+// which Spirit refuses to copy, as gh-ost does.
+//
+// Spirit finds rows by key with SQL literals: chunk boundaries, and the
+// DELETEs that replay the binlog. A FLOAT is compared to a literal as a
+// DOUBLE, and a FLOAT such as 0.1 has no text form that equals it as a DOUBLE
+// ("0.1" does not). A replayed DELETE then matches nothing, so a row deleted
+// during the migration is still in the table after cutover; and a chunk
+// boundary on a value shared by many rows never advances.
+//
+// The table is refused on setup, before MySQL's native DDL is attempted, so
+// the refusal holds for every statement on every server.
+func (t *TableInfo) FloatPrimaryKeyError() error {
+	for _, col := range t.KeyColumns {
+		if tp, ok := t.GetColumnMySQLType(col); ok && isFloatColumnType(tp) {
+			return fmt.Errorf("primary key column %q of table %q is a FLOAT, which is not supported: "+
+				"a FLOAT does not compare equal to its text form, so rows cannot be located by key", col, t.TableName)
 		}
 	}
 	return nil
@@ -756,11 +783,12 @@ func (t *TableInfo) HasEnumOrSetColumns() bool {
 
 // NeedsBinlogRowDecoding reports whether DecodeBinlogRow would do any
 // work for this table: it has ENUM/SET columns (ordinal/bitmask
-// decoding) or fixed-width BINARY columns (trailing 0x00 re-padding).
+// decoding), fixed-width BINARY columns (trailing 0x00 re-padding) or
+// FLOAT columns (widening to float64).
 // Used to skip the per-row decoding hot path when there's nothing to
 // decode.
 func (t *TableInfo) NeedsBinlogRowDecoding() bool {
-	return len(t.enumSetElements) > 0 || len(t.binaryColumnWidths) > 0
+	return len(t.enumSetElements) > 0 || len(t.binaryColumnWidths) > 0 || len(t.floatColumns) > 0
 }
 
 // DecodeBinlogRow normalizes a binlog row image in place so the
@@ -780,11 +808,27 @@ func (t *TableInfo) NeedsBinlogRowDecoding() bool {
 //     targets that don't re-pad server-side (e.g. VARBINARY), and
 //     binary primary-key lookups miss. See pkg/table/binarypad.go and
 //     block/spirit#945.
+//   - FLOAT values are widened from float32 to float64, so they are
+//     written as the float32's exact value (see the comment in the body).
 //
 // nil values (NULL columns) and rows with nothing to decode are a
-// no-op. If the table has no ENUM/SET/BINARY columns at all, callers
+// no-op. If the table has no ENUM/SET/BINARY/FLOAT columns at all, callers
 // should gate with NeedsBinlogRowDecoding and skip the call entirely.
 func (t *TableInfo) DecodeBinlogRow(row []any) error {
+	// The binlog decodes FLOAT as a float32, which Datum prints as the
+	// shortest string that round-trips as a float32 ("0.1"). MySQL parses
+	// that literal as a DOUBLE, so it is not the value the source holds: a
+	// DOUBLE target stores 0.1 where ALTER TABLE stores 0.10000000149011612,
+	// and FLT_MAX is out of range (warning 1264). The float64 holds the
+	// float32's exact value, which a FLOAT target stores back unchanged.
+	for _, ord := range t.floatColumns {
+		if ord >= len(row) {
+			continue
+		}
+		if f, ok := row[ord].(float32); ok {
+			row[ord] = float64(f)
+		}
+	}
 	for ord, width := range t.binaryColumnWidths {
 		if ord >= len(row) {
 			continue

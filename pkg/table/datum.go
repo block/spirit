@@ -37,6 +37,18 @@ func isBITType(mysqlTp string) bool {
 	return baseType == "BIT"
 }
 
+// isFloatColumnType reports whether mysqlTp is a FLOAT column type, in any of
+// its spellings: "float", "float unsigned", "float(7,4) zerofill". FLOAT(p)
+// with p > 24 is created as a DOUBLE, so information_schema never reports it.
+func isFloatColumnType(mysqlTp string) bool {
+	base := strings.ToLower(strings.TrimSpace(mysqlTp))
+	if before, _, found := strings.Cut(base, "("); found {
+		base = before
+	}
+	base, _, _ = strings.Cut(base, " ")
+	return base == "float"
+}
+
 func mySQLTypeToDatumTp(mysqlTp string) datumTp {
 	// Normalize to uppercase and remove width specifications
 	normalized := strings.ToUpper(removeWidth(mysqlTp))
@@ -60,6 +72,12 @@ func mySQLTypeToDatumTp(mysqlTp string) datumTp {
 		// MySQL coerces to a bit pattern, rather than a quoted string
 		// (which MySQL would otherwise interpret byte-by-byte as bits).
 		return unsignedType
+	case "YEAR":
+		// YEAR must be emitted as a bare number. MySQL stores the string
+		// '0' in a YEAR column as 2000 but the number 0 as 0000, and both
+		// the driver and the binlog deliver YEAR 0000 as the integer 0.
+		// As an unknownType it was quoted ("0") and silently became 2000.
+		return signedType
 	case "FLOAT", "DOUBLE", "DECIMAL":
 		// Treat floats as unknownType so they get formatted as-is
 		return unknownType

@@ -50,8 +50,13 @@ func TestCastableTp(t *testing.T) {
 		{"datetime(6)", "datetime(6)"},
 		{"datetime(1)", "datetime(1)"},
 		{"year", "char CHARACTER SET utf8mb4"},
-		{"float", "char"},
-		{"double", "char"},
+		// FLOAT and DOUBLE compare as their exact DOUBLE value: a char cast
+		// renders a FLOAT with 6 significant digits.
+		{"float", "double"},
+		{"double", "double"},
+		{"float unsigned", "double"},
+		{"double unsigned", "double"},
+		{"float(7,4) zerofill", "double"},
 		{"json", "json"},
 		{"int(11)", "signed"},
 		{"int(11) unsigned", "unsigned"},
@@ -98,6 +103,13 @@ func TestCastExpr(t *testing.T) {
 	require.Equal(t, "CAST(`b` AS binary(16))", castExpr("b", "binary(16)", castTarget))
 	require.Equal(t, "CAST(`d` AS decimal(6,2))", castExpr("d", "decimal(6,2)", castSource))
 	require.Equal(t, "CAST(`ts` AS datetime(6))", castExpr("ts", "datetime(6)", castTarget))
+	// DOUBLE is rendered as an addition, not a CAST, which only accepts
+	// DOUBLE from MySQL 8.0.17.
+	require.Equal(t, "(`f` + 0E0)", castExpr("f", "double", castSource))
+	require.Equal(t, "(`f` + 0E0)", castExpr("f", "double", castTarget))
+	// A narrowing to FLOAT rounds the source to FLOAT precision.
+	require.Equal(t, roundToFloatExpr("(`d` + 0E0)"), castExpr("d", "float", castSource))
+	require.Equal(t, "(`d` + 0E0)", castExpr("d", "float", castTarget))
 }
 
 func TestChecksumCastTp(t *testing.T) {
@@ -145,6 +157,16 @@ func TestChecksumCastTp(t *testing.T) {
 		{"enum('a','b')", "bit(8)", "unsigned"},
 		{"set('a','b')", "bit(8)", "unsigned"},
 		{"time", "bit(64)", "unsigned"},
+		// A FLOAT target with any other source is a narrowing, compared at
+		// FLOAT precision; FLOAT with FLOAT, or into DOUBLE, is exact.
+		{"double", "float", "float"},
+		{"varchar(20)", "float", "float"},
+		{"decimal(10,4)", "float unsigned", "float"},
+		{"bigint", "float(7,4)", "float"},
+		{"float", "float", "double"},
+		{"float unsigned", "float", "double"},
+		{"float", "double", "double"},
+		{"double", "double", "double"},
 		// The exception is only for a BIT target.
 		{"varchar(8)", "int", "signed"},
 	} {
