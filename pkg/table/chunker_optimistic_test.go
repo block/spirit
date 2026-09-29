@@ -1128,28 +1128,24 @@ func TestOptimisticPrefetchDensityUsesSourceRows(t *testing.T) {
 
 // A continuous checksum restarts its chunker with OpenAtWatermark while the
 // status dumper polls Progress from another goroutine, so the progress
-// counters must be safe to read concurrently with a resume. Run with -race.
+// counters must be safe to read concurrently with a resume. Run with -race:
+// both loops run a fixed number of times, so the reads always execute, and
+// nothing orders them against the writes, so the race detector sees any
+// unsynchronised access.
 func TestOptimisticOpenAtWatermarkConcurrentProgress(t *testing.T) {
 	_, chunker := newOptimisticChunker4Test(t)
 	watermark := `{"Key":["id"],"ChunkSize":1000,"LowerBound":{"Value":["3001"],"Inclusive":true},"UpperBound":{"Value":["4001"],"Inclusive":false},"RowsCopied":137}`
 
-	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				chunker.Progress()
-				chunker.RowsCopied()
-			}
+		for range 100 {
+			chunker.Progress()
+			chunker.RowsCopied()
 		}
 	})
 	for range 100 {
 		require.NoError(t, chunker.OpenAtWatermark(watermark))
 	}
-	close(done)
 	wg.Wait()
 
 	rowsCopied, _, _ := chunker.Progress()
