@@ -134,3 +134,22 @@ func TestTablePersistent(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, exists)
 }
+
+// TestReadLatestEscapesTableName checks that every operation works on a
+// checkpoint table whose name contains a backtick, as it does when the
+// migrated table's name contains one.
+func TestReadLatestEscapesTableName(t *testing.T) {
+	db, schema := setup(t)
+	name := "_ckpt`test_chkpnt"
+	t.Cleanup(func() { _ = dbconn.Exec(t.Context(), db, "DROP TABLE IF EXISTS %n.%n", schema, name) })
+	tbl := checkpoint.NewTable(db, name, checkpoint.Transient)
+
+	require.NoError(t, tbl.Create(t.Context()))
+	_, err := tbl.ReadLatest(t.Context())
+	require.ErrorIs(t, err, checkpoint.ErrNotFound)
+	require.NoError(t, tbl.Write(t.Context(), checkpoint.Record{Position: "pos1", Statement: "ALTER TABLE t ENGINE=InnoDB"}))
+	got, err := tbl.ReadLatest(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "pos1", got.Position)
+	require.NoError(t, tbl.Drop(t.Context()))
+}

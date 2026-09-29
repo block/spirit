@@ -3,6 +3,7 @@ package move
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -131,7 +132,7 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	// Do all the setup stuff from runnner.Run()
 	// Just don't run copier.Run() or cutover etc.
 	var ctx context.Context
-	ctx, r.cancelFunc = context.WithCancel(t.Context())
+	ctx, r.cancelFunc = context.WithCancelCause(t.Context())
 	r.dbConfig = dbconn.NewDBConfig()
 	srcDB, err := dbconn.New(r.move.SourceDSN, r.dbConfig)
 	require.NoError(t, err)
@@ -156,7 +157,7 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	require.NoError(t, r.DumpCheckpoint(ctx))
 
 	// Close everything manually.
-	r.cancelFunc()
+	r.cancelFunc(nil)
 	require.NoError(t, r.sources[0].db.Close())
 	require.NoError(t, r.targets[0].DB.Close())
 	require.NoError(t, r.Close())
@@ -397,7 +398,7 @@ func TestPostCopyAnalyzeTargetSchema(t *testing.T) {
 	// Drive the same setup the real Run() does, then run the copier so the
 	// target table exists and is populated, then call postCopyPhase directly.
 	var ctx context.Context
-	ctx, r.cancelFunc = context.WithCancel(t.Context())
+	ctx, r.cancelFunc = context.WithCancelCause(t.Context())
 	r.dbConfig = dbconn.NewDBConfig()
 	srcDB, err := dbconn.New(r.move.SourceDSN, r.dbConfig)
 	require.NoError(t, err)
@@ -416,7 +417,7 @@ func TestPostCopyAnalyzeTargetSchema(t *testing.T) {
 	require.NoError(t, r.setupDiscovery(ctx))
 	require.NoError(t, r.setupUnderLocks(ctx))
 	t.Cleanup(func() {
-		r.cancelFunc()
+		r.cancelFunc(nil)
 		// Runner.Close() closes the target DB and repl clients but not the raw
 		// source DB connection, so close it explicitly to avoid a goroutine leak
 		// (goleak runs in TestMain).
@@ -499,7 +500,7 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	// TestPostCopyAnalyzeTargetSchema), then run the copier so the target
 	// tables exist and are populated.
 	var ctx context.Context
-	ctx, r.cancelFunc = context.WithCancel(t.Context())
+	ctx, r.cancelFunc = context.WithCancelCause(t.Context())
 	r.dbConfig = dbconn.NewDBConfig()
 	srcDB, err := dbconn.New(r.move.SourceDSN, r.dbConfig)
 	require.NoError(t, err)
@@ -518,7 +519,7 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	require.NoError(t, r.setupDiscovery(ctx))
 	require.NoError(t, r.setupUnderLocks(ctx))
 	t.Cleanup(func() {
-		r.cancelFunc()
+		r.cancelFunc(nil)
 		// Runner.Close() closes the target DB and repl clients but not the raw
 		// source DB connection, so close it explicitly to avoid a goroutine leak
 		// (goleak runs in TestMain).
@@ -573,7 +574,7 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 		// exits before the outer cleanup tears down connections: release the
 		// MDL blocker, cancel the context, and wait for it.
 		release()
-		r.cancelFunc()
+		r.cancelFunc(nil)
 		<-done
 	})
 
@@ -690,6 +691,62 @@ func TestMoveValidate(t *testing.T) {
 			} else {
 				require.EqualError(t, err, tt.wantErr)
 			}
+		})
+	}
+}
+
+// TestMoveRefusesFloatAndBitPrimaryKeys checks that a source table whose
+// primary key includes a FLOAT or a BIT column is refused before anything is
+// created or copied on the target. A FLOAT key cannot be located by its text
+// form, so a replayed DELETE would miss; a BIT key cannot be read back as a
+// number, so the copy cannot compute its chunk boundaries.
+func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, create, insert, want string }{
+		{
+			name:   "float",
+			create: "CREATE TABLE %s.readings (id INT NOT NULL, f FLOAT NOT NULL, PRIMARY KEY (id, f))",
+			insert: "INSERT INTO %s.readings VALUES (1, 0.1), (2, 0.2)",
+			want:   `primary key column "f" of table "readings" is a FLOAT, which is not supported`,
+		},
+		{
+			name:   "bit",
+			create: "CREATE TABLE %s.readings (b BIT(16) NOT NULL PRIMARY KEY, v INT)",
+			insert: "INSERT INTO %s.readings VALUES (1, 1), (2, 2)",
+			want:   `primary key column "b" of table "readings" is a BIT, which is not supported`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcDB, destDB := "source_"+tc.name+"_pk", "dest_"+tc.name+"_pk"
+			for _, db := range []string{srcDB, destDB} {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+				testutils.RunSQL(t, "CREATE DATABASE "+db)
+			}
+			t.Cleanup(func() {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+destDB)
+			})
+			testutils.RunSQL(t, fmt.Sprintf(tc.create, srcDB))
+			testutils.RunSQL(t, fmt.Sprintf(tc.insert, srcDB))
+
+			src, dest := cfg.Clone(), cfg.Clone()
+			src.DBName, dest.DBName = srcDB, destDB
+			move := &Move{
+				SourceDSN:    src.FormatDSN(),
+				TargetDSN:    dest.FormatDSN(),
+				Threads:      2,
+				WriteThreads: 2,
+			}
+			require.ErrorContains(t, move.Run(), tc.want)
+
+			db, err := sql.Open("block-mysql", dest.FormatDSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			var n int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+			require.Zero(t, n, "nothing may be created on the target")
 		})
 	}
 }

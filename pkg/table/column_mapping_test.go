@@ -226,6 +226,28 @@ func TestColumnMappingChecksumExprsJSONAsymmetric(t *testing.T) {
 	require.Contains(t, tgt, "CAST(`j` AS json)")
 }
 
+func TestColumnMappingChecksumExprsEscapesColumnNames(t *testing.T) {
+	// Every column reference in the checksum expressions must be escaped: a
+	// backtick in a column name, quoted by hand, ends the identifier early
+	// and makes the checksum query a syntax error.
+	t1 := NewTableInfo(nil, "test", "t1")
+	t1new := NewTableInfo(nil, "test", "t1_new")
+	setColumns(t1, "id", "a`b", "old`c")
+	t1.columnsMySQLTps = map[string]string{"id": "int", "a`b": "varchar(10)", "old`c": "int"}
+	setColumns(t1new, "id", "a`b", "new`c")
+	t1new.columnsMySQLTps = map[string]string{"id": "int", "a`b": "varchar(10)", "new`c": "int"}
+
+	m := NewColumnMapping(t1, t1new, map[string]string{"old`c": "new`c"})
+	src, tgt, err := m.ChecksumExprs()
+	require.NoError(t, err)
+	require.Contains(t, src, "ISNULL(`a``b`)")
+	require.Contains(t, tgt, "ISNULL(`a``b`)")
+	require.Contains(t, src, "ISNULL(`old``c`)")
+	require.Contains(t, tgt, "ISNULL(`new``c`)")
+	require.NotContains(t, src, "ISNULL(`a`b`)")
+	require.NotContains(t, tgt, "ISNULL(`new`c`)")
+}
+
 func TestColumnMappingChecksumExprsTemporalPrecision(t *testing.T) {
 	// DATETIME/TIMESTAMP are cast to the wider of the source and target
 	// fractional-second precisions (see checksumCastTp), and both sides use

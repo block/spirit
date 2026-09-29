@@ -702,6 +702,7 @@ func TestPREFERREDModeDISABLEDFallback(t *testing.T) {
 		"time_zone=",
 		"innodb_lock_wait_timeout=60",
 		"lock_wait_timeout=60",
+		"wait_timeout=600",
 		"charset=utf8mb4",
 		"collation=utf8mb4_bin",
 		// No rejectReadOnly: the driver applies it unconditionally and no

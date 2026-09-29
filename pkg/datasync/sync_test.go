@@ -426,7 +426,7 @@ func TestFatalErrorConcurrentWithRunSetup(t *testing.T) {
 	wg.Go(func() {
 		// Simulate Run's setup assignment (see Runner.Run).
 		runner.progMu.Lock()
-		runner.cancelFunc = func() { cancelCalls.Add(1) }
+		runner.cancelFunc = func(error) { cancelCalls.Add(1) }
 		runner.progMu.Unlock()
 	})
 	wg.Go(func() {

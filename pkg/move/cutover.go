@@ -37,6 +37,14 @@ type CutoverResult struct {
 }
 
 // CutoverResultCallback is the result-bearing cutover callback form.
+//
+// A cutover callback (this form or the plain one passed to SetCutover or
+// SetReverseCutover) runs while the move holds LOCK TABLES on sessions it
+// sends no statements on. The final flush of the change feeds and the callback
+// together must complete within 10 minutes, the wait_timeout spirit sets on
+// every connection. Otherwise MySQL closes the idle lock sessions and releases
+// the locks before the tables are renamed, and writes can reach the tables the
+// traffic switch moved away from.
 type CutoverResultCallback func(context.Context) (CutoverResult, error)
 
 // CutOverSource holds per-source state needed for the cutover.

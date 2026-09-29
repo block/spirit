@@ -199,8 +199,12 @@ type Runner struct {
 	// phase transitions. It defaults to a NoopSink, so a caller that installs
 	// nothing pays only for the discarded values.
 	metricsSink metrics.Sink
-	cancelFunc  context.CancelFunc
-	dbConfig    *dbconn.DBConfig
+	// cancelFunc cancels the move context with a cause. Run returns that
+	// cause (see status.AbortCause) instead of the context.Canceled error the
+	// phases observe, so a fatal abort is reported as the failure it is and
+	// not as an operator cancellation. Cancel and Close pass a nil cause.
+	cancelFunc context.CancelCauseFunc
+	dbConfig   *dbconn.DBConfig
 
 	// fatalOnce makes fatalError idempotent. Move wires N repl clients
 	// (one per source) to the same fatalError callback, so a concurrent
@@ -290,7 +294,7 @@ func (r *Runner) recordCopyCompleted() {
 
 func (r *Runner) runCopy(ctx context.Context) error {
 	defer r.recordCopyCompleted()
-	return r.status.Do(status.CopyRows, func() error {
+	return r.status.DoContext(ctx, status.CopyRows, func() error {
 		return r.copier.Run(ctx)
 	})
 }
@@ -299,7 +303,7 @@ func (r *Runner) Close() error {
 	// Cancel the runner context so background goroutines (status.WatchTask)
 	// observe ctx.Done() and exit. Idempotent.
 	if r.cancelFunc != nil {
-		r.cancelFunc()
+		r.cancelFunc(nil)
 	}
 	// Wait for the status/checkpoint dumper goroutines to exit before
 	// tearing down connections, so a late DumpCheckpoint cannot race with
@@ -1302,14 +1306,19 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 }
 
 func (r *Runner) Run(ctx context.Context) (retErr error) {
-	ctx, r.cancelFunc = context.WithCancel(ctx)
-	defer r.cancelFunc()
+	ctx, r.cancelFunc = context.WithCancelCause(ctx)
+	defer r.cancelFunc(nil)
 	r.status.SetMetricsSink(r.metricsSink, r.logger)
 	r.status.Begin()
 	r.durableMutation.Store(false)
 	r.terminalOwnership.Store(uint32(status.WorkflowTerminalOwnershipNone))
 	defer func() {
 		r.recordWorkflowError(retErr)
+	}()
+	// Registered after recordWorkflowError so it runs first, and before the
+	// deferred cancelFunc(nil) so the cause read is the one that aborted us.
+	defer func() {
+		retErr = status.AbortCause(ctx, retErr)
 	}()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting table move",
@@ -1471,7 +1480,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		// But the caller will still want their cutoverFunc called. So we do that
 		// and then exit.
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
-		if err := r.status.Do(status.CutOver, func() error {
+		if err := r.status.DoContext(ctx, status.CutOver, func() error {
 			if r.cutoverFunc == nil {
 				return nil
 			}
@@ -1551,7 +1560,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// watermark invalidation are move-specific (multi-source feeds;
 	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
 	// so they are injected as callbacks. See pkg/sentinel.
-	if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
+	if err := r.status.DoContext(ctx, status.WaitingOnSentinelTable, func() error {
 		return sentinel.Wait(ctx, sentinel.WaitConfig{
 			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
 			RunChecksum:         r.runContinuousChecksum,
@@ -1570,7 +1579,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	}
 	r.logger.Info("Sentinel released, starting cutover")
 	// Create a cutover.
-	if err := r.status.Do(status.CutOver, func() error {
+	if err := r.status.DoContext(ctx, status.CutOver, func() error {
 		cutoverSources := make([]CutOverSource, len(r.sources))
 		for i := range r.sources {
 			cutoverSources[i] = CutOverSource{
@@ -1715,8 +1724,9 @@ func (r *Runner) assertNoRevertMarker(ctx context.Context, phase string) error {
 
 // fatalError is the callback provided to the replication client.
 // It is called when a DDL change is detected on a subscribed table
-// (change.FatalReasonSchemaChange), or when a fatal stream error occurs
-// (change.FatalReasonStreamError). The replication client may perform
+// (change.FatalReasonSchemaChange), when a fatal stream error occurs
+// (change.FatalReasonStreamError), or when the periodic flush fails to apply
+// changes (change.FatalReasonFlushError). The replication client may perform
 // its own logging either before or after invoking this callback, and DDL
 // logging may be skipped entirely if this callback returns false.
 //
@@ -1749,6 +1759,12 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 			// changed, so the checkpoint remains valid. Keep it and tell the
 			// operator how to recover.
 			r.logger.Error("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the move from it")
+		case change.FatalReasonFlushError:
+			// Applying buffered changes failed, so the checkpoint's positions
+			// have stopped advancing. The source tables have not changed and
+			// the checkpoint is still valid, but a resume replays the same
+			// changes: the cause (logged just before) must be fixed first.
+			r.logger.Error("fatal error applying replicated changes; the checkpoint has been preserved — fix the cause of the error and re-run spirit to resume the move from it")
 		case change.FatalReasonUnsupportedXA, change.FatalReasonLogPosWrapped:
 			// Both reasons leave a checkpoint that is technically readable
 			// but useless: resuming from it streams straight back into the
@@ -1781,7 +1797,7 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 		// cancelFunc can be nil during early setup or in test paths that
 		// bypass Run; nil-check before calling.
 		if r.cancelFunc != nil {
-			r.cancelFunc() // cancel the move context
+			r.cancelFunc(status.FatalAbort(fmt.Errorf("move aborted: fatal change feed condition (%s); see the preceding log lines for details", reason)))
 		}
 	})
 	return true
@@ -2022,7 +2038,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// pkg/change/subscription_buffered.go), unread binlog would pile up
 	// server-side, and a source purging binlogs past the reader's position
 	// during an hours-long index build would fail the move fatally.
-	if err := r.status.Do(status.ApplyChangeset, func() error {
+	if err := r.status.DoContext(ctx, status.ApplyChangeset, func() error {
 		return r.flushAllReplClients(ctx)
 	}); err != nil {
 		return err
@@ -2031,7 +2047,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// Restore secondary indexes if they were deferred during table creation.
 	// This is always called (not conditional on DeferSecondaryIndexes) to handle
 	// checkpoint resume scenarios where indexes may have been deferred in a previous run.
-	if err := r.status.Do(status.RestoreSecondaryIndexes, func() error {
+	if err := r.status.DoContext(ctx, status.RestoreSecondaryIndexes, func() error {
 		return r.restoreSecondaryIndexes(ctx)
 	}); err != nil {
 		return err
@@ -2041,7 +2057,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	if err := r.status.Do(status.AnalyzeTable, func() error {
+	if err := r.status.DoContext(ctx, status.AnalyzeTable, func() error {
 		r.logger.Info("Running ANALYZE TABLE")
 		for _, target := range r.targets {
 			for _, tbl := range r.sourceTables {
@@ -2108,7 +2124,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// repair) or resumes safely from a watermark that came from a clean
 	// pass. See pkg/migration/runner.go DumpCheckpoint for the full
 	// rationale.
-	return r.status.Do(status.Checksum, func() error {
+	return r.status.DoContext(ctx, status.Checksum, func() error {
 		return r.checker.Run(ctx)
 	})
 }
@@ -2195,6 +2211,9 @@ func (r *Runner) Result() status.WorkflowResult {
 	}
 }
 
+// SetCutover installs the caller-owned forward traffic switch. It runs under
+// the source table locks and, together with the final flush, must complete
+// within 10 minutes (see CutoverResultCallback).
 func (r *Runner) SetCutover(cutover func(ctx context.Context) error) {
 	r.cutoverResultFunc = nil
 	r.cutoverFunc = cutover
@@ -2208,7 +2227,9 @@ func (r *Runner) SetCutoverWithResult(cutover CutoverResultCallback) {
 }
 
 // SetReverseCutover registers the legacy rollback traffic switch used if a
-// revert is requested during the reverse window.
+// revert is requested during the reverse window. It runs under the target
+// table locks and, together with the reverse feed's final flush and the
+// source renames, must complete within 10 minutes (see CutoverResultCallback).
 func (r *Runner) SetReverseCutover(fn func(ctx context.Context) error) {
 	r.reverseCutoverResultFunc = nil
 	r.reverseCutoverFunc = fn
@@ -2562,8 +2583,10 @@ func renderCheckpointPosition(positions map[string]string) string {
 	return strings.Join(parts, ",")
 }
 
+// Cancel stops a running move. It is an operator cancellation: Run returns
+// context.Canceled.
 func (r *Runner) Cancel() {
-	r.cancelFunc()
+	r.cancelFunc(nil)
 }
 
 // createApplier creates the applier that writes to the targets. With several

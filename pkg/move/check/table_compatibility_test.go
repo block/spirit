@@ -65,3 +65,38 @@ func TestTableCompatibilityCheckNoTables(t *testing.T) {
 	err := tableCompatibilityCheck(context.Background(), r, slog.Default())
 	require.NoError(t, err)
 }
+
+// TestTableCompatibilityCheckFloatAndBitPK checks that a source table whose
+// primary key includes a FLOAT or a BIT column is refused, and that the same
+// types outside the primary key are not.
+func TestTableCompatibilityCheckFloatAndBitPK(t *testing.T) {
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE float_pk (id INT NOT NULL, f FLOAT NOT NULL, PRIMARY KEY (id, f))")
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE bit_pk (b BIT(16) NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE float_bit_cols (id INT NOT NULL PRIMARY KEY, f FLOAT, b BIT(8))")
+
+	info := func(name string) *table.TableInfo {
+		ti := table.NewTableInfo(db, dbName, name)
+		require.NoError(t, ti.SetInfo(t.Context()))
+		return ti
+	}
+	floatPK, bitPK, cols := info("float_pk"), info("bit_pk"), info("float_bit_cols")
+
+	err := tableCompatibilityCheck(t.Context(), Resources{SourceTables: []*table.TableInfo{cols, floatPK}}, slog.Default())
+	require.ErrorContains(t, err, `table 'float_pk' cannot be moved: primary key column "f" of table "float_pk" is a FLOAT, which is not supported`)
+
+	err = tableCompatibilityCheck(t.Context(), Resources{SourceTables: []*table.TableInfo{cols, bitPK}}, slog.Default())
+	require.ErrorContains(t, err, `table 'bit_pk' cannot be moved: primary key column "b" of table "bit_pk" is a BIT, which is not supported`)
+
+	require.NoError(t, tableCompatibilityCheck(t.Context(), Resources{SourceTables: []*table.TableInfo{cols}}, slog.Default()))
+}
+
+// TestTableCompatibilityCheckRegisteredForResume pins that a resume from
+// checkpoint applies the table requirements too: that path runs the resume
+// checks instead of re-running the post-setup ones.
+func TestTableCompatibilityCheckRegisteredForResume(t *testing.T) {
+	lock.Lock()
+	defer lock.Unlock()
+	require.Equal(t, ScopePostSetup, checks["table_compatibility"].scope)
+	require.Equal(t, ScopeResume, checks["table_compatibility_resume"].scope)
+}

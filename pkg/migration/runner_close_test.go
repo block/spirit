@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,7 @@ func TestFatalErrorIsIdempotent(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 
 	require.True(t, r.fatalError(change.FatalReasonSchemaChange), "first call must return true")
@@ -48,7 +49,7 @@ func TestFatalErrorConcurrentRace(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 
 	const goroutines = 32
@@ -75,7 +76,7 @@ func TestFatalErrorPastCutoverIsNoop(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 	r.status.Set(status.CutOver)
 
@@ -112,7 +113,7 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		t.Parallel()
 		r := setupRunnerForChecksumTest(t, "fatal_reason_ddl")
 		var cancelCalls atomic.Int32
-		r.cancelFunc = func() { cancelCalls.Add(1) }
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
 
 		require.True(t, r.fatalError(change.FatalReasonSchemaChange))
 		require.Equal(t, status.ErrCleanup, r.status.Get())
@@ -125,7 +126,7 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		t.Parallel()
 		r := setupRunnerForChecksumTest(t, "fatal_reason_stream")
 		var cancelCalls atomic.Int32
-		r.cancelFunc = func() { cancelCalls.Add(1) }
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
 
 		require.True(t, r.fatalError(change.FatalReasonStreamError))
 		require.Equal(t, status.ErrCleanup, r.status.Get())
@@ -134,11 +135,24 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 			"a stream-error fatal must preserve the checkpoint table so the migration can resume")
 	})
 
+	t.Run("FlushErrorPreservesCheckpoint", func(t *testing.T) {
+		t.Parallel()
+		r := setupRunnerForChecksumTest(t, "fatal_reason_flush")
+		var cancelCalls atomic.Int32
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
+
+		require.True(t, r.fatalError(change.FatalReasonFlushError))
+		require.Equal(t, status.ErrCleanup, r.status.Get())
+		require.Equal(t, int32(1), cancelCalls.Load(), "must still cancel the migration")
+		require.True(t, checkpointTableExists(t, r),
+			"a flush-error fatal must preserve the checkpoint table so the migration can resume")
+	})
+
 	t.Run("UnsupportedXADropsCheckpoint", func(t *testing.T) {
 		t.Parallel()
 		r := setupRunnerForChecksumTest(t, "fatal_reason_xa")
 		var cancelCalls atomic.Int32
-		r.cancelFunc = func() { cancelCalls.Add(1) }
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
 
 		require.True(t, r.fatalError(change.FatalReasonUnsupportedXA))
 		require.Equal(t, status.ErrCleanup, r.status.Get())
@@ -146,4 +160,19 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		require.False(t, checkpointTableExists(t, r),
 			"a checkpoint that replays the refused XA group cannot be resumed")
 	})
+}
+
+// TestFatalErrorCancelsWithCause pins that fatalError cancels the migration
+// context with an error naming the reason, not with a bare cancellation: Run
+// returns that cause, so the abort is reported and recorded as a failure.
+func TestFatalErrorCancelsWithCause(t *testing.T) {
+	var cause error
+	r := &Runner{
+		logger:     slog.Default(),
+		cancelFunc: func(err error) { cause = err },
+	}
+	require.True(t, r.fatalError(change.FatalReasonSchemaChange))
+	require.Error(t, cause)
+	require.NotErrorIs(t, cause, context.Canceled)
+	require.ErrorContains(t, cause, change.FatalReasonSchemaChange.String())
 }

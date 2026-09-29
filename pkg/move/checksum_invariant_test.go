@@ -66,7 +66,7 @@ func setupRunnerForChecksumTest(t *testing.T, dbSuffix string) (*Runner, context
 	r, err := NewRunner(move)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx, cancel := context.WithCancelCause(t.Context())
 	r.cancelFunc = cancel
 	r.dbConfig = dbconn.NewDBConfig()
 
@@ -98,7 +98,7 @@ func setupRunnerForChecksumTest(t *testing.T, dbSuffix string) (*Runner, context
 	// repl clients and target DB. goleak in TestMain catches anything we
 	// forget.
 	t.Cleanup(func() {
-		cancel()
+		cancel(nil)
 		_ = r.checksumChunker.Close()
 		_ = r.sources[0].db.Close()
 		_ = r.Close()
@@ -143,7 +143,7 @@ func TestChecksumErrorPreservesCheckpoint(t *testing.T) {
 			// Track whether fatalError-equivalent behavior fired.
 			origCancel := r.cancelFunc
 			var cancelled bool
-			r.cancelFunc = func() { cancelled = true; origCancel() }
+			r.cancelFunc = func(cause error) { cancelled = true; origCancel(cause) }
 
 			// Drive only the checker.Run() line from postCopyPhase. The
 			// rest of postCopyPhase (ANALYZE TABLE, secondary-index restore)

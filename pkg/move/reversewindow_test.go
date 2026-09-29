@@ -13,11 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -1055,4 +1057,103 @@ func TestMoveReverseWindowSwitchWrites(t *testing.T) {
 			require.True(t, reverted)
 		})
 	}
+}
+
+// fatalReasonRecorder records the reason of every "reverse feed fatal" log
+// record and passes all records on to the wrapped handler.
+type fatalReasonRecorder struct {
+	slog.Handler
+	state *fatalReasonState
+}
+
+type fatalReasonState struct {
+	mu      sync.Mutex
+	reasons []string
+}
+
+func (h *fatalReasonRecorder) Handle(ctx context.Context, rec slog.Record) error {
+	if rec.Message == "reverse feed fatal; source can no longer be trusted for rollback" {
+		rec.Attrs(func(a slog.Attr) bool {
+			if a.Key == "reason" {
+				h.state.mu.Lock()
+				h.state.reasons = append(h.state.reasons, a.Value.String())
+				h.state.mu.Unlock()
+			}
+			return true
+		})
+	}
+	return h.Handler.Handle(ctx, rec)
+}
+
+func (h *fatalReasonRecorder) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &fatalReasonRecorder{Handler: h.Handler.WithAttrs(attrs), state: h.state}
+}
+
+func (h *fatalReasonRecorder) WithGroup(name string) slog.Handler {
+	return &fatalReasonRecorder{Handler: h.Handler.WithGroup(name), state: h.state}
+}
+
+func (s *fatalReasonState) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.reasons...)
+}
+
+// TestMoveReverseWindowFlushErrorCompletesForward pins what a failed reverse
+// feed flush does to the window. The feed reports it as fatal, and the move
+// stops holding the window and completes forward at once: rollback is no
+// longer offered, because the source's _old tables no longer receive the
+// target's writes. The window is 5 minutes, so a run that returns within the
+// wait below did not wait it out.
+//
+// The flush is made to fail with a CHECK constraint added to the source's _old
+// table with sql_log_bin=0. Without binary logging the reverse feed does not
+// see the DDL (it would otherwise report a schema change, not a flush error).
+func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	oldFlush := reverseFeedFlushInterval
+	reverseFeedFlushInterval = 100 * time.Millisecond
+	t.Cleanup(func() { reverseFeedFlushInterval = oldFlush })
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwfe_src", "rwfe_dst")
+
+	m := &Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 5 * time.Minute,
+	}
+	runner, err := NewRunner(m)
+	require.NoError(t, err)
+	recorder := &fatalReasonState{}
+	runner.logger = slog.New(&fatalReasonRecorder{Handler: slog.Default().Handler(), state: recorder})
+	var reverseCutoverCalled bool
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
+
+	h := startRun(t, runner)
+	h.awaitReverseWindow(ctl, "rwfe_dst")
+
+	unlogged, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(unlogged)
+	conn, err := unlogged.Conn(t.Context())
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "ALTER TABLE rwfe_src.t1_old ADD CONSTRAINT rwfe_id_small CHECK (id < 100)")
+	require.NoError(t, err)
+	utils.CloseAndLog(conn)
+
+	// A target write the reverse feed cannot apply to the source.
+	testutils.RunSQL(t, "INSERT INTO rwfe_dst.t1 (id, val) VALUES (500, 'too big for _old')")
+
+	h.awaitDone(waitTimeout, "the move to complete forward after the reverse feed's flush failed")
+	require.Equal(t, []string{change.FatalReasonFlushError.String()}, recorder.snapshot(),
+		"the reverse feed must stop on the flush error")
+	require.False(t, reverseCutoverCalled, "a dead reverse feed must not roll back")
+	require.True(t, tableExists(t, ctl, "rwfe_src", "t1_old"), "source table stays retired to _old")
+	require.False(t, tableExists(t, ctl, "rwfe_src", "t1"), "source real table stays gone")
+	require.True(t, tableExists(t, ctl, "rwfe_dst", "t1"), "target keeps serving")
+	require.False(t, tableExists(t, ctl, "rwfe_dst", checkpointTableName), "checkpoint dropped by complete-forward")
 }
