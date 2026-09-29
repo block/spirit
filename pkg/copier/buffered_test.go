@@ -2,6 +2,7 @@ package copier
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -402,10 +403,13 @@ func TestBufferedCopierGeometry(t *testing.T) {
 // gateThrottler gives tests deterministic control over where read workers
 // park. BlockWait blocks until either one token is received on allow (waking
 // exactly one reader for one loop iteration) or open is closed (the gate is
-// permanently open and BlockWait returns immediately from then on).
+// permanently open and BlockWait returns immediately from then on). If
+// entered is non-nil, BlockWait sends on it first, so a test can wait until a
+// reader is actually parked rather than merely spawned.
 type gateThrottler struct {
-	allow chan struct{}
-	open  chan struct{}
+	allow   chan struct{}
+	open    chan struct{}
+	entered chan struct{}
 }
 
 func (g *gateThrottler) Open(_ context.Context) error      { return nil }
@@ -413,6 +417,12 @@ func (g *gateThrottler) Close() error                      { return nil }
 func (g *gateThrottler) IsThrottled() bool                 { return false }
 func (g *gateThrottler) UpdateLag(_ context.Context) error { return nil }
 func (g *gateThrottler) BlockWait(ctx context.Context) {
+	if g.entered != nil {
+		select {
+		case g.entered <- struct{}{}:
+		case <-ctx.Done():
+		}
+	}
 	select {
 	case <-g.allow:
 	case <-g.open:
@@ -728,4 +738,105 @@ func TestCopierReportsRenderedChunkBytes(t *testing.T) {
 		require.NoError(t, c.Run(t.Context()))
 		require.Equal(t, uint64(want), rec.bytes.Load())
 	})
+}
+
+// newParkedCopier starts Run on a two-reader copier whose throttler gate
+// never opens, and returns once both readers are parked in BlockWait.
+func newParkedCopier(t *testing.T, src, dst string) (*buffered, context.CancelCauseFunc, <-chan error) {
+	t.Helper()
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS "+src+", "+dst)
+	testutils.RunSQL(t, "CREATE TABLE "+src+" (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARBINARY(64) NOT NULL)")
+	testutils.RunSQL(t, "CREATE TABLE "+dst+" (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARBINARY(64) NOT NULL)")
+	testutils.RunSQL(t, "INSERT INTO "+src+" (pad) VALUES (RANDOM_BYTES(64)), (RANDOM_BYTES(64)), (RANDOM_BYTES(64))")
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+
+	t1 := table.NewTableInfo(db, "test", src)
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", dst)
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	const readers = 2
+	gate := &gateThrottler{
+		allow:   make(chan struct{}),
+		open:    make(chan struct{}),
+		entered: make(chan struct{}, readers),
+	}
+	cfg := NewCopierDefaultConfig()
+	cfg.Concurrency = readers
+	cfg.Throttler = gate
+	cfg.Applier, err = applier.New([]applier.Target{{DB: db}}, applier.NewApplierDefaultConfig())
+	require.NoError(t, err)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{
+		NewTable:        t2,
+		TargetChunkTime: time.Second,
+		Logger:          cfg.Logger,
+	})
+	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
+
+	copier, err := NewCopier(chunker, cfg)
+	require.NoError(t, err)
+	b := copier.(*buffered)
+
+	ctx, cancel := context.WithCancelCause(t.Context())
+	t.Cleanup(func() { cancel(nil) })
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- b.Run(ctx)
+	}()
+
+	for range readers {
+		select {
+		case <-gate.entered:
+		case err := <-runErr:
+			t.Fatalf("Run returned before the readers parked: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("readers did not park in BlockWait")
+		}
+	}
+	return b, cancel, runErr
+}
+
+func waitRun(t *testing.T, runErr <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-runErr:
+		return err
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+		return nil
+	}
+}
+
+// TestBufferedCopierCancelWhileThrottled cancels the copy while every read
+// worker is parked in throttler.BlockWait. Run must report the cancellation
+// rather than returning nil: a nil return is indistinguishable from a
+// completed copy, so callers would record the copy as successful and only
+// notice the cancellation in a later step. The error must match both the
+// caller's cause and context.Canceled, which is how the status tracker
+// classifies a phase as cancelled rather than failed.
+func TestBufferedCopierCancelWhileThrottled(t *testing.T) {
+	b, cancel, runErr := newParkedCopier(t, "cancelthrottledsrc", "cancelthrottleddst")
+	errAbort := errors.New("copy aborted by test")
+	cancel(errAbort)
+	err := waitRun(t, runErr)
+	require.ErrorIs(t, err, errAbort)
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, b.chunker.IsRead(), "no chunk should have been claimed while throttled")
+}
+
+// TestBufferedCopierRecordedErrorBeatsCancel checks that a copy error recorded
+// before the caller cancels wins over the cancellation, so a real read failure
+// is not reported as a cancellation.
+func TestBufferedCopierRecordedErrorBeatsCancel(t *testing.T) {
+	b, cancel, runErr := newParkedCopier(t, "cancelprecsrc", "cancelprecdst")
+	errRead := errors.New("failed to read chunk data")
+	b.setInvalid(errRead)
+	cancel(errors.New("copy aborted by test"))
+	err := waitRun(t, runErr)
+	require.ErrorIs(t, err, errRead)
+	require.NotErrorIs(t, err, context.Canceled)
 }

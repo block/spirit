@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -296,4 +297,93 @@ func TestCounterSpanRejectsAnOptionFromAnotherStatement(t *testing.T) {
 		_, _, ok := counterSpan(other, create.Options[i])
 		assert.False(t, ok, "span from another statement must not be trusted against %q", other)
 	}
+}
+
+func TestNextAutoIncrementFromCreateTable(t *testing.T) {
+	tests := []struct {
+		name      string
+		stmt      string
+		next      uint64
+		hasColumn bool
+	}{
+		{
+			name:      "counter present",
+			stmt:      "CREATE TABLE `t` (`id` int NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB AUTO_INCREMENT=42 DEFAULT CHARSET=utf8mb4",
+			next:      42,
+			hasColumn: true,
+		},
+		{
+			// MySQL omits the option until the first id has been generated.
+			name:      "auto_increment column without counter",
+			stmt:      "CREATE TABLE `t` (`id` int NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB",
+			next:      1,
+			hasColumn: true,
+		},
+		{
+			name:      "auto_increment column that is not the primary key",
+			stmt:      "CREATE TABLE `t` (`pk` varchar(10) NOT NULL, `seq` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`pk`), KEY `seq` (`seq`)) ENGINE=InnoDB AUTO_INCREMENT=7",
+			next:      7,
+			hasColumn: true,
+		},
+		{
+			name: "no auto_increment column",
+			stmt: "CREATE TABLE `t` (`id` int NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB",
+		},
+		{
+			name: "keyword only in a comment",
+			stmt: "CREATE TABLE `t` (`id` int NOT NULL COMMENT 'AUTO_INCREMENT', PRIMARY KEY (`id`)) ENGINE=InnoDB COMMENT='AUTO_INCREMENT=9'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			next, hasColumn, err := nextAutoIncrementFromCreateTable(tt.stmt)
+			require.NoError(t, err)
+			assert.Equal(t, tt.hasColumn, hasColumn)
+			assert.Equal(t, tt.next, next)
+		})
+	}
+	_, _, err := nextAutoIncrementFromCreateTable("not sql")
+	require.Error(t, err)
+}
+
+// TestNextAutoIncrementIsLive shows why NextAutoIncrement reads SHOW CREATE
+// TABLE: once anything has read the table's statistics,
+// information_schema.TABLES.AUTO_INCREMENT keeps returning that value for
+// information_schema_stats_expiry seconds, however far the counter moves.
+func TestNextAutoIncrementIsLive(t *testing.T) {
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE autoinc_live (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)`)
+	testutils.RunSQLInDatabase(t, dbName, `INSERT INTO autoinc_live (v) VALUES (1), (2), (3)`)
+
+	cached := func() uint64 {
+		var n uint64
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			"SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'autoinc_live'",
+			dbName).Scan(&n))
+		return n
+	}
+	require.Equal(t, uint64(4), cached()) // populates the statistics cache
+
+	testutils.RunSQLInDatabase(t, dbName, `INSERT INTO autoinc_live (v) VALUES (4), (5), (6), (7)`)
+	testutils.RunSQLInDatabase(t, dbName, `DELETE FROM autoinc_live WHERE id > 3`)
+
+	var expiry int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@information_schema_stats_expiry").Scan(&expiry))
+	if expiry > 0 {
+		require.Equal(t, uint64(4), cached(), "information_schema is expected to serve the cached counter")
+	}
+
+	next, hasColumn, err := NextAutoIncrement(t.Context(), db, dbName, "autoinc_live")
+	require.NoError(t, err)
+	require.True(t, hasColumn)
+	require.Equal(t, uint64(8), next)
+
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE autoinc_none (id INT NOT NULL PRIMARY KEY)`)
+	next, hasColumn, err = NextAutoIncrement(t.Context(), db, dbName, "autoinc_none")
+	require.NoError(t, err)
+	require.False(t, hasColumn)
+	require.Zero(t, next)
+
+	_, _, err = NextAutoIncrement(t.Context(), db, dbName, "autoinc_missing")
+	require.Error(t, err)
 }

@@ -186,6 +186,21 @@ func (c *buffered) readChunkData(ctx context.Context, chunk *table.Chunk) ([][]a
 	return rowDataList, nil
 }
 
+// cancellationErr returns nil while ctx is live. Once ctx is done it returns
+// ctx.Err(), wrapped together with context.Cause(ctx) when the caller supplied
+// a distinct cause, so the result matches both errors.Is(err, context.Canceled)
+// (how spirit classifies a phase as cancelled rather than failed) and the cause.
+func cancellationErr(ctx context.Context) error {
+	err := ctx.Err()
+	if err == nil {
+		return nil
+	}
+	if cause := context.Cause(ctx); !errors.Is(cause, err) {
+		return fmt.Errorf("%w: %w", err, cause)
+	}
+	return err
+}
+
 func (c *buffered) isHealthy(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return false
@@ -200,7 +215,9 @@ func (c *buffered) StartTime() time.Time {
 }
 
 // Run copies all rows from the source to the target table, blocking until
-// the copy completes or fails. Run must not be called more than once per
+// the copy completes or fails. If ctx is cancelled before the read workers
+// finish, Run returns a non-nil error: the recorded copy error if there is one,
+// otherwise ctx.Err() wrapped with context.Cause(ctx). Run must not be called more than once per
 // copier instance: it resets the read-worker pool state that SetReadWorkers
 // reconciles against, so a second concurrent Run would corrupt the first's
 // pool accounting.
@@ -264,6 +281,14 @@ func (c *buffered) Run(ctx context.Context) error {
 	// than returned through an errgroup, so pick them up here. They take
 	// precedence over applier.Wait/Stop errors below, as before.
 	err := c.getFirstErr()
+
+	// Readers that observe a cancelled context exit without recording an
+	// error, and applier.Wait returns nil when nothing is pending (e.g. every
+	// reader was parked in BlockWait). Without this check a cancelled copy
+	// would return nil and look identical to a completed one.
+	if err == nil {
+		err = cancellationErr(ctx)
+	}
 
 	// Wait for the applier to finish processing all pending work
 	// This ensures all callbacks have been invoked before we return
@@ -350,7 +375,7 @@ func (c *buffered) readWorker(ctx context.Context, quit <-chan struct{}) error {
 		// more chunk against a dead copy.
 		if !c.isHealthy(ctx) {
 			c.logger.Debug("readWorker unhealthy after BlockWait, exiting")
-			return nil
+			return cancellationErr(ctx)
 		}
 
 		c.logger.Debug("readWorker calling chunker.Next()")
@@ -445,7 +470,9 @@ func (c *buffered) readWorker(ctx context.Context, quit <-chan struct{}) error {
 	}
 
 	c.logger.Debug("readWorker exiting main loop")
-	return nil
+	// nil unless the loop ended because ctx was cancelled. An invalidated copy
+	// also returns nil here: its error was already recorded by setInvalid.
+	return cancellationErr(ctx)
 }
 
 // SetReadWorkers reconciles the live read-worker count to n, spawning new
@@ -518,9 +545,10 @@ func (c *buffered) spawnReadWorkerLocked() {
 	go func() {
 		defer c.readerExited(quit)
 		if err := c.readWorker(ctx, quit); err != nil {
-			// The error itself was already recorded by setInvalid inside
-			// readWorker; cancelling the shared reader context aborts sibling
-			// readers' in-flight reads promptly (errgroup parity).
+			// A copy error was already recorded by setInvalid inside readWorker.
+			// A cancellation is not recorded; Run picks it up from ctx. Either
+			// way, cancelling the shared reader context aborts sibling readers'
+			// in-flight reads promptly (errgroup parity).
 			cancel()
 		}
 	}()
