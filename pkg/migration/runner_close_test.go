@@ -1,6 +1,9 @@
 package migration
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -26,7 +29,7 @@ func TestFatalErrorIsIdempotent(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 
 	require.True(t, r.fatalError(change.FatalReasonSchemaChange), "first call must return true")
@@ -48,7 +51,7 @@ func TestFatalErrorConcurrentRace(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 
 	const goroutines = 32
@@ -75,7 +78,7 @@ func TestFatalErrorPastCutoverIsNoop(t *testing.T) {
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger:     slog.Default(),
-		cancelFunc: func() { cancelCalls.Add(1) },
+		cancelFunc: func(error) { cancelCalls.Add(1) },
 	}
 	r.status.Set(status.CutOver)
 
@@ -112,7 +115,7 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		t.Parallel()
 		r := setupRunnerForChecksumTest(t, "fatal_reason_ddl")
 		var cancelCalls atomic.Int32
-		r.cancelFunc = func() { cancelCalls.Add(1) }
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
 
 		require.True(t, r.fatalError(change.FatalReasonSchemaChange))
 		require.Equal(t, status.ErrCleanup, r.status.Get())
@@ -125,7 +128,7 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		t.Parallel()
 		r := setupRunnerForChecksumTest(t, "fatal_reason_stream")
 		var cancelCalls atomic.Int32
-		r.cancelFunc = func() { cancelCalls.Add(1) }
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
 
 		require.True(t, r.fatalError(change.FatalReasonStreamError))
 		require.Equal(t, status.ErrCleanup, r.status.Get())
@@ -138,7 +141,7 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		t.Parallel()
 		r := setupRunnerForChecksumTest(t, "fatal_reason_xa")
 		var cancelCalls atomic.Int32
-		r.cancelFunc = func() { cancelCalls.Add(1) }
+		r.cancelFunc = func(error) { cancelCalls.Add(1) }
 
 		require.True(t, r.fatalError(change.FatalReasonUnsupportedXA))
 		require.Equal(t, status.ErrCleanup, r.status.Get())
@@ -146,4 +149,49 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 		require.False(t, checkpointTableExists(t, r),
 			"a checkpoint that replays the refused XA group cannot be resumed")
 	})
+}
+
+// TestFatalErrorCancelsWithCause pins that fatalError cancels the migration
+// context with an error naming the reason, not with a bare cancellation: Run
+// returns that cause, so the abort is reported and recorded as a failure.
+func TestFatalErrorCancelsWithCause(t *testing.T) {
+	var cause error
+	r := &Runner{
+		logger:     slog.Default(),
+		cancelFunc: func(err error) { cause = err },
+	}
+	require.True(t, r.fatalError(change.FatalReasonSchemaChange))
+	require.Error(t, cause)
+	require.NotErrorIs(t, cause, context.Canceled)
+	require.ErrorContains(t, cause, change.FatalReasonSchemaChange.String())
+}
+
+func TestAbortCause(t *testing.T) {
+	fatal := errors.New("fatal condition")
+	aborted, abort := context.WithCancelCause(t.Context())
+	abort(fatal)
+	cancelled, cancel := context.WithCancelCause(t.Context())
+	cancel(nil)
+	live := t.Context()
+	other := errors.New("some other failure")
+	ambiguous := errors.Join(status.ErrOwnershipAmbiguous, context.Canceled)
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want error
+	}{
+		{name: "NoError", ctx: aborted, err: nil, want: nil},
+		{name: "CancellationReplacedByCause", ctx: aborted, err: context.Canceled, want: fatal},
+		{name: "WrappedCancellationReplacedByCause", ctx: aborted, err: fmt.Errorf("copy: %w", context.Canceled), want: fatal},
+		{name: "OtherErrorKept", ctx: aborted, err: other, want: other},
+		{name: "OwnershipEvidenceKept", ctx: aborted, err: ambiguous, want: ambiguous},
+		{name: "PlainCancellationKept", ctx: cancelled, err: context.Canceled, want: context.Canceled},
+		{name: "LiveContextKept", ctx: live, err: context.Canceled, want: context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, abortCause(tc.ctx, tc.err))
+		})
+	}
 }

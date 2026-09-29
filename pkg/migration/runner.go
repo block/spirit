@@ -105,8 +105,12 @@ type Runner struct {
 	usedResumeFromCheckpoint atomic.Bool
 
 	// Attached logger
-	logger     *slog.Logger
-	cancelFunc context.CancelFunc
+	logger *slog.Logger
+	// cancelFunc cancels the migration context with a cause. Run returns that
+	// cause (see abortCause) instead of the context.Canceled error the
+	// phases observe, so a fatal abort is reported as the failure it is and
+	// not as an operator cancellation. Cancel passes a nil cause.
+	cancelFunc context.CancelCauseFunc
 
 	// fatalOnce makes fatalError idempotent. Without it a concurrent burst
 	// of fatal events from the binlog goroutine and the migration loop
@@ -270,20 +274,25 @@ func (r *Runner) recordCopyCompleted() {
 
 func (r *Runner) runCopy(ctx context.Context) error {
 	defer r.recordCopyCompleted()
-	return r.status.Do(status.CopyRows, func() error {
+	return r.doPhase(ctx, status.CopyRows, func() error {
 		return r.copier.Run(ctx)
 	})
 }
 
 func (r *Runner) Run(ctx context.Context) (retErr error) {
-	ctx, r.cancelFunc = context.WithCancel(ctx)
-	defer r.cancelFunc()
+	ctx, r.cancelFunc = context.WithCancelCause(ctx)
+	defer r.cancelFunc(nil)
 	r.status.SetMetricsSink(r.metricsSink, r.logger)
 	r.status.Begin()
 	r.durableMutation.Store(false)
 	r.terminalOwnership.Store(uint32(status.WorkflowTerminalOwnershipNone))
 	defer func() {
 		r.recordWorkflowError(retErr)
+	}()
+	// Registered after recordWorkflowError so it runs first, and before the
+	// deferred cancelFunc(nil) so the cause read is the one that aborted us.
+	defer func() {
+		retErr = abortCause(ctx, retErr)
 	}()
 	bi := buildinfo.Get()
 	r.logger.Info("Starting spirit migration",
@@ -476,7 +485,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// Reuse the configured checker while waiting for a sentinel, including one
 	// created manually. The completed initial checksum remains the cutover gate.
 	if r.migration.RespectSentinel {
-		if err := r.status.Do(status.WaitingOnSentinelTable, func() error {
+		if err := r.doPhase(ctx, status.WaitingOnSentinelTable, func() error {
 			return sentinel.Wait(ctx, sentinel.WaitConfig{
 				Exists: func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
 				RunChecksum: func(ctx context.Context) error {
@@ -499,7 +508,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	}
 	// It's time for the final cut-over, where
 	// the tables are swapped under a lock.
-	if err := r.status.Do(status.CutOver, func() error {
+	if err := r.doPhase(ctx, status.CutOver, func() error {
 		cutoverCfg := []*cutoverConfig{}
 		for _, change := range r.changes {
 			cutoverCfg = append(cutoverCfg, &cutoverConfig{
@@ -579,7 +588,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// We want it disabled for ANALYZE TABLE and acquiring a table lock
 	// *but* it will be started again briefly inside of the checksum
 	// runner to ensure that the lag does not grow too long.
-	if err := r.status.Do(status.ApplyChangeset, func() error {
+	if err := r.doPhase(ctx, status.ApplyChangeset, func() error {
 		r.replClient.StopPeriodicFlush()
 		return r.replClient.Flush(ctx)
 	}); err != nil {
@@ -590,7 +599,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// This is required so on cutover plans don't go sideways, which
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
-	if err := r.status.Do(status.AnalyzeTable, func() error {
+	if err := r.doPhase(ctx, status.AnalyzeTable, func() error {
 		r.logger.Info("Running ANALYZE TABLE")
 		for _, change := range r.changes {
 			if err := dbconn.Exec(ctx, r.db, "ANALYZE TABLE %n.%n", change.newTable.SchemaName, change.newTable.TableName); err != nil {
@@ -1416,7 +1425,7 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 				}
 			}
 		}
-		r.Cancel()
+		r.cancel(fmt.Errorf("migration aborted: fatal change feed condition (%s); see the preceding log lines for details", reason))
 	})
 	return true
 }
@@ -1814,7 +1823,7 @@ func (r *Runner) initChunkers() error {
 
 // checksum runs the selected verification gate before the final binlog drain.
 func (r *Runner) checksum(ctx context.Context) error {
-	if err := r.status.Do(status.Checksum, func() error {
+	if err := r.doPhase(ctx, status.Checksum, func() error {
 		// Run the checksum with internal retry logic.
 		//
 		// We do not invalidate the checkpoint on a checksum error. The dumper
@@ -1843,7 +1852,7 @@ func (r *Runner) checksum(ctx context.Context) error {
 	// A long checksum extends the binlog deltas
 	// So if we've called this optional checksum, we need one more state
 	// of applying the binlog deltas.
-	return r.status.Do(status.PostChecksum, func() error {
+	return r.doPhase(ctx, status.PostChecksum, func() error {
 		return r.replClient.Flush(ctx)
 	})
 }
@@ -2033,8 +2042,44 @@ func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 	)
 }
 
+// Cancel stops a running migration. It is an operator cancellation: Run
+// returns context.Canceled.
 func (r *Runner) Cancel() {
+	r.cancel(nil)
+}
+
+// cancel cancels the migration context with cause. A nil cause is a plain
+// cancellation (context.Canceled).
+func (r *Runner) cancel(cause error) {
 	if r.cancelFunc != nil {
-		r.cancelFunc()
+		r.cancelFunc(cause)
 	}
+}
+
+// doPhase runs fn as the given status phase. When the migration was aborted
+// with a cause, the phase's context.Canceled error is replaced by that cause,
+// so the phase is recorded as failed rather than cancelled.
+func (r *Runner) doPhase(ctx context.Context, state status.State, fn func() error) error {
+	return r.status.Do(state, func() error {
+		return abortCause(ctx, fn())
+	})
+}
+
+// abortCause returns the cause the migration context was cancelled with in
+// place of err, when err is the context.Canceled that cancellation produced.
+// A plain cancellation (Cancel, or the caller cancelling its own context)
+// leaves err unchanged, as does any error that is not a cancellation, or that
+// carries ownership evidence the caller must still be able to inspect.
+func abortCause(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() == nil || !errors.Is(err, context.Canceled) {
+		return err
+	}
+	if errors.Is(err, status.ErrDurableMutation) || errors.Is(err, status.ErrOwnershipAmbiguous) {
+		return err
+	}
+	cause := context.Cause(ctx)
+	if cause == nil || errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		return err
+	}
+	return cause
 }

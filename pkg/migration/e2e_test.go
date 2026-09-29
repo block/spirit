@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/status"
@@ -372,6 +373,8 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 
 	m := NewTestRunnerFromStatement(t, "ALTER TABLE t1modification ENGINE=InnoDB",
 		WithThreads(1))
+	sink := newOutcomeSink()
+	m.SetMetricsSink(sink)
 
 	running := startTestRun(t, m.Run, m.Close)
 
@@ -380,7 +383,17 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	// Apply instant DDL — migration should detect this and cancel itself.
 	testutils.RunSQL(t, "ALTER TABLE t1modification ADD col3 INT")
 
-	require.Error(t, running.wait(t))
+	// The abort must come back as the failure it is, not as the
+	// context.Canceled every phase observes once the migration is stopped:
+	// callers (and the phase metrics) tell an operator cancellation from a
+	// failure by exactly that.
+	err := running.wait(t)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, change.FatalReasonSchemaChange.String())
+	outcomes := sink.outcomes()
+	require.Contains(t, outcomes, status.WorkflowPhaseOutcomeFailed, "the phase that observed the abort must be recorded as failed")
+	require.NotContains(t, outcomes, status.WorkflowPhaseOutcomeCancelled, "no phase may be recorded as cancelled")
 }
 
 // TestReservedWordPKMigration is a regression test for issue #828.
