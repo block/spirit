@@ -1,6 +1,10 @@
 package statement
 
-import "github.com/block/spirit/pkg/parser/mysql"
+import (
+	"strings"
+
+	"github.com/block/spirit/pkg/parser/mysql"
+)
 
 func init() { registerNormalizer(binaryAttributeNormalizer{}) }
 
@@ -12,6 +16,10 @@ func init() { registerNormalizer(binaryAttributeNormalizer{}) }
 //	c varchar(100) BINARY                        (table charset utf8mb4)
 //	  -> varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
 //	c varchar(100) CHARACTER SET latin1 BINARY
+//	  -> varchar(100) CHARACTER SET latin1 COLLATE latin1_bin
+//	c varchar(100) BINARY COLLATE latin1_swedish_ci  (table charset utf8mb4)
+//	  -> varchar(100) CHARACTER SET latin1 COLLATE latin1_bin
+//	c varchar(100) BINARY                        (table collation latin1_swedish_ci)
 //	  -> varchar(100) CHARACTER SET latin1 COLLATE latin1_bin
 //
 // The TiDB parser surfaces the attribute as the binary type flag with a
@@ -34,8 +42,8 @@ func init() { registerNormalizer(binaryAttributeNormalizer{}) }
 //	c NCHAR(5) BINARY COLLATE utf8mb3_unicode_ci
 //	  -> char(5) CHARACTER SET utf8mb3 COLLATE utf8mb3_unicode_ci
 //
-// If neither the column nor the table declares a charset the attribute
-// cannot be resolved (the effective charset is a server default only known at
+// If neither the column nor the table declares a charset or a collation the
+// attribute cannot be resolved (the effective charset is a server default only known at
 // runtime); the column keeps its character type and no collation is invented.
 type binaryAttributeNormalizer struct{}
 
@@ -53,14 +61,7 @@ func (binaryAttributeNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		if col.Charset != nil && col.Collation != nil {
 			continue // an explicit charset lets the COLLATE win over BINARY
 		}
-		// Resolve the effective charset: explicit column charset first,
-		// then the table default charset.
-		charsetName := ""
-		if col.Charset != nil {
-			charsetName = *col.Charset
-		} else if ct.TableOptions != nil && ct.TableOptions.Charset != nil {
-			charsetName = *ct.TableOptions.Charset
-		}
+		charsetName := binaryAttributeCharset(col, ct)
 		if charsetName == "" || charsetName == "binary" {
 			continue
 		}
@@ -69,4 +70,24 @@ func (binaryAttributeNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		col.Collation = &collation
 	}
 	return ct
+}
+
+// binaryAttributeCharset returns the charset whose _bin collation a BINARY
+// attribute selects, or "" when the definition does not determine it. A
+// collation names its charset, so the column's own charset or collation
+// decides first, then the table's default charset or collation.
+func binaryAttributeCharset(col *Column, ct *CreateTable) string {
+	switch {
+	case col.Charset != nil:
+		return *col.Charset
+	case col.Collation != nil:
+		return charsetOfCollation(strings.ToLower(*col.Collation))
+	case ct.TableOptions == nil:
+		return ""
+	case ct.TableOptions.Charset != nil:
+		return *ct.TableOptions.Charset
+	case ct.TableOptions.Collation != nil:
+		return charsetOfCollation(strings.ToLower(*ct.TableOptions.Collation))
+	}
+	return ""
 }

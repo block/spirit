@@ -123,6 +123,17 @@ func TestPrimaryKeyCollationStatementRefusal(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, refused)
 	assert.Contains(t, reason, `changing the collation of primary key column "id" is not supported`)
+
+	// A hand-written definition may leave the charset to its collation. The
+	// BINARY attribute still selects that charset's binary collation, so
+	// spelling it out is a restatement, not a change.
+	reason, refused, err = StatementRefusal(t.Context(),
+		"ALTER TABLE tokens MODIFY COLUMN token varchar(64) COLLATE utf8mb4_bin NOT NULL",
+		"CREATE TABLE tokens (token varchar(64) BINARY NOT NULL, PRIMARY KEY (token)) DEFAULT COLLATE=utf8mb4_0900_ai_ci",
+		discardLogger())
+	require.NoError(t, err)
+	assert.False(t, refused)
+	assert.Empty(t, reason)
 }
 
 // TestPrimaryKeyCollationReasonNamesOnlyTheStatement pins what a refusal
