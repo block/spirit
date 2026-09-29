@@ -79,9 +79,14 @@ func TestClassifyDefaultLiteral(t *testing.T) {
 			want:   DefaultKindUnknown,
 		},
 		{
-			name:   "a hex literal, which MySQL converts rather than reports back",
+			name:   "a hex literal",
 			column: "`a` datetime DEFAULT 0x1A",
-			want:   DefaultKindUnknown,
+			want:   DefaultKindHexLiteral,
+		},
+		{
+			name:   "a hex literal in the x'' form",
+			column: "`a` datetime DEFAULT X'1A'",
+			want:   DefaultKindHexLiteral,
 		},
 	}
 	for _, tt := range tests {
@@ -121,6 +126,27 @@ func TestUnknownDefaultKindKeepsHeuristicEmission(t *testing.T) {
 			require.Len(t, ct.Columns, 1)
 			require.Equal(t, DefaultKindUnknown, ct.Columns[0].DefaultKind)
 			assert.Contains(t, formatColumnDefinition(&ct.Columns[0]), tt.want)
+		})
+	}
+}
+
+// A hex literal is emitted bare. Quoted, it would be the text x'1a' rather than
+// the byte it spells: MySQL rejects that on a column too narrow for the text,
+// and stores the text itself on a column wide enough for it. The column is an
+// integer because binaryDefaultBytesNormalizer rewrites a hex default on
+// binary and varbinary to the bytes it stores.
+func TestHexLiteralDefaultIsEmittedBare(t *testing.T) {
+	for _, column := range []string{
+		"`a` int DEFAULT 0x1A",
+		"`a` int DEFAULT x'1a'",
+		"`a` int DEFAULT X'1A'",
+	} {
+		t.Run(column, func(t *testing.T) {
+			ct, err := ParseCreateTable("CREATE TABLE `t` (" + column + ")")
+			require.NoError(t, err)
+			require.Len(t, ct.Columns, 1)
+			require.Equal(t, DefaultKindHexLiteral, ct.Columns[0].DefaultKind)
+			assert.Contains(t, formatColumnDefinition(&ct.Columns[0]), "DEFAULT x'1a'")
 		})
 	}
 }

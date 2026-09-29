@@ -3,11 +3,13 @@
 package testutils
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,6 +151,65 @@ func SkipUnlessVectorSupported(t *testing.T) {
 	if !vectorSupported.ok {
 		t.Skip("skipping: server does not support the VECTOR type (requires MySQL 9.7+)")
 	}
+}
+
+// SkipBeforeMySQLVersion skips the test when the server's version() is older
+// than minVersion (e.g. "8.0.33"), giving reason in the skip message. Use it for
+// behavior an old server gets wrong and that is not worth special-casing, not to
+// hide a failure a supported server should pass.
+func SkipBeforeMySQLVersion(t *testing.T, minVersion, reason string) {
+	t.Helper()
+	db, err := sql.Open(driverName, DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var version string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT version()").Scan(&version))
+	if compareMySQLVersions(version, minVersion) < 0 {
+		t.Skipf("skipping on MySQL %s (requires %s+): %s", version, minVersion, reason)
+	}
+}
+
+// compareMySQLVersions compares two dotted MySQL versions numerically, returning
+// -1, 0 or 1. Anything after the numeric part (8.0.28-log) is ignored, and a
+// missing component counts as 0.
+func compareMySQLVersions(a, b string) int {
+	pa, pb := versionParts(a), versionParts(b)
+	for i := range max(len(pa), len(pb)) {
+		var x, y int
+		if i < len(pa) {
+			x = pa[i]
+		}
+		if i < len(pb) {
+			y = pb[i]
+		}
+		if x != y {
+			return cmp.Compare(x, y)
+		}
+	}
+	return 0
+}
+
+// versionParts returns the leading numeric components of a MySQL version.
+func versionParts(version string) []int {
+	var parts []int
+	for field := range strings.SplitSeq(version, ".") {
+		end := strings.IndexFunc(field, func(r rune) bool { return r < '0' || r > '9' })
+		if end == 0 {
+			break
+		}
+		if end > 0 {
+			field = field[:end]
+		}
+		n, err := strconv.Atoi(field)
+		if err != nil {
+			break
+		}
+		parts = append(parts, n)
+		if end > 0 {
+			break // a suffix such as -log ends the numeric part
+		}
+	}
+	return parts
 }
 
 // isUnknownFunctionErr reports whether err is the server telling us a function
