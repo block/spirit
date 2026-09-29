@@ -170,7 +170,8 @@ type bufferedMap struct {
 	// sizeBytes is an approximate count of memory currently held by
 	// changes + queue, plus the still-unapplied portion of any snapshot
 	// a Flush is currently draining. Maintained by HasChanged and the
-	// flush paths; see estimateRowSize for the accounting.
+	// flush paths; see sizeOfBufferedChange / sizeOfQueuedChange for the
+	// accounting.
 	sizeBytes int64
 
 	// softLimitBytes is the soft cap before HasChanged blocks waiting
@@ -270,22 +271,22 @@ type bufferedMap struct {
 	pkIsMemoryComparable bool
 }
 
-// Per-entry overheads applied on top of estimateRowSize so the soft
-// limit tracks closer to real RSS for high-cardinality, narrow-row
+// Per-entry overheads applied on top of utils.EstimateRenderedRowSize so the
+// soft limit tracks closer to real RSS for high-cardinality, narrow-row
 // workloads (where the variable-width contents don't dominate). For
 // wide-row workloads — the OOM scenario this cap was added to defend
 // against — these constants are noise next to the BLOB / large-string
 // payload sizes. Both are approximate; the cap is "soft" anyway.
 const (
 	// bufferedChangeOverhead is the fixed per-entry cost for an item
-	// in s.changes beyond what estimateRowSize captures: the hashed-
+	// in s.changes beyond what the row estimate captures: the hashed-
 	// key string header (~16 B), the bufferedChange struct laid out
 	// in the map's value slot (LogicalRow + originalKey slice header,
 	// ~56 B), and Go's map bucket overhead (~48 B amortized).
 	bufferedChangeOverhead = 120
 
 	// queuedChangeOverhead is the fixed per-element cost for an item
-	// in s.queue beyond estimateRowSize's contribution: the key
+	// in s.queue beyond the row estimate's contribution: the key
 	// string header (~16 B), the LogicalRow struct (~32 B), and the
 	// originalKey slice header (~24 B). Slice amortized-growth overhead
 	// is not explicitly accounted for.
@@ -409,76 +410,30 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 	return sub, nil
 }
 
-// estimateRowSize returns a rough byte estimate for a []any column slice
-// that bufferedMap holds in memory. The estimate is intentionally
-// approximate — we only use it to bound the buffer, not to report exact
-// memory usage. Costs accounted for:
-//   - 24 bytes of slice header
-//   - 16 bytes per element (interface header)
-//   - len(b) for []byte / string values (the dominant cost for wide rows)
-//   - 8 bytes for scalars, attributed to inline storage
-func estimateRowSize(row []any) int64 {
-	if len(row) == 0 {
-		return 0
-	}
-	var n int64 = 24
-	for _, v := range row {
-		n += 16
-		switch x := v.(type) {
-		case []byte:
-			n += int64(len(x))
-		case string:
-			n += int64(len(x))
-		default:
-			n += 8
-		}
-	}
-	return n
-}
-
+// sizeOfBufferedChange approximates the memory one s.changes entry holds: a
+// fixed per-entry overhead plus its key and row values. The values are sized
+// with utils.EstimateRenderedRowSize, which is not heap accounting; it only
+// has to bound the buffer (the soft limit), and the variable-width contents
+// it measures are what dominate for the wide rows that limit defends against.
 func sizeOfBufferedChange(hashedKey string, c bufferedChange) int64 {
-	return bufferedChangeOverhead + int64(len(hashedKey)) + estimateRowSize(c.logicalRow.RowImage) + estimateRowSize(c.originalKey)
+	return bufferedChangeOverhead + int64(len(hashedKey)) + int64(utils.EstimateRenderedRowSize(c.logicalRow.RowImage)) + int64(utils.EstimateRenderedRowSize(c.originalKey))
 }
 
+// sizeOfQueuedChange is sizeOfBufferedChange for an s.queue element.
 func sizeOfQueuedChange(c queuedChange) int64 {
-	return queuedChangeOverhead + int64(len(c.key)) + estimateRowSize(c.logicalRow.RowImage) + estimateRowSize(c.originalKey)
-}
-
-// estimateRenderedBytes returns a rough byte estimate of what a row image
-// (or key tuple) will occupy once the applier renders it into a SQL
-// statement. Binary values hex-encode at two characters per byte and quoted
-// strings can double under escaping, so variable-width values are counted at
-// twice their in-memory length; scalars render as short literals. Feeds the
-// same applier.MaxStatementSizeBytes budget as the copy path's estimator
-// (pkg/applier estimateValueSize) but with the opposite bias: that one counts
-// variable-width values at 1x and leans on the budget's ~64x headroom below
-// max_allowed_packet, while this one stays pessimistic — a flush batch cut
-// short only costs an extra statement, and the binlog path has no throughput
-// reason to run the estimate hot.
-func estimateRenderedBytes(values []any) int64 {
-	var n int64 = 2 // parentheses around the tuple
-	for _, v := range values {
-		n += 4 // separator plus quotes / 0x prefix
-		switch x := v.(type) {
-		case []byte:
-			n += int64(len(x)) * 2
-		case string:
-			n += int64(len(x)) * 2
-		default:
-			n += 20 // numeric / temporal literals are short
-		}
-	}
-	return n
+	return queuedChangeOverhead + int64(len(c.key)) + int64(utils.EstimateRenderedRowSize(c.logicalRow.RowImage)) + int64(utils.EstimateRenderedRowSize(c.originalKey))
 }
 
 // renderedBytesOfChange estimates the rendered-SQL contribution of one
-// buffered change: deletes contribute their key tuple (the DELETE ... IN
-// element list), upserts their full row image (the REPLACE ... VALUES list).
+// buffered change, against the same applier.MaxStatementSizeBytes budget the
+// copy path cuts chunklets by: deletes contribute their key tuple (the
+// DELETE ... IN element list), upserts their full row image (the
+// REPLACE ... VALUES list).
 func renderedBytesOfChange(lr applier.LogicalRow, originalKey []any) int64 {
 	if lr.IsDeleted {
-		return estimateRenderedBytes(originalKey)
+		return int64(utils.EstimateRenderedRowSize(originalKey))
 	}
-	return estimateRenderedBytes(lr.RowImage)
+	return int64(utils.EstimateRenderedRowSize(lr.RowImage))
 }
 
 // Assert that bufferedMap implements subscription

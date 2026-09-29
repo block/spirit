@@ -60,7 +60,7 @@ const (
 	// order as the applier's own chunklet limits, so a batch is roughly one
 	// statement's worth of rows and the read stays a little ahead of the writers
 	// without buffering a whole (possibly enormous) chunk. The byte half is
-	// measured with applier.EstimateRowSize, the same (approximate, cheap)
+	// measured with utils.EstimateRenderedRowSize, the same (approximate, cheap)
 	// accounting the applier uses to cut its own statements.
 	repairBatchRows  = 1000
 	repairBatchBytes = applier.MaxStatementSizeBytes

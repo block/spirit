@@ -364,9 +364,9 @@ There are some restrictions to `--statement`:
 - Type: Integer (bytes)
 - Default value: `16777216` (16 MiB)
 
-The in-memory byte budget the copier sizes each copy chunk against. This is a _byte_ target, not a time target: the copier reads full rows into memory, and its measured chunk time is a poor sizing signal (it includes the wait behind the write queue, which inflates under load independently of chunk size). Bytes-per-row is a stable property of the data, so a byte budget keeps chunks convergent under load and large enough to engage InnoDB/Aurora read-ahead.
+The in-memory byte budget the copier sizes each copy chunk against. This is a _byte_ target, not a time target: the copier reads full rows into memory and estimates each chunk's size from the values it read (their length once rendered as SQL, which approximates their size in memory), and its measured chunk time is a poor sizing signal (it includes the wait behind the write queue, which inflates under load independently of chunk size). Bytes-per-row is a stable property of the data, so a byte budget keeps chunks convergent under load and large enough to engage InnoDB/Aurora read-ahead.
 
-The chunker adjusts the row count per chunk so that the in-memory size of each chunk trends toward this budget, using a 90th-percentile servo over the last 10 chunks (with a `100,000`-row ceiling and a `10`-row floor). The default of 16 MiB is roughly 1024 16KB InnoDB pages per chunk; most users should not need to change it.
+The chunker adjusts the row count per chunk so that the estimated size of each chunk trends toward this budget, using a 90th-percentile servo over the last 10 chunks (with a `100,000`-row ceiling and a `10`-row floor). The default of 16 MiB is roughly 1024 16KB InnoDB pages per chunk; most users should not need to change it.
 
 ### threads
 

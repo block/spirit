@@ -107,9 +107,10 @@ func (d *dynamicChunkSizer) feedbackTime(logger *slog.Logger, dur time.Duration,
 	}
 }
 
-// feedbackBytes incorporates the in-memory byte size of one completed chunk. It
-// is the memory-signal path, used only by the buffered copier when
-// TargetChunkBytes is set. It mirrors feedbackTime exactly, servoing row-count
+// feedbackBytes incorporates the estimated byte size of one completed chunk
+// (Chunk.ActualBytes; see utils.EstimateRenderedChunkSize). It is the
+// memory-signal path, used only by the buffered copier when TargetChunkBytes
+// is set. It mirrors feedbackTime exactly, servoing row-count
 // against a byte budget rather than a time budget.
 //
 // Empty (gap) chunks report zero bytes and ARE fed to the history — like the

@@ -225,7 +225,7 @@ func (r *chunkRepairer) Recopy(ctx context.Context, chunk *table.Chunk) error {
 				return fmt.Errorf("failed to scan source %d row: %w", i, err)
 			}
 			batch = append(batch, values)
-			batchBytes += applier.EstimateRowSize(values)
+			batchBytes += utils.EstimateRenderedRowSize(values)
 			sourceRows++
 			if len(batch) >= repairBatchRows || batchBytes >= repairBatchBytes {
 				if err := flush(); err != nil {
