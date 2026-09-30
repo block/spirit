@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -22,9 +23,6 @@ import (
 const (
 	errLockWaitTimeout = 1205
 	errDeadlock        = 1213
-	// errKillDenied is ER_KILL_DENIED_ERROR: the user may not kill a session
-	// it does not own.
-	errKillDenied = 1095
 	// errCannotConnect (2003) and errConnLost (2013) are client-library CR_*
 	// codes: go-sql-driver itself never returns them as a *mysql.MySQLError
 	// (client-side failures surface as driver.ErrBadConn or
@@ -651,7 +649,7 @@ func blockerSurvivesKill(a forceExecAttempt) (reason string, survives bool) {
 		return "an explicit table lock blocks it, and force-kill does not end LOCK TABLES sessions", true
 	case errors.Is(a.killErr, errHeavyTransactionSkipped):
 		return "a blocking transaction is too heavy to roll back safely, and force-kill does not end it", true
-	case errors.Is(a.killErr, &mysql.MySQLError{Number: errKillDenied}):
+	case errors.Is(a.killErr, &mysql.MySQLError{Number: parsermysql.ErrKillDenied}):
 		return "the user may not kill a blocking session: it needs CONNECTION_ADMIN or SUPER", true
 	}
 	return "", false

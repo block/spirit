@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -480,7 +481,7 @@ func TestForceExecStopsWhenABlockerSurvivesTheKill(t *testing.T) {
 		{
 			name: "kill denied",
 			killErr: fmt.Errorf("errors occurred while killing locking transactions: %w",
-				errors.Join(fmt.Errorf("failed to kill transaction 7: %w", &mysql.MySQLError{Number: errKillDenied, Message: "You are not owner of thread 7"}))),
+				errors.Join(fmt.Errorf("failed to kill transaction 7: %w", &mysql.MySQLError{Number: parsermysql.ErrKillDenied, Message: "You are not owner of thread 7"}))),
 			reason: "needs CONNECTION_ADMIN or SUPER",
 		},
 	} {
@@ -627,7 +628,7 @@ func TestKillLockingTransactionsReportsKillsBesideADeniedOne(t *testing.T) {
 
 	tbl := table.NewTableInfo(db, "test", "kill_partly_denied")
 	killed, err := killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), nil)
-	require.ErrorIs(t, err, &mysql.MySQLError{Number: errKillDenied})
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
 	require.Equal(t, []int{ownedPID}, killed)
 	_, err = other.ExecContext(ctx, "SELECT 1")
 	require.NoError(t, err, "the other user's blocker must still be running")
