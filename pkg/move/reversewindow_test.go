@@ -1360,10 +1360,11 @@ func TestMoveReverseCutoverRefusesTriggersAndEvents(t *testing.T) {
 	}
 }
 
-// TestMoveReverseWindowIgnoresViewsAndRoutines: a view and a procedure
+// TestMoveReverseWindowIgnoresViewsAndRoutines: views and a procedure
 // created in the source schema during the window run only when a client
 // invokes them, so they block neither a resumed window's entry nor the
-// rollback.
+// rollback. One view is named like a retired table (report_old), which the
+// resume must not take for one.
 func TestMoveReverseWindowIgnoresViewsAndRoutines(t *testing.T) {
 	shortenReverseWindowPolling(t)
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcign_src", "rwcign_dst")
@@ -1389,6 +1390,9 @@ func TestMoveReverseWindowIgnoresViewsAndRoutines(t *testing.T) {
 	root := rootDB(t)
 	execUnlogged(t, root, "CREATE VIEW rwcign_src.report_v AS SELECT id FROM rwcign_src.t1_old")
 	execUnlogged(t, root, "CREATE PROCEDURE rwcign_src.purge_p() DELETE FROM rwcign_src.t1_old")
+	// A view whose name ends in _old is not a retired table: the resume
+	// must not take it for one (see reverseWindowLogicalTables).
+	execUnlogged(t, root, "CREATE VIEW rwcign_src.report_old AS SELECT id FROM rwcign_src.t1_old")
 	require.ErrorIs(t, h1.kill(), context.Canceled, "run 1 must die from the kill, not an earlier failure")
 	h1.close()
 
@@ -1435,4 +1439,27 @@ func execUnlogged(t *testing.T, db *sql.DB, stmt string) {
 	require.NoError(t, err)
 	_, err = conn.ExecContext(t.Context(), stmt)
 	require.NoError(t, err)
+}
+
+// TestReverseWindowLogicalTablesIgnoresViews: without SourceTables, a resumed
+// reverse window recovers the moved tables from the source's <table>_old
+// names. Only base tables are retired tables: a view named report_old is not.
+func TestReverseWindowLogicalTablesIgnoresViews(t *testing.T) {
+	const srcDB = "rwlog_src"
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB) })
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1_old (id INT NOT NULL PRIMARY KEY)")
+	testutils.RunSQLInDatabaseAsRoot(t, srcDB, "CREATE VIEW report_old AS SELECT id FROM t1_old")
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.DBName = srcDB
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	r := &Runner{move: &Move{}, logger: slog.Default(), sources: []sourceInfo{{db: db, config: cfg}}}
+	logical, err := r.reverseWindowLogicalTables(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, []string{"t1"}, logical)
 }

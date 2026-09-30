@@ -1137,12 +1137,13 @@ func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record)
 
 // reverseWindowLogicalTables recovers the logical names of the moved tables when
 // resuming a reverse window: the forward cutover renamed each to <name>_old on
-// the source, so it lists those and strips the suffix. When an explicit table
+// the source, so it lists those (base tables only: a view named <name>_old is
+// not a retired table) and strips the suffix. When an explicit table
 // list was supplied it is used to filter (ignoring unrelated _old tables).
 func (r *Runner) reverseWindowLogicalTables(ctx context.Context) ([]string, error) {
 	src := &r.sources[0]
 	rows, err := src.db.QueryContext(ctx,
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name LIKE '%\\_old'",
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' AND table_name LIKE '%\\_old'",
 		src.config.DBName)
 	if err != nil {
 		return nil, fmt.Errorf("resume reverse window: list retired source tables: %w", err)
