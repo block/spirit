@@ -12,6 +12,11 @@ func init() {
 	registerCheck("resume_state", resumeStateCheck, ScopeResume)
 }
 
+// moveCheckpointTableName must match pkg/move's checkpointTableName. It is
+// duplicated here because the check package cannot import move (move imports
+// check).
+const moveCheckpointTableName = "_spirit_move_checkpoint"
+
 // resumeStateCheck validates that the state is compatible with resuming from a checkpoint.
 // This check runs at ScopeResume and verifies:
 // 1. Checkpoint table exists on the first target
@@ -34,22 +39,19 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 	if tgt0.DB == nil || tgt0.Config == nil {
 		return errors.New("target[0] database connection or config is not initialized")
 	}
-	// Must match pkg/move's checkpointTableName. It is duplicated here because
-	// the check package cannot import move (move imports check).
-	checkpointTableName := "_spirit_move_checkpoint"
 	var checkpointExists int
 	err := tgt0.DB.QueryRowContext(ctx,
 		"SELECT 1 FROM information_schema.TABLES WHERE table_schema = ? AND table_name = ?",
-		tgt0.Config.DBName, checkpointTableName).Scan(&checkpointExists)
+		tgt0.Config.DBName, moveCheckpointTableName).Scan(&checkpointExists)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("checkpoint table '%s.%s' does not exist; cannot resume", tgt0.Config.DBName, checkpointTableName)
+		return fmt.Errorf("checkpoint table '%s.%s' does not exist; cannot resume", tgt0.Config.DBName, moveCheckpointTableName)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to check for checkpoint table: %w", err)
 	}
 
 	logger.Info("checkpoint table exists, validating target tables for resume",
-		"checkpoint_table", fmt.Sprintf("%s.%s", tgt0.Config.DBName, checkpointTableName))
+		"checkpoint_table", fmt.Sprintf("%s.%s", tgt0.Config.DBName, moveCheckpointTableName))
 
 	// Check 2: Verify all source tables have corresponding target tables with matching schema
 	for _, sourceTable := range r.SourceTables {

@@ -60,8 +60,8 @@ var (
 	// _spirit_checkpoint and datasync's _spirit_sync_checkpoint. A table with
 	// this name can only have been created by a move, which is what lets
 	// decideResume treat an empty one as a dead move's leavings and recover
-	// without --force. Keep it in sync with the literal in
-	// pkg/move/check/resume_state.go (that package cannot import this one).
+	// without --force. Keep it in sync with moveCheckpointTableName in
+	// pkg/move/check (that package cannot import this one).
 	checkpointTableName = "_spirit_move_checkpoint"
 	// Sentinel-wait timing lives in pkg/sentinel (sentinel.WaitLimit /
 	// sentinel.CheckInterval / sentinel.TableName) so it is shared with migrate.
@@ -1508,6 +1508,14 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		//
 		// But the caller will still want their cutoverFunc called. So we do that
 		// and then exit.
+		//
+		// No post-setup or resume check runs on this path, so run the target
+		// schema-objects check here: with no tables there is no table trigger
+		// to match, but a target event (or a trigger on a leftover checkpoint
+		// table) is still refused before the cutover callback.
+		if err := check.TargetSchemaObjectsError(ctx, r.targets, nil); err != nil {
+			return err
+		}
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
 		if err := r.status.DoContext(ctx, status.CutOver, func() error {
 			if r.cutoverFunc == nil {

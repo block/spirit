@@ -28,6 +28,10 @@ func init() {
 //   - Visibility of every view, trigger, event and stored routine in the
 //     source schema in information_schema, so the source_schema_objects check
 //     cannot pass just because they are hidden (see schemaGrants)
+//   - Visibility of every trigger and event in each target schema (TRIGGER
+//     and EVENT on the target schema), for the same reason for the
+//     target_schema_objects check. Only visibility is checked on the target
+//     here; the target-side write privileges are not.
 //
 // SHOW GRANTS by the current user lists the privileges of its active roles,
 // including a default role and, with activate_all_roles_on_login=ON, every
@@ -50,6 +54,14 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 	for i, src := range r.Sources {
 		if err := checkSourcePrivileges(ctx, src); err != nil {
 			return fmt.Errorf("source %d: %w", i, err)
+		}
+	}
+	for i, target := range r.Targets {
+		if target.DB == nil || target.Config == nil {
+			return fmt.Errorf("target %d database connection or config is not initialized", i)
+		}
+		if err := targetObjectVisibility(ctx, target.DB, target.Config.DBName); err != nil {
+			return fmt.Errorf("target %d (%s): %w", i, target.Config.DBName, err)
 		}
 	}
 	return nil
@@ -226,10 +238,23 @@ func (g schemaGrants) sees(o schemaObject) (bool, string) {
 	return false, fmt.Sprintf("unknown schema object kind %d", o)
 }
 
+// Reasons given by the visibility refusals, for the source and target checks.
+const (
+	sourceVisibilityReason = "move refuses source schemas that contain triggers, views, events or stored routines"
+	targetVisibilityReason = "move refuses triggers on the tables it writes to on the target and events in the target schema"
+)
+
 // schemaObjectVisibilityFromGrants returns a refusal (see ErrRefused) naming
 // the grants missing for the user to see every object of the given kinds in
-// schemaName, or nil.
+// source schema schemaName, or nil.
 func schemaObjectVisibilityFromGrants(grants []string, schemaName string, kinds ...schemaObject) error {
+	return visibilityFromGrants(grants, schemaName, sourceVisibilityReason, kinds...)
+}
+
+// visibilityFromGrants returns a refusal (see ErrRefused) naming the grants
+// missing for the user to see every object of the given kinds in schemaName,
+// or nil. reason says why move needs to see them.
+func visibilityFromGrants(grants []string, schemaName, reason string, kinds ...schemaObject) error {
 	g := schemaGrants{lines: grants, schema: schemaName}
 	var missing []string
 	for _, kind := range kinds {
@@ -240,27 +265,38 @@ func schemaObjectVisibilityFromGrants(grants []string, schemaName string, kinds 
 	if len(missing) == 0 {
 		return nil
 	}
-	return refuse(fmt.Errorf("insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: %s",
-		strings.Join(missing, "; ")))
+	return refuse(fmt.Errorf("insufficient privileges to run a move: %s, and information_schema hides them from users without these grants. Needed: %s",
+		reason, strings.Join(missing, "; ")))
 }
 
 // schemaObjectVisibility checks, from the connection's SHOW GRANTS, that the
-// user of db can see every object of the given kinds in schemaName (see
-// schemaGrants). The scans in this package call it every time, so a scan never
-// trusts an empty result on visibility checked in an earlier run (a
-// reverse-window resume runs no preflight) or since revoked. There is no
-// rds_superuser_role exemption: SHOW GRANTS lists the privileges of active
-// roles, so a real role's grants are counted.
+// user of db can see every object of the given kinds in source schema
+// schemaName (see schemaGrants). The scans in this package call it every
+// time, so a scan never trusts an empty result on visibility checked in an
+// earlier run (a reverse-window resume runs no preflight) or since revoked.
+// There is no rds_superuser_role exemption: SHOW GRANTS lists the privileges
+// of active roles, so a real role's grants are counted.
 //
 // Only a grant found missing is a refusal (see ErrRefused). A failure to
 // read SHOW GRANTS is returned as a plain error, which may
 // be transient and is retried under the cutover locks.
 func schemaObjectVisibility(ctx context.Context, db querier, schemaName string, kinds ...schemaObject) error {
+	return visibility(ctx, db, schemaName, sourceVisibilityReason, kinds...)
+}
+
+// targetObjectVisibility is schemaObjectVisibility for a target schema: it
+// checks that the user of db can see the schema's triggers and events
+// (targetObjectVisibilityKinds), which target_schema_objects refuses.
+func targetObjectVisibility(ctx context.Context, db querier, schemaName string) error {
+	return visibility(ctx, db, schemaName, targetVisibilityReason, targetObjectVisibilityKinds...)
+}
+
+func visibility(ctx context.Context, db querier, schemaName, reason string, kinds ...schemaObject) error {
 	grants, err := readGrants(ctx, db)
 	if err != nil {
 		return fmt.Errorf("could not read the grants that make the schema's objects visible: %w", err)
 	}
-	return schemaObjectVisibilityFromGrants(grants, schemaName, kinds...)
+	return visibilityFromGrants(grants, schemaName, reason, kinds...)
 }
 
 // readGrants returns the connection's SHOW GRANTS lines. For the current
