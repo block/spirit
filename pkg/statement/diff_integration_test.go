@@ -1333,9 +1333,11 @@ func TestDiffIntegrationBinaryLiteralDefaultsConverge(t *testing.T) {
 // TestDiffIntegrationZerofillDefaultWidthConverges verifies that a ZEROFILL
 // integer declared without a width resolves to the unsigned default width MySQL
 // stores for it (int zerofill is int(10) unsigned zerofill, not the parser's
-// signed int(11)). The live table starts on explicit signed-default widths, so
-// the diff must move every column to the unsigned default, and after the ALTER
-// is applied a re-diff must converge.
+// signed int(11)). The live table starts on widths other than the unsigned
+// default — the signed defaults for tinyint through int, where the two differ,
+// and bigint(21) for bigint, whose signed and unsigned defaults are both 20 and
+// so converged before this rule — so the diff must move every column to the
+// unsigned default, and after the ALTER is applied a re-diff must converge.
 func TestDiffIntegrationZerofillDefaultWidthConverges(t *testing.T) {
 	tt := testutils.NewTestTable(t, "diff_zerofill_width",
 		"CREATE TABLE diff_zerofill_width (id int NOT NULL, a int(11) zerofill, b tinyint(4) zerofill, c smallint(6) zerofill, d mediumint(9) zerofill, e bigint(21) zerofill, PRIMARY KEY (id))")
