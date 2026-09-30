@@ -293,7 +293,11 @@ func (r *Runner) dropStaleCopyTables(ctx context.Context) {
 		var n int
 		if err := r.db.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-			r.changes[0].table.SchemaName, newName).Scan(&n); err == nil && n > 0 {
+			r.changes[0].table.SchemaName, newName).Scan(&n); err != nil {
+			leaveInPlace("could not check whether the new table exists", "error", err)
+			return
+		}
+		if n > 0 {
 			leaveInPlace("there is no checkpoint table to confirm the new table was created by Spirit for this table")
 		}
 		return
@@ -307,11 +311,13 @@ func (r *Runner) dropStaleCopyTables(ctx context.Context) {
 		leaveInPlace("the checkpoint does not belong to this table", "checkpoint-original-table", rec.OriginalTableName)
 		return
 	}
-	drop := []string{newName, ckptName}
-	for _, name := range drop {
+	// _new first: the checkpoint is the evidence of ownership, so it must
+	// outlive _new. If a drop fails, stop and keep the checkpoint so a later
+	// run can retry.
+	for _, name := range []string{newName, ckptName} {
 		if err := dbconn.Exec(ctx, r.db, "DROP TABLE IF EXISTS %n", name); err != nil {
 			r.logger.Error("could not drop a stale table from an earlier interrupted migration", "table", name, "error", err)
-			continue
+			return
 		}
 		r.logger.Info("dropped a stale table from an earlier interrupted migration", "table", name)
 	}

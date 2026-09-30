@@ -414,9 +414,9 @@ func TestNativeDDLKeepsCopyTablesWhenCheckpointUnreadable(t *testing.T) {
 	}
 }
 
-// TestNativeDDLDropsNewTableWithoutCheckpoint checks that the cleanup after
-// native DDL drops a stale _new table when the checkpoint table is confirmed
-// absent, as a fresh copy would.
+// TestNativeDDLKeepsNewTableWithoutCheckpoint checks that the cleanup after
+// native DDL keeps a _new table when there is no checkpoint table, since
+// without one there is no evidence Spirit created it.
 func TestNativeDDLKeepsNewTableWithoutCheckpoint(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "stalenockpt", `CREATE TABLE stalenockpt (
