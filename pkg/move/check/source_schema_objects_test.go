@@ -85,6 +85,7 @@ func TestSourceSchemaObjectsCheckEachType(t *testing.T) {
 			err := sourceSchemaObjectsCheck(t.Context(), r, slog.Default())
 			require.EqualError(t, err, "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 ("+srcName+"): "+tc.want)
 			require.NotContains(t, err.Error(), "--force")
+			require.ErrorIs(t, err, ErrRefused, "finding objects is a refusal, not a transient error")
 		})
 	}
 }
@@ -140,4 +141,77 @@ func TestSourceSchemaObjectsCheckIgnoresOtherSchemas(t *testing.T) {
 func TestSourceSchemaObjectsCheckUninitializedSource(t *testing.T) {
 	err := sourceSchemaObjectsCheck(t.Context(), Resources{Sources: []SourceResource{{}}}, slog.Default())
 	require.EqualError(t, err, "source 0 database connection or config is not initialized")
+}
+
+// TestRetiredTableTriggersError checks the reverse cutover's check: only
+// triggers on the retired <table>_old tables of the moved tables refuse, on
+// any source. Other objects in the source schema do not.
+func TestRetiredTableTriggersError(t *testing.T) {
+	src0Name, src0DB := testutils.CreateUniqueTestDatabase(t)
+	src1Name, src1DB := testutils.CreateUniqueTestDatabase(t)
+	for _, name := range []string{src0Name, src1Name} {
+		for _, tbl := range []string{"t1_old", "t2_old", "other"} {
+			testutils.RunSQLInDatabase(t, name, "CREATE TABLE "+tbl+" (id INT NOT NULL PRIMARY KEY, v INT)")
+		}
+	}
+	sources := []SourceResource{
+		{DB: src0DB, Config: &mysql.Config{DBName: src0Name}},
+		{DB: src1DB, Config: &mysql.Config{DBName: src1Name}},
+	}
+	tables := []string{"t1", "t2"}
+
+	// Objects that are not triggers on a retired table do not refuse.
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE TRIGGER other_bi BEFORE INSERT ON other FOR EACH ROW SET NEW.v = 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE VIEW v1 AS SELECT id FROM other")
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE PROCEDURE p1() SELECT 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+	require.NoError(t, RetiredTableTriggersError(t.Context(), sources, tables))
+	// A retired table of a table that is not moved does not count either.
+	require.NoError(t, RetiredTableTriggersError(t.Context(), sources, []string{"t3"}))
+
+	testutils.RunSQLInDatabaseAsRoot(t, src1Name, "CREATE TRIGGER t2_old_bu BEFORE UPDATE ON t2_old FOR EACH ROW SET NEW.v = 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src1Name, "CREATE TRIGGER t1_old_bi BEFORE INSERT ON t1_old FOR EACH ROW SET NEW.v = 1")
+	err := RetiredTableTriggersError(t.Context(), sources, tables)
+	require.EqualError(t, err, "cannot revert: triggers on the retired tables would go live with them, and they must be dropped before the reverse cutover can continue: source 1 ("+src1Name+"): trigger 't1_old_bi' on table 't1_old', trigger 't2_old_bu' on table 't2_old'")
+	require.ErrorIs(t, err, ErrRefused)
+
+	require.EqualError(t, RetiredTableTriggersError(t.Context(), []SourceResource{{}}, tables),
+		"source 0 database connection or config is not initialized")
+}
+
+// TestRetiredTableTriggersErrorRequiresTriggerVisibility checks that the
+// reverse cutover's check refuses when the user cannot see the schema's
+// triggers, rather than trusting an empty result.
+func TestRetiredTableTriggersErrorRequiresTriggerVisibility(t *testing.T) {
+	schema, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE TRIGGER t1_old_bi BEFORE INSERT ON t1_old FOR EACH ROW SET NEW.v = 1")
+	// SELECT only: no TRIGGER, so the trigger is hidden. EVENT and routine
+	// grants are not needed for this check.
+	db, cfg := createMoveTestUser(t, "testmovevis_notrigger", schema, "GRANT SELECT ON `"+schema+"`.* TO %s")
+	err := RetiredTableTriggersError(t.Context(), []SourceResource{{DB: db, Config: cfg}}, []string{"t1"})
+	require.EqualError(t, err, "source 0 ("+schema+"): insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: TRIGGER on `"+schema+"`.* (to see its triggers)")
+	require.ErrorIs(t, err, ErrRefused)
+}
+
+// TestSourceSchemaObjectsCheckOrder pins the report order of the single
+// UNION ALL query: by type, then by name in each name column's own collation
+// (case-insensitive for triggers and routines, binary for views), the same
+// order as one query per type sorted by name.
+func TestSourceSchemaObjectsCheckOrder(t *testing.T) {
+	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+	for _, stmt := range []string{
+		"CREATE TRIGGER Zt BEFORE INSERT ON t1 FOR EACH ROW SET NEW.v = 1",
+		"CREATE TRIGGER at BEFORE UPDATE ON t1 FOR EACH ROW SET NEW.v = 1",
+		"CREATE VIEW av AS SELECT 1 AS x",
+		"CREATE VIEW Bv AS SELECT 1 AS x",
+		"CREATE PROCEDURE Zp() SELECT 1",
+		"CREATE PROCEDURE ap() SELECT 1",
+	} {
+		testutils.RunSQLInDatabaseAsRoot(t, srcName, stmt)
+	}
+	err := SourceSchemaObjectsError(t.Context(), []SourceResource{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}})
+	require.EqualError(t, err, "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 ("+srcName+"): "+
+		"trigger 'at' on table 't1', trigger 'Zt' on table 't1', view 'Bv', view 'av', procedure 'ap', procedure 'Zp'")
 }

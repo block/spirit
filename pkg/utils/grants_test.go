@@ -196,3 +196,25 @@ func TestDBLevelGrantHasAny(t *testing.T) {
 		})
 	}
 }
+
+func TestDBLevelRevokeHasAny(t *testing.T) {
+	tests := []struct {
+		grant, schema string
+		privs         []string
+		want          bool
+	}{
+		{"REVOKE SELECT, EVENT, TRIGGER ON `app`.* FROM `u`@`%`", "app", []string{"EVENT"}, true},
+		{"REVOKE SELECT ON `app_one`.* FROM `u`@`%`", "app_one", []string{"SELECT"}, true},
+		{"REVOKE ALL PRIVILEGES ON `app`.* FROM `u`@`%`", "app", []string{"TRIGGER"}, true},
+		{"REVOKE SELECT ON `app`.* FROM `u`@`%`", "app", []string{"EVENT"}, false},
+		{"REVOKE EVENT ON `other`.* FROM `u`@`%`", "app", []string{"EVENT"}, false},
+		// Taken literally, not as a pattern.
+		{"REVOKE EVENT ON `app_%`.* FROM `u`@`%`", "app_one", []string{"EVENT"}, false},
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", "app", []string{"EVENT"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.grant, func(t *testing.T) {
+			assert.Equal(t, tc.want, DBLevelRevokeHasAny(tc.grant, tc.schema, tc.privs...))
+		})
+	}
+}

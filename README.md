@@ -132,7 +132,7 @@ Spirit requires an account with these privileges:
 * The `RELOAD` privilege.
 * `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover.
 
-`spirit move` also requires `EVENT` on the source schema and `SHOW_ROUTINE` on `*.*` (or an alternative), so it can see the events and stored routines it refuses to move. See [docs/move.md](docs/move.md).
+`spirit move` also requires `EVENT` on the source schema and `SHOW_ROUTINE` (or `SELECT`) on `*.*`, so it can see the events and stored routines it refuses to move. See [docs/move.md](docs/move.md).
 
 For replica throttling, Spirit requires:
 

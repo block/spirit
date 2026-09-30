@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/block/mysql"
@@ -196,7 +197,9 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 		_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS testmoverdsroleuser")
 	})
 
-	_, err = db.ExecContext(t.Context(), "GRANT ALL ON test.* TO testmoverdsroleuser")
+	// An explicit schema-level list, not ALL: it has no EVENT and nothing
+	// that shows routines, which the opaque role is taken to provide.
+	_, err = db.ExecContext(t.Context(), "GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON test.* TO testmoverdsroleuser")
 	require.NoError(t, err)
 	_, err = db.ExecContext(t.Context(), "GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testmoverdsroleuser")
 	require.NoError(t, err)
@@ -231,6 +234,8 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	// privilegesCheck should pass.
 	err = privilegesCheck(t.Context(), r, slog.Default())
 	require.NoError(t, err, "should pass when activate_all_roles_on_login=ON and rds_superuser_role is granted")
+	// The per-scan visibility check applies the same exemption.
+	require.NoError(t, schemaObjectVisibility(t.Context(), lowPrivDB, sourceConfig.DBName, allSchemaObjects...))
 }
 
 // oldMinimalMoveGrants are the grants that passed the move privileges check
@@ -398,35 +403,109 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 }
 
 // TestSourceSchemaObjectsCheckRequiresVisibility checks that every scan
-// verifies that the user can see events and stored routines before trusting
-// an empty result, so a grant revoked after preflight (or a reverse-window
-// resume, which runs no preflight) cannot make the scan pass on objects it
-// cannot see.
+// verifies that the user can see every object type before trusting an empty
+// result, so a grant revoked after preflight (or a reverse-window resume,
+// which runs no preflight) cannot make the scan pass on objects it cannot
+// see. Missing grants are a refusal; failing to read the grants is not.
 func TestSourceSchemaObjectsCheckRequiresVisibility(t *testing.T) {
-	schema, _ := testutils.CreateUniqueTestDatabase(t)
-	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
-	db, cfg := createMoveTestUser(t, "testmovevis_revoke", schema,
-		append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
-	src := []SourceResource{{DB: db, Config: cfg}}
-	r := Resources{Sources: src}
+	const visibilityPrefix = "insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: "
 	scopes := []ScopeFlag{ScopePreflight, ScopePostSetup, ScopeResume, ScopePreCutover}
 	only := otherChecks("source_schema_objects_preflight", "source_schema_objects", "source_schema_objects_resume", "source_schema_objects_precutover")
-	for _, scope := range scopes {
-		require.NoError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), "scope %d", scope)
-	}
+	for _, tc := range []struct {
+		name, user, revoke, create, needed string
+	}{
+		{"EVENT revoked", "testmovevis_revokeevent", "REVOKE EVENT ON `%s`.* FROM %s",
+			"CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1", "EVENT on `%s`.* (to see its events)"},
+		{"TRIGGER revoked", "testmovevis_revoketrigger", "REVOKE TRIGGER ON `%s`.* FROM %s",
+			"CREATE TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.v = 1", "TRIGGER on `%s`.* (to see its triggers)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, _ := testutils.CreateUniqueTestDatabase(t)
+			testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+			db, cfg := createMoveTestUser(t, tc.user, schema,
+				append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+			src := []SourceResource{{DB: db, Config: cfg}}
+			r := Resources{Sources: src}
+			for _, scope := range scopes {
+				require.NoError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), "scope %d", scope)
+			}
 
-	// Revoke EVENT, as could happen during a long move, and create an event
-	// the user can no longer see.
-	testutils.RunSQLInDatabaseAsRoot(t, "", "REVOKE EVENT ON `"+schema+"`.* FROM testmovevis_revoke")
-	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
-	want := "source 0 (" + schema + "): insufficient privileges to run a move: move refuses source schemas that contain events or stored routines, and information_schema hides them from users without these grants. Needed: EVENT on `" + schema + "`.* (to see the schema's events)"
-	require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), want)
-	for _, scope := range scopes {
-		require.EqualError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), want, "scope %d", scope)
-	}
+			// Revoke the grant, as could happen during a long move, and
+			// create an object the user can no longer see.
+			testutils.RunSQLInDatabaseAsRoot(t, "", fmt.Sprintf(tc.revoke, schema, tc.user))
+			testutils.RunSQLInDatabaseAsRoot(t, schema, tc.create)
+			want := "source 0 (" + schema + "): " + visibilityPrefix + fmt.Sprintf(tc.needed, schema)
+			err := SourceSchemaObjectsError(t.Context(), src)
+			require.EqualError(t, err, want)
+			require.ErrorIs(t, err, ErrRefused)
+			for _, scope := range scopes {
+				require.EqualError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), want, "scope %d", scope)
+			}
 
-	// Fails closed when the grants cannot be read.
-	canceled, cancel := context.WithCancel(t.Context())
-	cancel()
-	require.ErrorContains(t, SourceSchemaObjectsError(canceled, src), "source 0 ("+schema+"): could not read the grants")
+			// Fails closed when the grants cannot be read, without a refusal:
+			// the error may be transient.
+			canceled, cancel := context.WithCancel(t.Context())
+			cancel()
+			err = SourceSchemaObjectsError(canceled, src)
+			require.ErrorContains(t, err, "source 0 ("+schema+"): could not read the grants")
+			require.NotErrorIs(t, err, ErrRefused)
+		})
+	}
+}
+
+// TestSchemaObjectVisibilityFromGrants checks the evaluation of SHOW GRANTS
+// lines: database-level (including patterns) and global grants count, a
+// partial revoke cancels a global grant for its schema, table-level grants do
+// not count, and each missing grant is named.
+func TestSchemaObjectVisibilityFromGrants(t *testing.T) {
+	const u = " TO `u`@`%`"
+	base := "GRANT SELECT, TRIGGER, EVENT ON `app`.*" + u
+	routines := "GRANT SHOW_ROUTINE ON *.*" + u
+	needSelect := "SELECT on `app`.* (to see its views)"
+	needTrigger := "TRIGGER on `app`.* (to see its triggers)"
+	needEvent := "EVENT on `app`.* (to see its events)"
+	needRoutine := "SHOW_ROUTINE on *.* (to see its stored procedures and functions; SELECT on *.*, or EXECUTE on `app`.*, also works)"
+	for _, tc := range []struct {
+		name    string
+		grants  []string
+		missing []string
+	}{
+		{"database-level grants and SHOW_ROUTINE", []string{base, routines}, nil},
+		{"database-level pattern", []string{"GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `ap\\_%`.*" + u}, []string{needSelect, needTrigger, needEvent, needRoutine}},
+		{"database-level pattern matching", []string{"GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `a%`.*" + u}, nil},
+		{"global grants", []string{"GRANT SELECT, TRIGGER, EVENT ON *.*" + u}, nil},
+		{"ALL PRIVILEGES on the schema", []string{"GRANT ALL PRIVILEGES ON `app`.*" + u}, nil},
+		{"ALL PRIVILEGES globally", []string{"GRANT ALL PRIVILEGES ON *.*" + u}, nil},
+		{"nothing", nil, []string{needSelect, needTrigger, needEvent, needRoutine}},
+		{"table-level grants do not count", []string{"GRANT SELECT, TRIGGER ON `app`.`t1`" + u, "GRANT EVENT ON `app`.*" + u, routines}, []string{needSelect, needTrigger}},
+		{"database-level SELECT does not show routines", []string{base}, []string{needRoutine}},
+		{"partial revoke of global EVENT and TRIGGER", []string{"GRANT SELECT, TRIGGER, EVENT ON *.*" + u, "REVOKE EVENT, TRIGGER ON `app`.* FROM `u`@`%`"}, []string{needTrigger, needEvent}},
+		{"partial revoke of global SELECT hides views and routines", []string{"GRANT SELECT ON *.*" + u, "GRANT TRIGGER, EVENT ON `app`.*" + u, "REVOKE SELECT ON `app`.* FROM `u`@`%`"}, []string{needSelect, needRoutine}},
+		{"partial revoke on another schema", []string{"GRANT SELECT, TRIGGER, EVENT ON *.*" + u, "REVOKE EVENT ON `other`.* FROM `u`@`%`"}, nil},
+		{"partial revoke of ALL PRIVILEGES", []string{"GRANT ALL PRIVILEGES ON *.*" + u, "REVOKE ALL PRIVILEGES ON `app`.* FROM `u`@`%`"}, []string{needSelect, needTrigger, needEvent, needRoutine}},
+		{"database-level grant with a partial revoke of the global grant", []string{"GRANT EVENT ON *.*" + u, "REVOKE EVENT ON `app`.* FROM `u`@`%`", base, routines}, nil},
+		{"routine privilege on the schema", []string{base, "GRANT EXECUTE ON `app`.*" + u}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := schemaObjectVisibilityFromGrants(tc.grants, "app", allSchemaObjects...)
+			if tc.missing == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, ErrRefused)
+			require.ErrorContains(t, err, "Needed: "+strings.Join(tc.missing, "; "))
+		})
+	}
+	// Only the kinds asked for are evaluated.
+	require.NoError(t, schemaObjectVisibilityFromGrants([]string{"GRANT TRIGGER ON `app`.*" + u}, "app", schemaTriggers))
+}
+
+func TestRDSSuperuserRoleGranted(t *testing.T) {
+	require.True(t, rdsSuperuserRoleGranted([]string{
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `app`.* TO `u`@`%`",
+		"GRANT `rds_superuser_role`@`%` TO `u`@`%`",
+	}))
+	require.True(t, rdsSuperuserRoleGranted([]string{"GRANT `other`@`%`,`rds_superuser_role`@`%` TO `u`@`%`"}))
+	require.False(t, rdsSuperuserRoleGranted([]string{"GRANT `other_role`@`%` TO `u`@`%`"}))
+	require.False(t, rdsSuperuserRoleGranted([]string{"GRANT SELECT ON `rds_superuser_role`.* TO `u`@`%`"}))
 }

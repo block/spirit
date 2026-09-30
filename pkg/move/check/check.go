@@ -26,8 +26,8 @@ const (
 	ScopeResume
 	// ScopePreCutover runs while the forward cutover holds its table locks
 	// on every source, after the final flush and before the traffic switch
-	// and the source rename. A failure refuses the cutover without a retry
-	// and leaves the source live.
+	// and the source rename. A refusal (ErrRefused) fails the cutover without
+	// a retry and leaves the source live. Any other error is retried.
 	ScopePreCutover
 )
 

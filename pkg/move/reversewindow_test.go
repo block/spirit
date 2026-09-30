@@ -1231,13 +1231,13 @@ func TestReverseWindowEntryRefusesSourceSchemaObjects(t *testing.T) {
 	})
 }
 
-// TestMoveReverseCutoverRefusesSourceSchemaObjects: an object created in the
-// source schema during the reverse window, here a trigger on a retired _old
-// table, must stop the rollback before the _old tables are put back into
-// service. The refusal fails closed: no rename, no traffic switch, the
-// target keeps serving and the checkpoint still records the reverse window,
-// so a re-run resumes it once the object is dropped.
-func TestMoveReverseCutoverRefusesSourceSchemaObjects(t *testing.T) {
+// TestMoveReverseCutoverRefusesRetiredTableTrigger: a trigger created on a
+// retired _old table during the reverse window must stop the rollback before
+// the _old tables are put back into service. The refusal fails closed: no
+// rename, no traffic switch, the target keeps serving and the checkpoint
+// still records the reverse window, so a re-run resumes it once the trigger
+// is dropped.
+func TestMoveReverseCutoverRefusesRetiredTableTrigger(t *testing.T) {
 	shortenReverseWindowPolling(t)
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcobj_src", "rwcobj_dst")
 
@@ -1262,8 +1262,7 @@ func TestMoveReverseCutoverRefusesSourceSchemaObjects(t *testing.T) {
 	testutils.RunSQL(t, "CREATE TABLE rwcobj_dst."+revertMarkerName+" (id INT)")
 
 	err = h.waitFor(reverseCutoverTimeout, "the reverse cutover to be refused")
-	require.ErrorContains(t, err, "reverse cutover: cannot move: move does not copy triggers, views, stored procedures, stored functions or events")
-	require.ErrorContains(t, err, "source 0 (rwcobj_src): trigger 't1_old_bu' on table 't1_old'")
+	require.ErrorContains(t, err, "reverse cutover: cannot revert: triggers on the retired tables would go live with them, and they must be dropped before the reverse cutover can continue: source 0 (rwcobj_src): trigger 't1_old_bu' on table 't1_old'")
 	require.False(t, reverseCutoverCalled, "traffic must not be switched back")
 	require.True(t, tableExists(t, ctl, "rwcobj_src", "t1_old"), "the source must stay retired")
 	require.False(t, tableExists(t, ctl, "rwcobj_src", "t1"), "the source must not be un-retired")
@@ -1273,6 +1272,53 @@ func TestMoveReverseCutoverRefusesSourceSchemaObjects(t *testing.T) {
 	require.NoError(t, ctl.QueryRowContext(t.Context(),
 		"SELECT move_phase FROM rwcobj_dst."+checkpointTableName+" WHERE id=1").Scan(&phase))
 	require.Equal(t, phaseReverseWindow, phase, "the checkpoint must still record the reverse window")
+}
+
+// TestMoveReverseCutoverIgnoresUnrelatedSchemaObjects: the reverse cutover
+// checks only the retired _old tables. A view and an event created elsewhere
+// in the source schema during the window do not change what the rollback
+// makes live, so they must not block it.
+func TestMoveReverseCutoverIgnoresUnrelatedSchemaObjects(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcign_src", "rwcign_dst")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second, // long; the revert ends it early
+	})
+	require.NoError(t, err)
+	var reverseCutoverCalled bool
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
+	h := startRun(t, runner)
+
+	deadline := h.awaitReverseWindow(ctl, "rwcign_dst")
+	h.awaitTable(deadline, ctl, "rwcign_src", "t1_old")
+	root := rootDB(t)
+	execUnlogged(t, root, "CREATE VIEW rwcign_src.report_v AS SELECT 1 AS x")
+	execUnlogged(t, root, "CREATE EVENT rwcign_src.cleanup_e ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+	testutils.RunSQL(t, "CREATE TABLE rwcign_dst."+revertMarkerName+" (id INT)")
+
+	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete")
+	require.True(t, reverseCutoverCalled, "the rollback must switch traffic back")
+	require.True(t, tableExists(t, ctl, "rwcign_src", "t1"), "the source must be un-retired")
+	require.True(t, tableExists(t, ctl, "rwcign_dst", "t1_revert"), "the target must be retired")
+}
+
+// rootDB opens a connection as root (see testutils.RunSQLInDatabaseAsRoot),
+// for statements the test user is not granted.
+func rootDB(t *testing.T) *sql.DB {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.User, cfg.DBName = "root", ""
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	return db
 }
 
 // execUnlogged runs stmt with sql_log_bin=0, so no change feed sees it: the

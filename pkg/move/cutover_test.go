@@ -16,6 +16,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/move/check"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -601,71 +602,94 @@ func TestNtoMShardedMoveCarriesAutoIncrement(t *testing.T) {
 	require.Equal(t, uint64(1001), nextAutoIncrement(t, tgt1Name, "users"))
 }
 
-// TestCutOverRefusedUnderLockIsNotRetried checks that the checks registered
-// with SetChecksUnderLock run while every source table is locked, and that a
-// refusal fails the cutover on the first attempt: no retry, no pre-switch
-// hook, no traffic switch, no rename, and the locks are released.
-func TestCutOverRefusedUnderLockIsNotRetried(t *testing.T) {
-	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
-	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
-	testutils.RunSQLInDatabase(t, srcName, "INSERT INTO t1 VALUES (1, 'a'), (2, 'b')")
+// TestCutOverChecksUnderLockRetryPolicy checks that the checks under the
+// cutover's locks run while the source tables are locked, that a refusal
+// (check.ErrRefused) gives one attempt only, with no pre-switch hook, no
+// traffic switch and no rename, and that any other error, which may be
+// transient, is retried. The locks are released either way.
+func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		firstErr error
+		refused  bool
+	}{
+		{"refusal is not retried", fmt.Errorf("%w: source schema has a trigger", check.ErrRefused), true},
+		{"transient error is retried", errors.New("failed to list schema objects on source 0: connection reset"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
+			testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
+			testutils.RunSQLInDatabase(t, srcName, "INSERT INTO t1 VALUES (1, 'a'), (2, 'b')")
 
-	dbConfig := dbconn.NewDBConfig()
-	dbConfig.MaxRetries = 3
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+			dbConfig := dbconn.NewDBConfig()
+			dbConfig.MaxRetries = 3
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
 
-	srcDSN := testutils.DSNForDatabase(srcName)
-	srcConfig, err := mysql.ParseDSN(srcDSN)
-	require.NoError(t, err)
-	replDB, err := dbconn.New(srcDSN, dbConfig)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(replDB)
-	cfg := change.NewClientDefaultConfig()
-	cfg.CancelFunc = func(change.FatalReason) bool { return false }
-	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
-	require.NoError(t, replClient.Start(ctx))
-	defer replClient.Close()
+			srcDSN := testutils.DSNForDatabase(srcName)
+			srcConfig, err := mysql.ParseDSN(srcDSN)
+			require.NoError(t, err)
+			replDB, err := dbconn.New(srcDSN, dbConfig)
+			require.NoError(t, err)
+			defer utils.CloseAndLog(replDB)
+			cfg := change.NewClientDefaultConfig()
+			cfg.CancelFunc = func(change.FatalReason) bool { return false }
+			replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+			require.NoError(t, replClient.Start(ctx))
+			defer replClient.Close()
 
-	tbl := table.NewTableInfo(srcDB, srcName, "t1")
-	require.NoError(t, tbl.SetInfo(ctx))
-	var cutoverFuncCalled, preSwitchCalled bool
-	cutover, err := NewCutOver([]CutOverSource{{DB: srcDB, ReplClient: replClient, Tables: []*table.TableInfo{tbl}}},
-		func(context.Context) error { cutoverFuncCalled = true; return nil }, dbConfig, slog.Default())
-	require.NoError(t, err)
-	cutover.SetPreSwitch(func(context.Context) error { preSwitchCalled = true; return nil })
+			tbl := table.NewTableInfo(srcDB, srcName, "t1")
+			require.NoError(t, tbl.SetInfo(ctx))
+			var cutoverFuncCalled, preSwitchCalled bool
+			cutover, err := NewCutOver([]CutOverSource{{DB: srcDB, ReplClient: replClient, Tables: []*table.TableInfo{tbl}}},
+				func(context.Context) error { cutoverFuncCalled = true; return nil }, dbConfig, slog.Default())
+			require.NoError(t, err)
+			cutover.SetPreSwitch(func(context.Context) error { preSwitchCalled = true; return nil })
 
-	// Another session trying to create a trigger on a locked table waits for
-	// the lock. A short lock_wait_timeout turns that wait into an error.
-	createTrigger := func(ctx context.Context) error {
-		conn, err := srcDB.Conn(ctx)
-		if err != nil {
-			return err
-		}
-		defer utils.CloseAndLog(conn)
-		if _, err := conn.ExecContext(ctx, "SET SESSION lock_wait_timeout = 1"); err != nil {
-			return err
-		}
-		_, err = conn.ExecContext(ctx, "CREATE TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.val = UPPER(NEW.val)")
-		return err
+			// Another session trying to create a trigger on a locked table waits
+			// for the lock. A short lock_wait_timeout turns that wait into an
+			// error.
+			createTrigger := func(ctx context.Context) error {
+				conn, err := srcDB.Conn(ctx)
+				if err != nil {
+					return err
+				}
+				defer utils.CloseAndLog(conn)
+				if _, err := conn.ExecContext(ctx, "SET SESSION lock_wait_timeout = 1"); err != nil {
+					return err
+				}
+				_, err = conn.ExecContext(ctx, "CREATE TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.val = UPPER(NEW.val)")
+				return err
+			}
+			checks := 0
+			cutover.SetChecksUnderLock(func(ctx context.Context) error {
+				checks++
+				require.Error(t, createTrigger(ctx), "the checks must run while the source tables are locked")
+				if checks == 1 {
+					return tc.firstErr
+				}
+				return nil
+			})
+
+			err = cutover.Run(ctx)
+			if tc.refused {
+				require.ErrorIs(t, err, errCutoverRefused)
+				require.ErrorIs(t, err, tc.firstErr)
+				require.Equal(t, 1, checks, "a refused cutover must not be retried")
+				require.False(t, preSwitchCalled, "the pre-switch hook must not run")
+				require.False(t, cutoverFuncCalled, "traffic must not be switched")
+				require.True(t, sentinelTestTableExists(t, srcDB, srcName, "t1"), "the source must stay live")
+				require.False(t, sentinelTestTableExists(t, srcDB, srcName, "t1_old"), "the source must not be renamed")
+				require.NoError(t, createTrigger(ctx), "the locks must be released")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, 2, checks, "a transient error must be retried")
+			require.True(t, preSwitchCalled)
+			require.True(t, cutoverFuncCalled)
+			require.True(t, sentinelTestTableExists(t, srcDB, srcName, "t1_old"), "the retried cutover must complete")
+		})
 	}
-	checks := 0
-	refusal := errors.New("source schema has a trigger")
-	cutover.SetChecksUnderLock(func(ctx context.Context) error {
-		checks++
-		require.Error(t, createTrigger(ctx), "the checks must run while the source tables are locked")
-		return refusal
-	})
-
-	err = cutover.Run(ctx)
-	require.ErrorIs(t, err, errCutoverRefused)
-	require.ErrorIs(t, err, refusal)
-	require.Equal(t, 1, checks, "a refused cutover must not be retried")
-	require.False(t, preSwitchCalled, "the pre-switch hook must not run")
-	require.False(t, cutoverFuncCalled, "traffic must not be switched")
-	require.True(t, sentinelTestTableExists(t, srcDB, srcName, "t1"), "the source must stay live")
-	require.False(t, sentinelTestTableExists(t, srcDB, srcName, "t1_old"), "the source must not be renamed")
-	require.NoError(t, createTrigger(ctx), "the locks must be released")
 }
 
 // TestMoveCutoverRefusesSourceSchemaObjectUnderLock checks the forward

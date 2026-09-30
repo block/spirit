@@ -381,14 +381,20 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	}
 	w.feed.Close()
 
-	// Check the source schemas one last time before the _old tables go back
-	// into service: nothing writes them now, and an object created on them
-	// during the window would otherwise go live with them. This path holds
-	// no lock on the source tables, so it does not keep DDL out while it
-	// runs. Fail closed: nothing has moved ownership yet, the phase is still
-	// reverse_window, and a re-run resumes the window once the objects are
-	// dropped.
-	if err := w.checkSourceSchemaObjects(ctx); err != nil {
+	// Check the _old tables for triggers one last time before they go back
+	// into service: nothing writes them now, and a trigger created on one
+	// during the window would otherwise go live with it. Only the _old
+	// tables are checked: a view, routine or event elsewhere in the source
+	// schema does not change what the rollback makes live, and must not
+	// block an emergency rollback. This path holds no lock on the source
+	// tables, so it does not keep DDL out while it runs. Fail closed: nothing
+	// has moved ownership yet, the phase is still reverse_window, and a
+	// re-run resumes the window once the triggers are dropped.
+	tables := make([]string, len(r.sourceTables))
+	for i, t := range r.sourceTables {
+		tables[i] = t.TableName
+	}
+	if err := check.RetiredTableTriggersError(ctx, r.checkResources().Sources, tables); err != nil {
 		return fmt.Errorf("reverse cutover: %w", err)
 	}
 

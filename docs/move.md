@@ -11,14 +11,20 @@ spirit move --source-dsn "user:pass@tcp(source-host:3306)/mydb" \
 
 This will copy all tables from the source database to the target database, verify them with a checksum, and then complete.
 
-Move copies base tables only. It refuses a source schema that contains triggers, views, stored procedures, stored functions or events, because it does not copy them to the target; drop them before moving. The whole schema is checked, also when only some tables are moved. The check runs before tables are discovered (so a schema with only views, routines or events is refused rather than moved as empty), before the copy, on resume, again under the cutover's table locks before traffic is switched, when a reverse window is entered, and before a reverse cutover.
+Move copies base tables only. It refuses a source schema that contains triggers, views, stored procedures, stored functions or events, because it does not copy them to the target; drop them before moving. The whole schema is checked, also when only some tables are moved. The check runs before tables are discovered (so a schema with only views, routines or events is refused rather than moved as empty), before the copy, on resume, again under the cutover's table locks before traffic is switched, and when a reverse window is entered. Under the cutover's locks, only finding objects (or missing grants, below) refuses the cutover without a retry; a failed query is retried like any other failed cutover attempt.
 
-`information_schema` hides events and stored routines from a user without privileges on them, so the move user needs these grants on each source in addition to the privileges listed in the [README](../README.md):
+A reverse cutover (a rollback during the reverse window) checks only for triggers on the retired `<table>_old` tables, because they would go live with those tables. Other objects in the source schema do not change what the rollback makes live, so they do not block it.
 
-* `EVENT` on the source schema (or on `*.*`), to see its events.
-* `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), to see its stored procedures and functions. `SELECT` on `*.*`, or `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the source schema (or on `*.*`), also works.
+`information_schema` only shows a user the objects it has privileges on, so the move user needs these grants on each source schema, in addition to the privileges listed in the [README](../README.md). Each one counts if it is granted on the schema or on `*.*`:
 
-The move is refused if they are missing. Grants through an active role (for example a default role) count. Every run of the check verifies the grants again before it trusts an empty result, so a grant revoked during a move refuses the next check, including the one under the cutover locks. Triggers and views need no extra grant: `TRIGGER` and `SELECT` on the schema, which are already required, make them visible.
+* `SELECT`, to see views.
+* `TRIGGER`, to see triggers.
+* `EVENT`, to see events (new: not needed by `migrate`).
+* `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), or `SELECT` on `*.*`, to see stored procedures and functions (new). `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the schema also works.
+
+`SELECT` and `TRIGGER` on the schema are already required. Table-level grants do not count. A global grant that a partial revoke (`partial_revokes=ON`) removes for the source schema does not count. Grants through an active role, such as a default role, count. On RDS, `rds_superuser_role` with `activate_all_roles_on_login=ON` is accepted in place of these grants, as it is for `CONNECTION_ADMIN` and `PROCESS`.
+
+The move is refused if a grant is missing. Every run of the check (including the reverse cutover's) reads the grants again before it trusts an empty result, so a grant revoked during a move refuses the next check.
 
 ## Configuration
 

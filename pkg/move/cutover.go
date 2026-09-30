@@ -75,8 +75,10 @@ type CutOver struct {
 	cutoverFuncSucceeded bool
 
 	// checksUnderLock, when set, runs under the source locks after the final
-	// flush and before preSwitch, the traffic switch and the rename. An error
-	// from it fails the cutover without a retry (errCutoverRefused). The locks
+	// flush and before preSwitch, the traffic switch and the rename. A
+	// refusal from it (check.ErrRefused) fails the cutover without a retry
+	// (errCutoverRefused); any other error is retried like a failed attempt.
+	// The locks
 	// keep out DDL that needs a metadata lock on the locked tables, such as a
 	// CREATE TRIGGER on them.
 	checksUnderLock func(ctx context.Context) error
@@ -303,7 +305,13 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 
 	if c.checksUnderLock != nil {
 		if err := c.checksUnderLock(ctx); err != nil {
-			return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			// Only a refusal is final. Any other error (a failed query, a
+			// dropped connection) may be transient, so it takes the normal
+			// retry path.
+			if errors.Is(err, check.ErrRefused) {
+				return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			}
+			return fmt.Errorf("checks under the source locks: %w", err)
 		}
 	}
 

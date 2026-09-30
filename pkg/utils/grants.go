@@ -22,6 +22,15 @@ var dbGrantRegexp = regexp.MustCompile("^GRANT (.+) ON `([^`]+)`\\.\\* TO ")
 // capturing "SELECT, EVENT" or "CONNECTION_ADMIN,SHOW_ROUTINE".
 var globalGrantRegexp = regexp.MustCompile(`^GRANT (.+) ON \*\.\* TO `)
 
+// dbRevokeRegexp captures the privilege list and database name from a partial
+// revoke line, which SHOW GRANTS prints when partial_revokes=ON and a global
+// privilege has been revoked for one database, e.g.
+//
+//	REVOKE SELECT, EVENT ON `app`.* FROM `user`@`%`
+//
+// capturing "SELECT, EVENT" and "app".
+var dbRevokeRegexp = regexp.MustCompile("^REVOKE (.+) ON `([^`]+)`\\.\\* FROM ")
+
 // migrationDBPrivileges is the database-level privilege set spirit requires to
 // run a migration or move (mirroring gh-ost's historical requirement). A grant
 // of ALL PRIVILEGES, or of every privilege in this set, satisfies the check.
@@ -75,6 +84,19 @@ func GlobalGrantHasAny(grant string, privs ...string) bool {
 func DBLevelGrantHasAny(grant, schemaName string, privs ...string) bool {
 	m := dbGrantRegexp.FindStringSubmatch(grant)
 	if m == nil || !MySQLLikeMatch(m[2], schemaName) {
+		return false
+	}
+	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
+}
+
+// DBLevelRevokeHasAny reports whether a single SHOW GRANTS line is a partial
+// revoke (partial_revokes=ON) on schemaName of ALL PRIVILEGES or any privilege
+// in privs. Such a line cancels a global grant of that privilege for that one
+// schema. With partial_revokes=ON, MySQL takes the database name in a revoke
+// literally, so it is compared exactly rather than as a pattern.
+func DBLevelRevokeHasAny(grant, schemaName string, privs ...string) bool {
+	m := dbRevokeRegexp.FindStringSubmatch(grant)
+	if m == nil || m[2] != schemaName {
 		return false
 	}
 	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
