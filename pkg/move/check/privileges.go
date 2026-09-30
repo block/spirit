@@ -79,9 +79,7 @@ type querier interface {
 func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceKillProbe func(context.Context) error) error {
 	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload, foundConnectionAdmin, foundProcess bool
 
-	// With partial_revokes=ON, MySQL takes database names in grants literally,
-	// so a grant on `app%`.* no longer covers app1.
-	grants, partialRevokes, err := readGrants(ctx, db)
+	grants, err := readGrants(ctx, db)
 	if err != nil {
 		return err
 	}
@@ -104,11 +102,10 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 		if utils.StringContainsAll(grant, `ALTER`, `CREATE`, `DELETE`, `DROP`, `INDEX`, `INSERT`, `LOCK TABLES`, `SELECT`, `TRIGGER`, `UPDATE`, ` ON *.*`) {
 			foundDBAll = true
 		}
-		// A database-level grant covers the schema if its database name matches
-		// (a pattern such as `app_%` when partial_revokes=OFF, a literal name
-		// when it is ON) and it confers either ALL PRIVILEGES or the full set
-		// spirit requires.
-		if schemaName != "" && utils.DBLevelGrantCoversSchema(grant, schemaName, partialRevokes) {
+		// A database-level grant covers the schema if its database-name pattern
+		// matches (including MySQL wildcards such as `strata_%`) and it confers
+		// either ALL PRIVILEGES or the full set spirit requires.
+		if schemaName != "" && utils.DBLevelGrantCoversSchema(grant, schemaName) {
 			foundDBAll = true
 		}
 		if strings.Contains(grant, `CONNECTION_ADMIN`) && strings.Contains(grant, ` ON *.*`) {
@@ -119,7 +116,7 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 		}
 	}
 	if foundAll {
-		return schemaObjectVisibilityFromGrants(grants, schemaName, partialRevokes, allSchemaObjects...)
+		return schemaObjectVisibilityFromGrants(grants, schemaName, allSchemaObjects...)
 	}
 
 	// A granted rds_superuser_role stands in for CONNECTION_ADMIN and PROCESS
@@ -158,7 +155,7 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 	if !hasBasePrivileges {
 		return fmt.Errorf("insufficient privileges to run a move. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", schemaName)
 	}
-	return schemaObjectVisibilityFromGrants(grants, schemaName, partialRevokes, allSchemaObjects...)
+	return schemaObjectVisibilityFromGrants(grants, schemaName, allSchemaObjects...)
 }
 
 // rdsSuperuserRoleActive reports whether the user has the RDS
@@ -208,55 +205,28 @@ var allSchemaObjects = []schemaObject{schemaViews, schemaTriggers, schemaEvents,
 // views need SELECT, triggers TRIGGER, events EVENT, and stored routines
 // SHOW_ROUTINE (MySQL 8.0.20+), global SELECT, or a routine privilege
 // (EXECUTE, ALTER ROUTINE, CREATE ROUTINE). A privilege counts on the schema
-// if it is granted globally, unless a partial revoke removes the global grant
-// for that schema, or if it is on every database-level grant whose name
-// matches the schema (see onSchema). SHOW_ROUTINE counts only when named: a
-// global ALL PRIVILEGES does not imply it. The name in a database-level grant
-// is a pattern when partial_revokes=OFF and a literal name when it is ON (see
-// utils.DBNameMatches); partial revokes only exist when it is ON. Table-level
-// grants do not count: move needs to see the whole schema. For the current user, SHOW GRANTS
+// if it is granted globally, or if it is on every database-level grant whose
+// name pattern matches the schema (see onSchema). SHOW_ROUTINE counts only
+// when named: a global ALL PRIVILEGES does not imply it. Table-level grants do
+// not count: move needs to see the whole schema. For the current user, SHOW GRANTS
 // includes the privileges of its active roles, so a grant through a default
 // role counts, and a granted role that is not active does not.
 type schemaGrants struct {
-	lines          []string
-	schema         string
-	partialRevokes bool
+	lines  []string
+	schema string
 }
 
-// global reports whether any of privs is granted globally and not partially
-// revoked on the schema. A global ALL PRIVILEGES counts; see globalNamed for
-// dynamic privileges.
+// global reports whether any of privs is granted globally. A global ALL
+// PRIVILEGES counts; see globalNamed for dynamic privileges.
 func (g schemaGrants) global(privs ...string) bool {
-	return g.globalBy(utils.GlobalGrantHasAny, privs...)
+	return slices.ContainsFunc(g.lines, func(line string) bool { return utils.GlobalGrantHasAny(line, privs...) })
 }
 
 // globalNamed is global, but counts only a global grant that names one of
 // privs, not ALL PRIVILEGES. It is for dynamic privileges such as
 // SHOW_ROUTINE, which a global ALL grant made before an upgrade can lack.
 func (g schemaGrants) globalNamed(privs ...string) bool {
-	return g.globalBy(utils.GlobalGrantNamesAny, privs...)
-}
-
-func (g schemaGrants) globalBy(granted func(string, ...string) bool, privs ...string) bool {
-	for _, priv := range privs {
-		if g.globalOne(granted, priv) {
-			return true
-		}
-	}
-	return false
-}
-
-func (g schemaGrants) globalOne(granted func(string, ...string) bool, priv string) bool {
-	var found bool
-	for _, line := range g.lines {
-		if utils.DBLevelRevokeHasAny(line, g.schema, priv) {
-			return false
-		}
-		if granted(line, priv) {
-			found = true
-		}
-	}
-	return found
+	return slices.ContainsFunc(g.lines, func(line string) bool { return utils.GlobalGrantNamesAny(line, privs...) })
 }
 
 // onSchema reports whether any of privs applies to the whole schema: granted
@@ -278,11 +248,11 @@ func (g schemaGrants) onSchema(privs ...string) bool {
 	}
 	has := map[string]bool{}
 	for _, line := range g.lines {
-		name, ok := utils.DBLevelGrantName(line, g.schema, g.partialRevokes)
+		name, ok := utils.DBLevelGrantName(line, g.schema)
 		if !ok {
 			continue
 		}
-		has[name] = has[name] || utils.DBLevelGrantHasAny(line, g.schema, g.partialRevokes, privs...)
+		has[name] = has[name] || utils.DBLevelGrantHasAny(line, g.schema, privs...)
 	}
 	for _, ok := range has {
 		if !ok {
@@ -312,9 +282,9 @@ func (g schemaGrants) sees(o schemaObject) (bool, string) {
 
 // schemaObjectVisibilityFromGrants returns a refusal (see ErrRefused) naming
 // the grants missing for the user to see every object of the given kinds in
-// schemaName, or nil. partialRevokes is the server's partial_revokes setting.
-func schemaObjectVisibilityFromGrants(grants []string, schemaName string, partialRevokes bool, kinds ...schemaObject) error {
-	g := schemaGrants{lines: grants, schema: schemaName, partialRevokes: partialRevokes}
+// schemaName, or nil.
+func schemaObjectVisibilityFromGrants(grants []string, schemaName string, kinds ...schemaObject) error {
+	g := schemaGrants{lines: grants, schema: schemaName}
 	var missing []string
 	for _, kind := range kinds {
 		if ok, needed := g.sees(kind); !ok {
@@ -337,36 +307,31 @@ func schemaObjectVisibilityFromGrants(grants []string, schemaName string, partia
 // roles, so a real role's grants are counted.
 //
 // Only a grant found missing is a refusal (see ErrRefused). A failure to
-// read SHOW GRANTS or partial_revokes is returned as a plain error, which may
+// read SHOW GRANTS is returned as a plain error, which may
 // be transient and is retried under the cutover locks.
 func schemaObjectVisibility(ctx context.Context, db querier, schemaName string, kinds ...schemaObject) error {
-	grants, partialRevokes, err := readGrants(ctx, db)
+	grants, err := readGrants(ctx, db)
 	if err != nil {
 		return fmt.Errorf("could not read the grants that make the schema's objects visible: %w", err)
 	}
-	return schemaObjectVisibilityFromGrants(grants, schemaName, partialRevokes, kinds...)
+	return schemaObjectVisibilityFromGrants(grants, schemaName, kinds...)
 }
 
-// readGrants returns the connection's SHOW GRANTS lines and the server's
-// partial_revokes setting. For the current user, SHOW GRANTS includes the
-// privileges of its active roles.
-func readGrants(ctx context.Context, db querier) ([]string, bool, error) {
-	partialRevokes, err := dbconn.PartialRevokesEnabled(ctx, db)
-	if err != nil {
-		return nil, false, err
-	}
+// readGrants returns the connection's SHOW GRANTS lines. For the current
+// user, SHOW GRANTS includes the privileges of its active roles.
+func readGrants(ctx context.Context, db querier) ([]string, error) {
 	rows, err := db.QueryContext(ctx, `SHOW GRANTS`)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer utils.CloseAndLog(rows)
 	var grants []string
 	for rows.Next() {
 		var grant string
 		if err := rows.Scan(&grant); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		grants = append(grants, grant)
 	}
-	return grants, partialRevokes, rows.Err()
+	return grants, rows.Err()
 }

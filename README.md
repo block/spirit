@@ -139,7 +139,7 @@ Spirit requires an account with these privileges:
 * `EVENT` on the schema or on `*.*`.
 * For stored procedures and functions, one of: `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), `SELECT` on `*.*`, or `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the schema or on `*.*`.
 
-`SELECT` and `TRIGGER` on the schema (listed above; `*.*` also works) make its views and triggers visible. Table-level grants do not count. See [docs/move.md](docs/move.md) for partial revokes, roles and `rds_superuser_role`.
+`SELECT` and `TRIGGER` on the schema (listed above; `*.*` also works) make its views and triggers visible. Table-level grants do not count. When more than one database-level grant matches a schema, each privilege must be on every matching grant. See [docs/move.md](docs/move.md) for roles and `rds_superuser_role`.
 
 For replica throttling, Spirit requires:
 

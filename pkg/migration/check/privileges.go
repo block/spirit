@@ -24,12 +24,6 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 	// validateGrants() in gh-ost/go/logic/inspect.go
 	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload, foundConnectionAdmin, foundProcess bool
 	var grantedRoles []string
-	// With partial_revokes=ON, MySQL takes database names in grants literally,
-	// so a grant on `app%`.* no longer covers app1.
-	partialRevokes, err := dbconn.PartialRevokesEnabled(ctx, r.DB)
-	if err != nil {
-		return err
-	}
 	rows, err := r.DB.QueryContext(ctx, `SHOW GRANTS`)
 	if err != nil {
 		return err
@@ -58,11 +52,10 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 		if utils.StringContainsAll(grant, `ALTER`, `CREATE`, `DELETE`, `DROP`, `INDEX`, `INSERT`, `LOCK TABLES`, `SELECT`, `TRIGGER`, `UPDATE`, ` ON *.*`) {
 			foundDBAll = true
 		}
-		// A database-level grant covers the schema if its database name matches
-		// (a pattern such as `app_%` when partial_revokes=OFF, a literal name
-		// when it is ON) and it confers either ALL PRIVILEGES or the full set
-		// spirit requires.
-		if utils.DBLevelGrantCoversSchema(grant, r.Table.SchemaName, partialRevokes) {
+		// A database-level grant covers the schema if its database-name pattern
+		// matches (including MySQL wildcards such as `strata_%`) and it confers
+		// either ALL PRIVILEGES or the full set spirit requires.
+		if utils.DBLevelGrantCoversSchema(grant, r.Table.SchemaName) {
 			foundDBAll = true
 		}
 		if strings.Contains(grant, `CONNECTION_ADMIN`) && strings.Contains(grant, ` ON *.*`) {
