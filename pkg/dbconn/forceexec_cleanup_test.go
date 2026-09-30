@@ -46,12 +46,34 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
 	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_delayed_cleanup")
 	require.NoError(t, err)
-	calls := 0
+	calls, blockerAliveOnRetry := 0, 0
+	isWaiting := waitingOn(tt.DB)
 	err = forceExec(ctx, db, config, slog.Default(),
 		"ALTER TABLE forceexec_delayed_cleanup ADD COLUMN c INT, ALGORITHM=INSTANT",
-		waitingOn(tt.DB),
-		func(context.Context, int) ([]int, error) {
+		func(ctx context.Context, connID int) (bool, error) {
+			// An attempt's kill worker stops at its kill, so every check
+			// after the first kill belongs to a retry. A retry that started
+			// before the killed blocker exited is still waiting on it at its
+			// first check, one poll interval in, however soon the blocker
+			// exits after that.
+			if calls > 0 {
+				var remaining int
+				if err := tt.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM performance_schema.threads WHERE processlist_id = ?", pid).Scan(&remaining); err != nil {
+					return false, err
+				}
+				blockerAliveOnRetry += remaining
+			}
+			return isWaiting(ctx, connID)
+		},
+		func(ctx context.Context, _ int) ([]int, error) {
 			calls++
+			if calls > 1 {
+				// Each retry runs its own kill worker, which kills when the
+				// retry waits for its lock for the kill delay. That can be an
+				// unrelated session's metadata lock on a shared server, so a
+				// later kill is not itself a failure.
+				return nil, nil
+			}
 			workers.Go(func() {
 				timer := time.NewTimer(1500 * time.Millisecond)
 				defer timer.Stop()
@@ -64,7 +86,8 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 			return []int{pid}, nil
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
-	require.Equal(t, 1, calls, "must not kill a fresh set of blockers on retry")
+	require.GreaterOrEqual(t, calls, 1)
+	require.Zero(t, blockerAliveOnRetry, "the retry must not start until the killed blocker has exited")
 	var column string
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COLUMN_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_delayed_cleanup' AND column_name = 'c'").Scan(&column))
 	require.Equal(t, "c", column)
@@ -99,6 +122,12 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				tt := testutils.NewTestTable(t, "forceexec_ancillary_failure", "CREATE TABLE forceexec_ancillary_failure (id INT PRIMARY KEY)")
 				config := NewDBConfig()
 				config.LockWaitTimeout = 1
+				// An attempt kills only once its kill worker has seen the
+				// statement waiting for the kill delay, and a slow check
+				// under load can push that past the lock wait timeout. Half
+				// the timeout, rather than the default 900ms, leaves a margin
+				// for attempts that must kill.
+				config.ForceKillAfter = 500 * time.Millisecond
 				db, err := New(testutils.DSN(), config)
 				require.NoError(t, err)
 				defer utils.CloseAndLog(db)
@@ -110,7 +139,7 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				defer func() { _ = blocker.Rollback() }()
 				var pid int
 				require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
-				// The blocked case runs every attempt at ~1.25s each.
+				// The blocked case runs up to MaxRetries attempts at ~1.75s each.
 				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()
 				_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_ancillary_failure")
@@ -118,9 +147,19 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				var logs bytes.Buffer
 				logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 				killCalls, cleanupCalls := 0, 0
-				fail := func() error {
-					// Keep the first attempt blocked beyond its one-second lock budget.
-					timer := time.NewTimer(250 * time.Millisecond)
+				var attemptErrs []error // one per statement execution
+				fail := func(calls int) error {
+					// Released: only the first call is the ancillary failure. A
+					// retry kills again if it waits for its lock for the kill
+					// delay, which an unrelated session's metadata lock on a
+					// shared server can cause; that later call must not hold up
+					// the retry or fail it.
+					if release && calls > 1 {
+						return nil
+					}
+					// Keep the first attempt blocked beyond its one-second lock
+					// budget: the kill runs at 500ms.
+					timer := time.NewTimer(750 * time.Millisecond)
 					defer timer.Stop()
 					select {
 					case <-ctx.Done():
@@ -138,22 +177,35 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 					func(context.Context, int) ([]int, error) {
 						killCalls++
 						if stage == "kill" {
-							return nil, fail()
+							return nil, fail(killCalls)
 						}
 						return []int{pid}, nil
-					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail() }, nil)
-				// Released: the retry succeeds before its own kill worker kills.
-				// Blocked: every attempt times out and re-arms the kill.
-				expectedCalls := 1
-				if !release {
-					expectedCalls = config.MaxRetries
+					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail(cleanupCalls) },
+					func(err error) { attemptErrs = append(attemptErrs, err) })
+				// How many attempts run depends on timing: an attempt is retried
+				// only if its kill worker saw it waiting for the kill delay
+				// before it timed out. What holds however many run: the first
+				// attempt's ancillary failure does not stop the retry, the
+				// retries stay within MaxRetries, and every attempt but the last
+				// ran a kill (and, for cleanup, a cleanup wait) and was retried.
+				attempts := len(attemptErrs)
+				require.GreaterOrEqual(t, attempts, 2, "the ancillary failure must not stop the retry")
+				require.LessOrEqual(t, attempts, config.MaxRetries)
+				for _, attemptErr := range attemptErrs[:attempts-1] {
+					var ddlErr *mysql.MySQLError
+					require.ErrorAs(t, attemptErr, &ddlErr)
+					require.EqualValues(t, 1205, ddlErr.Number)
 				}
-				require.Equal(t, expectedCalls, killCalls)
+				require.Equal(t, attempts-1, strings.Count(logs.String(), "retrying statement after lock wait timeout: it waited for its lock for the kill delay"))
+				// The last attempt is not retried, whether or not it killed.
+				require.GreaterOrEqual(t, killCalls, attempts-1)
+				require.LessOrEqual(t, killCalls, attempts)
 				if stage == "cleanup" {
-					// The final attempt's failure is returned without a cleanup wait.
-					require.Equal(t, min(expectedCalls, config.MaxRetries-1), cleanupCalls)
+					require.Equal(t, attempts-1, cleanupCalls)
 					require.Contains(t, logs.String(), "waiting for killed sessions")
 				}
+				// ForceExec returns the last statement's own error.
+				require.Equal(t, attemptErrs[attempts-1], err)
 				require.Contains(t, logs.String(), "retrying statement anyway")
 				require.Contains(t, logs.String(), "EOF")
 				if release {
@@ -193,6 +245,12 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 		waitingOn(tt.DB),
 		func(ctx context.Context, _ int) ([]int, error) {
 			calls++
+			if calls > 1 {
+				// The retry's own kill worker kills if the retry waits for its
+				// lock for the kill delay, which an unrelated session's
+				// metadata lock on a shared server can cause.
+				return nil, nil
+			}
 			// The kill runs at the 900ms delay. Hold the blocker beyond the
 			// first statement's one-second timeout, then let it exit voluntarily.
 			timer := time.NewTimer(250 * time.Millisecond)
@@ -205,7 +263,7 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 			return nil, blocker.Rollback()
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
-	require.Equal(t, 1, calls)
+	require.GreaterOrEqual(t, calls, 1)
 	var count int
 	require.NoError(t, tt.DB.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_no_kill' AND column_name = 'c'").Scan(&count))
