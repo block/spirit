@@ -1,12 +1,16 @@
 package dbconn
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,4 +460,50 @@ func TestExecUnderLockCancellation(t *testing.T) {
 		_ = lock.Close(t.Context())
 		require.Zero(t, db.Stats().InUse)
 	})
+}
+
+// The table lock's kill looks for the blockers again while LOCK TABLES
+// waits, and stops once it returns, so a lookup that never succeeds cannot
+// hold up NewTableLock, which waits for the kill before it returns.
+func TestTableLockStopsLookingOnceLockTablesReturns(t *testing.T) {
+	lockCtx, lockDone := context.WithCancel(t.Context())
+	defer lockDone()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	var calls atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		killTableLockBlockers(t.Context(), lockCtx, logger, func(context.Context) error {
+			calls.Add(1)
+			return fmt.Errorf("%w: %w", errBlockerLookupFailed, io.EOF)
+		})
+	}()
+	require.Eventually(t, func() bool { return calls.Load() >= 3 }, 5*time.Second, 10*time.Millisecond, "the kill must look again while LOCK TABLES waits")
+	lockDone()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the kill must stop looking once LOCK TABLES returns")
+	}
+	stopped := calls.Load()
+	time.Sleep(2 * killPollInterval)
+	require.Equal(t, stopped, calls.Load(), "no lookup may start after LOCK TABLES returns")
+	require.Equal(t, 1, strings.Count(logs.String(), "could not list the sessions blocking the table lock"))
+	require.Contains(t, logs.String(), "level=WARN msg=\"stopped looking for the sessions blocking the table lock")
+	require.NotContains(t, logs.String(), "level=ERROR")
+}
+
+// A kill that fails for another reason, such as an explicit table lock, is
+// not retried.
+func TestTableLockDoesNotRetryAKillThatListedTheBlockers(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	calls := 0
+	killTableLockBlockers(t.Context(), t.Context(), logger, func(context.Context) error {
+		calls++
+		return ErrTableLockFound
+	})
+	require.Equal(t, 1, calls)
+	require.Contains(t, logs.String(), "failed to kill locking transactions")
 }

@@ -90,7 +90,9 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 		wg.Add(1)
 		timer := time.AfterFunc(threshold, func() {
 			defer wg.Done()
-			killTableLockBlockers(ctx, lockCtx, db, tables, config, logger, pid)
+			killTableLockBlockers(ctx, lockCtx, logger, func(ctx context.Context) error {
+				return KillLockingTransactions(ctx, db, tables, config, logger, []int{pid})
+			})
 		})
 		defer func() {
 			if timer.Stop() {
@@ -126,14 +128,14 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	}, nil
 }
 
-// killTableLockBlockers kills the transactions blocking session pid's LOCK
-// TABLES. LOCK TABLES only waits until it returns, so while lockCtx lasts the
-// statement is still waiting, and a kill that could not list the blockers
-// looks again every poll interval.
-func killTableLockBlockers(ctx, lockCtx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, pid int) {
+// killTableLockBlockers runs kill, which kills the transactions blocking a
+// LOCK TABLES. LOCK TABLES only waits until it returns, so while lockCtx
+// lasts the statement is still waiting, and a kill that could not list the
+// blockers looks again every poll interval.
+func killTableLockBlockers(ctx, lockCtx context.Context, logger *slog.Logger, kill func(context.Context) error) {
 	lookupFailed := false
 	for {
-		err := KillLockingTransactions(ctx, db, tables, config, logger, []int{pid})
+		err := kill(ctx)
 		if !errors.Is(err, errBlockerLookupFailed) {
 			if err != nil {
 				logger.Error("failed to kill locking transactions", "error", err)
@@ -152,8 +154,10 @@ func killTableLockBlockers(ctx, lockCtx context.Context, db *sql.DB, tables []*t
 		}
 		// The timer can fire as LOCK TABLES returns, and select may pick
 		// either, so check that the statement still waits before looking again.
+		// LOCK TABLES may have got its lock once the blockers finished on
+		// their own, and it logs its own outcome, so this is not an error.
 		if lockCtx.Err() != nil {
-			logger.Error("failed to kill locking transactions: the table lock stopped waiting before the blocking sessions could be listed", "error", err)
+			logger.Warn("stopped looking for the sessions blocking the table lock: LOCK TABLES returned before they could be listed", "error", err)
 			return
 		}
 	}

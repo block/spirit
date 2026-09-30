@@ -382,7 +382,6 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 
 	rows, err := tx.QueryContext(ctx, query, params...)
 	if err != nil {
-		logger.Error("failed to query table locks", "error", err)
 		return nil, err
 	}
 	defer utils.CloseAndLog(rows)
@@ -422,10 +421,10 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 // information_schema.innodb_trx, and CONNECTION_ADMIN or SUPER to kill another
 // user's session. It returns an error naming each one that is missing.
 //
-// It is intended for preflight privilege checks: the probes return at most
-// one row and log nothing, so unlike GetTableLocks / GetLockingTransactions it
-// neither scans server-wide locks nor emits "found locking transaction" log
-// lines.
+// It is intended for preflight privilege checks: the table probes return at
+// most one row, and besides them it reads only the user's SHOW GRANTS and
+// logs nothing, so unlike GetTableLocks / GetLockingTransactions it neither
+// scans server-wide locks nor emits "found locking transaction" log lines.
 func CheckForceKillPrivileges(ctx context.Context, db *sql.DB) error {
 	var errs []error
 	if err := runPrivilegeProbe(ctx, db, forceKillPrivilegeProbe); err != nil {
