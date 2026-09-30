@@ -139,10 +139,7 @@ func isIntegerColumnType(typeName string) bool {
 // This is a heuristic over the value's text and is only the fallback: a default
 // whose literal form the parser recorded is emitted from that form instead (see
 // [DefaultKind] and formatColumnDefinition), which is what a text heuristic
-// cannot get right. A hex literal such as 0x1A still reaches here and is
-// misquoted as a string; MySQL never reports a hex literal back, so converging
-// one means converting it to the value the column's type stores rather than
-// recording a form for it.
+// cannot get right.
 func needsQuotes(value string) bool {
 	// Common SQL functions/expressions that don't need quotes
 	upper := strings.ToUpper(value)

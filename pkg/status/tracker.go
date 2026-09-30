@@ -92,6 +92,7 @@ type Tracker struct {
 	enteredAt time.Time               // when the current state was entered
 	open      bool                    // the current state has a running interval
 	durations map[State]time.Duration // closed time attributed per state
+	now       func() time.Time        // nil means time.Now; tests freeze it
 
 	// sink receives generic phase metrics on every transition. workflowSink is
 	// the optional typed capability on that same sink.
@@ -208,13 +209,21 @@ func (t *Tracker) RecordCopyCompleted(rows, chunks uint64) {
 	)
 }
 
+// clock returns the current time from the tracker's clock.
+func (t *Tracker) clock() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
 // Begin marks the start of a run: it resets all timing (start time, per-state
 // durations) and enters Initial, so setup work before the first phase is
 // attributed to Initial and TotalElapsed measures from here. Runners call it
 // at the top of Run, where they previously recorded a startTime field. Calling
 // Begin again starts a fresh run rather than extending the previous one.
 func (t *Tracker) Begin() {
-	now := time.Now()
+	now := t.clock()
 	t.mu.Lock()
 	t.startedAt = now
 	t.enteredAt = now
@@ -267,7 +276,7 @@ func (t *Tracker) Do(state State, fn func() error) (err error) {
 	}
 	completedNormally := false
 	defer func() {
-		d := t.exit(state)
+		d, closed := t.exit(state)
 		if !sinkEnabled {
 			return
 		}
@@ -276,7 +285,7 @@ func (t *Tracker) Do(state State, fn func() error) (err error) {
 			outcome = workflowPhaseOutcome(err)
 		}
 		t.recordWorkflowPhaseFinished(state, outcome)
-		if d > 0 {
+		if closed {
 			t.sendPhaseCompleted(state, d)
 		}
 	}()
@@ -303,7 +312,7 @@ func (t *Tracker) TotalElapsed() time.Duration {
 	if t.startedAt.IsZero() {
 		return 0
 	}
-	return time.Since(t.startedAt)
+	return t.clock().Sub(t.startedAt)
 }
 
 // Elapsed returns how long the current state has been current. It reports 0
@@ -315,7 +324,7 @@ func (t *Tracker) Elapsed() time.Duration {
 	if t.enteredAt.IsZero() {
 		return 0
 	}
-	return time.Since(t.enteredAt)
+	return t.clock().Sub(t.enteredAt)
 }
 
 // Duration returns the total time attributed to state so far, including the
@@ -328,24 +337,25 @@ func (t *Tracker) Duration(state State) time.Duration {
 	defer t.mu.Unlock()
 	d := t.durations[state]
 	if t.open && t.state.get() == state {
-		d += time.Since(t.enteredAt)
+		d += t.clock().Sub(t.enteredAt)
 	}
 	return d
 }
 
 func (t *Tracker) enter(state State) {
-	now := time.Now()
+	now := t.clock()
 	// Closing the previous state is a phase completion in its own right: a
 	// Set-based transition (Close, ErrCleanup) never runs through exit, so
 	// this is the only place its predecessor's duration is reported.
 	var completed State
 	var completedFor time.Duration
+	var hadOpen bool
 	t.mu.Lock()
 	if t.startedAt.IsZero() {
 		t.startedAt = now
 	}
 	if t.open {
-		completed, completedFor = t.state.get(), now.Sub(t.enteredAt)
+		completed, completedFor, hadOpen = t.state.get(), now.Sub(t.enteredAt), true
 		t.accrueLocked(now)
 	}
 	t.state.set(state)
@@ -357,8 +367,10 @@ func (t *Tracker) enter(state State) {
 	}
 
 	// Sending happens outside t.mu: a sink must never be able to block a
-	// state read (Get, Elapsed, the status block's goroutine).
-	if completedFor > 0 {
+	// state read (Get, Elapsed, the status block's goroutine). A phase that
+	// was entered and left within one clock tick is still a completed phase:
+	// report it with a zero duration rather than dropping it.
+	if hadOpen {
 		t.sendPhaseCompleted(completed, completedFor)
 	}
 	t.send(metrics.MetricValue{
@@ -379,24 +391,25 @@ func (t *Tracker) sendPhaseCompleted(state State, d time.Duration) {
 // exit closes the bracket opened by Do for state. If a nested Do or a Set has
 // already transitioned away, the interval was closed at that transition and
 // exit is a no-op — time between an inner bracket's end and the outer's end is
-// deliberately unattributed rather than double counted.
-func (t *Tracker) exit(state State) time.Duration {
-	now := time.Now()
+// deliberately unattributed rather than double counted. closed reports whether
+// this call closed the interval; d may be zero when it did.
+func (t *Tracker) exit(state State) (d time.Duration, closed bool) {
+	now := t.clock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if !t.open || t.state.get() != state {
-		return 0
+		return 0, false
 	}
-	d := now.Sub(t.enteredAt)
+	d = now.Sub(t.enteredAt)
 	t.accrueLocked(now)
-	return d
+	return d, true
 }
 
 // restartInterval excludes synchronous sink delivery from phase timing while
 // leaving the new state published before the sink is invoked. A concurrent
 // fatal transition wins and prevents this method from reviving the old state.
 func (t *Tracker) restartInterval(state State) {
-	now := time.Now()
+	now := t.clock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.open && t.state.get() == state {

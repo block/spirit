@@ -40,6 +40,14 @@ func TestHasTriggers(t *testing.T) {
 	err = hasTriggersCheck(t.Context(), r, slog.Default())
 	require.ErrorContains(t, err, "tables with triggers associated are not supported") // already has a trigger associated.
 
+	// Re-run before cutover, the refusal says the trigger is new.
+	cutover := r
+	cutover.scope = ScopeCutover
+	err = hasTriggersCheck(t.Context(), cutover, slog.Default())
+	require.ErrorContains(t, err, "a trigger was created during the migration")
+	require.Contains(t, ChecksInScope(ScopeCutover), "hastriggers")
+	require.Contains(t, ChecksInScope(ScopeCutoverLocked), "hastriggers")
+
 	_, err = db.ExecContext(t.Context(), `drop trigger if exists ins_sum`)
 	require.NoError(t, err)
 	err = hasTriggersCheck(t.Context(), r, slog.Default())

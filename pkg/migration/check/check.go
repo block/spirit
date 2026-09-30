@@ -57,8 +57,10 @@ const (
 	// whenever the native attempt does not take the statement — Spirit skips
 	// the attempt altogether for a multi-table change, and an older server
 	// rejects shapes a newer one completes instantly. Checks that need a live
-	// connection (existing foreign keys, triggers, privileges, ...) likewise
-	// run only at preflight.
+	// connection (existing foreign keys, triggers, privileges, ...) are not in
+	// this scope either: they run at preflight, and the foreign key and
+	// trigger checks run again before and during the cutover, to catch one
+	// created while the migration runs.
 	//
 	// A caller that reports these refusals somewhere other than its own logs
 	// judges the text by reading the checks that produce it, and a check added
@@ -66,6 +68,15 @@ const (
 	// the membership with ChecksInScope to keep that judgement attached to the
 	// checks it was made about.
 	ScopeStatement ScopeFlag = 1 << 6
+	// ScopeCutoverLocked runs while the cutover holds its table lock, after
+	// the final flush and immediately before the RENAME. LOCK TABLES ... WRITE
+	// keeps out any DDL that needs a metadata lock on the table, so a check
+	// here sees the state the RENAME acts on. The runner stops acting on
+	// schema-change notifications once the cutover starts, so this is the
+	// only check of anything created while the cutover waits for its lock.
+	// A failure here is not retried. Keep these checks to fast reads: they
+	// run while the application's writes to the table are blocked.
+	ScopeCutoverLocked ScopeFlag = 1 << 7
 )
 
 type Resources struct {

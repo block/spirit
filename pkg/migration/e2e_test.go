@@ -2,6 +2,7 @@ package migration
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -540,6 +542,129 @@ func TestBitPrimaryKeyRefusedAfterKeyChange(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 		"SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bit_pk_swap' AND CONSTRAINT_NAME = 'PRIMARY'").Scan(&key))
 	require.Equal(t, "id", key, "the refused ALTER must not change the table")
+}
+
+// TestUnsupportedTableNameRefused refuses a migration of a table whose name
+// contains a '.' or a backtick, and one that renames a table to such a name.
+// The replication client keys tables as schema + "." + table, so a '.' makes
+// two tables indistinguishable; a backtick has to be escaped in every
+// statement Spirit generates. The ALTERs are INSTANT on every supported
+// server, so the refusal has to come from the statement-scope checks that the
+// runner runs before it attempts native DDL. Nothing may be created or
+// changed.
+func TestUnsupportedTableNameRefused(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		table, want string
+	}{
+		{table: "dot.name", want: `table name "dot.name" contains a '.', which Spirit does not support`},
+		{table: "back`tick", want: "table name \"back`tick\" contains a backtick, which Spirit does not support"},
+	} {
+		tt := testutils.NewTestTable(t, tc.table, fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)",
+			sqlescape.EscapeIdentifier(tc.table)))
+		testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (v) VALUES (1), (2), (3)", sqlescape.EscapeIdentifier(tc.table)))
+
+		m := NewTestRunner(t, tc.table, "ADD COLUMN c INT")
+		err := m.Run(t.Context())
+		require.NoError(t, m.Close())
+		require.ErrorContains(t, err, tc.want)
+		require.False(t, m.usedInstantDDL)
+		requireNoSpiritArtifacts(t, tt.DB, tc.table)
+		var n int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'c'", tc.table).Scan(&n))
+		require.Zero(t, n, "the refused ALTER must not change the table")
+	}
+
+	// A rename to an unsupported name is refused too, even though the
+	// source table's name is fine.
+	tt := testutils.NewTestTable(t, "rename_src", "CREATE TABLE rename_src (id INT NOT NULL PRIMARY KEY)")
+	// The test does not own `rename.dst`. A build that accepts the rename
+	// would leave it behind in the shared schema and fail every later run.
+	dropRenameDst := func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS `rename.dst`") }
+	dropRenameDst()
+	t.Cleanup(dropRenameDst)
+	m := NewTestRunner(t, "rename_src", "RENAME TO `rename.dst`")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, `new table name "rename.dst" contains a '.', which Spirit does not support`)
+	var names []string
+	rows, err := tt.DB.QueryContext(t.Context(),
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('rename_src', 'rename.dst')")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		names = append(names, name)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []string{"rename_src"}, names, "the refused rename must leave the table in place")
+}
+
+// TestInstantAlterMultibyteTableName: MySQL limits a table name to 64
+// characters, not bytes, and the byte-length check runs only at preflight, after
+// native DDL has been tried. The statement-scope refusal of '.' and backticks
+// must not stop an INSTANT ALTER on a 24-character, 68-byte name.
+func TestInstantAlterMultibyteTableName(t *testing.T) {
+	t.Parallel()
+	name := "aa" + strings.Repeat("表", 22)
+	testutils.NewTestTable(t, name, "CREATE TABLE `"+name+"` (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+	m := NewTestRunner(t, name, "ADD COLUMN c INT")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.NoError(t, err)
+	require.True(t, m.usedInstantDDL)
+}
+
+// TestUnsupportedSchemaNameRefused refuses a migration in a schema whose name
+// contains a '.': the table name is fine, but schema + "." + table collides
+// just the same.
+func TestUnsupportedSchemaNameRefused(t *testing.T) {
+	t.Parallel()
+	const schema = "spirit.dotschema"
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS `spirit.dotschema`")
+	testutils.RunSQL(t, "CREATE DATABASE `spirit.dotschema`")
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS `spirit.dotschema`") })
+	testutils.RunSQL(t, "CREATE TABLE `spirit.dotschema`.t1 (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+
+	m := NewTestRunner(t, "t1", "ADD COLUMN c INT", WithDBName(schema))
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.ErrorContains(t, err, `schema name "spirit.dotschema" contains a '.', which Spirit does not support`)
+	require.False(t, m.usedInstantDDL)
+
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var tables []string
+	rows, err := db.QueryContext(t.Context(),
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME", schema)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []string{"t1"}, tables, "nothing may be created in the schema")
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 't1' AND COLUMN_NAME = 'c'", schema).Scan(&n))
+	require.Zero(t, n, "the refused ALTER must not change the table")
+}
+
+// requireNoSpiritArtifacts fails the test if Spirit created its new or
+// checkpoint table for tableName in the current database.
+func requireNoSpiritArtifacts(t *testing.T, db *sql.DB, tableName string) {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?, ?)",
+		utils.NewTableName(tableName), utils.CheckpointTableName(tableName)).Scan(&n))
+	require.Zero(t, n, "the table must be refused before the new and checkpoint tables are created")
 }
 
 // TestReservedWordPKMigration is a regression test for issue #828.

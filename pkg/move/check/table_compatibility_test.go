@@ -3,8 +3,11 @@ package check
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"testing"
 
+	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
@@ -99,4 +102,111 @@ func TestTableCompatibilityCheckRegisteredForResume(t *testing.T) {
 	defer lock.Unlock()
 	require.Equal(t, ScopePostSetup, checks["table_compatibility"].scope)
 	require.Equal(t, ScopeResume, checks["table_compatibility_resume"].scope)
+}
+
+// TestTableCompatibilityCheckUnsupportedNames checks that a '.' or a backtick
+// in a moved table's name, its schema, or a source or target schema is
+// refused, and that ordinary names pass. The check reads only the names, so
+// the table metadata is built without a database.
+func TestTableCompatibilityCheckUnsupportedNames(t *testing.T) {
+	keyed := func(schema, name string) *table.TableInfo {
+		return &table.TableInfo{SchemaName: schema, TableName: name, KeyColumns: []string{"id"}}
+	}
+	withDB := func(name string) *mysql.Config {
+		cfg := mysql.NewConfig()
+		cfg.DBName = name
+		return cfg
+	}
+	tests := []struct {
+		name    string
+		r       Resources
+		wantErr string
+	}{
+		{
+			name: "plain names pass",
+			r: Resources{
+				Sources:      []SourceResource{{Config: withDB("src1")}},
+				Targets:      []applier.Target{{Config: withDB("dst1")}},
+				SourceTables: []*table.TableInfo{keyed("src1", "t1"), keyed("src1", "t2")},
+			},
+		},
+		{
+			name:    "dot in table name",
+			r:       Resources{SourceTables: []*table.TableInfo{keyed("src1", "t1"), keyed("src1", "t.2")}},
+			wantErr: `table 't.2' cannot be moved: table name "t.2" contains a '.', which Spirit does not support`,
+		},
+		{
+			name:    "backtick in table name",
+			r:       Resources{SourceTables: []*table.TableInfo{keyed("src1", "t`2")}},
+			wantErr: "table 't`2' cannot be moved: table name \"t`2\" contains a backtick, which Spirit does not support",
+		},
+		{
+			name:    "dot in table schema name",
+			r:       Resources{SourceTables: []*table.TableInfo{keyed("src.1", "t1")}},
+			wantErr: `table 't1' cannot be moved: schema name "src.1" contains a '.', which Spirit does not support`,
+		},
+		{
+			name:    "backtick in table schema name",
+			r:       Resources{SourceTables: []*table.TableInfo{keyed("src`1", "t1")}},
+			wantErr: "table 't1' cannot be moved: schema name \"src`1\" contains a backtick",
+		},
+		{
+			name: "dot in a second source schema",
+			r: Resources{
+				Sources:      []SourceResource{{Config: withDB("src1")}, {Config: withDB("src.2")}},
+				SourceTables: []*table.TableInfo{keyed("src1", "t1")},
+			},
+			wantErr: `cannot move: source schema name "src.2" contains a '.', which Spirit does not support`,
+		},
+		{
+			name: "backtick in source schema",
+			r: Resources{
+				Sources: []SourceResource{{Config: withDB("src`1")}},
+			},
+			wantErr: "cannot move: source schema name \"src`1\" contains a backtick",
+		},
+		{
+			name: "dot in target schema",
+			r: Resources{
+				Targets:      []applier.Target{{Config: withDB("dst.1")}},
+				SourceTables: []*table.TableInfo{keyed("src1", "t1")},
+			},
+			wantErr: `cannot move: target schema name "dst.1" contains a '.', which Spirit does not support`,
+		},
+		{
+			name: "backtick in target schema",
+			r: Resources{
+				Targets: []applier.Target{{Config: withDB("dst1")}, {Config: withDB("dst`2")}},
+			},
+			wantErr: "cannot move: target schema name \"dst`2\" contains a backtick",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Both registrations share the callback; run through RunChecks at
+			// each scope so the resume path is covered as well.
+			for _, scope := range []ScopeFlag{ScopePostSetup, ScopeResume} {
+				err := RunChecks(t.Context(), tt.r, slog.Default(), scope, otherChecks("table_compatibility", "table_compatibility_resume")...)
+				if tt.wantErr == "" {
+					require.NoError(t, err)
+					continue
+				}
+				require.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// otherChecks returns the names of every registered check except keep, for
+// excluding them from RunChecks.
+func otherChecks(keep ...string) []string {
+	lock.Lock()
+	defer lock.Unlock()
+	var names []string
+	for name := range checks {
+		if !slices.Contains(keep, name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }

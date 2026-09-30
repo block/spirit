@@ -1,5 +1,10 @@
 package utils
 
+import (
+	"fmt"
+	"strings"
+)
+
 const (
 	// NameFormatTimestamp is the time.Format layout used in the timestamped
 	// _<table>_old_<timestamp> name when SkipDropAfterCutover is set.
@@ -54,4 +59,32 @@ func OldTableName(tableName string) string {
 // unique name across multiple migrations.
 func OldTableNameWithTimestamp(tableName, timestamp string) string {
 	return AuxTableName(tableName, suffixOld+"_"+timestamp)
+}
+
+// UnsupportedIdentifierError returns an error when name, a schema or table
+// name, contains a character Spirit refuses in those identifiers, and nil
+// otherwise. kind describes the identifier in the error message, e.g.
+// "table name" or "schema name".
+//
+// Two characters are refused:
+//
+//   - '.': the replication client keys each table's subscription by joining
+//     its schema and table name with a '.', so `a`.`b.c` and `a.b`.`c` map to
+//     the same key and a row change on one table can be applied to the other.
+//   - '`': every statement Spirit builds that names the table has to escape
+//     the backtick, and a single missed escape produces broken or wrong SQL.
+//     Refusing the name removes that class of bug rather than chasing each
+//     statement.
+func UnsupportedIdentifierError(kind, name string) error {
+	if strings.Contains(name, ".") {
+		return fmt.Errorf("%s %q contains a '.', which Spirit does not support: "+
+			"Spirit identifies tables by joining the schema and table name with a '.', "+
+			"so this name can collide with a different table's and changes to one could be applied to the other", kind, name)
+	}
+	if strings.Contains(name, "`") {
+		return fmt.Errorf("%s %q contains a backtick, which Spirit does not support: "+
+			"every statement Spirit generates that names the table would need to escape it, "+
+			"and a missed escape produces broken or incorrect SQL", kind, name)
+	}
+	return nil
 }

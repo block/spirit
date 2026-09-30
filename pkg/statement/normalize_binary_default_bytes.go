@@ -58,9 +58,9 @@ const maxBinaryWidth = 255
 //
 // Left alone:
 //
-//   - binary(0), for which the parser records no length. Its only non-NULL
-//     default is the empty string, which has nothing to pad. A column written
-//     without a width is binary(1), and is padded to that.
+//   - binary(0). Its only non-NULL default is the empty string, which has
+//     nothing to pad. A column written without a width is binary(1), and is
+//     padded to that.
 //   - binary wider than 255, which MySQL rejects. Padding it would allocate
 //     the declared width for DDL that can never be applied.
 //   - a default longer than the width, which MySQL rejects.
@@ -122,6 +122,19 @@ func binaryDefaultBytes(c *Column) (string, bool) {
 		// Only an integer, which MySQL stores as its decimal digits. One too
 		// large for 64 bits is still an integer; the parser types it decimal.
 		return utils.CanonicalInteger(*c.Default)
+	case DefaultKindHexLiteral, DefaultKindBitLiteral:
+		return binaryLiteralBytes(c)
+	case DefaultKindUnknown:
+		// NULL, a function default, or an expression: nothing MySQL pads.
+	}
+	return "", false
+}
+
+// binaryLiteralBytes returns the bytes of a column's hex or bit literal
+// DEFAULT, as MySQL reads them before converting them to the column's type, or
+// false for any other default.
+func binaryLiteralBytes(c *Column) (string, bool) {
+	switch c.DefaultKind {
 	case DefaultKindHexLiteral:
 		// The parser restores a hex literal as x'...' with every byte kept.
 		text := *c.Default
@@ -138,8 +151,7 @@ func binaryDefaultBytes(c *Column) (string, bool) {
 		// b'1100001'), which drops the leading zero bytes MySQL stores, so
 		// the bytes are read off the AST instead.
 		return bitLiteralDefault(c)
-	case DefaultKindUnknown:
-		// NULL, a function default, or an expression: nothing MySQL pads.
+	case DefaultKindUnknown, DefaultKindNumber, DefaultKindKeywordBool, DefaultKindString:
 	}
 	return "", false
 }

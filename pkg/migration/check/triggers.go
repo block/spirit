@@ -9,7 +9,12 @@ import (
 )
 
 func init() {
-	registerCheck("hastriggers", hasTriggersCheck, ScopePreflight)
+	// Re-run before cutover and again under the cutover lock: the binlog
+	// clients cancel on a CREATE TRIGGER they can parse, but skip statements
+	// they cannot, and are not acted on once the cutover starts. A trigger on
+	// the table is never created on the new table, so the cutover would drop
+	// it.
+	registerCheck("hastriggers", hasTriggersCheck, ScopePreflight|ScopeCutover|ScopeCutoverLocked)
 }
 
 // hasTriggersCheck check if table has triggers associated with it, which is not supported
@@ -22,6 +27,9 @@ func hasTriggersCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 	}
 	defer utils.CloseAndLog(rows)
 	if rows.Next() {
+		if r.scope&(ScopeCutover|ScopeCutoverLocked) != 0 {
+			return errors.New("a trigger was created during the migration: tables with triggers associated are not supported")
+		}
 		return errors.New("tables with triggers associated are not supported")
 	}
 	if rows.Err() != nil {

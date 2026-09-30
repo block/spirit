@@ -94,17 +94,33 @@ func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err
 				schema, tableName := getTableIdentity(defaultSchema, table)
 				info.tables = append(info.tables, schemaTable{schema, tableName})
 			}
+		case *ast.CreateTriggerStmt:
+			// A trigger on the table being copied is never created on the
+			// new table, so it would be lost at cutover. The trigger and its
+			// table share a schema, which may be named on either identifier.
+			triggerSchema := defaultSchema
+			if t.Name != nil && t.Name.Schema.String() != "" {
+				triggerSchema = t.Name.Schema.String()
+			}
+			schema, table := getTableIdentity(triggerSchema, t.Table)
+			info.tables = append(info.tables, schemaTable{schema, table})
 		case *ast.AlterTableStmt, *ast.CreateTableStmt, *ast.TruncateTableStmt,
 			*ast.CreateIndexStmt, *ast.DropIndexStmt:
 			var tableNode *ast.TableName
+			var refs []*ast.ReferenceDef
 			switch n := t.(type) {
 			case *ast.AlterTableStmt:
 				tableNode = n.Table
+				for _, spec := range n.Specs {
+					refs = append(refs, foreignKeyReferences([]*ast.Constraint{spec.Constraint}, nil)...)
+					refs = append(refs, foreignKeyReferences(spec.NewConstraints, spec.NewColumns)...)
+				}
 			case *ast.CreateTableStmt:
 				tableNode = n.Table
 				if n.StartTransaction {
 					info.opensTransaction = true
 				}
+				refs = foreignKeyReferences(n.Constraints, n.Cols)
 			case *ast.TruncateTableStmt:
 				tableNode = n.Table
 			case *ast.CreateIndexStmt:
@@ -114,9 +130,48 @@ func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err
 			}
 			schema, table := getTableIdentity(defaultSchema, tableNode)
 			info.tables = append(info.tables, schemaTable{schema, table})
+			// An unqualified REFERENCES names a table in the child's schema.
+			info.tables = append(info.tables, foreignKeyParents(schema, refs)...)
 		}
 	}
 	return info, nil
+}
+
+// foreignKeyReferences returns the REFERENCES clauses of the foreign keys
+// among constraints, and of any column declared with an inline REFERENCES.
+// MySQL 8.0 parses and ignores an inline REFERENCES, but MySQL 9.0 creates a
+// foreign key for it.
+func foreignKeyReferences(constraints []*ast.Constraint, columns []*ast.ColumnDef) []*ast.ReferenceDef {
+	var refs []*ast.ReferenceDef
+	for _, c := range constraints {
+		if c != nil && c.Tp == ast.ConstraintForeignKey && c.Refer != nil {
+			refs = append(refs, c.Refer)
+		}
+	}
+	for _, col := range columns {
+		for _, opt := range col.Options {
+			if opt.Tp == ast.ColumnOptionReference && opt.Refer != nil {
+				refs = append(refs, opt.Refer)
+			}
+		}
+	}
+	return refs
+}
+
+// foreignKeyParents returns the tables named by refs. A foreign key added to
+// another table that references a table being copied would follow the
+// cutover RENAME to the old table, so the DDL concerns the referenced table as
+// much as the one it is run on.
+func foreignKeyParents(defaultSchema string, refs []*ast.ReferenceDef) []schemaTable {
+	var tables []schemaTable
+	for _, ref := range refs {
+		if ref.Table == nil {
+			continue
+		}
+		schema, table := getTableIdentity(defaultSchema, ref.Table)
+		tables = append(tables, schemaTable{schema, table})
+	}
+	return tables
 }
 
 // extractTablesFromDDLStmts extracts table names from DDL statements.
