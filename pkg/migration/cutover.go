@@ -12,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -38,8 +39,9 @@ type CutOver struct {
 	dbConfig *dbconn.DBConfig
 	logger   *slog.Logger
 	// checksUnderLock, when set, runs with the table lock held, after the
-	// final flush and before the RENAME. An error from it fails the cutover
-	// without a retry (errCutoverRefused).
+	// final flush and before the RENAME. A refusal from it (check.ErrRefused)
+	// fails the cutover without a retry (errCutoverRefused). Any other error
+	// is retried like a failed attempt.
 	checksUnderLock func(context.Context) error
 	// testInjectRenameError is a test-only seam: when non-nil it is returned
 	// in place of a successful rename's nil result, simulating a connection
@@ -381,7 +383,13 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	// so these checks see exactly what the RENAME will act on.
 	if c.checksUnderLock != nil {
 		if err := c.checksUnderLock(ctx); err != nil {
-			return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			// Only a refusal is final. Any other error (a failed query, a
+			// dropped connection) may be transient, so it takes the normal
+			// retry path.
+			if errors.Is(err, check.ErrRefused) {
+				return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			}
+			return fmt.Errorf("checks under the table lock: %w", err)
 		}
 	}
 	if err := c.carryAutoIncrements(ctx, tableLock); err != nil {

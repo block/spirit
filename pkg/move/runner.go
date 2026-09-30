@@ -356,7 +356,10 @@ func (r *Runner) Close() error {
 // getTables connects to a source DB and fetches the list of tables.
 // If SourceTables is specified in the Move config, only those tables will be returned.
 func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.TableInfo, error) {
-	rows, err := src.db.QueryContext(ctx, "SHOW TABLES")
+	// Base tables only: a view has no rows of its own to copy. Views are
+	// refused by the source_schema_objects check, which names them; listing
+	// one here would fail first, on its missing primary key.
+	rows, err := src.db.QueryContext(ctx, "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
 	if err != nil {
 		return nil, err
 	}
@@ -370,10 +373,10 @@ func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.Table
 		}
 	}
 
-	var tableName string
+	var tableName, tableType string
 	tables := make([]*table.TableInfo, 0)
 	for rows.Next() {
-		if err := rows.Scan(&tableName); err != nil {
+		if err := rows.Scan(&tableName, &tableType); err != nil {
 			return nil, err
 		}
 		if strings.HasPrefix(tableName, "_spirit_") {
@@ -1122,7 +1125,9 @@ func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record)
 	}
 	r.sourceTables = r.sources[0].tables
 	// This path runs no check scope, and the reverse feeds subscribe these
-	// tables, so refuse unsupported names before starting them.
+	// tables, so refuse unsupported names before starting them. (The source
+	// schema objects check runs when the window is entered; see
+	// reverseWindow.run.)
 	if err := check.UnsupportedNameError(r.checkResources()); err != nil {
 		return fmt.Errorf("resume reverse window: %w", err)
 	}
@@ -1132,12 +1137,13 @@ func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record)
 
 // reverseWindowLogicalTables recovers the logical names of the moved tables when
 // resuming a reverse window: the forward cutover renamed each to <name>_old on
-// the source, so it lists those and strips the suffix. When an explicit table
+// the source, so it lists those (base tables only: a view named <name>_old is
+// not a retired table) and strips the suffix. When an explicit table
 // list was supplied it is used to filter (ignoring unrelated _old tables).
 func (r *Runner) reverseWindowLogicalTables(ctx context.Context) ([]string, error) {
 	src := &r.sources[0]
 	rows, err := src.db.QueryContext(ctx,
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name LIKE '%\\_old'",
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' AND table_name LIKE '%\\_old'",
 		src.config.DBName)
 	if err != nil {
 		return nil, fmt.Errorf("resume reverse window: list retired source tables: %w", err)
@@ -1616,6 +1622,12 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		if r.cutoverResultFunc != nil || r.cutoverFunc != nil {
 			cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
 		}
+		// The change feeds do not see every schema change (for example DDL run
+		// with sql_log_bin=0), so check the source schemas again under the
+		// cutover's table locks, before traffic is switched.
+		cutover.SetChecksUnderLock(func(ctx context.Context) error {
+			return r.runChecks(ctx, check.ScopePreCutover)
+		})
 		cutover.SetPreSwitch(func(ctx context.Context) error {
 			// Carry the counters over before the reverse-feed positions are
 			// captured, so a reverse feed never reads spirit's own ALTER.

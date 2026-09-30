@@ -1,9 +1,13 @@
 package check
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/block/mysql"
@@ -158,11 +162,19 @@ func TestMovePrivilegesMultipleSources(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestMovePrivilegesWithRDSSuperuserRole verifies that rds_superuser_role
-// is tolerated when activate_all_roles_on_login=ON. Same rationale as the
-// migration-side counterpart: only the acceptance path is covered, and
-// the test skips rather than flipping `activate_all_roles_on_login` via
-// `SET GLOBAL` (which races with concurrent test binaries; see #818).
+// TestMovePrivilegesWithRDSSuperuserRole checks how a granted
+// rds_superuser_role is treated, against a real server.
+//
+// Visibility (runs everywhere): the role is made active with SET DEFAULT ROLE,
+// which does not depend on activate_all_roles_on_login. SHOW GRANTS then
+// lists the role's privileges, so an empty role is refused and a role that
+// carries the visibility grants is accepted: the role counts for its
+// privileges, not its name.
+//
+// The CONNECTION_ADMIN exemption (skipped unless activate_all_roles_on_login
+// is ON): the role's name stands in for CONNECTION_ADMIN only with that
+// setting on. The test does not SET GLOBAL it, because that races with
+// concurrent test binaries (see #818).
 func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
@@ -171,63 +183,544 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	// Skip if the server doesn't have activate_all_roles_on_login=ON.
-	var activate string
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@global.activate_all_roles_on_login").Scan(&activate))
-	if activate != "1" {
-		t.Skip("requires activate_all_roles_on_login=ON; SET GLOBAL would race with concurrent test binaries, see #818")
-	}
-
-	// Clean up any previous test artifacts
-	_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS testmoverdsroleuser")
+	const user = "testmoverdsroleuser"
+	_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS "+user)
 	_, _ = db.ExecContext(t.Context(), "DROP ROLE IF EXISTS rds_superuser_role")
-
-	// Create an opaque role that simulates rds_superuser_role on RDS.
+	// An empty role, standing in for rds_superuser_role on RDS.
 	_, err = db.ExecContext(t.Context(), "CREATE ROLE rds_superuser_role")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_, _ = db.ExecContext(t.Context(), "DROP ROLE IF EXISTS rds_superuser_role")
 	})
-
-	_, err = db.ExecContext(t.Context(), "CREATE USER testmoverdsroleuser")
+	_, err = db.ExecContext(t.Context(), "CREATE USER "+user)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS testmoverdsroleuser")
+		_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS "+user)
 	})
-
-	_, err = db.ExecContext(t.Context(), "GRANT ALL ON test.* TO testmoverdsroleuser")
-	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), "GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testmoverdsroleuser")
-	require.NoError(t, err)
-	// Grant performance_schema and PROCESS directly so the probe queries
-	// succeed. On real RDS, rds_superuser_role grants these, but our test
-	// role is opaque (no actual privileges) so we simulate by granting
-	// them directly.
-	_, err = db.ExecContext(t.Context(), "GRANT SELECT ON `performance_schema`.* TO testmoverdsroleuser")
-	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), "GRANT PROCESS ON *.* TO testmoverdsroleuser")
-	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), "GRANT rds_superuser_role TO testmoverdsroleuser")
-	require.NoError(t, err)
-
-	config, err = mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-	config.User = "testmoverdsroleuser"
-	config.Passwd = ""
-
-	sourceConfig, err := mysql.ParseDSN(fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
-	require.NoError(t, err)
-
-	lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(lowPrivDB)
-
-	r := Resources{
-		Sources: []SourceResource{{DB: lowPrivDB, Config: sourceConfig}},
+	for _, stmt := range []string{
+		// An explicit schema-level list, not ALL: it has no EVENT and nothing
+		// that shows routines.
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON test.* TO " + user,
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO " + user,
+		// The force-kill privileges, granted directly so that the base check
+		// passes whatever activate_all_roles_on_login is.
+		"GRANT SELECT ON `performance_schema`.* TO " + user,
+		"GRANT CONNECTION_ADMIN, PROCESS ON *.* TO " + user,
+		"GRANT rds_superuser_role TO " + user,
+		"SET DEFAULT ROLE rds_superuser_role TO " + user,
+	} {
+		_, err = db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
 	}
 
-	// With rds_superuser_role granted and activate_all_roles_on_login=ON,
-	// privilegesCheck should pass.
+	sourceConfig, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	sourceConfig.User = user
+	sourceConfig.Passwd = ""
+	open := func() *sql.DB {
+		pool, err := sql.Open("block-mysql", sourceConfig.FormatDSN())
+		require.NoError(t, err)
+		t.Cleanup(func() { utils.CloseAndLog(pool) })
+		return pool
+	}
+
+	// The role is empty, so SHOW GRANTS lists nothing that shows events or
+	// routines, and both checks refuse.
+	lowPrivDB := open()
+	r := Resources{Sources: []SourceResource{{DB: lowPrivDB, Config: sourceConfig}}}
+	grants, err := readGrants(t.Context(), lowPrivDB)
+	require.NoError(t, err)
+	require.True(t, rdsSuperuserRoleGranted(grants), "SHOW GRANTS: %q", grants)
+	hasGlobalEvent := func(grants []string) bool {
+		return slices.ContainsFunc(grants, func(g string) bool { return utils.GlobalGrantHasAny(g, "EVENT") })
+	}
+	require.False(t, hasGlobalEvent(grants), "SHOW GRANTS: %q", grants)
+	const needed = "Needed: EVENT on `test`.* (to see its events); SHOW_ROUTINE on *.*"
 	err = privilegesCheck(t.Context(), r, slog.Default())
-	require.NoError(t, err, "should pass when activate_all_roles_on_login=ON and rds_superuser_role is granted")
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, needed)
+	err = schemaObjectVisibility(t.Context(), lowPrivDB, sourceConfig.DBName, allSchemaObjects...)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, needed)
+
+	// A role that carries the grants, like the real one: SHOW GRANTS merges
+	// the default role's privileges into the user's lines, so both checks
+	// pass. A new pool, so no
+	// connection predates the grant.
+	_, err = db.ExecContext(t.Context(), "GRANT SELECT, TRIGGER, EVENT ON *.* TO rds_superuser_role")
+	require.NoError(t, err)
+	withGrants := open()
+	grants, err = readGrants(t.Context(), withGrants)
+	require.NoError(t, err)
+	require.True(t, hasGlobalEvent(grants), "SHOW GRANTS: %q", grants)
+	r.Sources[0].DB = withGrants
+	require.NoError(t, privilegesCheck(t.Context(), r, slog.Default()))
+	require.NoError(t, schemaObjectVisibility(t.Context(), withGrants, sourceConfig.DBName, allSchemaObjects...))
+
+	t.Run("role name stands in for CONNECTION_ADMIN", func(t *testing.T) {
+		var activate string
+		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@global.activate_all_roles_on_login").Scan(&activate))
+		if activate != "1" {
+			t.Skip("requires activate_all_roles_on_login=ON; SET GLOBAL would race with concurrent test binaries, see #818")
+		}
+		_, err := db.ExecContext(t.Context(), "REVOKE CONNECTION_ADMIN ON *.* FROM "+user)
+		require.NoError(t, err)
+		noConnectionAdmin := open()
+		r := Resources{Sources: []SourceResource{{DB: noConnectionAdmin, Config: sourceConfig}}}
+		require.NoError(t, privilegesCheck(t.Context(), r, slog.Default()))
+	})
+}
+
+// oldMinimalMoveGrants are the grants that passed the move privileges check
+// before it required visibility of events and stored routines: the documented
+// schema-level list plus the replication, RELOAD and force-kill grants.
+func oldMinimalMoveGrants(schema string) []string {
+	return []string{
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `" + schema + "`.* TO %s",
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD, CONNECTION_ADMIN, PROCESS ON *.* TO %s",
+		"GRANT SELECT ON `performance_schema`.* TO %s",
+	}
+}
+
+// createMoveTestUser creates user as root with the given grants (each a
+// format string with one %s for the user) and returns a connection to schema
+// as that user. The user is dropped when the test ends.
+func createMoveTestUser(t *testing.T, user, schema string, grants ...string) (*sql.DB, *mysql.Config) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.User = "root" // needs grant privilege
+	cfg.DBName = ""
+	rootDB, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rootDB)
+	_, err = rootDB.ExecContext(t.Context(), "DROP USER IF EXISTS "+user)
+	require.NoError(t, err)
+	_, err = rootDB.ExecContext(t.Context(), "CREATE USER "+user)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cfg, err := mysql.ParseDSN(testutils.DSN())
+		if err != nil {
+			return
+		}
+		cfg.User, cfg.DBName = "root", ""
+		db, err := sql.Open("block-mysql", cfg.FormatDSN())
+		if err != nil {
+			return
+		}
+		defer utils.CloseAndLog(db)
+		_, _ = db.ExecContext(context.Background(), "DROP USER IF EXISTS "+user)
+	})
+	for _, g := range grants {
+		_, err = rootDB.ExecContext(t.Context(), fmt.Sprintf(g, user))
+		require.NoError(t, err)
+	}
+	userCfg, err := mysql.ParseDSN(fmt.Sprintf("%s:@tcp(%s)/%s", user, cfg.Addr, schema))
+	require.NoError(t, err)
+	db, err := sql.Open("block-mysql", userCfg.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	return db, userCfg
+}
+
+// TestMovePrivilegesSchemaObjectVisibility checks that the privileges check
+// requires the grants that make a schema's events and stored routines visible
+// in information_schema, and shows why: with the old minimal grants the
+// source_schema_objects check sees the trigger and the view (TRIGGER and
+// SELECT cover them) but not the procedure, the function or the event.
+func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
+	schema, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+	for _, stmt := range []string{
+		"CREATE TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.v = 1",
+		"CREATE VIEW v1 AS SELECT id FROM t1",
+		"CREATE PROCEDURE p1() SELECT 1",
+		"CREATE FUNCTION f1() RETURNS INT DETERMINISTIC RETURN 1",
+		"CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1",
+	} {
+		testutils.RunSQLInDatabaseAsRoot(t, schema, stmt)
+	}
+	objectsPrefix := "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 (" + schema + "): "
+	allObjects := objectsPrefix + "trigger 't1_bi' on table 't1', view 'v1', procedure 'p1', function 'f1', event 'e1'"
+	eventMissing := "EVENT on `" + schema + "`.*"
+	routineMissing := "SHOW_ROUTINE on *.*"
+
+	t.Run("old minimal grants", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_old", schema, oldMinimalMoveGrants(schema)...)
+		src := []SourceResource{{DB: db, Config: cfg}}
+		err := privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default())
+		require.ErrorContains(t, err, "insufficient privileges to run a move")
+		require.ErrorContains(t, err, eventMissing)
+		require.ErrorContains(t, err, routineMissing)
+		// The gap the requirement closes: the user sees the trigger and the
+		// view, but not the routines or the event.
+		var triggers, views, routines, events int
+		require.NoError(t, db.QueryRowContext(t.Context(), `SELECT
+			(SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?),
+			(SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ?),
+			(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ?),
+			(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?)`,
+			schema, schema, schema, schema).Scan(&triggers, &views, &routines, &events))
+		require.Equal(t, []int{1, 1, 0, 0}, []int{triggers, views, routines, events})
+		// So the scan refuses rather than trusting what it can see.
+		err = SourceSchemaObjectsError(t.Context(), src)
+		require.ErrorContains(t, err, "source 0 ("+schema+"): insufficient privileges to run a move")
+		require.ErrorContains(t, err, eventMissing)
+		require.ErrorContains(t, err, routineMissing)
+	})
+
+	t.Run("old minimal grants plus EVENT", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_event", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s")...)
+		err := privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
+		require.ErrorContains(t, err, routineMissing)
+		require.NotContains(t, err.Error(), eventMissing)
+	})
+
+	t.Run("old minimal grants plus SHOW_ROUTINE", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_routine", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+		err := privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
+		require.ErrorContains(t, err, eventMissing)
+		require.NotContains(t, err.Error(), routineMissing)
+	})
+
+	// A plain SHOW GRANTS by the current user includes the privileges of its
+	// active roles, so grants through a default role count. A granted role
+	// that is not active does not: information_schema does not show the
+	// objects to it either.
+	const role = "testmovevis_role"
+	for _, stmt := range []string{
+		"DROP ROLE IF EXISTS `" + role + "`",
+		"CREATE ROLE `" + role + "`",
+		"GRANT EVENT ON `" + schema + "`.* TO `" + role + "`",
+		"GRANT SHOW_ROUTINE ON *.* TO `" + role + "`",
+	} {
+		testutils.RunSQLInDatabaseAsRoot(t, "", stmt)
+	}
+	t.Cleanup(func() { testutils.RunSQLInDatabaseAsRoot(t, "", "DROP ROLE IF EXISTS `"+role+"`") })
+
+	t.Run("EVENT and SHOW_ROUTINE through a default role", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_defrole", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT `"+role+"` TO %s", "SET DEFAULT ROLE `"+role+"` TO %s")...)
+		src := []SourceResource{{DB: db, Config: cfg}}
+		require.NoError(t, privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default()))
+		require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), allObjects)
+	})
+
+	t.Run("EVENT and SHOW_ROUTINE through a role that is not active", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_inactiverole", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT `"+role+"` TO %s")...)
+		err := privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
+		require.ErrorContains(t, err, eventMissing)
+		require.ErrorContains(t, err, routineMissing)
+	})
+
+	// Each accepted way to see routines, together with EVENT, passes, and the
+	// user then sees every object in the schema.
+	for _, tc := range []struct {
+		name, user, grant string
+	}{
+		{"SHOW_ROUTINE on *.*", "testmovevis_showroutine", "GRANT SHOW_ROUTINE ON *.* TO %s"},
+		{"SELECT on *.*", "testmovevis_globalselect", "GRANT SELECT ON *.* TO %s"},
+		{"EXECUTE on the schema", "testmovevis_execute", "GRANT EXECUTE ON `" + schema + "`.* TO %s"},
+		{"ALTER ROUTINE on the schema", "testmovevis_alterroutine", "GRANT ALTER ROUTINE ON `" + schema + "`.* TO %s"},
+		{"CREATE ROUTINE on the schema", "testmovevis_createroutine", "GRANT CREATE ROUTINE ON `" + schema + "`.* TO %s"},
+	} {
+		t.Run("EVENT and "+tc.name, func(t *testing.T) {
+			db, cfg := createMoveTestUser(t, tc.user, schema,
+				append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s", tc.grant)...)
+			src := []SourceResource{{DB: db, Config: cfg}}
+			require.NoError(t, privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default()))
+			require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), allObjects)
+		})
+	}
+}
+
+// TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant: MySQL applies
+// one database-level grant row to a schema, not the union of every row whose
+// name matches it. Here the exact-name grant (created first) is the one that
+// applies, so EVENT granted on a pattern that also matches the schema does not
+// reach it, and information_schema.EVENTS hides the schema's event. The
+// visibility check must not count the pattern's EVENT.
+func TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant(t *testing.T) {
+	schema, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+	// '%' is doubled because createMoveTestUser formats each grant with Sprintf.
+	pattern := schema[:len(schema)-1] + "%%"
+	db, cfg := createMoveTestUser(t, "testmovevis_wildevent", schema,
+		append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+pattern+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+	var visible int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?", schema).Scan(&visible))
+	require.Zero(t, visible, "the server hides the event from this user")
+
+	src := []SourceResource{{DB: db, Config: cfg}}
+	require.ErrorIs(t, privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default()), ErrRefused)
+	require.ErrorIs(t, SourceSchemaObjectsError(t.Context(), src), ErrRefused)
+	// The reverse-window check uses the same evaluation.
+	err := ReverseWindowSchemaObjectsError(t.Context(), src)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, "EVENT on `"+schema+"`.* (to see its events)")
+}
+
+// TestSourceSchemaObjectsCheckRequiresVisibility checks that every scan
+// verifies that the user can see every object type before trusting an empty
+// result, so a grant revoked after preflight (or a reverse-window resume,
+// which runs no preflight) cannot make the scan pass on objects it cannot
+// see. Missing grants are a refusal; failing to read the grants is not.
+func TestSourceSchemaObjectsCheckRequiresVisibility(t *testing.T) {
+	const visibilityPrefix = "insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: "
+	scopes := []ScopeFlag{ScopePreflight, ScopePostSetup, ScopeResume, ScopePreCutover}
+	only := otherChecks("source_schema_objects_preflight", "source_schema_objects", "source_schema_objects_resume", "source_schema_objects_precutover")
+	for _, tc := range []struct {
+		name, user, revoke, create, needed string
+	}{
+		{"EVENT revoked", "testmovevis_revokeevent", "REVOKE EVENT ON `%s`.* FROM %s",
+			"CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1", "EVENT on `%s`.* (to see its events)"},
+		{"TRIGGER revoked", "testmovevis_revoketrigger", "REVOKE TRIGGER ON `%s`.* FROM %s",
+			"CREATE TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.v = 1", "TRIGGER on `%s`.* (to see its triggers)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, _ := testutils.CreateUniqueTestDatabase(t)
+			testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+			db, cfg := createMoveTestUser(t, tc.user, schema,
+				append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+			src := []SourceResource{{DB: db, Config: cfg}}
+			r := Resources{Sources: src}
+			for _, scope := range scopes {
+				require.NoError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), "scope %d", scope)
+			}
+
+			// Revoke the grant, as could happen during a long move, and
+			// create an object the user can no longer see.
+			testutils.RunSQLInDatabaseAsRoot(t, "", fmt.Sprintf(tc.revoke, schema, tc.user))
+			testutils.RunSQLInDatabaseAsRoot(t, schema, tc.create)
+			want := "source 0 (" + schema + "): " + visibilityPrefix + fmt.Sprintf(tc.needed, schema)
+			err := SourceSchemaObjectsError(t.Context(), src)
+			require.EqualError(t, err, want)
+			require.ErrorIs(t, err, ErrRefused)
+			for _, scope := range scopes {
+				require.EqualError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), want, "scope %d", scope)
+			}
+
+			// Fails closed when the grants cannot be read, without a refusal:
+			// the error may be transient.
+			canceled, cancel := context.WithCancel(t.Context())
+			cancel()
+			err = SourceSchemaObjectsError(canceled, src)
+			require.ErrorContains(t, err, "source 0 ("+schema+"): could not read the grants")
+			require.NotErrorIs(t, err, ErrRefused)
+		})
+	}
+}
+
+// TestSchemaObjectVisibilityFromGrants checks the evaluation of SHOW GRANTS
+// lines: database-level (including patterns) and global grants count, a
+// database-level privilege must be on every grant whose name matches,
+// table-level grants do not count, and each missing grant is named.
+func TestSchemaObjectVisibilityFromGrants(t *testing.T) {
+	const u = " TO `u`@`%`"
+	base := "GRANT SELECT, TRIGGER, EVENT ON `app`.*" + u
+	routines := "GRANT SHOW_ROUTINE ON *.*" + u
+	needSelect := "SELECT on `app`.* (to see its views)"
+	needTrigger := "TRIGGER on `app`.* (to see its triggers)"
+	needEvent := "EVENT on `app`.* (to see its events)"
+	needRoutine := "SHOW_ROUTINE on *.* (to see its stored procedures and functions; SELECT on *.*, or EXECUTE on `app`.*, also works)"
+	for _, tc := range []struct {
+		name    string
+		grants  []string
+		missing []string
+	}{
+		{"database-level grants and SHOW_ROUTINE", []string{base, routines}, nil},
+		{"database-level pattern", []string{"GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `ap\\_%`.*" + u}, []string{needSelect, needTrigger, needEvent, needRoutine}},
+		{"database-level pattern matching", []string{"GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `a%`.*" + u}, nil},
+		{"global grants", []string{"GRANT SELECT, TRIGGER, EVENT ON *.*" + u}, nil},
+		{"ALL PRIVILEGES on the schema", []string{"GRANT ALL PRIVILEGES ON `app`.*" + u}, nil},
+		{"ALL PRIVILEGES globally", []string{"GRANT ALL PRIVILEGES ON *.*" + u}, nil},
+		{"nothing", nil, []string{needSelect, needTrigger, needEvent, needRoutine}},
+		{"table-level grants do not count", []string{"GRANT SELECT, TRIGGER ON `app`.`t1`" + u, "GRANT EVENT ON `app`.*" + u, routines}, []string{needSelect, needTrigger}},
+		{"database-level SELECT does not show routines", []string{base}, []string{needRoutine}},
+		{"routine privilege on the schema", []string{base, "GRANT EXECUTE ON `app`.*" + u}, nil},
+		// MySQL applies one database-level grant to the schema, and SHOW
+		// GRANTS does not say which, so a privilege must be on every
+		// database-level grant whose name matches.
+		{"pattern grant shadowed by an exact-name grant", []string{"GRANT SELECT, TRIGGER ON `app`.*" + u, "GRANT SELECT, TRIGGER, EVENT ON `a%`.*" + u, routines}, []string{needEvent}},
+		{"exact-name grant shadowed by a pattern grant", []string{"GRANT SELECT, TRIGGER, EVENT ON `app`.*" + u, "GRANT EVENT ON `a%`.*" + u, routines}, []string{needSelect, needTrigger}},
+		{"privilege on every matching grant", []string{base, "GRANT SELECT, TRIGGER, EVENT ON `a%`.*" + u, routines}, nil},
+		{"several lines for one grant", []string{"GRANT SELECT ON `app`.*" + u, "GRANT TRIGGER, EVENT ON `app`.*" + u, routines}, nil},
+		{"global grant with shadowed database-level grants", []string{"GRANT SELECT, TRIGGER ON `app`.*" + u, "GRANT SELECT, TRIGGER, EVENT ON `a%`.*" + u, "GRANT EVENT ON *.*" + u, routines}, nil},
+		{"different routine privilege on each matching grant", []string{base, "GRANT EXECUTE ON `app`.*" + u, "GRANT SELECT, TRIGGER, EVENT, ALTER ROUTINE ON `a%`.*" + u}, nil},
+		{"routine privilege missing on one matching grant", []string{base, "GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `a%`.*" + u}, []string{needRoutine}},
+		// A global ALL grant without SHOW_ROUTINE (one made before the
+		// privilege existed) still shows routines, through its global SELECT.
+		{"global ALL PRIVILEGES without SHOW_ROUTINE", []string{"GRANT ALL PRIVILEGES ON *.*" + u}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := schemaObjectVisibilityFromGrants(tc.grants, "app", allSchemaObjects...)
+			if tc.missing == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, ErrRefused)
+			require.ErrorContains(t, err, "Needed: "+strings.Join(tc.missing, "; "))
+		})
+	}
+	// SHOW_ROUTINE is dynamic: a global ALL grant made before it existed
+	// lacks it, and SHOW GRANTS still prints ALL PRIVILEGES, so only a grant
+	// that names it counts as SHOW_ROUTINE.
+	all := schemaGrants{lines: []string{"GRANT ALL PRIVILEGES ON *.*" + u}, schema: "app"}
+	require.False(t, all.globalNamed("SHOW_ROUTINE"))
+	require.True(t, all.global("SELECT"))
+	require.True(t, schemaGrants{lines: []string{routines}, schema: "app"}.globalNamed("SHOW_ROUTINE"))
+	// Only the kinds asked for are evaluated.
+	require.NoError(t, schemaObjectVisibilityFromGrants([]string{"GRANT TRIGGER ON `app`.*" + u}, "app", schemaTriggers))
+}
+
+func TestRDSSuperuserRoleGranted(t *testing.T) {
+	require.True(t, rdsSuperuserRoleGranted([]string{
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `app`.* TO `u`@`%`",
+		"GRANT `rds_superuser_role`@`%` TO `u`@`%`",
+	}))
+	require.True(t, rdsSuperuserRoleGranted([]string{"GRANT `other`@`%`,`rds_superuser_role`@`%` TO `u`@`%`"}))
+	require.False(t, rdsSuperuserRoleGranted([]string{"GRANT `other_role`@`%` TO `u`@`%`"}))
+	require.False(t, rdsSuperuserRoleGranted([]string{"GRANT SELECT ON `rds_superuser_role`.* TO `u`@`%`"}))
+}
+
+// stubDB wraps a real connection for the grant checks. If grants is not nil,
+// SHOW GRANTS returns those lines instead of the user's (read through a real
+// SELECT, so the rows are genuine). A query containing fail fails: a
+// QueryContext with an error, a QueryRowContext with a *sql.Row whose Scan
+// returns context.Canceled.
+type stubDB struct {
+	*sql.DB
+	grants []string
+	fail   string
+}
+
+var errStubQuery = errors.New("stub: query failed")
+
+func (s stubDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if s.fail != "" && strings.Contains(query, s.fail) {
+		return nil, errStubQuery
+	}
+	if query == "SHOW GRANTS" && s.grants != nil {
+		selects := make([]string, len(s.grants))
+		lines := make([]any, len(s.grants))
+		for i, g := range s.grants {
+			selects[i], lines[i] = "SELECT ?", g
+		}
+		return s.DB.QueryContext(ctx, strings.Join(selects, " UNION ALL "), lines...)
+	}
+	return s.DB.QueryContext(ctx, query, args...)
+}
+
+func (s stubDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if s.fail != "" && strings.Contains(query, s.fail) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		return s.DB.QueryRowContext(canceled, query, args...)
+	}
+	return s.DB.QueryRowContext(ctx, query, args...)
+}
+
+// TestVisibilityReadErrorsAreNotRefusals checks that a failure of any read
+// the privilege decisions depend on is a plain error, not a refusal
+// (ErrRefused), so the cutover retries it instead of failing with a
+// misleading "insufficient privileges". Each stub case fails exactly one query
+// and lets the others through:
+//   - SHOW GRANTS: in the preflight privileges check and the per-scan
+//     visibility check;
+//   - activate_all_roles_on_login, read for a user granted rds_superuser_role:
+//     in the preflight privileges check, after SHOW GRANTS succeeded.
+//
+// It also checks the entry points (privilegesCheck, SourceSchemaObjectsError
+// and ReverseWindowSchemaObjectsError) on a closed pool, and that the
+// rds_superuser_role name is not accepted in place of the visibility grants.
+func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	noForceKillProbe := func(context.Context) error { return nil }
+
+	// Base privileges and the role, but none of the visibility grants the
+	// schema-level list lacks (EVENT, routines).
+	withRole := []string{
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `app`.* TO `u`@`%`",
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO `u`@`%`",
+		"GRANT `rds_superuser_role`@`%` TO `u`@`%`",
+	}
+
+	for _, tc := range []struct {
+		name, fail, want string
+		visibilityToo    bool
+	}{
+		{"SHOW GRANTS", "SHOW GRANTS", errStubQuery.Error(), true},
+		{"activate_all_roles_on_login", "activate_all_roles_on_login", "could not read activate_all_roles_on_login", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := stubDB{DB: db, grants: withRole, fail: tc.fail}
+			err := sourcePrivileges(t.Context(), stub, "app", noForceKillProbe)
+			require.ErrorContains(t, err, tc.want)
+			require.NotErrorIs(t, err, ErrRefused)
+			if tc.visibilityToo {
+				err = schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)
+				require.ErrorContains(t, err, "could not read the grants that make the schema's objects visible: "+tc.want)
+				require.NotErrorIs(t, err, ErrRefused)
+			}
+		})
+	}
+
+	// Every entry point, on a pool whose reads all fail.
+	t.Run("entry points on a closed pool", func(t *testing.T) {
+		closed, err := sql.Open("block-mysql", testutils.DSN())
+		require.NoError(t, err)
+		require.NoError(t, closed.Close())
+		cfg, err := mysql.ParseDSN(testutils.DSN())
+		require.NoError(t, err)
+		src := []SourceResource{{DB: closed, Config: cfg}}
+		for name, check := range map[string]func() error{
+			"privilegesCheck":                 func() error { return privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default()) },
+			"SourceSchemaObjectsError":        func() error { return SourceSchemaObjectsError(t.Context(), src) },
+			"ReverseWindowSchemaObjectsError": func() error { return ReverseWindowSchemaObjectsError(t.Context(), src) },
+		} {
+			err := check()
+			require.ErrorContains(t, err, "sql: database is closed", name)
+			require.NotErrorIs(t, err, ErrRefused, name)
+		}
+	})
+
+	// With every read succeeding, the same grants are a refusal: the stub
+	// reaches the evaluation, and the role's name does not stand in for the
+	// visibility grants. activate_all_roles_on_login is reported ON, so the
+	// role is taken as active; SHOW GRANTS would list its privileges.
+	t.Run("rds_superuser_role name does not substitute for visibility", func(t *testing.T) {
+		const needed = "Needed: EVENT on `app`.* (to see its events); SHOW_ROUTINE on *.*"
+		stub := stubDB{DB: db, grants: withRole}
+		err := schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)
+		require.ErrorIs(t, err, ErrRefused)
+		require.ErrorContains(t, err, needed)
+		on := onRoleStub{stub}
+		err = sourcePrivileges(t.Context(), on, "app", noForceKillProbe)
+		require.ErrorIs(t, err, ErrRefused)
+		require.ErrorContains(t, err, needed)
+		// The role's expanded privileges, as SHOW GRANTS lists them for an
+		// active role, are counted.
+		on.grants = append(slices.Clone(withRole), "GRANT SELECT, EVENT, TRIGGER ON *.* TO `u`@`%`")
+		require.NoError(t, sourcePrivileges(t.Context(), on, "app", noForceKillProbe))
+		require.NoError(t, schemaObjectVisibility(t.Context(), on, "app", allSchemaObjects...))
+	})
+}
+
+// onRoleStub reports activate_all_roles_on_login=ON, whatever the server's
+// setting, so that sourcePrivileges takes a granted rds_superuser_role as
+// active.
+type onRoleStub struct{ stubDB }
+
+func (s onRoleStub) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if strings.Contains(query, "activate_all_roles_on_login") {
+		return s.DB.QueryRowContext(ctx, "SELECT 1")
+	}
+	return s.stubDB.QueryRowContext(ctx, query, args...)
 }

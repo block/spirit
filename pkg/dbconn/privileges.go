@@ -3,20 +3,25 @@ package dbconn
 import (
 	"context"
 	"database/sql"
-	"log/slog"
+	"fmt"
 	"strings"
 )
 
-// ActivateAllRolesOnLogin returns true if the server has activate_all_roles_on_login=ON.
-// When this is enabled, all granted roles are automatically activated on login,
-// so role-granted privileges are available without explicit SET ROLE ALL.
-// A failed read is logged at debug level and reported as false.
-func ActivateAllRolesOnLogin(ctx context.Context, db *sql.DB, logger *slog.Logger) bool {
+// RowQuerier is the part of *sql.DB (or *sql.Conn) that reads one row.
+type RowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// ActivateAllRolesOnLogin reports whether the server has
+// activate_all_roles_on_login=ON. When this is enabled, all granted roles are
+// automatically activated on login, so role-granted privileges are available
+// without explicit SET ROLE ALL. A failed read is returned as an error, not
+// reported as false: a caller deciding whether privileges are missing must not
+// mistake a transient failure for a missing privilege.
+func ActivateAllRolesOnLogin(ctx context.Context, db RowQuerier) (bool, error) {
 	var value string
-	err := db.QueryRowContext(ctx, "SELECT @@global.activate_all_roles_on_login").Scan(&value)
-	if err != nil {
-		logger.Debug("failed to check activate_all_roles_on_login", "error", err)
-		return false
+	if err := db.QueryRowContext(ctx, "SELECT @@global.activate_all_roles_on_login").Scan(&value); err != nil {
+		return false, fmt.Errorf("could not read activate_all_roles_on_login: %w", err)
 	}
-	return value == "1" || strings.EqualFold(value, "ON")
+	return value == "1" || strings.EqualFold(value, "ON"), nil
 }

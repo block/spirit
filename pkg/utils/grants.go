@@ -12,7 +12,16 @@ import (
 //
 // capturing "ALL PRIVILEGES" and "strata_%". It only matches database-level
 // grants (`db`.*); global (*.*), table-level, and routine grants do not match.
-var dbGrantRegexp = regexp.MustCompile("^GRANT (.+) ON `([^`]+)`\\.\\* TO ")
+// SHOW GRANTS doubles a backquote inside the name; see unquoteDBName.
+var dbGrantRegexp = regexp.MustCompile("^GRANT (.+) ON `((?:[^`]|``)+)`\\.\\* TO ")
+
+// globalGrantRegexp captures the privilege list from a global grant line, e.g.
+//
+//	GRANT SELECT, EVENT ON *.* TO `user`@`%`
+//	GRANT CONNECTION_ADMIN,SHOW_ROUTINE ON *.* TO `user`@`%`
+//
+// capturing "SELECT, EVENT" or "CONNECTION_ADMIN,SHOW_ROUTINE".
+var globalGrantRegexp = regexp.MustCompile(`^GRANT (.+) ON \*\.\* TO `)
 
 // migrationDBPrivileges is the database-level privilege set spirit requires to
 // run a migration or move (mirroring gh-ost's historical requirement). A grant
@@ -30,14 +39,10 @@ var migrationDBPrivileges = []string{
 // match handled only exact and escaped-underscore database names.
 func DBLevelGrantCoversSchema(grant, schemaName string) bool {
 	m := dbGrantRegexp.FindStringSubmatch(grant)
-	if m == nil {
+	if m == nil || !MySQLLikeMatch(unquoteDBName(m[2]), schemaName) {
 		return false
 	}
-	privs, dbPattern := m[1], m[2]
-	if !MySQLLikeMatch(dbPattern, schemaName) {
-		return false
-	}
-	granted := splitPrivileges(privs)
+	granted := splitPrivileges(m[1])
 	if granted["ALL PRIVILEGES"] {
 		return true
 	}
@@ -47,6 +52,89 @@ func DBLevelGrantCoversSchema(grant, schemaName string) bool {
 		}
 	}
 	return true
+}
+
+// GlobalGrantHasAny reports whether a single SHOW GRANTS line is a global
+// (*.*) grant of ALL PRIVILEGES or of any privilege in privs. ALL PRIVILEGES
+// counts because it includes every static privilege, so privs should contain
+// at least one static privilege for it to be meaningful.
+func GlobalGrantHasAny(grant string, privs ...string) bool {
+	m := globalGrantRegexp.FindStringSubmatch(grant)
+	if m == nil {
+		return false
+	}
+	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
+}
+
+// GlobalGrantNamesAny reports whether a single SHOW GRANTS line is a global
+// (*.*) grant that names any privilege in privs explicitly. Unlike
+// GlobalGrantHasAny, ALL PRIVILEGES does not count. Use it for dynamic
+// privileges such as SHOW_ROUTINE: GRANT ALL includes a dynamic privilege only
+// if it was registered when the grant was issued, so a global ALL grant made
+// before an upgrade can lack it, and SHOW GRANTS still prints ALL PRIVILEGES.
+func GlobalGrantNamesAny(grant string, privs ...string) bool {
+	m := globalGrantRegexp.FindStringSubmatch(grant)
+	if m == nil {
+		return false
+	}
+	granted := splitPrivileges(m[1])
+	for _, p := range privs {
+		if granted[p] {
+			return true
+		}
+	}
+	return false
+}
+
+// DBLevelGrantName returns the database name of a single SHOW GRANTS line if
+// it is a database-level grant whose name pattern matches schemaName (see
+// MySQLLikeMatch), with the doubled backquotes SHOW GRANTS writes undone. The
+// name is returned as granted, so a pattern keeps its wildcards and escapes.
+//
+// SHOW GRANTS prints one line per mysql.db row, and MySQL applies only one
+// row to a schema, not the union of every row whose name matches it: an
+// exact-name row can shadow a pattern row, depending on the order the grants
+// were created. Callers that need a privilege on the schema can group the
+// matching lines by this name and require the privilege on every name.
+func DBLevelGrantName(grant, schemaName string) (string, bool) {
+	m := dbGrantRegexp.FindStringSubmatch(grant)
+	if m == nil {
+		return "", false
+	}
+	name := unquoteDBName(m[2])
+	if !MySQLLikeMatch(name, schemaName) {
+		return "", false
+	}
+	return name, true
+}
+
+// DBLevelGrantHasAny reports whether a single SHOW GRANTS line is a
+// database-level grant whose database name pattern matches schemaName (see
+// MySQLLikeMatch) and that confers ALL PRIVILEGES or any privilege in privs.
+func DBLevelGrantHasAny(grant, schemaName string, privs ...string) bool {
+	m := dbGrantRegexp.FindStringSubmatch(grant)
+	if m == nil || !MySQLLikeMatch(unquoteDBName(m[2]), schemaName) {
+		return false
+	}
+	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
+}
+
+// unquoteDBName undoes the only escaping SHOW GRANTS applies inside a
+// backquoted database name: a doubled backquote.
+func unquoteDBName(name string) string {
+	return strings.ReplaceAll(name, "``", "`")
+}
+
+func hasAnyPrivilege(granted map[string]bool, privs []string) bool {
+	if granted["ALL PRIVILEGES"] {
+		return true
+	}
+	for _, p := range privs {
+		if granted[p] {
+			return true
+		}
+	}
+	return false
 }
 
 // splitPrivileges parses the privilege list from a GRANT statement into a set

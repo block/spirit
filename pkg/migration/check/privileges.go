@@ -19,7 +19,7 @@ func init() {
 // Check the privileges of the user running the migration.
 // Ensure there is LOCK TABLES etc so we don't find out and get errors
 // at cutover time.
-func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
+func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 	// This is a re-implementation of the gh-ost check
 	// validateGrants() in gh-ost/go/logic/inspect.go
 	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload, foundConnectionAdmin, foundProcess bool
@@ -82,7 +82,12 @@ func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 	// opaque rds_superuser_role. When activate_all_roles_on_login=ON, this role
 	// is automatically active on every connection, so we can skip checking for
 	// those privileges directly.
-	skipRolePrivilegeCheck := slices.Contains(grantedRoles, "rds_superuser_role") && dbconn.ActivateAllRolesOnLogin(ctx, r.DB, logger)
+	var skipRolePrivilegeCheck bool
+	if slices.Contains(grantedRoles, "rds_superuser_role") {
+		if skipRolePrivilegeCheck, err = dbconn.ActivateAllRolesOnLogin(ctx, r.DB); err != nil {
+			return err
+		}
+	}
 
 	// Force-kill is always enabled, so its privileges are always required.
 	var errs []error

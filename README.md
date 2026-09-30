@@ -134,6 +134,13 @@ Spirit requires an account with these privileges:
 * `CREATE TEMPORARY TABLES` on the schema, but only for a table with an `ENUM` or `SET` member that `information_schema` reports with a `?`. MySQL reports each member character outside `utf8mb3` as `?`, so Spirit reads the members MySQL stores through a temporary table, and refuses the table if it cannot.
 * `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover.
 
+`spirit move` also needs to see the events and stored routines it refuses to move. On each source schema it requires:
+
+* `EVENT` on the schema or on `*.*`.
+* For stored procedures and functions, one of: `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), `SELECT` on `*.*`, or `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the schema or on `*.*`.
+
+`SELECT` and `TRIGGER` on the schema (listed above; `*.*` also works) make its views and triggers visible. Table-level grants do not count. When more than one database-level grant matches a schema, each privilege must be on every matching grant. See [docs/move.md](docs/move.md) for roles and `rds_superuser_role`.
+
 For replica throttling, Spirit requires:
 
 ```sql

@@ -28,9 +28,9 @@ func hasTriggersCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 	defer utils.CloseAndLog(rows)
 	if rows.Next() {
 		if r.scope&(ScopeCutover|ScopeCutoverLocked) != 0 {
-			return errors.New("a trigger was created during the migration: tables with triggers associated are not supported")
+			return refuse(errors.New("a trigger was created during the migration: tables with triggers associated are not supported"))
 		}
-		return errors.New("tables with triggers associated are not supported")
+		return refuse(errors.New("tables with triggers associated are not supported"))
 	}
 	if rows.Err() != nil {
 		return rows.Err()

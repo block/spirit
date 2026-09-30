@@ -87,6 +87,8 @@ func TestDBLevelGrantCoversSchema(t *testing.T) {
 			assert.Equal(t, tc.want, DBLevelGrantCoversSchema(tc.grant, tc.schema))
 		})
 	}
+	// SHOW GRANTS doubles a backquote in the name.
+	assert.True(t, DBLevelGrantCoversSchema("GRANT ALL PRIVILEGES ON `app``one`.* TO `u`@`%`", "app`one"))
 }
 
 func TestMySQLLikeMatch(t *testing.T) {
@@ -150,4 +152,92 @@ func TestStringContainsAll(t *testing.T) {
 	assert.True(t, StringContainsAll("GRANT SELECT", "", "SELECT"))
 	assert.False(t, StringContainsAll("GRANT SELECT", ""))
 	assert.False(t, StringContainsAll("GRANT SELECT"))
+}
+
+func TestGlobalGrantHasAny(t *testing.T) {
+	tests := []struct {
+		grant string
+		privs []string
+		want  bool
+	}{
+		{"GRANT SELECT, EVENT ON *.* TO `u`@`%`", []string{"EVENT"}, true},
+		{"GRANT CONNECTION_ADMIN,SHOW_ROUTINE ON *.* TO `u`@`%`", []string{"SHOW_ROUTINE"}, true},
+		{"GRANT ALL PRIVILEGES ON *.* TO `u`@`%` WITH GRANT OPTION", []string{"EVENT"}, true},
+		{"GRANT SELECT ON *.* TO `u`@`%`", []string{"SHOW_ROUTINE", "SELECT"}, true},
+		{"GRANT REPLICATION CLIENT ON *.* TO `u`@`%`", []string{"SELECT"}, false},
+		{"GRANT CREATE VIEW ON *.* TO `u`@`%`", []string{"CREATE"}, false},
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", []string{"EVENT"}, false},
+		{"GRANT SELECT ON `performance_schema`.* TO `u`@`%`", []string{"SELECT"}, false},
+		{"GRANT `role1`@`%` TO `u`@`%`", []string{"SELECT"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.grant, func(t *testing.T) {
+			assert.Equal(t, tc.want, GlobalGrantHasAny(tc.grant, tc.privs...))
+		})
+	}
+}
+
+func TestDBLevelGrantHasAny(t *testing.T) {
+	tests := []struct {
+		grant, schema string
+		privs         []string
+		want          bool
+	}{
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", "app", []string{"EVENT"}, true},
+		{"GRANT SELECT, EXECUTE ON `app\\_%`.* TO `u`@`%`", "app_one", []string{"EXECUTE"}, true},
+		{"GRANT SELECT, EXECUTE ON `app\\_%`.* TO `u`@`%`", "appxone", []string{"EXECUTE"}, false},
+		{"GRANT EVENT, EXECUTE ON `a%`.* TO `u`@`%`", "app", []string{"EVENT", "EXECUTE"}, true},
+		{"GRANT ALL PRIVILEGES ON `app`.* TO `u`@`%`", "app", []string{"EVENT"}, true},
+		{"GRANT ALTER ROUTINE ON `app`.* TO `u`@`%`", "app", []string{"EXECUTE", "ALTER ROUTINE"}, true},
+		{"GRANT ALTER ON `app`.* TO `u`@`%`", "app", []string{"ALTER ROUTINE"}, false},
+		{"GRANT EVENT ON `other`.* TO `u`@`%`", "app", []string{"EVENT"}, false},
+		{"GRANT EVENT ON *.* TO `u`@`%`", "app", []string{"EVENT"}, false},
+		{"GRANT SELECT ON `app`.`t1` TO `u`@`%`", "app", []string{"SELECT"}, false},
+		{"GRANT EVENT ON `app``one`.* TO `u`@`%`", "app`one", []string{"EVENT"}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.grant+" "+tc.schema, func(t *testing.T) {
+			assert.Equal(t, tc.want, DBLevelGrantHasAny(tc.grant, tc.schema, tc.privs...))
+		})
+	}
+}
+
+func TestGlobalGrantNamesAny(t *testing.T) {
+	assert.True(t, GlobalGrantNamesAny("GRANT SELECT, SHOW_ROUTINE ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	assert.True(t, GlobalGrantNamesAny("GRANT CONNECTION_ADMIN,SHOW_ROUTINE ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	// ALL PRIVILEGES does not name a dynamic privilege.
+	assert.False(t, GlobalGrantNamesAny("GRANT ALL PRIVILEGES ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	assert.False(t, GlobalGrantNamesAny("GRANT SELECT ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	assert.False(t, GlobalGrantNamesAny("GRANT SHOW_ROUTINE ON `app`.* TO `u`@`%`", "SHOW_ROUTINE"))
+}
+
+func TestDBLevelGrantName(t *testing.T) {
+	tests := []struct {
+		grant, schema string
+		want          string
+		ok            bool
+	}{
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", "app", "app", true},
+		// A pattern is returned as granted, escapes included.
+		{"GRANT EVENT ON `app\\_%`.* TO `u`@`%`", "app_1", "app\\_%", true},
+		{"GRANT EVENT ON `app%`.* TO `u`@`%`", "app_1", "app%", true},
+		{"GRANT EVENT ON `app\\_%`.* TO `u`@`%`", "appx1", "", false},
+		{"GRANT EVENT ON `app\\_1`.* TO `u`@`%`", "app_1", "app\\_1", true},
+		{"GRANT EVENT ON `app\\_1`.* TO `u`@`%`", "appx1", "", false},
+		// SHOW GRANTS doubles a backquote in the name.
+		{"GRANT EVENT ON `a``b`.* TO `u`@`%`", "a`b", "a`b", true},
+		{"GRANT EVENT ON `a``b`.* TO `u`@`%`", "a``b", "", false},
+		// Not database-level grants.
+		{"GRANT EVENT ON *.* TO `u`@`%`", "app", "", false},
+		{"GRANT SELECT ON `app`.`t1` TO `u`@`%`", "app", "", false},
+		{"REVOKE EVENT ON `app`.* FROM `u`@`%`", "app", "", false},
+		{"GRANT `r`@`%` TO `u`@`%`", "app", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.grant+" "+tc.schema, func(t *testing.T) {
+			name, ok := DBLevelGrantName(tc.grant, tc.schema)
+			assert.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.want, name)
+		})
+	}
 }

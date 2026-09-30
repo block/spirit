@@ -46,9 +46,9 @@ func hasForeignKeysCheck(ctx context.Context, r Resources, logger *slog.Logger) 
 	defer utils.CloseAndLog(rows)
 	if rows.Next() {
 		if r.scope&(ScopeCutover|ScopeCutoverLocked) != 0 {
-			return errors.New("a foreign key was created during the migration: tables with existing foreign key constraints are not supported")
+			return refuse(errors.New("a foreign key was created during the migration: tables with existing foreign key constraints are not supported"))
 		}
-		return errors.New("tables with existing foreign key constraints are not supported")
+		return refuse(errors.New("tables with existing foreign key constraints are not supported"))
 	}
 	if rows.Err() != nil {
 		return rows.Err()

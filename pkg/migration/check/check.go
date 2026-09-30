@@ -74,8 +74,12 @@ const (
 	// here sees the state the RENAME acts on. The runner stops acting on
 	// schema-change notifications once the cutover starts, so this is the
 	// only check of anything created while the cutover waits for its lock.
-	// A failure here is not retried. Keep these checks to fast reads: they
-	// run while the application's writes to the table are blocked.
+	// A refusal (an error that matches ErrRefused, see refuse) fails the
+	// cutover without a retry. Any other error is retried like any other
+	// cutover failure, so a check must return ErrRefused for a permanent
+	// condition, or it takes the table lock again on every retry. Keep these
+	// checks to fast reads: they run while the application's writes to the
+	// table are blocked.
 	ScopeCutoverLocked ScopeFlag = 1 << 7
 )
 

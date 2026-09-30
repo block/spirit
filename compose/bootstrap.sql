@@ -23,7 +23,7 @@ set default role R_REPLICATION, R_THROTTLER to rsandbox@'%';
 -- using the same password.
 create user if not exists tsandbox@'%' identified with caching_sha2_password by 'msandbox';
 grant R_MIGRATOR, R_REPLICATION, R_FORCEKILL to tsandbox@'%';
-grant event on *.* to tsandbox@'%'; -- sync's target check reads information_schema.EVENTS, which lists only events the user has EVENT on
+grant event on *.* to tsandbox@'%'; -- information_schema.EVENTS lists only events the user has EVENT on: sync's target check reads it, and move's privileges check requires EVENT (routines are visible through R_MIGRATOR's global SELECT)
 grant references on *.* to tsandbox@'%'; -- used in tests
 grant system_variables_admin on *.* to tsandbox@'%'; -- replaces SUPER, available since MySQL 8.0
 set default role R_MIGRATOR, R_REPLICATION, R_FORCEKILL to tsandbox@'%';

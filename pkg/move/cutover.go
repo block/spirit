@@ -28,6 +28,11 @@ var renameRetryWait = 1 * time.Second
 // that state cannot converge, so the retry loop aborts immediately.
 var errRenameRollbackFailed = errors.New("rename rollback failed")
 
+// errCutoverRefused marks a cutover attempt refused by a check that ran under
+// the source table locks. A retry would be refused for the same reason, so it
+// is not retried.
+var errCutoverRefused = errors.New("cutover refused")
+
 // CutoverResult reports authoritative evidence from a caller-owned cutover
 // callback, including failures after a durable mutation and failures whose
 // ownership outcome cannot be determined.
@@ -69,6 +74,15 @@ type CutOver struct {
 	// invoked again.
 	cutoverFuncSucceeded bool
 
+	// checksUnderLock, when set, runs under the source locks after the final
+	// flush and before preSwitch, the traffic switch and the rename. A
+	// refusal from it (check.ErrRefused) fails the cutover without a retry
+	// (errCutoverRefused); any other error is retried like a failed attempt.
+	// The locks
+	// keep out DDL that needs a metadata lock on the locked tables, such as a
+	// CREATE TRIGGER on them.
+	checksUnderLock func(ctx context.Context) error
+
 	// preSwitch runs under the source locks after the final flush and before
 	// traffic can reach the target. The runner carries the AUTO_INCREMENT
 	// counters over to the targets here, and reverse moves capture their start
@@ -80,6 +94,12 @@ type CutOver struct {
 	// before the source rename. It must run at most once.
 	postSwitch     func(ctx context.Context) error
 	postSwitchDone bool
+}
+
+// SetChecksUnderLock registers checks to run under the source locks after
+// the final flush and before the traffic switch. See CutOver.checksUnderLock.
+func (c *CutOver) SetChecksUnderLock(fn func(ctx context.Context) error) {
+	c.checksUnderLock = fn
 }
 
 // SetPreSwitch registers a hook after the final source flush and before the
@@ -166,6 +186,13 @@ func (c *CutOver) runWithRetries(ctx context.Context, runAttempt func(attempt in
 		}
 		err = runAttempt(attempt)
 		if err != nil {
+			if errors.Is(err, errCutoverRefused) {
+				// Refused before the traffic switch: the source is still live and
+				// a retry would be refused for the same reason.
+				c.logger.Error("cutover refused under the source table locks; not retrying",
+					"error", err.Error())
+				return err
+			}
 			if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, status.ErrOwnershipAmbiguous) {
 				c.logger.Error("cutover rename left ownership unresolved; not retrying",
 					"error", err.Error())
@@ -273,6 +300,18 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 	for i, src := range c.sources {
 		if !src.ReplClient.AllChangesFlushed() {
 			return fmt.Errorf("%w on source %d, final flush might be broken", change.ErrChangesNotFlushed, i)
+		}
+	}
+
+	if c.checksUnderLock != nil {
+		if err := c.checksUnderLock(ctx); err != nil {
+			// Only a refusal is final. Any other error (a failed query, a
+			// dropped connection) may be transient, so it takes the normal
+			// retry path.
+			if errors.Is(err, check.ErrRefused) {
+				return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			}
+			return fmt.Errorf("checks under the source locks: %w", err)
 		}
 	}
 
