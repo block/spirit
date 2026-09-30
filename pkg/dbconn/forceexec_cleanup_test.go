@@ -741,9 +741,9 @@ func TestForceExecSparesTrafficDuringAnInplaceRebuild(t *testing.T) {
 		KEY pad_idx (pad),
 		KEY tenant_pad_idx (tenant, pad)
 	)`)
-	// Enough rows, with random indexed values, that the rebuild runs well past
-	// the kill delay and the bystander's transaction.
-	tt.SeedRows(t, "INSERT INTO forceexec_inplace (pad, tenant) SELECT RANDOM_BYTES(64), FLOOR(RAND() * 1000)", 1<<16)
+	// Enough rows, with random indexed values, that the rebuild copies for
+	// several times as long as the bystander's transaction stays open.
+	tt.SeedRows(t, "INSERT INTO forceexec_inplace (pad, tenant) SELECT RANDOM_BYTES(64), FLOOR(RAND() * 1000)", 1<<18)
 	config := NewDBConfig()
 	config.LockWaitTimeout = 2
 	config.ForceKillAfter = 200 * time.Millisecond
@@ -761,31 +761,36 @@ func TestForceExecSparesTrafficDuringAnInplaceRebuild(t *testing.T) {
 		rebuildDone <- ForceExec(ctx, db, []*table.TableInfo{tbl}, config, logger, alterSQL)
 	}()
 
-	// Start the bystander once the rebuild holds its lock and is copying.
-	rebuildState := func() (state string, running bool, err error) {
-		var s sql.NullString
-		err = tt.DB.QueryRowContext(ctx, "SELECT state FROM information_schema.processlist WHERE info = ?", alterSQL).Scan(&s)
+	// The rebuild takes a brief exclusive lock before it starts copying and
+	// again when it finishes, and a transaction open at either moment really
+	// does block it. The bystander therefore opens only once the rebuild is
+	// copying, and commits while it is still copying.
+	const copying = "altering table"
+	rebuildState := func() (string, error) {
+		var state sql.NullString
+		err := tt.DB.QueryRowContext(ctx, "SELECT state FROM information_schema.processlist WHERE info = ?", alterSQL).Scan(&state)
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", false, nil
+			return "", nil
 		}
-		return s.String, err == nil, err
+		return state.String, err
 	}
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		state, running, err := rebuildState()
+		state, err := rebuildState()
 		require.NoError(c, err)
-		assert.True(c, running, "the rebuild did not start")
-		assert.NotEqual(c, "Waiting for table metadata lock", state)
-	}, 5*time.Second, 10*time.Millisecond)
+		assert.Equal(c, copying, state, "the rebuild is not copying yet")
+	}, 5*time.Second, 5*time.Millisecond)
+	copyStarted := time.Now()
 	bystander, err := tt.DB.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	defer func() { _ = bystander.Rollback() }()
 	_, err = bystander.ExecContext(ctx, "INSERT INTO forceexec_inplace (pad, tenant) VALUES ('bystander', 1)")
 	require.NoError(t, err)
-	// Hold the transaction open past the kill delay, while the rebuild runs.
-	time.Sleep(3 * config.ForceKillAfter)
-	_, stillRebuilding, err := rebuildState()
+	// Hold the transaction open past the kill delay, measured from when the
+	// rebuild started, so a kill that fires at the delay would find it.
+	time.Sleep(time.Until(copyStarted.Add(config.ForceKillAfter + 2*killPollInterval)))
+	state, err := rebuildState()
 	require.NoError(t, err)
-	require.True(t, stillRebuilding, "the rebuild must outlast the bystander for this test to observe anything")
+	require.Equal(t, copying, state, "the rebuild must still be copying when the bystander commits, or the bystander may have blocked it")
 	require.NoError(t, bystander.Commit(), "the bystander's transaction was not killed")
 
 	select {
