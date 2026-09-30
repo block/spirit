@@ -386,3 +386,52 @@ func TestNativeDDLKeepsCopyTablesOfAnotherTable(t *testing.T) {
 		require.Equal(t, 1, n, "%s belongs to another table and must be kept", name)
 	}
 }
+
+// TestNativeDDLKeepsCopyTablesWhenCheckpointUnreadable checks that the cleanup
+// after native DDL drops nothing when the checkpoint table exists but cannot
+// be read (here, a layout this version does not recognise), because ownership
+// of the auxiliary tables cannot be established.
+func TestNativeDDLKeepsCopyTablesWhenCheckpointUnreadable(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "staleunread", `CREATE TABLE staleunread (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	testutils.RunSQL(t, "CREATE TABLE _staleunread_new LIKE staleunread")
+	testutils.RunSQL(t, "CREATE TABLE _staleunread_chkpnt (id int not null primary key, some_other_column int)")
+	testutils.RunSQL(t, "INSERT INTO _staleunread_chkpnt VALUES (1, 1)")
+
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE staleunread ADD COLUMN c INT NOT NULL DEFAULT 7", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.True(t, m.usedInstantDDL)
+
+	for _, name := range []string{"_staleunread_new", "_staleunread_chkpnt"} {
+		var n int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&n))
+		require.Equal(t, 1, n, "%s must be kept when the checkpoint cannot be read", name)
+	}
+}
+
+// TestNativeDDLDropsNewTableWithoutCheckpoint checks that the cleanup after
+// native DDL drops a stale _new table when the checkpoint table is confirmed
+// absent, as a fresh copy would.
+func TestNativeDDLDropsNewTableWithoutCheckpoint(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "stalenockpt", `CREATE TABLE stalenockpt (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	testutils.RunSQL(t, "CREATE TABLE _stalenockpt_new LIKE stalenockpt")
+
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE stalenockpt ADD COLUMN c INT NOT NULL DEFAULT 7", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.True(t, m.usedInstantDDL)
+
+	var n int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_stalenockpt_new'").Scan(&n))
+	require.Zero(t, n, "a stale _new table must be dropped when there is no checkpoint table")
+}

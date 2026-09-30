@@ -259,33 +259,61 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 // changed it, so it can no longer be resumed from, and a later copy-based run
 // would only discard it. Without this, it stays behind indefinitely.
 //
+// Auxiliary table names are truncated, so two long table names can share them
+// (see utils.AuxTableName), and the state may belong to the other table. So
+// the tables are dropped only when ownership is established:
+//
+//   - the checkpoint table exists and its latest row names this table: drop
+//     _new and the checkpoint table;
+//   - the checkpoint table is confirmed absent: drop _new, as a fresh copy
+//     (newMigration -> createNewTable) does;
+//   - otherwise (the checkpoint cannot be read, is empty, or names another or
+//     no table): drop nothing and log why.
+//
 // A failure is logged, not returned: the ALTER has already been applied.
-// The tables are left alone when the checkpoint names a different table
-// (auxiliary table names are truncated, so two long table names can share
-// them; see utils.AuxTableName).
 func (r *Runner) dropStaleCopyTables(ctx context.Context) {
 	if len(r.changes) != 1 {
 		return // attemptMySQLDDL only supports single-table changes.
 	}
 	tableName := r.changes[0].table.TableName
-	if rec, err := r.checkpointTbl().ReadLatest(ctx); err == nil && rec.OriginalTableName != "" && rec.OriginalTableName != tableName {
-		r.logger.Warn("not dropping auxiliary tables: the checkpoint belongs to a different table",
-			"checkpoint-table", r.checkpointTableName(),
-			"checkpoint-original-table", rec.OriginalTableName,
-		)
+	newName := utils.NewTableName(tableName)
+	ckpt := r.checkpointTbl()
+	ckptName := r.checkpointTableName()
+	leaveInPlace := func(reason string, args ...any) {
+		r.logger.Warn("not dropping tables from an earlier interrupted migration: "+reason,
+			append([]any{"new-table", newName, "checkpoint-table", ckptName}, args...)...)
+	}
+
+	ckptExists, err := ckpt.Exists(ctx)
+	if err != nil {
+		leaveInPlace("could not check whether the checkpoint table exists", "error", err)
 		return
 	}
-	for _, name := range []string{utils.NewTableName(tableName), r.checkpointTableName()} {
-		var exists int
+	var drop []string
+	if ckptExists {
+		rec, err := ckpt.ReadLatest(ctx)
+		if err != nil {
+			leaveInPlace("could not read the checkpoint to confirm it belongs to this table", "error", err)
+			return
+		}
+		if rec.OriginalTableName != tableName {
+			leaveInPlace("the checkpoint does not belong to this table", "checkpoint-original-table", rec.OriginalTableName)
+			return
+		}
+		drop = append(drop, newName, ckptName)
+	} else {
+		var n int
 		if err := r.db.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-			r.changes[0].table.SchemaName, name).Scan(&exists); err != nil {
-			r.logger.Error("could not check for a stale table from an earlier interrupted migration", "table", name, "error", err)
-			continue
+			r.changes[0].table.SchemaName, newName).Scan(&n); err != nil {
+			leaveInPlace("could not check whether the new table exists", "error", err)
+			return
 		}
-		if exists == 0 {
-			continue
+		if n > 0 {
+			drop = append(drop, newName)
 		}
+	}
+	for _, name := range drop {
 		if err := dbconn.Exec(ctx, r.db, "DROP TABLE IF EXISTS %n", name); err != nil {
 			r.logger.Error("could not drop a stale table from an earlier interrupted migration", "table", name, "error", err)
 			continue
