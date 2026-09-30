@@ -10,9 +10,12 @@ package move
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -650,6 +653,143 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 	require.True(t, tableExists(t, ctl, "rwrk_src", "t1"), "source un-retired after rollback")
 	require.True(t, tableExists(t, ctl, "rwrk_dst", "t1_revert"), "target retired to _revert after rollback")
 	require.False(t, tableExists(t, ctl, "rwrk_dst", "t1"), "target real table gone after rollback")
+}
+
+// reverseCheckpointRow is the part of the checkpoint row a reverse window owns.
+type reverseCheckpointRow struct {
+	positions map[string]string
+	phase     string
+	cutoverAt string
+}
+
+func readReverseCheckpoint(ctx context.Context, db *sql.DB, dbName string) (reverseCheckpointRow, error) {
+	qctx, cancel := context.WithTimeout(ctx, waitQueryTimeout)
+	defer cancel()
+	var row reverseCheckpointRow
+	var posJSON string
+	if err := db.QueryRowContext(qctx,
+		"SELECT binlog_position, move_phase, cutover_at FROM "+dbName+"."+checkpointTableName+" WHERE id=1",
+	).Scan(&posJSON, &row.phase, &row.cutoverAt); err != nil {
+		return row, err
+	}
+	return row, json.Unmarshal([]byte(posJSON), &row.positions)
+}
+
+// positionCovers reports whether change-feed position have is at or past want,
+// in either coordinate scheme.
+func positionCovers(ctx context.Context, db *sql.DB, have, want string) (bool, error) {
+	if have == "" {
+		return false, nil
+	}
+	if change.IsGTIDPosition(want) {
+		var covered bool
+		err := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(?, ?)", want, have).Scan(&covered)
+		return covered, err
+	}
+	split := func(pos string) (string, int64, error) {
+		i := strings.LastIndex(pos, ":")
+		if i < 0 {
+			return "", 0, fmt.Errorf("malformed binlog position %q", pos)
+		}
+		off, err := strconv.ParseInt(pos[i+1:], 10, 64)
+		return pos[:i], off, err
+	}
+	haveFile, haveOff, err := split(have)
+	if err != nil {
+		return false, err
+	}
+	wantFile, wantOff, err := split(want)
+	if err != nil {
+		return false, err
+	}
+	// Binlog file names share a prefix and a fixed-width sequence number.
+	return haveFile > wantFile || (haveFile == wantFile && haveOff >= wantOff), nil
+}
+
+// TestMoveReverseWindowCheckpointsFeedPositions: during the reverse window the
+// checkpoint must follow the reverse feed's flushed position, not stay at the
+// position captured at cutover. With the cutover position only, every restart
+// re-reads the whole window's binlog, and cannot resume at all once the target
+// has purged it — traffic is on the target by then, so the move is stuck.
+func TestMoveReverseWindowCheckpointsFeedPositions(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	oldFlush := reverseFeedFlushInterval
+	reverseFeedFlushInterval = 100 * time.Millisecond
+	t.Cleanup(func() { reverseFeedFlushInterval = oldFlush })
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcp_src", "rwcp_dst")
+
+	run1, err := NewRunner(&Move{
+		SourceDSN: sourceDSN, TargetDSN: targetDSN,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	run1.SetCutover(func(context.Context) error { return nil })
+	h1 := startRun(t, run1)
+	deadline := h1.awaitReverseWindow(ctl, "rwcp_dst")
+	h1.awaitTable(deadline, ctl, "rwcp_src", "t1_old")
+	atCutover, err := readReverseCheckpoint(t.Context(), ctl, "rwcp_dst")
+	require.NoError(t, err)
+
+	// Write to the target, now serving, and take its head position after the
+	// writes. The checkpoint must come to cover it.
+	testutils.RunSQL(t, "INSERT INTO rwcp_dst.t1 (id, val) VALUES (10,'ten'),(11,'eleven')")
+	key := targetKey(run1.targets[0])
+	head, err := targetCurrentPosition(t.Context(), run1, &run1.targets[0])
+	require.NoError(t, err)
+	var last reverseCheckpointRow
+	var lastErr error
+	h1.poll(deadline, func() bool {
+		last, lastErr = readReverseCheckpoint(t.Context(), ctl, "rwcp_dst")
+		if lastErr != nil {
+			return false
+		}
+		covered, cerr := positionCovers(t.Context(), ctl, last.positions[key], head)
+		require.NoError(t, cerr)
+		return covered
+	}, func() string {
+		return fmt.Sprintf("checkpointed reverse position never reached the target head %q; cutover position=%q, last=%q, last read error=%v",
+			head, atCutover.positions[key], last.positions[key], lastErr)
+	})
+	require.Equal(t, phaseReverseWindow, last.phase, "the position checkpoint must keep the reverse-window phase")
+	require.Equal(t, atCutover.cutoverAt, last.cutoverAt, "the position checkpoint must keep the cutover time (the window deadline)")
+	// A position past the writes is only safe to resume from once the feed has
+	// applied them to the retired source table.
+	var applied int
+	require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM rwcp_src.t1_old WHERE id IN (10, 11)").Scan(&applied))
+	require.Equal(t, 2, applied, "checkpointed past writes the reverse feed had not applied")
+
+	require.ErrorIs(t, h1.kill(), context.Canceled, "run 1 must die from the kill, not an earlier failure")
+	h1.close()
+
+	// Written while nothing is running: the resumed feed starts from the
+	// advanced position and must still pick this up.
+	testutils.RunSQL(t, "INSERT INTO rwcp_dst.t1 (id, val) VALUES (12,'twelve')")
+
+	run2, err := NewRunner(&Move{
+		SourceDSN: sourceDSN, TargetDSN: targetDSN,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	run2.SetCutover(func(context.Context) error {
+		t.Error("resume must NOT run the forward cutover again")
+		return nil
+	})
+	h2 := startRun(t, run2)
+	h2.awaitReverseWindow(ctl, "rwcp_dst")
+	testutils.RunSQL(t, "CREATE TABLE rwcp_dst."+revertMarkerName+" (id INT)")
+	h2.awaitDone(reverseCutoverTimeout, "the resumed reverse window to roll back")
+
+	var ids []int
+	rows, err := ctl.QueryContext(t.Context(), "SELECT id FROM rwcp_src.t1 ORDER BY id")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var id int
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []int{1, 2, 3, 10, 11, 12}, ids, "the rolled-back source must hold every write made on the target")
 }
 
 // TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence verifies that a

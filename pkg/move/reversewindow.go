@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
@@ -161,10 +162,19 @@ func (w *reverseWindow) run(ctx context.Context) error {
 	return r.status.DoContext(ctx, status.ReverseWindow, func() error {
 		ticker := time.NewTicker(reverseWindowPollInterval)
 		defer ticker.Stop()
+		checkpointTicker := time.NewTicker(status.CheckpointDumpInterval)
+		defer checkpointTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-checkpointTicker.C:
+				// A failed write is not fatal: the row still holds an earlier
+				// position the feeds can resume from. Ending the window over it
+				// would stop keeping the source current.
+				if err := w.checkpointPositions(ctx); err != nil && ctx.Err() == nil {
+					r.logger.Warn("could not checkpoint reverse feed positions; will retry", "error", err)
+				}
 			case <-ticker.C:
 				if ferr := w.feed.Err(); ferr != nil {
 					r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", ferr)
@@ -187,6 +197,44 @@ func (w *reverseWindow) run(ctx context.Context) error {
 			}
 		}
 	})
+}
+
+// checkpointPositions persists the reverse feeds' flushed positions, so a
+// restart resumes each feed from what it had already applied rather than from
+// the cutover. Without it the checkpoint keeps the cutover positions for the
+// whole window: a restart re-reads the window's binlog, and cannot resume at
+// all once a target has purged it. It runs on the window loop's goroutine, so
+// it cannot interleave with a reverse cutover's phase writes or a
+// complete-forward's checkpoint drop.
+func (w *reverseWindow) checkpointPositions(ctx context.Context) error {
+	r := w.r
+	if w.feed.Err() != nil {
+		return nil // the window is about to complete forward; leave the row alone
+	}
+	feedPositions := w.feed.Positions()
+	positions := make(map[string]string, len(feedPositions))
+	for i, pos := range feedPositions {
+		if pos == "" {
+			return nil // nothing resumable observed yet; keep the previous row
+		}
+		positions[targetKey(r.targets[i])] = pos
+	}
+	if maps.Equal(positions, r.reversePositions) {
+		return nil
+	}
+	posJSON, err := json.Marshal(positions)
+	if err != nil {
+		return fmt.Errorf("marshal reverse positions: %w", err)
+	}
+	if err := r.checkpointTbl().Write(ctx, checkpoint.Record{
+		Position:  string(posJSON),
+		Phase:     phaseReverseWindow,
+		CutoverAt: r.cutoverAt,
+	}); err != nil {
+		return err
+	}
+	r.reversePositions = positions
+	return nil
 }
 
 // checkSourceSchemaObjects refuses when a source schema holds a trigger or an
@@ -249,10 +297,11 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 	w.watched = make([][]*table.TableInfo, len(r.targets))
 	for i := range r.targets {
 		tgt := &r.targets[i]
-		// The reverse feed MUST resume from the position captured at cutover. A
-		// missing/empty entry (e.g. a corrupted or partial checkpoint on resume)
-		// would otherwise fall back to the target's current head, silently
-		// skipping post-cutover writes and making rollback unsafe — so fail loudly.
+		// The reverse feed MUST resume from the position captured at cutover, or
+		// from a later one checkpointed during the window. A missing/empty entry
+		// (e.g. a corrupted or partial checkpoint on resume) would otherwise fall
+		// back to the target's current head, silently skipping post-cutover
+		// writes and making rollback unsafe — so fail loudly.
 		pos, ok := r.reversePositions[targetKey(*tgt)]
 		if !ok || pos == "" {
 			return fmt.Errorf("reverse window: no captured start position for target %d (%s); refusing to start the reverse feed, which would miss post-cutover writes and make rollback unsafe", i, targetKey(*tgt))
