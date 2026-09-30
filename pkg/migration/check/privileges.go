@@ -65,8 +65,8 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 
 	// Force-kill is enabled by default, so its privileges are required: the
 	// performance_schema lock tables, PROCESS, and CONNECTION_ADMIN or SUPER.
-	// The check reads at most one row and logs nothing; the lock detection
-	// that does log runs during cutover.
+	// The check reads at most one row of each lock table, plus SHOW GRANTS,
+	// and logs nothing; the lock detection that does log runs during cutover.
 	if err := dbconn.CheckForceKillPrivileges(ctx, r.DB); err != nil {
 		return fmt.Errorf("insufficient privileges to run a migration with force-kill. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", err)
 	}
