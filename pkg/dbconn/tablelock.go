@@ -67,16 +67,17 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&pid); err != nil {
 		return nil, err
 	}
+	// lockCtx ends when the LOCK TABLES statement returns, so a kill that is
+	// still looking for the blockers stops looking.
+	lockCtx, lockDone := context.WithCancel(ctx)
+	defer lockDone()
 	if config.ForceKill {
 		threshold := config.forceKillDelay()
 		var wg sync.WaitGroup
 		wg.Add(1)
 		timer := time.AfterFunc(threshold, func() {
 			defer wg.Done()
-			err := KillLockingTransactions(ctx, db, tables, config, logger, []int{pid})
-			if err != nil {
-				logger.Error("failed to kill locking transactions", "error", err)
-			}
+			killTableLockBlockers(ctx, lockCtx, db, tables, config, logger, pid)
 		})
 		defer func() {
 			if timer.Stop() {
@@ -94,6 +95,7 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	// For each table, we need to lock both the main table and its _new table.
 	logger.Warn("trying to acquire table locks", "timeout", config.LockWaitTimeout)
 	_, err = conn.ExecContext(ctx, lockStmt)
+	lockDone()
 	if err != nil {
 		logger.Warn("failed to acquire table lock(s)", "error", err)
 		return nil, err
@@ -108,6 +110,35 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 		lockConn: conn,
 		logger:   logger,
 	}, nil
+}
+
+// killTableLockBlockers kills the transactions blocking session pid's LOCK
+// TABLES. LOCK TABLES only waits until it returns, so while lockCtx lasts the
+// statement is still waiting, and a kill that could not list the blockers
+// looks again every poll interval.
+func killTableLockBlockers(ctx, lockCtx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, pid int) {
+	lookupFailed := false
+	for {
+		err := KillLockingTransactions(ctx, db, tables, config, logger, []int{pid})
+		if !errors.Is(err, errBlockerLookupFailed) {
+			if err != nil {
+				logger.Error("failed to kill locking transactions", "error", err)
+			}
+			return
+		}
+		if !lookupFailed {
+			logger.Warn("could not list the sessions blocking the table lock; looking again while it waits", "error", err)
+			lookupFailed = true
+		}
+		retry := time.NewTimer(killPollInterval)
+		select {
+		case <-lockCtx.Done():
+			retry.Stop()
+			logger.Error("failed to kill locking transactions: the table lock stopped waiting before the blocking sessions could be listed", "error", err)
+			return
+		case <-retry.C:
+		}
+	}
 }
 
 // DB returns the database connection pool this lock was acquired on.

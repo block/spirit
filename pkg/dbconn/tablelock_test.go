@@ -374,3 +374,32 @@ func TestTableLockCloseDuringExecUnderLock(t *testing.T) {
 	}
 	require.Zero(t, db.Stats().InUse)
 }
+
+// The table lock's kill must still end a blocker while another transaction
+// runs a statement that holds a 4-byte character. On MySQL 9.7 the kill
+// cannot list the blockers until that statement ends, so it looks again while
+// LOCK TABLES waits, and the lock is acquired before its timeout.
+func TestTableLockKillsBesideAFourByteCharacterStatement(t *testing.T) {
+	tt := testutils.NewTestTable(t, "tablelock_mb4", "CREATE TABLE tablelock_mb4 (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 10
+	config.ForceKillAfter = time.Second
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	blocker, err := tt.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM tablelock_mb4")
+	require.NoError(t, err)
+	statementDone := runFourByteCharacterStatement(t, ctx, db, "tablelock_mb4_other", 2)
+	tbl := &table.TableInfo{SchemaName: "test", TableName: "tablelock_mb4", QuotedTableName: "`tablelock_mb4`"}
+	lock, err := NewTableLock(ctx, db, []*table.TableInfo{tbl}, config, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, lock.Close(ctx))
+	_, err = blocker.ExecContext(ctx, "SELECT 1")
+	require.Error(t, err, "the blocker must have been killed")
+	require.NoError(t, <-statementDone)
+}

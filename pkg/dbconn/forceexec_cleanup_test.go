@@ -1180,3 +1180,116 @@ func TestForceExecPollsAtTheIntervalWhileTheStatementRuns(t *testing.T) {
 	require.NoError(t, err)
 	require.LessOrEqual(t, int(checks.Load()), int(runFor/killPollInterval)+1)
 }
+
+// A blocker must still be killed while another transaction runs a statement
+// that holds a 4-byte character. On MySQL 9.7 the kill cannot list the
+// blockers until that statement ends, so it looks again while the statement
+// still waits, and kills the blocker within the first attempt instead of
+// letting it hold the table until the lock wait timeout.
+func TestForceExecKillsBesideAFourByteCharacterStatement(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_mb4", "CREATE TABLE forceexec_mb4 (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 10
+	config.ForceKillAfter = time.Second
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	blocker, err := tt.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_mb4")
+	require.NoError(t, err)
+	statementDone := runFourByteCharacterStatement(t, ctx, db, "forceexec_mb4_other", 2)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	started := time.Now()
+	tbl := &table.TableInfo{SchemaName: "test", TableName: "forceexec_mb4", QuotedTableName: "`forceexec_mb4`"}
+	require.NoError(t, ForceExec(ctx, db, []*table.TableInfo{tbl}, config, logger, "ALTER TABLE forceexec_mb4 ADD COLUMN c INT, ALGORITHM=INSTANT"))
+	require.Less(t, time.Since(started), time.Duration(config.LockWaitTimeout)*time.Second, "the first attempt must succeed")
+	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout")
+	_, err = blocker.ExecContext(ctx, "SELECT 1")
+	require.Error(t, err, "the blocker must have been killed")
+	require.NoError(t, <-statementDone)
+}
+
+// A kill that cannot list the blockers kills nothing, so it looks again at the
+// next poll while the statement still waits, and the kill that lists them
+// lets the first attempt succeed.
+func TestForceExecLooksForBlockersAgainAfterAFailedLookup(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_lookup_fails", "CREATE TABLE forceexec_lookup_fails (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 5
+	config.ForceKillAfter = 500 * time.Millisecond
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	blocker, err := tt.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	var pid int
+	require.NoError(t, blocker.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&pid))
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_lookup_fails")
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	var killCalls []time.Time
+	err = forceExec(ctx, db, config, logger,
+		"ALTER TABLE forceexec_lookup_fails ADD COLUMN c INT, ALGORITHM=INSTANT",
+		waitingOn(tt.DB),
+		func(ctx context.Context, connID int) ([]int, error) {
+			killCalls = append(killCalls, time.Now())
+			if len(killCalls) < 3 {
+				return nil, fmt.Errorf("%w: %w", errBlockerLookupFailed, io.EOF)
+			}
+			return []int{pid}, KillTransaction(ctx, db, pid)
+		}, waitForKilledTransactions, nil)
+	require.NoError(t, err)
+	require.Len(t, killCalls, 3)
+	for i := 1; i < len(killCalls); i++ {
+		require.GreaterOrEqual(t, killCalls[i].Sub(killCalls[i-1]), killPollInterval, "the kill must wait a poll interval before it looks again")
+	}
+	require.Equal(t, 1, strings.Count(logs.String(), "could not list the sessions blocking the statement"))
+	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout")
+}
+
+// A lookup that never succeeds kills nothing. The kill stops looking when the
+// statement times out, and the next attempt's kill looks again.
+func TestForceExecRetriesAfterEveryLookupFails(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_lookups_fail", "CREATE TABLE forceexec_lookups_fail (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 2
+	config.ForceKillAfter = 500 * time.Millisecond
+	config.MaxRetries = 2
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	blocker, err := tt.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_lookups_fail")
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	var killCalls atomic.Int32
+	err = forceExec(ctx, db, config, logger,
+		"ALTER TABLE forceexec_lookups_fail ADD COLUMN c INT, ALGORITHM=INSTANT",
+		waitingOn(tt.DB),
+		func(context.Context, int) ([]int, error) {
+			killCalls.Add(1)
+			return nil, fmt.Errorf("%w: %w", errBlockerLookupFailed, io.EOF)
+		}, waitForKilledTransactions, nil)
+	var ddlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &ddlErr)
+	require.EqualValues(t, 1205, ddlErr.Number)
+	require.Equal(t, 2, strings.Count(logs.String(), "could not list the sessions blocking the statement"), "each attempt looks for the blockers")
+	require.Equal(t, 1, strings.Count(logs.String(), "retrying statement after lock wait timeout"))
+	require.Greater(t, killCalls.Load(), int32(4), "each attempt looks more than once while its statement waits")
+	_, err = blocker.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err, "a kill that could not list the blockers must not kill them")
+}

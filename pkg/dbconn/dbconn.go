@@ -573,6 +573,8 @@ func execWithKillWorker(ctx context.Context, conn *sql.Conn, connID int, delay t
 // A second failure in a row restarts the wait: over a longer stretch the
 // statement could have got its lock and started a new wait, and its blockers
 // must get the full delay from then.
+// A kill that could not list the blockers killed nothing, so the worker tries
+// again at the next poll that still sees the statement waiting.
 // The kill runs on ctx, so it finishes even if the statement returns while it
 // runs.
 func killWhenWaiting(ctx, stmtCtx context.Context, connID int, started time.Time, delay time.Duration, waiting func(context.Context, int) (bool, error), kill func(context.Context, int) ([]int, error), logger *slog.Logger) forceExecAttempt {
@@ -580,6 +582,7 @@ func killWhenWaiting(ctx, stmtCtx context.Context, connID int, started time.Time
 	lastNotWaiting := started
 	sawWaiting := false
 	lastCheckFailed := false
+	lookupFailed := false
 	// A statement can be queued from its start, so the first check is due by
 	// the delay even before any check has seen it waiting.
 	next := time.NewTimer(untilNextCheck(started, lastNotWaiting, delay, true))
@@ -614,7 +617,18 @@ func killWhenWaiting(ctx, stmtCtx context.Context, connID int, started time.Time
 		case checkStarted.Sub(lastNotWaiting) >= delay:
 			attempt.killAttempted = true
 			attempt.killed, attempt.killErr = kill(ctx, connID)
-			return attempt
+			if !errors.Is(attempt.killErr, errBlockerLookupFailed) {
+				return attempt
+			}
+			// The kill could not list the blockers, so it killed nothing.
+			// Look again once a poll interval has passed, and only if the
+			// statement is still waiting then.
+			if !lookupFailed {
+				logger.Warn("could not list the sessions blocking the statement; looking again while it waits", "error", attempt.killErr)
+				lookupFailed = true
+			}
+			next.Reset(killPollInterval)
+			continue
 		default:
 			sawWaiting = true
 		}

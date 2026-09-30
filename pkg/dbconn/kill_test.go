@@ -192,33 +192,45 @@ func TestCheckForceKillPrivileges(t *testing.T) {
 // some MySQL versions that fails while a statement holds a character utf8mb3
 // cannot store, so the check proves PROCESS without reading innodb_trx.
 func TestCheckForceKillPrivilegesBesideAFourByteCharacterStatement(t *testing.T) {
-	tt := testutils.NewTestTable(t, "forcekill_probe_mb4", "CREATE TABLE forcekill_probe_mb4 (id INT PRIMARY KEY)")
 	db, err := New(testutils.DSN(), NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
+	statementDone := runFourByteCharacterStatement(t, ctx, db, "forcekill_probe_mb4", 3)
+	require.NoError(t, CheckForceKillPrivileges(ctx, db))
+	require.NoError(t, <-statementDone)
+}
+
+// runFourByteCharacterStatement starts, in a transaction that has read its own
+// table, a statement that holds a 4-byte character and runs for seconds. It
+// returns once the statement is running, with a channel for its result. MySQL
+// 9.7 fails every read of information_schema.innodb_trx until the statement
+// ends, because it cannot copy the statement's text into that table.
+func runFourByteCharacterStatement(t *testing.T, ctx context.Context, db *sql.DB, tableName string, seconds int) <-chan error {
+	t.Helper()
+	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", tableName))
 	// Reading an InnoDB table puts the transaction in innodb_trx, with its
 	// running statement's text.
 	tx, err := tt.DB.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	defer func() { _ = tx.Rollback() }()
+	t.Cleanup(func() { _ = tx.Rollback() })
 	var pid int
 	require.NoError(t, tx.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&pid))
-	_, err = tx.ExecContext(ctx, "SELECT * FROM forcekill_probe_mb4")
+	_, err = tx.ExecContext(ctx, "SELECT * FROM "+tableName)
 	require.NoError(t, err)
+	stmt := fmt.Sprintf("SELECT SLEEP(%d), '\U0001F600'", seconds)
 	statementDone := make(chan error, 1)
 	go func() {
-		_, err := tx.ExecContext(ctx, "SELECT SLEEP(3), '\U0001F600'")
+		_, err := tx.ExecContext(ctx, stmt)
 		statementDone <- err
 	}()
 	require.Eventually(t, func() bool {
 		var n int
-		err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM performance_schema.threads WHERE processlist_id = ? AND processlist_info LIKE 'SELECT SLEEP(3)%'", pid).Scan(&n)
+		err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM performance_schema.threads WHERE processlist_id = ? AND processlist_info LIKE ?", pid, fmt.Sprintf("SELECT SLEEP(%d)%%", seconds)).Scan(&n)
 		return err == nil && n == 1
-	}, 2*time.Second, 10*time.Millisecond, "the statement must be running before the check")
-	require.NoError(t, CheckForceKillPrivileges(ctx, db))
-	require.NoError(t, <-statementDone)
+	}, 2*time.Second, 10*time.Millisecond, "the statement must be running")
+	return statementDone
 }
 
 // A user can hold the force-kill privileges through a role. The check counts

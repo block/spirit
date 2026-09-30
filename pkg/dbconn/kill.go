@@ -34,6 +34,15 @@ var (
 	// errHeavyTransactionSkipped marks a kill that left a blocking transaction
 	// alive because its weight exceeds TransactionWeightThreshold.
 	errHeavyTransactionSkipped = errors.New("a blocking transaction is too heavy to kill safely")
+
+	// errBlockerLookupFailed marks a kill that could not list the blocking
+	// sessions, so it killed nothing. The lookup can fail for as long as a
+	// transaction is running a statement MySQL cannot copy into
+	// information_schema.innodb_trx: MySQL 9.7 fails every read of that table
+	// while a running statement's text holds a 4-byte character, such as an
+	// emoji. The statement's lock wait outlasts most such statements, so the
+	// kill looks again while the statement still waits.
+	errBlockerLookupFailed = errors.New("could not list the sessions blocking the lock")
 )
 
 // forceKillGracePeriod returns how long to wait before force-killing
@@ -200,7 +209,7 @@ func killBlockers(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	// First, check if there are explicit table locks that would prevent us from acquiring the metadata lock.
 	locks, err := GetTableLocks(ctx, db, tables, logger, ignorePIDs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get table locks: %w", err)
+		return nil, nil, fmt.Errorf("%w: failed to get table locks: %w", errBlockerLookupFailed, err)
 	}
 	if len(locks) > 0 {
 		// If we find any table locks, we cannot proceed with the metadata lock.
@@ -219,7 +228,7 @@ func killBlockers(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	}
 	pids, heavy, err := getLockingTransactions(ctx, db, tables, logger, ignorePIDs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get locking transactions: %w", err)
+		return nil, nil, fmt.Errorf("%w: failed to get locking transactions: %w", errBlockerLookupFailed, err)
 	}
 	// Now we can kill these transactions
 	var errs []error
