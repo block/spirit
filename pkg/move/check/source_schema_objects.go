@@ -40,25 +40,37 @@ func sourceSchemaObjectsCheck(ctx context.Context, r Resources, _ *slog.Logger) 
 }
 
 // schemaObjectKinds names the object types in the order they are reported.
-// schemaObjectsQuery tags each row with its index in this list.
+// Each query branch (schemaObjectBranches) tags its rows with the kind's
+// index in this list.
 var schemaObjectKinds = []string{"trigger", "view", "procedure", "function", "event"}
 
-// schemaObjectsQuery lists every object in one schema, in one round trip
-// (the scan also runs under the cutover's table locks). Rows are ordered by
-// type, then by name in the name column's own collation: WEIGHT_STRING is
-// computed in each branch, before the UNION merges the collations, so the
-// order is the same as sorting each type separately.
-const schemaObjectsQuery = `SELECT 0, TRIGGER_NAME, EVENT_OBJECT_TABLE, WEIGHT_STRING(TRIGGER_NAME) AS w
-	FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?
-UNION ALL SELECT 1, TABLE_NAME, '', WEIGHT_STRING(TABLE_NAME)
-	FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ?
-UNION ALL SELECT 2, ROUTINE_NAME, '', WEIGHT_STRING(ROUTINE_NAME)
-	FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE'
-UNION ALL SELECT 3, ROUTINE_NAME, '', WEIGHT_STRING(ROUTINE_NAME)
-	FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION'
-UNION ALL SELECT 4, EVENT_NAME, '', WEIGHT_STRING(EVENT_NAME)
-	FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?
-ORDER BY 1, w`
+// schemaObjectBranches holds, for each kind in schemaObjectKinds (same
+// index), the query branch listing that kind's objects in one schema.
+var schemaObjectBranches = []string{
+	"SELECT 0, TRIGGER_NAME, EVENT_OBJECT_TABLE, WEIGHT_STRING(TRIGGER_NAME) AS w FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?",
+	"SELECT 1, TABLE_NAME, '', WEIGHT_STRING(TABLE_NAME) AS w FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ?",
+	"SELECT 2, ROUTINE_NAME, '', WEIGHT_STRING(ROUTINE_NAME) AS w FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE'",
+	"SELECT 3, ROUTINE_NAME, '', WEIGHT_STRING(ROUTINE_NAME) AS w FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION'",
+	"SELECT 4, EVENT_NAME, '', WEIGHT_STRING(EVENT_NAME) AS w FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?",
+}
+
+// allObjectKinds are the kinds the forward checks look for: all of them.
+var allObjectKinds = []int{0, 1, 2, 3, 4}
+
+// schemaObjectsQuery returns the query listing the objects of the given
+// kinds (indexes into schemaObjectKinds, in order) in one schema, in one
+// round trip: the scans also run under the cutover's table locks. It takes
+// the schema name once per kind. Rows are ordered by kind, then by name in
+// the name column's own collation: WEIGHT_STRING is computed in each branch,
+// before the UNION merges the collations, so the order is the same as
+// sorting each kind separately.
+func schemaObjectsQuery(kinds []int) string {
+	branches := make([]string, len(kinds))
+	for i, k := range kinds {
+		branches[i] = schemaObjectBranches[k]
+	}
+	return strings.Join(branches, "\nUNION ALL ") + "\nORDER BY 1, w"
+}
 
 // SourceSchemaObjectsError returns an error listing every trigger, view,
 // stored procedure, stored function and event in any source schema, grouped
@@ -96,7 +108,7 @@ func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) err
 		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, allSchemaObjects...); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
-		objects, err := schemaObjects(ctx, src, nil)
+		objects, err := schemaObjects(ctx, src, allObjectKinds)
 		if err != nil {
 			return fmt.Errorf("failed to list schema objects on source %d (%s): %w", i, src.Config.DBName, err)
 		}
@@ -111,12 +123,15 @@ func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) err
 		strings.Join(groups, "; ")))
 }
 
-// schemaObjects describes each object in src's schema, e.g. "view 'v1'" or
-// "trigger 't1_ai' on table 't1'". If keep is not nil, only the kinds (see
-// schemaObjectKinds) it returns true for are described.
-func schemaObjects(ctx context.Context, src SourceResource, keep map[string]bool) ([]string, error) {
-	name := src.Config.DBName
-	rows, err := src.DB.QueryContext(ctx, schemaObjectsQuery, name, name, name, name, name)
+// schemaObjects describes each object of the given kinds (see
+// schemaObjectsQuery) in src's schema, e.g. "view 'v1'" or "trigger 't1_ai'
+// on table 't1'".
+func schemaObjects(ctx context.Context, src SourceResource, kinds []int) ([]string, error) {
+	args := make([]any, len(kinds))
+	for i := range args {
+		args[i] = src.Config.DBName
+	}
+	rows, err := src.DB.QueryContext(ctx, schemaObjectsQuery(kinds), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -131,9 +146,6 @@ func schemaObjects(ctx context.Context, src SourceResource, keep map[string]bool
 		}
 		if kind < 0 || kind >= len(schemaObjectKinds) {
 			return nil, fmt.Errorf("unexpected object kind %d", kind)
-		}
-		if keep != nil && !keep[schemaObjectKinds[kind]] {
-			continue
 		}
 		objects = append(objects, describeSchemaObject(schemaObjectKinds[kind], objName, onTable))
 	}
@@ -152,7 +164,13 @@ func describeSchemaObject(kind, name, onTable string) string {
 // its table, which can write to any other table, and an event runs on a
 // schedule. Views, procedures and functions run only when a client invokes
 // them, which is no different from a client writing directly.
-var reverseWindowObjectKinds = map[string]bool{"trigger": true, "event": true}
+// Only their branches are queried: the reverse cutover runs this while the
+// target tables are write-locked.
+var reverseWindowObjectKinds = []int{0, 4}
+
+// reverseWindowVisibility is the visibility the reverse window's check needs
+// for reverseWindowObjectKinds.
+var reverseWindowVisibility = []schemaObject{schemaTriggers, schemaEvents}
 
 // ReverseWindowSchemaObjectsError returns a refusal (see ErrRefused) listing
 // every trigger, on any table, and every event in any source schema, grouped
@@ -178,7 +196,7 @@ func ReverseWindowSchemaObjectsError(ctx context.Context, sources []SourceResour
 		if src.DB == nil || src.Config == nil {
 			return fmt.Errorf("source %d database connection or config is not initialized", i)
 		}
-		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, schemaTriggers, schemaEvents); err != nil {
+		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, reverseWindowVisibility...); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
 		objects, err := schemaObjects(ctx, src, reverseWindowObjectKinds)

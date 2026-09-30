@@ -3,6 +3,7 @@ package check
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/block/mysql"
@@ -224,4 +225,33 @@ func TestSourceSchemaObjectsCheckOrder(t *testing.T) {
 	err := SourceSchemaObjectsError(t.Context(), []SourceResource{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}})
 	require.EqualError(t, err, "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 ("+srcName+"): "+
 		"trigger 'at' on table 't1', trigger 'Zt' on table 't1', view 'Bv', view 'av', procedure 'ap', procedure 'Zp'")
+}
+
+// TestSchemaObjectsQuery checks the query builder: the forward checks query
+// all five kinds, and the reverse window only triggers and events, which are
+// also the kinds whose visibility it requires.
+func TestSchemaObjectsQuery(t *testing.T) {
+	forward := schemaObjectsQuery(allObjectKinds)
+	require.Equal(t, 5, strings.Count(forward, "SELECT "))
+	require.Equal(t, 5, strings.Count(forward, "?"))
+	for _, table := range []string{"TRIGGERS", "VIEWS", "'PROCEDURE'", "'FUNCTION'", "EVENTS"} {
+		require.Contains(t, forward, table)
+	}
+	require.True(t, strings.HasSuffix(forward, "ORDER BY 1, w"))
+
+	reverse := schemaObjectsQuery(reverseWindowObjectKinds)
+	require.Equal(t, 2, strings.Count(reverse, "SELECT "))
+	require.Equal(t, 2, strings.Count(reverse, "?"))
+	require.Equal(t, schemaObjectBranches[0]+"\nUNION ALL "+schemaObjectBranches[4]+"\nORDER BY 1, w", reverse)
+	require.Contains(t, reverse, "information_schema.TRIGGERS")
+	require.Contains(t, reverse, "information_schema.EVENTS")
+	require.NotContains(t, reverse, "VIEWS")
+	require.NotContains(t, reverse, "ROUTINES")
+
+	var names []string
+	for _, k := range reverseWindowObjectKinds {
+		names = append(names, schemaObjectKinds[k])
+	}
+	require.Equal(t, []string{"trigger", "event"}, names)
+	require.Equal(t, []schemaObject{schemaTriggers, schemaEvents}, reverseWindowVisibility)
 }
