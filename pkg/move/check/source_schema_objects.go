@@ -108,7 +108,7 @@ func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) err
 		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, allSchemaObjects...); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
-		objects, err := schemaObjects(ctx, src, allObjectKinds)
+		objects, err := describeSchemaObjects(ctx, src, allObjectKinds)
 		if err != nil {
 			return fmt.Errorf("failed to list schema objects on source %d (%s): %w", i, src.Config.DBName, err)
 		}
@@ -123,40 +123,61 @@ func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) err
 		strings.Join(groups, "; ")))
 }
 
-// schemaObjects describes each object of the given kinds (see
-// schemaObjectsQuery) in src's schema, e.g. "view 'v1'" or "trigger 't1_ai'
-// on table 't1'".
-func schemaObjects(ctx context.Context, src SourceResource, kinds []int) ([]string, error) {
+// foundObject is one row of schemaObjectsQuery.
+type foundObject struct {
+	kind    string // an entry of schemaObjectKinds
+	name    string
+	onTable string // the trigger's table; empty for other kinds
+}
+
+func (o foundObject) String() string {
+	if o.onTable != "" {
+		return fmt.Sprintf("%s '%s' on table '%s'", o.kind, o.name, o.onTable)
+	}
+	return fmt.Sprintf("%s '%s'", o.kind, o.name)
+}
+
+// schemaObjects lists each object of the given kinds (see
+// schemaObjectsQuery) in schema, in the query's order.
+func schemaObjects(ctx context.Context, db querier, schema string, kinds []int) ([]foundObject, error) {
 	args := make([]any, len(kinds))
 	for i := range args {
-		args[i] = src.Config.DBName
+		args[i] = schema
 	}
-	rows, err := src.DB.QueryContext(ctx, schemaObjectsQuery(kinds), args...)
+	rows, err := db.QueryContext(ctx, schemaObjectsQuery(kinds), args...)
 	if err != nil {
 		return nil, err
 	}
 	defer utils.CloseAndLog(rows)
-	var objects []string
+	var objects []foundObject
 	for rows.Next() {
 		var kind int
-		var objName, onTable string
+		var o foundObject
 		var weight []byte
-		if err := rows.Scan(&kind, &objName, &onTable, &weight); err != nil {
+		if err := rows.Scan(&kind, &o.name, &o.onTable, &weight); err != nil {
 			return nil, err
 		}
 		if kind < 0 || kind >= len(schemaObjectKinds) {
 			return nil, fmt.Errorf("unexpected object kind %d", kind)
 		}
-		objects = append(objects, describeSchemaObject(schemaObjectKinds[kind], objName, onTable))
+		o.kind = schemaObjectKinds[kind]
+		objects = append(objects, o)
 	}
 	return objects, rows.Err()
 }
 
-func describeSchemaObject(kind, name, onTable string) string {
-	if onTable != "" {
-		return fmt.Sprintf("%s '%s' on table '%s'", kind, name, onTable)
+// describeSchemaObjects lists the objects of the given kinds in src's schema
+// as descriptions, e.g. "view 'v1'" or "trigger 't1_ai' on table 't1'".
+func describeSchemaObjects(ctx context.Context, src SourceResource, kinds []int) ([]string, error) {
+	objects, err := schemaObjects(ctx, src.DB, src.Config.DBName, kinds)
+	if err != nil {
+		return nil, err
 	}
-	return fmt.Sprintf("%s '%s'", kind, name)
+	descs := make([]string, len(objects))
+	for i, o := range objects {
+		descs[i] = o.String()
+	}
+	return descs, nil
 }
 
 // reverseWindowObjectKinds are the object kinds that run on their own and
@@ -199,7 +220,7 @@ func ReverseWindowSchemaObjectsError(ctx context.Context, sources []SourceResour
 		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, reverseWindowVisibility...); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
-		objects, err := schemaObjects(ctx, src, reverseWindowObjectKinds)
+		objects, err := describeSchemaObjects(ctx, src, reverseWindowObjectKinds)
 		if err != nil {
 			return fmt.Errorf("failed to list triggers and events on source %d (%s): %w", i, src.Config.DBName, err)
 		}
