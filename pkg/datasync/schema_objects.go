@@ -147,18 +147,29 @@ func (r *Runner) logUnsyncedSourceObjects(ctx context.Context, views []string) {
 // It runs in setup on every start, a fresh sync and a resume, before sync
 // creates, drops or writes any target table, including the --force wipe. A target schema or
 // table that does not exist yet has no triggers or events, so a fresh sync
-// into a new schema passes. Table names are compared case-insensitively so
-// that a target with lower_case_table_names=1 cannot hide a trigger on a
-// mixed-case source table's copy.
+// into a new schema passes. Table names are compared the way the target
+// compares them: case-insensitively when its lower_case_table_names is
+// nonzero, so a trigger on a mixed-case source table's copy is not missed, and
+// exactly when it is 0, where `Foo` and `foo` are different tables.
 //
 // There is no periodic re-check during the continuous run; the continuous
 // checksum is the backstop for an object added later.
 func (r *Runner) targetSchemaObjectsError(ctx context.Context) error {
 	schema := r.target.Config.DBName
+	var lowerCaseTableNames int
+	if err := r.target.DB.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
+		return fmt.Errorf("failed to read lower_case_table_names on the target: %w", err)
+	}
+	fold := func(name string) string {
+		if lowerCaseTableNames != 0 {
+			return strings.ToLower(name)
+		}
+		return name
+	}
 	owned := make(map[string]bool, len(r.sourceTables)+1)
-	owned[strings.ToLower(syncCheckpointTableName)] = true
+	owned[fold(syncCheckpointTableName)] = true
 	for _, t := range r.sourceTables {
-		owned[strings.ToLower(t.TableName)] = true
+		owned[fold(t.TableName)] = true
 	}
 	triggers, err := queryTriggers(ctx, r.target.DB, schema)
 	if err != nil {
@@ -170,7 +181,7 @@ func (r *Runner) targetSchemaObjectsError(ctx context.Context) error {
 	}
 	var found []string
 	for _, o := range triggers {
-		if owned[strings.ToLower(o.table)] {
+		if owned[fold(o.table)] {
 			found = append(found, o.String())
 		}
 	}

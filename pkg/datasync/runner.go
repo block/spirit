@@ -749,15 +749,16 @@ func (r *Runner) setup(ctx context.Context) error {
 	if err := r.unrecreatableTableError(); err != nil {
 		return err
 	}
-	if len(r.sourceTables) == 0 {
-		return nil
-	}
 	// Before sync creates, drops or writes any target table, including the
 	// --force wipe below. --force does not bypass it: the wipe drops the sync's target
 	// tables (and with them their triggers) only when the target cannot
-	// resume, and it never drops events.
+	// resume, and it never drops events. It also runs when the source has no
+	// base tables, so a target event is refused on every start.
 	if err := r.targetSchemaObjectsError(ctx); err != nil {
 		return err
+	}
+	if len(r.sourceTables) == 0 {
+		return nil
 	}
 
 	if err := r.setupThrottling(ctx); err != nil {

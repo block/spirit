@@ -205,6 +205,38 @@ func TestSyncRefusesTargetEvent(t *testing.T) {
 	require.Empty(t, targetTables(t, openDB(t, dest), dest.DBName), "no table may be created on the target")
 }
 
+// TestSyncRefusesTargetEventWithOnlySourceViews: the target check runs even
+// when the source has no base tables to sync.
+func TestSyncRefusesTargetEventWithOnlySourceViews(t *testing.T) {
+	src, dest := schemaObjectsTestDBs(t, "sync_tgtevent_views")
+	testutils.RunSQLInDatabaseAsRoot(t, src.DBName, "CREATE VIEW v1 AS SELECT 1 AS x")
+	testutils.RunSQL(t, "CREATE DATABASE "+dest.DBName)
+	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+
+	err := runSync(t, newSchemaObjectsSync(src, dest), nil)
+	require.ErrorContains(t, err, `drop them before the sync can continue: event "e1"`)
+}
+
+// TestSyncTargetTriggerMatchFollowsLowerCaseTableNames: with
+// lower_case_table_names=0, `Foo` and `foo` are different tables, so a
+// trigger on an unrelated target table `foo` does not refuse syncing `Foo`.
+func TestSyncTargetTriggerMatchFollowsLowerCaseTableNames(t *testing.T) {
+	src, dest := schemaObjectsTestDBs(t, "sync_tgttrig_case")
+	var lctn int
+	require.NoError(t, openDB(t, dest).QueryRowContext(t.Context(), "SELECT @@lower_case_table_names").Scan(&lctn))
+	if lctn != 0 {
+		t.Skip("needs lower_case_table_names=0")
+	}
+	testutils.RunSQLInDatabase(t, src.DBName, "CREATE TABLE Foo (id INT PRIMARY KEY, val VARCHAR(255))")
+	testutils.RunSQLInDatabase(t, src.DBName, "INSERT INTO Foo VALUES (1,'one')")
+	testutils.RunSQL(t, "CREATE DATABASE "+dest.DBName)
+	testutils.RunSQLInDatabase(t, dest.DBName, "CREATE TABLE foo (id INT PRIMARY KEY, val VARCHAR(255))")
+	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE TRIGGER foo_bi BEFORE INSERT ON foo FOR EACH ROW SET NEW.val = 'x'")
+
+	require.NoError(t, runSync(t, newSchemaObjectsSync(src, dest), nil))
+	require.Equal(t, 1, countIn(t, openDB(t, dest), "SELECT COUNT(*) FROM "+dest.DBName+".Foo"))
+}
+
 // TestSyncAllowsTargetViewsAndRoutines: target views, procedures and
 // functions only run when invoked, and sync never invokes them.
 func TestSyncAllowsTargetViewsAndRoutines(t *testing.T) {
@@ -240,7 +272,7 @@ func TestSyncResumeRefusesTargetTrigger(t *testing.T) {
 		return row
 	}
 	before := checkpointRow()
-	require.NotEqual(t, '|', before[0], "the first run must record a copier watermark: %q", before)
+	require.NotEqual(t, byte('|'), before[0], "the first run must record a copier watermark: %q", before)
 
 	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE TRIGGER t1_bu BEFORE UPDATE ON t1 FOR EACH ROW SET NEW.val = 'changed'")
 	testutils.RunSQLInDatabase(t, src.DBName, "INSERT INTO t1 VALUES (3,'three')")
