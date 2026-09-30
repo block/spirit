@@ -114,17 +114,25 @@ WHERE t.processlist_id = ?
 	killStatement    = "KILL %d"
 
 	// forceKillPrivilegeProbe verifies the connection can read every
-	// performance_schema / information_schema table the force-kill queries
-	// (TableLockQuery and LongRunningEventQuery) depend on. It selects zero rows
-	// (LIMIT 0) so it neither scans nor logs, but MySQL still enforces
-	// table-level SELECT privileges at prepare time, so a missing grant surfaces
-	// as an error.
+	// performance_schema table the force-kill queries (TableLockQuery and
+	// LongRunningEventQuery) depend on. It selects zero rows (LIMIT 0) so it
+	// neither scans nor logs, but MySQL still enforces table-level SELECT
+	// privileges at prepare time, so a missing grant surfaces as an error.
+	// It does not prove access to information_schema.innodb_trx: see
+	// innodbTrxPrivilegeProbe.
 	forceKillPrivilegeProbe = `SELECT 1
 FROM performance_schema.metadata_locks ml
     JOIN performance_schema.threads t ON ml.owner_thread_id = t.thread_id
     LEFT JOIN performance_schema.events_transactions_current etc ON etc.thread_id = ml.owner_thread_id
     LEFT JOIN information_schema.innodb_trx trx ON t.processlist_id = trx.trx_mysql_thread_id
 LIMIT 0`
+
+	// innodbTrxPrivilegeProbe verifies the connection can read
+	// information_schema.innodb_trx, which needs PROCESS. MySQL checks PROCESS
+	// only when it fills that table, and it skips the fill for a query that can
+	// return no rows, so forceKillPrivilegeProbe passes without it. This probe
+	// can return a row, so MySQL fills the table and checks the privilege.
+	innodbTrxPrivilegeProbe = "SELECT 1 FROM information_schema.innodb_trx LIMIT 1"
 )
 
 type LockDetail struct {
@@ -368,17 +376,34 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 	return locks, nil
 }
 
-// CheckForceKillPrivileges verifies that the connection can read the
-// performance_schema and information_schema tables required by the force-kill
-// queries used during cutover (see GetTableLocks and GetLockingTransactions).
-// It returns an error when any of those tables is inaccessible — for example,
-// when the user lacks SELECT on performance_schema.*.
+// CheckForceKillPrivileges verifies that the connection's user holds every
+// privilege force-kill needs: SELECT on the performance_schema tables its
+// queries read (see GetTableLocks and GetLockingTransactions), PROCESS to read
+// information_schema.innodb_trx, and CONNECTION_ADMIN or SUPER to kill another
+// user's session. It returns an error naming each one that is missing.
 //
-// It is intended for preflight privilege checks: the probe selects zero rows
-// and logs nothing, so unlike GetTableLocks / GetLockingTransactions it neither
-// scans server-wide locks nor emits "found locking transaction" log lines.
-func CheckForceKillPrivileges(ctx context.Context, db *sql.DB) (err error) {
-	rows, err := db.QueryContext(ctx, forceKillPrivilegeProbe)
+// It is intended for preflight privilege checks: the probes return at most
+// one row and log nothing, so unlike GetTableLocks / GetLockingTransactions it
+// neither scans server-wide locks nor emits "found locking transaction" log
+// lines.
+func CheckForceKillPrivileges(ctx context.Context, db *sql.DB) error {
+	var errs []error
+	if err := runPrivilegeProbe(ctx, db, forceKillPrivilegeProbe); err != nil {
+		errs = append(errs, fmt.Errorf("read the performance_schema lock tables: %w", err))
+	}
+	if err := runPrivilegeProbe(ctx, db, innodbTrxPrivilegeProbe); err != nil {
+		errs = append(errs, fmt.Errorf("read information_schema.innodb_trx: %w", err))
+	}
+	if err := checkKillPrivilege(ctx, db); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// runPrivilegeProbe runs a probe query and drains its result, so an error
+// raised while the server fills the result surfaces too.
+func runPrivilegeProbe(ctx context.Context, db *sql.DB, query string) (err error) {
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -389,8 +414,6 @@ func CheckForceKillPrivileges(ctx context.Context, db *sql.DB) (err error) {
 			err = cerr
 		}
 	}()
-	// Drain the (zero-row) result set so any driver-side error surfaces during
-	// iteration before we check rows.Err().
 	for rows.Next() {
 	}
 	return rows.Err()

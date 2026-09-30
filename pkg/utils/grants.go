@@ -14,6 +14,30 @@ import (
 // grants (`db`.*); global (*.*), table-level, and routine grants do not match.
 var dbGrantRegexp = regexp.MustCompile("^GRANT (.+) ON `([^`]+)`\\.\\* TO ")
 
+// globalGrantRegexp captures the privilege list from a global grant line,
+// e.g. GRANT PROCESS, RELOAD ON *.* TO `user`@`%` captures "PROCESS, RELOAD".
+var globalGrantRegexp = regexp.MustCompile(`^GRANT (.+) ON \*\.\* TO `)
+
+// GlobalGrantConfersAny reports whether a single SHOW GRANTS line is a global
+// (*.*) grant of ALL PRIVILEGES or of any of privs. It matches privilege names
+// exactly, so SUPER does not match a role or user whose name contains it.
+func GlobalGrantConfersAny(grant string, privs ...string) bool {
+	m := globalGrantRegexp.FindStringSubmatch(grant)
+	if m == nil {
+		return false
+	}
+	granted := splitPrivileges(m[1])
+	if granted["ALL PRIVILEGES"] {
+		return true
+	}
+	for _, p := range privs {
+		if granted[p] {
+			return true
+		}
+	}
+	return false
+}
+
 // migrationDBPrivileges is the database-level privilege set spirit requires to
 // run a migration or move (mirroring gh-ost's historical requirement). A grant
 // of ALL PRIVILEGES, or of every privilege in this set, satisfies the check.

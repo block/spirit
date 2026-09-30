@@ -2,10 +2,8 @@ package check
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn"
@@ -22,8 +20,7 @@ func init() {
 func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	// This is a re-implementation of the gh-ost check
 	// validateGrants() in gh-ost/go/logic/inspect.go
-	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload, foundConnectionAdmin, foundProcess bool
-	var grantedRoles []string
+	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload bool
 	rows, err := r.DB.QueryContext(ctx, `SHOW GRANTS`)
 	if err != nil {
 		return err
@@ -58,18 +55,6 @@ func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 		if utils.DBLevelGrantCoversSchema(grant, r.Table.SchemaName) {
 			foundDBAll = true
 		}
-		if strings.Contains(grant, `CONNECTION_ADMIN`) && strings.Contains(grant, ` ON *.*`) {
-			foundConnectionAdmin = true
-		}
-		if strings.Contains(grant, `PROCESS`) && strings.Contains(grant, ` ON *.*`) {
-			foundProcess = true
-		}
-		// Collect role names from grant lines like:
-		// GRANT `rds_superuser_role`@`%` TO `user`@`%`
-		if strings.HasPrefix(grant, "GRANT `") && strings.Contains(grant, " TO ") {
-			roles := utils.ParseRoleNames(grant)
-			grantedRoles = append(grantedRoles, roles...)
-		}
 	}
 	if rows.Err() != nil {
 		return rows.Err()
@@ -78,31 +63,12 @@ func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) erro
 		return nil
 	}
 
-	// On RDS, privileges like CONNECTION_ADMIN and PROCESS are granted via the
-	// opaque rds_superuser_role. When activate_all_roles_on_login=ON, this role
-	// is automatically active on every connection, so we can skip checking for
-	// those privileges directly.
-	skipRolePrivilegeCheck := slices.Contains(grantedRoles, "rds_superuser_role") && dbconn.ActivateAllRolesOnLogin(ctx, r.DB, logger)
-
-	// Force-kill is always enabled, so its privileges are always required.
-	var errs []error
-	// Parsing performance_schema grants seems really hard, so we just probe
-	// the tables the force-kill queries read and see if it succeeds. This is
-	// a privilege probe only: it selects zero rows and logs nothing. The
-	// actual lock detection (which does log) runs during cutover.
+	// Force-kill is enabled by default, so its privileges are required: the
+	// performance_schema lock tables, PROCESS, and CONNECTION_ADMIN or SUPER.
+	// The check reads at most one row and logs nothing; the lock detection
+	// that does log runs during cutover.
 	if err := dbconn.CheckForceKillPrivileges(ctx, r.DB); err != nil {
-		errs = append(errs, err)
-	}
-	if !skipRolePrivilegeCheck {
-		if !foundConnectionAdmin && !foundSuper {
-			errs = append(errs, errors.New("missing CONNECTION_ADMIN privilege"))
-		}
-		if !foundProcess {
-			errs = append(errs, errors.New("missing PROCESS privilege"))
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("insufficient privileges to run a migration with force-kill. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", errors.Join(errs...))
+		return fmt.Errorf("insufficient privileges to run a migration with force-kill. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", err)
 	}
 
 	if foundSuper && foundReplicationSlave && foundDBAll {

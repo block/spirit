@@ -89,6 +89,29 @@ func TestDBLevelGrantCoversSchema(t *testing.T) {
 	}
 }
 
+// TestGlobalGrantConfersAny matches privilege names exactly, on global grants
+// only.
+func TestGlobalGrantConfersAny(t *testing.T) {
+	tests := []struct {
+		name  string
+		grant string
+		want  bool
+	}{
+		{"dynamic privilege", "GRANT CONNECTION_ADMIN,SYSTEM_VARIABLES_ADMIN ON *.* TO `u`@`%`", true},
+		{"static privilege", "GRANT SELECT, PROCESS, SUPER ON *.* TO `u`@`%`", true},
+		{"all privileges", "GRANT ALL PRIVILEGES ON *.* TO `u`@`%` WITH GRANT OPTION", true},
+		{"missing", "GRANT SELECT, PROCESS ON *.* TO `u`@`%`", false},
+		{"database-level grant", "GRANT ALL PRIVILEGES ON `test`.* TO `u`@`%`", false},
+		{"name inside a role", "GRANT `rds_SUPERuser_role`@`%` TO `u`@`%`", false},
+		{"name inside a user", "GRANT SELECT ON *.* TO `SUPER`@`%`", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, GlobalGrantConfersAny(tt.grant, "CONNECTION_ADMIN", "SUPER"))
+		})
+	}
+}
+
 func TestMySQLLikeMatch(t *testing.T) {
 	tests := []struct {
 		pattern string
