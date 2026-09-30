@@ -76,6 +76,48 @@ func GlobalGrantHasAny(grant string, privs ...string) bool {
 	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
 }
 
+// GlobalGrantNamesAny reports whether a single SHOW GRANTS line is a global
+// (*.*) grant that names any privilege in privs explicitly. Unlike
+// GlobalGrantHasAny, ALL PRIVILEGES does not count. Use it for dynamic
+// privileges such as SHOW_ROUTINE: GRANT ALL includes a dynamic privilege only
+// if it was registered when the grant was issued, so a global ALL grant made
+// before an upgrade can lack it, and SHOW GRANTS still prints ALL PRIVILEGES.
+func GlobalGrantNamesAny(grant string, privs ...string) bool {
+	m := globalGrantRegexp.FindStringSubmatch(grant)
+	if m == nil {
+		return false
+	}
+	granted := splitPrivileges(m[1])
+	for _, p := range privs {
+		if granted[p] {
+			return true
+		}
+	}
+	return false
+}
+
+// DBLevelGrantName returns the database name of a single SHOW GRANTS line if
+// it is a database-level grant whose name matches schemaName (see
+// DBNameMatches), with the doubled backquotes SHOW GRANTS writes undone. The
+// name is returned as granted, so a pattern keeps its wildcards and escapes.
+//
+// SHOW GRANTS prints one line per mysql.db row, and MySQL applies only one
+// row to a schema, not the union of every row whose name matches it: an
+// exact-name row can shadow a pattern row, depending on the order the grants
+// were created. Callers that need a privilege on the schema can group the
+// matching lines by this name and require the privilege on every name.
+func DBLevelGrantName(grant, schemaName string, partialRevokes bool) (string, bool) {
+	m := dbGrantRegexp.FindStringSubmatch(grant)
+	if m == nil {
+		return "", false
+	}
+	name := unquoteDBName(m[2])
+	if !DBNameMatches(name, schemaName, partialRevokes) {
+		return "", false
+	}
+	return name, true
+}
+
 // DBLevelGrantHasAny reports whether a single SHOW GRANTS line is a
 // database-level grant whose database name matches schemaName (see
 // DBNameMatches) and that confers ALL PRIVILEGES or any privilege in privs.

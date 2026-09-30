@@ -256,3 +256,47 @@ func TestDBLevelRevokeHasAny(t *testing.T) {
 		})
 	}
 }
+
+func TestGlobalGrantNamesAny(t *testing.T) {
+	assert.True(t, GlobalGrantNamesAny("GRANT SELECT, SHOW_ROUTINE ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	assert.True(t, GlobalGrantNamesAny("GRANT CONNECTION_ADMIN,SHOW_ROUTINE ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	// ALL PRIVILEGES does not name a dynamic privilege.
+	assert.False(t, GlobalGrantNamesAny("GRANT ALL PRIVILEGES ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	assert.False(t, GlobalGrantNamesAny("GRANT SELECT ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
+	assert.False(t, GlobalGrantNamesAny("GRANT SHOW_ROUTINE ON `app`.* TO `u`@`%`", "SHOW_ROUTINE"))
+}
+
+func TestDBLevelGrantName(t *testing.T) {
+	tests := []struct {
+		grant, schema  string
+		partialRevokes bool
+		want           string
+		ok             bool
+	}{
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", "app", false, "app", true},
+		// A pattern is returned as granted, escapes included.
+		{"GRANT EVENT ON `app\\_%`.* TO `u`@`%`", "app_1", false, "app\\_%", true},
+		{"GRANT EVENT ON `app%`.* TO `u`@`%`", "app_1", false, "app%", true},
+		{"GRANT EVENT ON `app\\_%`.* TO `u`@`%`", "appx1", false, "", false},
+		// SHOW GRANTS doubles a backquote in the name.
+		{"GRANT EVENT ON `a``b`.* TO `u`@`%`", "a`b", false, "a`b", true},
+		{"GRANT EVENT ON `a``b`.* TO `u`@`%`", "a``b", false, "", false},
+		// partial_revokes=ON: the name is literal, including a backslash.
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", "app", true, "app", true},
+		{"GRANT EVENT ON `app%`.* TO `u`@`%`", "app_1", true, "", false},
+		{"GRANT EVENT ON `app\\_1`.* TO `u`@`%`", "app_1", true, "", false},
+		{"GRANT EVENT ON `app\\_1`.* TO `u`@`%`", "app\\_1", true, "app\\_1", true},
+		// Not database-level grants.
+		{"GRANT EVENT ON *.* TO `u`@`%`", "app", false, "", false},
+		{"GRANT SELECT ON `app`.`t1` TO `u`@`%`", "app", false, "", false},
+		{"REVOKE EVENT ON `app`.* FROM `u`@`%`", "app", true, "", false},
+		{"GRANT `r`@`%` TO `u`@`%`", "app", false, "", false},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%s %s partial_revokes=%t", tc.grant, tc.schema, tc.partialRevokes), func(t *testing.T) {
+			name, ok := DBLevelGrantName(tc.grant, tc.schema, tc.partialRevokes)
+			assert.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.want, name)
+		})
+	}
+}

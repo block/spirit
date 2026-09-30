@@ -28,13 +28,24 @@ func init() {
 //     source schema in information_schema, so the source_schema_objects check
 //     cannot pass just because they are hidden (see schemaGrants)
 //
-// On RDS, the opaque rds_superuser_role cannot be inspected for its underlying
-// privileges. When activate_all_roles_on_login=ON, the role is automatically
-// active on every connection, so we tolerate its presence as a substitute for
-// CONNECTION_ADMIN and PROCESS. It is not a substitute for the visibility
-// grants: SHOW GRANTS lists the privileges of the user's active roles, so the
-// visibility grants a real rds_superuser_role carries are counted, and a role
-// that only has the name is not.
+// SHOW GRANTS by the current user lists the privileges of its active roles,
+// including a default role and, with activate_all_roles_on_login=ON, every
+// granted role, so privileges granted through a role are counted like direct
+// grants. The visibility grants are always read this way: a role named
+// rds_superuser_role counts for what SHOW GRANTS lists for it, and its name
+// alone counts for nothing.
+//
+// The one exception is older than the visibility requirement: on RDS, a
+// granted rds_superuser_role is accepted by name in place of CONNECTION_ADMIN
+// and PROCESS when activate_all_roles_on_login=ON (see
+// rdsSuperuserRoleActive), and the visibility requirement left it as it was.
+// Those two privileges are only used by force-kill during cutover, to find
+// and kill other users' sessions that block the table lock. If the role lacks
+// them, the kill fails and is logged, and the cutover waits for the blocking
+// sessions or times out with an error. It never goes ahead without the lock,
+// and no object is missed. Visibility is
+// different: without it, the object scan sees an empty schema and passes, so
+// no name-based exemption applies to it.
 func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 	for i, src := range r.Sources {
 		if err := checkSourcePrivileges(ctx, src); err != nil {
@@ -111,10 +122,9 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 		return schemaObjectVisibilityFromGrants(grants, schemaName, partialRevokes, allSchemaObjects...)
 	}
 
-	// On RDS, privileges like CONNECTION_ADMIN and PROCESS are granted via the
-	// opaque rds_superuser_role. When activate_all_roles_on_login=ON, this role
-	// is automatically active on every connection, so we can skip checking for
-	// those privileges directly.
+	// A granted rds_superuser_role stands in for CONNECTION_ADMIN and PROCESS
+	// when activate_all_roles_on_login=ON (see privilegesCheck for why this
+	// name-based exemption covers only these two force-kill privileges).
 	skipRolePrivilegeCheck, err := rdsSuperuserRoleActive(ctx, db, grants)
 	if err != nil {
 		return err
@@ -153,9 +163,10 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 
 // rdsSuperuserRoleActive reports whether the user has the RDS
 // rds_superuser_role and activate_all_roles_on_login=ON makes it active on
-// every connection. The role's privileges cannot be inspected through SHOW
-// GRANTS, so its presence is accepted in place of CONNECTION_ADMIN and
-// PROCESS. The server setting is read only when the role is granted. A failed
+// every connection. Its presence is then accepted in place of CONNECTION_ADMIN
+// and PROCESS, whatever SHOW GRANTS lists for it; this exemption predates the
+// visibility requirement and does not apply to it (see privilegesCheck). The
+// server setting is read only when the role is granted. A failed
 // read is returned as an error, so that a transient failure is never taken
 // for a missing privilege.
 func rdsSuperuserRoleActive(ctx context.Context, db dbconn.RowQuerier, grants []string) (bool, error) {
@@ -197,11 +208,13 @@ var allSchemaObjects = []schemaObject{schemaViews, schemaTriggers, schemaEvents,
 // views need SELECT, triggers TRIGGER, events EVENT, and stored routines
 // SHOW_ROUTINE (MySQL 8.0.20+), global SELECT, or a routine privilege
 // (EXECUTE, ALTER ROUTINE, CREATE ROUTINE). A privilege counts on the schema
-// if it is granted on the schema or globally, unless a partial revoke
-// removes the global grant for that schema. The name in a database-level
-// grant is a pattern when partial_revokes=OFF and a literal name when it is
-// ON (see utils.DBNameMatches); partial revokes only exist when it is ON. Table-level grants do not count:
-// move needs to see the whole schema. For the current user, SHOW GRANTS
+// if it is granted globally, unless a partial revoke removes the global grant
+// for that schema, or if it is on every database-level grant whose name
+// matches the schema (see onSchema). SHOW_ROUTINE counts only when named: a
+// global ALL PRIVILEGES does not imply it. The name in a database-level grant
+// is a pattern when partial_revokes=OFF and a literal name when it is ON (see
+// utils.DBNameMatches); partial revokes only exist when it is ON. Table-level
+// grants do not count: move needs to see the whole schema. For the current user, SHOW GRANTS
 // includes the privileges of its active roles, so a grant through a default
 // role counts, and a granted role that is not active does not.
 type schemaGrants struct {
@@ -210,35 +223,73 @@ type schemaGrants struct {
 	partialRevokes bool
 }
 
-// global reports whether priv is granted globally and not partially revoked
-// on the schema.
-func (g schemaGrants) global(priv string) bool {
-	var granted bool
+// global reports whether any of privs is granted globally and not partially
+// revoked on the schema. A global ALL PRIVILEGES counts; see globalNamed for
+// dynamic privileges.
+func (g schemaGrants) global(privs ...string) bool {
+	return g.globalBy(utils.GlobalGrantHasAny, privs...)
+}
+
+// globalNamed is global, but counts only a global grant that names one of
+// privs, not ALL PRIVILEGES. It is for dynamic privileges such as
+// SHOW_ROUTINE, which a global ALL grant made before an upgrade can lack.
+func (g schemaGrants) globalNamed(privs ...string) bool {
+	return g.globalBy(utils.GlobalGrantNamesAny, privs...)
+}
+
+func (g schemaGrants) globalBy(granted func(string, ...string) bool, privs ...string) bool {
+	for _, priv := range privs {
+		if g.globalOne(granted, priv) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g schemaGrants) globalOne(granted func(string, ...string) bool, priv string) bool {
+	var found bool
 	for _, line := range g.lines {
 		if utils.DBLevelRevokeHasAny(line, g.schema, priv) {
 			return false
 		}
-		if utils.GlobalGrantHasAny(line, priv) {
-			granted = true
+		if granted(line, priv) {
+			found = true
 		}
 	}
-	return granted
+	return found
 }
 
-// onSchema reports whether priv applies to the whole schema.
-func (g schemaGrants) onSchema(priv string) bool {
-	if g.global(priv) {
+// onSchema reports whether any of privs applies to the whole schema: granted
+// globally, or on the database-level grant the server applies to the schema.
+//
+// MySQL applies one database-level grant (mysql.db row) to a schema, not the
+// union of every row whose name matches it, so a privilege granted on a
+// pattern such as `app_%`.* does not reach app_1 when an exact-name grant on
+// `app_1`.* is the row applied. Which row applies depends on the order the
+// grants were created, which SHOW GRANTS does not show. SHOW GRANTS prints one
+// line per row, so the matching lines are grouped by granted name, and one of
+// privs must be on every name.
+func (g schemaGrants) onSchema(privs ...string) bool {
+	if g.global(privs...) {
 		return true
 	}
 	if g.schema == "" {
 		return false
 	}
+	has := map[string]bool{}
 	for _, line := range g.lines {
-		if utils.DBLevelGrantHasAny(line, g.schema, g.partialRevokes, priv) {
-			return true
+		name, ok := utils.DBLevelGrantName(line, g.schema, g.partialRevokes)
+		if !ok {
+			continue
+		}
+		has[name] = has[name] || utils.DBLevelGrantHasAny(line, g.schema, g.partialRevokes, privs...)
+	}
+	for _, ok := range has {
+		if !ok {
+			return false
 		}
 	}
-	return false
+	return len(has) > 0
 }
 
 // sees reports whether the grants make every object of kind o in the schema
@@ -252,8 +303,8 @@ func (g schemaGrants) sees(o schemaObject) (bool, string) {
 	case schemaEvents:
 		return g.onSchema("EVENT"), fmt.Sprintf("EVENT on `%s`.* (to see its events)", g.schema)
 	case schemaRoutines:
-		ok := g.global("SHOW_ROUTINE") || g.global("SELECT") ||
-			g.onSchema("EXECUTE") || g.onSchema("ALTER ROUTINE") || g.onSchema("CREATE ROUTINE")
+		ok := g.globalNamed("SHOW_ROUTINE") || g.global("SELECT") ||
+			g.onSchema("EXECUTE", "ALTER ROUTINE", "CREATE ROUTINE")
 		return ok, fmt.Sprintf("SHOW_ROUTINE on *.* (to see its stored procedures and functions; SELECT on *.*, or EXECUTE on `%s`.*, also works)", g.schema)
 	}
 	return false, fmt.Sprintf("unknown schema object kind %d", o)

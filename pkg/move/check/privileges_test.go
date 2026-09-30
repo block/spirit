@@ -410,6 +410,8 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 		{"SHOW_ROUTINE on *.*", "testmovevis_showroutine", "GRANT SHOW_ROUTINE ON *.* TO %s"},
 		{"SELECT on *.*", "testmovevis_globalselect", "GRANT SELECT ON *.* TO %s"},
 		{"EXECUTE on the schema", "testmovevis_execute", "GRANT EXECUTE ON `" + schema + "`.* TO %s"},
+		{"ALTER ROUTINE on the schema", "testmovevis_alterroutine", "GRANT ALTER ROUTINE ON `" + schema + "`.* TO %s"},
+		{"CREATE ROUTINE on the schema", "testmovevis_createroutine", "GRANT CREATE ROUTINE ON `" + schema + "`.* TO %s"},
 	} {
 		t.Run("EVENT and "+tc.name, func(t *testing.T) {
 			db, cfg := createMoveTestUser(t, tc.user, schema,
@@ -419,6 +421,34 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 			require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), allObjects)
 		})
 	}
+}
+
+// TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant: MySQL applies
+// one database-level grant row to a schema, not the union of every row whose
+// name matches it. Here the exact-name grant (created first) is the one that
+// applies, so EVENT granted on a pattern that also matches the schema does not
+// reach it, and information_schema.EVENTS hides the schema's event. The
+// visibility check must not count the pattern's EVENT.
+func TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant(t *testing.T) {
+	schema, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+	// '%' is doubled because createMoveTestUser formats each grant with Sprintf.
+	pattern := schema[:len(schema)-1] + "%%"
+	db, cfg := createMoveTestUser(t, "testmovevis_wildevent", schema,
+		append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+pattern+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+	var visible int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?", schema).Scan(&visible))
+	require.Zero(t, visible, "the server hides the event from this user")
+
+	src := []SourceResource{{DB: db, Config: cfg}}
+	require.ErrorIs(t, privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default()), ErrRefused)
+	require.ErrorIs(t, SourceSchemaObjectsError(t.Context(), src), ErrRefused)
+	// The reverse-window check uses the same evaluation.
+	err := ReverseWindowSchemaObjectsError(t.Context(), src)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, "EVENT on `"+schema+"`.* (to see its events)")
 }
 
 // TestSourceSchemaObjectsCheckRequiresVisibility checks that every scan
@@ -484,6 +514,7 @@ func TestSchemaObjectVisibilityFromGrants(t *testing.T) {
 	needTrigger := "TRIGGER on `app`.* (to see its triggers)"
 	needEvent := "EVENT on `app`.* (to see its events)"
 	needRoutine := "SHOW_ROUTINE on *.* (to see its stored procedures and functions; SELECT on *.*, or EXECUTE on `app`.*, also works)"
+	allRevoked := "REVOKE SELECT, EXECUTE, ALTER ROUTINE, CREATE ROUTINE ON `app`.* FROM `u`@`%`"
 	for _, tc := range []struct {
 		name    string
 		grants  []string
@@ -504,6 +535,21 @@ func TestSchemaObjectVisibilityFromGrants(t *testing.T) {
 		{"partial revoke of ALL PRIVILEGES", []string{"GRANT ALL PRIVILEGES ON *.*" + u, "REVOKE ALL PRIVILEGES ON `app`.* FROM `u`@`%`"}, []string{needSelect, needTrigger, needEvent, needRoutine}},
 		{"database-level grant with a partial revoke of the global grant", []string{"GRANT EVENT ON *.*" + u, "REVOKE EVENT ON `app`.* FROM `u`@`%`", base, routines}, nil},
 		{"routine privilege on the schema", []string{base, "GRANT EXECUTE ON `app`.*" + u}, nil},
+		// MySQL applies one database-level grant to the schema, and SHOW
+		// GRANTS does not say which, so a privilege must be on every
+		// database-level grant whose name matches.
+		{"pattern grant shadowed by an exact-name grant", []string{"GRANT SELECT, TRIGGER ON `app`.*" + u, "GRANT SELECT, TRIGGER, EVENT ON `a%`.*" + u, routines}, []string{needEvent}},
+		{"exact-name grant shadowed by a pattern grant", []string{"GRANT SELECT, TRIGGER, EVENT ON `app`.*" + u, "GRANT EVENT ON `a%`.*" + u, routines}, []string{needSelect, needTrigger}},
+		{"privilege on every matching grant", []string{base, "GRANT SELECT, TRIGGER, EVENT ON `a%`.*" + u, routines}, nil},
+		{"several lines for one grant", []string{"GRANT SELECT ON `app`.*" + u, "GRANT TRIGGER, EVENT ON `app`.*" + u, routines}, nil},
+		{"global grant with shadowed database-level grants", []string{"GRANT SELECT, TRIGGER ON `app`.*" + u, "GRANT SELECT, TRIGGER, EVENT ON `a%`.*" + u, "GRANT EVENT ON *.*" + u, routines}, nil},
+		{"different routine privilege on each matching grant", []string{base, "GRANT EXECUTE ON `app`.*" + u, "GRANT SELECT, TRIGGER, EVENT, ALTER ROUTINE ON `a%`.*" + u}, nil},
+		{"routine privilege missing on one matching grant", []string{base, "GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `a%`.*" + u}, []string{needRoutine}},
+		// SHOW_ROUTINE is dynamic: a global ALL grant made before it existed
+		// lacks it, and SHOW GRANTS still prints ALL PRIVILEGES, so only a
+		// grant that names it counts.
+		{"global ALL PRIVILEGES does not imply SHOW_ROUTINE", []string{"GRANT ALL PRIVILEGES ON *.*" + u, allRevoked}, []string{needSelect, needRoutine}},
+		{"SHOW_ROUTINE named with global ALL PRIVILEGES", []string{"GRANT ALL PRIVILEGES ON *.*" + u, allRevoked, routines}, []string{needSelect}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := schemaObjectVisibilityFromGrants(tc.grants, "app", false, allSchemaObjects...)
@@ -523,6 +569,10 @@ func TestSchemaObjectVisibilityFromGrants(t *testing.T) {
 	require.ErrorIs(t, err, ErrRefused)
 	require.ErrorContains(t, err, "Needed: "+strings.Join([]string{needSelect, needTrigger, needEvent, needRoutine}, "; "))
 	require.NoError(t, schemaObjectVisibilityFromGrants([]string{"GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `app`.*" + u}, "app", true, allSchemaObjects...))
+	// Partial revokes exist only with partial_revokes=ON; the result is the same.
+	err = schemaObjectVisibilityFromGrants([]string{"GRANT ALL PRIVILEGES ON *.*" + u, allRevoked}, "app", true, allSchemaObjects...)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, "Needed: "+needSelect+"; "+needRoutine)
 	// Only the kinds asked for are evaluated.
 	require.NoError(t, schemaObjectVisibilityFromGrants([]string{"GRANT TRIGGER ON `app`.*" + u}, "app", false, schemaTriggers))
 }
