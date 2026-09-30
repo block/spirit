@@ -55,3 +55,19 @@ func normalizeCollationName(collation string) string {
 func charsetDefaultCollationIsFixed(cs string) bool {
 	return cs != "" && !strings.EqualFold(cs, charset.CharsetUTF8MB4)
 }
+
+// utf8mb4ServerDefaultCollations are the only collations a column naming
+// utf8mb4 without a COLLATE can take. MySQL gives such a column the server's
+// default_collation_for_utf8mb4, whatever the table default is, and that
+// variable accepts no other values (error 3721).
+var utf8mb4ServerDefaultCollations = map[string]bool{
+	"utf8mb4_0900_ai_ci": true,
+	"utf8mb4_general_ci": true,
+}
+
+// takesServerUTF8MB4Default reports whether a column declares CHARACTER SET
+// utf8mb4 without a COLLATE, so that its collation is the server's
+// default_collation_for_utf8mb4 rather than anything the definition names.
+func takesServerUTF8MB4Default(col *Column) bool {
+	return col.Charset != nil && col.Collation == nil && strings.EqualFold(*col.Charset, charset.CharsetUTF8MB4)
+}

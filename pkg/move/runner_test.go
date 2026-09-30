@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/sentinel"
@@ -334,7 +335,21 @@ func TestMoveWithNewTableCreation(t *testing.T) {
 // applier which requires full row images. We simulate a rogue session that has
 // SET binlog_row_image = 'minimal' at the session level, which causes its DML
 // to produce minimal row images in the binlog even though the global setting is FULL.
+//
+// The minimal-image UPDATE is committed only once the move is parked at the
+// sentinel (DeferCutOver), so the change feed is already streaming and the
+// move cannot cut over before the event reaches it. The move then ends either
+// through the UPDATE or through the sentinel wait limit, and the assertions
+// below reject the latter. See https://github.com/block/spirit/issues/1344.
 func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
+	// TestMain shrinks sentinel.WaitLimit to 10s for this package. Give the
+	// change feed a minute to read the event instead, so a slow feed (for
+	// example a streamer recreate on a loaded -race runner) cannot fail the
+	// test on a sentinel timeout.
+	oldWaitLimit := sentinel.WaitLimit
+	sentinel.WaitLimit = time.Minute
+	t.Cleanup(func() { sentinel.WaitLimit = oldWaitLimit })
+
 	sourceDSN := testutils.DSNForDatabase("source_minrbr")
 	targetDSN := testutils.DSNForDatabase("dest_minrbr")
 
@@ -347,9 +362,6 @@ func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
 		name VARCHAR(255) NOT NULL,
 		val INT NOT NULL DEFAULT 0
 	)`)
-
-	// Insert a small amount of data. The copier will finish quickly,
-	// and the error will surface when Flush/BlockWait is called after the copy phase.
 	testutils.RunSQL(t, `INSERT INTO source_minrbr.t1 (name, val) VALUES ('seed', 1)`)
 	for range 5 {
 		testutils.RunSQL(t, `INSERT INTO source_minrbr.t1 (name, val) SELECT CONCAT(name, '-', id), val FROM source_minrbr.t1`)
@@ -357,58 +369,117 @@ func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
 
 	testutils.RunSQL(t, `CREATE DATABASE dest_minrbr`)
 
-	// Open a dedicated connection with session-level minimal RBR.
-	// DML on this connection will produce minimal row images in the binlog.
+	// Pin one session with session-level minimal RBR. A *sql.Conn guarantees
+	// the UPDATE below runs on the session that has the variable set.
 	minimalDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(minimalDB)
-
-	// Force a single connection so the session variable sticks.
-	minimalDB.SetMaxOpenConns(1)
-	_, err = minimalDB.ExecContext(t.Context(), "SET binlog_row_image = 'MINIMAL'")
+	minimalConn, err := minimalDB.Conn(t.Context())
 	require.NoError(t, err)
+	defer utils.CloseAndLog(minimalConn)
+	_, err = minimalConn.ExecContext(t.Context(), "SET binlog_row_image = 'MINIMAL'")
+	require.NoError(t, err)
+	var rowImage string
+	require.NoError(t, minimalConn.QueryRowContext(t.Context(), "SELECT @@SESSION.binlog_row_image").Scan(&rowImage))
+	require.Equal(t, "MINIMAL", rowImage)
 
-	// Write a batch of rows using the minimal-RBR session before starting the move.
-	// These will be in the binlog when the repl client starts reading.
-	for i := range 100 {
-		_, err = minimalDB.ExecContext(t.Context(), `UPDATE source_minrbr.t1 SET val = val + 1 WHERE id = ?`, (i%32)+1)
-		require.NoError(t, err)
-	}
-
-	// Also keep writing during the move to ensure the repl client sees minimal events.
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		for i := 0; ; i++ {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				_, _ = minimalDB.ExecContext(ctx, `UPDATE source_minrbr.t1 SET val = val + 1 WHERE id = ?`, (i%32)+1)
-			}
-		}
-	})
-
-	move := &Move{
+	runner, err := NewRunner(&Move{
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
 		Threads:      2,
 		WriteThreads: 2,
-		DeferCutOver: false,
+		DeferCutOver: true,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+	errLog := &errorLogState{}
+	runner.SetLogger(slog.New(&errorLogRecorder{Handler: slog.Default().Handler(), state: errLog}))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, done)
+
+	// Commit one minimal-image UPDATE. The change feed is streaming, so it
+	// must read this event and abort the move.
+	res, err := minimalConn.ExecContext(t.Context(), `UPDATE source_minrbr.t1 SET val = val + 1 WHERE id = 1`)
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "the minimal-image UPDATE must change a row to produce a rows event")
+
+	// The sentinel wait limit bounds Run, so this timeout is only a backstop.
+	// When it fires, give Run a bounded time to honour the cancel before
+	// failing, so the deferred Close does not race a still-running Run and
+	// goleak does not bury this failure under a leak report.
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(2 * time.Minute):
+		cancel()
+		select {
+		case <-done:
+			t.Fatal("move did not return after a minimal RBR event was committed")
+		case <-time.After(30 * time.Second):
+			t.Fatal("move did not return after a minimal RBR event was committed, nor within 30s of being cancelled")
+		}
 	}
 
-	err = move.Run()
-	cancel()
-	wg.Wait()
+	// The runtime check detects the minimal row image while a buffered
+	// applier is in use and aborts the move through the change feed's fatal
+	// path. Require that specific cause so an unrelated error (for example a
+	// sentinel timeout) cannot pass the test.
+	require.Error(t, runErr)
+	require.NotErrorIs(t, runErr, context.Canceled)
+	require.ErrorContains(t, runErr, "fatal change feed condition ("+change.FatalReasonStreamError.String()+")")
+	// The stream-error reason is shared with other rows-event failures: with
+	// the minimal-image check removed, the event still aborts the move because
+	// its after-image has no primary key. The returned error does not carry
+	// the underlying cause, so check the logged one.
+	require.True(t, slices.ContainsFunc(errLog.snapshot(), func(e string) bool {
+		return strings.Contains(e, "received a minimal RBR event for table source_minrbr.t1")
+	}), "the move must be aborted by the minimal RBR check, got errors: %v", errLog.snapshot())
+}
 
-	// The move should fail because the runtime check detects minimal RBR
-	// events while a buffered applier is in use. The repl client cancels
-	// the caller's context, so the error may be context.Canceled or may
-	// contain the original "minimal RBR" message depending on which
-	// operation observes the cancellation first.
-	require.Error(t, err)
+// errorLogRecorder records the "error" attribute of every ERROR record and
+// passes all records on to the wrapped handler.
+type errorLogRecorder struct {
+	slog.Handler
+	state *errorLogState
+}
+
+type errorLogState struct {
+	mu     sync.Mutex
+	errors []string
+}
+
+func (h *errorLogRecorder) Handle(ctx context.Context, rec slog.Record) error {
+	if rec.Level >= slog.LevelError {
+		rec.Attrs(func(a slog.Attr) bool {
+			if a.Key == "error" {
+				h.state.mu.Lock()
+				h.state.errors = append(h.state.errors, a.Value.String())
+				h.state.mu.Unlock()
+			}
+			return true
+		})
+	}
+	return h.Handler.Handle(ctx, rec)
+}
+
+func (h *errorLogRecorder) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &errorLogRecorder{Handler: h.Handler.WithAttrs(attrs), state: h.state}
+}
+
+func (h *errorLogRecorder) WithGroup(name string) slog.Handler {
+	return &errorLogRecorder{Handler: h.Handler.WithGroup(name), state: h.state}
+}
+
+func (s *errorLogState) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.errors...)
 }
 
 // TestMoveResumeDeletesRecopyRange verifies that when a move operation

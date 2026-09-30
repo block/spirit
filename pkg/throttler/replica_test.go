@@ -195,13 +195,15 @@ func newLagQueryFixture(t *testing.T) *lagQueryFixture {
 	t.Helper()
 	// APPLYING_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP is NULL for an idle
 	// worker. The real table stores a zero date there; both make
-	// TIMESTAMPDIFF return NULL.
+	// TIMESTAMPDIFF return NULL. written_at is not in the real table: it
+	// records the NOW(6) the commit timestamps were derived from.
 	worker := testutils.NewTestTable(t, "lagq_worker",
 		`CREATE TABLE lagq_worker (
 			channel_name VARCHAR(64) NOT NULL PRIMARY KEY,
 			APPLYING_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP DATETIME(6) NULL,
 			LAST_APPLIED_TRANSACTION VARCHAR(64) NOT NULL,
-			LAST_APPLIED_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP DATETIME(6) NOT NULL
+			LAST_APPLIED_TRANSACTION_IMMEDIATE_COMMIT_TIMESTAMP DATETIME(6) NOT NULL,
+			written_at DATETIME(6) NOT NULL
 		)`)
 	testutils.NewTestTable(t, "lagq_conn",
 		`CREATE TABLE lagq_conn (
@@ -212,6 +214,9 @@ func newLagQueryFixture(t *testing.T) *lagQueryFixture {
 	query := strings.ReplaceAll(MySQL8LagQuery, "performance_schema.replication_applier_status_by_worker", "lagq_worker")
 	query = strings.ReplaceAll(query, "performance_schema.replication_connection_status", "lagq_conn")
 	require.NotContains(t, query, "performance_schema")
+	// NOW(6) is fixed for the whole statement, so the elapsed time read next
+	// to the lag uses the same clock reading as the lag itself.
+	query = "SELECT q.lagMs, (SELECT TIMESTAMPDIFF(MICROSECOND, written_at, NOW(6)) FROM lagq_worker) FROM (" + query + ") q"
 	return &lagQueryFixture{db: worker.DB, query: query}
 }
 
@@ -219,48 +224,63 @@ func newLagQueryFixture(t *testing.T) *lagQueryFixture {
 // applyingOffsetUs and appliedOffsetUs place the commit timestamps relative to
 // the server's NOW(6); a nil applyingOffsetUs means no transaction is in
 // flight. queuedGTID equal to lagQueryAppliedGTID means the queue is caught up.
-func (f *lagQueryFixture) lag(t *testing.T, applyingOffsetUs *int, appliedOffsetUs int, queuedGTID string) int64 {
+//
+// It also returns how far the server's NOW(6) advanced between writing the
+// commit timestamps and running the query, read in the same statement as the
+// lag. A timestamp written at offset o therefore reads exactly elapsedUs - o.
+func (f *lagQueryFixture) lag(t *testing.T, applyingOffsetUs *int64, appliedOffsetUs int64, queuedGTID string) (lagMs, elapsedUs int64) {
 	t.Helper()
 	ctx := t.Context()
-	_, err := f.db.ExecContext(ctx, "REPLACE INTO lagq_worker VALUES ('', NOW(6) + INTERVAL ? MICROSECOND, ?, NOW(6) + INTERVAL ? MICROSECOND)",
+	_, err := f.db.ExecContext(ctx, "REPLACE INTO lagq_worker VALUES ('', NOW(6) + INTERVAL ? MICROSECOND, ?, NOW(6) + INTERVAL ? MICROSECOND, NOW(6))",
 		applyingOffsetUs, lagQueryAppliedGTID, appliedOffsetUs)
 	require.NoError(t, err)
 	_, err = f.db.ExecContext(ctx, "REPLACE INTO lagq_conn VALUES ('', ?, NOW(6))", queuedGTID)
 	require.NoError(t, err)
-	var lag int64
-	require.NoError(t, f.db.QueryRowContext(ctx, f.query).Scan(&lag))
-	return lag
+	require.NoError(t, f.db.QueryRowContext(ctx, f.query).Scan(&lagMs, &elapsedUs))
+	return lagMs, elapsedUs
 }
 
 // TestMySQL8LagQuery covers the lag arithmetic. See
 // https://github.com/block/spirit/issues/1326.
+//
+// The fixture writes commit timestamps relative to NOW(6) in one statement and
+// the query reads NOW(6) in a later one, so every reading grows by however long
+// the round trips took. The fixture reports that elapsed time from the query's
+// own NOW(6), so each expected lag is exact however slow the runner is.
+// Timestamps that must not be read are an hour away.
 func TestMySQL8LagQuery(t *testing.T) {
 	f := newLagQueryFixture(t)
-	offset := func(us int) *int { return &us }
+	offset := func(us int64) *int64 { return &us }
+	const hourUs = int64(3_600_000_000)
+	// expected is the query's reading of a timestamp at offsetUs: the
+	// microsecond difference in milliseconds, rounded up by its CEIL.
+	expected := func(offsetUs, elapsedUs int64) int64 {
+		return (elapsedUs - offsetUs + 999) / 1000
+	}
 
 	// A commit timestamp ahead of the replica's NOW(6) (clock skew) reports
 	// 0, not a negative lag.
-	require.Equal(t, int64(0), f.lag(t, offset(500_000), 500_000, lagQueryBehindGTID))
+	lag, _ := f.lag(t, offset(hourUs), hourUs, lagQueryBehindGTID)
+	require.Equal(t, int64(0), lag)
 
 	// Committed 5s ago and still behind: the clamp does not hide real lag.
-	lag := f.lag(t, offset(-5_000_000), -5_000_000, lagQueryBehindGTID)
-	require.GreaterOrEqual(t, lag, int64(5000))
-	require.Less(t, lag, int64(10000))
+	lag, elapsedUs := f.lag(t, offset(-5_000_000), -5_000_000, lagQueryBehindGTID)
+	require.Equal(t, expected(-5_000_000, elapsedUs), lag)
 
 	// Applier only (queue caught up): a transaction that committed 200ms ago
-	// reports at least 200ms. A whole-second NOW() truncates the current
-	// second, so it reads anywhere from -800ms to 200ms here.
-	lag = f.lag(t, offset(-200_000), -1_000_000, lagQueryAppliedGTID)
-	require.GreaterOrEqual(t, lag, int64(200))
-	require.Less(t, lag, int64(1000))
+	// reads its exact age. A whole-second NOW() truncates the current second,
+	// so it reads up to 1s less. The last applied transaction is an hour old,
+	// so this also proves the caught-up queue contributes nothing.
+	lag, elapsedUs = f.lag(t, offset(-200_000), -hourUs, lagQueryAppliedGTID)
+	require.Equal(t, expected(-200_000, elapsedUs), lag)
 
 	// Idle applier with a backlog (SQL thread stopped, IO thread still
 	// queueing): applier_latency_ms is NULL, and the queue latency must still
 	// be reported rather than the whole reading collapsing to 0.
-	lag = f.lag(t, nil, -5_000_000, lagQueryBehindGTID)
-	require.GreaterOrEqual(t, lag, int64(5000))
-	require.Less(t, lag, int64(10000))
+	lag, elapsedUs = f.lag(t, nil, -5_000_000, lagQueryBehindGTID)
+	require.Equal(t, expected(-5_000_000, elapsedUs), lag)
 
 	// Idle applier and caught up: no lag.
-	require.Equal(t, int64(0), f.lag(t, nil, -5_000_000, lagQueryAppliedGTID))
+	lag, _ = f.lag(t, nil, -5_000_000, lagQueryAppliedGTID)
+	require.Equal(t, int64(0), lag)
 }

@@ -164,6 +164,16 @@ func explicitUnlessTableDefault(value, tableDefault *string) *string {
 	return value
 }
 
+// comparedCollation returns the collation a column is compared under: the
+// resolved one, or the written one when IgnoreCharsetCollation skips
+// resolution.
+func comparedCollation(col *Column, resolved string) string {
+	if resolved == "" && col.Collation != nil {
+		return strings.ToLower(*col.Collation)
+	}
+	return resolved
+}
+
 // charsetCollationEqual reports whether two columns have the same effective
 // charset and collation given their owning tables' defaults. Equality is
 // decided on the RESOLVED values, not the written ones: a column that
@@ -178,7 +188,9 @@ func explicitUnlessTableDefault(value, tableDefault *string) *string {
 // attribute falls back to comparing the written values with redundant
 // table-default spellings normalized away — an unexpressed preference is
 // treated as a match rather than guessed at, which keeps the diff from
-// emitting a MODIFY it could never prove converged.
+// emitting a MODIFY it could never prove converged. A column that names
+// utf8mb4 without a COLLATE is the one exception: it matches either collation
+// default_collation_for_utf8mb4 can hold, whatever the table defaults are.
 func charsetCollationEqual(a, b *Column, source, target *CreateTable, opts *DiffOptions) bool {
 	if !charsetCarryingTypes[strings.ToLower(a.Type)] {
 		// Non-character types have no table default to inherit, so compare
@@ -212,6 +224,27 @@ func charsetCollationEqual(a, b *Column, source, target *CreateTable, opts *Diff
 
 	if sourceCollation != "" && targetCollation != "" {
 		return sourceCollation == targetCollation
+	}
+	// A column that names utf8mb4 without a COLLATE takes the server's
+	// default_collation_for_utf8mb4, not the table's collation, so when the
+	// other side's collation is known it matches exactly the collations that
+	// variable can hold. The written-value comparison below cannot decide
+	// this: the live form spells the server's choice out as a COLLATE, which
+	// differs from the table default whenever the table uses another charset
+	// or collation, so a MODIFY restating the bare charset would never
+	// converge against it; and a live column that inherits a table default
+	// the bare column can never take (utf8mb4_bin) writes no COLLATE at all,
+	// so the two would compare equal. The charset was compared above, and
+	// both server defaults are utf8mb4 collations.
+	if takesServerUTF8MB4Default(a) {
+		if other := comparedCollation(b, targetCollation); other != "" {
+			return utf8mb4ServerDefaultCollations[other]
+		}
+	}
+	if takesServerUTF8MB4Default(b) {
+		if other := comparedCollation(a, sourceCollation); other != "" {
+			return utf8mb4ServerDefaultCollations[other]
+		}
 	}
 	return ptrEqual(
 		explicitUnlessTableDefault(a.Collation, source.TableOptions.getCollation()),
