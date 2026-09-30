@@ -239,8 +239,8 @@ func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 
 // RunSQLInDatabaseAsRoot runs SQL in a specific database as the root user,
 // with the password from MYSQL_DSN (CI gives root and the test user the same
-// password). Use it for statements the test user is deliberately not granted,
-// such as CREATE VIEW, CREATE ROUTINE or CREATE EVENT.
+// password). Use it for statements the test user is not granted, such as
+// CREATE VIEW or CREATE ROUTINE (compose/bootstrap.sql lists its grants).
 func RunSQLInDatabaseAsRoot(t *testing.T, dbName, stmt string) {
 	t.Helper()
 	cfg, err := mysql.ParseDSN(DSN())

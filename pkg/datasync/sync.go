@@ -10,8 +10,8 @@
 // backlog and exits cleanly.
 //
 // The source is either a built-in MySQL binlog client (constructed from
-// SourceDSN) or a caller-injected change.Source — e.g. a Vitess /
-// PlanetScale VStream. The target is written through an applier; today
+// SourceDSN) or a caller-injected change.Source — e.g. a Vitess
+// VStream. The target is written through an applier; today
 // that is a single-target MySQLApplier, but the applier abstraction is
 // what makes the sync heterogeneous: a future Postgres applier would
 // let this sync MySQL → Postgres without changing the runner.
@@ -39,7 +39,7 @@ import (
 
 // Sync is the configuration for a continuous data sync. The exported,
 // kong-tagged fields are the CLI surface; the kong:"-" fields are for
-// programmatic callers (e.g. strata's Vitess/PlanetScale import) that
+// programmatic callers (e.g. a Vitess VStream import) that
 // inject a non-MySQL change source and/or a custom applier.
 type Sync struct {
 	// EnableExperimentalAutoscaling derives bounded copy/checksum concurrency
@@ -96,7 +96,7 @@ type Sync struct {
 	// SHOW CREATE TABLE, the initial-copy SELECTs). Setting Source requires
 	// setting Applier (see below).
 	//
-	// Intended for callers (e.g. strata's Vitess/PlanetScale import) that
+	// Intended for callers (e.g. a Vitess VStream import) that
 	// need a non-MySQL-binlog change source.
 	Source change.Source `kong:"-"`
 
