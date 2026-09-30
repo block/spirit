@@ -194,20 +194,25 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					}
 					return ctx.Err()
 				}
-				if errors.Is(err, checkpoint.ErrWriteAbandoned) || dbconn.IsOutcomeUnknown(err) {
-					// The REPLACE may still commit: Write abandoned it, or the
-					// connection was lost with the statement possibly already
-					// on the server. A terminal action from here on
-					// (the reverse cutover's phase writes, complete-forward's
-					// checkpoint drop) could be overwritten by it, so end the
-					// window instead, as the forward dumper aborts the move.
-					// Every write in this phase, the late one included, records
-					// phase reverse_window, so a re-run resumes the window.
+				if !errors.Is(err, checkpoint.ErrWriteNotSent) &&
+					(errors.Is(err, checkpoint.ErrWriteAbandoned) || dbconn.IsOutcomeUnknown(err)) {
+					// The REPLACE reached the server and its outcome is unknown:
+					// Write abandoned it, or the connection was lost after it
+					// was sent. It may still commit, and would then overwrite a
+					// terminal action taken from here on (the reverse cutover's
+					// phase writes, complete-forward's checkpoint drop), so end
+					// the window instead, as the forward dumper aborts the move
+					// on a failed write. Every write in this phase, the late one
+					// included, records phase reverse_window, so a re-run
+					// resumes the window.
 					return status.FatalAbort(fmt.Errorf("reverse window: %w", err))
 				}
-				// Any other failed write left nothing pending: the row still
-				// holds an earlier position the feeds can resume from. Ending
-				// the window over it would stop keeping the source current.
+				// The write failed without leaving a REPLACE that can commit
+				// later: it was never sent (ErrWriteNotSent, even on a lost
+				// connection), or the server answered with an error. The row
+				// still holds an earlier position the feeds can resume from,
+				// and ending the window over it would stop keeping the source
+				// current, so retry on the next tick.
 				r.logger.Warn("could not checkpoint reverse feed positions; will retry", "error", err)
 			case <-ticker.C:
 				if ferr := w.feed.Err(); ferr != nil {

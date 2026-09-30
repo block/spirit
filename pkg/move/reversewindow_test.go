@@ -825,10 +825,49 @@ func newCheckpointLoopWindow(t *testing.T, write func(context.Context, checkpoin
 	}
 }
 
-// TestReverseWindowCheckpointWriteFailure: an abandoned position write, or one
-// that lost its connection, may still commit on the server, so the window must
-// end rather than go on to a terminal action the late REPLACE could overwrite. Any other failed write
-// left nothing pending and is retried while the window stays open.
+// TestReverseWindowCheckpointKeysEachPositionByItsTarget: with several targets,
+// each checkpointed position must be stored under the target whose binlog it
+// came from. A position stored under another target's key resumes that
+// target's feed at a coordinate on the wrong server.
+func TestReverseWindowCheckpointKeysEachPositionByItsTarget(t *testing.T) {
+	targets := []applier.Target{
+		{Config: &mysql.Config{Addr: "target-a:3306", DBName: "dst"}},
+		{Config: &mysql.Config{Addr: "target-b:3306", DBName: "dst"}},
+	}
+	var written checkpoint.Record
+	w := &reverseWindow{
+		r: &Runner{
+			targets:   targets,
+			cutoverAt: time.Now(),
+			reversePositions: map[string]string{
+				targetKey(targets[0]): "binlog.000001:4",
+				targetKey(targets[1]): "binlog.000007:4",
+			},
+		},
+		feed: &ReverseFeed{clients: []change.Source{
+			&change.MockSource{Pos: "binlog.000001:900"},
+			&change.MockSource{Pos: "binlog.000007:300"},
+		}},
+		writeCheckpoint: func(_ context.Context, rec checkpoint.Record) error {
+			written = rec
+			return nil
+		},
+	}
+	require.NoError(t, w.checkpointPositions(t.Context()))
+	var got map[string]string
+	require.NoError(t, json.Unmarshal([]byte(written.Position), &got))
+	require.Equal(t, map[string]string{
+		targetKey(targets[0]): "binlog.000001:900",
+		targetKey(targets[1]): "binlog.000007:300",
+	}, got)
+}
+
+// TestReverseWindowCheckpointWriteFailure: a position write that reached the
+// server with an unknown outcome (abandoned, or its connection lost after the
+// REPLACE was sent) may still commit, so the window must end rather than go on
+// to a terminal action the late REPLACE could overwrite. A write that was never
+// sent, or that the server answered with an error, left nothing pending and is
+// retried while the window stays open.
 //
 // Sequential: it lengthens reverseWindowPollInterval so the only thing the
 // loop does is checkpoint (status.CheckpointDumpInterval is 100ms here).
@@ -882,6 +921,31 @@ func TestReverseWindowCheckpointWriteFailure(t *testing.T) {
 		require.ErrorIs(t, err, mysql.ErrInvalidConn)
 		require.ErrorIs(t, err, status.ErrFatalAbort)
 		require.Equal(t, int32(1), calls.Load(), "no write may follow one with an unknown outcome")
+	})
+
+	t.Run("connection loss before the REPLACE is sent is retried", func(t *testing.T) {
+		// Write marks a failure before the REPLACE reached the server, so
+		// nothing can commit late even though the connection was lost.
+		var calls atomic.Int32
+		w := newCheckpointLoopWindow(t, func(context.Context, checkpoint.Record) error {
+			calls.Add(1)
+			return fmt.Errorf("%w: %w", checkpoint.ErrWriteNotSent, mysql.ErrInvalidConn)
+		})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- w.hold(ctx) }()
+		deadline := time.After(10 * time.Second)
+		for calls.Load() < 3 {
+			select {
+			case err := <-done:
+				t.Fatalf("the window ended on a checkpoint write that was never sent: %v", err)
+			case <-deadline:
+				t.Fatalf("the window did not retry the checkpoint write; calls=%d", calls.Load())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
 	})
 
 	t.Run("other write errors are retried", func(t *testing.T) {
