@@ -90,8 +90,8 @@ Sync copies base tables only. Other schema objects are handled as follows:
   They are logged once at startup as not synced. The source stays live, and
   rows that they write on the source reach the change stream as ordinary row
   events (the built-in feed requires `binlog_format=ROW`), so the target still
-  receives those rows. Unlike [`move`](move.md), sync does not refuse them:
-  there is no cutover, so nothing is lost when sync stops. The startup log is
+  receives those rows. Sync does not refuse them: there is no cutover, so
+  nothing is lost when sync stops. The startup log is
   best-effort. If a query fails, for example on a source endpoint that is not
   MySQL, sync logs the error at debug level and continues.
 - **Target triggers** on a synced table or on the sync checkpoint table are

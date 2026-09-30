@@ -1049,6 +1049,108 @@ func (r *Runner) unsupportedNameError() error {
 	return nil
 }
 
+// logUnsyncedSourceObjects logs, once at startup, the source schema objects
+// that sync does not copy: the views getTables skipped, and the triggers,
+// procedures, functions and events. It never fails the sync. The source may
+// be an injected change.Source whose SQL endpoint is not MySQL, or a user
+// with only SELECT, so a query that fails is logged at Debug and skipped.
+func (r *Runner) logUnsyncedSourceObjects(ctx context.Context, views []string) {
+	schema := r.source.config.DBName
+	var attrs []any
+	if len(views) > 0 {
+		attrs = append(attrs, "views", views)
+	}
+	for _, q := range []struct {
+		what  string
+		query func(context.Context, *sql.DB, string) ([]schemaObject, error)
+	}{
+		{"triggers", queryTriggers},
+		{"routines", queryRoutines},
+		{"events", queryEvents},
+	} {
+		objects, err := q.query(ctx, r.source.db, schema)
+		if err != nil {
+			r.logger.Debug("could not list source "+q.what+"; not reporting them", "schema", schema, "error", err)
+			continue
+		}
+		if len(objects) == 0 {
+			continue
+		}
+		names := make([]string, 0, len(objects))
+		for _, o := range objects {
+			names = append(names, o.String())
+		}
+		attrs = append(attrs, q.what, names)
+	}
+	if len(attrs) == 0 {
+		return
+	}
+	attrs = append([]any{"schema", schema,
+		"reason", "sync copies base tables only; rows these objects write on the source reach the target as row events"}, attrs...)
+	r.logger.Info("Source schema objects are not synced", attrs...)
+}
+
+// targetSchemaObjectsError refuses a target that has a trigger on a table
+// sync writes to (a synced table or the checkpoint table), or any event in
+// the target schema. Both run on their own on the target and can write to the
+// tables sync owns, so rows could be applied twice or the target could
+// diverge from the source, and the checksum's repairs would then contend
+// with them. Views, procedures and functions only run when invoked, so they
+// are not refused.
+//
+// It runs in setup on every start, a fresh sync and a resume, before sync
+// creates, drops or writes any target table, including the --force wipe. A target schema or
+// table that does not exist yet has no triggers or events, so a fresh sync
+// into a new schema passes. Table names are compared the way the target
+// compares them: case-insensitively when its lower_case_table_names is
+// nonzero, so a trigger on a mixed-case source table's copy is not missed, and
+// exactly when it is 0, where `Foo` and `foo` are different tables.
+//
+// There is no periodic re-check during the continuous run; the continuous
+// checksum is the backstop for an object added later.
+func (r *Runner) targetSchemaObjectsError(ctx context.Context) error {
+	schema := r.target.Config.DBName
+	var lowerCaseTableNames int
+	if err := r.target.DB.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
+		return fmt.Errorf("failed to read lower_case_table_names on the target: %w", err)
+	}
+	fold := func(name string) string {
+		if lowerCaseTableNames != 0 {
+			return strings.ToLower(name)
+		}
+		return name
+	}
+	owned := make(map[string]bool, len(r.sourceTables)+1)
+	owned[fold(syncCheckpointTableName)] = true
+	for _, t := range r.sourceTables {
+		owned[fold(t.TableName)] = true
+	}
+	triggers, err := queryTriggers(ctx, r.target.DB, schema)
+	if err != nil {
+		return fmt.Errorf("failed to list the triggers in target schema %q: %w", schema, err)
+	}
+	events, err := queryEvents(ctx, r.target.DB, schema)
+	if err != nil {
+		return fmt.Errorf("failed to list the events in target schema %q: %w", schema, err)
+	}
+	var found []string
+	for _, o := range triggers {
+		if owned[fold(o.table)] {
+			found = append(found, o.String())
+		}
+	}
+	for _, o := range events {
+		found = append(found, o.String())
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("cannot sync: target schema %q has triggers on tables sync writes to, or events; "+
+		"they run on the target on their own and can write to those tables, so rows could be applied twice "+
+		"or diverge from the source; drop them before the sync can continue: %s",
+		schema, strings.Join(found, ", "))
+}
+
 // unsupportedPrimaryKeyError refuses a table whose primary key includes a
 // FLOAT or a BIT column before anything is written, as move does. A FLOAT key
 // cannot be located by its text form, so a replayed DELETE matches nothing

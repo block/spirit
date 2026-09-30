@@ -18,7 +18,9 @@ import (
 // databases are dropped before and after the test; only the source is
 // created. Views, routines, events and triggers are created with
 // testutils.RunSQLInDatabaseAsRoot, because the CI test user is not granted
-// CREATE VIEW, CREATE ROUTINE or EVENT.
+// CREATE VIEW or CREATE ROUTINE. The CI test user does have EVENT
+// (compose/bootstrap.sql): information_schema.EVENTS hides events from a user
+// without it, so TestSyncRefusesTargetEvent needs it.
 func schemaObjectsTestDBs(t *testing.T, prefix string) (src, dest *mysql.Config) {
 	t.Helper()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
@@ -235,6 +237,19 @@ func TestSyncTargetTriggerMatchFollowsLowerCaseTableNames(t *testing.T) {
 
 	require.NoError(t, runSync(t, newSchemaObjectsSync(src, dest), nil))
 	require.Equal(t, 1, countIn(t, openDB(t, dest), "SELECT COUNT(*) FROM "+dest.DBName+".Foo"))
+}
+
+// TestSyncRefusesTriggerOnCheckpointTable: sync writes the checkpoint table
+// too, so a trigger on it is refused like one on a synced table.
+func TestSyncRefusesTriggerOnCheckpointTable(t *testing.T) {
+	src, dest := schemaObjectsTestDBs(t, "sync_tgttrig_ckpt")
+	testutils.RunSQLInDatabase(t, src.DBName, "CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(255))")
+	testutils.RunSQLInDatabase(t, src.DBName, "INSERT INTO t1 VALUES (1,'one')")
+	require.NoError(t, runSync(t, newSchemaObjectsSync(src, dest), nil))
+
+	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE TRIGGER ckpt_bu BEFORE UPDATE ON _spirit_sync_checkpoint FOR EACH ROW SET NEW.copier_watermark = NEW.copier_watermark")
+	err := runSync(t, newSchemaObjectsSync(src, dest), nil)
+	require.ErrorContains(t, err, `drop them before the sync can continue: trigger "ckpt_bu" on table "_spirit_sync_checkpoint"`)
 }
 
 // TestSyncAllowsTargetViewsAndRoutines: target views, procedures and
