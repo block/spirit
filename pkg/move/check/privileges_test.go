@@ -314,8 +314,21 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 		require.ErrorContains(t, err, "insufficient privileges to run a move")
 		require.ErrorContains(t, err, eventMissing)
 		require.ErrorContains(t, err, routineMissing)
-		// The gap the requirement closes: routines and events are hidden.
-		require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), objectsPrefix+"trigger 't1_bi' on table 't1', view 'v1'")
+		// The gap the requirement closes: the user sees the trigger and the
+		// view, but not the routines or the event.
+		var triggers, views, routines, events int
+		require.NoError(t, db.QueryRowContext(t.Context(), `SELECT
+			(SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?),
+			(SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ?),
+			(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ?),
+			(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?)`,
+			schema, schema, schema, schema).Scan(&triggers, &views, &routines, &events))
+		require.Equal(t, []int{1, 1, 0, 0}, []int{triggers, views, routines, events})
+		// So the scan refuses rather than trusting what it can see.
+		err = SourceSchemaObjectsError(t.Context(), src)
+		require.ErrorContains(t, err, "source 0 ("+schema+"): insufficient privileges to run a move")
+		require.ErrorContains(t, err, eventMissing)
+		require.ErrorContains(t, err, routineMissing)
 	})
 
 	t.Run("old minimal grants plus EVENT", func(t *testing.T) {
@@ -332,6 +345,37 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 		err := privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
 		require.ErrorContains(t, err, eventMissing)
 		require.NotContains(t, err.Error(), routineMissing)
+	})
+
+	// A plain SHOW GRANTS by the current user includes the privileges of its
+	// active roles, so grants through a default role count. A granted role
+	// that is not active does not: information_schema does not show the
+	// objects to it either.
+	const role = "testmovevis_role"
+	for _, stmt := range []string{
+		"DROP ROLE IF EXISTS `" + role + "`",
+		"CREATE ROLE `" + role + "`",
+		"GRANT EVENT ON `" + schema + "`.* TO `" + role + "`",
+		"GRANT SHOW_ROUTINE ON *.* TO `" + role + "`",
+	} {
+		testutils.RunSQLInDatabaseAsRoot(t, "", stmt)
+	}
+	t.Cleanup(func() { testutils.RunSQLInDatabaseAsRoot(t, "", "DROP ROLE IF EXISTS `"+role+"`") })
+
+	t.Run("EVENT and SHOW_ROUTINE through a default role", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_defrole", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT `"+role+"` TO %s", "SET DEFAULT ROLE `"+role+"` TO %s")...)
+		src := []SourceResource{{DB: db, Config: cfg}}
+		require.NoError(t, privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default()))
+		require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), allObjects)
+	})
+
+	t.Run("EVENT and SHOW_ROUTINE through a role that is not active", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_inactiverole", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT `"+role+"` TO %s")...)
+		err := privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
+		require.ErrorContains(t, err, eventMissing)
+		require.ErrorContains(t, err, routineMissing)
 	})
 
 	// Each accepted way to see routines, together with EVENT, passes, and the
@@ -351,4 +395,38 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 			require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), allObjects)
 		})
 	}
+}
+
+// TestSourceSchemaObjectsCheckRequiresVisibility checks that every scan
+// verifies that the user can see events and stored routines before trusting
+// an empty result, so a grant revoked after preflight (or a reverse-window
+// resume, which runs no preflight) cannot make the scan pass on objects it
+// cannot see.
+func TestSourceSchemaObjectsCheckRequiresVisibility(t *testing.T) {
+	schema, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+	db, cfg := createMoveTestUser(t, "testmovevis_revoke", schema,
+		append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+	src := []SourceResource{{DB: db, Config: cfg}}
+	r := Resources{Sources: src}
+	scopes := []ScopeFlag{ScopePreflight, ScopePostSetup, ScopeResume, ScopePreCutover}
+	only := otherChecks("source_schema_objects_preflight", "source_schema_objects", "source_schema_objects_resume", "source_schema_objects_precutover")
+	for _, scope := range scopes {
+		require.NoError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), "scope %d", scope)
+	}
+
+	// Revoke EVENT, as could happen during a long move, and create an event
+	// the user can no longer see.
+	testutils.RunSQLInDatabaseAsRoot(t, "", "REVOKE EVENT ON `"+schema+"`.* FROM testmovevis_revoke")
+	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+	want := "source 0 (" + schema + "): insufficient privileges to run a move: move refuses source schemas that contain events or stored routines, and information_schema hides them from users without these grants. Needed: EVENT on `" + schema + "`.* (to see the schema's events)"
+	require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), want)
+	for _, scope := range scopes {
+		require.EqualError(t, RunChecks(t.Context(), r, slog.Default(), scope, only...), want, "scope %d", scope)
+	}
+
+	// Fails closed when the grants cannot be read.
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorContains(t, SourceSchemaObjectsError(canceled, src), "source 0 ("+schema+"): could not read the grants")
 }

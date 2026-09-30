@@ -65,9 +65,11 @@ var schemaObjectQueries = []struct {
 //
 // information_schema only shows objects the connecting user has a privilege
 // on. TRIGGER and SELECT on the schema, which a move already needs, show its
-// triggers and views. Events and stored routines need more, which the
-// privileges check requires (see schemaObjectVisibilityError), so they cannot
-// go unreported because they are hidden.
+// triggers and views. Events and stored routines need more (see
+// schemaObjectVisibilityError). The privileges check requires those grants at
+// preflight, and every scan here checks them again for each source before
+// trusting an empty result: a reverse-window resume runs no preflight, and a
+// grant can be revoked during a long move.
 //
 // The runner also calls it directly when entering a reverse window and before
 // a reverse cutover, which run no check scope. The retired `<table>_old`
@@ -80,6 +82,11 @@ func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) err
 		// dereference panic (mirrors rename_safety).
 		if src.DB == nil || src.Config == nil {
 			return fmt.Errorf("source %d database connection or config is not initialized", i)
+		}
+		// An empty result only proves the schema is clear if the user can see
+		// every object type. Fail closed otherwise.
+		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName); err != nil {
+			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
 		objects, err := schemaObjects(ctx, src)
 		if err != nil {

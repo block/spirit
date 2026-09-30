@@ -2,6 +2,7 @@ package check
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -94,14 +95,9 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 		if strings.Contains(grant, `PROCESS`) && strings.Contains(grant, ` ON *.*`) {
 			foundProcess = true
 		}
-		if utils.GlobalGrantHasAny(grant, eventVisibilityPrivileges...) ||
-			(schemaName != "" && utils.DBLevelGrantHasAny(grant, schemaName, eventVisibilityPrivileges...)) {
-			foundEventVisibility = true
-		}
-		if utils.GlobalGrantHasAny(grant, globalRoutineVisibilityPrivileges...) ||
-			(schemaName != "" && utils.DBLevelGrantHasAny(grant, schemaName, dbRoutineVisibilityPrivileges...)) {
-			foundRoutineVisibility = true
-		}
+		events, routines := grantShowsSchemaObjects(grant, schemaName)
+		foundEventVisibility = foundEventVisibility || events
+		foundRoutineVisibility = foundRoutineVisibility || routines
 		// Collect role names from grant lines like:
 		// GRANT `rds_superuser_role`@`%` TO `user`@`%`
 		if strings.HasPrefix(grant, "GRANT `") && strings.Contains(grant, " TO ") {
@@ -168,6 +164,45 @@ var (
 	// database-level SELECT does not show routines.
 	dbRoutineVisibilityPrivileges = []string{"EXECUTE", "ALTER ROUTINE", "CREATE ROUTINE"}
 )
+
+// grantShowsSchemaObjects reports whether one SHOW GRANTS line makes
+// schemaName's events, and its stored routines, visible in information_schema.
+func grantShowsSchemaObjects(grant, schemaName string) (events, routines bool) {
+	events = utils.GlobalGrantHasAny(grant, eventVisibilityPrivileges...) ||
+		(schemaName != "" && utils.DBLevelGrantHasAny(grant, schemaName, eventVisibilityPrivileges...))
+	routines = utils.GlobalGrantHasAny(grant, globalRoutineVisibilityPrivileges...) ||
+		(schemaName != "" && utils.DBLevelGrantHasAny(grant, schemaName, dbRoutineVisibilityPrivileges...))
+	return events, routines
+}
+
+// schemaObjectVisibility checks that the user of db can see schemaName's
+// events and stored routines, from the same SHOW GRANTS lines the privileges
+// check reads. For the current user, SHOW GRANTS includes the privileges of
+// its active roles, so a grant through a default role counts, and a granted
+// role that is not active does not (information_schema does not show the
+// objects to it either). SourceSchemaObjectsError calls it on every scan, so
+// a scan never relies on visibility that was checked in an earlier run or
+// has since been revoked.
+func schemaObjectVisibility(ctx context.Context, db *sql.DB, schemaName string) error {
+	rows, err := db.QueryContext(ctx, `SHOW GRANTS`)
+	if err != nil {
+		return fmt.Errorf("could not read the grants that make events and stored routines visible: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	var events, routines bool
+	for rows.Next() {
+		var grant string
+		if err := rows.Scan(&grant); err != nil {
+			return err
+		}
+		e, r := grantShowsSchemaObjects(grant, schemaName)
+		events, routines = events || e, routines || r
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return schemaObjectVisibilityError(schemaName, events, routines)
+}
 
 // schemaObjectVisibilityError names the grants missing for the move user to
 // see the source schema's events and stored routines, or returns nil.

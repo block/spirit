@@ -18,7 +18,7 @@ Move copies base tables only. It refuses a source schema that contains triggers,
 * `EVENT` on the source schema (or on `*.*`), to see its events.
 * `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), to see its stored procedures and functions. `SELECT` on `*.*`, or `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the source schema (or on `*.*`), also works.
 
-The move is refused if they are missing. Triggers and views need no extra grant: `TRIGGER` and `SELECT` on the schema, which are already required, make them visible.
+The move is refused if they are missing. Grants through an active role (for example a default role) count. Every run of the check verifies the grants again before it trusts an empty result, so a grant revoked during a move refuses the next check, including the one under the cutover locks. Triggers and views need no extra grant: `TRIGGER` and `SELECT` on the schema, which are already required, make them visible.
 
 ## Configuration
 
