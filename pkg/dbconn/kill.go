@@ -97,6 +97,9 @@ WHERE t.processlist_id IS NOT NULL
 
 	// statementWaitingQuery counts the table metadata locks a session is
 	// still waiting for. A statement with none holds every lock it needs.
+	// Unlike the kill queries, it needs no CONNECTION_ID() exclusion: it reads
+	// only the statement's own session, and the check runs on another one, so
+	// the locks this read takes on performance_schema are never counted.
 	statementWaitingQuery = `SELECT COUNT(*)
 FROM performance_schema.metadata_locks ml
     JOIN performance_schema.threads t
