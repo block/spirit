@@ -1565,3 +1565,115 @@ func TestDiffIntegrationTinyint1UnsignedConverges(t *testing.T) {
 	requireConverged(t, tt.DB, tt.Name, declaredSQL)
 	requireNoSelfDiff(t, tt.DB, tt.Name)
 }
+
+// TestDiffIntegrationCharDefaultSpaces verifies that a string default on a
+// char(N) column matches its live form, which MySQL reports with every
+// trailing space stripped (char(4) DEFAULT 'a  ' is reported as DEFAULT 'a'),
+// in every charset and collation, NO PAD collations included. A varchar(N)
+// default keeps its trailing spaces, except those past the column's width,
+// which MySQL drops (varchar(4) DEFAULT 'ab      ' is reported as 'ab  ').
+// A hex or bit literal default is reported as the string its bytes form, with
+// the same spaces handling (char(4) DEFAULT x'612020' is reported as 'a').
+// Without the conversion the diff emits a MODIFY that MySQL rewrites to its
+// own form again, on every run.
+func TestDiffIntegrationCharDefaultSpaces(t *testing.T) {
+	for _, tc := range []struct{ name, ddl, live string }{
+		{"diff_charpad_trailing", "CREATE TABLE diff_charpad_trailing (id int NOT NULL, b char(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_only_spaces", "CREATE TABLE diff_charpad_only_spaces (id int NOT NULL, b char(4) NOT NULL DEFAULT '    ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) NOT NULL DEFAULT ''"},
+		{"diff_charpad_no_width", "CREATE TABLE diff_charpad_no_width (id int NOT NULL, b char DEFAULT ' ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(1) DEFAULT ''"},
+		{"diff_charpad_leading", "CREATE TABLE diff_charpad_leading (id int NOT NULL, b char(4) DEFAULT ' a ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT ' a'"},
+		{"diff_charpad_past_width", "CREATE TABLE diff_charpad_past_width (id int NOT NULL, b char(4) DEFAULT 'abcd  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'abcd'"},
+		{"diff_charpad_tab", "CREATE TABLE diff_charpad_tab (id int NOT NULL, b char(4) DEFAULT 'ab\\t  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'ab\t'"},
+		{"diff_charpad_nul", "CREATE TABLE diff_charpad_nul (id int NOT NULL, b char(4) DEFAULT 'a\\0 ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a\\0'"},
+		{"diff_charpad_introducer", "CREATE TABLE diff_charpad_introducer (id int NOT NULL, b char(4) DEFAULT _latin1'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_no_pad", "CREATE TABLE diff_charpad_no_pad (id int NOT NULL, b char(4) COLLATE utf8mb4_0900_bin DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin DEFAULT 'a'"},
+		{"diff_charpad_utf16", "CREATE TABLE diff_charpad_utf16 (id int NOT NULL, b char(4) CHARACTER SET utf16 DEFAULT 'abcd  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) CHARACTER SET utf16 COLLATE utf16_general_ci DEFAULT 'abcd'"},
+		{"diff_charpad_latin1_table", "CREATE TABLE diff_charpad_latin1_table (id int NOT NULL, b char(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=latin1", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_hex", "CREATE TABLE diff_charpad_hex (id int NOT NULL, b char(4) DEFAULT x'612020', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_hex_past_width", "CREATE TABLE diff_charpad_hex_past_width (id int NOT NULL, b char(4) DEFAULT 0x61202020202020, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_bit", "CREATE TABLE diff_charpad_bit (id int NOT NULL, b char(4) DEFAULT b'011000010010000000100000', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_varcharpad_hex_past_width", "CREATE TABLE diff_varcharpad_hex_past_width (id int NOT NULL, b varchar(4) DEFAULT x'61202020202020', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a   '"},
+		{"diff_varcharpad_keeps", "CREATE TABLE diff_varcharpad_keeps (id int NOT NULL, b varchar(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a  '"},
+		{"diff_varcharpad_past_width", "CREATE TABLE diff_varcharpad_past_width (id int NOT NULL, b varchar(4) DEFAULT 'ab      ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'ab  '"},
+		{"diff_varcharpad_multibyte", "CREATE TABLE diff_varcharpad_multibyte (id int NOT NULL, b varchar(2) DEFAULT 'é   ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(2) DEFAULT 'é '"},
+		{"diff_varcharpad_latin1", "CREATE TABLE diff_varcharpad_latin1 (id int NOT NULL, b varchar(4) CHARACTER SET latin1 NOT NULL DEFAULT 'ab    ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL DEFAULT 'ab  '"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, tc.name, tc.ddl)
+			liveSQL := showCreateTable(t, tt.DB, tt.Name)
+			require.Contains(t, liveSQL, tc.live, "the reading this case pins")
+			desired, err := ParseCreateTable(tc.ddl)
+			require.NoError(t, err)
+			live, err := ParseCreateTable(liveSQL)
+			require.NoError(t, err)
+			stmts, err := live.Diff(desired, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "a char default must match its live form")
+			stmts, err = desired.Diff(live, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "the live form must match the char default")
+		})
+	}
+}
+
+// TestDiffIntegrationCharDefaultSpacesConverges verifies that the MODIFY
+// emitted for a char or varchar default with trailing spaces round-trips:
+// MySQL applies it and reports the value it carries, after which a re-diff
+// converges to nil.
+func TestDiffIntegrationCharDefaultSpacesConverges(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_charpad_converge",
+		"CREATE TABLE diff_charpad_converge (id int NOT NULL, c char(4), v varchar(4), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	desired, err := ParseCreateTable(
+		"CREATE TABLE diff_charpad_converge (id int NOT NULL, c char(4) DEFAULT 'a  ', v varchar(4) DEFAULT 'ab      ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+
+	live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+	require.NoError(t, err)
+	stmts, err := live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "`c` char(4) NULL DEFAULT 'a'")
+	require.Contains(t, stmts[0].Statement, "`v` varchar(4) NULL DEFAULT 'ab  '")
+	testutils.RunSQL(t, stmts[0].Statement)
+
+	var stored string
+	testutils.RunSQL(t, "INSERT INTO diff_charpad_converge (id) VALUES (1)")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT CONCAT('[', c, '][', v, ']') FROM diff_charpad_converge WHERE id = 1").Scan(&stored))
+	require.Equal(t, "[a][ab  ]", stored)
+
+	liveSQL := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, liveSQL, "`c` char(4) DEFAULT 'a'")
+	require.Contains(t, liveSQL, "`v` varchar(4) DEFAULT 'ab  '")
+	live, err = ParseCreateTable(liveSQL)
+	require.NoError(t, err)
+	stmts, err = live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
+}
+
+// TestDiffIntegrationCharDefaultSpacesPadCharToFullLength verifies that a char
+// default read by a session with the PAD_CHAR_TO_FULL_LENGTH sql_mode, whose
+// SHOW CREATE TABLE reports it padded to the column's width (DEFAULT 'a   '),
+// still matches the declared default. Spirit's own connections never set that
+// mode, but a caller of Diff may read the live table through its own.
+func TestDiffIntegrationCharDefaultSpacesPadCharToFullLength(t *testing.T) {
+	ddl := "CREATE TABLE diff_charpad_full_length (id int NOT NULL, b char(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	tt := testutils.NewTestTable(t, "diff_charpad_full_length", ddl)
+
+	conn, err := tt.DB.Conn(t.Context())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, conn.Close()) }()
+	_, err = conn.ExecContext(t.Context(), "SET SESSION sql_mode = CONCAT(@@sql_mode, ',PAD_CHAR_TO_FULL_LENGTH')")
+	require.NoError(t, err)
+	var name, liveSQL string
+	require.NoError(t, conn.QueryRowContext(t.Context(), "SHOW CREATE TABLE diff_charpad_full_length").Scan(&name, &liveSQL))
+	require.Contains(t, liveSQL, "`b` char(4) DEFAULT 'a   '", "the reading this test pins")
+
+	desired, err := ParseCreateTable(ddl)
+	require.NoError(t, err)
+	live, err := ParseCreateTable(liveSQL)
+	require.NoError(t, err)
+	stmts, err := live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts, "a padded reading must match the char default")
+}
