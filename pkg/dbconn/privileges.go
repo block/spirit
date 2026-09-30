@@ -80,5 +80,5 @@ func checkKillPrivilege(ctx context.Context, db grantsQuerier) error {
 			return nil
 		}
 	}
-	return errors.New("missing CONNECTION_ADMIN or SUPER privilege")
+	return missingPrivilegeError{errors.New("missing CONNECTION_ADMIN or SUPER privilege")}
 }

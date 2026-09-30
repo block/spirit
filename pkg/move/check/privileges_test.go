@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -618,10 +619,9 @@ func (s stubDB) QueryRowContext(ctx context.Context, query string, args ...any) 
 // TestVisibilityReadErrorsAreNotRefusals checks that a failure of any read
 // the privilege decisions depend on is a plain error, not a refusal
 // (ErrRefused), so the cutover retries it instead of failing with a
-// misleading "insufficient privileges". Each stub case fails exactly one query
-// and lets the others through:
-//   - SHOW GRANTS: in the preflight privileges check and the per-scan
-//     visibility check.
+// misleading "insufficient privileges". It covers a failed SHOW GRANTS, in
+// the preflight privileges check and the per-scan visibility check, and a
+// force-kill check that could not run.
 //
 // It also checks the entry points (privilegesCheck, SourceSchemaObjectsError
 // and ReverseWindowSchemaObjectsError) on a closed pool, and that the
@@ -640,24 +640,37 @@ func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
 		"GRANT `rds_superuser_role`@`%` TO `u`@`%`",
 	}
 
-	for _, tc := range []struct {
-		name, fail, want string
-		visibilityToo    bool
-	}{
-		{"SHOW GRANTS", "SHOW GRANTS", errStubQuery.Error(), true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			stub := stubDB{DB: db, grants: withRole, fail: tc.fail}
-			err := sourcePrivileges(t.Context(), stub, "app", noForceKillProbe)
-			require.ErrorContains(t, err, tc.want)
-			require.NotErrorIs(t, err, ErrRefused)
-			if tc.visibilityToo {
-				err = schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)
-				require.ErrorContains(t, err, "could not read the grants that make the schema's objects visible: "+tc.want)
-				require.NotErrorIs(t, err, ErrRefused)
-			}
-		})
-	}
+	t.Run("SHOW GRANTS", func(t *testing.T) {
+		stub := stubDB{DB: db, grants: withRole, fail: "SHOW GRANTS"}
+		err := sourcePrivileges(t.Context(), stub, "app", noForceKillProbe)
+		require.ErrorContains(t, err, errStubQuery.Error())
+		require.NotErrorIs(t, err, ErrRefused)
+		err = schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)
+		require.ErrorContains(t, err, "could not read the grants that make the schema's objects visible: "+errStubQuery.Error())
+		require.NotErrorIs(t, err, ErrRefused)
+	})
+
+	// A force-kill check that could not run, such as a lost connection while
+	// it reads activate_all_roles_on_login, does not name a missing grant.
+	// One that found a grant missing does.
+	t.Run("force-kill check", func(t *testing.T) {
+		withBase := []string{
+			"GRANT ALL PRIVILEGES ON `app`.* TO `u`@`%`",
+			"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO `u`@`%`",
+		}
+		stub := stubDB{DB: db, grants: withBase}
+		readFailed := func(context.Context) error { return errStubQuery }
+		err := sourcePrivileges(t.Context(), stub, "app", readFailed)
+		require.EqualError(t, err, "could not check the privileges force-kill needs: "+errStubQuery.Error())
+		require.NotErrorIs(t, err, ErrRefused)
+
+		missing := func(context.Context) error {
+			return fmt.Errorf("%w: missing CONNECTION_ADMIN or SUPER privilege", dbconn.ErrForceKillPrivilegeMissing)
+		}
+		err = sourcePrivileges(t.Context(), stub, "app", missing)
+		require.ErrorContains(t, err, "insufficient privileges to run a move with force-kill enabled")
+		require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege")
+	})
 
 	// Every entry point, on a pool whose reads all fail.
 	t.Run("entry points on a closed pool", func(t *testing.T) {
@@ -687,14 +700,13 @@ func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
 		err := schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)
 		require.ErrorIs(t, err, ErrRefused)
 		require.ErrorContains(t, err, needed)
-		on := stub
-		err = sourcePrivileges(t.Context(), on, "app", noForceKillProbe)
+		err = sourcePrivileges(t.Context(), stub, "app", noForceKillProbe)
 		require.ErrorIs(t, err, ErrRefused)
 		require.ErrorContains(t, err, needed)
 		// The role's expanded privileges, as SHOW GRANTS lists them for an
 		// active role, are counted.
-		on.grants = append(slices.Clone(withRole), "GRANT SELECT, EVENT, TRIGGER ON *.* TO `u`@`%`")
-		require.NoError(t, sourcePrivileges(t.Context(), on, "app", noForceKillProbe))
-		require.NoError(t, schemaObjectVisibility(t.Context(), on, "app", allSchemaObjects...))
+		expanded := stubDB{DB: db, grants: append(slices.Clone(withRole), "GRANT SELECT, EVENT, TRIGGER ON *.* TO `u`@`%`")}
+		require.NoError(t, sourcePrivileges(t.Context(), expanded, "app", noForceKillProbe))
+		require.NoError(t, schemaObjectVisibility(t.Context(), expanded, "app", allSchemaObjects...))
 	})
 }

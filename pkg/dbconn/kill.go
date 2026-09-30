@@ -421,22 +421,54 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 // information_schema.innodb_trx, and CONNECTION_ADMIN or SUPER to kill another
 // user's session. It returns an error naming each one that is missing.
 //
-// It is intended for preflight privilege checks: the table probes return at
-// most one row, and besides them it reads only the user's SHOW GRANTS and
-// logs nothing, so unlike GetTableLocks / GetLockingTransactions it neither
-// scans server-wide locks nor emits "found locking transaction" log lines.
+// A privilege the user lacks matches ErrForceKillPrivilegeMissing. A read
+// that fails for another reason, such as a lost connection, does not, so a
+// caller can tell a missing grant from a check it could not run.
+//
+// It is intended for preflight privilege checks. It reads SHOW GRANTS, one
+// row of information_schema.innodb_metrics, no rows of the performance_schema
+// lock tables, and, when rds_superuser_role is granted, the global
+// activate_all_roles_on_login. It logs nothing, so unlike GetTableLocks /
+// GetLockingTransactions it neither scans server-wide locks nor emits "found
+// locking transaction" log lines.
 func CheckForceKillPrivileges(ctx context.Context, db *sql.DB) error {
 	var errs []error
 	if err := runPrivilegeProbe(ctx, db, forceKillPrivilegeProbe); err != nil {
-		errs = append(errs, fmt.Errorf("read the performance_schema lock tables: %w", err))
+		errs = append(errs, markAccessDenied(fmt.Errorf("read the performance_schema lock tables: %w", err)))
 	}
 	if err := runPrivilegeProbe(ctx, db, processPrivilegeProbe); err != nil {
-		errs = append(errs, fmt.Errorf("check for PROCESS, which information_schema.innodb_trx needs: %w", err))
+		errs = append(errs, markAccessDenied(fmt.Errorf("check for PROCESS, which information_schema.innodb_trx needs: %w", err)))
 	}
 	if err := checkKillPrivilege(ctx, db); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// ErrForceKillPrivilegeMissing matches an error from CheckForceKillPrivileges
+// that names a privilege the user lacks.
+var ErrForceKillPrivilegeMissing = errors.New("missing a privilege force-kill needs")
+
+// missingPrivilegeError marks err as a missing privilege without changing
+// its text.
+type missingPrivilegeError struct{ err error }
+
+func (e missingPrivilegeError) Error() string { return e.err.Error() }
+func (e missingPrivilegeError) Unwrap() error { return e.err }
+func (e missingPrivilegeError) Is(target error) bool {
+	return target == ErrForceKillPrivilegeMissing
+}
+
+// markAccessDenied marks a probe's error as a missing privilege when MySQL
+// denied the read, and leaves any other failure as it is.
+func markAccessDenied(err error) error {
+	if myErr, ok := errors.AsType[*mysql.MySQLError](err); ok {
+		switch myErr.Number {
+		case parsermysql.ErrTableaccessDenied, parsermysql.ErrSpecificAccessDenied:
+			return missingPrivilegeError{err}
+		}
+	}
+	return err
 }
 
 // runPrivilegeProbe runs a probe query and drains its result, so an error

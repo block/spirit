@@ -93,7 +93,10 @@ func TestCheckKillPrivilege(t *testing.T) {
 				return
 			}
 			require.ErrorContains(t, err, tc.wantErr)
-			if tc.wantErr != missing {
+			if tc.wantErr == missing {
+				require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
+			} else {
+				require.NotErrorIs(t, err, ErrForceKillPrivilegeMissing, "a failed read is not a missing grant")
 				require.NotContains(t, err.Error(), "missing", "a failed read is not a missing grant")
 			}
 		})

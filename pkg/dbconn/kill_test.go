@@ -166,6 +166,7 @@ func TestCheckForceKillPrivileges(t *testing.T) {
 	require.ErrorContains(t, err, "read the performance_schema lock tables")
 	require.ErrorContains(t, err, "check for PROCESS")
 	require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege")
+	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
 
 	_, err = rootDB.ExecContext(t.Context(), "GRANT SELECT ON `performance_schema`.* TO testforcekillprobeuser")
 	require.NoError(t, err)
@@ -176,15 +177,35 @@ func TestCheckForceKillPrivileges(t *testing.T) {
 	require.ErrorContains(t, err, "check for PROCESS")
 	require.ErrorContains(t, err, "PROCESS")
 	require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege")
+	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
+
+	// Each probe's own access-denied error names a missing privilege, so
+	// grant the rest and check one probe at a time.
+	_, err = rootDB.ExecContext(t.Context(), "GRANT CONNECTION_ADMIN ON *.* TO testforcekillprobeuser")
+	require.NoError(t, err)
+	err = check()
+	require.ErrorContains(t, err, "check for PROCESS")
+	require.NotContains(t, err.Error(), "CONNECTION_ADMIN")
+	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
 
 	_, err = rootDB.ExecContext(t.Context(), "GRANT PROCESS ON *.* TO testforcekillprobeuser")
 	require.NoError(t, err)
-	err = check()
-	require.EqualError(t, err, "missing CONNECTION_ADMIN or SUPER privilege")
-
-	_, err = rootDB.ExecContext(t.Context(), "GRANT CONNECTION_ADMIN ON *.* TO testforcekillprobeuser")
-	require.NoError(t, err)
 	require.NoError(t, check(), "check must pass once every force-kill privilege is granted")
+
+	_, err = rootDB.ExecContext(t.Context(), "REVOKE SELECT ON `performance_schema`.* FROM testforcekillprobeuser")
+	require.NoError(t, err)
+	err = check()
+	require.ErrorContains(t, err, "read the performance_schema lock tables")
+	require.NotContains(t, err.Error(), "check for PROCESS")
+	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
+
+	// A check that cannot run names no missing privilege.
+	closed, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	err = CheckForceKillPrivileges(t.Context(), closed)
+	require.ErrorContains(t, err, "sql: database is closed")
+	require.NotErrorIs(t, err, ErrForceKillPrivilegeMissing)
 }
 
 // The check must not depend on what other sessions are running. Filling

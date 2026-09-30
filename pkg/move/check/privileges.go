@@ -114,11 +114,13 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 	}
 
 	// Move operations always use force-kill (it's enabled by default in
-	// DBConfig), so its privileges are required. The check reads at most one
-	// row and logs nothing; the lock detection that does log runs during
-	// cutover, not preflight.
+	// DBConfig), so its privileges are required. The check logs nothing; the
+	// lock detection that does log runs during cutover, not preflight.
 	if err := forceKillProbe(ctx); err != nil {
-		return fmt.Errorf("insufficient privileges to run a move with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", err)
+		if errors.Is(err, dbconn.ErrForceKillPrivilegeMissing) {
+			return fmt.Errorf("insufficient privileges to run a move with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", err)
+		}
+		return fmt.Errorf("could not check the privileges force-kill needs: %w", err)
 	}
 
 	hasBasePrivileges := (foundSuper && foundReplicationSlave && foundDBAll) ||
