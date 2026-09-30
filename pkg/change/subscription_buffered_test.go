@@ -1400,6 +1400,84 @@ func TestBufferedMapSoftLimitOversizedRowAdmitted(t *testing.T) {
 	require.Equal(t, int64(1), sub.timesParked.Load())
 }
 
+// TestBufferedMapQueueModeOversizedRowAdmitted is the queue-mode twin of
+// TestBufferedMapSoftLimitOversizedRowAdmitted: queued changes are accounted
+// by sizeOfQueuedChange, not sizeOfBufferedChange, so the row image's bytes
+// must be counted on that path too. Without them a queue of wide rows reads as
+// a few hundred bytes and never parks the reader.
+func TestBufferedMapQueueModeOversizedRowAdmitted(t *testing.T) {
+	sub := &bufferedMap{
+		changes:               make(map[string]bufferedChange),
+		softLimitBytes:        1024,  // tiny limit
+		pkIsMemoryComparable:  false, // route to queue
+		watermarkOptimization: false, // post-copy: queue mode active
+		logger:                slog.Default(),
+		table:                 &table.TableInfo{SchemaName: "test", TableName: "bare"},
+	}
+	sub.cond = sync.NewCond(&sub.Mutex)
+
+	bigVal := make([]byte, 16*1024)
+	sub.HasChanged([]any{"k1"}, []any{"k1", bigVal}, false)
+	require.Empty(t, sub.changes, "queue-mode events must not enter the map")
+	require.Len(t, sub.queue, 1)
+	require.Greater(t, sub.sizeBytes, int64(16*1024),
+		"oversized queued row should be admitted; its row image's bytes accounted")
+	require.Equal(t, int64(0), sub.timesParked.Load(),
+		"first call into an empty buffer must not park")
+
+	// The wide row alone put the queue over the limit; the next caller parks.
+	done := make(chan struct{})
+	go func() {
+		sub.HasChanged([]any{"k2"}, []any{"k2", "small"}, false)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("second queue-mode HasChanged should have parked")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	drainBareBufferedMap(sub)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second queue-mode HasChanged did not unblock after drain")
+	}
+	require.Equal(t, int64(1), sub.timesParked.Load())
+}
+
+// TestBufferedMapWideKeyAccounted: a buffered change holds its key three times
+// over (the hashed key, the original key tuple, and the key column in the row
+// image), so a wide primary key must be counted each time on both the map and
+// the queue path. Queue mode is where wide keys show up in practice: it is
+// chosen for non-memory-comparable PKs, usually a string under a
+// case-insensitive collation.
+func TestBufferedMapWideKeyAccounted(t *testing.T) {
+	wide := strings.Repeat("k", 8*1024)
+	for _, queueMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queueMode=%t", queueMode), func(t *testing.T) {
+			sub := &bufferedMap{
+				changes:              make(map[string]bufferedChange),
+				pkIsMemoryComparable: !queueMode,
+				logger:               slog.Default(),
+				table:                &table.TableInfo{SchemaName: "test", TableName: "bare"},
+			}
+			sub.cond = sync.NewCond(&sub.Mutex)
+
+			sub.HasChanged([]any{wide}, []any{wide}, false)
+			if queueMode {
+				require.Len(t, sub.queue, 1)
+				require.Empty(t, sub.changes)
+			} else {
+				require.Len(t, sub.changes, 1)
+				require.Empty(t, sub.queue)
+			}
+			require.Greater(t, sub.sizeBytes, int64(3*len(wide)),
+				"the hashed key, the key tuple and the row image must each count the wide key")
+		})
+	}
+}
+
 // TestBufferedMapRealFlushWakesParked exercises the full HasChanged →
 // park → real Flush → broadcast → resume cycle against a live DB-backed
 // subscription. The bare-helper tests above broadcast by hand; this one
