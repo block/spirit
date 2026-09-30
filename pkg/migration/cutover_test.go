@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -1291,4 +1293,70 @@ func TestCutoverCancellationReleasesTableLocks(t *testing.T) {
 	// The failed flush must not have reached the rename.
 	_, err = db.ExecContext(probeCtx, "INSERT INTO _cutover_cancel_cleanup_new VALUES (1)")
 	require.NoError(t, err)
+}
+
+// TestCutOverChecksUnderLockRetryPolicy checks that only a refusal from the
+// checks under the table lock (check.ErrRefused) fails the cutover without a
+// retry. Any other error, such as a failed information_schema query, may be
+// transient and must take the normal retry path.
+func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		firstErr  error
+		wantCalls int
+		refused   bool
+	}{
+		{"transient error is retried", errors.New("failed to query information_schema: connection reset"), 2, false},
+		{"refusal is not retried", fmt.Errorf("%w: a trigger was created during the migration", check.ErrRefused), 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbName, _ := testutils.CreateUniqueTestDatabase(t)
+			testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE lockchk (id INT NOT NULL PRIMARY KEY, name VARCHAR(255) NOT NULL)")
+			testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE _lockchk_new (id INT NOT NULL PRIMARY KEY, name VARCHAR(255) NOT NULL)")
+			testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE _lockchk_chkpnt (a INT)") // for binlog advancement
+			testutils.RunSQLInDatabase(t, dbName, "INSERT INTO lockchk VALUES (1, 'a'), (2, 'b')")
+
+			cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(dbName))
+			require.NoError(t, err)
+			db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			tbl := table.NewTableInfo(db, dbName, "lockchk")
+			require.NoError(t, tbl.SetInfo(t.Context()))
+			newTbl := table.NewTableInfo(db, dbName, "_lockchk_new")
+			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+			defer feed.Close()
+			chunker, err := table.NewChunker(tbl, table.ChunkerConfig{NewTable: newTbl})
+			require.NoError(t, err)
+			require.NoError(t, feed.AddSubscription(tbl, newTbl, chunker))
+			require.NoError(t, feed.Start(t.Context()))
+
+			dbConfig := dbconn.NewDBConfig()
+			dbConfig.MaxRetries = 3
+			cutover, err := NewCutOver(db, []*cutoverConfig{{table: tbl, newTable: newTbl, oldTableName: "_lockchk_old"}}, feed, dbConfig, slog.Default())
+			require.NoError(t, err)
+			var calls int
+			cutover.checksUnderLock = func(context.Context) error {
+				calls++
+				if calls == 1 {
+					return tc.firstErr
+				}
+				return nil
+			}
+			err = cutover.Run(t.Context())
+			require.Equal(t, tc.wantCalls, calls)
+			var n int
+			if tc.refused {
+				require.ErrorIs(t, err, errCutoverRefused)
+				require.ErrorIs(t, err, check.ErrRefused)
+				require.NoError(t, db.QueryRowContext(t.Context(),
+					"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_lockchk_old'", dbName).Scan(&n))
+				require.Zero(t, n, "the refused cutover must not rename")
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _lockchk_old").Scan(&n))
+			require.Equal(t, 2, n, "the retried cutover must complete")
+		})
+	}
 }
