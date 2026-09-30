@@ -327,7 +327,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 
 	// Open the source SQL connection. Even when the change feed is an
 	// injected non-MySQL source, spirit still needs SQL access to the
-	// source for SHOW TABLES / SHOW CREATE TABLE and the initial-copy
+	// source for SHOW FULL TABLES / SHOW CREATE TABLE and the initial-copy
 	// SELECTs.
 	db, err := dbconn.New(r.sync.SourceDSN, r.sourceDBConfig)
 	if err != nil {
@@ -726,15 +726,20 @@ func (r *Runner) ChecksumStats() checksum.LocklessCheckerStats {
 // REPLICATION privileges + ROW binlog format on Start; a VStream
 // authenticates over gRPC). A table without a primary key surfaces a clear
 // error from getTables (SetInfo); a FLOAT or BIT primary key is refused by
-// unsupportedPrimaryKeyError. The only target-side gate is that, for a
-// fresh sync, the target tables must be empty.
+// unsupportedPrimaryKeyError. Source views are skipped, and source triggers,
+// routines and events are only logged (logUnsyncedSourceObjects).
+//
+// The target-side gates are: on every start, no trigger on a table sync
+// writes to and no event in the target schema (targetSchemaObjectsError);
+// and, for a fresh sync, the target tables must be empty.
 func (r *Runner) setup(ctx context.Context) error {
 	r.logger.Info("Fetching source table list")
-	tables, err := r.getTables(ctx)
+	tables, views, err := r.getTables(ctx)
 	if err != nil {
 		return err
 	}
 	r.sourceTables = tables
+	r.logUnsyncedSourceObjects(ctx, views)
 	if err := r.unsupportedNameError(); err != nil {
 		return err
 	}
@@ -742,6 +747,14 @@ func (r *Runner) setup(ctx context.Context) error {
 		return err
 	}
 	if err := r.unrecreatableTableError(); err != nil {
+		return err
+	}
+	// Before sync creates, drops or writes any target table, including the
+	// --force wipe below. --force does not bypass it: the wipe drops the sync's target
+	// tables (and with them their triggers) only when the target cannot
+	// resume, and it never drops events. It also runs when the source has no
+	// base tables, so a target event is refused on every start.
+	if err := r.targetSchemaObjectsError(ctx); err != nil {
 		return err
 	}
 	if len(r.sourceTables) == 0 {
@@ -964,20 +977,35 @@ func (r *Runner) TargetUnderLoad() bool {
 	return throttler.GradualOnly(r.currentLoadSignal()).IsThrottled()
 }
 
-// getTables discovers all tables in the source schema. Sync operates on a
-// whole schema at a time. Each table's metadata is populated via SetInfo.
-func (r *Runner) getTables(ctx context.Context) ([]*table.TableInfo, error) {
-	rows, err := r.source.db.QueryContext(ctx, "SHOW TABLES")
+// getTables discovers the base tables in the source schema. Sync operates on
+// a whole schema at a time. Each table's metadata is populated via SetInfo.
+//
+// Views are not synced and are returned separately, for the startup log.
+// SHOW TABLES lists them too, and a view has no primary key, so without the
+// filter a view failed the sync with "no primary key found". The filter is
+// applied to the Table_type column of SHOW FULL TABLES in Go rather than with
+// a WHERE clause, so the statement stays in the plain form that any
+// MySQL-protocol source endpoint supports. Any other type that is not a base
+// table is skipped the same way and listed with its type.
+func (r *Runner) getTables(ctx context.Context) (tables []*table.TableInfo, views []string, err error) {
+	rows, err := r.source.db.QueryContext(ctx, "SHOW FULL TABLES")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer utils.CloseAndLog(rows)
 
-	var tableName string
-	tables := make([]*table.TableInfo, 0)
+	var tableName, tableType string
+	tables = make([]*table.TableInfo, 0)
 	for rows.Next() {
-		if err := rows.Scan(&tableName); err != nil {
-			return nil, err
+		if err := rows.Scan(&tableName, &tableType); err != nil {
+			return nil, nil, err
+		}
+		if !strings.EqualFold(tableType, "BASE TABLE") {
+			if !strings.EqualFold(tableType, "VIEW") {
+				tableName = fmt.Sprintf("%s (%s)", tableName, tableType)
+			}
+			views = append(views, tableName)
+			continue
 		}
 		// Skip the checkpoint table in case the source and target schemas
 		// coincide (e.g. local testing).
@@ -992,11 +1020,11 @@ func (r *Runner) getTables(ctx context.Context) ([]*table.TableInfo, error) {
 		// temporary table, for an ENUM or SET member reported with a '?'.
 		ti.DisableAnalyze = true
 		if err := ti.SetInfo(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		tables = append(tables, ti)
 	}
-	return tables, rows.Err()
+	return tables, views, rows.Err()
 }
 
 // unsupportedNameError refuses a schema or table name containing a '.' or a
@@ -1019,6 +1047,108 @@ func (r *Runner) unsupportedNameError() error {
 		}
 	}
 	return nil
+}
+
+// logUnsyncedSourceObjects logs, once at startup, the source schema objects
+// that sync does not copy: the views getTables skipped, and the triggers,
+// procedures, functions and events. It never fails the sync. The source may
+// be an injected change.Source whose SQL endpoint is not MySQL, or a user
+// with only SELECT, so a query that fails is logged at Debug and skipped.
+func (r *Runner) logUnsyncedSourceObjects(ctx context.Context, views []string) {
+	schema := r.source.config.DBName
+	var attrs []any
+	if len(views) > 0 {
+		attrs = append(attrs, "views", views)
+	}
+	for _, q := range []struct {
+		what  string
+		query func(context.Context, *sql.DB, string) ([]schemaObject, error)
+	}{
+		{"triggers", queryTriggers},
+		{"routines", queryRoutines},
+		{"events", queryEvents},
+	} {
+		objects, err := q.query(ctx, r.source.db, schema)
+		if err != nil {
+			r.logger.Debug("could not list source "+q.what+"; not reporting them", "schema", schema, "error", err)
+			continue
+		}
+		if len(objects) == 0 {
+			continue
+		}
+		names := make([]string, 0, len(objects))
+		for _, o := range objects {
+			names = append(names, o.String())
+		}
+		attrs = append(attrs, q.what, names)
+	}
+	if len(attrs) == 0 {
+		return
+	}
+	attrs = append([]any{"schema", schema,
+		"reason", "sync copies base tables only; rows these objects write on the source reach the target as row events"}, attrs...)
+	r.logger.Info("Source schema objects are not synced", attrs...)
+}
+
+// targetSchemaObjectsError refuses a target that has a trigger on a table
+// sync writes to (a synced table or the checkpoint table), or any event in
+// the target schema. Both run on their own on the target and can write to the
+// tables sync owns, so rows could be applied twice or the target could
+// diverge from the source, and the checksum's repairs would then contend
+// with them. Views, procedures and functions only run when invoked, so they
+// are not refused.
+//
+// It runs in setup on every start, a fresh sync and a resume, before sync
+// creates, drops or writes any target table, including the --force wipe. A target schema or
+// table that does not exist yet has no triggers or events, so a fresh sync
+// into a new schema passes. Table names are compared the way the target
+// compares them: case-insensitively when its lower_case_table_names is
+// nonzero, so a trigger on a mixed-case source table's copy is not missed, and
+// exactly when it is 0, where `Foo` and `foo` are different tables.
+//
+// There is no periodic re-check during the continuous run; the continuous
+// checksum is the backstop for an object added later.
+func (r *Runner) targetSchemaObjectsError(ctx context.Context) error {
+	schema := r.target.Config.DBName
+	var lowerCaseTableNames int
+	if err := r.target.DB.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
+		return fmt.Errorf("failed to read lower_case_table_names on the target: %w", err)
+	}
+	fold := func(name string) string {
+		if lowerCaseTableNames != 0 {
+			return strings.ToLower(name)
+		}
+		return name
+	}
+	owned := make(map[string]bool, len(r.sourceTables)+1)
+	owned[fold(syncCheckpointTableName)] = true
+	for _, t := range r.sourceTables {
+		owned[fold(t.TableName)] = true
+	}
+	triggers, err := queryTriggers(ctx, r.target.DB, schema)
+	if err != nil {
+		return fmt.Errorf("failed to list the triggers in target schema %q: %w", schema, err)
+	}
+	events, err := queryEvents(ctx, r.target.DB, schema)
+	if err != nil {
+		return fmt.Errorf("failed to list the events in target schema %q: %w", schema, err)
+	}
+	var found []string
+	for _, o := range triggers {
+		if owned[fold(o.table)] {
+			found = append(found, o.String())
+		}
+	}
+	for _, o := range events {
+		found = append(found, o.String())
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("cannot sync: target schema %q has triggers on tables sync writes to, or events; "+
+		"they run on the target on their own and can write to those tables, so rows could be applied twice "+
+		"or diverge from the source; drop them before the sync can continue: %s",
+		schema, strings.Join(found, ", "))
 }
 
 // unsupportedPrimaryKeyError refuses a table whose primary key includes a

@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/migration/check"
+	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -1840,4 +1841,73 @@ func TestEnumSetMembersOutsideUTF8MB3(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
 		"SELECT COUNT(*) FROM %s WHERE HEX(e) = 'F09F9880'", tableName)).Scan(&emoji))
 	require.Positive(t, emoji)
+}
+
+// TestEnumSetEscapedMembersDML covers ENUM and SET members that hold a
+// backslash, newline, carriage return, NUL or single quote. information_schema
+// reports those characters escaped in column_type (a backslash as \\, a
+// newline as \n), and the binlog decoder maps an ordinal or bitmask to that
+// text. A replayed change to such a member therefore wrote the escaped text,
+// which is not a member: MySQL warned (1265) and the migration aborted. A
+// member of a binary-charset column that is not valid utf8mb3 is reported as
+// a hex literal, which the parser refused, so no migration of such a table
+// could start.
+// ENGINE=InnoDB copies the table without changing the columns.
+func TestEnumSetEscapedMembersDML(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	tableName := "enumesc_mig"
+	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(`CREATE TABLE %s (
+		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		e enum('a\\b','c','nl\nx','cr\rx','nul\0x','q''x') NOT NULL,
+		s set('a\\b','x','nl\nx') NOT NULL,
+		b enum(x'5c', x'815c', 'c', x'f09f9880', x'00', x'e9') CHARACTER SET binary NOT NULL
+	) DEFAULT CHARSET=utf8mb4`, tableName))
+	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (e, s, b) VALUES ('c','x','c'), ('c','x','c'), ('c','x','c'), ('c','x','c'), ('c','x','c')", tableName))
+
+	// The cutover waits for the sentinel to be dropped, and the copy has
+	// finished by then. So each write below happens after the copy and before
+	// the cutover, and reaches the new table only through binlog replay.
+	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
+		WithDBName(dbName),
+		WithThreads(1),
+		WithDeferCutOver(),
+		WithRespectSentinel(),
+		WithSkipDropAfterCutover())
+	running := startTestRun(t, m.Run, m.Close)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
+
+	// Each member with an escaped character, as a SQL literal. The members
+	// of b other than 'c' are not valid utf8mb3, so information_schema
+	// reports them as hex literals.
+	updates := []struct{ e, s, b string }{
+		{`'a\\b'`, `'a\\b'`, `x'5c'`},
+		{`'nl\nx'`, `'a\\b,nl\nx'`, `x'815c'`},
+		{`'cr\rx'`, `'nl\nx'`, `x'f09f9880'`},
+		{`'nul\0x'`, `'x,nl\nx'`, `x'00'`},
+		{`'q''x'`, `'a\\b,x'`, `x'e9'`},
+	}
+	for i, u := range updates {
+		// Rows 1-5 were copied, so the UPDATE is replayed; rows 6-10 are new.
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("UPDATE %s SET e = %s, s = %s, b = %s WHERE id = %d", tableName, u.e, u.s, u.b, i+1))
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (id, e, s, b) VALUES (%d, %s, %s, %s)", tableName, i+6, u.e, u.s, u.b))
+	}
+	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
+	require.NoError(t, running.wait(t))
+
+	for i, u := range updates {
+		for _, id := range []int{i + 1, i + 6} {
+			var match int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE id = %d AND e = %s AND s = %s AND b = %s", tableName, id, u.e, u.s, u.b)).Scan(&match))
+			require.Equal(t, 1, match, "row %d must hold e=%s, s=%s, b=%s", id, u.e, u.s, u.b)
+		}
+	}
+	// The source is kept (WithSkipDropAfterCutover), so every row can be
+	// compared with the one it was copied from, by stored bytes.
+	var differ int
+	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s n LEFT JOIN `%s` o USING (id) WHERE o.id IS NULL OR HEX(n.e) <> HEX(o.e) OR HEX(n.s) <> HEX(o.s) OR HEX(n.b) <> HEX(o.b)",
+		tableName, m.changes[0].oldTableName())).Scan(&differ))
+	require.Zero(t, differ)
 }
