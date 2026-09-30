@@ -46,6 +46,7 @@ func TestHasTriggers(t *testing.T) {
 	err = hasTriggersCheck(t.Context(), cutover, slog.Default())
 	require.ErrorContains(t, err, "a trigger was created during the migration")
 	require.Contains(t, ChecksInScope(ScopeCutover), "hastriggers")
+	require.Contains(t, ChecksInScope(ScopeCutoverLocked), "hastriggers")
 
 	_, err = db.ExecContext(t.Context(), `drop trigger if exists ins_sum`)
 	require.NoError(t, err)

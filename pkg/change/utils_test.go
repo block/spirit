@@ -215,6 +215,25 @@ func TestExtractTablesFromDDLStmts(t *testing.T) {
 			want:          []schemaTable{{"test", "child"}, {"test", "parent"}},
 		},
 		{
+			// MySQL 9.0 creates a foreign key for an inline REFERENCES.
+			name:          "alter table add column with inline references",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE child ADD COLUMN parent_id INT REFERENCES parent (id)",
+			want:          []schemaTable{{"test", "child"}, {"test", "parent"}},
+		},
+		{
+			name:          "alter table modify column with inline references",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE child MODIFY parent_id BIGINT REFERENCES auth.parent (id)",
+			want:          []schemaTable{{"test", "child"}, {"auth", "parent"}},
+		},
+		{
+			name:          "create table with inline references",
+			defaultSchema: "test",
+			statement:     "CREATE TABLE shop.child (id INT PRIMARY KEY, parent_id INT REFERENCES parent (id))",
+			want:          []schemaTable{{"shop", "child"}, {"shop", "parent"}},
+		},
+		{
 			name:          "alter table add unique key",
 			defaultSchema: "test",
 			statement:     "ALTER TABLE child ADD UNIQUE KEY (parent_id)",

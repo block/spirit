@@ -68,6 +68,7 @@ func TestHasForeignKey(t *testing.T) {
 	err = hasForeignKeysCheck(t.Context(), cutover, slog.Default())
 	require.ErrorContains(t, err, "a foreign key was created during the migration")
 	require.Contains(t, ChecksInScope(ScopeCutover), "hasforeignkeys")
+	require.Contains(t, ChecksInScope(ScopeCutoverLocked), "hasforeignkeys")
 
 	r.Table.TableName = "customer_contacts"
 	r.Statement = statement.MustNew("ALTER TABLE customer_contacts ENGINE=innodb")[0]
