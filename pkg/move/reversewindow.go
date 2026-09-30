@@ -205,6 +205,7 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					// on a failed write. Every write in this phase, the late one
 					// included, records phase reverse_window, so a re-run
 					// resumes the window.
+					// (Write abandons only once ctx is done, caught above; that arm is defence in depth.)
 					return status.FatalAbort(fmt.Errorf("reverse window: %w", err))
 				}
 				// The write failed without leaving a REPLACE that can commit
@@ -258,6 +259,10 @@ func (w *reverseWindow) checkpointPositions(ctx context.Context) error {
 		}
 		positions[targetKey(r.targets[i])] = pos
 	}
+	// Skip the write only when no feed position moved. In practice that
+	// excludes targets[0]: the previous checkpoint REPLACE is in its binlog and
+	// advances its feed's position, so even an idle window writes once per
+	// interval.
 	if maps.Equal(positions, r.reversePositions) {
 		return nil
 	}

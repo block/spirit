@@ -683,8 +683,10 @@ func positionCovers(ctx context.Context, db *sql.DB, have, want string) (bool, e
 		return false, nil
 	}
 	if change.IsGTIDPosition(want) {
+		qctx, cancel := context.WithTimeout(ctx, waitQueryTimeout)
+		defer cancel()
 		var covered bool
-		err := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(?, ?)", want, have).Scan(&covered)
+		err := db.QueryRowContext(qctx, "SELECT GTID_SUBSET(?, ?)", want, have).Scan(&covered)
 		return covered, err
 	}
 	split := func(pos string) (string, int64, error) {
@@ -877,6 +879,10 @@ func TestReverseWindowCheckpointWriteFailure(t *testing.T) {
 	t.Cleanup(func() { reverseWindowPollInterval = old })
 
 	t.Run("abandoned write ends the window", func(t *testing.T) {
+		// Pins the defensive arm: a real Write abandons only after ctx is
+		// done, which the loop's shutdown branch handles first. The fake
+		// returns ErrWriteAbandoned with ctx live, as a Write with a deadline
+		// of its own could.
 		var mu sync.Mutex
 		var writes []checkpoint.Record
 		w := newCheckpointLoopWindow(t, func(_ context.Context, rec checkpoint.Record) error {
