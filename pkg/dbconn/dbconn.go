@@ -641,11 +641,14 @@ func killWhenWaiting(ctx, stmtCtx context.Context, connID int, started time.Time
 			}
 			// The kill could not list the blockers, so it killed nothing.
 			// Look again once a poll interval has passed, and only if the
-			// statement is still waiting then.
+			// statement is still waiting then. This check succeeded and saw
+			// the wait, so a single failed check after it keeps the wait.
 			if !lookupFailed {
 				logger.Warn("could not list the sessions blocking the statement; looking again while it waits", "error", attempt.killErr)
 				lookupFailed = true
 			}
+			sawWaiting = true
+			lastCheckFailed = false
 			next.Reset(killPollInterval)
 			continue
 		default:
@@ -683,7 +686,7 @@ func blockerSurvivesKill(a forceExecAttempt) (reason string, survives bool) {
 	case errors.Is(a.killErr, errHeavyTransactionSkipped):
 		return "a blocking transaction is too heavy to roll back safely, and force-kill does not end it", true
 	case errors.Is(a.killErr, &mysql.MySQLError{Number: parsermysql.ErrKillDenied}):
-		return "the user may not kill a blocking session: it needs CONNECTION_ADMIN or SUPER", true
+		return "the user may not kill a blocking session: it needs CONNECTION_ADMIN or SUPER, and SYSTEM_USER if the session belongs to a SYSTEM_USER account", true
 	}
 	return "", false
 }

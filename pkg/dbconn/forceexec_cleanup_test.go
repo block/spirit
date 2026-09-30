@@ -1256,6 +1256,59 @@ func TestForceExecLooksForBlockersAgainAfterAFailedLookup(t *testing.T) {
 	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout")
 }
 
+// A failed lookup follows a check that saw the statement waiting, so it keeps
+// the wait like any successful check. A failed check before the lookup and a
+// single failed check after it therefore leave the wait in progress, and the
+// next check kills at once instead of starting the delay over.
+func TestForceExecKeepsTheWaitAcrossAFailedLookupBetweenFailedChecks(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_lookup_blip", "CREATE TABLE forceexec_lookup_blip (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 4
+	config.ForceKillAfter = time.Second
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	blocker, err := tt.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_lookup_blip")
+	require.NoError(t, err)
+	tbl := table.NewTableInfo(db, "test", "forceexec_lookup_blip")
+	started := time.Now()
+	realWaiting := waitingOn(tt.DB)
+	// failNext fails the next waiting check: once shortly before the delay,
+	// and once right after the failed lookup.
+	failedBeforeDelay, failNext := false, false
+	var killedAfter []time.Duration
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_lookup_blip ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(ctx context.Context, connID int) (bool, error) {
+			if !failedBeforeDelay && time.Since(started) >= 850*time.Millisecond {
+				failedBeforeDelay = true
+				return false, io.EOF
+			}
+			if failNext {
+				failNext = false
+				return false, io.EOF
+			}
+			return realWaiting(ctx, connID)
+		},
+		func(ctx context.Context, connID int) ([]int, error) {
+			killedAfter = append(killedAfter, time.Since(started))
+			if len(killedAfter) == 1 {
+				failNext = true
+				return nil, fmt.Errorf("%w: %w", errBlockerLookupFailed, io.EOF)
+			}
+			return killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), []int{connID})
+		}, waitForKilledTransactions, nil)
+	require.NoError(t, err)
+	require.Len(t, killedAfter, 2)
+	require.GreaterOrEqual(t, killedAfter[0], config.ForceKillAfter)
+	require.Less(t, killedAfter[1], config.ForceKillAfter+500*time.Millisecond, "the failed check after the lookup must not restart the delay")
+}
+
 // A lookup that never succeeds kills nothing. The kill stops looking when the
 // statement times out, and the next attempt's kill looks again.
 func TestForceExecRetriesAfterEveryLookupFails(t *testing.T) {
