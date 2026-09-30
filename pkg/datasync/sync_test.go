@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -1626,4 +1628,50 @@ func TestSyncResumeSourceIdentityCaseInsensitive(t *testing.T) {
 	got, err := r.resolveResumePosition(wrapped)
 	require.NoError(t, err)
 	require.Equal(t, position, got)
+}
+
+// TestSyncRefusesUnsupportedNames: the change source routes row events by
+// schema + "." + table, so a table whose name contains a '.' can receive the
+// changes of a different table. Sync must refuse such a name, and a backtick,
+// before it writes anything to the target.
+func TestSyncRefusesUnsupportedNames(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, srcDB, table, want string }{
+		{"dot in table name", "sync_dot_tbl_src", "dot.name", `cannot sync table "dot.name": table name "dot.name" contains a '.'`},
+		{"backtick in table name", "sync_bt_tbl_src", "back`tick", "table name \"back`tick\" contains a backtick"},
+		{"dot in source schema name", "sync.dot_schema_src", "t1", `cannot sync: source schema name "sync.dot_schema_src" contains a '.'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			destDB := strings.ReplaceAll(tc.srcDB, ".", "_") + "_dest"
+			for _, db := range []string{tc.srcDB, destDB} {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+sqlescape.EscapeIdentifier(db))
+			}
+			testutils.RunSQL(t, "CREATE DATABASE "+sqlescape.EscapeIdentifier(tc.srcDB))
+			t.Cleanup(func() {
+				for _, db := range []string{tc.srcDB, destDB} {
+					testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+sqlescape.EscapeIdentifier(db))
+				}
+			})
+			testutils.RunSQL(t, "CREATE TABLE "+sqlescape.EscapeIdentifier(tc.srcDB)+"."+sqlescape.EscapeIdentifier(tc.table)+" (id INT PRIMARY KEY)")
+
+			src, dest := cfg.Clone(), cfg.Clone()
+			src.DBName, dest.DBName = tc.srcDB, destDB
+			runner, err := NewRunner(&Sync{SourceDSN: src.FormatDSN(), TargetDSN: dest.FormatDSN(), Threads: 1, WriteThreads: 1})
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			err = runner.Run(ctx)
+			require.NoError(t, runner.Close())
+			require.ErrorContains(t, err, tc.want)
+
+			db, err := sql.Open("block-mysql", cfg.FormatDSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			var n int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+			require.Zero(t, n, "nothing may be created on the target")
+		})
+	}
 }

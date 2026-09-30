@@ -39,7 +39,7 @@ func init() {
 // uniqueness produces the correct end state. See
 // pkg/change/subscription_buffered.go for the routing rules.
 func tableCompatibilityCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
-	if err := unsupportedNameError(r); err != nil {
+	if err := UnsupportedNameError(r); err != nil {
 		return err
 	}
 	for _, tbl := range r.SourceTables {
@@ -56,10 +56,13 @@ func tableCompatibilityCheck(ctx context.Context, r Resources, logger *slog.Logg
 	return nil
 }
 
-// unsupportedNameError returns an error for the first schema or table name in
+// UnsupportedNameError returns an error for the first schema or table name in
 // the move that contains a '.' or a backtick: each source and target schema,
 // then each source table and its schema.
-func unsupportedNameError(r Resources) error {
+//
+// The runner also calls it directly when resuming a reverse window, which runs
+// no check scope.
+func UnsupportedNameError(r Resources) error {
 	for _, src := range r.Sources {
 		if src.Config == nil {
 			continue

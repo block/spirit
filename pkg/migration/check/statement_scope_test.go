@@ -43,7 +43,7 @@ func TestStatementScopeMembership(t *testing.T) {
 		"primarykeyexists",
 		"primarykeyfloat",
 		"setReorder",
-		"tablename",
+		"tableidentifier",
 	}, ChecksInScope(ScopeStatement))
 }
 

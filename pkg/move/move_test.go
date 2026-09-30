@@ -740,7 +740,10 @@ func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
 				Threads:      2,
 				WriteThreads: 2,
 			}
-			require.ErrorContains(t, move.Run(), tc.want)
+			err := move.Run()
+			require.ErrorContains(t, err, tc.want)
+			// --force wipes the target, which cannot fix a name.
+			require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
 
 			db, err := sql.Open("block-mysql", dest.FormatDSN())
 			require.NoError(t, err)
@@ -803,7 +806,10 @@ func TestMoveRefusesUnsupportedNames(t *testing.T) {
 				Threads:      2,
 				WriteThreads: 2,
 			}
-			require.ErrorContains(t, move.Run(), tc.want)
+			err := move.Run()
+			require.ErrorContains(t, err, tc.want)
+			// --force wipes the target, which cannot fix a name.
+			require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
 
 			db, err := sql.Open("block-mysql", dest.FormatDSN())
 			require.NoError(t, err)

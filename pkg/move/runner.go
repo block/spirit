@@ -760,6 +760,12 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 			r.logger.Warn("target holds an empty checkpoint table: a prior move attempt stopped before writing its first checkpoint; wiping target tables and starting fresh")
 		case resumeNone:
 			if !r.move.Force {
+				// A failure that wiping the target cannot fix (an unsupported
+				// name, a missing or FLOAT/BIT primary key, ...) is reported
+				// as itself, not with advice to re-run with --force.
+				if preErr := r.runChecks(ctx, check.ScopePostSetup, check.TargetStateCheckName); preErr != nil {
+					return preErr
+				}
 				return fmt.Errorf("target state is invalid for both new copy and resume (re-run with --force to wipe the target and start fresh): %w", err)
 			}
 			r.logger.Warn("force set and the target cannot resume; wiping target tables and starting fresh")
@@ -1105,6 +1111,11 @@ func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record)
 		}
 	}
 	r.sourceTables = r.sources[0].tables
+	// This path runs no check scope, and the reverse feeds subscribe these
+	// tables, so refuse unsupported names before starting them.
+	if err := check.UnsupportedNameError(r.checkResources()); err != nil {
+		return fmt.Errorf("resume reverse window: %w", err)
+	}
 
 	return newReverseWindow(r).run(ctx)
 }

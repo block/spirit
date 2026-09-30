@@ -580,6 +580,11 @@ func TestUnsupportedTableNameRefused(t *testing.T) {
 	// A rename to an unsupported name is refused too, even though the
 	// source table's name is fine.
 	tt := testutils.NewTestTable(t, "rename_src", "CREATE TABLE rename_src (id INT NOT NULL PRIMARY KEY)")
+	// The test does not own `rename.dst`. A build that accepts the rename
+	// would leave it behind in the shared schema and fail every later run.
+	dropRenameDst := func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS `rename.dst`") }
+	dropRenameDst()
+	t.Cleanup(dropRenameDst)
 	m := NewTestRunner(t, "rename_src", "RENAME TO `rename.dst`")
 	err := m.Run(t.Context())
 	require.NoError(t, m.Close())
@@ -596,6 +601,21 @@ func TestUnsupportedTableNameRefused(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 	require.Equal(t, []string{"rename_src"}, names, "the refused rename must leave the table in place")
+}
+
+// TestInstantAlterMultibyteTableName: MySQL limits a table name to 64
+// characters, not bytes, and the byte-length check runs only at preflight, after
+// native DDL has been tried. The statement-scope refusal of '.' and backticks
+// must not stop an INSTANT ALTER on a 24-character, 68-byte name.
+func TestInstantAlterMultibyteTableName(t *testing.T) {
+	t.Parallel()
+	name := "aa" + strings.Repeat("表", 22)
+	testutils.NewTestTable(t, name, "CREATE TABLE `"+name+"` (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+	m := NewTestRunner(t, name, "ADD COLUMN c INT")
+	err := m.Run(t.Context())
+	require.NoError(t, m.Close())
+	require.NoError(t, err)
+	require.True(t, m.usedInstantDDL)
 }
 
 // TestUnsupportedSchemaNameRefused refuses a migration in a schema whose name
