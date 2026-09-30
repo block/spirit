@@ -43,6 +43,7 @@ func TestStatementScopeMembership(t *testing.T) {
 		"primarykeyexists",
 		"primarykeyfloat",
 		"setReorder",
+		"tableidentifier",
 	}, ChecksInScope(ScopeStatement))
 }
 
@@ -76,6 +77,16 @@ func TestStatementScopeChecks(t *testing.T) {
 			name:    "explicit lock clause is refused",
 			stmt:    "ALTER TABLE t1 ADD COLUMN b INT, LOCK=NONE",
 			wantErr: "LOCK=",
+		},
+		{
+			name:    "dot in table name is refused",
+			stmt:    "ALTER TABLE `t.1` ADD COLUMN b INT",
+			wantErr: `table name "t.1" contains a '.'`,
+		},
+		{
+			name:    "backtick in rename target is refused",
+			stmt:    "ALTER TABLE t1 RENAME TO `t``2`",
+			wantErr: "new table name \"t`2\" contains a backtick",
 		},
 		{
 			name: "add column passes",

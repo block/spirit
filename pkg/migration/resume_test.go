@@ -408,55 +408,6 @@ func TestCheckpointRestore(t *testing.T) {
 	require.NoError(t, r2.Close())
 }
 
-// TestCheckpointRestoreBacktickTableName checks that a migration of a table
-// whose name contains a backtick can resume from its checkpoint. Reading the
-// checkpoint used to quote the table name by hand, which broke every resume
-// with a syntax error.
-func TestCheckpointRestoreBacktickTableName(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "cpt`bt", "CREATE TABLE `cpt``bt` (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARCHAR(100) NOT NULL DEFAULT '')")
-	testutils.RunSQL(t, "INSERT INTO `cpt``bt` (pad) VALUES ('a'), ('b'), ('c')")
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-	newRunner := func() *Runner {
-		r, err := NewRunner(&Migration{
-			Host:         cfg.Addr,
-			Username:     cfg.User,
-			Password:     &cfg.Passwd,
-			Database:     cfg.DBName,
-			Threads:      1,
-			WriteThreads: 1,
-			Statement:    "ALTER TABLE `cpt``bt` ENGINE=InnoDB",
-		})
-		require.NoError(t, err)
-		return r
-	}
-
-	// Step through the start of a migration and leave a checkpoint behind.
-	r := newRunner()
-	r.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
-	require.NoError(t, err)
-	r.dbConfig = dbconn.NewDBConfig()
-	r.changes[0].table = table.NewTableInfo(r.db, r.migration.Database, r.changes[0].stmt.Table)
-	require.NoError(t, r.changes[0].table.SetInfo(t.Context()))
-	require.NoError(t, r.newMigration(t.Context()))
-	watermark := "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\":[\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\":[\"2\"],\"Inclusive\":false}}"
-	require.NoError(t, r.checkpointTbl().Write(t.Context(), checkpoint.Record{
-		CopierWatermark: watermark,
-		Position:        r.replClient.Position(),
-		Statement:       r.migration.Statement,
-	}))
-	require.NoError(t, r.Close())
-
-	r2 := newRunner()
-	require.NoError(t, r2.Run(t.Context()))
-	require.True(t, r2.usedResumeFromCheckpoint.Load(), "the migration must resume from its checkpoint")
-	require.NoError(t, r2.Close())
-	var count int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM `cpt``bt`").Scan(&count))
-	require.Equal(t, 3, count)
-}
-
 // https://github.com/block/spirit/issues/381
 func TestCheckpointRestoreBinaryPK(t *testing.T) {
 	t.Parallel()

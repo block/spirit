@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
@@ -738,7 +740,76 @@ func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
 				Threads:      2,
 				WriteThreads: 2,
 			}
-			require.ErrorContains(t, move.Run(), tc.want)
+			err := move.Run()
+			require.ErrorContains(t, err, tc.want)
+			// --force wipes the target, which cannot fix a name.
+			require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
+
+			db, err := sql.Open("block-mysql", dest.FormatDSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			var n int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+			require.Zero(t, n, "nothing may be created on the target")
+		})
+	}
+}
+
+// TestMoveRefusesUnsupportedNames checks that a move is refused before
+// anything is created on the target when a moved table's name, or the source
+// schema's name, contains a '.' or a backtick. The replication client tracks
+// tables as schema + "." + table, so a '.' makes two tables indistinguishable;
+// a backtick has to be escaped by every statement that names the table.
+func TestMoveRefusesUnsupportedNames(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, srcDB, table, want string }{
+		{
+			name:  "dot in table name",
+			srcDB: "source_dot_tbl",
+			table: "dot.name",
+			want:  `table name "dot.name" contains a '.', which Spirit does not support`,
+		},
+		{
+			name:  "backtick in table name",
+			srcDB: "source_bt_tbl",
+			table: "back`tick",
+			want:  "table name \"back`tick\" contains a backtick, which Spirit does not support",
+		},
+		{
+			name:  "dot in source schema name",
+			srcDB: "source.dot_schema",
+			table: "t1",
+			want:  `source schema name "source.dot_schema" contains a '.', which Spirit does not support`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			destDB := "dest_" + strings.NewReplacer(".", "_", " ", "_").Replace(tc.name)
+			for _, db := range []string{tc.srcDB, destDB} {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+sqlescape.EscapeIdentifier(db))
+				testutils.RunSQL(t, "CREATE DATABASE "+sqlescape.EscapeIdentifier(db))
+			}
+			t.Cleanup(func() {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+sqlescape.EscapeIdentifier(tc.srcDB))
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+sqlescape.EscapeIdentifier(destDB))
+			})
+			qualified := sqlescape.EscapeIdentifier(tc.srcDB) + "." + sqlescape.EscapeIdentifier(tc.table)
+			testutils.RunSQL(t, "CREATE TABLE "+qualified+" (id INT NOT NULL PRIMARY KEY, v INT)")
+			testutils.RunSQL(t, "INSERT INTO "+qualified+" VALUES (1, 1), (2, 2)")
+
+			src, dest := cfg.Clone(), cfg.Clone()
+			src.DBName, dest.DBName = tc.srcDB, destDB
+			move := &Move{
+				SourceDSN:    src.FormatDSN(),
+				TargetDSN:    dest.FormatDSN(),
+				Threads:      2,
+				WriteThreads: 2,
+			}
+			err := move.Run()
+			require.ErrorContains(t, err, tc.want)
+			// --force wipes the target, which cannot fix a name.
+			require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
 
 			db, err := sql.Open("block-mysql", dest.FormatDSN())
 			require.NoError(t, err)

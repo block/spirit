@@ -20,6 +20,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -1156,4 +1157,32 @@ func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
 	require.False(t, tableExists(t, ctl, "rwfe_src", "t1"), "source real table stays gone")
 	require.True(t, tableExists(t, ctl, "rwfe_dst", "t1"), "target keeps serving")
 	require.False(t, tableExists(t, ctl, "rwfe_dst", checkpointTableName), "checkpoint dropped by complete-forward")
+}
+
+// TestResumeReverseWindowRefusesUnsupportedNames: resuming a reverse window
+// runs no check scope, and its reverse feeds subscribe the moved tables. A
+// window left behind for a table whose name contains a '.' (by a version that
+// did not refuse such names) must be refused before those feeds start.
+func TestResumeReverseWindowRefusesUnsupportedNames(t *testing.T) {
+	const srcDB = "rwdot_src"
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB) })
+	// The forward cutover retired the source table to <name>_old.
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".`dot.name_old` (id INT NOT NULL PRIMARY KEY)")
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.DBName = srcDB
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	r := &Runner{
+		move:    &Move{},
+		logger:  slog.Default(),
+		sources: []sourceInfo{{db: db, config: cfg}},
+	}
+	err = r.resumeReverseWindow(t.Context(), checkpoint.Record{Position: "{}"})
+	require.ErrorContains(t, err, `resume reverse window: table 'dot.name' cannot be moved: table name "dot.name" contains a '.'`)
 }

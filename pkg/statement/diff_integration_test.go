@@ -1239,3 +1239,92 @@ func TestDiffIntegrationBinaryDefaultBytesHexConverges(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
 }
+
+// TestDiffIntegrationBinaryLiteralDefaults verifies that a hex or bit literal
+// default on an integer, bit, char or varchar column matches its live form.
+// MySQL converts the literal to the column's own type and reports it in that
+// form: int DEFAULT 0x1A as DEFAULT '26', bit(8) DEFAULT x'61' as
+// DEFAULT b'1100001', and varchar(4) DEFAULT 0x61 as DEFAULT 'a'. An integer
+// default on a bit column is converted the same way (bit(1) DEFAULT 0 is
+// reported as DEFAULT b'0'). Without the conversion the diff emits a MODIFY
+// that MySQL rewrites to its own form again, on every run.
+//
+// A char default that is not valid utf8mb3 is reported as a hex literal only
+// from MySQL 8.0.33 (see binaryDefaultHexReason), so that case skips before it.
+func TestDiffIntegrationBinaryLiteralDefaults(t *testing.T) {
+	needsHexReporting := map[string]bool{"diff_binlit_char_4byte": true}
+	for _, tc := range []struct{ name, column, live string }{
+		{"diff_binlit_int_hex", "b int DEFAULT 0x1A", "`b` int DEFAULT '26'"},
+		{"diff_binlit_int_bit", "b int DEFAULT b'1010'", "`b` int DEFAULT '10'"},
+		{"diff_binlit_decimal_hex", "b decimal(5) DEFAULT 0x1A", "`b` decimal(5,0) DEFAULT '26'"},
+		{"diff_binlit_decimal_max", "b decimal(20,0) DEFAULT 0x7FFFFFFFFFFFFFFF", "`b` decimal(20,0) DEFAULT '9223372036854775807'"},
+		{"diff_binlit_int_max", "b bigint unsigned NOT NULL DEFAULT 0xFFFFFFFFFFFFFFFF", "`b` bigint unsigned NOT NULL DEFAULT '18446744073709551615'"},
+		{"diff_binlit_bit_hex", "b bit(8) DEFAULT x'61'", "`b` bit(8) DEFAULT b'1100001'"},
+		{"diff_binlit_bit_hex_zero", "b bit(8) DEFAULT x'0000'", "`b` bit(8) DEFAULT b'0'"},
+		{"diff_binlit_bit_int", "b bit(1) NOT NULL DEFAULT 0", "`b` bit(1) NOT NULL DEFAULT b'0'"},
+		{"diff_binlit_bit_no_width", "b bit DEFAULT 1", "`b` bit(1) DEFAULT b'1'"},
+		{"diff_binlit_bit_string", "b bit(8) DEFAULT '0'", "`b` bit(8) DEFAULT b'110000'"},
+		{"diff_binlit_char_hex", "b char(4) DEFAULT x'61'", "`b` char(4) DEFAULT 'a'"},
+		{"diff_binlit_varchar_hex", "b varchar(4) DEFAULT 0x61", "`b` varchar(4) DEFAULT 'a'"},
+		{"diff_binlit_varchar_bit", "b varchar(4) DEFAULT b'01100001'", "`b` varchar(4) DEFAULT 'a'"},
+		{"diff_binlit_char_multibyte", "b char(4) DEFAULT x'c3a9'", "`b` char(4) DEFAULT 'é'"},
+		{"diff_binlit_char_quote", "b char(4) DEFAULT x'27'", "`b` char(4) DEFAULT ''''"},
+		{"diff_binlit_char_ascii", "b char(4) CHARACTER SET ascii DEFAULT x'61'", "`b` char(4) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT 'a'"},
+		{"diff_binlit_char_4byte", "b char(4) DEFAULT x'f09f9880'", "`b` char(4) DEFAULT 0xF09F9880"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if needsHexReporting[tc.name] {
+				testutils.SkipBeforeMySQLVersion(t, "8.0.33", binaryDefaultHexReason)
+			}
+			ddl := "CREATE TABLE " + tc.name + " (id int NOT NULL, " + tc.column + ", PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+			tt := testutils.NewTestTable(t, tc.name, ddl)
+			liveSQL := showCreateTable(t, tt.DB, tt.Name)
+			require.Contains(t, liveSQL, tc.live, "the reading this case pins")
+			desired, err := ParseCreateTable(ddl)
+			require.NoError(t, err)
+			live, err := ParseCreateTable(liveSQL)
+			require.NoError(t, err)
+			stmts, err := live.Diff(desired, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "a literal default must match its live form")
+			stmts, err = desired.Diff(live, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "the live form must match the literal default")
+		})
+	}
+}
+
+// TestDiffIntegrationBinaryLiteralDefaultsConverge verifies that the MODIFY
+// emitted for a hex or bit literal default on an integer, bit or varchar column
+// carries the value in the column's own form, which MySQL applies unchanged,
+// after which a re-diff converges to nil.
+func TestDiffIntegrationBinaryLiteralDefaultsConverge(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_binlit_converge",
+		"CREATE TABLE diff_binlit_converge (id int NOT NULL, i int, b bit(8), f bit(1) NOT NULL, v varchar(4), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	desired, err := ParseCreateTable(
+		"CREATE TABLE diff_binlit_converge (id int NOT NULL, i int DEFAULT 0x1A, b bit(8) DEFAULT x'61', f bit(1) NOT NULL DEFAULT 0, v varchar(4) DEFAULT 0x27, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+
+	live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+	require.NoError(t, err)
+	stmts, err := live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "`i` int NULL DEFAULT 26")
+	require.Contains(t, stmts[0].Statement, "`b` bit(8) NULL DEFAULT b'1100001'")
+	require.Contains(t, stmts[0].Statement, "`f` bit(1) NOT NULL DEFAULT b'0'")
+	require.Contains(t, stmts[0].Statement, "`v` varchar(4) NULL DEFAULT '\\''")
+	testutils.RunSQL(t, stmts[0].Statement)
+
+	liveSQL := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, liveSQL, "`i` int DEFAULT '26'")
+	require.Contains(t, liveSQL, "`b` bit(8) DEFAULT b'1100001'")
+	require.Contains(t, liveSQL, "`f` bit(1) NOT NULL DEFAULT b'0'")
+	require.Contains(t, liveSQL, "`v` varchar(4) DEFAULT ''''")
+
+	live, err = ParseCreateTable(liveSQL)
+	require.NoError(t, err)
+	stmts, err = live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
+}

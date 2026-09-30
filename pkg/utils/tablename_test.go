@@ -52,3 +52,22 @@ func TestAuxTableNameTypedHelpers(t *testing.T) {
 	require.Equal(t, "_t_old", OldTableName("t"))
 	require.Equal(t, "_t_old_20260101_000000", OldTableNameWithTimestamp("t", "20260101_000000"))
 }
+
+func TestUnsupportedIdentifierError(t *testing.T) {
+	for _, name := range []string{"t1", "orders_2026", "a-b", "a b", "a$b", "_t1_chkpnt", strings.Repeat("x", MaxTableNameLength)} {
+		require.NoError(t, UnsupportedIdentifierError("table name", name), name)
+	}
+
+	err := UnsupportedIdentifierError("table name", "a.b")
+	require.ErrorContains(t, err, `table name "a.b" contains a '.', which Spirit does not support`)
+	require.ErrorContains(t, err, "collide")
+
+	err = UnsupportedIdentifierError("schema name", ".")
+	require.ErrorContains(t, err, `schema name "." contains a '.'`)
+
+	err = UnsupportedIdentifierError("table name", "a`b")
+	require.ErrorContains(t, err, "table name \"a`b\" contains a backtick, which Spirit does not support")
+
+	err = UnsupportedIdentifierError("schema name", "`")
+	require.ErrorContains(t, err, "schema name \"`\" contains a backtick")
+}

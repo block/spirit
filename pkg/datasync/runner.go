@@ -722,6 +722,9 @@ func (r *Runner) setup(ctx context.Context) error {
 		return err
 	}
 	r.sourceTables = tables
+	if err := r.unsupportedNameError(); err != nil {
+		return err
+	}
 	if len(r.sourceTables) == 0 {
 		return nil
 	}
@@ -974,6 +977,28 @@ func (r *Runner) getTables(ctx context.Context) ([]*table.TableInfo, error) {
 		tables = append(tables, ti)
 	}
 	return tables, rows.Err()
+}
+
+// unsupportedNameError refuses a schema or table name containing a '.' or a
+// backtick before anything is written (see utils.UnsupportedIdentifierError).
+// The change source routes row events by schema + "." + table, so a table
+// named b.c in schema a would also receive the changes of table c in schema
+// a.b on the same source.
+func (r *Runner) unsupportedNameError() error {
+	if err := utils.UnsupportedIdentifierError("source schema name", r.source.config.DBName); err != nil {
+		return fmt.Errorf("cannot sync: %w", err)
+	}
+	if r.target.Config != nil {
+		if err := utils.UnsupportedIdentifierError("target schema name", r.target.Config.DBName); err != nil {
+			return fmt.Errorf("cannot sync: %w", err)
+		}
+	}
+	for _, t := range r.sourceTables {
+		if err := utils.UnsupportedIdentifierError("table name", t.TableName); err != nil {
+			return fmt.Errorf("cannot sync table %q: %w", t.TableName, err)
+		}
+	}
+	return nil
 }
 
 // checkTargetEmpty verifies that, for a fresh sync, none of the source

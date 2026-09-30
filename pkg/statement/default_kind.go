@@ -52,9 +52,12 @@ const (
 	// DefaultKindHexLiteral is a hex literal such as 0x1A or x'1a', which the
 	// parser restores as x'1a'. MySQL converts it to whatever the column's
 	// type stores (an integer column reports 0x1A as 26), and reports it back
-	// as hex only on a binary or varbinary column whose value is not valid
-	// utf8mb3 (see [binaryDefaultBytesNormalizer]). It must be emitted bare:
-	// quoted, it is the string "x'1a'" rather than the byte 0x1a.
+	// as hex only on a binary, varbinary, char or varchar column whose value is
+	// not valid utf8mb3. The normalization rules convert it to the reported
+	// form on those types, on the integer types and on bit (see
+	// [binaryDefaultBytesNormalizer], [integerBinaryLiteralDefaultNormalizer],
+	// [bitDefaultNormalizer], [charBinaryLiteralDefaultNormalizer]). It must be
+	// emitted bare: quoted, it is the string "x'1a'" rather than the byte 0x1a.
 	DefaultKindHexLiteral
 )
 
