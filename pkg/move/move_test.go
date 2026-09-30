@@ -821,3 +821,57 @@ func TestMoveRefusesUnsupportedNames(t *testing.T) {
 		})
 	}
 }
+
+// TestMoveRefusesSourceTriggers checks that a move is refused before anything
+// is created on the target when a moved source table has a trigger. Move does
+// not copy triggers, so the cutover would retire the source table with its
+// triggers and leave the target without them. With more than one source,
+// every source is checked, not only the one the table list is read from.
+func TestMoveRefusesSourceTriggers(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		srcDBs  []string
+		trigger int // index into srcDBs of the source that gets the trigger
+	}{
+		{name: "single source", srcDBs: []string{"source_trg"}, trigger: 0},
+		{name: "second of two sources", srcDBs: []string{"source_trg_a", "source_trg_b"}, trigger: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			destDB := "dest_trg_" + strings.ReplaceAll(tc.name, " ", "_")
+			for _, db := range append([]string{destDB}, tc.srcDBs...) {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+				testutils.RunSQL(t, "CREATE DATABASE "+db)
+				t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db) })
+			}
+			var sourceDSNs []string
+			for i, db := range tc.srcDBs {
+				testutils.RunSQL(t, "CREATE TABLE "+db+".orders (id INT NOT NULL PRIMARY KEY, v INT)")
+				testutils.RunSQL(t, "CREATE TABLE "+db+".orders_audit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id INT)")
+				testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s.orders VALUES (%d, 1), (%d, 2)", db, 2*i+1, 2*i+2))
+				sourceDSNs = append(sourceDSNs, testutils.DSNForDatabase(db))
+			}
+			testutils.RunSQL(t, "CREATE TRIGGER "+tc.srcDBs[tc.trigger]+".orders_ai AFTER INSERT ON "+tc.srcDBs[tc.trigger]+
+				".orders FOR EACH ROW INSERT INTO orders_audit (order_id) VALUES (NEW.id)")
+
+			move := &Move{
+				SourceDSNs:   sourceDSNs,
+				TargetDSN:    testutils.DSNForDatabase(destDB),
+				Threads:      2,
+				WriteThreads: 2,
+			}
+			err := move.Run()
+			require.ErrorContains(t, err, "table 'orders' has trigger 'orders_ai' on source")
+			require.ErrorContains(t, err, "("+tc.srcDBs[tc.trigger]+"): move does not support tables with triggers")
+			// --force wipes the target, which cannot remove a source trigger.
+			require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
+
+			db, err := sql.Open("block-mysql", testutils.DSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			var n int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+			require.Zero(t, n, "nothing may be created on the target")
+		})
+	}
+}

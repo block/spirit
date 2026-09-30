@@ -1670,6 +1670,77 @@ func TestResumeFromCheckpointNotTooOld(t *testing.T) {
 	require.NoError(t, r.Close())
 }
 
+// TestResumeFromCheckpointRefusesSourceTrigger checks that a trigger created
+// on a moved source table after a checkpoint was written blocks the resume
+// before any further copy or cutover, without and with --force, and that the
+// partial copy and its checkpoint survive.
+func TestResumeFromCheckpointRefusesSourceTrigger(t *testing.T) {
+	const (
+		srcDB = "source_chkpt_trg"
+		dstDB = "dest_chkpt_trg"
+	)
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+dstDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+dstDB)
+	t.Cleanup(func() {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+dstDB)
+	})
+
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, val VARBINARY(64))")
+	testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 (val) SELECT RANDOM_BYTES(64)")
+	for range 3 { // 1 -> 2 -> 10 -> 1010 rows
+		testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 (val) SELECT RANDOM_BYTES(64) FROM "+srcDB+".t1 a JOIN "+srcDB+".t1 b JOIN "+srcDB+".t1 c LIMIT 5000")
+	}
+
+	move := &Move{
+		SourceDSN:    testutils.DSNForDatabase(srcDB),
+		TargetDSN:    testutils.DSNForDatabase(dstDB),
+		Threads:      1,
+		WriteThreads: 1,
+	}
+	checkpointAndStop(t, move)
+
+	ctl, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(ctl)
+	// Create the trigger without writing it to the binary log. A logged
+	// CREATE TRIGGER would also be caught when the resumed change feed replays
+	// past it, after the resume has started; unlogged, only the check can
+	// refuse it.
+	conn, err := ctl.Conn(t.Context())
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "CREATE TRIGGER "+srcDB+".t1_bu BEFORE UPDATE ON "+srcDB+".t1 FOR EACH ROW SET NEW.val = UPPER(NEW.val)")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	const want = "cannot move: table 't1' has trigger 't1_bu' on source 0 (" + srcDB + "): move does not support tables with triggers"
+
+	r, err := NewRunner(move)
+	require.NoError(t, err)
+	err = r.Run(t.Context())
+	require.ErrorContains(t, err, want)
+	require.NotContains(t, err.Error(), "--force", "wiping the target cannot remove a source trigger")
+	require.False(t, r.usedResumeFromCheckpoint.Load())
+	require.NoError(t, r.Close())
+	require.True(t, tableExists(t, ctl, dstDB, checkpointTableName), "the checkpoint must survive the refusal")
+
+	// --force must not wipe the target over a failure that wiping cannot fix.
+	forced := *move
+	forced.Force = true
+	r, err = NewRunner(&forced)
+	require.NoError(t, err)
+	err = r.Run(t.Context())
+	require.ErrorContains(t, err, "refusing to wipe the target")
+	require.ErrorContains(t, err, want)
+	require.NoError(t, r.Close())
+	require.True(t, tableExists(t, ctl, dstDB, checkpointTableName), "--force must not wipe the target")
+	require.True(t, tableExists(t, ctl, dstDB, "t1"), "--force must not wipe the target")
+	require.True(t, tableExists(t, ctl, srcDB, "t1"), "the source table must not be retired")
+}
+
 // TestCreateSentinelTableIdempotent verifies that sentinel.Create
 // adopts an existing sentinel rather than DROP+CREATE-ing it. The sentinel
 // name is shared with concurrent spirit processes polling it every

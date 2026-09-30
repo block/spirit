@@ -1186,3 +1186,32 @@ func TestResumeReverseWindowRefusesUnsupportedNames(t *testing.T) {
 	err = r.resumeReverseWindow(t.Context(), checkpoint.Record{Position: "{}"})
 	require.ErrorContains(t, err, `resume reverse window: table 'dot.name' cannot be moved: table name "dot.name" contains a '.'`)
 }
+
+// TestResumeReverseWindowRefusesRetiredTableTrigger: resuming a reverse window
+// runs no check scope. Its reverse feeds write to the retired _old source
+// tables, and a reverse cutover makes them live again, so a trigger created on
+// one since the forward move started must be refused before the feeds start.
+func TestResumeReverseWindowRefusesRetiredTableTrigger(t *testing.T) {
+	const srcDB = "rwtrg_src"
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB) })
+	// The forward cutover retired the source table to <name>_old.
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1_old (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQL(t, "CREATE TRIGGER "+srcDB+".t1_old_bi BEFORE INSERT ON "+srcDB+".t1_old FOR EACH ROW SET NEW.v = 1")
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.DBName = srcDB
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	r := &Runner{
+		move:    &Move{},
+		logger:  slog.Default(),
+		sources: []sourceInfo{{db: db, config: cfg}},
+	}
+	err = r.resumeReverseWindow(t.Context(), checkpoint.Record{Position: "{}"})
+	require.ErrorContains(t, err, "resume reverse window: cannot move: table 't1_old' has trigger 't1_old_bi' on source 0 ("+srcDB+")")
+}

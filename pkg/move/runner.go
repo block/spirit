@@ -1116,6 +1116,17 @@ func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record)
 	if err := check.UnsupportedNameError(r.checkResources()); err != nil {
 		return fmt.Errorf("resume reverse window: %w", err)
 	}
+	// Nor does it run the trigger check. The reverse feeds write to the
+	// retired _old tables on every source, which would fire any trigger
+	// created on them since the forward move started, and a reverse cutover
+	// makes those tables live again. Refuse before the feeds start.
+	retired := make([]string, len(logical))
+	for i, name := range logical {
+		retired[i] = check.CutoverOldName(name)
+	}
+	if err := check.SourceTriggersError(ctx, r.checkResources().Sources, retired); err != nil {
+		return fmt.Errorf("resume reverse window: %w", err)
+	}
 
 	return newReverseWindow(r).run(ctx)
 }
