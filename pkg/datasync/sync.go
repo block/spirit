@@ -92,7 +92,7 @@ type Sync struct {
 	// Source optionally provides a pre-constructed change.Source to use
 	// for replication instead of constructing a built-in MySQL-binlog
 	// client from SourceDSN. When set, the runner uses this as the change
-	// feed. SourceDSN is still required for source-side SQL (SHOW TABLES,
+	// feed. SourceDSN is still required for source-side SQL (SHOW FULL TABLES,
 	// SHOW CREATE TABLE, the initial-copy SELECTs). Setting Source requires
 	// setting Applier (see below).
 	//

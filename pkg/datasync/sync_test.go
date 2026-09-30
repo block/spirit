@@ -1209,7 +1209,7 @@ func TestSyncDeferSecondaryIndexesCreateAndRestore(t *testing.T) {
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
 
 	ctx := context.Background()
-	tables, err := runner.getTables(ctx)
+	tables, _, err := runner.getTables(ctx)
 	require.NoError(t, err)
 	runner.sourceTables = tables
 
@@ -1537,7 +1537,7 @@ func TestSyncTargetSchemaVerifyIgnoresDeferredIndexes(t *testing.T) {
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
 
 	ctx := context.Background()
-	tables, err := runner.getTables(ctx)
+	tables, _, err := runner.getTables(ctx)
 	require.NoError(t, err)
 	runner.sourceTables = tables
 

@@ -327,7 +327,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 
 	// Open the source SQL connection. Even when the change feed is an
 	// injected non-MySQL source, spirit still needs SQL access to the
-	// source for SHOW TABLES / SHOW CREATE TABLE and the initial-copy
+	// source for SHOW FULL TABLES / SHOW CREATE TABLE and the initial-copy
 	// SELECTs.
 	db, err := dbconn.New(r.sync.SourceDSN, r.sourceDBConfig)
 	if err != nil {
@@ -726,15 +726,20 @@ func (r *Runner) ChecksumStats() checksum.LocklessCheckerStats {
 // REPLICATION privileges + ROW binlog format on Start; a VStream
 // authenticates over gRPC). A table without a primary key surfaces a clear
 // error from getTables (SetInfo); a FLOAT or BIT primary key is refused by
-// unsupportedPrimaryKeyError. The only target-side gate is that, for a
-// fresh sync, the target tables must be empty.
+// unsupportedPrimaryKeyError. Source views are skipped, and source triggers,
+// routines and events are only logged (logUnsyncedSourceObjects).
+//
+// The target-side gates are: on every start, no trigger on a table sync
+// writes to and no event in the target schema (targetSchemaObjectsError);
+// and, for a fresh sync, the target tables must be empty.
 func (r *Runner) setup(ctx context.Context) error {
 	r.logger.Info("Fetching source table list")
-	tables, err := r.getTables(ctx)
+	tables, views, err := r.getTables(ctx)
 	if err != nil {
 		return err
 	}
 	r.sourceTables = tables
+	r.logUnsyncedSourceObjects(ctx, views)
 	if err := r.unsupportedNameError(); err != nil {
 		return err
 	}
@@ -746,6 +751,13 @@ func (r *Runner) setup(ctx context.Context) error {
 	}
 	if len(r.sourceTables) == 0 {
 		return nil
+	}
+	// Before sync creates, drops or writes any target table, including the
+	// --force wipe below. --force does not bypass it: the wipe drops the sync's target
+	// tables (and with them their triggers) only when the target cannot
+	// resume, and it never drops events.
+	if err := r.targetSchemaObjectsError(ctx); err != nil {
+		return err
 	}
 
 	if err := r.setupThrottling(ctx); err != nil {
@@ -964,20 +976,35 @@ func (r *Runner) TargetUnderLoad() bool {
 	return throttler.GradualOnly(r.currentLoadSignal()).IsThrottled()
 }
 
-// getTables discovers all tables in the source schema. Sync operates on a
-// whole schema at a time. Each table's metadata is populated via SetInfo.
-func (r *Runner) getTables(ctx context.Context) ([]*table.TableInfo, error) {
-	rows, err := r.source.db.QueryContext(ctx, "SHOW TABLES")
+// getTables discovers the base tables in the source schema. Sync operates on
+// a whole schema at a time. Each table's metadata is populated via SetInfo.
+//
+// Views are not synced and are returned separately, for the startup log.
+// SHOW TABLES lists them too, and a view has no primary key, so without the
+// filter a view failed the sync with "no primary key found". The filter is
+// applied to the Table_type column of SHOW FULL TABLES in Go rather than with
+// a WHERE clause, so the statement stays in the plain form that any
+// MySQL-protocol source endpoint supports. Any other type that is not a base
+// table is skipped the same way and listed with its type.
+func (r *Runner) getTables(ctx context.Context) (tables []*table.TableInfo, views []string, err error) {
+	rows, err := r.source.db.QueryContext(ctx, "SHOW FULL TABLES")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer utils.CloseAndLog(rows)
 
-	var tableName string
-	tables := make([]*table.TableInfo, 0)
+	var tableName, tableType string
+	tables = make([]*table.TableInfo, 0)
 	for rows.Next() {
-		if err := rows.Scan(&tableName); err != nil {
-			return nil, err
+		if err := rows.Scan(&tableName, &tableType); err != nil {
+			return nil, nil, err
+		}
+		if !strings.EqualFold(tableType, "BASE TABLE") {
+			if !strings.EqualFold(tableType, "VIEW") {
+				tableName = fmt.Sprintf("%s (%s)", tableName, tableType)
+			}
+			views = append(views, tableName)
+			continue
 		}
 		// Skip the checkpoint table in case the source and target schemas
 		// coincide (e.g. local testing).
@@ -992,11 +1019,11 @@ func (r *Runner) getTables(ctx context.Context) ([]*table.TableInfo, error) {
 		// temporary table, for an ENUM or SET member reported with a '?'.
 		ti.DisableAnalyze = true
 		if err := ti.SetInfo(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		tables = append(tables, ti)
 	}
-	return tables, rows.Err()
+	return tables, views, rows.Err()
 }
 
 // unsupportedNameError refuses a schema or table name containing a '.' or a
