@@ -94,17 +94,33 @@ func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err
 				schema, tableName := getTableIdentity(defaultSchema, table)
 				info.tables = append(info.tables, schemaTable{schema, tableName})
 			}
+		case *ast.CreateTriggerStmt:
+			// A trigger on the table being copied is never created on the
+			// new table, so it would be lost at cutover. The trigger and its
+			// table share a schema, which may be named on either identifier.
+			triggerSchema := defaultSchema
+			if t.Name != nil && t.Name.Schema.String() != "" {
+				triggerSchema = t.Name.Schema.String()
+			}
+			schema, table := getTableIdentity(triggerSchema, t.Table)
+			info.tables = append(info.tables, schemaTable{schema, table})
 		case *ast.AlterTableStmt, *ast.CreateTableStmt, *ast.TruncateTableStmt,
 			*ast.CreateIndexStmt, *ast.DropIndexStmt:
 			var tableNode *ast.TableName
+			var fks []*ast.Constraint
 			switch n := t.(type) {
 			case *ast.AlterTableStmt:
 				tableNode = n.Table
+				for _, spec := range n.Specs {
+					fks = append(fks, spec.Constraint)
+					fks = append(fks, spec.NewConstraints...)
+				}
 			case *ast.CreateTableStmt:
 				tableNode = n.Table
 				if n.StartTransaction {
 					info.opensTransaction = true
 				}
+				fks = n.Constraints
 			case *ast.TruncateTableStmt:
 				tableNode = n.Table
 			case *ast.CreateIndexStmt:
@@ -114,9 +130,27 @@ func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err
 			}
 			schema, table := getTableIdentity(defaultSchema, tableNode)
 			info.tables = append(info.tables, schemaTable{schema, table})
+			// An unqualified REFERENCES names a table in the child's schema.
+			info.tables = append(info.tables, foreignKeyParents(schema, fks...)...)
 		}
 	}
 	return info, nil
+}
+
+// foreignKeyParents returns the tables referenced by the foreign keys among
+// constraints. A foreign key added to another table that references a table
+// being copied would follow the cutover RENAME to the old table, so the DDL
+// concerns the referenced table as much as the one it is run on.
+func foreignKeyParents(defaultSchema string, constraints ...*ast.Constraint) []schemaTable {
+	var tables []schemaTable
+	for _, c := range constraints {
+		if c == nil || c.Tp != ast.ConstraintForeignKey || c.Refer == nil || c.Refer.Table == nil {
+			continue
+		}
+		schema, table := getTableIdentity(defaultSchema, c.Refer.Table)
+		tables = append(tables, schemaTable{schema, table})
+	}
+	return tables
 }
 
 // extractTablesFromDDLStmts extracts table names from DDL statements.

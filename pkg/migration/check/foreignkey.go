@@ -11,7 +11,11 @@ import (
 
 func init() {
 	registerCheck("addforeignkey", addForeignKeyCheck, ScopePreflight|ScopeStatement)
-	registerCheck("hasforeignkeys", hasForeignKeysCheck, ScopePreflight)
+	// Re-run before cutover: the binlog clients cancel on a foreign key
+	// they can parse, but skip statements they cannot, and an inbound
+	// foreign key added during the migration would follow the cutover
+	// RENAME to the _old table.
+	registerCheck("hasforeignkeys", hasForeignKeysCheck, ScopePreflight|ScopeCutover)
 }
 
 // The spirit OSC algorithm does not support foreign key constraints.
@@ -39,6 +43,9 @@ func hasForeignKeysCheck(ctx context.Context, r Resources, logger *slog.Logger) 
 	}
 	defer utils.CloseAndLog(rows)
 	if rows.Next() {
+		if r.scope == ScopeCutover {
+			return errors.New("a foreign key was created during the migration: tables with existing foreign key constraints are not supported")
+		}
 		return errors.New("tables with existing foreign key constraints are not supported")
 	}
 	if rows.Err() != nil {
