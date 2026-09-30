@@ -103,3 +103,31 @@ func TestSetReorderCheckVarcharToSet(t *testing.T) {
 	err = setReorderCheck(t.Context(), r, slog.Default())
 	require.NoError(t, err)
 }
+
+// TestSetReorderCheckEscapedMembers is TestEnumReorderCheckEscapedMembers for
+// SET.
+func TestSetReorderCheckEscapedMembers(t *testing.T) {
+	tt := testutils.NewTestTable(t, "setchk_escaped", `CREATE TABLE setchk_escaped (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		s SET('a\\b','c','nl\nx') NOT NULL
+	)`)
+	tbl := table.NewTableInfo(tt.DB, "test", "setchk_escaped")
+	require.NoError(t, tbl.SetInfo(t.Context()))
+
+	// Append: safe.
+	r := Resources{
+		Table:     tbl,
+		Statement: statement.MustNew(`ALTER TABLE setchk_escaped MODIFY COLUMN s SET('a\\b','c','nl\nx','d') NOT NULL`)[0],
+	}
+	require.NoError(t, setReorderCheck(t.Context(), r, slog.Default()))
+
+	// Moving a member to the end: a reorder.
+	for _, members := range []string{`'c','nl\nx','a\\b'`, `'a\\b','nl\nx','c'`} {
+		r = Resources{
+			Table:     tbl,
+			Statement: statement.MustNew("ALTER TABLE setchk_escaped MODIFY COLUMN s SET(" + members + ") NOT NULL")[0],
+		}
+		err := setReorderCheck(t.Context(), r, slog.Default())
+		require.ErrorContains(t, err, "unsafe SET value reorder", members)
+	}
+}

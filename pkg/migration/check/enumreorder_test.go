@@ -146,3 +146,34 @@ func TestEnumReorderCheckVarcharToEnum(t *testing.T) {
 	err = enumReorderCheck(t.Context(), r, slog.Default())
 	require.NoError(t, err)
 }
+
+// TestEnumReorderCheckEscapedMembers compares an ENUM whose members
+// information_schema reports escaped (a backslash as \\, a newline as \n) with
+// the members of the ALTER. Read as the escaped text, a kept member looked
+// dropped and re-added, so appending a member was refused and moving one to
+// the end was accepted.
+func TestEnumReorderCheckEscapedMembers(t *testing.T) {
+	tt := testutils.NewTestTable(t, "enumchk_escaped", `CREATE TABLE enumchk_escaped (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		e ENUM('a\\b','c','nl\nx') NOT NULL
+	)`)
+	tbl := table.NewTableInfo(tt.DB, "test", "enumchk_escaped")
+	require.NoError(t, tbl.SetInfo(t.Context()))
+
+	// Append: safe.
+	r := Resources{
+		Table:     tbl,
+		Statement: statement.MustNew(`ALTER TABLE enumchk_escaped MODIFY COLUMN e ENUM('a\\b','c','nl\nx','d') NOT NULL`)[0],
+	}
+	require.NoError(t, enumReorderCheck(t.Context(), r, slog.Default()))
+
+	// Moving a member to the end: a reorder.
+	for _, members := range []string{`'c','nl\nx','a\\b'`, `'a\\b','nl\nx','c'`} {
+		r = Resources{
+			Table:     tbl,
+			Statement: statement.MustNew("ALTER TABLE enumchk_escaped MODIFY COLUMN e ENUM(" + members + ") NOT NULL")[0],
+		}
+		err := enumReorderCheck(t.Context(), r, slog.Default())
+		require.ErrorContains(t, err, "unsafe ENUM value reorder", members)
+	}
+}

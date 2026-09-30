@@ -332,10 +332,10 @@ func (t *TableInfo) setStoredEnumSetMembers(ctx context.Context) error {
 				"through a temporary table%s: %w",
 				t.SchemaName, t.TableName, name, mysqlType, hint, err)
 		}
-		// information_schema also escapes some characters (a backslash is
-		// reported as \\), so the stored members can differ from the parsed
-		// ones without any being misreported. Only a member with a character
-		// outside utf8mb3 is reported as '?'.
+		// ParseEnumSetElements decodes the characters information_schema
+		// escapes (a backslash is reported as \\), so a stored member differs
+		// from the parsed one only where a character outside utf8mb3 was
+		// reported as '?'. Only such a member is misreported.
 		if !slices.Equal(stored, reported) {
 			t.enumSetElements[ord] = stored
 		}
