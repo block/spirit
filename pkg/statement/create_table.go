@@ -1547,6 +1547,10 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 	// 2. Its previous column changed (explicit reorder)
 	needsExplicitPosition := ct.calculateColumnPositioning(target, sourceColumns, targetColumns)
 
+	// Whether this ALTER sets the table default to the server's utf8mb4
+	// default collation; see modifiedColumn.
+	resetsTableDefault := !opts.IgnoreCharsetCollation && resetsToServerUTF8MB4Default(ct, target)
+
 	// Generate the ALTER clauses in target order
 	var prevColumn string
 	for i, targetCol := range target.Columns {
@@ -1581,7 +1585,7 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 				needsExplicitPosition[strings.ToLower(targetCol.Name)]
 
 			if needsModify {
-				clause := fmt.Sprintf("MODIFY COLUMN %s", formatColumnDefinition(&targetCol))
+				clause := fmt.Sprintf("MODIFY COLUMN %s", formatColumnDefinition(modifiedColumn(&targetCol, resetsTableDefault)))
 				if needsExplicitPosition[strings.ToLower(targetCol.Name)] {
 					if prevColumn == "" {
 						clause += " FIRST"
@@ -1597,6 +1601,23 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 	}
 
 	return clauses
+}
+
+// modifiedColumn returns the definition a MODIFY COLUMN renders for col. When
+// the same ALTER sets the table default to DEFAULT CHARSET=utf8mb4 without a
+// COLLATE (resetsTableDefault), a column that inherits it is rendered with
+// CHARACTER SET utf8mb4. MySQL resolves that to default_collation_for_utf8mb4,
+// as it does the table option, but resolves a MODIFY that names no charset in
+// that ALTER to utf8mb4_0900_ai_ci. On a server whose variable is
+// utf8mb4_general_ci, the column would then differ from the table it was
+// declared to inherit from, and a re-diff would emit a second MODIFY.
+func modifiedColumn(col *Column, resetsTableDefault bool) *Column {
+	if !resetsTableDefault || col.Charset != nil || col.Collation != nil || !charsetCarryingTypes[strings.ToLower(col.Type)] {
+		return col
+	}
+	withCharset := *col
+	withCharset.Charset = new(charset.CharsetUTF8MB4)
+	return &withCharset
 }
 
 // calculateColumnPositioning determines which columns need explicit positioning (FIRST/AFTER).
@@ -1954,7 +1975,14 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 
 	// Compare CHARSET and COLLATION
 	if !opts.IgnoreCharsetCollation {
-		if !ptrEqual(ct.TableOptions.getCharset(), target.TableOptions.getCharset()) {
+		// A DEFAULT CHARSET=utf8mb4 without a COLLATE also differs from a
+		// utf8mb4 table on a collation default_collation_for_utf8mb4 cannot
+		// hold, such as utf8mb4_bin. The clause is emitted alone: MySQL
+		// resolves it to that variable's value, which is what CREATE TABLE
+		// would give the declared table, while naming either collation would
+		// only be right on some servers.
+		if !ptrEqual(ct.TableOptions.getCharset(), target.TableOptions.getCharset()) ||
+			resetsToServerUTF8MB4Default(ct, target) {
 			if charset := target.TableOptions.getCharset(); charset != nil {
 				clauses = append(clauses, fmt.Sprintf("DEFAULT CHARSET=%s", *charset))
 			}

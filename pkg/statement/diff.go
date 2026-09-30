@@ -188,9 +188,12 @@ func comparedCollation(col *Column, resolved string) string {
 // attribute falls back to comparing the written values with redundant
 // table-default spellings normalized away — an unexpressed preference is
 // treated as a match rather than guessed at, which keeps the diff from
-// emitting a MODIFY it could never prove converged. A column that names
-// utf8mb4 without a COLLATE is the one exception: it matches either collation
-// default_collation_for_utf8mb4 can hold, whatever the table defaults are.
+// emitting a MODIFY it could never prove converged. Two exceptions follow
+// from default_collation_for_utf8mb4 accepting only two collations: a column
+// that names utf8mb4 without a COLLATE matches either of them, whatever the
+// table defaults are; and a column inheriting a DEFAULT CHARSET=utf8mb4
+// declared without a COLLATE does not match one whose table names any other
+// collation.
 func charsetCollationEqual(a, b *Column, source, target *CreateTable, opts *DiffOptions) bool {
 	if !charsetCarryingTypes[strings.ToLower(a.Type)] {
 		// Non-character types have no table default to inherit, so compare
@@ -244,6 +247,22 @@ func charsetCollationEqual(a, b *Column, source, target *CreateTable, opts *Diff
 	if takesServerUTF8MB4Default(b) {
 		if other := comparedCollation(a, sourceCollation); other != "" {
 			return utf8mb4ServerDefaultCollations[other]
+		}
+	}
+	// A column that inherits a DEFAULT CHARSET=utf8mb4 declared without a
+	// COLLATE has its table's server default. When the other table names a
+	// collation that default can never be (utf8mb4_bin, or another charset's),
+	// the table-option diff changes the table's collation, and a table
+	// default only applies to columns added later, so this column needs a
+	// MODIFY in the same ALTER. The written values cannot show this: the live
+	// form of an inheriting column writes no COLLATE. IgnoreCharsetCollation
+	// suppresses that table-option diff, so the rule does not apply there.
+	if !opts.IgnoreCharsetCollation {
+		if inheritsServerUTF8MB4Default(a, source) && isNonServerUTF8MB4Collation(target) {
+			return false
+		}
+		if inheritsServerUTF8MB4Default(b, target) && isNonServerUTF8MB4Collation(source) {
+			return false
 		}
 	}
 	return ptrEqual(

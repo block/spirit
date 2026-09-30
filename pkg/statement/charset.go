@@ -71,3 +71,42 @@ var utf8mb4ServerDefaultCollations = map[string]bool{
 func takesServerUTF8MB4Default(col *Column) bool {
 	return col.Charset != nil && col.Collation == nil && strings.EqualFold(*col.Charset, charset.CharsetUTF8MB4)
 }
+
+// takesServerUTF8MB4TableDefault reports whether a table declares DEFAULT
+// CHARSET=utf8mb4 without a COLLATE. MySQL gives such a table the server's
+// default_collation_for_utf8mb4, whatever the schema default is, so like a
+// column naming utf8mb4 alone it can only take the collations in
+// utf8mb4ServerDefaultCollations. A table with no charset clause is not
+// covered: it inherits the schema default, which can be any collation.
+func takesServerUTF8MB4TableDefault(table *CreateTable) bool {
+	cs := table.TableOptions.getCharset()
+	return cs != nil && table.TableOptions.getCollation() == nil && strings.EqualFold(*cs, charset.CharsetUTF8MB4)
+}
+
+// inheritsServerUTF8MB4Default reports whether a column names neither a
+// charset nor a collation and its table declares DEFAULT CHARSET=utf8mb4
+// without a COLLATE, so that the column takes the same server default as the
+// table.
+func inheritsServerUTF8MB4Default(col *Column, table *CreateTable) bool {
+	return col.Charset == nil && col.Collation == nil && takesServerUTF8MB4TableDefault(table)
+}
+
+// isNonServerUTF8MB4Collation reports whether a table names a collation that
+// no table declaring DEFAULT CHARSET=utf8mb4 without a COLLATE can have. A
+// table that names no collation is underdetermined, and reports false.
+func isNonServerUTF8MB4Collation(table *CreateTable) bool {
+	collation := table.TableOptions.getCollation()
+	return collation != nil && !utf8mb4ServerDefaultCollations[strings.ToLower(*collation)]
+}
+
+// resetsToServerUTF8MB4Default reports whether converging source onto target
+// sets the table default to the server's default_collation_for_utf8mb4:
+// target declares DEFAULT CHARSET=utf8mb4 without a COLLATE, and source uses
+// another charset or names a collation that default cannot be.
+func resetsToServerUTF8MB4Default(source, target *CreateTable) bool {
+	if !takesServerUTF8MB4TableDefault(target) {
+		return false
+	}
+	return !ptrEqual(source.TableOptions.getCharset(), target.TableOptions.getCharset()) ||
+		isNonServerUTF8MB4Collation(source)
+}

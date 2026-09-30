@@ -1068,6 +1068,93 @@ func TestDiffIntegrationUtf8mb4ColumnWithoutCollationDetectsDrift(t *testing.T) 
 	}
 }
 
+// TestDiffIntegrationUtf8mb4TableWithoutCollation verifies that a desired
+// DEFAULT CHARSET=utf8mb4 without a COLLATE converges a table MySQL could not
+// have created from it, including the column that inherits the table default,
+// in one ALTER, whichever value default_collation_for_utf8mb4 has. That
+// variable is what CREATE TABLE gives the declared table, and it accepts only
+// the two server-default collations, so a utf8mb4_bin table is drift.
+func TestDiffIntegrationUtf8mb4TableWithoutCollation(t *testing.T) {
+	const declared = "CREATE TABLE %s (id int NOT NULL, b varchar(3), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4"
+	for _, serverDefault := range []string{"utf8mb4_0900_ai_ci", "utf8mb4_general_ci"} {
+		for _, liveOpts := range []string{
+			"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+			"DEFAULT CHARSET=latin1",
+		} {
+			t.Run(serverDefault+"/"+liveOpts, func(t *testing.T) {
+				tt := testutils.NewTestTable(t, "diff_utf8mb4_table_no_collate",
+					"CREATE TABLE diff_utf8mb4_table_no_collate (id int NOT NULL, b varchar(3), PRIMARY KEY (id)) "+liveOpts)
+				conn, err := tt.DB.Conn(t.Context())
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = conn.Close() })
+				_, err = conn.ExecContext(t.Context(), "SET SESSION default_collation_for_utf8mb4 = "+serverDefault)
+				require.NoError(t, err)
+				collations := func(table string) (tableCollation, columnCollation string) {
+					require.NoError(t, conn.QueryRowContext(t.Context(),
+						"SELECT table_collation FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", table).Scan(&tableCollation))
+					require.NoError(t, conn.QueryRowContext(t.Context(),
+						"SELECT collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'b'", table).Scan(&columnCollation))
+					return tableCollation, columnCollation
+				}
+
+				// The premise: CREATE TABLE gives the declared table and its
+				// inheriting column the variable's value.
+				const createdName = "diff_utf8mb4_table_no_collate_created"
+				t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS "+createdName) })
+				_, err = conn.ExecContext(t.Context(), "DROP TABLE IF EXISTS "+createdName)
+				require.NoError(t, err)
+				_, err = conn.ExecContext(t.Context(), fmt.Sprintf(declared, createdName))
+				require.NoError(t, err)
+				tableCollation, columnCollation := collations(createdName)
+				require.Equal(t, serverDefault, tableCollation)
+				require.Equal(t, serverDefault, columnCollation)
+
+				desired, err := ParseCreateTable(fmt.Sprintf(declared, tt.Name))
+				require.NoError(t, err)
+				live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+				require.NoError(t, err)
+				stmts, err := live.Diff(desired, nil)
+				require.NoError(t, err)
+				require.Len(t, stmts, 1)
+				_, err = conn.ExecContext(t.Context(), stmts[0].Statement)
+				require.NoError(t, err)
+
+				tableCollation, columnCollation = collations(tt.Name)
+				require.Equal(t, serverDefault, tableCollation, stmts[0].Statement)
+				require.Equal(t, serverDefault, columnCollation, stmts[0].Statement)
+
+				live, err = ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+				require.NoError(t, err)
+				stmts, err = live.Diff(desired, nil)
+				require.NoError(t, err)
+				require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
+			})
+		}
+	}
+}
+
+// TestDiffIntegrationNoTableCharsetStaysUnderdetermined verifies the case the
+// rule above must not cover: a table with no charset clause inherits the
+// schema default, which can be utf8mb4_bin, so a utf8mb4_bin table matches it.
+func TestDiffIntegrationNoTableCharsetStaysUnderdetermined(t *testing.T) {
+	// A database of its own, so that changing its default does not affect
+	// other tests.
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "ALTER DATABASE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin")
+	ddl := "CREATE TABLE diff_no_table_charset (id int NOT NULL, b varchar(3), PRIMARY KEY (id))"
+	testutils.RunSQLInDatabase(t, dbName, ddl)
+
+	desired, err := ParseCreateTable(ddl)
+	require.NoError(t, err)
+	liveDDL := showCreateTable(t, db, "diff_no_table_charset")
+	require.Contains(t, liveDDL, "COLLATE=utf8mb4_bin")
+	live, err := ParseCreateTable(liveDDL)
+	require.NoError(t, err)
+	stmts, err := live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts)
+}
+
 // TestDiffIntegrationTableCharsetSelectsDefaultCollation verifies that a
 // desired DEFAULT CHARSET=latin1 converges a latin1_bin table, including the
 // column that inherits the table default, onto latin1_swedish_ci in one ALTER.

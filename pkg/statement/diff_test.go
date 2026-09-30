@@ -890,13 +890,81 @@ func TestDiff(t *testing.T) {
 			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) NULL, COLLATE=latin1_swedish_ci",
 		},
 		{
-			// utf8mb4's default collation depends on the server, so a
-			// DEFAULT CHARSET=utf8mb4 without a COLLATE still matches any
-			// utf8mb4 collation.
-			name:     "Utf8mb4WithoutCollationStaysUnderdetermined",
+			// DEFAULT CHARSET=utf8mb4 without a COLLATE gives the table the
+			// server's default_collation_for_utf8mb4, which can only be
+			// utf8mb4_0900_ai_ci or utf8mb4_general_ci, so a utf8mb4_bin
+			// table is converged. The table option cannot name the server's
+			// choice, so it restates the charset alone, and the inheriting
+			// column is MODIFYed in the same ALTER with CHARACTER SET
+			// utf8mb4, which MySQL resolves the same way.
+			name:     "Utf8mb4WithoutCollationIsNotUtf8mb4Bin",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) COLLATE utf8mb4_bin DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) CHARACTER SET utf8mb4 NULL, DEFAULT CHARSET=utf8mb4",
+		},
+		{
+			// The live form: an inheriting column writes no COLLATE.
+			name:     "Utf8mb4WithoutCollationIsNotUtf8mb4Bin_LiveForm",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) CHARACTER SET utf8mb4 NULL, DEFAULT CHARSET=utf8mb4",
+		},
+		{
+			// A column the live table spells out on a server default still
+			// needs the MODIFY: on the other server default it would not
+			// follow the table.
+			name:     "Utf8mb4WithoutCollationIsNotUtf8mb4Bin_ColumnOnServerDefault",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) CHARACTER SET utf8mb4 NULL, DEFAULT CHARSET=utf8mb4",
+		},
+		{
+			// Converging the other way sets COLLATE=utf8mb4_bin, which
+			// leaves existing columns on the old collation, so the
+			// inheriting column is MODIFYed onto it.
+			name:     "Utf8mb4WithoutCollationIsNotUtf8mb4Bin_Reverse",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) NULL DEFAULT NULL, COLLATE=utf8mb4_bin",
+		},
+		{
+			// Either server default is one the declared table can have, so
+			// it stays underdetermined against them.
+			name:     "Utf8mb4WithoutCollationMatchesServerDefault",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
 			expected: "",
+		},
+		{
+			name:     "Utf8mb4WithoutCollationMatchesServerDefault_0900",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
+			expected: "",
+		},
+		{
+			// A column the declaration says inherits the table, but which the
+			// live table spells out on the other server default, is still
+			// MODIFYed onto the table's collation.
+			name:     "Utf8mb4WithoutCollationColumnOffTableServerDefault",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) COLLATE utf8mb4_general_ci DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) NULL",
+		},
+		{
+			// A table with no charset clause inherits the schema default,
+			// which can be any collation, so it stays underdetermined.
+			name:     "NoTableCharsetStaysUnderdetermined",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3))",
+			expected: "",
+		},
+		{
+			// Converting another charset to a bare utf8mb4 spells the
+			// charset on the inheriting column for the same reason.
+			name:     "Latin1ToUtf8mb4WithoutCollation",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=latin1",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) CHARACTER SET utf8mb4 NULL, DEFAULT CHARSET=utf8mb4",
 		},
 		{
 			// A column that names utf8mb4 without a COLLATE is not
@@ -906,7 +974,7 @@ func TestDiff(t *testing.T) {
 			name:     "Utf8mb4ColumnWithoutCollationIsNotTheTableCollation",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, b varchar(3) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, b varchar(3) CHARACTER SET utf8mb4) DEFAULT CHARSET=utf8mb4",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `b` varchar(3) CHARACTER SET utf8mb4 NULL",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `b` varchar(3) CHARACTER SET utf8mb4 NULL, DEFAULT CHARSET=utf8mb4",
 		},
 		{
 			// The live form of that column in a utf8mb4_bin table inherits
@@ -1951,6 +2019,15 @@ func TestDiff_DiffOptions(t *testing.T) {
 			name:     "IgnoreCharsetCollation_Charset",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY) CHARSET=utf8mb4",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY) CHARSET=latin1",
+			opts:     &DiffOptions{IgnoreCharsetCollation: true, IgnoreAutoIncrement: true, IgnoreEngine: true},
+			expected: "",
+		},
+		{
+			// The bare utf8mb4 table rule is a table-option difference, so it
+			// is suppressed with the rest of them.
+			name:     "IgnoreCharsetCollation_Utf8mb4WithoutCollation",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
 			opts:     &DiffOptions{IgnoreCharsetCollation: true, IgnoreAutoIncrement: true, IgnoreEngine: true},
 			expected: "",
 		},
