@@ -47,7 +47,10 @@ type FeedbackCall struct {
 	Timestamp  time.Time
 }
 
-var _ MappedChunker = &MockChunker{}
+var (
+	_ MappedChunker    = &MockChunker{}
+	_ BufferedKeyNoter = &MockChunker{}
+)
 
 // NewMockChunker creates a new mock chunker for testing
 func NewMockChunker(tableName string, totalRows uint64) *MockChunker {

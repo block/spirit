@@ -17,7 +17,7 @@ import (
 // changes for keys that were already copied in a previous run.
 //
 // bufferedHighPtr is the same guard for rows the change stream may have
-// written to the target in *this* run: see MappedChunker.NoteBufferedKey.
+// written to the target in *this* run: see BufferedKeyNoter.NoteBufferedKey.
 type watermarkTracker struct {
 	watermark              *Chunk
 	lowerBoundWatermarkMap map[string]*Chunk
@@ -47,7 +47,7 @@ type watermarkTracker struct {
 	inflightChunks uint64
 }
 
-// noteBufferedKey implements MappedChunker.NoteBufferedKey for both chunkers.
+// noteBufferedKey implements BufferedKeyNoter.NoteBufferedKey for both chunkers.
 // notDispatched is the caller's answer to "is key possibly not yet covered by
 // a dispatched chunk"; convErr is the error from converting key0 to a Datum.
 // Caller must hold the chunker's mutex.

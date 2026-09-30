@@ -68,21 +68,55 @@ func TestPreDispatchChangeThenAboveHighWatermark(t *testing.T) {
 	}
 	timings := []preDispatchTiming{firstStillBuffered, firstFlushedBeforeDispatch, firstFlushedBeforeOptimization}
 	for clientName, newClient := range clients {
-		for _, timing := range timings {
-			for _, secondIsDelete := range []bool{false, true} {
-				name := fmt.Sprintf("%s/%s/update", clientName, timing)
-				if secondIsDelete {
-					name = fmt.Sprintf("%s/%s/delete", clientName, timing)
+		for _, chunkerKind := range []string{"with-noter", "without-noter"} {
+			hideNoter := chunkerKind == "without-noter"
+			for _, timing := range timings {
+				for _, secondIsDelete := range []bool{false, true} {
+					op := "update"
+					if secondIsDelete {
+						op = "delete"
+					}
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", clientName, chunkerKind, timing, op), func(t *testing.T) {
+						runPreDispatchScenario(t, newClient, timing, secondIsDelete, hideNoter)
+					})
 				}
-				t.Run(name, func(t *testing.T) {
-					runPreDispatchScenario(t, newClient, timing, secondIsDelete)
-				})
 			}
 		}
 	}
 }
 
-func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, applier.Applier) preDispatchClient, timing preDispatchTiming, secondIsDelete bool) {
+// hiddenNoterChunker exposes only table.MappedChunker, hiding the wrapped
+// chunker's optional table.BufferedKeyNoter capability. It stands in for an
+// out-of-tree chunker that predates that interface.
+type hiddenNoterChunker struct {
+	table.MappedChunker
+}
+
+// subscriptionOf returns the bufferedMap a pre-dispatch test client created
+// for schema.tbl.
+func subscriptionOf(t *testing.T, client preDispatchClient, schema, tbl string) *bufferedMap {
+	t.Helper()
+	var subs *subscriptionRegistry
+	switch c := client.(type) {
+	case *binlogClient:
+		subs = c.subs
+	case *gtidClient:
+		subs = c.subs
+	default:
+		t.Fatalf("unexpected client type %T", client)
+	}
+	sub, ok := subs.Get(encodeSchemaTable(schema, tbl))
+	require.True(t, ok)
+	buffered, ok := sub.(*bufferedMap)
+	require.True(t, ok)
+	return buffered
+}
+
+// runPreDispatchScenario runs the sequence described on
+// TestPreDispatchChangeThenAboveHighWatermark. With hideNoter the subscription
+// gets a chunker without table.BufferedKeyNoter: it must then never discard a
+// change as above the high watermark, and the target must still converge.
+func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, applier.Applier) preDispatchClient, timing preDispatchTiming, secondIsDelete, hideNoter bool) {
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -111,9 +145,17 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 	chunker, err := table.NewChunker(src, table.ChunkerConfig{NewTable: dst, TargetChunkTime: time.Second})
 	require.NoError(t, err)
 	require.NoError(t, chunker.Open())
-	require.NoError(t, client.AddSubscription(src, dst, chunker))
+	subChunker := chunker
+	if hideNoter {
+		subChunker = hiddenNoterChunker{chunker}
+		_, ok := subChunker.(table.BufferedKeyNoter)
+		require.False(t, ok)
+	}
+	require.NoError(t, client.AddSubscription(src, dst, subChunker))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
+	sub := subscriptionOf(t, client, "test", "predisp_src")
+	require.Equal(t, hideNoter, sub.keyNoter == nil)
 
 	if timing != firstFlushedBeforeOptimization {
 		require.NoError(t, client.SetWatermarkOptimization(t.Context(), true))
@@ -146,6 +188,11 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 	require.NoError(t, err)
 	require.NoError(t, cp.CopyChunk(t.Context(), chunk))
 	require.True(t, chunker.KeyNotYetDispatched(key))
+	if hideNoter {
+		// Nothing told the chunker about the first change, so it would
+		// discard the second one. The subscription must not ask it.
+		require.True(t, chunker.KeyAboveHighWatermark(key))
+	}
 
 	// (3) The second change to the same key. Its key is above the high
 	// watermark; it must still reach the target.
@@ -155,6 +202,7 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 		testutils.RunSQL(t, fmt.Sprintf("UPDATE predisp_src SET b = 100 WHERE a = %d", key))
 	}
 	require.NoError(t, client.BlockWait(t.Context()))
+	require.Zero(t, sub.keysDroppedAbove.Load(), "the second change was discarded as above the high watermark")
 
 	// (4) A periodic flush, then the copier finishes the table.
 	require.NoError(t, client.flush(t.Context(), false, nil))

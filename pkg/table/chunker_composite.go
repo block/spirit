@@ -49,7 +49,10 @@ type compositeWatermark struct {
 	RowsCopied uint64
 }
 
-var _ MappedChunker = &chunkerComposite{}
+var (
+	_ MappedChunker    = &chunkerComposite{}
+	_ BufferedKeyNoter = &chunkerComposite{}
+)
 
 func (t *chunkerComposite) additionalConditionsSQL(whereSent bool) string {
 	if t.where == "" {
@@ -632,7 +635,7 @@ func (t *chunkerComposite) KeyNotYetDispatched(key0 any) bool {
 	return above
 }
 
-// NoteBufferedKey satisfies MappedChunker. See the interface docs.
+// NoteBufferedKey satisfies BufferedKeyNoter. See the interface docs.
 func (t *chunkerComposite) NoteBufferedKey(key0 any) {
 	t.Lock()
 	defer t.Unlock()

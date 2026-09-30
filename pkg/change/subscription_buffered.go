@@ -192,6 +192,13 @@ type bufferedMap struct {
 
 	watermarkOptimization bool
 	chunker               table.MappedChunker
+	// keyNoter is chunker's optional table.BufferedKeyNoter capability,
+	// asserted once at construction. When it is nil (a chunker that does
+	// not implement it), the subscription never applies the
+	// above-high-watermark discard: it could not tell the chunker which keys
+	// a flush may already have written ahead of the copier, so discarding a
+	// later change for such a key could leave a stale or phantom row.
+	keyNoter table.BufferedKeyNoter
 
 	// closed is set by Close() to release any HasChanged caller parked on
 	// the soft memory limit. Without it, Client.Close() deadlocks on
@@ -405,6 +412,12 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 		flushConcurrency:     cfg.FlushConcurrency,
 		batchSize:            cfg.BatchSize,
 		underLoad:            cfg.UnderLoad,
+	}
+	if noter, ok := cfg.Chunker.(table.BufferedKeyNoter); ok {
+		sub.keyNoter = noter
+	} else if cfg.Chunker != nil {
+		logger.Warn("chunker does not implement table.BufferedKeyNoter; the above-high-watermark discard is disabled for this subscription",
+			"table", cfg.CurrentTable.QuotedTableName, "chunker", fmt.Sprintf("%T", cfg.Chunker))
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
 	return sub, nil
@@ -925,7 +938,9 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 	// chunk. Deterministic repro: TestKeyAboveWatermarkVisibilityWindow.
 	// Analysis + fix directions: "Above-watermark discard vs. binlog
 	// visibility" in this package's README.
-	if s.watermarkOptimizationEnabled() && s.chunker.KeyAboveHighWatermark(key[0]) {
+	// Without a BufferedKeyNoter the discard is never safe (see keyNoter), so
+	// every change is admitted.
+	if s.watermarkOptimizationEnabled() && s.keyNoter != nil && s.chunker.KeyAboveHighWatermark(key[0]) {
 		s.keysDroppedAbove.Add(1)
 		s.logger.Debug("key above watermark", "key", key[0])
 		return
@@ -939,8 +954,8 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 	// dropped change is a DELETE. This runs before the change is buffered and
 	// under s.Mutex, so no later HasChanged for the key can be discarded in
 	// between, even while a flush has the entry swapped out.
-	if s.chunker != nil {
-		s.chunker.NoteBufferedKey(key[0])
+	if s.keyNoter != nil {
+		s.keyNoter.NoteBufferedKey(key[0])
 	}
 
 	hashedKey := utils.HashKey(key)
@@ -2085,9 +2100,11 @@ func (s *bufferedMap) flushQueueLocked(ctx context.Context, underLock bool, lock
 // entry is enough to make every flush report allChangesFlushed=false.
 //
 // Flushing a not-yet-dispatched key puts it on the target before the copier,
-// whose INSERT IGNORE then skips it. That is safe only because HasChanged
-// reported the key through NoteBufferedKey when it admitted the change, so no
-// later change for the key is discarded as above the high watermark.
+// whose INSERT IGNORE then skips it. That is safe only because no later change
+// for the key is discarded as above the high watermark: HasChanged reported
+// the key through BufferedKeyNoter.NoteBufferedKey when it admitted the
+// change, or, for a chunker without that capability, HasChanged never
+// discards at all.
 func (s *bufferedMap) mustDeferKey(key0 any) bool {
 	if s.chunker.KeyBelowLowWatermark(key0) {
 		return false // already copied and committed

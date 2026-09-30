@@ -203,10 +203,14 @@ The copier maintains a "watermark" representing its progress. The replication cl
 
 ```go
 // Ingest time (HasChanged): drop what the copier is guaranteed to pick up.
-if chunker.KeyAboveHighWatermark(key[0]) {
+// keyNoter is the chunker's optional table.BufferedKeyNoter, asserted once
+// when the subscription is created; nil disables the discard (see below).
+if keyNoter != nil && chunker.KeyAboveHighWatermark(key[0]) {
     return  // Skip, copier will handle this
 }
-chunker.NoteBufferedKey(key[0]) // admitted: never drop this key again (see below)
+if keyNoter != nil {
+    keyNoter.NoteBufferedKey(key[0]) // admitted: never drop this key again
+}
 
 // Flush time (bufferedMap.mustDeferKey): defer only the in-flight band.
 if !chunker.KeyBelowLowWatermark(key[0]) && !chunker.KeyNotYetDispatched(key[0]) {
@@ -235,6 +239,12 @@ covered it. `KeyAboveHighWatermark` returns `false` at or below that guard,
 exactly as it does at or below `checkpointHighPtr` after a resume. The guard
 is a single value, so it costs no memory; the cost is that changes to keys
 between the dispatch pointer and the guard are applied instead of dropped.
+`NoteBufferedKey` is on a separate optional interface,
+`table.BufferedKeyNoter`, so a `MappedChunker` written before it existed still
+compiles. The subscription type-asserts for it once, when it is created. If
+the chunker does not implement it, the subscription never applies the
+above-high-watermark discard: every change is buffered and applied, which is
+correct but gives up the optimization. The in-tree chunkers implement it.
 Regression tests: `TestPreDispatchChangeThenAboveHighWatermark`
 ([`predispatch_discard_test.go`](predispatch_discard_test.go)), and end to end
 `TestE2EPreDispatchChangeThenAboveHighWatermark` (pkg/migration) and
