@@ -21,7 +21,18 @@ func TestStripIntegerDisplayWidth(t *testing.T) {
 		{"CREATE TABLE t (a tinyint(1))", new(1)},                 // BOOLEAN form, preserved
 		{"CREATE TABLE t (a boolean)", new(1)},                    // folds to tinyint(1)
 		{"CREATE TABLE t (a int(10) unsigned zerofill)", new(10)}, // width kept under zerofill
-		{"CREATE TABLE t (a int zerofill)", new(10)},              // unsigned default, not the parser's int(11)
+		{"CREATE TABLE t (a int(0))", nil},
+		{"CREATE TABLE t (a tinyint(0))", nil},
+		{"CREATE TABLE t (a int(0) zerofill)", new(10)}, // MySQL substitutes the unsigned default width
+		{"CREATE TABLE t (a tinyint(0) zerofill)", new(3)},
+		{"CREATE TABLE t (a smallint(0) zerofill)", new(5)},
+		{"CREATE TABLE t (a mediumint(0) zerofill)", new(8)},
+		{"CREATE TABLE t (a bigint(0) zerofill)", new(20)},
+		{"CREATE TABLE t (a int(5) zerofill)", new(5)}, // a non-zero zerofill width is kept as declared
+		{"CREATE TABLE t (a tinyint(1) zerofill)", new(1)},
+		{"CREATE TABLE t (a mediumint(3) zerofill)", new(3)},
+		{"CREATE TABLE t (a bigint(25) zerofill)", new(25)},
+		{"CREATE TABLE t (a int zerofill)", new(10)}, // unsigned default, not the parser's int(11)
 		{"CREATE TABLE t (a int unsigned zerofill)", new(10)},
 		{"CREATE TABLE t (a integer zerofill)", new(10)},
 		{"CREATE TABLE t (a tinyint zerofill)", new(3)},
@@ -75,4 +86,18 @@ func TestZerofillDefaultWidthConverges(t *testing.T) {
 	require.Len(t, stmts, 1)
 	assert.Contains(t, stmts[0].Statement, "`a` int(11) unsigned zerofill")
 	assert.NotContains(t, stmts[0].Statement, "`b`")
+}
+
+// TestZerofillWidthChangeReported verifies that a change between two
+// non-default ZEROFILL widths is still reported: only a missing or zero width
+// is replaced with the type's default.
+func TestZerofillWidthChangeReported(t *testing.T) {
+	live, err := ParseCreateTable("CREATE TABLE t (a int(5) unsigned zerofill)")
+	require.NoError(t, err)
+	declared, err := ParseCreateTable("CREATE TABLE t (a int(8) zerofill)")
+	require.NoError(t, err)
+	stmts, err := live.Diff(declared, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	assert.Equal(t, "ALTER TABLE `t` MODIFY COLUMN `a` int(8) unsigned zerofill NULL", stmts[0].Statement)
 }

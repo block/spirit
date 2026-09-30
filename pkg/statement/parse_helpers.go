@@ -197,8 +197,13 @@ func restoreExpressionText(expr ast.ExprNode) (string, bool) {
 	return sb.String(), true
 }
 
-// extractLengthFromTypeString extracts length from type string like "varchar(100)"
-func extractLengthFromTypeString(typeStr string) int {
+// extractLengthFromTypeString extracts length from type string like
+// "varchar(100)". ok reports whether the type string carries a width at all, so
+// that a zero width (varchar(0), char(0), binary(0)) is distinguished from none:
+// MySQL stores and reports those columns with their zero width. A negative
+// width is the parser's unspecified-length marker (year renders as year(-1))
+// and is reported as no width.
+func extractLengthFromTypeString(typeStr string) (length int, ok bool) {
 	// Simple regex-like parsing for common cases
 	if strings.Contains(typeStr, "(") && strings.Contains(typeStr, ")") {
 		start := strings.Index(typeStr, "(")
@@ -211,14 +216,13 @@ func extractLengthFromTypeString(typeStr string) int {
 				lengthStr = lengthStr[:commaIdx]
 			}
 
-			var length int
-			if n, err := fmt.Sscanf(lengthStr, "%d", &length); n == 1 && err == nil {
-				return length
+			if n, err := fmt.Sscanf(lengthStr, "%d", &length); n == 1 && err == nil && length >= 0 {
+				return length, true
 			}
 		}
 	}
 
-	return 0
+	return 0, false
 }
 
 // extractPrecisionScaleFromTypeString extracts precision and scale from type string like "decimal(10,2)"

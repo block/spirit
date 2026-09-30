@@ -14,16 +14,17 @@ func init() { registerNormalizer(integerDisplayWidthNormalizer{}) }
 // Two widths are preserved, because MySQL preserves them:
 //   - tinyint(1): the canonical BOOLEAN form (also how the parser folds BOOL).
 //   - any integer with ZEROFILL: the width drives the zero-padding, so it is
-//     semantically meaningful and kept in SHOW CREATE TABLE. A ZEROFILL column
-//     declared without a width gets the type's default *unsigned* width from
-//     MySQL (int zerofill is stored as int(10) unsigned zerofill), but the
-//     parser fills in the *signed* default (int(11)), so that width is
-//     rewritten here. An explicit width, int(11) zerofill included, is kept.
+//     semantically meaningful and kept in SHOW CREATE TABLE. Two ZEROFILL
+//     widths are rewritten to the type's default *unsigned* width, because
+//     MySQL stores that width for both (int zerofill and int(0) zerofill are
+//     stored as int(10) unsigned zerofill): no width at all, which the parser
+//     fills in with the *signed* default (int(11)), and a width of 0. Any other
+//     explicit width, int(11) zerofill included, is kept.
 type integerDisplayWidthNormalizer struct{}
 
 // zerofillDefaultWidths is the display width MySQL gives each integer type
-// under ZEROFILL (which implies UNSIGNED) when no width is declared: the
-// number of digits in the type's largest unsigned value.
+// under ZEROFILL (which implies UNSIGNED) when no width, or a width of 0, is
+// declared: the number of digits in the type's largest unsigned value.
 var zerofillDefaultWidths = map[string]int{
 	"tinyint":   3,
 	"smallint":  5,
@@ -41,7 +42,7 @@ func (integerDisplayWidthNormalizer) Normalize(ct *CreateTable) *CreateTable {
 			continue // not an integer type
 		}
 		if c.Zerofill != nil && *c.Zerofill {
-			if width, ok := zerofillDefaultWidths[c.Type]; ok && widthUnspecified(c) {
+			if width, ok := zerofillDefaultWidths[c.Type]; ok && (widthUnspecified(c) || (c.Length != nil && *c.Length == 0)) {
 				c.Length = &width
 			}
 			continue // width is meaningful under ZEROFILL

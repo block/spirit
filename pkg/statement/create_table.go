@@ -38,7 +38,7 @@ type Column struct {
 	Raw             *ast.ColumnDef    `json:"-"`
 	Name            string            `json:"name"`
 	Type            string            `json:"type"`
-	Length          *int              `json:"length,omitempty"`
+	Length          *int              `json:"length,omitempty"` // nil = no width; 0 is a real width (varchar(0))
 	Precision       *int              `json:"precision,omitempty"`
 	Scale           *int              `json:"scale,omitempty"`
 	Unsigned        *bool             `json:"unsigned,omitempty"`
@@ -673,7 +673,7 @@ func (ct *CreateTable) parseColumn(col *ast.ColumnDef) Column {
 
 	// Extract type information
 	typeStr := col.Tp.String()
-	if length := extractLengthFromTypeString(typeStr); length > 0 {
+	if length, ok := extractLengthFromTypeString(typeStr); ok {
 		column.Length = &length
 	}
 

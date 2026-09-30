@@ -58,9 +58,9 @@ const maxBinaryWidth = 255
 //
 // Left alone:
 //
-//   - binary(0), for which the parser records no length. Its only non-NULL
-//     default is the empty string, which has nothing to pad. A column written
-//     without a width is binary(1), and is padded to that.
+//   - binary(0). Its only non-NULL default is the empty string, which has
+//     nothing to pad. A column written without a width is binary(1), and is
+//     padded to that.
 //   - binary wider than 255, which MySQL rejects. Padding it would allocate
 //     the declared width for DDL that can never be applied.
 //   - a default longer than the width, which MySQL rejects.

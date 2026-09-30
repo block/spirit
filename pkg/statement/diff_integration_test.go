@@ -1241,6 +1241,61 @@ func TestDiffIntegrationBinaryDefaultBytesHexConverges(t *testing.T) {
 	require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
 }
 
+// TestDiffIntegrationZeroWidthConverges verifies that the ALTER Diff emits for
+// zero-width columns applies on a real MySQL server and converges. varchar(0)
+// and varbinary(0) have no width-less spelling (a bare varchar is invalid SQL),
+// char(0) and binary(0) must not be emitted as char/binary (which are width 1),
+// and a change to or from a zero width must still be reported. The int(0)
+// zerofill and decimal(0) columns are rewritten by MySQL to their default
+// widths, so they must not diff against the live table at all.
+func TestDiffIntegrationZeroWidthConverges(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_zero_width",
+		"CREATE TABLE diff_zero_width (id int NOT NULL, v varchar(0), w varchar(0), c char(0), bn binary(1), vb varbinary(1), z int(10) unsigned zerofill, d decimal(10,0), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	const declaredSQL = "CREATE TABLE diff_zero_width (id int NOT NULL, v varchar(0) DEFAULT '', w varchar(1), c char(0) DEFAULT '', bn binary(0), vb varbinary(0) DEFAULT '', z int(0) zerofill, d decimal(0), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, declaredSQL)
+	require.Len(t, stmts, 1)
+	for _, want := range []string{
+		"MODIFY COLUMN `v` varchar(0) NULL DEFAULT ''",
+		"MODIFY COLUMN `w` varchar(1) NULL",
+		"MODIFY COLUMN `c` char(0) NULL DEFAULT ''",
+		"MODIFY COLUMN `bn` binary(0) NULL",
+		"MODIFY COLUMN `vb` varbinary(0) NULL DEFAULT ''",
+	} {
+		require.Contains(t, stmts[0].Statement, want)
+	}
+	require.NotContains(t, stmts[0].Statement, "`z`")
+	require.NotContains(t, stmts[0].Statement, "`d`")
+	execStatements(t, tt.DB, stmts)
+
+	liveSQL := showCreateTable(t, tt.DB, tt.Name)
+	for _, want := range []string{
+		"`v` varchar(0) DEFAULT ''",
+		"`w` varchar(1) DEFAULT NULL",
+		"`c` char(0) DEFAULT ''",
+		"`bn` binary(0) DEFAULT NULL",
+		"`vb` varbinary(0) DEFAULT ''",
+	} {
+		require.Contains(t, liveSQL, want)
+	}
+	requireConverged(t, tt.DB, tt.Name, declaredSQL)
+}
+
+// TestDiffIntegrationZeroWidthCreatedAsDeclared verifies that a table created
+// from a schema with zero-width columns diffs clean against that schema: each
+// column is parsed to the same width MySQL stores for it.
+func TestDiffIntegrationZeroWidthCreatedAsDeclared(t *testing.T) {
+	const declaredSQL = "CREATE TABLE diff_zero_width_created (id int NOT NULL, v varchar(0), c char(0), bn binary(0), vb varbinary(0), z int(0) zerofill, t tinyint(0) zerofill, i int(0), d decimal(0), u decimal(0,0) unsigned, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	tt := testutils.NewTestTable(t, "diff_zero_width_created", declaredSQL)
+
+	liveSQL := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, liveSQL, "`z` int(10) unsigned zerofill")
+	require.Contains(t, liveSQL, "`t` tinyint(3) unsigned zerofill")
+	require.Contains(t, liveSQL, "`d` decimal(10,0)")
+	requireConverged(t, tt.DB, tt.Name, declaredSQL)
+	requireNoSelfDiff(t, tt.DB, tt.Name)
+}
+
 // TestDiffIntegrationBinaryLiteralDefaults verifies that a hex or bit literal
 // default on an integer, bit, char or varchar column matches its live form.
 // MySQL converts the literal to the column's own type and reports it in that
