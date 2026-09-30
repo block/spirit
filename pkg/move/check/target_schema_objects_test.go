@@ -174,3 +174,32 @@ func TestTargetSchemaObjectsCheckRequiresVisibility(t *testing.T) {
 	require.EqualError(t, privilegesCheck(t.Context(), Resources{Targets: []applier.Target{{}}}, slog.Default()),
 		"target 0 database connection or config is not initialized")
 }
+
+// TestTargetSchemaObjectsUsesTargetLowerCaseTableNames: on a target with
+// lower_case_table_names=0, `Orders` and `orders` are different tables, so a
+// trigger on `orders` is not on the moved table `Orders` and is not refused.
+// It pins that the check uses the value read from the target: passing a
+// constant 1 instead refuses the trigger on `orders`.
+func TestTargetSchemaObjectsUsesTargetLowerCaseTableNames(t *testing.T) {
+	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
+	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
+	var lctn int
+	require.NoError(t, tgtDB.QueryRowContext(t.Context(), "SELECT @@lower_case_table_names").Scan(&lctn))
+	if lctn != 0 {
+		t.Skip("needs a target with lower_case_table_names=0")
+	}
+	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE Orders (id INT NOT NULL PRIMARY KEY, v INT)")
+	src := table.NewTableInfo(srcDB, srcName, "Orders")
+	require.NoError(t, src.SetInfo(t.Context()))
+	testutils.RunSQLInDatabase(t, tgtName, "CREATE TABLE Orders (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabase(t, tgtName, "CREATE TABLE orders (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabaseAsRoot(t, tgtName, "CREATE TRIGGER orders_ai AFTER INSERT ON orders FOR EACH ROW SET @x = 1")
+	targets := []applier.Target{targetResource(t, tgtName, tgtDB)}
+	tables := []*table.TableInfo{src}
+
+	require.NoError(t, TargetSchemaObjectsError(t.Context(), targets, tables))
+
+	testutils.RunSQLInDatabaseAsRoot(t, tgtName, "CREATE TRIGGER moved_ai AFTER INSERT ON Orders FOR EACH ROW SET @x = 1")
+	require.EqualError(t, RunChecks(t.Context(), Resources{Targets: targets, SourceTables: tables}, slog.Default(), ScopePostSetup, otherChecks(targetObjectsChecks...)...),
+		targetObjectsPrefix+"target 0 ("+tgtName+"): trigger 'moved_ai' on table 'Orders'")
+}

@@ -126,10 +126,16 @@ func TestShardedMoveRefusesTargetTriggerOnOneShard(t *testing.T) {
 	defer utils.CloseAndLog(runner)
 	var cutoverCalled bool
 	runner.SetCutover(func(context.Context) error { cutoverCalled = true; return nil })
+	// Run sorts the targets by targetKey, and the unique database names end
+	// in an unpadded counter, so the second shard is not always target 1.
+	want := 1
+	if targetKey(targets[1]) < targetKey(targets[0]) {
+		want = 0
+	}
 	err = runner.Run(t.Context())
 	require.ErrorContains(t, err, targetObjectsRefusal)
-	require.ErrorContains(t, err, "target 1 ("+shard1Name+"): trigger 'users_ai' on table 'users'")
-	require.NotContains(t, err.Error(), "target 0 (")
+	require.ErrorContains(t, err, fmt.Sprintf("target %d (%s): trigger 'users_ai' on table 'users'", want, shard1Name))
+	require.NotContains(t, err.Error(), "("+shard0Name+")")
 	require.False(t, cutoverCalled, "the cutover callback must not be called")
 	require.Zero(t, countTables(t, ctl, shard0Name), "nothing may be created on the first shard")
 	var n int
