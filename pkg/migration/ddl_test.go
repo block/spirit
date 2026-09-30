@@ -417,7 +417,7 @@ func TestNativeDDLKeepsCopyTablesWhenCheckpointUnreadable(t *testing.T) {
 // TestNativeDDLDropsNewTableWithoutCheckpoint checks that the cleanup after
 // native DDL drops a stale _new table when the checkpoint table is confirmed
 // absent, as a fresh copy would.
-func TestNativeDDLDropsNewTableWithoutCheckpoint(t *testing.T) {
+func TestNativeDDLKeepsNewTableWithoutCheckpoint(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "stalenockpt", `CREATE TABLE stalenockpt (
 		id int not null primary key auto_increment,
@@ -433,5 +433,5 @@ func TestNativeDDLDropsNewTableWithoutCheckpoint(t *testing.T) {
 	var n int
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_stalenockpt_new'").Scan(&n))
-	require.Zero(t, n, "a stale _new table must be dropped when there is no checkpoint table")
+	require.Equal(t, 1, n, "a _new table without a checkpoint table may not be Spirit's and must be kept")
 }

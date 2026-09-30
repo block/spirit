@@ -260,15 +260,13 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 // would only discard it. Without this, it stays behind indefinitely.
 //
 // Auxiliary table names are truncated, so two long table names can share them
-// (see utils.AuxTableName), and the state may belong to the other table. So
-// the tables are dropped only when ownership is established:
-//
-//   - the checkpoint table exists and its latest row names this table: drop
-//     _new and the checkpoint table;
-//   - the checkpoint table is confirmed absent: drop _new, as a fresh copy
-//     (newMigration -> createNewTable) does;
-//   - otherwise (the checkpoint cannot be read, is empty, or names another or
-//     no table): drop nothing and log why.
+// (see utils.AuxTableName), and the state may belong to the other table. A
+// _new table without a checkpoint table may not be Spirit's at all (other
+// online schema change tools use the same name, and may still have triggers
+// writing to it). So the tables are dropped only when the checkpoint table
+// exists and its latest row names this table. Otherwise (no checkpoint table,
+// or one that cannot be read, is empty, or names another or no table) nothing
+// is dropped and the reason is logged.
 //
 // A failure is logged, not returned: the ALTER has already been applied.
 func (r *Runner) dropStaleCopyTables(ctx context.Context) {
@@ -289,30 +287,27 @@ func (r *Runner) dropStaleCopyTables(ctx context.Context) {
 		leaveInPlace("could not check whether the checkpoint table exists", "error", err)
 		return
 	}
-	var drop []string
-	if ckptExists {
-		rec, err := ckpt.ReadLatest(ctx)
-		if err != nil {
-			leaveInPlace("could not read the checkpoint to confirm it belongs to this table", "error", err)
-			return
-		}
-		if rec.OriginalTableName != tableName {
-			leaveInPlace("the checkpoint does not belong to this table", "checkpoint-original-table", rec.OriginalTableName)
-			return
-		}
-		drop = append(drop, newName, ckptName)
-	} else {
+	if !ckptExists {
+		// Only a _new table can be left: without a checkpoint there is no
+		// evidence that Spirit created it, so leave it in place.
 		var n int
 		if err := r.db.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-			r.changes[0].table.SchemaName, newName).Scan(&n); err != nil {
-			leaveInPlace("could not check whether the new table exists", "error", err)
-			return
+			r.changes[0].table.SchemaName, newName).Scan(&n); err == nil && n > 0 {
+			leaveInPlace("there is no checkpoint table to confirm the new table was created by Spirit for this table")
 		}
-		if n > 0 {
-			drop = append(drop, newName)
-		}
+		return
 	}
+	rec, err := ckpt.ReadLatest(ctx)
+	if err != nil {
+		leaveInPlace("could not read the checkpoint to confirm it belongs to this table", "error", err)
+		return
+	}
+	if rec.OriginalTableName != tableName {
+		leaveInPlace("the checkpoint does not belong to this table", "checkpoint-original-table", rec.OriginalTableName)
+		return
+	}
+	drop := []string{newName, ckptName}
 	for _, name := range drop {
 		if err := dbconn.Exec(ctx, r.db, "DROP TABLE IF EXISTS %n", name); err != nil {
 			r.logger.Error("could not drop a stale table from an earlier interrupted migration", "table", name, "error", err)
