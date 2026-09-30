@@ -3,6 +3,7 @@ package checksum
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -111,6 +112,82 @@ func TestRepairStreamsChunkThroughApplier(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM repairbatch_t1").Scan(&rows))
 	require.Equal(t, 2048, rows, "the fixture must exceed repairBatchRows for this test to mean anything")
 	require.Greater(t, rows, repairBatchRows)
+}
+
+// TestRepairBatchesBoundedByBytes covers the other half of the batch cut: a
+// chunk of wide rows must be handed to the applier in several batches bounded
+// by repairBatchBytes, even though it holds far fewer than repairBatchRows
+// rows. Cutting on row count alone would buffer the whole chunk in one batch,
+// and client memory would then scale with row width.
+func TestRepairBatchesBoundedByBytes(t *testing.T) {
+	src := testutils.NewTestTable(t, "repairwide_t1", "CREATE TABLE repairwide_t1 (a INT NOT NULL AUTO_INCREMENT, b MEDIUMTEXT NOT NULL, c INT, PRIMARY KEY (a))")
+	testutils.NewTestTable(t, "_repairwide_t1_new", "CREATE TABLE _repairwide_t1_new LIKE repairwide_t1")
+	testutils.RunSQL(t, "CREATE TABLE _repairwide_t1_chkpnt (a INT)") // for binlog advancement
+	// Each row estimates to just over a fifth of the budget, so a batch is cut
+	// after its fifth row. Derived from the constant so retuning it cannot
+	// silently turn this into a single-batch case that asserts nothing.
+	src.SeedRows(t, fmt.Sprintf("INSERT INTO repairwide_t1 (b, c) SELECT REPEAT('x', %d), 1", repairBatchBytes/5), 16)
+
+	repairer, chunk, db := newRepairFixture(t, "repairwide_t1", "_repairwide_t1_new", nil)
+	spy := &applier.MockApplier{Inner: repairer.applier}
+	repairer.applier = spy
+
+	require.NoError(t, repairer.Recopy(t.Context(), chunk))
+	requireTablesMatch(t, db, "repairwide_t1", "_repairwide_t1_new")
+
+	calls := spy.ApplyCalls()
+	require.Greater(t, len(calls), 1, "16 rows at ~20% of repairBatchBytes each must span several batches")
+	totalRows := 0
+	for i, batch := range calls {
+		require.NotEmpty(t, batch)
+		require.Less(t, len(batch), repairBatchRows, "batch %d was cut by row count, not bytes", i)
+		totalRows += len(batch)
+		if i == len(calls)-1 {
+			continue // the final batch is whatever is left over
+		}
+		// A full batch is cut at the first row that reaches the budget: the
+		// batch is at or over it, and without its last row it was under it.
+		var size int
+		for _, row := range batch {
+			size += utils.EstimateRenderedRowSize(row)
+		}
+		require.GreaterOrEqual(t, size, repairBatchBytes, "batch %d was cut before reaching the byte budget", i)
+		require.Less(t, size-utils.EstimateRenderedRowSize(batch[len(batch)-1]), repairBatchBytes,
+			"batch %d should have been cut one row earlier", i)
+	}
+	require.Equal(t, 16, totalRows, "every source row must be written exactly once")
+}
+
+// TestRepairBatchesBoundedByRows is the row-count twin of
+// TestRepairBatchesBoundedByBytes: narrow rows reach repairBatchRows long
+// before repairBatchBytes, so every batch but the last must be exactly
+// repairBatchRows rows. TestRepairStreamsChunkThroughApplier crosses the cut
+// but asserts only the end state, which a single whole-chunk batch also meets.
+func TestRepairBatchesBoundedByRows(t *testing.T) {
+	src := testutils.NewTestTable(t, "repairnarrow_t1", "CREATE TABLE repairnarrow_t1 (a INT NOT NULL AUTO_INCREMENT, b VARCHAR(255) NOT NULL, c INT, PRIMARY KEY (a))")
+	testutils.NewTestTable(t, "_repairnarrow_t1_new", "CREATE TABLE _repairnarrow_t1_new LIKE repairnarrow_t1")
+	testutils.RunSQL(t, "CREATE TABLE _repairnarrow_t1_chkpnt (a INT)") // for binlog advancement
+	src.SeedRows(t, "INSERT INTO repairnarrow_t1 (b, c) SELECT REPEAT('x', 200), 1", 2*repairBatchRows+1)
+
+	repairer, chunk, db := newRepairFixture(t, "repairnarrow_t1", "_repairnarrow_t1_new", nil)
+	spy := &applier.MockApplier{Inner: repairer.applier}
+	repairer.applier = spy
+
+	require.NoError(t, repairer.Recopy(t.Context(), chunk))
+	requireTablesMatch(t, db, "repairnarrow_t1", "_repairnarrow_t1_new")
+
+	var rows int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM repairnarrow_t1").Scan(&rows))
+	require.Greater(t, rows, 2*repairBatchRows, "the fixture must span at least two full batches")
+	var want []int
+	for n := rows; n > 0; n -= repairBatchRows {
+		want = append(want, min(n, repairBatchRows))
+	}
+	var got []int
+	for _, batch := range spy.ApplyCalls() {
+		got = append(got, len(batch))
+	}
+	require.Equal(t, want, got, "batches must be cut at repairBatchRows")
 }
 
 // TestRepairDoesNotLockSourceRows is the regression test for block/spirit#1130.
