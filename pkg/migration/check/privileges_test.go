@@ -93,19 +93,15 @@ func TestPrivileges(t *testing.T) {
 	require.NoError(t, err) // privileges work fine
 }
 
-// TestPrivilegesWithRDSSuperuserRole verifies that rds_superuser_role is
-// tolerated when activate_all_roles_on_login=ON, allowing privilegesCheck
-// to skip the CONNECTION_ADMIN/PROCESS direct-grant check.
+// TestPrivilegesWithRDSSuperuserRole verifies that a granted
+// rds_superuser_role stands in for CONNECTION_ADMIN when
+// activate_all_roles_on_login=ON. It stands in for nothing else: PROCESS is
+// still proven by a read that needs it.
 //
-// Scope is intentionally narrow: the test only covers the *acceptance*
-// path. The previous version of this test also covered the rejection
-// path by flipping `activate_all_roles_on_login` OFF and back ON via
-// `SET GLOBAL`, but that races with every other Go test binary running
-// concurrently against the same MySQL (t.Parallel only governs
-// within-binary scheduling; cross-binary parallelism is controlled by
-// `go test -p`). Until privilegesCheck is refactored to be unit-testable
-// without touching server globals, the rejection path is unverified;
-// see #818 for the cleanup proposal.
+// The test covers only the acceptance path, against a real server, since
+// flipping activate_all_roles_on_login with SET GLOBAL would race with other
+// test binaries running against the same MySQL. dbconn's
+// TestCheckKillPrivilege covers the rejection path with a stub.
 //
 // If the test MySQL doesn't have activate_all_roles_on_login=ON the
 // test skips rather than flips the global.

@@ -467,28 +467,32 @@ func TestExecUnderLockCancellation(t *testing.T) {
 // hold up NewTableLock, which waits for the kill before it returns.
 func TestTableLockStopsLookingOnceLockTablesReturns(t *testing.T) {
 	lockCtx, lockDone := context.WithCancel(t.Context())
-	defer lockDone()
+	t.Cleanup(lockDone)
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	var calls atomic.Int32
+	// LOCK TABLES returns while the third lookup runs.
+	const lookups = 3
+	var calls, lateCalls atomic.Int32
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		killTableLockBlockers(t.Context(), lockCtx, logger, func(context.Context) error {
-			calls.Add(1)
+			if lockCtx.Err() != nil {
+				lateCalls.Add(1)
+			}
+			if calls.Add(1) == lookups {
+				lockDone()
+			}
 			return fmt.Errorf("%w: %w", errBlockerLookupFailed, io.EOF)
 		})
 	}()
-	require.Eventually(t, func() bool { return calls.Load() >= 3 }, 5*time.Second, 10*time.Millisecond, "the kill must look again while LOCK TABLES waits")
-	lockDone()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "the kill must stop looking once LOCK TABLES returns")
 	}
-	stopped := calls.Load()
-	time.Sleep(2 * killPollInterval)
-	require.Equal(t, stopped, calls.Load(), "no lookup may start after LOCK TABLES returns")
+	require.Equal(t, int32(lookups), calls.Load(), "the kill must look again while LOCK TABLES waits, and not after")
+	require.Zero(t, lateCalls.Load(), "no lookup may start after LOCK TABLES returns")
 	require.Equal(t, 1, strings.Count(logs.String(), "could not list the sessions blocking the table lock"))
 	require.Contains(t, logs.String(), "level=WARN msg=\"stopped looking for the sessions blocking the table lock")
 	require.NotContains(t, logs.String(), "level=ERROR")
