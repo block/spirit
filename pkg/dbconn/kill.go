@@ -95,6 +95,16 @@ WHERE t.processlist_id IS NOT NULL
     AND ml.object_type = 'TABLE'
     AND ml.lock_status = 'GRANTED' `
 
+	// statementWaitingQuery counts the table metadata locks a session is
+	// still waiting for. A statement with none holds every lock it needs.
+	statementWaitingQuery = `SELECT COUNT(*)
+FROM performance_schema.metadata_locks ml
+    JOIN performance_schema.threads t
+        ON ml.owner_thread_id = t.thread_id
+WHERE t.processlist_id = ?
+    AND ml.object_type = 'TABLE'
+    AND ml.lock_status = 'PENDING' `
+
 	processIDClause  = " AND t.processlist_id NOT IN (CONNECTION_ID() %s) "
 	queryTableClause = " AND (ml.object_schema, ml.object_name) IN (%s) "
 	rdsKillStatement = "CALL mysql.rds_kill(%d)" // not needed in MySQL 8.0 with the CONNECTION_ADMIN privilege
@@ -133,6 +143,23 @@ type LockDetail struct {
 func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) error {
 	_, err := killLockingTransactions(ctx, db, tables, config, logger, ignorePIDs)
 	return err
+}
+
+// statementIsWaitingForTableLock reports whether the session connID is waiting
+// for a metadata lock on one of tables, or on any table when tables is empty.
+func statementIsWaitingForTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, logger *slog.Logger, connID int) (bool, error) {
+	query := statementWaitingQuery
+	params := []any{connID}
+	if len(tables) > 0 {
+		inList, inParams := tablesToInList(tables, logger)
+		query += fmt.Sprintf(queryTableClause, inList)
+		params = append(params, inParams...)
+	}
+	var pending int
+	if err := db.QueryRowContext(ctx, query, params...).Scan(&pending); err != nil {
+		return false, fmt.Errorf("check whether session %d is waiting for a metadata lock: %w", connID, err)
+	}
+	return pending > 0, nil
 }
 
 // killLockingTransactions also returns the successfully signalled sessions.
