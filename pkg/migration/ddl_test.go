@@ -20,16 +20,14 @@ import (
 func TestForNonInstantBurn(t *testing.T) {
 	t.Parallel()
 
-	// Skip on MySQL 8.0.28 (uses INSTANT_COLS, not total_row_versions) and
-	// MySQL 9.x (total_row_versions limit was raised beyond 64).
+	testutils.SkipBeforeMySQLVersion(t, "8.0.29", "total_row_versions was added in 8.0.29; earlier versions use INSTANT_COLS")
+
+	// Skip on MySQL 9.x (total_row_versions limit was raised beyond 64).
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	var version string
 	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT version()`).Scan(&version))
-	if version == "8.0.28" {
-		t.Skip("Skipping this test for MySQL 8.0.28")
-	}
 	if strings.HasPrefix(version, "9.") {
 		t.Skip("Skipping this test for MySQL 9.x: total_row_versions limit was raised beyond 64")
 	}
