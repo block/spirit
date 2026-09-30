@@ -1102,11 +1102,12 @@ func TestDiffIntegrationBinaryCharsetConverges(t *testing.T) {
 	require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
 }
 
-// binaryDefaultHexReason is why the binary-default tests that read back a
-// non-utf8mb3 default skip before MySQL 8.0.33: earlier servers' SHOW CREATE
-// TABLE replaces each such byte with '?' instead of reporting the default as a
-// hex literal (MySQL Bug #104840).
-const binaryDefaultHexReason = "SHOW CREATE TABLE reports a non-utf8mb3 binary default as '?' rather than hex"
+// binaryDefaultHexReason is why the binary and utf8mb4 default tests that read
+// back a non-utf8mb3 default skip before MySQL 8.0.33: earlier servers' SHOW
+// CREATE TABLE replaces each such byte of a binary default, or character of a
+// utf8mb4 one, with '?' instead of reporting the default as a hex literal
+// (MySQL Bug #104840).
+const binaryDefaultHexReason = "SHOW CREATE TABLE reports a non-utf8mb3 default as '?' rather than hex"
 
 // TestDiffIntegrationBinaryDefaultBytes verifies that a literal default on a
 // binary(N) column matches its live form, which MySQL stores NUL-padded to the
@@ -1385,4 +1386,109 @@ func TestDiffIntegrationZerofillExplicitWidthKept(t *testing.T) {
 	require.Len(t, stmts, 1)
 	require.Contains(t, stmts[0].Statement, "`a` int(10) unsigned zerofill")
 	require.Contains(t, stmts[0].Statement, "`b` tinyint(3) unsigned zerofill")
+}
+
+// TestDiffIntegrationCharUTF8MB4Default verifies that a string default on a
+// utf8mb4 char or varchar column that is not valid utf8mb3 matches its live
+// form, which SHOW CREATE TABLE reports as a hex literal (char(4) DEFAULT '😀'
+// is reported as DEFAULT 0xF09F9880). Without the conversion the diff emits a
+// MODIFY that MySQL reports as hex again, on every run. It needs MySQL
+// 8.0.33+, which reports such a default as hex (see binaryDefaultHexReason).
+func TestDiffIntegrationCharUTF8MB4Default(t *testing.T) {
+	testutils.SkipBeforeMySQLVersion(t, "8.0.33", binaryDefaultHexReason)
+	for _, tc := range []struct{ name, ddl, live string }{
+		{"diff_mb4def_char", "CREATE TABLE diff_mb4def_char (id int NOT NULL, b char(4) DEFAULT '😀', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 0xF09F9880"},
+		{"diff_mb4def_varchar", "CREATE TABLE diff_mb4def_varchar (id int NOT NULL, b varchar(4) NOT NULL DEFAULT 'a😀', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) NOT NULL DEFAULT 0x61F09F9880"},
+		{"diff_mb4def_char_spaces", "CREATE TABLE diff_mb4def_char_spaces (id int NOT NULL, b char(4) DEFAULT '😀 ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 0xF09F9880"},
+		{"diff_mb4def_varchar_spaces", "CREATE TABLE diff_mb4def_varchar_spaces (id int NOT NULL, b varchar(4) DEFAULT '😀 ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 0xF09F988020"},
+		{"diff_mb4def_escapes", "CREATE TABLE diff_mb4def_escapes (id int NOT NULL, b varchar(4) DEFAULT '''\\\\😀', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 0x275CF09F9880"},
+		{"diff_mb4def_introducer", "CREATE TABLE diff_mb4def_introducer (id int NOT NULL, b char(4) DEFAULT _utf8mb4'😀', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 0xF09F9880"},
+		{"diff_mb4def_binary_introducer", "CREATE TABLE diff_mb4def_binary_introducer (id int NOT NULL, b char(4) DEFAULT _binary'😀', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 0xF09F9880"},
+		{"diff_mb4def_hex_spaces", "CREATE TABLE diff_mb4def_hex_spaces (id int NOT NULL, b char(4) DEFAULT x'f09f988020', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 0xF09F9880"},
+		{"diff_mb4def_bit", "CREATE TABLE diff_mb4def_bit (id int NOT NULL, b char(4) DEFAULT b'11110000100111111001100010000000', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 0xF09F9880"},
+		{"diff_mb4def_varchar_overflow_spaces", "CREATE TABLE diff_mb4def_varchar_overflow_spaces (id int NOT NULL, b varchar(1) DEFAULT '😀 ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(1) DEFAULT 0xF09F9880"},
+		{"diff_mb4def_column_charset", "CREATE TABLE diff_mb4def_column_charset (id int NOT NULL, b char(4) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT '😀', PRIMARY KEY (id)) DEFAULT CHARSET=latin1", "`b` char(4) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT 0xF09F9880"},
+		{"diff_mb4def_utf8mb3_string", "CREATE TABLE diff_mb4def_utf8mb3_string (id int NOT NULL, b char(4) DEFAULT 'é', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'é'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, tc.name, tc.ddl)
+			liveSQL := showCreateTable(t, tt.DB, tt.Name)
+			require.Contains(t, liveSQL, tc.live, "the reading this case pins")
+			desired, err := ParseCreateTable(tc.ddl)
+			require.NoError(t, err)
+			live, err := ParseCreateTable(liveSQL)
+			require.NoError(t, err)
+			stmts, err := live.Diff(desired, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "a utf8mb4 default must match its live form")
+			stmts, err = desired.Diff(live, nil)
+			require.NoError(t, err)
+			require.Nil(t, stmts, "the live form must match the utf8mb4 default")
+		})
+	}
+}
+
+// TestDiffIntegrationCharUTF8MB4DefaultConverges verifies that the MODIFY
+// emitted for a utf8mb4 default that is not valid utf8mb3 carries a hex
+// literal with a _utf8mb4 introducer, that MySQL applies it and stores the
+// intended character, and that a re-diff then converges to nil.
+func TestDiffIntegrationCharUTF8MB4DefaultConverges(t *testing.T) {
+	testutils.SkipBeforeMySQLVersion(t, "8.0.33", binaryDefaultHexReason)
+	tt := testutils.NewTestTable(t, "diff_mb4def_converge",
+		"CREATE TABLE diff_mb4def_converge (id int NOT NULL, c char(4), v varchar(4) DEFAULT 'a', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	desired, err := ParseCreateTable(
+		"CREATE TABLE diff_mb4def_converge (id int NOT NULL, c char(4) DEFAULT '😀', v varchar(4) DEFAULT 'a😀', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+
+	live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+	require.NoError(t, err)
+	stmts, err := live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "`c` char(4) NULL DEFAULT _utf8mb4 x'f09f9880'")
+	require.Contains(t, stmts[0].Statement, "`v` varchar(4) NULL DEFAULT _utf8mb4 x'61f09f9880'")
+	testutils.RunSQL(t, stmts[0].Statement)
+
+	var matches bool
+	testutils.RunSQL(t, "INSERT INTO diff_mb4def_converge (id) VALUES (1)")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT c = _utf8mb4 X'F09F9880' AND HEX(c) = 'F09F9880' AND CHAR_LENGTH(c) = 1 AND HEX(v) = '61F09F9880' AND CHAR_LENGTH(v) = 2 FROM diff_mb4def_converge WHERE id = 1").Scan(&matches))
+	require.True(t, matches, "the hex literal must store the character, not its bytes as characters")
+
+	liveSQL := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, liveSQL, "`c` char(4) DEFAULT 0xF09F9880")
+	require.Contains(t, liveSQL, "`v` varchar(4) DEFAULT 0x61F09F9880")
+	live, err = ParseCreateTable(liveSQL)
+	require.NoError(t, err)
+	stmts, err = live.Diff(desired, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
+}
+
+// TestDiffIntegrationCharUTF8MB4DefaultIgnoreCharsetCollation verifies that
+// the MODIFY emitted for a declared utf8mb4 default stores the intended
+// character on a live column of another charset, which happens when
+// IgnoreCharsetCollation leaves the table charset alone. A bare
+// x'f09f9880' would be read as utf16 there, storing U+F09F U+9880; the
+// _utf8mb4 introducer makes MySQL convert the character instead.
+func TestDiffIntegrationCharUTF8MB4DefaultIgnoreCharsetCollation(t *testing.T) {
+	testutils.SkipBeforeMySQLVersion(t, "8.0.33", binaryDefaultHexReason)
+	tt := testutils.NewTestTable(t, "diff_mb4def_ignore_charset",
+		"CREATE TABLE diff_mb4def_ignore_charset (id int NOT NULL, b char(4), PRIMARY KEY (id)) DEFAULT CHARSET=utf16")
+	desired, err := ParseCreateTable(
+		"CREATE TABLE diff_mb4def_ignore_charset (id int NOT NULL, b char(4) DEFAULT '😀', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	live, err := ParseCreateTable(showCreateTable(t, tt.DB, tt.Name))
+	require.NoError(t, err)
+	opts := NewDiffOptions()
+	opts.IgnoreCharsetCollation = true
+	stmts, err := live.Diff(desired, opts)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	testutils.RunSQL(t, stmts[0].Statement)
+
+	var stored string
+	testutils.RunSQL(t, "INSERT INTO diff_mb4def_ignore_charset (id) VALUES (1)")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT HEX(b) FROM diff_mb4def_ignore_charset WHERE id = 1").Scan(&stored))
+	require.Equal(t, "D83DDE00", stored, "the utf16 encoding of the character")
 }

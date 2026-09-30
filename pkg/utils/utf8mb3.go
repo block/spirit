@@ -8,8 +8,9 @@ import "unicode/utf8"
 // valid utf8mb4 but not utf8mb3.
 //
 // It is the test MySQL 8.0.33+ applies when SHOW CREATE TABLE converts a
-// binary column's DEFAULT to the system charset: a default that fails it is
-// reported as a hex literal instead of a string.
+// binary, varbinary, or utf8mb4 char or varchar column's DEFAULT to the system
+// charset: a default that fails it is reported as a hex literal instead of a
+// string.
 func ValidUTF8MB3(s string) bool {
 	if !utf8.ValidString(s) {
 		return false

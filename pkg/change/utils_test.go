@@ -173,6 +173,73 @@ func TestExtractTablesFromDDLStmts(t *testing.T) {
 			want:          []schemaTable{{"test", "users"}, {"test", "users"}},
 		},
 		{
+			// A trigger on a table being copied is not created on the new
+			// table, so it must be reported against the table it is ON.
+			name:          "create trigger",
+			defaultSchema: "test",
+			statement:     "CREATE DEFINER=`u`@`%` TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW BEGIN SET NEW.a = 1; END",
+			want:          []schemaTable{{"test", "t1"}},
+		},
+		{
+			name:          "create trigger schema on trigger name",
+			defaultSchema: "test",
+			statement:     "CREATE TRIGGER mydb.t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.a = 1",
+			want:          []schemaTable{{"mydb", "t1"}},
+		},
+		{
+			name:          "create trigger schema on table",
+			defaultSchema: "test",
+			statement:     "CREATE TRIGGER t1_bi BEFORE INSERT ON mydb.t1 FOR EACH ROW SET NEW.a = 1",
+			want:          []schemaTable{{"mydb", "t1"}},
+		},
+		{
+			// A foreign key added to another table that references a table
+			// being copied follows the cutover RENAME to the old table.
+			name:          "alter table add foreign key",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE child ADD CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent (id)",
+			want:          []schemaTable{{"test", "child"}, {"test", "parent"}},
+		},
+		{
+			// An unqualified REFERENCES names a table in the child's schema,
+			// not the session's default schema.
+			name:          "alter table add foreign key child schema",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE shop.child ADD FOREIGN KEY (parent_id) REFERENCES parent (id), ADD FOREIGN KEY (other_id) REFERENCES auth.other (id)",
+			want:          []schemaTable{{"shop", "child"}, {"shop", "parent"}, {"auth", "other"}},
+		},
+		{
+			name:          "alter table add column with foreign key",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE child ADD (parent_id INT, FOREIGN KEY (parent_id) REFERENCES parent (id))",
+			want:          []schemaTable{{"test", "child"}, {"test", "parent"}},
+		},
+		{
+			// MySQL 9.0 creates a foreign key for an inline REFERENCES.
+			name:          "alter table add column with inline references",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE child ADD COLUMN parent_id INT REFERENCES parent (id)",
+			want:          []schemaTable{{"test", "child"}, {"test", "parent"}},
+		},
+		{
+			name:          "alter table modify column with inline references",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE child MODIFY parent_id BIGINT REFERENCES auth.parent (id)",
+			want:          []schemaTable{{"test", "child"}, {"auth", "parent"}},
+		},
+		{
+			name:          "create table with inline references",
+			defaultSchema: "test",
+			statement:     "CREATE TABLE shop.child (id INT PRIMARY KEY, parent_id INT REFERENCES parent (id))",
+			want:          []schemaTable{{"shop", "child"}, {"shop", "parent"}},
+		},
+		{
+			name:          "alter table add unique key",
+			defaultSchema: "test",
+			statement:     "ALTER TABLE child ADD UNIQUE KEY (parent_id)",
+			want:          []schemaTable{{"test", "child"}},
+		},
+		{
 			name:          "invalid statement",
 			defaultSchema: "test",
 			statement:     "INVALID SQL",
@@ -292,7 +359,7 @@ func TestExtractTablesFromDDLStmtsComplex(t *testing.T) {
 				user_id INT,
 				FOREIGN KEY (user_id) REFERENCES users(id)
 			)`,
-			want: []schemaTable{{"test", "orders"}},
+			want: []schemaTable{{"test", "orders"}, {"test", "users"}},
 		},
 		{
 			name:          "multiple schema references",
@@ -302,7 +369,7 @@ func TestExtractTablesFromDDLStmtsComplex(t *testing.T) {
 				user_id INT,
 				FOREIGN KEY (user_id) REFERENCES auth.users(id)
 			)`,
-			want: []schemaTable{{"shop", "orders"}},
+			want: []schemaTable{{"shop", "orders"}, {"auth", "users"}},
 		},
 		{
 			name:          "partition definition",

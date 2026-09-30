@@ -647,6 +647,72 @@ func TestDDLNotification(t *testing.T) {
 	require.Equal(t, FatalReasonSchemaChange, <-cancelled)
 }
 
+// TestDDLNotificationTriggerAndForeignKey: a trigger created on a watched
+// table is never created on the new table, and a foreign key added to another
+// table that references a watched table follows the cutover RENAME to the old
+// table. Neither statement names the watched table as the one it alters, but
+// both must cancel, on the binlog and the GTID client alike.
+func TestDDLNotificationTriggerAndForeignKey(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+
+	clients := map[string]func(*sql.DB, *ClientConfig) Source{
+		"binlog": func(db *sql.DB, c *ClientConfig) Source {
+			return NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), c)
+		},
+		"gtid": func(db *sql.DB, c *ClientConfig) Source {
+			return NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), c)
+		},
+	}
+	ddls := map[string]string{
+		"trigger":     "CREATE TRIGGER ddltrgfk_t1_bi BEFORE INSERT ON ddltrgfk_t1 FOR EACH ROW BEGIN SET NEW.b = 1; END",
+		"foreign key": "ALTER TABLE ddltrgfk_child ADD CONSTRAINT ddltrgfk_fk FOREIGN KEY (pid) REFERENCES ddltrgfk_t1 (a)",
+	}
+	for clientName, newClient := range clients {
+		for ddlName, ddl := range ddls {
+			t.Run(clientName+"/"+ddlName, func(t *testing.T) {
+				if clientName == "gtid" {
+					skipUnlessGTIDEnabled(t)
+				}
+				testutils.RunSQL(t, "DROP TABLE IF EXISTS ddltrgfk_child, ddltrgfk_t1, ddltrgfk_t2")
+				testutils.RunSQL(t, "CREATE TABLE ddltrgfk_t1 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+				testutils.RunSQL(t, "CREATE TABLE ddltrgfk_t2 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+				testutils.RunSQL(t, "CREATE TABLE ddltrgfk_child (id INT NOT NULL PRIMARY KEY, pid INT)")
+				t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS ddltrgfk_child, ddltrgfk_t1, ddltrgfk_t2") })
+
+				t1 := table.NewTableInfo(db, "test", "ddltrgfk_t1")
+				require.NoError(t, t1.SetInfo(t.Context()))
+				t2 := table.NewTableInfo(db, "test", "ddltrgfk_t2")
+				require.NoError(t, t2.SetInfo(t.Context()))
+
+				cancelled := make(chan FatalReason, 1)
+				clientConfig := NewClientDefaultConfig()
+				clientConfig.CancelFunc = func(reason FatalReason) bool {
+					cancelled <- reason
+					return true
+				}
+				client := newClient(db, clientConfig)
+				chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+				require.NoError(t, err)
+				require.NoError(t, client.AddSubscription(t1, t2, chunker))
+				require.NoError(t, client.Start(t.Context()))
+				defer client.Close()
+
+				testutils.RunSQL(t, ddl)
+				select {
+				case reason := <-cancelled:
+					require.Equal(t, FatalReasonSchemaChange, reason)
+				case <-time.After(10 * time.Second):
+					t.Fatal("the client did not cancel")
+				}
+			})
+		}
+	}
+}
+
 // TestDDLNotificationTransactionCompression is TestDDLNotification with the
 // DDL issued from a session that has binlog_transaction_compression=ON. On
 // current MySQL versions DDL statements are excluded from compression and

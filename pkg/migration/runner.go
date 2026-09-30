@@ -534,6 +534,12 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		if err != nil {
 			return err
 		}
+		// Schema-change notifications are not acted on from here on, so a
+		// trigger or foreign key created while the cutover waits for its lock
+		// is only caught by checking again once the lock is held.
+		cutover.checksUnderLock = func(ctx context.Context) error {
+			return r.runChecks(ctx, check.ScopeCutoverLocked)
+		}
 		// Drop the _old table if it exists. This ensures
 		// that the rename will succeed (although there is a brief race)
 		for _, change := range r.changes {

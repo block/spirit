@@ -108,7 +108,7 @@ Larger instances can typically perform schema changes much faster, because they 
   - **`ENUM`**: appending values to the end of the list is supported, and so is dropping values from anywhere in the list. Reordering the values that are kept, or inserting a new value ahead of one that is kept, is not.
   - **`SET`**: only appending values to the end of the list is supported. The new list must begin with the existing list, so reordering or removing members is not supported.
   - **Type conversions**: converting `ENUM`/`SET` to a string type (`VARCHAR`, `CHAR`, `TEXT`, `BLOB`, etc.) is supported, and so is `ENUM` to `SET`. `SET` to `ENUM` is not, because a `SET` value can hold several members where an `ENUM` holds at most one. `ENUM`/`SET` to a numeric type is not, because the value would be coerced from its string form and lost.
-- **`FOREIGN KEYS`** or **`TRIGGERS`**. Spirit does not support migrating tables that have `FOREIGN KEYS` or `TRIGGERS`.
+- **`FOREIGN KEYS`** or **`TRIGGERS`**. Spirit does not support migrating tables that have `FOREIGN KEYS` or `TRIGGERS`. Creating a trigger on the table, or a foreign key on it or referencing it, while the migration runs fails the migration.
 
 ## Requirements
 

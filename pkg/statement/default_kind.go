@@ -56,7 +56,10 @@ const (
 	// not valid utf8mb3. The normalization rules convert it to the reported
 	// form on those types, on the integer types and on bit (see
 	// [binaryDefaultBytesNormalizer], [integerBinaryLiteralDefaultNormalizer],
-	// [bitDefaultNormalizer], [charBinaryLiteralDefaultNormalizer]). It must be
+	// [bitDefaultNormalizer], [charBinaryLiteralDefaultNormalizer]). On a
+	// utf8mb4 char or varchar column the recorded text carries a _utf8mb4
+	// introducer, `_utf8mb4 x'f09f9880'`, whether the default was written as a
+	// string or as hex (see [charUTF8MB4DefaultNormalizer]). It must be
 	// emitted bare: quoted, it is the string "x'1a'" rather than the byte 0x1a.
 	DefaultKindHexLiteral
 )

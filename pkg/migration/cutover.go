@@ -33,6 +33,10 @@ type CutOver struct {
 	config   []*cutoverConfig
 	dbConfig *dbconn.DBConfig
 	logger   *slog.Logger
+	// checksUnderLock, when set, runs with the table lock held, after the
+	// final flush and before the RENAME. An error from it fails the cutover
+	// without a retry (errCutoverRefused).
+	checksUnderLock func(context.Context) error
 	// testInjectRenameError is a test-only seam: when non-nil it is returned
 	// in place of a successful rename's nil result, simulating a connection
 	// that died after the server committed the RENAME TABLE but before the
@@ -44,6 +48,10 @@ type CutOver struct {
 	// "the cutover failed" from "we cannot tell who owns the table".
 	testAfterRenameError func()
 }
+
+// errCutoverRefused marks a cutover attempt refused by a check that ran under
+// the table lock. The refusal is not retried.
+var errCutoverRefused = errors.New("cutover refused")
 
 type cutoverConfig struct {
 	table          *table.TableInfo
@@ -176,6 +184,11 @@ func (c *CutOver) Run(ctx context.Context) error {
 		}
 		if err != nil {
 			attemptErrs = append(attemptErrs, fmt.Errorf("attempt %d: %w", i+1, err))
+			if errors.Is(err, errCutoverRefused) {
+				// A retry would be refused for the same reason.
+				c.logger.Error("cutover refused under the table lock", "error", err.Error())
+				return fail()
+			}
 			if dbconn.IsConnectionLossError(err) {
 				// Ambiguous failure: the connection died, so the client
 				// cannot know whether the server committed the rename before
@@ -324,6 +337,13 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	}
 	if !c.feed.AllChangesFlushed() {
 		return fmt.Errorf("%w, final flush might be broken", change.ErrChangesNotFlushed)
+	}
+	// The lock keeps out any DDL that needs a metadata lock on the tables,
+	// so these checks see exactly what the RENAME will act on.
+	if c.checksUnderLock != nil {
+		if err := c.checksUnderLock(ctx); err != nil {
+			return fmt.Errorf("%w: %w", errCutoverRefused, err)
+		}
 	}
 	if err := c.carryAutoIncrements(ctx, tableLock); err != nil {
 		return err
