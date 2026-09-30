@@ -135,7 +135,10 @@ type Runner struct {
 	terminalOwnership atomic.Uint32
 }
 
-var _ status.Task = (*Runner)(nil)
+var (
+	_ status.Task    = (*Runner)(nil)
+	_ status.Aborter = (*Runner)(nil)
+)
 
 func NewRunner(m *Migration) (*Runner, error) {
 	stmts, err := m.normalizeOptions()
@@ -2071,6 +2074,13 @@ func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 // returns context.Canceled.
 func (r *Runner) Cancel() {
 	r.cancel(nil)
+}
+
+// Abort stops a running migration with cause (see status.Aborter). The
+// checkpoint dumper calls it when it cannot write a checkpoint, so Run returns
+// the write error instead of context.Canceled.
+func (r *Runner) Abort(cause error) {
+	r.cancel(cause)
 }
 
 // cancel cancels the migration context with cause. A nil cause is a plain

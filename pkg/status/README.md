@@ -49,7 +49,7 @@ The `Task` interface defines the contract that a migration runner must implement
 `WatchTask` launches two background goroutines:
 
 1. **Status logger**: Logs `task.Status()` every 30 seconds until the migration reaches cutover. This provides a regular heartbeat in the logs.
-2. **Checkpoint dumper**: Calls `task.DumpCheckpoint()` every 50 seconds until cutover. If a checkpoint write fails (with anything other than `ErrWatermarkNotReady` or `context.Canceled`), the task is **cancelled immediately**. The rationale is that it is better to fail early than to discover after a multi-day migration that progress was never being saved.
+2. **Checkpoint dumper**: Calls `task.DumpCheckpoint()` every 50 seconds until cutover. If a checkpoint write fails (with anything other than `ErrWatermarkNotReady` or `context.Canceled`), the task is **cancelled immediately**. A task that implements `Aborter` is stopped with `Abort(cause)`, where the cause is the write error marked by `FatalAbort`, so it can return that error instead of `context.Canceled`; any other task is stopped with `Cancel()`. The rationale is that it is better to fail early than to discover after a multi-day migration that progress was never being saved.
 
 The checkpoint dumper also handles a race condition where the state transitions past cutover mid-checkpoint — the checkpoint table may have already been dropped, so this case is handled gracefully rather than treated as an error.
 

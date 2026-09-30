@@ -20,6 +20,15 @@ type Task interface {
 	Cancel() // a callback to be able to cancel the task.
 }
 
+// Aborter is implemented by a Task that can stop itself with a cause. When a
+// checkpoint cannot be written, the checkpoint dumper aborts such a task with
+// the write error marked by FatalAbort, so the task can return that error (see
+// AbortCause) instead of the context.Canceled a plain Cancel produces. A Task
+// that does not implement it is stopped with Cancel.
+type Aborter interface {
+	Abort(cause error)
+}
+
 // WatchTask periodically does the status reporting for a task.
 // This includes writing to the logger the current state,
 // and dumping checkpoints.
@@ -99,7 +108,11 @@ func continuallyDumpCheckpoint(ctx context.Context, task Task, logger *slog.Logg
 				// We could get 10 days into a migration, and then fail, and then
 				// discover this. It's better to fast fail now.
 				logger.Error("error writing checkpoint", "error", err)
-				task.Cancel()
+				if a, ok := task.(Aborter); ok {
+					a.Abort(FatalAbort(err))
+				} else {
+					task.Cancel()
+				}
 				return
 			}
 		}

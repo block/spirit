@@ -3,6 +3,7 @@ package status
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -356,4 +357,41 @@ func TestContinuallyDumpCheckpointCanceledMidDump(t *testing.T) {
 	if n := task.checkpointCount.Load(); n != 1 {
 		t.Fatalf("expected exactly 1 checkpoint attempt, got %d", n)
 	}
+}
+
+// abortingTask is a fakeTask that can be stopped with a cause (Aborter).
+type abortingTask struct {
+	*fakeTask
+	abortCause chan error
+}
+
+func (a *abortingTask) Abort(cause error) { a.abortCause <- cause }
+
+// TestContinuallyDumpCheckpointFatalErrorAbortsWithCause verifies that a task
+// implementing Aborter is stopped with the checkpoint error as the cause,
+// marked by FatalAbort, so its Run can return that error (see AbortCause)
+// instead of context.Canceled. Cancel must not be called.
+func TestContinuallyDumpCheckpointFatalErrorAbortsWithCause(t *testing.T) {
+	setTestIntervals(t, time.Hour, 2*time.Millisecond)
+	writeErr := fmt.Errorf("%w: disk full", ErrCouldNotWriteCheckpoint)
+	task := &abortingTask{fakeTask: newFakeTask(CopyRows), abortCause: make(chan error, 1)}
+	task.dumpErr = func() error { return writeErr }
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		continuallyDumpCheckpoint(t.Context(), task, slog.Default())
+	}()
+
+	waitSignal(t, done, "checkpoint loop exit after fatal error")
+	var cause error
+	select {
+	case cause = <-task.abortCause:
+	default:
+		t.Fatal("a fatal checkpoint error must abort a task that implements Aborter")
+	}
+	require.ErrorIs(t, cause, ErrFatalAbort)
+	require.ErrorIs(t, cause, ErrCouldNotWriteCheckpoint)
+	require.Equal(t, writeErr.Error(), cause.Error())
+	require.False(t, task.cancelled(), "Cancel must not be called when the task can be aborted with a cause")
 }

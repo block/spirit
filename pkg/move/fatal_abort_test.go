@@ -2,8 +2,10 @@ package move
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,8 @@ import (
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -158,4 +162,79 @@ func TestMoveFatalAbortBeforeFirstPhase(t *testing.T) {
 	require.NotErrorIs(t, runErr, context.Canceled, "a fatal abort is not an operator cancellation")
 	require.ErrorContains(t, runErr, change.FatalReasonStreamError.String())
 	require.Empty(t, sink.outcomes(), "Run must stop before its first phase")
+}
+
+// parkAfterChunks lets the copier read its first chunks and then parks it
+// until its context is cancelled, so a test can act while the copy is in
+// progress and the copier low watermark is already set.
+type parkAfterChunks struct {
+	throttler.Noop
+	pass  int64
+	calls atomic.Int64
+}
+
+func (p *parkAfterChunks) IsThrottled() bool { return true }
+
+func (p *parkAfterChunks) BlockWait(ctx context.Context) {
+	if p.calls.Add(1) > p.pass {
+		<-ctx.Done()
+	}
+}
+
+// TestMoveCheckpointWriteFailureReturnsCause checks that when the checkpoint
+// dumper cannot write the checkpoint and stops the move, Run returns an error
+// naming the checkpoint failure. The dumper used to stop the move with a plain
+// cancellation, so Run returned context.Canceled and the failure was reported
+// as if an operator had cancelled the move.
+func TestMoveCheckpointWriteFailureReturnsCause(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	dstName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQL(t, "CREATE TABLE "+srcName+".t1 (id INT PRIMARY KEY, val VARCHAR(255))")
+	testutils.RunSQL(t, "INSERT INTO "+srcName+".t1 WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 1000) SELECT a.n * 1000 + b.n, 'x' FROM seq a JOIN seq b WHERE a.n <= 10")
+	src := cfg.Clone()
+	src.DBName = srcName
+	dst := cfg.Clone()
+	dst.DBName = dstName
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:    src.FormatDSN(),
+		TargetDSN:    dst.FormatDSN(),
+		Threads:      1,
+		WriteThreads: 1,
+	})
+	require.NoError(t, err)
+	fakeAurora(runner, 0, throttler.AuroraResult{Throttlers: []throttler.Throttler{&parkAfterChunks{pass: 3}}})
+	sink := &outcomeSink{}
+	runner.SetMetricsSink(sink)
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(t.Context()) }()
+
+	// Wait for the first checkpoint, then remove the table it is written to so
+	// the next write fails.
+	db, err := sql.Open("block-mysql", dst.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.Eventually(t, func() bool {
+		var n int
+		err := db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+checkpointTableName).Scan(&n)
+		return err == nil && n > 0
+	}, time.Minute, 10*time.Millisecond, "no checkpoint was written")
+	testutils.RunSQL(t, "DROP TABLE "+dstName+"."+checkpointTableName)
+
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("move did not return after the checkpoint write failed")
+	}
+	require.NoError(t, runner.Close())
+
+	require.Error(t, runErr)
+	require.NotErrorIs(t, runErr, context.Canceled, "a checkpoint failure is not an operator cancellation")
+	require.ErrorIs(t, runErr, status.ErrCouldNotWriteCheckpoint)
+	require.Contains(t, sink.outcomes(), status.WorkflowPhaseOutcomeFailed)
+	require.NotContains(t, sink.outcomes(), status.WorkflowPhaseOutcomeCancelled)
 }

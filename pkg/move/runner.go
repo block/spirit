@@ -226,7 +226,10 @@ type Runner struct {
 	bgCancel context.CancelFunc
 }
 
-var _ status.Task = (*Runner)(nil)
+var (
+	_ status.Task    = (*Runner)(nil)
+	_ status.Aborter = (*Runner)(nil)
+)
 
 func NewRunner(m *Move) (*Runner, error) {
 	if err := m.Validate(); err != nil {
@@ -2598,6 +2601,13 @@ func renderCheckpointPosition(positions map[string]string) string {
 // context.Canceled.
 func (r *Runner) Cancel() {
 	r.cancelFunc(nil)
+}
+
+// Abort stops a running move with cause (see status.Aborter). The checkpoint
+// dumper calls it when it cannot write a checkpoint, so Run returns the write
+// error instead of context.Canceled.
+func (r *Runner) Abort(cause error) {
+	r.cancelFunc(cause)
 }
 
 // createApplier creates the applier that writes to the targets. With several
