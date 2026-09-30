@@ -1,6 +1,7 @@
 package check
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -143,14 +144,14 @@ func TestSourceSchemaObjectsCheckUninitializedSource(t *testing.T) {
 	require.EqualError(t, err, "source 0 database connection or config is not initialized")
 }
 
-// TestRetiredTableTriggersError checks the reverse cutover's check: only
-// triggers on the retired <table>_old tables of the moved tables refuse, on
-// any source. Other objects in the source schema do not.
-func TestRetiredTableTriggersError(t *testing.T) {
+// TestReverseWindowSchemaObjectsError checks the reverse window's check:
+// triggers on any table and events refuse, on any source. Views, procedures
+// and functions do not.
+func TestReverseWindowSchemaObjectsError(t *testing.T) {
 	src0Name, src0DB := testutils.CreateUniqueTestDatabase(t)
 	src1Name, src1DB := testutils.CreateUniqueTestDatabase(t)
 	for _, name := range []string{src0Name, src1Name} {
-		for _, tbl := range []string{"t1_old", "t2_old", "other"} {
+		for _, tbl := range []string{"t1_old", "other"} {
 			testutils.RunSQLInDatabase(t, name, "CREATE TABLE "+tbl+" (id INT NOT NULL PRIMARY KEY, v INT)")
 		}
 	}
@@ -158,40 +159,49 @@ func TestRetiredTableTriggersError(t *testing.T) {
 		{DB: src0DB, Config: &mysql.Config{DBName: src0Name}},
 		{DB: src1DB, Config: &mysql.Config{DBName: src1Name}},
 	}
-	tables := []string{"t1", "t2"}
 
-	// Objects that are not triggers on a retired table do not refuse.
-	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE TRIGGER other_bi BEFORE INSERT ON other FOR EACH ROW SET NEW.v = 1")
+	// Objects that run only when a client invokes them do not refuse.
 	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE VIEW v1 AS SELECT id FROM other")
 	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE PROCEDURE p1() SELECT 1")
-	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
-	require.NoError(t, RetiredTableTriggersError(t.Context(), sources, tables))
-	// A retired table of a table that is not moved does not count either.
-	require.NoError(t, RetiredTableTriggersError(t.Context(), sources, []string{"t3"}))
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE FUNCTION f1() RETURNS INT DETERMINISTIC RETURN 1")
+	require.NoError(t, ReverseWindowSchemaObjectsError(t.Context(), sources))
 
-	testutils.RunSQLInDatabaseAsRoot(t, src1Name, "CREATE TRIGGER t2_old_bu BEFORE UPDATE ON t2_old FOR EACH ROW SET NEW.v = 1")
-	testutils.RunSQLInDatabaseAsRoot(t, src1Name, "CREATE TRIGGER t1_old_bi BEFORE INSERT ON t1_old FOR EACH ROW SET NEW.v = 1")
-	err := RetiredTableTriggersError(t.Context(), sources, tables)
-	require.EqualError(t, err, "cannot revert: triggers on the retired tables would go live with them, and they must be dropped before the reverse cutover can continue: source 1 ("+src1Name+"): trigger 't1_old_bi' on table 't1_old', trigger 't2_old_bu' on table 't2_old'")
+	// A trigger on a table that is not moved, a trigger on a retired table,
+	// and an event all refuse.
+	testutils.RunSQLInDatabaseAsRoot(t, src1Name, "CREATE TRIGGER other_bi BEFORE INSERT ON other FOR EACH ROW SET NEW.v = 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src1Name, "CREATE TRIGGER t1_old_bu BEFORE UPDATE ON t1_old FOR EACH ROW SET NEW.v = 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src1Name, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO UPDATE t1_old SET v = 0")
+	err := ReverseWindowSchemaObjectsError(t.Context(), sources)
+	require.EqualError(t, err, "triggers and events in the source schema can write to the retired tables without passing through the reverse feed, and they must be dropped before the reverse window or a rollback can continue: source 1 ("+src1Name+"): trigger 'other_bi' on table 'other', trigger 't1_old_bu' on table 't1_old', event 'e1'")
 	require.ErrorIs(t, err, ErrRefused)
 
-	require.EqualError(t, RetiredTableTriggersError(t.Context(), []SourceResource{{}}, tables),
+	require.EqualError(t, ReverseWindowSchemaObjectsError(t.Context(), []SourceResource{{}}),
 		"source 0 database connection or config is not initialized")
 }
 
-// TestRetiredTableTriggersErrorRequiresTriggerVisibility checks that the
-// reverse cutover's check refuses when the user cannot see the schema's
-// triggers, rather than trusting an empty result.
-func TestRetiredTableTriggersErrorRequiresTriggerVisibility(t *testing.T) {
+// TestReverseWindowSchemaObjectsErrorRequiresVisibility checks that the
+// reverse window's check refuses when the user cannot see the schema's
+// triggers or events, rather than trusting an empty result. Routine
+// visibility is not needed for it.
+func TestReverseWindowSchemaObjectsErrorRequiresVisibility(t *testing.T) {
 	schema, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY, v INT)")
-	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE TRIGGER t1_old_bi BEFORE INSERT ON t1_old FOR EACH ROW SET NEW.v = 1")
-	// SELECT only: no TRIGGER, so the trigger is hidden. EVENT and routine
-	// grants are not needed for this check.
-	db, cfg := createMoveTestUser(t, "testmovevis_notrigger", schema, "GRANT SELECT ON `"+schema+"`.* TO %s")
-	err := RetiredTableTriggersError(t.Context(), []SourceResource{{DB: db, Config: cfg}}, []string{"t1"})
-	require.EqualError(t, err, "source 0 ("+schema+"): insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: TRIGGER on `"+schema+"`.* (to see its triggers)")
-	require.ErrorIs(t, err, ErrRefused)
+	const prefix = "insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: "
+	for _, tc := range []struct {
+		name, user, grant, needed string
+	}{
+		{"no TRIGGER", "testmovevis_rwnotrigger", "GRANT SELECT, EVENT ON `%s`.* TO %%s", "TRIGGER on `%s`.* (to see its triggers)"},
+		{"no EVENT", "testmovevis_rwnoevent", "GRANT SELECT, TRIGGER ON `%s`.* TO %%s", "EVENT on `%s`.* (to see its events)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, cfg := createMoveTestUser(t, tc.user, schema, fmt.Sprintf(tc.grant, schema))
+			err := ReverseWindowSchemaObjectsError(t.Context(), []SourceResource{{DB: db, Config: cfg}})
+			require.EqualError(t, err, "source 0 ("+schema+"): "+prefix+fmt.Sprintf(tc.needed, schema))
+			require.ErrorIs(t, err, ErrRefused)
+		})
+	}
+	db, cfg := createMoveTestUser(t, "testmovevis_rwok", schema, "GRANT SELECT, TRIGGER, EVENT ON `"+schema+"`.* TO %s")
+	require.NoError(t, ReverseWindowSchemaObjectsError(t.Context(), []SourceResource{{DB: db, Config: cfg}}))
 }
 
 // TestSourceSchemaObjectsCheckOrder pins the report order of the single

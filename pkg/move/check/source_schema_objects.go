@@ -80,10 +80,8 @@ ORDER BY 1, w`
 // Finding objects, or missing grants, is a refusal (see ErrRefused). Any
 // other error, such as a failed query, may be transient.
 //
-// The runner also calls it directly when entering a reverse window, which
-// runs no check scope. The retired `<table>_old` tables are in the source
-// schema, so they are covered too. The reverse cutover checks only the
-// retired tables (see RetiredTableTriggersError).
+// The reverse window (entry and reverse cutover) uses the narrower
+// ReverseWindowSchemaObjectsError.
 func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) error {
 	var groups []string
 	for i, src := range sources {
@@ -98,7 +96,7 @@ func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) err
 		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, allSchemaObjects...); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
-		objects, err := schemaObjects(ctx, src)
+		objects, err := schemaObjects(ctx, src, nil)
 		if err != nil {
 			return fmt.Errorf("failed to list schema objects on source %d (%s): %w", i, src.Config.DBName, err)
 		}
@@ -114,8 +112,9 @@ func SourceSchemaObjectsError(ctx context.Context, sources []SourceResource) err
 }
 
 // schemaObjects describes each object in src's schema, e.g. "view 'v1'" or
-// "trigger 't1_ai' on table 't1'".
-func schemaObjects(ctx context.Context, src SourceResource) ([]string, error) {
+// "trigger 't1_ai' on table 't1'". If keep is not nil, only the kinds (see
+// schemaObjectKinds) it returns true for are described.
+func schemaObjects(ctx context.Context, src SourceResource, keep map[string]bool) ([]string, error) {
 	name := src.Config.DBName
 	rows, err := src.DB.QueryContext(ctx, schemaObjectsQuery, name, name, name, name, name)
 	if err != nil {
@@ -133,6 +132,9 @@ func schemaObjects(ctx context.Context, src SourceResource) ([]string, error) {
 		if kind < 0 || kind >= len(schemaObjectKinds) {
 			return nil, fmt.Errorf("unexpected object kind %d", kind)
 		}
+		if keep != nil && !keep[schemaObjectKinds[kind]] {
+			continue
+		}
 		objects = append(objects, describeSchemaObject(schemaObjectKinds[kind], objName, onTable))
 	}
 	return objects, rows.Err()
@@ -145,59 +147,51 @@ func describeSchemaObject(kind, name, onTable string) string {
 	return fmt.Sprintf("%s '%s'", kind, name)
 }
 
-// RetiredTableTriggersError returns a refusal (see ErrRefused) listing every
-// trigger on a retired `<table>_old` table, for each of tables, on any
-// source, or nil. The reverse cutover calls it before it renames the _old
-// tables back into service: a trigger on one would go live with it. It checks
-// only those tables, unlike SourceSchemaObjectsError: another object in the
-// source schema does not change what the rollback makes live, and must not
-// block it. Like SourceSchemaObjectsError, it first checks that the user can
-// see the schema's triggers.
-func RetiredTableTriggersError(ctx context.Context, sources []SourceResource, tables []string) error {
-	retired := make(map[string]bool, len(tables))
-	for _, t := range tables {
-		retired[CutoverOldName(t)] = true
-	}
+// reverseWindowObjectKinds are the object kinds that run on their own and
+// can write to a table without a client asking: a trigger fires on a write to
+// its table, which can write to any other table, and an event runs on a
+// schedule. Views, procedures and functions run only when a client invokes
+// them, which is no different from a client writing directly.
+var reverseWindowObjectKinds = map[string]bool{"trigger": true, "event": true}
+
+// ReverseWindowSchemaObjectsError returns a refusal (see ErrRefused) listing
+// every trigger, on any table, and every event in any source schema, grouped
+// by source, or nil.
+//
+// During a reverse window the source's retired `<table>_old` tables are kept
+// current by the reverse feed, and a reverse cutover puts them back into
+// service. A trigger or an event in the source schema can write to them
+// without passing through the reverse feed, so the rollback could make live
+// data that differs from the target; a trigger on an _old table would also go
+// live with it. The runner calls this when it enters the window (fresh and on
+// resume) and in the reverse cutover, before any rename. It does not refuse
+// views, procedures or functions: they do not change what the rollback makes
+// live, and must not block an emergency rollback. The forward pre-cutover
+// check (SourceSchemaObjectsError) has checked the whole schema just before a
+// fresh window starts.
+//
+// Like SourceSchemaObjectsError, it first checks that the user can see the
+// schema's triggers and events, and refuses if not.
+func ReverseWindowSchemaObjectsError(ctx context.Context, sources []SourceResource) error {
 	var groups []string
 	for i, src := range sources {
 		if src.DB == nil || src.Config == nil {
 			return fmt.Errorf("source %d database connection or config is not initialized", i)
 		}
-		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, schemaTriggers); err != nil {
+		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, schemaTriggers, schemaEvents); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
-		triggers, err := retiredTableTriggers(ctx, src, retired)
+		objects, err := schemaObjects(ctx, src, reverseWindowObjectKinds)
 		if err != nil {
-			return fmt.Errorf("failed to list triggers on source %d (%s): %w", i, src.Config.DBName, err)
+			return fmt.Errorf("failed to list triggers and events on source %d (%s): %w", i, src.Config.DBName, err)
 		}
-		if len(triggers) > 0 {
-			groups = append(groups, fmt.Sprintf("source %d (%s): %s", i, src.Config.DBName, strings.Join(triggers, ", ")))
+		if len(objects) > 0 {
+			groups = append(groups, fmt.Sprintf("source %d (%s): %s", i, src.Config.DBName, strings.Join(objects, ", ")))
 		}
 	}
 	if len(groups) == 0 {
 		return nil
 	}
-	return refuse(fmt.Errorf("cannot revert: triggers on the retired tables would go live with them, and they must be dropped before the reverse cutover can continue: %s",
+	return refuse(fmt.Errorf("triggers and events in the source schema can write to the retired tables without passing through the reverse feed, and they must be dropped before the reverse window or a rollback can continue: %s",
 		strings.Join(groups, "; ")))
-}
-
-func retiredTableTriggers(ctx context.Context, src SourceResource, retired map[string]bool) ([]string, error) {
-	rows, err := src.DB.QueryContext(ctx,
-		"SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ? ORDER BY TRIGGER_NAME",
-		src.Config.DBName)
-	if err != nil {
-		return nil, err
-	}
-	defer utils.CloseAndLog(rows)
-	var triggers []string
-	for rows.Next() {
-		var name, onTable string
-		if err := rows.Scan(&name, &onTable); err != nil {
-			return nil, err
-		}
-		if retired[onTable] {
-			triggers = append(triggers, describeSchemaObject("trigger", name, onTable))
-		}
-	}
-	return triggers, rows.Err()
 }

@@ -132,10 +132,11 @@ func newReverseWindow(r *Runner) *reverseWindow {
 func (w *reverseWindow) run(ctx context.Context) error {
 	// Both the fresh cutover and a resume enter the window here, and neither
 	// runs a check scope on the way. The reverse feeds write to the retired
-	// _old tables, which would fire a trigger created on them, and a reverse
-	// cutover puts them back into service. Refuse before the feeds start;
-	// traffic stays on the target, and a re-run resumes the window once the
-	// objects are dropped.
+	// _old tables, and a reverse cutover puts them back into service, so a
+	// trigger or event in the source schema that can write to them is
+	// refused before the feeds start (see
+	// check.ReverseWindowSchemaObjectsError). Traffic stays on the target, and
+	// a re-run resumes the window once the objects are dropped.
 	if err := w.checkSourceSchemaObjects(ctx); err != nil {
 		return fmt.Errorf("reverse window: %w", err)
 	}
@@ -187,11 +188,10 @@ func (w *reverseWindow) run(ctx context.Context) error {
 	})
 }
 
-// checkSourceSchemaObjects refuses when a source schema holds a trigger, view,
-// stored procedure, stored function or event. See
-// check.SourceSchemaObjectsError.
+// checkSourceSchemaObjects refuses when a source schema holds a trigger or an
+// event. See check.ReverseWindowSchemaObjectsError.
 func (w *reverseWindow) checkSourceSchemaObjects(ctx context.Context) error {
-	return check.SourceSchemaObjectsError(ctx, w.r.checkResources().Sources)
+	return check.ReverseWindowSchemaObjectsError(ctx, w.r.checkResources().Sources)
 }
 
 // buildFeed constructs the reverse feed: reverse sources are the former targets
@@ -381,20 +381,16 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	}
 	w.feed.Close()
 
-	// Check the _old tables for triggers one last time before they go back
-	// into service: nothing writes them now, and a trigger created on one
-	// during the window would otherwise go live with it. Only the _old
-	// tables are checked: a view, routine or event elsewhere in the source
-	// schema does not change what the rollback makes live, and must not
-	// block an emergency rollback. This path holds no lock on the source
-	// tables, so it does not keep DDL out while it runs. Fail closed: nothing
-	// has moved ownership yet, the phase is still reverse_window, and a
-	// re-run resumes the window once the triggers are dropped.
-	tables := make([]string, len(r.sourceTables))
-	for i, t := range r.sourceTables {
-		tables[i] = t.TableName
-	}
-	if err := check.RetiredTableTriggersError(ctx, r.checkResources().Sources, tables); err != nil {
+	// Check the source schema one last time before the _old tables go back
+	// into service: the reverse feed is drained, and a trigger or event
+	// created during the window could have written to them outside it, or (a
+	// trigger on an _old table) would go live with them. Views, procedures
+	// and functions are not refused (see
+	// check.ReverseWindowSchemaObjectsError). This path holds no lock on the
+	// source tables, so it does not keep DDL out while it runs. Fail closed:
+	// nothing has moved ownership yet, the phase is still reverse_window, and
+	// a re-run resumes the window once the objects are dropped.
+	if err := w.checkSourceSchemaObjects(ctx); err != nil {
 		return fmt.Errorf("reverse cutover: %w", err)
 	}
 

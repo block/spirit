@@ -11,9 +11,9 @@ spirit move --source-dsn "user:pass@tcp(source-host:3306)/mydb" \
 
 This will copy all tables from the source database to the target database, verify them with a checksum, and then complete.
 
-Move copies base tables only. It refuses a source schema that contains triggers, views, stored procedures, stored functions or events, because it does not copy them to the target; drop them before moving. The whole schema is checked, also when only some tables are moved. The check runs before tables are discovered (so a schema with only views, routines or events is refused rather than moved as empty), before the copy, on resume, again under the cutover's table locks before traffic is switched, and when a reverse window is entered. Under the cutover's locks, only finding objects (or missing grants, below) refuses the cutover without a retry; a failed query is retried like any other failed cutover attempt.
+Move copies base tables only. It refuses a source schema that contains triggers, views, stored procedures, stored functions or events, because it does not copy them to the target; drop them before moving. The whole schema is checked, also when only some tables are moved. The check runs before tables are discovered (so a schema with only views, routines or events is refused rather than moved as empty), before the copy, on resume, and again under the cutover's table locks before traffic is switched. Under the cutover's locks, only finding objects (or missing grants, below) refuses the cutover without a retry; a failed query, or a failure to read the grants, is retried like any other failed cutover attempt.
 
-A reverse cutover (a rollback during the reverse window) checks only for triggers on the retired `<table>_old` tables, because they would go live with those tables. Other objects in the source schema do not change what the rollback makes live, so they do not block it.
+During the reverse window, the check is narrower. When the window is entered (after the cutover, or when a killed move resumes into it) and again before a reverse cutover (a rollback), move refuses triggers on any table in the source schema and events in the source schema. They run on their own and can write to the retired `<table>_old` tables without passing through the reverse feed, so a rollback could make live data that differs from the target; a trigger on an `_old` table would also go live with it. Views, stored procedures and stored functions are not refused there: they run only when a client invokes them, like any direct write, so they do not block a rollback. Move does not verify that the `_old` tables still match the target.
 
 `information_schema` only shows a user the objects it has privileges on, so the move user needs these grants on each source schema, in addition to the privileges listed in the [README](../README.md). Each one counts if it is granted on the schema or on `*.*`:
 
@@ -22,9 +22,9 @@ A reverse cutover (a rollback during the reverse window) checks only for trigger
 * `EVENT`, to see events (new: not needed by `migrate`).
 * `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), or `SELECT` on `*.*`, to see stored procedures and functions (new). `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the schema also works.
 
-`SELECT` and `TRIGGER` on the schema are already required. Table-level grants do not count. A global grant that a partial revoke (`partial_revokes=ON`) removes for the source schema does not count. Grants through an active role, such as a default role, count. On RDS, `rds_superuser_role` with `activate_all_roles_on_login=ON` is accepted in place of these grants, as it is for `CONNECTION_ADMIN` and `PROCESS`.
+`SELECT` and `TRIGGER` on the schema are already required. Table-level grants do not count. With `partial_revokes=ON`, MySQL takes the database name in a grant literally (`%` and `_` are not wildcards), and move matches it the same way; a global grant that a partial revoke removes for the source schema does not count. Grants through an active role, such as a default role, count. On RDS, `rds_superuser_role` with `activate_all_roles_on_login=ON` is accepted in place of these grants, as it is for `CONNECTION_ADMIN` and `PROCESS`.
 
-The move is refused if a grant is missing. Every run of the check (including the reverse cutover's) reads the grants again before it trusts an empty result, so a grant revoked during a move refuses the next check.
+The move is refused if a grant is missing. Every run of the check reads the grants again before it trusts an empty result, so a grant revoked during a move refuses the next check. The reverse window's check needs only the grants for the object types it looks for: `TRIGGER` and `EVENT`.
 
 ## Configuration
 

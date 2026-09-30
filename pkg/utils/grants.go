@@ -12,7 +12,8 @@ import (
 //
 // capturing "ALL PRIVILEGES" and "strata_%". It only matches database-level
 // grants (`db`.*); global (*.*), table-level, and routine grants do not match.
-var dbGrantRegexp = regexp.MustCompile("^GRANT (.+) ON `([^`]+)`\\.\\* TO ")
+// SHOW GRANTS doubles a backquote inside the name; see unquoteDBName.
+var dbGrantRegexp = regexp.MustCompile("^GRANT (.+) ON `((?:[^`]|``)+)`\\.\\* TO ")
 
 // globalGrantRegexp captures the privilege list from a global grant line, e.g.
 //
@@ -29,7 +30,7 @@ var globalGrantRegexp = regexp.MustCompile(`^GRANT (.+) ON \*\.\* TO `)
 //	REVOKE SELECT, EVENT ON `app`.* FROM `user`@`%`
 //
 // capturing "SELECT, EVENT" and "app".
-var dbRevokeRegexp = regexp.MustCompile("^REVOKE (.+) ON `([^`]+)`\\.\\* FROM ")
+var dbRevokeRegexp = regexp.MustCompile("^REVOKE (.+) ON `((?:[^`]|``)+)`\\.\\* FROM ")
 
 // migrationDBPrivileges is the database-level privilege set spirit requires to
 // run a migration or move (mirroring gh-ost's historical requirement). A grant
@@ -41,20 +42,17 @@ var migrationDBPrivileges = []string{
 
 // DBLevelGrantCoversSchema reports whether a single SHOW GRANTS line is a
 // database-level grant that confers the privileges spirit needs on schemaName.
-// Unlike a literal substring match, it expands MySQL wildcard patterns in the
-// granted database name (see MySQLLikeMatch), so a grant on `strata_%`.* is
-// recognized as covering strata_boardgames_sharded_n80. The previous literal
-// match handled only exact and escaped-underscore database names.
-func DBLevelGrantCoversSchema(grant, schemaName string) bool {
+// The granted database name is matched as described in DBNameMatches, so with
+// partialRevokes=false a grant on `strata_%`.* covers
+// strata_boardgames_sharded_n80, and with partialRevokes=true it does not.
+// partialRevokes is the server's partial_revokes setting
+// (dbconn.PartialRevokesEnabled).
+func DBLevelGrantCoversSchema(grant, schemaName string, partialRevokes bool) bool {
 	m := dbGrantRegexp.FindStringSubmatch(grant)
-	if m == nil {
+	if m == nil || !DBNameMatches(unquoteDBName(m[2]), schemaName, partialRevokes) {
 		return false
 	}
-	privs, dbPattern := m[1], m[2]
-	if !MySQLLikeMatch(dbPattern, schemaName) {
-		return false
-	}
-	granted := splitPrivileges(privs)
+	granted := splitPrivileges(m[1])
 	if granted["ALL PRIVILEGES"] {
 		return true
 	}
@@ -79,11 +77,11 @@ func GlobalGrantHasAny(grant string, privs ...string) bool {
 }
 
 // DBLevelGrantHasAny reports whether a single SHOW GRANTS line is a
-// database-level grant whose database-name pattern matches schemaName (see
-// MySQLLikeMatch) and that confers ALL PRIVILEGES or any privilege in privs.
-func DBLevelGrantHasAny(grant, schemaName string, privs ...string) bool {
+// database-level grant whose database name matches schemaName (see
+// DBNameMatches) and that confers ALL PRIVILEGES or any privilege in privs.
+func DBLevelGrantHasAny(grant, schemaName string, partialRevokes bool, privs ...string) bool {
 	m := dbGrantRegexp.FindStringSubmatch(grant)
-	if m == nil || !MySQLLikeMatch(m[2], schemaName) {
+	if m == nil || !DBNameMatches(unquoteDBName(m[2]), schemaName, partialRevokes) {
 		return false
 	}
 	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
@@ -96,10 +94,29 @@ func DBLevelGrantHasAny(grant, schemaName string, privs ...string) bool {
 // literally, so it is compared exactly rather than as a pattern.
 func DBLevelRevokeHasAny(grant, schemaName string, privs ...string) bool {
 	m := dbRevokeRegexp.FindStringSubmatch(grant)
-	if m == nil || m[2] != schemaName {
+	if m == nil || unquoteDBName(m[2]) != schemaName {
 		return false
 	}
 	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
+}
+
+// DBNameMatches reports whether the database name in a database-level grant
+// applies to schemaName. With partialRevokes=false (the MySQL default), the
+// name is a LIKE pattern (see MySQLLikeMatch). With partialRevokes=true, MySQL
+// takes the name literally: '%' and '_' are ordinary characters, and so is a
+// backslash, so a grant on `app\_db`.* applies only to a schema whose name
+// contains the backslash, not to app_db (verified on MySQL 8.0.45).
+func DBNameMatches(grantedName, schemaName string, partialRevokes bool) bool {
+	if partialRevokes {
+		return grantedName == schemaName
+	}
+	return MySQLLikeMatch(grantedName, schemaName)
+}
+
+// unquoteDBName undoes the only escaping SHOW GRANTS applies inside a
+// backquoted database name: a doubled backquote.
+func unquoteDBName(name string) string {
+	return strings.ReplaceAll(name, "``", "`")
 }
 
 func hasAnyPrivilege(granted map[string]bool, privs []string) bool {

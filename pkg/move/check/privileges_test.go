@@ -487,7 +487,7 @@ func TestSchemaObjectVisibilityFromGrants(t *testing.T) {
 		{"routine privilege on the schema", []string{base, "GRANT EXECUTE ON `app`.*" + u}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := schemaObjectVisibilityFromGrants(tc.grants, "app", allSchemaObjects...)
+			err := schemaObjectVisibilityFromGrants(tc.grants, "app", false, allSchemaObjects...)
 			if tc.missing == nil {
 				require.NoError(t, err)
 				return
@@ -496,8 +496,16 @@ func TestSchemaObjectVisibilityFromGrants(t *testing.T) {
 			require.ErrorContains(t, err, "Needed: "+strings.Join(tc.missing, "; "))
 		})
 	}
+	// With partial_revokes=ON, a database-level grant name is literal: a
+	// pattern does not match, and the exact name does.
+	pattern := []string{"GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `a%`.*" + u}
+	require.NoError(t, schemaObjectVisibilityFromGrants(pattern, "app", false, allSchemaObjects...))
+	err := schemaObjectVisibilityFromGrants(pattern, "app", true, allSchemaObjects...)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, "Needed: "+strings.Join([]string{needSelect, needTrigger, needEvent, needRoutine}, "; "))
+	require.NoError(t, schemaObjectVisibilityFromGrants([]string{"GRANT SELECT, TRIGGER, EVENT, EXECUTE ON `app`.*" + u}, "app", true, allSchemaObjects...))
 	// Only the kinds asked for are evaluated.
-	require.NoError(t, schemaObjectVisibilityFromGrants([]string{"GRANT TRIGGER ON `app`.*" + u}, "app", schemaTriggers))
+	require.NoError(t, schemaObjectVisibilityFromGrants([]string{"GRANT TRIGGER ON `app`.*" + u}, "app", false, schemaTriggers))
 }
 
 func TestRDSSuperuserRoleGranted(t *testing.T) {
@@ -508,4 +516,46 @@ func TestRDSSuperuserRoleGranted(t *testing.T) {
 	require.True(t, rdsSuperuserRoleGranted([]string{"GRANT `other`@`%`,`rds_superuser_role`@`%` TO `u`@`%`"}))
 	require.False(t, rdsSuperuserRoleGranted([]string{"GRANT `other_role`@`%` TO `u`@`%`"}))
 	require.False(t, rdsSuperuserRoleGranted([]string{"GRANT SELECT ON `rds_superuser_role`.* TO `u`@`%`"}))
+}
+
+// TestVisibilityReadErrorsAreNotRefusals checks that a failure to read what
+// the visibility decision depends on (SHOW GRANTS, partial_revokes, or
+// activate_all_roles_on_login for the rds_superuser_role exemption) is a
+// plain error, not a refusal (ErrRefused), so the cutover retries it instead
+// of failing with a misleading "insufficient privileges". A closed pool
+// stands in for a connection lost mid-check.
+func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// The role is granted, so the exemption needs the server setting, and
+	// the read fails. Without the probe, these grants would be refused.
+	withRole := []string{"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `app`.* TO `u`@`%`",
+		"GRANT `rds_superuser_role`@`%` TO `u`@`%`"}
+	err = evaluateSchemaObjectVisibility(t.Context(), db, withRole, "app", false, allSchemaObjects...)
+	require.ErrorContains(t, err, "could not check whether rds_superuser_role makes the schema's objects visible: could not read activate_all_roles_on_login")
+	require.NotErrorIs(t, err, ErrRefused)
+
+	// Without the role, the setting is not read, and missing grants are a
+	// refusal.
+	err = evaluateSchemaObjectVisibility(t.Context(), db, withRole[:1], "app", false, allSchemaObjects...)
+	require.ErrorIs(t, err, ErrRefused)
+
+	// Reading the grants (partial_revokes, then SHOW GRANTS) fails the same
+	// way, in every scan.
+	cfg := &mysql.Config{DBName: "app"}
+	for name, scan := range map[string]func() error{
+		"schema objects": func() error { return SourceSchemaObjectsError(t.Context(), []SourceResource{{DB: db, Config: cfg}}) },
+		"reverse window": func() error {
+			return ReverseWindowSchemaObjectsError(t.Context(), []SourceResource{{DB: db, Config: cfg}})
+		},
+		"privileges": func() error {
+			return privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
+		},
+	} {
+		err := scan()
+		require.Error(t, err, name)
+		require.NotErrorIs(t, err, ErrRefused, name)
+	}
 }

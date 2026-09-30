@@ -54,6 +54,12 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 		schemaName = src.Config.DBName
 	}
 
+	// With partial_revokes=ON, MySQL takes database names in grants literally,
+	// so a grant on `app%`.* no longer covers app1.
+	partialRevokes, err := dbconn.PartialRevokesEnabled(ctx, src.DB)
+	if err != nil {
+		return err
+	}
 	rows, err := src.DB.QueryContext(ctx, `SHOW GRANTS`)
 	if err != nil {
 		return err
@@ -82,10 +88,11 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 		if utils.StringContainsAll(grant, `ALTER`, `CREATE`, `DELETE`, `DROP`, `INDEX`, `INSERT`, `LOCK TABLES`, `SELECT`, `TRIGGER`, `UPDATE`, ` ON *.*`) {
 			foundDBAll = true
 		}
-		// A database-level grant covers the schema if its database-name pattern
-		// matches (including MySQL wildcards such as `strata_%`) and it confers
-		// either ALL PRIVILEGES or the full set spirit requires.
-		if schemaName != "" && utils.DBLevelGrantCoversSchema(grant, schemaName) {
+		// A database-level grant covers the schema if its database name matches
+		// (a pattern such as `app_%` when partial_revokes=OFF, a literal name
+		// when it is ON) and it confers either ALL PRIVILEGES or the full set
+		// spirit requires.
+		if schemaName != "" && utils.DBLevelGrantCoversSchema(grant, schemaName, partialRevokes) {
 			foundDBAll = true
 		}
 		if strings.Contains(grant, `CONNECTION_ADMIN`) && strings.Contains(grant, ` ON *.*`) {
@@ -100,14 +107,17 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 		return rows.Err()
 	}
 	if foundAll {
-		return schemaObjectVisibilityFromGrants(grants, schemaName, allSchemaObjects...)
+		return schemaObjectVisibilityFromGrants(grants, schemaName, partialRevokes, allSchemaObjects...)
 	}
 
 	// On RDS, privileges like CONNECTION_ADMIN and PROCESS are granted via the
 	// opaque rds_superuser_role. When activate_all_roles_on_login=ON, this role
 	// is automatically active on every connection, so we can skip checking for
 	// those privileges directly.
-	skipRolePrivilegeCheck := rdsSuperuserRoleActive(ctx, src.DB, grants, logger)
+	skipRolePrivilegeCheck, err := rdsSuperuserRoleActive(ctx, src.DB, grants)
+	if err != nil {
+		return err
+	}
 
 	// Move operations always use force-kill (it's enabled by default in DBConfig).
 	// Check the force-kill related privileges.
@@ -142,16 +152,21 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 		// either (see rdsSuperuserRoleActive).
 		return nil
 	}
-	return schemaObjectVisibilityFromGrants(grants, schemaName, allSchemaObjects...)
+	return schemaObjectVisibilityFromGrants(grants, schemaName, partialRevokes, allSchemaObjects...)
 }
 
 // rdsSuperuserRoleActive reports whether the user has the RDS
 // rds_superuser_role and activate_all_roles_on_login=ON makes it active on
 // every connection. The role's privileges cannot be inspected through SHOW
 // GRANTS, so its presence is accepted in place of the privileges it is
-// expected to carry.
-func rdsSuperuserRoleActive(ctx context.Context, db *sql.DB, grants []string, logger *slog.Logger) bool {
-	return rdsSuperuserRoleGranted(grants) && dbconn.ActivateAllRolesOnLogin(ctx, db, logger)
+// expected to carry. The server setting is read only when the role is
+// granted. A failed read is returned as an error, so that a transient failure
+// is never taken for a missing privilege.
+func rdsSuperuserRoleActive(ctx context.Context, db *sql.DB, grants []string) (bool, error) {
+	if !rdsSuperuserRoleGranted(grants) {
+		return false, nil
+	}
+	return dbconn.ActivateAllRolesOnLogin(ctx, db)
 }
 
 // rdsSuperuserRoleGranted reports whether a role grant line, such as
@@ -186,15 +201,17 @@ var allSchemaObjects = []schemaObject{schemaViews, schemaTriggers, schemaEvents,
 // views need SELECT, triggers TRIGGER, events EVENT, and stored routines
 // SHOW_ROUTINE (MySQL 8.0.20+), global SELECT, or a routine privilege
 // (EXECUTE, ALTER ROUTINE, CREATE ROUTINE). A privilege counts on the schema
-// if it is granted on the schema (a database-level grant, whose name may be
-// a pattern) or globally, unless a partial revoke (partial_revokes=ON)
-// removes the global grant for that schema. Table-level grants do not count:
+// if it is granted on the schema or globally, unless a partial revoke
+// removes the global grant for that schema. The name in a database-level
+// grant is a pattern when partial_revokes=OFF and a literal name when it is
+// ON (see utils.DBNameMatches); partial revokes only exist when it is ON. Table-level grants do not count:
 // move needs to see the whole schema. For the current user, SHOW GRANTS
 // includes the privileges of its active roles, so a grant through a default
 // role counts, and a granted role that is not active does not.
 type schemaGrants struct {
-	lines  []string
-	schema string
+	lines          []string
+	schema         string
+	partialRevokes bool
 }
 
 // global reports whether priv is granted globally and not partially revoked
@@ -221,7 +238,7 @@ func (g schemaGrants) onSchema(priv string) bool {
 		return false
 	}
 	for _, line := range g.lines {
-		if utils.DBLevelGrantHasAny(line, g.schema, priv) {
+		if utils.DBLevelGrantHasAny(line, g.schema, g.partialRevokes, priv) {
 			return true
 		}
 	}
@@ -248,9 +265,9 @@ func (g schemaGrants) sees(o schemaObject) (bool, string) {
 
 // schemaObjectVisibilityFromGrants returns a refusal (see ErrRefused) naming
 // the grants missing for the user to see every object of the given kinds in
-// schemaName, or nil.
-func schemaObjectVisibilityFromGrants(grants []string, schemaName string, kinds ...schemaObject) error {
-	g := schemaGrants{lines: grants, schema: schemaName}
+// schemaName, or nil. partialRevokes is the server's partial_revokes setting.
+func schemaObjectVisibilityFromGrants(grants []string, schemaName string, partialRevokes bool, kinds ...schemaObject) error {
+	g := schemaGrants{lines: grants, schema: schemaName, partialRevokes: partialRevokes}
 	var missing []string
 	for _, kind := range kinds {
 		if ok, needed := g.sees(kind); !ok {
@@ -269,27 +286,52 @@ func schemaObjectVisibilityFromGrants(grants []string, schemaName string, kinds 
 // schemaGrants), with the same rds_superuser_role exemption as the privileges
 // check. The scans in this package call it every time, so a scan never
 // trusts an empty result on visibility checked in an earlier run (a
-// reverse-window resume runs no preflight) or since revoked. A failure to read
-// the grants is returned as a plain error, which may be transient.
+// reverse-window resume runs no preflight) or since revoked.
+//
+// Only a grant found missing is a refusal (see ErrRefused). A failure to
+// read SHOW GRANTS, partial_revokes or activate_all_roles_on_login is
+// returned as a plain error, which may be transient and is retried under the
+// cutover locks.
 func schemaObjectVisibility(ctx context.Context, db *sql.DB, schemaName string, kinds ...schemaObject) error {
-	rows, err := db.QueryContext(ctx, `SHOW GRANTS`)
+	grants, partialRevokes, err := readGrants(ctx, db)
 	if err != nil {
 		return fmt.Errorf("could not read the grants that make the schema's objects visible: %w", err)
+	}
+	return evaluateSchemaObjectVisibility(ctx, db, grants, schemaName, partialRevokes, kinds...)
+}
+
+// readGrants returns the connection's SHOW GRANTS lines and the server's
+// partial_revokes setting.
+func readGrants(ctx context.Context, db *sql.DB) ([]string, bool, error) {
+	partialRevokes, err := dbconn.PartialRevokesEnabled(ctx, db)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := db.QueryContext(ctx, `SHOW GRANTS`)
+	if err != nil {
+		return nil, false, err
 	}
 	defer utils.CloseAndLog(rows)
 	var grants []string
 	for rows.Next() {
 		var grant string
 		if err := rows.Scan(&grant); err != nil {
-			return fmt.Errorf("could not read the grants that make the schema's objects visible: %w", err)
+			return nil, false, err
 		}
 		grants = append(grants, grant)
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("could not read the grants that make the schema's objects visible: %w", err)
+	return grants, partialRevokes, rows.Err()
+}
+
+// evaluateSchemaObjectVisibility applies the rds_superuser_role exemption,
+// then schemaObjectVisibilityFromGrants.
+func evaluateSchemaObjectVisibility(ctx context.Context, db *sql.DB, grants []string, schemaName string, partialRevokes bool, kinds ...schemaObject) error {
+	exempt, err := rdsSuperuserRoleActive(ctx, db, grants)
+	if err != nil {
+		return fmt.Errorf("could not check whether rds_superuser_role makes the schema's objects visible: %w", err)
 	}
-	if rdsSuperuserRoleActive(ctx, db, grants, slog.Default()) {
+	if exempt {
 		return nil
 	}
-	return schemaObjectVisibilityFromGrants(grants, schemaName, kinds...)
+	return schemaObjectVisibilityFromGrants(grants, schemaName, partialRevokes, kinds...)
 }
