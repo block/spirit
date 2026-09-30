@@ -60,8 +60,8 @@ var (
 	// _spirit_checkpoint and datasync's _spirit_sync_checkpoint. A table with
 	// this name can only have been created by a move, which is what lets
 	// decideResume treat an empty one as a dead move's leavings and recover
-	// without --force. Keep it in sync with the literal in
-	// pkg/move/check/resume_state.go (that package cannot import this one).
+	// without --force. Keep it in sync with moveCheckpointTableName in
+	// pkg/move/check (that package cannot import this one).
 	checkpointTableName = "_spirit_move_checkpoint"
 	// Sentinel-wait timing lives in pkg/sentinel (sentinel.WaitLimit /
 	// sentinel.CheckInterval / sentinel.TableName) so it is shared with migrate.

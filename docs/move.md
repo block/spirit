@@ -26,6 +26,16 @@ During the reverse window, the check is narrower. When the window is entered (af
 
 The move is refused if a grant is missing. Every run of the check reads the grants again before it trusts an empty result, so a grant revoked during a move refuses the next check. The reverse window's check needs only the grants for the object types it looks for: `TRIGGER` and `EVENT`.
 
+Move also refuses a target that has a trigger on a table move writes to, or an event, on any target:
+
+* A trigger on a moved table. A target table that already exists is used when it is empty and matches the source (see [target-dsn](#target-dsn)), and it may carry a trigger. Move writes every copied row and every replayed change through it, so the trigger fires once per copied row and again for each replayed change.
+* A trigger on move's checkpoint table (`_spirit_move_checkpoint`, on the first target).
+* An event in the target schema. It runs on its own schedule and can write to the moved tables.
+
+A trigger on a target table that move does not write to is not refused, and neither are views, stored procedures and stored functions: they run only when something else writes to that table or invokes them. Table names are compared the way the target compares them: case-insensitively when its `lower_case_table_names` is nonzero.
+
+The target check runs before the copy and on resume, before move writes anything to the target, and again under the cutover's table locks before traffic is switched: a trigger or an event created on a target during the copy has already run for the rows written since, and would go live with the target. [force](#force) does not bypass it: move checks before it wipes the target, and the wipe does not drop events. To see triggers and events, the move user needs `TRIGGER` and `EVENT` on each target schema (or on `*.*`), with the same rules for table-level grants, multiple matching grants and roles as above. The move is refused if either is missing: the privileges check requires them before the move starts, and every run of the target check reads the grants again.
+
 ## Configuration
 
 - [checkpoint-max-age](#checkpoint-max-age)
@@ -170,7 +180,7 @@ The in-memory byte budget the buffered copier sizes each copy chunk against. Mov
 
 A Go MySQL DSN for the target database. Tables will be created here automatically from the source schema.
 
-A table that already exists on the target is used as-is, provided it is empty and its schema matches the source. "Matches" permits the target to be *stricter* in two specific ways, so a declaratively-managed target does not have to mirror artifacts of its unsharded source:
+A table that already exists on the target is used as-is, provided it is empty, its schema matches the source, and it has no triggers (see the target check at the top of this page). "Matches" permits the target to be *stricter* in two specific ways, so a declaratively-managed target does not have to mirror artifacts of its unsharded source:
 
 - the source's column-level `AUTO_INCREMENT` may be absent on the target (its ids come from elsewhere, e.g. a Vitess sequence);
 - a column the source declares nullable may be `NOT NULL` on the target — for example a shard key, which cannot be NULL in a sharded keyspace.
