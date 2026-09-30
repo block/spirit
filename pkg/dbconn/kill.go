@@ -30,6 +30,10 @@ var (
 	TransactionWeightThreshold int64 = 1_000_000
 
 	ErrTableLockFound = errors.New("explicit table lock found! spirit cannot proceed")
+
+	// errHeavyTransactionSkipped marks a kill that left a blocking transaction
+	// alive because its weight exceeds TransactionWeightThreshold.
+	errHeavyTransactionSkipped = errors.New("a blocking transaction is too heavy to kill safely")
 )
 
 // forceKillGracePeriod returns how long to wait before force-killing
@@ -156,7 +160,7 @@ type LockDetail struct {
 }
 
 func KillLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) error {
-	_, err := killLockingTransactions(ctx, db, tables, config, logger, ignorePIDs)
+	_, _, err := killBlockers(ctx, db, tables, config, logger, ignorePIDs)
 	return err
 }
 
@@ -177,13 +181,26 @@ func statementIsWaitingForTableLock(ctx context.Context, db *sql.DB, tables []*t
 	return pending > 0, nil
 }
 
-// killLockingTransactions also returns the successfully signalled sessions.
-// KILL acknowledges the request before rollback and lock release complete.
+// killLockingTransactions also returns the successfully signalled sessions,
+// including when killing another one failed. KILL acknowledges the request
+// before rollback and lock release complete. A blocker left alive because it
+// is too heavy to kill is reported as errHeavyTransactionSkipped.
 func killLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) ([]int, error) {
+	killed, heavy, err := killBlockers(ctx, db, tables, config, logger, ignorePIDs)
+	if len(heavy) > 0 {
+		err = errors.Join(err, fmt.Errorf("%w: sessions %v", errHeavyTransactionSkipped, heavy))
+	}
+	return killed, err
+}
+
+// killBlockers kills the transactions holding locks on tables. It returns the
+// sessions it signalled and the blocking sessions it left alive because their
+// transactions are too heavy to kill.
+func killBlockers(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) (killed, heavy []int, err error) {
 	// First, check if there are explicit table locks that would prevent us from acquiring the metadata lock.
 	locks, err := GetTableLocks(ctx, db, tables, logger, ignorePIDs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get table locks: %w", err)
+		return nil, nil, fmt.Errorf("failed to get table locks: %w", err)
 	}
 	if len(locks) > 0 {
 		// If we find any table locks, we cannot proceed with the metadata lock.
@@ -198,28 +215,26 @@ func killLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 				"objectName", lock.ObjectName,
 			)
 		}
-		return nil, ErrTableLockFound
+		return nil, nil, ErrTableLockFound
 	}
-	pids, err := GetLockingTransactions(ctx, db, tables, config, logger, ignorePIDs)
+	pids, heavy, err := getLockingTransactions(ctx, db, tables, logger, ignorePIDs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get locking transactions: %w", err)
+		return nil, nil, fmt.Errorf("failed to get locking transactions: %w", err)
 	}
 	// Now we can kill these transactions
 	var errs []error
-	var killed []int
 	for _, pid := range pids {
 		logger.Warn("killing locking transaction", "pid", pid)
-		err = KillTransaction(ctx, db, pid)
-		if err != nil {
+		if err := KillTransaction(ctx, db, pid); err != nil {
 			errs = append(errs, fmt.Errorf("failed to kill transaction %d: %w", pid, err))
 		} else {
 			killed = append(killed, pid)
 		}
 	}
 	if len(errs) > 0 {
-		return nil, fmt.Errorf("errors occurred while killing locking transactions: %w", errors.Join(errs...))
+		return killed, heavy, fmt.Errorf("errors occurred while killing locking transactions: %w", errors.Join(errs...))
 	}
-	return killed, nil
+	return killed, heavy, nil
 }
 
 // GetLockingTransactions queries the performance schema to find locking transactions
@@ -228,6 +243,13 @@ func killLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Ta
 // If a transaction's weight exceeds the TransactionWeightThreshold, it will be skipped.
 // If no long-running transactions are found, it returns nil.
 func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, ignorePIDs []int) ([]int, error) {
+	pids, _, err := getLockingTransactions(ctx, db, tables, logger, ignorePIDs)
+	return pids, err
+}
+
+// getLockingTransactions is GetLockingTransactions that also returns the
+// sessions it skipped because their transactions are too heavy to kill.
+func getLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.TableInfo, logger *slog.Logger, ignorePIDs []int) (pids, heavy []int, err error) {
 	// This function should query the performance schema to find long-running transactions
 	// that are holding locks on the specified tables.
 
@@ -256,7 +278,7 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -278,7 +300,7 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 			&lock.RunningTime,
 			&lock.TrxWeight,
 		); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		logger.Info("found locking transaction",
 			"pid", lock.PID,
@@ -292,11 +314,11 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 		locks = append(locks, lock)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(locks) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var uniquePids []int
@@ -306,6 +328,9 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 				"pid", lock.PID,
 				"weight", lock.TrxWeight.Int64,
 				"threshold", TransactionWeightThreshold)
+			if !slices.Contains(heavy, lock.PID) {
+				heavy = append(heavy, lock.PID)
+			}
 			continue // Skip transactions that are too heavy
 		}
 		// Check if this PID is already in the unique list using slices.Contains
@@ -316,7 +341,7 @@ func GetLockingTransactions(ctx context.Context, db *sql.DB, tables []*table.Tab
 
 	logger.Info("found locking transactions", "count", len(uniquePids), "pids", uniquePids)
 
-	return uniquePids, nil
+	return uniquePids, heavy, nil
 }
 
 func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, logger *slog.Logger, ignorePIDs []int) ([]*LockDetail, error) {

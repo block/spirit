@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -460,6 +461,207 @@ func TestForceExecStopsWhenKillFindsTableLock(t *testing.T) {
 	require.Equal(t, 1, killCalls)
 	require.Contains(t, logs.String(), "not retrying statement after lock wait timeout")
 	require.NotContains(t, logs.String(), "retrying statement anyway")
+}
+
+// A kill that leaves a blocker no kill ends stops the retry loop, whatever
+// else it killed. The next attempt would queue behind that blocker for a full
+// lock wait timeout and block the table's traffic again.
+func TestForceExecStopsWhenABlockerSurvivesTheKill(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		killErr error
+		reason  string
+	}{
+		{
+			name:    "heavy transaction",
+			killErr: fmt.Errorf("%w: sessions [7]", errHeavyTransactionSkipped),
+			reason:  "too heavy to roll back safely",
+		},
+		{
+			name: "kill denied",
+			killErr: fmt.Errorf("errors occurred while killing locking transactions: %w",
+				errors.Join(fmt.Errorf("failed to kill transaction 7: %w", &mysql.MySQLError{Number: errKillDenied, Message: "You are not owner of thread 7"}))),
+			reason: "needs CONNECTION_ADMIN or SUPER",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "forceexec_blocker_survives", "CREATE TABLE forceexec_blocker_survives (id INT PRIMARY KEY)")
+			config := NewDBConfig()
+			config.LockWaitTimeout = 1
+			require.Greater(t, config.MaxRetries, 1)
+			db, err := New(testutils.DSN(), config)
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			// Keep the SELECT's metadata lock until Rollback so ALTER TABLE blocks.
+			blocker, err := tt.DB.BeginTx(t.Context(), nil)
+			require.NoError(t, err)
+			defer func() { _ = blocker.Rollback() }()
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_blocker_survives")
+			require.NoError(t, err)
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			killCalls, cleanupCalls := 0, 0
+			err = forceExec(ctx, db, config, logger,
+				"ALTER TABLE forceexec_blocker_survives ADD COLUMN c INT, ALGORITHM=INSTANT",
+				waitingOn(tt.DB),
+				func(context.Context, int) ([]int, error) {
+					killCalls++
+					// Another blocker was killed beside the one that survives.
+					return []int{8}, tc.killErr
+				}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return nil }, nil)
+			var ddlErr *mysql.MySQLError
+			require.ErrorAs(t, err, &ddlErr)
+			require.EqualValues(t, errLockWaitTimeout, ddlErr.Number)
+			// The kill outcome stays out of the statement's error tree.
+			require.NotErrorIs(t, err, tc.killErr)
+			require.Equal(t, 1, killCalls)
+			require.Zero(t, cleanupCalls)
+			require.Contains(t, logs.String(), "not retrying statement after lock wait timeout")
+			require.Contains(t, logs.String(), tc.reason)
+			require.NotContains(t, logs.String(), "retrying statement anyway")
+		})
+	}
+}
+
+// A transaction too heavy to roll back safely is never killed, so ForceExec
+// gives up after one attempt and leaves it running. The threshold is lowered
+// so a one-row insert counts as heavy.
+func TestForceExecMakesOneAttemptAgainstAHeavyTransaction(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_heavy_trx", "CREATE TABLE forceexec_heavy_trx (id INT PRIMARY KEY)")
+	threshold := TransactionWeightThreshold
+	TransactionWeightThreshold = 0
+	t.Cleanup(func() { TransactionWeightThreshold = threshold })
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	require.Greater(t, config.MaxRetries, 1)
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	blocker, err := tt.DB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(ctx, "INSERT INTO forceexec_heavy_trx VALUES (1)")
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	tbl := table.NewTableInfo(db, "test", "forceexec_heavy_trx")
+	err = ForceExec(ctx, db, []*table.TableInfo{tbl}, config, logger,
+		"ALTER TABLE forceexec_heavy_trx ADD COLUMN c INT, ALGORITHM=INSTANT")
+	var ddlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &ddlErr)
+	require.EqualValues(t, errLockWaitTimeout, ddlErr.Number)
+	require.Contains(t, logs.String(), "skipping transaction with weight exceeding threshold")
+	require.Contains(t, logs.String(), "not retrying statement after lock wait timeout: a blocking transaction is too heavy")
+	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout: it waited for its lock for the kill delay")
+	// The heavy transaction was not killed.
+	require.NoError(t, blocker.Commit())
+}
+
+// newNoKillUserDB opens a pool for a user that holds every force-kill
+// privilege except CONNECTION_ADMIN, so it can kill its own sessions but not
+// another user's.
+func newNoKillUserDB(t *testing.T, config *DBConfig) *sql.DB {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	rootCfg := *cfg
+	rootCfg.User = "root" // needs grant privilege
+	rootDB, err := sql.Open("block-mysql", rootCfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rootDB)
+	for _, stmt := range []string{
+		"DROP USER IF EXISTS forceexecnokilluser",
+		"CREATE USER forceexecnokilluser",
+		"GRANT ALL ON test.* TO forceexecnokilluser",
+		"GRANT SELECT ON `performance_schema`.* TO forceexecnokilluser",
+		"GRANT PROCESS ON *.* TO forceexecnokilluser",
+	} {
+		_, err = rootDB.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	t.Cleanup(func() {
+		cleanupDB, err := sql.Open("block-mysql", rootCfg.FormatDSN())
+		if err != nil {
+			return
+		}
+		defer utils.CloseAndLog(cleanupDB)
+		_, _ = cleanupDB.ExecContext(context.Background(), "DROP USER IF EXISTS forceexecnokilluser")
+	})
+	userCfg := *cfg
+	userCfg.User = "forceexecnokilluser"
+	userCfg.Passwd = ""
+	db, err := New(userCfg.FormatDSN(), config)
+	require.NoError(t, err)
+	return db
+}
+
+// holdTableLock opens a transaction on db that reads tableName, so it holds
+// the table's metadata lock until it ends.
+func holdTableLock(t *testing.T, ctx context.Context, db *sql.DB, tableName string) *sql.Tx {
+	t.Helper()
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tx.Rollback() })
+	_, err = tx.ExecContext(ctx, "SELECT * FROM "+tableName)
+	require.NoError(t, err)
+	return tx
+}
+
+// A kill that is denied for one blocker still reports the blockers it did
+// kill, so the caller can wait for them to exit.
+func TestKillLockingTransactionsReportsKillsBesideADeniedOne(t *testing.T) {
+	tt := testutils.NewTestTable(t, "kill_partly_denied", "CREATE TABLE kill_partly_denied (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	db := newNoKillUserDB(t, config)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	owned := holdTableLock(t, ctx, db, "kill_partly_denied")
+	var ownedPID int
+	require.NoError(t, owned.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&ownedPID))
+	other := holdTableLock(t, ctx, tt.DB, "kill_partly_denied")
+
+	tbl := table.NewTableInfo(db, "test", "kill_partly_denied")
+	killed, err := killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), nil)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: errKillDenied})
+	require.Equal(t, []int{ownedPID}, killed)
+	_, err = other.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err, "the other user's blocker must still be running")
+}
+
+// A user without CONNECTION_ADMIN can kill its own sessions but not another
+// user's. ForceExec kills the blocker it owns, and then gives up after one
+// attempt: the next attempt's KILL of the other user's blocker is denied too.
+func TestForceExecMakesOneAttemptWhenAKillIsDenied(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_kill_denied", "CREATE TABLE forceexec_kill_denied (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	require.Greater(t, config.MaxRetries, 1)
+	db := newNoKillUserDB(t, config)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	owned := holdTableLock(t, ctx, db, "forceexec_kill_denied")
+	other := holdTableLock(t, ctx, tt.DB, "forceexec_kill_denied")
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	tbl := table.NewTableInfo(db, "test", "forceexec_kill_denied")
+	err := ForceExec(ctx, db, []*table.TableInfo{tbl}, config, logger,
+		"ALTER TABLE forceexec_kill_denied ADD COLUMN c INT, ALGORITHM=INSTANT")
+	var ddlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &ddlErr)
+	require.EqualValues(t, errLockWaitTimeout, ddlErr.Number)
+	require.Contains(t, logs.String(), "not retrying statement after lock wait timeout: the user may not kill a blocking session")
+	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout: it waited for its lock for the kill delay")
+	_, err = owned.ExecContext(ctx, "SELECT 1")
+	require.Error(t, err, "the blocker the user owns must have been killed")
+	_, err = other.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err, "the other user's blocker must still be running")
 }
 
 // A session holding LOCK TABLES on the target table makes ForceExec give up
