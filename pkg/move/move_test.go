@@ -822,22 +822,74 @@ func TestMoveRefusesUnsupportedNames(t *testing.T) {
 	}
 }
 
-// TestMoveRefusesSourceTriggers checks that a move is refused before anything
-// is created on the target when a moved source table has a trigger. Move does
-// not copy triggers, so the cutover would retire the source table with its
-// triggers and leave the target without them. With more than one source,
+// TestMoveRefusesSourceSchemaObjects checks that a move is refused before
+// anything is created on the target when a source schema contains a trigger,
+// a view, a stored procedure, a stored function or an event. Move copies none
+// of them, so the cutover would leave them behind on the retired source. The
+// whole schema is checked: an object unrelated to the moved tables is refused
+// too, also when only a subset of tables is moved. With more than one source,
 // every source is checked, not only the one the table list is read from.
-func TestMoveRefusesSourceTriggers(t *testing.T) {
+func TestMoveRefusesSourceSchemaObjects(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		srcDBs  []string
-		trigger int // index into srcDBs of the source that gets the trigger
+		name         string
+		srcDBs       []string
+		on           int // index into srcDBs of the source that gets the object
+		create       string
+		want         string
+		sourceTables []string
 	}{
-		{name: "single source", srcDBs: []string{"source_trg"}, trigger: 0},
-		{name: "second of two sources", srcDBs: []string{"source_trg_a", "source_trg_b"}, trigger: 1},
+		{
+			name:   "trigger",
+			srcDBs: []string{"source_obj_trg"},
+			create: "CREATE TRIGGER orders_ai AFTER INSERT ON orders FOR EACH ROW INSERT INTO orders_audit (order_id) VALUES (NEW.id)",
+			want:   "trigger 'orders_ai' on table 'orders'",
+		},
+		{
+			// Before discovery listed base tables only, a view failed the move
+			// on its missing primary key before any check ran.
+			name:   "view",
+			srcDBs: []string{"source_obj_view"},
+			create: "CREATE VIEW orders_v AS SELECT id, v FROM orders",
+			want:   "view 'orders_v'",
+		},
+		{
+			name:   "procedure",
+			srcDBs: []string{"source_obj_proc"},
+			create: "CREATE PROCEDURE orders_p() SELECT COUNT(*) FROM orders",
+			want:   "procedure 'orders_p'",
+		},
+		{
+			name:   "function",
+			srcDBs: []string{"source_obj_func"},
+			create: "CREATE FUNCTION orders_f() RETURNS INT DETERMINISTIC RETURN 1",
+			want:   "function 'orders_f'",
+		},
+		{
+			name:   "event",
+			srcDBs: []string{"source_obj_event"},
+			create: "CREATE EVENT orders_e ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM orders",
+			want:   "event 'orders_e'",
+		},
+		{
+			name:         "trigger on a table outside the moved subset",
+			srcDBs:       []string{"source_obj_subset"},
+			create:       "CREATE TRIGGER orders_audit_ai AFTER INSERT ON orders_audit FOR EACH ROW UPDATE orders SET v = v + 1 WHERE id = NEW.order_id",
+			want:         "trigger 'orders_audit_ai' on table 'orders_audit'",
+			sourceTables: []string{"orders"},
+		},
+		{
+			name:   "second of two sources",
+			srcDBs: []string{"source_obj_a", "source_obj_b"},
+			on:     1,
+			create: "CREATE TRIGGER orders_ai AFTER INSERT ON orders FOR EACH ROW INSERT INTO orders_audit (order_id) VALUES (NEW.id)",
+			want:   "trigger 'orders_ai' on table 'orders'",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			destDB := "dest_trg_" + strings.ReplaceAll(tc.name, " ", "_")
+			destDB := "dest_obj_" + strings.ReplaceAll(tc.name, " ", "_")
+			if len(destDB) > 64 {
+				destDB = destDB[:64]
+			}
 			for _, db := range append([]string{destDB}, tc.srcDBs...) {
 				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
 				testutils.RunSQL(t, "CREATE DATABASE "+db)
@@ -850,20 +902,22 @@ func TestMoveRefusesSourceTriggers(t *testing.T) {
 				testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s.orders VALUES (%d, 1), (%d, 2)", db, 2*i+1, 2*i+2))
 				sourceDSNs = append(sourceDSNs, testutils.DSNForDatabase(db))
 			}
-			testutils.RunSQL(t, "CREATE TRIGGER "+tc.srcDBs[tc.trigger]+".orders_ai AFTER INSERT ON "+tc.srcDBs[tc.trigger]+
-				".orders FOR EACH ROW INSERT INTO orders_audit (order_id) VALUES (NEW.id)")
+			objDB := tc.srcDBs[tc.on]
+			testutils.RunSQLInDatabase(t, objDB, tc.create)
 
 			move := &Move{
 				SourceDSNs:   sourceDSNs,
 				TargetDSN:    testutils.DSNForDatabase(destDB),
 				Threads:      2,
 				WriteThreads: 2,
+				SourceTables: tc.sourceTables,
 			}
 			err := move.Run()
-			require.ErrorContains(t, err, "table 'orders' has trigger 'orders_ai' on source")
-			require.ErrorContains(t, err, "("+tc.srcDBs[tc.trigger]+"): move does not support tables with triggers")
-			// --force wipes the target, which cannot remove a source trigger.
+			require.ErrorContains(t, err, "cannot move: move does not copy triggers, views, stored procedures, stored functions or events")
+			require.ErrorContains(t, err, "("+objDB+"): "+tc.want)
+			// --force wipes the target, which cannot remove a source object.
 			require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
+			require.NotContains(t, err.Error(), "primary key")
 
 			db, err := sql.Open("block-mysql", testutils.DSN())
 			require.NoError(t, err)

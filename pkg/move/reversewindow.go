@@ -130,6 +130,15 @@ func newReverseWindow(r *Runner) *reverseWindow {
 // run holds the window and performs the terminal action. It owns the feed's
 // lifecycle.
 func (w *reverseWindow) run(ctx context.Context) error {
+	// Both the fresh cutover and a resume enter the window here, and neither
+	// runs a check scope on the way. The reverse feeds write to the retired
+	// _old tables, which would fire a trigger created on them, and a reverse
+	// cutover puts them back into service. Refuse before the feeds start;
+	// traffic stays on the target, and a re-run resumes the window once the
+	// objects are dropped.
+	if err := w.checkSourceSchemaObjects(ctx); err != nil {
+		return fmt.Errorf("reverse window: %w", err)
+	}
 	if err := w.buildFeed(ctx); err != nil {
 		return err
 	}
@@ -176,6 +185,13 @@ func (w *reverseWindow) run(ctx context.Context) error {
 			}
 		}
 	})
+}
+
+// checkSourceSchemaObjects refuses when a source schema holds a trigger, view,
+// stored procedure, stored function or event. See
+// check.SourceSchemaObjectsError.
+func (w *reverseWindow) checkSourceSchemaObjects(ctx context.Context) error {
+	return check.SourceSchemaObjectsError(ctx, w.r.checkResources().Sources)
 }
 
 // buildFeed constructs the reverse feed: reverse sources are the former targets
@@ -364,6 +380,17 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 			change.ErrChangesNotFlushed)
 	}
 	w.feed.Close()
+
+	// Check the source schemas one last time before the _old tables go back
+	// into service: nothing writes them now, and an object created on them
+	// during the window would otherwise go live with them. This path holds
+	// no lock on the source tables, so it does not keep DDL out while it
+	// runs. Fail closed: nothing has moved ownership yet, the phase is still
+	// reverse_window, and a re-run resumes the window once the objects are
+	// dropped.
+	if err := w.checkSourceSchemaObjects(ctx); err != nil {
+		return fmt.Errorf("reverse cutover: %w", err)
+	}
 
 	// The mirror of the forward cutover's carryAutoIncrementsToTargets: ids the
 	// targets issued during the window and have since deleted never reached

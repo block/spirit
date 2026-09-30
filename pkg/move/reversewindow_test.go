@@ -23,6 +23,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/status"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -1187,12 +1188,14 @@ func TestResumeReverseWindowRefusesUnsupportedNames(t *testing.T) {
 	require.ErrorContains(t, err, `resume reverse window: table 'dot.name' cannot be moved: table name "dot.name" contains a '.'`)
 }
 
-// TestResumeReverseWindowRefusesRetiredTableTrigger: resuming a reverse window
-// runs no check scope. Its reverse feeds write to the retired _old source
-// tables, and a reverse cutover makes them live again, so a trigger created on
-// one since the forward move started must be refused before the feeds start.
-func TestResumeReverseWindowRefusesRetiredTableTrigger(t *testing.T) {
-	const srcDB = "rwtrg_src"
+// TestReverseWindowEntryRefusesSourceSchemaObjects: neither the fresh cutover
+// nor a resume runs a check scope on the way into the reverse window. Its
+// feeds write to the retired _old source tables, and a reverse cutover puts
+// them back into service, so a trigger, view, routine or event in the source
+// schema must be refused before the feeds start. Both paths enter the window
+// through reverseWindow.run.
+func TestReverseWindowEntryRefusesSourceSchemaObjects(t *testing.T) {
+	const srcDB = "rwobj_src"
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
 	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
 	t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB) })
@@ -1206,12 +1209,81 @@ func TestResumeReverseWindowRefusesRetiredTableTrigger(t *testing.T) {
 	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
-
-	r := &Runner{
-		move:    &Move{},
-		logger:  slog.Default(),
-		sources: []sourceInfo{{db: db, config: cfg}},
+	newRunner := func() *Runner {
+		return &Runner{
+			move:    &Move{},
+			logger:  slog.Default(),
+			sources: []sourceInfo{{db: db, config: cfg}},
+		}
 	}
-	err = r.resumeReverseWindow(t.Context(), checkpoint.Record{Position: "{}"})
-	require.ErrorContains(t, err, "resume reverse window: cannot move: table 't1_old' has trigger 't1_old_bi' on source 0 ("+srcDB+")")
+	const want = "reverse window: cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 (" +
+		srcDB + "): trigger 't1_old_bi' on table 't1_old'"
+
+	t.Run("resume", func(t *testing.T) {
+		err := newRunner().resumeReverseWindow(t.Context(), checkpoint.Record{Position: "{}"})
+		require.EqualError(t, err, want)
+	})
+	t.Run("fresh cutover", func(t *testing.T) {
+		r := newRunner()
+		r.sourceTables = []*table.TableInfo{table.NewTableInfo(db, srcDB, "t1")}
+		r.sources[0].tables = r.sourceTables
+		require.EqualError(t, newReverseWindow(r).run(t.Context()), want)
+	})
+}
+
+// TestMoveReverseCutoverRefusesSourceSchemaObjects: an object created in the
+// source schema during the reverse window, here a trigger on a retired _old
+// table, must stop the rollback before the _old tables are put back into
+// service. The refusal fails closed: no rename, no traffic switch, the
+// target keeps serving and the checkpoint still records the reverse window,
+// so a re-run resumes it once the object is dropped.
+func TestMoveReverseCutoverRefusesSourceSchemaObjects(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcobj_src", "rwcobj_dst")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second, // long; the revert ends it early
+	})
+	require.NoError(t, err)
+	var reverseCutoverCalled bool
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
+	h := startRun(t, runner)
+
+	deadline := h.awaitReverseWindow(ctl, "rwcobj_dst")
+	h.awaitTable(deadline, ctl, "rwcobj_src", "t1_old")
+	// Unlogged: a logged CREATE TRIGGER on an _old table kills the reverse
+	// feed, which then completes forward instead of rolling back.
+	execUnlogged(t, ctl, "CREATE TRIGGER rwcobj_src.t1_old_bu BEFORE UPDATE ON rwcobj_src.t1_old FOR EACH ROW SET NEW.val = UPPER(NEW.val)")
+	testutils.RunSQL(t, "CREATE TABLE rwcobj_dst."+revertMarkerName+" (id INT)")
+
+	err = h.waitFor(reverseCutoverTimeout, "the reverse cutover to be refused")
+	require.ErrorContains(t, err, "reverse cutover: cannot move: move does not copy triggers, views, stored procedures, stored functions or events")
+	require.ErrorContains(t, err, "source 0 (rwcobj_src): trigger 't1_old_bu' on table 't1_old'")
+	require.False(t, reverseCutoverCalled, "traffic must not be switched back")
+	require.True(t, tableExists(t, ctl, "rwcobj_src", "t1_old"), "the source must stay retired")
+	require.False(t, tableExists(t, ctl, "rwcobj_src", "t1"), "the source must not be un-retired")
+	require.True(t, tableExists(t, ctl, "rwcobj_dst", "t1"), "the target must keep serving")
+	require.False(t, tableExists(t, ctl, "rwcobj_dst", "t1_revert"), "the target must not be retired")
+	var phase string
+	require.NoError(t, ctl.QueryRowContext(t.Context(),
+		"SELECT move_phase FROM rwcobj_dst."+checkpointTableName+" WHERE id=1").Scan(&phase))
+	require.Equal(t, phaseReverseWindow, phase, "the checkpoint must still record the reverse window")
+}
+
+// execUnlogged runs stmt with sql_log_bin=0, so no change feed sees it: the
+// case only a check can catch.
+func execUnlogged(t *testing.T, db *sql.DB, stmt string) {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), stmt)
+	require.NoError(t, err)
 }

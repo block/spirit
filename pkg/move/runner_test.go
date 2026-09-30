@@ -1671,7 +1671,7 @@ func TestResumeFromCheckpointNotTooOld(t *testing.T) {
 }
 
 // TestResumeFromCheckpointRefusesSourceTrigger checks that a trigger created
-// on a moved source table after a checkpoint was written blocks the resume
+// in the source schema after a checkpoint was written blocks the resume
 // before any further copy or cutover, without and with --force, and that the
 // partial copy and its checkpoint survive.
 func TestResumeFromCheckpointRefusesSourceTrigger(t *testing.T) {
@@ -1709,14 +1709,9 @@ func TestResumeFromCheckpointRefusesSourceTrigger(t *testing.T) {
 	// CREATE TRIGGER would also be caught when the resumed change feed replays
 	// past it, after the resume has started; unlogged, only the check can
 	// refuse it.
-	conn, err := ctl.Conn(t.Context())
-	require.NoError(t, err)
-	_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
-	require.NoError(t, err)
-	_, err = conn.ExecContext(t.Context(), "CREATE TRIGGER "+srcDB+".t1_bu BEFORE UPDATE ON "+srcDB+".t1 FOR EACH ROW SET NEW.val = UPPER(NEW.val)")
-	require.NoError(t, err)
-	require.NoError(t, conn.Close())
-	const want = "cannot move: table 't1' has trigger 't1_bu' on source 0 (" + srcDB + "): move does not support tables with triggers"
+	execUnlogged(t, ctl, "CREATE TRIGGER "+srcDB+".t1_bu BEFORE UPDATE ON "+srcDB+".t1 FOR EACH ROW SET NEW.val = UPPER(NEW.val)")
+	const want = "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 (" +
+		srcDB + "): trigger 't1_bu' on table 't1'"
 
 	r, err := NewRunner(move)
 	require.NoError(t, err)

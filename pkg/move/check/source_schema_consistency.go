@@ -118,19 +118,21 @@ func sourceSchemaConsistencyCheck(ctx context.Context, r Resources, logger *slog
 	return nil
 }
 
-// listTables returns the table names in the given source's database, excluding
+// listTables returns the base table names in the given source's database, excluding
 // Spirit-internal artifacts and leftover shadow tables (see isShadowTable).
 func listTables(ctx context.Context, r Resources, sourceIndex int) ([]string, error) {
 	src := r.Sources[sourceIndex]
-	rows, err := src.DB.QueryContext(ctx, "SHOW TABLES")
+	// Base tables only, matching the runner's getTables (views are refused by
+	// the source_schema_objects check).
+	rows, err := src.DB.QueryContext(ctx, "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
 	if err != nil {
 		return nil, err
 	}
 	defer utils.CloseAndLog(rows)
 	var tables []string
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var name, tableType string
+		if err := rows.Scan(&name, &tableType); err != nil {
 			return nil, err
 		}
 		// Skip shadow tables so they never register as schema drift. The runner's

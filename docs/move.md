@@ -11,6 +11,8 @@ spirit move --source-dsn "user:pass@tcp(source-host:3306)/mydb" \
 
 This will copy all tables from the source database to the target database, verify them with a checksum, and then complete.
 
+Move copies base tables only. It refuses a source schema that contains triggers, views, stored procedures, stored functions or events, because it does not copy them to the target; drop them before moving. The whole schema is checked, also when only some tables are moved. The check runs before the copy, on resume, again under the cutover's table locks before traffic is switched, when a reverse window is entered, and before a reverse cutover.
+
 ## Configuration
 
 - [checkpoint-max-age](#checkpoint-max-age)
