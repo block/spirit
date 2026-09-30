@@ -3,6 +3,7 @@ package datasync
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -1208,7 +1209,7 @@ func TestSyncDeferSecondaryIndexesCreateAndRestore(t *testing.T) {
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
 
 	ctx := context.Background()
-	tables, err := runner.getTables(ctx)
+	tables, _, err := runner.getTables(ctx)
 	require.NoError(t, err)
 	runner.sourceTables = tables
 
@@ -1536,7 +1537,7 @@ func TestSyncTargetSchemaVerifyIgnoresDeferredIndexes(t *testing.T) {
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
 
 	ctx := context.Background()
-	tables, err := runner.getTables(ctx)
+	tables, _, err := runner.getTables(ctx)
 	require.NoError(t, err)
 	runner.sourceTables = tables
 
@@ -1657,6 +1658,140 @@ func TestSyncRefusesUnsupportedNames(t *testing.T) {
 
 			src, dest := cfg.Clone(), cfg.Clone()
 			src.DBName, dest.DBName = tc.srcDB, destDB
+			runner, err := NewRunner(&Sync{SourceDSN: src.FormatDSN(), TargetDSN: dest.FormatDSN(), Threads: 1, WriteThreads: 1})
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			err = runner.Run(ctx)
+			require.NoError(t, runner.Close())
+			require.ErrorContains(t, err, tc.want)
+
+			db, err := sql.Open("block-mysql", cfg.FormatDSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			var n int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+			require.Zero(t, n, "nothing may be created on the target")
+		})
+	}
+}
+
+// TestSyncRefusesEnumSetMembersOutsideUTF8MB3: SHOW CREATE TABLE reports an
+// ENUM or SET member character outside utf8mb3 as '?', and sync creates the
+// target from it, so the target would not have the member. Sync must refuse
+// such a table before it writes anything to the target.
+func TestSyncRefusesEnumSetMembersOutsideUTF8MB3(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	srcDB, destDB := "sync_enum_4byte_src", "sync_enum_4byte_dest"
+	for _, db := range []string{srcDB, destDB} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+	}
+	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+	t.Cleanup(func() {
+		for _, db := range []string{srcDB, destDB} {
+			testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+		}
+	})
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1 (id INT PRIMARY KEY, s SET('🎉','x')) DEFAULT CHARSET=utf8mb4")
+	testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 VALUES (1, 'x')")
+
+	src, dest := cfg.Clone(), cfg.Clone()
+	src.DBName, dest.DBName = srcDB, destDB
+	runner, err := NewRunner(&Sync{SourceDSN: src.FormatDSN(), TargetDSN: dest.FormatDSN(), Threads: 1, WriteThreads: 1})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	err = runner.Run(ctx)
+	require.NoError(t, runner.Close())
+	require.ErrorContains(t, err, `cannot sync table "t1": column "s" of table "t1" is set('?','x'), but MySQL stores a member with a character outside utf8mb3 there`)
+
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+	require.Zero(t, n, "nothing may be created on the target")
+}
+
+// TestSyncRefusesMisreportedEnumSetTarget: a target table that exists already
+// is accepted by comparing its SHOW CREATE TABLE with the source's. A source
+// member that really is '?' and a target member such as '😀' are both
+// reported as '?', so sync must also examine the target's stored members.
+func TestSyncRefusesMisreportedEnumSetTarget(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	srcDB, destDB := "sync_enum_4byte_tgt_src", "sync_enum_4byte_tgt_dest"
+	for _, db := range []string{srcDB, destDB} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+		testutils.RunSQL(t, "CREATE DATABASE "+db)
+	}
+	t.Cleanup(func() {
+		for _, db := range []string{srcDB, destDB} {
+			testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+		}
+	})
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1 (id INT PRIMARY KEY, e ENUM('?','a')) DEFAULT CHARSET=utf8mb4")
+	testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 VALUES (1, 'a')")
+	testutils.RunSQL(t, "CREATE TABLE "+destDB+".t1 (id INT PRIMARY KEY, e ENUM('😀','a')) DEFAULT CHARSET=utf8mb4")
+
+	src, dest := cfg.Clone(), cfg.Clone()
+	src.DBName, dest.DBName = srcDB, destDB
+	runner, err := NewRunner(&Sync{SourceDSN: src.FormatDSN(), TargetDSN: dest.FormatDSN(), Threads: 1, WriteThreads: 1})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	err = runner.Run(ctx)
+	require.NoError(t, runner.Close())
+	require.ErrorContains(t, err, `table t1 already exists on the target (`+destDB+`) but cannot be compared with the source: column "e" of table "t1" is enum('?','a'), but MySQL stores a member with a character outside utf8mb3 there`)
+
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+destDB+".t1").Scan(&n))
+	require.Zero(t, n, "nothing may be copied into the target")
+}
+
+// TestSyncRefusesFloatAndBitPrimaryKeys: a FLOAT key cannot be located by its
+// text form, so a replayed DELETE matches nothing; a BIT key cannot be read
+// back as a number, so the copy cannot compute its chunk boundaries. Sync must
+// refuse both before it writes anything to the target, as move does.
+func TestSyncRefusesFloatAndBitPrimaryKeys(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, create, insert, want string }{
+		{
+			name:   "float",
+			create: "CREATE TABLE %s.readings (id INT NOT NULL, f FLOAT NOT NULL, PRIMARY KEY (id, f))",
+			insert: "INSERT INTO %s.readings VALUES (1, 0.1), (2, 0.2)",
+			want:   `cannot sync table "readings": primary key column "f" of table "readings" is a FLOAT, which is not supported`,
+		},
+		{
+			name:   "bit",
+			create: "CREATE TABLE %s.readings (b BIT(16) NOT NULL PRIMARY KEY, v INT)",
+			insert: "INSERT INTO %s.readings VALUES (1, 1), (2, 2)",
+			want:   `cannot sync table "readings": primary key column "b" of table "readings" is a BIT, which is not supported`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcDB, destDB := "sync_"+tc.name+"_pk_src", "sync_"+tc.name+"_pk_dest"
+			for _, db := range []string{srcDB, destDB} {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+			}
+			testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
+			t.Cleanup(func() {
+				for _, db := range []string{srcDB, destDB} {
+					testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+				}
+			})
+			testutils.RunSQL(t, fmt.Sprintf(tc.create, srcDB))
+			testutils.RunSQL(t, fmt.Sprintf(tc.insert, srcDB))
+
+			src, dest := cfg.Clone(), cfg.Clone()
+			src.DBName, dest.DBName = srcDB, destDB
 			runner, err := NewRunner(&Sync{SourceDSN: src.FormatDSN(), TargetDSN: dest.FormatDSN(), Threads: 1, WriteThreads: 1})
 			require.NoError(t, err)
 			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)

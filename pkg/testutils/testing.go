@@ -237,6 +237,26 @@ func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 	require.NoError(t, err)
 }
 
+// RunSQLInDatabaseAsRoot runs SQL in a specific database as the root user,
+// with the password from MYSQL_DSN (CI gives root and the test user the same
+// password). Use it for statements the test user is deliberately not granted,
+// such as CREATE VIEW, CREATE ROUTINE or CREATE EVENT.
+func RunSQLInDatabaseAsRoot(t *testing.T, dbName, stmt string) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(DSN())
+	require.NoError(t, err)
+	cfg.User = "root"
+	cfg.DBName = dbName
+	db, err := sql.Open(driverName, cfg.FormatDSN())
+	require.NoError(t, err)
+	defer func() {
+		_ = db.Close()
+	}()
+	// Might be run in cleanup, use Background context
+	_, err = db.ExecContext(context.Background(), stmt)
+	require.NoError(t, err)
+}
+
 func RunSQL(t *testing.T, stmt string) {
 	t.Helper()
 	db, err := sql.Open(driverName, DSN())

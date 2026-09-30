@@ -11,7 +11,7 @@ import (
 
 type busyProgressThrottler struct{ throttler.Mock }
 
-func (busyProgressThrottler) Utilization() float64 { return 1.2 }
+func (*busyProgressThrottler) Utilization() float64 { return 1.2 }
 
 func TestMoveContinuousChecksumThrottleProgress(t *testing.T) {
 	r := &Runner{}

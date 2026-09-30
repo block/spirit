@@ -76,6 +76,11 @@ func configurationCheck(ctx context.Context, r Resources, logger *slog.Logger) e
 	} else if binlogTransactionCompression != "0" {
 		return errors.New("binlog_transaction_compression must be OFF: spirit does not support compressed transactions in the binary log")
 	}
+	var partialRevokes string
+	err = r.DB.QueryRowContext(ctx, `SELECT @@global.partial_revokes`).Scan(&partialRevokes)
+	if err := partialRevokesError(partialRevokes, err); err != nil {
+		return err
+	}
 
 	if logBin != "1" {
 		// This is a hard requirement because we need to be able to read the binlog.
@@ -110,5 +115,26 @@ func configurationCheck(ctx context.Context, r Resources, logger *slog.Logger) e
 	// automatically (change.NewAutoClient probes gtid_mode /
 	// enforce_gtid_consistency itself), so a server without GTIDs simply
 	// gets the binlog file+position client rather than an error.
+	return nil
+}
+
+// partialRevokesError decides the partial_revokes part of the configuration
+// check from the value of @@global.partial_revokes and the error reading it.
+// partial_revokes=ON lets SHOW GRANTS print a REVOKE line that removes a
+// global grant for one schema, and makes MySQL read the database name in a
+// grant literally rather than as a pattern. The privileges check reads SHOW
+// GRANTS as additive GRANT lines, so it would pass for a user that cannot act
+// on the schema. The variable only exists on MySQL 8.0.16+; an older server
+// cannot have partial revokes, so unknown-variable passes.
+func partialRevokesError(value string, err error) error {
+	if err != nil {
+		if myErr, ok := errors.AsType[*mysql.MySQLError](err); ok && myErr.Number == parsermysql.ErrUnknownSystemVariable {
+			return nil
+		}
+		return err
+	}
+	if value != "0" {
+		return errors.New("partial_revokes must be OFF: spirit does not support partial revokes")
+	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // This file holds the helpers that render parsed schema elements back into the
@@ -16,22 +17,24 @@ import (
 // unsigned and zerofill display attributes. Charset and collation are excluded —
 // formatColumnDefinition emits those separately.
 func formatColumnType(col *Column) string {
-	return columnType(col, sqlescape.EscapeString)
+	return columnType(col, func(s string) string { return "'" + sqlescape.EscapeString(s) + "'" })
 }
 
 // formatColumnTypeAsMetadata renders a column's data type the way MySQL reports
 // it in information_schema.columns.column_type. It differs from formatColumnType
 // only in how ENUM/SET elements are escaped: MySQL's metadata doubles an embedded
-// single quote, where the SQL Spirit emits backslash-escapes it. Both are valid
-// SQL, but the parsers that read an element list back out of column_type accept
-// only the doubled form.
+// single quote and backslash-escapes only a backslash, newline, carriage return
+// and NUL (see utils.QuoteEnumSetMember), where the SQL Spirit emits
+// backslash-escapes a quote and more characters. Both are valid SQL, but the
+// parser that reads an element list back out of column_type
+// (utils.ParseEnumSetElements) accepts only MySQL's form.
 func formatColumnTypeAsMetadata(col *Column) string {
-	return columnType(col, func(s string) string { return strings.ReplaceAll(s, "'", "''") })
+	return columnType(col, utils.QuoteEnumSetMember)
 }
 
-// columnType renders a column's data type, escaping ENUM/SET elements with the
-// supplied escaper.
-func columnType(col *Column, escapeElement func(string) string) string {
+// columnType renders a column's data type, quoting ENUM/SET elements with the
+// supplied quoter.
+func columnType(col *Column, quoteElement func(string) string) string {
 	typeDef := col.Type
 
 	// Determine the full type definition including length/precision/values
@@ -39,13 +42,13 @@ func columnType(col *Column, escapeElement func(string) string) string {
 	case col.Type == "enum" && len(col.EnumValues) > 0:
 		var values []string
 		for _, v := range col.EnumValues {
-			values = append(values, fmt.Sprintf("'%s'", escapeElement(v)))
+			values = append(values, quoteElement(v))
 		}
 		typeDef = fmt.Sprintf("enum(%s)", strings.Join(values, ","))
 	case col.Type == "set" && len(col.SetValues) > 0:
 		var values []string
 		for _, v := range col.SetValues {
-			values = append(values, fmt.Sprintf("'%s'", escapeElement(v)))
+			values = append(values, quoteElement(v))
 		}
 		typeDef = fmt.Sprintf("set(%s)", strings.Join(values, ","))
 	case col.Precision != nil && col.Scale != nil:

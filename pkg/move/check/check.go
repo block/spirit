@@ -24,6 +24,11 @@ const (
 	ScopePreflight
 	ScopePostSetup
 	ScopeResume
+	// ScopePreCutover runs while the forward cutover holds its table locks
+	// on every source, after the final flush and before the traffic switch
+	// and the source rename. A refusal (ErrRefused) fails the cutover without
+	// a retry and leaves the source live. Any other error is retried.
+	ScopePreCutover
 )
 
 // SourceResource holds per-source connection state for checks.
@@ -31,6 +36,10 @@ type SourceResource struct {
 	DB     *sql.DB
 	Config *mysql.Config
 	DSN    string
+	// Tables are this source's tables. Resources.SourceTables holds the
+	// first source's, which stand for every source where only their
+	// reported definition matters.
+	Tables []*table.TableInfo
 }
 
 // Resources contains the resources needed for move checks

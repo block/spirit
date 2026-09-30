@@ -106,6 +106,41 @@ func TestMockThrottler(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second)
 }
 
+func TestStallingMockThrottler(t *testing.T) {
+	stalling := NewStallingMock(2)
+	require.True(t, stalling.IsThrottled())
+
+	// The first two calls pass at once.
+	start := time.Now()
+	stalling.BlockWait(t.Context())
+	stalling.BlockWait(t.Context())
+	require.Less(t, time.Since(start), time.Second)
+
+	// Later calls block until the context is done: not for the pacing
+	// mock's 1s, and not forever.
+	ctx, cancel := context.WithTimeout(t.Context(), 1500*time.Millisecond)
+	defer cancel()
+	start = time.Now()
+	stalling.BlockWait(ctx)
+	require.GreaterOrEqual(t, time.Since(start), 1500*time.Millisecond)
+	require.Error(t, ctx.Err())
+
+	// With no passes, the first call already blocks.
+	ctx, cancel = context.WithCancel(t.Context())
+	returned := make(chan struct{})
+	go func() {
+		NewStallingMock(0).BlockWait(ctx)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+		t.Fatal("BlockWait returned before the context was cancelled")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	<-returned
+}
+
 func TestIsShutdownError(t *testing.T) {
 	live := t.Context()
 	cancelled, cancel := context.WithCancel(t.Context())

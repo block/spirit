@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -48,6 +50,7 @@ type TableInfo struct {
 	unknownCharsets             map[string]bool   // columns that carry a charset the table definition does not determine
 	unknownCollations           map[string]bool   // columns that carry a charset whose collation the table definition does not determine
 	enumSetElements             map[int][]string  // parsed ENUM/SET element list, keyed by column ordinal; only present for ENUM/SET columns
+	misreportedEnumSets         []string          // ENUM/SET columns whose stored members information_schema does not report (see readStoredEnumSetMembers), in ordinal order
 	binaryColumnWidths          map[int]int       // declared width of BINARY(N) columns, keyed by column ordinal; only present for fixed-width BINARY columns
 	floatColumns                []int             // ordinals of FLOAT columns, whose binlog values DecodeBinlogRow widens to float64
 	binlogCharsets              map[string]string // map from column name to the charset of the string bytes a binlog row image carries; only present for string columns whose charset is not utf8mb4/utf8mb3 (see BinlogColumnType)
@@ -204,6 +207,9 @@ func (t *TableInfo) SetInfo(ctx context.Context) error {
 	if err := t.setColumns(ctx); err != nil {
 		return err
 	}
+	if err := t.setStoredEnumSetMembers(ctx); err != nil {
+		return err
+	}
 	if err := t.setPrimaryKey(ctx); err != nil {
 		return err
 	}
@@ -295,6 +301,51 @@ func (t *TableInfo) setColumns(ctx context.Context) error {
 	return nil
 }
 
+// setStoredEnumSetMembers replaces the ENUM/SET member lists setColumns
+// parsed from information_schema with the members MySQL stores, for each
+// column whose reported list contains a '?'. information_schema reports every
+// member character outside utf8mb3 as '?', so without this the binlog decoder
+// would write '?' in place of a stored member such as '😀': a value the
+// column rejects, or a different member when '?' is one too.
+//
+// A '?' is also an ordinary member character, so the stored members are read
+// back (see readStoredEnumSetMembers) rather than the column refused. A column
+// with a stored member that has a character outside utf8mb3 is recorded for
+// MisreportedEnumSetError. If the members cannot be read — the probe needs the
+// CREATE TEMPORARY TABLES privilege — SetInfo fails rather than guessing.
+func (t *TableInfo) setStoredEnumSetMembers(ctx context.Context) error {
+	for ord, name := range t.Columns {
+		reported, ok := t.enumSetElements[ord]
+		if !ok || !slices.ContainsFunc(reported, func(m string) bool { return strings.Contains(m, "?") }) {
+			continue
+		}
+		mysqlType := t.columnsMySQLTps[name]
+		stored, err := readStoredEnumSetMembers(ctx, t.db, t.TableName, name, utils.IsSetType(mysqlType), len(reported))
+		if err != nil {
+			hint := ""
+			if myErr, ok := errors.AsType[*mysql.MySQLError](err); ok &&
+				(myErr.Number == parsermysql.ErrDBaccessDenied || myErr.Number == parsermysql.ErrTableaccessDenied) {
+				hint = ", which needs the CREATE TEMPORARY TABLES privilege"
+			}
+			return fmt.Errorf("column %s.%s.%s is %s, which information_schema reports with a '?' in a member. "+
+				"MySQL reports each member character outside utf8mb3 as '?', so spirit reads the members MySQL stores "+
+				"through a temporary table%s: %w",
+				t.SchemaName, t.TableName, name, mysqlType, hint, err)
+		}
+		// ParseEnumSetElements decodes the characters information_schema
+		// escapes (a backslash is reported as \\), so a stored member differs
+		// from the parsed one only where a character outside utf8mb3 was
+		// reported as '?'. Only such a member is misreported.
+		if !slices.Equal(stored, reported) {
+			t.enumSetElements[ord] = stored
+		}
+		if slices.ContainsFunc(stored, hasCharOutsideUTF8MB3) {
+			t.misreportedEnumSets = append(t.misreportedEnumSets, name)
+		}
+	}
+	return nil
+}
+
 // resetColumns clears the column metadata so it can be repopulated from
 // scratch. Columns must then be added in ordinal order: the ENUM/SET element
 // and BINARY width caches are keyed by ordinal position.
@@ -307,6 +358,7 @@ func (t *TableInfo) resetColumns() {
 	t.unknownCharsets = make(map[string]bool)
 	t.unknownCollations = make(map[string]bool)
 	t.enumSetElements = nil
+	t.misreportedEnumSets = nil
 	t.binaryColumnWidths = nil
 	t.floatColumns = nil
 	t.binlogCharsets = nil
@@ -605,6 +657,26 @@ func (t *TableInfo) FloatPrimaryKeyError() error {
 	return nil
 }
 
+// MisreportedEnumSetError returns an error if an ENUM or SET column has a
+// member that information_schema and SHOW CREATE TABLE do not report: each
+// member character outside utf8mb3, such as a 4-byte UTF-8 emoji, is reported
+// as '?' (see setStoredEnumSetMembers). A table created from its reported
+// definition does not have the member, and cannot hold the rows that use it:
+// the copy fails, or, when no row uses it yet, completes and loses the member.
+//
+// SetInfo does not call it: a TableInfo describes any table, and refusing one
+// is for the caller to decide. Move and sync, which create the target table
+// from the source's SHOW CREATE TABLE, refuse such a table with it. A
+// migration does not need to: CREATE TABLE .. LIKE copies the stored members.
+func (t *TableInfo) MisreportedEnumSetError() error {
+	if len(t.misreportedEnumSets) == 0 {
+		return nil
+	}
+	name := t.misreportedEnumSets[0]
+	return fmt.Errorf("column %q of table %q is %s, but MySQL stores a member with a character outside utf8mb3 there, which "+
+		"information_schema and SHOW CREATE TABLE report as '?', so the table cannot be recreated from its definition", name, t.TableName, t.columnsMySQLTps[name])
+}
+
 // BitPrimaryKeyError returns an error if a primary key column is a BIT, which
 // Spirit does not support.
 //
@@ -798,6 +870,19 @@ func (t *TableInfo) datumTp(col string) (datumTp, error) {
 func (t *TableInfo) GetColumnMySQLType(col string) (string, bool) {
 	tp, ok := t.columnsMySQLTps[col]
 	return tp, ok
+}
+
+// EnumSetMembers returns the members of the ENUM or SET column col, and false
+// if col is not one. Use it rather than parsing GetColumnMySQLType: SetInfo
+// replaces a member that information_schema reports as '?' with the member
+// MySQL stores (see setStoredEnumSetMembers).
+func (t *TableInfo) EnumSetMembers(col string) ([]string, bool) {
+	ord := slices.Index(t.Columns, col)
+	if ord < 0 {
+		return nil, false
+	}
+	members, ok := t.enumSetElements[ord]
+	return slices.Clone(members), ok
 }
 
 // BinlogColumnType resolves col for NewDatumFromValueWithType when the

@@ -32,8 +32,10 @@ checkpoint rather than re-copying from scratch.
 | Cutover | atomic rename | none |
 | Source | MySQL | MySQL (a pluggable `change.Source` allows other producers) |
 
-`sync` never writes to the source, runs no `ANALYZE`, acquires no source
-locks, and performs no cutover, so it can run against a replica. The exact
+`sync` never writes to the source's tables, runs no `ANALYZE`, acquires no
+source locks, and performs no cutover, so it can run against a replica. (It
+can create a session-local temporary table, which a read-only server allows;
+see [Requirements](#requirements).) The exact
 source privileges depend on the change feed:
 
 - **Built-in MySQL source** (default, from `--source-dsn`): needs `SELECT`
@@ -49,6 +51,10 @@ source privileges depend on the change feed:
   `SELECT` on the source schema is required for the initial copy. GTID
   auto-detection does not apply to an injected source.
 
+With either feed, a source table with an `ENUM` or `SET` member reported with
+a `?` also needs `CREATE TEMPORARY TABLES` on the source schema, including a
+member that really is `?` (see [Requirements](#requirements)).
+
 ## Requirements
 
 - **MySQL 8.0+** on both ends
@@ -56,10 +62,58 @@ source privileges depend on the change feed:
   `REPLICATION SLAVE` + `REPLICATION CLIENT` privileges; plus `RELOAD` when
   the source does not have GTIDs enabled (the file+offset reader issues
   `FLUSH BINARY LOGS`)
+- No `ENUM` or `SET` member with a character outside `utf8mb3` (such as a
+  4-byte emoji). MySQL reports each such character as `?` in `SHOW CREATE
+  TABLE`, which sync replays to create the target table, so sync refuses the
+  table. A target table that exists already and stores such a member is
+  refused too. Reading the members MySQL stores needs `CREATE TEMPORARY
+  TABLES` on the schema whenever a member is reported with a `?`.
 
 A source that cannot grant the built-in feed privileges must use a
 programmatically injected `change.Source`; the CLI no longer has a mode that
 runs without a change stream.
+
+## Schema objects
+
+Sync copies base tables only. Other schema objects are handled as follows:
+
+| Object | Source | Target |
+|---|---|---|
+| View | skipped, logged | allowed |
+| Procedure, function | logged | allowed |
+| Trigger | logged | refused if it is on a table sync writes to |
+| Event | logged | refused |
+
+- **Source views** are skipped. They have no primary key and hold no data of
+  their own.
+- **Source triggers, procedures, functions and events** do not stop the sync.
+  They are logged once at startup as not synced. The source stays live, and
+  rows that they write on the source reach the change stream as ordinary row
+  events (the built-in feed requires `binlog_format=ROW`), so the target still
+  receives those rows. Sync does not refuse them: there is no cutover, so
+  nothing is lost when sync stops. The startup log is
+  best-effort. If a query fails, for example on a source endpoint that is not
+  MySQL, sync logs the error at debug level and continues.
+- **Target triggers** on a synced table or on the sync checkpoint table are
+  refused. A trigger fires on every row sync applies, so rows could be written
+  twice or diverge from the source, and the checksum's repairs would then
+  contend with it. A trigger on a target table that sync does not write to is
+  ignored.
+- **Target events** in the target schema are refused. An event runs on its own
+  schedule and can write to the tables sync owns.
+- **Target views, procedures and functions** are allowed. They only run when
+  something invokes them, and sync never does.
+
+The target check runs at every start, a fresh sync and a resume, before sync
+creates, drops or writes any target table. `--force` does not bypass it: drop
+the trigger or event on the target and re-run. There is no re-check while the
+sync runs; the continuous checksum is the backstop for an object added later.
+
+The checks read `information_schema`, which lists only the objects the
+connecting user has a privilege on: a trigger needs `TRIGGER` on its table, an
+event needs `EVENT` on the schema, and a routine needs a routine privilege or
+global `SELECT`. Sync does not require these privileges. An object the user
+cannot see is not reported and not refused.
 
 ## Autoscaling
 
@@ -208,7 +262,8 @@ connections must refer to different databases, including when `--force` is set.
 The source table list defines what Sync owns: if a table copied by an earlier
 run has since been dropped from the source, `--force` does not discover or
 remove that stale target table. Remove such tables manually if they are no
-longer wanted. Intended for testing/iterating.
+longer wanted. Intended for testing/iterating. `--force` does not bypass the
+refusal of target triggers and events (see [Schema objects](#schema-objects)).
 
 ## GTID auto-detection
 

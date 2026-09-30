@@ -17,7 +17,7 @@ func init() {
 // Check the privileges of the user running the migration.
 // Ensure there is LOCK TABLES etc so we don't find out and get errors
 // at cutover time.
-func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
+func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 	// This is a re-implementation of the gh-ost check
 	// validateGrants() in gh-ost/go/logic/inspect.go
 	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload bool

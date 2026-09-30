@@ -93,6 +93,9 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 				return fmt.Errorf("table '%s' schema mismatch between source and target %d (%s); cannot resume safely. Schema may have changed since checkpoint was created. Reconcile the target to the source with: %s",
 					sourceTable.TableName, i, target.Config.DBName, diff)
 			}
+			if err := targetMisreportedEnumSetError(ctx, target, i, sourceTable.TableName); err != nil {
+				return err
+			}
 
 			logger.Debug("validated target table for resume",
 				"table", sourceTable.TableName,

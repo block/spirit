@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -16,11 +17,23 @@ import (
 
 const tableUnlockTimeout = 30 * time.Second
 
+// lockedStatementCompletionMargin is how long a statement whose outcome the
+// caller must know is waited for beyond the session's lock_wait_timeout. See
+// DBConfig.StatementCompletionTimeout.
+const lockedStatementCompletionMargin = 30 * time.Second
+
+// ErrStatementOutcomeUnknown marks a statement that ExecUnderLock sent to the
+// server but stopped waiting for. The server may have committed
+// it: the caller must check the server state before it acts on the failure.
+var ErrStatementOutcomeUnknown = errors.New("statement outcome unknown")
+
 type TableLock struct {
 	db       *sql.DB // the connection pool the lock was acquired on
 	mu       sync.Mutex
 	lockConn *sql.Conn
 	logger   *slog.Logger
+	// completionTimeout bounds each statement run by ExecUnderLock.
+	completionTimeout time.Duration
 }
 
 // NewTableLock creates a new server wide lock on multiple tables.
@@ -106,9 +119,10 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	logger.Warn("table lock(s) acquired")
 	acquired = true
 	return &TableLock{
-		db:       db,
-		lockConn: conn,
-		logger:   logger,
+		db:                db,
+		lockConn:          conn,
+		logger:            logger,
+		completionTimeout: config.StatementCompletionTimeout(),
 	}, nil
 }
 
@@ -154,7 +168,22 @@ func (s *TableLock) DB() *sql.DB {
 	return s.db
 }
 
-// ExecUnderLock executes a set of statements under a table lock.
+// ExecUnderLock executes statements on the locking session, in order.
+//
+// It does not start a statement once ctx is done. A statement it has started
+// runs to completion even if ctx is then cancelled: with a cancellable
+// context, a cancel during the statement would close the connection and
+// return context.Canceled, but the server can still commit the statement, so
+// the caller could not tell whether it took effect (issue #1338). Each
+// statement instead runs on a context detached from ctx's cancellation and
+// bounded by DBConfig.StatementCompletionTimeout. If that bound expires, the
+// error wraps ErrStatementOutcomeUnknown. The client closes the connection
+// then, but the server may still be running the statement: a read of the
+// server state that shows it did not take effect is not conclusive.
+//
+// A caller that must run its statements even after a cancel, such as the
+// rename that retires a source after a traffic switch, passes
+// context.WithoutCancel(ctx).
 func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -165,8 +194,17 @@ func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 		if stmt == "" {
 			continue
 		}
-		_, err := s.lockConn.ExecContext(ctx, stmt)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		execCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.completionTimeout)
+		_, err := s.lockConn.ExecContext(execCtx, stmt)
+		expired := execCtx.Err() != nil
+		cancel()
 		if err != nil {
+			if expired {
+				return fmt.Errorf("%w: %w", ErrStatementOutcomeUnknown, err)
+			}
 			return err
 		}
 	}

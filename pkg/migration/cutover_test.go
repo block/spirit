@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -293,11 +295,112 @@ func TestCutoverConnectionLossWithUnavailableOwnershipCheck(t *testing.T) {
 	cutover, _, _ := newConnectionLossCutover(t, "cutoverconnunknown")
 	ctx, cancel := context.WithCancel(t.Context())
 	cutover.testAfterRenameError = cancel
+	cutover.testRenameCompleted = func() (bool, error) {
+		return false, errors.New("injected: information_schema unavailable")
+	}
 
 	err := cutover.Run(ctx)
 
 	require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+// TestCutoverCancelWhileRenameOutcomeUnknown covers issue #1338: the run is
+// cancelled while the rename's outcome is unknown, and the server committed the
+// rename. Run must check the server state on a context that is not cancelled
+// and report the cutover as done, not as a plain cancellation.
+func TestCutoverCancelWhileRenameOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		tableName string
+		err       error
+	}{
+		{"connection lost", "cutovercancelconnloss", mysql.ErrInvalidConn},
+		{"completion bound expired", "cutovercancelbound", fmt.Errorf("%w: %w", dbconn.ErrStatementOutcomeUnknown, context.DeadlineExceeded)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cutover, db, _ := newConnectionLossCutover(t, tc.tableName)
+			cutover.testInjectRenameError = tc.err
+			ctx, cancel := context.WithCancel(t.Context())
+			cutover.testAfterRenameError = cancel
+
+			require.NoError(t, cutover.Run(ctx),
+				"a committed rename must be reported as success although the run was cancelled")
+			require.ErrorIs(t, ctx.Err(), context.Canceled)
+
+			var count int
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _"+tc.tableName+"_old").Scan(&count))
+			require.Equal(t, 2, count)
+		})
+	}
+}
+
+// TestCutoverCancelAfterUnconfirmedRename covers a cancel after an attempt
+// whose outcome is unknown, where the state check then reads "not renamed".
+// After a lost connection that reading is conclusive, and the run reports a
+// plain cancellation. After an expired completion bound it is not: the server
+// may still be running the rename, which can commit after the read. That run
+// must report ErrOwnershipAmbiguous.
+func TestCutoverCancelAfterUnconfirmedRename(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		tableName     string
+		err           error
+		wantAmbiguous bool
+	}{
+		{"connection lost", "cutoverunconfconnloss", mysql.ErrInvalidConn, false},
+		{"completion bound expired", "cutoverunconfbound", fmt.Errorf("%w: %w", dbconn.ErrStatementOutcomeUnknown, context.DeadlineExceeded), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cutover, _, _ := newConnectionLossCutover(t, tc.tableName)
+			cutover.testInjectRenameError = tc.err
+			cutover.testRenameCompleted = func() (bool, error) { return false, nil }
+			ctx, cancel := context.WithCancel(t.Context())
+			cutover.testAfterRenameError = cancel
+
+			err := cutover.Run(ctx)
+			require.ErrorIs(t, err, context.Canceled)
+			if tc.wantAmbiguous {
+				require.ErrorIs(t, err, status.ErrOwnershipAmbiguous)
+			} else {
+				require.NotErrorIs(t, err, status.ErrOwnershipAmbiguous)
+			}
+		})
+	}
+}
+
+// TestCutoverCancelBeforeRenameDoesNotRename checks the other side of #1338:
+// a cancel that arrives before the rename starts stops the cutover. The error
+// is a plain cancellation, not ErrOwnershipAmbiguous, and the tables are not
+// swapped.
+func TestCutoverCancelBeforeRenameDoesNotRename(t *testing.T) {
+	t.Parallel()
+	cutover, db, dbName := newConnectionLossCutover(t, "cutovercancelbefore")
+	cutover.testInjectRenameError = nil
+	// Skip carryAutoIncrements, which would otherwise be the first statement
+	// to see the cancel. The rename's own check must stop it.
+	cutover.config[0].keepNewAutoIncrement = true
+	ctx, cancel := context.WithCancel(t.Context())
+	cutover.checksUnderLock = func(context.Context) error {
+		cancel()
+		return nil
+	}
+
+	err := cutover.Run(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, status.ErrOwnershipAmbiguous)
+
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM cutovercancelbefore").Scan(&count))
+	require.Equal(t, 2, count, "the original table must not have been renamed away")
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = '_cutovercancelbefore_new'",
+		dbName).Scan(&count))
+	require.Equal(t, 1, count, "_new must still exist")
 }
 
 func newConnectionLossCutover(t *testing.T, tableName string) (*CutOver, *sql.DB, string) {
@@ -951,6 +1054,41 @@ func TestSkipDropAfterCutover(t *testing.T) {
 	require.NoError(t, m.Close())
 }
 
+// TestCancelAfterCutoverReportsSuccess covers the runner side of issue #1338:
+// a cancel that arrives once the cutover has committed must not turn the
+// migration into a reported failure, or leave a checkpoint that the next run
+// would try to resume from without a _new table.
+func TestCancelAfterCutoverReportsSuccess(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "cancelaftercutover", `CREATE TABLE cancelaftercutover (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(255) NOT NULL
+	)`)
+	testutils.RunSQL(t, "INSERT INTO cancelaftercutover (name) VALUES ('a'), ('b')")
+
+	m := NewTestRunner(t, "cancelaftercutover", "ENGINE=InnoDB")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var cutoverCommitted bool
+	m.testAfterCutover = func() {
+		cutoverCommitted = true
+		cancel()
+	}
+
+	require.NoError(t, m.Run(ctx), "a committed cutover must be reported as success")
+	require.True(t, cutoverCommitted, "the migration must have taken the cutover path")
+	require.True(t, m.Result().DurableMutation)
+	require.NoError(t, m.Close())
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN (?, ?)`,
+		"_cancelaftercutover_new", "_cancelaftercutover_chkpnt").Scan(&count))
+	require.Zero(t, count, "the _new and checkpoint tables must be dropped")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM cancelaftercutover").Scan(&count))
+	require.Equal(t, 2, count)
+}
+
 // TestDropAfterCutover tests that the old table is dropped when SkipDropAfterCutover is false.
 func TestDropAfterCutover(t *testing.T) {
 	t.Parallel()
@@ -1291,4 +1429,70 @@ func TestCutoverCancellationReleasesTableLocks(t *testing.T) {
 	// The failed flush must not have reached the rename.
 	_, err = db.ExecContext(probeCtx, "INSERT INTO _cutover_cancel_cleanup_new VALUES (1)")
 	require.NoError(t, err)
+}
+
+// TestCutOverChecksUnderLockRetryPolicy checks that only a refusal from the
+// checks under the table lock (check.ErrRefused) fails the cutover without a
+// retry. Any other error, such as a failed information_schema query, may be
+// transient and must take the normal retry path.
+func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		firstErr  error
+		wantCalls int
+		refused   bool
+	}{
+		{"transient error is retried", errors.New("failed to query information_schema: connection reset"), 2, false},
+		{"refusal is not retried", fmt.Errorf("%w: a trigger was created during the migration", check.ErrRefused), 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbName, _ := testutils.CreateUniqueTestDatabase(t)
+			testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE lockchk (id INT NOT NULL PRIMARY KEY, name VARCHAR(255) NOT NULL)")
+			testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE _lockchk_new (id INT NOT NULL PRIMARY KEY, name VARCHAR(255) NOT NULL)")
+			testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE _lockchk_chkpnt (a INT)") // for binlog advancement
+			testutils.RunSQLInDatabase(t, dbName, "INSERT INTO lockchk VALUES (1, 'a'), (2, 'b')")
+
+			cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(dbName))
+			require.NoError(t, err)
+			db, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			tbl := table.NewTableInfo(db, dbName, "lockchk")
+			require.NoError(t, tbl.SetInfo(t.Context()))
+			newTbl := table.NewTableInfo(db, dbName, "_lockchk_new")
+			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+			defer feed.Close()
+			chunker, err := table.NewChunker(tbl, table.ChunkerConfig{NewTable: newTbl})
+			require.NoError(t, err)
+			require.NoError(t, feed.AddSubscription(tbl, newTbl, chunker))
+			require.NoError(t, feed.Start(t.Context()))
+
+			dbConfig := dbconn.NewDBConfig()
+			dbConfig.MaxRetries = 3
+			cutover, err := NewCutOver(db, []*cutoverConfig{{table: tbl, newTable: newTbl, oldTableName: "_lockchk_old"}}, feed, dbConfig, slog.Default())
+			require.NoError(t, err)
+			var calls int
+			cutover.checksUnderLock = func(context.Context) error {
+				calls++
+				if calls == 1 {
+					return tc.firstErr
+				}
+				return nil
+			}
+			err = cutover.Run(t.Context())
+			require.Equal(t, tc.wantCalls, calls)
+			var n int
+			if tc.refused {
+				require.ErrorIs(t, err, errCutoverRefused)
+				require.ErrorIs(t, err, check.ErrRefused)
+				require.NoError(t, db.QueryRowContext(t.Context(),
+					"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_lockchk_old'", dbName).Scan(&n))
+				require.Zero(t, n, "the refused cutover must not rename")
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _lockchk_old").Scan(&n))
+			require.Equal(t, 2, n, "the retried cutover must complete")
+		})
+	}
 }

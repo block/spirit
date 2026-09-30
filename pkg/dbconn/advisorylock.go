@@ -38,7 +38,9 @@ type AdvisoryLock struct {
 	// reconnection failures deterministically; production leaves it nil.
 	// NewAdvisoryLock enforces the dedicated-pool invariants on whatever
 	// the factory returns, so the seam cannot weaken the lock semantics.
-	newDBConn func() (*sql.DB, error)
+	// ctx is the caller's context for the initial connection and the
+	// refresh loop's context for a reconnect.
+	newDBConn func(ctx context.Context) (*sql.DB, error)
 }
 
 func NewAdvisoryLock(ctx context.Context, dsn string, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger, optionFns ...func(*AdvisoryLock)) (*AdvisoryLock, error) {
@@ -86,14 +88,19 @@ func NewAdvisoryLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 	// the invariants are enforced here regardless of which factory ran:
 	// GET_LOCK is session scoped, so the pool must serve exactly one
 	// connection and must never recycle it client-side.
-	dial := func() (*sql.DB, error) {
-		return New(dsn, &dbConfig)
+	//
+	// dial takes a context so a reconnect in the refresh loop ends when the
+	// lock is closed. Without it, Close waits for the reconnect's ping, which
+	// is only bounded by connectTimeout when the server accepts the TCP
+	// connection but never completes the handshake.
+	dial := func(ctx context.Context) (*sql.DB, error) {
+		return NewContext(ctx, dsn, &dbConfig)
 	}
 	if lock.newDBConn != nil {
 		dial = lock.newDBConn // test seam, see AdvisoryLock.newDBConn
 	}
-	newConnection := func() (*sql.DB, error) {
-		db, err := dial()
+	newConnection := func(ctx context.Context) (*sql.DB, error) {
+		db, err := dial(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -108,7 +115,7 @@ func NewAdvisoryLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 		return db, nil
 	}
 	var err error
-	lock.db, err = newConnection()
+	lock.db, err = newConnection(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +190,7 @@ func NewAdvisoryLock(ctx context.Context, dsn string, tables []*table.TableInfo,
 				// (nil, err) and lock.db stays nil; the next tick then lands
 				// back here and retries the connection first, instead of
 				// dereferencing the nil pool in getLocks.
-				if lock.db, err = newConnection(); err != nil {
+				if lock.db, err = newConnection(ctx); err != nil {
 					logger.Warn("could not re-establish database connection", "error", err)
 					continue
 				}

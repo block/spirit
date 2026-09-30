@@ -1,7 +1,6 @@
 package dbconn
 
 import (
-	"log/slog"
 	"strings"
 	"testing"
 
@@ -16,9 +15,12 @@ func TestActivateAllRolesOnLogin(t *testing.T) {
 	var value string
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@global.activate_all_roles_on_login").Scan(&value))
 	want := value == "1" || strings.EqualFold(value, "ON")
-	require.Equal(t, want, ActivateAllRolesOnLogin(t.Context(), db, slog.Default()))
+	got, err := ActivateAllRolesOnLogin(t.Context(), db)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
 
-	// A failed read (here: a closed pool) reports false rather than an error.
+	// A failed read (here: a closed pool) is an error, not false.
 	require.NoError(t, db.Close())
-	require.False(t, ActivateAllRolesOnLogin(t.Context(), db, slog.Default()))
+	_, err = ActivateAllRolesOnLogin(t.Context(), db)
+	require.ErrorContains(t, err, "could not read activate_all_roles_on_login")
 }

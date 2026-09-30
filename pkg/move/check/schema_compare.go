@@ -3,9 +3,12 @@ package check
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
 )
 
 // showCreateTable returns the SHOW CREATE TABLE statement for schema.table.
@@ -23,6 +26,20 @@ func showCreateTable(ctx context.Context, db *sql.DB, schema, table string) (str
 		return "", err
 	}
 	return createStmt, nil
+}
+
+// targetMisreportedEnumSetError refuses a target table that exists already
+// and has an ENUM or SET member that SHOW CREATE TABLE reports as '?' but
+// MySQL stores as a character outside utf8mb3. TargetSchemaDiff compares the
+// reported definitions, so such a target compares equal to a source whose
+// member really is '?' while storing a different one. tableCompatibilityCheck
+// refuses the same on every source, so when both pass, the comparison is
+// exact.
+func targetMisreportedEnumSetError(ctx context.Context, target applier.Target, targetIndex int, tableName string) error {
+	if err := table.MisreportedEnumSetErrorForTable(ctx, target.DB, target.Config.DBName, tableName); err != nil {
+		return fmt.Errorf("table '%s' exists on target %d (%s) but cannot be compared with the source: %w", tableName, targetIndex, target.Config.DBName, err)
+	}
+	return nil
 }
 
 // schemaDiff compares two CREATE TABLE statements and returns a runnable

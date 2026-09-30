@@ -28,6 +28,11 @@ var renameRetryWait = 1 * time.Second
 // that state cannot converge, so the retry loop aborts immediately.
 var errRenameRollbackFailed = errors.New("rename rollback failed")
 
+// errCutoverRefused marks a cutover attempt refused by a check that ran under
+// the source table locks. A retry would be refused for the same reason, so it
+// is not retried.
+var errCutoverRefused = errors.New("cutover refused")
+
 // CutoverResult reports authoritative evidence from a caller-owned cutover
 // callback, including failures after a durable mutation and failures whose
 // ownership outcome cannot be determined.
@@ -69,6 +74,15 @@ type CutOver struct {
 	// invoked again.
 	cutoverFuncSucceeded bool
 
+	// checksUnderLock, when set, runs under the source locks after the final
+	// flush and before preSwitch, the traffic switch and the rename. A
+	// refusal from it (check.ErrRefused) fails the cutover without a retry
+	// (errCutoverRefused); any other error is retried like a failed attempt.
+	// The locks
+	// keep out DDL that needs a metadata lock on the locked tables, such as a
+	// CREATE TRIGGER on them.
+	checksUnderLock func(ctx context.Context) error
+
 	// preSwitch runs under the source locks after the final flush and before
 	// traffic can reach the target. The runner carries the AUTO_INCREMENT
 	// counters over to the targets here, and reverse moves capture their start
@@ -80,6 +94,12 @@ type CutOver struct {
 	// before the source rename. It must run at most once.
 	postSwitch     func(ctx context.Context) error
 	postSwitchDone bool
+}
+
+// SetChecksUnderLock registers checks to run under the source locks after
+// the final flush and before the traffic switch. See CutOver.checksUnderLock.
+func (c *CutOver) SetChecksUnderLock(fn func(ctx context.Context) error) {
+	c.checksUnderLock = fn
 }
 
 // SetPreSwitch registers a hook after the final source flush and before the
@@ -166,6 +186,13 @@ func (c *CutOver) runWithRetries(ctx context.Context, runAttempt func(attempt in
 		}
 		err = runAttempt(attempt)
 		if err != nil {
+			if errors.Is(err, errCutoverRefused) {
+				// Refused before the traffic switch: the source is still live and
+				// a retry would be refused for the same reason.
+				c.logger.Error("cutover refused under the source table locks; not retrying",
+					"error", err.Error())
+				return err
+			}
 			if errors.Is(err, errRenameRollbackFailed) || errors.Is(err, status.ErrOwnershipAmbiguous) {
 				c.logger.Error("cutover rename left ownership unresolved; not retrying",
 					"error", err.Error())
@@ -276,6 +303,18 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 		}
 	}
 
+	if c.checksUnderLock != nil {
+		if err := c.checksUnderLock(ctx); err != nil {
+			// Only a refusal is final. Any other error (a failed query, a
+			// dropped connection) may be transient, so it takes the normal
+			// retry path.
+			if errors.Is(err, check.ErrRefused) {
+				return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			}
+			return fmt.Errorf("checks under the source locks: %w", err)
+		}
+	}
+
 	if c.preSwitch != nil {
 		if err := c.preSwitch(ctx); err != nil {
 			return fmt.Errorf("pre-switch hook failed: %w", err)
@@ -289,6 +328,16 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 		return err
 	}
 
+	// Traffic is now on the target, and the source locks are the only fence
+	// against straggler writes. Everything from here to the end of the source
+	// rename runs even if ctx is cancelled: a cancel that stopped the
+	// post-switch hook, a rename, its retry or a rollback would release the
+	// locks while a source still serves under its live name, or leave the
+	// sources partially renamed. Each statement under lock is bounded by
+	// TableLock.ExecUnderLock, and the post-switch hook by
+	// postCutoverCleanupTimeout.
+	afterSwitch := context.WithoutCancel(ctx)
+
 	// Reverse-window hook: after the traffic switch and before retiring the
 	// sources, persist the captured reverse-feed positions and record that the
 	// move has entered its reverse window. Runs once, under the source locks,
@@ -296,7 +345,10 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 	// routing switch has already succeeded, so (like a rename failure past that
 	// point) Run does not retry from the top and surfaces the error.
 	if c.postSwitch != nil && !c.postSwitchDone {
-		if err := c.postSwitch(ctx); err != nil {
+		hookCtx, cancel := context.WithTimeout(afterSwitch, postCutoverCleanupTimeout)
+		err := c.postSwitch(hookCtx)
+		cancel()
+		if err != nil {
 			return fmt.Errorf("reverse-window post-switch hook failed: %w", err)
 		}
 		c.postSwitchDone = true
@@ -315,13 +367,9 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 			c.logger.Warn("retrying rename while still holding source table locks",
 				"attempt", attempt,
 				"max-retries", c.dbConfig.MaxRetries)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(renameRetryWait):
-			}
+			time.Sleep(renameRetryWait)
 		}
-		if err = c.renameAllSources(ctx, sourceLocks); err == nil {
+		if err = c.renameAllSources(afterSwitch, sourceLocks); err == nil {
 			// Every source is renamed and the source locks are still held, so no
 			// write can be in flight. Stop the forward feeds inside that window
 			// rather than after the deferred unlock, where the first straggler
@@ -355,6 +403,9 @@ func (c *CutOver) stopSourceFeeds() {
 // rolling back the completed renames if a later source fails. A rollback
 // failure is wrapped with errRenameRollbackFailed because the sources are
 // then left partially renamed and a retry of the full rename cannot succeed.
+//
+// The caller passes a context that is not cancelled once traffic has switched;
+// see algorithmCutover.
 func (c *CutOver) renameAllSources(ctx context.Context, sourceLocks []*dbconn.TableLock) error {
 	var completedRenames []int
 	for i, src := range c.sources {
@@ -388,9 +439,9 @@ func (c *CutOver) renameAllSources(ctx context.Context, sourceLocks []*dbconn.Ta
 				return fmt.Errorf("%w: rename failed on source %d and rollback also failed (%s): %w",
 					errRenameRollbackFailed, i, strings.Join(rollbackErrors, "; "), err)
 			}
-			if dbconn.IsConnectionLossError(err) {
-				// The connection died, so the server may have committed this
-				// source's rename before the OK packet was lost. The earlier
+			if dbconn.IsOutcomeUnknown(err) {
+				// The connection died or the client stopped waiting, so the
+				// server may have committed this source's rename. The earlier
 				// sources have definitively been rolled back, but this one's
 				// state is unknown: retrying the whole rename could retire a
 				// source that is already retired.

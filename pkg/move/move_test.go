@@ -265,6 +265,60 @@ func TestEmptyDatabaseMove(t *testing.T) {
 	require.NoError(t, runner.Close())
 }
 
+// TestMoveCancelAfterCutoverReportsSuccess covers issue #1338 for move: a
+// cancel that arrives after the traffic switch must not stop the source rename
+// or the checkpoint drop, so the committed move is reported as a success.
+func TestMoveCancelAfterCutoverReportsSuccess(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "source_cancel_after_cutover"
+	dest := cfg.Clone()
+	dest.DBName = "dest_cancel_after_cutover"
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS source_cancel_after_cutover`)
+	testutils.RunSQL(t, `CREATE DATABASE source_cancel_after_cutover`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS dest_cancel_after_cutover`)
+	testutils.RunSQL(t, `CREATE DATABASE dest_cancel_after_cutover`)
+	t.Cleanup(func() {
+		testutils.RunSQL(t, `DROP DATABASE IF EXISTS source_cancel_after_cutover`)
+		testutils.RunSQL(t, `DROP DATABASE IF EXISTS dest_cancel_after_cutover`)
+	})
+	testutils.RunSQL(t, `CREATE TABLE source_cancel_after_cutover.t1 (id INT NOT NULL PRIMARY KEY, val VARCHAR(10))`)
+	testutils.RunSQL(t, `INSERT INTO source_cancel_after_cutover.t1 VALUES (1, 'a'), (2, 'b')`)
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:    src.FormatDSN(),
+		TargetDSN:    dest.FormatDSN(),
+		Threads:      2,
+		WriteThreads: 2,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runner.SetCutover(func(context.Context) error {
+		cancel() // the operator stops the move right after the switch
+		return nil
+	})
+
+	require.NoError(t, runner.Run(ctx), "a committed move must be reported as success")
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	require.NoError(t, runner.Close())
+
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var sourceTables string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT GROUP_CONCAT(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_schema = ?",
+		"source_cancel_after_cutover").Scan(&sourceTables))
+	require.Equal(t, "t1_old", sourceTables, "the source table must have been retired")
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+		"dest_cancel_after_cutover", checkpointTableName).Scan(&count))
+	require.Zero(t, count, "the checkpoint table must be dropped")
+}
+
 // TestMoveReservedWordPK is a regression test for issue #828. Moving a
 // table whose primary key contains columns named with MySQL reserved
 // words used to fail because the chunker_composite prefetch query joined
@@ -756,6 +810,90 @@ func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
 	}
 }
 
+// TestMoveRefusesEnumSetMembersOutsideUTF8MB3 checks that a source table with
+// an ENUM member that SHOW CREATE TABLE reports as '?' (a character outside
+// utf8mb3) is refused before anything is created on the target. The target
+// is created from that definition, so it would not have the member; with no
+// row using the member, the move used to complete and cut over without it.
+func TestMoveRefusesEnumSetMembersOutsideUTF8MB3(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	srcDB, destDB := "source_enum_4byte", "dest_enum_4byte"
+	for _, db := range []string{srcDB, destDB} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+		testutils.RunSQL(t, "CREATE DATABASE "+db)
+	}
+	t.Cleanup(func() {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+destDB)
+	})
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".t1 (id INT NOT NULL PRIMARY KEY, e ENUM('😀','a')) DEFAULT CHARSET=utf8mb4")
+	testutils.RunSQL(t, "INSERT INTO "+srcDB+".t1 VALUES (1, 'a'), (2, 'a')")
+
+	src, dest := cfg.Clone(), cfg.Clone()
+	src.DBName, dest.DBName = srcDB, destDB
+	move := &Move{
+		SourceDSN:    src.FormatDSN(),
+		TargetDSN:    dest.FormatDSN(),
+		Threads:      2,
+		WriteThreads: 2,
+	}
+	err = move.Run()
+	require.ErrorContains(t, err, `column "e" of table "t1" is enum('?','a'), but MySQL stores a member with a character outside utf8mb3 there`)
+	require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
+
+	db, err := sql.Open("block-mysql", dest.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+	require.Zero(t, n, "nothing may be created on the target")
+}
+
+// TestNtoMMoveRefusesMisreportedEnumSetOnLaterSource: the first source's
+// member really is '?', the second's is an emoji. Both report enum('?','a'),
+// so only the second source's own stored members can refuse the move. This
+// covers the runner passing every source's tables to the checks.
+func TestNtoMMoveRefusesMisreportedEnumSetOnLaterSource(t *testing.T) {
+	src0Name, src1Name, tgtName := "ntom_enum4b_src0", "ntom_enum4b_src1", "ntom_enum4b_dst"
+	for _, db := range []string{src0Name, src1Name, tgtName} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+		testutils.RunSQL(t, "CREATE DATABASE "+db)
+	}
+	t.Cleanup(func() {
+		for _, db := range []string{src0Name, src1Name, tgtName} {
+			testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+		}
+	})
+	testutils.RunSQLInDatabase(t, src0Name, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('?','a')) DEFAULT CHARSET=utf8mb4")
+	testutils.RunSQLInDatabase(t, src1Name, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('😀','a')) DEFAULT CHARSET=utf8mb4")
+
+	db, err := dbconn.New(testutils.DSNForDatabase(tgtName), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(tgtName))
+	require.NoError(t, err)
+	runner, err := NewRunner(&Move{
+		SourceDSNs:   []string{testutils.DSNForDatabase(src0Name), testutils.DSNForDatabase(src1Name)},
+		Targets:      []applier.Target{{DB: db, Config: cfg}},
+		Threads:      1,
+		WriteThreads: 1,
+		SourceTables: []string{"t"},
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	err = runner.Run(ctx)
+	require.ErrorContains(t, err, `table 't' on source 1 cannot be moved: column "e" of table "t" is enum('?','a'), but MySQL stores a member with a character outside utf8mb3 there`)
+
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", tgtName).Scan(&n))
+	require.Zero(t, n, "nothing may be created on the target")
+}
+
 // TestMoveRefusesUnsupportedNames checks that a move is refused before
 // anything is created on the target when a moved table's name, or the source
 // schema's name, contains a '.' or a backtick. The replication client tracks
@@ -820,4 +958,204 @@ func TestMoveRefusesUnsupportedNames(t *testing.T) {
 			require.Zero(t, n, "nothing may be created on the target")
 		})
 	}
+}
+
+// TestMoveRefusesSourceSchemaObjects checks that a move is refused before
+// anything is created on the target when a source schema contains a trigger,
+// a view, a stored procedure, a stored function or an event. Move copies none
+// of them, so the cutover would leave them behind on the retired source. The
+// whole schema is checked: an object unrelated to the moved tables is refused
+// too, also when only a subset of tables is moved. With more than one source,
+// every source is checked, not only the one the table list is read from.
+// A schema with no base tables, or a SourceTables entry that names a view, is
+// refused by the preflight check before discovery, instead of taking the
+// zero-table shortcut (which calls the cutover callback) or failing discovery
+// with a less specific error.
+func TestMoveRefusesSourceSchemaObjects(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		srcDBs       []string
+		on           int // index into srcDBs of the source that gets the object
+		noTables     bool
+		create       string
+		want         string
+		sourceTables []string
+	}{
+		{
+			name:   "trigger",
+			srcDBs: []string{"source_obj_trg"},
+			create: "CREATE TRIGGER orders_ai AFTER INSERT ON orders FOR EACH ROW INSERT INTO orders_audit (order_id) VALUES (NEW.id)",
+			want:   "trigger 'orders_ai' on table 'orders'",
+		},
+		{
+			// Before discovery listed base tables only, a view failed the move
+			// on its missing primary key before any check ran.
+			name:   "view",
+			srcDBs: []string{"source_obj_view"},
+			create: "CREATE VIEW orders_v AS SELECT id, v FROM orders",
+			want:   "view 'orders_v'",
+		},
+		{
+			name:   "procedure",
+			srcDBs: []string{"source_obj_proc"},
+			create: "CREATE PROCEDURE orders_p() SELECT COUNT(*) FROM orders",
+			want:   "procedure 'orders_p'",
+		},
+		{
+			name:   "function",
+			srcDBs: []string{"source_obj_func"},
+			create: "CREATE FUNCTION orders_f() RETURNS INT DETERMINISTIC RETURN 1",
+			want:   "function 'orders_f'",
+		},
+		{
+			name:   "event",
+			srcDBs: []string{"source_obj_event"},
+			create: "CREATE EVENT orders_e ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM orders",
+			want:   "event 'orders_e'",
+		},
+		{
+			name:         "trigger on a table outside the moved subset",
+			srcDBs:       []string{"source_obj_subset"},
+			create:       "CREATE TRIGGER orders_audit_ai AFTER INSERT ON orders_audit FOR EACH ROW UPDATE orders SET v = v + 1 WHERE id = NEW.order_id",
+			want:         "trigger 'orders_audit_ai' on table 'orders_audit'",
+			sourceTables: []string{"orders"},
+		},
+		{
+			name:   "second of two sources",
+			srcDBs: []string{"source_obj_a", "source_obj_b"},
+			on:     1,
+			create: "CREATE TRIGGER orders_ai AFTER INSERT ON orders FOR EACH ROW INSERT INTO orders_audit (order_id) VALUES (NEW.id)",
+			want:   "trigger 'orders_ai' on table 'orders'",
+		},
+		{
+			name:     "schema with only a view",
+			srcDBs:   []string{"source_obj_viewonly"},
+			noTables: true,
+			create:   "CREATE VIEW only_v AS SELECT 1 AS x",
+			want:     "view 'only_v'",
+		},
+		{
+			name:     "schema with only a procedure",
+			srcDBs:   []string{"source_obj_proconly"},
+			noTables: true,
+			create:   "CREATE PROCEDURE only_p() SELECT 1",
+			want:     "procedure 'only_p'",
+		},
+		{
+			name:         "view named in SourceTables",
+			srcDBs:       []string{"source_obj_viewsel"},
+			create:       "CREATE VIEW orders_v AS SELECT id, v FROM orders",
+			want:         "view 'orders_v'",
+			sourceTables: []string{"orders_v"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			destDB := "dest_obj_" + strings.ReplaceAll(tc.name, " ", "_")
+			if len(destDB) > 64 {
+				destDB = destDB[:64]
+			}
+			for _, db := range append([]string{destDB}, tc.srcDBs...) {
+				testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+				testutils.RunSQL(t, "CREATE DATABASE "+db)
+				t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db) })
+			}
+			var sourceDSNs []string
+			for i, db := range tc.srcDBs {
+				sourceDSNs = append(sourceDSNs, testutils.DSNForDatabase(db))
+				if tc.noTables {
+					continue
+				}
+				testutils.RunSQL(t, "CREATE TABLE "+db+".orders (id INT NOT NULL PRIMARY KEY, v INT)")
+				testutils.RunSQL(t, "CREATE TABLE "+db+".orders_audit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id INT)")
+				testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s.orders VALUES (%d, 1), (%d, 2)", db, 2*i+1, 2*i+2))
+			}
+			objDB := tc.srcDBs[tc.on]
+			testutils.RunSQLInDatabaseAsRoot(t, objDB, tc.create)
+
+			runner, err := NewRunner(&Move{
+				SourceDSNs:   sourceDSNs,
+				TargetDSN:    testutils.DSNForDatabase(destDB),
+				Threads:      2,
+				WriteThreads: 2,
+				SourceTables: tc.sourceTables,
+			})
+			require.NoError(t, err)
+			defer utils.CloseAndLog(runner)
+			var cutoverCalled bool
+			runner.SetCutover(func(context.Context) error { cutoverCalled = true; return nil })
+			err = runner.Run(t.Context())
+			require.False(t, cutoverCalled, "the cutover callback must not be called")
+			require.ErrorContains(t, err, "cannot move: move does not copy triggers, views, stored procedures, stored functions or events")
+			require.ErrorContains(t, err, "("+objDB+"): "+tc.want)
+			// --force wipes the target, which cannot remove a source object.
+			require.NotContains(t, err.Error(), "--force", "the refusal must not suggest --force")
+			require.NotContains(t, err.Error(), "primary key")
+			require.NotContains(t, err.Error(), "could not find all SourceTables")
+
+			db, err := sql.Open("block-mysql", testutils.DSN())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			var n int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+			require.Zero(t, n, "nothing may be created on the target")
+		})
+	}
+}
+
+// TestMoveRefusesUserThatCannotSeeRoutines checks that a move run by a user
+// who cannot see the source schema's stored routines is refused by the
+// privileges check. information_schema hides routines from such a user, so
+// without the requirement the source_schema_objects check would pass and the
+// move would leave the procedure behind on the retired source.
+func TestMoveRefusesUserThatCannotSeeRoutines(t *testing.T) {
+	const srcDB, destDB, user = "source_obj_hidden", "dest_obj_hidden", "testmovehiddenroutine"
+	for _, db := range []string{srcDB, destDB} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
+		testutils.RunSQL(t, "CREATE DATABASE "+db)
+		t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db) })
+	}
+	testutils.RunSQL(t, "CREATE TABLE "+srcDB+".orders (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQL(t, "INSERT INTO "+srcDB+".orders VALUES (1, 1), (2, 2)")
+	testutils.RunSQLInDatabaseAsRoot(t, srcDB, "CREATE PROCEDURE orders_p() SELECT COUNT(*) FROM orders")
+
+	// Everything a move needed before this requirement, plus EVENT, but no
+	// grant that shows routines (SHOW_ROUTINE, global SELECT, or a routine
+	// privilege).
+	for _, stmt := range []string{
+		"DROP USER IF EXISTS " + user,
+		"CREATE USER " + user,
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE, EVENT ON " + srcDB + ".* TO " + user,
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD, CONNECTION_ADMIN, PROCESS ON *.* TO " + user,
+		"GRANT SELECT ON performance_schema.* TO " + user,
+	} {
+		testutils.RunSQLInDatabaseAsRoot(t, "", stmt)
+	}
+	t.Cleanup(func() { testutils.RunSQLInDatabaseAsRoot(t, "", "DROP USER IF EXISTS "+user) })
+
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	runner, err := NewRunner(&Move{
+		SourceDSN:    fmt.Sprintf("%s:@tcp(%s)/%s", user, cfg.Addr, srcDB),
+		TargetDSN:    testutils.DSNForDatabase(destDB),
+		Threads:      2,
+		WriteThreads: 2,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+	var cutoverCalled bool
+	runner.SetCutover(func(context.Context) error { cutoverCalled = true; return nil })
+	err = runner.Run(t.Context())
+	require.ErrorContains(t, err, "insufficient privileges to run a move")
+	require.ErrorContains(t, err, "SHOW_ROUTINE on *.*")
+	require.NotContains(t, err.Error(), "EVENT on")
+	require.False(t, cutoverCalled, "the cutover callback must not be called")
+
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
+	require.Zero(t, n, "nothing may be created on the target")
 }

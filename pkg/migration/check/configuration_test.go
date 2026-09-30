@@ -2,9 +2,12 @@ package check
 
 import (
 	"database/sql"
+	"errors"
 	"log/slog"
 	"testing"
 
+	"github.com/block/mysql"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -33,4 +36,17 @@ func TestConfiguration(t *testing.T) {
 
 	err = configurationCheck(t.Context(), r, slog.Default())
 	require.NoError(t, err)
+}
+
+// TestPartialRevokesError covers the partial_revokes refusal without
+// SET GLOBAL (see TestConfiguration): ON refuses, OFF passes, a server
+// without the variable passes, and any other read error fails the check.
+func TestPartialRevokesError(t *testing.T) {
+	require.NoError(t, partialRevokesError("0", nil))
+	require.ErrorContains(t, partialRevokesError("1", nil), "partial_revokes must be OFF")
+	require.NoError(t, partialRevokesError("", &mysql.MySQLError{Number: parsermysql.ErrUnknownSystemVariable}))
+	accessDenied := &mysql.MySQLError{Number: parsermysql.ErrSpecificAccessDenied}
+	require.ErrorIs(t, partialRevokesError("", accessDenied), accessDenied)
+	connErr := errors.New("connection reset")
+	require.ErrorIs(t, partialRevokesError("", connErr), connErr)
 }

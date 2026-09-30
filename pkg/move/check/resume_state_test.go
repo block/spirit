@@ -317,3 +317,36 @@ func TestResumeStateCheckSchemaTypesAndCollation(t *testing.T) {
 		require.Contains(t, err.Error(), "schema mismatch")
 	})
 }
+
+// TestResumeStateCheckMisreportedEnumSetTarget checks that resume refuses a
+// target that stores an ENUM member that SHOW CREATE TABLE reports as '?',
+// which the schema comparison alone cannot tell from a source's real '?'.
+func TestResumeStateCheckMisreportedEnumSetTarget(t *testing.T) {
+	srcName, srcDB := createW3DDatabase(t)
+	tgtName, tgtDB := createW3DDatabase(t)
+	_, err := srcDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('?','a')) DEFAULT CHARSET=utf8mb4")
+	require.NoError(t, err)
+	_, err = tgtDB.ExecContext(t.Context(), `CREATE TABLE _spirit_move_checkpoint (
+		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		copier_watermark TEXT, checksum_watermark TEXT, binlog_position TEXT, statement TEXT,
+		original_table_name VARCHAR(64) NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)`)
+	require.NoError(t, err)
+	sourceTable := table.NewTableInfo(srcDB, srcName, "t")
+	require.NoError(t, sourceTable.SetInfo(t.Context()))
+	r := Resources{
+		Sources:      []SourceResource{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
+		Targets:      []applier.Target{{DB: tgtDB, Config: &mysql.Config{DBName: tgtName}}},
+		SourceTables: []*table.TableInfo{sourceTable},
+	}
+
+	_, err = tgtDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('😀','a')) DEFAULT CHARSET=utf8mb4")
+	require.NoError(t, err)
+	err = resumeStateCheck(t.Context(), r, slog.Default())
+	require.ErrorContains(t, err, `table 't' exists on target 0 (`+tgtName+`) but cannot be compared with the source: column "e" of table "t" is enum('?','a'), but MySQL stores a member with a character outside utf8mb3 there`)
+
+	_, err = tgtDB.ExecContext(t.Context(), "DROP TABLE t")
+	require.NoError(t, err)
+	_, err = tgtDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('?','a')) DEFAULT CHARSET=utf8mb4")
+	require.NoError(t, err)
+	require.NoError(t, resumeStateCheck(t.Context(), r, slog.Default()))
+}

@@ -26,6 +26,37 @@ func TestAddForeignKey(t *testing.T) {
 	require.NoError(t, err) // regular DDL
 }
 
+// TestAddForeignKeyInlineReference checks that a column declared with an
+// inline REFERENCES is refused. MySQL 8.0 ignores an inline REFERENCES, but
+// MySQL 9.0 creates a foreign key for it, so the new table would get one.
+func TestAddForeignKeyInlineReference(t *testing.T) {
+	for _, stmt := range []string{
+		"ALTER TABLE t1 ADD COLUMN customer_id INT REFERENCES customers (id)",
+		"ALTER TABLE t1 ADD COLUMN (a INT, customer_id INT REFERENCES customers (id))",
+		"ALTER TABLE t1 MODIFY customer_id INT REFERENCES customers (id)",
+		"ALTER TABLE t1 CHANGE cust_id customer_id INT REFERENCES customers (id)",
+		"ALTER TABLE t1 ADD INDEX (b), MODIFY customer_id INT NOT NULL REFERENCES customers (id) ON DELETE CASCADE",
+	} {
+		t.Run(stmt, func(t *testing.T) {
+			r := Resources{Statement: statement.MustNew(stmt)[0]}
+			err := addForeignKeyCheck(t.Context(), r, slog.Default())
+			require.ErrorContains(t, err, "adding foreign key constraints is not supported")
+			require.ErrorContains(t, err, `column "customer_id" is declared with an inline REFERENCES`)
+		})
+	}
+	// Columns without an inline REFERENCES are fine.
+	for _, stmt := range []string{
+		"ALTER TABLE t1 ADD COLUMN customer_id INT NOT NULL DEFAULT 0",
+		"ALTER TABLE t1 MODIFY customer_id BIGINT",
+		"ALTER TABLE t1 CHANGE cust_id customer_id INT COMMENT 'references customers (id)'",
+	} {
+		t.Run(stmt, func(t *testing.T) {
+			r := Resources{Statement: statement.MustNew(stmt)[0]}
+			require.NoError(t, addForeignKeyCheck(t.Context(), r, slog.Default()))
+		})
+	}
+}
+
 func TestHasForeignKey(t *testing.T) {
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)

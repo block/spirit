@@ -3,9 +3,12 @@ package check
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"testing"
 
+	"github.com/block/mysql"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -58,3 +61,19 @@ func TestConfigurationCheckMultipleSources(t *testing.T) {
 // values via an injectable struct (and is therefore unit-testable without
 // touching the server), we accept that the negative branches are exercised
 // only at startup against a real misconfigured server.
+
+// TestPartialRevokesError covers the partial_revokes refusal without
+// SET GLOBAL (see the comment above): ON refuses and names the source,
+// OFF passes, a server without the variable passes, and any other read
+// error fails the check and names the source.
+func TestPartialRevokesError(t *testing.T) {
+	require.NoError(t, partialRevokesError(0, "0", nil))
+	require.EqualError(t, partialRevokesError(2, "1", nil), "source 2: partial_revokes must be OFF for move operations")
+	require.NoError(t, partialRevokesError(0, "", &mysql.MySQLError{Number: parsermysql.ErrUnknownSystemVariable}))
+	accessDenied := &mysql.MySQLError{Number: parsermysql.ErrSpecificAccessDenied}
+	err := partialRevokesError(1, "", accessDenied)
+	require.ErrorIs(t, err, accessDenied)
+	require.ErrorContains(t, err, "source 1: ")
+	connErr := errors.New("connection reset")
+	require.ErrorIs(t, partialRevokesError(0, "", connErr), connErr)
+}

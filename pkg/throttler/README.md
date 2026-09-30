@@ -82,7 +82,10 @@ throttler := &throttler.Noop{}
 
 ### Mock Throttler
 
-A throttler used internally by the test suite to help reduce race conditions when running migration tests across different types of hardware. It injects 1 second of sleep every time `BlockWait()` is called.
+A throttler used internally by the test suite. It always reports throttled, and has two modes:
+
+- `&throttler.Mock{}` paces its caller: it injects 1 second of sleep every time `BlockWait()` is called. This helps reduce race conditions when running migration tests across different types of hardware.
+- `throttler.NewStallingMock(n)` stops its caller: the first `n` calls to `BlockWait()` return at once, and every later call blocks until its context is done. A copier using it copies `n` chunks and then holds, so a test can let a run make a known amount of progress and be sure it is still copying when the test stops it.
 
 ### Replication Throttler
 

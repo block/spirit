@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/migration/check"
+	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -1774,4 +1775,139 @@ func TestEnumSetBinaryMemberSpaces(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 		fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE b = 'b' OR b = '' OR FIND_IN_SET('y', s) > 0", tableName)).Scan(&stripped))
 	require.Zero(t, stripped, "no row may hold a member stripped of its spaces")
+}
+
+// TestEnumSetMembersOutsideUTF8MB3 migrates ENUM and SET columns with a member
+// character outside utf8mb3. information_schema reports each such character
+// as '?', which the enum reorder check compared the new members against (so
+// appending a member was refused as a reorder) and which the binlog decoder
+// wrote in place of the member (so a replayed change was rejected by the
+// column, aborting the migration, or took the '?' member).
+func TestEnumSetMembersOutsideUTF8MB3(t *testing.T) {
+	t.Parallel()
+	tableName := "enum4b_mig"
+	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf(`CREATE TABLE %s (
+		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		e enum('😀','a') NOT NULL,
+		q enum('😀','?') NOT NULL,
+		s set('🎉','x') NOT NULL
+	) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`, tableName))
+	tt.SeedRows(t, fmt.Sprintf("INSERT INTO %s (e, q, s) SELECT 'a', '?', 'x'", tableName), 200)
+
+	// Making the columns nullable is not an INSTANT change, so the rows are
+	// copied into a shadow table.
+	m := NewTestRunner(t, tableName, "MODIFY e enum('😀','a','c') NULL, MODIFY q enum('😀','?','c') NULL, MODIFY s set('🎉','x','z') NULL",
+		WithThreads(1),
+		WithTestThrottler(),
+		WithSkipDropAfterCutover())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	dmlDone := make(chan struct{})
+	go func() {
+		defer close(dmlDone)
+		if !waitForCopyRows(t, ctx, m) {
+			return
+		}
+		for i := 1; i <= 20; i++ {
+			if ctx.Err() != nil {
+				return
+			}
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s (e, q, s) VALUES ('😀', '😀', '🎉,x')", tableName))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET e = '😀', q = '😀', s = '🎉' WHERE id = %d", tableName, i))
+		}
+	}()
+
+	require.NoError(t, m.Run(ctx))
+	cancel()
+	<-dmlDone
+	require.NoError(t, m.Close())
+
+	oldName := m.changes[0].oldTableName()
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS `"+oldName+"`") })
+	var oldTables int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='test' AND table_name=?`, oldName).Scan(&oldTables))
+	require.Equal(t, 1, oldTables, "the migration must have copied the rows")
+
+	// The source is kept (WithSkipDropAfterCutover), so every row can be
+	// compared with the one it was copied from, by stored bytes.
+	var differ int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s n LEFT JOIN `%s` o USING (id) WHERE o.id IS NULL OR HEX(n.e) <> HEX(o.e) OR HEX(n.q) <> HEX(o.q) OR HEX(n.s) <> HEX(o.s)",
+		tableName, oldName)).Scan(&differ))
+	require.Zero(t, differ)
+	var emoji int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s WHERE HEX(e) = 'F09F9880'", tableName)).Scan(&emoji))
+	require.Positive(t, emoji)
+}
+
+// TestEnumSetEscapedMembersDML covers ENUM and SET members that hold a
+// backslash, newline, carriage return, NUL or single quote. information_schema
+// reports those characters escaped in column_type (a backslash as \\, a
+// newline as \n), and the binlog decoder maps an ordinal or bitmask to that
+// text. A replayed change to such a member therefore wrote the escaped text,
+// which is not a member: MySQL warned (1265) and the migration aborted. A
+// member of a binary-charset column that is not valid utf8mb3 is reported as
+// a hex literal, which the parser refused, so no migration of such a table
+// could start.
+// ENGINE=InnoDB copies the table without changing the columns.
+func TestEnumSetEscapedMembersDML(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	tableName := "enumesc_mig"
+	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(`CREATE TABLE %s (
+		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		e enum('a\\b','c','nl\nx','cr\rx','nul\0x','q''x') NOT NULL,
+		s set('a\\b','x','nl\nx') NOT NULL,
+		b enum(x'5c', x'815c', 'c', x'f09f9880', x'00', x'e9') CHARACTER SET binary NOT NULL
+	) DEFAULT CHARSET=utf8mb4`, tableName))
+	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (e, s, b) VALUES ('c','x','c'), ('c','x','c'), ('c','x','c'), ('c','x','c'), ('c','x','c')", tableName))
+
+	// The cutover waits for the sentinel to be dropped, and the copy has
+	// finished by then. So each write below happens after the copy and before
+	// the cutover, and reaches the new table only through binlog replay.
+	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
+		WithDBName(dbName),
+		WithThreads(1),
+		WithDeferCutOver(),
+		WithRespectSentinel(),
+		WithSkipDropAfterCutover())
+	running := startTestRun(t, m.Run, m.Close)
+	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
+
+	// Each member with an escaped character, as a SQL literal. The members
+	// of b other than 'c' are not valid utf8mb3, so information_schema
+	// reports them as hex literals.
+	updates := []struct{ e, s, b string }{
+		{`'a\\b'`, `'a\\b'`, `x'5c'`},
+		{`'nl\nx'`, `'a\\b,nl\nx'`, `x'815c'`},
+		{`'cr\rx'`, `'nl\nx'`, `x'f09f9880'`},
+		{`'nul\0x'`, `'x,nl\nx'`, `x'00'`},
+		{`'q''x'`, `'a\\b,x'`, `x'e9'`},
+	}
+	for i, u := range updates {
+		// Rows 1-5 were copied, so the UPDATE is replayed; rows 6-10 are new.
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("UPDATE %s SET e = %s, s = %s, b = %s WHERE id = %d", tableName, u.e, u.s, u.b, i+1))
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (id, e, s, b) VALUES (%d, %s, %s, %s)", tableName, i+6, u.e, u.s, u.b))
+	}
+	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
+	require.NoError(t, running.wait(t))
+
+	for i, u := range updates {
+		for _, id := range []int{i + 1, i + 6} {
+			var match int
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE id = %d AND e = %s AND s = %s AND b = %s", tableName, id, u.e, u.s, u.b)).Scan(&match))
+			require.Equal(t, 1, match, "row %d must hold e=%s, s=%s, b=%s", id, u.e, u.s, u.b)
+		}
+	}
+	// The source is kept (WithSkipDropAfterCutover), so every row can be
+	// compared with the one it was copied from, by stored bytes.
+	var differ int
+	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s n LEFT JOIN `%s` o USING (id) WHERE o.id IS NULL OR HEX(n.e) <> HEX(o.e) OR HEX(n.s) <> HEX(o.s) OR HEX(n.b) <> HEX(o.b)",
+		tableName, m.changes[0].oldTableName())).Scan(&differ))
+	require.Zero(t, differ)
 }
