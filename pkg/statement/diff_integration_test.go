@@ -1549,3 +1549,19 @@ func TestDiffIntegrationCharUTF8MB4DefaultIgnoreCharsetCollation(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT HEX(b) FROM diff_mb4def_ignore_charset WHERE id = 1").Scan(&stored))
 	require.Equal(t, "D83DDE00", stored, "the utf16 encoding of the character")
 }
+
+// TestDiffIntegrationTinyint1UnsignedConverges verifies that a table created
+// from tinyint(1) unsigned diffs clean against that schema: MySQL keeps the
+// width only on the signed tinyint(1) and stores tinyint unsigned. Under
+// ZEROFILL the width is kept.
+func TestDiffIntegrationTinyint1UnsignedConverges(t *testing.T) {
+	const declaredSQL = "CREATE TABLE diff_tinyint1_unsigned (id int NOT NULL, a tinyint(1) unsigned, b tinyint(1), c tinyint(1) unsigned zerofill, PRIMARY KEY (id))"
+	tt := testutils.NewTestTable(t, "diff_tinyint1_unsigned", declaredSQL)
+
+	liveSQL := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, liveSQL, "`a` tinyint unsigned DEFAULT NULL")
+	require.Contains(t, liveSQL, "`b` tinyint(1) DEFAULT NULL")
+	require.Contains(t, liveSQL, "`c` tinyint(1) unsigned zerofill DEFAULT NULL")
+	requireConverged(t, tt.DB, tt.Name, declaredSQL)
+	requireNoSelfDiff(t, tt.DB, tt.Name)
+}

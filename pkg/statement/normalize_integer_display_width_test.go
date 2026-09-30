@@ -18,9 +18,12 @@ func TestStripIntegerDisplayWidth(t *testing.T) {
 		{"CREATE TABLE t (a smallint(6))", nil},
 		{"CREATE TABLE t (a mediumint(9))", nil},
 		{"CREATE TABLE t (a tinyint(4))", nil},
-		{"CREATE TABLE t (a tinyint(1))", new(1)},                 // BOOLEAN form, preserved
-		{"CREATE TABLE t (a boolean)", new(1)},                    // folds to tinyint(1)
-		{"CREATE TABLE t (a int(10) unsigned zerofill)", new(10)}, // width kept under zerofill
+		{"CREATE TABLE t (a tinyint(1))", new(1)},       // BOOLEAN form, preserved
+		{"CREATE TABLE t (a boolean)", new(1)},          // folds to tinyint(1)
+		{"CREATE TABLE t (a tinyint(1) unsigned)", nil}, // MySQL keeps the width only on the signed form
+		{"CREATE TABLE t (a int1(1) unsigned)", nil},
+		{"CREATE TABLE t (a tinyint(1) unsigned zerofill)", new(1)}, // width kept under zerofill
+		{"CREATE TABLE t (a int(10) unsigned zerofill)", new(10)},   // width kept under zerofill
 		{"CREATE TABLE t (a int(0))", nil},
 		{"CREATE TABLE t (a tinyint(0))", nil},
 		{"CREATE TABLE t (a int(0) zerofill)", new(10)}, // MySQL substitutes the unsigned default width

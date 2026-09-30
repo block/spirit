@@ -12,7 +12,9 @@ func init() { registerNormalizer(integerDisplayWidthNormalizer{}) }
 // makes the unspecified and specified spellings converge (INT == INT(11)).
 //
 // Two widths are preserved, because MySQL preserves them:
-//   - tinyint(1): the canonical BOOLEAN form (also how the parser folds BOOL).
+//   - signed tinyint(1): the canonical BOOLEAN form (also how the parser folds
+//     BOOL). MySQL keeps the width only on the signed form: tinyint(1) unsigned
+//     is stored as tinyint unsigned, so its width is stripped.
 //   - any integer with ZEROFILL: the width drives the zero-padding, so it is
 //     semantically meaningful and kept in SHOW CREATE TABLE. Two ZEROFILL
 //     widths are rewritten to the type's default *unsigned* width, because
@@ -47,8 +49,8 @@ func (integerDisplayWidthNormalizer) Normalize(ct *CreateTable) *CreateTable {
 			}
 			continue // width is meaningful under ZEROFILL
 		}
-		if c.Type == "tinyint" && c.Length != nil && *c.Length == 1 {
-			continue // tinyint(1) is preserved by MySQL
+		if c.Type == "tinyint" && c.Length != nil && *c.Length == 1 && (c.Unsigned == nil || !*c.Unsigned) {
+			continue // signed tinyint(1) is preserved by MySQL
 		}
 		c.Length = nil
 	}
