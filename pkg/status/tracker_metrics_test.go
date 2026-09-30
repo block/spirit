@@ -146,6 +146,52 @@ func TestTrackerReportsPhaseCompletionOnce(t *testing.T) {
 	require.InDelta(t, tracker.Duration(CopyRows).Seconds(), seconds[1], 0.001)
 }
 
+// TestTrackerReportsZeroDurationPhaseCompletion pins that a phase entered and
+// left within one clock tick is still reported as completed, with a zero
+// duration, both when the next transition closes it (enter) and when its own
+// bracket does (Do's exit).
+func TestTrackerReportsZeroDurationPhaseCompletion(t *testing.T) {
+	sink := &recordingSink{}
+	frozen := time.Now()
+	tracker := Tracker{now: func() time.Time { return frozen }}
+	tracker.SetMetricsSink(sink, nil)
+
+	tracker.Begin()
+	require.NoError(t, tracker.Do(CopyRows, func() error { return nil }))
+	tracker.Set(Close)
+
+	require.Equal(t,
+		[]float64{float64(Initial), float64(CopyRows)},
+		sink.values(metrics.WorkflowPhaseCompletedMetricName))
+	require.Equal(t, []float64{0, 0}, sink.values(metrics.WorkflowPhaseSecondsMetricName))
+}
+
+// TestTrackerDoesNotReportBracketClosedByLaterTransition pins that a Do whose
+// interval was already closed by a nested Do or a Set reports nothing at its
+// own exit, even when every duration is zero, so a phase is never reported
+// twice.
+func TestTrackerDoesNotReportBracketClosedByLaterTransition(t *testing.T) {
+	sink := &recordingSink{}
+	frozen := time.Now()
+	tracker := Tracker{now: func() time.Time { return frozen }}
+	tracker.SetMetricsSink(sink, nil)
+
+	tracker.Begin()
+	require.NoError(t, tracker.Do(CopyRows, func() error {
+		return tracker.Do(Checksum, func() error { return nil })
+	}))
+	require.NoError(t, tracker.Do(CutOver, func() error {
+		tracker.Set(ErrCleanup)
+		return nil
+	}))
+
+	require.Equal(t,
+		[]float64{float64(Initial), float64(CopyRows), float64(Checksum), float64(CutOver)},
+		sink.values(metrics.WorkflowPhaseCompletedMetricName),
+		"the outer CopyRows and CutOver brackets were closed by later transitions")
+	require.Equal(t, []float64{0, 0, 0, 0}, sink.values(metrics.WorkflowPhaseSecondsMetricName))
+}
+
 // TestTrackerPhaseBatchCorrelatesPhaseAndDuration pins the batch contract the
 // sink relies on: a completion batch carries the phase and its duration
 // together, since there is nowhere else to put the phase.
