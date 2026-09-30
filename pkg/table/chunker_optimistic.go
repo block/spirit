@@ -919,6 +919,11 @@ func (t *chunkerOptimistic) NoteBufferedKey(key0 any) {
 		// KeyAboveHighWatermark never discards once the final chunk is out.
 		return
 	}
+	if !t.isOpen {
+		// chunkPtr has no type yet, so key0 cannot be converted.
+		t.noteBufferedKey(Datum{}, ErrChunkerNotOpen, Datum{}, t.Ti.QuotedTableName, t.logger)
+		return
+	}
 	keyDatum, err := NewDatum(key0, t.chunkPtr.Tp)
 	t.noteBufferedKey(keyDatum, err, t.chunkPtr, t.Ti.QuotedTableName, t.logger)
 }

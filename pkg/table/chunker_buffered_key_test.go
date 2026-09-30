@@ -17,6 +17,14 @@ import (
 // and so on.
 func newBufferedKeyChunker4Test(t *testing.T) *chunkerOptimistic {
 	t.Helper()
+	chunker := newUnopenedBufferedKeyChunker4Test()
+	require.NoError(t, chunker.Open())
+	return chunker
+}
+
+// newUnopenedBufferedKeyChunker4Test is newBufferedKeyChunker4Test without
+// the Open.
+func newUnopenedBufferedKeyChunker4Test() *chunkerOptimistic {
 	t1 := newTableInfo4Test("test", "t1")
 	t1.minValue = Datum{Val: int64(1), Tp: signedType}
 	t1.maxValue = Datum{Val: int64(4000), Tp: signedType}
@@ -35,7 +43,6 @@ func newBufferedKeyChunker4Test(t *testing.T) *chunkerOptimistic {
 		logger:            slog.Default(),
 	}
 	chunker.SetDynamicChunking(false)
-	require.NoError(t, chunker.Open())
 	return chunker
 }
 
@@ -202,6 +209,60 @@ func TestCompositeNoteBufferedKey(t *testing.T) {
 	// Inside the dispatched range: nothing recorded.
 	comp.NoteBufferedKey(500)
 	require.True(t, comp.KeyAboveHighWatermark(1401))
+}
+
+// TestNoteBufferedKeyUnopenedChunker: a subscription can be given a chunker
+// that is never opened (move's reverse feed does this). NoteBufferedKey must
+// fail closed, turning the discard off, without logging at Error.
+func TestNoteBufferedKeyUnopenedChunker(t *testing.T) {
+	newLogger := func(buf *bytes.Buffer) *slog.Logger {
+		return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
+
+	t.Run("optimistic", func(t *testing.T) {
+		chunker := newUnopenedBufferedKeyChunker4Test()
+		var buf bytes.Buffer
+		chunker.logger = newLogger(&buf)
+		chunker.NoteBufferedKey(3500)
+		require.True(t, chunker.bufferedHighUnknown)
+		require.True(t, chunker.bufferedHighPtr.IsNil())
+		require.NotContains(t, buf.String(), "level=ERROR")
+		require.Contains(t, buf.String(), "level=DEBUG")
+
+		// Opening later does not re-enable the discard.
+		require.NoError(t, chunker.Open())
+		_, err := chunker.Next()
+		require.NoError(t, err)
+		_, err = chunker.Next()
+		require.NoError(t, err)
+		require.False(t, chunker.KeyAboveHighWatermark(3999))
+	})
+
+	t.Run("composite", func(t *testing.T) {
+		testutils.RunSQL(t, "DROP TABLE IF EXISTS composite_note_unopened_t1")
+		testutils.RunSQL(t, `CREATE TABLE composite_note_unopened_t1 (id int NOT NULL, PRIMARY KEY (id))`)
+		t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS composite_note_unopened_t1") })
+		db, err := sql.Open("block-mysql", testutils.DSN())
+		require.NoError(t, err)
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Logf("failed to close db: %v", err)
+			}
+		}()
+		tbl := NewTableInfo(db, "test", "composite_note_unopened_t1")
+		require.NoError(t, tbl.SetInfo(t.Context()))
+		var buf bytes.Buffer
+		chunker, err := NewChunker(tbl, ChunkerConfig{Logger: newLogger(&buf)})
+		require.NoError(t, err)
+		require.IsType(t, &chunkerComposite{}, chunker)
+		comp := chunker.(*chunkerComposite)
+
+		comp.NoteBufferedKey(int32(1400))
+		require.True(t, comp.bufferedHighUnknown)
+		require.True(t, comp.discardSuppressedByBufferedKey(Datum{Val: int64(5000), Tp: signedType}, comp.logger))
+		require.NotContains(t, buf.String(), "level=ERROR")
+		require.Contains(t, buf.String(), "level=DEBUG")
+	})
 }
 
 func TestMockChunkerNoteBufferedKey(t *testing.T) {

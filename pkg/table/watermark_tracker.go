@@ -1,6 +1,7 @@
 package table
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 )
@@ -57,8 +58,17 @@ func (w *watermarkTracker) noteBufferedKey(key Datum, convErr error, dispatchPtr
 		return
 	}
 	if convErr != nil {
-		logger.Error("failed to create datum in NoteBufferedKey; disabling the above-high-watermark discard", "table", tableName, "error", convErr)
+		// Fail closed either way: a key that could not be recorded must never
+		// let a later discard drop a change for it.
 		w.bufferedHighUnknown = true
+		if errors.Is(convErr, ErrChunkerNotOpen) {
+			// Expected for a subscription whose chunker is never opened
+			// (for example move's reverse feed, which never copies and runs
+			// with the optimization off), so not an error.
+			logger.Debug("NoteBufferedKey on a chunker that is not open; disabling the above-high-watermark discard", "table", tableName)
+			return
+		}
+		logger.Error("failed to create datum in NoteBufferedKey; disabling the above-high-watermark discard", "table", tableName, "error", convErr)
 		return
 	}
 	// Same boundary as KeyNotYetDispatched: dispatchPtr itself has not been

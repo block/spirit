@@ -648,10 +648,10 @@ func (t *chunkerComposite) NoteBufferedKey(key0 any) {
 		err      error
 	)
 	switch {
+	case !t.isOpen || len(t.chunkKeys) == 0:
+		err = ErrChunkerNotOpen
 	case len(t.chunkPtrs) > 0:
 		keyDatum, err = NewDatum(key0, t.chunkPtrs[0].Tp)
-	case len(t.chunkKeys) == 0:
-		err = ErrChunkerNotOpen
 	default:
 		// Nothing dispatched yet: use the type Next() will give chunkPtrs[0].
 		var tp datumTp
