@@ -674,6 +674,9 @@ func TestDDLNotificationTriggerAndForeignKey(t *testing.T) {
 	for clientName, newClient := range clients {
 		for ddlName, ddl := range ddls {
 			t.Run(clientName+"/"+ddlName, func(t *testing.T) {
+				if clientName == "gtid" {
+					skipUnlessGTIDEnabled(t)
+				}
 				testutils.RunSQL(t, "DROP TABLE IF EXISTS ddltrgfk_child, ddltrgfk_t1, ddltrgfk_t2")
 				testutils.RunSQL(t, "CREATE TABLE ddltrgfk_t1 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
 				testutils.RunSQL(t, "CREATE TABLE ddltrgfk_t2 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
