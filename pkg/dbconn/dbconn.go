@@ -22,6 +22,9 @@ import (
 const (
 	errLockWaitTimeout = 1205
 	errDeadlock        = 1213
+	// errKillDenied is ER_KILL_DENIED_ERROR: the user may not kill a session
+	// it does not own.
+	errKillDenied = 1095
 	// errCannotConnect (2003) and errConnLost (2013) are client-library CR_*
 	// codes: go-sql-driver itself never returns them as a *mysql.MySQLError
 	// (client-side failures surface as driver.ErrBadConn or
@@ -459,15 +462,17 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 			}
 			return result.err
 		}
-		// The kill step never ends a LOCK TABLES session, so another attempt
-		// succeeds only if that session happens to unlock in time. Until
-		// then its exclusive metadata lock request queues for a full lock
-		// wait timeout again, blocking reads and writes to the table.
-		if errors.Is(result.killErr, ErrTableLockFound) {
-			logger.Warn("not retrying statement after lock wait timeout: an explicit table lock blocks it, and force-kill does not end LOCK TABLES sessions",
+		// A blocker the kill could not end is still there for the next
+		// attempt, whose kill cannot end it either. That attempt succeeds only
+		// if the blocker happens to finish in time. Until then its exclusive
+		// metadata lock request queues for a full lock wait timeout again,
+		// blocking reads and writes to the table.
+		if reason, survives := blockerSurvivesKill(result); survives {
+			logger.Warn("not retrying statement after lock wait timeout: "+reason,
 				"attempt", attempt,
 				"max_attempts", attempts,
 				"error", result.err,
+				"kill_error", result.killErr,
 			)
 			return result.err
 		}
@@ -634,6 +639,22 @@ func untilNextCheck(now, lastNotWaiting time.Time, delay time.Duration, waiting 
 		return max(untilDelay, 0)
 	}
 	return killPollInterval
+}
+
+// blockerSurvivesKill reports whether the attempt's kill left a blocker that
+// no kill ends, and why. It does not cover a kill that found nothing to end:
+// that blocker may have finished on its own, or a new one taken its place,
+// and the next attempt's kill handles either.
+func blockerSurvivesKill(a forceExecAttempt) (reason string, survives bool) {
+	switch {
+	case errors.Is(a.killErr, ErrTableLockFound):
+		return "an explicit table lock blocks it, and force-kill does not end LOCK TABLES sessions", true
+	case errors.Is(a.killErr, errHeavyTransactionSkipped):
+		return "a blocking transaction is too heavy to roll back safely, and force-kill does not end it", true
+	case errors.Is(a.killErr, &mysql.MySQLError{Number: errKillDenied}):
+		return "the user may not kill a blocking session: it needs CONNECTION_ADMIN or SUPER", true
+	}
+	return "", false
 }
 
 func shouldRetryForceExecAfterKill(err error, killAttempted bool) bool {
