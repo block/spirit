@@ -1723,13 +1723,16 @@ func TestResumeFromCheckpointRefusesSourceTrigger(t *testing.T) {
 	require.True(t, tableExists(t, ctl, dstDB, checkpointTableName), "the checkpoint must survive the refusal")
 
 	// --force must not wipe the target over a failure that wiping cannot fix.
+	// The preflight registration refuses before the resume decision is made,
+	// so --force never gets as far as the wipe. (Without it, the resume
+	// registration makes decideResume refuse to wipe the target.)
 	forced := *move
 	forced.Force = true
 	r, err = NewRunner(&forced)
 	require.NoError(t, err)
 	err = r.Run(t.Context())
-	require.ErrorContains(t, err, "refusing to wipe the target")
 	require.ErrorContains(t, err, want)
+	require.NotContains(t, err.Error(), "--force")
 	require.NoError(t, r.Close())
 	require.True(t, tableExists(t, ctl, dstDB, checkpointTableName), "--force must not wipe the target")
 	require.True(t, tableExists(t, ctl, dstDB, "t1"), "--force must not wipe the target")

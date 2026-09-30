@@ -25,6 +25,7 @@ create user if not exists tsandbox@'%' identified with caching_sha2_password by 
 grant R_MIGRATOR, R_REPLICATION, R_FORCEKILL to tsandbox@'%';
 grant references on *.* to tsandbox@'%'; -- used in tests
 grant system_variables_admin on *.* to tsandbox@'%'; -- replaces SUPER, available since MySQL 8.0
+grant event on *.* to tsandbox@'%'; -- move's privileges check requires EVENT (to see the source schema's events); routines are visible through R_MIGRATOR's global SELECT
 set default role R_MIGRATOR, R_REPLICATION, R_FORCEKILL to tsandbox@'%';
 
 flush privileges;

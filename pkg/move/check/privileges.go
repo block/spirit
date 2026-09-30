@@ -18,11 +18,14 @@ func init() {
 
 // privilegesCheck checks the privileges of the user running the move operation.
 // Move operations require:
-// - REPLICATION CLIENT and REPLICATION SLAVE (or SUPER) for binlog reading
-// - RELOAD for FLUSH TABLES
-// - Table-level privileges (SELECT, INSERT, etc.) on the source database
-// - LOCK TABLES for cutover
-// - CONNECTION_ADMIN + PROCESS + performance_schema access for force-kill (enabled by default)
+//   - REPLICATION CLIENT and REPLICATION SLAVE (or SUPER) for binlog reading
+//   - RELOAD for FLUSH TABLES
+//   - Table-level privileges (SELECT, INSERT, etc.) on the source database
+//   - LOCK TABLES for cutover
+//   - CONNECTION_ADMIN + PROCESS + performance_schema access for force-kill (enabled by default)
+//   - Visibility of the source schema's events and stored routines in
+//     information_schema, so the source_schema_objects check cannot pass just
+//     because they are hidden (see schemaObjectVisibilityError)
 //
 // On RDS, the opaque rds_superuser_role cannot be inspected for its underlying
 // privileges. When activate_all_roles_on_login=ON, the role is automatically
@@ -43,6 +46,7 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 	}
 
 	var foundAll, foundSuper, foundReplicationClient, foundReplicationSlave, foundDBAll, foundReload, foundConnectionAdmin, foundProcess bool
+	var foundEventVisibility, foundRoutineVisibility bool
 	var grantedRoles []string
 
 	schemaName := ""
@@ -90,6 +94,14 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 		if strings.Contains(grant, `PROCESS`) && strings.Contains(grant, ` ON *.*`) {
 			foundProcess = true
 		}
+		if utils.GlobalGrantHasAny(grant, eventVisibilityPrivileges...) ||
+			(schemaName != "" && utils.DBLevelGrantHasAny(grant, schemaName, eventVisibilityPrivileges...)) {
+			foundEventVisibility = true
+		}
+		if utils.GlobalGrantHasAny(grant, globalRoutineVisibilityPrivileges...) ||
+			(schemaName != "" && utils.DBLevelGrantHasAny(grant, schemaName, dbRoutineVisibilityPrivileges...)) {
+			foundRoutineVisibility = true
+		}
 		// Collect role names from grant lines like:
 		// GRANT `rds_superuser_role`@`%` TO `user`@`%`
 		if strings.HasPrefix(grant, "GRANT `") && strings.Contains(grant, " TO ") {
@@ -133,12 +145,43 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource, r Resources,
 		return fmt.Errorf("insufficient privileges to run a move with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", errors.Join(errs...))
 	}
 
-	if foundSuper && foundReplicationSlave && foundDBAll {
-		return nil
+	hasBasePrivileges := (foundSuper && foundReplicationSlave && foundDBAll) ||
+		(foundReplicationClient && foundReplicationSlave && foundDBAll && foundReload)
+	if !hasBasePrivileges {
+		return fmt.Errorf("insufficient privileges to run a move. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", schemaName)
 	}
-	if foundReplicationClient && foundReplicationSlave && foundDBAll && foundReload {
-		return nil
-	}
+	return schemaObjectVisibilityError(schemaName, foundEventVisibility, foundRoutineVisibility)
+}
 
-	return fmt.Errorf("insufficient privileges to run a move. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", schemaName)
+// The privileges that make a schema's events and stored routines visible in
+// information_schema.EVENTS and information_schema.ROUTINES. Without them
+// those tables return no rows for the schema, and the source_schema_objects
+// check would pass without having seen them. Triggers need TRIGGER and views
+// need SELECT, which the base requirement already includes.
+var (
+	// EVENT on the schema or globally (or ALL PRIVILEGES, matched by the
+	// grant helpers).
+	eventVisibilityPrivileges = []string{"EVENT"}
+	// Globally: SHOW_ROUTINE (MySQL 8.0.20+), SELECT, or a routine privilege.
+	globalRoutineVisibilityPrivileges = []string{"SHOW_ROUTINE", "SELECT", "EXECUTE", "ALTER ROUTINE", "CREATE ROUTINE"}
+	// On the schema: a routine privilege. SHOW_ROUTINE is global only, and a
+	// database-level SELECT does not show routines.
+	dbRoutineVisibilityPrivileges = []string{"EXECUTE", "ALTER ROUTINE", "CREATE ROUTINE"}
+)
+
+// schemaObjectVisibilityError names the grants missing for the move user to
+// see the source schema's events and stored routines, or returns nil.
+func schemaObjectVisibilityError(schemaName string, events, routines bool) error {
+	var missing []string
+	if !events {
+		missing = append(missing, fmt.Sprintf("EVENT on `%s`.* (to see the schema's events)", schemaName))
+	}
+	if !routines {
+		missing = append(missing, fmt.Sprintf("SHOW_ROUTINE on *.* (to see the schema's stored procedures and functions; SELECT on *.*, or EXECUTE on `%s`.*, also works)", schemaName))
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("insufficient privileges to run a move: move refuses source schemas that contain events or stored routines, and information_schema hides them from users without these grants. Needed: %s",
+		strings.Join(missing, "; "))
 }

@@ -14,6 +14,14 @@ import (
 // grants (`db`.*); global (*.*), table-level, and routine grants do not match.
 var dbGrantRegexp = regexp.MustCompile("^GRANT (.+) ON `([^`]+)`\\.\\* TO ")
 
+// globalGrantRegexp captures the privilege list from a global grant line, e.g.
+//
+//	GRANT SELECT, EVENT ON *.* TO `user`@`%`
+//	GRANT CONNECTION_ADMIN,SHOW_ROUTINE ON *.* TO `user`@`%`
+//
+// capturing "SELECT, EVENT" or "CONNECTION_ADMIN,SHOW_ROUTINE".
+var globalGrantRegexp = regexp.MustCompile(`^GRANT (.+) ON \*\.\* TO `)
+
 // migrationDBPrivileges is the database-level privilege set spirit requires to
 // run a migration or move (mirroring gh-ost's historical requirement). A grant
 // of ALL PRIVILEGES, or of every privilege in this set, satisfies the check.
@@ -47,6 +55,41 @@ func DBLevelGrantCoversSchema(grant, schemaName string) bool {
 		}
 	}
 	return true
+}
+
+// GlobalGrantHasAny reports whether a single SHOW GRANTS line is a global
+// (*.*) grant of ALL PRIVILEGES or of any privilege in privs. ALL PRIVILEGES
+// counts because it includes every static privilege, so privs should contain
+// at least one static privilege for it to be meaningful.
+func GlobalGrantHasAny(grant string, privs ...string) bool {
+	m := globalGrantRegexp.FindStringSubmatch(grant)
+	if m == nil {
+		return false
+	}
+	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
+}
+
+// DBLevelGrantHasAny reports whether a single SHOW GRANTS line is a
+// database-level grant whose database-name pattern matches schemaName (see
+// MySQLLikeMatch) and that confers ALL PRIVILEGES or any privilege in privs.
+func DBLevelGrantHasAny(grant, schemaName string, privs ...string) bool {
+	m := dbGrantRegexp.FindStringSubmatch(grant)
+	if m == nil || !MySQLLikeMatch(m[2], schemaName) {
+		return false
+	}
+	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
+}
+
+func hasAnyPrivilege(granted map[string]bool, privs []string) bool {
+	if granted["ALL PRIVILEGES"] {
+		return true
+	}
+	for _, p := range privs {
+		if granted[p] {
+			return true
+		}
+	}
+	return false
 }
 
 // splitPrivileges parses the privilege list from a GRANT statement into a set

@@ -10,11 +10,23 @@ import (
 )
 
 func init() {
+	// The preflight registration runs before table discovery. Discovery lists
+	// base tables only, so without it a schema holding only views, routines
+	// or events would be taken as having nothing to move, and a view named in
+	// the table list would fail as a missing table instead of being named
+	// here. It runs after the privileges check, which (sorted by name) comes
+	// first and makes sure the move user can see events and routines.
+	//
 	// An object can be created in a source schema between runs, and a resume
 	// from checkpoint runs the resume checks instead of the post-setup ones,
-	// so the check is registered under both. The pre-cutover registration
-	// runs it again under the cutover's table locks, just before traffic is
-	// switched.
+	// so the check is registered under both as well. The pre-cutover
+	// registration runs it again under the cutover's table locks, just before
+	// traffic is switched. That is the only check that covers objects created
+	// after the post-setup (or resume) check: the change feed starts at the
+	// binlog position current when it starts, so it misses objects created
+	// before that, and it cancels the move on DDL only until the move enters
+	// the cutover state, after which a schema change is ignored.
+	registerCheck("source_schema_objects_preflight", sourceSchemaObjectsCheck, ScopePreflight)
 	registerCheck("source_schema_objects", sourceSchemaObjectsCheck, ScopePostSetup)
 	registerCheck("source_schema_objects_resume", sourceSchemaObjectsCheck, ScopeResume)
 	registerCheck("source_schema_objects_precutover", sourceSchemaObjectsCheck, ScopePreCutover)
@@ -51,8 +63,11 @@ var schemaObjectQueries = []struct {
 // moved: a trigger on a table that is not moved can write to a moved table,
 // and routines and events cannot be mapped to tables.
 //
-// Objects the connecting user has no privilege on are not visible in
-// information_schema and are not reported.
+// information_schema only shows objects the connecting user has a privilege
+// on. TRIGGER and SELECT on the schema, which a move already needs, show its
+// triggers and views. Events and stored routines need more, which the
+// privileges check requires (see schemaObjectVisibilityError), so they cannot
+// go unreported because they are hidden.
 //
 // The runner also calls it directly when entering a reverse window and before
 // a reverse cutover, which run no check scope. The retired `<table>_old`

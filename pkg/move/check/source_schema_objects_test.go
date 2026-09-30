@@ -10,12 +10,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSourceSchemaObjectsCheckRegistered pins that the check runs before a
-// fresh copy (post-setup), before a resume from checkpoint (the runner only
-// runs one of those two scopes), and under the forward cutover's locks.
+// TestSourceSchemaObjectsCheckRegistered pins that the check runs before
+// table discovery (preflight), before a fresh copy (post-setup), before a
+// resume from checkpoint (the runner only runs one of those two scopes), and
+// under the forward cutover's locks.
 func TestSourceSchemaObjectsCheckRegistered(t *testing.T) {
 	lock.Lock()
 	defer lock.Unlock()
+	require.Equal(t, ScopePreflight, checks["source_schema_objects_preflight"].scope)
 	require.Equal(t, ScopePostSetup, checks["source_schema_objects"].scope)
 	require.Equal(t, ScopeResume, checks["source_schema_objects_resume"].scope)
 	require.Equal(t, ScopePreCutover, checks["source_schema_objects_precutover"].scope)
@@ -78,7 +80,7 @@ func TestSourceSchemaObjectsCheckEachType(t *testing.T) {
 			require.NoError(t, sourceSchemaObjectsCheck(t.Context(), r, slog.Default()))
 
 			for _, stmt := range tc.create {
-				testutils.RunSQLInDatabase(t, srcName, stmt)
+				testutils.RunSQLInDatabaseAsRoot(t, srcName, stmt)
 			}
 			err := sourceSchemaObjectsCheck(t.Context(), r, slog.Default())
 			require.EqualError(t, err, "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 ("+srcName+"): "+tc.want)
@@ -97,13 +99,13 @@ func TestSourceSchemaObjectsCheckListsAllGroupedPerSource(t *testing.T) {
 	for _, name := range []string{src0Name, src1Name, src2Name} {
 		testutils.RunSQLInDatabase(t, name, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
 	}
-	testutils.RunSQLInDatabase(t, src0Name, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
-	testutils.RunSQLInDatabase(t, src0Name, "CREATE VIEW v1 AS SELECT id FROM t1")
-	testutils.RunSQLInDatabase(t, src0Name, "CREATE TRIGGER t1_bu BEFORE UPDATE ON t1 FOR EACH ROW SET NEW.v = 1")
-	testutils.RunSQLInDatabase(t, src0Name, "CREATE TRIGGER t1_ad AFTER DELETE ON t1 FOR EACH ROW SET @x = 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE VIEW v1 AS SELECT id FROM t1")
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE TRIGGER t1_bu BEFORE UPDATE ON t1 FOR EACH ROW SET NEW.v = 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src0Name, "CREATE TRIGGER t1_ad AFTER DELETE ON t1 FOR EACH ROW SET @x = 1")
 	// Source 1 is clean; source 2 has a function and a procedure.
-	testutils.RunSQLInDatabase(t, src2Name, "CREATE FUNCTION f1() RETURNS INT DETERMINISTIC RETURN 1")
-	testutils.RunSQLInDatabase(t, src2Name, "CREATE PROCEDURE p1() SELECT 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src2Name, "CREATE FUNCTION f1() RETURNS INT DETERMINISTIC RETURN 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src2Name, "CREATE PROCEDURE p1() SELECT 1")
 
 	r := Resources{Sources: []SourceResource{
 		{DB: src0DB, Config: &mysql.Config{DBName: src0Name}},
@@ -113,9 +115,9 @@ func TestSourceSchemaObjectsCheckListsAllGroupedPerSource(t *testing.T) {
 	want := "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: " +
 		"source 0 (" + src0Name + "): trigger 't1_ad' on table 't1', trigger 't1_bu' on table 't1', view 'v1', event 'e1'; " +
 		"source 2 (" + src2Name + "): procedure 'p1', function 'f1'"
-	for _, scope := range []ScopeFlag{ScopePostSetup, ScopeResume, ScopePreCutover} {
+	for _, scope := range []ScopeFlag{ScopePreflight, ScopePostSetup, ScopeResume, ScopePreCutover} {
 		err := RunChecks(t.Context(), r, slog.Default(), scope,
-			otherChecks("source_schema_objects", "source_schema_objects_resume", "source_schema_objects_precutover")...)
+			otherChecks("source_schema_objects_preflight", "source_schema_objects", "source_schema_objects_resume", "source_schema_objects_precutover")...)
 		require.EqualError(t, err, want, "scope %d", scope)
 	}
 }
@@ -128,8 +130,8 @@ func TestSourceSchemaObjectsCheckIgnoresOtherSchemas(t *testing.T) {
 	otherName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
 	testutils.RunSQLInDatabase(t, otherName, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
-	testutils.RunSQLInDatabase(t, otherName, "CREATE VIEW v1 AS SELECT id FROM t1")
-	testutils.RunSQLInDatabase(t, otherName, "CREATE PROCEDURE p1() SELECT 1")
+	testutils.RunSQLInDatabaseAsRoot(t, otherName, "CREATE VIEW v1 AS SELECT id FROM t1")
+	testutils.RunSQLInDatabaseAsRoot(t, otherName, "CREATE PROCEDURE p1() SELECT 1")
 
 	require.NoError(t, SourceSchemaObjectsError(t.Context(), []SourceResource{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}}))
 	require.NoError(t, SourceSchemaObjectsError(t.Context(), nil))

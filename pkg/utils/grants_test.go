@@ -151,3 +151,48 @@ func TestStringContainsAll(t *testing.T) {
 	assert.False(t, StringContainsAll("GRANT SELECT", ""))
 	assert.False(t, StringContainsAll("GRANT SELECT"))
 }
+
+func TestGlobalGrantHasAny(t *testing.T) {
+	tests := []struct {
+		grant string
+		privs []string
+		want  bool
+	}{
+		{"GRANT SELECT, EVENT ON *.* TO `u`@`%`", []string{"EVENT"}, true},
+		{"GRANT CONNECTION_ADMIN,SHOW_ROUTINE ON *.* TO `u`@`%`", []string{"SHOW_ROUTINE"}, true},
+		{"GRANT ALL PRIVILEGES ON *.* TO `u`@`%` WITH GRANT OPTION", []string{"EVENT"}, true},
+		{"GRANT SELECT ON *.* TO `u`@`%`", []string{"SHOW_ROUTINE", "SELECT"}, true},
+		{"GRANT REPLICATION CLIENT ON *.* TO `u`@`%`", []string{"SELECT"}, false},
+		{"GRANT CREATE VIEW ON *.* TO `u`@`%`", []string{"CREATE"}, false},
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", []string{"EVENT"}, false},
+		{"GRANT SELECT ON `performance_schema`.* TO `u`@`%`", []string{"SELECT"}, false},
+		{"GRANT `role1`@`%` TO `u`@`%`", []string{"SELECT"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.grant, func(t *testing.T) {
+			assert.Equal(t, tc.want, GlobalGrantHasAny(tc.grant, tc.privs...))
+		})
+	}
+}
+
+func TestDBLevelGrantHasAny(t *testing.T) {
+	tests := []struct {
+		grant, schema string
+		privs         []string
+		want          bool
+	}{
+		{"GRANT EVENT ON `app`.* TO `u`@`%`", "app", []string{"EVENT"}, true},
+		{"GRANT SELECT, EXECUTE ON `app\\_%`.* TO `u`@`%`", "app_one", []string{"EXECUTE"}, true},
+		{"GRANT ALL PRIVILEGES ON `app`.* TO `u`@`%`", "app", []string{"EVENT"}, true},
+		{"GRANT ALTER ROUTINE ON `app`.* TO `u`@`%`", "app", []string{"EXECUTE", "ALTER ROUTINE"}, true},
+		{"GRANT ALTER ON `app`.* TO `u`@`%`", "app", []string{"ALTER ROUTINE"}, false},
+		{"GRANT EVENT ON `other`.* TO `u`@`%`", "app", []string{"EVENT"}, false},
+		{"GRANT EVENT ON *.* TO `u`@`%`", "app", []string{"EVENT"}, false},
+		{"GRANT SELECT ON `app`.`t1` TO `u`@`%`", "app", []string{"SELECT"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.grant, func(t *testing.T) {
+			assert.Equal(t, tc.want, DBLevelGrantHasAny(tc.grant, tc.schema, tc.privs...))
+		})
+	}
+}

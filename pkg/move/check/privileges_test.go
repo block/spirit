@@ -1,6 +1,7 @@
 package check
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -230,4 +231,124 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	// privilegesCheck should pass.
 	err = privilegesCheck(t.Context(), r, slog.Default())
 	require.NoError(t, err, "should pass when activate_all_roles_on_login=ON and rds_superuser_role is granted")
+}
+
+// oldMinimalMoveGrants are the grants that passed the move privileges check
+// before it required visibility of events and stored routines: the documented
+// schema-level list plus the replication, RELOAD and force-kill grants.
+func oldMinimalMoveGrants(schema string) []string {
+	return []string{
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `" + schema + "`.* TO %s",
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD, CONNECTION_ADMIN, PROCESS ON *.* TO %s",
+		"GRANT SELECT ON `performance_schema`.* TO %s",
+	}
+}
+
+// createMoveTestUser creates user as root with the given grants (each a
+// format string with one %s for the user) and returns a connection to schema
+// as that user. The user is dropped when the test ends.
+func createMoveTestUser(t *testing.T, user, schema string, grants ...string) (*sql.DB, *mysql.Config) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	cfg.User = "root" // needs grant privilege
+	cfg.DBName = ""
+	rootDB, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rootDB)
+	_, err = rootDB.ExecContext(t.Context(), "DROP USER IF EXISTS "+user)
+	require.NoError(t, err)
+	_, err = rootDB.ExecContext(t.Context(), "CREATE USER "+user)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cfg, err := mysql.ParseDSN(testutils.DSN())
+		if err != nil {
+			return
+		}
+		cfg.User, cfg.DBName = "root", ""
+		db, err := sql.Open("block-mysql", cfg.FormatDSN())
+		if err != nil {
+			return
+		}
+		defer utils.CloseAndLog(db)
+		_, _ = db.ExecContext(context.Background(), "DROP USER IF EXISTS "+user)
+	})
+	for _, g := range grants {
+		_, err = rootDB.ExecContext(t.Context(), fmt.Sprintf(g, user))
+		require.NoError(t, err)
+	}
+	userCfg, err := mysql.ParseDSN(fmt.Sprintf("%s:@tcp(%s)/%s", user, cfg.Addr, schema))
+	require.NoError(t, err)
+	db, err := sql.Open("block-mysql", userCfg.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	return db, userCfg
+}
+
+// TestMovePrivilegesSchemaObjectVisibility checks that the privileges check
+// requires the grants that make a schema's events and stored routines visible
+// in information_schema, and shows why: with the old minimal grants the
+// source_schema_objects check sees the trigger and the view (TRIGGER and
+// SELECT cover them) but not the procedure, the function or the event.
+func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
+	schema, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+	for _, stmt := range []string{
+		"CREATE TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.v = 1",
+		"CREATE VIEW v1 AS SELECT id FROM t1",
+		"CREATE PROCEDURE p1() SELECT 1",
+		"CREATE FUNCTION f1() RETURNS INT DETERMINISTIC RETURN 1",
+		"CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1",
+	} {
+		testutils.RunSQLInDatabaseAsRoot(t, schema, stmt)
+	}
+	objectsPrefix := "cannot move: move does not copy triggers, views, stored procedures, stored functions or events, and they must be dropped before the move can continue: source 0 (" + schema + "): "
+	allObjects := objectsPrefix + "trigger 't1_bi' on table 't1', view 'v1', procedure 'p1', function 'f1', event 'e1'"
+	eventMissing := "EVENT on `" + schema + "`.*"
+	routineMissing := "SHOW_ROUTINE on *.*"
+
+	t.Run("old minimal grants", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_old", schema, oldMinimalMoveGrants(schema)...)
+		src := []SourceResource{{DB: db, Config: cfg}}
+		err := privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default())
+		require.ErrorContains(t, err, "insufficient privileges to run a move")
+		require.ErrorContains(t, err, eventMissing)
+		require.ErrorContains(t, err, routineMissing)
+		// The gap the requirement closes: routines and events are hidden.
+		require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), objectsPrefix+"trigger 't1_bi' on table 't1', view 'v1'")
+	})
+
+	t.Run("old minimal grants plus EVENT", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_event", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s")...)
+		err := privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
+		require.ErrorContains(t, err, routineMissing)
+		require.NotContains(t, err.Error(), eventMissing)
+	})
+
+	t.Run("old minimal grants plus SHOW_ROUTINE", func(t *testing.T) {
+		db, cfg := createMoveTestUser(t, "testmovevis_routine", schema,
+			append(oldMinimalMoveGrants(schema), "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+		err := privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
+		require.ErrorContains(t, err, eventMissing)
+		require.NotContains(t, err.Error(), routineMissing)
+	})
+
+	// Each accepted way to see routines, together with EVENT, passes, and the
+	// user then sees every object in the schema.
+	for _, tc := range []struct {
+		name, user, grant string
+	}{
+		{"SHOW_ROUTINE on *.*", "testmovevis_showroutine", "GRANT SHOW_ROUTINE ON *.* TO %s"},
+		{"SELECT on *.*", "testmovevis_globalselect", "GRANT SELECT ON *.* TO %s"},
+		{"EXECUTE on the schema", "testmovevis_execute", "GRANT EXECUTE ON `" + schema + "`.* TO %s"},
+	} {
+		t.Run("EVENT and "+tc.name, func(t *testing.T) {
+			db, cfg := createMoveTestUser(t, tc.user, schema,
+				append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+schema+"`.* TO %s", tc.grant)...)
+			src := []SourceResource{{DB: db, Config: cfg}}
+			require.NoError(t, privilegesCheck(t.Context(), Resources{Sources: src}, slog.Default()))
+			require.EqualError(t, SourceSchemaObjectsError(t.Context(), src), allObjects)
+		})
+	}
 }

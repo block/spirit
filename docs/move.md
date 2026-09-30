@@ -11,7 +11,14 @@ spirit move --source-dsn "user:pass@tcp(source-host:3306)/mydb" \
 
 This will copy all tables from the source database to the target database, verify them with a checksum, and then complete.
 
-Move copies base tables only. It refuses a source schema that contains triggers, views, stored procedures, stored functions or events, because it does not copy them to the target; drop them before moving. The whole schema is checked, also when only some tables are moved. The check runs before the copy, on resume, again under the cutover's table locks before traffic is switched, when a reverse window is entered, and before a reverse cutover.
+Move copies base tables only. It refuses a source schema that contains triggers, views, stored procedures, stored functions or events, because it does not copy them to the target; drop them before moving. The whole schema is checked, also when only some tables are moved. The check runs before tables are discovered (so a schema with only views, routines or events is refused rather than moved as empty), before the copy, on resume, again under the cutover's table locks before traffic is switched, when a reverse window is entered, and before a reverse cutover.
+
+`information_schema` hides events and stored routines from a user without privileges on them, so the move user needs these grants on each source in addition to the privileges listed in the [README](../README.md):
+
+* `EVENT` on the source schema (or on `*.*`), to see its events.
+* `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), to see its stored procedures and functions. `SELECT` on `*.*`, or `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the source schema (or on `*.*`), also works.
+
+The move is refused if they are missing. Triggers and views need no extra grant: `TRIGGER` and `SELECT` on the schema, which are already required, make them visible.
 
 ## Configuration
 
