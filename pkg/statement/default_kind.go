@@ -54,9 +54,10 @@ const (
 	// type stores (an integer column reports 0x1A as 26), and reports it back
 	// as hex only on a binary, varbinary, char or varchar column whose value is
 	// not valid utf8mb3. The normalization rules convert it to the reported
-	// form on those types, on the integer types and on bit (see
+	// form on those types, on the integer types, on bit and on year (see
 	// [binaryDefaultBytesNormalizer], [integerBinaryLiteralDefaultNormalizer],
-	// [bitDefaultNormalizer], [charBinaryLiteralDefaultNormalizer]). On a
+	// [bitDefaultNormalizer], [charBinaryLiteralDefaultNormalizer],
+	// [yearDefaultNormalizer]). On a
 	// utf8mb4 char or varchar column the recorded text carries a _utf8mb4
 	// introducer, `_utf8mb4 x'f09f9880'`, whether the default was written as a
 	// string or as hex (see [charUTF8MB4DefaultNormalizer]). It must be

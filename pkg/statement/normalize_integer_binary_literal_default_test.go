@@ -109,7 +109,7 @@ func TestIntegerBinaryLiteralDefaultLeavesOtherDefaultsAlone(t *testing.T) {
 		{"a scaled decimal, which pads to its scale", "`b` decimal(5,2) DEFAULT 0x1A", "x'1a'", DefaultKindHexLiteral},
 		{"a decimal at 2^63, which MySQL rejects as hex only", "`b` decimal(20,0) DEFAULT 0x8000000000000000", "x'8000000000000000'", DefaultKindHexLiteral},
 		{"double, which formats the value itself", "`b` double DEFAULT 0x1A", "x'1a'", DefaultKindHexLiteral},
-		{"year, which reads the value as a year", "`b` year DEFAULT 0x07", "x'07'", DefaultKindHexLiteral},
+		{"year, which reads the value as a year and yearDefaultNormalizer folds", "`b` year DEFAULT 0x07", "2007", DefaultKindNumber},
 		{"a number, which is already the integer", "`b` int DEFAULT 26", "26", DefaultKindNumber},
 		{"a string", "`b` int DEFAULT '26'", "26", DefaultKindString},
 	} {

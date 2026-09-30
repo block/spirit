@@ -292,6 +292,88 @@ func TestDiffIntegrationYearDisplayWidthConverges(t *testing.T) {
 	requireConverged(t, tt.DB, tt.Name, targetSQL)
 }
 
+// A literal default on a year column is stored as a four-digit year, so a table
+// created from these declarations must diff clean against them. Without
+// yearDefaultNormalizer the diff emits `MODIFY COLUMN ... DEFAULT 99` against
+// the live '1999' on every run.
+func TestDiffIntegrationYearDefaultCreatedAsDeclared(t *testing.T) {
+	const declaredSQL = "CREATE TABLE diff_year_default (" +
+		"id int NOT NULL, " +
+		"two_digit year DEFAULT 99, " +
+		"two_digit_str year DEFAULT '24', " +
+		"one_digit year DEFAULT 5, " +
+		"num_zero year DEFAULT 0, " +
+		"str_zero year DEFAULT '0', " +
+		"str_zero4 year DEFAULT '0000', " +
+		"hex year DEFAULT 0x07, " +
+		"bits year DEFAULT b'111', " +
+		"kw_true year NOT NULL DEFAULT TRUE, " +
+		"kw_false year NOT NULL DEFAULT FALSE, " +
+		"four_digit year DEFAULT 2024, " +
+		"plus year DEFAULT +5, " +
+		"plus_padded year DEFAULT +0099, " +
+		"neg_zero year DEFAULT -0, " +
+		"neg_zero_padded year DEFAULT -00, " +
+		"low_str year DEFAULT '01901', " +
+		"high_str year DEFAULT '02155', " +
+		"low_hex year DEFAULT 0x076D, " +
+		"high_hex year DEFAULT 0x086B, " +
+		"PRIMARY KEY (id))"
+
+	tt := testutils.NewTestTable(t, "diff_year_default", declaredSQL)
+
+	live := showCreateTable(t, tt.DB, tt.Name)
+	for _, want := range []string{
+		"`two_digit` year DEFAULT '1999'",
+		"`two_digit_str` year DEFAULT '2024'",
+		"`one_digit` year DEFAULT '2005'",
+		"`num_zero` year DEFAULT '0000'",
+		"`str_zero` year DEFAULT '2000'",
+		"`str_zero4` year DEFAULT '0000'",
+		"`hex` year DEFAULT '2007'",
+		"`bits` year DEFAULT '2007'",
+		"`kw_true` year NOT NULL DEFAULT '2001'",
+		"`kw_false` year NOT NULL DEFAULT '0000'",
+		"`four_digit` year DEFAULT '2024'",
+		"`plus` year DEFAULT '2005'",
+		"`plus_padded` year DEFAULT '1999'",
+		"`neg_zero` year DEFAULT '0000'",
+		"`neg_zero_padded` year DEFAULT '0000'",
+		"`low_str` year DEFAULT '1901'",
+		"`high_str` year DEFAULT '2155'",
+		"`low_hex` year DEFAULT '1901'",
+		"`high_hex` year DEFAULT '2155'",
+	} {
+		require.Contains(t, live, want)
+	}
+
+	require.Nil(t, diffLiveTable(t, tt.DB, tt.Name, declaredSQL))
+}
+
+// Changing a column to a year with a two-digit default is a real change: the
+// diff is emitted, MySQL stores the default as a four-digit year, and a re-diff
+// is clean. The zero defaults are included because the numeric and string
+// zero store different years ('0000' and '2000'), and the bare year the diff
+// emits must store the same one.
+func TestDiffIntegrationYearDefaultConverges(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_year_default_change",
+		"CREATE TABLE diff_year_default_change (id int NOT NULL, a smallint, b smallint, c smallint, PRIMARY KEY (id))")
+
+	const targetSQL = "CREATE TABLE diff_year_default_change (id int NOT NULL, " +
+		"a year DEFAULT 99, b year DEFAULT 0, c year DEFAULT '0', PRIMARY KEY (id))"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+
+	execStatements(t, tt.DB, stmts)
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "`a` year DEFAULT '1999'")
+	require.Contains(t, live, "`b` year DEFAULT '0000'")
+	require.Contains(t, live, "`c` year DEFAULT '2000'")
+
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+}
+
 // TestDiffIntegrationForeignKeyNoAction verifies against a real MySQL server
 // that a desired schema spelling out ON DELETE NO ACTION / ON UPDATE NO ACTION
 // converges with the live table. MySQL omits NO ACTION from SHOW CREATE TABLE
@@ -828,10 +910,12 @@ func TestDiffIntegrationBooleanKeywordDefaultAcrossFoldingTypes(t *testing.T) {
 // reading that puts each out of scope and the diff it still emits as a result.
 // Asserting the leftover diff alongside the reading is deliberate: a reading on
 // its own does not say whether the exclusion it justifies is the right one, and
-// these two are excluded for reasons this layer cannot fix — scale padding
+// scaled decimal is excluded for a reason this layer cannot fix — scale padding
 // belongs to numeric canonicalization. binary is excluded here too, because it
 // pads the keyword to the column width; binaryDefaultBytesNormalizer folds it
-// instead, and TestDiffIntegrationBinaryDefaultBytes covers it.
+// instead, and TestDiffIntegrationBinaryDefaultBytes covers it. year reads the
+// keyword as a year (TRUE stores '2001'); yearDefaultNormalizer folds it, and
+// TestDiffIntegrationYearDefaultCreatedAsDeclared covers it.
 //
 // enum and set are excluded too but are deliberately not fixtures here. They
 // have no single reading to record: through 8.4 the keyword resolves to a
@@ -842,21 +926,17 @@ func TestDiffIntegrationBooleanKeywordDefaultAcrossFoldingTypes(t *testing.T) {
 // TestBooleanKeywordDefaultLeavesOtherTypesAlone.
 func TestDiffIntegrationBooleanKeywordDefaultOnExcludedTypes(t *testing.T) {
 	const declaredSQL = "CREATE TABLE diff_bool_keyword_excluded_types (" +
-		"scaled decimal(4,2) NOT NULL DEFAULT TRUE, " +
-		"yr year NOT NULL DEFAULT TRUE)"
+		"scaled decimal(4,2) NOT NULL DEFAULT TRUE)"
 	tt := testutils.NewTestTable(t, "diff_bool_keyword_excluded_types", declaredSQL)
 
 	live := showCreateTable(t, tt.DB, tt.Name)
 	require.Contains(t, live, "`scaled` decimal(4,2) NOT NULL DEFAULT '1.00'")
-	require.Contains(t, live, "`yr` year NOT NULL DEFAULT '2001'")
 
-	// The table was created from this very declaration, so every statement here
+	// The table was created from this very declaration, so the statement here
 	// re-stores a value the column already holds.
 	stmts := diffLiveTable(t, tt.DB, tt.Name, declaredSQL)
 	require.Len(t, stmts, 1)
-	for _, col := range []string{"scaled", "yr"} {
-		require.Contains(t, stmts[0].Statement, "MODIFY COLUMN `"+col+"`")
-	}
+	require.Contains(t, stmts[0].Statement, "MODIFY COLUMN `scaled`")
 }
 
 // A ZEROFILL integer's default is stored padded to the display width, so a

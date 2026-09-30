@@ -45,7 +45,7 @@ source privileges depend on the change feed:
   that reader runs `FLUSH BINARY LOGS` to establish/advance its start
   position, so it is not a pure `SELECT`-only role even though it never
   modifies your data. See [GTID auto-detection](#gtid-auto-detection).
-- **Injected `change.Source`** (e.g. a Vitess/PlanetScale VStream supplied by
+- **Injected `change.Source`** (e.g. a Vitess VStream supplied by
   a programmatic caller): the feed is driven entirely by that source, so the
   built-in binlog privileges (`REPLICATION *`, `RELOAD`) do not apply — only
   `SELECT` on the source schema is required for the initial copy. GTID
@@ -277,7 +277,7 @@ for the behavioural differences and the resume rules.
 Sync-specific notes:
 
 - **Does not apply to an injected `Source`** (e.g. a programmatic caller
-  passing a Vitess/PlanetScale VStream `change.Source`) — auto-detection only
+  passing a Vitess VStream `change.Source`) — auto-detection only
   controls how Sync constructs its own MySQL client.
 - **No `RELOAD` / `FLUSH BINARY LOGS` requirement in GTID mode.** The GTID
   feed reads `@@GLOBAL.gtid_executed` to discover positions, so the source

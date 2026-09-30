@@ -68,7 +68,7 @@ type TableInfo struct {
 	// otherwise run to refresh the optimizer's row estimate. ANALYZE TABLE
 	// writes to the statistics tables, so it requires INSERT on the table
 	// and a writable server. Set this when reading from a least-privilege
-	// (SELECT-only) or read-only source — e.g. sync's Vitess/PlanetScale
+	// (SELECT-only) or read-only source — e.g. sync's Vitess
 	// replica — so the row estimate comes straight from information_schema,
 	// which only needs SELECT. Set before calling SetInfo.
 	DisableAnalyze bool

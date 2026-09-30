@@ -48,8 +48,8 @@ func init() { registerNormalizer(integerBinaryLiteralDefaultNormalizer{}) }
 //
 // Left alone otherwise: a scaled decimal pads to its scale (decimal(5,2)
 // DEFAULT 0x1A stores '26.00') and year puts the value through its own
-// interpretation (year DEFAULT 0x07 stores '2007'), so neither stores the
-// plain integer. float and
+// interpretation (year DEFAULT 0x07 stores '2007', which
+// [yearDefaultNormalizer] folds), so neither stores the plain integer. float and
 // double store it only while it fits their precision (double DEFAULT 0x1A
 // stores '26'). Past that MySQL rounds it and formats it in its own notation,
 // which this rule does not reproduce: float DEFAULT 0x01000001 stores

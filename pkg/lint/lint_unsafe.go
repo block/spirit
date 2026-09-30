@@ -100,8 +100,7 @@ func (l *UnsafeLinter) Lint(_ []*statement.CreateTable, changes []*statement.Abs
 					// The lossy vs. non-lossy is detection is done at runtime via a checksum.
 					// It is not computed in advance.
 					//
-					// I do not believe that PlanetScale has this detection, so we may decide to
-					// implement it here in future.
+					// We may decide to implement this detection here in future.
 				case ast.AlterTableDropForeignKey, ast.AlterTableRenameColumn,
 					ast.AlterTableRenameTable, ast.AlterTableDropIndex, ast.AlterTableDropCheck, ast.AlterTableDropConstraint,
 					ast.AlterTableOption:

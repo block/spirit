@@ -33,7 +33,7 @@ import (
 // syncCheckpointTableName is the table, created on the target, that
 // records the source change-feed position so a restart can resume the
 // continuous stream instead of re-copying. It always lives on the target
-// because the source may be read-only (e.g. a Vitess/PlanetScale replica).
+// because the source may be read-only (e.g. a Vitess replica).
 const syncCheckpointTableName = "_spirit_sync_checkpoint"
 
 // shutdownFlushTimeout bounds the best-effort final flush on a clean shutdown,
@@ -303,7 +303,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	//     never does.
 	//
 	// There used to be a second, RejectReadOnly=false, on the grounds that the
-	// source is read-only by design (e.g. a Vitess/PlanetScale replica). That
+	// source is read-only by design (e.g. a Vitess replica). That
 	// reasoned from the wrong axis: 1290/1792/1836 are raised by *writes*, not
 	// by connecting to a read-only server, and everything sync sends the source
 	// succeeds against a super_read_only MySQL — including the binlog client's

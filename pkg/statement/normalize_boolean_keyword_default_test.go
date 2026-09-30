@@ -122,9 +122,9 @@ func TestBooleanKeywordDefaultLeavesOtherTypesAlone(t *testing.T) {
 			want:   "TRUE",
 		},
 		{
-			name:   "year reads the keyword as a year, storing 2001",
+			name:   "year reads the keyword as a year, which yearDefaultNormalizer folds to 2001",
 			column: "`a` year NOT NULL DEFAULT TRUE",
-			want:   "TRUE",
+			want:   "2001",
 		},
 		{
 			name:   "binary pads to the column width with NULs, which binaryDefaultBytesNormalizer folds",

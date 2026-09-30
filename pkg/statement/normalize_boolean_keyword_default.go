@@ -32,7 +32,8 @@ func init() { registerNormalizer(booleanKeywordDefaultNormalizer{}) }
 //     decimal(4,2) DEFAULT TRUE stores '1.00'. An unscaled decimal has nothing
 //     to pad and does fold. Canonicalizing numeric scale is a separate rule.
 //   - year, which puts the keyword through YEAR's own interpretation:
-//     year DEFAULT TRUE stores '2001', not 1.
+//     year DEFAULT TRUE stores '2001', not 1. [yearDefaultNormalizer] folds
+//     it to that year instead.
 //   - binary, which pads to the column width with NULs: binary(4) DEFAULT TRUE
 //     stores '1\0\0\0'. [binaryDefaultBytesNormalizer] folds it to that
 //     padded value instead. varbinary has nothing to pad and does fold here.
