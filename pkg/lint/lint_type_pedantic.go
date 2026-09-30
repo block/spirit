@@ -407,13 +407,12 @@ func (l *TypePedanticLinter) sameNameTypes(refs []tpColRef) []Violation {
 				continue
 			}
 			colName := r.col.Name
-			example := strings.Join(tpFirstN(majorityTables, 3), ", ")
 			violations = append(violations, Violation{
 				Linter:   l,
 				Severity: l.sameNameSeverity,
 				Message: fmt.Sprintf(
-					"Column %q in table %q has type %q but %d other table(s) use type %q (e.g. %s)",
-					r.col.Name, r.table.TableName, r.typ, len(majorityTables), majority, example,
+					"Column %q in table %q has type %q but %s type %q (e.g. %s)",
+					r.col.Name, r.table.TableName, r.typ, tpOtherTablesUse(majorityTables), majority, tpExampleTables(majorityTables),
 				),
 				Location:   &Location{Table: r.table.TableName, Column: &colName},
 				Suggestion: new(fmt.Sprintf("Align %s.%s to type %q for consistency", r.table.TableName, r.col.Name, majority)),
@@ -483,13 +482,12 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 				continue
 			}
 			colName := r.col.Name
-			example := strings.Join(tpFirstN(majorityTables, 3), ", ")
 			violations = append(violations, Violation{
 				Linter:   l,
 				Severity: l.collationSeverity,
 				Message: fmt.Sprintf(
-					"Column %q in table %q uses collation %q but %d other table(s) use %q (e.g. %s) — %s",
-					r.col.Name, r.table.TableName, r.collation, len(majorityTables), majority, example,
+					"Column %q in table %q uses collation %q but %s %q (e.g. %s) — %s",
+					r.col.Name, r.table.TableName, r.collation, tpOtherTablesUse(majorityTables), majority, tpExampleTables(majorityTables),
 					tpCollationConsequence(r.charset, charsetOf[majority]),
 				),
 				Location: &Location{Table: r.table.TableName, Column: &colName},
@@ -714,6 +712,22 @@ func tpPickMajority(counts map[string]int) (string, bool) {
 
 func tpDedupeStrings(ss []string) []string {
 	return slices.Compact(slices.Sorted(slices.Values(ss)))
+}
+
+// tpOtherTablesUse counts the tables that hold the majority type or collation,
+// with the noun and verb agreeing with the count: "1 other table uses" versus
+// "2 other tables use".
+func tpOtherTablesUse(tables []string) string {
+	if len(tables) == 1 {
+		return "1 other table uses"
+	}
+	return fmt.Sprintf("%d other tables use", len(tables))
+}
+
+// tpExampleTables names up to three of the majority's tables, each quoted like
+// every other identifier in the message.
+func tpExampleTables(tables []string) string {
+	return quoteJoin(tpFirstN(tables, 3))
 }
 
 func tpFirstN(s []string, n int) []string {
