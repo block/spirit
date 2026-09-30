@@ -118,8 +118,8 @@ WHERE t.processlist_id = ?
 	// LongRunningEventQuery) depend on. It selects zero rows (LIMIT 0) so it
 	// neither scans nor logs, but MySQL still enforces table-level SELECT
 	// privileges at prepare time, so a missing grant surfaces as an error.
-	// It does not prove access to information_schema.innodb_trx: see
-	// innodbTrxPrivilegeProbe.
+	// It does not prove the PROCESS privilege that
+	// information_schema.innodb_trx needs: see processPrivilegeProbe.
 	forceKillPrivilegeProbe = `SELECT 1
 FROM performance_schema.metadata_locks ml
     JOIN performance_schema.threads t ON ml.owner_thread_id = t.thread_id
@@ -127,12 +127,16 @@ FROM performance_schema.metadata_locks ml
     LEFT JOIN information_schema.innodb_trx trx ON t.processlist_id = trx.trx_mysql_thread_id
 LIMIT 0`
 
-	// innodbTrxPrivilegeProbe verifies the connection can read
-	// information_schema.innodb_trx, which needs PROCESS. MySQL checks PROCESS
-	// only when it fills that table, and it skips the fill for a query that can
-	// return no rows, so forceKillPrivilegeProbe passes without it. This probe
-	// can return a row, so MySQL fills the table and checks the privilege.
-	innodbTrxPrivilegeProbe = "SELECT 1 FROM information_schema.innodb_trx LIMIT 1"
+	// processPrivilegeProbe verifies the connection holds PROCESS, which
+	// information_schema.innodb_trx needs. MySQL checks PROCESS for the InnoDB
+	// information_schema tables only when it fills them, and it skips the fill
+	// for a query that can return no rows, so forceKillPrivilegeProbe passes
+	// without it. This probe can return a row, so MySQL fills the table and
+	// checks the privilege. It reads INNODB_METRICS, which needs the same
+	// PROCESS privilege, rather than innodb_trx itself: filling innodb_trx
+	// copies every running statement's text, and on MySQL 9.7 that fails
+	// while any of them contains a character utf8mb3 cannot hold.
+	processPrivilegeProbe = "SELECT 1 FROM information_schema.innodb_metrics LIMIT 1"
 )
 
 type LockDetail struct {
@@ -391,8 +395,8 @@ func CheckForceKillPrivileges(ctx context.Context, db *sql.DB) error {
 	if err := runPrivilegeProbe(ctx, db, forceKillPrivilegeProbe); err != nil {
 		errs = append(errs, fmt.Errorf("read the performance_schema lock tables: %w", err))
 	}
-	if err := runPrivilegeProbe(ctx, db, innodbTrxPrivilegeProbe); err != nil {
-		errs = append(errs, fmt.Errorf("read information_schema.innodb_trx: %w", err))
+	if err := runPrivilegeProbe(ctx, db, processPrivilegeProbe); err != nil {
+		errs = append(errs, fmt.Errorf("check for PROCESS, which information_schema.innodb_trx needs: %w", err))
 	}
 	if err := checkKillPrivilege(ctx, db); err != nil {
 		errs = append(errs, err)
