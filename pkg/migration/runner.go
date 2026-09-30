@@ -253,6 +253,47 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
 }
 
+// dropStaleCopyTables drops the _new and checkpoint tables that an earlier,
+// interrupted copy of the table may have left, after the ALTER has completed
+// with MySQL's own DDL. That state describes the table before this ALTER
+// changed it, so it can no longer be resumed from, and a later copy-based run
+// would only discard it. Without this, it stays behind indefinitely.
+//
+// A failure is logged, not returned: the ALTER has already been applied.
+// The tables are left alone when the checkpoint names a different table
+// (auxiliary table names are truncated, so two long table names can share
+// them; see utils.AuxTableName).
+func (r *Runner) dropStaleCopyTables(ctx context.Context) {
+	if len(r.changes) != 1 {
+		return // attemptMySQLDDL only supports single-table changes.
+	}
+	tableName := r.changes[0].table.TableName
+	if rec, err := r.checkpointTbl().ReadLatest(ctx); err == nil && rec.OriginalTableName != "" && rec.OriginalTableName != tableName {
+		r.logger.Warn("not dropping auxiliary tables: the checkpoint belongs to a different table",
+			"checkpoint-table", r.checkpointTableName(),
+			"checkpoint-original-table", rec.OriginalTableName,
+		)
+		return
+	}
+	for _, name := range []string{utils.NewTableName(tableName), r.checkpointTableName()} {
+		var exists int
+		if err := r.db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+			r.changes[0].table.SchemaName, name).Scan(&exists); err != nil {
+			r.logger.Error("could not check for a stale table from an earlier interrupted migration", "table", name, "error", err)
+			continue
+		}
+		if exists == 0 {
+			continue
+		}
+		if err := dbconn.Exec(ctx, r.db, "DROP TABLE IF EXISTS %n", name); err != nil {
+			r.logger.Error("could not drop a stale table from an earlier interrupted migration", "table", name, "error", err)
+			continue
+		}
+		r.logger.Info("dropped a stale table from an earlier interrupted migration", "table", name)
+	}
+}
+
 // attemptMySQLDDL tries to perform the DDL using MySQL's built-in
 // either with INSTANT or known safe INPLACE operations.
 func (r *Runner) attemptMySQLDDL(ctx context.Context) error {
@@ -441,6 +482,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	err = r.attemptMySQLDDL(ctx)
 	if err == nil {
 		r.durableMutation.Store(true)
+		r.dropStaleCopyTables(ctx)
 		r.logger.Info("apply complete",
 			"instant-ddl", r.usedInstantDDL,
 			"inplace-ddl", r.usedInplaceDDL,
