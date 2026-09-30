@@ -206,6 +206,7 @@ The copier maintains a "watermark" representing its progress. The replication cl
 if chunker.KeyAboveHighWatermark(key[0]) {
     return  // Skip, copier will handle this
 }
+chunker.NoteBufferedKey(key[0]) // admitted: never drop this key again (see below)
 
 // Flush time (bufferedMap.mustDeferKey): defer only the in-flight band.
 if !chunker.KeyBelowLowWatermark(key[0]) && !chunker.KeyNotYetDispatched(key[0]) {
@@ -216,9 +217,28 @@ if !chunker.KeyBelowLowWatermark(key[0]) && !chunker.KeyNotYetDispatched(key[0])
 Note the flush-time filter has two halves. A buffered change is safe to apply
 both when the copier has already committed its key (`KeyBelowLowWatermark`)
 **and** when the copier has not yet dispatched a chunk covering it
-(`KeyNotYetDispatched`) — in the latter case the copier's later read observes a
-source state at least as new as the change and overwrites it. Only the band
-between them, where a chunk read is genuinely in flight, has to wait.
+(`KeyNotYetDispatched`). Only the band between them, where a chunk read is
+genuinely in flight, has to wait.
+
+Applying a not-yet-dispatched key puts it on the target *before* the copier,
+and the copier writes with `INSERT IGNORE`, so its later copy of that row is
+skipped, not applied on top. The target is only correct if every later change
+for the key keeps reaching it. The ingest-time discard would break that: a
+second change to the same key after the copier's first dispatch is above the
+high watermark and was dropped, leaving the first change's image on the target
+(or, if the dropped change was a `DELETE`, a row the source no longer has). The
+same happens when a change is flushed before `SetWatermarkOptimization(true)`,
+which is the order `pkg/datasync` uses. `NoteBufferedKey` closes this: every
+admitted change reports its key, and the chunker raises a per-run guard
+(`bufferedHighPtr`) to the highest key admitted while no dispatched chunk
+covered it. `KeyAboveHighWatermark` returns `false` at or below that guard,
+exactly as it does at or below `checkpointHighPtr` after a resume. The guard
+is a single value, so it costs no memory; the cost is that changes to keys
+between the dispatch pointer and the guard are applied instead of dropped.
+Regression tests: `TestPreDispatchChangeThenAboveHighWatermark`
+([`predispatch_discard_test.go`](predispatch_discard_test.go)), and end to end
+`TestE2EPreDispatchChangeThenAboveHighWatermark` (pkg/migration) and
+`TestSyncPreDispatchChangeThenAboveHighWatermark` (pkg/datasync).
 
 Deferring the not-yet-dispatched region too (the behaviour before
 [#1167](https://github.com/block/spirit/pull/1167)) pinned the checkpoint's

@@ -15,10 +15,27 @@ import (
 // checkpointHighPtr is set on resume-from-checkpoint and used by
 // KeyAboveHighWatermark before chunkPtr advances, to prevent re-applying
 // changes for keys that were already copied in a previous run.
+//
+// bufferedHighPtr is the same guard for rows the change stream may have
+// written to the target in *this* run: see MappedChunker.NoteBufferedKey.
 type watermarkTracker struct {
 	watermark              *Chunk
 	lowerBoundWatermarkMap map[string]*Chunk
 	checkpointHighPtr      Datum
+
+	// bufferedHighPtr is the highest key[0] that the change stream admitted
+	// into its buffer while no dispatched chunk covered it. Such a change
+	// may be flushed to the target ahead of the copier, whose INSERT IGNORE
+	// then skips the key, so KeyAboveHighWatermark must not discard later
+	// changes at or below it. It only ever rises, and Reset does not clear
+	// it: lowering it could re-enable the discard for a key that is already
+	// on the target, while keeping it only costs the optimization.
+	bufferedHighPtr Datum
+	// bufferedHighUnknown is set when a key could not be recorded in
+	// bufferedHighPtr (conversion or comparison failure). The discard is
+	// then disabled for the rest of the run, because the chunker can no
+	// longer tell which keys the change stream may have written.
+	bufferedHighUnknown bool
 
 	// inflightChunks counts chunks that have been dispatched via Next()
 	// but not yet returned via Feedback(). Dispatch and commit are
@@ -28,6 +45,64 @@ type watermarkTracker struct {
 	// the final chunk has been dispatched AND inflightChunks is zero has
 	// every dispatched chunk been committed and fed back.
 	inflightChunks uint64
+}
+
+// noteBufferedKey implements MappedChunker.NoteBufferedKey for both chunkers.
+// notDispatched is the caller's answer to "is key possibly not yet covered by
+// a dispatched chunk"; convErr is the error from converting key0 to a Datum.
+// Caller must hold the chunker's mutex.
+func (w *watermarkTracker) noteBufferedKey(key Datum, convErr error, notDispatched func(Datum) (bool, error), logger *slog.Logger) {
+	if w.bufferedHighUnknown {
+		return
+	}
+	if convErr != nil {
+		logger.Error("failed to create datum in NoteBufferedKey; disabling the above-high-watermark discard", "error", convErr)
+		w.bufferedHighUnknown = true
+		return
+	}
+	ahead, err := notDispatched(key)
+	if err != nil {
+		logger.Error("comparing chunk pointer in NoteBufferedKey; disabling the above-high-watermark discard", "error", err)
+		w.bufferedHighUnknown = true
+		return
+	}
+	if !ahead {
+		// A dispatched chunk already covers the key. The change is deferred
+		// until that chunk commits, never flushed ahead of the copier, and
+		// chunk pointers only move forward, so there is nothing to record.
+		return
+	}
+	if !w.bufferedHighPtr.IsNil() {
+		higher, err := key.GreaterThan(w.bufferedHighPtr)
+		if err != nil {
+			logger.Error("comparing bufferedHighPtr in NoteBufferedKey; disabling the above-high-watermark discard", "error", err)
+			w.bufferedHighUnknown = true
+			return
+		}
+		if !higher {
+			return
+		}
+	}
+	w.bufferedHighPtr = key
+}
+
+// discardSuppressedByBufferedKey reports whether KeyAboveHighWatermark must
+// return FALSE for key because the change stream may already have written it
+// to the target (see noteBufferedKey). Any ambiguity returns TRUE. Caller
+// must hold the chunker's mutex.
+func (w *watermarkTracker) discardSuppressedByBufferedKey(key Datum, logger *slog.Logger) bool {
+	if w.bufferedHighUnknown {
+		return true
+	}
+	if w.bufferedHighPtr.IsNil() {
+		return false
+	}
+	atOrAbove, err := w.bufferedHighPtr.GreaterThanOrEqual(key)
+	if err != nil {
+		logger.Error("comparing bufferedHighPtr in KeyAboveHighWatermark", "error", err)
+		return true
+	}
+	return atOrAbove
 }
 
 // chunkDispatched records that Next() handed out a chunk.

@@ -817,6 +817,11 @@ func (t *chunkerOptimistic) KeyAboveHighWatermark(key0 any) bool {
 			return false
 		}
 	}
+	// The same guard for keys the change stream may have written to the
+	// target ahead of the copier in this run (see NoteBufferedKey).
+	if t.discardSuppressedByBufferedKey(keyDatum, t.logger) {
+		return false
+	}
 	// Finally we check the chunkPtr.
 	above, err := keyDatum.GreaterThanOrEqual(t.chunkPtr)
 	if err != nil {
@@ -901,6 +906,24 @@ func (t *chunkerOptimistic) KeyNotYetDispatched(key0 any) bool {
 		return false
 	}
 	return above
+}
+
+// NoteBufferedKey satisfies MappedChunker. See the interface docs.
+func (t *chunkerOptimistic) NoteBufferedKey(key0 any) {
+	t.Lock()
+	defer t.Unlock()
+	if t.finalChunkSent {
+		// KeyAboveHighWatermark never discards once the final chunk is out.
+		return
+	}
+	keyDatum, err := NewDatum(key0, t.chunkPtr.Tp)
+	t.noteBufferedKey(keyDatum, err, func(key Datum) (bool, error) {
+		if t.chunkPtr.IsNil() {
+			return true, nil
+		}
+		// Same boundary as KeyNotYetDispatched.
+		return key.GreaterThanOrEqual(t.chunkPtr)
+	}, t.logger)
 }
 
 func (t *chunkerOptimistic) Tables() []*TableInfo {

@@ -930,6 +930,18 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 		s.logger.Debug("key above watermark", "key", key[0])
 		return
 	}
+	// The change is admitted. If no dispatched chunk covers its key yet, a
+	// flush can write it to the target ahead of the copier (KeyNotYetDispatched,
+	// or any flush before the optimization is enabled), and the copier's
+	// INSERT IGNORE will then skip the key instead of overwriting it. Tell the
+	// chunker, so it stops discarding later changes for the key: dropping one
+	// would leave this image on the target — a stale row, or a phantom if the
+	// dropped change is a DELETE. This runs before the change is buffered and
+	// under s.Mutex, so no later HasChanged for the key can be discarded in
+	// between, even while a flush has the entry swapped out.
+	if s.chunker != nil {
+		s.chunker.NoteBufferedKey(key[0])
+	}
 
 	hashedKey := utils.HashKey(key)
 
@@ -2071,6 +2083,11 @@ func (s *bufferedMap) flushQueueLocked(ctx context.Context, underLock bool, lock
 // chunker.Next(), which the throttler can stretch arbitrarily — sits above the
 // low watermark until the copier physically reaches its key, and one such
 // entry is enough to make every flush report allChangesFlushed=false.
+//
+// Flushing a not-yet-dispatched key puts it on the target before the copier,
+// whose INSERT IGNORE then skips it. That is safe only because HasChanged
+// reported the key through NoteBufferedKey when it admitted the change, so no
+// later change for the key is discarded as above the high watermark.
 func (s *bufferedMap) mustDeferKey(key0 any) bool {
 	if s.chunker.KeyBelowLowWatermark(key0) {
 		return false // already copied and committed

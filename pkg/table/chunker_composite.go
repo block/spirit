@@ -519,6 +519,11 @@ func (t *chunkerComposite) KeyAboveHighWatermark(key0 any) bool {
 			return false
 		}
 	}
+	// The same guard for keys the change stream may have written to the
+	// target ahead of the copier in this run (see NoteBufferedKey).
+	if t.discardSuppressedByBufferedKey(keyDatum, t.logger) {
+		return false
+	}
 
 	// Check if key is above the current chunkPtr[0] using strict
 	// GreaterThan (see below for why; supports numeric, string, temporal).
@@ -625,6 +630,40 @@ func (t *chunkerComposite) KeyNotYetDispatched(key0 any) bool {
 		return false
 	}
 	return above
+}
+
+// NoteBufferedKey satisfies MappedChunker. See the interface docs.
+func (t *chunkerComposite) NoteBufferedKey(key0 any) {
+	t.Lock()
+	defer t.Unlock()
+	if t.finalChunkSent {
+		// KeyAboveHighWatermark never discards once the final chunk is out.
+		return
+	}
+	var (
+		keyDatum Datum
+		err      error
+	)
+	switch {
+	case len(t.chunkPtrs) > 0:
+		keyDatum, err = NewDatum(key0, t.chunkPtrs[0].Tp)
+	case len(t.chunkKeys) == 0:
+		err = ErrChunkerNotOpen
+	default:
+		// Nothing dispatched yet: use the type Next() will give chunkPtrs[0].
+		var tp datumTp
+		if tp, err = t.Ti.datumTp(t.chunkKeys[0]); err == nil {
+			keyDatum, err = NewDatum(key0, tp)
+		}
+	}
+	t.noteBufferedKey(keyDatum, err, func(key Datum) (bool, error) {
+		if len(t.chunkPtrs) == 0 {
+			return true, nil
+		}
+		// key[0] == chunkPtrs[0] is partly dispatched. Recording it costs
+		// nothing and avoids reasoning about the tuple tail.
+		return key.GreaterThanOrEqual(t.chunkPtrs[0])
+	}, t.logger)
 }
 
 // SetKey allows you to chunk on a secondary index, and not the primary key.

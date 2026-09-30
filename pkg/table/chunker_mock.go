@@ -23,6 +23,10 @@ type MockChunker struct {
 	currentPosition uint64
 	rowsCopied      uint64
 	isComplete      bool
+	// bufferedHigh is the mock's bufferedHighPtr (see NoteBufferedKey);
+	// hasBufferedHigh says whether it is set.
+	bufferedHigh    uint64
+	hasBufferedHigh bool
 
 	// Control behavior
 	openError      error
@@ -268,8 +272,42 @@ func (m *MockChunker) KeyAboveHighWatermark(key any) bool {
 		return false
 	}
 
+	// A key the change stream may already have written to the target is
+	// never discarded (see NoteBufferedKey).
+	if m.hasBufferedHigh && keyPos <= m.bufferedHigh {
+		return false
+	}
+
 	// Key is above high watermark if it's greater than current position
 	return keyPos > m.currentPosition
+}
+
+// NoteBufferedKey records numeric keys that are not yet dispatched (by this
+// mock's KeyNotYetDispatched definition), so KeyAboveHighWatermark stops
+// discarding them. Non-numeric keys are ignored: KeyAboveHighWatermark never
+// discards those.
+func (m *MockChunker) NoteBufferedKey(key any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var keyPos uint64
+	switch v := key.(type) {
+	case int:
+		keyPos = uint64(v)
+	case uint64:
+		keyPos = v
+	case int64:
+		keyPos = uint64(v)
+	default:
+		return
+	}
+	if keyPos <= m.currentPosition {
+		return
+	}
+	if !m.hasBufferedHigh || keyPos > m.bufferedHigh {
+		m.bufferedHigh = keyPos
+		m.hasBufferedHigh = true
+	}
 }
 
 // KeyBelowLowWatermark returns true if the given key is below the current low watermark
