@@ -194,8 +194,10 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					}
 					return ctx.Err()
 				}
-				if errors.Is(err, checkpoint.ErrWriteAbandoned) {
-					// The REPLACE may still commit. A terminal action from here on
+				if errors.Is(err, checkpoint.ErrWriteAbandoned) || dbconn.IsOutcomeUnknown(err) {
+					// The REPLACE may still commit: Write abandoned it, or the
+					// connection was lost with the statement possibly already
+					// on the server. A terminal action from here on
 					// (the reverse cutover's phase writes, complete-forward's
 					// checkpoint drop) could be overwritten by it, so end the
 					// window instead, as the forward dumper aborts the move.

@@ -825,9 +825,9 @@ func newCheckpointLoopWindow(t *testing.T, write func(context.Context, checkpoin
 	}
 }
 
-// TestReverseWindowCheckpointWriteFailure: an abandoned position write may
-// still commit on the server, so the window must end rather than go on to a
-// terminal action the late REPLACE could overwrite. Any other failed write
+// TestReverseWindowCheckpointWriteFailure: an abandoned position write, or one
+// that lost its connection, may still commit on the server, so the window must
+// end rather than go on to a terminal action the late REPLACE could overwrite. Any other failed write
 // left nothing pending and is retried while the window stays open.
 //
 // Sequential: it lengthens reverseWindowPollInterval so the only thing the
@@ -861,6 +861,27 @@ func TestReverseWindowCheckpointWriteFailure(t *testing.T) {
 		require.Len(t, writes, 1, "no write may follow an abandoned one")
 		require.Equal(t, phaseReverseWindow, writes[0].Phase, "a late commit must still resume the window")
 		require.Equal(t, w.r.cutoverAt, writes[0].CutoverAt)
+	})
+
+	t.Run("connection loss ends the window", func(t *testing.T) {
+		// The connection dropped after the REPLACE may have reached the
+		// server, so its outcome is as unknown as an abandoned write's.
+		var calls atomic.Int32
+		w := newCheckpointLoopWindow(t, func(context.Context, checkpoint.Record) error {
+			calls.Add(1)
+			return fmt.Errorf("write checkpoint: %w", mysql.ErrInvalidConn)
+		})
+		done := make(chan error, 1)
+		go func() { done <- w.hold(t.Context()) }()
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the window kept running after a checkpoint write lost its connection")
+		}
+		require.ErrorIs(t, err, mysql.ErrInvalidConn)
+		require.ErrorIs(t, err, status.ErrFatalAbort)
+		require.Equal(t, int32(1), calls.Load(), "no write may follow one with an unknown outcome")
 	})
 
 	t.Run("other write errors are retried", func(t *testing.T) {
