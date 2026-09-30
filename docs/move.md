@@ -151,7 +151,7 @@ The marker and the checkpoint are dropped once the rollback completes.
 
 - **Unsharded source only.** `--reverse-window` requires a single source (a 1→M move). A sharded source would need an M:N reverse and is rejected at startup.
 - **Stale marker.** If `_spirit_move_revert` already exists when a move starts, or when it reaches cutover — e.g. left over from a prior interrupted rollback — the move refuses to run, so a leftover marker is never mistaken for a fresh request.
-- **Resume.** The checkpoint records that the move entered its reverse window (via a `move_phase` column and the cutover time), so a move killed *during* the window resumes back into it rather than re-copying. A move killed *mid-rollback* is not auto-resumed and must be completed manually.
+- **Resume.** The checkpoint records that the move entered its reverse window (via a `move_phase` column and the cutover time), so a move killed *during* the window resumes back into it rather than re-copying. While the window is open, the checkpoint also records how far the reverse feed has applied the target's binary log, so a resumed window continues from there rather than from the cutover, and needs only the target's binary logs from that point on. A move killed *mid-rollback* is not auto-resumed and must be completed manually.
 
 ```bash
 spirit move --reverse-window 30m \

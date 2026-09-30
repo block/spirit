@@ -10,10 +10,14 @@ package move
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -650,6 +654,330 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 	require.True(t, tableExists(t, ctl, "rwrk_src", "t1"), "source un-retired after rollback")
 	require.True(t, tableExists(t, ctl, "rwrk_dst", "t1_revert"), "target retired to _revert after rollback")
 	require.False(t, tableExists(t, ctl, "rwrk_dst", "t1"), "target real table gone after rollback")
+}
+
+// reverseCheckpointRow is the part of the checkpoint row a reverse window owns.
+type reverseCheckpointRow struct {
+	positions map[string]string
+	phase     string
+	cutoverAt string
+}
+
+func readReverseCheckpoint(ctx context.Context, db *sql.DB, dbName string) (reverseCheckpointRow, error) {
+	qctx, cancel := context.WithTimeout(ctx, waitQueryTimeout)
+	defer cancel()
+	var row reverseCheckpointRow
+	var posJSON string
+	if err := db.QueryRowContext(qctx,
+		"SELECT binlog_position, move_phase, cutover_at FROM "+dbName+"."+checkpointTableName+" WHERE id=1",
+	).Scan(&posJSON, &row.phase, &row.cutoverAt); err != nil {
+		return row, err
+	}
+	return row, json.Unmarshal([]byte(posJSON), &row.positions)
+}
+
+// positionCovers reports whether the parameter have, a change-feed position,
+// is at or past the parameter want, in either coordinate scheme.
+func positionCovers(ctx context.Context, db *sql.DB, have, want string) (bool, error) {
+	if have == "" {
+		return false, nil
+	}
+	if change.IsGTIDPosition(want) {
+		qctx, cancel := context.WithTimeout(ctx, waitQueryTimeout)
+		defer cancel()
+		var covered bool
+		err := db.QueryRowContext(qctx, "SELECT GTID_SUBSET(?, ?)", want, have).Scan(&covered)
+		return covered, err
+	}
+	split := func(pos string) (string, int64, error) {
+		i := strings.LastIndex(pos, ":")
+		if i < 0 {
+			return "", 0, fmt.Errorf("malformed binlog position %q", pos)
+		}
+		off, err := strconv.ParseInt(pos[i+1:], 10, 64)
+		return pos[:i], off, err
+	}
+	haveFile, haveOff, err := split(have)
+	if err != nil {
+		return false, err
+	}
+	wantFile, wantOff, err := split(want)
+	if err != nil {
+		return false, err
+	}
+	// Binlog file names share a prefix and a fixed-width sequence number.
+	return haveFile > wantFile || (haveFile == wantFile && haveOff >= wantOff), nil
+}
+
+// TestMoveReverseWindowCheckpointsFeedPositions: during the reverse window the
+// checkpoint must follow the reverse feed's flushed position, not stay at the
+// position captured at cutover. With the cutover position only, every restart
+// re-reads the whole window's binlog, and cannot resume at all once the target
+// has purged it — traffic is on the target by then, so the move is stuck.
+func TestMoveReverseWindowCheckpointsFeedPositions(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	oldFlush := reverseFeedFlushInterval
+	reverseFeedFlushInterval = 100 * time.Millisecond
+	t.Cleanup(func() { reverseFeedFlushInterval = oldFlush })
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcp_src", "rwcp_dst")
+
+	run1, err := NewRunner(&Move{
+		SourceDSN: sourceDSN, TargetDSN: targetDSN,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	run1.SetCutover(func(context.Context) error { return nil })
+	h1 := startRun(t, run1)
+	deadline := h1.awaitReverseWindow(ctl, "rwcp_dst")
+	h1.awaitTable(deadline, ctl, "rwcp_src", "t1_old")
+	atCutover, err := readReverseCheckpoint(t.Context(), ctl, "rwcp_dst")
+	require.NoError(t, err)
+
+	// Write to the target, now serving, and take its head position after the
+	// writes. The checkpoint must come to cover it.
+	testutils.RunSQL(t, "INSERT INTO rwcp_dst.t1 (id, val) VALUES (10,'ten'),(11,'eleven')")
+	key := targetKey(run1.targets[0])
+	head, err := targetCurrentPosition(t.Context(), run1, &run1.targets[0])
+	require.NoError(t, err)
+	var last reverseCheckpointRow
+	var lastErr error
+	h1.poll(deadline, func() bool {
+		last, lastErr = readReverseCheckpoint(t.Context(), ctl, "rwcp_dst")
+		if lastErr != nil {
+			return false
+		}
+		covered, cerr := positionCovers(t.Context(), ctl, last.positions[key], head)
+		require.NoError(t, cerr)
+		return covered
+	}, func() string {
+		return fmt.Sprintf("checkpointed reverse position never reached the target head %q; cutover position=%q, last=%q, last read error=%v",
+			head, atCutover.positions[key], last.positions[key], lastErr)
+	})
+	require.Equal(t, phaseReverseWindow, last.phase, "the position checkpoint must keep the reverse-window phase")
+	require.Equal(t, atCutover.cutoverAt, last.cutoverAt, "the position checkpoint must keep the cutover time (the window deadline)")
+	// A position past the writes is only safe to resume from once the feed has
+	// applied them to the retired source table.
+	var applied int
+	require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM rwcp_src.t1_old WHERE id IN (10, 11)").Scan(&applied))
+	require.Equal(t, 2, applied, "checkpointed past writes the reverse feed had not applied")
+
+	require.ErrorIs(t, h1.kill(), context.Canceled, "run 1 must die from the kill, not an earlier failure")
+	h1.close()
+
+	// Written while nothing is running: the resumed feed starts from the
+	// advanced position and must still pick this up.
+	testutils.RunSQL(t, "INSERT INTO rwcp_dst.t1 (id, val) VALUES (12,'twelve')")
+
+	run2, err := NewRunner(&Move{
+		SourceDSN: sourceDSN, TargetDSN: targetDSN,
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	run2.SetCutover(func(context.Context) error {
+		t.Error("resume must NOT run the forward cutover again")
+		return nil
+	})
+	h2 := startRun(t, run2)
+	h2.awaitReverseWindow(ctl, "rwcp_dst")
+	testutils.RunSQL(t, "CREATE TABLE rwcp_dst."+revertMarkerName+" (id INT)")
+	h2.awaitDone(reverseCutoverTimeout, "the resumed reverse window to roll back")
+
+	var ids []int
+	rows, err := ctl.QueryContext(t.Context(), "SELECT id FROM rwcp_src.t1 ORDER BY id")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var id int
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []int{1, 2, 3, 10, 11, 12}, ids, "the rolled-back source must hold every write made on the target")
+}
+
+// newCheckpointLoopWindow builds a reverseWindow whose loop can run without a
+// live topology: a fake feed with a position the checkpoint has not recorded
+// yet, a window that does not elapse, and terminal side effects that fail the
+// test if the loop reaches them.
+func newCheckpointLoopWindow(t *testing.T, write func(context.Context, checkpoint.Record) error) *reverseWindow {
+	t.Helper()
+	cfg := &mysql.Config{Addr: "target:3306", DBName: "dst"}
+	unexpected := func(what string) func(context.Context) error {
+		return func(context.Context) error {
+			t.Errorf("the window loop must not %s", what)
+			return nil
+		}
+	}
+	return &reverseWindow{
+		r: &Runner{
+			logger:           slog.Default(),
+			move:             &Move{ReverseWindow: time.Hour},
+			targets:          []applier.Target{{Config: cfg}},
+			cutoverAt:        time.Now(),
+			reversePositions: map[string]string{"target:3306/dst/": "uuid:1-5"},
+		},
+		feed: &ReverseFeed{clients: []change.Source{&change.MockSource{Pos: "uuid:1-9"}}},
+		persistPhase: func(context.Context, string) error {
+			t.Error("the window loop must not write a phase")
+			return nil
+		},
+		dropMarker:      unexpected("drop the revert marker"),
+		dropCheckpoint:  unexpected("drop the checkpoint"),
+		writeCheckpoint: write,
+	}
+}
+
+// TestReverseWindowCheckpointKeysEachPositionByItsTarget: with several targets,
+// each checkpointed position must be stored under the target whose binlog it
+// came from. A position stored under another target's key resumes that
+// target's feed at a coordinate on the wrong server.
+func TestReverseWindowCheckpointKeysEachPositionByItsTarget(t *testing.T) {
+	targets := []applier.Target{
+		{Config: &mysql.Config{Addr: "target-a:3306", DBName: "dst"}},
+		{Config: &mysql.Config{Addr: "target-b:3306", DBName: "dst"}},
+	}
+	var written checkpoint.Record
+	w := &reverseWindow{
+		r: &Runner{
+			targets:   targets,
+			cutoverAt: time.Now(),
+			reversePositions: map[string]string{
+				targetKey(targets[0]): "binlog.000001:4",
+				targetKey(targets[1]): "binlog.000007:4",
+			},
+		},
+		feed: &ReverseFeed{clients: []change.Source{
+			&change.MockSource{Pos: "binlog.000001:900"},
+			&change.MockSource{Pos: "binlog.000007:300"},
+		}},
+		writeCheckpoint: func(_ context.Context, rec checkpoint.Record) error {
+			written = rec
+			return nil
+		},
+	}
+	require.NoError(t, w.checkpointPositions(t.Context()))
+	var got map[string]string
+	require.NoError(t, json.Unmarshal([]byte(written.Position), &got))
+	require.Equal(t, map[string]string{
+		targetKey(targets[0]): "binlog.000001:900",
+		targetKey(targets[1]): "binlog.000007:300",
+	}, got)
+}
+
+// TestReverseWindowCheckpointWriteFailure: a position write that reached the
+// server with an unknown outcome (abandoned, or its connection lost after the
+// REPLACE was sent) may still commit, so the window must end rather than go on
+// to a terminal action the late REPLACE could overwrite. A write that was never
+// sent, or that the server answered with an error, left nothing pending and is
+// retried while the window stays open.
+//
+// Sequential: it lengthens reverseWindowPollInterval so the only thing the
+// loop does is checkpoint (status.CheckpointDumpInterval is 100ms here).
+func TestReverseWindowCheckpointWriteFailure(t *testing.T) {
+	old := reverseWindowPollInterval
+	reverseWindowPollInterval = time.Hour
+	t.Cleanup(func() { reverseWindowPollInterval = old })
+
+	t.Run("abandoned write ends the window", func(t *testing.T) {
+		// Pins the defensive arm: a real Write abandons only after ctx is
+		// done, which the loop's shutdown branch handles first. The fake
+		// returns ErrWriteAbandoned with ctx live, as a Write with a deadline
+		// of its own could.
+		var mu sync.Mutex
+		var writes []checkpoint.Record
+		w := newCheckpointLoopWindow(t, func(_ context.Context, rec checkpoint.Record) error {
+			mu.Lock()
+			defer mu.Unlock()
+			writes = append(writes, rec)
+			return fmt.Errorf("%w: session 42 did not answer in time and could not be killed, so the REPLACE may still commit", checkpoint.ErrWriteAbandoned)
+		})
+		done := make(chan error, 1)
+		go func() { done <- w.hold(t.Context()) }()
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the window kept running after an abandoned checkpoint write")
+		}
+		require.ErrorIs(t, err, checkpoint.ErrWriteAbandoned)
+		require.ErrorIs(t, err, status.ErrFatalAbort)
+		mu.Lock()
+		defer mu.Unlock()
+		require.Len(t, writes, 1, "no write may follow an abandoned one")
+		require.Equal(t, phaseReverseWindow, writes[0].Phase, "a late commit must still resume the window")
+		require.Equal(t, w.r.cutoverAt, writes[0].CutoverAt)
+	})
+
+	t.Run("connection loss ends the window", func(t *testing.T) {
+		// The connection dropped after the REPLACE may have reached the
+		// server, so its outcome is as unknown as an abandoned write's.
+		var calls atomic.Int32
+		w := newCheckpointLoopWindow(t, func(context.Context, checkpoint.Record) error {
+			calls.Add(1)
+			return fmt.Errorf("write checkpoint: %w", mysql.ErrInvalidConn)
+		})
+		done := make(chan error, 1)
+		go func() { done <- w.hold(t.Context()) }()
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the window kept running after a checkpoint write lost its connection")
+		}
+		require.ErrorIs(t, err, mysql.ErrInvalidConn)
+		require.ErrorIs(t, err, status.ErrFatalAbort)
+		require.Equal(t, int32(1), calls.Load(), "no write may follow one with an unknown outcome")
+	})
+
+	t.Run("connection loss before the REPLACE is sent is retried", func(t *testing.T) {
+		// Write marks a failure before the REPLACE reached the server, so
+		// nothing can commit late even though the connection was lost.
+		var calls atomic.Int32
+		w := newCheckpointLoopWindow(t, func(context.Context, checkpoint.Record) error {
+			calls.Add(1)
+			return fmt.Errorf("%w: %w", checkpoint.ErrWriteNotSent, mysql.ErrInvalidConn)
+		})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- w.hold(ctx) }()
+		deadline := time.After(10 * time.Second)
+		for calls.Load() < 3 {
+			select {
+			case err := <-done:
+				t.Fatalf("the window ended on a checkpoint write that was never sent: %v", err)
+			case <-deadline:
+				t.Fatalf("the window did not retry the checkpoint write; calls=%d", calls.Load())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+
+	t.Run("other write errors are retried", func(t *testing.T) {
+		var calls atomic.Int32
+		w := newCheckpointLoopWindow(t, func(context.Context, checkpoint.Record) error {
+			calls.Add(1)
+			return errors.New("lock wait timeout exceeded")
+		})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- w.hold(ctx) }()
+		deadline := time.After(10 * time.Second)
+		for calls.Load() < 3 {
+			select {
+			case err := <-done:
+				t.Fatalf("the window ended on a retryable checkpoint write error: %v", err)
+			case <-deadline:
+				t.Fatalf("the window did not retry the checkpoint write; calls=%d", calls.Load())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+		require.Equal(t, map[string]string{"target:3306/dst/": "uuid:1-5"}, w.r.reversePositions,
+			"a failed write must not advance the recorded positions")
+	})
 }
 
 // TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence verifies that a

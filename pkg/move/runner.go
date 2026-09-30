@@ -196,8 +196,10 @@ type Runner struct {
 	terminalOwnership atomic.Uint32
 	// reversePositions holds each target's binlog position captured by the
 	// pre-switch hook (keyed by targetKey) — the start points for the reverse
-	// feeds. cutoverAt is set by the post-switch hook when the forward cutover
-	// completes, and the reverse-window deadline is measured from it.
+	// feeds. During the window it tracks the last positions checkpointed (see
+	// reverseWindow.checkpointPositions). cutoverAt is set by the post-switch
+	// hook when the forward cutover completes, and the reverse-window deadline
+	// is measured from it.
 	reversePositions map[string]string
 	cutoverAt        time.Time
 
@@ -1090,12 +1092,12 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 
 // resumeReverseWindow rebuilds the reverse-window state from the checkpoint and
 // re-enters the window. The reverse feeds restart from the checkpointed
-// positions and catch up whatever the source missed while the process was down.
+// positions (the window keeps them current; see
+// reverseWindow.checkpointPositions) and catch up whatever the source missed
+// while the process was down.
 //
 // v1 note: no advisory locks are re-acquired here (a concurrent second restart
-// of the same move is an operator error), and the feed always resumes from the
-// original cutover position — correct via idempotent apply, at the cost of
-// re-reading the window's binlog.
+// of the same move is an operator error).
 func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record) error {
 	var positions map[string]string
 	if err := json.Unmarshal([]byte(rec.Position), &positions); err != nil {
