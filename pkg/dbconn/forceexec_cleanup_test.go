@@ -140,7 +140,7 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 						}
 						return []int{pid}, nil
 					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail() }, nil)
-				// Released: the retry succeeds before its own timer fires.
+				// Released: the retry succeeds before its own kill worker kills.
 				// Blocked: every attempt times out and re-arms the kill.
 				expectedCalls := 1
 				if !release {
@@ -191,8 +191,8 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 		waitingOn(tt.DB),
 		func(ctx context.Context, _ int) ([]int, error) {
 			calls++
-			// The timer fires at 900ms. Hold the blocker beyond the first
-			// statement's one-second timeout, then let it exit voluntarily.
+			// The kill runs at the 900ms delay. Hold the blocker beyond the
+			// first statement's one-second timeout, then let it exit voluntarily.
 			timer := time.NewTimer(250 * time.Millisecond)
 			defer timer.Stop()
 			select {
@@ -248,10 +248,10 @@ func TestForceExecRetryKillsFreshBlocker(t *testing.T) {
 		func(ctx context.Context, connID int) ([]int, error) {
 			attempts++
 			if attempts > 1 {
-				// The retry's timer fired: the real kill must find the fresh blocker.
+				// The retry's kill worker saw it waiting: the real kill must find the fresh blocker.
 				return killLockingTransactions(ctx, db, tables, config, slog.Default(), []int{connID})
 			}
-			// The timer fires at 900ms. Hold the first blocker past the
+			// The kill runs at the 900ms delay. Hold the first blocker past the
 			// one-second lock budget so the first attempt definitely fails,
 			// then swap in a fresh blocker before the retry can run. With
 			// the first attempt's request withdrawn nothing queues ahead
@@ -803,15 +803,74 @@ func TestForceExecSparesTrafficDuringAnInplaceRebuild(t *testing.T) {
 }
 
 // A statement queued behind a blocker keeps waiting until it gets its lock, so
-// a check that fails while the wait is in progress does not restart it. The
-// blocker is killed at the delay, the same as if every check had succeeded,
+// a single check that fails while the wait is in progress does not restart it.
+// The blocker is killed at the delay, the same as if every check had succeeded,
 // and not a full delay after the failed check, which with a delay close to the
-// lock wait timeout would come too late to kill or retry at all.
+// lock wait timeout would come too late to kill or retry at all. Over several
+// failed checks in a row, the statement could have got its lock and started a
+// new wait, so the wait restarts and the blocker gets the full delay from the
+// last of them.
 func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
-	tt := testutils.NewTestTable(t, "forceexec_check_blip", "CREATE TABLE forceexec_check_blip (id INT PRIMARY KEY)")
+	for _, tc := range []struct {
+		name               string
+		failFrom, failTill time.Duration
+		killedFrom         time.Duration
+		killedBefore       time.Duration
+	}{
+		{name: "one failed check", failFrom: 450 * time.Millisecond, failTill: 550 * time.Millisecond,
+			killedFrom: time.Second, killedBefore: 1300 * time.Millisecond},
+		{name: "failed checks in a row", failFrom: 400 * time.Millisecond, failTill: 700 * time.Millisecond,
+			killedFrom: 1400 * time.Millisecond, killedBefore: 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "forceexec_check_blip", "CREATE TABLE forceexec_check_blip (id INT PRIMARY KEY)")
+			config := NewDBConfig()
+			config.LockWaitTimeout = 4
+			config.ForceKillAfter = time.Second
+			db, err := New(testutils.DSN(), config)
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+			blocker, err := tt.DB.BeginTx(t.Context(), nil)
+			require.NoError(t, err)
+			defer func() { _ = blocker.Rollback() }()
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_check_blip")
+			require.NoError(t, err)
+			tbl := table.NewTableInfo(db, "test", "forceexec_check_blip")
+			started := time.Now()
+			realWaiting := waitingOn(tt.DB)
+			var killedAfter time.Duration
+			killCalls := 0
+			err = forceExec(ctx, db, config, slog.Default(),
+				"ALTER TABLE forceexec_check_blip ADD COLUMN c INT, ALGORITHM=INSTANT",
+				func(ctx context.Context, connID int) (bool, error) {
+					if elapsed := time.Since(started); elapsed >= tc.failFrom && elapsed < tc.failTill {
+						return false, io.EOF
+					}
+					return realWaiting(ctx, connID)
+				},
+				func(ctx context.Context, connID int) ([]int, error) {
+					killCalls++
+					killedAfter = time.Since(started)
+					return killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), []int{connID})
+				}, waitForKilledTransactions, nil)
+			require.NoError(t, err)
+			require.Equal(t, 1, killCalls)
+			require.GreaterOrEqual(t, killedAfter, tc.killedFrom)
+			require.Less(t, killedAfter, tc.killedBefore)
+		})
+	}
+}
+
+// A check that sees the statement waiting can end after the delay has passed.
+// The next check then runs at once rather than a poll interval later, so the
+// kill still comes within one check of the delay.
+func TestForceExecKillsRightAfterACheckThatRunsPastTheDelay(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_slow_check", "CREATE TABLE forceexec_slow_check (id INT PRIMARY KEY)")
 	config := NewDBConfig()
 	config.LockWaitTimeout = 4
-	config.ForceKillAfter = time.Second
+	config.ForceKillAfter = 850 * time.Millisecond
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -820,31 +879,36 @@ func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
 	defer func() { _ = blocker.Rollback() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_check_blip")
+	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_slow_check")
 	require.NoError(t, err)
-	tbl := table.NewTableInfo(db, "test", "forceexec_check_blip")
+	tbl := table.NewTableInfo(db, "test", "forceexec_slow_check")
 	started := time.Now()
-	realWaiting := waitingOn(tt.DB)
+	// The statement really is waiting. Every check says so at once, except
+	// the one that starts shortly before the delay, which ends 30ms after it.
+	const slowCheckEnds = 880 * time.Millisecond
 	var killedAfter time.Duration
-	killCalls := 0
+	attempts := 0
 	err = forceExec(ctx, db, config, slog.Default(),
-		"ALTER TABLE forceexec_check_blip ADD COLUMN c INT, ALGORITHM=INSTANT",
-		func(ctx context.Context, connID int) (bool, error) {
-			// Checks fail for a stretch in the middle of the wait.
-			if elapsed := time.Since(started); elapsed >= 400*time.Millisecond && elapsed < 600*time.Millisecond {
-				return false, io.EOF
+		"ALTER TABLE forceexec_slow_check ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(ctx context.Context, _ int) (bool, error) {
+			if elapsed := time.Since(started); elapsed >= 750*time.Millisecond && elapsed < config.ForceKillAfter {
+				select {
+				case <-time.After(time.Until(started.Add(slowCheckEnds))):
+				case <-ctx.Done():
+					return false, ctx.Err()
+				}
 			}
-			return realWaiting(ctx, connID)
+			return true, nil
 		},
 		func(ctx context.Context, connID int) ([]int, error) {
-			killCalls++
+			attempts++
 			killedAfter = time.Since(started)
 			return killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), []int{connID})
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
-	require.Equal(t, 1, killCalls)
-	require.GreaterOrEqual(t, killedAfter, config.ForceKillAfter)
-	require.Less(t, killedAfter, config.ForceKillAfter+300*time.Millisecond, "the failed checks must not restart the wait")
+	require.Equal(t, 1, attempts)
+	require.GreaterOrEqual(t, killedAfter, slowCheckEnds)
+	require.Less(t, killedAfter, slowCheckEnds+40*time.Millisecond, "the kill must follow the slow check, not wait for the next poll")
 }
 
 // The kill worker checks at the moment the delay is reached, not only on its
