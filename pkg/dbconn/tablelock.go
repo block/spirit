@@ -134,9 +134,13 @@ func killTableLockBlockers(ctx, lockCtx context.Context, db *sql.DB, tables []*t
 		select {
 		case <-lockCtx.Done():
 			retry.Stop()
+		case <-retry.C:
+		}
+		// The timer can fire as LOCK TABLES returns, and select may pick
+		// either, so check that the statement still waits before looking again.
+		if lockCtx.Err() != nil {
 			logger.Error("failed to kill locking transactions: the table lock stopped waiting before the blocking sessions could be listed", "error", err)
 			return
-		case <-retry.C:
 		}
 	}
 }
