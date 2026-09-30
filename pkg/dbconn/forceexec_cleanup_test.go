@@ -1087,31 +1087,53 @@ func TestForceExecKillsRightAfterACheckThatRunsPastTheDelay(t *testing.T) {
 	tbl := table.NewTableInfo(db, "test", "forceexec_slow_check")
 	started := time.Now()
 	// The statement really is waiting. Every check says so at once, except
-	// the one that starts shortly before the delay, which ends 30ms after it.
-	const slowCheckEnds = 880 * time.Millisecond
-	var killedAfter time.Duration
-	attempts := 0
+	// the last one that starts before the delay, which ends 30ms after it.
+	// The slow check is picked by count, not by time since started: the
+	// worker's clock starts later, once forceExec has a connection and its ID.
+	// While the delay is more than a poll away, each check starts a full poll
+	// after the one before it returned, so the slow check starts at least
+	// 800ms into the worker's wait and returns at least 880ms into it.
+	slowCheck := int(config.ForceKillAfter / killPollInterval)
+	const slowCheckTakes = 80 * time.Millisecond
+	var killedAt, slowCheckReturned, lastCheckStarted time.Time
+	checks, attempts := 0, 0
 	err = forceExec(ctx, db, config, slog.Default(),
 		"ALTER TABLE forceexec_slow_check ADD COLUMN c INT, ALGORITHM=INSTANT",
 		func(ctx context.Context, _ int) (bool, error) {
-			if elapsed := time.Since(started); elapsed >= 750*time.Millisecond && elapsed < config.ForceKillAfter {
+			lastCheckStarted = time.Now()
+			checks++
+			if checks == slowCheck {
 				select {
-				case <-time.After(time.Until(started.Add(slowCheckEnds))):
+				case <-time.After(slowCheckTakes):
 				case <-ctx.Done():
 					return false, ctx.Err()
 				}
+				slowCheckReturned = time.Now()
 			}
 			return true, nil
 		},
 		func(ctx context.Context, connID int) ([]int, error) {
 			attempts++
-			killedAfter = time.Since(started)
+			killedAt = time.Now()
 			return killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), []int{connID})
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, attempts)
-	require.GreaterOrEqual(t, killedAfter, slowCheckEnds)
-	require.Less(t, killedAfter, slowCheckEnds+40*time.Millisecond, "the kill must follow the slow check, not wait for the next poll")
+	require.False(t, slowCheckReturned.IsZero(), "the slow check must have run")
+	// The check that killed must have started at the delay or later. The
+	// worker starts its clock after started, so this bound never fails a
+	// correct kill.
+	require.GreaterOrEqual(t, lastCheckStarted.Sub(started), config.ForceKillAfter, "the kill must not come before the delay")
+	// Waiting for the next poll would put the kill a full poll interval after
+	// the slow check returned. Half an interval leaves room for scheduling
+	// delays.
+	require.Less(t, killedAt.Sub(slowCheckReturned), killPollInterval/2, "the kill must follow the slow check, not wait for the next poll")
+	// The slow check ends past the delay, so the check right after it kills.
+	// The slow check kills itself only if polls drifted enough that it started
+	// past the delay. A kill that lands late, after a run of checks that each
+	// follow the last at once, would come from a later check and still be
+	// within half an interval of the slow check.
+	require.LessOrEqual(t, checks, slowCheck+1, "the kill must come from the check right after the slow one")
 }
 
 // The kill worker checks at the moment the delay is reached, not only on its
@@ -1139,20 +1161,36 @@ func TestForceExecKillsAtTheDelayBetweenPolls(t *testing.T) {
 	require.NoError(t, err)
 	tbl := table.NewTableInfo(db, "test", "forceexec_between_polls")
 	started := time.Now()
-	var killedAfter time.Duration
+	var killedAt time.Time
+	var checksReturned []time.Time
 	attempts := 0
 	err = forceExec(ctx, db, config, slog.Default(),
 		"ALTER TABLE forceexec_between_polls ADD COLUMN c INT, ALGORITHM=INSTANT",
-		func(context.Context, int) (bool, error) { return true, nil },
+		func(context.Context, int) (bool, error) {
+			checksReturned = append(checksReturned, time.Now())
+			return true, nil
+		},
 		func(ctx context.Context, connID int) ([]int, error) {
 			attempts++
-			killedAfter = time.Since(started)
+			killedAt = time.Now()
 			return killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), []int{connID})
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, attempts)
-	require.GreaterOrEqual(t, killedAfter, config.ForceKillAfter)
-	require.Less(t, killedAfter, config.ForceKillAfter+40*time.Millisecond, "the kill must land at the delay, not on the next poll")
+	require.GreaterOrEqual(t, killedAt.Sub(started), config.ForceKillAfter)
+	// The last check is the one that killed. The poll before it lands half an
+	// interval before the delay, so the kill follows it by about half an
+	// interval. Waiting for the next poll would put the kill at least a full
+	// interval after it. Measuring from that poll, not from the test's start,
+	// keeps connection setup and a late poll out of the budget.
+	require.GreaterOrEqual(t, len(checksReturned), 2)
+	lastPoll := checksReturned[len(checksReturned)-2]
+	require.Less(t, killedAt.Sub(lastPoll), killPollInterval, "the kill must land at the delay, not on the next poll")
+	// The poll before the kill must be a regular one, a full interval after the
+	// check before it. Otherwise a kill that lands late, after a run of checks
+	// that each follow the last at once, is within an interval of the last one.
+	require.GreaterOrEqual(t, len(checksReturned), 3)
+	require.GreaterOrEqual(t, lastPoll.Sub(checksReturned[len(checksReturned)-3]), killPollInterval, "the poll before the kill must be a regular poll")
 }
 
 // A statement that holds its locks and runs is checked once per poll interval,
