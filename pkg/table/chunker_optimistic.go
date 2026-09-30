@@ -920,13 +920,7 @@ func (t *chunkerOptimistic) NoteBufferedKey(key0 any) {
 		return
 	}
 	keyDatum, err := NewDatum(key0, t.chunkPtr.Tp)
-	t.noteBufferedKey(keyDatum, err, func(key Datum) (bool, error) {
-		if t.chunkPtr.IsNil() {
-			return true, nil
-		}
-		// Same boundary as KeyNotYetDispatched.
-		return key.GreaterThanOrEqual(t.chunkPtr)
-	}, t.logger)
+	t.noteBufferedKey(keyDatum, err, t.chunkPtr, t.Ti.QuotedTableName, t.logger)
 }
 
 func (t *chunkerOptimistic) Tables() []*TableInfo {

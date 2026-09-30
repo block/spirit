@@ -48,23 +48,29 @@ type watermarkTracker struct {
 }
 
 // noteBufferedKey implements BufferedKeyNoter.NoteBufferedKey for both chunkers.
-// notDispatched is the caller's answer to "is key possibly not yet covered by
-// a dispatched chunk"; convErr is the error from converting key0 to a Datum.
-// Caller must hold the chunker's mutex.
-func (w *watermarkTracker) noteBufferedKey(key Datum, convErr error, notDispatched func(Datum) (bool, error), logger *slog.Logger) {
+// dispatchPtr is the lowest key the chunker has not yet dispatched (chunks
+// are [lower, dispatchPtr)), or a nil Datum before the first dispatch;
+// convErr is the error from converting key0 to a Datum. tableName is only
+// used for logging. Caller must hold the chunker's mutex.
+func (w *watermarkTracker) noteBufferedKey(key Datum, convErr error, dispatchPtr Datum, tableName string, logger *slog.Logger) {
 	if w.bufferedHighUnknown {
 		return
 	}
 	if convErr != nil {
-		logger.Error("failed to create datum in NoteBufferedKey; disabling the above-high-watermark discard", "error", convErr)
+		logger.Error("failed to create datum in NoteBufferedKey; disabling the above-high-watermark discard", "table", tableName, "error", convErr)
 		w.bufferedHighUnknown = true
 		return
 	}
-	ahead, err := notDispatched(key)
-	if err != nil {
-		logger.Error("comparing chunk pointer in NoteBufferedKey; disabling the above-high-watermark discard", "error", err)
-		w.bufferedHighUnknown = true
-		return
+	// Same boundary as KeyNotYetDispatched: dispatchPtr itself has not been
+	// dispatched, so a flush may write it ahead of the copier.
+	ahead := true
+	if !dispatchPtr.IsNil() {
+		var err error
+		if ahead, err = key.GreaterThanOrEqual(dispatchPtr); err != nil {
+			logger.Error("comparing chunk pointer in NoteBufferedKey; disabling the above-high-watermark discard", "table", tableName, "error", err)
+			w.bufferedHighUnknown = true
+			return
+		}
 	}
 	if !ahead {
 		// A dispatched chunk already covers the key. The change is deferred
@@ -75,13 +81,21 @@ func (w *watermarkTracker) noteBufferedKey(key Datum, convErr error, notDispatch
 	if !w.bufferedHighPtr.IsNil() {
 		higher, err := key.GreaterThan(w.bufferedHighPtr)
 		if err != nil {
-			logger.Error("comparing bufferedHighPtr in NoteBufferedKey; disabling the above-high-watermark discard", "error", err)
+			logger.Error("comparing bufferedHighPtr in NoteBufferedKey; disabling the above-high-watermark discard", "table", tableName, "error", err)
 			w.bufferedHighUnknown = true
 			return
 		}
 		if !higher {
 			return
 		}
+	}
+	if w.bufferedHighPtr.IsNil() {
+		// Logged once per chunker: the guard only rises after this. On an
+		// actively written table the guard usually ends up near the table's
+		// max key, which turns the above-high-watermark discard off for
+		// most of the copy; this line makes that visible.
+		logger.Info("change stream admitted a key the copier has not reached; changes at or below the highest such key will be applied instead of discarded as above the high watermark",
+			"table", tableName, "key", key.String(), "dispatch_ptr", dispatchPtr.String())
 	}
 	w.bufferedHighPtr = key
 }

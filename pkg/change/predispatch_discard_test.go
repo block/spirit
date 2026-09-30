@@ -52,6 +52,9 @@ const (
 // change had already put the key on the target. The target kept the first
 // image (UPDATE), or a row the source no longer has (DELETE), with no change
 // left buffered and the flushed position past both transactions.
+//
+// Every case runs on both chunkers (optimistic and composite), with and
+// without the table.BufferedKeyNoter capability, and with both clients.
 func TestPreDispatchChangeThenAboveHighWatermark(t *testing.T) {
 	clients := map[string]func(t *testing.T, db *sql.DB, appl applier.Applier) preDispatchClient{
 		"binlog": func(t *testing.T, db *sql.DB, appl applier.Applier) preDispatchClient {
@@ -68,21 +71,43 @@ func TestPreDispatchChangeThenAboveHighWatermark(t *testing.T) {
 	}
 	timings := []preDispatchTiming{firstStillBuffered, firstFlushedBeforeDispatch, firstFlushedBeforeOptimization}
 	for clientName, newClient := range clients {
-		for _, chunkerKind := range []string{"with-noter", "without-noter"} {
-			hideNoter := chunkerKind == "without-noter"
-			for _, timing := range timings {
-				for _, secondIsDelete := range []bool{false, true} {
-					op := "update"
-					if secondIsDelete {
-						op = "delete"
+		// An AUTO_INCREMENT key selects the optimistic chunker; any other key
+		// the composite chunker.
+		for _, chunkerType := range []string{"optimistic", "composite"} {
+			for _, noterKind := range []string{"with-noter", "without-noter"} {
+				for _, timing := range timings {
+					for _, secondIsDelete := range []bool{false, true} {
+						op := "update"
+						if secondIsDelete {
+							op = "delete"
+						}
+						c := preDispatchCase{
+							timing:         timing,
+							secondIsDelete: secondIsDelete,
+							hideNoter:      noterKind == "without-noter",
+							composite:      chunkerType == "composite",
+						}
+						t.Run(fmt.Sprintf("%s/%s/%s/%s/%s", clientName, chunkerType, noterKind, timing, op), func(t *testing.T) {
+							runPreDispatchScenario(t, newClient, c)
+						})
 					}
-					t.Run(fmt.Sprintf("%s/%s/%s/%s", clientName, chunkerKind, timing, op), func(t *testing.T) {
-						runPreDispatchScenario(t, newClient, timing, secondIsDelete, hideNoter)
-					})
 				}
 			}
 		}
 	}
+}
+
+// preDispatchCase is one combination of TestPreDispatchChangeThenAboveHighWatermark.
+type preDispatchCase struct {
+	timing         preDispatchTiming
+	secondIsDelete bool
+	// hideNoter gives the subscription a chunker without
+	// table.BufferedKeyNoter: it must then never discard a change as above
+	// the high watermark, and the target must still converge.
+	hideNoter bool
+	// composite uses a key without AUTO_INCREMENT, so the copy runs on the
+	// composite chunker instead of the optimistic one.
+	composite bool
 }
 
 // hiddenNoterChunker exposes only table.MappedChunker, hiding the wrapped
@@ -113,20 +138,23 @@ func subscriptionOf(t *testing.T, client preDispatchClient, schema, tbl string) 
 }
 
 // runPreDispatchScenario runs the sequence described on
-// TestPreDispatchChangeThenAboveHighWatermark. With hideNoter the subscription
-// gets a chunker without table.BufferedKeyNoter: it must then never discard a
-// change as above the high watermark, and the target must still converge.
-func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, applier.Applier) preDispatchClient, timing preDispatchTiming, secondIsDelete, hideNoter bool) {
+// TestPreDispatchChangeThenAboveHighWatermark for one preDispatchCase.
+func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, applier.Applier) preDispatchClient, c preDispatchCase) {
+	timing, secondIsDelete, hideNoter := c.timing, c.secondIsDelete, c.hideNoter
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS predisp_src, predisp_dst")
-	testutils.RunSQL(t, "CREATE TABLE predisp_src (a INT NOT NULL auto_increment, b INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "CREATE TABLE predisp_dst (a INT NOT NULL auto_increment, b INT, PRIMARY KEY (a))")
-	testutils.RunSQL(t, "INSERT INTO predisp_src (a,b) SELECT NULL, 1 FROM dual")
-	for range 14 {
-		testutils.RunSQL(t, "INSERT INTO predisp_src (a,b) SELECT NULL, 1 FROM predisp_src")
+	autoInc := "auto_increment"
+	if c.composite {
+		autoInc = ""
+	}
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE predisp_src (a INT NOT NULL %s, b INT, PRIMARY KEY (a))", autoInc))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE predisp_dst (a INT NOT NULL %s, b INT, PRIMARY KEY (a))", autoInc))
+	testutils.RunSQL(t, "INSERT INTO predisp_src (a,b) VALUES (1, 1)")
+	for n := 1; n < 16384; n *= 2 { // a = 1..16384
+		testutils.RunSQL(t, fmt.Sprintf("INSERT INTO predisp_src (a,b) SELECT a + %d, 1 FROM predisp_src", n))
 	}
 	testutils.RunSQL(t, "ANALYZE TABLE predisp_src")
 	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS predisp_src, predisp_dst") })
@@ -144,6 +172,11 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 
 	chunker, err := table.NewChunker(src, table.ChunkerConfig{NewTable: dst, TargetChunkTime: time.Second})
 	require.NoError(t, err)
+	wantType := "Optimistic"
+	if c.composite {
+		wantType = "Composite"
+	}
+	require.Contains(t, fmt.Sprintf("%T", chunker), wantType)
 	require.NoError(t, chunker.Open())
 	subChunker := chunker
 	if hideNoter {

@@ -239,6 +239,13 @@ covered it. `KeyAboveHighWatermark` returns `false` at or below that guard,
 exactly as it does at or below `checkpointHighPtr` after a resume. The guard
 is a single value, so it costs no memory; the cost is that changes to keys
 between the dispatch pointer and the guard are applied instead of dropped.
+In practice that range is usually most of the table. On an actively written
+table, a single insert, or an update to a recent row, before the copier's first
+dispatch raises the guard to roughly the table's max key. From then on the
+discard mostly applies only to rows inserted after the copy started, and
+`keys_dropped_above_high` falls to match. The chunker logs once at Info, with
+the key and the dispatch pointer, the first time the guard rises, so a lower
+drop count on a hot table has a visible cause.
 `NoteBufferedKey` is on a separate optional interface,
 `table.BufferedKeyNoter`, so a `MappedChunker` written before it existed still
 compiles. The subscription type-asserts for it once, when it is created. If

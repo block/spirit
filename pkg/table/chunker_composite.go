@@ -659,14 +659,14 @@ func (t *chunkerComposite) NoteBufferedKey(key0 any) {
 			keyDatum, err = NewDatum(key0, tp)
 		}
 	}
-	t.noteBufferedKey(keyDatum, err, func(key Datum) (bool, error) {
-		if len(t.chunkPtrs) == 0 {
-			return true, nil
-		}
-		// key[0] == chunkPtrs[0] is partly dispatched. Recording it costs
-		// nothing and avoids reasoning about the tuple tail.
-		return key.GreaterThanOrEqual(t.chunkPtrs[0])
-	}, t.logger)
+	// Only the first key column is compared, so key[0] == chunkPtrs[0]
+	// (partly dispatched) is recorded too. That costs nothing and avoids
+	// reasoning about the tuple tail.
+	var dispatchPtr Datum
+	if len(t.chunkPtrs) > 0 {
+		dispatchPtr = t.chunkPtrs[0]
+	}
+	t.noteBufferedKey(keyDatum, err, dispatchPtr, t.Ti.QuotedTableName, t.logger)
 }
 
 // SetKey allows you to chunk on a secondary index, and not the primary key.

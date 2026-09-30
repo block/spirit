@@ -1,8 +1,10 @@
 package table
 
 import (
+	"bytes"
 	"database/sql"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,6 +79,53 @@ func TestOptimisticNoteBufferedKey(t *testing.T) {
 	// KeyNotYetDispatched is unaffected: the guard only stops discards.
 	require.True(t, chunker.KeyNotYetDispatched(3500))
 	require.False(t, chunker.KeyNotYetDispatched(500))
+}
+
+// TestOptimisticNoteBufferedKeyAtChunkPtr: chunkPtr itself is not yet
+// dispatched (chunks are [lower, chunkPtr)), so a flush may write it ahead of
+// the copier and a change admitted for it must raise the guard. A key inside a
+// dispatched chunk must not.
+func TestOptimisticNoteBufferedKeyAtChunkPtr(t *testing.T) {
+	chunker := newBufferedKeyChunker4Test(t)
+	_, err := chunker.Next() // `id` < 1
+	require.NoError(t, err)
+	_, err = chunker.Next() // [1, 1001)
+	require.NoError(t, err)
+
+	chunker.NoteBufferedKey(500) // dispatched: nothing to record
+	require.True(t, chunker.bufferedHighPtr.IsNil())
+
+	require.True(t, chunker.KeyNotYetDispatched(1001))
+	require.True(t, chunker.KeyAboveHighWatermark(1001))
+	chunker.NoteBufferedKey(1001)
+	require.False(t, chunker.KeyAboveHighWatermark(1001))
+	require.True(t, chunker.KeyAboveHighWatermark(1002))
+}
+
+// TestOptimisticNoteBufferedKeyLogsOnce: the chunker logs at Info the first
+// time the guard rises, and never again, however often it rises afterwards.
+func TestOptimisticNoteBufferedKeyLogsOnce(t *testing.T) {
+	chunker := newBufferedKeyChunker4Test(t)
+	var buf bytes.Buffer
+	chunker.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	const msg = "change stream admitted a key the copier has not reached"
+
+	_, err := chunker.Next() // `id` < 1
+	require.NoError(t, err)
+	_, err = chunker.Next() // [1, 1001)
+	require.NoError(t, err)
+	chunker.NoteBufferedKey(500) // dispatched: no log
+	require.NotContains(t, buf.String(), msg)
+
+	chunker.NoteBufferedKey(2000)
+	require.Equal(t, 1, strings.Count(buf.String(), msg))
+	require.Contains(t, buf.String(), "key=2000")
+	require.Contains(t, buf.String(), "dispatch_ptr=1001")
+
+	for _, key := range []int{2000, 1500, 3000, 3999} {
+		chunker.NoteBufferedKey(key)
+	}
+	require.Equal(t, 1, strings.Count(buf.String(), msg))
 }
 
 // TestOptimisticNoteBufferedKeyUnconvertible: if a key cannot be recorded,
