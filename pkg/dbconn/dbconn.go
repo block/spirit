@@ -486,7 +486,7 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 				logger.Warn("killed-session cleanup failed; retrying statement anyway", "pids", result.killed, "error", cleanupErr)
 			}
 		}
-		logger.Warn("retrying statement after lock wait timeout because force-kill timer fired",
+		logger.Warn("retrying statement after lock wait timeout: it waited for its lock for the kill delay, so the kill ran",
 			"attempt", attempt,
 			"max_attempts", attempts,
 			"error", result.err,
@@ -514,9 +514,13 @@ func (a forceExecAttempt) skippedKillAfterFailedCheck() bool {
 }
 
 // killPollInterval is how often, while the statement runs, the kill worker
-// checks whether it is waiting for a metadata lock. It also bounds each check,
-// so a check that cannot get a connection fails instead of stalling the worker.
+// checks whether it is waiting for a metadata lock.
 const killPollInterval = 100 * time.Millisecond
+
+// waitingCheckTimeout bounds each check, so a check that cannot get a
+// connection fails and is logged instead of stalling the worker. It is longer
+// than the poll interval, so a connection redial or a slow read still counts.
+const waitingCheckTimeout = time.Second
 
 // execWithKillWorker runs stmt on conn once. It kills the blockers of connID,
 // but only once the statement has been waiting for a table metadata lock for
@@ -556,25 +560,31 @@ func execWithKillWorker(ctx context.Context, conn *sql.Conn, connID int, delay t
 // statement on connID is waiting for a metadata lock, and kills its blockers
 // once it has waited at least delay. The wait is measured from the end of the
 // last check that did not see the statement waiting (or from started), to the
-// start of the check that sees it waiting, so the blockers get the delay, give
-// or take one poll interval plus the time a check takes. A check that fails
-// does not kill, because it cannot tell blockers from concurrent traffic, and
-// it restarts the wait, because it cannot say whether the statement was
-// waiting. The kill runs on ctx, so it finishes even if the statement returns
-// while it runs.
+// start of the check that sees it waiting. A check is also scheduled for the
+// moment the delay would be reached, so the blockers get between the delay less
+// one poll interval and the delay, plus the time a check takes. A check that
+// fails does not kill, because it cannot tell blockers from concurrent traffic.
+// It leaves a wait the last successful check saw in progress, because a
+// statement waiting for a lock keeps waiting until it gets it, and otherwise
+// restarts the wait, because it cannot say whether the statement was waiting.
+// The kill runs on ctx, so it finishes even if the statement returns while it
+// runs.
 func killWhenWaiting(ctx, stmtCtx context.Context, connID int, started time.Time, delay time.Duration, waiting func(context.Context, int) (bool, error), kill func(context.Context, int) ([]int, error), logger *slog.Logger) forceExecAttempt {
 	var attempt forceExecAttempt
 	lastNotWaiting := started
-	ticker := time.NewTicker(killPollInterval)
-	defer ticker.Stop()
+	sawWaiting := false
+	// A statement can be queued from its start, so the first check is due by
+	// the delay even before any check has seen it waiting.
+	next := time.NewTimer(untilNextCheck(started, lastNotWaiting, delay, true))
+	defer next.Stop()
 	for {
 		select {
 		case <-stmtCtx.Done():
 			return attempt
-		case <-ticker.C:
+		case <-next.C:
 		}
 		checkStarted := time.Now()
-		checkCtx, cancel := context.WithTimeout(stmtCtx, killPollInterval)
+		checkCtx, cancel := context.WithTimeout(stmtCtx, waitingCheckTimeout)
 		isWaiting, err := waiting(checkCtx, connID)
 		cancel()
 		switch {
@@ -587,15 +597,36 @@ func killWhenWaiting(ctx, stmtCtx context.Context, connID int, started time.Time
 				logger.Warn("could not tell whether the statement is waiting for a metadata lock; not killing until a check succeeds", "error", err)
 				attempt.checkErr = err
 			}
-			lastNotWaiting = time.Now()
+			if !sawWaiting {
+				lastNotWaiting = time.Now()
+			}
 		case !isWaiting:
+			sawWaiting = false
 			lastNotWaiting = time.Now()
 		case checkStarted.Sub(lastNotWaiting) >= delay:
 			attempt.killAttempted = true
 			attempt.killed, attempt.killErr = kill(ctx, connID)
 			return attempt
+		default:
+			sawWaiting = true
 		}
+		next.Reset(untilNextCheck(time.Now(), lastNotWaiting, delay, sawWaiting))
 	}
+}
+
+// untilNextCheck is how long the kill worker waits before its next check: one
+// poll interval, or less when the statement is waiting and would reach the
+// delay sooner, so the kill lands at the delay rather than on the next poll.
+// Without that, a delay just under the lock wait timeout could fall between two
+// polls, and the statement would time out before any kill. A statement last
+// seen running keeps the poll interval, so a short delay never turns the polls
+// into a busy loop.
+func untilNextCheck(now, lastNotWaiting time.Time, delay time.Duration, waiting bool) time.Duration {
+	untilDelay := lastNotWaiting.Add(delay).Sub(now)
+	if waiting && untilDelay > 0 && untilDelay < killPollInterval {
+		return untilDelay
+	}
+	return killPollInterval
 }
 
 func shouldRetryForceExecAfterKill(err error, killAttempted bool) bool {

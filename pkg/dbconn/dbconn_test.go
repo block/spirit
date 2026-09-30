@@ -468,7 +468,7 @@ func TestForceExecRawVerb(t *testing.T) {
 // TestForceExecBadFormatString tests that ForceExec returns an error (rather
 // than panicking mid-flight) when the format string cannot be escaped, e.g. a
 // %? specifier with no matching argument. The escape now happens before the
-// kill timer is armed, so a bad format string can never fire the killer.
+// kill worker starts, so a bad format string can never fire the killer.
 func TestForceExecBadFormatString(t *testing.T) {
 	config := NewDBConfig()
 	db, err := New(testutils.DSN(), config)
