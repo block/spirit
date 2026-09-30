@@ -1,7 +1,7 @@
 use mysql;
 
 create role if not exists R_MIGRATOR;
-grant alter, create, delete, drop, index, insert, lock tables, select, trigger, update, reload on *.* to R_MIGRATOR;
+grant alter, create, create temporary tables, delete, drop, index, insert, lock tables, select, trigger, update, reload on *.* to R_MIGRATOR;
 create role if not exists R_REPLICATION;
 grant replication slave, replication client on *.* to R_REPLICATION;
 create role if not exists R_THROTTLER;

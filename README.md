@@ -108,6 +108,7 @@ Larger instances can typically perform schema changes much faster, because they 
   - **`ENUM`**: appending values to the end of the list is supported, and so is dropping values from anywhere in the list. Reordering the values that are kept, or inserting a new value ahead of one that is kept, is not.
   - **`SET`**: only appending values to the end of the list is supported. The new list must begin with the existing list, so reordering or removing members is not supported.
   - **Type conversions**: converting `ENUM`/`SET` to a string type (`VARCHAR`, `CHAR`, `TEXT`, `BLOB`, etc.) is supported, and so is `ENUM` to `SET`. `SET` to `ENUM` is not, because a `SET` value can hold several members where an `ENUM` holds at most one. `ENUM`/`SET` to a numeric type is not, because the value would be coerced from its string form and lost.
+- **Moving or syncing an `ENUM` or `SET` member with a character outside `utf8mb3`** (such as a 4-byte emoji). MySQL reports each such character as `?` in `SHOW CREATE TABLE` and `information_schema`, and `move` and `sync` create the target table from that definition, so the target would not have the member. They refuse the table instead, on any source. They also refuse a target table that exists already and stores such a member, because its definition would compare equal to a source's real `?`. `migrate` supports these columns.
 - **`FOREIGN KEYS`** or **`TRIGGERS`**. Spirit does not support migrating tables that have `FOREIGN KEYS` or `TRIGGERS`. Creating a trigger on the table, or a foreign key on it or referencing it, while the migration runs fails the migration.
 
 ## Requirements
@@ -130,6 +131,7 @@ Spirit requires an account with these privileges:
 * `ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE` on the schema where the table is being migrated.
 * Either `SUPER, REPLICATION SLAVE on *.*` or `REPLICATION CLIENT, REPLICATION SLAVE on *.*`.
 * The `RELOAD` privilege.
+* `CREATE TEMPORARY TABLES` on the schema, but only for a table with an `ENUM` or `SET` member that `information_schema` reports with a `?`. MySQL reports each member character outside `utf8mb3` as `?`, so Spirit reads the members MySQL stores through a temporary table, and refuses the table if it cannot.
 * `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover.
 
 `spirit move` also requires `EVENT` on the source schema and `SHOW_ROUTINE` (or `SELECT`) on `*.*`, so it can see the events and stored routines it refuses to move. See [docs/move.md](docs/move.md).

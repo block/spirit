@@ -113,6 +113,16 @@ func (c *DBConfig) forceKillDelay() time.Duration {
 	return forceKillGracePeriod(c.LockWaitTimeout)
 }
 
+// StatementCompletionTimeout is how long to wait for a statement whose outcome
+// the caller must know, such as a cutover RENAME TABLE: the session's
+// lock_wait_timeout plus lockedStatementCompletionMargin. The server reports a
+// metadata lock wait as ER_LOCK_WAIT_TIMEOUT after lock_wait_timeout, and that
+// error is conclusive, so the client-side bound must be longer. A statement
+// still running when this bound expires has an unknown outcome.
+func (c *DBConfig) StatementCompletionTimeout() time.Duration {
+	return time.Duration(c.LockWaitTimeout)*time.Second + lockedStatementCompletionMargin
+}
+
 // IsConnectionLossError reports whether err indicates that the connection to
 // MySQL failed or was lost, meaning the client cannot know whether the last
 // statement it sent was executed by the server. Connection-level failures
@@ -148,6 +158,15 @@ func IsConnectionLossError(err error) bool {
 	default:
 		return false
 	}
+}
+
+// IsOutcomeUnknown reports whether err leaves the outcome of the statement
+// unknown: the connection was lost (see IsConnectionLossError), or
+// TableLock.ExecUnderLock stopped waiting for the reply
+// (ErrStatementOutcomeUnknown). The caller must check the server state before
+// it treats the statement as failed.
+func IsOutcomeUnknown(err error) bool {
+	return IsConnectionLossError(err) || errors.Is(err, ErrStatementOutcomeUnknown)
 }
 
 // UnsafeWarningError reports a warning that MySQL raised on a statement Spirit

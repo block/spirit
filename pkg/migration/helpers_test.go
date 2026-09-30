@@ -12,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/require"
 )
 
@@ -216,7 +217,23 @@ func WithStatement(s string) RunnerOption {
 // so the repl client has time to observe events).
 func WithTestThrottler() RunnerOption {
 	return func(m *Migration) {
-		m.useTestThrottler = true
+		m.testThrottler = &throttler.Mock{}
+	}
+}
+
+// WithCopyStalledAfterChunks lets the copier read n chunks and then holds it
+// until the run's context is cancelled (throttler.NewStallingMock). The run
+// can write a checkpoint but cannot finish the copy, so a test that cancels it
+// after waitForCheckpoint always cancels during the copy, never during the
+// cutover (issue #1338).
+//
+// The optimistic chunker's watermark needs a chunk with both bounds, and the
+// first chunk has no lower bound, so a checkpoint needs n >= 2. The table must
+// be large enough that chunk n is not the final, open-ended one. Use it with
+// WithThreads(1): the budget is shared by all read workers.
+func WithCopyStalledAfterChunks(n int64) RunnerOption {
+	return func(m *Migration) {
+		m.testThrottler = throttler.NewStallingMock(n)
 	}
 }
 

@@ -178,6 +178,97 @@ func TestCutOverSingleSource(t *testing.T) {
 	require.Error(t, err, "t1 should not exist after rename")
 }
 
+// TestCutOverCancelAfterSwitchStillRenamesSource checks that a cancel which
+// arrives after the traffic switch does not stop the source rename (issue
+// #1338). The rename is the only fence against straggler writes to the source
+// once the locks are released, so everything after the switch runs to
+// completion and the cutover succeeds:
+//   - the rename itself;
+//   - the reverse-window post-switch hook, which runs before the rename;
+//   - a rename retry after a first attempt that failed.
+func TestCutOverCancelAfterSwitchStillRenamesSource(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// postSwitch, when set, is registered as the post-switch hook.
+		postSwitch func(ctx context.Context) error
+		// failFirstRename makes the first rename attempt fail with a leftover
+		// t1_old, which is dropped once the cancel has arrived.
+		failFirstRename bool
+	}{
+		{name: "rename"},
+		{name: "post switch hook", postSwitch: func(ctx context.Context) error { return ctx.Err() }},
+		{name: "rename retry", failFirstRename: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
+			testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE t1 (
+				id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+				val VARCHAR(255)
+			)`)
+			testutils.RunSQLInDatabase(t, srcName, "INSERT INTO t1 (id, val) VALUES (1, 'a'), (2, 'b')")
+			if tc.failFirstRename {
+				testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY)")
+				originalRenameRetryWait := renameRetryWait
+				renameRetryWait = 250 * time.Millisecond
+				t.Cleanup(func() { renameRetryWait = originalRenameRetryWait })
+			}
+
+			dbConfig := dbconn.NewDBConfig()
+			dbConfig.MaxRetries = 5
+			logger := slog.Default()
+			srcDSN := testutils.DSNForDatabase(srcName)
+			srcConfig, err := mysql.ParseDSN(srcDSN)
+			require.NoError(t, err)
+			replDB, err := dbconn.New(srcDSN, dbConfig)
+			require.NoError(t, err)
+			defer utils.CloseAndLog(replDB)
+			cfg := change.NewClientDefaultConfig()
+			cfg.CancelFunc = func(change.FatalReason) bool { return false }
+			replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+			require.NoError(t, replClient.Start(t.Context()))
+			defer replClient.Close()
+
+			cutoverTbl := table.NewTableInfo(srcDB, srcName, "t1")
+			require.NoError(t, cutoverTbl.SetInfo(t.Context()))
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			dropDone := make(chan struct{})
+			cutover, err := NewCutOver([]CutOverSource{{
+				DB:         srcDB,
+				ReplClient: replClient,
+				Tables:     []*table.TableInfo{cutoverTbl},
+			}}, func(context.Context) error {
+				cancel() // the operator stops the move right after the switch
+				if tc.failFirstRename {
+					// The first rename attempt runs at once; this drop lands
+					// between it and the retry renameRetryWait later.
+					go func() {
+						defer close(dropDone)
+						time.Sleep(renameRetryWait / 2)
+						_, _ = srcDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS t1_old")
+					}()
+				}
+				return nil
+			}, dbConfig, logger)
+			require.NoError(t, err)
+			if tc.postSwitch != nil {
+				cutover.SetPostSwitch(tc.postSwitch)
+			}
+
+			require.NoError(t, cutover.Run(ctx))
+			require.ErrorIs(t, ctx.Err(), context.Canceled)
+			if tc.failFirstRename {
+				<-dropDone
+			}
+
+			var count int
+			require.NoError(t, srcDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1_old").Scan(&count))
+			require.Equal(t, 2, count, "t1 must have been renamed to t1_old")
+		})
+	}
+}
+
 // TestCutOverFuncCalledOnceAcrossRenameRetry verifies that the caller-supplied
 // cutoverFunc (the traffic switch, e.g. a Vitess routing change) is invoked
 // exactly once even when the RENAME TABLE step fails and has to be retried.

@@ -2,6 +2,7 @@ package move
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -414,16 +415,16 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 
 	// 3. Un-retire the source: rename its _old tables back to their real names
 	//    (on every source shard) so it can serve again. The feed is stopped, so
-	//    nothing writes them.
+	//    nothing writes them. The renames move ownership, so a started rename
+	//    runs to completion even if ctx is cancelled: a cancelled one could
+	//    still commit on the server, and the client could not tell.
 	for si := range r.sources {
 		s := &r.sources[si]
 		for _, t := range r.sourceTables {
-			oldName := check.CutoverOldName(t.TableName)
-			if err := dbconn.Exec(ctx, s.db, "RENAME TABLE %n TO %n", oldName, t.TableName); err != nil {
-				if dbconn.IsConnectionLossError(err) {
-					return fmt.Errorf("%w: reverse cutover: un-retire source %d table %q, outcome unknown: %w",
-						status.ErrOwnershipAmbiguous, si, t.TableName, err)
-				}
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("reverse cutover: un-retire source %d table %q: %w", si, t.TableName, err)
+			}
+			if err := w.unretireSourceTable(ctx, s.db, t.TableName); err != nil {
 				return fmt.Errorf("reverse cutover: un-retire source %d table %q: %w", si, t.TableName, err)
 			}
 			r.durableMutation.Store(true)
@@ -438,13 +439,15 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	// 5. Retire the former targets to their _revert form under their lock —
 	//    fencing straggler writes after the switch, mirroring the forward
 	//    cutover's source rename. _revert (not _old) marks these as revert
-	//    artifacts, so a later move can safely drop them.
+	//    artifacts, so a later move can safely drop them. Traffic is back on
+	//    the source, so the renames run even if ctx is cancelled
+	//    (context.WithoutCancel): a stopped one would leave a target serving.
 	for i := range r.targets {
 		for _, t := range r.sourceTables {
 			revertName := check.RevertRetiredName(t.TableName)
 			stmt := sqlescape.MustEscapeSQL("RENAME TABLE %n TO %n", t.TableName, revertName)
-			if err := locks[i].ExecUnderLock(ctx, stmt); err != nil {
-				if dbconn.IsConnectionLossError(err) {
+			if err := locks[i].ExecUnderLock(context.WithoutCancel(ctx), stmt); err != nil {
+				if dbconn.IsOutcomeUnknown(err) {
 					return fmt.Errorf("%w: reverse cutover: retire target %d table %q, outcome unknown: %w",
 						status.ErrOwnershipAmbiguous, i, t.TableName, err)
 				}
@@ -453,7 +456,26 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 		}
 	}
 
-	return w.finalizeReverse(ctx)
+	// Ownership is back on the source. Record it even if ctx is cancelled: a
+	// cancelled write would leave the checkpoint at phaseReverting, and the
+	// next run would treat the finished rollback as ownership-ambiguous.
+	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCutoverCleanupTimeout)
+	defer cancel()
+	return w.finalizeReverse(finalizeCtx)
+}
+
+// unretireSourceTable renames one source table from its _old name back to its
+// real name. The rename runs on a context detached from ctx's cancellation and
+// bounded by DBConfig.StatementCompletionTimeout. A lost connection or an
+// expired bound leaves its outcome unknown, reported as ErrOwnershipAmbiguous.
+func (w *reverseWindow) unretireSourceTable(ctx context.Context, db *sql.DB, tableName string) error {
+	renameCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.r.dbConfig.StatementCompletionTimeout())
+	defer cancel()
+	err := dbconn.Exec(renameCtx, db, "RENAME TABLE %n TO %n", check.CutoverOldName(tableName), tableName)
+	if err != nil && (renameCtx.Err() != nil || dbconn.IsOutcomeUnknown(err)) {
+		return fmt.Errorf("%w: outcome unknown: %w", status.ErrOwnershipAmbiguous, err)
+	}
+	return err
 }
 
 // carryAutoIncrementsToSource raises each of the source's retired (_old)

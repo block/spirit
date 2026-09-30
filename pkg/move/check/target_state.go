@@ -128,6 +128,9 @@ func validateExistingTargetTable(ctx context.Context, target applier.Target, tab
 		return fmt.Errorf("table '%s' exists on target %d (%s) but schema does not match source; reconcile the target to the source with: %s. Please ensure the table schema matches exactly (including column types, charset and collation) or drop the table",
 			tableName, targetIndex, target.Config.DBName, diff)
 	}
+	if err := targetMisreportedEnumSetError(ctx, target, targetIndex, tableName); err != nil {
+		return err
+	}
 
 	logger.Info("validated existing target table",
 		"table", tableName,

@@ -14,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -118,8 +119,9 @@ type Migration struct {
 	RespectSentinel bool `name:"respect-sentinel" help:"Look for sentinel table to exist and block if it does" optional:"" default:"true" hidden:""`
 
 	// useTestCutover is a test-only cutover
-	useTestCutover   bool
-	useTestThrottler bool
+	useTestCutover bool
+	// testThrottler is a test-only copier throttler (see WithTestThrottler).
+	testThrottler throttler.Throttler
 }
 
 // minPoolSize is the smallest --max-connections a migration can complete on.

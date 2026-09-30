@@ -28,6 +28,7 @@ import (
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +44,26 @@ func waitForCheckpoint(t *testing.T, runner *Runner) {
 	require.Eventually(t, func() bool {
 		return runner.DumpCheckpoint(t.Context()) == nil
 	}, 30*time.Second, 10*time.Millisecond, "timeout waiting for first successful checkpoint")
+}
+
+// runUntilCheckpointThenCancel runs m until it has written a checkpoint, then
+// cancels it, waits for Run to return, and closes it. Build m with
+// WithCopyStalledAfterChunks: the copy then cannot finish, so the cancel
+// always lands during the copy and the checkpoint and _new table survive it. A
+// run that can finish its copy before the cancel reaches the cutover instead,
+// and the next run finds no _new table to resume from (issue #1338).
+func runUntilCheckpointThenCancel(t *testing.T, m *Runner) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- m.Run(ctx)
+	}()
+	waitForCheckpoint(t, m)
+	cancel()
+	require.ErrorIs(t, <-errCh, context.Canceled, "the first run must be cancelled during the copy")
+	require.NoError(t, m.Close())
 }
 
 // Test int to bigint primary key while resuming from checkpoint.
@@ -137,14 +158,14 @@ func TestCheckpoint(t *testing.T) {
 
 	preSetup := func() *Runner {
 		r, err := NewRunner(&Migration{
-			Host:             cfg.Addr,
-			Username:         cfg.User,
-			Password:         &cfg.Passwd,
-			Database:         cfg.DBName,
-			Threads:          1,
-			WriteThreads:     1,
-			Statement:        "ALTER TABLE cpt1 ENGINE=InnoDB",
-			useTestThrottler: true,
+			Host:          cfg.Addr,
+			Username:      cfg.User,
+			Password:      &cfg.Passwd,
+			Database:      cfg.DBName,
+			Threads:       1,
+			WriteThreads:  1,
+			Statement:     "ALTER TABLE cpt1 ENGINE=InnoDB",
+			testThrottler: &throttler.Mock{},
 		})
 		require.NoError(t, err)
 		require.Equal(t, "initial", r.status.Get().String())
@@ -818,25 +839,13 @@ func TestResumeFromCheckpointTooOld(t *testing.T) {
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name VARCHAR(255) NOT NULL,
 		pad VARCHAR(1000) NOT NULL default 'x')`)
-	tt.SeedRows(t, "INSERT INTO chkpttooold (name, pad) SELECT 'a', REPEAT('x', 1000)", 1000)
+	tt.SeedRows(t, "INSERT INTO chkpttooold (name, pad) SELECT 'a', REPEAT('x', 1000)", 4096)
 
 	// First run: create a checkpoint
 	m := NewTestRunner(t, "chkpttooold", "ENGINE=InnoDB",
 		WithThreads(1),
-		WithTestThrottler())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = m.Run(ctx)
-	}()
-
-	waitForCheckpoint(t, m)
-	cancel()
-	<-done
-	require.NoError(t, m.Close())
+		WithCopyStalledAfterChunks(2))
+	runUntilCheckpointThenCancel(t, m)
 
 	// Backdate the checkpoint's created_at to simulate an old checkpoint (8 days ago).
 	testutils.RunSQL(t, `UPDATE _chkpttooold_chkpnt SET created_at = DATE_SUB(NOW(), INTERVAL 8 DAY)`)
@@ -856,25 +865,13 @@ func TestResumeFromCheckpointNotTooOld(t *testing.T) {
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name VARCHAR(255) NOT NULL,
 		pad VARCHAR(1000) NOT NULL default 'x')`)
-	tt.SeedRows(t, "INSERT INTO chkptnotold (name, pad) SELECT 'a', REPEAT('x', 1000)", 1000)
+	tt.SeedRows(t, "INSERT INTO chkptnotold (name, pad) SELECT 'a', REPEAT('x', 1000)", 4096)
 
 	// First run: create a checkpoint
 	m := NewTestRunner(t, "chkptnotold", "ENGINE=InnoDB",
 		WithThreads(1),
-		WithTestThrottler())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = m.Run(ctx)
-	}()
-
-	waitForCheckpoint(t, m)
-	cancel()
-	<-done
-	require.NoError(t, m.Close())
+		WithCopyStalledAfterChunks(2))
+	runUntilCheckpointThenCancel(t, m)
 
 	// Do NOT backdate the checkpoint - it was just created, so it's fresh.
 	// The migration should resume from checkpoint successfully.
@@ -895,24 +892,13 @@ func TestResumeRejectsCheckpointFromDifferentTable(t *testing.T) {
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name VARCHAR(255) NOT NULL,
 		pad VARCHAR(1000) NOT NULL default 'x')`)
-	tt.SeedRows(t, "INSERT INTO chkptmismatch (name, pad) SELECT 'a', REPEAT('x', 1000)", 1000)
+	tt.SeedRows(t, "INSERT INTO chkptmismatch (name, pad) SELECT 'a', REPEAT('x', 1000)", 4096)
 
 	// First run: produce a real checkpoint via normal flow.
 	m := NewTestRunner(t, "chkptmismatch", "ENGINE=InnoDB",
 		WithThreads(1),
-		WithTestThrottler())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = m.Run(ctx)
-	}()
-	waitForCheckpoint(t, m)
-	cancel()
-	<-done
-	require.NoError(t, m.Close())
+		WithCopyStalledAfterChunks(2))
+	runUntilCheckpointThenCancel(t, m)
 
 	// Tamper: pretend the checkpoint belongs to a different table.
 	testutils.RunSQL(t, `UPDATE _chkptmismatch_chkpnt SET original_table_name = 'someothertable'`)
@@ -940,24 +926,13 @@ func TestResumeTransientErrorPreservesState(t *testing.T) {
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name VARCHAR(255) NOT NULL,
 		pad VARCHAR(1000) NOT NULL default 'x')`)
-	tt.SeedRows(t, "INSERT INTO transientresume (name, pad) SELECT 'a', REPEAT('x', 1000)", 1000)
+	tt.SeedRows(t, "INSERT INTO transientresume (name, pad) SELECT 'a', REPEAT('x', 1000)", 4096)
 
 	// First run: produce a real checkpoint via normal flow, then stop.
 	m := NewTestRunner(t, "transientresume", "ENGINE=InnoDB",
 		WithThreads(1),
-		WithTestThrottler())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = m.Run(ctx)
-	}()
-	waitForCheckpoint(t, m)
-	cancel()
-	<-done
-	require.NoError(t, m.Close())
+		WithCopyStalledAfterChunks(2))
+	runUntilCheckpointThenCancel(t, m)
 
 	// Second run, assembled by hand (same shape as TestCheckpoint's preSetup)
 	// so we can hand setup() a broken DB pool: the resume probe then fails

@@ -32,6 +32,12 @@ import (
 	"github.com/block/spirit/pkg/utils"
 )
 
+// postCutoverCleanupTimeout bounds the cleanup that runs after the cutover
+// has committed (see run). Each statement's metadata lock wait is already
+// bounded by the session's lock_wait_timeout; this also covers a server that
+// stops responding.
+const postCutoverCleanupTimeout = 2 * time.Minute
+
 // These are really consts, but set to var for testing.
 var (
 	tableStatUpdateInterval = 5 * time.Minute
@@ -133,9 +139,16 @@ type Runner struct {
 	// Correctness evidence from the most recent Run invocation.
 	durableMutation   atomic.Bool
 	terminalOwnership atomic.Uint32
+
+	// testAfterCutover is a test-only seam that runs after the cutover has
+	// committed and before the post-cutover cleanup.
+	testAfterCutover func()
 }
 
-var _ status.Task = (*Runner)(nil)
+var (
+	_ status.Task    = (*Runner)(nil)
+	_ status.Aborter = (*Runner)(nil)
+)
 
 func NewRunner(m *Migration) (*Runner, error) {
 	stmts, err := m.normalizeOptions()
@@ -248,6 +261,76 @@ func (r *Runner) SetMetricsSink(sink metrics.Sink) {
 
 func (r *Runner) SetLogger(logger *slog.Logger) {
 	r.logger = logger
+}
+
+// dropStaleCopyTables drops the _new and checkpoint tables that an earlier,
+// interrupted copy of the table may have left, after the ALTER has completed
+// with MySQL's own DDL. That state describes the table before this ALTER
+// changed it, so it can no longer be resumed from, and a later copy-based run
+// would only discard it. Without this, it stays behind indefinitely.
+//
+// Auxiliary table names are truncated, so two long table names can share them
+// (see utils.AuxTableName), and the state may belong to the other table. A
+// _new table without a checkpoint table may not be Spirit's at all (other
+// online schema change tools use the same name, and may still have triggers
+// writing to it). So the tables are dropped only when the checkpoint table
+// exists and its latest row names this table. Otherwise (no checkpoint table,
+// or one that cannot be read, is empty, or names another or no table) nothing
+// is dropped and the reason is logged.
+//
+// A failure is logged, not returned: the ALTER has already been applied.
+func (r *Runner) dropStaleCopyTables(ctx context.Context) {
+	if len(r.changes) != 1 {
+		return // attemptMySQLDDL only supports single-table changes.
+	}
+	tableName := r.changes[0].table.TableName
+	newName := utils.NewTableName(tableName)
+	ckpt := r.checkpointTbl()
+	ckptName := r.checkpointTableName()
+	leaveInPlace := func(reason string, args ...any) {
+		r.logger.Warn("not dropping tables from an earlier interrupted migration: "+reason,
+			append([]any{"new-table", newName, "checkpoint-table", ckptName}, args...)...)
+	}
+
+	ckptExists, err := ckpt.Exists(ctx)
+	if err != nil {
+		leaveInPlace("could not check whether the checkpoint table exists", "error", err)
+		return
+	}
+	if !ckptExists {
+		// Only a _new table can be left: without a checkpoint there is no
+		// evidence that Spirit created it, so leave it in place.
+		var n int
+		if err := r.db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+			r.changes[0].table.SchemaName, newName).Scan(&n); err != nil {
+			leaveInPlace("could not check whether the new table exists", "error", err)
+			return
+		}
+		if n > 0 {
+			leaveInPlace("there is no checkpoint table to confirm the new table was created by Spirit for this table")
+		}
+		return
+	}
+	rec, err := ckpt.ReadLatest(ctx)
+	if err != nil {
+		leaveInPlace("could not read the checkpoint to confirm it belongs to this table", "error", err)
+		return
+	}
+	if rec.OriginalTableName != tableName {
+		leaveInPlace("the checkpoint does not belong to this table", "checkpoint-original-table", rec.OriginalTableName)
+		return
+	}
+	// _new first: the checkpoint is the evidence of ownership, so it must
+	// outlive _new. If a drop fails, stop and keep the checkpoint so a later
+	// run can retry.
+	for _, name := range []string{newName, ckptName} {
+		if err := dbconn.Exec(ctx, r.db, "DROP TABLE IF EXISTS %n", name); err != nil {
+			r.logger.Error("could not drop a stale table from an earlier interrupted migration", "table", name, "error", err)
+			return
+		}
+		r.logger.Info("dropped a stale table from an earlier interrupted migration", "table", name)
+	}
 }
 
 // attemptMySQLDDL tries to perform the DDL using MySQL's built-in
@@ -438,6 +521,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	err = r.attemptMySQLDDL(ctx)
 	if err == nil {
 		r.durableMutation.Store(true)
+		r.dropStaleCopyTables(ctx)
 		r.logger.Info("apply complete",
 			"instant-ddl", r.usedInstantDDL,
 			"inplace-ddl", r.usedInplaceDDL,
@@ -551,10 +635,23 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 			return fmt.Errorf("cutover failed: %w", err)
 		}
 		r.durableMutation.Store(true)
+		if r.testAfterCutover != nil {
+			r.testAfterCutover()
+		}
 		return nil
 	}); err != nil {
 		return err
 	}
+	// The cutover has committed, so the migration has succeeded even if ctx
+	// is cancelled from here on. The cleanup below that decides that outcome
+	// runs on a detached, bounded context: with ctx, a cancel that arrived
+	// during the cutover would fail it, report the committed migration as
+	// failed, and leave a checkpoint that the next run tries to resume from
+	// without a _new table (issue #1338). Dropping _old stays on ctx: it can
+	// be slow on a large table, a cancel should not wait for it, and its
+	// failure is only logged.
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), postCutoverCleanupTimeout)
+	defer cancelCleanup()
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
 			if err := change.dropOldTable(ctx); err != nil {
@@ -584,13 +681,13 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	)
 	// cleanup all the tables
 	for _, change := range r.changes {
-		if err := change.cleanup(ctx); err != nil {
+		if err := change.cleanup(cleanupCtx); err != nil {
 			return err
 		}
 	}
 	// drop the checkpoint table
 	if r.checkpointTable != nil {
-		if err := r.checkpointTbl().Drop(ctx); err != nil {
+		if err := r.checkpointTbl().Drop(cleanupCtx); err != nil {
 			return err
 		}
 	}
@@ -1181,16 +1278,16 @@ func (r *Runner) setThrottlerOnPhases() {
 // Multiple replica DSNs can be specified as a comma-separated list.
 // This is common logic shared between resume and new migration paths.
 func (r *Runner) setupThrottler(ctx context.Context) error {
-	if r.migration.useTestThrottler {
-		// We are in tests, add a throttler that always throttles.
+	if r.migration.testThrottler != nil {
+		// We are in tests: use the test's throttler (a throttler.Mock).
 		//
 		// Deliberately wired to the copier only, not through
-		// setThrottlerOnPhases. The mock is always-throttled and blocks for a
-		// second per call, so it exists to pace the copy at a known rate.
+		// setThrottlerOnPhases. The mock exists to pace or stall the copy.
 		// Handing it to the checksum as well would add a second per checksum
-		// chunk to every test that uses it — real wall-clock cost, no extra
-		// coverage. Checksum throttling is covered directly in pkg/checksum.
-		r.setThrottler(&throttler.Mock{})
+		// chunk to every test that paces with it — real wall-clock cost, no
+		// extra coverage. Checksum throttling is covered directly in
+		// pkg/checksum.
+		r.setThrottler(r.migration.testThrottler)
 		r.copier.SetThrottler(r.currentThrottler())
 		return r.currentThrottler().Open(ctx)
 	}
@@ -2071,6 +2168,13 @@ func (r *Runner) invalidateChecksumWatermark(ctx context.Context) error {
 // returns context.Canceled.
 func (r *Runner) Cancel() {
 	r.cancel(nil)
+}
+
+// Abort stops a running migration with cause (see status.Aborter). The
+// checkpoint dumper calls it when it cannot write a checkpoint, so Run returns
+// the write error instead of context.Canceled.
+func (r *Runner) Abort(cause error) {
+	r.cancel(cause)
 }
 
 // cancel cancels the migration context with cause. A nil cause is a plain

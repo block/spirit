@@ -1775,3 +1775,69 @@ func TestEnumSetBinaryMemberSpaces(t *testing.T) {
 		fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE b = 'b' OR b = '' OR FIND_IN_SET('y', s) > 0", tableName)).Scan(&stripped))
 	require.Zero(t, stripped, "no row may hold a member stripped of its spaces")
 }
+
+// TestEnumSetMembersOutsideUTF8MB3 migrates ENUM and SET columns with a member
+// character outside utf8mb3. information_schema reports each such character
+// as '?', which the enum reorder check compared the new members against (so
+// appending a member was refused as a reorder) and which the binlog decoder
+// wrote in place of the member (so a replayed change was rejected by the
+// column, aborting the migration, or took the '?' member).
+func TestEnumSetMembersOutsideUTF8MB3(t *testing.T) {
+	t.Parallel()
+	tableName := "enum4b_mig"
+	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf(`CREATE TABLE %s (
+		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		e enum('😀','a') NOT NULL,
+		q enum('😀','?') NOT NULL,
+		s set('🎉','x') NOT NULL
+	) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`, tableName))
+	tt.SeedRows(t, fmt.Sprintf("INSERT INTO %s (e, q, s) SELECT 'a', '?', 'x'", tableName), 200)
+
+	// Making the columns nullable is not an INSTANT change, so the rows are
+	// copied into a shadow table.
+	m := NewTestRunner(t, tableName, "MODIFY e enum('😀','a','c') NULL, MODIFY q enum('😀','?','c') NULL, MODIFY s set('🎉','x','z') NULL",
+		WithThreads(1),
+		WithTestThrottler(),
+		WithSkipDropAfterCutover())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	dmlDone := make(chan struct{})
+	go func() {
+		defer close(dmlDone)
+		if !waitForCopyRows(t, ctx, m) {
+			return
+		}
+		for i := 1; i <= 20; i++ {
+			if ctx.Err() != nil {
+				return
+			}
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s (e, q, s) VALUES ('😀', '😀', '🎉,x')", tableName))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET e = '😀', q = '😀', s = '🎉' WHERE id = %d", tableName, i))
+		}
+	}()
+
+	require.NoError(t, m.Run(ctx))
+	cancel()
+	<-dmlDone
+	require.NoError(t, m.Close())
+
+	oldName := m.changes[0].oldTableName()
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS `"+oldName+"`") })
+	var oldTables int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='test' AND table_name=?`, oldName).Scan(&oldTables))
+	require.Equal(t, 1, oldTables, "the migration must have copied the rows")
+
+	// The source is kept (WithSkipDropAfterCutover), so every row can be
+	// compared with the one it was copied from, by stored bytes.
+	var differ int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s n LEFT JOIN `%s` o USING (id) WHERE o.id IS NULL OR HEX(n.e) <> HEX(o.e) OR HEX(n.q) <> HEX(o.q) OR HEX(n.s) <> HEX(o.s)",
+		tableName, oldName)).Scan(&differ))
+	require.Zero(t, differ)
+	var emoji int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s WHERE HEX(e) = 'F09F9880'", tableName)).Scan(&emoji))
+	require.Positive(t, emoji)
+}

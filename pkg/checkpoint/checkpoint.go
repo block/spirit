@@ -24,6 +24,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // IsIncompatible reports whether err means the checkpoint table can't be read
@@ -161,22 +162,88 @@ func (t *Table) Drop(ctx context.Context) error {
 	return dbconn.Exec(ctx, t.db, "DROP TABLE IF EXISTS %n", t.name)
 }
 
+// writeCancelGrace bounds how long Write keeps waiting for the server after
+// its caller's context is canceled, and writeKillTimeout bounds killing the
+// write's session once that grace has run out. See Write.
+var (
+	writeCancelGrace = 10 * time.Second
+	writeKillTimeout = 5 * time.Second
+)
+
+// ErrWriteAbandoned means Write gave up on a REPLACE the server had not
+// answered in time and killed its session. The row holds either the previous
+// checkpoint or this one; nothing is left pending.
+var ErrWriteAbandoned = errors.New("checkpoint write abandoned")
+
 // Write records a checkpoint row, keeping a single row by overwriting it in
 // place (REPLACE on the fixed primary key id=1). The table has one logical
 // owner, so there is no value in accumulating history, and REPLACE is one atomic
 // statement — a crash mid-write leaves either the old row or the new one, never
 // none. created_at is (re)assigned by the server on each write.
+//
+// When Write returns, the REPLACE is no longer pending on the server: it has
+// committed, failed, or been rolled back. Callers rely on this. They stop the
+// checkpoint dumper by canceling its context and joining it (Runner.Close,
+// move's stopWatchTask), then read, edit, or rewrite the row, and a REPLACE
+// still queued on the server would overwrite that row later. The driver's
+// cancellation only closes the socket; it does not stop the statement. So:
+//
+//   - If ctx is already done, Write sends nothing.
+//   - Canceling ctx mid-write does not abort it: Write waits up to
+//     writeCancelGrace for the server to answer. ctx's deadline, if any, still
+//     applies.
+//   - If the server has not answered by then, Write kills the session and waits
+//     for it to exit, then returns an error wrapping ErrWriteAbandoned.
+//
+// See github.com/block/spirit/issues/1313.
 func (t *Table) Write(ctx context.Context, rec Record) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var cutoverAt string
 	if !rec.CutoverAt.IsZero() {
 		cutoverAt = rec.CutoverAt.UTC().Format(time.RFC3339Nano)
 	}
-	return dbconn.Exec(ctx, t.db,
+	stmt, err := sqlescape.EscapeSQL(
 		"REPLACE INTO %n (id, copier_watermark, checksum_watermark, binlog_position, statement, original_table_name, move_phase, cutover_at) VALUES (1, %?, %?, %?, %?, %?, %?, %?)",
 		t.name,
 		rec.CopierWatermark, rec.ChecksumWatermark, rec.Position, rec.Statement, rec.OriginalTableName,
 		rec.Phase, cutoverAt,
 	)
+	if err != nil {
+		return err
+	}
+	writeCtx, cancel := utils.WithCancelGrace(ctx, writeCancelGrace)
+	defer cancel()
+	// A dedicated session, so that its ID is known if it has to be killed.
+	conn, err := t.db.Conn(writeCtx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	var connID int
+	if err := conn.QueryRowContext(writeCtx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(writeCtx, stmt)
+	if err == nil || writeCtx.Err() == nil {
+		return err
+	}
+	// Keep the context error in the chain whatever the driver returned, so
+	// callers still classify this as a cancellation or a timeout.
+	if cerr := writeCtx.Err(); !errors.Is(err, cerr) {
+		err = errors.Join(err, cerr)
+	}
+	// The grace or ctx's deadline ran out and the driver closed the socket, but
+	// the server may still be running the REPLACE (for example queued behind a
+	// metadata lock, which waits up to lock_wait_timeout). Kill the session so
+	// that it cannot commit after Write returns.
+	killCtx, cancelKill := context.WithTimeout(context.WithoutCancel(ctx), writeKillTimeout)
+	defer cancelKill()
+	if kerr := dbconn.KillSessionAndWait(killCtx, t.db, connID); kerr != nil {
+		return fmt.Errorf("%w: session %d did not answer in time and could not be killed, so the REPLACE may still commit: %w", ErrWriteAbandoned, connID, errors.Join(err, kerr))
+	}
+	return fmt.Errorf("%w: session %d did not answer in time and was killed: %w", ErrWriteAbandoned, connID, err)
 }
 
 // ReadLatest returns the most recent checkpoint row, or ErrNotFound when there

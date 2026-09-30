@@ -38,7 +38,9 @@ const syncCheckpointTableName = "_spirit_sync_checkpoint"
 
 // shutdownFlushTimeout bounds the best-effort final flush on a clean shutdown,
 // and shutdownCheckpointTimeout bounds the final checkpoint write (kept
-// independent so a slow flush can't starve the checkpoint). Both are short so
+// independent so a slow flush can't starve the checkpoint). A write the server
+// has not answered by then is killed, which checkpoint.Table.Write bounds
+// separately. Both are short so
 // Ctrl-C / SIGTERM exits promptly even against a busy source whose change feed
 // never fully catches up; unflushed changes are re-applied on the next run from
 // the checkpoint.
@@ -290,7 +292,9 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// Sync only ever reads the source data (copy SELECTs + the change feed).
 	// It never writes the source's data, acquires no source locks, and
 	// performs no cutover. With an injected change.Source it needs only SELECT
-	// on the source schema; the built-in MySQL binlog client additionally
+	// on the source schema (plus CREATE TEMPORARY TABLES for a table with an
+	// ENUM or SET member reported with a '?', see
+	// table.TableInfo.MisreportedEnumSetError); the built-in MySQL binlog client additionally
 	// needs REPLICATION SLAVE/CLIENT (validated on Start) and RELOAD, because
 	// it issues FLUSH BINARY LOGS to establish its start position. Disable the
 	// one dbConfig behaviour that would otherwise demand more:
@@ -519,6 +523,13 @@ func (r *Runner) runContinuous(ctx context.Context) error {
 	// copier watermark + change-feed position that let a restart resume instead
 	// of re-copying, so a slow or timed-out final flush above must not starve
 	// it of a shared deadline.
+	//
+	// Join the periodic dumper first (it stops on the same canceled ctx), so a
+	// periodic REPLACE still in flight cannot land after this one and roll the
+	// row back to an older watermark and position.
+	if ctx.Err() != nil && r.watchTaskWait != nil {
+		r.watchTaskWait()
+	}
 	cpCtx, cancelCp := context.WithTimeout(context.WithoutCancel(ctx), shutdownCheckpointTimeout)
 	defer cancelCp()
 	if err := r.dumpCheckpoint(cpCtx); err != nil {
@@ -709,11 +720,13 @@ func (r *Runner) ChecksumStats() checksum.LocklessCheckerStats {
 // source, and prepares either a fresh copy or a checkpoint resume.
 //
 // Sync deliberately runs no source privilege/configuration preflight: it
-// needs only SELECT on the source, and the change source validates any
+// needs only SELECT on the source (plus CREATE TEMPORARY TABLES for a table
+// with an ENUM or SET member reported with a '?'), and the change source validates any
 // feed-specific requirements itself (the MySQL binlog client checks
 // REPLICATION privileges + ROW binlog format on Start; a VStream
 // authenticates over gRPC). A table without a primary key surfaces a clear
-// error from getTables (SetInfo). The only target-side gate is that, for a
+// error from getTables (SetInfo); a FLOAT or BIT primary key is refused by
+// unsupportedPrimaryKeyError. The only target-side gate is that, for a
 // fresh sync, the target tables must be empty.
 func (r *Runner) setup(ctx context.Context) error {
 	r.logger.Info("Fetching source table list")
@@ -723,6 +736,12 @@ func (r *Runner) setup(ctx context.Context) error {
 	}
 	r.sourceTables = tables
 	if err := r.unsupportedNameError(); err != nil {
+		return err
+	}
+	if err := r.unsupportedPrimaryKeyError(); err != nil {
+		return err
+	}
+	if err := r.unrecreatableTableError(); err != nil {
 		return err
 	}
 	if len(r.sourceTables) == 0 {
@@ -967,9 +986,10 @@ func (r *Runner) getTables(ctx context.Context) ([]*table.TableInfo, error) {
 		}
 		ti := table.NewTableInfo(r.source.db, r.source.config.DBName, tableName)
 		ti.Host = r.source.config.Addr
-		// Sync only needs SELECT on the source, so skip the ANALYZE TABLE
-		// (it needs INSERT + a writable server); the row estimate comes from
-		// information_schema instead.
+		// Sync needs no write privilege on the source, so skip the ANALYZE
+		// TABLE (it needs INSERT + a writable server); the row estimate comes
+		// from information_schema instead. SetInfo may still create a
+		// temporary table, for an ENUM or SET member reported with a '?'.
 		ti.DisableAnalyze = true
 		if err := ti.SetInfo(ctx); err != nil {
 			return nil, err
@@ -995,6 +1015,42 @@ func (r *Runner) unsupportedNameError() error {
 	}
 	for _, t := range r.sourceTables {
 		if err := utils.UnsupportedIdentifierError("table name", t.TableName); err != nil {
+			return fmt.Errorf("cannot sync table %q: %w", t.TableName, err)
+		}
+	}
+	return nil
+}
+
+// unsupportedPrimaryKeyError refuses a table whose primary key includes a
+// FLOAT or a BIT column before anything is written, as move does. A FLOAT key
+// cannot be located by its text form, so a replayed DELETE matches nothing
+// (see table.TableInfo.FloatPrimaryKeyError). A BIT key cannot be read back
+// from the table as a number, so chunk boundaries cannot be computed (see
+// table.TableInfo.BitPrimaryKeyError).
+func (r *Runner) unsupportedPrimaryKeyError() error {
+	for _, t := range r.sourceTables {
+		if err := t.FloatPrimaryKeyError(); err != nil {
+			return fmt.Errorf("cannot sync table %q: %w", t.TableName, err)
+		}
+		if err := t.BitPrimaryKeyError(); err != nil {
+			return fmt.Errorf("cannot sync table %q: %w", t.TableName, err)
+		}
+	}
+	return nil
+}
+
+// unrecreatableTableError refuses a source table that createTargetTables
+// cannot recreate from its SHOW CREATE TABLE: an ENUM or SET member with a
+// character outside utf8mb3 is reported there as '?', so the target would not
+// have the member (see table.TableInfo.MisreportedEnumSetError).
+//
+// verifyExistingTargetTable compares a target that exists already with the
+// source by the same reported definitions, which cannot tell a misreported
+// member from a '?'. This refusal covers the source side of that comparison;
+// createTargetTables examines the target side.
+func (r *Runner) unrecreatableTableError() error {
+	for _, t := range r.sourceTables {
+		if err := t.MisreportedEnumSetError(); err != nil {
 			return fmt.Errorf("cannot sync table %q: %w", t.TableName, err)
 		}
 	}
@@ -1211,6 +1267,12 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 			}
 			if err := r.verifyExistingTargetTable(t.TableName, createStmt, targetCreateStmt); err != nil {
 				return err
+			}
+			// verifyExistingTargetTable compares reported definitions, which
+			// cannot tell a misreported ENUM or SET member from a '?'
+			// (see unrecreatableTableError).
+			if err := table.MisreportedEnumSetErrorForTable(ctx, r.target.DB, r.target.Config.DBName, t.TableName); err != nil {
+				return fmt.Errorf("table %s already exists on the target (%s) but cannot be compared with the source: %w", t.TableName, r.target.Config.DBName, err)
 			}
 			r.logger.Info("target table already exists and passed schema verification, skipping creation",
 				"table", t.TableName, "database", r.target.Config.DBName)

@@ -449,6 +449,63 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	require.False(t, tableExists(t, ctl, "rwrv_dst", checkpointTableName), "checkpoint should be dropped")
 }
 
+// TestMoveReverseWindowRevertCancelAfterSwitchBack: a cancel that arrives
+// during the reverse traffic switch must not stop the rollback's remaining
+// steps. Traffic is already back on the source, so the targets are still
+// retired, the finalized phase is recorded and the checkpoint is dropped. With
+// the cancelled context the phase write would fail and leave the checkpoint
+// at "reverting", which the next run rejects as ownership-ambiguous.
+func TestMoveReverseWindowRevertCancelAfterSwitchBack(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwrc_src", "rwrc_dst")
+
+	m := &Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Threads:       1,
+		WriteThreads:  1,
+		ReverseWindow: 30 * time.Second, // long; the revert ends it early
+	}
+	runner, err := NewRunner(m)
+	require.NoError(t, err)
+
+	// The run's cancel func reaches the callback through a channel, which
+	// orders it after startRun for the race detector.
+	cancelRun := make(chan context.CancelFunc, 1)
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error {
+		(<-cancelRun)() // the operator stops the move right after the switch back
+		return nil
+	})
+	h := startRun(t, runner)
+	cancelRun <- h.cancel
+
+	h.awaitReverseWindow(ctl, "rwrc_dst")
+	testutils.RunSQL(t, "CREATE TABLE rwrc_dst."+revertMarkerName+" (id INT)")
+
+	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete")
+
+	require.True(t, tableExists(t, ctl, "rwrc_src", "t1"), "source should be un-retired")
+	require.True(t, tableExists(t, ctl, "rwrc_dst", "t1_revert"), "target should be retired to _revert")
+	require.False(t, tableExists(t, ctl, "rwrc_dst", "t1"), "target real table should be gone after retire")
+	require.False(t, tableExists(t, ctl, "rwrc_dst", checkpointTableName), "checkpoint should be dropped")
+	require.Equal(t, status.WorkflowTerminalOwnershipReverseFinalized, runner.Result().TerminalOwnership)
+}
+
+// TestUnretireSourceTableIgnoresCancel: un-retiring a source table moves
+// ownership, so the rename must not be interrupted by a cancel. A cancelled
+// rename could still commit on the server without the client knowing.
+func TestUnretireSourceTableIgnoresCancel(t *testing.T) {
+	name, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, name, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY)")
+	w := &reverseWindow{r: &Runner{dbConfig: dbconn.NewDBConfig(), logger: slog.Default()}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	require.NoError(t, w.unretireSourceTable(ctx, db, "t1"))
+	require.True(t, tableExists(t, db, name, "t1"), "t1_old must have been renamed to t1")
+}
+
 // TestMoveReverseWindowRevertCarriesAutoIncrement: ids the target issues and
 // deletes during the window never flow back to the source, so the revert must
 // carry the target's AUTO_INCREMENT counter back or the source would issue

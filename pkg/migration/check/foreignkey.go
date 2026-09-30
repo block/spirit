@@ -3,6 +3,7 @@ package check
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/block/spirit/pkg/parser/ast"
@@ -55,6 +56,10 @@ func hasForeignKeysCheck(ctx context.Context, r Resources, logger *slog.Logger) 
 	return nil
 }
 
+// addForeignKeyCheck refuses an ALTER that adds a foreign key: a FOREIGN KEY
+// constraint, or a column added or redefined with an inline REFERENCES. MySQL
+// 8.0 parses and ignores an inline REFERENCES, but MySQL 9.0 creates a foreign
+// key for it, so it is refused on every version.
 func addForeignKeyCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	alterStmt, ok := (*r.Statement.StmtNode).(*ast.AlterTableStmt)
 	if !ok {
@@ -68,6 +73,15 @@ func addForeignKeyCheck(ctx context.Context, r Resources, logger *slog.Logger) e
 			for _, constraint := range spec.NewConstraints {
 				if constraint.Refer != nil {
 					return errors.New("adding foreign key constraints is not supported")
+				}
+			}
+		}
+		// ADD COLUMN, MODIFY and CHANGE all carry their column definitions in
+		// NewColumns.
+		for _, col := range spec.NewColumns {
+			for _, opt := range col.Options {
+				if opt.Tp == ast.ColumnOptionReference {
+					return fmt.Errorf("adding foreign key constraints is not supported: column %q is declared with an inline REFERENCES, which MySQL 9.0 and later create a foreign key for", col.Name.Name.O)
 				}
 			}
 		}

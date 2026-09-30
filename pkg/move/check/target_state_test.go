@@ -258,6 +258,47 @@ func TestTargetStateCheckNotNullShardKey(t *testing.T) {
 	})
 }
 
+// TestTargetStateCheckMisreportedEnumSetTarget checks that a pre-created
+// target is refused when it stores an ENUM member that SHOW CREATE TABLE
+// reports as '?'. Its reported definition equals that of a source whose member
+// really is '?', so the schema comparison alone would accept it.
+func TestTargetStateCheckMisreportedEnumSetTarget(t *testing.T) {
+	srcName, srcDB := createW3DDatabase(t)
+	tgtName, tgtDB := createW3DDatabase(t)
+	_, err := srcDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('?','a')) DEFAULT CHARSET=utf8mb4")
+	require.NoError(t, err)
+	sourceTable := table.NewTableInfo(srcDB, srcName, "t")
+	require.NoError(t, sourceTable.SetInfo(t.Context()))
+	r := Resources{
+		Sources:      []SourceResource{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
+		Targets:      []applier.Target{{DB: tgtDB, Config: &mysql.Config{DBName: tgtName}}},
+		SourceTables: []*table.TableInfo{sourceTable},
+	}
+
+	t.Run("misreported target member fails", func(t *testing.T) {
+		_, err := tgtDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('😀','a')) DEFAULT CHARSET=utf8mb4")
+		require.NoError(t, err)
+		defer func() { _, _ = tgtDB.ExecContext(t.Context(), "DROP TABLE t") }()
+		sourceCreate, err := showCreateTable(t.Context(), srcDB, srcName, "t")
+		require.NoError(t, err)
+		targetCreate, err := showCreateTable(t.Context(), tgtDB, tgtName, "t")
+		require.NoError(t, err)
+		diff, err := TargetSchemaDiff("t", sourceCreate, targetCreate)
+		require.NoError(t, err)
+		require.Empty(t, diff, "the reported definitions compare equal")
+
+		err = targetStateCheck(t.Context(), r, slog.Default())
+		require.ErrorContains(t, err, `table 't' exists on target 0 (`+tgtName+`) but cannot be compared with the source: column "e" of table "t" is enum('?','a'), but MySQL stores a member with a character outside utf8mb3 there`)
+	})
+
+	t.Run("matching target passes", func(t *testing.T) {
+		_, err := tgtDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('?','a')) DEFAULT CHARSET=utf8mb4")
+		require.NoError(t, err)
+		defer func() { _, _ = tgtDB.ExecContext(t.Context(), "DROP TABLE t") }()
+		require.NoError(t, targetStateCheck(t.Context(), r, slog.Default()))
+	})
+}
+
 // TestTargetStateCheckRejectsNullableTargetColumn pins the direction of the
 // nullability relaxation from the other side: a target that permits NULL where
 // the SOURCE is NOT NULL can accept rows the source never could, so it stays a

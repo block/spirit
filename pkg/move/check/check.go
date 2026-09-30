@@ -36,6 +36,10 @@ type SourceResource struct {
 	DB     *sql.DB
 	Config *mysql.Config
 	DSN    string
+	// Tables are this source's tables. Resources.SourceTables holds the
+	// first source's, which stand for every source where only their
+	// reported definition matters.
+	Tables []*table.TableInfo
 }
 
 // Resources contains the resources needed for move checks

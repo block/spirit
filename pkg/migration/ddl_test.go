@@ -1,10 +1,13 @@
 package migration
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/testutils"
@@ -312,4 +315,123 @@ func TestPercentSignsInDDLLiterals(t *testing.T) {
 	sc = showCreateTable(t, tt.DB, "pct_literals_create")
 	require.Contains(t, sc, "DEFAULT '50%% off'")
 	require.Contains(t, sc, "COMMENT '100%new'")
+}
+
+// TestNativeDDLDropsStaleCopyTables checks that when the ALTER completes with
+// MySQL's own DDL (INSTANT here), the _new and checkpoint tables left by an
+// earlier interrupted copy of the same table are dropped. They describe the
+// table before this ALTER changed it, so they can no longer be resumed from,
+// and nothing else would drop them.
+func TestNativeDDLDropsStaleCopyTables(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "stalecopy", `CREATE TABLE stalecopy (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	tt.SeedRows(t, "INSERT INTO stalecopy (b) SELECT 'abc'", 100000)
+
+	// Interrupt a copy once it has written a checkpoint with copy progress.
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE stalecopy ENGINE=InnoDB", WithThreads(1), WithTestThrottler())
+	running := startTestRun(t, m.Run, m.Close)
+	require.Eventually(t, func() bool {
+		var n int
+		err := tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _stalecopy_chkpnt WHERE copier_watermark != ''").Scan(&n)
+		return err == nil && n > 0
+	}, time.Minute, 10*time.Millisecond, "no checkpoint was written")
+	running.cancel()
+	require.ErrorIs(t, running.wait(t), context.Canceled)
+
+	tableExists := func(name string) bool {
+		var n int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&n))
+		return n > 0
+	}
+	require.True(t, tableExists("_stalecopy_new"), "the interrupted copy leaves its _new table")
+	require.True(t, tableExists("_stalecopy_chkpnt"), "the interrupted copy leaves its checkpoint table")
+
+	m2 := NewTestRunnerFromStatement(t, "ALTER TABLE stalecopy ADD COLUMN c INT NOT NULL DEFAULT 7", WithThreads(1))
+	require.NoError(t, m2.Run(t.Context()))
+	require.NoError(t, m2.Close())
+	require.True(t, m2.usedInstantDDL)
+
+	require.False(t, tableExists("_stalecopy_new"), "a stale _new table must be dropped after native DDL")
+	require.False(t, tableExists("_stalecopy_chkpnt"), "a stale checkpoint table must be dropped after native DDL")
+}
+
+// TestNativeDDLKeepsCopyTablesOfAnotherTable checks that the cleanup after
+// native DDL leaves the auxiliary tables alone when the checkpoint records a
+// different original table: auxiliary names are truncated, so two long table
+// names can share them, and the state may belong to the other table.
+func TestNativeDDLKeepsCopyTablesOfAnotherTable(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "staleother", `CREATE TABLE staleother (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	testutils.RunSQL(t, "CREATE TABLE _staleother_new LIKE staleother")
+	ckpt := checkpoint.NewTable(tt.DB, "_staleother_chkpnt", checkpoint.Transient)
+	require.NoError(t, ckpt.Create(t.Context()))
+	require.NoError(t, ckpt.Write(t.Context(), checkpoint.Record{Statement: "ALTER TABLE x ENGINE=InnoDB", OriginalTableName: "a_different_table"}))
+
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE staleother ADD COLUMN c INT NOT NULL DEFAULT 7", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.True(t, m.usedInstantDDL)
+
+	for _, name := range []string{"_staleother_new", "_staleother_chkpnt"} {
+		var n int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&n))
+		require.Equal(t, 1, n, "%s belongs to another table and must be kept", name)
+	}
+}
+
+// TestNativeDDLKeepsCopyTablesWhenCheckpointUnreadable checks that the cleanup
+// after native DDL drops nothing when the checkpoint table exists but cannot
+// be read (here, a layout this version does not recognise), because ownership
+// of the auxiliary tables cannot be established.
+func TestNativeDDLKeepsCopyTablesWhenCheckpointUnreadable(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "staleunread", `CREATE TABLE staleunread (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	testutils.RunSQL(t, "CREATE TABLE _staleunread_new LIKE staleunread")
+	testutils.RunSQL(t, "CREATE TABLE _staleunread_chkpnt (id int not null primary key, some_other_column int)")
+	testutils.RunSQL(t, "INSERT INTO _staleunread_chkpnt VALUES (1, 1)")
+
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE staleunread ADD COLUMN c INT NOT NULL DEFAULT 7", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.True(t, m.usedInstantDDL)
+
+	for _, name := range []string{"_staleunread_new", "_staleunread_chkpnt"} {
+		var n int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&n))
+		require.Equal(t, 1, n, "%s must be kept when the checkpoint cannot be read", name)
+	}
+}
+
+// TestNativeDDLKeepsNewTableWithoutCheckpoint checks that the cleanup after
+// native DDL keeps a _new table when there is no checkpoint table, since
+// without one there is no evidence Spirit created it.
+func TestNativeDDLKeepsNewTableWithoutCheckpoint(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "stalenockpt", `CREATE TABLE stalenockpt (
+		id int not null primary key auto_increment,
+		b varchar(100) not null
+	)`)
+	testutils.RunSQL(t, "CREATE TABLE _stalenockpt_new LIKE stalenockpt")
+
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE stalenockpt ADD COLUMN c INT NOT NULL DEFAULT 7", WithThreads(1))
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+	require.True(t, m.usedInstantDDL)
+
+	var n int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_stalenockpt_new'").Scan(&n))
+	require.Equal(t, 1, n, "a _new table without a checkpoint table may not be Spirit's and must be kept")
 }

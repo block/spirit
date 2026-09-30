@@ -61,9 +61,12 @@ func enumReorderCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 			continue
 		}
 
-		existingElems, err := utils.ParseEnumSetElements(existingType)
-		if err != nil {
-			return cannotClassify("unable to validate ENUM change for column %q: %w", col.LookupName, err)
+		// Not ParseEnumSetElements(existingType): information_schema reports
+		// a member character outside utf8mb3 as '?', and EnumSetMembers has
+		// the member MySQL stores.
+		existingElems, ok := r.Table.EnumSetMembers(col.LookupName)
+		if !ok {
+			return cannotClassify("unable to validate ENUM change for column %q: its members were not found in table metadata", col.LookupName)
 		}
 		if len(existingElems) == 0 {
 			continue

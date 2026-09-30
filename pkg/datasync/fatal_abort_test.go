@@ -17,13 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// stallThrottler is always throttled, and its BlockWait returns only when the
-// context is done. The copier waits on it before reading each chunk, so a
-// sync using it stays in CopyRows until it is stopped.
-type stallThrottler struct{ throttler.Mock }
-
-func (*stallThrottler) BlockWait(ctx context.Context) { <-ctx.Done() }
-
 // outcomeSink records the outcome of every finished workflow phase.
 type outcomeSink struct {
 	mu       sync.Mutex
@@ -82,7 +75,7 @@ func TestSyncFatalAbortDuringCopy(t *testing.T) {
 				WriteThreads: 1,
 			})
 			require.NoError(t, err)
-			fakeAurora(runner, 8, throttler.AuroraResult{Throttlers: []throttler.Throttler{&stallThrottler{}}})
+			fakeAurora(runner, 8, throttler.AuroraResult{Throttlers: []throttler.Throttler{throttler.NewStallingMock(0)}})
 			sink := &outcomeSink{}
 			runner.SetMetricsSink(sink)
 

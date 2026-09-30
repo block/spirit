@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/mysql"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -412,6 +414,40 @@ func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
 	}
 
 	return nil
+}
+
+// KillSessionAndWait kills the session pid and waits until it has exited, so
+// any statement it was running has either finished or been rolled back. A
+// session that is already gone counts as success. ctx bounds both steps.
+//
+// It needs no extra privileges when pid belongs to the same user as db: a user
+// can KILL its own sessions and see them in information_schema.PROCESSLIST
+// without CONNECTION_ADMIN or PROCESS.
+func KillSessionAndWait(ctx context.Context, db *sql.DB, pid int) error {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(killStatement, pid)); err != nil {
+		if myErr, ok := errors.AsType[*mysql.MySQLError](err); !ok || myErr.Number != parsermysql.ErrNoSuchThread {
+			return fmt.Errorf("failed to kill session %d: %w", pid, err)
+		}
+	}
+	interval := 10 * time.Millisecond
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		var remaining int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", pid).Scan(&remaining); err != nil {
+			return fmt.Errorf("waiting for killed session %d to exit: %w", pid, err)
+		}
+		if remaining == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for killed session %d to exit: %w", pid, ctx.Err())
+		case <-timer.C:
+		}
+		interval = min(interval*2, 100*time.Millisecond)
+		timer.Reset(interval)
+	}
 }
 
 func tablesToInList(tables []*table.TableInfo, logger *slog.Logger) (inList string, params []any) {
