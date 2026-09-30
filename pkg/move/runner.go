@@ -1506,6 +1506,14 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		//
 		// But the caller will still want their cutoverFunc called. So we do that
 		// and then exit.
+		//
+		// No post-setup or resume check runs on this path, so run the target
+		// schema-objects check here: with no tables there is no table trigger
+		// to match, but a target event (or a trigger on a leftover checkpoint
+		// table) is still refused before the cutover callback.
+		if err := check.TargetSchemaObjectsError(ctx, r.targets, nil); err != nil {
+			return err
+		}
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
 		if err := r.status.DoContext(ctx, status.CutOver, func() error {
 			if r.cutoverFunc == nil {

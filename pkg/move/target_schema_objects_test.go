@@ -242,3 +242,27 @@ func countTables(t *testing.T, db *sql.DB, schema string) int {
 		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", schema).Scan(&n))
 	return n
 }
+
+// TestEmptySourceMoveRefusesTargetEvent: a source with no tables skips
+// setup and goes straight to the cutover callback. An event in the target
+// schema still refuses the move there, before the callback runs.
+func TestEmptySourceMoveRefusesTargetEvent(t *testing.T) {
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	dstName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabaseAsRoot(t, dstName, "CREATE EVENT orders_e ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:    testutils.DSNForDatabase(srcName),
+		TargetDSN:    testutils.DSNForDatabase(dstName),
+		Threads:      1,
+		WriteThreads: 1,
+	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+	var cutoverCalled bool
+	runner.SetCutover(func(context.Context) error { cutoverCalled = true; return nil })
+	err = runner.Run(t.Context())
+	require.ErrorContains(t, err, targetObjectsRefusal)
+	require.ErrorContains(t, err, "target 0 ("+dstName+"): event 'orders_e'")
+	require.False(t, cutoverCalled, "the cutover callback must not be called")
+}

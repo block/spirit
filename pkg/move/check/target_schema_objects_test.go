@@ -125,10 +125,10 @@ func TestTargetSchemaObjectsCheck(t *testing.T) {
 
 	// With no moved table (a fresh move into a schema without them), an event
 	// and a trigger on the checkpoint table of the first target still refuse.
-	require.EqualError(t, targetSchemaObjectsError(t.Context(), r.Targets[1:], nil),
+	require.EqualError(t, TargetSchemaObjectsError(t.Context(), r.Targets[1:], nil),
 		targetObjectsPrefix+"target 0 ("+tgt1Name+"): trigger 'chk_ai' on table '"+moveCheckpointTableName+"', event 'e1'")
-	require.NoError(t, targetSchemaObjectsError(t.Context(), nil, r.SourceTables))
-	require.EqualError(t, targetSchemaObjectsError(t.Context(), []applier.Target{{}}, nil),
+	require.NoError(t, TargetSchemaObjectsError(t.Context(), nil, r.SourceTables))
+	require.EqualError(t, TargetSchemaObjectsError(t.Context(), []applier.Target{{}}, nil),
 		"target 0 database connection or config is not initialized")
 }
 
@@ -152,7 +152,7 @@ func TestTargetSchemaObjectsCheckRequiresVisibility(t *testing.T) {
 			db, cfg := createMoveTestUser(t, tc.user, schema, fmt.Sprintf(tc.grant, schema))
 			targets := []applier.Target{{DB: db, Config: cfg}}
 			want := "target 0 (" + schema + "): " + prefix + fmt.Sprintf(tc.needed, schema)
-			err := targetSchemaObjectsError(t.Context(), targets, nil)
+			err := TargetSchemaObjectsError(t.Context(), targets, nil)
 			require.EqualError(t, err, want)
 			require.ErrorIs(t, err, ErrRefused)
 			err = privilegesCheck(t.Context(), Resources{Targets: targets}, slog.Default())
@@ -161,7 +161,7 @@ func TestTargetSchemaObjectsCheckRequiresVisibility(t *testing.T) {
 
 			canceled, cancel := context.WithCancel(t.Context())
 			cancel()
-			err = targetSchemaObjectsError(canceled, targets, nil)
+			err = TargetSchemaObjectsError(canceled, targets, nil)
 			require.ErrorContains(t, err, "target 0 ("+schema+"): could not read the grants")
 			require.NotErrorIs(t, err, ErrRefused)
 		})
@@ -169,7 +169,7 @@ func TestTargetSchemaObjectsCheckRequiresVisibility(t *testing.T) {
 	db, cfg := createMoveTestUser(t, "testmovevis_tgtok", schema, "GRANT SELECT, TRIGGER, EVENT ON `"+schema+"`.* TO %s")
 	targets := []applier.Target{{DB: db, Config: cfg}}
 	require.NoError(t, privilegesCheck(t.Context(), Resources{Targets: targets}, slog.Default()))
-	require.EqualError(t, targetSchemaObjectsError(t.Context(), targets, nil),
+	require.EqualError(t, TargetSchemaObjectsError(t.Context(), targets, nil),
 		targetObjectsPrefix+"target 0 ("+schema+"): event 'e1'", "with the grants, the objects are visible")
 	require.EqualError(t, privilegesCheck(t.Context(), Resources{Targets: []applier.Target{{}}}, slog.Default()),
 		"target 0 database connection or config is not initialized")

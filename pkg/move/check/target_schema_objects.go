@@ -19,6 +19,10 @@ func init() {
 	// under both still refuses before any target write. The privileges check
 	// requires the target visibility grants at preflight.
 	//
+	// A move with no tables skips the post-setup and resume checks and goes
+	// straight to the cutover callback, so the runner calls
+	// TargetSchemaObjectsError itself on that path.
+	//
 	// The pre-cutover registration runs it again under the cutover's table
 	// locks, just before traffic is switched: a trigger or an event created on
 	// a target during the copy has already run for the rows written since, and
@@ -39,10 +43,10 @@ var targetObjectKinds = []int{0, 4}
 var targetObjectVisibilityKinds = []schemaObject{schemaTriggers, schemaEvents}
 
 func targetSchemaObjectsCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
-	return targetSchemaObjectsError(ctx, r.Targets, r.SourceTables)
+	return TargetSchemaObjectsError(ctx, r.Targets, r.SourceTables)
 }
 
-// targetSchemaObjectsError returns a refusal (see ErrRefused) listing, for
+// TargetSchemaObjectsError returns a refusal (see ErrRefused) listing, for
 // every target, each trigger on a table move writes to and each event in the
 // target schema, grouped by target, or nil.
 //
@@ -63,7 +67,7 @@ func targetSchemaObjectsCheck(ctx context.Context, r Resources, _ *slog.Logger) 
 //
 // --force does not bypass the refusal: the runner runs this check before it
 // wipes the target, and the wipe never drops events.
-func targetSchemaObjectsError(ctx context.Context, targets []applier.Target, tables []*table.TableInfo) error {
+func TargetSchemaObjectsError(ctx context.Context, targets []applier.Target, tables []*table.TableInfo) error {
 	var groups []string
 	for i, target := range targets {
 		if target.DB == nil || target.Config == nil {
