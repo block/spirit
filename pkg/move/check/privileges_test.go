@@ -3,8 +3,10 @@ package check
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -198,7 +200,7 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	})
 
 	// An explicit schema-level list, not ALL: it has no EVENT and nothing
-	// that shows routines, which the opaque role is taken to provide.
+	// that shows routines.
 	_, err = db.ExecContext(t.Context(), "GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON test.* TO testmoverdsroleuser")
 	require.NoError(t, err)
 	_, err = db.ExecContext(t.Context(), "GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testmoverdsroleuser")
@@ -230,12 +232,29 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 		Sources: []SourceResource{{DB: lowPrivDB, Config: sourceConfig}},
 	}
 
-	// With rds_superuser_role granted and activate_all_roles_on_login=ON,
-	// privilegesCheck should pass.
+	// The role stands in for CONNECTION_ADMIN, but not for the visibility
+	// grants: this role is empty, so SHOW GRANTS lists nothing that shows
+	// events or routines, and both checks refuse.
+	const needed = "Needed: EVENT on `test`.* (to see its events); SHOW_ROUTINE on *.*"
 	err = privilegesCheck(t.Context(), r, slog.Default())
-	require.NoError(t, err, "should pass when activate_all_roles_on_login=ON and rds_superuser_role is granted")
-	// The per-scan visibility check applies the same exemption.
-	require.NoError(t, schemaObjectVisibility(t.Context(), lowPrivDB, sourceConfig.DBName, allSchemaObjects...))
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, needed)
+	err = schemaObjectVisibility(t.Context(), lowPrivDB, sourceConfig.DBName, allSchemaObjects...)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, needed)
+
+	// A role that carries the grants, like the real one: with
+	// activate_all_roles_on_login=ON, SHOW GRANTS lists the active role's
+	// privileges, so both checks pass. A new pool, so no connection predates
+	// the grant.
+	_, err = db.ExecContext(t.Context(), "GRANT SELECT, TRIGGER, EVENT ON *.* TO rds_superuser_role")
+	require.NoError(t, err)
+	withGrants, err := sql.Open("block-mysql", sourceConfig.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(withGrants)
+	r.Sources[0].DB = withGrants
+	require.NoError(t, privilegesCheck(t.Context(), r, slog.Default()))
+	require.NoError(t, schemaObjectVisibility(t.Context(), withGrants, sourceConfig.DBName, allSchemaObjects...))
 }
 
 // oldMinimalMoveGrants are the grants that passed the move privileges check
@@ -518,44 +537,121 @@ func TestRDSSuperuserRoleGranted(t *testing.T) {
 	require.False(t, rdsSuperuserRoleGranted([]string{"GRANT SELECT ON `rds_superuser_role`.* TO `u`@`%`"}))
 }
 
-// TestVisibilityReadErrorsAreNotRefusals checks that a failure to read what
-// the visibility decision depends on (SHOW GRANTS, partial_revokes, or
-// activate_all_roles_on_login for the rds_superuser_role exemption) is a
-// plain error, not a refusal (ErrRefused), so the cutover retries it instead
-// of failing with a misleading "insufficient privileges". A closed pool
-// stands in for a connection lost mid-check.
+// stubDB wraps a real connection for the grant checks. If grants is not nil,
+// SHOW GRANTS returns those lines instead of the user's (read through a real
+// SELECT, so the rows are genuine). A query containing fail fails: a
+// QueryContext with an error, a QueryRowContext with a *sql.Row whose Scan
+// returns context.Canceled.
+type stubDB struct {
+	*sql.DB
+	grants []string
+	fail   string
+}
+
+var errStubQuery = errors.New("stub: query failed")
+
+func (s stubDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if s.fail != "" && strings.Contains(query, s.fail) {
+		return nil, errStubQuery
+	}
+	if query == "SHOW GRANTS" && s.grants != nil {
+		selects := make([]string, len(s.grants))
+		lines := make([]any, len(s.grants))
+		for i, g := range s.grants {
+			selects[i], lines[i] = "SELECT ?", g
+		}
+		return s.DB.QueryContext(ctx, strings.Join(selects, " UNION ALL "), lines...)
+	}
+	return s.DB.QueryContext(ctx, query, args...)
+}
+
+func (s stubDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if s.fail != "" && strings.Contains(query, s.fail) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		return s.DB.QueryRowContext(canceled, query, args...)
+	}
+	return s.DB.QueryRowContext(ctx, query, args...)
+}
+
+// TestVisibilityReadErrorsAreNotRefusals checks that a failure of any read
+// the privilege decisions depend on is a plain error, not a refusal
+// (ErrRefused), so the cutover retries it instead of failing with a
+// misleading "insufficient privileges". Each case fails exactly one query and
+// lets the others through:
+//   - partial_revokes: in the preflight privileges check and the per-scan
+//     visibility check;
+//   - SHOW GRANTS: in both, after partial_revokes has been read;
+//   - activate_all_roles_on_login, read for a user granted rds_superuser_role:
+//     in the preflight privileges check, after both grant reads succeeded.
+//
+// It also checks that the rds_superuser_role name is not accepted in place of
+// the visibility grants.
 func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
-	require.NoError(t, db.Close())
+	defer utils.CloseAndLog(db)
+	noForceKillProbe := func(context.Context) error { return nil }
 
-	// The role is granted, so the exemption needs the server setting, and
-	// the read fails. Without the probe, these grants would be refused.
-	withRole := []string{"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `app`.* TO `u`@`%`",
-		"GRANT `rds_superuser_role`@`%` TO `u`@`%`"}
-	err = evaluateSchemaObjectVisibility(t.Context(), db, withRole, "app", false, allSchemaObjects...)
-	require.ErrorContains(t, err, "could not check whether rds_superuser_role makes the schema's objects visible: could not read activate_all_roles_on_login")
-	require.NotErrorIs(t, err, ErrRefused)
-
-	// Without the role, the setting is not read, and missing grants are a
-	// refusal.
-	err = evaluateSchemaObjectVisibility(t.Context(), db, withRole[:1], "app", false, allSchemaObjects...)
-	require.ErrorIs(t, err, ErrRefused)
-
-	// Reading the grants (partial_revokes, then SHOW GRANTS) fails the same
-	// way, in every scan.
-	cfg := &mysql.Config{DBName: "app"}
-	for name, scan := range map[string]func() error{
-		"schema objects": func() error { return SourceSchemaObjectsError(t.Context(), []SourceResource{{DB: db, Config: cfg}}) },
-		"reverse window": func() error {
-			return ReverseWindowSchemaObjectsError(t.Context(), []SourceResource{{DB: db, Config: cfg}})
-		},
-		"privileges": func() error {
-			return privilegesCheck(t.Context(), Resources{Sources: []SourceResource{{DB: db, Config: cfg}}}, slog.Default())
-		},
-	} {
-		err := scan()
-		require.Error(t, err, name)
-		require.NotErrorIs(t, err, ErrRefused, name)
+	// Base privileges and the role, but none of the visibility grants the
+	// schema-level list lacks (EVENT, routines).
+	withRole := []string{
+		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON `app`.* TO `u`@`%`",
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO `u`@`%`",
+		"GRANT `rds_superuser_role`@`%` TO `u`@`%`",
 	}
+
+	for _, tc := range []struct {
+		name, fail, want string
+		visibilityToo    bool
+	}{
+		{"partial_revokes", "partial_revokes", "could not read partial_revokes", true},
+		{"SHOW GRANTS", "SHOW GRANTS", errStubQuery.Error(), true},
+		{"activate_all_roles_on_login", "activate_all_roles_on_login", "could not read activate_all_roles_on_login", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := stubDB{DB: db, grants: withRole, fail: tc.fail}
+			err := sourcePrivileges(t.Context(), stub, "app", noForceKillProbe)
+			require.ErrorContains(t, err, tc.want)
+			require.NotErrorIs(t, err, ErrRefused)
+			if tc.visibilityToo {
+				err = schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)
+				require.ErrorContains(t, err, "could not read the grants that make the schema's objects visible: "+tc.want)
+				require.NotErrorIs(t, err, ErrRefused)
+			}
+		})
+	}
+
+	// With every read succeeding, the same grants are a refusal: the stub
+	// reaches the evaluation, and the role's name does not stand in for the
+	// visibility grants. activate_all_roles_on_login is reported ON, so the
+	// role is taken as active; SHOW GRANTS would list its privileges.
+	t.Run("rds_superuser_role name does not substitute for visibility", func(t *testing.T) {
+		const needed = "Needed: EVENT on `app`.* (to see its events); SHOW_ROUTINE on *.*"
+		stub := stubDB{DB: db, grants: withRole}
+		err := schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)
+		require.ErrorIs(t, err, ErrRefused)
+		require.ErrorContains(t, err, needed)
+		on := onRoleStub{stub}
+		err = sourcePrivileges(t.Context(), on, "app", noForceKillProbe)
+		require.ErrorIs(t, err, ErrRefused)
+		require.ErrorContains(t, err, needed)
+		// The role's expanded privileges, as SHOW GRANTS lists them for an
+		// active role, are counted.
+		on.grants = append(slices.Clone(withRole), "GRANT SELECT, EVENT, TRIGGER ON *.* TO `u`@`%`")
+		require.NoError(t, sourcePrivileges(t.Context(), on, "app", noForceKillProbe))
+		require.NoError(t, schemaObjectVisibility(t.Context(), on, "app", allSchemaObjects...))
+	})
+}
+
+// onRoleStub reports activate_all_roles_on_login=ON, whatever the server's
+// setting, so that sourcePrivileges takes a granted rds_superuser_role as
+// active.
+type onRoleStub struct{ stubDB }
+
+func (s onRoleStub) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if strings.Contains(query, "activate_all_roles_on_login") {
+		return s.DB.QueryRowContext(ctx, "SELECT 1")
+	}
+	return s.stubDB.QueryRowContext(ctx, query, args...)
 }

@@ -11,13 +11,18 @@ import (
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 )
 
+// RowQuerier is the part of *sql.DB (or *sql.Conn) that reads one row.
+type RowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // ActivateAllRolesOnLogin reports whether the server has
 // activate_all_roles_on_login=ON. When this is enabled, all granted roles are
 // automatically activated on login, so role-granted privileges are available
 // without explicit SET ROLE ALL. A failed read is returned as an error, not
 // reported as false: a caller deciding whether privileges are missing must not
 // mistake a transient failure for a missing privilege.
-func ActivateAllRolesOnLogin(ctx context.Context, db *sql.DB) (bool, error) {
+func ActivateAllRolesOnLogin(ctx context.Context, db RowQuerier) (bool, error) {
 	var value string
 	if err := db.QueryRowContext(ctx, "SELECT @@global.activate_all_roles_on_login").Scan(&value); err != nil {
 		return false, fmt.Errorf("could not read activate_all_roles_on_login: %w", err)
@@ -33,7 +38,7 @@ func ActivateAllRolesOnLogin(ctx context.Context, db *sql.DB) (bool, error) {
 // error: guessing either value could accept a grant that does not cover the
 // schema, or refuse one that does. The one exception is a server without the
 // variable (see partialRevokesFromRead).
-func PartialRevokesEnabled(ctx context.Context, db *sql.DB) (bool, error) {
+func PartialRevokesEnabled(ctx context.Context, db RowQuerier) (bool, error) {
 	var value string
 	err := db.QueryRowContext(ctx, "SELECT @@global.partial_revokes").Scan(&value)
 	return partialRevokesFromRead(value, err)
