@@ -126,7 +126,8 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 	if err := m.Cutover.Validate(); err != nil {
 		return nil, err
 	}
-	m.Normalize(slog.Default())
+	m.WarnZeroWriteThreads(slog.Default())
+	m.Normalize()
 	if m.ReplicaMaxLag == 0 {
 		m.ReplicaMaxLag = 120 * time.Second
 	}

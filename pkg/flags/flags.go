@@ -127,24 +127,11 @@ func (c *Common) ValidationThreads() int {
 
 // Normalize fills in the defaults for zero counts, so a programmatic caller
 // that leaves a field unset gets what the CLI does.
-//
-// A zero WriteThreads is warned about: it used to mean "auto-size from the
-// instance", so anyone who adopted that opt-in would otherwise see their apply
-// pool quietly drop from the instance vCPU count to the default. (Kong's
-// default is non-zero, so a literal 0 was either passed explicitly or left
-// unset by a programmatic caller.)
-func (c *Common) Normalize(logger *slog.Logger) {
-	if logger == nil {
-		logger = slog.Default()
-	}
+func (c *Common) Normalize() {
 	if c.Threads <= 0 {
 		c.Threads = DefaultThreads
 	}
 	if c.WriteThreads <= 0 {
-		if c.WriteThreads == 0 {
-			logger.Warn("--write-threads 0 no longer means auto-size; using the default. Pass --enable-experimental-autoscaling for instance-derived thread counts",
-				"write_threads", DefaultWriteThreads)
-		}
 		c.WriteThreads = DefaultWriteThreads
 	}
 	if c.MaxConnections == 0 {
@@ -156,6 +143,24 @@ func (c *Common) Normalize(logger *slog.Logger) {
 	if c.CheckpointMaxAge == 0 {
 		c.CheckpointMaxAge = DefaultCheckpointMaxAge
 	}
+}
+
+// WarnZeroWriteThreads warns when WriteThreads is zero, before Normalize
+// replaces it with the default. In migrate and move a zero used to mean
+// "auto-size from the instance", so anyone who adopted that opt-in would
+// otherwise see their apply pool quietly drop from the instance vCPU count to
+// the default. Sync always treated zero as the default, so it does not call
+// this. (Kong's default is non-zero, so a literal 0 was either passed
+// explicitly or left unset by a programmatic caller.)
+func (c *Common) WarnZeroWriteThreads(logger *slog.Logger) {
+	if c.WriteThreads != 0 {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("--write-threads 0 no longer means auto-size; using the default. Pass --enable-experimental-autoscaling for instance-derived thread counts",
+		"write_threads", DefaultWriteThreads)
 }
 
 // ApplyTo copies the connection-level flags onto a connection config: the pool

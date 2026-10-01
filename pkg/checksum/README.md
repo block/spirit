@@ -1155,7 +1155,7 @@ The reason repair exists at all is the [copy-phase exposure](#not-only-bugs-two-
   The one part of a checksum that replicates is a chunk repair, and it is deliberately left unpaced — repairs are rare and small, and blocking one incurs exactly the snapshot-hold cost the narrowing exists to avoid.
 - **Scaling** is opt-in via `AutoscaleConfig`, and adjusts the live worker count during a pass. Two signals drive it:
   - The throttler's continuous **utilization** signal, applying the same zone law as the copier (see `pkg/autoscale`). Only the Aurora throttlers provide this signal, so this is where growth comes from and it is Aurora-only.
-  - The **change-feed backlog**, whose signal is available everywhere — unlike utilization, it needs nothing from the throttler. The feed flushes concurrently with the checksum, and its backlog gates cut-over — if it grows unboundedly the binlogs may be purged before a resume can replay them. If the feed is losing ground, the checksum's reads are winning a race against writes that have to finish, so a worker is shed. On stock MySQL this is the only shedding lever, and recovery is capped at the configured concurrency.
+  - The **change-feed backlog**, whose signal is available everywhere — unlike utilization, it needs nothing from the throttler. The feed flushes concurrently with the checksum, and its backlog gates cut-over — if it grows unboundedly the binlogs may be purged before a resume can replay them. If the feed is losing ground, the checksum's reads are winning a race against writes that have to finish, so a worker is shed. It is the one lever that needs nothing from the utilization signal, but it lives in the scaler, which exists only when autoscaling engages (an Aurora target), so it always acts alongside utilization.
 
     Available everywhere does not mean active everywhere: shedding lives in the scaler, and the scaler is only constructed when scaling is enabled. Without the opt-in a checksum has the hard stop and nothing else — it never moves its own worker count in either direction.
 
@@ -1171,11 +1171,10 @@ The opt-in is the axis that matters most, so the capability table is keyed on it
 
 | | hard stop | shed on backlog | grow |
 | --- | --- | --- | --- |
-| scaling disabled (the default), any server | on load only | no | no |
-| scaling enabled, stock MySQL | on load only | yes | no (recovers to the configured count only) |
-| scaling enabled, Aurora | on load only | yes | yes (utilization law) |
+| scaling disabled (the default, or the flag set on a server it cannot engage on) | on load only | no | no |
+| scaling engaged (Aurora, at least `autoscale.MinVCPUs`) | on load only | yes | yes (utilization law) |
 
-The hard stop is the one behavior that needs no opt-in — but "on load only" carries weight in every row: the load signal comes from the Aurora throttlers, so on stock MySQL there is nothing for the hard stop to react to and a checksum there is unpaced apart from the backlog lever. `AutoscaleConfig.Enabled` — `--enable-experimental-autoscaling` for `migrate` — is what builds the scaler, and the scaler is where both shedding and growth live.
+The hard stop is the one behavior that needs no opt-in — but "on load only" carries weight in every row: the load signal comes from the Aurora throttlers, so on stock MySQL there is nothing for the hard stop to react to and a checksum there is unpaced. `AutoscaleConfig.Enabled` is what builds the scaler, and the scaler is where both shedding and growth live. It is set only when `--enable-experimental-autoscaling` *engages* (`concurrency.Engage`): every target must provide an Aurora load signal and have at least `autoscale.MinVCPUs`. On stock MySQL the flag does not engage, so there is no scaler and no shedding.
 
 Concurrency is gated by a resizable `autoscale.Limiter` rather than `errgroup.SetLimit`, which may not be resized while goroutines are active.
 

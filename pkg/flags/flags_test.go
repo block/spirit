@@ -1,6 +1,8 @@
 package flags
 
 import (
+	"bytes"
+	"log/slog"
 	"reflect"
 	"strconv"
 	"testing"
@@ -63,7 +65,7 @@ func TestWaitsOnSentinel(t *testing.T) {
 
 func TestNormalize(t *testing.T) {
 	c := &Common{}
-	c.Normalize(nil)
+	c.Normalize()
 	require.Equal(t, DefaultThreads, c.Threads)
 	require.Equal(t, DefaultWriteThreads, c.WriteThreads)
 	require.Equal(t, DefaultMaxConnections, c.MaxConnections)
@@ -72,7 +74,7 @@ func TestNormalize(t *testing.T) {
 	require.Zero(t, c.MaxCommitLatency, "zero disables the commit-latency throttler and must survive")
 
 	c = &Common{Threads: 3, WriteThreads: 5, MaxConnections: 37, TargetChunkSize: 8192, CheckpointMaxAge: time.Hour}
-	c.Normalize(nil)
+	c.Normalize()
 	require.Equal(t, Common{Threads: 3, WriteThreads: 5, MaxConnections: 37, TargetChunkSize: 8192, CheckpointMaxAge: time.Hour}, *c)
 }
 
@@ -99,4 +101,13 @@ func TestApplyTo(t *testing.T) {
 	require.Equal(t, 5*time.Second, config.ForceKillAfter)
 	require.Equal(t, "REQUIRED", config.TLSMode)
 	require.Equal(t, "/ca.pem", config.TLSCertificatePath)
+}
+
+func TestWarnZeroWriteThreads(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	(&Common{WriteThreads: 3}).WarnZeroWriteThreads(logger)
+	require.Empty(t, buf.String())
+	(&Common{}).WarnZeroWriteThreads(logger)
+	require.Contains(t, buf.String(), "--write-threads 0 no longer means auto-size")
 }

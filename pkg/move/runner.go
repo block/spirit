@@ -238,7 +238,8 @@ func NewRunner(m *Move) (*Runner, error) {
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
-	m.Normalize(slog.Default())
+	m.WarnZeroWriteThreads(slog.Default())
+	m.Normalize()
 	r := &Runner{
 		move:                m,
 		reverseWriteThreads: m.WriteThreads,

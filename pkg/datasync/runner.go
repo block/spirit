@@ -175,7 +175,7 @@ func NewRunner(s *Sync) (*Runner, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
-	s.Normalize(slog.Default())
+	s.Normalize()
 	if s.Source != nil && s.Applier == nil {
 		return nil, errors.New("Sync.Source requires Sync.Applier to also be set; the injected change.Source needs the same applier the copier uses")
 	}

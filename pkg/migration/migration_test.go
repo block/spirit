@@ -1,6 +1,8 @@
 package migration
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
@@ -8,13 +10,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/concurrency"
+	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/mysql"
 	"github.com/stretchr/testify/require"
@@ -140,6 +147,61 @@ func TestE2EAutoscalingEnabled(t *testing.T) {
 
 	var count int
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1autoscale").Scan(&count))
+	require.Equal(t, 5, count)
+}
+
+// TestE2EAutoscalingEngaged runs a migration with autoscaling engaged, which
+// CI cannot reach for real (it needs an Aurora target): the Aurora probes are
+// faked to report a redo-aware 16-vCPU target. It pins that the probe runs
+// once, before setup chooses resume or fresh, and that the runner provisions
+// the plan concurrency.Derive produces for that target — the starting counts
+// replace --threads/--write-threads, and the read and write ceilings and the
+// flush pair are the plan's, not swapped or left at their defaults.
+// setupCopierCheckerAndReplClient builds the copier and the checksum from
+// autoscaleConfigs, so the configs are asserted there.
+func TestE2EAutoscalingEngaged(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "t1autoscaleon", `CREATE TABLE t1autoscaleon (
+		id int(11) NOT NULL AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	testutils.RunSQL(t, `INSERT INTO t1autoscaleon (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')`)
+	r := NewTestRunner(t, "t1autoscaleon", "ENGINE=InnoDB", WithThreads(1), WithWriteThreads(1), WithAutoscaling())
+	var builds int
+	r.buildAurora = func(context.Context, throttler.AuroraSetup) (throttler.AuroraResult, error) {
+		builds++
+		return throttler.AuroraResult{Throttlers: []throttler.Throttler{&throttler.Noop{}}, RedoAware: true}, nil
+	}
+	r.auroraVCPUs = func(context.Context, *sql.DB) (int, error) { return 16, nil }
+	require.NoError(t, r.Run(t.Context()))
+	defer utils.CloseAndLog(r)
+
+	// A programmatic Migration leaves MaxCommitLatency at zero, which disables
+	// the commit-latency backstop, so the write ceiling stays at its start.
+	require.Zero(t, r.migration.MaxCommitLatency)
+	want, ok := concurrency.Derive(concurrency.Topology{VCPUs: []int{16}}, autoscale.ClientCeiling(), true, false)
+	require.True(t, ok)
+	require.Equal(t, 1, builds, "the Aurora probe must run once per migration")
+	require.Equal(t, want, r.autoscale)
+	require.NotEqual(t, want.MaxReadThreads, want.MaxWriteThreads, "distinct ceilings, so a read/write swap would fail this test")
+	require.Equal(t, want.ReadStart, r.migration.Threads, "--threads is replaced by the derived start")
+	require.Equal(t, want.WriteStart, r.migration.WriteThreads, "--write-threads is replaced by the derived start")
+	// The configs the copier and the checksum were built from.
+	copierAutoscale, checksumAutoscale := r.autoscaleConfigs()
+	require.Equal(t, copier.AutoscaleConfig{
+		Enabled:        true,
+		StartThreads:   want.WriteStart,
+		MaxThreads:     want.MaxWriteThreads,
+		MaxReadThreads: want.MaxReadThreads,
+	}, copierAutoscale)
+	require.Equal(t, checksum.AutoscaleConfig{Enabled: true, MaxThreads: want.MaxReadThreads}, checksumAutoscale)
+	feed := r.replClientConfig(r.autoscale.FlushConcurrency, r.autoscale.FlushBatchSize)
+	require.Equal(t, want.FlushConcurrency, feed.FlushConcurrency)
+	require.Equal(t, want.FlushBatchSize, feed.BatchSize)
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1autoscaleon").Scan(&count))
 	require.Equal(t, 5, count)
 }
 
