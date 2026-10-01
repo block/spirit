@@ -112,7 +112,6 @@ func testMoveWithConcurrentWrites(t *testing.T, deferSecondaryIndexes bool) {
 		SourceDSN:             sourceDSN,
 		TargetDSN:             targetDSN,
 		Common:                flags.Common{Threads: 2, WriteThreads: 2},
-		DeferCutOver:          false,
 		DeferSecondaryIndexes: deferSecondaryIndexes,
 	}
 
@@ -287,10 +286,10 @@ func TestMoveWithNewTableCreation(t *testing.T) {
 	// it has a sentinel so it will never complete accidentally
 	time.Sleep(100 * time.Millisecond)
 	move := Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 2, WriteThreads: 2},
-		DeferCutOver: true,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	}
 	wg.Go(func() {
 		err = move.Run()
@@ -369,10 +368,10 @@ func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
 	require.Equal(t, "MINIMAL", rowImage)
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 2, WriteThreads: 2},
-		DeferCutOver: true,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)
@@ -830,10 +829,10 @@ func TestMoveWithVarcharPK(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	runner, err := NewRunner(&Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 2, WriteThreads: 2},
-		DeferCutOver: true,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	})
 	require.NoError(t, err)
 	done := make(chan struct{})

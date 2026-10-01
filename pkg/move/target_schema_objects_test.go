@@ -204,10 +204,10 @@ func TestMoveCutoverRefusesTargetTriggerUnderLock(t *testing.T) {
 	testutils.RunSQLInDatabase(t, srcName, "INSERT INTO t1 VALUES (1, 'one'), (2, 'two')")
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Common:       flags.Common{Threads: 1, WriteThreads: 1},
-		DeferCutOver: true,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(dstName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)

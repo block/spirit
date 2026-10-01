@@ -49,24 +49,16 @@ type Migration struct {
 	// `Error 1040: Too many connections`. Validate rejects a value too small
 	// for the migration to finish on; see minPoolSize.
 	flags.Common
+	flags.Cutover
 
 	EnableExperimentalLocklessChecksum bool `name:"enable-experimental-lockless-checksum" help:"EXPERIMENTAL: verify with optimistic reads and retries instead of checksum locks and long-lived snapshots. Cutover locking is unchanged." default:"false"`
 
 	ReplicaDSN           string        `name:"replica-dsn" help:"DSN(s) for replica(s) used for lag checking. Multiple replicas can be comma-separated; Spirit throttles on the slowest." optional:""`
 	ReplicaMaxLag        time.Duration `name:"replica-max-lag" help:"The maximum lag allowed on the replica before the migration throttles. If lag becomes unobservable (lag polling keeps failing) the migration pauses (fails closed) until polling recovers; remove --replica-dsn to proceed without lag protection." optional:"" default:"120s"`
 	SkipDropAfterCutover bool          `name:"skip-drop-after-cutover" help:"Keep old table after completing cutover" optional:"" default:"false"`
-	DeferCutOver         bool          `name:"defer-cutover" help:"Defer cutover (and checksum) until sentinel table is dropped" optional:"" default:"false"`
 	Statement            string        `name:"statement" help:"The SQL statement to run" required:""`
 
-	CheckpointMaxAge     time.Duration `name:"checkpoint-max-age" help:"Maximum age of a checkpoint before refusing to resume from it" optional:"" default:"168h"`
 	ChecksumYieldTimeout time.Duration `name:"checksum-yield-timeout" help:"Maximum duration for a single checksum pass before yielding to release long-running REPEATABLE READ transactions (reduces InnoDB HLL growth)" optional:"" default:"24h"`
-
-	// Hidden options for now (supports more obscure cash/sq usecases)
-	InterpolateParams bool `name:"interpolate-params" help:"Enable interpolate params for DSN" optional:"" default:"false" hidden:""`
-	// Used for tests so we can concurrently execute without issues even though
-	// the sentinel name is shared. Basically it will be true here, but false
-	// in the tests unless we set it explicitly true.
-	RespectSentinel bool `name:"respect-sentinel" help:"Look for sentinel table to exist and block if it does" optional:"" default:"true" hidden:""`
 
 	// useTestCutover is a test-only cutover
 	useTestCutover bool
@@ -100,11 +92,11 @@ func (m *Migration) Validate() error {
 	if err := m.Common.Validate(); err != nil {
 		return err
 	}
+	if err := m.Cutover.Validate(); err != nil {
+		return err
+	}
 	if m.ReplicaMaxLag < 0 {
 		return fmt.Errorf("--replica-max-lag must be non-negative, got %s", m.ReplicaMaxLag)
-	}
-	if m.CheckpointMaxAge < 0 {
-		return fmt.Errorf("--checkpoint-max-age must be non-negative, got %s", m.CheckpointMaxAge)
 	}
 	return dbconn.ValidateMaxConnections(m.MaxConnections, m.ValidationThreads(), minChecksumPhaseReserve)
 }
@@ -131,12 +123,12 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 	if err := m.Common.Validate(); err != nil {
 		return nil, err
 	}
+	if err := m.Cutover.Validate(); err != nil {
+		return nil, err
+	}
 	m.Normalize(slog.Default())
 	if m.ReplicaMaxLag == 0 {
 		m.ReplicaMaxLag = 120 * time.Second
-	}
-	if m.CheckpointMaxAge == 0 {
-		m.CheckpointMaxAge = 7 * 24 * time.Hour // 7 days
 	}
 	if m.ChecksumYieldTimeout == 0 {
 		m.ChecksumYieldTimeout = checksum.DefaultYieldTimeout

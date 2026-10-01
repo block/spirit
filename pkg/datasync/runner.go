@@ -1302,6 +1302,10 @@ func (r *Runner) hasResumableCheckpoint(ctx context.Context) (bool, error) {
 	if rec.CopierWatermark == "" {
 		return false, nil
 	}
+	if aerr := r.checkCheckpointAge(rec); aerr != nil {
+		r.logger.Warn("force: checkpoint is too old to resume; treating as non-resumable", "reason", aerr)
+		return false, nil
+	}
 	// A checkpoint whose position resume would refuse — recorded on a
 	// different source server, or lacking the identity needed to verify it —
 	// is not resumable either: --force should wipe and start fresh rather
@@ -1857,7 +1861,29 @@ func (r *Runner) readCheckpoint(ctx context.Context) (watermark, pos string, ok 
 	if e != nil {
 		return "", "", false, fmt.Errorf("failed to read checkpoint: %w", e)
 	}
+	if err := r.checkCheckpointAge(rec); err != nil {
+		return "", "", false, err
+	}
 	return rec.CopierWatermark, rec.Position, true, nil
+}
+
+// checkCheckpointAge refuses to resume from a checkpoint last written more
+// than --checkpoint-max-age ago: the previous run has been stopped that long,
+// and catching up that much change stream can be slower than a fresh copy (or
+// impossible, once the source has purged it). Like move, and unlike migrate,
+// sync cannot fall back to a fresh copy on its own because the target is not
+// empty, so it fails and leaves the choice to the operator; --force treats
+// such a checkpoint as unresumable (see hasResumableCheckpoint).
+func (r *Runner) checkCheckpointAge(rec checkpoint.Record) error {
+	if age := rec.Age(); age >= r.sync.CheckpointMaxAge {
+		return fmt.Errorf("%w: checkpoint is %s old (max allowed: %s). To proceed, either re-run with a larger --checkpoint-max-age, or re-run with --force to wipe the target tables (including '%s') and restart the sync from scratch",
+			status.ErrCheckpointTooOld,
+			age.Round(time.Second),
+			r.sync.CheckpointMaxAge,
+			syncCheckpointTableName,
+		)
+	}
+	return nil
 }
 
 // startBackgroundRoutines starts the periodic flush (which advances the

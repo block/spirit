@@ -3,9 +3,10 @@
 //
 // The three commands used to declare these separately, with defaults, help
 // text and validation that drifted apart (move's --threads defaulted to 2, the
-// others to 4; only migrate had --lock-wait-timeout, --force-kill-after and the
-// TLS flags). Common is embedded in each command's Kong struct, so each flag,
-// its default and its validation are declared once.
+// others to 4; only migrate had the TLS flags). Common is embedded in each
+// command's Kong struct, so each flag, its default and its validation are
+// declared once. Cutover holds the flags of the two commands that end in a
+// cutover (migrate and move); sync runs continuously and has none.
 //
 // The autoscaling setup that turns these flags into thread counts is
 // concurrency.Engage.
@@ -27,6 +28,8 @@ const (
 	DefaultThreads        = 4
 	DefaultWriteThreads   = 4
 	DefaultMaxConnections = dbconn.DefaultMaxConnections
+
+	DefaultCheckpointMaxAge = 7 * 24 * time.Hour
 )
 
 // Common is the configuration shared by migrate, move and sync. It is embedded
@@ -70,12 +73,18 @@ type Common struct {
 	// derived from the instance. See issue #831.
 	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: size the copy, apply and checksum thread pools from the instance and scale them on throttler feedback. Overrides --threads and --write-threads. Requires an Aurora target" optional:"" default:"false"`
 
-	// ForceKillAfter and LockWaitTimeout bound how long spirit's DDL and table
-	// locks wait on the workload, and when spirit kills the transactions
-	// blocking them. A zero ForceKillAfter means 90% of LockWaitTimeout; a zero
-	// LockWaitTimeout keeps dbconn's default.
-	ForceKillAfter  time.Duration `name:"force-kill-after" help:"Delay before killing transactions blocking DDL or table locks; 0 uses 90% of lock-wait-timeout" optional:"" default:"0s"`
-	LockWaitTimeout time.Duration `name:"lock-wait-timeout" help:"The DDL lock_wait_timeout required for checksum and cutover" optional:"" default:"30s"`
+	// CheckpointMaxAge is the oldest checkpoint a run will resume from. Its
+	// age is the time since the checkpoint row was last written, i.e. how long
+	// the previous run has been stopped. What happens to a checkpoint that is
+	// too old is per-command: migrate starts fresh, move and sync fail (their
+	// targets are not empty) and point at --force or a larger value. Zero
+	// means the default (Normalize fills it in).
+	CheckpointMaxAge time.Duration `name:"checkpoint-max-age" help:"Maximum age of a checkpoint before refusing to resume from it" optional:"" default:"168h"`
+
+	// InterpolateParams sets the driver's interpolateParams on every
+	// connection: client-side placeholder interpolation instead of
+	// server-side prepared statements.
+	InterpolateParams bool `name:"interpolate-params" help:"Enable interpolate params for DSN" optional:"" default:"false" hidden:""`
 
 	// TLS Configuration. Empty keeps the connection config's own value
 	// (dbconn's PREFERRED default, or what a conf file supplied), and a DSN's
@@ -84,9 +93,8 @@ type Common struct {
 	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
 }
 
-// Validate rejects explicitly negative thread counts and durations, and a
-// ForceKillAfter that leaves no time to acquire a lock. Zero counts are
-// accepted and mean "use the default". Each command validates MaxConnections itself, because the smallest
+// Validate rejects explicitly negative thread counts and durations. Zero
+// values are accepted and mean "use the default". Each command validates MaxConnections itself, because the smallest
 // usable pool depends on what the command runs on it
 // (dbconn.ValidateMaxConnections vs dbconn.ValidateConnectionLimit).
 func (c *Common) Validate() error {
@@ -96,18 +104,16 @@ func (c *Common) Validate() error {
 	if c.WriteThreads < 0 {
 		return fmt.Errorf("--write-threads must be non-negative, got %d", c.WriteThreads)
 	}
-	// ApplyTo and the throttler treat a non-positive duration as "use the
-	// default" and "disabled" respectively, so a negative one would silently
-	// become a different setting.
-	if c.LockWaitTimeout < 0 {
-		return fmt.Errorf("--lock-wait-timeout must be non-negative, got %s", c.LockWaitTimeout)
-	}
+	// The throttler treats a non-positive latency as "disabled" and Normalize
+	// a zero age as "use the default", so a negative one would silently become
+	// a different setting.
 	if c.MaxCommitLatency < 0 {
 		return fmt.Errorf("--max-commit-latency must be non-negative (0 disables it), got %s", c.MaxCommitLatency)
 	}
-	config := dbconn.NewDBConfig()
-	c.ApplyTo(config)
-	return config.ValidateForceKillAfter()
+	if c.CheckpointMaxAge < 0 {
+		return fmt.Errorf("--checkpoint-max-age must be non-negative, got %s", c.CheckpointMaxAge)
+	}
+	return nil
 }
 
 // ValidationThreads is the read-thread count a run will start with, for
@@ -147,10 +153,13 @@ func (c *Common) Normalize(logger *slog.Logger) {
 	if c.TargetChunkSize == 0 {
 		c.TargetChunkSize = table.DefaultTargetChunkBytes
 	}
+	if c.CheckpointMaxAge == 0 {
+		c.CheckpointMaxAge = DefaultCheckpointMaxAge
+	}
 }
 
 // ApplyTo copies the connection-level flags onto a connection config: the pool
-// size, the lock timeouts and TLS. Zero or empty values leave the config's own
+// size, TLS and parameter interpolation. Zero or empty values leave the config's own
 // value alone, so a programmatic caller that never set one keeps dbconn's
 // default. Callers that want a different pool size for a dedicated pool (a
 // monitor, a replica) override MaxOpenConnections afterwards.
@@ -158,10 +167,9 @@ func (c *Common) ApplyTo(config *dbconn.DBConfig) {
 	if c.MaxConnections > 0 {
 		config.MaxOpenConnections = c.MaxConnections
 	}
-	if c.LockWaitTimeout > 0 {
-		config.LockWaitTimeout = int(c.LockWaitTimeout.Seconds())
+	if c.InterpolateParams {
+		config.InterpolateParams = true
 	}
-	config.ForceKillAfter = c.ForceKillAfter
 	if c.TLSMode != "" {
 		config.TLSMode = c.TLSMode
 	}

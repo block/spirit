@@ -117,10 +117,9 @@ func TestMoveProgressPolledConcurrently(t *testing.T) {
 
 	// test
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 2, WriteThreads: 2},
-		DeferCutOver: false,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 	}
 	runner, err := NewRunner(move)
 	require.NoError(t, err)

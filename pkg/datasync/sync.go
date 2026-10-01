@@ -45,7 +45,8 @@ import (
 type Sync struct {
 	// Common holds the flags shared with migrate and move: thread counts,
 	// --max-connections (each source and target pool), --max-commit-latency,
-	// autoscaling, lock timeouts and TLS.
+	// autoscaling, TLS and --checkpoint-max-age. Sync does not embed
+	// flags.Cutover: it performs no cutover and takes no table locks.
 	flags.Common
 
 	SourceDSN string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`

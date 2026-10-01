@@ -822,6 +822,71 @@ func TestSyncResumeIncompatibleCheckpoint(t *testing.T) {
 	require.Equal(t, 1, n2, "force must recreate the checkpoint table with the current schema")
 }
 
+// TestSyncResumeCheckpointTooOld verifies --checkpoint-max-age on sync: a
+// checkpoint last written longer ago than the limit is refused with
+// status.ErrCheckpointTooOld (the target is not empty, so like move there is
+// no silent fresh copy), a larger limit resumes from it, and --force treats it
+// as unresumable and re-copies.
+func TestSyncResumeCheckpointTooOld(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sync_chkpt_age_src"
+	dest := cfg.Clone()
+	dest.DBName = "sync_chkpt_age_dest"
+	sourceDSN := src.FormatDSN()
+	targetDSN := dest.FormatDSN()
+
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_chkpt_age_src`)
+	testutils.RunSQL(t, `CREATE DATABASE sync_chkpt_age_src`)
+	testutils.RunSQL(t, `CREATE TABLE sync_chkpt_age_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_chkpt_age_src.t1 VALUES (1,'one'),(2,'two'),(3,'three')`)
+	testutils.RunSQL(t, `CREATE TABLE sync_chkpt_age_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))`)
+	testutils.RunSQL(t, `INSERT INTO sync_chkpt_age_src.t2 VALUES (10,'ten'),(20,'twenty')`)
+	testutils.RunSQL(t, `DROP DATABASE IF EXISTS sync_chkpt_age_dest`)
+
+	run := func(force bool, maxAge time.Duration) error {
+		r, nerr := NewRunner(&Sync{
+			SourceDSN: sourceDSN,
+			TargetDSN: targetDSN,
+			Common:    flags.Common{Threads: 2, WriteThreads: 2, CheckpointMaxAge: maxAge},
+			Force:     force,
+		})
+		require.NoError(t, nerr)
+		rerr := runUntilCopied(t, r)
+		require.NoError(t, r.Close())
+		return rerr
+	}
+	tgt, err := sql.Open("block-mysql", targetDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(tgt)
+	// Simulate a sync that has been stopped for 8 days (the default limit is
+	// 7). The row must carry a watermark, or there is nothing to resume from.
+	backdate := func() {
+		var wm string
+		require.NoError(t, tgt.QueryRowContext(t.Context(),
+			"SELECT IFNULL(copier_watermark, '') FROM _spirit_sync_checkpoint").Scan(&wm))
+		require.NotEmpty(t, wm, "the previous run must have recorded a copier watermark")
+		_, err := tgt.ExecContext(t.Context(), "UPDATE _spirit_sync_checkpoint SET created_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 8 DAY)")
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, run(false, 0))
+	backdate()
+
+	err = run(false, 0)
+	require.ErrorIs(t, err, status.ErrCheckpointTooOld)
+	require.ErrorContains(t, err, "re-run with a larger --checkpoint-max-age")
+
+	require.NoError(t, run(false, 9*24*time.Hour), "a checkpoint within a larger limit must resume")
+
+	backdate()
+	require.NoError(t, run(true, 0), "--force must treat a too-old checkpoint as unresumable and re-copy")
+	var n int
+	require.NoError(t, tgt.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1").Scan(&n))
+	require.Equal(t, 3, n)
+}
+
 // TestSyncPositionEncodeDecode covers the checkpoint-position payload codec:
 // round-tripping preserves position + identity, and anything that is not our
 // structured payload (legacy bare positions, empty strings, foreign JSON,

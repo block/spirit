@@ -17,14 +17,16 @@ type Move struct {
 	// (--write-threads is per target), --max-connections (each source and
 	// target pool; dedicated monitor/advisory pools are separate),
 	// --max-commit-latency (any target), autoscaling (the busiest target host
-	// scales every shard together), lock timeouts and TLS.
+	// scales every shard together), TLS and --checkpoint-max-age.
 	flags.Common
+	// Cutover holds the flags shared with migrate: lock timeouts,
+	// --defer-cutover (the sentinel lives on the first target) and
+	// --respect-sentinel.
+	flags.Cutover
 
-	SourceDSN             string        `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
-	TargetDSN             string        `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
-	DeferCutOver          bool          `name:"defer-cutover" help:"Defer cutover (and continuous checksum) until the sentinel table on the first target database is dropped" default:"false"`
-	DeferSecondaryIndexes bool          `name:"defer-secondary-indexes" help:"Defer regular indexes until before cutover, preserving required AUTO_INCREMENT support" default:"false"`
-	CheckpointMaxAge      time.Duration `name:"checkpoint-max-age" help:"Maximum age of a checkpoint before refusing to resume from it" optional:"" default:"168h"`
+	SourceDSN             string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
+	TargetDSN             string `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
+	DeferSecondaryIndexes bool   `name:"defer-secondary-indexes" help:"Defer regular indexes until before cutover, preserving required AUTO_INCREMENT support" default:"false"`
 	// Force makes the runner wipe the target tables and start the copy fresh when
 	// it cannot resume from a checkpoint (e.g. the checkpoint is from an
 	// incompatible spirit version, or the target is in a state resume can't
@@ -86,6 +88,9 @@ type Move struct {
 // caught. Mirrors migration.Migration.Validate.
 func (m *Move) Validate() error {
 	if err := m.Common.Validate(); err != nil {
+		return err
+	}
+	if err := m.Cutover.Validate(); err != nil {
 		return err
 	}
 	if m.ReverseWindow < 0 {

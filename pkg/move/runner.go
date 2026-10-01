@@ -239,17 +239,6 @@ func NewRunner(m *Move) (*Runner, error) {
 		return nil, err
 	}
 	m.Normalize(slog.Default())
-
-	// Normalize CheckpointMaxAge here rather than in a Validate hook:
-	// orchestration callers construct Move programmatically (bypassing the
-	// Kong default of 168h), so a zero value means "use the default". This
-	// mirrors Migration.normalizeOptions in pkg/migration.
-	if m.CheckpointMaxAge < 0 {
-		return nil, fmt.Errorf("checkpoint-max-age must be non-negative, got %s", m.CheckpointMaxAge)
-	}
-	if m.CheckpointMaxAge == 0 {
-		m.CheckpointMaxAge = 7 * 24 * time.Hour // 7 days, same as migrate
-	}
 	r := &Runner{
 		move:                m,
 		reverseWriteThreads: m.WriteThreads,
@@ -1332,7 +1321,8 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	r.dbConfig = dbconn.NewDBConfig()
 	// ForceKill is now true by default in NewDBConfig(), no need to set explicitly.
 	// Worker counts do not grow the configured connection pools.
-	r.move.ApplyTo(r.dbConfig)
+	r.move.Common.ApplyTo(r.dbConfig)
+	r.move.Cutover.ApplyTo(r.dbConfig)
 
 	// Build the list of source DSNs. If SourceDSNs is set (N:M), use it.
 	// Otherwise, use SourceDSN as the single source (backward compat).
@@ -1549,16 +1539,19 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// lives in the sentinel package). The continuous-checksum lifecycle and
 	// watermark invalidation are move-specific (multi-source feeds;
 	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
-	// so they are injected as callbacks. See pkg/sentinel.
-	if err := r.status.DoContext(ctx, status.WaitingOnSentinelTable, func() error {
-		return sentinel.Wait(ctx, sentinel.WaitConfig{
-			Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
-			RunChecksum:         r.runContinuousChecksum,
-			InvalidateWatermark: r.invalidateChecksumWatermark,
-			Logger:              r.logger,
-		})
-	}); err != nil {
-		return err
+	// so they are injected as callbacks. See pkg/sentinel. Whether to wait at
+	// all is shared with migrate (flags.Cutover.WaitsOnSentinel).
+	if r.move.WaitsOnSentinel() {
+		if err := r.status.DoContext(ctx, status.WaitingOnSentinelTable, func() error {
+			return sentinel.Wait(ctx, sentinel.WaitConfig{
+				Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
+				RunChecksum:         r.runContinuousChecksum,
+				InvalidateWatermark: r.invalidateChecksumWatermark,
+				Logger:              r.logger,
+			})
+		}); err != nil {
+			return err
+		}
 	}
 
 	if r.move.ReverseWindow > 0 {

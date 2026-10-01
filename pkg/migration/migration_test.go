@@ -878,9 +878,8 @@ func TestMigrationValidate(t *testing.T) {
 	}{
 		{name: "zero values are valid"},
 		{name: "typical values are valid", m: Migration{
-			Common:           flags.Common{Threads: 4, WriteThreads: 4},
-			ReplicaMaxLag:    120 * time.Second,
-			CheckpointMaxAge: 168 * time.Hour,
+			Common:        flags.Common{Threads: 4, WriteThreads: 4, CheckpointMaxAge: 168 * time.Hour},
+			ReplicaMaxLag: 120 * time.Second,
 		}},
 		{name: "negative threads", m: Migration{Common: flags.Common{Threads: -5}},
 			wantErr: "--threads must be non-negative, got -5"},
@@ -888,7 +887,7 @@ func TestMigrationValidate(t *testing.T) {
 			wantErr: "--write-threads must be non-negative, got -1"},
 		{name: "negative replica-max-lag", m: Migration{ReplicaMaxLag: -time.Minute},
 			wantErr: "--replica-max-lag must be non-negative, got -1m0s"},
-		{name: "negative checkpoint-max-age", m: Migration{CheckpointMaxAge: -time.Hour},
+		{name: "negative checkpoint-max-age", m: Migration{Common: flags.Common{CheckpointMaxAge: -time.Hour}},
 			wantErr: "--checkpoint-max-age must be non-negative, got -1h0m0s"},
 	}
 	for _, tt := range tests {

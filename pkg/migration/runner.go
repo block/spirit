@@ -401,9 +401,10 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// It will be closed in r.Close()
 	var err error
 	r.dbConfig = dbconn.NewDBConfig()
-	// Lock timeouts, TLS and the pool size come from the shared flags.
-	r.migration.ApplyTo(r.dbConfig)
-	r.dbConfig.InterpolateParams = r.migration.InterpolateParams
+	// The pool size, TLS, interpolation and lock timeouts come from the shared
+	// flags.
+	r.migration.Common.ApplyTo(r.dbConfig)
+	r.migration.Cutover.ApplyTo(r.dbConfig)
 	// ForceKill is always enabled for migrations (true by default in NewDBConfig).
 	// The pool is --max-connections, verbatim and once. Nothing recomputes it,
 	// no phase ratchets it, and no ceiling derived later raises it — an operator
@@ -582,7 +583,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 
 	// Reuse the configured checker while waiting for a sentinel, including one
 	// created manually. The completed initial checksum remains the cutover gate.
-	if r.migration.RespectSentinel {
+	if r.migration.WaitsOnSentinel() {
 		if err := r.status.DoContext(ctx, status.WaitingOnSentinelTable, func() error {
 			return sentinel.Wait(ctx, sentinel.WaitConfig{
 				Exists: func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },

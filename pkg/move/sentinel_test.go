@@ -55,10 +55,10 @@ func TestMoveSentinelDropReleasesCutover(t *testing.T) {
 	defer utils.CloseAndLog(ctl)
 
 	m := &Move{
-		SourceDSN:    src.FormatDSN(),
-		TargetDSN:    dst.FormatDSN(),
-		Common:       flags.Common{Threads: 1, WriteThreads: 1},
-		DeferCutOver: true,
+		SourceDSN: src.FormatDSN(),
+		TargetDSN: dst.FormatDSN(),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
@@ -120,10 +120,10 @@ func TestMoveContinuousChecksumAbortsThenResumeRepairs(t *testing.T) {
 	defer utils.CloseAndLog(ctl)
 
 	move := &Move{
-		SourceDSN:    testutils.DSNForDatabase(srcDB),
-		TargetDSN:    testutils.DSNForDatabase(dstDB),
-		Common:       flags.Common{Threads: 1, WriteThreads: 1},
-		DeferCutOver: true,
+		SourceDSN: testutils.DSNForDatabase(srcDB),
+		TargetDSN: testutils.DSNForDatabase(dstDB),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	}
 
 	// First run: corrupt the target once the move is waiting on the sentinel.

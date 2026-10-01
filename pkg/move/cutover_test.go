@@ -621,10 +621,10 @@ func TestMoveCarriesAutoIncrement(t *testing.T) {
 	testutils.RunSQLInDatabase(t, srcName, `INSERT INTO settings VALUES ('a', 1)`)
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Common:       flags.Common{Threads: 1, WriteThreads: 1},
-		DeferCutOver: true,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(dstName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)
@@ -667,7 +667,7 @@ func TestNtoMShardedMoveCarriesAutoIncrement(t *testing.T) {
 		Targets:      targets,
 		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		SourceTables: []string{"users"},
-		DeferCutOver: true,
+		Cutover:      flags.Cutover{DeferCutOver: true},
 		ShardingProvider: &testShardingProvider{
 			shardingColumn: "id",
 			hashFunc:       testutils.EvenOddHasher,
@@ -794,10 +794,10 @@ func TestMoveCutoverRefusesSourceSchemaObjectUnderLock(t *testing.T) {
 	testutils.RunSQLInDatabase(t, srcName, "INSERT INTO t1 VALUES (1, 'one'), (2, 'two')")
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Common:       flags.Common{Threads: 1, WriteThreads: 1},
-		DeferCutOver: true,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(dstName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+		Cutover:   flags.Cutover{DeferCutOver: true},
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)

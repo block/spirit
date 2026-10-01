@@ -75,10 +75,10 @@ func TestMoveFatalAbort(t *testing.T) {
 			dst.DBName = dstName
 
 			runner, err := NewRunner(&Move{
-				SourceDSN:    src.FormatDSN(),
-				TargetDSN:    dst.FormatDSN(),
-				Common:       flags.Common{Threads: 1, WriteThreads: 1},
-				DeferCutOver: true,
+				SourceDSN: src.FormatDSN(),
+				TargetDSN: dst.FormatDSN(),
+				Common:    flags.Common{Threads: 1, WriteThreads: 1},
+				Cutover:   flags.Cutover{DeferCutOver: true},
 			})
 			require.NoError(t, err)
 			sink := &outcomeSink{}

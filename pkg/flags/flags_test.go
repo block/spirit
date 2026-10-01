@@ -26,7 +26,12 @@ func TestDefaultsMatchKongTags(t *testing.T) {
 	}
 	f, _ := typ.FieldByName("TargetChunkSize")
 	require.Equal(t, strconv.FormatUint(table.DefaultTargetChunkBytes, 10), f.Tag.Get("default"))
-	f, _ = typ.FieldByName("LockWaitTimeout")
+	f, _ = typ.FieldByName("CheckpointMaxAge")
+	maxAge, err := time.ParseDuration(f.Tag.Get("default"))
+	require.NoError(t, err)
+	require.Equal(t, DefaultCheckpointMaxAge, maxAge)
+
+	f, _ = reflect.TypeFor[Cutover]().FieldByName("LockWaitTimeout")
 	lockWait, err := time.ParseDuration(f.Tag.Get("default"))
 	require.NoError(t, err)
 	require.Equal(t, dbconn.NewDBConfig().LockWaitTimeout, int(lockWait.Seconds()),
@@ -37,11 +42,23 @@ func TestValidate(t *testing.T) {
 	require.NoError(t, (&Common{}).Validate())
 	require.ErrorContains(t, (&Common{Threads: -1}).Validate(), "--threads must be non-negative")
 	require.ErrorContains(t, (&Common{WriteThreads: -1}).Validate(), "--write-threads must be non-negative")
-	require.Error(t, (&Common{ForceKillAfter: -time.Second}).Validate())
-	require.ErrorContains(t, (&Common{LockWaitTimeout: -time.Second}).Validate(), "--lock-wait-timeout must be non-negative")
 	require.ErrorContains(t, (&Common{MaxCommitLatency: -time.Millisecond}).Validate(), "--max-commit-latency must be non-negative")
-	require.Error(t, (&Common{LockWaitTimeout: 10 * time.Second, ForceKillAfter: 10 * time.Second}).Validate())
-	require.NoError(t, (&Common{LockWaitTimeout: 10 * time.Second, ForceKillAfter: 9 * time.Second}).Validate())
+	require.ErrorContains(t, (&Common{CheckpointMaxAge: -time.Hour}).Validate(), "--checkpoint-max-age must be non-negative")
+}
+
+func TestCutoverValidate(t *testing.T) {
+	require.NoError(t, (&Cutover{}).Validate())
+	require.Error(t, (&Cutover{ForceKillAfter: -time.Second}).Validate())
+	require.ErrorContains(t, (&Cutover{LockWaitTimeout: -time.Second}).Validate(), "--lock-wait-timeout must be non-negative")
+	require.Error(t, (&Cutover{LockWaitTimeout: 10 * time.Second, ForceKillAfter: 10 * time.Second}).Validate())
+	require.NoError(t, (&Cutover{LockWaitTimeout: 10 * time.Second, ForceKillAfter: 9 * time.Second}).Validate())
+}
+
+func TestWaitsOnSentinel(t *testing.T) {
+	require.False(t, (&Cutover{}).WaitsOnSentinel())
+	require.True(t, (&Cutover{RespectSentinel: true}).WaitsOnSentinel())
+	require.True(t, (&Cutover{DeferCutOver: true}).WaitsOnSentinel(),
+		"a run that created a sentinel must not cut over past it")
 }
 
 func TestNormalize(t *testing.T) {
@@ -51,11 +68,12 @@ func TestNormalize(t *testing.T) {
 	require.Equal(t, DefaultWriteThreads, c.WriteThreads)
 	require.Equal(t, DefaultMaxConnections, c.MaxConnections)
 	require.Equal(t, uint64(table.DefaultTargetChunkBytes), c.TargetChunkSize)
+	require.Equal(t, DefaultCheckpointMaxAge, c.CheckpointMaxAge)
 	require.Zero(t, c.MaxCommitLatency, "zero disables the commit-latency throttler and must survive")
 
-	c = &Common{Threads: 3, WriteThreads: 5, MaxConnections: 37, TargetChunkSize: 8192}
+	c = &Common{Threads: 3, WriteThreads: 5, MaxConnections: 37, TargetChunkSize: 8192, CheckpointMaxAge: time.Hour}
 	c.Normalize(nil)
-	require.Equal(t, Common{Threads: 3, WriteThreads: 5, MaxConnections: 37, TargetChunkSize: 8192}, *c)
+	require.Equal(t, Common{Threads: 3, WriteThreads: 5, MaxConnections: 37, TargetChunkSize: 8192, CheckpointMaxAge: time.Hour}, *c)
 }
 
 func TestApplyTo(t *testing.T) {
@@ -65,14 +83,18 @@ func TestApplyTo(t *testing.T) {
 	(&Common{}).ApplyTo(config)
 	require.Equal(t, want, *config)
 
+	(&Cutover{}).ApplyTo(config)
+	require.Equal(t, want, *config)
+
 	(&Common{
 		MaxConnections:     37,
-		LockWaitTimeout:    10 * time.Second,
-		ForceKillAfter:     5 * time.Second,
+		InterpolateParams:  true,
 		TLSMode:            "REQUIRED",
 		TLSCertificatePath: "/ca.pem",
 	}).ApplyTo(config)
+	(&Cutover{LockWaitTimeout: 10 * time.Second, ForceKillAfter: 5 * time.Second}).ApplyTo(config)
 	require.Equal(t, 37, config.MaxOpenConnections)
+	require.True(t, config.InterpolateParams)
 	require.Equal(t, 10, config.LockWaitTimeout)
 	require.Equal(t, 5*time.Second, config.ForceKillAfter)
 	require.Equal(t, "REQUIRED", config.TLSMode)

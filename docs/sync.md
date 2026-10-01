@@ -159,8 +159,7 @@ observe its load but do not share a single worker budget.
 - [max-connections](#max-connections)
 - [defer-secondary-indexes](#defer-secondary-indexes)
 - [force](#force)
-- [force-kill-after](#force-kill-after)
-- [lock-wait-timeout](#lock-wait-timeout)
+- [checkpoint-max-age](#checkpoint-max-age)
 - [tls-ca](#tls-ca)
 - [tls-mode](#tls-mode)
 
@@ -271,19 +270,14 @@ remove that stale target table. Remove such tables manually if they are no
 longer wanted. Intended for testing/iterating. `--force` does not bypass the
 refusal of target triggers and events (see [Schema objects](#schema-objects)).
 
-### force-kill-after
+### checkpoint-max-age
 
 - Type: Duration
-- Default value: `0s` (i.e. 90% of [lock-wait-timeout](#lock-wait-timeout))
+- Default value: `168h` (7 days)
 
-Shared with `migrate` and `move` (see [migrate's force-kill-after](migrate.md#force-kill-after)), but currently has no effect in `sync`: sync performs no cutover and takes no table locks, so it never force-kills. It is still validated against [lock-wait-timeout](#lock-wait-timeout).
+The maximum age of a checkpoint before Sync refuses to resume from it. A checkpoint's age is the time since it was last written, which for a stopped sync is how long it has been stopped. Catching up that much change stream can be slower than re-copying, and the source may have purged the binary logs in the meantime.
 
-### lock-wait-timeout
-
-- Type: Duration
-- Default value: `30s`
-
-The `lock_wait_timeout` Spirit sets on its connections, bounding how long its DDL and table locks wait. Shared with `migrate`; see [migrate's lock-wait-timeout](migrate.md#lock-wait-timeout) for the force-kill rules.
+Like [move](move.md#checkpoint-max-age), and unlike [migrate](migrate.md#checkpoint-max-age), Sync does **not** fall back to a fresh copy on its own: the target already holds data. The sync fails with a `checkpoint is too old to safely resume` error. To proceed, either re-run with a larger `--checkpoint-max-age`, or re-run with [`--force`](#force), which treats the checkpoint as unresumable and re-copies.
 
 ### tls-ca
 

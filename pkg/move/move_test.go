@@ -64,10 +64,9 @@ func TestBasicMove(t *testing.T) {
 
 	// test
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 2, WriteThreads: 16, MaxConnections: 8},
-		DeferCutOver: false,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 16, MaxConnections: 8},
 	}
 	runner, err := NewRunner(move)
 	require.NoError(t, err)
@@ -241,10 +240,9 @@ func TestEmptyDatabaseMove(t *testing.T) {
 
 	// Run move with empty source
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 4, WriteThreads: 4},
-		DeferCutOver: false,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 4, WriteThreads: 4},
 	}
 
 	runner, err := NewRunner(move)
@@ -354,10 +352,9 @@ func TestMoveReservedWordPK(t *testing.T) {
 		") ENGINE=InnoDB")
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 2, WriteThreads: 2},
-		DeferCutOver: false,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 	}
 	require.NoError(t, move.Run())
 }
@@ -397,10 +394,9 @@ func TestMoveReservedWordTableName(t *testing.T) {
 		") ENGINE=InnoDB")
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Common:       flags.Common{Threads: 2, WriteThreads: 2},
-		DeferCutOver: false,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 	}
 	require.NoError(t, move.Run())
 }

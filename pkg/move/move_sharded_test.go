@@ -386,7 +386,7 @@ func TestShardedMoveVindexUpdateFails(t *testing.T) {
 		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 		// The sentinel blocks the move before cutover, giving the test a
 		// deterministic window in which the repl client is streaming.
-		DeferCutOver: true,
+		Cutover: flags.Cutover{DeferCutOver: true},
 		ShardingProvider: &testShardingProvider{
 			shardingColumn: "user_id",
 			hashFunc:       testutils.EvenOddHasher,
