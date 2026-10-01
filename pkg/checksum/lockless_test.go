@@ -1425,6 +1425,30 @@ func (f *stallableFeed) Flush(ctx context.Context) error {
 	return f.MockSource.Flush(ctx)
 }
 
+// A drain request made while another drain is running is declined, so the
+// dispatcher knows to ask again: the running drain may have started before
+// the waiting retry was gated and cannot release it.
+func TestFeedFlusherDeclinesWhileDraining(t *testing.T) {
+	release := make(chan struct{})
+	feed := &change.MockSource{FlushFn: func(ctx context.Context) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	}}
+	c := newTestChecker(t, newTestChunker(1), fastConfig(), nil)
+	c.feeds = []change.Source{feed}
+	f := newFeedFlusher(t.Context(), c)
+	defer f.close()
+
+	require.True(t, f.request(), "an idle flusher starts a drain")
+	require.False(t, f.request(), "a second request while draining is declined")
+	close(release)
+	require.Eventually(t, f.request, 5*time.Second, time.Millisecond,
+		"a request after the drain finished starts a new one")
+}
+
 // The checker requests a flush once per gated retry, not on every poll: a
 // flush that returns without completing (a failing or stalled feed) must not
 // be re-requested four times a second until RetryFlushWait expires.

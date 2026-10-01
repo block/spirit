@@ -42,9 +42,10 @@ type retryEntry struct {
 	// passes. A zero flushDeadline means ungated. See LocklessChecker.retryDue.
 	flushes       []int
 	flushDeadline time.Time
-	// flushRequested records that the dispatcher has already requested a
-	// flush for this gate, so a flush that fails is not re-requested on
-	// every poll. gateOnFlush clears it when the entry is gated again.
+	// flushRequested records that the dispatcher has started a drain for
+	// this gate, so a drain that fails is not restarted on every poll. It is
+	// only set when a drain actually started (see feedFlusher.request).
+	// gateOnFlush clears it when the entry is gated again.
 	flushRequested bool
 
 	// consecutiveSrcChanged counts retries on which the source signature

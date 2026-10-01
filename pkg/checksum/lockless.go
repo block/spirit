@@ -462,6 +462,45 @@ func (c *LocklessChecker) gateOnFlush(e *retryEntry) {
 	e.flushRequested = false
 }
 
+// feedFlusher drains a checker's change feeds in the background, one drain at
+// a time. A failed drain is logged, not returned: a gated retry whose drain
+// failed falls back to the periodic flush and, failing that, to its
+// RetryFlushWait deadline.
+type feedFlusher struct {
+	c      *LocklessChecker
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	busy   atomic.Bool
+}
+
+func newFeedFlusher(ctx context.Context, c *LocklessChecker) *feedFlusher {
+	ctx, cancel := context.WithCancel(ctx)
+	return &feedFlusher{c: c, ctx: ctx, cancel: cancel}
+}
+
+// request starts a drain and reports whether it did. It does not start one
+// while another is running, and returns false so the caller asks again.
+func (f *feedFlusher) request() bool {
+	if !f.busy.CompareAndSwap(false, true) {
+		return false
+	}
+	f.wg.Go(func() {
+		defer f.busy.Store(false)
+		if err := f.c.flushFeeds(f.ctx); err != nil && f.ctx.Err() == nil {
+			f.c.cfg.Logger.Warn("lockless checksum: could not flush the change feed for a waiting retry",
+				"error", err)
+		}
+	})
+	return true
+}
+
+// close cancels a running drain and waits for it to return.
+func (f *feedFlusher) close() {
+	f.cancel()
+	f.wg.Wait()
+}
+
 // retryFlushPoll is how often the dispatcher re-checks the flush count for a
 // retry that is past its notBefore but still waiting on a flush. The check is
 // a mutex read per feed, so this only bounds how late after a flush the retry
@@ -874,29 +913,10 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 	defer walkerCancel()
 	go c.runWalker(walkerCtx, walkCh, walkErrCh)
 
-	// requestFlush drains the change feeds in the background, at most one
-	// drain at a time. The dispatcher calls it once per gate, when the retry
-	// at the head of the queue is due except for the flush it is gated on
-	// (see gateOnFlush). A failed drain is not fatal and is not re-requested
-	// for the same gate: the retry falls back to the periodic flush and,
-	// failing that, to its RetryFlushWait deadline.
-	flushCtx, flushCancel := context.WithCancel(ctx)
-	var flushWG sync.WaitGroup
-	var flushing atomic.Bool
-	defer flushWG.Wait()
-	defer flushCancel()
-	requestFlush := func() {
-		if !flushing.CompareAndSwap(false, true) {
-			return
-		}
-		flushWG.Go(func() {
-			defer flushing.Store(false)
-			if err := c.flushFeeds(flushCtx); err != nil && flushCtx.Err() == nil {
-				c.cfg.Logger.Warn("lockless checksum: could not flush the change feed for a waiting retry",
-					"error", err)
-			}
-		})
-	}
+	// The dispatcher starts one drain per gate, when the retry at the head of
+	// the queue is due except for the flush it is gated on (see gateOnFlush).
+	flusher := newFeedFlusher(ctx, c)
+	defer flusher.close()
 
 	queue := list.New() // FIFO of *retryEntry
 	inFlight := 0
@@ -957,9 +977,10 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 				var due bool
 				due, headWait = c.retryDue(e, now)
 				if !due && !now.Before(e.notBefore) && !e.flushRequested {
-					// Past RetryDelay, so only the flush gate holds it.
-					e.flushRequested = true
-					requestFlush()
+					// Past RetryDelay, so only the flush gate holds it. A drain
+					// already running may have started before this gate, so it
+					// is not enough to release it: ask again on the next poll.
+					e.flushRequested = flusher.request()
 				}
 				if due {
 					dueHead = e
