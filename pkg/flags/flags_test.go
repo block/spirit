@@ -57,9 +57,9 @@ func TestCutoverValidate(t *testing.T) {
 }
 
 func TestWaitsOnSentinel(t *testing.T) {
-	require.False(t, (&Cutover{}).WaitsOnSentinel())
-	require.True(t, (&Cutover{RespectSentinel: true}).WaitsOnSentinel())
-	require.True(t, (&Cutover{DeferCutOver: true}).WaitsOnSentinel(),
+	require.True(t, (&Cutover{}).WaitsOnSentinel(), "the zero value must honour a sentinel")
+	require.False(t, (&Cutover{IgnoreSentinel: true}).WaitsOnSentinel())
+	require.True(t, (&Cutover{DeferCutOver: true, IgnoreSentinel: true}).WaitsOnSentinel(),
 		"a run that created a sentinel must not cut over past it")
 }
 

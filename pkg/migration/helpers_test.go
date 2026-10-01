@@ -252,10 +252,12 @@ func WithDBName(name string) RunnerOption {
 	}
 }
 
-// WithRespectSentinel enables sentinel table detection.
+// WithRespectSentinel makes the run block on a sentinel it did not create
+// (production's default). newTestMigration ignores such sentinels, so that
+// tests sharing a schema do not block on each other's.
 func WithRespectSentinel() RunnerOption {
 	return func(m *Migration) {
-		m.RespectSentinel = true
+		m.IgnoreSentinel = false
 	}
 }
 
@@ -302,6 +304,7 @@ func newTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 		Password: &cfg.Passwd,
 		Database: cfg.DBName,
 		Common:   flags.Common{Threads: 2, WriteThreads: 2},
+		Cutover:  flags.Cutover{IgnoreSentinel: true},
 	}
 	for _, opt := range opts {
 		opt(migration)

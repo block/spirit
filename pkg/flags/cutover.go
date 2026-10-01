@@ -24,20 +24,21 @@ type Cutover struct {
 	// blocks before cutover (running a continuous checksum) until an operator
 	// drops it.
 	DeferCutOver bool `name:"defer-cutover" help:"Defer cutover (and continuous checksum) until the sentinel table is dropped" optional:"" default:"false"`
-	// RespectSentinel makes the run block before cutover while a sentinel
-	// table exists, including one it did not create. It is true on the CLI.
-	// A programmatic caller's zero value ignores a sentinel it did not ask
-	// for (tests use this to run concurrently despite the shared sentinel
-	// name) but never one it did: see WaitsOnSentinel.
-	RespectSentinel bool `name:"respect-sentinel" help:"Look for sentinel table to exist and block if it does" optional:"" default:"true" hidden:""`
+	// IgnoreSentinel lets the run cut over while a sentinel table it did not
+	// create exists. By default (the zero value, for the CLI and for
+	// programmatic callers alike) a run blocks before cutover while any
+	// sentinel exists, so an operator can hold a cutover by creating one. It
+	// never overrides DeferCutOver: see WaitsOnSentinel. Tests set it so they
+	// can run concurrently despite the shared sentinel name.
+	IgnoreSentinel bool `name:"ignore-sentinel" help:"Cut over even while a sentinel table exists, unless --defer-cutover is set" optional:"" default:"false" hidden:""`
 }
 
 // WaitsOnSentinel reports whether the run blocks before cutover while the
-// sentinel table exists. DeferCutOver implies it: a run that created a
-// sentinel and then ignored it would cut over without the deferral the caller
-// asked for.
+// sentinel table exists. DeferCutOver overrides IgnoreSentinel: a run that
+// created a sentinel and then ignored it would cut over without the deferral
+// the caller asked for.
 func (c *Cutover) WaitsOnSentinel() bool {
-	return c.DeferCutOver || c.RespectSentinel
+	return c.DeferCutOver || !c.IgnoreSentinel
 }
 
 // Validate rejects a negative LockWaitTimeout (ApplyTo would silently keep

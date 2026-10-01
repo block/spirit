@@ -172,3 +172,52 @@ func TestMoveContinuousChecksumAbortsThenResumeRepairs(t *testing.T) {
 	}
 	require.True(t, cutoverCalled)
 }
+
+// TestMoveWaitsOnSentinelItDidNotCreate: a programmatic Move that sets neither
+// DeferCutOver nor IgnoreSentinel must still hold its cutover while a sentinel
+// exists. An operator creates one to hold a cutover; the zero value must not
+// cut over past it.
+func TestMoveWaitsOnSentinelItDidNotCreate(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src := cfg.Clone()
+	src.DBName = "sentext_src"
+	dst := cfg.Clone()
+	dst.DBName = "sentext_dst"
+
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sentext_src")
+	testutils.RunSQL(t, "CREATE DATABASE sentext_src")
+	testutils.RunSQL(t, "CREATE TABLE sentext_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))")
+	testutils.RunSQL(t, "INSERT INTO sentext_src.t1 VALUES (1,'one'),(2,'two')")
+	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sentext_dst")
+	testutils.RunSQL(t, "CREATE DATABASE sentext_dst")
+	// Created by the operator, not by the move.
+	testutils.RunSQL(t, "CREATE TABLE sentext_dst."+sentinel.TableName+" (id INT NOT NULL PRIMARY KEY)")
+
+	m := &Move{
+		SourceDSN: src.FormatDSN(),
+		TargetDSN: dst.FormatDSN(),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+	}
+	require.True(t, m.WaitsOnSentinel())
+	runner, err := NewRunner(m)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
+	var cutoverCalled bool
+	runner.SetCutover(func(context.Context) error { cutoverCalled = true; return nil })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- runner.Run(context.Background()) }()
+
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
+	require.False(t, cutoverCalled, "cutover must wait while the sentinel exists")
+
+	testutils.RunSQL(t, "DROP TABLE sentext_dst."+sentinel.TableName)
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("move did not complete after the sentinel was dropped")
+	}
+	require.True(t, cutoverCalled, "cutover must run once the sentinel is dropped")
+}
