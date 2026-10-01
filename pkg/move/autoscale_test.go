@@ -47,10 +47,10 @@ func TestMoveAutoscaleDisabled(t *testing.T) {
 func TestMoveThrottleStatus(t *testing.T) {
 	r := &Runner{}
 	r.setThrottler(&throttler.Mock{})
-	require.True(t, r.throttleStatus(status.CopyRows).Throttled)
-	require.False(t, r.throttleStatus(status.Checksum).Throttled)
-	require.Empty(t, r.throttleStatus(status.CutOver))
-	require.Empty(t, r.throttleStatus(status.Close))
+	require.True(t, r.snapshot(status.CopyRows).ThrottleStatus().Throttled)
+	require.False(t, r.snapshot(status.Checksum).ThrottleStatus().Throttled)
+	require.Empty(t, r.snapshot(status.CutOver).ThrottleStatus())
+	require.Empty(t, r.snapshot(status.Close).ThrottleStatus())
 }
 
 func TestMoveAutoscaleFitsFixedPool(t *testing.T) {

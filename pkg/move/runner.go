@@ -27,6 +27,7 @@ import (
 	"github.com/block/spirit/pkg/host"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/move/check"
+	"github.com/block/spirit/pkg/runstatus"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
@@ -1713,45 +1714,21 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 	}
 	r.fatalOnce.Do(func() {
 		r.status.Set(status.ErrCleanup)
-		switch reason { //nolint: exhaustive // schema change intentionally handled by default: drop is the safe fallback for unknown reasons
-		case change.FatalReasonStreamError:
-			// The stream died but the source tables are not known to have
-			// changed, so the checkpoint remains valid. Keep it and tell the
-			// operator how to recover.
-			r.logger.Error("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the move from it")
-		case change.FatalReasonFlushError:
-			// Applying buffered changes failed, so the checkpoint's positions
-			// have stopped advancing. The source tables have not changed and
-			// the checkpoint is still valid, but a resume replays the same
-			// changes: the cause (logged just before) must be fixed first.
-			r.logger.Error("fatal error applying replicated changes; the checkpoint has been preserved — fix the cause of the error and re-run spirit to resume the move from it")
-		case change.FatalReasonUnsupportedXA, change.FatalReasonLogPosWrapped:
-			// Both reasons leave a checkpoint that is technically readable
-			// but useless: resuming from it streams straight back into the
-			// condition that killed the run.
-			if reason == change.FatalReasonUnsupportedXA {
-				r.logger.Error("XA transaction detected; the checkpoint will be invalidated — stop XA activity and start a fresh move")
-			} else {
-				r.logger.Error("binlog LogPos wrapped past 4GiB; the checkpoint will be invalidated — enable GTIDs (or lower max_binlog_cache_size so no transaction can grow a binlog file beyond 4GiB) and start a fresh move")
-			}
-			fallthrough
-		default:
-			// Schema change — and, defensively, any future reason we don't
-			// recognize (invalidating is the safe default: it costs a restart,
-			// while wrongly resuming could corrupt data).
-			// Invalidate the checkpoint, so we don't try to resume.
-			// If we don't do this, the move will permanently be blocked from proceeding.
-			// Letting it start again is the better choice.
-			// Use a background context since the move context may already be
-			// cancelled. checkpointTable can still be nil if fatalError fires
-			// during early setup, before createCheckpointTable runs — skip the
-			// drop in that case.
-			if r.checkpointTable != nil && len(r.targets) > 0 && r.targets[0].DB != nil {
-				if err := dbconn.Exec(context.Background(), r.targets[0].DB, "DROP TABLE IF EXISTS %n", r.checkpointTable.TableName); err != nil {
-					r.logger.Error("could not remove checkpoint",
-						"error", err,
-					)
-				}
+		if advice := reason.Advice("move"); advice != "" {
+			r.logger.Error(advice)
+		}
+		// Unless the reason leaves the checkpoint resumable, invalidate it, so
+		// we don't try to resume: the move would otherwise be blocked from
+		// proceeding permanently, and letting it start again is the better
+		// choice. Use a background context since the move context may already
+		// be cancelled. checkpointTable can still be nil if fatalError fires
+		// during early setup, before createCheckpointTable runs — skip the
+		// drop in that case.
+		if !reason.PreservesCheckpoint() && r.checkpointTable != nil && len(r.targets) > 0 && r.targets[0].DB != nil {
+			if err := r.checkpointTbl().Drop(context.Background()); err != nil {
+				r.logger.Error("could not remove checkpoint",
+					"error", err,
+				)
 			}
 		}
 		// cancelFunc can be nil during early setup or in test paths that
@@ -1764,85 +1741,9 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 }
 
 // Status returns the periodic report on the whole move: a header line plus one
-// indented row per subsystem (see status.Block). It deliberately absorbs what
-// used to be separate periodic lines from the change feeds (flushes, rotations)
-// and the checkpoint dumper — see github.com/block/spirit/issues/329.
+// indented row per subsystem (see runstatus.Snapshot.Status).
 func (r *Runner) Status() string {
-	state := r.status.Get()
-	if state > status.CutOver {
-		return ""
-	}
-	switch state { //nolint:exhaustive
-	case status.CopyRows:
-		progress := status.CopyFromTables(r.copyTables())
-		b := status.NewBlock("migration status: state=%s total-time=%s copier-time=%s",
-			state.String(),
-			r.status.TotalElapsed().Round(time.Second),
-			r.status.Elapsed().Round(time.Second),
-		)
-		b.Row("copier", "%6.2f%%  %d/%d  chunk-size=%d  eta=%s  throttled=%v",
-			progress.Fraction()*100,
-			progress.RowsCopied,
-			progress.RowsTotal,
-			r.copier.ChunkSize(),
-			r.copier.GetETA(),
-			r.copier.GetThrottler().IsThrottled(),
-		)
-		b.Row("applier", "%s", applier.StatusRow(r.applier))
-		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
-		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
-		return b.String()
-	case status.WaitingOnSentinelTable:
-		b := status.NewBlock("migration status: state=%s total-time=%s",
-			state.String(),
-			r.status.TotalElapsed().Round(time.Second),
-		)
-		b.Row("sentinel", "waiting=%s  max-wait=%s",
-			r.status.Elapsed().Round(time.Second),
-			sentinel.WaitLimit,
-		)
-		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
-		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
-		return b.String()
-	case status.ApplyChangeset, status.PostChecksum:
-		// We've finished copying rows, and we are now trying to reduce the number of binlog deltas before
-		// proceeding to the checksum and then the final cutover.
-		b := status.NewBlock("migration status: state=%s total-time=%s",
-			state.String(),
-			r.status.TotalElapsed().Round(time.Second),
-		)
-		b.Row("applier", "%s", applier.StatusRow(r.applier))
-		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
-		// See pkg/migration: the dumper keeps checkpointing during the drain,
-		// so the resume position is still worth watching here.
-		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
-		return b.String()
-	case status.Checksum:
-		// This could take a while if it's a large table.
-		b := status.NewBlock("migration status: state=%s total-time=%s checksum-time=%s",
-			state.String(),
-			r.status.TotalElapsed().Round(time.Second),
-			r.status.Elapsed().Round(time.Second),
-		)
-		b.Row("checksum", "%s", checksum.StatusRow(r.checker))
-		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
-		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
-		return b.String()
-	case status.RestoreSecondaryIndexes, status.AnalyzeTable:
-		// Neither phase has progress to report, but both can block for a long
-		// time on a busy server, and with the per-dump checkpoint line now at
-		// DEBUG this is the only INFO output they produce. See pkg/migration.
-		b := status.NewBlock("migration status: state=%s total-time=%s state-time=%s",
-			state.String(),
-			r.status.TotalElapsed().Round(time.Second),
-			r.status.Elapsed().Round(time.Second),
-		)
-		b.Row("binlog", "deltas=%d  %s", r.getDeltaLenAll(), r.feedStatusRow())
-		b.Row("ckpt", "%s", r.lastCheckpoint.Row())
-		return b.String()
-	default:
-		return ""
-	}
+	return r.snapshot(r.status.Get()).Status()
 }
 
 func (r *Runner) SetLogger(logger *slog.Logger) {
@@ -2214,61 +2115,33 @@ func (r *Runner) copyTables() []status.TableProgress {
 	return status.TablesFromChunker(copyChunker)
 }
 
-func (r *Runner) Progress() status.Progress {
-	// Read the state once: the phase-specific fields below (summary, ETA,
-	// checksum, throttle) must all describe the same state, not whichever state
-	// each happened to observe.
-	state := r.status.Get()
-
-	tables := r.copyTables()
-	copyProgress := status.CopyFromTables(tables)
-
-	var summary string
-	var eta status.ETA
-	var checksumProgress status.ChecksumProgress
-	switch state { //nolint: exhaustive
-	case status.CopyRows:
-		// One copier read, so the ETA in Summary and the ETA field describe
-		// the same instant.
-		eta = r.copier.GetETAState()
-		summary = fmt.Sprintf("%s %s ETA %s", copyProgress.String(), state.String(), eta.String())
-	case status.WaitingOnSentinelTable:
-		summary = "Waiting on Sentinel Table"
-	case status.ApplyChangeset, status.PostChecksum:
-		summary = fmt.Sprintf("Applying Changeset Deltas=%v", r.getDeltaLenAll())
-	case status.Checksum:
-		checksumProgress = r.checker.GetProgress()
-		summary = checksum.StatusSummary(r.checker)
-	}
-	return status.Progress{
-		CurrentState: state,
-		Summary:      summary,
-		Resume:       r.usedResumeFromCheckpoint.Load(),
-		ETA:          eta,
-		Copy:         copyProgress,
-		Checksum:     checksumProgress,
-		Tables:       tables,
-		Throttle:     r.throttleStatus(state),
+// snapshot captures what Status and Progress report on, for the given state.
+func (r *Runner) snapshot(state status.State) *runstatus.Snapshot {
+	return &runstatus.Snapshot{
+		Noun:       "move",
+		State:      state,
+		Tracker:    &r.status,
+		Tables:     r.copyTables(),
+		Checkpoint: &r.lastCheckpoint,
+		Resumed:    r.usedResumeFromCheckpoint.Load(),
+		Source:     statusSource{r},
 	}
 }
 
-// Sentinel waiting only reports pacing while a continuous checksum is running.
-func (r *Runner) throttleStatus(state status.State) status.ThrottleStatus {
-	t := r.currentThrottler()
-	switch state { //nolint:exhaustive
-	case status.CopyRows:
-	case status.Checksum:
-		t = throttler.GradualOnly(t)
-	case status.WaitingOnSentinelTable:
-		if r.checker == nil || !r.checker.ContinuousActive() {
-			return status.ThrottleStatus{}
-		}
-		t = throttler.GradualOnly(t)
-	default:
-		return status.ThrottleStatus{}
-	}
-	paused, reason, util := throttler.Describe(t)
-	return status.ThrottleStatus{Throttled: paused, Reason: reason, Utilization: util}
+// statusSource hands runstatus the runner's subsystems. It reads each one only
+// when the state being reported on needs it, which is after setup has assigned
+// it (see runstatus.Source).
+type statusSource struct{ r *Runner }
+
+func (s statusSource) Copier() copier.Copier          { return s.r.copier }
+func (s statusSource) Applier() applier.Applier       { return s.r.applier }
+func (s statusSource) Checker() checksum.Checker      { return s.r.checker }
+func (s statusSource) Feeds() []change.Source         { return s.r.feeds() }
+func (s statusSource) Throttler() throttler.Throttler { return s.r.currentThrottler() }
+func (s statusSource) SentinelSchema() string         { return "" }
+
+func (r *Runner) Progress() status.Progress {
+	return r.snapshot(r.status.Get()).Progress()
 }
 
 // targetHosts is the common host view for monitoring and DDL scheduling.
@@ -2554,24 +2427,13 @@ func (r *Runner) setWatermarkOptimizationAll(ctx context.Context, enabled bool) 
 	return nil
 }
 
-// getDeltaLenAll returns the total number of pending changes across all replication clients.
-func (r *Runner) getDeltaLenAll() int {
-	total := 0
-	for i := range r.sources {
-		total += r.sources[i].replClient.GetDeltaLen()
-	}
-	return total
-}
-
-// feedStatusRow renders the change-feed fields for the status block's binlog
-// row across every source. change.StatusRow merges them into one set of fields
-// (see there for how), so a 16-shard move does not print 16 rows.
-func (r *Runner) feedStatusRow() string {
+// feeds returns every source's change feed.
+func (r *Runner) feeds() []change.Source {
 	srcs := make([]change.Source, 0, len(r.sources))
 	for i := range r.sources {
 		srcs = append(srcs, r.sources[i].replClient)
 	}
-	return change.StatusRow(srcs...)
+	return srcs
 }
 
 // stopPeriodicFlushAll stops periodic flushing on all replication clients.

@@ -18,17 +18,17 @@ func (*busyProgressThrottler) Utilization() float64 { return 1.2 }
 func TestMoveContinuousChecksumThrottleProgress(t *testing.T) {
 	r := &Runner{}
 	r.setThrottler(&busyProgressThrottler{})
-	require.True(t, r.throttleStatus(status.Checksum).Throttled)
-	require.Empty(t, r.throttleStatus(status.WaitingOnSentinelTable), "no checker yet")
+	require.True(t, r.snapshot(status.Checksum).ThrottleStatus().Throttled)
+	require.Empty(t, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus(), "no checker yet")
 	v := &pacingChecker{}
 	r.checker = v
-	require.Empty(t, r.throttleStatus(status.WaitingOnSentinelTable), "waiting between passes")
+	require.Empty(t, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus(), "waiting between passes")
 	v.active.Store(true)
-	require.True(t, r.throttleStatus(status.WaitingOnSentinelTable).Throttled, "reading a pass")
-	require.InDelta(t, 1.2, r.throttleStatus(status.WaitingOnSentinelTable).Utilization, 0.001)
-	require.Empty(t, r.throttleStatus(status.CutOver))
+	require.True(t, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus().Throttled, "reading a pass")
+	require.InDelta(t, 1.2, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus().Utilization, 0.001)
+	require.Empty(t, r.snapshot(status.CutOver).ThrottleStatus())
 	r.setThrottler(&throttler.Mock{})
-	require.Empty(t, r.throttleStatus(status.WaitingOnSentinelTable)) // Binary signals do not pace checksums.
+	require.Empty(t, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus()) // Binary signals do not pace checksums.
 }
 
 func TestReverseWindowPreservesConfiguredWorkers(t *testing.T) {
