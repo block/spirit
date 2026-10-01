@@ -262,9 +262,7 @@ func (r *Runner) runCopy(ctx context.Context) error {
 func (r *Runner) Close() error {
 	// Cancel the runner context so background goroutines (status.WatchTask)
 	// observe ctx.Done() and exit. Idempotent.
-	if r.cancelFunc != nil {
-		r.cancelFunc(nil)
-	}
+	r.cancel(nil)
 	// Wait for the status/checkpoint dumper goroutines to exit before
 	// tearing down connections, so a late DumpCheckpoint cannot race with
 	// post-Close cleanup.
@@ -1754,11 +1752,7 @@ func (r *Runner) fatalError(reason change.FatalReason) bool {
 				}
 			}
 		}
-		// cancelFunc can be nil during early setup or in test paths that
-		// bypass Run; nil-check before calling.
-		if r.cancelFunc != nil {
-			r.cancelFunc(status.FatalAbort(fmt.Errorf("move aborted: fatal change feed condition (%s); see the preceding log lines for details", reason)))
-		}
+		r.cancel(status.FatalAbort(fmt.Errorf("move aborted: fatal change feed condition (%s); see the preceding log lines for details", reason)))
 	})
 	return true
 }
@@ -2413,14 +2407,23 @@ func renderCheckpointPosition(positions map[string]string) string {
 // Cancel stops a running move. It is an operator cancellation: Run returns
 // context.Canceled.
 func (r *Runner) Cancel() {
-	r.cancelFunc(nil)
+	r.cancel(nil)
 }
 
 // Abort stops a running move with cause (see status.Aborter). The checkpoint
 // dumper calls it when it cannot write a checkpoint, so Run returns the write
 // error instead of context.Canceled.
 func (r *Runner) Abort(cause error) {
-	r.cancelFunc(cause)
+	r.cancel(cause)
+}
+
+// cancel cancels the move context with cause. A nil cause is a plain
+// cancellation (context.Canceled). cancelFunc is only set by Run, so this is
+// a no-op before Run (early setup, or test paths that bypass Run).
+func (r *Runner) cancel(cause error) {
+	if r.cancelFunc != nil {
+		r.cancelFunc(cause)
+	}
 }
 
 // createApplier creates the applier that writes to the targets. With several

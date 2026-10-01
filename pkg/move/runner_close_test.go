@@ -112,6 +112,16 @@ func TestFatalErrorSafeWithoutCancelFunc(t *testing.T) {
 	})
 }
 
+// TestCancelAndAbortBeforeRun verifies Cancel and Abort are no-ops on a
+// runner that has not been Run: cancelFunc is only set by Run, so without
+// the nil-check they nil-deref.
+func TestCancelAndAbortBeforeRun(t *testing.T) {
+	r, err := NewRunner(&Move{})
+	require.NoError(t, err)
+	require.NotPanics(t, r.Cancel)
+	require.NotPanics(t, func() { r.Abort(errors.New("checkpoint write failed")) })
+}
+
 // TestFatalErrorCancelsWithCause pins that fatalError cancels the move
 // context with an error naming the reason, not with a bare cancellation: Run
 // returns that cause, so the abort is reported and recorded as a failure.
