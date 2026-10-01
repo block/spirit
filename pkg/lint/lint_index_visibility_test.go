@@ -115,8 +115,9 @@ func TestIndexVisibilityMixedLinter_ViolationDetail(t *testing.T) {
 }
 
 // TestIndexVisibilityMixedLinter_MultipleIndexes verifies that a statement
-// flipping several indexes lists them all in the message, and leaves
-// Location.Index unset rather than arbitrarily naming the first one.
+// flipping several indexes lists them all in the message, each quoted as its
+// own identifier, and leaves Location.Index unset rather than arbitrarily
+// naming the first one.
 func TestIndexVisibilityMixedLinter_MultipleIndexes(t *testing.T) {
 	stmts, err := statement.New("ALTER TABLE t1 ALTER INDEX a INVISIBLE, ALTER INDEX b VISIBLE, ADD COLUMN c INT")
 	require.NoError(t, err)
@@ -125,7 +126,7 @@ func TestIndexVisibilityMixedLinter_MultipleIndexes(t *testing.T) {
 	violations := linter.Lint(nil, stmts)
 
 	require.Len(t, violations, 1)
-	require.Contains(t, violations[0].Message, "\"a, b\"")
+	require.Contains(t, violations[0].Message, `Index visibility change on "a", "b" is mixed with`)
 	require.Equal(t, "t1", violations[0].Location.Table)
 	require.Nil(t, violations[0].Location.Index)
 }

@@ -112,8 +112,8 @@ func (l *IndexVisibilityMixedLinter) Lint(_ []*statement.CreateTable, changes []
 		violations = append(violations, Violation{
 			Linter:   l,
 			Severity: SeverityWarning,
-			Message: fmt.Sprintf("Index visibility change on %q is mixed with table-rebuilding operations (%s). A visibility change is usually an experiment, and rebuilding the table at the same time makes the result difficult to interpret",
-				strings.Join(visibilityIndexes, ", "), operations),
+			Message: fmt.Sprintf("Index visibility change on %s is mixed with table-rebuilding operations (%s). A visibility change is usually an experiment, and rebuilding the table at the same time makes the result difficult to interpret",
+				quoteJoin(visibilityIndexes), operations),
 			Location:   location,
 			Suggestion: &suggestion,
 		})

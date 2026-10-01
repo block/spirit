@@ -948,10 +948,12 @@ func TestTypePedantic_SameName_EnumSetMemberSpaces(t *testing.T) {
 }
 
 // The majority count renders with its noun and verb in agreement, and only the
-// first three example tables are named, each quoted.
+// first three example tables are named, each quoted, with an ellipsis marking
+// a list that stops short of the count.
 func TestTypePedantic_OtherTablesPhrase(t *testing.T) {
-	require.Equal(t, "1 other table uses", tpOtherTablesUse([]string{"orders"}))
-	require.Equal(t, "2 other tables use", tpOtherTablesUse([]string{"invoices", "orders"}))
-	require.Equal(t, `"a", "b", "c"`, tpExampleTables([]string{"a", "b", "c", "d"}))
+	require.Equal(t, "1 other table uses", tpOtherTables([]string{"orders"}))
+	require.Equal(t, "2 other tables use", tpOtherTables([]string{"invoices", "orders"}))
 	require.Equal(t, `"orders"`, tpExampleTables([]string{"orders"}))
+	require.Equal(t, `"a", "b", "c"`, tpExampleTables([]string{"a", "b", "c"}), "a complete list carries no ellipsis")
+	require.Equal(t, `"a", "b", "c", …`, tpExampleTables([]string{"a", "b", "c", "d"}), "a truncated list says so")
 }

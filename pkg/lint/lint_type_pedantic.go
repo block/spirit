@@ -412,7 +412,7 @@ func (l *TypePedanticLinter) sameNameTypes(refs []tpColRef) []Violation {
 				Severity: l.sameNameSeverity,
 				Message: fmt.Sprintf(
 					"Column %q in table %q has type %q but %s type %q (e.g. %s)",
-					r.col.Name, r.table.TableName, r.typ, tpOtherTablesUse(majorityTables), majority, tpExampleTables(majorityTables),
+					r.col.Name, r.table.TableName, r.typ, tpOtherTables(majorityTables), majority, tpExampleTables(majorityTables),
 				),
 				Location:   &Location{Table: r.table.TableName, Column: &colName},
 				Suggestion: new(fmt.Sprintf("Align %s.%s to type %q for consistency", r.table.TableName, r.col.Name, majority)),
@@ -487,7 +487,7 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 				Severity: l.collationSeverity,
 				Message: fmt.Sprintf(
 					"Column %q in table %q uses collation %q but %s %q (e.g. %s) — %s",
-					r.col.Name, r.table.TableName, r.collation, tpOtherTablesUse(majorityTables), majority, tpExampleTables(majorityTables),
+					r.col.Name, r.table.TableName, r.collation, tpOtherTables(majorityTables), majority, tpExampleTables(majorityTables),
 					tpCollationConsequence(r.charset, charsetOf[majority]),
 				),
 				Location: &Location{Table: r.table.TableName, Column: &colName},
@@ -714,20 +714,25 @@ func tpDedupeStrings(ss []string) []string {
 	return slices.Compact(slices.Sorted(slices.Values(ss)))
 }
 
-// tpOtherTablesUse counts the tables that hold the majority type or collation,
-// with the noun and verb agreeing with the count: "1 other table uses" versus
-// "2 other tables use".
-func tpOtherTablesUse(tables []string) string {
-	if len(tables) == 1 {
-		return "1 other table uses"
-	}
-	return fmt.Sprintf("%d other tables use", len(tables))
+// tpExampleLimit is how many of the majority's tables a message names. The
+// count beside the list says how many there are in total; the list only has
+// to show which tables the reader could open to see the majority type.
+const tpExampleLimit = 3
+
+// tpOtherTables counts the tables that hold the majority type or collation.
+func tpOtherTables(tables []string) string {
+	return countedPhrase(len(tables), "other table uses", "other tables use")
 }
 
-// tpExampleTables names up to three of the majority's tables, each quoted like
-// every other identifier in the message.
+// tpExampleTables names up to tpExampleLimit of the majority's tables, each
+// quoted like every other identifier in the message, with a trailing ellipsis
+// when the list stops short of the count beside it.
 func tpExampleTables(tables []string) string {
-	return quoteJoin(tpFirstN(tables, 3))
+	examples := quoteJoin(tpFirstN(tables, tpExampleLimit))
+	if len(tables) > tpExampleLimit {
+		return examples + ", …"
+	}
+	return examples
 }
 
 func tpFirstN(s []string, n int) []string {
