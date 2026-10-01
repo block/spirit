@@ -443,9 +443,12 @@ func (c *LocklessChecker) flushResidual() (int, int) {
 // Waiting for the periodic flush would make every retry round cost up to a
 // full flush interval, and a hot range that has to split needs several rounds
 // in sequence. So once a retry has waited out RetryDelay and is held only by
-// the flush, the dispatcher requests one (see runOnePass): the retry is
-// released as soon as that flush completes, and it still re-reads a target
-// that has applied every change up to its own read.
+// the flush, the dispatcher requests one (see runOnePass). The count moves
+// with each batch a drain applies, not with the drain as a whole, so the
+// drain's first batch releases the retry, before the drain waits for the
+// binlog reader to catch up. A reader that lags by more than RetryDelay can
+// therefore release the retry against a target still missing the change, and
+// the re-read spends one attempt, the same cost as the race above.
 //
 // Without feeds there is nothing to wait for, so the entry is left ungated.
 // The deadline covers a feed that has stopped flushing — the retry then
