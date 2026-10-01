@@ -84,9 +84,9 @@ type Common struct {
 	TLSCertificatePath string `name:"tls-ca" help:"Path to custom TLS CA certificate file" optional:""`
 }
 
-// Validate rejects explicitly negative thread counts and a ForceKillAfter that
-// leaves no time to acquire a lock. Zero counts are accepted and mean "use the
-// default". Each command validates MaxConnections itself, because the smallest
+// Validate rejects explicitly negative thread counts and durations, and a
+// ForceKillAfter that leaves no time to acquire a lock. Zero counts are
+// accepted and mean "use the default". Each command validates MaxConnections itself, because the smallest
 // usable pool depends on what the command runs on it
 // (dbconn.ValidateMaxConnections vs dbconn.ValidateConnectionLimit).
 func (c *Common) Validate() error {
@@ -95,6 +95,15 @@ func (c *Common) Validate() error {
 	}
 	if c.WriteThreads < 0 {
 		return fmt.Errorf("--write-threads must be non-negative, got %d", c.WriteThreads)
+	}
+	// ApplyTo and the throttler treat a non-positive duration as "use the
+	// default" and "disabled" respectively, so a negative one would silently
+	// become a different setting.
+	if c.LockWaitTimeout < 0 {
+		return fmt.Errorf("--lock-wait-timeout must be non-negative, got %s", c.LockWaitTimeout)
+	}
+	if c.MaxCommitLatency < 0 {
+		return fmt.Errorf("--max-commit-latency must be non-negative (0 disables it), got %s", c.MaxCommitLatency)
 	}
 	config := dbconn.NewDBConfig()
 	c.ApplyTo(config)

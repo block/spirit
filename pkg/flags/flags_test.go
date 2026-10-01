@@ -38,6 +38,8 @@ func TestValidate(t *testing.T) {
 	require.ErrorContains(t, (&Common{Threads: -1}).Validate(), "--threads must be non-negative")
 	require.ErrorContains(t, (&Common{WriteThreads: -1}).Validate(), "--write-threads must be non-negative")
 	require.Error(t, (&Common{ForceKillAfter: -time.Second}).Validate())
+	require.ErrorContains(t, (&Common{LockWaitTimeout: -time.Second}).Validate(), "--lock-wait-timeout must be non-negative")
+	require.ErrorContains(t, (&Common{MaxCommitLatency: -time.Millisecond}).Validate(), "--max-commit-latency must be non-negative")
 	require.Error(t, (&Common{LockWaitTimeout: 10 * time.Second, ForceKillAfter: 10 * time.Second}).Validate())
 	require.NoError(t, (&Common{LockWaitTimeout: 10 * time.Second, ForceKillAfter: 9 * time.Second}).Validate())
 }

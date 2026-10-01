@@ -132,7 +132,10 @@ type Topology struct {
 //     (every feed's flush fans out to the busiest server) and capped by the
 //     client ceiling split across sources, but never below
 //     autoscale.MinFlushConcurrency — the width every run had before this was
-//     derived, so engaging never narrows a drain.
+//     derived, so engaging never narrows a drain. With one source the floor
+//     never exceeds the client ceiling, because autoscale.ClientCeiling is
+//     at least autoscale.ClientThreadsPerCore (16); so for migrate and sync
+//     this is the old ceiling-capped width.
 //
 // redoAware and commitLatencyEnabled decide whether the write ceiling may
 // exceed the start (see throttler.ResolveMaxWriteThreads).

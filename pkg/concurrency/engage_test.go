@@ -50,6 +50,22 @@ func TestDeriveMultiTarget(t *testing.T) {
 	require.Equal(t, 1, minimum.MaxWriteThreads)
 }
 
+// The flush floor must not lift a single source's width past the client
+// ceiling (migrate and sync capped flush at it before the rules were shared).
+// That holds because the smallest ceiling autoscale.ClientCeiling can return
+// (one core) is already at or above the floor.
+func TestFlushFloorWithinSingleSourceClientCeiling(t *testing.T) {
+	require.GreaterOrEqual(t, autoscale.ClientThreadsPerCore, autoscale.MinFlushConcurrency)
+	require.GreaterOrEqual(t, autoscale.ClientCeiling(), autoscale.MinFlushConcurrency)
+	for vcpus := autoscale.MinVCPUs; vcpus <= 192; vcpus++ {
+		cc := autoscale.ClientThreadsPerCore
+		plan, ok := Derive(single(vcpus), cc, false, true)
+		require.True(t, ok)
+		width, _ := autoscale.FlushBounds(vcpus)
+		require.Equal(t, min(width, cc), plan.FlushConcurrency, "vcpus=%d", vcpus)
+	}
+}
+
 // A single target is the degenerate case of the multi-target rules, and must
 // produce exactly the numbers migration derived before the rules were shared:
 // ReadBounds and WriteStart, each capped by the client ceiling.

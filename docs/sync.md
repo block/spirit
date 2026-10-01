@@ -276,7 +276,7 @@ refusal of target triggers and events (see [Schema objects](#schema-objects)).
 - Type: Duration
 - Default value: `0s` (i.e. 90% of [lock-wait-timeout](#lock-wait-timeout))
 
-How long Spirit waits before it starts killing the connections that are blocking a metadata lock. Shared with `migrate`; see [migrate's force-kill-after](migrate.md#force-kill-after).
+Shared with `migrate` and `move` (see [migrate's force-kill-after](migrate.md#force-kill-after)), but currently has no effect in `sync`: sync performs no cutover and takes no table locks, so it never force-kills. It is still validated against [lock-wait-timeout](#lock-wait-timeout).
 
 ### lock-wait-timeout
 
