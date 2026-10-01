@@ -239,6 +239,7 @@ func NewRunner(m *Move) (*Runner, error) {
 		return nil, err
 	}
 	m.WarnZeroWriteThreads(slog.Default())
+	m.WarnDeprecated(slog.Default())
 	m.Normalize()
 	r := &Runner{
 		move:                m,

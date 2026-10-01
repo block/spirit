@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/require"
@@ -61,6 +62,50 @@ func TestWaitsOnSentinel(t *testing.T) {
 	require.False(t, (&Cutover{IgnoreSentinel: true}).WaitsOnSentinel())
 	require.True(t, (&Cutover{DeferCutOver: true, IgnoreSentinel: true}).WaitsOnSentinel(),
 		"a run that created a sentinel must not cut over past it")
+}
+
+// TestDeprecatedRespectSentinel: the removed hidden --respect-sentinel still
+// parses, keeps its old meaning, and cannot be combined with --ignore-sentinel.
+func TestDeprecatedRespectSentinel(t *testing.T) {
+	parse := func(args ...string) (*Cutover, error) {
+		var cli struct{ Cutover }
+		parser, err := kong.New(&cli)
+		require.NoError(t, err)
+		_, err = parser.Parse(args)
+		if err != nil {
+			return nil, err
+		}
+		return &cli.Cutover, cli.Validate()
+	}
+	c, err := parse()
+	require.NoError(t, err)
+	require.Nil(t, c.DeprecatedRespectSentinel)
+	require.True(t, c.WaitsOnSentinel())
+
+	c, err = parse("--respect-sentinel=false")
+	require.NoError(t, err)
+	require.False(t, c.WaitsOnSentinel())
+
+	c, err = parse("--respect-sentinel=false", "--defer-cutover")
+	require.NoError(t, err)
+	require.True(t, c.WaitsOnSentinel(), "--defer-cutover still overrides")
+
+	c, err = parse("--respect-sentinel")
+	require.NoError(t, err)
+	require.True(t, c.WaitsOnSentinel())
+
+	_, err = parse("--respect-sentinel=false", "--ignore-sentinel")
+	require.ErrorContains(t, err, "cannot be combined with --ignore-sentinel")
+}
+
+func TestCutoverWarnDeprecated(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	(&Cutover{IgnoreSentinel: true}).WarnDeprecated(logger)
+	require.Empty(t, buf.String())
+	respect := false
+	(&Cutover{DeprecatedRespectSentinel: &respect}).WarnDeprecated(logger)
+	require.Contains(t, buf.String(), "--respect-sentinel is deprecated")
 }
 
 func TestNormalize(t *testing.T) {
