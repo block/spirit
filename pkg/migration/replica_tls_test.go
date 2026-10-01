@@ -9,6 +9,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -118,14 +119,13 @@ func TestReplicaTLSEnhancement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup migration config with main TLS settings
 			migration := &Migration{
-				Host:               cfg.Addr,
-				Username:           cfg.User,
-				Password:           &cfg.Passwd,
-				Database:           cfg.DBName,
-				Statement:          "ALTER TABLE test_table ADD COLUMN test_col INT",
-				TLSMode:            tc.mainTLSMode,
-				TLSCertificatePath: tc.mainTLSCert,
-				ReplicaDSN:         tc.replicaDSN,
+				Host:       cfg.Addr,
+				Username:   cfg.User,
+				Password:   &cfg.Passwd,
+				Database:   cfg.DBName,
+				Statement:  "ALTER TABLE test_table ADD COLUMN test_col INT",
+				Common:     flags.Common{TLSMode: tc.mainTLSMode, TLSCertificatePath: tc.mainTLSCert},
+				ReplicaDSN: tc.replicaDSN,
 			}
 
 			runner, err := NewRunner(migration)
@@ -274,14 +274,13 @@ func TestReplicaTLSIntegration(t *testing.T) {
 	replicaDSN := "replica_user:replica_pass@tcp(replica.example.com:3306)/testdb"
 
 	migration := &Migration{
-		Host:               cfg.Addr,
-		Username:           cfg.User,
-		Password:           &cfg.Passwd,
-		Database:           cfg.DBName,
-		Statement:          "ALTER TABLE test_table ADD COLUMN test_col INT",
-		TLSMode:            "VERIFY_CA",
-		TLSCertificatePath: tempFile.Name(),
-		ReplicaDSN:         replicaDSN,
+		Host:       cfg.Addr,
+		Username:   cfg.User,
+		Password:   &cfg.Passwd,
+		Database:   cfg.DBName,
+		Statement:  "ALTER TABLE test_table ADD COLUMN test_col INT",
+		Common:     flags.Common{TLSMode: "VERIFY_CA", TLSCertificatePath: tempFile.Name()},
+		ReplicaDSN: replicaDSN,
 	}
 
 	runner, err := NewRunner(migration)

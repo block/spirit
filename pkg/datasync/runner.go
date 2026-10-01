@@ -14,10 +14,10 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/concurrency"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -175,20 +175,9 @@ func NewRunner(s *Sync) (*Runner, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
-	if s.MaxConnections == 0 {
-		s.MaxConnections = dbconn.DefaultMaxConnections
-	}
+	s.Normalize(slog.Default())
 	if s.Source != nil && s.Applier == nil {
 		return nil, errors.New("Sync.Source requires Sync.Applier to also be set; the injected change.Source needs the same applier the copier uses")
-	}
-	if s.Threads <= 0 {
-		s.Threads = 4
-	}
-	if s.WriteThreads <= 0 {
-		s.WriteThreads = 4
-	}
-	if s.TargetChunkSize == 0 {
-		s.TargetChunkSize = table.DefaultTargetChunkBytes
 	}
 	if s.FlushInterval <= 0 {
 		s.FlushInterval = change.DefaultFlushInterval
@@ -313,7 +302,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// costs sync nothing. If sync ever does write to its source, that is a bug,
 	// and the rejection now surfaces it instead of hiding it.
 	r.sourceDBConfig.ForceKill = false
-	r.sourceDBConfig.MaxOpenConnections = r.sync.MaxConnections
+	r.sync.ApplyTo(r.sourceDBConfig)
 
 	// The target is written to (table creation, the copy/apply, the
 	// checkpoint, and CREATE DATABASE on the admin connection), so it keeps the
@@ -325,7 +314,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// applied (no cutover here either, so ForceKill is left at its default but
 	// never fires).
 	r.targetDBConfig = dbconn.NewDBConfig()
-	r.targetDBConfig.MaxOpenConnections = r.sync.MaxConnections
+	r.sync.ApplyTo(r.targetDBConfig)
 
 	// Open the source SQL connection. Even when the change feed is an
 	// injected non-MySQL source, spirit still needs SQL access to the
@@ -924,42 +913,33 @@ func (r *Runner) openLoadSignal(ctx context.Context, result throttler.AuroraResu
 }
 
 // setupAutoscaling derives thread counts from the target when autoscaling is
-// enabled and the target provides a load signal. result is the probe that
-// built that signal.
+// enabled and the target provides a load signal (concurrency.Engage). result is
+// the probe that built that signal.
 func (r *Runner) setupAutoscaling(ctx context.Context, result throttler.AuroraResult) error {
-	if !r.sync.EnableExperimentalAutoscaling {
-		return nil
+	plan, err := concurrency.Engage(ctx, &r.sync.Common, concurrency.Request{
+		Targets: []concurrency.Target{{DB: r.target.DB, Aurora: result}},
+		Fit:     r.fitAutoscaleToPool,
+		VCPUs:   r.auroraVCPUs,
+		Logger:  r.logger,
+	})
+	if err != nil || !plan.Engaged {
+		return err
 	}
-	switch {
-	case result.ProbeErr != nil:
-		r.logger.Warn("sync autoscaling disabled: target detection failed", "error", result.ProbeErr)
-		return nil
-	case len(result.Throttlers) == 0:
-		r.logger.Info("sync autoscaling disabled: target is not Aurora")
-		return nil
-	}
-	vcpus, err := r.auroraVCPUs(ctx, r.target.DB)
-	if err != nil {
-		return fmt.Errorf("sync target CPU capacity: %w", err)
-	}
-	readStart, config := syncAutoscaleBounds(vcpus, autoscale.ClientCeiling(), r.sync.MaxConnections, result.RedoAware, r.sync.MaxCommitLatency > 0)
-	if !config.Enabled {
-		r.logger.Info("sync autoscaling disabled: target too small", "vcpus", vcpus)
-		return nil
-	}
-	r.engageAutoscaling(readStart, config)
-	r.flushConcurrency, r.flushBatchSize = syncFlushBounds(vcpus, autoscale.ClientCeiling())
+	r.autoscale = plan.Copier()
+	r.flushConcurrency, r.flushBatchSize = plan.FlushConcurrency, plan.FlushBatchSize
 	return nil
 }
 
-// engageAutoscaling hands the thread counts to the controllers. The load
-// signal must already be open (openLoadSignal).
-func (r *Runner) engageAutoscaling(readStart int, config copier.AutoscaleConfig) {
-	r.autoscale = config
-	r.sync.Threads, r.sync.WriteThreads = readStart, config.StartThreads
-	r.logger.Info("sync autoscaling engaged; configured thread counts overridden",
-		"threads", readStart, "max_read_threads", config.MaxReadThreads,
-		"write_threads", config.StartThreads, "max_write_threads", config.MaxThreads)
+// fitAutoscaleToPool partitions the target pool between verification reads and
+// repair writes, which share it. It reserves the entire change-feed flush plus
+// six checkpoint/metadata connections, then splits the remainder so both
+// worker ceilings fit simultaneously.
+func (r *Runner) fitAutoscaleToPool(plan concurrency.Plan) (concurrency.Plan, bool) {
+	available := r.sync.MaxConnections - plan.FlushConcurrency - 6
+	if available < 2 {
+		return plan, false
+	}
+	return plan.Cap(available/2, available-available/2), true
 }
 
 func (r *Runner) currentLoadSignal() throttler.Throttler {

@@ -4,6 +4,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/require"
@@ -31,12 +32,12 @@ func TestMoveContinuousChecksumThrottleProgress(t *testing.T) {
 
 func TestReverseWindowPreservesConfiguredWorkers(t *testing.T) {
 	for _, configured := range []int{0, 7} {
-		r, err := NewRunner(&Move{WriteThreads: configured})
+		r, err := NewRunner(&Move{Common: flags.Common{WriteThreads: configured}})
 		require.NoError(t, err)
 		expected := r.move.WriteThreads
 		r.move.WriteThreads = 32 // Forward autoscaling resolves an instance-derived count.
 		require.Equal(t, expected, r.reverseWriteThreads)
-		resumed, err := NewRunner(&Move{WriteThreads: configured})
+		resumed, err := NewRunner(&Move{Common: flags.Common{WriteThreads: configured}})
 		require.NoError(t, err)
 		require.Equal(t, resumed.reverseWriteThreads, r.reverseWriteThreads)
 	}

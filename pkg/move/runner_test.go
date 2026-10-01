@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -38,19 +38,6 @@ func TestMoveTargetChunkSizeDefault(t *testing.T) {
 	r, err := NewRunner(&Move{})
 	require.NoError(t, err)
 	require.Equal(t, uint64(table.DefaultTargetChunkBytes), r.move.TargetChunkSize)
-}
-
-// TestMoveTargetChunkSizeKongDefault pins the hardcoded Kong default on
-// --target-chunk-size to table.DefaultTargetChunkBytes (the Kong tag must be a
-// literal, so this guards against drift from the constant).
-func TestMoveTargetChunkSizeKongDefault(t *testing.T) {
-	t.Parallel()
-	field, ok := reflect.TypeFor[Move]().FieldByName("TargetChunkSize")
-	require.True(t, ok)
-	require.Equal(t,
-		strconv.FormatUint(table.DefaultTargetChunkBytes, 10),
-		field.Tag.Get("default"),
-		"Kong default for --target-chunk-size must equal table.DefaultTargetChunkBytes")
 }
 
 // TestMoveWithConcurrentWrites verifies move behavior under lots of concurrent
@@ -124,8 +111,7 @@ func testMoveWithConcurrentWrites(t *testing.T, deferSecondaryIndexes bool) {
 	move := &Move{
 		SourceDSN:             sourceDSN,
 		TargetDSN:             targetDSN,
-		Threads:               2,
-		WriteThreads:          2,
+		Common:                flags.Common{Threads: 2, WriteThreads: 2},
 		DeferCutOver:          false,
 		DeferSecondaryIndexes: deferSecondaryIndexes,
 	}
@@ -303,8 +289,7 @@ func TestMoveWithNewTableCreation(t *testing.T) {
 	move := Move{
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
-		Threads:      2,
-		WriteThreads: 2,
+		Common:       flags.Common{Threads: 2, WriteThreads: 2},
 		DeferCutOver: true,
 	}
 	wg.Go(func() {
@@ -386,8 +371,7 @@ func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
-		Threads:      2,
-		WriteThreads: 2,
+		Common:       flags.Common{Threads: 2, WriteThreads: 2},
 		DeferCutOver: true,
 	})
 	require.NoError(t, err)
@@ -522,10 +506,9 @@ func TestMoveResumeDeletesRecopyRange(t *testing.T) {
 		"SELECT MAX(id), COUNT(*) FROM t1").Scan(&srcMaxID, &srcCount))
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -633,11 +616,10 @@ func TestMoveForceWipesUnresumableTarget(t *testing.T) {
 
 	newMove := func(force bool) *Move {
 		return &Move{
-			SourceDSN:    sourceDSN,
-			TargetDSN:    targetDSN,
-			Threads:      2,
-			WriteThreads: 2,
-			Force:        force,
+			SourceDSN: sourceDSN,
+			TargetDSN: targetDSN,
+			Common:    flags.Common{Threads: 2, WriteThreads: 2},
+			Force:     force,
 		}
 	}
 
@@ -697,10 +679,9 @@ func TestMoveRetryBeforeFirstCheckpointStartsFresh(t *testing.T) {
 
 	newMove := func() *Move {
 		return &Move{
-			SourceDSN:    sourceDSN,
-			TargetDSN:    targetDSN,
-			Threads:      2,
-			WriteThreads: 2,
+			SourceDSN: sourceDSN,
+			TargetDSN: targetDSN,
+			Common:    flags.Common{Threads: 2, WriteThreads: 2},
 		}
 	}
 
@@ -779,11 +760,10 @@ func TestConcurrentMoveDoesNotWipeTarget(t *testing.T) {
 	// target is exactly the state --force wipes — but B must fail on the
 	// advisory lock before it gets the chance.
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      2,
-		WriteThreads: 2,
-		Force:        true,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
+		Force:     true,
 	}
 	err = move.Run()
 	require.Error(t, err)
@@ -852,8 +832,7 @@ func TestMoveWithVarcharPK(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
-		Threads:      2,
-		WriteThreads: 2,
+		Common:       flags.Common{Threads: 2, WriteThreads: 2},
 		DeferCutOver: true,
 	})
 	require.NoError(t, err)
@@ -1042,10 +1021,9 @@ func TestResumeFromCheckpointMultiTableE2E(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO "+srcDB+".t2 VALUES ('a','1'), ('b','2'), ('c','3'), ('d','4'), ('e','5')")
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -1112,10 +1090,9 @@ func TestResumeFromCheckpointCompositePKE2E(t *testing.T) {
 	}
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -1194,8 +1171,7 @@ func TestMultiSourceResumeFromCheckpointE2E(t *testing.T) {
 	move := &Move{
 		SourceDSNs:   []string{testutils.DSNForDatabase(srcAName), testutils.DSNForDatabase(srcBName)},
 		TargetDSN:    testutils.DSNForDatabase(tgtName),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		SourceTables: []string{"users"},
 	}
 	checkpointAndStop(t, move)
@@ -1273,8 +1249,7 @@ func TestMultiSourceResumeDiscardsChecksumWatermark(t *testing.T) {
 	move := &Move{
 		SourceDSNs:   []string{testutils.DSNForDatabase(srcAName), testutils.DSNForDatabase(srcBName)},
 		TargetDSN:    testutils.DSNForDatabase(tgtName),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		SourceTables: []string{"users"},
 	}
 	checkpointAndStop(t, move)
@@ -1350,10 +1325,9 @@ func TestSingleSourceResumeKeepsChecksumWatermark(t *testing.T) {
 	seedUsersRange(t, srcName, 1, 2399) // 1200 rows
 
 	move := &Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		TargetDSN:    testutils.DSNForDatabase(tgtName),
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(tgtName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -1610,10 +1584,9 @@ func TestResumeFromCheckpointTooOld(t *testing.T) {
 	}
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -1655,10 +1628,9 @@ func TestResumeFromCheckpointNotTooOld(t *testing.T) {
 	}
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -1695,10 +1667,9 @@ func TestResumeFromCheckpointRefusesSourceTrigger(t *testing.T) {
 	}
 
 	move := &Move{
-		SourceDSN:    testutils.DSNForDatabase(srcDB),
-		TargetDSN:    testutils.DSNForDatabase(dstDB),
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: testutils.DSNForDatabase(srcDB),
+		TargetDSN: testutils.DSNForDatabase(dstDB),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -1811,9 +1782,8 @@ func TestMoveForcePreservesTargetOnSourceSideFailure(t *testing.T) {
 			SourceDSN: sourceDSN,
 			TargetDSN: targetDSN,
 
-			Threads:      2,
-			WriteThreads: 2,
-			Force:        true,
+			Common: flags.Common{Threads: 2, WriteThreads: 2},
+			Force:  true,
 		}
 	}
 
@@ -1876,8 +1846,7 @@ func testForceRecoversUnresumableCheckpoint(t *testing.T, suffix string, corrupt
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
 
-		Threads:      1,
-		WriteThreads: 1,
+		Common: flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 	corrupt(dstDB)

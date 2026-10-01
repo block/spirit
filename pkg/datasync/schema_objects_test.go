@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -41,8 +42,7 @@ func newSchemaObjectsSync(src, dest *mysql.Config) *Sync {
 	return &Sync{
 		SourceDSN:     src.FormatDSN(),
 		TargetDSN:     dest.FormatDSN(),
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		FlushInterval: 100 * time.Millisecond,
 	}
 }

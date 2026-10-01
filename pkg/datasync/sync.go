@@ -34,6 +34,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/utils"
 )
 
@@ -42,26 +43,13 @@ import (
 // programmatic callers (e.g. a Vitess VStream import) that
 // inject a non-MySQL change source and/or a custom applier.
 type Sync struct {
-	// EnableExperimentalAutoscaling derives bounded copy/checksum concurrency
-	// from the Aurora target and adapts it to target load throughout the sync.
-	EnableExperimentalAutoscaling bool `name:"enable-experimental-autoscaling" help:"EXPERIMENTAL: scale copy, write and checksum concurrency using Aurora target load. Overrides --threads and --write-threads when the target qualifies." default:"false"`
+	// Common holds the flags shared with migrate and move: thread counts,
+	// --max-connections (each source and target pool), --max-commit-latency,
+	// autoscaling, lock timeouts and TLS.
+	flags.Common
 
-	// MaxCommitLatency throttles when the target's average commit latency
-	// exceeds this threshold. Same semantics as migrate's --max-commit-latency:
-	// auto-enabled only on Aurora targets, and zero disables it. See issue #468.
-	MaxCommitLatency time.Duration `name:"max-commit-latency" help:"Throttle when the target's average commit latency exceeds this threshold (currently only auto-enabled on Aurora)" optional:"" default:"100ms"`
-
-	// MaxConnections limits each SQL pool; worker counts do not expand it.
-	MaxConnections int    `name:"max-connections" help:"Size of each source and target SQL connection pool. Workers share the pool and contend for connections." default:"128"`
-	SourceDSN      string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
-	TargetDSN      string `name:"target-dsn" help:"Where to sync the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
-	// TargetChunkSize is the in-memory byte budget the buffered copier sizes each
-	// copy chunk against (see table.DefaultTargetChunkBytes). Sync always uses the
-	// buffered copier. A zero value means "use the default" (the runner fills it
-	// in). The Kong default below must stay equal to table.DefaultTargetChunkBytes.
-	TargetChunkSize uint64 `name:"target-chunk-size" help:"In-memory byte budget per copy chunk (in bytes)." default:"16777216"`
-	Threads         int    `name:"threads" help:"How many chunks to copy in parallel during the initial copy." default:"4"`
-	WriteThreads    int    `name:"write-threads" help:"How many concurrent write threads to use on the target." default:"4"`
+	SourceDSN string `name:"source-dsn" help:"Where to sync the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
+	TargetDSN string `name:"target-dsn" help:"Where to sync the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
 	// FlushInterval controls how often buffered changes are applied to the
 	// target during continuous sync — i.e. the replication latency vs.
 	// batching trade-off. Defaults to change.DefaultFlushInterval.
@@ -119,11 +107,8 @@ type Sync struct {
 // not rejected here; only explicitly-negative or otherwise invalid values
 // are caught. Mirrors migration.Migration.Validate.
 func (s *Sync) Validate() error {
-	if s.Threads < 0 {
-		return fmt.Errorf("--threads must be non-negative, got %d", s.Threads)
-	}
-	if s.WriteThreads < 0 {
-		return fmt.Errorf("--write-threads must be non-negative, got %d", s.WriteThreads)
+	if err := s.Common.Validate(); err != nil {
+		return err
 	}
 	if s.FlushInterval < 0 {
 		return fmt.Errorf("--flush-interval must be non-negative, got %s", s.FlushInterval)

@@ -8,6 +8,7 @@ import (
 	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -237,10 +238,8 @@ func TestValidateMaxConnections(t *testing.T) {
 	// with the thread counts filled in. Mirror that.
 	valid := func(maxConnections int) *Migration {
 		return &Migration{
-			Statement:      "ALTER TABLE t1 ENGINE=InnoDB",
-			Threads:        4,
-			WriteThreads:   4,
-			MaxConnections: maxConnections,
+			Statement: "ALTER TABLE t1 ENGINE=InnoDB",
+			Common:    flags.Common{Threads: 4, WriteThreads: 4, MaxConnections: maxConnections},
 		}
 	}
 
@@ -271,7 +270,7 @@ func TestValidateMaxConnections(t *testing.T) {
 	// A zero Threads means "use the default", and Validate runs before
 	// normalizeOptions fills it in. Checking the 0 rather than the 4 it becomes
 	// would accept a pool the migration then stalls on.
-	unset := valid(defaultThreads + minChecksumPhaseReserve - 1)
+	unset := valid(flags.DefaultThreads + minChecksumPhaseReserve - 1)
 	unset.Threads = 0
 	require.ErrorContains(t, unset.Validate(), "below what the checksum phase needs",
 		"an unset --threads must be validated as the default it resolves to")

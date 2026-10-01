@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -137,14 +138,13 @@ func TestReplicaTLSIntegrationScenarios(t *testing.T) {
 			// Create migration with TLS configuration
 			sanitizedName := sanitizeColumnName(scenario.name)
 			migration := &Migration{
-				Host:               cfg.Addr,
-				Username:           cfg.User,
-				Password:           &cfg.Passwd,
-				Database:           cfg.DBName,
-				Statement:          "ALTER TABLE test_tls_table ADD COLUMN test_col_" + sanitizedName + " VARCHAR(50)",
-				TLSMode:            scenario.mainTLSMode,
-				TLSCertificatePath: scenario.mainTLSCert,
-				ReplicaDSN:         scenario.replicaDSN,
+				Host:       cfg.Addr,
+				Username:   cfg.User,
+				Password:   &cfg.Passwd,
+				Database:   cfg.DBName,
+				Statement:  "ALTER TABLE test_tls_table ADD COLUMN test_col_" + sanitizedName + " VARCHAR(50)",
+				Common:     flags.Common{TLSMode: scenario.mainTLSMode, TLSCertificatePath: scenario.mainTLSCert},
+				ReplicaDSN: scenario.replicaDSN,
 			}
 
 			// Create runner to test TLS configuration
@@ -225,14 +225,13 @@ func TestTLSConfigurationFlow(t *testing.T) {
 		{
 			name: "End-to-end REQUIRED mode flow",
 			migration: &Migration{
-				Host:               cfg.Addr,
-				Username:           cfg.User,
-				Password:           &cfg.Passwd,
-				Database:           cfg.DBName,
-				Statement:          "ALTER TABLE test_table ADD COLUMN flow_test VARCHAR(50)",
-				TLSMode:            "REQUIRED",
-				TLSCertificatePath: tempCertFile,
-				ReplicaDSN:         "replica:pass@tcp(replica.example.com:3306)/testdb",
+				Host:       cfg.Addr,
+				Username:   cfg.User,
+				Password:   &cfg.Passwd,
+				Database:   cfg.DBName,
+				Statement:  "ALTER TABLE test_table ADD COLUMN flow_test VARCHAR(50)",
+				Common:     flags.Common{TLSMode: "REQUIRED", TLSCertificatePath: tempCertFile},
+				ReplicaDSN: "replica:pass@tcp(replica.example.com:3306)/testdb",
 			},
 			expectMainTLS:    "required",
 			expectReplicaTLS: "required",
@@ -241,14 +240,13 @@ func TestTLSConfigurationFlow(t *testing.T) {
 		{
 			name: "End-to-end PREFERRED mode flow",
 			migration: &Migration{
-				Host:               cfg.Addr,
-				Username:           cfg.User,
-				Password:           &cfg.Passwd,
-				Database:           cfg.DBName,
-				Statement:          "ALTER TABLE test_table ADD COLUMN flow_test VARCHAR(50)",
-				TLSMode:            "PREFERRED",
-				TLSCertificatePath: tempCertFile,
-				ReplicaDSN:         "replica:pass@tcp(replica.example.com:3306)/testdb",
+				Host:       cfg.Addr,
+				Username:   cfg.User,
+				Password:   &cfg.Passwd,
+				Database:   cfg.DBName,
+				Statement:  "ALTER TABLE test_table ADD COLUMN flow_test VARCHAR(50)",
+				Common:     flags.Common{TLSMode: "PREFERRED", TLSCertificatePath: tempCertFile},
+				ReplicaDSN: "replica:pass@tcp(replica.example.com:3306)/testdb",
 			},
 			expectMainTLS:    "custom",
 			expectReplicaTLS: "custom",
@@ -257,14 +255,13 @@ func TestTLSConfigurationFlow(t *testing.T) {
 		{
 			name: "End-to-end with explicit replica TLS override",
 			migration: &Migration{
-				Host:               cfg.Addr,
-				Username:           cfg.User,
-				Password:           &cfg.Passwd,
-				Database:           cfg.DBName,
-				Statement:          "ALTER TABLE test_table ADD COLUMN flow_test VARCHAR(50)",
-				TLSMode:            "VERIFY_IDENTITY",
-				TLSCertificatePath: tempCAFile,
-				ReplicaDSN:         "replica:pass@tcp(replica.example.com:3306)/testdb?tls=false",
+				Host:       cfg.Addr,
+				Username:   cfg.User,
+				Password:   &cfg.Passwd,
+				Database:   cfg.DBName,
+				Statement:  "ALTER TABLE test_table ADD COLUMN flow_test VARCHAR(50)",
+				Common:     flags.Common{TLSMode: "VERIFY_IDENTITY", TLSCertificatePath: tempCAFile},
+				ReplicaDSN: "replica:pass@tcp(replica.example.com:3306)/testdb?tls=false",
 			},
 			expectMainTLS:    "verify_identity",
 			expectReplicaTLS: "false",
@@ -324,14 +321,13 @@ func TestTLSErrorHandling(t *testing.T) {
 		{
 			name: "Invalid replica DSN should be handled gracefully",
 			migration: &Migration{
-				Host:               cfg.Addr,
-				Username:           cfg.User,
-				Password:           &cfg.Passwd,
-				Database:           cfg.DBName,
-				Statement:          "ALTER TABLE test_table ADD COLUMN error_test VARCHAR(50)",
-				TLSMode:            "REQUIRED",
-				TLSCertificatePath: "",
-				ReplicaDSN:         "invalid-dsn-format",
+				Host:       cfg.Addr,
+				Username:   cfg.User,
+				Password:   &cfg.Passwd,
+				Database:   cfg.DBName,
+				Statement:  "ALTER TABLE test_table ADD COLUMN error_test VARCHAR(50)",
+				Common:     flags.Common{TLSMode: "REQUIRED", TLSCertificatePath: ""},
+				ReplicaDSN: "invalid-dsn-format",
 			},
 			expectError: false, // Should handle gracefully, not error
 			description: "Invalid replica DSN should be handled gracefully",
@@ -339,14 +335,13 @@ func TestTLSErrorHandling(t *testing.T) {
 		{
 			name: "Missing TLS certificate file should be handled",
 			migration: &Migration{
-				Host:               cfg.Addr,
-				Username:           cfg.User,
-				Password:           &cfg.Passwd,
-				Database:           cfg.DBName,
-				Statement:          "ALTER TABLE test_table ADD COLUMN error_test VARCHAR(50)",
-				TLSMode:            "VERIFY_IDENTITY",
-				TLSCertificatePath: "/nonexistent/cert.pem",
-				ReplicaDSN:         "replica:pass@tcp(replica.example.com:3306)/testdb",
+				Host:       cfg.Addr,
+				Username:   cfg.User,
+				Password:   &cfg.Passwd,
+				Database:   cfg.DBName,
+				Statement:  "ALTER TABLE test_table ADD COLUMN error_test VARCHAR(50)",
+				Common:     flags.Common{TLSMode: "VERIFY_IDENTITY", TLSCertificatePath: "/nonexistent/cert.pem"},
+				ReplicaDSN: "replica:pass@tcp(replica.example.com:3306)/testdb",
 			},
 			expectError: false, // Configuration should still work, connection might fail later
 			description: "Missing TLS certificate should not prevent configuration",
@@ -380,14 +375,13 @@ func TestConcurrentTLSConfiguration(t *testing.T) {
 	// Create multiple runners with different TLS configurations
 	for i := range numRunners {
 		migration := &Migration{
-			Host:               cfg.Addr,
-			Username:           cfg.User,
-			Password:           &cfg.Passwd,
-			Database:           cfg.DBName,
-			Statement:          "ALTER TABLE test_table ADD COLUMN concurrent_test VARCHAR(50)",
-			TLSMode:            []string{"DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}[i%5],
-			TLSCertificatePath: "",
-			ReplicaDSN:         "replica:pass@tcp(replica.example.com:3306)/testdb",
+			Host:       cfg.Addr,
+			Username:   cfg.User,
+			Password:   &cfg.Passwd,
+			Database:   cfg.DBName,
+			Statement:  "ALTER TABLE test_table ADD COLUMN concurrent_test VARCHAR(50)",
+			Common:     flags.Common{TLSMode: []string{"DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"}[i%5], TLSCertificatePath: ""},
+			ReplicaDSN: "replica:pass@tcp(replica.example.com:3306)/testdb",
 		}
 
 		runner, err := NewRunner(migration)

@@ -11,6 +11,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -39,13 +40,12 @@ func setupRunnerForChecksumTest(t *testing.T, tableName string) *Runner {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	r, err := NewRunner(&Migration{
-		Host:         cfg.Addr,
-		Username:     cfg.User,
-		Password:     &cfg.Passwd,
-		Database:     cfg.DBName,
-		Threads:      1,
-		WriteThreads: 1,
-		Statement:    fmt.Sprintf("ALTER TABLE %s ENGINE=InnoDB", tableName),
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+		Statement: fmt.Sprintf("ALTER TABLE %s ENGINE=InnoDB", tableName),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(r) })

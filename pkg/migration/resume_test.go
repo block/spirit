@@ -24,6 +24,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -162,8 +163,7 @@ func TestCheckpoint(t *testing.T) {
 			Username:      cfg.User,
 			Password:      &cfg.Passwd,
 			Database:      cfg.DBName,
-			Threads:       1,
-			WriteThreads:  1,
+			Common:        flags.Common{Threads: 1, WriteThreads: 1},
 			Statement:     "ALTER TABLE cpt1 ENGINE=InnoDB",
 			testThrottler: &throttler.Mock{},
 		})
@@ -373,13 +373,12 @@ func TestCheckpointRestore(t *testing.T) {
 	require.NoError(t, err)
 
 	r, err := NewRunner(&Migration{
-		Host:         cfg.Addr,
-		Username:     cfg.User,
-		Password:     &cfg.Passwd,
-		Database:     cfg.DBName,
-		Threads:      2,
-		WriteThreads: 2,
-		Statement:    "ALTER TABLE cpt2 ENGINE=InnoDB",
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
+		Statement: "ALTER TABLE cpt2 ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	require.Equal(t, "initial", r.status.Get().String())
@@ -415,13 +414,12 @@ func TestCheckpointRestore(t *testing.T) {
 	require.NoError(t, r.Close())
 
 	r2, err := NewRunner(&Migration{
-		Host:         cfg.Addr,
-		Username:     cfg.User,
-		Password:     &cfg.Passwd,
-		Database:     cfg.DBName,
-		Threads:      2,
-		WriteThreads: 2,
-		Statement:    "ALTER TABLE cpt2 ENGINE=InnoDB",
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
+		Statement: "ALTER TABLE cpt2 ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	require.NoError(t, r2.Run(t.Context()))
@@ -554,13 +552,12 @@ func TestCheckpointDifferentRestoreOptions(t *testing.T) {
 	// fresh — see TestResumeFromCheckpointCleanupOnFailure). This check is
 	// copier-agnostic, so the runner uses the default buffered copier.
 	m2, err := NewRunner(&Migration{
-		Host:         cfg.Addr,
-		Username:     cfg.User,
-		Password:     &cfg.Passwd,
-		Database:     cfg.DBName,
-		Threads:      2,
-		WriteThreads: 2,
-		Statement:    "ALTER TABLE cpt1difft1 ADD COLUMN id4 INT NOT NULL DEFAULT 0, ADD INDEX(id2)",
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
+		Statement: "ALTER TABLE cpt1difft1 ADD COLUMN id4 INT NOT NULL DEFAULT 0, ADD INDEX(id2)",
 	})
 	require.NoError(t, err)
 	m2.db, err = dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
@@ -940,13 +937,12 @@ func TestResumeTransientErrorPreservesState(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	r, err := NewRunner(&Migration{
-		Host:         cfg.Addr,
-		Username:     cfg.User,
-		Password:     &cfg.Passwd,
-		Database:     cfg.DBName,
-		Threads:      1,
-		WriteThreads: 1,
-		Statement:    "ALTER TABLE transientresume ENGINE=InnoDB",
+		Host:      cfg.Addr,
+		Username:  cfg.User,
+		Password:  &cfg.Passwd,
+		Database:  cfg.DBName,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+		Statement: "ALTER TABLE transientresume ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
 	r.dbConfig = dbconn.NewDBConfig()

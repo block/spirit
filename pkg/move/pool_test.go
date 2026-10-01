@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/require"
 )
@@ -19,9 +20,9 @@ func TestMoveConnectionBudget(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "128", field.Tag.Get("default"))
 	for _, budget := range []int{-1, 4, 7} {
-		require.Error(t, (&Move{Threads: 2, MaxConnections: budget}).Validate())
+		require.Error(t, (&Move{Common: flags.Common{Threads: 2, MaxConnections: budget}}).Validate())
 	}
-	require.NoError(t, (&Move{Threads: 2, MaxConnections: 8, WriteThreads: 100}).Validate())
+	require.NoError(t, (&Move{Common: flags.Common{Threads: 2, MaxConnections: 8, WriteThreads: 100}}).Validate())
 	r.move.MaxConnections = 8
 	r.move.Threads = 16
 	r.move.WriteThreads = 100
@@ -35,7 +36,7 @@ func TestMoveConnectionBudget(t *testing.T) {
 // reusing one handle cost one connection per worker. A handle that is both a
 // source and a target is read on both sides at once, so it costs two.
 func TestMoveSharedHandleBudget(t *testing.T) {
-	r, err := NewRunner(&Move{Threads: 4, MaxConnections: 16})
+	r, err := NewRunner(&Move{Common: flags.Common{Threads: 4, MaxConnections: 16}})
 	require.NoError(t, err)
 	db := new(sql.DB) // Identity only; this test performs no database operations.
 	r.targets = []applier.Target{{DB: db}, {DB: db}, {DB: db}}
@@ -51,7 +52,7 @@ func TestMoveSharedHandleBudget(t *testing.T) {
 }
 
 func TestMoveTableStatisticsReserve(t *testing.T) {
-	r, err := NewRunner(&Move{Threads: 4, MaxConnections: 12})
+	r, err := NewRunner(&Move{Common: flags.Common{Threads: 4, MaxConnections: 12}})
 	require.NoError(t, err) // Parse-time headroom fits, before table discovery.
 	r.sourceTables = make([]*table.TableInfo, 20)
 	require.NoError(t, r.fitReadThreadsToPools())

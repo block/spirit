@@ -12,6 +12,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -41,8 +42,7 @@ func TestMoveRefusesTargetTriggerOnPrecreatedTable(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSN:    testutils.DSNForDatabase(src),
 		TargetDSN:    testutils.DSNForDatabase(dst),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		SourceTables: []string{"orders"},
 	})
 	require.NoError(t, err)
@@ -70,10 +70,9 @@ func TestMoveRefusesTargetEvent(t *testing.T) {
 	testutils.RunSQLInDatabaseAsRoot(t, dstName, "CREATE EVENT orders_e ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM orders")
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(dstName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)
@@ -117,8 +116,7 @@ func TestShardedMoveRefusesTargetTriggerOnOneShard(t *testing.T) {
 
 	runner, err := NewRunner(&Move{
 		SourceDSN:        testutils.DSNForDatabase(srcName),
-		Threads:          1,
-		WriteThreads:     1,
+		Common:           flags.Common{Threads: 1, WriteThreads: 1},
 		ShardingProvider: &testShardingProvider{shardingColumn: "user_id", hashFunc: testutils.EvenOddHasher},
 		Targets:          targets,
 	})
@@ -157,10 +155,9 @@ func TestResumeFromCheckpointRefusesTargetTrigger(t *testing.T) {
 	}
 
 	move := &Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(dstName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	checkpointAndStop(t, move)
 
@@ -209,8 +206,7 @@ func TestMoveCutoverRefusesTargetTriggerUnderLock(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSN:    testutils.DSNForDatabase(srcName),
 		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		DeferCutOver: true,
 	})
 	require.NoError(t, err)
@@ -258,10 +254,9 @@ func TestEmptySourceMoveRefusesTargetEvent(t *testing.T) {
 	testutils.RunSQLInDatabaseAsRoot(t, dstName, "CREATE EVENT orders_e ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(dstName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)

@@ -10,6 +10,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -84,8 +85,7 @@ func TestShardedMove(t *testing.T) {
 	// Configure the move with multiple targets
 	move := &Move{
 		SourceDSN:        sourceDSN,
-		Threads:          2,
-		WriteThreads:     2,
+		Common:           flags.Common{Threads: 2, WriteThreads: 2},
 		ShardingProvider: shardingProvider,
 		Targets: []applier.Target{
 			{
@@ -193,8 +193,7 @@ func TestNtoMShardedMove(t *testing.T) {
 
 	move := &Move{
 		SourceDSNs:   []string{src0DSN, src1DSN},
-		Threads:      2,
-		WriteThreads: 2,
+		Common:       flags.Common{Threads: 2, WriteThreads: 2},
 		Targets:      targets,
 		SourceTables: []string{"users"},
 		ShardingProvider: &testShardingProvider{
@@ -317,8 +316,7 @@ func TestNtoMShardedMoveCheckpointDeterminism(t *testing.T) {
 
 	move := &Move{
 		SourceDSNs:   reversedDSNs,
-		Threads:      2,
-		WriteThreads: 2,
+		Common:       flags.Common{Threads: 2, WriteThreads: 2},
 		Targets:      reversedTargets,
 		SourceTables: []string{"users"},
 		ShardingProvider: &testShardingProvider{
@@ -384,9 +382,8 @@ func TestShardedMoveVindexUpdateFails(t *testing.T) {
 	require.NoError(t, err)
 
 	move := &Move{
-		SourceDSN:    testutils.DSNForDatabase(srcName),
-		Threads:      2,
-		WriteThreads: 2,
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 		// The sentinel blocks the move before cutover, giving the test a
 		// deterministic window in which the repl client is streaming.
 		DeferCutOver: true,

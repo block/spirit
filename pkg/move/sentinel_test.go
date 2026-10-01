@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -56,8 +57,7 @@ func TestMoveSentinelDropReleasesCutover(t *testing.T) {
 	m := &Move{
 		SourceDSN:    src.FormatDSN(),
 		TargetDSN:    dst.FormatDSN(),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		DeferCutOver: true,
 	}
 	runner, err := NewRunner(m)
@@ -122,8 +122,7 @@ func TestMoveContinuousChecksumAbortsThenResumeRepairs(t *testing.T) {
 	move := &Move{
 		SourceDSN:    testutils.DSNForDatabase(srcDB),
 		TargetDSN:    testutils.DSNForDatabase(dstDB),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		DeferCutOver: true,
 	}
 

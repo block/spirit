@@ -16,11 +16,11 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/buildinfo"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/concurrency"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -35,12 +35,6 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"golang.org/x/sync/errgroup"
 )
-
-// defaultWriteThreads must match the `default:"4"` kong tag on
-// Move.WriteThreads, so a programmatic caller that leaves the field unset lands
-// on the same value the CLI does.
-const defaultWriteThreads = 4
-const defaultThreads = 2
 
 // As in migration, reserve checksum repair/prefetch, checkpoint/flush polling,
 // at least one statistics query, and a drain connection. The runtime reserve
@@ -244,12 +238,7 @@ func NewRunner(m *Move) (*Runner, error) {
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
-	if m.MaxConnections == 0 {
-		m.MaxConnections = dbconn.DefaultMaxConnections
-	}
-	if m.Threads == 0 {
-		m.Threads = defaultThreads
-	}
+	m.Normalize(slog.Default())
 
 	// Normalize CheckpointMaxAge here rather than in a Validate hook:
 	// orchestration callers construct Move programmatically (bypassing the
@@ -260,18 +249,6 @@ func NewRunner(m *Move) (*Runner, error) {
 	}
 	if m.CheckpointMaxAge == 0 {
 		m.CheckpointMaxAge = 7 * 24 * time.Hour // 7 days, same as migrate
-	}
-	if m.TargetChunkSize == 0 {
-		m.TargetChunkSize = table.DefaultTargetChunkBytes
-	}
-	// WriteThreads has no "0 means auto" meaning any more, so fill in the Kong
-	// default for programmatic callers as well. Warn on
-	// an explicit 0, which used to mean "size from the instance" and would
-	// otherwise silently become 4.
-	if m.WriteThreads == 0 {
-		slog.Default().Warn("--write-threads 0 no longer means auto-size; using the default",
-			"write_threads", defaultWriteThreads)
-		m.WriteThreads = defaultWriteThreads
 	}
 	r := &Runner{
 		move:                m,
@@ -863,59 +840,35 @@ func (r *Runner) applyAuroraResults(ctx context.Context, groups []host.Group, re
 	return r.setupAutoscaling(ctx, groups, results)
 }
 
-// setupAutoscaling derives thread counts from the targets. results holds each
-// host group's probe from setupThrottling. All targets must supply a usable
-// signal before we override the configured thread counts; move's only policy
-// difference from migration is conservative, lockstep scaling across targets
-// (#1212).
+// setupAutoscaling derives thread counts from the targets (concurrency.Engage).
+// results holds each host group's probe from setupThrottling. All targets must
+// supply a usable signal before we override the configured thread counts;
+// move's only policy difference from migration is conservative, lockstep
+// scaling across targets (#1212), which Engage derives from the host groups.
 func (r *Runner) setupAutoscaling(ctx context.Context, groups []host.Group, results []throttler.AuroraResult) error {
-	if !r.move.EnableExperimentalAutoscaling {
-		return nil
-	}
-	redoAware := false
-	for i, group := range groups {
-		target := r.targets[group.Indices[0]]
-		// The policy is the same either way — all targets or none, since the
-		// controller scales them in lockstep — but the two causes are not. A
-		// probe that failed is something an operator needs to act on (locked-down
-		// perf_schema, an under-granted monitor user); a target that is simply
-		// not Aurora is an ordinary configuration, so it does not warn.
-		switch {
-		case results[i].ProbeErr != nil:
-			r.logger.Warn("move autoscaling disabled: could not determine whether the target is Aurora; thread counts stay as configured",
-				"target", targetKey(target), "error", results[i].ProbeErr.Error())
-			return nil
-		case len(results[i].Throttlers) == 0:
-			r.logger.Info("move autoscaling disabled: every target must provide an Aurora load signal; thread counts stay as configured",
-				"target", targetKey(target))
-			return nil
-		}
-		// One redo-aware target is enough to need the backstop: the composite
-		// signal cannot see that target's redo log oversubscribed.
-		redoAware = redoAware || results[i].RedoAware
-	}
-	vcpus := make([]int, len(groups))
-	for i, group := range groups {
-		target := r.targets[group.Indices[0]]
-		var err error
-		vcpus[i], err = r.auroraVCPUs(ctx, target.DB)
-		if err != nil {
-			return fmt.Errorf("target %s CPU capacity: %w", targetKey(target), err)
+	var targets []concurrency.Target
+	if r.move.EnableExperimentalAutoscaling {
+		for i, group := range groups {
+			target := r.targets[group.Indices[0]]
+			targets = append(targets, concurrency.Target{
+				DB:     target.DB,
+				Aurora: results[i],
+				Shards: len(group.Indices),
+				Name:   targetKey(target),
+			})
 		}
 	}
-	readStart, config := moveAutoscaleBounds(vcpus, groups, autoscale.ClientCeiling(), redoAware, r.move.MaxCommitLatency > 0)
-	if !config.Enabled {
-		r.logger.Warn("move autoscaling disabled: target too small", "vcpus", vcpus, "min_vcpus", autoscale.MinVCPUs)
-		return nil
+	plan, err := concurrency.Engage(ctx, &r.move.Common, concurrency.Request{
+		Targets: targets,
+		Sources: len(r.sources),
+		VCPUs:   r.auroraVCPUs,
+		Logger:  r.logger,
+	})
+	if err != nil || !plan.Engaged {
+		return err
 	}
-	r.autoscale = config
-	r.move.Threads = readStart
-	r.move.WriteThreads = config.StartThreads
-	r.flushConcurrency, r.flushBatchSize = moveFlushBounds(vcpus, groups, len(r.sources), autoscale.ClientCeiling())
-	r.logger.Info("move autoscaling engaged: busiest target controls all shard pools; --threads and --write-threads are ignored",
-		"threads", readStart, "max_read_threads", config.MaxReadThreads,
-		"write_threads_per_target", config.StartThreads, "max_write_threads_per_target", config.MaxThreads,
-		"flush_concurrency", r.flushConcurrency, "flush_batch_size", r.flushBatchSize)
+	r.autoscale = plan.Copier()
+	r.flushConcurrency, r.flushBatchSize = plan.FlushConcurrency, plan.FlushBatchSize
 	return nil
 }
 
@@ -1379,7 +1332,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	r.dbConfig = dbconn.NewDBConfig()
 	// ForceKill is now true by default in NewDBConfig(), no need to set explicitly.
 	// Worker counts do not grow the configured connection pools.
-	r.dbConfig.MaxOpenConnections = r.move.MaxConnections
+	r.move.ApplyTo(r.dbConfig)
 
 	// Build the list of source DSNs. If SourceDSNs is set (N:M), use it.
 	// Otherwise, use SourceDSN as the single source (backward compat).

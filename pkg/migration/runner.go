@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,11 +14,11 @@ import (
 	"github.com/block/mysql"
 
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/buildinfo"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/concurrency"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -61,6 +60,16 @@ type Runner struct {
 	// throttling is enabled.
 	monitorDB       *sql.DB
 	checkpointTable *table.TableInfo
+
+	// aurora is the target's Aurora probe, built once by setupAutoscaling
+	// before the copier exists. setupThrottler installs its throttlers, and
+	// autoscale is sized from the same result, so the signal autoscaling scales
+	// against is the one throttling the migration. Its MonitorDB is owned by
+	// monitorDB from the moment it is built.
+	aurora throttler.AuroraResult
+	// autoscale is the outcome of concurrency.Engage. Zero (not Engaged)
+	// unless autoscaling was requested and the target qualified.
+	autoscale concurrency.Plan
 
 	// Changes enccapsulates all changes
 	// With a stmt, alter, table, newTable.
@@ -392,15 +401,10 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// It will be closed in r.Close()
 	var err error
 	r.dbConfig = dbconn.NewDBConfig()
-	if r.migration.LockWaitTimeout > 0 {
-		r.dbConfig.LockWaitTimeout = int(r.migration.LockWaitTimeout.Seconds())
-	}
-	r.dbConfig.ForceKillAfter = r.migration.ForceKillAfter
+	// Lock timeouts, TLS and the pool size come from the shared flags.
+	r.migration.ApplyTo(r.dbConfig)
 	r.dbConfig.InterpolateParams = r.migration.InterpolateParams
 	// ForceKill is always enabled for migrations (true by default in NewDBConfig).
-	// Map TLS configuration from migration to dbConfig
-	r.dbConfig.TLSMode = r.migration.TLSMode
-	r.dbConfig.TLSCertificatePath = r.migration.TLSCertificatePath
 	// The pool is --max-connections, verbatim and once. Nothing recomputes it,
 	// no phase ratchets it, and no ceiling derived later raises it — an operator
 	// budgeting against max_user_connections needs a number they can subtract.
@@ -817,197 +821,28 @@ func (r *Runner) checkpointTbl() *checkpoint.Table {
 func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosition, checksumWatermark string) error {
 	var err error
 
-	autoscaleEnabled := r.migration.EnableExperimentalAutoscaling
-	// redoAware tracks whether the Aurora threads throttler will run its
-	// redo-aware perf_schema signal (which excludes redo-log waiters). It gates
-	// the autoscaler's growth cap below: because that signal ignores redo-log
-	// waiters it will not self-limit if extra write threads oversubscribe the
-	// log, so growing above the start value needs the commit-latency throttler
-	// as the backstop. AuroraSetup.Build makes the authoritative mode choice
-	// (and logs it) when the throttler is built; this is an independent probe of
-	// the same source in the same setup phase, used only to size maxWrite here.
-	redoAware := false
-	// readCeiling is the upper bound for the read side (the copier's read workers
-	// and the checksum's workers). It stays zero unless it was derived from the
-	// instance below, which is also the marker for "nothing can grow" — see the
-	// maxRead fallback.
-	readCeiling := 0
-	// flushConcurrency and flushBatchSize shape the change-feed drain. Like
-	// readCeiling they stay zero unless derived from the instance below, and zero
-	// means "leave the change package's defaults alone" (see
-	// ClientConfig.resolveFlushConcurrency / resolveBatchSize). Unlike the read
-	// and write pools these are not autoscaled — the drain has its own AIMD
-	// controller keyed on lock contention — so this only moves the starting
-	// point.
-	flushConcurrency, flushBatchSize := 0, 0
-	// Aurora is the one place the autoscaler can engage at all: it needs the
-	// continuous signal only the Aurora throttlers provide. Below
-	// autoscale.MinVCPUs it must not engage even there — one thread is half or
-	// more of the dead band, so the controller could only oscillate.
-	//
-	// A probe failure disables autoscaling rather than falling through. It is a
-	// separate, uncached query from the one AuroraSetup.Build runs later, so a
-	// blip here does not stop the throttler from selecting a GradualThrottler
-	// that the copier would then scale against — with the flag-relative bounds
-	// this function exists to replace, and with both guards below skipped (the
-	// MinVCPUs check, and redoAware staying false so an unguarded redo log gets
-	// the 2x ceiling instead of the capped one). Autoscaling is an optimization
-	// and the guards are not, so an unreadable instance means fixed pools.
+	// The thread counts and bounds were settled once, before resume or a fresh
+	// migration started, by setupAutoscaling: when autoscaling engaged,
+	// r.migration.Threads and WriteThreads already hold the instance-derived
+	// starting sizes and r.autoscale holds the bounds. This function runs
+	// twice when a resume attempt fails and falls back to a fresh migration,
+	// and reads the same plan both times.
+	autoscaleEnabled := r.autoscale.Engaged
+	// When autoscaling did not engage no pool can grow, so provision the
+	// configured counts and no more. That matters most for the checksum, which
+	// turns its read ceiling into transactions started serially under the
+	// table lock whether or not scaling can ever reach it — capacity nothing
+	// can use, paid for in lock time.
+	maxRead, maxWrite := r.migration.Threads, r.migration.WriteThreads
 	if autoscaleEnabled {
-		isAurora, err := throttler.IsAurora(ctx, r.db)
-		switch {
-		case err != nil:
-			r.logger.Warn("autoscaling disabled: could not determine whether the target is Aurora; thread counts stay as configured",
-				"error", err.Error(),
-				"threads", r.migration.Threads,
-				"write_threads", r.migration.WriteThreads)
-			autoscaleEnabled = false
-		case !isAurora:
-			// Left enabled deliberately: the checksum's backlog veto works on any
-			// server, so the flag still buys shedding. Only growth needs Aurora,
-			// and the copier logs its own downgrade for the copy phase.
-		default:
-			vCPUs, err := throttler.AuroraVCPUs(ctx, r.db)
-			if err != nil {
-				return err
-			}
-			if vCPUs < autoscale.MinVCPUs {
-				r.logger.Warn("autoscaling disabled: instance is too small for the utilization signal to guide scaling; thread counts stay as configured",
-					"vcpus", vCPUs, "min_vcpus", autoscale.MinVCPUs,
-					"threads", r.migration.Threads,
-					"write_threads", r.migration.WriteThreads)
-				autoscaleEnabled = false
-				break
-			}
-			redoAware = throttler.CanReadRedoAwareThreads(ctx, r.db) == nil
-			// Autoscaling has engaged, so it owns the thread counts: --threads
-			// and --write-threads are ignored and both pools are sized from the
-			// instance instead. The alternative — honoring the flags as starting
-			// points — makes the outcome depend on a number the caller usually
-			// left at its default, and that default is what capped the checksum
-			// at 8 workers on a 24xlarge no matter how much headroom the signal
-			// reported. A controller that is told to find the right size should
-			// not also be told where to stop.
-			//
-			// The log line reports only the derived counts: this function runs
-			// twice when a resume attempt fails and falls back to a fresh
-			// migration, and by the second call the fields below hold the first
-			// call's derived values rather than anything the caller configured.
-			// The derivation is idempotent (same instance, same numbers), so the
-			// second line agreeing with the first is correct.
-			var readStart int
-			readStart, readCeiling = autoscale.ReadBounds(vCPUs)
-			writeStart := autoscale.WriteStart(vCPUs)
-
-			// Both derivations above size the pools from the target. That
-			// assumes a worker is mostly waiting on the server, which stops
-			// being true when spirit's own host is small — a worker also builds
-			// its statement locally, which is pure client CPU. Take the client
-			// ceiling so a small pod cannot derive a thread count it has no
-			// cores to run: the excess would add queueing and latency, and
-			// nothing on the target side can see it (its CPU and commit latency
-			// both read idle while spirit is the one saturated).
-			//
-			// Applied to the derived numbers only. An explicitly configured
-			// --threads/--write-threads above this is the caller's decision and
-			// is warned about, not overridden, below.
-			clientCeiling := autoscale.ClientCeiling()
-			cappedRead, cappedWrite := min(readStart, clientCeiling), min(writeStart, clientCeiling)
-			if cappedRead != readStart || cappedWrite != writeStart {
-				r.logger.Warn("thread counts capped by this host's CPU count: the target would justify more workers than spirit has cores to run them on. Give spirit more CPU to use the target's full capacity",
-					"gomaxprocs", runtime.GOMAXPROCS(0),
-					"client_ceiling", clientCeiling,
-					"read_threads", cappedRead, "instance_read_threads", readStart,
-					"write_threads", cappedWrite, "instance_write_threads", writeStart)
-				readStart, writeStart = cappedRead, cappedWrite
-			}
-			// The read ceiling is capped too, so the checksum does not
-			// pre-create transactions under the table lock for workers this
-			// host cannot drive — that ceiling is paid in lock time whether or
-			// not scaling reaches it. Unconditionally, not just when a start was
-			// clipped: with today's formulas the ceiling cannot exceed the
-			// client ceiling while both starts fit (that would need vCPUs <
-			// MinVCPUs), but that invariant lives in another package, and the
-			// write side's ceiling below is capped unconditionally too.
-			readCeiling = max(min(readCeiling, clientCeiling), readStart)
-
-			// Size the change-feed drain from the instance too. This is the one
-			// derivation here that is not a thread count: it returns a
-			// (concurrency, batch size) pair whose product — the rows one drain
-			// has in flight — is the same on every instance size. A larger
-			// instance buys more concurrent REPLACE statements, each holding
-			// proportionally fewer locks, not more rows at once. See
-			// autoscale.FlushBounds for why that trade is safe rather than
-			// merely faster.
-			//
-			// The same client-side bound applies: a flush batch is built by the
-			// same datum-to-string conversion a copy batch is, so it is subject
-			// to the same local-CPU limit. The batch size is re-paired to
-			// whatever concurrency survives the cap, which keeps the rows in
-			// flight where they were rather than silently reducing drain
-			// throughput on a small pod.
-			flushConcurrency, flushBatchSize = autoscale.FlushBounds(vCPUs)
-			if flushConcurrency > clientCeiling {
-				flushConcurrency = clientCeiling
-				flushBatchSize = autoscale.FlushBatchSize(flushConcurrency)
-			}
-			r.logger.Info("autoscaling engaged: thread counts are derived from the instance; --threads and --write-threads are ignored",
-				"vcpus", vCPUs,
-				"read_threads", readStart, "max_read_threads", readCeiling,
-				"write_threads", writeStart,
-				"flush_concurrency", flushConcurrency, "flush_batch_size", flushBatchSize)
-			r.migration.Threads = readStart
-			r.migration.WriteThreads = writeStart
-		}
-	}
-	// Resolve the autoscaler's upper bound. When autoscaling is disabled this
-	// equals WriteThreads (no movement). When enabled it is 2x the start value —
-	// except in redo-aware mode with the commit-latency backstop disabled
-	// (--max-commit-latency=0), where it stays at the start value so the
-	// autoscaler can shed but not oversubscribe the redo log unguarded (see
-	// ResolveMaxWriteThreads).
-	commitLatencyEnabled := r.migration.MaxCommitLatency > 0
-	maxWrite := throttler.ResolveMaxWriteThreads(r.migration.WriteThreads, autoscaleEnabled, redoAware, commitLatencyEnabled)
-	// The autoscaler's ceiling gets the same client-side bound as the start value:
-	// capping the start but letting growth walk past it would just re-arrive at a
-	// thread count this host cannot run, 15 seconds at a time. Never below the
-	// start value, which a pool cannot be controlled beneath.
-	if clientCeiling := autoscale.ClientCeiling(); maxWrite > clientCeiling {
-		maxWrite = max(clientCeiling, r.migration.WriteThreads)
-	}
-	// Configured counts are not overridden — an operator who names a number owns
-	// it — but the mismatch is worth saying once, since the symptom (flat
-	// throughput as threads rise, with an idle-looking target) is hard to read.
-	if configured := max(r.migration.Threads, r.migration.WriteThreads); configured > autoscale.ClientCeiling() {
-		r.logger.Warn("configured thread count is high for this host's CPU count; the extra workers may add latency without throughput",
-			"gomaxprocs", runtime.GOMAXPROCS(0),
-			"client_ceiling", autoscale.ClientCeiling(),
-			"threads", r.migration.Threads,
-			"write_threads", r.migration.WriteThreads)
-	}
-	// The read side's ceiling is half the instance when autoscaling engaged above
-	// (autoscale.ReadBounds).
-	//
-	// A zero readCeiling means the gate above did not derive one, which is also
-	// exactly the case where neither read pool can grow: growth needs the
-	// continuous signal only the Aurora throttlers supply, and if we could not
-	// confirm Aurora then neither the copier's autoscaler nor the checksum's will
-	// have a GradualThrottler to grow against. Provision the configured count and
-	// no more. That matters most for the checksum, which turns this ceiling into
-	// transactions started serially under the table lock whether or not scaling
-	// can ever reach it — capacity nothing can use, paid for in lock time. (The
-	// flag still buys the checksum its backlog-shedding veto there; only growth
-	// is off, so nothing is lost by not reserving for it.)
-	maxRead := readCeiling
-	if maxRead == 0 {
-		maxRead = copier.ResolveMaxReadThreads(r.migration.Threads, false)
+		maxRead, maxWrite = r.autoscale.MaxReadThreads, r.autoscale.MaxWriteThreads
 	}
 	// Fit both read bounds to the pool. The start matters as much as the ceiling
 	// here: r.migration.Threads is what the checksum takes as its Concurrency and
 	// what the copier takes as its starting read-worker count, and both of them
 	// floor the ceiling back up to it (see readBoundsForPool). Under autoscaling
-	// this is the number the block above replaced with readStart, so it is
-	// instance-derived and has never been checked against the operator's pool.
+	// it is instance-derived and has never been checked against the operator's
+	// pool.
 	if fitStart, fitCeiling := dbconn.ReadBoundsForPool(r.migration.Threads, maxRead, r.migration.MaxConnections, r.checksumPhaseReserve()); fitStart != r.migration.Threads || fitCeiling != maxRead {
 		r.logger.Warn("read thread bounds do not fit the connection pool; capping them",
 			"threads", r.migration.Threads, "capped_threads", fitStart,
@@ -1064,7 +899,7 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 	// automatic: a resumed migration stays in the coordinate scheme its
 	// checkpoint was written in (resumePosition), and a fresh one uses GTIDs
 	// whenever the server has them enabled.
-	replConfig := r.replClientConfig(flushConcurrency, flushBatchSize)
+	replConfig := r.replClientConfig(r.autoscale.FlushConcurrency, r.autoscale.FlushBatchSize)
 	r.replClient, err = change.NewAutoClient(ctx, r.db, r.migration.Host, r.migration.Username, *r.migration.Password, appl, replConfig, resumePosition)
 	if err != nil {
 		return err
@@ -1277,6 +1112,52 @@ func (r *Runner) setThrottlerOnPhases() {
 //
 // Multiple replica DSNs can be specified as a comma-separated list.
 // This is common logic shared between resume and new migration paths.
+// setupAutoscaling builds the target's Aurora throttlers and sizes autoscaling
+// from the same probe (concurrency.Engage). The throttlers are installed later,
+// by setupThrottler, once the copier and checker exist to receive them.
+//
+// The two Aurora throttlers have independent gates: setting MaxCommitLatency=0
+// disables only commit-latency; the Aurora threads throttler is always enabled
+// when Aurora is detected (Build picks the redo-aware perf_schema signal or the
+// Threads_running fallback via a privilege probe). Build returns a zero result
+// on non-Aurora targets, so this is safe to call unconditionally.
+//
+// OpenMonitor is invoked lazily by Build only after IsAurora returns true, so
+// non-Aurora users never pay the connect cost. MaxOpenConnections=2 lets both
+// Aurora throttlers poll concurrently without serializing on a single conn,
+// with a touch of headroom.
+//
+// A test throttler replaces the Aurora throttlers entirely, so there is no
+// probe and autoscaling cannot engage.
+func (r *Runner) setupAutoscaling(ctx context.Context) error {
+	if r.migration.testThrottler == nil {
+		result, err := throttler.AuroraSetup{
+			Source: r.db,
+			OpenMonitor: func() (*sql.DB, error) {
+				monitorCfg := *r.dbConfig // shallow copy — MaxOpenConnections is value-typed
+				monitorCfg.MaxOpenConnections = 2
+				return dbconn.NewWithConnectionType(r.dsn(), &monitorCfg, "monitor database")
+			},
+			CommitLatencyThreshold: r.migration.MaxCommitLatency,
+			Logger:                 r.logger,
+		}.Build(ctx)
+		if err != nil {
+			return err
+		}
+		r.aurora = result
+		r.monitorDB = result.MonitorDB
+	}
+	plan, err := concurrency.Engage(ctx, &r.migration.Common, concurrency.Request{
+		Targets: []concurrency.Target{{DB: r.db, Aurora: r.aurora}},
+		Logger:  r.logger,
+	})
+	if err != nil {
+		return err
+	}
+	r.autoscale = plan
+	return nil
+}
+
 func (r *Runner) setupThrottler(ctx context.Context) error {
 	if r.migration.testThrottler != nil {
 		// We are in tests: use the test's throttler (a throttler.Mock).
@@ -1302,38 +1183,9 @@ func (r *Runner) setupThrottler(ctx context.Context) error {
 		throttlers = append(throttlers, replicaThrottlers...)
 	}
 
-	// Aurora throttlers — assembled by the shared throttler.AuroraSetup
-	// helper so the move runner can use the same wiring. The two Aurora
-	// throttlers have independent gates: setting MaxCommitLatency=0 disables
-	// only commit-latency; the Aurora threads throttler is always enabled
-	// when Aurora is detected (Build picks the redo-aware perf_schema signal or
-	// the Threads_running fallback via a privilege probe). Build returns a zero
-	// result on non-Aurora sources so this call is safe to make unconditionally.
-	//
-	// OpenMonitor is invoked lazily by the helper only after IsAurora
-	// returns true (on Aurora the threads throttler is always built,
-	// so a pool is always needed there), so non-Aurora users never pay the
-	// connect cost. MaxOpenConnections=2 lets both Aurora throttlers poll
-	// concurrently without serializing on a single conn, with a touch of
-	// headroom.
-	auroraRes, err := throttler.AuroraSetup{
-		Source: r.db,
-		OpenMonitor: func() (*sql.DB, error) {
-			monitorCfg := *r.dbConfig // shallow copy — MaxOpenConnections is value-typed
-			monitorCfg.MaxOpenConnections = 2
-			return dbconn.NewWithConnectionType(r.dsn(), &monitorCfg, "monitor database")
-		},
-		CommitLatencyThreshold: r.migration.MaxCommitLatency,
-		Logger:                 r.logger,
-	}.Build(ctx)
-	if err != nil {
-		_ = r.closeReplicas()
-		return err
-	}
-	if auroraRes.MonitorDB != nil {
-		r.monitorDB = auroraRes.MonitorDB
-	}
-	throttlers = append(throttlers, auroraRes.Throttlers...)
+	// The Aurora throttlers were built by setupAutoscaling (empty on a
+	// non-Aurora target, or when a test throttler is set).
+	throttlers = append(throttlers, r.aurora.Throttlers...)
 
 	if len(throttlers) == 0 {
 		return nil // use default Noop throttler
@@ -1435,6 +1287,13 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 // - starting the periodic flush routine
 func (r *Runner) setup(ctx context.Context) error {
 	var err error
+
+	// Probe the target and settle the thread counts before either path builds
+	// the copier, so both the fresh and the resumed migration size their pools
+	// from the same probe the throttlers are built from.
+	if err := r.setupAutoscaling(ctx); err != nil {
+		return err
+	}
 
 	// We always attempt to resume from a checkpoint.
 	if err = r.resumeFromCheckpoint(ctx); err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/move/check"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
@@ -622,8 +623,7 @@ func TestMoveCarriesAutoIncrement(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSN:    testutils.DSNForDatabase(srcName),
 		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		DeferCutOver: true,
 	})
 	require.NoError(t, err)
@@ -665,8 +665,7 @@ func TestNtoMShardedMoveCarriesAutoIncrement(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSNs:   []string{testutils.DSNForDatabase(src0Name), testutils.DSNForDatabase(src1Name)},
 		Targets:      targets,
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		SourceTables: []string{"users"},
 		DeferCutOver: true,
 		ShardingProvider: &testShardingProvider{
@@ -797,8 +796,7 @@ func TestMoveCutoverRefusesSourceSchemaObjectUnderLock(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSN:    testutils.DSNForDatabase(srcName),
 		TargetDSN:    testutils.DSNForDatabase(dstName),
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		DeferCutOver: true,
 	})
 	require.NoError(t, err)

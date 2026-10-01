@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
@@ -69,10 +70,9 @@ func TestSyncFatalAbortDuringCopy(t *testing.T) {
 			dst.DBName = dstName
 
 			runner, err := NewRunner(&Sync{
-				SourceDSN:    src.FormatDSN(),
-				TargetDSN:    dst.FormatDSN(),
-				Threads:      1,
-				WriteThreads: 1,
+				SourceDSN: src.FormatDSN(),
+				TargetDSN: dst.FormatDSN(),
+				Common:    flags.Common{Threads: 1, WriteThreads: 1},
 			})
 			require.NoError(t, err)
 			fakeAurora(runner, 8, throttler.AuroraResult{Throttlers: []throttler.Throttler{throttler.NewStallingMock(0)}})
@@ -140,10 +140,9 @@ func TestSyncFatalAbortBeforeFirstPhase(t *testing.T) {
 	dst.DBName = dstName
 
 	runner, err := NewRunner(&Sync{
-		SourceDSN:    src.FormatDSN(),
-		TargetDSN:    dst.FormatDSN(),
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: src.FormatDSN(),
+		TargetDSN: dst.FormatDSN(),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	})
 	require.NoError(t, err)
 	runner.logger = slog.New(testutils.NewOnLogHandler(slog.Default().Handler(), "Starting sync", func() {

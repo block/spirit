@@ -159,6 +159,10 @@ observe its load but do not share a single worker budget.
 - [max-connections](#max-connections)
 - [defer-secondary-indexes](#defer-secondary-indexes)
 - [force](#force)
+- [force-kill-after](#force-kill-after)
+- [lock-wait-timeout](#lock-wait-timeout)
+- [tls-ca](#tls-ca)
+- [tls-mode](#tls-mode)
 
 ### source-dsn
 
@@ -200,6 +204,8 @@ How many chunks to copy in parallel from the source during the initial copy.
 - Default value: `4`
 
 How many concurrent write threads to use on the target.
+
+These counts are overridden when [autoscaling](#autoscaling) engages.
 
 ### flush-interval
 
@@ -264,6 +270,34 @@ run has since been dropped from the source, `--force` does not discover or
 remove that stale target table. Remove such tables manually if they are no
 longer wanted. Intended for testing/iterating. `--force` does not bypass the
 refusal of target triggers and events (see [Schema objects](#schema-objects)).
+
+### force-kill-after
+
+- Type: Duration
+- Default value: `0s` (i.e. 90% of [lock-wait-timeout](#lock-wait-timeout))
+
+How long Spirit waits before it starts killing the connections that are blocking a metadata lock. Shared with `migrate`; see [migrate's force-kill-after](migrate.md#force-kill-after).
+
+### lock-wait-timeout
+
+- Type: Duration
+- Default value: `30s`
+
+The `lock_wait_timeout` Spirit sets on its connections, bounding how long its DDL and table locks wait. Shared with `migrate`; see [migrate's lock-wait-timeout](migrate.md#lock-wait-timeout) for the force-kill rules.
+
+### tls-ca
+
+- Type: String
+- Default value: ``
+
+Path to a custom TLS CA certificate file (PEM format), applied to every source and target connection. Shared with `migrate`; see [migrate's tls-ca](migrate.md#tls-ca).
+
+### tls-mode
+
+- Type: Enumeration
+- Default value: `PREFERRED`
+
+The TLS mode applied to every source and target connection: `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA` or `VERIFY_IDENTITY`. A DSN's own `tls=` parameter takes precedence. Shared with `migrate`; see [migrate's tls-mode](migrate.md#tls-mode).
 
 ## GTID auto-detection
 

@@ -26,6 +26,7 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -384,8 +385,7 @@ func TestMoveReverseWindowCompleteForward(t *testing.T) {
 	m := &Move{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow: 2 * time.Second,
 	}
 	runner, err := NewRunner(m)
@@ -417,8 +417,7 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	m := &Move{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow: 30 * time.Second, // long; the revert ends it early
 	}
 	runner, err := NewRunner(m)
@@ -466,8 +465,7 @@ func TestMoveReverseWindowRevertCancelAfterSwitchBack(t *testing.T) {
 	m := &Move{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow: 30 * time.Second, // long; the revert ends it early
 	}
 	runner, err := NewRunner(m)
@@ -524,8 +522,7 @@ func TestMoveReverseWindowRevertCarriesAutoIncrement(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSN:     testutils.DSNForDatabase(srcName),
 		TargetDSN:     testutils.DSNForDatabase(dstName),
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow: 30 * time.Second, // long; the revert ends it early
 	})
 	require.NoError(t, err)
@@ -556,8 +553,7 @@ func runRevertingMove(t *testing.T, sourceDSN, targetDSN string, ctl *sql.DB, ds
 	m := &Move{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow: 30 * time.Second, // long; the revert ends it early
 	}
 	runner, err := NewRunner(m)
@@ -991,8 +987,7 @@ func TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence(t *testing.T) 
 		runner, err := NewRunner(&Move{
 			SourceDSN:     sourceDSN,
 			TargetDSN:     targetDSN,
-			Threads:       1,
-			WriteThreads:  1,
+			Common:        flags.Common{Threads: 1, WriteThreads: 1},
 			ReverseWindow: 30 * time.Second,
 		})
 		require.NoError(t, err)
@@ -1033,8 +1028,7 @@ func TestMoveReverseWindowRefusesStaleRevertMarker(t *testing.T) {
 	m := &Move{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow: 2 * time.Second,
 	}
 	runner, err := NewRunner(m)
@@ -1054,8 +1048,7 @@ func TestMoveReverseWindowShardedSourceGuards(t *testing.T) {
 	newShardedMove := func() *Move {
 		return &Move{
 			SourceDSNs:    []string{"u:p@tcp(127.0.0.1:3306)/a", "u:p@tcp(127.0.0.1:3306)/b"},
-			Threads:       1,
-			WriteThreads:  1,
+			Common:        flags.Common{Threads: 1, WriteThreads: 1},
 			ReverseWindow: time.Second,
 		}
 	}
@@ -1157,8 +1150,7 @@ func (f *nmReverseFixture) newRunner(t *testing.T, window time.Duration) *Runner
 		SourceTables:            []string{"users"},
 		ShardingProvider:        provider,
 		ReverseShardingProvider: provider,
-		Threads:                 1,
-		WriteThreads:            1,
+		Common:                  flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow:           window,
 	}
 	runner, err := NewRunner(m)
@@ -1394,7 +1386,7 @@ func TestMoveReverseWindowSwitchWrites(t *testing.T) {
 			r, err := NewRunner(&Move{
 				SourceDSN: testutils.DSNForDatabase(srcName),
 				TargetDSN: testutils.DSNForDatabase(dstName),
-				Threads:   1, WriteThreads: 1, ReverseWindow: 30 * time.Second,
+				Common:    flags.Common{Threads: 1, WriteThreads: 1}, ReverseWindow: 30 * time.Second,
 			})
 			require.NoError(t, err)
 			defer utils.CloseAndLog(r)
@@ -1506,8 +1498,7 @@ func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
 	m := &Move{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       1,
-		WriteThreads:  1,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
 		ReverseWindow: 5 * time.Minute,
 	}
 	runner, err := NewRunner(m)
@@ -1652,8 +1643,7 @@ func TestMoveReverseCutoverRefusesTriggersAndEvents(t *testing.T) {
 			runner, err := NewRunner(&Move{
 				SourceDSN:     sourceDSN,
 				TargetDSN:     targetDSN,
-				Threads:       1,
-				WriteThreads:  1,
+				Common:        flags.Common{Threads: 1, WriteThreads: 1},
 				ReverseWindow: 30 * time.Second, // long; the revert ends it early
 			})
 			require.NoError(t, err)
@@ -1701,8 +1691,7 @@ func TestMoveReverseWindowIgnoresViewsAndRoutines(t *testing.T) {
 		runner, err := NewRunner(&Move{
 			SourceDSN:     sourceDSN,
 			TargetDSN:     targetDSN,
-			Threads:       1,
-			WriteThreads:  1,
+			Common:        flags.Common{Threads: 1, WriteThreads: 1},
 			ReverseWindow: 30 * time.Second, // long; the revert ends it early
 		})
 		require.NoError(t, err)

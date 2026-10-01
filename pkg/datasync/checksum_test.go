@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -37,8 +38,7 @@ func TestSyncContinuousChecksumFirstCleanPass(t *testing.T) {
 	s := &Sync{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       2,
-		WriteThreads:  2,
+		Common:        flags.Common{Threads: 2, WriteThreads: 2},
 		FlushInterval: 100 * time.Millisecond,
 	}
 	runner, err := NewRunner(s)
@@ -101,8 +101,7 @@ func TestSyncContinuousChecksumWithBackgroundWrites(t *testing.T) {
 	s := &Sync{
 		SourceDSN:     sourceDSN,
 		TargetDSN:     targetDSN,
-		Threads:       2,
-		WriteThreads:  2,
+		Common:        flags.Common{Threads: 2, WriteThreads: 2},
 		FlushInterval: 100 * time.Millisecond,
 	}
 	runner, err := NewRunner(s)

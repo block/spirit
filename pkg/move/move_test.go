@@ -14,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
@@ -63,12 +64,10 @@ func TestBasicMove(t *testing.T) {
 
 	// test
 	move := &Move{
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		Threads:        2,
-		WriteThreads:   16,
-		MaxConnections: 8,
-		DeferCutOver:   false,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		Common:       flags.Common{Threads: 2, WriteThreads: 16, MaxConnections: 8},
+		DeferCutOver: false,
 	}
 	runner, err := NewRunner(move)
 	require.NoError(t, err)
@@ -124,8 +123,7 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	move := &Move{
 		SourceDSN:             sourceDSN,
 		TargetDSN:             targetDSN,
-		Threads:               1,
-		WriteThreads:          1,
+		Common:                flags.Common{Threads: 1, WriteThreads: 1},
 		DeferSecondaryIndexes: deferSecondaryIndexes,
 	}
 	r, err := NewRunner(move)
@@ -245,8 +243,7 @@ func TestEmptyDatabaseMove(t *testing.T) {
 	move := &Move{
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
-		Threads:      4,
-		WriteThreads: 4,
+		Common:       flags.Common{Threads: 4, WriteThreads: 4},
 		DeferCutOver: false,
 	}
 
@@ -287,10 +284,9 @@ func TestMoveCancelAfterCutoverReportsSuccess(t *testing.T) {
 	testutils.RunSQL(t, `INSERT INTO source_cancel_after_cutover.t1 VALUES (1, 'a'), (2, 'b')`)
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:    src.FormatDSN(),
-		TargetDSN:    dest.FormatDSN(),
-		Threads:      2,
-		WriteThreads: 2,
+		SourceDSN: src.FormatDSN(),
+		TargetDSN: dest.FormatDSN(),
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -360,8 +356,7 @@ func TestMoveReservedWordPK(t *testing.T) {
 	move := &Move{
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
-		Threads:      2,
-		WriteThreads: 2,
+		Common:       flags.Common{Threads: 2, WriteThreads: 2},
 		DeferCutOver: false,
 	}
 	require.NoError(t, move.Run())
@@ -404,8 +399,7 @@ func TestMoveReservedWordTableName(t *testing.T) {
 	move := &Move{
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
-		Threads:      2,
-		WriteThreads: 2,
+		Common:       flags.Common{Threads: 2, WriteThreads: 2},
 		DeferCutOver: false,
 	}
 	require.NoError(t, move.Run())
@@ -443,10 +437,9 @@ func TestPostCopyAnalyzeTargetSchema(t *testing.T) {
 	})
 
 	move := &Move{
-		SourceDSN:    sourceDSN,
-		TargetDSN:    targetDSN,
-		Threads:      1,
-		WriteThreads: 1,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
 	}
 	r, err := NewRunner(move)
 	require.NoError(t, err)
@@ -545,8 +538,7 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	move := &Move{
 		SourceDSN:             src.FormatDSN(),
 		TargetDSN:             dest.FormatDSN(),
-		Threads:               1,
-		WriteThreads:          1,
+		Common:                flags.Common{Threads: 1, WriteThreads: 1},
 		DeferSecondaryIndexes: true,
 	}
 	r, err := NewRunner(move)
@@ -731,12 +723,11 @@ func TestMoveValidate(t *testing.T) {
 	}{
 		{name: "zero values are valid"},
 		{name: "typical values are valid", m: Move{
-			Threads:      2,
-			WriteThreads: 4,
+			Common: flags.Common{Threads: 2, WriteThreads: 4},
 		}},
-		{name: "negative threads", m: Move{Threads: -5},
+		{name: "negative threads", m: Move{Common: flags.Common{Threads: -5}},
 			wantErr: "--threads must be non-negative, got -5"},
-		{name: "negative write-threads", m: Move{WriteThreads: -1},
+		{name: "negative write-threads", m: Move{Common: flags.Common{WriteThreads: -1}},
 			wantErr: "--write-threads must be non-negative, got -1"},
 	}
 	for _, tt := range tests {
@@ -789,10 +780,9 @@ func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
 			src, dest := cfg.Clone(), cfg.Clone()
 			src.DBName, dest.DBName = srcDB, destDB
 			move := &Move{
-				SourceDSN:    src.FormatDSN(),
-				TargetDSN:    dest.FormatDSN(),
-				Threads:      2,
-				WriteThreads: 2,
+				SourceDSN: src.FormatDSN(),
+				TargetDSN: dest.FormatDSN(),
+				Common:    flags.Common{Threads: 2, WriteThreads: 2},
 			}
 			err := move.Run()
 			require.ErrorContains(t, err, tc.want)
@@ -833,10 +823,9 @@ func TestMoveRefusesEnumSetMembersOutsideUTF8MB3(t *testing.T) {
 	src, dest := cfg.Clone(), cfg.Clone()
 	src.DBName, dest.DBName = srcDB, destDB
 	move := &Move{
-		SourceDSN:    src.FormatDSN(),
-		TargetDSN:    dest.FormatDSN(),
-		Threads:      2,
-		WriteThreads: 2,
+		SourceDSN: src.FormatDSN(),
+		TargetDSN: dest.FormatDSN(),
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 	}
 	err = move.Run()
 	require.ErrorContains(t, err, `column "e" of table "t1" is enum('?','a'), but MySQL stores a member with a character outside utf8mb3 there`)
@@ -877,8 +866,7 @@ func TestNtoMMoveRefusesMisreportedEnumSetOnLaterSource(t *testing.T) {
 	runner, err := NewRunner(&Move{
 		SourceDSNs:   []string{testutils.DSNForDatabase(src0Name), testutils.DSNForDatabase(src1Name)},
 		Targets:      []applier.Target{{DB: db, Config: cfg}},
-		Threads:      1,
-		WriteThreads: 1,
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
 		SourceTables: []string{"t"},
 	})
 	require.NoError(t, err)
@@ -939,10 +927,9 @@ func TestMoveRefusesUnsupportedNames(t *testing.T) {
 			src, dest := cfg.Clone(), cfg.Clone()
 			src.DBName, dest.DBName = tc.srcDB, destDB
 			move := &Move{
-				SourceDSN:    src.FormatDSN(),
-				TargetDSN:    dest.FormatDSN(),
-				Threads:      2,
-				WriteThreads: 2,
+				SourceDSN: src.FormatDSN(),
+				TargetDSN: dest.FormatDSN(),
+				Common:    flags.Common{Threads: 2, WriteThreads: 2},
 			}
 			err := move.Run()
 			require.ErrorContains(t, err, tc.want)
@@ -1075,8 +1062,7 @@ func TestMoveRefusesSourceSchemaObjects(t *testing.T) {
 			runner, err := NewRunner(&Move{
 				SourceDSNs:   sourceDSNs,
 				TargetDSN:    testutils.DSNForDatabase(destDB),
-				Threads:      2,
-				WriteThreads: 2,
+				Common:       flags.Common{Threads: 2, WriteThreads: 2},
 				SourceTables: tc.sourceTables,
 			})
 			require.NoError(t, err)
@@ -1136,10 +1122,9 @@ func TestMoveRefusesUserThatCannotSeeRoutines(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	runner, err := NewRunner(&Move{
-		SourceDSN:    fmt.Sprintf("%s:@tcp(%s)/%s", user, cfg.Addr, srcDB),
-		TargetDSN:    testutils.DSNForDatabase(destDB),
-		Threads:      2,
-		WriteThreads: 2,
+		SourceDSN: fmt.Sprintf("%s:@tcp(%s)/%s", user, cfg.Addr, srcDB),
+		TargetDSN: testutils.DSNForDatabase(destDB),
+		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 	})
 	require.NoError(t, err)
 	defer utils.CloseAndLog(runner)

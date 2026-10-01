@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/block/spirit/pkg/utils"
@@ -123,13 +124,11 @@ func runSyncPreDispatchScenario(t *testing.T, secondIsDelete bool) {
 
 	gate := newGateThrottler()
 	runner, err := NewRunner(&Sync{
-		SourceDSN:      src.FormatDSN(),
-		TargetDSN:      dest.FormatDSN(),
-		Threads:        1, // one read worker, so one token is one chunk
-		WriteThreads:   2,
-		MaxConnections: 16,
-		Target:         &applier.Target{DB: tgt, Config: dest},
-		FlushInterval:  50 * time.Millisecond,
+		SourceDSN:     src.FormatDSN(),
+		TargetDSN:     dest.FormatDSN(),
+		Common:        flags.Common{Threads: 1, WriteThreads: 2, MaxConnections: 16}, // one read worker, so one token is one chunk
+		Target:        &applier.Target{DB: tgt, Config: dest},
+		FlushInterval: 50 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	fakeAurora(runner, 2, throttler.AuroraResult{Throttlers: []throttler.Throttler{gate}})

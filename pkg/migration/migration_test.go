@@ -4,13 +4,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
@@ -121,12 +120,12 @@ func TestE2ENullAlter1Row(t *testing.T) {
 }
 
 // TestE2EAutoscalingEnabled runs a full migration with the experimental
-// write-thread autoscaler turned on. The local (non-Aurora) target has no
-// GradualThrottler, so this exercises the downgrade path end-to-end: the
-// autoscaler declines to engage (a warning is logged), write threads stay at
-// the starting value, the connection pool is still sized for the ceiling, and
-// the migration completes correctly (goleak in TestMain catches leaks). The
-// engaged path is covered by the autoscaler unit tests.
+// write-thread autoscaler turned on. The local (non-Aurora) target supplies no
+// Aurora load signal, so this exercises the disengaged path end-to-end:
+// concurrency.Engage declines (and logs why), the configured thread counts
+// stand, and the migration completes correctly (goleak in TestMain catches
+// leaks). The engaged path is covered by pkg/concurrency and the autoscaler
+// unit tests.
 func TestE2EAutoscalingEnabled(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "t1autoscale", `CREATE TABLE t1autoscale (
@@ -398,30 +397,15 @@ func TestMigrationParamsDefaultsUsed(t *testing.T) {
 	require.Equal(t, uint64(table.DefaultTargetChunkBytes), migration.TargetChunkSize)
 }
 
-// TestTargetChunkSizeKongDefault pins the hardcoded Kong default on
-// --target-chunk-size to table.DefaultTargetChunkBytes. The Kong tag must be a
-// literal, so this guards against it drifting from the constant (which also
-// backs the zero-value default in normalizeOptions).
-func TestTargetChunkSizeKongDefault(t *testing.T) {
-	t.Parallel()
-	field, ok := reflect.TypeFor[Migration]().FieldByName("TargetChunkSize")
-	require.True(t, ok)
-	require.Equal(t,
-		strconv.FormatUint(table.DefaultTargetChunkBytes, 10),
-		field.Tag.Get("default"),
-		"Kong default for --target-chunk-size must equal table.DefaultTargetChunkBytes")
-}
-
 func TestMigrationParamsCLIUsed(t *testing.T) {
 	t.Parallel()
 	migration := &Migration{
-		Host:               "cli-host:3306",
-		Username:           "cli-user",
-		Password:           new("cli-password"),
-		Database:           "cli-db",
-		Statement:          "ALTER TABLE testtable ENGINE=InnoDB",
-		TLSMode:            "VERIFY_CA",
-		TLSCertificatePath: "/path/to/ca",
+		Host:      "cli-host:3306",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		Common:    flags.Common{TLSMode: "VERIFY_CA", TLSCertificatePath: "/path/to/ca"},
 	}
 
 	_, err := migration.normalizeOptions()
@@ -482,14 +466,13 @@ tls-ca = /path/from/file
 `)
 
 	migration := &Migration{
-		Host:               "cli-host:1234",
-		Username:           "cli-user",
-		Password:           new("cli-password"),
-		Database:           "cli-db",
-		Statement:          "ALTER TABLE testtable ENGINE=InnoDB",
-		ConfFile:           confPath,
-		TLSMode:            "REQUIRED",
-		TLSCertificatePath: "/path/to/cert",
+		Host:      "cli-host:1234",
+		Username:  "cli-user",
+		Password:  new("cli-password"),
+		Database:  "cli-db",
+		Statement: "ALTER TABLE testtable ENGINE=InnoDB",
+		ConfFile:  confPath,
+		Common:    flags.Common{TLSMode: "REQUIRED", TLSCertificatePath: "/path/to/cert"},
 	}
 
 	_, err := migration.normalizeOptions()
@@ -826,7 +809,7 @@ func TestDefaultPort(t *testing.T) {
 		Username:  "root",
 		Password:  new("mypassword"),
 		Database:  "test",
-		Threads:   2,
+		Common:    flags.Common{Threads: 2},
 		Statement: "ALTER TABLE t1 DROP COLUMN b, ENGINE=InnoDB",
 	})
 	require.NoError(t, err)
@@ -895,14 +878,13 @@ func TestMigrationValidate(t *testing.T) {
 	}{
 		{name: "zero values are valid"},
 		{name: "typical values are valid", m: Migration{
-			Threads:          4,
-			WriteThreads:     4,
+			Common:           flags.Common{Threads: 4, WriteThreads: 4},
 			ReplicaMaxLag:    120 * time.Second,
 			CheckpointMaxAge: 168 * time.Hour,
 		}},
-		{name: "negative threads", m: Migration{Threads: -5},
+		{name: "negative threads", m: Migration{Common: flags.Common{Threads: -5}},
 			wantErr: "--threads must be non-negative, got -5"},
-		{name: "negative write-threads", m: Migration{WriteThreads: -1},
+		{name: "negative write-threads", m: Migration{Common: flags.Common{WriteThreads: -1}},
 			wantErr: "--write-threads must be non-negative, got -1"},
 		{name: "negative replica-max-lag", m: Migration{ReplicaMaxLag: -time.Minute},
 			wantErr: "--replica-max-lag must be non-negative, got -1m0s"},
