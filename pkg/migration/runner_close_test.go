@@ -2,10 +2,12 @@ package migration
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/status"
@@ -175,4 +177,44 @@ func TestFatalErrorCancelsWithCause(t *testing.T) {
 	require.Error(t, cause)
 	require.NotErrorIs(t, cause, context.Canceled)
 	require.ErrorContains(t, cause, change.FatalReasonSchemaChange.String())
+}
+
+// TestCancelConcurrentWithRun: Cancel is how another goroutine stops a
+// migration, so it must be safe to call while Run is still setting up its
+// context.
+func TestCancelConcurrentWithRun(t *testing.T) {
+	r, err := NewRunner(&Migration{
+		Host:      "127.0.0.1:1", // nothing listens here, so Run fails fast
+		Username:  "spirit",
+		Database:  "test",
+		Statement: "ALTER TABLE t1 ENGINE=InnoDB",
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Cancel()
+	}()
+	_ = r.Run(ctx)
+	<-done
+	require.NoError(t, r.Close())
+}
+
+// TestCancelAbortAndCloseCancelTheRun pins what each entry point passes to the
+// migration context once Run has set it: Cancel and Close a plain
+// cancellation, and Abort its cause, so Run returns the checkpoint error
+// rather than context.Canceled.
+func TestCancelAbortAndCloseCancelTheRun(t *testing.T) {
+	var causes []error
+	r := &Runner{
+		logger:     slog.Default(),
+		cancelFunc: func(err error) { causes = append(causes, err) },
+	}
+	abortErr := errors.New("checkpoint write failed")
+	r.Cancel()
+	r.Abort(abortErr)
+	require.NoError(t, r.Close())
+	require.Equal(t, []error{nil, abortErr, nil}, causes)
 }

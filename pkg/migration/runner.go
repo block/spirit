@@ -132,6 +132,9 @@ type Runner struct {
 	// phases observe, so a fatal abort is reported as the failure it is and
 	// not as an operator cancellation. Cancel passes a nil cause.
 	cancelFunc context.CancelCauseFunc
+	// cancelMu guards cancelFunc: Run assigns it while Cancel, Abort, Close
+	// and fatalError may already be reading it from other goroutines.
+	cancelMu sync.Mutex
 
 	// fatalOnce makes fatalError idempotent. Without it a concurrent burst
 	// of fatal events from the binlog goroutine and the migration loop
@@ -382,8 +385,11 @@ func (r *Runner) runCopy(ctx context.Context) error {
 }
 
 func (r *Runner) Run(ctx context.Context) (retErr error) {
-	ctx, r.cancelFunc = context.WithCancelCause(ctx)
-	defer r.cancelFunc(nil)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	r.cancelMu.Lock()
+	r.cancelFunc = cancel
+	r.cancelMu.Unlock()
 	r.status.SetMetricsSink(r.metricsSink, r.logger)
 	r.status.Begin()
 	r.durableMutation.Store(false)
@@ -1912,7 +1918,10 @@ func (r *Runner) Abort(cause error) {
 // cancel cancels the migration context with cause. A nil cause is a plain
 // cancellation (context.Canceled).
 func (r *Runner) cancel(cause error) {
-	if r.cancelFunc != nil {
-		r.cancelFunc(cause)
+	r.cancelMu.Lock()
+	cancel := r.cancelFunc
+	r.cancelMu.Unlock()
+	if cancel != nil {
+		cancel(cause)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
@@ -120,6 +121,39 @@ func TestCancelAndAbortBeforeRun(t *testing.T) {
 	require.NoError(t, err)
 	require.NotPanics(t, r.Cancel)
 	require.NotPanics(t, func() { r.Abort(errors.New("checkpoint write failed")) })
+}
+
+// TestCancelConcurrentWithRun: Cancel is how another goroutine stops a move,
+// so it must be safe to call while Run is still setting up its context.
+func TestCancelConcurrentWithRun(t *testing.T) {
+	r, err := NewRunner(&Move{})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Cancel()
+	}()
+	_ = r.Run(ctx) // fails fast: the Move has no sources
+	<-done
+}
+
+// TestCancelAbortAndCloseCancelTheRun pins what each entry point passes to the
+// move context once Run has set it: Cancel and Close a plain cancellation, and
+// Abort its cause, so Run returns the checkpoint error rather than
+// context.Canceled.
+func TestCancelAbortAndCloseCancelTheRun(t *testing.T) {
+	var causes []error
+	r := &Runner{
+		logger:     slog.Default(),
+		cancelFunc: func(err error) { causes = append(causes, err) },
+	}
+	abortErr := errors.New("checkpoint write failed")
+	r.Cancel()
+	r.Abort(abortErr)
+	require.NoError(t, r.Close())
+	require.Equal(t, []error{nil, abortErr, nil}, causes)
 }
 
 // TestFatalErrorCancelsWithCause pins that fatalError cancels the move

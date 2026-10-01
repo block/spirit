@@ -188,7 +188,11 @@ type Runner struct {
 	// phases observe, so a fatal abort is reported as the failure it is and
 	// not as an operator cancellation. Cancel and Close pass a nil cause.
 	cancelFunc context.CancelCauseFunc
-	dbConfig   *dbconn.DBConfig
+	// cancelMu guards cancelFunc: Run assigns it while Cancel, Abort, Close
+	// and fatalError may already be reading it from other goroutines.
+	cancelMu sync.Mutex
+
+	dbConfig *dbconn.DBConfig
 
 	// fatalOnce makes fatalError idempotent. Move wires N repl clients
 	// (one per source) to the same fatalError callback, so a concurrent
@@ -1239,8 +1243,11 @@ func (r *Runner) createCheckpointTable(ctx context.Context) error {
 }
 
 func (r *Runner) Run(ctx context.Context) (retErr error) {
-	ctx, r.cancelFunc = context.WithCancelCause(ctx)
-	defer r.cancelFunc(nil)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	r.cancelMu.Lock()
+	r.cancelFunc = cancel
+	r.cancelMu.Unlock()
 	r.status.SetMetricsSink(r.metricsSink, r.logger)
 	r.status.Begin()
 	r.durableMutation.Store(false)
@@ -2294,8 +2301,11 @@ func (r *Runner) Abort(cause error) {
 // cancellation (context.Canceled). cancelFunc is only set by Run, so this is
 // a no-op before Run (early setup, or test paths that bypass Run).
 func (r *Runner) cancel(cause error) {
-	if r.cancelFunc != nil {
-		r.cancelFunc(cause)
+	r.cancelMu.Lock()
+	cancel := r.cancelFunc
+	r.cancelMu.Unlock()
+	if cancel != nil {
+		cancel(cause)
 	}
 }
 

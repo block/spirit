@@ -1989,9 +1989,7 @@ func (r *Runner) fatal() error {
 // calls change.Source.Close (documented idempotent) to release the
 // runner's reference.
 func (r *Runner) Close() error {
-	if r.cancelFunc != nil {
-		r.cancelFunc(nil)
-	}
+	r.Cancel()
 	// Wait for the status + checkpoint goroutines (status.WatchTask) to exit
 	// before tearing down connections, so a late DumpCheckpoint can't run
 	// against a closed pool.
