@@ -16,6 +16,7 @@ package checkpoint
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"time"
@@ -175,6 +176,18 @@ var (
 // checkpoint or this one; nothing is left pending.
 var ErrWriteAbandoned = errors.New("checkpoint write abandoned")
 
+// ErrWriteNotSent means Write failed before the REPLACE reached the server
+// (getting a session, reading its ID, or a driver.ErrBadConn from the REPLACE
+// itself, which the driver returns only when nothing was written or the server
+// refused the statement on a read-only session). The REPLACE cannot commit
+// later, so the row holds the previous checkpoint. The underlying error stays
+// in the chain, so it may also be a connection-loss error.
+var ErrWriteNotSent = errors.New("checkpoint write not sent")
+
+func notSent(err error) error {
+	return fmt.Errorf("%w: %w", ErrWriteNotSent, err)
+}
+
 // Write records a checkpoint row, keeping a single row by overwriting it in
 // place (REPLACE on the fixed primary key id=1). The table has one logical
 // owner, so there is no value in accumulating history, and REPLACE is one atomic
@@ -188,7 +201,8 @@ var ErrWriteAbandoned = errors.New("checkpoint write abandoned")
 // still queued on the server would overwrite that row later. The driver's
 // cancellation only closes the socket; it does not stop the statement. So:
 //
-//   - If ctx is already done, Write sends nothing.
+//   - If ctx is already done, Write sends nothing. This and every other
+//     failure before the REPLACE reaches the server wraps ErrWriteNotSent.
 //   - Canceling ctx mid-write does not abort it: Write waits up to
 //     writeCancelGrace for the server to answer. ctx's deadline, if any, still
 //     applies.
@@ -198,7 +212,7 @@ var ErrWriteAbandoned = errors.New("checkpoint write abandoned")
 // See github.com/block/spirit/issues/1313.
 func (t *Table) Write(ctx context.Context, rec Record) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return notSent(err)
 	}
 	var cutoverAt string
 	if !rec.CutoverAt.IsZero() {
@@ -211,22 +225,28 @@ func (t *Table) Write(ctx context.Context, rec Record) error {
 		rec.Phase, cutoverAt,
 	)
 	if err != nil {
-		return err
+		return notSent(err)
 	}
 	writeCtx, cancel := utils.WithCancelGrace(ctx, writeCancelGrace)
 	defer cancel()
 	// A dedicated session, so that its ID is known if it has to be killed.
 	conn, err := t.db.Conn(writeCtx)
 	if err != nil {
-		return err
+		return notSent(err)
 	}
 	defer func() { _ = conn.Close() }()
 	var connID int
 	if err := conn.QueryRowContext(writeCtx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
-		return err
+		return notSent(err)
 	}
 	_, err = conn.ExecContext(writeCtx, stmt)
-	if err == nil || writeCtx.Err() == nil {
+	if err == nil {
+		return nil
+	}
+	if writeCtx.Err() == nil {
+		if errors.Is(err, driver.ErrBadConn) {
+			return notSent(err)
+		}
 		return err
 	}
 	// Keep the context error in the chain whatever the driver returned, so

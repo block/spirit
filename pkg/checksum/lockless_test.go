@@ -1407,12 +1407,78 @@ func TestRunUntilCleanHonoursMaxPasses(t *testing.T) {
 	require.True(t, c.Stats().FirstCleanPassAt.IsZero())
 }
 
+// stallableFeed is a MockSource that can stop flushing: while stalled, Flush
+// returns without flushing and the flush count does not move, which is how a
+// feed that has stopped flushing looks to the checker. The checker requests
+// flushes itself, so a plain MockSource can never look stalled.
+type stallableFeed struct {
+	*change.MockSource
+	stalled atomic.Bool
+	calls   atomic.Int64 // every Flush call, stalled or not
+}
+
+func (f *stallableFeed) Flush(ctx context.Context) error {
+	f.calls.Add(1)
+	if f.stalled.Load() {
+		return nil
+	}
+	return f.MockSource.Flush(ctx)
+}
+
+// A drain request made while another drain is running is declined, so the
+// dispatcher knows to ask again: the running drain may have started before
+// the waiting retry was gated and cannot release it.
+func TestFeedFlusherDeclinesWhileDraining(t *testing.T) {
+	release := make(chan struct{})
+	feed := &change.MockSource{FlushFn: func(ctx context.Context) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	}}
+	c := newTestChecker(t, newTestChunker(1), fastConfig(), nil)
+	c.feeds = []change.Source{feed}
+	f := newFeedFlusher(t.Context(), c)
+	defer f.close()
+
+	require.True(t, f.request(), "an idle flusher starts a drain")
+	require.False(t, f.request(), "a second request while draining is declined")
+	close(release)
+	require.Eventually(t, f.request, 5*time.Second, time.Millisecond,
+		"a request after the drain finished starts a new one")
+}
+
+// The checker requests a flush once per gated retry, not on every poll: a
+// flush that returns without completing (a failing or stalled feed) must not
+// be re-requested four times a second until RetryFlushWait expires.
+func TestGatedRetryRequestsOneFlush(t *testing.T) {
+	cfg := fastConfig()
+	cfg.RetryDelay = time.Millisecond
+	cfg.RetryFlushWait = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg, func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+		return 1, 2, 1, nil // the target never matches
+	})
+	feed := &stallableFeed{MockSource: &change.MockSource{}}
+	feed.stalled.Store(true)
+	c.feeds = []change.Source{feed}
+
+	stop, _ := runUntil(t, c)
+	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
+	require.Eventually(t, func() bool { return feed.calls.Load() == 1 }, 5*time.Second, time.Millisecond,
+		"the gated retry requests a flush")
+	time.Sleep(4 * retryFlushPoll)
+	require.Equal(t, int64(1), feed.calls.Load(), "the same gate does not request a flush again")
+	require.Zero(t, c.Stats().PassesCompleted, "the retry is still waiting on the flush")
+}
+
 // A retry waits for the change feed to flush, because until then the target
 // cannot have moved. The chunk here is hot and the target shows the source as
 // of the last flush — the shape of a feed that applies every
 // DefaultFlushInterval. Retried on RetryDelay alone, every re-read would see
 // the same stale target, spend the MaxHotAttempts budget on it, and defer the
-// chunk; gated on the flush, the one retry passes.
+// chunk; gated on the flush, the one retry passes. The checker requests that
+// flush itself rather than waiting for the periodic one.
 func TestRetryWaitsForFeedFlush(t *testing.T) {
 	var (
 		mu      sync.Mutex
@@ -1420,12 +1486,12 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 		lastSrc int64
 		tgt     int64 // the source as of the last flush
 	)
-	feed := &change.MockSource{FlushFn: func(context.Context) error {
+	feed := &stallableFeed{MockSource: &change.MockSource{FlushFn: func(context.Context) error {
 		mu.Lock()
 		defer mu.Unlock()
 		tgt = lastSrc
 		return nil
-	}}
+	}}}
 	readCount := func() int {
 		mu.Lock()
 		defer mu.Unlock()
@@ -1450,6 +1516,7 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 	}
 
 	t.Run("gated until a flush", func(t *testing.T) {
+		feed.stalled.Store(true)
 		c := newChecker(t, time.Minute)
 		errCh := make(chan error, 1)
 		go func() { errCh <- c.RunUntilClean(t.Context()) }()
@@ -1458,6 +1525,9 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 		time.Sleep(300 * time.Millisecond) // 300 RetryDelays
 		require.Equal(t, 1, readCount(), "no retry before the feed has flushed")
 
+		// The checker's one request for this gate went to the stalled feed;
+		// the next flush (the periodic one, here) releases the retry.
+		feed.stalled.Store(false)
 		require.NoError(t, feed.Flush(t.Context()))
 		select {
 		case err := <-errCh:
@@ -1468,10 +1538,26 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 		require.Equal(t, 2, readCount())
 	})
 
+	t.Run("a waiting retry requests the flush", func(t *testing.T) {
+		mu.Lock()
+		reads, lastSrc, tgt = 0, 0, 0
+		mu.Unlock()
+		feed.stalled.Store(false)
+		before := feed.Flushes()
+		c := newChecker(t, time.Minute)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, c.RunUntilClean(ctx),
+			"nothing else flushes this feed: the checker's own request releases the retry")
+		require.Equal(t, 2, readCount())
+		require.Equal(t, before+1, feed.Flushes())
+	})
+
 	t.Run("deadline releases a feed that never flushes", func(t *testing.T) {
 		mu.Lock()
 		reads, lastSrc, tgt = 0, 0, 0
 		mu.Unlock()
+		feed.stalled.Store(true)
 		c := newChecker(t, 20*time.Millisecond)
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
@@ -2034,12 +2120,13 @@ func TestSplitChildrenGoAheadOfGatedRetries(t *testing.T) {
 		mu.Unlock()
 		return 700, 700, 1, nil
 	})
-	feed := &change.MockSource{}
+	feed := &stallableFeed{MockSource: &change.MockSource{}}
 	c.feeds = []change.Source{feed}
 	c.splitChunk = func(ctx context.Context, _ *table.Chunk, _ uint64) ([]*table.Chunk, error) {
 		mu.Lock()
 		split = true // no flush from here on
 		mu.Unlock()
+		feed.stalled.Store(true)
 		releaseOnce.Do(func() { close(releaseLag) })
 		// Hand the children over only once the lagging chunk's gated retry is
 		// the whole queue (the hot parent is in flight here, not queued).

@@ -60,8 +60,8 @@ var (
 	// _spirit_checkpoint and datasync's _spirit_sync_checkpoint. A table with
 	// this name can only have been created by a move, which is what lets
 	// decideResume treat an empty one as a dead move's leavings and recover
-	// without --force. Keep it in sync with the literal in
-	// pkg/move/check/resume_state.go (that package cannot import this one).
+	// without --force. Keep it in sync with moveCheckpointTableName in
+	// pkg/move/check (that package cannot import this one).
 	checkpointTableName = "_spirit_move_checkpoint"
 	// Sentinel-wait timing lives in pkg/sentinel (sentinel.WaitLimit /
 	// sentinel.CheckInterval / sentinel.TableName) so it is shared with migrate.
@@ -196,8 +196,10 @@ type Runner struct {
 	terminalOwnership atomic.Uint32
 	// reversePositions holds each target's binlog position captured by the
 	// pre-switch hook (keyed by targetKey) — the start points for the reverse
-	// feeds. cutoverAt is set by the post-switch hook when the forward cutover
-	// completes, and the reverse-window deadline is measured from it.
+	// feeds. During the window it tracks the last positions checkpointed (see
+	// reverseWindow.checkpointPositions). cutoverAt is set by the post-switch
+	// hook when the forward cutover completes, and the reverse-window deadline
+	// is measured from it.
 	reversePositions map[string]string
 	cutoverAt        time.Time
 
@@ -1090,12 +1092,12 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 
 // resumeReverseWindow rebuilds the reverse-window state from the checkpoint and
 // re-enters the window. The reverse feeds restart from the checkpointed
-// positions and catch up whatever the source missed while the process was down.
+// positions (the window keeps them current; see
+// reverseWindow.checkpointPositions) and catch up whatever the source missed
+// while the process was down.
 //
 // v1 note: no advisory locks are re-acquired here (a concurrent second restart
-// of the same move is an operator error), and the feed always resumes from the
-// original cutover position — correct via idempotent apply, at the cost of
-// re-reading the window's binlog.
+// of the same move is an operator error).
 func (r *Runner) resumeReverseWindow(ctx context.Context, rec checkpoint.Record) error {
 	var positions map[string]string
 	if err := json.Unmarshal([]byte(rec.Position), &positions); err != nil {
@@ -1506,6 +1508,14 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		//
 		// But the caller will still want their cutoverFunc called. So we do that
 		// and then exit.
+		//
+		// No post-setup or resume check runs on this path, so run the target
+		// schema-objects check here: with no tables there is no table trigger
+		// to match, but a target event (or a trigger on a leftover checkpoint
+		// table) is still refused before the cutover callback.
+		if err := check.TargetSchemaObjectsError(ctx, r.targets, nil); err != nil {
+			return err
+		}
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
 		if err := r.status.DoContext(ctx, status.CutOver, func() error {
 			if r.cutoverFunc == nil {

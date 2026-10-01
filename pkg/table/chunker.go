@@ -102,18 +102,47 @@ type MappedChunker interface {
 	KeyBelowLowWatermark(key0 any) bool
 	// KeyNotYetDispatched reports whether the chunker has definitely not yet
 	// handed out a chunk covering key0. When true, no copier read for that key
-	// is in flight, so a buffered change for it can be flushed immediately:
-	// the copier's later read of the covering chunk observes a source state at
-	// least as new as the change, and overwrites it. It is the flush-time
-	// counterpart of KeyBelowLowWatermark ("already copied and committed") —
-	// between them sits the in-flight band, which is the only region a flush
-	// must defer.
+	// is in flight, so a buffered change for it can be flushed immediately.
+	// It is the flush-time counterpart of KeyBelowLowWatermark ("already
+	// copied and committed") — between them sits the in-flight band, which is
+	// the only region a flush must defer.
+	//
+	// Flushing such a key writes it to the target ahead of the copier, and
+	// the copier's INSERT IGNORE later skips it rather than overwriting it.
+	// That is only correct because every later change for the key keeps
+	// reaching the target: see BufferedKeyNoter.
 	//
 	// TRUE means the caller will flush, so any ambiguity must return FALSE.
 	// Unlike KeyAboveHighWatermark this is NOT a discard decision, so it
 	// deliberately ignores checkpointHighPtr: a key copied by a *previous*
 	// run has no read in flight in this one.
 	KeyNotYetDispatched(key0 any) bool
+}
+
+// BufferedKeyNoter is an optional capability of a MappedChunker. The change
+// stream type-asserts for it once, when it creates a subscription.
+//
+// A chunker that does not implement it still works, but the change stream
+// then never applies the above-high-watermark discard for that subscription:
+// every change is buffered and applied, which is always correct but applies
+// changes the copier would otherwise have picked up. The in-tree chunkers
+// implement it.
+type BufferedKeyNoter interface {
+	// NoteBufferedKey records that the change stream admitted a change for
+	// key0 into its buffer instead of discarding it. The change stream calls
+	// it for every admitted change, whether or not the watermark
+	// optimization is enabled at that moment.
+	//
+	// If key0 is not yet covered by a dispatched chunk, the buffered change
+	// can reach the target before the copier does (see KeyNotYetDispatched,
+	// and the flush that runs before SetWatermarkOptimization(true)), and
+	// the copier's INSERT IGNORE cannot overwrite it afterwards. A later
+	// change for the same key must therefore never be discarded as above the
+	// high watermark: the target would keep the earlier image, or, for a
+	// DELETE, a row the source no longer has. After this call
+	// KeyAboveHighWatermark returns FALSE for key0 and every key below it,
+	// the same way it does for keys at or below checkpointHighPtr.
+	NoteBufferedKey(key0 any)
 }
 
 // ChunkerConfig holds optional configuration for creating a Chunker.

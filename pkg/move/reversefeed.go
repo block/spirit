@@ -47,8 +47,11 @@ type ReverseSource struct {
 	User     string             // binlog syncer user
 	Password string             // binlog syncer password
 	Tables   []*table.TableInfo // S-side tables to watch, built on DB
-	// Position is the opaque change.Source position to resume from (captured at
-	// cutover). Empty means start from the source's current head. Its encoding
+	// Position is the opaque change.Source position to resume from: the one
+	// captured at cutover, or on a resumed window the feed's flushed position
+	// as last checkpointed during the window (see
+	// reverseWindow.checkpointPositions). Empty means start from the source's
+	// current head. Its encoding
 	// also selects the change-source coordinate scheme, exactly like a
 	// checkpoint resume (see change.NewAutoClient): a GTID set resumes through
 	// the GTID client (and requires the server to still have GTIDs enabled), a

@@ -75,6 +75,6 @@ Two constraints and one resume note:
 
 - **Unsharded source only** — reverse-window is a 1→M forward move reversed as M→1; a sharded source would need an M:N reverse and is rejected at startup.
 - **Stale-marker guard** — a `_spirit_move_revert` present at pre-flight or pre-cutover aborts the run, so a leftover from an interrupted rollback is never read as a fresh request.
-- **Resume** — the checkpoint gains `move_phase` (`reverse_window` / `reverting`) and `cutover_at` columns, so a move killed during the window resumes back into it rather than re-copying. The `reverting` phase (mid-rollback) is not auto-resumed and must be completed manually.
+- **Resume** — the checkpoint gains `move_phase` (`reverse_window` / `reverting`) and `cutover_at` columns, so a move killed during the window resumes back into it rather than re-copying. During the window the checkpoint's position is advanced to the reverse feeds' flushed positions every `CheckpointDumpInterval`, so the resumed feeds start from what they had already applied, not from the cutover. The `reverting` phase (mid-rollback) is not auto-resumed and must be completed manually.
 
 Reverse-window writes use the configured `WriteThreads` count (including its default), independently of the forward autoscaler’s resolved count. This keeps uninterrupted and resumed reverse windows consistent without applying forward-target capacity assumptions to the reverse destinations.

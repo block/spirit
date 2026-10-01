@@ -241,6 +241,7 @@ func TestBufferedMapFlushUnderLockBypassesWatermark(t *testing.T) {
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
 		chunker:               mockChunker,
+		keyNoter:              mockChunker,
 		watermarkOptimization: true, // Enable watermark optimization
 		pkIsMemoryComparable:  true, // INT PK -> map mode
 	}
@@ -368,6 +369,7 @@ func TestBufferedMapFlushWithoutLockRespectsWatermark(t *testing.T) {
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
 		chunker:               mockChunker,
+		keyNoter:              mockChunker,
 		watermarkOptimization: true, // Enable watermark optimization
 		pkIsMemoryComparable:  true, // INT PK -> map mode
 	}
@@ -463,6 +465,7 @@ func TestBufferedMapQueueModeRouting(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: false,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -535,6 +538,7 @@ func TestBufferedMapQueueModeFlush(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: false,
 		// watermarkOptimization left false so queue mode is active.
 	}
@@ -616,6 +620,7 @@ func TestBufferedMapQueueModeFIFOOrder(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: false,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -682,6 +687,7 @@ func TestBufferedMapTransitionDrainsOutgoing(t *testing.T) {
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
 		chunker:               mockChunker,
+		keyNoter:              mockChunker,
 		watermarkOptimization: true,
 		pkIsMemoryComparable:  false,
 	}
@@ -767,6 +773,7 @@ func TestBufferedMapToggleDrainFailureLeavesFlagUnchanged(t *testing.T) {
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
 		chunker:               mockChunker,
+		keyNoter:              mockChunker,
 		watermarkOptimization: true,
 		pkIsMemoryComparable:  false,
 	}
@@ -838,6 +845,7 @@ func TestBufferedMapTogglePassthrough(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: true,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -883,6 +891,7 @@ func TestBufferedMapConcurrentHasChanged(t *testing.T) {
 		newTable: dstTable,
 		changes:  make(map[string]bufferedChange),
 		chunker:  mockChunker,
+		keyNoter: mockChunker,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
 
@@ -935,6 +944,7 @@ func TestBufferedMapKeyOverwriteDedupes(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: true,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -979,6 +989,7 @@ func TestBufferedMapHasChangedNilAndEmpty(t *testing.T) {
 		newTable: dstTable,
 		changes:  make(map[string]bufferedChange),
 		chunker:  mockChunker,
+		keyNoter: mockChunker,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
 
@@ -1026,6 +1037,7 @@ func TestBufferedMapKeyAboveWatermarkCounters(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: true,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -1095,6 +1107,7 @@ func TestBufferedMapQueueFlushEmpty(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: false,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -1149,6 +1162,7 @@ func TestBufferedMapQueueFlushUnderLock(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: false,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -1227,6 +1241,7 @@ func TestBufferedMapQueueConcurrentFlush(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: false,
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -1828,6 +1843,7 @@ func TestBufferedMapSeparatorInPKValues(t *testing.T) {
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: false,
 		// watermarkOptimization on => map mode (copy phase). MockChunker
 		// returns false from KeyAboveHighWatermark for string keys, so
@@ -1882,6 +1898,7 @@ func newByteCapBufferedMap(fake *applier.MockApplier, queueMode bool) *bufferedM
 		table:                &table.TableInfo{SchemaName: "test", TableName: "bytecap"},
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
+		keyNoter:             mockChunker,
 		pkIsMemoryComparable: !queueMode,
 		// watermarkOptimization left false: no watermark filtering, and
 		// with pkIsMemoryComparable=false this selects queue mode.

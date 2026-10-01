@@ -144,6 +144,8 @@ Spirit requires an account with these privileges:
 
 `SELECT` and `TRIGGER` on the schema (listed above; `*.*` also works) make its views and triggers visible. Table-level grants do not count. When more than one database-level grant matches a schema, each privilege must be on every matching grant. See [docs/move.md](docs/move.md) for roles and `rds_superuser_role`.
 
+`spirit move` refuses a trigger on a table it writes to on a target (a moved table, or its checkpoint table), and an event in a target schema, because they run on their own and can write to the moved tables. To see them, it requires `TRIGGER` and `EVENT` on each target schema or on `*.*`. See [docs/move.md](docs/move.md).
+
 For replica throttling, Spirit requires:
 
 ```sql

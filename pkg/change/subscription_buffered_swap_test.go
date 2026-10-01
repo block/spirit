@@ -101,6 +101,7 @@ func TestBufferedMapSwapPairFlushesViaReplace(t *testing.T) {
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
 		chunker:               mockChunker,
+		keyNoter:              mockChunker,
 		watermarkOptimization: false, // accept every event; no chunker-progress gating
 		pkIsMemoryComparable:  true,  // INT PK → map mode
 	}

@@ -81,7 +81,10 @@ type chunkerOptimistic struct {
 	logger *slog.Logger
 }
 
-var _ MappedChunker = &chunkerOptimistic{}
+var (
+	_ MappedChunker    = &chunkerOptimistic{}
+	_ BufferedKeyNoter = &chunkerOptimistic{}
+)
 
 // optimisticWatermark is the optimistic chunker's checkpoint format: the chunk
 // JSON with the settled row count alongside it, so that RowsCopied survives a
@@ -817,6 +820,11 @@ func (t *chunkerOptimistic) KeyAboveHighWatermark(key0 any) bool {
 			return false
 		}
 	}
+	// The same guard for keys the change stream may have written to the
+	// target ahead of the copier in this run (see NoteBufferedKey).
+	if t.discardSuppressedByBufferedKey(keyDatum, t.logger) {
+		return false
+	}
 	// Finally we check the chunkPtr.
 	above, err := keyDatum.GreaterThanOrEqual(t.chunkPtr)
 	if err != nil {
@@ -901,6 +909,23 @@ func (t *chunkerOptimistic) KeyNotYetDispatched(key0 any) bool {
 		return false
 	}
 	return above
+}
+
+// NoteBufferedKey satisfies BufferedKeyNoter. See the interface docs.
+func (t *chunkerOptimistic) NoteBufferedKey(key0 any) {
+	t.Lock()
+	defer t.Unlock()
+	if t.finalChunkSent {
+		// KeyAboveHighWatermark never discards once the final chunk is out.
+		return
+	}
+	if !t.isOpen {
+		// chunkPtr has no type yet, so key0 cannot be converted.
+		t.noteBufferedKey(Datum{}, ErrChunkerNotOpen, Datum{}, t.Ti.QuotedTableName, t.logger)
+		return
+	}
+	keyDatum, err := NewDatum(key0, t.chunkPtr.Tp)
+	t.noteBufferedKey(keyDatum, err, t.chunkPtr, t.Ti.QuotedTableName, t.logger)
 }
 
 func (t *chunkerOptimistic) Tables() []*TableInfo {

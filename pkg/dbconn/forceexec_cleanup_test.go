@@ -25,8 +25,7 @@ import (
 
 func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_delayed_cleanup", "CREATE TABLE forceexec_delayed_cleanup (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -46,12 +45,34 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
 	_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_delayed_cleanup")
 	require.NoError(t, err)
-	calls := 0
+	calls, blockerAliveOnRetry := 0, 0
+	isWaiting := waitingOn(tt.DB)
 	err = forceExec(ctx, db, config, slog.Default(),
 		"ALTER TABLE forceexec_delayed_cleanup ADD COLUMN c INT, ALGORITHM=INSTANT",
-		waitingOn(tt.DB),
-		func(context.Context, int) ([]int, error) {
+		func(ctx context.Context, connID int) (bool, error) {
+			// An attempt's kill worker stops at its kill, so every check
+			// after the first kill belongs to a retry. A retry that started
+			// before the killed blocker exited is still waiting on it at its
+			// first check, one poll interval in, however soon the blocker
+			// exits after that.
+			if calls > 0 {
+				var remaining int
+				if err := tt.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM performance_schema.threads WHERE processlist_id = ?", pid).Scan(&remaining); err != nil {
+					return false, err
+				}
+				blockerAliveOnRetry += remaining
+			}
+			return isWaiting(ctx, connID)
+		},
+		func(ctx context.Context, _ int) ([]int, error) {
 			calls++
+			if calls > 1 {
+				// Each retry runs its own kill worker, which kills when the
+				// retry waits for its lock for the kill delay. That can be an
+				// unrelated session's metadata lock on a shared server, so a
+				// later kill is not itself a failure.
+				return nil, nil
+			}
 			workers.Go(func() {
 				timer := time.NewTimer(1500 * time.Millisecond)
 				defer timer.Stop()
@@ -64,7 +85,8 @@ func TestForceExecWaitsForKilledSessionCleanup(t *testing.T) {
 			return []int{pid}, nil
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
-	require.Equal(t, 1, calls, "must not kill a fresh set of blockers on retry")
+	require.GreaterOrEqual(t, calls, 1)
+	require.Zero(t, blockerAliveOnRetry, "the retry must not start until the killed blocker has exited")
 	var column string
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COLUMN_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_delayed_cleanup' AND column_name = 'c'").Scan(&column))
 	require.Equal(t, "c", column)
@@ -99,6 +121,12 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				tt := testutils.NewTestTable(t, "forceexec_ancillary_failure", "CREATE TABLE forceexec_ancillary_failure (id INT PRIMARY KEY)")
 				config := NewDBConfig()
 				config.LockWaitTimeout = 1
+				// An attempt kills only once its kill worker has seen the
+				// statement waiting for the kill delay, and a slow check
+				// under load can push that past the lock wait timeout. Half
+				// the timeout, rather than the default 900ms, leaves a margin
+				// for attempts that must kill.
+				config.ForceKillAfter = 500 * time.Millisecond
 				db, err := New(testutils.DSN(), config)
 				require.NoError(t, err)
 				defer utils.CloseAndLog(db)
@@ -110,7 +138,7 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				defer func() { _ = blocker.Rollback() }()
 				var pid int
 				require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
-				// The blocked case runs every attempt at ~1.25s each.
+				// The blocked case runs up to MaxRetries attempts at ~1.75s each.
 				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()
 				_, err = blocker.ExecContext(ctx, "SELECT * FROM forceexec_ancillary_failure")
@@ -118,9 +146,19 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 				var logs bytes.Buffer
 				logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 				killCalls, cleanupCalls := 0, 0
-				fail := func() error {
-					// Keep the first attempt blocked beyond its one-second lock budget.
-					timer := time.NewTimer(250 * time.Millisecond)
+				var attemptErrs []error // one per statement execution
+				fail := func(calls int) error {
+					// Released: only the first call is the ancillary failure. A
+					// retry kills again if it waits for its lock for the kill
+					// delay, which an unrelated session's metadata lock on a
+					// shared server can cause; that later call must not hold up
+					// the retry or fail it.
+					if release && calls > 1 {
+						return nil
+					}
+					// Keep the first attempt blocked beyond its one-second lock
+					// budget: the kill runs at 500ms.
+					timer := time.NewTimer(750 * time.Millisecond)
 					defer timer.Stop()
 					select {
 					case <-ctx.Done():
@@ -138,22 +176,35 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 					func(context.Context, int) ([]int, error) {
 						killCalls++
 						if stage == "kill" {
-							return nil, fail()
+							return nil, fail(killCalls)
 						}
 						return []int{pid}, nil
-					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail() }, nil)
-				// Released: the retry succeeds before its own kill worker kills.
-				// Blocked: every attempt times out and re-arms the kill.
-				expectedCalls := 1
-				if !release {
-					expectedCalls = config.MaxRetries
+					}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return fail(cleanupCalls) },
+					func(err error) { attemptErrs = append(attemptErrs, err) })
+				// How many attempts run depends on timing: an attempt is retried
+				// only if its kill worker saw it waiting for the kill delay
+				// before it timed out. What holds however many run: the first
+				// attempt's ancillary failure does not stop the retry, the
+				// retries stay within MaxRetries, and every attempt but the last
+				// ran a kill (and, for cleanup, a cleanup wait) and was retried.
+				attempts := len(attemptErrs)
+				require.GreaterOrEqual(t, attempts, 2, "the ancillary failure must not stop the retry")
+				require.LessOrEqual(t, attempts, config.MaxRetries)
+				for _, attemptErr := range attemptErrs[:attempts-1] {
+					var ddlErr *mysql.MySQLError
+					require.ErrorAs(t, attemptErr, &ddlErr)
+					require.EqualValues(t, 1205, ddlErr.Number)
 				}
-				require.Equal(t, expectedCalls, killCalls)
+				require.Equal(t, attempts-1, strings.Count(logs.String(), "retrying statement after lock wait timeout: it waited for its lock for the kill delay"))
+				// The last attempt is not retried, whether or not it killed.
+				require.GreaterOrEqual(t, killCalls, attempts-1)
+				require.LessOrEqual(t, killCalls, attempts)
 				if stage == "cleanup" {
-					// The final attempt's failure is returned without a cleanup wait.
-					require.Equal(t, min(expectedCalls, config.MaxRetries-1), cleanupCalls)
+					require.Equal(t, attempts-1, cleanupCalls)
 					require.Contains(t, logs.String(), "waiting for killed sessions")
 				}
+				// ForceExec returns the last statement's own error.
+				require.Equal(t, attemptErrs[attempts-1], err)
 				require.Contains(t, logs.String(), "retrying statement anyway")
 				require.Contains(t, logs.String(), "EOF")
 				if release {
@@ -174,8 +225,7 @@ func TestForceExecAncillaryFailuresPreserveRetry(t *testing.T) {
 // that case; the empty PID set only makes cleanup waiting a no-op.
 func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_no_kill", "CREATE TABLE forceexec_no_kill (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -193,9 +243,15 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 		waitingOn(tt.DB),
 		func(ctx context.Context, _ int) ([]int, error) {
 			calls++
-			// The kill runs at the 900ms delay. Hold the blocker beyond the
+			if calls > 1 {
+				// The retry's own kill worker kills if the retry waits for its
+				// lock for the kill delay, which an unrelated session's
+				// metadata lock on a shared server can cause.
+				return nil, nil
+			}
+			// The kill runs at the 100ms delay. Hold the blocker beyond the
 			// first statement's one-second timeout, then let it exit voluntarily.
-			timer := time.NewTimer(250 * time.Millisecond)
+			timer := time.NewTimer(1150 * time.Millisecond)
 			defer timer.Stop()
 			select {
 			case <-ctx.Done():
@@ -205,7 +261,7 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 			return nil, blocker.Rollback()
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
-	require.Equal(t, 1, calls)
+	require.GreaterOrEqual(t, calls, 1)
 	var count int
 	require.NoError(t, tt.DB.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_no_kill' AND column_name = 'c'").Scan(&count))
@@ -218,8 +274,7 @@ func TestForceExecRetriesWhenBlockerExitsWithoutKill(t *testing.T) {
 // retry without one times out again and the caller falls back to a copy.
 func TestForceExecRetryKillsFreshBlocker(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_fresh_blocker", "CREATE TABLE forceexec_fresh_blocker (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -243,22 +298,25 @@ func TestForceExecRetryKillsFreshBlocker(t *testing.T) {
 		}
 	}()
 	attempts := 0
-	start := time.Now()
+	// The retry starts only after the first kill returns, because the kill
+	// worker is joined first, so the retry's wait starts after this point.
+	var firstKillReturned, retryKillCalled time.Time
 	err = forceExec(ctx, db, config, slog.Default(),
 		"ALTER TABLE forceexec_fresh_blocker ADD COLUMN c INT, ALGORITHM=INSTANT",
 		waitingOn(tt.DB),
 		func(ctx context.Context, connID int) ([]int, error) {
 			attempts++
 			if attempts > 1 {
+				retryKillCalled = time.Now()
 				// The retry's kill worker saw it waiting: the real kill must find the fresh blocker.
 				return killLockingTransactions(ctx, db, tables, config, slog.Default(), []int{connID})
 			}
-			// The kill runs at the 900ms delay. Hold the first blocker past the
+			// The kill runs at the 100ms delay. Hold the first blocker past the
 			// one-second lock budget so the first attempt definitely fails,
 			// then swap in a fresh blocker before the retry can run. With
 			// the first attempt's request withdrawn nothing queues ahead
 			// of the fresh SELECT's shared lock.
-			timer := time.NewTimer(250 * time.Millisecond)
+			timer := time.NewTimer(1150 * time.Millisecond)
 			defer timer.Stop()
 			select {
 			case <-ctx.Done():
@@ -273,11 +331,12 @@ func TestForceExecRetryKillsFreshBlocker(t *testing.T) {
 				return nil, err
 			}
 			_, err = second.ExecContext(ctx, "SELECT * FROM forceexec_fresh_blocker")
+			firstKillReturned = time.Now()
 			return nil, err
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, attempts, "the retry must run its own kill worker and kill")
-	require.GreaterOrEqual(t, time.Since(start), 2*config.forceKillDelay(), "each attempt keeps the grace period")
+	require.GreaterOrEqual(t, retryKillCalled.Sub(firstKillReturned), config.forceKillDelay(), "the retry gives its blocker the kill delay too")
 	_, err = second.ExecContext(ctx, "SELECT 1")
 	require.Error(t, err, "the fresh blocker must have been killed")
 	var count int
@@ -290,8 +349,7 @@ func TestForceExecRetryKillsFreshBlocker(t *testing.T) {
 // attempt's lock wait timeout, not an endless retry.
 func TestForceExecGivesUpAfterMaxRetries(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_max_retries", "CREATE TABLE forceexec_max_retries (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	config.MaxRetries = 2
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
@@ -324,8 +382,7 @@ func TestForceExecGivesUpAfterMaxRetries(t *testing.T) {
 // bound never falls to zero, which would retry, and kill, without end.
 func TestForceExecWithoutRetryBudgetMakesOneAttempt(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_no_budget", "CREATE TABLE forceexec_no_budget (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	config.MaxRetries = 0
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
@@ -430,8 +487,7 @@ func TestForceExecRetainsConnectionUntilKillWorkerExits(t *testing.T) {
 // same lock for a full lock wait timeout and block the table's traffic again.
 func TestForceExecStopsWhenKillFindsTableLock(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_table_lock_found", "CREATE TABLE forceexec_table_lock_found (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	require.Greater(t, config.MaxRetries, 1)
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
@@ -487,8 +543,7 @@ func TestForceExecStopsWhenABlockerSurvivesTheKill(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tt := testutils.NewTestTable(t, "forceexec_blocker_survives", "CREATE TABLE forceexec_blocker_survives (id INT PRIMARY KEY)")
-			config := NewDBConfig()
-			config.LockWaitTimeout = 1
+			config := newShortKillDelayConfig()
 			require.Greater(t, config.MaxRetries, 1)
 			db, err := New(testutils.DSN(), config)
 			require.NoError(t, err)
@@ -534,8 +589,7 @@ func TestForceExecMakesOneAttemptAgainstAHeavyTransaction(t *testing.T) {
 	threshold := TransactionWeightThreshold
 	TransactionWeightThreshold = 0
 	t.Cleanup(func() { TransactionWeightThreshold = threshold })
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	require.Greater(t, config.MaxRetries, 1)
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
@@ -639,8 +693,7 @@ func TestKillLockingTransactionsReportsKillsBesideADeniedOne(t *testing.T) {
 // attempt: the next attempt's KILL of the other user's blocker is denied too.
 func TestForceExecMakesOneAttemptWhenAKillIsDenied(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_kill_denied", "CREATE TABLE forceexec_kill_denied (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	require.Greater(t, config.MaxRetries, 1)
 	db := newNoKillUserDB(t, config)
 	defer utils.CloseAndLog(db)
@@ -669,8 +722,7 @@ func TestForceExecMakesOneAttemptWhenAKillIsDenied(t *testing.T) {
 // after one attempt, leaving the locking session connected.
 func TestForceExecMakesOneAttemptAgainstLockTables(t *testing.T) {
 	tt := testutils.NewTestTable(t, "forceexec_lock_tables", "CREATE TABLE forceexec_lock_tables (id INT PRIMARY KEY)")
-	config := NewDBConfig()
-	config.LockWaitTimeout = 1
+	config := newShortKillDelayConfig()
 	require.Greater(t, config.MaxRetries, 1)
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
@@ -697,6 +749,18 @@ func TestForceExecMakesOneAttemptAgainstLockTables(t *testing.T) {
 	// The locking session was not killed.
 	_, err = locker.ExecContext(ctx, "UNLOCK TABLES")
 	require.NoError(t, err)
+}
+
+// newShortKillDelayConfig returns a config with a one-second lock wait timeout
+// and a 100ms kill delay, for tests that need the kill to run but do not test
+// when it runs. The default delay at that timeout is 900ms, which leaves
+// 100ms for the waiting check and the kill before the statement times out; a
+// slow check on a loaded server misses it, and the attempt ends with no kill.
+func newShortKillDelayConfig() *DBConfig {
+	config := NewDBConfig()
+	config.LockWaitTimeout = 1
+	config.ForceKillAfter = 100 * time.Millisecond
+	return config
 }
 
 // waitingOn checks, over db, whether a session is waiting for a metadata lock
@@ -944,16 +1008,22 @@ func TestForceExecSparesTrafficDuringAnInplaceRebuild(t *testing.T) {
 		KEY pad_idx (pad),
 		KEY tenant_pad_idx (tenant, pad)
 	)`)
-	// Enough rows, with random indexed values, that the rebuild copies for
-	// several times as long as the bystander's transaction stays open.
+	// Enough rows, with random indexed values, that the rebuild is still
+	// copying when the bystander commits, ForceKillAfter + 2*killPollInterval
+	// (300ms) after the copy starts. On an idle host the copy takes about
+	// 0.5-0.7s, roughly twice that window. A loaded host only lengthens it.
 	tt.SeedRows(t, "INSERT INTO forceexec_inplace (pad, tenant) SELECT RANDOM_BYTES(64), FLOOR(RAND() * 1000)", 1<<18)
 	config := NewDBConfig()
 	config.LockWaitTimeout = 2
-	config.ForceKillAfter = 200 * time.Millisecond
+	// A short delay keeps the bystander's window short. It must still outlast
+	// the few milliseconds the rebuild takes to reach its copy: a kill that
+	// wrongly counted the running rebuild as waiting fires at the delay after
+	// the rebuild starts, and catches that only if the bystander is open.
+	config.ForceKillAfter = 100 * time.Millisecond
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
@@ -996,11 +1066,28 @@ func TestForceExecSparesTrafficDuringAnInplaceRebuild(t *testing.T) {
 	require.Equal(t, copying, state, "the rebuild must still be copying when the bystander commits, or the bystander may have blocked it")
 	require.NoError(t, bystander.Commit(), "the bystander's transaction was not killed")
 
+	// This deadline only bounds how long the rebuild may take to finish. The
+	// timing the test depends on is measured from when the copy starts, so a
+	// slow runner that stretches the copy makes it easier to satisfy, not
+	// harder, and must not fail the test.
+	const rebuildDeadline = 2 * time.Minute
 	select {
 	case err := <-rebuildDone:
 		require.NoError(t, err)
-	case <-ctx.Done():
-		t.Fatal("the rebuild did not complete")
+	case <-time.After(rebuildDeadline):
+		// Read the rebuild's state while it is still running, to tell a slow
+		// copy from a rebuild stuck waiting for a lock. Then stop it, and wait
+		// for ForceExec to return before reading the log it writes to.
+		state, stateErr := rebuildState()
+		cancel()
+		select {
+		case err := <-rebuildDone:
+			t.Fatalf("the rebuild did not complete within %v: state=%q (err=%v), ForceExec returned %v after cancel\nForceExec log:\n%s",
+				rebuildDeadline, state, stateErr, err, logs.String())
+		case <-time.After(30 * time.Second):
+			t.Fatalf("the rebuild did not complete within %v: state=%q (err=%v), and ForceExec did not return after cancel",
+				rebuildDeadline, state, stateErr)
+		}
 	}
 	require.NotContains(t, logs.String(), "killing locking transaction")
 }
@@ -1087,31 +1174,53 @@ func TestForceExecKillsRightAfterACheckThatRunsPastTheDelay(t *testing.T) {
 	tbl := table.NewTableInfo(db, "test", "forceexec_slow_check")
 	started := time.Now()
 	// The statement really is waiting. Every check says so at once, except
-	// the one that starts shortly before the delay, which ends 30ms after it.
-	const slowCheckEnds = 880 * time.Millisecond
-	var killedAfter time.Duration
-	attempts := 0
+	// the last one that starts before the delay, which ends 30ms after it.
+	// The slow check is picked by count, not by time since started: the
+	// worker's clock starts later, once forceExec has a connection and its ID.
+	// While the delay is more than a poll away, each check starts a full poll
+	// after the one before it returned, so the slow check starts at least
+	// 800ms into the worker's wait and returns at least 880ms into it.
+	slowCheck := int(config.ForceKillAfter / killPollInterval)
+	const slowCheckTakes = 80 * time.Millisecond
+	var killedAt, slowCheckReturned, lastCheckStarted time.Time
+	checks, attempts := 0, 0
 	err = forceExec(ctx, db, config, slog.Default(),
 		"ALTER TABLE forceexec_slow_check ADD COLUMN c INT, ALGORITHM=INSTANT",
 		func(ctx context.Context, _ int) (bool, error) {
-			if elapsed := time.Since(started); elapsed >= 750*time.Millisecond && elapsed < config.ForceKillAfter {
+			lastCheckStarted = time.Now()
+			checks++
+			if checks == slowCheck {
 				select {
-				case <-time.After(time.Until(started.Add(slowCheckEnds))):
+				case <-time.After(slowCheckTakes):
 				case <-ctx.Done():
 					return false, ctx.Err()
 				}
+				slowCheckReturned = time.Now()
 			}
 			return true, nil
 		},
 		func(ctx context.Context, connID int) ([]int, error) {
 			attempts++
-			killedAfter = time.Since(started)
+			killedAt = time.Now()
 			return killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), []int{connID})
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, attempts)
-	require.GreaterOrEqual(t, killedAfter, slowCheckEnds)
-	require.Less(t, killedAfter, slowCheckEnds+40*time.Millisecond, "the kill must follow the slow check, not wait for the next poll")
+	require.False(t, slowCheckReturned.IsZero(), "the slow check must have run")
+	// The check that killed must have started at the delay or later. The
+	// worker starts its clock after started, so this bound never fails a
+	// correct kill.
+	require.GreaterOrEqual(t, lastCheckStarted.Sub(started), config.ForceKillAfter, "the kill must not come before the delay")
+	// Waiting for the next poll would put the kill a full poll interval after
+	// the slow check returned. Half an interval leaves room for scheduling
+	// delays.
+	require.Less(t, killedAt.Sub(slowCheckReturned), killPollInterval/2, "the kill must follow the slow check, not wait for the next poll")
+	// The slow check ends past the delay, so the check right after it kills.
+	// The slow check kills itself only if polls drifted enough that it started
+	// past the delay. A kill that lands late, after a run of checks that each
+	// follow the last at once, would come from a later check and still be
+	// within half an interval of the slow check.
+	require.LessOrEqual(t, checks, slowCheck+1, "the kill must come from the check right after the slow one")
 }
 
 // The kill worker checks at the moment the delay is reached, not only on its
@@ -1139,20 +1248,36 @@ func TestForceExecKillsAtTheDelayBetweenPolls(t *testing.T) {
 	require.NoError(t, err)
 	tbl := table.NewTableInfo(db, "test", "forceexec_between_polls")
 	started := time.Now()
-	var killedAfter time.Duration
+	var killedAt time.Time
+	var checksReturned []time.Time
 	attempts := 0
 	err = forceExec(ctx, db, config, slog.Default(),
 		"ALTER TABLE forceexec_between_polls ADD COLUMN c INT, ALGORITHM=INSTANT",
-		func(context.Context, int) (bool, error) { return true, nil },
+		func(context.Context, int) (bool, error) {
+			checksReturned = append(checksReturned, time.Now())
+			return true, nil
+		},
 		func(ctx context.Context, connID int) ([]int, error) {
 			attempts++
-			killedAfter = time.Since(started)
+			killedAt = time.Now()
 			return killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, config, slog.Default(), []int{connID})
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, attempts)
-	require.GreaterOrEqual(t, killedAfter, config.ForceKillAfter)
-	require.Less(t, killedAfter, config.ForceKillAfter+40*time.Millisecond, "the kill must land at the delay, not on the next poll")
+	require.GreaterOrEqual(t, killedAt.Sub(started), config.ForceKillAfter)
+	// The last check is the one that killed. The poll before it lands half an
+	// interval before the delay, so the kill follows it by about half an
+	// interval. Waiting for the next poll would put the kill at least a full
+	// interval after it. Measuring from that poll, not from the test's start,
+	// keeps connection setup and a late poll out of the budget.
+	require.GreaterOrEqual(t, len(checksReturned), 2)
+	lastPoll := checksReturned[len(checksReturned)-2]
+	require.Less(t, killedAt.Sub(lastPoll), killPollInterval, "the kill must land at the delay, not on the next poll")
+	// The poll before the kill must be a regular one, a full interval after the
+	// check before it. Otherwise a kill that lands late, after a run of checks
+	// that each follow the last at once, is within an interval of the last one.
+	require.GreaterOrEqual(t, len(checksReturned), 3)
+	require.GreaterOrEqual(t, lastPoll.Sub(checksReturned[len(checksReturned)-3]), killPollInterval, "the poll before the kill must be a regular poll")
 }
 
 // A statement that holds its locks and runs is checked once per poll interval,
