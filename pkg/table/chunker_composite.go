@@ -35,16 +35,18 @@ type chunkerComposite struct {
 	isOpen         bool
 
 	// endPtrs is the largest key tuple in the table, read the first time
-	// next() runs and re-read at most every lastChunkStatisticsThreshold.
+	// next() runs and re-read at most once more per walk (endPtrsRefreshed),
+	// if it is older than lastChunkStatisticsThreshold when reached.
 	// The boundary prefetch never looks past it, so the final chunk is
 	// sent once the chunker reaches it. Without this bound the chunker
 	// ends only when fewer than chunkSize rows remain after chunkPtrs,
 	// which a writer inserting ascending keys can keep from happening.
 	// The final chunk stays open-ended, so rows inserted above endPtrs
 	// are still copied. An empty endPtrs means the table was empty.
-	endPtrs       []Datum
-	endPtrsLoaded bool
-	endPtrsAt     time.Time
+	endPtrs          []Datum
+	endPtrsLoaded    bool
+	endPtrsRefreshed bool
+	endPtrsAt        time.Time
 
 	columnMapping *ColumnMapping
 
@@ -112,13 +114,16 @@ func (t *chunkerComposite) next() (*Chunk, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(upperDatums) == 0 && time.Since(t.endPtrsAt) > lastChunkStatisticsThreshold {
-		// We reached endPtrs, but it may be stale. Re-read it once so the
+	if len(upperDatums) == 0 && !t.endPtrsRefreshed && time.Since(t.endPtrsAt) > lastChunkStatisticsThreshold {
+		// We reached endPtrs, but it may be stale. Re-read it so the
 		// open-ended final chunk only has to pick up rows inserted since
-		// then, not every row inserted since the copy began.
+		// then, not every row inserted since the copy began. Only once per
+		// walk: refreshing every time the end is reached would let a writer
+		// that outpaces the copy keep the final chunk from ever being sent.
 		if err := t.loadEndPtrs(); err != nil {
 			return nil, err
 		}
+		t.endPtrsRefreshed = true
 		if upperDatums, err = t.prefetchUpperBound(); err != nil {
 			return nil, err
 		}
@@ -380,6 +385,7 @@ func (t *chunkerComposite) Reset() error {
 	t.finalChunkSent = false
 	t.endPtrs = nil
 	t.endPtrsLoaded = false
+	t.endPtrsRefreshed = false
 	t.chunkSize = StartingChunkSize
 	t.watermark = nil
 	t.lowerBoundWatermarkMap = make(map[string]*Chunk, 0)
@@ -477,6 +483,7 @@ func (t *chunkerComposite) open() (err error) {
 	t.finalChunkSent = false
 	t.endPtrs = nil
 	t.endPtrsLoaded = false
+	t.endPtrsRefreshed = false
 	t.chunkSize = StartingChunkSize
 	t.inflightChunks = 0
 	t.checkpointHighPtr = Datum{} // reset checkpoint high pointer

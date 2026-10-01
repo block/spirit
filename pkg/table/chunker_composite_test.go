@@ -2014,10 +2014,28 @@ func TestCompositeChunkerRefreshesStaleEndOfKeyRange(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO "+tbl+" (pk, a) WITH RECURSIVE seq AS (SELECT 101 AS n UNION ALL SELECT n+1 FROM seq WHERE n < 300) SELECT n, n FROM seq")
 	chunker.endPtrsAt = time.Now().Add(-2 * lastChunkStatisticsThreshold)
 
+	// Make the refreshed end stale too, before the chunker reaches it, and
+	// keep appending: it must not refresh a second time and chase the writer.
+	chunk, err := chunker.Next()
+	require.NoError(t, err)
+	require.Equal(t, "`pk` >= 11 AND `pk` < 22", chunk.String())
+	chunker.endPtrsAt = time.Now().Add(-2 * lastChunkStatisticsThreshold)
+	for range 9 { // 11..99: up to the original end
+		_, err = chunker.Next()
+		require.NoError(t, err)
+	}
+	require.True(t, chunker.endPtrsRefreshed, "reaching the stale end re-reads it")
+	chunker.endPtrsAt = time.Now().Add(-2 * lastChunkStatisticsThreshold)
+	testutils.RunSQL(t, "INSERT INTO "+tbl+" (pk, a) WITH RECURSIVE seq AS (SELECT 301 AS n UNION ALL SELECT n+1 FROM seq WHERE n < 500) SELECT n, n FROM seq")
+
 	chunks := drainChunks(t, chunker)
 	final := chunks[len(chunks)-1]
 	require.Nil(t, final.UpperBound)
-	require.Equal(t, "`pk` >= 297", final.String())
+	require.Equal(t, "`pk` >= 297", final.String(), "the end is refreshed at most once per walk")
+
+	// Reset starts a new walk, which may refresh again.
+	require.NoError(t, chunker.Reset())
+	require.False(t, chunker.endPtrsRefreshed)
 }
 
 // TestCompositeChunkerStopsAtEndOfMultiColumnKeyRange is the multi-column
