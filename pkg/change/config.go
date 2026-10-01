@@ -43,6 +43,40 @@ const (
 	FatalReasonFlushError
 )
 
+// PreservesCheckpoint reports whether a finite run (a migration or a move)
+// can still resume from its checkpoint after aborting for this reason. Only a
+// failed stream or a failed flush leaves the watched tables unchanged and the
+// checkpoint usable. Every other reason — including any future one — reports
+// false: invalidating costs a restart, while wrongly resuming could corrupt
+// data.
+func (f FatalReason) PreservesCheckpoint() bool {
+	return f == FatalReasonStreamError || f == FatalReasonFlushError
+}
+
+// Advice returns what a finite run logs when it aborts for this reason, naming
+// the run as noun ("migration", "move"): whether the checkpoint survives and
+// what the operator must do before re-running. It is empty for a schema
+// change, which the change client has already logged.
+func (f FatalReason) Advice(noun string) string {
+	switch f { //nolint: exhaustive // a schema change needs no further advice
+	case FatalReasonStreamError:
+		return fmt.Sprintf("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the %s from it", noun)
+	case FatalReasonFlushError:
+		// The resume coordinate has stopped advancing, so a resume replays
+		// the same changes: the cause (logged just before) must be fixed
+		// first.
+		return fmt.Sprintf("fatal error applying replicated changes; the checkpoint has been preserved — fix the cause of the error and re-run spirit to resume the %s from it", noun)
+	case FatalReasonUnsupportedXA:
+		// Resuming streams straight back into the XA group.
+		return fmt.Sprintf("XA transaction detected; the checkpoint will be invalidated — stop XA activity and start a fresh %s", noun)
+	case FatalReasonLogPosWrapped:
+		// Resuming streams forward into the same oversized transaction.
+		return fmt.Sprintf("binlog LogPos wrapped past 4GiB; the checkpoint will be invalidated — enable GTIDs (or lower max_binlog_cache_size so no transaction can grow a binlog file beyond 4GiB) and start a fresh %s", noun)
+	default:
+		return ""
+	}
+}
+
 // String implements fmt.Stringer for logging.
 func (f FatalReason) String() string {
 	switch f {

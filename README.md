@@ -59,7 +59,7 @@ Spirit will attempt to use MySQL 8.0's `INSTANT` DDL assertion before applying t
 
 Spirit periodically saves the progress of a schema change to an internal checkpoint table. If the migration is interrupted, it can be resumed with only about the last minute of progress lost. There are no flags required to enable this feature; it will apply automatically provided that Spirit is invoked with an identical `ALTER` statement and the required binary logs are still available.
 
-When you consider that many migrations are best measured in _days_, this feature can save you a lot of lost work and improves the predictability of large-table schema migrations.
+When you consider that many migrations are best measured in _days_, this feature can save you a lot of lost work and improves the predictability of large-table schema migrations. See [pkg/checkpoint](pkg/checkpoint/README.md) for how checkpoints are stored and when a run resumes or starts fresh.
 
 > **⚠️ Resume across Spirit binary versions is not supported.** A migration must be resumed by the same Spirit binary version that wrote the checkpoint. See [checkpoint-max-age](docs/migrate.md#checkpoint-max-age) for details on what Spirit does (and does not) detect when a different version is used to resume.
 

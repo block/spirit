@@ -66,13 +66,13 @@ func TestThrottleStatusReportsReasonDuringCopy(t *testing.T) {
 
 	// No throttler resolved yet (setup has not reached setupThrottler, or found
 	// nothing to throttle on): not throttled, and no invented load reading.
-	ts := r.throttleStatus(status.CopyRows)
+	ts := r.snapshot(status.CopyRows).ThrottleStatus()
 	require.False(t, ts.Throttled)
 	require.Empty(t, ts.Reason)
 	require.Zero(t, ts.Utilization)
 
 	r.setThrottler(&throttler.Mock{})
-	ts = r.throttleStatus(status.CopyRows)
+	ts = r.snapshot(status.CopyRows).ThrottleStatus()
 	require.True(t, ts.Throttled)
 	require.Equal(t, "mock throttler (always throttled)", ts.Reason)
 }
@@ -84,9 +84,9 @@ func TestThrottleStatusNarrowsToLoadSignalsDuringChecksum(t *testing.T) {
 	r := &Runner{}
 	r.setThrottler(&throttler.Mock{})
 
-	require.True(t, r.throttleStatus(status.CopyRows).Throttled)
+	require.True(t, r.snapshot(status.CopyRows).ThrottleStatus().Throttled)
 
-	checksumThrottle := r.throttleStatus(status.Checksum)
+	checksumThrottle := r.snapshot(status.Checksum).ThrottleStatus()
 	require.False(t, checksumThrottle.Throttled,
 		"a checksum must not be reported as throttled by a signal it does not honour")
 	require.Empty(t, checksumThrottle.Reason)
@@ -111,7 +111,7 @@ func TestThrottleStatusIsZeroInUnpacedPhases(t *testing.T) {
 	}
 	for _, state := range unpaced {
 		t.Run(state.String(), func(t *testing.T) {
-			require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(state),
+			require.Equal(t, status.ThrottleStatus{}, r.snapshot(state).ThrottleStatus(),
 				"nothing paces itself against a throttler in %s, so status must not report it as paused", state)
 		})
 	}
@@ -211,13 +211,13 @@ func TestContinuousChecksumThrottleStatus(t *testing.T) {
 	checker := &activeContinuousChecker{}
 	r := &Runner{checker: checker}
 	r.setThrottler(&gradualTestThrottler{throttled: true})
-	require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(status.WaitingOnSentinelTable))
+	require.Equal(t, status.ThrottleStatus{}, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus())
 	checker.active = true
-	require.True(t, r.throttleStatus(status.WaitingOnSentinelTable).Throttled)
+	require.True(t, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus().Throttled)
 	r.setThrottler(&throttler.Mock{})
-	require.False(t, r.throttleStatus(status.WaitingOnSentinelTable).Throttled, "replica/binary signals do not pace checksum")
+	require.False(t, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus().Throttled, "replica/binary signals do not pace checksum")
 	checker.active = false
-	require.Equal(t, status.ThrottleStatus{}, r.throttleStatus(status.WaitingOnSentinelTable))
+	require.Equal(t, status.ThrottleStatus{}, r.snapshot(status.WaitingOnSentinelTable).ThrottleStatus())
 }
 
 func (*activeContinuousChecker) GetProgress() status.ChecksumProgress {

@@ -1229,9 +1229,10 @@ func (r *Runner) createApplier() (applier.Applier, error) {
 		return r.sync.Applier, nil
 	}
 	appl, err := applier.New([]applier.Target{r.target}, &applier.ApplierConfig{
-		DBConfig: r.targetDBConfig,
-		Logger:   r.logger,
-		Threads:  r.sync.WriteThreads,
+		DBConfig:    r.targetDBConfig,
+		Logger:      r.logger,
+		Threads:     r.sync.WriteThreads,
+		MetricsSink: r.metricsSink,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create applier: %w", err)

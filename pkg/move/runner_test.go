@@ -16,10 +16,12 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
+	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -1924,4 +1926,51 @@ func TestMoveForceSourceAlias(t *testing.T) {
 		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT val FROM precious WHERE id=1").Scan(&val))
 		require.Equal(t, 42, val)
 	}
+}
+
+// applierStatsSink records whether an applier pipeline gauge was sent.
+type applierStatsSink struct{ seen atomic.Bool }
+
+func (s *applierStatsSink) Send(_ context.Context, m *metrics.Metrics) error {
+	for _, v := range m.Values {
+		if v.Name == metrics.ApplierQueueDepthMetricName {
+			s.seen.Store(true)
+		}
+	}
+	return nil
+}
+
+// TestCreateApplierReportsStatsToMetricsSink checks that the applier a move
+// builds reports its pipeline stats to the sink installed with SetMetricsSink.
+// Without the sink in its config the applier starts no stats emitter, so a
+// move's applier gauges were never reported. The emitter ticks every
+// autoscale.Tick, so the first send arrives one tick after Start.
+func TestCreateApplierReportsStatsToMetricsSink(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	dstName, dstDB := testutils.CreateUniqueTestDatabase(t)
+	src := cfg.Clone()
+	src.DBName = srcName
+	dst := cfg.Clone()
+	dst.DBName = dstName
+
+	r, err := NewRunner(&Move{
+		SourceDSN: src.FormatDSN(),
+		TargetDSN: dst.FormatDSN(),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+	})
+	require.NoError(t, err)
+	sink := &applierStatsSink{}
+	r.SetMetricsSink(sink)
+	r.dbConfig = dbconn.NewDBConfig()
+	r.targets = []applier.Target{{DB: dstDB, Config: dst, KeyRange: "0"}}
+
+	appl, err := r.createApplier()
+	require.NoError(t, err)
+	require.NoError(t, appl.Start(t.Context()))
+	defer func() { require.NoError(t, appl.Stop()) }()
+
+	require.Eventually(t, sink.seen.Load, 3*autoscale.Tick, 50*time.Millisecond,
+		"the move's applier never reported its stats to the metrics sink")
 }
