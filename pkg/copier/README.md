@@ -229,11 +229,13 @@ The copier fails fast on errors:
 The copier provides sophisticated ETA estimation:
 
 1. **Warmup Period**: Returns "TBD" for the first minute to allow for stabilization
-2. **Rate Calculation**: Every 10 seconds, calculates rows/second based on progress
-3. **Remaining Time**: Divides remaining rows by current rate
+2. **Rate Calculation**: Every 10 seconds, samples the rows copied in that interval and reports the rows/second averaged over the most recent 2 minutes of samples. Until the window fills it averages every sample so far, so the first estimate arrives at the end of the warmup period built from the whole period rather than from its last 10 seconds. If nothing was copied in the entire window (the copy has been paused for longer than the window covers), the rate falls back to the run's overall pace, so the ETA keeps reporting the remaining time at the speed the copy has actually sustained.
+3. **Remaining Time**: Divides remaining rows by the current rate
 4. **Nearly Complete**: Returns "DUE" when >99.99% complete
 
-The estimate used to carry a relative comparison against an hour-old estimate (`2h30m (-15m from 1h ago)`). It was removed in [#329](https://github.com/block/spirit/issues/329): the sign convention read backwards to most people, and the underlying estimate is derived from a single unsmoothed 10-second sample, so the comparison mostly reported sampling noise.
+The window exists because a single interval is too noisy to pace an ETA on: parallel threads land their chunks unevenly, and a throttler pausing the copy for part of an interval reads as a collapse in speed that the next interval reverses, swinging the ETA by hours between two status polls.
+
+The estimate used to carry a relative comparison against an hour-old estimate (`2h30m (-15m from 1h ago)`). It was removed in [#329](https://github.com/block/spirit/issues/329): the sign convention read backwards to most people, and the estimate was then derived from a single unsmoothed 10-second sample, so the comparison mostly reported sampling noise.
 
 The ETA adapts to changing conditions like throttling, system load, or chunk size adjustments.
 
