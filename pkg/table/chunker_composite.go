@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,20 +32,6 @@ type chunkerComposite struct {
 	where          string     // any additional WHERE conditions.
 	finalChunkSent bool
 	isOpen         bool
-
-	// endPtrs is the largest key tuple in the table, read the first time
-	// next() runs and re-read at most once more per walk (endPtrsRefreshed),
-	// if it is older than lastChunkStatisticsThreshold when reached.
-	// The boundary prefetch never looks past it, so the final chunk is
-	// sent once the chunker reaches it. Without this bound the chunker
-	// ends only when fewer than chunkSize rows remain after chunkPtrs,
-	// which a writer inserting ascending keys can keep from happening.
-	// The final chunk stays open-ended, so rows inserted above endPtrs
-	// are still copied. An empty endPtrs means the table was empty.
-	endPtrs          []Datum
-	endPtrsLoaded    bool
-	endPtrsRefreshed bool
-	endPtrsAt        time.Time
 
 	columnMapping *ColumnMapping
 
@@ -105,28 +90,34 @@ func (t *chunkerComposite) next() (*Chunk, error) {
 	if !t.isOpen {
 		return nil, ErrTableNotOpen
 	}
-	if !t.endPtrsLoaded {
-		if err := t.loadEndPtrs(); err != nil {
-			return nil, err
-		}
+	// Start prefetching the next chunk
+	// First assume it's the first chunk, we can overwrite this
+	// just below.
+	quotedChunkKeys := sqlescape.EscapeIdentifierList(t.chunkKeys)
+	quotedKeyName := sqlescape.EscapeIdentifier(t.keyName)
+	query := fmt.Sprintf("SELECT %s FROM %s FORCE INDEX (%s) %s ORDER BY %s LIMIT 1 OFFSET %d",
+		quotedChunkKeys,
+		t.Ti.QuotedTableName,
+		quotedKeyName,
+		t.additionalConditionsSQL(false),
+		quotedChunkKeys,
+		t.chunkSize,
+	)
+	if !t.isFirstChunk() {
+		// This is not the first chunk, since we have pointers set.
+		query = fmt.Sprintf("SELECT %s FROM %s FORCE INDEX (%s) WHERE %s %s ORDER BY %s LIMIT 1 OFFSET %d",
+			quotedChunkKeys,
+			t.Ti.QuotedTableName,
+			quotedKeyName,
+			expandRowConstructorComparison(t.chunkKeys, OpGreaterThan, t.chunkPtrs),
+			t.additionalConditionsSQL(true),
+			quotedChunkKeys, // order by
+			t.chunkSize,
+		)
 	}
-	upperDatums, err := t.prefetchUpperBound()
+	upperDatums, err := t.nextQueryToDatums(query)
 	if err != nil {
 		return nil, err
-	}
-	if len(upperDatums) == 0 && !t.endPtrsRefreshed && time.Since(t.endPtrsAt) > lastChunkStatisticsThreshold {
-		// We reached endPtrs, but it may be stale. Re-read it so the
-		// open-ended final chunk only has to pick up rows inserted since
-		// then, not every row inserted since the copy began. Only once per
-		// walk: refreshing every time the end is reached would let a writer
-		// that outpaces the copy keep the final chunk from ever being sent.
-		if err := t.loadEndPtrs(); err != nil {
-			return nil, err
-		}
-		t.endPtrsRefreshed = true
-		if upperDatums, err = t.prefetchUpperBound(); err != nil {
-			return nil, err
-		}
 	}
 	// Handle the special cases first:
 	// there were no rows found, so we are at the end
@@ -171,56 +162,6 @@ func (t *chunkerComposite) next() (*Chunk, error) {
 		NewTable:             t.NewTi,
 		ColumnMapping:        t.columnMapping,
 	}, nil
-}
-
-// prefetchUpperBound returns the key tuple chunkSize rows after chunkPtrs
-// (or after the start of the table for the first chunk), considering only
-// keys at or below endPtrs. It returns nil when fewer rows remain, meaning
-// the next chunk is the final one.
-func (t *chunkerComposite) prefetchUpperBound() ([]Datum, error) {
-	if len(t.endPtrs) == 0 {
-		return nil, nil // the table was empty when endPtrs was read.
-	}
-	conds := []string{expandRowConstructorComparison(t.chunkKeys, OpLessEqual, t.endPtrs)}
-	if !t.isFirstChunk() {
-		conds = append(conds, expandRowConstructorComparison(t.chunkKeys, OpGreaterThan, t.chunkPtrs))
-	}
-	if t.where != "" {
-		conds = append(conds, "("+t.where+")")
-	}
-	quotedChunkKeys := sqlescape.EscapeIdentifierList(t.chunkKeys)
-	query := fmt.Sprintf("SELECT %s FROM %s FORCE INDEX (%s) WHERE %s ORDER BY %s LIMIT 1 OFFSET %d",
-		quotedChunkKeys,
-		t.Ti.QuotedTableName,
-		sqlescape.EscapeIdentifier(t.keyName),
-		strings.Join(conds, " AND "),
-		quotedChunkKeys,
-		t.chunkSize,
-	)
-	return t.nextQueryToDatums(query)
-}
-
-// loadEndPtrs reads the largest key tuple (matching t.where) into endPtrs.
-func (t *chunkerComposite) loadEndPtrs() error {
-	descKeys := make([]string, len(t.chunkKeys))
-	for i, col := range t.chunkKeys {
-		descKeys[i] = sqlescape.EscapeIdentifier(col) + " DESC"
-	}
-	query := fmt.Sprintf("SELECT %s FROM %s FORCE INDEX (%s) %s ORDER BY %s LIMIT 1",
-		sqlescape.EscapeIdentifierList(t.chunkKeys),
-		t.Ti.QuotedTableName,
-		sqlescape.EscapeIdentifier(t.keyName),
-		t.additionalConditionsSQL(false),
-		strings.Join(descKeys, ", "),
-	)
-	endPtrs, err := t.nextQueryToDatums(query)
-	if err != nil {
-		return fmt.Errorf("reading the end of the key range: %w", err)
-	}
-	t.endPtrs = endPtrs
-	t.endPtrsLoaded = true
-	t.endPtrsAt = time.Now()
-	return nil
 }
 
 func (t *chunkerComposite) isFirstChunk() bool {
@@ -383,9 +324,6 @@ func (t *chunkerComposite) Reset() error {
 	// Reset all state to initial values
 	t.chunkPtrs = []Datum{} // reset to empty slice (first chunk)
 	t.finalChunkSent = false
-	t.endPtrs = nil
-	t.endPtrsLoaded = false
-	t.endPtrsRefreshed = false
 	t.chunkSize = StartingChunkSize
 	t.watermark = nil
 	t.lowerBoundWatermarkMap = make(map[string]*Chunk, 0)
@@ -481,9 +419,6 @@ func (t *chunkerComposite) open() (err error) {
 		t.keyName = "PRIMARY"
 	}
 	t.finalChunkSent = false
-	t.endPtrs = nil
-	t.endPtrsLoaded = false
-	t.endPtrsRefreshed = false
 	t.chunkSize = StartingChunkSize
 	t.inflightChunks = 0
 	t.checkpointHighPtr = Datum{} // reset checkpoint high pointer
