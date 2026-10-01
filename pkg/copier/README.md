@@ -229,7 +229,7 @@ The copier fails fast on errors:
 The copier provides sophisticated ETA estimation:
 
 1. **Warmup Period**: Returns "TBD" for the first minute to allow for stabilization
-2. **Rate Calculation**: Every 10 seconds, samples the rows copied in that interval and reports the rows/second averaged over the most recent 2 minutes of samples. Until the window fills it averages every sample so far, so the first estimate arrives at the end of the warmup period built from the whole period rather than from its last 10 seconds. If nothing was copied in the entire window (the copy has been paused for longer than the window covers), the rate falls back to the run's overall pace, so the ETA keeps reporting the remaining time at the speed the copy has actually sustained.
+2. **Rate Calculation**: Every 10 seconds, samples the rows copied in that interval and reports the rows/second averaged over the most recent 2 minutes of samples. Until the window fills it averages every sample so far, so the first estimate arrives at the end of the warmup period built from the whole period rather than from its last 10 seconds. If nothing was copied in the entire window (the copy has been paused for longer than the window covers), the rate holds the last value the window reported, so the ETA keeps reporting rather than reverting to "TBD". A pause therefore drains the rate one interval at a time and a resume refills it the same way, with no jump at either edge. During a long pause the ETA stops counting down, which together with the `throttled` column says the copy is not progressing.
 3. **Remaining Time**: Divides remaining rows by the current rate
 4. **Nearly Complete**: Returns "DUE" when >99.99% complete
 
