@@ -1414,13 +1414,38 @@ func TestRunUntilCleanHonoursMaxPasses(t *testing.T) {
 type stallableFeed struct {
 	*change.MockSource
 	stalled atomic.Bool
+	calls   atomic.Int64 // every Flush call, stalled or not
 }
 
 func (f *stallableFeed) Flush(ctx context.Context) error {
+	f.calls.Add(1)
 	if f.stalled.Load() {
 		return nil
 	}
 	return f.MockSource.Flush(ctx)
+}
+
+// The checker requests a flush once per gated retry, not on every poll: a
+// flush that returns without completing (a failing or stalled feed) must not
+// be re-requested four times a second until RetryFlushWait expires.
+func TestGatedRetryRequestsOneFlush(t *testing.T) {
+	cfg := fastConfig()
+	cfg.RetryDelay = time.Millisecond
+	cfg.RetryFlushWait = time.Hour
+	c := newTestChecker(t, newTestChunker(1), cfg, func(context.Context, *table.Chunk, int) (int64, int64, uint64, error) {
+		return 1, 2, 1, nil // the target never matches
+	})
+	feed := &stallableFeed{MockSource: &change.MockSource{}}
+	feed.stalled.Store(true)
+	c.feeds = []change.Source{feed}
+
+	stop, _ := runUntil(t, c)
+	defer func() { require.ErrorIs(t, stop(), context.Canceled) }()
+	require.Eventually(t, func() bool { return feed.calls.Load() == 1 }, 5*time.Second, time.Millisecond,
+		"the gated retry requests a flush")
+	time.Sleep(4 * retryFlushPoll)
+	require.Equal(t, int64(1), feed.calls.Load(), "the same gate does not request a flush again")
+	require.Zero(t, c.Stats().PassesCompleted, "the retry is still waiting on the flush")
 }
 
 // A retry waits for the change feed to flush, because until then the target
@@ -1476,8 +1501,10 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 		time.Sleep(300 * time.Millisecond) // 300 RetryDelays
 		require.Equal(t, 1, readCount(), "no retry before the feed has flushed")
 
-		// The checker's own flush request now goes through.
+		// The checker's one request for this gate went to the stalled feed;
+		// the next flush (the periodic one, here) releases the retry.
 		feed.stalled.Store(false)
+		require.NoError(t, feed.Flush(t.Context()))
 		select {
 		case err := <-errCh:
 			require.NoError(t, err, "the first retry after the flush sees the target caught up")
@@ -1485,7 +1512,21 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 			t.Fatal("retry was not released by the flush")
 		}
 		require.Equal(t, 2, readCount())
-		require.Positive(t, feed.Flushes(), "the checker requested the flush; nothing else flushes this feed")
+	})
+
+	t.Run("a waiting retry requests the flush", func(t *testing.T) {
+		mu.Lock()
+		reads, lastSrc, tgt = 0, 0, 0
+		mu.Unlock()
+		feed.stalled.Store(false)
+		before := feed.Flushes()
+		c := newChecker(t, time.Minute)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, c.RunUntilClean(ctx),
+			"nothing else flushes this feed: the checker's own request releases the retry")
+		require.Equal(t, 2, readCount())
+		require.Equal(t, before+1, feed.Flushes())
 	})
 
 	t.Run("deadline releases a feed that never flushes", func(t *testing.T) {
