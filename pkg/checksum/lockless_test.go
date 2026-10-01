@@ -1407,12 +1407,29 @@ func TestRunUntilCleanHonoursMaxPasses(t *testing.T) {
 	require.True(t, c.Stats().FirstCleanPassAt.IsZero())
 }
 
+// stallableFeed is a MockSource that can stop flushing: while stalled, Flush
+// returns without flushing and the flush count does not move, which is how a
+// feed that has stopped flushing looks to the checker. The checker requests
+// flushes itself, so a plain MockSource can never look stalled.
+type stallableFeed struct {
+	*change.MockSource
+	stalled atomic.Bool
+}
+
+func (f *stallableFeed) Flush(ctx context.Context) error {
+	if f.stalled.Load() {
+		return nil
+	}
+	return f.MockSource.Flush(ctx)
+}
+
 // A retry waits for the change feed to flush, because until then the target
 // cannot have moved. The chunk here is hot and the target shows the source as
 // of the last flush — the shape of a feed that applies every
 // DefaultFlushInterval. Retried on RetryDelay alone, every re-read would see
 // the same stale target, spend the MaxHotAttempts budget on it, and defer the
-// chunk; gated on the flush, the one retry passes.
+// chunk; gated on the flush, the one retry passes. The checker requests that
+// flush itself rather than waiting for the periodic one.
 func TestRetryWaitsForFeedFlush(t *testing.T) {
 	var (
 		mu      sync.Mutex
@@ -1420,12 +1437,12 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 		lastSrc int64
 		tgt     int64 // the source as of the last flush
 	)
-	feed := &change.MockSource{FlushFn: func(context.Context) error {
+	feed := &stallableFeed{MockSource: &change.MockSource{FlushFn: func(context.Context) error {
 		mu.Lock()
 		defer mu.Unlock()
 		tgt = lastSrc
 		return nil
-	}}
+	}}}
 	readCount := func() int {
 		mu.Lock()
 		defer mu.Unlock()
@@ -1450,6 +1467,7 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 	}
 
 	t.Run("gated until a flush", func(t *testing.T) {
+		feed.stalled.Store(true)
 		c := newChecker(t, time.Minute)
 		errCh := make(chan error, 1)
 		go func() { errCh <- c.RunUntilClean(t.Context()) }()
@@ -1458,7 +1476,8 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 		time.Sleep(300 * time.Millisecond) // 300 RetryDelays
 		require.Equal(t, 1, readCount(), "no retry before the feed has flushed")
 
-		require.NoError(t, feed.Flush(t.Context()))
+		// The checker's own flush request now goes through.
+		feed.stalled.Store(false)
 		select {
 		case err := <-errCh:
 			require.NoError(t, err, "the first retry after the flush sees the target caught up")
@@ -1466,12 +1485,14 @@ func TestRetryWaitsForFeedFlush(t *testing.T) {
 			t.Fatal("retry was not released by the flush")
 		}
 		require.Equal(t, 2, readCount())
+		require.Positive(t, feed.Flushes(), "the checker requested the flush; nothing else flushes this feed")
 	})
 
 	t.Run("deadline releases a feed that never flushes", func(t *testing.T) {
 		mu.Lock()
 		reads, lastSrc, tgt = 0, 0, 0
 		mu.Unlock()
+		feed.stalled.Store(true)
 		c := newChecker(t, 20*time.Millisecond)
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
@@ -2034,12 +2055,13 @@ func TestSplitChildrenGoAheadOfGatedRetries(t *testing.T) {
 		mu.Unlock()
 		return 700, 700, 1, nil
 	})
-	feed := &change.MockSource{}
+	feed := &stallableFeed{MockSource: &change.MockSource{}}
 	c.feeds = []change.Source{feed}
 	c.splitChunk = func(ctx context.Context, _ *table.Chunk, _ uint64) ([]*table.Chunk, error) {
 		mu.Lock()
 		split = true // no flush from here on
 		mu.Unlock()
+		feed.stalled.Store(true)
 		releaseOnce.Do(func() { close(releaseLag) })
 		// Hand the children over only once the lagging chunk's gated retry is
 		// the whole queue (the hot parent is in flight here, not queued).

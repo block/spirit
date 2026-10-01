@@ -440,6 +440,13 @@ func (c *LocklessChecker) flushResidual() (int, int) {
 // flush's start, and the re-read spends one attempt. Requiring two flushes
 // would close that, at the cost of doubling every gated wait.
 //
+// Waiting for the periodic flush would make every retry round cost up to a
+// full flush interval, and a hot range that has to split needs several rounds
+// in sequence. So once a retry has waited out RetryDelay and is held only by
+// the flush, the dispatcher requests one (see runOnePass): the retry is
+// released as soon as that flush completes, and it still re-reads a target
+// that has applied every change up to its own read.
+//
 // Without feeds there is nothing to wait for, so the entry is left ungated.
 // The deadline covers a feed that has stopped flushing — the retry then
 // proceeds on RetryDelay alone, as if ungated.
@@ -866,6 +873,29 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 	defer walkerCancel()
 	go c.runWalker(walkerCtx, walkCh, walkErrCh)
 
+	// requestFlush drains the change feeds in the background, at most one
+	// drain at a time. The dispatcher calls it when the retry at the head of
+	// the queue is due except for the flush it is gated on (see gateOnFlush).
+	// A failed drain is not fatal: the retry falls back to the periodic flush
+	// and, failing that, to its RetryFlushWait deadline.
+	flushCtx, flushCancel := context.WithCancel(ctx)
+	var flushWG sync.WaitGroup
+	var flushing atomic.Bool
+	defer flushWG.Wait()
+	defer flushCancel()
+	requestFlush := func() {
+		if !flushing.CompareAndSwap(false, true) {
+			return
+		}
+		flushWG.Go(func() {
+			defer flushing.Store(false)
+			if err := c.flushFeeds(flushCtx); err != nil && flushCtx.Err() == nil {
+				c.cfg.Logger.Warn("lockless checksum: could not flush the change feed for a waiting retry",
+					"error", err)
+			}
+		})
+	}
+
 	queue := list.New() // FIFO of *retryEntry
 	inFlight := 0
 	walkerDone := false
@@ -921,8 +951,13 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 			// entries are ungated and go to the front.)
 			if front := queue.Front(); front != nil {
 				e := front.Value.(*retryEntry)
+				now := time.Now()
 				var due bool
-				due, headWait = c.retryDue(e, time.Now())
+				due, headWait = c.retryDue(e, now)
+				if !due && !now.Before(e.notBefore) {
+					// Past RetryDelay, so only the flush gate holds it.
+					requestFlush()
+				}
 				if due {
 					dueHead = e
 					emit = &workItem{
