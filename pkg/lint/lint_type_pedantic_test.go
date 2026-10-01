@@ -55,6 +55,9 @@ func TestTypePedantic_SameName_TypeMismatch(t *testing.T) {
 	require.Equal(t,
 		`Column "customer_id" in table "returns" has type "int(11)" but 2 other tables use type "bigint(20) unsigned" (e.g. "invoices", "orders")`,
 		v.Message, "every identifier is quoted, and the table count agrees with its noun")
+	require.NotNil(t, v.Suggestion)
+	require.Equal(t, `Align "returns"."customer_id" to type "bigint(20) unsigned" for consistency`,
+		*v.Suggestion, "the suggestion quotes the table and column the message names")
 	require.Equal(t, "int(11)", v.Context["current_type"])
 	require.Equal(t, "bigint(20) unsigned", v.Context["expected_type"])
 }
@@ -127,6 +130,10 @@ func TestTypePedantic_InferredFK_Mismatch(t *testing.T) {
 	require.Equal(t, "orders", v.Location.Table)
 	require.Equal(t, "customer_id", *v.Location.Column)
 	require.Contains(t, v.Message, "customers")
+	require.NotNil(t, v.Suggestion)
+	require.Equal(t,
+		`Align types: "orders"."customer_id" ("int(11) unsigned") and "customers".id ("bigint(20) unsigned") should match — grow the smaller side rather than shrink the larger`,
+		*v.Suggestion, "the suggestion quotes both tables and the column")
 	require.Equal(t, "customers", v.Context["referenced_table"])
 }
 
@@ -654,7 +661,8 @@ func TestTypePedantic_SameName_CharsetMismatchWording(t *testing.T) {
 	require.Equal(t, true, v.Context["charset_differs"])
 	require.Contains(t, v.Message, "prevents index use")
 	require.NotNil(t, v.Suggestion)
-	require.Contains(t, *v.Suggestion, "CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci")
+	require.Equal(t, `Convert "legacy"."email" to CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci for consistency`,
+		*v.Suggestion, "identifiers are quoted; the CHARACTER SET clause stays as SQL")
 }
 
 func TestTypePedantic_SameName_CollationUndeclaredTablesAgree(t *testing.T) {
@@ -732,6 +740,9 @@ func TestTypePedantic_InferredFK_CollationUndeclaredTargetUsesAssumedCharset(t *
 	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "inferred_fk_collation")
 	require.Len(t, flagged, 1)
 	require.Equal(t, "utf8mb4_0900_ai_ci", flagged[0].Context["expected_collation"])
+	require.NotNil(t, flagged[0].Suggestion)
+	require.Equal(t, `Convert "orders"."customer_id" to CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci to match "customers".id`,
+		*flagged[0].Suggestion, "identifiers are quoted; the CHARACTER SET clause stays as SQL")
 }
 
 func TestTypePedantic_SameName_CollationIgnoresNonTextColumns(t *testing.T) {

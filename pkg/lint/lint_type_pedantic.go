@@ -415,7 +415,7 @@ func (l *TypePedanticLinter) sameNameTypes(refs []tpColRef) []Violation {
 					r.col.Name, r.table.TableName, r.typ, tpOtherTables(majorityTables), majority, tpExampleTables(majorityTables),
 				),
 				Location:   &Location{Table: r.table.TableName, Column: &colName},
-				Suggestion: new(fmt.Sprintf("Align %s.%s to type %q for consistency", r.table.TableName, r.col.Name, majority)),
+				Suggestion: new(fmt.Sprintf("Align %q.%q to type %q for consistency", r.table.TableName, r.col.Name, majority)),
 				Context: map[string]any{
 					"current_type":  r.typ,
 					"expected_type": majority,
@@ -492,7 +492,7 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 				),
 				Location: &Location{Table: r.table.TableName, Column: &colName},
 				Suggestion: new(fmt.Sprintf(
-					"Convert %s.%s to CHARACTER SET %s COLLATE %s for consistency",
+					"Convert %q.%q to CHARACTER SET %s COLLATE %s for consistency",
 					r.table.TableName, r.col.Name, charsetOf[majority], majority,
 				)),
 				Context: map[string]any{
@@ -574,7 +574,7 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 					),
 					Location: &Location{Table: t.TableName, Column: &colName},
 					Suggestion: new(fmt.Sprintf(
-						"Align types: %s.%s (%q) and %s.id (%q) should match — grow the smaller side rather than shrink the larger",
+						"Align types: %q.%q (%q) and %q.id (%q) should match — grow the smaller side rather than shrink the larger",
 						t.TableName, c.Name, colType, target.TableName, idType,
 					)),
 					Context: map[string]any{
@@ -606,7 +606,7 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 				),
 				Location: &Location{Table: t.TableName, Column: &colName},
 				Suggestion: new(fmt.Sprintf(
-					"Convert %s.%s to CHARACTER SET %s COLLATE %s to match %s.id",
+					"Convert %q.%q to CHARACTER SET %s COLLATE %s to match %q.id",
 					t.TableName, c.Name, idCharset, idCollation, target.TableName,
 				)),
 				Context: map[string]any{
