@@ -57,7 +57,8 @@ This protects against resuming from very stale checkpoints where replaying the a
 
 When Spirit reads a checkpoint, it relies on the columns of the checkpoint table matching the columns the current binary expects:
 
-- **If the checkpoint table schema differs** between versions (columns added, removed, or reordered), the resume read will fail and Spirit logs a warning and starts a fresh migration. Progress from the previous binary version is silently discarded.
+- **If the checkpoint table is missing a column the current binary expects** (typically, a newer binary resuming a checkpoint written by an older one), the resume read fails, and Spirit logs a warning and starts a fresh migration. Progress from the previous binary version is discarded.
+- **If the checkpoint table only has extra or reordered columns** (typically, an older binary resuming a checkpoint written by a newer one), the read succeeds, because Spirit selects the columns it knows by name. Spirit cannot detect the mismatch, and resumes from a checkpoint whose extra fields it ignores.
 - **If the checkpoint table schema is unchanged but the *meaning* of stored values has changed** between versions (for example, a watermark format change, a routing-policy change, or a new applier behavior), Spirit cannot detect the mismatch. The resume will silently succeed and the new binary will reinterpret the old checkpoint, which can produce incorrect results.
 
 Operationally, this means:
@@ -182,18 +183,7 @@ Cutover still requires a complete clean pass. Hot ranges are split. Small unreso
 snapshot drain: read target keys first, freeze source PK/CRC32 images once, and
 retry target reads until each frozen image has matched and every observed
 target-only key is absent. Later inserts do not expand the frozen work set, so
-an append-heavy tail can converge. There are no stream-backed or soft passes.
-**Current limitation:** workloads that continuously update the same rows are not
-currently supported reliably by the lockless algorithm. Splitting down to a
-single row does not resolve this: its frozen source image may be superseded
-before a target read observes it. A source row deleted before its image can be
-verified can remain unresolved for the same reason. The snapshot fallback helps
-append-heavy tails, but does not guarantee convergence for these hot-row workloads.
-
-Replication-applier integration is planned to address this limitation by using
-change-stream row images and their application to reconcile unresolved rows.
-That support is not implemented; the current checker requires matching target
-reads and does not accept unverified rows to complete the checksum.
+an append-heavy tail can converge.
 
 Each side is limited to 128 rows, with a combined 64 KiB key-data budget;
 oversized ranges stay on normal splitting/retries. Snapshot reads have a
@@ -201,20 +191,32 @@ oversized ranges stay on normal splitting/retries. Snapshot reads have a
 Snapshot retries use the ordinary retry delay and bounded
 hot-attempt count, then defer without authorizing cutover. Unresolved ranges
 are revisited in another pass. Completing a scan or
-deferring a hot range does not authorize cutover. Stable divergence aborts the
-migration instead of repairing the shadow table. Persistently hot workloads can
-therefore prevent completion; cancel the run or resume with the default checker.
+deferring a hot range does not authorize cutover. As with the default checker,
+a stable divergence found by the initial checksum is repaired from the source and
+re-verified on a later pass, while one found by the continuous checksum during
+the sentinel wait aborts the migration. The initial checksum gives up after 10
+passes without a clean one and fails the migration; resuming with the default
+checker is the fallback.
+
+Rows that are updated continuously are verified against the change stream
+rather than by reading the source again. A range that keeps changing is
+*settled* one row at a time: Spirit waits for the row's next change event,
+applies it to the shadow table, and compares the shadow row to that event's
+row image. The more often a row is written, the sooner its next event arrives.
+A row is deferred to the next pass instead when, for example, no change arrives
+within the range's 5-second settling budget, it is written again before the
+shadow row can be read, or the buffered changes cannot be fully applied. See
+[Continuously updated hot rows](../pkg/checksum/README.md#continuously-updated-hot-rows)
+for the full list.
 
 This is optimistic verification, not a comparison at one common source/target
 snapshot. Use it to evaluate the experimental algorithm before adopting it
 broadly. The final replication drain and cutover locking are unchanged.
 
-Copy checkpoints are preserved, but experimental checksum progress is neither
-saved nor resumed: verification starts from the beginning after a restart,
-including when resuming a checkpoint created by the default checker.
-`--checksum-yield-timeout` applies only to the default snapshot checksum. There
-is no equivalent overall deadline for the experimental gate: unresolved hot
-ranges can keep it running until cancelled. The status line's `deferred` count
+Initial checksum progress is checkpointed and resumed the same way as with the
+default checker, including when resuming a checkpoint created by the default
+checker. `--checksum-yield-timeout` applies only to the default snapshot
+checksum; the experimental gate is bounded by its 10-pass limit instead. The status line's `deferred` count
 covers only the current pass, not the lifetime of the run; use the timestamped
 hot-range and pass-completion logs to investigate repeated deferrals.
 

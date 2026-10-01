@@ -894,7 +894,7 @@ func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPas
 			return ctx.Err()
 		}
 		// Bound the finite gate. Without this a range that never converges —
-		// the continuously-updated hot row the algorithm cannot yet verify —
+		// a hot range that could not be settled against the change stream —
 		// keeps the caller in a full-table re-walk loop with no error and no
 		// end, which reads to an operator as a migration that has simply
 		// stopped making progress.
