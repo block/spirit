@@ -134,11 +134,12 @@ func (l *AllowCharset) allows(cs string) bool {
 	})
 }
 
-// suggestion lists the allowed charsets in the spelling the messages use.
+// suggestion lists the allowed charsets in the spelling the messages use,
+// each quoted the way the message quotes the charset it rejected.
 func (l *AllowCharset) suggestion() string {
 	names := make([]string, len(l.charsets))
 	for i, cs := range l.charsets {
 		names[i] = statement.NormalizeCharsetName(cs)
 	}
-	return "Use a supported character set: " + strings.Join(names, ", ")
+	return "Use a supported character set: " + quoteJoin(names)
 }

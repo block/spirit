@@ -17,8 +17,6 @@ import (
 	"github.com/block/spirit/pkg/throttler"
 )
 
-const copyEstimateInterval = 10 * time.Second // how frequently to re-estimate copy speed
-
 // Copier is the interface which copiers use. The single implementation
 // streams rows from the source through an applier to the target (the
 // DBLog-style buffered algorithm; see buffered.go). The legacy unbuffered

@@ -28,20 +28,20 @@ import (
 type buffered struct {
 	sync.Mutex
 
-	applier       applier.Applier
-	chunker       table.Chunker
-	concurrency   int
-	rowsPerSecond atomic.Uint64
-	chunkSize     atomic.Uint64 // size of the most recently claimed chunk; see Copier.ChunkSize
-	isInvalid     atomic.Bool
-	errMu         sync.Mutex // guards firstErr
-	firstErr      error      // first error that invalidated the copy (any goroutine)
-	startTime     time.Time
-	throttler     throttler.Throttler
-	dbConfig      *dbconn.DBConfig
-	logger        *slog.Logger
-	metricsSink   metrics.Sink
-	autoscale     AutoscaleConfig
+	applier     applier.Applier
+	chunker     table.Chunker
+	concurrency int
+	rate        copyRate
+	chunkSize   atomic.Uint64 // size of the most recently claimed chunk; see Copier.ChunkSize
+	isInvalid   atomic.Bool
+	errMu       sync.Mutex // guards firstErr
+	firstErr    error      // first error that invalidated the copy (any goroutine)
+	startTime   time.Time
+	throttler   throttler.Throttler
+	dbConfig    *dbconn.DBConfig
+	logger      *slog.Logger
+	metricsSink metrics.Sink
+	autoscale   AutoscaleConfig
 
 	// Read-worker pool management, symmetric with the applier's write-worker
 	// pool (SetWriteWorkers/ActiveWriteWorkers). concurrency above is the
@@ -639,12 +639,15 @@ func (c *buffered) GetETAState() status.ETA {
 	c.Lock()
 	defer c.Unlock()
 	copiedRows, totalRows, pct := c.getCopyStats()
-	return status.EstimateETA(copiedRows, totalRows, pct, c.rowsPerSecond.Load(), c.startTime)
+	return status.EstimateETA(copiedRows, totalRows, pct, c.rate.rowsPerSecond(), c.startTime)
 }
 
+// estimateRowsPerSecondLoop feeds the copy rate with the rows the chunker
+// reports copied in each copyEstimateInterval. The chunker's Progress is the
+// source because the copier no longer counts rows itself; for the optimistic
+// chunker it is keyspace distance rather than rows, which is what the ETA is
+// paced on either way.
 func (c *buffered) estimateRowsPerSecondLoop(ctx context.Context) {
-	// We take >10 second averages because with parallel copy it bounces around a lot.
-	// Get progress from chunker since we no longer track rows locally
 	prevRowsCount, _, _ := c.chunker.Progress()
 	ticker := time.NewTicker(copyEstimateInterval)
 	defer ticker.Stop()
@@ -657,10 +660,7 @@ func (c *buffered) estimateRowsPerSecondLoop(ctx context.Context) {
 				return
 			}
 			newRowsCount, _, _ := c.chunker.Progress()
-			rowsPerInterval := float64(newRowsCount - prevRowsCount)
-			intervalsDivisor := float64(copyEstimateInterval / time.Second) // should be something like 10 for 10 seconds
-			rowsPerSecond := uint64(rowsPerInterval / intervalsDivisor)
-			c.rowsPerSecond.Store(rowsPerSecond)
+			c.rate.observe(newRowsCount - prevRowsCount)
 			prevRowsCount = newRowsCount
 		}
 	}
