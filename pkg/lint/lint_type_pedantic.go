@@ -407,16 +407,15 @@ func (l *TypePedanticLinter) sameNameTypes(refs []tpColRef) []Violation {
 				continue
 			}
 			colName := r.col.Name
-			example := strings.Join(tpFirstN(majorityTables, 3), ", ")
 			violations = append(violations, Violation{
 				Linter:   l,
 				Severity: l.sameNameSeverity,
 				Message: fmt.Sprintf(
-					"Column %q in table %q has type %q but %d other table(s) use type %q (e.g. %s)",
-					r.col.Name, r.table.TableName, r.typ, len(majorityTables), majority, example,
+					"Column %q in table %q has type %q but %s type %q (e.g. %s)",
+					r.col.Name, r.table.TableName, r.typ, tpOtherTables(majorityTables), majority, tpExampleTables(majorityTables),
 				),
 				Location:   &Location{Table: r.table.TableName, Column: &colName},
-				Suggestion: new(fmt.Sprintf("Align %s.%s to type %q for consistency", r.table.TableName, r.col.Name, majority)),
+				Suggestion: new(fmt.Sprintf("Align %q.%q to type %q for consistency", r.table.TableName, r.col.Name, majority)),
 				Context: map[string]any{
 					"current_type":  r.typ,
 					"expected_type": majority,
@@ -483,18 +482,17 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 				continue
 			}
 			colName := r.col.Name
-			example := strings.Join(tpFirstN(majorityTables, 3), ", ")
 			violations = append(violations, Violation{
 				Linter:   l,
 				Severity: l.collationSeverity,
 				Message: fmt.Sprintf(
-					"Column %q in table %q uses collation %q but %d other table(s) use %q (e.g. %s) — %s",
-					r.col.Name, r.table.TableName, r.collation, len(majorityTables), majority, example,
+					"Column %q in table %q uses collation %q but %s %q (e.g. %s) — %s",
+					r.col.Name, r.table.TableName, r.collation, tpOtherTables(majorityTables), majority, tpExampleTables(majorityTables),
 					tpCollationConsequence(r.charset, charsetOf[majority]),
 				),
 				Location: &Location{Table: r.table.TableName, Column: &colName},
 				Suggestion: new(fmt.Sprintf(
-					"Convert %s.%s to CHARACTER SET %s COLLATE %s for consistency",
+					"Convert %q.%q to CHARACTER SET %s COLLATE %s for consistency",
 					r.table.TableName, r.col.Name, charsetOf[majority], majority,
 				)),
 				Context: map[string]any{
@@ -576,7 +574,7 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 					),
 					Location: &Location{Table: t.TableName, Column: &colName},
 					Suggestion: new(fmt.Sprintf(
-						"Align types: %s.%s (%q) and %s.id (%q) should match — grow the smaller side rather than shrink the larger",
+						"Align types: %q.%q (%q) and %q.id (%q) should match — grow the smaller side rather than shrink the larger",
 						t.TableName, c.Name, colType, target.TableName, idType,
 					)),
 					Context: map[string]any{
@@ -608,7 +606,7 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 				),
 				Location: &Location{Table: t.TableName, Column: &colName},
 				Suggestion: new(fmt.Sprintf(
-					"Convert %s.%s to CHARACTER SET %s COLLATE %s to match %s.id",
+					"Convert %q.%q to CHARACTER SET %s COLLATE %s to match %q.id",
 					t.TableName, c.Name, idCharset, idCollation, target.TableName,
 				)),
 				Context: map[string]any{
@@ -714,6 +712,27 @@ func tpPickMajority(counts map[string]int) (string, bool) {
 
 func tpDedupeStrings(ss []string) []string {
 	return slices.Compact(slices.Sorted(slices.Values(ss)))
+}
+
+// tpExampleLimit is how many of the majority's tables a message names. The
+// count beside the list says how many there are in total; the list only has
+// to show which tables the reader could open to see the majority type.
+const tpExampleLimit = 3
+
+// tpOtherTables counts the tables that hold the majority type or collation.
+func tpOtherTables(tables []string) string {
+	return countedPhrase(len(tables), "other table uses", "other tables use")
+}
+
+// tpExampleTables names up to tpExampleLimit of the majority's tables, each
+// quoted like every other identifier in the message, with a trailing ellipsis
+// when the list stops short of the count beside it.
+func tpExampleTables(tables []string) string {
+	examples := quoteJoin(tpFirstN(tables, tpExampleLimit))
+	if len(tables) > tpExampleLimit {
+		return examples + ", …"
+	}
+	return examples
 }
 
 func tpFirstN(s []string, n int) []string {

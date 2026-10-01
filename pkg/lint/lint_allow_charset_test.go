@@ -34,7 +34,7 @@ func TestDisallowedCharacterSet(t *testing.T) {
 	violations := linter.Lint(nil, stmts)
 	require.Len(t, violations, 1)
 	require.Contains(t, violations[0].Message, "Character set \"latin1\" given for table \"t1\" is not allowed")
-	require.Contains(t, *violations[0].Suggestion, "Use a supported character set: utf8mb4")
+	require.Contains(t, *violations[0].Suggestion, `Use a supported character set: "utf8mb4"`)
 }
 
 // Tests for column-level character sets
@@ -741,7 +741,7 @@ func TestUTF8MB3SpellingsConfigure(t *testing.T) {
 			require.Len(t, violations, 1)
 			require.Equal(t, "c", *violations[0].Location.Column)
 			require.Contains(t, violations[0].Message, `"latin1"`)
-			require.Equal(t, "Use a supported character set: utf8mb4, utf8mb3", *violations[0].Suggestion)
+			require.Equal(t, `Use a supported character set: "utf8mb4", "utf8mb3"`, *violations[0].Suggestion)
 		})
 	}
 }
@@ -762,5 +762,5 @@ func TestConfigureCharsetsWithSpaces(t *testing.T) {
 	violations := linter.Lint(nil, stmts)
 	require.Len(t, violations, 1)
 	require.Equal(t, "b", *violations[0].Location.Column)
-	require.Equal(t, "Use a supported character set: utf8mb4, utf8mb3", *violations[0].Suggestion)
+	require.Equal(t, `Use a supported character set: "utf8mb4", "utf8mb3"`, *violations[0].Suggestion)
 }

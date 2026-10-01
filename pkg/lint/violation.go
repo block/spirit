@@ -92,6 +92,16 @@ func quotedList(items []string) string {
 	return "(" + quoteJoin(items) + ")"
 }
 
+// countedPhrase renders a count with the words that follow it in number
+// agreement — `1 other table uses` versus `2 other tables use` — so a message
+// never hedges with "table(s)" when the count is known.
+func countedPhrase(n int, singular, plural string) string {
+	if n == 1 {
+		return "1 " + singular
+	}
+	return fmt.Sprintf("%d %s", n, plural)
+}
+
 // columnsPhrase renders a column list with its noun in number agreement —
 // `column "a"` versus `columns ("a", "b")` — so messages never read
 // `columns ("a")` for a single column.
