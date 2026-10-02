@@ -854,15 +854,26 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NULL PARTITION BY RANGE"},
 		},
 		{
-			// MySQL folds each bound when it stores it: 20, 30, 40, 300, 395.
+			// MySQL folds each bound when it stores it: 20, 30, 40, 300, 405.
 			name:   "AppendExpressionBounds",
 			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
 			insert: "INSERT INTO diff_part_chg (id) VALUES (1), (5)",
 			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), " +
 				"PARTITION p1 VALUES LESS THAN (10+10), PARTITION p2 VALUES LESS THAN (+30), PARTITION p3 VALUES LESS THAN ((40)), " +
-				"PARTITION p4 VALUES LESS THAN (7 DIV 2 * 100), PARTITION p5 VALUES LESS THAN (MOD(1000, 600) - -(-5)))",
+				"PARTITION p4 VALUES LESS THAN (7 DIV 2 * 100), PARTITION p5 VALUES LESS THAN (MOD(1000, 600) - -5))",
 			expected: []string{"ADD PARTITION"},
 			after:    "INSERT INTO diff_part_chg (id) VALUES (394)",
+		},
+		{
+			// MOD takes the dividend's type, so this is a signed -1, not an
+			// out-of-range unsigned one.
+			name:   "AppendModuloOfUnsignedBound",
+			source: "CREATE TABLE diff_part_chg (id bigint NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))",
+			insert: "INSERT INTO diff_part_chg (id) VALUES (1)",
+			target: "CREATE TABLE diff_part_chg (id bigint NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (MOD(7, 9223372036854775808) - 8))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (-1)",
 		},
 		{
 			name:   "AppendExpressionListValues",
@@ -1065,6 +1076,9 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// The target must itself be a table MySQL accepts.
+			testutils.NewTestTable(t, "diff_part_chg_target",
+				strings.Replace(tc.target, "CREATE TABLE diff_part_chg ", "CREATE TABLE diff_part_chg_target ", 1))
 			tt := testutils.NewTestTable(t, "diff_part_chg", tc.source)
 			insert := tc.insert
 			if insert == "" {
@@ -1153,6 +1167,45 @@ func TestDiffIntegrationListNullValueKeepsRows(t *testing.T) {
 		var count int
 		require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_list_null").Scan(&count))
 		require.Equal(t, 2, count)
+	})
+}
+
+// TestDiffIntegrationFractionalDatetimeBoundKeepsRows verifies that a bound
+// spirit cannot evaluate offline is emitted as written, for MySQL to
+// evaluate. MySQL rounds the fractional second first, so
+// YEAR('2030-12-31 23:59:59.9999999') is 2031; evaluated as 2030, a
+// comment-only REORGANIZE would move the 2031 row into no partition, and MySQL
+// would delete it without an error.
+func TestDiffIntegrationFractionalDatetimeBoundKeepsRows(t *testing.T) {
+	const bound = "YEAR('2030-12-31 23:59:59.9999999')"
+	t.Run("ReorganizeBetweenAuthoredSchemas", func(t *testing.T) {
+		const create = "CREATE TABLE diff_fraction (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) " +
+			"(PARTITION p0 VALUES IN (" + bound + ") COMMENT 'old')"
+		tt := testutils.NewTestTable(t, "diff_fraction", create)
+		testutils.RunSQL(t, "INSERT INTO diff_fraction VALUES (2031)")
+		source, err := ParseCreateTable(create)
+		require.NoError(t, err)
+		target, err := ParseCreateTable(strings.Replace(create, "COMMENT 'old'", "COMMENT 'new'", 1))
+		require.NoError(t, err)
+		stmts, err := source.Diff(target, nil)
+		require.NoError(t, err)
+		require.Len(t, stmts, 1)
+		require.Contains(t, stmts[0].Statement, "VALUES IN ("+bound+")")
+		execStatements(t, tt.DB, stmts)
+		var count int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_fraction").Scan(&count))
+		require.Equal(t, 1, count, "the 2031 row must survive: %s", stmts[0].Statement)
+	})
+	// Against the live table the bound applies with the value MySQL gives
+	// it. It does not converge: the live table reads 2031.
+	t.Run("AppendToLiveTable", func(t *testing.T) {
+		tt := testutils.NewTestTable(t, "diff_fraction",
+			"CREATE TABLE diff_fraction (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))")
+		stmts := diffLiveTable(t, tt.DB, tt.Name, "CREATE TABLE diff_fraction (id int NOT NULL, PRIMARY KEY (id)) "+
+			"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN ("+bound+"))")
+		require.Len(t, stmts, 1)
+		execStatements(t, tt.DB, stmts)
+		testutils.RunSQL(t, "INSERT INTO diff_fraction VALUES (2031)")
 	})
 }
 

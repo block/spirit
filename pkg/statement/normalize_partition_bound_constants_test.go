@@ -1,8 +1,16 @@
 package statement
 
 import (
+	"database/sql"
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
+	"github.com/block/spirit/pkg/parser"
+	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/utils"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,4 +82,123 @@ func TestPartitionBoundConstantFoldingInTuple(t *testing.T) {
 		partitionValueTuple{"3", partitionStringLiteral("y")},
 		partitionValueTuple{"4", partitionNullValue{}},
 	}, ct.Partition.Definitions[0].Values.Values)
+}
+
+// mysqlPartitionConstant is what MySQL makes of an expression as a partition
+// value: accepted, and the integer it stores, or rejected.
+type mysqlPartitionConstant struct {
+	accepted bool
+	value    string
+}
+
+// evalOnMySQL evaluates expr on conn the way a partition value is evaluated.
+// MySQL accepts it only as a non-NULL integer: a DECIMAL result is rejected
+// with 1697 and NULL with 1566, so both count as rejected here.
+func evalOnMySQL(t *testing.T, conn *sql.Conn, expr string) mysqlPartitionConstant {
+	t.Helper()
+	rows, err := conn.QueryContext(t.Context(), "SELECT "+expr)
+	if err != nil {
+		return mysqlPartitionConstant{}
+	}
+	defer utils.CloseAndLog(rows)
+	types, err := rows.ColumnTypes()
+	require.NoError(t, err)
+	if !rows.Next() {
+		// 1690 surfaces here, as the error reading the first row.
+		require.Error(t, rows.Err(), "%s returned no row", expr)
+		return mysqlPartitionConstant{}
+	}
+	var value sql.NullString
+	require.NoError(t, rows.Scan(&value))
+	if !value.Valid || !strings.HasSuffix(types[0].DatabaseTypeName(), "INT") {
+		return mysqlPartitionConstant{}
+	}
+	return mysqlPartitionConstant{accepted: true, value: value.String}
+}
+
+// TestPartitionBoundConstantFoldingMatchesMySQL checks foldPartitionConstant
+// against MySQL itself, under the default sql_mode and with
+// NO_UNSIGNED_SUBTRACTION. A folded value must be the one MySQL stores under
+// both, or a bound MySQL rejects (or evaluates differently) would be
+// installed as a different, valid one. For the integer arithmetic it must
+// also fold everything MySQL evaluates the same way under both, or a valid
+// bound would never converge.
+func TestPartitionBoundConstantFoldingMatchesMySQL(t *testing.T) {
+	_, db := testutils.CreateUniqueTestDatabase(t)
+	defaultMode, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(defaultMode)
+	noUnsignedSubtraction, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(noUnsignedSubtraction)
+	_, err = noUnsignedSubtraction.ExecContext(t.Context(), "SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_UNSIGNED_SUBTRACTION')")
+	require.NoError(t, err)
+
+	operands := []string{"-9223372036854775808", "-7", "-2", "-1", "0", "1", "2", "7",
+		"9223372036854775807", "9223372036854775808", "18446744073709551615"}
+	// Subexpressions whose type is not what their value suggests: a signed 7
+	// (MOD takes the dividend's type), an unsigned 1 and 0, and the one
+	// negation of a value above the BIGINT range that stays a BIGINT.
+	subexpressions := []string{"7 % 9223372036854775808", "9223372036854775808 % 9", "-7 % 9223372036854775808",
+		"9223372036854775808 DIV 9223372036854775808", "9223372036854775808 - 9223372036854775808",
+		"-(9223372036854775808)", "+(-1)"}
+	// Negations MySQL types DECIMAL. Rejected as a bound, but DIV turns one
+	// back into an integer; the evaluator does not model DECIMAL arithmetic,
+	// so these must never fold to a wrong value but need not fold at all.
+	decimalSubexpressions := []string{"-(9223372036854775808 DIV 1)", "-(-1)", "-(18446744073709551615)"}
+	combine := func(lefts []string) []string {
+		var out []string
+		for _, l := range lefts {
+			out = append(out, l, "-("+l+")")
+			for _, r := range operands {
+				for _, op := range []string{"+", "-", "*", "DIV", "%"} {
+					out = append(out, "("+l+") "+op+" ("+r+")")
+				}
+			}
+		}
+		return out
+	}
+	arithmetic := combine(append(slices.Clone(operands), subexpressions...))
+	var dates []string
+	for _, year := range []int{1, 4, 100, 400, 1000, 1582, 1900, 1969, 1970, 2000, 2030, 9999} {
+		for _, date := range []string{fmt.Sprintf("%04d-01-01", year), fmt.Sprintf("%04d-02-28 23:59:59", year), fmt.Sprintf("%04d-12-31 23:59:59", year)} {
+			for _, fn := range []string{"TO_DAYS", "TO_SECONDS", "YEAR"} {
+				dates = append(dates, fn+"('"+date+"')")
+			}
+		}
+	}
+	// Folded only when MySQL agrees, never required to be.
+	var declinable []string
+	for _, fraction := range []string{".1", ".4", ".5", ".999999", ".9999994", ".9999995", ".9999999"} {
+		for _, fn := range []string{"TO_DAYS", "TO_SECONDS", "YEAR"} {
+			declinable = append(declinable, fn+"('2030-12-31 23:59:59"+fraction+"')")
+		}
+	}
+	declinable = append(declinable, "TO_DAYS('20300101')", "TO_DAYS('2030-1-1')", "TO_DAYS('2030-02-29')", "YEAR('0000-01-01')")
+	declinable = append(declinable, combine(decimalSubexpressions)...)
+
+	p := parser.New()
+	check := func(t *testing.T, expr string, mustFold bool) {
+		parsed, ok := parseExpressionText(p, expr)
+		require.True(t, ok, expr)
+		folded, ok := foldPartitionConstant(parsed)
+		inDefault := evalOnMySQL(t, defaultMode, expr)
+		inNoUnsignedSubtraction := evalOnMySQL(t, noUnsignedSubtraction, expr)
+		agreed := inDefault.accepted && inDefault == inNoUnsignedSubtraction
+		if ok {
+			assert.True(t, agreed && folded.String() == inDefault.value,
+				"%s folded to %s; MySQL: %+v, with NO_UNSIGNED_SUBTRACTION: %+v", expr, folded, inDefault, inNoUnsignedSubtraction)
+		} else if mustFold {
+			assert.False(t, agreed, "%s not folded; MySQL stores %s under both sql_modes", expr, inDefault.value)
+		}
+	}
+	for _, expr := range arithmetic {
+		check(t, expr, true)
+	}
+	for _, expr := range dates {
+		check(t, expr, true)
+	}
+	for _, expr := range declinable {
+		check(t, expr, false)
+	}
 }

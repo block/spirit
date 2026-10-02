@@ -25,12 +25,14 @@ func init() { registerNormalizer(partitionBoundConstantNormalizer{}) }
 // (also written %), plus TO_DAYS, TO_SECONDS and YEAR of a 'YYYY-MM-DD' or
 // 'YYYY-MM-DD HH:MM:SS' literal. Everything else is left as an expression,
 // which still emits valid SQL but does not converge. UNIX_TIMESTAMP is left
-// on purpose: its result depends on the session time zone.
+// on purpose: its result depends on the session time zone. So is a datetime
+// with a fractional second, which MySQL rounds before taking the date.
 //
-// An intermediate result out of range for its type (BIGINT, or BIGINT
-// UNSIGNED once an operand is unsigned) is not folded, because MySQL rejects
-// it (error 1690); neither is division by zero, which MySQL evaluates to NULL
-// and rejects (error 1566).
+// A value MySQL rejects is not folded either: an intermediate result out of
+// range for the type MySQL gives it (error 1690, see
+// partitionConstantEvaluator), a DECIMAL result (error 1697), and division
+// by zero, which MySQL evaluates to NULL (error 1566). Folding one would turn
+// an invalid bound into a valid, different one.
 type partitionBoundConstantNormalizer struct{}
 
 func (partitionBoundConstantNormalizer) Name() string { return "partition-bound-constants" }
@@ -80,33 +82,62 @@ var (
 	minBigint         = big.NewInt(math.MinInt64)
 	maxBigint         = big.NewInt(math.MaxInt64)
 	maxUnsignedBigint = new(big.Int).SetUint64(math.MaxUint64)
+	// minBigintMagnitude is 9223372036854775808, the one literal above the
+	// BIGINT range that MySQL negates to a BIGINT.
+	minBigintMagnitude = new(big.Int).Neg(minBigint)
 )
 
 // mysqlDayNumberOfUnixEpoch is TO_DAYS('1970-01-01').
 const mysqlDayNumberOfUnixEpoch = 719528
 
 // partitionConstant is an integer with the type MySQL gives it: BIGINT, or
-// BIGINT UNSIGNED for a literal above the BIGINT range and for any arithmetic
-// with an unsigned operand.
+// BIGINT UNSIGNED (see partitionConstantEvaluator for which operators
+// produce which). literal records that it is written as an integer literal,
+// which only matters to unary minus.
 type partitionConstant struct {
 	n        *big.Int
 	unsigned bool
+	literal  bool
 }
 
 // foldPartitionConstant evaluates expr as MySQL would for a partition value,
 // returning false when expr is not one of the forms
-// partitionBoundConstantNormalizer folds, or when any intermediate result is
-// out of range for its type.
+// partitionBoundConstantNormalizer folds, or when MySQL would reject it.
+//
+// The NO_UNSIGNED_SUBTRACTION sql_mode changes the type of a subtraction, and
+// with it which results are in range, and the session that runs the emitted
+// DDL is unknown. The expression is evaluated under both settings and folded
+// only when both give the same value.
 func foldPartitionConstant(expr ast.ExprNode) (*big.Int, bool) {
-	c, ok := evalPartitionConstant(expr)
+	defaultMode, ok := partitionConstantEvaluator{}.eval(expr)
 	if !ok {
 		return nil, false
 	}
-	return c.n, true
+	noUnsignedSubtraction, ok := partitionConstantEvaluator{noUnsignedSubtraction: true}.eval(expr)
+	if !ok || defaultMode.n.Cmp(noUnsignedSubtraction.n) != 0 {
+		return nil, false
+	}
+	return defaultMode.n, true
 }
 
-func evalPartitionConstant(expr ast.ExprNode) (partitionConstant, bool) {
-	c, ok := evalPartitionConstantUnchecked(expr)
+// partitionConstantEvaluator follows MySQL 8.0's integer arithmetic
+// (Item_func_plus, _minus, _mul, _int_div, _mod and _neg), checked value by
+// value against MySQL 8.0.43 by TestPartitionBoundConstantFoldingMatchesMySQL:
+//
+//   - +, *, DIV: unsigned if either operand is; - too, unless
+//     NO_UNSIGNED_SUBTRACTION is set. MOD: unsigned if the dividend is.
+//   - Every result must be in range for its type, or MySQL raises 1690. DIV
+//     also raises 1690 for a negative quotient below -9223372036854775807,
+//     so -9223372036854775808 DIV 1 is rejected.
+//   - Unary minus of a negative value, or of one above the BIGINT range other
+//     than the literal 9223372036854775808, is DECIMAL, which MySQL rejects
+//     as a partition value (1697): -(-50) is not a valid bound.
+type partitionConstantEvaluator struct {
+	noUnsignedSubtraction bool
+}
+
+func (ev partitionConstantEvaluator) eval(expr ast.ExprNode) (partitionConstant, bool) {
+	c, ok := ev.evalUnchecked(expr)
 	if !ok {
 		return partitionConstant{}, false
 	}
@@ -118,35 +149,43 @@ func evalPartitionConstant(expr ast.ExprNode) (partitionConstant, bool) {
 	return c, ok
 }
 
-func evalPartitionConstantUnchecked(expr ast.ExprNode) (partitionConstant, bool) {
+func (ev partitionConstantEvaluator) evalUnchecked(expr ast.ExprNode) (partitionConstant, bool) {
 	switch e := expr.(type) {
 	case *ast.ParenthesesExpr:
-		return evalPartitionConstant(e.Expr)
+		// Parentheses create no expression in MySQL, so a parenthesized
+		// literal is still a literal.
+		return ev.eval(e.Expr)
 	case *ast.ValueExpr:
 		switch e.Kind() {
 		case ast.KindInt64:
-			return partitionConstant{n: big.NewInt(e.GetInt64())}, true
+			return partitionConstant{n: big.NewInt(e.GetInt64()), literal: true}, true
 		case ast.KindUint64:
 			v := e.GetUint64()
-			return partitionConstant{n: new(big.Int).SetUint64(v), unsigned: v > math.MaxInt64}, true
+			return partitionConstant{n: new(big.Int).SetUint64(v), unsigned: v > math.MaxInt64, literal: true}, true
 		}
 	case *ast.UnaryOperationExpr:
-		v, ok := evalPartitionConstant(e.V)
+		v, ok := ev.eval(e.V)
 		if !ok {
 			return partitionConstant{}, false
 		}
 		switch e.Op { //nolint:exhaustive // every other operator is left unfolded
 		case opcode.Plus:
+			// MySQL's parser drops a unary plus.
 			return v, true
 		case opcode.Minus:
+			if v.n.Sign() < 0 || v.n.Cmp(maxBigint) > 0 {
+				if !v.literal || v.n.Cmp(minBigintMagnitude) != 0 {
+					return partitionConstant{}, false // DECIMAL
+				}
+			}
 			return partitionConstant{n: new(big.Int).Neg(v.n)}, true
 		}
 	case *ast.BinaryOperationExpr:
-		l, ok := evalPartitionConstant(e.L)
+		l, ok := ev.eval(e.L)
 		if !ok {
 			return partitionConstant{}, false
 		}
-		r, ok := evalPartitionConstant(e.R)
+		r, ok := ev.eval(e.R)
 		if !ok {
 			return partitionConstant{}, false
 		}
@@ -156,6 +195,9 @@ func evalPartitionConstantUnchecked(expr ast.ExprNode) (partitionConstant, bool)
 			result.n.Add(l.n, r.n)
 		case opcode.Minus:
 			result.n.Sub(l.n, r.n)
+			if ev.noUnsignedSubtraction {
+				result.unsigned = false
+			}
 		case opcode.Mul:
 			result.n.Mul(l.n, r.n)
 		case opcode.IntDiv:
@@ -164,12 +206,17 @@ func evalPartitionConstantUnchecked(expr ast.ExprNode) (partitionConstant, bool)
 			}
 			// MySQL's DIV truncates toward zero, as Quo does.
 			result.n.Quo(l.n, r.n)
+			if l.n.Sign()*r.n.Sign() < 0 && result.n.Cmp(minBigint) <= 0 {
+				return partitionConstant{}, false
+			}
 		case opcode.Mod:
 			if r.n.Sign() == 0 {
 				return partitionConstant{}, false
 			}
-			// MySQL's MOD takes the sign of the dividend, as Rem does.
+			// MySQL's MOD takes the sign of the dividend, as Rem does, and
+			// its type.
 			result.n.Rem(l.n, r.n)
+			result.unsigned = l.unsigned
 		default:
 			return partitionConstant{}, false
 		}
@@ -191,12 +238,18 @@ func evalPartitionDateFunc(call *ast.FuncCallExpr) (*big.Int, bool) {
 	if !ok {
 		return nil, false
 	}
+	// Only the exact 'YYYY-MM-DD' and 'YYYY-MM-DD HH:MM:SS' forms. time.Parse
+	// also accepts a fractional second, which MySQL rounds into the seconds
+	// first: YEAR('2030-12-31 23:59:59.9999999') is 2031.
 	var t time.Time
 	var err error
-	if len(literal) == len(time.DateOnly) {
+	switch len(literal) {
+	case len(time.DateOnly):
 		t, err = time.Parse(time.DateOnly, literal)
-	} else {
+	case len(time.DateTime):
 		t, err = time.Parse(time.DateTime, literal)
+	default:
+		return nil, false
 	}
 	if err != nil || t.Year() < 1 {
 		return nil, false
