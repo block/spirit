@@ -515,6 +515,9 @@ func partitionDefinitionEqual(a, b *PartitionDefinition) bool {
 	if !ptrEqual(a.Comment, b.Comment) {
 		return false
 	}
+	if !partitionStorageEqual(&a.PartitionStorage, &b.PartitionStorage) {
+		return false
+	}
 
 	// The per-partition ENGINE clause is deliberately not compared. MySQL
 	// requires every partition to use the table's storage engine, so the clause
@@ -545,7 +548,18 @@ func partitionDefinitionEqual(a, b *PartitionDefinition) bool {
 // partitions, a subpartition's ENGINE is not compared (see
 // partitionDefinitionEqual).
 func subPartitionDefinitionEqual(a, b *SubPartitionDefinition) bool {
-	return a.Name == b.Name && ptrEqual(a.Comment, b.Comment)
+	return a.Name == b.Name && ptrEqual(a.Comment, b.Comment) &&
+		partitionStorageEqual(&a.PartitionStorage, &b.PartitionStorage)
+}
+
+// partitionStorageEqual checks if two partitions' storage options are equal.
+func partitionStorageEqual(a, b *PartitionStorage) bool {
+	return ptrEqual(a.DataDirectory, b.DataDirectory) &&
+		ptrEqual(a.IndexDirectory, b.IndexDirectory) &&
+		ptrEqual(a.MaxRows, b.MaxRows) &&
+		ptrEqual(a.MinRows, b.MinRows) &&
+		ptrEqual(a.Tablespace, b.Tablespace) &&
+		ptrEqual(a.Nodegroup, b.Nodegroup)
 }
 
 // isUnresolvedPartitionValue reports whether a partition value, or any

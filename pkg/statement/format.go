@@ -479,6 +479,7 @@ func formatPartitionDefinition(def *PartitionDefinition) string {
 	if def.Comment != nil {
 		parts = append(parts, fmt.Sprintf("COMMENT = '%s'", sqlescape.EscapeString(*def.Comment)))
 	}
+	parts = append(parts, formatPartitionStorage(&def.PartitionStorage)...)
 
 	// Explicitly named subpartitions, when the definition carries them. MySQL
 	// only reports subpartition names from SHOW CREATE TABLE when they were
@@ -496,15 +497,41 @@ func formatPartitionDefinition(def *PartitionDefinition) string {
 	return strings.Join(parts, " ")
 }
 
-// formatSubPartitionDefinition formats a single named subpartition. Only the
-// name and comment are emitted; a subpartition's ENGINE always matches the
-// table's (see partitionDefinitionEqual) and is therefore not diffed.
+// formatSubPartitionDefinition formats a single named subpartition. Its
+// ENGINE is not emitted: it always matches the table's (see
+// partitionDefinitionEqual) and is therefore not diffed.
 func formatSubPartitionDefinition(sub *SubPartitionDefinition) string {
 	parts := []string{"SUBPARTITION " + sqlescape.EscapeIdentifier(sub.Name)}
 
 	if sub.Comment != nil {
 		parts = append(parts, fmt.Sprintf("COMMENT = '%s'", sqlescape.EscapeString(*sub.Comment)))
 	}
+	parts = append(parts, formatPartitionStorage(&sub.PartitionStorage)...)
 
 	return strings.Join(parts, " ")
+}
+
+// formatPartitionStorage formats a partition's storage options. Without them
+// a REORGANIZE or repartition would silently drop them.
+func formatPartitionStorage(s *PartitionStorage) []string {
+	var parts []string
+	if s.DataDirectory != nil {
+		parts = append(parts, fmt.Sprintf("DATA DIRECTORY = '%s'", sqlescape.EscapeString(*s.DataDirectory)))
+	}
+	if s.IndexDirectory != nil {
+		parts = append(parts, fmt.Sprintf("INDEX DIRECTORY = '%s'", sqlescape.EscapeString(*s.IndexDirectory)))
+	}
+	if s.MaxRows != nil {
+		parts = append(parts, fmt.Sprintf("MAX_ROWS = %d", *s.MaxRows))
+	}
+	if s.MinRows != nil {
+		parts = append(parts, fmt.Sprintf("MIN_ROWS = %d", *s.MinRows))
+	}
+	if s.Tablespace != nil {
+		parts = append(parts, "TABLESPACE = "+sqlescape.EscapeIdentifier(*s.Tablespace))
+	}
+	if s.Nodegroup != nil {
+		parts = append(parts, fmt.Sprintf("NODEGROUP = %d", *s.Nodegroup))
+	}
+	return parts
 }

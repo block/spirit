@@ -303,12 +303,48 @@ type PartitionOptions struct {
 
 // PartitionDefinition represents a single partition definition
 type PartitionDefinition struct {
-	Name          string                   `json:"name"`
-	Values        *PartitionValues         `json:"values,omitempty"` // VALUES LESS THAN or VALUES IN
-	Comment       *string                  `json:"comment,omitempty"`
-	Engine        *string                  `json:"engine,omitempty"`
-	Options       map[string]any           `json:"options,omitempty"`
+	Name    string           `json:"name"`
+	Values  *PartitionValues `json:"values,omitempty"` // VALUES LESS THAN or VALUES IN
+	Comment *string          `json:"comment,omitempty"`
+	Engine  *string          `json:"engine,omitempty"`
+	PartitionStorage
+	Options       map[string]any           `json:"options,omitempty"` // Options MySQL does not accept on a partition
 	SubPartitions []SubPartitionDefinition `json:"subpartitions,omitempty"`
+}
+
+// PartitionStorage holds the storage options of a partition or subpartition
+// definition. A partition with named subpartitions holds none: MySQL stores
+// them on each subpartition (see partitionOptionsNormalizer).
+type PartitionStorage struct {
+	DataDirectory  *string `json:"data_directory,omitempty"`
+	IndexDirectory *string `json:"index_directory,omitempty"` // InnoDB rejects it (error 1031)
+	MaxRows        *uint64 `json:"max_rows,omitempty"`
+	MinRows        *uint64 `json:"min_rows,omitempty"`
+	Tablespace     *string `json:"tablespace,omitempty"`
+	Nodegroup      *uint64 `json:"nodegroup,omitempty"`
+}
+
+// parsePartitionStorageOption stores opt in s if it is a storage option, and
+// reports whether it was one.
+func parsePartitionStorageOption(opt *ast.TableOption, s *PartitionStorage) bool {
+	str, n := opt.StrValue, opt.UintValue
+	switch opt.Tp { //nolint:exhaustive // every other option is not a storage option
+	case ast.TableOptionDataDirectory:
+		s.DataDirectory = &str
+	case ast.TableOptionIndexDirectory:
+		s.IndexDirectory = &str
+	case ast.TableOptionMaxRows:
+		s.MaxRows = &n
+	case ast.TableOptionMinRows:
+		s.MinRows = &n
+	case ast.TableOptionTablespace:
+		s.Tablespace = &str
+	case ast.TableOptionNodegroup:
+		s.Nodegroup = &n
+	default:
+		return false
+	}
+	return true
 }
 
 // PartitionValues represents the VALUES clause in partition definitions
@@ -371,10 +407,11 @@ type SubPartitionOptions struct {
 
 // SubPartitionDefinition represents a single subpartition definition
 type SubPartitionDefinition struct {
-	Name    string         `json:"name"`
-	Comment *string        `json:"comment,omitempty"`
-	Engine  *string        `json:"engine,omitempty"`
-	Options map[string]any `json:"options,omitempty"`
+	Name    string  `json:"name"`
+	Comment *string `json:"comment,omitempty"`
+	Engine  *string `json:"engine,omitempty"`
+	PartitionStorage
+	Options map[string]any `json:"options,omitempty"` // Options MySQL does not accept on a subpartition
 }
 
 // tableSchema represents a parsed CREATE TABLE statement with flexible access
@@ -1263,15 +1300,17 @@ func (ct *CreateTable) parsePartitionDefinition(def *ast.PartitionDefinition) Pa
 
 	// Parse partition options
 	for _, opt := range def.Options {
-		switch opt.Tp {
-		case ast.TableOptionComment:
+		switch {
+		case opt.Tp == ast.TableOptionComment:
 			if opt.StrValue != "" {
 				partDef.Comment = &opt.StrValue
 			}
-		case ast.TableOptionEngine:
+		case opt.Tp == ast.TableOptionEngine:
 			if opt.StrValue != "" {
 				partDef.Engine = &opt.StrValue
 			}
+		case parsePartitionStorageOption(opt, &partDef.PartitionStorage):
+			// Stored by parsePartitionStorageOption.
 		default:
 			// Store other options in the options map
 			partDef.Options[fmt.Sprintf("option_%d", opt.Tp)] = opt.StrValue
@@ -1424,17 +1463,20 @@ func (ct *CreateTable) parseSubPartitionDefinition(sub *ast.SubPartitionDefiniti
 		Options: make(map[string]any),
 	}
 
-	// Parse subpartition options
+	// Parse subpartition options. An empty COMMENT is kept: it stops the
+	// partition's comment from applying, and partitionOptionsNormalizer drops
+	// it after that.
 	for _, opt := range sub.Options {
-		switch opt.Tp {
-		case ast.TableOptionComment:
-			if opt.StrValue != "" {
-				subDef.Comment = &opt.StrValue
-			}
-		case ast.TableOptionEngine:
+		switch {
+		case opt.Tp == ast.TableOptionComment:
+			comment := opt.StrValue
+			subDef.Comment = &comment
+		case opt.Tp == ast.TableOptionEngine:
 			if opt.StrValue != "" {
 				subDef.Engine = &opt.StrValue
 			}
+		case parsePartitionStorageOption(opt, &subDef.PartitionStorage):
+			// Stored by parsePartitionStorageOption.
 		default:
 			// Store other options in the options map
 			subDef.Options[fmt.Sprintf("option_%d", opt.Tp)] = opt.StrValue

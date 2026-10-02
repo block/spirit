@@ -1073,6 +1073,36 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 				"(PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30), PARTITION p2 VALUES LESS THAN (40))",
 			expected: []string{"ADD PARTITION"},
 		},
+		{
+			name:     "PartitionMaxRowsChange",
+			source:   rangeSource,
+			target:   strings.Replace(rangeSource, "VALUES LESS THAN (20)", "VALUES LESS THAN (20) MAX_ROWS = 200 NODEGROUP = 0", 1),
+			expected: []string{"REORGANIZE PARTITION `p1` INTO"},
+		},
+		{
+			name:     "AppendListWithStorageOptions",
+			source:   listSource,
+			target:   strings.Replace(listSource, "VALUES IN (25))", "VALUES IN (25), PARTITION p3 VALUES IN (35) MAX_ROWS = 10 MIN_ROWS = 1)", 1),
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (35)",
+		},
+		{
+			name: "SubpartitionStorageOptions",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) " +
+				"(PARTITION p0 VALUES LESS THAN (10) (SUBPARTITION s0, SUBPARTITION s1), PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) " +
+				"(PARTITION p0 VALUES LESS THAN (10) COMMENT 'pc' MAX_ROWS = 9 (SUBPARTITION s0 COMMENT '' MAX_ROWS = 5, SUBPARTITION s1), " +
+				"PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))",
+			expected: []string{"REORGANIZE PARTITION `p0` INTO"},
+		},
+		{
+			// SHOW CREATE TABLE then prints the tablespace on every
+			// partition. It has no effect with innodb_file_per_table=ON.
+			name:     "FilePerTableTablespace",
+			source:   rangeSource,
+			target:   strings.Replace(rangeSource, "VALUES LESS THAN (20)", "VALUES LESS THAN (20) TABLESPACE = innodb_file_per_table", 1),
+			expected: nil,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1244,6 +1274,73 @@ func TestDiffIntegrationSessionDependentListValueKeepsRows(t *testing.T) {
 	var count int
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_tz_list").Scan(&count))
 	require.Equal(t, 1, count, "the row must survive: %s", stmts[0].Statement)
+}
+
+// TestDiffIntegrationListValueOrderNoDiff verifies that a desired schema
+// listing VALUES IN values in another order than the live table does not
+// diff. MySQL keeps the written order, so the live table and the desired
+// schema differ only in order.
+func TestDiffIntegrationListValueOrderNoDiff(t *testing.T) {
+	for _, tc := range []struct{ name, live, desired string }{
+		{
+			name:    "ListExpression",
+			live:    "CREATE TABLE diff_list_order (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (5, 2, 10), PARTITION p1 VALUES IN (3, NULL))",
+			desired: "CREATE TABLE diff_list_order (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (2, 5, 10), PARTITION p1 VALUES IN (NULL, 3))",
+		},
+		{
+			name:    "ListColumnsTuples",
+			live:    "CREATE TABLE diff_list_order (a int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (a, b)) PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((2, 'x'), (1, 'y'), (1, 'x')))",
+			desired: "CREATE TABLE diff_list_order (a int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (a, b)) PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((1, 'x'), (1, 'y'), (2, 'x')))",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "diff_list_order", tc.live)
+			requireConverged(t, tt.DB, tt.Name, tc.desired)
+			requireNoSelfDiff(t, tt.DB, tt.Name)
+		})
+	}
+}
+
+// TestDiffIntegrationPartitionOptionsNoSelfDiff verifies that partition and
+// subpartition options converge: MySQL moves a partition's options onto its
+// named subpartitions, drops zero and empty values, and prints a
+// file-per-table tablespace on every partition.
+func TestDiffIntegrationPartitionOptionsNoSelfDiff(t *testing.T) {
+	const authoredSQL = "CREATE TABLE diff_part_opts (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) (" +
+		"PARTITION p0 VALUES LESS THAN (10) COMMENT 'pc' MAX_ROWS = 9 MIN_ROWS = 2 NODEGROUP = 3 " +
+		"(SUBPARTITION s0 COMMENT '' MAX_ROWS = 0 NODEGROUP = 0, SUBPARTITION s1 MAX_ROWS = 5), " +
+		"PARTITION p1 VALUES LESS THAN (20) TABLESPACE = innodb_file_per_table (SUBPARTITION s2, SUBPARTITION s3), " +
+		"PARTITION p2 VALUES LESS THAN MAXVALUE MAX_ROWS = 0 (SUBPARTITION s4 COMMENT 's4', SUBPARTITION s5))"
+	tt := testutils.NewTestTable(t, "diff_part_opts", authoredSQL)
+	requireConverged(t, tt.DB, tt.Name, authoredSQL)
+	requireNoSelfDiff(t, tt.DB, tt.Name)
+}
+
+// TestDiffIntegrationPartitionDataDirectory verifies that DATA DIRECTORY is
+// emitted and converges. MySQL prints '/x' as '/x/' after CREATE TABLE, but
+// as written after ADD PARTITION. It needs a directory in
+// innodb_directories, so it is skipped on a server without one.
+func TestDiffIntegrationPartitionDataDirectory(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_part_dd", "CREATE TABLE diff_part_dd (id int NOT NULL, PRIMARY KEY (id))")
+	var dirs sql.NullString
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT @@innodb_directories").Scan(&dirs))
+	if !dirs.Valid || dirs.String == "" {
+		t.Skip("innodb_directories is not set")
+	}
+	dir := strings.TrimRight(strings.Split(dirs.String, ";")[0], "/")
+	create := "CREATE TABLE diff_part_dd (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id) " +
+		"(PARTITION p0 VALUES LESS THAN (10) DATA DIRECTORY = '" + dir + "')"
+	testutils.RunSQL(t, "DROP TABLE diff_part_dd")
+	testutils.RunSQL(t, create)
+	require.Contains(t, showCreateTable(t, tt.DB, tt.Name), "DATA DIRECTORY = '"+dir+"/'", "precondition: CREATE TABLE adds a slash")
+	requireConverged(t, tt.DB, tt.Name, create)
+
+	target := strings.Replace(create, "'"+dir+"')", "'"+dir+"/', PARTITION p1 VALUES LESS THAN (20) DATA DIRECTORY = '"+dir+"')", 1)
+	stmts := diffLiveTable(t, tt.DB, tt.Name, target)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "ADD PARTITION (PARTITION `p1` VALUES LESS THAN (20) DATA DIRECTORY = '"+dir+"')")
+	execStatements(t, tt.DB, stmts)
+	requireConverged(t, tt.DB, tt.Name, target)
 }
 
 // TestDiffIntegrationMultiColumnListNoSelfDiff verifies that a multi-column

@@ -1,6 +1,7 @@
 package statement
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -1231,7 +1232,7 @@ func TestDiff(t *testing.T) {
 			name:     "AddListPartition",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, region VARCHAR(50))",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, region VARCHAR(50)) PARTITION BY LIST COLUMNS(region) (PARTITION pNorth VALUES IN('US', 'CA'), PARTITION pSouth VALUES IN('MX', 'BR'))",
-			expected: "ALTER TABLE `t1` PARTITION BY LIST COLUMNS (`region`) (PARTITION `pNorth` VALUES IN ('US', 'CA'), PARTITION `pSouth` VALUES IN ('MX', 'BR'))",
+			expected: "ALTER TABLE `t1` PARTITION BY LIST COLUMNS (`region`) (PARTITION `pNorth` VALUES IN ('CA', 'US'), PARTITION `pSouth` VALUES IN ('BR', 'MX'))",
 		},
 		{
 			name:     "RemovePartition",
@@ -2439,6 +2440,43 @@ func TestDiffPartitionChanges(t *testing.T) {
 			expected: []string{"ALTER TABLE `t1` REORGANIZE PARTITION `p1` INTO (PARTITION `p1` VALUES IN (20) COMMENT = 'new')"},
 		},
 		{
+			name:     "PartitionMaxRowsChange",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20) MAX_ROWS = 100)",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20) MAX_ROWS = 200)",
+			expected: []string{"ALTER TABLE `t1` REORGANIZE PARTITION `p1` INTO (PARTITION `p1` VALUES LESS THAN (20) MAX_ROWS = 200)"},
+		},
+		{
+			name:     "PartitionStorageOptionsEmitted",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) COMMENT 'c' DATA DIRECTORY '/data/' INDEX DIRECTORY '/idx' MAX_ROWS 9 MIN_ROWS 1 TABLESPACE ts1 NODEGROUP 0)",
+			expected: []string{"ALTER TABLE `t1` REORGANIZE PARTITION `p0` INTO (PARTITION `p0` VALUES LESS THAN (10) COMMENT = 'c' DATA DIRECTORY = '/data' INDEX DIRECTORY = '/idx' MAX_ROWS = 9 MIN_ROWS = 1 TABLESPACE = `ts1` NODEGROUP = 0)"},
+		},
+		{
+			name:     "AppendWithStorageOptions",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20) MAX_ROWS = 5)",
+			expected: []string{"ALTER TABLE `t1` ADD PARTITION (PARTITION `p1` VALUES LESS THAN (20) MAX_ROWS = 5)"},
+		},
+		{
+			name:     "SubpartitionStorageOptionChange",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) (PARTITION p0 VALUES LESS THAN (10) (SUBPARTITION s0, SUBPARTITION s1))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) (PARTITION p0 VALUES LESS THAN (10) MAX_ROWS = 9 (SUBPARTITION s0 MAX_ROWS = 5, SUBPARTITION s1))",
+			expected: []string{"ALTER TABLE `t1` REORGANIZE PARTITION `p0` INTO (PARTITION `p0` VALUES LESS THAN (10) (SUBPARTITION `s0` MAX_ROWS = 5, SUBPARTITION `s1` MAX_ROWS = 9))"},
+		},
+		{
+			// MySQL prints a partition's options on each named subpartition.
+			name:     "PartitionOptionsOnNamedSubpartitionsNoDiff",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) (PARTITION p0 VALUES LESS THAN (10) (SUBPARTITION s0 COMMENT = 'c' MAX_ROWS = 9, SUBPARTITION s1 COMMENT = 'c' MAX_ROWS = 9))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) (PARTITION p0 VALUES LESS THAN (10) COMMENT 'c' MAX_ROWS = 9 (SUBPARTITION s0, SUBPARTITION s1))",
+			expected: []string{},
+		},
+		{
+			name:     "FilePerTableTablespaceNoDiff",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) TABLESPACE = `innodb_file_per_table`, PARTITION p1 VALUES LESS THAN (20) TABLESPACE = `innodb_file_per_table`)",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{},
+		},
+		{
 			name:     "AppendListPartition",
 			source:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2))",
 			target:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3))",
@@ -2619,4 +2657,35 @@ func TestNewDiffOptions(t *testing.T) {
 	require.False(t, opts.IgnoreCharsetCollation, "IgnoreCharsetCollation should default to false")
 	require.False(t, opts.IgnorePartitioning, "IgnorePartitioning should default to false")
 	require.True(t, opts.IgnoreRowFormat, "IgnoreRowFormat should default to true")
+}
+
+// TestDiffPartitionStorageOptionChange checks that a change to any one
+// storage option of a partition, or of a named subpartition, is a diff.
+func TestDiffPartitionStorageOptionChange(t *testing.T) {
+	options := []struct{ from, to, emitted string }{
+		{"DATA DIRECTORY = '/a'", "DATA DIRECTORY = '/b'", "DATA DIRECTORY = '/b'"},
+		{"INDEX DIRECTORY = '/a'", "INDEX DIRECTORY = '/b'", "INDEX DIRECTORY = '/b'"},
+		{"MAX_ROWS = 1", "MAX_ROWS = 2", "MAX_ROWS = 2"},
+		{"MIN_ROWS = 1", "MIN_ROWS = 2", "MIN_ROWS = 2"},
+		{"TABLESPACE = ts1", "TABLESPACE = ts2", "TABLESPACE = `ts2`"},
+		{"NODEGROUP = 1", "NODEGROUP = 2", "NODEGROUP = 2"},
+	}
+	for _, opt := range options {
+		t.Run(opt.to, func(t *testing.T) {
+			for _, layout := range []string{
+				"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) %s)",
+				"PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) (PARTITION p0 VALUES LESS THAN (10) (SUBPARTITION s0 %s, SUBPARTITION s1))",
+			} {
+				source, err := ParseCreateTable("CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) " + strings.Replace(layout, "%s", opt.from, 1))
+				require.NoError(t, err)
+				target, err := ParseCreateTable("CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) " + strings.Replace(layout, "%s", opt.to, 1))
+				require.NoError(t, err)
+				stmts, err := source.Diff(target, nil)
+				require.NoError(t, err)
+				require.Len(t, stmts, 1, layout)
+				require.Contains(t, stmts[0].Statement, "REORGANIZE PARTITION `p0` INTO")
+				require.Contains(t, stmts[0].Statement, opt.emitted)
+			}
+		})
+	}
 }
