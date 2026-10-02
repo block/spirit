@@ -797,9 +797,9 @@ func TestDiffIntegrationTableCollationChangeConverges(t *testing.T) {
 
 // TestDiffIntegrationInheritedColumnFollowsNewTableCollation verifies the
 // same convergence when the target column also inherits its table default:
-// the emitted MODIFY carries no explicit COLLATE, and MySQL resolves it
-// against the new table default set by the table-option clause in the same
-// ALTER, so the column lands on the target collation in one apply.
+// the emitted MODIFY names the new table default as the column's collation,
+// so the plan shows the collation the column moves onto, and the column lands
+// on it in one apply.
 func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
 	tt := testutils.NewTestTable(t, "diff_collation_inherit",
 		"CREATE TABLE diff_collation_inherit (id int NOT NULL, name varchar(100), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
@@ -808,7 +808,7 @@ func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
 
 	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
 	require.Len(t, stmts, 1)
-	require.Equal(t, "ALTER TABLE `diff_collation_inherit` MODIFY COLUMN `name` varchar(100) NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
+	require.Equal(t, "ALTER TABLE `diff_collation_inherit` MODIFY COLUMN `name` varchar(100) COLLATE utf8mb4_general_ci NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
 
 	execStatements(t, tt.DB, stmts)
 	var collation string
@@ -821,6 +821,66 @@ func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
 	// Re-diff: converged in one apply — nothing left over.
 	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
 	require.Nil(t, stmts)
+}
+
+// A table created under a server whose utf8mb4 default was
+// utf8mb4_general_ci reports that collation on every column, while the schema
+// file names utf8mb4_0900_ai_ci only as the table default. The MODIFY that
+// converges each column names the collation it moves onto, so the plan does
+// not read as a restatement of the live column, and applying it lands every
+// column on the file's collation in one apply. A column whose MODIFY changes
+// something other than its collation is written without one.
+func TestDiffIntegrationInheritedColumnNamesChangedCollation(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_collation_named",
+		"CREATE TABLE diff_collation_named (id int NOT NULL, sku varchar(15) NOT NULL, note varchar(40), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+
+	const targetSQL = "CREATE TABLE diff_collation_named (id int NOT NULL, sku varchar(15) NOT NULL, note varchar(40), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_named` MODIFY COLUMN `sku` varchar(15) COLLATE utf8mb4_0900_ai_ci NOT NULL, MODIFY COLUMN `note` varchar(40) COLLATE utf8mb4_0900_ai_ci NULL, COLLATE=utf8mb4_0900_ai_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	requireColumnCollations(t, tt.DB, tt.Name, map[string]string{"sku": "utf8mb4_0900_ai_ci", "note": "utf8mb4_0900_ai_ci"})
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+
+	// Widening sku keeps its collation, so the MODIFY names none.
+	const widenedSQL = "CREATE TABLE diff_collation_named (id int NOT NULL, sku varchar(20) NOT NULL, note varchar(40), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	stmts = diffLiveTable(t, tt.DB, tt.Name, widenedSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_named` MODIFY COLUMN `sku` varchar(20) NOT NULL", stmts[0].Statement)
+}
+
+// A table default that moves to another charset moves its inheriting columns
+// with it. The MODIFY names both the charset and the collation the column
+// takes, and applying it converges in one apply.
+func TestDiffIntegrationInheritedColumnNamesChangedCharset(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_charset_named",
+		"CREATE TABLE diff_charset_named (id int NOT NULL, label varchar(30), PRIMARY KEY (id)) DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci")
+
+	const targetSQL = "CREATE TABLE diff_charset_named (id int NOT NULL, label varchar(30), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_charset_named` MODIFY COLUMN `label` varchar(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL, DEFAULT CHARSET=utf8mb4, COLLATE=utf8mb4_0900_ai_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	requireColumnCollations(t, tt.DB, tt.Name, map[string]string{"label": "utf8mb4_0900_ai_ci"})
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+}
+
+// requireColumnCollations asserts the collation information_schema reports
+// for each named column of tableName.
+func requireColumnCollations(t *testing.T, db *sql.DB, tableName string, want map[string]string) {
+	t.Helper()
+	for column, collation := range want {
+		var got string
+		err := db.QueryRowContext(t.Context(),
+			"SELECT COLLATION_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+			tableName, column).Scan(&got)
+		require.NoError(t, err)
+		assert.Equal(t, collation, got, "collation of %s.%s", tableName, column)
+	}
 }
 
 // A schema file declaring `active BOOLEAN NOT NULL DEFAULT FALSE` and the table
