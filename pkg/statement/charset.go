@@ -1,6 +1,8 @@
 package statement
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/parser/charset"
@@ -8,7 +10,8 @@ import (
 
 // This file holds the exported charset/collation helpers used by callers
 // outside the diff — notably pkg/lint, which compares columns across
-// *different* tables rather than the two sides of one table's diff.
+// *different* tables rather than the two sides of one table's diff, and
+// tools that describe what a collation change does to comparisons.
 
 // DefaultCollationForCharset returns the charset and the collation MySQL
 // applies to it when no COLLATE is written, and whether cs names a charset the
@@ -109,4 +112,51 @@ func resetsToServerUTF8MB4Default(source, target *CreateTable) bool {
 	}
 	return !ptrEqual(source.TableOptions.getCharset(), target.TableOptions.getCharset()) ||
 		isNonServerUTF8MB4Collation(source)
+}
+
+// CollationProperties describes how a collation compares strings: whether
+// letter case is significant, and whether trailing spaces are.
+type CollationProperties struct {
+	// CaseSensitive reports whether strings that differ only in letter case
+	// compare unequal ('abc' != 'ABC').
+	CaseSensitive bool
+	// PadSpace reports whether trailing spaces are ignored in comparisons
+	// (PAD SPACE, so 'abc' = 'abc '). A NO PAD collation compares them.
+	PadSpace bool
+}
+
+// LookupCollationProperties returns how the named collation compares strings.
+// Case sensitivity follows MySQL's collation naming: a _bin suffix (or the
+// binary collation) compares bytes or code points, and _cs and _ci name case
+// sensitivity directly. The pad attribute is the one MySQL reports in
+// information_schema.COLLATIONS. Accent sensitivity is not reported: a name
+// without an _ai or _as suffix does not decide it, and many such collations
+// are accent-sensitive.
+//
+// It returns an error for a collation the parser does not know or whose name
+// carries no case suffix. A caller deciding whether a collation change alters
+// comparisons must treat that error as unknown, never as unchanged.
+func LookupCollationProperties(name string) (CollationProperties, error) {
+	collation, err := charset.GetCollationByName(name)
+	if err != nil {
+		return CollationProperties{}, fmt.Errorf("look up collation %q: %w", name, err)
+	}
+	props := CollationProperties{PadSpace: collation.PadAttribute == charset.PadSpace}
+	if strings.EqualFold(collation.Name, charset.CollationBin) {
+		props.CaseSensitive = true
+		return props, nil
+	}
+	// Read the suffixes from the end: a language code such as Czech's "cs"
+	// follows the charset name and must not be taken for one.
+	parts := strings.Split(strings.ToLower(collation.Name), "_")
+	for _, part := range slices.Backward(parts) {
+		switch part {
+		case "bin", "cs":
+			props.CaseSensitive = true
+			return props, nil
+		case "ci":
+			return props, nil
+		}
+	}
+	return CollationProperties{}, fmt.Errorf("collation %q names no case sensitivity", name)
 }
