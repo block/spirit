@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/spirit/pkg/parser/charset"
 	"github.com/block/spirit/pkg/statement"
 )
 
@@ -474,33 +475,54 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 	}
 
 	var violations []Violation
-	majority, clear := tpPickMajority(counts)
+	expected, clear := tpPickMajority(counts)
+	if current, ok := tpCurrentCollation(slices.Sorted(maps.Keys(counts))); ok {
+		// One collation in use replaces every other, so it is the one to
+		// converge on even when it is not the most common: converging on the
+		// majority would move columns onto an obsolete collation.
+		expected, clear = current, true
+	}
 	if clear {
-		majorityTables := tpDedupeStrings(tablesByCollation[majority])
+		expectedTables := tpDedupeStrings(tablesByCollation[expected])
 		for _, r := range determined {
-			if r.collation == majority {
+			if r.collation == expected {
 				continue
 			}
 			colName := r.col.Name
+			replaces := tpReplaces(expected, r.collation)
+			message := fmt.Sprintf(
+				"Column %q in table %q uses collation %q but %s %q (e.g. %s) — %s",
+				r.col.Name, r.table.TableName, r.collation, tpOtherTables(expectedTables), expected, tpExampleTables(expectedTables),
+				tpCollationConsequence(r.charset, charsetOf[expected]),
+			)
+			suggestion := fmt.Sprintf(
+				"Convert %q.%q to CHARACTER SET %s COLLATE %s for consistency",
+				r.table.TableName, r.col.Name, charsetOf[expected], expected,
+			)
+			if replaces {
+				message = fmt.Sprintf(
+					"Column %q in table %q uses collation %q but %s %q (e.g. %s), which replaces it — %s",
+					r.col.Name, r.table.TableName, r.collation, tpOtherTables(expectedTables), expected, tpExampleTables(expectedTables),
+					tpCollationConsequence(r.charset, charsetOf[expected]),
+				)
+				suggestion = fmt.Sprintf(
+					"Convert %q.%q to CHARACTER SET %s COLLATE %s, which replaces %s",
+					r.table.TableName, r.col.Name, charsetOf[expected], expected, r.collation,
+				)
+			}
 			violations = append(violations, Violation{
-				Linter:   l,
-				Severity: l.collationSeverity,
-				Message: fmt.Sprintf(
-					"Column %q in table %q uses collation %q but %s %q (e.g. %s) — %s",
-					r.col.Name, r.table.TableName, r.collation, tpOtherTables(majorityTables), majority, tpExampleTables(majorityTables),
-					tpCollationConsequence(r.charset, charsetOf[majority]),
-				),
-				Location: &Location{Table: r.table.TableName, Column: &colName},
-				Suggestion: new(fmt.Sprintf(
-					"Convert %q.%q to CHARACTER SET %s COLLATE %s for consistency",
-					r.table.TableName, r.col.Name, charsetOf[majority], majority,
-				)),
+				Linter:     l,
+				Severity:   l.collationSeverity,
+				Message:    message,
+				Location:   &Location{Table: r.table.TableName, Column: &colName},
+				Suggestion: &suggestion,
 				Context: map[string]any{
 					"current_collation":  r.collation,
-					"expected_collation": majority,
+					"expected_collation": expected,
 					"current_charset":    r.charset,
-					"expected_charset":   charsetOf[majority],
-					"charset_differs":    r.charset != charsetOf[majority],
+					"expected_charset":   charsetOf[expected],
+					"charset_differs":    r.charset != charsetOf[expected],
+					"replaces_current":   replaces,
 					"rule":               "same_name_collation",
 				},
 			})
@@ -596,6 +618,19 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 			if colCollation == "" || idCollation == "" || colCollation == idCollation {
 				continue
 			}
+			suggestion := fmt.Sprintf(
+				"Convert %q.%q to CHARACTER SET %s COLLATE %s to match %q.id",
+				t.TableName, c.Name, idCharset, idCollation, target.TableName,
+			)
+			convertTarget := tpReplaces(colCollation, idCollation)
+			if convertTarget {
+				// Matching the target would move the column onto an obsolete
+				// collation, so the target is the side to convert.
+				suggestion = fmt.Sprintf(
+					"Convert %q.id to CHARACTER SET %s COLLATE %s, which replaces %s",
+					target.TableName, colCharset, colCollation, idCollation,
+				)
+			}
 			violations = append(violations, Violation{
 				Linter:   l,
 				Severity: l.collationSeverity,
@@ -604,11 +639,8 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 					c.Name, t.TableName, colCollation, target.TableName, idCollation,
 					tpCollationConsequence(colCharset, idCharset),
 				),
-				Location: &Location{Table: t.TableName, Column: &colName},
-				Suggestion: new(fmt.Sprintf(
-					"Convert %q.%q to CHARACTER SET %s COLLATE %s to match %q.id",
-					t.TableName, c.Name, idCharset, idCollation, target.TableName,
-				)),
+				Location:   &Location{Table: t.TableName, Column: &colName},
+				Suggestion: &suggestion,
 				Context: map[string]any{
 					"current_collation":  colCollation,
 					"expected_collation": idCollation,
@@ -616,6 +648,7 @@ func (l *TypePedanticLinter) lintInferredFK(tables []*statement.CreateTable, tab
 					"expected_charset":   idCharset,
 					"charset_differs":    colCharset != idCharset,
 					"referenced_table":   target.TableName,
+					"convert_referenced": convertTarget,
 					"rule":               "inferred_fk_collation",
 				},
 			})
@@ -681,6 +714,49 @@ func tpFindIDColumn(t *statement.CreateTable) *statement.Column {
 		}
 	}
 	return nil
+}
+
+// tpCurrentCollation returns the collation among collations that replaces
+// every other one, following each one's DeprecatedByCollationID, or ("",
+// false) when none does.
+func tpCurrentCollation(collations []string) (string, bool) {
+	for _, candidate := range collations {
+		replacesAll := true
+		for _, other := range collations {
+			if other != candidate && !tpReplaces(candidate, other) {
+				replacesAll = false
+				break
+			}
+		}
+		if replacesAll {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// tpReplaces reports whether newer replaces older: following older's
+// DeprecatedByCollationID, directly or through collations in between, reaches
+// newer. A collation the registry does not know replaces nothing and is
+// replaced by nothing.
+func tpReplaces(newer, older string) bool {
+	target, err := charset.FindCollationByName(newer)
+	if err != nil {
+		return false
+	}
+	c, err := charset.FindCollationByName(older)
+	if err != nil {
+		return false
+	}
+	for c.DeprecatedByCollationID != 0 {
+		if c, err = charset.FindCollationByID(c.DeprecatedByCollationID); err != nil {
+			return false
+		}
+		if c.ID == target.ID {
+			return true
+		}
+	}
+	return false
 }
 
 // tpPickMajority returns (winningType, true) when one type strictly dominates,

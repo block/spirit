@@ -743,6 +743,7 @@ func TestTypePedantic_InferredFK_CollationUndeclaredTargetUsesAssumedCharset(t *
 	require.NotNil(t, flagged[0].Suggestion)
 	require.Equal(t, `Convert "orders"."customer_id" to CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci to match "customers".id`,
 		*flagged[0].Suggestion, "identifiers are quoted; the CHARACTER SET clause stays as SQL")
+	require.Equal(t, false, flagged[0].Context["convert_referenced"], "0900_ai_ci replaces general_ci, so the column is the side to convert")
 }
 
 func TestTypePedantic_SameName_CollationIgnoresNonTextColumns(t *testing.T) {
@@ -966,4 +967,110 @@ func TestTypePedantic_OtherTablesPhrase(t *testing.T) {
 	require.Equal(t, `"orders"`, tpExampleTables([]string{"orders"}))
 	require.Equal(t, `"a", "b", "c"`, tpExampleTables([]string{"a", "b", "c"}), "a complete list carries no ellipsis")
 	require.Equal(t, `"a", "b", "c", …`, tpExampleTables([]string{"a", "b", "c", "d"}), "a truncated list says so")
+}
+
+func TestTypePedantic_SameName_CollationReplacementOutranksMajority(t *testing.T) {
+	// Two tables still on utf8mb4_general_ci and one on utf8mb4_0900_ai_ci,
+	// which replaces it. Converging on the majority would move the newer
+	// table back onto the obsolete collation, so the verdict is 0900_ai_ci
+	// and the two general_ci columns are the ones flagged.
+	tables := parseTables(t,
+		`CREATE TABLE users (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE profiles (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE accounts (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2)
+	for _, v := range flagged {
+		require.Contains(t, []string{"users", "profiles"}, v.Location.Table)
+		require.Equal(t, "utf8mb4_general_ci", v.Context["current_collation"])
+		require.Equal(t, "utf8mb4_0900_ai_ci", v.Context["expected_collation"])
+		require.Equal(t, true, v.Context["replaces_current"])
+		require.Contains(t, v.Message, `but 1 other table uses "utf8mb4_0900_ai_ci" (e.g. "accounts"), which replaces it`)
+		require.NotNil(t, v.Suggestion)
+		require.Equal(t,
+			fmt.Sprintf(`Convert %q."email" to CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci, which replaces utf8mb4_general_ci`, v.Location.Table),
+			*v.Suggestion)
+	}
+}
+
+func TestTypePedantic_SameName_CollationReplacementBreaksTie(t *testing.T) {
+	// One table on each step of the utf8mb4 lineage. Without the lineage this
+	// is a three-way tie; with it, 0900_ai_ci replaces both of the others.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_520_ci`,
+		`CREATE TABLE c (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2)
+	got := map[string]string{}
+	for _, v := range flagged {
+		require.Equal(t, "utf8mb4_0900_ai_ci", v.Context["expected_collation"])
+		require.Equal(t, true, v.Context["replaces_current"])
+		got[v.Location.Table] = v.Context["current_collation"].(string)
+	}
+	require.Equal(t, map[string]string{"a": "utf8mb4_general_ci", "b": "utf8mb4_unicode_520_ci"}, got)
+}
+
+func TestTypePedantic_SameName_CollationMajorityNamesReplacementPerColumn(t *testing.T) {
+	// 0900_ai_ci holds the majority but does not replace utf8mb4_bin, so the
+	// majority decides. It does replace utf8mb4_general_ci, and only that
+	// column's suggestion says so.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE c (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+		`CREATE TABLE d (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2)
+	byTable := map[string]Violation{}
+	for _, v := range flagged {
+		require.Equal(t, "utf8mb4_0900_ai_ci", v.Context["expected_collation"])
+		byTable[v.Location.Table] = v
+	}
+	require.Contains(t, byTable, "c")
+	require.Contains(t, byTable, "d")
+	require.Equal(t, false, byTable["c"].Context["replaces_current"])
+	require.Equal(t, `Convert "c"."email" to CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci for consistency`, *byTable["c"].Suggestion)
+	require.Equal(t, true, byTable["d"].Context["replaces_current"])
+	require.Equal(t, `Convert "d"."email" to CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci, which replaces utf8mb4_general_ci`, *byTable["d"].Suggestion)
+}
+
+func TestTypePedantic_SameName_CollationReplacementAcrossCharsets(t *testing.T) {
+	// utf8mb3 is deprecated in favor of utf8mb4, so a utf8mb3 majority gives
+	// way to the one utf8mb4 table, and the suggestion changes the charset.
+	tables := parseTables(t,
+		`CREATE TABLE a (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb3`,
+		`CREATE TABLE b (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb3`,
+		`CREATE TABLE c (id BIGINT UNSIGNED PRIMARY KEY, email VARCHAR(255), KEY k (email)) DEFAULT CHARSET=utf8mb4`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "same_name_collation")
+	require.Len(t, flagged, 2)
+	for _, v := range flagged {
+		require.Contains(t, []string{"a", "b"}, v.Location.Table)
+		require.Equal(t, "utf8mb4_0900_ai_ci", v.Context["expected_collation"])
+		require.Equal(t, "utf8mb4", v.Context["expected_charset"])
+		require.Equal(t, true, v.Context["charset_differs"])
+		require.Equal(t, true, v.Context["replaces_current"])
+	}
+}
+
+func TestTypePedantic_InferredFK_CollationConvertsObsoleteTarget(t *testing.T) {
+	// The referencing column is on utf8mb4_0900_ai_ci and the target id is
+	// still on utf8mb4_general_ci, which 0900_ai_ci replaces. Matching the
+	// target would move the column onto the obsolete collation, so the
+	// suggestion converts the target instead.
+	tables := parseTables(t,
+		`CREATE TABLE customers (id VARCHAR(64) NOT NULL PRIMARY KEY) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		`CREATE TABLE orders (id BIGINT UNSIGNED PRIMARY KEY, customer_id VARCHAR(64) NOT NULL) DEFAULT CHARSET=utf8mb4`,
+	)
+	flagged := filterRule(newTypePedantic(t).Lint(tables, nil), "inferred_fk_collation")
+	require.Len(t, flagged, 1)
+	v := flagged[0]
+	require.Equal(t, "orders", v.Location.Table)
+	require.Equal(t, true, v.Context["convert_referenced"])
+	require.NotNil(t, v.Suggestion)
+	require.Equal(t, `Convert "customers".id to CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci, which replaces utf8mb4_general_ci`, *v.Suggestion)
 }
