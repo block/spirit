@@ -110,7 +110,11 @@ func evalOnMySQL(t *testing.T, conn *sql.Conn, expr string) mysqlPartitionConsta
 	}
 	var value sql.NullString
 	require.NoError(t, rows.Scan(&value))
-	if !value.Valid || !strings.HasSuffix(types[0].DatabaseTypeName(), "INT") {
+	// From 8.4, YEAR() is typed YEAR rather than an integer. A partition
+	// still stores its value as an integer, outside YEAR's 1901-2155 range
+	// too: YEAR('0001-01-01') is stored as 1.
+	typeName := types[0].DatabaseTypeName()
+	if !value.Valid || (!strings.HasSuffix(typeName, "INT") && typeName != "YEAR") {
 		return mysqlPartitionConstant{}
 	}
 	return mysqlPartitionConstant{accepted: true, value: value.String}
