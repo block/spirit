@@ -123,12 +123,19 @@ type CollationProperties struct {
 	// PadSpace reports whether trailing spaces are ignored in comparisons
 	// (PAD SPACE, so 'abc' = 'abc '). A NO PAD collation compares them.
 	PadSpace bool
+	// Binary reports whether the collation compares bytes or code points
+	// rather than weights, so two values it calls equal are identical apart
+	// from the trailing spaces a PAD SPACE collation ignores. Moving a column
+	// onto a binary collation of the same charset cannot make values that
+	// compared unequal start comparing equal, unless it starts ignoring
+	// trailing spaces.
+	Binary bool
 }
 
 // LookupCollationProperties returns how the named collation compares strings.
 // Case sensitivity follows MySQL's collation naming: a _bin suffix (or the
-// binary collation) compares bytes or code points, and _cs and _ci name case
-// sensitivity directly. The pad attribute is the one MySQL reports in
+// binary collation) compares bytes or code points, which also makes it
+// Binary, and _cs and _ci name case sensitivity directly. The pad attribute is the one MySQL reports in
 // information_schema.COLLATIONS. Accent sensitivity is not reported: a name
 // without an _ai or _as suffix does not decide it, and many such collations
 // are accent-sensitive.
@@ -143,7 +150,7 @@ func LookupCollationProperties(name string) (CollationProperties, error) {
 	}
 	props := CollationProperties{PadSpace: collation.PadAttribute == charset.PadSpace}
 	if strings.EqualFold(collation.Name, charset.CollationBin) {
-		props.CaseSensitive = true
+		props.CaseSensitive, props.Binary = true, true
 		return props, nil
 	}
 	// Read the suffixes from the end: a language code such as Czech's "cs"
@@ -151,7 +158,10 @@ func LookupCollationProperties(name string) (CollationProperties, error) {
 	parts := strings.Split(strings.ToLower(collation.Name), "_")
 	for _, part := range slices.Backward(parts) {
 		switch part {
-		case "bin", "cs":
+		case "bin":
+			props.CaseSensitive, props.Binary = true, true
+			return props, nil
+		case "cs":
 			props.CaseSensitive = true
 			return props, nil
 		case "ci":
