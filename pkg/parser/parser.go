@@ -20818,7 +20818,7 @@ yynewstate:
 			// Like CharsetName above: unknown collations, including
 			// user-defined LDML collations such as utf8mb4_test_ci, are a
 			// runtime error in MySQL (ER_UNKNOWN_COLLATION), not a parse error.
-			if info, err := charset.GetCollationByName(yyS[yypt-0].ident); err == nil {
+			if info, err := charset.FindCollationByName(yyS[yypt-0].ident); err == nil {
 				parser.yyVAL.ident = info.Name
 			} else {
 				parser.yyVAL.ident = strings.ToLower(yyS[yypt-0].ident)

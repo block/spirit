@@ -11098,7 +11098,7 @@ CollationName:
 		// Like CharsetName above: unknown collations, including
 		// user-defined LDML collations such as utf8mb4_test_ci, are a
 		// runtime error in MySQL (ER_UNKNOWN_COLLATION), not a parse error.
-		if info, err := charset.GetCollationByName($1); err == nil {
+		if info, err := charset.FindCollationByName($1); err == nil {
 			$$ = info.Name
 		} else {
 			$$ = strings.ToLower($1)

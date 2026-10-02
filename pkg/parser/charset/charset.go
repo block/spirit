@@ -180,8 +180,8 @@ func utf8Alias(csname string) string {
 	return csname
 }
 
-// GetCollationByName returns the collation by name.
-func GetCollationByName(name string) (*Collation, error) {
+// FindCollationByName returns the collation by name.
+func FindCollationByName(name string) (*Collation, error) {
 	csname := utf8Alias(strings.ToLower(name))
 	collation, ok := collationsNameMap[csname]
 	if !ok {
@@ -190,9 +190,9 @@ func GetCollationByName(name string) (*Collation, error) {
 	return collation, nil
 }
 
-// GetCollationByID returns the collation with the given ID, such as the one a
+// FindCollationByID returns the collation with the given ID, such as the one a
 // Collation's DeprecatedByCollationID names.
-func GetCollationByID(id int) (*Collation, error) {
+func FindCollationByID(id int) (*Collation, error) {
 	collation, ok := collationsIDMap[id]
 	if !ok {
 		return nil, fmt.Errorf("unknown collation ID %d", id)

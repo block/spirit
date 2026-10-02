@@ -126,14 +126,14 @@ func TestGetCharsetDesc(t *testing.T) {
 	}
 }
 
-func TestGetCollationByName(t *testing.T) {
+func TestFindCollationByName(t *testing.T) {
 	for _, collation := range collations {
-		coll, err := GetCollationByName(collation.Name)
+		coll, err := FindCollationByName(collation.Name)
 		require.NoError(t, err)
 		require.Equal(t, collation, coll)
 	}
 
-	_, err := GetCollationByName("non_exist")
+	_, err := FindCollationByName("non_exist")
 	require.EqualError(t, err, "[ddl:1273]Unknown collation: 'non_exist'")
 }
 
@@ -165,7 +165,7 @@ func TestUTF8MB3(t *testing.T) {
 		{"utf8mb3_tolower_ci", "utf8_tolower_ci"},
 	}
 	for _, tt := range tests {
-		col, err := GetCollationByName(tt.cs)
+		col, err := FindCollationByName(tt.cs)
 		require.NoError(t, err)
 		require.Equal(t, col.Name, tt.alias)
 	}
@@ -219,7 +219,7 @@ func TestMySQLDefaultCollationBelongsToCharset(t *testing.T) {
 	for name := range charsets {
 		co, ok := MySQLDefaultCollation(name)
 		require.True(t, ok, "charset %q", name)
-		collation, err := GetCollationByName(co)
+		collation, err := FindCollationByName(co)
 		require.NoError(t, err, "charset %q default %q", name, co)
 		require.Equal(t, name, collation.CharsetName, "charset %q default %q", name, co)
 	}

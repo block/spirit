@@ -64,7 +64,7 @@ func TestCollationComparison(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.collation, func(t *testing.T) {
-			c, err := GetCollationByName(tt.collation)
+			c, err := FindCollationByName(tt.collation)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, comparisonOf(c))
 		})
@@ -84,11 +84,11 @@ func TestUCAVersionOrder(t *testing.T) {
 // one that replaces it.
 func successors(t *testing.T, name string) []string {
 	t.Helper()
-	c, err := GetCollationByName(name)
+	c, err := FindCollationByName(name)
 	require.NoError(t, err)
 	var chain []string
 	for c.DeprecatedByCollationID != 0 {
-		c, err = GetCollationByID(c.DeprecatedByCollationID)
+		c, err = FindCollationByID(c.DeprecatedByCollationID)
 		require.NoError(t, err)
 		chain = append(chain, c.Name)
 		require.Less(t, len(chain), len(collations), "deprecation cycle from %q", name)
@@ -131,7 +131,7 @@ func TestDeprecatedByCollationIDIsComplete(t *testing.T) {
 			}
 			continue
 		}
-		next, err := GetCollationByID(c.DeprecatedByCollationID)
+		next, err := FindCollationByID(c.DeprecatedByCollationID)
 		require.NoError(t, err, c.Name)
 		if c.CharsetName == CharsetUTF8 {
 			assert.Equal(t, CharsetUTF8MB4+strings.TrimPrefix(c.Name, CharsetUTF8), next.Name, c.Name)
@@ -143,13 +143,13 @@ func TestDeprecatedByCollationIDIsComplete(t *testing.T) {
 	assert.ElementsMatch(t, []string{"utf8mb4_persian_ci", "utf8mb4_sinhala_ci"}, withoutSuccessor)
 }
 
-func TestGetCollationByID(t *testing.T) {
+func TestFindCollationByID(t *testing.T) {
 	for _, c := range collations {
-		got, err := GetCollationByID(c.ID)
+		got, err := FindCollationByID(c.ID)
 		require.NoError(t, err)
 		assert.Equal(t, c, got)
 	}
-	_, err := GetCollationByID(-1)
+	_, err := FindCollationByID(-1)
 	require.Error(t, err)
 }
 
@@ -195,7 +195,7 @@ func TestCollationComparisonMatchesServer(t *testing.T) {
 	accentPairs := [][2]string{{"a", "á"}, {"a", "à"}, {"a", "â"}, {"e", "é"}, {"e", "è"}, {"o", "ó"}, {"u", "ú"}}
 	for _, sc := range serverCollations {
 		t.Run(sc.name, func(t *testing.T) {
-			c, err := GetCollationByName(sc.name)
+			c, err := FindCollationByName(sc.name)
 			require.NoError(t, err)
 			assert.Equal(t, sc.pad, c.PadAttribute, "pad attribute")
 
