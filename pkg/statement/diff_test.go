@@ -2416,6 +2416,29 @@ func TestDiffPartitionChanges(t *testing.T) {
 			expected: []string{"ALTER TABLE `t1` ADD PARTITION (PARTITION `p1` VALUES LESS THAN (UNIX_TIMESTAMP('2031-01-01 00:00:00')))"},
 		},
 		{
+			// A LIST value left as an expression may evaluate differently
+			// when the ALTER runs (UNIX_TIMESTAMP reads the session time
+			// zone), and a LIST REORGANIZE deletes the rows of a value it
+			// loses. PARTITION BY fails with 1526 instead.
+			name:     "ListExpressionValueCommentChange",
+			source:   "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (UNIX_TIMESTAMP('2030-01-01 00:00:00')) COMMENT 'old')",
+			target:   "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (UNIX_TIMESTAMP('2030-01-01 00:00:00')) COMMENT 'new')",
+			expected: []string{"ALTER TABLE `t1` PARTITION BY LIST (`id`) (PARTITION `p0` VALUES IN (1), PARTITION `p1` VALUES IN (UNIX_TIMESTAMP('2030-01-01 00:00:00')) COMMENT = 'new')"},
+		},
+		{
+			name:     "ListColumnsExpressionInTupleCommentChange",
+			source:   "CREATE TABLE t1 (a BIGINT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b)) PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((UNIX_TIMESTAMP('2030-01-01 00:00:00'), 1)) COMMENT 'old')",
+			target:   "CREATE TABLE t1 (a BIGINT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b)) PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((UNIX_TIMESTAMP('2030-01-01 00:00:00'), 1)) COMMENT 'new')",
+			expected: []string{"ALTER TABLE `t1` PARTITION BY LIST COLUMNS (`a`, `b`) (PARTITION `p0` VALUES IN ((UNIX_TIMESTAMP('2030-01-01 00:00:00'), 1)) COMMENT = 'new')"},
+		},
+		{
+			// A folded constant is a value, so it still qualifies.
+			name:     "ListFoldedValueCommentChange",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (10 + 10) COMMENT 'old')",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (20) COMMENT 'new')",
+			expected: []string{"ALTER TABLE `t1` REORGANIZE PARTITION `p1` INTO (PARTITION `p1` VALUES IN (20) COMMENT = 'new')"},
+		},
+		{
 			name:     "AppendListPartition",
 			source:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2))",
 			target:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3))",

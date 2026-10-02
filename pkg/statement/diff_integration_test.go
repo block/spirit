@@ -1173,9 +1173,11 @@ func TestDiffIntegrationListNullValueKeepsRows(t *testing.T) {
 // TestDiffIntegrationFractionalDatetimeBoundKeepsRows verifies that a bound
 // spirit cannot evaluate offline is emitted as written, for MySQL to
 // evaluate. MySQL rounds the fractional second first, so
-// YEAR('2030-12-31 23:59:59.9999999') is 2031; evaluated as 2030, a
-// comment-only REORGANIZE would move the 2031 row into no partition, and MySQL
-// would delete it without an error.
+// YEAR('2030-12-31 23:59:59.9999999') is 2031; evaluated as 2030, the
+// comment-only change would move the 2031 row into no partition. (The change
+// is a PARTITION BY, not a REORGANIZE: an unevaluated LIST value never
+// qualifies for REORGANIZE, see
+// TestDiffIntegrationSessionDependentListValueKeepsRows.)
 func TestDiffIntegrationFractionalDatetimeBoundKeepsRows(t *testing.T) {
 	const bound = "YEAR('2030-12-31 23:59:59.9999999')"
 	t.Run("ReorganizeBetweenAuthoredSchemas", func(t *testing.T) {
@@ -1207,6 +1209,41 @@ func TestDiffIntegrationFractionalDatetimeBoundKeepsRows(t *testing.T) {
 		execStatements(t, tt.DB, stmts)
 		testutils.RunSQL(t, "INSERT INTO diff_fraction VALUES (2031)")
 	})
+}
+
+// TestDiffIntegrationSessionDependentListValueKeepsRows verifies that a
+// LIST value left as an expression does not qualify for REORGANIZE, even when
+// its text is unchanged. UNIX_TIMESTAMP reads the session time zone, so the
+// same text names a different value in a session with a different zone. A
+// REORGANIZE run there leaves the stored value without a partition, and MySQL
+// deletes its rows without an error. PARTITION BY fails with 1526 instead.
+func TestDiffIntegrationSessionDependentListValueKeepsRows(t *testing.T) {
+	const create = "CREATE TABLE diff_tz_list (id bigint NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) " +
+		"(PARTITION p0 VALUES IN (UNIX_TIMESTAMP('2030-01-01 00:00:00')) COMMENT 'old')"
+	// Created, and the row inserted, in the UTC session spirit connects with.
+	tt := testutils.NewTestTable(t, "diff_tz_list", create)
+	testutils.RunSQL(t, "INSERT INTO diff_tz_list VALUES (UNIX_TIMESTAMP('2030-01-01 00:00:00'))")
+
+	source, err := ParseCreateTable(create)
+	require.NoError(t, err)
+	target, err := ParseCreateTable(strings.Replace(create, "COMMENT 'old'", "COMMENT 'new'", 1))
+	require.NoError(t, err)
+	stmts, err := source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "PARTITION BY LIST")
+
+	conn, err := tt.DB.Conn(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = conn.ExecContext(t.Context(), "SET SESSION time_zone = '+01:00'")
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), stmts[0].Statement)
+	require.ErrorContains(t, err, "1526")
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_tz_list").Scan(&count))
+	require.Equal(t, 1, count, "the row must survive: %s", stmts[0].Statement)
 }
 
 // TestDiffIntegrationMultiColumnListNoSelfDiff verifies that a multi-column

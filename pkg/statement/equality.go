@@ -404,6 +404,13 @@ func reorganizedPartitions(source, target *PartitionOptions) ([]string, []Partit
 // listValuesEqual reports whether two runs of LIST partitions hold the same
 // set of values, regardless of which partition holds each one. A
 // multi-column LIST COLUMNS value counts as one value (its whole tuple).
+//
+// A value left as an expression (one partitionBoundConstantNormalizer could
+// not fold) disqualifies the run. Its text says nothing about the value
+// MySQL stored: UNIX_TIMESTAMP('2030-01-01 00:00:00') evaluates by the
+// session time zone, so the same text can name a different value when the
+// REORGANIZE runs, and a LIST REORGANIZE silently deletes the rows of a
+// value it leaves out. PARTITION BY fails with error 1526 instead.
 func listValuesEqual(a, b []PartitionDefinition) bool {
 	counts := make(map[string]int)
 	for i := range a {
@@ -411,6 +418,9 @@ func listValuesEqual(a, b []PartitionDefinition) bool {
 			return false
 		}
 		for _, v := range a[i].Values.Values {
+			if isUnresolvedPartitionValue(v) {
+				return false
+			}
 			counts[formatPartitionValue(v)]++
 		}
 	}
@@ -419,6 +429,9 @@ func listValuesEqual(a, b []PartitionDefinition) bool {
 			return false
 		}
 		for _, v := range b[i].Values.Values {
+			if isUnresolvedPartitionValue(v) {
+				return false
+			}
 			k := formatPartitionValue(v)
 			if counts[k] == 0 {
 				return false
@@ -533,6 +546,18 @@ func partitionDefinitionEqual(a, b *PartitionDefinition) bool {
 // partitionDefinitionEqual).
 func subPartitionDefinitionEqual(a, b *SubPartitionDefinition) bool {
 	return a.Name == b.Name && ptrEqual(a.Comment, b.Comment)
+}
+
+// isUnresolvedPartitionValue reports whether a partition value, or any
+// element of a LIST COLUMNS tuple, is an expression rather than a constant.
+func isUnresolvedPartitionValue(v any) bool {
+	switch v := v.(type) {
+	case partitionExprValue:
+		return true
+	case partitionValueTuple:
+		return slices.ContainsFunc(v, isUnresolvedPartitionValue)
+	}
+	return false
 }
 
 // partitionValuesEqual checks if two partition values are equal
