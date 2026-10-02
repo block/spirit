@@ -11,17 +11,19 @@ import (
 
 func init() { registerNormalizer(expressionParenNormalizer{}) }
 
-// expressionParenNormalizer rewrites CHECK-constraint and generated-column
-// expressions into a canonical parenthesization, mirroring the fact that
-// MySQL stores these expressions in its own fully parenthesized form. A
-// user's CHECK (a = 1 AND b = 2) comes back from SHOW CREATE TABLE as
-// CHECK (((`a` = 1) and (`b` = 2))), while the parser preserves whichever
+// expressionParenNormalizer rewrites CHECK-constraint, generated-column and
+// partitioning expressions into a canonical parenthesization, mirroring the
+// fact that MySQL stores these expressions in its own fully parenthesized
+// form. A user's CHECK (a = 1 AND b = 2) comes back from SHOW CREATE TABLE as
+// CHECK (((`a` = 1) and (`b` = 2))), and PARTITION BY RANGE (a + b) as
+// PARTITION BY RANGE ((`a` + `b`)), while the parser preserves whichever
 // parentheses the input happened to contain. Without a canonical form the
 // desired and live expressions differ textually forever and a declarative
-// diff re-emits the same DROP+ADD on every run. CHECK comparison is
-// definition-based (constraint names are schema-scoped, so the shadow table
-// renames them and diffConstraints pairs constraints by expression), which
-// makes the definition text the only thing that can converge.
+// diff re-emits the same DROP+ADD (or repartition) on every run. CHECK
+// comparison is definition-based (constraint names are schema-scoped, so the
+// shadow table renames them and diffConstraints pairs constraints by
+// expression), which makes the definition text the only thing that can
+// converge.
 //
 // Canonicalization runs in two passes over the parsed expression:
 //
@@ -73,6 +75,12 @@ func (expressionParenNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		canonicalizeExprParens(p, c.Expression)
 		definition := checkConstraintDefinition(c)
 		c.Definition = &definition
+	}
+	if ct.Partition != nil {
+		canonicalizeExprParens(p, ct.Partition.Expression)
+		if ct.Partition.SubPartition != nil {
+			canonicalizeExprParens(p, ct.Partition.SubPartition.Expression)
+		}
 	}
 	return ct
 }

@@ -101,9 +101,7 @@ func (functionAliasNormalizer) Normalize(ct *CreateTable) *CreateTable {
 	if ct.Partition != nil {
 		canonicalizeFuncAliases(p, ct.Partition.Expression, restoreExpressionText)
 		if ct.Partition.SubPartition != nil {
-			// A subpartition expression is parsed through parseExpression, not
-			// the generic expression restore the partition expression uses.
-			canonicalizeFuncAliases(p, ct.Partition.SubPartition.Expression, restoreLiteralStyleText)
+			canonicalizeFuncAliases(p, ct.Partition.SubPartition.Expression, restoreExpressionText)
 		}
 	}
 	return ct

@@ -348,6 +348,9 @@ func formatPartitionOptions(partOpts *PartitionOptions) string {
 			parts = append(parts, fmt.Sprintf("(%s)", sqlescape.EscapeIdentifierList(partOpts.Columns)))
 		}
 	case "KEY":
+		if partOpts.KeyAlgorithm != 0 {
+			parts = append(parts, fmt.Sprintf("ALGORITHM=%d", partOpts.KeyAlgorithm))
+		}
 		if len(partOpts.Columns) > 0 {
 			parts = append(parts, fmt.Sprintf("(%s)", sqlescape.EscapeIdentifierList(partOpts.Columns)))
 		} else {
@@ -426,6 +429,9 @@ func formatSubPartitionOptions(subOpts *SubPartitionOptions) string {
 			parts = append(parts, fmt.Sprintf("(%s)", sqlescape.EscapeIdentifierList(subOpts.Columns)))
 		}
 	case "KEY":
+		if subOpts.KeyAlgorithm != 0 {
+			parts = append(parts, fmt.Sprintf("ALGORITHM=%d", subOpts.KeyAlgorithm))
+		}
 		if len(subOpts.Columns) > 0 {
 			parts = append(parts, fmt.Sprintf("(%s)", sqlescape.EscapeIdentifierList(subOpts.Columns)))
 		} else {

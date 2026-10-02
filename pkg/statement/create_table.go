@@ -291,13 +291,14 @@ type TableOptions struct {
 
 // PartitionOptions represents table partitioning configuration
 type PartitionOptions struct {
-	Type         string                `json:"type"`                   // RANGE, LIST, HASH, KEY
-	Expression   *string               `json:"expression,omitempty"`   // For HASH and RANGE
-	Columns      []string              `json:"columns,omitempty"`      // For KEY, RANGE COLUMNS, LIST COLUMNS
-	Linear       bool                  `json:"linear,omitempty"`       // For LINEAR HASH/KEY
-	Partitions   uint64                `json:"partitions,omitempty"`   // Number of partitions
-	Definitions  []PartitionDefinition `json:"definitions,omitempty"`  // Individual partition definitions
-	SubPartition *SubPartitionOptions  `json:"subpartition,omitempty"` // Subpartitioning options
+	Type         string                `json:"type"`                    // RANGE, LIST, HASH, KEY
+	Expression   *string               `json:"expression,omitempty"`    // For HASH and RANGE
+	Columns      []string              `json:"columns,omitempty"`       // For KEY, RANGE COLUMNS, LIST COLUMNS
+	Linear       bool                  `json:"linear,omitempty"`        // For LINEAR HASH/KEY
+	KeyAlgorithm uint64                `json:"key_algorithm,omitempty"` // For KEY: ALGORITHM=1; 0 is MySQL's default (2)
+	Partitions   uint64                `json:"partitions,omitempty"`    // Number of partitions
+	Definitions  []PartitionDefinition `json:"definitions,omitempty"`   // Individual partition definitions
+	SubPartition *SubPartitionOptions  `json:"subpartition,omitempty"`  // Subpartitioning options
 }
 
 // PartitionDefinition represents a single partition definition
@@ -350,13 +351,22 @@ type partitionNullValue struct{}
 // error 1653) and a regrouping of the same values compares equal.
 type partitionValueTuple []any
 
+// partitionExprValue is a partition value written as an expression rather
+// than a literal, e.g. 10+10 or TO_DAYS('2030-01-01'). It renders bare:
+// quoted, it would be the string '10+10', which MySQL rejects (error 1697).
+// MySQL evaluates the expression when it stores the partition, and the
+// partition-bound-constants rule folds the ones it can evaluate offline into
+// the literal MySQL reports.
+type partitionExprValue string
+
 // SubPartitionOptions represents subpartitioning configuration
 type SubPartitionOptions struct {
-	Type       string   `json:"type"`                 // HASH, KEY
-	Expression *string  `json:"expression,omitempty"` // For HASH
-	Columns    []string `json:"columns,omitempty"`    // For KEY
-	Linear     bool     `json:"linear,omitempty"`     // For LINEAR HASH/KEY
-	Count      uint64   `json:"count,omitempty"`      // Number of subpartitions
+	Type         string   `json:"type"`                    // HASH, KEY
+	Expression   *string  `json:"expression,omitempty"`    // For HASH
+	Columns      []string `json:"columns,omitempty"`       // For KEY
+	Linear       bool     `json:"linear,omitempty"`        // For LINEAR HASH/KEY
+	KeyAlgorithm uint64   `json:"key_algorithm,omitempty"` // For KEY: ALGORITHM=1; 0 is MySQL's default (2)
+	Count        uint64   `json:"count,omitempty"`         // Number of subpartitions
 }
 
 // SubPartitionDefinition represents a single subpartition definition
@@ -1201,6 +1211,10 @@ func (ct *CreateTable) parsePartitionOptions(partition *ast.PartitionOptions) *P
 		partOpts.Type = fmt.Sprintf("UNKNOWN_%d", partition.Tp)
 	}
 
+	if partition.KeyAlgorithm != nil {
+		partOpts.KeyAlgorithm = partition.KeyAlgorithm.Type
+	}
+
 	// Parse expression for HASH and RANGE
 	if partition.Expr != nil {
 		// Restore the full expression using the AST
@@ -1331,11 +1345,18 @@ func (ct *CreateTable) parsePartitionClause(clause ast.PartitionDefinitionClause
 // parsePartitionValue parses a single partition value expression. The
 // MAXVALUE keyword becomes the partitionMaxValue sentinel so it is emitted
 // bare (never as the string literal 'MAXVALUE', which MySQL rejects with
-// error 1697), and NULL becomes partitionNullValue for the same reason. String literals (LIST/RANGE COLUMNS on a string column) are
-// wrapped in partitionStringLiteral carrying their true raw value, so
-// emission can quote them unconditionally. Numeric literals and expressions
-// (e.g. YEAR(col)) fall back to the Restored text form as plain strings.
+// error 1697), and NULL becomes partitionNullValue for the same reason.
+// String literals (LIST/RANGE COLUMNS on a string column) are wrapped in
+// partitionStringLiteral carrying their true raw value, so emission can
+// quote them unconditionally. Numeric literals become their text as plain
+// strings, and anything else (e.g. 10+10, TO_DAYS('2030-01-01')) becomes a
+// partitionExprValue.
+//
+// Parentheses around a value carry no meaning, so they are dropped first:
+// otherwise ('y') would be read as an expression rather than the string
+// 'y', and (NULL) as something other than NULL.
 func (ct *CreateTable) parsePartitionValue(expr ast.ExprNode) any {
+	expr = unwrapParenExpr(expr)
 	if _, isMax := expr.(*ast.MaxValueExpr); isMax {
 		return partitionMaxValue{}
 	}
@@ -1344,6 +1365,12 @@ func (ct *CreateTable) parsePartitionValue(expr ast.ExprNode) any {
 	}
 	if literal, isStr := stringLiteralValue(expr); isStr {
 		return partitionStringLiteral(literal)
+	}
+	if _, isLiteral := expr.(*ast.ValueExpr); isLiteral {
+		return ct.parseExpression(expr)
+	}
+	if text, ok := restoreExpressionText(expr); ok {
+		return partitionExprValue(text)
 	}
 	return ct.parseExpression(expr)
 }
@@ -1358,6 +1385,9 @@ func (ct *CreateTable) parseSubPartitionOptions(sub *ast.PartitionMethod) *SubPa
 		Linear: sub.Linear,
 		Count:  sub.Num,
 	}
+	if sub.KeyAlgorithm != nil {
+		subOpts.KeyAlgorithm = sub.KeyAlgorithm.Type
+	}
 
 	// Parse subpartition type
 	switch sub.Tp {
@@ -1371,8 +1401,7 @@ func (ct *CreateTable) parseSubPartitionOptions(sub *ast.PartitionMethod) *SubPa
 
 	// Parse expression for HASH
 	if sub.Expr != nil {
-		expr := ct.parseExpression(sub.Expr)
-		if exprStr, ok := expr.(string); ok && exprStr != "" {
+		if exprStr, ok := restoreExpressionText(sub.Expr); ok && exprStr != "" {
 			subOpts.Expression = &exprStr
 		}
 	}
@@ -2198,24 +2227,45 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 
 // partitionKeyColumnsChanged reports whether any column the target's
 // partitioning reads (its COLUMNS list, or the columns in its expression)
-// differs between ct and target. It returns true when the columns can't be
+// differs between ct and target. A generated column counts as reading the
+// columns its expression reads, transitively: RANGE (g) with g AS (FLOOR(d))
+// moves rows between partitions when d changes type, even though g's own
+// definition is unchanged. It returns true when the columns can't be
 // determined, so callers fall back to the conservative path.
 func (ct *CreateTable) partitionKeyColumnsChanged(target *CreateTable, opts *DiffOptions) bool {
 	if target.Partition == nil {
 		return false
 	}
-	names := target.Partition.Columns
+	p := parser.New()
+	pending := slices.Clone(target.Partition.Columns)
 	if target.Partition.Expression != nil {
 		var ok bool
-		names, ok = expressionColumnNames(parser.New(), *target.Partition.Expression)
+		pending, ok = expressionColumnNames(p, *target.Partition.Expression)
 		if !ok {
 			return true
 		}
 	}
-	for _, name := range names {
+	seen := make(map[string]bool)
+	for len(pending) > 0 {
+		name := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if seen[strings.ToLower(name)] {
+			continue
+		}
+		seen[strings.ToLower(name)] = true
 		sourceCol, targetCol := findColumn(ct.Columns, name), findColumn(target.Columns, name)
 		if sourceCol == nil || targetCol == nil || !ct.columnsEqualWithContext(sourceCol, targetCol, target, opts) {
 			return true
+		}
+		for _, col := range []*Column{sourceCol, targetCol} {
+			if col.GeneratedExpr == nil {
+				continue
+			}
+			deps, ok := expressionColumnNames(p, *col.GeneratedExpr)
+			if !ok {
+				return true
+			}
+			pending = append(pending, deps...)
 		}
 	}
 	return false

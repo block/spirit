@@ -38,8 +38,11 @@ var numericPartitionValueRe = regexp.MustCompile(`^-?(0|[1-9]\d*)(\.\d+)?$`)
 // A partitionValueTuple (one multi-column LIST COLUMNS value) renders as a
 // parenthesized list of its elements, e.g. (1, 'a').
 //
-// For plain Go strings (numeric literals and expressions the parser
-// Restored to text, e.g. YEAR(col)) we fall back to the
+// A partitionExprValue (an expression such as 10+10 that MySQL evaluates)
+// renders bare.
+//
+// For plain Go strings (numeric literals the parser Restored to text) we
+// fall back to the
 // numericPartitionValueRe heuristic: values that match render unquoted;
 // anything else is quote+escaped. The heuristic deliberately excludes
 // ParseFloat-accepting curiosities (NaN, Inf, "1e10") and zero-prefix
@@ -57,6 +60,9 @@ func formatPartitionValue(v any) string {
 			elems[i] = formatPartitionValue(e)
 		}
 		return "(" + strings.Join(elems, ", ") + ")"
+	}
+	if e, ok := v.(partitionExprValue); ok {
+		return string(e)
 	}
 	if sl, ok := v.(partitionStringLiteral); ok {
 		return "'" + sqlescape.EscapeString(string(sl)) + "'"

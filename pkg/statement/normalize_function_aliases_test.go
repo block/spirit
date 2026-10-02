@@ -188,7 +188,7 @@ func TestFunctionAliasNormalization(t *testing.T) {
 			sql: "CREATE TABLE t (id int NOT NULL, dt date NOT NULL, PRIMARY KEY (id, dt)) " +
 				"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (DAY(dt)) SUBPARTITIONS 2 " +
 				"(PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
-			wantExpr: "dayofmonth(`dt`)",
+			wantExpr: "DAYOFMONTH(`dt`)",
 			get:      func(ct *CreateTable) *string { return ct.Partition.SubPartition.Expression },
 		},
 		{

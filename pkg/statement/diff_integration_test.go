@@ -693,7 +693,7 @@ func TestDiffIntegrationSubpartitionChange(t *testing.T) {
 	require.Len(t, stmts, 1, "a repartition needs no REMOVE PARTITIONING first")
 	require.Equal(t,
 		"ALTER TABLE `diff_subpart_chg` PARTITION BY RANGE (YEAR(`dt`)) "+
-			"SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 4 "+
+			"SUBPARTITION BY HASH (DAYOFMONTH(`dt`)) SUBPARTITIONS 4 "+
 			"(PARTITION `p0` VALUES LESS THAN (2020), PARTITION `p1` VALUES LESS THAN MAXVALUE)",
 		stmts[0].Statement)
 
@@ -783,6 +783,8 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 		target string
 		// prefix of each emitted statement, after "ALTER TABLE `diff_part_chg` "
 		expected []string
+		// after, if set, must succeed once the table has converged
+		after string
 	}{
 		{
 			name:     "ChangeTypeWithColumn",
@@ -831,6 +833,174 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d decimal(10,2) NOT NULL, PRIMARY KEY (id, d)) " +
 				"PARTITION BY RANGE (FLOOR(d)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
 			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NOT NULL PARTITION BY RANGE"},
+		},
+		{
+			// The same, with the partitioning reading d through a generated
+			// column: g's definition is unchanged, but its value moves.
+			name:   "AppendRangePartitionWithGeneratedPartitionKeyChange",
+			source: "CREATE TABLE diff_part_chg (d decimal(10,3), g int AS (FLOOR(d)) STORED) PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg (d) VALUES (9.996)",
+			target: "CREATE TABLE diff_part_chg (d decimal(10,2), g int AS (FLOOR(d)) STORED) " +
+				"PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NULL PARTITION BY RANGE"},
+		},
+		{
+			// Two generated columns deep.
+			name:   "AppendRangePartitionWithTransitivePartitionKeyChange",
+			source: "CREATE TABLE diff_part_chg (d decimal(10,3), g int AS (FLOOR(d)) STORED, h int AS (g + 1) STORED) PARTITION BY RANGE (h) (PARTITION p0 VALUES LESS THAN (11))",
+			insert: "INSERT INTO diff_part_chg (d) VALUES (9.996)",
+			target: "CREATE TABLE diff_part_chg (d decimal(10,2), g int AS (FLOOR(d)) STORED, h int AS (g + 1) STORED) " +
+				"PARTITION BY RANGE (h) (PARTITION p0 VALUES LESS THAN (11), PARTITION p1 VALUES LESS THAN (21))",
+			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NULL PARTITION BY RANGE"},
+		},
+		{
+			// MySQL folds each bound when it stores it: 20, 30, 40, 300, 395.
+			name:   "AppendExpressionBounds",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg (id) VALUES (1), (5)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), " +
+				"PARTITION p1 VALUES LESS THAN (10+10), PARTITION p2 VALUES LESS THAN (+30), PARTITION p3 VALUES LESS THAN ((40)), " +
+				"PARTITION p4 VALUES LESS THAN (7 DIV 2 * 100), PARTITION p5 VALUES LESS THAN (MOD(1000, 600) - -(-5)))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (394)",
+		},
+		{
+			name:   "AppendExpressionListValues",
+			source: listSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 5), PARTITION p1 VALUES IN (15), PARTITION p2 VALUES IN (25), PARTITION p3 VALUES IN (30+5, 3*15))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (35), (45)",
+		},
+		{
+			name:   "AppendRangeColumnsExpressionBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE COLUMNS (id, d) (PARTITION p0 VALUES LESS THAN (10, '2020-01-01'))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2019-01-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) " +
+				"PARTITION BY RANGE COLUMNS (id, d) (PARTITION p0 VALUES LESS THAN (10, '2020-01-01'), PARTITION p1 VALUES LESS THAN (10+10, '2020-01-01'))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "AppendToDaysBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_DAYS(d)) (PARTITION p0 VALUES LESS THAN (TO_DAYS('2026-01-01')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2025-06-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_DAYS(d)) " +
+				"(PARTITION p0 VALUES LESS THAN (TO_DAYS('2026-01-01')), PARTITION p1 VALUES LESS THAN (TO_DAYS('2027-01-01 00:00:00')))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg VALUES (2, '2026-12-31')",
+		},
+		{
+			name:   "AppendToSecondsBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d datetime NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_SECONDS(d)) (PARTITION p0 VALUES LESS THAN (TO_SECONDS('1969-07-20 20:17:40')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '1969-07-20 20:17:39')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d datetime NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_SECONDS(d)) " +
+				"(PARTITION p0 VALUES LESS THAN (TO_SECONDS('1969-07-20 20:17:40')), PARTITION p1 VALUES LESS THAN (TO_SECONDS('2026-10-01 12:00:01')))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "AppendYearBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (YEAR(d)) (PARTITION p0 VALUES LESS THAN (YEAR('2026-06-01')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2025-06-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (YEAR(d)) " +
+				"(PARTITION p0 VALUES LESS THAN (YEAR('2026-06-01')), PARTITION p1 VALUES LESS THAN (YEAR('2027-06-01')))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name: "AppendParenthesizedTupleLiteral",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')), PARTITION p1 VALUES IN ((2, ('y'))))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg VALUES (2, 'y')",
+		},
+		{
+			name:   "AppendParenthesizedTupleNull",
+			source: "CREATE TABLE diff_part_chg (id int, b varchar(10)) PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x')",
+			target: "CREATE TABLE diff_part_chg (id int, b varchar(10)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')), PARTITION p1 VALUES IN ((2, (NULL))))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg VALUES (2, NULL)",
+		},
+		{
+			// MySQL stores RANGE (a + b) as RANGE ((`a` + `b`)); the two must
+			// compare equal, or this would be a full PARTITION BY.
+			name:   "AppendWithCompoundExpression",
+			source: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) PARTITION BY RANGE (a + b) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 2)",
+			target: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) " +
+				"PARTITION BY RANGE (a + b) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "AppendWithParenthesizedColumnExpression",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE ((id)) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg (id) VALUES (1)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE ((id)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name: "AppendWithCompoundSubpartitionExpression",
+			source: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) " +
+				"PARTITION BY RANGE (a) SUBPARTITION BY HASH (a + b * 2) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 2)",
+			target: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) " +
+				"PARTITION BY RANGE (a) SUBPARTITION BY HASH (a + b * 2) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			// MySQL stores MOD(id, 2) as (`id` % 2).
+			name:   "AppendWithModExpression",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (MOD(id, 3)) (PARTITION p0 VALUES IN (0))",
+			insert: "INSERT INTO diff_part_chg VALUES (3)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (MOD(id, 3)) (PARTITION p0 VALUES IN (0), PARTITION p1 VALUES IN (1, 2))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			// MySQL stores NULL first in a LIST (expr) value list.
+			name:   "AppendWithNullNotFirst",
+			source: "CREATE TABLE diff_part_chg (id int) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (2, NULL), PARTITION p1 VALUES IN (3))",
+			insert: "INSERT INTO diff_part_chg VALUES (NULL), (2), (3)",
+			target: "CREATE TABLE diff_part_chg (id int) PARTITION BY LIST (id) " +
+				"(PARTITION p0 VALUES IN (2, NULL), PARTITION p1 VALUES IN (3), PARTITION p2 VALUES IN (4))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:     "KeyAlgorithmToDefault",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY ALGORITHM=1 (id) PARTITIONS 2",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 2",
+			expected: []string{"PARTITION BY KEY (`id`) PARTITIONS 2"},
+		},
+		{
+			name:     "KeyAlgorithmFromDefault",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 2",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY LINEAR KEY ALGORITHM=1 (id) PARTITIONS 2",
+			expected: []string{"PARTITION BY LINEAR KEY ALGORITHM=1 (`id`) PARTITIONS 2"},
+		},
+		{
+			// ADD PARTITION PARTITIONS 1 would keep algorithm 1.
+			name:     "KeyAlgorithmAndCountChange",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY ALGORITHM=1 (id) PARTITIONS 2",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 3",
+			expected: []string{"PARTITION BY KEY (`id`) PARTITIONS 3"},
+		},
+		{
+			// ALGORITHM=2 is the default, which MySQL does not print.
+			name:   "KeyAlgorithmExplicitDefault",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 2",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY ALGORITHM=2 (id) PARTITIONS 2",
+		},
+		{
+			// ADD PARTITION would keep the subpartitions' algorithm 1.
+			name:   "AppendWithSubpartitionKeyAlgorithmChange",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY KEY ALGORITHM=1 (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (30))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY KEY (id) SUBPARTITIONS 2 " +
+				"(PARTITION p0 VALUES LESS THAN (30), PARTITION p1 VALUES LESS THAN (40))",
+			expected: []string{"PARTITION BY RANGE (`id`) SUBPARTITION BY KEY (`id`) SUBPARTITIONS 2"},
 		},
 		{
 			name:   "AppendListPartition",
@@ -916,6 +1086,9 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 			var after int
 			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_part_chg").Scan(&after))
 			require.Equal(t, before, after, "no row may be lost")
+			if tc.after != "" {
+				testutils.RunSQL(t, tc.after)
+			}
 		})
 	}
 }

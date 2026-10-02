@@ -276,8 +276,8 @@ func isPartitionCountOnlyChange(source, target *PartitionOptions) (bool, int) {
 		return false, 0
 	}
 
-	// Must have same linear flag
-	if source.Linear != target.Linear {
+	// Must have same linear flag and KEY algorithm
+	if source.Linear != target.Linear || source.KeyAlgorithm != target.KeyAlgorithm {
 		return false, 0
 	}
 
@@ -458,8 +458,8 @@ func partitionOptionsEqual(a, b *PartitionOptions) bool {
 		return false
 	}
 
-	// Compare linear flag
-	if a.Linear != b.Linear {
+	// Compare linear flag and KEY algorithm
+	if a.Linear != b.Linear || a.KeyAlgorithm != b.KeyAlgorithm {
 		return false
 	}
 
@@ -589,7 +589,7 @@ func subPartitionOptionsEqual(a, b *SubPartitionOptions) bool {
 		return false
 	}
 
-	if a.Linear != b.Linear {
+	if a.Linear != b.Linear || a.KeyAlgorithm != b.KeyAlgorithm {
 		return false
 	}
 
