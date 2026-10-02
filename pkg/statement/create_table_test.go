@@ -1955,3 +1955,48 @@ func TestSpatialIndexParsing(t *testing.T) {
 	require.Equal(t, "SPATIAL", spatial.Type)
 	require.Equal(t, []string{"location"}, spatial.Columns)
 }
+
+func TestPartitionKeyColumnsChanged(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   string
+		target   string
+		expected bool
+	}{
+		{
+			name:     "Unchanged",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b BIGINT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			expected: false,
+		},
+		{
+			name:     "ExpressionColumnChanged",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY RANGE (id + 1) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, b INT) PARTITION BY RANGE (id + 1) (PARTITION p0 VALUES LESS THAN (10))",
+			expected: true,
+		},
+		{
+			name:     "ColumnsListColumnChanged",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, d DATE NOT NULL) PARTITION BY RANGE COLUMNS (id) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, d DATE NOT NULL) PARTITION BY RANGE COLUMNS (id) (PARTITION p0 VALUES LESS THAN (10))",
+			expected: true,
+		},
+		{
+			// KEY () reads the primary key without naming it, so the
+			// columns can't be determined and the answer is conservative.
+			name:     "KeyWithoutColumns",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY KEY () PARTITIONS 2",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY KEY () PARTITIONS 2",
+			expected: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			source, err := ParseCreateTable(tc.source)
+			require.NoError(t, err)
+			target, err := ParseCreateTable(tc.target)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, source.partitionKeyColumnsChanged(target, NewDiffOptions()))
+		})
+	}
+}

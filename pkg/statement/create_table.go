@@ -292,7 +292,7 @@ type TableOptions struct {
 // PartitionOptions represents table partitioning configuration
 type PartitionOptions struct {
 	Type         string                `json:"type"`                    // RANGE, LIST, HASH, KEY
-	Expression   *string               `json:"expression,omitempty"`    // For HASH and RANGE
+	Expression   *string               `json:"expression,omitempty"`    // For HASH, RANGE and LIST
 	Columns      []string              `json:"columns,omitempty"`       // For KEY, RANGE COLUMNS, LIST COLUMNS
 	Linear       bool                  `json:"linear,omitempty"`        // For LINEAR HASH/KEY
 	KeyAlgorithm uint64                `json:"key_algorithm,omitempty"` // For KEY: ALGORITHM=1; 0 is MySQL's default (2)
@@ -2244,6 +2244,11 @@ func (ct *CreateTable) partitionKeyColumnsChanged(target *CreateTable, opts *Dif
 		if !ok {
 			return true
 		}
+	}
+	// KEY () reads the primary key, and an expression without a column is
+	// not valid partitioning: neither names its columns here.
+	if len(pending) == 0 {
+		return true
 	}
 	seen := make(map[string]bool)
 	for len(pending) > 0 {

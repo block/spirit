@@ -577,13 +577,12 @@ func partitionValuesEqual(a, b *PartitionValues) bool {
 		return false
 	}
 
-	// Today both sides come from the same parsePartitionClause path and
-	// are always Go strings, so reflect.DeepEqual and the old
-	// fmt.Sprintf("%v") string compare are equivalent. The change is
-	// forward-compatibility: if parsePartitionClause ever preserves the
-	// AST literal kind (so e.g. an int literal stays an int rather than
-	// being Restored to its string form), DeepEqual will distinguish
-	// "5" from 5 where %v would collapse them. No behaviour change today.
+	// A value's Go type carries its kind: a plain string is a number,
+	// partitionStringLiteral a quoted string, partitionNullValue NULL,
+	// partitionMaxValue MAXVALUE, partitionExprValue an unfolded
+	// expression and partitionValueTuple a LIST COLUMNS tuple.
+	// reflect.DeepEqual compares kind and value, so 1, '1' and NULL stay
+	// distinct, and tuples compare element by element.
 	for i := range a.Values {
 		if !reflect.DeepEqual(a.Values[i], b.Values[i]) {
 			return false
