@@ -172,6 +172,33 @@ func parseExpressionText(p *parser.Parser, text string) (ast.ExprNode, bool) {
 	return sel.Fields.Fields[0].Expr, true
 }
 
+// expressionColumnNames returns the names of the columns an expression text
+// reads, e.g. dt for YEAR(`dt`). It returns false when the text does not
+// parse.
+func expressionColumnNames(p *parser.Parser, text string) ([]string, bool) {
+	expr, ok := parseExpressionText(p, text)
+	if !ok {
+		return nil, false
+	}
+	var c columnNameCollector
+	expr.Accept(&c)
+	return c.names, true
+}
+
+// columnNameCollector is the ast.Visitor behind expressionColumnNames.
+type columnNameCollector struct {
+	names []string
+}
+
+func (c *columnNameCollector) Enter(n ast.Node) (ast.Node, bool) {
+	if col, ok := n.(*ast.ColumnNameExpr); ok {
+		c.names = append(c.names, col.Name.Name.O)
+	}
+	return n, false
+}
+
+func (c *columnNameCollector) Leave(n ast.Node) (ast.Node, bool) { return n, true }
+
 // restoreExpressionText restores an expression AST node to its SQL text,
 // stripping redundant outer parentheses. MySQL's SHOW CREATE TABLE wraps
 // generated-column and CHECK expressions in an extra set of parentheses

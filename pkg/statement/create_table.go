@@ -1468,10 +1468,13 @@ func (ct *CreateTable) Diff(target *CreateTable, opts *DiffOptions) ([]*Abstract
 		switch {
 		case pd.standalone != "" && len(alterClauses) == 0:
 			alterClauses = []string{pd.standalone}
-		case pd.standalone != "" && pd.standaloneInplace:
+		case pd.standalone != "" && pd.standaloneInplace && !ct.partitionKeyColumnsChanged(target, opts):
 			// The cheap clause is metadata-only, so running it as its own
 			// statement costs less than folding a repartition (a full table
-			// copy) into the primary ALTER.
+			// copy) into the primary ALTER. It runs after the primary ALTER,
+			// so that ALTER must not change a column the partitioning reads:
+			// a converted value (e.g. a DECIMAL rounded up) could then fall
+			// past the last existing partition before the new one is added.
 			additionalStatements = append(additionalStatements, []string{pd.standalone})
 		default:
 			partitionClause = pd.repartition
@@ -2181,6 +2184,42 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 		return false
 	}
 	return true
+}
+
+// partitionKeyColumnsChanged reports whether any column the target's
+// partitioning reads (its COLUMNS list, or the columns in its expression)
+// differs between ct and target. It returns true when the columns can't be
+// determined, so callers fall back to the conservative path.
+func (ct *CreateTable) partitionKeyColumnsChanged(target *CreateTable, opts *DiffOptions) bool {
+	if target.Partition == nil {
+		return false
+	}
+	names := target.Partition.Columns
+	if target.Partition.Expression != nil {
+		var ok bool
+		names, ok = expressionColumnNames(parser.New(), *target.Partition.Expression)
+		if !ok {
+			return true
+		}
+	}
+	for _, name := range names {
+		sourceCol, targetCol := findColumn(ct.Columns, name), findColumn(target.Columns, name)
+		if sourceCol == nil || targetCol == nil || !ct.columnsEqualWithContext(sourceCol, targetCol, target, opts) {
+			return true
+		}
+	}
+	return false
+}
+
+// findColumn returns the column named name (case-insensitively, as MySQL
+// compares column names), or nil.
+func findColumn(cols Columns, name string) *Column {
+	for i := range cols {
+		if strings.EqualFold(cols[i].Name, name) {
+			return &cols[i]
+		}
+	}
+	return nil
 }
 
 // partitionDiff is the partition change needed to move a table from its

@@ -822,6 +822,17 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 			expected: []string{"ADD COLUMN `c` int NULL", "ADD PARTITION"},
 		},
 		{
+			// MODIFY rounds 9.996 to 10.00, past p0. As a separate statement
+			// after the MODIFY, the ADD PARTITION would come too late (MySQL
+			// error 1526); folded into one PARTITION BY it applies.
+			name:   "AppendRangePartitionWithPartitionKeyChange",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d decimal(10,3) NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (FLOOR(d)) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 9.996)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d decimal(10,2) NOT NULL, PRIMARY KEY (id, d)) " +
+				"PARTITION BY RANGE (FLOOR(d)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NOT NULL PARTITION BY RANGE"},
+		},
+		{
 			name:   "AppendListPartition",
 			source: listSource,
 			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +

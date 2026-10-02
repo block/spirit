@@ -339,7 +339,7 @@ Partitioning is compared as a whole, and a difference is emitted as one clause:
 | Anything else (type, expression, subpartitioning, a shrunk range, a dropped LIST value) | a complete `PARTITION BY`, which replaces the existing partitioning |
 | Partitioning removed | `REMOVE PARTITIONING` |
 
-`ADD PARTITION`, `COALESCE PARTITION` and `REORGANIZE PARTITION` can't share an `ALTER TABLE` with other clauses. When columns, indexes or table options change too, an `ADD PARTITION (...)` append is emitted as a second statement (it is still metadata-only); the others become a `PARTITION BY` in the same statement. `PARTITION BY` and `REMOVE PARTITIONING` go last in that statement, separated by a space: MySQL rejects them after a comma.
+`ADD PARTITION`, `COALESCE PARTITION` and `REORGANIZE PARTITION` can't share an `ALTER TABLE` with other clauses. When columns, indexes or table options change too, an `ADD PARTITION (...)` append is emitted as a second statement (it is still metadata-only), unless a column the partitioning reads changes: the first statement could then convert a stored value past the last existing partition before the second adds the new one. That case, and the other standalone clauses, become a `PARTITION BY` in the same statement. `PARTITION BY` and `REMOVE PARTITIONING` go last in that statement, separated by a space: MySQL rejects them after a comma.
 
 `DROP PARTITION` is never emitted, because it deletes the partition's rows. A LIST `REORGANIZE` that leaves out a value deletes the rows holding it without an error, so it is only emitted when the value set is unchanged. Otherwise the change is a `PARTITION BY`, which fails with error 1526 if a row has no partition to go to.
 

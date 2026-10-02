@@ -2362,6 +2362,22 @@ func TestDiffPartitionChanges(t *testing.T) {
 			},
 		},
 		{
+			// The separate ADD PARTITION would run after the MODIFY, which can
+			// move a stored partition-key value past the last existing
+			// partition (9.996 rounds to 10.00). Folded into one PARTITION BY,
+			// MySQL places rows against the target partitions.
+			name:     "AppendRangePartitionWithPartitionKeyChange",
+			source:   "CREATE TABLE t1 (id INT NOT NULL, d DECIMAL(10,3) NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (FLOOR(d)) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL, d DECIMAL(10,2) NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (FLOOR(d)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ALTER TABLE `t1` MODIFY COLUMN `d` decimal(10,2) NOT NULL PARTITION BY RANGE (FLOOR(`d`)) (PARTITION `p0` VALUES LESS THAN (10), PARTITION `p1` VALUES LESS THAN (20))"},
+		},
+		{
+			name:     "AppendRangeColumnsPartitionWithPartitionKeyChange",
+			source:   "CREATE TABLE t1 (id INT NOT NULL, d DATETIME NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE COLUMNS (d) (PARTITION p0 VALUES LESS THAN ('2026-11-01'))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL, d DATE NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE COLUMNS (d) (PARTITION p0 VALUES LESS THAN ('2026-11-01'), PARTITION p1 VALUES LESS THAN ('2026-12-01'))",
+			expected: []string{"ALTER TABLE `t1` MODIFY COLUMN `d` date NOT NULL PARTITION BY RANGE COLUMNS (`d`) (PARTITION `p0` VALUES LESS THAN ('2026-11-01'), PARTITION `p1` VALUES LESS THAN ('2026-12-01'))"},
+		},
+		{
 			name:     "AppendListPartition",
 			source:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2))",
 			target:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3))",
