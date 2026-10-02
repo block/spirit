@@ -443,8 +443,7 @@ func TestRoundTrip_PartitionStringValuesWithQuotes(t *testing.T) {
 		},
 	}
 
-	// A partition-definition change is emitted as REMOVE PARTITIONING
-	// followed by a fresh PARTITION BY clause; apply each in order.
+	// Apply each emitted statement in order.
 	stmts, err := source.Diff(target, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, stmts)

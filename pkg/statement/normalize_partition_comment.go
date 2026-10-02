@@ -13,7 +13,7 @@ func init() { registerNormalizer(partitionCommentNormalizer{}) }
 // SHOW CREATE TABLE reports s0 with 'sc0', s1 with 'pc0', and p0 with no
 // comment at all (verified against MySQL 9.7). Without this rule the authored
 // form never converges with the live one: the partition comment differs
-// forever, so Diff re-emits REMOVE PARTITIONING + PARTITION BY on every run.
+// forever, so Diff re-emits a partition change on every run.
 //
 // The pushdown only happens when the subpartitions are spelled out. A partition
 // comment on a table that leaves its subpartitions implicit (SUBPARTITIONS n)

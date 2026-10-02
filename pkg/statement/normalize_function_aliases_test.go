@@ -335,8 +335,8 @@ func TestRoundTrip_FunctionAliases(t *testing.T) {
 		},
 		// A subpartitioned table has no live case here: diffPartitions does not
 		// compare subpartitioning at all, so such a table re-emits a
-		// REMOVE PARTITIONING + PARTITION BY pair (which also drops the
-		// SUBPARTITION clause) whatever the expressions say. The rule's effect
+		// repartition (which also drops the SUBPARTITION clause) whatever
+		// the expressions say. The rule's effect
 		// on SubPartition.Expression is covered by the unit test above.
 		{
 			name:     "string_to_vector",

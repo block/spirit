@@ -674,9 +674,9 @@ func TestDiffIntegrationSubpartitionNoSpuriousDiff(t *testing.T) {
 }
 
 // TestDiffIntegrationSubpartitionChange verifies that a genuine subpartitioning
-// change is emitted in full and actually applies: the REMOVE PARTITIONING +
-// PARTITION BY pair must carry the SUBPARTITION BY clause, or the table comes
-// back partitioned but no longer subpartitioned. The re-diff then converges.
+// change is emitted in full and actually applies: the PARTITION BY must carry
+// the SUBPARTITION BY clause, or the table comes back partitioned but no
+// longer subpartitioned. The re-diff then converges.
 func TestDiffIntegrationSubpartitionChange(t *testing.T) {
 	tt := testutils.NewTestTable(t, "diff_subpart_chg",
 		"CREATE TABLE diff_subpart_chg (dt date NOT NULL, PRIMARY KEY (dt)) "+
@@ -690,13 +690,12 @@ func TestDiffIntegrationSubpartitionChange(t *testing.T) {
 	require.NoError(t, err)
 
 	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
-	require.Len(t, stmts, 2, "a subpartitioning change needs REMOVE PARTITIONING first")
-	require.Equal(t, "ALTER TABLE `diff_subpart_chg` REMOVE PARTITIONING", stmts[0].Statement)
+	require.Len(t, stmts, 1, "a repartition needs no REMOVE PARTITIONING first")
 	require.Equal(t,
 		"ALTER TABLE `diff_subpart_chg` PARTITION BY RANGE (YEAR(`dt`)) "+
 			"SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 4 "+
 			"(PARTITION `p0` VALUES LESS THAN (2020), PARTITION `p1` VALUES LESS THAN MAXVALUE)",
-		stmts[1].Statement)
+		stmts[0].Statement)
 
 	// Execute exactly what Diff emitted, as the Runner would.
 	for _, stmt := range stmts {
@@ -736,7 +735,7 @@ func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, stmts, "named subpartitions and comments must not diff against themselves")
 
-	// Now move p0's boundary. The repartition has to carry every subpartition
+	// Now move p0's boundary. The REORGANIZE has to carry every subpartition
 	// name and comment through, or they are silently lost.
 	const movedSQL = "CREATE TABLE diff_subpart_named (dt date NOT NULL, PRIMARY KEY (dt)) " +
 		"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY KEY (dt) " +
@@ -746,7 +745,8 @@ func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
 	require.NoError(t, err)
 
 	stmts = diffLiveTable(t, tt.DB, tt.Name, movedSQL)
-	require.Len(t, stmts, 2)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "REORGANIZE PARTITION `p0`, `p1` INTO")
 	for _, stmt := range stmts {
 		_, err = tt.DB.ExecContext(t.Context(), stmt.Statement)
 		require.NoError(t, err)
@@ -763,6 +763,194 @@ func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
 	stmts, err = source.Diff(moved, nil)
 	require.NoError(t, err)
 	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationPartitionChanges applies each kind of partition change
+// Diff emits to a table holding rows, and checks that MySQL accepts it, that
+// the table converges on the target, and that no row is lost.
+func TestDiffIntegrationPartitionChanges(t *testing.T) {
+	const rangeSource = "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+		"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20), PARTITION pmax VALUES LESS THAN MAXVALUE)"
+	const listSource = "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+		"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 5), PARTITION p1 VALUES IN (15), PARTITION p2 VALUES IN (25))"
+	const hashSource = "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY HASH (id) PARTITIONS 4"
+	const dateSource = "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) " +
+		"PARTITION BY RANGE COLUMNS (d) (PARTITION p202610 VALUES LESS THAN ('2026-11-01'), PARTITION pmax VALUES LESS THAN (MAXVALUE))"
+	tests := []struct {
+		name   string
+		source string
+		insert string
+		target string
+		// prefix of each emitted statement, after "ALTER TABLE `diff_part_chg` "
+		expected []string
+	}{
+		{
+			name:     "ChangeTypeWithColumn",
+			source:   hashSource,
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 3",
+			expected: []string{"ADD COLUMN `c` int NULL PARTITION BY KEY"},
+		},
+		{
+			name:     "CoalesceWithColumn",
+			source:   hashSource,
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) PARTITION BY HASH (id) PARTITIONS 2",
+			expected: []string{"ADD COLUMN `c` int NULL PARTITION BY HASH"},
+		},
+		{
+			name:     "AddPartitioningWithColumn",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id))",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) PARTITION BY HASH (id) PARTITIONS 2",
+			expected: []string{"ADD COLUMN `c` int NULL PARTITION BY HASH"},
+		},
+		{
+			name:     "RemovePartitioningWithColumn",
+			source:   hashSource,
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id))",
+			expected: []string{"ADD COLUMN `c` int NULL REMOVE PARTITIONING"},
+		},
+		{
+			name:     "RangeToList",
+			source:   rangeSource,
+			target:   listSource,
+			expected: []string{"PARTITION BY LIST"},
+		},
+		{
+			name:   "AppendRangePartitionWithColumn",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30), PARTITION p2 VALUES LESS THAN (40))",
+			expected: []string{"ADD COLUMN `c` int NULL", "ADD PARTITION"},
+		},
+		{
+			name:   "AppendListPartition",
+			source: listSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 5), PARTITION p1 VALUES IN (15), PARTITION p2 VALUES IN (25), PARTITION p3 VALUES IN (35))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "SplitMaxvaluePartition",
+			source: dateSource,
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2026-10-05'), (2, '2026-11-05'), (3, '2027-01-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) " +
+				"PARTITION BY RANGE COLUMNS (d) (PARTITION p202610 VALUES LESS THAN ('2026-11-01'), PARTITION p202611 VALUES LESS THAN ('2026-12-01'), PARTITION pmax VALUES LESS THAN (MAXVALUE))",
+			expected: []string{"REORGANIZE PARTITION `pmax` INTO"},
+		},
+		{
+			name:   "MergeRangePartitions",
+			source: rangeSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			expected: []string{"REORGANIZE PARTITION `p1`, `pmax` INTO"},
+		},
+		{
+			name:   "MoveRangeBoundary",
+			source: rangeSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (12), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			expected: []string{"REORGANIZE PARTITION `p1`, `pmax` INTO"},
+		},
+		{
+			name:   "MoveListValue",
+			source: listSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (5, 15), PARTITION p2 VALUES IN (25))",
+			expected: []string{"REORGANIZE PARTITION `p0`, `p1` INTO"},
+		},
+		{
+			name: "MoveMultiColumnListTuple",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x'), (3, 'y')), PARTITION p1 VALUES IN ((5, 'z')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x'), (3, 'y'), (5, 'z')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')), PARTITION p1 VALUES IN ((3, 'y'), (5, 'z')))",
+			expected: []string{"REORGANIZE PARTITION `p0`, `p1` INTO"},
+		},
+		{
+			name:   "AddMultiColumnListPartitioning",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x'), (3, 'y')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x'), (3, 'y')), PARTITION p1 VALUES IN ((5, 'z')))",
+			expected: []string{"PARTITION BY LIST COLUMNS"},
+		},
+		{
+			name:   "SubpartitionedAppend",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 " +
+				"(PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30), PARTITION p2 VALUES LESS THAN (40))",
+			expected: []string{"ADD PARTITION"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "diff_part_chg", tc.source)
+			insert := tc.insert
+			if insert == "" {
+				insert = "INSERT INTO diff_part_chg (id) VALUES (1), (5), (15), (25)"
+			}
+			testutils.RunSQL(t, insert)
+			var before int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_part_chg").Scan(&before))
+
+			stmts := diffLiveTable(t, tt.DB, tt.Name, tc.target)
+			require.Len(t, stmts, len(tc.expected))
+			for i, stmt := range stmts {
+				require.True(t, strings.HasPrefix(stmt.Statement, "ALTER TABLE `diff_part_chg` "+tc.expected[i]),
+					"statement %d: %s", i, stmt.Statement)
+			}
+			execStatements(t, tt.DB, stmts)
+			requireConverged(t, tt.DB, tt.Name, tc.target)
+
+			var after int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_part_chg").Scan(&after))
+			require.Equal(t, before, after, "no row may be lost")
+		})
+	}
+}
+
+// TestDiffIntegrationMultiColumnListNoSelfDiff verifies that a multi-column
+// LIST COLUMNS table, read back from SHOW CREATE TABLE, does not diff against
+// the SQL it was created from.
+func TestDiffIntegrationMultiColumnListNoSelfDiff(t *testing.T) {
+	const authoredSQL = "CREATE TABLE diff_list_tuples (a int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (a, b)) " +
+		"PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((1, 'x'), (2, 'y')), PARTITION p1 VALUES IN ((3, 'z')))"
+	tt := testutils.NewTestTable(t, "diff_list_tuples", authoredSQL)
+
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "VALUES IN ((1,'x'),(2,'y'))", "precondition: MySQL prints the tuples")
+	source, err := ParseCreateTable(live)
+	require.NoError(t, err)
+	target, err := ParseCreateTable(authoredSQL)
+	require.NoError(t, err)
+	stmts, err := source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts)
+
+	requireNoSelfDiff(t, tt.DB, tt.Name)
+}
+
+// TestDiffIntegrationPartitionChangeKeepsRows verifies that a partition
+// change that would leave rows without a partition fails, rather than
+// deleting them. A LIST REORGANIZE PARTITION would delete them silently, so
+// Diff must emit a PARTITION BY.
+func TestDiffIntegrationPartitionChangeKeepsRows(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_part_keep",
+		"CREATE TABLE diff_part_keep (id int NOT NULL, PRIMARY KEY (id)) "+
+			"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3))")
+	testutils.RunSQL(t, "INSERT INTO diff_part_keep VALUES (1), (2), (3)")
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name,
+		"CREATE TABLE diff_part_keep (id int NOT NULL, PRIMARY KEY (id)) "+
+			"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (3))")
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "PARTITION BY LIST")
+	_, err := tt.DB.ExecContext(t.Context(), stmts[0].Statement)
+	require.ErrorContains(t, err, "1526")
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_part_keep").Scan(&count))
+	require.Equal(t, 3, count)
 }
 
 // TestDiffIntegrationTableCollationChangeConverges verifies that changing a

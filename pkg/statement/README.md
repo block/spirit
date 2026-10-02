@@ -329,7 +329,21 @@ type PartitionOptions struct {
 }
 ```
 
-Partitioning is compared as a whole: MySQL cannot alter a partition method in place, so any difference other than a HASH/KEY partition-count change is emitted as `REMOVE PARTITIONING` followed by a complete `PARTITION BY` — including its `SUBPARTITION BY` clause, partition comments, and any explicitly named subpartitions. The per-partition `ENGINE` clause is the one thing deliberately **not** compared: MySQL requires every partition to use the table's engine, so it carries no information, yet `SHOW CREATE TABLE` always prints it while authored SQL does not.
+Partitioning is compared as a whole, and a difference is emitted as one clause:
+
+| Change | Clause |
+|---|---|
+| HASH/KEY partition count only | `ADD PARTITION PARTITIONS n` / `COALESCE PARTITION n` |
+| RANGE/LIST partitions appended after the existing ones | `ADD PARTITION (...)` (in-place, metadata-only) |
+| A contiguous run of RANGE/LIST partitions split, merged, renamed or re-bounded, when the run keeps its outer RANGE bound or its set of LIST values | `REORGANIZE PARTITION ... INTO (...)` |
+| Anything else (type, expression, subpartitioning, a shrunk range, a dropped LIST value) | a complete `PARTITION BY`, which replaces the existing partitioning |
+| Partitioning removed | `REMOVE PARTITIONING` |
+
+`ADD PARTITION`, `COALESCE PARTITION` and `REORGANIZE PARTITION` can't share an `ALTER TABLE` with other clauses. When columns, indexes or table options change too, an `ADD PARTITION (...)` append is emitted as a second statement (it is still metadata-only); the others become a `PARTITION BY` in the same statement. `PARTITION BY` and `REMOVE PARTITIONING` go last in that statement, separated by a space: MySQL rejects them after a comma.
+
+`DROP PARTITION` is never emitted, because it deletes the partition's rows. A LIST `REORGANIZE` that leaves out a value deletes the rows holding it without an error, so it is only emitted when the value set is unchanged. Otherwise the change is a `PARTITION BY`, which fails with error 1526 if a row has no partition to go to.
+
+A `PARTITION BY` carries the `SUBPARTITION BY` clause, partition comments, and any explicitly named subpartitions. The per-partition `ENGINE` clause is the one thing deliberately **not** compared: MySQL requires every partition to use the table's engine, so it carries no information, yet `SHOW CREATE TABLE` always prints it while authored SQL does not.
 
 ## Normalization
 

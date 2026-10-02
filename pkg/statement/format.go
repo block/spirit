@@ -363,7 +363,9 @@ func formatPartitionOptions(partOpts *PartitionOptions) string {
 			parts = append(parts, fmt.Sprintf("(%s)", sqlescape.EscapeIdentifierList(partOpts.Columns)))
 		}
 	case "LIST":
-		if len(partOpts.Columns) > 0 {
+		if partOpts.Expression != nil {
+			parts = append(parts, fmt.Sprintf("(%s)", *partOpts.Expression))
+		} else if len(partOpts.Columns) > 0 {
 			// LIST COLUMNS
 			parts[len(parts)-1] = "LIST COLUMNS"
 			parts = append(parts, fmt.Sprintf("(%s)", sqlescape.EscapeIdentifierList(partOpts.Columns)))
@@ -377,10 +379,9 @@ func formatPartitionOptions(partOpts *PartitionOptions) string {
 
 	// Add the subpartitioning clause. MySQL's grammar places SUBPARTITION BY
 	// (and its SUBPARTITIONS count) after the partition method and before the
-	// partition definition list. Emitting it is not optional: the only way Diff
-	// changes a partitioned table's layout is REMOVE PARTITIONING followed by a
-	// fresh PARTITION BY, so a missing clause silently drops the table's
-	// subpartitioning.
+	// partition definition list. Emitting it is not optional: Diff changes a
+	// partitioned table's layout with a fresh PARTITION BY, so a missing clause
+	// silently drops the table's subpartitioning.
 	if partOpts.SubPartition != nil {
 		parts = append(parts, formatSubPartitionOptions(partOpts.SubPartition))
 	}

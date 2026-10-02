@@ -33,6 +33,9 @@ var numericPartitionValueRe = regexp.MustCompile(`^-?(0|[1-9]\d*)(\.\d+)?$`)
 // what stops a numeric-looking LIST COLUMNS value like '2020' on a VARCHAR
 // column from being emitted bare and rejected by MySQL (error 1654).
 //
+// A partitionValueTuple (one multi-column LIST COLUMNS value) renders as a
+// parenthesized list of its elements, e.g. (1, 'a').
+//
 // For plain Go strings (numeric literals and expressions the parser
 // Restored to text, e.g. YEAR(col)) we fall back to the
 // numericPartitionValueRe heuristic: values that match render unquoted;
@@ -42,6 +45,13 @@ var numericPartitionValueRe = regexp.MustCompile(`^-?(0|[1-9]\d*)(\.\d+)?$`)
 func formatPartitionValue(v any) string {
 	if _, ok := v.(partitionMaxValue); ok {
 		return "MAXVALUE"
+	}
+	if tuple, ok := v.(partitionValueTuple); ok {
+		elems := make([]string, len(tuple))
+		for i, e := range tuple {
+			elems[i] = formatPartitionValue(e)
+		}
+		return "(" + strings.Join(elems, ", ") + ")"
 	}
 	if sl, ok := v.(partitionStringLiteral); ok {
 		return "'" + sqlescape.EscapeString(string(sl)) + "'"
