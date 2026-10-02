@@ -243,3 +243,32 @@ func TestEstimateRenderedValueSizePositive(t *testing.T) {
 		assert.Positive(t, estimateRenderedValueSize(v), "value %v estimated non-positively", v)
 	}
 }
+
+func TestParseSizeNumber(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    uint64
+		wantErr bool
+	}{
+		{in: "0", want: 0},
+		{in: "4194304", want: 4194304},
+		{in: "4M", want: 4 << 20},
+		{in: "4m", want: 4 << 20},
+		{in: "1K", want: 1 << 10},
+		{in: "2G", want: 2 << 30},
+		{in: "", wantErr: true},
+		{in: "4T", wantErr: true},
+		{in: "M", wantErr: true},
+		{in: "-1", wantErr: true},
+		{in: "4 M", wantErr: true},
+		{in: "18446744073709551615K", wantErr: true},
+	} {
+		got, err := ParseSizeNumber(tc.in)
+		if tc.wantErr {
+			require.Error(t, err, tc.in)
+			continue
+		}
+		require.NoError(t, err, tc.in)
+		assert.Equal(t, tc.want, got, tc.in)
+	}
+}

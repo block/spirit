@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,28 +19,33 @@ import (
 // (columnsEqualWithContext + the shared columnExtendedAttributesEqual helper)
 // compares.
 var columnFieldsCompared = map[string]struct{}{
-	"Name":            {},
-	"Type":            {},
-	"Length":          {},
-	"Precision":       {},
-	"Scale":           {},
-	"Unsigned":        {},
-	"Zerofill":        {},
-	"EnumValues":      {},
-	"SetValues":       {},
-	"Nullable":        {},
-	"Default":         {},
-	"DefaultIsExpr":   {},
-	"DefaultKind":     {},
-	"OnUpdate":        {},
-	"GeneratedExpr":   {},
-	"GeneratedStored": {},
-	"SRID":            {},
-	"AutoInc":         {},
-	"PrimaryKey":      {},
-	"Comment":         {},
-	"Charset":         {},
-	"Collation":       {},
+	"Name":                     {},
+	"Type":                     {},
+	"Length":                   {},
+	"Precision":                {},
+	"Scale":                    {},
+	"Unsigned":                 {},
+	"Zerofill":                 {},
+	"EnumValues":               {},
+	"SetValues":                {},
+	"Nullable":                 {},
+	"Default":                  {},
+	"DefaultIsExpr":            {},
+	"DefaultKind":              {},
+	"OnUpdate":                 {},
+	"GeneratedExpr":            {},
+	"GeneratedStored":          {},
+	"SRID":                     {},
+	"Invisible":                {},
+	"NotSecondary":             {},
+	"ColumnFormat":             {},
+	"Storage":                  {},
+	"SecondaryEngineAttribute": {},
+	"AutoInc":                  {},
+	"PrimaryKey":               {},
+	"Comment":                  {},
+	"Charset":                  {},
+	"Collation":                {},
 }
 
 // columnFieldsNotCompared lists exported Column fields that are deliberately
@@ -52,7 +58,7 @@ var columnFieldsNotCompared = map[string]string{
 	// the parser (columnCheckNormalizer) and diffed by diffConstraints instead —
 	// see the comment on columnExtendedAttributesEqual. So it is intentionally not
 	// part of per-column equality.
-	"Check": "hoisted to table-level Constraints; diffed by diffConstraints, not here",
+	"Checks": "hoisted to table-level Constraints; diffed by diffConstraints, not here",
 	// Options is a catch-all map for column options the parser did not model
 	// explicitly. It is currently NOT compared by either columnsEqual function.
 	// If you start populating Options with semantically meaningful data, it must
@@ -63,6 +69,12 @@ var columnFieldsNotCompared = map[string]string{
 	// materialized into a table-level index by indexNormalizer and diffed by
 	// diffIndexes instead of being part of per-column equality.
 	"Unique": "materialized into a table-level index by indexNormalizer; diffed by diffIndexes, not here",
+	// DefaultAsWritten is the literal as the schema spelled it, kept so that
+	// emission writes it back unchanged. Default holds the value MySQL stores
+	// for it (the normalization rules rewrite it to that reading), which is
+	// what equality compares: two spellings of one stored value are the same
+	// column, and must not MODIFY on every run.
+	"DefaultAsWritten": "the written literal, kept for emission; Default is the normalized reading that is compared",
 }
 
 // TestColumnsEqualAllFieldsAccounted is the primary tripwire: it enumerates the
@@ -75,7 +87,7 @@ var columnFieldsNotCompared = map[string]string{
 // update columnsEqualWithContext in create_table.go (plus columnExtendedAttributesEqual
 // for extended attributes) to compare the new field, then add it to
 // columnFieldsCompared. If the new field is intentionally NOT part of column
-// equality (like Raw / Check / Options), add it to columnFieldsNotCompared with
+// equality (like Raw / Checks / Options), add it to columnFieldsNotCompared with
 // a justifying comment instead.
 func TestColumnsEqualAllFieldsAccounted(t *testing.T) {
 	typ := reflect.TypeFor[Column]()
@@ -122,29 +134,34 @@ func TestColumnsEqualAllFieldsAccounted(t *testing.T) {
 // so that DefaultKind participates in the comparison.
 func baseColumn() Column {
 	return Column{
-		Name:            "c",
-		Type:            "varchar",
-		Length:          new(255),
-		Precision:       new(10),
-		Scale:           new(2),
-		Unsigned:        new(true),
-		Zerofill:        new(true),
-		EnumValues:      []string{"a", "b"},
-		SetValues:       []string{"x", "y"},
-		Nullable:        false,
-		Default:         new("foo"),
-		DefaultIsExpr:   true,
-		DefaultKind:     DefaultKindString,
-		OnUpdate:        new("current_timestamp"),
-		GeneratedExpr:   new("(1 + 1)"),
-		GeneratedStored: true,
-		SRID:            new(uint32(4326)),
-		AutoInc:         true,
-		PrimaryKey:      true,
-		Unique:          true,
-		Comment:         new("hi"),
-		Charset:         new("utf8mb4"),
-		Collation:       new("utf8mb4_bin"),
+		Name:                     "c",
+		Type:                     "varchar",
+		Length:                   new(255),
+		Precision:                new(10),
+		Scale:                    new(2),
+		Unsigned:                 new(true),
+		Zerofill:                 new(true),
+		EnumValues:               []string{"a", "b"},
+		SetValues:                []string{"x", "y"},
+		Nullable:                 false,
+		Default:                  new("foo"),
+		DefaultIsExpr:            true,
+		DefaultKind:              DefaultKindString,
+		OnUpdate:                 new("current_timestamp"),
+		GeneratedExpr:            new("(1 + 1)"),
+		GeneratedStored:          true,
+		SRID:                     new(uint32(4326)),
+		Invisible:                true,
+		NotSecondary:             true,
+		ColumnFormat:             new("FIXED"),
+		Storage:                  new("DISK"),
+		SecondaryEngineAttribute: new(`{"a": 1}`),
+		AutoInc:                  true,
+		PrimaryKey:               true,
+		Unique:                   true,
+		Comment:                  new("hi"),
+		Charset:                  new("utf8mb4"),
+		Collation:                new("utf8mb4_bin"),
 	}
 }
 
@@ -176,6 +193,11 @@ func everyComparedFieldMutation() []struct {
 		{"GeneratedExpr", func(c *Column) { c.GeneratedExpr = new("(2 + 2)") }},
 		{"GeneratedStored", func(c *Column) { c.GeneratedStored = false }},
 		{"SRID", func(c *Column) { c.SRID = new(uint32(3857)) }},
+		{"Invisible", func(c *Column) { c.Invisible = false }},
+		{"NotSecondary", func(c *Column) { c.NotSecondary = false }},
+		{"ColumnFormat", func(c *Column) { c.ColumnFormat = new("DYNAMIC") }},
+		{"Storage", func(c *Column) { c.Storage = new("MEMORY") }},
+		{"SecondaryEngineAttribute", func(c *Column) { c.SecondaryEngineAttribute = new(`{"a": 2}`) }},
 		{"AutoInc", func(c *Column) { c.AutoInc = false }},
 		{"PrimaryKey", func(c *Column) { c.PrimaryKey = false }},
 		{"Comment", func(c *Column) { c.Comment = new("bye") }},
@@ -220,4 +242,35 @@ func TestColumnsEqualWithContextDetectsEveryField(t *testing.T) {
 					"if you added field %s, make sure columnsEqualWithContext compares it", m.name, m.name)
 		})
 	}
+}
+
+// TestDefaultAsWrittenIsEmittedAndNotCompared pins the split between the two
+// default fields: the rules rewrite Default to MySQL's reading, which is what
+// equality sees, while emission writes DefaultAsWritten back unchanged.
+func TestDefaultAsWrittenIsEmittedAndNotCompared(t *testing.T) {
+	ct, err := ParseCreateTable("CREATE TABLE t (f FLOAT DEFAULT 0.1, d DATETIME DEFAULT '2020-1-1', e DECIMAL(6,2) DEFAULT (1 + 1))")
+	require.NoError(t, err)
+	f, d, e := ct.Columns[0], ct.Columns[1], ct.Columns[2]
+
+	assert.Equal(t, "0.10000000149011612", *f.Default, "the compared reading is the exact stored value")
+	require.NotNil(t, f.DefaultAsWritten)
+	assert.Equal(t, DefaultLiteral{Text: "0.1", Kind: DefaultKindNumber}, *f.DefaultAsWritten)
+	assert.Contains(t, formatColumnDefinition(&f), "DEFAULT 0.1")
+
+	assert.Equal(t, "2020-01-01 00:00:00", *d.Default)
+	assert.Equal(t, DefaultLiteral{Text: "2020-1-1", Kind: DefaultKindString}, *d.DefaultAsWritten)
+	assert.Contains(t, formatColumnDefinition(&d), "DEFAULT '2020-1-1'")
+
+	assert.Nil(t, e.DefaultAsWritten, "an expression default is emitted from Default")
+	assert.Contains(t, formatColumnDefinition(&e), "DEFAULT (1+1)")
+
+	// Two spellings of one stored value are the same column.
+	other, err := ParseCreateTable("CREATE TABLE t (f FLOAT DEFAULT '0.1', d DATETIME DEFAULT '2020-01-01 00:00:00', e DECIMAL(6,2) DEFAULT (1 + 1))")
+	require.NoError(t, err)
+	stmts, err := other.Diff(ct, nil)
+	require.NoError(t, err)
+	assert.Empty(t, stmts)
+	// And without DefaultAsWritten the column is emitted from Default.
+	f.DefaultAsWritten = nil
+	assert.Contains(t, formatColumnDefinition(&f), "DEFAULT 0.10000000149011612")
 }

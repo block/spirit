@@ -68,10 +68,28 @@ type DiffOptions struct {
 	// Default: false (via NewDiffOptions).
 	IgnorePartitioning bool
 
-	// IgnoreRowFormat skips diffing the ROW_FORMAT table option.
+	// IgnoreRowFormat skips diffing the ROW_FORMAT table option, and with it
+	// the table-level KEY_BLOCK_SIZE (the compressed page size, which implies
+	// ROW_FORMAT=COMPRESSED and is only valid with it).
 	// Default: true (via NewDiffOptions).
 	// ROW_FORMAT=DYNAMIC is the InnoDB default in MySQL 8.0+, so differences
 	// between an unspecified ROW_FORMAT and an explicit DYNAMIC are cosmetic.
+	//
+	// When false, a target that names no row format (or names
+	// ROW_FORMAT=DEFAULT, which MySQL stores as none) clears a row format the
+	// source has with ROW_FORMAT=DEFAULT, so the table returns to the engine
+	// default. That is a table rebuild, as every row format change is, and
+	// it fires once: the rebuilt table reports no row format either.
+	//
+	// A KEY_BLOCK_SIZE change on a table that stays compressed emits only
+	// the new size, and does not converge: MySQL keeps the old size on every
+	// existing index and reports it there. Compressed tables are out of
+	// scope (Spirit targets Aurora, which does not support them), so the
+	// diff does not re-create the indexes for it; re-creating the primary
+	// key would need a DROP PRIMARY KEY, which Spirit refuses.
+	// If the follow-up diff finds a primary key whose stored size differs
+	// from the target, it returns an unsupported-primary-key-options error
+	// and no statements, rather than planning a DROP and ADD MySQL ignores.
 	IgnoreRowFormat bool
 }
 

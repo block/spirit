@@ -3,6 +3,7 @@ package statement
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,6 +37,9 @@ func TestCanonicalExprParensIsFixedPoint(t *testing.T) {
 		"((a + b) * (c - 1)) / 2 > a",
 		"a & 3 | b = 0",
 		"a & (3 | b) = 0",
+		"a & (b & c) = 0",
+		"a | (b | c) = 0",
+		"a ^ (b ^ c) = 0",
 		"(a << 1) + b > 0",
 		"a BETWEEN 1 AND 10 AND b > 0",
 		"a = (b BETWEEN 1 AND 10)",
@@ -110,6 +114,12 @@ func TestCanonicalExprParensKeepsDistinctExpressionsDistinct(t *testing.T) {
 		{"a - (b - c) > 0", "(a - b) - c > 0"},
 		{"a / (b / c) > 0", "a / b / c > 0"},
 		{"a & (3 | b) = 0", "a & 3 | b = 0"},
+		// Bitwise operators evaluate on binary strings or on integers by
+		// operand, so their grouping is the value: _binary'12' & (_binary'21'
+		// & 7) is 4 and (_binary'12' & _binary'21') & 7 is 0.
+		{"a & (b & c) = 0", "(a & b) & c = 0"},
+		{"a | (b | c) = 0", "(a | b) | c = 0"},
+		{"a ^ (b ^ c) = 0", "(a ^ b) ^ c = 0"},
 		{"a = (b BETWEEN 1 AND 10)", "(a = b) BETWEEN 1 AND 10"},
 		{"-(a + b) < c", "-a + b < c"},
 		{"a = (b IN (1,2))", "(a = b) IN (1,2)"},
@@ -120,6 +130,160 @@ func TestCanonicalExprParensKeepsDistinctExpressionsDistinct(t *testing.T) {
 	for _, pair := range pairs {
 		t.Run(pair[0]+" vs "+pair[1], func(t *testing.T) {
 			require.NotEqual(t, canonicalCheck(t, pair[0]), canonicalCheck(t, pair[1]))
+		})
+	}
+}
+
+// MySQL discards a unary plus when it parses an expression, so a declared +x
+// and the live x have to canonicalize to the same text everywhere an
+// expression is stored. Each live side is the SHOW CREATE TABLE reading MySQL
+// 8.0.43 gives for the declared side.
+func TestCanonicalExprParensDropsUnaryPlus(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"a > +1", "(`a` > 1)"},
+		{"+a > 1", "(`a` > 1)"},
+		{"a + +1 > 1", "((`a` + 1) > 1)"},
+		{"a > +(+1)", "(`a` > 1)"},
+		{"a > +(b + 1)", "(`a` > (`b` + 1))"},
+		{"a > -+1", "(`a` > -(1))"},
+		{"a > +-1", "(`a` > -(1))"},
+	} {
+		t.Run(pair[0], func(t *testing.T) {
+			assert.Equal(t, canonicalCheck(t, pair[1]), canonicalCheck(t, pair[0]))
+		})
+	}
+	ct, err := ParseCreateTable("CREATE TABLE t (id INT PRIMARY KEY, a INT, " +
+		"g1 INT GENERATED ALWAYS AS (+a), g2 INT GENERATED ALWAYS AS (a + +1), g3 INT GENERATED ALWAYS AS (+(a + 1)), " +
+		"KEY k ((+a + 1)))")
+	require.NoError(t, err)
+	assert.Equal(t, "`a`", *ct.Columns[2].GeneratedExpr)
+	assert.Equal(t, "`a`+1", *ct.Columns[3].GeneratedExpr)
+	assert.Equal(t, "`a`+1", *ct.Columns[4].GeneratedExpr)
+	require.NotNil(t, ct.Indexes[0].ColumnList[0].Expression)
+	assert.Equal(t, "`a`+1", *ct.Indexes[0].ColumnList[0].Expression)
+	// A unary minus is an operator MySQL keeps; dropping its parentheses
+	// must not drop the sign.
+	require.NotEqual(t, canonicalCheck(t, "a > -1"), canonicalCheck(t, "a > 1"))
+	require.NotEqual(t, canonicalCheck(t, "-a > 1"), canonicalCheck(t, "a > 1"))
+}
+
+// An expression default is stored by MySQL with its own parenthesization and
+// without unary pluses, like every other stored expression. Each declared
+// column and the SHOW CREATE TABLE reading MySQL 8.0.43 gives for it diff
+// clean, in both directions and under every normalizer order.
+func TestCanonicalExprParensExpressionDefaultsConverge(t *testing.T) {
+	requireDefaultsConverge(t, []defaultPair{
+		{"a negated literal", "(a int DEFAULT (-1))", "(a int DEFAULT (-(1)))"},
+		{"a unary plus", "(a int DEFAULT (+1))", "(a int DEFAULT (1))"},
+		{"a negated argument", "(a int DEFAULT (abs(-1)))", "(a int DEFAULT (abs(-(1))))"},
+		{"a unary plus argument", "(a int DEFAULT (abs(+1)))", "(a int DEFAULT (abs(1)))"},
+		{"a negated sum", "(a int DEFAULT (-(1 + 2)))", "(a int DEFAULT (-((1 + 2))))"},
+		{"a double negation", "(a int DEFAULT (- -1))", "(a int DEFAULT (-(-(1))))"},
+		{"a negative operand", "(a int DEFAULT (1 - -1))", "(a int DEFAULT ((1 - -(1))))"},
+		{"a positive operand", "(a int DEFAULT (1 + +1))", "(a int DEFAULT ((1 + 1)))"},
+		{"a product of negatives", "(a int DEFAULT (-1 * -1))", "(a int DEFAULT ((-(1) * -(1))))"},
+		{"a negated string", "(a int DEFAULT (-'1'))", "(a int DEFAULT (-(_utf8mb4'1')))"},
+		{"a unary plus on a string", "(a int DEFAULT (+'1'))", "(a int DEFAULT (_utf8mb4'1'))"},
+		{"a unary plus on a string column", "(a varchar(10) DEFAULT (+'1'))", "(a varchar(10) DEFAULT (_utf8mb4'1'))"},
+		{"a negated hex literal", "(a int DEFAULT (-0x1A))", "(a int DEFAULT (-(0x1a)))"},
+		{"a negated keyword", "(a int DEFAULT (-TRUE))", "(a int DEFAULT (-(true)))"},
+		{"a negated float", "(a int DEFAULT (-1e2))", "(a int DEFAULT (-(1e2)))"},
+		{"a unary plus on a float", "(a int DEFAULT (+1e2))", "(a int DEFAULT (1e2))"},
+		{"a negated decimal", "(a double DEFAULT (-1.0))", "(a double DEFAULT (-(1.0)))"},
+		{"a negated leading-dot decimal", "(a int DEFAULT (-.5))", "(a int DEFAULT (-(0.5)))"},
+		{"a negated zero", "(a int DEFAULT (-0))", "(a int DEFAULT (-(0)))"},
+		{"a negated NULL", "(a int DEFAULT (-NULL))", "(a int DEFAULT (-(NULL)))"},
+		{"a bitwise negation", "(a int DEFAULT (~1))", "(a int DEFAULT (~(1)))"},
+		{"a negated call", "(a double DEFAULT (-pi()))", "(a double DEFAULT (-(pi())))"},
+		{"a negated factor", "(a int DEFAULT (2 * -1))", "(a int DEFAULT ((2 * -(1))))"},
+		{"a negated column type", "(a varchar(10) DEFAULT (-1))", "(a varchar(10) DEFAULT (-(1)))"},
+		{"NOT NULL", "(a int NOT NULL DEFAULT (-1))", "(a int NOT NULL DEFAULT (-(1)))"},
+	})
+}
+
+// Canonicalizing an expression default can leave a bare literal; the kind
+// Spirit records for it then has to be the literal's, so it emits and
+// compares like one.
+func TestCanonicalExprParensExpressionDefaultKinds(t *testing.T) {
+	ct, err := ParseCreateTable("CREATE TABLE t (id INT PRIMARY KEY, " +
+		"a INT DEFAULT (+1), b VARCHAR(10) DEFAULT (+'it''s'), c INT DEFAULT (-(1)), d INT DEFAULT (-(-(1))), " +
+		"e INT DEFAULT (+0x1A), f INT DEFAULT (+TRUE), g INT DEFAULT (-(abs(1))), h INT DEFAULT ((1)), i JSON DEFAULT ('{}'))")
+	require.NoError(t, err)
+	want := []struct {
+		text string
+		kind DefaultKind
+	}{
+		{"1", DefaultKindNumber},
+		{"it's", DefaultKindString},
+		{"-1", DefaultKindNumber},
+		{"-(-1)", DefaultKindUnknown},
+		{"x'1a'", DefaultKindHexLiteral},
+		{"TRUE", DefaultKindKeywordBool},
+		{"-ABS(1)", DefaultKindUnknown},
+		{"1", DefaultKindNumber},
+		{"{}", DefaultKindString},
+	}
+	for i, w := range want {
+		col := ct.Columns[i+1]
+		require.NotNil(t, col.Default, col.Name)
+		assert.Equal(t, w.text, *col.Default, col.Name)
+		assert.Equal(t, w.kind, col.DefaultKind, col.Name)
+		assert.True(t, col.DefaultIsExpr, col.Name)
+	}
+	assert.Equal(t, "`a` int NULL DEFAULT (1)", formatColumnDefinition(&ct.Columns[1]))
+	assert.Equal(t, "`b` varchar(10) NULL DEFAULT ('it\\'s')", formatColumnDefinition(&ct.Columns[2]))
+	assert.Equal(t, "`c` int NULL DEFAULT (-1)", formatColumnDefinition(&ct.Columns[3]))
+	assert.Equal(t, "`i` json NULL DEFAULT ('{}')", formatColumnDefinition(&ct.Columns[9]))
+}
+
+func TestCanonicalExprParensExpressionDefaultsStillDiffRealChanges(t *testing.T) {
+	requireDefaultStillDiffs(t,
+		"a int DEFAULT (-2)",
+		"a int DEFAULT (-(1))",
+		"MODIFY COLUMN `a` int NULL DEFAULT (-2)")
+	requireDefaultStillDiffs(t,
+		"a int DEFAULT (-1)",
+		"a int DEFAULT (1)",
+		"MODIFY COLUMN `a` int NULL DEFAULT (-1)")
+	requireDefaultStillDiffs(t,
+		"a int DEFAULT (-(1 + 2))",
+		"a int DEFAULT ((-(1) + 2))",
+		"MODIFY COLUMN `a` int NULL DEFAULT (-(1+2))")
+}
+
+// TestCanonicalExprDefaultUnquotesOnlyStringLiterals pins that a default is
+// stored without its quotes only when the whole default is one string literal.
+// The stripping used to key off the rendered text, so once the canonical form
+// had dropped the parentheses of DEFAULT (('a') = ('a')) the comparison
+// rendered as 'a'='a', which starts and ends with a quote, and the default
+// became the unparsable a'='a.
+func TestCanonicalExprDefaultUnquotesOnlyStringLiterals(t *testing.T) {
+	cases := []struct {
+		column string
+		want   string
+		kind   DefaultKind
+	}{
+		{"a INT DEFAULT (('a') = ('a'))", "`a` int NULL DEFAULT ('a'='a')", DefaultKindUnknown},
+		{"a INT DEFAULT ('a' = 'b')", "`a` int NULL DEFAULT ('a'='b')", DefaultKindUnknown},
+		{"a INT DEFAULT ('a' LIKE 'a%')", "`a` int NULL DEFAULT ('a' LIKE 'a%')", DefaultKindUnknown},
+		{"a INT DEFAULT ('a' IN ('a','b'))", "`a` int NULL DEFAULT ('a' IN ('a','b'))", DefaultKindUnknown},
+		{"a VARCHAR(5) DEFAULT (('a'))", "`a` varchar(5) NULL DEFAULT ('a')", DefaultKindString},
+		{"a VARCHAR(5) DEFAULT ('a')", "`a` varchar(5) NULL DEFAULT ('a')", DefaultKindString},
+		{"a VARCHAR(5) DEFAULT ('it''s')", "`a` varchar(5) NULL DEFAULT ('it\\'s')", DefaultKindString},
+		{"a VARCHAR(5) DEFAULT 'a'", "`a` varchar(5) NULL DEFAULT 'a'", DefaultKindString},
+	}
+	for _, c := range cases {
+		t.Run(c.column, func(t *testing.T) {
+			ct, err := ParseCreateTable("CREATE TABLE t (" + c.column + ")")
+			require.NoError(t, err)
+			require.Len(t, ct.Columns, 1)
+			assert.Equal(t, c.kind, ct.Columns[0].DefaultKind)
+			definition := formatColumnDefinition(&ct.Columns[0])
+			assert.Equal(t, c.want, definition)
+			// What is emitted parses, and parses back to the same definition.
+			again, err := ParseCreateTable("CREATE TABLE t (" + definition + ")")
+			require.NoError(t, err, definition)
+			assert.Equal(t, definition, formatColumnDefinition(&again.Columns[0]))
 		})
 	}
 }

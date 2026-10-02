@@ -24,6 +24,9 @@ func TestDiffColumnAttributeOptions(t *testing.T) {
 		source   string
 		target   string
 		expected string // empty string means no diff expected
+		// expectedStatements, when set, asserts the full ordered list of
+		// emitted statements; expected is then ignored.
+		expectedStatements []string
 	}{
 		// ON UPDATE CURRENT_TIMESTAMP
 		{
@@ -89,10 +92,12 @@ func TestDiffColumnAttributeOptions(t *testing.T) {
 			expected: "",
 		},
 		{
+			// MySQL refuses to MODIFY between STORED and VIRTUAL (error 3106),
+			// so the column is dropped and added back; see rebuiltColumns.
 			name:     "GeneratedStoredVsVirtual",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a + 1) VIRTUAL)",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `b` int GENERATED ALWAYS AS (`a`+1) VIRTUAL NULL",
+			expected: "ALTER TABLE `t1` DROP COLUMN `b`, ADD COLUMN `b` int GENERATED ALWAYS AS (`a`+1) VIRTUAL NULL",
 		},
 		{
 			name:     "GeneratedExpressionChanged",
@@ -124,6 +129,65 @@ func TestDiffColumnAttributeOptions(t *testing.T) {
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326)",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326)",
 			expected: "",
+		},
+		// MySQL refuses to change the SRID of a column while a spatial index
+		// is on it (error 3644), even when the same ALTER drops the index.
+		// The index is dropped in a statement of its own first and added
+		// back in the primary ALTER. See spatialIndexesBlockingSRIDChange.
+		{
+			name:   "SridChangedUnderSpatialIndex",
+			source: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326, SPATIAL KEY k (g))",
+			target: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 3857, SPATIAL KEY k (g))",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` DROP INDEX `k`",
+				"ALTER TABLE `t1` MODIFY COLUMN `g` point NOT NULL SRID 3857, ADD SPATIAL INDEX `k` (`g`)",
+			},
+		},
+		{
+			name:   "SridAddedUnderSpatialIndex",
+			source: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL, SPATIAL KEY k (g))",
+			target: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326, SPATIAL KEY k (g))",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` DROP INDEX `k`",
+				"ALTER TABLE `t1` MODIFY COLUMN `g` point NOT NULL SRID 4326, ADD SPATIAL INDEX `k` (`g`)",
+			},
+		},
+		{
+			name:   "SridRemovedUnderSpatialIndex",
+			source: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326, SPATIAL KEY k (g))",
+			target: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL, SPATIAL KEY k (g))",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` DROP INDEX `k`",
+				"ALTER TABLE `t1` MODIFY COLUMN `g` point NOT NULL, ADD SPATIAL INDEX `k` (`g`)",
+			},
+		},
+		{
+			// Every spatial index on the column goes; one on another column
+			// stays.
+			name:   "SridChangedUnderTwoSpatialIndexes",
+			source: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326, h POINT NOT NULL SRID 4326, SPATIAL KEY k (g), SPATIAL KEY k2 (g), SPATIAL KEY kh (h))",
+			target: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 3857, h POINT NOT NULL SRID 4326, SPATIAL KEY k (g), SPATIAL KEY k2 (g), SPATIAL KEY kh (h))",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` DROP INDEX `k2`, DROP INDEX `k`",
+				"ALTER TABLE `t1` MODIFY COLUMN `g` point NOT NULL SRID 3857, ADD SPATIAL INDEX `k2` (`g`), ADD SPATIAL INDEX `k` (`g`)",
+			},
+		},
+		{
+			// The target has no index to add back.
+			name:   "SridChangedSpatialIndexRemoved",
+			source: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326, SPATIAL KEY k (g))",
+			target: "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 3857)",
+			expectedStatements: []string{
+				"ALTER TABLE `t1` DROP INDEX `k`",
+				"ALTER TABLE `t1` MODIFY COLUMN `g` point NOT NULL SRID 3857",
+			},
+		},
+		{
+			// Any other change to a spatially indexed column is a plain MODIFY.
+			name:     "CommentChangedUnderSpatialIndex",
+			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326, SPATIAL KEY k (g))",
+			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, g POINT NOT NULL SRID 4326 COMMENT 'x', SPATIAL KEY k (g))",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `g` point NOT NULL SRID 4326 COMMENT 'x'",
 		},
 		{
 			// MySQL's SHOW CREATE TABLE emits SRID inside a versioned
@@ -191,9 +255,15 @@ func TestDiffColumnAttributeOptions(t *testing.T) {
 			stmts, err := ct1.Diff(ct2, nil)
 			require.NoError(t, err)
 
-			if tt.expected == "" {
+			switch {
+			case len(tt.expectedStatements) > 0:
+				require.Len(t, stmts, len(tt.expectedStatements))
+				for i, want := range tt.expectedStatements {
+					require.Equal(t, want, stmts[i].Statement)
+				}
+			case tt.expected == "":
 				require.Nil(t, stmts, "expected nil for identical tables")
-			} else {
+			default:
 				require.Len(t, stmts, 1)
 				require.Equal(t, tt.expected, stmts[0].Statement)
 			}
@@ -249,9 +319,9 @@ func TestParseColumnAttributeOptions(t *testing.T) {
 	c := ct.Columns.ByName("c")
 	require.NotNil(t, c)
 	// Column-level CHECK is hoisted into a table-level constraint (mirroring
-	// MySQL), so Column.Check is cleared and the constraint appears in
+	// MySQL), so Column.Checks is cleared and the constraint appears in
 	// ct.Constraints with MySQL's auto-generated name.
-	require.Nil(t, c.Check)
+	require.Empty(t, c.Checks)
 	require.Empty(t, c.Options)
 
 	var chk *Constraint
@@ -554,4 +624,60 @@ func TestColumnAttributeOptionsMySQL(t *testing.T) {
 		requireNoSelfDiff(t, db, "multi_chk_t")
 		requireConverged(t, db, "multi_chk_t", target)
 	})
+}
+
+// TestParseColumnVisibilityAndEngineOptions parses the per-column attributes
+// in the version-comment form SHOW CREATE TABLE reports them in, and in the
+// user-written form, into their own fields rather than the unmodeled Options.
+func TestParseColumnVisibilityAndEngineOptions(t *testing.T) {
+	ct, err := ParseCreateTable("CREATE TABLE `t` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `a` int DEFAULT NULL /*!80023 INVISIBLE */,\n" +
+		"  `c` int NOT SECONDARY DEFAULT NULL /*!80023 INVISIBLE */,\n" +
+		"  `e` int GENERATED ALWAYS AS ((`id` + 1)) STORED NOT NULL /*!80023 INVISIBLE */ COMMENT 'e',\n" +
+		"  `h` int /*!50606 STORAGE MEMORY */ /*!50606 COLUMN_FORMAT DYNAMIC */ DEFAULT NULL /*!80023 INVISIBLE */ COMMENT 'h' /*!80021 SECONDARY_ENGINE_ATTRIBUTE '{\"k\": 1}' */,\n" +
+		"  `v` int VISIBLE,\n" +
+		"  `w` int COLUMN_FORMAT DEFAULT STORAGE DEFAULT SECONDARY_ENGINE_ATTRIBUTE='',\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		")")
+	require.NoError(t, err)
+
+	a := ct.Columns.ByName("a")
+	require.NotNil(t, a)
+	require.True(t, a.Invisible)
+	require.Empty(t, a.Options)
+
+	c := ct.Columns.ByName("c")
+	require.NotNil(t, c)
+	require.True(t, c.Invisible)
+	require.True(t, c.NotSecondary)
+	require.Empty(t, c.Options)
+
+	e := ct.Columns.ByName("e")
+	require.NotNil(t, e)
+	require.True(t, e.Invisible)
+	require.NotNil(t, e.GeneratedExpr)
+	require.NotNil(t, e.Comment)
+
+	h := ct.Columns.ByName("h")
+	require.NotNil(t, h)
+	require.True(t, h.Invisible)
+	require.NotNil(t, h.Storage)
+	require.Equal(t, "MEMORY", *h.Storage)
+	require.NotNil(t, h.ColumnFormat)
+	require.Equal(t, "DYNAMIC", *h.ColumnFormat)
+	require.NotNil(t, h.SecondaryEngineAttribute)
+	require.Equal(t, `{"k": 1}`, *h.SecondaryEngineAttribute)
+	require.Empty(t, h.Options)
+
+	// VISIBLE and the DEFAULT keywords mean "unset": MySQL reports nothing.
+	for _, name := range []string{"v", "w"} {
+		col := ct.Columns.ByName(name)
+		require.NotNil(t, col)
+		require.False(t, col.Invisible, name)
+		require.Nil(t, col.ColumnFormat, name)
+		require.Nil(t, col.Storage, name)
+		require.Nil(t, col.SecondaryEngineAttribute, name)
+		require.Empty(t, col.Options, name)
+	}
 }

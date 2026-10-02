@@ -7,7 +7,8 @@ import (
 	"testing"
 	"unicode"
 
-	_ "github.com/block/mysql"
+	drivermysql "github.com/block/mysql"
+	"github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/assert"
@@ -71,9 +72,9 @@ func TestDiffIntegrationFulltextParser(t *testing.T) {
 
 	stmts, err := source.Diff(target, nil)
 	require.NoError(t, err)
-	require.Len(t, stmts, 2, "option-only index change must be two separate statements")
-	require.Equal(t, "ALTER TABLE `diff_ft_parser` DROP INDEX `ft_b`", stmts[0].Statement)
-	require.Equal(t, "ALTER TABLE `diff_ft_parser` ADD FULLTEXT INDEX `ft_b` (`b`) WITH PARSER ngram", stmts[1].Statement)
+	require.Len(t, stmts, 2, "option-only index change must be a swap and a rename")
+	require.Equal(t, "ALTER TABLE `diff_ft_parser` ADD FULLTEXT INDEX `_ft_b_new` (`b`) WITH PARSER ngram, DROP INDEX `ft_b`", stmts[0].Statement)
+	require.Equal(t, "ALTER TABLE `diff_ft_parser` RENAME INDEX `_ft_b_new` TO `ft_b`", stmts[1].Statement)
 
 	// Execute the emitted statements exactly as the Runner would, and verify
 	// the parser change actually took effect — no extra manual ALTERs.
@@ -233,9 +234,9 @@ func TestDiffIntegrationKeyBlockSize(t *testing.T) {
 
 	stmts, err := source.Diff(target, nil)
 	require.NoError(t, err)
-	require.Len(t, stmts, 2, "option-only index change must be two separate statements")
-	require.Equal(t, "ALTER TABLE `diff_kbs` DROP INDEX `idx_b`", stmts[0].Statement)
-	require.Equal(t, "ALTER TABLE `diff_kbs` ADD INDEX `idx_b` (`b`) KEY_BLOCK_SIZE=8", stmts[1].Statement)
+	require.Len(t, stmts, 2, "option-only index change must be a swap and a rename")
+	require.Equal(t, "ALTER TABLE `diff_kbs` ADD INDEX `_idx_b_new` (`b`) KEY_BLOCK_SIZE=8, DROP INDEX `idx_b`", stmts[0].Statement)
+	require.Equal(t, "ALTER TABLE `diff_kbs` RENAME INDEX `_idx_b_new` TO `idx_b`", stmts[1].Statement)
 
 	// Execute the emitted statements exactly as the Runner would, and verify
 	// KEY_BLOCK_SIZE actually took effect — no extra manual ALTERs.
@@ -409,8 +410,8 @@ func TestDiffIntegrationForeignKeyNoAction(t *testing.T) {
 
 	// A genuine action change (NO ACTION -> CASCADE) still produces a diff,
 	// and applying it converges. The desired FK uses a different constraint
-	// name because MySQL rejects a same-name DROP FOREIGN KEY + ADD
-	// CONSTRAINT within a single ALTER (Error 1826).
+	// name, which fits one ALTER; the same-name change, which MySQL rejects
+	// in one ALTER (error 1826), is TestDiffIntegrationForeignKeySameNameReadd.
 	desiredCascade, err := ParseCreateTable(
 		"CREATE TABLE diff_fkna_child (id int primary key, pid int, KEY fk_fkna_pid (pid), " +
 			"CONSTRAINT fk_fkna_pid2 FOREIGN KEY (pid) REFERENCES diff_fkna_parent (id) ON DELETE CASCADE)")
@@ -425,6 +426,116 @@ func TestDiffIntegrationForeignKeyNoAction(t *testing.T) {
 	require.NoError(t, err)
 	stmts, err = source.Diff(desiredCascade, nil)
 	require.NoError(t, err)
+	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationForeignKeySameNameReadd verifies against MySQL that a
+// foreign key whose definition changes under the same name is replaced in
+// one ALTER under a fresh name. MySQL rejects the same-name pair in one ALTER
+// (error 1826, "Duplicate foreign key constraint name").
+func TestDiffIntegrationForeignKeySameNameReadd(t *testing.T) {
+	_ = testutils.NewTestTable(t, "diff_fkrd_parent",
+		"CREATE TABLE diff_fkrd_parent (id int primary key)")
+	tt := testutils.NewTestTable(t, "diff_fkrd_child",
+		"CREATE TABLE diff_fkrd_child (id int primary key, pid int, KEY pid (pid), "+
+			"CONSTRAINT fk_fkrd_pid FOREIGN KEY (pid) REFERENCES diff_fkrd_parent (id))")
+
+	// Document the server behavior the replacement name depends on.
+	_, err := tt.DB.ExecContext(t.Context(), "ALTER TABLE diff_fkrd_child DROP FOREIGN KEY fk_fkrd_pid, "+
+		"ADD CONSTRAINT fk_fkrd_pid FOREIGN KEY (pid) REFERENCES diff_fkrd_parent (id) ON DELETE CASCADE")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Error 1826")
+
+	targetSQL := "CREATE TABLE diff_fkrd_child (id int primary key, pid int, b int, KEY pid (pid), " +
+		"CONSTRAINT fk_fkrd_pid FOREIGN KEY (pid) REFERENCES diff_fkrd_parent (id) ON DELETE CASCADE)"
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_fkrd_child` ADD COLUMN `b` int NULL, DROP FOREIGN KEY `fk_fkrd_pid`, "+
+		"ADD CONSTRAINT `_fk_fkrd_pid_new` FOREIGN KEY (`pid`) REFERENCES `diff_fkrd_parent` (`id`) ON DELETE CASCADE", stmts[0].Statement)
+
+	// The table is never without the constraint: a row with no parent is
+	// refused before the statement and after it.
+	orphan := "INSERT INTO diff_fkrd_child (id, pid) VALUES (100, 999)"
+	requireOrphanRefused := func() {
+		t.Helper()
+		_, err := tt.DB.ExecContext(t.Context(), orphan)
+		require.Error(t, err, "the child table must stay constrained")
+		var mysqlErr *drivermysql.MySQLError
+		require.ErrorAs(t, err, &mysqlErr)
+		// MySQL can report either the generic or detailed foreign-key
+		// violation. Both prove the orphan was refused by the constraint.
+		require.Contains(t, []uint16{mysql.ErrNoReferencedRow, mysql.ErrNoReferencedRow2}, mysqlErr.Number)
+	}
+	requireOrphanRefused()
+	execStatements(t, tt.DB, stmts)
+	requireOrphanRefused()
+
+	// The foreign key keeps the replacement name; the next diff pairs it
+	// with the desired one by definition.
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "CONSTRAINT `_fk_fkrd_pid_new` FOREIGN KEY (`pid`) REFERENCES `diff_fkrd_parent` (`id`) ON DELETE CASCADE")
+	require.NotContains(t, live, "CONSTRAINT `fk_fkrd_pid`")
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+
+	// A later change under the desired name fits one ALTER under the two
+	// names, and brings the name back.
+	targetSQL = "CREATE TABLE diff_fkrd_child (id int primary key, pid int, b int, KEY pid (pid), " +
+		"CONSTRAINT fk_fkrd_pid FOREIGN KEY (pid) REFERENCES diff_fkrd_parent (id) ON DELETE SET NULL)"
+	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_fkrd_child` DROP FOREIGN KEY `_fk_fkrd_pid_new`, "+
+		"ADD CONSTRAINT `fk_fkrd_pid` FOREIGN KEY (`pid`) REFERENCES `diff_fkrd_parent` (`id`) ON DELETE SET NULL", stmts[0].Statement)
+	requireOrphanRefused()
+	execStatements(t, tt.DB, stmts)
+	requireOrphanRefused()
+	live = showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "CONSTRAINT `fk_fkrd_pid` FOREIGN KEY (`pid`) REFERENCES `diff_fkrd_parent` (`id`) ON DELETE SET NULL")
+	require.NotContains(t, live, "_new")
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+}
+
+// TestDiffIntegrationForeignKeyReferencedSchema verifies against MySQL that a
+// foreign key moved to a parent in another schema is a diff, and documents
+// how the referenced schema reads back: qualified only when it is another
+// schema, which is why a reference qualified with the table's own schema
+// compares equal to an unqualified one.
+func TestDiffIntegrationForeignKeyReferencedSchema(t *testing.T) {
+	// The child references otherDB first; it is created second so its
+	// database is dropped first on cleanup.
+	otherDB, other := testutils.CreateUniqueTestDatabase(t)
+	ownDB, db := testutils.CreateUniqueTestDatabase(t)
+	_, err := other.ExecContext(t.Context(), "CREATE TABLE parent (id int primary key)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE parent (id int primary key)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE child (id int primary key, pid int, KEY pid (pid), "+
+		"CONSTRAINT fk_pid FOREIGN KEY (pid) REFERENCES `%s`.parent (id))", otherDB))
+	require.NoError(t, err)
+
+	live := showCreateTable(t, db, "child")
+	require.Contains(t, live, fmt.Sprintf("REFERENCES `%s`.`parent` (`id`)", otherDB))
+
+	// Repoint the foreign key at this schema's parent.
+	targetSQL := fmt.Sprintf("CREATE TABLE child (id int primary key, pid int, KEY pid (pid), "+
+		"CONSTRAINT fk_pid FOREIGN KEY (pid) REFERENCES `%s`.parent (id))", ownDB)
+	stmts := diffLiveTable(t, db, "child", targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, fmt.Sprintf("ALTER TABLE `child` DROP FOREIGN KEY `fk_pid`, ADD CONSTRAINT `_fk_pid_new` FOREIGN KEY (`pid`) REFERENCES `%s`.`parent` (`id`)", ownDB), stmts[0].Statement)
+	execStatements(t, db, stmts)
+
+	// A reference into the table's own schema reads back unqualified ...
+	live = showCreateTable(t, db, "child")
+	require.Contains(t, live, "REFERENCES `parent` (`id`)")
+	require.NotContains(t, live, otherDB)
+	// ... and converges with the qualified desired definition.
+	requireConverged(t, db, "child", targetSQL)
+
+	// Repointing back to the other schema is a diff again.
+	stmts = diffLiveTable(t, db, "child", fmt.Sprintf("CREATE TABLE child (id int primary key, pid int, KEY pid (pid), "+
+		"CONSTRAINT fk_pid FOREIGN KEY (pid) REFERENCES `%s`.parent (id))", otherDB))
+	// The live reference is unqualified, so it cannot be told apart from
+	// a reference to any schema: this is the documented limitation of
+	// comparing a schema only when both sides are qualified.
 	require.Nil(t, stmts)
 }
 
@@ -674,9 +785,9 @@ func TestDiffIntegrationSubpartitionNoSpuriousDiff(t *testing.T) {
 }
 
 // TestDiffIntegrationSubpartitionChange verifies that a genuine subpartitioning
-// change is emitted in full and actually applies: the REMOVE PARTITIONING +
-// PARTITION BY pair must carry the SUBPARTITION BY clause, or the table comes
-// back partitioned but no longer subpartitioned. The re-diff then converges.
+// change is emitted in full and actually applies: the PARTITION BY must carry
+// the SUBPARTITION BY clause, or the table comes back partitioned but no
+// longer subpartitioned. The re-diff then converges.
 func TestDiffIntegrationSubpartitionChange(t *testing.T) {
 	tt := testutils.NewTestTable(t, "diff_subpart_chg",
 		"CREATE TABLE diff_subpart_chg (dt date NOT NULL, PRIMARY KEY (dt)) "+
@@ -690,13 +801,12 @@ func TestDiffIntegrationSubpartitionChange(t *testing.T) {
 	require.NoError(t, err)
 
 	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
-	require.Len(t, stmts, 2, "a subpartitioning change needs REMOVE PARTITIONING first")
-	require.Equal(t, "ALTER TABLE `diff_subpart_chg` REMOVE PARTITIONING", stmts[0].Statement)
+	require.Len(t, stmts, 1, "a repartition needs no REMOVE PARTITIONING first")
 	require.Equal(t,
 		"ALTER TABLE `diff_subpart_chg` PARTITION BY RANGE (YEAR(`dt`)) "+
-			"SUBPARTITION BY HASH (dayofmonth(`dt`)) SUBPARTITIONS 4 "+
+			"SUBPARTITION BY HASH (DAYOFMONTH(`dt`)) SUBPARTITIONS 4 "+
 			"(PARTITION `p0` VALUES LESS THAN (2020), PARTITION `p1` VALUES LESS THAN MAXVALUE)",
-		stmts[1].Statement)
+		stmts[0].Statement)
 
 	// Execute exactly what Diff emitted, as the Runner would.
 	for _, stmt := range stmts {
@@ -736,7 +846,7 @@ func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, stmts, "named subpartitions and comments must not diff against themselves")
 
-	// Now move p0's boundary. The repartition has to carry every subpartition
+	// Now move p0's boundary. The REORGANIZE has to carry every subpartition
 	// name and comment through, or they are silently lost.
 	const movedSQL = "CREATE TABLE diff_subpart_named (dt date NOT NULL, PRIMARY KEY (dt)) " +
 		"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY KEY (dt) " +
@@ -746,7 +856,8 @@ func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
 	require.NoError(t, err)
 
 	stmts = diffLiveTable(t, tt.DB, tt.Name, movedSQL)
-	require.Len(t, stmts, 2)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "REORGANIZE PARTITION `p0`, `p1` INTO")
 	for _, stmt := range stmts {
 		_, err = tt.DB.ExecContext(t.Context(), stmt.Statement)
 		require.NoError(t, err)
@@ -763,6 +874,628 @@ func TestDiffIntegrationSubpartitionNamesAndComments(t *testing.T) {
 	stmts, err = source.Diff(moved, nil)
 	require.NoError(t, err)
 	require.Nil(t, stmts)
+}
+
+// TestDiffIntegrationPartitionChanges applies each kind of partition change
+// Diff emits to a table holding rows, and checks that MySQL accepts it, that
+// the table converges on the target, and that no row is lost.
+func TestDiffIntegrationPartitionChanges(t *testing.T) {
+	const rangeSource = "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+		"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20), PARTITION pmax VALUES LESS THAN MAXVALUE)"
+	const listSource = "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+		"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 5), PARTITION p1 VALUES IN (15), PARTITION p2 VALUES IN (25))"
+	const hashSource = "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY HASH (id) PARTITIONS 4"
+	const dateSource = "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) " +
+		"PARTITION BY RANGE COLUMNS (d) (PARTITION p202610 VALUES LESS THAN ('2026-11-01'), PARTITION pmax VALUES LESS THAN (MAXVALUE))"
+	tests := []struct {
+		name   string
+		source string
+		insert string
+		target string
+		// prefix of each emitted statement, after "ALTER TABLE `diff_part_chg` "
+		expected []string
+		// after, if set, must succeed once the table has converged
+		after string
+	}{
+		{
+			name:     "ChangeTypeWithColumn",
+			source:   hashSource,
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 3",
+			expected: []string{"ADD COLUMN `c` int NULL PARTITION BY KEY"},
+		},
+		{
+			name:     "CoalesceWithColumn",
+			source:   hashSource,
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) PARTITION BY HASH (id) PARTITIONS 2",
+			expected: []string{"ADD COLUMN `c` int NULL PARTITION BY HASH"},
+		},
+		{
+			name:     "AddPartitioningWithColumn",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id))",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) PARTITION BY HASH (id) PARTITIONS 2",
+			expected: []string{"ADD COLUMN `c` int NULL PARTITION BY HASH"},
+		},
+		{
+			name:     "RemovePartitioningWithColumn",
+			source:   hashSource,
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id))",
+			expected: []string{"ADD COLUMN `c` int NULL REMOVE PARTITIONING"},
+		},
+		{
+			name:     "RangeToList",
+			source:   rangeSource,
+			target:   listSource,
+			expected: []string{"PARTITION BY LIST"},
+		},
+		{
+			name:   "AppendRangePartitionWithColumn",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, c int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30), PARTITION p2 VALUES LESS THAN (40))",
+			expected: []string{"ADD COLUMN `c` int NULL", "ADD PARTITION"},
+		},
+		{
+			// MODIFY rounds 9.996 to 10.00, past p0. As a separate statement
+			// after the MODIFY, the ADD PARTITION would come too late (MySQL
+			// error 1526); folded into one PARTITION BY it applies.
+			name:   "AppendRangePartitionWithPartitionKeyChange",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d decimal(10,3) NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (FLOOR(d)) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 9.996)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d decimal(10,2) NOT NULL, PRIMARY KEY (id, d)) " +
+				"PARTITION BY RANGE (FLOOR(d)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NOT NULL PARTITION BY RANGE"},
+		},
+		{
+			// The same, with the partitioning reading d through a generated
+			// column: g's definition is unchanged, but its value moves.
+			name:   "AppendRangePartitionWithGeneratedPartitionKeyChange",
+			source: "CREATE TABLE diff_part_chg (d decimal(10,3), g int AS (FLOOR(d)) STORED) PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg (d) VALUES (9.996)",
+			target: "CREATE TABLE diff_part_chg (d decimal(10,2), g int AS (FLOOR(d)) STORED) " +
+				"PARTITION BY RANGE (g) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NULL PARTITION BY RANGE"},
+		},
+		{
+			// Two generated columns deep.
+			name:   "AppendRangePartitionWithTransitivePartitionKeyChange",
+			source: "CREATE TABLE diff_part_chg (d decimal(10,3), g int AS (FLOOR(d)) STORED, h int AS (g + 1) STORED) PARTITION BY RANGE (h) (PARTITION p0 VALUES LESS THAN (11))",
+			insert: "INSERT INTO diff_part_chg (d) VALUES (9.996)",
+			target: "CREATE TABLE diff_part_chg (d decimal(10,2), g int AS (FLOOR(d)) STORED, h int AS (g + 1) STORED) " +
+				"PARTITION BY RANGE (h) (PARTITION p0 VALUES LESS THAN (11), PARTITION p1 VALUES LESS THAN (21))",
+			expected: []string{"MODIFY COLUMN `d` decimal(10,2) NULL PARTITION BY RANGE"},
+		},
+		{
+			// MySQL folds each bound when it stores it: 20, 30, 40, 300, 405.
+			name:   "AppendExpressionBounds",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg (id) VALUES (1), (5)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), " +
+				"PARTITION p1 VALUES LESS THAN (10+10), PARTITION p2 VALUES LESS THAN (+30), PARTITION p3 VALUES LESS THAN ((40)), " +
+				"PARTITION p4 VALUES LESS THAN (7 DIV 2 * 100), PARTITION p5 VALUES LESS THAN (MOD(1000, 600) - -5))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (394)",
+		},
+		{
+			// MOD takes the dividend's type, so this is a signed -1, not an
+			// out-of-range unsigned one.
+			name:   "AppendModuloOfUnsignedBound",
+			source: "CREATE TABLE diff_part_chg (id bigint NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))",
+			insert: "INSERT INTO diff_part_chg (id) VALUES (1)",
+			target: "CREATE TABLE diff_part_chg (id bigint NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (MOD(7, 9223372036854775808) - 8))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (-1)",
+		},
+		{
+			name:   "AppendExpressionListValues",
+			source: listSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 5), PARTITION p1 VALUES IN (15), PARTITION p2 VALUES IN (25), PARTITION p3 VALUES IN (30+5, 3*15))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (35), (45)",
+		},
+		{
+			name:   "AppendRangeColumnsExpressionBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE COLUMNS (id, d) (PARTITION p0 VALUES LESS THAN (10, '2020-01-01'))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2019-01-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) " +
+				"PARTITION BY RANGE COLUMNS (id, d) (PARTITION p0 VALUES LESS THAN (10, '2020-01-01'), PARTITION p1 VALUES LESS THAN (10+10, '2020-01-01'))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "AppendToDaysBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_DAYS(d)) (PARTITION p0 VALUES LESS THAN (TO_DAYS('2026-01-01')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2025-06-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_DAYS(d)) " +
+				"(PARTITION p0 VALUES LESS THAN (TO_DAYS('2026-01-01')), PARTITION p1 VALUES LESS THAN (TO_DAYS('2027-01-01 00:00:00')))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg VALUES (2, '2026-12-31')",
+		},
+		{
+			name:   "AppendToSecondsBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d datetime NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_SECONDS(d)) (PARTITION p0 VALUES LESS THAN (TO_SECONDS('1969-07-20 20:17:40')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '1969-07-20 20:17:39')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d datetime NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (TO_SECONDS(d)) " +
+				"(PARTITION p0 VALUES LESS THAN (TO_SECONDS('1969-07-20 20:17:40')), PARTITION p1 VALUES LESS THAN (TO_SECONDS('2026-10-01 12:00:01')))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "AppendYearBound",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (YEAR(d)) (PARTITION p0 VALUES LESS THAN (YEAR('2026-06-01')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2025-06-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) PARTITION BY RANGE (YEAR(d)) " +
+				"(PARTITION p0 VALUES LESS THAN (YEAR('2026-06-01')), PARTITION p1 VALUES LESS THAN (YEAR('2027-06-01')))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name: "AppendParenthesizedTupleLiteral",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')), PARTITION p1 VALUES IN ((2, ('y'))))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg VALUES (2, 'y')",
+		},
+		{
+			name:   "AppendParenthesizedTupleNull",
+			source: "CREATE TABLE diff_part_chg (id int, b varchar(10)) PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x')",
+			target: "CREATE TABLE diff_part_chg (id int, b varchar(10)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')), PARTITION p1 VALUES IN ((2, (NULL))))",
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg VALUES (2, NULL)",
+		},
+		{
+			// MySQL stores RANGE (a + b) as RANGE ((`a` + `b`)); the two must
+			// compare equal, or this would be a full PARTITION BY.
+			name:   "AppendWithCompoundExpression",
+			source: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) PARTITION BY RANGE (a + b) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 2)",
+			target: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) " +
+				"PARTITION BY RANGE (a + b) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "AppendWithParenthesizedColumnExpression",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE ((id)) (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg (id) VALUES (1)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE ((id)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name: "AppendWithCompoundSubpartitionExpression",
+			source: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) " +
+				"PARTITION BY RANGE (a) SUBPARTITION BY HASH (a + b * 2) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (10))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 2)",
+			target: "CREATE TABLE diff_part_chg (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b)) " +
+				"PARTITION BY RANGE (a) SUBPARTITION BY HASH (a + b * 2) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			// MySQL stores MOD(id, 2) as (`id` % 2).
+			name:   "AppendWithModExpression",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (MOD(id, 3)) (PARTITION p0 VALUES IN (0))",
+			insert: "INSERT INTO diff_part_chg VALUES (3)",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (MOD(id, 3)) (PARTITION p0 VALUES IN (0), PARTITION p1 VALUES IN (1, 2))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			// MySQL stores NULL first in a LIST (expr) value list.
+			name:   "AppendWithNullNotFirst",
+			source: "CREATE TABLE diff_part_chg (id int) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (2, NULL), PARTITION p1 VALUES IN (3))",
+			insert: "INSERT INTO diff_part_chg VALUES (NULL), (2), (3)",
+			target: "CREATE TABLE diff_part_chg (id int) PARTITION BY LIST (id) " +
+				"(PARTITION p0 VALUES IN (2, NULL), PARTITION p1 VALUES IN (3), PARTITION p2 VALUES IN (4))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:     "KeyAlgorithmToDefault",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY ALGORITHM=1 (id) PARTITIONS 2",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 2",
+			expected: []string{"PARTITION BY KEY (`id`) PARTITIONS 2"},
+		},
+		{
+			name:     "KeyAlgorithmFromDefault",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 2",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY LINEAR KEY ALGORITHM=1 (id) PARTITIONS 2",
+			expected: []string{"PARTITION BY LINEAR KEY ALGORITHM=1 (`id`) PARTITIONS 2"},
+		},
+		{
+			// ADD PARTITION PARTITIONS 1 would keep algorithm 1.
+			name:     "KeyAlgorithmAndCountChange",
+			source:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY ALGORITHM=1 (id) PARTITIONS 2",
+			target:   "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 3",
+			expected: []string{"PARTITION BY KEY (`id`) PARTITIONS 3"},
+		},
+		{
+			// ALGORITHM=2 is the default, which MySQL does not print.
+			name:   "KeyAlgorithmExplicitDefault",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY (id) PARTITIONS 2",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY KEY ALGORITHM=2 (id) PARTITIONS 2",
+		},
+		{
+			// ADD PARTITION would keep the subpartitions' algorithm 1.
+			name:   "AppendWithSubpartitionKeyAlgorithmChange",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY KEY ALGORITHM=1 (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (30))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY KEY (id) SUBPARTITIONS 2 " +
+				"(PARTITION p0 VALUES LESS THAN (30), PARTITION p1 VALUES LESS THAN (40))",
+			expected: []string{"PARTITION BY RANGE (`id`) SUBPARTITION BY KEY (`id`) SUBPARTITIONS 2"},
+		},
+		{
+			name:   "AppendListPartition",
+			source: listSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 5), PARTITION p1 VALUES IN (15), PARTITION p2 VALUES IN (25), PARTITION p3 VALUES IN (35))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:   "SplitMaxvaluePartition",
+			source: dateSource,
+			insert: "INSERT INTO diff_part_chg VALUES (1, '2026-10-05'), (2, '2026-11-05'), (3, '2027-01-01')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, d date NOT NULL, PRIMARY KEY (id, d)) " +
+				"PARTITION BY RANGE COLUMNS (d) (PARTITION p202610 VALUES LESS THAN ('2026-11-01'), PARTITION p202611 VALUES LESS THAN ('2026-12-01'), PARTITION pmax VALUES LESS THAN (MAXVALUE))",
+			expected: []string{"REORGANIZE PARTITION `pmax` INTO"},
+		},
+		{
+			name:   "MergeRangePartitions",
+			source: rangeSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			expected: []string{"REORGANIZE PARTITION `p1`, `pmax` INTO"},
+		},
+		{
+			name:   "MoveRangeBoundary",
+			source: rangeSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (12), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			expected: []string{"REORGANIZE PARTITION `p1`, `pmax` INTO"},
+		},
+		{
+			name:   "MoveListValue",
+			source: listSource,
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) " +
+				"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (5, 15), PARTITION p2 VALUES IN (25))",
+			expected: []string{"REORGANIZE PARTITION `p0`, `p1` INTO"},
+		},
+		{
+			name: "MoveMultiColumnListTuple",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x'), (3, 'y')), PARTITION p1 VALUES IN ((5, 'z')))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x'), (3, 'y'), (5, 'z')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x')), PARTITION p1 VALUES IN ((3, 'y'), (5, 'z')))",
+			expected: []string{"REORGANIZE PARTITION `p0`, `p1` INTO"},
+		},
+		{
+			name:   "AddMultiColumnListPartitioning",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b))",
+			insert: "INSERT INTO diff_part_chg VALUES (1, 'x'), (3, 'y')",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (id, b)) " +
+				"PARTITION BY LIST COLUMNS (id, b) (PARTITION p0 VALUES IN ((1, 'x'), (3, 'y')), PARTITION p1 VALUES IN ((5, 'z')))",
+			expected: []string{"PARTITION BY LIST COLUMNS"},
+		},
+		{
+			name:   "SubpartitionedAppend",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 " +
+				"(PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (30), PARTITION p2 VALUES LESS THAN (40))",
+			expected: []string{"ADD PARTITION"},
+		},
+		{
+			name:     "PartitionMaxRowsChange",
+			source:   rangeSource,
+			target:   strings.Replace(rangeSource, "VALUES LESS THAN (20)", "VALUES LESS THAN (20) MAX_ROWS = 200 NODEGROUP = 0", 1),
+			expected: []string{"REORGANIZE PARTITION `p1` INTO"},
+		},
+		{
+			name:     "AppendListWithStorageOptions",
+			source:   listSource,
+			target:   strings.Replace(listSource, "VALUES IN (25))", "VALUES IN (25), PARTITION p3 VALUES IN (35) MAX_ROWS = 10 MIN_ROWS = 1)", 1),
+			expected: []string{"ADD PARTITION"},
+			after:    "INSERT INTO diff_part_chg (id) VALUES (35)",
+		},
+		{
+			name: "SubpartitionStorageOptions",
+			source: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) " +
+				"(PARTITION p0 VALUES LESS THAN (10) (SUBPARTITION s0, SUBPARTITION s1), PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))",
+			target: "CREATE TABLE diff_part_chg (id int NOT NULL, b int, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) " +
+				"(PARTITION p0 VALUES LESS THAN (10) COMMENT 'pc' MAX_ROWS = 9 (SUBPARTITION s0 COMMENT '' MAX_ROWS = 5, SUBPARTITION s1), " +
+				"PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))",
+			expected: []string{"REORGANIZE PARTITION `p0` INTO"},
+		},
+		{
+			// SHOW CREATE TABLE then prints the tablespace on every
+			// partition. It has no effect with innodb_file_per_table=ON.
+			name:     "FilePerTableTablespace",
+			source:   rangeSource,
+			target:   strings.Replace(rangeSource, "VALUES LESS THAN (20)", "VALUES LESS THAN (20) TABLESPACE = innodb_file_per_table", 1),
+			expected: nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// The target must itself be a table MySQL accepts.
+			testutils.NewTestTable(t, "diff_part_chg_target",
+				strings.Replace(tc.target, "CREATE TABLE diff_part_chg ", "CREATE TABLE diff_part_chg_target ", 1))
+			tt := testutils.NewTestTable(t, "diff_part_chg", tc.source)
+			insert := tc.insert
+			if insert == "" {
+				insert = "INSERT INTO diff_part_chg (id) VALUES (1), (5), (15), (25)"
+			}
+			testutils.RunSQL(t, insert)
+			var before int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_part_chg").Scan(&before))
+
+			stmts := diffLiveTable(t, tt.DB, tt.Name, tc.target)
+			require.Len(t, stmts, len(tc.expected))
+			for i, stmt := range stmts {
+				require.True(t, strings.HasPrefix(stmt.Statement, "ALTER TABLE `diff_part_chg` "+tc.expected[i]),
+					"statement %d: %s", i, stmt.Statement)
+			}
+			execStatements(t, tt.DB, stmts)
+			requireConverged(t, tt.DB, tt.Name, tc.target)
+
+			var after int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_part_chg").Scan(&after))
+			require.Equal(t, before, after, "no row may be lost")
+			if tc.after != "" {
+				testutils.RunSQL(t, tc.after)
+			}
+		})
+	}
+}
+
+// TestDiffIntegrationListNullValueKeepsRows verifies that a LIST partition
+// holding NULL keeps its NULL rows through a partition change. Emitted as the
+// string 'NULL', a REORGANIZE would move them into no partition, and MySQL
+// would delete them without an error.
+func TestDiffIntegrationListNullValueKeepsRows(t *testing.T) {
+	const create = "CREATE TABLE diff_list_null (id int NOT NULL, s varchar(10)) " +
+		"PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN (NULL, 'a'), PARTITION p1 VALUES IN ('b'))"
+	tests := []struct {
+		name     string
+		target   string
+		expected string
+	}{
+		{
+			name: "CommentChange",
+			target: "CREATE TABLE diff_list_null (id int NOT NULL, s varchar(10)) " +
+				"PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN (NULL, 'a') COMMENT 'x', PARTITION p1 VALUES IN ('b'))",
+			expected: "VALUES IN (NULL, 'a')",
+		},
+		{
+			name: "MoveNull",
+			target: "CREATE TABLE diff_list_null (id int NOT NULL, s varchar(10)) " +
+				"PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN ('a'), PARTITION p1 VALUES IN (NULL, 'b'))",
+			expected: "VALUES IN (NULL, 'b')",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "diff_list_null", create)
+			testutils.RunSQL(t, "INSERT INTO diff_list_null VALUES (1, NULL), (2, 'a'), (3, 'b')")
+			requireNoSelfDiff(t, tt.DB, tt.Name)
+
+			stmts := diffLiveTable(t, tt.DB, tt.Name, tc.target)
+			require.Len(t, stmts, 1)
+			require.Contains(t, stmts[0].Statement, "REORGANIZE PARTITION")
+			require.Contains(t, stmts[0].Statement, tc.expected)
+			execStatements(t, tt.DB, stmts)
+
+			var count int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_list_null").Scan(&count))
+			require.Equal(t, 3, count, "the NULL row must survive: %s", stmts[0].Statement)
+			requireConverged(t, tt.DB, tt.Name, tc.target)
+		})
+	}
+
+	// On an integer column NULL is re-emitted in a PARTITION BY (the split
+	// can't share an ALTER with the column change). Quoted, it didn't apply.
+	t.Run("IntegerRepartition", func(t *testing.T) {
+		tt := testutils.NewTestTable(t, "diff_list_null",
+			"CREATE TABLE diff_list_null (id int) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (NULL, 1))")
+		testutils.RunSQL(t, "INSERT INTO diff_list_null VALUES (NULL), (1)")
+		const target = "CREATE TABLE diff_list_null (id int, c int) PARTITION BY LIST (id) " +
+			"(PARTITION p0 VALUES IN (NULL), PARTITION p1 VALUES IN (1))"
+		stmts := diffLiveTable(t, tt.DB, tt.Name, target)
+		require.Len(t, stmts, 1)
+		require.Contains(t, stmts[0].Statement, "PARTITION BY LIST (`id`) (PARTITION `p0` VALUES IN (NULL)")
+		execStatements(t, tt.DB, stmts)
+		requireConverged(t, tt.DB, tt.Name, target)
+		var count int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_list_null").Scan(&count))
+		require.Equal(t, 2, count)
+	})
+}
+
+// TestDiffIntegrationFractionalDatetimeBoundKeepsRows verifies that a bound
+// spirit cannot evaluate offline is emitted as written, for MySQL to
+// evaluate. MySQL rounds the fractional second first, so
+// YEAR('2030-12-31 23:59:59.9999999') is 2031; evaluated as 2030, the
+// comment-only change would move the 2031 row into no partition. (The change
+// is a PARTITION BY, not a REORGANIZE: an unevaluated LIST value never
+// qualifies for REORGANIZE, see
+// TestDiffIntegrationSessionDependentListValueKeepsRows.)
+func TestDiffIntegrationFractionalDatetimeBoundKeepsRows(t *testing.T) {
+	const bound = "YEAR('2030-12-31 23:59:59.9999999')"
+	t.Run("ReorganizeBetweenAuthoredSchemas", func(t *testing.T) {
+		const create = "CREATE TABLE diff_fraction (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) " +
+			"(PARTITION p0 VALUES IN (" + bound + ") COMMENT 'old')"
+		tt := testutils.NewTestTable(t, "diff_fraction", create)
+		testutils.RunSQL(t, "INSERT INTO diff_fraction VALUES (2031)")
+		source, err := ParseCreateTable(create)
+		require.NoError(t, err)
+		target, err := ParseCreateTable(strings.Replace(create, "COMMENT 'old'", "COMMENT 'new'", 1))
+		require.NoError(t, err)
+		stmts, err := source.Diff(target, nil)
+		require.NoError(t, err)
+		require.Len(t, stmts, 1)
+		require.Contains(t, stmts[0].Statement, "VALUES IN ("+bound+")")
+		execStatements(t, tt.DB, stmts)
+		var count int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_fraction").Scan(&count))
+		require.Equal(t, 1, count, "the 2031 row must survive: %s", stmts[0].Statement)
+	})
+	// Against the live table the bound applies with the value MySQL gives
+	// it. It does not converge: the live table reads 2031.
+	t.Run("AppendToLiveTable", func(t *testing.T) {
+		tt := testutils.NewTestTable(t, "diff_fraction",
+			"CREATE TABLE diff_fraction (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))")
+		stmts := diffLiveTable(t, tt.DB, tt.Name, "CREATE TABLE diff_fraction (id int NOT NULL, PRIMARY KEY (id)) "+
+			"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN ("+bound+"))")
+		require.Len(t, stmts, 1)
+		execStatements(t, tt.DB, stmts)
+		testutils.RunSQL(t, "INSERT INTO diff_fraction VALUES (2031)")
+	})
+}
+
+// TestDiffIntegrationSessionDependentListValueKeepsRows verifies that a
+// LIST value left as an expression does not qualify for REORGANIZE, even when
+// its text is unchanged. UNIX_TIMESTAMP reads the session time zone, so the
+// same text names a different value in a session with a different zone. A
+// REORGANIZE run there leaves the stored value without a partition, and MySQL
+// deletes its rows without an error. PARTITION BY fails with 1526 instead.
+func TestDiffIntegrationSessionDependentListValueKeepsRows(t *testing.T) {
+	const create = "CREATE TABLE diff_tz_list (id bigint NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) " +
+		"(PARTITION p0 VALUES IN (UNIX_TIMESTAMP('2030-01-01 00:00:00')) COMMENT 'old')"
+	// Created, and the row inserted, in the UTC session spirit connects with.
+	tt := testutils.NewTestTable(t, "diff_tz_list", create)
+	testutils.RunSQL(t, "INSERT INTO diff_tz_list VALUES (UNIX_TIMESTAMP('2030-01-01 00:00:00'))")
+
+	source, err := ParseCreateTable(create)
+	require.NoError(t, err)
+	target, err := ParseCreateTable(strings.Replace(create, "COMMENT 'old'", "COMMENT 'new'", 1))
+	require.NoError(t, err)
+	stmts, err := source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "PARTITION BY LIST")
+
+	conn, err := tt.DB.Conn(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = conn.ExecContext(t.Context(), "SET SESSION time_zone = '+01:00'")
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), stmts[0].Statement)
+	require.ErrorContains(t, err, "1526")
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_tz_list").Scan(&count))
+	require.Equal(t, 1, count, "the row must survive: %s", stmts[0].Statement)
+}
+
+// TestDiffIntegrationListValueOrderNoDiff verifies that a desired schema
+// listing VALUES IN values in another order than the live table does not
+// diff. MySQL keeps the written order, so the live table and the desired
+// schema differ only in order.
+func TestDiffIntegrationListValueOrderNoDiff(t *testing.T) {
+	for _, tc := range []struct{ name, live, desired string }{
+		{
+			name:    "ListExpression",
+			live:    "CREATE TABLE diff_list_order (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (5, 2, 10), PARTITION p1 VALUES IN (3, NULL))",
+			desired: "CREATE TABLE diff_list_order (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (2, 5, 10), PARTITION p1 VALUES IN (NULL, 3))",
+		},
+		{
+			name:    "ListColumnsTuples",
+			live:    "CREATE TABLE diff_list_order (a int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (a, b)) PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((2, 'x'), (1, 'y'), (1, 'x')))",
+			desired: "CREATE TABLE diff_list_order (a int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (a, b)) PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((1, 'x'), (1, 'y'), (2, 'x')))",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "diff_list_order", tc.live)
+			requireConverged(t, tt.DB, tt.Name, tc.desired)
+			requireNoSelfDiff(t, tt.DB, tt.Name)
+		})
+	}
+}
+
+// TestDiffIntegrationPartitionOptionsNoSelfDiff verifies that partition and
+// subpartition options converge: MySQL moves a partition's options onto its
+// named subpartitions, drops zero and empty values, and prints a
+// file-per-table tablespace on every partition.
+func TestDiffIntegrationPartitionOptionsNoSelfDiff(t *testing.T) {
+	const authoredSQL = "CREATE TABLE diff_part_opts (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) (" +
+		"PARTITION p0 VALUES LESS THAN (10) COMMENT 'pc' MAX_ROWS = 9 MIN_ROWS = 2 NODEGROUP = 3 " +
+		"(SUBPARTITION s0 COMMENT '' MAX_ROWS = 0 NODEGROUP = 0, SUBPARTITION s1 MAX_ROWS = 5), " +
+		"PARTITION p1 VALUES LESS THAN (20) TABLESPACE = innodb_file_per_table (SUBPARTITION s2, SUBPARTITION s3), " +
+		"PARTITION p2 VALUES LESS THAN MAXVALUE MAX_ROWS = 0 (SUBPARTITION s4 COMMENT 's4', SUBPARTITION s5))"
+	tt := testutils.NewTestTable(t, "diff_part_opts", authoredSQL)
+	requireConverged(t, tt.DB, tt.Name, authoredSQL)
+	requireNoSelfDiff(t, tt.DB, tt.Name)
+}
+
+// TestDiffIntegrationPartitionDataDirectory verifies that DATA DIRECTORY is
+// emitted and converges. MySQL prints '/x' as '/x/' after CREATE TABLE, but
+// as written after ADD PARTITION. It needs a directory in
+// innodb_directories, so it is skipped on a server without one.
+func TestDiffIntegrationPartitionDataDirectory(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_part_dd", "CREATE TABLE diff_part_dd (id int NOT NULL, PRIMARY KEY (id))")
+	var dirs sql.NullString
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT @@innodb_directories").Scan(&dirs))
+	if !dirs.Valid || dirs.String == "" {
+		t.Skip("innodb_directories is not set")
+	}
+	dir := strings.TrimRight(strings.Split(dirs.String, ";")[0], "/")
+	create := "CREATE TABLE diff_part_dd (id int NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id) " +
+		"(PARTITION p0 VALUES LESS THAN (10) DATA DIRECTORY = '" + dir + "')"
+	testutils.RunSQL(t, "DROP TABLE diff_part_dd")
+	testutils.RunSQL(t, create)
+	require.Contains(t, showCreateTable(t, tt.DB, tt.Name), "DATA DIRECTORY = '"+dir+"/'", "precondition: CREATE TABLE adds a slash")
+	requireConverged(t, tt.DB, tt.Name, create)
+
+	target := strings.Replace(create, "'"+dir+"')", "'"+dir+"/', PARTITION p1 VALUES LESS THAN (20) DATA DIRECTORY = '"+dir+"')", 1)
+	stmts := diffLiveTable(t, tt.DB, tt.Name, target)
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "ADD PARTITION (PARTITION `p1` VALUES LESS THAN (20) DATA DIRECTORY = '"+dir+"')")
+	execStatements(t, tt.DB, stmts)
+	requireConverged(t, tt.DB, tt.Name, target)
+}
+
+// TestDiffIntegrationMultiColumnListNoSelfDiff verifies that a multi-column
+// LIST COLUMNS table, read back from SHOW CREATE TABLE, does not diff against
+// the SQL it was created from.
+func TestDiffIntegrationMultiColumnListNoSelfDiff(t *testing.T) {
+	const authoredSQL = "CREATE TABLE diff_list_tuples (a int NOT NULL, b varchar(10) NOT NULL, PRIMARY KEY (a, b)) " +
+		"PARTITION BY LIST COLUMNS (a, b) (PARTITION p0 VALUES IN ((1, 'x'), (2, 'y')), PARTITION p1 VALUES IN ((3, 'z')))"
+	tt := testutils.NewTestTable(t, "diff_list_tuples", authoredSQL)
+
+	live := showCreateTable(t, tt.DB, tt.Name)
+	require.Contains(t, live, "VALUES IN ((1,'x'),(2,'y'))", "precondition: MySQL prints the tuples")
+	source, err := ParseCreateTable(live)
+	require.NoError(t, err)
+	target, err := ParseCreateTable(authoredSQL)
+	require.NoError(t, err)
+	stmts, err := source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Nil(t, stmts)
+
+	requireNoSelfDiff(t, tt.DB, tt.Name)
+}
+
+// TestDiffIntegrationPartitionChangeKeepsRows verifies that a partition
+// change that would leave rows without a partition fails, rather than
+// deleting them. A LIST REORGANIZE PARTITION would delete them silently, so
+// Diff must emit a PARTITION BY.
+func TestDiffIntegrationPartitionChangeKeepsRows(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_part_keep",
+		"CREATE TABLE diff_part_keep (id int NOT NULL, PRIMARY KEY (id)) "+
+			"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3))")
+	testutils.RunSQL(t, "INSERT INTO diff_part_keep VALUES (1), (2), (3)")
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name,
+		"CREATE TABLE diff_part_keep (id int NOT NULL, PRIMARY KEY (id)) "+
+			"PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (3))")
+	require.Len(t, stmts, 1)
+	require.Contains(t, stmts[0].Statement, "PARTITION BY LIST")
+	_, err := tt.DB.ExecContext(t.Context(), stmts[0].Statement)
+	require.ErrorContains(t, err, "1526")
+
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_part_keep").Scan(&count))
+	require.Equal(t, 3, count)
 }
 
 // TestDiffIntegrationTableCollationChangeConverges verifies that changing a
@@ -797,9 +1530,9 @@ func TestDiffIntegrationTableCollationChangeConverges(t *testing.T) {
 
 // TestDiffIntegrationInheritedColumnFollowsNewTableCollation verifies the
 // same convergence when the target column also inherits its table default:
-// the emitted MODIFY carries no explicit COLLATE, and MySQL resolves it
-// against the new table default set by the table-option clause in the same
-// ALTER, so the column lands on the target collation in one apply.
+// the emitted MODIFY names the new table default as the column's collation,
+// so the plan shows the collation the column moves onto, and the column lands
+// on it in one apply.
 func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
 	tt := testutils.NewTestTable(t, "diff_collation_inherit",
 		"CREATE TABLE diff_collation_inherit (id int NOT NULL, name varchar(100), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
@@ -808,7 +1541,7 @@ func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
 
 	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
 	require.Len(t, stmts, 1)
-	require.Equal(t, "ALTER TABLE `diff_collation_inherit` MODIFY COLUMN `name` varchar(100) NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
+	require.Equal(t, "ALTER TABLE `diff_collation_inherit` MODIFY COLUMN `name` varchar(100) COLLATE utf8mb4_general_ci NULL, COLLATE=utf8mb4_general_ci", stmts[0].Statement)
 
 	execStatements(t, tt.DB, stmts)
 	var collation string
@@ -821,6 +1554,66 @@ func TestDiffIntegrationInheritedColumnFollowsNewTableCollation(t *testing.T) {
 	// Re-diff: converged in one apply — nothing left over.
 	stmts = diffLiveTable(t, tt.DB, tt.Name, targetSQL)
 	require.Nil(t, stmts)
+}
+
+// A table created under a server whose utf8mb4 default was
+// utf8mb4_general_ci reports that collation on every column, while the schema
+// file names utf8mb4_0900_ai_ci only as the table default. The MODIFY that
+// converges each column names the collation it moves onto, so the plan does
+// not read as a restatement of the live column, and applying it lands every
+// column on the file's collation in one apply. A column whose MODIFY changes
+// something other than its collation is written without one.
+func TestDiffIntegrationInheritedColumnNamesChangedCollation(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_collation_named",
+		"CREATE TABLE diff_collation_named (id int NOT NULL, sku varchar(15) NOT NULL, note varchar(40), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+
+	const targetSQL = "CREATE TABLE diff_collation_named (id int NOT NULL, sku varchar(15) NOT NULL, note varchar(40), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_named` MODIFY COLUMN `sku` varchar(15) COLLATE utf8mb4_0900_ai_ci NOT NULL, MODIFY COLUMN `note` varchar(40) COLLATE utf8mb4_0900_ai_ci NULL, COLLATE=utf8mb4_0900_ai_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	requireColumnCollations(t, tt.DB, tt.Name, map[string]string{"sku": "utf8mb4_0900_ai_ci", "note": "utf8mb4_0900_ai_ci"})
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+
+	// Widening sku keeps its collation, so the MODIFY names none.
+	const widenedSQL = "CREATE TABLE diff_collation_named (id int NOT NULL, sku varchar(20) NOT NULL, note varchar(40), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	stmts = diffLiveTable(t, tt.DB, tt.Name, widenedSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_collation_named` MODIFY COLUMN `sku` varchar(20) NOT NULL", stmts[0].Statement)
+}
+
+// A table default that moves to another charset moves its inheriting columns
+// with it. The MODIFY names both the charset and the collation the column
+// takes, and applying it converges in one apply.
+func TestDiffIntegrationInheritedColumnNamesChangedCharset(t *testing.T) {
+	tt := testutils.NewTestTable(t, "diff_charset_named",
+		"CREATE TABLE diff_charset_named (id int NOT NULL, label varchar(30), PRIMARY KEY (id)) DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci")
+
+	const targetSQL = "CREATE TABLE diff_charset_named (id int NOT NULL, label varchar(30), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	stmts := diffLiveTable(t, tt.DB, tt.Name, targetSQL)
+	require.Len(t, stmts, 1)
+	require.Equal(t, "ALTER TABLE `diff_charset_named` MODIFY COLUMN `label` varchar(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL, DEFAULT CHARSET=utf8mb4, COLLATE=utf8mb4_0900_ai_ci", stmts[0].Statement)
+
+	execStatements(t, tt.DB, stmts)
+	requireColumnCollations(t, tt.DB, tt.Name, map[string]string{"label": "utf8mb4_0900_ai_ci"})
+	requireConverged(t, tt.DB, tt.Name, targetSQL)
+}
+
+// requireColumnCollations asserts the collation information_schema reports
+// for each named column of tableName.
+func requireColumnCollations(t *testing.T, db *sql.DB, tableName string, want map[string]string) {
+	t.Helper()
+	for column, collation := range want {
+		var got string
+		err := db.QueryRowContext(t.Context(),
+			"SELECT COLLATION_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+			tableName, column).Scan(&got)
+		require.NoError(t, err)
+		assert.Equal(t, collation, got, "collation of %s.%s", tableName, column)
+	}
 }
 
 // A schema file declaring `active BOOLEAN NOT NULL DEFAULT FALSE` and the table
@@ -907,15 +1700,14 @@ func TestDiffIntegrationBooleanKeywordDefaultAcrossFoldingTypes(t *testing.T) {
 }
 
 // The types that store the keyword as something other than 1/0, with the
-// reading that puts each out of scope and the diff it still emits as a result.
-// Asserting the leftover diff alongside the reading is deliberate: a reading on
-// its own does not say whether the exclusion it justifies is the right one, and
-// scaled decimal is excluded for a reason this layer cannot fix — scale padding
-// belongs to numeric canonicalization. binary is excluded here too, because it
-// pads the keyword to the column width; binaryDefaultBytesNormalizer folds it
-// instead, and TestDiffIntegrationBinaryDefaultBytes covers it. year reads the
-// keyword as a year (TRUE stores '2001'); yearDefaultNormalizer folds it, and
-// TestDiffIntegrationYearDefaultCreatedAsDeclared covers it.
+// reading that puts each out of scope of the keyword fold. scaled decimal pads
+// the keyword to its scale, which belongs to numeric canonicalization:
+// numericDefaultNormalizer folds it to the padded value, so the table created
+// from the declaration has nothing left to apply. binary is excluded too,
+// because it pads the keyword to the column width; binaryDefaultBytesNormalizer
+// folds it instead, and TestDiffIntegrationBinaryDefaultBytes covers it. year
+// reads the keyword as a year (TRUE stores '2001'); yearDefaultNormalizer folds
+// it, and TestDiffIntegrationYearDefaultCreatedAsDeclared covers it.
 //
 // enum and set are excluded too but are deliberately not fixtures here. They
 // have no single reading to record: through 8.4 the keyword resolves to a
@@ -932,11 +1724,7 @@ func TestDiffIntegrationBooleanKeywordDefaultOnExcludedTypes(t *testing.T) {
 	live := showCreateTable(t, tt.DB, tt.Name)
 	require.Contains(t, live, "`scaled` decimal(4,2) NOT NULL DEFAULT '1.00'")
 
-	// The table was created from this very declaration, so the statement here
-	// re-stores a value the column already holds.
-	stmts := diffLiveTable(t, tt.DB, tt.Name, declaredSQL)
-	require.Len(t, stmts, 1)
-	require.Contains(t, stmts[0].Statement, "MODIFY COLUMN `scaled`")
+	require.Nil(t, diffLiveTable(t, tt.DB, tt.Name, declaredSQL))
 }
 
 // A ZEROFILL integer's default is stored padded to the display width, so a
@@ -1854,7 +2642,7 @@ func TestDiffIntegrationBinaryDefaultBytesConverges(t *testing.T) {
 	stmts, err := live.Diff(desired, nil)
 	require.NoError(t, err)
 	require.Len(t, stmts, 1)
-	require.Contains(t, stmts[0].Statement, "DEFAULT 'a\\0\\0'")
+	require.Contains(t, stmts[0].Statement, "`a` binary(3) NULL DEFAULT 'a'") // the literal as written; MySQL pads it
 	testutils.RunSQL(t, stmts[0].Statement)
 
 	liveSQL := showCreateTable(t, tt.DB, tt.Name)
@@ -1887,7 +2675,7 @@ func TestDiffIntegrationBinaryDefaultBytesHexConverges(t *testing.T) {
 	stmts, err := live.Diff(desired, nil)
 	require.NoError(t, err)
 	require.Len(t, stmts, 1)
-	require.Contains(t, stmts[0].Statement, "`h` binary(3) NULL DEFAULT x'ff0000'")
+	require.Contains(t, stmts[0].Statement, "`h` binary(3) NULL DEFAULT x'ff'")
 	require.Contains(t, stmts[0].Statement, "`v` varbinary(4) NULL DEFAULT x'ff'")
 	testutils.RunSQL(t, stmts[0].Statement)
 
@@ -2031,10 +2819,10 @@ func TestDiffIntegrationBinaryLiteralDefaultsConverge(t *testing.T) {
 	stmts, err := live.Diff(desired, nil)
 	require.NoError(t, err)
 	require.Len(t, stmts, 1)
-	require.Contains(t, stmts[0].Statement, "`i` int NULL DEFAULT 26")
-	require.Contains(t, stmts[0].Statement, "`b` bit(8) NULL DEFAULT b'1100001'")
-	require.Contains(t, stmts[0].Statement, "`f` bit(1) NOT NULL DEFAULT b'0'")
-	require.Contains(t, stmts[0].Statement, "`v` varchar(4) NULL DEFAULT '\\''")
+	require.Contains(t, stmts[0].Statement, "`i` int NULL DEFAULT x'1a'")
+	require.Contains(t, stmts[0].Statement, "`b` bit(8) NULL DEFAULT x'61'")
+	require.Contains(t, stmts[0].Statement, "`f` bit(1) NOT NULL DEFAULT 0")
+	require.Contains(t, stmts[0].Statement, "`v` varchar(4) NULL DEFAULT x'27'")
 	testutils.RunSQL(t, stmts[0].Statement)
 
 	liveSQL := showCreateTable(t, tt.DB, tt.Name)
@@ -2297,8 +3085,8 @@ func TestDiffIntegrationCharDefaultSpacesConverges(t *testing.T) {
 	stmts, err := live.Diff(desired, nil)
 	require.NoError(t, err)
 	require.Len(t, stmts, 1)
-	require.Contains(t, stmts[0].Statement, "`c` char(4) NULL DEFAULT 'a'")
-	require.Contains(t, stmts[0].Statement, "`v` varchar(4) NULL DEFAULT 'ab  '")
+	require.Contains(t, stmts[0].Statement, "`c` char(4) NULL DEFAULT 'a  '")
+	require.Contains(t, stmts[0].Statement, "`v` varchar(4) NULL DEFAULT 'ab      '")
 	testutils.RunSQL(t, stmts[0].Statement)
 
 	var stored string
@@ -2402,8 +3190,8 @@ func TestDiffIntegrationEnumSetDefaultConverges(t *testing.T) {
 	stmts, err := live.Diff(desired, nil)
 	require.NoError(t, err)
 	require.Len(t, stmts, 1)
-	require.Contains(t, stmts[0].Statement, "`e` enum('a','B') NULL DEFAULT 'B'")
-	require.Contains(t, stmts[0].Statement, "`s` set('a','b','c') NULL DEFAULT 'a,c'")
+	require.Contains(t, stmts[0].Statement, "`e` enum('a','B') NULL DEFAULT 'b '")
+	require.Contains(t, stmts[0].Statement, "`s` set('a','b','c') NULL DEFAULT 'c,a '")
 	testutils.RunSQL(t, stmts[0].Statement)
 
 	var stored string
@@ -2611,6 +3399,423 @@ func TestDiffIntegrationEnumSetMemberSpacesNoTableDefault(t *testing.T) {
 			stmts, err = live.Diff(desired, nil)
 			require.NoError(t, err)
 			require.Nil(t, stmts, "re-diff after applying the ALTER must converge")
+		})
+	}
+}
+
+// TestDiffIntegrationVirtualToRegularKeepsValues verifies, on a populated
+// table, that a VIRTUAL generated column the target makes a regular column
+// keeps the values its expression produced. MySQL refuses the direct MODIFY
+// (error 3106), and a DROP+ADD of the regular column leaves it NULL because a
+// VIRTUAL column holds no data. The diff stages the change through a STORED
+// column, which MySQL fills from the expression and whose values a MODIFY
+// into a regular column keeps (see virtualToRegularIntermediate). Each case
+// also checks that the live table ends up as a direct CREATE of the target
+// and that a second diff is empty.
+func TestDiffIntegrationVirtualToRegularKeepsValues(t *testing.T) {
+	cases := []struct {
+		name   string
+		source string
+		target string
+		query  string // one row; every column must read as want
+		want   []int64
+	}{
+		{
+			name:   "regular column keeps the generated value",
+			source: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) VIRTUAL)",
+			target: "(id INT PRIMARY KEY, c INT, g INT)",
+			query:  "SELECT g FROM t",
+			want:   []int64{41},
+		},
+		{
+			name:   "type and attribute changes ride the second statement",
+			source: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) VIRTUAL)",
+			target: "(id INT PRIMARY KEY, c INT, g BIGINT NOT NULL DEFAULT 0, d INT)",
+			query:  "SELECT g FROM t",
+			want:   []int64{41},
+		},
+		{
+			name:   "the read column can go in the second statement",
+			source: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) VIRTUAL)",
+			target: "(id INT PRIMARY KEY, g INT)",
+			query:  "SELECT g FROM t",
+			want:   []int64{41},
+		},
+		{
+			name:   "a functional index and a CHECK reading the column are re-added",
+			source: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) VIRTUAL, KEY kf ((g + 1)), CONSTRAINT ck CHECK (g > 0))",
+			target: "(id INT PRIMARY KEY, c INT, g INT, KEY kf ((g + 1)), CONSTRAINT ck CHECK (g > 0))",
+			query:  "SELECT g FROM t",
+			want:   []int64{41},
+		},
+		{
+			name:   "a renamed equivalent CHECK is re-added for the column rebuild",
+			source: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) VIRTUAL, CONSTRAINT ck_old CHECK (g > 0))",
+			target: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) STORED, CONSTRAINT ck_new CHECK (g > 0))",
+			query:  "SELECT g FROM t",
+			want:   []int64{41},
+		},
+		{
+			name:   "a dependent generated column is recomputed from the kept value",
+			source: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) VIRTUAL, s INT AS (g + 1) STORED)",
+			target: "(id INT PRIMARY KEY, c INT, g INT, s INT AS (g + 1) STORED)",
+			query:  "SELECT g, s FROM t",
+			want:   []int64{41, 42},
+		},
+		{
+			// The STORED column s reads g, which is rebuilt. Rebuilding s with
+			// it would have dropped its values; the MODIFY keeps them.
+			name:   "a dependent STORED column becoming regular keeps its values",
+			source: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) VIRTUAL, s INT AS (g + 1) STORED)",
+			target: "(id INT PRIMARY KEY, c INT, g INT AS (c + 1) STORED, s INT)",
+			query:  "SELECT g, s FROM t",
+			want:   []int64{41, 42},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, db := testutils.CreateUniqueTestDatabase(t)
+			exec := func(stmt string) {
+				t.Helper()
+				_, err := db.ExecContext(t.Context(), stmt)
+				require.NoError(t, err, "executing: %s", stmt)
+			}
+			exec("CREATE TABLE t " + c.target)
+			expected := showCreateTable(t, db, "t")
+			exec("DROP TABLE t")
+
+			exec("CREATE TABLE t " + c.source)
+			exec("INSERT INTO t (id, c) VALUES (1, 40)")
+			stmts := diffLiveTable(t, db, "t", "CREATE TABLE t "+c.target)
+			require.NotEmpty(t, stmts)
+			execStatements(t, db, stmts)
+
+			got := make([]sql.NullInt64, len(c.want))
+			dest := make([]any, len(got))
+			for i := range got {
+				dest[i] = &got[i]
+			}
+			require.NoError(t, db.QueryRowContext(t.Context(), c.query).Scan(dest...))
+			for i, want := range c.want {
+				assert.Equal(t, sql.NullInt64{Int64: want, Valid: true}, got[i], "column %d of %q", i, c.query)
+			}
+			assert.Equal(t, expected, showCreateTable(t, db, "t"))
+			requireConverged(t, db, "t", "CREATE TABLE t "+c.target)
+		})
+	}
+}
+
+// TestDiffIntegrationFloatDefaultValueAsWritten verifies that the DEFAULT a
+// diff emits on a FLOAT column stores the value the schema's literal names,
+// and that a float is compared by that value, not by the six-significant-digit
+// reading SHOW CREATE TABLE reports. MySQL reports `float DEFAULT 1234567` as
+// '1234570'; 1234567, 1234568 and 1234570 are three different floats under
+// that one report, so emitting the report stored the wrong value and
+// comparing by it hid a change. A literal whose six-digit report reads back
+// as the same float converges. One that does not keeps diffing: the live
+// '1234570' is not 1234567, the MODIFY is emitted again with the literal as
+// written, and applying it stores the same value again. The stored value is
+// read back through CAST(... AS DOUBLE) and compared with a direct CREATE of
+// the target.
+func TestDiffIntegrationFloatDefaultValueAsWritten(t *testing.T) {
+	cases := []struct {
+		literal   string
+		emitted   string // the parser spells a positive exponent with its sign
+		converges bool
+	}{
+		{"0.1", "0.1", true},
+		{"1.23457", "1.23457", true},
+		{"1234570", "1234570", true},
+		{"1e-45", "1e-45", true},
+		{"1e38", "1e+38", true},
+		{"3.4e38", "3.4e+38", true},
+		{"1e15", "1e+15", true},
+		{"1.23456789", "1.23456789", false},
+		{"1234567", "1234567", false},
+		{"0.123456789", "0.123456789", false},
+		{"1.234567e-30", "1.234567e-30", false},
+		{"1.1754944e-38", "1.1754944e-38", false},
+		{"16777217", "16777217", false},
+	}
+	for _, c := range cases {
+		literal := c.literal
+		t.Run(literal, func(t *testing.T) {
+			_, db := testutils.CreateUniqueTestDatabase(t)
+			exec := func(stmt string) {
+				t.Helper()
+				_, err := db.ExecContext(t.Context(), stmt)
+				require.NoError(t, err, "executing: %s", stmt)
+			}
+			storedDefault := func() string {
+				t.Helper()
+				exec("TRUNCATE TABLE t")
+				exec("INSERT INTO t (id) VALUES (1)")
+				var v string
+				require.NoError(t, db.QueryRowContext(t.Context(), "SELECT CAST(f AS DOUBLE) FROM t").Scan(&v))
+				return v
+			}
+			target := "(id INT PRIMARY KEY, f FLOAT DEFAULT " + literal + ")"
+			exec("CREATE TABLE t " + target)
+			expectedCreate := showCreateTable(t, db, "t")
+			expectedValue := storedDefault()
+			exec("DROP TABLE t")
+
+			// Added through a diff, then changed through one.
+			exec("CREATE TABLE t (id INT PRIMARY KEY)")
+			stmts := diffLiveTable(t, db, "t", "CREATE TABLE t "+target)
+			require.Len(t, stmts, 1)
+			assert.Contains(t, stmts[0].Statement, "DEFAULT "+c.emitted, "the literal is emitted as written")
+			execStatements(t, db, stmts)
+			assert.Equal(t, expectedValue, storedDefault())
+			assert.Equal(t, expectedCreate, showCreateTable(t, db, "t"))
+
+			// The residual: converged, or the same MODIFY again, which
+			// changes nothing.
+			requireFloatResidual := func() {
+				t.Helper()
+				residual := diffLiveTable(t, db, "t", "CREATE TABLE t "+target)
+				if c.converges {
+					require.Nil(t, residual, "expected the live table to have converged")
+					return
+				}
+				require.Len(t, residual, 1, "a literal SHOW CREATE TABLE cannot spell keeps diffing")
+				assert.Equal(t, "ALTER TABLE `t` MODIFY COLUMN `f` float NULL DEFAULT "+c.emitted, residual[0].Statement)
+				execStatements(t, db, residual)
+				assert.Equal(t, expectedValue, storedDefault())
+				assert.Equal(t, expectedCreate, showCreateTable(t, db, "t"))
+			}
+			requireFloatResidual()
+
+			exec("ALTER TABLE t MODIFY COLUMN f FLOAT DEFAULT 1")
+			stmts = diffLiveTable(t, db, "t", "CREATE TABLE t "+target)
+			require.Len(t, stmts, 1)
+			execStatements(t, db, stmts)
+			assert.Equal(t, expectedValue, storedDefault())
+			assert.Equal(t, expectedCreate, showCreateTable(t, db, "t"))
+			requireFloatResidual()
+		})
+	}
+}
+
+// TestDiffIntegrationFloatDefaultChangeUnderOneReport verifies that a change
+// between two FLOAT defaults SHOW CREATE TABLE reports alike is still a
+// change: the live `float DEFAULT 1234567` reports as '1234570', the schema
+// now says 1234568, and the diff must emit the MODIFY (a reading that
+// compared the six-digit report would have called them equal) and store the
+// new value.
+func TestDiffIntegrationFloatDefaultChangeUnderOneReport(t *testing.T) {
+	_, db := testutils.CreateUniqueTestDatabase(t)
+	exec := func(stmt string) {
+		t.Helper()
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, "executing: %s", stmt)
+	}
+	storedDefault := func() float64 {
+		t.Helper()
+		exec("TRUNCATE TABLE t")
+		exec("INSERT INTO t (id) VALUES (1)")
+		var v float64
+		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT CAST(f AS DOUBLE) FROM t").Scan(&v))
+		return v
+	}
+	exec("CREATE TABLE t (id INT PRIMARY KEY, f FLOAT DEFAULT 1234567)")
+	require.Contains(t, showCreateTable(t, db, "t"), "DEFAULT '1234570'", "MySQL reports the float with six significant digits")
+	require.InDelta(t, 1234567, storedDefault(), 0)
+
+	stmts := diffLiveTable(t, db, "t", "CREATE TABLE t (id INT PRIMARY KEY, f FLOAT DEFAULT 1234568)")
+	require.Len(t, stmts, 1)
+	assert.Equal(t, "ALTER TABLE `t` MODIFY COLUMN `f` float NULL DEFAULT 1234568", stmts[0].Statement)
+	execStatements(t, db, stmts)
+	assert.InDelta(t, 1234568, storedDefault(), 0)
+	assert.Contains(t, showCreateTable(t, db, "t"), "DEFAULT '1234570'")
+}
+
+// TestDiffIntegrationTemporalDefaultTruncateFractional verifies, under the
+// default sql_mode and under TIME_TRUNCATE_FRACTIONAL, that a temporal
+// DEFAULT a diff emits stores the value MySQL reads for the written literal
+// under the session's own mode, and that temporalDefaultNormalizer reads a
+// fraction past the column's precision only where the two modes agree. MySQL
+// rounds such a fraction by default and truncates it under that mode; the
+// rule cannot see the session of the CREATE, and reading the literal under
+// an assumed mode made a schema compare equal to a value the table did not
+// hold (and emitting the rounded reading stored a value one unit too high
+// under the other mode). A literal whose extra digits round down converges
+// under both modes. One the modes disagree on, including a carry into year
+// 0000 that MySQL stores as the zero date, is left as written: it keeps
+// diffing under both modes, with the MODIFY carrying the literal as written,
+// and applying it again changes nothing.
+func TestDiffIntegrationTemporalDefaultTruncateFractional(t *testing.T) {
+	cases := []struct {
+		name      string
+		target    string
+		converges bool
+	}{
+		{"time", "(id INT PRIMARY KEY, c TIME DEFAULT '12:34:56.9')", false},
+		{"time with precision", "(id INT PRIMARY KEY, c TIME(1) DEFAULT '12:34:56.99')", false},
+		{"datetime", "(id INT PRIMARY KEY, c DATETIME DEFAULT '2024-01-01 23:59:59.9')", false},
+		{"timestamp", "(id INT PRIMARY KEY, c TIMESTAMP NULL DEFAULT '2024-01-01 23:59:59.9')", false},
+		{"date", "(id INT PRIMARY KEY, c DATE DEFAULT '2024-01-01 23:59:59.9')", false},
+		{"time from a number", "(id INT PRIMARY KEY, c TIME DEFAULT 1.55)", false},
+		{"datetime carry into year zero", "(id INT PRIMARY KEY, c DATETIME DEFAULT '0000-12-09 23:59:59.5')", false},
+		{"time below the half", "(id INT PRIMARY KEY, c TIME DEFAULT '12:34:56.4')", true},
+		{"time with precision below the half", "(id INT PRIMARY KEY, c TIME(1) DEFAULT '12:34:56.94')", true},
+		{"datetime below the half", "(id INT PRIMARY KEY, c DATETIME DEFAULT '2024-01-01 23:59:59.4')", true},
+		{"datetime with precision at the seventh digit", "(id INT PRIMARY KEY, c DATETIME(6) DEFAULT '2024-01-01 10:00:00.1234564999')", true},
+		{"date below the half", "(id INT PRIMARY KEY, c DATE DEFAULT '2024-01-01 23:59:59.4')", true},
+		{"time from a number below the half", "(id INT PRIMARY KEY, c TIME(1) DEFAULT 1.54)", true},
+		{"datetime in year zero below the half", "(id INT PRIMARY KEY, c DATETIME DEFAULT '0000-12-09 23:59:59.4')", true},
+	}
+	modes := []struct {
+		name    string
+		sqlMode string
+	}{
+		{"default", ""},
+		{"TIME_TRUNCATE_FRACTIONAL", "SET SESSION sql_mode = CONCAT(@@sql_mode, ',TIME_TRUNCATE_FRACTIONAL')"},
+	}
+	for _, mode := range modes {
+		for _, c := range cases {
+			t.Run(mode.name+"/"+c.name, func(t *testing.T) {
+				dbName, _ := testutils.CreateUniqueTestDatabase(t)
+				// One connection, so the SET SESSION applies to every statement.
+				db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, db.Close()) })
+				db.SetMaxOpenConns(1)
+				exec := func(stmt string) {
+					t.Helper()
+					_, err := db.ExecContext(t.Context(), stmt)
+					require.NoError(t, err, "executing: %s", stmt)
+				}
+				if mode.sqlMode != "" {
+					exec(mode.sqlMode)
+				}
+
+				exec("CREATE TABLE t " + c.target)
+				expected := showCreateTable(t, db, "t")
+				exec("DROP TABLE t")
+
+				exec("CREATE TABLE t (id INT PRIMARY KEY)")
+				stmts := diffLiveTable(t, db, "t", "CREATE TABLE t "+c.target)
+				require.Len(t, stmts, 1)
+				execStatements(t, db, stmts)
+				assert.Equal(t, expected, showCreateTable(t, db, "t"), "the default must be what MySQL reads for the written literal under this session's mode")
+
+				again := diffLiveTable(t, db, "t", "CREATE TABLE t "+c.target)
+				if c.converges {
+					require.Nil(t, again, "a fraction the two modes agree on converges")
+					return
+				}
+				// The documented residual: a literal the two modes store
+				// differently is left as written, so it compares unequal to
+				// the live value under either mode, the same MODIFY is emitted
+				// again, and applying it changes nothing.
+				require.Len(t, again, 1, "a literal MySQL rounds under one sql_mode and truncates under the other keeps diffing; if this converges now, update temporalDefaultNormalizer's doc")
+				assert.Contains(t, again[0].Statement, "MODIFY COLUMN `c` ")
+				assert.Contains(t, again[0].Statement, "DEFAULT "+c.target[strings.LastIndex(c.target, "DEFAULT ")+len("DEFAULT "):len(c.target)-1], "the literal as written")
+				execStatements(t, db, again)
+				assert.Equal(t, expected, showCreateTable(t, db, "t"))
+			})
+		}
+	}
+}
+
+// TestDiffIntegrationExpressionDefaultIntroducerValues verifies that an
+// expression default whose charset introducer decides its value stores, when
+// added through a diff, the value a direct CREATE of the target stores, and
+// that the introducer is kept whatever reads the literal. The diff used to
+// fold an ASCII latin1 (or utf8mb3) literal to the bare literal everywhere
+// but beneath COLLATE, CHARSET(), COLLATION() and WEIGHT_STRING(), which
+// changed CHARSET(_latin1'a') from 'latin1' to 'utf8mb4', made
+// CONCAT(_latin1'a') COLLATE latin1_bin error 1253, and would have changed
+// UPPER(_latin5'i') from 'İ' to 'I' and STRCMP(_latin1'a', _latin1'a ') from
+// 0 to -1 (a PAD SPACE collation against a NO PAD one): an ASCII literal's
+// introducer can decide the value under any function.
+func TestDiffIntegrationExpressionDefaultIntroducerValues(t *testing.T) {
+	for _, expr := range []string{
+		"CHARSET(_latin1'a')",
+		"COLLATION(_utf8mb3'a')",
+		"CONCAT(_latin1'a') COLLATE latin1_bin",
+		"HEX(WEIGHT_STRING(_latin1'a'))",
+		"CHARSET(IF(id, _latin1'a', _latin1'b'))",
+		"UPPER(_latin5'i')",
+		"UPPER(_latin1'a')",
+		"STRCMP(_latin1'a', _latin1'a ')",
+		"STRCMP(_utf8mb3'a', _utf8mb3'a ')",
+		"LENGTH(_utf8mb3'a')",
+	} {
+		t.Run(expr, func(t *testing.T) {
+			_, db := testutils.CreateUniqueTestDatabase(t)
+			exec := func(stmt string) {
+				t.Helper()
+				_, err := db.ExecContext(t.Context(), stmt)
+				require.NoError(t, err, "executing: %s", stmt)
+			}
+			storedDefault := func() string {
+				t.Helper()
+				exec("TRUNCATE TABLE t")
+				exec("INSERT INTO t (id) VALUES (1)")
+				var v string
+				require.NoError(t, db.QueryRowContext(t.Context(), "SELECT c FROM t").Scan(&v))
+				return v
+			}
+			target := "(id INT PRIMARY KEY, c VARCHAR(64) DEFAULT (" + expr + "))"
+			exec("CREATE TABLE t " + target)
+			expectedCreate := showCreateTable(t, db, "t")
+			expectedValue := storedDefault()
+			exec("DROP TABLE t")
+
+			exec("CREATE TABLE t (id INT PRIMARY KEY)")
+			stmts := diffLiveTable(t, db, "t", "CREATE TABLE t "+target)
+			require.Len(t, stmts, 1)
+			execStatements(t, db, stmts)
+			assert.Equal(t, expectedValue, storedDefault(), "the expression default must keep its introducer: %s", stmts[0].Statement)
+			assert.Equal(t, expectedCreate, showCreateTable(t, db, "t"))
+			requireConverged(t, db, "t", "CREATE TABLE t "+target)
+		})
+	}
+}
+
+// TestDiffIntegrationExpressionGroupingValues verifies that an expression
+// whose operand grouping decides its value stores, when added through a diff,
+// the value a direct CREATE of the target stores. The diff used to regroup a
+// nested bitwise operator the way it regroups a nested AND, and MySQL
+// evaluates & | ^ on binary strings when both operands are binary strings and
+// on integers otherwise, so _binary'12' & (_binary'21' & 7) is 4 where the
+// regrouped (_binary'12' & _binary'21') & 7 is 0.
+func TestDiffIntegrationExpressionGroupingValues(t *testing.T) {
+	for _, expr := range []string{
+		"_binary'12' & (_binary'21' & 7)",
+		"_binary'12' | (_binary'21' | 7)",
+		"_binary'12' ^ (_binary'21' ^ 7)",
+	} {
+		t.Run(expr, func(t *testing.T) {
+			_, db := testutils.CreateUniqueTestDatabase(t)
+			exec := func(stmt string) {
+				t.Helper()
+				_, err := db.ExecContext(t.Context(), stmt)
+				require.NoError(t, err, "executing: %s", stmt)
+			}
+			storedDefault := func() string {
+				t.Helper()
+				exec("TRUNCATE TABLE t")
+				exec("INSERT INTO t (id) VALUES (1)")
+				var v string
+				require.NoError(t, db.QueryRowContext(t.Context(), "SELECT c FROM t").Scan(&v))
+				return v
+			}
+			target := "(id INT PRIMARY KEY, c INT DEFAULT (" + expr + "))"
+			exec("CREATE TABLE t " + target)
+			expectedCreate := showCreateTable(t, db, "t")
+			expectedValue := storedDefault()
+			exec("DROP TABLE t")
+
+			exec("CREATE TABLE t (id INT PRIMARY KEY)")
+			stmts := diffLiveTable(t, db, "t", "CREATE TABLE t "+target)
+			require.Len(t, stmts, 1)
+			execStatements(t, db, stmts)
+			assert.Equal(t, expectedValue, storedDefault(), "the expression default must keep its grouping: %s", stmts[0].Statement)
+			assert.Equal(t, expectedCreate, showCreateTable(t, db, "t"))
+			requireConverged(t, db, "t", "CREATE TABLE t "+target)
 		})
 	}
 }

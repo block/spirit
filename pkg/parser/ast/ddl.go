@@ -2354,11 +2354,13 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 			return fmt.Errorf("invalid TableOption: TableOptionRowFormat: %d", n.UintValue)
 		}
 	case TableOptionStatsPersistent:
-		// TODO: not support
 		ctx.WriteKeyWord("STATS_PERSISTENT ")
 		ctx.WritePlain("= ")
-		ctx.WriteKeyWord("DEFAULT")
-		ctx.WritePlain(" /* TableOptionStatsPersistent is not supported */ ")
+		if n.Default {
+			ctx.WriteKeyWord("DEFAULT")
+		} else {
+			ctx.WritePlainf("%d", n.UintValue)
+		}
 	case TableOptionStatsAutoRecalc:
 		ctx.WriteKeyWord("STATS_AUTO_RECALC ")
 		ctx.WritePlain("= ")
@@ -2368,11 +2370,13 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 			ctx.WritePlainf("%d", n.UintValue)
 		}
 	case TableOptionPackKeys:
-		// TODO: not support
 		ctx.WriteKeyWord("PACK_KEYS ")
 		ctx.WritePlain("= ")
-		ctx.WriteKeyWord("DEFAULT")
-		ctx.WritePlain(" /* TableOptionPackKeys is not supported */ ")
+		if n.Default {
+			ctx.WriteKeyWord("DEFAULT")
+		} else {
+			ctx.WritePlainf("%d", n.UintValue)
+		}
 	case TableOptionTablespace:
 		ctx.WriteKeyWord("TABLESPACE ")
 		ctx.WritePlain("= ")

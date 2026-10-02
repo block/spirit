@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -275,6 +276,143 @@ func TestDeclarativeToImperative_OrderingCreateAlterBeforeDrop(t *testing.T) {
 	require.Contains(t, changes[1].Statement, "ALTER TABLE")
 	require.Contains(t, changes[2].Statement, "DROP TABLE")
 	require.Contains(t, changes[3].Statement, "DROP TABLE")
+}
+
+// TestDeclarativeToImperative_CreateOrderFollowsForeignKeys verifies that a
+// new table is created after the new tables its foreign keys reference, even
+// when alphabetical order says otherwise: MySQL refuses to create a child
+// whose parent does not exist yet (error 1824).
+func TestDeclarativeToImperative_CreateOrderFollowsForeignKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		desired []table.TableSchema
+		want    []string // table names in CREATE order
+	}{
+		{
+			name: "child named before parent",
+			desired: []table.TableSchema{
+				{Name: "a_child", Schema: "CREATE TABLE a_child (id INT PRIMARY KEY, pid INT, CONSTRAINT fk FOREIGN KEY (pid) REFERENCES b_parent (id))"},
+				{Name: "b_parent", Schema: "CREATE TABLE b_parent (id INT PRIMARY KEY)"},
+			},
+			want: []string{"b_parent", "a_child"},
+		},
+		{
+			name: "chain of three",
+			desired: []table.TableSchema{
+				{Name: "a", Schema: "CREATE TABLE a (id INT PRIMARY KEY, bid INT, CONSTRAINT fk_a FOREIGN KEY (bid) REFERENCES b (id))"},
+				{Name: "b", Schema: "CREATE TABLE b (id INT PRIMARY KEY, cid INT, CONSTRAINT fk_b FOREIGN KEY (cid) REFERENCES c (id))"},
+				{Name: "c", Schema: "CREATE TABLE c (id INT PRIMARY KEY)"},
+			},
+			want: []string{"c", "b", "a"},
+		},
+		{
+			name: "unrelated tables stay alphabetical",
+			desired: []table.TableSchema{
+				{Name: "c", Schema: "CREATE TABLE c (id INT PRIMARY KEY)"},
+				{Name: "a", Schema: "CREATE TABLE a (id INT PRIMARY KEY)"},
+				{Name: "b", Schema: "CREATE TABLE b (id INT PRIMARY KEY)"},
+			},
+			want: []string{"a", "b", "c"},
+		},
+		{
+			name: "self reference imposes no order",
+			desired: []table.TableSchema{
+				{Name: "b_tree", Schema: "CREATE TABLE b_tree (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk FOREIGN KEY (parent_id) REFERENCES b_tree (id))"},
+				{Name: "a", Schema: "CREATE TABLE a (id INT PRIMARY KEY)"},
+			},
+			want: []string{"a", "b_tree"},
+		},
+		{
+			name: "reference to an existing table imposes no order",
+			desired: []table.TableSchema{
+				{Name: "b", Schema: "CREATE TABLE b (id INT PRIMARY KEY)"},
+				{Name: "a", Schema: "CREATE TABLE a (id INT PRIMARY KEY, xid INT, CONSTRAINT fk FOREIGN KEY (xid) REFERENCES existing (id))"},
+			},
+			want: []string{"a", "b"},
+		},
+		{
+			// MySQL cannot create either table of a cycle without
+			// FOREIGN_KEY_CHECKS=0; the output is still complete and
+			// deterministic.
+			name: "cycle falls back to alphabetical",
+			desired: []table.TableSchema{
+				{Name: "b", Schema: "CREATE TABLE b (id INT PRIMARY KEY, aid INT, CONSTRAINT fk_b FOREIGN KEY (aid) REFERENCES a (id))"},
+				{Name: "a", Schema: "CREATE TABLE a (id INT PRIMARY KEY, bid INT, CONSTRAINT fk_a FOREIGN KEY (bid) REFERENCES b (id))"},
+			},
+			want: []string{"a", "b"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changes, err := DeclarativeToImperative(nil, tt.desired, nil)
+			require.NoError(t, err)
+			var got []string
+			for _, ch := range changes {
+				require.True(t, ch.IsCreateTable(), ch.Statement)
+				got = append(got, ch.Table)
+			}
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestDeclarativeToImperative_DropOrderFollowsForeignKeys verifies that a
+// table is dropped before the tables that reference it: MySQL refuses to drop
+// a parent while a child still references it (error 3730). The order comes
+// from the current schemas, so a current schema that does not parse keeps
+// its DROP and only its place in the order.
+func TestDeclarativeToImperative_DropOrderFollowsForeignKeys(t *testing.T) {
+	current := []table.TableSchema{
+		{Name: "a_parent", Schema: "CREATE TABLE a_parent (id INT PRIMARY KEY)"},
+		{Name: "b_child", Schema: "CREATE TABLE b_child (id INT PRIMARY KEY, pid INT, CONSTRAINT fk_b FOREIGN KEY (pid) REFERENCES a_parent (id))"},
+		{Name: "c_grandchild", Schema: "CREATE TABLE c_grandchild (id INT PRIMARY KEY, cid INT, CONSTRAINT fk_c FOREIGN KEY (cid) REFERENCES b_child (id))"},
+		{Name: "d_unparsed", Schema: "not a create table"},
+		{Name: "e_kept", Schema: "CREATE TABLE e_kept (id INT PRIMARY KEY, pid INT, CONSTRAINT fk_e FOREIGN KEY (pid) REFERENCES a_parent (id))"},
+	}
+	desired := []table.TableSchema{
+		// The surviving child drops its reference first (ALTER before DROP).
+		{Name: "e_kept", Schema: "CREATE TABLE e_kept (id INT PRIMARY KEY, pid INT)"},
+	}
+	changes, err := DeclarativeToImperative(current, desired, nil)
+	require.NoError(t, err)
+	got := statementsToStrings(changes)
+	require.Equal(t, []string{
+		"ALTER TABLE `e_kept` DROP FOREIGN KEY `fk_e`",
+		"DROP TABLE `c_grandchild`",
+		"DROP TABLE `b_child`",
+		"DROP TABLE `a_parent`",
+		"DROP TABLE `d_unparsed`",
+	}, got)
+}
+
+// TestDeclarativeToImperativeMySQLForeignKeyOrder runs the emitted statements
+// against MySQL: the creates in order, then the drops in order. Alphabetical
+// order would fail both ways (errors 1824 and 3730).
+func TestDeclarativeToImperativeMySQLForeignKeyOrder(t *testing.T) {
+	_, db := testutils.CreateUniqueTestDatabase(t)
+	desired := []table.TableSchema{
+		{Name: "a_child", Schema: "CREATE TABLE a_child (id INT PRIMARY KEY, pid INT, KEY pid (pid), CONSTRAINT fk_a FOREIGN KEY (pid) REFERENCES b_parent (id))"},
+		{Name: "b_parent", Schema: "CREATE TABLE b_parent (id INT PRIMARY KEY, gid INT, KEY gid (gid), CONSTRAINT fk_b FOREIGN KEY (gid) REFERENCES c_grandparent (id))"},
+		{Name: "c_grandparent", Schema: "CREATE TABLE c_grandparent (id INT PRIMARY KEY)"},
+	}
+
+	creates, err := DeclarativeToImperative(nil, desired, nil)
+	require.NoError(t, err)
+	require.Len(t, creates, 3)
+	execStatements(t, db, creates)
+
+	current := make([]table.TableSchema, 0, len(desired))
+	for _, want := range desired {
+		current = append(current, table.TableSchema{Name: want.Name, Schema: showCreateTable(t, db, want.Name)})
+	}
+	drops, err := DeclarativeToImperative(current, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, drops, 3)
+	execStatements(t, db, drops)
+
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()").Scan(&count))
+	require.Zero(t, count)
 }
 
 func TestToTableSchema(t *testing.T) {

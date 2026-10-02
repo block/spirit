@@ -59,9 +59,9 @@ func TestBitDefaultLeavesOtherDefaultsAlone(t *testing.T) {
 	}
 }
 
-// A different default must still diff, and the MODIFY must carry the bit
-// literal MySQL stores.
+// A different default must still diff, and the MODIFY carries the literal as
+// written; the bit literal MySQL reports is the compared reading only.
 func TestBitDefaultStillDiffsRealChanges(t *testing.T) {
-	requireDefaultStillDiffs(t, "`b` bit(8) DEFAULT x'62'", "`b` bit(8) DEFAULT b'1100001'", "MODIFY COLUMN `b` bit(8) NULL DEFAULT b'1100010'")
-	requireDefaultStillDiffs(t, "`b` bit(1) DEFAULT 1", "`b` bit(1)", "MODIFY COLUMN `b` bit(1) NULL DEFAULT b'1'")
+	requireDefaultStillDiffs(t, "`b` bit(8) DEFAULT x'62'", "`b` bit(8) DEFAULT b'1100001'", "MODIFY COLUMN `b` bit(8) NULL DEFAULT x'62'")
+	requireDefaultStillDiffs(t, "`b` bit(1) DEFAULT 1", "`b` bit(1)", "MODIFY COLUMN `b` bit(1) NULL DEFAULT 1")
 }

@@ -1111,6 +1111,13 @@ func TestLoadDataExtensions(t *testing.T) {
 
 func TestTableOptionValueForms(t *testing.T) {
 	table := []testCase{
+		// Keep explicit false distinct from the default through Restore.
+		{"CREATE TABLE t2 (a INT) STATS_PERSISTENT=0", true, "CREATE TABLE `t2` (`a` INT) STATS_PERSISTENT = 0"},
+		{"CREATE TABLE t2 (a INT) STATS_PERSISTENT=1", true, "CREATE TABLE `t2` (`a` INT) STATS_PERSISTENT = 1"},
+		{"CREATE TABLE t2 (a INT) STATS_PERSISTENT=DEFAULT", true, "CREATE TABLE `t2` (`a` INT) STATS_PERSISTENT = DEFAULT"},
+		{"CREATE TABLE t2 (a INT) PACK_KEYS=0", true, "CREATE TABLE `t2` (`a` INT) PACK_KEYS = 0"},
+		{"CREATE TABLE t2 (a INT) PACK_KEYS=1", true, "CREATE TABLE `t2` (`a` INT) PACK_KEYS = 1"},
+		{"CREATE TABLE t2 (a INT) PACK_KEYS=DEFAULT", true, "CREATE TABLE `t2` (`a` INT) PACK_KEYS = DEFAULT"},
 		// AUTOEXTEND_SIZE takes a plain byte count as well as '4M'-style
 		// strings ("4M" unquoted lexes as an identifier).
 		{"CREATE TABLE t2 (a INT) AUTOEXTEND_SIZE = 4194304", true, "CREATE TABLE `t2` (`a` INT) AUTOEXTEND_SIZE = 4194304"},

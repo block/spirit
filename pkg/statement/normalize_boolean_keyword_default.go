@@ -30,7 +30,8 @@ func init() { registerNormalizer(booleanKeywordDefaultNormalizer{}) }
 //
 //   - scaled decimal, which pads the default to the column's scale:
 //     decimal(4,2) DEFAULT TRUE stores '1.00'. An unscaled decimal has nothing
-//     to pad and does fold. Canonicalizing numeric scale is a separate rule.
+//     to pad and does fold. numericDefaultNormalizer folds the scaled case to
+//     the padded value.
 //   - year, which puts the keyword through YEAR's own interpretation:
 //     year DEFAULT TRUE stores '2001', not 1. [yearDefaultNormalizer] folds
 //     it to that year instead.

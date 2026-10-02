@@ -188,7 +188,7 @@ func TestFunctionAliasNormalization(t *testing.T) {
 			sql: "CREATE TABLE t (id int NOT NULL, dt date NOT NULL, PRIMARY KEY (id, dt)) " +
 				"PARTITION BY RANGE (YEAR(dt)) SUBPARTITION BY HASH (DAY(dt)) SUBPARTITIONS 2 " +
 				"(PARTITION p0 VALUES LESS THAN (2020), PARTITION p1 VALUES LESS THAN MAXVALUE)",
-			wantExpr: "dayofmonth(`dt`)",
+			wantExpr: "DAYOFMONTH(`dt`)",
 			get:      func(ct *CreateTable) *string { return ct.Partition.SubPartition.Expression },
 		},
 		{
@@ -235,12 +235,12 @@ func TestFunctionAliasConverges(t *testing.T) {
 		{
 			name:     "vector default",
 			authored: "CREATE TABLE t (id int NOT NULL PRIMARY KEY, v vector(3) DEFAULT (STRING_TO_VECTOR('[1,2,3]')))",
-			live:     "CREATE TABLE t (id int NOT NULL PRIMARY KEY, v vector(3) DEFAULT (to_vector(_latin1'[1,2,3]')))",
+			live:     "CREATE TABLE t (id int NOT NULL PRIMARY KEY, v vector(3) DEFAULT (to_vector(_utf8mb4'[1,2,3]')))",
 		},
 		{
-			name:     "expression default with a charset introducer",
+			name:     "expression default with the session's introducer",
 			authored: "CREATE TABLE t (id int NOT NULL PRIMARY KEY, c varchar(10) DEFAULT (LCASE('AB')))",
-			live:     "CREATE TABLE t (id int NOT NULL PRIMARY KEY, c varchar(10) DEFAULT (lower(_latin1'AB')))",
+			live:     "CREATE TABLE t (id int NOT NULL PRIMARY KEY, c varchar(10) DEFAULT (lower(_utf8mb4'AB')))",
 		},
 		{
 			name:     "timestamp expression default",
@@ -335,8 +335,8 @@ func TestRoundTrip_FunctionAliases(t *testing.T) {
 		},
 		// A subpartitioned table has no live case here: diffPartitions does not
 		// compare subpartitioning at all, so such a table re-emits a
-		// REMOVE PARTITIONING + PARTITION BY pair (which also drops the
-		// SUBPARTITION clause) whatever the expressions say. The rule's effect
+		// repartition (which also drops the SUBPARTITION clause) whatever
+		// the expressions say. The rule's effect
 		// on SubPartition.Expression is covered by the unit test above.
 		{
 			name:     "string_to_vector",

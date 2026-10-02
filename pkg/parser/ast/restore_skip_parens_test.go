@@ -93,6 +93,13 @@ func TestRestoreSkipRedundantParentheses(t *testing.T) {
 		// change a finite-precision result.
 		{"a + (b + c)", "`a`+(`b`+`c`)"},
 		{"a * (b * c)", "`a`*(`b`*`c`)"},
+		// So are the bitwise operators, which MySQL evaluates on binary strings
+		// when both operands are binary strings and on integers otherwise:
+		// _binary'12' & (_binary'21' & 7) is 4, (_binary'12' & _binary'21') & 7
+		// is 0.
+		{"a & (b & c)", "`a`&(`b`&`c`)"},
+		{"a | (b | c)", "`a`|(`b`|`c`)"},
+		{"a ^ (b ^ c)", "`a`^(`b`^`c`)"},
 		// (The operators that do regroup safely are covered by
 		// TestRestoreSkipRedundantParenthesesRegroups.)
 		// Mixing operators of equal precedence is not regrouping-safe.
@@ -178,11 +185,13 @@ func TestRestoreSkipRedundantParentheses(t *testing.T) {
 	}
 }
 
-// TestRestoreSkipRedundantParenthesesRegroups covers the operators whose
+// TestRestoreSkipRedundantParenthesesRegroups covers the two operators whose
 // same-precedence right child may drop its parentheses. Unlike every other
 // case, these deliberately change the parse structure — `a AND (b AND c)`
 // becomes the left-nested `a AND b AND c` — which is only sound because the
-// operator is associative in SQL, so the value of the expression is unchanged.
+// operator is associative under MySQL's evaluation, so the value of the
+// expression is unchanged (see isAssociativeRestoreOp for the ones that are
+// not).
 func TestRestoreSkipRedundantParenthesesRegroups(t *testing.T) {
 	cases := []struct {
 		source string
@@ -190,9 +199,6 @@ func TestRestoreSkipRedundantParenthesesRegroups(t *testing.T) {
 	}{
 		{"a AND (b AND c)", "`a` AND `b` AND `c`"},
 		{"a OR (b OR c)", "`a` OR `b` OR `c`"},
-		{"a & (b & c)", "`a`&`b`&`c`"},
-		{"a | (b | c)", "`a`|`b`|`c`"},
-		{"a ^ (b ^ c)", "`a`^`b`^`c`"},
 	}
 
 	p := parser.New()

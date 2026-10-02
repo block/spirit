@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // DeclarativeToImperative compares current and desired schemas and returns the
@@ -17,12 +18,20 @@ import (
 // definitions, compute the minimal set of changes. It is used by spirit's diff
 // subcommand, strata, and GAP.
 //
-// The returned statements are ordered as CREATE → ALTER → DROP (within each
-// group, tables are sorted alphabetically). This ordering is a correctness
-// property: it ensures the output is safe to execute sequentially (e.g. an
-// ALTER that adds a foreign key referencing a newly-created table will run
-// after the CREATE, and a table referenced by a FK won't be dropped before
-// the referencing ALTER runs).
+// The returned statements are ordered as CREATE → ALTER → DROP. This ordering
+// is a correctness property: it ensures the output is safe to execute
+// sequentially (e.g. an ALTER that adds a foreign key referencing a
+// newly-created table will run after the CREATE, and a table referenced by a
+// FK won't be dropped before the referencing ALTER runs). Within the CREATE
+// and DROP groups, tables follow their foreign keys: a table is created after
+// the tables its foreign keys reference (MySQL error 1824 otherwise) and
+// dropped before the tables that reference it (error 3730). Tables with no
+// such dependency between them are sorted alphabetically, and ALTERs always
+// are. A reference is matched by table name alone; a reference to a table
+// outside the group, or a table's reference to itself, imposes no order. Two
+// orders the output cannot satisfy are left to MySQL: a cycle of references
+// among new tables (MySQL creates neither table without FOREIGN_KEY_CHECKS=0)
+// and an ALTER that depends on another table's ALTER.
 //
 // If opts is nil, NewDiffOptions() defaults are used for table diffs.
 func DeclarativeToImperative(current, desired []table.TableSchema, opts *DiffOptions) ([]*AbstractStatement, error) {
@@ -41,6 +50,11 @@ func DeclarativeToImperative(current, desired []table.TableSchema, opts *DiffOpt
 	var creates []*AbstractStatement
 	var alters []*AbstractStatement
 	var drops []*AbstractStatement
+
+	// New tables are collected first and emitted parent before child.
+	var createNames []string
+	createStmts := make(map[string][]*AbstractStatement)
+	createDeps := make(map[string][]string)
 
 	// Tables in desired: create if new, diff if existing.
 	for _, name := range desiredNames {
@@ -63,8 +77,10 @@ func DeclarativeToImperative(current, desired []table.TableSchema, opts *DiffOpt
 				if err := checkPrimaryKeyNullability(ct); err != nil {
 					return nil, fmt.Errorf("invalid desired schema for table %q: %w", name, err)
 				}
+				createDeps[name] = append(createDeps[name], referencedTables(ct)...)
 			}
-			creates = append(creates, stmts...)
+			createNames = append(createNames, name)
+			createStmts[name] = stmts
 			continue
 		}
 
@@ -76,7 +92,14 @@ func DeclarativeToImperative(current, desired []table.TableSchema, opts *DiffOpt
 		alters = append(alters, diffs...)
 	}
 
-	// Tables in current but not in desired — emit DROP TABLE.
+	for _, name := range utils.TopologicalOrder(createNames, createDeps) {
+		creates = append(creates, createStmts[name]...)
+	}
+
+	// Tables in current but not in desired — emit DROP TABLE, child before
+	// parent. A dropped table's dependencies come from its current schema;
+	// the DROP itself needs no definition, so a schema that does not parse
+	// only loses its place in the order.
 	dropNames := make([]string, 0)
 	for name := range currentMap {
 		if _, exists := desiredMap[name]; !exists {
@@ -84,8 +107,18 @@ func DeclarativeToImperative(current, desired []table.TableSchema, opts *DiffOpt
 		}
 	}
 	slices.Sort(dropNames)
-
+	droppedBefore := make(map[string][]string)
 	for _, name := range dropNames {
+		ct, err := ParseCreateTable(currentMap[name].Schema)
+		if err != nil {
+			continue
+		}
+		for _, parent := range referencedTables(ct) {
+			droppedBefore[parent] = append(droppedBefore[parent], name)
+		}
+	}
+
+	for _, name := range utils.TopologicalOrder(dropNames, droppedBefore) {
 		stmts, err := New(fmt.Sprintf("DROP TABLE %s", sqlescape.EscapeIdentifier(name)))
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse DROP TABLE for %q: %w", name, err)
@@ -99,6 +132,19 @@ func DeclarativeToImperative(current, desired []table.TableSchema, opts *DiffOpt
 	result = append(result, alters...)
 	result = append(result, drops...)
 	return result, nil
+}
+
+// referencedTables returns the names of the tables ct's foreign keys
+// reference, without their schema: DeclarativeToImperative orders one
+// schema's tables, which carry no schema of their own to compare against.
+func referencedTables(ct *CreateTable) []string {
+	var names []string
+	for i := range ct.Constraints {
+		if ref := ct.Constraints[i].References; ref != nil {
+			names = append(names, ref.Table)
+		}
+	}
+	return names
 }
 
 // diffTable computes the ALTER TABLE diff for a single table, recovering from

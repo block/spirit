@@ -46,6 +46,74 @@ func TestPartitioningSyntax(t *testing.T) {
 	require.NoError(t, m.Close())
 }
 
+// TestPartitionChangeShapes runs each shape of partition ALTER that
+// statement.Diff emits through a migration: a PARTITION BY or REMOVE
+// PARTITIONING after other clauses (space-separated, no comma), a REORGANIZE
+// PARTITION, and an ADD PARTITION, which runs in place.
+func TestPartitionChangeShapes(t *testing.T) {
+	t.Parallel()
+	const rangeTable = `CREATE TABLE %s (
+		id INT NOT NULL PRIMARY KEY,
+		name varchar(255) NOT NULL
+	) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (100), PARTITION pmax VALUES LESS THAN MAXVALUE)`
+	tests := []struct {
+		name    string
+		alter   string
+		inplace bool
+		expect  string
+	}{
+		{
+			name:   "partshapet1",
+			alter:  "ADD COLUMN c INT PARTITION BY KEY (id) PARTITIONS 3",
+			expect: "PARTITION BY KEY (id)",
+		},
+		{
+			name:   "partshapet2",
+			alter:  "ADD COLUMN c INT REMOVE PARTITIONING",
+			expect: "`c` int",
+		},
+		{
+			name:   "partshapet3",
+			alter:  "REORGANIZE PARTITION pmax INTO (PARTITION p1 VALUES LESS THAN (200), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			expect: "PARTITION p1 VALUES LESS THAN (200)",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, tc.name, fmt.Sprintf(rangeTable, tc.name))
+			testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s VALUES (1, 'a'), (150, 'b'), (250, 'c')", tc.name))
+
+			m := NewTestRunner(t, tc.name, tc.alter)
+			require.NoError(t, m.Run(t.Context()))
+			require.False(t, m.usedInplaceDDL)
+			require.NoError(t, m.Close())
+
+			var tableName, createTable string
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE "+tc.name).Scan(&tableName, &createTable))
+			require.Contains(t, createTable, tc.expect)
+			var count int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+tc.name).Scan(&count))
+			require.Equal(t, 3, count)
+		})
+	}
+
+	t.Run("partshapet4", func(t *testing.T) {
+		tt := testutils.NewTestTable(t, "partshapet4", `CREATE TABLE partshapet4 (
+			id INT NOT NULL PRIMARY KEY,
+			name varchar(255) NOT NULL
+		) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (100))`)
+
+		m := NewTestRunner(t, "partshapet4", "ADD PARTITION (PARTITION p1 VALUES LESS THAN (200))")
+		require.NoError(t, m.Run(t.Context()))
+		require.True(t, m.usedInplaceDDL, "appending a RANGE partition is metadata-only")
+		require.NoError(t, m.Close())
+
+		var tableName, createTable string
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE partshapet4").Scan(&tableName, &createTable))
+		require.Contains(t, createTable, "PARTITION p1 VALUES LESS THAN (200)")
+	})
+}
+
 func TestVarbinary(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "varbinaryt1", `CREATE TABLE varbinaryt1 (

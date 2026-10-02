@@ -124,7 +124,8 @@ func TestCharDefaultSpacesLeavesOtherDefaultsAlone(t *testing.T) {
 }
 
 // A default that is genuinely different must still diff, and the emitted MODIFY
-// carries the value MySQL reports back.
+// carries the literal as written; the value MySQL reports back is the compared
+// reading only.
 func TestCharDefaultSpacesStillDiffsRealChanges(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -136,7 +137,7 @@ func TestCharDefaultSpacesStillDiffsRealChanges(t *testing.T) {
 			name:     "a different string",
 			declared: "`b` char(4) DEFAULT 'b  '",
 			live:     "`b` char(4) DEFAULT 'a'",
-			want:     "MODIFY COLUMN `b` char(4) NULL DEFAULT 'b'",
+			want:     "MODIFY COLUMN `b` char(4) NULL DEFAULT 'b  '",
 		},
 		{
 			name:     "a leading space added",
@@ -148,13 +149,13 @@ func TestCharDefaultSpacesStillDiffsRealChanges(t *testing.T) {
 			name:     "a default added to a column that had none",
 			declared: "`b` char(4) DEFAULT 'a  '",
 			live:     "`b` char(4)",
-			want:     "MODIFY COLUMN `b` char(4) NULL DEFAULT 'a'",
+			want:     "MODIFY COLUMN `b` char(4) NULL DEFAULT 'a  '",
 		},
 		{
 			name:     "a char default of spaces is the empty string, not NULL",
 			declared: "`b` char(4) DEFAULT '  '",
 			live:     "`b` char(4) DEFAULT NULL",
-			want:     "MODIFY COLUMN `b` char(4) NULL DEFAULT ''",
+			want:     "MODIFY COLUMN `b` char(4) NULL DEFAULT '  '",
 		},
 		{
 			name:     "char to varchar keeps the spaces",
@@ -172,7 +173,7 @@ func TestCharDefaultSpacesStillDiffsRealChanges(t *testing.T) {
 			name:     "a varchar width change cuts to the new width",
 			declared: "`b` varchar(3) CHARACTER SET utf8mb4 DEFAULT 'ab    '",
 			live:     "`b` varchar(4) CHARACTER SET utf8mb4 DEFAULT 'ab  '",
-			want:     "MODIFY COLUMN `b` varchar(3) CHARACTER SET utf8mb4 NULL DEFAULT 'ab '",
+			want:     "MODIFY COLUMN `b` varchar(3) CHARACTER SET utf8mb4 NULL DEFAULT 'ab    '",
 		},
 	}
 	for _, tt := range tests {

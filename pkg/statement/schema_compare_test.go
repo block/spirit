@@ -86,13 +86,13 @@ func TestDiffCreateTables(t *testing.T) {
 // single statement, so merging the two into one comma-joined ALTER would emit
 // SQL that silently fails to reconcile the schemas.
 func TestDiffCreateTablesKeepsStatementBoundaries(t *testing.T) {
-	want := "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b VARCHAR(255), KEY idx_b (b) KEY_BLOCK_SIZE=8)"
-	got := "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b VARCHAR(255), KEY idx_b (b) KEY_BLOCK_SIZE=4)"
+	want := "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b VARCHAR(255), KEY idx_b (b) KEY_BLOCK_SIZE=8) ROW_FORMAT=COMPRESSED"
+	got := "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b VARCHAR(255), KEY idx_b (b) KEY_BLOCK_SIZE=4) ROW_FORMAT=COMPRESSED"
 
 	diff, err := DiffCreateTables("t1", want, got, nil)
 	require.NoError(t, err)
 	require.Equal(t,
-		"ALTER TABLE `t1` DROP INDEX `idx_b`; ALTER TABLE `t1` ADD INDEX `idx_b` (`b`) KEY_BLOCK_SIZE=8",
+		"ALTER TABLE `t1` ADD INDEX `_idx_b_new` (`b`) KEY_BLOCK_SIZE=8, DROP INDEX `idx_b`; ALTER TABLE `t1` RENAME INDEX `_idx_b_new` TO `idx_b`",
 		diff,
 		"statements Diff kept separate must not be merged into one ALTER")
 }

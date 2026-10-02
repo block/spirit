@@ -3,8 +3,6 @@ package statement
 import (
 	"math"
 	"math/big"
-	"regexp"
-	"strconv"
 	"strings"
 )
 
@@ -101,121 +99,14 @@ func zerofillDisplayWidth(c *Column) (int, bool) {
 
 // zerofillDefaultValue returns a literal DEFAULT as the non-negative integer
 // MySQL converts it to on an integer column, in decimal digits with no
-// leading zeros, or false when this rule does not convert it.
+// leading zeros, or false when this rule does not convert it (see
+// integerDefaultValue, shared with numericDefaultNormalizer). A value past the
+// unsigned 64-bit range is outside every integer type and left for MySQL to
+// reject as written.
 func zerofillDefaultValue(c *Column) (string, bool) {
-	switch c.DefaultKind {
-	case DefaultKindHexLiteral, DefaultKindBitLiteral:
-		value, ok := binaryLiteralValue(c)
-		if !ok {
-			return "", false
-		}
-		return strconv.FormatUint(value, 10), true
-	case DefaultKindKeywordBool:
-		switch strings.ToUpper(*c.Default) {
-		case "TRUE":
-			return "1", true
-		case "FALSE":
-			return "0", true
-		}
-	case DefaultKindNumber:
-		// The parser restores a float literal with an exponent (2.5e0 as
-		// 2.5e+00) and a decimal literal without one.
-		if strings.ContainsAny(*c.Default, "eE") {
-			return roundedFloatText(*c.Default)
-		}
-		// MySQL rejects a negative decimal literal unless it is exactly zero:
-		// -0.0 is accepted, -0.4 is not.
-		return roundedDecimalText(*c.Default, false)
-	case DefaultKindString:
-		// MySQL skips leading spaces and tabs, and ignores trailing
-		// whitespace; it rejects a leading newline, carriage return, form
-		// feed or vertical tab. A negative string that rounds to zero ('-0.4')
-		// is accepted.
-		text := strings.TrimLeft(*c.Default, " \t")
-		text = strings.TrimRight(text, " \t\n\r\f\v")
-		return roundedDecimalText(text, true)
-	case DefaultKindUnknown:
-	}
-	return "", false
-}
-
-// roundedFloatText rounds a float literal to an integer the way MySQL stores
-// a double in an unsigned integer column: the exact value of the double,
-// rounded half to even. The double is not the written decimal once it has
-// more than 15-17 significant digits: 1234567890123456789e0 is stored as
-// 1234567890123456768. A negative value is accepted only when it rounds to
-// zero (-0.5e0 is, -0.6e0 is not). It returns false for anything else,
-// including a value outside the unsigned 64-bit range.
-func roundedFloatText(text string) (string, bool) {
-	f, err := strconv.ParseFloat(text, 64)
-	if err != nil {
+	value, ok := integerDefaultValue(c, true)
+	if !ok || value.Cmp(new(big.Int).SetUint64(math.MaxUint64)) > 0 {
 		return "", false
 	}
-	f = math.RoundToEven(f)
-	if f == 0 {
-		return "0", true
-	}
-	if f < 0 || f >= 0x1p64 {
-		return "", false
-	}
-	value, _ := big.NewFloat(f).Int(nil)
 	return value.String(), true
-}
-
-// decimalNumberPattern matches a decimal number with an optional sign,
-// fraction and exponent: 5, +5, -0, 007, 5., .5, 2.5, 1e1, 2.5e+00.
-var decimalNumberPattern = regexp.MustCompile(`^([+-]?)([0-9]*)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]+))?$`)
-
-// roundedDecimalText rounds a decimal number text half up to an integer, as
-// MySQL converts a decimal literal or a string, and returns it in decimal
-// digits. A negative number is accepted only when its value is zero, or,
-// with negativeRoundsToZero, when it rounds to zero. It returns false for
-// any other text.
-func roundedDecimalText(text string, negativeRoundsToZero bool) (string, bool) {
-	m := decimalNumberPattern.FindStringSubmatch(text)
-	if m == nil || m[2]+m[3] == "" {
-		return "", false
-	}
-	digits, ok := new(big.Int).SetString(m[2]+m[3], 10)
-	if !ok {
-		return "", false
-	}
-	if digits.Sign() == 0 {
-		return "0", true
-	}
-	exponent := 0
-	if m[4] != "" {
-		e, err := strconv.Atoi(m[4])
-		// Past 10^64 a non-zero value is out of any integer type's range;
-		// leave it for MySQL to reject as written.
-		if err != nil || e > 64 {
-			return "", false
-		}
-		exponent = e
-	}
-	// The number is digits × 10^-scale.
-	scale := len(m[3]) - exponent
-	ten := big.NewInt(10)
-	var quotient *big.Int
-	exact := true
-	switch {
-	case scale <= 0:
-		quotient = digits.Mul(digits, new(big.Int).Exp(ten, big.NewInt(int64(-scale)), nil))
-	case scale > len(m[2]+m[3]):
-		// digits < 10^len(digits), so the value is below 0.1 and rounds to
-		// zero, however small the exponent.
-		quotient, exact = new(big.Int), false
-	default:
-		divisor := new(big.Int).Exp(ten, big.NewInt(int64(scale)), nil)
-		var remainder *big.Int
-		quotient, remainder = new(big.Int).QuoRem(digits, divisor, new(big.Int))
-		exact = remainder.Sign() == 0
-		if remainder.Lsh(remainder, 1).Cmp(divisor) >= 0 {
-			quotient.Add(quotient, big.NewInt(1))
-		}
-	}
-	if m[1] == "-" && (quotient.Sign() != 0 || !exact && !negativeRoundsToZero) {
-		return "", false
-	}
-	return quotient.String(), true
 }

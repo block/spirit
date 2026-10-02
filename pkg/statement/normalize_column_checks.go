@@ -2,20 +2,24 @@ package statement
 
 import (
 	"fmt"
-
-	"github.com/block/spirit/pkg/parser/ast"
 )
 
 func init() { registerNormalizer(columnCheckNormalizer{}) }
 
 // columnCheckNormalizer hoists column-level CHECK constraints into table-level
 // constraints, mirroring what MySQL does in SHOW CREATE TABLE. Without this,
-// a column-level CHECK lives only in Column.Check while the live table (after
+// a column-level CHECK lives only in Column.Checks while the live table (after
 // the ALTER is applied) reports the same constraint in CreateTable.Constraints.
-// A re-diff would then (a) keep emitting MODIFY COLUMN because Column.Check
+// A re-diff would then (a) keep emitting MODIFY COLUMN because Column.Checks
 // differs and (b) try to DROP the live CHECK because it is absent from the
 // target's Constraints. Hoisting at parse time keeps the parsed form canonical
 // so the re-diff converges and no constraint is ever dropped.
+//
+// Every CHECK a column carries is hoisted, with its name and its enforcement:
+// `c INT CHECK (c > 0) CHECK (c < 10)` is two constraints, and
+// `CHECK (c > 0) NOT ENFORCED` stays NOT ENFORCED. Keeping only the last one,
+// or dropping the enforcement, would make a diff silently remove a constraint
+// the live table has, or start enforcing one the user declared unenforced.
 //
 // MySQL auto-names unnamed CHECK constraints `<table>_chk_<n>`. We replicate
 // that here: user-named CHECKs keep their name; unnamed ones are numbered in
@@ -50,32 +54,22 @@ func (columnCheckNormalizer) Normalize(ct *CreateTable) *CreateTable {
 	// equality or column-definition emission.
 	for i := range ct.Columns {
 		col := &ct.Columns[i]
-		if col.Check == nil {
-			continue
-		}
-		// Recover the user-supplied constraint name (if any) from the raw
-		// column option; unnamed ones are auto-numbered below.
-		name := ""
-		if col.Raw != nil {
-			for _, opt := range col.Raw.Options {
-				if opt.Tp == ast.ColumnOptionCheck {
-					name = opt.ConstraintName
-					break
-				}
+		for _, check := range col.Checks {
+			expr := check.Expression
+			c := Constraint{
+				Name:        check.Name,
+				Type:        "CHECK",
+				Expression:  &expr,
+				NotEnforced: check.NotEnforced,
+			}
+			definition := checkConstraintDefinition(&c)
+			c.Definition = &definition
+			ct.Constraints = append(ct.Constraints, c)
+			if check.Name != "" {
+				usedNames[check.Name] = true
 			}
 		}
-		expr := *col.Check
-		definition := fmt.Sprintf("CHECK (%s)", expr)
-		ct.Constraints = append(ct.Constraints, Constraint{
-			Name:       name,
-			Type:       "CHECK",
-			Expression: &expr,
-			Definition: &definition,
-		})
-		col.Check = nil
-		if name != "" {
-			usedNames[name] = true
-		}
+		col.Checks = nil
 	}
 
 	// Number the unnamed CHECK constraints `<table>_chk_<n>`. Resolve indices

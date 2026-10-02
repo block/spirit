@@ -21818,7 +21818,9 @@ yynewstate:
 		}
 	case 2169:
 		{
-			parser.yyVAL.item = &ast.TableOption{Tp: ast.TableOptionStatsPersistent}
+			opt := yyS[yypt-0].item.(*ast.TableOption)
+			opt.Tp = ast.TableOptionStatsPersistent
+			parser.yyVAL.item = opt
 		}
 	case 2170:
 		{
@@ -21856,8 +21858,9 @@ yynewstate:
 		}
 	case 2174:
 		{
-			// Parse it but will ignore it.
-			parser.yyVAL.item = &ast.TableOption{Tp: ast.TableOptionPackKeys}
+			opt := yyS[yypt-0].item.(*ast.TableOption)
+			opt.Tp = ast.TableOptionPackKeys
+			parser.yyVAL.item = opt
 		}
 	case 2175:
 		{
@@ -21925,6 +21928,14 @@ yynewstate:
 	case 2184:
 		{
 			parser.yyVAL.item = true
+		}
+	case 2185:
+		{
+			parser.yyVAL.item = &ast.TableOption{Default: true}
+		}
+	case 2186:
+		{
+			parser.yyVAL.item = &ast.TableOption{UintValue: yyS[yypt-0].item.(uint64)}
 		}
 	case 2187:
 		{

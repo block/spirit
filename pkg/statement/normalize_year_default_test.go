@@ -80,13 +80,13 @@ func TestYearDefaultLeavesOtherDefaultsAlone(t *testing.T) {
 	}
 }
 
-// A different default must still diff, and the MODIFY must carry the year
-// bare.
+// A different default must still diff, and the MODIFY carries the literal as
+// written; the four-digit year is the compared reading only.
 func TestYearDefaultStillDiffsRealChanges(t *testing.T) {
-	requireDefaultStillDiffs(t, "`a` year DEFAULT 99", "`a` year DEFAULT '1998'", "MODIFY COLUMN `a` year NULL DEFAULT 1999")
-	requireDefaultStillDiffs(t, "`a` year DEFAULT '0'", "`a` year DEFAULT '0000'", "MODIFY COLUMN `a` year NULL DEFAULT 2000")
-	requireDefaultStillDiffs(t, "`a` year DEFAULT 0", "`a` year DEFAULT '2000'", "MODIFY COLUMN `a` year NULL DEFAULT 0000")
-	requireDefaultStillDiffs(t, "`a` year DEFAULT 5", "`a` year", "MODIFY COLUMN `a` year NULL DEFAULT 2005")
+	requireDefaultStillDiffs(t, "`a` year DEFAULT 99", "`a` year DEFAULT '1998'", "MODIFY COLUMN `a` year NULL DEFAULT 99")
+	requireDefaultStillDiffs(t, "`a` year DEFAULT '0'", "`a` year DEFAULT '0000'", "MODIFY COLUMN `a` year NULL DEFAULT '0'")
+	requireDefaultStillDiffs(t, "`a` year DEFAULT 0", "`a` year DEFAULT '2000'", "MODIFY COLUMN `a` year NULL DEFAULT 0")
+	requireDefaultStillDiffs(t, "`a` year DEFAULT 5", "`a` year", "MODIFY COLUMN `a` year NULL DEFAULT 5")
 }
 
 // The four-digit range is 1901-2155. A bare four-digit number reads back as

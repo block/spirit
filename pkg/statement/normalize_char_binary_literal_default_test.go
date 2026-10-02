@@ -62,11 +62,11 @@ func TestCharBinaryLiteralDefaultLeavesOtherDefaultsAlone(t *testing.T) {
 	}
 }
 
-// A different default must still diff, and the MODIFY must carry the string
-// the bytes spell.
+// A different default must still diff, and the MODIFY carries the hex literal
+// as written; the string it spells is the compared reading only.
 func TestCharBinaryLiteralDefaultStillDiffsRealChanges(t *testing.T) {
-	requireDefaultStillDiffs(t, "`b` varchar(4) CHARACTER SET utf8mb4 DEFAULT x'62'", "`b` varchar(4) CHARACTER SET utf8mb4 DEFAULT 'a'", "MODIFY COLUMN `b` varchar(4) CHARACTER SET utf8mb4 NULL DEFAULT 'b'")
-	requireDefaultStillDiffs(t, "`b` char(4) CHARACTER SET utf8mb4 DEFAULT x'27'", "`b` char(4) CHARACTER SET utf8mb4", "MODIFY COLUMN `b` char(4) CHARACTER SET utf8mb4 NULL DEFAULT '\\''")
+	requireDefaultStillDiffs(t, "`b` varchar(4) CHARACTER SET utf8mb4 DEFAULT x'62'", "`b` varchar(4) CHARACTER SET utf8mb4 DEFAULT 'a'", "MODIFY COLUMN `b` varchar(4) CHARACTER SET utf8mb4 NULL DEFAULT x'62'")
+	requireDefaultStillDiffs(t, "`b` char(4) CHARACTER SET utf8mb4 DEFAULT x'27'", "`b` char(4) CHARACTER SET utf8mb4", "MODIFY COLUMN `b` char(4) CHARACTER SET utf8mb4 NULL DEFAULT x'27'")
 }
 
 // ASCII bytes are the same characters in every charset in

@@ -125,8 +125,11 @@ func (charUTF8MB4DefaultNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		default:
 			continue
 		}
+		// The recorded form is also the emitted one, so DefaultAsWritten is
+		// dropped: a bare hex literal, the form a live table reports, would
+		// store other characters on a column of another charset (see above).
 		hexLiteral := utf8mb4Introducer + "x'" + hex.EncodeToString([]byte(value)) + "'"
-		c.Default, c.DefaultKind = &hexLiteral, DefaultKindHexLiteral
+		c.Default, c.DefaultKind, c.DefaultAsWritten = &hexLiteral, DefaultKindHexLiteral, nil
 	}
 	return ct
 }

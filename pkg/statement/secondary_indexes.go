@@ -198,12 +198,11 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 				// Functional (expression) index part, e.g. KEY ((lower(b))).
 				// Column is nil in this case; MySQL requires the expression
 				// to be wrapped in its own parentheses.
-				var exprSb strings.Builder
-				rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags|format.RestoreStringWithoutCharset, &exprSb)
-				if err := key.Expr.Restore(rCtx); err != nil {
-					return "", fmt.Errorf("failed to restore expression for index %q: %w", constraint.Name, err)
+				exprText, ok := restoreExprText(key.Expr, format.DefaultRestoreFlags)
+				if !ok {
+					return "", fmt.Errorf("failed to restore expression for index %q", constraint.Name)
 				}
-				fmt.Fprintf(&sb, "(%s)", exprSb.String())
+				fmt.Fprintf(&sb, "(%s)", exprText)
 			default:
 				return "", fmt.Errorf("index %q has a key part with neither a column nor an expression", constraint.Name)
 			}

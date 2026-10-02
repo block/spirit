@@ -1124,11 +1124,8 @@ func restoreFixedOperandPrecedence(op opcode.Op, side int) int {
 // restoreBinaryPrecedence follows MySQL operator precedence: larger values bind
 // tighter, and 0 means unknown so parentheses must be kept. Binary operators are
 // left-associative, so same-precedence right children can drop parentheses only
-// for operators that preserve SQL evaluation semantics after regrouping.
-// Arithmetic operators are intentionally excluded: subtraction, division,
-// integer division, and modulo are not associative, while addition and
-// multiplication can still produce different finite-precision numeric results
-// after reassociation.
+// for operators that preserve SQL evaluation semantics after regrouping (see
+// isAssociativeRestoreOp).
 //
 // Examples:
 //   - `(a + b) * c` must keep parentheses.
@@ -1172,13 +1169,25 @@ func restoreBinaryPrecedence(op opcode.Op) int {
 	}
 }
 
+// isAssociativeRestoreOp reports whether a same-precedence right child of
+// parentOp may drop its parentheses although that regroups the expression:
+// a AND (b AND c) restored as a AND b AND c. Only the logical AND and OR are
+// associative under MySQL's evaluation. Subtraction, division, integer
+// division and modulo are not associative at all; addition and multiplication
+// regroup to a different finite-precision result (1e-1 + (2e-1 + 3e-1) and
+// (1e-1 + 2e-1) + 3e-1 are different doubles) or to an overflow
+// ((9223372036854775807 + 1) - 1 is error 1690 where the other grouping is
+// not); and the bitwise &, | and ^ operate on binary strings when both
+// operands are binary strings and on integers otherwise, so the grouping
+// decides which: _binary'12' & (_binary'21' & 7) is 4 while
+// (_binary'12' & _binary'21') & 7 is 0. XOR is associative but MySQL keeps
+// its grouping, so there is nothing to gain from regrouping it.
 func isAssociativeRestoreOp(parentOp, childOp opcode.Op) bool {
 	if parentOp != childOp {
 		return false
 	}
-	// Every other operator is either non-associative or not worth regrouping.
 	switch parentOp { //nolint:exhaustive
-	case opcode.LogicAnd, opcode.LogicOr, opcode.And, opcode.Or, opcode.Xor:
+	case opcode.LogicAnd, opcode.LogicOr:
 		return true
 	default:
 		return false

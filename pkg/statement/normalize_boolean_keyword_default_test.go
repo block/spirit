@@ -117,9 +117,9 @@ func TestBooleanKeywordDefaultLeavesOtherTypesAlone(t *testing.T) {
 		want   string
 	}{
 		{
-			name:   "decimal applies its scale, so 1 is not what is stored",
+			name:   "decimal applies its scale, so 1 is not what is stored; numericDefaultNormalizer folds it to the padded value",
 			column: "`a` decimal(4,2) NOT NULL DEFAULT TRUE",
-			want:   "TRUE",
+			want:   "1.00",
 		},
 		{
 			name:   "year reads the keyword as a year, which yearDefaultNormalizer folds to 2001",
@@ -163,6 +163,7 @@ func TestBooleanKeywordDefaultLeavesOtherTypesAlone(t *testing.T) {
 // asserts the emitted default and not just that something was emitted, because
 // a statement that names the column is produced either way — what distinguishes
 // a correct fold from one that mangled the value is which default it stores.
+// The MODIFY carries the keyword as written; MySQL reads it as 0 or 1.
 func TestBooleanKeywordDefaultStillDiffsRealChanges(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -174,25 +175,25 @@ func TestBooleanKeywordDefaultStillDiffsRealChanges(t *testing.T) {
 			name:     "FALSE against a stored 1",
 			declared: "`a` boolean NOT NULL DEFAULT FALSE",
 			live:     "`a` tinyint(1) NOT NULL DEFAULT '1'",
-			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT 0",
+			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT FALSE",
 		},
 		{
 			name:     "TRUE against a stored 0",
 			declared: "`a` boolean NOT NULL DEFAULT TRUE",
 			live:     "`a` tinyint(1) NOT NULL DEFAULT '0'",
-			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT 1",
+			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT TRUE",
 		},
 		{
 			name:     "a keyword default added to a column that had none",
 			declared: "`a` boolean NOT NULL DEFAULT FALSE",
 			live:     "`a` tinyint(1) NOT NULL",
-			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT 0",
+			want:     "MODIFY COLUMN `a` tinyint(1) NOT NULL DEFAULT FALSE",
 		},
 		{
 			name:     "a keyword default on a string column against the other value",
 			declared: "`a` varchar(8) NOT NULL DEFAULT FALSE",
 			live:     "`a` varchar(8) NOT NULL DEFAULT '1'",
-			want:     "MODIFY COLUMN `a` varchar(8) NOT NULL DEFAULT '0'",
+			want:     "MODIFY COLUMN `a` varchar(8) NOT NULL DEFAULT FALSE",
 		},
 		{
 			name:     "a quoted 'FALSE' is not satisfied by a stored 0",

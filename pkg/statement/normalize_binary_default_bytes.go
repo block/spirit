@@ -66,6 +66,8 @@ const maxBinaryWidth = 255
 //   - a default longer than the width, which MySQL rejects.
 //   - a decimal or float default: MySQL formats it as a string with its own
 //     rules (1.5 is stored as '1.5'), which this rule does not reproduce.
+//     numericDefaultNormalizer does, and pads the result on binary the same
+//     way, so the two agree in either order.
 //   - an expression default, which MySQL stores unpadded.
 type binaryDefaultBytesNormalizer struct{}
 

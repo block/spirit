@@ -62,9 +62,11 @@ var mysqlFunctionAliases = map[string]string{
 //
 // The rule renames only; it does not touch the shape of the expression. The
 // other half of the rewriting MySQL does to a stored expression — charset
-// introducers, so that 'x' reads back as _latin1'x' — needs no rule, because
-// the introducer is dropped when the expression is restored to text
-// (format.RestoreStringWithoutCharset) on both sides of the diff.
+// introducers, so that 'x' reads back as _utf8mb4'x' — needs no rule either,
+// because every restore to text omits the _utf8mb4 introducer and keeps every
+// other (see restoreExprText) on both sides of the diff. A literal stored
+// from a client of another charset reads back with that charset's introducer
+// (_latin1'x'), which is kept, so such a schema diffs once and then agrees.
 type functionAliasNormalizer struct{}
 
 func (functionAliasNormalizer) Name() string { return "function-aliases" }
@@ -79,7 +81,9 @@ func (functionAliasNormalizer) Normalize(ct *CreateTable) *CreateTable {
 			canonicalizeFuncAliases(p, col.Default, restoreExprDefaultText)
 		}
 		canonicalizeFuncAliases(p, col.GeneratedExpr, restoreExpressionText)
-		canonicalizeFuncAliases(p, col.Check, restoreExpressionText)
+		for j := range col.Checks {
+			canonicalizeFuncAliases(p, &col.Checks[j].Expression, restoreExpressionText)
+		}
 	}
 	for i := range ct.Constraints {
 		c := &ct.Constraints[i]
@@ -101,17 +105,17 @@ func (functionAliasNormalizer) Normalize(ct *CreateTable) *CreateTable {
 	if ct.Partition != nil {
 		canonicalizeFuncAliases(p, ct.Partition.Expression, restoreExpressionText)
 		if ct.Partition.SubPartition != nil {
-			// A subpartition expression is parsed through parseExpression, not
-			// the generic expression restore the partition expression uses.
-			canonicalizeFuncAliases(p, ct.Partition.SubPartition.Expression, restoreLiteralStyleText)
+			canonicalizeFuncAliases(p, ct.Partition.SubPartition.Expression, restoreExpressionText)
 		}
 	}
 	return ct
 }
 
-// functionAliasRewriter is the ast.Visitor behind canonicalizeFuncAliases: it
+// functionAliasRewriter is the exprRewriter behind canonicalizeFuncAliases: it
 // renames each aliased function call on the way back up the tree.
 type functionAliasRewriter struct{ renamed bool }
+
+func (r *functionAliasRewriter) Changed() bool { return r.renamed }
 
 func (r *functionAliasRewriter) Enter(n ast.Node) (ast.Node, bool) { return n, false }
 
@@ -132,42 +136,11 @@ func (r *functionAliasRewriter) Leave(n ast.Node) (ast.Node, bool) {
 }
 
 // canonicalizeFuncAliases rewrites the aliased function names in an expression
-// text, in place, and reports whether anything changed. A nil or empty text is
-// left alone.
-//
-// render must be the same restore the text was originally produced with, so
-// that an expression holding an alias and one already spelling the stored name
-// render identically — that identity is the whole point of the rule. An
-// expression with no alias in it is left byte-for-byte untouched rather than
-// re-rendered, so this rule cannot perturb a form another rule established
-// (which is what keeps it order-independent).
+// text, in place, and reports whether anything changed. render must be the
+// same restore the text was originally produced with (see
+// rewriteExpressionText).
 func canonicalizeFuncAliases(p *parser.Parser, text *string, render func(ast.ExprNode) (string, bool)) bool {
-	if text == nil || *text == "" {
-		return false
-	}
-	expr, ok := parseExpressionText(p, *text)
-	if !ok {
-		return false
-	}
-	rewriter := &functionAliasRewriter{}
-	node, ok := expr.Accept(rewriter)
-	if !ok || !rewriter.renamed {
-		return false
-	}
-	// The rewriter only ever renames a call in place, so the node it hands
-	// back is the expression it was given. Check rather than assert anyway:
-	// normalization runs on every parse, and leaving the text alone beats
-	// panicking if a future visitor change breaks that.
-	rewritten, ok := node.(ast.ExprNode)
-	if !ok {
-		return false
-	}
-	rendered, ok := render(rewritten)
-	if !ok {
-		return false
-	}
-	*text = rendered
-	return true
+	return rewriteExpressionText(p, text, render, &functionAliasRewriter{})
 }
 
 // restoreExprDefaultText and restoreLiteralStyleText are restoreValueExprText's

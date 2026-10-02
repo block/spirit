@@ -12338,7 +12338,9 @@ TableOption:
 	}
 |	"STATS_PERSISTENT" EqOpt StatsPersistentVal
 	{
-		$$ = &ast.TableOption{Tp: ast.TableOptionStatsPersistent}
+		opt := $3.(*ast.TableOption)
+		opt.Tp = ast.TableOptionStatsPersistent
+		$$ = opt
 	}
 |	"STATS_AUTO_RECALC" EqOpt LengthNum
 	{
@@ -12376,8 +12378,9 @@ TableOption:
 	}
 |	"PACK_KEYS" EqOpt StatsPersistentVal
 	{
-		// Parse it but will ignore it.
-		$$ = &ast.TableOption{Tp: ast.TableOptionPackKeys}
+		opt := $3.(*ast.TableOption)
+		opt.Tp = ast.TableOptionPackKeys
+		$$ = opt
 	}
 |	"STORAGE" "MEMORY"
 	{
@@ -12451,9 +12454,13 @@ ForceOpt:
 
 StatsPersistentVal:
 	"DEFAULT"
-	{}
+	{
+		$$ = &ast.TableOption{Default: true}
+	}
 |	LengthNum
-	{}
+	{
+		$$ = &ast.TableOption{UintValue: $1.(uint64)}
+	}
 
 CreateTableOptionListOpt:
 	/* empty */ %prec lowerThanCreateTableSelect

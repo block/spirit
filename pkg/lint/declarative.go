@@ -143,8 +143,8 @@ func PlanChanges(current, desired []table.TableSchema, diffOpts *statement.DiffO
 	}
 
 	// 5. Build the plan, attaching violations to the last statement per table.
-	// A diff may produce multiple statements for the same table (e.g. partition
-	// type changes require REMOVE PARTITIONING then PARTITION BY). Violations
+	// A diff may produce multiple statements for the same table (e.g. ADD
+	// PARTITION can't share an ALTER with a column change). Violations
 	// are attached only to the last statement for each table so they are not
 	// duplicated.
 	plan := &Plan{}

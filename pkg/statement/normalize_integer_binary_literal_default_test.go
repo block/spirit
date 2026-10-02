@@ -106,12 +106,13 @@ func TestIntegerBinaryLiteralDefaultLeavesOtherDefaultsAlone(t *testing.T) {
 		{"an empty hex literal, which MySQL rejects", "`b` int DEFAULT x''", "x''", DefaultKindHexLiteral},
 		{"more than 8 bytes, which MySQL rejects", "`b` bigint unsigned DEFAULT 0x00FFFFFFFFFFFFFFFF", "x'00ffffffffffffffff'", DefaultKindHexLiteral},
 		{"an expression default, which MySQL stores as written", "`b` int DEFAULT (0x1A)", "x'1a'", DefaultKindHexLiteral},
-		{"a scaled decimal, which pads to its scale", "`b` decimal(5,2) DEFAULT 0x1A", "x'1a'", DefaultKindHexLiteral},
+		// A scaled decimal, double and a string are not this rule's: numericDefaultNormalizer folds them.
+		{"a scaled decimal, which pads to its scale", "`b` decimal(5,2) DEFAULT 0x1A", "26.00", DefaultKindNumber},
 		{"a decimal at 2^63, which MySQL rejects as hex only", "`b` decimal(20,0) DEFAULT 0x8000000000000000", "x'8000000000000000'", DefaultKindHexLiteral},
-		{"double, which formats the value itself", "`b` double DEFAULT 0x1A", "x'1a'", DefaultKindHexLiteral},
+		{"double, which formats the value itself", "`b` double DEFAULT 0x1A", "26", DefaultKindNumber},
 		{"year, which reads the value as a year and yearDefaultNormalizer folds", "`b` year DEFAULT 0x07", "2007", DefaultKindNumber},
 		{"a number, which is already the integer", "`b` int DEFAULT 26", "26", DefaultKindNumber},
-		{"a string", "`b` int DEFAULT '26'", "26", DefaultKindString},
+		{"a string", "`b` int DEFAULT '26'", "26", DefaultKindNumber},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			requireDefaultLeftAlone(t, tt.column, tt.want, tt.kind)
@@ -119,9 +120,9 @@ func TestIntegerBinaryLiteralDefaultLeavesOtherDefaultsAlone(t *testing.T) {
 	}
 }
 
-// A different default must still diff, and the MODIFY must carry the integer
-// bare.
+// A different default must still diff, and the MODIFY carries the literal as
+// written; the integer is the compared reading only.
 func TestIntegerBinaryLiteralDefaultStillDiffsRealChanges(t *testing.T) {
-	requireDefaultStillDiffs(t, "`b` int DEFAULT 0x1A", "`b` int DEFAULT '27'", "MODIFY COLUMN `b` int NULL DEFAULT 26")
-	requireDefaultStillDiffs(t, "`b` int DEFAULT b'1010'", "`b` int", "MODIFY COLUMN `b` int NULL DEFAULT 10")
+	requireDefaultStillDiffs(t, "`b` int DEFAULT 0x1A", "`b` int DEFAULT '27'", "MODIFY COLUMN `b` int NULL DEFAULT x'1a'")
+	requireDefaultStillDiffs(t, "`b` int DEFAULT b'1010'", "`b` int", "MODIFY COLUMN `b` int NULL DEFAULT b'1010'")
 }

@@ -53,8 +53,9 @@ func init() { registerNormalizer(integerBinaryLiteralDefaultNormalizer{}) }
 // double store it only while it fits their precision (double DEFAULT 0x1A
 // stores '26'). Past that MySQL rounds it and formats it in its own notation,
 // which this rule does not reproduce: float DEFAULT 0x01000001 stores
-// '16777200' and double DEFAULT 0x20000000000001 stores
-// '9.007199254740992e15'.
+// 16777216 (reported as '16777200') and double DEFAULT 0x20000000000001
+// stores '9.007199254740992e15'. numericDefaultNormalizer folds the scaled decimal,
+// float and double cases.
 type integerBinaryLiteralDefaultNormalizer struct{}
 
 func (integerBinaryLiteralDefaultNormalizer) Name() string {

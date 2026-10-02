@@ -26,6 +26,17 @@ import (
 // [booleanKeywordDefaultNormalizer]).
 type DefaultKind uint8
 
+// DefaultLiteral is a column DEFAULT literal as the schema spelled it: the
+// text in the form the parse records for its kind (a string literal's raw
+// value, any other literal's restored text) and the [DefaultKind] that tells
+// emission how to write it back. [Column.DefaultAsWritten] keeps one so that
+// an emitted DEFAULT is the literal the author wrote rather than the reading
+// the normalization rules leave in [Column.Default].
+type DefaultLiteral struct {
+	Text string      `json:"text"`
+	Kind DefaultKind `json:"kind"`
+}
+
 const (
 	// DefaultKindUnknown is a default whose literal form is not modelled here
 	// — NULL, a function default such as CURRENT_TIMESTAMP, an expression. Emission falls back to the [needsQuotes] text heuristic, as

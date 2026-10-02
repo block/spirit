@@ -194,7 +194,8 @@ func TestZerofillDefaultNegativeZeroAndWhitespace(t *testing.T) {
 	})
 }
 
-// A changed default is still a change after padding.
+// A changed default is still a change after padding; the MODIFY carries the
+// literal as written and MySQL pads it.
 func TestZerofillDefaultChangeIsDetected(t *testing.T) {
 	declared, err := ParseCreateTable("CREATE TABLE t (a int(4) zerofill DEFAULT 6)")
 	require.NoError(t, err)
@@ -204,5 +205,5 @@ func TestZerofillDefaultChangeIsDetected(t *testing.T) {
 	stmts, err := live.Diff(declared, nil)
 	require.NoError(t, err)
 	require.Len(t, stmts, 1)
-	assert.Equal(t, "ALTER TABLE `t` MODIFY COLUMN `a` int(4) unsigned zerofill NULL DEFAULT '0006'", stmts[0].Statement)
+	assert.Equal(t, "ALTER TABLE `t` MODIFY COLUMN `a` int(4) unsigned zerofill NULL DEFAULT 6", stmts[0].Statement)
 }

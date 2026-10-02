@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	_ "github.com/block/mysql"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -325,8 +326,7 @@ func TestSchemaAnalyzer_IndexVisibilityStructured(t *testing.T) {
 
 	statusIdx := indexes.ByName("idx_status")
 	require.NotNil(t, statusIdx, "Should find idx_status")
-	require.NotNil(t, statusIdx.Invisible)
-	require.False(t, *statusIdx.Invisible, "idx_status should be explicitly visible")
+	require.Nil(t, statusIdx.Invisible, "VISIBLE is the default and is not recorded (indexDefaultsNormalizer)")
 
 	nameIdx := indexes.ByName("idx_name")
 	require.NotNil(t, nameIdx, "Should find idx_name")
@@ -893,9 +893,9 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 				}
 
 				require.NotNil(t, testIndex)
-				// Last option should win (VISIBLE), so Invisible should be false
-				require.NotNil(t, testIndex.Invisible)
-				require.False(t, *testIndex.Invisible)
+				// Last option should win (VISIBLE), which is the default and
+				// is not recorded (indexDefaultsNormalizer).
+				require.Nil(t, testIndex.Invisible)
 			},
 		},
 
@@ -923,7 +923,7 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 		},
 		{
 			Name:        "Index with USING HASH",
-			SQL:         "CREATE TABLE t (id INT, INDEX idx (id) USING HASH);",
+			SQL:         "CREATE TABLE t (id INT, INDEX idx (id) USING HASH) ENGINE=MEMORY;",
 			ShouldParse: true,
 			Validate: func(t *testing.T, createTable *CreateTable) {
 				indexes := createTable.GetIndexes()
@@ -944,7 +944,7 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 		},
 		{
 			Name:        "Index with USING HASH and INVISIBLE",
-			SQL:         "CREATE TABLE t (id INT, INDEX idx (id) USING HASH INVISIBLE);",
+			SQL:         "CREATE TABLE t (id INT, INDEX idx (id) USING HASH INVISIBLE) ENGINE=MEMORY;",
 			ShouldParse: true,
 			Validate: func(t *testing.T, createTable *CreateTable) {
 				indexes := createTable.GetIndexes()
@@ -992,7 +992,7 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 		// Key block size tests
 		{
 			Name:        "Index with KEY_BLOCK_SIZE",
-			SQL:         "CREATE TABLE t (id INT, INDEX idx (id) KEY_BLOCK_SIZE = 16);",
+			SQL:         "CREATE TABLE t (id INT, INDEX idx (id) KEY_BLOCK_SIZE = 16) ROW_FORMAT=COMPRESSED;",
 			ShouldParse: true,
 			Validate: func(t *testing.T, createTable *CreateTable) {
 				indexes := createTable.GetIndexes()
@@ -1038,7 +1038,7 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 		// Complex multi-option index tests
 		{
 			Name:        "UNIQUE index with multiple options",
-			SQL:         "CREATE TABLE t (email VARCHAR(255), UNIQUE KEY uk_email (email) USING BTREE COMMENT 'Unique email' KEY_BLOCK_SIZE = 8 INVISIBLE);",
+			SQL:         "CREATE TABLE t (email VARCHAR(255), UNIQUE KEY uk_email (email) USING BTREE COMMENT 'Unique email' KEY_BLOCK_SIZE = 8 INVISIBLE) ROW_FORMAT=COMPRESSED;",
 			ShouldParse: true,
 			Validate: func(t *testing.T, createTable *CreateTable) {
 				indexes := createTable.GetIndexes()
@@ -1164,7 +1164,7 @@ func TestComprehensiveParsingFromTiDBTestSuite(t *testing.T) {
 				INDEX idx_activity_type (activity_type) INVISIBLE COMMENT 'Activity type lookup',
 				UNIQUE KEY uk_user_timestamp (user_id, timestamp) USING BTREE KEY_BLOCK_SIZE = 16 INVISIBLE,
 				FULLTEXT idx_data (data) WITH PARSER ngram COMMENT 'JSON search'
-			) ENGINE=InnoDB CHARSET=utf8mb4 COMMENT='User activity tracking';`,
+			) ENGINE=InnoDB CHARSET=utf8mb4 ROW_FORMAT=COMPRESSED COMMENT='User activity tracking';`,
 			ShouldParse: true,
 			Validate: func(t *testing.T, ct *CreateTable) {
 				// Validate table
@@ -1954,4 +1954,89 @@ func TestSpatialIndexParsing(t *testing.T) {
 	require.NotNil(t, spatial, "expected SPATIAL index idx_location to be present")
 	require.Equal(t, "SPATIAL", spatial.Type)
 	require.Equal(t, []string{"location"}, spatial.Columns)
+}
+
+func TestPartitionKeyColumnsChanged(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   string
+		target   string
+		expected bool
+	}{
+		{
+			name:     "Unchanged",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b BIGINT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10))",
+			expected: false,
+		},
+		{
+			name:     "ExpressionColumnChanged",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY RANGE (id + 1) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, b INT) PARTITION BY RANGE (id + 1) (PARTITION p0 VALUES LESS THAN (10))",
+			expected: true,
+		},
+		{
+			name:     "ColumnsListColumnChanged",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, d DATE NOT NULL) PARTITION BY RANGE COLUMNS (id) (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, d DATE NOT NULL) PARTITION BY RANGE COLUMNS (id) (PARTITION p0 VALUES LESS THAN (10))",
+			expected: true,
+		},
+		{
+			// KEY () reads the primary key without naming it, so the
+			// columns can't be determined and the answer is conservative.
+			name:     "KeyWithoutColumns",
+			source:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY KEY () PARTITIONS 2",
+			target:   "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, b INT) PARTITION BY KEY () PARTITIONS 2",
+			expected: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			source, err := ParseCreateTable(tc.source)
+			require.NoError(t, err)
+			target, err := ParseCreateTable(tc.target)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, source.partitionKeyColumnsChanged(target, NewDiffOptions()))
+		})
+	}
+}
+
+// TestParseTableOptionsReportedByShowCreate parses every table and index
+// option SHOW CREATE TABLE reports, in the form it reports them, and checks
+// that each lands in its field, that MySQL's "unset" spellings stay unset,
+// and that a suffixed AUTOEXTEND_SIZE is read in bytes.
+func TestParseTableOptionsReportedByShowCreate(t *testing.T) {
+	ct, err := ParseCreateTable("CREATE TABLE t (id INT PRIMARY KEY, KEY k (id) /*!80021 SECONDARY_ENGINE_ATTRIBUTE '{\"k\": 1}' */) " +
+		"/*!80023 AUTOEXTEND_SIZE=4194304 */ ENGINE=InnoDB MIN_ROWS=10 MAX_ROWS=1000 AVG_ROW_LENGTH=100 PACK_KEYS=1 " +
+		"STATS_PERSISTENT=0 STATS_AUTO_RECALC=1 STATS_SAMPLE_PAGES=42 CHECKSUM=1 DELAY_KEY_WRITE=1 KEY_BLOCK_SIZE=8 " +
+		"/*!80021 SECONDARY_ENGINE_ATTRIBUTE='{\"t\": 1}' */")
+	require.NoError(t, err)
+	o := ct.TableOptions
+	require.NotNil(t, o)
+	assert.Equal(t, uint64(4194304), *o.AutoextendSize)
+	assert.Equal(t, uint64(10), *o.MinRows)
+	assert.Equal(t, uint64(1000), *o.MaxRows)
+	assert.Equal(t, uint64(100), *o.AvgRowLength)
+	assert.True(t, *o.PackKeys)
+	assert.False(t, *o.StatsPersistent)
+	assert.True(t, *o.StatsAutoRecalc)
+	assert.Equal(t, uint64(42), *o.StatsSamplePages)
+	assert.True(t, o.Checksum)
+	assert.True(t, o.DelayKeyWrite)
+	assert.Equal(t, uint64(8), *o.KeyBlockSize)
+	assert.Equal(t, `{"t": 1}`, *o.SecondaryEngineAttribute)
+	assert.Equal(t, `{"k": 1}`, *ct.Indexes.ByName("k").SecondaryEngineAttribute)
+
+	ct, err = ParseCreateTable("CREATE TABLE t (id INT PRIMARY KEY, KEY k (id) SECONDARY_ENGINE_ATTRIBUTE='') " +
+		"STATS_PERSISTENT=DEFAULT STATS_AUTO_RECALC=DEFAULT STATS_SAMPLE_PAGES=DEFAULT PACK_KEYS=DEFAULT " +
+		"AUTOEXTEND_SIZE=0 KEY_BLOCK_SIZE=0 CHECKSUM=0 DELAY_KEY_WRITE=0 MIN_ROWS=0 MAX_ROWS=0 AVG_ROW_LENGTH=0 SECONDARY_ENGINE_ATTRIBUTE=''")
+	require.NoError(t, err)
+	assert.Nil(t, ct.TableOptions)
+	assert.Nil(t, ct.Indexes.ByName("k").SecondaryEngineAttribute)
+
+	ct, err = ParseCreateTable("CREATE TABLE t (id INT PRIMARY KEY) AUTOEXTEND_SIZE=4M STATS_PERSISTENT=1 PACK_KEYS=0")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4194304), *ct.TableOptions.AutoextendSize)
+	assert.True(t, *ct.TableOptions.StatsPersistent)
+	assert.False(t, *ct.TableOptions.PackKeys)
 }

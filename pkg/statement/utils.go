@@ -33,8 +33,16 @@ var numericPartitionValueRe = regexp.MustCompile(`^-?(0|[1-9]\d*)(\.\d+)?$`)
 // what stops a numeric-looking LIST COLUMNS value like '2020' on a VARCHAR
 // column from being emitted bare and rejected by MySQL (error 1654).
 //
-// For plain Go strings (numeric literals and expressions the parser
-// Restored to text, e.g. YEAR(col)) we fall back to the
+// A partitionNullValue is the NULL literal and renders bare, like MAXVALUE.
+//
+// A partitionValueTuple (one multi-column LIST COLUMNS value) renders as a
+// parenthesized list of its elements, e.g. (1, 'a').
+//
+// A partitionExprValue (an expression such as 10+10 that MySQL evaluates)
+// renders bare.
+//
+// For plain Go strings (numeric literals the parser Restored to text) we
+// fall back to the
 // numericPartitionValueRe heuristic: values that match render unquoted;
 // anything else is quote+escaped. The heuristic deliberately excludes
 // ParseFloat-accepting curiosities (NaN, Inf, "1e10") and zero-prefix
@@ -42,6 +50,19 @@ var numericPartitionValueRe = regexp.MustCompile(`^-?(0|[1-9]\d*)(\.\d+)?$`)
 func formatPartitionValue(v any) string {
 	if _, ok := v.(partitionMaxValue); ok {
 		return "MAXVALUE"
+	}
+	if _, ok := v.(partitionNullValue); ok {
+		return "NULL"
+	}
+	if tuple, ok := v.(partitionValueTuple); ok {
+		elems := make([]string, len(tuple))
+		for i, e := range tuple {
+			elems[i] = formatPartitionValue(e)
+		}
+		return "(" + strings.Join(elems, ", ") + ")"
+	}
+	if e, ok := v.(partitionExprValue); ok {
+		return string(e)
 	}
 	if sl, ok := v.(partitionStringLiteral); ok {
 		return "'" + sqlescape.EscapeString(string(sl)) + "'"
@@ -67,23 +88,6 @@ func ptrEqual[T comparable](a, b *T) bool {
 		return false
 	}
 	return *a == *b
-}
-
-// getPreviousColumn returns the name of the column directly before
-// `name` in the given slice, or "" if `name` is the first column or
-// not found. Used by diffColumns to decide whether an ADD COLUMN needs
-// an AFTER clause. Matches `name` case-insensitively, since MySQL
-// column identifiers are case-insensitive.
-func getPreviousColumn(columns []Column, name string) string {
-	for i, col := range columns {
-		if strings.EqualFold(col.Name, name) {
-			if i == 0 {
-				return ""
-			}
-			return columns[i-1].Name
-		}
-	}
-	return ""
 }
 
 // numericColumnTypes are the column types whose DEFAULT value is a number.

@@ -141,7 +141,8 @@ func TestEnumSetDefaultLeavesOtherDefaultsAlone(t *testing.T) {
 }
 
 // A default that names a different member must still diff, and the emitted
-// MODIFY carries the member text MySQL reports back.
+// MODIFY carries the literal as written; the member text MySQL reports back
+// is the compared reading only.
 func TestEnumSetDefaultStillDiffsRealChanges(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -153,19 +154,19 @@ func TestEnumSetDefaultStillDiffsRealChanges(t *testing.T) {
 			name:     "a different member",
 			declared: "`b` enum('a','b') DEFAULT 'a '",
 			live:     "`b` enum('a','b') DEFAULT 'b'",
-			want:     "MODIFY COLUMN `b` enum('a','b') NULL DEFAULT 'a'",
+			want:     "MODIFY COLUMN `b` enum('a','b') NULL DEFAULT 'a '",
 		},
 		{
 			name:     "a default added to a column that had none",
 			declared: "`b` enum('a','B') DEFAULT 'b '",
 			live:     "`b` enum('a','B')",
-			want:     "MODIFY COLUMN `b` enum('a','B') NULL DEFAULT 'B'",
+			want:     "MODIFY COLUMN `b` enum('a','B') NULL DEFAULT 'b '",
 		},
 		{
 			name:     "a set default with another member",
 			declared: "`b` set('a','b','c') DEFAULT 'c,a '",
 			live:     "`b` set('a','b','c') DEFAULT 'a'",
-			want:     "MODIFY COLUMN `b` set('a','b','c') NULL DEFAULT 'a,c'",
+			want:     "MODIFY COLUMN `b` set('a','b','c') NULL DEFAULT 'c,a '",
 		},
 	}
 	for _, tt := range tests {

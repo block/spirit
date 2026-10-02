@@ -1,6 +1,12 @@
 package utils
 
-import "time"
+import (
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+)
 
 // EstimateRenderedChunkSize estimates the size of a chunk's rows, for the
 // memory-based dynamic chunker: the sum of EstimateRenderedRowSize over every
@@ -105,4 +111,34 @@ func estimateRenderedValueSize(value any) int {
 		// Cheap and slightly generous rather than reflective.
 		return 32
 	}
+}
+
+// ParseSizeNumber parses a MySQL size_number: an unsigned integer with an
+// optional K, M or G suffix (case-insensitive), the form AUTOEXTEND_SIZE and
+// the tablespace sizes accept. It returns the value in bytes, so "4M" is
+// 4194304. Any other suffix is an error, as it is in MySQL.
+func ParseSizeNumber(s string) (uint64, error) {
+	var shift uint
+	switch {
+	case s == "":
+		return 0, fmt.Errorf("empty size")
+	case strings.HasSuffix(s, "K"), strings.HasSuffix(s, "k"):
+		shift = 10
+	case strings.HasSuffix(s, "M"), strings.HasSuffix(s, "m"):
+		shift = 20
+	case strings.HasSuffix(s, "G"), strings.HasSuffix(s, "g"):
+		shift = 30
+	}
+	digits := s
+	if shift > 0 {
+		digits = s[:len(s)-1]
+	}
+	n, err := strconv.ParseUint(digits, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", s, err)
+	}
+	if shift > 0 && n > math.MaxUint64>>shift {
+		return 0, fmt.Errorf("size %q overflows", s)
+	}
+	return n << shift, nil
 }

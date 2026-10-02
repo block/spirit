@@ -2,32 +2,37 @@ package statement
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/parser/format"
+	"github.com/block/spirit/pkg/parser/opcode"
 )
 
 func init() { registerNormalizer(expressionParenNormalizer{}) }
 
-// expressionParenNormalizer rewrites CHECK-constraint and generated-column
-// expressions into a canonical parenthesization, mirroring the fact that
-// MySQL stores these expressions in its own fully parenthesized form. A
-// user's CHECK (a = 1 AND b = 2) comes back from SHOW CREATE TABLE as
-// CHECK (((`a` = 1) and (`b` = 2))), while the parser preserves whichever
-// parentheses the input happened to contain. Without a canonical form the
-// desired and live expressions differ textually forever and a declarative
-// diff re-emits the same DROP+ADD on every run. CHECK comparison is
-// definition-based (constraint names are schema-scoped, so the shadow table
-// renames them and diffConstraints pairs constraints by expression), which
-// makes the definition text the only thing that can converge.
+// expressionParenNormalizer rewrites expression-DEFAULT, CHECK-constraint,
+// generated-column, functional-index and partitioning expressions into a
+// canonical parenthesization, mirroring the fact that MySQL stores these
+// expressions in its own fully parenthesized form. A user's CHECK (a = 1 AND
+// b = 2) comes back from SHOW CREATE TABLE as CHECK (((`a` = 1) and (`b` =
+// 2))), KEY k ((a + 1)) as KEY k (((`a` + 1))), PARTITION BY RANGE (a + b) as
+// PARTITION BY RANGE ((`a` + `b`)), and DEFAULT (-1) as DEFAULT (-(1)), while
+// the parser preserves whichever parentheses the input happened to contain.
+// Without a canonical form the desired and live expressions differ textually
+// forever and a declarative diff re-emits the same DROP+ADD (or repartition,
+// or MODIFY COLUMN) on every run. CHECK comparison is definition-based
+// (constraint names are schema-scoped, so the shadow table renames them and
+// diffConstraints pairs constraints by expression), which makes the
+// definition text the only thing that can converge.
 //
 // Canonicalization runs in two passes over the parsed expression:
 //
-//  1. Every user-written (or MySQL-added) parenthesis is dropped, and every
-//     operator expression — binary, unary, IS NULL, IS TRUE, BETWEEN, IN,
-//     LIKE, REGEXP — is re-wrapped in exactly one set. This erases the input's
+//  1. Every user-written (or MySQL-added) parenthesis is dropped, every unary
+//     plus is dropped (MySQL discards it when it parses the expression, so
+//     +1 is stored as 1 and +`a` as `a`), and every operator expression —
+//     binary, unary, IS NULL, IS TRUE, BETWEEN, IN, LIKE, REGEXP — is
+//     re-wrapped in exactly one set. This erases the input's
 //     parenthesization entirely: what remains is a function of the parse tree
 //     alone, so two texts that parse the same way now hold the same tree.
 //  2. The tree is rendered with format.RestoreSkipRedundantParentheses, which
@@ -50,10 +55,18 @@ func init() { registerNormalizer(expressionParenNormalizer{}) }
 // two trees, which is why it reasons about precedence rather than shape (see
 // ast.canRestoreWithoutParentheses).
 //
-// One deliberate exception: an associative operator's parentheses are dropped
+// One deliberate exception: the parentheses of a nested AND or OR are dropped
 // even when regrouping changes the tree, so a AND (b AND c) and (a AND b) AND c
-// converge on a AND b AND c. They evaluate identically, so collapsing them
-// removes a spurious diff rather than hiding a real one.
+// converge on a AND b AND c. The two evaluate identically, and MySQL itself
+// stores either as the flat chain, so collapsing them removes a spurious diff
+// rather than hiding a real one. No other operator regroups: MySQL keeps the
+// written grouping of every other one, and for most of them the grouping is
+// the value. The bitwise &, | and ^ are the sharp edge — they operate on
+// binary strings when both operands are binary strings and on integers
+// otherwise, so _binary'12' & (_binary'21' & 7) is 4 where
+// (_binary'12' & _binary'21') & 7 is 0 — and double addition, BIGINT overflow
+// and every non-commutative operator differ by grouping too (see
+// ast.isAssociativeRestoreOp).
 type expressionParenNormalizer struct{}
 
 func (expressionParenNormalizer) Name() string { return "expression-parens" }
@@ -62,8 +75,15 @@ func (expressionParenNormalizer) Normalize(ct *CreateTable) *CreateTable {
 	p := parser.New()
 	for i := range ct.Columns {
 		col := &ct.Columns[i]
+		// A string-literal default holds a value, not an expression, even in
+		// the parenthesized DEFAULT ('{}') form.
+		if col.DefaultIsExpr && col.DefaultKind != DefaultKindString {
+			canonicalizeExprDefault(p, col)
+		}
 		canonicalizeExprParens(p, col.GeneratedExpr)
-		canonicalizeExprParens(p, col.Check)
+		for j := range col.Checks {
+			canonicalizeExprParens(p, &col.Checks[j].Expression)
+		}
 	}
 	for i := range ct.Constraints {
 		c := &ct.Constraints[i]
@@ -73,6 +93,17 @@ func (expressionParenNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		canonicalizeExprParens(p, c.Expression)
 		definition := checkConstraintDefinition(c)
 		c.Definition = &definition
+	}
+	for i := range ct.Indexes {
+		for j := range ct.Indexes[i].ColumnList {
+			canonicalizeExprParens(p, ct.Indexes[i].ColumnList[j].Expression)
+		}
+	}
+	if ct.Partition != nil {
+		canonicalizeExprParens(p, ct.Partition.Expression)
+		if ct.Partition.SubPartition != nil {
+			canonicalizeExprParens(p, ct.Partition.SubPartition.Expression)
+		}
 	}
 	return ct
 }
@@ -106,13 +137,21 @@ func (parenCanonicalizer) Leave(n ast.Node) (ast.Node, bool) {
 	switch e := n.(type) {
 	case *ast.ParenthesesExpr:
 		return e.Expr, true
+	case *ast.UnaryOperationExpr:
+		// MySQL's parser discards a unary plus outright, so SHOW CREATE TABLE
+		// never reports one: +1 reads back as 1. Its operand has already been
+		// through Leave, so it is wrapped if it is an operator.
+		if e.Op == opcode.Plus {
+			return e.V, true
+		}
+		return &ast.ParenthesesExpr{Expr: e}, true
 	case *ast.FuncCallExpr:
 		// A function call is self-delimiting, except for MEMBER OF, which the
 		// parser models as a call but restores as an infix operator.
 		if e.FnName.L == ast.JSONMemberOf {
 			return &ast.ParenthesesExpr{Expr: e}, true
 		}
-	case *ast.BinaryOperationExpr, *ast.UnaryOperationExpr, *ast.IsNullExpr, *ast.IsTruthExpr,
+	case *ast.BinaryOperationExpr, *ast.IsNullExpr, *ast.IsTruthExpr,
 		*ast.BetweenExpr, *ast.PatternInExpr, *ast.PatternLikeExpr, *ast.PatternRegexpExpr,
 		*ast.CompareSubqueryExpr, *ast.SetCollationExpr:
 		return &ast.ParenthesesExpr{Expr: n.(ast.ExprNode)}, true
@@ -124,28 +163,68 @@ func (parenCanonicalizer) Leave(n ast.Node) (ast.Node, bool) {
 // canonical parenthesization, in place. A nil or empty text is left alone; so
 // is one that does not re-parse (see parseExpressionText).
 func canonicalizeExprParens(p *parser.Parser, text *string) {
+	canonicalizeExprParensWith(p, text, restoreExpressionCanonicalText)
+}
+
+// canonicalizeExprParensWith is canonicalizeExprParens rendering with render,
+// which must be the restore the text was produced with plus
+// RestoreSkipRedundantParentheses (see rewriteExpressionText for why). It
+// returns the canonical tree so the caller can inspect what the text became.
+func canonicalizeExprParensWith(p *parser.Parser, text *string, render func(ast.ExprNode) (string, bool)) (ast.ExprNode, bool) {
 	if text == nil || *text == "" {
-		return
+		return nil, false
 	}
 	parsed, ok := parseExpressionText(p, *text)
 	if !ok {
-		return
+		return nil, false
 	}
 	node, ok := parsed.Accept(parenCanonicalizer{})
 	if !ok {
+		return nil, false
+	}
+	expr, ok := node.(ast.ExprNode)
+	if !ok {
+		return nil, false
+	}
+	rendered, ok := render(expr)
+	if !ok {
+		return nil, false
+	}
+	*text = rendered
+	return expr, true
+}
+
+// restoreExpressionCanonicalText renders an expression the way
+// restoreExpressionText does, minus the parentheses that MySQL's precedence
+// rules make redundant. The outermost parentheses carry no information — the
+// expression is already delimited by its surrounding CHECK (...) / AS (...)
+// syntax — and RestoreSkipRedundantParentheses drops them for that reason:
+// at the top level there is no enclosing operator to reason about.
+func restoreExpressionCanonicalText(expr ast.ExprNode) (string, bool) {
+	return restoreExprText(expr, format.DefaultRestoreFlags|format.RestoreSkipRedundantParentheses)
+}
+
+// restoreExprDefaultCanonicalText is restoreExprDefaultText minus the
+// redundant parentheses: the rendering of a canonicalized expression default.
+func restoreExprDefaultCanonicalText(expr ast.ExprNode) (string, bool) {
+	text, ok := restoreValueExprTextWith(expr, false, format.RestoreSkipRedundantParentheses).(string)
+	return text, ok
+}
+
+// canonicalizeExprDefault canonicalizes a column's expression default in
+// place. Dropping a unary plus or the parentheses can leave a bare literal —
+// DEFAULT (+1) is the number 1, DEFAULT (+'1') the string '1', which is how
+// MySQL stores them — so the literal kind is read off the canonical tree
+// again, and a string literal is stored raw the way the parse stores one.
+func canonicalizeExprDefault(p *parser.Parser, col *Column) {
+	expr, ok := canonicalizeExprParensWith(p, col.Default, restoreExprDefaultCanonicalText)
+	if !ok {
 		return
 	}
-	expr := node.(ast.ExprNode)
-	// The outermost parentheses carry no information — the expression is
-	// already delimited by its surrounding CHECK (...) / AS (...) syntax — and
-	// RestoreSkipRedundantParentheses drops them for that reason: at the top
-	// level there is no enclosing operator to reason about.
-	var sb strings.Builder
-	rCtx := format.NewRestoreCtx(
-		format.DefaultRestoreFlags|format.RestoreStringWithoutCharset|format.RestoreSkipRedundantParentheses,
-		&sb)
-	if err := expr.Restore(rCtx); err != nil {
+	expr = unwrapParenExpr(expr)
+	if literal, isStr := stringLiteralValue(expr); isStr {
+		col.Default, col.DefaultKind = &literal, DefaultKindString
 		return
 	}
-	*text = sb.String()
+	col.DefaultKind = classifyDefaultLiteral(expr)
 }

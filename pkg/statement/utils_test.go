@@ -45,6 +45,13 @@ func TestFormatPartitionValue(t *testing.T) {
 		{"trailing_dot", "1.", "'1.'"},
 		{"leading_dot", ".5", "'.5'"},
 		{"plus_sign_int", "+1", "'+1'"},
+
+		// Typed values
+		{"string_literal_numeric", partitionStringLiteral("2020"), "'2020'"},
+		{"expression", partitionExprValue("UNIX_TIMESTAMP('2031-01-01 00:00:00')"), "UNIX_TIMESTAMP('2031-01-01 00:00:00')"},
+		{"null", partitionNullValue{}, "NULL"},
+		{"maxvalue", partitionMaxValue{}, "MAXVALUE"},
+		{"tuple", partitionValueTuple{"1", partitionStringLiteral("a"), partitionNullValue{}}, "(1, 'a', NULL)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -117,21 +124,6 @@ func TestHelperFunctions(t *testing.T) {
 		require.True(t, needsQuotes("2023-01-01 00:00:00"))
 		require.True(t, needsQuotes(""))
 		require.True(t, needsQuotes("O'Brien"))
-	})
-
-	t.Run("getPreviousColumn", func(t *testing.T) {
-		columns := []Column{
-			{Name: "id"},
-			{Name: "name"},
-			{Name: "email"},
-			{Name: "created_at"},
-		}
-
-		require.Empty(t, getPreviousColumn(columns, "id"))
-		require.Equal(t, "id", getPreviousColumn(columns, "name"))
-		require.Equal(t, "name", getPreviousColumn(columns, "email"))
-		require.Equal(t, "email", getPreviousColumn(columns, "created_at"))
-		require.Empty(t, getPreviousColumn(columns, "nonexistent"))
 	})
 
 	t.Run("getPrimaryKeyIndex", func(t *testing.T) {
