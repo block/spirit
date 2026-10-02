@@ -53,9 +53,35 @@ type Collation struct {
 	IsDefault    bool
 	Sortlen      int
 	PadAttribute string
+	// CaseSensitive reports whether strings that differ only in letter case
+	// compare unequal ('abc' != 'ABC').
+	CaseSensitive bool
+	// AccentSensitive reports whether strings that differ only in accents
+	// compare unequal ('cafe' and 'café'). Insensitive still keeps apart a
+	// letter the collation's language counts as its own, such as Icelandic
+	// 'á'.
+	AccentSensitive Sensitivity
+	// KanaSensitive reports whether hiragana and katakana forms of the same
+	// kana compare unequal.
+	KanaSensitive Sensitivity
+	// Binary reports whether the collation compares bytes or code points
+	// rather than weights, so two values it calls equal are identical apart
+	// from the trailing spaces a PAD SPACE collation ignores. Moving a column
+	// onto a binary collation of the same charset cannot make values that
+	// compared unequal start comparing equal, unless it starts ignoring
+	// trailing spaces.
+	Binary bool
+	// UCAVersion is the Unicode Collation Algorithm version of the weights.
+	UCAVersion UCAVersion
+	// DeprecatedByCollationID is the ID of the collation that replaces this
+	// one, or 0 when none does. Following it from an obsolete collation
+	// reaches a current one.
+	DeprecatedByCollationID int
 }
 
 var collationsNameMap = make(map[string]*Collation)
+
+var collationsIDMap = make(map[int]*Collation)
 
 // CharacterSetInfos contains all the supported charsets.
 var CharacterSetInfos = map[string]*Charset{
@@ -160,6 +186,16 @@ func GetCollationByName(name string) (*Collation, error) {
 	collation, ok := collationsNameMap[csname]
 	if !ok {
 		return nil, ErrUnknownCollation.GenByArgs(name)
+	}
+	return collation, nil
+}
+
+// GetCollationByID returns the collation with the given ID, such as the one a
+// Collation's DeprecatedByCollationID names.
+func GetCollationByID(id int) (*Collation, error) {
+	collation, ok := collationsIDMap[id]
+	if !ok {
+		return nil, fmt.Errorf("unknown collation ID %d", id)
 	}
 	return collation, nil
 }
@@ -283,7 +319,10 @@ var charsets = map[string]*Charset{
 	CharsetUTF8MB4:  {Name: CharsetUTF8MB4, Maxlen: 4, DefaultCollation: "utf8mb4_0900_ai_ci", Desc: "UTF-8 Unicode", Collations: make(map[string]*Collation)},
 }
 
-var collations = []*Collation{
+// collations is built from collationTable by init.
+var collations []*Collation
+
+var collationTable = []collationRow{
 	{1, "big5", "big5_chinese_ci", true, 1, PadSpace},
 	{2, "latin2", "latin2_czech_cs", false, 1, PadSpace},
 	{3, "dec8", "dec8_swedish_ci", true, 1, PadSpace},
@@ -574,8 +613,14 @@ var collations = []*Collation{
 
 // init method always puts to the end of file.
 func init() {
+	built, err := buildCollations(collationTable)
+	if err != nil {
+		panic(fmt.Sprintf("build collation table: %v", err))
+	}
+	collations = built
 	for _, c := range collations {
 		collationsNameMap[c.Name] = c
+		collationsIDMap[c.ID] = c
 
 		if charset, ok := CharacterSetInfos[c.CharsetName]; ok {
 			charset.Collations[c.Name] = c
