@@ -336,6 +336,13 @@ type partitionStringLiteral string
 // SHOW CREATE TABLE's bare-keyword form.
 type partitionMaxValue struct{}
 
+// partitionNullValue is a sentinel for the NULL literal in a LIST partition's
+// VALUES IN list. Stored as the plain string "NULL" it would be emitted as
+// the string literal 'NULL', which is a different value: a REORGANIZE built
+// from it moves the NULL rows into no partition, and MySQL deletes them
+// without an error.
+type partitionNullValue struct{}
+
 // partitionValueTuple is one multi-column value of a LIST COLUMNS partition,
 // e.g. each of (1, 2) and (3, 4) in VALUES IN ((1, 2), (3, 4)). Keeping the
 // tuple as one element of PartitionValues.Values preserves which values go
@@ -1324,13 +1331,16 @@ func (ct *CreateTable) parsePartitionClause(clause ast.PartitionDefinitionClause
 // parsePartitionValue parses a single partition value expression. The
 // MAXVALUE keyword becomes the partitionMaxValue sentinel so it is emitted
 // bare (never as the string literal 'MAXVALUE', which MySQL rejects with
-// error 1697). String literals (LIST/RANGE COLUMNS on a string column) are
+// error 1697), and NULL becomes partitionNullValue for the same reason. String literals (LIST/RANGE COLUMNS on a string column) are
 // wrapped in partitionStringLiteral carrying their true raw value, so
 // emission can quote them unconditionally. Numeric literals and expressions
 // (e.g. YEAR(col)) fall back to the Restored text form as plain strings.
 func (ct *CreateTable) parsePartitionValue(expr ast.ExprNode) any {
 	if _, isMax := expr.(*ast.MaxValueExpr); isMax {
 		return partitionMaxValue{}
+	}
+	if v, ok := expr.(*ast.ValueExpr); ok && v.Kind() == ast.KindNull {
+		return partitionNullValue{}
 	}
 	if literal, isStr := stringLiteralValue(expr); isStr {
 		return partitionStringLiteral(literal)

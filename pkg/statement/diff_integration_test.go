@@ -920,6 +920,69 @@ func TestDiffIntegrationPartitionChanges(t *testing.T) {
 	}
 }
 
+// TestDiffIntegrationListNullValueKeepsRows verifies that a LIST partition
+// holding NULL keeps its NULL rows through a partition change. Emitted as the
+// string 'NULL', a REORGANIZE would move them into no partition, and MySQL
+// would delete them without an error.
+func TestDiffIntegrationListNullValueKeepsRows(t *testing.T) {
+	const create = "CREATE TABLE diff_list_null (id int NOT NULL, s varchar(10)) " +
+		"PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN (NULL, 'a'), PARTITION p1 VALUES IN ('b'))"
+	tests := []struct {
+		name     string
+		target   string
+		expected string
+	}{
+		{
+			name: "CommentChange",
+			target: "CREATE TABLE diff_list_null (id int NOT NULL, s varchar(10)) " +
+				"PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN (NULL, 'a') COMMENT 'x', PARTITION p1 VALUES IN ('b'))",
+			expected: "VALUES IN (NULL, 'a')",
+		},
+		{
+			name: "MoveNull",
+			target: "CREATE TABLE diff_list_null (id int NOT NULL, s varchar(10)) " +
+				"PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN ('a'), PARTITION p1 VALUES IN (NULL, 'b'))",
+			expected: "VALUES IN (NULL, 'b')",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := testutils.NewTestTable(t, "diff_list_null", create)
+			testutils.RunSQL(t, "INSERT INTO diff_list_null VALUES (1, NULL), (2, 'a'), (3, 'b')")
+			requireNoSelfDiff(t, tt.DB, tt.Name)
+
+			stmts := diffLiveTable(t, tt.DB, tt.Name, tc.target)
+			require.Len(t, stmts, 1)
+			require.Contains(t, stmts[0].Statement, "REORGANIZE PARTITION")
+			require.Contains(t, stmts[0].Statement, tc.expected)
+			execStatements(t, tt.DB, stmts)
+
+			var count int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_list_null").Scan(&count))
+			require.Equal(t, 3, count, "the NULL row must survive: %s", stmts[0].Statement)
+			requireConverged(t, tt.DB, tt.Name, tc.target)
+		})
+	}
+
+	// On an integer column NULL is re-emitted in a PARTITION BY (the split
+	// can't share an ALTER with the column change). Quoted, it didn't apply.
+	t.Run("IntegerRepartition", func(t *testing.T) {
+		tt := testutils.NewTestTable(t, "diff_list_null",
+			"CREATE TABLE diff_list_null (id int) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (NULL, 1))")
+		testutils.RunSQL(t, "INSERT INTO diff_list_null VALUES (NULL), (1)")
+		const target = "CREATE TABLE diff_list_null (id int, c int) PARTITION BY LIST (id) " +
+			"(PARTITION p0 VALUES IN (NULL), PARTITION p1 VALUES IN (1))"
+		stmts := diffLiveTable(t, tt.DB, tt.Name, target)
+		require.Len(t, stmts, 1)
+		require.Contains(t, stmts[0].Statement, "PARTITION BY LIST (`id`) (PARTITION `p0` VALUES IN (NULL)")
+		execStatements(t, tt.DB, stmts)
+		requireConverged(t, tt.DB, tt.Name, target)
+		var count int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM diff_list_null").Scan(&count))
+		require.Equal(t, 2, count)
+	})
+}
+
 // TestDiffIntegrationMultiColumnListNoSelfDiff verifies that a multi-column
 // LIST COLUMNS table, read back from SHOW CREATE TABLE, does not diff against
 // the SQL it was created from.

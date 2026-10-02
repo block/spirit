@@ -2493,6 +2493,32 @@ func TestDiffPartitionChanges(t *testing.T) {
 			expected: []string{"ALTER TABLE `t1` PARTITION BY LIST COLUMNS (`a`, `b`) (PARTITION `p0` VALUES IN ((1, 3), (2, 4)))"},
 		},
 		{
+			// NULL is a value, not the string 'NULL': emitted quoted, the
+			// REORGANIZE would move the NULL rows into no partition and MySQL
+			// would delete them.
+			name:     "ListNullValueCommentChange",
+			source:   "CREATE TABLE t1 (id INT NOT NULL, s VARCHAR(10)) PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN (NULL, 'a'), PARTITION p1 VALUES IN ('b'))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL, s VARCHAR(10)) PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN (NULL, 'a') COMMENT 'x', PARTITION p1 VALUES IN ('b'))",
+			expected: []string{"ALTER TABLE `t1` REORGANIZE PARTITION `p0` INTO (PARTITION `p0` VALUES IN (NULL, 'a') COMMENT = 'x')"},
+		},
+		{
+			// NULL and the string 'NULL' are different values, so swapping one
+			// for the other changes the value set: a repartition.
+			name:     "ListNullValueToStringNull",
+			source:   "CREATE TABLE t1 (id INT NOT NULL, s VARCHAR(10)) PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN (NULL, 'a'))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL, s VARCHAR(10)) PARTITION BY LIST COLUMNS (s) (PARTITION p0 VALUES IN ('NULL', 'a'))",
+			expected: []string{"ALTER TABLE `t1` PARTITION BY LIST COLUMNS (`s`) (PARTITION `p0` VALUES IN ('NULL', 'a'))"},
+		},
+		{
+			// Appending a partition while the subpartitioning changes is a
+			// repartition: ADD PARTITION would leave the subpartitioning as
+			// it was.
+			name:     "AppendWithSubpartitionChange",
+			source:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (10))",
+			target:   "CREATE TABLE t1 (id INT NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id) SUBPARTITION BY HASH (id) SUBPARTITIONS 4 (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+			expected: []string{"ALTER TABLE `t1` PARTITION BY RANGE (`id`) SUBPARTITION BY HASH (`id`) SUBPARTITIONS 4 (PARTITION `p0` VALUES LESS THAN (10), PARTITION `p1` VALUES LESS THAN (20))"},
+		},
+		{
 			// REORGANIZE can't share an ALTER and copies the table in spirit
 			// anyway, so alongside a column change it is a repartition.
 			name:     "SplitRangePartitionWithColumn",
