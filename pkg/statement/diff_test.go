@@ -831,7 +831,7 @@ func TestDiff(t *testing.T) {
 			name:     "Utf8mb3TableDefaultCollation",
 			source:   "CREATE TABLE s2 (id int NOT NULL, c varchar(10) DEFAULT NULL, u varchar(10) DEFAULT NULL, UNIQUE KEY u (u), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_unicode_ci",
 			target:   "CREATE TABLE s2 (id int NOT NULL, c varchar(10), u varchar(10), UNIQUE KEY u (u), PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb3",
-			expected: "ALTER TABLE `s2` MODIFY COLUMN `c` varchar(10) NULL, MODIFY COLUMN `u` varchar(10) NULL, COLLATE=utf8_general_ci",
+			expected: "ALTER TABLE `s2` MODIFY COLUMN `c` varchar(10) COLLATE utf8_general_ci NULL, MODIFY COLUMN `u` varchar(10) COLLATE utf8_general_ci NULL, COLLATE=utf8_general_ci",
 		},
 		{
 			// Declaring utf8mb3 explicitly, directly or through NVARCHAR,
@@ -888,7 +888,7 @@ func TestDiff(t *testing.T) {
 			name:     "TableCharsetWithoutCollationSelectsDefault",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) COLLATE latin1_bin DEFAULT NULL) DEFAULT CHARSET=latin1 COLLATE=latin1_bin",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=latin1",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) NULL, COLLATE=latin1_swedish_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) COLLATE latin1_swedish_ci NULL, COLLATE=latin1_swedish_ci",
 		},
 		{
 			// DEFAULT CHARSET=utf8mb4 without a COLLATE gives the table the
@@ -926,7 +926,7 @@ func TestDiff(t *testing.T) {
 			name:     "Utf8mb4WithoutCollationIsNotUtf8mb4Bin_Reverse",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3)) DEFAULT CHARSET=utf8mb4",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, a varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) NULL DEFAULT NULL, COLLATE=utf8mb4_bin",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `a` varchar(3) COLLATE utf8mb4_bin NULL DEFAULT NULL, COLLATE=utf8mb4_bin",
 		},
 		{
 			// Either server default is one the declared table can have, so
@@ -990,7 +990,7 @@ func TestDiff(t *testing.T) {
 			name:     "Utf8mb4ColumnWithoutCollationAgainstInheritedNonDefault_Reverse",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, b varchar(3) CHARACTER SET utf8mb4) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, b varchar(3) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `b` varchar(3) NULL DEFAULT NULL",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `b` varchar(3) COLLATE utf8mb4_bin NULL DEFAULT NULL",
 		},
 		{
 			// A table on a server-default collation is one the bare column
@@ -1092,13 +1092,13 @@ func TestDiff(t *testing.T) {
 			name:     "TableCollationChangeModifiesInheritingColumn_InheritedTarget",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) NULL, COLLATE=utf8mb4_general_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) COLLATE utf8mb4_general_ci NULL, COLLATE=utf8mb4_general_ci",
 		},
 		{
 			name:     "TableCharsetChangeModifiesInheritingColumn",
 			source:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 			target:   "CREATE TABLE t1 (id INT PRIMARY KEY, name VARCHAR(100)) CHARSET=latin1 COLLATE=latin1_swedish_ci",
-			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) NULL, DEFAULT CHARSET=latin1, COLLATE=latin1_swedish_ci",
+			expected: "ALTER TABLE `t1` MODIFY COLUMN `name` varchar(100) CHARACTER SET latin1 COLLATE latin1_swedish_ci NULL, DEFAULT CHARSET=latin1, COLLATE=latin1_swedish_ci",
 		},
 		// When both tables share the same defaults, a column that inherits
 		// them and a column that explicitly restates them are the same

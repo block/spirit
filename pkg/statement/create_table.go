@@ -1699,7 +1699,8 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions) []str
 				needsExplicitPosition[strings.ToLower(targetCol.Name)]
 
 			if needsModify {
-				clause := fmt.Sprintf("MODIFY COLUMN %s", formatColumnDefinition(modifiedColumn(&targetCol, resetsTableDefault)))
+				definition := withChangedCollationNamed(sourceCol, &targetCol, ct, target, opts)
+				clause := fmt.Sprintf("MODIFY COLUMN %s", formatColumnDefinition(modifiedColumn(definition, resetsTableDefault)))
 				if needsExplicitPosition[strings.ToLower(targetCol.Name)] {
 					if prevColumn == "" {
 						clause += " FIRST"
@@ -1732,6 +1733,37 @@ func modifiedColumn(col *Column, resetsTableDefault bool) *Column {
 	withCharset := *col
 	withCharset.Charset = new(charset.CharsetUTF8MB4)
 	return &withCharset
+}
+
+// withChangedCollationNamed returns the definition a MODIFY COLUMN renders for
+// col with its collation written out when col inherits its table's default and
+// the MODIFY moves it onto a different collation than source has. The charset
+// is written too when it changes as well. MySQL resolves an inheriting MODIFY
+// against the table default the same ALTER sets (see alterDefaults), so naming
+// that default stores the same column. Without it, a MODIFY that changes the
+// collation of every row reads like a restatement of the live column, because
+// the live form of the old collation is the only place it appears. A collation
+// that cannot be determined from the statement alone (see
+// resolvedCharsetCollation) is left unwritten, as is every column when
+// IgnoreCharsetCollation keeps the table default out of the ALTER.
+func withChangedCollationNamed(source, col *Column, sourceTable, targetTable *CreateTable, opts *DiffOptions) *Column {
+	if opts.IgnoreCharsetCollation || col.Charset != nil || col.Collation != nil || !charsetCarryingTypes[strings.ToLower(col.Type)] {
+		return col
+	}
+	targetCharset, targetCollation := resolvedCharsetCollation(col, targetTable)
+	if targetCollation == "" {
+		return col
+	}
+	sourceCharset, sourceCollation := resolvedCharsetCollation(source, sourceTable)
+	if sourceCollation == targetCollation {
+		return col
+	}
+	named := *col
+	named.Collation = &targetCollation
+	if sourceCharset != targetCharset {
+		named.Charset = &targetCharset
+	}
+	return &named
 }
 
 // calculateColumnPositioning determines which columns need explicit positioning (FIRST/AFTER).
