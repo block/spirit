@@ -66,6 +66,28 @@ func Exists(ctx context.Context, db *sql.DB) (bool, error) {
 	return count > 0, nil
 }
 
+// WarnIfIgnored is called instead of Wait by a run that did not defer its
+// cutover, and so cuts over without waiting on the sentinel. If the sentinel
+// table exists it logs a warning, so an operator who created the table
+// expecting it to hold this run's cutover can see why it did not. It only
+// reports: a failed probe is logged rather than returned, because whether the
+// table exists does not change what the run does next.
+func WarnIfIgnored(ctx context.Context, exists func(context.Context) (bool, error), logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	present, err := exists(ctx)
+	if err != nil {
+		logger.Warn("could not check for the sentinel table; this run did not defer cutover, so it cuts over without waiting on it",
+			"table", TableName, "error", err)
+		return
+	}
+	if present {
+		logger.Warn("sentinel table exists, but this run did not defer cutover, so it cuts over without waiting on it",
+			"table", TableName)
+	}
+}
+
 // WaitConfig holds the dependencies of Wait. Exists, RunChecksum and
 // InvalidateWatermark are required; Logger is optional (a nil Logger defaults to
 // slog.Default()). The poll/timeout timing comes from the package-level

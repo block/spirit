@@ -27,6 +27,7 @@ import (
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/runtime"
+	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -670,9 +671,9 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	t.Parallel()
 	// This test is similar to TestResumeFromCheckpointE2E but it adds a sentinel table
 	// created after the migration begins and is interrupted.
-	// The migration itself runs with DeferCutOver=false
-	// so we test to make sure a sentinel table created manually by the operator
-	// blocks cutover.
+	// The first run does not defer its cutover. The operator then creates the
+	// sentinel by hand and resumes with DeferCutOver, which is how a run started
+	// without --defer-cutover is held: the resumed run must wait on the sentinel.
 
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
 	tableName := `resume_checkpoint_e2e_w_sentinel`
@@ -768,6 +769,38 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, m.usedResumeFromCheckpoint.Load())
 	require.NoError(t, m.Close())
+}
+
+// TestResumeWithoutDeferIgnoresSurvivingSentinel: a deferred run interrupted
+// while parked on the sentinel, then resumed without DeferCutOver, cuts over
+// even though the sentinel still exists, and leaves the sentinel in place for
+// any other deferred run in the schema that may be waiting on it.
+func TestResumeWithoutDeferIgnoresSurvivingSentinel(t *testing.T) {
+	t.Parallel()
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE nodefer_resume (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARCHAR(100) NOT NULL DEFAULT '0')`)
+	testutils.RunSQLInDatabase(t, dbName, `INSERT INTO nodefer_resume (pad) SELECT REPEAT('a', 100) FROM dual`)
+	for range 10 {
+		testutils.RunSQLInDatabase(t, dbName, `INSERT INTO nodefer_resume (pad) SELECT REPEAT('a', 100) FROM nodefer_resume`)
+	}
+
+	r := NewTestRunner(t, "nodefer_resume", "ENGINE=InnoDB", WithDBName(dbName), WithDeferCutOver())
+	running := startTestRun(t, r.Run, r.Close)
+	waitForStatus(t, r, status.WaitingOnSentinelTable, running)
+	require.NoError(t, r.DumpCheckpoint(t.Context()))
+	running.cancel()
+	require.Error(t, running.wait(t))
+	require.NoError(t, r.Close())
+
+	r2 := NewTestRunner(t, "nodefer_resume", "ENGINE=InnoDB", WithDBName(dbName))
+	require.NoError(t, r2.Run(t.Context()), "a resume without DeferCutOver must cut over past the surviving sentinel")
+	require.NoError(t, r2.Close())
+	require.True(t, r2.usedResumeFromCheckpoint.Load(), "the second run must resume, not start over")
+
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?", dbName, sentinel.TableName).Scan(&n))
+	require.Equal(t, 1, n, "a run that did not defer leaves the sentinel where it found it")
 }
 
 // TestResumeFromCheckpointCleanupOnFailure tests that when a checkpoint's binlog

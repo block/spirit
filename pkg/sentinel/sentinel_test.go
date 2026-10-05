@@ -1,6 +1,7 @@
 package sentinel_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -187,4 +188,30 @@ func TestWaitParentContextCancelled(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	// Cleanup still runs even though the parent context was cancelled.
 	assert.True(t, invalidateCalled.Load())
+}
+
+// TestWarnIfIgnored: a run that did not defer its cutover warns when the
+// sentinel table exists, stays quiet when it does not, and reports a failed
+// probe without returning it.
+func TestWarnIfIgnored(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		exists func(context.Context) (bool, error)
+		want   string
+	}{
+		{"present", func(context.Context) (bool, error) { return true, nil }, "sentinel table exists, but this run did not defer cutover"},
+		{"absent", func(context.Context) (bool, error) { return false, nil }, ""},
+		{"probe fails", func(context.Context) (bool, error) { return false, errors.New("probe failed") }, "could not check for the sentinel table"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			sentinel.WarnIfIgnored(t.Context(), tc.exists, slog.New(slog.NewTextHandler(&buf, nil)))
+			if tc.want == "" {
+				assert.Empty(t, buf.String())
+				return
+			}
+			assert.Contains(t, buf.String(), "level=WARN")
+			assert.Contains(t, buf.String(), tc.want)
+		})
+	}
 }

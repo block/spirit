@@ -554,12 +554,16 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	// Reuse the configured checker while waiting for a sentinel, including one
-	// created manually. The completed initial checksum remains the cutover gate.
-	if r.migration.WaitsOnSentinel() {
+	// Only a deferred run waits on the sentinel (flags.Cutover.WaitsOnSentinel).
+	// While it waits, the configured checker re-verifies the copy; the
+	// completed initial checksum remains the cutover gate.
+	sentinelExists := func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) }
+	if !r.migration.WaitsOnSentinel() {
+		sentinel.WarnIfIgnored(ctx, sentinelExists, r.logger)
+	} else {
 		if err := r.status.DoContext(ctx, status.WaitingOnSentinelTable, func() error {
 			return sentinel.Wait(ctx, sentinel.WaitConfig{
-				Exists: func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.db) },
+				Exists: sentinelExists,
 				RunChecksum: func(ctx context.Context) error {
 					// Clear evidence before background work, including on a hard crash.
 					if err := r.invalidateChecksumWatermark(context.WithoutCancel(ctx)); err != nil {

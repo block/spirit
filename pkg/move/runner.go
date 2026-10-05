@@ -1480,10 +1480,13 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// all is shared with migrate (flags.Cutover.WaitsOnSentinel): only a
 	// deferred move waits, so a sentinel left behind by another run never
 	// holds a cutover nobody deferred.
-	if r.move.WaitsOnSentinel() {
+	sentinelExists := func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) }
+	if !r.move.WaitsOnSentinel() {
+		sentinel.WarnIfIgnored(ctx, sentinelExists, r.logger)
+	} else {
 		if err := r.status.DoContext(ctx, status.WaitingOnSentinelTable, func() error {
 			return sentinel.Wait(ctx, sentinel.WaitConfig{
-				Exists:              func(ctx context.Context) (bool, error) { return sentinel.Exists(ctx, r.targets[0].DB) },
+				Exists:              sentinelExists,
 				RunChecksum:         r.runContinuousChecksum,
 				InvalidateWatermark: r.invalidateChecksumWatermark,
 				Logger:              r.logger,
@@ -1491,6 +1494,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		}); err != nil {
 			return err
 		}
+		r.logger.Info("Sentinel released, starting cutover")
 	}
 
 	if r.move.ReverseWindow > 0 {
@@ -1499,7 +1503,6 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		// clobber the reverse-window phase / revert flag with a copy-phase row.
 		r.stopWatchTask()
 	}
-	r.logger.Info("Sentinel released, starting cutover")
 	// Create a cutover.
 	if err := r.status.DoContext(ctx, status.CutOver, func() error {
 		cutoverSources := make([]CutOverSource, len(r.sources))
