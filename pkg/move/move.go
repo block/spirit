@@ -19,9 +19,8 @@ type Move struct {
 	// --max-commit-latency (any target), autoscaling (the busiest target host
 	// scales every shard together), TLS and --checkpoint-max-age.
 	flags.Common
-	// Cutover holds the flags shared with migrate: lock timeouts,
-	// --defer-cutover (the sentinel lives on the first target) and
-	// --ignore-sentinel.
+	// Cutover holds the flags shared with migrate: lock timeouts and
+	// --defer-cutover (the sentinel lives on the first target).
 	flags.Cutover
 
 	SourceDSN             string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`

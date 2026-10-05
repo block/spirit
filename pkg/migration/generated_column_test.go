@@ -90,7 +90,6 @@ func TestGeneratedColumnModify(t *testing.T) {
 				WithThreads(1),
 				WithTestThrottler(),
 				WithDeferCutOver(),
-				WithRespectSentinel(),
 			)
 			running := startTestRun(t, m.Run, m.Close)
 

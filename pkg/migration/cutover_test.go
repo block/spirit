@@ -1121,8 +1121,7 @@ func TestDeferCutOver(t *testing.T) {
 
 	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 		WithDBName(dbName),
-		WithDeferCutOver(),
-		WithRespectSentinel())
+		WithDeferCutOver())
 
 	running := startTestRun(t, m.Run, m.Close)
 	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
@@ -1151,8 +1150,7 @@ func TestDeferCutOverE2E(t *testing.T) {
 
 	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 		WithDBName(dbName),
-		WithDeferCutOver(),
-		WithRespectSentinel())
+		WithDeferCutOver())
 
 	running := startTestRun(t, m.Run, m.Close)
 
@@ -1197,8 +1195,7 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 
 	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 		WithDBName(dbName),
-		WithDeferCutOver(),
-		WithRespectSentinel())
+		WithDeferCutOver())
 
 	running := startTestRun(t, m.Run, m.Close)
 
@@ -1315,8 +1312,7 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 
 	mA := NewTestRunner(t, "defer_shared_a", "ENGINE=InnoDB",
 		WithDBName(dbName),
-		WithDeferCutOver(),
-		WithRespectSentinel())
+		WithDeferCutOver())
 	runningA := startTestRun(t, mA.Run, mA.Close)
 	waitForStatus(t, mA, status.WaitingOnSentinelTable, runningA)
 
@@ -1324,8 +1320,7 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 	// sentinel, and re-creates the shared sentinel during its setup.
 	mB := NewTestRunner(t, "defer_shared_b", "ENGINE=InnoDB",
 		WithDBName(dbName),
-		WithDeferCutOver(),
-		WithRespectSentinel())
+		WithDeferCutOver())
 	runningB := startTestRun(t, mB.Run, mB.Close)
 	waitForStatus(t, mB, status.WaitingOnSentinelTable, runningB)
 
@@ -1341,6 +1336,39 @@ func TestDeferCutOverTwoMigrationsSharedSentinel(t *testing.T) {
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
 	require.NoError(t, runningA.wait(t))
 	require.NoError(t, runningB.wait(t))
+}
+
+// TestMigrationIgnoresSentinelItDidNotDefer runs a migration without
+// --defer-cutover in a schema where a deferred migration is parked on the
+// sentinel. The non-deferred migration must cut over without waiting, and the
+// deferred one must keep waiting: the sentinel holds only the run that asked
+// to defer.
+func TestMigrationIgnoresSentinelItDidNotDefer(t *testing.T) {
+	t.Parallel()
+
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	for _, tbl := range []string{"sentinel_deferred", "sentinel_immediate"} {
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(
+			`CREATE TABLE %s (id bigint unsigned not null auto_increment, primary key(id))`, tbl))
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(
+			"INSERT INTO %s () VALUES (),(),(),(),(),(),(),(),(),()", tbl))
+	}
+
+	deferred := NewTestRunner(t, "sentinel_deferred", "ENGINE=InnoDB",
+		WithDBName(dbName),
+		WithDeferCutOver())
+	runningDeferred := startTestRun(t, deferred.Run, deferred.Close)
+	waitForStatus(t, deferred, status.WaitingOnSentinelTable, runningDeferred)
+
+	immediate := NewTestRunner(t, "sentinel_immediate", "ENGINE=InnoDB",
+		WithDBName(dbName))
+	require.NoError(t, immediate.Run(t.Context()), "a migration that did not defer must cut over past the sentinel")
+	require.NoError(t, immediate.Close())
+
+	require.Equal(t, status.WaitingOnSentinelTable, deferred.status.Get(),
+		"the deferred migration must keep waiting until the sentinel is dropped")
+	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
+	require.NoError(t, runningDeferred.wait(t))
 }
 
 // TestMultiTableMigrationBlockedPerSchema verifies that only one atomic
@@ -1361,7 +1389,7 @@ func TestMultiTableMigrationBlockedPerSchema(t *testing.T) {
 	// Migration A (multi-table) parks on its deferred cutover, holding the
 	// schema lock for the whole run.
 	stmtA := "ALTER TABLE mt_lock_a1 ENGINE=InnoDB; ALTER TABLE mt_lock_a2 ENGINE=InnoDB"
-	mA := NewTestRunnerFromStatement(t, stmtA, WithDBName(dbName), WithDeferCutOver(), WithRespectSentinel())
+	mA := NewTestRunnerFromStatement(t, stmtA, WithDBName(dbName), WithDeferCutOver())
 	require.Len(t, mA.changes, 2)
 	runningA := startTestRun(t, mA.Run, mA.Close)
 	waitForStatus(t, mA, status.WaitingOnSentinelTable, runningA)

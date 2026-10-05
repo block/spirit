@@ -482,7 +482,7 @@ func TestCheckpointResumeAfterContinuousChecksum(t *testing.T) {
 	r := NewTestRunner(t, "cptresume", "ENGINE=InnoDB",
 		WithDBName(dbName),
 		WithThreads(4),
-		WithRespectSentinel())
+		WithDeferCutOver())
 
 	// Exercise the real lifecycle. Never invoke the initial gate concurrently
 	// with continuous verification: both phases now share the checker/chunker.
@@ -710,8 +710,7 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	runner := NewTestRunner(t, tableName, alterSQL,
 		WithDBName(dbName),
 		WithThreads(1),
-		WithTestThrottler(),
-		WithRespectSentinel())
+		WithTestThrottler())
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -744,10 +743,10 @@ func TestResumeFromCheckpointE2EWithManualSentinel(t *testing.T) {
 	m := NewTestRunner(t, tableName, alterSQL,
 		WithDBName(dbName),
 		WithThreads(4),
-		WithRespectSentinel())
+		WithDeferCutOver())
 
-	// Run the resumed migration in a goroutine. It should block on the
-	// manually-created sentinel table.
+	// Run the resumed migration in a goroutine. A resume does not create the
+	// sentinel, so the deferred run should block on the manually-created one.
 	c := make(chan error, 1)
 	go func() {
 		c <- m.Run(t.Context())

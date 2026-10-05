@@ -110,7 +110,6 @@ func (m *Migration) normalizeOptions() (stmts []*statement.AbstractStatement, er
 		return nil, err
 	}
 	m.WarnZeroWriteThreads(slog.Default())
-	m.WarnDeprecated(slog.Default())
 	m.Normalize()
 	if m.ReplicaMaxLag == 0 {
 		m.ReplicaMaxLag = 120 * time.Second

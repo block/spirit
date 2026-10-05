@@ -1872,7 +1872,6 @@ func TestEnumSetEscapedMembersDML(t *testing.T) {
 		WithDBName(dbName),
 		WithThreads(1),
 		WithDeferCutOver(),
-		WithRespectSentinel(),
 		WithSkipDropAfterCutover())
 	running := startTestRun(t, m.Run, m.Close)
 	waitForStatus(t, m, status.WaitingOnSentinelTable, running)

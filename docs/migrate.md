@@ -136,7 +136,7 @@ The defer cutover feature will not be used and the sentinel table will not be cr
 
 If defer-cutover is true, Spirit will create the "sentinel" table in the same schema as the table being altered; the name of the sentinel table will always be `_spirit_sentinel`. Spirit will block before the cutover, waiting for the operator to manually drop the sentinel table, which triggers Spirit to proceed with the cutover. Spirit will never delete the sentinel table on its own. It will block for 48 hours waiting for the sentinel table to be dropped by the operator, after which it will exit with an error.
 
-You can resume a migration from checkpoint and Spirit will start waiting again for you to drop the sentinel table. You can also choose to delete the sentinel table before restarting Spirit, which will cause it to resume from checkpoint and complete the cutover without waiting, even if you have again enabled `defer-cutover` for the migration.
+You can resume a migration from checkpoint and Spirit will start waiting again for you to drop the sentinel table. You can also choose to delete the sentinel table before restarting Spirit, which will cause it to resume from checkpoint and complete the cutover without waiting, even if you have again enabled `defer-cutover` for the migration. A migration resumed without `defer-cutover` does not wait on the sentinel table, even if it still exists.
 
 If you start a migration and realize that you forgot to set defer-cutover, worry not! You can manually create a sentinel table `_spirit_sentinel`, and Spirit will detect the table before the cutover is completed and block as though defer-cutover had been enabled from the beginning.
 
@@ -753,7 +753,7 @@ Note that the whole report is a single log record containing newlines. Spirit's 
 
 | Field | Meaning |
 | --- | --- |
-| `state` | The migration phase. Runs in order: `copyRows` → `applyChangeset` → `analyzeTable` → `checksum` → `postChecksum` → `waitingOnSentinelTable` → `cutOver`. The sentinel wait sits immediately before cutover and is entered whenever the sentinel is respected, which is the default: with [`--defer-cutover`](#defer-cutover) it blocks until you drop the sentinel table, and without it Spirit confirms no sentinel table exists and moves on. |
+| `state` | The migration phase. Runs in order: `copyRows` → `applyChangeset` → `analyzeTable` → `checksum` → `postChecksum` → `waitingOnSentinelTable` → `cutOver`. The sentinel wait sits immediately before cutover and is entered only with [`--defer-cutover`](#defer-cutover), where it blocks until you drop the sentinel table. |
 | `total-time` | Wall-clock time since the migration started. |
 | `copier-time` / `checksum-time` | Time spent in the current phase. |
 

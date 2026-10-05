@@ -74,7 +74,7 @@ The same caveats about [resuming across Spirit binary versions](migrate.md#resum
 
 When set to `true`, a sentinel table (`_spirit_sentinel`) is created on the first **target** database (targets[0], alongside the checkpoint) during setup, before the row copy starts. Move continues through copy and the initial checksum, then blocks before cutover until the sentinel table is manually dropped, giving the operator a chance to verify the copy before proceeding.
 
-A sentinel table that Move did not create blocks the cutover in the same way. If you start a move without `defer-cutover`, you can create `_spirit_sentinel` on the first target before the cutover, and Move blocks as though `defer-cutover` had been set. This applies to programmatic callers that leave `DeferCutOver` unset as well as to the CLI.
+Only a move started with `defer-cutover` waits on the sentinel. A move without it cuts over even if `_spirit_sentinel` exists on the first target, for example one left behind by an earlier deferred move that was cancelled. This applies to programmatic callers that leave `DeferCutOver` unset as well as to the CLI.
 
 #### Two-checksum model
 

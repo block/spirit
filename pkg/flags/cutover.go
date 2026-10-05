@@ -1,9 +1,7 @@
 package flags
 
 import (
-	"errors"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
@@ -24,58 +22,28 @@ type Cutover struct {
 
 	// DeferCutOver creates the sentinel table before the copy, so the run
 	// blocks before cutover (running a continuous checksum) until an operator
-	// drops it.
+	// drops it. Only a deferred run waits on the sentinel: see WaitsOnSentinel.
 	DeferCutOver bool `name:"defer-cutover" help:"Defer cutover (and continuous checksum) until the sentinel table is dropped" optional:"" default:"false"`
-	// IgnoreSentinel lets the run cut over while a sentinel table it did not
-	// create exists. By default (the zero value, for the CLI and for
-	// programmatic callers alike) a run blocks before cutover while any
-	// sentinel exists, so an operator can hold a cutover by creating one. It
-	// never overrides DeferCutOver: see WaitsOnSentinel. Tests set it so they
-	// can run concurrently despite the shared sentinel name.
-	IgnoreSentinel bool `name:"ignore-sentinel" help:"Cut over even while a sentinel table exists, unless --defer-cutover is set" optional:"" default:"false" hidden:""`
-	// DeprecatedRespectSentinel keeps the removed hidden --respect-sentinel
-	// parsing on the CLI: --respect-sentinel=false means --ignore-sentinel.
-	// It is a pointer so that an unset flag is distinguishable from false.
-	// Go callers set IgnoreSentinel instead. Remove in a later release.
-	DeprecatedRespectSentinel *bool `name:"respect-sentinel" help:"Deprecated: use --ignore-sentinel" optional:"" hidden:""`
 }
 
 // WaitsOnSentinel reports whether the run blocks before cutover while the
-// sentinel table exists. DeferCutOver overrides IgnoreSentinel: a run that
-// created a sentinel and then ignored it would cut over without the deferral
-// the caller asked for.
+// sentinel table exists. Only a deferred run does. A run that did not ask to
+// defer cuts over even if a sentinel is present, such as one left behind by
+// an earlier deferred run that was cancelled or failed, so a stray sentinel
+// never holds a cutover nobody deferred.
 func (c *Cutover) WaitsOnSentinel() bool {
-	return c.DeferCutOver || !c.ignoresSentinel()
-}
-
-func (c *Cutover) ignoresSentinel() bool {
-	if c.DeprecatedRespectSentinel != nil {
-		return !*c.DeprecatedRespectSentinel
-	}
-	return c.IgnoreSentinel
+	return c.DeferCutOver
 }
 
 // Validate rejects a negative LockWaitTimeout (ApplyTo would silently keep
-// the default), a ForceKillAfter that leaves no time to acquire a lock, and
-// --respect-sentinel combined with --ignore-sentinel.
+// the default) and a ForceKillAfter that leaves no time to acquire a lock.
 func (c *Cutover) Validate() error {
-	if c.DeprecatedRespectSentinel != nil && c.IgnoreSentinel {
-		return errors.New("--respect-sentinel is deprecated and cannot be combined with --ignore-sentinel")
-	}
 	if c.LockWaitTimeout < 0 {
 		return fmt.Errorf("--lock-wait-timeout must be non-negative, got %s", c.LockWaitTimeout)
 	}
 	config := dbconn.NewDBConfig()
 	c.ApplyTo(config)
 	return config.ValidateForceKillAfter()
-}
-
-// WarnDeprecated logs once per run when the deprecated --respect-sentinel is
-// set. It is separate from Validate because Validate runs more than once.
-func (c *Cutover) WarnDeprecated(logger *slog.Logger) {
-	if c.DeprecatedRespectSentinel != nil {
-		logger.Warn("--respect-sentinel is deprecated and will be removed: a sentinel is respected by default; use --ignore-sentinel instead of --respect-sentinel=false")
-	}
 }
 
 // ApplyTo copies the lock timeouts onto a connection config. A zero

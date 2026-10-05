@@ -205,7 +205,6 @@ func NewRunner(m *Move) (*Runner, error) {
 		return nil, err
 	}
 	m.WarnZeroWriteThreads(slog.Default())
-	m.WarnDeprecated(slog.Default())
 	m.Normalize()
 	r := &Runner{
 		move:                m,
@@ -1107,10 +1106,10 @@ func (r *Runner) newCopy(ctx context.Context) error {
 	// move's coordination tables live in one place (the source tables are
 	// renamed out of the way at cutover). Only the fresh-copy path creates it;
 	// a resume never does, and does not need to — the sentinel lives on the
-	// target, so it simply survives, and sentinel.Wait below blocks on it
-	// again unless --ignore-sentinel is set without --defer-cutover (see
-	// flags.Cutover.WaitsOnSentinel). If the operator dropped it before the
-	// resume, the resumed move cuts over without waiting, matching migrate.
+	// target, so it simply survives, and a resumed deferred move blocks on it
+	// again in sentinel.Wait below (see flags.Cutover.WaitsOnSentinel). If the
+	// operator dropped it before the resume, the resumed move cuts over
+	// without waiting, matching migrate.
 	// Creation is idempotent (CREATE IF NOT EXISTS) so that a concurrent
 	// existence probe never sees it absent — see
 	// TestCreateSentinelTableIdempotent.
@@ -1478,9 +1477,9 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// watermark invalidation are move-specific (multi-source feeds;
 	// invalidateChecksumWatermark blanks the whole per-move checkpoint table),
 	// so they are injected as callbacks. See pkg/sentinel. Whether to wait at
-	// all is shared with migrate (flags.Cutover.WaitsOnSentinel): by default a
-	// move waits on any sentinel, including one an operator created to hold
-	// the cutover.
+	// all is shared with migrate (flags.Cutover.WaitsOnSentinel): only a
+	// deferred move waits, so a sentinel left behind by another run never
+	// holds a cutover nobody deferred.
 	if r.move.WaitsOnSentinel() {
 		if err := r.status.DoContext(ctx, status.WaitingOnSentinelTable, func() error {
 			return sentinel.Wait(ctx, sentinel.WaitConfig{

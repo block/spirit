@@ -44,7 +44,7 @@ func TestTriggerOrForeignKeyCreatedDuringMigrationRefused(t *testing.T) {
 
 			// A copy-path ALTER, held before cutover by the sentinel table.
 			m := NewTestRunner(t, "ddlrun", "MODIFY name TEXT",
-				WithDBName(dbName), WithThreads(1), WithDeferCutOver(), WithRespectSentinel())
+				WithDBName(dbName), WithThreads(1), WithDeferCutOver())
 			running := startTestRun(t, m.Run, m.Close)
 			waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 
@@ -93,7 +93,7 @@ func TestTriggerOrForeignKeyCreatedWhileCutoverWaitsForLock(t *testing.T) {
 			testutils.RunSQLInDatabase(t, dbName, "INSERT INTO ddlrun VALUES (1, 'a'), (2, 'b')")
 			testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE ddlrun_child (id INT NOT NULL PRIMARY KEY, pid INT)")
 			m := NewTestRunner(t, "ddlrun", "MODIFY name TEXT",
-				WithDBName(dbName), WithThreads(1), WithDeferCutOver(), WithRespectSentinel())
+				WithDBName(dbName), WithThreads(1), WithDeferCutOver())
 			running := startTestRun(t, m.Run, m.Close)
 			waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 

@@ -299,7 +299,7 @@ func TestCutOverCarriesAutoIncrement(t *testing.T) {
 	}
 	m := NewTestRunnerFromStatement(t,
 		"ALTER TABLE autoinc_queue MODIFY v BIGINT NOT NULL; ALTER TABLE autoinc_queue2 MODIFY v BIGINT NOT NULL",
-		WithDBName(dbName), WithThreads(1), WithDeferCutOver(), WithRespectSentinel())
+		WithDBName(dbName), WithThreads(1), WithDeferCutOver())
 	running := startTestRun(t, m.Run, m.Close)
 	waitForStatus(t, m, status.WaitingOnSentinelTable, running)
 

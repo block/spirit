@@ -408,8 +408,7 @@ func TestPreventConcurrentRuns(t *testing.T) {
 
 	m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 		WithDBName(dbName),
-		WithDeferCutOver(),
-		WithRespectSentinel())
+		WithDeferCutOver())
 	running := startTestRun(t, m.Run, m.Close)
 
 	// Wait until m has reached the sentinel wait phase before starting m2.

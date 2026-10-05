@@ -195,7 +195,6 @@ func TestContinuousChecksumAbortsThenResumeRepairs(t *testing.T) {
 			m := NewTestRunner(t, tableName, "ENGINE=InnoDB",
 				WithThreads(1),
 				WithDeferCutOver(),
-				WithRespectSentinel(),
 				withChecker)
 			running := startTestRun(t, m.Run, m.Close)
 			waitForStatus(t, m, status.WaitingOnSentinelTable, running)
@@ -317,7 +316,7 @@ func TestContinuousChecksumInvalidatesBeforeExit(t *testing.T) {
 	dbName, db := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE eager_invalidation (id INT PRIMARY KEY)")
 	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO eager_invalidation VALUES (1)")
-	m := NewTestRunner(t, "eager_invalidation", "ENGINE=InnoDB", WithDBName(dbName), WithThreads(1), WithTestThrottler(), WithDeferCutOver(), WithRespectSentinel())
+	m := NewTestRunner(t, "eager_invalidation", "ENGINE=InnoDB", WithDBName(dbName), WithThreads(1), WithTestThrottler(), WithDeferCutOver())
 	running := startTestRun(t, m.Run, m.Close)
 	waitForStatus(t, m, status.CopyRows, running)
 	_, err := db.ExecContext(t.Context(), "INSERT INTO _eager_invalidation_chkpnt (id, checksum_watermark, statement) VALUES (1, 'old-initial-watermark', ?)", m.migration.Statement)

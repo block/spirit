@@ -75,7 +75,7 @@ func TestLocklessChecksumResumeAfterInitialChecksum(t *testing.T) {
 		testutils.RunSQLInDatabase(t, dbName, `INSERT INTO lockless_resume_chk (id2, pad) SELECT 1, REPEAT('a', 100) FROM lockless_resume_chk`)
 	}
 
-	r := NewTestRunner(t, "lockless_resume_chk", "ENGINE=InnoDB", WithDBName(dbName), WithThreads(4), WithRespectSentinel(), withLockless())
+	r := NewTestRunner(t, "lockless_resume_chk", "ENGINE=InnoDB", WithDBName(dbName), WithThreads(4), WithDeferCutOver(), withLockless())
 	running := startTestRun(t, r.Run, r.Close)
 	waitForStatus(t, r, status.WaitingOnSentinelTable, running)
 
