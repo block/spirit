@@ -134,11 +134,17 @@ The "defer cutover" feature makes spirit wait to perform the final cutover until
 
 The defer cutover feature will not be used and the sentinel table will not be created if the schema migration can be successfully executed using `ALGORITHM=INSTANT` (see "Attempt Instant DDL" in the [project README](../README.md)).
 
-If defer-cutover is true, Spirit will create the "sentinel" table in the same schema as the table being altered; the name of the sentinel table will always be `_spirit_sentinel`. Spirit will block before the cutover, waiting for the operator to manually drop the sentinel table, which triggers Spirit to proceed with the cutover. Spirit will never delete the sentinel table on its own. It will block for 48 hours waiting for the sentinel table to be dropped by the operator, after which it will exit with an error.
+Deferring a cutover is decided when Spirit starts, and the sentinel table only holds a run that was started with `defer-cutover`:
 
-You can resume a migration from checkpoint and Spirit will start waiting again for you to drop the sentinel table. You can also choose to delete the sentinel table before restarting Spirit, which will cause it to resume from checkpoint and complete the cutover without waiting, even if you have again enabled `defer-cutover` for the migration. A migration resumed without `defer-cutover` does not wait on the sentinel table, even if it still exists.
+1. **Pass `defer-cutover` at startup.** It cannot be turned on for a run that is already in progress.
+2. **Spirit creates the sentinel table.** When a migration starts fresh with `defer-cutover`, Spirit creates `_spirit_sentinel` in the same schema as the table being altered, before the row copy begins.
+3. **The cutover is held for as long as the table exists.** Spirit blocks before the cutover until the operator drops the sentinel table, then proceeds. Spirit never drops the sentinel table itself. After 48 hours of waiting it exits with an error.
 
-If you start a migration and realize that you forgot to set defer-cutover, worry not! You can manually create a sentinel table `_spirit_sentinel`, and Spirit will detect the table before the cutover is completed and block as though defer-cutover had been enabled from the beginning.
+A run started without `defer-cutover` never waits on the sentinel table. Creating `_spirit_sentinel` by hand while it runs has no effect, and neither does a sentinel table left behind by an earlier deferred migration: the run cuts over without waiting.
+
+A migration resumed from checkpoint with `defer-cutover` waits again if the sentinel table still exists. A resume does not create the table, so dropping it before restarting Spirit lets the resumed migration complete the cutover without waiting. A migration resumed without `defer-cutover` does not wait, even if the sentinel table still exists.
+
+If you start a migration and realize you forgot to set `defer-cutover`, cancel it, create `_spirit_sentinel` in the schema, and restart with `defer-cutover`. The migration resumes from its checkpoint and waits for you to drop the table.
 
 #### Initial and continuous verification
 

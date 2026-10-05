@@ -27,10 +27,11 @@ type Cutover struct {
 }
 
 // WaitsOnSentinel reports whether the run blocks before cutover while the
-// sentinel table exists. Only a deferred run does. A run that did not ask to
-// defer cuts over even if a sentinel is present, such as one left behind by
-// an earlier deferred run that was cancelled or failed, so a stray sentinel
-// never holds a cutover nobody deferred.
+// sentinel table exists. Only a deferred run does, and DeferCutOver is fixed
+// when the run starts. A run that did not ask to defer cuts over even if a
+// sentinel is present, whether an operator created it during the run or an
+// earlier deferred run that was cancelled or failed left it behind, so a
+// stray sentinel never holds a cutover nobody deferred.
 func (c *Cutover) WaitsOnSentinel() bool {
 	return c.DeferCutOver
 }

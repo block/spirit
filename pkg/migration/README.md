@@ -134,7 +134,7 @@ While the copy runs, the change source applies binlog row images to `_new`. With
 
 ### 13. Sentinel wait
 
-With `--defer-cutover`, the runner blocks before cutover while a table named `_spirit_sentinel` exists in the schema. The runner created the sentinel in setup, and an operator drops it to release the cutover. Without `--defer-cutover` the step is skipped, even if a sentinel exists: one left behind by another run, such as a cancelled deferred migration, never holds a cutover nobody deferred (`flags.Cutover.WaitsOnSentinel`).
+With `--defer-cutover`, which is read once at startup, the runner blocks before cutover while a table named `_spirit_sentinel` exists in the schema. A fresh run creates the sentinel in setup (a resume does not), and an operator drops it to release the cutover. Without `--defer-cutover` the step is skipped, even if a sentinel exists: one created by hand during the run, or left behind by another run such as a cancelled deferred migration, never holds a cutover nobody deferred (`flags.Cutover.WaitsOnSentinel`).
 
 If no sentinel exists, the step returns immediately. While waiting, a **continuous checksum** re-verifies the tables in the background, at most one pass per hour. A divergence it confirms aborts the migration rather than being repaired. Entering the wait discards the saved checksum watermark, so a run interrupted during the wait keeps its copy progress but repeats the whole initial checksum when it resumes. The wait gives up with an error after 48 hours (`sentinel.WaitLimit`). See [defer-cutover](../../docs/migrate.md#defer-cutover).
 
