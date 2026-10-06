@@ -37,12 +37,13 @@ type Copier interface {
 	StartTime() time.Time
 	GetProgress() string
 	// CopyProgress returns the copier's own measure of the copy in numeric
-	// form: the chunker's Progress, which for the optimistic chunker is
-	// keyspace distance against the auto_increment max rather than rows. It
-	// is the measure the ETA is paced on. Callers reporting rows to a human
+	// form: the chunker's Progress, which for the optimistic chunker on a
+	// dense key is keyspace distance against the auto_increment max rather
+	// than rows, and on a sparse key is settled rows against the row estimate.
+	// It is the measure the ETA is paced on. Callers reporting rows to a human
 	// or a wrapper should sum the chunker's per-table settled counts instead
-	// (status.CopyFromTables), which is what the runners do. GetProgress is
-	// this value rendered.
+	// (status.CopyFromTables), which is what the runners do: it is rows on
+	// every key. GetProgress is this value rendered.
 	CopyProgress() status.CopyProgress
 	// ChunkSize returns the row count of the most recently claimed chunk, or
 	// 0 before the first one. This is the dynamic chunker's current sizing

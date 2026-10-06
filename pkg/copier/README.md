@@ -62,7 +62,7 @@ type ChunkCopier interface {
 - **`Run(ctx)`**: Starts the copy process and blocks until completion or error. Spawns multiple worker goroutines based on the configured concurrency level.
 - **`GetETA()`**: Returns estimated time to completion as a human-readable string. Returns "TBD" during the initial warmup period (1 minute), "DUE" when >99.99% complete, or a duration like "2h30m15s".
 - **`GetETAState()`**: The same estimate as a `status.ETA{State, Duration}`, for callers that branch on whether an estimate exists yet. `GetETA()` is its `String()`.
-- **`CopyProgress()`**: Returns the copier's own progress as `status.CopyProgress{RowsCopied, RowsTotal}`. This is the measure the copier paces on: for the optimistic chunker it is keyspace distance against the auto_increment max, not a row count, so the runners report settled rows from the chunker instead (see `status.CopyFromTables`). `GetProgress()` is its rendered form, kept for interface compatibility; Spirit itself no longer calls it.
+- **`CopyProgress()`**: Returns the copier's own progress as `status.CopyProgress{RowsCopied, RowsTotal}`. This is the measure the copier paces on: for the optimistic chunker on a dense key it is keyspace distance against the auto_increment max, not a row count. On a key space more than five times wider than the row estimate, it is settled rows against the row estimate, the same measure the composite chunker reports. The runners report settled rows from the chunker on every key (see `status.CopyFromTables`). `GetProgress()` is its rendered form, kept for interface compatibility; Spirit itself no longer calls it.
 - **`ChunkSize()`**: Rows in the most recently claimed chunk, the `chunk-size=` field of the status log block. The chunker sizes chunks dynamically to hit the target byte budget, so this moves during a copy.
 - **`GetChunker()`**: Returns the underlying chunker for accessing detailed progress information.
 - **`SetThrottler(throttler)`**: Updates the throttler used to control copy rate.
@@ -173,7 +173,8 @@ for {
         return
     case <-ticker.C:
         // Settled rows against the row estimates, summed over the tables.
-        // CopyProgress() is the copier's own pacing measure, not a row count.
+        // CopyProgress() is the copier's own pacing measure, which on a dense
+        // auto_increment key is keyspace distance rather than a row count.
         progress := status.CopyFromTables(status.TablesFromChunker(copier.GetChunker()))
         eta := copier.GetETAState()
         fmt.Printf("Progress: %s, ETA: %s\n", progress, eta)

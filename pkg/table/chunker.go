@@ -65,11 +65,11 @@ type Chunker interface {
 	Progress() (rowsRead uint64, chunksCopied uint64, totalRowsExpected uint64)
 	// RowsCopied returns the number of rows the applier has actually settled,
 	// summed from the actualRows reported to Feedback. It is deliberately not
-	// Progress's first return: the optimistic chunker measures progress as
-	// distance travelled through the auto-increment key space (so that it can
-	// be compared against the auto-increment max), which on a sparse table is
-	// nothing like a row count. Use Progress to render a percentage, and this
-	// to report how much data was copied.
+	// Progress's first return: on a dense key the optimistic chunker measures
+	// progress as distance travelled through the auto-increment key space (so
+	// that it can be compared against the auto-increment max), which is not a
+	// row count. Use Progress to render a percentage, and this to report how
+	// much data was copied.
 	//
 	// A resumed run carries the count forward from the watermark, so it
 	// reports the work of every run that contributed to the copy rather than

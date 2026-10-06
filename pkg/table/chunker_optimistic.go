@@ -79,17 +79,14 @@ type chunkerOptimistic struct {
 	chunksCopied     atomic.Uint64
 	// progressInRows is set when the key space is too sparse for key-space
 	// distance to measure the copy (see keySpaceIsSparse). Progress then
-	// reports sourceRowsRead against the table's row estimate. It is decided
-	// when the chunker opens and held for the run, so every Progress reading
-	// in a run is in the same unit and the copy rate measured between two of
-	// them is meaningful.
+	// reports the row estimate the composite chunker reports:
+	// actualRowsCopied against the table's row estimate. It is decided when
+	// the chunker opens and held for the run, so every Progress reading in a
+	// run is in the same unit and the copy rate measured between two of them
+	// is meaningful. A key that becomes sparse after the chunker opens, such as
+	// an auto_increment that jumps mid-copy, keeps reporting key-space distance
+	// until the copy next resumes.
 	progressInRows atomic.Bool
-	// sourceRowsRead is the rows the producer read from the source for each
-	// chunk fed back, which is the row measure Progress uses on a sparse key.
-	// actualRowsCopied cannot serve: INSERT IGNORE does not count a row the
-	// change stream already wrote to the new table. A resume seeds it with the
-	// rows below the watermark, so the rows it copies again are counted once.
-	sourceRowsRead atomic.Uint64
 	// keySpaceOrigin is MinValue as it stood when the chunker opened, the
 	// point rowsCopied measures from. Statistics refresh MinValue during the
 	// copy, so the key-space total is measured from this rather than from the
@@ -127,12 +124,6 @@ type optimisticWatermark struct {
 	// way, and it is why completion is tested with IsComplete rather than by
 	// comparing the count against the table's rows.
 	RowsCopied uint64
-
-	// SourceRowsBelow is the source rows of the chunks wholly below the
-	// watermark chunk (see watermarkTracker.rowsBelowWatermark). Unlike
-	// RowsCopied it excludes every row the resume copies again, so it is the
-	// count a row-based Progress resumes from.
-	SourceRowsBelow uint64
 }
 
 // maxPrefetchRejections is how many prefetch episodes may be abandoned on their
@@ -434,8 +425,6 @@ func (t *chunkerOptimistic) OpenAtWatermark(cp string) error {
 		return fmt.Errorf("could not read rows copied from watermark: %w", err)
 	}
 	t.actualRowsCopied.Store(restored.RowsCopied)
-	t.rowsBelowWatermark = restored.SourceRowsBelow
-	t.sourceRowsRead.Store(restored.SourceRowsBelow)
 	return nil
 }
 
@@ -459,7 +448,6 @@ func (t *chunkerOptimistic) Reset() error {
 	t.finalChunkSent = false
 	t.chunkSize = StartingChunkSize
 	t.watermark = nil
-	t.rowsBelowWatermark = 0
 	t.lowerBoundWatermarkMap = make(map[string]*Chunk, 0)
 	t.inflightChunks = 0
 	t.chunkTimingInfo = []time.Duration{}
@@ -474,7 +462,6 @@ func (t *chunkerOptimistic) Reset() error {
 	t.rowsCopied.Store(0)
 	t.actualRowsCopied.Store(0)
 	t.chunksCopied.Store(0)
-	t.sourceRowsRead.Store(0)
 	t.openProgress()
 
 	// Make sure min/max value are always specified
@@ -491,16 +478,8 @@ func (t *chunkerOptimistic) Feedback(chunk *Chunk, d time.Duration, actualRows u
 	t.Lock()
 	defer t.Unlock()
 	t.chunkFedBack()
-	// A producer that does not hold the rows itself (the checksum) leaves
-	// SourceRows at zero, and its own count of the chunk's rows stands in.
-	// It is recorded on the chunk because the watermark counts a chunk's rows
-	// when it moves past the chunk, which can be after this call returns.
-	if chunk.SourceRows == 0 {
-		chunk.SourceRows = actualRows
-	}
 	t.bumpWatermark(chunk, t.logger)
 	t.actualRowsCopied.Add(actualRows)
-	t.sourceRowsRead.Add(chunk.SourceRows)
 
 	// It is up to the chunker implementation to decide how to track "rows copied"
 	// In the optimistic chunker, since it is really designed around auto_increment
@@ -730,9 +709,8 @@ func (t *chunkerOptimistic) GetLowWatermark() (string, error) {
 	}
 
 	out, err := json.Marshal(optimisticWatermark{
-		JSONChunk:       t.watermark.jsonChunk(),
-		RowsCopied:      t.actualRowsCopied.Load(),
-		SourceRowsBelow: t.rowsBelowWatermark,
+		JSONChunk:  t.watermark.jsonChunk(),
+		RowsCopied: t.actualRowsCopied.Load(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("could not serialize watermark: %w", err)
@@ -773,8 +751,6 @@ func (t *chunkerOptimistic) open() (err error) {
 	// Initialize progress tracking
 	t.rowsCopied.Store(0)
 	t.actualRowsCopied.Store(0)
-	t.sourceRowsRead.Store(0)
-	t.rowsBelowWatermark = 0
 	t.openProgress()
 
 	// Make sure min/max value are always specified
@@ -799,12 +775,13 @@ func (t *chunkerOptimistic) RowsCopied() uint64 {
 }
 
 // Progress reports the copied and total amounts in key-space distance from
-// the minimum key, which is exact for a dense auto-increment key. A key space
-// too sparse for that (see keySpaceIsSparse) is reported in source rows read
-// against the table's row estimate instead.
+// the minimum key. Its total is exact rather than estimated, so for a dense
+// auto-increment key it cannot overshoot 100% or finish short of it. A key
+// space too sparse for that (see keySpaceIsSparse) reports the row estimate
+// instead, the same measure the composite chunker reports.
 func (t *chunkerOptimistic) Progress() (uint64, uint64, uint64) {
 	if t.progressInRows.Load() {
-		return t.sourceRowsRead.Load(), t.chunksCopied.Load(), atomic.LoadUint64(&t.Ti.EstimatedRows)
+		return progressInRowEstimate(t.actualRowsCopied.Load(), t.chunksCopied.Load(), t.Ti)
 	}
 	total, ok := t.keySpaceWidth()
 	if !ok {
@@ -825,12 +802,14 @@ func (t *chunkerOptimistic) openProgress() {
 }
 
 // keySpaceSparseFactor is how many times wider than its row estimate a key
-// space has to be before the optimistic chunker reports progress in rows.
-// Past it, key-space distance is off from the rows left by more than a row
-// estimate usually is, and on a key with a wide gap ahead of the copy it is
-// off by orders of magnitude: the ETA paces the whole gap at the rate the
-// copy moves through populated keys.
-const keySpaceSparseFactor = 2
+// space has to be before the optimistic chunker reports progress in rows. On
+// a key with a wide gap ahead of the copy, key-space distance is off by orders
+// of magnitude: the ETA paces the whole gap at the rate the copy moves through
+// populated keys. The factor is wide so that the gaps deletes leave, a row
+// estimate that lags the table, and a small auto_increment_increment all keep
+// the exact key-space measure. A gap narrower than the factor goes undetected,
+// and the ETA runs long until the copy reaches it.
+const keySpaceSparseFactor = 5
 
 // keySpaceIsSparse reports whether the key space is wider than the table's
 // row estimate by more than keySpaceSparseFactor. A table with no row estimate

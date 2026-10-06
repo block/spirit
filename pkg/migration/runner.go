@@ -1353,7 +1353,7 @@ func (r *Runner) Result() status.WorkflowResult {
 // Progress and Status both derive their copy figures from it, so the API and
 // the log block report one measure: settled rows against the tables'
 // cardinality estimates, kept past the end of the copy. The copier's own
-// progress is not used for either, because on an auto_increment key it
+// progress is not used for either, because on a dense auto_increment key it
 // measures keyspace distance, not rows. The chunker is read under chunkerMu
 // to synchronize with initChunkers(), which may be assigning it concurrently
 // during setup.

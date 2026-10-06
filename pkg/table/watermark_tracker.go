@@ -46,24 +46,6 @@ type watermarkTracker struct {
 	// the final chunk has been dispatched AND inflightChunks is zero has
 	// every dispatched chunk been committed and fed back.
 	inflightChunks uint64
-
-	// rowsBelowWatermark is the source rows of every chunk wholly below the
-	// watermark chunk: the rows a resume from the watermark does not copy
-	// again, since a resume restarts at the watermark chunk's lower bound.
-	// Each chunk's rows are added once, when the watermark moves past it, so
-	// a chunk that completed out of order is not counted until the chunks
-	// before it have landed. The optimistic chunker checkpoints it.
-	rowsBelowWatermark uint64
-}
-
-// advanceWatermark makes next the watermark chunk, counting the rows of the
-// chunk it replaces into rowsBelowWatermark. Caller must hold the chunker's
-// mutex.
-func (w *watermarkTracker) advanceWatermark(next *Chunk) {
-	if w.watermark != nil {
-		w.rowsBelowWatermark += w.watermark.SourceRows
-	}
-	w.watermark = next
 }
 
 // noteBufferedKey implements BufferedKeyNoter.NoteBufferedKey for both chunkers.
@@ -208,7 +190,7 @@ func (w *watermarkTracker) bumpWatermark(chunk *Chunk, logger *slog.Logger) {
 	}
 	// First chunk, or the special restored chunk: set and drain stored chunks.
 	if (w.watermark == nil && chunk.LowerBound == nil) || w.isSpecialRestoredChunk(chunk) {
-		w.advanceWatermark(chunk)
+		w.watermark = chunk
 		w.drainAlignedChunks()
 		return
 	}
@@ -230,7 +212,7 @@ func (w *watermarkTracker) bumpWatermark(chunk *Chunk, logger *slog.Logger) {
 
 	// Chunk aligns with the current watermark.UpperBound: it becomes the
 	// new watermark.
-	w.advanceWatermark(chunk)
+	w.watermark = chunk
 	w.drainAlignedChunks()
 }
 
@@ -244,7 +226,7 @@ func (w *watermarkTracker) drainAlignedChunks() {
 		if !ok {
 			return
 		}
-		w.advanceWatermark(next)
+		w.watermark = next
 		delete(w.lowerBoundWatermarkMap, key)
 	}
 }

@@ -2055,8 +2055,8 @@ func (r *Runner) Progress() status.Progress {
 	// with Tables and keeps its final reading once the copy has finished.
 	// Status derives its copier row the same way, so the API and the log
 	// block report one measure. The copier's own progress is not used for
-	// either: on an auto_increment key that measures keyspace distance, not
-	// rows.
+	// either: on a dense auto_increment key that measures keyspace distance,
+	// not rows.
 	copyProgress := status.CopyFromTables(tables)
 
 	var summary string

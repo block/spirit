@@ -18,9 +18,10 @@ import (
 // whose ids are sparse enough that keyspace distance against the auto_increment
 // max would differ from the row count by orders of magnitude. Copy must follow
 // the row-count path Tables uses, so a caller reading both in one snapshot sees
-// one story, and the reading must survive leaving the copy phase. The copier's
-// own progress, which paces the ETA, reports rows on such a key too, so it
-// tells the same story.
+// one story, and the reading must survive leaving the copy phase. On such a key
+// the copier's own progress, which paces the ETA, reads the same settled-row
+// counter against the same estimate, so it tells the same story, with or
+// without concurrent writes.
 func TestProgressCopyReconcilesWithTablesOnAutoIncrementKey(t *testing.T) {
 	testutils.NewTestTable(t, "copyprog", `CREATE TABLE copyprog (
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -64,9 +65,9 @@ func TestProgressCopyReconcilesWithTablesOnAutoIncrementKey(t *testing.T) {
 	require.Less(t, p.Copy.RowsTotal, uint64(1000000), "the total is the row estimate, not the auto_increment max")
 	require.Equal(t, p.Copy.String()+" copyRows ETA TBD", p.Summary)
 
-	// The copier's own measure counts the rows it read against the row
-	// estimate rather than ids against the auto_increment max, so it does not
-	// count ids the table never had.
+	// The copier's own measure is the settled rows against the row estimate
+	// rather than ids against the auto_increment max, so it does not count ids
+	// the table never had.
 	own := m.copier.CopyProgress()
 	require.Equal(t, p.Copy, own)
 

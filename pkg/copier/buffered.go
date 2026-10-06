@@ -645,8 +645,9 @@ func (c *buffered) GetETAState() status.ETA {
 // estimateRowsPerSecondLoop feeds the copy rate with the rows the chunker
 // reports copied in each copyEstimateInterval. The chunker's Progress is the
 // source because the copier no longer counts rows itself; for the optimistic
-// chunker it is keyspace distance rather than rows, which is what the ETA is
-// paced on either way.
+// chunker on a dense key it is keyspace distance rather than rows, which is
+// what the ETA is paced on either way. The chunker fixes its unit when it
+// opens, so two readings a run takes are always in the same unit.
 func (c *buffered) estimateRowsPerSecondLoop(ctx context.Context) {
 	prevRowsCount, _, _ := c.chunker.Progress()
 	ticker := time.NewTicker(copyEstimateInterval)
