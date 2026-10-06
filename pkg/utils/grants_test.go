@@ -206,6 +206,33 @@ func TestDBLevelGrantHasAny(t *testing.T) {
 	}
 }
 
+func TestProcedureGrantHasAny(t *testing.T) {
+	tests := []struct {
+		grant, schema, proc string
+		want                bool
+	}{
+		{"GRANT EXECUTE ON PROCEDURE `mysql`.`rds_kill` TO `u`@`%`", "mysql", "rds_kill", true},
+		{"GRANT EXECUTE, ALTER ROUTINE ON PROCEDURE `mysql`.`rds_kill` TO `u`@`%`", "mysql", "rds_kill", true},
+		// Routine names are not case sensitive.
+		{"GRANT EXECUTE ON PROCEDURE `mysql`.`RDS_KILL` TO `u`@`%`", "mysql", "rds_kill", true},
+		{"GRANT ALTER ROUTINE ON PROCEDURE `mysql`.`rds_kill` TO `u`@`%`", "mysql", "rds_kill", false},
+		{"GRANT EXECUTE ON PROCEDURE `mysql`.`rds_kill_query` TO `u`@`%`", "mysql", "rds_kill", false},
+		{"GRANT EXECUTE ON PROCEDURE `other`.`rds_kill` TO `u`@`%`", "mysql", "rds_kill", false},
+		{"GRANT EXECUTE ON FUNCTION `mysql`.`rds_kill` TO `u`@`%`", "mysql", "rds_kill", false},
+		// Not procedure-level grants.
+		{"GRANT EXECUTE ON *.* TO `u`@`%`", "mysql", "rds_kill", false},
+		{"GRANT EXECUTE ON `mysql`.* TO `u`@`%`", "mysql", "rds_kill", false},
+		{"GRANT EXECUTE ON `mysql`.`rds_kill` TO `u`@`%`", "mysql", "rds_kill", false},
+		// SHOW GRANTS doubles a backquote in a name.
+		{"GRANT EXECUTE ON PROCEDURE `a``b`.`p``q` TO `u`@`%`", "a`b", "p`q", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.grant, func(t *testing.T) {
+			assert.Equal(t, tc.want, ProcedureGrantHasAny(tc.grant, tc.schema, tc.proc, "EXECUTE"))
+		})
+	}
+}
+
 func TestGlobalGrantNamesAny(t *testing.T) {
 	assert.True(t, GlobalGrantNamesAny("GRANT SELECT, SHOW_ROUTINE ON *.* TO `u`@`%`", "SHOW_ROUTINE"))
 	assert.True(t, GlobalGrantNamesAny("GRANT CONNECTION_ADMIN,SHOW_ROUTINE ON *.* TO `u`@`%`", "SHOW_ROUTINE"))

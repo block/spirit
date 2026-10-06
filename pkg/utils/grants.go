@@ -119,6 +119,26 @@ func DBLevelGrantHasAny(grant, schemaName string, privs ...string) bool {
 	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
 }
 
+// procedureGrantRegexp captures the privilege list, database name and
+// procedure name from a procedure-level grant line, e.g.
+//
+//	GRANT EXECUTE ON PROCEDURE `mysql`.`rds_kill` TO `user`@`%`
+//
+// capturing "EXECUTE", "mysql" and "rds_kill".
+var procedureGrantRegexp = regexp.MustCompile("^GRANT (.+) ON PROCEDURE `((?:[^`]|``)+)`\\.`((?:[^`]|``)+)` TO ")
+
+// ProcedureGrantHasAny reports whether a single SHOW GRANTS line is a
+// procedure-level grant on schemaName.procName that confers any privilege in
+// privs. Stored routine names are not case sensitive, so neither name is
+// compared case sensitively.
+func ProcedureGrantHasAny(grant, schemaName, procName string, privs ...string) bool {
+	m := procedureGrantRegexp.FindStringSubmatch(grant)
+	if m == nil || !strings.EqualFold(unquoteDBName(m[2]), schemaName) || !strings.EqualFold(unquoteDBName(m[3]), procName) {
+		return false
+	}
+	return hasAnyPrivilege(splitPrivileges(m[1]), privs)
+}
+
 // unquoteDBName undoes the only escaping SHOW GRANTS applies inside a
 // backquoted database name: a doubled backquote.
 func unquoteDBName(name string) string {

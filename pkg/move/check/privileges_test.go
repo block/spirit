@@ -172,10 +172,9 @@ func TestMovePrivilegesMultipleSources(t *testing.T) {
 // carries the visibility grants is accepted: the role counts for its
 // privileges, not its name.
 //
-// The CONNECTION_ADMIN exemption (skipped unless activate_all_roles_on_login
-// is ON): the role's name stands in for CONNECTION_ADMIN only with that
-// setting on. The test does not SET GLOBAL it, because that races with
-// concurrent test binaries (see #818).
+// Force-kill (runs everywhere): the role's name does not stand in for
+// CONNECTION_ADMIN either. On Aurora MySQL 3 the role often lacks it, so
+// accepting the name passed preflight while the cutover's KILL was denied.
 func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
@@ -204,7 +203,7 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 		"GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE ON test.* TO " + user,
 		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO " + user,
 		// The force-kill privileges, granted directly so that the base check
-		// passes whatever activate_all_roles_on_login is.
+		// passes.
 		"GRANT SELECT ON `performance_schema`.* TO " + user,
 		"GRANT CONNECTION_ADMIN, PROCESS ON *.* TO " + user,
 		"GRANT rds_superuser_role TO " + user,
@@ -258,17 +257,14 @@ func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
 	require.NoError(t, privilegesCheck(t.Context(), r, slog.Default()))
 	require.NoError(t, schemaObjectVisibility(t.Context(), withGrants, sourceConfig.DBName, allSchemaObjects...))
 
-	t.Run("role name stands in for CONNECTION_ADMIN", func(t *testing.T) {
-		var activate string
-		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@global.activate_all_roles_on_login").Scan(&activate))
-		if activate != "1" {
-			t.Skip("requires activate_all_roles_on_login=ON; SET GLOBAL would race with concurrent test binaries, see #818")
-		}
+	t.Run("role name does not stand in for CONNECTION_ADMIN", func(t *testing.T) {
 		_, err := db.ExecContext(t.Context(), "REVOKE CONNECTION_ADMIN ON *.* FROM "+user)
 		require.NoError(t, err)
 		noConnectionAdmin := open()
 		r := Resources{Sources: []SourceResource{{DB: noConnectionAdmin, Config: sourceConfig}}}
-		require.NoError(t, privilegesCheck(t.Context(), r, slog.Default()))
+		err = privilegesCheck(t.Context(), r, slog.Default())
+		require.ErrorContains(t, err, "Needed: CONNECTION_ADMIN/SUPER or EXECUTE on mysql.rds_kill")
+		require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill")
 	})
 }
 
@@ -651,7 +647,7 @@ func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
 	})
 
 	// A force-kill check that could not run, such as a lost connection while
-	// it reads activate_all_roles_on_login, does not name a missing grant.
+	// it reads information_schema.ROUTINES, does not name a missing grant.
 	// One that found a grant missing does.
 	t.Run("force-kill check", func(t *testing.T) {
 		withBase := []string{
@@ -665,11 +661,11 @@ func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
 		require.NotErrorIs(t, err, ErrRefused)
 
 		missing := func(context.Context) error {
-			return fmt.Errorf("%w: missing CONNECTION_ADMIN or SUPER privilege", dbconn.ErrForceKillPrivilegeMissing)
+			return fmt.Errorf("%w: missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill", dbconn.ErrForceKillPrivilegeMissing)
 		}
 		err = sourcePrivileges(t.Context(), stub, "app", missing)
-		require.ErrorContains(t, err, "insufficient privileges to run a move with force-kill enabled")
-		require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege")
+		require.ErrorContains(t, err, "insufficient privileges to run a move with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER or EXECUTE on mysql.rds_kill")
+		require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill")
 	})
 
 	// Every entry point, on a pool whose reads all fail.

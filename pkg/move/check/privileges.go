@@ -23,8 +23,9 @@ func init() {
 //   - RELOAD for FLUSH TABLES
 //   - Table-level privileges (SELECT, INSERT, etc.) on the source database
 //   - LOCK TABLES for cutover
-//   - CONNECTION_ADMIN or SUPER, PROCESS, and performance_schema access for
-//     force-kill (enabled by default), checked by dbconn.CheckForceKillPrivileges
+//   - CONNECTION_ADMIN or SUPER (or EXECUTE on mysql.rds_kill on RDS and
+//     Aurora), PROCESS, and performance_schema access for force-kill
+//     (enabled by default), checked by dbconn.CheckForceKillPrivileges
 //   - Visibility of every view, trigger, event and stored routine in the
 //     source schema in information_schema, so the source_schema_objects check
 //     cannot pass just because they are hidden (see schemaGrants)
@@ -41,15 +42,15 @@ func init() {
 // alone counts for nothing.
 //
 // The force-kill privileges are checked by dbconn.CheckForceKillPrivileges.
-// On RDS it accepts a granted rds_superuser_role by name in place of
-// CONNECTION_ADMIN when activate_all_roles_on_login=ON, and proves PROCESS by
-// reading an InnoDB information_schema table. Force-kill uses those
-// privileges only during cutover, to find and kill other users' sessions that
-// block the table lock. If the role lacks CONNECTION_ADMIN, the kill fails
-// and is logged, and the cutover waits for the blocking sessions or times out
-// with an error. It never goes ahead without the lock, and no object is
-// missed. Visibility is different: without it, the object scan sees an empty
-// schema and passes, so no name-based exemption applies to it.
+// It accepts CONNECTION_ADMIN or SUPER, or, on RDS and Aurora, EXECUTE on an
+// existing mysql.rds_kill, which the kill falls back to when KILL is denied.
+// Like the visibility grants, it counts what SHOW GRANTS lists, so a role
+// named rds_superuser_role counts for its privileges, not its name. It proves
+// PROCESS by reading an InnoDB information_schema table. Force-kill uses
+// those privileges only during cutover, to find and kill other users'
+// sessions that block the table lock. If a kill still fails, it is logged,
+// and the cutover waits for the blocking sessions or times out with an error.
+// It never goes ahead without the lock, and no object is missed.
 func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 	for i, src := range r.Sources {
 		if err := checkSourcePrivileges(ctx, src); err != nil {
@@ -130,7 +131,7 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 	// lock detection that does log runs during cutover, not preflight.
 	if err := forceKillProbe(ctx); err != nil {
 		if errors.Is(err, dbconn.ErrForceKillPrivilegeMissing) {
-			return fmt.Errorf("insufficient privileges to run a move with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", err)
+			return fmt.Errorf("insufficient privileges to run a move with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER or EXECUTE on mysql.rds_kill, PROCESS, and SELECT on performance_schema.*: %w", err)
 		}
 		return fmt.Errorf("could not check the privileges force-kill needs: %w", err)
 	}

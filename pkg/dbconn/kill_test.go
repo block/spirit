@@ -365,3 +365,222 @@ func TestForceKillGracePeriod(t *testing.T) {
 			"forceKillGracePeriod(%d)", test.lockWaitTimeout)
 	}
 }
+
+// rdsKillFixture stands in for RDS and Aurora on community MySQL, which has
+// no mysql.rds_kill. It creates a stub procedure that kills like the real one
+// (SQL SECURITY DEFINER, defined by root) in its own schema, points
+// rdsKillSchema at that schema for the test, and creates a user that may
+// read the force-kill lock tables but holds neither CONNECTION_ADMIN nor
+// SUPER, and a victim user whose sessions it kills. The stub lives in a test schema rather than in mysql, because test
+// binaries run concurrently against one server, and a procedure in mysql
+// would change what every other package's kill and privilege tests see.
+type rdsKillFixture struct {
+	rootDB *sql.DB
+	schema string // holds the stub procedure
+	user   string
+	addr   string
+	dbName string
+	// victimDB is a pool for a user whose sessions the user does not own.
+	victimDB *sql.DB
+}
+
+func newRDSKillFixture(t *testing.T, user string) *rdsKillFixture {
+	t.Helper()
+	config, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	rootCfg := *config
+	rootCfg.User = "root" // needs grant privilege and CREATE ROUTINE
+	rootDB, err := sql.Open("block-mysql", rootCfg.FormatDSN())
+	require.NoError(t, err)
+	// Close in a cleanup, not a defer: cleanups run last-in first-out after
+	// the test returns, so the drops registered below still have a connection.
+	t.Cleanup(func() { utils.CloseAndLog(rootDB) })
+
+	schema, _ := testutils.CreateUniqueTestDatabase(t)
+	f := &rdsKillFixture{rootDB: rootDB, schema: schema, user: user, addr: config.Addr, dbName: config.DBName}
+	for _, stmt := range []string{
+		"CREATE PROCEDURE `" + schema + "`.rds_kill(IN thread BIGINT) SQL SECURITY DEFINER KILL thread",
+		"DROP USER IF EXISTS " + user,
+		"CREATE USER " + user,
+		"GRANT SELECT ON test.* TO " + user,
+		"GRANT SELECT ON `performance_schema`.* TO " + user,
+		"GRANT PROCESS ON *.* TO " + user,
+		// The victim is not root: killing a SYSTEM_USER session needs
+		// SYSTEM_USER as well.
+		"DROP USER IF EXISTS " + user + "_victim",
+		"CREATE USER " + user + "_victim",
+		"GRANT SELECT ON test.* TO " + user + "_victim",
+	} {
+		_, err = rootDB.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	t.Cleanup(func() {
+		_, _ = rootDB.ExecContext(context.Background(), "DROP USER IF EXISTS "+user)
+		_, _ = rootDB.ExecContext(context.Background(), "DROP USER IF EXISTS "+user+"_victim")
+	})
+	victimDB, err := sql.Open("block-mysql", fmt.Sprintf("%s_victim:@tcp(%s)/%s", user, config.Addr, config.DBName))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(victimDB) })
+	f.victimDB = victimDB
+
+	oldSchema := rdsKillSchema
+	rdsKillSchema = schema
+	t.Cleanup(func() { rdsKillSchema = oldSchema })
+	return f
+}
+
+func (f *rdsKillFixture) exec(t *testing.T, stmt string) {
+	t.Helper()
+	_, err := f.rootDB.ExecContext(t.Context(), stmt)
+	require.NoError(t, err, stmt)
+}
+
+// grantExecute grants the user EXECUTE on the stub procedure.
+func (f *rdsKillFixture) grantExecute(t *testing.T) {
+	f.exec(t, "GRANT EXECUTE ON PROCEDURE `"+f.schema+"`.`rds_kill` TO "+f.user)
+}
+
+// userDB opens a pool for the fixture's user.
+func (f *rdsKillFixture) userDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("block-mysql", fmt.Sprintf("%s:@tcp(%s)/%s", f.user, f.addr, f.dbName))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	return db
+}
+
+// victim opens a session the fixture's user does not own, and returns it
+// with its connection id.
+func (f *rdsKillFixture) victim(t *testing.T) (*sql.Conn, int) {
+	t.Helper()
+	conn, err := f.victimDB.Conn(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	var pid int
+	require.NoError(t, conn.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&pid))
+	return conn, pid
+}
+
+func requireSessionGone(t *testing.T, conn *sql.Conn) {
+	t.Helper()
+	_, err := conn.ExecContext(t.Context(), "SELECT 1")
+	require.Error(t, err, "the session must have been killed")
+}
+
+func requireSessionAlive(t *testing.T, conn *sql.Conn) {
+	t.Helper()
+	_, err := conn.ExecContext(t.Context(), "SELECT 1")
+	require.NoError(t, err, "the session must not have been killed")
+}
+
+// A user without CONNECTION_ADMIN or SUPER but with EXECUTE on rds_kill
+// passes the preflight check, and kills another user's session through the
+// procedure when KILL is denied.
+func TestKillFallsBackToRDSKill(t *testing.T) {
+	f := newRDSKillFixture(t, "testrdskilluser")
+	f.grantExecute(t)
+	db := f.userDB(t)
+
+	require.NoError(t, CheckForceKillPrivileges(t.Context(), db))
+
+	conn, pid := f.victim(t)
+	require.NoError(t, KillTransaction(t.Context(), db, pid))
+	requireSessionGone(t, conn)
+
+	conn, pid = f.victim(t)
+	require.NoError(t, KillSessionAndWait(t.Context(), db, pid))
+	requireSessionGone(t, conn)
+
+	// A session that has already gone is reported by KILL itself, before
+	// any privilege check, so the fallback does not run.
+	err := KillTransaction(t.Context(), db, pid)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread})
+	require.NotContains(t, err.Error(), "rds_kill")
+	require.NoError(t, KillSessionAndWait(t.Context(), db, pid))
+}
+
+// The cutover's kill of the sessions blocking a table lock uses the
+// fallback too.
+func TestKillLockingTransactionsFallsBackToRDSKill(t *testing.T) {
+	testutils.SkipFromMySQLVersion(t, "9.7.0", blockerLookupFailsReason)
+	testutils.NewTestTable(t, "kill_rds_fallback", "CREATE TABLE kill_rds_fallback (id INT PRIMARY KEY)")
+	f := newRDSKillFixture(t, "testrdskilllockuser")
+	f.grantExecute(t)
+	db := f.userDB(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	blocker := holdTableLock(t, ctx, f.victimDB, "kill_rds_fallback")
+	var blockerPID int
+	require.NoError(t, blocker.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&blockerPID))
+
+	tbl := table.NewTableInfo(db, "test", "kill_rds_fallback")
+	killed, err := killLockingTransactions(ctx, db, []*table.TableInfo{tbl}, slog.Default(), nil)
+	require.NoError(t, err)
+	require.Equal(t, []int{blockerPID}, killed)
+	_, err = blocker.ExecContext(ctx, "SELECT 1")
+	require.Error(t, err, "the blocker must have been killed")
+}
+
+// A user that may neither KILL another user's session nor execute rds_kill
+// fails the preflight check, and a kill's error names both failures. The
+// fallback is decided on every kill, so EXECUTE granted mid-run takes effect
+// at the next one.
+func TestKillWithoutRDSKillPrivilege(t *testing.T) {
+	f := newRDSKillFixture(t, "testnordskilluser")
+	db := f.userDB(t)
+
+	err := CheckForceKillPrivileges(t.Context(), db)
+	require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill")
+	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
+
+	conn, pid := f.victim(t)
+	err = KillTransaction(t.Context(), db, pid)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrProcaccessDenied})
+	require.ErrorContains(t, err, "falling back to `"+f.schema+"`.`rds_kill` failed")
+	err = KillSessionAndWait(t.Context(), db, pid)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrProcaccessDenied})
+	requireSessionAlive(t, conn)
+
+	f.grantExecute(t)
+	require.NoError(t, KillTransaction(t.Context(), db, pid))
+	requireSessionGone(t, conn)
+}
+
+// EXECUTE on every procedure does not help where there is no rds_kill, as on
+// community MySQL: the preflight check fails, and a kill's error names both
+// the denied KILL and the missing procedure.
+func TestKillWithoutRDSKillProcedure(t *testing.T) {
+	f := newRDSKillFixture(t, "testnoprocrdskilluser")
+	f.exec(t, "GRANT EXECUTE ON *.* TO "+f.user)
+	f.exec(t, "DROP PROCEDURE `"+f.schema+"`.rds_kill")
+	db := f.userDB(t)
+
+	err := CheckForceKillPrivileges(t.Context(), db)
+	require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill")
+	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
+
+	conn, pid := f.victim(t)
+	err = KillTransaction(t.Context(), db, pid)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrSpDoesNotExist})
+	requireSessionAlive(t, conn)
+}
+
+// A user with CONNECTION_ADMIN kills with KILL and never needs the
+// procedure: here there is none.
+func TestKillWithConnectionAdminSkipsRDSKill(t *testing.T) {
+	f := newRDSKillFixture(t, "testconnadminkilluser")
+	f.exec(t, "GRANT CONNECTION_ADMIN ON *.* TO "+f.user)
+	f.exec(t, "DROP PROCEDURE `"+f.schema+"`.rds_kill")
+	db := f.userDB(t)
+
+	require.NoError(t, CheckForceKillPrivileges(t.Context(), db))
+	conn, pid := f.victim(t)
+	require.NoError(t, KillTransaction(t.Context(), db, pid))
+	requireSessionGone(t, conn)
+	conn, pid = f.victim(t)
+	require.NoError(t, KillSessionAndWait(t.Context(), db, pid))
+	requireSessionGone(t, conn)
+}

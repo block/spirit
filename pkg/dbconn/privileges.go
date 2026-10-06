@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"slices"
-	"strings"
 
 	"github.com/block/spirit/pkg/utils"
 )
@@ -16,44 +14,38 @@ type RowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// ActivateAllRolesOnLogin reports whether the server has
-// activate_all_roles_on_login=ON. When this is enabled, all granted roles are
-// automatically activated on login, so role-granted privileges are available
-// without explicit SET ROLE ALL. A failed read is returned as an error, not
-// reported as false: a caller deciding whether privileges are missing must not
-// mistake a transient failure for a missing privilege.
-func ActivateAllRolesOnLogin(ctx context.Context, db RowQuerier) (bool, error) {
-	var value string
-	if err := db.QueryRowContext(ctx, "SELECT @@global.activate_all_roles_on_login").Scan(&value); err != nil {
-		return false, fmt.Errorf("could not read activate_all_roles_on_login: %w", err)
-	}
-	return value == "1" || strings.EqualFold(value, "ON"), nil
-}
-
 // grantsQuerier is the part of *sql.DB checkKillPrivilege reads SHOW GRANTS
-// and the server's role setting with.
+// and information_schema.ROUTINES with.
 type grantsQuerier interface {
 	RowQuerier
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// errKillPrivilegeMissing is the text of the error checkKillPrivilege returns
+// when the user can kill another user's session neither way.
+const errKillPrivilegeMissing = "missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill"
+
 // checkKillPrivilege reports an error unless the connection's user can kill
-// another user's session, which needs CONNECTION_ADMIN or SUPER. No query
-// tests that without killing a session, so it reads SHOW GRANTS, which lists
-// the privileges of the session's active roles alongside the user's own.
+// another user's session. It can with KILL when it holds CONNECTION_ADMIN or
+// SUPER, or, on RDS and Aurora, through the mysql.rds_kill procedure when it
+// may execute it (see killConnection). No query tests either without killing
+// a session, so it reads SHOW GRANTS, which for the current user lists the
+// privileges of its active roles alongside its own, and, for the
+// procedure, information_schema.ROUTINES to check that it exists.
 //
-// On RDS, privileges like CONNECTION_ADMIN are granted through the opaque
-// rds_superuser_role, whose privileges SHOW GRANTS does not list. When
-// activate_all_roles_on_login=ON that role is active on every connection, so
-// holding it counts as holding the privilege. A failed read of that setting
-// is returned as it is, not as a missing privilege.
+// A role's name confers nothing: on Aurora MySQL 3, rds_superuser_role often
+// lacks CONNECTION_ADMIN, and a blue/green switchover can remove it, so only
+// the privileges SHOW GRANTS lists count. When rds_superuser_role is active,
+// SHOW GRANTS lists its EXECUTE on *.*, so its holder passes through
+// mysql.rds_kill. A failed read is returned as it is, not as a missing
+// privilege.
 func checkKillPrivilege(ctx context.Context, db grantsQuerier) error {
 	rows, err := db.QueryContext(ctx, "SHOW GRANTS")
 	if err != nil {
 		return fmt.Errorf("read grants to check for CONNECTION_ADMIN: %w", err)
 	}
 	defer utils.CloseAndLog(rows)
-	var grantedRoles []string
+	var grants []string
 	for rows.Next() {
 		var grant string
 		if err := rows.Scan(&grant); err != nil {
@@ -62,23 +54,46 @@ func checkKillPrivilege(ctx context.Context, db grantsQuerier) error {
 		if utils.GlobalGrantHasAny(grant, "CONNECTION_ADMIN", "SUPER") {
 			return nil
 		}
-		// Collect role names from grant lines like:
-		// GRANT `rds_superuser_role`@`%` TO `user`@`%`
-		if strings.HasPrefix(grant, "GRANT `") && strings.Contains(grant, " TO ") {
-			grantedRoles = append(grantedRoles, utils.ParseRoleNames(grant)...)
-		}
+		grants = append(grants, grant)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("read grants to check for CONNECTION_ADMIN: %w", err)
 	}
-	if slices.Contains(grantedRoles, "rds_superuser_role") {
-		active, err := ActivateAllRolesOnLogin(ctx, db)
-		if err != nil {
-			return fmt.Errorf("check whether rds_superuser_role confers CONNECTION_ADMIN: %w", err)
+	if grantsAllowExecute(grants, rdsKillSchema, rdsKillName) {
+		var found int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.ROUTINES
+			WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ? AND ROUTINE_TYPE = 'PROCEDURE'`,
+			rdsKillSchema, rdsKillName).Scan(&found); err != nil {
+			return fmt.Errorf("check whether %s exists: %w", rdsKillProcedure(), err)
 		}
-		if active {
+		if found > 0 {
 			return nil
 		}
 	}
-	return missingPrivilegeError{errors.New("missing CONNECTION_ADMIN or SUPER privilege")}
+	return missingPrivilegeError{errors.New(errKillPrivilegeMissing)}
+}
+
+// grantsAllowExecute reports whether SHOW GRANTS lines grant EXECUTE on the
+// procedure schema.proc: globally, on the procedure itself, or on its schema.
+//
+// MySQL applies one database-level grant (mysql.db row) to a schema, not the
+// union of every row whose name pattern matches it, and SHOW GRANTS does not
+// show which one, so a database-level grant counts only when every matching
+// name has EXECUTE.
+func grantsAllowExecute(grants []string, schema, proc string) bool {
+	onSchema := map[string]bool{}
+	for _, grant := range grants {
+		if utils.GlobalGrantHasAny(grant, "EXECUTE") || utils.ProcedureGrantHasAny(grant, schema, proc, "EXECUTE") {
+			return true
+		}
+		if name, ok := utils.DBLevelGrantName(grant, schema); ok {
+			onSchema[name] = onSchema[name] || utils.DBLevelGrantHasAny(grant, schema, "EXECUTE")
+		}
+	}
+	for _, ok := range onSchema {
+		if !ok {
+			return false
+		}
+	}
+	return len(onSchema) > 0
 }

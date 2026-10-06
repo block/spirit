@@ -1,6 +1,7 @@
 package check
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -94,88 +95,79 @@ func TestPrivileges(t *testing.T) {
 }
 
 // TestPrivilegesWithRDSSuperuserRole verifies that a granted
-// rds_superuser_role stands in for CONNECTION_ADMIN when
-// activate_all_roles_on_login=ON. It stands in for nothing else: PROCESS is
-// still proven by a read that needs it.
+// rds_superuser_role counts for the privileges SHOW GRANTS lists for it, not
+// for its name. On Aurora MySQL 3 the role often lacks CONNECTION_ADMIN, so
+// accepting its name passed preflight while the cutover's KILL was then
+// denied. The role is made the user's default role, so it is active whatever
+// activate_all_roles_on_login is.
 //
-// The test covers only the acceptance path, against a real server, since
-// flipping activate_all_roles_on_login with SET GLOBAL would race with other
-// test binaries running against the same MySQL. dbconn's
-// TestCheckKillPrivilege covers the rejection path with a stub.
-//
-// If the test MySQL doesn't have activate_all_roles_on_login=ON the
-// test skips rather than flips the global.
+// Community MySQL has no mysql.rds_kill, so the role's EXECUTE on *.* (which
+// Aurora's role has) does not pass here; dbconn's TestKillFallsBackToRDSKill
+// covers the rds_kill path with a stub procedure.
 func TestPrivilegesWithRDSSuperuserRole(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "root"
 	db, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
 	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-
-	// Skip if the server doesn't have activate_all_roles_on_login=ON, since
-	// the role-tolerance path we're testing requires it. We deliberately do
-	// NOT flip it ourselves — see comment above.
-	var activate string
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@global.activate_all_roles_on_login").Scan(&activate))
-	if activate != "1" {
-		t.Skip("requires activate_all_roles_on_login=ON; SET GLOBAL would race with concurrent test binaries, see #818")
-	}
+	// Close in a cleanup, not a defer: cleanups run last-in first-out after
+	// the test returns, so the drops registered below still have a connection.
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 
 	// Clean up any previous test artifacts
 	_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS testrdsroleuser")
 	_, _ = db.ExecContext(t.Context(), "DROP ROLE IF EXISTS rds_superuser_role")
 
-	// Create an opaque role that simulates rds_superuser_role on RDS.
-	// We intentionally do NOT grant CONNECTION_ADMIN to it, because on real
-	// RDS the role is opaque and cannot be inspected. The privilege check
-	// tolerates it by name only when activate_all_roles_on_login=ON.
-	_, err = db.ExecContext(t.Context(), "CREATE ROLE rds_superuser_role")
-	require.NoError(t, err)
+	// An empty role, standing in for rds_superuser_role on RDS.
+	for _, stmt := range []string{
+		"CREATE ROLE rds_superuser_role",
+		"CREATE USER testrdsroleuser",
+		"GRANT ALL ON test.* TO testrdsroleuser",
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testrdsroleuser",
+		"GRANT SELECT ON `performance_schema`.* TO testrdsroleuser",
+		"GRANT PROCESS ON *.* TO testrdsroleuser",
+		"GRANT rds_superuser_role TO testrdsroleuser",
+		"SET DEFAULT ROLE rds_superuser_role TO testrdsroleuser",
+	} {
+		_, err = db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
 	t.Cleanup(func() {
-		_, _ = db.ExecContext(t.Context(), "DROP ROLE IF EXISTS rds_superuser_role")
+		_, _ = db.ExecContext(context.Background(), "DROP USER IF EXISTS testrdsroleuser")
+		_, _ = db.ExecContext(context.Background(), "DROP ROLE IF EXISTS rds_superuser_role")
 	})
-
-	_, err = db.ExecContext(t.Context(), "CREATE USER testrdsroleuser")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, _ = db.ExecContext(t.Context(), "DROP USER IF EXISTS testrdsroleuser")
-	})
-
-	_, err = db.ExecContext(t.Context(), "GRANT ALL ON test.* TO testrdsroleuser")
-	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), "GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testrdsroleuser")
-	require.NoError(t, err)
-	// Grant performance_schema and PROCESS directly so the probe queries
-	// succeed. On real RDS, rds_superuser_role grants these, but our test
-	// role is opaque (no actual privileges) so we simulate by granting
-	// them directly. The test specifically validates that
-	// CONNECTION_ADMIN tolerance works via the rds_superuser_role name
-	// check + activate_all_roles_on_login guard.
-	_, err = db.ExecContext(t.Context(), "GRANT SELECT ON `performance_schema`.* TO testrdsroleuser")
-	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), "GRANT PROCESS ON *.* TO testrdsroleuser")
-	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), "GRANT rds_superuser_role TO testrdsroleuser")
-	require.NoError(t, err)
 
 	config, err = mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "testrdsroleuser"
 	config.Passwd = ""
 
-	lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(lowPrivDB)
-
-	r := Resources{
-		DB:    lowPrivDB,
-		Table: &table.TableInfo{TableName: "test", SchemaName: "test"},
+	// check reconnects, so each new grant to the role is picked up.
+	check := func() error {
+		lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+		require.NoError(t, err)
+		defer utils.CloseAndLog(lowPrivDB)
+		r := Resources{
+			DB:    lowPrivDB,
+			Table: &table.TableInfo{TableName: "test", SchemaName: "test"},
+		}
+		return privilegesCheck(t.Context(), r, slog.Default())
 	}
 
-	// With rds_superuser_role granted and activate_all_roles_on_login=ON,
-	// privilegesCheck should pass even though CONNECTION_ADMIN is not
-	// directly granted to the user.
-	err = privilegesCheck(t.Context(), r, slog.Default())
-	require.NoError(t, err, "should pass when activate_all_roles_on_login=ON and rds_superuser_role is granted")
+	// The role's name alone no longer stands in for CONNECTION_ADMIN.
+	err = check()
+	require.ErrorContains(t, err, "Needed: CONNECTION_ADMIN/SUPER or EXECUTE on mysql.rds_kill")
+	require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill")
+
+	// Aurora's role grants EXECUTE on *.*, but there is no mysql.rds_kill to
+	// execute on community MySQL.
+	_, err = db.ExecContext(t.Context(), "GRANT EXECUTE ON *.* TO rds_superuser_role")
+	require.NoError(t, err)
+	err = check()
+	require.ErrorContains(t, err, "missing CONNECTION_ADMIN or SUPER privilege, or EXECUTE on mysql.rds_kill")
+
+	// A role that does hold CONNECTION_ADMIN counts, as SHOW GRANTS lists it.
+	_, err = db.ExecContext(t.Context(), "GRANT CONNECTION_ADMIN ON *.* TO rds_superuser_role")
+	require.NoError(t, err)
+	require.NoError(t, check())
 }
