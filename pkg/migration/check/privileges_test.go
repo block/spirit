@@ -102,7 +102,7 @@ func TestPrivileges(t *testing.T) {
 // activate_all_roles_on_login is.
 //
 // Community MySQL has no mysql.rds_kill, so the role's EXECUTE on *.* (which
-// Aurora's role has) does not pass here; dbconn's TestKillFallsBackToRDSKill
+// Aurora's role has) does not pass here; dbconn's TestKillFallsBackToKillProcedure
 // covers the rds_kill path with a stub procedure.
 func TestPrivilegesWithRDSSuperuserRole(t *testing.T) {
 	config, err := mysql.ParseDSN(testutils.DSN())

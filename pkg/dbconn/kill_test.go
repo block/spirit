@@ -476,7 +476,7 @@ func requireSessionAlive(t *testing.T, conn *sql.Conn) {
 // A user without CONNECTION_ADMIN or SUPER but with EXECUTE on rds_kill
 // passes the preflight check, and kills another user's session through the
 // procedure when KILL is denied.
-func TestKillFallsBackToRDSKill(t *testing.T) {
+func TestKillFallsBackToKillProcedure(t *testing.T) {
 	f := newRDSKillFixture(t, "testrdskilluser")
 	f.grantExecute(t)
 	db := f.userDB(t)
@@ -501,7 +501,7 @@ func TestKillFallsBackToRDSKill(t *testing.T) {
 
 // The cutover's kill of the sessions blocking a table lock uses the
 // fallback too.
-func TestKillLockingTransactionsFallsBackToRDSKill(t *testing.T) {
+func TestKillLockingTransactionsFallsBackToKillProcedure(t *testing.T) {
 	testutils.SkipFromMySQLVersion(t, "9.7.0", blockerLookupFailsReason)
 	testutils.NewTestTable(t, "kill_rds_fallback", "CREATE TABLE kill_rds_fallback (id INT PRIMARY KEY)")
 	f := newRDSKillFixture(t, "testrdskilllockuser")
@@ -525,7 +525,7 @@ func TestKillLockingTransactionsFallsBackToRDSKill(t *testing.T) {
 // fails the preflight check, and a kill's error names both failures. The
 // fallback is decided on every kill, so EXECUTE granted mid-run takes effect
 // at the next one.
-func TestKillWithoutRDSKillPrivilege(t *testing.T) {
+func TestKillWithoutKillProcedurePrivilege(t *testing.T) {
 	f := newRDSKillFixture(t, "testnordskilluser")
 	db := f.userDB(t)
 
@@ -551,7 +551,7 @@ func TestKillWithoutRDSKillPrivilege(t *testing.T) {
 // EXECUTE on every procedure does not help where there is no rds_kill, as on
 // community MySQL: the preflight check fails, and a kill's error names both
 // the denied KILL and the missing procedure.
-func TestKillWithoutRDSKillProcedure(t *testing.T) {
+func TestKillWithoutKillProcedure(t *testing.T) {
 	f := newRDSKillFixture(t, "testnoprocrdskilluser")
 	f.exec(t, "GRANT EXECUTE ON *.* TO "+f.user)
 	f.exec(t, "DROP PROCEDURE `"+f.schema+"`.rds_kill")
@@ -570,7 +570,7 @@ func TestKillWithoutRDSKillProcedure(t *testing.T) {
 
 // A user with CONNECTION_ADMIN kills with KILL and never needs the
 // procedure: here there is none.
-func TestKillWithConnectionAdminSkipsRDSKill(t *testing.T) {
+func TestKillWithConnectionAdminSkipsKillProcedure(t *testing.T) {
 	f := newRDSKillFixture(t, "testconnadminkilluser")
 	f.exec(t, "GRANT CONNECTION_ADMIN ON *.* TO "+f.user)
 	f.exec(t, "DROP PROCEDURE `"+f.schema+"`.rds_kill")
