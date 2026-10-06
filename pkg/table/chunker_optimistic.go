@@ -77,6 +77,13 @@ type chunkerOptimistic struct {
 	// compared against the auto-increment max.
 	actualRowsCopied atomic.Uint64
 	chunksCopied     atomic.Uint64
+	// progressInRows is set when the key space is too sparse for key-space
+	// distance to measure the copy (see keySpaceIsSparse). Progress then
+	// reports rows, the way the composite chunker does. It is decided when the
+	// chunker opens and held for the run, so every Progress reading in a run
+	// is in the same unit and the copy rate measured between two of them is
+	// meaningful.
+	progressInRows atomic.Bool
 
 	logger *slog.Logger
 }
@@ -447,6 +454,7 @@ func (t *chunkerOptimistic) Reset() error {
 	t.rowsCopied.Store(0)
 	t.actualRowsCopied.Store(0)
 	t.chunksCopied.Store(0)
+	t.progressInRows.Store(keySpaceIsSparse(t.Ti))
 
 	// Make sure min/max value are always specified
 	// To simplify the code in NextChunk funcs.
@@ -735,6 +743,7 @@ func (t *chunkerOptimistic) open() (err error) {
 	// Initialize progress tracking
 	t.rowsCopied.Store(0)
 	t.actualRowsCopied.Store(0)
+	t.progressInRows.Store(keySpaceIsSparse(t.Ti))
 
 	// Make sure min/max value are always specified
 	// To simplify the code in NextChunk funcs.
@@ -757,12 +766,57 @@ func (t *chunkerOptimistic) RowsCopied() uint64 {
 	return t.actualRowsCopied.Load()
 }
 
+// Progress reports the copied and total amounts in key-space distance from
+// MinValue, which is exact for a dense auto-increment key. A key space too
+// sparse for that (see keySpaceIsSparse) is reported in rows against the
+// table's row estimate instead.
 func (t *chunkerOptimistic) Progress() (uint64, uint64, uint64) {
-	maxValue, err := strconv.ParseUint(t.Ti.MaxValue().String(), 10, 64) // autoInc max
-	if err != nil {
-		maxValue = atomic.LoadUint64(&t.Ti.EstimatedRows) // should not be needed.
+	if t.progressInRows.Load() {
+		return t.actualRowsCopied.Load(), t.chunksCopied.Load(), atomic.LoadUint64(&t.Ti.EstimatedRows)
 	}
-	return t.rowsCopied.Load(), t.chunksCopied.Load(), maxValue
+	total, ok := keySpaceWidth(t.Ti)
+	if !ok {
+		total = atomic.LoadUint64(&t.Ti.EstimatedRows) // should not be needed.
+	}
+	return t.rowsCopied.Load(), t.chunksCopied.Load(), total
+}
+
+// keySpaceSparseFactor is how many times wider than its row estimate a key
+// space has to be before the optimistic chunker reports progress in rows.
+// Past it, key-space distance is off from the rows left by more than a row
+// estimate usually is, and on a key with a wide gap ahead of the copy it is
+// off by orders of magnitude: the ETA paces the whole gap at the rate the
+// copy moves through populated keys.
+const keySpaceSparseFactor = 2
+
+// keySpaceIsSparse reports whether the table's key space is wider than its
+// row estimate by more than keySpaceSparseFactor. A table with no row estimate
+// or a key space that cannot be measured keeps reporting key-space distance.
+func keySpaceIsSparse(ti *TableInfo) bool {
+	estimatedRows := atomic.LoadUint64(&ti.EstimatedRows)
+	if estimatedRows == 0 {
+		return false
+	}
+	width, ok := keySpaceWidth(ti)
+	if !ok {
+		return false
+	}
+	return width/keySpaceSparseFactor > estimatedRows
+}
+
+// keySpaceWidth returns MaxValue - MinValue, the distance a full copy
+// travels, which is what rowsCopied counts toward. A MinValue that is not a
+// non-negative integer (a signed key holding negative values) measures from
+// zero, matching how OpenAtWatermark seeds rowsCopied in that case.
+func keySpaceWidth(ti *TableInfo) (uint64, bool) {
+	maxValue, err := strconv.ParseUint(ti.MaxValue().String(), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if minValue, err := strconv.ParseUint(ti.MinValue().String(), 10, 64); err == nil && maxValue >= minValue {
+		return maxValue - minValue, true
+	}
+	return maxValue, true
 }
 
 // KeyAboveHighWatermark returns true if the key is above the high watermark.

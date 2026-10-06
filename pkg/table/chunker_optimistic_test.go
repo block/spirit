@@ -394,7 +394,10 @@ func TestOptimisticResumeProgressAccounting(t *testing.T) {
 	// accumulates it -- NOT the absolute resume key (713192535, which produced
 	// the bogus ~53% before the fix).
 	require.Equal(t, uint64(713192535-682769913), rowsCopied)
-	require.Equal(t, uint64(1341021280), total)
+	// The total is measured the same way, as the distance a full copy
+	// travels from MinValue, so the percentage reaches 100 at the end of the
+	// copy instead of stopping at (MAX-MIN)/MAX.
+	require.Equal(t, uint64(1341021280-682769913), total)
 
 	// The reported percentage should be a few percent, nowhere near the ~53%
 	// the bug produced.
@@ -427,6 +430,53 @@ func newOptimisticChunker4Test(t *testing.T) (*TableInfo, *chunkerOptimistic) {
 	}
 	chunker.SetDynamicChunking(false)
 	return ti, chunker
+}
+
+// On a dense key, key-space distance is the copy's progress: every chunk
+// advances it by its width, and the total is the width of the key space.
+func TestOptimisticProgressOnADenseKeySpaceIsKeyDistance(t *testing.T) {
+	_, chunker := newOptimisticChunker4Test(t)
+	require.NoError(t, chunker.Open())
+
+	for range 3 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunker.Feedback(chunk, time.Second, 137)
+	}
+
+	copied, chunks, total := chunker.Progress()
+	require.Equal(t, uint64(3*StartingChunkSize), copied)
+	require.Equal(t, uint64(3), chunks)
+	require.Equal(t, uint64(1000000-1), total)
+}
+
+// A key that jumps far ahead of its rows, such as one generated rather than
+// incremented, leaves most of the key space empty. Key-space distance would
+// pace that whole gap at the rate the copy moves through populated keys, so
+// the remaining work and the ETA come out orders of magnitude too large.
+// Progress is reported in rows against the row estimate instead.
+func TestOptimisticProgressOnASparseKeySpaceIsInRows(t *testing.T) {
+	ti, chunker := newOptimisticChunker4Test(t)
+	ti.maxValue = Datum{Val: int64(1_000_000_000_000_000), Tp: signedType}
+	require.NoError(t, chunker.Open())
+
+	const settledPerChunk = 137
+	for range 3 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunker.Feedback(chunk, time.Second, settledPerChunk)
+	}
+
+	copied, chunks, total := chunker.Progress()
+	require.Equal(t, uint64(3*settledPerChunk), copied)
+	require.Equal(t, uint64(3), chunks)
+	require.Equal(t, uint64(1000000), total, "the total is the row estimate, not the key space")
+
+	// The unit is fixed when the chunker opens, so a row estimate refreshed
+	// mid-copy cannot switch it and leave a rate measured across two units.
+	ti.EstimatedRows = 1_000_000_000_000_000
+	copied, _, _ = chunker.Progress()
+	require.Equal(t, uint64(3*settledPerChunk), copied)
 }
 
 // A copy that stops and resumes reports the rows settled by every run that
