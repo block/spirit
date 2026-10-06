@@ -119,7 +119,7 @@ func TestLowWatermark(t *testing.T) {
 	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err := chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false},\"RowsCopied\":2}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"1001\"],\"Inclusive\":false},\"RowsCopied\":2,\"SourceRowsBelow\":1}", watermark)
 
 	// Check key w.r.t. watermark
 	require.False(t, chunker.KeyAboveHighWatermark(1000))
@@ -136,7 +136,7 @@ func TestLowWatermark(t *testing.T) {
 	require.True(t, chunker.KeyBelowLowWatermark(1001))
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":3}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":3,\"SourceRowsBelow\":2}", watermark)
 
 	chunkAsync1, err := chunker.Next()
 	require.NoError(t, err)
@@ -156,18 +156,18 @@ func TestLowWatermark(t *testing.T) {
 	chunker.Feedback(chunkAsync2, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":4}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":4,\"SourceRowsBelow\":2}", watermark)
 
 	chunker.Feedback(chunkAsync3, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":5}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"1001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"2001\"],\"Inclusive\":false},\"RowsCopied\":5,\"SourceRowsBelow\":2}", watermark)
 	require.False(t, chunker.KeyBelowLowWatermark(2001))
 
 	chunker.Feedback(chunkAsync1, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false},\"RowsCopied\":6}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false},\"RowsCopied\":6,\"SourceRowsBelow\":5}", watermark)
 	require.True(t, chunker.KeyBelowLowWatermark(2001))
 	require.True(t, chunker.KeyBelowLowWatermark(5000))
 
@@ -176,12 +176,12 @@ func TestLowWatermark(t *testing.T) {
 	require.Equal(t, "`id` >= 5001 AND `id` < 6001", chunk.String()) // should bump immediately
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false},\"RowsCopied\":6}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"4001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"5001\"],\"Inclusive\":false},\"RowsCopied\":6,\"SourceRowsBelow\":5}", watermark)
 
 	chunker.Feedback(chunk, time.Second, 1)
 	watermark, err = chunker.GetLowWatermark()
 	require.NoError(t, err)
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"5001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"6001\"],\"Inclusive\":false},\"RowsCopied\":7}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":1000,\"LowerBound\":{\"Value\": [\"5001\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"6001\"],\"Inclusive\":false},\"RowsCopied\":7,\"SourceRowsBelow\":6}", watermark)
 
 	// Test that we have applied all stored chunks and the map is empty,
 	// as we gave Feedback for all chunks.
@@ -334,7 +334,7 @@ func TestOptimisticDynamicChunking(t *testing.T) {
 	watermark, err := chunker.GetLowWatermark()
 	require.NoError(t, err)
 
-	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":22,\"LowerBound\":{\"Value\": [\"584\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"606\"],\"Inclusive\":false},\"RowsCopied\":35}", watermark)
+	require.JSONEq(t, "{\"Key\":[\"id\"],\"ChunkSize\":22,\"LowerBound\":{\"Value\": [\"584\"],\"Inclusive\":true},\"UpperBound\":{\"Value\": [\"606\"],\"Inclusive\":false},\"RowsCopied\":35,\"SourceRowsBelow\":34}", watermark)
 
 	// Start everything over again as t2.
 	t2 := newTableInfo4Test("test", "t1")
@@ -454,21 +454,23 @@ func TestOptimisticProgressOnADenseKeySpaceIsKeyDistance(t *testing.T) {
 // incremented, leaves most of the key space empty. Key-space distance would
 // pace that whole gap at the rate the copy moves through populated keys, so
 // the remaining work and the ETA come out orders of magnitude too large.
-// Progress is reported in rows against the row estimate instead.
+// Progress is reported in the rows read from the source against the row
+// estimate instead. The rows read count even when INSERT IGNORE settles fewer,
+// because the change stream already wrote the rest.
 func TestOptimisticProgressOnASparseKeySpaceIsInRows(t *testing.T) {
-	ti, chunker := newOptimisticChunker4Test(t)
-	ti.maxValue = Datum{Val: int64(1_000_000_000_000_000), Tp: signedType}
+	ti, chunker := newSparseOptimisticChunker4Test(t)
 	require.NoError(t, chunker.Open())
 
-	const settledPerChunk = 137
+	const readPerChunk, settledPerChunk = 500, 137
 	for range 3 {
 		chunk, err := chunker.Next()
 		require.NoError(t, err)
+		chunk.SourceRows = readPerChunk
 		chunker.Feedback(chunk, time.Second, settledPerChunk)
 	}
 
 	copied, chunks, total := chunker.Progress()
-	require.Equal(t, uint64(3*settledPerChunk), copied)
+	require.Equal(t, uint64(3*readPerChunk), copied)
 	require.Equal(t, uint64(3), chunks)
 	require.Equal(t, uint64(1000000), total, "the total is the row estimate, not the key space")
 
@@ -476,7 +478,71 @@ func TestOptimisticProgressOnASparseKeySpaceIsInRows(t *testing.T) {
 	// mid-copy cannot switch it and leave a rate measured across two units.
 	ti.EstimatedRows = 1_000_000_000_000_000
 	copied, _, _ = chunker.Progress()
-	require.Equal(t, uint64(3*settledPerChunk), copied)
+	require.Equal(t, uint64(3*readPerChunk), copied)
+}
+
+// A resume copies again every chunk from the watermark chunk on, including
+// chunks that had completed out of order ahead of it. Row-based progress
+// resumes from the rows below the watermark chunk, so none of those rows is
+// counted twice.
+func TestOptimisticSparseProgressResumesFromRowsBelowTheWatermark(t *testing.T) {
+	_, chunker := newSparseOptimisticChunker4Test(t)
+	require.NoError(t, chunker.Open())
+
+	const readPerChunk = 500
+	var dispatched []*Chunk
+	for range 4 {
+		chunk, err := chunker.Next()
+		require.NoError(t, err)
+		chunk.SourceRows = readPerChunk
+		dispatched = append(dispatched, chunk)
+	}
+	// The third chunk is still in flight when the copy stops, so the
+	// watermark is the second chunk and the fourth sits ahead of it.
+	for _, i := range []int{0, 1, 3} {
+		chunker.Feedback(dispatched[i], time.Second, readPerChunk)
+	}
+	copied, _, _ := chunker.Progress()
+	require.Equal(t, uint64(3*readPerChunk), copied)
+
+	watermark, err := chunker.GetLowWatermark()
+	require.NoError(t, err)
+
+	_, resumed := newSparseOptimisticChunker4Test(t)
+	require.NoError(t, resumed.OpenAtWatermark(watermark))
+	copied, _, _ = resumed.Progress()
+	require.Equal(t, uint64(readPerChunk), copied, "only the first chunk is below the watermark chunk")
+
+	// The resume starts by copying the watermark chunk again, which counts it
+	// once more, and only once.
+	chunk, err := resumed.Next()
+	require.NoError(t, err)
+	chunk.SourceRows = readPerChunk
+	resumed.Feedback(chunk, time.Second, readPerChunk)
+	copied, _, _ = resumed.Progress()
+	require.Equal(t, uint64(2*readPerChunk), copied)
+}
+
+// Statistics refresh MinValue during a copy, for example after the oldest
+// rows are purged. rowsCopied keeps measuring from the minimum it opened at,
+// so the total does too, and the percentage does not jump.
+func TestOptimisticProgressTotalKeepsTheOriginItOpenedAt(t *testing.T) {
+	ti, chunker := newOptimisticChunker4Test(t)
+	require.NoError(t, chunker.Open())
+
+	ti.minValue = Datum{Val: int64(400000), Tp: signedType}
+
+	_, _, total := chunker.Progress()
+	require.Equal(t, uint64(1000000-1), total)
+}
+
+// newSparseOptimisticChunker4Test is newOptimisticChunker4Test with a key
+// space that reaches far beyond the table's rows.
+func newSparseOptimisticChunker4Test(t *testing.T) (*TableInfo, *chunkerOptimistic) {
+	t.Helper()
+	ti, chunker := newOptimisticChunker4Test(t)
+	ti.maxValue = Datum{Val: int64(1_000_000_000_000_000), Tp: signedType}
+	return ti, chunker
 }
 
 // A copy that stops and resumes reports the rows settled by every run that

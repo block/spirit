@@ -302,6 +302,7 @@ func (t *chunkerComposite) OpenAtWatermark(checkpnt string) error {
 	// There might be an annoying off by 1 error. So let's just restore
 	// from the chunk.LowerBound.
 	t.watermark = chunk
+	t.rowsBelowWatermark = 0
 	t.chunkPtrs = chunk.LowerBound.Value
 	t.rowsCopied.Store(watermark.RowsCopied)
 	return nil
@@ -326,6 +327,7 @@ func (t *chunkerComposite) Reset() error {
 	t.finalChunkSent = false
 	t.chunkSize = StartingChunkSize
 	t.watermark = nil
+	t.rowsBelowWatermark = 0
 	t.lowerBoundWatermarkMap = make(map[string]*Chunk, 0)
 	t.inflightChunks = 0
 	t.chunkTimingInfo = []time.Duration{}
