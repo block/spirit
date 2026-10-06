@@ -584,3 +584,21 @@ func TestKillWithConnectionAdminSkipsKillProcedure(t *testing.T) {
 	require.NoError(t, KillSessionAndWait(t.Context(), db, pid))
 	requireSessionGone(t, conn)
 }
+
+// A session that exits between the denied KILL and the procedure call is
+// reported as gone, not as a kill the user may not make, so ForceExec retries
+// instead of giving up on a blocker that no longer exists. The race cannot be
+// timed, so the stub raises the procedure's 1094 directly.
+func TestKillProcedureFindsSessionGone(t *testing.T) {
+	f := newRDSKillFixture(t, "testrdskillgoneuser")
+	f.exec(t, "DROP PROCEDURE `"+f.schema+"`.rds_kill")
+	f.exec(t, "CREATE PROCEDURE `"+f.schema+"`.rds_kill(IN thread BIGINT) SQL SECURITY DEFINER "+
+		"SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = 1094, MESSAGE_TEXT = 'Unknown thread id'")
+	f.grantExecute(t)
+	db := f.userDB(t)
+
+	_, pid := f.victim(t)
+	err := KillTransaction(t.Context(), db, pid)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread})
+	require.NotErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
+}
