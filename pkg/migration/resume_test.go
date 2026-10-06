@@ -117,14 +117,15 @@ func TestChangeIntToBigIntPKResumeFromChkPt(t *testing.T) {
 
 // watermarkChunkJSON returns the chunk portion of a watermark, dropping the
 // fields the chunker persists alongside it. It lets a test pin the exact chunk
-// the watermark points at without also pinning the row count, which depends on
+// the watermark points at without also pinning the row counts, which depend on
 // how much of the binlog the applier had already written to the new table when
-// the chunk was copied.
+// the chunk was copied, and on the gaps the seed left in the key.
 func watermarkChunkJSON(t *testing.T, watermark string) string {
 	t.Helper()
 	var fields map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal([]byte(watermark), &fields))
 	delete(fields, "RowsCopied")
+	delete(fields, "SourceRowsBelow")
 	out, err := json.Marshal(fields)
 	require.NoError(t, err)
 	return string(out)
