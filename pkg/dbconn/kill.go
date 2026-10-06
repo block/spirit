@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -45,7 +46,20 @@ var (
 	// emoji. The statement's lock wait outlasts most such statements, so the
 	// kill looks again while the statement still waits.
 	errBlockerLookupFailed = errors.New("could not list the sessions blocking the lock")
+
+	// rdsKillSchema and rdsKillName name the procedure RDS and Aurora MySQL
+	// provide to kill a connection, which needs only EXECUTE on it. KILL
+	// falls back to it when it is denied (see killConnection). They are
+	// variables only so tests on community MySQL, which lacks the procedure,
+	// can point them at a stub in a test schema.
+	rdsKillSchema = "mysql"
+	rdsKillName   = "rds_kill"
 )
+
+// rdsKillProcedure returns the quoted name of the RDS kill procedure.
+func rdsKillProcedure() string {
+	return sqlescape.EscapeIdentifier(rdsKillSchema) + "." + sqlescape.EscapeIdentifier(rdsKillName)
+}
 
 // innodbTrxFourByteBug explains error 3854 (ErrCannotConvertString) from the
 // blocker lookup, so an operator does not look for a fault in their own setup.
@@ -129,7 +143,6 @@ WHERE t.processlist_id = ?
 
 	processIDClause  = " AND t.processlist_id NOT IN (CONNECTION_ID() %s) "
 	queryTableClause = " AND (ml.object_schema, ml.object_name) IN (%s) "
-	rdsKillStatement = "CALL mysql.rds_kill(%d)" // not needed in MySQL 8.0 with the CONNECTION_ADMIN privilege
 	killStatement    = "KILL %d"
 
 	// forceKillPrivilegeProbe verifies the connection can read every
@@ -243,7 +256,8 @@ func killBlockers(ctx context.Context, db *sql.DB, tables []*table.TableInfo, lo
 	var errs []error
 	for _, pid := range pids {
 		logger.Warn("killing locking transaction", "pid", pid)
-		if err := KillTransaction(ctx, db, pid); err != nil {
+		if err := killConnection(ctx, db, pid, logger); err != nil {
+			logger.Warn("failed to kill locking transaction", "pid", pid, "error", err)
 			errs = append(errs, fmt.Errorf("failed to kill transaction %d: %w", pid, err))
 		} else {
 			killed = append(killed, pid)
@@ -419,8 +433,9 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 // CheckForceKillPrivileges verifies that the connection's user holds every
 // privilege force-kill needs: SELECT on the performance_schema tables its
 // queries read (see GetTableLocks and getLockingTransactions), PROCESS to read
-// information_schema.innodb_trx, and CONNECTION_ADMIN or SUPER to kill another
-// user's session. It returns an error naming each one that is missing.
+// information_schema.innodb_trx, and CONNECTION_ADMIN or SUPER, or EXECUTE on
+// mysql.rds_kill, to kill another user's session (see checkKillPrivilege). It
+// returns an error naming each one that is missing.
 //
 // A privilege the user lacks matches ErrForceKillPrivilegeMissing. A read
 // that fails for another reason, such as a lost connection, does not, so a
@@ -428,8 +443,8 @@ func GetTableLocks(ctx context.Context, db *sql.DB, tables []*table.TableInfo, l
 //
 // It is intended for preflight privilege checks. It reads SHOW GRANTS, one
 // row of information_schema.innodb_metrics, no rows of the performance_schema
-// lock tables, and, when rds_superuser_role is granted, the global
-// activate_all_roles_on_login. It logs nothing, so unlike GetTableLocks /
+// lock tables, and, when the grants allow executing mysql.rds_kill, one row of
+// information_schema.ROUTINES. It logs nothing, so unlike GetTableLocks /
 // getLockingTransactions it neither scans server-wide locks nor emits "found
 // locking transaction" log lines.
 func CheckForceKillPrivileges(ctx context.Context, db *sql.DB) error {
@@ -501,12 +516,44 @@ func runPrivilegeProbe(ctx context.Context, db *sql.DB, query string) (err error
 // disconnected — in which case KILL returns a harmless error). Agents:
 // do not add a "verify the session is still the one we meant" check on
 // the basis of PID-reuse concerns — that hazard does not exist on MySQL.
+//
+// A session that no longer exists is returned as an error matching
+// ErrNoSuchThread. See killConnection for the RDS fallback.
 func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(killStatement, pid)); err != nil {
+	if err := killConnection(ctx, db, pid, slog.Default()); err != nil {
 		return fmt.Errorf("failed to kill transaction %d: %w", pid, err)
 	}
-
 	return nil
+}
+
+// killConnection kills the session pid with KILL. When KILL is denied
+// (ER_KILL_DENIED_ERROR: the user holds neither CONNECTION_ADMIN nor SUPER),
+// it calls mysql.rds_kill instead, which RDS and Aurora MySQL provide and
+// which needs only EXECUTE on the procedure. On Aurora MySQL 3,
+// rds_superuser_role often lacks CONNECTION_ADMIN, and a blue/green
+// switchover can remove it, so the procedure is the reliable way to kill
+// there. It decides on every call, so a privilege granted or revoked during a
+// migration takes effect at the next kill.
+//
+// When the procedure also fails, the error wraps both failures, so it still
+// matches ER_KILL_DENIED_ERROR. The one exception is a session that has
+// already gone (ER_NO_SUCH_THREAD from the procedure), which is returned on
+// its own, as KILL itself would return it.
+func killConnection(ctx context.Context, db *sql.DB, pid int, logger *slog.Logger) error {
+	_, killErr := db.ExecContext(ctx, fmt.Sprintf(killStatement, pid))
+	if killErr == nil || !errors.Is(killErr, &mysql.MySQLError{Number: parsermysql.ErrKillDenied}) {
+		return killErr
+	}
+	proc := rdsKillProcedure()
+	_, rdsErr := db.ExecContext(ctx, fmt.Sprintf("CALL %s(%d)", proc, pid))
+	switch {
+	case rdsErr == nil:
+		logger.Info("KILL was denied, so killed the session with "+proc+" instead", "pid", pid)
+		return nil
+	case errors.Is(rdsErr, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread}):
+		return fmt.Errorf("KILL was denied, and %s found no session %d: %w", proc, pid, rdsErr)
+	}
+	return errors.Join(killErr, fmt.Errorf("KILL was denied, and falling back to %s failed: %w", proc, rdsErr))
 }
 
 // KillSessionAndWait kills the session pid and waits until it has exited, so
@@ -515,10 +562,12 @@ func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
 //
 // It needs no extra privileges when pid belongs to the same user as db: a user
 // can KILL its own sessions and see them in information_schema.PROCESSLIST
-// without CONNECTION_ADMIN or PROCESS.
+// without CONNECTION_ADMIN or PROCESS. Another user's session needs
+// CONNECTION_ADMIN or SUPER, or, on RDS and Aurora, EXECUTE on mysql.rds_kill
+// (see killConnection).
 func KillSessionAndWait(ctx context.Context, db *sql.DB, pid int) error {
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(killStatement, pid)); err != nil {
-		if myErr, ok := errors.AsType[*mysql.MySQLError](err); !ok || myErr.Number != parsermysql.ErrNoSuchThread {
+	if err := killConnection(ctx, db, pid, slog.Default()); err != nil {
+		if !errors.Is(err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread}) {
 			return fmt.Errorf("failed to kill session %d: %w", pid, err)
 		}
 	}

@@ -65,12 +65,13 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 	}
 
 	// Force-kill is enabled by default, so its privileges are required: the
-	// performance_schema lock tables, PROCESS, and CONNECTION_ADMIN or SUPER.
+	// performance_schema lock tables, PROCESS, and CONNECTION_ADMIN or SUPER,
+	// or EXECUTE on mysql.rds_kill (RDS and Aurora).
 	// The check logs nothing; the lock detection that does log runs during
 	// cutover.
 	if err := dbconn.CheckForceKillPrivileges(ctx, r.DB); err != nil {
 		if errors.Is(err, dbconn.ErrForceKillPrivilegeMissing) {
-			return fmt.Errorf("insufficient privileges to run a migration with force-kill. Needed: CONNECTION_ADMIN/SUPER, PROCESS, and SELECT on performance_schema.*: %w", err)
+			return fmt.Errorf("insufficient privileges to run a migration with force-kill. Needed: CONNECTION_ADMIN/SUPER or EXECUTE on mysql.rds_kill, PROCESS, and SELECT on performance_schema.*: %w", err)
 		}
 		return fmt.Errorf("could not check the privileges force-kill needs: %w", err)
 	}

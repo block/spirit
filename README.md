@@ -135,7 +135,7 @@ Spirit requires an account with these privileges:
 * Either `SUPER, REPLICATION SLAVE on *.*` or `REPLICATION CLIENT, REPLICATION SLAVE on *.*`.
 * The `RELOAD` privilege.
 * `CREATE TEMPORARY TABLES` on the schema, but only for a table with an `ENUM` or `SET` member that `information_schema` reports with a `?`. MySQL reports each member character outside `utf8mb3` as `?`, so Spirit reads the members MySQL stores through a temporary table, and refuses the table if it cannot.
-* `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover. To kill a session of an account that has `SYSTEM_USER`, Spirit's user needs `SYSTEM_USER` too.
+* `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover. To kill a session of an account that has `SYSTEM_USER`, Spirit's user needs `SYSTEM_USER` too. On RDS and Aurora MySQL, `EXECUTE` on the `mysql.rds_kill` procedure (on `*.*`, on `mysql.*`, or on the procedure) can replace `CONNECTION_ADMIN`: when `KILL` is denied, Spirit calls `mysql.rds_kill` instead. On Aurora MySQL 3, `rds_superuser_role` does not reliably include `CONNECTION_ADMIN`, so Spirit counts only the privileges `SHOW GRANTS` lists for an active role, not its name.
 
 `spirit move` also needs to see the events and stored routines it refuses to move. On each source schema it requires:
 

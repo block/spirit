@@ -49,6 +49,7 @@ func TestAdvisoryLock(t *testing.T) {
 
 	// Confirm a second lock cannot be acquired
 	_, err = NewAdvisoryLock(t.Context(), testutils.DSN(), lockTables, NewDBConfig(), logger)
+	require.ErrorIs(t, err, ErrLockHeld)
 	require.ErrorContains(t, err, "lock is held by another connection")
 
 	// Close the original lock

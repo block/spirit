@@ -687,7 +687,7 @@ func blockerSurvivesKill(a forceExecAttempt) (reason string, survives bool) {
 	case errors.Is(a.killErr, errHeavyTransactionSkipped):
 		return "a blocking transaction is too heavy to roll back safely, and force-kill does not end it", true
 	case errors.Is(a.killErr, &mysql.MySQLError{Number: parsermysql.ErrKillDenied}):
-		return "the user may not kill a blocking session: it needs CONNECTION_ADMIN or SUPER, and SYSTEM_USER if the session belongs to a SYSTEM_USER account", true
+		return "the user may not kill a blocking session: it needs CONNECTION_ADMIN or SUPER (or, on RDS and Aurora, EXECUTE on mysql.rds_kill), and SYSTEM_USER if the session belongs to a SYSTEM_USER account", true
 	}
 	return "", false
 }
