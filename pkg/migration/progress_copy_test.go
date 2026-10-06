@@ -14,12 +14,13 @@ import (
 )
 
 // TestProgressCopyReconcilesWithTablesOnAutoIncrementKey exercises Progress.Copy
-// on the chunker Spirit selects for a single auto_increment key. That chunker
-// paces itself on keyspace distance against the auto_increment max, which is
-// what the copier's own progress reports, and a table whose ids are sparse
-// makes that measure differ from the row count by orders of magnitude. Copy
-// must follow the row-count path Tables uses, so a caller reading both in one
-// snapshot sees one story, and the reading must survive leaving the copy phase.
+// on the chunker Spirit selects for a single auto_increment key, over a table
+// whose ids are sparse enough that keyspace distance against the auto_increment
+// max would differ from the row count by orders of magnitude. Copy must follow
+// the row-count path Tables uses, so a caller reading both in one snapshot sees
+// one story, and the reading must survive leaving the copy phase. The copier's
+// own progress, which paces the ETA, reports rows on such a key too, so it
+// tells the same story.
 func TestProgressCopyReconcilesWithTablesOnAutoIncrementKey(t *testing.T) {
 	testutils.NewTestTable(t, "copyprog", `CREATE TABLE copyprog (
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -63,21 +64,16 @@ func TestProgressCopyReconcilesWithTablesOnAutoIncrementKey(t *testing.T) {
 	require.Less(t, p.Copy.RowsTotal, uint64(1000000), "the total is the row estimate, not the auto_increment max")
 	require.Equal(t, p.Copy.String()+" copyRows ETA TBD", p.Summary)
 
-	// The copier's own measure is the one Copy must not be: keyspace distance
-	// against the auto_increment max. Its total is the highest id, and its
-	// numerator counts ids the table never had, so it overshoots the rows
-	// settled.
+	// The copier's own measure counts the rows it read against the row
+	// estimate rather than ids against the auto_increment max, so it does not
+	// count ids the table never had.
 	own := m.copier.CopyProgress()
-	require.EqualValues(t, 1000000, own.RowsTotal)
-	require.Equal(t, 2*m.copier.ChunkSize(), own.RowsCopied, "two chunks of the pinned size, counted as ids rather than rows")
-	require.Greater(t, own.RowsCopied, p.Copy.RowsCopied)
-	require.NotEqual(t, p.Copy, own)
+	require.Equal(t, p.Copy, own)
 
 	// The log block reports the same measure as the API on the same tick,
 	// percentage included.
 	block := m.Status()
 	require.Contains(t, block, fmt.Sprintf("%6.2f%%  %d/%d", p.Copy.Fraction()*100, p.Copy.RowsCopied, p.Copy.RowsTotal))
-	require.NotContains(t, block, fmt.Sprintf("%d/%d", own.RowsCopied, own.RowsTotal))
 
 	m.status.Set(status.WaitingOnSentinelTable)
 	require.Equal(t, p.Copy, m.Progress().Copy)
