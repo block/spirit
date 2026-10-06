@@ -16,6 +16,13 @@ import (
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
+// ErrLockHeld reports that another connection holds an advisory lock this one
+// needs: another migration is already running against the table, or the
+// schema for an atomic multi-table migration. It is not a failure of the
+// migration that was refused, which can run once the holder releases the lock,
+// so callers can tell it apart from one with errors.Is.
+var ErrLockHeld = errors.New("lock is held by another connection")
+
 var (
 	// getLockTimeout is the timeout for acquiring the GET_LOCK. We set it to 0
 	// because we want to return immediately if the lock is not available
@@ -231,7 +238,7 @@ func (m *AdvisoryLock) getLocks(ctx context.Context, logger *slog.Logger) error 
 		if answer == 0 {
 			// 0 means the lock is held by another connection
 			logger.Warn("could not acquire advisory lock, lock is held by another connection", "lock_name", lockName)
-			return fmt.Errorf("could not acquire advisory lock for %s, lock is held by another connection", lockName)
+			return fmt.Errorf("could not acquire advisory lock for %s: %w", lockName, ErrLockHeld)
 		} else if answer != 1 {
 			// probably we never get here, but just in case
 			return fmt.Errorf("could not acquire advisory lock %s, GET_LOCK returned: %d", lockName, answer)
