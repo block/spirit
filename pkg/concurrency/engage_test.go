@@ -451,3 +451,39 @@ func TestEngageWarnsWhenReplacingConfiguredThreads(t *testing.T) {
 		})
 	}
 }
+
+// A programmatic caller that declares its non-default counts a baseline
+// (ThreadsAreBaseline) still has them replaced on Aurora, by autoscaling and
+// by small-instance mode alike, but without the warning. The same counts
+// without the declaration (as the CLI passes them) still warn.
+func TestEngageBaselineThreadsDoNotWarn(t *testing.T) {
+	cases := map[string]struct {
+		vcpus   int
+		small   bool
+		warning string
+	}{
+		"autoscaling":    {64, false, "level=WARN msg=\"autoscaling replaces the configured --threads/--write-threads"},
+		"small instance": {2, true, "level=WARN msg=\"small-instance mode replaces the configured --threads/--write-threads"},
+	}
+	for name, tc := range cases {
+		for _, baseline := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/baseline=%t", name, baseline), func(t *testing.T) {
+				f := &flags.Common{Threads: 2, WriteThreads: 8, MaxCommitLatency: 100 * time.Millisecond, ThreadsAreBaseline: baseline}
+				plan, logs := engageForTest(t, f, Request{Targets: []Target{{Aurora: aurora(false)}}, VCPUs: vcpus(tc.vcpus)})
+				require.Equal(t, tc.small, plan.SmallInstance)
+				require.Equal(t, !tc.small, plan.Engaged)
+				wantThreads, wantWriteThreads := plan.ReadStart, plan.WriteStart
+				if tc.small {
+					wantThreads, wantWriteThreads = autoscale.SmallInstanceThreads, autoscale.SmallInstanceThreads
+				}
+				require.Equal(t, wantThreads, f.Threads, "the counts are replaced either way")
+				require.Equal(t, wantWriteThreads, f.WriteThreads)
+				if baseline {
+					require.NotContains(t, logs, tc.warning)
+				} else {
+					require.Contains(t, logs, tc.warning)
+				}
+			})
+		}
+	}
+}

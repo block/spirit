@@ -339,8 +339,9 @@ func engage(ctx context.Context, f *flags.Common, req Request, clientCeiling int
 	// right size should not also be told where to stop.
 	//
 	// A count other than the default was most likely set on purpose, often as
-	// a load cap on a production writer, so say loudly that it is replaced.
-	if explicitThreads(f.Threads, flags.DefaultThreads) || explicitThreads(f.WriteThreads, flags.DefaultWriteThreads) {
+	// a load cap on a production writer, so say loudly that it is replaced —
+	// unless the caller declared its counts a baseline (ThreadsAreBaseline).
+	if deliberateThreads(f) {
 		logger.Warn("autoscaling replaces the configured --threads/--write-threads with counts derived from the targets; pass --skip-autoscaling to keep them",
 			"threads", f.Threads, "write_threads", f.WriteThreads,
 			"read_threads", plan.ReadStart, "max_read_threads", plan.MaxReadThreads,
@@ -356,10 +357,17 @@ func engage(ctx context.Context, f *flags.Common, req Request, clientCeiling int
 	return plan, nil
 }
 
-// explicitThreads reports whether a thread count differs from its default.
-// Zero is the programmatic "use the default" (flags.Common.Normalize).
-func explicitThreads(n, def int) bool {
-	return n != 0 && n != def
+// deliberateThreads reports whether f's thread counts look like a deliberate
+// setting worth warning about when they are replaced: either count differs
+// from its default, and the caller has not declared them a baseline
+// (flags.Common.ThreadsAreBaseline). Zero is the programmatic "use the
+// default" (flags.Common.Normalize).
+func deliberateThreads(f *flags.Common) bool {
+	if f.ThreadsAreBaseline {
+		return false
+	}
+	differs := func(n, def int) bool { return n != 0 && n != def }
+	return differs(f.Threads, flags.DefaultThreads) || differs(f.WriteThreads, flags.DefaultWriteThreads)
 }
 
 // smallInstance selects small-instance mode when any target, with vcpus[i] the
@@ -371,7 +379,7 @@ func smallInstance(f *flags.Common, req Request, vcpus []int, logger *slog.Logge
 		if vcpus[i] == 0 || !autoscale.IsSmallInstance(vcpus[i]) {
 			continue
 		}
-		if explicitThreads(f.Threads, flags.DefaultThreads) || explicitThreads(f.WriteThreads, flags.DefaultWriteThreads) {
+		if deliberateThreads(f) {
 			logger.Warn("small-instance mode replaces the configured --threads/--write-threads; pass --skip-autoscaling to keep them",
 				"threads", f.Threads, "write_threads", f.WriteThreads,
 				"small_instance_threads", autoscale.SmallInstanceThreads)

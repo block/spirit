@@ -76,6 +76,17 @@ type Common struct {
 	// flag has no effect. See issue #831.
 	SkipAutoscaling bool `name:"skip-autoscaling" help:"Do not size the copy, apply and checksum thread pools from the instance or scale them on throttler feedback, and use --threads and --write-threads instead. Autoscaling only engages on Aurora, so this flag has no effect elsewhere. It also disables small-instance mode (one thread per pool and 1 MiB chunks on an Aurora target with fewer than 4 vCPUs)" optional:"" default:"false"`
 
+	// ThreadsAreBaseline declares that Threads and WriteThreads are the
+	// caller's baseline for servers autoscaling does not engage on, not a load
+	// cap. It is for programmatic callers that embed spirit and pass their own
+	// non-default counts on every run. Autoscaling and small-instance mode
+	// still replace the counts on Aurora; this only silences the warning that
+	// they did, which otherwise fires on every Aurora run and names a CLI flag
+	// (--skip-autoscaling) such a caller may not expose. A caller whose counts
+	// are a cap sets SkipAutoscaling instead. It is not a CLI flag: a
+	// non-default count passed on the command line is an explicit choice.
+	ThreadsAreBaseline bool `kong:"-"`
+
 	// CheckpointMaxAge is the oldest checkpoint a run will resume from. Its
 	// age is the time since the checkpoint row was last written, i.e. how long
 	// the previous run has been stopped. What happens to a checkpoint that is
