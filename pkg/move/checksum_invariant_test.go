@@ -302,3 +302,47 @@ func TestDumpCheckpointNoopAfterReverseWindowPersisted(t *testing.T) {
 	require.NoError(t, r.DumpCheckpoint(ctx))
 	require.Equal(t, phaseReverseWindow, phase())
 }
+
+// TestDumpCheckpointNoopAfterResumingPastCutover verifies that a run which
+// finds a post-cutover row on resume also stops copy-phase dumps, even though
+// this process never wrote the row itself.
+func TestDumpCheckpointNoopAfterResumingPastCutover(t *testing.T) {
+	r, ctx := setupRunnerForChecksumTest(t, "rw_resumed")
+	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
+	r.status.Set(status.Checksum)
+
+	// The row a previous process left behind.
+	r.reversePositions = map[string]string{"t": "pos"}
+	require.NoError(t, persistReverseWindow(ctx, r))
+	r.checkpointMu.Lock()
+	r.checkpointOwnedByReverseWindow = false // this process starts fresh
+	r.checkpointMu.Unlock()
+
+	// The resume itself fails here (the fixture has no retired _old tables),
+	// but it must already have claimed the row.
+	resumed, _ := r.maybeResumeReverseWindow(ctx)
+	require.True(t, resumed)
+
+	require.NoError(t, r.DumpCheckpoint(ctx))
+	rec, err := r.checkpointTbl().ReadLatest(ctx)
+	require.NoError(t, err)
+	require.Equal(t, phaseReverseWindow, rec.Phase)
+}
+
+// TestPersistReverseWindowFailureKeepsDumpEnabled verifies that the reverse
+// window claims the row only once its write succeeded.
+func TestPersistReverseWindowFailureKeepsDumpEnabled(t *testing.T) {
+	r, ctx := setupRunnerForChecksumTest(t, "rw_fail")
+	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
+	r.status.Set(status.Checksum)
+
+	require.NoError(t, r.checkpointTbl().Drop(ctx))
+	require.Error(t, persistReverseWindow(ctx, r))
+	require.NoError(t, r.checkpointTbl().Create(ctx))
+
+	require.NoError(t, r.DumpCheckpoint(ctx))
+	rec, err := r.checkpointTbl().ReadLatest(ctx)
+	require.NoError(t, err)
+	require.Empty(t, rec.Phase)
+	require.NotEmpty(t, rec.Position)
+}
