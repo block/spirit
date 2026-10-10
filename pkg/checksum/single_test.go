@@ -294,6 +294,96 @@ func TestRetryDoesNotVacuouslyPass(t *testing.T) {
 	require.Positive(t, singleChecker.differencesFound.Load())
 }
 
+// ErrDifferencesExhausted tells a caller that a retry reproduces the
+// differences, so Run may return it only when every attempt completed having
+// found some. In a run whose first attempt errored and whose last one found
+// and repaired a difference, nothing re-verified that repair: the run is
+// exhausted attempts, not a reproduced divergence.
+func TestRunDifferencesExhaustedNeedsEveryAttempt(t *testing.T) {
+	repairFailed := errors.New("repair failed")
+	for _, tc := range []struct {
+		name string
+		// recopy is called for each repair, numbered from 1; repair is the
+		// checker's own repair path.
+		recopy func(ctx context.Context, call int, repair Recopier, chunk *table.Chunk) error
+		assert func(t *testing.T, err error)
+	}{
+		{
+			name: "first attempt errors, last attempt repairs",
+			recopy: func(ctx context.Context, call int, repair Recopier, chunk *table.Chunk) error {
+				if call == 1 {
+					return repairFailed
+				}
+				return repair.Recopy(ctx, chunk)
+			},
+			assert: func(t *testing.T, err error) {
+				require.ErrorIs(t, err, ErrAttemptsExhausted)
+				require.NotErrorIs(t, err, ErrDifferencesExhausted)
+				require.ErrorIs(t, err, repairFailed, "the attempt error stays triagable")
+				require.False(t, IsReproducible(err))
+			},
+		},
+		{
+			name: "every attempt finds differences",
+			// The repair reports success without writing, so every attempt
+			// completes and finds the difference again.
+			recopy: func(context.Context, int, Recopier, *table.Chunk) error { return nil },
+			assert: func(t *testing.T, err error) {
+				require.ErrorIs(t, err, ErrDifferencesExhausted)
+				require.NotErrorIs(t, err, ErrAttemptsExhausted)
+				require.True(t, IsReproducible(err))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl := "diffexh_" + fmt.Sprint(len(tc.name))
+			testutils.RunSQL(t, fmt.Sprintf("DROP TABLE IF EXISTS %s, _%s_new, _%s_chkpnt", tbl, tbl, tbl))
+			testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", tbl))
+			testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE _%s_new (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))", tbl))
+			testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE _%s_chkpnt (a INT)", tbl)) // for binlog advancement
+			testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s VALUES (1, 2, 3)", tbl))
+			testutils.RunSQL(t, fmt.Sprintf("INSERT INTO _%s_new VALUES (1, 2, 3), (2, 2, 3)", tbl)) // corrupt: row not in source
+
+			db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
+
+			t1 := table.NewTableInfo(db, "test", tbl)
+			require.NoError(t, t1.SetInfo(t.Context()))
+			t2 := table.NewTableInfo(db, "test", "_"+tbl+"_new")
+			require.NoError(t, t2.SetInfo(t.Context()))
+
+			cfg, err := mysql.ParseDSN(testutils.DSN())
+			require.NoError(t, err)
+			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+			defer feed.Close()
+			chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+			require.NoError(t, err)
+			require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+			require.NoError(t, feed.Start(t.Context()))
+			require.NoError(t, chunker.Open())
+
+			config := newTestCheckerConfig(t, db)
+			config.MaxRetries = 2
+			checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, config)
+			require.NoError(t, err)
+			single := checker.(*SingleChecker)
+			repair := single.recopier
+			fake := &fakeRecopier{}
+			fake.recopyFn = func(ctx context.Context, chunk *table.Chunk) error {
+				fake.mu.Lock()
+				call := fake.calls
+				fake.mu.Unlock()
+				return tc.recopy(ctx, call, repair, chunk)
+			}
+			single.recopier = fake
+
+			tc.assert(t, checker.Run(t.Context()))
+			require.Equal(t, 2, fake.calls, "each attempt found the difference and tried to repair it")
+		})
+	}
+}
+
 // TestRunResetsPriorInvalidState covers the cross-Run leak of isInvalid: a
 // prior Run that errored WITHOUT recording differences (e.g. a transient
 // connection failure) leaves isInvalid=true and differencesFound==0. A

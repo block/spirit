@@ -549,10 +549,11 @@ func (c *LocklessChecker) SetThrottler(t throttler.Throttler) {
 // plausibly survive the failure. This mirrors SingleChecker.Run, and for the
 // same reason: a checksum is the last thing standing between a migration and a
 // cut-over, and a pool of connections killed mid-pass (or any other transient
-// infrastructure failure) should not fail the migration outright. The two
-// verdicts that are *about the data* — ErrPermanentDivergence and
-// ErrVerificationUnresolved — are not retried, because repeating the read would
-// reach the same conclusion.
+// infrastructure failure) should not fail the migration outright. The verdicts
+// that are *about the data* (IsReproducible) are not retried, because repeating
+// the read would reach the same conclusion, and neither is
+// ErrVerificationUnresolved, whose attempt already spent the pass budget (see
+// locklessRetryable).
 func (c *LocklessChecker) Run(ctx context.Context) error {
 	var lastErr error
 	for attempt := 1; attempt <= c.cfg.MaxRetries; attempt++ {
@@ -584,19 +585,14 @@ func (c *LocklessChecker) Run(ctx context.Context) error {
 	return fmt.Errorf("%w (%d/%d); last error: %w", ErrAttemptsExhausted, c.cfg.MaxRetries, c.cfg.MaxRetries, lastErr)
 }
 
-// locklessRetryable reports whether a failed attempt is worth repeating. Only
-// the verdicts that describe the *data* are excluded: they are reproducible by
-// construction, so retrying spends the whole table's worth of reads to reach
-// the same answer.
+// locklessRetryable reports whether a failed attempt is worth repeating inside
+// this Run. The verdicts about the data (IsReproducible) are excluded: retrying
+// spends the whole table's worth of reads to reach the same answer. So is
+// ErrVerificationUnresolved, although it is not reproducible: the attempt has
+// already spent MaxPasses re-walking the table, and repeating that straight
+// away is unlikely to find it any quieter. A caller can retry it later.
 func locklessRetryable(err error) bool {
-	switch {
-	case errors.Is(err, ErrPermanentDivergence):
-		return false
-	case errors.Is(err, ErrVerificationUnresolved):
-		return false
-	default:
-		return true
-	}
+	return !IsReproducible(err) && !errors.Is(err, ErrVerificationUnresolved)
 }
 
 // RunUntilClean is one attempt of Run: it returns as soon as a complete pass

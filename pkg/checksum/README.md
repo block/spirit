@@ -586,6 +586,9 @@ the finite gate stops after `MaxPasses` (10) with
 `ErrVerificationUnresolved`. When more than one pass ran and every pass
 repaired at least one range, the error also wraps `ErrDifferencesExhausted`:
 the repairs cannot close the divergence, so a retry would fail the same way.
+`IsReproducible` reports that case, and `ErrPermanentDivergence`, as verdicts
+about the data; a bare `ErrVerificationUnresolved` is not one, because it
+proves no divergence.
 
 ### Prior art, and what is new here
 
