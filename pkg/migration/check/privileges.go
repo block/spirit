@@ -27,11 +27,13 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 		return err
 	}
 	defer utils.CloseAndLog(rows)
+	var grants []string
 	for rows.Next() {
 		var grant string
 		if err := rows.Scan(&grant); err != nil {
 			return err
 		}
+		grants = append(grants, grant)
 		if strings.Contains(grant, `GRANT ALL PRIVILEGES ON *.*`) {
 			foundAll = true
 		}
@@ -50,15 +52,15 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 		if utils.StringContainsAll(grant, `ALTER`, `CREATE`, `DELETE`, `DROP`, `INDEX`, `INSERT`, `LOCK TABLES`, `SELECT`, `TRIGGER`, `UPDATE`, ` ON *.*`) {
 			foundDBAll = true
 		}
-		// A database-level grant covers the schema if its database-name pattern
-		// matches (including MySQL wildcards such as `strata_%`) and it confers
-		// either ALL PRIVILEGES or the full set spirit requires.
-		if utils.DBLevelGrantCoversSchema(grant, r.Table.SchemaName) {
-			foundDBAll = true
-		}
 	}
 	if rows.Err() != nil {
 		return rows.Err()
+	}
+	// Database-level grants are evaluated together: MySQL applies one
+	// database-level grant to the schema, not the union of every match, so
+	// every matching name (exact or pattern) must carry the full set.
+	if utils.DBLevelGrantsCoverSchema(grants, r.Table.SchemaName) {
+		foundDBAll = true
 	}
 	if foundAll {
 		return nil
@@ -83,5 +85,9 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 		return nil
 	}
 
-	return fmt.Errorf("insufficient privileges to run a migration. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", r.Table.SchemaName)
+	err = fmt.Errorf("insufficient privileges to run a migration. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", r.Table.SchemaName)
+	if note := utils.ShadowingGrantsNote(grants, r.Table.SchemaName); note != "" && !foundDBAll {
+		err = fmt.Errorf("%w (%s)", err, note)
+	}
+	return err
 }
