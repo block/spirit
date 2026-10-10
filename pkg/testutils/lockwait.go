@@ -14,17 +14,22 @@ import (
 )
 
 // helperLockWaitTimeout bounds how long any statement issued by a testutils
-// helper waits for a metadata or row lock. MySQL's default is a year, so a
-// leaked lock would otherwise hang the whole package until the go test
-// timeout and fail every test with only a goroutine dump. It must stay well
-// under that timeout. It applies only to connections the helpers open
+// helper waits for a metadata lock (lock_wait_timeout). MySQL's default is a
+// year, so a leaked metadata lock would otherwise hang the whole package until
+// the go test timeout and fail every test with only a goroutine dump. InnoDB
+// row-lock waits are governed by innodb_lock_wait_timeout instead, which this
+// does not change. It applies only to connections the helpers open
 // themselves, never to the DSN returned by DSN(), so tests that deliberately
 // wait on locks through spirit's own connections are unaffected.
-const helperLockWaitTimeout = 30 * time.Second
+//
+// It must be shorter than testCleanupTimeout, the context deadline on setup
+// and cleanup drops: the server must return error 1205 (and so the lock
+// holder diagnostics) before the client gives up with a context error.
+const helperLockWaitTimeout = 20 * time.Second
 
-// boundedDSN returns dsn with a session lock_wait_timeout of d (rounded up to
-// whole seconds) unless the DSN already sets one. The driver sends unknown DSN
-// parameters as SET statements on connect.
+// boundedDSN returns dsn with a session lock_wait_timeout (metadata locks) of
+// d, rounded up to whole seconds, unless the DSN already sets one. The driver
+// sends unknown DSN parameters as SET statements on connect.
 func boundedDSN(dsn string, d time.Duration) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {

@@ -58,3 +58,21 @@ func TestBoundedDSNKeepsExplicitLockWaitTimeout(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, dsn, "lock_wait_timeout=2")
 }
+
+// TestHelperLockWaitIsShorterThanCleanupDeadline guards the ordering the
+// lock holder diagnostics depend on: the server's 1205 must arrive before the
+// client's context deadline on setup and cleanup drops.
+func TestHelperLockWaitIsShorterThanCleanupDeadline(t *testing.T) {
+	require.Less(t, helperLockWaitTimeout, testCleanupTimeout)
+}
+
+// TestDSNForDatabaseKeepsParameters verifies that only the database name is
+// replaced, so an explicit lock_wait_timeout in the DSN still wins.
+func TestDSNForDatabaseKeepsParameters(t *testing.T) {
+	t.Setenv("MYSQL_DSN", "u:p@tcp(127.0.0.1:3306)/test?lock_wait_timeout=5")
+	assert.Equal(t, "u:p@tcp(127.0.0.1:3306)/other?lock_wait_timeout=5", DSNForDatabase("other"))
+	assert.Equal(t, "u:p@tcp(127.0.0.1:3306)/?lock_wait_timeout=5", DSNForDatabase(""))
+	bounded, err := boundedDSN(DSNForDatabase("other"), helperLockWaitTimeout)
+	require.NoError(t, err)
+	assert.Contains(t, bounded, "lock_wait_timeout=5")
+}

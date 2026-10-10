@@ -42,7 +42,11 @@ func DSN() string {
 // DSNForDatabase returns a DSN for a specific database name
 func DSNForDatabase(dbName string) string {
 	baseDSN := DSN()
-	// Replace the database part of the DSN
+	// Replace only the database name, keeping the DSN's parameters.
+	if cfg, err := mysql.ParseDSN(baseDSN); err == nil {
+		cfg.DBName = dbName
+		return cfg.FormatDSN()
+	}
 	parts := strings.Split(baseDSN, "/")
 	if len(parts) >= 2 {
 		parts[len(parts)-1] = dbName
@@ -96,12 +100,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	t.Helper()
 
 	// Connect to MySQL without specifying a database
-	baseDSN := DSN()
-	lastSlash := strings.LastIndex(baseDSN, "/")
-	if lastSlash < 0 {
-		t.Fatalf("could not parse DSN: %s", baseDSN)
-	}
-	rootDSN := baseDSN[:lastSlash+1]
+	rootDSN := DSNForDatabase("")
 
 	rootDB, err := openBounded(rootDSN)
 	require.NoError(t, err)
@@ -127,7 +126,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	t.Log("test database:", dbName)
 
 	// Open a connection scoped to the new database
-	scopedDB, err := openBounded(rootDSN + dbName)
+	scopedDB, err := openBounded(DSNForDatabase(dbName))
 	require.NoError(t, err)
 
 	// Register cleanup to close the connection and drop the database
