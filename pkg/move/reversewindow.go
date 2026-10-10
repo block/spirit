@@ -82,6 +82,10 @@ func captureReverseWindow(ctx context.Context, r *Runner) error {
 // source. The background checkpoint dumper is already stopped, so this write
 // is authoritative. The window duration starts when the switch completes.
 func persistReverseWindow(ctx context.Context, r *Runner) error {
+	// Hold checkpointMu so no periodic dump is mid-write, and mark the row as
+	// owned by the reverse window so none can follow (see DumpCheckpoint).
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
 	r.cutoverAt = time.Now()
 	posJSON, err := json.Marshal(r.reversePositions)
 	if err != nil {
@@ -91,11 +95,15 @@ func persistReverseWindow(ctx context.Context, r *Runner) error {
 	// pre-cutover already guaranteed no revert marker was present up to here, so
 	// any _spirit_move_revert that appears on targets[0] from now on is a genuine
 	// operator revert request for THIS window — never dropped as "stale".
-	return r.checkpointTbl().Write(ctx, checkpoint.Record{
+	if err := r.checkpointTbl().Write(ctx, checkpoint.Record{
 		Position:  string(posJSON),
 		Phase:     phaseReverseWindow,
 		CutoverAt: r.cutoverAt,
-	})
+	}); err != nil {
+		return err
+	}
+	r.checkpointOwnedByReverseWindow = true
+	return nil
 }
 
 // reverseWindow drives the post-cutover reverse window: it stands up a

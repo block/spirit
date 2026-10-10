@@ -276,3 +276,29 @@ func latestCheckpointWatermarks(t *testing.T, r *Runner) (string, string) {
 	require.NoError(t, err)
 	return copierWM.String, checksumWM.String
 }
+
+// TestDumpCheckpointNoopAfterReverseWindowPersisted pins that once the
+// reverse-window row is written, a later periodic dump cannot overwrite it
+// with a phase-less copy-phase row (block/spirit#1239).
+func TestDumpCheckpointNoopAfterReverseWindowPersisted(t *testing.T) {
+	r, ctx := setupRunnerForChecksumTest(t, "rw_owned")
+	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
+	r.status.Set(status.Checksum)
+
+	phase := func() string {
+		rec, err := r.checkpointTbl().ReadLatest(ctx)
+		require.NoError(t, err)
+		return rec.Phase
+	}
+
+	// Before the window opens, a dump writes a phase-less row.
+	require.NoError(t, r.DumpCheckpoint(ctx))
+	require.Empty(t, phase())
+
+	require.NoError(t, persistReverseWindow(ctx, r))
+	require.Equal(t, phaseReverseWindow, phase())
+
+	// A dump after that is a no-op and leaves the phase intact.
+	require.NoError(t, r.DumpCheckpoint(ctx))
+	require.Equal(t, phaseReverseWindow, phase())
+}

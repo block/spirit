@@ -147,6 +147,14 @@ type Runner struct {
 	// Mirrors pkg/migration.
 	checkpointMu sync.Mutex
 
+	// checkpointOwnedByReverseWindow is set (under checkpointMu) once
+	// persistReverseWindow has written the reverse-window row. From then on the
+	// reverse window is the sole writer of the checkpoint row and DumpCheckpoint
+	// is a no-op, so a copy-phase dump can never overwrite move_phase. This is
+	// defense in depth: stopWatchTask already joins the dumper before cutover.
+	// See block/spirit#1239.
+	checkpointOwnedByReverseWindow bool
+
 	// Track some key statistics. usedResumeFromCheckpoint is atomic because it
 	// is also reported to API callers as Progress().Resume, which they poll from
 	// their own goroutine while setup is still writing it.
@@ -2090,6 +2098,9 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	// cleared watermark with one it read before. See checkpointMu.
 	r.checkpointMu.Lock()
 	defer r.checkpointMu.Unlock()
+	if r.checkpointOwnedByReverseWindow {
+		return nil
+	}
 	// Collect per-source positions (opaque strings owned by the source
 	// implementation), keyed by sourceKey (addr/dbname).
 	positions := make(map[string]string)
