@@ -1211,11 +1211,16 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 	binlogPos := m.replClient.Position()
 	for range 4 {
 		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (id) SELECT null FROM %s a, %s b, %s c LIMIT 1000", tableName, tableName, tableName, tableName))
-		require.NoError(t, m.replClient.BlockWait(t.Context()))
-		require.NoError(t, m.replClient.Flush(t.Context()))
-		newBinlogPos := m.replClient.Position()
-		require.NotEqual(t, binlogPos, newBinlogPos)
-		binlogPos = newBinlogPos
+		// Do not call Flush() here: the continuous checksum is running and
+		// holds LOCK TABLES while it flushes via FlushUnderTableLock. An
+		// unlocked Flush from the test can take the bufferedMap mutex first
+		// and then block on the table lock (lock-order inversion, #1401).
+		// Wait for the migration's own periodic flush to advance instead.
+		prev := binlogPos
+		require.Eventually(t, func() bool {
+			return m.replClient.Position() != prev
+		}, 30*time.Second, 50*time.Millisecond)
+		binlogPos = m.replClient.Position()
 	}
 
 	testutils.RunSQLInDatabase(t, dbName, "DROP TABLE "+sentinel.TableName)
