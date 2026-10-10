@@ -147,6 +147,15 @@ type Runner struct {
 	// Mirrors pkg/migration.
 	checkpointMu sync.Mutex
 
+	// checkpointOwnedByReverseWindow is set (under checkpointMu) once
+	// persistReverseWindow has written the reverse-window row, or a resumed
+	// run finds a row that is already past cutover. From then on the
+	// reverse window is the sole writer of the checkpoint row and DumpCheckpoint
+	// is a no-op, so a copy-phase dump can never overwrite move_phase. This is
+	// defense in depth: stopWatchTask already joins the dumper before cutover.
+	// See block/spirit#1239.
+	checkpointOwnedByReverseWindow bool
+
 	// Track some key statistics. usedResumeFromCheckpoint is atomic because it
 	// is also reported to API callers as Progress().Resume, which they poll from
 	// their own goroutine while setup is still writing it.
@@ -946,6 +955,14 @@ func (r *Runner) maybeResumeReverseWindow(ctx context.Context) (bool, error) {
 		// can't read) — not a reverse resume; let the normal flow decide
 		// copy-resume vs fresh.
 		return false, nil //nolint:nilerr
+	}
+	if rec.Phase != "" {
+		// The row is past cutover: this process did not write it, but it
+		// must not overwrite it with a copy-phase dump either. See
+		// checkpointOwnedByReverseWindow.
+		r.checkpointMu.Lock()
+		r.checkpointOwnedByReverseWindow = true
+		r.checkpointMu.Unlock()
 	}
 	switch rec.Phase {
 	case phaseReverseWindow:
@@ -2090,6 +2107,13 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	// cleared watermark with one it read before. See checkpointMu.
 	r.checkpointMu.Lock()
 	defer r.checkpointMu.Unlock()
+	if r.checkpointOwnedByReverseWindow {
+		// Should never happen: the dumper is joined before cutover, and a
+		// resumed post-cutover run starts none. Log it so a dumper running
+		// after cutover shows up instead of being absorbed silently.
+		r.logger.Warn("checkpoint dump skipped: the reverse window owns the checkpoint row")
+		return nil
+	}
 	// Collect per-source positions (opaque strings owned by the source
 	// implementation), keyed by sourceKey (addr/dbname).
 	positions := make(map[string]string)

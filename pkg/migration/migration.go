@@ -47,7 +47,8 @@ type Migration struct {
 	flags.Common
 	flags.Cutover
 
-	LegacyChecksum bool `name:"legacy-checksum" help:"Verify with the legacy snapshot checksum (checksum table locks and long-lived REPEATABLE READ snapshots) instead of the default lockless checksum. Cutover locking is unchanged." default:"false"`
+	EnableExperimentalForeignKeys bool `name:"enable-experimental-foreign-keys" help:"EXPERIMENTAL: allow altering a table that has foreign keys. Requires MySQL 9.7 or later. Tables referenced by a foreign key are still refused, and the ALTER cannot add one." default:"false"`
+	LegacyChecksum                bool `name:"legacy-checksum" help:"Verify with the legacy snapshot checksum (checksum table locks and long-lived REPEATABLE READ snapshots) instead of the default lockless checksum. Cutover locking is unchanged." default:"false"`
 
 	ReplicaDSN           string        `name:"replica-dsn" help:"DSN(s) for replica(s) used for lag checking. Multiple replicas can be comma-separated; Spirit throttles on the slowest." optional:""`
 	ReplicaMaxLag        time.Duration `name:"replica-max-lag" help:"The maximum lag allowed on the replica before the migration throttles. If lag becomes unobservable (lag polling keeps failing) the migration pauses (fails closed) until polling recovers; remove --replica-dsn to proceed without lag protection." optional:"" default:"120s"`

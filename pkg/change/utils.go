@@ -43,6 +43,23 @@ type schemaTable struct {
 	table  string
 }
 
+// alterChangesForeignKeysOnly reports whether every spec of an ALTER TABLE
+// adds or drops a foreign key, apart from the ALGORITHM and LOCK clauses.
+func alterChangesForeignKeysOnly(specs []*ast.AlterTableSpec) bool {
+	foreignKeys := false
+	for _, spec := range specs {
+		if spec.Tp == ast.AlterTableAlgorithm || spec.Tp == ast.AlterTableLock {
+			continue
+		}
+		addsForeignKey := spec.Tp == ast.AlterTableAddConstraint && spec.Constraint != nil && spec.Constraint.Tp == ast.ConstraintForeignKey
+		if !addsForeignKey && spec.Tp != ast.AlterTableDropForeignKey {
+			return false
+		}
+		foreignKeys = true
+	}
+	return foreignKeys
+}
+
 // queryEventInfo describes the statements in one binlog QueryEvent.
 type queryEventInfo struct {
 	tables []schemaTable
@@ -57,6 +74,10 @@ type queryEventInfo struct {
 	keepsTransactionOpen bool
 	endsTransaction      bool
 	xa                   bool
+	// foreignKeysOnly is set when the event is one ALTER TABLE that only
+	// adds or drops foreign keys: it changes no column and no row of the
+	// table it alters (the first of tables).
+	foreignKeysOnly bool
 }
 
 // QueryEvents include BEGIN for nearly every transaction. Reuse parser
@@ -119,6 +140,9 @@ func parseQueryEvent(defaultSchema, statements string) (info queryEventInfo, err
 			switch n := t.(type) {
 			case *ast.AlterTableStmt:
 				tableNode = n.Table
+				if len(stmts) == 1 && alterChangesForeignKeysOnly(n.Specs) {
+					info.foreignKeysOnly = true
+				}
 				for _, spec := range n.Specs {
 					refs = append(refs, foreignKeyReferences([]*ast.Constraint{spec.Constraint}, nil)...)
 					refs = append(refs, foreignKeyReferences(spec.NewConstraints, spec.NewColumns)...)

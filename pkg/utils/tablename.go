@@ -53,6 +53,25 @@ func OldTableName(tableName string) string {
 	return AuxTableName(tableName, suffixOld)
 }
 
+// ForeignKeyProbeTableName returns the name of the table the cutover probes
+// the foreign keys of the given original table on.
+func ForeignKeyProbeTableName(tableName string) string {
+	return AuxTableName(tableName, "_fkprobe")
+}
+
+// ForeignKeyProbeParentName returns the name of the copy of the i-th table
+// the foreign keys of the given original table reference, for the probe.
+func ForeignKeyProbeParentName(tableName string, i int) string {
+	return AuxTableName(tableName, fmt.Sprintf("_fkparent%d", i))
+}
+
+// ForeignKeyProbeName returns the name of the i-th foreign key of the probe
+// table of the given original table. Foreign key names are unique per schema,
+// so the name is derived from the table's.
+func ForeignKeyProbeName(tableName string, i int) string {
+	return AuxTableName(tableName, fmt.Sprintf("_fkprobe%d", i))
+}
+
 // OldTableNameWithTimestamp returns the auxiliary _old_<timestamp> table name
 // for the given original table and timestamp string. Used when
 // SkipDropAfterCutover is set so the renamed-away table is preserved with a

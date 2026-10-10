@@ -1626,6 +1626,26 @@ func TestProcessDDLNotification(t *testing.T) {
 		cancelled = false
 		c.processDDLNotification("other_schema", "orders")
 		require.False(t, cancelled, "should not cancel on DDL in a different schema")
+
+		// An ALTER that only adds or drops foreign keys does not cancel on
+		// the new table, but does on the table being copied, and any other
+		// ALTER of the new table does.
+		for _, test := range []struct {
+			statement string
+			cancels   bool
+		}{
+			{"ALTER TABLE _orders_new ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES parent (id), ALGORITHM=INPLACE, LOCK=NONE", false},
+			{"ALTER TABLE _orders_new DROP FOREIGN KEY fk, ALGORITHM=INPLACE, LOCK=NONE", false},
+			{"ALTER TABLE orders DROP FOREIGN KEY fk", true},
+			{"ALTER TABLE _orders_new ADD COLUMN c INT", true},
+			{"ALTER TABLE _orders_new ADD FOREIGN KEY (id) REFERENCES parent (id), ADD COLUMN c INT", true},
+		} {
+			info, err := parseQueryEvent(dbName, test.statement)
+			require.NoError(t, err)
+			cancelled = false
+			c.processDDLTables(info)
+			require.Equal(t, test.cancels, cancelled, test.statement)
+		}
 	})
 
 	t.Run("default mode: move-style subscription (nil newTable)", func(t *testing.T) {

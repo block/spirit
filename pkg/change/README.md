@@ -504,7 +504,7 @@ This park is unrelated to the [memory backpressure](#memory-backpressure) park, 
 ### Other Minor Features
 
 - **Automatic recovery**: Handles transient errors and reconnects to the binlog stream without data loss
-- **DDL detection**: Monitors for schema changes and notifies the migration coordinator. This is used to abandon any schema changes if the table was externally modified.
+- **DDL detection**: Monitors for schema changes and notifies the migration coordinator. This is used to abandon any schema changes if the table was externally modified. An `ALTER TABLE` that only adds or drops foreign keys on a subscription's new table is not treated as a change: it changes no column and no row, and the migration's experimental foreign key support writes such `ALTER`s to the binary log on every cutover attempt, so a run resumed after a failed attempt reads them after its checkpoint.
 
 ## Implementing a Source
 

@@ -36,7 +36,7 @@ var (
 )
 
 // rewritePlaceholderTable is the table name used while re-parsing an ALTER's
-// clauses into a private AST (see AlterWithRenamedCheckConstraints). It is never
+// clauses into a private AST (see AlterWithRenamedConstraints). It is never
 // sent to MySQL: only the clauses that follow the table name are read back out.
 const rewritePlaceholderTable = "_spirit_rewrite"
 
@@ -520,16 +520,33 @@ func (a *AbstractStatement) GenericConstraintDrops() []string {
 	return names
 }
 
-// AlterWithRenamedCheckConstraints returns this ALTER's clauses with its check
-// constraint symbols rewritten for a table other than the one the user named:
-// the copy algorithm's _new table, which holds the same check constraints under
-// different names because check constraint names are unique per schema rather
-// than per table.
+// ForeignKeysDropped returns the names in this ALTER's DROP FOREIGN KEY
+// clauses.
+func (a *AbstractStatement) ForeignKeysDropped() []string {
+	alterStmt, ok := a.AsAlterTable()
+	if !ok {
+		return nil
+	}
+	var names []string
+	for _, spec := range alterStmt.Specs {
+		if spec.Tp == ast.AlterTableDropForeignKey && spec.Name != "" {
+			names = append(names, spec.Name)
+		}
+	}
+	return names
+}
+
+// AlterWithRenamedConstraints returns this ALTER's clauses with its check
+// constraint and foreign key symbols rewritten for a table other than the one
+// the user named: the copy algorithm's _new table, which holds the same
+// constraints under different names because check constraint and foreign key
+// names are unique per schema rather than per table.
 //
-// renames maps a lower-cased check constraint name on the user's table to the
-// name the same constraint has on the table the ALTER will be applied to. Names
-// in DROP CHECK / DROP CONSTRAINT and ALTER CHECK clauses are translated
-// through it; a name that is not in the map is left alone, so MySQL still
+// checkRenames maps a lower-cased check constraint name on the user's table to
+// the name the same constraint has on the table the ALTER will be applied to.
+// Names in DROP CHECK / DROP CONSTRAINT and ALTER CHECK clauses are translated
+// through it. foreignKeyRenames does the same for the names in DROP FOREIGN
+// KEY clauses. A name that is not in its map is left alone, so MySQL still
 // reports it as missing rather than spirit guessing at what was meant.
 //
 // A named check constraint being added by this same ALTER under a name it also
@@ -540,7 +557,7 @@ func (a *AbstractStatement) GenericConstraintDrops() []string {
 // algorithm already produces for every check constraint it copies, and the
 // resolution recommended in issue #418. Those names are returned so the caller
 // can report them.
-func (a *AbstractStatement) AlterWithRenamedCheckConstraints(renames map[string]string) (string, []string, error) {
+func (a *AbstractStatement) AlterWithRenamedConstraints(checkRenames, foreignKeyRenames map[string]string) (string, []string, error) {
 	if !a.IsAlterTable() {
 		return "", nil, ErrNotAlterTable
 	}
@@ -550,7 +567,7 @@ func (a *AbstractStatement) AlterWithRenamedCheckConstraints(renames map[string]
 	copied, err := New(fmt.Sprintf("ALTER TABLE %s %s",
 		sqlescape.EscapeIdentifier(rewritePlaceholderTable), a.TrimAlter()))
 	if err != nil {
-		return "", nil, fmt.Errorf("could not re-parse ALTER to rewrite check constraint names: %w", err)
+		return "", nil, fmt.Errorf("could not re-parse ALTER to rewrite constraint names: %w", err)
 	}
 	alterStmt, ok := copied[0].AsAlterTable()
 	if !ok {
@@ -573,8 +590,12 @@ func (a *AbstractStatement) AlterWithRenamedCheckConstraints(renames map[string]
 			if spec.Constraint == nil {
 				continue
 			}
-			if renamed, ok := renames[strings.ToLower(spec.Constraint.Name)]; ok {
+			if renamed, ok := checkRenames[strings.ToLower(spec.Constraint.Name)]; ok {
 				spec.Constraint.Name = renamed
+			}
+		case ast.AlterTableDropForeignKey:
+			if renamed, ok := foreignKeyRenames[strings.ToLower(spec.Name)]; ok {
+				spec.Name = renamed
 			}
 		case ast.AlterTableAddConstraint:
 			if spec.Constraint == nil || spec.Constraint.Tp != ast.ConstraintCheck || spec.Constraint.Name == "" {

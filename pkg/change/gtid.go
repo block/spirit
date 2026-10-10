@@ -685,9 +685,7 @@ func (c *gtidClient) processQueryEvent(event *replication.QueryEvent) error {
 	if !info.opensTransaction {
 		c.promotePendingGTID()
 	}
-	for _, ddlTable := range info.tables {
-		c.processDDLNotification(ddlTable.schema, ddlTable.table)
-	}
+	c.processDDLTables(info)
 	return nil
 }
 

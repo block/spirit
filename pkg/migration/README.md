@@ -145,10 +145,13 @@ Cutover checks (`ScopeCutover`) run first. Then `CutOver.Run` (`cutover.go`) mak
 1. Flushes the change source *without* a lock, so the locked section has little left to apply.
 2. Takes `LOCK TABLES <table> WRITE, _<table>_new WRITE[, ...]` on a dedicated connection. Blocking sessions are [force-killed](#force-kill).
 3. Calls `FlushUnderTableLock` (flush, wait for the change source to reach the current binlog position, flush again), then asserts every change has been applied.
-4. Runs the cutover-locked checks (`ScopeCutoverLocked`), which catch a foreign key or trigger added during the migration. These refuse the cutover with no retry.
-5. Raises `_new`'s `AUTO_INCREMENT` to at least the source's, unless the `ALTER` set `AUTO_INCREMENT` itself.
-6. `RENAME TABLE <table> TO _<table>_old, _<table>_new TO <table>[, ...]`. For a multi-table migration, every table is renamed in the same statement.
-7. Stops the change source while still holding the lock, then `UNLOCK TABLES`.
+4. With `--enable-experimental-foreign-keys`, adds the table's foreign keys to `_new`, with `foreign_key_checks` off (`foreignKeyCutover.addToNewTables` in `foreignkeys.go`). `_new` has none until here. This is metadata-only only when `_new` has an index each foreign key can use; otherwise MySQL builds one under the lock (`LOCK=NONE` does not prevent it, and `ALGORITHM=INSTANT` is refused for `ADD FOREIGN KEY`), so before step 2 `foreignKeyCutover.probe` adds the same foreign keys to an empty `CREATE TABLE ... LIKE _new` copy that references empty copies of the parent tables, and refuses the cutover if its indexes changed. Here, the cutover refuses unless the foreign keys and `_new`'s columns and indexes are the ones probed. MySQL picks the index from the definition, not the rows, so the probe gets MySQL's own answer rather than a prediction of it.
+5. Runs the cutover-locked checks (`ScopeCutoverLocked`), which catch a foreign key or trigger added during the migration, and check the foreign keys added to `_new`. These refuse the cutover with no retry.
+6. Raises `_new`'s `AUTO_INCREMENT` to at least the source's, unless the `ALTER` set `AUTO_INCREMENT` itself.
+7. `RENAME TABLE <table> TO _<table>_old, _<table>_new TO <table>[, ...]`. For a multi-table migration, every table is renamed in the same statement.
+8. Stops the change source while still holding the lock. With foreign keys, drops the foreign keys of `_<table>_old` and restores the original foreign key names (`foreignKeyCutover.settle`). Then `UNLOCK TABLES`. A failed attempt drops the foreign keys it added to `_new` before it unlocks.
+
+With foreign keys, `LOCK TABLES` also read-locks the parent tables, and the DDL under the lock waits for every transaction that has used one. The lock is taken with `dbconn.NewTableLockReferencing`, which extends the [force-kill](#force-kill) to the parent tables.
 
 Renaming a table while holding `LOCK TABLES` requires MySQL 8.0.13 or later.
 
@@ -205,7 +208,7 @@ What the checks enforce, grouped:
 - **Settings** (`settings`): `--threads` between 1 and 64, `--replica-max-lag` between 10s and 4h.
 - **Names** (`tablename`, `tableidentifier`): non-empty, at most 64 characters, and no `.` or backtick in the schema or table name.
 - **Primary key** (`primarykey`, `primarykeyexists`, `primarykeybit`, `primarykeyfloat`, `primarykeycollation`, `primarykeycollationstatement`): the table must have a primary key, and the `ALTER` must not drop it, change its collation, or involve a `BIT` or `FLOAT` primary key column. The chunkers and the change source depend on comparing key values exactly.
-- **Foreign keys and triggers** (`addforeignkey`, `hasforeignkeys`, `hastriggers`): no foreign key may reference or be referenced by the table, and it may have no triggers. These are checked again at cutover, because one could have been added during the copy.
+- **Foreign keys and triggers** (`addforeignkey`, `hasforeignkeys`, `hastriggers`): no foreign key may reference or be referenced by the table, and it may have no triggers. These are checked again at cutover, because one could have been added during the copy. With `--enable-experimental-foreign-keys` (MySQL 9.7+), the table may have foreign keys to other tables: `hasforeignkeys` then checks the server version and `innodb_native_foreign_keys`, and that the new table has no foreign keys, except under the cutover lock, where it must have a copy of each (`foreignkeys.go` adds them).
 - **Column changes** (`dropadd`, `rename`, `enumReorder`, `setReorder`, `enumSetRemoval`): no dropping and re-adding the same column, no renaming the table or a primary key column, and no `ENUM`/`SET` change that would alter the meaning of stored values. See [Unsupported Features](../../README.md#unsupported-features).
 
 Statement-scope checks use only the statement and the table's current definition, with no database connection. A failure in this scope is certain: Spirit can never run the statement. Checks that MySQL's own DDL might satisfy (`dropadd`, `rename`) are excluded from it. `check.StatementRefusal` exposes this scope to callers that want to classify a statement before running it.

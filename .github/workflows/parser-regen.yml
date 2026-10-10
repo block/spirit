@@ -14,12 +14,12 @@ jobs:
     name: generated parser matches grammar
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version: "1.26.6"
-          cache: false
       - name: Checkout code
         uses: actions/checkout@v7
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - name: Regenerate parser from grammar
         run: |
           rm -f pkg/parser/parser.go pkg/parser/hintparser.go

@@ -580,6 +580,10 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	if err := r.runChecks(ctx, check.ScopeCutover); err != nil {
 		return err
 	}
+	var foreignKeys *foreignKeyCutover
+	if r.migration.EnableExperimentalForeignKeys {
+		foreignKeys = r.foreignKeyCutover()
+	}
 	// It's time for the final cut-over, where
 	// the tables are swapped under a lock.
 	if err := r.status.DoContext(ctx, status.CutOver, func() error {
@@ -604,6 +608,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		cutover.checksUnderLock = func(ctx context.Context) error {
 			return r.runChecks(ctx, check.ScopeCutoverLocked)
 		}
+		cutover.foreignKeys = foreignKeys
 		// Drop the _old table if it exists. This ensures
 		// that the rename will succeed (although there is a brief race)
 		for _, change := range r.changes {
@@ -612,6 +617,11 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 			}
 		}
 		if err := cutover.Run(ctx); err != nil {
+			if foreignKeys != nil {
+				removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCutoverCleanupTimeout)
+				foreignKeys.removeAfterFailure(removeCtx)
+				cancel()
+			}
 			return fmt.Errorf("cutover failed: %w", err)
 		}
 		r.lifecycle.MarkDurableMutation()
@@ -632,6 +642,11 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// failure is only logged.
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), postCutoverCleanupTimeout)
 	defer cancelCleanup()
+	if foreignKeys != nil && !foreignKeys.settled {
+		// Before the old tables are dropped: dropping them would free the
+		// names, but a failed drop would leave their foreign keys in place.
+		foreignKeys.settleAfterUnlock(cleanupCtx)
+	}
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
 			if err := change.dropOldTable(ctx); err != nil {
@@ -730,6 +745,21 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	return r.checksum(ctx)
 }
 
+// foreignKeyCutover returns what the cutover needs to put the foreign keys of
+// the tables being altered on their new tables (see foreignKeyCutover).
+func (r *Runner) foreignKeyCutover() *foreignKeyCutover {
+	f := &foreignKeyCutover{db: r.db, dbConfig: r.dbConfig, logger: r.logger}
+	for _, change := range r.changes {
+		f.tables = append(f.tables, &foreignKeyTable{
+			stmt:         change.stmt,
+			table:        change.table,
+			newTable:     change.newTable,
+			oldTableName: change.oldTableName(),
+		})
+	}
+	return f
+}
+
 // runChecks wraps around check.RunChecks and adds the context of this migration
 // We redundantly run checks, once per change.
 func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
@@ -744,12 +774,13 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			ReplicaMaxLag: r.migration.ReplicaMaxLag,
 			// For the pre-run checks we don't have a DB connection yet.
 			// Instead we check the credentials provided.
-			Host:                 r.migration.Host,
-			Username:             r.migration.Username,
-			Password:             *r.migration.Password,
-			TLSMode:              r.migration.TLSMode,
-			TLSCertificatePath:   r.migration.TLSCertificatePath,
-			SkipDropAfterCutover: r.migration.SkipDropAfterCutover,
+			Host:                    r.migration.Host,
+			Username:                r.migration.Username,
+			Password:                *r.migration.Password,
+			TLSMode:                 r.migration.TLSMode,
+			TLSCertificatePath:      r.migration.TLSCertificatePath,
+			SkipDropAfterCutover:    r.migration.SkipDropAfterCutover,
+			ExperimentalForeignKeys: r.migration.EnableExperimentalForeignKeys,
 		}, r.logger, scope); err != nil {
 			return err
 		}
@@ -1520,6 +1551,14 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		newName := utils.NewTableName(change.table.TableName)
 		change.newTable = table.NewTableInfo(r.db, change.stmt.Schema, newName)
 		if err := change.newTable.SetInfo(ctx); err != nil {
+			return err
+		}
+	}
+	if r.migration.EnableExperimentalForeignKeys {
+		// A run that stopped during a cutover attempt can have left the
+		// foreign keys the attempt added on the new tables.
+		f := r.foreignKeyCutover()
+		if err := f.removeFromNewTables(ctx, f.forceExec); err != nil {
 			return err
 		}
 	}

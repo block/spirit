@@ -3,7 +3,6 @@
 package testutils
 
 import (
-	"cmp"
 	"context"
 	"crypto/sha1"
 	"database/sql"
@@ -11,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,7 +42,11 @@ func DSN() string {
 // DSNForDatabase returns a DSN for a specific database name
 func DSNForDatabase(dbName string) string {
 	baseDSN := DSN()
-	// Replace the database part of the DSN
+	// Replace only the database name, keeping the DSN's parameters.
+	if cfg, err := mysql.ParseDSN(baseDSN); err == nil {
+		cfg.DBName = dbName
+		return cfg.FormatDSN()
+	}
 	parts := strings.Split(baseDSN, "/")
 	if len(parts) >= 2 {
 		parts[len(parts)-1] = dbName
@@ -98,14 +100,9 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	t.Helper()
 
 	// Connect to MySQL without specifying a database
-	baseDSN := DSN()
-	lastSlash := strings.LastIndex(baseDSN, "/")
-	if lastSlash < 0 {
-		t.Fatalf("could not parse DSN: %s", baseDSN)
-	}
-	rootDSN := baseDSN[:lastSlash+1]
+	rootDSN := DSNForDatabase("")
 
-	rootDB, err := sql.Open(driverName, rootDSN)
+	rootDB, err := openBounded(rootDSN)
 	require.NoError(t, err)
 	defer func() {
 		_ = rootDB.Close()
@@ -118,7 +115,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	var dbName string
 	for attempt := 1; ; attempt++ {
 		dbName = uniqueDatabaseName(t.Name(), os.Getpid(), dbCounter.Add(1))
-		_, err = rootDB.ExecContext(t.Context(), "CREATE DATABASE "+dbName)
+		err = execBounded(t.Context(), rootDB, rootDSN, "CREATE DATABASE "+dbName)
 		myErr, ok := errors.AsType[*mysql.MySQLError](err)
 		if !ok || myErr.Number != parsermysql.ErrDBCreateExists || attempt == 10 {
 			break
@@ -129,19 +126,20 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	t.Log("test database:", dbName)
 
 	// Open a connection scoped to the new database
-	scopedDB, err := sql.Open(driverName, rootDSN+dbName)
+	scopedDB, err := openBounded(DSNForDatabase(dbName))
 	require.NoError(t, err)
 
 	// Register cleanup to close the connection and drop the database
 	t.Cleanup(func() {
 		_ = scopedDB.Close()
-		cleanupDB, err := sql.Open(driverName, rootDSN)
+		cleanupDB, err := openBounded(rootDSN)
 		require.NoError(t, err)
 		defer func() {
 			_ = cleanupDB.Close()
 		}()
-		_, err = cleanupDB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+dbName)
-		require.NoError(t, err)
+		ctx, cancel := newTestCleanupContext()
+		defer cancel()
+		require.NoError(t, execBounded(ctx, cleanupDB, rootDSN, "DROP DATABASE IF EXISTS "+dbName))
 	})
 
 	return dbName, scopedDB
@@ -207,7 +205,7 @@ func SkipBeforeMySQLVersion(t *testing.T, minVersion, reason string) {
 	defer utils.CloseAndLog(db)
 	var version string
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT version()").Scan(&version))
-	if compareMySQLVersions(version, minVersion) < 0 {
+	if utils.CompareMySQLVersions(version, minVersion) < 0 {
 		t.Skipf("skipping on MySQL %s (requires %s+): %s", version, minVersion, reason)
 	}
 }
@@ -223,52 +221,9 @@ func SkipFromMySQLVersion(t *testing.T, fromVersion, reason string) {
 	defer utils.CloseAndLog(db)
 	var version string
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT version()").Scan(&version))
-	if compareMySQLVersions(version, fromVersion) >= 0 {
+	if utils.CompareMySQLVersions(version, fromVersion) >= 0 {
 		t.Skipf("skipping on MySQL %s (%s and later): %s", version, fromVersion, reason)
 	}
-}
-
-// compareMySQLVersions compares two dotted MySQL versions numerically, returning
-// -1, 0 or 1. Anything after the numeric part (8.0.28-log) is ignored, and a
-// missing component counts as 0.
-func compareMySQLVersions(a, b string) int {
-	pa, pb := versionParts(a), versionParts(b)
-	for i := range max(len(pa), len(pb)) {
-		var x, y int
-		if i < len(pa) {
-			x = pa[i]
-		}
-		if i < len(pb) {
-			y = pb[i]
-		}
-		if x != y {
-			return cmp.Compare(x, y)
-		}
-	}
-	return 0
-}
-
-// versionParts returns the leading numeric components of a MySQL version.
-func versionParts(version string) []int {
-	var parts []int
-	for field := range strings.SplitSeq(version, ".") {
-		end := strings.IndexFunc(field, func(r rune) bool { return r < '0' || r > '9' })
-		if end == 0 {
-			break
-		}
-		if end > 0 {
-			field = field[:end]
-		}
-		n, err := strconv.Atoi(field)
-		if err != nil {
-			break
-		}
-		parts = append(parts, n)
-		if end > 0 {
-			break // a suffix such as -log ends the numeric part
-		}
-	}
-	return parts
 }
 
 // isUnknownFunctionErr reports whether err is the server telling us a function
@@ -287,13 +242,12 @@ func isUnknownFunctionErr(err error) bool {
 func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 	t.Helper()
 	dsn := DSNForDatabase(dbName)
-	db, err := sql.Open(driverName, dsn)
+	db, err := openBounded(dsn)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
 	}()
-	_, err = db.ExecContext(t.Context(), stmt)
-	require.NoError(t, err)
+	require.NoError(t, execBounded(t.Context(), db, dsn, stmt))
 }
 
 // RunSQLInDatabaseAsRoot runs SQL in a specific database as the root user,
@@ -306,26 +260,26 @@ func RunSQLInDatabaseAsRoot(t *testing.T, dbName, stmt string) {
 	require.NoError(t, err)
 	cfg.User = "root"
 	cfg.DBName = dbName
-	db, err := sql.Open(driverName, cfg.FormatDSN())
+	rootDSN := cfg.FormatDSN()
+	db, err := openBounded(rootDSN)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
 	}()
 	// Might be run in cleanup, use Background context
-	_, err = db.ExecContext(context.Background(), stmt)
-	require.NoError(t, err)
+	require.NoError(t, execBounded(context.Background(), db, rootDSN, stmt))
 }
 
 func RunSQL(t *testing.T, stmt string) {
 	t.Helper()
-	db, err := sql.Open(driverName, DSN())
+	dsn := DSN()
+	db, err := openBounded(dsn)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
 	}()
 	// Might be run in cleanup, use Background context
-	_, err = db.ExecContext(context.Background(), stmt)
-	require.NoError(t, err)
+	require.NoError(t, execBounded(context.Background(), db, dsn, stmt))
 }
 
 // WaitForReplicaHealthy polls SHOW REPLICA STATUS until both the IO and SQL

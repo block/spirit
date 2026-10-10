@@ -43,6 +43,15 @@ func (c *tableChange) createNewTable(ctx context.Context) error {
 		newName, c.table.TableName); err != nil {
 		return err
 	}
+	if c.runner.migration.EnableExperimentalForeignKeys {
+		exec, err := c.foreignKeyExec(ctx, newName)
+		if err != nil {
+			return err
+		}
+		if err := copyForeignKeys(ctx, c.runner.db, c.runner.logger, exec, c.table.TableName, newName, c.oldTableName()); err != nil {
+			return err
+		}
+	}
 	c.newTable = table.NewTableInfo(c.runner.db, c.stmt.Schema, newName)
 	if err := c.newTable.SetInfo(ctx); err != nil {
 		return err
@@ -61,24 +70,39 @@ func (c *tableChange) alterNewTable(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	exec := func(ctx context.Context, stmt string) error {
+		return dbconn.Exec(ctx, c.runner.db, "%r", sqlescape.RawSQL(stmt))
+	}
+	if c.runner.migration.EnableExperimentalForeignKeys {
+		if exec, err = c.foreignKeyExec(ctx, c.newTable.TableName); err != nil {
+			return err
+		}
+	}
 	// The ALTER clause is spliced in with %r: it is raw SQL that may
 	// legitimately contain % characters (e.g. COMMENT '100%new'), which must
 	// not be interpreted as format specifiers.
-	if err := dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n %r, ALGORITHM=COPY",
-		c.newTable.TableName, sqlescape.RawSQL(alter)); err != nil {
+	if err := exec(ctx, sqlescape.MustEscapeSQL("ALTER TABLE %n %r, ALGORITHM=COPY",
+		c.newTable.TableName, sqlescape.RawSQL(alter))); err != nil {
 		// Retry without the ALGORITHM=COPY. If there is a second error, then the DDL itself
 		// is not supported. It could be a syntax error, in which case we return the second
 		// error, which will probably be easier to read because spirit's own ALGORITHM=COPY
 		// is not on the end of it. The clauses can still differ from what the user wrote:
 		// newTableAlter rewrites check constraint names for the new table, so either error
 		// may quote a server-generated name in place of the user's symbol.
-		if err := dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n %r", c.newTable.TableName, sqlescape.RawSQL(alter)); err != nil {
+		if err := exec(ctx, sqlescape.MustEscapeSQL("ALTER TABLE %n %r", c.newTable.TableName, sqlescape.RawSQL(alter))); err != nil {
 			if alter != c.stmt.TrimAlter() {
 				// Say which statement failed, since it is not the one the user
 				// wrote and the error can name a constraint they have never seen.
 				return fmt.Errorf("%w (applied to the new table as: ALTER TABLE %s %s)",
 					err, c.newTable.TableName, alter)
 			}
+			return err
+		}
+	}
+	if c.runner.migration.EnableExperimentalForeignKeys {
+		// The foreign keys were only there for MySQL to check the ALTER
+		// against. The cutover adds them back (see foreignKeyCutover).
+		if _, err := dropForeignKeys(ctx, c.runner.db, c.newTable.TableName, exec); err != nil {
 			return err
 		}
 	}
@@ -90,6 +114,21 @@ func (c *tableChange) alterNewTable(ctx context.Context) error {
 
 	// Preserve AUTO_INCREMENT value from the original table AFTER the ALTER.
 	return c.preserveAutoIncrement(ctx)
+}
+
+// foreignKeyExec returns how setup runs DDL on newName, the new table of a
+// table that may have foreign keys. DDL on a table with foreign keys waits for
+// every open transaction that has read or written a table they reference, so
+// the force-kill covers those tables as well as the new table.
+func (c *tableChange) foreignKeyExec(ctx context.Context, newName string) (execFunc, error) {
+	tables, err := referencedTables(ctx, c.runner.db, c.table)
+	if err != nil {
+		return nil, err
+	}
+	tables = append(tables, table.NewTableInfo(c.runner.db, c.table.SchemaName, newName))
+	return func(ctx context.Context, stmt string) error {
+		return dbconn.ForceExec(ctx, c.runner.db, tables, c.runner.dbConfig, c.runner.logger, "%r", sqlescape.RawSQL(stmt))
+	}, nil
 }
 
 // newTableAlter returns the ALTER clauses to apply to the new table.
@@ -106,29 +145,43 @@ func (c *tableChange) alterNewTable(ctx context.Context) error {
 //
 // So DROP CHECK / ALTER CHECK are retargeted at the _new table's names for the
 // same constraints, and a re-added name is dropped so MySQL generates one. See
-// AlterWithRenamedCheckConstraints for the rewriting rules.
+// AlterWithRenamedConstraints for the rewriting rules.
+//
+// Foreign key names are unique per schema too. With
+// --enable-experimental-foreign-keys the _new table holds copies of the
+// table's foreign keys while the ALTER is applied (see copyForeignKeys), so
+// DROP FOREIGN KEY is retargeted at the copy's name in the same way.
 func (c *tableChange) newTableAlter(ctx context.Context) (string, error) {
-	// Only an ALTER that names a check constraint needs any of this, which
-	// keeps the two SHOW CREATE TABLE round trips off the common path.
-	if len(c.stmt.CheckConstraintsReferenced()) == 0 {
+	var foreignKeys map[string]string
+	if c.runner.migration.EnableExperimentalForeignKeys && len(c.stmt.ForeignKeysDropped()) > 0 {
+		var err error
+		if foreignKeys, err = foreignKeyRenames(ctx, c.runner.db, c.table.TableName); err != nil {
+			return "", err
+		}
+	}
+	// Only an ALTER that names a check constraint or drops a foreign key
+	// needs any of this, which keeps the SHOW CREATE TABLE round trips off
+	// the common path.
+	var checks map[string]string
+	if len(c.stmt.CheckConstraintsReferenced()) > 0 {
+		source, err := tableDefinition(ctx, c.runner.db, c.table.TableName)
+		if err != nil {
+			return "", err
+		}
+		if err := rejectAmbiguousConstraintDrop(c.stmt, source, c.table.TableName); err != nil {
+			return "", err
+		}
+		newTable, err := tableDefinition(ctx, c.runner.db, c.newTable.TableName)
+		if err != nil {
+			return "", err
+		}
+		if checks, err = c.checkConstraintRenames(source, newTable); err != nil {
+			return "", err
+		}
+	} else if foreignKeys == nil {
 		return c.stmt.TrimAlter(), nil
 	}
-	source, err := tableDefinition(ctx, c.runner.db, c.table.TableName)
-	if err != nil {
-		return "", err
-	}
-	if err := rejectAmbiguousConstraintDrop(c.stmt, source, c.table.TableName); err != nil {
-		return "", err
-	}
-	newTable, err := tableDefinition(ctx, c.runner.db, c.newTable.TableName)
-	if err != nil {
-		return "", err
-	}
-	renames, err := c.checkConstraintRenames(source, newTable)
-	if err != nil {
-		return "", err
-	}
-	alter, unnamed, err := c.stmt.AlterWithRenamedCheckConstraints(renames)
+	alter, unnamed, err := c.stmt.AlterWithRenamedConstraints(checks, foreignKeys)
 	if err != nil {
 		return "", err
 	}
@@ -138,7 +191,7 @@ func (c *tableChange) newTableAlter(ctx context.Context) (string, error) {
 			"constraint", name)
 	}
 	if alter != c.stmt.TrimAlter() {
-		c.runner.logger.Info("rewrote CHECK constraint names for the new table",
+		c.runner.logger.Info("rewrote constraint names for the new table",
 			"table", c.newTable.TableName,
 			"alter", alter)
 	}
@@ -165,7 +218,9 @@ func (c *tableChange) newTableAlter(ctx context.Context) (string, error) {
 // success.
 //
 // The foreign key namespace is not consulted: spirit refuses a table with
-// foreign keys long before this point.
+// foreign keys long before this point, and with
+// --enable-experimental-foreign-keys it refuses a DROP CONSTRAINT that names
+// one (see the hasforeignkeys check).
 func rejectAmbiguousConstraintDrop(stmt *statement.AbstractStatement, def *statement.CreateTable, tableName string) error {
 	for _, name := range stmt.GenericConstraintDrops() {
 		var owners []string

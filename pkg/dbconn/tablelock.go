@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -31,9 +32,19 @@ type TableLock struct {
 	db       *sql.DB // the connection pool the lock was acquired on
 	mu       sync.Mutex
 	lockConn *sql.Conn
+	lockPID  int
 	logger   *slog.Logger
 	// completionTimeout bounds each statement run by ExecUnderLock.
 	completionTimeout time.Duration
+	// referenced are tables the locked tables' foreign keys reference. See
+	// NewTableLockReferencing.
+	referenced []*table.TableInfo
+	// forceKillDelay is how long a statement under the lock waits before the
+	// sessions blocking it on a referenced table are killed. Zero disables it.
+	forceKillDelay time.Duration
+	// discard is set when the session's state could not be restored, so
+	// Close must not return it to the pool.
+	discard bool
 }
 
 // NewTableLock creates a new server wide lock on multiple tables.
@@ -48,6 +59,21 @@ type TableLock struct {
 // LockWaitTimeout). Programmatic callers that never take locks (e.g. datasync's
 // read-only source) can disable it via DBConfig.ForceKill.
 func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, config *DBConfig, logger *slog.Logger) (*TableLock, error) {
+	return NewTableLockReferencing(ctx, db, tables, nil, config, logger)
+}
+
+// NewTableLockReferencing is NewTableLock for tables whose foreign keys
+// reference the tables in referenced. LOCK TABLES also locks the tables a
+// locked table's foreign keys reference, for reading, so it waits for the
+// sessions that write to them. DDL under the lock that adds, drops or renames
+// a foreign key (RENAME TABLE included) waits for every open transaction that
+// has read or written them. With config.ForceKill, the sessions blocking the
+// lock or a statement run under it on a referenced table are killed, as they
+// are on the locked tables.
+//
+// A foreign key added under the lock can only reference a table that is
+// locked this way: MySQL refuses any other with error 1100.
+func NewTableLockReferencing(ctx context.Context, db *sql.DB, tables, referenced []*table.TableInfo, config *DBConfig, logger *slog.Logger) (*TableLock, error) {
 	if err := config.ValidateForceKillAfter(); err != nil {
 		return nil, err
 	}
@@ -73,7 +99,7 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	defer func() {
 		if !acquired {
 			// A failed LOCK response may leave the server's lock state unknown.
-			_ = discardTableLockConn(conn)
+			_ = discardConn(conn)
 		}
 	}()
 	var pid int
@@ -91,7 +117,7 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 		timer := time.AfterFunc(threshold, func() {
 			defer wg.Done()
 			killTableLockBlockers(ctx, lockCtx, logger, func(ctx context.Context) error {
-				return KillLockingTransactions(ctx, db, tables, logger, []int{pid})
+				return KillLockingTransactions(ctx, db, append(slices.Clone(tables), referenced...), logger, []int{pid})
 			})
 		})
 		defer func() {
@@ -120,12 +146,18 @@ func NewTableLock(ctx context.Context, db *sql.DB, tables []*table.TableInfo, co
 	// it's a critical function.
 	logger.Warn("table lock(s) acquired")
 	acquired = true
-	return &TableLock{
+	lock := &TableLock{
 		db:                db,
 		lockConn:          conn,
+		lockPID:           pid,
 		logger:            logger,
 		completionTimeout: config.StatementCompletionTimeout(),
-	}, nil
+		referenced:        referenced,
+	}
+	if config.ForceKill && len(referenced) > 0 {
+		lock.forceKillDelay = config.forceKillDelay()
+	}
+	return lock, nil
 }
 
 // killTableLockBlockers runs kill, which kills the transactions blocking a
@@ -188,9 +220,46 @@ func (s *TableLock) DB() *sql.DB {
 // A caller that must run its statements even after a cancel, such as the
 // rename that retires a source after a traffic switch, passes
 // context.WithoutCancel(ctx).
+//
+// For a lock taken with NewTableLockReferencing, the sessions that block a
+// statement on a referenced table are killed once it has waited the force-kill
+// delay.
 func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.execUnderLock(ctx, stmts...)
+}
+
+// ExecUnderLockWithoutForeignKeyChecks is ExecUnderLock with the locking
+// session's foreign_key_checks turned off for the statements, for DDL that
+// must add a foreign key in place without checking the rows (see
+// ExecWithoutForeignKeyChecks). The session gets its previous setting back
+// afterwards; if it cannot, Close discards the session instead of returning
+// it to the pool.
+func (s *TableLock) ExecUnderLockWithoutForeignKeyChecks(ctx context.Context, stmts ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lockConn == nil {
+		return sql.ErrConnDone
+	}
+	var checks int
+	if err := s.lockConn.QueryRowContext(ctx, "SELECT @@session.foreign_key_checks").Scan(&checks); err != nil {
+		return err
+	}
+	if err := s.execUnderLock(ctx, "SET SESSION foreign_key_checks = 0"); err != nil {
+		s.discard = true
+		return err
+	}
+	execErr := s.execUnderLock(ctx, stmts...)
+	// Restore even after a cancel: the statements may have used up ctx.
+	if err := s.execUnderLock(context.WithoutCancel(ctx), fmt.Sprintf("SET SESSION foreign_key_checks = %d", checks)); err != nil {
+		s.discard = true
+		return errors.Join(execErr, err)
+	}
+	return execErr
+}
+
+func (s *TableLock) execUnderLock(ctx context.Context, stmts ...string) error {
 	if s.lockConn == nil {
 		return sql.ErrConnDone
 	}
@@ -202,9 +271,11 @@ func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 			return err
 		}
 		execCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.completionTimeout)
+		stopKill := s.killReferencedBlockers(ctx, execCtx)
 		_, err := s.lockConn.ExecContext(execCtx, stmt)
 		expired := execCtx.Err() != nil
 		cancel()
+		stopKill()
 		if err != nil {
 			if expired {
 				return fmt.Errorf("%w: %w", ErrStatementOutcomeUnknown, err)
@@ -213,6 +284,39 @@ func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 		}
 	}
 	return nil
+}
+
+// killReferencedBlockers kills the sessions blocking the locking session on a
+// referenced table once the statement it is about to run has waited the
+// force-kill delay, if it is still waiting for a metadata lock on one.
+// stmtCtx ends when the statement returns. The returned function stops the
+// kill and waits for one that has started.
+func (s *TableLock) killReferencedBlockers(ctx, stmtCtx context.Context) func() {
+	if s.forceKillDelay == 0 {
+		return func() {}
+	}
+	stmtCtx, done := context.WithCancel(stmtCtx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	timer := time.AfterFunc(s.forceKillDelay, func() {
+		defer wg.Done()
+		killTableLockBlockers(ctx, stmtCtx, s.logger, func(ctx context.Context) error {
+			// A statement can run past the delay without waiting for a lock.
+			// Only one that waits on a referenced table has blockers to kill.
+			waiting, err := statementIsWaitingForTableLock(ctx, s.db, s.referenced, s.logger, s.lockPID)
+			if err != nil || !waiting {
+				return err
+			}
+			return KillLockingTransactions(ctx, s.db, s.referenced, s.logger, []int{s.lockPID})
+		})
+	})
+	return func() {
+		done()
+		if timer.Stop() {
+			wg.Done()
+		}
+		wg.Wait()
+	}
 }
 
 // Close releases the table lock even if the caller's context has expired.
@@ -230,7 +334,10 @@ func (s *TableLock) Close(ctx context.Context) error {
 	unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tableUnlockTimeout)
 	defer cancel()
 	if _, err := conn.ExecContext(unlockCtx, "UNLOCK TABLES"); err != nil {
-		return errors.Join(err, discardTableLockConn(conn))
+		return errors.Join(err, discardConn(conn))
+	}
+	if s.discard {
+		return discardConn(conn)
 	}
 	err := conn.Close()
 	if err == nil {
@@ -241,7 +348,7 @@ func (s *TableLock) Close(ctx context.Context) error {
 
 // sql.Conn.Close alone returns the session to the pool. ErrBadConn through Raw
 // instructs database/sql to close the underlying connection instead.
-func discardTableLockConn(conn *sql.Conn) error {
+func discardConn(conn *sql.Conn) error {
 	err := conn.Raw(func(any) error { return driver.ErrBadConn })
 	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
 		err = nil

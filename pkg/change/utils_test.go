@@ -261,6 +261,31 @@ func TestParseQueryEventTables(t *testing.T) {
 	}
 }
 
+// TestParseQueryEventForeignKeysOnly checks which ALTERs are classified as
+// only adding or dropping foreign keys.
+func TestParseQueryEventForeignKeysOnly(t *testing.T) {
+	for _, test := range []struct {
+		statement string
+		want      bool
+	}{
+		{"ALTER TABLE _child_new ADD CONSTRAINT `_fk_new` FOREIGN KEY (pid) REFERENCES parent (id), ALGORITHM=INPLACE, LOCK=NONE", true},
+		{"ALTER TABLE _child_new DROP FOREIGN KEY `_fk_new`, ALGORITHM=INPLACE, LOCK=NONE", true},
+		{"ALTER TABLE child DROP FOREIGN KEY fk, ADD CONSTRAINT fk2 FOREIGN KEY (pid) REFERENCES parent (id)", true},
+		{"ALTER TABLE _child_new ALGORITHM=INPLACE", false},
+		{"ALTER TABLE _child_new ADD FOREIGN KEY (pid) REFERENCES parent (id), ADD COLUMN c INT", false},
+		{"ALTER TABLE _child_new ADD UNIQUE KEY (pid)", false},
+		{"ALTER TABLE _child_new ADD CONSTRAINT chk CHECK (pid > 0)", false},
+		{"ALTER TABLE _child_new DROP INDEX pid", false},
+		{"ALTER TABLE _child_new ADD COLUMN parent_id INT REFERENCES parent (id)", false},
+		{"CREATE TABLE _child_new (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES parent (id))", false},
+		{"DROP TABLE _child_new", false},
+	} {
+		info, err := parseQueryEvent("test", test.statement)
+		require.NoError(t, err)
+		require.Equal(t, test.want, info.foreignKeysOnly, test.statement)
+	}
+}
+
 func TestToSet(t *testing.T) {
 	tests := []struct {
 		name     string

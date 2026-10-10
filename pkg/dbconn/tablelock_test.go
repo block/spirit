@@ -289,7 +289,7 @@ func TestTableLockCleanup(t *testing.T) {
 			case "discard_locked_session":
 				// Exercise the error-path discard on a live locked session:
 				// merely calling Conn.Close would leak this lock into the pool.
-				require.NoError(t, discardTableLockConn(lock.lockConn))
+				require.NoError(t, discardConn(lock.lockConn))
 			}
 			err = lock.Close(cleanupCtx)
 			if mode == "lost_connection" || mode == "cancel_inflight_query" || mode == "discard_locked_session" {
@@ -511,4 +511,91 @@ func TestTableLockDoesNotRetryAKillThatListedTheBlockers(t *testing.T) {
 	})
 	require.Equal(t, 1, calls)
 	require.Contains(t, logs.String(), "failed to kill locking transactions")
+}
+
+// foreignKeyLockFixture creates a parent table, a child table with a foreign
+// key to it and a copy of the child without the foreign key, as a migration
+// does, and returns the lock on both children, with a 1s force-kill delay.
+func foreignKeyLockFixture(t *testing.T, name string) (db *sql.DB, lock *TableLock, parent, child string) {
+	t.Helper()
+	testutils.SkipBeforeMySQLVersion(t, "9.7.0", "foreign keys are only supported from MySQL 9.7")
+	parent, child = name+"_parent", name+"_child"
+	newChild := "_" + child + "_new"
+	drop := fmt.Sprintf("DROP TABLE IF EXISTS %s, %s, %s", newChild, child, parent)
+	testutils.RunSQL(t, drop)
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (id INT NOT NULL PRIMARY KEY)", parent))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s (id INT NOT NULL PRIMARY KEY, pid INT, KEY (pid), FOREIGN KEY (pid) REFERENCES %s (id))", child, parent))
+	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE %s LIKE %s", newChild, child))
+	t.Cleanup(func() { testutils.RunSQL(t, drop) })
+	config := NewDBConfig()
+	config.LockWaitTimeout = 10
+	config.ForceKillAfter = time.Second
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	lock, err = NewTableLockReferencing(t.Context(), db,
+		[]*table.TableInfo{table.NewTableInfo(db, "test", child), table.NewTableInfo(db, "test", newChild)},
+		[]*table.TableInfo{table.NewTableInfo(db, "test", parent)},
+		config, slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLogWithContext(t.Context(), lock) })
+	return db, lock, parent, newChild
+}
+
+// TestTableLockKillsReferencedTableBlockers checks that DDL under the lock
+// that adds a foreign key, which waits for every open transaction that has
+// read the parent table, gets the parent's blockers killed.
+func TestTableLockKillsReferencedTableBlockers(t *testing.T) {
+	db, lock, parent, child := foreignKeyLockFixture(t, "tlfk_kill")
+	blocker, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback() }()
+	_, err = blocker.ExecContext(t.Context(), "SELECT * FROM "+parent)
+	require.NoError(t, err)
+
+	start := time.Now()
+	err = lock.ExecUnderLockWithoutForeignKeyChecks(t.Context(),
+		fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s_fk FOREIGN KEY (pid) REFERENCES %s (id)", child, child, parent))
+	require.NoError(t, err)
+	require.Less(t, time.Since(start), 8*time.Second, "the ALTER must not have waited out lock_wait_timeout")
+	_, err = blocker.ExecContext(t.Context(), "SELECT 1")
+	require.Error(t, err, "the blocker on the parent table must have been killed")
+}
+
+// TestTableLockDoesNotKillWhenNotWaiting checks that a statement under the
+// lock that runs past the force-kill delay without waiting for a metadata
+// lock kills no one.
+func TestTableLockDoesNotKillWhenNotWaiting(t *testing.T) {
+	db, lock, parent, _ := foreignKeyLockFixture(t, "tlfk_nokill")
+	reader, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() { _ = reader.Rollback() }()
+	_, err = reader.ExecContext(t.Context(), "SELECT * FROM "+parent)
+	require.NoError(t, err)
+
+	require.NoError(t, lock.ExecUnderLock(t.Context(), "DO SLEEP(2)"))
+	_, err = reader.ExecContext(t.Context(), "SELECT 1")
+	require.NoError(t, err, "a transaction on the parent table must not be killed when nothing waits for it")
+}
+
+// TestExecUnderLockWithoutForeignKeyChecks checks that the locking session
+// runs the statements with foreign_key_checks off and gets its own setting
+// back afterwards, including when a statement fails.
+func TestExecUnderLockWithoutForeignKeyChecks(t *testing.T) {
+	_, lock, parent, child := foreignKeyLockFixture(t, "tlfk_checks")
+	readChecks := func() int {
+		var checks int
+		require.NoError(t, lock.lockConn.QueryRowContext(t.Context(), "SELECT @@session.foreign_key_checks").Scan(&checks))
+		return checks
+	}
+	require.Equal(t, 1, readChecks())
+	// The child row has no parent: the foreign key is only added without checks.
+	require.NoError(t, lock.ExecUnderLock(t.Context(), fmt.Sprintf("INSERT INTO %s VALUES (1, 1)", child)))
+	require.NoError(t, lock.ExecUnderLockWithoutForeignKeyChecks(t.Context(),
+		fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s_fk FOREIGN KEY (pid) REFERENCES %s (id)", child, child, parent)))
+	require.Equal(t, 1, readChecks())
+
+	require.Error(t, lock.ExecUnderLockWithoutForeignKeyChecks(t.Context(), "ALTER TABLE no_such_table ENGINE=InnoDB"))
+	require.Equal(t, 1, readChecks())
+	require.False(t, lock.discard)
 }

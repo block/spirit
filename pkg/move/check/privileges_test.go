@@ -437,9 +437,9 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 // TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant: MySQL applies
 // one database-level grant row to a schema, not the union of every row whose
 // name matches it. Here the exact-name grant (created first) is the one that
-// applies, so EVENT granted on a pattern that also matches the schema does not
-// reach it, and information_schema.EVENTS hides the schema's event. The
-// visibility check must not count the pattern's EVENT.
+// applies, so EVENT granted (with the base set) on a pattern that also matches
+// the schema does not reach it, and information_schema.EVENTS hides the
+// schema's event. The visibility check must not count the pattern's EVENT.
 func TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant(t *testing.T) {
 	schema, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
@@ -447,7 +447,7 @@ func TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant(t *testing.T) {
 	// '%' is doubled because createMoveTestUser formats each grant with Sprintf.
 	pattern := schema[:len(schema)-1] + "%%"
 	db, cfg := createMoveTestUser(t, "testmovevis_wildevent", schema,
-		append(oldMinimalMoveGrants(schema), "GRANT EVENT ON `"+pattern+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
+		append(oldMinimalMoveGrants(schema), "GRANT ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE, EVENT ON `"+pattern+"`.* TO %s", "GRANT SHOW_ROUTINE ON *.* TO %s")...)
 	var visible int
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		"SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?", schema).Scan(&visible))
@@ -610,6 +610,36 @@ func (s stubDB) QueryRowContext(ctx context.Context, query string, args ...any) 
 		return s.DB.QueryRowContext(canceled, query, args...)
 	}
 	return s.DB.QueryRowContext(ctx, query, args...)
+}
+
+// TestSourcePrivilegesBaseGrantShadowedByExactGrant checks that the base
+// privileges must be on every database-level grant matching the schema: an
+// exact-name grant with a smaller set can shadow a pattern grant with the full
+// set, and MySQL applies only one of them.
+func TestSourcePrivilegesBaseGrantShadowedByExactGrant(t *testing.T) {
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	noForceKillProbe := func(context.Context) error { return nil }
+	const full = "ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE"
+	const global = "GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD, EVENT, SHOW_ROUTINE ON *.* TO `u`@`%`"
+	run := func(grants ...string) error {
+		return sourcePrivileges(t.Context(), stubDB{DB: db, grants: append(grants, global)}, "app_1", noForceKillProbe)
+	}
+
+	require.NoError(t, run("GRANT "+full+" ON `app\\_%`.* TO `u`@`%`"))
+	require.NoError(t, run(
+		"GRANT "+full+" ON `app\\_%`.* TO `u`@`%`",
+		"GRANT "+full+" ON `app_1`.* TO `u`@`%`"))
+	err = run(
+		"GRANT "+full+" ON `app\\_%`.* TO `u`@`%`",
+		"GRANT SELECT, INSERT ON `app_1`.* TO `u`@`%`")
+	require.ErrorContains(t, err, "insufficient privileges to run a move")
+
+	// The full set granted globally counts on its own.
+	require.NoError(t, run(
+		"GRANT "+full+" ON *.* TO `u`@`%`",
+		"GRANT SELECT, INSERT ON `app_1`.* TO `u`@`%`"))
 }
 
 // TestVisibilityReadErrorsAreNotRefusals checks that a failure of any read

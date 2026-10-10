@@ -92,6 +92,9 @@ type Resources struct {
 	Threads              int
 	ReplicaMaxLag        time.Duration
 	SkipDropAfterCutover bool
+	// ExperimentalForeignKeys is --enable-experimental-foreign-keys: a table
+	// with foreign keys of its own is supported on MySQL 9.7 and later.
+	ExperimentalForeignKeys bool
 	// The following resources are only used by the
 	// pre-run checks
 	Host               string

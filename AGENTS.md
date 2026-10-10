@@ -300,7 +300,7 @@ Key principles:
 - **RENAME column** — some rename operations are intentionally not supported. Renaming primary key columns and dangerous overlap patterns (e.g., `RENAME COLUMN c1 TO n1, ADD COLUMN c1 ...`) are blocked. Simple non-PK column renames are supported.
 - **ALTER/DROP PRIMARY KEY** — primary key must remain unchanged
 - **Lossy conversions** (e.g., shortening VARCHAR below max data length)
-- **FOREIGN KEYS or TRIGGERS** on migrated tables
+- **FOREIGN KEYS or TRIGGERS** on migrated tables. Exception: `--enable-experimental-foreign-keys` (MySQL 9.7+, where cascades are in the binary log) supports a table's own foreign keys in `pkg/migration` only. A table other foreign keys reference stays unsupported, and so does `ADD FOREIGN KEY`. The `_new` table must have no foreign keys until the cutover lock adds them (see `pkg/migration/foreignkeys.go`): one on it would make parent-table deletes fail against the copy's rows
 - **Read-replica fidelity** (<10s lag guarantees)
 
 ## Common Patterns

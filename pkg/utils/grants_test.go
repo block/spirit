@@ -91,6 +91,38 @@ func TestDBLevelGrantCoversSchema(t *testing.T) {
 	assert.True(t, DBLevelGrantCoversSchema("GRANT ALL PRIVILEGES ON `app``one`.* TO `u`@`%`", "app`one"))
 }
 
+// TestDBLevelGrantsCoverSchema checks that the database-level grants are
+// evaluated together: MySQL applies one mysql.db row to a schema, so an
+// exact-name row with a smaller set can shadow a pattern row with the full set.
+func TestDBLevelGrantsCoverSchema(t *testing.T) {
+	const full = "ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE"
+	const partial = "SELECT, INSERT, UPDATE, DELETE"
+	grant := func(privs, db string) string {
+		return "GRANT " + privs + " ON `" + db + "`.* TO `u`@`%`"
+	}
+	tests := []struct {
+		name   string
+		grants []string
+		want   bool
+	}{
+		{"pattern only, full set", []string{grant(full, `app\_%`)}, true},
+		{"pattern only, ALL PRIVILEGES", []string{grant("ALL PRIVILEGES", `app\_%`)}, true},
+		{"exact partial shadows pattern full", []string{grant(full, `app\_%`), grant(partial, "app_1")}, false},
+		{"exact partial listed first", []string{grant(partial, "app_1"), grant(full, `app\_%`)}, false},
+		{"exact full and pattern full", []string{grant(full, `app\_%`), grant(full, "app_1")}, true},
+		{"exact full, pattern partial", []string{grant(partial, `app\_%`), grant(full, "app_1")}, false},
+		{"pattern partial only", []string{grant(partial, `app\_%`)}, false},
+		{"non-matching grants ignored", []string{grant(full, "app_1"), grant(partial, "other")}, true},
+		{"no grants", nil, false},
+		{"global grant is not database-level", []string{"GRANT " + full + " ON *.* TO `u`@`%`"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DBLevelGrantsCoverSchema(tc.grants, "app_1"))
+		})
+	}
+}
+
 func TestMySQLLikeMatch(t *testing.T) {
 	tests := []struct {
 		pattern string
@@ -271,4 +303,41 @@ func TestDBLevelGrantName(t *testing.T) {
 			assert.Equal(t, tc.want, name)
 		})
 	}
+}
+
+func TestDBLevelGrantsCoverSchemaSameNameOnTwoLines(t *testing.T) {
+	const full = "ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE"
+	grant := func(privs, db string) string {
+		return "GRANT " + privs + " ON `" + db + "`.* TO `u`@`%`"
+	}
+	// One granted name listed on two lines (for example the user's own grant
+	// and a grant from an active role): the name counts as covered when either
+	// line carries the full set, whichever order SHOW GRANTS prints them in.
+	assert.True(t, DBLevelGrantsCoverSchema([]string{grant(full, "app_1"), grant("SELECT", "app_1")}, "app_1"))
+	assert.True(t, DBLevelGrantsCoverSchema([]string{grant("SELECT", "app_1"), grant(full, "app_1")}, "app_1"))
+}
+
+func TestShadowingGrantsNote(t *testing.T) {
+	const full = "ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE"
+	grant := func(privs, db string) string {
+		return "GRANT " + privs + " ON `" + db + "`.* TO `u`@`%`"
+	}
+	assert.Empty(t, ShadowingGrantsNote(nil, "app_1"))
+	assert.Empty(t, ShadowingGrantsNote([]string{grant(full, "app_1"), grant("ALL PRIVILEGES", "app\\_%")}, "app_1"))
+	assert.Empty(t, ShadowingGrantsNote([]string{grant("SELECT", "other")}, "app_1"))
+	note := ShadowingGrantsNote([]string{grant(full, "app_1"), grant("EVENT", "app\\_%"), grant("SELECT", "app_%")}, "app_1")
+	assert.Contains(t, note, "`app\\_%`.*, `app_%`.*")
+	assert.NotContains(t, note, "`app_1`.*")
+	assert.Contains(t, note, "MySQL may apply that grant")
+	assert.Equal(t, []string{"app_%"}, DBLevelGrantNamesLackingSet([]string{grant("SELECT", "app_%"), grant(full, "app_1")}, "app_1"))
+}
+
+func TestDBLevelGrantsAll(t *testing.T) {
+	grant := func(privs, db string) string {
+		return "GRANT " + privs + " ON `" + db + "`.* TO `u`@`%`"
+	}
+	hasSelect := func(g string) bool { return DBLevelGrantHasAny(g, "app_1", "SELECT") }
+	assert.False(t, DBLevelGrantsAll(nil, "app_1", hasSelect))
+	assert.True(t, DBLevelGrantsAll([]string{grant("SELECT", "app_1"), grant("ALL PRIVILEGES", "app_%")}, "app_1", hasSelect))
+	assert.False(t, DBLevelGrantsAll([]string{grant("INSERT", "app_1"), grant("SELECT", "app_%")}, "app_1", hasSelect))
 }

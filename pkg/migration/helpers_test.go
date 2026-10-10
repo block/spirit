@@ -280,6 +280,20 @@ func WithSkipDropAfterCutover() RunnerOption {
 	}
 }
 
+// WithForceKillAfter sets --force-kill-after.
+func WithForceKillAfter(d time.Duration) RunnerOption {
+	return func(m *Migration) {
+		m.ForceKillAfter = d
+	}
+}
+
+// WithExperimentalForeignKeys sets --enable-experimental-foreign-keys.
+func WithExperimentalForeignKeys() RunnerOption {
+	return func(m *Migration) {
+		m.EnableExperimentalForeignKeys = true
+	}
+}
+
 // newTestMigration creates a Migration with sensible defaults for integration tests.
 // It parses the test DSN and fills in Host/Username/Password/Database.
 // Callers must set Statement before calling Run().
@@ -363,4 +377,37 @@ func NewTestRunnerFromStatement(t *testing.T, statement string, opts ...RunnerOp
 func NewTestMigration(t *testing.T, opts ...RunnerOption) *Migration {
 	t.Helper()
 	return newTestMigration(t, opts...)
+}
+
+// Wait until we are at least copying rows
+// before we dump a checkpoint, then wait for first
+// successful checkpoint.
+func waitForCheckpoint(t *testing.T, runner *Runner) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return runner.status.Get() >= status.CopyRows
+	}, 60*time.Second, time.Millisecond, "timeout waiting for status >= copyRows")
+	require.Eventually(t, func() bool {
+		return runner.DumpCheckpoint(t.Context()) == nil
+	}, 30*time.Second, 10*time.Millisecond, "timeout waiting for first successful checkpoint")
+}
+
+// runUntilCheckpointThenCancel runs m until it has written a checkpoint, then
+// cancels it, waits for Run to return, and closes it. Build m with
+// WithCopyStalledAfterChunks: the copy then cannot finish, so the cancel
+// always lands during the copy and the checkpoint and _new table survive it. A
+// run that can finish its copy before the cancel reaches the cutover instead,
+// and the next run finds no _new table to resume from (issue #1338).
+func runUntilCheckpointThenCancel(t *testing.T, m *Runner) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- m.Run(ctx)
+	}()
+	waitForCheckpoint(t, m)
+	cancel()
+	require.ErrorIs(t, <-errCh, context.Canceled, "the first run must be cancelled during the copy")
+	require.NoError(t, m.Close())
 }

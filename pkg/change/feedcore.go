@@ -290,6 +290,25 @@ func (c *feedCore) buildSyncerConfig(host string, port uint16) replication.Binlo
 // specific tables within the schema triggers cancellation — this is used for partial
 // moves where only a subset of tables from a schema are being moved.
 func (c *feedCore) processDDLNotification(schema, table string) {
+	c.processDDL(schema, table, false)
+}
+
+// processDDLTables notifies processDDL of every table a DDL event names.
+func (c *feedCore) processDDLTables(info queryEventInfo) {
+	for i, ddlTable := range info.tables {
+		c.processDDL(ddlTable.schema, ddlTable.table, i == 0 && info.foreignKeysOnly)
+	}
+}
+
+// processDDL is processDDLNotification, except that with foreignKeysOnly (an
+// ALTER of the table that only adds or drops foreign keys) a subscription's
+// new table does not match. Such an ALTER changes no column and no row: the
+// migration's experimental foreign key support adds the table's foreign keys
+// to the new table under the cutover lock, and drops them again if the
+// attempt fails, so a run resumed after a failed attempt reads those ALTERs
+// after its checkpoint. The migration refuses a foreign key on the new table
+// outside the cutover lock on its own.
+func (c *feedCore) processDDL(schema, table string, foreignKeysOnly bool) {
 	if c.stopped.Load() {
 		// Post-cutover, where spirit's own RENAME TABLE is the DDL we would
 		// otherwise be reporting on ourselves. See Source.Stop.
@@ -311,7 +330,7 @@ func (c *feedCore) processDDLNotification(schema, table string) {
 		// Tables() is a pure accessor and needs no further locking.
 		matchFound := false
 		for _, sub := range c.subs.Snapshot() {
-			for _, tsub := range sub.Tables() { // currentTable, newTable
+			for i, tsub := range sub.Tables() { // currentTable, newTable
 				if tsub == nil {
 					// Defensive: in-tree subscriptions never emit nil
 					// entries (bufferedMap.Tables omits a nil newTable),
@@ -320,7 +339,7 @@ func (c *feedCore) processDDLNotification(schema, table string) {
 					// crash the stream reader.
 					continue
 				}
-				if tsub.SchemaName == schema && tsub.TableName == table {
+				if tsub.SchemaName == schema && tsub.TableName == table && (i == 0 || !foreignKeysOnly) {
 					matchFound = true
 					break
 				}

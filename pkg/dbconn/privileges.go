@@ -81,19 +81,12 @@ func checkKillPrivilege(ctx context.Context, db grantsQuerier) error {
 // show which one, so a database-level grant counts only when every matching
 // name has EXECUTE.
 func grantsAllowExecute(grants []string, schema, proc string) bool {
-	onSchema := map[string]bool{}
 	for _, grant := range grants {
 		if utils.GlobalGrantHasAny(grant, "EXECUTE") || utils.ProcedureGrantHasAny(grant, schema, proc, "EXECUTE") {
 			return true
 		}
-		if name, ok := utils.DBLevelGrantName(grant, schema); ok {
-			onSchema[name] = onSchema[name] || utils.DBLevelGrantHasAny(grant, schema, "EXECUTE")
-		}
 	}
-	for _, ok := range onSchema {
-		if !ok {
-			return false
-		}
-	}
-	return len(onSchema) > 0
+	return utils.DBLevelGrantsAll(grants, schema, func(grant string) bool {
+		return utils.DBLevelGrantHasAny(grant, schema, "EXECUTE")
+	})
 }

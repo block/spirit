@@ -622,9 +622,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			}
 			// Query event, check if it is a DDL statement,
 			// in which case we need to notify the caller.
-			for _, ddlTable := range info.tables {
-				c.processDDLNotification(ddlTable.schema, ddlTable.table)
-			}
+			c.processDDLTables(info)
 		case *replication.TransactionPayloadEvent:
 			// binlog_transaction_compression=ON wraps an entire transaction —
 			// the BEGIN QueryEvent, TableMapEvents, row events and the
@@ -864,9 +862,7 @@ func (c *binlogClient) processTransactionPayload(e *replication.TransactionPaylo
 			// Usually the transaction's BEGIN, which parses cleanly and
 			// yields no DDL tables. Unparseable statements are skipped the
 			// same way readStream skips them.
-			for _, ddlTable := range info.tables {
-				c.processDDLNotification(ddlTable.schema, ddlTable.table)
-			}
+			c.processDDLTables(info)
 		case *replication.TableMapEvent, *replication.XIDEvent:
 			// Housekeeping inside the payload. The TableMapEvents were
 			// already consumed by go-mysql's inner parser to decode the

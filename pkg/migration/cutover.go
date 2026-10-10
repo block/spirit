@@ -43,6 +43,10 @@ type CutOver struct {
 	// fails the cutover without a retry (errCutoverRefused). Any other error
 	// is retried like a failed attempt.
 	checksUnderLock func(context.Context) error
+	// foreignKeys, when set, adds the foreign keys of the tables to their new
+	// tables under the lock, before checksUnderLock, and settles their names
+	// after the RENAME (see foreignKeyCutover).
+	foreignKeys *foreignKeyCutover
 	// testInjectRenameError is a test-only seam: when non-nil it is returned
 	// in place of a successful rename's nil result, simulating a connection
 	// that died after the server committed the RENAME TABLE but before the
@@ -52,6 +56,10 @@ type CutOver struct {
 	// testInjectRenameError is returned. It lets a test cancel the run while
 	// the rename's outcome is unknown.
 	testAfterRenameError func()
+	// testAfterFailedAttempt is a test-only seam that runs after an attempt
+	// has failed and unlocked, before the retry. It lets a test leave state
+	// behind that a failed attempt could not clean up.
+	testAfterFailedAttempt func()
 	// testRenameCompleted is a test-only seam: when non-nil, renameCompleted
 	// returns its result instead of reading the server state. An error makes
 	// the ownership verification unavailable, which is the state that
@@ -189,6 +197,21 @@ func (c *CutOver) Run(ctx context.Context) error {
 		if renameMayHaveCommitted && confirm() {
 			return nil
 		}
+		// A failed attempt takes the foreign keys it added off the new tables
+		// before it unlocks, but not when its RENAME's outcome was unknown,
+		// nor when that removal itself failed (a dead locking session). Drop
+		// any that are left before the unlocked work below: until then they
+		// hold the application's changes to the parent tables to the new
+		// tables' rows. If they cannot be dropped, fail rather than retry
+		// with them in place.
+		if i > 0 && c.foreignKeys != nil {
+			if err := c.foreignKeys.removeFromNewTables(ctx, c.foreignKeys.forceExec); err != nil {
+				if ctx.Err() != nil {
+					return cancelled()
+				}
+				return fail(fmt.Errorf("could not drop the foreign keys a failed cutover attempt left on the new tables: %w", err))
+			}
+		}
 		// Try and catch up before we attempt the cutover.
 		// since we will need to catch up again with the lock held
 		// and we want to minimize that.
@@ -238,6 +261,9 @@ func (c *CutOver) Run(ctx context.Context) error {
 				"error", err.Error(),
 				"next_backoff", backoff,
 			)
+			if c.testAfterFailedAttempt != nil {
+				c.testAfterFailedAttempt()
+			}
 			continue
 		}
 		c.logger.Warn("final cut over operation complete")
@@ -355,7 +381,27 @@ func (c *CutOver) algorithmRenameUnderLock(ctx context.Context) error {
 // the tables half-renamed and expects Run's retry loop — and therefore the
 // feed — to carry on.
 func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*table.TableInfo, renameFragments []string, stopFeed bool) error {
-	tableLock, err := dbconn.NewTableLock(ctx, c.db, tablesToLock, c.dbConfig, c.logger)
+	// partialRenameForTest leaves the foreign keys alone.
+	foreignKeys := c.foreignKeys
+	if !stopFeed {
+		foreignKeys = nil
+	}
+	var referenced []*table.TableInfo
+	if foreignKeys != nil {
+		// Before the lock: the probe finds out whether adding the foreign
+		// keys under it would build an index.
+		if err := foreignKeys.probe(ctx); err != nil {
+			if errors.Is(err, check.ErrRefused) {
+				return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			}
+			return err
+		}
+		var err error
+		if referenced, err = foreignKeys.referenced(ctx); err != nil {
+			return err
+		}
+	}
+	tableLock, err := dbconn.NewTableLockReferencing(ctx, c.db, tablesToLock, referenced, c.dbConfig, c.logger)
 	if err != nil {
 		return err
 	}
@@ -363,6 +409,21 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	// session if unlocking fails. Log cleanup errors without retrying a rename
 	// that may already have succeeded.
 	defer utils.CloseAndLogWithContext(ctx, tableLock)
+	// mayHaveRenamed is set when the RENAME may have taken effect. Until then,
+	// a failed attempt takes the foreign keys it added off the new tables
+	// again, before it unlocks: until the next attempt they would hold the
+	// application's changes to the parent tables to the new tables' rows.
+	mayHaveRenamed := false
+	if foreignKeys != nil {
+		defer func() {
+			if mayHaveRenamed {
+				return
+			}
+			if err := foreignKeys.removeFromNewTables(context.WithoutCancel(ctx), underLock(tableLock)); err != nil {
+				c.logger.Warn("could not drop the foreign keys of the new tables after a failed cutover attempt", "error", err)
+			}
+		}()
+	}
 	// FlushUnderTableLock itself does flush → BlockWait → flush, so the
 	// flush's own binlog events (REPLACE INTO _new / DELETE FROM _new) are
 	// already read back inside the BlockWait of the same call. The earlier
@@ -378,6 +439,14 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	}
 	if !c.feed.AllChangesFlushed() {
 		return fmt.Errorf("%w, final flush might be broken", change.ErrChangesNotFlushed)
+	}
+	if foreignKeys != nil {
+		if err := foreignKeys.addToNewTables(ctx, tableLock); err != nil {
+			if errors.Is(err, check.ErrRefused) {
+				return fmt.Errorf("%w: %w", errCutoverRefused, err)
+			}
+			return err
+		}
 	}
 	// The lock keeps out any DDL that needs a metadata lock on the tables,
 	// so these checks see exactly what the RENAME will act on.
@@ -401,8 +470,11 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	// were swapped unless the completion bound expires.
 	renameStatement := "RENAME TABLE " + strings.Join(renameFragments, ", ")
 	if err := tableLock.ExecUnderLock(ctx, renameStatement); err != nil {
+		// Any other error is the server's report that the RENAME failed.
+		mayHaveRenamed = dbconn.IsOutcomeUnknown(err)
 		return err
 	}
+	mayHaveRenamed = true
 	// The tables are swapped and the lock is still held, so no application
 	// write can be in flight and nothing more can reach the changeset. Stop
 	// the feed here, in that window, rather than after the deferred UNLOCK
@@ -411,6 +483,15 @@ func (c *CutOver) executeRenameUnderLock(ctx context.Context, tablesToLock []*ta
 	// still holds the pre-ALTER TableInfo. See change.Source's Stop.
 	if stopFeed {
 		c.feed.Stop()
+	}
+	if foreignKeys != nil {
+		// The cutover has happened, so a failure here only leaves the old
+		// tables' foreign keys and the copies' names in place: the runner
+		// settles them once the lock is released (settleAfterUnlock).
+		exec := underLock(tableLock)
+		if err := foreignKeys.settle(context.WithoutCancel(ctx), exec, exec); err != nil {
+			c.logger.Warn("could not settle the foreign keys under the table lock; trying again after the cutover", "error", err)
+		}
 	}
 	if c.testInjectRenameError != nil {
 		// Test-only seam: the rename was committed by the server, but we

@@ -54,7 +54,7 @@ func TestGenericConstraintDrops(t *testing.T) {
 	}
 }
 
-func TestAlterWithRenamedCheckConstraints(t *testing.T) {
+func TestAlterWithRenamedConstraints(t *testing.T) {
 	// Names as they are on the table the ALTER will actually be applied to,
 	// keyed by the name on the table the user named.
 	renames := map[string]string{
@@ -147,7 +147,7 @@ func TestAlterWithRenamedCheckConstraints(t *testing.T) {
 	}
 	for _, test := range tests {
 		stmts := MustNew(test.statement)
-		alter, unnamed, err := stmts[0].AlterWithRenamedCheckConstraints(renames)
+		alter, unnamed, err := stmts[0].AlterWithRenamedConstraints(renames, nil)
 		require.NoError(t, err, test.statement)
 		assert.Equal(t, test.expected, alter, test.statement)
 		assert.Equal(t, test.unnamed, unnamed, test.statement)
@@ -185,8 +185,38 @@ func TestDropConstraintKeywordPreserved(t *testing.T) {
 	}
 }
 
-func TestAlterWithRenamedCheckConstraintsNotAlterTable(t *testing.T) {
+func TestAlterWithRenamedConstraintsNotAlterTable(t *testing.T) {
 	stmts := MustNew("CREATE TABLE t1 (a INT)")
-	_, _, err := stmts[0].AlterWithRenamedCheckConstraints(nil)
+	_, _, err := stmts[0].AlterWithRenamedConstraints(nil, nil)
 	require.ErrorIs(t, err, ErrNotAlterTable)
+}
+
+func TestAlterWithRenamedConstraintsForeignKeys(t *testing.T) {
+	foreignKeys := map[string]string{"fk_parent": "_fk_parent_new", "t1_ibfk_1": "_t1_new_ibfk_1"}
+	tests := []struct {
+		statement string
+		expected  string
+	}{
+		{"ALTER TABLE t1 DROP FOREIGN KEY fk_parent", "DROP FOREIGN KEY `_fk_parent_new`"},
+		// Names are matched case-insensitively, as MySQL matches them.
+		{"ALTER TABLE t1 DROP FOREIGN KEY FK_Parent, ADD COLUMN c INT", "DROP FOREIGN KEY `_fk_parent_new`, ADD COLUMN `c` INT"},
+		{"ALTER TABLE t1 DROP FOREIGN KEY t1_ibfk_1", "DROP FOREIGN KEY `_t1_new_ibfk_1`"},
+		// A name that is not in the map is left for MySQL to report as missing.
+		{"ALTER TABLE t1 DROP FOREIGN KEY fk_other", "DROP FOREIGN KEY `fk_other`"},
+		// A check constraint of the same name is in another namespace.
+		{"ALTER TABLE t1 DROP CHECK fk_parent", "DROP CHECK `fk_parent`"},
+	}
+	for _, test := range tests {
+		stmts := MustNew(test.statement)
+		alter, unnamed, err := stmts[0].AlterWithRenamedConstraints(nil, foreignKeys)
+		require.NoError(t, err, test.statement)
+		assert.Equal(t, test.expected, alter, test.statement)
+		assert.Empty(t, unnamed, test.statement)
+	}
+}
+
+func TestForeignKeysDropped(t *testing.T) {
+	assert.Equal(t, []string{"a", "B"}, MustNew("ALTER TABLE t1 DROP FOREIGN KEY a, ADD COLUMN c INT, DROP FOREIGN KEY B")[0].ForeignKeysDropped())
+	assert.Empty(t, MustNew("ALTER TABLE t1 DROP CONSTRAINT a, DROP CHECK b")[0].ForeignKeysDropped())
+	assert.Empty(t, MustNew("CREATE TABLE t1 (a INT)")[0].ForeignKeysDropped())
 }
