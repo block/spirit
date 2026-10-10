@@ -1216,10 +1216,11 @@ func TestDeferCutOverE2EBinlogAdvance(t *testing.T) {
 		// unlocked Flush from the test can take the bufferedMap mutex first
 		// and then block on the table lock (lock-order inversion, #1401).
 		// Wait for the migration's own periodic flush to advance instead.
+		// That flush runs on a ticker, so allow a full interval plus margin.
 		prev := binlogPos
 		require.Eventually(t, func() bool {
 			return m.replClient.Position() != prev
-		}, 30*time.Second, 50*time.Millisecond)
+		}, 2*change.DefaultFlushInterval, 50*time.Millisecond)
 		binlogPos = m.replClient.Position()
 	}
 
