@@ -1140,10 +1140,14 @@ func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
 			tbl := table.NewTableInfo(db, "test", "forceexec_check_blip")
 			started := time.Now()
 			realWaiting := waitingOn(tt.DB)
-			// The failures are picked by count, not by time since started: on a
+			// The failures are picked by count, not by a time window: on a
 			// loaded runner a slow check could otherwise leave only one check
-			// inside a time window. They start at the first check that sees
-			// the statement waiting, so a wait is in progress when they hit.
+			// inside the window. They start at the first check that sees the
+			// statement waiting once failFrom has passed since started, so a
+			// wait is in progress and has run for a while when they hit. A
+			// wait wrongly restarted by the failure would then be killed
+			// ForceKillAfter after it, later than anything the kept wait does.
+			const failFrom = 450 * time.Millisecond
 			var killedAfter time.Duration
 			var lastFailReturned time.Time
 			sawWaiting, failures := false, 0
@@ -1151,7 +1155,7 @@ func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
 			err = forceExec(ctx, db, config, slog.Default(),
 				"ALTER TABLE forceexec_check_blip ADD COLUMN c INT, ALGORITHM=INSTANT",
 				func(ctx context.Context, connID int) (bool, error) {
-					if sawWaiting && failures < tc.failed {
+					if sawWaiting && time.Since(started) >= failFrom && failures < tc.failed {
 						failures++
 						lastFailReturned = time.Now()
 						return false, io.EOF
@@ -1172,9 +1176,11 @@ func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
 			require.Equal(t, tc.failed, failures)
 			if tc.failed == 1 {
 				// The wait is kept: the kill comes at the delay after the
-				// statement started, not after the failed check.
+				// statement started, not at the delay after the failed check.
+				// A restart could not kill before that, so killing earlier
+				// tells the two apart by construction, whatever the timing.
 				require.GreaterOrEqual(t, killedAfter, config.ForceKillAfter)
-				require.Less(t, killedAfter, 1300*time.Millisecond)
+				require.Less(t, killedAfter, lastFailReturned.Sub(started)+config.ForceKillAfter)
 				return
 			}
 			// The wait restarted at the last failed check, so the blocker gets
