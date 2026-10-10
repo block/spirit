@@ -1,6 +1,6 @@
 module github.com/block/spirit
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/alecthomas/kong v1.16.1
@@ -18,7 +18,7 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
-	github.com/klauspost/compress v1.18.6 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/pingcap/errors v0.11.5-0.20260310054046-9c8b3586e4b2 // indirect
 	github.com/pingcap/log v1.1.1-0.20260227082333-572e590d08f1 // indirect
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20260504140133-511dba1dbe17 // indirect

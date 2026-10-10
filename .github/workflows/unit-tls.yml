@@ -31,7 +31,7 @@ jobs:
 
       - uses: actions/setup-go@v7.0.0
         with:
-          go-version: "1.26.6"
+          go-version-file: go.mod
           # No module cache. This workflow also runs on release tags, and a
           # cache restored there could have been written from a lower-trust
           # context — the cache-poisoning class zizmor flags. linter.yml
