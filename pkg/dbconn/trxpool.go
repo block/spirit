@@ -65,8 +65,8 @@ var trxPoolSleep = func(ctx context.Context, d time.Duration) error {
 
 // isTLSHandshakeError reports whether err is a TLS record-header failure,
 // e.g. "tls: first record does not look like a TLS handshake". This happens
-// when the server answers the SSL switch with a plaintext packet (typically
-// an ERR such as "too many connections"), which hides the real error.
+// when the server answers the SSL switch with a plaintext packet (an ERR
+// whose content the client cannot decode), which hides the real error.
 func isTLSHandshakeError(err error) bool {
 	_, ok := errors.AsType[tls.RecordHeaderError](err)
 	return ok
@@ -92,7 +92,7 @@ func isTrxPoolTransient(err error) bool {
 func wrapTrxPoolBeginError(err error) error {
 	if isTLSHandshakeError(err) {
 		return fmt.Errorf("TLS handshake failed while opening a checksum transaction; the server most likely rejected the connection during the handshake "+
-			"(e.g. too many connections, or a server/proxy that does not speak TLS): %w", err)
+			"with a plaintext error the client could not read; check the server error log: %w", err)
 	}
 	return err
 }
