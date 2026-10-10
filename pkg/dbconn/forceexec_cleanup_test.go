@@ -868,8 +868,12 @@ func TestForceExecKillsOnceAStatementStartsWaiting(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 1, killCalls)
 			// The blocker gets the kill delay, less at most one poll interval,
-			// measured from when the statement started waiting.
-			require.GreaterOrEqual(t, killedAfter, tc.waitStartsAfter+config.ForceKillAfter-killPollInterval)
+			// measured from when the statement started waiting. A poll timer
+			// that fires late moves the last failed check, and so the start of
+			// the delay, earlier by the lateness, so allow some timer slack.
+			// A kill that ignored the delay would land about a second early.
+			const timerSlack = 20 * time.Millisecond
+			require.GreaterOrEqual(t, killedAfter, tc.waitStartsAfter+config.ForceKillAfter-killPollInterval-timerSlack)
 		})
 	}
 }
@@ -1108,15 +1112,11 @@ func TestForceExecSparesTrafficDuringAnInplaceRebuild(t *testing.T) {
 func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
 	testutils.SkipFromMySQLVersion(t, "9.7.0", blockerLookupFailsReason)
 	for _, tc := range []struct {
-		name               string
-		failFrom, failTill time.Duration
-		killedFrom         time.Duration
-		killedBefore       time.Duration
+		name   string
+		failed int
 	}{
-		{name: "one failed check", failFrom: 450 * time.Millisecond, failTill: 550 * time.Millisecond,
-			killedFrom: time.Second, killedBefore: 1300 * time.Millisecond},
-		{name: "failed checks in a row", failFrom: 400 * time.Millisecond, failTill: 700 * time.Millisecond,
-			killedFrom: 1400 * time.Millisecond, killedBefore: 2 * time.Second},
+		{name: "one failed check", failed: 1},
+		{name: "failed checks in a row", failed: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tt := testutils.NewTestTable(t, "forceexec_check_blip", "CREATE TABLE forceexec_check_blip (id INT PRIMARY KEY)")
@@ -1136,15 +1136,27 @@ func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
 			tbl := table.NewTableInfo(db, "test", "forceexec_check_blip")
 			started := time.Now()
 			realWaiting := waitingOn(tt.DB)
+			// The failures are picked by count, not by time since started: on a
+			// loaded runner a slow check could otherwise leave only one check
+			// inside a time window. They start at the first check that sees
+			// the statement waiting, so a wait is in progress when they hit.
 			var killedAfter time.Duration
+			var lastFailReturned time.Time
+			sawWaiting, failures := false, 0
 			killCalls := 0
 			err = forceExec(ctx, db, config, slog.Default(),
 				"ALTER TABLE forceexec_check_blip ADD COLUMN c INT, ALGORITHM=INSTANT",
 				func(ctx context.Context, connID int) (bool, error) {
-					if elapsed := time.Since(started); elapsed >= tc.failFrom && elapsed < tc.failTill {
+					if sawWaiting && failures < tc.failed {
+						failures++
+						lastFailReturned = time.Now()
 						return false, io.EOF
 					}
-					return realWaiting(ctx, connID)
+					isWaiting, err := realWaiting(ctx, connID)
+					if isWaiting && err == nil {
+						sawWaiting = true
+					}
+					return isWaiting, err
 				},
 				func(ctx context.Context, connID int) ([]int, error) {
 					killCalls++
@@ -1153,8 +1165,19 @@ func TestForceExecKeepsAnObservedWaitAcrossAFailedCheck(t *testing.T) {
 				}, waitForKilledTransactions, nil)
 			require.NoError(t, err)
 			require.Equal(t, 1, killCalls)
-			require.GreaterOrEqual(t, killedAfter, tc.killedFrom)
-			require.Less(t, killedAfter, tc.killedBefore)
+			require.Equal(t, tc.failed, failures)
+			if tc.failed == 1 {
+				// The wait is kept: the kill comes at the delay after the
+				// statement started, not after the failed check.
+				require.GreaterOrEqual(t, killedAfter, config.ForceKillAfter)
+				require.Less(t, killedAfter, 1300*time.Millisecond)
+				return
+			}
+			// The wait restarted at the last failed check, so the blocker gets
+			// the full delay from when that check returned.
+			killedSince := killedAfter - lastFailReturned.Sub(started)
+			require.GreaterOrEqual(t, killedSince, config.ForceKillAfter)
+			require.Less(t, killedSince, config.ForceKillAfter+500*time.Millisecond)
 		})
 	}
 }
