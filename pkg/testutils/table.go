@@ -22,6 +22,7 @@ const testCleanupTimeout = 30 * time.Second
 type TestTable struct {
 	Name string
 	DB   *sql.DB
+	dsn  string
 }
 
 // NewTestTable creates a test table and registers cleanup to drop it
@@ -41,10 +42,10 @@ type TestTable struct {
 func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 	t.Helper()
 
-	tt := &TestTable{Name: name}
+	tt := &TestTable{Name: name, dsn: DSN()}
 
 	// Open a DB connection for this table (used for cleanup and verification).
-	db, err := sql.Open(driverName, DSN())
+	db, err := openBounded(tt.dsn)
 	require.NoError(t, err)
 	tt.DB = db
 
@@ -67,13 +68,15 @@ func NewTestTable(t *testing.T, name string, createSQL string) *TestTable {
 	})
 
 	// Drop any pre-existing table and Spirit artifacts.
-	require.NoError(t, tt.dropArtifacts(t.Context()), "removing stale artifacts for %q", name)
+	// Bounded: t.Context() is not canceled until the test ends.
+	setupCtx, cancelSetup := context.WithTimeout(t.Context(), testCleanupTimeout)
+	defer cancelSetup()
+	require.NoError(t, tt.dropArtifacts(setupCtx), "removing stale artifacts for %q", name)
 
 	cleanupArtifacts = true // Clean up even if CREATE fails.
 
 	// Create the table.
-	_, err = db.ExecContext(t.Context(), createSQL)
-	require.NoError(t, err)
+	require.NoError(t, execBounded(t.Context(), db, tt.dsn, createSQL))
 
 	return tt
 }
@@ -98,7 +101,7 @@ func (tt *TestTable) dropArtifacts(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
-		_, err := tt.DB.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", sqlescape.EscapeIdentifier(tbl)))
+		err := execBounded(ctx, tt.DB, tt.dsn, fmt.Sprintf("DROP TABLE IF EXISTS %s", sqlescape.EscapeIdentifier(tbl)))
 		if err != nil && !isIdentifierTooLongError(err) {
 			errs = append(errs, fmt.Errorf("dropping %q: %w", tbl, err))
 			if ctx.Err() != nil {

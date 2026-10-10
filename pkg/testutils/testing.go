@@ -103,7 +103,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	}
 	rootDSN := baseDSN[:lastSlash+1]
 
-	rootDB, err := sql.Open(driverName, rootDSN)
+	rootDB, err := openBounded(rootDSN)
 	require.NoError(t, err)
 	defer func() {
 		_ = rootDB.Close()
@@ -116,7 +116,7 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	var dbName string
 	for attempt := 1; ; attempt++ {
 		dbName = uniqueDatabaseName(t.Name(), os.Getpid(), dbCounter.Add(1))
-		_, err = rootDB.ExecContext(t.Context(), "CREATE DATABASE "+dbName)
+		err = execBounded(t.Context(), rootDB, rootDSN, "CREATE DATABASE "+dbName)
 		myErr, ok := errors.AsType[*mysql.MySQLError](err)
 		if !ok || myErr.Number != parsermysql.ErrDBCreateExists || attempt == 10 {
 			break
@@ -127,19 +127,20 @@ func CreateUniqueTestDatabase(t *testing.T) (string, *sql.DB) {
 	t.Log("test database:", dbName)
 
 	// Open a connection scoped to the new database
-	scopedDB, err := sql.Open(driverName, rootDSN+dbName)
+	scopedDB, err := openBounded(rootDSN + dbName)
 	require.NoError(t, err)
 
 	// Register cleanup to close the connection and drop the database
 	t.Cleanup(func() {
 		_ = scopedDB.Close()
-		cleanupDB, err := sql.Open(driverName, rootDSN)
+		cleanupDB, err := openBounded(rootDSN)
 		require.NoError(t, err)
 		defer func() {
 			_ = cleanupDB.Close()
 		}()
-		_, err = cleanupDB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+dbName)
-		require.NoError(t, err)
+		ctx, cancel := newTestCleanupContext()
+		defer cancel()
+		require.NoError(t, execBounded(ctx, cleanupDB, rootDSN, "DROP DATABASE IF EXISTS "+dbName))
 	})
 
 	return dbName, scopedDB
@@ -242,13 +243,12 @@ func isUnknownFunctionErr(err error) bool {
 func RunSQLInDatabase(t *testing.T, dbName, stmt string) {
 	t.Helper()
 	dsn := DSNForDatabase(dbName)
-	db, err := sql.Open(driverName, dsn)
+	db, err := openBounded(dsn)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
 	}()
-	_, err = db.ExecContext(t.Context(), stmt)
-	require.NoError(t, err)
+	require.NoError(t, execBounded(t.Context(), db, dsn, stmt))
 }
 
 // RunSQLInDatabaseAsRoot runs SQL in a specific database as the root user,
@@ -261,26 +261,26 @@ func RunSQLInDatabaseAsRoot(t *testing.T, dbName, stmt string) {
 	require.NoError(t, err)
 	cfg.User = "root"
 	cfg.DBName = dbName
-	db, err := sql.Open(driverName, cfg.FormatDSN())
+	rootDSN := cfg.FormatDSN()
+	db, err := openBounded(rootDSN)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
 	}()
 	// Might be run in cleanup, use Background context
-	_, err = db.ExecContext(context.Background(), stmt)
-	require.NoError(t, err)
+	require.NoError(t, execBounded(context.Background(), db, rootDSN, stmt))
 }
 
 func RunSQL(t *testing.T, stmt string) {
 	t.Helper()
-	db, err := sql.Open(driverName, DSN())
+	dsn := DSN()
+	db, err := openBounded(dsn)
 	require.NoError(t, err)
 	defer func() {
 		_ = db.Close()
 	}()
 	// Might be run in cleanup, use Background context
-	_, err = db.ExecContext(context.Background(), stmt)
-	require.NoError(t, err)
+	require.NoError(t, execBounded(context.Background(), db, dsn, stmt))
 }
 
 // WaitForReplicaHealthy polls SHOW REPLICA STATUS until both the IO and SQL
