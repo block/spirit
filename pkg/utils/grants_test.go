@@ -91,6 +91,38 @@ func TestDBLevelGrantCoversSchema(t *testing.T) {
 	assert.True(t, DBLevelGrantCoversSchema("GRANT ALL PRIVILEGES ON `app``one`.* TO `u`@`%`", "app`one"))
 }
 
+// TestDBLevelGrantsCoverSchema checks that the database-level grants are
+// evaluated together: MySQL applies one mysql.db row to a schema, so an
+// exact-name row with a smaller set can shadow a pattern row with the full set.
+func TestDBLevelGrantsCoverSchema(t *testing.T) {
+	const full = "ALTER, CREATE, DELETE, DROP, INDEX, INSERT, LOCK TABLES, SELECT, TRIGGER, UPDATE"
+	const partial = "SELECT, INSERT, UPDATE, DELETE"
+	grant := func(privs, db string) string {
+		return "GRANT " + privs + " ON `" + db + "`.* TO `u`@`%`"
+	}
+	tests := []struct {
+		name   string
+		grants []string
+		want   bool
+	}{
+		{"pattern only, full set", []string{grant(full, `app\_%`)}, true},
+		{"pattern only, ALL PRIVILEGES", []string{grant("ALL PRIVILEGES", `app\_%`)}, true},
+		{"exact partial shadows pattern full", []string{grant(full, `app\_%`), grant(partial, "app_1")}, false},
+		{"exact partial listed first", []string{grant(partial, "app_1"), grant(full, `app\_%`)}, false},
+		{"exact full and pattern full", []string{grant(full, `app\_%`), grant(full, "app_1")}, true},
+		{"exact full, pattern partial", []string{grant(partial, `app\_%`), grant(full, "app_1")}, false},
+		{"pattern partial only", []string{grant(partial, `app\_%`)}, false},
+		{"non-matching grants ignored", []string{grant(full, "app_1"), grant(partial, "other")}, true},
+		{"no grants", nil, false},
+		{"global grant is not database-level", []string{"GRANT " + full + " ON *.* TO `u`@`%`"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DBLevelGrantsCoverSchema(tc.grants, "app_1"))
+		})
+	}
+}
+
 func TestMySQLLikeMatch(t *testing.T) {
 	tests := []struct {
 		pattern string

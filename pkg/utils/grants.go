@@ -265,3 +265,27 @@ func StringContainsAll(s string, substrings ...string) bool {
 	}
 	return nonEmptyStringsFound
 }
+
+// DBLevelGrantsCoverSchema reports whether the database-level grants in
+// grants (SHOW GRANTS lines) confer the privileges spirit needs on schemaName
+// (see DBLevelGrantCoversSchema).
+//
+// MySQL applies one database-level grant (mysql.db row) to a schema, not the
+// union of every row whose name matches it, and SHOW GRANTS does not show
+// which one. An exact-name row can shadow a pattern row, so the matching lines
+// are grouped by granted name (see DBLevelGrantName) and every name must carry
+// the full set. It returns false if no database-level grant matches.
+func DBLevelGrantsCoverSchema(grants []string, schemaName string) bool {
+	covered := map[string]bool{}
+	for _, grant := range grants {
+		if name, ok := DBLevelGrantName(grant, schemaName); ok {
+			covered[name] = covered[name] || DBLevelGrantCoversSchema(grant, schemaName)
+		}
+	}
+	for _, ok := range covered {
+		if !ok {
+			return false
+		}
+	}
+	return len(covered) > 0
+}

@@ -115,12 +115,12 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 		if utils.StringContainsAll(grant, `ALTER`, `CREATE`, `DELETE`, `DROP`, `INDEX`, `INSERT`, `LOCK TABLES`, `SELECT`, `TRIGGER`, `UPDATE`, ` ON *.*`) {
 			foundDBAll = true
 		}
-		// A database-level grant covers the schema if its database-name pattern
-		// matches (including MySQL wildcards such as `strata_%`) and it confers
-		// either ALL PRIVILEGES or the full set spirit requires.
-		if schemaName != "" && utils.DBLevelGrantCoversSchema(grant, schemaName) {
-			foundDBAll = true
-		}
+	}
+	// Database-level grants are evaluated together: MySQL applies one
+	// database-level grant to the schema, not the union of every match, so
+	// every matching name (exact or pattern) must carry the full set.
+	if schemaName != "" && utils.DBLevelGrantsCoverSchema(grants, schemaName) {
+		foundDBAll = true
 	}
 	if foundAll {
 		return schemaObjectVisibilityFromGrants(grants, schemaName, allSchemaObjects...)
