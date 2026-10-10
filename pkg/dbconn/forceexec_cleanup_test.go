@@ -848,11 +848,16 @@ func TestForceExecKillsOnceAStatementStartsWaiting(t *testing.T) {
 			started := time.Now()
 			realWaiting := waitingOn(tt.DB)
 			var killedAfter time.Duration
+			// lastNotWaiting is when the last check that reported the
+			// statement as not waiting (or failed) returned. The kill worker
+			// restarts the delay just after each such check returns.
+			var lastNotWaiting time.Time
 			killCalls := 0
 			err = forceExec(ctx, db, config, slog.Default(),
 				"ALTER TABLE forceexec_late_wait ADD COLUMN c INT, ALGORITHM=INSTANT",
 				func(ctx context.Context, connID int) (bool, error) {
 					if time.Since(started) < tc.waitStartsAfter {
+						lastNotWaiting = time.Now()
 						if tc.checksFail {
 							return false, io.EOF
 						}
@@ -867,13 +872,12 @@ func TestForceExecKillsOnceAStatementStartsWaiting(t *testing.T) {
 				}, waitForKilledTransactions, nil)
 			require.NoError(t, err)
 			require.Equal(t, 1, killCalls)
-			// The blocker gets the kill delay, less at most one poll interval,
-			// measured from when the statement started waiting. A poll timer
-			// that fires late moves the last failed check, and so the start of
-			// the delay, earlier by the lateness, so allow some timer slack.
-			// A kill that ignored the delay would land about a second early.
-			const timerSlack = 20 * time.Millisecond
-			require.GreaterOrEqual(t, killedAfter, tc.waitStartsAfter+config.ForceKillAfter-killPollInterval-timerSlack)
+			// The blocker gets the full kill delay, measured from the last
+			// check that did not see the statement waiting. That check's time
+			// is observed rather than assumed from waitStartsAfter, because a
+			// poll timer that fires late moves it earlier (#1416).
+			require.False(t, lastNotWaiting.IsZero())
+			require.GreaterOrEqual(t, killedAfter, lastNotWaiting.Sub(started)+config.ForceKillAfter)
 		})
 	}
 }
