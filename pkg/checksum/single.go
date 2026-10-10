@@ -305,6 +305,14 @@ func (c *SingleChecker) initConnPool(ctx context.Context) error {
 	if err := c.feed.Flush(ctx); err != nil {
 		return err
 	}
+	// Open the checksum connections before the table lock. Opening one
+	// (TCP, TLS, authentication, and retries of a transient failure) is
+	// the slow part of building the pool and must not extend the lock.
+	// Their read-views are created under the lock, below.
+	trxPool, err := dbconn.OpenTrxPool(ctx, c.db, c.maxConcurrency, c.dbConfig, c.logger)
+	if err != nil {
+		return err
+	}
 	// Lock the source and target tables on a dedicated connection
 	// so the connection is not used by others
 	c.logger.Info("starting checksum operation, this will require a table lock")
@@ -312,18 +320,18 @@ func (c *SingleChecker) initConnPool(ctx context.Context) error {
 	// Always acquire lock on the read database
 	tableLock, err := dbconn.NewTableLock(ctx, c.db, c.chunker.Tables(), c.dbConfig, c.logger)
 	if err != nil {
-		return err
+		return errors.Join(err, trxPool.Close())
 	}
 	defer utils.CloseAndLogWithContext(ctx, tableLock)
 	// We only have a reader, so flush the read connection.
 	if err := c.feed.FlushUnderTableLock(ctx, []*dbconn.TableLock{tableLock}); err != nil {
-		return err
+		return errors.Join(err, trxPool.Close())
 	}
 
 	// Assert that the change set is empty. This should always
 	// be the case because we are under a lock.
 	if !c.feed.AllChangesFlushed() {
-		return change.ErrChangesNotFlushed
+		return errors.Join(change.ErrChangesNotFlushed, trxPool.Close())
 	}
 	// Create a set of connections which can be used to checksum
 	// The table. They MUST be created before the lock is released
@@ -339,10 +347,10 @@ func (c *SingleChecker) initConnPool(ctx context.Context) error {
 	// connection per idle transaction and nothing else: all of these read views
 	// pin history from the same instant, so the history list length floor is
 	// identical whether the autoscaler ends up using four of them or sixteen.
-	c.trxPool, err = dbconn.NewTrxPool(ctx, c.db, c.maxConcurrency, c.dbConfig, c.logger)
-	if err != nil {
+	if err := trxPool.Snapshot(ctx); err != nil {
 		return err
 	}
+	c.trxPool = trxPool
 
 	return nil
 }

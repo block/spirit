@@ -35,9 +35,11 @@ const (
 
 const (
 	// trxPoolBeginAttempts is the total number of attempts to establish one
-	// pool connection. NewTrxPool usually runs under table locks, so the
-	// retry budget must stay small: worst case it adds
-	// trxPoolBeginBackoff * (1 + 2) = 300ms per failing connection.
+	// pool connection in OpenTrxPool, with trxPoolBeginBackoff doubling
+	// between them. OpenTrxPool runs before the caller takes its table
+	// locks, so the backoff never extends a lock. Snapshot, which runs under
+	// the locks, never waits: it makes at most one immediate attempt to
+	// replace a connection that died in between.
 	trxPoolBeginAttempts = 3
 	trxPoolBeginBackoff  = 100 * time.Millisecond
 )
@@ -120,6 +122,7 @@ func beginTrx(ctx context.Context, db *sql.DB, logger *slog.Logger) (*sql.Tx, er
 type TrxPool struct {
 	sync.Mutex
 
+	db     *sql.DB // replaces a connection lost before Snapshot
 	trxs   []*sql.Tx
 	logger *slog.Logger
 	// createdAt is when pool creation completed: every snapshot is
@@ -137,6 +140,9 @@ type TrxPool struct {
 
 // NewTrxPool creates a pool of transactions which have already
 // had their read-view created in REPEATABLE READ isolation.
+// It is OpenTrxPool followed by Snapshot. A caller that takes table locks
+// so every snapshot sees the same point in time should call them
+// separately: OpenTrxPool before the locks, Snapshot under them.
 //
 // The pool is sized for the maximum concurrency the caller may ever scale up
 // to, so some transactions can sit unused for hours. An idle transaction
@@ -148,21 +154,61 @@ type TrxPool struct {
 // transactions are idle in the pool; it stops when ctx is canceled or the
 // pool is closed. A nil logger discards keepalive warnings.
 func NewTrxPool(ctx context.Context, db *sql.DB, count int, config *DBConfig, logger *slog.Logger) (*TrxPool, error) {
+	pool, err := OpenTrxPool(ctx, db, count, config, logger)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Snapshot(ctx); err != nil {
+		return nil, err
+	}
+	return pool, nil
+}
+
+// OpenTrxPool establishes count connections, each with a REPEATABLE READ
+// transaction open but no read-view yet. Call Snapshot to create the
+// read-views. Opening a connection (TCP, TLS and authentication) is the slow
+// and failure-prone part of building the pool, so OpenTrxPool does it before
+// the caller takes table locks, and retries transient failures with a short
+// backoff. The pool is unusable until Snapshot returns nil; Close it on any
+// error.
+func OpenTrxPool(ctx context.Context, db *sql.DB, count int, config *DBConfig, logger *slog.Logger) (*TrxPool, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	pool := &TrxPool{trxs: make([]*sql.Tx, 0, count), logger: logger}
+	pool := &TrxPool{db: db, trxs: make([]*sql.Tx, 0, count), logger: logger}
 	for range count {
-		// Only connection establishment is retried: transactions already in
-		// the pool keep their snapshots, and (when the caller holds table
-		// locks) the new one still sees the same point in time.
 		trx, err := beginTrx(ctx, db, logger)
 		if err != nil {
 			return nil, errors.Join(err, pool.Close())
 		}
 		pool.trxs = append(pool.trxs, trx)
-		if _, err := trx.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
-			return nil, errors.Join(err, pool.Close())
+	}
+	return pool, nil
+}
+
+// Snapshot creates the read-view of every transaction in the pool with
+// START TRANSACTION WITH CONSISTENT SNAPSHOT, then starts the keepalive.
+// Callers that need one point in time across the pool call it under table
+// locks, so it opens no connections and never sleeps. The one exception: a
+// connection that died after OpenTrxPool (e.g. while the caller waited for
+// its locks) is replaced with a single immediate attempt, the same cost as
+// building the pool under the locks. On error the pool is closed.
+func (p *TrxPool) Snapshot(ctx context.Context) error {
+	for i := range p.trxs {
+		_, err := p.trxs[i].ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT")
+		if err != nil && IsConnectionLossError(err) && ctx.Err() == nil {
+			p.logger.Warn("checksum connection was lost before its snapshot; replacing it", "error", err)
+			_ = p.trxs[i].Rollback()
+			var trx *sql.Tx
+			if trx, err = trxPoolBegin(ctx, p.db); err == nil {
+				p.trxs[i] = trx
+				_, err = trx.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT")
+			} else {
+				err = wrapTrxPoolBeginError(err)
+			}
+		}
+		if err != nil {
+			return errors.Join(err, p.Close())
 		}
 	}
 	// Timestamp the pool only after every snapshot is established, so that
@@ -170,21 +216,21 @@ func NewTrxPool(ctx context.Context, db *sql.DB, count int, config *DBConfig, lo
 	// age. Stamping before the loop would inflate it by the creation time
 	// and could suggest an age threshold (wait_timeout, a reaper) that no
 	// snapshot has actually reached.
-	pool.createdAt = time.Now()
-	if len(pool.trxs) > 0 {
+	p.createdAt = time.Now()
+	if len(p.trxs) > 0 {
 		// Derive the ping cadence from the session wait_timeout so the
 		// keepalive holds up however aggressively the server is configured.
 		// Every connection comes from the same DSN, so sampling one is enough.
 		var waitTimeout int
-		if err := pool.trxs[0].QueryRowContext(ctx, "SELECT @@wait_timeout").Scan(&waitTimeout); err != nil {
-			return nil, errors.Join(err, pool.Close())
+		if err := p.trxs[0].QueryRowContext(ctx, "SELECT @@wait_timeout").Scan(&waitTimeout); err != nil {
+			return errors.Join(err, p.Close())
 		}
 		keepaliveCtx, cancel := context.WithCancel(ctx)
-		pool.keepaliveCancel = cancel
-		pool.keepaliveDone = make(chan struct{})
-		go pool.keepalive(keepaliveCtx, keepaliveInterval(waitTimeout))
+		p.keepaliveCancel = cancel
+		p.keepaliveDone = make(chan struct{})
+		go p.keepalive(keepaliveCtx, keepaliveInterval(waitTimeout))
 	}
-	return pool, nil
+	return nil
 }
 
 // keepaliveInterval returns how often to ping the idle transactions in the
