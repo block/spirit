@@ -139,7 +139,11 @@ func sourcePrivileges(ctx context.Context, db querier, schemaName string, forceK
 	hasBasePrivileges := (foundSuper && foundReplicationSlave && foundDBAll) ||
 		(foundReplicationClient && foundReplicationSlave && foundDBAll && foundReload)
 	if !hasBasePrivileges {
-		return fmt.Errorf("insufficient privileges to run a move. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", schemaName)
+		err := fmt.Errorf("insufficient privileges to run a move. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", schemaName)
+		if note := utils.ShadowingGrantsNote(grants, schemaName); note != "" && !foundDBAll && schemaName != "" {
+			err = fmt.Errorf("%w (%s)", err, note)
+		}
+		return err
 	}
 	return schemaObjectVisibilityFromGrants(grants, schemaName, allSchemaObjects...)
 }
@@ -205,20 +209,9 @@ func (g schemaGrants) onSchema(privs ...string) bool {
 	if g.schema == "" {
 		return false
 	}
-	has := map[string]bool{}
-	for _, line := range g.lines {
-		name, ok := utils.DBLevelGrantName(line, g.schema)
-		if !ok {
-			continue
-		}
-		has[name] = has[name] || utils.DBLevelGrantHasAny(line, g.schema, privs...)
-	}
-	for _, ok := range has {
-		if !ok {
-			return false
-		}
-	}
-	return len(has) > 0
+	return utils.DBLevelGrantsAll(g.lines, g.schema, func(line string) bool {
+		return utils.DBLevelGrantHasAny(line, g.schema, privs...)
+	})
 }
 
 // sees reports whether the grants make every object of kind o in the schema

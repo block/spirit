@@ -437,9 +437,9 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 // TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant: MySQL applies
 // one database-level grant row to a schema, not the union of every row whose
 // name matches it. Here the exact-name grant (created first) is the one that
-// applies, so EVENT granted (with the base set) on a pattern that also matches the schema does not
-// reach it, and information_schema.EVENTS hides the schema's event. The
-// visibility check must not count the pattern's EVENT.
+// applies, so EVENT granted (with the base set) on a pattern that also matches
+// the schema does not reach it, and information_schema.EVENTS hides the
+// schema's event. The visibility check must not count the pattern's EVENT.
 func TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant(t *testing.T) {
 	schema, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")

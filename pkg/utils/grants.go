@@ -1,7 +1,9 @@
 package utils
 
 import (
+	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -266,26 +268,78 @@ func StringContainsAll(s string, substrings ...string) bool {
 	return nonEmptyStringsFound
 }
 
-// DBLevelGrantsCoverSchema reports whether the database-level grants in
-// grants (SHOW GRANTS lines) confer the privileges spirit needs on schemaName
-// (see DBLevelGrantCoversSchema).
+// dbLevelGrantsByName groups the database-level grants in grants whose name
+// matches schemaName by granted name (see DBLevelGrantName). A name maps to
+// true if ok is true for any of its lines: one name can appear on more than
+// one line, for example the user's own grant and one from an active role.
+func dbLevelGrantsByName(grants []string, schemaName string, ok func(grant string) bool) map[string]bool {
+	byName := map[string]bool{}
+	for _, grant := range grants {
+		if name, matches := DBLevelGrantName(grant, schemaName); matches {
+			byName[name] = byName[name] || ok(grant)
+		}
+	}
+	return byName
+}
+
+// DBLevelGrantsAll reports whether ok holds on every database-level grant name
+// that matches schemaName, where a name holds if ok is true for any of its
+// SHOW GRANTS lines. It returns false if no database-level grant matches.
 //
 // MySQL applies one database-level grant (mysql.db row) to a schema, not the
 // union of every row whose name matches it, and SHOW GRANTS does not show
 // which one. An exact-name row can shadow a pattern row, so the matching lines
-// are grouped by granted name (see DBLevelGrantName) and every name must carry
-// the full set. It returns false if no database-level grant matches.
-func DBLevelGrantsCoverSchema(grants []string, schemaName string) bool {
-	covered := map[string]bool{}
-	for _, grant := range grants {
-		if name, ok := DBLevelGrantName(grant, schemaName); ok {
-			covered[name] = covered[name] || DBLevelGrantCoversSchema(grant, schemaName)
-		}
-	}
-	for _, ok := range covered {
-		if !ok {
+// are grouped by granted name (see DBLevelGrantName) and every name must
+// satisfy ok.
+func DBLevelGrantsAll(grants []string, schemaName string, ok func(grant string) bool) bool {
+	byName := dbLevelGrantsByName(grants, schemaName, ok)
+	for _, held := range byName {
+		if !held {
 			return false
 		}
 	}
-	return len(covered) > 0
+	return len(byName) > 0
+}
+
+// DBLevelGrantsCoverSchema reports whether the database-level grants in
+// grants (SHOW GRANTS lines) confer the privileges spirit needs on schemaName
+// (see DBLevelGrantCoversSchema) on every matching granted name
+// (see DBLevelGrantsAll). It returns false if no database-level grant matches.
+func DBLevelGrantsCoverSchema(grants []string, schemaName string) bool {
+	return DBLevelGrantsAll(grants, schemaName, func(grant string) bool {
+		return DBLevelGrantCoversSchema(grant, schemaName)
+	})
+}
+
+// DBLevelGrantNamesLackingSet returns, sorted, the database-level granted names
+// that match schemaName but do not carry the full set spirit needs (see
+// DBLevelGrantCoversSchema) on any of their lines.
+func DBLevelGrantNamesLackingSet(grants []string, schemaName string) []string {
+	var lacking []string
+	for name, held := range dbLevelGrantsByName(grants, schemaName, func(grant string) bool {
+		return DBLevelGrantCoversSchema(grant, schemaName)
+	}) {
+		if !held {
+			lacking = append(lacking, name)
+		}
+	}
+	sort.Strings(lacking)
+	return lacking
+}
+
+// ShadowingGrantsNote explains a refusal for missing base privileges on
+// schemaName when a matching database-level grant lacks the full set: MySQL
+// may apply that grant to the schema instead of one that has it. It returns ""
+// if no matching database-level grant lacks the set.
+func ShadowingGrantsNote(grants []string, schemaName string) string {
+	lacking := DBLevelGrantNamesLackingSet(grants, schemaName)
+	if len(lacking) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(lacking))
+	for i, name := range lacking {
+		quoted[i] = "`" + name + "`.*"
+	}
+	return fmt.Sprintf("grants on %s also match %s and lack the full set; MySQL may apply that grant to %s instead of one that has it",
+		strings.Join(quoted, ", "), schemaName, schemaName)
 }

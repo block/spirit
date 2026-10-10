@@ -171,3 +171,50 @@ func TestPrivilegesWithRDSSuperuserRole(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, check())
 }
+
+// TestPrivilegesShadowedDatabaseGrant verifies that a pattern grant with the
+// full set does not satisfy the base privileges when an exact-name grant with a
+// smaller set also matches the schema: MySQL applies one database-level grant
+// to a schema, not the union, and SHOW GRANTS does not show which. The refusal
+// names the shadowing grant.
+func TestPrivilegesShadowedDatabaseGrant(t *testing.T) {
+	config, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	config.User = "root" // needs grant privilege
+	db, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	_, err = db.ExecContext(t.Context(), "DROP USER IF EXISTS testprivsshadow")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE USER testprivsshadow")
+	require.NoError(t, err)
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), "DROP USER IF EXISTS testprivsshadow")
+	}()
+	for _, stmt := range []string{
+		"GRANT ALL ON `tes%`.* TO testprivsshadow",
+		"GRANT SELECT ON `test`.* TO testprivsshadow",
+		"GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD, CONNECTION_ADMIN, PROCESS ON *.* TO testprivsshadow",
+		"GRANT SELECT ON `performance_schema`.* TO testprivsshadow",
+	} {
+		_, err = db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+
+	config.User = "testprivsshadow"
+	config.Passwd = ""
+	lowPrivDB, err := sql.Open("block-mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", config.User, config.Passwd, config.Addr, config.DBName))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(lowPrivDB)
+
+	r := Resources{
+		DB:    lowPrivDB,
+		Table: &table.TableInfo{TableName: "test", SchemaName: "test"},
+	}
+	err = privilegesCheck(t.Context(), r, slog.Default())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ALL on test.*")
+	require.Contains(t, err.Error(), "`test`.*")
+	require.Contains(t, err.Error(), "MySQL may apply that grant")
+}

@@ -85,5 +85,9 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 		return nil
 	}
 
-	return fmt.Errorf("insufficient privileges to run a migration. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", r.Table.SchemaName)
+	err = fmt.Errorf("insufficient privileges to run a migration. Needed: SUPER|REPLICATION CLIENT, RELOAD, REPLICATION SLAVE and ALL on %s.*", r.Table.SchemaName)
+	if note := utils.ShadowingGrantsNote(grants, r.Table.SchemaName); note != "" && !foundDBAll {
+		err = fmt.Errorf("%w (%s)", err, note)
+	}
+	return err
 }
