@@ -76,3 +76,62 @@ func TestDSNForDatabaseKeepsParameters(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, bounded, "lock_wait_timeout=5")
 }
+
+// TestHelperConnectionsAreBounded pins the wiring: the connections the
+// helpers open must carry the bounded lock_wait_timeout.
+func TestHelperConnectionsAreBounded(t *testing.T) {
+	want := int(helperLockWaitTimeout / time.Second)
+	read := func(db *sql.DB) int {
+		var got int
+		require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@session.lock_wait_timeout").Scan(&got))
+		return got
+	}
+
+	db, err := openBounded(DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	assert.Equal(t, want, read(db))
+
+	tt := NewTestTable(t, "testutils_wiring",
+		`CREATE TABLE testutils_wiring (id INT NOT NULL PRIMARY KEY)`)
+	assert.Equal(t, want, read(tt.DB))
+
+	// The DSN handed to spirit itself must stay unbounded.
+	plain, err := sql.Open(driverName, DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(plain)
+	assert.Greater(t, read(plain), want)
+}
+
+// TestDropArtifactsReportsLockHolders exercises the cleanup path from #1327:
+// dropArtifacts must surface the 1205 and the holder, not just a timeout.
+// tt.DB is swapped for a 1s-bounded handle to keep the test fast.
+func TestDropArtifactsReportsLockHolders(t *testing.T) {
+	tt := NewTestTable(t, "testutils_dropdiag",
+		`CREATE TABLE testutils_dropdiag (id INT NOT NULL PRIMARY KEY)`)
+
+	holder, err := tt.DB.Conn(t.Context())
+	require.NoError(t, err)
+	defer func() {
+		_, _ = holder.ExecContext(context.Background(), "UNLOCK TABLES")
+		_ = holder.Close()
+	}()
+	var holderID int64
+	require.NoError(t, holder.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&holderID))
+	_, err = holder.ExecContext(t.Context(), "LOCK TABLES testutils_dropdiag WRITE")
+	require.NoError(t, err)
+
+	dsn, err := boundedDSN(DSN(), time.Second)
+	require.NoError(t, err)
+	fast, err := sql.Open(driverName, dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(fast)
+	probe := &TestTable{Name: tt.Name, DB: fast, dsn: DSN()}
+
+	ctx, cancel := newTestCleanupContext()
+	defer cancel()
+	err = probe.dropArtifacts(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "metadata lock holders")
+	assert.Contains(t, err.Error(), fmt.Sprintf("processlist_id=%d", holderID))
+}
