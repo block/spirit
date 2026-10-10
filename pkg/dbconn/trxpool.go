@@ -2,9 +2,12 @@ package dbconn
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 )
@@ -29,6 +32,90 @@ const (
 	// hold the pool mutex (blocking Get/Put) indefinitely.
 	keepaliveRoundTimeout = 30 * time.Second
 )
+
+const (
+	// trxPoolBeginAttempts is the total number of attempts to establish one
+	// pool connection. NewTrxPool usually runs under table locks, so the
+	// retry budget must stay small: worst case it adds
+	// trxPoolBeginBackoff * (1 + 2) = 300ms per failing connection.
+	trxPoolBeginAttempts = 3
+	trxPoolBeginBackoff  = 100 * time.Millisecond
+)
+
+// trxPoolBegin opens one REPEATABLE READ transaction. It is a variable so
+// tests can inject connection-establishment failures deterministically.
+var trxPoolBegin = func(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
+	return db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+}
+
+// trxPoolSleep waits for d or until ctx is done. A variable so tests do not
+// have to sleep.
+var trxPoolSleep = func(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// isTLSHandshakeError reports whether err is a TLS record-header failure,
+// e.g. "tls: first record does not look like a TLS handshake". This happens
+// when the server answers the SSL switch with a plaintext packet (typically
+// an ERR such as "too many connections"), which hides the real error.
+func isTLSHandshakeError(err error) bool {
+	_, ok := errors.AsType[tls.RecordHeaderError](err)
+	return ok
+}
+
+// isTrxPoolTransient reports whether a failure to establish a connection is
+// worth retrying: lost connections, TLS handshake failures (a transient
+// server rejection) and network errors. Real server errors such as access
+// denied (1045) are not retried, and neither is a canceled context.
+func isTrxPoolTransient(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if IsConnectionLossError(err) || isTLSHandshakeError(err) {
+		return true
+	}
+	_, ok := errors.AsType[net.Error](err)
+	return ok
+}
+
+// wrapTrxPoolBeginError adds context to a TLS handshake failure, whose raw
+// message hides what actually went wrong. The error is still wrapped (%w).
+func wrapTrxPoolBeginError(err error) error {
+	if isTLSHandshakeError(err) {
+		return fmt.Errorf("TLS handshake failed while opening a checksum transaction; the server most likely rejected the connection during the handshake "+
+			"(e.g. too many connections, or a server/proxy that does not speak TLS): %w", err)
+	}
+	return err
+}
+
+// beginTrx establishes one pool transaction, retrying transient
+// connection-establishment failures a bounded number of times.
+func beginTrx(ctx context.Context, db *sql.DB, logger *slog.Logger) (*sql.Tx, error) {
+	var err error
+	for attempt := 1; attempt <= trxPoolBeginAttempts; attempt++ {
+		var trx *sql.Tx
+		trx, err = trxPoolBegin(ctx, db)
+		if err == nil {
+			return trx, nil
+		}
+		if attempt == trxPoolBeginAttempts || !isTrxPoolTransient(err) {
+			break
+		}
+		backoff := trxPoolBeginBackoff * time.Duration(1<<(attempt-1))
+		logger.Warn("failed to open checksum transaction, retrying", "error", err, "attempt", attempt, "backoff", backoff)
+		if sleepErr := trxPoolSleep(ctx, backoff); sleepErr != nil {
+			return nil, errors.Join(wrapTrxPoolBeginError(err), sleepErr)
+		}
+	}
+	return nil, wrapTrxPoolBeginError(err)
+}
 
 type TrxPool struct {
 	sync.Mutex
@@ -66,7 +153,10 @@ func NewTrxPool(ctx context.Context, db *sql.DB, count int, config *DBConfig, lo
 	}
 	pool := &TrxPool{trxs: make([]*sql.Tx, 0, count), logger: logger}
 	for range count {
-		trx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+		// Only connection establishment is retried: transactions already in
+		// the pool keep their snapshots, and (when the caller holds table
+		// locks) the new one still sees the same point in time.
+		trx, err := beginTrx(ctx, db, logger)
 		if err != nil {
 			return nil, errors.Join(err, pool.Close())
 		}
