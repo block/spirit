@@ -1,6 +1,7 @@
 package statement
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -177,6 +178,119 @@ func TestDeclarativeToImperativeWithOptions(t *testing.T) {
 	changes, err := DeclarativeToImperative(current, desired, NewDiffOptions())
 	require.NoError(t, err)
 	require.Empty(t, changes, "AUTO_INCREMENT differences should be ignored with default options")
+}
+
+// TestDeclarativeToImperative_DuplicateTableRefused: a schema that declares the
+// same table twice is refused instead of planned from whichever definition
+// came last. Under a case-insensitive target, names that differ only in case
+// are the same table; under lower_case_table_names=0 they are two tables.
+func TestDeclarativeToImperative_DuplicateTableRefused(t *testing.T) {
+	folding := NewDiffOptions()
+	folding.LowerCaseTableNames = 1
+	tests := []struct {
+		name    string
+		current []table.TableSchema
+		desired []table.TableSchema
+		opts    *DiffOptions
+		wantErr string
+	}{
+		{
+			name: "desired declares a table twice",
+			desired: []table.TableSchema{
+				{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY)"},
+				{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY, total INT)"},
+			},
+			opts:    NewDiffOptions(),
+			wantErr: `desired schema declares table "orders" more than once`,
+		},
+		{
+			name: "desired names one table in two cases on a case-insensitive target",
+			desired: []table.TableSchema{
+				{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY)"},
+				{Name: "Orders", Schema: "CREATE TABLE Orders (id INT PRIMARY KEY, total INT)"},
+			},
+			opts:    folding,
+			wantErr: `desired schema declares tables "orders" and "Orders", which are the same table when lower_case_table_names=1`,
+		},
+		{
+			name: "current lists one table twice",
+			current: []table.TableSchema{
+				{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY)"},
+				{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY)"},
+			},
+			opts:    nil,
+			wantErr: `current schema declares table "orders" more than once`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changes, err := DeclarativeToImperative(tt.current, tt.desired, tt.opts)
+			require.EqualError(t, err, tt.wantErr)
+			require.Nil(t, changes)
+		})
+	}
+
+	t.Run("names that differ in case are two tables on a case-sensitive target", func(t *testing.T) {
+		desired := []table.TableSchema{
+			{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY)"},
+			{Name: "Orders", Schema: "CREATE TABLE Orders (id INT PRIMARY KEY)"},
+		}
+		changes, err := DeclarativeToImperative(nil, desired, NewDiffOptions())
+		require.NoError(t, err)
+		require.Len(t, changes, 2)
+		assertChangesContain(t, changes, []string{"CREATE TABLE orders", "CREATE TABLE Orders"})
+	})
+}
+
+// TestDeclarativeToImperative_LowerCaseTableNames: on a target that compares
+// table names case-insensitively, a desired table matches the current table
+// whose name differs only in case. It is diffed under the name it exists by,
+// rather than created beside it (a CREATE MySQL refuses) and the existing one
+// dropped with its rows; dropped tables keep the case they exist in, and
+// foreign key references order new tables whatever case they are written in.
+func TestDeclarativeToImperative_LowerCaseTableNames(t *testing.T) {
+	for _, lctn := range []int{1, 2} {
+		opts := NewDiffOptions()
+		opts.LowerCaseTableNames = lctn
+
+		t.Run(fmt.Sprintf("lower_case_table_names=%d/case-only rename diffs the existing table", lctn), func(t *testing.T) {
+			current := []table.TableSchema{{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY)"}}
+			desired := []table.TableSchema{{Name: "Orders", Schema: "CREATE TABLE Orders (id INT PRIMARY KEY, total INT)"}}
+			changes, err := DeclarativeToImperative(current, desired, opts)
+			require.NoError(t, err)
+			require.Equal(t, []string{"ALTER TABLE `orders` ADD COLUMN `total` int NULL"}, statementsToStrings(changes))
+		})
+
+		t.Run(fmt.Sprintf("lower_case_table_names=%d/dropped table keeps its case", lctn), func(t *testing.T) {
+			current := []table.TableSchema{{Name: "Orders", Schema: "CREATE TABLE Orders (id INT PRIMARY KEY)"}}
+			changes, err := DeclarativeToImperative(current, nil, opts)
+			require.NoError(t, err)
+			require.Equal(t, []string{"DROP TABLE `Orders`"}, statementsToStrings(changes))
+		})
+
+		t.Run(fmt.Sprintf("lower_case_table_names=%d/reference in another case orders the creates", lctn), func(t *testing.T) {
+			desired := []table.TableSchema{
+				{Name: "child", Schema: "CREATE TABLE child (id INT PRIMARY KEY, pid INT, CONSTRAINT fk FOREIGN KEY (pid) REFERENCES Parent (id))"},
+				{Name: "parent", Schema: "CREATE TABLE parent (id INT PRIMARY KEY)"},
+			}
+			changes, err := DeclarativeToImperative(nil, desired, opts)
+			require.NoError(t, err)
+			require.Len(t, changes, 2)
+			require.Equal(t, "parent", changes[0].Table)
+			require.Equal(t, "child", changes[1].Table)
+		})
+	}
+
+	t.Run("lower_case_table_names=0 creates and drops", func(t *testing.T) {
+		current := []table.TableSchema{{Name: "orders", Schema: "CREATE TABLE orders (id INT PRIMARY KEY)"}}
+		desired := []table.TableSchema{{Name: "Orders", Schema: "CREATE TABLE Orders (id INT PRIMARY KEY, total INT)"}}
+		changes, err := DeclarativeToImperative(current, desired, NewDiffOptions())
+		require.NoError(t, err)
+		require.Len(t, changes, 2)
+		require.Equal(t, "Orders", changes[0].Table)
+		require.True(t, changes[0].IsCreateTable())
+		require.Equal(t, "DROP TABLE `orders`", changes[1].Statement)
+	})
 }
 
 // TestDeclarativeToImperative_PrimaryKeyDeclaresNull: a desired primary key
