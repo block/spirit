@@ -101,3 +101,23 @@ func (l *Lifecycle) Result() status.WorkflowResult {
 		TerminalOwnership: status.WorkflowTerminalOwnership(l.terminalOwnership.Load()),
 	}
 }
+
+// Teardown is the shared order of a runner's Close. It cancels the run as an
+// operator cancel (Cancel(nil)), waits for the run's background tasks, then
+// runs every step and joins their errors. wait is the status.WatchTask join;
+// nil means none started. The wait comes before any step, so a late
+// checkpoint write cannot land after Close has returned or reach a closed
+// pool. Every step runs even when an earlier one fails, so one failed close
+// does not leak the rest. Steps run in order: a runner closes its change feeds
+// before the throttler their UnderLoad callback reads, and the pools last.
+func (l *Lifecycle) Teardown(wait func(), steps ...func() error) error {
+	l.Cancel(nil)
+	if wait != nil {
+		wait()
+	}
+	errs := make([]error, 0, len(steps))
+	for _, step := range steps {
+		errs = append(errs, step())
+	}
+	return errors.Join(errs...)
+}

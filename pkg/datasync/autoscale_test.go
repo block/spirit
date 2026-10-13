@@ -13,6 +13,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/autoscale"
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/concurrency"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
@@ -205,40 +206,53 @@ func TestAutoscalingPreservesCallerConfig(t *testing.T) {
 	require.NoError(t, r.Close())
 }
 
-// Verification reads, repair writes and the change-feed flush share the
-// target pool, so the fitted ceilings must all fit in it at once.
-func TestSyncSharedTargetBudget(t *testing.T) {
-	fit := func(cores, client, connections int) (concurrency.Plan, bool) {
-		r, err := NewRunner(&Sync{Common: flags.Common{MaxConnections: connections}})
+// Verification reads share the target pool with the change-feed flush, the
+// checkpoint and metadata queries and the repair writes, so the read bounds are
+// fitted to what is left, with dbconn.ReadBoundsForPool as in migration and move.
+func TestSyncFitReadThreadsToPool(t *testing.T) {
+	fit := func(connections int, plan concurrency.Plan) *Runner {
+		r, err := NewRunner(&Sync{Common: flags.Common{Threads: 3, WriteThreads: 5, MaxConnections: connections}})
 		require.NoError(t, err)
-		plan, ok := concurrency.Derive(concurrency.Topology{VCPUs: []int{cores}}, client, true, true)
-		require.True(t, ok)
-		return r.fitAutoscaleToPool(plan)
+		if plan.Engaged {
+			engageAutoscaling(r, plan.ReadStart, plan.Copier())
+			r.flushConcurrency, r.flushBatchSize = plan.FlushConcurrency, plan.FlushBatchSize
+		}
+		r.fitReadThreadsToPool()
+		return r
 	}
 	for _, cores := range []int{4, 16, 192} {
 		for _, client := range []int{1, 4, 64, 256} {
 			for _, connections := range []int{8, 16, 128, 256} {
-				plan, ok := fit(cores, client, connections)
-				if !ok {
-					require.Less(t, connections-plan.FlushConcurrency-6, 2)
-					continue
-				}
-				require.LessOrEqual(t, plan.MaxReadThreads+plan.MaxWriteThreads+plan.FlushConcurrency+6, connections)
-				require.Positive(t, plan.ReadStart)
-				require.LessOrEqual(t, plan.ReadStart, plan.MaxReadThreads)
-				require.LessOrEqual(t, plan.WriteStart, plan.MaxWriteThreads)
+				plan, ok := concurrency.Derive(concurrency.Topology{VCPUs: []int{cores}}, client, true, true)
+				require.True(t, ok)
+				r := fit(connections, plan)
+				reserve := plan.FlushConcurrency + targetMetadataConns + plan.WriteStart
+				require.Positive(t, r.sync.Threads)
+				require.LessOrEqual(t, r.sync.Threads, r.autoscale.MaxReadThreads)
+				require.LessOrEqual(t, r.autoscale.MaxReadThreads, max(1, connections-reserve))
+				require.LessOrEqual(t, r.autoscale.MaxReadThreads, plan.MaxReadThreads)
+				require.Equal(t, plan.MaxWriteThreads, r.autoscale.MaxThreads, "the write ceiling is not fitted")
 			}
 		}
 	}
 	// A pool large enough not to bind leaves the derived bounds alone.
-	plan, ok := fit(16, 64, 128)
+	plan, ok := concurrency.Derive(concurrency.Topology{VCPUs: []int{16}}, 64, true, true)
 	require.True(t, ok)
-	require.Equal(t, 4, plan.ReadStart)
-	require.Equal(t, 8, plan.MaxReadThreads)
-	require.Equal(t, 14, plan.WriteStart)
-	require.Equal(t, 28, plan.MaxWriteThreads)
-	require.Equal(t, 14, plan.FlushConcurrency)
-	require.Equal(t, 571, plan.FlushBatchSize)
+	r := fit(128, plan)
+	require.Equal(t, plan.ReadStart, r.sync.Threads)
+	require.Equal(t, plan.MaxReadThreads, r.autoscale.MaxReadThreads)
+
+	// Without autoscaling the configured --threads is fitted too, against the
+	// change package's default flush width.
+	r = fit(change.DefaultFlushConcurrency+targetMetadataConns+5+2, concurrency.Plan{})
+	require.Equal(t, 2, r.sync.Threads)
+	require.False(t, r.autoscale.Enabled)
+	// A pool too small for the reserve keeps one reader so the sync progresses.
+	r = fit(8, concurrency.Plan{})
+	require.Equal(t, 1, r.sync.Threads)
+	// The default pool leaves the configured count alone.
+	r = fit(dbconn.DefaultMaxConnections, concurrency.Plan{})
+	require.Equal(t, 3, r.sync.Threads)
 }
 
 // The Aurora load throttlers pace the sync whether or not autoscaling is

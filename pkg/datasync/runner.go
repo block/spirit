@@ -38,6 +38,10 @@ import (
 // because the source may be read-only (e.g. a Vitess replica).
 const syncCheckpointTableName = "_spirit_sync_checkpoint"
 
+// targetMetadataConns is what fitReadThreadsToPool keeps free on the target
+// pool for the checkpoint and metadata queries.
+const targetMetadataConns = 6
+
 // shutdownFlushTimeout bounds the best-effort final flush on a clean shutdown,
 // and shutdownCheckpointTimeout bounds the final checkpoint write (kept
 // independent so a slow flush can't starve the checkpoint). A write the server
@@ -560,12 +564,6 @@ func (r *Runner) runChecksum(ctx context.Context) error {
 		}
 	}()
 
-	// The copy controller has exited. Keep write scaling alive for the
-	// initial verification's repairs, and join it before stopping the applier
-	// (the deferred call covers an early return; a second call is a no-op).
-	stopScaling := copier.StartWriteAutoscaler(ctx, r.currentLoadSignal(), r.applier, r.autoscale, r.logger, r.metricsSink)
-	defer stopScaling()
-
 	built, err := checksum.NewChecker([]*sql.DB{r.source.db}, chunker, []change.Source{r.replClient}, r.checksumConfig())
 	if err != nil {
 		return fmt.Errorf("construct lockless checker: %w", err)
@@ -602,12 +600,11 @@ func (r *Runner) runChecksum(ctx context.Context) error {
 		return err
 	}
 	// RunContinuous resets the per-run counters, so keep the initial
-	// verification's; and it never repairs, so stop the repair write scaling.
+	// verification's.
 	r.progMu.Lock()
 	r.initialChecksumStats = checker.Stats()
 	r.initialChecksumDone = true
 	r.progMu.Unlock()
-	stopScaling()
 	// Continuous verification: passes keep running until ctx is cancelled.
 	// RunContinuous reports a cancellation as nil; any other error is real.
 	return checker.RunContinuous(ctx)
@@ -744,6 +741,7 @@ func (r *Runner) setup(ctx context.Context) error {
 	if err := r.setupThrottling(ctx); err != nil {
 		return err
 	}
+	r.fitReadThreadsToPool()
 
 	r.logger.Info("Creating applier")
 	appl, err := r.createApplier()
@@ -896,7 +894,6 @@ func (r *Runner) openLoadSignal(ctx context.Context, result throttler.AuroraResu
 func (r *Runner) setupAutoscaling(ctx context.Context, result throttler.AuroraResult) error {
 	plan, err := concurrency.Engage(ctx, &r.sync.Common, concurrency.Request{
 		Targets: []concurrency.Target{{DB: r.target.DB, Aurora: result}},
-		Fit:     r.fitAutoscaleToPool,
 		VCPUs:   r.auroraVCPUs,
 		Logger:  r.logger,
 	})
@@ -909,16 +906,34 @@ func (r *Runner) setupAutoscaling(ctx context.Context, result throttler.AuroraRe
 	return nil
 }
 
-// fitAutoscaleToPool partitions the target pool between verification reads and
-// repair writes, which share it. It reserves the entire change-feed flush plus
-// six checkpoint/metadata connections, then splits the remainder so both
-// worker ceilings fit simultaneously.
-func (r *Runner) fitAutoscaleToPool(plan concurrency.Plan) (concurrency.Plan, bool) {
-	available := r.sync.MaxConnections - plan.FlushConcurrency - 6
-	if available < 2 {
-		return plan, false
+// fitReadThreadsToPool fits the read bounds to the target pool with
+// dbconn.ReadBoundsForPool, as migration and move do. Verification reads share
+// that pool with the change-feed flush, the checkpoint and metadata queries,
+// and the repairs, which write at the applier's starting count
+// (--write-threads). The copy runs before verification and reads the source,
+// so its write workers are not reserved: like migration and move, a write
+// ceiling above the pool waits for connections.
+func (r *Runner) fitReadThreadsToPool() {
+	flush := r.flushConcurrency
+	if flush <= 0 {
+		flush = change.DefaultFlushConcurrency
 	}
-	return plan.Cap(available/2, available-available/2), true
+	reserve := flush + targetMetadataConns + r.sync.WriteThreads
+	ceiling := r.sync.Threads
+	if r.autoscale.Enabled {
+		ceiling = max(ceiling, r.autoscale.MaxReadThreads)
+	}
+	start, fitCeiling := dbconn.ReadBoundsForPool(r.sync.Threads, ceiling, r.sync.MaxConnections, reserve, 1)
+	if start != r.sync.Threads || fitCeiling != ceiling {
+		r.logger.Info("fitting read threads to the target connection pool",
+			"threads", r.sync.Threads, "capped_threads", start,
+			"read_ceiling", ceiling, "capped_read_ceiling", fitCeiling,
+			"max_connections", r.sync.MaxConnections, "reserved", reserve)
+	}
+	r.sync.Threads = start
+	if r.autoscale.Enabled {
+		r.autoscale.MaxReadThreads = fitCeiling
+	}
 }
 
 func (r *Runner) currentLoadSignal() throttler.Throttler {
@@ -1805,45 +1820,49 @@ func (r *Runner) fatal() error {
 // calls change.Source.Close (documented idempotent) to release the
 // runner's reference.
 func (r *Runner) Close() error {
-	r.Cancel()
-	// Wait for the status + checkpoint goroutines (status.WatchTask) to exit
-	// before tearing down connections, so a late DumpCheckpoint can't run
-	// against a closed pool.
-	if r.watchTaskWait != nil {
-		r.watchTaskWait()
-	}
-	if r.replClient != nil {
-		r.replClient.StopPeriodicFlush()
-		r.replClient.Close()
-	}
-	// Run every cleanup step unconditionally and collect errors with
-	// errors.Join. Previously the first failing step short-circuited the
-	// rest, leaking the remaining DB pools (the target and source handles).
-	// The individual close calls are independent enough that running them
-	// all does no harm.
-	var errs []error
-	if r.loadSignal != nil {
-		errs = append(errs, r.loadSignal.Close())
-	}
-	if r.monitorDB != nil {
-		errs = append(errs, r.monitorDB.Close())
-	}
-	if r.copyChunker != nil {
-		if err := r.copyChunker.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if r.ownsTarget && r.target.DB != nil {
-		if err := r.target.DB.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if r.source.db != nil {
-		if err := r.source.db.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	// Teardown cancels the run and waits for the status + checkpoint
+	// goroutines (status.WatchTask) to exit before tearing down connections,
+	// so a late DumpCheckpoint can't run against a closed pool.
+	return r.lifecycle.Teardown(r.watchTaskWait,
+		func() error {
+			if r.replClient != nil {
+				r.replClient.StopPeriodicFlush()
+				r.replClient.Close()
+			}
+			return nil
+		},
+		func() error {
+			if r.loadSignal == nil {
+				return nil
+			}
+			return r.loadSignal.Close()
+		},
+		// After the load signal, so its pollers stop before their pool closes.
+		func() error {
+			if r.monitorDB == nil {
+				return nil
+			}
+			return r.monitorDB.Close()
+		},
+		func() error {
+			if r.copyChunker == nil {
+				return nil
+			}
+			return r.copyChunker.Close()
+		},
+		func() error {
+			if !r.ownsTarget || r.target.DB == nil {
+				return nil
+			}
+			return r.target.DB.Close()
+		},
+		func() error {
+			if r.source.db == nil {
+				return nil
+			}
+			return r.source.db.Close()
+		},
+	)
 }
 
 // --- progress-field setters (guard the fields the status.Task accessors read) ---

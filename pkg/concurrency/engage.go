@@ -5,13 +5,14 @@
 // small to scale it selects small-instance mode instead, which fixes every pool at
 // one worker and shrinks the copy chunks. Either way, on Aurora the thread
 // counts come from the instance, not from --threads and --write-threads,
-// except where autoscaling falls back (a failed probe, a non-Aurora sibling
-// target, or a pool Fit refuses).
+// except where autoscaling falls back (a failed probe or a non-Aurora sibling
+// target).
 //
 // The three runners used to each derive these with their own copy of the
 // rules. What stays with each runner is genuinely topology-specific: which
-// servers it watches, how many targets share each one, and how its connection
-// pools are budgeted (Request.Fit).
+// servers it watches and how many targets share each one. Fitting the bounds
+// to a runner's connection pool is the runner's, after Engage
+// (dbconn.ReadBoundsForPool).
 package concurrency
 
 import (
@@ -54,10 +55,6 @@ type Request struct {
 	// Sources is how many change feeds fan their flushes out to the targets.
 	// Zero means one.
 	Sources int
-	// Fit, when set, fits the derived plan to the runner's connection budget.
-	// Returning false disables autoscaling: the pool cannot hold the bounds.
-	Fit func(Plan) (Plan, bool)
-
 	// VCPUs reads a target's vCPU count. Nil means throttler.AuroraVCPUs; tests
 	// replace it because CI has no Aurora instance.
 	VCPUs func(context.Context, *sql.DB) (int, error)
@@ -103,16 +100,6 @@ func (p Plan) Copier() copier.AutoscaleConfig {
 		MaxThreads:     p.MaxWriteThreads,
 		MaxReadThreads: p.MaxReadThreads,
 	}
-}
-
-// Cap lowers every read bound to at most read and every write bound to at most
-// write. Both must be positive. It is the building block for Request.Fit.
-func (p Plan) Cap(read, write int) Plan {
-	p.ReadStart = min(p.ReadStart, read)
-	p.MaxReadThreads = min(p.MaxReadThreads, read)
-	p.WriteStart = min(p.WriteStart, write)
-	p.MaxWriteThreads = min(p.MaxWriteThreads, write)
-	return p
 }
 
 // Topology describes the servers a plan is sized for.
@@ -321,14 +308,6 @@ func engage(ctx context.Context, f *flags.Common, req Request, clientCeiling int
 			"client_ceiling", clientCeiling,
 			"read_threads", plan.ReadStart, "instance_read_threads", uncapped.ReadStart,
 			"write_threads", plan.WriteStart, "instance_write_threads", uncapped.WriteStart)
-	}
-	if req.Fit != nil {
-		if plan, ok = req.Fit(plan); !ok {
-			logger.Warn("autoscaling disabled: the connection pool cannot hold the derived thread bounds; thread counts stay as configured",
-				"max_connections", f.MaxConnections,
-				"threads", f.Threads, "write_threads", f.WriteThreads)
-			return Plan{}, nil
-		}
 	}
 
 	// Autoscaling has engaged, so it owns the thread counts. The alternative —

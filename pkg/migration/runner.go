@@ -233,18 +233,18 @@ const drainReserveConns = 1
 // checksumPhaseReserve is the number of connections that must stay checkout-able
 // while the checksum holds its read transactions open.
 //
-// The checksum is the only phase that pins connections rather than borrowing
-// them: every transaction in its pool holds one for the whole phase whether or
-// not a worker has it checked out. So anything that has to keep running
+// The legacy checksum (--legacy-checksum, SingleChecker) is the only phase that
+// pins connections rather than borrowing them: every transaction in its pool
+// holds one for the whole phase whether or not a worker has it checked out. So anything that has to keep running
 // alongside it needs its share carved out of the pool up front — the checksum's
 // own off-pool queries (checksumOffPoolConns), the control-plane queries, and
 // the drain. The copier and applier are not in the reserve because they have
 // finished by the time the checksum starts.
 //
-// Lockless verification pins nothing — it borrows a connection per read and
-// gives it straight back — so the reserve is strictly conservative for it and
-// is deliberately not narrowed: the flag is experimental, and an over-reserved
-// pool costs read concurrency while an under-reserved one costs a stalled
+// Lockless verification, the default, pins nothing — it borrows a connection
+// per read and gives it straight back — so the reserve is strictly
+// conservative for it and is deliberately not narrowed: an over-reserved pool
+// costs read concurrency while an under-reserved one costs a stalled
 // migration.
 func (r *Runner) checksumPhaseReserve() int {
 	return checksumOffPoolConns + r.controlPlaneConns() + drainReserveConns
@@ -1424,69 +1424,65 @@ func (r *Runner) Progress() status.Progress {
 
 func (r *Runner) Close() error {
 	r.status.Set(status.Close)
-	// Cancel the migration context so background goroutines started in
-	// startBackgroundRoutines (notably the status.WatchTask checkpoint
-	// dumper) observe ctx.Done() and exit. This is normally already done
-	// by Run's deferred cancel, but Close() may be called via paths that
-	// don't run that defer; calling it here is idempotent and cheap.
-	r.Cancel()
-	// Wait for the status/checkpoint dumper goroutines to exit *before*
-	// tearing down the database connection, so a late DumpCheckpoint INSERT
-	// cannot land in the checkpoint table after the caller assumes Close()
-	// has fully quiesced the runner.
-	if r.watchTaskWait != nil {
-		r.watchTaskWait()
-	}
-	// Run every cleanup step unconditionally and collect errors with
-	// errors.Join. Previously the first failing step short-circuited the
-	// rest, leaking the repl client's binlog reader goroutine, the
-	// throttler, replica DB handles, and finally the primary DB pool. The
-	// individual close calls are independent enough that running them all
-	// out of order does no harm.
-	var errs []error
-	for _, change := range r.changes {
-		if err := change.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if r.replClient != nil {
-		r.replClient.Close()
-	}
-	// Stop the applier's async write workers. After a completed copy this is
-	// a no-op (the copier's Run already stopped them; Stop is idempotent),
-	// but paths that never reach or never finish the copy — early failures,
-	// and tests stepping the copy incrementally via CopyChunk — would
-	// otherwise leak the worker goroutines. The replication client's
-	// synchronous applier methods are unaffected by Stop, and it has already
-	// been closed above.
-	if r.applier != nil {
-		if err := r.applier.Stop(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if t := r.throttler.Get(); t != nil {
-		if err := t.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	// Close the Aurora monitor pool after the throttler so its background
-	// pollers observe Close() / ctx cancellation before we yank the pool
-	// out from under them. No-op when not Aurora.
-	if r.monitorDB != nil {
-		if err := r.monitorDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
-		r.monitorDB = nil
-	}
-	if err := r.closeReplicas(); err != nil {
-		errs = append(errs, err)
-	}
-	if r.db != nil {
-		if err := r.db.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	// Teardown cancels the migration context so the background goroutines
+	// started in startBackgroundRoutines (notably the status.WatchTask
+	// checkpoint dumper) exit, and waits for them before any step, so a late
+	// DumpCheckpoint INSERT cannot land in the checkpoint table after the
+	// caller assumes Close() has fully quiesced the runner. Run's deferred
+	// cancel normally got there first; Close may be called via paths that
+	// don't run it.
+	return r.lifecycle.Teardown(r.watchTaskWait,
+		func() error {
+			var errs []error
+			for _, change := range r.changes {
+				errs = append(errs, change.Close())
+			}
+			return errors.Join(errs...)
+		},
+		func() error {
+			if r.replClient != nil {
+				r.replClient.Close()
+			}
+			return nil
+		},
+		// Stop the applier's async write workers. After a completed copy this
+		// is a no-op (the copier's Run already stopped them; Stop is
+		// idempotent), but paths that never reach or never finish the copy —
+		// early failures, and tests stepping the copy incrementally via
+		// CopyChunk — would otherwise leak the worker goroutines. The
+		// replication client's synchronous applier methods are unaffected by
+		// Stop, and it has already been closed above.
+		func() error {
+			if r.applier == nil {
+				return nil
+			}
+			return r.applier.Stop()
+		},
+		func() error {
+			if t := r.throttler.Get(); t != nil {
+				return t.Close()
+			}
+			return nil
+		},
+		// Close the Aurora monitor pool after the throttler so its background
+		// pollers observe Close() / ctx cancellation before we yank the pool
+		// out from under them. No-op when not Aurora.
+		func() error {
+			if r.monitorDB == nil {
+				return nil
+			}
+			err := r.monitorDB.Close()
+			r.monitorDB = nil
+			return err
+		},
+		r.closeReplicas,
+		func() error {
+			if r.db == nil {
+				return nil
+			}
+			return r.db.Close()
+		},
+	)
 }
 
 func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {

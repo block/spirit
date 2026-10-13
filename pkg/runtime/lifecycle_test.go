@@ -118,3 +118,31 @@ func TestSharedThrottlerConcurrent(t *testing.T) {
 	wg.Wait()
 	require.Same(t, mock, s.Get())
 }
+
+// TestLifecycleTeardown pins Close's order: cancel, then wait, then every step
+// in order, each running even after an earlier one fails.
+func TestLifecycleTeardown(t *testing.T) {
+	var l Lifecycle
+	ctx, end := l.Begin(t.Context())
+	var order []string
+	first, second := errors.New("first"), errors.New("second")
+	err := l.Teardown(
+		func() {
+			require.ErrorIs(t, ctx.Err(), context.Canceled, "the run is cancelled before the wait")
+			order = append(order, "wait")
+		},
+		func() error { order = append(order, "a"); return first },
+		func() error { order = append(order, "b"); return nil },
+		func() error { order = append(order, "c"); return second },
+	)
+	require.Equal(t, []string{"wait", "a", "b", "c"}, order)
+	require.ErrorIs(t, err, first)
+	require.ErrorIs(t, err, second)
+	var retErr error
+	end(&retErr)
+	require.NoError(t, retErr, "Teardown's cancel is an operator cancel, not a fatal cause")
+
+	// Before Begin, and with nothing to wait for.
+	var unstarted Lifecycle
+	require.NoError(t, unstarted.Teardown(nil))
+}

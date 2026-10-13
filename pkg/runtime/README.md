@@ -17,7 +17,7 @@ The name matches the standard library's `runtime` package. A file that needs bot
 |---|---|---|
 | `Snapshot`, `Source` | Two copies of the periodic `Status()` block, `Progress()` and its throttle status | migration, move |
 | `FatalGate` | Two copies of the fatal change-feed handler (`change.ClientConfig.CancelFunc`) | migration, move |
-| `Lifecycle` | Three copies of the cancel function a `Run` invocation publishes, the opening lines of `Run`, and the evidence behind `Result()` | migration, move, datasync |
+| `Lifecycle` | Three copies of the cancel function a `Run` invocation publishes, the opening lines of `Run`, the evidence behind `Result()`, and the order of `Close` (`Teardown`) | migration, move, datasync |
 | `SharedThrottler` | Two copies of the mutex-guarded throttler that setup resolves | migration, move |
 | `RecordCopyCompleted` | Three identical copies of the copy aggregate reported when the copy ends | migration, move, datasync |
 | `RetryCutover` | Two copies of the cutover attempt loop, one with a backoff and joined attempt errors and one without | migration, move |
@@ -65,6 +65,8 @@ The evidence is recorded after the substitution, so it is the evidence of the er
 
 `Lifecycle` is a named field and is not embedded. Each runner forwards its own `Cancel`, `Abort` and `Result` to it. As a result, the runner's public API does not gain `MarkDurableMutation`, `SetTerminalOwnership` or `RecordError`. Datasync uses only the cancel side; it reports no `Result`. Tests that drive phases without calling `Run` use `SetCancel`.
 
+`Teardown` is the body of each runner's `Close`. It cancels the run (an operator cancel), waits for the status and checkpoint goroutines, then runs every step the runner passes, in order, and joins their errors. A failed step does not skip the rest. The wait comes first so a late checkpoint write cannot reach a closed pool. The steps stay with each runner because each owns different resources.
+
 ### `SharedThrottler`
 
 This holds the throttler that setup resolves partway through. `Progress` and the change feed's `UnderLoad` callback may already be reading it at that point. Datasync reads its own load signal under `progMu`, so it does not use this.
@@ -87,11 +89,9 @@ The loop does not cover move's rename retries under the source locks (`renameRet
 
 ## What does not live here (yet)
 
-These parts of the runners are still duplicated or still differ. The last two are tracked in `AGENTS.md` ("Not yet unified").
+These parts of the runners are still duplicated or still differ.
 
 - **`DumpCheckpoint` in migration and move.** The two share a skeleton, including the rule for which states may persist checksum evidence. They differ only in the position and in the record fields.
 - **`invalidateChecksumWatermark`.** It runs raw SQL that belongs in `pkg/checkpoint`.
-- **`Close` teardown.** Each runner owns different resources. The order of the steps is shared, but the code is not.
-- **Aurora autoscaling details** that `pkg/concurrency` does not cover.
 
 When you find another copy, extract it here, or into the subsystem package it belongs to. Then add a row to the table above and to the shared-table section of `AGENTS.md`.

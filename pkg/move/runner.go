@@ -236,60 +236,68 @@ func (r *Runner) runCopy(ctx context.Context) error {
 }
 
 func (r *Runner) Close() error {
-	// Cancel the runner context so background goroutines (status.WatchTask)
-	// observe ctx.Done() and exit. Idempotent.
-	r.lifecycle.Cancel(nil)
-	// Wait for the status/checkpoint dumper goroutines to exit before
-	// tearing down connections, so a late DumpCheckpoint cannot race with
-	// post-Close cleanup.
-	if r.watchTaskWait != nil {
-		r.watchTaskWait()
-	}
-	// Run every cleanup step unconditionally and collect errors with
-	// errors.Join. Previously the first failing step short-circuited the
-	// rest, leaking the remaining repl clients' binlog reader goroutines
-	// and the target DB handles.
-	var errs []error
-	if t := r.throttler.Get(); t != nil {
-		errs = append(errs, t.Close())
-	}
-	for _, db := range r.monitorDBs {
-		errs = append(errs, db.Close())
-	}
-	if r.copyChunker != nil {
-		if err := r.copyChunker.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	// The checksum chunker outlives runChecksum: the sentinel wait reuses
-	// r.checker, and with it this chunker, for continuous verification.
-	if r.checksumChunker != nil {
-		if err := r.checksumChunker.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	for i := range r.sources {
-		if r.sources[i].replClient != nil {
-			r.sources[i].replClient.Close()
-		}
-	}
-	// Stop the applier's async write workers, as migration does. The copier's
-	// Run stops them when it returns (Stop is idempotent), so this matters only
-	// to a path that started them some other way and never stopped them.
-	if r.applier != nil {
-		if err := r.applier.Stop(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	for _, target := range r.targets {
-		if target.DB == nil {
-			continue
-		}
-		if err := target.DB.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	// Teardown cancels the runner context so background goroutines
+	// (status.WatchTask) exit, and waits for them before tearing down
+	// connections, so a late DumpCheckpoint cannot race with post-Close
+	// cleanup. The change feeds close before the throttler, which their
+	// UnderLoad callback reads, as in migration and datasync.
+	return r.lifecycle.Teardown(r.watchTaskWait,
+		func() error {
+			for i := range r.sources {
+				if r.sources[i].replClient != nil {
+					r.sources[i].replClient.Close()
+				}
+			}
+			return nil
+		},
+		// Stop the applier's async write workers, as migration does. The
+		// copier's Run stops them when it returns (Stop is idempotent), so
+		// this matters only to a path that started them some other way and
+		// never stopped them.
+		func() error {
+			if r.applier == nil {
+				return nil
+			}
+			return r.applier.Stop()
+		},
+		func() error {
+			if t := r.throttler.Get(); t != nil {
+				return t.Close()
+			}
+			return nil
+		},
+		// After the throttler, so its pollers stop before their pools close.
+		func() error {
+			var errs []error
+			for _, db := range r.monitorDBs {
+				errs = append(errs, db.Close())
+			}
+			return errors.Join(errs...)
+		},
+		func() error {
+			if r.copyChunker == nil {
+				return nil
+			}
+			return r.copyChunker.Close()
+		},
+		// The checksum chunker outlives runChecksum: the sentinel wait reuses
+		// r.checker, and with it this chunker, for continuous verification.
+		func() error {
+			if r.checksumChunker == nil {
+				return nil
+			}
+			return r.checksumChunker.Close()
+		},
+		func() error {
+			var errs []error
+			for _, target := range r.targets {
+				if target.DB != nil {
+					errs = append(errs, target.DB.Close())
+				}
+			}
+			return errors.Join(errs...)
+		},
+	)
 }
 
 // getTables connects to a source DB and fetches the list of tables.

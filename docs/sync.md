@@ -240,7 +240,7 @@ The default of `100ms` is intentionally a high upper bound, so it trims only the
 
 ### max-connections
 
-`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). With autoscaling disabled, worker counts may exceed the budget and wait for connections. Autoscaling partitions the target pool between checksum reads and repair writes, reserving the derived replication flush width plus six connections for checkpoints and metadata. Pools too small for that reservation keep configured concurrency. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
+`--max-connections` sets the fixed size of each source and target SQL pool (default `128`, matching `migrate` and `move`). Checksum reads are fitted to the target pool, as in `migrate` and `move`: the sync reserves the replication flush width, six connections for checkpoints and metadata, and `--write-threads` for repair writes, and caps the read threads (and, under autoscaling, the read ceiling) to what is left, keeping at least one. Copy write workers are not fitted; above the budget they wait for connections. It also applies to a supplied target handle; additional connections owned by a custom applier are outside this limit. Zero in the Go API selects the default; negative values are rejected.
 
 Sync’s continuous checker uses ordinary reads rather than pinned snapshot pools, and sync has no cutover. It therefore does not require move’s checksum/cutover headroom or lower configured read concurrency to fit that headroom.
 

@@ -40,11 +40,12 @@ func ValidateMaxConnections(maxConnections, readers, reserve int) error {
 }
 
 // ReadBoundsForPool fits BOTH bounds of a reader pool without growing the
-// connection pool. Checksums pre-open a snapshot transaction per ceiling slot:
-// fitting just the ceiling fails because consumers floor it back to the start
-// (see checksum.NewChecker and the copier's resolveReadCeiling). Snapshot
-// creation under one table lock is in SingleChecker.initConnPool.
-// The caller supplies its lifecycle-specific reserve. holds is how many
+// connection pool. Fitting just the ceiling fails because consumers floor it
+// back to the start (see checksum.NewChecker and the copier's
+// resolveReadCeiling). The legacy SingleChecker also pre-opens a snapshot
+// transaction per ceiling slot under one table lock (initConnPool); the
+// lockless checker borrows a connection per read. Migration, move and sync
+// all fit with it. The caller supplies its lifecycle-specific reserve. holds is how many
 // connections one reader takes from the busiest pool at once: one for a
 // migration, more for a move whose source and target share a handle. Values
 // below one mean one. Unresolved connection limits pass through; a small budget

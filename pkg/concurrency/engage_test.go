@@ -161,10 +161,8 @@ func TestDeriveFlush(t *testing.T) {
 	require.Zero(t, batch)
 }
 
-func TestPlanCap(t *testing.T) {
+func TestPlanCopier(t *testing.T) {
 	plan := Plan{Engaged: true, ReadStart: 4, MaxReadThreads: 8, WriteStart: 14, MaxWriteThreads: 28}
-	capped := plan.Cap(6, 10)
-	require.Equal(t, Plan{Engaged: true, ReadStart: 4, MaxReadThreads: 6, WriteStart: 10, MaxWriteThreads: 10}, capped)
 	require.Zero(t, Plan{}.Copier(), "a disengaged plan disables the copier's controllers")
 	copierConfig := plan.Copier()
 	require.True(t, copierConfig.Enabled)
@@ -204,19 +202,15 @@ func TestEngageDisabled(t *testing.T) {
 		vcpus   int
 		log     string
 	}{
-		"skipped":       {false, []Target{{Aurora: aurora(false)}}, 16, ""},
-		"no targets":    {true, nil, 16, "no target"},
-		"probe failed":  {true, []Target{{Aurora: aurora(false)}, {Aurora: throttler.AuroraResult{ProbeErr: errors.New("denied")}}}, 16, "could not determine whether the target is Aurora"},
-		"not aurora":    {true, []Target{{Aurora: aurora(false)}, {}}, 16, "every target must provide an Aurora load signal"},
-		"pool too tiny": {true, []Target{{Aurora: aurora(false)}}, 16, "connection pool cannot hold"},
+		"skipped":      {false, []Target{{Aurora: aurora(false)}}, 16, ""},
+		"no targets":   {true, nil, 16, "no target"},
+		"probe failed": {true, []Target{{Aurora: aurora(false)}, {Aurora: throttler.AuroraResult{ProbeErr: errors.New("denied")}}}, 16, "could not determine whether the target is Aurora"},
+		"not aurora":   {true, []Target{{Aurora: aurora(false)}, {}}, 16, "every target must provide an Aurora load signal"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := &flags.Common{Threads: 3, WriteThreads: 5, SkipAutoscaling: !tc.flag}
 			req := Request{Targets: tc.targets, VCPUs: vcpus(tc.vcpus)}
-			if name == "pool too tiny" {
-				req.Fit = func(p Plan) (Plan, bool) { return p, false }
-			}
 			plan, logs := engageForTest(t, f, req)
 			require.False(t, plan.Engaged)
 			require.Zero(t, plan)
@@ -260,20 +254,6 @@ func TestEngageTopology(t *testing.T) {
 	})
 	want, _ := Derive(Topology{VCPUs: []int{64, 64}, ShardsPerHost: 2, Targets: 3, Sources: 2}, 1024, false, false)
 	require.Equal(t, want, plan)
-}
-
-func TestEngageFit(t *testing.T) {
-	f := &flags.Common{}
-	plan, _ := engageForTest(t, f, Request{
-		Targets: []Target{{Aurora: aurora(false)}},
-		VCPUs:   vcpus(64),
-		Fit:     func(p Plan) (Plan, bool) { return p.Cap(3, 7), true },
-	})
-	require.True(t, plan.Engaged)
-	require.Equal(t, 3, plan.MaxReadThreads)
-	require.Equal(t, 7, plan.MaxWriteThreads)
-	require.Equal(t, plan.ReadStart, f.Threads, "the fitted start is what the run uses")
-	require.Equal(t, plan.WriteStart, f.WriteThreads)
 }
 
 func TestEngageClientCeilingWarnings(t *testing.T) {
