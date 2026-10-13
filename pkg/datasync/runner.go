@@ -988,11 +988,16 @@ func (r *Runner) getTables(ctx context.Context) (tables []*table.TableInfo, err 
 // The configuration check is about the source's binary log, so it is skipped
 // when an injected change.Source reads the changes instead.
 func (r *Runner) runChecks(ctx context.Context, phase check.Phase) error {
-	var exclude []string
+	return check.RunChecks(ctx, r.checkResources(), r.logger, phase, r.checkExclusions()...)
+}
+
+// checkExclusions names the checks registered for check.Sync that this sync
+// does not run.
+func (r *Runner) checkExclusions() []string {
 	if r.sync.Source != nil {
-		exclude = append(exclude, "configuration")
+		return []string{check.ConfigurationCheckName}
 	}
-	return check.RunChecks(ctx, r.checkResources(), r.logger, phase, exclude...)
+	return nil
 }
 
 // checkResources describes the sync to pkg/check: one source, one target.

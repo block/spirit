@@ -55,6 +55,76 @@ func TestCheckAPI(t *testing.T) {
 	ran = nil
 	require.ErrorContains(t, RunChecks(t.Context(), Resources{}, slog.Default(), phaseTesting), "Runtime is not set")
 	assert.Empty(t, ran, "no check runs without a runtime")
+
+	// A check that branches on the runtime reads it as the one runner it
+	// runs for, so a combination or an unknown bit is refused rather than
+	// running the union of the checks, or none of them.
+	for _, rt := range []Runtime{Migration | Move, Move | Sync, 1 << 5} {
+		require.ErrorContains(t, RunChecks(t.Context(), Resources{Runtime: rt}, slog.Default(), phaseTesting),
+			"is not exactly one of Migration, Move or Sync", "runtime %d", rt)
+	}
+	// An exclusion that names no check would stop skipping its check
+	// silently once that check is renamed.
+	require.EqualError(t, RunChecks(t.Context(), Resources{Runtime: Move}, slog.Default(), phaseTesting, "a_shared", "renamed"),
+		`check: cannot exclude "renamed": no check is registered under that name`)
+	assert.Empty(t, ran, "no check runs when the arguments are invalid")
+}
+
+type registration struct {
+	phases   Phase
+	runtimes Runtime
+}
+
+// TestRegisteredChecks pins every registered check to the phases it runs in
+// and the runtimes it applies to. The per-check tests call each callback
+// directly, so a registration that drifts (a phase lost, a runtime dropped)
+// stops the check running where it used to and nothing else fails.
+func TestRegisteredChecks(t *testing.T) {
+	const (
+		pre, stmt, flight, post = PhasePreRun, PhaseStatement, PhasePreflight, PhasePostSetup
+		cut, locked, resume     = PhaseCutover, PhaseCutoverLocked, PhaseResume
+		mig, mv, syn            = Migration, Move, Sync
+	)
+	want := map[string]registration{
+		"addforeignkey":                {flight | stmt, mig},
+		"configuration":                {flight, mig | mv | syn},
+		"dropadd":                      {flight, mig},
+		"enumReorder":                  {flight | stmt, mig},
+		"enumSetRemoval":               {flight | stmt, mig},
+		"hasforeignkeys":               {flight | post | cut | locked, mig},
+		"hastriggers":                  {flight | cut | locked, mig},
+		"illegalClause":                {flight | stmt, mig},
+		"primarykey":                   {flight | stmt, mig},
+		"primarykeybit":                {stmt | post, mig},
+		"primarykeycollation":          {post, mig},
+		"primarykeycollationstatement": {stmt, mig},
+		"primarykeyexists":             {stmt, mig},
+		"primarykeyfloat":              {stmt | post, mig},
+		"privileges":                   {flight, mig | mv},
+		"rename":                       {flight, mig},
+		"rename_safety":                {post | resume, mv},
+		"replica":                      {flight, mig},
+		"replicahealth":                {post | cut, mig},
+		"resume_state":                 {resume, mv},
+		"setReorder":                   {flight | stmt, mig},
+		"settings":                     {flight, mig},
+		"source_schema_consistency":    {post, mv},
+		"source_schema_objects":        {flight | post | resume | locked, mv},
+		"table_compatibility":          {post | resume, mv | syn},
+		"tableidentifier":              {flight | stmt, mig},
+		"tablename":                    {flight, mig},
+		"target_schema_objects":        {post | resume | locked, mv | syn},
+		"target_state":                 {post, mv},
+		"unsynced_source_objects":      {post, syn},
+		"version":                      {pre | flight, mig | mv | syn},
+	}
+	lock.Lock()
+	defer lock.Unlock()
+	got := make(map[string]registration, len(checks))
+	for name, c := range checks {
+		got[name] = registration{c.phases, c.runtimes}
+	}
+	assert.Equal(t, want, got)
 }
 
 func TestRegisterRefusesDuplicatesAndEmptyMasks(t *testing.T) {

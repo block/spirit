@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"database/sql"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
@@ -297,4 +299,28 @@ func targetTables(t *testing.T, db *sql.DB, schema string) []string {
 	}
 	require.NoError(t, rows.Err())
 	return names
+}
+
+// TestSyncCheckExclusions pins which checks a sync runs: an injected
+// change.Source does not read the source's binary log, so only the
+// configuration check is skipped for it, and the version, compatibility and
+// target checks still run.
+func TestSyncCheckExclusions(t *testing.T) {
+	builtIn := &Runner{sync: &Sync{}}
+	require.Empty(t, builtIn.checkExclusions())
+
+	injected := &Runner{sync: &Sync{Source: &change.MockSource{}}}
+	require.Equal(t, []string{check.ConfigurationCheckName}, injected.checkExclusions())
+	run := func(phase check.Phase) []string {
+		var names []string
+		for _, name := range check.Checks(check.Sync, phase) {
+			if !slices.Contains(injected.checkExclusions(), name) {
+				names = append(names, name)
+			}
+		}
+		return names
+	}
+	require.Equal(t, []string{"version"}, run(check.PhasePreflight))
+	require.Equal(t, []string{"table_compatibility", "target_schema_objects", "unsynced_source_objects"}, run(check.PhasePostSetup))
+	require.Equal(t, []string{check.ConfigurationCheckName, "version"}, check.Checks(check.Sync, check.PhasePreflight))
 }

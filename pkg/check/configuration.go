@@ -2,6 +2,7 @@ package check
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 
@@ -9,11 +10,15 @@ import (
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 )
 
+// ConfigurationCheckName is the configuration check's name, for a runner
+// that excludes it (see RunChecks).
+const ConfigurationCheckName = "configuration"
+
 func init() {
 	// A sync runs this check only when it reads the source with the built-in
 	// binlog client: the settings are the binary log's, and an injected
 	// change.Source (e.g. a Vitess VStream) does not read it.
-	register(check{name: "configuration", run: configurationCheck, phases: PhasePreflight, runtimes: Migration | Move | Sync})
+	register(check{name: ConfigurationCheckName, run: configurationCheck, phases: PhasePreflight, runtimes: Migration | Move | Sync})
 }
 
 // configurationCheck checks the configuration of every source. There are some
@@ -35,8 +40,25 @@ func configurationCheck(ctx context.Context, r Resources, logger *slog.Logger) e
 
 // sourceConfiguration checks the configuration of one source.
 func sourceConfiguration(ctx context.Context, runtime Runtime, src Endpoint, logger *slog.Logger) error {
-	var binlogFormat, innodbAutoincLockMode, binlogRowImage, logBin, logSlaveUpdates, binlogRowValueOptions, performanceSchema, binlogOrderCommits string
-	err := src.DB.QueryRowContext(ctx,
+	settings, err := readSourceSettings(ctx, src.DB)
+	if err != nil {
+		return err
+	}
+	return settings.check(runtime, logger)
+}
+
+// sourceSettings are the server settings the configuration check decides on.
+type sourceSettings struct {
+	binlogFormat, innodbAutoincLockMode, binlogRowImage, logBin, logSlaveUpdates string
+	binlogRowValueOptions, performanceSchema, binlogOrderCommits                 string
+	binlogTransactionCompression                                                 string // "" when the server does not have the variable
+	partialRevokesErr                                                            error  // the result of partialRevokesError
+}
+
+// readSourceSettings reads the settings of the server db is connected to.
+func readSourceSettings(ctx context.Context, db *sql.DB) (sourceSettings, error) {
+	var s sourceSettings
+	err := db.QueryRowContext(ctx,
 		`SELECT @@global.binlog_format,
 		@@global.innodb_autoinc_lock_mode,
 		@@global.binlog_row_image,
@@ -45,39 +67,59 @@ func sourceConfiguration(ctx context.Context, runtime Runtime, src Endpoint, log
 		@@global.binlog_row_value_options,
 		@@global.performance_schema,
 		@@global.binlog_order_commits`).Scan(
-		&binlogFormat,
-		&innodbAutoincLockMode,
-		&binlogRowImage,
-		&logBin,
-		&logSlaveUpdates,
-		&binlogRowValueOptions,
-		&performanceSchema,
-		&binlogOrderCommits,
+		&s.binlogFormat,
+		&s.innodbAutoincLockMode,
+		&s.binlogRowImage,
+		&s.logBin,
+		&s.logSlaveUpdates,
+		&s.binlogRowValueOptions,
+		&s.performanceSchema,
+		&s.binlogOrderCommits,
 	)
 	if err != nil {
-		return err
+		return s, err
 	}
-	if binlogFormat != "ROW" {
+	// Queried separately from the batch above because the variable only
+	// exists on MySQL 8.0.20+; on older servers compression cannot be enabled
+	// at all, so unknown-variable passes the check.
+	err = db.QueryRowContext(ctx, `SELECT @@global.binlog_transaction_compression`).Scan(&s.binlogTransactionCompression)
+	if err != nil {
+		if myErr, ok := errors.AsType[*mysql.MySQLError](err); !ok || myErr.Number != parsermysql.ErrUnknownSystemVariable {
+			return s, err
+		}
+		s.binlogTransactionCompression = ""
+	}
+	var partialRevokes string
+	err = db.QueryRowContext(ctx, `SELECT @@global.partial_revokes`).Scan(&partialRevokes)
+	s.partialRevokesErr = partialRevokesError(partialRevokes, err)
+	return s, nil
+}
+
+// check decides the configuration check for runtime from the settings. There
+// are some hard nos, and some suggestions around configuration for
+// performance.
+func (s sourceSettings) check(runtime Runtime, logger *slog.Logger) error {
+	if s.binlogFormat != "ROW" {
 		return errors.New("binlog_format must be ROW")
 	}
-	if innodbAutoincLockMode != "2" && runtime == Migration {
+	if s.innodbAutoincLockMode != "2" && runtime == Migration {
 		// This is strongly encouraged because otherwise running parallel threads is pointless.
 		// i.e. on a test with 2 threads running INSERT INTO new SELECT * FROM old WHERE <range>
 		// the inserts will run in serial when there is an autoinc column on new and innodbAutoincLockMode != "2"
 		// This is the auto-inc lock. It won't show up in SHOW PROCESSLIST that they are serial.
 		// Only a migration writes to the source server; a move's or sync's
 		// inserts land on the target, where this source setting has no effect.
-		logger.Warn("innodb_autoinc_lock_mode != 2. This will cause the migration to run slower than expected because concurrent inserts to the new table will be serialized.", "innodb_autoinc_lock_mode", innodbAutoincLockMode)
+		logger.Warn("innodb_autoinc_lock_mode != 2. This will cause the migration to run slower than expected because concurrent inserts to the new table will be serialized.", "innodb_autoinc_lock_mode", s.innodbAutoincLockMode)
 	}
 	// Spirit's replication applier reads full row images directly from the
 	// binlog instead of `REPLACE INTO _new ... SELECT FROM original ...`,
 	// which sidesteps the MySQL binlog/visibility race that caused silent
 	// row loss under load (issue #746). That requires the source server to
 	// publish full images.
-	if binlogRowImage != "FULL" {
+	if s.binlogRowImage != "FULL" {
 		return errors.New("binlog_row_image must be FULL: spirit no longer supports minimal")
 	}
-	if binlogRowValueOptions != "" {
+	if s.binlogRowValueOptions != "" {
 		return errors.New("binlog_row_value_options must be empty: spirit does not support non-empty values")
 	}
 	// binlog_transaction_compression=ON delivers every transaction wrapped in
@@ -85,38 +127,25 @@ func sourceConfiguration(ctx context.Context, runtime Runtime, src Endpoint, log
 	// these — it has to, because any session can enable the setting for its
 	// own transactions regardless of the global value — but as a server-wide
 	// default it is not a supported configuration, so reject it up front with
-	// a clear message. Queried separately from the batch above because the
-	// variable only exists on MySQL 8.0.20+; on older servers compression
-	// cannot be enabled at all, so unknown-variable passes the check.
-	var binlogTransactionCompression string
-	err = src.DB.QueryRowContext(ctx, `SELECT @@global.binlog_transaction_compression`).Scan(&binlogTransactionCompression)
-	if err != nil {
-		if myErr, ok := errors.AsType[*mysql.MySQLError](err); !ok || myErr.Number != parsermysql.ErrUnknownSystemVariable {
-			return err
-		}
-	} else if binlogTransactionCompression != "0" {
+	// a clear message.
+	if s.binlogTransactionCompression != "" && s.binlogTransactionCompression != "0" {
 		return errors.New("binlog_transaction_compression must be OFF: spirit does not support compressed transactions in the binary log")
 	}
 	// partial_revokes only matters to the privileges check, which a sync
 	// does not run.
-	if runtime != Sync {
-		var partialRevokes string
-		err = src.DB.QueryRowContext(ctx, `SELECT @@global.partial_revokes`).Scan(&partialRevokes)
-		if err := partialRevokesError(partialRevokes, err); err != nil {
-			return err
-		}
+	if runtime != Sync && s.partialRevokesErr != nil {
+		return s.partialRevokesErr
 	}
-
-	if logBin != "1" {
+	if s.logBin != "1" {
 		// This is a hard requirement because we need to be able to read the binlog.
 		return errors.New("log_bin must be enabled")
 	}
-	if logSlaveUpdates != "1" {
+	if s.logSlaveUpdates != "1" {
 		// This is a hard requirement unless we enhance this to confirm
 		//  its not receiving any updates via the replication stream.
 		return errors.New("log_slave_updates must be enabled")
 	}
-	if performanceSchema != "1" && runtime != Sync {
+	if s.performanceSchema != "1" && runtime != Sync {
 		// A sync takes no table locks, so it never force-kills.
 		// Force-kill (the default) uses performance_schema to find and kill
 		// locking transactions via metadata_locks and threads tables. We could technically
@@ -124,7 +153,7 @@ func sourceConfiguration(ctx context.Context, runtime Runtime, src Endpoint, log
 		// use, we just require it.
 		return errors.New("performance_schema must be enabled")
 	}
-	if binlogOrderCommits != "1" {
+	if s.binlogOrderCommits != "1" {
 		// binlog_order_commits=ON is the MySQL default. Setting it OFF allows
 		// MySQL to commit transactions to InnoDB in a different order than they
 		// appear in the binlog — specifically, a transaction's row events can

@@ -220,7 +220,9 @@ func register(c check) {
 }
 
 // RunChecks runs every check registered for both r.Runtime and phase, except
-// those named in exclude. Checks run in name order so that a run failing more
+// those named in exclude. r.Runtime must be exactly one runtime: a check that
+// branches on the runtime reads it as the runner it is running for. Every
+// name in exclude must be a registered check. Checks run in name order so that a run failing more
 // than one check always reports the same error.
 //
 // logger may be nil: checks log as they run, and a caller classifying a
@@ -229,6 +231,9 @@ func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, phase Phas
 	if r.Runtime == 0 {
 		return errors.New("check: Resources.Runtime is not set")
 	}
+	if !r.Runtime.valid() {
+		return fmt.Errorf("check: Resources.Runtime %d is not exactly one of Migration, Move or Sync", r.Runtime)
+	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
@@ -236,6 +241,13 @@ func RunChecks(ctx context.Context, r Resources, logger *slog.Logger, phase Phas
 	lock.Lock()
 	registered := maps.Clone(checks)
 	lock.Unlock()
+	// An exclusion that names no check would silently run the check it was
+	// meant to skip once that check is renamed.
+	for _, name := range exclude {
+		if _, ok := registered[name]; !ok {
+			return fmt.Errorf("check: cannot exclude %q: no check is registered under that name", name)
+		}
+	}
 	for _, name := range namesFor(registered, r.Runtime, phase) {
 		if slices.Contains(exclude, name) {
 			continue
@@ -307,6 +319,11 @@ func (r Resources) sourceError(i int, err error) error {
 // tableError attributes err to the source table named table.
 func (r Resources) tableError(table string, err error) error {
 	return fmt.Errorf("table '%s' cannot be %s: %w", table, r.Runtime.participle(), err)
+}
+
+// valid reports whether rt is exactly one of the runtimes.
+func (rt Runtime) valid() bool {
+	return rt == Migration || rt == Move || rt == Sync
 }
 
 // noun names the runtime's operation in an error message ("run a migration").
