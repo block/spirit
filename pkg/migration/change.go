@@ -53,10 +53,72 @@ func (c *tableChange) createNewTable(ctx context.Context) error {
 		}
 	}
 	c.newTable = table.NewTableInfo(c.runner.db, c.stmt.Schema, newName)
+	if err := c.restoreCopiedCheckConstraints(ctx); err != nil {
+		return err
+	}
 	if err := c.newTable.SetInfo(ctx); err != nil {
 		return err
 	}
 	return nil
+}
+
+// restoreCopiedCheckConstraints preserves the source expressions on the empty
+// table just created by CREATE TABLE LIKE. MySQL can rewrite literal charset
+// introducers while copying a CHECK (for example _utf8mb4 to _ascii), so its
+// copied definition need not equal the source definition. Do not weaken the
+// subsequent expression comparison or strip introducers: they can be semantic.
+// Restore the source definition instead, before applying the requested ALTER
+// or copying any rows. The source table is never modified here.
+func (c *tableChange) restoreCopiedCheckConstraints(ctx context.Context) error {
+	sourceDef, err := tableDefinition(ctx, c.runner.db, c.table.TableName)
+	if err != nil {
+		return err
+	}
+	source := checkConstraints(sourceDef)
+	if len(source) == 0 {
+		return nil
+	}
+	copyDef, err := tableDefinition(ctx, c.runner.db, c.newTable.TableName)
+	if err != nil {
+		return err
+	}
+	copied := checkConstraints(copyDef)
+	if len(source) != len(copied) {
+		return fmt.Errorf("table %s has %d CHECK constraint(s) but its copy %s has %d",
+			c.table.TableName, len(source), c.newTable.TableName, len(copied))
+	}
+	if err := sortByGeneratedNumber(copied, c.newTable.TableName); err != nil {
+		return err
+	}
+	var clauses []string
+	for i := range source {
+		if checkConstraintsMatch(source[i], copied[i]) {
+			continue
+		}
+		if source[i].Definition == nil {
+			return fmt.Errorf("CHECK constraint %s on %s has no restorable definition",
+				source[i].Name, c.table.TableName)
+		}
+		clauses = append(clauses,
+			sqlescape.MustEscapeSQL("DROP CHECK %n", copied[i].Name),
+			sqlescape.MustEscapeSQL("ADD CONSTRAINT %n %r", copied[i].Name,
+				sqlescape.RawSQL(*source[i].Definition)))
+	}
+	if len(clauses) == 0 {
+		return nil
+	}
+	if err := dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n %r",
+		c.newTable.TableName, sqlescape.RawSQL(strings.Join(clauses, ", "))); err != nil {
+		return fmt.Errorf("restore source CHECK definitions on the empty copy %s: %w", c.newTable.TableName, err)
+	}
+	// Re-read and retain the strict expression/enforcement check. If the server
+	// cannot preserve a definition, refuse rather than copying under another rule.
+	copyDef, err = tableDefinition(ctx, c.runner.db, c.newTable.TableName)
+	if err != nil {
+		return err
+	}
+	_, err = c.checkConstraintRenames(sourceDef, copyDef)
+	return err
 }
 
 // alterNewTable applies the ALTER to the new table.
