@@ -10,13 +10,14 @@ import (
 
 func init() {
 	// A resume from checkpoint copies and replays with the same code as a
-	// fresh copy, so the table requirements hold for both; the resume path
-	// does not re-run the post-setup checks, so register under both.
-	register(check{name: "table_compatibility", run: tableCompatibilityCheck, phases: PhasePostSetup | PhaseResume, runtimes: Move})
+	// fresh copy, so the table requirements hold for both; the move resume
+	// path does not re-run the post-setup checks, so register under both. A
+	// sync runs its post-setup checks on every start, including a resume.
+	register(check{name: "table_compatibility", run: tableCompatibilityCheck, phases: PhasePostSetup | PhaseResume, runtimes: Move | Sync})
 }
 
-// tableCompatibilityCheck verifies that all source tables are compatible
-// with move operations: no schema or table name may contain a '.' or a
+// tableCompatibilityCheck verifies that all source tables can be moved or
+// synced: no schema or table name may contain a '.' or a
 // backtick, every table needs a primary key, which is required for
 // replication tracking, that key must not include a FLOAT or a BIT
 // column, and every ENUM and SET member must be reported as MySQL stores it.
@@ -33,11 +34,12 @@ func init() {
 // table.TableInfo.BitPrimaryKeyError).
 //
 // An ENUM or SET member with a character outside utf8mb3 is reported as '?'
-// by SHOW CREATE TABLE, which the move replays to create the target table, so
-// the target would not have the member (see
+// by SHOW CREATE TABLE, which a move or a sync replays to create the target
+// table, so the target would not have the member (see
 // table.TableInfo.MisreportedEnumSetError). This holds for the tables of every
 // source, not only the first. A target table that exists already is examined
-// by target_state and resume_state instead.
+// by move's target_state and resume_state, and by sync's createTargetTables,
+// instead.
 //
 // Non-memory-comparable PKs (e.g. VARCHAR with a CI collation) are now
 // supported: bufferedMap routes those subscriptions through its FIFO queue
@@ -50,16 +52,16 @@ func tableCompatibilityCheck(ctx context.Context, r Resources, logger *slog.Logg
 	}
 	for _, tbl := range r.SourceTables {
 		if len(tbl.KeyColumns) == 0 {
-			return fmt.Errorf("table '%s' does not have a primary key, which is required for move operations", tbl.TableName)
+			return fmt.Errorf("table '%s' does not have a primary key, which is required for %s operations", tbl.TableName, r.Runtime.noun())
 		}
 		if err := tbl.FloatPrimaryKeyError(); err != nil {
-			return fmt.Errorf("table '%s' cannot be moved: %w", tbl.TableName, err)
+			return r.tableError(tbl.TableName, err)
 		}
 		if err := tbl.BitPrimaryKeyError(); err != nil {
-			return fmt.Errorf("table '%s' cannot be moved: %w", tbl.TableName, err)
+			return r.tableError(tbl.TableName, err)
 		}
 		if err := tbl.MisreportedEnumSetError(); err != nil {
-			return fmt.Errorf("table '%s' cannot be moved: %w", tbl.TableName, err)
+			return r.tableError(tbl.TableName, err)
 		}
 	}
 	// Every other source is compared with the first by its reported
@@ -68,7 +70,7 @@ func tableCompatibilityCheck(ctx context.Context, r Resources, logger *slog.Logg
 	for i, src := range r.Sources {
 		for _, tbl := range src.Tables {
 			if err := tbl.MisreportedEnumSetError(); err != nil {
-				return fmt.Errorf("table '%s' on source %d cannot be moved: %w", tbl.TableName, i, err)
+				return fmt.Errorf("table '%s' on source %d cannot be %s: %w", tbl.TableName, i, r.Runtime.participle(), err)
 			}
 		}
 	}
@@ -76,18 +78,18 @@ func tableCompatibilityCheck(ctx context.Context, r Resources, logger *slog.Logg
 }
 
 // UnsupportedNameError returns an error for the first schema or table name in
-// the move that contains a '.' or a backtick: each source and target schema,
-// then each source table and its schema.
+// a move or a sync that contains a '.' or a backtick: each source and target
+// schema, then each source table and its schema.
 //
-// The runner also calls it directly when resuming a reverse window, which runs
-// no check scope.
+// The move runner also calls it directly when resuming a reverse window, which
+// runs no check phase.
 func UnsupportedNameError(r Resources) error {
 	for _, src := range r.Sources {
 		if src.Config == nil {
 			continue
 		}
 		if err := utils.UnsupportedIdentifierError("source schema name", src.Config.DBName); err != nil {
-			return fmt.Errorf("cannot move: %w", err)
+			return fmt.Errorf("cannot %s: %w", r.Runtime.noun(), err)
 		}
 	}
 	for _, tgt := range r.Targets {
@@ -95,15 +97,15 @@ func UnsupportedNameError(r Resources) error {
 			continue
 		}
 		if err := utils.UnsupportedIdentifierError("target schema name", tgt.Config.DBName); err != nil {
-			return fmt.Errorf("cannot move: %w", err)
+			return fmt.Errorf("cannot %s: %w", r.Runtime.noun(), err)
 		}
 	}
 	for _, tbl := range r.SourceTables {
 		if err := utils.UnsupportedIdentifierError("table name", tbl.TableName); err != nil {
-			return fmt.Errorf("table '%s' cannot be moved: %w", tbl.TableName, err)
+			return r.tableError(tbl.TableName, err)
 		}
 		if err := utils.UnsupportedIdentifierError("schema name", tbl.SchemaName); err != nil {
-			return fmt.Errorf("table '%s' cannot be moved: %w", tbl.TableName, err)
+			return r.tableError(tbl.TableName, err)
 		}
 	}
 	return nil

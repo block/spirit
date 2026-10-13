@@ -12,11 +12,6 @@ func init() {
 	register(check{name: "resume_state", run: resumeStateCheck, phases: PhaseResume, runtimes: Move})
 }
 
-// moveCheckpointTableName must match pkg/move's checkpointTableName. It is
-// duplicated here because the check package cannot import move (move imports
-// check).
-const moveCheckpointTableName = "_spirit_move_checkpoint"
-
 // resumeStateCheck validates that the state is compatible with resuming from a checkpoint.
 // This check runs at PhaseResume and verifies:
 // 1. Checkpoint table exists on the first target
@@ -33,6 +28,9 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 	if len(r.Targets) == 0 {
 		return errors.New("no targets configured")
 	}
+	if r.CheckpointTable == "" {
+		return errors.New("no checkpoint table configured")
+	}
 	// Check 1: Verify checkpoint table exists on targets[0] (by convention).
 	// The runner sorts targets so targets[0] is stable across runs.
 	tgt0 := r.Targets[0]
@@ -42,16 +40,16 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 	var checkpointExists int
 	err := tgt0.DB.QueryRowContext(ctx,
 		"SELECT 1 FROM information_schema.TABLES WHERE table_schema = ? AND table_name = ?",
-		tgt0.Config.DBName, moveCheckpointTableName).Scan(&checkpointExists)
+		tgt0.Config.DBName, r.CheckpointTable).Scan(&checkpointExists)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("checkpoint table '%s.%s' does not exist; cannot resume", tgt0.Config.DBName, moveCheckpointTableName)
+		return fmt.Errorf("checkpoint table '%s.%s' does not exist; cannot resume", tgt0.Config.DBName, r.CheckpointTable)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to check for checkpoint table: %w", err)
 	}
 
 	logger.Info("checkpoint table exists, validating target tables for resume",
-		"checkpoint_table", fmt.Sprintf("%s.%s", tgt0.Config.DBName, moveCheckpointTableName))
+		"checkpoint_table", fmt.Sprintf("%s.%s", tgt0.Config.DBName, r.CheckpointTable))
 
 	// Check 2: Verify all source tables have corresponding target tables with matching schema
 	for _, sourceTable := range r.SourceTables {

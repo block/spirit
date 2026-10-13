@@ -94,22 +94,27 @@ func (g schemaGrants) sees(o schemaObject) (bool, string) {
 }
 
 // Reasons given by the visibility refusals, for the source and target checks.
-const (
-	sourceVisibilityReason = "move refuses source schemas that contain triggers, views, events or stored routines"
-	targetVisibilityReason = "move refuses triggers on the tables it writes to on the target and events in the target schema"
-)
+// Only a move refuses source schema objects; a sync logs them, and needs no
+// visibility for that.
+const sourceVisibilityReason = "move refuses source schemas that contain triggers, views, events or stored routines"
+
+// targetVisibilityReason is the reason given by the target visibility refusal
+// of runtime.
+func targetVisibilityReason(runtime Runtime) string {
+	return runtime.noun() + " refuses triggers on the tables it writes to on the target and events in the target schema"
+}
 
 // schemaObjectVisibilityFromGrants returns a refusal (see ErrRefused) naming
 // the grants missing for the user to see every object of the given kinds in
 // source schema schemaName, or nil.
 func schemaObjectVisibilityFromGrants(grants []string, schemaName string, kinds ...schemaObject) error {
-	return visibilityFromGrants(grants, schemaName, sourceVisibilityReason, kinds...)
+	return visibilityFromGrants(grants, Move, schemaName, sourceVisibilityReason, kinds...)
 }
 
 // visibilityFromGrants returns a refusal (see ErrRefused) naming the grants
 // missing for the user to see every object of the given kinds in schemaName,
-// or nil. reason says why move needs to see them.
-func visibilityFromGrants(grants []string, schemaName, reason string, kinds ...schemaObject) error {
+// or nil. reason says why runtime needs to see them.
+func visibilityFromGrants(grants []string, runtime Runtime, schemaName, reason string, kinds ...schemaObject) error {
 	g := schemaGrants{lines: grants, schema: schemaName}
 	var missing []string
 	for _, kind := range kinds {
@@ -120,8 +125,8 @@ func visibilityFromGrants(grants []string, schemaName, reason string, kinds ...s
 	if len(missing) == 0 {
 		return nil
 	}
-	return refuse(fmt.Errorf("insufficient privileges to run a move: %s, and information_schema hides them from users without these grants. Needed: %s",
-		reason, strings.Join(missing, "; ")))
+	return refuse(fmt.Errorf("insufficient privileges to run a %s: %s, and information_schema hides them from users without these grants. Needed: %s",
+		runtime.noun(), reason, strings.Join(missing, "; ")))
 }
 
 // schemaObjectVisibility checks, from the connection's SHOW GRANTS, that the
@@ -136,22 +141,22 @@ func visibilityFromGrants(grants []string, schemaName, reason string, kinds ...s
 // read SHOW GRANTS is returned as a plain error, which may
 // be transient and is retried under the cutover locks.
 func schemaObjectVisibility(ctx context.Context, db querier, schemaName string, kinds ...schemaObject) error {
-	return visibility(ctx, db, schemaName, sourceVisibilityReason, kinds...)
+	return visibility(ctx, db, Move, schemaName, sourceVisibilityReason, kinds...)
 }
 
-// targetObjectVisibility is schemaObjectVisibility for a target schema: it
-// checks that the user of db can see the schema's triggers and events
-// (targetObjectVisibilityKinds), which target_schema_objects refuses.
-func targetObjectVisibility(ctx context.Context, db querier, schemaName string) error {
-	return visibility(ctx, db, schemaName, targetVisibilityReason, targetObjectVisibilityKinds...)
+// targetObjectVisibility is schemaObjectVisibility for a target schema of
+// runtime: it checks that the user of db can see the schema's triggers and
+// events (targetObjectVisibilityKinds), which target_schema_objects refuses.
+func targetObjectVisibility(ctx context.Context, runtime Runtime, db querier, schemaName string) error {
+	return visibility(ctx, db, runtime, schemaName, targetVisibilityReason(runtime), targetObjectVisibilityKinds...)
 }
 
-func visibility(ctx context.Context, db querier, schemaName, reason string, kinds ...schemaObject) error {
+func visibility(ctx context.Context, db querier, runtime Runtime, schemaName, reason string, kinds ...schemaObject) error {
 	grants, err := readGrants(ctx, db)
 	if err != nil {
 		return fmt.Errorf("could not read the grants that make the schema's objects visible: %w", err)
 	}
-	return visibilityFromGrants(grants, schemaName, reason, kinds...)
+	return visibilityFromGrants(grants, runtime, schemaName, reason, kinds...)
 }
 
 // readGrants returns the connection's SHOW GRANTS lines. For the current

@@ -58,3 +58,17 @@ func TestSourceError(t *testing.T) {
 	require.EqualError(t, moved, "source 2: partial_revokes must be OFF")
 	require.ErrorIs(t, moved, err)
 }
+
+// TestConfigurationCheckSync covers the sync registration. A sync takes no
+// table locks and runs no privileges check, so it does not need
+// performance_schema or partial_revokes=OFF; the binary log settings still
+// apply.
+func TestConfigurationCheckSync(t *testing.T) {
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	require.Contains(t, Checks(Sync, PhasePreflight), "configuration")
+	r := Resources{Runtime: Sync, Sources: []Endpoint{{DB: db}}}
+	require.NoError(t, configurationCheck(t.Context(), r, slog.Default()))
+}

@@ -160,7 +160,7 @@ func TestTableCompatibilityCheckRegisteredForResume(t *testing.T) {
 	lock.Lock()
 	defer lock.Unlock()
 	require.Equal(t, PhasePostSetup|PhaseResume, checks["table_compatibility"].phases)
-	require.Equal(t, Move, checks["table_compatibility"].runtimes)
+	require.Equal(t, Move|Sync, checks["table_compatibility"].runtimes)
 }
 
 // TestTableCompatibilityCheckUnsupportedNames checks that a '.' or a backtick

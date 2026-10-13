@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/block/mysql"
@@ -18,6 +19,14 @@ const targetObjectsPrefix = "cannot move: triggers on the tables move writes to 
 
 var targetObjectsChecks = []string{"target_schema_objects"}
 
+// moveCheckpointTableName is pkg/move's checkpoint table name.
+const moveCheckpointTableName = "_spirit_move_checkpoint"
+
+// moveTargets returns the Resources a move gives the target check.
+func moveTargets(targets []applier.Target, tables []*table.TableInfo) Resources {
+	return Resources{Runtime: Move, Targets: targets, SourceTables: tables, CheckpointTable: moveCheckpointTableName}
+}
+
 // TestTargetSchemaObjectsCheckRegistered pins that the check runs before a
 // fresh copy (post-setup), before a resume from checkpoint (the runner writes
 // to the target only after one of those two phases), and under the forward
@@ -27,7 +36,7 @@ func TestTargetSchemaObjectsCheckRegistered(t *testing.T) {
 	lock.Lock()
 	defer lock.Unlock()
 	require.Equal(t, PhasePostSetup|PhaseResume|PhaseCutoverLocked, checks["target_schema_objects"].phases)
-	require.Equal(t, Move, checks["target_schema_objects"].runtimes)
+	require.Equal(t, Move|Sync, checks["target_schema_objects"].runtimes)
 }
 
 // TestRefusedTargetObjects checks which listed objects are refused, and that
@@ -87,9 +96,10 @@ func TestTargetSchemaObjectsCheck(t *testing.T) {
 		}
 	}
 	r := Resources{
-		Runtime:      Move,
-		Targets:      []applier.Target{targetResource(t, tgt0Name, tgt0DB), targetResource(t, tgt1Name, tgt1DB)},
-		SourceTables: []*table.TableInfo{t1},
+		Runtime:         Move,
+		Targets:         []applier.Target{targetResource(t, tgt0Name, tgt0DB), targetResource(t, tgt1Name, tgt1DB)},
+		SourceTables:    []*table.TableInfo{t1},
+		CheckpointTable: moveCheckpointTableName,
 	}
 	scopes := []Phase{PhasePostSetup, PhaseResume, PhaseCutoverLocked}
 	only := otherChecks(targetObjectsChecks...)
@@ -120,10 +130,10 @@ func TestTargetSchemaObjectsCheck(t *testing.T) {
 
 	// With no moved table (a fresh move into a schema without them), an event
 	// and a trigger on the checkpoint table of the first target still refuse.
-	require.EqualError(t, TargetSchemaObjectsError(t.Context(), r.Targets[1:], nil),
+	require.EqualError(t, TargetSchemaObjectsError(t.Context(), moveTargets(r.Targets[1:], nil)),
 		targetObjectsPrefix+"target 0 ("+tgt1Name+"): trigger 'chk_ai' on table '"+moveCheckpointTableName+"', event 'e1'")
-	require.NoError(t, TargetSchemaObjectsError(t.Context(), nil, r.SourceTables))
-	require.EqualError(t, TargetSchemaObjectsError(t.Context(), []applier.Target{{}}, nil),
+	require.NoError(t, TargetSchemaObjectsError(t.Context(), moveTargets(nil, r.SourceTables)))
+	require.EqualError(t, TargetSchemaObjectsError(t.Context(), moveTargets([]applier.Target{{}}, nil)),
 		"target 0 database connection or config is not initialized")
 }
 
@@ -147,7 +157,7 @@ func TestTargetSchemaObjectsCheckRequiresVisibility(t *testing.T) {
 			db, cfg := createMoveTestUser(t, tc.user, schema, fmt.Sprintf(tc.grant, schema))
 			targets := []applier.Target{{DB: db, Config: cfg}}
 			want := "target 0 (" + schema + "): " + prefix + fmt.Sprintf(tc.needed, schema)
-			err := TargetSchemaObjectsError(t.Context(), targets, nil)
+			err := TargetSchemaObjectsError(t.Context(), moveTargets(targets, nil))
 			require.EqualError(t, err, want)
 			require.ErrorIs(t, err, ErrRefused)
 			err = privilegesCheck(t.Context(), Resources{Runtime: Move, Targets: targets}, slog.Default())
@@ -156,15 +166,22 @@ func TestTargetSchemaObjectsCheckRequiresVisibility(t *testing.T) {
 
 			canceled, cancel := context.WithCancel(t.Context())
 			cancel()
-			err = TargetSchemaObjectsError(canceled, targets, nil)
+			err = TargetSchemaObjectsError(canceled, moveTargets(targets, nil))
 			require.ErrorContains(t, err, "target 0 ("+schema+"): could not read the grants")
 			require.NotErrorIs(t, err, ErrRefused)
+
+			// A sync runs no privileges check, so its target check is what
+			// refuses, naming the sync.
+			synced := Resources{Runtime: Sync, Targets: targets, CheckpointTable: "_spirit_sync_checkpoint"}
+			err = RunChecks(t.Context(), synced, slog.Default(), PhasePostSetup, otherChecks(targetObjectsChecks...)...)
+			require.EqualError(t, err, strings.ReplaceAll(want, "move", "sync"))
+			require.ErrorIs(t, err, ErrRefused)
 		})
 	}
 	db, cfg := createMoveTestUser(t, "testmovevis_tgtok", schema, "GRANT SELECT, TRIGGER, EVENT ON `"+schema+"`.* TO %s")
 	targets := []applier.Target{{DB: db, Config: cfg}}
 	require.NoError(t, privilegesCheck(t.Context(), Resources{Runtime: Move, Targets: targets}, slog.Default()))
-	require.EqualError(t, TargetSchemaObjectsError(t.Context(), targets, nil),
+	require.EqualError(t, TargetSchemaObjectsError(t.Context(), moveTargets(targets, nil)),
 		targetObjectsPrefix+"target 0 ("+schema+"): event 'e1'", "with the grants, the objects are visible")
 	require.EqualError(t, privilegesCheck(t.Context(), Resources{Runtime: Move, Targets: []applier.Target{{}}}, slog.Default()),
 		"target 0 database connection or config is not initialized")
@@ -192,9 +209,9 @@ func TestTargetSchemaObjectsUsesTargetLowerCaseTableNames(t *testing.T) {
 	targets := []applier.Target{targetResource(t, tgtName, tgtDB)}
 	tables := []*table.TableInfo{src}
 
-	require.NoError(t, TargetSchemaObjectsError(t.Context(), targets, tables))
+	require.NoError(t, TargetSchemaObjectsError(t.Context(), moveTargets(targets, tables)))
 
 	testutils.RunSQLInDatabaseAsRoot(t, tgtName, "CREATE TRIGGER moved_ai AFTER INSERT ON Orders FOR EACH ROW SET @x = 1")
-	require.EqualError(t, RunChecks(t.Context(), Resources{Runtime: Move, Targets: targets, SourceTables: tables}, slog.Default(), PhasePostSetup, otherChecks(targetObjectsChecks...)...),
+	require.EqualError(t, RunChecks(t.Context(), moveTargets(targets, tables), slog.Default(), PhasePostSetup, otherChecks(targetObjectsChecks...)...),
 		targetObjectsPrefix+"target 0 ("+tgtName+"): trigger 'moved_ai' on table 'Orders'")
 }

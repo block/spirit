@@ -57,11 +57,17 @@ member that really is `?` (see [Requirements](#requirements)).
 
 ## Requirements
 
-- **MySQL 8.0+** on both ends
-- Source (built-in feed): `binlog_format=ROW`, `log_bin=ON`, and `SELECT` +
-  `REPLICATION SLAVE` + `REPLICATION CLIENT` privileges; plus `RELOAD` when
-  the source does not have GTIDs enabled (the file+offset reader issues
-  `FLUSH BINARY LOGS`)
+- **MySQL 8.0+** on both ends, checked at startup
+- Source (built-in feed): `SELECT` + `REPLICATION SLAVE` + `REPLICATION
+  CLIENT` privileges; plus `RELOAD` when the source does not have GTIDs
+  enabled (the file+offset reader issues `FLUSH BINARY LOGS`). At startup sync
+  checks the source's binary log configuration, the same check migrate and
+  move run: `log_bin=ON`, `log_slave_updates=ON`, `binlog_format=ROW`,
+  `binlog_row_image=FULL`, an empty `binlog_row_value_options`,
+  `binlog_transaction_compression=OFF` and `binlog_order_commits=ON`. The
+  check is skipped for an injected `change.Source`.
+- Target: `TRIGGER` and `EVENT` on the target schema, so that sync can see the
+  triggers and events it refuses (see [Schema objects](#schema-objects)).
 - No `ENUM` or `SET` member with a character outside `utf8mb3` (such as a
   4-byte emoji). MySQL reports each such character as `?` in `SHOW CREATE
   TABLE`, which sync replays to create the target table, so sync refuses the
@@ -112,8 +118,10 @@ sync runs; the continuous checksum is the backstop for an object added later.
 The checks read `information_schema`, which lists only the objects the
 connecting user has a privilege on: a trigger needs `TRIGGER` on its table, an
 event needs `EVENT` on the schema, and a routine needs a routine privilege or
-global `SELECT`. Sync does not require these privileges. An object the user
-cannot see is not reported and not refused.
+global `SELECT`. On the target, sync requires `TRIGGER` and `EVENT` on the
+target schema and refuses to start without them, so a trigger or an event it
+must refuse cannot be hidden from it. On the source, sync requires none of
+them: an object the user cannot see is not logged.
 
 ## Autoscaling
 

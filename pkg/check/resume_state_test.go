@@ -49,8 +49,9 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 1: No checkpoint table should fail
 	t.Run("no checkpoint table fails", func(t *testing.T) {
 		r := Resources{
-			Runtime: Move,
-			Sources: []Endpoint{{DB: sourceDB, Config: sourceConfig}},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -85,8 +86,9 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 2: Checkpoint exists but no target tables should fail
 	t.Run("checkpoint exists but no target tables fails", func(t *testing.T) {
 		r := Resources{
-			Runtime: Move,
-			Sources: []Endpoint{{DB: sourceDB, Config: sourceConfig}},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -111,8 +113,9 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 3: Checkpoint and matching target tables should pass
 	t.Run("checkpoint and matching target tables pass", func(t *testing.T) {
 		r := Resources{
-			Runtime: Move,
-			Sources: []Endpoint{{DB: sourceDB, Config: sourceConfig}},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -136,8 +139,9 @@ func TestResumeStateCheck(t *testing.T) {
 			_, _ = targetDB.ExecContext(t.Context(), "DROP TABLE IF EXISTS resume_tgt.test_table")
 		}()
 		r := Resources{
-			Runtime: Move,
-			Sources: []Endpoint{{DB: sourceDB, Config: sourceConfig}},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -155,8 +159,9 @@ func TestResumeStateCheck(t *testing.T) {
 	// Test 5: No source tables should fail
 	t.Run("no source tables fails", func(t *testing.T) {
 		r := Resources{
-			Runtime: Move,
-			Sources: []Endpoint{{DB: sourceDB, Config: sourceConfig}},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -198,8 +203,9 @@ func TestResumeStateCheck(t *testing.T) {
 		}
 
 		r := Resources{
-			Runtime: Move,
-			Sources: []Endpoint{{DB: sourceDB, Config: sourceConfig}},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -231,8 +237,9 @@ func TestResumeStateCheck(t *testing.T) {
 		}
 
 		r := Resources{
-			Runtime: Move,
-			Sources: []Endpoint{{DB: sourceDB, Config: sourceConfig}},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: sourceDB, Config: sourceConfig}},
 			Targets: []applier.Target{
 				{
 					DB:     targetDB,
@@ -280,10 +287,11 @@ func TestResumeStateCheckSchemaTypesAndCollation(t *testing.T) {
 
 	newResources := func() Resources {
 		return Resources{
-			Runtime:      Move,
-			Sources:      []Endpoint{{DB: srcDB, Config: sourceConfig}},
-			Targets:      []applier.Target{{DB: tgtDB, Config: targetConfig}},
-			SourceTables: []*table.TableInfo{sourceTable},
+			Runtime:         Move,
+			CheckpointTable: moveCheckpointTableName,
+			Sources:         []Endpoint{{DB: srcDB, Config: sourceConfig}},
+			Targets:         []applier.Target{{DB: tgtDB, Config: targetConfig}},
+			SourceTables:    []*table.TableInfo{sourceTable},
 		}
 	}
 
@@ -342,10 +350,11 @@ func TestResumeStateCheckMisreportedEnumSetTarget(t *testing.T) {
 	sourceTable := table.NewTableInfo(srcDB, srcName, "t")
 	require.NoError(t, sourceTable.SetInfo(t.Context()))
 	r := Resources{
-		Runtime:      Move,
-		Sources:      []Endpoint{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
-		Targets:      []applier.Target{{DB: tgtDB, Config: &mysql.Config{DBName: tgtName}}},
-		SourceTables: []*table.TableInfo{sourceTable},
+		Runtime:         Move,
+		CheckpointTable: moveCheckpointTableName,
+		Sources:         []Endpoint{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
+		Targets:         []applier.Target{{DB: tgtDB, Config: &mysql.Config{DBName: tgtName}}},
+		SourceTables:    []*table.TableInfo{sourceTable},
 	}
 
 	_, err = tgtDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('😀','a')) DEFAULT CHARSET=utf8mb4")
@@ -358,4 +367,15 @@ func TestResumeStateCheckMisreportedEnumSetTarget(t *testing.T) {
 	_, err = tgtDB.ExecContext(t.Context(), "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, e ENUM('?','a')) DEFAULT CHARSET=utf8mb4")
 	require.NoError(t, err)
 	require.NoError(t, resumeStateCheck(t.Context(), r, slog.Default()))
+}
+
+// TestResumeStateCheckRequiresCheckpointTable: the checkpoint table name comes
+// from the runner, and a resume check without one fails rather than passes.
+func TestResumeStateCheckRequiresCheckpointTable(t *testing.T) {
+	r := Resources{
+		Runtime:      Move,
+		Targets:      []applier.Target{{}},
+		SourceTables: []*table.TableInfo{table.NewTableInfo(nil, "test", "t1")},
+	}
+	require.EqualError(t, resumeStateCheck(t.Context(), r, slog.Default()), "no checkpoint table configured")
 }

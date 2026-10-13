@@ -10,7 +10,10 @@ import (
 )
 
 func init() {
-	register(check{name: "configuration", run: configurationCheck, phases: PhasePreflight, runtimes: Migration | Move})
+	// A sync runs this check only when it reads the source with the built-in
+	// binlog client: the settings are the binary log's, and an injected
+	// change.Source (e.g. a Vitess VStream) does not read it.
+	register(check{name: "configuration", run: configurationCheck, phases: PhasePreflight, runtimes: Migration | Move | Sync})
 }
 
 // configurationCheck checks the configuration of every source. There are some
@@ -94,10 +97,14 @@ func sourceConfiguration(ctx context.Context, runtime Runtime, src Endpoint, log
 	} else if binlogTransactionCompression != "0" {
 		return errors.New("binlog_transaction_compression must be OFF: spirit does not support compressed transactions in the binary log")
 	}
-	var partialRevokes string
-	err = src.DB.QueryRowContext(ctx, `SELECT @@global.partial_revokes`).Scan(&partialRevokes)
-	if err := partialRevokesError(partialRevokes, err); err != nil {
-		return err
+	// partial_revokes only matters to the privileges check, which a sync
+	// does not run.
+	if runtime != Sync {
+		var partialRevokes string
+		err = src.DB.QueryRowContext(ctx, `SELECT @@global.partial_revokes`).Scan(&partialRevokes)
+		if err := partialRevokesError(partialRevokes, err); err != nil {
+			return err
+		}
 	}
 
 	if logBin != "1" {
@@ -109,7 +116,8 @@ func sourceConfiguration(ctx context.Context, runtime Runtime, src Endpoint, log
 		//  its not receiving any updates via the replication stream.
 		return errors.New("log_slave_updates must be enabled")
 	}
-	if performanceSchema != "1" {
+	if performanceSchema != "1" && runtime != Sync {
+		// A sync takes no table locks, so it never force-kills.
 		// Force-kill (the default) uses performance_schema to find and kill
 		// locking transactions via metadata_locks and threads tables. We could technically
 		// support performance_schema = 0 for other cases, but to simplify testing and future

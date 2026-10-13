@@ -66,7 +66,7 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 		if target.DB == nil || target.Config == nil {
 			return fmt.Errorf("target %d database connection or config is not initialized", i)
 		}
-		if err := targetObjectVisibility(ctx, target.DB, target.Config.DBName); err != nil {
+		if err := targetObjectVisibility(ctx, r.Runtime, target.DB, target.Config.DBName); err != nil {
 			return fmt.Errorf("target %d (%s): %w", i, target.Config.DBName, err)
 		}
 	}

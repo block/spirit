@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-
-	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/table"
 )
 
 func init() {
@@ -27,13 +24,18 @@ func init() {
 	// locks, just before traffic is switched: a trigger or an event created on
 	// a target during the copy has already run for the rows written since, and
 	// would go live with the target.
-	register(check{name: "target_schema_objects", run: targetSchemaObjectsCheck, phases: PhasePostSetup | PhaseResume | PhaseCutoverLocked, runtimes: Move})
+	//
+	// A sync runs its post-setup checks on every start, a fresh sync and a
+	// resume, before it creates, drops or writes any target table, including
+	// the --force wipe. It has no cutover, and does not check again while it
+	// runs; the continuous checksum is the backstop for an object added later.
+	register(check{name: "target_schema_objects", run: targetSchemaObjectsCheck, phases: PhasePostSetup | PhaseResume | PhaseCutoverLocked, runtimes: Move | Sync})
 }
 
 // targetObjectKinds are the object kinds refused on a target: triggers and
 // events (indexes into schemaObjectKinds). They run on their own on the
 // target. Views, procedures and functions run only when something invokes
-// them, and move never does.
+// them, and neither move nor sync does.
 var targetObjectKinds = []int{0, 4}
 
 // targetObjectVisibilityKinds is the visibility the target check needs for
@@ -41,19 +43,20 @@ var targetObjectKinds = []int{0, 4}
 var targetObjectVisibilityKinds = []schemaObject{schemaTriggers, schemaEvents}
 
 func targetSchemaObjectsCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
-	return TargetSchemaObjectsError(ctx, r.Targets, r.SourceTables)
+	return TargetSchemaObjectsError(ctx, r)
 }
 
 // TargetSchemaObjectsError returns a refusal (see ErrRefused) listing, for
-// every target, each trigger on a table move writes to and each event in the
-// target schema, grouped by target, or nil.
+// every target in r.Targets, each trigger on a table the run writes to and
+// each event in the target schema, grouped by target, or nil.
 //
-// Move writes to the moved tables on every target, and to its checkpoint table
-// on targets[0]. A pre-created target table may carry a trigger (target_state
-// accepts an empty table whose definition matches the source), and a trigger
-// fires once for every copied row and again for every replayed change, so its
-// writes are applied twice or more. An event runs on its own schedule and can
-// write to the moved tables. A trigger on another table is not refused: it
+// The run writes to r.SourceTables on every target, and to r.CheckpointTable
+// on targets[0]. A pre-created target table may carry a trigger (move's
+// target_state accepts an empty table whose definition matches the source,
+// and a sync resumes onto tables that exist), and a trigger fires once for
+// every copied row and again for every replayed change, so its writes are
+// applied twice or more. An event runs on its own schedule and can write to
+// the tables the run writes to. A trigger on another table is not refused: it
 // fires only when something else writes to that table.
 //
 // Table names are compared the way the target compares them: case-insensitively
@@ -65,26 +68,26 @@ func targetSchemaObjectsCheck(ctx context.Context, r Resources, _ *slog.Logger) 
 //
 // --force does not bypass the refusal: the runner runs this check before it
 // wipes the target, and the wipe never drops events.
-func TargetSchemaObjectsError(ctx context.Context, targets []applier.Target, tables []*table.TableInfo) error {
+func TargetSchemaObjectsError(ctx context.Context, r Resources) error {
 	var groups []string
-	for i, target := range targets {
+	for i, target := range r.Targets {
 		if target.DB == nil || target.Config == nil {
 			return fmt.Errorf("target %d database connection or config is not initialized", i)
 		}
 		schema := target.Config.DBName
-		if err := targetObjectVisibility(ctx, target.DB, schema); err != nil {
+		if err := targetObjectVisibility(ctx, r.Runtime, target.DB, schema); err != nil {
 			return fmt.Errorf("target %d (%s): %w", i, schema, err)
 		}
 		var lowerCaseTableNames int
 		if err := target.DB.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
 			return fmt.Errorf("failed to read lower_case_table_names on target %d (%s): %w", i, schema, err)
 		}
-		written := make([]string, 0, len(tables)+1)
-		for _, t := range tables {
+		written := make([]string, 0, len(r.SourceTables)+1)
+		for _, t := range r.SourceTables {
 			written = append(written, t.TableName)
 		}
-		if i == 0 {
-			written = append(written, moveCheckpointTableName)
+		if i == 0 && r.CheckpointTable != "" {
+			written = append(written, r.CheckpointTable)
 		}
 		objects, err := schemaObjects(ctx, target.DB, schema, targetObjectKinds)
 		if err != nil {
@@ -97,8 +100,9 @@ func TargetSchemaObjectsError(ctx context.Context, targets []applier.Target, tab
 	if len(groups) == 0 {
 		return nil
 	}
-	return refuse(fmt.Errorf("cannot move: triggers on the tables move writes to on the target, and events in the target schema, run on their own and can write to the moved tables; they must be dropped before the move can continue: %s",
-		strings.Join(groups, "; ")))
+	noun := r.Runtime.noun()
+	return refuse(fmt.Errorf("cannot %s: triggers on the tables %s writes to on the target, and events in the target schema, run on their own and can write to the %s tables; they must be dropped before the %s can continue: %s",
+		noun, noun, r.Runtime.participle(), noun, strings.Join(groups, "; ")))
 }
 
 // refusedTargetObjects describes the objects the target check refuses: every

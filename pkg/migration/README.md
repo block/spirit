@@ -197,7 +197,7 @@ Package [`pkg/check`](../check/README.md) holds the rules that decide whether Sp
 |-------|-------------|--------|
 | `PhasePreRun` | `Migration.Run`, before `Runner.Run` (see [below](#using-spirit-migration-as-a-go-package)) | `version` |
 | `PhaseStatement` | Before advisory locks and the INSTANT/INPLACE attempt | `addforeignkey`, `enumReorder`, `enumSetRemoval`, `illegalClause`, `primarykey`, `primarykeybit`, `primarykeycollationstatement`, `primarykeyexists`, `primarykeyfloat`, `setReorder`, `tableidentifier` |
-| `PhasePreflight` | After the INSTANT/INPLACE attempt fails, before setup | `addforeignkey`, `configuration`, `dropadd`, `enumReorder`, `enumSetRemoval`, `hasforeignkeys`, `hastriggers`, `illegalClause`, `primarykey`, `privileges`, `rename`, `replica`, `setReorder`, `settings`, `tableidentifier`, `tablename` |
+| `PhasePreflight` | After the INSTANT/INPLACE attempt fails, before setup | `addforeignkey`, `configuration`, `dropadd`, `enumReorder`, `enumSetRemoval`, `hasforeignkeys`, `hastriggers`, `illegalClause`, `primarykey`, `privileges`, `rename`, `replica`, `setReorder`, `settings`, `tableidentifier`, `tablename`, `version` |
 | `PhasePostSetup` | After `_new` exists, before the copy | `hasforeignkeys`, `primarykeybit`, `primarykeycollation`, `primarykeyfloat`, `replicahealth` |
 | `PhaseCutover` | After the sentinel wait, before cutover | `hasforeignkeys`, `hastriggers`, `replicahealth` |
 | `PhaseCutoverLocked` | Inside cutover, while the table lock is held | `hasforeignkeys`, `hastriggers` |

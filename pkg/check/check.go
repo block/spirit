@@ -167,12 +167,15 @@ type Resources struct {
 	// Sources are the servers the run reads from. A migration has exactly
 	// one: the server it alters the table on.
 	Sources []Endpoint
-	// Targets are the servers a move writes to.
+	// Targets are the servers a move or a sync writes to.
 	Targets []applier.Target
 	// SourceTables are the first source's tables. They stand for every
 	// source where only their reported definition matters; Sources[i].Tables
-	// holds each source's own (Move only).
+	// holds each source's own (Move and Sync).
 	SourceTables []*table.TableInfo
+	// CheckpointTable is the checkpoint table the run writes on Targets[0]
+	// (Move and Sync).
+	CheckpointTable string
 	// Replicas are the migration's replicas, for the replica checks.
 	Replicas []*sql.DB
 	// Change is the migration's table and statement (Migration only).
@@ -301,6 +304,11 @@ func (r Resources) sourceError(i int, err error) error {
 	return fmt.Errorf("source %d: %w", i, err)
 }
 
+// tableError attributes err to the source table named table.
+func (r Resources) tableError(table string, err error) error {
+	return fmt.Errorf("table '%s' cannot be %s: %w", table, r.Runtime.participle(), err)
+}
+
 // noun names the runtime's operation in an error message ("run a migration").
 func (rt Runtime) noun() string {
 	switch rt {
@@ -312,4 +320,17 @@ func (rt Runtime) noun() string {
 		return "sync"
 	}
 	return "spirit operation"
+}
+
+// participle completes "cannot be ..." in an error message ("cannot be moved").
+func (rt Runtime) participle() string {
+	switch rt {
+	case Migration:
+		return "migrated"
+	case Move:
+		return "moved"
+	case Sync:
+		return "synced"
+	}
+	return "processed"
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -37,6 +38,10 @@ func schemaObjectsTestDBs(t *testing.T, prefix string) (src, dest *mysql.Config)
 	testutils.RunSQL(t, "CREATE DATABASE "+src.DBName)
 	return src, dest
 }
+
+// targetObjectsRefusal is the start of pkg/check's refusal of target triggers
+// and events, for a sync.
+const targetObjectsRefusal = "cannot sync: triggers on the tables sync writes to on the target, and events in the target schema, run on their own and can write to the synced tables; they must be dropped before the sync can continue: "
 
 func newSchemaObjectsSync(src, dest *mysql.Config) *Sync {
 	return &Sync{
@@ -97,7 +102,7 @@ func TestSyncSkipsSourceViews(t *testing.T) {
 		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'v1'", dest.DBName),
 		"the view must not be created on the target, as a table or a view")
 	require.Contains(t, logs.String(), `msg="Source schema objects are not synced"`)
-	require.Contains(t, logs.String(), "views=[v1]")
+	require.Contains(t, logs.String(), `views="[view 'v1']"`)
 }
 
 // TestSyncLogsSourceTriggersRoutinesAndEvents: source triggers, procedures,
@@ -138,35 +143,9 @@ func TestSyncLogsSourceTriggersRoutinesAndEvents(t *testing.T) {
 		"source triggers are not copied")
 	out := logs.String()
 	require.Equal(t, 1, strings.Count(out, `msg="Source schema objects are not synced"`), out)
-	require.Contains(t, out, `triggers="[trigger \"t1_ai\" on table \"t1\"]"`)
-	require.Contains(t, out, `routines="[procedure \"p1\" function \"f1\"]"`)
-	require.Contains(t, out, `events="[event \"e1\"]"`)
-}
-
-// TestSyncSourceObjectsLogIsBestEffort: listing the source's schema objects
-// never fails the sync. A source whose queries fail (here, a closed pool) is
-// logged at Debug and skipped.
-func TestSyncSourceObjectsLogIsBestEffort(t *testing.T) {
-	db, err := sql.Open("block-mysql", testutils.DSN())
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-	var logs bytes.Buffer
-	r := &Runner{
-		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		source: sourceInfo{db: db, config: &mysql.Config{DBName: "src"}},
-	}
-	r.logUnsyncedSourceObjects(t.Context(), nil)
-	out := logs.String()
-	for _, what := range []string{"triggers", "routines", "events"} {
-		require.Contains(t, out, `level=DEBUG msg="could not list source `+what+`; not reporting them"`)
-	}
-	require.NotContains(t, out, "level=INFO")
-
-	// The views getTables skipped are still logged.
-	logs.Reset()
-	r.logUnsyncedSourceObjects(t.Context(), []string{"v1"})
-	require.Contains(t, logs.String(), `level=INFO msg="Source schema objects are not synced"`)
-	require.Contains(t, logs.String(), "views=[v1]")
+	require.Contains(t, out, `triggers="[trigger 't1_ai' on table 't1']"`)
+	require.Contains(t, out, `routines="[procedure 'p1' function 'f1']"`)
+	require.Contains(t, out, `events="[event 'e1']"`)
 }
 
 // TestSyncRefusesTargetTrigger: a trigger on a target table that sync writes
@@ -185,9 +164,8 @@ func TestSyncRefusesTargetTrigger(t *testing.T) {
 	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE TRIGGER other_bi BEFORE INSERT ON other FOR EACH ROW SET NEW.id = NEW.id")
 
 	err := runSync(t, newSchemaObjectsSync(src, dest), nil)
-	require.EqualError(t, err, `cannot sync: target schema "`+dest.DBName+`" has triggers on tables sync writes to, or events; `+
-		`they run on the target on their own and can write to those tables, so rows could be applied twice or diverge from the source; `+
-		`drop them before the sync can continue: trigger "t1_bi" on table "t1"`)
+	require.EqualError(t, err, targetObjectsRefusal+"target 0 ("+dest.DBName+"): trigger 't1_bi' on table 't1'")
+	require.ErrorIs(t, err, check.ErrRefused)
 
 	db := openDB(t, dest)
 	require.Zero(t, countIn(t, db, "SELECT COUNT(*) FROM "+dest.DBName+".t1"), "nothing may be copied into the target")
@@ -203,8 +181,7 @@ func TestSyncRefusesTargetEvent(t *testing.T) {
 	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
 
 	err := runSync(t, newSchemaObjectsSync(src, dest), nil)
-	require.ErrorContains(t, err, `cannot sync: target schema "`+dest.DBName+`" has triggers on tables sync writes to, or events;`)
-	require.ErrorContains(t, err, `drop them before the sync can continue: event "e1"`)
+	require.EqualError(t, err, targetObjectsRefusal+"target 0 ("+dest.DBName+"): event 'e1'")
 	require.Empty(t, targetTables(t, openDB(t, dest), dest.DBName), "no table may be created on the target")
 }
 
@@ -217,7 +194,7 @@ func TestSyncRefusesTargetEventWithOnlySourceViews(t *testing.T) {
 	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
 
 	err := runSync(t, newSchemaObjectsSync(src, dest), nil)
-	require.ErrorContains(t, err, `drop them before the sync can continue: event "e1"`)
+	require.EqualError(t, err, targetObjectsRefusal+"target 0 ("+dest.DBName+"): event 'e1'")
 }
 
 // TestSyncTargetTriggerMatchFollowsLowerCaseTableNames: with
@@ -250,7 +227,7 @@ func TestSyncRefusesTriggerOnCheckpointTable(t *testing.T) {
 
 	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE TRIGGER ckpt_bu BEFORE UPDATE ON _spirit_sync_checkpoint FOR EACH ROW SET NEW.copier_watermark = NEW.copier_watermark")
 	err := runSync(t, newSchemaObjectsSync(src, dest), nil)
-	require.ErrorContains(t, err, `drop them before the sync can continue: trigger "ckpt_bu" on table "_spirit_sync_checkpoint"`)
+	require.EqualError(t, err, targetObjectsRefusal+"target 0 ("+dest.DBName+"): trigger 'ckpt_bu' on table '_spirit_sync_checkpoint'")
 }
 
 // TestSyncAllowsTargetViewsAndRoutines: target views, procedures and
@@ -293,7 +270,7 @@ func TestSyncResumeRefusesTargetTrigger(t *testing.T) {
 	testutils.RunSQLInDatabaseAsRoot(t, dest.DBName, "CREATE TRIGGER t1_bu BEFORE UPDATE ON t1 FOR EACH ROW SET NEW.val = 'changed'")
 	testutils.RunSQLInDatabase(t, src.DBName, "INSERT INTO t1 VALUES (3,'three')")
 	err := runSync(t, newSchemaObjectsSync(src, dest), nil)
-	require.ErrorContains(t, err, `drop them before the sync can continue: trigger "t1_bu" on table "t1"`)
+	require.EqualError(t, err, targetObjectsRefusal+"target 0 ("+dest.DBName+"): trigger 't1_bu' on table 't1'")
 	require.Equal(t, 2, countIn(t, db, "SELECT COUNT(*) FROM "+dest.DBName+".t1"), "nothing may be applied to the target")
 	require.Equal(t, before, checkpointRow(), "the checkpoint must not move")
 
@@ -303,7 +280,7 @@ func TestSyncResumeRefusesTargetTrigger(t *testing.T) {
 	s := newSchemaObjectsSync(src, dest)
 	s.Force = true
 	err = runSync(t, s, nil)
-	require.ErrorContains(t, err, `drop them before the sync can continue: trigger "t1_bu" on table "t1"`)
+	require.EqualError(t, err, targetObjectsRefusal+"target 0 ("+dest.DBName+"): trigger 't1_bu' on table 't1'")
 	require.Equal(t, 2, countIn(t, db, "SELECT COUNT(*) FROM "+dest.DBName+".t1"), "--force must not wipe the target")
 }
 

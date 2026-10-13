@@ -1309,7 +1309,7 @@ func TestSyncDeferSecondaryIndexesCreateAndRestore(t *testing.T) {
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
 
 	ctx := context.Background()
-	tables, _, err := runner.getTables(ctx)
+	tables, err := runner.getTables(ctx)
 	require.NoError(t, err)
 	runner.sourceTables = tables
 
@@ -1635,7 +1635,7 @@ func TestSyncTargetSchemaVerifyIgnoresDeferredIndexes(t *testing.T) {
 	runner.target = applier.Target{KeyRange: "0", DB: targetDB, Config: dest}
 
 	ctx := context.Background()
-	tables, _, err := runner.getTables(ctx)
+	tables, err := runner.getTables(ctx)
 	require.NoError(t, err)
 	runner.sourceTables = tables
 
@@ -1737,7 +1737,7 @@ func TestSyncRefusesUnsupportedNames(t *testing.T) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	for _, tc := range []struct{ name, srcDB, table, want string }{
-		{"dot in table name", "sync_dot_tbl_src", "dot.name", `cannot sync table "dot.name": table name "dot.name" contains a '.'`},
+		{"dot in table name", "sync_dot_tbl_src", "dot.name", `table 'dot.name' cannot be synced: table name "dot.name" contains a '.'`},
 		{"backtick in table name", "sync_bt_tbl_src", "back`tick", "table name \"back`tick\" contains a backtick"},
 		{"dot in source schema name", "sync.dot_schema_src", "t1", `cannot sync: source schema name "sync.dot_schema_src" contains a '.'`},
 	} {
@@ -1803,7 +1803,7 @@ func TestSyncRefusesEnumSetMembersOutsideUTF8MB3(t *testing.T) {
 	defer cancel()
 	err = runner.Run(ctx)
 	require.NoError(t, runner.Close())
-	require.ErrorContains(t, err, `cannot sync table "t1": column "s" of table "t1" is set('?','x'), but MySQL stores a member with a character outside utf8mb3 there`)
+	require.ErrorContains(t, err, `table 't1' cannot be synced: column "s" of table "t1" is set('?','x'), but MySQL stores a member with a character outside utf8mb3 there`)
 
 	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
@@ -1865,13 +1865,13 @@ func TestSyncRefusesFloatAndBitPrimaryKeys(t *testing.T) {
 			name:   "float",
 			create: "CREATE TABLE %s.readings (id INT NOT NULL, f FLOAT NOT NULL, PRIMARY KEY (id, f))",
 			insert: "INSERT INTO %s.readings VALUES (1, 0.1), (2, 0.2)",
-			want:   `cannot sync table "readings": primary key column "f" of table "readings" is a FLOAT, which is not supported`,
+			want:   `table 'readings' cannot be synced: primary key column "f" of table "readings" is a FLOAT, which is not supported`,
 		},
 		{
 			name:   "bit",
 			create: "CREATE TABLE %s.readings (b BIT(16) NOT NULL PRIMARY KEY, v INT)",
 			insert: "INSERT INTO %s.readings VALUES (1, 1), (2, 2)",
-			want:   `cannot sync table "readings": primary key column "b" of table "readings" is a BIT, which is not supported`,
+			want:   `table 'readings' cannot be synced: primary key column "b" of table "readings" is a BIT, which is not supported`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

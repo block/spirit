@@ -1404,7 +1404,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		// schema-objects check here: with no tables there is no table trigger
 		// to match, but a target event (or a trigger on a leftover checkpoint
 		// table) is still refused before the cutover callback.
-		if err := check.TargetSchemaObjectsError(ctx, r.targets, nil); err != nil {
+		if err := check.TargetSchemaObjectsError(ctx, r.checkResources()); err != nil {
 			return err
 		}
 		r.logger.Info("No tables to copy, proceeding directly to cutover")
@@ -1735,11 +1735,12 @@ func (r *Runner) checkResources() check.Resources {
 		}
 	}
 	return check.Resources{
-		Runtime:      check.Move,
-		Sources:      sources,
-		Targets:      r.targets,
-		SourceTables: r.sourceTables,
-		Options:      check.Options{MoveEverything: len(r.move.SourceTables) == 0},
+		Runtime:         check.Move,
+		Sources:         sources,
+		Targets:         r.targets,
+		SourceTables:    r.sourceTables,
+		CheckpointTable: checkpointTableName,
+		Options:         check.Options{MoveEverything: len(r.move.SourceTables) == 0},
 	}
 }
 
