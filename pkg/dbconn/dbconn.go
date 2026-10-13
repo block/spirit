@@ -21,9 +21,9 @@ import (
 	"github.com/block/spirit/pkg/utils"
 )
 
+// MySQL error numbers with no constant in pkg/parser/mysql. The rest come from
+// there (parsermysql.ErrLockWaitTimeout, ...).
 const (
-	errLockWaitTimeout = 1205
-	errDeadlock        = 1213
 	// errCannotConnect (2003) and errConnLost (2013) are client-library CR_*
 	// codes: go-sql-driver itself never returns them as a *mysql.MySQLError
 	// (client-side failures surface as driver.ErrBadConn or
@@ -39,19 +39,7 @@ const (
 	// wait_timeout kill can also surface as a bare driver.ErrBadConn — so
 	// both shapes must classify the same way.
 	errClientInteractionTimeout = 4031
-	// errReadOnly (1290), errReadOnlyTransaction (1792) and errReadOnlyMode
-	// (1836) are consumed by the driver and converted to driver.ErrBadConn,
-	// unconditionally now that rejectReadOnly is not an option. They are kept
-	// here for the one case the driver exempts: a transaction the caller
-	// opened with sql.TxOptions{ReadOnly: true}, where the read-only error is
-	// the answer that was asked for and database/sql would not retry anyway.
-	errReadOnly            = 1290
-	errReadOnlyTransaction = 1792 // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
-	errReadOnlyMode        = 1836
-	errQueryInterrupted    = 1317 // ER_QUERY_INTERRUPTED: query was killed (e.g. KILL QUERY)
-	errCapacityExceeded    = 3170
-	errFoundDuppKey        = 1062 // yes I know there's a typo
-	errDeprecatedSyntax    = 1287 // ER_WARN_DEPRECATED_SYNTAX: "'%s' is deprecated and will be removed in a future release"
+	errCapacityExceeded         = 3170 // ER_CAPACITY_EXCEEDED
 )
 
 type DBConfig struct {
@@ -229,8 +217,14 @@ func canRetryError(err error) bool {
 		return false
 	}
 	switch val.Number {
-	case errLockWaitTimeout, errDeadlock, errReadOnly,
-		errReadOnlyTransaction, errReadOnlyMode, errQueryInterrupted:
+	// The read-only errors (1290, 1792, 1836) are consumed by the driver and
+	// converted to driver.ErrBadConn, unconditionally now that rejectReadOnly
+	// is not an option. They are listed for the one case the driver exempts:
+	// a transaction the caller opened with sql.TxOptions{ReadOnly: true},
+	// where the read-only error is the answer that was asked for and
+	// database/sql would not retry anyway.
+	case parsermysql.ErrLockWaitTimeout, parsermysql.ErrLockDeadlock, parsermysql.ErrOptionPreventsStatement,
+		parsermysql.ErrCantExecuteInReadOnlyTransaction, parsermysql.ErrReadOnlyMode, parsermysql.ErrQueryInterrupted:
 		return true
 	default:
 		return false
@@ -254,7 +248,7 @@ func IsLockContentionError(err error) bool {
 	if !ok {
 		return false
 	}
-	return val.Number == errLockWaitTimeout || val.Number == errDeadlock
+	return val.Number == parsermysql.ErrLockWaitTimeout || val.Number == parsermysql.ErrLockDeadlock
 }
 
 // DupKeyHandling selects how RetryableTransaction treats duplicate-key (1062)
@@ -271,6 +265,54 @@ const (
 	// IgnoreDupKeyWarnings tolerates duplicate-key warnings.
 	IgnoreDupKeyWarnings
 )
+
+// checkWarnings returns an error for any SHOW WARNINGS entry left by the
+// statement just executed on trx, other than the ones RetryableTransaction
+// tolerates. fatal reports that retrying the transaction cannot help.
+func checkWarnings(ctx context.Context, trx *sql.Tx, dupKeyHandling DupKeyHandling) (fatal bool, err error) {
+	rows, err := trx.QueryContext(ctx, "SHOW WARNINGS")
+	if err != nil {
+		return false, err
+	}
+	defer utils.CloseAndLog(rows)
+	var level, message string
+	var code int
+	for rows.Next() {
+		if err := rows.Scan(&level, &code, &message); err != nil {
+			return false, err
+		}
+		// We won't receive out of range warnings (1264)
+		// because the SQL mode has been unset. This is important
+		// because a historical value like 0000-00-00 00:00:00
+		// might exist in the table and needs to be copied.
+		switch {
+		case code == parsermysql.ErrDupEntry && dupKeyHandling == IgnoreDupKeyWarnings:
+			continue // ignore duplicate key warnings
+		case code == parsermysql.ErrWarnDeprecatedSyntax:
+			// A deprecation notice, raised when the statement is
+			// parsed; it says nothing about the rows written. The
+			// binlog applier emits the charset introducer of a
+			// column's own charset (see table.Datum.String), and
+			// naming one MySQL has deprecated (ucs2, macroman,
+			// macce, dec8, hp8) in any form raises this warning.
+			continue
+		case code == errCapacityExceeded:
+			// "Memory capacity of 8388608 bytes for 'range_optimizer_max_mem_size' exceeded.
+			// Range optimization was not done for this query."
+			// i.e. the query can still execute, but it won't be efficient. Prior to
+			// https://github.com/block/spirit/issues/239 we allowed this warning
+			// to be ignored. *However* if range optimization is disabled the query is going to
+			// tablescan, so it's better to just bail out and present a useful error message.
+			return true, errors.New("MySQL refused to optimize a statement because the value of 'range_optimizer_max_mem_size' is too low. Please decrease the target-chunk-size, or increase the value of 'range_optimizer_max_mem_size'")
+		default:
+			return true, &UnsafeWarningError{Warning: &mysql.MySQLError{
+				Number:  uint16(code),
+				Message: message,
+			}}
+		}
+	}
+	return false, rows.Err()
+}
 
 // RetryableTransaction retries all statements in a transaction, retrying if a statement
 // errors, or there is a deadlock. It will retry up to maxRetries times.
@@ -316,57 +358,9 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 					}
 					return
 				}
-				// Even though there was no ERROR we still need to inspect SHOW WARNINGS
-				// This is because many of the statements use INSERT IGNORE.
-				var warningRes *sql.Rows
-				warningRes, err = trx.QueryContext(ctx, "SHOW WARNINGS")
-				if err != nil {
-					return
-				}
-				defer utils.CloseAndLog(warningRes)
-				var level, message string
-				var code int
-				for warningRes.Next() {
-					err = warningRes.Scan(&level, &code, &message)
-					if err != nil {
-						return
-					}
-					// We won't receive out of range warnings (1264)
-					// because the SQL mode has been unset. This is important
-					// because a historical value like 0000-00-00 00:00:00
-					// might exist in the table and needs to be copied.
-					switch {
-					case code == errFoundDuppKey && dupKeyHandling == IgnoreDupKeyWarnings:
-						continue // ignore duplicate key warnings
-					case code == errDeprecatedSyntax:
-						// A deprecation notice, raised when the statement is
-						// parsed; it says nothing about the rows written. The
-						// binlog applier emits the charset introducer of a
-						// column's own charset (see table.Datum.String), and
-						// naming one MySQL has deprecated (ucs2, macroman,
-						// macce, dec8, hp8) in any form raises this warning.
-						continue
-					case code == errCapacityExceeded:
-						// "Memory capacity of 8388608 bytes for 'range_optimizer_max_mem_size' exceeded.
-						// Range optimization was not done for this query."
-						// i.e. the query can still execute, but it won't be efficient. Prior to
-						// https://github.com/block/spirit/issues/239 we allowed this warning
-						// to be ignored. *However* if range optimization is disabled the query is going to
-						// tablescan, so it's better to just bail out and present a useful error message.
-						isFatal = true
-						err = errors.New("MySQL refused to optimize a statement because the value of 'range_optimizer_max_mem_size' is too low. Please decrease the target-chunk-size, or increase the value of 'range_optimizer_max_mem_size'")
-						return
-					default:
-						isFatal = true
-						err = &UnsafeWarningError{Warning: &mysql.MySQLError{
-							Number:  uint16(code),
-							Message: message,
-						}}
-						return
-					}
-				}
-				if warningRes.Err() != nil {
-					err = warningRes.Err()
+				// Even though there was no ERROR we still need to inspect SHOW
+				// WARNINGS: an INSERT IGNORE turns row errors into warnings.
+				if isFatal, err = checkWarnings(ctx, trx, dupKeyHandling); err != nil {
 					return
 				}
 				// As long as it is a statement that supports affected rows (err == nil)
@@ -698,7 +692,7 @@ func shouldRetryForceExecAfterKill(err error, killAttempted bool) bool {
 
 func isLockWaitTimeout(err error) bool {
 	val, ok := errors.AsType[*mysql.MySQLError](err)
-	return ok && val.Number == errLockWaitTimeout
+	return ok && val.Number == parsermysql.ErrLockWaitTimeout
 }
 
 // Exec is like db.Exec but only returns an error.

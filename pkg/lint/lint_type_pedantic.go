@@ -400,8 +400,8 @@ func (l *TypePedanticLinter) sameNameTypes(refs []tpColRef) []Violation {
 	}
 
 	var violations []Violation
-	majority, clear := tpPickMajority(typeCounts)
-	if clear {
+	majority, dominant := tpPickMajority(typeCounts)
+	if dominant {
 		majorityTables := tpDedupeStrings(typeTables[majority])
 		for _, r := range refs {
 			if r.typ == majority {
@@ -475,14 +475,14 @@ func (l *TypePedanticLinter) sameNameCollations(refs []tpColRef) []Violation {
 	}
 
 	var violations []Violation
-	expected, clear := tpPickMajority(counts)
+	expected, dominant := tpPickMajority(counts)
 	if current, ok := tpCurrentCollation(slices.Sorted(maps.Keys(counts))); ok {
 		// One collation in use replaces every other, so it is the one to
 		// converge on even when it is not the most common: converging on the
 		// majority would move columns onto an obsolete collation.
-		expected, clear = current, true
+		expected, dominant = current, true
 	}
-	if clear {
+	if dominant {
 		expectedTables := tpDedupeStrings(tablesByCollation[expected])
 		for _, r := range determined {
 			if r.collation == expected {

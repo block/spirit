@@ -364,8 +364,7 @@ func (c *gtidClient) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start GTID binlog streamer: %w", err)
 	}
 	ctx, c.cancelFunc = context.WithCancel(ctx)
-	c.streamWG.Add(1)
-	go c.readStream(ctx)
+	c.streamWG.Go(func() { c.readStream(ctx) })
 	return nil
 }
 
@@ -411,8 +410,6 @@ func (c *gtidClient) recreateStreamer() error {
 // dispatches RowsEvent to subscriptions, surfaces DDL via the cancel
 // callback, and advances the resume coordinate per-transaction.
 func (c *gtidClient) readStream(ctx context.Context) {
-	defer c.streamWG.Done()
-
 	consecutiveErrors := 0
 	recreateAttempts := 0
 	backoffDuration := initialBackoffDuration

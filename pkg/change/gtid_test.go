@@ -960,8 +960,7 @@ func TestGTIDClientXAGuardStream(t *testing.T) {
 		client.bufferedGTID = empty
 		client.flushedGTID = empty.Clone()
 		client.cancelFunc = cancel
-		client.streamWG.Add(1)
-		go client.readStream(ctx)
+		client.streamWG.Go(func() { client.readStream(ctx) })
 		t.Cleanup(client.Close)
 		return client, streamer, &gotReason
 	}
@@ -1204,8 +1203,7 @@ func TestGTIDClientSavepointPromotionOrdering(t *testing.T) {
 	client.bufferedGTID = empty
 	client.flushedGTID = empty.Clone()
 	client.cancelFunc = cancel
-	client.streamWG.Add(1)
-	go client.readStream(ctx)
+	client.streamWG.Go(func() { client.readStream(ctx) })
 	defer client.Close()
 
 	const sid = "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff"
@@ -1456,8 +1454,7 @@ func TestGTIDClientQueryPromotionOrdering(t *testing.T) {
 	client.bufferedGTID = empty
 	client.flushedGTID = empty.Clone()
 	client.cancelFunc = cancel
-	client.streamWG.Add(1)
-	go client.readStream(ctx)
+	client.streamWG.Go(func() { client.readStream(ctx) })
 	defer client.Close()
 
 	const sid = "aaaaaaaa-bbbb-cccc-dddd-000000000000"

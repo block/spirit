@@ -334,8 +334,7 @@ func (c *binlogClient) Start(ctx context.Context) error {
 	// Start the binlog reader in a go routine, using a context with cancel.
 	// Write the cancel function to c.cancelFunc
 	ctx, c.cancelFunc = context.WithCancel(ctx)
-	c.streamWG.Add(1)
-	go c.readStream(ctx)
+	c.streamWG.Go(func() { c.readStream(ctx) })
 	return nil
 }
 
@@ -396,8 +395,6 @@ func (c *binlogClient) recreateStreamer() error {
 // It will read the stream until the context is closed
 // *and* it continues on any errors
 func (c *binlogClient) readStream(ctx context.Context) {
-	defer c.streamWG.Done() // Signal completion when goroutine exits
-
 	c.mu.Lock()
 	currentLogName := c.flushedPos.Name
 	startPos := c.flushedPos // Copy while holding lock

@@ -243,8 +243,7 @@ func (a *MySQLApplier) Start(ctx context.Context) error {
 
 	// Start a single feedback coordinator for all shards, before the workers,
 	// so completions are always drained.
-	a.wg.Add(1)
-	go a.feedbackCoordinator(workerCtx)
+	a.wg.Go(func() { a.feedbackCoordinator(workerCtx) })
 
 	// Report pipeline gauges (aggregated across shards) for the applier's
 	// lifetime. Exits on Stop()'s context cancellation; joined via a.wg.
@@ -733,7 +732,6 @@ func (a *MySQLApplier) writeChunklet(ctx context.Context, shard *shardTarget, ch
 // ctx is the worker context; once it is cancelled, completions for already-cleaned-up
 // work are an expected part of shutdown rather than a bug (see Apply's ctx-cancel cleanup).
 func (a *MySQLApplier) feedbackCoordinator(ctx context.Context) {
-	defer a.wg.Done()
 	a.logger.Debug("feedbackCoordinator started")
 
 	// processCompletion handles a single chunklet completion.

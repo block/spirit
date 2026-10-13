@@ -321,7 +321,7 @@ func formatAddConstraint(constr *Constraint) string {
 
 	switch constr.Type {
 	case "CHECK":
-		clause := ""
+		var clause string
 		if constr.Name != "" {
 			clause = fmt.Sprintf("ADD CONSTRAINT %s CHECK (%s)", sqlescape.EscapeIdentifier(constr.Name), *constr.Expression)
 		} else {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -342,12 +343,12 @@ func TestRetryableTrxRetriesKilledConnection(t *testing.T) {
 
 func TestShouldRetryForceExecAfterKill(t *testing.T) {
 	require.False(t, shouldRetryForceExecAfterKill(nil, true))
-	require.False(t, shouldRetryForceExecAfterKill(&mysql.MySQLError{Number: errLockWaitTimeout}, false))
-	require.False(t, shouldRetryForceExecAfterKill(&mysql.MySQLError{Number: errDeadlock}, true))
+	require.False(t, shouldRetryForceExecAfterKill(&mysql.MySQLError{Number: parsermysql.ErrLockWaitTimeout}, false))
+	require.False(t, shouldRetryForceExecAfterKill(&mysql.MySQLError{Number: parsermysql.ErrLockDeadlock}, true))
 	require.False(t, shouldRetryForceExecAfterKill(errors.New("not a mysql error"), true))
-	require.True(t, shouldRetryForceExecAfterKill(&mysql.MySQLError{Number: errLockWaitTimeout}, true))
+	require.True(t, shouldRetryForceExecAfterKill(&mysql.MySQLError{Number: parsermysql.ErrLockWaitTimeout}, true))
 	require.True(t, shouldRetryForceExecAfterKill(fmt.Errorf("force exec failed: %w",
-		&mysql.MySQLError{Number: errLockWaitTimeout}), true))
+		&mysql.MySQLError{Number: parsermysql.ErrLockWaitTimeout}), true))
 }
 
 // killedSessionLingersReason is why tests that force-kill an idle MDL holder

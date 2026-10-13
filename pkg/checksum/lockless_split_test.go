@@ -520,7 +520,7 @@ func TestHotSplitDescendantsDoNotWaitForHotness(t *testing.T) {
 	require.NoError(t, res.err)
 	require.Len(t, res.children, 11)
 	var queued []*retryEntry
-	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { queued = append(queued, e); return nil }))
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) { queued = append(queued, e) }))
 	require.Len(t, queued, 11)
 	for i, e := range queued {
 		require.True(t, e.fresh)
@@ -600,7 +600,7 @@ func TestHotSplitBudgetIsSharedPerRoot(t *testing.T) {
 	res := c.executeWork(t.Context(), first)
 	require.Len(t, res.children, 3)
 	var descendants []*retryEntry
-	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { descendants = append(descendants, e); return nil }))
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) { descendants = append(descendants, e) }))
 	sibling := &workItem{chunk: descendants[0].chunk, splitDepth: 2, splitBudget: descendants[0].splitBudget}
 	for range hotSplitRootLimit - 1 {
 		require.Len(t, c.executeWork(t.Context(), sibling).children, 3)
@@ -616,7 +616,7 @@ func TestHotSplitBudgetIsSharedPerRoot(t *testing.T) {
 	first.attempts = 1
 	res = c.executeWork(t.Context(), first)
 	var retry *retryEntry
-	require.NoError(t, c.handleResult(res, func(e *retryEntry) error { retry = e; return nil }))
+	require.NoError(t, c.handleResult(res, func(e *retryEntry) { retry = e }))
 	require.NotNil(t, retry)
 	require.Same(t, first.splitBudget, retry.splitBudget)
 	require.False(t, res.passed)

@@ -252,16 +252,16 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 // unnamedIndexDefinition compares unnamed indexes by their full definition,
 // including key order, expressions, prefix lengths, and options.
 func unnamedIndexDefinition(constraint *ast.Constraint) (string, error) {
-	copy := *constraint
-	copy.Name = ""
-	switch copy.Tp { //nolint:exhaustive
+	bare := *constraint
+	bare.Name = ""
+	switch bare.Tp { //nolint:exhaustive
 	case ast.ConstraintKey:
-		copy.Tp = ast.ConstraintIndex
+		bare.Tp = ast.ConstraintIndex
 	case ast.ConstraintUniq, ast.ConstraintUniqKey:
-		copy.Tp = ast.ConstraintUniqIndex
+		bare.Tp = ast.ConstraintUniqIndex
 	}
 	var sb strings.Builder
-	if err := copy.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)); err != nil {
+	if err := bare.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)); err != nil {
 		return "", fmt.Errorf("failed to restore index definition: %w", err)
 	}
 	return sb.String(), nil

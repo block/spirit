@@ -464,9 +464,9 @@ type autoIncrementTable struct {
 	name   string
 }
 
-// carryAutoIncrement raises the AUTO_INCREMENT counter of every table in to
-// to at least the highest counter among the tables in from, so that no copy
-// in to ever issues an id that a copy in from has issued.
+// carryAutoIncrement raises the AUTO_INCREMENT counter of every table in `to`
+// to at least the highest counter among the tables in `from`, so that no copy
+// in `to` ever issues an id that a copy in `from` has issued.
 //
 // Rows only carry ids. A destination's counter follows the highest id it has
 // received, so any id issued above that on the source - rows inserted and then
@@ -475,9 +475,9 @@ type autoIncrementTable struct {
 // moves. The counter a target table was created with is stale by the time of
 // the cutover.
 //
-// The caller must guarantee nothing can advance a counter in from after it has
+// The caller must guarantee nothing can advance a counter in `from` after it has
 // been read (the sources are locked and flushed) and that nothing but spirit
-// writes to to yet (traffic has not been switched).
+// writes to `to` yet (traffic has not been switched).
 //
 // With several copies on either side (a sharded source or target), every
 // destination gets the maximum of all the source counters. That is the only

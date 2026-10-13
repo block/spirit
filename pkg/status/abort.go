@@ -51,13 +51,3 @@ func AbortCause(ctx context.Context, err error) error {
 	}
 	return err
 }
-
-// DoContext is Do for a phase that runs under ctx: when ctx was cancelled with
-// a fatal-abort cause, the context.Canceled error fn returns is replaced by
-// that cause (see AbortCause), so the phase is recorded as failed rather than
-// cancelled and the caller receives the cause.
-func (t *Tracker) DoContext(ctx context.Context, state State, fn func() error) error {
-	return t.Do(state, func() error {
-		return AbortCause(ctx, fn())
-	})
-}

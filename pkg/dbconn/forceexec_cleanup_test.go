@@ -570,7 +570,7 @@ func TestForceExecStopsWhenABlockerSurvivesTheKill(t *testing.T) {
 				}, func(context.Context, *sql.DB, []int) error { cleanupCalls++; return nil }, nil)
 			var ddlErr *mysql.MySQLError
 			require.ErrorAs(t, err, &ddlErr)
-			require.EqualValues(t, errLockWaitTimeout, ddlErr.Number)
+			require.EqualValues(t, parsermysql.ErrLockWaitTimeout, ddlErr.Number)
 			// The kill outcome stays out of the statement's error tree.
 			require.NotErrorIs(t, err, tc.killErr)
 			require.Equal(t, 1, killCalls)
@@ -610,7 +610,7 @@ func TestForceExecMakesOneAttemptAgainstAHeavyTransaction(t *testing.T) {
 		"ALTER TABLE forceexec_heavy_trx ADD COLUMN c INT, ALGORITHM=INSTANT")
 	var ddlErr *mysql.MySQLError
 	require.ErrorAs(t, err, &ddlErr)
-	require.EqualValues(t, errLockWaitTimeout, ddlErr.Number)
+	require.EqualValues(t, parsermysql.ErrLockWaitTimeout, ddlErr.Number)
 	require.Contains(t, logs.String(), "skipping transaction with weight exceeding threshold")
 	require.Contains(t, logs.String(), "not retrying statement after lock wait timeout: a blocking transaction is too heavy")
 	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout: it waited for its lock for the kill delay")
@@ -713,7 +713,7 @@ func TestForceExecMakesOneAttemptWhenAKillIsDenied(t *testing.T) {
 		"ALTER TABLE forceexec_kill_denied ADD COLUMN c INT, ALGORITHM=INSTANT")
 	var ddlErr *mysql.MySQLError
 	require.ErrorAs(t, err, &ddlErr)
-	require.EqualValues(t, errLockWaitTimeout, ddlErr.Number)
+	require.EqualValues(t, parsermysql.ErrLockWaitTimeout, ddlErr.Number)
 	require.Contains(t, logs.String(), "not retrying statement after lock wait timeout: the user may not kill a blocking session")
 	require.NotContains(t, logs.String(), "retrying statement after lock wait timeout: it waited for its lock for the kill delay")
 	_, err = owned.ExecContext(ctx, "SELECT 1")

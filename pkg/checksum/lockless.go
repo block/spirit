@@ -755,9 +755,8 @@ func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPas
 	workerCtx, workerCancel := context.WithCancel(ctx)
 
 	var workerWG sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		workerWG.Add(1)
-		go c.worker(workerCtx, &workerWG, workCh, resultCh, limiter)
+	for range workers {
+		workerWG.Go(func() { c.worker(workerCtx, workCh, resultCh, limiter) })
 	}
 	// Shutdown order matters on early error returns (ErrPermanentDivergence,
 	// walker error): a worker that has just produced a result may be
@@ -963,7 +962,7 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 	// MaxQueueSize because a result came back during a stall, we'd rather
 	// process the existing retry and re-stall the walker than drop the
 	// chunk's divergence info.
-	enqueueRetry := func(e *retryEntry) error {
+	enqueueRetry := func(e *retryEntry) {
 		if e.fresh {
 			// A fresh entry is a first read (a split child), not a retry, so
 			// it has nothing to wait for. Queue it ahead of the retries, which
@@ -977,8 +976,14 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 		if e.consecutiveSrcChanged >= 2 {
 			c.hotChunkCount.Add(1)
 		}
-		return nil
 	}
+
+	// dueTimer wakes the dispatcher when the retry at the head of the queue
+	// comes due. It is re-armed each iteration that waits on it; since Go
+	// 1.23 a Reset or Stop discards any value from an earlier firing.
+	dueTimer := time.NewTimer(time.Hour)
+	dueTimer.Stop()
+	defer dueTimer.Stop()
 
 	for {
 		// Termination: walker exhausted, retry queue empty, no in-flight items.
@@ -1036,13 +1041,12 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 		// during walking so a retry that comes due mid-pass is picked up
 		// promptly (otherwise the dispatcher would block on walkCh/resultCh
 		// until something else wakes it).
-		var dueTimer *time.Timer
 		var dueCh <-chan time.Time
-		if emit == nil {
-			if queue.Front() != nil {
-				dueTimer = time.NewTimer(headWait)
-				dueCh = dueTimer.C
-			}
+		if emit == nil && queue.Front() != nil {
+			dueTimer.Reset(headWait)
+			dueCh = dueTimer.C
+		} else {
+			dueTimer.Stop()
 		}
 
 		// walkRecv is enabled only when we don't already have a staged
@@ -1074,15 +1078,9 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 
 		select {
 		case <-ctx.Done():
-			if dueTimer != nil {
-				dueTimer.Stop()
-			}
 			return ctx.Err()
 
 		case emitTarget <- emit:
-			if dueTimer != nil {
-				dueTimer.Stop()
-			}
 			if emitFresh {
 				// Commit the fresh emit: clear the slot and count it for
 				// this pass. The worker itself times its read for Feedback;
@@ -1106,9 +1104,6 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 			c.inFlight.Store(int64(inFlight))
 
 		case item, ok := <-walkRecv:
-			if dueTimer != nil {
-				dueTimer.Stop()
-			}
 			if !ok {
 				walkerDone = true
 				// Walker closes walkCh on both clean exit and error. Only
@@ -1128,9 +1123,6 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 			pendingFresh = item
 
 		case res := <-resultCh:
-			if dueTimer != nil {
-				dueTimer.Stop()
-			}
 			inFlight--
 			c.inFlight.Store(int64(inFlight))
 			if err := c.handleResult(res, enqueueRetry); err != nil {
@@ -1176,12 +1168,10 @@ func (c *LocklessChecker) runWalker(ctx context.Context, walkCh chan<- *workItem
 // or ctx cancellation.
 func (c *LocklessChecker) worker(
 	ctx context.Context,
-	wg *sync.WaitGroup,
 	workCh <-chan *workItem,
 	resultCh chan<- *workResult,
 	limiter *autoscale.Limiter,
 ) {
-	defer wg.Done()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1555,10 +1545,9 @@ func (c *LocklessChecker) logRowDifferences(ctx context.Context, chunk *table.Ch
 }
 
 // handleResult applies pass/retry policy in the dispatcher goroutine. enqueueRetry
-// is supplied as a closure so the dispatcher's local queue/inFlight state stays
-// the single source of truth (handleResult is called while inFlight has just
-// been decremented; that's why enqueueRetry tests against inFlight too).
-func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retryEntry) error) error {
+// is supplied as a closure so the dispatcher's local queue state stays the
+// single source of truth.
+func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retryEntry)) error {
 	if res.err != nil {
 		return res.err
 	}
@@ -1574,9 +1563,7 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 		// Children are fresh, so enqueueRetry pushes each to the front; walk
 		// them backwards so they are read in key order.
 		for i, child := range slices.Backward(res.children) {
-			if err := enqueueRetry(&retryEntry{chunk: child, fresh: true, splitBudget: res.item.splitBudget, splitDepth: res.item.splitDepth + 1, point: i%2 == 1, notBefore: time.Now()}); err != nil {
-				return err
-			}
+			enqueueRetry(&retryEntry{chunk: child, fresh: true, splitBudget: res.item.splitBudget, splitDepth: res.item.splitDepth + 1, point: i%2 == 1, notBefore: time.Now()})
 		}
 		return nil
 	}
@@ -1613,10 +1600,11 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 		return res.divergenceError()
 	}
 	if res.snapshot != nil {
-		return enqueueRetry(&retryEntry{chunk: res.item.chunk, snapshot: res.snapshot, splitBudget: res.item.splitBudget,
+		enqueueRetry(&retryEntry{chunk: res.item.chunk, snapshot: res.snapshot, splitBudget: res.item.splitBudget,
 			splitDepth: res.item.splitDepth, point: res.item.point, attempts: res.item.attempts + 1,
 			readDuration: res.item.readDuration, readRows: res.item.readRows,
 			consecutiveSrcChanged: max(2, res.item.consecutiveSrcChanged), notBefore: time.Now().Add(c.cfg.RetryDelay)})
+		return nil
 	}
 
 	// Mismatch — enqueue a retry. Either a fresh-walk first-time mismatch,
@@ -1634,7 +1622,7 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 			"sourceCount", res.newSrc.count,
 			"targetCount", res.newTgt.count,
 		)
-		return enqueueRetry(&retryEntry{
+		enqueueRetry(&retryEntry{
 			chunk:        res.item.chunk,
 			splitDepth:   res.item.splitDepth,
 			splitBudget:  res.item.splitBudget,
@@ -1646,6 +1634,7 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 			readDuration: res.readDuration,
 			readRows:     res.newTgt.count,
 		})
+		return nil
 	}
 
 	// Hot chunk: source changed across retry windows. Replace the
@@ -1662,7 +1651,7 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 		"consecutiveSourceChanged", newConsecutive,
 		"attempts", res.item.attempts+1,
 	)
-	return enqueueRetry(&retryEntry{
+	enqueueRetry(&retryEntry{
 		chunk:                 res.item.chunk,
 		splitDepth:            res.item.splitDepth,
 		splitBudget:           res.item.splitBudget,
@@ -1675,6 +1664,7 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 		readDuration:          res.item.readDuration,
 		readRows:              res.item.readRows,
 	})
+	return nil
 }
 
 // feedbackResolved reports a resolved chunk to the chunker. It is the hinge the

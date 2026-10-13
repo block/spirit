@@ -939,8 +939,7 @@ func TestBinlogClientXAPrepareEventGuard(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	client.streamer = streamer
 	client.cancelFunc = cancel
-	client.streamWG.Add(1)
-	go client.readStream(ctx)
+	client.streamWG.Go(func() { client.readStream(ctx) })
 	defer client.Close()
 
 	require.NoError(t, streamer.AddEventToStreamer(&replication.BinlogEvent{
@@ -1860,8 +1859,7 @@ func TestBinlogClientLogPosWraparoundGuard(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	client.cancelFunc = cancel
-	client.streamWG.Add(1)
-	go client.readStream(ctx)
+	client.streamWG.Go(func() { client.readStream(ctx) })
 
 	require.NoError(t, streamer.AddEventToStreamer(rotateTo("binlog.000042", 4)))
 	// The last event that still fits in a uint32 offset.
@@ -1893,8 +1891,7 @@ func TestBinlogClientReplayIsNotAWraparound(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	client.cancelFunc = cancel
-	client.streamWG.Add(1)
-	go client.readStream(ctx)
+	client.streamWG.Go(func() { client.readStream(ctx) })
 
 	require.NoError(t, streamer.AddEventToStreamer(rotateTo("binlog.000042", 4)))
 	high, _ := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, 4294967000, "test", "logposreplayt1", 1)

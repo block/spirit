@@ -719,81 +719,15 @@ func GetTLSConfigForBinlog(config *DBConfig, host string) (*tls.Config, error) {
 	}
 
 	var tlsConfig *tls.Config
-
-	switch strings.ToUpper(config.TLSMode) {
-	case "DISABLED":
-		// No TLS for the binlog connection. (Unreachable in practice because
-		// the early return above handles DISABLED, but kept explicit so the
-		// switch covers every documented mode rather than treating DISABLED as
-		// an unknown mode that falls into the PREFERRED-style default.)
-		return nil, nil
-
-	case "PREFERRED":
-		// For PREFERRED mode, we need to setup custom TLS config
-		if err := initCustomTLS(config); err != nil {
+	if strings.ToUpper(config.TLSMode) == "REQUIRED" && IsRDSHost(host) {
+		if err := initRDSTLS(); err != nil {
 			return nil, err
 		}
-		var certData []byte
-		if config.TLSCertificatePath != "" {
-			var err error
-			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
-			}
-		}
-		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
-
-	case "REQUIRED":
-		if IsRDSHost(host) {
-			if err := initRDSTLS(); err != nil {
-				return nil, err
-			}
-			tlsConfig = NewTLSConfig()
-		} else {
-			if err := initCustomTLS(config); err != nil {
-				return nil, err
-			}
-			var certData []byte
-			if config.TLSCertificatePath != "" {
-				var err error
-				certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
-				if err != nil {
-					return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
-				}
-			}
-			tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
-		}
-
-	case "VERIFY_CA":
-		if err := initCustomTLS(config); err != nil {
-			return nil, err
-		}
-		var certData []byte
-		if config.TLSCertificatePath != "" {
-			var err error
-			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
-			}
-		}
-		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
-
-	case "VERIFY_IDENTITY":
-		if err := initCustomTLS(config); err != nil {
-			return nil, err
-		}
-		var certData []byte
-		if config.TLSCertificatePath != "" {
-			var err error
-			certData, err = LoadCertificateFromFile(config.TLSCertificatePath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
-			}
-		}
-		tlsConfig = NewCustomTLSConfig(certData, config.TLSMode)
-
-	default:
-		// For unknown modes, use PREFERRED logic
+		tlsConfig = NewTLSConfig()
+	} else {
+		// PREFERRED, VERIFY_CA, VERIFY_IDENTITY, REQUIRED against a non-RDS
+		// host, and any unknown mode (treated as PREFERRED) all use the
+		// custom config.
 		if err := initCustomTLS(config); err != nil {
 			return nil, err
 		}

@@ -88,7 +88,7 @@ func hasCharOutsideUTF8MB3(s string) bool {
 }
 
 // readStoredEnumSetMembers returns the members MySQL stores for the ENUM or
-// SET column column of table tableName (in the connection's schema), which
+// SET column `column` of table `tableName` (in the connection's schema), which
 // information_schema reports with count members.
 //
 // No information_schema table or SHOW statement reports a member character

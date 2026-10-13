@@ -1249,7 +1249,7 @@ func (ct *CreateTable) parseIndexColumnList(keys []*ast.IndexPartSpecification) 
 
 			// Add prefix length if specified
 			if key.Length > 0 {
-				length := int(key.Length)
+				length := key.Length
 				col.Length = &length
 			}
 		} else if key.Expr != nil {
@@ -1268,39 +1268,32 @@ func (ct *CreateTable) parseIndexColumnList(keys []*ast.IndexPartSpecification) 
 // parseTableOptions converts table options to a TableOptions struct
 func (ct *CreateTable) parseTableOptions(options []*ast.TableOption) *TableOptions {
 	tableOpts := &TableOptions{}
-	hasOptions := false
 
 	for _, option := range options {
 		switch option.Tp {
 		case ast.TableOptionEngine:
 			if option.StrValue != "" {
 				tableOpts.Engine = &option.StrValue
-				hasOptions = true
 			}
 		case ast.TableOptionCharset:
 			if option.StrValue != "" {
 				tableOpts.Charset = &option.StrValue
-				hasOptions = true
 			}
 		case ast.TableOptionCollate:
 			if option.StrValue != "" {
 				tableOpts.Collation = &option.StrValue
-				hasOptions = true
 			}
 		case ast.TableOptionComment:
 			if option.StrValue != "" {
 				tableOpts.Comment = &option.StrValue
-				hasOptions = true
 			}
 		case ast.TableOptionAutoIncrement:
 			if option.UintValue > 0 {
 				tableOpts.AutoIncrement = &option.UintValue
-				hasOptions = true
 			}
 		case ast.TableOptionKeyBlockSize:
 			if option.UintValue > 0 {
 				tableOpts.KeyBlockSize = &option.UintValue
-				hasOptions = true
 			}
 		case ast.TableOptionAutoextendSize:
 			// The grammar yields the bare byte count in UintValue and a
@@ -1316,57 +1309,46 @@ func (ct *CreateTable) parseTableOptions(options []*ast.TableOption) *TableOptio
 			}
 			if size > 0 {
 				tableOpts.AutoextendSize = &size
-				hasOptions = true
 			}
 		case ast.TableOptionStatsPersistent:
 			if !option.Default {
 				tableOpts.StatsPersistent = new(option.UintValue != 0)
-				hasOptions = true
 			}
 		case ast.TableOptionStatsAutoRecalc:
 			if !option.Default {
 				tableOpts.StatsAutoRecalc = new(option.UintValue != 0)
-				hasOptions = true
 			}
 		case ast.TableOptionStatsSamplePages:
 			if !option.Default && option.UintValue > 0 {
 				tableOpts.StatsSamplePages = &option.UintValue
-				hasOptions = true
 			}
 		case ast.TableOptionPackKeys:
 			if !option.Default {
 				tableOpts.PackKeys = new(option.UintValue != 0)
-				hasOptions = true
 			}
 		case ast.TableOptionCheckSum:
 			if option.UintValue != 0 {
 				tableOpts.Checksum = true
-				hasOptions = true
 			}
 		case ast.TableOptionDelayKeyWrite:
 			if option.UintValue != 0 {
 				tableOpts.DelayKeyWrite = true
-				hasOptions = true
 			}
 		case ast.TableOptionAvgRowLength:
 			if option.UintValue > 0 {
 				tableOpts.AvgRowLength = &option.UintValue
-				hasOptions = true
 			}
 		case ast.TableOptionMinRows:
 			if option.UintValue > 0 {
 				tableOpts.MinRows = &option.UintValue
-				hasOptions = true
 			}
 		case ast.TableOptionMaxRows:
 			if option.UintValue > 0 {
 				tableOpts.MaxRows = &option.UintValue
-				hasOptions = true
 			}
 		case ast.TableOptionSecondaryEngineAttribute:
 			if option.StrValue != "" {
 				tableOpts.SecondaryEngineAttribute = &option.StrValue
-				hasOptions = true
 			}
 		case ast.TableOptionRowFormat:
 			// ROW_FORMAT=DEFAULT is the absence of a row format: MySQL stores
@@ -1393,12 +1375,13 @@ func (ct *CreateTable) parseTableOptions(options []*ast.TableOption) *TableOptio
 				}
 
 				tableOpts.RowFormat = &rowFormat
-				hasOptions = true
 			}
 		}
 	}
 
-	if !hasOptions {
+	// Every field is a pointer or a bool, and each case above sets only a
+	// non-zero value, so the zero value means no option was recorded.
+	if *tableOpts == (TableOptions{}) {
 		return nil
 	}
 
