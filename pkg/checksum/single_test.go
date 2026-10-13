@@ -864,7 +864,7 @@ func TestChecksumChunkReleasesTrxDuringRepair(t *testing.T) {
 	chunk, err := chunker.Next() // small table: one chunk covers everything
 	require.NoError(t, err)
 
-	pool, err := dbconn.NewTrxPool(t.Context(), db, 2, config.DBConfig, config.Logger)
+	pool, err := dbconn.NewTrxPool(t.Context(), db, 2, config.Logger)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, pool.Close()) }()
 

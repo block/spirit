@@ -237,14 +237,8 @@ type CheckerConfig struct {
 	// them. SingleChecker is expected to be removed in its favour.
 	Lockless    bool
 	Concurrency int
-	// TargetChunkTime is reporting-only: it is the target the chunk-size
-	// distribution summary is compared against at the end of each pass, so it
-	// should match the TargetChunkTime the caller built the chunker with
-	// (table.ChunkerDefaultTarget unless the caller overrode it). It does not
-	// itself size anything — chunk sizing lives entirely in the chunker.
-	TargetChunkTime time.Duration
-	DBConfig        *dbconn.DBConfig
-	Logger          *slog.Logger
+	DBConfig    *dbconn.DBConfig
+	Logger      *slog.Logger
 	// Watermark is verification evidence from a previous run: every row below
 	// it was read on both sides and observed equal. Supplying it makes the
 	// factory open the chunker there, so verification resumes rather than
@@ -398,12 +392,11 @@ func applySharedDefaults(cfg *CheckerConfig) {
 
 func NewCheckerDefaultConfig() *CheckerConfig {
 	return &CheckerConfig{
-		Concurrency:     DefaultConcurrency,
-		TargetChunkTime: table.ChunkerDefaultTarget,
-		DBConfig:        dbconn.NewDBConfig(),
-		Logger:          slog.Default(),
-		MaxRetries:      defaultMaxRetries,
-		YieldTimeout:    DefaultYieldTimeout,
+		Concurrency:  DefaultConcurrency,
+		DBConfig:     dbconn.NewDBConfig(),
+		Logger:       slog.Default(),
+		MaxRetries:   defaultMaxRetries,
+		YieldTimeout: DefaultYieldTimeout,
 	}
 }
 

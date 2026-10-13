@@ -48,18 +48,19 @@ func (o *chunkObserver) record(rows uint64, d time.Duration) {
 // recorded (an empty table, or a pass that failed before its first chunk).
 //
 // The p90s are what the sizing decision needs: the dynamic sizer targets p90
-// chunk time, so comparing p90-duration against the target shows how much
-// headroom the time signal has, while row-capped shows whether the row
-// ceiling is taking that headroom away.
-func (o *chunkObserver) summary(target time.Duration) string {
+// chunk time, so comparing p90-duration against the chunker's target
+// (table.ChunkerDefaultTarget unless the caller set one) shows how much
+// headroom the time signal has, while row-capped shows whether the row ceiling
+// is taking that headroom away. The target is not printed: the observer does
+// not know it, and a guessed value could disagree with the chunker.
+func (o *chunkObserver) summary() string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if len(o.durations) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("chunks=%d target=%v duration-p50=%v duration-p90=%v duration-max=%v rows-p50=%d rows-max=%d row-capped=%d/%d",
+	return fmt.Sprintf("chunks=%d duration-p50=%v duration-p90=%v duration-max=%v rows-p50=%d rows-max=%d row-capped=%d/%d",
 		len(o.durations),
-		target,
 		utils.Percentile(o.durations, 50).Round(time.Millisecond),
 		utils.Percentile(o.durations, 90).Round(time.Millisecond),
 		slices.Max(o.durations).Round(time.Millisecond),

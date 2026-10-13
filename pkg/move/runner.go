@@ -515,7 +515,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		Throttler:   r.throttler.Get(),
 		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
-		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
 	})
 	if err != nil {
@@ -1150,7 +1149,6 @@ func (r *Runner) newCopy(ctx context.Context) error {
 		Throttler:   r.throttler.Get(),
 		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
-		DBConfig:    r.dbConfig,
 		Applier:     r.applier, // Use the shared applier
 	})
 	if err != nil {
@@ -1734,7 +1732,6 @@ func (r *Runner) checkResources() check.Resources {
 		sources[i] = check.SourceResource{
 			DB:     r.sources[i].db,
 			Config: r.sources[i].config,
-			DSN:    r.sources[i].dsn,
 			Tables: r.sources[i].tables,
 		}
 	}
@@ -1742,7 +1739,6 @@ func (r *Runner) checkResources() check.Resources {
 		Sources:        sources,
 		Targets:        r.targets,
 		SourceTables:   r.sourceTables,
-		DeferCutOver:   r.move.DeferCutOver,
 		MoveEverything: len(r.move.SourceTables) == 0,
 	}
 }

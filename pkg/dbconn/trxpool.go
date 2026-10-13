@@ -60,7 +60,7 @@ type TrxPool struct {
 // the pool runs a background keepalive that periodically pings whatever
 // transactions are idle in the pool; it stops when ctx is canceled or the
 // pool is closed. A nil logger discards keepalive warnings.
-func NewTrxPool(ctx context.Context, db *sql.DB, count int, config *DBConfig, logger *slog.Logger) (*TrxPool, error) {
+func NewTrxPool(ctx context.Context, db *sql.DB, count int, logger *slog.Logger) (*TrxPool, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}

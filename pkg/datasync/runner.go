@@ -54,7 +54,6 @@ const (
 type sourceInfo struct {
 	db     *sql.DB
 	config *mysql.Config
-	dsn    string
 }
 
 // Runner executes a Sync: an initial copy followed by continuous
@@ -163,7 +162,6 @@ type Runner struct {
 	// verification returned clean (initialChecksumDone).
 	initialChecksumStats    checksum.LocklessCheckerStats
 	initialChecksumDone     bool
-	locklessChunker         table.Chunker
 	locklessReadyCh         chan struct{}
 	firstCleanPassCh        chan struct{}
 	locklessCheckerInitOnce sync.Once
@@ -315,7 +313,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("failed to parse source DSN: %w", err)
 	}
-	r.source = sourceInfo{db: db, config: cfg, dsn: r.sync.SourceDSN}
+	r.source = sourceInfo{db: db, config: cfg}
 
 	// Resolve the single target. The target database is auto-created (if
 	// missing) on both paths — the import's per-shard target databases are
@@ -577,12 +575,11 @@ func (r *Runner) runChecksum(ctx context.Context) error {
 	// the Checker interface.
 	checker := built.(*checksum.LocklessChecker)
 
-	// Publish the checker + chunker so accessors (FirstCleanPass,
+	// Publish the checker so accessors (FirstCleanPass,
 	// ChecksumStats) can observe state from other goroutines. Close
 	// locklessReadyCh exactly once, so callers can block on it.
 	r.progMu.Lock()
 	r.locklessChecker = checker
-	r.locklessChunker = chunker
 	r.progMu.Unlock()
 	r.locklessCheckerInitOnce.Do(func() { close(r.locklessReadyCh) })
 
@@ -1575,7 +1572,6 @@ func (r *Runner) buildCopyPipeline() error {
 		Throttler:   r.currentLoadSignal(),
 		Autoscale:   r.autoscale,
 		MetricsSink: r.metricsSink,
-		DBConfig:    r.sourceDBConfig,
 		Applier:     r.applier,
 	})
 	if err != nil {

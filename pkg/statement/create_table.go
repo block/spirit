@@ -107,14 +107,13 @@ type IndexColumn struct {
 
 // Index represents an index definition
 type Index struct {
-	Raw        *ast.Constraint `json:"-"`
-	Name       string          `json:"name"`
-	Type       string          `json:"type"`                  // PRIMARY KEY, UNIQUE, INDEX, FULLTEXT, SPATIAL
-	Columns    []string        `json:"columns"`               // Deprecated: use ColumnList for full details
-	ColumnList []IndexColumn   `json:"column_list,omitempty"` // Full column specifications including prefix/expression
-	Invisible  *bool           `json:"invisible,omitempty"`
-	Using      *string         `json:"using,omitempty"` // BTREE, HASH, RTREE
-	Comment    *string         `json:"comment,omitempty"`
+	Name       string        `json:"name"`
+	Type       string        `json:"type"`                  // PRIMARY KEY, UNIQUE, INDEX, FULLTEXT, SPATIAL
+	Columns    []string      `json:"columns"`               // Deprecated: use ColumnList for full details
+	ColumnList []IndexColumn `json:"column_list,omitempty"` // Full column specifications including prefix/expression
+	Invisible  *bool         `json:"invisible,omitempty"`
+	Using      *string       `json:"using,omitempty"` // BTREE, HASH, RTREE
+	Comment    *string       `json:"comment,omitempty"`
 	// KeyBlockSize is the index's own KEY_BLOCK_SIZE; nil when none is set or
 	// it equals the table's, which SHOW CREATE TABLE omits
 	// (indexDefaultsNormalizer).
@@ -1050,7 +1049,6 @@ func nonDefaultKeyword(keyword string) *string {
 // parseIndex converts a constraint to an Index struct
 func (ct *CreateTable) parseIndex(constraint *ast.Constraint) Index {
 	index := Index{
-		Raw:        constraint,
 		Name:       constraint.Name,
 		Columns:    ct.parseIndexColumns(constraint.Keys),
 		ColumnList: ct.parseIndexColumnList(constraint.Keys),

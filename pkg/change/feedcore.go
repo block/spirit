@@ -283,16 +283,6 @@ func (c *feedCore) buildSyncerConfig(host string, port uint16) replication.Binlo
 	}
 }
 
-// processDDLNotification cancels the client if the DDL matches our filter criteria.
-// By default, only exact schema.table matches against subscriptions trigger cancellation.
-// If ddlFilterSchema is set, any DDL in that schema triggers cancellation instead.
-// If ddlFilterTables is also set (alongside ddlFilterSchema), only DDL on those
-// specific tables within the schema triggers cancellation — this is used for partial
-// moves where only a subset of tables from a schema are being moved.
-func (c *feedCore) processDDLNotification(schema, table string) {
-	c.processDDL(schema, table, false)
-}
-
 // processDDLTables notifies processDDL of every table a DDL event names.
 func (c *feedCore) processDDLTables(info queryEventInfo) {
 	for i, ddlTable := range info.tables {
@@ -300,14 +290,20 @@ func (c *feedCore) processDDLTables(info queryEventInfo) {
 	}
 }
 
-// processDDL is processDDLNotification, except that with foreignKeysOnly (an
-// ALTER of the table that only adds or drops foreign keys) a subscription's
-// new table does not match. Such an ALTER changes no column and no row: the
-// migration's experimental foreign key support adds the table's foreign keys
-// to the new table under the cutover lock, and drops them again if the
-// attempt fails, so a run resumed after a failed attempt reads those ALTERs
-// after its checkpoint. The migration refuses a foreign key on the new table
-// outside the cutover lock on its own.
+// processDDL cancels the client if the DDL matches our filter criteria.
+// By default, only exact schema.table matches against subscriptions trigger cancellation.
+// If ddlFilterSchema is set, any DDL in that schema triggers cancellation instead.
+// If ddlFilterTables is also set (alongside ddlFilterSchema), only DDL on those
+// specific tables within the schema triggers cancellation — this is used for partial
+// moves where only a subset of tables from a schema are being moved.
+//
+// With foreignKeysOnly (an ALTER of the table that only adds or drops foreign
+// keys) a subscription's new table does not match. Such an ALTER changes no
+// column and no row: the migration's experimental foreign key support adds the
+// table's foreign keys to the new table under the cutover lock, and drops them
+// again if the attempt fails, so a run resumed after a failed attempt reads
+// those ALTERs after its checkpoint. The migration refuses a foreign key on the
+// new table outside the cutover lock on its own.
 func (c *feedCore) processDDL(schema, table string, foreignKeysOnly bool) {
 	if c.stopped.Load() {
 		// Post-cutover, where spirit's own RENAME TABLE is the DDL we would

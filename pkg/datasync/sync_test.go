@@ -1302,7 +1302,7 @@ func TestSyncDeferSecondaryIndexesCreateAndRestore(t *testing.T) {
 	sourceDB, err := sql.Open("block-mysql", s.SourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
-	runner.source = sourceInfo{db: sourceDB, config: src, dsn: s.SourceDSN}
+	runner.source = sourceInfo{db: sourceDB, config: src}
 	targetDB, err := sql.Open("block-mysql", s.TargetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
@@ -1628,7 +1628,7 @@ func TestSyncTargetSchemaVerifyIgnoresDeferredIndexes(t *testing.T) {
 	sourceDB, err := sql.Open("block-mysql", s.SourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
-	runner.source = sourceInfo{db: sourceDB, config: src, dsn: s.SourceDSN}
+	runner.source = sourceInfo{db: sourceDB, config: src}
 	targetDB, err := sql.Open("block-mysql", s.TargetDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)

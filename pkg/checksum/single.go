@@ -53,7 +53,6 @@ type SingleChecker struct {
 	metricsSink metrics.Sink
 	// limiter gates live concurrency for the current pass; nil until Run.
 	limiter          *autoscale.Limiter
-	targetChunkTime  time.Duration
 	feed             change.Source
 	db               *sql.DB
 	trxPool          *dbconn.TrxPool // reader trx pool
@@ -339,7 +338,7 @@ func (c *SingleChecker) initConnPool(ctx context.Context) error {
 	// connection per idle transaction and nothing else: all of these read views
 	// pin history from the same instant, so the history list length floor is
 	// identical whether the autoscaler ends up using four of them or sixteen.
-	c.trxPool, err = dbconn.NewTrxPool(ctx, c.db, c.maxConcurrency, c.dbConfig, c.logger)
+	c.trxPool, err = dbconn.NewTrxPool(ctx, c.db, c.maxConcurrency, c.logger)
 	if err != nil {
 		return err
 	}
@@ -509,7 +508,7 @@ func (c *SingleChecker) logChunkSummary() {
 	if c.chunks == nil {
 		return
 	}
-	if summary := c.chunks.summary(c.targetChunkTime); summary != "" {
+	if summary := c.chunks.summary(); summary != "" {
 		c.logger.Info("checksum chunk size distribution", "stats", summary)
 	}
 }
@@ -744,20 +743,19 @@ func newSingleChecker(db *sql.DB, chunker table.Chunker, feed change.Source, rec
 		cfg.YieldTimeout = DefaultYieldTimeout
 	}
 	return &SingleChecker{
-		concurrency:     cfg.Concurrency,
-		maxConcurrency:  cfg.Autoscale.MaxThreads,
-		autoscale:       cfg.Autoscale.Enabled,
-		throttler:       cfg.Throttler,
-		metricsSink:     cfg.MetricsSink,
-		targetChunkTime: cfg.TargetChunkTime,
-		db:              db,
-		feed:            feed,
-		chunker:         chunker,
-		dbConfig:        cfg.DBConfig,
-		logger:          cfg.Logger,
-		recopier:        recopier,
-		maxRetries:      cfg.MaxRetries,
-		yieldTimeout:    cfg.YieldTimeout,
+		concurrency:    cfg.Concurrency,
+		maxConcurrency: cfg.Autoscale.MaxThreads,
+		autoscale:      cfg.Autoscale.Enabled,
+		throttler:      cfg.Throttler,
+		metricsSink:    cfg.MetricsSink,
+		db:             db,
+		feed:           feed,
+		chunker:        chunker,
+		dbConfig:       cfg.DBConfig,
+		logger:         cfg.Logger,
+		recopier:       recopier,
+		maxRetries:     cfg.MaxRetries,
+		yieldTimeout:   cfg.YieldTimeout,
 	}
 }
 

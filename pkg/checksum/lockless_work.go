@@ -31,7 +31,6 @@ type retryEntry struct {
 	point       bool
 
 	originalSrc chunkSig
-	originalTgt chunkSig
 
 	// notBefore is the earliest wall-clock time this entry may be retried.
 	// Set to now + RetryDelay on enqueue and on each re-enqueue.
@@ -79,7 +78,6 @@ type workItem struct {
 
 	// Only valid when isRetry is true:
 	originalSrc           chunkSig
-	originalTgt           chunkSig
 	consecutiveSrcChanged int
 	attempts              int
 	readDuration          time.Duration

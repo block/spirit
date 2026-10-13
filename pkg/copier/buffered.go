@@ -11,7 +11,6 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/autoscale"
-	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -38,7 +37,6 @@ type buffered struct {
 	firstErr    error      // first error that invalidated the copy (any goroutine)
 	startTime   time.Time
 	throttler   throttler.Throttler
-	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
 	metricsSink metrics.Sink
 	autoscale   AutoscaleConfig
@@ -206,12 +204,6 @@ func (c *buffered) isHealthy(ctx context.Context) bool {
 		return false
 	}
 	return !c.isInvalid.Load()
-}
-
-func (c *buffered) StartTime() time.Time {
-	c.Lock()
-	defer c.Unlock()
-	return c.startTime
 }
 
 // Run copies all rows from the source to the target table, blocking until
@@ -610,11 +602,6 @@ func (c *buffered) getCopyStats() (uint64, uint64, float64) {
 	}
 
 	return rowsProcessed, totalRows, pct
-}
-
-// GetProgress returns the progress of the copier
-func (c *buffered) GetProgress() string {
-	return c.CopyProgress().String()
 }
 
 // CopyProgress satisfies Copier.

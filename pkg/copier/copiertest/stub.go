@@ -23,7 +23,6 @@ type Stub struct {
 
 func (s Stub) GetETA() string                    { return s.ETA.String() }
 func (s Stub) GetETAState() status.ETA           { return s.ETA }
-func (s Stub) GetProgress() string               { return s.Copy.String() }
 func (s Stub) CopyProgress() status.CopyProgress { return s.Copy }
 func (s Stub) ChunkSize() uint64                 { return s.Chunk }
 func (s Stub) GetThrottler() throttler.Throttler { return &throttler.Noop{} }

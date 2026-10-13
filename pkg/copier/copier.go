@@ -7,10 +7,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"time"
 
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -34,8 +32,6 @@ type Copier interface {
 	GetChunker() table.Chunker
 	SetThrottler(throttler throttler.Throttler)
 	GetThrottler() throttler.Throttler
-	StartTime() time.Time
-	GetProgress() string
 	// CopyProgress returns the copier's own measure of the copy in numeric
 	// form: the chunker's Progress, which for the optimistic chunker on a
 	// dense key is keyspace distance against the auto_increment max rather
@@ -43,7 +39,7 @@ type Copier interface {
 	// It is the measure the ETA is paced on. Callers reporting rows to a human
 	// or a wrapper should sum the chunker's per-table settled counts instead
 	// (status.CopyFromTables), which is what the runners do: it is rows on
-	// every key. GetProgress is this value rendered.
+	// every key.
 	CopyProgress() status.CopyProgress
 	// ChunkSize returns the row count of the most recently claimed chunk, or
 	// 0 before the first one. This is the dynamic chunker's current sizing
@@ -72,7 +68,6 @@ type CopierConfig struct {
 	Throttler   throttler.Throttler
 	Logger      *slog.Logger
 	MetricsSink metrics.Sink
-	DBConfig    *dbconn.DBConfig
 	// Applier is used by the copier to write rows to the destination. It is
 	// required (non-nil). It is also used by callers (migration/move runner)
 	// for the replication client; construction is shared so that both paths
@@ -113,7 +108,6 @@ func NewCopierDefaultConfig() *CopierConfig {
 		Throttler:   &throttler.Noop{},
 		Logger:      slog.Default(),
 		MetricsSink: &metrics.NoopSink{},
-		DBConfig:    dbconn.NewDBConfig(),
 	}
 }
 
@@ -127,9 +121,6 @@ func NewCopier(chunker table.Chunker, config *CopierConfig) (Copier, error) {
 	if chunker == nil {
 		return nil, errors.New("chunker must be non-nil")
 	}
-	if config.DBConfig == nil {
-		return nil, errors.New("dbConfig must be non-nil")
-	}
 	if config.Applier == nil {
 		return nil, errors.New("copier requires a non-nil Applier")
 	}
@@ -139,7 +130,6 @@ func NewCopier(chunker table.Chunker, config *CopierConfig) (Copier, error) {
 		chunker:     chunker,
 		logger:      config.Logger,
 		metricsSink: config.MetricsSink,
-		dbConfig:    config.DBConfig,
 		applier:     config.Applier,
 		autoscale:   config.Autoscale,
 	}, nil

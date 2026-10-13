@@ -484,7 +484,7 @@ func TestKillFallsBackToKillProcedure(t *testing.T) {
 	require.NoError(t, CheckForceKillPrivileges(t.Context(), db))
 
 	conn, pid := f.victim(t)
-	require.NoError(t, KillTransaction(t.Context(), db, pid))
+	require.NoError(t, killConnection(t.Context(), db, pid, slog.Default()))
 	requireSessionGone(t, conn)
 
 	conn, pid = f.victim(t)
@@ -493,7 +493,7 @@ func TestKillFallsBackToKillProcedure(t *testing.T) {
 
 	// A session that has already gone is reported by KILL itself, before
 	// any privilege check, so the fallback does not run.
-	err := KillTransaction(t.Context(), db, pid)
+	err := killConnection(t.Context(), db, pid, slog.Default())
 	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread})
 	require.NotContains(t, err.Error(), "rds_kill")
 	require.NoError(t, KillSessionAndWait(t.Context(), db, pid))
@@ -534,7 +534,7 @@ func TestKillWithoutKillProcedurePrivilege(t *testing.T) {
 	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
 
 	conn, pid := f.victim(t)
-	err = KillTransaction(t.Context(), db, pid)
+	err = killConnection(t.Context(), db, pid, slog.Default())
 	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
 	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrProcaccessDenied})
 	require.ErrorContains(t, err, "falling back to `"+f.schema+"`.`rds_kill` failed")
@@ -544,7 +544,7 @@ func TestKillWithoutKillProcedurePrivilege(t *testing.T) {
 	requireSessionAlive(t, conn)
 
 	f.grantExecute(t)
-	require.NoError(t, KillTransaction(t.Context(), db, pid))
+	require.NoError(t, killConnection(t.Context(), db, pid, slog.Default()))
 	requireSessionGone(t, conn)
 }
 
@@ -562,7 +562,7 @@ func TestKillWithoutKillProcedure(t *testing.T) {
 	require.ErrorIs(t, err, ErrForceKillPrivilegeMissing)
 
 	conn, pid := f.victim(t)
-	err = KillTransaction(t.Context(), db, pid)
+	err = killConnection(t.Context(), db, pid, slog.Default())
 	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
 	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrSpDoesNotExist})
 	requireSessionAlive(t, conn)
@@ -578,7 +578,7 @@ func TestKillWithConnectionAdminSkipsKillProcedure(t *testing.T) {
 
 	require.NoError(t, CheckForceKillPrivileges(t.Context(), db))
 	conn, pid := f.victim(t)
-	require.NoError(t, KillTransaction(t.Context(), db, pid))
+	require.NoError(t, killConnection(t.Context(), db, pid, slog.Default()))
 	requireSessionGone(t, conn)
 	conn, pid = f.victim(t)
 	require.NoError(t, KillSessionAndWait(t.Context(), db, pid))
@@ -598,7 +598,7 @@ func TestKillProcedureFindsSessionGone(t *testing.T) {
 	db := f.userDB(t)
 
 	_, pid := f.victim(t)
-	err := KillTransaction(t.Context(), db, pid)
+	err := killConnection(t.Context(), db, pid, slog.Default())
 	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread})
 	require.NotErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrKillDenied})
 }

@@ -1818,11 +1818,11 @@ func TestGTIDProcessDDLNotificationMoveStyle(t *testing.T) {
 	require.True(t, c.subs.Add(dbName+".orders", sub))
 
 	// DDL on an unrelated table must be ignored — not panic.
-	c.processDDLNotification(dbName, "unrelated_table")
+	c.processDDL(dbName, "unrelated_table", false)
 	require.False(t, cancelled, "should not cancel on DDL for an unrelated table")
 
 	// DDL on the subscribed table still cancels.
-	c.processDDLNotification(dbName, "orders")
+	c.processDDL(dbName, "orders", false)
 	require.True(t, cancelled, "should cancel on DDL matching the subscribed table")
 }
 

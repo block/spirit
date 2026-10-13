@@ -779,7 +779,6 @@ func (r *Runner) runChecks(ctx context.Context, scope check.ScopeFlag) error {
 			Password:                *r.migration.Password,
 			TLSMode:                 r.migration.TLSMode,
 			TLSCertificatePath:      r.migration.TLSCertificatePath,
-			SkipDropAfterCutover:    r.migration.SkipDropAfterCutover,
 			ExperimentalForeignKeys: r.migration.EnableExperimentalForeignKeys,
 		}, r.logger, scope); err != nil {
 			return err
@@ -860,7 +859,6 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 		Throttler:   &throttler.Noop{},
 		Logger:      r.logger,
 		MetricsSink: r.metricsSink,
-		DBConfig:    r.dbConfig,
 		Applier:     appl,
 		Autoscale:   copierAutoscale,
 	})
@@ -898,15 +896,13 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 	// Repair policy is not configured: both checkers repair in Run (the initial
 	// checksum) and report in RunContinuous (the sentinel wait).
 	r.checker, err = checksum.NewChecker([]*sql.DB{r.db}, r.checksumChunker, []change.Source{r.replClient}, &checksum.CheckerConfig{
-		Lockless:        !r.migration.LegacyChecksum,
-		Watermark:       checksumWatermark,
-		Concurrency:     r.migration.Threads,
-		TargetChunkTime: table.ChunkerDefaultTarget,
-		DBConfig:        r.dbConfig,
-		Logger:          r.logger,
-		MaxRetries:      3,
-		YieldTimeout:    r.migration.LegacyChecksumYieldTimeout,
-		MetricsSink:     r.metricsSink,
+		Lockless:     !r.migration.LegacyChecksum,
+		Watermark:    checksumWatermark,
+		Concurrency:  r.migration.Threads,
+		DBConfig:     r.dbConfig,
+		Logger:       r.logger,
+		YieldTimeout: r.migration.LegacyChecksumYieldTimeout,
+		MetricsSink:  r.metricsSink,
 		// Repairing a mismatched chunk writes through the same applier the copy
 		// and binlog-apply phases use, so a repair inherits the configured write
 		// concurrency instead of standing up a second write path. The copier has

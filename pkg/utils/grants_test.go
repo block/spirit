@@ -169,14 +169,6 @@ func TestMySQLLikeMatch(t *testing.T) {
 	}
 }
 
-func TestParseRoleNames(t *testing.T) {
-	assert.Equal(t, []string{"rds_superuser_role"}, ParseRoleNames("GRANT `rds_superuser_role`@`%` TO `user`@`%`"))
-	assert.Equal(t, []string{"role_a", "role_b"}, ParseRoleNames("GRANT `role_a`@`%`,`role_b`@`localhost` TO `user`@`%`"))
-	// The target user after TO is not a granted role.
-	assert.Nil(t, ParseRoleNames("GRANT `role_a`@`%`"))
-	assert.Nil(t, ParseRoleNames("GRANT SELECT ON *.* TO `user`@`%`"))
-}
-
 func TestStringContainsAll(t *testing.T) {
 	assert.True(t, StringContainsAll("GRANT SELECT, INSERT ON *.*", "SELECT", "INSERT", " ON *.*"))
 	assert.False(t, StringContainsAll("GRANT SELECT ON *.*", "SELECT", "INSERT"))

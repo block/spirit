@@ -25,7 +25,7 @@
 // First-attempt failures are common — the target legitimately lags the
 // source — so failures are not noisy events. They go through a retry queue:
 //
-//  1. On initial mismatch, record {originalSrcCRC, originalTgtCRC} and
+//  1. On initial mismatch, record originalSrcCRC and
 //     enqueue with a not-before time of now+RetryDelay. With a change feed,
 //     the retry also waits (up to RetryFlushWait) for the feed to complete a
 //     flush, since until then the target cannot have moved. This applies to
@@ -1027,7 +1027,6 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 						splitBudget:           e.splitBudget,
 						point:                 e.point,
 						originalSrc:           e.originalSrc,
-						originalTgt:           e.originalTgt,
 						consecutiveSrcChanged: e.consecutiveSrcChanged,
 						attempts:              e.attempts,
 						readDuration:          e.readDuration,
@@ -1628,7 +1627,6 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 			splitBudget:  res.item.splitBudget,
 			point:        res.item.point,
 			originalSrc:  res.newSrc,
-			originalTgt:  res.newTgt,
 			notBefore:    time.Now().Add(c.cfg.RetryDelay),
 			attempts:     1,
 			readDuration: res.readDuration,
@@ -1657,7 +1655,6 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 		splitBudget:           res.item.splitBudget,
 		point:                 res.item.point,
 		originalSrc:           res.newSrc,
-		originalTgt:           res.newTgt,
 		notBefore:             time.Now().Add(c.cfg.RetryDelay),
 		consecutiveSrcChanged: newConsecutive,
 		attempts:              res.item.attempts + 1,

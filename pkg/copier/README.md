@@ -40,8 +40,6 @@ type Copier interface {
     GetChunker() table.Chunker
     SetThrottler(throttler throttler.Throttler)
     GetThrottler() throttler.Throttler
-    StartTime() time.Time
-    GetProgress() string
     CopyProgress() status.CopyProgress
     ChunkSize() uint64
 }
@@ -62,12 +60,11 @@ type ChunkCopier interface {
 - **`Run(ctx)`**: Starts the copy process and blocks until completion or error. Spawns multiple worker goroutines based on the configured concurrency level.
 - **`GetETA()`**: Returns estimated time to completion as a human-readable string. Returns "TBD" during the initial warmup period (1 minute), "DUE" when >99.99% complete, or a duration like "2h30m15s".
 - **`GetETAState()`**: The same estimate as a `status.ETA{State, Duration}`, for callers that branch on whether an estimate exists yet. `GetETA()` is its `String()`.
-- **`CopyProgress()`**: Returns the copier's own progress as `status.CopyProgress{RowsCopied, RowsTotal}`. This is the measure the copier paces on: for the optimistic chunker on a dense key it is keyspace distance against the auto_increment max, not a row count. On a key space more than five times wider than the row estimate, it is settled rows against the row estimate, the same measure the composite chunker reports. The runners report settled rows from the chunker on every key (see `status.CopyFromTables`). `GetProgress()` is its rendered form, kept for interface compatibility; Spirit itself no longer calls it.
+- **`CopyProgress()`**: Returns the copier's own progress as `status.CopyProgress{RowsCopied, RowsTotal}`. This is the measure the copier paces on: for the optimistic chunker on a dense key it is keyspace distance against the auto_increment max, not a row count. On a key space more than five times wider than the row estimate, it is settled rows against the row estimate, the same measure the composite chunker reports. The runners report settled rows from the chunker on every key (see `status.CopyFromTables`).
 - **`ChunkSize()`**: Rows in the most recently claimed chunk, the `chunk-size=` field of the status log block. The chunker sizes chunks dynamically to hit the target byte budget, so this moves during a copy.
 - **`GetChunker()`**: Returns the underlying chunker for accessing detailed progress information.
 - **`SetThrottler(throttler)`**: Updates the throttler used to control copy rate.
 - **`GetThrottler()`**: Returns the current throttler.
-- **`StartTime()`**: Returns when the copy operation started.
 
 ## Configuration
 
@@ -79,7 +76,6 @@ type CopierConfig struct {
     Throttler   throttler.Throttler
     Logger      *slog.Logger
     MetricsSink metrics.Sink
-    DBConfig    *dbconn.DBConfig
     Applier     applier.Applier
     Autoscale   AutoscaleConfig
 }
@@ -91,7 +87,6 @@ type CopierConfig struct {
 - **`Throttler`** (default: `Noop`): Controls when copying should pause to protect system health. See `pkg/throttler` for implementations.
 - **`Logger`** (default: `slog.Default()`): Structured logger for debugging and monitoring.
 - **`MetricsSink`** (default: `NoopSink`): Destination for metrics like chunk processing time and row counts.
-- **`DBConfig`**: Database connection configuration including retry settings.
 - **`Applier`**: Writes rows to the target. Required (non-nil). The migration runner shares one applier between the copier and the replication client, so the copy and the binlog replay go through the same write pipeline.
 
 Note that chunk sizing is **not** configured here — it lives entirely in the chunker. Configure it via `table.ChunkerConfig` when you build the chunker: `TargetChunkBytes` for the copier's in-memory byte-budget signal, or `TargetChunkTime` (default `table.ChunkerDefaultTarget`) for the wall-clock signal the checksum uses.
@@ -146,11 +141,12 @@ if err != nil {
 }
 
 // Start copying
+start := time.Now()
 if err := copier.Run(ctx); err != nil {
     return err
 }
 
-fmt.Printf("Copy completed in %s\n", time.Since(copier.StartTime()))
+fmt.Printf("Copy completed in %s\n", time.Since(start))
 ```
 
 ### Progress Monitoring

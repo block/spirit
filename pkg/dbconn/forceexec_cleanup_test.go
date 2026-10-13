@@ -672,6 +672,7 @@ func holdTableLock(t *testing.T, ctx context.Context, db *sql.DB, tableName stri
 // kill, so the caller can wait for them to exit.
 func TestKillLockingTransactionsReportsKillsBesideADeniedOne(t *testing.T) {
 	testutils.SkipFromMySQLVersion(t, "9.7.0", blockerLookupFailsReason)
+	testutils.SkipBeforeMySQLVersion(t, "8.0.29", killedSessionLingersReason)
 	tt := testutils.NewTestTable(t, "kill_partly_denied", "CREATE TABLE kill_partly_denied (id INT PRIMARY KEY)")
 	config := NewDBConfig()
 	db := newNoKillUserDB(t, config)
@@ -696,6 +697,7 @@ func TestKillLockingTransactionsReportsKillsBesideADeniedOne(t *testing.T) {
 // attempt: the next attempt's KILL of the other user's blocker is denied too.
 func TestForceExecMakesOneAttemptWhenAKillIsDenied(t *testing.T) {
 	testutils.SkipFromMySQLVersion(t, "9.7.0", blockerLookupFailsReason)
+	testutils.SkipBeforeMySQLVersion(t, "8.0.29", killedSessionLingersReason)
 	tt := testutils.NewTestTable(t, "forceexec_kill_denied", "CREATE TABLE forceexec_kill_denied (id INT PRIMARY KEY)")
 	config := newShortKillDelayConfig()
 	require.Greater(t, config.MaxRetries, 1)
@@ -1412,7 +1414,7 @@ func TestForceExecLooksForBlockersAgainAfterAFailedLookup(t *testing.T) {
 			if len(killCalls) < 3 {
 				return nil, fmt.Errorf("%w: %w", errBlockerLookupFailed, io.EOF)
 			}
-			return []int{pid}, KillTransaction(ctx, db, pid)
+			return []int{pid}, killConnection(ctx, db, pid, slog.Default())
 		}, waitForKilledTransactions, nil)
 	require.NoError(t, err)
 	require.Len(t, killCalls, 3)

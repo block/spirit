@@ -19,13 +19,12 @@ import (
 type ScopeFlag uint8
 
 const (
-	ScopeNone        ScopeFlag = 0
-	ScopePreRun      ScopeFlag = 1 << 0
-	ScopePreflight   ScopeFlag = 1 << 1
-	ScopePostSetup   ScopeFlag = 1 << 2
-	ScopeCutover     ScopeFlag = 1 << 3
-	ScopePostCutover ScopeFlag = 1 << 4
-	ScopeTesting     ScopeFlag = 1 << 5
+	ScopeNone      ScopeFlag = 0
+	ScopePreRun    ScopeFlag = 1 << 0
+	ScopePreflight ScopeFlag = 1 << 1
+	ScopePostSetup ScopeFlag = 1 << 2
+	ScopeCutover   ScopeFlag = 1 << 3
+	ScopeTesting   ScopeFlag = 1 << 5
 	// ScopeStatement marks checks a caller can run ahead of an apply to learn
 	// that Spirit will refuse a statement. Most are preflight checks that also
 	// run as part of a migration; a check registered only here predicts, from
@@ -84,14 +83,13 @@ const (
 )
 
 type Resources struct {
-	DB                   *sql.DB
-	Replicas             []*sql.DB
-	Table                *table.TableInfo
-	NewTable             *table.TableInfo // the altered shadow table; set from ScopePostSetup onwards
-	Statement            *statement.AbstractStatement
-	Threads              int
-	ReplicaMaxLag        time.Duration
-	SkipDropAfterCutover bool
+	DB            *sql.DB
+	Replicas      []*sql.DB
+	Table         *table.TableInfo
+	NewTable      *table.TableInfo // the altered shadow table; set from ScopePostSetup onwards
+	Statement     *statement.AbstractStatement
+	Threads       int
+	ReplicaMaxLag time.Duration
 	// ExperimentalForeignKeys is --enable-experimental-foreign-keys: a table
 	// with foreign keys of its own is supported on MySQL 9.7 and later.
 	ExperimentalForeignKeys bool

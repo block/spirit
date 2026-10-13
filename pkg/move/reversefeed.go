@@ -97,7 +97,6 @@ type ReverseFeedConfig struct {
 type ReverseFeed struct {
 	sources  []ReverseSource
 	clients  []change.Source
-	appl     applier.Applier
 	logger   *slog.Logger
 	flushInt time.Duration
 
@@ -183,7 +182,6 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 
 	rf := &ReverseFeed{
 		sources:  cfg.Sources,
-		appl:     appl,
 		logger:   logger,
 		flushInt: flushInt,
 	}

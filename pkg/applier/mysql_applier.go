@@ -33,7 +33,6 @@ type MySQLApplier struct {
 
 	shards      []*shardTarget
 	targets     []Target // Original target configurations
-	dbConfig    *dbconn.DBConfig
 	logger      *slog.Logger
 	metricsSink metrics.Sink // nil disables the stats emitter
 
@@ -97,7 +96,6 @@ type shardTarget struct {
 	writeWorkersCount int32
 	workers           workerPool
 	workerIDCounter   atomic.Int32 // monotonic worker id, for debug logging only
-	logger            *slog.Logger
 	dbConfig          *dbconn.DBConfig
 }
 
@@ -161,7 +159,6 @@ func New(targets []Target, cfg *ApplierConfig) (*MySQLApplier, error) {
 			chunkletBuffer:      make(chan chunklet, defaultBufferSize),
 			chunkletCompletions: make(chan chunkletCompletion, defaultBufferSize),
 			writeWorkersCount:   int32(cfg.Threads),
-			logger:              cfg.Logger,
 			dbConfig:            cfg.DBConfig,
 		}
 	}
@@ -194,7 +191,6 @@ func New(targets []Target, cfg *ApplierConfig) (*MySQLApplier, error) {
 	return &MySQLApplier{
 		shards:      shards,
 		targets:     targets,
-		dbConfig:    cfg.DBConfig,
 		logger:      cfg.Logger,
 		metricsSink: cfg.MetricsSink,
 		unsharded:   len(shards) == 1 && shards[0].keyRange.coversAll(),

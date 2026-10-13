@@ -84,7 +84,6 @@ func checkSourcePrivileges(ctx context.Context, src SourceResource) error {
 // querier is the part of *sql.DB the grant checks use.
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // sourcePrivileges checks one source's privileges (see privilegesCheck).

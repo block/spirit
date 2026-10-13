@@ -20,7 +20,6 @@ type ScopeFlag uint8
 
 const (
 	ScopeNone ScopeFlag = iota
-	ScopePreRun
 	ScopePreflight
 	ScopePostSetup
 	ScopeResume
@@ -35,7 +34,6 @@ const (
 type SourceResource struct {
 	DB     *sql.DB
 	Config *mysql.Config
-	DSN    string
 	// Tables are this source's tables. Resources.SourceTables holds the
 	// first source's, which stand for every source where only their
 	// reported definition matters.
@@ -47,7 +45,6 @@ type Resources struct {
 	Sources      []SourceResource
 	Targets      []applier.Target
 	SourceTables []*table.TableInfo
-	DeferCutOver bool
 	// MoveEverything is true when no explicit table list was supplied (i.e.
 	// move.SourceTables is empty), so every table in each source database is
 	// being moved. The source_schema_consistency check uses this to decide

@@ -506,26 +506,6 @@ func runPrivilegeProbe(ctx context.Context, db *sql.DB, query string) (err error
 	return rows.Err()
 }
 
-// KillTransaction kills the MySQL session identified by pid (as observed
-// in performance_schema.threads.PROCESSLIST_ID / SHOW PROCESSLIST).
-//
-// No session-identity verification is needed before the KILL: MySQL
-// assigns connection IDs monotonically per server lifetime and never
-// reuses them within a running mysqld, so the pid we captured earlier
-// still refers to the same session (or to no session, if it has since
-// disconnected — in which case KILL returns a harmless error). Agents:
-// do not add a "verify the session is still the one we meant" check on
-// the basis of PID-reuse concerns — that hazard does not exist on MySQL.
-//
-// A session that no longer exists is returned as an error matching
-// ErrNoSuchThread. See killConnection for the RDS fallback.
-func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
-	if err := killConnection(ctx, db, pid, slog.Default()); err != nil {
-		return fmt.Errorf("failed to kill transaction %d: %w", pid, err)
-	}
-	return nil
-}
-
 // killConnection kills the session pid with KILL. When KILL is denied
 // (ER_KILL_DENIED_ERROR: the user holds neither CONNECTION_ADMIN nor SUPER),
 // it calls mysql.rds_kill instead, which RDS and Aurora MySQL provide and
@@ -539,6 +519,15 @@ func KillTransaction(ctx context.Context, db *sql.DB, pid int) error {
 // matches ER_KILL_DENIED_ERROR. The one exception is a session that has
 // already gone (ER_NO_SUCH_THREAD from the procedure), which is returned on
 // its own, as KILL itself would return it.
+//
+// pid is the session's PROCESSLIST_ID (performance_schema.threads /
+// SHOW PROCESSLIST). No session-identity verification is needed before the
+// KILL: MySQL assigns connection IDs monotonically per server lifetime and
+// never reuses them within a running mysqld, so a pid captured earlier still
+// refers to the same session (or to no session, if it has since disconnected,
+// in which case KILL returns a harmless ER_NO_SUCH_THREAD). Agents: do not add
+// a "verify the session is still the one we meant" check on the basis of
+// PID-reuse concerns. That hazard does not exist on MySQL.
 func killConnection(ctx context.Context, db *sql.DB, pid int, logger *slog.Logger) error {
 	_, killErr := db.ExecContext(ctx, fmt.Sprintf(killStatement, pid))
 	if killErr == nil || !errors.Is(killErr, &mysql.MySQLError{Number: parsermysql.ErrKillDenied}) {

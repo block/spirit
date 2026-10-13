@@ -125,7 +125,7 @@ func TestImmutableColumnUpdateFatalGTID(t *testing.T) {
 	defer client.Close()
 
 	// DDL on an UNRELATED table must be ignored. Regression: the
-	// subscription-match loop in processDDLNotification used to walk past
+	// subscription-match loop in processDDL used to walk past
 	// the current table into the nil newTable entry of this move-style
 	// subscription and panic the readStream goroutine — killing the whole
 	// process whenever any other session ran DDL while a client without a

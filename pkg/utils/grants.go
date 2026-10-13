@@ -225,31 +225,6 @@ func MySQLLikeMatch(pattern, name string) bool {
 	return pi == len(p)
 }
 
-// grantedRolesRegexp matches role grants in SHOW GRANTS output.
-// MySQL outputs role grants as: GRANT `role_name`@`%` TO `user`@`%`
-// There may be multiple roles in a single line, comma-separated.
-var grantedRolesRegexp = regexp.MustCompile("`([^`]+)`@`[^`]+`")
-
-// ParseRoleNames extracts role names from a SHOW GRANTS line that grants roles.
-// e.g. "GRANT `rds_superuser_role`@`%`,`other_role`@`%` TO `user`@`%`"
-// returns ["rds_superuser_role", "other_role"]
-func ParseRoleNames(grant string) []string {
-	// Split on " TO " to get only the roles part (before the target user)
-	parts := strings.SplitN(grant, " TO ", 2)
-	if len(parts) < 2 {
-		return nil
-	}
-	rolesPart := parts[0] // "GRANT `role1`@`%`,`role2`@`%`"
-	matches := grantedRolesRegexp.FindAllStringSubmatch(rolesPart, -1)
-	var roles []string
-	for _, match := range matches {
-		if len(match) >= 2 {
-			roles = append(roles, match[1])
-		}
-	}
-	return roles
-}
-
 // StringContainsAll returns true if `s` contains all non empty given `substrings`
 // The function returns `false` if no non-empty arguments are given.
 func StringContainsAll(s string, substrings ...string) bool {

@@ -37,7 +37,7 @@ func TestTrxPool(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test that the transaction pool is working.
-	pool, err := NewTrxPool(t.Context(), db, 2, config, slog.New(slog.DiscardHandler))
+	pool, err := NewTrxPool(t.Context(), db, 2, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	// The pool is all repeatable-read transactions, so if I insert new rows
@@ -80,8 +80,7 @@ func TestTrxPoolBeginError(t *testing.T) {
 	require.NoError(t, db.PingContext(t.Context()))
 	require.NoError(t, db.Close()) // BeginTx now fails with "sql: database is closed"
 
-	config := NewDBConfig()
-	pool, err := NewTrxPool(t.Context(), db, 2, config, nil) // nil logger must be tolerated
+	pool, err := NewTrxPool(t.Context(), db, 2, nil) // nil logger must be tolerated
 	require.Error(t, err)
 	require.ErrorContains(t, err, "database is closed")
 	require.Nil(t, pool)
@@ -96,7 +95,6 @@ func TestTrxPoolBeginErrorMidLoop(t *testing.T) {
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()))
 
-	config := NewDBConfig()
 	// Allow only 2 connections but request 3 transactions. The first two
 	// BeginTx calls succeed and hold both connections; the third blocks
 	// waiting for a free connection until the context times out, so the
@@ -104,7 +102,7 @@ func TestTrxPoolBeginErrorMidLoop(t *testing.T) {
 	db.SetMaxOpenConns(2)
 	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
-	pool, err := NewTrxPool(ctx, db, 3, config, nil)
+	pool, err := NewTrxPool(ctx, db, 3, nil)
 	require.Error(t, err)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Nil(t, pool)
@@ -151,7 +149,7 @@ func TestTrxPoolKeepalive(t *testing.T) {
 	var one int
 	require.NoError(t, control.QueryRowContext(t.Context(), "SELECT 1").Scan(&one))
 
-	pool, err := NewTrxPool(t.Context(), db, 2, NewDBConfig(), slog.New(slog.DiscardHandler))
+	pool, err := NewTrxPool(t.Context(), db, 2, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	// Sleep past wait_timeout. The pinger keeps the pooled transactions'
@@ -196,7 +194,7 @@ func TestTrxPoolCloseAfterConnectionLoss(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	pool, err := NewTrxPool(t.Context(), db, 2, NewDBConfig(), slog.New(slog.DiscardHandler))
+	pool, err := NewTrxPool(t.Context(), db, 2, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	// Check a transaction out for the whole wait: it is not in the pool, so
@@ -259,7 +257,7 @@ func TestTrxPoolCloseAfterCanceledStatement(t *testing.T) {
 			require.NoError(t, err)
 			defer utils.CloseAndLog(db)
 
-			pool, err := NewTrxPool(t.Context(), db, 1, NewDBConfig(), slog.New(slog.DiscardHandler))
+			pool, err := NewTrxPool(t.Context(), db, 1, slog.New(slog.DiscardHandler))
 			require.NoError(t, err)
 
 			trx, err := pool.Get()
