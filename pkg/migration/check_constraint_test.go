@@ -838,6 +838,8 @@ func TestRestoreCopiedCheckConstraintsRefusesMismatch(t *testing.T) {
 	var rows, copied int
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_refuse WHERE (id = 1 AND state = 'created') OR (id = 2 AND state = 'started')").Scan(&rows))
 	require.Equal(t, 2, rows, "refusal must preserve source rows")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_refuse").Scan(&rows))
+	require.Equal(t, 2, rows, "refusal must not add source rows")
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _chk_restore_refuse_new").Scan(&copied))
 	require.Zero(t, copied, "refusal must precede row copy and cutover")
 }
