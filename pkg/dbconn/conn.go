@@ -394,7 +394,7 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	// the next sequence value on INSERT/REPLACE. That silently corrupts a
 	// MODIFY ... AUTO_INCREMENT migration of a column whose source data
 	// already contains 0: the row at pk=0 ends up at a different pk in the
-	// new table, and neither the copier's INSERT IGNORE SELECT nor the
+	// new table, and neither the copier's INSERT IGNORE nor the
 	// checksum recopy can undo it (each retry re-allocates a fresh
 	// auto-inc value). NO_AUTO_VALUE_ON_ZERO is otherwise a no-op (it
 	// only affects literal-0 inserts into AUTO_INCREMENT columns), so it

@@ -865,11 +865,11 @@ func (t *chunkerOptimistic) KeyAboveHighWatermark(key0 any) bool {
 		//
 		// Per this method's contract above ("if there is any ambiguity, it's
 		// important to return FALSE"), return FALSE: keep the change in the
-		// delta/buffered map. Once the chunker advances, the watermark logic
-		// at flush time will route it correctly — either flushing it via
-		// REPLACE INTO ... SELECT FROM original (idempotent with anything the
-		// chunker's own SELECT picked up) or deferring it until the chunker
-		// passes its key.
+		// buffered map. Once the chunker advances, the watermark logic
+		// at flush time will route it correctly — either flushing it via the
+		// applier's REPLACE INTO ... VALUES of its row image (idempotent with
+		// anything the chunker's own SELECT picked up) or deferring it until
+		// the chunker passes its key.
 		return false
 	}
 	if t.finalChunkSent {

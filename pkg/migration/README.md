@@ -44,7 +44,7 @@ There is one change source (`change.Source`) for the whole migration, with one s
 │              └──────────────┬──────────────┴─────────────────────────────┘              │
 │                             ▼                                                           │
 │                     ┌───────────────┐                                                   │
-│                     │    APPLIER    │ ── REPLACE INTO _new VALUES (…) ──►  _new table   │
+│                     │    APPLIER    │ ── INSERT IGNORE / REPLACE VALUES ──►  _new table │
 │                     │  pkg/applier  │                                                   │
 │                     └───────────────┘                                                   │
 │                                                                                         │
@@ -121,7 +121,7 @@ Setup ends by attaching the throttlers, enabling the watermark optimization, and
 
 ### 8. Row copy
 
-The copier reads chunks of the source table into Spirit and writes them through the applier with `REPLACE INTO _new VALUES (...)`. Chunk size adapts to a byte budget (`--target-chunk-size`). See [pkg/copier/README.md](../copier/README.md).
+The copier reads chunks of the source table into Spirit and writes them through the applier with `INSERT IGNORE INTO _new VALUES (...)`. The change source writes through the same applier with `REPLACE INTO _new VALUES (...)`. Chunk size adapts to a byte budget (`--target-chunk-size`). See [pkg/copier/README.md](../copier/README.md).
 
 While the copy runs, the change source applies binlog row images to `_new`. With the **watermark optimization** on, it discards changes to rows above the copier's high watermark, because the copier will read those rows later anyway. This is only safe while the copier is still running, so the runner disables it when the copy finishes. See [pkg/change/README.md](../change/README.md#watermark-optimization).
 
@@ -245,7 +245,7 @@ There are two types of locks to consider:
 
 ### Data locks
 
-**Spirit takes no data locks on the source table.** The copier reads rows into Spirit and writes them to `_new` through the applier (`REPLACE INTO _new VALUES (...)`). The change source applies binlog row images and never runs `SELECT FROM original`. The checksum's chunk repair reads the chunk into Spirit and rewrites it through the applier (see [Chunk repair](../checksum/README.md#chunk-repair)). Historically repair used `REPLACE INTO _new ... SELECT FROM original`, whose `SELECT` took shared row locks on the source. No current path holds shared row locks on the source, so Spirit does not contend with production workloads on hot rows. The applier's writes do take locks, but only on `_new`, which nothing else touches.
+**Spirit takes no data locks on the source table.** The copier reads rows into Spirit and writes them to `_new` through the applier (`INSERT IGNORE INTO _new VALUES (...)`). The change source applies binlog row images and never runs `SELECT FROM original`. The checksum's chunk repair reads the chunk into Spirit and rewrites it through the applier (see [Chunk repair](../checksum/README.md#chunk-repair)). Historically repair used `REPLACE INTO _new ... SELECT FROM original`, whose `SELECT` took shared row locks on the source. No current path holds shared row locks on the source, so Spirit does not contend with production workloads on hot rows. The applier's writes do take locks, but only on `_new`, which nothing else touches.
 
 ### Metadata locks
 

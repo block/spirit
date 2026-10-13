@@ -22,7 +22,7 @@ Its implementation is very similar to how the chunker in gh-ost works:
 ```sql
 SELECT pk FROM table WHERE pk > chunkPointer ORDER BY pk LIMIT 1 OFFSET {chunkSize}
 ```
-- The rows between the last chunk pointer and the new value are then handed to the copier (the chunker only computes the boundaries). The copier reads that range with a `SELECT` and writes it via the applier (`REPLACE INTO _new`).
+- The rows between the last chunk pointer and the new value are then handed to the copier (the chunker only computes the boundaries). The copier reads that range with a `SELECT` and writes it via the applier (`INSERT IGNORE INTO _new ... VALUES`).
 
 The composite chunker is very good at dividing the chunks up equally, since barring a brief race condition each chunk will match exactly the `chunkSize` value. The main downside is that it becomes a little bit wasteful when you have `AUTO_INCREMENT` `PRIMARY KEY`s and rarely delete data. In this case, you waste the initial `SELECT` statement, since the client could easily calculate the next chunk pointer by adding `chunkSize` to the previous chunk pointer. A second issue is that the `KeyAboveHighWatermark` optimization is more complex for the composite chunker than for the optimistic chunker. It works correctly for numeric, binary, and temporal primary key types, but for `VARCHAR`/`TEXT` columns with collations, Go's byte-order comparison may differ from MySQL's collation order (e.g., `'aa' = 'AA'` in `utf8mb4_0900_ai_ci`). Any discrepancies are caught by the checksum phase, since watermark optimizations are disabled before checksumming begins (see [issue #479](https://github.com/block/spirit/issues/479)).
 
@@ -55,7 +55,7 @@ The optimistic and composite chunkers implement `MappedChunker`. The multi chunk
 `ColumnMapping` describes the column relationship between a source and target table, including any column renames. It is created via `NewColumnMapping(source, target, renames)` where `renames` is an optional `map[string]string` of old→new column names.
 
 It provides:
-- `Columns()` — returns the comma-separated source and target column lists for `INSERT ... SELECT` and `REPLACE` statements
+- `Columns()` — returns the comma-separated source and target column lists for the applier's `INSERT IGNORE` and `REPLACE` statements
 - `ColumnsSlice()` — returns the column lists as slices
 - `ChecksumExprs()` — returns expressions for CRC32-based checksum comparison, handling type casting and renamed columns
 - `SourceTable()` / `TargetTable()` — returns the source/target `TableInfo`

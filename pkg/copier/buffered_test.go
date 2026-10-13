@@ -666,7 +666,7 @@ func TestCopyChunkApplyError(t *testing.T) {
 	require.NoError(t, stepper.CopyChunk(t.Context(), chunk))
 	feedbacksBefore := recorder.feedbacks.Load()
 
-	// The second chunk carries rows, so the applier's REPLACE hits the
+	// The second chunk carries rows, so the applier's INSERT IGNORE hits the
 	// missing table and the error must surface synchronously, with no
 	// feedback recorded for the failed chunk.
 	chunk, err = recorder.Next()
