@@ -843,3 +843,42 @@ func TestRestoreCopiedCheckConstraintsRefusesMismatch(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _chk_restore_refuse_new").Scan(&copied))
 	require.Zero(t, copied, "refusal must precede row copy and cutover")
 }
+
+func TestRestoreCopiedCheckConstraintsServerFailure(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "chk_restore_failure", `CREATE TABLE chk_restore_failure (
+		id INT NOT NULL PRIMARY KEY,
+		state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		CHECK (state IN (_utf8mb4'created', _utf8mb4'started'))
+	)`)
+	testutils.RunSQL(t, "INSERT INTO chk_restore_failure VALUES (1, 'created'), (2, 'started')")
+	var name, before string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE chk_restore_failure").Scan(&name, &before))
+	testutils.RunSQL(t, "CREATE TABLE _chk_restore_failure_new LIKE chk_restore_failure")
+	// Keep one generated CHECK, but remove the column needed by the source
+	// expression. The count guard passes; the real server must reject repair.
+	testutils.RunSQL(t, `ALTER TABLE _chk_restore_failure_new
+		DROP CHECK _chk_restore_failure_new_chk_1, DROP COLUMN state,
+		ADD CONSTRAINT _chk_restore_failure_new_chk_1 CHECK (id > 0)`)
+	var copyBefore string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE _chk_restore_failure_new").Scan(&name, &copyBefore))
+	change := &tableChange{
+		table:    table.NewTableInfo(tt.DB, "", tt.Name),
+		newTable: table.NewTableInfo(tt.DB, "", "_chk_restore_failure_new"),
+		runner:   &Runner{db: tt.DB},
+	}
+	require.ErrorContains(t, change.restoreCopiedCheckConstraints(t.Context()),
+		"restore source CHECK definitions on the empty copy _chk_restore_failure_new")
+	var after string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE chk_restore_failure").Scan(&name, &after))
+	require.Equal(t, before, after, "failed repair must not alter the source schema")
+	var rows, matching, copied int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_failure").Scan(&rows))
+	require.Equal(t, 2, rows, "failed repair must preserve the source row count")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_failure WHERE (id = 1 AND state = 'created') OR (id = 2 AND state = 'started')").Scan(&matching))
+	require.Equal(t, rows, matching, "failed repair must preserve the source row values")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _chk_restore_failure_new").Scan(&copied))
+	require.Zero(t, copied, "failed repair must precede row copy and cutover")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE _chk_restore_failure_new").Scan(&name, &after))
+	require.Equal(t, copyBefore, after, "rejected repair DDL must retain the copied CHECK")
+}
