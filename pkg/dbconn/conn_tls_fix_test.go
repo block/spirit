@@ -98,6 +98,19 @@ func TestGetTLSConfigForBinlogDISABLEDReturnsNil(t *testing.T) {
 	require.Nil(t, tlsConfig, "lowercase 'disabled' must return a nil binlog TLS config (no TLS), even for RDS hosts")
 }
 
+// TestGetTLSConfigForBinlogRequiredByHost pins both halves of the REQUIRED
+// branch: REQUIRED verifies the server certificate against the RDS roots for
+// an RDS host, and is encryption only for any other host.
+func TestGetTLSConfigForBinlogRequiredByHost(t *testing.T) {
+	rds, err := GetTLSConfigForBinlog(&DBConfig{TLSMode: "REQUIRED"}, "db.cluster-abc.us-east-1.rds.amazonaws.com")
+	require.NoError(t, err)
+	require.False(t, rds.InsecureSkipVerify, "REQUIRED against an RDS host must verify the certificate")
+
+	other, err := GetTLSConfigForBinlog(&DBConfig{TLSMode: "REQUIRED"}, "mysql.example.test")
+	require.NoError(t, err)
+	require.True(t, other.InsecureSkipVerify, "REQUIRED against a non-RDS host is encryption only")
+}
+
 // TestNewWithConnectionTypeCaseInsensitivePool verifies that lowercase and
 // mixed-case TLS mode strings drive the same DSN/TLS decision in the pool
 // constructor as their uppercase forms. We don't need a live server for this:

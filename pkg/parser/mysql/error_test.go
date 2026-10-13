@@ -37,3 +37,10 @@ func TestParseError(t *testing.T) {
 	other := NewStdErr("parser", ErrParse)
 	require.NotErrorIs(t, inst, other)
 }
+
+// TestServerErrorCodeValues pins the values of codes spirit matches on that
+// no other test compares against a literal.
+func TestServerErrorCodeValues(t *testing.T) {
+	require.Equal(t, 3170, ErrCapacityExceeded)
+	require.Equal(t, 4031, ErrClientInteractionTimeout)
+}

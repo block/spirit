@@ -593,7 +593,7 @@ func TestRangeOptimizerRefusal(t *testing.T) {
 	}
 	query := "INSERT INTO test.rangeopt2 SELECT * FROM test.rangeopt1 WHERE " + strings.Join(preds, " OR ")
 	_, err = RetryableTransaction(t.Context(), db, IgnoreDupKeyWarnings, config, query)
-	require.ErrorContains(t, err, "range_optimizer_max_mem_size")
+	require.ErrorContains(t, err, "Please decrease the target-chunk-size")
 }
 
 // An unsafe warning reads as one sentence naming its code, and stays
