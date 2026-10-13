@@ -37,7 +37,7 @@ The exit code is `0` if no errors are found, `1` if there are error-level violat
 - Type: String
 - Environment variable: `MYSQL_DSN`
 
-A Go MySQL DSN for the existing (source) schema. Mutually exclusive with `--source-dir`. Table names are matched the way this server compares them: case-insensitively when its `lower_case_table_names` is 1 or 2, so a schema file that writes `Orders` for a live `orders` produces an `ALTER TABLE orders` rather than a `CREATE` and a `DROP`. With `--source-dir` there is no server to ask, and names match exactly.
+A Go MySQL DSN for the existing (source) schema. Mutually exclusive with `--source-dir`. Table names are matched the way this server compares them: case-insensitively when its `lower_case_table_names` is 1 or 2, so a schema file that writes `Orders` for a live `orders` produces an `ALTER TABLE orders` rather than a `CREATE` and a `DROP`. With `--source-dir` there is no server to ask, and names match exactly. TLS is used when the server supports it (spirit's `PREFERRED` default); add `tls=false` to the DSN to disable it, or another `tls=` value to require it. Spirit sets its own session `sql_mode`, `time_zone`, `charset`, `collation` and `interpolateParams`, so those DSN parameters are ignored.
 
 ### source-dir
 
@@ -49,7 +49,7 @@ Path to a directory containing `CREATE TABLE` `.sql` files representing the exis
 
 - Type: String
 
-A Go MySQL DSN for the target schema to diff against the source. Mutually exclusive with `--target-dir` and `--target-alter`.
+A Go MySQL DSN for the target schema to diff against the source. Mutually exclusive with `--target-dir` and `--target-alter`. TLS is used when the server supports it (spirit's `PREFERRED` default); add `tls=false` to the DSN to disable it, or another `tls=` value to require it. Spirit sets its own session `sql_mode`, `time_zone`, `charset`, `collation` and `interpolateParams`, so those DSN parameters are ignored.
 
 ### target-dir
 

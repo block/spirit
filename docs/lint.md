@@ -37,7 +37,7 @@ The exit code is `0` if no errors are found, `1` if there are error-level violat
 - Type: String
 - Environment variable: `MYSQL_DSN`
 
-A Go MySQL DSN for the existing schema to lint. Mutually exclusive with `--source-dir`.
+A Go MySQL DSN for the existing schema to lint. Mutually exclusive with `--source-dir`. TLS is used when the server supports it (spirit's `PREFERRED` default); add `tls=false` to the DSN to disable it, or another `tls=` value to require it. Spirit sets its own session `sql_mode`, `time_zone`, `charset`, `collation` and `interpolateParams`, so those DSN parameters are ignored.
 
 ### source-dir
 

@@ -13,6 +13,16 @@
 //
 // Modelled on `go fmt`: if changes were made, the filename is printed to stdout.
 // If no changes were needed, nothing is printed.
+//
+// The connection is opened with dbconn, so it uses the same session settings
+// as every other spirit connection, with STRICT_TRANS_TABLES and
+// NO_ENGINE_SUBSTITUTION added to spirit's sql_mode (NO_AUTO_VALUE_ON_ZERO).
+// Without them MySQL accepts some invalid definitions by changing them: an
+// index that is too long becomes a prefix index, a VARCHAR that is too long
+// becomes a TEXT type, and an unknown engine becomes InnoDB. fmt would then
+// write a different table into the file. The zero-date checks (NO_ZERO_DATE,
+// NO_ZERO_IN_DATE) stay off, as in spirit, so DEFAULT '0000-00-00' is
+// accepted. TLS is PREFERRED: it is used when the server supports it.
 package fmt
 
 import (
@@ -23,7 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	_ "github.com/block/mysql"
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/parser/format"
@@ -34,16 +44,46 @@ import (
 )
 
 // FmtCmd is the Kong CLI struct for the fmt command.
-// It canonicalizes CREATE TABLE .sql files by round-tripping them through MySQL.
+// It canonicalizes CREATE TABLE .sql files by round-tripping them through MySQL,
+// under formatSQLMode.
 type FmtCmd struct {
 	// Files is the list of .sql files (or directories) to format.
-	Files []string `arg:"" help:"SQL files or directories to format." type:"path"`
+	Files []string `arg:"" help:"SQL files or directories to format. Statements run in strict mode with NO_ENGINE_SUBSTITUTION, so a definition MySQL would change is an error, but zero dates such as DEFAULT '0000-00-00' are accepted." type:"path"`
 
 	// MySQL connection options
-	Host     string `name:"host" help:"MySQL server host:port" default:"127.0.0.1:3306" env:"MYSQL_SERVER"`
+	Host     string `name:"host" help:"MySQL server host:port. TLS is used when the server supports it" default:"127.0.0.1:3306" env:"MYSQL_SERVER"`
 	Username string `name:"username" help:"MySQL username" default:"root" env:"MYSQL_USER"`
 	Password string `name:"password" help:"MySQL password" default:"" env:"MYSQL_PASSWORD"`
 	Database string `name:"database" help:"Temporary database to use for formatting" default:"spirit_fmt" env:"MYSQL_DATABASE"`
+}
+
+// formatSQLMode is added to spirit's session sql_mode (NO_AUTO_VALUE_ON_ZERO)
+// for the formatting session. Without these modes MySQL accepts some invalid
+// definitions by changing them (a too-long index becomes a prefix index, a
+// too-long VARCHAR a TEXT type, an unknown engine InnoDB), and fmt would write
+// the changed table back into the file.
+const formatSQLMode = "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"
+
+// session is the connection the formatting statements run on: a *sql.Conn
+// from formatSession.
+type session interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// formatSession pins one connection of db and adds formatSQLMode to its
+// sql_mode. The connection is pinned because a SET SESSION on the pool would
+// be lost when the pool replaces the connection.
+func formatSession(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',', ?)", formatSQLMode); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to set sql_mode: %w", err)
+	}
+	return conn, nil
 }
 
 // Run executes the fmt command. It is called by Kong.
@@ -61,15 +101,13 @@ func (cmd *FmtCmd) Run() error {
 
 	// Connect to MySQL without a database first so we can create the
 	// working database if it doesn't exist yet.
-	bootstrapDSN := buildDSN(cmd.Username, cmd.Password, cmd.Host, "")
-	bootstrapDB, err := sql.Open(dbconn.DriverName, bootstrapDSN)
+	dbConfig := dbconn.NewDBConfig()
+	dbConfig.MaxOpenConnections = 1
+	bootstrapDB, err := dbconn.NewContext(ctx, buildDSN(cmd.Username, cmd.Password, cmd.Host, ""), dbConfig)
 	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-	defer utils.CloseAndLog(bootstrapDB)
-	if err := bootstrapDB.PingContext(ctx); err != nil {
 		return fmt.Errorf("failed to connect to MySQL at %s: %w", cmd.Host, err)
 	}
+	defer utils.CloseAndLog(bootstrapDB)
 
 	// Ensure the working database exists.
 	if _, err := bootstrapDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", sqlescape.EscapeIdentifier(cmd.Database))); err != nil {
@@ -77,19 +115,20 @@ func (cmd *FmtCmd) Run() error {
 	}
 
 	// Now connect to the working database.
-	dsn := buildDSN(cmd.Username, cmd.Password, cmd.Host, cmd.Database)
-	db, err := sql.Open(dbconn.DriverName, dsn)
+	db, err := dbconn.NewContext(ctx, buildDSN(cmd.Username, cmd.Password, cmd.Host, cmd.Database), dbConfig)
 	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-	defer utils.CloseAndLog(db)
-	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("failed to connect to MySQL at %s/%s: %w", cmd.Host, cmd.Database, err)
 	}
+	defer utils.CloseAndLog(db)
+	conn, err := formatSession(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer utils.CloseAndLog(conn)
 
 	// Process each file.
 	for _, path := range files {
-		changed, err := formatFile(ctx, db, path)
+		changed, err := formatFile(ctx, conn, path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
@@ -102,7 +141,7 @@ func (cmd *FmtCmd) Run() error {
 
 // formatFile canonicalizes a single .sql file. It returns true if the file was
 // modified.
-func formatFile(ctx context.Context, db *sql.DB, path string) (bool, error) {
+func formatFile(ctx context.Context, db session, path string) (bool, error) {
 	original, err := os.ReadFile(path)
 	if err != nil {
 		return false, fmt.Errorf("failed to read file: %w", err)
@@ -169,7 +208,7 @@ func parseAndPrepare(createSQL string) (tableName string, execSQL string, resetA
 // The SQL is first parsed to validate it is a single CREATE TABLE statement.
 // Any database qualifier is stripped. This prevents SQL injection since only
 // valid CREATE TABLE statements are executed against the MySQL server.
-func canonicalize(ctx context.Context, db *sql.DB, createStmt string) (string, error) {
+func canonicalize(ctx context.Context, db session, createStmt string) (string, error) {
 	tableName, execSQL, resetAutoIncrement, err := parseAndPrepare(createStmt)
 	if err != nil {
 		return "", err
@@ -242,10 +281,16 @@ func collectSQLFiles(paths []string) ([]string, error) {
 	return files, nil
 }
 
-// buildDSN constructs a MySQL DSN from the given parameters.
+// buildDSN constructs a MySQL DSN from the given parameters. It formats the
+// DSN with the driver rather than by concatenation, which escapes the
+// database name: a '?' or '%' in it would otherwise be read as the start of
+// the driver parameters or as an escape.
 func buildDSN(username, password, host, database string) string {
-	if password != "" {
-		return fmt.Sprintf("%s:%s@tcp(%s)/%s", username, password, host, database)
-	}
-	return fmt.Sprintf("%s@tcp(%s)/%s", username, host, database)
+	cfg := mysql.NewConfig()
+	cfg.User = username
+	cfg.Passwd = password
+	cfg.Net = "tcp"
+	cfg.Addr = host
+	cfg.DBName = database
+	return cfg.FormatDSN()
 }

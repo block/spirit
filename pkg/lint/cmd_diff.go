@@ -15,11 +15,11 @@ import (
 // It diffs two schemas, shows the generated DDL, and lints the changes.
 type DiffCmd struct {
 	// Source of existing schema (exactly one required)
-	SourceDSN string `help:"MySQL DSN for existing schema" xor:"source" required:"" env:"MYSQL_DSN"`
+	SourceDSN string `help:"MySQL DSN for existing schema. TLS is attempted by default; add tls=false to the DSN to disable it" xor:"source" required:"" env:"MYSQL_DSN"`
 	SourceDir string `help:"Directory of CREATE TABLE .sql files for existing schema" xor:"source" required:"" type:"existingdir"`
 
 	// Target / proposed changes (exactly one required)
-	TargetDSN   string   `help:"MySQL DSN for target schema (will diff against source)" xor:"target" required:""`
+	TargetDSN   string   `help:"MySQL DSN for target schema (will diff against source). TLS is attempted by default; add tls=false to the DSN to disable it" xor:"target" required:""`
 	TargetDir   string   `help:"Directory of CREATE TABLE .sql files for target state" xor:"target" required:"" type:"existingdir"`
 	TargetAlter []string `help:"ALTER TABLE statement(s) to apply" short:"a" xor:"target" required:""`
 
@@ -34,8 +34,10 @@ type DiffCmd struct {
 func (cmd *DiffCmd) Run() error {
 	ctx := context.Background()
 
-	// 1. Load source schema.
-	source, err := loadSource(ctx, cmd.SourceDSN, cmd.SourceDir)
+	// 1. Load source schema. The source is the server the plan is applied
+	// to, so its lower_case_table_names decides how table names match. A
+	// source directory has no server to ask, so names match exactly (0).
+	source, lowerCaseTableNames, err := cmd.loadSource(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading source schema: %s\n", err)
 		os.Exit(2)
@@ -89,18 +91,7 @@ func (cmd *DiffCmd) Run() error {
 			fmt.Fprintf(os.Stderr, "Error converting target schema: %s\n", err)
 			os.Exit(2)
 		}
-		// The source is the server the plan is applied to, so its
-		// lower_case_table_names decides how table names match. A source
-		// directory has no server to ask, so names match exactly.
-		diffOpts := statement.NewDiffOptions()
-		if cmd.SourceDSN != "" {
-			diffOpts.LowerCaseTableNames, err = LowerCaseTableNamesFromDSN(ctx, cmd.SourceDSN)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading source server settings: %s\n", err)
-				os.Exit(2)
-			}
-		}
-		plan, err := PlanChanges(currentSchemas, targetSchemas, diffOpts, &config)
+		plan, err := PlanChanges(currentSchemas, targetSchemas, diffOptions(lowerCaseTableNames), &config)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error planning changes: %s\n", err)
 			os.Exit(2)
@@ -111,6 +102,24 @@ func (cmd *DiffCmd) Run() error {
 		}
 	}
 	return nil
+}
+
+// diffOptions returns the options for diffing against a source server whose
+// lower_case_table_names is lowerCaseTableNames.
+func diffOptions(lowerCaseTableNames int) *statement.DiffOptions {
+	opts := statement.NewDiffOptions()
+	opts.LowerCaseTableNames = lowerCaseTableNames
+	return opts
+}
+
+// loadSource loads the source schema from a DSN or a directory, with the
+// source server's lower_case_table_names (0 for a directory).
+func (cmd *DiffCmd) loadSource(ctx context.Context) ([]*statement.CreateTable, int, error) {
+	if cmd.SourceDSN != "" {
+		return loadServerSchema(ctx, cmd.SourceDSN)
+	}
+	tables, err := LoadSchemaFromDir(cmd.SourceDir)
+	return tables, 0, err
 }
 
 // loadTarget loads the target schema from a directory or DSN.

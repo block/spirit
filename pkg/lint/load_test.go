@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,4 +116,35 @@ func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644)
 	require.NoError(t, err)
+}
+
+func TestLoadSchemaFromDSN(t *testing.T) {
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE users (id bigint unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, name varchar(100))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE orders (id bigint unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	tables, err := LoadSchemaFromDSN(t.Context(), testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	names := make([]string, 0, len(tables))
+	for _, ct := range tables {
+		names = append(names, ct.TableName)
+	}
+	require.ElementsMatch(t, []string{"users", "orders"}, names)
+
+	// loadServerSchema reads lower_case_table_names over the same connection.
+	// The expected value is the server's own, so the test holds on servers
+	// configured with any setting.
+	var want int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@lower_case_table_names").Scan(&want))
+	tables, lowerCaseTableNames, err := loadServerSchema(t.Context(), testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	require.Len(t, tables, 2)
+	require.Equal(t, want, lowerCaseTableNames)
+}
+
+func TestLoadSchemaFromDSN_BadDSN(t *testing.T) {
+	_, err := LoadSchemaFromDSN(t.Context(), "not a dsn")
+	require.Error(t, err)
 }

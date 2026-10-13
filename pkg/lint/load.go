@@ -2,13 +2,11 @@ package lint
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
@@ -17,43 +15,43 @@ import (
 
 // LoadSchemaFromDSN connects to a MySQL server and retrieves all CREATE TABLE
 // statements from the connected database, parsed into structured CreateTable objects.
+//
+// The connection is opened with dbconn, so it gets spirit's session settings
+// and its TLS default (PREFERRED). Set tls= in the DSN to override it, for
+// example tls=false to disable TLS.
 func LoadSchemaFromDSN(ctx context.Context, dsn string) ([]*statement.CreateTable, error) {
-	db, err := sql.Open(dbconn.DriverName, dsn)
+	tables, _, err := loadServerSchema(ctx, dsn)
+	return tables, err
+}
+
+// loadServerSchema is LoadSchemaFromDSN that also returns the server's
+// @@lower_case_table_names, for statement.DiffOptions.LowerCaseTableNames.
+// Both are read over one connection, so the server is only opened once.
+func loadServerSchema(ctx context.Context, dsn string) ([]*statement.CreateTable, int, error) {
+	cfg := dbconn.NewDBConfig()
+	cfg.MaxOpenConnections = 1
+	db, err := dbconn.NewContext(ctx, dsn, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, 0, fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer utils.CloseAndLog(db)
-	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	var lowerCaseTableNames int
+	if err := db.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
+		return nil, 0, fmt.Errorf("failed to read lower_case_table_names: %w", err)
 	}
 	rawTables, err := table.LoadSchemaFromDB(ctx, db)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var tables []*statement.CreateTable
 	for _, raw := range rawTables {
 		ct, err := statement.ParseCreateTable(raw.Schema)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse CREATE TABLE for %s: %w", raw.Name, err)
+			return nil, 0, fmt.Errorf("failed to parse CREATE TABLE for %s: %w", raw.Name, err)
 		}
 		tables = append(tables, ct)
 	}
-	return tables, nil
-}
-
-// LowerCaseTableNamesFromDSN returns the server's @@lower_case_table_names,
-// for statement.DiffOptions.LowerCaseTableNames.
-func LowerCaseTableNamesFromDSN(ctx context.Context, dsn string) (int, error) {
-	db, err := sql.Open(dbconn.DriverName, dsn)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open database: %w", err)
-	}
-	defer utils.CloseAndLog(db)
-	var lowerCaseTableNames int
-	if err := db.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
-		return 0, fmt.Errorf("failed to read lower_case_table_names: %w", err)
-	}
-	return lowerCaseTableNames, nil
+	return tables, lowerCaseTableNames, nil
 }
 
 // LoadSchemaFromDir reads all .sql files from a directory and parses them as

@@ -13,7 +13,7 @@ import (
 // It lints an entire schema without requiring a target.
 type LintCmd struct {
 	// Source of existing schema (exactly one required)
-	SourceDSN string `help:"MySQL DSN for existing schema" xor:"source" required:"" env:"MYSQL_DSN"`
+	SourceDSN string `help:"MySQL DSN for existing schema. TLS is attempted by default; add tls=false to the DSN to disable it" xor:"source" required:"" env:"MYSQL_DSN"`
 	SourceDir string `help:"Directory of CREATE TABLE .sql files for existing schema" xor:"source" required:"" type:"existingdir"`
 
 	// Filtering

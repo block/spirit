@@ -1,10 +1,13 @@
 package lint
 
 import (
+	"io"
+	"os"
 	"testing"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -287,4 +290,54 @@ func parseCreateTables(t *testing.T, sqls ...string) []*statement.CreateTable {
 		tables = append(tables, ct)
 	}
 	return tables
+}
+
+// TestDiffOptionsLowerCaseTableNames pins that the source server's
+// lower_case_table_names reaches the diff. CI's servers all run with 0, so the
+// end-to-end tests cannot tell it apart from a dropped value.
+func TestDiffOptionsLowerCaseTableNames(t *testing.T) {
+	for _, v := range []int{0, 1, 2} {
+		require.Equal(t, v, diffOptions(v).LowerCaseTableNames)
+	}
+}
+
+// TestDiffCmd_DSNs runs the diff command end to end with both schemas read
+// from a server, the path `spirit diff --source-dsn --target-dsn` takes.
+func TestDiffCmd_DSNs(t *testing.T) {
+	sourceName, sourceDB := testutils.CreateUniqueTestDatabase(t)
+	targetName, targetDB := testutils.CreateUniqueTestDatabase(t)
+	_, err := sourceDB.ExecContext(t.Context(), "CREATE TABLE users (id bigint unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, name varchar(100))")
+	require.NoError(t, err)
+	_, err = targetDB.ExecContext(t.Context(), "CREATE TABLE users (id bigint unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, name varchar(100), email varchar(255))")
+	require.NoError(t, err)
+
+	cmd := &DiffCmd{
+		SourceDSN: testutils.DSNForDatabase(sourceName),
+		TargetDSN: testutils.DSNForDatabase(targetName),
+	}
+	out := captureStdout(t, func() { require.NoError(t, cmd.Run()) })
+	require.Contains(t, out, "ALTER TABLE `users`")
+	require.Contains(t, out, "ADD COLUMN `email` varchar(255)")
+}
+
+// captureStdout returns what fn writes to os.Stdout.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	orig := os.Stdout
+	os.Stdout = w
+	done := make(chan []byte)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- b
+	}()
+	defer func() {
+		os.Stdout = orig
+	}()
+	fn()
+	require.NoError(t, w.Close())
+	out := <-done
+	require.NoError(t, r.Close())
+	return string(out)
 }
