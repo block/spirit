@@ -906,6 +906,7 @@ var MySQLErrName = map[uint16]string{
 	ErrBadUser:                                               "User %s does not exist.",
 	ErrUserAlreadyExists:                                     "User %s already exists.",
 	ErrInvalidJSONPathArrayCell:                              "A path expression is not a path to a cell in an array.",
+	ErrCapacityExceeded:                                      "Memory capacity of %d bytes for '%s' exceeded. %s",
 	ErrInvalidEncryptionOption:                               "Invalid encryption option.",
 	ErrWindowNoSuchWindow:                                    "Window name '%s' is not defined.",
 	ErrWindowCircularityInWindowGraph:                        "There is a circularity in the window dependency graph.",
@@ -952,6 +953,7 @@ var MySQLErrName = map[uint16]string{
 	ErrJsonValueOutOfRangeForFuncIndex:                       "Out of range JSON value for CAST for functional index '%s'",
 	ErrFunctionalIndexDataIsTooLong:                          "Data too long for functional index '%s'",
 	ErrFunctionalIndexNotApplicable:                          "Cannot use functional index '%s' due to type or collation conversion",
+	ErrClientInteractionTimeout:                              "The client was disconnected by the server because of inactivity. See wait_timeout and interactive_timeout for configuring this behavior.",
 
 	// Optimizer-hint warnings.
 	ErrWarnOptimizerHintInvalidInteger:  "integer value is out of range in '%s'",

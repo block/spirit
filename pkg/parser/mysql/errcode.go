@@ -910,6 +910,7 @@ const (
 	ErrBadUser                                               = 3162
 	ErrUserAlreadyExists                                     = 3163
 	ErrInvalidJSONPathArrayCell                              = 3165
+	ErrCapacityExceeded                                      = 3170
 	ErrInvalidEncryptionOption                               = 3184
 	ErrRoleNotGranted                                        = 3530
 	ErrLockAcquireFailAndNoWaitSet                           = 3572
@@ -955,6 +956,7 @@ const (
 	ErrJsonValueOutOfRangeForFuncIndex                       = 3904 //nolint: revive
 	ErrFunctionalIndexDataIsTooLong                          = 3907
 	ErrFunctionalIndexNotApplicable                          = 3909
+	ErrClientInteractionTimeout                              = 4031
 
 	// Optimizer-hint warning codes, inherited from the TiDB fork base.
 	ErrWarnOptimizerHintUnsupportedHint = 8061

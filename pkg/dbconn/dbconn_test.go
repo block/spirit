@@ -206,9 +206,9 @@ func TestIsConnectionLossError(t *testing.T) {
 	require.True(t, IsConnectionLossError(driver.ErrBadConn))
 	require.True(t, IsConnectionLossError(mysql.ErrInvalidConn))
 	require.True(t, IsConnectionLossError(io.EOF))
-	require.True(t, IsConnectionLossError(&mysql.MySQLError{Number: 2003})) // CR_CONN_HOST_ERROR relayed by a proxy
-	require.True(t, IsConnectionLossError(&mysql.MySQLError{Number: 2013})) // CR_SERVER_LOST relayed by a proxy
-	require.True(t, IsConnectionLossError(&mysql.MySQLError{Number: 4031})) // ER_CLIENT_INTERACTION_TIMEOUT: killed by wait_timeout
+	require.True(t, IsConnectionLossError(&mysql.MySQLError{Number: 2003}))                                    // CR_CONN_HOST_ERROR relayed by a proxy
+	require.True(t, IsConnectionLossError(&mysql.MySQLError{Number: 2013}))                                    // CR_SERVER_LOST relayed by a proxy
+	require.True(t, IsConnectionLossError(&mysql.MySQLError{Number: parsermysql.ErrClientInteractionTimeout})) // killed by wait_timeout
 
 	// Wrapped variants must also be detected.
 	require.True(t, IsConnectionLossError(fmt.Errorf("rename failed: %w", driver.ErrBadConn)))
@@ -249,14 +249,14 @@ func TestIsLockContentionError(t *testing.T) {
 	// after lock contention" at an operator who is looking at something else.
 	require.False(t, IsLockContentionError(nil))
 	require.False(t, IsLockContentionError(errors.New("not a mysql error")))
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1062})) // duplicate key
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1064})) // syntax error
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1146})) // no such table
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1317})) // query interrupted: retryable, not contention
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1406})) // data too long
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1836})) // read only mode: retryable, not contention
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 2013})) // CR_SERVER_LOST: connection loss, not contention
-	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 4031})) // killed by wait_timeout: connection loss
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1062}))                                    // duplicate key
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1064}))                                    // syntax error
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1146}))                                    // no such table
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1317}))                                    // query interrupted: retryable, not contention
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1406}))                                    // data too long
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 1836}))                                    // read only mode: retryable, not contention
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: 2013}))                                    // CR_SERVER_LOST: connection loss, not contention
+	require.False(t, IsLockContentionError(&mysql.MySQLError{Number: parsermysql.ErrClientInteractionTimeout})) // killed by wait_timeout: connection loss
 	require.False(t, IsLockContentionError(driver.ErrBadConn))
 	require.False(t, IsLockContentionError(mysql.ErrInvalidConn))
 	require.False(t, IsLockContentionError(context.DeadlineExceeded))
@@ -563,7 +563,7 @@ func TestForceExecBadFormatString(t *testing.T) {
 	require.ErrorContains(t, err, "missing arguments")
 }
 
-// TestRangeOptimizerRefusal covers the errCapacityExceeded (3170) branch of
+// TestRangeOptimizerRefusal covers the ER_CAPACITY_EXCEEDED (3170) branch of
 // the warning inspection: when range_optimizer_max_mem_size is too low MySQL
 // silently falls back to a table scan, so RetryableTransaction refuses the
 // statement instead of letting a chunk-ranged query scan the whole table.

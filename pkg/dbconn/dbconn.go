@@ -32,14 +32,6 @@ const (
 	// inside real server error packets.
 	errCannotConnect = 2003
 	errConnLost      = 2013
-	// errClientInteractionTimeout (4031, ER_CLIENT_INTERACTION_TIMEOUT) is
-	// written by MySQL >= 8.0.24 as a final packet when the server
-	// disconnects an idle connection (wait_timeout); the client reads it on
-	// the connection's next use. Aurora does not always deliver it — a
-	// wait_timeout kill can also surface as a bare driver.ErrBadConn — so
-	// both shapes must classify the same way.
-	errClientInteractionTimeout = 4031
-	errCapacityExceeded         = 3170 // ER_CAPACITY_EXCEEDED
 )
 
 type DBConfig struct {
@@ -142,8 +134,13 @@ func IsConnectionLossError(err error) bool {
 	if !ok {
 		return false
 	}
+	// ER_CLIENT_INTERACTION_TIMEOUT is written by MySQL >= 8.0.24 as a final
+	// packet when the server disconnects an idle connection (wait_timeout); the
+	// client reads it on the connection's next use. Aurora does not always
+	// deliver it — a wait_timeout kill can also surface as a bare
+	// driver.ErrBadConn — so both shapes must classify the same way.
 	switch val.Number {
-	case errCannotConnect, errConnLost, errClientInteractionTimeout:
+	case errCannotConnect, errConnLost, parsermysql.ErrClientInteractionTimeout:
 		return true
 	default:
 		return false
@@ -296,7 +293,7 @@ func checkWarnings(ctx context.Context, trx *sql.Tx, dupKeyHandling DupKeyHandli
 			// naming one MySQL has deprecated (ucs2, macroman,
 			// macce, dec8, hp8) in any form raises this warning.
 			continue
-		case code == errCapacityExceeded:
+		case code == parsermysql.ErrCapacityExceeded:
 			// "Memory capacity of 8388608 bytes for 'range_optimizer_max_mem_size' exceeded.
 			// Range optimization was not done for this query."
 			// i.e. the query can still execute, but it won't be efficient. Prior to
