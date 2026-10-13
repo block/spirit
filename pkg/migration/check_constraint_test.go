@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -703,4 +705,180 @@ func tableCheckConstraints(t *testing.T, db *sql.DB, tableName string) map[strin
 	}
 	require.NoError(t, rows.Err())
 	return constraints
+}
+
+// TestCheckConstraintASCIICharsetCopy reproduces MySQL's CREATE TABLE LIKE
+// rewrite from _utf8mb4 literals to _ascii for a checked ASCII column.
+func TestCheckConstraintASCIICharsetCopy(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "chk_ascii_copy", `CREATE TABLE chk_ascii_copy (
+		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+		state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		CONSTRAINT chk_ascii_state CHECK (state IN (_utf8mb4'created', _utf8mb4'started')),
+		value INT NOT NULL DEFAULT 1,
+		CONSTRAINT chk_ascii_positive CHECK (value > 0)
+	)`)
+	testutils.RunSQL(t, `INSERT INTO chk_ascii_copy (state) VALUES ('created'), ('started')`)
+	m := NewTestRunner(t, "chk_ascii_copy",
+		`ADD COLUMN previous_state VARCHAR(32) CHARACTER SET ascii NULL,
+		 DROP CHECK chk_ascii_state,
+		 ADD CONSTRAINT chk_ascii_state CHECK (state IN (_utf8mb4'created', _utf8mb4'started', _utf8mb4'waiting'))`)
+	require.NoError(t, m.Run(t.Context()))
+	require.False(t, m.usedInstantDDL)
+	require.NoError(t, m.Close())
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_ascii_copy").Scan(&count))
+	require.Equal(t, 2, count)
+	_, err := tt.DB.ExecContext(t.Context(), "INSERT INTO chk_ascii_copy (state) VALUES ('waiting')")
+	require.NoError(t, err)
+	_, err = tt.DB.ExecContext(t.Context(), "INSERT INTO chk_ascii_copy (state) VALUES ('bogus')")
+	require.Error(t, err)
+	_, err = tt.DB.ExecContext(t.Context(), "INSERT INTO chk_ascii_copy (value, state) VALUES (-1, 'created')")
+	require.Error(t, err, "an unrelated constraint must remain enforced")
+}
+
+// Restore applies to copy migrations even when the ALTER does not name a CHECK.
+func TestCheckConstraintASCIICharsetPreserved(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "chk_ascii_preserve", `CREATE TABLE chk_ascii_preserve (
+		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+		state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		CONSTRAINT chk_ascii_preserve_state CHECK (state IN (_utf8mb4'created', _utf8mb4'started')) NOT ENFORCED
+	)`)
+	direct := testutils.NewTestTable(t, "chk_ascii_direct", `CREATE TABLE chk_ascii_direct (
+		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+		state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		CONSTRAINT chk_ascii_direct_state CHECK (state IN (_utf8mb4'created', _utf8mb4'started')) NOT ENFORCED
+	)`)
+	// MySQL can rewrite the introducers again during ALTER ALGORITHM=COPY.
+	// Compare with that same requested ALTER executed directly on a test table.
+	testutils.RunSQL(t, "ALTER TABLE chk_ascii_direct ENGINE=InnoDB, ALGORITHM=COPY")
+	expected, err := tableDefinition(t.Context(), direct.DB, direct.Name)
+	require.NoError(t, err)
+	m := NewTestRunner(t, "chk_ascii_preserve", "ENGINE=InnoDB")
+	require.NoError(t, m.Run(t.Context()))
+	require.False(t, m.usedInstantDDL)
+	require.NoError(t, m.Close())
+	result, err := tableDefinition(t.Context(), tt.DB, "chk_ascii_preserve")
+	require.NoError(t, err)
+	require.True(t, checkConstraintsMatch(checkConstraints(expected)[0], checkConstraints(result)[0]))
+	_, err = tt.DB.ExecContext(t.Context(), "INSERT INTO chk_ascii_preserve (state) VALUES ('bogus')")
+	require.NoError(t, err, "NOT ENFORCED must remain NOT ENFORCED")
+}
+
+// Restoration must preserve the numeric pairing beyond _chk_9, including
+// multiple rewritten expressions among named and server-generated checks.
+func TestCheckConstraintASCIICharsetMany(t *testing.T) {
+	t.Parallel()
+	var definition strings.Builder
+	definition.WriteString(`CREATE TABLE chk_ascii_many (
+		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+		state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		other_state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		value INT NOT NULL,
+		CONSTRAINT chk_ascii_many_a_state CHECK (state IN (_utf8mb4'created', _utf8mb4'started')),
+		CONSTRAINT chk_ascii_many_z_other CHECK (other_state IN (_utf8mb4'created', _utf8mb4'started')) NOT ENFORCED`)
+	for i := range 11 {
+		fmt.Fprintf(&definition, ", CHECK (value > %d)", i)
+	}
+	definition.WriteString(")")
+	tt := testutils.NewTestTable(t, "chk_ascii_many", definition.String())
+	testutils.RunSQL(t, `INSERT INTO chk_ascii_many (state, other_state, value) VALUES ('created', 'created', 100), ('started', 'started', 100)`)
+	direct := testutils.NewTestTable(t, "chk_ascii_many_direct", strings.ReplaceAll(definition.String(), "chk_ascii_many", "chk_ascii_many_direct"))
+	testutils.RunSQL(t, "ALTER TABLE chk_ascii_many_direct DROP CHECK chk_ascii_many_direct_chk_10, ENGINE=InnoDB, ALGORITHM=COPY")
+	directDef, err := tableDefinition(t.Context(), direct.DB, direct.Name)
+	require.NoError(t, err)
+	expected := checkConstraints(directDef)
+	require.Len(t, expected, 12)
+	m := NewTestRunner(t, tt.Name, "DROP CHECK chk_ascii_many_chk_10, ENGINE=InnoDB")
+	require.NoError(t, m.Run(t.Context()))
+	require.False(t, m.usedInstantDDL)
+	require.NoError(t, m.Close())
+	result, err := tableDefinition(t.Context(), tt.DB, tt.Name)
+	require.NoError(t, err)
+	actual := checkConstraints(result)
+	require.Len(t, actual, len(expected))
+	// Check definitions as a set: cutover renames the copied constraints.
+	for _, check := range expected {
+		require.True(t, slices.ContainsFunc(actual, func(candidate statement.Constraint) bool {
+			return checkConstraintsMatch(check, candidate)
+		}), "constraint %s must retain its expression and enforcement", check.Name)
+	}
+	var count int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_ascii_many").Scan(&count))
+	require.Equal(t, 2, count)
+	_, err = tt.DB.ExecContext(t.Context(), "INSERT INTO chk_ascii_many (state, other_state, value) VALUES ('created', 'bogus', 100)")
+	require.NoError(t, err, "the second restored check must remain NOT ENFORCED")
+	_, err = tt.DB.ExecContext(t.Context(), "INSERT INTO chk_ascii_many (state, other_state, value) VALUES ('bogus', 'created', 100)")
+	require.Error(t, err, "the first restored check must remain enforced")
+}
+
+func TestRestoreCopiedCheckConstraintsRefusesMismatch(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "chk_restore_refuse", `CREATE TABLE chk_restore_refuse (
+		id INT NOT NULL PRIMARY KEY,
+		state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		CHECK (state IN (_utf8mb4'created', _utf8mb4'started')),
+		CHECK (id > 0)
+	)`)
+	testutils.RunSQL(t, "INSERT INTO chk_restore_refuse VALUES (1, 'created'), (2, 'started')")
+	var sourceName, before string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE chk_restore_refuse").Scan(&sourceName, &before))
+	testutils.RunSQL(t, "CREATE TABLE _chk_restore_refuse_new LIKE chk_restore_refuse")
+	testutils.RunSQL(t, "ALTER TABLE _chk_restore_refuse_new DROP CHECK _chk_restore_refuse_new_chk_1")
+	change := &tableChange{
+		table:    table.NewTableInfo(tt.DB, "", tt.Name),
+		newTable: table.NewTableInfo(tt.DB, "", "_chk_restore_refuse_new"),
+		runner:   &Runner{db: tt.DB},
+	}
+	require.ErrorContains(t, change.restoreCopiedCheckConstraints(t.Context()), "has 2 CHECK constraint(s) but its copy _chk_restore_refuse_new has 1")
+	var after string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE chk_restore_refuse").Scan(&sourceName, &after))
+	require.Equal(t, before, after, "refusal must not alter the source schema")
+	var rows, copied int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_refuse WHERE (id = 1 AND state = 'created') OR (id = 2 AND state = 'started')").Scan(&rows))
+	require.Equal(t, 2, rows, "refusal must preserve source rows")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_refuse").Scan(&rows))
+	require.Equal(t, 2, rows, "refusal must not add source rows")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _chk_restore_refuse_new").Scan(&copied))
+	require.Zero(t, copied, "refusal must precede row copy and cutover")
+}
+
+func TestRestoreCopiedCheckConstraintsServerFailure(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "chk_restore_failure", `CREATE TABLE chk_restore_failure (
+		id INT NOT NULL PRIMARY KEY,
+		state VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+		CHECK (state IN (_utf8mb4'created', _utf8mb4'started'))
+	)`)
+	testutils.RunSQL(t, "INSERT INTO chk_restore_failure VALUES (1, 'created'), (2, 'started')")
+	var name, before string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE chk_restore_failure").Scan(&name, &before))
+	testutils.RunSQL(t, "CREATE TABLE _chk_restore_failure_new LIKE chk_restore_failure")
+	// Keep one generated CHECK, but remove the column needed by the source
+	// expression. The count guard passes; the real server must reject repair.
+	testutils.RunSQL(t, `ALTER TABLE _chk_restore_failure_new
+		DROP CHECK _chk_restore_failure_new_chk_1, DROP COLUMN state,
+		ADD CONSTRAINT _chk_restore_failure_new_chk_1 CHECK (id > 0)`)
+	var copyBefore string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE _chk_restore_failure_new").Scan(&name, &copyBefore))
+	change := &tableChange{
+		table:    table.NewTableInfo(tt.DB, "", tt.Name),
+		newTable: table.NewTableInfo(tt.DB, "", "_chk_restore_failure_new"),
+		runner:   &Runner{db: tt.DB},
+	}
+	require.ErrorContains(t, change.restoreCopiedCheckConstraints(t.Context()),
+		"restore source CHECK definitions on the empty copy _chk_restore_failure_new")
+	var after string
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE chk_restore_failure").Scan(&name, &after))
+	require.Equal(t, before, after, "failed repair must not alter the source schema")
+	var rows, matching, copied int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_failure").Scan(&rows))
+	require.Equal(t, 2, rows, "failed repair must preserve the source row count")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM chk_restore_failure WHERE (id = 1 AND state = 'created') OR (id = 2 AND state = 'started')").Scan(&matching))
+	require.Equal(t, rows, matching, "failed repair must preserve the source row values")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM _chk_restore_failure_new").Scan(&copied))
+	require.Zero(t, copied, "failed repair must precede row copy and cutover")
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SHOW CREATE TABLE _chk_restore_failure_new").Scan(&name, &after))
+	require.Equal(t, copyBefore, after, "rejected repair DDL must retain the copied CHECK")
 }
