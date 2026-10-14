@@ -278,10 +278,12 @@ func checkWarnings(ctx context.Context, trx *sql.Tx, dupKeyHandling DupKeyHandli
 		if err := rows.Scan(&level, &code, &message); err != nil {
 			return false, err
 		}
-		// We won't receive out of range warnings (1264)
-		// because the SQL mode has been unset. This is important
-		// because a historical value like 0000-00-00 00:00:00
-		// might exist in the table and needs to be copied.
+		// Connections run a non-strict sql_mode (see New), so a
+		// historical value like 0000-00-00 00:00:00 copies without a
+		// warning. Non-strict mode does not silence every row the new
+		// table cannot hold, though: a value out of range for a
+		// narrowed column is clipped and raises 1264, and that reaches
+		// the default case like any other write that changes the data.
 		switch {
 		case code == parsermysql.ErrDupEntry && dupKeyHandling == IgnoreDupKeyWarnings:
 			continue // ignore duplicate key warnings

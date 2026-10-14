@@ -649,6 +649,51 @@ func TestRetryableTransactionUnsafeWarningCarriesCode(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsafe warning 1048:")
 }
 
+// A value out of range for its column is clipped under Spirit's non-strict
+// sql_mode, and the warning that reports the clip stops the transaction: the
+// row would otherwise land holding a different value than it was written with.
+func TestRetryableTransactionOutOfRangeWarningIsUnsafe(t *testing.T) {
+	config := NewDBConfig()
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, Exec(t.Context(), db, "DROP TABLE IF EXISTS test.outofrangewarn1"))
+	require.NoError(t, Exec(t.Context(), db,
+		"CREATE TABLE test.outofrangewarn1 (a INT NOT NULL, b TINYINT NOT NULL, PRIMARY KEY (a))"))
+
+	_, err = RetryableTransaction(t.Context(), db, IgnoreDupKeyWarnings, config,
+		"INSERT IGNORE INTO test.outofrangewarn1 (a, b) VALUES (1, 1000)")
+	require.Error(t, err)
+
+	warning, ok := errors.AsType[*UnsafeWarningError](err)
+	require.True(t, ok, "transaction error does not carry the warning: %v", err)
+	assert.Equal(t, uint16(1264), warning.Warning.Number)
+	assert.Contains(t, err.Error(), "unsafe warning 1264:")
+}
+
+// A zero date is a historical value a table may hold, and Spirit's non-strict
+// sql_mode copies it without a warning, so the transaction succeeds and the
+// value lands as written.
+func TestRetryableTransactionCopiesZeroDate(t *testing.T) {
+	config := NewDBConfig()
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, Exec(t.Context(), db, "DROP TABLE IF EXISTS test.zerodate1"))
+	require.NoError(t, Exec(t.Context(), db,
+		"CREATE TABLE test.zerodate1 (a INT NOT NULL, b DATETIME NOT NULL, PRIMARY KEY (a))"))
+
+	affected, err := RetryableTransaction(t.Context(), db, IgnoreDupKeyWarnings, config,
+		"INSERT IGNORE INTO test.zerodate1 (a, b) VALUES (1, '0000-00-00 00:00:00')")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), affected)
+	var got string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT CAST(b AS CHAR) FROM test.zerodate1 WHERE a = 1").Scan(&got))
+	assert.Equal(t, "0000-00-00 00:00:00", got)
+}
+
 // A deprecation warning (1287) is not about the rows written, so it does not
 // stop the transaction. The binlog applier raises one whenever it writes a
 // value of a column in a charset MySQL has deprecated, such as ucs2, because
