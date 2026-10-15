@@ -1,6 +1,7 @@
 package statement
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,7 +36,12 @@ func TestDiffRejectsRepeatedNames(t *testing.T) {
 		{
 			name:     "constraint",
 			repeated: "CREATE TABLE t (id int NOT NULL, x int, PRIMARY KEY (id), CONSTRAINT c CHECK (x > 0), CONSTRAINT c CHECK (x < 9))",
-			wantErr:  `constraint "c" is declared more than once`,
+			wantErr:  `CHECK constraint "c" is declared more than once`,
+		},
+		{
+			name:     "foreign key in another case",
+			repeated: "CREATE TABLE t (id int NOT NULL, x int, PRIMARY KEY (id), CONSTRAINT fk FOREIGN KEY (x) REFERENCES parent (id), CONSTRAINT FK FOREIGN KEY (id) REFERENCES parent (id))",
+			wantErr:  `FOREIGN KEY constraint "FK" is declared more than once`,
 		},
 	}
 	for _, tt := range tests {
@@ -73,4 +79,72 @@ func TestDiffAcceptsUnnamedIndexesAndConstraints(t *testing.T) {
 	assert.Contains(t, stmts[0].Statement, "ADD UNIQUE INDEX `x` (`x`)")
 	assert.Contains(t, stmts[0].Statement, "ADD INDEX `x_2` (`x`)")
 	assert.Contains(t, stmts[0].Statement, "ADD INDEX `x_3` (`x`, `id`)")
+}
+
+// A CHECK and a foreign key may share a name, since each kind of constraint
+// is its own namespace in MySQL. Diff accepts the table and pairs each
+// constraint with the one of its own kind and name: flipping the CHECK to NOT
+// ENFORCED alters it in place and leaves the foreign key alone.
+func TestDiffPairsConstraintsByKind(t *testing.T) {
+	const table = "CREATE TABLE t (id int NOT NULL, p int, PRIMARY KEY (id), KEY c (p), CONSTRAINT c FOREIGN KEY (p) REFERENCES parent (id), CONSTRAINT c CHECK (p > 0)%s)"
+	source, err := ParseCreateTable(fmt.Sprintf(table, ""))
+	require.NoError(t, err)
+	target, err := ParseCreateTable(fmt.Sprintf(table, " NOT ENFORCED"))
+	require.NoError(t, err)
+
+	stmts, err := source.Diff(source, nil)
+	require.NoError(t, err)
+	assert.Empty(t, stmts)
+
+	stmts, err = source.Diff(target, nil)
+	require.NoError(t, err)
+	require.Len(t, stmts, 1)
+	assert.Equal(t, "ALTER TABLE `t` ALTER CHECK `c` NOT ENFORCED", stmts[0].Statement)
+}
+
+// MySQL compares index names case-insensitively when it names an unnamed
+// index or an inline UNIQUE, so a name taken in another case is skipped:
+// `KEY X (x), KEY (x)` stores the unnamed key as x_2, and so does an inline
+// UNIQUE on x declared after `KEY X`. Diff accepts both on either side.
+func TestDiffNamesIndexesAroundNamesInAnotherCase(t *testing.T) {
+	tests := []struct {
+		name  string
+		plain string
+		table string
+		add   string
+		drop  string
+	}{
+		{
+			name:  "unnamed key",
+			plain: "CREATE TABLE t (id int NOT NULL, x int, PRIMARY KEY (id))",
+			table: "CREATE TABLE t (id int NOT NULL, x int, PRIMARY KEY (id), KEY X (x), KEY (x))",
+			add:   "ALTER TABLE `t` ADD INDEX `X` (`x`), ADD INDEX `x_2` (`x`)",
+			drop:  "ALTER TABLE `t` DROP INDEX `X`, DROP INDEX `x_2`",
+		},
+		{
+			name:  "inline unique",
+			plain: "CREATE TABLE t (id int NOT NULL, y int, x int, PRIMARY KEY (id))",
+			table: "CREATE TABLE t (id int NOT NULL, y int, PRIMARY KEY (id), KEY X (y), x int UNIQUE)",
+			add:   "ALTER TABLE `t` ADD INDEX `X` (`y`), ADD UNIQUE INDEX `x_2` (`x`)",
+			drop:  "ALTER TABLE `t` DROP INDEX `X`, DROP INDEX `x_2`",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withIndexes, err := ParseCreateTable(tt.table)
+			require.NoError(t, err)
+			plainTable, err := ParseCreateTable(tt.plain)
+			require.NoError(t, err)
+
+			stmts, err := plainTable.Diff(withIndexes, nil)
+			require.NoError(t, err)
+			require.Len(t, stmts, 1)
+			assert.Equal(t, tt.add, stmts[0].Statement)
+
+			stmts, err = withIndexes.Diff(plainTable, nil)
+			require.NoError(t, err)
+			require.Len(t, stmts, 1)
+			assert.Equal(t, tt.drop, stmts[0].Statement)
+		})
+	}
 }

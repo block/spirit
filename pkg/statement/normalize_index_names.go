@@ -1,6 +1,9 @@
 package statement
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 func init() { registerNormalizer(indexNormalizer{}) }
 
@@ -28,12 +31,14 @@ type indexNormalizer struct{}
 func (indexNormalizer) Name() string { return "index-normalization" }
 
 func (indexNormalizer) Normalize(ct *CreateTable) *CreateTable {
-	// Track all used index names (including already-named indexes). The value
-	// is the highest _N suffix seen for that base name (0 = base name only).
+	// Track all used index names (including already-named indexes), keyed
+	// lowercased because MySQL compares index names case-insensitively: in
+	// `KEY X (x), KEY (x)` the unnamed key is x_2. The value is the highest _N
+	// suffix seen for that base name (0 = base name only).
 	usedNames := make(map[string]int)
 	for i := range ct.Indexes {
 		if ct.Indexes[i].Name != "" {
-			usedNames[ct.Indexes[i].Name] = 0
+			usedNames[strings.ToLower(ct.Indexes[i].Name)] = 0
 		}
 	}
 
@@ -47,12 +52,12 @@ func (indexNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		}
 		name := col.Name
 		for suffix := 2; ; suffix++ {
-			if _, taken := usedNames[name]; !taken {
+			if _, taken := usedNames[strings.ToLower(name)]; !taken {
 				break
 			}
 			name = fmt.Sprintf("%s_%d", col.Name, suffix)
 		}
-		usedNames[name] = 0
+		usedNames[strings.ToLower(name)] = 0
 		ct.Indexes = append(ct.Indexes, Index{
 			Name:          name,
 			Type:          "UNIQUE",
@@ -88,15 +93,15 @@ func (indexNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		// Find a unique name following MySQL's convention:
 		// first try baseName, then baseName_2, baseName_3, ...
 		candidate := baseName
-		if _, taken := usedNames[candidate]; taken {
+		if _, taken := usedNames[strings.ToLower(candidate)]; taken {
 			// Start from _2 and increment
 			suffix := 2
-			if prev, ok := usedNames[baseName]; ok && prev >= 2 {
+			if prev, ok := usedNames[strings.ToLower(baseName)]; ok && prev >= 2 {
 				suffix = prev + 1
 			}
 			for {
 				candidate = fmt.Sprintf("%s_%d", baseName, suffix)
-				if _, taken := usedNames[candidate]; !taken {
+				if _, taken := usedNames[strings.ToLower(candidate)]; !taken {
 					break
 				}
 				suffix++
@@ -104,14 +109,14 @@ func (indexNormalizer) Normalize(ct *CreateTable) *CreateTable {
 		}
 
 		idx.Name = candidate
-		usedNames[candidate] = 0
+		usedNames[strings.ToLower(candidate)] = 0
 		// Track the highest suffix used for this base name
 		if candidate != baseName {
 			// Extract suffix number
 			var suffixNum int
 			if _, err := fmt.Sscanf(candidate, baseName+"_%d", &suffixNum); err == nil {
-				if current, ok := usedNames[baseName]; !ok || suffixNum > current {
-					usedNames[baseName] = suffixNum
+				if current, ok := usedNames[strings.ToLower(baseName)]; !ok || suffixNum > current {
+					usedNames[strings.ToLower(baseName)] = suffixNum
 				}
 			}
 		}

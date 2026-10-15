@@ -2656,12 +2656,12 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 	// Build maps for easier lookup
 	sourceConstraints := make(map[string]*Constraint)
 	for i := range ct.Constraints {
-		sourceConstraints[ct.Constraints[i].Name] = &ct.Constraints[i]
+		sourceConstraints[constraintKey(&ct.Constraints[i])] = &ct.Constraints[i]
 	}
 
 	targetConstraints := make(map[string]*Constraint)
 	for i := range target.Constraints {
-		targetConstraints[target.Constraints[i].Name] = &target.Constraints[i]
+		targetConstraints[constraintKey(&target.Constraints[i])] = &target.Constraints[i]
 	}
 
 	// Build a set of source constraint names that have an equivalent match in the
@@ -2670,11 +2670,11 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 	// differs only cosmetically (e.g. charset introducers like _utf8mb3 that are
 	// stripped during parsing). Without this, such constraints would produce a
 	// spurious DROP + ADD.
-	matchedSourceByExpression := make(map[string]bool) // source name -> matched
-	matchedTargetByExpression := make(map[string]bool) // target name -> matched
+	matchedSourceByExpression := make(map[string]bool) // source key -> matched
+	matchedTargetByExpression := make(map[string]bool) // target key -> matched
 	for i := range ct.Constraints {
 		sourceConstr := &ct.Constraints[i]
-		if _, exactMatch := targetConstraints[sourceConstr.Name]; exactMatch {
+		if _, exactMatch := targetConstraints[constraintKey(sourceConstr)]; exactMatch {
 			continue // will be handled by the normal name-based path
 		}
 		if readsRebuilt(sourceConstr) {
@@ -2683,15 +2683,15 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 		// No exact name match — look for an expression-equivalent target constraint
 		for j := range target.Constraints {
 			targetConstr := &target.Constraints[j]
-			if _, exactMatch := sourceConstraints[targetConstr.Name]; exactMatch {
+			if _, exactMatch := sourceConstraints[constraintKey(targetConstr)]; exactMatch {
 				continue // this target constraint already has a name match in source
 			}
-			if matchedTargetByExpression[targetConstr.Name] || readsRebuilt(targetConstr) {
+			if matchedTargetByExpression[constraintKey(targetConstr)] || readsRebuilt(targetConstr) {
 				continue // already paired with another source constraint, or re-added for a rebuild
 			}
 			if constraintsEqualIgnoreName(sourceConstr, targetConstr) {
-				matchedSourceByExpression[sourceConstr.Name] = true
-				matchedTargetByExpression[targetConstr.Name] = true
+				matchedSourceByExpression[constraintKey(sourceConstr)] = true
+				matchedTargetByExpression[constraintKey(targetConstr)] = true
 				break
 			}
 		}
@@ -2704,13 +2704,13 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 	var enforcementClauses []string
 	for i := range ct.Constraints {
 		sourceConstr := &ct.Constraints[i]
-		if matchedSourceByExpression[sourceConstr.Name] {
+		if matchedSourceByExpression[constraintKey(sourceConstr)] {
 			continue // equivalent constraint exists in target under a different name
 		}
-		targetConstr, exists := targetConstraints[sourceConstr.Name]
+		targetConstr, exists := targetConstraints[constraintKey(sourceConstr)]
 		rebuild := readsRebuilt(sourceConstr)
 		if rebuild {
-			droppedForRebuild[sourceConstr.Name] = true
+			droppedForRebuild[constraintKey(sourceConstr)] = true
 		}
 
 		// Drop if constraint doesn't exist in target OR if it changed
@@ -2747,11 +2747,11 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 	// replacement name (error 1826, see above).
 	var addClauses []string
 	for _, targetConstr := range target.Constraints {
-		if matchedTargetByExpression[targetConstr.Name] {
+		if matchedTargetByExpression[constraintKey(&targetConstr)] {
 			continue // equivalent constraint exists in source under a different name
 		}
-		sourceConstr, existsInSource := sourceConstraints[targetConstr.Name]
-		rebuild := droppedForRebuild[targetConstr.Name] || readsRebuilt(&targetConstr)
+		sourceConstr, existsInSource := sourceConstraints[constraintKey(&targetConstr)]
+		rebuild := droppedForRebuild[constraintKey(&targetConstr)] || readsRebuilt(&targetConstr)
 
 		if rebuild || !existsInSource || !constraintsEqual(sourceConstr, &targetConstr) {
 			if !rebuild && existsInSource && constraintsEqualExceptEnforcement(sourceConstr, &targetConstr) {
@@ -2770,6 +2770,13 @@ func (ct *CreateTable) diffConstraints(target *CreateTable, rebuilt, takenNames 
 	clauses = append(clauses, addClauses...)
 
 	return clauses
+}
+
+// constraintKey identifies a constraint for pairing in diffConstraints. Each
+// kind of constraint is its own namespace in MySQL, so a CHECK and a foreign
+// key may share a name, and the key carries both.
+func constraintKey(c *Constraint) string {
+	return c.Type + " " + c.Name
 }
 
 // diffTableOptions compares table options and returns ALTER clauses for differences.
