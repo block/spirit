@@ -1722,8 +1722,10 @@ func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
 // that cannot share an ALTER after it. See pkg/statement/README.md,
 // "Statement Planning".
 // Returns nil if the tables are identical.
-// Returns an error if target has a primary key column that declares NULL, or
-// changes primary key options MySQL would ignore in a combined DROP and ADD.
+// Returns an error if either table declares a column, index, or constraint
+// name more than once, if target has a primary key column that declares NULL,
+// or if target changes primary key options MySQL would ignore in a combined
+// DROP and ADD.
 // If opts is nil, NewDiffOptions() defaults are used.
 func (ct *CreateTable) Diff(target *CreateTable, opts *DiffOptions) ([]*AbstractStatement, error) {
 	if opts == nil {
@@ -1731,6 +1733,12 @@ func (ct *CreateTable) Diff(target *CreateTable, opts *DiffOptions) ([]*Abstract
 	}
 	if ct.TableName != target.TableName {
 		return nil, fmt.Errorf("cannot diff tables with different names: %s vs %s", ct.TableName, target.TableName)
+	}
+	if err := checkUniqueNames(ct); err != nil {
+		return nil, fmt.Errorf("invalid source table %q: %w", ct.TableName, err)
+	}
+	if err := checkUniqueNames(target); err != nil {
+		return nil, fmt.Errorf("invalid target table %q: %w", target.TableName, err)
 	}
 	if err := checkPrimaryKeyNullability(target); err != nil {
 		return nil, fmt.Errorf("invalid target table %q: %w", target.TableName, err)
