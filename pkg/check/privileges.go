@@ -28,13 +28,18 @@ func init() {
 //     (enabled by default), checked by dbconn.CheckForceKillPrivileges
 //
 // A move additionally requires:
-//   - Visibility of every view, trigger, event and stored routine in the
-//     source schema in information_schema, so the source_schema_objects check
-//     cannot pass just because they are hidden (see schemaGrants)
-//   - Visibility of every trigger and event in each target schema (TRIGGER
-//     and EVENT on the target schema), for the same reason for the
-//     target_schema_objects check. Only visibility is checked on the target
-//     here; the target-side write privileges are not.
+//   - Visibility of every view and trigger in the source schema in
+//     information_schema, so the source_schema_objects check cannot pass just
+//     because they are hidden (see schemaGrants)
+//   - Visibility of every trigger in each target schema (TRIGGER on the
+//     target schema), for the same reason for the target_schema_objects
+//     check. Only visibility is checked on the target here; the target-side
+//     write privileges are not.
+//
+// A move also looks for events and stored routines in the source schema, and
+// events in each target schema, but does not yet require seeing them (see
+// unenforcedMoveVisibility): if a grant that shows them is missing, it logs a
+// warning naming it.
 //
 // SHOW GRANTS by the current user lists the privileges of its active roles,
 // including a default role and, with activate_all_roles_on_login=ON, every
@@ -56,9 +61,13 @@ func init() {
 //
 // The base grant rules are a re-implementation of the gh-ost check
 // validateGrants() in gh-ost/go/logic/inspect.go.
-func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
+func privilegesCheck(ctx context.Context, r Resources, logger *slog.Logger) error {
 	for i, src := range r.Sources {
 		if err := checkSourcePrivileges(ctx, r.Runtime, src); err != nil {
+			return r.sourceError(i, err)
+		}
+		where := fmt.Sprintf("source %d", i)
+		if err := warnUnenforcedVisibility(ctx, logger, r.Runtime, src.DB, where, src.schema(), sourceVisibilityKinds(r.Runtime)); err != nil {
 			return r.sourceError(i, err)
 		}
 	}
@@ -67,6 +76,10 @@ func privilegesCheck(ctx context.Context, r Resources, _ *slog.Logger) error {
 			return fmt.Errorf("target %d database connection or config is not initialized", i)
 		}
 		if err := targetObjectVisibility(ctx, r.Runtime, target.DB, target.Config.DBName); err != nil {
+			return fmt.Errorf("target %d (%s): %w", i, target.Config.DBName, err)
+		}
+		where := fmt.Sprintf("target %d", i)
+		if err := warnUnenforcedVisibility(ctx, logger, r.Runtime, target.DB, where, target.Config.DBName, targetObjectVisibilityKinds); err != nil {
 			return fmt.Errorf("target %d (%s): %w", i, target.Config.DBName, err)
 		}
 	}
@@ -122,7 +135,7 @@ func sourcePrivileges(ctx context.Context, runtime Runtime, db querier, schemaNa
 	if schemaName != "" && utils.DBLevelGrantsCoverSchema(grants, schemaName) {
 		foundDBAll = true
 	}
-	visibilityKinds := sourceVisibilityKinds(runtime)
+	visibilityKinds := enforcedVisibility(runtime, sourceVisibilityKinds(runtime))
 	if foundAll {
 		return schemaObjectVisibilityFromGrants(grants, schemaName, visibilityKinds...)
 	}
@@ -151,8 +164,9 @@ func sourcePrivileges(ctx context.Context, runtime Runtime, db querier, schemaNa
 
 // sourceVisibilityKinds are the schema objects a source's user must be able
 // to see. A move refuses a source schema with any of them
-// (source_schema_objects), so it must see them all; a migration only looks at
-// the migrated table's own triggers and foreign keys, and needs none.
+// (source_schema_objects), so it must see them all, although it does not yet
+// require seeing some (see enforcedVisibility); a migration only looks at the
+// migrated table's own triggers and foreign keys, and needs none.
 func sourceVisibilityKinds(runtime Runtime) []schemaObject {
 	if runtime == Move {
 		return allSchemaObjects

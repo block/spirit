@@ -1048,12 +1048,14 @@ func TestMoveRefusesSourceSchemaObjects(t *testing.T) {
 	}
 }
 
-// TestMoveRefusesUserThatCannotSeeRoutines checks that a move run by a user
-// who cannot see the source schema's stored routines is refused by the
-// privileges check. information_schema hides routines from such a user, so
-// without the requirement the source_schema_objects check would pass and the
-// move would leave the procedure behind on the retired source.
-func TestMoveRefusesUserThatCannotSeeRoutines(t *testing.T) {
+// TestMoveDoesNotYetRequireRoutineVisibility checks that a move run by a
+// user who cannot see the source schema's stored routines is not refused, for
+// now (see unenforcedMoveVisibility in pkg/check). information_schema hides
+// the routines from such a user, so the source_schema_objects check passes,
+// and the move leaves the procedure behind on the retired source. When the
+// requirement is enforced again, the privileges check refuses this move
+// before anything is created on the target.
+func TestMoveDoesNotYetRequireRoutineVisibility(t *testing.T) {
 	const srcDB, destDB, user = "source_obj_hidden", "dest_obj_hidden", "testmovehiddenroutine"
 	for _, db := range []string{srcDB, destDB} {
 		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
@@ -1089,17 +1091,14 @@ func TestMoveRefusesUserThatCannotSeeRoutines(t *testing.T) {
 	defer utils.CloseAndLog(runner)
 	var cutoverCalled bool
 	runner.SetCutover(func(context.Context) error { cutoverCalled = true; return nil })
-	err = runner.Run(t.Context())
-	require.ErrorContains(t, err, "insufficient privileges to run a move")
-	require.ErrorContains(t, err, "SHOW_ROUTINE on *.*")
-	require.NotContains(t, err.Error(), "EVENT on")
-	require.False(t, cutoverCalled, "the cutover callback must not be called")
+	require.NoError(t, runner.Run(t.Context()))
+	require.True(t, cutoverCalled, "the move must reach the cutover")
 
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	var n int
 	require.NoError(t, db.QueryRowContext(t.Context(),
-		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?", destDB).Scan(&n))
-	require.Zero(t, n, "nothing may be created on the target")
+		"SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ?", destDB).Scan(&n))
+	require.Zero(t, n, "move does not copy the procedure")
 }

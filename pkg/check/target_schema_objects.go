@@ -64,7 +64,9 @@ func targetSchemaObjectsCheck(ctx context.Context, r Resources, _ *slog.Logger) 
 //
 // information_schema only shows triggers and events the user has the TRIGGER
 // and EVENT privilege on, so every call first checks that the user has both on
-// the target schema, and refuses if not (see targetObjectVisibility).
+// the target schema, and refuses if not (see targetObjectVisibility). A move
+// does not yet require EVENT (see unenforcedMoveVisibility); without it, the
+// target's events are not found.
 //
 // --force does not bypass the refusal: the runner runs this check before it
 // wipes the target, and the wipe never drops events.

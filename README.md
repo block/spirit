@@ -137,14 +137,16 @@ Spirit requires an account with these privileges:
 * `CREATE TEMPORARY TABLES` on the schema, but only for a table with an `ENUM` or `SET` member that `information_schema` reports with a `?`. MySQL reports each member character outside `utf8mb3` as `?`, so Spirit reads the members MySQL stores through a temporary table, and refuses the table if it cannot.
 * `CONNECTION_ADMIN` (or `SUPER`) and `PROCESS` on `*.*`, and `SELECT` on `performance_schema.*` — required for the force-kill feature which is always enabled. This allows Spirit to kill long-running transactions that block metadata lock acquisition during checksum and cutover. To kill a session of an account that has `SYSTEM_USER`, Spirit's user needs `SYSTEM_USER` too. On RDS and Aurora MySQL, `EXECUTE` on the `mysql.rds_kill` procedure (on `*.*`, on `mysql.*`, or on the procedure) can replace `CONNECTION_ADMIN`: when `KILL` is denied, Spirit calls `mysql.rds_kill` instead. On Aurora MySQL 3, `rds_superuser_role` does not reliably include `CONNECTION_ADMIN`, so Spirit counts only the privileges `SHOW GRANTS` lists for an active role, not its name.
 
-`spirit move` also needs to see the events and stored routines it refuses to move. On each source schema it requires:
+`spirit move` also needs to see the events and stored routines it refuses to move. On each source schema it should have:
 
 * `EVENT` on the schema or on `*.*`.
 * For stored procedures and functions, one of: `SHOW_ROUTINE` on `*.*` (MySQL 8.0.20+), `SELECT` on `*.*`, or `EXECUTE`, `ALTER ROUTINE` or `CREATE ROUTINE` on the schema or on `*.*`.
 
 `SELECT` and `TRIGGER` on the schema (listed above; `*.*` also works) make its views and triggers visible. Table-level grants do not count. When more than one database-level grant matches a schema, each privilege must be on every matching grant. See [docs/move.md](docs/move.md) for roles and `rds_superuser_role`.
 
-`spirit move` refuses a trigger on a table it writes to on a target (a moved table, or its checkpoint table), and an event in a target schema, because they run on their own and can write to the moved tables. To see them, it requires `TRIGGER` and `EVENT` on each target schema or on `*.*`. See [docs/move.md](docs/move.md).
+`spirit move` refuses a trigger on a table it writes to on a target (a moved table, or its checkpoint table), and an event in a target schema, because they run on their own and can write to the moved tables. To see them, it requires `TRIGGER` on each target schema or on `*.*`, and should have `EVENT`.
+
+The `EVENT` and stored routine grants are not yet required: without them, `spirit move` logs a warning naming the missing grants and runs, but cannot find the events or routines they hide. A future release will refuse the move instead. See [docs/move.md](docs/move.md).
 
 For replica throttling, Spirit requires:
 
