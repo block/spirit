@@ -1,6 +1,7 @@
 package check
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -180,6 +182,7 @@ func TestMovePrivilegesMultipleSources(t *testing.T) {
 // CONNECTION_ADMIN either. On Aurora MySQL 3 the role often lacks it, so
 // accepting the name passed preflight while the cutover's KILL was denied.
 func TestMovePrivilegesWithRDSSuperuserRole(t *testing.T) {
+	enforceAllMoveVisibility(t)
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	config.User = "root"
@@ -283,6 +286,78 @@ func oldMinimalMoveGrants(schema string) []string {
 	}
 }
 
+// enforceAllMoveVisibility makes a move require the visibility of every
+// schema object kind for the rest of the test, as it will once
+// unenforcedMoveVisibility is emptied. The tests in this package do not run
+// in parallel.
+func enforceAllMoveVisibility(t *testing.T) {
+	t.Helper()
+	saved := unenforcedMoveVisibility
+	unenforcedMoveVisibility = nil
+	t.Cleanup(func() { unenforcedMoveVisibility = saved })
+}
+
+// TestMoveDoesNotYetRequireEventAndRoutineVisibility checks that a move
+// whose user cannot see events or stored routines is not refused, for now
+// (see unenforcedMoveVisibility): the privileges check logs a warning naming
+// the missing grants, and the scans do not find the hidden objects. Views and
+// triggers are still required, and a sync's target check still requires
+// EVENT.
+func TestMoveDoesNotYetRequireEventAndRoutineVisibility(t *testing.T) {
+	require.Equal(t, []schemaObject{schemaEvents, schemaRoutines}, unenforcedMoveVisibility)
+	src, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, src, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabase(t, src, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY, v INT)")
+	testutils.RunSQLInDatabaseAsRoot(t, src, "CREATE PROCEDURE p1() SELECT 1")
+	testutils.RunSQLInDatabaseAsRoot(t, src, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+	tgt, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabaseAsRoot(t, tgt, "CREATE EVENT e2 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
+
+	srcDB, srcCfg := createMoveTestUser(t, "testmovevis_relaxsrc", src, oldMinimalMoveGrants(src)...)
+	tgtDB, tgtCfg := createMoveTestUser(t, "testmovevis_relaxtgt", tgt, "GRANT SELECT, INSERT, TRIGGER ON `"+tgt+"`.* TO %s")
+	sources := []Endpoint{{DB: srcDB, Config: srcCfg}}
+	targets := []applier.Target{{DB: tgtDB, Config: tgtCfg}}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	require.NoError(t, privilegesCheck(t.Context(), Resources{Runtime: Move, Sources: sources, Targets: targets}, logger))
+	out := logs.String()
+	require.Contains(t, out, "level=WARN")
+	require.Contains(t, out, "endpoint=\"source 0\" schema="+src)
+	require.Contains(t, out, "EVENT on `"+src+"`.* (to see its events); SHOW_ROUTINE on *.*")
+	require.Contains(t, out, "endpoint=\"target 0\" schema="+tgt)
+	require.Contains(t, out, "EVENT on `"+tgt+"`.* (to see its events)")
+
+	// The hidden procedure and events are not found.
+	require.NoError(t, SourceSchemaObjectsError(t.Context(), sources))
+	require.NoError(t, ReverseWindowSchemaObjectsError(t.Context(), sources))
+	require.NoError(t, TargetSchemaObjectsError(t.Context(), moveTargets(targets, nil)))
+
+	// A sync's target check still requires EVENT.
+	synced := Resources{Runtime: Sync, Targets: targets, CheckpointTable: "_spirit_sync_checkpoint"}
+	err := RunChecks(t.Context(), synced, slog.Default(), PhasePostSetup, otherChecks(targetObjectsChecks...)...)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, "Needed: EVENT on `"+tgt+"`.* (to see its events)")
+
+	// With the grants, there is no warning, and the objects are found.
+	srcDB, srcCfg = createMoveTestUser(t, "testmovevis_relaxsrcok", src,
+		append(oldMinimalMoveGrants(src), "GRANT EVENT, EXECUTE ON `"+src+"`.* TO %s")...)
+	sources = []Endpoint{{DB: srcDB, Config: srcCfg}}
+	logs.Reset()
+	require.NoError(t, privilegesCheck(t.Context(), Resources{Runtime: Move, Sources: sources}, logger))
+	require.Empty(t, logs.String())
+	require.ErrorContains(t, SourceSchemaObjectsError(t.Context(), sources), "procedure 'p1', event 'e1'")
+
+	// TRIGGER is still required.
+	testutils.RunSQLInDatabaseAsRoot(t, "", "REVOKE TRIGGER ON `"+src+"`.* FROM testmovevis_relaxsrcok")
+	err = SourceSchemaObjectsError(t.Context(), sources)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, "Needed: TRIGGER on `"+src+"`.* (to see its triggers)")
+	err = ReverseWindowSchemaObjectsError(t.Context(), sources)
+	require.ErrorIs(t, err, ErrRefused)
+	require.ErrorContains(t, err, "Needed: TRIGGER on `"+src+"`.* (to see its triggers)")
+}
+
 // createMoveTestUser creates user as root with the given grants (each a
 // format string with one %s for the user) and returns a connection to schema
 // as that user. The user is dropped when the test ends.
@@ -330,6 +405,7 @@ func createMoveTestUser(t *testing.T, user, schema string, grants ...string) (*s
 // source_schema_objects check sees the trigger and the view (TRIGGER and
 // SELECT cover them) but not the procedure, the function or the event.
 func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
+	enforceAllMoveVisibility(t)
 	schema, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
 	for _, stmt := range []string{
@@ -445,6 +521,7 @@ func TestMovePrivilegesSchemaObjectVisibility(t *testing.T) {
 // the schema does not reach it, and information_schema.EVENTS hides the
 // schema's event. The visibility check must not count the pattern's EVENT.
 func TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant(t *testing.T) {
+	enforceAllMoveVisibility(t)
 	schema, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
 	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE EVENT e1 ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")
@@ -472,6 +549,7 @@ func TestSchemaObjectVisibilityWildcardGrantShadowedByExactGrant(t *testing.T) {
 // which runs no preflight) cannot make the scan pass on objects it cannot
 // see. Missing grants are a refusal; failing to read the grants is not.
 func TestSourceSchemaObjectsCheckRequiresVisibility(t *testing.T) {
+	enforceAllMoveVisibility(t)
 	const visibilityPrefix = "insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: "
 	scopes := []Phase{PhasePreflight, PhasePostSetup, PhaseResume, PhaseCutoverLocked}
 	only := otherChecks("source_schema_objects")
@@ -727,6 +805,7 @@ func TestVisibilityReadErrorsAreNotRefusals(t *testing.T) {
 	// reaches the evaluation, and the role's name does not stand in for the
 	// visibility grants.
 	t.Run("rds_superuser_role name does not substitute for visibility", func(t *testing.T) {
+		enforceAllMoveVisibility(t)
 		const needed = "Needed: EVENT on `app`.* (to see its events); SHOW_ROUTINE on *.*"
 		stub := stubDB{DB: db, grants: withRole}
 		err := schemaObjectVisibility(t.Context(), stub, "app", allSchemaObjects...)

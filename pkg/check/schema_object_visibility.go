@@ -3,6 +3,7 @@ package check
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 
@@ -22,6 +23,43 @@ const (
 
 // allSchemaObjects are the kinds source_schema_objects looks for.
 var allSchemaObjects = []schemaObject{schemaViews, schemaTriggers, schemaEvents, schemaRoutines}
+
+// unenforcedMoveVisibility are the kinds a move still looks for, but does not
+// yet refuse to run without seeing. If the move user lacks the grant that
+// shows them, information_schema hides them and the scans find none, so an
+// event or a stored routine in a source schema, or an event in a target
+// schema, is not detected. The privileges check logs a warning naming the
+// missing grants instead of refusing.
+//
+// Requiring these grants broke moves by users provisioned before the
+// requirement was added, and the case it protects against, an event or
+// routine in a schema being moved, is unlikely. The requirement is relaxed so
+// that the grants can be rolled out first; empty this list to enforce them
+// again. Views and triggers are always enforced. A sync is not affected.
+var unenforcedMoveVisibility = []schemaObject{schemaEvents, schemaRoutines}
+
+// enforcedVisibility returns the kinds runtime refuses to run without seeing:
+// kinds, less unenforcedMoveVisibility for a move.
+func enforcedVisibility(runtime Runtime, kinds []schemaObject) []schemaObject {
+	if runtime != Move {
+		return kinds
+	}
+	return slices.DeleteFunc(slices.Clone(kinds), func(k schemaObject) bool {
+		return slices.Contains(unenforcedMoveVisibility, k)
+	})
+}
+
+// unenforcedVisibility returns the kinds runtime looks for without requiring
+// that they are visible: those of kinds in unenforcedMoveVisibility, for a
+// move.
+func unenforcedVisibility(runtime Runtime, kinds []schemaObject) []schemaObject {
+	if runtime != Move {
+		return nil
+	}
+	return slices.DeleteFunc(slices.Clone(kinds), func(k schemaObject) bool {
+		return !slices.Contains(unenforcedMoveVisibility, k)
+	})
+}
 
 // schemaGrants evaluates SHOW GRANTS lines for one schema.
 //
@@ -115,6 +153,17 @@ func schemaObjectVisibilityFromGrants(grants []string, schemaName string, kinds 
 // missing for the user to see every object of the given kinds in schemaName,
 // or nil. reason says why runtime needs to see them.
 func visibilityFromGrants(grants []string, runtime Runtime, schemaName, reason string, kinds ...schemaObject) error {
+	missing := missingVisibility(grants, schemaName, kinds)
+	if len(missing) == 0 {
+		return nil
+	}
+	return refuse(fmt.Errorf("insufficient privileges to run a %s: %s, and information_schema hides them from users without these grants. Needed: %s",
+		runtime.noun(), reason, strings.Join(missing, "; ")))
+}
+
+// missingVisibility names the grants missing for the user to see every object
+// of the given kinds in schemaName, or returns nil.
+func missingVisibility(grants []string, schemaName string, kinds []schemaObject) []string {
 	g := schemaGrants{lines: grants, schema: schemaName}
 	var missing []string
 	for _, kind := range kinds {
@@ -122,11 +171,27 @@ func visibilityFromGrants(grants []string, runtime Runtime, schemaName, reason s
 			missing = append(missing, needed)
 		}
 	}
-	if len(missing) == 0 {
+	return missing
+}
+
+// warnUnenforcedVisibility logs a warning if the user of db cannot see every
+// object of the kinds runtime looks for in schemaName without requiring it
+// (see unenforcedMoveVisibility). where names the endpoint, such as "source
+// 0". It returns an error only if SHOW GRANTS cannot be read.
+func warnUnenforcedVisibility(ctx context.Context, logger *slog.Logger, runtime Runtime, db querier, where, schemaName string, kinds []schemaObject) error {
+	unenforced := unenforcedVisibility(runtime, kinds)
+	if len(unenforced) == 0 {
 		return nil
 	}
-	return refuse(fmt.Errorf("insufficient privileges to run a %s: %s, and information_schema hides them from users without these grants. Needed: %s",
-		runtime.noun(), reason, strings.Join(missing, "; ")))
+	grants, err := readGrants(ctx, db)
+	if err != nil {
+		return fmt.Errorf("could not read the grants that make the schema's objects visible: %w", err)
+	}
+	if missing := missingVisibility(grants, schemaName, unenforced); len(missing) > 0 {
+		logger.Warn("the "+runtime.noun()+" user lacks the grants that make some of the schema's objects visible, so the "+runtime.noun()+" cannot check for them; a future release will require these grants",
+			"endpoint", where, "schema", schemaName, "needed", strings.Join(missing, "; "))
+	}
+	return nil
 }
 
 // schemaObjectVisibility checks, from the connection's SHOW GRANTS, that the
@@ -147,8 +212,10 @@ func schemaObjectVisibility(ctx context.Context, db querier, schemaName string, 
 // targetObjectVisibility is schemaObjectVisibility for a target schema of
 // runtime: it checks that the user of db can see the schema's triggers and
 // events (targetObjectVisibilityKinds), which target_schema_objects refuses.
+// A move does not yet require seeing the events (see
+// unenforcedMoveVisibility).
 func targetObjectVisibility(ctx context.Context, runtime Runtime, db querier, schemaName string) error {
-	return visibility(ctx, db, runtime, schemaName, targetVisibilityReason(runtime), targetObjectVisibilityKinds...)
+	return visibility(ctx, db, runtime, schemaName, targetVisibilityReason(runtime), enforcedVisibility(runtime, targetObjectVisibilityKinds)...)
 }
 
 func visibility(ctx context.Context, db querier, runtime Runtime, schemaName, reason string, kinds ...schemaObject) error {

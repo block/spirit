@@ -15,7 +15,8 @@ func init() {
 	// or events would be taken as having nothing to move, and a view named in
 	// the table list would fail as a missing table instead of being named
 	// here. It runs after the privileges check, which (sorted by name) comes
-	// first and makes sure the move user can see events and routines.
+	// first and makes sure the move user can see views and triggers, and warns
+	// if it cannot see events or routines (see unenforcedMoveVisibility).
 	//
 	// An object can be created in a source schema between runs, and a resume
 	// from checkpoint runs the resume checks instead of the post-setup ones,
@@ -85,6 +86,8 @@ func schemaObjectsQuery(kinds []int) string {
 // preflight, and every call checks them again for each source before it
 // trusts an empty result, and refuses if they are missing: a reverse-window
 // resume runs no preflight, and a grant can be revoked during a long move.
+// The grants that show events and stored routines are not yet required (see
+// unenforcedMoveVisibility): without them, those objects are not found.
 //
 // Finding objects, or missing grants, is a refusal (see ErrRefused). Any
 // other error, such as a failed query, may be transient.
@@ -101,8 +104,8 @@ func SourceSchemaObjectsError(ctx context.Context, sources []Endpoint) error {
 			return fmt.Errorf("source %d database connection or config is not initialized", i)
 		}
 		// An empty result only proves the schema is clear if the user can see
-		// every object type. Fail closed otherwise.
-		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, allSchemaObjects...); err != nil {
+		// every object type. Fail closed otherwise, for the types enforced.
+		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, enforcedVisibility(Move, allSchemaObjects)...); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
 		objects, err := describeSchemaObjects(ctx, src, allObjectKinds)
@@ -207,14 +210,15 @@ var reverseWindowVisibility = []schemaObject{schemaTriggers, schemaEvents}
 // fresh window starts.
 //
 // Like SourceSchemaObjectsError, it first checks that the user can see the
-// schema's triggers and events, and refuses if not.
+// schema's triggers, and refuses if not. Seeing its events is not yet
+// required (see unenforcedMoveVisibility).
 func ReverseWindowSchemaObjectsError(ctx context.Context, sources []Endpoint) error {
 	var groups []string
 	for i, src := range sources {
 		if src.DB == nil || src.Config == nil {
 			return fmt.Errorf("source %d database connection or config is not initialized", i)
 		}
-		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, reverseWindowVisibility...); err != nil {
+		if err := schemaObjectVisibility(ctx, src.DB, src.Config.DBName, enforcedVisibility(Move, reverseWindowVisibility)...); err != nil {
 			return fmt.Errorf("source %d (%s): %w", i, src.Config.DBName, err)
 		}
 		objects, err := describeSchemaObjects(ctx, src, reverseWindowObjectKinds)

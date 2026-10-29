@@ -184,6 +184,7 @@ func TestReverseWindowSchemaObjectsError(t *testing.T) {
 // triggers or events, rather than trusting an empty result. Routine
 // visibility is not needed for it.
 func TestReverseWindowSchemaObjectsErrorRequiresVisibility(t *testing.T) {
+	enforceAllMoveVisibility(t)
 	schema, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY, v INT)")
 	const prefix = "insufficient privileges to run a move: move refuses source schemas that contain triggers, views, events or stored routines, and information_schema hides them from users without these grants. Needed: "

@@ -142,6 +142,7 @@ func TestTargetSchemaObjectsCheck(t *testing.T) {
 // target schema's triggers or events, rather than trusting an empty result.
 // Failing to read the grants is not a refusal.
 func TestTargetSchemaObjectsCheckRequiresVisibility(t *testing.T) {
+	enforceAllMoveVisibility(t)
 	schema, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, schema, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT)")
 	testutils.RunSQLInDatabaseAsRoot(t, schema, "CREATE TRIGGER t1_bi BEFORE INSERT ON t1 FOR EACH ROW SET NEW.v = 1")
