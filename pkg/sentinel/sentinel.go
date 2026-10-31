@@ -34,7 +34,7 @@ const TableName = "_spirit_sentinel"
 // them. Keeping the timing here makes the cutover wait identical across every
 // caller (migrate, move).
 var (
-	WaitLimit     = 48 * time.Hour
+	WaitLimit     = 720 * time.Hour
 	CheckInterval = 1 * time.Second
 )
 

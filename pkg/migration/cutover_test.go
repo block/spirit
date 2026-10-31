@@ -1176,7 +1176,7 @@ func TestDropAfterCutover(t *testing.T) {
 
 // TestDeferCutOver tests that deferred cutover times out waiting for the sentinel table.
 func TestDeferCutOver(t *testing.T) {
-	t.Skip("skipping: this test waits for sentinel.WaitLimit to expire, which is too slow with the current 48 hour limit")
+	t.Skip("skipping: this test waits for sentinel.WaitLimit to expire, which is too slow with the current 720 hour limit")
 	t.Parallel()
 
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
