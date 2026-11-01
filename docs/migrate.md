@@ -112,7 +112,7 @@ Deferring a cutover is decided when Spirit starts, and the sentinel table only h
 
 1. **Pass `defer-cutover` at startup.** It cannot be turned on for a run that is already in progress.
 2. **Spirit creates the sentinel table.** When a migration starts fresh with `defer-cutover`, Spirit creates `_spirit_sentinel` in the same schema as the table being altered, before the row copy begins.
-3. **The cutover is held for as long as the table exists.** Spirit blocks before the cutover until the operator drops the sentinel table, then proceeds. Spirit never drops the sentinel table itself. After 48 hours of waiting it exits with an error.
+3. **The cutover is held for as long as the table exists.** Spirit blocks before the cutover until the operator drops the sentinel table, then proceeds. Spirit never drops the sentinel table itself. After 720 hours (30 days) of waiting it exits with an error.
 
 A run started without `defer-cutover` never waits on the sentinel table. Creating `_spirit_sentinel` by hand while it runs has no effect, and neither does a sentinel table left behind by an earlier deferred migration: the run cuts over without waiting.
 
