@@ -232,6 +232,10 @@ func (s *TableLock) DB() *sql.DB {
 // For a lock taken with NewTableLockReferencing, the sessions that block a
 // statement on a referenced table are killed once it has waited the force-kill
 // delay.
+//
+// A statement still running after 5 seconds logs what the locking session is
+// doing and the metadata locks on the server, and logs them again each time
+// its running time doubles.
 func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -298,8 +302,10 @@ func (s *TableLock) execUnderLock(ctx context.Context, inspectWarnings bool, stm
 		}
 		execCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.completionTimeout)
 		stopKill := s.killReferencedBlockers(ctx, execCtx)
+		stopReport := s.reportSlowStatement(execCtx, stmt)
 		_, err := s.lockConn.ExecContext(execCtx, stmt)
 		expired := execCtx.Err() != nil
+		stopReport()
 		stopKill()
 		if err == nil && inspectWarnings {
 			// Read the diagnostics before any other statement can replace them.
