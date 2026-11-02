@@ -77,7 +77,7 @@ The same caveats about [resuming across Spirit binary versions](migrate.md#resum
 
 How long a cutover attempt may hold its table locks before it switches traffic. New reads and writes of the locked tables wait from the first `LOCK TABLES` until the locks are released, so this bounds the part of that wait that comes before the switch: the final flush, the checks under the lock, and the work that prepares the switch. With many targets that work grows with the number of targets. An attempt that runs past the timeout releases its locks without switching traffic and is retried, up to the retry limit. The traffic switch itself is not bounded, because cancelling it could leave it half applied. Each `LOCK TABLES` is bounded separately by [lock-wait-timeout](#lock-wait-timeout).
 
-A rollback's reverse cutover uses the same bound for the work it does under the target locks before it un-retires the source. An attempt that runs past it releases the locks, the reverse window stays open, and the rollback is tried again on the next poll.
+A rollback's reverse cutover uses the same bound for the work it does under the target locks before it un-retires the source. An attempt that runs past it before it stops the reverse feed releases the locks, the reverse window stays open, and the rollback is tried again on the next poll.
 
 Every attempt logs how long it waited for its locks, how long it held them, how long the tables were blocked before traffic switched, and the time spent in each step.
 
@@ -180,7 +180,7 @@ A rollback is triggered out of band by creating a table named `_spirit_move_reve
 4. runs the reverse-cutover hook if the embedding application registered one (the `spirit` CLI does not — programmatic callers use it to switch routing back to the source); and
 5. retires the former target tables to a `_revert` suffix — distinct from `_old`, so a later move can recognize and clean them up. Each target's tables are renamed in one statement.
 
-A failure before step 3 moves no ownership: the locks are released, the reverse feed keeps running, and the rollback is tried again on the next poll, up to the retry limit (see [cutover-lock-timeout](#cutover-lock-timeout)). A hook that fails without reporting a change is retried under the locks.
+A failure before the reverse feed is stopped in step 2 moves no ownership: the locks are released, the reverse feed keeps running, and the rollback is tried again on the next poll, up to the retry limit (see [cutover-lock-timeout](#cutover-lock-timeout)). A hook that fails without reporting a change is retried under the locks.
 
 The marker and the checkpoint are dropped once the rollback completes.
 

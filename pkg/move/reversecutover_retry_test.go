@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
@@ -207,4 +208,20 @@ func TestMayRetryReverseCutover(t *testing.T) {
 	require.False(t, w.mayRetryReverseCutover(cancelled, abandoned, 1), "a cancelled window is not retried")
 	require.False(t, w.mayRetryReverseCutover(t.Context(),
 		errors.New("reverse cutover: persist reverting phase: write failed"), 1), "a failure past the reverting phase is not retried")
+}
+
+// TestReverseFeedPauseResumePeriodicFlush: a reverse cutover stops every
+// feed's periodic flush before it locks the targets, so its own flush under
+// the locks cannot wait on one already running, and restarts them when the
+// attempt is abandoned.
+func TestReverseFeedPauseResumePeriodicFlush(t *testing.T) {
+	a, b := &change.MockSource{}, &change.MockSource{}
+	rf := &ReverseFeed{clients: []change.Source{a, b}, flushInt: time.Second}
+	rf.PausePeriodicFlush()
+	require.Equal(t, 1, a.PeriodicFlushStops())
+	require.Equal(t, 1, b.PeriodicFlushStops())
+	require.Zero(t, a.PeriodicFlushStarts())
+	rf.ResumePeriodicFlush(t.Context())
+	require.Equal(t, 1, a.PeriodicFlushStarts())
+	require.Equal(t, 1, b.PeriodicFlushStarts())
 }

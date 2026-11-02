@@ -466,6 +466,18 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 		return abandonReverseCutover(err)
 	}
 
+	// Stop the periodic flush before locking, and restart it if this attempt
+	// is abandoned with the feed still open (see PausePeriodicFlush). Waiting
+	// here for a periodic flush in progress blocks nothing: the targets are
+	// not locked yet.
+	w.feed.PausePeriodicFlush()
+	feedClosed := false
+	defer func() {
+		if !feedClosed {
+			w.feed.ResumePeriodicFlush(ctx)
+		}
+	}()
+
 	timing := newLockTiming(r.logger, "reverse cutover")
 	defer func() { timing.log(err) }()
 
@@ -500,46 +512,24 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 		}
 	}
 
-	// 2. Flush the reverse feed so the source's _old tables reflect every target
-	//    write. The feed stays open until just before the reverting phase is
-	//    written: an attempt that fails before then leaves it running, so the
-	//    window can keep the source current and try again.
-	if err := w.drainFeed(lockedCtx); err != nil {
-		return beforePersist(err)
-	}
-	timing.step("flush")
-
 	// Check the source schema one last time before the _old tables go back
-	// into service: the reverse feed is drained, and a trigger or event
-	// created during the window could have written to them outside it, or (a
-	// trigger on an _old table) would go live with them. Views, procedures
-	// and functions are not refused (see
-	// check.ReverseWindowSchemaObjectsError). This path holds no lock on the
-	// source tables, so it does not keep DDL out while it runs. Fail closed:
-	// nothing has moved ownership yet, the phase is still reverse_window, and
-	// a re-run resumes the window once the objects are dropped.
+	// into service: a trigger or event created during the window could have
+	// written to them outside the reverse feed, or (a trigger on an _old
+	// table) would go live with them. Views, procedures and functions are not
+	// refused (see check.ReverseWindowSchemaObjectsError). This path holds no
+	// lock on the source tables, so it does not keep DDL out while it runs.
+	// Fail closed: nothing has moved ownership yet, the phase is still
+	// reverse_window, and a re-run resumes the window once the objects are
+	// dropped.
 	if err := w.checkSourceSchemaObjects(lockedCtx); err != nil {
 		return beforePersist(fmt.Errorf("reverse cutover: %w", err))
 	}
 	timing.step("checks")
 
-	// The mirror of the forward cutover's carryAutoIncrementsToTargets: ids the
-	// targets issued during the window and have since deleted never reached
-	// the source's _old tables, so without this the source would issue them
-	// again once traffic returns. The targets are locked and the feed is
-	// drained, so neither side's counter can move now.
-	if err := w.carryAutoIncrementsToSource(lockedCtx); err != nil {
-		return beforePersist(fmt.Errorf("reverse cutover: %w", err))
-	}
-	timing.step("auto_increment")
-
-	// Drain the feed again and stop it: no more writes to _old during the
-	// renames below.
-	//
-	// Both checks, then Close, in this order, and none is optional. Close
-	// discards the buffer rather than flushing it, and the renames below put
-	// the source's _old tables back into service — so a change still
-	// buffered here is a target-era write that is silently lost.
+	// 2. Flush the reverse feed so the source's _old tables reflect every target
+	//    write, then stop it (no more writes to _old during the renames below).
+	//    The feed stays open until here, so an attempt that fails before this
+	//    point leaves it running and the window can try again.
 	if err := w.drainFeed(lockedCtx); err != nil {
 		return beforePersist(err)
 	}
@@ -547,14 +537,30 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 		return beforePersist(err)
 	}
 	w.feed.Close()
-	timing.step("stop_feed")
+	feedClosed = true
+	timing.step("flush")
+
+	// The mirror of the forward cutover's carryAutoIncrementsToTargets: ids the
+	// targets issued during the window and have since deleted never reached
+	// the source's _old tables, so without this the source would issue them
+	// again once traffic returns. The targets are locked and the feed is
+	// drained, so neither side's counter can move now.
+	//
+	// It runs after the feed is closed: its ALTER TABLE on an _old table is a
+	// schema change the feed would stop on where the source and a target
+	// share a server. A failure here is therefore not retried by the window
+	// (the feed is gone); it fails the run with the phase still
+	// reverse_window, and a re-run resumes the window.
+	if err := w.carryAutoIncrementsToSource(lockedCtx); err != nil {
+		return lockTimeoutError(ctx, lockedCtx, lockTimeout, fmt.Errorf("reverse cutover: %w", err))
+	}
+	timing.step("auto_increment")
 
 	// Persist the ownership boundary immediately before the first rename that
 	// moves ownership, and fail closed if it cannot be written. Everything up
 	// to here is reversible; from the next statement on, a crash leaves the
 	// move half-rolled-back, and a resume that could not read phaseReverting
 	// would restart the window as though traffic were still on the target.
-	// The feed is closed, so a failure here is not retried by the window.
 	if err := w.persistPhase(ctx, phaseReverting); err != nil {
 		return fmt.Errorf("reverse cutover: persist reverting phase: %w", err)
 	}
@@ -692,15 +698,9 @@ func (w *reverseWindow) retireTargets(ctx context.Context, locks []*dbconn.Table
 		})
 	}
 	wg.Wait()
-	var ambiguous []error
-	for _, err := range errs {
-		if errors.Is(err, status.ErrOwnershipAmbiguous) {
-			ambiguous = append(ambiguous, err)
-		}
-	}
-	if len(ambiguous) > 0 {
-		return errors.Join(ambiguous...)
-	}
+	// Every target's outcome is kept: recovery needs to know which targets
+	// are definitely still unretired, not only which one is ambiguous.
+	// errors.Is still finds ErrOwnershipAmbiguous in the joined error.
 	return errors.Join(errs...)
 }
 

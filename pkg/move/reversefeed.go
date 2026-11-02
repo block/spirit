@@ -301,6 +301,24 @@ func (rf *ReverseFeed) Flush(ctx context.Context) error {
 	return nil
 }
 
+// PausePeriodicFlush stops every feed's periodic flush and waits for any
+// periodic flush in progress to end. A reverse cutover calls it before it
+// locks the targets: a flush of its own taken under the locks would otherwise
+// wait, without regard to its context, for a periodic flush already running.
+func (rf *ReverseFeed) PausePeriodicFlush() {
+	for _, client := range rf.clients {
+		client.StopPeriodicFlush()
+	}
+}
+
+// ResumePeriodicFlush restarts the periodic flush PausePeriodicFlush stopped.
+// It is a no-op on a closed feed.
+func (rf *ReverseFeed) ResumePeriodicFlush(ctx context.Context) {
+	for _, client := range rf.clients {
+		client.StartPeriodicFlush(ctx, rf.flushInt)
+	}
+}
+
 // AllChangesFlushed reports whether every feed has applied its whole buffer.
 //
 // Flush returning nil is not the same question, and callers that are about to
