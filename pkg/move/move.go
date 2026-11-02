@@ -45,6 +45,16 @@ type Move struct {
 	// reverseWindow (reversewindow.go).
 	ReverseWindow time.Duration `name:"reverse-window" help:"After cutover, reverse the move (change-only) and keep it alive for this long to allow rollback. 0 disables (normal cutover)." default:"0"`
 
+	// CutoverLockTimeout bounds, per attempt and from the moment every table
+	// lock is held, the work a cutover (and a reverse cutover) does under the
+	// locks before it switches traffic: the final flush, the checks under the
+	// lock and the work that prepares the switch. Each LOCK TABLES is bounded
+	// separately by --lock-wait-timeout, so the first lock taken has been held
+	// for up to that long when the timeout starts. An attempt that runs past
+	// it releases the locks without switching, and may be retried. Zero uses
+	// DefaultCutoverLockTimeout.
+	CutoverLockTimeout time.Duration `name:"cutover-lock-timeout" help:"Per cutover attempt, how long the work under the table locks may take before traffic switches, counted from when every lock is held; past it the attempt releases them and is retried" optional:"" default:"1m"`
+
 	// SourceTables optionally specifies a list of tables to move.
 	// If empty, all tables in the source database will be moved.
 	// This is useful for Vitess MoveTables operations where only specific tables should be moved.
@@ -81,6 +91,15 @@ type Move struct {
 	Targets []applier.Target `kong:"-"`
 }
 
+// cutoverLockTimeout returns CutoverLockTimeout, or DefaultCutoverLockTimeout
+// when it is zero or m is nil.
+func (m *Move) cutoverLockTimeout() time.Duration {
+	if m == nil || m.CutoverLockTimeout <= 0 {
+		return DefaultCutoverLockTimeout
+	}
+	return m.CutoverLockTimeout
+}
+
 // Validate is called by Kong after parsing to check for invalid flag values.
 // Zero values mean "use the default" (NewRunner fills them in), so they are not
 // rejected here; only explicitly-negative or otherwise invalid values are
@@ -94,6 +113,9 @@ func (m *Move) Validate() error {
 	}
 	if m.ReverseWindow < 0 {
 		return fmt.Errorf("--reverse-window must be non-negative, got %s", m.ReverseWindow)
+	}
+	if m.CutoverLockTimeout < 0 {
+		return fmt.Errorf("--cutover-lock-timeout must be non-negative, got %s", m.CutoverLockTimeout)
 	}
 	return dbconn.ValidateMaxConnections(m.MaxConnections, m.ValidationThreads(), minChecksumPhaseReserve)
 }

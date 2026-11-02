@@ -45,6 +45,9 @@ type TableLock struct {
 	// discard is set when the session's state could not be restored, so
 	// Close must not return it to the pool.
 	discard bool
+	// acquiredAt is when LOCK TABLES returned. Close logs how long the lock
+	// was held from then.
+	acquiredAt time.Time
 }
 
 // NewTableLock creates a new server wide lock on multiple tables.
@@ -135,18 +138,23 @@ func NewTableLockReferencing(ctx context.Context, db *sql.DB, tables, referenced
 	// We need to lock all the tables we intend to write to while we have the lock.
 	// For each table, we need to lock both the main table and its _new table.
 	logger.Warn("trying to acquire table locks", "timeout", config.LockWaitTimeout)
+	// A LOCK TABLES that is still waiting already blocks new reads and writes
+	// of these tables, so the wait is part of how long the lock blocked them.
+	requested := time.Now()
 	_, err = conn.ExecContext(ctx, lockStmt)
 	lockDone()
 	if err != nil {
-		logger.Warn("failed to acquire table lock(s)", "error", err)
+		logger.Warn("failed to acquire table lock(s)", "error", err, "wait", time.Since(requested))
 		return nil, err
 	}
 
 	// Otherwise we are successful, we still log because
 	// it's a critical function.
-	logger.Warn("table lock(s) acquired")
+	acquiredAt := time.Now()
+	logger.Warn("table lock(s) acquired", "wait", acquiredAt.Sub(requested))
 	acquired = true
 	lock := &TableLock{
+		acquiredAt:        acquiredAt,
 		db:                db,
 		lockConn:          conn,
 		lockPID:           pid,
@@ -361,14 +369,18 @@ func (s *TableLock) Close(ctx context.Context) error {
 	unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tableUnlockTimeout)
 	defer cancel()
 	if _, err := conn.ExecContext(unlockCtx, "UNLOCK TABLES"); err != nil {
+		// Discarding the session releases its locks on the server.
+		s.logger.Warn("table lock released by discarding the session", "error", err, "held", time.Since(s.acquiredAt))
 		return errors.Join(err, discardConn(conn))
 	}
+	held := time.Since(s.acquiredAt)
 	if s.discard {
+		s.logger.Warn("table lock released", "held", held)
 		return discardConn(conn)
 	}
 	err := conn.Close()
 	if err == nil {
-		s.logger.Warn("table lock released")
+		s.logger.Warn("table lock released", "held", held)
 	}
 	return err
 }

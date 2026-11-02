@@ -41,6 +41,7 @@ The target check runs before the copy and on resume, before move writes anything
 ## Configuration
 
 - [checkpoint-max-age](#checkpoint-max-age)
+- [cutover-lock-timeout](#cutover-lock-timeout)
 - [defer-cutover](#defer-cutover)
 - [defer-secondary-indexes](#defer-secondary-indexes)
 - [force](#force)
@@ -68,6 +69,23 @@ The maximum age of a checkpoint before Move refuses to resume from it. Replaying
 Unlike [migrate](migrate.md#checkpoint-max-age), Move does **not** fall back to a fresh copy when the checkpoint is too old: the target tables already contain rows (which is why the resume path was selected), so silently restarting is not possible. Instead the move fails with a `checkpoint is too old to safely resume` error. To proceed, either re-run with a larger `--checkpoint-max-age`, or wipe the target tables (including the `_spirit_move_checkpoint` table) and restart the move from scratch.
 
 The same caveats about [resuming across Spirit binary versions](migrate.md#resuming-across-spirit-binary-versions) apply to Move, with one difference: where migrate silently discards an unreadable checkpoint and starts fresh, Move fails the run.
+
+### cutover-lock-timeout
+
+- Type: Duration
+- Default value: `1m`
+
+How long, per cutover attempt, the work under the table locks may take before traffic switches. The timer starts once every lock is held, and covers the final flush, the checks under the lock, and the work that prepares the switch. An attempt that runs past the timeout releases its locks without switching traffic and is retried, up to the retry limit.
+
+This is not a bound on how long the tables are blocked. New reads and writes of the locked tables wait from the first `LOCK TABLES` until the locks are released, and that includes:
+
+- the wait for the other locks, each bounded by [lock-wait-timeout](#lock-wait-timeout);
+- the traffic switch and the renames after it, which are not bounded, because cancelling them could leave them half applied;
+- every retried attempt.
+
+A rollback's reverse cutover uses the same bound for its work under the target locks before it stops the reverse feed. An attempt that runs past it releases the locks, the reverse window stays open, and the rollback is tried again after a backoff that starts at 2 seconds and doubles up to 10 seconds. After the feed is stopped, the `AUTO_INCREMENT` carry is retried in place under the locks, each try bounded by the same timeout.
+
+Every attempt logs how long it waited for its locks, how long it held them, how long the tables were blocked before traffic switched, and the time spent in each step.
 
 ### defer-cutover
 
@@ -162,10 +180,13 @@ While the window is open the run reports the `reverseWindow` state. The reverse 
 
 A rollback is triggered out of band by creating a table named `_spirit_move_revert` on the **first target** database — the same database that holds the checkpoint. (The log line printed when the window opens names the exact host and database.) The window loop polls for the marker; on seeing it, Move:
 
-1. flushes the reverse feed so the source reflects every target write, then stops it;
-2. renames the source's `_old` tables back to their real names, un-retiring the source;
-3. runs the reverse-cutover hook if the embedding application registered one (the `spirit` CLI does not — programmatic callers use it to switch routing back to the source); and
-4. retires the former target tables to a `_revert` suffix — distinct from `_old`, so a later move can recognize and clean them up.
+1. locks the target tables on every target at the same time;
+2. flushes the reverse feed so the source reflects every target write, then stops it;
+3. renames the source's `_old` tables back to their real names, un-retiring the source;
+4. runs the reverse-cutover hook if the embedding application registered one (the `spirit` CLI does not — programmatic callers use it to switch routing back to the source); and
+5. retires the former target tables to a `_revert` suffix — distinct from `_old`, so a later move can recognize and clean them up. Each target's tables are renamed in one statement.
+
+A failure before the reverse feed is stopped in step 2 moves no ownership: the locks are released, the reverse feed keeps running, and the rollback is tried again after a backoff, up to the retry limit (see [cutover-lock-timeout](#cutover-lock-timeout)). The `AUTO_INCREMENT` carry after step 2, and a hook that fails without reporting a change, are retried under the locks.
 
 The marker and the checkpoint are dropped once the rollback completes.
 

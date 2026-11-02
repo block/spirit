@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
@@ -17,7 +19,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
-	"github.com/block/spirit/pkg/utils"
+	"golang.org/x/sync/errgroup"
 )
 
 // Checkpoint phase values for a reverse-window move. The empty string ("") is
@@ -36,6 +38,11 @@ const (
 // reverseWindowPollInterval is how often the window loop checks for a revert
 // request, feed death, or the deadline. A var so tests can shorten it.
 var reverseWindowPollInterval = 1 * time.Second
+
+// reverseCutoverUnderLockHook, when non-nil, runs at the start of each reverse
+// cutover attempt's work under the target locks, bounded by the cutover lock
+// timeout. A var so tests can stall or fail an attempt there.
+var reverseCutoverUnderLockHook func(ctx context.Context) error
 
 // reverseFeedFlushInterval is the reverse feed's periodic flush interval. A var
 // so tests can shorten it.
@@ -64,14 +71,26 @@ func targetCurrentPosition(ctx context.Context, r *Runner, tgt *applier.Target) 
 // captureReverseWindow runs under the source locks after the final forward
 // flush, before switching traffic. They are the reverse feeds' start points,
 // so writes committed during the switch are included when those feeds start.
-// On a safe cutover retry they are recaptured after the new final flush.
+// On a safe cutover retry they are recaptured after the new final flush. The
+// targets are read at the same time, since this runs under the locks.
 func captureReverseWindow(ctx context.Context, r *Runner) error {
-	positions := make(map[string]string, len(r.targets))
+	read := make([]string, len(r.targets))
+	g, gctx := errgroup.WithContext(ctx)
 	for i := range r.targets {
-		pos, err := targetCurrentPosition(ctx, r, &r.targets[i])
-		if err != nil {
-			return fmt.Errorf("capture reverse-feed start position for target %d: %w", i, err)
-		}
+		g.Go(func() error {
+			pos, err := targetCurrentPosition(gctx, r, &r.targets[i])
+			if err != nil {
+				return fmt.Errorf("capture reverse-feed start position for target %d: %w", i, err)
+			}
+			read[i] = pos
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	positions := make(map[string]string, len(r.targets))
+	for i, pos := range read {
 		positions[targetKey(r.targets[i])] = pos
 	}
 	r.reversePositions = positions
@@ -185,6 +204,13 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 		defer ticker.Stop()
 		checkpointTicker := time.NewTicker(status.CheckpointDumpInterval)
 		defer checkpointTicker.Stop()
+		// failedReverts counts reverse cutover attempts that failed before
+		// ownership moved (see errReverseCutoverAbandoned). After one, the
+		// next attempt waits until retryRevertAt, so a failing attempt does
+		// not lock the targets again on the next tick.
+		failedReverts := 0
+		var retryRevertAt time.Time
+		revertBackoff := reverseCutoverInitialBackoff
 		for {
 			select {
 			case <-ctx.Done():
@@ -228,6 +254,9 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", ferr)
 					return w.completeForward(ctx)
 				}
+				if time.Now().Before(retryRevertAt) {
+					continue
+				}
 				requested, err := w.revertRequested(ctx)
 				if err != nil {
 					// A transient read error should not abandon the window; log and
@@ -236,7 +265,21 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 				} else if requested {
 					r.logger.Info(fmt.Sprintf("revert triggered: detected a table named %s on %s; rolling back to source",
 						revertMarkerName, revertLoc))
-					return w.reverseCutover(ctx)
+					err := w.reverseCutover(ctx)
+					if err == nil {
+						return nil
+					}
+					failedReverts++
+					if !w.mayRetryReverseCutover(ctx, err, failedReverts) {
+						return err
+					}
+					// The marker is still there, so a tick after the backoff
+					// tries again.
+					r.logger.Warn("reverse cutover attempt failed before ownership moved; the reverse window stays open and will try again",
+						"attempt", failedReverts, "max_retries", r.dbConfig.MaxRetries, "retry_in", revertBackoff, "error", err.Error())
+					retryRevertAt = time.Now().Add(revertBackoff)
+					revertBackoff = min(revertBackoff*2, reverseCutoverMaxBackoff)
+					continue
 				}
 				if !time.Now().Before(deadline) {
 					r.logger.Info("reverse window elapsed; completing forward")
@@ -434,7 +477,7 @@ func (w *reverseWindow) completeForward(ctx context.Context) error {
 // cutover with roles swapped, plus one asymmetry: the source tables sit under
 // their _old names (on every source shard) and must be un-retired before
 // traffic returns to them.
-func (w *reverseWindow) reverseCutover(ctx context.Context) error {
+func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 	r := w.r
 
 	// Clear any stale _revert tables on the targets before the retire (step 5)
@@ -443,67 +486,99 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	// leftovers are not in the lock set (DROP under LOCK TABLES is disallowed for
 	// unlocked tables).
 	if err := r.dropStaleRevertTables(ctx); err != nil {
-		return err
+		return abandonReverseCutover(err)
 	}
 
-	// 1. Lock the reverse sources (former targets) to freeze their writes.
-	var locks []*dbconn.TableLock
-	closeLocks := func() {
-		for _, l := range locks {
-			utils.CloseAndLogWithContext(ctx, l)
+	// Stop the periodic flush before locking, and restart it if this attempt
+	// is abandoned with the feed still open (see PausePeriodicFlush). Waiting
+	// here for a periodic flush in progress blocks nothing: the targets are
+	// not locked yet.
+	w.feed.PausePeriodicFlush()
+	feedClosed := false
+	defer func() {
+		if !feedClosed {
+			w.feed.ResumePeriodicFlush(ctx)
 		}
-	}
-	for i := range r.targets {
+	}()
+
+	timing := newLockTiming(r.logger, "reverse cutover")
+	defer func() { timing.log(err) }()
+
+	// 1. Lock the reverse sources (former targets) to freeze their writes, all
+	//    at the same time (see lockAll).
+	locks, err := lockAll(ctx, len(r.targets), func(ctx context.Context, i int) (*dbconn.TableLock, error) {
 		lock, err := dbconn.NewTableLock(ctx, r.targets[i].DB, w.watched[i], r.dbConfig, r.logger)
 		if err != nil {
-			closeLocks()
-			return fmt.Errorf("reverse cutover: lock target %d: %w", i, err)
+			return nil, fmt.Errorf("reverse cutover: lock target %d: %w", i, err)
 		}
-		locks = append(locks, lock)
+		return lock, nil
+	})
+	if err != nil {
+		return abandonReverseCutover(err)
 	}
-	defer closeLocks()
+	defer closeLocks(ctx, locks)
+	timing.locked()
+
+	// Everything up to the reverting phase write is bounded by the cutover
+	// lock timeout, as the forward cutover bounds its work before the switch.
+	// None of it moves ownership, so an attempt past the bound releases the
+	// locks and leaves the window open for another (see hold).
+	lockTimeout := r.move.cutoverLockTimeout()
+	lockedCtx, cancelLocked := context.WithTimeout(ctx, lockTimeout)
+	defer cancelLocked()
+	beforePersist := func(err error) error {
+		return abandonReverseCutover(lockTimeoutError(ctx, lockedCtx, lockTimeout, err))
+	}
+	if reverseCutoverUnderLockHook != nil {
+		if err := reverseCutoverUnderLockHook(lockedCtx); err != nil {
+			return beforePersist(err)
+		}
+	}
+
+	// Check the source schema one last time before the _old tables go back
+	// into service: a trigger or event created during the window could have
+	// written to them outside the reverse feed, or (a trigger on an _old
+	// table) would go live with them. Views, procedures and functions are not
+	// refused (see check.ReverseWindowSchemaObjectsError). This path holds no
+	// lock on the source tables, so it does not keep DDL out while it runs.
+	// Fail closed: nothing has moved ownership yet, the phase is still
+	// reverse_window, and a re-run resumes the window once the objects are
+	// dropped.
+	if err := w.checkSourceSchemaObjects(lockedCtx); err != nil {
+		return beforePersist(fmt.Errorf("reverse cutover: %w", err))
+	}
+	timing.step("checks")
 
 	// 2. Flush the reverse feed so the source's _old tables reflect every target
 	//    write, then stop it (no more writes to _old during the renames below).
-	//
-	// Both calls, in this order, and neither is optional. Close discards the
-	// buffer rather than flushing it, and the renames below put the source's
-	// _old tables back into service — so a change still buffered here is a
-	// target-era write that is silently lost. A nil error from Flush does not
-	// rule that out: a drain can decline to finish and report it by leaving the
-	// changes buffered, and Flush's loop exits on a *trivial* backlog rather
-	// than an empty one. AllChangesFlushed is the question that matters, and
-	// asking it is what the forward cutover already does (cutover.go).
-	if err := w.feed.Flush(ctx); err != nil {
-		return fmt.Errorf("reverse cutover: final flush: %w", err)
+	//    The feed stays open until here, so an attempt that fails before this
+	//    point leaves it running and the window can try again.
+	if err := w.drainFeed(lockedCtx); err != nil {
+		return beforePersist(err)
 	}
-	if !w.feed.AllChangesFlushed() {
-		return fmt.Errorf("reverse cutover: %w; refusing to discard buffered target writes",
-			change.ErrChangesNotFlushed)
+	if err := lockedCtx.Err(); err != nil {
+		return beforePersist(err)
 	}
 	w.feed.Close()
-
-	// Check the source schema one last time before the _old tables go back
-	// into service: the reverse feed is drained, and a trigger or event
-	// created during the window could have written to them outside it, or (a
-	// trigger on an _old table) would go live with them. Views, procedures
-	// and functions are not refused (see
-	// check.ReverseWindowSchemaObjectsError). This path holds no lock on the
-	// source tables, so it does not keep DDL out while it runs. Fail closed:
-	// nothing has moved ownership yet, the phase is still reverse_window, and
-	// a re-run resumes the window once the objects are dropped.
-	if err := w.checkSourceSchemaObjects(ctx); err != nil {
-		return fmt.Errorf("reverse cutover: %w", err)
-	}
+	feedClosed = true
+	timing.step("flush")
 
 	// The mirror of the forward cutover's carryAutoIncrementsToTargets: ids the
 	// targets issued during the window and have since deleted never reached
 	// the source's _old tables, so without this the source would issue them
 	// again once traffic returns. The targets are locked and the feed is
 	// drained, so neither side's counter can move now.
-	if err := w.carryAutoIncrementsToSource(ctx); err != nil {
+	//
+	// It runs after the feed is closed: its ALTER TABLE on an _old table is a
+	// schema change the feed would stop on where the source and a target
+	// share a server. The window cannot retry a failure here (the feed is
+	// gone), so the carry is retried in place, under the locks (see
+	// retryAutoIncrementCarry). If every attempt fails, the run fails with the
+	// phase still reverse_window, and a re-run resumes the window.
+	if err := retryAutoIncrementCarry(ctx, r, lockTimeout, w.carryAutoIncrementsToSource); err != nil {
 		return fmt.Errorf("reverse cutover: %w", err)
 	}
+	timing.step("auto_increment")
 
 	// Persist the ownership boundary immediately before the first rename that
 	// moves ownership, and fail closed if it cannot be written. Everything up
@@ -513,6 +588,7 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	if err := w.persistPhase(ctx, phaseReverting); err != nil {
 		return fmt.Errorf("reverse cutover: persist reverting phase: %w", err)
 	}
+	timing.step("persist_phase")
 
 	// 3. Un-retire the source: rename its _old tables back to their real names
 	//    (on every source shard) so it can serve again. The feed is stopped, so
@@ -531,11 +607,16 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 			r.lifecycle.MarkDurableMutation()
 		}
 	}
+	timing.step("unretire")
 
-	// 4. Switch traffic back to the source.
-	if err := w.runReverseCutoverCallback(ctx); err != nil {
+	// 4. Switch traffic back to the source. The source serves under its real
+	//    names now, and the target locks are what keeps stragglers off the
+	//    targets, so a callback that failed cleanly is retried here, under
+	//    the locks, rather than leaving the move half rolled back.
+	if err := w.switchTrafficToSource(ctx); err != nil {
 		return err
 	}
+	timing.switchedTraffic()
 
 	// 5. Retire the former targets to their _revert form under their lock —
 	//    fencing straggler writes after the switch, mirroring the forward
@@ -543,19 +624,10 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	//    artifacts, so a later move can safely drop them. Traffic is back on
 	//    the source, so the renames run even if ctx is cancelled
 	//    (context.WithoutCancel): a stopped one would leave a target serving.
-	for i := range r.targets {
-		for _, t := range r.sourceTables {
-			revertName := check.RevertRetiredName(t.TableName)
-			stmt := sqlescape.MustEscapeSQL("RENAME TABLE %n TO %n", t.TableName, revertName)
-			if err := locks[i].ExecUnderLock(context.WithoutCancel(ctx), stmt); err != nil {
-				if dbconn.IsOutcomeUnknown(err) {
-					return fmt.Errorf("%w: reverse cutover: retire target %d table %q, outcome unknown: %w",
-						status.ErrOwnershipAmbiguous, i, t.TableName, err)
-				}
-				return fmt.Errorf("reverse cutover: retire target %d table %q: %w", i, t.TableName, err)
-			}
-		}
+	if err := w.retireTargets(context.WithoutCancel(ctx), locks); err != nil {
+		return err
 	}
+	timing.step("retire")
 
 	// Ownership is back on the source. Record it even if ctx is cancelled: a
 	// cancelled write would leave the checkpoint at phaseReverting, and the
@@ -563,6 +635,161 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) error {
 	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCutoverCleanupTimeout)
 	defer cancel()
 	return w.finalizeReverse(finalizeCtx)
+}
+
+// reverseCutoverInitialBackoff and reverseCutoverMaxBackoff bound the wait
+// between reverse cutover attempts. Vars so tests can shorten them.
+var (
+	reverseCutoverInitialBackoff = 2 * time.Second
+	reverseCutoverMaxBackoff     = 10 * time.Second
+)
+
+// retryAutoIncrementCarry runs carry, and runs it again, up to
+// DBConfig.MaxRetries attempts, when it fails while ctx is live. Each attempt
+// is bounded by timeout. The carry only raises AUTO_INCREMENT counters, so
+// repeating it is safe, and it runs after the reverse feed is closed, where a
+// failure would end the run instead of leaving the window open.
+func retryAutoIncrementCarry(ctx context.Context, r *Runner, timeout time.Duration, carry func(ctx context.Context) error) error {
+	var err error
+	for attempt := 1; attempt <= max(r.dbConfig.MaxRetries, 1); attempt++ {
+		if attempt > 1 {
+			r.logger.Warn("retrying the AUTO_INCREMENT carry of a reverse cutover while still holding target table locks",
+				"attempt", attempt, "max_retries", r.dbConfig.MaxRetries, "error", err.Error())
+			select {
+			case <-ctx.Done():
+				return errors.Join(err, ctx.Err())
+			case <-time.After(renameRetryWait):
+			}
+		}
+		err = carryAttempt(ctx, timeout, carry)
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
+}
+
+func carryAttempt(ctx context.Context, timeout time.Duration, carry func(ctx context.Context) error) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := carry(attemptCtx)
+	if err != nil && ctx.Err() == nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: the AUTO_INCREMENT carry did not finish within %s (--cutover-lock-timeout): %w", errCutoverLockTimeout, timeout, err)
+	}
+	return err
+}
+
+// mayRetryReverseCutover reports whether the window may try a reverse cutover
+// again after its failedReverts-th failed attempt failed with err: the attempt
+// moved no ownership (errReverseCutoverAbandoned), no check refused it (a
+// retry would be refused for the same reason), ctx is live, and fewer than
+// DBConfig.MaxRetries attempts have failed.
+func (w *reverseWindow) mayRetryReverseCutover(ctx context.Context, err error, failedReverts int) bool {
+	return errors.Is(err, errReverseCutoverAbandoned) &&
+		!errors.Is(err, check.ErrRefused) &&
+		ctx.Err() == nil &&
+		failedReverts < w.r.dbConfig.MaxRetries
+}
+
+// errReverseCutoverAbandoned marks a reverse cutover attempt that failed before
+// it wrote the reverting phase. Nothing has moved ownership: the targets still
+// serve and the reverse feed is still running, so the window may try again.
+var errReverseCutoverAbandoned = errors.New("reverse cutover abandoned before ownership moved")
+
+func abandonReverseCutover(err error) error {
+	return fmt.Errorf("%w: %w", errReverseCutoverAbandoned, err)
+}
+
+// drainFeed flushes the reverse feed and confirms that nothing is left
+// buffered. A nil error from Flush does not rule that out: a drain can decline
+// to finish and report it by leaving the changes buffered, and Flush's loop
+// exits on a *trivial* backlog rather than an empty one. AllChangesFlushed is
+// the question that matters, and asking it is what the forward cutover already
+// does (cutover.go).
+func (w *reverseWindow) drainFeed(ctx context.Context) error {
+	if err := w.feed.Flush(ctx); err != nil {
+		return fmt.Errorf("reverse cutover: final flush: %w", err)
+	}
+	if !w.feed.AllChangesFlushed() {
+		return fmt.Errorf("reverse cutover: %w; refusing to discard buffered target writes",
+			change.ErrChangesNotFlushed)
+	}
+	return nil
+}
+
+// switchTrafficToSource runs the reverse cutover callback, and runs it again,
+// up to DBConfig.MaxRetries attempts, when it fails without reporting a
+// durable mutation or ambiguous ownership: the callback changed nothing, so
+// trying again cannot make the routing worse.
+func (w *reverseWindow) switchTrafficToSource(ctx context.Context) error {
+	r := w.r
+	var err error
+	for attempt := 1; attempt <= max(r.dbConfig.MaxRetries, 1); attempt++ {
+		if attempt > 1 {
+			r.logger.Warn("retrying the reverse cutover traffic switch while still holding target table locks",
+				"attempt", attempt, "max_retries", r.dbConfig.MaxRetries, "error", err.Error())
+			select {
+			case <-ctx.Done():
+				return errors.Join(err, ctx.Err())
+			case <-time.After(renameRetryWait):
+			}
+		}
+		err = w.runReverseCutoverCallback(ctx)
+		if err == nil || errors.Is(err, status.ErrDurableMutation) || errors.Is(err, status.ErrOwnershipAmbiguous) {
+			return err
+		}
+	}
+	return err
+}
+
+// retireTargets renames every former target's tables to their _revert names,
+// one RENAME TABLE per target covering all of its tables, so a target is never
+// left partially retired. The targets are renamed at the same time. A rename
+// the server refused is retried under the lock, as the forward cutover retries
+// its source rename. A rename whose outcome is unknown is not: a retry cannot
+// tell whether it already ran, so it is reported as ErrOwnershipAmbiguous.
+func (w *reverseWindow) retireTargets(ctx context.Context, locks []*dbconn.TableLock) error {
+	r := w.r
+	fragments := make([]string, 0, len(r.sourceTables))
+	for _, t := range r.sourceTables {
+		fragments = append(fragments, sqlescape.MustEscapeSQL("%n TO %n", t.TableName, check.RevertRetiredName(t.TableName)))
+	}
+	stmt := "RENAME TABLE " + strings.Join(fragments, ", ")
+
+	errs := make([]error, len(locks))
+	var wg sync.WaitGroup
+	for i := range locks {
+		wg.Go(func() {
+			errs[i] = w.retireTarget(ctx, i, locks[i], stmt)
+		})
+	}
+	wg.Wait()
+	// Every target's outcome is kept: recovery needs to know which targets
+	// are definitely still unretired, not only which one is ambiguous.
+	// errors.Is still finds ErrOwnershipAmbiguous in the joined error.
+	return errors.Join(errs...)
+}
+
+func (w *reverseWindow) retireTarget(ctx context.Context, i int, lock *dbconn.TableLock, stmt string) error {
+	r := w.r
+	var err error
+	for attempt := 1; attempt <= max(r.dbConfig.MaxRetries, 1); attempt++ {
+		if attempt > 1 {
+			r.logger.Warn("retrying the retire of a former target while still holding its table locks",
+				"target", i, "attempt", attempt, "max_retries", r.dbConfig.MaxRetries, "error", err.Error())
+			time.Sleep(renameRetryWait)
+		}
+		err = lock.ExecUnderLock(ctx, stmt)
+		if err == nil {
+			return nil
+		}
+		if dbconn.IsOutcomeUnknown(err) {
+			return fmt.Errorf("%w: reverse cutover: retire target %d, outcome unknown: %w",
+				status.ErrOwnershipAmbiguous, i, err)
+		}
+	}
+	return fmt.Errorf("reverse cutover: retire target %d after %d attempts under lock: %w",
+		i, max(r.dbConfig.MaxRetries, 1), err)
 }
 
 // unretireSourceTable renames one source table from its _old name back to its

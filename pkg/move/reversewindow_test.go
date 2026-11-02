@@ -62,6 +62,16 @@ func shortenReverseWindowPolling(t *testing.T) {
 	old := reverseWindowPollInterval
 	reverseWindowPollInterval = 100 * time.Millisecond
 	t.Cleanup(func() { reverseWindowPollInterval = old })
+	setReverseCutoverBackoff(t, 100*time.Millisecond)
+}
+
+// setReverseCutoverBackoff sets the wait between reverse cutover attempts to
+// d for the test.
+func setReverseCutoverBackoff(t *testing.T, d time.Duration) {
+	t.Helper()
+	oldInitial, oldMax := reverseCutoverInitialBackoff, reverseCutoverMaxBackoff
+	reverseCutoverInitialBackoff, reverseCutoverMaxBackoff = d, d
+	t.Cleanup(func() { reverseCutoverInitialBackoff, reverseCutoverMaxBackoff = oldInitial, oldMax })
 }
 
 // Timing for the wait helpers below.
@@ -526,6 +536,8 @@ func TestMoveReverseWindowRevertCarriesAutoIncrement(t *testing.T) {
 		ReverseWindow: 30 * time.Second, // long; the revert ends it early
 	})
 	require.NoError(t, err)
+	recorder := &fatalReasonState{}
+	runner.logger = slog.New(&fatalReasonRecorder{Handler: slog.Default().Handler(), state: recorder})
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { return nil })
 	h := startRun(t, runner)
@@ -540,6 +552,12 @@ func TestMoveReverseWindowRevertCarriesAutoIncrement(t *testing.T) {
 	require.True(t, tableExists(t, ctl, srcName, "jobs"), "source should be un-retired")
 	require.Equal(t, uint64(9), nextAutoIncrement(t, srcName, "jobs"),
 		"the source's AUTO_INCREMENT is behind the target's after the revert")
+	// The source and target share a server here, so the carry's ALTER TABLE
+	// on jobs_old is in the binary log the reverse feed reads. The carry runs
+	// after the feed is closed; with the feed still open it would stop on it
+	// as a schema change, and a window that retried the revert would find
+	// the feed dead and complete forward instead.
+	require.Empty(t, recorder.snapshot(), "the AUTO_INCREMENT carry must not stop the reverse feed")
 }
 
 // runRevertingMove runs one reverse-window move against the given DSNs and, once

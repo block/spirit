@@ -13,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
+	"golang.org/x/sync/errgroup"
 )
 
 // ReverseFeed implements the data plane of the "reverse-window" move: after a
@@ -291,14 +292,38 @@ func (rf *ReverseFeed) Start(ctx context.Context) error {
 }
 
 // Flush drains all feeds synchronously (e.g. before a health check or a reverse
-// cutover, so U reflects everything written to the sources so far).
+// cutover, so U reflects everything written to the sources so far). The feeds
+// are drained at the same time, as their periodic flushes already run through
+// the shared applier at the same time.
 func (rf *ReverseFeed) Flush(ctx context.Context) error {
+	g, gctx := errgroup.WithContext(ctx)
 	for i, client := range rf.clients {
-		if err := client.Flush(ctx); err != nil {
-			return fmt.Errorf("reverse feed: flush source %d: %w", i, err)
-		}
+		g.Go(func() error {
+			if err := client.Flush(gctx); err != nil {
+				return fmt.Errorf("reverse feed: flush source %d: %w", i, err)
+			}
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
+}
+
+// PausePeriodicFlush stops every feed's periodic flush and waits for any
+// periodic flush in progress to end. A reverse cutover calls it before it
+// locks the targets: a flush of its own taken under the locks would otherwise
+// wait, without regard to its context, for a periodic flush already running.
+func (rf *ReverseFeed) PausePeriodicFlush() {
+	for _, client := range rf.clients {
+		client.StopPeriodicFlush()
+	}
+}
+
+// ResumePeriodicFlush restarts the periodic flush PausePeriodicFlush stopped.
+// It is a no-op on a closed feed.
+func (rf *ReverseFeed) ResumePeriodicFlush(ctx context.Context) {
+	for _, client := range rf.clients {
+		client.StartPeriodicFlush(ctx, rf.flushInt)
+	}
 }
 
 // AllChangesFlushed reports whether every feed has applied its whole buffer.
