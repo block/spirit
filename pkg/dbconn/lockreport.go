@@ -26,28 +26,40 @@ const (
 	// the locks most likely to block the statement first.
 	metadataLockReportLimit = 200
 
-	// reportedTextLimit caps the statement text a report logs.
+	// reportedTextLimit caps the statement digest a report logs.
 	reportedTextLimit = 512
+
+	// statementDigestColumn is the normalized text of the statement the
+	// thread t is running, or ran last: every literal becomes "?". A report
+	// never logs a statement's own text (processlist_info), which can hold
+	// row values.
+	statementDigestColumn = `(SELECT esc.digest_text
+        FROM performance_schema.events_statements_current esc
+        WHERE esc.thread_id = t.thread_id
+        ORDER BY esc.event_id DESC LIMIT 1)`
 
 	// lockSessionStateQuery reads the server's hostname and what the lock
 	// session is doing, such as "Waiting for table metadata lock".
-	lockSessionStateQuery = `SELECT @@hostname,
-    (SELECT processlist_state FROM performance_schema.threads WHERE processlist_id = ?),
-    (SELECT processlist_time FROM performance_schema.threads WHERE processlist_id = ?)`
+	lockSessionStateQuery = `SELECT @@hostname, t.processlist_state, t.processlist_time, ` + statementDigestColumn + `
+FROM (SELECT 1) AS one
+    LEFT JOIN performance_schema.threads t ON t.processlist_id = ?`
 
 	// metadataLocksQuery lists every metadata lock on the server, of any
 	// object type and both granted and pending, except the report's own. It
-	// keeps background threads, whose processlist_id is NULL. The order puts
-	// pending locks first, then global, schema, backup and other non-table
-	// locks, then the locks on the lock session's schema.
+	// keeps background threads, whose processlist_id is NULL, and locks whose
+	// owner thread is gone, such as those of a prepared XA transaction whose
+	// session disconnected. The order puts pending locks first, then global,
+	// schema, backup and other non-table locks, then the locks on the lock
+	// session's schema.
 	metadataLocksQuery = `SELECT
+    ml.owner_thread_id,
     t.processlist_id,
     t.name,
     t.processlist_user,
     t.processlist_host,
     t.processlist_state,
     t.processlist_time,
-    t.processlist_info,
+    ` + statementDigestColumn + `,
     ml.object_type,
     ml.object_schema,
     ml.object_name,
@@ -55,7 +67,7 @@ const (
     ml.lock_duration,
     ml.lock_status
 FROM performance_schema.metadata_locks ml
-    JOIN performance_schema.threads t ON ml.owner_thread_id = t.thread_id
+    LEFT JOIN performance_schema.threads t ON ml.owner_thread_id = t.thread_id
 WHERE t.processlist_id IS NULL OR t.processlist_id <> CONNECTION_ID()
 ORDER BY ml.lock_status = 'PENDING' DESC,
     ml.object_type <> 'TABLE' DESC,
@@ -66,13 +78,14 @@ LIMIT %d`
 
 // metadataLock is one row of metadataLocksQuery.
 type metadataLock struct {
+	OwnerThread  sql.NullInt64
 	PID          sql.NullInt64
 	Thread       sql.NullString
 	User         sql.NullString
 	Host         sql.NullString
 	State        sql.NullString
 	Time         sql.NullInt64
-	Info         sql.NullString
+	Digest       sql.NullString
 	ObjectType   sql.NullString
 	ObjectSchema sql.NullString
 	ObjectName   sql.NullString
@@ -81,19 +94,19 @@ type metadataLock struct {
 	LockStatus   sql.NullString
 }
 
-// reportSlowStatement logs the metadata locks on the lock's server once stmt
-// has run for slowLockedStatementThreshold, and again each time its running
-// time doubles, until stmtCtx ends. The returned function stops the reports
-// and waits for one in progress.
-func (s *TableLock) reportSlowStatement(stmtCtx context.Context, stmt string) func() {
+// reportSlowStatement logs the metadata locks on the lock's server once the
+// statement under the lock has run for slowLockedStatementThreshold, and again
+// each time its running time doubles, until stmtCtx ends. The returned
+// function stops the reports. It does not wait for one in progress: a slow
+// log sink must not hold the table locks after the statement returns. A
+// report cut short that way may still log the rows it had read.
+func (s *TableLock) reportSlowStatement(stmtCtx context.Context) context.CancelFunc {
 	if slowLockedStatementThreshold <= 0 {
 		return func() {}
 	}
 	reportCtx, done := context.WithCancel(stmtCtx)
 	started := time.Now()
-	finished := make(chan struct{})
 	go func() {
-		defer close(finished)
 		next := slowLockedStatementThreshold
 		for {
 			timer := time.NewTimer(next - time.Since(started))
@@ -103,27 +116,24 @@ func (s *TableLock) reportSlowStatement(stmtCtx context.Context, stmt string) fu
 				return
 			case <-timer.C:
 			}
-			logMetadataLocks(reportCtx, s.db, s.logger, s.lockPID, stmt, time.Since(started))
+			logMetadataLocks(reportCtx, s.db, s.logger, s.lockPID, time.Since(started))
 			next *= 2
 		}
 	}()
-	return func() {
-		done()
-		<-finished
-	}
+	return done
 }
 
 // logMetadataLocks logs what the lock session pid is doing and every metadata
-// lock on db's server, up to metadataLockReportLimit. stmt is the statement
-// pid has been running for elapsed. It logs a failed read and returns, since
+// lock on db's server, up to metadataLockReportLimit. pid has been running its
+// statement for elapsed. It logs a failed read and returns, since
 // the report is only a diagnostic; a read cut short because the statement
 // returned (ctx done) is not logged.
-func logMetadataLocks(ctx context.Context, db *sql.DB, logger *slog.Logger, pid int, stmt string, elapsed time.Duration) {
+func logMetadataLocks(ctx context.Context, db *sql.DB, logger *slog.Logger, pid int, elapsed time.Duration) {
 	ctx, cancel := context.WithTimeout(ctx, metadataLockReportTimeout)
 	defer cancel()
-	var hostname, state sql.NullString
+	var hostname, state, digest sql.NullString
 	var stateTime sql.NullInt64
-	if err := db.QueryRowContext(ctx, lockSessionStateQuery, pid, pid).Scan(&hostname, &state, &stateTime); err != nil {
+	if err := db.QueryRowContext(ctx, lockSessionStateQuery, pid).Scan(&hostname, &state, &stateTime, &digest); err != nil {
 		logReportFailure(ctx, logger, pid, err)
 		return
 	}
@@ -138,20 +148,24 @@ func logMetadataLocks(ctx context.Context, db *sql.DB, logger *slog.Logger, pid 
 		"lock_session", pid,
 		"lock_session_state", state.String,
 		"lock_session_state_seconds", nullInt(stateTime),
-		"statement", truncateText(stmt),
+		"statement_digest", truncateText(digest.String),
 		"metadata_locks", len(locks),
 		"truncated", truncated,
 	)
 	for _, l := range locks {
+		// Connection ids are only unique per server, and concurrent reports
+		// from several servers share a logger, so every record names its server.
 		logger.Warn("metadata lock",
+			"server", hostname.String,
 			"lock_session", pid,
+			"owner_thread", nullInt(l.OwnerThread),
 			"pid", nullInt(l.PID),
 			"thread", l.Thread.String,
 			"user", l.User.String,
 			"host", l.Host.String,
 			"state", l.State.String,
 			"state_seconds", nullInt(l.Time),
-			"info", truncateText(l.Info.String),
+			"statement_digest", truncateText(l.Digest.String),
 			"object_type", l.ObjectType.String,
 			"object_schema", l.ObjectSchema.String,
 			"object_name", l.ObjectName.String,
@@ -181,7 +195,7 @@ func readMetadataLocks(ctx context.Context, db *sql.DB) (locks []metadataLock, t
 	defer utils.CloseAndLog(rows)
 	for rows.Next() {
 		var l metadataLock
-		if err := rows.Scan(&l.PID, &l.Thread, &l.User, &l.Host, &l.State, &l.Time, &l.Info,
+		if err := rows.Scan(&l.OwnerThread, &l.PID, &l.Thread, &l.User, &l.Host, &l.State, &l.Time, &l.Digest,
 			&l.ObjectType, &l.ObjectSchema, &l.ObjectName, &l.LockType, &l.LockDuration, &l.LockStatus); err != nil {
 			return nil, false, err
 		}

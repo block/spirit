@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +21,8 @@ const slowStatementReport = "a statement under the table lock is still running; 
 // TestExecUnderLockReportsSlowStatement: a statement under the lock that runs
 // past the threshold logs what the lock session is doing and the metadata
 // locks on the server, granted and pending, and logs them again each time its
-// running time doubles. A fast statement logs nothing.
+// running time doubles. Statements appear only as digests, without their
+// literals. A fast statement logs nothing.
 func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	threshold := slowLockedStatementThreshold
 	slowLockedStatementThreshold = 100 * time.Millisecond
@@ -34,8 +36,8 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	tbl := &table.TableInfo{SchemaName: dbName, TableName: "slowlock", QuotedTableName: "`slowlock`"}
 	lock, err := NewTableLock(ctx, db, []*table.TableInfo{tbl}, NewDBConfig(), logger)
 	require.NoError(t, err)
@@ -49,7 +51,7 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	// A reader queued behind the lock shows as a pending metadata lock.
 	readerDone := make(chan error, 1)
 	go func() {
-		_, err := db.ExecContext(ctx, "SELECT * FROM slowlock")
+		_, err := db.ExecContext(ctx, "SELECT * FROM slowlock WHERE id = 9876543")
 		readerDone <- err
 	}()
 	require.Eventually(t, func() bool {
@@ -60,8 +62,11 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 
 	logs.Reset()
-	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.5)"))
-	records := logRecords(t, logs.String())
+	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.7)"))
+	out := logs.String()
+	require.NotContains(t, out, "9876543", "a report must not log a statement's literals")
+	require.NotContains(t, out, "0.7", "a report must not log a statement's literals")
+	records := logRecords(t, out)
 
 	// Reports at 100ms, 200ms and 400ms.
 	var reports []map[string]any
@@ -73,12 +78,16 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	require.Len(t, reports, 3)
 	require.Equal(t, "User sleep", reports[0]["lock_session_state"])
 	require.NotEmpty(t, reports[0]["server"])
-	require.Equal(t, "DO SLEEP(0.5)", reports[0]["statement"])
+	require.Equal(t, "DO `SLEEP` (?)", reports[0]["statement_digest"])
 	require.InDelta(t, float64(lock.lockPID), reports[0]["lock_session"], 0)
 
 	var granted, pending bool
 	for _, r := range records {
-		if r["msg"] != "metadata lock" || r["object_schema"] != dbName || r["object_name"] != "slowlock" {
+		if r["msg"] != "metadata lock" {
+			continue
+		}
+		require.Equal(t, reports[0]["server"], r["server"], "every lock record names its server")
+		if r["object_schema"] != dbName || r["object_name"] != "slowlock" {
 			continue
 		}
 		switch {
@@ -86,7 +95,7 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 			require.InDelta(t, float64(lock.lockPID), r["pid"], 0, "the table lock is held by the lock session")
 			granted = true
 		case r["lock_status"] == "PENDING":
-			require.Equal(t, "SELECT * FROM slowlock", r["info"])
+			require.Equal(t, "SELECT * FROM `slowlock` WHERE `id` = ?", r["statement_digest"])
 			pending = true
 		}
 	}
@@ -100,6 +109,30 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	require.NoError(t, lock.Close(ctx))
 	locked = false
 	require.NoError(t, <-readerDone)
+}
+
+// lockedBuffer is an io.Writer safe for concurrent use, for capturing logs.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *lockedBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
 }
 
 // logRecords parses the JSON log lines in out.
