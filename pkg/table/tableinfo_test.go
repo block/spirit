@@ -1,13 +1,18 @@
 package table
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/testutils"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
@@ -613,4 +618,115 @@ func TestPrimaryKeyValuesNonSliceRow(t *testing.T) {
 	pk, err := ti.PrimaryKeyValues([]any{int64(7), "alice"})
 	require.NoError(t, err)
 	require.Equal(t, []any{int64(7)}, pk)
+}
+
+// TestAutoUpdateStatisticsLogging: a failed update logs the error and no
+// success line; an update cut short because its context ended logs nothing;
+// a table disabled while the loop waits for its tick runs no further update.
+func TestAutoUpdateStatisticsLogging(t *testing.T) {
+	statsTable := func(db *sql.DB, name string) *TableInfo {
+		return &TableInfo{
+			SchemaName:        "test",
+			TableName:         name,
+			QuotedTableName:   "`" + name + "`",
+			KeyColumns:        []string{"id"},
+			keyColumnsMySQLTp: []string{"int"},
+			keyDatums:         []datumTp{signedType},
+			Columns:           []string{"id"},
+			db:                db,
+		}
+	}
+	run := func(ctx context.Context, tbl *TableInfo, logs *lockedBuffer) <-chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			tbl.AutoUpdateStatistics(ctx, 10*time.Millisecond, slog.New(slog.NewTextHandler(logs, nil)))
+		}()
+		return done
+	}
+
+	t.Run("failed update", func(t *testing.T) {
+		db, err := sql.Open("block-mysql", testutils.DSN())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(db)
+		testutils.RunSQL(t, `DROP TABLE IF EXISTS statsmissing`)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		logs := &lockedBuffer{}
+		done := run(ctx, statsTable(db, "statsmissing"), logs)
+		require.Eventually(t, func() bool {
+			return strings.Count(logs.String(), "error updating table statistics") >= 2
+		}, 5*time.Second, 10*time.Millisecond)
+		cancel()
+		<-done
+		out := logs.String()
+		require.Contains(t, out, "table=statsmissing")
+		require.NotContains(t, out, "table statistics updated", "a failed update must not log a success")
+	})
+
+	t.Run("cancelled during an update", func(t *testing.T) {
+		db, err := sql.Open("block-mysql", testutils.DSN())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(db)
+		testutils.RunSQL(t, `DROP TABLE IF EXISTS statscancel`)
+		testutils.RunSQL(t, `CREATE TABLE statscancel (id INT NOT NULL PRIMARY KEY)`)
+		// Hold the only connection, so the update blocks waiting for it.
+		db.SetMaxOpenConns(1)
+		held, err := db.Conn(t.Context())
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		logs := &lockedBuffer{}
+		done := run(ctx, statsTable(db, "statscancel"), logs)
+		require.Eventually(t, func() bool { return db.Stats().WaitCount > 0 }, 5*time.Second, time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("AutoUpdateStatistics did not return after its context ended")
+		}
+		require.NoError(t, held.Close())
+		require.Empty(t, logs.String(), "an update cut short by its context logs nothing")
+	})
+
+	t.Run("disabled while waiting for a tick", func(t *testing.T) {
+		db, err := sql.Open("block-mysql", testutils.DSN())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(db)
+		testutils.RunSQL(t, `DROP TABLE IF EXISTS statsdisabled`)
+		testutils.RunSQL(t, `CREATE TABLE statsdisabled (id INT NOT NULL PRIMARY KEY)`)
+
+		tbl := statsTable(db, "statsdisabled")
+		logs := &lockedBuffer{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			// A long interval, so the disable lands before the first tick.
+			tbl.AutoUpdateStatistics(t.Context(), 300*time.Millisecond, slog.New(slog.NewTextHandler(logs, nil)))
+		}()
+		time.Sleep(50 * time.Millisecond)
+		tbl.DisableAutoUpdateStatistics.Store(true)
+		<-done
+		require.Empty(t, logs.String(), "a disabled table runs no further update")
+	})
+}
+
+// lockedBuffer is an io.Writer safe for concurrent use, for capturing logs.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

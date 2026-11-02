@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -350,4 +351,39 @@ func columnExists(t *testing.T, db *sql.DB, schema, table, column string) bool {
 		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
 		schema, table, column).Scan(&n))
 	return n > 0
+}
+
+// TestMoveStopsStatisticsUpdatesBeforeTheReverseWindow: the source tables'
+// statistics updates stop once the copy completes. The forward cutover renames
+// the source tables away and Run stays open for the reverse window, so an
+// update left running would fail against the renamed tables until the window
+// closes.
+func TestMoveStopsStatisticsUpdatesBeforeTheReverseWindow(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	interval := tableStatUpdateInterval
+	tableStatUpdateInterval = 20 * time.Millisecond
+	t.Cleanup(func() { tableStatUpdateInterval = interval })
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwst_src", "rwst_dst")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	logs := &lockedBuffer{}
+	runner.SetLogger(slog.New(slog.NewTextHandler(logs, nil)))
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { return nil })
+	h := startRun(t, runner)
+
+	h.awaitReverseWindow(ctl, "rwst_dst")
+	// Many update intervals inside the window.
+	time.Sleep(20 * tableStatUpdateInterval)
+	testutils.RunSQL(t, "CREATE TABLE rwst_dst."+revertMarkerName+" (id INT)")
+	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete")
+
+	require.Zero(t, strings.Count(logs.String(), "error updating table statistics"),
+		"no statistics update may run against the renamed source tables")
 }

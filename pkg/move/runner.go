@@ -203,6 +203,9 @@ type Runner struct {
 	// (stopWatchTask) so the reverse window is the sole writer of the checkpoint
 	// row.
 	bgCancel context.CancelFunc
+	// stopStats stops the source tables' statistics updates and waits for
+	// them to exit. Set in startBackgroundRoutines; see stopStatisticsUpdates.
+	stopStats func()
 }
 
 var (
@@ -1474,6 +1477,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	}
 
 	r.startBackgroundRoutines(ctx)
+	defer r.stopStatisticsUpdates()
 	if err := r.setWatermarkOptimizationAll(ctx, true); err != nil {
 		return err
 	}
@@ -1481,6 +1485,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	if err := r.runCopy(ctx); err != nil {
 		return err
 	}
+	r.stopStatisticsUpdates()
 
 	// Disable both watermark optimizations so that all changes can be flushed.
 	// For non-memory-comparable PKs this also drains the buffered map and
@@ -1641,14 +1646,19 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 	// Start routines in table and replication packages to
 	// Continuously update the min/max and estimated rows
 	// and to flush the binary log position periodically.
-	// These will both be stopped when the copier finishes
-	// and checksum starts, although the PeriodicFlush
-	// will be restarted again after.
+	// The statistics updates are stopped when the copier
+	// finishes (see stopStatisticsUpdates).
+	statsCtx, statsCancel := context.WithCancel(ctx)
+	var stats sync.WaitGroup
 	for i := range r.sources {
 		for _, tbl := range r.sources[i].tables {
-			go tbl.AutoUpdateStatistics(ctx, tableStatUpdateInterval, r.logger)
+			stats.Go(func() { tbl.AutoUpdateStatistics(statsCtx, tableStatUpdateInterval, r.logger) })
 		}
 		r.sources[i].replClient.StartPeriodicFlush(ctx, change.DefaultFlushInterval)
+	}
+	r.stopStats = func() {
+		statsCancel()
+		stats.Wait()
 	}
 
 	// Start go routines for checkpointing and dumping status. The returned
@@ -1659,6 +1669,23 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 	bgCtx, bgCancel := context.WithCancel(ctx)
 	r.bgCancel = bgCancel
 	r.watchTaskWait = status.WatchTask(bgCtx, r, r.logger)
+}
+
+// stopStatisticsUpdates stops the source tables' statistics updates and waits
+// for them to exit. Idempotent. Run stops them once the copy completes, as
+// migration does when its checksum starts. The optimistic chunker refreshes
+// stale statistics itself when it reaches the end of a table; the composite
+// chunker does not, so its progress after the copy is against the estimate
+// the copy ended with. The forward cutover renames the source tables away,
+// and in reverse-window mode Run does not return until the window closes, so
+// updates left running would fail against the renamed tables for the whole
+// window. Run also defers a call, so that on an early return no update is
+// still running when it closes the source pools.
+func (r *Runner) stopStatisticsUpdates() {
+	if r.stopStats != nil {
+		r.stopStats()
+		r.stopStats = nil
+	}
 }
 
 // stopWatchTask stops the background status/checkpoint dumper and waits for it
