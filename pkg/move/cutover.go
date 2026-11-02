@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/block/spirit/pkg/change"
@@ -16,6 +17,7 @@ import (
 	"github.com/block/spirit/pkg/runtime"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
+	"golang.org/x/sync/errgroup"
 )
 
 // renameRetryWait is the pause between RENAME TABLE attempts while the
@@ -523,25 +525,29 @@ type autoIncrementTable struct {
 // AUTO_INCREMENT (no table rebuild) for each destination that is behind.
 func carryAutoIncrement(ctx context.Context, logger *slog.Logger, from, to []autoIncrementTable) error {
 	var maxNext uint64
-	for _, t := range from {
+	var mu sync.Mutex
+	if err := forEachAutoIncrementTable(ctx, from, func(ctx context.Context, t autoIncrementTable) error {
 		next, ok, err := table.NextAutoIncrement(ctx, t.db, t.schema, t.name)
-		if err != nil {
+		if err != nil || !ok {
 			return err
 		}
-		if ok {
-			maxNext = max(maxNext, next)
-		}
+		mu.Lock()
+		maxNext = max(maxNext, next)
+		mu.Unlock()
+		return nil
+	}); err != nil {
+		return err
 	}
 	if maxNext <= 1 {
 		return nil // no AUTO_INCREMENT column, or no id issued yet
 	}
-	for _, t := range to {
+	return forEachAutoIncrementTable(ctx, to, func(ctx context.Context, t autoIncrementTable) error {
 		next, ok, err := table.NextAutoIncrement(ctx, t.db, t.schema, t.name)
 		if err != nil {
 			return err
 		}
 		if !ok || next >= maxNext {
-			continue
+			return nil
 		}
 		if err := dbconn.Exec(ctx, t.db, "ALTER TABLE %n.%n AUTO_INCREMENT = %?", t.schema, t.name, maxNext); err != nil {
 			return fmt.Errorf("failed to set AUTO_INCREMENT on %s.%s: %w", t.schema, t.name, err)
@@ -551,6 +557,22 @@ func carryAutoIncrement(ctx context.Context, logger *slog.Logger, from, to []aut
 			"table", t.name,
 			"from", next,
 			"auto_increment", maxNext)
+		return nil
+	})
+}
+
+// autoIncrementConcurrency bounds how many copies carryAutoIncrement reads or
+// raises at once. The copies are usually on different servers, so reading
+// them one after another costs a round trip each under the cutover's locks.
+const autoIncrementConcurrency = 32
+
+// forEachAutoIncrementTable runs fn for every table, up to
+// autoIncrementConcurrency at once, and returns the first error.
+func forEachAutoIncrementTable(ctx context.Context, tables []autoIncrementTable, fn func(ctx context.Context, t autoIncrementTable) error) error {
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(autoIncrementConcurrency)
+	for _, t := range tables {
+		g.Go(func() error { return fn(gctx, t) })
 	}
-	return nil
+	return g.Wait()
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/block/spirit/pkg/concurrency"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/host"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/runtime"
@@ -929,15 +930,27 @@ func (r *Runner) wipeTargets(ctx context.Context) error {
 // cutover itself — must clear those first so the retire RENAME cannot collide
 // with a leftover. Safe because only a revert ever creates a _revert table.
 func (r *Runner) dropStaleRevertTables(ctx context.Context) error {
-	for i := range r.targets {
-		for _, t := range r.sourceTables {
-			revertName := check.RevertRetiredName(t.TableName)
-			if err := dbconn.Exec(ctx, r.targets[i].DB, "DROP TABLE IF EXISTS %n", revertName); err != nil {
-				return fmt.Errorf("drop stale revert table %q on target %d: %w", revertName, i, err)
-			}
-		}
+	if len(r.sourceTables) == 0 {
+		return nil
 	}
-	return nil
+	names := make([]string, 0, len(r.sourceTables))
+	for _, t := range r.sourceTables {
+		names = append(names, sqlescape.MustEscapeSQL("%n", check.RevertRetiredName(t.TableName)))
+	}
+	// One statement per target, and the targets at the same time: with many
+	// targets, one DROP per table per target adds up to a long wait before a
+	// reverse cutover can lock anything.
+	stmt := "DROP TABLE IF EXISTS " + strings.Join(names, ", ")
+	g, gctx := errgroup.WithContext(ctx)
+	for i := range r.targets {
+		g.Go(func() error {
+			if _, err := r.targets[i].DB.ExecContext(gctx, stmt); err != nil {
+				return fmt.Errorf("drop stale revert tables on target %d: %w", i, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // maybeResumeReverseWindow takes over the run when a prior attempt reached the
