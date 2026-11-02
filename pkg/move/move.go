@@ -45,6 +45,14 @@ type Move struct {
 	// reverseWindow (reversewindow.go).
 	ReverseWindow time.Duration `name:"reverse-window" help:"After cutover, reverse the move (change-only) and keep it alive for this long to allow rollback. 0 disables (normal cutover)." default:"0"`
 
+	// CutoverLockTimeout bounds how long a cutover attempt (and a reverse
+	// cutover's) holds its table locks before it switches traffic: the final
+	// flush, the checks under the lock and the work that prepares the switch.
+	// Each LOCK TABLES is bounded separately by --lock-wait-timeout. An attempt
+	// that runs past it releases the locks without switching, and may be
+	// retried. Zero uses DefaultCutoverLockTimeout.
+	CutoverLockTimeout time.Duration `name:"cutover-lock-timeout" help:"How long a cutover may hold its table locks before it switches traffic; past it the attempt releases them and is retried" optional:"" default:"1m"`
+
 	// SourceTables optionally specifies a list of tables to move.
 	// If empty, all tables in the source database will be moved.
 	// This is useful for Vitess MoveTables operations where only specific tables should be moved.
@@ -94,6 +102,9 @@ func (m *Move) Validate() error {
 	}
 	if m.ReverseWindow < 0 {
 		return fmt.Errorf("--reverse-window must be non-negative, got %s", m.ReverseWindow)
+	}
+	if m.CutoverLockTimeout < 0 {
+		return fmt.Errorf("--cutover-lock-timeout must be non-negative, got %s", m.CutoverLockTimeout)
 	}
 	return dbconn.ValidateMaxConnections(m.MaxConnections, m.ValidationThreads(), minChecksumPhaseReserve)
 }

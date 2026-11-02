@@ -16,7 +16,6 @@ import (
 	"github.com/block/spirit/pkg/runtime"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
-	"github.com/block/spirit/pkg/utils"
 )
 
 // renameRetryWait is the pause between RENAME TABLE attempts while the
@@ -96,6 +95,10 @@ type CutOver struct {
 	postSwitch     func(ctx context.Context) error
 	postSwitchDone bool
 
+	// lockTimeout bounds how long an attempt holds the source locks before the
+	// traffic switch. See SetLockTimeout.
+	lockTimeout time.Duration
+
 	// testSleep, when non-nil, replaces the backoff between cutover attempts
 	// (see runtime.CutoverRetry.Sleep). It is a test seam.
 	testSleep func(ctx context.Context, d time.Duration) error
@@ -117,6 +120,17 @@ func (c *CutOver) SetPreSwitch(fn func(ctx context.Context) error) {
 // traffic switch and before the source rename. See CutOver.postSwitch.
 func (c *CutOver) SetPostSwitch(fn func(ctx context.Context) error) {
 	c.postSwitch = fn
+}
+
+// SetLockTimeout sets how long an attempt may hold the source table locks
+// before it reaches the traffic switch: the final flush, the checks under the
+// lock and the pre-switch hook. An attempt that runs past it releases the
+// locks and fails with a retryable error. A zero or negative d keeps
+// DefaultCutoverLockTimeout.
+func (c *CutOver) SetLockTimeout(d time.Duration) {
+	if d > 0 {
+		c.lockTimeout = d
+	}
 }
 
 // SetCutoverWithResult installs a result-bearing forward cutover callback.
@@ -161,6 +175,7 @@ func NewCutOver(sources []CutOverSource, cutoverFunc func(ctx context.Context) e
 		cutoverFunc: cutoverFunc,
 		dbConfig:    dbConfig,
 		logger:      logger,
+		lockTimeout: DefaultCutoverLockTimeout,
 	}, nil
 }
 
@@ -267,30 +282,36 @@ func (c *CutOver) runCutoverCallback(ctx context.Context) error {
 	return nil
 }
 
-func (c *CutOver) algorithmCutover(ctx context.Context) error {
-	// Lock tables on ALL sources.
-	var sourceLocks []*dbconn.TableLock
-	for i, src := range c.sources {
-		lock, err := dbconn.NewTableLock(ctx, src.DB, src.Tables, c.dbConfig, c.logger)
+func (c *CutOver) algorithmCutover(ctx context.Context) (err error) {
+	timing := newLockTiming(c.logger, "cutover")
+	// Registered first so it runs last, after the deferred unlock below.
+	defer func() { timing.log(err) }()
+
+	// Lock tables on ALL sources, at the same time.
+	sourceLocks, err := lockAll(ctx, len(c.sources), func(ctx context.Context, i int) (*dbconn.TableLock, error) {
+		lock, err := dbconn.NewTableLock(ctx, c.sources[i].DB, c.sources[i].Tables, c.dbConfig, c.logger)
 		if err != nil {
-			// Close any locks we already acquired.
-			for _, l := range sourceLocks {
-				utils.CloseAndLogWithContext(ctx, l)
-			}
-			return fmt.Errorf("failed to lock tables on source %d: %w", i, err)
+			return nil, fmt.Errorf("failed to lock tables on source %d: %w", i, err)
 		}
-		sourceLocks = append(sourceLocks, lock)
+		return lock, nil
+	})
+	if err != nil {
+		return err
 	}
-	defer func() {
-		for _, l := range sourceLocks {
-			utils.CloseAndLogWithContext(ctx, l)
-		}
-	}()
+	defer closeLocks(ctx, sourceLocks)
+	timing.locked()
+
+	// Everything up to the traffic switch must finish within the cutover lock
+	// timeout. Past it the attempt gives up and releases the locks: nothing
+	// has switched, so the source still serves and the attempt may be retried.
+	lockedCtx, cancelLocked := context.WithTimeout(ctx, c.lockTimeout)
+	defer cancelLocked()
+	timedOut := func(err error) error { return lockTimeoutError(ctx, lockedCtx, c.lockTimeout, err) }
 
 	// Flush ALL repl clients. No new changes will arrive because all sources are locked.
 	for i, src := range c.sources {
-		if err := src.ReplClient.Flush(ctx); err != nil {
-			return fmt.Errorf("failed to flush repl client for source %d: %w", i, err)
+		if err := src.ReplClient.Flush(lockedCtx); err != nil {
+			return timedOut(fmt.Errorf("failed to flush repl client for source %d: %w", i, err))
 		}
 	}
 
@@ -300,31 +321,40 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 			return fmt.Errorf("%w on source %d, final flush might be broken", change.ErrChangesNotFlushed, i)
 		}
 	}
+	timing.step("flush")
 
 	if c.checksUnderLock != nil {
-		if err := c.checksUnderLock(ctx); err != nil {
+		if err := c.checksUnderLock(lockedCtx); err != nil {
 			// Only a refusal is final. Any other error (a failed query, a
 			// dropped connection) may be transient, so it takes the normal
 			// retry path.
 			if errors.Is(err, check.ErrRefused) {
 				return fmt.Errorf("%w: %w", errCutoverRefused, err)
 			}
-			return fmt.Errorf("checks under the source locks: %w", err)
+			return timedOut(fmt.Errorf("checks under the source locks: %w", err))
 		}
 	}
+	timing.step("checks")
 
 	if c.preSwitch != nil {
-		if err := c.preSwitch(ctx); err != nil {
-			return fmt.Errorf("pre-switch hook failed: %w", err)
+		if err := c.preSwitch(lockedCtx); err != nil {
+			return timedOut(fmt.Errorf("pre-switch hook failed: %w", err))
 		}
+	}
+	timing.step("pre_switch")
+	if err := lockedCtx.Err(); err != nil {
+		return timedOut(err)
 	}
 
 	// Run the caller-owned traffic switch at most once. Result-bearing callers
 	// retain durable-mutation and ambiguity evidence even when they return an
 	// error; the legacy callback is conservatively ambiguous on any error.
+	// The callback is not bounded by the cutover lock timeout: cancelling a
+	// traffic switch part way could leave it half applied.
 	if err := c.runCutoverCallback(ctx); err != nil {
 		return err
 	}
+	timing.switchedTraffic()
 
 	// Traffic is now on the target, and the source locks are the only fence
 	// against straggler writes. Everything from here to the end of the source
@@ -351,6 +381,7 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 		}
 		c.postSwitchDone = true
 	}
+	timing.step("post_switch")
 
 	// Rename the source tables out of the way. Once the cutover function has
 	// succeeded, traffic is on the target and the table locks held above are
@@ -359,7 +390,7 @@ func (c *CutOver) algorithmCutover(ctx context.Context) error {
 	// So the rename is retried HERE, while the locks are still held, rather
 	// than by returning to Run's retry loop (which would release the locks
 	// between attempts and reopen that window).
-	var err error
+	defer timing.step("rename")
 	for attempt := 1; attempt <= c.dbConfig.MaxRetries; attempt++ {
 		if attempt > 1 {
 			c.logger.Warn("retrying rename while still holding source table locks",

@@ -1536,6 +1536,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		if err != nil {
 			return err
 		}
+		cutover.SetLockTimeout(r.move.CutoverLockTimeout)
 		if r.cutoverResultFunc != nil || r.cutoverFunc != nil {
 			cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
 		}
