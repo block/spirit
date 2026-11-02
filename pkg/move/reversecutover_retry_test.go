@@ -2,9 +2,11 @@ package move
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,9 +82,16 @@ func TestMoveReverseCutoverRetriesAfterLockTimeout(t *testing.T) {
 // resumes it.
 func TestMoveReverseCutoverGivesUpAfterMaxRetries(t *testing.T) {
 	shortenReverseWindowPolling(t)
+	const backoff = 500 * time.Millisecond
+	setReverseCutoverBackoff(t, backoff)
 	var attempts atomic.Int32
+	var mu sync.Mutex
+	var started []time.Time
 	setReverseCutoverUnderLockHook(t, func(ctx context.Context) error {
 		attempts.Add(1)
+		mu.Lock()
+		started = append(started, time.Now())
+		mu.Unlock()
 		<-ctx.Done()
 		return ctx.Err()
 	})
@@ -108,6 +117,14 @@ func TestMoveReverseCutoverGivesUpAfterMaxRetries(t *testing.T) {
 	require.ErrorIs(t, err, errCutoverLockTimeout)
 	require.ErrorIs(t, err, errReverseCutoverAbandoned)
 	require.Equal(t, int32(runner.dbConfig.MaxRetries), attempts.Load())
+	// Each retry waits out the backoff after the failed attempt released its
+	// locks, rather than locking the targets again on the next tick.
+	mu.Lock()
+	for i := 1; i < len(started); i++ {
+		require.GreaterOrEqual(t, started[i].Sub(started[i-1]), 200*time.Millisecond+backoff,
+			"attempt %d started too soon after attempt %d", i+1, i)
+	}
+	mu.Unlock()
 	require.False(t, reverseCutoverCalled.Load(), "traffic must not be switched back")
 	require.True(t, tableExists(t, ctl, "rwmr_src", "t1_old"), "the source must stay retired")
 	require.False(t, tableExists(t, ctl, "rwmr_src", "t1"), "the source must not be un-retired")
@@ -224,4 +241,108 @@ func TestReverseFeedPauseResumePeriodicFlush(t *testing.T) {
 	rf.ResumePeriodicFlush(t.Context())
 	require.Equal(t, 1, a.PeriodicFlushStarts())
 	require.Equal(t, 1, b.PeriodicFlushStarts())
+}
+
+// TestRetryAutoIncrementCarry: the reverse cutover's AUTO_INCREMENT carry,
+// which runs after the reverse feed is closed, is retried in place up to
+// MaxRetries attempts, each bounded by the cutover lock timeout.
+func TestRetryAutoIncrementCarry(t *testing.T) {
+	oldWait := renameRetryWait
+	renameRetryWait = time.Millisecond
+	t.Cleanup(func() { renameRetryWait = oldWait })
+	r := &Runner{dbConfig: dbconn.NewDBConfig(), logger: slog.Default()}
+	maxRetries := int32(r.dbConfig.MaxRetries)
+	carryErr := errors.New("SHOW CREATE TABLE: connection reset")
+
+	t.Run("a failed attempt is retried", func(t *testing.T) {
+		var calls atomic.Int32
+		err := retryAutoIncrementCarry(t.Context(), r, time.Minute, func(context.Context) error {
+			if calls.Add(1) < maxRetries {
+				return carryErr
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, maxRetries, calls.Load())
+	})
+
+	t.Run("it gives up after MaxRetries attempts", func(t *testing.T) {
+		var calls atomic.Int32
+		err := retryAutoIncrementCarry(t.Context(), r, time.Minute, func(context.Context) error {
+			calls.Add(1)
+			return carryErr
+		})
+		require.ErrorIs(t, err, carryErr)
+		require.Equal(t, maxRetries, calls.Load())
+	})
+
+	t.Run("each attempt is bounded by the timeout", func(t *testing.T) {
+		var calls atomic.Int32
+		err := retryAutoIncrementCarry(t.Context(), r, 50*time.Millisecond, func(ctx context.Context) error {
+			calls.Add(1)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		require.ErrorIs(t, err, errCutoverLockTimeout)
+		require.ErrorContains(t, err, "--cutover-lock-timeout")
+		require.Equal(t, maxRetries, calls.Load())
+	})
+
+	t.Run("a cancelled run is not retried", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		var calls atomic.Int32
+		err := retryAutoIncrementCarry(ctx, r, time.Minute, func(ctx context.Context) error {
+			calls.Add(1)
+			cancel()
+			return ctx.Err()
+		})
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, errCutoverLockTimeout)
+		require.Equal(t, int32(1), calls.Load())
+	})
+}
+
+// TestMoveReverseCutoverRetiresEveryTable: a reverse cutover of a move with
+// more than one table drops every stale _revert table on the target, then
+// retires every table there in one rename.
+func TestMoveReverseCutoverRetiresEveryTable(t *testing.T) {
+	shortenReverseWindowPolling(t)
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwmt_src", "rwmt_dst")
+	testutils.RunSQL(t, "CREATE TABLE rwmt_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))")
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		ReverseWindow: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { return nil })
+	h := startRun(t, runner)
+
+	h.awaitReverseWindow(ctl, "rwmt_dst")
+	// Leftovers of an earlier rollback: the retire would collide with them.
+	for _, name := range []string{"t1", "t2"} {
+		testutils.RunSQL(t, "CREATE TABLE rwmt_dst."+name+"_revert (id INT PRIMARY KEY, stale INT)")
+	}
+	testutils.RunSQL(t, "CREATE TABLE rwmt_dst."+revertMarkerName+" (id INT)")
+	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete")
+
+	for _, name := range []string{"t1", "t2"} {
+		require.True(t, tableExists(t, ctl, "rwmt_src", name), "source %s should be un-retired", name)
+		require.True(t, tableExists(t, ctl, "rwmt_dst", name+"_revert"), "target %s should be retired to _revert", name)
+		require.False(t, tableExists(t, ctl, "rwmt_dst", name), "target %s should be gone after retire", name)
+		require.False(t, columnExists(t, ctl, "rwmt_dst", name+"_revert", "stale"), "the stale %s_revert should have been dropped", name)
+	}
+}
+
+// columnExists reports whether schema.table has a column named column.
+func columnExists(t *testing.T, db *sql.DB, schema, table, column string) bool {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
+		schema, table, column).Scan(&n))
+	return n > 0
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
+	"golang.org/x/sync/errgroup"
 )
 
 // Checkpoint phase values for a reverse-window move. The empty string ("") is
@@ -70,14 +71,26 @@ func targetCurrentPosition(ctx context.Context, r *Runner, tgt *applier.Target) 
 // captureReverseWindow runs under the source locks after the final forward
 // flush, before switching traffic. They are the reverse feeds' start points,
 // so writes committed during the switch are included when those feeds start.
-// On a safe cutover retry they are recaptured after the new final flush.
+// On a safe cutover retry they are recaptured after the new final flush. The
+// targets are read at the same time, since this runs under the locks.
 func captureReverseWindow(ctx context.Context, r *Runner) error {
-	positions := make(map[string]string, len(r.targets))
+	read := make([]string, len(r.targets))
+	g, gctx := errgroup.WithContext(ctx)
 	for i := range r.targets {
-		pos, err := targetCurrentPosition(ctx, r, &r.targets[i])
-		if err != nil {
-			return fmt.Errorf("capture reverse-feed start position for target %d: %w", i, err)
-		}
+		g.Go(func() error {
+			pos, err := targetCurrentPosition(gctx, r, &r.targets[i])
+			if err != nil {
+				return fmt.Errorf("capture reverse-feed start position for target %d: %w", i, err)
+			}
+			read[i] = pos
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	positions := make(map[string]string, len(r.targets))
+	for i, pos := range read {
 		positions[targetKey(r.targets[i])] = pos
 	}
 	r.reversePositions = positions
@@ -192,8 +205,12 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 		checkpointTicker := time.NewTicker(status.CheckpointDumpInterval)
 		defer checkpointTicker.Stop()
 		// failedReverts counts reverse cutover attempts that failed before
-		// ownership moved (see errReverseCutoverAbandoned).
+		// ownership moved (see errReverseCutoverAbandoned). After one, the
+		// next attempt waits until retryRevertAt, so a failing attempt does
+		// not lock the targets again on the next tick.
 		failedReverts := 0
+		var retryRevertAt time.Time
+		revertBackoff := reverseCutoverInitialBackoff
 		for {
 			select {
 			case <-ctx.Done():
@@ -237,6 +254,9 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", ferr)
 					return w.completeForward(ctx)
 				}
+				if time.Now().Before(retryRevertAt) {
+					continue
+				}
 				requested, err := w.revertRequested(ctx)
 				if err != nil {
 					// A transient read error should not abandon the window; log and
@@ -253,9 +273,12 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					if !w.mayRetryReverseCutover(ctx, err, failedReverts) {
 						return err
 					}
-					// The marker is still there, so the next tick tries again.
+					// The marker is still there, so a tick after the backoff
+					// tries again.
 					r.logger.Warn("reverse cutover attempt failed before ownership moved; the reverse window stays open and will try again",
-						"attempt", failedReverts, "max_retries", r.dbConfig.MaxRetries, "error", err.Error())
+						"attempt", failedReverts, "max_retries", r.dbConfig.MaxRetries, "retry_in", revertBackoff, "error", err.Error())
+					retryRevertAt = time.Now().Add(revertBackoff)
+					revertBackoff = min(revertBackoff*2, reverseCutoverMaxBackoff)
 					continue
 				}
 				if !time.Now().Before(deadline) {
@@ -548,11 +571,12 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 	//
 	// It runs after the feed is closed: its ALTER TABLE on an _old table is a
 	// schema change the feed would stop on where the source and a target
-	// share a server. A failure here is therefore not retried by the window
-	// (the feed is gone); it fails the run with the phase still
-	// reverse_window, and a re-run resumes the window.
-	if err := w.carryAutoIncrementsToSource(lockedCtx); err != nil {
-		return lockTimeoutError(ctx, lockedCtx, lockTimeout, fmt.Errorf("reverse cutover: %w", err))
+	// share a server. The window cannot retry a failure here (the feed is
+	// gone), so the carry is retried in place, under the locks (see
+	// retryAutoIncrementCarry). If every attempt fails, the run fails with the
+	// phase still reverse_window, and a re-run resumes the window.
+	if err := retryAutoIncrementCarry(ctx, r, lockTimeout, w.carryAutoIncrementsToSource); err != nil {
+		return fmt.Errorf("reverse cutover: %w", err)
 	}
 	timing.step("auto_increment")
 
@@ -611,6 +635,48 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCutoverCleanupTimeout)
 	defer cancel()
 	return w.finalizeReverse(finalizeCtx)
+}
+
+// reverseCutoverInitialBackoff and reverseCutoverMaxBackoff bound the wait
+// between reverse cutover attempts. Vars so tests can shorten them.
+var (
+	reverseCutoverInitialBackoff = 2 * time.Second
+	reverseCutoverMaxBackoff     = 10 * time.Second
+)
+
+// retryAutoIncrementCarry runs carry, and runs it again, up to
+// DBConfig.MaxRetries attempts, when it fails while ctx is live. Each attempt
+// is bounded by timeout. The carry only raises AUTO_INCREMENT counters, so
+// repeating it is safe, and it runs after the reverse feed is closed, where a
+// failure would end the run instead of leaving the window open.
+func retryAutoIncrementCarry(ctx context.Context, r *Runner, timeout time.Duration, carry func(ctx context.Context) error) error {
+	var err error
+	for attempt := 1; attempt <= max(r.dbConfig.MaxRetries, 1); attempt++ {
+		if attempt > 1 {
+			r.logger.Warn("retrying the AUTO_INCREMENT carry of a reverse cutover while still holding target table locks",
+				"attempt", attempt, "max_retries", r.dbConfig.MaxRetries, "error", err.Error())
+			select {
+			case <-ctx.Done():
+				return errors.Join(err, ctx.Err())
+			case <-time.After(renameRetryWait):
+			}
+		}
+		err = carryAttempt(ctx, timeout, carry)
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
+}
+
+func carryAttempt(ctx context.Context, timeout time.Duration, carry func(ctx context.Context) error) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := carry(attemptCtx)
+	if err != nil && ctx.Err() == nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: the AUTO_INCREMENT carry did not finish within %s (--cutover-lock-timeout): %w", errCutoverLockTimeout, timeout, err)
+	}
+	return err
 }
 
 // mayRetryReverseCutover reports whether the window may try a reverse cutover

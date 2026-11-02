@@ -128,7 +128,7 @@ func (t *lockTiming) log(err error) {
 // parent, has not.
 func lockTimeoutError(ctx, lockedCtx context.Context, timeout time.Duration, err error) error {
 	if ctx.Err() == nil && errors.Is(lockedCtx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("%w: held the table locks for %s without reaching the traffic switch: %w", errCutoverLockTimeout, timeout, err)
+		return fmt.Errorf("%w: held the table locks for %s (--cutover-lock-timeout) without reaching the traffic switch: %w", errCutoverLockTimeout, timeout, err)
 	}
 	return err
 }

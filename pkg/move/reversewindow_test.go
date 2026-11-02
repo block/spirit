@@ -62,6 +62,16 @@ func shortenReverseWindowPolling(t *testing.T) {
 	old := reverseWindowPollInterval
 	reverseWindowPollInterval = 100 * time.Millisecond
 	t.Cleanup(func() { reverseWindowPollInterval = old })
+	setReverseCutoverBackoff(t, 100*time.Millisecond)
+}
+
+// setReverseCutoverBackoff sets the wait between reverse cutover attempts to
+// d for the test.
+func setReverseCutoverBackoff(t *testing.T, d time.Duration) {
+	t.Helper()
+	oldInitial, oldMax := reverseCutoverInitialBackoff, reverseCutoverMaxBackoff
+	reverseCutoverInitialBackoff, reverseCutoverMaxBackoff = d, d
+	t.Cleanup(func() { reverseCutoverInitialBackoff, reverseCutoverMaxBackoff = oldInitial, oldMax })
 }
 
 // Timing for the wait helpers below.

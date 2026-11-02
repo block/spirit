@@ -121,6 +121,40 @@ func TestCutOverLockTimeout(t *testing.T) {
 	})
 }
 
+// TestCutOverLockTimeoutBoundsEveryStepBeforeTheSwitch: the checks under the
+// lock, and a pre-switch hook that ignores its context, each end an attempt
+// that has outlasted the cutover lock timeout without switching traffic.
+func TestCutOverLockTimeoutBoundsEveryStepBeforeTheSwitch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	t.Run("checks under the lock", func(t *testing.T) {
+		var switched bool
+		cutover, _, _ := lockTimeoutCutover(t, ctx, 1, slog.Default(), func(context.Context) error { switched = true; return nil })
+		cutover.SetLockTimeout(100 * time.Millisecond)
+		cutover.SetChecksUnderLock(func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		err := cutover.Run(ctx)
+		require.ErrorIs(t, err, errCutoverLockTimeout)
+		require.False(t, switched)
+	})
+
+	t.Run("a pre-switch hook that ignores its context", func(t *testing.T) {
+		var switched bool
+		cutover, _, _ := lockTimeoutCutover(t, ctx, 1, slog.Default(), func(context.Context) error { switched = true; return nil })
+		cutover.SetLockTimeout(100 * time.Millisecond)
+		cutover.SetPreSwitch(func(context.Context) error {
+			time.Sleep(300 * time.Millisecond)
+			return nil
+		})
+		err := cutover.Run(ctx)
+		require.ErrorIs(t, err, errCutoverLockTimeout)
+		require.False(t, switched, "traffic must not be switched after the lock timeout")
+	})
+}
+
 // TestLockAllReleasesOnFailure checks that when one lock cannot be taken,
 // lockAll releases the locks it did take.
 func TestLockAllReleasesOnFailure(t *testing.T) {

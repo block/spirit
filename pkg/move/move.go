@@ -45,13 +45,15 @@ type Move struct {
 	// reverseWindow (reversewindow.go).
 	ReverseWindow time.Duration `name:"reverse-window" help:"After cutover, reverse the move (change-only) and keep it alive for this long to allow rollback. 0 disables (normal cutover)." default:"0"`
 
-	// CutoverLockTimeout bounds how long a cutover attempt (and a reverse
-	// cutover's) holds its table locks before it switches traffic: the final
-	// flush, the checks under the lock and the work that prepares the switch.
-	// Each LOCK TABLES is bounded separately by --lock-wait-timeout. An attempt
-	// that runs past it releases the locks without switching, and may be
-	// retried. Zero uses DefaultCutoverLockTimeout.
-	CutoverLockTimeout time.Duration `name:"cutover-lock-timeout" help:"How long a cutover may hold its table locks before it switches traffic; past it the attempt releases them and is retried" optional:"" default:"1m"`
+	// CutoverLockTimeout bounds, per attempt and from the moment every table
+	// lock is held, the work a cutover (and a reverse cutover) does under the
+	// locks before it switches traffic: the final flush, the checks under the
+	// lock and the work that prepares the switch. Each LOCK TABLES is bounded
+	// separately by --lock-wait-timeout, so the first lock taken has been held
+	// for up to that long when the timeout starts. An attempt that runs past
+	// it releases the locks without switching, and may be retried. Zero uses
+	// DefaultCutoverLockTimeout.
+	CutoverLockTimeout time.Duration `name:"cutover-lock-timeout" help:"Per cutover attempt, how long the work under the table locks may take before traffic switches, counted from when every lock is held; past it the attempt releases them and is retried" optional:"" default:"1m"`
 
 	// SourceTables optionally specifies a list of tables to move.
 	// If empty, all tables in the source database will be moved.
