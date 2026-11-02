@@ -621,8 +621,8 @@ func TestPrimaryKeyValuesNonSliceRow(t *testing.T) {
 }
 
 // TestAutoUpdateStatisticsLogging: a failed update logs the error and no
-// success line, and an update cut short because its context ended logs
-// nothing.
+// success line; an update cut short because its context ended logs nothing;
+// a table disabled while the loop waits for its tick runs no further update.
 func TestAutoUpdateStatisticsLogging(t *testing.T) {
 	statsTable := func(db *sql.DB, name string) *TableInfo {
 		return &TableInfo{
@@ -689,6 +689,27 @@ func TestAutoUpdateStatisticsLogging(t *testing.T) {
 		}
 		require.NoError(t, held.Close())
 		require.Empty(t, logs.String(), "an update cut short by its context logs nothing")
+	})
+
+	t.Run("disabled while waiting for a tick", func(t *testing.T) {
+		db, err := sql.Open("block-mysql", testutils.DSN())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(db)
+		testutils.RunSQL(t, `DROP TABLE IF EXISTS statsdisabled`)
+		testutils.RunSQL(t, `CREATE TABLE statsdisabled (id INT NOT NULL PRIMARY KEY)`)
+
+		tbl := statsTable(db, "statsdisabled")
+		logs := &lockedBuffer{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			// A long interval, so the disable lands before the first tick.
+			tbl.AutoUpdateStatistics(t.Context(), 300*time.Millisecond, slog.New(slog.NewTextHandler(logs, nil)))
+		}()
+		time.Sleep(50 * time.Millisecond)
+		tbl.DisableAutoUpdateStatistics.Store(true)
+		<-done
+		require.Empty(t, logs.String(), "a disabled table runs no further update")
 	})
 }
 

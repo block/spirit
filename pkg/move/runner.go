@@ -1673,11 +1673,14 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 
 // stopStatisticsUpdates stops the source tables' statistics updates and waits
 // for them to exit. Idempotent. Run stops them once the copy completes, as
-// migration does when its checksum starts: a chunker that reaches the end of a
-// table with stale statistics refreshes them itself. The forward cutover
-// renames the source tables away, and in reverse-window mode Run does not
-// return until the window closes, so updates left running would fail against
-// the renamed tables for the whole window.
+// migration does when its checksum starts. The optimistic chunker refreshes
+// stale statistics itself when it reaches the end of a table; the composite
+// chunker does not, so its progress after the copy is against the estimate
+// the copy ended with. The forward cutover renames the source tables away,
+// and in reverse-window mode Run does not return until the window closes, so
+// updates left running would fail against the renamed tables for the whole
+// window. Run also defers a call, so that on an early return no update is
+// still running when it closes the source pools.
 func (r *Runner) stopStatisticsUpdates() {
 	if r.stopStats != nil {
 		r.stopStats()
