@@ -769,7 +769,7 @@ func (t *TableInfo) Close() error {
 }
 
 // AutoUpdateStatistics runs a loop that updates the table statistics every interval.
-// This will continue until Close() is called on the tableInfo, or t.DisableAutoUpdateStatistics is set to true.
+// This will continue until ctx is done, or t.DisableAutoUpdateStatistics is set to true.
 func (t *TableInfo) AutoUpdateStatistics(ctx context.Context, interval time.Duration, logger *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -781,10 +781,19 @@ func (t *TableInfo) AutoUpdateStatistics(ctx context.Context, interval time.Dura
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if t.DisableAutoUpdateStatistics.Load() {
+				return
+			}
 			if err := t.updateTableStatistics(ctx); err != nil {
-				logger.Error("error updating table statistics", "error", err)
+				if ctx.Err() != nil {
+					return
+				}
+				logger.Error("error updating table statistics", "schema", t.SchemaName, "table", t.TableName, "error", err)
+				continue
 			}
 			logger.Info("table statistics updated",
+				"schema", t.SchemaName,
+				"table", t.TableName,
 				"estimated-rows", atomic.LoadUint64(&t.EstimatedRows),
 				"pk[0].max-value", t.MaxValue())
 		}
