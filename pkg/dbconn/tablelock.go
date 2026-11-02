@@ -233,9 +233,9 @@ func (s *TableLock) DB() *sql.DB {
 // statement on a referenced table are killed once it has waited the force-kill
 // delay.
 //
-// A statement still running after 5 seconds logs what the locking session is
-// doing and the metadata locks on the server, and logs them again each time
-// its running time doubles. The report logs statement digests, never a
+// A statement still running after slowLockedStatementThreshold logs what the
+// locking session is doing and the metadata locks on the server, and logs them
+// again each time its running time doubles. The report logs statement digests, never a
 // statement's text.
 func (s *TableLock) ExecUnderLock(ctx context.Context, stmts ...string) error {
 	s.mu.Lock()

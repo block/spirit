@@ -17,14 +17,16 @@ import (
 // variable only so tests can shorten it.
 var slowLockedStatementThreshold = 5 * time.Second
 
+// metadataLockReportLimit caps the locks one report logs. A busy server holds
+// a lock for every running query, and every query queued behind the locked
+// tables waits for one, so the report orders the locks most likely to explain
+// the slow statement first (see metadataLocksQuery). It is a variable only so
+// tests can lower it.
+var metadataLockReportLimit = 200
+
 const (
 	// metadataLockReportTimeout bounds the queries of one report.
 	metadataLockReportTimeout = 5 * time.Second
-
-	// metadataLockReportLimit caps the locks one report logs. A busy server
-	// holds a SHARED_READ lock for every running query, so the report orders
-	// the locks most likely to block the statement first.
-	metadataLockReportLimit = 200
 
 	// reportedTextLimit caps the statement digest a report logs.
 	reportedTextLimit = 512
@@ -48,9 +50,11 @@ FROM (SELECT 1) AS one
 	// object type and both granted and pending, except the report's own. It
 	// keeps background threads, whose processlist_id is NULL, and locks whose
 	// owner thread is gone, such as those of a prepared XA transaction whose
-	// session disconnected. The order puts pending locks first, then global,
-	// schema, backup and other non-table locks, then the locks on the lock
-	// session's schema.
+	// session disconnected. The order puts first the lock session's own
+	// locks, including any it waits for, then pending locks (the queries
+	// queued behind it), then global, schema, backup and other non-table
+	// locks, then the locks on the lock session's schema. The placeholder is
+	// the lock session's processlist id.
 	metadataLocksQuery = `SELECT
     ml.owner_thread_id,
     t.processlist_id,
@@ -69,7 +73,8 @@ FROM (SELECT 1) AS one
 FROM performance_schema.metadata_locks ml
     LEFT JOIN performance_schema.threads t ON ml.owner_thread_id = t.thread_id
 WHERE t.processlist_id IS NULL OR t.processlist_id <> CONNECTION_ID()
-ORDER BY ml.lock_status = 'PENDING' DESC,
+ORDER BY t.processlist_id <=> ? DESC,
+    ml.lock_status = 'PENDING' DESC,
     ml.object_type <> 'TABLE' DESC,
     ml.object_schema <=> DATABASE() DESC,
     t.processlist_id, ml.object_schema, ml.object_name
@@ -99,7 +104,8 @@ type metadataLock struct {
 // each time its running time doubles, until stmtCtx ends. The returned
 // function stops the reports. It does not wait for one in progress: a slow
 // log sink must not hold the table locks after the statement returns. A
-// report cut short that way may still log the rows it had read.
+// report still reading when the statement returns logs nothing; one already
+// writing its lines finishes them.
 func (s *TableLock) reportSlowStatement(stmtCtx context.Context) context.CancelFunc {
 	if slowLockedStatementThreshold <= 0 {
 		return func() {}
@@ -137,9 +143,14 @@ func logMetadataLocks(ctx context.Context, db *sql.DB, logger *slog.Logger, pid 
 		logReportFailure(ctx, logger, pid, err)
 		return
 	}
-	locks, truncated, err := readMetadataLocks(ctx, db)
+	locks, truncated, err := readMetadataLocks(ctx, db, pid)
 	if err != nil {
 		logReportFailure(ctx, logger, pid, err)
+		return
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		// The statement returned while the rows were read: they no longer
+		// describe a statement that is still running.
 		return
 	}
 	logger.Warn("a statement under the table lock is still running; logging the metadata locks on its server",
@@ -186,9 +197,10 @@ func logReportFailure(ctx context.Context, logger *slog.Logger, pid int, err err
 }
 
 // readMetadataLocks returns up to metadataLockReportLimit rows of
-// metadataLocksQuery, and whether the server holds more.
-func readMetadataLocks(ctx context.Context, db *sql.DB) (locks []metadataLock, truncated bool, err error) {
-	rows, err := db.QueryContext(ctx, fmt.Sprintf(metadataLocksQuery, metadataLockReportLimit+1))
+// metadataLocksQuery for the lock session pid, and whether the server holds
+// more.
+func readMetadataLocks(ctx context.Context, db *sql.DB, pid int) (locks []metadataLock, truncated bool, err error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(metadataLocksQuery, metadataLockReportLimit+1), pid)
 	if err != nil {
 		return nil, false, err
 	}

@@ -3,6 +3,7 @@ package dbconn
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"strings"
@@ -48,10 +49,12 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 		}
 	}()
 
-	// A reader queued behind the lock shows as a pending metadata lock.
+	// A reader queued behind the lock shows as a pending metadata lock. The
+	// statements' string literals must not reach the log; numbers would not
+	// prove it, since timestamps, durations and addresses hold digits.
 	readerDone := make(chan error, 1)
 	go func() {
-		_, err := db.ExecContext(ctx, "SELECT * FROM slowlock WHERE id = 9876543")
+		_, err := db.ExecContext(ctx, "SELECT * FROM slowlock WHERE id = 1 OR 'reader-literal' = ''")
 		readerDone <- err
 	}()
 	require.Eventually(t, func() bool {
@@ -62,10 +65,10 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 
 	logs.Reset()
-	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.7)"))
+	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.7), 'locked-literal'"))
 	out := logs.String()
-	require.NotContains(t, out, "9876543", "a report must not log a statement's literals")
-	require.NotContains(t, out, "0.7", "a report must not log a statement's literals")
+	require.NotContains(t, out, "reader-literal", "a report must not log a statement's literals")
+	require.NotContains(t, out, "locked-literal", "a report must not log a statement's literals")
 	records := logRecords(t, out)
 
 	// Reports at 100ms, 200ms and 400ms.
@@ -78,7 +81,7 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	require.Len(t, reports, 3)
 	require.Equal(t, "User sleep", reports[0]["lock_session_state"])
 	require.NotEmpty(t, reports[0]["server"])
-	require.Equal(t, "DO `SLEEP` (?)", reports[0]["statement_digest"])
+	require.Equal(t, "DO `SLEEP` (?) , ?", reports[0]["statement_digest"])
 	require.InDelta(t, float64(lock.lockPID), reports[0]["lock_session"], 0)
 
 	var granted, pending bool
@@ -87,6 +90,9 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 			continue
 		}
 		require.Equal(t, reports[0]["server"], r["server"], "every lock record names its server")
+		require.NotNil(t, r["owner_thread"], "every lock record names its owner thread")
+		digest, _ := r["statement_digest"].(string)
+		require.False(t, strings.HasPrefix(digest, "SELECT `ml` . `owner_thread_id`"), "the report must not list its own locks")
 		if r["object_schema"] != dbName || r["object_name"] != "slowlock" {
 			continue
 		}
@@ -95,7 +101,7 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 			require.InDelta(t, float64(lock.lockPID), r["pid"], 0, "the table lock is held by the lock session")
 			granted = true
 		case r["lock_status"] == "PENDING":
-			require.Equal(t, "SELECT * FROM `slowlock` WHERE `id` = ?", r["statement_digest"])
+			require.Equal(t, "SELECT * FROM `slowlock` WHERE `id` = ? OR ? = ?", r["statement_digest"])
 			pending = true
 		}
 	}
@@ -109,6 +115,98 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 	require.NoError(t, lock.Close(ctx))
 	locked = false
 	require.NoError(t, <-readerDone)
+}
+
+// TestSlowStatementReportKeepsTheLockSessionFirst: when more locks are held
+// or awaited than a report logs, the report keeps the lock session's own
+// locks ahead of the queries queued behind it, and says it was truncated. A
+// zero threshold disables the reports.
+func TestSlowStatementReportKeepsTheLockSessionFirst(t *testing.T) {
+	threshold, limit := slowLockedStatementThreshold, metadataLockReportLimit
+	slowLockedStatementThreshold = 100 * time.Millisecond
+	t.Cleanup(func() { slowLockedStatementThreshold, metadataLockReportLimit = threshold, limit })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE busy (id INT NOT NULL PRIMARY KEY)")
+	// The readers' sessions exist before the lock session, so their
+	// processlist ids sort ahead of its own.
+	app, err := New(testutils.DSNForDatabase(dbName), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(app)
+	const readers = 20
+	app.SetMaxOpenConns(readers)
+	warm := make([]*sql.Conn, readers)
+	for i := range warm {
+		warm[i], err = app.Conn(ctx)
+		require.NoError(t, err)
+	}
+	for _, c := range warm {
+		require.NoError(t, c.Close())
+	}
+
+	db, err := New(testutils.DSNForDatabase(dbName), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, nil))
+	tbl := &table.TableInfo{SchemaName: dbName, TableName: "busy", QuotedTableName: "`busy`"}
+	lock, err := NewTableLock(ctx, db, []*table.TableInfo{tbl}, NewDBConfig(), logger)
+	require.NoError(t, err)
+	locked := true
+	defer func() {
+		if locked {
+			utils.CloseAndLogWithContext(ctx, lock)
+		}
+	}()
+	var queued sync.WaitGroup
+	for range readers {
+		queued.Go(func() { _, _ = app.ExecContext(ctx, "SELECT * FROM busy") })
+	}
+	require.Eventually(t, func() bool {
+		var pending int
+		err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM performance_schema.metadata_locks
+			WHERE object_schema = ? AND object_name = 'busy' AND lock_status = 'PENDING'`, dbName).Scan(&pending)
+		return err == nil && pending == readers
+	}, 10*time.Second, 10*time.Millisecond)
+
+	logs.Reset()
+	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.15)"))
+	records := logRecords(t, logs.String())
+	require.Equal(t, slowStatementReport, records[0]["msg"])
+	require.Equal(t, false, records[0]["truncated"])
+	report := records[1:]
+	ownRows := 0
+	for ownRows < len(report) && report[ownRows]["pid"] == float64(lock.lockPID) {
+		ownRows++
+	}
+	require.Positive(t, ownRows, "the lock session's own locks come first")
+	for _, r := range report[ownRows:] {
+		require.NotEqual(t, float64(lock.lockPID), r["pid"])
+	}
+	require.Equal(t, "PENDING", report[ownRows]["lock_status"], "the queued readers follow")
+
+	// Truncated to the limit.
+	metadataLockReportLimit = ownRows + 2
+	logs.Reset()
+	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.15)"))
+	records = logRecords(t, logs.String())
+	require.Equal(t, slowStatementReport, records[0]["msg"])
+	require.Equal(t, true, records[0]["truncated"])
+	require.InDelta(t, float64(ownRows+2), records[0]["metadata_locks"], 0)
+	require.Len(t, records, ownRows+3, "a header and the first locks up to the limit")
+	require.Equal(t, "PENDING", records[len(records)-1]["lock_status"], "the queued readers follow")
+
+	// Disabled.
+	slowLockedStatementThreshold = 0
+	logs.Reset()
+	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.15)"))
+	require.NotContains(t, logs.String(), slowStatementReport)
+
+	require.NoError(t, lock.Close(ctx))
+	locked = false
+	queued.Wait()
 }
 
 // lockedBuffer is an io.Writer safe for concurrent use, for capturing logs.
