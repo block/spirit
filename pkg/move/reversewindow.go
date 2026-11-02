@@ -760,7 +760,16 @@ func (w *reverseWindow) retireTargets(ctx context.Context, locks []*dbconn.Table
 	var wg sync.WaitGroup
 	for i := range locks {
 		wg.Go(func() {
+			started := time.Now()
 			errs[i] = w.retireTarget(ctx, i, locks[i], stmt)
+			// The retire step lasts as long as the slowest target.
+			attrs := []any{"target", i, "addr", r.targets[i].Config.Addr, "database", r.targets[i].Config.DBName,
+				"duration", time.Since(started)}
+			if errs[i] != nil {
+				r.logger.Warn("reverse cutover: failed to retire a former target", append(attrs, "error", errs[i].Error())...)
+				return
+			}
+			r.logger.Warn("reverse cutover: retired a former target", attrs...)
 		})
 	}
 	wg.Wait()

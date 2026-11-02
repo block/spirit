@@ -304,7 +304,7 @@ func TestRetryAutoIncrementCarry(t *testing.T) {
 
 // TestMoveReverseCutoverRetiresEveryTable: a reverse cutover of a move with
 // more than one table drops every stale _revert table on the target, then
-// retires every table there in one rename.
+// retires every table there in one rename, and logs how long the target took.
 func TestMoveReverseCutoverRetiresEveryTable(t *testing.T) {
 	shortenReverseWindowPolling(t)
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwmt_src", "rwmt_dst")
@@ -317,6 +317,8 @@ func TestMoveReverseCutoverRetiresEveryTable(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	logs := &lockedBuffer{}
+	runner.SetLogger(slog.New(slog.NewTextHandler(logs, nil)))
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { return nil })
 	h := startRun(t, runner)
@@ -335,6 +337,9 @@ func TestMoveReverseCutoverRetiresEveryTable(t *testing.T) {
 		require.False(t, tableExists(t, ctl, "rwmt_dst", name), "target %s should be gone after retire", name)
 		require.False(t, columnExists(t, ctl, "rwmt_dst", name+"_revert", "stale"), "the stale %s_revert should have been dropped", name)
 	}
+	out := logs.String()
+	require.Contains(t, out, `msg="reverse cutover: retired a former target" target=0`)
+	require.Contains(t, out, "database=rwmt_dst duration=")
 }
 
 // columnExists reports whether schema.table has a column named column.
