@@ -89,6 +89,15 @@ type Move struct {
 	Targets []applier.Target `kong:"-"`
 }
 
+// cutoverLockTimeout returns CutoverLockTimeout, or DefaultCutoverLockTimeout
+// when it is zero or m is nil.
+func (m *Move) cutoverLockTimeout() time.Duration {
+	if m == nil || m.CutoverLockTimeout <= 0 {
+		return DefaultCutoverLockTimeout
+	}
+	return m.CutoverLockTimeout
+}
+
 // Validate is called by Kong after parsing to check for invalid flag values.
 // Zero values mean "use the default" (NewRunner fills them in), so they are not
 // rejected here; only explicitly-negative or otherwise invalid values are
