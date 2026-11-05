@@ -77,9 +77,14 @@ type Plan struct {
 	// change package's default. The thread bounds stay zero: callers size
 	// fixed pools from the flags, as they do for a disengaged plan.
 	SmallInstance bool
-	// ReadStart and MaxReadThreads bound the read side: the copier's read
-	// workers and the checksum's workers.
+	// ReadStart and MaxReadThreads bound the checksum's workers. Engage sets
+	// flags.Threads to ReadStart.
 	ReadStart, MaxReadThreads int
+	// CopyReadStart and MaxCopyReadThreads bound the copier's read workers.
+	// They differ from ReadStart and MaxReadThreads only when several targets
+	// share one server (see Derive). With one shard per server they are equal,
+	// which is why migrate and sync use one count for both.
+	CopyReadStart, MaxCopyReadThreads int
 	// WriteStart and MaxWriteThreads bound each target's apply workers.
 	WriteStart, MaxWriteThreads int
 	// FlushConcurrency and FlushBatchSize shape each change feed's drain. They
@@ -98,7 +103,7 @@ func (p Plan) Copier() copier.AutoscaleConfig {
 		Enabled:        true,
 		StartThreads:   p.WriteStart,
 		MaxThreads:     p.MaxWriteThreads,
-		MaxReadThreads: p.MaxReadThreads,
+		MaxReadThreads: p.MaxCopyReadThreads,
 	}
 }
 
@@ -124,9 +129,16 @@ type Topology struct {
 // the degenerate case of the same rules (one server, one shard, one source),
 // so migrate, move and sync derive identical numbers for identical servers.
 //
-//   - Read side: autoscale.ReadBounds, divided by the shards on one server (a
-//     checksum reads every target for each chunk, so schemas on one server
-//     share its read budget) and capped by the client ceiling.
+//   - Checksum reads: autoscale.ReadBounds, divided by the shards on one
+//     server (a checksum reads every target for each chunk, so schemas on one
+//     server share its read budget) and capped by the client ceiling.
+//   - Copy reads: autoscale.ReadBounds capped by the client ceiling, and not
+//     divided by shards. The copier's readers read the sources only, so the
+//     checksum's reason for dividing does not apply to them. What reaches a
+//     target is bounded by its write workers, not by how many readers feed
+//     them. Dividing anyway pinned a move of 4 shards per 8-vCPU host to one
+//     reader with a ceiling of one, so the read controller could never grow
+//     it. With one shard per server the two read bounds are equal.
 //   - Write side: autoscale.WriteStart, divided the same way, with the ceiling
 //     from throttler.ResolveMaxWriteThreads. Both are capped by the client
 //     ceiling split across targets, since each target runs its own workers.
@@ -157,9 +169,11 @@ func Derive(t Topology, clientCeiling int, redoAware, commitLatencyEnabled bool)
 	sources := max(1, t.Sources)
 	clientCeiling = max(1, clientCeiling)
 
-	readStart, readMax := autoscale.ReadBounds(smallest)
-	readMax = min(max(1, readMax/shards), clientCeiling)
-	readStart = min(max(1, readStart/shards), readMax)
+	instanceReadStart, instanceReadMax := autoscale.ReadBounds(smallest)
+	readMax := min(max(1, instanceReadMax/shards), clientCeiling)
+	readStart := min(max(1, instanceReadStart/shards), readMax)
+	copyReadMax := min(instanceReadMax, clientCeiling)
+	copyReadStart := min(instanceReadStart, copyReadMax)
 
 	writeBudget := max(1, clientCeiling/targets)
 	writeStart := min(max(1, autoscale.WriteStart(smallest)/shards), writeBudget)
@@ -172,6 +186,7 @@ func Derive(t Topology, clientCeiling int, redoAware, commitLatencyEnabled bool)
 	return Plan{
 		Engaged:   true,
 		ReadStart: readStart, MaxReadThreads: readMax,
+		CopyReadStart: copyReadStart, MaxCopyReadThreads: copyReadMax,
 		WriteStart: writeStart, MaxWriteThreads: writeMax,
 		FlushConcurrency: width, FlushBatchSize: autoscale.FlushBatchSize(width),
 	}, true
@@ -302,11 +317,12 @@ func engage(ctx context.Context, f *flags.Common, req Request, clientCeiling int
 	// derive a count it has no cores to run. Nothing on the target side can see
 	// that excess (its CPU and commit latency both read idle while spirit is
 	// the one saturated), so say so.
-	if uncapped, _ := Derive(topology, math.MaxInt, redoAware, commitLatencyEnabled); uncapped.ReadStart != plan.ReadStart || uncapped.WriteStart != plan.WriteStart {
+	if uncapped, _ := Derive(topology, math.MaxInt, redoAware, commitLatencyEnabled); uncapped.ReadStart != plan.ReadStart || uncapped.CopyReadStart != plan.CopyReadStart || uncapped.WriteStart != plan.WriteStart {
 		logger.Warn("thread counts capped by this host's CPU count: the target would justify more workers than spirit has cores to run them on. Give spirit more CPU to use the target's full capacity",
 			"gomaxprocs", runtime.GOMAXPROCS(0),
 			"client_ceiling", clientCeiling,
 			"read_threads", plan.ReadStart, "instance_read_threads", uncapped.ReadStart,
+			"copy_read_threads", plan.CopyReadStart, "instance_copy_read_threads", uncapped.CopyReadStart,
 			"write_threads", plan.WriteStart, "instance_write_threads", uncapped.WriteStart)
 	}
 
@@ -331,6 +347,7 @@ func engage(ctx context.Context, f *flags.Common, req Request, clientCeiling int
 	logger.Info("autoscaling engaged: thread counts are derived from the targets; --threads and --write-threads are ignored",
 		"vcpus", topology.VCPUs, "targets", topology.Targets,
 		"read_threads", plan.ReadStart, "max_read_threads", plan.MaxReadThreads,
+		"copy_read_threads", plan.CopyReadStart, "max_copy_read_threads", plan.MaxCopyReadThreads,
 		"write_threads_per_target", plan.WriteStart, "max_write_threads_per_target", plan.MaxWriteThreads,
 		"flush_concurrency", plan.FlushConcurrency, "flush_batch_size", plan.FlushBatchSize)
 	return plan, nil
