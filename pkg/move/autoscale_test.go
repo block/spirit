@@ -10,6 +10,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/autoscale"
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/host"
@@ -30,6 +31,7 @@ func TestMoveAutoscaleNonAurora(t *testing.T) {
 	require.NoError(t, r.setupThrottling(t.Context()))
 	require.False(t, r.autoscale.Enabled)
 	require.Equal(t, 3, r.move.Threads)
+	require.Equal(t, 3, r.copyThreads)
 	require.Equal(t, 5, r.move.WriteThreads)
 	require.Empty(t, r.monitorDBs)
 	require.False(t, r.throttler.Get().IsThrottled())
@@ -59,11 +61,13 @@ func TestMoveAutoscaleFitsFixedPool(t *testing.T) {
 		r, err := NewRunner(&Move{Common: flags.Common{Threads: 2, MaxConnections: 16, WriteThreads: 20}})
 		require.NoError(t, err)
 		// Simulate counts resolved by the Aurora probe after flag validation.
-		r.move.Threads = start
+		r.move.Threads, r.copyThreads = start, start
 		r.autoscale.Enabled = true
-		r.autoscale.MaxReadThreads = 32
+		r.maxChecksumThreads, r.autoscale.MaxReadThreads = 32, 32
 		require.NoError(t, r.fitReadThreadsToPools())
 		require.Equal(t, min(start, 10), r.move.Threads)
+		require.Equal(t, 10, r.maxChecksumThreads)
+		require.Equal(t, min(start, 10), r.copyThreads)
 		require.Equal(t, 10, r.autoscale.MaxReadThreads)
 		require.Equal(t, 16, r.move.MaxConnections)
 		require.Equal(t, 20, r.move.WriteThreads)
@@ -212,6 +216,41 @@ func TestMoveSetupThrottling(t *testing.T) {
 	require.Greater(t, r.autoscale.MaxThreads, r.autoscale.StartThreads)
 }
 
+// Shards that share a target server share its checksum read budget, because a
+// checksum worker reads every target. A copy reader reads only the sources, so
+// its bounds are not divided: four shards on one 8-vCPU server once pinned the
+// whole copy to one reader that the read controller could not grow.
+func TestMoveCopyReadsNotDividedByShards(t *testing.T) {
+	config, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	r, err := NewRunner(&Move{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, r.Close()) })
+	group := host.Group{}
+	for _, keyRange := range []string{"-40", "40-80", "80-c0", "c0-"} {
+		group.Indices = append(group.Indices, len(r.targets))
+		r.targets = append(r.targets, applier.Target{Config: config, KeyRange: keyRange})
+	}
+	r.auroraVCPUs = func(context.Context, *sql.DB) (int, error) { return 8, nil }
+	results := []throttler.AuroraResult{{Throttlers: []throttler.Throttler{&closeCountingThrottler{}}}}
+	require.NoError(t, r.applyAuroraResults(t.Context(), []host.Group{group}, results))
+
+	require.True(t, r.autoscale.Enabled)
+	readStart, readCeiling := autoscale.ReadBounds(8)
+	require.Equal(t, max(1, readStart/4), r.move.Threads)
+	require.Equal(t, max(1, readCeiling/4), r.maxChecksumThreads)
+	require.Equal(t, readStart, r.copyThreads)
+	require.Equal(t, readCeiling, r.autoscale.MaxReadThreads)
+	require.Greater(t, r.autoscale.MaxReadThreads, r.copyThreads, "the copy's read controller has room to grow")
+
+	// Both copier constructions (a fresh copy and a resume) and the checksum
+	// take these bounds from the configs built here.
+	copierConfig := r.copierConfig()
+	require.Equal(t, r.copyThreads, copierConfig.Concurrency)
+	require.Equal(t, r.autoscale, copierConfig.Autoscale)
+	require.Equal(t, checksum.AutoscaleConfig{Enabled: true, MaxThreads: r.maxChecksumThreads}, r.checksumAutoscale())
+}
+
 // A target below autoscale.MinVCPUs (2 vCPUs, too small to autoscale)
 // runs the whole move at one reader, one writer and one flush, with small copy
 // chunks, even when the other target is not Aurora.
@@ -230,6 +269,7 @@ func TestMoveSmallInstance(t *testing.T) {
 	require.NoError(t, r.setupThrottling(t.Context()))
 	require.False(t, r.autoscale.Enabled)
 	require.Equal(t, 1, r.move.Threads)
+	require.Equal(t, 1, r.copyThreads)
 	require.Equal(t, 1, r.move.WriteThreads)
 	require.Equal(t, uint64(autoscale.SmallInstanceTargetChunkBytes), r.move.TargetChunkSize)
 	feed := r.replClientConfig(&r.sources[0])

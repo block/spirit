@@ -35,12 +35,17 @@ func TestDeriveMultiTarget(t *testing.T) {
 	require.Equal(t, heterogeneous.WriteStart/2, colocated.WriteStart)
 	require.Equal(t, heterogeneous.MaxWriteThreads/2, colocated.MaxWriteThreads)
 	require.Equal(t, heterogeneous.MaxReadThreads/2, colocated.MaxReadThreads)
+	// Copy readers read only the sources, so they do not share it.
+	require.Equal(t, heterogeneous.CopyReadStart, colocated.CopyReadStart)
+	require.Equal(t, heterogeneous.MaxCopyReadThreads, colocated.MaxCopyReadThreads)
 
 	// The client ceiling caps reads, and is split across targets for writes.
 	capped, _ := Derive(separate(128, 128), 8, true, true)
 	require.LessOrEqual(t, capped.MaxWriteThreads*2, 8)
 	require.LessOrEqual(t, capped.MaxReadThreads, 8)
 	require.LessOrEqual(t, capped.ReadStart, capped.MaxReadThreads)
+	require.LessOrEqual(t, capped.MaxCopyReadThreads, 8)
+	require.LessOrEqual(t, capped.CopyReadStart, capped.MaxCopyReadThreads)
 
 	for _, sizes := range [][]int{nil, {64, 0}, {2, 64}} {
 		_, ok := Derive(separate(sizes...), 128, true, true)
@@ -80,6 +85,8 @@ func TestDeriveSingleTargetMatchesInstanceBounds(t *testing.T) {
 			writeStart := min(autoscale.WriteStart(vcpus), clientCeiling)
 			require.Equal(t, readStart, plan.ReadStart, "vcpus=%d", vcpus)
 			require.Equal(t, max(min(readCeiling, clientCeiling), readStart), plan.MaxReadThreads, "vcpus=%d", vcpus)
+			require.Equal(t, plan.ReadStart, plan.CopyReadStart, "vcpus=%d", vcpus)
+			require.Equal(t, plan.MaxReadThreads, plan.MaxCopyReadThreads, "vcpus=%d", vcpus)
 			require.Equal(t, writeStart, plan.WriteStart, "vcpus=%d", vcpus)
 			maxWrite := throttler.ResolveMaxWriteThreads(writeStart, true, false, true)
 			if maxWrite > clientCeiling {
@@ -94,6 +101,25 @@ func TestDeriveSingleTargetMatchesInstanceBounds(t *testing.T) {
 			}
 		}
 	}
+}
+
+// Co-located shards divide the checksum's read bounds but not the copy's.
+// 32 servers of 8 vCPUs with 4 shards each once derived one copy reader with a
+// ceiling of one, so the read controller could never add a second.
+func TestDeriveCopyReadsIgnoreShards(t *testing.T) {
+	topology := Topology{VCPUs: make([]int, 32), ShardsPerHost: 4, Targets: 128}
+	for i := range topology.VCPUs {
+		topology.VCPUs[i] = 8
+	}
+	plan, ok := Derive(topology, 160, false, true)
+	require.True(t, ok)
+	readStart, readCeiling := autoscale.ReadBounds(8)
+	require.Equal(t, 1, plan.ReadStart)
+	require.Equal(t, 1, plan.MaxReadThreads)
+	require.Equal(t, readStart, plan.CopyReadStart)
+	require.Equal(t, readCeiling, plan.MaxCopyReadThreads)
+	require.Greater(t, plan.MaxCopyReadThreads, plan.CopyReadStart, "the read controller has room to grow")
+	require.Equal(t, plan.MaxCopyReadThreads, plan.Copier().MaxReadThreads)
 }
 
 // Growth above the start needs the commit-latency backstop when a target runs
@@ -162,13 +188,13 @@ func TestDeriveFlush(t *testing.T) {
 }
 
 func TestPlanCopier(t *testing.T) {
-	plan := Plan{Engaged: true, ReadStart: 4, MaxReadThreads: 8, WriteStart: 14, MaxWriteThreads: 28}
+	plan := Plan{Engaged: true, ReadStart: 4, MaxReadThreads: 8, CopyReadStart: 6, MaxCopyReadThreads: 12, WriteStart: 14, MaxWriteThreads: 28}
 	require.Zero(t, Plan{}.Copier(), "a disengaged plan disables the copier's controllers")
 	copierConfig := plan.Copier()
 	require.True(t, copierConfig.Enabled)
 	require.Equal(t, 14, copierConfig.StartThreads)
 	require.Equal(t, 28, copierConfig.MaxThreads)
-	require.Equal(t, 8, copierConfig.MaxReadThreads)
+	require.Equal(t, 12, copierConfig.MaxReadThreads, "the copy's read ceiling, not the checksum's")
 }
 
 type loadSignal struct{ throttler.Noop }

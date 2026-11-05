@@ -44,11 +44,12 @@ func TestMoveSharedHandleBudget(t *testing.T) {
 	require.NoError(t, r.fitReadThreadsToPools())
 	require.Equal(t, 4, r.move.Threads, "a target handle reused three times counts once")
 
-	r.move.Threads = 8
+	r.move.Threads, r.copyThreads = 8, 8
 	r.sources = []sourceInfo{{db: db}}
 	// Each worker now holds two connections on db: 10/2 leaves room for five.
 	require.NoError(t, r.fitReadThreadsToPools())
 	require.Equal(t, 5, r.move.Threads, "a handle shared by a source and a target counts twice")
+	require.Equal(t, 8, r.copyThreads, "a copy reader reads only the source, so it holds one")
 }
 
 func TestMoveTableStatisticsReserve(t *testing.T) {
