@@ -145,7 +145,7 @@ func sourcePrivileges(ctx context.Context, runtime Runtime, db querier, schemaNa
 	// cutover, not preflight.
 	if err := forceKillProbe(ctx); err != nil {
 		if errors.Is(err, dbconn.ErrForceKillPrivilegeMissing) {
-			return fmt.Errorf("insufficient privileges to run a %s with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER or EXECUTE on mysql.rds_kill, PROCESS, and SELECT on performance_schema.*: %w", runtime.noun(), err)
+			return refuse(fmt.Errorf("insufficient privileges to run a %s with force-kill enabled. Needed: CONNECTION_ADMIN/SUPER or EXECUTE on mysql.rds_kill, PROCESS, and SELECT on performance_schema.*: %w", runtime.noun(), err))
 		}
 		return fmt.Errorf("could not check the privileges force-kill needs: %w", err)
 	}
@@ -157,7 +157,7 @@ func sourcePrivileges(ctx context.Context, runtime Runtime, db querier, schemaNa
 		if note := utils.ShadowingGrantsNote(grants, schemaName); note != "" && !foundDBAll && schemaName != "" {
 			err = fmt.Errorf("%w (%s)", err, note)
 		}
-		return err
+		return refuse(err)
 	}
 	return schemaObjectVisibilityFromGrants(grants, schemaName, visibilityKinds...)
 }
