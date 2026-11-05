@@ -2345,9 +2345,12 @@ func (r *Runner) flushAllReplClients(ctx context.Context) error {
 // copier re-copies that range from the current source snapshot before the
 // checksum and cutover, and binlog replay converges concurrent changes.
 //
-// The range is about as many rows as the copy wrote since the last
-// checkpoint, on every target, and the resume waits for it with no status
-// reports and no change feed running. Like restoreSecondaryIndexes, the
+// For a table with a watermark, the range is usually about as many rows as
+// the copy wrote since the last checkpoint. A table that was not ready when
+// the checkpoint was written is emptied on every target, and with several
+// sources a DELETE can also remove other sources' rows (see below). The
+// resume waits for all of it with no status reports and no change feed
+// running. Like restoreSecondaryIndexes, the
 // target servers are deleted from at the same time, and the targets that
 // share a server one after another.
 func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) error {
