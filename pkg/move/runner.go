@@ -524,14 +524,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
-	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
-		Concurrency: r.copyThreads,
-		Logger:      r.logger,
-		Throttler:   r.throttler.Get(),
-		Autoscale:   r.autoscale,
-		MetricsSink: r.metricsSink,
-		Applier:     r.applier, // Use the shared applier
-	})
+	r.copier, err = copier.NewCopier(r.copyChunker, r.copierConfig())
 	if err != nil {
 		return err
 	}
@@ -886,6 +879,27 @@ func (r *Runner) fitReadThreadsToPools() error {
 	return nil
 }
 
+// copierConfig is the configuration both copier constructions use (a fresh
+// copy and a resume), so the copy's read bounds reach them the same way.
+// Extracted so that wiring can be asserted without running a copy.
+func (r *Runner) copierConfig() *copier.CopierConfig {
+	return &copier.CopierConfig{
+		Concurrency: r.copyThreads,
+		Logger:      r.logger,
+		Throttler:   r.throttler.Get(),
+		Autoscale:   r.autoscale,
+		MetricsSink: r.metricsSink,
+		Applier:     r.applier, // Use the shared applier
+	}
+}
+
+// checksumAutoscale is the checksum's scaling config. Its ceiling is the
+// checksum's own, not the copy's (autoscale.MaxReadThreads), because shards
+// sharing a server divide only the checksum's read bounds.
+func (r *Runner) checksumAutoscale() checksum.AutoscaleConfig {
+	return checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.maxChecksumThreads}
+}
+
 // resumeDecision is decideResume's verdict on a target that failed the
 // new-copy (post-setup) checks.
 type resumeDecision int
@@ -1194,14 +1208,7 @@ func (r *Runner) newCopy(ctx context.Context) error {
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
 	var err error
-	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
-		Concurrency: r.copyThreads,
-		Logger:      r.logger,
-		Throttler:   r.throttler.Get(),
-		Autoscale:   r.autoscale,
-		MetricsSink: r.metricsSink,
-		Applier:     r.applier, // Use the shared applier
-	})
+	r.copier, err = copier.NewCopier(r.copyChunker, r.copierConfig())
 	if err != nil {
 		return err
 	}
@@ -2014,7 +2021,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 		Logger:      r.logger,
 		Applier:     r.applier,
 		Throttler:   r.throttler.Get(),
-		Autoscale:   checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.maxChecksumThreads},
+		Autoscale:   r.checksumAutoscale(),
 		MetricsSink: r.metricsSink,
 	})
 	if err != nil {

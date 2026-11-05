@@ -10,6 +10,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/autoscale"
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/host"
@@ -241,6 +242,13 @@ func TestMoveCopyReadsNotDividedByShards(t *testing.T) {
 	require.Equal(t, readStart, r.copyThreads)
 	require.Equal(t, readCeiling, r.autoscale.MaxReadThreads)
 	require.Greater(t, r.autoscale.MaxReadThreads, r.copyThreads, "the copy's read controller has room to grow")
+
+	// Both copier constructions (a fresh copy and a resume) and the checksum
+	// take these bounds from the configs built here.
+	copierConfig := r.copierConfig()
+	require.Equal(t, r.copyThreads, copierConfig.Concurrency)
+	require.Equal(t, r.autoscale, copierConfig.Autoscale)
+	require.Equal(t, checksum.AutoscaleConfig{Enabled: true, MaxThreads: r.maxChecksumThreads}, r.checksumAutoscale())
 }
 
 // A target below autoscale.MinVCPUs (2 vCPUs, too small to autoscale)
