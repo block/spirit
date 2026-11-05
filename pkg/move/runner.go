@@ -117,6 +117,13 @@ type Runner struct {
 	throttler  runtime.SharedThrottler
 	monitorDBs []*sql.DB
 	autoscale  copier.AutoscaleConfig
+	// copyThreads is the copier's starting read-worker count, and
+	// maxChecksumThreads the checksum's read ceiling. move.Threads is the
+	// checksum's starting count. Under autoscaling the copier's bounds
+	// (copyThreads, autoscale.MaxReadThreads) are not divided by the shards
+	// sharing a target server, and the checksum's are; see
+	// concurrency.Plan.CopyReadStart. Otherwise both sides use move.Threads.
+	copyThreads, maxChecksumThreads int
 	// flushConcurrency and flushBatchSize shape each forward feed's drain.
 	// Zero leaves the change package's defaults; autoscaling derives them
 	// from the targets (moveFlushBounds).
@@ -517,14 +524,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	}
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
-	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
-		Concurrency: r.move.Threads,
-		Logger:      r.logger,
-		Throttler:   r.throttler.Get(),
-		Autoscale:   r.autoscale,
-		MetricsSink: r.metricsSink,
-		Applier:     r.applier, // Use the shared applier
-	})
+	r.copier, err = copier.NewCopier(r.copyChunker, r.copierConfig())
 	if err != nil {
 		return err
 	}
@@ -799,11 +799,20 @@ func (r *Runner) setupAutoscaling(ctx context.Context, groups []host.Group, resu
 		VCPUs:   r.auroraVCPUs,
 		Logger:  r.logger,
 	})
-	if err != nil || (!plan.Engaged && !plan.SmallInstance) {
+	if err != nil {
 		return err
+	}
+	// Small-instance mode sets the thread counts in the flags, so the copier
+	// takes its start from them like a disengaged plan does.
+	r.copyThreads, r.maxChecksumThreads = r.move.Threads, r.move.Threads
+	if !plan.Engaged && !plan.SmallInstance {
+		return nil
 	}
 	// Small-instance mode sets only the flush shape: plan.Copier() is zero.
 	r.autoscale = plan.Copier()
+	if plan.Engaged {
+		r.copyThreads, r.maxChecksumThreads = plan.CopyReadStart, plan.MaxReadThreads
+	}
 	r.flushConcurrency, r.flushBatchSize = plan.FlushConcurrency, plan.FlushBatchSize
 	return nil
 }
@@ -840,7 +849,7 @@ func (r *Runner) fitReadThreadsToPools() error {
 	// changing the fixed pool budget inherited from --max-connections.
 	ceiling := r.move.Threads
 	if r.autoscale.Enabled {
-		ceiling = max(r.move.Threads, r.autoscale.MaxReadThreads)
+		ceiling = max(r.move.Threads, r.maxChecksumThreads)
 	}
 	// Preserve at least one reader, matching migration; advisory control-plane
 	// queries may queue when the requested budget cannot cover all headroom.
@@ -849,10 +858,46 @@ func (r *Runner) fitReadThreadsToPools() error {
 		r.logger.Info("fitting read threads to the connection pool", "threads", start, "max_connections", r.move.MaxConnections, "reserved", reserve)
 	}
 	if r.autoscale.Enabled {
-		r.autoscale.MaxReadThreads = ceiling
+		r.maxChecksumThreads = ceiling
 	}
 	r.move.Threads = start
+
+	// A copy reader holds one connection, on its chunk's source pool: unlike a
+	// checksum worker it never reads a target.
+	copyCeiling := r.copyThreads
+	if r.autoscale.Enabled {
+		copyCeiling = max(r.copyThreads, r.autoscale.MaxReadThreads)
+	}
+	copyStart, copyCeiling := dbconn.ReadBoundsForPool(r.copyThreads, copyCeiling, r.move.MaxConnections, reserve, 1)
+	if copyStart != r.copyThreads {
+		r.logger.Info("fitting copy read threads to the connection pool", "threads", copyStart, "max_connections", r.move.MaxConnections, "reserved", reserve)
+	}
+	if r.autoscale.Enabled {
+		r.autoscale.MaxReadThreads = copyCeiling
+	}
+	r.copyThreads = copyStart
 	return nil
+}
+
+// copierConfig is the configuration both copier constructions use (a fresh
+// copy and a resume), so the copy's read bounds reach them the same way.
+// Extracted so that wiring can be asserted without running a copy.
+func (r *Runner) copierConfig() *copier.CopierConfig {
+	return &copier.CopierConfig{
+		Concurrency: r.copyThreads,
+		Logger:      r.logger,
+		Throttler:   r.throttler.Get(),
+		Autoscale:   r.autoscale,
+		MetricsSink: r.metricsSink,
+		Applier:     r.applier, // Use the shared applier
+	}
+}
+
+// checksumAutoscale is the checksum's scaling config. Its ceiling is the
+// checksum's own, not the copy's (autoscale.MaxReadThreads), because shards
+// sharing a server divide only the checksum's read bounds.
+func (r *Runner) checksumAutoscale() checksum.AutoscaleConfig {
+	return checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.maxChecksumThreads}
 }
 
 // resumeDecision is decideResume's verdict on a target that failed the
@@ -1163,14 +1208,7 @@ func (r *Runner) newCopy(ctx context.Context) error {
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
 	var err error
-	r.copier, err = copier.NewCopier(r.copyChunker, &copier.CopierConfig{
-		Concurrency: r.move.Threads,
-		Logger:      r.logger,
-		Throttler:   r.throttler.Get(),
-		Autoscale:   r.autoscale,
-		MetricsSink: r.metricsSink,
-		Applier:     r.applier, // Use the shared applier
-	})
+	r.copier, err = copier.NewCopier(r.copyChunker, r.copierConfig())
 	if err != nil {
 		return err
 	}
@@ -1983,7 +2021,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 		Logger:      r.logger,
 		Applier:     r.applier,
 		Throttler:   r.throttler.Get(),
-		Autoscale:   checksum.AutoscaleConfig{Enabled: r.autoscale.Enabled, MaxThreads: r.autoscale.MaxReadThreads},
+		Autoscale:   r.checksumAutoscale(),
 		MetricsSink: r.metricsSink,
 	})
 	if err != nil {

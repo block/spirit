@@ -124,6 +124,10 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 func TestSlowStatementReportKeepsTheLockSessionFirst(t *testing.T) {
 	threshold, limit := slowLockedStatementThreshold, metadataLockReportLimit
 	slowLockedStatementThreshold = 100 * time.Millisecond
+	// The report reads every metadata lock on the server, and other packages'
+	// tests share it, so the default limit can truncate the first report
+	// (#1483). The truncated case below sets its own limit.
+	metadataLockReportLimit = 1_000_000
 	t.Cleanup(func() { slowLockedStatementThreshold, metadataLockReportLimit = threshold, limit })
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
