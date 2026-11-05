@@ -1534,6 +1534,79 @@ func TestDeleteRecopyRangeRemovesRowsDeletedOnSource(t *testing.T) {
 	require.Equal(t, srcRows, dstRows, "target must equal source after delete+recopy")
 }
 
+// TestDeleteRecopyRangeDeletesFromServersConcurrently: a resume deletes the
+// recopy range from every target server at the same time, so a slow server
+// does not hold up the others. Target 0's table is locked, which blocks its
+// DELETE; target 1, on another server, must still be pruned while it waits.
+// Both targets live on the test MySQL, so their configs name two servers.
+func TestDeleteRecopyRangeDeletesFromServersConcurrently(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	srcDB, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, srcDB, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, val VARCHAR(64))")
+	srcConn, err := dbconn.New(testutils.DSNForDatabase(srcDB), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(srcConn)
+	srcCfg, err := mysql.ParseDSN(testutils.DSNForDatabase(srcDB))
+	require.NoError(t, err)
+	t1 := table.NewTableInfo(srcConn, srcDB, "t1")
+	t1.Host = srcCfg.Addr // matches what Runner.getTables sets
+	require.NoError(t, t1.SetInfo(ctx))
+
+	var targets []applier.Target
+	for i, server := range []string{"server-a:3306", "server-b:3306"} {
+		dbName, _ := testutils.CreateUniqueTestDatabase(t)
+		testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, val VARCHAR(64))")
+		testutils.RunSQLInDatabase(t, dbName, "INSERT INTO t1 (id, val) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+		conn, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(conn)
+		cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(dbName))
+		require.NoError(t, err)
+		cfg.Addr = server
+		targets = append(targets, applier.Target{KeyRange: strconv.Itoa(i), DB: conn, Config: cfg})
+	}
+
+	r, err := NewRunner(&Move{})
+	require.NoError(t, err)
+	r.sources = []sourceInfo{{db: srcConn, config: srcCfg, dsn: testutils.DSNForDatabase(srcDB), tables: []*table.TableInfo{t1}}}
+	r.sourceTables = []*table.TableInfo{t1}
+	r.targets = targets
+	require.Len(t, r.targetHosts(), 2)
+
+	holder, err := targets[0].DB.Conn(ctx)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(holder)
+	_, err = holder.ExecContext(ctx, "LOCK TABLES t1 WRITE")
+	require.NoError(t, err)
+
+	watermark := `{"Key":["id"],"ChunkSize":1000,"LowerBound":{"Value":["3"],"Inclusive":true},"UpperBound":{"Value":["5"],"Inclusive":false}}`
+	done := make(chan error, 1)
+	go func() { done <- r.deleteRecopyRange(ctx, watermark) }()
+
+	countRows := func(db *sql.DB) (int, error) {
+		var count int
+		err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM t1").Scan(&count)
+		return count, err
+	}
+	require.Eventually(t, func() bool {
+		count, err := countRows(targets[1].DB)
+		return err == nil && count == 2
+	}, 10*time.Second, 10*time.Millisecond, "target 1 must be pruned while target 0's DELETE waits for its lock")
+	select {
+	case err := <-done:
+		t.Fatalf("deleteRecopyRange returned while target 0 was locked: %v", err)
+	default:
+	}
+
+	_, err = holder.ExecContext(ctx, "UNLOCK TABLES")
+	require.NoError(t, err)
+	require.NoError(t, <-done)
+	count, err := countRows(targets[0].DB)
+	require.NoError(t, err)
+	require.Equal(t, 2, count, "only rows below the resume position (ids 1..2) may remain")
+}
+
 func varcharPKWriteOne(ctx context.Context, db *sql.DB, srcDB string) error {
 	id := uuid.New().String()
 

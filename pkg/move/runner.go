@@ -2344,6 +2344,12 @@ func (r *Runner) flushAllReplClients(ctx context.Context) error {
 // Deleting already-copied rows inside the watermark chunk is safe — the
 // copier re-copies that range from the current source snapshot before the
 // checksum and cutover, and binlog replay converges concurrent changes.
+//
+// The range is about as many rows as the copy wrote since the last
+// checkpoint, on every target, and the resume waits for it with no status
+// reports and no change feed running. Like restoreSecondaryIndexes, the
+// target servers are deleted from at the same time, and the targets that
+// share a server one after another.
 func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) error {
 	// The checkpoint watermark format depends on how many chunkers the copy
 	// chunker wraps: a single (source, table) pair stores that chunker's own
@@ -2359,6 +2365,12 @@ func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) 
 	if err != nil {
 		return fmt.Errorf("failed to parse copier watermark: %w", err)
 	}
+	type recopyDelete struct {
+		table     *table.TableInfo
+		watermark string
+		stmt      string
+	}
+	deletes := make([]recopyDelete, 0, len(allTables))
 	for _, src := range allTables {
 		// A table without a watermark entry was not ready when the
 		// checkpoint was written. On resume the chunker restarts it from
@@ -2384,24 +2396,48 @@ func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) 
 		// when there is more than one source. Deleting too little would
 		// leave phantom rows, which is the race this function exists to
 		// prevent.
-		for i, target := range r.targets {
-			deleteStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-				src.QuotedTableName, recopyClause)
-			result, err := target.DB.ExecContext(ctx, deleteStmt)
-			if err != nil {
-				return fmt.Errorf("failed to delete the recopy range on target %d table %s: %w", i, src.TableName, err)
-			}
-			rowsDeleted, _ := result.RowsAffected()
-			if rowsDeleted > 0 {
-				r.logger.Info("deleted rows at/above the copier resume position from target",
-					"target", i,
-					"table", src.TableName,
-					"rowsDeleted", rowsDeleted,
-					"watermark", watermark,
-				)
-			}
-		}
+		deletes = append(deletes, recopyDelete{
+			table:     src,
+			watermark: watermark,
+			stmt:      fmt.Sprintf("DELETE FROM %s WHERE %s", src.QuotedTableName, recopyClause),
+		})
 	}
+
+	hosts := r.targetHosts()
+	r.logger.Info("deleting rows at/above the copier resume position from every target",
+		"tables", len(deletes),
+		"targets", len(r.targets),
+		"hosts", len(hosts),
+	)
+	started := time.Now()
+	g, gctx := errgroup.WithContext(ctx)
+	for _, group := range hosts {
+		g.Go(func() error {
+			for _, i := range group.Indices {
+				for _, d := range deletes {
+					result, err := r.targets[i].DB.ExecContext(gctx, d.stmt)
+					if err != nil {
+						return fmt.Errorf("failed to delete the recopy range on target %d table %s: %w", i, d.table.TableName, err)
+					}
+					rowsDeleted, _ := result.RowsAffected()
+					if rowsDeleted > 0 {
+						r.logger.Info("deleted rows at/above the copier resume position from target",
+							"target", i,
+							"table", d.table.TableName,
+							"rowsDeleted", rowsDeleted,
+							"watermark", d.watermark,
+						)
+					}
+				}
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	r.logger.Info("deleted rows at/above the copier resume position from every target",
+		"duration", time.Since(started))
 	return nil
 }
 
