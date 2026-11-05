@@ -24,6 +24,10 @@ type recopyDeleteTargets struct {
 	delay time.Duration // how long each statement takes
 	fail  int           // the target whose statements fail, or -1
 	block int           // the target whose statements wait for cancel, or -1
+	// blocked is closed once the block target's statement is running. The
+	// fail target waits for it, so the failure comes while that statement
+	// runs rather than before it starts.
+	blocked chan struct{}
 
 	mu        sync.Mutex
 	runs      map[string]int // "target|statement" -> times run
@@ -37,6 +41,7 @@ func newRecopyDeleteTargets() *recopyDeleteTargets {
 	return &recopyDeleteTargets{
 		fail:      -1,
 		block:     -1,
+		blocked:   make(chan struct{}),
 		runs:      map[string]int{},
 		inflight:  map[string]int{},
 		maxServer: map[string]int{},
@@ -90,8 +95,16 @@ func (f *recopyDeleteTargets) exec(ctx context.Context, target int, server, quer
 
 	switch target {
 	case f.fail:
+		if f.block >= 0 {
+			select {
+			case <-f.blocked:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return errors.New("target unavailable")
 	case f.block:
+		close(f.blocked)
 		<-ctx.Done()
 		f.mu.Lock()
 		f.canceled = append(f.canceled, target)
