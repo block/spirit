@@ -195,16 +195,18 @@ func TestDeleteRecopyRangeFailureCancelsOtherServers(t *testing.T) {
 func TestDeleteRecopyRangeCanceled(t *testing.T) {
 	f := newRecopyDeleteTargets()
 	f.block = 0
-	r := f.runner(t, []string{"server-a:3306", "server-b:3306"}, "t1")
+	// One target: with two, the other target's statement could also return
+	// the cancellation, and the error would name it instead.
+	r := f.runner(t, []string{"server-a:3306"}, "t1")
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- r.deleteRecopyRange(ctx, `{}`) }()
-	require.Eventually(t, func() bool {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return f.inflight["server-a:3306"] == 1
-	}, 5*time.Second, time.Millisecond)
+	select {
+	case <-f.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the DELETE on target 0 did not start")
+	}
 	cancel()
 	select {
 	case err := <-done:
