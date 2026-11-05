@@ -61,7 +61,10 @@ func TestCutOverLockTimeout(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(&logs, nil))
 		var switched int
 		cutover, srcDB, srcName := lockTimeoutCutover(t, ctx, 3, logger, func(context.Context) error { switched++; return nil })
-		cutover.SetLockTimeout(200 * time.Millisecond)
+		// The timeout also covers the flush under the locks, which waits for
+		// the change feed to catch up, through every other package's binlog
+		// events on a shared CI server: it must not expire on its own (#1486).
+		cutover.SetLockTimeout(2 * time.Second)
 		attempts := 0
 		cutover.SetPreSwitch(func(ctx context.Context) error {
 			attempts++
