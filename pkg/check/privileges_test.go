@@ -48,7 +48,7 @@ func TestPrivileges(t *testing.T) {
 	require.NoError(t, err)
 
 	err = privilegesCheck(t.Context(), r, slog.Default())
-	require.Error(t, err) // still not enough, needs replication client
+	require.ErrorIs(t, err, ErrRefused) // still not enough, needs replication client
 
 	_, err = db.ExecContext(t.Context(), "GRANT REPLICATION CLIENT, REPLICATION SLAVE, RELOAD ON *.* TO testprivsuser")
 	require.NoError(t, err)
@@ -56,19 +56,19 @@ func TestPrivileges(t *testing.T) {
 	// Basic replication privileges are not enough.
 	// We also need the force-kill privileges.
 	err = privilegesCheck(t.Context(), r, slog.Default())
-	require.Error(t, err) // still not enough, needs force-kill privileges
+	require.ErrorIs(t, err, ErrRefused) // still not enough, needs force-kill privileges
 
 	_, err = db.ExecContext(t.Context(), "GRANT SELECT on `performance_schema`.* TO testprivsuser")
 	require.NoError(t, err)
 
 	err = privilegesCheck(t.Context(), r, slog.Default())
-	require.Error(t, err) // still not enough, needs connection_admin
+	require.ErrorIs(t, err, ErrRefused) // still not enough, needs connection_admin
 
 	_, err = db.ExecContext(t.Context(), "GRANT CONNECTION_ADMIN ON *.* TO testprivsuser")
 	require.NoError(t, err)
 
 	err = privilegesCheck(t.Context(), r, slog.Default())
-	require.Error(t, err) // still not enough, needs PROCESS
+	require.ErrorIs(t, err, ErrRefused) // still not enough, needs PROCESS
 	t.Log(err)
 
 	_, err = db.ExecContext(t.Context(), "GRANT PROCESS ON *.* TO testprivsuser")
