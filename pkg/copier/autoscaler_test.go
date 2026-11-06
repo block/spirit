@@ -378,6 +378,10 @@ func TestClassifyQueue(t *testing.T) {
 		{"below full occupancy is balanced", applier.Stats{QueueDepth: 79, QueueCap: 100, QueueWaitP90: ms(50), WriteTimeP90: ms(10)}, queueBalanced},
 		{"full occupancy but wait below write is balanced", applier.Stats{QueueDepth: 90, QueueCap: 100, QueueWaitP90: ms(5), WriteTimeP90: ms(10)}, queueBalanced},
 		{"mid occupancy is balanced", applier.Stats{QueueDepth: 50, QueueCap: 100, QueueWaitP90: ms(3), WriteTimeP90: ms(5)}, queueBalanced},
+		// 128 shards of 128: one shard pegged is 1% of the summed queue.
+		{"fullest shard full is full though the sum is not", applier.Stats{QueueDepth: 128, QueueCap: 16384, FullestShardDepth: 128, FullestShardCap: 128, QueueWaitP90: ms(50), WriteTimeP90: ms(10)}, queueFull},
+		{"fullest shard half full is not starved though the sum is", applier.Stats{QueueDepth: 64, QueueCap: 16384, FullestShardDepth: 64, FullestShardCap: 128, QueueWaitP90: 0}, queueBalanced},
+		{"every shard empty is starved", applier.Stats{QueueDepth: 0, QueueCap: 16384, FullestShardDepth: 0, FullestShardCap: 128, QueueWaitP90: 0}, queueStarved},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

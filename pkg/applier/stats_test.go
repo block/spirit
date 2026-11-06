@@ -260,6 +260,41 @@ func TestShardedApplierStats(t *testing.T) {
 	require.Positive(t, stats.WriteTimeP90)
 }
 
+// TestShardedApplierStatsFullestShard: the snapshot reports the fullest
+// shard's buffer alongside the summed queue, and Occupancy reads it, so a
+// queue that only one shard is filling reads as that shard's fill.
+func TestShardedApplierStatsFullestShard(t *testing.T) {
+	sourceTable, _, _, _, a := setupShardedUnderLockTest(t, "test_stats_fullest")
+	// Deliberately NOT started: no worker drains the buffers, so enqueued
+	// chunklets stay visible.
+	chunk := &table.Chunk{
+		Table:         sourceTable,
+		NewTable:      sourceTable,
+		ColumnMapping: table.NewColumnMapping(sourceTable, sourceTable, nil),
+	}
+	// user_id 2 and 4 (even) both route to shard 1; shard 2 gets nothing.
+	for i := range 3 {
+		rows := [][]any{{int64(i), int64(2 * (i + 1)), "a"}}
+		require.NoError(t, a.Apply(t.Context(), chunk, rows, func(int64, error) {}))
+	}
+
+	stats := a.Stats()
+	require.Equal(t, 3, stats.QueueDepth)
+	require.Equal(t, 2*defaultBufferSize, stats.QueueCap)
+	require.Equal(t, 3, stats.FullestShardDepth)
+	require.Equal(t, defaultBufferSize, stats.FullestShardCap)
+	require.InDelta(t, 3.0/defaultBufferSize, stats.Occupancy(), 1e-9,
+		"occupancy is the fullest shard's, not half of it")
+}
+
+func TestStatsOccupancy(t *testing.T) {
+	require.Zero(t, Stats{}.Occupancy())
+	require.InDelta(t, 0.25, Stats{QueueDepth: 32, QueueCap: 128}.Occupancy(), 1e-9,
+		"without per-shard figures it is the whole queue's")
+	require.InDelta(t, 1.0, Stats{QueueDepth: 128, QueueCap: 16384, FullestShardDepth: 128, FullestShardCap: 128}.Occupancy(), 1e-9,
+		"with them it is the fullest shard's")
+}
+
 // TestSingleTargetApplierStatsRoundTrip verifies that a completed write
 // populates the rolling timings and drains pending work.
 func TestSingleTargetApplierStatsRoundTrip(t *testing.T) {

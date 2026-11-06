@@ -536,7 +536,8 @@ func (a *MySQLApplier) ActiveWriteWorkers() int {
 }
 
 // Stats returns a point-in-time snapshot of the write pipeline, aggregated
-// across shards: queue depth/cap are summed, and active workers is the sum of
+// across shards: queue depth/cap are summed, the fullest shard's buffer is
+// reported alongside them, and active workers is the sum of
 // each shard's pool count — goroutines currently running, which during a shrink
 // can briefly exceed the number of quit channels the pool still tracks, since a
 // retired worker is removed from quits before it returns. The embedded mutex is
@@ -544,10 +545,15 @@ func (a *MySQLApplier) ActiveWriteWorkers() int {
 // restart; len/cap on a closed channel are safe.
 func (a *MySQLApplier) Stats() Stats {
 	a.Lock()
-	var queueDepth, queueCap int
+	var queueDepth, queueCap, fullestDepth, fullestCap int
 	for _, shard := range a.shards {
-		queueDepth += len(shard.chunkletBuffer)
-		queueCap += cap(shard.chunkletBuffer)
+		depth, capacity := len(shard.chunkletBuffer), cap(shard.chunkletBuffer)
+		queueDepth += depth
+		queueCap += capacity
+		// depth/capacity > fullestDepth/fullestCap, without dividing.
+		if capacity > 0 && (fullestCap == 0 || depth*fullestCap > fullestDepth*capacity) {
+			fullestDepth, fullestCap = depth, capacity
+		}
 	}
 	a.Unlock()
 
@@ -557,19 +563,21 @@ func (a *MySQLApplier) Stats() Stats {
 
 	t := a.timings.percentiles()
 	return Stats{
-		QueueDepth:      queueDepth,
-		QueueCap:        queueCap,
-		PendingWork:     pending,
-		ActiveWorkers:   a.ActiveWriteWorkers(),
-		RowsPerChunklet: a.splits.mean(),
-		QueueWaitP50:    t.queueWaitP50,
-		QueueWaitP90:    t.queueWaitP90,
-		BuildTimeP50:    t.buildP50,
-		BuildTimeP90:    t.buildP90,
-		WriteTimeP50:    t.writeP50,
-		WriteTimeP90:    t.writeP90,
-		HandoffP50:      t.handoffP50,
-		HandoffP90:      t.handoffP90,
+		QueueDepth:        queueDepth,
+		QueueCap:          queueCap,
+		FullestShardDepth: fullestDepth,
+		FullestShardCap:   fullestCap,
+		PendingWork:       pending,
+		ActiveWorkers:     a.ActiveWriteWorkers(),
+		RowsPerChunklet:   a.splits.mean(),
+		QueueWaitP50:      t.queueWaitP50,
+		QueueWaitP90:      t.queueWaitP90,
+		BuildTimeP50:      t.buildP50,
+		BuildTimeP90:      t.buildP90,
+		WriteTimeP50:      t.writeP50,
+		WriteTimeP90:      t.writeP90,
+		HandoffP50:        t.handoffP50,
+		HandoffP90:        t.handoffP90,
 	}
 }
 

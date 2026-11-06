@@ -28,6 +28,13 @@ type Stats struct {
 	QueueDepth int
 	// QueueCap is the total buffer capacity (summed across shards).
 	QueueCap int
+	// FullestShardDepth and FullestShardCap are the queue depth and capacity
+	// of the shard whose buffer is fullest. Each shard has its own buffer, and
+	// Apply blocks on the first full one, so one write-limited shard stops
+	// every reader while the summed queue sits far below capacity. Zero when
+	// the applier reports no per-shard buffers (see Occupancy).
+	FullestShardDepth int
+	FullestShardCap   int
 	// PendingWork is the number of chunks accepted by Apply() whose
 	// callback has not fired yet (queued + in-flight).
 	PendingWork int
@@ -90,6 +97,21 @@ type Stats struct {
 	// will not help.
 	HandoffP50 time.Duration
 	HandoffP90 time.Duration
+}
+
+// Occupancy is the fill fraction of the fullest shard's buffer, or of the
+// whole queue when no per-shard figures are reported. It is the occupancy a
+// controller should read: with one target the two are equal, and with several
+// the fullest buffer is the one that blocks Apply, so the summed figure would
+// read a move whose slowest shard is pegged as nearly idle.
+func (s Stats) Occupancy() float64 {
+	if s.FullestShardCap > 0 {
+		return float64(s.FullestShardDepth) / float64(s.FullestShardCap)
+	}
+	if s.QueueCap > 0 {
+		return float64(s.QueueDepth) / float64(s.QueueCap)
+	}
+	return 0
 }
 
 // handoffNoiseFloor is the handoff p50 below which the completion path is
