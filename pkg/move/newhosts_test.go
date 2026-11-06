@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/block/mysql"
@@ -12,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/throttler"
 	"github.com/stretchr/testify/require"
 )
@@ -112,4 +114,93 @@ func TestMoveSetupThrottlingNewHosts(t *testing.T) {
 	require.True(t, r.autoscale.Enabled)
 	require.Equal(t, autoscale.NewHostMinWriteThreads, r.autoscale.MinThreads)
 	require.GreaterOrEqual(t, r.autoscale.StartThreads, autoscale.NewHostMinWriteThreads)
+}
+
+// preCreatedIndexTables creates a source and a target schema that both hold
+// table items, as a declarative schema workflow pre-creates it on the target:
+// empty, with the source's indexes. It returns the source and target DSNs.
+func preCreatedIndexTables(t *testing.T, srcName, dstName string) (string, string) {
+	t.Helper()
+	const ddl = "(id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT, c VARCHAR(32), KEY a_idx (a), UNIQUE KEY c_uniq (c))"
+	for _, name := range []string{srcName, dstName} {
+		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+name)
+		testutils.RunSQL(t, "CREATE DATABASE "+name)
+		testutils.RunSQL(t, "CREATE TABLE "+name+".items "+ddl)
+		t.Cleanup(func() { testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+name) })
+	}
+	testutils.RunSQL(t, "INSERT INTO "+srcName+".items (a, c) VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	src, dst := cfg.Clone(), cfg.Clone()
+	src.DBName, dst.DBName = srcName, dstName
+	return src.FormatDSN(), dst.FormatDSN()
+}
+
+func targetIndexes(t *testing.T, schema string) []string {
+	t.Helper()
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	rows, err := db.QueryContext(t.Context(), "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'items'", schema)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	var names []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		names = append(names, name)
+	}
+	require.NoError(t, rows.Err())
+	slices.Sort(names)
+	return names
+}
+
+// On new hosts a pre-created target table loses its deferrable secondary
+// indexes before the copy, as a table the move creates is built without them.
+func TestMoveDefersIndexesOfPreCreatedTables(t *testing.T) {
+	sourceDSN, targetDSN := preCreatedIndexTables(t, "precreated_defer_src", "precreated_defer_dst")
+	r, err := NewRunner(&Move{
+		SourceDSN:             sourceDSN,
+		TargetDSN:             targetDSN,
+		Common:                flags.Common{Threads: 1, WriteThreads: 1},
+		DeferSecondaryIndexes: true,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	r.lifecycle.SetCancel(cancel)
+	r.dbConfig = dbconn.NewDBConfig()
+	srcDB, err := dbconn.New(sourceDSN, r.dbConfig)
+	require.NoError(t, err)
+	srcConfig, err := mysql.ParseDSN(sourceDSN)
+	require.NoError(t, err)
+	r.sources = []sourceInfo{{db: srcDB, config: srcConfig, dsn: sourceDSN}}
+	targetDB, err := dbconn.New(targetDSN, r.dbConfig)
+	require.NoError(t, err)
+	targetConfig, err := mysql.ParseDSN(targetDSN)
+	require.NoError(t, err)
+	r.targets = []applier.Target{{KeyRange: "0", DB: targetDB, Config: targetConfig}}
+	t.Cleanup(func() {
+		r.lifecycle.Cancel(nil)
+		require.NoError(t, srcDB.Close())
+		require.NoError(t, r.Close())
+	})
+	require.NoError(t, r.setupDiscovery(ctx))
+	require.NoError(t, r.setupUnderLocks(ctx))
+
+	require.Equal(t, []string{"PRIMARY", "c_uniq"}, targetIndexes(t, "precreated_defer_dst"),
+		"the regular index is deferred; the primary and unique keys stay")
+}
+
+// A move into a pre-created table on new hosts ends with the table's
+// secondary indexes back, matching the source.
+func TestMovePreCreatedTablesRestoresDeferredIndexes(t *testing.T) {
+	sourceDSN, targetDSN := preCreatedIndexTables(t, "precreated_restore_src", "precreated_restore_dst")
+	move := &Move{
+		SourceDSN:             sourceDSN,
+		TargetDSN:             targetDSN,
+		Common:                flags.Common{Threads: 1, WriteThreads: 1},
+		DeferSecondaryIndexes: true,
+	}
+	require.NoError(t, move.Run())
+	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "precreated_restore_dst"))
 }

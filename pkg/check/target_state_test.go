@@ -264,6 +264,50 @@ func TestTargetStateCheckNotNullShardKey(t *testing.T) {
 	})
 }
 
+// TestTargetStateCheckDeferredIndexes: a pre-created target that lacks only
+// the indexes a move defers (statement.RemoveSecondaryIndexes) passes, since
+// the move adds them back before its checksum. Lacking any other index, or
+// only some of the deferrable ones, still fails.
+func TestTargetStateCheckDeferredIndexes(t *testing.T) {
+	srcName, srcDB := createW3DDatabase(t)
+	tgtName, tgtDB := createW3DDatabase(t)
+	targetConfig := &mysql.Config{DBName: tgtName}
+
+	_, err := srcDB.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.items (id BIGINT NOT NULL, a INT, b INT, c VARCHAR(32), PRIMARY KEY (id), KEY a_idx (a), KEY b_idx (b), UNIQUE KEY c_uniq (c))", srcName))
+	require.NoError(t, err)
+	sourceTable := table.NewTableInfo(srcDB, srcName, "items")
+	require.NoError(t, sourceTable.SetInfo(t.Context()))
+	resources := Resources{
+		Runtime:      Move,
+		Sources:      []Endpoint{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
+		Targets:      []applier.Target{{DB: tgtDB, Config: targetConfig}},
+		SourceTables: []*table.TableInfo{sourceTable},
+	}
+
+	for _, tc := range []struct {
+		name, indexes string
+		ok            bool
+	}{
+		{"every index", ", KEY a_idx (a), KEY b_idx (b), UNIQUE KEY c_uniq (c)", true},
+		{"deferrable indexes dropped", ", UNIQUE KEY c_uniq (c)", true},
+		{"one deferrable index dropped", ", KEY b_idx (b), UNIQUE KEY c_uniq (c)", false},
+		{"unique index dropped", ", KEY a_idx (a), KEY b_idx (b)", false},
+		{"no secondary index", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tgtDB.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.items (id BIGINT NOT NULL, a INT, b INT, c VARCHAR(32), PRIMARY KEY (id)%s)", tgtName, tc.indexes))
+			require.NoError(t, err)
+			defer func() { _, _ = tgtDB.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s.items", tgtName)) }()
+			err = targetStateCheck(t.Context(), resources, slog.Default())
+			if tc.ok {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, "schema does not match")
+		})
+	}
+}
+
 // TestTargetStateCheckMisreportedEnumSetTarget checks that a pre-created
 // target is refused when it stores an ENUM member that SHOW CREATE TABLE
 // reports as '?'. Its reported definition equals that of a source whose member

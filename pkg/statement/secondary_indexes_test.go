@@ -3,6 +3,7 @@ package statement
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/block/spirit/pkg/testutils"
@@ -960,4 +961,59 @@ func TestMissingUnnamedSecondaryIndexes(t *testing.T) {
 	restore, err = GetMissingSecondaryIndexes(source, target, "t")
 	require.NoError(t, err)
 	require.Empty(t, restore)
+}
+
+// DropDeferrableSecondaryIndexes drops exactly the indexes
+// RemoveSecondaryIndexes leaves out: regular indexes, less the one that
+// supports AUTO_INCREMENT. UNIQUE, FULLTEXT and the primary key stay.
+func TestDropDeferrableSecondaryIndexes(t *testing.T) {
+	for _, tc := range []struct {
+		name, ddl, want string
+	}{
+		{
+			name: "regular indexes",
+			ddl:  "CREATE TABLE `t` (`id` int NOT NULL, `a` int, `b` varchar(32), `c` text, PRIMARY KEY (`id`), KEY `a_idx` (`a`), UNIQUE KEY `b_uniq` (`b`), KEY `ab_idx` (`a`,`b`), FULLTEXT KEY `c_ft` (`c`))",
+			want: "ALTER TABLE `t` DROP INDEX `a_idx`, DROP INDEX `ab_idx`",
+		},
+		{
+			name: "auto increment support kept",
+			ddl:  "CREATE TABLE `t` (`id` int NOT NULL AUTO_INCREMENT, `p` int NOT NULL, PRIMARY KEY (`p`), KEY `redundant` (`id`,`p`), KEY `ai` (`id`), KEY `extra` (`p`))",
+			want: "ALTER TABLE `t` DROP INDEX `redundant`, DROP INDEX `extra`",
+		},
+		{
+			name: "functional index",
+			ddl:  "CREATE TABLE `t` (`id` int NOT NULL, `b` varchar(32), PRIMARY KEY (`id`), KEY `fn` ((lower(`b`))))",
+			want: "ALTER TABLE `t` DROP INDEX `fn`",
+		},
+		{
+			name: "nothing to defer",
+			ddl:  "CREATE TABLE `t` (`id` int NOT NULL, `b` varchar(32), PRIMARY KEY (`id`), UNIQUE KEY `b_uniq` (`b`))",
+			want: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DropDeferrableSecondaryIndexes(tc.ddl, "t")
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+
+			// The table the ALTER leaves is the one RemoveSecondaryIndexes builds.
+			stripped, err := RemoveSecondaryIndexes(tc.ddl)
+			require.NoError(t, err)
+			want, err := ParseCreateTable(stripped)
+			require.NoError(t, err)
+			ct, err := ParseCreateTable(tc.ddl)
+			require.NoError(t, err)
+			kept := map[string]bool{}
+			for _, idx := range want.GetIndexes() {
+				kept[idx.Name] = true
+			}
+			for _, idx := range ct.GetIndexes() {
+				dropped := strings.Contains(got, "DROP INDEX `"+idx.Name+"`")
+				require.NotEqual(t, kept[idx.Name], dropped, "index %s", idx.Name)
+			}
+		})
+	}
+
+	_, err := DropDeferrableSecondaryIndexes("not sql", "t")
+	require.Error(t, err)
 }

@@ -396,7 +396,10 @@ func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.Table
 // createTargetTables creates tables on all targets.
 // On new hosts (newHosts), tables are created without secondary indexes.
 // Secondary indexes will be added later by restoreSecondaryIndexes() before cutover.
-// This function skips tables that already exist (they were validated by checkTargetEmpty).
+// A table that already exists (pre-created, and validated empty and matching
+// the source by the target_state check) is not created; on new hosts its
+// deferrable secondary indexes are dropped instead, so it is copied into the
+// same way as a table the move creates.
 func (r *Runner) createTargetTables(ctx context.Context) error {
 	// All sources have identical schemas (enforced by the source_schema_consistency
 	// check at PhasePostSetup), so use sources[0] for SHOW CREATE TABLE.
@@ -428,11 +431,16 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 				target.Config.DBName, t.TableName).Scan(&tableExists)
 
 			if err == nil {
-				// Table already exists, skip creation (it was validated by checkTargetEmpty)
+				// Table already exists, skip creation (it was validated by the target_state check)
 				r.logger.Info("skipping table creation, already exists",
 					"table", t.TableName,
 					"target", i,
 					"database", target.Config.DBName)
+				if r.newHosts {
+					if err := r.deferExistingIndexes(ctx, i, t.TableName); err != nil {
+						return err
+					}
+				}
 				continue
 			} else if err != sql.ErrNoRows {
 				// Unexpected error
@@ -451,6 +459,36 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 			)
 		}
 	}
+	return nil
+}
+
+// deferExistingIndexes drops the deferrable secondary indexes from a target
+// table that existed before the move (statement.DropDeferrableSecondaryIndexes).
+// The table is empty, so the drop is quick. restoreSecondaryIndexes adds them
+// back from the source before the checksum, and the target_state check
+// accepts the table without them if the move stops before its first
+// checkpoint.
+func (r *Runner) deferExistingIndexes(ctx context.Context, targetIndex int, tableName string) error {
+	target := r.targets[targetIndex]
+	var name, createStmt string
+	if err := target.DB.QueryRowContext(ctx, "SHOW CREATE TABLE "+sqlescape.EscapeIdentifier(tableName)).Scan(&name, &createStmt); err != nil {
+		return fmt.Errorf("failed to read table %s on target %d: %w", tableName, targetIndex, err)
+	}
+	alter, err := statement.DropDeferrableSecondaryIndexes(createStmt, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to defer the secondary indexes of table %s on target %d: %w", tableName, targetIndex, err)
+	}
+	if alter == "" {
+		return nil
+	}
+	if _, err := target.DB.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("failed to defer the secondary indexes of table %s on target %d: %w", tableName, targetIndex, err)
+	}
+	r.logger.Info("deferred the secondary indexes of an existing target table",
+		"table", tableName,
+		"target", targetIndex,
+		"database", target.Config.DBName,
+		"statement", alter)
 	return nil
 }
 

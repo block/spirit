@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -123,6 +124,24 @@ func validateExistingTargetTable(ctx context.Context, target applier.Target, tab
 	diff, err := TargetSchemaDiff(tableName, sourceCreate, targetCreate)
 	if err != nil {
 		return fmt.Errorf("failed to compare schema for table '%s' on target %d: %w", tableName, targetIndex, err)
+	}
+	if diff != "" {
+		// A target that lacks only the indexes a move defers on new hosts
+		// (statement.RemoveSecondaryIndexes) matches the source once
+		// restoreSecondaryIndexes adds them back before the checksum. A move
+		// that dropped them from this pre-created table and stopped before
+		// its first checkpoint leaves exactly this.
+		deferred, err := statement.RemoveSecondaryIndexes(sourceCreate)
+		if err != nil {
+			return fmt.Errorf("failed to compare schema for table '%s' on target %d: %w", tableName, targetIndex, err)
+		}
+		if deferredDiff, err := TargetSchemaDiff(tableName, deferred, targetCreate); err == nil && deferredDiff == "" {
+			logger.Info("existing target table lacks only deferrable secondary indexes; they are added before the checksum",
+				"table", tableName,
+				"target", targetIndex,
+				"database", target.Config.DBName)
+			diff = ""
+		}
 	}
 	if diff != "" {
 		return fmt.Errorf("table '%s' exists on target %d (%s) but schema does not match source; reconcile the target to the source with: %s. Please ensure the table schema matches exactly (including column types, charset and collation) or drop the table",
