@@ -951,6 +951,18 @@ func (r *Runner) setupAutoscaling(ctx context.Context, groups []host.Group, resu
 	if plan.Engaged {
 		r.copyThreads, r.maxChecksumThreads = plan.CopyReadStart, plan.MaxReadThreads
 	}
+	// The throttler watches the targets and the copy readers read the
+	// sources, so the readers scale on the applier queue alone unless a source
+	// is also a target server.
+	sourceConfigs := make([]*mysql.Config, len(r.sources))
+	for i := range r.sources {
+		sourceConfigs[i] = r.sources[i].config
+	}
+	targetConfigs := make([]*mysql.Config, len(r.targets))
+	for i, target := range r.targets {
+		targetConfigs[i] = target.Config
+	}
+	r.autoscale.IndependentReads = host.Disjoint(sourceConfigs, targetConfigs)
 	r.flushConcurrency, r.flushBatchSize = plan.FlushConcurrency, plan.FlushBatchSize
 	return nil
 }

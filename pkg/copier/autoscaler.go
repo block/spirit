@@ -187,6 +187,11 @@ type autoScaler struct {
 	reader                        readScaler
 	stats                         statsProvider
 	readMin, readMax, readCurrent int
+	// independentReads selects the independent law (AutoscaleConfig.
+	// IndependentReads): the read pool scales on the queue alone, under its
+	// own readGate, and utilization moves only the write pool through gate.
+	independentReads bool
+	readGate         autoscale.Gate
 	// queueState / queueStateTicks implement the anti-flap persistence: the
 	// most recently observed state and how many consecutive ticks it has
 	// held. See observeQueue.
@@ -258,9 +263,18 @@ func (a *autoScaler) run(ctx context.Context) {
 // The balanced-hold means a stably balanced pipeline stops growing even with
 // utilization headroom — deliberate for now; revisit if soak shows a stuck
 // equilibrium below the achievable throughput.
+//
+// This law assumes the readers load the server utilization describes. When
+// they do not (AutoscaleConfig.IndependentReads), tickIndependent runs
+// instead.
 func (a *autoScaler) tick(ctx context.Context) {
 	util := a.throttler.Utilization()
 	queue := a.observeQueue()
+	if a.reader != nil && a.independentReads {
+		a.tickIndependent(util, queue)
+		a.emit(ctx, util)
+		return
+	}
 	// The zone law and the cooldown gating are autoscale.Gate's; what remains
 	// here is apportioning the permitted move between the two pools. The copier
 	// supplies no veto — the queue is an arbiter, not a signal of its own, and it
@@ -329,6 +343,72 @@ func (a *autoScaler) tick(ctx context.Context) {
 	}
 
 	a.emit(ctx, util)
+}
+
+// tickIndependent is tick under the independent law, for readers that read
+// servers the throttler does not watch (AutoscaleConfig.IndependentReads).
+// Utilization describes only the writers' servers there, so it moves only the
+// write pool, and the queue alone scales the read pool:
+//
+//	write pool (gate):      util >= panic  halve
+//	                        util >= high   shed 1
+//	                        util < low     +1 if the queue is full, else hold
+//	read pool (readGate):   starved        +1, unless the throttler is tripped
+//	                        full           shed 1
+//	                        balanced       hold
+//
+// While the throttler is tripped the readers wait in BlockWait, so the queue
+// drains and reads as starved without saying anything about the readers; the
+// read pool then holds instead of growing into the stop. The two pools keep
+// separate cooldowns because they no longer share a signal: a reader added on
+// a starved queue says nothing about whether the writers' servers have room.
+func (a *autoScaler) tickIndependent(util float64, queue queueState) {
+	zone := autoscale.Classify(util)
+	writePlan := a.gate.Decide(autoscale.Inputs{Zone: zone})
+	wrote := true
+	switch writePlan {
+	case autoscale.PlanHalve:
+		a.setWrite(autoscale.CeilDiv(a.current, 2))
+	case autoscale.PlanShed, autoscale.PlanShedVeto:
+		a.setWrite(a.current - 1)
+	case autoscale.PlanGrow, autoscale.PlanRecover:
+		if queue == queueFull {
+			a.setWrite(a.current + 1)
+		} else {
+			wrote = false
+		}
+	case autoscale.PlanNone:
+		wrote = false
+	}
+	if wrote {
+		a.gate.Applied(writePlan)
+	} else {
+		a.gate.Idle()
+	}
+
+	readZone := autoscale.Hold
+	switch queue {
+	case queueStarved:
+		readZone = autoscale.Grow
+	case queueFull:
+		readZone = autoscale.Shed
+	case queueBalanced:
+	}
+	readPlan := a.readGate.Decide(autoscale.Inputs{
+		Zone:          readZone,
+		GrowthBlocked: zone == autoscale.Halve || a.throttler.IsThrottled(),
+	})
+	switch readPlan {
+	case autoscale.PlanGrow:
+		a.setRead(a.readCurrent + 1)
+	case autoscale.PlanShed:
+		a.setRead(a.readCurrent - 1)
+	case autoscale.PlanNone, autoscale.PlanHalve, autoscale.PlanShedVeto, autoscale.PlanRecover:
+		// The read inputs carry no veto, no recovery and no Halve zone.
+		a.readGate.Idle()
+		return
+	}
+	a.readGate.Applied(readPlan)
 }
 
 // observeQueue samples the applier queue, folds it into the persistence

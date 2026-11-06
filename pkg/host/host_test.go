@@ -23,3 +23,21 @@ func TestGroupConfigs(t *testing.T) {
 	}, GroupConfigs(configs))
 	require.Empty(t, GroupConfigs(nil))
 }
+
+func TestDisjoint(t *testing.T) {
+	sources := []*mysql.Config{{Net: "tcp", Addr: "source:3306", DBName: "a"}}
+	targets := []*mysql.Config{
+		{Net: "tcp", Addr: "target-1:3306", DBName: "a"},
+		{Addr: "target-2:3306", DBName: "b"},
+	}
+	require.True(t, Disjoint(sources, targets))
+	// The same endpoint with another schema is the same server; an empty Net
+	// is tcp, as in GroupConfigs.
+	require.False(t, Disjoint(sources, append(targets, &mysql.Config{Addr: "source:3306", DBName: "c"})))
+	// Another port or transport is another server.
+	require.True(t, Disjoint(sources, []*mysql.Config{{Net: "tcp", Addr: "source:3307"}, {Net: "unix", Addr: "source:3306"}}))
+	require.True(t, Disjoint(nil, targets))
+	// An unknown endpoint could be any server.
+	require.False(t, Disjoint([]*mysql.Config{nil}, targets))
+	require.False(t, Disjoint(sources, []*mysql.Config{nil}))
+}

@@ -22,6 +22,7 @@ import (
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/host"
 	"github.com/block/spirit/pkg/metrics"
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/runtime"
@@ -902,6 +903,10 @@ func (r *Runner) setupAutoscaling(ctx context.Context, result throttler.AuroraRe
 	}
 	// Small-instance mode sets only the flush shape: plan.Copier() is zero.
 	r.autoscale = plan.Copier()
+	// The throttler watches the target and the copy readers read the source,
+	// so the readers scale on the applier queue alone unless both are on one
+	// server (or either endpoint is unknown).
+	r.autoscale.IndependentReads = host.Disjoint([]*mysql.Config{r.source.config}, []*mysql.Config{r.target.Config})
 	r.flushConcurrency, r.flushBatchSize = plan.FlushConcurrency, plan.FlushBatchSize
 	return nil
 }

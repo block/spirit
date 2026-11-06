@@ -277,6 +277,8 @@ The gradual multi-throttler reports the maximum utilization across hosts: all ho
 
 The copier adds write threads when the applier queue is nearly full and queued work waits longer than a write takes. It reads the fullest shard's queue, not the total across shards. Write-thread counts change on every shard together, so one slow shard whose queue fills adds write threads on every target, up to the ceiling and while the load signal allows it. This applies to every sharded move, on new and serving hosts.
 
+Target load does not scale the copy's read threads. A copy reader reads only the sources, which move does not monitor, so the copier adds a read thread when the applier queue is nearly empty and removes one when it is nearly full, whatever the targets' load. Target load sheds only write threads. While a target is throttled, the readers are paused, and their count holds. When a source is also one of the target servers, the copy's read threads follow that server's load as in migration.
+
 As in migration, the copier owns throttling: it pauses before reading another chunk and its autoscaler adjusts the applier through `SetWriteWorkers`. Already-read and queued work continues draining. Moving throttler ownership into the applier is outside this change.
 
 If any Aurora target has fewer than 4 vCPUs, the whole move runs in small-instance mode instead, whatever the other targets are: 1 read thread, 1 write thread per target, 1 concurrent change-feed flush per source, a 1 MiB [target-chunk-size](#target-chunk-size), and no scaling. See [migrate's small-instance mode](migrate.md#skip-autoscaling).

@@ -137,8 +137,12 @@ monitor pool. That monitoring, and the throttling it drives, runs with
 `--skip-autoscaling` too (see [max-commit-latency](#max-commit-latency)); the
 flag only removes thread-count scaling. Source load is not measured.
 
-During the initial copy, the shared copier controller adjusts read and write
-workers using target load and the applier queue. After copying, the continuous
+During the initial copy, the shared copier controller adjusts write workers
+using target load and the applier queue, and read workers using the applier
+queue alone: a reader reads only the source, which the target load does not
+measure. While the target is throttled, the readers are paused, and their
+count holds. When the source and target are one server, the read workers
+follow its load as in `migrate`. After copying, the continuous
 checksum controller adjusts concurrent checks using target load and change-feed
 backlog. Target overload pauses new checks, while in-flight repairs finish.
 A write controller also remains active for the initial verification's repairs.

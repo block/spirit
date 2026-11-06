@@ -251,6 +251,40 @@ func TestMoveCopyReadsNotDividedByShards(t *testing.T) {
 	require.Equal(t, checksum.AutoscaleConfig{Enabled: true, MaxThreads: r.maxChecksumThreads}, r.checksumAutoscale())
 }
 
+// The move throttles on its targets while the copy readers read the sources,
+// so the readers scale on the applier queue alone (IndependentReads) unless a
+// source is also a target server, whose load the readers then add to.
+func TestMoveCopyReadsIndependentOfTargetLoad(t *testing.T) {
+	config, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	source := *config
+	source.Addr = "source-host:3306"
+	for _, tc := range []struct {
+		name   string
+		source *mysql.Config
+		want   bool
+	}{
+		{"source on its own server", &source, true},
+		{"source on a target server", config, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := NewRunner(&Move{})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, r.Close()) })
+			r.sources = []sourceInfo{{config: tc.source}}
+			r.targets = []applier.Target{{Config: config, KeyRange: "-80"}, {Config: config, KeyRange: "80-"}}
+			r.auroraVCPUs = func(context.Context, *sql.DB) (int, error) { return 8, nil }
+			group := host.Group{Indices: []int{0, 1}}
+			results := []throttler.AuroraResult{{Throttlers: []throttler.Throttler{&closeCountingThrottler{}}}}
+			require.NoError(t, r.applyAuroraResults(t.Context(), []host.Group{group}, results))
+
+			require.True(t, r.autoscale.Enabled)
+			require.Equal(t, tc.want, r.autoscale.IndependentReads)
+			require.Equal(t, tc.want, r.copierConfig().Autoscale.IndependentReads)
+		})
+	}
+}
+
 // A target below autoscale.MinVCPUs (2 vCPUs, too small to autoscale)
 // runs the whole move at one reader, one writer and one flush, with small copy
 // chunks, even when the other target is not Aurora.
