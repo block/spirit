@@ -204,3 +204,64 @@ func TestMovePreCreatedTablesRestoresDeferredIndexes(t *testing.T) {
 	require.NoError(t, move.Run())
 	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "precreated_restore_dst"))
 }
+
+// resumeWithIndexes stops a move into the items table after its copy and
+// first checkpoint, and leaves a_idx on the target, as a move that started
+// before it deferred its indexes would. Whether the first run deferred them
+// depends on how much data the test server holds, so it is not relied on.
+func resumeWithIndexes(t *testing.T, srcName, dstName string) *Move {
+	t.Helper()
+	sourceDSN, targetDSN := preCreatedIndexTables(t, srcName, dstName)
+	move := &Move{
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+	}
+	checkpointAndStop(t, move)
+	if !slices.Contains(targetIndexes(t, dstName), "a_idx") {
+		testutils.RunSQL(t, "ALTER TABLE "+dstName+".items ADD KEY a_idx (a)")
+	}
+	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, dstName))
+	return move
+}
+
+// A move resumed on new hosts before its checksum started drops the
+// deferrable secondary indexes from the tables it is still copying into, and
+// the finished move has them back.
+func TestMoveResumeDefersIndexes(t *testing.T) {
+	move := resumeWithIndexes(t, "resume_defer_src", "resume_defer_dst")
+	move.DeferSecondaryIndexes = true
+
+	r, ctx := buildTestRunner(t, move)
+	require.NoError(t, r.setupDiscovery(ctx))
+	require.NoError(t, r.setupUnderLocks(ctx))
+	require.True(t, r.usedResumeFromCheckpoint.Load())
+	require.Equal(t, []string{"PRIMARY", "c_uniq"}, targetIndexes(t, "resume_defer_dst"),
+		"the regular index is deferred; the primary and unique keys stay")
+	closeTestRunner(t, r)
+
+	require.NoError(t, move.Run())
+	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_defer_dst"))
+	var count int
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM resume_defer_dst.items").Scan(&count))
+	require.Equal(t, 3, count)
+}
+
+// A checkpoint with a checksum watermark was written after the indexes were
+// restored, so a resume on new hosts keeps them: dropping them would rebuild
+// them before the checksum resumes.
+func TestMoveResumeKeepsIndexesPastChecksum(t *testing.T) {
+	move := resumeWithIndexes(t, "resume_keep_src", "resume_keep_dst")
+	move.DeferSecondaryIndexes = true
+	testutils.RunSQL(t, "UPDATE resume_keep_dst."+checkpointTableName+" SET checksum_watermark = '{}'")
+
+	r, ctx := buildTestRunner(t, move)
+	defer closeTestRunner(t, r)
+	require.NoError(t, r.setupDiscovery(ctx))
+	require.NoError(t, r.setupUnderLocks(ctx))
+	require.True(t, r.usedResumeFromCheckpoint.Load())
+	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_keep_dst"))
+}

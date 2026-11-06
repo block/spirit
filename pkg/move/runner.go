@@ -463,11 +463,11 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 }
 
 // deferExistingIndexes drops the deferrable secondary indexes from a target
-// table that existed before the move (statement.DropDeferrableSecondaryIndexes).
-// The table is empty, so the drop is quick. restoreSecondaryIndexes adds them
-// back from the source before the checksum, and the target_state check
-// accepts the table without them if the move stops before its first
-// checkpoint.
+// table that already exists (statement.DropDeferrableSecondaryIndexes): one
+// created before the move, or one a resumed move is still copying into
+// (deferTargetIndexes). restoreSecondaryIndexes adds them back from the
+// source before the checksum, and the target_state check accepts the table
+// without them if the move stops before its first checkpoint.
 func (r *Runner) deferExistingIndexes(ctx context.Context, targetIndex int, tableName string) error {
 	target := r.targets[targetIndex]
 	var name, createStmt string
@@ -489,6 +489,41 @@ func (r *Runner) deferExistingIndexes(ctx context.Context, targetIndex int, tabl
 		"target", targetIndex,
 		"database", target.Config.DBName,
 		"statement", alter)
+	return nil
+}
+
+// deferTargetIndexes drops the deferrable secondary indexes of every moved
+// table on every target (deferExistingIndexes), for a resume on new hosts. A
+// table whose indexes are already deferred is left alone. The target servers
+// are altered at the same time, and the targets that share a server one
+// after another, like restoreSecondaryIndexes. On a table that already holds
+// rows a DROP INDEX is an in-place change that frees the index's pages.
+func (r *Runner) deferTargetIndexes(ctx context.Context) error {
+	hosts := r.targetHosts()
+	r.logger.Info("deferring the secondary indexes of every target table on resume",
+		"tables", len(r.sourceTables),
+		"targets", len(r.targets),
+		"hosts", len(hosts),
+	)
+	started := time.Now()
+	g, gctx := errgroup.WithContext(ctx)
+	for _, group := range hosts {
+		g.Go(func() error {
+			for _, i := range group.Indices {
+				for _, tbl := range r.sourceTables {
+					if err := r.deferExistingIndexes(gctx, i, tbl.TableName); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	r.logger.Info("deferred the secondary indexes of every target table on resume",
+		"duration", time.Since(started))
 	return nil
 }
 
@@ -596,6 +631,21 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 			"reason", "deleteRecopyRange may remove rows below other sources' watermarks; only a from-scratch checksum re-verifies and repairs them",
 			"sources", len(r.sources))
 		r.checksumWatermark = ""
+	}
+
+	// On new hosts, a checkpoint with no checksum watermark was written
+	// before the checksum started, so the copy is still running or its
+	// indexes are being restored: drop the deferrable secondary indexes
+	// (again) so the rest of the copy does not maintain them. They are
+	// restored before the checksum, as on a fresh run. This also defers the
+	// indexes of a move that started without deferring them. It is checked on
+	// the checkpoint's watermark, not r.checksumWatermark, which a
+	// multi-source resume discards above. Dropping first also makes the
+	// DELETE below cheaper.
+	if r.newHosts && rec.ChecksumWatermark == "" {
+		if err := r.deferTargetIndexes(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Delete rows at/above the copier's resume position (the watermark
