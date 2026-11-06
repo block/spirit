@@ -128,10 +128,9 @@ type Runner struct {
 	// Zero leaves the change package's defaults; autoscaling derives them
 	// from the targets (moveFlushBounds).
 	flushConcurrency, flushBatchSize int
-	// newHosts is set when every target server serves nothing but this move:
-	// --defer-secondary-indexes says so, or detectNewHosts measured it. It
-	// defers the secondary indexes and loads the targets harder (see
-	// throttler.AuroraSetup.NewHost and concurrency.Request.NewHosts).
+	// newHosts is set when detectNewHosts measured that every target server
+	// serves nothing but this move. It defers the secondary indexes and keeps
+	// more writers per target (concurrency.Request.NewHosts).
 	newHosts bool
 	// buildAurora and auroraVCPUs are the instance probes setupThrottling runs.
 	// NewRunner sets buildAurora to throttler.BuildAurora; a nil auroraVCPUs is
@@ -139,9 +138,8 @@ type Runner struct {
 	// because CI has no Aurora to probe.
 	buildAurora func(context.Context, throttler.AuroraSetup) (throttler.AuroraResult, error)
 	auroraVCPUs func(context.Context, *sql.DB) (int, error)
-	// readServerData is detectNewHosts' measurement. NewRunner sets it to
-	// dbconn.ReadServerUserData; tests replace it, because the CI server's
-	// size depends on what the other tests have left on it.
+	// readServerData is detectNewHosts' measurement: Move.readServerData when
+	// a test set it, otherwise dbconn.ReadServerUserData.
 	readServerData func(context.Context, *sql.DB, func(schema, table string) bool) (dbconn.ServerUserData, error)
 
 	applier     applier.Applier
@@ -242,6 +240,9 @@ func NewRunner(m *Move) (*Runner, error) {
 		metricsSink:         &metrics.NoopSink{},
 		buildAurora:         throttler.BuildAurora,
 		readServerData:      dbconn.ReadServerUserData,
+	}
+	if m.readServerData != nil {
+		r.readServerData = m.readServerData
 	}
 	return r, nil
 }
@@ -733,7 +734,7 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 // lock before it can destroy the first run's target data.
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
-	r.newHosts = r.move.DeferSecondaryIndexes || r.detectNewHosts(ctx)
+	r.newHosts = r.detectNewHosts(ctx)
 	if err := r.setupThrottling(ctx); err != nil {
 		return err
 	}
@@ -835,7 +836,6 @@ func (r *Runner) setupThrottling(ctx context.Context) error {
 			Source:                 target.DB,
 			OpenMonitor:            dbconn.MonitorOpener(target.Config.FormatDSN(), r.dbConfig, "move target monitor"),
 			CommitLatencyThreshold: r.move.MaxCommitLatency,
-			NewHost:                r.newHosts,
 			Logger:                 r.logger.With("target", targetKey(target)),
 		})
 		if err != nil {
@@ -850,12 +850,17 @@ func (r *Runner) setupThrottling(ctx context.Context) error {
 }
 
 // detectNewHosts reports whether every target server is a new host: it holds
-// less than dbconn.NewHostDataLimit bytes outside the tables this move writes,
-// and the target user sees every table on it (dbconn.ReadServerUserData). The
-// move's own tables are left out so a resumed move, whose targets hold the
-// rows copied so far, reaches the same answer as the fresh one. A server that
-// cannot be measured is not a new host: the move then runs as it would into a
-// serving host.
+// less than dbconn.NewHostDataLimit bytes outside the tables this move writes
+// (dbconn.ReadServerUserData). The move's own tables are left out so a
+// resumed move, whose targets hold the rows copied so far, reaches the same
+// answer as the fresh one. A server that cannot be measured is not a new
+// host: the move then runs as it would into a serving host.
+//
+// The measurement covers only the tables the target user can see. A user
+// granted only some schemas does not see the others, so a server that holds
+// data only in schemas the user was not granted counts as a new host. Target
+// users are usually granted the schemas they write to, so this is accepted:
+// a global grant would rule it out.
 func (r *Runner) detectNewHosts(ctx context.Context) bool {
 	own := make(map[string]bool, len(r.sourceTables))
 	for _, t := range r.sourceTables {
@@ -876,13 +881,14 @@ func (r *Runner) detectNewHosts(ctx context.Context) bool {
 		case err != nil:
 			log.Warn("could not measure the target server's data; treating it as a serving host", "error", err.Error())
 			return false
-		case !data.SeesEveryTable:
-			log.Info("the target user has no global table privilege, so it cannot see every table on the target server; treating it as a serving host")
-			return false
 		case !data.NewHost():
 			log.Info("the target server already holds data; treating it as a serving host",
 				"bytes", data.Bytes, "limit", dbconn.NewHostDataLimit)
 			return false
+		}
+		if !data.SeesEveryTable {
+			log.Info("the target user has no global table privilege, so the measurement covers only the schemas it was granted; other schemas on the server may hold data",
+				"bytes", data.Bytes)
 		}
 		total += data.Bytes
 	}
@@ -1979,7 +1985,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.Phase, exclude ...st
 }
 
 // restoreSecondaryIndexes restores any secondary indexes that were deferred during table creation.
-// This function is always called (regardless of DeferSecondaryIndexes flag) to handle
+// This function is always called (on serving hosts too) to handle
 // checkpoint resume scenarios. It uses statement.GetMissingSecondaryIndexes to compare source and target
 // schemas and generate a single ALTER TABLE statement for all missing indexes per table.
 // Targets are processed in parallel, grouped by hostname to avoid overloading any single MySQL instance.
@@ -2083,7 +2089,7 @@ func (r *Runner) restoreIndexesForTargets(ctx context.Context, host string, targ
 // before cutover.
 func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// Flush all pending events, but leave the periodic flush running until
-	// just before the checksum. With --defer-secondary-indexes,
+	// just before the checksum. On new hosts,
 	// restoreSecondaryIndexes issues one giant ALTER per table that can run
 	// for hours, and both it and ANALYZE TABLE permit concurrent DML on the
 	// target: adding a regular secondary index is online (INPLACE) DDL in
@@ -2101,7 +2107,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	}
 
 	// Restore secondary indexes if they were deferred during table creation.
-	// This is always called (not conditional on DeferSecondaryIndexes) to handle
+	// This is always called (not only on new hosts) to handle
 	// checkpoint resume scenarios where indexes may have been deferred in a previous run.
 	if err := r.status.DoContext(ctx, status.RestoreSecondaryIndexes, func() error {
 		return r.restoreSecondaryIndexes(ctx)

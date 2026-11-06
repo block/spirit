@@ -50,7 +50,7 @@ func TestMoveWithConcurrentWrites(t *testing.T) {
 	testMoveWithConcurrentWrites(t, true)
 }
 
-func testMoveWithConcurrentWrites(t *testing.T, deferSecondaryIndexes bool) {
+func testMoveWithConcurrentWrites(t *testing.T, newHosts bool) {
 	// Unique (per-process) database names: the move treats any DDL in its
 	// source schema as a schema change and cancels itself, so a fixed name
 	// lets a concurrent `go test` against the same server kill this run by
@@ -62,7 +62,7 @@ func testMoveWithConcurrentWrites(t *testing.T, deferSecondaryIndexes bool) {
 	targetDSN := testutils.DSNForDatabase(targetName)
 
 	// Setup source database with a table similar to the load test
-	t.Logf("Creating source table for deferSecondaryIndexes=%v", deferSecondaryIndexes)
+	t.Logf("Creating source table for newHosts=%v", newHosts)
 	testutils.RunSQLInDatabase(t, sourceName, `CREATE TABLE xfers (
 		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
 		x_token VARCHAR(36) NOT NULL,
@@ -111,10 +111,10 @@ func testMoveWithConcurrentWrites(t *testing.T, deferSecondaryIndexes bool) {
 
 	// Run the move operation
 	move := &Move{
-		SourceDSN:             sourceDSN,
-		TargetDSN:             targetDSN,
-		Common:                flags.Common{Threads: 2, WriteThreads: 2},
-		DeferSecondaryIndexes: deferSecondaryIndexes,
+		SourceDSN:      sourceDSN,
+		TargetDSN:      targetDSN,
+		Common:         flags.Common{Threads: 2, WriteThreads: 2},
+		readServerData: fixedServerData(newHosts),
 	}
 
 	// Run move - this should succeed even with concurrent writes

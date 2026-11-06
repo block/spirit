@@ -34,10 +34,11 @@ type ServerUserData struct {
 	SeesEveryTable bool
 }
 
-// NewHost reports whether the server counts as a new host: the user sees
-// every table and they hold less than NewHostDataLimit bytes.
+// NewHost reports whether the server counts as a new host: the tables the
+// user sees hold less than NewHostDataLimit bytes. Without SeesEveryTable,
+// other schemas on the server may hold data the measurement cannot see.
 func (d ServerUserData) NewHost() bool {
-	return d.SeesEveryTable && d.Bytes < NewHostDataLimit
+	return d.Bytes < NewHostDataLimit
 }
 
 // ReadServerUserData measures the user data on db's server. exclude reports

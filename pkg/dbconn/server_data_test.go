@@ -13,8 +13,8 @@ func TestServerUserDataNewHost(t *testing.T) {
 	require.True(t, ServerUserData{Bytes: 0, SeesEveryTable: true}.NewHost())
 	require.True(t, ServerUserData{Bytes: NewHostDataLimit - 1, SeesEveryTable: true}.NewHost())
 	require.False(t, ServerUserData{Bytes: NewHostDataLimit, SeesEveryTable: true}.NewHost())
-	require.False(t, ServerUserData{Bytes: 0, SeesEveryTable: false}.NewHost(),
-		"a user that cannot see every table cannot tell an empty server from one it has no grant on")
+	require.True(t, ServerUserData{Bytes: 0, SeesEveryTable: false}.NewHost(),
+		"a user granted only some schemas measures only those")
 }
 
 // TestReadServerUserData: a table's size counts toward the server's user data
