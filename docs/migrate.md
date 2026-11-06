@@ -11,6 +11,12 @@ spirit migrate --host mydb:3306 --username root --password secret \
                --database mydb --statement "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
 ```
 
+## Adding columns with expression defaults
+
+MySQL can reject `ADD COLUMN uuid CHAR(36) NOT NULL DEFAULT (UUID())` with error 1674 even on an empty table: DDL is statement-logged regardless of `binlog_format`. When this happens during shadow-table setup, Spirit adds the columns without their expression defaults, then sets those defaults before copying any rows. The row copy generates the new values using row-based logging. The source table is not altered by this fallback.
+
+The fallback applies only to ALTERs that add ordinary columns with independent defaults. Mixed operations, generated columns, check or foreign-key constraints, auto-increment columns, and defaults that reference columns retain the original error. New default values can be regenerated while changes are replayed into the private shadow table; they become visible to the application at cutover.
+
 ## Configuration
 
 - [checkpoint-max-age](#checkpoint-max-age)
