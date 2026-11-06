@@ -696,6 +696,27 @@ func TestIndependentAutoScaler_TrippedThrottlerHoldsReaders(t *testing.T) {
 	require.Equal(t, 3, as.readCurrent)
 }
 
+func TestIndependentAutoScaler_TrippedThrottlerFullQueueHoldsReaders(t *testing.T) {
+	// A halve fills the queue: the writers drain it at half the rate. The
+	// read pool must not shed for it, or the copy restarts short of readers
+	// once the stop clears.
+	as, fs, fr, st, ut := newTestIndependentScaler(8, 16, 3, 4)
+	ut.setUtil(1.2)
+	st.s = fullStats()
+	for range 10 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 3, as.readCurrent, "the read pool holds on a full queue while the throttler is tripped")
+	require.Equal(t, 3, fr.n)
+	require.Less(t, as.current, 8, "the write pool halves")
+	require.Equal(t, as.current, fs.n)
+
+	// Once the stop clears, a full queue sheds a reader again.
+	ut.setUtil(0.8)
+	as.tick(t.Context())
+	require.Equal(t, 2, as.readCurrent)
+}
+
 func TestIndependentAutoScaler_BalancedHoldsReaders(t *testing.T) {
 	as, _, fr, st, ut := newTestIndependentScaler(2, 4, 2, 4)
 	ut.setUtil(0.8)

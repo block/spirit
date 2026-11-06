@@ -353,13 +353,16 @@ func (a *autoScaler) tick(ctx context.Context) {
 //	write pool (gate):      util >= panic  halve
 //	                        util >= high   shed 1
 //	                        util < low     +1 if the queue is full, else hold
-//	read pool (readGate):   starved        +1, unless the throttler is tripped
+//	read pool (readGate):   util >= panic or throttler tripped  hold
+//	                        starved        +1
 //	                        full           shed 1
 //	                        balanced       hold
 //
 // While the throttler is tripped the readers wait in BlockWait, so the queue
-// drains and reads as starved without saying anything about the readers; the
-// read pool then holds instead of growing into the stop. The two pools keep
+// drains and reads as starved without saying anything about the readers; a
+// halve fills it for the same reason. The read pool then holds, neither
+// growing into the stop nor shedding readers the writers will need once it
+// clears. The two pools keep
 // separate cooldowns because they no longer share a signal: a reader added on
 // a starved queue says nothing about whether the writers' servers have room.
 func (a *autoScaler) tickIndependent(util float64, queue queueState) {
@@ -386,18 +389,20 @@ func (a *autoScaler) tickIndependent(util float64, queue queueState) {
 		a.gate.Idle()
 	}
 
+	// The queue says nothing about the readers while the writers' servers
+	// halve or stop them: it drains with the readers parked in BlockWait and
+	// fills with the writers halved. The read pool holds through both.
 	readZone := autoscale.Hold
-	switch queue {
-	case queueStarved:
-		readZone = autoscale.Grow
-	case queueFull:
-		readZone = autoscale.Shed
-	case queueBalanced:
+	if zone != autoscale.Halve && !a.throttler.IsThrottled() {
+		switch queue {
+		case queueStarved:
+			readZone = autoscale.Grow
+		case queueFull:
+			readZone = autoscale.Shed
+		case queueBalanced:
+		}
 	}
-	readPlan := a.readGate.Decide(autoscale.Inputs{
-		Zone:          readZone,
-		GrowthBlocked: zone == autoscale.Halve || a.throttler.IsThrottled(),
-	})
+	readPlan := a.readGate.Decide(autoscale.Inputs{Zone: readZone})
 	switch readPlan {
 	case autoscale.PlanGrow:
 		a.setRead(a.readCurrent + 1)
