@@ -58,14 +58,21 @@ func DropDeferrableSecondaryIndexes(createStmt, tableName string) (string, error
 // source's AUTO_INCREMENT, and so may have dropped the index that supports
 // it, while MySQL refuses a table whose AUTO_INCREMENT column leads no index.
 // PRIMARY, UNIQUE, FULLTEXT and SPATIAL indexes are never removed, and an index
-// the target has under a source index's name is compared as it is.
+// the target has under a source index's name is compared as it is. Only the
+// target's indexes count toward that name match, not its CHECK or FOREIGN KEY
+// constraints.
 func RemoveDeferredIndexes(sourceCreate, targetCreate string) (string, error) {
 	target, err := ParseCreateTable(targetCreate)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse target CREATE TABLE: %w", err)
 	}
+	// Only indexes: a CHECK or FOREIGN KEY constraint is in its own namespace,
+	// so one named like a deferred index must not make it look present.
 	present := make(map[string]bool)
 	for _, constraint := range target.Raw.Constraints {
+		if constraint.Tp == ast.ConstraintCheck || constraint.Tp == ast.ConstraintForeignKey {
+			continue
+		}
 		present[strings.ToLower(constraint.Name)] = true
 	}
 	source, err := ParseCreateTable(sourceCreate)

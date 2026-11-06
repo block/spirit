@@ -1049,6 +1049,7 @@ func TestRemoveDeferredIndexes(t *testing.T) {
 		{"one deferred", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), UNIQUE KEY c_uniq (c))", []string{"PRIMARY", "ai", "c_uniq"}},
 		{"auto-increment support deferred", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL, a INT, c INT, PRIMARY KEY (p), UNIQUE KEY c_uniq (c))", []string{"PRIMARY", "c_uniq"}},
 		{"unique key missing", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), KEY a_idx (a))", []string{"PRIMARY", "ai", "a_idx", "c_uniq"}},
+		{"deferred index shares a check constraint's name", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), UNIQUE KEY c_uniq (c), CONSTRAINT a_idx CHECK (a >= 0))", []string{"PRIMARY", "ai", "c_uniq"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := RemoveDeferredIndexes(source, tc.target)
