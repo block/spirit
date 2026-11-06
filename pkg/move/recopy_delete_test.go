@@ -28,6 +28,10 @@ type recopyDeleteTargets struct {
 	// fail target waits for it, so the failure comes while that statement
 	// runs rather than before it starts.
 	blocked chan struct{}
+	// gather is, per server, how many statements must be running on it
+	// before each of them finishes, waiting up to five seconds. It makes
+	// the overlap a test asserts not depend on scheduling.
+	gather map[string]int
 
 	mu        sync.Mutex
 	runs      map[string]int // "target|statement" -> times run
@@ -87,6 +91,18 @@ func (f *recopyDeleteTargets) exec(ctx context.Context, target int, server, quer
 	}
 	f.maxAll = max(f.maxAll, all)
 	f.mu.Unlock()
+	if want := f.gather[server]; want > 0 {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			f.mu.Lock()
+			reached := f.maxServer[server] >= want
+			f.mu.Unlock()
+			if reached {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 	defer func() {
 		f.mu.Lock()
 		f.inflight[server]--
@@ -168,6 +184,28 @@ func TestDeleteRecopyRangeRunsEveryDeleteOncePerServer(t *testing.T) {
 	require.Equal(t, map[string]int{"server-a:3306": 1, "server-b:3306": 1, "server-c:3306": 1}, f.maxServer,
 		"a server runs one recopy DELETE at a time")
 	require.Greater(t, f.maxAll, 1, "different servers run their DELETEs at the same time")
+}
+
+// TestDeleteRecopyRangeNewHostsRunEveryTargetAtOnce: on new hosts the targets
+// that share a server delete at the same time, each target still running its
+// tables one after another, and every DELETE still runs exactly once.
+func TestDeleteRecopyRangeNewHostsRunEveryTargetAtOnce(t *testing.T) {
+	f := newRecopyDeleteTargets()
+	// Targets 0, 1 and 2 share server-a.
+	f.gather = map[string]int{"server-a:3306": 3}
+	r := f.runner(t, []string{"server-a:3306", "server-a:3306", "server-a:3306", "server-b:3306"}, "t1", "t2")
+	r.newHosts = true
+	require.NoError(t, r.deleteRecopyRange(t.Context(), `{}`))
+
+	want := map[string]int{}
+	for target := range 4 {
+		for _, name := range []string{"t1", "t2"} {
+			want[strconv.Itoa(target)+"|DELETE FROM `"+name+"` WHERE 1=1"] = 1
+		}
+	}
+	require.Equal(t, want, f.runs)
+	require.Equal(t, map[string]int{"server-a:3306": 3, "server-b:3306": 1}, f.maxServer,
+		"every target on a new host deletes at the same time, one table at a time")
 }
 
 // TestDeleteRecopyRangeFailureCancelsOtherServers: a DELETE that fails on one

@@ -2495,9 +2495,12 @@ func (r *Runner) flushAllReplClients(ctx context.Context) error {
 // the checkpoint was written is emptied on every target, and with several
 // sources a DELETE can also remove other sources' rows (see below). The
 // resume waits for all of it with no status reports and no change feed
-// running. Like restoreSecondaryIndexes, the
-// target servers are deleted from at the same time, and the targets that
-// share a server one after another.
+// running. The target servers are deleted from at the same time. On new
+// hosts (detectNewHosts) every target deletes at the same time too: the server
+// serves nothing but this move, and the copy already writes to every target
+// on it at once. Elsewhere the targets that share a server delete one after
+// another, like restoreSecondaryIndexes, because nothing throttles the resume
+// before the copy starts. Each target deletes its tables one after another.
 func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) error {
 	// The checkpoint watermark format depends on how many chunkers the copy
 	// chunker wraps: a single (source, table) pair stores that chunker's own
@@ -2552,16 +2555,29 @@ func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) 
 	}
 
 	hosts := r.targetHosts()
+	// Each lane runs its targets one after another, and the lanes run at the
+	// same time: one lane per server, or one per target on new hosts.
+	lanes := make([][]int, 0, len(r.targets))
+	for _, group := range hosts {
+		if !r.newHosts {
+			lanes = append(lanes, group.Indices)
+			continue
+		}
+		for _, i := range group.Indices {
+			lanes = append(lanes, []int{i})
+		}
+	}
 	r.logger.Info("deleting rows at/above the copier resume position from every target",
 		"tables", len(deletes),
 		"targets", len(r.targets),
 		"hosts", len(hosts),
+		"concurrent_deletes", len(lanes),
 	)
 	started := time.Now()
 	g, gctx := errgroup.WithContext(ctx)
-	for _, group := range hosts {
+	for _, lane := range lanes {
 		g.Go(func() error {
-			for _, i := range group.Indices {
+			for _, i := range lane {
 				for _, d := range deletes {
 					result, err := r.targets[i].DB.ExecContext(gctx, d.stmt)
 					if err != nil {
