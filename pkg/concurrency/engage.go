@@ -63,7 +63,9 @@ type Request struct {
 	ClientCeiling int
 	// NewHosts declares that the target servers serve nothing but this run,
 	// so each target gets at least autoscale.NewHostMinWriteThreads write
-	// workers.
+	// workers. The write floor is the only autoscaling difference today; more
+	// are likely to follow, since a server no client depends on can be loaded
+	// harder than a serving one. Add them behind this field.
 	NewHosts bool
 	Logger   *slog.Logger
 }
