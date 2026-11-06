@@ -37,8 +37,11 @@ func UserDataBytes(ctx context.Context, db *sql.DB, exclude func(schema, table s
 	}
 	defer func() {
 		// The pool reuses the connection, so put the cache back. If that
-		// fails, drop the connection instead.
-		if _, err := conn.ExecContext(context.WithoutCancel(ctx), "SET SESSION information_schema_stats_expiry = DEFAULT"); err != nil {
+		// fails, drop the connection instead. The reset is bounded: the
+		// caller may hold locks, so a hung server must not keep it waiting.
+		resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tableUnlockTimeout)
+		defer cancel()
+		if _, err := conn.ExecContext(resetCtx, "SET SESSION information_schema_stats_expiry = DEFAULT"); err != nil {
 			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 		}
 	}()

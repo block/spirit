@@ -1017,3 +1017,35 @@ func TestDropDeferrableSecondaryIndexes(t *testing.T) {
 	_, err := DropDeferrableSecondaryIndexes("not sql", "t")
 	require.Error(t, err)
 }
+
+// TestRemoveDeferredIndexes: the source loses exactly the deferrable indexes
+// the target lacks, including one that supports AUTO_INCREMENT on the source,
+// and never a unique key.
+func TestRemoveDeferredIndexes(t *testing.T) {
+	const source = "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), KEY a_idx (a), UNIQUE KEY c_uniq (c))"
+	indexes := func(t *testing.T, createStmt string) []string {
+		t.Helper()
+		ct, err := ParseCreateTable(createStmt)
+		require.NoError(t, err)
+		var names []string
+		for _, index := range ct.GetIndexes() {
+			names = append(names, index.Name)
+		}
+		return names
+	}
+	for _, tc := range []struct {
+		name, target string
+		want         []string
+	}{
+		{"every index", source, []string{"PRIMARY", "ai", "a_idx", "c_uniq"}},
+		{"one deferred", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), UNIQUE KEY c_uniq (c))", []string{"PRIMARY", "ai", "c_uniq"}},
+		{"auto-increment support deferred", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL, a INT, c INT, PRIMARY KEY (p), UNIQUE KEY c_uniq (c))", []string{"PRIMARY", "c_uniq"}},
+		{"unique key missing", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), KEY a_idx (a))", []string{"PRIMARY", "ai", "a_idx", "c_uniq"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := RemoveDeferredIndexes(source, tc.target)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, indexes(t, got))
+		})
+	}
+}

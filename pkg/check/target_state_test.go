@@ -290,7 +290,8 @@ func TestTargetStateCheckDeferredIndexes(t *testing.T) {
 	}{
 		{"every index", ", KEY a_idx (a), KEY b_idx (b), UNIQUE KEY c_uniq (c)", true},
 		{"deferrable indexes dropped", ", UNIQUE KEY c_uniq (c)", true},
-		{"one deferrable index dropped", ", KEY b_idx (b), UNIQUE KEY c_uniq (c)", false},
+		{"one deferrable index dropped", ", KEY b_idx (b), UNIQUE KEY c_uniq (c)", true},
+		{"deferrable index redefined", ", KEY a_idx (b), KEY b_idx (b), UNIQUE KEY c_uniq (c)", false},
 		{"unique index dropped", ", KEY a_idx (a), KEY b_idx (b)", false},
 		{"no secondary index", "", false},
 	} {
@@ -377,4 +378,24 @@ func TestTargetStateCheckRejectsNullableTargetColumn(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "schema does not match")
 	require.Contains(t, err.Error(), "customer_id")
+}
+
+// TestTargetStateCheckDeferredAutoIncrementSupport: a sharded target without
+// the source's AUTO_INCREMENT may drop the index that supports it on the
+// source, and a re-run still accepts it.
+func TestTargetStateCheckDeferredAutoIncrementSupport(t *testing.T) {
+	srcName, srcDB := createW3DDatabase(t)
+	tgtName, tgtDB := createW3DDatabase(t)
+	_, err := srcDB.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.items (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, PRIMARY KEY (p), KEY ai (id), KEY a_idx (a))", srcName))
+	require.NoError(t, err)
+	_, err = tgtDB.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.items (p INT NOT NULL, id BIGINT NOT NULL, a INT, PRIMARY KEY (p))", tgtName))
+	require.NoError(t, err)
+	sourceTable := table.NewTableInfo(srcDB, srcName, "items")
+	require.NoError(t, sourceTable.SetInfo(t.Context()))
+	require.NoError(t, targetStateCheck(t.Context(), Resources{
+		Runtime:      Move,
+		Sources:      []Endpoint{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
+		Targets:      []applier.Target{{DB: tgtDB, Config: &mysql.Config{DBName: tgtName}}},
+		SourceTables: []*table.TableInfo{sourceTable},
+	}, slog.Default()))
 }

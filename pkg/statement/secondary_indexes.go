@@ -50,6 +50,51 @@ func DropDeferrableSecondaryIndexes(createStmt, tableName string) (string, error
 	return fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(tableName), strings.Join(clauses, ", ")), nil
 }
 
+// RemoveDeferredIndexes returns sourceCreate without the deferrable secondary
+// indexes that targetCreate lacks: the source as a target whose indexes were
+// deferred should look, however many of them it has gained back. An index
+// counts as deferrable without regard to AUTO_INCREMENT support (as in
+// RemoveSecondaryIndexesForComparison): a sharded target may not carry the
+// source's AUTO_INCREMENT, and so may have dropped the index that supports
+// it, while MySQL refuses a table whose AUTO_INCREMENT column leads no index.
+// PRIMARY, UNIQUE, FULLTEXT and SPATIAL indexes are never removed, and an index
+// the target has under a source index's name is compared as it is.
+func RemoveDeferredIndexes(sourceCreate, targetCreate string) (string, error) {
+	target, err := ParseCreateTable(targetCreate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse target CREATE TABLE: %w", err)
+	}
+	present := make(map[string]bool)
+	for _, constraint := range target.Raw.Constraints {
+		present[strings.ToLower(constraint.Name)] = true
+	}
+	source, err := ParseCreateTable(sourceCreate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse source CREATE TABLE: %w", err)
+	}
+	missing := make(map[*ast.Constraint]bool)
+	for _, constraint := range deferrableIndexes(source, false) {
+		if constraint.Name != "" && !present[strings.ToLower(constraint.Name)] {
+			missing[constraint] = true
+		}
+	}
+	if len(missing) == 0 {
+		return sourceCreate, nil
+	}
+	kept := make([]*ast.Constraint, 0, len(source.Raw.Constraints))
+	for _, constraint := range source.Raw.Constraints {
+		if !missing[constraint] {
+			kept = append(kept, constraint)
+		}
+	}
+	source.Raw.Constraints = kept
+	var sb strings.Builder
+	if err := source.Raw.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)); err != nil {
+		return "", fmt.Errorf("failed to restore CREATE TABLE: %w", err)
+	}
+	return sb.String(), nil
+}
+
 func removeSecondaryIndexes(createStmt string, preserveAutoIncrement bool) (string, error) {
 	ct, err := ParseCreateTable(createStmt)
 	if err != nil {

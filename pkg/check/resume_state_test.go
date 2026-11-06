@@ -379,3 +379,49 @@ func TestResumeStateCheckRequiresCheckpointTable(t *testing.T) {
 	}
 	require.EqualError(t, resumeStateCheck(t.Context(), r, slog.Default()), "no checkpoint table configured")
 }
+
+// TestResumeStateCheckDeferredIndexes: a move stopped while its secondary
+// indexes were deferred, or part way through restoring them, can resume. A
+// missing unique key or a changed index still blocks the resume.
+func TestResumeStateCheckDeferredIndexes(t *testing.T) {
+	srcName, srcDB := createW3DDatabase(t)
+	tgtName, tgtDB := createW3DDatabase(t)
+	_, err := srcDB.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.items (id BIGINT NOT NULL, a INT, b INT, c VARCHAR(32), PRIMARY KEY (id), KEY a_idx (a), KEY b_idx (b), UNIQUE KEY c_uniq (c))", srcName))
+	require.NoError(t, err)
+	_, err = tgtDB.ExecContext(t.Context(), fmt.Sprintf(`CREATE TABLE %s._spirit_move_checkpoint (
+		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		copier_watermark TEXT, checksum_watermark TEXT, binlog_position TEXT, statement TEXT,
+		original_table_name VARCHAR(64) NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)`, tgtName))
+	require.NoError(t, err)
+	sourceTable := table.NewTableInfo(srcDB, srcName, "items")
+	require.NoError(t, sourceTable.SetInfo(t.Context()))
+	resources := Resources{
+		Runtime:         Move,
+		CheckpointTable: moveCheckpointTableName,
+		Sources:         []Endpoint{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
+		Targets:         []applier.Target{{DB: tgtDB, Config: &mysql.Config{DBName: tgtName}}},
+		SourceTables:    []*table.TableInfo{sourceTable},
+	}
+	for _, tc := range []struct {
+		name, indexes string
+		ok            bool
+	}{
+		{"every index", ", KEY a_idx (a), KEY b_idx (b), UNIQUE KEY c_uniq (c)", true},
+		{"deferrable indexes dropped", ", UNIQUE KEY c_uniq (c)", true},
+		{"one deferrable index restored", ", KEY b_idx (b), UNIQUE KEY c_uniq (c)", true},
+		{"deferrable index redefined", ", KEY a_idx (b), UNIQUE KEY c_uniq (c)", false},
+		{"unique index dropped", ", KEY a_idx (a), KEY b_idx (b)", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tgtDB.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.items (id BIGINT NOT NULL, a INT, b INT, c VARCHAR(32), PRIMARY KEY (id)%s)", tgtName, tc.indexes))
+			require.NoError(t, err)
+			defer func() { _, _ = tgtDB.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s.items", tgtName)) }()
+			err = resumeStateCheck(t.Context(), resources, slog.Default())
+			if tc.ok {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, "schema mismatch")
+		})
+	}
+}
