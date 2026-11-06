@@ -613,6 +613,21 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
+	// On new hosts, a checkpoint with no checksum watermark was written
+	// before the checksum started, so the copy is still running or its
+	// indexes are being restored: drop the deferrable secondary indexes
+	// (again) so the rest of the copy does not maintain them. They are
+	// restored before the checksum, as on a fresh run. This also defers the
+	// indexes of a move that started without deferring them. It runs before
+	// a multi-source resume discards the watermark below, so the decision is
+	// the checkpoint's for every number of sources. Dropping first also makes
+	// the DELETE in deleteRecopyRange cheaper.
+	if r.newHosts && r.checksumWatermark == "" {
+		if err := r.deferTargetIndexes(ctx); err != nil {
+			return err
+		}
+	}
+
 	// With multiple sources, a persisted checksum watermark cannot be trusted.
 	// deleteRecopyRange (below) runs every (source, table) DELETE against
 	// every target, and same-named tables from different sources interleave in
@@ -632,21 +647,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 			"reason", "deleteRecopyRange may remove rows below other sources' watermarks; only a from-scratch checksum re-verifies and repairs them",
 			"sources", len(r.sources))
 		r.checksumWatermark = ""
-	}
-
-	// On new hosts, a checkpoint with no checksum watermark was written
-	// before the checksum started, so the copy is still running or its
-	// indexes are being restored: drop the deferrable secondary indexes
-	// (again) so the rest of the copy does not maintain them. They are
-	// restored before the checksum, as on a fresh run. This also defers the
-	// indexes of a move that started without deferring them. It is checked on
-	// the checkpoint's watermark, not r.checksumWatermark, which a
-	// multi-source resume discards above. Dropping first also makes the
-	// DELETE below cheaper.
-	if r.newHosts && rec.ChecksumWatermark == "" {
-		if err := r.deferTargetIndexes(ctx); err != nil {
-			return err
-		}
 	}
 
 	// Delete rows at/above the copier's resume position (the watermark
