@@ -119,10 +119,10 @@ func testResumeFromCheckpointE2E(t *testing.T, newHosts bool) {
 	defer utils.CloseAndLog(db)
 	// test
 	move := &Move{
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		Common:         flags.Common{Threads: 1, WriteThreads: 1},
-		readServerData: fixedServerData(newHosts),
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(newHosts),
 	}
 	r, err := NewRunner(move)
 	require.NoError(t, err)
@@ -531,10 +531,10 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	})
 
 	move := &Move{
-		SourceDSN:      src.FormatDSN(),
-		TargetDSN:      dest.FormatDSN(),
-		Common:         flags.Common{Threads: 1, WriteThreads: 1},
-		readServerData: fixedServerData(true),
+		SourceDSN:     src.FormatDSN(),
+		TargetDSN:     dest.FormatDSN(),
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(true),
 	}
 	r, err := NewRunner(move)
 	require.NoError(t, err)

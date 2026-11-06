@@ -111,10 +111,10 @@ func testMoveWithConcurrentWrites(t *testing.T, newHosts bool) {
 
 	// Run the move operation
 	move := &Move{
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		Common:         flags.Common{Threads: 2, WriteThreads: 2},
-		readServerData: fixedServerData(newHosts),
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 2, WriteThreads: 2},
+		userDataBytes: fixedServerData(newHosts),
 	}
 
 	// Run move - this should succeed even with concurrent writes

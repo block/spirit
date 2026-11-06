@@ -138,9 +138,9 @@ type Runner struct {
 	// because CI has no Aurora to probe.
 	buildAurora func(context.Context, throttler.AuroraSetup) (throttler.AuroraResult, error)
 	auroraVCPUs func(context.Context, *sql.DB) (int, error)
-	// readServerData is detectNewHosts' measurement: Move.readServerData when
-	// a test set it, otherwise dbconn.ReadServerUserData.
-	readServerData func(context.Context, *sql.DB, func(schema, table string) bool) (dbconn.ServerUserData, error)
+	// userDataBytes is detectNewHosts' measurement: Move.userDataBytes when
+	// a test set it, otherwise dbconn.UserDataBytes.
+	userDataBytes func(context.Context, *sql.DB, func(schema, table string) bool) (int64, error)
 
 	applier     applier.Applier
 	chunkerMu   sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
@@ -239,10 +239,10 @@ func NewRunner(m *Move) (*Runner, error) {
 		logger:              slog.Default(),
 		metricsSink:         &metrics.NoopSink{},
 		buildAurora:         throttler.BuildAurora,
-		readServerData:      dbconn.ReadServerUserData,
+		userDataBytes:       dbconn.UserDataBytes,
 	}
-	if m.readServerData != nil {
-		r.readServerData = m.readServerData
+	if m.userDataBytes != nil {
+		r.userDataBytes = m.userDataBytes
 	}
 	return r, nil
 }
@@ -851,7 +851,7 @@ func (r *Runner) setupThrottling(ctx context.Context) error {
 
 // detectNewHosts reports whether every target server is a new host: it holds
 // less than dbconn.NewHostDataLimit bytes outside the tables this move writes
-// (dbconn.ReadServerUserData). The move's own tables are left out so a
+// (dbconn.UserDataBytes). The move's own tables are left out so a
 // resumed move, whose targets hold the rows copied so far, reaches the same
 // answer as the fresh one. A server that cannot be measured is not a new
 // host: the move then runs as it would into a serving host.
@@ -859,8 +859,8 @@ func (r *Runner) setupThrottling(ctx context.Context) error {
 // The measurement covers only the tables the target user can see. A user
 // granted only some schemas does not see the others, so a server that holds
 // data only in schemas the user was not granted counts as a new host. Target
-// users are usually granted the schemas they write to, so this is accepted:
-// a global grant would rule it out.
+// users are usually granted only the schemas they write to, so this is
+// accepted.
 func (r *Runner) detectNewHosts(ctx context.Context) bool {
 	own := make(map[string]bool, len(r.sourceTables))
 	for _, t := range r.sourceTables {
@@ -873,7 +873,7 @@ func (r *Runner) detectNewHosts(ctx context.Context) bool {
 			schemas[r.targets[i].Config.DBName] = true
 		}
 		target := r.targets[group.Indices[0]]
-		data, err := r.readServerData(ctx, target.DB, func(schema, table string) bool {
+		bytes, err := r.userDataBytes(ctx, target.DB, func(schema, table string) bool {
 			return schemas[schema] && own[table]
 		})
 		log := r.logger.With("target", targetKey(target))
@@ -881,16 +881,12 @@ func (r *Runner) detectNewHosts(ctx context.Context) bool {
 		case err != nil:
 			log.Warn("could not measure the target server's data; treating it as a serving host", "error", err.Error())
 			return false
-		case !data.NewHost():
+		case bytes >= dbconn.NewHostDataLimit:
 			log.Info("the target server already holds data; treating it as a serving host",
-				"bytes", data.Bytes, "limit", dbconn.NewHostDataLimit)
+				"bytes", bytes, "limit", dbconn.NewHostDataLimit)
 			return false
 		}
-		if !data.SeesEveryTable {
-			log.Info("the target user has no global table privilege, so the measurement covers only the schemas it was granted; other schemas on the server may hold data",
-				"bytes", data.Bytes)
-		}
-		total += data.Bytes
+		total += bytes
 	}
 	r.logger.Info("every target server is a new host: deferring secondary indexes and allowing more load on the targets",
 		"hosts", len(r.targetHosts()), "bytes", total, "limit_per_host", dbconn.NewHostDataLimit)

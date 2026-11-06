@@ -21,20 +21,20 @@ import (
 // fixedServerData answers detectNewHosts with an empty server when newHosts
 // is set and with a full one otherwise, so a test's mode does not depend on
 // what other tests left on the shared server.
-func fixedServerData(newHosts bool) func(context.Context, *sql.DB, func(schema, table string) bool) (dbconn.ServerUserData, error) {
-	data := dbconn.ServerUserData{Bytes: dbconn.NewHostDataLimit, SeesEveryTable: true}
+func fixedServerData(newHosts bool) func(context.Context, *sql.DB, func(schema, table string) bool) (int64, error) {
+	bytes := int64(dbconn.NewHostDataLimit)
 	if newHosts {
-		data.Bytes = 0
+		bytes = 0
 	}
-	return func(context.Context, *sql.DB, func(schema, table string) bool) (dbconn.ServerUserData, error) {
-		return data, nil
+	return func(context.Context, *sql.DB, func(schema, table string) bool) (int64, error) {
+		return bytes, nil
 	}
 }
 
 // newHostsRunner returns a runner moving table t1 to three targets: shard0
 // and shard2 share server-a, and shard1 is on server-b. read answers each
 // server's measurement.
-func newHostsRunner(t *testing.T, read func(server string, exclude func(schema, table string) bool) (dbconn.ServerUserData, error)) *Runner {
+func newHostsRunner(t *testing.T, read func(server string, exclude func(schema, table string) bool) (int64, error)) *Runner {
 	t.Helper()
 	r, err := NewRunner(&Move{})
 	require.NoError(t, err)
@@ -49,19 +49,19 @@ func newHostsRunner(t *testing.T, read func(server string, exclude func(schema, 
 			Config:   &mysql.Config{Net: "tcp", Addr: server, DBName: "shard" + string(rune('0'+i))},
 		})
 	}
-	r.readServerData = func(_ context.Context, db *sql.DB, exclude func(schema, table string) bool) (dbconn.ServerUserData, error) {
+	r.userDataBytes = func(_ context.Context, db *sql.DB, exclude func(schema, table string) bool) (int64, error) {
 		return read(dbs[db], exclude)
 	}
 	return r
 }
 
 func TestDetectNewHosts(t *testing.T) {
-	empty := dbconn.ServerUserData{Bytes: 1 << 20, SeesEveryTable: true}
+	const empty = 1 << 20
 
 	// Every server measured once, leaving out only the move's own tables in
 	// that server's target schemas.
 	measured := map[string]int{}
-	r := newHostsRunner(t, func(server string, exclude func(schema, table string) bool) (dbconn.ServerUserData, error) {
+	r := newHostsRunner(t, func(server string, exclude func(schema, table string) bool) (int64, error) {
 		measured[server]++
 		switch server {
 		case "server-a:3306":
@@ -79,25 +79,18 @@ func TestDetectNewHosts(t *testing.T) {
 	require.True(t, r.detectNewHosts(t.Context()))
 	require.Equal(t, map[string]int{"server-a:3306": 1, "server-b:3306": 1}, measured)
 
-	// A user granted only the target schemas measures only those: the
-	// servers still count as new hosts.
-	r = newHostsRunner(t, func(string, func(string, string) bool) (dbconn.ServerUserData, error) {
-		return dbconn.ServerUserData{Bytes: 1 << 20}, nil
-	})
-	require.True(t, r.detectNewHosts(t.Context()))
-
 	// One server that holds data, or that cannot be measured, makes the move
 	// treat every target as serving.
 	for name, answer := range map[string]struct {
-		data dbconn.ServerUserData
-		err  error
+		bytes int64
+		err   error
 	}{
-		"holds data":       {data: dbconn.ServerUserData{Bytes: dbconn.NewHostDataLimit, SeesEveryTable: true}},
+		"holds data":       {bytes: dbconn.NewHostDataLimit},
 		"measurement fail": {err: errors.New("server gone")},
 	} {
-		r := newHostsRunner(t, func(server string, _ func(string, string) bool) (dbconn.ServerUserData, error) {
+		r := newHostsRunner(t, func(server string, _ func(string, string) bool) (int64, error) {
 			if server == "server-b:3306" {
-				return answer.data, answer.err
+				return answer.bytes, answer.err
 			}
 			return empty, nil
 		})
@@ -177,10 +170,10 @@ func targetIndexes(t *testing.T, schema string) []string {
 func TestMoveDefersIndexesOfPreCreatedTables(t *testing.T) {
 	sourceDSN, targetDSN := preCreatedIndexTables(t, "precreated_defer_src", "precreated_defer_dst")
 	r, err := NewRunner(&Move{
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		Common:         flags.Common{Threads: 1, WriteThreads: 1},
-		readServerData: fixedServerData(true),
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(true),
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancelCause(t.Context())
@@ -213,10 +206,10 @@ func TestMoveDefersIndexesOfPreCreatedTables(t *testing.T) {
 func TestMovePreCreatedTablesRestoresDeferredIndexes(t *testing.T) {
 	sourceDSN, targetDSN := preCreatedIndexTables(t, "precreated_restore_src", "precreated_restore_dst")
 	move := &Move{
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		Common:         flags.Common{Threads: 1, WriteThreads: 1},
-		readServerData: fixedServerData(true),
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(true),
 	}
 	require.NoError(t, move.Run())
 	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "precreated_restore_dst"))
@@ -229,10 +222,10 @@ func resumeWithIndexes(t *testing.T, srcName, dstName string) *Move {
 	t.Helper()
 	sourceDSN, targetDSN := preCreatedIndexTables(t, srcName, dstName)
 	move := &Move{
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		Common:         flags.Common{Threads: 1, WriteThreads: 1},
-		readServerData: fixedServerData(false),
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(false),
 	}
 	checkpointAndStop(t, move)
 	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, dstName))
@@ -244,7 +237,7 @@ func resumeWithIndexes(t *testing.T, srcName, dstName string) *Move {
 // the finished move has them back.
 func TestMoveResumeDefersIndexes(t *testing.T) {
 	move := resumeWithIndexes(t, "resume_defer_src", "resume_defer_dst")
-	move.readServerData = fixedServerData(true)
+	move.userDataBytes = fixedServerData(true)
 
 	r, ctx := buildTestRunner(t, move)
 	require.NoError(t, r.setupDiscovery(ctx))
@@ -269,7 +262,7 @@ func TestMoveResumeDefersIndexes(t *testing.T) {
 // them before the checksum resumes.
 func TestMoveResumeKeepsIndexesPastChecksum(t *testing.T) {
 	move := resumeWithIndexes(t, "resume_keep_src", "resume_keep_dst")
-	move.readServerData = fixedServerData(true)
+	move.userDataBytes = fixedServerData(true)
 	testutils.RunSQL(t, "UPDATE resume_keep_dst."+checkpointTableName+" SET checksum_watermark = '{}'")
 
 	r, ctx := buildTestRunner(t, move)

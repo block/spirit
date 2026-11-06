@@ -9,18 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestServerUserDataNewHost(t *testing.T) {
-	require.True(t, ServerUserData{Bytes: 0, SeesEveryTable: true}.NewHost())
-	require.True(t, ServerUserData{Bytes: NewHostDataLimit - 1, SeesEveryTable: true}.NewHost())
-	require.False(t, ServerUserData{Bytes: NewHostDataLimit, SeesEveryTable: true}.NewHost())
-	require.True(t, ServerUserData{Bytes: 0, SeesEveryTable: false}.NewHost(),
-		"a user granted only some schemas measures only those")
-}
-
-// TestReadServerUserData: a table's size counts toward the server's user data
+// TestUserDataBytes: a table's size counts toward the server's user data
 // unless it is excluded, and the connection the sizes are read on goes back to
 // the pool with the stats cache restored.
-func TestReadServerUserData(t *testing.T) {
+func TestUserDataBytes(t *testing.T) {
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE sized (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pad VARBINARY(1024) NOT NULL)")
 	testutils.RunSQLInDatabase(t, dbName, "INSERT INTO sized (pad) SELECT RANDOM_BYTES(1024) FROM dual")
@@ -41,15 +33,14 @@ func TestReadServerUserData(t *testing.T) {
 
 	// Other tests write to the same server, so each read excludes every
 	// table it does not assert on.
-	only, err := ReadServerUserData(t.Context(), db, func(schema, table string) bool {
+	only, err := UserDataBytes(t.Context(), db, func(schema, table string) bool {
 		return schema != dbName || table != "sized"
 	})
 	require.NoError(t, err)
-	require.True(t, only.SeesEveryTable, "the test user's role grants SELECT on *.*")
-	require.GreaterOrEqual(t, only.Bytes, int64(1024*1024), "1024 rows of 1 KiB")
-	none, err := ReadServerUserData(t.Context(), db, func(string, string) bool { return true })
+	require.GreaterOrEqual(t, only, int64(1024*1024), "1024 rows of 1 KiB")
+	none, err := UserDataBytes(t.Context(), db, func(string, string) bool { return true })
 	require.NoError(t, err)
-	require.Zero(t, none.Bytes)
+	require.Zero(t, none)
 
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@session.information_schema_stats_expiry").Scan(&sessionExpiry))
 	require.Equal(t, globalExpiry, sessionExpiry, "the pooled connection keeps the server's stats cache setting")
