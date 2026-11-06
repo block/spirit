@@ -79,7 +79,7 @@ import (
 // arbitrates, so transient chunk-size swings (one huge chunk momentarily
 // draining or flooding the queue) don't flap the controller between sides.
 const (
-	// acQueueStarvedOccupancy is the occupancy (QueueDepth/QueueCap) at or
+	// acQueueStarvedOccupancy is the occupancy (applier.Stats.Occupancy) at or
 	// below which the queue reads as starved, provided queue-wait is also
 	// near zero — an empty queue alone is ambiguous while writers are still
 	// chewing through in-flight work.
@@ -195,18 +195,19 @@ type autoScaler struct {
 }
 
 // newAutoScaler builds a controller. start is the resolved write-thread count
-// (the applier was started at this value); maxThreads is the cap. The minimum
-// is always 1 so the copy keeps making progress. Requiring a GradualThrottler
+// (the applier was started at this value); minThreads and maxThreads bound it.
+// A minThreads below 1 means 1, so the copy keeps making progress. Requiring a GradualThrottler
 // (not just a Throttler) is what guarantees there is a continuous signal to
 // control on — the caller asserts for it and skips autoscaling otherwise.
-func newAutoScaler(t throttler.GradualThrottler, s writeScaler, start, maxThreads int, logger *slog.Logger, sink metrics.Sink) *autoScaler {
+func newAutoScaler(t throttler.GradualThrottler, s writeScaler, minThreads, start, maxThreads int, logger *slog.Logger, sink metrics.Sink) *autoScaler {
+	minThreads = max(1, min(minThreads, start))
 	if maxThreads < start {
 		maxThreads = start
 	}
 	return &autoScaler{
 		throttler:   t,
 		scaler:      s,
-		min:         1,
+		min:         minThreads,
 		max:         maxThreads,
 		current:     start,
 		logger:      logger,
@@ -360,7 +361,12 @@ func classifyQueue(s applier.Stats) queueState {
 	if s.QueueCap <= 0 {
 		return queueBalanced
 	}
-	occupancy := float64(s.QueueDepth) / float64(s.QueueCap)
+	// The fullest shard's buffer, not the summed queue: Apply blocks on the
+	// first full buffer, so a write-limited shard stops the readers while the
+	// summed queue of a many-target move reads nearly empty, and its writers
+	// would never grow. For starvation it is the stricter test too: readers
+	// are the bottleneck only when even the fullest buffer is nearly empty.
+	occupancy := s.Occupancy()
 	switch {
 	case occupancy <= acQueueStarvedOccupancy && s.QueueWaitP90 < acQueueWaitEpsilon:
 		return queueStarved

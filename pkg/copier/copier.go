@@ -91,6 +91,9 @@ type AutoscaleConfig struct {
 	StartThreads int
 	// MaxThreads is the cap the controller may scale up to.
 	MaxThreads int
+	// MinThreads is the fewest write threads the controller may scale down
+	// to. Zero means 1; it never exceeds StartThreads.
+	MinThreads int
 	// MaxReadThreads is the cap for the read-worker pool, which scales from
 	// CopierConfig.Concurrency. Zero means "derive it from Concurrency"
 	// (ResolveMaxReadThreads) — for callers with no view of the instance size.

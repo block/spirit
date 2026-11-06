@@ -43,7 +43,6 @@ The target check runs before the copy and on resume, before move writes anything
 - [checkpoint-max-age](#checkpoint-max-age)
 - [cutover-lock-timeout](#cutover-lock-timeout)
 - [defer-cutover](#defer-cutover)
-- [defer-secondary-indexes](#defer-secondary-indexes)
 - [force](#force)
 - [force-kill-after](#force-kill-after)
 - [lock-wait-timeout](#lock-wait-timeout)
@@ -114,13 +113,6 @@ Both checksums are lockless: they take no table lock and hold no long-lived snap
 The continuous checksum reuses the initial checksum's checker, so it runs at `--threads`, or is autoscaled when autoscaling engages (see [skip-autoscaling](#skip-autoscaling)). The first continuous-checksum iteration starts **one hour after the initial checksum completes**, so it does not re-read the tables straight after the pass that just verified them. Subsequent iterations run **at most once per hour**: after each pass finishes, Move waits one hour minus the duration of the just-finished pass before starting the next one (so passes that themselves take longer than an hour proceed immediately). The wait is interrupted immediately when the sentinel is dropped. It is enabled automatically whenever the sentinel is in effect — there is no separate flag.
 
 The continuous checksum does not repair. If a chunk still differs after the change feeds have been drained, the move is aborted with a "permanent divergence" error that names the chunk. The checksum watermark is cleared when the sentinel wait starts, so re-running the move resumes from the checkpoint and the initial checksum re-verifies every chunk and repairs the one that diverged. The intent is "fail loud, investigate" — since the initial checksum already passed, any difference detected during the sentinel wait is unexpected. A chunk that mismatches only until the feeds catch up is lag, not a difference, and does not abort the move. Because the watermark is cleared unconditionally, a move restarted at any point during the sentinel wait re-runs the full initial checksum.
-
-### defer-secondary-indexes
-
-- Type: Boolean
-- Default value: `false`
-
-When set to `true`, target tables are created without deferrable regular secondary indexes. PRIMARY, UNIQUE, FULLTEXT, and SPATIAL indexes are preserved, as is one regular index needed to support AUTO_INCREMENT (preferring the fewest key parts). The deferred indexes are restored from the source schema just before cutover. This can significantly speed up the initial data load for tables with many secondary indexes.
 
 ### force
 
@@ -283,6 +275,8 @@ For sharded moves, all write pools scale together using the **busiest target hos
 
 The gradual multi-throttler reports the maximum utilization across hosts: all hosts must have headroom to permit growth; any host in the middle band holds scaling steady; any busy host can trigger a reduction. Which host is busiest can change from one sample to the next. Write-thread counts apply per shard. There is no additional fixed host concurrency guard.
 
+The copier adds write threads when the applier queue is nearly full and queued work waits longer than a write takes. It reads the fullest shard's queue, not the total across shards. Write-thread counts change on every shard together, so one slow shard whose queue fills adds write threads on every target, up to the ceiling and while the load signal allows it. This applies to every sharded move, on new and serving hosts.
+
 As in migration, the copier owns throttling: it pauses before reading another chunk and its autoscaler adjusts the applier through `SetWriteWorkers`. Already-read and queued work continues draining. Moving throttler ownership into the applier is outside this change.
 
 If any Aurora target has fewer than 4 vCPUs, the whole move runs in small-instance mode instead, whatever the other targets are: 1 read thread, 1 write thread per target, 1 concurrent change-feed flush per source, a 1 MiB [target-chunk-size](#target-chunk-size), and no scaling. See [migrate's small-instance mode](migrate.md#skip-autoscaling).
@@ -294,6 +288,21 @@ Autoscaling engages only when every target host is Aurora (with at least four vC
 Each source's binlog flush is also sized from the targets, as `migrate` and `sync` size theirs: the smallest target's flush width, divided by the number of sources and by the largest number of target shards sharing a host (every flush fans out to every shard), and never narrower than the default of 8 concurrent statements (except in small-instance mode, where it is 1). The batch size shrinks as the width grows, so the rows each flush has in flight stay the same.
 
 This flag is experimental, as it is for `migrate`. It applies to forward copying and checksums; the reverse window does not acquire new monitors for its write destinations.
+
+## New target hosts
+
+A new host is a target server that serves nothing but this move. Move detects new hosts itself; there is no flag.
+
+**Detection.** Every target server is measured before the copy starts, on a fresh move and on a resume. A server is a new host when the data and index length of its base tables, outside the system schemas and the tables this move writes, is under 100 MiB. The sizes are read with `information_schema_stats_expiry = 0`, which bypasses the one-day statistics cache. They are fresher, not exact: InnoDB's own size estimates can lag a bulk load that just finished. 100 MiB is a proxy for "serves nothing": a small server that is busy also counts as a new host. The move's own tables are left out, so a resumed move reaches the same answer as the fresh one. If any target server holds more, or cannot be measured, the move treats every target as a serving host.
+
+`information_schema` lists only the tables the target user holds a privilege on. A user granted only the target schemas therefore measures only those, and a server whose other data sits in schemas the user cannot see counts as a new host. A global grant (for example `SELECT ON *.*`) makes the measurement cover the whole server.
+
+On new hosts:
+
+- Target tables are created without deferrable regular secondary indexes. PRIMARY, UNIQUE, FULLTEXT, and SPATIAL indexes are preserved, as is one regular index needed to support AUTO_INCREMENT (preferring the fewest key parts). The deferred indexes are restored from the source schema after the copy, before the checksum. This can significantly speed up the initial data load for tables with many secondary indexes.
+- A target table that already exists when the move starts (pre-created by a declarative schema workflow; it must be empty and match the source) has the same indexes dropped before the copy, and they are restored the same way. If the move stops before its first checkpoint, such a table is left without them. A re-run, and a resume, accept a target table that lacks some or all of the deferrable indexes and nothing else, and restore them; a target whose other indexes or columns differ from the source is still refused.
+- A move resumed from a checkpoint written before the checksum started drops the deferrable indexes from the target tables again, so the rest of the copy does not maintain them; this also defers the indexes of a move that started without deferring them. The drop runs on every target server at the same time and frees the indexes' pages. A move resumed while its indexes were being restored, or while it waited on the sentinel, drops and rebuilds them, which is correct but repeats the rebuild. The sentinel wait clears the checksum watermark, so with [defer-cutover](#defer-cutover) every restart during the wait rebuilds every deferrable index before the initial checksum re-runs. Allow for that time when you plan a long wait.
+- Autoscaling keeps at least two write threads per target. One write thread leaves a target idle while it prepares its next statement and waits on its commit. This is the only autoscaling change on new hosts today; later releases are likely to add more, since a server that serves no clients can be loaded harder.
 
 ## GTID auto-detection
 

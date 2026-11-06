@@ -26,12 +26,108 @@ func RemoveSecondaryIndexesForComparison(createStmt string) (string, error) {
 	return removeSecondaryIndexes(createStmt, false)
 }
 
+// DropDeferrableSecondaryIndexes returns the ALTER TABLE that drops from
+// tableName the indexes RemoveSecondaryIndexes would leave out of createStmt,
+// or "" if there are none. It defers the indexes of a table that already
+// exists, such as one pre-created by a declarative schema workflow, the same
+// way RemoveSecondaryIndexes defers them for a table about to be created.
+// createStmt should come from SHOW CREATE TABLE, which names every index.
+func DropDeferrableSecondaryIndexes(createStmt, tableName string) (string, error) {
+	ct, err := ParseCreateTable(createStmt)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse CREATE TABLE: %w", err)
+	}
+	var clauses []string
+	for _, constraint := range deferrableIndexes(ct, true) {
+		if constraint.Name == "" {
+			return "", fmt.Errorf("cannot drop an unnamed index from %s", tableName)
+		}
+		clauses = append(clauses, "DROP INDEX "+sqlescape.EscapeIdentifier(constraint.Name))
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(tableName), strings.Join(clauses, ", ")), nil
+}
+
+// RemoveDeferredIndexes returns sourceCreate without the deferrable secondary
+// indexes that targetCreate lacks: the source as a target whose indexes were
+// deferred should look, however many of them it has gained back. An index
+// counts as deferrable without regard to AUTO_INCREMENT support (as in
+// RemoveSecondaryIndexesForComparison): a sharded target may not carry the
+// source's AUTO_INCREMENT, and so may have dropped the index that supports
+// it, while MySQL refuses a table whose AUTO_INCREMENT column leads no index.
+// PRIMARY, UNIQUE, FULLTEXT and SPATIAL indexes are never removed, and an index
+// the target has under a source index's name is compared as it is.
+func RemoveDeferredIndexes(sourceCreate, targetCreate string) (string, error) {
+	target, err := ParseCreateTable(targetCreate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse target CREATE TABLE: %w", err)
+	}
+	present := make(map[string]bool)
+	for _, constraint := range target.Raw.Constraints {
+		present[strings.ToLower(constraint.Name)] = true
+	}
+	source, err := ParseCreateTable(sourceCreate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse source CREATE TABLE: %w", err)
+	}
+	missing := make(map[*ast.Constraint]bool)
+	for _, constraint := range deferrableIndexes(source, false) {
+		if constraint.Name != "" && !present[strings.ToLower(constraint.Name)] {
+			missing[constraint] = true
+		}
+	}
+	if len(missing) == 0 {
+		return sourceCreate, nil
+	}
+	kept := make([]*ast.Constraint, 0, len(source.Raw.Constraints))
+	for _, constraint := range source.Raw.Constraints {
+		if !missing[constraint] {
+			kept = append(kept, constraint)
+		}
+	}
+	source.Raw.Constraints = kept
+	var sb strings.Builder
+	if err := source.Raw.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)); err != nil {
+		return "", fmt.Errorf("failed to restore CREATE TABLE: %w", err)
+	}
+	return sb.String(), nil
+}
+
 func removeSecondaryIndexes(createStmt string, preserveAutoIncrement bool) (string, error) {
 	ct, err := ParseCreateTable(createStmt)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse CREATE TABLE: %w", err)
 	}
+	deferred := make(map[*ast.Constraint]bool)
+	for _, constraint := range deferrableIndexes(ct, preserveAutoIncrement) {
+		deferred[constraint] = true
+	}
+	filteredConstraints := make([]*ast.Constraint, 0)
+	for _, constraint := range ct.Raw.Constraints {
+		if !deferred[constraint] {
+			filteredConstraints = append(filteredConstraints, constraint)
+		}
+	}
 
+	// Update the AST with filtered constraints
+	ct.Raw.Constraints = filteredConstraints
+
+	// Restore the modified AST back to SQL
+	var sb strings.Builder
+	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
+	if err := ct.Raw.Restore(rCtx); err != nil {
+		return "", fmt.Errorf("failed to restore CREATE TABLE: %w", err)
+	}
+
+	return sb.String(), nil
+}
+
+// deferrableIndexes returns ct's regular (non-UNIQUE, non-FULLTEXT,
+// non-SPATIAL) indexes in declaration order, less the one kept to support an
+// AUTO_INCREMENT column when preserveAutoIncrement is set.
+func deferrableIndexes(ct *CreateTable, preserveAutoIncrement bool) []*ast.Constraint {
 	// InnoDB requires AUTO_INCREMENT to lead an index. Retained primary
 	// and unique keys can satisfy it; otherwise keep one supporting regular
 	// index. ParseCreateTable normalizes inline PRIMARY KEY and UNIQUE clauses.
@@ -61,29 +157,17 @@ func removeSecondaryIndexes(createStmt string, preserveAutoIncrement bool) (stri
 			support[name] = constraint
 		}
 	}
-	filteredConstraints := make([]*ast.Constraint, 0)
+	var deferrable []*ast.Constraint
 	for _, constraint := range ct.Raw.Constraints {
-		switch constraint.Tp { //nolint:exhaustive
-		case ast.ConstraintKey, ast.ConstraintIndex:
-			if len(constraint.Keys) > 0 && constraint.Keys[0].Column != nil && support[strings.ToLower(constraint.Keys[0].Column.Name.O)] == constraint {
-				filteredConstraints = append(filteredConstraints, constraint)
-			}
-		default:
-			filteredConstraints = append(filteredConstraints, constraint)
+		if constraint.Tp != ast.ConstraintKey && constraint.Tp != ast.ConstraintIndex {
+			continue
 		}
+		if len(constraint.Keys) > 0 && constraint.Keys[0].Column != nil && support[strings.ToLower(constraint.Keys[0].Column.Name.O)] == constraint {
+			continue
+		}
+		deferrable = append(deferrable, constraint)
 	}
-
-	// Update the AST with filtered constraints
-	ct.Raw.Constraints = filteredConstraints
-
-	// Restore the modified AST back to SQL
-	var sb strings.Builder
-	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-	if err := ct.Raw.Restore(rCtx); err != nil {
-		return "", fmt.Errorf("failed to restore CREATE TABLE: %w", err)
-	}
-
-	return sb.String(), nil
+	return deferrable
 }
 
 // GetMissingSecondaryIndexes compares two CREATE TABLE statements (source and target)

@@ -88,7 +88,7 @@ func TestResumeFromCheckpointE2E(t *testing.T) {
 	})
 }
 
-func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
+func testResumeFromCheckpointE2E(t *testing.T, newHosts bool) {
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -119,10 +119,10 @@ func testResumeFromCheckpointE2E(t *testing.T, deferSecondaryIndexes bool) {
 	defer utils.CloseAndLog(db)
 	// test
 	move := &Move{
-		SourceDSN:             sourceDSN,
-		TargetDSN:             targetDSN,
-		Common:                flags.Common{Threads: 1, WriteThreads: 1},
-		DeferSecondaryIndexes: deferSecondaryIndexes,
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(newHosts),
 	}
 	r, err := NewRunner(move)
 	require.NoError(t, err)
@@ -492,7 +492,7 @@ func TestPostCopyAnalyzeTargetSchema(t *testing.T) {
 
 // TestDeltasFlushedDuringIndexRestore is a regression test for the
 // availability bug where postCopyPhase stopped the periodic flush before
-// restoreSecondaryIndexes. With --defer-secondary-indexes the restore is one
+// restoreSecondaryIndexes. On new hosts the restore is one
 // giant ALTER per table which can run for hours on a large table; with
 // flushing stopped for that window, deltas accumulated until the buffered
 // subscription parked the binlog reader on its soft memory limit, and a
@@ -531,10 +531,10 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 	})
 
 	move := &Move{
-		SourceDSN:             src.FormatDSN(),
-		TargetDSN:             dest.FormatDSN(),
-		Common:                flags.Common{Threads: 1, WriteThreads: 1},
-		DeferSecondaryIndexes: true,
+		SourceDSN:     src.FormatDSN(),
+		TargetDSN:     dest.FormatDSN(),
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(true),
 	}
 	r, err := NewRunner(move)
 	require.NoError(t, err)

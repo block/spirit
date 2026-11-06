@@ -329,10 +329,10 @@ func (c *buffered) autoscalerIfEnabled() *autoScaler {
 		return nil
 	}
 	c.logger.Info("starting autoscaler: write-thread scaling engaged",
-		"start", c.autoscale.StartThreads, "max", c.autoscale.MaxThreads,
+		"start", c.autoscale.StartThreads, "min", max(1, c.autoscale.MinThreads), "max", c.autoscale.MaxThreads,
 		"low_watermark", autoscale.LowWatermark, "high_watermark", autoscale.HighWatermark)
 	scaler.SetWriteWorkers(c.autoscale.StartThreads)
-	as := newAutoScaler(gradual, scaler, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
+	as := newAutoScaler(gradual, scaler, c.autoscale.MinThreads, c.autoscale.StartThreads, c.autoscale.MaxThreads, c.logger, c.metricsSink)
 	// Read scaling engages whenever the write side does: the copier's own
 	// reader pool is runtime-resizable (SetReadWorkers) and every applier
 	// reports the queue snapshot (Stats) the arbiter needs.

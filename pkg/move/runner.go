@@ -128,12 +128,19 @@ type Runner struct {
 	// Zero leaves the change package's defaults; autoscaling derives them
 	// from the targets (moveFlushBounds).
 	flushConcurrency, flushBatchSize int
+	// newHosts is set when detectNewHosts measured that every target server
+	// serves nothing but this move. It defers the secondary indexes and keeps
+	// more writers per target (concurrency.Request.NewHosts).
+	newHosts bool
 	// buildAurora and auroraVCPUs are the instance probes setupThrottling runs.
 	// NewRunner sets buildAurora to throttler.BuildAurora; a nil auroraVCPUs is
 	// throttler.AuroraVCPUs (concurrency.Request.VCPUs). Tests replace them,
 	// because CI has no Aurora to probe.
 	buildAurora func(context.Context, throttler.AuroraSetup) (throttler.AuroraResult, error)
 	auroraVCPUs func(context.Context, *sql.DB) (int, error)
+	// userDataBytes is detectNewHosts' measurement: Move.userDataBytes when
+	// a test set it, otherwise dbconn.UserDataBytes.
+	userDataBytes func(context.Context, *sql.DB, func(schema, table string) bool) (int64, error)
 
 	applier     applier.Applier
 	chunkerMu   sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
@@ -232,6 +239,10 @@ func NewRunner(m *Move) (*Runner, error) {
 		logger:              slog.Default(),
 		metricsSink:         &metrics.NoopSink{},
 		buildAurora:         throttler.BuildAurora,
+		userDataBytes:       dbconn.UserDataBytes,
+	}
+	if m.userDataBytes != nil {
+		r.userDataBytes = m.userDataBytes
 	}
 	return r, nil
 }
@@ -384,9 +395,12 @@ func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.Table
 }
 
 // createTargetTables creates tables on all targets.
-// If DeferSecondaryIndexes is enabled, tables are created without secondary indexes.
+// On new hosts (newHosts), tables are created without secondary indexes.
 // Secondary indexes will be added later by restoreSecondaryIndexes() before cutover.
-// This function skips tables that already exist (they were validated by checkTargetEmpty).
+// A table that already exists (pre-created, and validated empty and matching
+// the source by the target_state check) is not created; on new hosts its
+// deferrable secondary indexes are dropped instead, so it is copied into the
+// same way as a table the move creates.
 func (r *Runner) createTargetTables(ctx context.Context) error {
 	// All sources have identical schemas (enforced by the source_schema_consistency
 	// check at PhasePostSetup), so use sources[0] for SHOW CREATE TABLE.
@@ -398,10 +412,10 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 			return err
 		}
 
-		// If DeferSecondaryIndexes is enabled, remove secondary indexes from CREATE TABLE
+		// On new hosts, remove secondary indexes from CREATE TABLE
 		// We don't have to track what these indexes were: we'll just recreate them later
 		// from the source table.
-		if r.move.DeferSecondaryIndexes {
+		if r.newHosts {
 			var err error
 			createStmt, err = statement.RemoveSecondaryIndexes(createStmt)
 			if err != nil {
@@ -418,11 +432,16 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 				target.Config.DBName, t.TableName).Scan(&tableExists)
 
 			if err == nil {
-				// Table already exists, skip creation (it was validated by checkTargetEmpty)
+				// Table already exists, skip creation (it was validated by the target_state check)
 				r.logger.Info("skipping table creation, already exists",
 					"table", t.TableName,
 					"target", i,
 					"database", target.Config.DBName)
+				if r.newHosts {
+					if err := r.deferExistingIndexes(ctx, i, t.TableName); err != nil {
+						return err
+					}
+				}
 				continue
 			} else if err != sql.ErrNoRows {
 				// Unexpected error
@@ -437,10 +456,75 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 				"table", t.TableName,
 				"target", i,
 				"database", target.Config.DBName,
-				"deferred_indexes", r.move.DeferSecondaryIndexes,
+				"deferred_indexes", r.newHosts,
 			)
 		}
 	}
+	return nil
+}
+
+// deferExistingIndexes drops the deferrable secondary indexes from a target
+// table that already exists (statement.DropDeferrableSecondaryIndexes): one
+// created before the move, or one a resumed move is still copying into
+// (deferTargetIndexes). restoreSecondaryIndexes adds them back from the
+// source before the checksum, and the target_state check accepts the table
+// without them if the move stops before its first checkpoint.
+func (r *Runner) deferExistingIndexes(ctx context.Context, targetIndex int, tableName string) error {
+	target := r.targets[targetIndex]
+	var name, createStmt string
+	if err := target.DB.QueryRowContext(ctx, "SHOW CREATE TABLE "+sqlescape.EscapeIdentifier(tableName)).Scan(&name, &createStmt); err != nil {
+		return fmt.Errorf("failed to read table %s on target %d: %w", tableName, targetIndex, err)
+	}
+	alter, err := statement.DropDeferrableSecondaryIndexes(createStmt, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to defer the secondary indexes of table %s on target %d: %w", tableName, targetIndex, err)
+	}
+	if alter == "" {
+		return nil
+	}
+	if _, err := target.DB.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("failed to defer the secondary indexes of table %s on target %d: %w", tableName, targetIndex, err)
+	}
+	r.logger.Info("deferred the secondary indexes of an existing target table",
+		"table", tableName,
+		"target", targetIndex,
+		"database", target.Config.DBName,
+		"statement", alter)
+	return nil
+}
+
+// deferTargetIndexes drops the deferrable secondary indexes of every moved
+// table on every target (deferExistingIndexes), for a resume on new hosts. A
+// table whose indexes are already deferred is left alone. The target servers
+// are altered at the same time, and the targets that share a server one
+// after another, like restoreSecondaryIndexes. On a table that already holds
+// rows a DROP INDEX is an in-place change that frees the index's pages.
+func (r *Runner) deferTargetIndexes(ctx context.Context) error {
+	hosts := r.targetHosts()
+	r.logger.Info("deferring the secondary indexes of every target table on resume",
+		"tables", len(r.sourceTables),
+		"targets", len(r.targets),
+		"hosts", len(hosts),
+	)
+	started := time.Now()
+	g, gctx := errgroup.WithContext(ctx)
+	for _, group := range hosts {
+		g.Go(func() error {
+			for _, i := range group.Indices {
+				for _, tbl := range r.sourceTables {
+					if err := r.deferExistingIndexes(gctx, i, tbl.TableName); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	r.logger.Info("deferred the secondary indexes of every target table on resume",
+		"duration", time.Since(started))
 	return nil
 }
 
@@ -527,6 +611,21 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	r.copier, err = copier.NewCopier(r.copyChunker, r.copierConfig())
 	if err != nil {
 		return err
+	}
+
+	// On new hosts, a checkpoint with no checksum watermark was written
+	// before the checksum started, so the copy is still running or its
+	// indexes are being restored: drop the deferrable secondary indexes
+	// (again) so the rest of the copy does not maintain them. They are
+	// restored before the checksum, as on a fresh run. This also defers the
+	// indexes of a move that started without deferring them. It runs before
+	// a multi-source resume discards the watermark below, so the decision is
+	// the checkpoint's for every number of sources. Dropping first also makes
+	// the DELETE in deleteRecopyRange cheaper.
+	if r.newHosts && r.checksumWatermark == "" {
+		if err := r.deferTargetIndexes(ctx); err != nil {
+			return err
+		}
 	}
 
 	// With multiple sources, a persisted checksum watermark cannot be trusted.
@@ -635,6 +734,7 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 // lock before it can destroy the first run's target data.
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
+	r.newHosts = r.detectNewHosts(ctx)
 	if err := r.setupThrottling(ctx); err != nil {
 		return err
 	}
@@ -749,6 +849,50 @@ func (r *Runner) setupThrottling(ctx context.Context) error {
 	return r.applyAuroraResults(ctx, groups, results)
 }
 
+// detectNewHosts reports whether every target server is a new host: it holds
+// less than dbconn.NewHostDataLimit bytes outside the tables this move writes
+// (dbconn.UserDataBytes). The move's own tables are left out so a
+// resumed move, whose targets hold the rows copied so far, reaches the same
+// answer as the fresh one. A server that cannot be measured is not a new
+// host: the move then runs as it would into a serving host.
+//
+// The measurement covers only the tables the target user can see. A user
+// granted only some schemas does not see the others, so a server that holds
+// data only in schemas the user was not granted counts as a new host. Target
+// users are usually granted only the schemas they write to, so this is
+// accepted.
+func (r *Runner) detectNewHosts(ctx context.Context) bool {
+	own := make(map[string]bool, len(r.sourceTables))
+	for _, t := range r.sourceTables {
+		own[t.TableName] = true
+	}
+	var total int64
+	for _, group := range r.targetHosts() {
+		schemas := make(map[string]bool, len(group.Indices))
+		for _, i := range group.Indices {
+			schemas[r.targets[i].Config.DBName] = true
+		}
+		target := r.targets[group.Indices[0]]
+		bytes, err := r.userDataBytes(ctx, target.DB, func(schema, table string) bool {
+			return schemas[schema] && own[table]
+		})
+		log := r.logger.With("target", targetKey(target))
+		switch {
+		case err != nil:
+			log.Warn("could not measure the target server's data; treating it as a serving host", "error", err.Error())
+			return false
+		case bytes >= dbconn.NewHostDataLimit:
+			log.Info("the target server already holds data; treating it as a serving host",
+				"bytes", bytes, "limit", dbconn.NewHostDataLimit)
+			return false
+		}
+		total += bytes
+	}
+	r.logger.Info("every target server is a new host: deferring secondary indexes and allowing more load on the targets",
+		"hosts", len(r.targetHosts()), "bytes", total, "limit_per_host", dbconn.NewHostDataLimit)
+	return true
+}
+
 // applyAuroraResults installs the targets' combined load signal and then
 // sizes autoscaling from the same results. It takes ownership of every
 // result's throttlers and monitor pool, including on failure.
@@ -794,10 +938,11 @@ func (r *Runner) setupAutoscaling(ctx context.Context, groups []host.Group, resu
 		}
 	}
 	plan, err := concurrency.Engage(ctx, &r.move.Common, concurrency.Request{
-		Targets: targets,
-		Sources: len(r.sources),
-		VCPUs:   r.auroraVCPUs,
-		Logger:  r.logger,
+		Targets:  targets,
+		Sources:  len(r.sources),
+		VCPUs:    r.auroraVCPUs,
+		NewHosts: r.newHosts,
+		Logger:   r.logger,
 	})
 	if err != nil {
 		return err
@@ -1836,7 +1981,7 @@ func (r *Runner) runChecks(ctx context.Context, scope check.Phase, exclude ...st
 }
 
 // restoreSecondaryIndexes restores any secondary indexes that were deferred during table creation.
-// This function is always called (regardless of DeferSecondaryIndexes flag) to handle
+// This function is always called (on serving hosts too) to handle
 // checkpoint resume scenarios. It uses statement.GetMissingSecondaryIndexes to compare source and target
 // schemas and generate a single ALTER TABLE statement for all missing indexes per table.
 // Targets are processed in parallel, grouped by hostname to avoid overloading any single MySQL instance.
@@ -1940,7 +2085,7 @@ func (r *Runner) restoreIndexesForTargets(ctx context.Context, host string, targ
 // before cutover.
 func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// Flush all pending events, but leave the periodic flush running until
-	// just before the checksum. With --defer-secondary-indexes,
+	// just before the checksum. On new hosts,
 	// restoreSecondaryIndexes issues one giant ALTER per table that can run
 	// for hours, and both it and ANALYZE TABLE permit concurrent DML on the
 	// target: adding a regular secondary index is online (INPLACE) DDL in
@@ -1958,7 +2103,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	}
 
 	// Restore secondary indexes if they were deferred during table creation.
-	// This is always called (not conditional on DeferSecondaryIndexes) to handle
+	// This is always called (not only on new hosts) to handle
 	// checkpoint resume scenarios where indexes may have been deferred in a previous run.
 	if err := r.status.DoContext(ctx, status.RestoreSecondaryIndexes, func() error {
 		return r.restoreSecondaryIndexes(ctx)

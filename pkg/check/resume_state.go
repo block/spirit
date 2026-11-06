@@ -76,7 +76,10 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 			// types, charset, collation, indexes and constraints while ignoring
 			// AUTO_INCREMENT counters and other instance-specific noise. It is
 			// the same comparison target_state ran before the copy, so a move
-			// that was allowed to start does not fail on resume.
+			// that was allowed to start does not fail on resume. Like
+			// target_state, it accepts a target that lacks deferrable secondary
+			// indexes: a move stopped while they were deferred leaves that, and
+			// restoreSecondaryIndexes adds them back before the checksum.
 			sourceCreate, err := showCreateTable(ctx, sourceTable.DB(), sourceTable.SchemaName, sourceTable.TableName)
 			if err != nil {
 				return fmt.Errorf("failed to read source schema for table '%s': %w", sourceTable.TableName, err)
@@ -85,7 +88,7 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 			if err != nil {
 				return fmt.Errorf("failed to read target %d schema for table '%s': %w", i, sourceTable.TableName, err)
 			}
-			diff, err := TargetSchemaDiff(sourceTable.TableName, sourceCreate, targetCreate)
+			diff, deferred, err := targetSchemaDiffDeferred(sourceTable.TableName, sourceCreate, targetCreate)
 			if err != nil {
 				return fmt.Errorf("failed to compare schema for table '%s' on target %d: %w", sourceTable.TableName, i, err)
 			}
@@ -100,7 +103,8 @@ func resumeStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 			logger.Debug("validated target table for resume",
 				"table", sourceTable.TableName,
 				"target", i,
-				"database", target.Config.DBName)
+				"database", target.Config.DBName,
+				"deferred_indexes", deferred)
 		}
 	}
 	return nil

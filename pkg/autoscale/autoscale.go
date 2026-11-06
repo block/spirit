@@ -245,6 +245,14 @@ func ClientCeiling() int {
 	return max(1, ClientThreadsPerCore*runtime.GOMAXPROCS(0))
 }
 
+// NewHostMinWriteThreads is the fewest write workers a target gets when its
+// server serves nothing but the run (a move into new hosts). One worker
+// leaves the target idle while it builds its next statement and waits on its
+// commit; a second keeps a statement in flight during that time. On a serving
+// host one worker per target is the floor, so the run's load stays
+// proportionate to the instance.
+const NewHostMinWriteThreads = 2
+
 // WriteStart returns the starting size for the apply (write) pool on an instance
 // of the given vCPU count: the whole instance less VCPUReserve, floored at one.
 //

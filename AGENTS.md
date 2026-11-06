@@ -286,6 +286,7 @@ How the recently-unified pieces handle per-tool differences, as patterns to copy
 These were reviewed and are intentional. Re-decide only if the reason stops holding.
 
 - **Move's reverse window** writes with the configured `--write-threads` and has no monitor or autoscaling. It replays the live target's writes back to the old source after cutover, with no copy phase; throttling it would only make the fallback lag.
+- **New-host mode is move-only.** Move treats its targets as new hosts when every target server holds under `dbconn.NewHostDataLimit` outside the move's tables (`Runner.detectNewHosts`; there is no flag); it then defers secondary indexes and floors writers at `autoscale.NewHostMinWriteThreads` (`concurrency.Request.NewHosts`). Migration writes to a serving source. Datasync's target may start serving while the sync continues, so datasync keeps `--defer-secondary-indexes` as an explicit option.
 - **Datasync's injected `change.Source`** (only datasync accepts one) must wire `Runner.TargetUnderLoad` as its `UnderLoad` callback itself; the built-in feeds of all three runners already wire theirs. Do not confuse the applier's copy/repair workers with synchronous change-feed flush concurrency.
 
 When you add a checkpoint field, add it to `pkg/checkpoint`'s schema — it is shared by all three. When you add a teardown step, a new lifecycle phase, or a safety gate, grep all three `runner.go` files and decide explicitly: port, or extract. A difference you decide to keep goes in "Deliberate differences" with its reason.

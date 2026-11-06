@@ -61,7 +61,13 @@ type Request struct {
 	// ClientCeiling bounds derived counts by this host's CPU. Zero means
 	// autoscale.ClientCeiling().
 	ClientCeiling int
-	Logger        *slog.Logger
+	// NewHosts declares that the target servers serve nothing but this run,
+	// so each target gets at least autoscale.NewHostMinWriteThreads write
+	// workers. The write floor is the only autoscaling difference today; more
+	// are likely to follow, since a server no client depends on can be loaded
+	// harder than a serving one. Add them behind this field.
+	NewHosts bool
+	Logger   *slog.Logger
 }
 
 // Plan is the outcome of Engage. When neither Engaged nor SmallInstance is set
@@ -85,8 +91,10 @@ type Plan struct {
 	// share one server (see Derive). With one shard per server they are equal,
 	// which is why migrate and sync use one count for both.
 	CopyReadStart, MaxCopyReadThreads int
-	// WriteStart and MaxWriteThreads bound each target's apply workers.
-	WriteStart, MaxWriteThreads int
+	// WriteStart and MaxWriteThreads bound each target's apply workers, and
+	// MinWriteThreads is the fewest the controller may shed to (one, or
+	// autoscale.NewHostMinWriteThreads for new hosts).
+	WriteStart, MaxWriteThreads, MinWriteThreads int
 	// FlushConcurrency and FlushBatchSize shape each change feed's drain. They
 	// are a starting point, not autoscaled: the drain has its own AIMD
 	// controller keyed on lock contention.
@@ -103,6 +111,7 @@ func (p Plan) Copier() copier.AutoscaleConfig {
 		Enabled:        true,
 		StartThreads:   p.WriteStart,
 		MaxThreads:     p.MaxWriteThreads,
+		MinThreads:     p.MinWriteThreads,
 		MaxReadThreads: p.MaxCopyReadThreads,
 	}
 }
@@ -117,6 +126,9 @@ type Topology struct {
 	Targets int
 	// Sources is the number of change feeds. Zero means one.
 	Sources int
+	// NewHosts declares that the servers serve nothing but the run (see
+	// Request.NewHosts).
+	NewHosts bool
 }
 
 // Derive sizes a plan from the targets' capacity. ok is false when there is
@@ -142,6 +154,10 @@ type Topology struct {
 //   - Write side: autoscale.WriteStart, divided the same way, with the ceiling
 //     from throttler.ResolveMaxWriteThreads. Both are capped by the client
 //     ceiling split across targets, since each target runs its own workers.
+//     On new hosts (Topology.NewHosts) no target gets fewer than
+//     autoscale.NewHostMinWriteThreads, whatever the division and the client
+//     ceiling give: one worker per target leaves the target idle between its
+//     statements.
 //   - Flush: autoscale.FlushBounds, divided by sources × shards on one server
 //     (every feed's flush fans out to the busiest server) and capped by the
 //     client ceiling split across sources, but never below
@@ -175,8 +191,12 @@ func Derive(t Topology, clientCeiling int, redoAware, commitLatencyEnabled bool)
 	copyReadMax := min(instanceReadMax, clientCeiling)
 	copyReadStart := min(instanceReadStart, copyReadMax)
 
-	writeBudget := max(1, clientCeiling/targets)
-	writeStart := min(max(1, autoscale.WriteStart(smallest)/shards), writeBudget)
+	writeMin := 1
+	if t.NewHosts {
+		writeMin = autoscale.NewHostMinWriteThreads
+	}
+	writeBudget := max(writeMin, clientCeiling/targets)
+	writeStart := min(max(writeMin, autoscale.WriteStart(smallest)/shards), writeBudget)
 	writeMax := min(throttler.ResolveMaxWriteThreads(writeStart, true, redoAware, commitLatencyEnabled), writeBudget)
 
 	width, _ := autoscale.FlushBounds(smallest)
@@ -187,7 +207,7 @@ func Derive(t Topology, clientCeiling int, redoAware, commitLatencyEnabled bool)
 		Engaged:   true,
 		ReadStart: readStart, MaxReadThreads: readMax,
 		CopyReadStart: copyReadStart, MaxCopyReadThreads: copyReadMax,
-		WriteStart: writeStart, MaxWriteThreads: writeMax,
+		WriteStart: writeStart, MaxWriteThreads: writeMax, MinWriteThreads: writeMin,
 		FlushConcurrency: width, FlushBatchSize: autoscale.FlushBatchSize(width),
 	}, true
 }
@@ -280,7 +300,7 @@ func engage(ctx context.Context, f *flags.Common, req Request, clientCeiling int
 	}
 
 	redoAware := false
-	topology := Topology{Sources: req.Sources, VCPUs: vcpus}
+	topology := Topology{Sources: req.Sources, VCPUs: vcpus, NewHosts: req.NewHosts}
 	for _, target := range req.Targets {
 		log := logger
 		if target.Name != "" {
@@ -349,6 +369,7 @@ func engage(ctx context.Context, f *flags.Common, req Request, clientCeiling int
 		"read_threads", plan.ReadStart, "max_read_threads", plan.MaxReadThreads,
 		"copy_read_threads", plan.CopyReadStart, "max_copy_read_threads", plan.MaxCopyReadThreads,
 		"write_threads_per_target", plan.WriteStart, "max_write_threads_per_target", plan.MaxWriteThreads,
+		"min_write_threads_per_target", plan.MinWriteThreads, "new_hosts", topology.NewHosts,
 		"flush_concurrency", plan.FlushConcurrency, "flush_batch_size", plan.FlushBatchSize)
 	return plan, nil
 }

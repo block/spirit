@@ -84,7 +84,7 @@ func newTestScaler(start, max int) (*autoScaler, *fakeScaler, *utilThrottler) {
 	fs := &fakeScaler{n: start}
 	ut := &utilThrottler{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	as := newAutoScaler(ut, fs, start, max, logger, &metrics.NoopSink{})
+	as := newAutoScaler(ut, fs, 1, start, max, logger, &metrics.NoopSink{})
 	return as, fs, ut
 }
 
@@ -212,6 +212,22 @@ func TestAutoScaler_ClampsAtMinOne(t *testing.T) {
 		as.tick(t.Context())
 	}
 	require.Equal(t, 1, as.current, "must never drop below 1")
+}
+
+// A configured minimum (new hosts keep two writers per target) holds under
+// any overload; a minimum above the start is lowered to the start.
+func TestAutoScaler_ClampsAtConfiguredMin(t *testing.T) {
+	ut := &utilThrottler{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	as := newAutoScaler(ut, &fakeScaler{n: 4}, 2, 4, 8, logger, &metrics.NoopSink{})
+	ut.setUtil(1.5)
+	for range 10 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 2, as.current, "must never drop below the configured minimum")
+
+	require.Equal(t, 3, newAutoScaler(ut, &fakeScaler{n: 3}, 5, 3, 8, logger, &metrics.NoopSink{}).min)
+	require.Equal(t, 1, newAutoScaler(ut, &fakeScaler{n: 3}, 0, 3, 8, logger, &metrics.NoopSink{}).min)
 }
 
 func TestAutoScaler_MaxFlooredAtStart(t *testing.T) {
@@ -378,6 +394,10 @@ func TestClassifyQueue(t *testing.T) {
 		{"below full occupancy is balanced", applier.Stats{QueueDepth: 79, QueueCap: 100, QueueWaitP90: ms(50), WriteTimeP90: ms(10)}, queueBalanced},
 		{"full occupancy but wait below write is balanced", applier.Stats{QueueDepth: 90, QueueCap: 100, QueueWaitP90: ms(5), WriteTimeP90: ms(10)}, queueBalanced},
 		{"mid occupancy is balanced", applier.Stats{QueueDepth: 50, QueueCap: 100, QueueWaitP90: ms(3), WriteTimeP90: ms(5)}, queueBalanced},
+		// 128 shards of 128: one shard pegged is 1% of the summed queue.
+		{"fullest shard full is full though the sum is not", applier.Stats{QueueDepth: 128, QueueCap: 16384, FullestShardDepth: 128, FullestShardCap: 128, QueueWaitP90: ms(50), WriteTimeP90: ms(10)}, queueFull},
+		{"fullest shard half full is not starved though the sum is", applier.Stats{QueueDepth: 64, QueueCap: 16384, FullestShardDepth: 64, FullestShardCap: 128, QueueWaitP90: 0}, queueBalanced},
+		{"every shard empty is starved", applier.Stats{QueueDepth: 0, QueueCap: 16384, FullestShardDepth: 0, FullestShardCap: 128, QueueWaitP90: 0}, queueStarved},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -773,7 +793,7 @@ func TestAutoScalerBusiestTarget(t *testing.T) {
 	signal, ok := composite.(throttler.GradualThrottler)
 	require.True(t, ok)
 	writer := &fakeScaler{n: 8}
-	controller := newAutoScaler(signal, writer, 8, 16, slog.Default(), &metrics.NoopSink{})
+	controller := newAutoScaler(signal, writer, 1, 8, 16, slog.Default(), &metrics.NoopSink{})
 	controller.tick(t.Context())
 	require.Equal(t, 4, writer.n)
 	require.True(t, composite.IsThrottled())
@@ -791,7 +811,7 @@ func TestAutoScalerBusiestHostCanChange(t *testing.T) {
 	second.setUtil(0.1)
 	signal := throttler.NewMultiThrottler(first, second).(throttler.GradualThrottler)
 	writer := &fakeScaler{n: 4}
-	controller := newAutoScaler(signal, writer, 4, 8, slog.Default(), &metrics.NoopSink{})
+	controller := newAutoScaler(signal, writer, 1, 4, 8, slog.Default(), &metrics.NoopSink{})
 	controller.tick(t.Context())
 	require.Equal(t, 5, writer.n, "all hosts have headroom")
 	second.setUtil(0.55)

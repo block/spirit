@@ -132,6 +132,32 @@ func TargetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) 
 	return statement.DiffCreateTables(table, sourceCreate, targetCreate, diffOpts)
 }
 
+// targetSchemaDiffDeferred is TargetSchemaDiff for a target that may lack
+// some of the source's deferrable secondary indexes
+// (statement.RemoveDeferredIndexes): a move defers them on new hosts, and
+// restoreSecondaryIndexes adds every missing one back before the checksum,
+// on every run. deferred reports that the target matched only once the
+// indexes it lacks were left out. A target that differs in anything else
+// returns the full diff against the source.
+func targetSchemaDiffDeferred(table, sourceCreate, targetCreate string) (diff string, deferred bool, err error) {
+	diff, err = TargetSchemaDiff(table, sourceCreate, targetCreate)
+	if err != nil || diff == "" {
+		return diff, false, err
+	}
+	withoutMissing, err := statement.RemoveDeferredIndexes(sourceCreate, targetCreate)
+	if err != nil {
+		return "", false, err
+	}
+	deferredDiff, err := TargetSchemaDiff(table, withoutMissing, targetCreate)
+	if err != nil {
+		return "", false, err
+	}
+	if deferredDiff == "" {
+		return "", true, nil
+	}
+	return diff, false, nil
+}
+
 // moveDiffOptions returns the diff options every move-tables schema comparison
 // starts from: the package defaults plus move's column-level AUTO_INCREMENT
 // relaxation (see schemaDiff).

@@ -2,6 +2,7 @@ package move
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -23,9 +24,12 @@ type Move struct {
 	// --defer-cutover (the sentinel lives on the first target).
 	flags.Cutover
 
-	SourceDSN             string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
-	TargetDSN             string `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
-	DeferSecondaryIndexes bool   `name:"defer-secondary-indexes" help:"Defer regular indexes until before cutover, preserving required AUTO_INCREMENT support" default:"false"`
+	SourceDSN string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
+	TargetDSN string `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
+	// userDataBytes replaces dbconn.UserDataBytes, which decides
+	// whether the targets are new hosts (Runner.detectNewHosts). Tests set it,
+	// because the CI server's size depends on what other tests left on it.
+	userDataBytes func(context.Context, *sql.DB, func(schema, table string) bool) (int64, error)
 	// Force makes the runner wipe the target tables and start the copy fresh when
 	// it cannot resume from a checkpoint (e.g. the checkpoint is from an
 	// incompatible spirit version, or the target is in a state resume can't

@@ -9,7 +9,7 @@ A move operation follows this sequence:
 1. **Pre-run checks** — validate configuration before opening database connections.
 2. **Setup** — discover source tables, create targets, run preflight/post-setup checks.
 3. **Copy rows** — bulk-copy all source tables to their targets using the copier.
-4. **Initial checksum** (post-copy phase) — flush the binlog backlog, restore any secondary indexes that were deferred during table creation (see `DeferSecondaryIndexes` below), run ANALYZE TABLE, and verify data consistency between source and targets. This is the correctness gate; cutover does not proceed unless this checksum succeeds.
+4. **Initial checksum** (post-copy phase) — flush the binlog backlog, restore any secondary indexes that were deferred during table creation (see Deferred Secondary Indexes below), run ANALYZE TABLE, and verify data consistency between source and targets. This is the correctness gate; cutover does not proceed unless this checksum succeeds.
 5. **Sentinel wait** — optionally pause before cutover, allowing external orchestration to confirm readiness. While the sentinel blocks cutover, a **continuous checksum** loop runs in the background to keep re-verifying the data; the loop is interrupted as soon as the sentinel is dropped.
 6. **Cutover** — acquire a table lock, flush remaining replication changes, execute the caller-provided cutover function, and rename original tables out of the way.
 7. **Reverse window** (optional) — when `ReverseWindow` is set, the move does not exit after cutover; it holds a change-only reverse feed (targets → the source's `_old` tables) for the configured duration so the move can be rolled back. See [Reverse Window](#reverse-window) below.
@@ -32,7 +32,7 @@ Unless `SkipAutoscaling` is set, move adds conservative host-aware thread scalin
 
 ### Deferred Secondary Indexes
 
-The `DeferSecondaryIndexes` option creates target tables without secondary indexes, adding them back before cutover. This can significantly speed up the bulk copy phase since index maintenance is avoided until the data is in place.
+On new hosts, move creates target tables without secondary indexes, adding them back before cutover. A pre-created target table has them dropped instead (`statement.DropDeferrableSecondaryIndexes`), and the `target_state` and `resume_state` checks accept a target table that lacks some or all of the deferrable indexes and differs in nothing else (`statement.RemoveDeferredIndexes`). A resume on new hosts whose checkpoint has no checksum watermark (the copy or the index restore was still running) drops them from every target table again (`Runner.deferTargetIndexes`); `restoreSecondaryIndexes` always runs in the post-copy phase, so they come back before the checksum. This can significantly speed up the bulk copy phase since index maintenance is avoided until the data is in place. A new host is a target server that serves nothing but the move. There is no flag: `Runner.detectNewHosts` detects it when every target server holds under `dbconn.NewHostDataLimit` (100 MiB) outside the move's own tables, as far as the target user can see. On new hosts autoscaling also keeps at least `autoscale.NewHostMinWriteThreads` writers per target. That is the only autoscaling difference so far; further new-host autoscaling changes are likely, and belong behind `concurrency.Request.NewHosts`. See [New target hosts](../../docs/move.md#new-target-hosts).
 
 However, this optimization is not always safe:
 
