@@ -227,6 +227,22 @@ func TestGetMissingSecondaryIndexes(t *testing.T) {
 			expectedAlter: "ALTER TABLE `users` ADD INDEX `idx_name` (`name`)",
 		},
 		{
+			name: "Missing index shares a check constraint's name",
+			sourceCreateTable: `CREATE TABLE orders (
+				id INT PRIMARY KEY,
+				amount INT,
+				KEY positive (amount),
+				CONSTRAINT positive CHECK (amount >= 0)
+			)`,
+			targetCreateTable: `CREATE TABLE orders (
+				id INT PRIMARY KEY,
+				amount INT,
+				CONSTRAINT positive CHECK (amount >= 0)
+			)`,
+			tableName:     "orders",
+			expectedAlter: "ALTER TABLE `orders` ADD INDEX `positive` (`amount`)",
+		},
+		{
 			name: "Multiple missing indexes",
 			sourceCreateTable: `CREATE TABLE users (
 				id INT PRIMARY KEY,

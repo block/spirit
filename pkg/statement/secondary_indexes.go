@@ -66,14 +66,11 @@ func RemoveDeferredIndexes(sourceCreate, targetCreate string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to parse target CREATE TABLE: %w", err)
 	}
-	// Only indexes: a CHECK or FOREIGN KEY constraint is in its own namespace,
-	// so one named like a deferred index must not make it look present.
 	present := make(map[string]bool)
 	for _, constraint := range target.Raw.Constraints {
-		if constraint.Tp == ast.ConstraintCheck || constraint.Tp == ast.ConstraintForeignKey {
-			continue
+		if isIndex(constraint) {
+			present[strings.ToLower(constraint.Name)] = true
 		}
-		present[strings.ToLower(constraint.Name)] = true
 	}
 	source, err := ParseCreateTable(sourceCreate)
 	if err != nil {
@@ -228,7 +225,7 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 	targetDefinitions := make(map[string]bool)
 	for _, constraint := range targetCT.Raw.Constraints {
 		// Skip PRIMARY KEY, but include all other index types
-		if constraint.Tp == ast.ConstraintPrimaryKey {
+		if constraint.Tp == ast.ConstraintPrimaryKey || !isIndex(constraint) {
 			continue
 		}
 		if constraint.Name != "" {
@@ -250,13 +247,7 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 			continue
 		}
 		// Include: UNIQUE, FULLTEXT, SPATIAL, and regular INDEX
-		if constraint.Tp != ast.ConstraintKey &&
-			constraint.Tp != ast.ConstraintIndex &&
-			constraint.Tp != ast.ConstraintUniq &&
-			constraint.Tp != ast.ConstraintUniqKey &&
-			constraint.Tp != ast.ConstraintUniqIndex &&
-			constraint.Tp != ast.ConstraintFulltext &&
-			constraint.Tp != ast.ConstraintSpatial {
+		if !isIndex(constraint) {
 			continue
 		}
 
@@ -372,6 +363,21 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 
 // unnamedIndexDefinition compares unnamed indexes by their full definition,
 // including key order, expressions, prefix lengths, and options.
+// isIndex reports whether constraint is an index. A CHECK or FOREIGN KEY
+// constraint is not, and its name is in a separate namespace from index
+// names: a table may have KEY positive (amount) and CONSTRAINT positive
+// CHECK (amount >= 0), so a constraint's name must never stand in for an
+// index's.
+func isIndex(constraint *ast.Constraint) bool {
+	switch constraint.Tp { //nolint:exhaustive
+	case ast.ConstraintPrimaryKey, ast.ConstraintKey, ast.ConstraintIndex,
+		ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex,
+		ast.ConstraintFulltext, ast.ConstraintSpatial:
+		return true
+	}
+	return false
+}
+
 func unnamedIndexDefinition(constraint *ast.Constraint) (string, error) {
 	bare := *constraint
 	bare.Name = ""
