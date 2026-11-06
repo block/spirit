@@ -126,7 +126,8 @@ func removeSecondaryIndexes(createStmt string, preserveAutoIncrement bool) (stri
 
 // deferrableIndexes returns ct's regular (non-UNIQUE, non-FULLTEXT,
 // non-SPATIAL) indexes in declaration order, less the one kept to support an
-// AUTO_INCREMENT column when preserveAutoIncrement is set.
+// AUTO_INCREMENT column when preserveAutoIncrement is set, and less every one
+// that can support a foreign key.
 func deferrableIndexes(ct *CreateTable, preserveAutoIncrement bool) []*ast.Constraint {
 	// InnoDB requires AUTO_INCREMENT to lead an index. Retained primary
 	// and unique keys can satisfy it; otherwise keep one supporting regular
@@ -165,9 +166,38 @@ func deferrableIndexes(ct *CreateTable, preserveAutoIncrement bool) []*ast.Const
 		if len(constraint.Keys) > 0 && constraint.Keys[0].Column != nil && support[strings.ToLower(constraint.Keys[0].Column.Name.O)] == constraint {
 			continue
 		}
+		if supportsForeignKey(ct, constraint) {
+			continue
+		}
 		deferrable = append(deferrable, constraint)
 	}
 	return deferrable
+}
+
+// supportsForeignKey reports whether index could be the index one of ct's
+// foreign keys uses: its leading key parts are that foreign key's columns, in
+// order. InnoDB requires such an index and refuses to drop the last one
+// (error 1553), so none of them is deferred. Keeping every candidate, not only
+// the one MySQL would pick, is the conservative choice: it never leaves a
+// foreign key without an index.
+func supportsForeignKey(ct *CreateTable, index *ast.Constraint) bool {
+	for _, fk := range ct.Raw.Constraints {
+		if fk.Tp != ast.ConstraintForeignKey || len(fk.Keys) == 0 || len(index.Keys) < len(fk.Keys) {
+			continue
+		}
+		matches := true
+		for i, key := range fk.Keys {
+			part := index.Keys[i]
+			if key.Column == nil || part.Column == nil || !strings.EqualFold(key.Column.Name.O, part.Column.Name.O) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
 }
 
 // GetMissingSecondaryIndexes compares two CREATE TABLE statements (source and target)

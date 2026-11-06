@@ -83,8 +83,8 @@ func schemaDiff(table, wantCreate, gotCreate string) (string, error) {
 // restoreSecondaryIndexes adds every missing one back before the checksum, on
 // every run, so a move resumed or retried mid-copy must accept the target it
 // left behind. An index the target has is compared as it is, so a redefined
-// one is still a difference, and PRIMARY, UNIQUE, FULLTEXT and SPATIAL indexes
-// are never deferrable.
+// one is still a difference. PRIMARY, UNIQUE, FULLTEXT and SPATIAL indexes,
+// and an index a foreign key can use, are never deferrable.
 //
 // Anything else is a difference, the reverse of the first two included: a
 // target looser than its source fails, as does any change to types, charset,
