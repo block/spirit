@@ -249,6 +249,35 @@ func TestRedoAwareThreadsQuery_LocalMySQL(t *testing.T) {
 	require.GreaterOrEqual(t, active, int64(0))
 }
 
+func TestIOWaitAwareThreadsQuery_LocalMySQL(t *testing.T) {
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	// The same join as the redo-aware query, with a wider wait filter, so it
+	// must be valid wherever that one is.
+	var active int64
+	require.NoError(t, db.QueryRowContext(t.Context(), ioWaitAwareThreadsQuery).Scan(&active))
+	require.GreaterOrEqual(t, active, int64(0))
+}
+
+// The new-host signal replaces only the redo-aware one: the Threads_running
+// fallback has no per-thread wait to read, and a serving host keeps counting
+// I/O waits as load.
+func TestNewHostMode(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	require.Equal(t, ioWaitAwareMode, newHostMode(redoAwareMode, true, logger))
+	require.Equal(t, redoAwareMode, newHostMode(redoAwareMode, false, logger))
+	require.Equal(t, globalStatusMode, newHostMode(globalStatusMode, true, logger))
+	require.Equal(t, globalStatusMode, newHostMode(globalStatusMode, false, logger))
+
+	// Both perf_schema signals ignore redo-log waiters, so both need the
+	// commit-latency backstop to grow writers (ResolveMaxWriteThreads).
+	require.True(t, ioWaitAwareMode.ignoresRedoWaiters())
+	require.True(t, redoAwareMode.ignoresRedoWaiters())
+	require.False(t, globalStatusMode.ignoresRedoWaiters())
+}
+
 func TestCanReadRedoAwareThreads_LocalMySQL(t *testing.T) {
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)

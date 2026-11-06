@@ -195,18 +195,19 @@ type autoScaler struct {
 }
 
 // newAutoScaler builds a controller. start is the resolved write-thread count
-// (the applier was started at this value); maxThreads is the cap. The minimum
-// is always 1 so the copy keeps making progress. Requiring a GradualThrottler
+// (the applier was started at this value); minThreads and maxThreads bound it.
+// A minThreads below 1 means 1, so the copy keeps making progress. Requiring a GradualThrottler
 // (not just a Throttler) is what guarantees there is a continuous signal to
 // control on — the caller asserts for it and skips autoscaling otherwise.
-func newAutoScaler(t throttler.GradualThrottler, s writeScaler, start, maxThreads int, logger *slog.Logger, sink metrics.Sink) *autoScaler {
+func newAutoScaler(t throttler.GradualThrottler, s writeScaler, minThreads, start, maxThreads int, logger *slog.Logger, sink metrics.Sink) *autoScaler {
+	minThreads = max(1, min(minThreads, start))
 	if maxThreads < start {
 		maxThreads = start
 	}
 	return &autoScaler{
 		throttler:   t,
 		scaler:      s,
-		min:         1,
+		min:         minThreads,
 		max:         maxThreads,
 		current:     start,
 		logger:      logger,

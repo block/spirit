@@ -128,12 +128,21 @@ type Runner struct {
 	// Zero leaves the change package's defaults; autoscaling derives them
 	// from the targets (moveFlushBounds).
 	flushConcurrency, flushBatchSize int
+	// newHosts is set when every target server serves nothing but this move:
+	// --defer-secondary-indexes says so, or detectNewHosts measured it. It
+	// defers the secondary indexes and loads the targets harder (see
+	// throttler.AuroraSetup.NewHost and concurrency.Request.NewHosts).
+	newHosts bool
 	// buildAurora and auroraVCPUs are the instance probes setupThrottling runs.
 	// NewRunner sets buildAurora to throttler.BuildAurora; a nil auroraVCPUs is
 	// throttler.AuroraVCPUs (concurrency.Request.VCPUs). Tests replace them,
 	// because CI has no Aurora to probe.
 	buildAurora func(context.Context, throttler.AuroraSetup) (throttler.AuroraResult, error)
 	auroraVCPUs func(context.Context, *sql.DB) (int, error)
+	// readServerData is detectNewHosts' measurement. NewRunner sets it to
+	// dbconn.ReadServerUserData; tests replace it, because the CI server's
+	// size depends on what the other tests have left on it.
+	readServerData func(context.Context, *sql.DB, func(schema, table string) bool) (dbconn.ServerUserData, error)
 
 	applier     applier.Applier
 	chunkerMu   sync.RWMutex // Publishes copyChunker to concurrent Progress callers.
@@ -232,6 +241,7 @@ func NewRunner(m *Move) (*Runner, error) {
 		logger:              slog.Default(),
 		metricsSink:         &metrics.NoopSink{},
 		buildAurora:         throttler.BuildAurora,
+		readServerData:      dbconn.ReadServerUserData,
 	}
 	return r, nil
 }
@@ -384,7 +394,7 @@ func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.Table
 }
 
 // createTargetTables creates tables on all targets.
-// If DeferSecondaryIndexes is enabled, tables are created without secondary indexes.
+// On new hosts (newHosts), tables are created without secondary indexes.
 // Secondary indexes will be added later by restoreSecondaryIndexes() before cutover.
 // This function skips tables that already exist (they were validated by checkTargetEmpty).
 func (r *Runner) createTargetTables(ctx context.Context) error {
@@ -398,10 +408,10 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 			return err
 		}
 
-		// If DeferSecondaryIndexes is enabled, remove secondary indexes from CREATE TABLE
+		// On new hosts, remove secondary indexes from CREATE TABLE
 		// We don't have to track what these indexes were: we'll just recreate them later
 		// from the source table.
-		if r.move.DeferSecondaryIndexes {
+		if r.newHosts {
 			var err error
 			createStmt, err = statement.RemoveSecondaryIndexes(createStmt)
 			if err != nil {
@@ -437,7 +447,7 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 				"table", t.TableName,
 				"target", i,
 				"database", target.Config.DBName,
-				"deferred_indexes", r.move.DeferSecondaryIndexes,
+				"deferred_indexes", r.newHosts,
 			)
 		}
 	}
@@ -635,6 +645,7 @@ func (r *Runner) setupDiscovery(ctx context.Context) error {
 // lock before it can destroy the first run's target data.
 func (r *Runner) setupUnderLocks(ctx context.Context) error {
 	var err error
+	r.newHosts = r.move.DeferSecondaryIndexes || r.detectNewHosts(ctx)
 	if err := r.setupThrottling(ctx); err != nil {
 		return err
 	}
@@ -736,6 +747,7 @@ func (r *Runner) setupThrottling(ctx context.Context) error {
 			Source:                 target.DB,
 			OpenMonitor:            dbconn.MonitorOpener(target.Config.FormatDSN(), r.dbConfig, "move target monitor"),
 			CommitLatencyThreshold: r.move.MaxCommitLatency,
+			NewHost:                r.newHosts,
 			Logger:                 r.logger.With("target", targetKey(target)),
 		})
 		if err != nil {
@@ -747,6 +759,48 @@ func (r *Runner) setupThrottling(ctx context.Context) error {
 		results[i] = result
 	}
 	return r.applyAuroraResults(ctx, groups, results)
+}
+
+// detectNewHosts reports whether every target server is a new host: it holds
+// less than dbconn.NewHostDataLimit bytes outside the tables this move writes,
+// and the target user sees every table on it (dbconn.ReadServerUserData). The
+// move's own tables are left out so a resumed move, whose targets hold the
+// rows copied so far, reaches the same answer as the fresh one. A server that
+// cannot be measured is not a new host: the move then runs as it would into a
+// serving host.
+func (r *Runner) detectNewHosts(ctx context.Context) bool {
+	own := make(map[string]bool, len(r.sourceTables))
+	for _, t := range r.sourceTables {
+		own[t.TableName] = true
+	}
+	var total int64
+	for _, group := range r.targetHosts() {
+		schemas := make(map[string]bool, len(group.Indices))
+		for _, i := range group.Indices {
+			schemas[r.targets[i].Config.DBName] = true
+		}
+		target := r.targets[group.Indices[0]]
+		data, err := r.readServerData(ctx, target.DB, func(schema, table string) bool {
+			return schemas[schema] && own[table]
+		})
+		log := r.logger.With("target", targetKey(target))
+		switch {
+		case err != nil:
+			log.Warn("could not measure the target server's data; treating it as a serving host", "error", err.Error())
+			return false
+		case !data.SeesEveryTable:
+			log.Info("the target user has no global table privilege, so it cannot see every table on the target server; treating it as a serving host")
+			return false
+		case !data.NewHost():
+			log.Info("the target server already holds data; treating it as a serving host",
+				"bytes", data.Bytes, "limit", dbconn.NewHostDataLimit)
+			return false
+		}
+		total += data.Bytes
+	}
+	r.logger.Info("every target server is a new host: deferring secondary indexes and allowing more load on the targets",
+		"hosts", len(r.targetHosts()), "bytes", total, "limit_per_host", dbconn.NewHostDataLimit)
+	return true
 }
 
 // applyAuroraResults installs the targets' combined load signal and then
@@ -794,10 +848,11 @@ func (r *Runner) setupAutoscaling(ctx context.Context, groups []host.Group, resu
 		}
 	}
 	plan, err := concurrency.Engage(ctx, &r.move.Common, concurrency.Request{
-		Targets: targets,
-		Sources: len(r.sources),
-		VCPUs:   r.auroraVCPUs,
-		Logger:  r.logger,
+		Targets:  targets,
+		Sources:  len(r.sources),
+		VCPUs:    r.auroraVCPUs,
+		NewHosts: r.newHosts,
+		Logger:   r.logger,
 	})
 	if err != nil {
 		return err

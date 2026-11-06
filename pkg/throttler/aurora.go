@@ -44,6 +44,15 @@ type AuroraSetup struct {
 	// proved is at least partly readable).
 	CommitLatencyThreshold time.Duration
 
+	// NewHost declares that the server serves nothing but this run, as with a
+	// move into new hosts. The threads signal then leaves out threads waiting
+	// on I/O (page reads, not only the redo-log flush), so the run may keep
+	// more statements in flight than the server has vCPUs: they wait on
+	// storage, not on CPU, and no other user's reads are slowed. It applies
+	// only to the perf_schema signal; the Threads_running fallback counts
+	// every running thread either way.
+	NewHost bool
+
 	Logger *slog.Logger
 }
 
@@ -60,11 +69,12 @@ type AuroraResult struct {
 	// it was asked to scale and cannot tell whether it should.
 	ProbeErr error
 
-	// RedoAware reports whether the threads throttler runs the redo-aware
-	// perf_schema signal rather than the Threads_running fallback. That signal
-	// ignores redo-log waiters, so it cannot see write threads oversubscribing
-	// the log; ResolveMaxWriteThreads takes it to decide whether growth needs
-	// the commit-latency backstop. False when Throttlers is empty.
+	// RedoAware reports whether the threads throttler runs a perf_schema
+	// signal (redo-aware, or io-wait-aware for a new host) rather than the
+	// Threads_running fallback. Both ignore redo-log waiters, so they cannot
+	// see write threads oversubscribing the log; ResolveMaxWriteThreads takes
+	// it to decide whether growth needs the commit-latency backstop. False
+	// when Throttlers is empty.
 	RedoAware bool
 }
 
@@ -147,7 +157,7 @@ func (s AuroraSetup) Build(ctx context.Context) (AuroraResult, error) {
 	// Choose the threads signal: prefer the redo-aware perf_schema count, fall
 	// back to Threads_running when the extra grants are missing. The probe runs
 	// on Source (cheap, one-shot); the throttler then polls monitorDB.
-	mode := selectThreadsMode(ctx, s.Source, s.Logger)
+	mode := newHostMode(selectThreadsMode(ctx, s.Source, s.Logger), s.NewHost, s.Logger)
 
 	monitorDB, err := s.OpenMonitor()
 	if err != nil {
@@ -174,7 +184,19 @@ func (s AuroraSetup) Build(ctx context.Context) (AuroraResult, error) {
 	}
 	throttlers = append(throttlers, tr)
 
-	return AuroraResult{Throttlers: throttlers, MonitorDB: monitorDB, RedoAware: mode == redoAwareMode}, nil
+	return AuroraResult{Throttlers: throttlers, MonitorDB: monitorDB, RedoAware: mode.ignoresRedoWaiters()}, nil
+}
+
+// newHostMode upgrades the redo-aware signal to the io-wait-aware one when
+// the server serves nothing but the run (AuroraSetup.NewHost). Both read the
+// same perf_schema tables, so the grant probe that chose redo-aware covers
+// it. The Threads_running fallback is returned unchanged.
+func newHostMode(mode threadsMode, newHost bool, logger *slog.Logger) threadsMode {
+	if !newHost || mode != redoAwareMode {
+		return mode
+	}
+	logger.Info("Aurora threads throttler: the server serves nothing but this run, so threads waiting on I/O are not counted as load")
+	return ioWaitAwareMode
 }
 
 // BuildAurora is setup.Build as a plain function, so a runner can hold it in a

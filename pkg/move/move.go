@@ -23,9 +23,16 @@ type Move struct {
 	// --defer-cutover (the sentinel lives on the first target).
 	flags.Cutover
 
-	SourceDSN             string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
-	TargetDSN             string `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
-	DeferSecondaryIndexes bool   `name:"defer-secondary-indexes" help:"Defer regular indexes until before cutover, preserving required AUTO_INCREMENT support" default:"false"`
+	SourceDSN string `name:"source-dsn" help:"Where to copy the tables from." default:"spirit:spirit@tcp(127.0.0.1:3306)/src"`
+	TargetDSN string `name:"target-dsn" help:"Where to copy the tables to." default:"spirit:spirit@tcp(127.0.0.1:3306)/dest"`
+	// DeferSecondaryIndexes declares the target servers new hosts: they serve
+	// nothing but this move. A move detects that without it when every target
+	// server holds less than dbconn.NewHostDataLimit outside the move's tables
+	// (Runner.detectNewHosts), so the flag is only needed when the target user
+	// cannot see every table. On new hosts the secondary indexes are added
+	// before cutover rather than kept during the copy, and the targets are
+	// loaded harder.
+	DeferSecondaryIndexes bool `name:"defer-secondary-indexes" help:"Treat the target servers as new hosts that serve nothing else: defer regular indexes until before cutover (preserving required AUTO_INCREMENT support) and load the targets harder. Detected automatically when every target server holds under 100 MiB outside the moved tables." default:"false"`
 	// Force makes the runner wipe the target tables and start the copy fresh when
 	// it cannot resume from a checkpoint (e.g. the checkpoint is from an
 	// incompatible spirit version, or the target is in a state resume can't

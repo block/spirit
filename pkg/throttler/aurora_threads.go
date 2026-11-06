@@ -79,6 +79,24 @@ const (
 	  AND pps.PROCESSLIST_ID <> CONNECTION_ID()
 	  AND pps.PROCESSLIST_COMMAND = 'Query'`
 
+	// ioWaitAwareThreadsQuery is redoAwareThreadsQuery for a server that
+	// serves nothing but the run (AuroraSetup.NewHost): it subtracts every
+	// thread waiting on I/O, not only on the redo-log flush. A thread reading
+	// a page from storage or writing to its socket is off CPU, and on such a
+	// server there are no other users whose reads more concurrent I/O would
+	// slow. It matches the wait class rather than event names, so it needs no
+	// Aurora-specific name: wait/io/file, wait/io/socket and the redo flush
+	// are all excluded. wait/io/table is kept: it times the handler calls that
+	// wrap row operations, which include CPU work. A thread whose wait is not
+	// instrumented still counts, the same conservative fallback as above.
+	ioWaitAwareThreadsQuery = `SELECT
+		GREATEST(COUNT(*) - COALESCE(SUM(CASE WHEN ewc.END_EVENT_ID IS NULL AND ewc.EVENT_NAME LIKE 'wait/io/%' AND ewc.EVENT_NAME NOT LIKE 'wait/io/table/%' THEN 1 ELSE 0 END), 0), 0) AS active_cpu_threads
+	FROM performance_schema.threads pps
+	LEFT JOIN performance_schema.events_waits_current ewc ON pps.THREAD_ID = ewc.THREAD_ID
+	WHERE pps.PROCESSLIST_ID IS NOT NULL
+	  AND pps.PROCESSLIST_ID <> CONNECTION_ID()
+	  AND pps.PROCESSLIST_COMMAND = 'Query'`
+
 	// threadsRunningQuery reads the Threads_running status variable: the count
 	// of non-sleeping threads. It comes from performance_schema.global_status
 	// (the same source as the commit-latency throttler and IsAurora), so it
@@ -161,12 +179,25 @@ var (
 	// shared monitor pool, which it cannot single out.
 	redoAwareMode = threadsMode{query: redoAwareThreadsQuery, headroom: 1, label: "redo-aware"}
 
+	// ioWaitAwareMode is redoAwareMode on a server that serves nothing but the
+	// run: it also leaves out threads waiting on other I/O, such as page reads
+	// (see ioWaitAwareThreadsQuery). It needs the same grants, and like
+	// redoAwareMode it ignores redo-log waiters, so growing write threads
+	// needs the commit-latency backstop (ResolveMaxWriteThreads).
+	ioWaitAwareMode = threadsMode{query: ioWaitAwareThreadsQuery, headroom: 1, label: "io-wait-aware"}
+
 	// globalStatusMode is the fallback when the perf-schema grants above are
 	// absent: it counts ALL running threads via Threads_running from
 	// global_status. It cannot exclude any of spirit's monitoring threads, so
 	// it carries the full selfMonitoringHeadroom.
 	globalStatusMode = threadsMode{query: threadsRunningQuery, headroom: selfMonitoringHeadroom, label: "threads-running"}
 )
+
+// ignoresRedoWaiters reports whether the mode leaves redo-log waiters out of
+// its count, which is what AuroraResult.RedoAware reports.
+func (m threadsMode) ignoresRedoWaiters() bool {
+	return m == redoAwareMode || m == ioWaitAwareMode
+}
 
 // AuroraVCPUs reads the instance vCPU count from @@innodb_buffer_pool_instances,
 // which Aurora pins to the vCPU count (issue #831). It returns an error if the

@@ -493,3 +493,42 @@ func TestEngageBaselineThreadsDoNotWarn(t *testing.T) {
 		}
 	}
 }
+
+// On new hosts no target gets fewer than autoscale.NewHostMinWriteThreads
+// write workers, even where dividing the instance between its shards or the
+// client ceiling between the targets would give one.
+func TestDeriveNewHostsWriteFloor(t *testing.T) {
+	// 128 targets, four to each 8-vCPU server, under a 256-thread client
+	// ceiling: the division gives WriteStart(8)/4 = 1 and a budget of 2.
+	many := Topology{VCPUs: make([]int, 32), ShardsPerHost: 4, Targets: 128}
+	for i := range many.VCPUs {
+		many.VCPUs[i] = 8
+	}
+	serving, ok := Derive(many, 256, true, true)
+	require.True(t, ok)
+	require.Equal(t, 1, serving.WriteStart)
+	require.Equal(t, 1, serving.MinWriteThreads)
+
+	many.NewHosts = true
+	fresh, ok := Derive(many, 256, true, true)
+	require.True(t, ok)
+	require.Equal(t, autoscale.NewHostMinWriteThreads, fresh.WriteStart)
+	require.Equal(t, autoscale.NewHostMinWriteThreads, fresh.MinWriteThreads)
+	require.GreaterOrEqual(t, fresh.MaxWriteThreads, fresh.WriteStart)
+	require.Equal(t, autoscale.NewHostMinWriteThreads, fresh.Copier().MinThreads)
+
+	// The floor holds below the client ceiling's share too.
+	tiny := shared(16)
+	tiny.NewHosts = true
+	floored, _ := Derive(tiny, 1, true, true)
+	require.Equal(t, autoscale.NewHostMinWriteThreads, floored.WriteStart)
+	require.Equal(t, autoscale.NewHostMinWriteThreads, floored.MaxWriteThreads)
+
+	// A count the division already puts above the floor is unchanged.
+	large := separate(64)
+	plain, _ := Derive(large, 128, true, true)
+	large.NewHosts = true
+	lifted, _ := Derive(large, 128, true, true)
+	require.Equal(t, plain.WriteStart, lifted.WriteStart)
+	require.Equal(t, plain.MaxWriteThreads, lifted.MaxWriteThreads)
+}
