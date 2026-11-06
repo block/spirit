@@ -98,6 +98,33 @@ type syncOwnedSignal struct {
 func (s *syncOwnedSignal) Open(context.Context) error { s.opens++; return s.openErr }
 func (s *syncOwnedSignal) Close() error               { s.closes++; return nil }
 
+// The sync throttles on its target while the copy readers read the source,
+// so the readers scale on the applier queue alone (IndependentReads) unless
+// the source is on the target server or either endpoint is unknown.
+func TestSyncCopyReadsIndependentOfTargetLoad(t *testing.T) {
+	target := &mysql.Config{Net: "tcp", Addr: "target-host:3306", DBName: "target"}
+	for _, tc := range []struct {
+		name           string
+		source, target *mysql.Config
+		want           bool
+	}{
+		{"source on its own server", &mysql.Config{Net: "tcp", Addr: "source-host:3306", DBName: "source"}, target, true},
+		{"source on the target server", &mysql.Config{Net: "tcp", Addr: "target-host:3306", DBName: "source"}, target, false},
+		{"target endpoint unknown", &mysql.Config{Net: "tcp", Addr: "source-host:3306", DBName: "source"}, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := NewRunner(&Sync{})
+			require.NoError(t, err)
+			r.source.config = tc.source
+			r.target.Config = tc.target
+			r.auroraVCPUs = func(context.Context, *sql.DB) (int, error) { return 16, nil }
+			require.NoError(t, r.setupAutoscaling(t.Context(), throttler.AuroraResult{Throttlers: []throttler.Throttler{&syncOwnedSignal{}}}))
+			require.True(t, r.autoscale.Enabled)
+			require.Equal(t, tc.want, r.autoscale.IndependentReads)
+		})
+	}
+}
+
 func TestSyncAutoscaleMonitorOwnership(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(fmt.Sprint(fail), func(t *testing.T) {

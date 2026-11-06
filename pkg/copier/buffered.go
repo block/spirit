@@ -338,8 +338,9 @@ func (c *buffered) autoscalerIfEnabled() *autoScaler {
 	// reports the queue snapshot (Stats) the arbiter needs.
 	maxRead := resolveReadCeiling(c.autoscale.MaxReadThreads, c.concurrency)
 	c.logger.Info("read-worker scaling engaged",
-		"start", c.concurrency, "max", maxRead)
+		"start", c.concurrency, "max", maxRead, "independent", c.autoscale.IndependentReads)
 	as.enableReadScaling(c, c.applier, c.concurrency, maxRead)
+	as.independentReads = c.autoscale.IndependentReads
 	return as
 }
 

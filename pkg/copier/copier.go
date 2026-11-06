@@ -101,6 +101,14 @@ type AutoscaleConfig struct {
 	// read pool sized off a flag default has no relationship to the cores it is
 	// competing for (see autoscale.ReadBounds).
 	MaxReadThreads int
+	// IndependentReads is set when the read workers read only servers the
+	// throttler does not watch: move and sync throttle on their targets while
+	// their readers read the sources. The read pool then scales on the applier
+	// queue alone, and the throttler's utilization moves only the write pool
+	// (see autoScaler.tickIndependent). Left false, a starved queue under load
+	// blames the readers, which is right when they read the watched server, as
+	// a migration's do. The throttler's hard stop pauses the readers either way.
+	IndependentReads bool
 }
 
 // NewCopierDefaultConfig returns a default config for the copier. Callers

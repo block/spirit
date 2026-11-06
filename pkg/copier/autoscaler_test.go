@@ -607,6 +607,127 @@ func TestDualAutoScaler_SharedCooldownAcrossPools(t *testing.T) {
 	require.Equal(t, 3, as.readCurrent, "read pool unchanged by the writer increase")
 }
 
+// newTestIndependentScaler builds a controller under the independent law
+// (AutoscaleConfig.IndependentReads): readers that read servers the throttler
+// does not watch.
+func newTestIndependentScaler(wStart, wMax, rStart, rMax int) (*autoScaler, *fakeScaler, *fakeReadScaler, *stubStats, *utilThrottler) {
+	as, fs, fr, st, ut := newTestDualScaler(wStart, wMax, rStart, rMax)
+	as.independentReads = true
+	return as, fs, fr, st, ut
+}
+
+func TestIndependentAutoScaler_StarvedGrowsReadersUnderLoad(t *testing.T) {
+	// Soft overload on the watched servers with a starved queue. The readers
+	// do not load those servers, so the overload sheds a writer and the
+	// starved queue still grows the read pool. (The dual law sheds a reader
+	// here: TestDualAutoScaler_ShedBlamesStarvedReadSide.)
+	as, fs, fr, st, ut := newTestIndependentScaler(4, 8, 2, 4)
+	ut.setUtil(0.8)
+	st.s = starvedStats()
+
+	as.tick(t.Context()) // queue unconfirmed: only the overload acts
+	require.Equal(t, 3, as.current, "overload sheds a writer")
+	require.Equal(t, 3, fs.n)
+	require.Equal(t, 2, as.readCurrent)
+
+	as.tick(t.Context()) // starved confirmed: the read pool grows
+	require.Equal(t, 3, as.readCurrent, "a starved queue grows the readers despite the overload")
+	require.Equal(t, 3, fr.n)
+
+	for range 20 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 4, as.readCurrent, "the read pool climbs to its cap and is never shed for the overload")
+	require.Equal(t, 1, as.current, "the overload keeps shedding writers to their floor")
+}
+
+func TestIndependentAutoScaler_FullShedsReaders(t *testing.T) {
+	// A full queue is the read pool's only shed signal. With headroom on the
+	// watched servers the writers grow on the same tick: the pools keep
+	// separate cooldowns.
+	as, fs, fr, st, ut := newTestIndependentScaler(2, 4, 3, 4)
+	ut.setUtil(0.2)
+	st.s = fullStats()
+
+	as.tick(t.Context()) // unconfirmed: hold both
+	require.Equal(t, 2, as.current)
+	require.Equal(t, 3, as.readCurrent)
+
+	as.tick(t.Context())
+	require.Equal(t, 3, as.current, "a full queue with headroom grows a writer")
+	require.Equal(t, 3, fs.n)
+	require.Equal(t, 2, as.readCurrent, "a full queue sheds a reader on the same tick")
+	require.Equal(t, 2, fr.n)
+}
+
+func TestIndependentAutoScaler_StarvedWithHeadroomHoldsWriters(t *testing.T) {
+	// Headroom on the watched servers grows a writer only when the queue is
+	// full: on a starved queue the writers have nothing more to do.
+	as, fs, _, st, ut := newTestIndependentScaler(2, 4, 2, 4)
+	ut.setUtil(0.1)
+	st.s = starvedStats()
+	for range 10 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 2, as.current)
+	require.Equal(t, 2, fs.n)
+	require.Equal(t, 4, as.readCurrent)
+}
+
+func TestIndependentAutoScaler_TrippedThrottlerHoldsReaders(t *testing.T) {
+	// At the panic threshold the hard stop parks the readers in BlockWait,
+	// so the queue drains and reads as starved. The read pool must neither
+	// grow into the stop nor halve for a load it did not cause; the write
+	// pool halves.
+	as, fs, fr, st, ut := newTestIndependentScaler(8, 16, 2, 4)
+	ut.setUtil(1.2)
+	st.s = starvedStats()
+	for range 10 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 2, as.readCurrent, "the read pool holds while the throttler is tripped")
+	require.Equal(t, 2, fr.n)
+	require.Less(t, as.current, 8, "the write pool halves")
+	require.Equal(t, as.current, fs.n)
+
+	// Once the stop clears, a starved queue grows the readers again.
+	ut.setUtil(0.8)
+	as.tick(t.Context())
+	require.Equal(t, 3, as.readCurrent)
+}
+
+func TestIndependentAutoScaler_TrippedThrottlerFullQueueHoldsReaders(t *testing.T) {
+	// A halve fills the queue: the writers drain it at half the rate. The
+	// read pool must not shed for it, or the copy restarts short of readers
+	// once the stop clears.
+	as, fs, fr, st, ut := newTestIndependentScaler(8, 16, 3, 4)
+	ut.setUtil(1.2)
+	st.s = fullStats()
+	for range 10 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 3, as.readCurrent, "the read pool holds on a full queue while the throttler is tripped")
+	require.Equal(t, 3, fr.n)
+	require.Less(t, as.current, 8, "the write pool halves")
+	require.Equal(t, as.current, fs.n)
+
+	// Once the stop clears, a full queue sheds a reader again.
+	ut.setUtil(0.8)
+	as.tick(t.Context())
+	require.Equal(t, 2, as.readCurrent)
+}
+
+func TestIndependentAutoScaler_BalancedHoldsReaders(t *testing.T) {
+	as, _, fr, st, ut := newTestIndependentScaler(2, 4, 2, 4)
+	ut.setUtil(0.8)
+	st.s = balancedStats()
+	for range 10 {
+		as.tick(t.Context())
+	}
+	require.Equal(t, 2, as.readCurrent)
+	require.Equal(t, 2, fr.n)
+}
+
 // TestAutoscalerIfEnabled_Gating covers the three conditions that must all
 // hold for the autoscaler to engage: the flag is on, the applier supports
 // dynamic write threads, and the throttler provides a continuous load signal
@@ -631,6 +752,10 @@ func TestAutoscalerIfEnabled_Gating(t *testing.T) {
 	require.NotNil(t, as.reader, "read scaling must engage with the write side")
 	require.Equal(t, 3, as.readCurrent)
 	require.Equal(t, 6, as.readMax)
+	require.False(t, as.independentReads, "the dual law is the default")
+	c.autoscale.IndependentReads = true
+	require.True(t, c.autoscalerIfEnabled().independentReads, "IndependentReads selects the independent law")
+	c.autoscale.IndependentReads = false
 
 	// Binary-only throttler (Noop here; replica lag and Mock behave the same):
 	// no continuous signal to control on, so the pool stays fixed.

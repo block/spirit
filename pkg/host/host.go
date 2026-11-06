@@ -3,7 +3,11 @@
 // must not treat separate schemas on the same endpoint as separate machines.
 package host
 
-import "github.com/block/mysql"
+import (
+	"slices"
+
+	"github.com/block/mysql"
+)
 
 // Host identifies an endpoint independently of schema and credentials. Ports
 // and transports remain distinct. DNS aliases and proxies cannot be resolved
@@ -41,4 +45,24 @@ func GroupConfigs(configs []*mysql.Config) []Group {
 		groups[pos].Indices = append(groups[pos].Indices, i)
 	}
 	return groups
+}
+
+// Disjoint reports whether no endpoint appears in both a and b. Like
+// GroupConfigs it compares endpoints as written, so two names for one server
+// read as different servers. A nil config is an endpoint that is not known,
+// which could be in either list, so it makes the lists not disjoint.
+func Disjoint(a, b []*mysql.Config) bool {
+	if slices.Contains(a, nil) || slices.Contains(b, nil) {
+		return false
+	}
+	seen := make(map[Host]bool)
+	for _, group := range GroupConfigs(a) {
+		seen[group.Host] = true
+	}
+	for _, group := range GroupConfigs(b) {
+		if seen[group.Host] {
+			return false
+		}
+	}
+	return true
 }
