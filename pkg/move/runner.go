@@ -594,18 +594,11 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
-	// Verify columns match between source and target for all tables.
-	for _, src := range r.sourceTables {
-		for i, target := range r.targets {
-			targetTable := table.NewTableInfo(target.DB, target.Config.DBName, src.TableName)
-			if err := targetTable.SetInfo(ctx); err != nil {
-				return fmt.Errorf("failed to get table info for target %d table %s: %w", i, src.TableName, err)
-			}
-			if !slices.Equal(src.Columns, targetTable.Columns) {
-				return fmt.Errorf("source and target table structures do not match for table '%s' on target %d", src.TableName, i)
-			}
-		}
-	}
+	// The target tables' schemas were already compared with the source's by
+	// the resume_state check (decideResume), which diffs the full CREATE TABLE,
+	// column order included, on every target. Repeating a names-only check
+	// here cost one SetInfo (ANALYZE TABLE and several queries) per table per
+	// target, serially: minutes of silence on a resume with many targets.
 
 	// Create a copier that reads from the multi chunker and uses the shared applier.
 	r.copier, err = copier.NewCopier(r.copyChunker, r.copierConfig())

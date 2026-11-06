@@ -332,6 +332,19 @@ func TestResumeStateCheckSchemaTypesAndCollation(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "schema mismatch")
 	})
+
+	// Test 4: same columns in a different order FAILS. The copier writes
+	// positional row images, so the move runner relies on this check, not a
+	// second comparison of its own, to refuse a reordered target.
+	t.Run("same columns different order fails", func(t *testing.T) {
+		_, err := tgtDB.ExecContext(t.Context(),
+			fmt.Sprintf("CREATE TABLE %s.t (name VARCHAR(100), id VARCHAR(64) COLLATE utf8mb4_bin NOT NULL, PRIMARY KEY (id))", tgtName))
+		require.NoError(t, err)
+		defer func() { _, _ = tgtDB.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s.t", tgtName)) }()
+		err = resumeStateCheck(t.Context(), newResources(), slog.Default())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "schema mismatch")
+	})
 }
 
 // TestResumeStateCheckMisreportedEnumSetTarget checks that resume refuses a
