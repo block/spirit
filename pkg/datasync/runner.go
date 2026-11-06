@@ -1298,7 +1298,10 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 // The comparison is deliberately exact, unlike move's source->target check
 // (check.TargetSchemaDiff), which forgives a target that drops the
 // source's column-level AUTO_INCREMENT or is stricter about NULL. Neither
-// relaxation transfers, because the two gates guard different states:
+// relaxation transfers, because the two gates guard different states (move
+// also forgives missing deferrable secondary indexes, which it restores before
+// its checksum; datasync restores its own deferred indexes and needs no
+// relaxation for them):
 //
 //   - move requires a pre-existing target table to be EMPTY (target_state
 //     rejects one holding any row), so only rows not yet copied are at stake
