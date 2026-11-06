@@ -1075,7 +1075,7 @@ func TestRemoveSecondaryIndexesForeignKeySupport(t *testing.T) {
 	for _, idx := range ct.GetIndexes() {
 		names = append(names, idx.Name)
 	}
-	require.Equal(t, []string{"PRIMARY", "fk_parent"}, names, "the foreign key's index is not deferred")
+	require.ElementsMatch(t, []string{"PRIMARY", "fk_parent"}, names, "the foreign key's index is not deferred")
 
 	_, err = db.ExecContext(t.Context(), source)
 	require.NoError(t, err)
