@@ -132,7 +132,7 @@ func TestTargetSchemaDiffNarrowNotNullRelaxation(t *testing.T) {
 
 // TestTargetSchemaDiffPublicContract pins what TargetSchemaDiff promises now
 // that it is exported: an empty diff means "the move will accept this target",
-// and the tolerated set is exactly two divergences. External callers preview a
+// and the tolerated set is exactly three divergences. External callers preview a
 // move by calling this and testing the result against "" — strata's
 // `keyspace move-tables` does, before the operator confirms — so a tolerance
 // added or removed here changes their verdict too, and a case moving between
@@ -148,6 +148,7 @@ func TestTargetSchemaDiffPublicContract(t *testing.T) {
 
 	tests := []struct {
 		name     string
+		source   string // empty means the shared source above
 		target   string
 		accepted bool
 	}{
@@ -225,7 +226,50 @@ func TestTargetSchemaDiffPublicContract(t *testing.T) {
 			accepted: false,
 		},
 		{
-			name: "target drops an index",
+			// A move defers this index on new hosts and restores it before
+			// the checksum, so a retried or resumed move must accept it.
+			name: "target lacks a deferrable secondary index",
+			target: "CREATE TABLE `corder` (\n" +
+				"  `order_id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"  `customer_id` bigint DEFAULT NULL,\n" +
+				"  `sku` varchar(128) DEFAULT NULL,\n" +
+				"  PRIMARY KEY (`order_id`)\n" +
+				") ENGINE=InnoDB",
+			accepted: true,
+		},
+		{
+			name: "target redefines an index",
+			target: "CREATE TABLE `corder` (\n" +
+				"  `order_id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"  `customer_id` bigint DEFAULT NULL,\n" +
+				"  `sku` varchar(128) DEFAULT NULL,\n" +
+				"  PRIMARY KEY (`order_id`),\n" +
+				"  KEY `idx_customer_id` (`sku`)\n" +
+				") ENGINE=InnoDB",
+			accepted: false,
+		},
+		{
+			name: "target adds an index",
+			target: "CREATE TABLE `corder` (\n" +
+				"  `order_id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"  `customer_id` bigint DEFAULT NULL,\n" +
+				"  `sku` varchar(128) DEFAULT NULL,\n" +
+				"  PRIMARY KEY (`order_id`),\n" +
+				"  KEY `idx_customer_id` (`customer_id`),\n" +
+				"  KEY `idx_sku` (`sku`)\n" +
+				") ENGINE=InnoDB",
+			accepted: false,
+		},
+		{
+			name: "target lacks a unique index",
+			source: "CREATE TABLE `corder` (\n" +
+				"  `order_id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"  `customer_id` bigint DEFAULT NULL,\n" +
+				"  `sku` varchar(128) DEFAULT NULL,\n" +
+				"  PRIMARY KEY (`order_id`),\n" +
+				"  UNIQUE KEY `uk_sku` (`sku`),\n" +
+				"  KEY `idx_customer_id` (`customer_id`)\n" +
+				") ENGINE=InnoDB",
 			target: "CREATE TABLE `corder` (\n" +
 				"  `order_id` bigint NOT NULL AUTO_INCREMENT,\n" +
 				"  `customer_id` bigint DEFAULT NULL,\n" +
@@ -238,7 +282,11 @@ func TestTargetSchemaDiffPublicContract(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			diff, err := TargetSchemaDiff("corder", source, tt.target)
+			src := source
+			if tt.source != "" {
+				src = tt.source
+			}
+			diff, err := TargetSchemaDiff("corder", src, tt.target)
 			require.NoError(t, err)
 			if tt.accepted {
 				require.Empty(t, diff, "the move must accept this target")

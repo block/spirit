@@ -256,7 +256,9 @@ Bulk-loading a table with fewer indexes is faster and lighter on temporary space
 regular secondary indexes are deferred — `PRIMARY`, `UNIQUE`, `FULLTEXT` and
 `SPATIAL` indexes are kept on the initial `CREATE`. If no retained primary or
 unique key starts with the `AUTO_INCREMENT` column, one regular supporting
-index is also kept, preferring the fewest key parts. This mirrors
+index is also kept, preferring the fewest key parts. Every regular index a
+foreign key can use (its leading columns are the foreign key's columns, in
+order) is kept too. This mirrors
 the index deferral of [`move` on new target hosts](move.md#new-target-hosts).
 
 Use it only when the target is **not yet serving reads**: the tables briefly

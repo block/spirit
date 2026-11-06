@@ -227,6 +227,22 @@ func TestGetMissingSecondaryIndexes(t *testing.T) {
 			expectedAlter: "ALTER TABLE `users` ADD INDEX `idx_name` (`name`)",
 		},
 		{
+			name: "Missing index shares a check constraint's name",
+			sourceCreateTable: `CREATE TABLE orders (
+				id INT PRIMARY KEY,
+				amount INT,
+				KEY positive (amount),
+				CONSTRAINT positive CHECK (amount >= 0)
+			)`,
+			targetCreateTable: `CREATE TABLE orders (
+				id INT PRIMARY KEY,
+				amount INT,
+				CONSTRAINT positive CHECK (amount >= 0)
+			)`,
+			tableName:     "orders",
+			expectedAlter: "ALTER TABLE `orders` ADD INDEX `positive` (`amount`)",
+		},
+		{
 			name: "Multiple missing indexes",
 			sourceCreateTable: `CREATE TABLE users (
 				id INT PRIMARY KEY,
@@ -986,6 +1002,14 @@ func TestDropDeferrableSecondaryIndexes(t *testing.T) {
 			want: "ALTER TABLE `t` DROP INDEX `fn`",
 		},
 		{
+			// InnoDB refuses to drop the last index a foreign key can use
+			// (error 1553), so every candidate stays: one whose leading key
+			// parts are the foreign key's columns, in order.
+			name: "foreign key support kept",
+			ddl:  "CREATE TABLE `t` (`id` int NOT NULL, `parent_id` int, `tenant` int, `a` int, PRIMARY KEY (`id`), KEY `fk_parent` (`parent_id`), KEY `parent_a` (`parent_id`,`a`), KEY `a_parent` (`a`,`parent_id`), KEY `tp` (`tenant`,`parent_id`), CONSTRAINT `t_parent` FOREIGN KEY (`parent_id`) REFERENCES `p` (`id`), CONSTRAINT `t_tp` FOREIGN KEY (`tenant`,`parent_id`) REFERENCES `p2` (`t`,`id`))",
+			want: "ALTER TABLE `t` DROP INDEX `a_parent`",
+		},
+		{
 			name: "nothing to defer",
 			ddl:  "CREATE TABLE `t` (`id` int NOT NULL, `b` varchar(32), PRIMARY KEY (`id`), UNIQUE KEY `b_uniq` (`b`))",
 			want: "",
@@ -1041,6 +1065,7 @@ func TestRemoveDeferredIndexes(t *testing.T) {
 		{"one deferred", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), UNIQUE KEY c_uniq (c))", []string{"PRIMARY", "ai", "c_uniq"}},
 		{"auto-increment support deferred", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL, a INT, c INT, PRIMARY KEY (p), UNIQUE KEY c_uniq (c))", []string{"PRIMARY", "c_uniq"}},
 		{"unique key missing", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), KEY a_idx (a))", []string{"PRIMARY", "ai", "a_idx", "c_uniq"}},
+		{"deferred index shares a check constraint's name", "CREATE TABLE t (p INT NOT NULL, id BIGINT NOT NULL AUTO_INCREMENT, a INT, c INT, PRIMARY KEY (p), KEY ai (id), UNIQUE KEY c_uniq (c), CONSTRAINT a_idx CHECK (a >= 0))", []string{"PRIMARY", "ai", "c_uniq"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := RemoveDeferredIndexes(source, tc.target)
@@ -1048,4 +1073,32 @@ func TestRemoveDeferredIndexes(t *testing.T) {
 			require.Equal(t, tc.want, indexes(t, got))
 		})
 	}
+}
+
+// TestRemoveSecondaryIndexesForeignKeySupport: a fresh deferred CREATE keeps
+// the index a foreign key uses, so the target table MySQL creates has the
+// source's own index rather than one it generates under the constraint's name,
+// and the drop on a pre-created table succeeds.
+func TestRemoveSecondaryIndexesForeignKeySupport(t *testing.T) {
+	_, db := testutils.CreateUniqueTestDatabase(t)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+	require.NoError(t, err)
+	const source = "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, parent_id INT, a INT, KEY fk_parent (parent_id), KEY a_idx (a), CONSTRAINT t_parent FOREIGN KEY (parent_id) REFERENCES p (id))"
+	stripped, err := RemoveSecondaryIndexes(source)
+	require.NoError(t, err)
+	ct, err := ParseCreateTable(stripped)
+	require.NoError(t, err)
+	var names []string
+	for _, idx := range ct.GetIndexes() {
+		names = append(names, idx.Name)
+	}
+	require.ElementsMatch(t, []string{"PRIMARY", "fk_parent"}, names, "the foreign key's index is not deferred")
+
+	_, err = db.ExecContext(t.Context(), source)
+	require.NoError(t, err)
+	drop, err := DropDeferrableSecondaryIndexes(source, "t")
+	require.NoError(t, err)
+	require.Equal(t, "ALTER TABLE `t` DROP INDEX `a_idx`", drop)
+	_, err = db.ExecContext(t.Context(), drop)
+	require.NoError(t, err, "MySQL refuses to drop an index a foreign key needs (1553)")
 }

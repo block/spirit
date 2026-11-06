@@ -107,13 +107,15 @@ type metadataLock struct {
 // report still reading when the statement returns logs nothing; one already
 // writing its lines finishes them.
 func (s *TableLock) reportSlowStatement(stmtCtx context.Context) context.CancelFunc {
-	if slowLockedStatementThreshold <= 0 {
+	// Read the threshold here, not in the goroutine: done does not wait for
+	// it, so a read there could race a later write.
+	next := slowLockedStatementThreshold
+	if next <= 0 {
 		return func() {}
 	}
 	reportCtx, done := context.WithCancel(stmtCtx)
 	started := time.Now()
 	go func() {
-		next := slowLockedStatementThreshold
 		for {
 			timer := time.NewTimer(next - time.Since(started))
 			select {

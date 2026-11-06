@@ -58,7 +58,9 @@ func DropDeferrableSecondaryIndexes(createStmt, tableName string) (string, error
 // source's AUTO_INCREMENT, and so may have dropped the index that supports
 // it, while MySQL refuses a table whose AUTO_INCREMENT column leads no index.
 // PRIMARY, UNIQUE, FULLTEXT and SPATIAL indexes are never removed, and an index
-// the target has under a source index's name is compared as it is.
+// the target has under a source index's name is compared as it is. Only the
+// target's indexes count toward that name match, not its CHECK or FOREIGN KEY
+// constraints.
 func RemoveDeferredIndexes(sourceCreate, targetCreate string) (string, error) {
 	target, err := ParseCreateTable(targetCreate)
 	if err != nil {
@@ -66,7 +68,9 @@ func RemoveDeferredIndexes(sourceCreate, targetCreate string) (string, error) {
 	}
 	present := make(map[string]bool)
 	for _, constraint := range target.Raw.Constraints {
-		present[strings.ToLower(constraint.Name)] = true
+		if isIndex(constraint) {
+			present[strings.ToLower(constraint.Name)] = true
+		}
 	}
 	source, err := ParseCreateTable(sourceCreate)
 	if err != nil {
@@ -126,7 +130,8 @@ func removeSecondaryIndexes(createStmt string, preserveAutoIncrement bool) (stri
 
 // deferrableIndexes returns ct's regular (non-UNIQUE, non-FULLTEXT,
 // non-SPATIAL) indexes in declaration order, less the one kept to support an
-// AUTO_INCREMENT column when preserveAutoIncrement is set.
+// AUTO_INCREMENT column when preserveAutoIncrement is set, and less every one
+// that can support a foreign key.
 func deferrableIndexes(ct *CreateTable, preserveAutoIncrement bool) []*ast.Constraint {
 	// InnoDB requires AUTO_INCREMENT to lead an index. Retained primary
 	// and unique keys can satisfy it; otherwise keep one supporting regular
@@ -165,9 +170,38 @@ func deferrableIndexes(ct *CreateTable, preserveAutoIncrement bool) []*ast.Const
 		if len(constraint.Keys) > 0 && constraint.Keys[0].Column != nil && support[strings.ToLower(constraint.Keys[0].Column.Name.O)] == constraint {
 			continue
 		}
+		if supportsForeignKey(ct, constraint) {
+			continue
+		}
 		deferrable = append(deferrable, constraint)
 	}
 	return deferrable
+}
+
+// supportsForeignKey reports whether index could be the index one of ct's
+// foreign keys uses: its leading key parts are that foreign key's columns, in
+// order. InnoDB requires such an index and refuses to drop the last one
+// (error 1553), so none of them is deferred. Keeping every candidate, not only
+// the one MySQL would pick, is the conservative choice: it never leaves a
+// foreign key without an index.
+func supportsForeignKey(ct *CreateTable, index *ast.Constraint) bool {
+	for _, fk := range ct.Raw.Constraints {
+		if fk.Tp != ast.ConstraintForeignKey || len(fk.Keys) == 0 || len(index.Keys) < len(fk.Keys) {
+			continue
+		}
+		matches := true
+		for i, key := range fk.Keys {
+			part := index.Keys[i]
+			if key.Column == nil || part.Column == nil || !strings.EqualFold(key.Column.Name.O, part.Column.Name.O) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
 }
 
 // GetMissingSecondaryIndexes compares two CREATE TABLE statements (source and target)
@@ -191,7 +225,7 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 	targetDefinitions := make(map[string]bool)
 	for _, constraint := range targetCT.Raw.Constraints {
 		// Skip PRIMARY KEY, but include all other index types
-		if constraint.Tp == ast.ConstraintPrimaryKey {
+		if constraint.Tp == ast.ConstraintPrimaryKey || !isIndex(constraint) {
 			continue
 		}
 		if constraint.Name != "" {
@@ -213,13 +247,7 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 			continue
 		}
 		// Include: UNIQUE, FULLTEXT, SPATIAL, and regular INDEX
-		if constraint.Tp != ast.ConstraintKey &&
-			constraint.Tp != ast.ConstraintIndex &&
-			constraint.Tp != ast.ConstraintUniq &&
-			constraint.Tp != ast.ConstraintUniqKey &&
-			constraint.Tp != ast.ConstraintUniqIndex &&
-			constraint.Tp != ast.ConstraintFulltext &&
-			constraint.Tp != ast.ConstraintSpatial {
+		if !isIndex(constraint) {
 			continue
 		}
 
@@ -335,6 +363,21 @@ func GetMissingSecondaryIndexes(sourceCreateTable, targetCreateTable, tableName 
 
 // unnamedIndexDefinition compares unnamed indexes by their full definition,
 // including key order, expressions, prefix lengths, and options.
+// isIndex reports whether constraint is an index. A CHECK or FOREIGN KEY
+// constraint is not, and its name is in a separate namespace from index
+// names: a table may have KEY positive (amount) and CONSTRAINT positive
+// CHECK (amount >= 0), so a constraint's name must never stand in for an
+// index's.
+func isIndex(constraint *ast.Constraint) bool {
+	switch constraint.Tp { //nolint:exhaustive
+	case ast.ConstraintPrimaryKey, ast.ConstraintKey, ast.ConstraintIndex,
+		ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex,
+		ast.ConstraintFulltext, ast.ConstraintSpatial:
+		return true
+	}
+	return false
+}
+
 func unnamedIndexDefinition(constraint *ast.Constraint) (string, error) {
 	bare := *constraint
 	bare.Name = ""

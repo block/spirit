@@ -67,19 +67,28 @@ func schemaDiff(table, wantCreate, gotCreate string) (string, error) {
 // or an empty string if the move will accept the target as it stands. It is the
 // comparison the source→target checks use (target_state, resume_state).
 //
-// Two divergences are tolerated, and only these two. Both are a target that is
-// deliberately stricter or leaner than the unsharded source it moves from, so
-// that a declaratively-managed target does not have to mirror artifacts of its
-// source:
+// Three divergences are tolerated, and only these three. The first two are a
+// target that is deliberately stricter or leaner than the unsharded source it
+// moves from, so that a declaratively-managed target does not have to mirror
+// artifacts of its source:
 //
 //   - the source's column-level AUTO_INCREMENT may be absent on the target,
 //     whose ids come from elsewhere (e.g. a Vitess sequence);
 //   - a column the source declares nullable may be NOT NULL on the target — a
 //     shard key, typically, which cannot be NULL in a sharded keyspace.
 //
-// Anything else is a difference, the reverse of either included: a target looser
-// than its source fails, as does any change to types, charset, collation,
-// indexes or constraints. See statement.DiffCreateTables for the
+// The third is a target the move itself leaves part-built: it may lack some or
+// all of the source's deferrable secondary indexes
+// (statement.RemoveDeferredIndexes). A move defers them on new hosts, and
+// restoreSecondaryIndexes adds every missing one back before the checksum, on
+// every run, so a move resumed or retried mid-copy must accept the target it
+// left behind. An index the target has is compared as it is, so a redefined
+// one is still a difference. PRIMARY, UNIQUE, FULLTEXT and SPATIAL indexes,
+// and an index a foreign key can use, are never deferrable.
+//
+// Anything else is a difference, the reverse of the first two included: a
+// target looser than its source fails, as does any change to types, charset,
+// collation, indexes or constraints. See statement.DiffCreateTables for the
 // canonicalization rules underneath.
 //
 // It is exported because "which divergences does a move tolerate" must have
@@ -127,20 +136,16 @@ func schemaDiff(table, wantCreate, gotCreate string) (string, error) {
 // for it. The parameter names below are what prevents that, which is why the
 // option and the argument order never leave this function.
 func TargetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) {
-	diffOpts := moveDiffOptions()
-	diffOpts.IgnoreNotNullRelaxation = true
-	return statement.DiffCreateTables(table, sourceCreate, targetCreate, diffOpts)
+	diff, _, err := targetSchemaDiffDeferred(table, sourceCreate, targetCreate)
+	return diff, err
 }
 
-// targetSchemaDiffDeferred is TargetSchemaDiff for a target that may lack
-// some of the source's deferrable secondary indexes
-// (statement.RemoveDeferredIndexes): a move defers them on new hosts, and
-// restoreSecondaryIndexes adds every missing one back before the checksum,
-// on every run. deferred reports that the target matched only once the
-// indexes it lacks were left out. A target that differs in anything else
+// targetSchemaDiffDeferred is TargetSchemaDiff that also reports whether the
+// target matched only once the deferrable secondary indexes it lacks were
+// left out, so the checks can log it. A target that differs in anything else
 // returns the full diff against the source.
 func targetSchemaDiffDeferred(table, sourceCreate, targetCreate string) (diff string, deferred bool, err error) {
-	diff, err = TargetSchemaDiff(table, sourceCreate, targetCreate)
+	diff, err = relaxedTargetSchemaDiff(table, sourceCreate, targetCreate)
 	if err != nil || diff == "" {
 		return diff, false, err
 	}
@@ -148,7 +153,7 @@ func targetSchemaDiffDeferred(table, sourceCreate, targetCreate string) (diff st
 	if err != nil {
 		return "", false, err
 	}
-	deferredDiff, err := TargetSchemaDiff(table, withoutMissing, targetCreate)
+	deferredDiff, err := relaxedTargetSchemaDiff(table, withoutMissing, targetCreate)
 	if err != nil {
 		return "", false, err
 	}
@@ -156,6 +161,14 @@ func targetSchemaDiffDeferred(table, sourceCreate, targetCreate string) (diff st
 		return "", true, nil
 	}
 	return diff, false, nil
+}
+
+// relaxedTargetSchemaDiff is TargetSchemaDiff's first two tolerances alone:
+// column-level AUTO_INCREMENT and a target that tightens NOT NULL.
+func relaxedTargetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) {
+	diffOpts := moveDiffOptions()
+	diffOpts.IgnoreNotNullRelaxation = true
+	return statement.DiffCreateTables(table, sourceCreate, targetCreate, diffOpts)
 }
 
 // moveDiffOptions returns the diff options every move-tables schema comparison

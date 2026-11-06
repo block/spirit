@@ -515,9 +515,10 @@ modified, err := statement.RemoveSecondaryIndexes(original)
 - UNIQUE indexes (enforce data integrity constraints)
 - FULLTEXT and SPATIAL indexes (specialized index types)
 - One regular index leading with AUTO_INCREMENT when no retained PRIMARY or UNIQUE key already supports it
+- Every regular index a foreign key can use: its leading columns are the foreign key's columns, in order. InnoDB refuses to drop the last such index (error 1553)
 
 **What's Removed:**
-- Regular INDEX (non-unique secondary indexes), except the required AUTO_INCREMENT support index
+- Regular INDEX (non-unique secondary indexes), except the required AUTO_INCREMENT support index and foreign key support indexes
 
 This functionality is used by move tables operations to defer regular index creation until after data is copied, improving copy performance.
 
