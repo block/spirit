@@ -66,10 +66,9 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 
 	logs.Reset()
 	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.7), 'locked-literal'"))
-	out := logs.String()
+	out, records := completeReports(t, logs)
 	require.NotContains(t, out, "reader-literal", "a report must not log a statement's literals")
 	require.NotContains(t, out, "locked-literal", "a report must not log a statement's literals")
-	records := logRecords(t, out)
 
 	// Reports at 100ms, 200ms and 400ms.
 	var reports []map[string]any
@@ -177,7 +176,7 @@ func TestSlowStatementReportKeepsTheLockSessionFirst(t *testing.T) {
 
 	logs.Reset()
 	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.15)"))
-	records := logRecords(t, logs.String())
+	_, records := completeReports(t, logs)
 	require.Equal(t, slowStatementReport, records[0]["msg"])
 	require.Equal(t, false, records[0]["truncated"])
 	report := records[1:]
@@ -195,7 +194,7 @@ func TestSlowStatementReportKeepsTheLockSessionFirst(t *testing.T) {
 	metadataLockReportLimit = ownRows + 2
 	logs.Reset()
 	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.15)"))
-	records = logRecords(t, logs.String())
+	_, records = completeReports(t, logs)
 	require.Equal(t, slowStatementReport, records[0]["msg"])
 	require.Equal(t, true, records[0]["truncated"])
 	require.InDelta(t, float64(ownRows+2), records[0]["metadata_locks"], 0)
@@ -235,6 +234,48 @@ func (b *lockedBuffer) Reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.buf.Reset()
+}
+
+// completeReports returns the captured log, and its records, once every
+// report in it has written all the lock records its header counts.
+// ExecUnderLock does not wait for a report that is already writing, so its
+// last lines can land after the statement returns: reading or resetting the
+// log before then would split a report, and leave its tail for the next
+// check to find.
+func completeReports(t *testing.T, logs *lockedBuffer) (string, []map[string]any) {
+	t.Helper()
+	var out string
+	require.Eventually(t, func() bool {
+		out = logs.String()
+		return reportsComplete(out)
+	}, 5*time.Second, 10*time.Millisecond, "a report did not finish writing its lock records")
+	return out, logRecords(t, out)
+}
+
+// reportsComplete reports whether every report header in out is followed by
+// as many lock records as it counts.
+func reportsComplete(out string) bool {
+	want := 0
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		var r map[string]any
+		if json.Unmarshal([]byte(line), &r) != nil {
+			return false
+		}
+		switch r["msg"] {
+		case slowStatementReport:
+			n, ok := r["metadata_locks"].(float64)
+			if !ok || want != 0 {
+				return false
+			}
+			want = int(n)
+		case "metadata lock":
+			want--
+		}
+	}
+	return want == 0
 }
 
 // logRecords parses the JSON log lines in out.
