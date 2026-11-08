@@ -235,7 +235,7 @@ func resumeWithIndexes(t *testing.T, srcName, dstName string) *Move {
 // A resume on new hosts never drops the target's secondary indexes, even
 // from a checkpoint with no checksum watermark: such a checkpoint is also
 // written while, and after, restoreSecondaryIndexes runs, so a drop there
-// could undo a finished restore. The finished move has every index and row.
+// could undo a finished restore.
 func TestMoveResumeKeepsIndexes(t *testing.T) {
 	move := resumeWithIndexes(t, "resume_keep_src", "resume_keep_dst")
 	move.userDataBytes = fixedServerData(true)
@@ -248,17 +248,41 @@ func TestMoveResumeKeepsIndexes(t *testing.T) {
 	require.Empty(t, checksumWatermark, "the checkpoint was written before the checksum started")
 
 	r, ctx := buildTestRunner(t, move)
+	defer closeTestRunner(t, r)
 	require.NoError(t, r.setupDiscovery(ctx))
 	require.NoError(t, r.setupUnderLocks(ctx))
 	require.True(t, r.newHosts)
 	require.True(t, r.usedResumeFromCheckpoint.Load())
 	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_keep_dst"),
 		"a resume keeps the indexes the target has")
-	closeTestRunner(t, r)
+}
 
-	require.NoError(t, move.Run())
-	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_keep_dst"))
+// A move started on new hosts that stops after its copy leaves the target
+// without the deferrable index. The resumed move keeps the target as it is
+// and restores the index before its checksum.
+func TestMoveResumeRestoresDeferredIndexes(t *testing.T) {
+	sourceDSN, targetDSN := preCreatedIndexTables(t, "resume_restore_src", "resume_restore_dst")
+	move := &Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		userDataBytes: fixedServerData(true),
+	}
+	checkpointAndStop(t, move)
+	require.Equal(t, []string{"PRIMARY", "c_uniq"}, targetIndexes(t, "resume_restore_dst"),
+		"the first run deferred the regular index")
+
+	r, err := NewRunner(move)
+	require.NoError(t, err)
+	require.NoError(t, r.Run(t.Context()))
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
+	require.NoError(t, r.Close())
+
+	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_restore_dst"))
+	db, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
 	var count int
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM resume_keep_dst.items").Scan(&count))
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM resume_restore_dst.items").Scan(&count))
 	require.Equal(t, 3, count)
 }

@@ -572,16 +572,6 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
-	// A resume does not drop the target's secondary indexes, even on new
-	// hosts. A checkpoint has no checksum watermark while
-	// restoreSecondaryIndexes runs, after it finishes until the checksum
-	// records one, and during the sentinel wait (which clears it), so a
-	// resume cannot tell a copy still in progress from indexes that were
-	// already restored. Dropping them there raced with the restore and
-	// repeated the rebuild. The target keeps whichever indexes
-	// it has, and restoreSecondaryIndexes adds the missing ones in the
-	// post-copy phase, as on a fresh run.
-
 	// With multiple sources, a persisted checksum watermark cannot be trusted.
 	// deleteRecopyRange (below) runs every (source, table) DELETE against
 	// every target, and same-named tables from different sources interleave in
@@ -1948,7 +1938,12 @@ func (r *Runner) runChecks(ctx context.Context, scope check.Phase, exclude ...st
 
 // restoreSecondaryIndexes restores any secondary indexes that were deferred during table creation.
 // This function is always called (on serving hosts too) to handle
-// checkpoint resume scenarios. It uses statement.GetMissingSecondaryIndexes to compare source and target
+// checkpoint resume scenarios. A resume keeps whichever indexes the target
+// has and never drops any: a checkpoint has no checksum watermark during the
+// copy, while this function runs, after it finishes until the checksum
+// records one, and during the sentinel wait (which clears it), so a resume
+// cannot tell a copy in progress from indexes already restored.
+// It uses statement.GetMissingSecondaryIndexes to compare source and target
 // schemas and generate a single ALTER TABLE statement for all missing indexes per table.
 // Targets are processed in parallel, grouped by hostname to avoid overloading any single MySQL instance.
 func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
