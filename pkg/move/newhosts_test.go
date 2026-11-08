@@ -232,43 +232,33 @@ func resumeWithIndexes(t *testing.T, srcName, dstName string) *Move {
 	return move
 }
 
-// A move resumed on new hosts before its checksum started drops the
-// deferrable secondary indexes from the tables it is still copying into, and
-// the finished move has them back.
-func TestMoveResumeDefersIndexes(t *testing.T) {
-	move := resumeWithIndexes(t, "resume_defer_src", "resume_defer_dst")
+// A resume on new hosts never drops the target's secondary indexes, even
+// from a checkpoint with no checksum watermark: such a checkpoint is also
+// written while, and after, restoreSecondaryIndexes runs, so a drop there
+// could undo a finished restore. The finished move has every index and row.
+func TestMoveResumeKeepsIndexes(t *testing.T) {
+	move := resumeWithIndexes(t, "resume_keep_src", "resume_keep_dst")
 	move.userDataBytes = fixedServerData(true)
-
-	r, ctx := buildTestRunner(t, move)
-	require.NoError(t, r.setupDiscovery(ctx))
-	require.NoError(t, r.setupUnderLocks(ctx))
-	require.True(t, r.usedResumeFromCheckpoint.Load())
-	require.Equal(t, []string{"PRIMARY", "c_uniq"}, targetIndexes(t, "resume_defer_dst"),
-		"the regular index is deferred; the primary and unique keys stay")
-	closeTestRunner(t, r)
-
-	require.NoError(t, move.Run())
-	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_defer_dst"))
-	var count int
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, db.Close()) }()
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM resume_defer_dst.items").Scan(&count))
-	require.Equal(t, 3, count)
-}
-
-// A checkpoint with a checksum watermark was written after the indexes were
-// restored, so a resume on new hosts keeps them: dropping them would rebuild
-// them before the checksum resumes.
-func TestMoveResumeKeepsIndexesPastChecksum(t *testing.T) {
-	move := resumeWithIndexes(t, "resume_keep_src", "resume_keep_dst")
-	move.userDataBytes = fixedServerData(true)
-	testutils.RunSQL(t, "UPDATE resume_keep_dst."+checkpointTableName+" SET checksum_watermark = '{}'")
+	var checksumWatermark string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COALESCE(checksum_watermark, '') FROM resume_keep_dst."+checkpointTableName).Scan(&checksumWatermark))
+	require.Empty(t, checksumWatermark, "the checkpoint was written before the checksum started")
 
 	r, ctx := buildTestRunner(t, move)
-	defer closeTestRunner(t, r)
 	require.NoError(t, r.setupDiscovery(ctx))
 	require.NoError(t, r.setupUnderLocks(ctx))
+	require.True(t, r.newHosts)
 	require.True(t, r.usedResumeFromCheckpoint.Load())
+	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_keep_dst"),
+		"a resume keeps the indexes the target has")
+	closeTestRunner(t, r)
+
+	require.NoError(t, move.Run())
 	require.Equal(t, []string{"PRIMARY", "a_idx", "c_uniq"}, targetIndexes(t, "resume_keep_dst"))
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM resume_keep_dst.items").Scan(&count))
+	require.Equal(t, 3, count)
 }

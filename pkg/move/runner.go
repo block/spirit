@@ -464,11 +464,12 @@ func (r *Runner) createTargetTables(ctx context.Context) error {
 }
 
 // deferExistingIndexes drops the deferrable secondary indexes from a target
-// table that already exists (statement.DropDeferrableSecondaryIndexes): one
-// created before the move, or one a resumed move is still copying into
-// (deferTargetIndexes). restoreSecondaryIndexes adds them back from the
-// source before the checksum, and the target_state check accepts the table
-// without them if the move stops before its first checkpoint.
+// table that already exists when a fresh move starts
+// (statement.DropDeferrableSecondaryIndexes), such as one pre-created by a
+// declarative schema workflow. restoreSecondaryIndexes adds them back from
+// the source before the checksum, and the target_state check accepts the
+// table without them if the move stops before its first checkpoint. A resume
+// never calls it (see resumeFromCheckpoint).
 func (r *Runner) deferExistingIndexes(ctx context.Context, targetIndex int, tableName string) error {
 	target := r.targets[targetIndex]
 	var name, createStmt string
@@ -490,41 +491,6 @@ func (r *Runner) deferExistingIndexes(ctx context.Context, targetIndex int, tabl
 		"target", targetIndex,
 		"database", target.Config.DBName,
 		"statement", alter)
-	return nil
-}
-
-// deferTargetIndexes drops the deferrable secondary indexes of every moved
-// table on every target (deferExistingIndexes), for a resume on new hosts. A
-// table whose indexes are already deferred is left alone. The target servers
-// are altered at the same time, and the targets that share a server one
-// after another, like restoreSecondaryIndexes. On a table that already holds
-// rows a DROP INDEX is an in-place change that frees the index's pages.
-func (r *Runner) deferTargetIndexes(ctx context.Context) error {
-	hosts := r.targetHosts()
-	r.logger.Info("deferring the secondary indexes of every target table on resume",
-		"tables", len(r.sourceTables),
-		"targets", len(r.targets),
-		"hosts", len(hosts),
-	)
-	started := time.Now()
-	g, gctx := errgroup.WithContext(ctx)
-	for _, group := range hosts {
-		g.Go(func() error {
-			for _, i := range group.Indices {
-				for _, tbl := range r.sourceTables {
-					if err := r.deferExistingIndexes(gctx, i, tbl.TableName); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return err
-	}
-	r.logger.Info("deferred the secondary indexes of every target table on resume",
-		"duration", time.Since(started))
 	return nil
 }
 
@@ -606,20 +572,15 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
-	// On new hosts, a checkpoint with no checksum watermark was written
-	// before the checksum started, so the copy is still running or its
-	// indexes are being restored: drop the deferrable secondary indexes
-	// (again) so the rest of the copy does not maintain them. They are
-	// restored before the checksum, as on a fresh run. This also defers the
-	// indexes of a move that started without deferring them. It runs before
-	// a multi-source resume discards the watermark below, so the decision is
-	// the checkpoint's for every number of sources. Dropping first also makes
-	// the DELETE in deleteRecopyRange cheaper.
-	if r.newHosts && r.checksumWatermark == "" {
-		if err := r.deferTargetIndexes(ctx); err != nil {
-			return err
-		}
-	}
+	// A resume does not drop the target's secondary indexes, even on new
+	// hosts. A checkpoint has no checksum watermark while
+	// restoreSecondaryIndexes runs, after it finishes until the checksum
+	// records one, and during the sentinel wait (which clears it), so a
+	// resume cannot tell a copy still in progress from indexes that were
+	// already restored. Dropping them there raced with the restore and
+	// repeated the rebuild. The target keeps whichever indexes
+	// it has, and restoreSecondaryIndexes adds the missing ones in the
+	// post-copy phase, as on a fresh run.
 
 	// With multiple sources, a persisted checksum watermark cannot be trusted.
 	// deleteRecopyRange (below) runs every (source, table) DELETE against
