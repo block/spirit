@@ -454,7 +454,12 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 	if err != nil {
 		return err
 	}
-	defer utils.CloseAndLog(conn)
+	discarded := false
+	defer func() {
+		if !discarded {
+			utils.CloseAndLog(conn)
+		}
+	}()
 	var connID int
 	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
 		return err
@@ -469,7 +474,9 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 	for attempt := 1; ; attempt++ {
 		result := execWithKillWorker(ctx, conn, connID, dbConfig.forceKillDelay(), stmt, waiting, kill, logger, afterExec)
 		if result.err != nil && ctx.Err() != nil {
-			return endCancelledStatement(ctx, db, connID, result.err, logger)
+			// The kill worker has joined, so nothing else uses conn.
+			discarded = true
+			return endCancelledConn(ctx, db, conn, connID, result.err, logger)
 		}
 		if !shouldRetryForceExecAfterKill(result.err, result.killAttempted) || attempt == attempts {
 			if result.skippedKillAfterFailedCheck() {
@@ -548,6 +555,16 @@ func (e *CancelledStatementError) Unwrap() []error {
 // table rolls back before its session exits, so this is independent of
 // LockWaitTimeout.
 const cancelledStatementKillTimeout = 30 * time.Second
+
+// endCancelledConn discards conn, whose statement the caller cancelled, and
+// then ends that statement on the server. The connection goes first: it keeps
+// its slot in the pool until closed, and the kill needs a connection of its
+// own, so on a full pool the kill could not run while conn was held. The
+// cancelled session cannot be used again either way.
+func endCancelledConn(ctx context.Context, db *sql.DB, conn *sql.Conn, connID int, err error, logger *slog.Logger) error {
+	discardErr := discardConn(conn)
+	return errors.Join(endCancelledStatement(ctx, db, connID, err, logger), discardErr)
+}
 
 // endCancelledStatement makes sure a statement the caller cancelled is no
 // longer running on the server. On cancel the Go MySQL driver closes the
@@ -794,18 +811,17 @@ func ExecKillOnCancel(ctx context.Context, db *sql.DB, logger *slog.Logger, stmt
 	if err != nil {
 		return err
 	}
-	defer utils.CloseAndLog(conn)
 	var connID int
 	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
-		return err
+		return errors.Join(err, conn.Close())
 	}
 	if _, err := conn.ExecContext(ctx, stmt); err != nil {
 		if ctx.Err() != nil {
-			return endCancelledStatement(ctx, db, connID, err, logger)
+			return endCancelledConn(ctx, db, conn, connID, err, logger)
 		}
-		return err
+		return errors.Join(err, conn.Close())
 	}
-	return nil
+	return conn.Close()
 }
 
 // analyzeAttempts is how many times AnalyzeTable runs ANALYZE TABLE before

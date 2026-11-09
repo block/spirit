@@ -40,7 +40,7 @@ func ExecWithoutForeignKeyChecks(ctx context.Context, db *sql.DB, logger *slog.L
 	_, execErr := conn.ExecContext(ctx, stmt)
 	if execErr != nil && ctx.Err() != nil {
 		// The killed session cannot be turned back, so it is discarded.
-		return errors.Join(endCancelledStatement(ctx, db, connID, execErr, logger), discardConn(conn))
+		return endCancelledConn(ctx, db, conn, connID, execErr, logger)
 	}
 	// Restore on a context of its own: the statement may have used up ctx.
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tableUnlockTimeout)

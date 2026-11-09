@@ -1527,6 +1527,9 @@ func TestForceExecEndsACancelledStatementOnTheServer(t *testing.T) {
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
+	// One connection: the kill can only run once the cancelled statement's
+	// connection has given back its slot.
+	db.SetMaxOpenConns(1)
 	setupCtx, setupCancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer setupCancel()
 	blocker := holdTableLock(t, setupCtx, tt.DB, "forceexec_cancelled")
@@ -1586,13 +1589,35 @@ func TestEndCancelledStatementReportsAnUnconfirmedEnd(t *testing.T) {
 // ended on the server before ExecKillOnCancel returns, so the table is still
 // there once the lock is released. The session holding the lock is not killed.
 func TestExecKillOnCancelEndsACancelledStatementOnTheServer(t *testing.T) {
-	tt := testutils.NewTestTable(t, "exec_kill_on_cancel", "CREATE TABLE exec_kill_on_cancel (id INT PRIMARY KEY)")
+	requireCancelledDropLeavesTable(t, "exec_kill_on_cancel", func(ctx context.Context, db *sql.DB, stmt string) error {
+		return ExecKillOnCancel(ctx, db, slog.Default(), stmt)
+	})
+}
+
+// ExecWithoutForeignKeyChecks ends a cancelled statement on the server the same
+// way.
+func TestExecWithoutForeignKeyChecksEndsACancelledStatementOnTheServer(t *testing.T) {
+	requireCancelledDropLeavesTable(t, "exec_without_fk_checks_cancel", func(ctx context.Context, db *sql.DB, stmt string) error {
+		return ExecWithoutForeignKeyChecks(ctx, db, slog.Default(), stmt)
+	})
+}
+
+// requireCancelledDropLeavesTable cancels exec's DROP TABLE of table while it
+// waits for another session's metadata lock, and requires that the statement's
+// session has ended when exec returns, that the lock holder was not killed, and
+// that the table survives the lock's release. exec runs on a pool of one
+// connection, so the kill can only run once the cancelled statement's
+// connection has given back its slot.
+func requireCancelledDropLeavesTable(t *testing.T, table string, exec func(context.Context, *sql.DB, string) error) {
+	t.Helper()
+	tt := testutils.NewTestTable(t, table, fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", table))
 	db, err := New(testutils.DSN(), NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
+	db.SetMaxOpenConns(1)
 	setupCtx, setupCancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer setupCancel()
-	blocker := holdTableLock(t, setupCtx, tt.DB, "exec_kill_on_cancel")
+	blocker := holdTableLock(t, setupCtx, tt.DB, table)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -1602,7 +1627,7 @@ func TestExecKillOnCancelEndsACancelledStatementOnTheServer(t *testing.T) {
 		// Cancel once the DROP is seen waiting for the blocker's lock.
 		for ctx.Err() == nil {
 			var pid int64
-			err := tt.DB.QueryRowContext(ctx, "SELECT id FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE 'DROP TABLE exec_kill_on_cancel%'").Scan(&pid)
+			err := tt.DB.QueryRowContext(ctx, "SELECT id FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE "+table+"%").Scan(&pid)
 			if err == nil {
 				stmtPID.Store(pid)
 				cancel()
@@ -1611,7 +1636,7 @@ func TestExecKillOnCancelEndsACancelledStatementOnTheServer(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
-	err = ExecKillOnCancel(ctx, db, slog.Default(), "DROP TABLE exec_kill_on_cancel")
+	err = exec(ctx, db, "DROP TABLE "+table)
 	workers.Wait()
 	require.ErrorIs(t, err, context.Canceled)
 	require.NotErrorIs(t, err, ErrCancelledStatementMayStillRun)
@@ -1624,6 +1649,6 @@ func TestExecKillOnCancelEndsACancelledStatementOnTheServer(t *testing.T) {
 	require.NoError(t, err, "the session holding the lock must not be killed")
 	require.NoError(t, blocker.Rollback())
 	var tables int
-	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'exec_kill_on_cancel'").Scan(&tables))
+	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", table).Scan(&tables))
 	require.Equal(t, 1, tables, "the cancelled DROP must not apply once the lock is released")
 }
