@@ -377,6 +377,12 @@ func (r *Runner) runCopy(ctx context.Context) error {
 	})
 }
 
+// Run applies the schema change. An error does not always mean the change was
+// not applied: when a DROP that Run issues to clean up after the change has
+// applied is cancelled and cannot be confirmed to have ended on the server,
+// Run returns that *dbconn.CancelledStatementError, and Result().DurableMutation
+// reports that the change took effect. A caller must check Result before it
+// retries the change.
 func (r *Runner) Run(ctx context.Context) (retErr error) {
 	ctx, end := r.lifecycle.Begin(ctx)
 	defer end(&retErr)
@@ -684,8 +690,8 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
 			if err := r.dropAfterChange(ctx, change.oldTableName()); err != nil {
-				// Don't return the error because our automation
-				// will retry the migration (but it's already happened)
+				// Only a DROP that may still run is returned; any other
+				// failure is logged, since the cutover has already happened.
 				r.logger.Error("migration successful but failed to drop old table",
 					"table", change.oldTableName(),
 					"error", err,
