@@ -326,7 +326,7 @@ func (r *Runner) dropStaleCopyTables(ctx context.Context) {
 	// outlive _new. If a drop fails, stop and keep the checkpoint so a later
 	// run can retry.
 	for _, name := range []string{newName, ckptName} {
-		if err := dbconn.Exec(ctx, r.db, "DROP TABLE IF EXISTS %n", name); err != nil {
+		if err := dbconn.ExecKillOnCancel(ctx, r.db, r.logger, "DROP TABLE IF EXISTS %n", name); err != nil {
 			r.logger.Error("could not drop a stale table from an earlier interrupted migration", "table", name, "error", err)
 			return
 		}

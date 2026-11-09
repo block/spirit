@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
@@ -17,7 +18,10 @@ import (
 // the pool. When that fails, the session is discarded instead, so no other
 // statement can run with the checks off. The setting is read rather than reset
 // with DEFAULT: SET foreign_key_checks = DEFAULT turns the checks off.
-func ExecWithoutForeignKeyChecks(ctx context.Context, db *sql.DB, stmt string, args ...any) error {
+//
+// As with ExecKillOnCancel, a cancelled statement's session is killed and
+// waited for before the call returns, so the DDL cannot take effect later.
+func ExecWithoutForeignKeyChecks(ctx context.Context, db *sql.DB, logger *slog.Logger, stmt string, args ...any) error {
 	stmt, err := sqlescape.EscapeSQL(stmt, args...)
 	if err != nil {
 		return err
@@ -26,14 +30,18 @@ func ExecWithoutForeignKeyChecks(ctx context.Context, db *sql.DB, stmt string, a
 	if err != nil {
 		return err
 	}
-	var checks int
-	if err := conn.QueryRowContext(ctx, "SELECT @@session.foreign_key_checks").Scan(&checks); err != nil {
+	var connID, checks int
+	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID(), @@session.foreign_key_checks").Scan(&connID, &checks); err != nil {
 		return errors.Join(err, conn.Close())
 	}
 	if _, err := conn.ExecContext(ctx, "SET SESSION foreign_key_checks = 0"); err != nil {
 		return errors.Join(err, discardConn(conn))
 	}
 	_, execErr := conn.ExecContext(ctx, stmt)
+	if execErr != nil && ctx.Err() != nil {
+		// The killed session cannot be turned back, so it is discarded.
+		return errors.Join(endCancelledStatement(ctx, db, connID, execErr, logger), discardConn(conn))
+	}
 	// Restore on a context of its own: the statement may have used up ctx.
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tableUnlockTimeout)
 	defer cancel()

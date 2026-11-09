@@ -159,19 +159,19 @@ func (f *foreignKeyCutover) probeTable(ctx context.Context, t *foreignKeyTable) 
 		}
 	}
 	// A probe that did not finish can leave its tables behind.
-	if err := dropProbeTables(ctx, f.db, probeName, parents); err != nil {
+	if err := dropProbeTables(ctx, f.db, f.logger, probeName, parents); err != nil {
 		return err
 	}
 	defer func() {
-		err = errors.Join(err, dropProbeTables(context.WithoutCancel(ctx), f.db, probeName, parents))
+		err = errors.Join(err, dropProbeTables(context.WithoutCancel(ctx), f.db, f.logger, probeName, parents))
 	}()
 	for i, c := range copies {
 		schema, name := c.parent(t.table.SchemaName)
-		if err := dbconn.Exec(ctx, f.db, "CREATE TABLE IF NOT EXISTS %n LIKE %n.%n", parentNames[parentKeys[i]], schema, name); err != nil {
+		if err := dbconn.ExecKillOnCancel(ctx, f.db, f.logger, "CREATE TABLE IF NOT EXISTS %n LIKE %n.%n", parentNames[parentKeys[i]], schema, name); err != nil {
 			return fmt.Errorf("could not create a copy of %s to probe the foreign keys of %s: %w", parentKeys[i], t.table.TableName, err)
 		}
 	}
-	if err := dbconn.Exec(ctx, f.db, "CREATE TABLE %n LIKE %n", probeName, t.newTable.TableName); err != nil {
+	if err := dbconn.ExecKillOnCancel(ctx, f.db, f.logger, "CREATE TABLE %n LIKE %n", probeName, t.newTable.TableName); err != nil {
 		return fmt.Errorf("could not create a copy of %s to probe the foreign keys of %s: %w", t.newTable.TableName, t.table.TableName, err)
 	}
 	before, err := tableDefinition(ctx, f.db, probeName)
@@ -187,7 +187,7 @@ func (f *foreignKeyCutover) probeTable(ctx context.Context, t *foreignKeyTable) 
 		clauses = append(clauses, c.clause)
 		probeClauses = append(probeClauses, "ADD "+clause)
 	}
-	if err := dbconn.ExecWithoutForeignKeyChecks(ctx, f.db, "ALTER TABLE %n %r, ALGORITHM=INPLACE, LOCK=NONE",
+	if err := dbconn.ExecWithoutForeignKeyChecks(ctx, f.db, f.logger, "ALTER TABLE %n %r, ALGORITHM=INPLACE, LOCK=NONE",
 		probeName, sqlescape.RawSQL(strings.Join(probeClauses, ", "))); err != nil {
 		return fmt.Errorf("could not probe the foreign keys of %s: %w", t.table.TableName, err)
 	}
@@ -211,12 +211,12 @@ func (f *foreignKeyCutover) probeTable(ctx context.Context, t *foreignKeyTable) 
 
 // dropProbeTables drops the tables of a probe: the probe table first, as its
 // foreign keys reference the others.
-func dropProbeTables(ctx context.Context, db *sql.DB, probeName string, parents []string) error {
-	if err := dbconn.Exec(ctx, db, "DROP TABLE IF EXISTS %n", probeName); err != nil {
+func dropProbeTables(ctx context.Context, db *sql.DB, logger *slog.Logger, probeName string, parents []string) error {
+	if err := dbconn.ExecKillOnCancel(ctx, db, logger, "DROP TABLE IF EXISTS %n", probeName); err != nil {
 		return err
 	}
 	for _, p := range parents {
-		if err := dbconn.Exec(ctx, db, "DROP TABLE IF EXISTS %n", p); err != nil {
+		if err := dbconn.ExecKillOnCancel(ctx, db, logger, "DROP TABLE IF EXISTS %n", p); err != nil {
 			return err
 		}
 	}
@@ -326,7 +326,7 @@ func (f *foreignKeyCutover) settleAfterUnlock(ctx context.Context) {
 		return f.forceExec(ctx, stmt)
 	}
 	restoreExec := func(ctx context.Context, stmt string) error {
-		return dbconn.ExecWithoutForeignKeyChecks(ctx, f.db, "%r", sqlescape.RawSQL(stmt))
+		return dbconn.ExecWithoutForeignKeyChecks(ctx, f.db, f.logger, "%r", sqlescape.RawSQL(stmt))
 	}
 	if err := f.settle(ctx, dropExec, restoreExec); err != nil {
 		f.logger.Error("migration successful but the foreign keys of the old table could not be dropped, or the new table's foreign keys could not be given their names back: drop the old table's foreign keys and rename the new table's by hand",

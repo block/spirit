@@ -37,10 +37,10 @@ type tableChange struct {
 func (c *tableChange) createNewTable(ctx context.Context) error {
 	newName := utils.NewTableName(c.table.TableName)
 	// drop the newName if we've decided to call this func.
-	if err := dbconn.Exec(ctx, c.runner.db, "DROP TABLE IF EXISTS %n", newName); err != nil {
+	if err := dbconn.ExecKillOnCancel(ctx, c.runner.db, c.runner.logger, "DROP TABLE IF EXISTS %n", newName); err != nil {
 		return err
 	}
-	if err := dbconn.Exec(ctx, c.runner.db, "CREATE TABLE %n LIKE %n",
+	if err := dbconn.ExecKillOnCancel(ctx, c.runner.db, c.runner.logger, "CREATE TABLE %n LIKE %n",
 		newName, c.table.TableName); err != nil {
 		return err
 	}
@@ -108,7 +108,7 @@ func (c *tableChange) restoreCopiedCheckConstraints(ctx context.Context) error {
 	if len(clauses) == 0 {
 		return nil
 	}
-	if err := dbconn.Exec(ctx, c.runner.db, "ALTER TABLE %n %r",
+	if err := dbconn.ExecKillOnCancel(ctx, c.runner.db, c.runner.logger, "ALTER TABLE %n %r",
 		c.newTable.TableName, sqlescape.RawSQL(strings.Join(clauses, ", "))); err != nil {
 		return fmt.Errorf("restore source CHECK definitions on the empty copy %s: %w", c.newTable.TableName, err)
 	}
@@ -134,7 +134,7 @@ func (c *tableChange) alterNewTable(ctx context.Context) error {
 		return err
 	}
 	exec := func(ctx context.Context, stmt string) error {
-		return dbconn.Exec(ctx, c.runner.db, "%r", sqlescape.RawSQL(stmt))
+		return dbconn.ExecKillOnCancel(ctx, c.runner.db, c.runner.logger, "%r", sqlescape.RawSQL(stmt))
 	}
 	if c.runner.migration.EnableExperimentalForeignKeys {
 		if exec, err = c.foreignKeyExec(ctx, c.newTable.TableName); err != nil {
@@ -478,7 +478,7 @@ func raiseAutoIncrement(ctx context.Context, db *sql.DB, src, dst *table.TableIn
 }
 
 func (c *tableChange) dropOldTable(ctx context.Context) error {
-	return dbconn.Exec(ctx, c.runner.db, "DROP TABLE IF EXISTS %n", c.oldTableName())
+	return dbconn.ExecKillOnCancel(ctx, c.runner.db, c.runner.logger, "DROP TABLE IF EXISTS %n", c.oldTableName())
 }
 
 func (c *tableChange) oldTableName() string {
@@ -520,7 +520,7 @@ func (c *tableChange) attemptInplaceDDL(ctx context.Context) error {
 
 func (c *tableChange) cleanup(ctx context.Context) error {
 	if c.newTable != nil {
-		if err := dbconn.Exec(ctx, c.runner.db, "DROP TABLE IF EXISTS %n", c.newTable.TableName); err != nil {
+		if err := dbconn.ExecKillOnCancel(ctx, c.runner.db, c.runner.logger, "DROP TABLE IF EXISTS %n", c.newTable.TableName); err != nil {
 			return err
 		}
 	}
