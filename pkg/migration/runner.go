@@ -410,7 +410,9 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 			// The statement is the user's own SQL and is spliced in with %r:
 			// it may contain % characters in literals (e.g. COMMENT
 			// '100%new') that must not be format-interpreted.
-			err := dbconn.Exec(ctx, r.db, "%r", sqlescape.RawSQL(r.changes[0].stmt.Statement))
+			// A DROP or RENAME can wait for a metadata lock, so a cancel must
+			// end it on the server rather than leave it to take effect later.
+			err := dbconn.ExecKillOnCancel(ctx, r.db, r.logger, "%r", sqlescape.RawSQL(r.changes[0].stmt.Statement))
 			if err != nil {
 				if ambiguous := ambiguousDDLError(err); ambiguous != nil {
 					return ambiguous

@@ -759,6 +759,36 @@ func Exec(ctx context.Context, db *sql.DB, stmt string, args ...any) error {
 	return err
 }
 
+// ExecKillOnCancel is like Exec, for a statement that must not take effect
+// after the caller has given up on it, such as DDL that can wait for a
+// metadata lock. It runs the statement on a session of its own, and when the
+// caller cancels it, kills that session and waits for it to exit before
+// returning, as ForceExec does. Unlike ForceExec it never kills the sessions
+// blocking the statement. When the cancelled statement's session cannot be
+// confirmed to have ended, the error wraps ErrCancelledStatementMayStillRun.
+func ExecKillOnCancel(ctx context.Context, db *sql.DB, logger *slog.Logger, stmt string, args ...any) error {
+	stmt, err := sqlescape.EscapeSQL(stmt, args...)
+	if err != nil {
+		return err
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer utils.CloseAndLog(conn)
+	var connID int
+	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, stmt); err != nil {
+		if ctx.Err() != nil {
+			return endCancelledStatement(ctx, db, connID, err, logger)
+		}
+		return err
+	}
+	return nil
+}
+
 // analyzeAttempts is how many times AnalyzeTable runs ANALYZE TABLE before
 // it gives up on an Error row, and analyzeRetryDelay the pause between them.
 var (

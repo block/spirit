@@ -1578,3 +1578,49 @@ func TestEndCancelledStatementReportsAnUnconfirmedEnd(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, "session 12345")
 }
+
+// A DROP TABLE cancelled by its caller while it waits for a metadata lock is
+// ended on the server before ExecKillOnCancel returns, so the table is still
+// there once the lock is released. The session holding the lock is not killed.
+func TestExecKillOnCancelEndsACancelledStatementOnTheServer(t *testing.T) {
+	tt := testutils.NewTestTable(t, "exec_kill_on_cancel", "CREATE TABLE exec_kill_on_cancel (id INT PRIMARY KEY)")
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	setupCtx, setupCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer setupCancel()
+	blocker := holdTableLock(t, setupCtx, tt.DB, "exec_kill_on_cancel")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var workers sync.WaitGroup
+	var stmtPID atomic.Int64
+	workers.Go(func() {
+		// Cancel once the DROP is seen waiting for the blocker's lock.
+		for ctx.Err() == nil {
+			var pid int64
+			err := tt.DB.QueryRowContext(ctx, "SELECT id FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE 'DROP TABLE exec_kill_on_cancel%'").Scan(&pid)
+			if err == nil {
+				stmtPID.Store(pid)
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	err = ExecKillOnCancel(ctx, db, slog.Default(), "DROP TABLE exec_kill_on_cancel")
+	workers.Wait()
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrCancelledStatementMayStillRun)
+	require.NotZero(t, stmtPID.Load(), "the DROP must have been seen waiting for its lock")
+
+	var remaining int
+	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", stmtPID.Load()).Scan(&remaining))
+	require.Zero(t, remaining, "the cancelled statement's session must have ended")
+	_, err = blocker.ExecContext(setupCtx, "SELECT 1")
+	require.NoError(t, err, "the session holding the lock must not be killed")
+	require.NoError(t, blocker.Rollback())
+	var tables int
+	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'exec_kill_on_cancel'").Scan(&tables))
+	require.Equal(t, 1, tables, "the cancelled DROP must not apply once the lock is released")
+}
