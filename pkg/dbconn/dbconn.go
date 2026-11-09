@@ -468,6 +468,9 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 	attempts := max(1, dbConfig.MaxRetries)
 	for attempt := 1; ; attempt++ {
 		result := execWithKillWorker(ctx, conn, connID, dbConfig.forceKillDelay(), stmt, waiting, kill, logger, afterExec)
+		if result.err != nil && ctx.Err() != nil {
+			return endCancelledStatement(ctx, db, connID, result.err, logger)
+		}
 		if !shouldRetryForceExecAfterKill(result.err, result.killAttempted) || attempt == attempts {
 			if result.skippedKillAfterFailedCheck() {
 				logger.Warn("not retrying statement after lock wait timeout: a check of whether it was waiting for a metadata lock failed, and nothing was killed",
@@ -514,6 +517,46 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 			"error", result.err,
 		)
 	}
+}
+
+// ErrCancelledStatementMayStillRun reports that the caller cancelled a
+// statement and its session could not be confirmed to have ended, so the
+// statement may still be running on the server and take effect later.
+var ErrCancelledStatementMayStillRun = errors.New("cancelled statement may still be running")
+
+// cancelledStatementKillTimeout bounds killing the session of a cancelled
+// statement and waiting for it to exit. A killed statement that was changing a
+// table rolls back before its session exits, so this is independent of
+// LockWaitTimeout.
+const cancelledStatementKillTimeout = 30 * time.Second
+
+// endCancelledStatement makes sure a statement the caller cancelled is no
+// longer running on the server. On cancel the Go MySQL driver closes the
+// socket, but MySQL keeps running the statement: a DDL queued behind a
+// metadata lock still takes effect once the lock is released. So this kills
+// the statement's session and waits for it to exit. Once it has, the statement
+// has either finished or been rolled back, and nothing it started can change
+// the table later. When that cannot be confirmed, the error wraps
+// ErrCancelledStatementMayStillRun. Either way the error also carries the
+// statement's own error and the cancellation.
+func endCancelledStatement(ctx context.Context, db *sql.DB, connID int, err error, logger *slog.Logger) error {
+	if cause := ctx.Err(); !errors.Is(err, cause) {
+		err = errors.Join(err, cause)
+	}
+	killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelledStatementKillTimeout)
+	defer cancel()
+	if killErr := KillSessionAndWait(killCtx, db, connID); killErr != nil {
+		logger.Error("cancelled statement may still be running: its session could not be confirmed stopped",
+			"pid", connID,
+			"error", err,
+			"kill_error", killErr,
+		)
+		// The kill error is only logged: callers inspect the returned error
+		// tree to classify the statement's outcome.
+		return fmt.Errorf("%w: session %d: %w", ErrCancelledStatementMayStillRun, connID, err)
+	}
+	logger.Info("killed the session of a cancelled statement, so it cannot take effect after the caller stopped", "pid", connID)
+	return err
 }
 
 // forceExecAttempt is the outcome of one statement execution under a kill worker.

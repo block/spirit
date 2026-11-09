@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -532,9 +533,11 @@ func (c *tableChange) cleanup(ctx context.Context) error {
 // the expected case the caller falls through on. A connection loss means the
 // server may have applied it and the client never saw the OK packet — falling
 // through to the copy algorithm would then build a _new table from a table
-// that has *already* been altered. It returns nil when err is unambiguous.
+// that has *already* been altered. A cancelled statement whose session could
+// not be confirmed to have ended is ambiguous for the same reason. It returns
+// nil when err is unambiguous.
 func ambiguousDDLError(err error) error {
-	if !dbconn.IsConnectionLossError(err) {
+	if !dbconn.IsConnectionLossError(err) && !errors.Is(err, dbconn.ErrCancelledStatementMayStillRun) {
 		return nil
 	}
 	return fmt.Errorf("%w: direct DDL may have committed: %w", status.ErrOwnershipAmbiguous, err)

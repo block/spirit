@@ -1516,3 +1516,65 @@ func TestForceExecRetriesAfterEveryLookupFails(t *testing.T) {
 	_, err = blocker.ExecContext(ctx, "SELECT 1")
 	require.NoError(t, err, "a kill that could not list the blockers must not kill them")
 }
+
+// A caller that cancels ForceExec while its statement waits for a metadata
+// lock gets the cancellation back only once the statement's session has ended
+// on the server. The statement then cannot take effect when the lock is
+// released, as it would if only the client had given up on it.
+func TestForceExecEndsACancelledStatementOnTheServer(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_cancelled", "CREATE TABLE forceexec_cancelled (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	setupCtx, setupCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer setupCancel()
+	blocker := holdTableLock(t, setupCtx, tt.DB, "forceexec_cancelled")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	isWaiting := waitingOn(tt.DB)
+	var stmtPID atomic.Int64
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_cancelled ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(checkCtx context.Context, connID int) (bool, error) {
+			waiting, err := isWaiting(checkCtx, connID)
+			if waiting {
+				stmtPID.Store(int64(connID))
+				cancel()
+			}
+			return waiting, err
+		},
+		func(context.Context, int) ([]int, error) {
+			t.Error("the blocker must not be killed")
+			return nil, nil
+		}, waitForKilledTransactions, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrCancelledStatementMayStillRun)
+	require.NotZero(t, stmtPID.Load(), "the statement must have been seen waiting for its lock")
+
+	var remaining int
+	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", stmtPID.Load()).Scan(&remaining))
+	require.Zero(t, remaining, "the cancelled statement's session must have ended")
+	require.NoError(t, blocker.Rollback())
+	var columns int
+	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_cancelled' AND column_name = 'c'").Scan(&columns))
+	require.Zero(t, columns, "the cancelled ALTER must not apply once the lock is released")
+}
+
+// When the session of a cancelled statement cannot be confirmed to have ended,
+// the error says the statement may still be running, and still carries the
+// statement's error and the cancellation.
+func TestEndCancelledStatementReportsAnUnconfirmedEnd(t *testing.T) {
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	require.NoError(t, db.Close()) // Neither the kill nor the wait can run.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	stmtErr := errors.New("statement interrupted")
+	err = endCancelledStatement(ctx, db, 12345, stmtErr, slog.Default())
+	require.ErrorIs(t, err, ErrCancelledStatementMayStillRun)
+	require.ErrorIs(t, err, stmtErr)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "session 12345")
+}
