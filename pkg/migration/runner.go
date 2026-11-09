@@ -143,6 +143,11 @@ type Runner struct {
 	// testAfterCutover is a test-only seam that runs after the cutover has
 	// committed and before the post-cutover cleanup.
 	testAfterCutover func()
+
+	// testDropAfterChange is a test-only seam that replaces the DROP of a
+	// table left over once the change has applied: a stale _new or
+	// checkpoint table after native DDL, or the _old table after the cutover.
+	testDropAfterChange func(ctx context.Context, table string) error
 }
 
 var (
@@ -279,10 +284,14 @@ func (r *Runner) SetLogger(logger *slog.Logger) {
 // or one that cannot be read, is empty, or names another or no table) nothing
 // is dropped and the reason is logged.
 //
-// A failure is logged, not returned: the ALTER has already been applied.
-func (r *Runner) dropStaleCopyTables(ctx context.Context) {
+// A failure is logged, not returned: the ALTER has already been applied. The
+// exception is a DROP that was cancelled and could not be confirmed to have
+// ended on the server (dbconn.ErrCancelledStatementMayStillRun). That error is
+// returned so the caller knows a statement may still run, while Result still
+// reports the ALTER as applied.
+func (r *Runner) dropStaleCopyTables(ctx context.Context) error {
 	if len(r.changes) != 1 {
-		return // attemptMySQLDDL only supports single-table changes.
+		return nil // attemptMySQLDDL only supports single-table changes.
 	}
 	tableName := r.changes[0].table.TableName
 	newName := utils.NewTableName(tableName)
@@ -296,7 +305,7 @@ func (r *Runner) dropStaleCopyTables(ctx context.Context) {
 	ckptExists, err := ckpt.Exists(ctx)
 	if err != nil {
 		leaveInPlace("could not check whether the checkpoint table exists", "error", err)
-		return
+		return nil
 	}
 	if !ckptExists {
 		// Only a _new table can be left: without a checkpoint there is no
@@ -306,32 +315,50 @@ func (r *Runner) dropStaleCopyTables(ctx context.Context) {
 			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
 			r.changes[0].table.SchemaName, newName).Scan(&n); err != nil {
 			leaveInPlace("could not check whether the new table exists", "error", err)
-			return
+			return nil
 		}
 		if n > 0 {
 			leaveInPlace("there is no checkpoint table to confirm the new table was created by Spirit for this table")
 		}
-		return
+		return nil
 	}
 	rec, err := ckpt.ReadLatest(ctx)
 	if err != nil {
 		leaveInPlace("could not read the checkpoint to confirm it belongs to this table", "error", err)
-		return
+		return nil
 	}
 	if rec.OriginalTableName != tableName {
 		leaveInPlace("the checkpoint does not belong to this table", "checkpoint-original-table", rec.OriginalTableName)
-		return
+		return nil
 	}
 	// _new first: the checkpoint is the evidence of ownership, so it must
 	// outlive _new. If a drop fails, stop and keep the checkpoint so a later
 	// run can retry.
 	for _, name := range []string{newName, ckptName} {
-		if err := dbconn.ExecKillOnCancel(ctx, r.db, r.logger, "DROP TABLE IF EXISTS %n", name); err != nil {
+		if err := r.dropAfterChange(ctx, name); err != nil {
 			r.logger.Error("could not drop a stale table from an earlier interrupted migration", "table", name, "error", err)
-			return
+			return unconfirmedEnd(err)
 		}
 		r.logger.Info("dropped a stale table from an earlier interrupted migration", "table", name)
 	}
+	return nil
+}
+
+// dropAfterChange drops a table left over once the change has applied.
+func (r *Runner) dropAfterChange(ctx context.Context, table string) error {
+	if r.testDropAfterChange != nil {
+		return r.testDropAfterChange(ctx, table)
+	}
+	return dbconn.ExecKillOnCancel(ctx, r.db, r.logger, "DROP TABLE IF EXISTS %n", table)
+}
+
+// unconfirmedEnd returns err when it reports a cancelled statement that may
+// still be running on the server, and nil for any other error.
+func unconfirmedEnd(err error) error {
+	if errors.Is(err, dbconn.ErrCancelledStatementMayStillRun) {
+		return err
+	}
+	return nil
 }
 
 // attemptMySQLDDL tries to perform the DDL using MySQL's built-in
@@ -497,12 +524,14 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	err = r.attemptMySQLDDL(ctx)
 	if err == nil {
 		r.lifecycle.MarkDurableMutation()
-		r.dropStaleCopyTables(ctx)
+		cleanupErr := r.dropStaleCopyTables(ctx)
 		r.logger.Info("apply complete",
 			"instant-ddl", r.usedInstantDDL,
 			"inplace-ddl", r.usedInplaceDDL,
 		)
-		return nil // success!
+		// Nil unless a cleanup DROP may still be running; Result reports
+		// the ALTER as applied either way.
+		return cleanupErr
 	}
 	// A direct-DDL failure is normally expected and ignored: we fall through
 	// to the copy algorithm below. But if the DDL's outcome is unknown, the
@@ -647,15 +676,21 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 		// names, but a failed drop would leave their foreign keys in place.
 		foreignKeys.settleAfterUnlock(cleanupCtx)
 	}
+	// A cancelled DROP of _old that could not be confirmed to have ended is
+	// the one failure returned, after the rest of the cleanup has run, so the
+	// caller knows a statement may still run. Result still reports the
+	// cutover as committed.
+	var unconfirmedDrops error
 	if !r.migration.SkipDropAfterCutover {
 		for _, change := range r.changes {
-			if err := change.dropOldTable(ctx); err != nil {
+			if err := r.dropAfterChange(ctx, change.oldTableName()); err != nil {
 				// Don't return the error because our automation
 				// will retry the migration (but it's already happened)
 				r.logger.Error("migration successful but failed to drop old table",
 					"table", change.oldTableName(),
 					"error", err,
 				)
+				unconfirmedDrops = errors.Join(unconfirmedDrops, unconfirmedEnd(err))
 			} else {
 				r.logger.Info("successfully dropped old table",
 					"table", change.oldTableName(),
@@ -677,16 +712,16 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// cleanup all the tables
 	for _, change := range r.changes {
 		if err := change.cleanup(cleanupCtx); err != nil {
-			return err
+			return errors.Join(err, unconfirmedDrops)
 		}
 	}
 	// drop the checkpoint table
 	if r.checkpointTable != nil {
 		if err := r.checkpointTbl().Drop(cleanupCtx); err != nil {
-			return err
+			return errors.Join(err, unconfirmedDrops)
 		}
 	}
-	return nil
+	return unconfirmedDrops
 }
 
 // postCopyPhase runs the work that happens between copy-rows and the
