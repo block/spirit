@@ -1577,6 +1577,9 @@ func TestEndCancelledStatementReportsAnUnconfirmedEnd(t *testing.T) {
 	require.ErrorIs(t, err, stmtErr)
 	require.ErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, "session 12345")
+	var unconfirmed *CancelledStatementError
+	require.ErrorAs(t, err, &unconfirmed)
+	require.Equal(t, 12345, unconfirmed.ConnID, "the error names the session to check")
 }
 
 // A DROP TABLE cancelled by its caller while it waits for a metadata lock is

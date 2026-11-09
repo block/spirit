@@ -524,6 +524,25 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 // statement may still be running on the server and take effect later.
 var ErrCancelledStatementMayStillRun = errors.New("cancelled statement may still be running")
 
+// CancelledStatementError is the error for a cancelled statement whose session
+// could not be confirmed to have ended. It matches
+// ErrCancelledStatementMayStillRun with errors.Is, and names the session so a
+// caller can check later whether the statement is still running on the server.
+type CancelledStatementError struct {
+	// ConnID is the server's connection ID of the statement's session.
+	ConnID int
+	// Err is the statement's own error, joined with the cancellation.
+	Err error
+}
+
+func (e *CancelledStatementError) Error() string {
+	return fmt.Sprintf("%s: session %d: %s", ErrCancelledStatementMayStillRun, e.ConnID, e.Err)
+}
+
+func (e *CancelledStatementError) Unwrap() []error {
+	return []error{ErrCancelledStatementMayStillRun, e.Err}
+}
+
 // cancelledStatementKillTimeout bounds killing the session of a cancelled
 // statement and waiting for it to exit. A killed statement that was changing a
 // table rolls back before its session exits, so this is independent of
@@ -536,8 +555,8 @@ const cancelledStatementKillTimeout = 30 * time.Second
 // metadata lock still takes effect once the lock is released. So this kills
 // the statement's session and waits for it to exit. Once it has, the statement
 // has either finished or been rolled back, and nothing it started can change
-// the table later. When that cannot be confirmed, the error wraps
-// ErrCancelledStatementMayStillRun. Either way the error also carries the
+// the table later. When that cannot be confirmed, the error is a
+// *CancelledStatementError. Either way the error also carries the
 // statement's own error and the cancellation.
 func endCancelledStatement(ctx context.Context, db *sql.DB, connID int, err error, logger *slog.Logger) error {
 	if cause := ctx.Err(); !errors.Is(err, cause) {
@@ -553,7 +572,7 @@ func endCancelledStatement(ctx context.Context, db *sql.DB, connID int, err erro
 		)
 		// The kill error is only logged: callers inspect the returned error
 		// tree to classify the statement's outcome.
-		return fmt.Errorf("%w: session %d: %w", ErrCancelledStatementMayStillRun, connID, err)
+		return &CancelledStatementError{ConnID: connID, Err: err}
 	}
 	logger.Info("killed the session of a cancelled statement, so it cannot take effect after the caller stopped", "pid", connID)
 	return err
@@ -765,7 +784,7 @@ func Exec(ctx context.Context, db *sql.DB, stmt string, args ...any) error {
 // caller cancels it, kills that session and waits for it to exit before
 // returning, as ForceExec does. Unlike ForceExec it never kills the sessions
 // blocking the statement. When the cancelled statement's session cannot be
-// confirmed to have ended, the error wraps ErrCancelledStatementMayStillRun.
+// confirmed to have ended, the error is a *CancelledStatementError.
 func ExecKillOnCancel(ctx context.Context, db *sql.DB, logger *slog.Logger, stmt string, args ...any) error {
 	stmt, err := sqlescape.EscapeSQL(stmt, args...)
 	if err != nil {
