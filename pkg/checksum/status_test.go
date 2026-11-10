@@ -98,15 +98,51 @@ func TestLocklessRateSampleAcrossPassRollover(t *testing.T) {
 
 	// The pass walks its last 1000 rows, the next pass starts, and walks 500.
 	chunker.SimulateProgress(1)
-	walked, _, _ := chunker.Progress()
-	c.walkedAtRollover.Store(walked)
-	c.rollovers.Add(1)
-	require.NoError(t, chunker.Reset())
+	require.NoError(t, c.resetForPass())
 	chunker.SimulateProgress(0.05)
 
 	c.observeRate(&sample)
 	require.Equal(t, uint64(150), c.rate.RowsPerSecond(), "1500 rows over one 10s sample")
 	require.Equal(t, uint64(500), sample.walked)
+}
+
+// resetHookChunker runs onReset inside Reset, before the position goes back
+// to the start, which is where a rate sample used to see a rollover's count
+// with the finished pass's position.
+type resetHookChunker struct {
+	*table.MockChunker
+	onReset func()
+}
+
+func (r *resetHookChunker) Reset() error {
+	r.onReset()
+	return r.MockChunker.Reset()
+}
+
+// TestLocklessRateRolloverIsAtomic pins that a sample started while the
+// chunker is resetting sees the rollover's count together with the reset
+// position, so it counts the finished pass once rather than twice.
+func TestLocklessRateRolloverIsAtomic(t *testing.T) {
+	mock := table.NewMockChunker("t1", 10000)
+	require.NoError(t, mock.Open())
+	chunker := &resetHookChunker{MockChunker: mock}
+	c := &LocklessChecker{chunker: chunker}
+	mock.SimulateProgress(0.9)
+	sample := c.newRateSample()
+	mock.SimulateProgress(1)
+
+	sampled := make(chan rateSample, 1)
+	chunker.onReset = func() {
+		go func() { sampled <- c.newRateSample() }()
+		require.False(t, c.rolloverMu.TryLock(), "the reset runs under rolloverMu")
+	}
+	require.NoError(t, c.resetForPass())
+
+	cur := <-sampled
+	require.Equal(t, rateSample{walked: 0, rollovers: 1, walkedAtRollover: 10000}, cur)
+	prev := sample
+	c.observeRate(&prev)
+	require.Equal(t, uint64(100), c.rate.RowsPerSecond(), "the last 1000 rows of the pass, counted once")
 }
 
 // TestLocklessRateSkipsScheduledWaits pins that a sample covering a scheduled

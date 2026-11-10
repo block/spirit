@@ -303,9 +303,12 @@ type LocklessChecker struct {
 	// rollovers counts the chunker resets between passes, and
 	// walkedAtRollover is how far the previous pass had walked when the last
 	// one happened, so a sample that spans a reset still counts the end of
-	// the previous pass.
-	rollovers        atomic.Uint64
-	walkedAtRollover atomic.Uint64
+	// the previous pass. rolloverMu covers both and the reset itself (see
+	// resetForPass), so a sample never sees the counter of a reset whose
+	// chunker position it does not also see.
+	rolloverMu       sync.Mutex
+	rollovers        uint64
+	walkedAtRollover uint64
 
 	firstCleanPassOnce sync.Once
 	firstCleanPassCh   chan struct{}
@@ -750,16 +753,32 @@ func (c *LocklessChecker) sampleRateLoop(ctx context.Context) {
 	}
 }
 
-// rateSample is the reading the next rate sample is measured from.
+// rateSample is the reading the next rate sample is measured from: the
+// chunker's position, the rollover count, and the position the last rollover
+// left the previous pass at, all read together under rolloverMu.
 type rateSample struct {
-	walked    uint64
-	rollovers uint64
+	walked           uint64
+	rollovers        uint64
+	walkedAtRollover uint64
 }
 
 func (c *LocklessChecker) newRateSample() rateSample {
-	rollovers := c.rollovers.Load()
+	c.rolloverMu.Lock()
+	defer c.rolloverMu.Unlock()
 	walked, _, _ := c.chunker.Progress()
-	return rateSample{walked: walked, rollovers: rollovers}
+	return rateSample{walked: walked, rollovers: c.rollovers, walkedAtRollover: c.walkedAtRollover}
+}
+
+// resetForPass resets the chunker for the next pass, recording how far the
+// previous one walked. The record and the reset happen under one lock, so a
+// rate sample sees either neither or both: if it saw the new count with the
+// old position, it would count the whole finished pass twice.
+func (c *LocklessChecker) resetForPass() error {
+	c.rolloverMu.Lock()
+	defer c.rolloverMu.Unlock()
+	c.walkedAtRollover, _, _ = c.chunker.Progress()
+	c.rollovers++
+	return c.chunker.Reset()
 }
 
 // observeRate records how far the walk advanced since prev, and moves prev to
@@ -769,12 +788,10 @@ func (c *LocklessChecker) newRateSample() rateSample {
 // the rate measures the checksum while it works, and the wait is not part of
 // the current pass, whose rest is what the ETA estimates.
 func (c *LocklessChecker) observeRate(prev *rateSample) {
-	// Read the counter before the position: a reset that lands between the
-	// two then shows up in the next sample rather than being lost.
 	cur := c.newRateSample()
 	var advanced uint64
 	if cur.rollovers != prev.rollovers {
-		advanced = utils.SubFloor(c.walkedAtRollover.Load(), prev.walked) + cur.walked
+		advanced = utils.SubFloor(cur.walkedAtRollover, prev.walked) + cur.walked
 	} else {
 		advanced = utils.SubFloor(cur.walked, prev.walked)
 	}
@@ -911,14 +928,11 @@ func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPas
 				c.nextPassAt = time.Time{}
 				c.statsMu.Unlock()
 			}
-			walked, _, _ := c.chunker.Progress()
-			c.walkedAtRollover.Store(walked)
-			c.rollovers.Add(1)
 			// Note that this discards the resume evidence published so far:
 			// ResumeWatermark reports the current walk's verified prefix, and
 			// the new pass has not verified anything yet. That is deliberate —
 			// see ResumeWatermark.
-			if err := c.chunker.Reset(); err != nil {
+			if err := c.resetForPass(); err != nil {
 				return fmt.Errorf("reset chunker for pass %d: %w", passNum, err)
 			}
 		}
