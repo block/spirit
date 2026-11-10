@@ -21,7 +21,8 @@ type MockChunker struct {
 	columnMapping *ColumnMapping
 	// chunks, when set by NewMockChunkerFromChunks, is what Next hands out:
 	// chunks[currentPosition], so currentPosition counts chunks rather than
-	// rows. A test can compare a dispatched chunk against it by pointer.
+	// rows, including where the key methods and GetLowWatermark read it. A
+	// test can compare a dispatched chunk against it by pointer.
 	chunks []*Chunk
 
 	// State
@@ -81,6 +82,13 @@ func NewMockChunker(tableName string, totalRows uint64) *MockChunker {
 // NewMockChunkerFromChunks creates an open mock chunker whose Next hands out
 // chunks in order, and the same chunks again after Reset. Its table is the
 // first chunk's, or test.t when there are none. Progress counts chunks.
+//
+// Its position is a chunk index, not a key, and the key methods do not
+// translate it: KeyAboveHighWatermark, KeyBelowLowWatermark,
+// KeyNotYetDispatched and NoteBufferedKey compare a row key against the
+// number of chunks handed out, and GetLowWatermark returns that number.
+// Do not wire this mode to a change feed; use NewMockChunker, whose position
+// is a key.
 func NewMockChunkerFromChunks(chunks ...*Chunk) *MockChunker {
 	tableInfo := &TableInfo{SchemaName: "test", TableName: "t"}
 	if len(chunks) > 0 && chunks[0].Table != nil {
