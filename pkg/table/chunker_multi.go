@@ -19,7 +19,6 @@ type multiChunker struct {
 }
 
 var _ Chunker = &multiChunker{}
-var _ CopyCompleter = (*multiChunker)(nil)
 
 // NewMultiChunker creates a new multi-chunker that wraps multiple chunkers
 func NewMultiChunker(c ...Chunker) Chunker {
@@ -76,18 +75,13 @@ func (m *multiChunker) IsRead() bool {
 	return true
 }
 
-// MarkCopyComplete marks every wrapped chunker's copy complete. See
-// CopyCompleter. It fails if a wrapped chunker does not implement it.
-func (m *multiChunker) MarkCopyComplete() error {
+// MarkRead marks every wrapped chunker read. See the Chunker interface.
+func (m *multiChunker) MarkRead() error {
 	m.Lock()
 	defer m.Unlock()
 	for tableName, chunker := range m.chunkers {
-		completer, ok := chunker.(CopyCompleter)
-		if !ok {
-			return fmt.Errorf("chunker for table %q (%T) cannot mark its copy complete", tableName, chunker)
-		}
-		if err := completer.MarkCopyComplete(); err != nil {
-			return fmt.Errorf("could not mark the copy of table %q complete: %w", tableName, err)
+		if err := chunker.MarkRead(); err != nil {
+			return fmt.Errorf("could not mark table %q read: %w", tableName, err)
 		}
 	}
 	return nil

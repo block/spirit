@@ -14,8 +14,6 @@ import (
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
-var _ CopyCompleter = (*chunkerOptimistic)(nil)
-
 type chunkerOptimistic struct {
 	sync.Mutex
 	// dynamicChunkSizer owns chunkSize / chunkTimingInfo / ChunkerTarget /
@@ -767,15 +765,15 @@ func (t *chunkerOptimistic) IsRead() bool {
 	return t.finalChunkSent
 }
 
-// MarkCopyComplete satisfies CopyCompleter. See the interface docs.
-func (t *chunkerOptimistic) MarkCopyComplete() error {
+// MarkRead satisfies Chunker. See the interface docs.
+func (t *chunkerOptimistic) MarkRead() error {
 	t.Lock()
 	defer t.Unlock()
 	if !t.isOpen {
 		return ErrChunkerNotOpen
 	}
 	if t.inflightChunks > 0 {
-		return fmt.Errorf("cannot mark the copy of %s complete: %d chunks are in flight", t.Ti.QuotedTableName, t.inflightChunks)
+		return fmt.Errorf("cannot mark %s read: %d chunks are in flight", t.Ti.QuotedTableName, t.inflightChunks)
 	}
 	t.finalChunkSent = true
 	return nil

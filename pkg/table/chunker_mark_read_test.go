@@ -27,11 +27,11 @@ func copiedWatermark4Test(t *testing.T) string {
 	return watermark
 }
 
-// TestOptimisticMarkCopyComplete: a chunker reopened at a checkpoint and
-// marked complete reports its key space as copied, so the change stream
+// TestOptimisticMarkRead: a chunker reopened at a checkpoint and
+// marked read reports its key space as dispatched, so the change stream
 // neither discards nor records any key, and the checkpointed watermark is
 // kept as it was.
-func TestOptimisticMarkCopyComplete(t *testing.T) {
+func TestOptimisticMarkRead(t *testing.T) {
 	watermark := copiedWatermark4Test(t)
 
 	chunker := newUnopenedBufferedKeyChunker4Test()
@@ -40,7 +40,7 @@ func TestOptimisticMarkCopyComplete(t *testing.T) {
 	require.NoError(t, chunker.OpenAtWatermark(watermark))
 	require.False(t, chunker.IsRead())
 
-	require.NoError(t, chunker.MarkCopyComplete())
+	require.NoError(t, chunker.MarkRead())
 	require.True(t, chunker.IsRead())
 	_, err := chunker.Next()
 	require.ErrorIs(t, err, ErrTableIsRead)
@@ -58,37 +58,37 @@ func TestOptimisticMarkCopyComplete(t *testing.T) {
 	require.JSONEq(t, watermark, got)
 }
 
-// TestOptimisticMarkCopyCompleteRefuses: marking the copy complete is only
+// TestOptimisticMarkReadRefuses: marking a chunker read is only
 // meaningful for an open chunker with nothing in flight.
-func TestOptimisticMarkCopyCompleteRefuses(t *testing.T) {
+func TestOptimisticMarkReadRefuses(t *testing.T) {
 	unopened := newUnopenedBufferedKeyChunker4Test()
-	require.ErrorIs(t, unopened.MarkCopyComplete(), ErrChunkerNotOpen)
+	require.ErrorIs(t, unopened.MarkRead(), ErrChunkerNotOpen)
 	require.False(t, unopened.finalChunkSent)
 
 	chunker := newBufferedKeyChunker4Test(t)
 	_, err := chunker.Next() // in flight: no feedback yet
 	require.NoError(t, err)
-	require.ErrorContains(t, chunker.MarkCopyComplete(), "chunks are in flight")
+	require.ErrorContains(t, chunker.MarkRead(), "chunks are in flight")
 	require.False(t, chunker.IsRead())
 }
 
-// TestCompositeMarkCopyComplete is TestOptimisticMarkCopyComplete for the
+// TestCompositeMarkRead is TestOptimisticMarkRead for the
 // composite chunker.
-func TestCompositeMarkCopyComplete(t *testing.T) {
-	testutils.RunSQL(t, "DROP TABLE IF EXISTS composite_copy_complete_t1")
+func TestCompositeMarkRead(t *testing.T) {
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS composite_mark_read_t1")
 	// Not auto_increment, so NewChunker selects the composite chunker.
-	testutils.RunSQL(t, `CREATE TABLE composite_copy_complete_t1 (id int NOT NULL, PRIMARY KEY (id))`)
+	testutils.RunSQL(t, `CREATE TABLE composite_mark_read_t1 (id int NOT NULL, PRIMARY KEY (id))`)
 	for start := 1; start <= 2001; start += 1000 {
-		testutils.RunSQL(t, fmt.Sprintf(`INSERT INTO composite_copy_complete_t1 (id)
+		testutils.RunSQL(t, fmt.Sprintf(`INSERT INTO composite_mark_read_t1 (id)
 			WITH RECURSIVE seq AS (SELECT %d AS n UNION ALL SELECT n + 1 FROM seq WHERE n < %d)
 			SELECT n FROM seq`, start, start+999))
 	}
-	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS composite_copy_complete_t1") })
+	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS composite_mark_read_t1") })
 
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	tbl := NewTableInfo(db, "test", "composite_copy_complete_t1")
+	tbl := NewTableInfo(db, "test", "composite_mark_read_t1")
 	require.NoError(t, tbl.SetInfo(t.Context()))
 
 	newComposite := func() *chunkerComposite {
@@ -99,11 +99,11 @@ func TestCompositeMarkCopyComplete(t *testing.T) {
 	}
 
 	first := newComposite()
-	require.ErrorIs(t, first.MarkCopyComplete(), ErrChunkerNotOpen)
+	require.ErrorIs(t, first.MarkRead(), ErrChunkerNotOpen)
 	require.NoError(t, first.Open())
 	chunk, err := first.Next()
 	require.NoError(t, err)
-	require.ErrorContains(t, first.MarkCopyComplete(), "chunks are in flight")
+	require.ErrorContains(t, first.MarkRead(), "chunks are in flight")
 	first.Feedback(chunk, time.Millisecond, 1)
 	chunk, err = first.Next()
 	require.NoError(t, err)
@@ -119,7 +119,7 @@ func TestCompositeMarkCopyComplete(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, chunker.Close()) })
 	require.False(t, chunker.IsRead())
 
-	require.NoError(t, chunker.MarkCopyComplete())
+	require.NoError(t, chunker.MarkRead())
 	require.True(t, chunker.IsRead())
 	_, err = chunker.Next()
 	require.ErrorIs(t, err, ErrTableIsRead)
@@ -134,9 +134,9 @@ func TestCompositeMarkCopyComplete(t *testing.T) {
 	require.JSONEq(t, watermark, got)
 }
 
-// TestMultiChunkerMarkCopyComplete: the multi-chunker marks every child, and
-// refuses a child that cannot be marked rather than skipping it.
-func TestMultiChunkerMarkCopyComplete(t *testing.T) {
+// TestMultiChunkerMarkRead: the multi-chunker marks every child, and
+// fails if a child refuses rather than skipping it.
+func TestMultiChunkerMarkRead(t *testing.T) {
 	t1 := newBufferedKeyChunker4Test(t)
 	t2 := newUnopenedOptimisticChunker4Test("t2")
 	require.NoError(t, t2.Open())
@@ -144,11 +144,27 @@ func TestMultiChunkerMarkCopyComplete(t *testing.T) {
 	multi := NewMultiChunker(t1, t2).(*multiChunker)
 	multi.isOpen = true
 	require.False(t, multi.IsRead())
-	require.NoError(t, multi.MarkCopyComplete())
+	require.NoError(t, multi.MarkRead())
 	require.True(t, t1.IsRead())
 	require.True(t, t2.IsRead())
 	require.True(t, multi.IsRead())
 
-	mocks := NewMultiChunker(NewMockChunker("table1", 1000), NewMockChunker("table2", 1000)).(*multiChunker)
-	require.ErrorContains(t, mocks.MarkCopyComplete(), "cannot mark its copy complete")
+	opened, unopened := NewMockChunker("table1", 1000), NewMockChunker("table2", 1000)
+	require.NoError(t, opened.Open())
+	mocks := NewMultiChunker(opened, unopened).(*multiChunker)
+	require.ErrorIs(t, mocks.MarkRead(), ErrChunkerNotOpen)
+	require.False(t, mocks.IsRead())
+}
+
+// TestMockChunkerMarkRead: the mock behaves like the real chunkers, so a
+// caller's MarkRead path can be tested against it.
+func TestMockChunkerMarkRead(t *testing.T) {
+	mock := NewMockChunker("table1", 1000)
+	require.ErrorIs(t, mock.MarkRead(), ErrChunkerNotOpen)
+	require.NoError(t, mock.Open())
+	require.False(t, mock.IsRead())
+	require.NoError(t, mock.MarkRead())
+	require.True(t, mock.IsRead())
+	_, err := mock.Next()
+	require.ErrorIs(t, err, ErrTableIsRead)
 }

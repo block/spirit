@@ -59,6 +59,16 @@ const (
 type Chunker interface {
 	Open() error
 	IsRead() bool
+	// MarkRead marks an open chunker as read to the end without dispatching
+	// the rest of its key space, for a caller that knows the work is already
+	// done: move calls it when a checkpoint proves an earlier run finished the
+	// copy. IsRead then reports true and Next returns ErrTableIsRead. A
+	// MappedChunker then reports no key above the high watermark or not yet
+	// dispatched, so the change stream discards and defers none, and records
+	// none with NoteBufferedKey. The watermark is kept, so GetLowWatermark
+	// returns what it did before. It fails on a chunker that is not open or
+	// has chunks in flight. A multi chunker marks every chunker it wraps.
+	MarkRead() error
 	Close() error
 	Next() (*Chunk, error)
 	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)
@@ -117,21 +127,6 @@ type MappedChunker interface {
 	// deliberately ignores checkpointHighPtr: a key copied by a *previous*
 	// run has no read in flight in this one.
 	KeyNotYetDispatched(key0 any) bool
-}
-
-// CopyCompleter is implemented by chunkers that a resume can mark as having
-// copied their whole key space without running the copy, because its
-// checkpoint proves an earlier run finished it (see pkg/move's copyComplete).
-// The in-tree chunkers implement it.
-type CopyCompleter interface {
-	// MarkCopyComplete marks an open chunker's key space as dispatched and
-	// committed: IsRead reports true and Next returns ErrTableIsRead. Nothing
-	// is above the high watermark or not yet dispatched, so the change stream
-	// discards and defers no key, and NoteBufferedKey records none. The
-	// watermark the chunker was opened at is kept, so GetLowWatermark returns
-	// it unchanged. It fails on a chunker that is not open or has chunks in
-	// flight.
-	MarkCopyComplete() error
 }
 
 // BufferedKeyNoter is an optional capability of a MappedChunker. The change

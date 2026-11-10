@@ -630,18 +630,14 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
-	// A resume after the copy marks the reopened chunkers complete before the
+	// A resume after the copy marks the reopened chunkers read before the
 	// feeds start below. Left open at the watermark, they treat every key at
 	// or above it as not yet copied: the feeds' first change to such a key
 	// logs that the above-high-watermark discard is suppressed, although this
 	// run never turns the optimization on, and Progress reports the tables as
-	// not copied. Marking them complete keeps the watermark unchanged.
+	// not copied. Marking them read keeps the watermark unchanged.
 	if r.copyComplete.Load() {
-		completer, ok := r.copyChunker.(table.CopyCompleter)
-		if !ok {
-			return fmt.Errorf("copy chunker %T cannot mark its copy complete", r.copyChunker)
-		}
-		if err := completer.MarkCopyComplete(); err != nil {
+		if err := r.copyChunker.MarkRead(); err != nil {
 			return err
 		}
 	}
