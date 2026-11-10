@@ -488,7 +488,9 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 		return true, nil
 	}
 	if n.FnName.L == CharFunc {
-		return true, n.restoreChar(ctx)
+		if done, err := n.restoreChar(ctx); done {
+			return true, err
+		}
 	}
 	if n.FnName.L == JSONMemberOf {
 		if len(n.Args) == 2 {
@@ -510,12 +512,21 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 
 // restoreChar writes CHAR(N, ... [USING charset_name]). The parser names the
 // function char_func, which MySQL rejects, and appends the charset as a last
-// argument: a NULL value when there is no USING clause.
-func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) error {
+// argument: a NULL value when there is no USING clause. A call without that
+// shape, such as a schema-qualified or zero-argument call to a function a
+// user named char_func, returns false so the caller restores it as written.
+func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) (bool, error) {
+	if n.Schema.L != "" || len(n.Args) < 2 {
+		return false, nil
+	}
 	last := len(n.Args) - 1
 	charset, ok := n.Args[last].(*ValueExpr)
 	if !ok {
-		return fmt.Errorf("an error occurred while restore FuncCallExpr.(CHAR): charset is %T", n.Args[last])
+		return false, nil
+	}
+	name, isString := charset.GetValue().(string)
+	if charset.GetValue() != nil && !isString {
+		return false, nil
 	}
 	ctx.WriteKeyWord("CHAR")
 	ctx.WritePlain("(")
@@ -524,15 +535,15 @@ func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) error {
 			ctx.WritePlain(", ")
 		}
 		if err := arg.Restore(ctx); err != nil {
-			return fmt.Errorf("an error occurred while restore FuncCallExpr.(CHAR).Args[%d]: %w", i, err)
+			return true, fmt.Errorf("an error occurred while restore FuncCallExpr.(CHAR).Args[%d]: %w", i, err)
 		}
 	}
-	if charset.GetValue() != nil {
+	if isString {
 		ctx.WriteKeyWord(" USING ")
-		ctx.WriteKeyWord(charset.GetString())
+		ctx.WriteKeyWord(name)
 	}
 	ctx.WritePlain(")")
-	return nil
+	return true, nil
 }
 
 // Accept implements Node interface.
