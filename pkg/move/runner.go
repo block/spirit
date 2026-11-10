@@ -152,6 +152,10 @@ type Runner struct {
 	copier            copier.Copier
 	checker           checksum.Checker
 	checksumWatermark string
+	// copyComplete is set on a resume whose checkpoint proves the copy
+	// finished (see resumeFromCheckpoint). Run then skips the copy, and the
+	// resume skips deleteRecopyRange.
+	copyComplete bool
 
 	// lastCheckpoint is when the checkpoint was last persisted and the
 	// position(s) it saved, reported together on the ckpt row of the status
@@ -547,6 +551,22 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// All definitive validation has passed before changing runner or target state.
 	copierWatermark := rec.CopierWatermark
 	r.checksumWatermark = rec.ChecksumWatermark
+	// A checksum watermark proves the copy finished. DumpCheckpoint writes
+	// one only from the checksum phase, and before that phase Run turns off
+	// the watermark optimization and flushes every feed. From then on the
+	// feeds apply every change, none is discarded as above the copier's
+	// position, so every change before the checkpointed position is on the
+	// targets and replaying from it is complete. deleteRecopyRange guards
+	// against changes that optimization discarded, so it and the copy have
+	// nothing left to do: the resume goes straight to the post-copy phase,
+	// whose initial checksum still verifies and repairs.
+	//
+	// The checkpoint is empty of a checksum watermark at other points after
+	// the copy too (restoreSecondaryIndexes, ANALYZE TABLE, the start of the
+	// checksum and the sentinel wait), and a resume there still deletes and
+	// recopies. A checkpoint field that marks the copy complete would cover
+	// those, at the cost of changing the checkpoint format.
+	r.copyComplete = r.checksumWatermark != ""
 
 	// Build each source's change source in the coordinate scheme its
 	// checkpointed position was written in (a GTID set resumes through the
@@ -572,26 +592,14 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		return err
 	}
 
-	// With multiple sources, a persisted checksum watermark cannot be trusted.
-	// deleteRecopyRange (below) runs every (source, table) DELETE against
-	// every target, and same-named tables from different sources interleave in
-	// the target tables — so one source's DELETE also removes OTHER sources'
-	// rows below their own watermarks. Those rows are not recopied (each
-	// source's chunker resumes from its own watermark); only a checksum pass
-	// that runs from the very beginning detects and repairs the hole. Resuming
-	// the checksum at a watermark would skip re-verifying exactly the range
-	// where the hole sits, so discard it and force a full pass.
-	//
-	// With a single source the watermark is kept: deletes are per-table, and
-	// each table's delete range coincides exactly with its recopy range (both
-	// start at the watermark chunk's lower bound), so nothing below the
-	// checksum watermark can have been deleted without being recopied.
-	if len(r.sources) > 1 && r.checksumWatermark != "" {
-		r.logger.Info("discarding persisted checksum watermark: multi-source resume requires a full checksum pass",
-			"reason", "deleteRecopyRange may remove rows below other sources' watermarks; only a from-scratch checksum re-verifies and repairs them",
-			"sources", len(r.sources))
-		r.checksumWatermark = ""
-	}
+	// A checksum watermark and deleteRecopyRange never meet: the resume
+	// deletes only when the checkpoint has no checksum watermark, and then
+	// the initial checksum runs a full pass. That matters with several
+	// sources, because deleteRecopyRange runs every (source, table) DELETE
+	// against every target and same-named tables from different sources
+	// interleave there: one source's DELETE also removes other sources' rows
+	// below their own watermarks, which their chunkers do not recopy. Only a
+	// checksum pass from the beginning repairs that.
 
 	// Delete rows at/above the copier's resume position (the watermark
 	// chunk's lower bound) from all target tables before resuming, so that
@@ -604,10 +612,15 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// resume position: the copier re-copies the deleted range from the
 	// current source snapshot (so rows deleted on the source stay gone), and
 	// the checksum will verify. See deleteRecopyRange for the races.
-	if err := r.deleteRecopyRange(ctx, copierWatermark); err != nil {
+	if r.copyComplete {
+		r.logger.Info("resuming after the copy finished: skipping the recopy and its delete",
+			"reason", "the checkpoint has a checksum watermark, which is written only after the copy completed")
+	} else if err := r.deleteRecopyRange(ctx, copierWatermark); err != nil {
 		return err
 	}
 
+	// Opened at the watermark even after the copy, so that DumpCheckpoint
+	// reads the same copier watermark back and keeps writing checkpoints.
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
 	}
@@ -1617,12 +1630,16 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 
 	r.startBackgroundRoutines(ctx)
 	defer r.stopStatisticsUpdates()
-	if err := r.setWatermarkOptimizationAll(ctx, true); err != nil {
-		return err
-	}
-
-	if err := r.runCopy(ctx); err != nil {
-		return err
+	// A resume after the copy never turns the watermark optimization on: the
+	// copier does not run, so no key is above its position and every change
+	// must be applied.
+	if !r.copyComplete {
+		if err := r.setWatermarkOptimizationAll(ctx, true); err != nil {
+			return err
+		}
+		if err := r.runCopy(ctx); err != nil {
+			return err
+		}
 	}
 	r.stopStatisticsUpdates()
 
