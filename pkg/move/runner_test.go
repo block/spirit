@@ -1210,13 +1210,15 @@ func TestMultiSourceResumeFromCheckpointE2E(t *testing.T) {
 
 // TestMultiSourceResumeAfterCopySkipsRecopyDelete: a checkpoint with a
 // checksum watermark was written after the copy, so the resume neither
-// deletes nor recopies, and it keeps the watermark with several sources.
+// deletes nor recopies, and the checkpoint keeps the checksum watermark as
+// proof that the copy finished. That the initial checksum still runs a full
+// pass with several sources is TestMultiSourceResumeAfterCopyRunsFullChecksum.
 //
 // The checkpoint is crafted into the case that once lost data: skewed copier
 // watermarks (source A at id 100, source B at id 31), whose per-source
 // DELETEs would remove each other's interleaved rows, and a checksum
-// watermark above every row, which would leave the hole unverified. With the
-// delete skipped the hole never opens: every row the copy wrote stays.
+// watermark above every row. With the delete skipped the hole never opens:
+// the checksum finds no difference.
 func TestMultiSourceResumeAfterCopySkipsRecopyDelete(t *testing.T) {
 	srcAName, _ := testutils.CreateUniqueTestDatabase(t)
 	srcBName, _ := testutils.CreateUniqueTestDatabase(t)
@@ -1277,15 +1279,21 @@ func TestMultiSourceResumeAfterCopySkipsRecopyDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
 	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
-	require.True(t, r.copyComplete, "a checksum watermark must mark the copy complete")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
 	require.Equal(t, string(checksumWM), r.checksumWatermark,
-		"a resume after the copy deletes nothing, so it keeps the checksum watermark with several sources")
+		"the checkpoint's checksum watermark is kept as proof that the copy finished")
+	require.Equal(t, r.copyRowsAtResume, r.copyChunker.RowsCopied(), "the resumed move must not copy any rows")
+	require.Zero(t, r.checker.DifferencesFound(),
+		"nothing was deleted, so the full pass must find no difference to repair")
+	for _, tbl := range r.Progress().Tables {
+		require.True(t, tbl.IsComplete, "a resume after the copy reports %s as copied", tbl.TableName)
+	}
 	require.NoError(t, r.Close())
 
 	// All 200 rows must be present. Had the delete run, source B's DELETE
-	// (id >= 31) would have removed source A's odd ids 31..99, and nothing
-	// would have restored them: the copy does not run, and the checksum
-	// resumes above every row.
+	// (id >= 31) would have removed source A's odd ids 31..99; the full pass
+	// would have repaired them, which the zero-difference check above rules
+	// out.
 	var tgtOdd, tgtEven int
 	require.NoError(t, tgtDB.QueryRowContext(t.Context(),
 		"SELECT COUNT(*) FROM users WHERE id % 2 = 1").Scan(&tgtOdd))
@@ -1352,6 +1360,70 @@ func TestSingleSourceResumeKeepsChecksumWatermark(t *testing.T) {
 	require.Equal(t, srcCount, tgtCount)
 }
 
+// TestMultiSourceResumeAfterCopyRunsFullChecksum: with several sources, a
+// resume after the copy still skips the copy but runs the initial checksum
+// from the beginning, ignoring the checkpoint's checksum watermark (see
+// checksumResumeWatermark). A target row changed while the move was stopped,
+// with no change event to correct it, stands in for a row removed by another
+// source's replay; it sits below the checksum watermark, so only a full pass
+// repairs it.
+func TestMultiSourceResumeAfterCopyRunsFullChecksum(t *testing.T) {
+	srcAName, _ := testutils.CreateUniqueTestDatabase(t)
+	srcBName, srcBDB := testutils.CreateUniqueTestDatabase(t)
+	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
+	for _, dbName := range []string{srcAName, srcBName} {
+		testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (
+			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(255) NOT NULL
+		)`)
+	}
+	seedUsersRange(t, srcAName, 1, 199)
+	seedUsersRange(t, srcBName, 2, 200)
+
+	move := &Move{
+		SourceDSNs:   []string{testutils.DSNForDatabase(srcAName), testutils.DSNForDatabase(srcBName)},
+		TargetDSN:    testutils.DSNForDatabase(tgtName),
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
+		SourceTables: []string{"users"},
+	}
+	checkpointAndStop(t, move)
+
+	srcACfg, err := mysql.ParseDSN(testutils.DSNForDatabase(srcAName))
+	require.NoError(t, err)
+	srcBCfg, err := mysql.ParseDSN(testutils.DSNForDatabase(srcBName))
+	require.NoError(t, err)
+	qnA := srcACfg.Addr + "." + srcAName + ".users"
+	qnB := srcBCfg.Addr + "." + srcBName + ".users"
+	// A checksum watermark above every row (max id is 200).
+	checksumWM, err := json.Marshal(map[string]string{
+		qnA: watermarkChunkJSON(290, 300),
+		qnB: watermarkChunkJSON(290, 300),
+	})
+	require.NoError(t, err)
+	_, err = tgtDB.ExecContext(t.Context(),
+		"UPDATE _spirit_move_checkpoint SET checksum_watermark = ?", string(checksumWM))
+	require.NoError(t, err)
+	// Source B's row 2, removed from the target behind the feed's back.
+	_, err = tgtDB.ExecContext(t.Context(), "DELETE FROM users WHERE id = 2")
+	require.NoError(t, err)
+
+	move.Threads = 4
+	r, err := NewRunner(move)
+	require.NoError(t, err)
+	require.NoError(t, r.Run(t.Context()))
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
+	require.Equal(t, r.copyRowsAtResume, r.copyChunker.RowsCopied(), "the resumed move must not copy any rows")
+	require.NoError(t, r.Close())
+
+	var name string
+	require.NoError(t, tgtDB.QueryRowContext(t.Context(), "SELECT name FROM users WHERE id = 2").Scan(&name),
+		"only a full checksum pass restores a row below the checksum watermark")
+	var srcName string
+	require.NoError(t, srcBDB.QueryRowContext(t.Context(), "SELECT name FROM users_old WHERE id = 2").Scan(&srcName))
+	require.Equal(t, srcName, name)
+}
+
 // TestResumeAfterCopyAppliesChangesWithoutRecopy: a move stopped after its
 // copy, with a checksum watermark in its checkpoint, resumes without
 // deleting or recopying, and the change feed alone carries every source
@@ -1408,7 +1480,7 @@ func TestResumeAfterCopyAppliesChangesWithoutRecopy(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
 	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
-	require.True(t, r.copyComplete, "a checksum watermark must mark the copy complete")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
 	require.Equal(t, r.copyRowsAtResume, r.copyChunker.RowsCopied(), "the resumed move must not copy any rows")
 	wm, err := r.copyChunker.GetLowWatermark()
 	require.NoError(t, err)
@@ -1460,7 +1532,7 @@ func TestResumeAfterCopyKeepsChecksumWatermark(t *testing.T) {
 	require.NoError(t, r.setupDiscovery(ctx))
 	require.NoError(t, r.setupUnderLocks(ctx))
 	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint")
-	require.True(t, r.copyComplete, "a checksum watermark must mark the copy complete")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
 	require.Less(t, r.status.Get(), status.Checksum, "the checkpoint must be dumped before the checksum phase")
 	require.NoError(t, r.DumpCheckpoint(ctx))
 

@@ -156,7 +156,8 @@ type Runner struct {
 	// finished (see resumeFromCheckpoint). Run then skips the copy, the
 	// resume skips deleteRecopyRange, and DumpCheckpoint keeps writing the
 	// resumed checksum watermark until the checksum phase writes its own.
-	copyComplete bool
+	// Progress reads it while setup may still change it, so it is atomic.
+	copyComplete atomic.Bool
 
 	// lastCheckpoint is when the checkpoint was last persisted and the
 	// position(s) it saved, reported together on the ckpt row of the status
@@ -570,7 +571,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// carries its checksum watermark through those steps instead (see
 	// DumpCheckpoint), so stopping it again before its checksum starts keeps
 	// the skip.
-	r.copyComplete = r.checksumWatermark != ""
+	r.copyComplete.Store(r.checksumWatermark != "")
 
 	// Build each source's change source in the coordinate scheme its
 	// checkpointed position was written in (a GTID set resumes through the
@@ -616,7 +617,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// resume position: the copier re-copies the deleted range from the
 	// current source snapshot (so rows deleted on the source stay gone), and
 	// the checksum will verify. See deleteRecopyRange for the races.
-	if r.copyComplete {
+	if r.copyComplete.Load() {
 		r.logger.Info("resuming after the copy finished: skipping the recopy and its delete",
 			"reason", "the checkpoint has a checksum watermark, which is written only after the copy completed")
 	} else if err := r.deleteRecopyRange(ctx, copierWatermark); err != nil {
@@ -744,7 +745,7 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 			// leak stale checkpoint state into newCopy.
 			r.checksumWatermark = ""
 			r.copyRowsAtResume = 0
-			r.copyComplete = false
+			r.copyComplete.Store(false)
 		case resumeFreshOwned:
 			r.logger.Warn("target holds an empty checkpoint table: a prior move attempt stopped before writing its first checkpoint; wiping target tables and starting fresh")
 		case resumeNone:
@@ -1638,7 +1639,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 	// A resume after the copy never turns the watermark optimization on: the
 	// copier does not run, so no key is above its position and every change
 	// must be applied.
-	if !r.copyComplete {
+	if !r.copyComplete.Load() {
 		if err := r.setWatermarkOptimizationAll(ctx, true); err != nil {
 			return err
 		}
@@ -2120,11 +2121,12 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// when it finishes), so ours must not be running alongside it.
 	r.stopPeriodicFlushAll()
 
-	// On resume from checkpoint, r.checksumWatermark carries verification
+	// On resume from checkpoint, the checksum watermark carries verification
 	// evidence from a previous run, and the factory opens the chunker there.
 	// The chunker is not closed here: the sentinel wait reuses r.checker (and
 	// so this chunker) for continuous verification. Close owns it.
-	if r.checksumWatermark == "" {
+	checksumWatermark := r.checksumResumeWatermark()
+	if checksumWatermark == "" {
 		if err := r.checksumChunker.Open(); err != nil {
 			return err
 		}
@@ -2143,7 +2145,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// initial checksum) and reports in RunContinuous (the sentinel wait).
 	r.checker, err = checksum.NewChecker(sourceDBs, r.checksumChunker, feeds, &checksum.CheckerConfig{
 		Lockless:    true,
-		Watermark:   r.checksumWatermark,
+		Watermark:   checksumWatermark,
 		Concurrency: r.move.Threads,
 		DBConfig:    r.dbConfig,
 		Logger:      r.logger,
@@ -2240,7 +2242,40 @@ func (r *Runner) copyTables() []status.TableProgress {
 	r.chunkerMu.RLock()
 	copyChunker := r.copyChunker
 	r.chunkerMu.RUnlock()
-	return status.TablesFromChunker(copyChunker)
+	tables := status.TablesFromChunker(copyChunker)
+	// A resume that skipped the copy reopens the copy chunker at its
+	// watermark and never reads it to the end, so the chunker does not
+	// report the tables as read. The checkpoint proved the copy finished.
+	if r.copyComplete.Load() {
+		for i := range tables {
+			tables[i].IsComplete = true
+		}
+	}
+	return tables
+}
+
+// checksumResumeWatermark is the checksum watermark the initial checksum
+// opens at: the checkpoint's, or "" for a full pass.
+//
+// With several sources it is always "". Their feeds resume from positions
+// checkpointed independently, so replaying one source's changes can remove a
+// row another source already finished writing: a REPLACE that claims a
+// secondary UNIQUE value the other source's row holds on the target deletes
+// that row, and the other feed has no later event that restores it. The row
+// may sit below the checksum watermark, where only a full pass finds and
+// repairs it. With one source every such conflict is resolved by a later
+// event of the same feed, which the replay also applies.
+//
+// r.checksumWatermark itself is kept: it is what proves the copy finished,
+// and DumpCheckpoint writes it back until the checksum phase starts.
+func (r *Runner) checksumResumeWatermark() string {
+	if len(r.sources) > 1 && r.checksumWatermark != "" {
+		r.logger.Info("multi-source resume: running a full checksum pass instead of resuming at the checksum watermark",
+			"reason", "replaying independently checkpointed feeds can remove a row of another source below the watermark",
+			"sources", len(r.sources))
+		return ""
+	}
+	return r.checksumWatermark
 }
 
 // snapshot captures what Status and Progress report on, for the given state.
@@ -2361,7 +2396,7 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 			return status.ErrWatermarkNotReady
 		}
 		checksumWatermark = wm
-	case state < status.Checksum && r.copyComplete:
+	case state < status.Checksum && r.copyComplete.Load():
 		checksumWatermark = r.checksumWatermark
 	}
 	// Debug, not Info: the status block's ckpt row reports it instead —
