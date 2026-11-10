@@ -1984,7 +1984,9 @@ func (r *Runner) analyzeTargetTables(ctx context.Context) error {
 				// Unqualified on the target's DB: the source schema does not
 				// exist on a cross-cluster target (and breaks through a
 				// vtgate). See dbconn.AnalyzeTable.
-				if err := dbconn.AnalyzeTable(ctx, r.targets[i].DB, r.logger, "", tbl.TableName); err != nil {
+				// The servers run at once, so the target goes in the retry and
+				// non-OK warnings too, not only in the final error.
+				if err := dbconn.AnalyzeTable(ctx, r.targets[i].DB, r.logger.With("target", i), "", tbl.TableName); err != nil {
 					return fmt.Errorf("failed to analyze table %s on target %d: %w", tbl.TableName, i, err)
 				}
 			}

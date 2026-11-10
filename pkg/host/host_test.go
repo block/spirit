@@ -48,23 +48,24 @@ func TestDisjoint(t *testing.T) {
 }
 
 // TestEachRunsGroupsConcurrently: every group's call is running at once. Each
-// call waits for all of them to start, so calls run one at a time would never
-// get past the barrier.
+// call waits until all of them have started, so calls run one at a time
+// would never get past the barrier. A call that times out returns, so a
+// failing run leaves no goroutine blocked.
 func TestEachRunsGroupsConcurrently(t *testing.T) {
 	groups := GroupConfigs([]*mysql.Config{{Addr: "a:3306"}, {Addr: "b:3306"}, {Addr: "a:3306"}, {Addr: "c:3306"}})
 	require.Len(t, groups, 3)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	var started sync.WaitGroup
-	started.Add(len(groups))
+	var started atomic.Int32
+	allStarted := make(chan struct{})
 	var mu sync.Mutex
 	var seen []Group
 	require.NoError(t, Each(ctx, groups, func(ctx context.Context, group Group) error {
-		started.Done()
-		waited := make(chan struct{})
-		go func() { started.Wait(); close(waited) }()
+		if started.Add(1) == int32(len(groups)) {
+			close(allStarted)
+		}
 		select {
-		case <-waited:
+		case <-allStarted:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
