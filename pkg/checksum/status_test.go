@@ -85,3 +85,51 @@ func TestLocklessChecksumStatusETA(t *testing.T) {
 	chunker.SimulateProgress(1)
 	require.Equal(t, status.ETADue, c.ChecksumStatus().ETA.State)
 }
+
+// TestLocklessRateSampleAcrossPassRollover pins that a sample spanning the
+// chunker reset between passes counts the end of the previous pass as well as
+// the start of the new one, rather than only the new pass's walk.
+func TestLocklessRateSampleAcrossPassRollover(t *testing.T) {
+	chunker := table.NewMockChunker("t1", 10000)
+	require.NoError(t, chunker.Open())
+	c := &LocklessChecker{chunker: chunker}
+	chunker.SimulateProgress(0.9)
+	sample := c.newRateSample()
+
+	// The pass walks its last 1000 rows, the next pass starts, and walks 500.
+	chunker.SimulateProgress(1)
+	walked, _, _ := chunker.Progress()
+	c.walkedAtRollover.Store(walked)
+	c.rollovers.Add(1)
+	require.NoError(t, chunker.Reset())
+	chunker.SimulateProgress(0.05)
+
+	c.observeRate(&sample)
+	require.Equal(t, uint64(150), c.rate.RowsPerSecond(), "1500 rows over one 10s sample")
+	require.Equal(t, uint64(500), sample.walked)
+}
+
+// TestLocklessRateSkipsScheduledWaits pins that a sample covering a scheduled
+// wait between passes is not observed, so the wait does not read as a slow
+// checksum and lengthen the ETA.
+func TestLocklessRateSkipsScheduledWaits(t *testing.T) {
+	chunker := table.NewMockChunker("t1", 10000)
+	c := &LocklessChecker{chunker: chunker}
+	sample := c.newRateSample()
+	chunker.SimulateProgress(0.1)
+	c.observeRate(&sample)
+	require.Equal(t, uint64(100), c.rate.RowsPerSecond())
+
+	// While waiting, and in the sample the wait ends in, nothing is observed.
+	c.setPaceWaiting(true)
+	c.observeRate(&sample)
+	c.observeRate(&sample)
+	c.setPaceWaiting(false)
+	c.observeRate(&sample)
+	require.Equal(t, uint64(100), c.rate.RowsPerSecond(), "the wait intervals were not observed as zero")
+
+	// The next working sample is observed again.
+	chunker.SimulateProgress(0.4)
+	c.observeRate(&sample)
+	require.Equal(t, uint64(200), c.rate.RowsPerSecond(), "(1000 + 3000) rows over two 10s samples")
+}

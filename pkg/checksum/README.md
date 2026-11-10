@@ -878,7 +878,9 @@ its line starts with `checksum:` (the phase, not the algorithm), e.g.
 `LocklessChecker` reports an ETA for its current pass in `ChecksumStatus.ETA`, built the
 same way as the copier's: `status.Rate` averages the chunker's `Progress` over a
 2-minute window of `status.RateSampleInterval` samples, and `status.EstimateETA` divides
-what is left of the walk by it. It is in the chunker's unit, so on an auto-increment key
+what is left of the walk by it. A sample that spans the chunker reset between passes counts the
+end of the previous pass too, and a sample that covers a scheduled wait between passes is skipped,
+so the wait does not read as a slow checksum. It is in the chunker's unit, so on an auto-increment key
 it is paced on key-space distance and a table statistics refresh does not move it. It is
 `TBD` for the first minute of a run. It covers one pass: a pass that ends with chunks
 still retrying or repaired is followed by another, so the checksum can run past `DUE`.

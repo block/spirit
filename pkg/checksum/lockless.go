@@ -115,6 +115,7 @@ import (
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/throttler"
+	"github.com/block/spirit/pkg/utils"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -293,6 +294,18 @@ type LocklessChecker struct {
 	// across runs, so a continuous run after the initial checksum starts with
 	// the rate that one measured.
 	rate status.Rate
+	// paceWaiting is set while the checker deliberately waits between passes
+	// (or before a continuous run's first pass), and paceWaited records that
+	// such a wait happened since the last rate sample. A sample that covers
+	// one is skipped, so a scheduled wait does not read as a slow checksum.
+	paceWaiting atomic.Bool
+	paceWaited  atomic.Bool
+	// rollovers counts the chunker resets between passes, and
+	// walkedAtRollover is how far the previous pass had walked when the last
+	// one happened, so a sample that spans a reset still counts the end of
+	// the previous pass.
+	rollovers        atomic.Uint64
+	walkedAtRollover atomic.Uint64
 
 	firstCleanPassOnce sync.Once
 	firstCleanPassCh   chan struct{}
@@ -691,8 +704,13 @@ func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
 		// that was just verified, so it waits out the interval before its first
 		// pass instead of re-walking back-to-back. A checker whose first run is
 		// continuous (cross-server sync) has nothing to wait for.
-		if !firstRun && !waitForChecksum(ctx, minPassInterval) {
-			return nil
+		if !firstRun {
+			c.setPaceWaiting(true)
+			waited := waitForChecksum(ctx, minPassInterval)
+			c.setPaceWaiting(false)
+			if !waited {
+				return nil
+			}
 		}
 		c.continuousActive.Store(true)
 		defer c.continuousActive.Store(false)
@@ -717,11 +735,9 @@ func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
 // sampleRateLoop feeds the rate with how far the chunker advanced in each
 // status.RateSampleInterval, the same sampling the copier does for its ETA.
 // The chunker advances only on feedback for a chunk that resolved clean, so
-// this is the verification rate. Each pass resets the chunker, so a reading
-// below the previous one is a new pass, and it contributes only what that
-// pass has verified so far.
+// this is the verification rate.
 func (c *LocklessChecker) sampleRateLoop(ctx context.Context) {
-	prev, _, _ := c.chunker.Progress()
+	sample := c.newRateSample()
 	ticker := time.NewTicker(status.RateSampleInterval)
 	defer ticker.Stop()
 	for {
@@ -729,15 +745,54 @@ func (c *LocklessChecker) sampleRateLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cur, _, _ := c.chunker.Progress()
-			if cur >= prev {
-				c.rate.Observe(cur - prev)
-			} else {
-				c.rate.Observe(cur)
-			}
-			prev = cur
+			c.observeRate(&sample)
 		}
 	}
+}
+
+// rateSample is the reading the next rate sample is measured from.
+type rateSample struct {
+	walked    uint64
+	rollovers uint64
+}
+
+func (c *LocklessChecker) newRateSample() rateSample {
+	rollovers := c.rollovers.Load()
+	walked, _, _ := c.chunker.Progress()
+	return rateSample{walked: walked, rollovers: rollovers}
+}
+
+// observeRate records how far the walk advanced since prev, and moves prev to
+// the current reading. Each pass resets the chunker, so across a reset the
+// advance is the rest of the previous pass plus the new pass's walk so far.
+// An interval that covered a scheduled wait between passes is not observed:
+// the rate measures the checksum while it works, and the wait is not part of
+// the current pass, whose rest is what the ETA estimates.
+func (c *LocklessChecker) observeRate(prev *rateSample) {
+	// Read the counter before the position: a reset that lands between the
+	// two then shows up in the next sample rather than being lost.
+	cur := c.newRateSample()
+	var advanced uint64
+	if cur.rollovers != prev.rollovers {
+		advanced = utils.SubFloor(c.walkedAtRollover.Load(), prev.walked) + cur.walked
+	} else {
+		advanced = utils.SubFloor(cur.walked, prev.walked)
+	}
+	*prev = cur
+	waited := c.paceWaited.Swap(false)
+	if c.paceWaiting.Load() || waited {
+		return
+	}
+	c.rate.Observe(advanced)
+}
+
+// setPaceWaiting marks the start or end of a scheduled wait between passes.
+// Both edges mark the current sample interval as covering a wait: a wait
+// longer than one interval has already had its earlier marks consumed by the
+// time it ends, and the interval it ends in is still partly idle.
+func (c *LocklessChecker) setPaceWaiting(waiting bool) {
+	c.paceWaiting.Store(waiting)
+	c.paceWaited.Store(true)
 }
 
 // passInterval is how long the pass loop waits between passes. Each mode has
@@ -839,20 +894,26 @@ func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPas
 				c.statsMu.Lock()
 				c.nextPassAt = lastPassStart.Add(minPassInterval)
 				c.statsMu.Unlock()
+				c.setPaceWaiting(true)
 				timer := time.NewTimer(wait)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
+					c.setPaceWaiting(false)
 					c.statsMu.Lock()
 					c.nextPassAt = time.Time{}
 					c.statsMu.Unlock()
 					return ctx.Err()
 				case <-timer.C:
 				}
+				c.setPaceWaiting(false)
 				c.statsMu.Lock()
 				c.nextPassAt = time.Time{}
 				c.statsMu.Unlock()
 			}
+			walked, _, _ := c.chunker.Progress()
+			c.walkedAtRollover.Store(walked)
+			c.rollovers.Add(1)
 			// Note that this discards the resume evidence published so far:
 			// ResumeWatermark reports the current walk's verified prefix, and
 			// the new pass has not verified anything yet. That is deliberate —
