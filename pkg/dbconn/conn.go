@@ -540,7 +540,7 @@ func newWithConnectTimeout(ctx context.Context, inputDSN string, config *DBConfi
 	// For PREFERRED mode, implement fallback behavior
 	if config.TLSMode == "PREFERRED" {
 		// First try with TLS
-		db, err := sql.Open(DriverName, dsn)
+		db, err := openPool(dsn)
 		if err == nil {
 			if pingErr := pingWithTimeout(ctx, db, timeout); pingErr == nil {
 				// TLS connection successful
@@ -559,7 +559,7 @@ func newWithConnectTimeout(ctx context.Context, inputDSN string, config *DBConfi
 					"connection_type", connectionType)
 			}
 		} else {
-			// sql.Open only validates the DSN; a non-nil error here means the
+			// openPool only parses the DSN; a non-nil error here means the
 			// DSN itself is bad, so there is nothing to ping or fall back to.
 			return nil, fmt.Errorf("failed to open %s connection: %w", connectionType, err)
 		}
@@ -577,7 +577,7 @@ func newWithConnectTimeout(ctx context.Context, inputDSN string, config *DBConfi
 			return nil, fmt.Errorf("failed to create fallback DSN for %s connection: %w", connectionType, err)
 		}
 
-		db, err = sql.Open(DriverName, fallbackDSN)
+		db, err = openPool(fallbackDSN)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open fallback %s connection: %w", connectionType, err)
 		}
@@ -589,7 +589,7 @@ func newWithConnectTimeout(ctx context.Context, inputDSN string, config *DBConfi
 	}
 
 	// For all other modes, use standard connection
-	db, err = sql.Open(DriverName, dsn)
+	db, err = openPool(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s connection: %w", connectionType, err)
 	}

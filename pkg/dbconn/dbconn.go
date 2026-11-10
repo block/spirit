@@ -460,10 +460,11 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 			utils.CloseAndLog(conn)
 		}
 	}()
-	var connID int
-	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+	target, err := readKillTarget(ctx, conn)
+	if err != nil {
 		return err
 	}
+	connID := int(target.ThreadID)
 
 	// Each attempt runs its own kill worker. A single retry with no kill is
 	// only as good as the first kill: a blocker that rolls back slowly, or a
@@ -472,11 +473,12 @@ func forceExec(ctx context.Context, db *sql.DB, dbConfig *DBConfig, logger *slog
 	// MaxRetries, the same budget cutover uses for its LOCK TABLES attempts.
 	attempts := max(1, dbConfig.MaxRetries)
 	for attempt := 1; ; attempt++ {
-		result := execWithKillWorker(ctx, conn, connID, dbConfig.forceKillDelay(), stmt, waiting, kill, logger, afterExec)
-		if result.err != nil && ctx.Err() != nil {
+		result := execWithKillWorker(ctx, db, conn, target, dbConfig.forceKillDelay(), stmt, waiting, kill, logger, afterExec)
+		if ctx.Err() != nil {
 			// The kill worker has joined, so nothing else uses conn.
-			discarded = true
-			return endCancelledConn(ctx, db, conn, connID, result.err, logger)
+			var err error
+			discarded, err = endCancelled(ctx, db, conn, connID, result.err, result.interrupt, logger)
+			return err
 		}
 		if !shouldRetryForceExecAfterKill(result.err, result.killAttempted) || attempt == attempts {
 			if result.skippedKillAfterFailedCheck() {
@@ -597,7 +599,9 @@ func endCancelledStatement(ctx context.Context, db *sql.DB, connID int, err erro
 
 // forceExecAttempt is the outcome of one statement execution under a kill worker.
 type forceExecAttempt struct {
-	err           error
+	err error
+	// interrupt is what ending the statement on a cancel did.
+	interrupt     mysql.InterruptOutcome
 	killAttempted bool
 	killed        []int
 	killErr       error
@@ -634,7 +638,8 @@ const waitingCheckTimeout = time.Second
 // still has its blockers killed, and only once they have blocked it for the
 // delay. The kill worker is always joined before returning, so a late kill can
 // never target sessions that a later attempt or the caller is already using.
-func execWithKillWorker(ctx context.Context, conn *sql.Conn, connID int, delay time.Duration, stmt string, waiting func(context.Context, int) (bool, error), kill func(context.Context, int) ([]int, error), logger *slog.Logger, afterExec func(error)) forceExecAttempt {
+func execWithKillWorker(ctx context.Context, db *sql.DB, conn *sql.Conn, target mysql.KillTarget, delay time.Duration, stmt string, waiting func(context.Context, int) (bool, error), kill func(context.Context, int) ([]int, error), logger *slog.Logger, afterExec func(error)) forceExecAttempt {
+	connID := int(target.ThreadID)
 	var wg sync.WaitGroup
 	var attempt forceExecAttempt
 	// stmtCtx ends when the statement returns, so a check still waiting for a
@@ -645,7 +650,9 @@ func execWithKillWorker(ctx context.Context, conn *sql.Conn, connID int, delay t
 	wg.Go(func() {
 		attempt = killWhenWaiting(ctx, stmtCtx, connID, started, delay, waiting, kill, logger)
 	})
-	_, err := conn.ExecContext(ctx, stmt)
+	// A cancel ends the statement on the server (execEndingOnCancel). It also
+	// ends stmtCtx, so the kill worker stops looking for blockers.
+	interrupt, err := execEndingOnCancel(ctx, db, conn, target, stmt, logger)
 	stmtDone()
 	if afterExec != nil {
 		afterExec(err)
@@ -654,6 +661,7 @@ func execWithKillWorker(ctx context.Context, conn *sql.Conn, connID int, delay t
 	// connections that are now being used for subsequent operations.
 	wg.Wait()
 	attempt.err = err
+	attempt.interrupt = interrupt
 	return attempt
 }
 
@@ -798,10 +806,14 @@ func Exec(ctx context.Context, db *sql.DB, stmt string, args ...any) error {
 // ExecKillOnCancel is like Exec, for a statement that must not take effect
 // after the caller has given up on it, such as DDL that can wait for a
 // metadata lock. It runs the statement on a session of its own, and when the
-// caller cancels it, kills that session and waits for it to exit before
-// returning, as ForceExec does. Unlike ForceExec it never kills the sessions
-// blocking the statement. When the cancelled statement's session cannot be
-// confirmed to have ended, the error is a *CancelledStatementError.
+// caller cancels it, ends the statement on the server before returning, as
+// ForceExec does: with KILL QUERY, waiting for the statement's reply, and if
+// that fails by killing the session and waiting for it to exit (see
+// execEndingOnCancel). Unlike ForceExec it never kills the sessions blocking
+// the statement. A cancelled statement that the server reports succeeded
+// returns nil: it took effect before the kill. When the cancelled
+// statement's end cannot be confirmed, the error is a
+// *CancelledStatementError.
 func ExecKillOnCancel(ctx context.Context, db *sql.DB, logger *slog.Logger, stmt string, args ...any) error {
 	stmt, err := sqlescape.EscapeSQL(stmt, args...)
 	if err != nil {
@@ -811,17 +823,19 @@ func ExecKillOnCancel(ctx context.Context, db *sql.DB, logger *slog.Logger, stmt
 	if err != nil {
 		return err
 	}
-	var connID int
-	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+	target, err := readKillTarget(ctx, conn)
+	if err != nil {
 		return errors.Join(err, conn.Close())
 	}
-	if _, err := conn.ExecContext(ctx, stmt); err != nil {
-		if ctx.Err() != nil {
-			return endCancelledConn(ctx, db, conn, connID, err, logger)
+	interrupt, err := execEndingOnCancel(ctx, db, conn, target, stmt, logger)
+	if ctx.Err() != nil {
+		discarded, err := endCancelled(ctx, db, conn, int(target.ThreadID), err, interrupt, logger)
+		if discarded {
+			return err
 		}
 		return errors.Join(err, conn.Close())
 	}
-	return conn.Close()
+	return errors.Join(err, conn.Close())
 }
 
 // analyzeAttempts is how many times AnalyzeTable runs ANALYZE TABLE before

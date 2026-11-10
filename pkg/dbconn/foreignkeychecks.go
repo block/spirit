@@ -19,8 +19,8 @@ import (
 // statement can run with the checks off. The setting is read rather than reset
 // with DEFAULT: SET foreign_key_checks = DEFAULT turns the checks off.
 //
-// As with ExecKillOnCancel, a cancelled statement's session is killed and
-// waited for before the call returns, so the DDL cannot take effect later.
+// As with ExecKillOnCancel, a cancelled statement is ended on the server
+// before the call returns, so the DDL cannot take effect later.
 func ExecWithoutForeignKeyChecks(ctx context.Context, db *sql.DB, logger *slog.Logger, stmt string, args ...any) error {
 	stmt, err := sqlescape.EscapeSQL(stmt, args...)
 	if err != nil {
@@ -30,17 +30,25 @@ func ExecWithoutForeignKeyChecks(ctx context.Context, db *sql.DB, logger *slog.L
 	if err != nil {
 		return err
 	}
-	var connID, checks int
-	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID(), @@session.foreign_key_checks").Scan(&connID, &checks); err != nil {
+	target, err := readKillTarget(ctx, conn)
+	if err != nil {
+		return errors.Join(err, conn.Close())
+	}
+	var checks int
+	if err := conn.QueryRowContext(ctx, "SELECT @@session.foreign_key_checks").Scan(&checks); err != nil {
 		return errors.Join(err, conn.Close())
 	}
 	if _, err := conn.ExecContext(ctx, "SET SESSION foreign_key_checks = 0"); err != nil {
 		return errors.Join(err, discardConn(conn))
 	}
-	_, execErr := conn.ExecContext(ctx, stmt)
-	if execErr != nil && ctx.Err() != nil {
-		// The killed session cannot be turned back, so it is discarded.
-		return endCancelledConn(ctx, db, conn, connID, execErr, logger)
+	interrupt, execErr := execEndingOnCancel(ctx, db, conn, target, stmt, logger)
+	if ctx.Err() != nil {
+		discarded, err := endCancelled(ctx, db, conn, int(target.ThreadID), execErr, interrupt, logger)
+		if discarded {
+			// A killed session cannot be turned back.
+			return err
+		}
+		execErr = err
 	}
 	// Restore on a context of its own: the statement may have used up ctx.
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tableUnlockTimeout)
