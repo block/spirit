@@ -92,7 +92,8 @@ type DiffOptions struct {
 	// and no statements, rather than planning a DROP and ADD MySQL ignores.
 	IgnoreRowFormat bool
 
-	// LowerCaseTableNames is the target server's @@lower_case_table_names.
+	// LowerCaseTableNames is the target server's @@lower_case_table_names,
+	// as dbconn.LowerCaseTableNames reads it.
 	// When it is nonzero the server compares table names case-insensitively,
 	// so DeclarativeToImperative does too: `Orders` in the desired schema is
 	// the same table as `orders` in the current one (diffed, not created and
