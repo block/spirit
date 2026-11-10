@@ -501,13 +501,10 @@ func TestMultiChunkerReset(t *testing.T) {
 	require.Equal(t, initialRowsCopied3, resetRowsCopied3, "mock3 rowsCopied should be reset to initial value")
 	require.Equal(t, initialChunksCopied3, resetChunksCopied3, "mock3 chunksCopied should be reset to initial value")
 
-	// Verify feedback history is cleared
-	resetFeedback1 := mock1.GetFeedbackCalls()
-	resetFeedback2 := mock2.GetFeedbackCalls()
-	resetFeedback3 := mock3.GetFeedbackCalls()
-	require.Empty(t, resetFeedback1, "mock1 feedback should be cleared after reset")
-	require.Empty(t, resetFeedback2, "mock2 feedback should be cleared after reset")
-	require.Empty(t, resetFeedback3, "mock3 feedback should be cleared after reset")
+	// Verify every child was reset once
+	require.Equal(t, 1, mock1.ResetCount(), "mock1 should be reset once")
+	require.Equal(t, 1, mock2.ResetCount(), "mock2 should be reset once")
+	require.Equal(t, 1, mock3.ResetCount(), "mock3 should be reset once")
 
 	// Verify that after reset, the chunker produces the same selection behavior
 	// Reset progress to same initial state

@@ -23,25 +23,14 @@ import (
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// testChunker is a deterministic Chunker for unit-testing the dispatcher
-// without standing up real databases. It yields a fixed slice of chunks
-// on each pass; Reset() rewinds. Safe for concurrent calls from the
-// walker goroutine.
-type testChunker struct {
-	mu       sync.Mutex
-	chunks   []*table.Chunk
-	cursor   int
-	resets   int
-	feedback []table.FeedbackCall
-	closed   bool
-}
-
-func newTestChunker(n int) *testChunker {
+// newTestChunker returns an open mock chunker that hands out n chunks of
+// 1000 ids each, the same chunks again after Reset.
+func newTestChunker(n int) *table.MockChunker {
 	chunks := make([]*table.Chunk, n)
 	for i := range n {
 		chunks[i] = newTestChunk(uint64(i*1000), uint64((i+1)*1000))
 	}
-	return &testChunker{chunks: chunks}
+	return table.NewMockChunkerFromChunks(chunks...)
 }
 
 func newTestChunk(lo, hi uint64) *table.Chunk {
@@ -61,64 +50,6 @@ func newTestChunk(lo, hi uint64) *table.Chunk {
 		Table:      &table.TableInfo{SchemaName: "test", TableName: "t"},
 		NewTable:   &table.TableInfo{SchemaName: "test", TableName: "t"},
 	}
-}
-
-func (c *testChunker) Open() error  { return nil }
-func (c *testChunker) Close() error { c.mu.Lock(); defer c.mu.Unlock(); c.closed = true; return nil }
-func (c *testChunker) IsRead() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.cursor >= len(c.chunks)
-}
-func (c *testChunker) MarkRead() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cursor = len(c.chunks)
-	return nil
-}
-func (c *testChunker) Next() (*table.Chunk, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cursor >= len(c.chunks) {
-		return nil, table.ErrTableIsRead
-	}
-	ch := c.chunks[c.cursor]
-	c.cursor++
-	return ch, nil
-}
-func (c *testChunker) Feedback(chunk *table.Chunk, duration time.Duration, actualRows uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.feedback = append(c.feedback, table.FeedbackCall{Chunk: chunk, Duration: duration, ActualRows: actualRows, Timestamp: time.Now()})
-}
-func (c *testChunker) RowsCopied() uint64 { return 0 }
-
-func (c *testChunker) Progress() (uint64, uint64, uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return uint64(c.cursor), uint64(c.cursor), uint64(len(c.chunks))
-}
-func (c *testChunker) OpenAtWatermark(watermark string) error { return nil }
-func (c *testChunker) GetLowWatermark() (string, error)       { return "", nil }
-func (c *testChunker) Reset() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cursor = 0
-	c.resets++
-	return nil
-}
-func (c *testChunker) Tables() []*table.TableInfo { return nil }
-
-func (c *testChunker) resetCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.resets
-}
-
-func (c *testChunker) feedbackCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.feedback)
 }
 
 // declineHotSnapshot stubs out the hot-range snapshot fallback. These tests
@@ -825,7 +756,7 @@ func TestRecopyPassDoesNotFireFirstCleanPass(t *testing.T) {
 // guarantees the re-read happened (happens-before via the pass barrier).
 func TestRecopiedChunkReverifiedBeforeCleanPass(t *testing.T) {
 	chunker := newTestChunker(2)
-	divergent := chunker.chunks[0] // only this chunk diverges
+	divergent := chunker.Chunks()[0] // only this chunk diverges
 	var recopied sync.Map
 	var readAfterRecopy atomic.Bool
 	recopier := &fakeRecopier{
@@ -1026,9 +957,7 @@ func TestMultiplePassesResetCounters(t *testing.T) {
 	require.True(t, errors.Is(err, context.Canceled) || err == nil)
 
 	// Chunker should have been Reset() at least once.
-	chunker.mu.Lock()
-	resets := chunker.resets
-	chunker.mu.Unlock()
+	resets := chunker.ResetCount()
 	require.GreaterOrEqual(t, resets, 1, "chunker should have been reset between passes")
 }
 
@@ -1082,7 +1011,7 @@ func TestStatsReportsInFlightWork(t *testing.T) {
 
 // Distinct units ensure progress cannot accidentally use emitted chunks.
 type estimateChunker struct {
-	*testChunker
+	*table.MockChunker
 	progress, emitted, total uint64
 }
 
@@ -1598,20 +1527,20 @@ func TestRunIgnoresMaxPasses(t *testing.T) {
 // that matters here: the low watermark exists only once a chunk has been fed
 // back, and Reset() clears it because the next walk starts at the table again.
 type watermarkChunker struct {
-	*testChunker
+	*table.MockChunker
 	mu   sync.Mutex
 	done map[*table.Chunk]bool
 }
 
 func newWatermarkChunker(n int) *watermarkChunker {
-	return &watermarkChunker{testChunker: newTestChunker(n), done: map[*table.Chunk]bool{}}
+	return &watermarkChunker{MockChunker: newTestChunker(n), done: map[*table.Chunk]bool{}}
 }
 
 func (c *watermarkChunker) Feedback(chunk *table.Chunk, d time.Duration, rows uint64) {
 	c.mu.Lock()
 	c.done[chunk] = true
 	c.mu.Unlock()
-	c.testChunker.Feedback(chunk, d, rows)
+	c.MockChunker.Feedback(chunk, d, rows)
 }
 
 // GetLowWatermark reports the contiguous fed-back prefix, like the real
@@ -1620,7 +1549,7 @@ func (c *watermarkChunker) GetLowWatermark() (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	wm := ""
-	for _, chunk := range c.chunks {
+	for _, chunk := range c.Chunks() {
 		if !c.done[chunk] {
 			break
 		}
@@ -1636,7 +1565,7 @@ func (c *watermarkChunker) Reset() error {
 	c.mu.Lock()
 	c.done = map[*table.Chunk]bool{}
 	c.mu.Unlock()
-	return c.testChunker.Reset()
+	return c.MockChunker.Reset()
 }
 
 // A chunk that diverges again after every repair is a divergence the repairs
@@ -1655,7 +1584,7 @@ func TestRunUntilCleanRepeatedRepairsAreDifferencesExhausted(t *testing.T) {
 			cfg.MaxPasses = tc.maxPasses
 			chunker := newWatermarkChunker(3)
 			recopier := &fakeRecopier{}
-			bad := chunker.chunks[0]
+			bad := chunker.Chunks()[0]
 			c := newTestChecker(t, chunker, cfg,
 				func(_ context.Context, chunk *table.Chunk, _ int) (int64, int64, uint64, error) {
 					if chunk == bad {
@@ -1702,7 +1631,7 @@ func TestRepairedChunkIsNotResumeEvidence(t *testing.T) {
 	cfg.MaxPasses = 1 // stop after the pass that repairs
 	chunker := newWatermarkChunker(3)
 	recopier := &fakeRecopier{}
-	bad := chunker.chunks[0]
+	bad := chunker.Chunks()[0]
 	c := newTestChecker(t, chunker, cfg,
 		func(_ context.Context, chunk *table.Chunk, _ int) (int64, int64, uint64, error) {
 			if chunk == bad {
@@ -1717,8 +1646,8 @@ func TestRepairedChunkIsNotResumeEvidence(t *testing.T) {
 	require.ErrorIs(t, c.RunUntilClean(ctx), ErrVerificationUnresolved)
 
 	require.Equal(t, 1, recopier.callCount())
-	require.Len(t, chunker.feedback, 2, "the two clean chunks resolved; the repaired one did not")
-	for _, fb := range chunker.feedback {
+	require.Len(t, chunker.GetFeedbackCalls(), 2, "the two clean chunks resolved; the repaired one did not")
+	for _, fb := range chunker.GetFeedbackCalls() {
 		require.NotSame(t, bad, fb.Chunk)
 	}
 	wm, err := c.ResumeWatermark()
@@ -1746,7 +1675,7 @@ func TestResumeWatermarkTracksCurrentWalkOnly(t *testing.T) {
 	chunker := newWatermarkChunker(3)
 	// The first two chunks verify; the last is permanently hot, so it is
 	// deferred and no pass is ever clean.
-	hot := chunker.chunks[2]
+	hot := chunker.Chunks()[2]
 	// Two gates hold the walk still at the two points the test inspects it, so
 	// neither observation depends on winning a race with the pass loop:
 	// holdPass1 keeps pass 1 from ending, and holdPass2 keeps pass 2 from
@@ -1767,7 +1696,7 @@ func TestResumeWatermarkTracksCurrentWalkOnly(t *testing.T) {
 				if err := wait(ctx, holdPass1); err != nil {
 					return 0, 0, 0, err
 				}
-			case chunk == chunker.chunks[0] && attempt == 2:
+			case chunk == chunker.Chunks()[0] && attempt == 2:
 				if err := wait(ctx, holdPass2); err != nil {
 					return 0, 0, 0, err
 				}
@@ -1796,10 +1725,10 @@ func TestResumeWatermarkTracksCurrentWalkOnly(t *testing.T) {
 	// re-walks. holdPass2 keeps the re-walk on its first chunk, so the state
 	// below is examined at rest.
 	require.Eventually(t, func() bool {
-		return chunker.resetCount() > 0
+		return chunker.ResetCount() > 0
 	}, 30*time.Second, time.Millisecond, "the pass must end and re-walk")
 
-	require.GreaterOrEqual(t, chunker.feedbackCount(), 2,
+	require.GreaterOrEqual(t, len(chunker.GetFeedbackCalls()), 2,
 		"pass 1 verified a prefix, so there is an answer available to carry forward")
 	wm, err := c.ResumeWatermark()
 	require.NoError(t, err)
@@ -1847,7 +1776,7 @@ func TestHotSnapshotAdmission(t *testing.T) {
 // has been proven about the data, and the condition is plausibly gone by the
 // next attempt.
 type failingWalk struct {
-	*testChunker
+	*table.MockChunker
 	failPasses int
 	failures   atomic.Int64
 }
@@ -1859,17 +1788,17 @@ func (c *failingWalk) Next() (*table.Chunk, error) {
 		c.failures.Add(1)
 		return nil, errTransientWalk
 	}
-	return c.testChunker.Next()
+	return c.MockChunker.Next()
 }
 
 // IsRead reports the table as unread while there is still a failure to inject,
-// so the dispatcher actually asks for a chunk. An empty testChunker is read
+// so the dispatcher actually asks for a chunk. An empty mock chunker is read
 // from the outset, which would skip Next entirely.
 func (c *failingWalk) IsRead() bool {
 	if c.failing() {
 		return false
 	}
-	return c.testChunker.IsRead()
+	return c.MockChunker.IsRead()
 }
 
 func (c *failingWalk) failing() bool { return int(c.failures.Load()) < c.failPasses }
@@ -1894,7 +1823,7 @@ func TestFiniteLocklessRetriesTransientFailures(t *testing.T) {
 
 	t.Run("recovers within the budget", func(t *testing.T) {
 		// Two attempts are spent on the failure, the third walks cleanly.
-		chunker := &failingWalk{testChunker: newTestChunker(0), failPasses: maxRetries - 1}
+		chunker := &failingWalk{MockChunker: newTestChunker(0), failPasses: maxRetries - 1}
 		require.NoError(t, newChecker(t, chunker).Run(t.Context()))
 		require.Equal(t, int64(maxRetries-1), chunker.failures.Load())
 	})
@@ -1903,7 +1832,7 @@ func TestFiniteLocklessRetriesTransientFailures(t *testing.T) {
 		// A failure that outlasts the budget is reported as exhausted attempts,
 		// wrapping the last one so it is the error an operator triages. It must
 		// not be mistaken for a verdict about the data.
-		chunker := &failingWalk{testChunker: newTestChunker(0), failPasses: maxRetries + 1}
+		chunker := &failingWalk{MockChunker: newTestChunker(0), failPasses: maxRetries + 1}
 		err := newChecker(t, chunker).Run(t.Context())
 		require.ErrorIs(t, err, ErrAttemptsExhausted)
 		require.ErrorIs(t, err, errTransientWalk)
@@ -1918,7 +1847,7 @@ func TestFiniteLocklessRetriesTransientFailures(t *testing.T) {
 // way the real one does for a pass that repaired or deferred a range: those
 // chunks are never fed back, so they never advance the count.
 type partialProgressChunker struct {
-	*testChunker
+	*table.MockChunker
 	verified, total uint64
 }
 
@@ -1930,7 +1859,7 @@ func (c *partialProgressChunker) Progress() (uint64, uint64, uint64) {
 // repaired or deferred and so never fed back. Reporting the feedback count
 // after one would leave a finished checksum reading as permanently incomplete.
 func TestFiniteLocklessReportsFullProgressAfterCleanPass(t *testing.T) {
-	chunker := &partialProgressChunker{testChunker: newTestChunker(0), verified: 3, total: 10}
+	chunker := &partialProgressChunker{MockChunker: newTestChunker(0), verified: 3, total: 10}
 	cfg := NewCheckerDefaultConfig()
 	cfg.Lockless = true
 	cfg.noRepair = true
@@ -2097,7 +2026,7 @@ func TestRetryGateNeedsEveryFeedToFlush(t *testing.T) {
 // stops for good once the range splits: the children still verify at once.
 func TestSplitChildrenAreNotGatedOnAFlush(t *testing.T) {
 	chunker := newTestChunker(1)
-	parent := chunker.chunks[0]
+	parent := chunker.Chunks()[0]
 	children := []*table.Chunk{newTestChunk(0, 500), newTestChunk(500, 501), newTestChunk(501, 1000)}
 	cfg := fastConfig()
 	cfg.RetryDelay = time.Millisecond
@@ -2152,7 +2081,7 @@ func TestSplitChildrenAreNotGatedOnAFlush(t *testing.T) {
 // splits — the feed never flushes again — and the children must still be read.
 func TestSplitChildrenGoAheadOfGatedRetries(t *testing.T) {
 	chunker := newTestChunker(2)
-	hot, lagging := chunker.chunks[0], chunker.chunks[1]
+	hot, lagging := chunker.Chunks()[0], chunker.Chunks()[1]
 	children := []*table.Chunk{newTestChunk(0, 500), newTestChunk(500, 501), newTestChunk(501, 1000)}
 	cfg := fastConfig()
 	cfg.RetryDelay = time.Millisecond
