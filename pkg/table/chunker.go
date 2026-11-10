@@ -119,6 +119,21 @@ type MappedChunker interface {
 	KeyNotYetDispatched(key0 any) bool
 }
 
+// CopyCompleter is implemented by chunkers that a resume can mark as having
+// copied their whole key space without running the copy, because its
+// checkpoint proves an earlier run finished it (see pkg/move's copyComplete).
+// The in-tree chunkers implement it.
+type CopyCompleter interface {
+	// MarkCopyComplete marks an open chunker's key space as dispatched and
+	// committed: IsRead reports true and Next returns ErrTableIsRead. Nothing
+	// is above the high watermark or not yet dispatched, so the change stream
+	// discards and defers no key, and NoteBufferedKey records none. The
+	// watermark the chunker was opened at is kept, so GetLowWatermark returns
+	// it unchanged. It fails on a chunker that is not open or has chunks in
+	// flight.
+	MarkCopyComplete() error
+}
+
 // BufferedKeyNoter is an optional capability of a MappedChunker. The change
 // stream type-asserts for it once, when it creates a subscription.
 //

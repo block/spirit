@@ -156,7 +156,8 @@ type Runner struct {
 	// finished (see resumeFromCheckpoint). Run then skips the copy, the
 	// resume skips deleteRecopyRange, and DumpCheckpoint keeps writing the
 	// resumed checksum watermark until the checksum phase writes its own.
-	// Progress reads it while setup may still change it, so it is atomic.
+	// The checkpoint loop reads it while setup may still change it, so it is
+	// atomic.
 	copyComplete atomic.Bool
 
 	// lastCheckpoint is when the checkpoint was last persisted and the
@@ -628,6 +629,21 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// reads the same copier watermark back and keeps writing checkpoints.
 	if err := r.copyChunker.OpenAtWatermark(copierWatermark); err != nil {
 		return err
+	}
+	// A resume after the copy marks the reopened chunkers complete before the
+	// feeds start below. Left open at the watermark, they treat every key at
+	// or above it as not yet copied: the feeds' first change to such a key
+	// logs that the above-high-watermark discard is suppressed, although this
+	// run never turns the optimization on, and Progress reports the tables as
+	// not copied. Marking them complete keeps the watermark unchanged.
+	if r.copyComplete.Load() {
+		completer, ok := r.copyChunker.(table.CopyCompleter)
+		if !ok {
+			return fmt.Errorf("copy chunker %T cannot mark its copy complete", r.copyChunker)
+		}
+		if err := completer.MarkCopyComplete(); err != nil {
+			return err
+		}
 	}
 
 	// Open each source's change feed at its checkpointed position.
@@ -2259,16 +2275,7 @@ func (r *Runner) copyTables() []status.TableProgress {
 	r.chunkerMu.RLock()
 	copyChunker := r.copyChunker
 	r.chunkerMu.RUnlock()
-	tables := status.TablesFromChunker(copyChunker)
-	// A resume that skipped the copy reopens the copy chunker at its
-	// watermark and never reads it to the end, so the chunker does not
-	// report the tables as read. The checkpoint proved the copy finished.
-	if r.copyComplete.Load() {
-		for i := range tables {
-			tables[i].IsComplete = true
-		}
-	}
-	return tables
+	return status.TablesFromChunker(copyChunker)
 }
 
 // checksumResumeWatermark is the checksum watermark the initial checksum
