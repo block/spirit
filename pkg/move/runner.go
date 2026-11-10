@@ -153,8 +153,9 @@ type Runner struct {
 	checker           checksum.Checker
 	checksumWatermark string
 	// copyComplete is set on a resume whose checkpoint proves the copy
-	// finished (see resumeFromCheckpoint). Run then skips the copy, and the
-	// resume skips deleteRecopyRange.
+	// finished (see resumeFromCheckpoint). Run then skips the copy, the
+	// resume skips deleteRecopyRange, and DumpCheckpoint keeps writing the
+	// resumed checksum watermark until the checksum phase writes its own.
 	copyComplete bool
 
 	// lastCheckpoint is when the checkpoint was last persisted and the
@@ -561,11 +562,14 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 	// nothing left to do: the resume goes straight to the post-copy phase,
 	// whose initial checksum still verifies and repairs.
 	//
-	// The checkpoint is empty of a checksum watermark at other points after
-	// the copy too (restoreSecondaryIndexes, ANALYZE TABLE, the start of the
-	// checksum and the sentinel wait), and a resume there still deletes and
-	// recopies. A checkpoint field that marks the copy complete would cover
-	// those, at the cost of changing the checkpoint format.
+	// A run that never resumed writes no checksum watermark before the
+	// checksum phase (restoreSecondaryIndexes, ANALYZE TABLE) or during the
+	// sentinel wait, and a resume from there still deletes and recopies. A
+	// checkpoint field that marks the copy complete would cover those, at the
+	// cost of changing the checkpoint format. A resume that skipped the copy
+	// carries its checksum watermark through those steps instead (see
+	// DumpCheckpoint), so stopping it again before its checksum starts keeps
+	// the skip.
 	r.copyComplete = r.checksumWatermark != ""
 
 	// Build each source's change source in the coordinate scheme its
@@ -740,6 +744,7 @@ func (r *Runner) setupUnderLocks(ctx context.Context) error {
 			// leak stale checkpoint state into newCopy.
 			r.checksumWatermark = ""
 			r.copyRowsAtResume = 0
+			r.copyComplete = false
 		case resumeFreshOwned:
 			r.logger.Warn("target holds an empty checkpoint table: a prior move attempt stopped before writing its first checkpoint; wiping target tables and starting fresh")
 		case resumeNone:
@@ -2341,13 +2346,23 @@ func (r *Runner) DumpCheckpoint(ctx context.Context) error {
 	// background checker starts, including the gap between invalidating the
 	// watermark and RunContinuous marking the checker continuous, so a restart
 	// during the sentinel wait rechecks the whole range.
+	//
+	// A resume that skipped the copy writes back the checksum watermark it
+	// resumed from until its checksum phase starts. That watermark is still
+	// evidence: the chunks below it were verified, the optimization stays off,
+	// and the position written with it is the feeds' current one, so every
+	// change since is replayed. Without it, stopping again during the index
+	// restore or ANALYZE TABLE would fall back to the delete and recopy.
 	var checksumWatermark string
-	if state := r.status.Get(); state >= status.Checksum && state < status.WaitingOnSentinelTable && r.checker != nil {
+	switch state := r.status.Get(); {
+	case state >= status.Checksum && state < status.WaitingOnSentinelTable && r.checker != nil:
 		wm, wmErr := r.checker.ResumeWatermark()
 		if wmErr != nil {
 			return status.ErrWatermarkNotReady
 		}
 		checksumWatermark = wm
+	case state < status.Checksum && r.copyComplete:
+		checksumWatermark = r.checksumWatermark
 	}
 	// Debug, not Info: the status block's ckpt row reports it instead —
 	// see pkg/migration's DumpCheckpoint (#329).
@@ -2517,11 +2532,12 @@ func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) 
 		// own watermark. Those rows are NOT recopied (each source's chunker
 		// resumes from its own watermark), so this is only safe because the
 		// initial checksum (which repairs) then runs a FULL pass that
-		// detects and repairs the missing rows before cutover — enforced by
-		// resumeFromCheckpoint discarding any persisted checksum watermark
-		// when there is more than one source. Deleting too little would
-		// leave phantom rows, which is the race this function exists to
-		// prevent.
+		// detects and repairs the missing rows before cutover. That pass is
+		// full because this function runs only when the checkpoint has no
+		// checksum watermark: one with a checksum watermark sets
+		// copyComplete, and resumeFromCheckpoint skips this delete. Deleting
+		// too little would leave phantom rows, which is the race this
+		// function exists to prevent.
 		deletes = append(deletes, recopyDelete{
 			table:     src,
 			watermark: watermark,

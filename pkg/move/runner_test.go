@@ -1359,6 +1359,10 @@ func TestSingleSourceResumeKeepsChecksumWatermark(t *testing.T) {
 // deleting rows inside the range a recopy would have covered, which is what
 // deleteRecopyRange exists for: with the watermark optimization never turned
 // on, those deletes are applied rather than discarded.
+//
+// The checksum watermark sits above every changed key, so the initial
+// checksum verifies none of them and cannot repair a change the feed failed
+// to apply: the end state is the feed's work alone.
 func TestResumeAfterCopyAppliesChangesWithoutRecopy(t *testing.T) {
 	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
 	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
@@ -1378,11 +1382,11 @@ func TestResumeAfterCopyAppliesChangesWithoutRecopy(t *testing.T) {
 	}
 	checkpointAndStop(t, move)
 
-	// A checksum watermark at the first chunk: a move stopped early in its
+	// A checksum watermark above every key: a move stopped at the end of its
 	// initial checksum. With one (source, table) pair the checksum chunker is
 	// the optimistic chunker itself, so the watermark is raw chunk JSON.
 	res, err := tgtDB.ExecContext(t.Context(),
-		"UPDATE _spirit_move_checkpoint SET checksum_watermark = ?", watermarkChunkJSON(1, 51))
+		"UPDATE _spirit_move_checkpoint SET checksum_watermark = ?", watermarkChunkJSON(3101, 3151))
 	require.NoError(t, err)
 	rowsAffected, err := res.RowsAffected()
 	require.NoError(t, err)
@@ -1424,6 +1428,46 @@ func TestResumeAfterCopyAppliesChangesWithoutRecopy(t *testing.T) {
 	require.Equal(t, 1200-50-50+50, srcCount)
 	require.Equal(t, srcCount, tgtCount, "the target must have exactly the source's rows")
 	require.Equal(t, srcSum, tgtSum, "the target rows must match the source's")
+}
+
+// TestResumeAfterCopyKeepsChecksumWatermark: a move that resumed after its
+// copy writes the checksum watermark it resumed from back into every
+// checkpoint until its own checksum starts, so being stopped again during
+// the index restore or ANALYZE TABLE still skips the delete and recopy.
+func TestResumeAfterCopyKeepsChecksumWatermark(t *testing.T) {
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
+
+	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(255) NOT NULL
+	)`)
+	seedUsersRange(t, srcName, 1, 2399)
+
+	move := &Move{
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(tgtName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+	}
+	checkpointAndStop(t, move)
+	checksumWM := watermarkChunkJSON(1001, 1051)
+	_, err := tgtDB.ExecContext(t.Context(),
+		"UPDATE _spirit_move_checkpoint SET checksum_watermark = ?", checksumWM)
+	require.NoError(t, err)
+
+	r, ctx := buildTestRunner(t, move)
+	defer closeTestRunner(t, r)
+	require.NoError(t, r.setupDiscovery(ctx))
+	require.NoError(t, r.setupUnderLocks(ctx))
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint")
+	require.True(t, r.copyComplete, "a checksum watermark must mark the copy complete")
+	require.Less(t, r.status.Get(), status.Checksum, "the checkpoint must be dumped before the checksum phase")
+	require.NoError(t, r.DumpCheckpoint(ctx))
+
+	var written string
+	require.NoError(t, tgtDB.QueryRowContext(t.Context(),
+		"SELECT checksum_watermark FROM _spirit_move_checkpoint").Scan(&written))
+	require.Equal(t, checksumWM, written, "the resumed checksum watermark must be written back before the checksum phase")
 }
 
 // TestDeleteRecopyRangeFormats exercises deleteRecopyRange directly
