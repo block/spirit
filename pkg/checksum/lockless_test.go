@@ -70,6 +70,12 @@ func (c *testChunker) IsRead() bool {
 	defer c.mu.Unlock()
 	return c.cursor >= len(c.chunks)
 }
+func (c *testChunker) MarkRead() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cursor = len(c.chunks)
+	return nil
+}
 func (c *testChunker) Next() (*table.Chunk, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
