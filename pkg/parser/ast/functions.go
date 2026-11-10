@@ -487,6 +487,9 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 		}
 		return true, nil
 	}
+	if n.FnName.L == CharFunc {
+		return true, n.restoreChar(ctx)
+	}
 	if n.FnName.L == JSONMemberOf {
 		if len(n.Args) == 2 {
 			if err := restoreExprWithBinaryOpParent(ctx, n.Args[0], restoreOpMemberOf, binaryOpLeftSide); err != nil {
@@ -503,6 +506,33 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 		return true, (fmt.Errorf("incorrect parameter count in the call to native function 'json_memberof'"))
 	}
 	return false, nil
+}
+
+// restoreChar writes CHAR(N, ... [USING charset_name]). The parser names the
+// function char_func, which MySQL rejects, and appends the charset as a last
+// argument: a NULL value when there is no USING clause.
+func (n *FuncCallExpr) restoreChar(ctx *format.RestoreCtx) error {
+	last := len(n.Args) - 1
+	charset, ok := n.Args[last].(*ValueExpr)
+	if !ok {
+		return fmt.Errorf("an error occurred while restore FuncCallExpr.(CHAR): charset is %T", n.Args[last])
+	}
+	ctx.WriteKeyWord("CHAR")
+	ctx.WritePlain("(")
+	for i, arg := range n.Args[:last] {
+		if i != 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := arg.Restore(ctx); err != nil {
+			return fmt.Errorf("an error occurred while restore FuncCallExpr.(CHAR).Args[%d]: %w", i, err)
+		}
+	}
+	if charset.GetValue() != nil {
+		ctx.WriteKeyWord(" USING ")
+		ctx.WriteKeyWord(charset.GetString())
+	}
+	ctx.WritePlain(")")
+	return nil
 }
 
 // Accept implements Node interface.
