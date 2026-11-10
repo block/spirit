@@ -198,6 +198,18 @@ func (m *MockChunker) IsRead() bool {
 	return m.isRead()
 }
 
+// MarkRead satisfies Chunker: an open mock reports itself read. Unlike
+// MarkAsComplete it refuses a mock that is not open, like the real chunkers.
+func (m *MockChunker) MarkRead() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.isOpen {
+		return ErrChunkerNotOpen
+	}
+	m.isComplete = true
+	return nil
+}
+
 func (m *MockChunker) isRead() bool {
 	return m.isComplete || m.currentPosition >= m.totalRows
 }

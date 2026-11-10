@@ -765,6 +765,20 @@ func (t *chunkerOptimistic) IsRead() bool {
 	return t.finalChunkSent
 }
 
+// MarkRead satisfies Chunker. See the interface docs.
+func (t *chunkerOptimistic) MarkRead() error {
+	t.Lock()
+	defer t.Unlock()
+	if !t.isOpen {
+		return ErrChunkerNotOpen
+	}
+	if t.inflightChunks > 0 {
+		return fmt.Errorf("cannot mark %s read: %d chunks are in flight", t.Ti.QuotedTableName, t.inflightChunks)
+	}
+	t.finalChunkSent = true
+	return nil
+}
+
 // Progress returns the current progress of the chunker as (rowsCopied, totalRows)
 // It is up to the chunker implementation to select the formula. The optimistic
 // chunker is based on the progress of the auto_increment column.

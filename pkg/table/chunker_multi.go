@@ -75,6 +75,21 @@ func (m *multiChunker) IsRead() bool {
 	return true
 }
 
+// MarkRead marks every wrapped chunker read. See the Chunker interface.
+func (m *multiChunker) MarkRead() error {
+	m.Lock()
+	defer m.Unlock()
+	if !m.isOpen {
+		return ErrChunkerNotOpen
+	}
+	for tableName, chunker := range m.chunkers {
+		if err := chunker.MarkRead(); err != nil {
+			return fmt.Errorf("could not mark table %q read: %w", tableName, err)
+		}
+	}
+	return nil
+}
+
 // Close closes all wrapped chunkers
 func (m *multiChunker) Close() error {
 	m.Lock()
