@@ -4,9 +4,11 @@
 package host
 
 import (
+	"context"
 	"slices"
 
 	"github.com/block/mysql"
+	"golang.org/x/sync/errgroup"
 )
 
 // Host identifies an endpoint independently of schema and credentials. Ports
@@ -45,6 +47,20 @@ func GroupConfigs(configs []*mysql.Config) []Group {
 		groups[pos].Indices = append(groups[pos].Indices, i)
 	}
 	return groups
+}
+
+// Each calls fn once for every group, all the groups at the same time. A
+// caller that works through a group's Indices one after another therefore
+// runs at most one statement at a time per server, however many schemas share
+// it: the servers set the pace, and no server takes more than one. The first
+// error cancels the context the other calls receive, and Each returns it once
+// every call has returned.
+func Each(ctx context.Context, groups []Group, fn func(ctx context.Context, group Group) error) error {
+	g, gctx := errgroup.WithContext(ctx)
+	for _, group := range groups {
+		g.Go(func() error { return fn(gctx, group) })
+	}
+	return g.Wait()
 }
 
 // Disjoint reports whether no endpoint appears in both a and b. Like

@@ -1,7 +1,11 @@
 package host
 
 import (
+	"context"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/block/mysql"
 	"github.com/stretchr/testify/require"
@@ -40,4 +44,53 @@ func TestDisjoint(t *testing.T) {
 	// An unknown endpoint could be any server.
 	require.False(t, Disjoint([]*mysql.Config{nil}, targets))
 	require.False(t, Disjoint(sources, []*mysql.Config{nil}))
+}
+
+// TestEachRunsGroupsConcurrently: every group's call is running at once. Each
+// call waits for all of them to start, so calls run one at a time would never
+// get past the barrier.
+func TestEachRunsGroupsConcurrently(t *testing.T) {
+	groups := GroupConfigs([]*mysql.Config{{Addr: "a:3306"}, {Addr: "b:3306"}, {Addr: "a:3306"}, {Addr: "c:3306"}})
+	require.Len(t, groups, 3)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var started sync.WaitGroup
+	started.Add(len(groups))
+	var mu sync.Mutex
+	var seen []Group
+	require.NoError(t, Each(ctx, groups, func(ctx context.Context, group Group) error {
+		started.Done()
+		waited := make(chan struct{})
+		go func() { started.Wait(); close(waited) }()
+		select {
+		case <-waited:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, group)
+		return nil
+	}))
+	require.ElementsMatch(t, groups, seen)
+}
+
+// TestEachReturnsFirstErrorAndCancelsOthers: one call's error cancels the
+// context the other calls receive, and Each returns that error after they
+// return.
+func TestEachReturnsFirstErrorAndCancelsOthers(t *testing.T) {
+	groups := GroupConfigs([]*mysql.Config{{Addr: "a:3306"}, {Addr: "b:3306"}})
+	errBoom := errors.New("boom")
+	err := Each(t.Context(), groups, func(ctx context.Context, group Group) error {
+		if group.Host.Address == "a:3306" {
+			return errBoom
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+			return errors.New("not canceled")
+		}
+	})
+	require.ErrorIs(t, err, errBoom)
 }

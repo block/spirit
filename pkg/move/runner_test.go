@@ -1607,6 +1607,85 @@ func TestDeleteRecopyRangeDeletesFromServersConcurrently(t *testing.T) {
 	require.Equal(t, 2, count, "only rows below the resume position (ids 1..2) may remain")
 }
 
+// TestAnalyzeTargetTablesAnalyzesServersConcurrently: ANALYZE TABLE runs on
+// every target server at the same time, so the phase does not scale with the
+// shard count. Target 0's table is locked, which blocks its ANALYZE; target 1,
+// on another server, must still be analyzed while it waits. Both targets live
+// on the test MySQL, so their configs name two servers. STATS_AUTO_RECALC=0
+// keeps the index cardinality at its value from CREATE TABLE until ANALYZE
+// recomputes it, which is how the test sees that ANALYZE ran.
+func TestAnalyzeTargetTablesAnalyzesServersConcurrently(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	const createTable = "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, val VARCHAR(64)) STATS_PERSISTENT=1 STATS_AUTO_RECALC=0"
+	var targets []applier.Target
+	for i, server := range []string{"server-a:3306", "server-b:3306"} {
+		dbName, _ := testutils.CreateUniqueTestDatabase(t)
+		testutils.RunSQLInDatabase(t, dbName, createTable)
+		testutils.RunSQLInDatabase(t, dbName, "INSERT INTO t1 (val) WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 100) SELECT 'a' FROM seq")
+		conn, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(conn)
+		cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(dbName))
+		require.NoError(t, err)
+		cfg.Addr = server
+		targets = append(targets, applier.Target{KeyRange: strconv.Itoa(i), DB: conn, Config: cfg})
+	}
+
+	r, err := NewRunner(&Move{})
+	require.NoError(t, err)
+	r.sourceTables = []*table.TableInfo{{TableName: "t1"}}
+	r.targets = targets
+	require.Len(t, r.targetHosts(), 2)
+
+	// cardinality reads the PRIMARY index's cardinality from the server's
+	// statistics, not from the information_schema cache.
+	cardinality := func(db *sql.DB) (int64, error) {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return 0, err
+		}
+		defer utils.CloseAndLog(conn)
+		if _, err := conn.ExecContext(ctx, "SET SESSION information_schema_stats_expiry = 0"); err != nil {
+			return 0, err
+		}
+		var n sql.NullInt64
+		err = conn.QueryRowContext(ctx, "SELECT CARDINALITY FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 't1' AND index_name = 'PRIMARY'").Scan(&n)
+		return n.Int64, err
+	}
+	for i := range targets {
+		n, err := cardinality(targets[i].DB)
+		require.NoError(t, err)
+		require.NotEqual(t, int64(100), n, "target %d must not be analyzed before analyzeTargetTables runs", i)
+	}
+
+	holder, err := targets[0].DB.Conn(ctx)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(holder)
+	_, err = holder.ExecContext(ctx, "LOCK TABLES t1 WRITE")
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- r.analyzeTargetTables(ctx) }()
+
+	require.Eventually(t, func() bool {
+		n, err := cardinality(targets[1].DB)
+		return err == nil && n == 100
+	}, 10*time.Second, 10*time.Millisecond, "target 1 must be analyzed while target 0's ANALYZE waits for its lock")
+	select {
+	case err := <-done:
+		t.Fatalf("analyzeTargetTables returned while target 0 was locked: %v", err)
+	default:
+	}
+
+	_, err = holder.ExecContext(ctx, "UNLOCK TABLES")
+	require.NoError(t, err)
+	require.NoError(t, <-done)
+	n, err := cardinality(targets[0].DB)
+	require.NoError(t, err)
+	require.Equal(t, int64(100), n, "target 0 must be analyzed once its lock is released")
+}
+
 func varcharPKWriteOne(ctx context.Context, db *sql.DB, srcDB string) error {
 	id := uuid.New().String()
 

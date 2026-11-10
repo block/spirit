@@ -1955,19 +1955,45 @@ func (r *Runner) restoreSecondaryIndexes(ctx context.Context) error {
 		"hostCount", len(hostGroups),
 		"targetCount", len(r.targets))
 
-	// Process each host group in parallel using errgroup
-	g, gctx := errgroup.WithContext(ctx)
-	for _, group := range hostGroups {
-		g.Go(func() error {
-			return r.restoreIndexesForTargets(gctx, group.Host.String(), group.Indices)
-		})
-	}
-
-	// Wait for all host groups to complete
-	if err := g.Wait(); err != nil {
+	if err := host.Each(ctx, hostGroups, func(ctx context.Context, group host.Group) error {
+		return r.restoreIndexesForTargets(ctx, group.Host.String(), group.Indices)
+	}); err != nil {
 		return err
 	}
 	r.logger.Info("Completed restoring all secondary indexes")
+	return nil
+}
+
+// analyzeTargetTables runs ANALYZE TABLE on every moved table of every target.
+// The target servers are analyzed at the same time, and the targets that
+// share a server one after another, like restoreSecondaryIndexes: a move with
+// many shards issues one statement per table per shard, so running them all
+// in one sequence made this phase scale with the shard count rather than with
+// the shards on one server.
+func (r *Runner) analyzeTargetTables(ctx context.Context) error {
+	hosts := r.targetHosts()
+	r.logger.Info("Running ANALYZE TABLE",
+		"tables", len(r.sourceTables),
+		"targets", len(r.targets),
+		"hosts", len(hosts),
+	)
+	started := time.Now()
+	if err := host.Each(ctx, hosts, func(ctx context.Context, group host.Group) error {
+		for _, i := range group.Indices {
+			for _, tbl := range r.sourceTables {
+				// Unqualified on the target's DB: the source schema does not
+				// exist on a cross-cluster target (and breaks through a
+				// vtgate). See dbconn.AnalyzeTable.
+				if err := dbconn.AnalyzeTable(ctx, r.targets[i].DB, r.logger, "", tbl.TableName); err != nil {
+					return fmt.Errorf("failed to analyze table %s on target %d: %w", tbl.TableName, i, err)
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	r.logger.Info("Completed ANALYZE TABLE on every target", "duration", time.Since(started))
 	return nil
 }
 
@@ -2077,18 +2103,7 @@ func (r *Runner) postCopyPhase(ctx context.Context) error {
 	// is at elevated risk because the batch loading can cause statistics
 	// to be out of date.
 	if err := r.status.DoContext(ctx, status.AnalyzeTable, func() error {
-		r.logger.Info("Running ANALYZE TABLE")
-		for _, target := range r.targets {
-			for _, tbl := range r.sourceTables {
-				// Unqualified on target.DB: the old code qualified with the source
-				// schema, which doesn't exist on a cross-cluster target (and breaks
-				// through a vtgate). See dbconn.AnalyzeTable.
-				if err := dbconn.AnalyzeTable(ctx, target.DB, r.logger, "", tbl.TableName); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
+		return r.analyzeTargetTables(ctx)
 	}); err != nil {
 		return err
 	}
@@ -2519,30 +2534,26 @@ func (r *Runner) deleteRecopyRange(ctx context.Context, copierWatermark string) 
 		"hosts", len(hosts),
 	)
 	started := time.Now()
-	g, gctx := errgroup.WithContext(ctx)
-	for _, group := range hosts {
-		g.Go(func() error {
-			for _, i := range group.Indices {
-				for _, d := range deletes {
-					result, err := r.targets[i].DB.ExecContext(gctx, d.stmt)
-					if err != nil {
-						return fmt.Errorf("failed to delete the recopy range on target %d table %s: %w", i, d.table.TableName, err)
-					}
-					rowsDeleted, _ := result.RowsAffected()
-					if rowsDeleted > 0 {
-						r.logger.Info("deleted rows at/above the copier resume position from target",
-							"target", i,
-							"table", d.table.TableName,
-							"rowsDeleted", rowsDeleted,
-							"watermark", d.watermark,
-						)
-					}
+	if err := host.Each(ctx, hosts, func(ctx context.Context, group host.Group) error {
+		for _, i := range group.Indices {
+			for _, d := range deletes {
+				result, err := r.targets[i].DB.ExecContext(ctx, d.stmt)
+				if err != nil {
+					return fmt.Errorf("failed to delete the recopy range on target %d table %s: %w", i, d.table.TableName, err)
+				}
+				rowsDeleted, _ := result.RowsAffected()
+				if rowsDeleted > 0 {
+					r.logger.Info("deleted rows at/above the copier resume position from target",
+						"target", i,
+						"table", d.table.TableName,
+						"rowsDeleted", rowsDeleted,
+						"watermark", d.watermark,
+					)
 				}
 			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	r.logger.Info("deleted rows at/above the copier resume position from every target",
