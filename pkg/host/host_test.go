@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,16 +82,21 @@ func TestEachRunsGroupsConcurrently(t *testing.T) {
 func TestEachReturnsFirstErrorAndCancelsOthers(t *testing.T) {
 	groups := GroupConfigs([]*mysql.Config{{Addr: "a:3306"}, {Addr: "b:3306"}})
 	errBoom := errors.New("boom")
+	// Each returns only the first error, so the other call records whether
+	// it saw the cancellation rather than reporting it through its error.
+	var canceled atomic.Bool
 	err := Each(t.Context(), groups, func(ctx context.Context, group Group) error {
 		if group.Host.Address == "a:3306" {
 			return errBoom
 		}
 		select {
 		case <-ctx.Done():
+			canceled.Store(true)
 			return ctx.Err()
 		case <-time.After(10 * time.Second):
-			return errors.New("not canceled")
+			return nil
 		}
 	})
 	require.ErrorIs(t, err, errBoom)
+	require.True(t, canceled.Load(), "the first error must cancel the context of the other calls")
 }
