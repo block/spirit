@@ -869,9 +869,20 @@ the shared `checksum.MockChecker`, whose throttler setter is a no-op and whose
 mismatch count can be changed safely while a runner is active.
 
 The optional `StatusReporter` capability exposes a structured `ChecksumStatus`.
-`StatusSummary` and `StatusRow` format it, falling back to basic progress and pacing
+`Report`, `StatusSummary` and `StatusRow` format it, falling back to basic progress and pacing
 for checkers without that capability. Runners need no concrete checker assertions.
-Optimistic status distinguishes scan completion from verification completion.
+Optimistic status distinguishes scan completion from verification completion, and
+its line starts with `checksum:` (the phase, not the algorithm), e.g.
+`checksum: scanning scan≈25.0% eta=1m30s passed=40 retrying=0 in-flight=8 deferred=0 settled=0`.
+
+`LocklessChecker` reports an ETA for its current pass in `ChecksumStatus.ETA`, built the
+same way as the copier's: `status.Rate` averages the chunker's `Progress` over a
+2-minute window of `status.RateSampleInterval` samples, and `status.EstimateETA` divides
+what is left of the walk by it. It is in the chunker's unit, so on an auto-increment key
+it is paced on key-space distance and a table statistics refresh does not move it. It is
+`TBD` for the first minute of a run. It covers one pass: a pass that ends with chunks
+still retrying or repaired is followed by another, so the checksum can run past `DUE`.
+`SingleChecker` reports no ETA.
 
 ## Checksum Algorithm
 

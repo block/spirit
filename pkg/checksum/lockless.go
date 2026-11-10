@@ -288,6 +288,12 @@ type LocklessChecker struct {
 	elapsed  time.Duration
 	finished bool
 
+	// rate is the verification rate the ETA is paced on, sampled from the
+	// chunker's Progress by sampleRateLoop while a run is active. It is kept
+	// across runs, so a continuous run after the initial checksum starts with
+	// the rate that one measured.
+	rate status.Rate
+
 	firstCleanPassOnce sync.Once
 	firstCleanPassCh   chan struct{}
 
@@ -667,6 +673,11 @@ func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
 		c.statsMu.Unlock()
 	}()
 
+	sampleCtx, stopSampling := context.WithCancel(ctx)
+	var sampler sync.WaitGroup
+	sampler.Go(func() { c.sampleRateLoop(sampleCtx) })
+	defer func() { stopSampling(); sampler.Wait() }()
+
 	if c.ownsFeedFlush {
 		for _, feed := range c.feeds {
 			feed.StartPeriodicFlush(ctx, change.DefaultFlushInterval)
@@ -701,6 +712,32 @@ func (c *LocklessChecker) run(ctx context.Context, untilClean bool) error {
 		}
 	}
 	return err
+}
+
+// sampleRateLoop feeds the rate with how far the chunker advanced in each
+// status.RateSampleInterval, the same sampling the copier does for its ETA.
+// The chunker advances only on feedback for a chunk that resolved clean, so
+// this is the verification rate. Each pass resets the chunker, so a reading
+// below the previous one is a new pass, and it contributes only what that
+// pass has verified so far.
+func (c *LocklessChecker) sampleRateLoop(ctx context.Context) {
+	prev, _, _ := c.chunker.Progress()
+	ticker := time.NewTicker(status.RateSampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cur, _, _ := c.chunker.Progress()
+			if cur >= prev {
+				c.rate.Observe(cur - prev)
+			} else {
+				c.rate.Observe(cur)
+			}
+			prev = cur
+		}
+	}
 }
 
 // passInterval is how long the pass loop waits between passes. Each mode has
@@ -1944,13 +1981,28 @@ func (c *LocklessChecker) GetProgress() status.ChecksumProgress {
 // progress. Before that was so, this reported 0 until the first clean pass and
 // then jumped to the whole table, which read as a stalled checksum for the
 // entire run.
+//
+// The ETA is the current pass's: the rest of its walk at the rate sampled by
+// sampleRateLoop. Like the copier's, it is in the chunker's unit, which for an
+// auto-increment key is key-space distance, so a table statistics refresh does
+// not move it.
 func (c *LocklessChecker) ChecksumStatus() ChecksumStatus {
 	stats := c.Stats()
-	verified, _, total := c.chunker.Progress()
+	walked, _, total := c.chunker.Progress()
+	verified := walked
 	if !stats.FirstCleanPassAt.IsZero() {
 		// A completed clean pass verified everything, including the ranges that
 		// were repaired or deferred and so never fed back.
 		verified = total
 	}
-	return ChecksumStatus{Progress: status.ChecksumProgress{RowsChecked: verified, RowsTotal: total}, Optimistic: &stats}
+	var pct float64
+	if total > 0 {
+		pct = float64(walked) / float64(total) * 100
+	}
+	eta := status.EstimateETA(walked, total, pct, c.rate.RowsPerSecond(), c.StartTime())
+	return ChecksumStatus{
+		Progress:   status.ChecksumProgress{RowsChecked: verified, RowsTotal: total},
+		ETA:        eta,
+		Optimistic: &stats,
+	}
 }

@@ -205,16 +205,17 @@ func (s *Snapshot) Progress() status.Progress {
 	case status.WaitingOnSentinelTable:
 		summary = "Waiting on Sentinel Table"
 		if s.continuousChecksum() {
-			checker := s.Source.Checker()
-			checksumProgress = checker.GetProgress()
-			summary += "; " + checksum.StatusSummary(checker)
+			// The pass ETA stays out of the ETA field here: the continuous
+			// checksum re-walks until the sentinel is dropped, so its pass
+			// does not end the wait. Summary still carries it.
+			var checksumSummary string
+			checksumProgress, _, checksumSummary = checksum.Report(s.Source.Checker())
+			summary += "; " + checksumSummary
 		}
 	case status.ApplyChangeset, status.PostChecksum:
 		summary = fmt.Sprintf("Applying Changeset Deltas=%v", s.deltaLen())
 	case status.Checksum:
-		checker := s.Source.Checker()
-		checksumProgress = checker.GetProgress()
-		summary = checksum.StatusSummary(checker)
+		checksumProgress, eta, summary = checksum.Report(s.Source.Checker())
 	}
 	return status.Progress{
 		CurrentState: s.State,
