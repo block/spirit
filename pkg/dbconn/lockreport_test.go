@@ -122,7 +122,12 @@ func TestExecUnderLockReportsSlowStatement(t *testing.T) {
 // zero threshold disables the reports.
 func TestSlowStatementReportKeepsTheLockSessionFirst(t *testing.T) {
 	threshold, limit := slowLockedStatementThreshold, metadataLockReportLimit
-	slowLockedStatementThreshold = 100 * time.Millisecond
+	// One report per statement: it fires at 500ms, and the statements below
+	// return at 900ms, before the next one is due at 1s. The 400ms between
+	// gives the report time to read every metadata lock on a busy shared
+	// server; a report still reading when the statement returns logs nothing
+	// (#1503).
+	slowLockedStatementThreshold = 500 * time.Millisecond
 	// The report reads every metadata lock on the server, and other packages'
 	// tests share it, so the default limit can truncate the first report
 	// (#1483). The truncated case below sets its own limit.
@@ -175,7 +180,7 @@ func TestSlowStatementReportKeepsTheLockSessionFirst(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 
 	logs.Reset()
-	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.15)"))
+	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.9)"))
 	_, records := completeReports(t, logs)
 	require.Equal(t, slowStatementReport, records[0]["msg"])
 	require.Equal(t, false, records[0]["truncated"])
@@ -193,7 +198,7 @@ func TestSlowStatementReportKeepsTheLockSessionFirst(t *testing.T) {
 	// Truncated to the limit.
 	metadataLockReportLimit = ownRows + 2
 	logs.Reset()
-	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.15)"))
+	require.NoError(t, lock.ExecUnderLock(ctx, "DO SLEEP(0.9)"))
 	_, records = completeReports(t, logs)
 	require.Equal(t, slowStatementReport, records[0]["msg"])
 	require.Equal(t, true, records[0]["truncated"])
@@ -252,10 +257,12 @@ func completeReports(t *testing.T, logs *lockedBuffer) (string, []map[string]any
 	return out, logRecords(t, out)
 }
 
-// reportsComplete reports whether every report header in out is followed by
-// as many lock records as it counts.
+// reportsComplete reports whether out holds at least one report and every
+// report header in it is followed by as many lock records as it counts. Output
+// with no report is not complete: the caller expects one, and parsing nothing
+// would leave it indexing an empty slice (#1503).
 func reportsComplete(out string) bool {
-	want := 0
+	want, headers := 0, 0
 	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
@@ -271,11 +278,12 @@ func reportsComplete(out string) bool {
 				return false
 			}
 			want = int(n)
+			headers++
 		case "metadata lock":
 			want--
 		}
 	}
-	return want == 0
+	return headers > 0 && want == 0
 }
 
 // logRecords parses the JSON log lines in out.
