@@ -143,8 +143,7 @@ func TestLocklessHotSnapshotGate(t *testing.T) {
 		t.Run(fmt.Sprint(converge), func(t *testing.T) {
 			db, chunk := snapshotTestTables(t, "id INT PRIMARY KEY, value INT", []string{"id"})
 			snapshotExec(t, db, "INSERT INTO src VALUES (1,10)")
-			chunker := newTestChunker(1)
-			chunker.chunks[0] = chunk
+			chunker := table.NewMockChunkerFromChunks(chunk)
 			cfg := fastConfig()
 			cfg.RetryDelay = time.Millisecond
 			cfg.MaxHotAttempts = 4

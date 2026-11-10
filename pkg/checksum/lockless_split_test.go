@@ -113,7 +113,7 @@ func TestLocklessHotSplit(t *testing.T) {
 	for _, hotLeaf := range []bool{false, true} {
 		t.Run(fmt.Sprint(hotLeaf), func(t *testing.T) {
 			chunker := newTestChunker(1)
-			parent := chunker.chunks[0]
+			parent := chunker.Chunks()[0]
 			children := []*table.Chunk{newTestChunk(0, 500), newTestChunk(500, 501), newTestChunk(501, 1000)}
 			cfg := fastConfig()
 			cfg.RetryDelay = time.Millisecond
@@ -149,10 +149,8 @@ func TestLocklessHotSplit(t *testing.T) {
 					t.Fatal("all children verified but parent unresolved")
 				}
 			}
-			chunker.mu.Lock()
-			require.Empty(t, chunker.feedback,
+			require.Empty(t, chunker.GetFeedbackCalls(),
 				"a split parent never resolves as itself, and its synthetic children were never handed out by the chunker")
-			chunker.mu.Unlock()
 		})
 	}
 }
@@ -161,7 +159,7 @@ func TestHotSplitDoesNotInheritSignatures(t *testing.T) {
 	cfg := fastConfig()
 	cfg.RetryDelay = time.Millisecond
 	chunker := newTestChunker(1)
-	parent := chunker.chunks[0]
+	parent := chunker.Chunks()[0]
 	children := []*table.Chunk{newTestChunk(0, 1), newTestChunk(1, 2), newTestChunk(2, 1000)}
 	c := newTestChecker(t, chunker, cfg, func(_ context.Context, ch *table.Chunk, n int) (int64, int64, uint64, error) {
 		if ch == parent {
@@ -224,7 +222,7 @@ func TestHotSplitReadback(t *testing.T) {
 			require.NoError(t, sourceTable.SetInfo(t.Context()))
 			require.NoError(t, targetTable.SetInfo(t.Context()))
 			parent := &table.Chunk{Key: []string{"id"}, Table: sourceTable, NewTable: targetTable, ColumnMapping: table.NewColumnMapping(sourceTable, targetTable, nil)}
-			chunker := &testChunker{chunks: []*table.Chunk{parent}}
+			chunker := table.NewMockChunkerFromChunks(parent)
 			cfg := fastConfig()
 			cfg.RetryDelay = time.Millisecond
 			applySharedDefaults(&cfg)
@@ -252,7 +250,7 @@ func TestHotSplitReadback(t *testing.T) {
 
 func TestHotSplitRecursesToSmallRanges(t *testing.T) {
 	root := newTestChunk(0, 1600)
-	chunker := &testChunker{chunks: []*table.Chunk{root}}
+	chunker := table.NewMockChunkerFromChunks(root)
 	cfg := fastConfig()
 	cfg.RetryDelay = time.Millisecond
 	cfg.minPassInterval = time.Hour

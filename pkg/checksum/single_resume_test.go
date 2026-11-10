@@ -68,7 +68,7 @@ func TestResumeFailedResetKeepsEvidenceInvalid(t *testing.T) {
 	resetErr := errors.New("reset failed")
 	require.ErrorIs(t, guard.restart(&differences, func() error { return resetErr }), resetErr)
 	require.Equal(t, uint64(1), differences.Load())
-	chunker := &resumeChunker{testChunker: newTestChunker(0), watermark: "repaired-prefix"}
+	chunker := &resumeChunker{MockChunker: newTestChunker(0), watermark: "repaired-prefix"}
 	wm, err := guard.capture(chunker, &differences)
 	require.NoError(t, err)
 	require.Empty(t, wm)
