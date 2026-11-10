@@ -1,7 +1,9 @@
 package runtime
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
@@ -116,3 +118,48 @@ func TestProgressCopyRows(t *testing.T) {
 	require.Equal(t, status.CopyProgress{RowsCopied: 50, RowsTotal: 100}, p.Copy)
 	require.Contains(t, p.Summary, "copyRows ETA")
 }
+
+// reportingChecker is a MockChecker that reports structured status, as the
+// lockless checker does.
+type reportingChecker struct {
+	*checksum.MockChecker
+	st checksum.ChecksumStatus
+}
+
+func (r reportingChecker) ChecksumStatus() checksum.ChecksumStatus { return r.st }
+
+// TestProgressChecksumReportsETA pins that the checksum's pass ETA reaches the
+// ETA field during the Checksum state, and that the summary names the phase.
+func TestProgressChecksumReportsETA(t *testing.T) {
+	snap, src := newSnapshot("move", status.Checksum)
+	eta := status.ETA{State: status.ETAReady, Duration: 42 * time.Second}
+	src.checker = reportingChecker{&checksum.MockChecker{}, checksum.ChecksumStatus{
+		Progress:   status.ChecksumProgress{RowsChecked: 25, RowsTotal: 100},
+		ETA:        eta,
+		Optimistic: &checksum.LocklessCheckerStats{ProgressBasisPoints: 2500},
+	}}
+	p := snap.Progress()
+	require.Equal(t, eta, p.ETA)
+	require.Equal(t, status.ChecksumProgress{RowsChecked: 25, RowsTotal: 100}, p.Checksum)
+	require.True(t, strings.HasPrefix(p.Summary, "checksum: scanning scan≈25.0% eta=42s "), p.Summary)
+
+	// A checker without structured status reports no ETA.
+	src.checker = &checksum.MockChecker{}
+	require.Equal(t, status.ETA{}, snap.Progress().ETA)
+
+	// The continuous checksum's pass does not end the sentinel wait, so its
+	// ETA stays in the summary only.
+	snap.State = status.WaitingOnSentinelTable
+	src.checker = continuousReportingChecker{reportingChecker{&checksum.MockChecker{}, checksum.ChecksumStatus{
+		ETA:        eta,
+		Optimistic: &checksum.LocklessCheckerStats{},
+	}}}
+	p = snap.Progress()
+	require.Equal(t, status.ETA{}, p.ETA)
+	require.Contains(t, p.Summary, "Waiting on Sentinel Table; checksum: ")
+	require.Contains(t, p.Summary, "eta=42s")
+}
+
+type continuousReportingChecker struct{ reportingChecker }
+
+func (continuousReportingChecker) ContinuousActive() bool { return true }

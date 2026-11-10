@@ -135,7 +135,7 @@ Migration and move follow the same phase rules. A `move` reports the combined lo
 
 ### Structured runner progress
 
-Migration, move and datasync use `TablesFromChunker` to return table progress in a stable order. Multi-source identifiers retain the source qualifier so equally named tables remain distinct. Copy ETA is populated during `CopyRows` and cleared afterwards; the `Copy` counts persist past it. Migration and move also expose the finite initial checksum counts; datasync’s continuous verifier has no corresponding finite phase.
+Migration, move and datasync use `TablesFromChunker` to return table progress in a stable order. Multi-source identifiers retain the source qualifier so equally named tables remain distinct. `ETA` is populated during `CopyRows` (the copy) and during `Checksum` (the checksum's current pass, from a checker that estimates one — the lockless checker does), and is `ETANone` in every other state; the `Copy` counts persist past it. Migration and move also expose the finite initial checksum counts; datasync’s continuous verifier has no corresponding finite phase.
 
 All three use multiline status blocks. Datasync includes `copier-time` while copying and `state-time` while restoring indexes, alongside its existing binlog and checkpoint rows. Sentinel progress polling returns a summary without emitting logs; periodic logging remains the responsibility of `WatchTask`.
 
