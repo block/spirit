@@ -727,8 +727,7 @@ func TestLocklessSettlesHotChunkEndToEnd(t *testing.T) {
 				snapshotExec(t, db, "INSERT INTO dst VALUES (2,99)")
 			}
 
-			chunker := newTestChunker(1)
-			chunker.chunks[0] = chunk
+			chunker := table.NewMockChunkerFromChunks(chunk)
 			cfg := fastConfig()
 			cfg.RetryDelay = time.Millisecond
 			cfg.MaxHotAttempts = 3
@@ -792,8 +791,7 @@ func TestLocklessContinuousSettledDivergenceSurvivesCancel(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	chunker := newTestChunker(1)
-	chunker.chunks[0] = chunk
+	chunker := table.NewMockChunkerFromChunks(chunk)
 	cfg := fastConfig()
 	cfg.RetryDelay = time.Millisecond
 	cfg.MaxHotAttempts = 3
@@ -871,8 +869,7 @@ func TestLocklessSettlesHotRowOnTheFeedThatOwnsIt(t *testing.T) {
 	snapshotExec(t, db, "INSERT INTO src VALUES (1,10),(2,20)")
 	snapshotExec(t, db, "INSERT INTO dst VALUES (1,10)")
 
-	chunker := newTestChunker(1)
-	chunker.chunks[0] = chunk
+	chunker := table.NewMockChunkerFromChunks(chunk)
 	cfg := fastConfig()
 	cfg.RetryDelay = time.Millisecond
 	cfg.MaxHotAttempts = 3

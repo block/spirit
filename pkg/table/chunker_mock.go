@@ -7,7 +7,9 @@ import (
 	"time"
 )
 
-// MockChunker provides a controllable chunker for testing multi-chunker behavior
+// MockChunker provides a controllable chunker for tests. NewMockChunker
+// generates chunks over a key space of totalRows; NewMockChunkerFromChunks
+// hands out a fixed list of chunks instead, the same pointers on every pass.
 type MockChunker struct {
 	mu sync.Mutex
 
@@ -17,6 +19,11 @@ type MockChunker struct {
 	chunkSize     uint64
 	tableInfo     *TableInfo
 	columnMapping *ColumnMapping
+	// chunks, when set by NewMockChunkerFromChunks, is what Next hands out:
+	// chunks[currentPosition], so currentPosition counts chunks rather than
+	// rows, including where the key methods and GetLowWatermark read it. A
+	// test can compare a dispatched chunk against it by pointer.
+	chunks []*Chunk
 
 	// State
 	isOpen          bool
@@ -34,10 +41,13 @@ type MockChunker struct {
 	nextError      error
 	watermarkError error
 
-	// Tracking
+	// Tracking. Reset clears the counters Progress reports but keeps
+	// feedbackCalls and counts itself in resets, so a test can see what
+	// happened across passes.
 	feedbackCalls []FeedbackCall
 	nextCalls     int
 	progressCalls int
+	resets        int
 }
 
 type FeedbackCall struct {
@@ -65,6 +75,32 @@ func NewMockChunker(tableName string, totalRows uint64) *MockChunker {
 		totalRows:     totalRows,
 		chunkSize:     1000, // default chunk size
 		tableInfo:     tableInfo,
+		feedbackCalls: make([]FeedbackCall, 0),
+	}
+}
+
+// NewMockChunkerFromChunks creates an open mock chunker whose Next hands out
+// chunks in order, and the same chunks again after Reset. Its table is the
+// first chunk's, or test.t when there are none. Progress counts chunks.
+//
+// Its position is a chunk index, not a key, and the key methods do not
+// translate it: KeyAboveHighWatermark, KeyBelowLowWatermark,
+// KeyNotYetDispatched and NoteBufferedKey compare a row key against the
+// number of chunks handed out, and GetLowWatermark returns that number.
+// Do not wire this mode to a change feed; use NewMockChunker, whose position
+// is a key.
+func NewMockChunkerFromChunks(chunks ...*Chunk) *MockChunker {
+	tableInfo := &TableInfo{SchemaName: "test", TableName: "t"}
+	if len(chunks) > 0 && chunks[0].Table != nil {
+		tableInfo = chunks[0].Table
+	}
+	return &MockChunker{
+		tableName:     tableInfo.TableName,
+		totalRows:     uint64(len(chunks)),
+		chunkSize:     1,
+		tableInfo:     tableInfo,
+		chunks:        chunks,
+		isOpen:        true,
 		feedbackCalls: make([]FeedbackCall, 0),
 	}
 }
@@ -119,6 +155,20 @@ func (m *MockChunker) MarkAsComplete() {
 	m.isComplete = true
 }
 
+// Chunks returns the chunks a mock from NewMockChunkerFromChunks hands out.
+func (m *MockChunker) Chunks() []*Chunk {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.chunks
+}
+
+// ResetCount returns how many times Reset succeeded.
+func (m *MockChunker) ResetCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.resets
+}
+
 func (m *MockChunker) GetFeedbackCalls() []FeedbackCall {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -156,6 +206,18 @@ func (m *MockChunker) IsRead() bool {
 	return m.isRead()
 }
 
+// MarkRead satisfies Chunker: an open mock reports itself read. Unlike
+// MarkAsComplete it refuses a mock that is not open, like the real chunkers.
+func (m *MockChunker) MarkRead() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.isOpen {
+		return ErrChunkerNotOpen
+	}
+	m.isComplete = true
+	return nil
+}
+
 func (m *MockChunker) isRead() bool {
 	return m.isComplete || m.currentPosition >= m.totalRows
 }
@@ -184,9 +246,9 @@ func (m *MockChunker) Reset() error {
 	m.currentPosition = 0
 	m.rowsCopied = 0
 	m.isComplete = false
-	m.feedbackCalls = make([]FeedbackCall, 0)
 	m.nextCalls = 0
 	m.progressCalls = 0
+	m.resets++
 
 	return nil
 }
@@ -209,8 +271,13 @@ func (m *MockChunker) Next() (*Chunk, error) {
 		return nil, ErrTableIsRead
 	}
 
+	if m.chunks != nil {
+		chunk := m.chunks[m.currentPosition]
+		m.currentPosition++
+		return chunk, nil
+	}
+
 	// Create a chunk
-	_ = fmt.Sprintf("%s_chunk_%d", m.tableName, m.nextCalls)
 	lowerDatum, err := NewDatum(m.currentPosition, unsignedType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create lower bound datum: %w", err)

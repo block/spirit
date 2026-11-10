@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+
+	"github.com/block/spirit/pkg/dbconn"
 )
 
 func init() {
@@ -80,9 +82,9 @@ func TargetSchemaObjectsError(ctx context.Context, r Resources) error {
 		if err := targetObjectVisibility(ctx, r.Runtime, target.DB, schema); err != nil {
 			return fmt.Errorf("target %d (%s): %w", i, schema, err)
 		}
-		var lowerCaseTableNames int
-		if err := target.DB.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
-			return fmt.Errorf("failed to read lower_case_table_names on target %d (%s): %w", i, schema, err)
+		lowerCaseTableNames, err := dbconn.LowerCaseTableNames(ctx, target.DB)
+		if err != nil {
+			return fmt.Errorf("target %d (%s): %w", i, schema, err)
 		}
 		written := make([]string, 0, len(r.SourceTables)+1)
 		for _, t := range r.SourceTables {

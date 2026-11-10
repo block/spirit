@@ -15,7 +15,7 @@ import (
 )
 
 type resumeChunker struct {
-	*testChunker
+	*table.MockChunker
 	opened       string
 	watermark    string
 	watermarkErr error
@@ -27,7 +27,7 @@ func (c *resumeChunker) GetLowWatermark() (string, error) { return c.watermark, 
 func TestFactoryVerificationResume(t *testing.T) {
 	for _, mode := range []string{"single", "lockless"} {
 		t.Run(mode, func(t *testing.T) {
-			chunker := &resumeChunker{testChunker: newTestChunker(0), watermark: "verified-prefix"}
+			chunker := &resumeChunker{MockChunker: newTestChunker(0), watermark: "verified-prefix"}
 			cfg := NewCheckerDefaultConfig()
 			cfg.Watermark = "saved-prefix"
 			cfg.Applier = &applier.MockApplier{}
@@ -82,7 +82,7 @@ func TestFactoryLocklessConfigAndLifecycle(t *testing.T) {
 		require.False(t, checker.StartTime().IsZero())
 		require.Positive(t, checker.ExecTime())
 	}
-	require.Equal(t, 1, chunker.resets)
+	require.Equal(t, 1, chunker.ResetCount())
 	require.Equal(t, 2, feed.PeriodicFlushStarts())
 	require.Equal(t, feed.PeriodicFlushStarts(), feed.PeriodicFlushStops())
 }
@@ -339,7 +339,7 @@ func TestFactoryCheckerSelection(t *testing.T) {
 }
 
 func TestSnapshotResumeWatermarkNotReady(t *testing.T) {
-	chunker := &resumeChunker{testChunker: newTestChunker(0), watermarkErr: table.ErrWatermarkNotReady}
+	chunker := &resumeChunker{MockChunker: newTestChunker(0), watermarkErr: table.ErrWatermarkNotReady}
 	checker := &SingleChecker{chunker: chunker}
 	_, err := checker.ResumeWatermark()
 	require.ErrorIs(t, err, table.ErrWatermarkNotReady)

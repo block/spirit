@@ -9,30 +9,33 @@ import (
 // Progress is returned as a struct because we may add more to it later.
 // It is designed for wrappers (like a GUI) to be able to summarize the
 // current status without parsing log output.
-// ETAState describes the availability of the row-copy ETA estimate, so callers
+// ETAState describes the availability of the row-copy or checksum ETA estimate, so callers
 // can distinguish "still measuring" from a real estimate without parsing the
 // Summary string. It mirrors the cases GetETA renders as text.
 type ETAState string
 
 const (
-	// ETANone means there is no copy ETA because the migration is not in the
-	// row-copy phase. Duration is 0.
+	// ETANone means there is no ETA because the run is in neither the row-copy
+	// nor the checksum phase, or its checker does not estimate one. Duration
+	// is 0.
 	ETANone ETAState = ""
-	// ETAMeasuring means a copy is in progress but no copy rate has been measured
-	// yet, so no estimate is available (Summary shows "ETA TBD"). Duration is 0.
+	// ETAMeasuring means a copy or checksum is in progress but no rate has been
+	// measured yet, so no estimate is available (Summary shows "ETA TBD" for
+	// the copy, "eta=TBD" for the checksum). Duration is 0.
 	ETAMeasuring ETAState = "measuring"
 	// ETAReady means Duration holds a current remaining-time estimate.
 	ETAReady ETAState = "ready"
-	// ETADue means the copy is essentially complete (Summary shows "ETA DUE").
-	// Duration is 0.
+	// ETADue means the copy, or the checksum's current pass, is essentially
+	// complete (Summary shows "ETA DUE" / "eta=DUE"). Duration is 0.
 	ETADue ETAState = "due"
 )
 
 // ETA is the structured form of the ETA embedded in Summary. State reports
 // whether Duration is available yet — e.g. ETAMeasuring during the initial
 // window before a copy rate is known — so callers can show "calculating" rather
-// than a misleading 0. Duration is the estimated remaining row-copy time, valid
-// only when State is ETAReady and 0 otherwise.
+// than a misleading 0. Duration is the estimated remaining row-copy time, or
+// the remaining time of the checksum's current pass, valid only when State is
+// ETAReady and 0 otherwise.
 type ETA struct {
 	State    ETAState
 	Duration time.Duration
@@ -149,7 +152,11 @@ type Progress struct {
 	// snapshot open for longer).
 	Throttle ThrottleStatus
 
-	// ETA is the structured remaining row-copy estimate and its availability.
+	// ETA is the structured remaining-time estimate and its availability: of
+	// the row copy while CurrentState is CopyRows, and of the checksum's
+	// current pass while it is Checksum. A checksum pass that ends with
+	// chunks still retrying or repaired is followed by another pass, so the
+	// checksum can run past ETADue. It is ETANone in every other state.
 	ETA ETA
 
 	// Copy is the runner-wide row copy: the sum of Tables, so the two reconcile

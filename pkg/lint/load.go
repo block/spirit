@@ -35,9 +35,9 @@ func loadServerSchema(ctx context.Context, dsn string) ([]*statement.CreateTable
 		return nil, 0, fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer utils.CloseAndLog(db)
-	var lowerCaseTableNames int
-	if err := db.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
-		return nil, 0, fmt.Errorf("failed to read lower_case_table_names: %w", err)
+	lowerCaseTableNames, err := dbconn.LowerCaseTableNames(ctx, db)
+	if err != nil {
+		return nil, 0, err
 	}
 	rawTables, err := table.LoadSchemaFromDB(ctx, db)
 	if err != nil {

@@ -50,7 +50,7 @@ The `MappedChunker` interface extends `Chunker` for chunkers that operate on a s
 - `ColumnMapping()` — returns the `ColumnMapping` between source and target tables
 - `KeyAboveHighWatermark()` / `KeyBelowLowWatermark()` — watermark optimizations for binlog filtering
 
-The optimistic and composite chunkers implement `MappedChunker`. It also exposes `KeyNotYetDispatched()`, so a feed defers only keys covered by an in-flight read. Their optional `BufferedKeyNoter` capability prevents later changes to an already-admitted key being discarded above the high watermark. A multi chunker wraps independent table pairs and implements only `Chunker`; `NewMultiChunker` returns its child directly when given one child.
+The optimistic and composite chunkers implement `MappedChunker`. It also exposes `KeyNotYetDispatched()`, so a feed defers only keys covered by an in-flight read. Their optional `BufferedKeyNoter` capability prevents later changes to an already-admitted key being discarded above the high watermark. `Chunker.MarkRead()` marks an open chunker as read to the end without moving its watermark (move calls it on a resume after the copy). A multi chunker wraps independent table pairs and implements only `Chunker`; `NewMultiChunker` returns its child directly when given one child.
 
 ## ColumnMapping
 

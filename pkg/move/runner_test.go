@@ -1148,8 +1148,9 @@ func watermarkChunkJSON(lower, upper int) string {
 // deleteRecopyRange runs every (source, table) pair's DELETE against every
 // target, so one source's DELETE can remove the other source's already-copied
 // rows below its own watermark; the full initial checksum pass must repair
-// them before cutover (the persisted-checksum-watermark half of that bug is
-// pinned by TestMultiSourceResumeDiscardsChecksumWatermark). This test
+// them before cutover. That pass runs from the beginning because a checkpoint
+// with a checksum watermark skips the delete altogether
+// (TestMultiSourceResumeAfterCopySkipsRecopyDelete). This test
 // asserts the end state: after a stop + resume, every row from both sources
 // is present on the target.
 func TestMultiSourceResumeFromCheckpointE2E(t *testing.T) {
@@ -1207,30 +1208,18 @@ func TestMultiSourceResumeFromCheckpointE2E(t *testing.T) {
 	require.Equal(t, srcBCount, tgtEven, "all of source B's (even) rows must be on the target")
 }
 
-// TestMultiSourceResumeDiscardsChecksumWatermark reproduces the multi-source
-// resume data-loss hole end-to-end and pins the fix: a persisted (non-empty)
-// checksum watermark must be DISCARDED when resuming a move with more than
-// one source.
+// TestMultiSourceResumeAfterCopySkipsRecopyDelete: a checkpoint with a
+// checksum watermark was written after the copy, so the resume neither
+// deletes nor recopies, and the checkpoint keeps the checksum watermark as
+// proof that the copy finished. That the initial checksum still runs a full
+// pass with several sources is TestMultiSourceResumeAfterCopyRunsFullChecksum.
 //
-// The hole: on resume, deleteRecopyRange runs each (source, table) pair's
-// "DELETE ... WHERE id >= <that source's watermark lower bound>" on every
-// target. Same-named tables from different sources interleave in the target
-// table, so the source with the LOWER watermark deletes the other source's
-// rows between the two watermarks — rows the other source's chunker (which
-// resumes from its own, higher watermark) never recopies. Only a checksum
-// pass that runs from the very beginning detects and repairs the hole; a
-// checksum resumed at a persisted watermark skips exactly that range and the
-// move cuts over with rows silently missing.
-//
-// The test crafts the checkpoint row into the worst case: skewed copier
-// watermarks (source A resumes at id 100 and deletes at/above it, source B
-// resumes at id 31 and deletes at/above it) and a checksum watermark above
-// every row — exactly what a checkpoint dumped during the sentinel wait
-// persists after a clean initial checksum pass. Without the fix the move
-// completes with source A's odd ids 31..99 missing from the target; with the
-// fix the watermark is discarded, the full checksum pass repairs the hole,
-// and every row is present.
-func TestMultiSourceResumeDiscardsChecksumWatermark(t *testing.T) {
+// The checkpoint is crafted into the case that once lost data: skewed copier
+// watermarks (source A at id 100, source B at id 31), whose per-source
+// DELETEs would remove each other's interleaved rows, and a checksum
+// watermark above every row. With the delete skipped the hole never opens:
+// the checksum finds no difference.
+func TestMultiSourceResumeAfterCopySkipsRecopyDelete(t *testing.T) {
 	srcAName, _ := testutils.CreateUniqueTestDatabase(t)
 	srcBName, _ := testutils.CreateUniqueTestDatabase(t)
 	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
@@ -1290,13 +1279,21 @@ func TestMultiSourceResumeDiscardsChecksumWatermark(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Run(t.Context()))
 	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
-	require.Empty(t, r.checksumWatermark,
-		"a multi-source resume must discard the persisted checksum watermark and run a full checksum pass")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
+	require.Equal(t, string(checksumWM), r.checksumWatermark,
+		"the checkpoint's checksum watermark is kept as proof that the copy finished")
+	require.Equal(t, r.copyRowsAtResume, r.copyChunker.RowsCopied(), "the resumed move must not copy any rows")
+	require.Zero(t, r.checker.DifferencesFound(),
+		"nothing was deleted, so the full pass must find no difference to repair")
+	for _, tbl := range r.Progress().Tables {
+		require.True(t, tbl.IsComplete, "a resume after the copy reports %s as copied", tbl.TableName)
+	}
 	require.NoError(t, r.Close())
 
-	// All 200 rows must be present. Without the fix, source A's odd ids
-	// 31..99 (35 rows) are deleted by source B's DELETE (id >= 31) and never
-	// restored — source A's own chunker resumes at id 100.
+	// All 200 rows must be present. Had the delete run, source B's DELETE
+	// (id >= 31) would have removed source A's odd ids 31..99; the full pass
+	// would have repaired them, which the zero-difference check above rules
+	// out.
 	var tgtOdd, tgtEven int
 	require.NoError(t, tgtDB.QueryRowContext(t.Context(),
 		"SELECT COUNT(*) FROM users WHERE id % 2 = 1").Scan(&tgtOdd))
@@ -1361,6 +1358,195 @@ func TestSingleSourceResumeKeepsChecksumWatermark(t *testing.T) {
 		"SELECT COUNT(*) FROM users").Scan(&tgtCount))
 	require.Positive(t, srcCount)
 	require.Equal(t, srcCount, tgtCount)
+}
+
+// TestMultiSourceResumeAfterCopyRunsFullChecksum: with several sources, a
+// resume after the copy still skips the copy but runs the initial checksum
+// from the beginning, ignoring the checkpoint's checksum watermark (see
+// checksumResumeWatermark). A target row changed while the move was stopped,
+// with no change event to correct it, stands in for a row removed by another
+// source's replay; it sits below the checksum watermark, so only a full pass
+// repairs it.
+func TestMultiSourceResumeAfterCopyRunsFullChecksum(t *testing.T) {
+	srcAName, _ := testutils.CreateUniqueTestDatabase(t)
+	srcBName, srcBDB := testutils.CreateUniqueTestDatabase(t)
+	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
+	for _, dbName := range []string{srcAName, srcBName} {
+		testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (
+			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(255) NOT NULL
+		)`)
+	}
+	seedUsersRange(t, srcAName, 1, 199)
+	seedUsersRange(t, srcBName, 2, 200)
+
+	move := &Move{
+		SourceDSNs:   []string{testutils.DSNForDatabase(srcAName), testutils.DSNForDatabase(srcBName)},
+		TargetDSN:    testutils.DSNForDatabase(tgtName),
+		Common:       flags.Common{Threads: 1, WriteThreads: 1},
+		SourceTables: []string{"users"},
+	}
+	checkpointAndStop(t, move)
+
+	srcACfg, err := mysql.ParseDSN(testutils.DSNForDatabase(srcAName))
+	require.NoError(t, err)
+	srcBCfg, err := mysql.ParseDSN(testutils.DSNForDatabase(srcBName))
+	require.NoError(t, err)
+	qnA := srcACfg.Addr + "." + srcAName + ".users"
+	qnB := srcBCfg.Addr + "." + srcBName + ".users"
+	// A checksum watermark above every row (max id is 200).
+	checksumWM, err := json.Marshal(map[string]string{
+		qnA: watermarkChunkJSON(290, 300),
+		qnB: watermarkChunkJSON(290, 300),
+	})
+	require.NoError(t, err)
+	_, err = tgtDB.ExecContext(t.Context(),
+		"UPDATE _spirit_move_checkpoint SET checksum_watermark = ?", string(checksumWM))
+	require.NoError(t, err)
+	// Source B's row 2, removed from the target behind the feed's back.
+	_, err = tgtDB.ExecContext(t.Context(), "DELETE FROM users WHERE id = 2")
+	require.NoError(t, err)
+
+	move.Threads = 4
+	r, err := NewRunner(move)
+	require.NoError(t, err)
+	require.NoError(t, r.Run(t.Context()))
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
+	require.Equal(t, r.copyRowsAtResume, r.copyChunker.RowsCopied(), "the resumed move must not copy any rows")
+	require.NoError(t, r.Close())
+
+	var name string
+	require.NoError(t, tgtDB.QueryRowContext(t.Context(), "SELECT name FROM users WHERE id = 2").Scan(&name),
+		"only a full checksum pass restores a row below the checksum watermark")
+	var srcName string
+	require.NoError(t, srcBDB.QueryRowContext(t.Context(), "SELECT name FROM users_old WHERE id = 2").Scan(&srcName))
+	require.Equal(t, srcName, name)
+}
+
+// TestResumeAfterCopyAppliesChangesWithoutRecopy: a move stopped after its
+// copy, with a checksum watermark in its checkpoint, resumes without
+// deleting or recopying, and the change feed alone carries every source
+// change made while it was stopped onto the target. The changes include
+// deleting rows inside the range a recopy would have covered, which is what
+// deleteRecopyRange exists for: with the watermark optimization never turned
+// on, those deletes are applied rather than discarded.
+//
+// The checksum watermark sits above every changed key, so the initial
+// checksum verifies none of them and cannot repair a change the feed failed
+// to apply: the end state is the feed's work alone.
+func TestResumeAfterCopyAppliesChangesWithoutRecopy(t *testing.T) {
+	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
+	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
+
+	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(255) NOT NULL
+	)`)
+	// Enough rows that the copier watermark is ready when the checkpoint is
+	// dumped (the optimistic chunker needs a few chunks).
+	seedUsersRange(t, srcName, 1, 2399) // 1200 rows
+
+	move := &Move{
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(tgtName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+	}
+	checkpointAndStop(t, move)
+
+	// A checksum watermark above every key: a move stopped at the end of its
+	// initial checksum. With one (source, table) pair the checksum chunker is
+	// the optimistic chunker itself, so the watermark is raw chunk JSON.
+	res, err := tgtDB.ExecContext(t.Context(),
+		"UPDATE _spirit_move_checkpoint SET checksum_watermark = ?", watermarkChunkJSON(3101, 3151))
+	require.NoError(t, err)
+	rowsAffected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rowsAffected, "exactly one checkpoint row should have been crafted")
+	var copierWM string
+	require.NoError(t, tgtDB.QueryRowContext(t.Context(),
+		"SELECT copier_watermark FROM _spirit_move_checkpoint").Scan(&copierWM))
+
+	// Change the source while the move is stopped: delete rows at the end of
+	// the table (inside the recopy range), update and delete rows below it,
+	// and insert new rows.
+	testutils.RunSQLInDatabase(t, srcName, "DELETE FROM users WHERE id >= 2301")
+	testutils.RunSQLInDatabase(t, srcName, "DELETE FROM users WHERE id BETWEEN 101 AND 199")
+	testutils.RunSQLInDatabase(t, srcName, "UPDATE users SET name = 'changed' WHERE id <= 99")
+	seedUsersRange(t, srcName, 3001, 3099)
+
+	move.Threads = 4
+	r, err := NewRunner(move)
+	require.NoError(t, err)
+	logs := &lockedBuffer{}
+	r.SetLogger(slog.New(slog.NewTextHandler(logs, nil)))
+	require.NoError(t, r.Run(t.Context()))
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
+	require.Equal(t, r.copyRowsAtResume, r.copyChunker.RowsCopied(), "the resumed move must not copy any rows")
+	// The copy chunker is marked read before the feed starts, so the
+	// replayed inserts above the copier watermark are not reported as keys
+	// the copier has not reached.
+	require.Contains(t, logs.String(), "resuming after the copy finished")
+	require.NotContains(t, logs.String(), "change stream admitted a key the copier has not reached")
+	wm, err := r.copyChunker.GetLowWatermark()
+	require.NoError(t, err)
+	require.Equal(t, copierWM, wm, "the copier watermark must be written back unchanged, so checkpoints keep being written")
+	require.NoError(t, r.Close())
+
+	// The move cut over, so the source table is now users_old.
+	checksumRows := func(db *sql.DB, tbl string) (int, string) {
+		var count int
+		var sum string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			"SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT(id, ':', name))), 0) FROM "+tbl).Scan(&count, &sum))
+		return count, sum
+	}
+	srcCount, srcSum := checksumRows(srcDB, "users_old")
+	tgtCount, tgtSum := checksumRows(tgtDB, "users")
+	require.Equal(t, 1200-50-50+50, srcCount)
+	require.Equal(t, srcCount, tgtCount, "the target must have exactly the source's rows")
+	require.Equal(t, srcSum, tgtSum, "the target rows must match the source's")
+}
+
+// TestResumeAfterCopyKeepsChecksumWatermark: a move that resumed after its
+// copy writes the checksum watermark it resumed from back into every
+// checkpoint until its own checksum starts, so being stopped again during
+// the index restore or ANALYZE TABLE still skips the delete and recopy.
+func TestResumeAfterCopyKeepsChecksumWatermark(t *testing.T) {
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	tgtName, tgtDB := testutils.CreateUniqueTestDatabase(t)
+
+	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(255) NOT NULL
+	)`)
+	seedUsersRange(t, srcName, 1, 2399)
+
+	move := &Move{
+		SourceDSN: testutils.DSNForDatabase(srcName),
+		TargetDSN: testutils.DSNForDatabase(tgtName),
+		Common:    flags.Common{Threads: 1, WriteThreads: 1},
+	}
+	checkpointAndStop(t, move)
+	checksumWM := watermarkChunkJSON(1001, 1051)
+	_, err := tgtDB.ExecContext(t.Context(),
+		"UPDATE _spirit_move_checkpoint SET checksum_watermark = ?", checksumWM)
+	require.NoError(t, err)
+
+	r, ctx := buildTestRunner(t, move)
+	defer closeTestRunner(t, r)
+	require.NoError(t, r.setupDiscovery(ctx))
+	require.NoError(t, r.setupUnderLocks(ctx))
+	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint")
+	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
+	require.Less(t, r.status.Get(), status.Checksum, "the checkpoint must be dumped before the checksum phase")
+	require.NoError(t, r.DumpCheckpoint(ctx))
+
+	var written string
+	require.NoError(t, tgtDB.QueryRowContext(t.Context(),
+		"SELECT checksum_watermark FROM _spirit_move_checkpoint").Scan(&written))
+	require.Equal(t, checksumWM, written, "the resumed checksum watermark must be written back before the checksum phase")
 }
 
 // TestDeleteRecopyRangeFormats exercises deleteRecopyRange directly
@@ -1605,6 +1791,85 @@ func TestDeleteRecopyRangeDeletesFromServersConcurrently(t *testing.T) {
 	count, err := countRows(targets[0].DB)
 	require.NoError(t, err)
 	require.Equal(t, 2, count, "only rows below the resume position (ids 1..2) may remain")
+}
+
+// TestAnalyzeTargetTablesAnalyzesServersConcurrently: ANALYZE TABLE runs on
+// every target server at the same time, so the phase does not scale with the
+// shard count. Target 0's table is locked, which blocks its ANALYZE; target 1,
+// on another server, must still be analyzed while it waits. Both targets live
+// on the test MySQL, so their configs name two servers. STATS_AUTO_RECALC=0
+// keeps the index cardinality at its value from CREATE TABLE until ANALYZE
+// recomputes it, which is how the test sees that ANALYZE ran.
+func TestAnalyzeTargetTablesAnalyzesServersConcurrently(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	const createTable = "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, val VARCHAR(64)) STATS_PERSISTENT=1 STATS_AUTO_RECALC=0"
+	var targets []applier.Target
+	for i, server := range []string{"server-a:3306", "server-b:3306"} {
+		dbName, _ := testutils.CreateUniqueTestDatabase(t)
+		testutils.RunSQLInDatabase(t, dbName, createTable)
+		testutils.RunSQLInDatabase(t, dbName, "INSERT INTO t1 (val) WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 100) SELECT 'a' FROM seq")
+		conn, err := dbconn.New(testutils.DSNForDatabase(dbName), dbconn.NewDBConfig())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(conn)
+		cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(dbName))
+		require.NoError(t, err)
+		cfg.Addr = server
+		targets = append(targets, applier.Target{KeyRange: strconv.Itoa(i), DB: conn, Config: cfg})
+	}
+
+	r, err := NewRunner(&Move{})
+	require.NoError(t, err)
+	r.sourceTables = []*table.TableInfo{{TableName: "t1"}}
+	r.targets = targets
+	require.Len(t, r.targetHosts(), 2)
+
+	// cardinality reads the PRIMARY index's cardinality from the server's
+	// statistics, not from the information_schema cache.
+	cardinality := func(db *sql.DB) (int64, error) {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return 0, err
+		}
+		defer utils.CloseAndLog(conn)
+		if _, err := conn.ExecContext(ctx, "SET SESSION information_schema_stats_expiry = 0"); err != nil {
+			return 0, err
+		}
+		var n sql.NullInt64
+		err = conn.QueryRowContext(ctx, "SELECT CARDINALITY FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 't1' AND index_name = 'PRIMARY'").Scan(&n)
+		return n.Int64, err
+	}
+	for i := range targets {
+		n, err := cardinality(targets[i].DB)
+		require.NoError(t, err)
+		require.NotEqual(t, int64(100), n, "target %d must not be analyzed before analyzeTargetTables runs", i)
+	}
+
+	holder, err := targets[0].DB.Conn(ctx)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(holder)
+	_, err = holder.ExecContext(ctx, "LOCK TABLES t1 WRITE")
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- r.analyzeTargetTables(ctx) }()
+
+	require.Eventually(t, func() bool {
+		n, err := cardinality(targets[1].DB)
+		return err == nil && n == 100
+	}, 10*time.Second, 10*time.Millisecond, "target 1 must be analyzed while target 0's ANALYZE waits for its lock")
+	select {
+	case err := <-done:
+		t.Fatalf("analyzeTargetTables returned while target 0 was locked: %v", err)
+	default:
+	}
+
+	_, err = holder.ExecContext(ctx, "UNLOCK TABLES")
+	require.NoError(t, err)
+	require.NoError(t, <-done)
+	n, err := cardinality(targets[0].DB)
+	require.NoError(t, err)
+	require.Equal(t, int64(100), n, "target 0 must be analyzed once its lock is released")
 }
 
 func varcharPKWriteOne(ctx context.Context, db *sql.DB, srcDB string) error {
