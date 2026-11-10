@@ -59,6 +59,16 @@ const (
 type Chunker interface {
 	Open() error
 	IsRead() bool
+	// MarkRead marks an open chunker as read to the end without dispatching
+	// the rest of its key space, for a caller that knows the work is already
+	// done: move calls it when a checkpoint proves an earlier run finished the
+	// copy. IsRead then reports true and Next returns ErrTableIsRead. A
+	// MappedChunker then reports no key above the high watermark or not yet
+	// dispatched, so the change stream discards and defers none, and records
+	// none with NoteBufferedKey. The watermark is kept, so GetLowWatermark
+	// returns what it did before. It fails on a chunker that is not open or
+	// has chunks in flight. A multi chunker marks every chunker it wraps.
+	MarkRead() error
 	Close() error
 	Next() (*Chunk, error)
 	Feedback(chunk *Chunk, duration time.Duration, actualRows uint64)

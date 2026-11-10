@@ -25,12 +25,19 @@ func newBufferedKeyChunker4Test(t *testing.T) *chunkerOptimistic {
 // newUnopenedBufferedKeyChunker4Test is newBufferedKeyChunker4Test without
 // the Open.
 func newUnopenedBufferedKeyChunker4Test() *chunkerOptimistic {
-	t1 := newTableInfo4Test("test", "t1")
+	return newUnopenedOptimisticChunker4Test("t1")
+}
+
+// newUnopenedOptimisticChunker4Test is newUnopenedBufferedKeyChunker4Test for
+// the table test.<table>.
+func newUnopenedOptimisticChunker4Test(table string) *chunkerOptimistic {
+	t1 := newTableInfo4Test("test", table)
 	t1.minValue = Datum{Val: int64(1), Tp: signedType}
 	t1.maxValue = Datum{Val: int64(4000), Tp: signedType}
 	t1.EstimatedRows = 4000
 	t1.KeyColumns = []string{"id"}
 	t1.keyColumnsMySQLTp = []string{"bigint"}
+	t1.columnsMySQLTps = map[string]string{"id": "bigint", "name": "varchar(255)"}
 	t1.keyDatums = []datumTp{signedType}
 	t1.KeyIsAutoInc = true
 	t1.Columns = []string{"id", "name"}

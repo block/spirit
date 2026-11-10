@@ -94,7 +94,7 @@ func TestContinuousSnapshotLifecycle(t *testing.T) {
 func TestContinuousFactoryDiscardsResumeEvidence(t *testing.T) {
 	for _, mode := range []string{"single", "lockless"} {
 		t.Run(mode, func(t *testing.T) {
-			chunker := &resumeChunker{testChunker: newTestChunker(0), watermark: "initial-verification"}
+			chunker := &resumeChunker{MockChunker: newTestChunker(0), watermark: "initial-verification"}
 			feed := &change.MockSource{}
 			cfg := NewCheckerDefaultConfig()
 			cfg.Applier = &applier.MockApplier{}
@@ -119,7 +119,7 @@ func TestContinuousFactoryDiscardsResumeEvidence(t *testing.T) {
 }
 
 type continuousScanGate struct {
-	*testChunker
+	*table.MockChunker
 	entered, release chan struct{}
 }
 
@@ -127,17 +127,15 @@ func (c *continuousScanGate) Next() (*table.Chunk, error) {
 	if c.entered != nil {
 		c.entered <- struct{}{}
 		<-c.release
-		c.mu.Lock()
-		c.cursor = len(c.chunks)
-		c.mu.Unlock()
+		c.MarkAsComplete()
 		return nil, table.ErrTableIsRead
 	}
-	return c.testChunker.Next()
+	return c.MockChunker.Next()
 }
 
 func TestLocklessContinuousReusesCheckerAfterInitialPass(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		chunker := &continuousScanGate{testChunker: newTestChunker(0)}
+		chunker := &continuousScanGate{MockChunker: newTestChunker(0)}
 		feed := &change.MockSource{}
 		cfg := NewCheckerDefaultConfig()
 		cfg.Lockless = true
@@ -146,7 +144,7 @@ func TestLocklessContinuousReusesCheckerAfterInitialPass(t *testing.T) {
 		checker, err := NewChecker([]*sql.DB{{}}, chunker, []change.Source{feed}, cfg)
 		require.NoError(t, err)
 		require.NoError(t, checker.Run(t.Context()))
-		chunker.testChunker = newTestChunker(1)
+		chunker.MockChunker = newTestChunker(1)
 		chunker.entered, chunker.release = make(chan struct{}, 1), make(chan struct{})
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
@@ -158,7 +156,7 @@ func TestLocklessContinuousReusesCheckerAfterInitialPass(t *testing.T) {
 		require.True(t, checker.ContinuousActive(), "scanning is active")
 		close(chunker.release)
 		synctest.Wait()
-		require.GreaterOrEqual(t, chunker.resets, 1)
+		require.GreaterOrEqual(t, chunker.ResetCount(), 1)
 		require.Equal(t, uint64(1), checker.(*LocklessChecker).Stats().PassesCompleted)
 		require.False(t, checker.ContinuousActive(), "inter-pass pacing is idle")
 		cancel()
@@ -253,7 +251,7 @@ func newContinuousChecker(t *testing.T, chunker table.Chunker, feed change.Sourc
 	return checker.(*LocklessChecker)
 }
 
-type canceledScan struct{ *testChunker }
+type canceledScan struct{ *table.MockChunker }
 
 func (*canceledScan) Next() (*table.Chunk, error) { return nil, context.Canceled }
 

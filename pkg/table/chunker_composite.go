@@ -435,6 +435,20 @@ func (t *chunkerComposite) IsRead() bool {
 	return t.finalChunkSent
 }
 
+// MarkRead satisfies Chunker. See the interface docs.
+func (t *chunkerComposite) MarkRead() error {
+	t.Lock()
+	defer t.Unlock()
+	if !t.isOpen {
+		return ErrChunkerNotOpen
+	}
+	if t.inflightChunks > 0 {
+		return fmt.Errorf("cannot mark %s read: %d chunks are in flight", t.Ti.QuotedTableName, t.inflightChunks)
+	}
+	t.finalChunkSent = true
+	return nil
+}
+
 // Progress returns the current progress of the chunker
 // It is up the implementation to determine how it
 // wants to do that. For the composite chunker we use

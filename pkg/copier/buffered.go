@@ -30,7 +30,7 @@ type buffered struct {
 	applier     applier.Applier
 	chunker     table.Chunker
 	concurrency int
-	rate        copyRate
+	rate        status.Rate
 	chunkSize   atomic.Uint64 // size of the most recently claimed chunk; see Copier.ChunkSize
 	isInvalid   atomic.Bool
 	errMu       sync.Mutex // guards firstErr
@@ -627,18 +627,18 @@ func (c *buffered) GetETAState() status.ETA {
 	c.Lock()
 	defer c.Unlock()
 	copiedRows, totalRows, pct := c.getCopyStats()
-	return status.EstimateETA(copiedRows, totalRows, pct, c.rate.rowsPerSecond(), c.startTime)
+	return status.EstimateETA(copiedRows, totalRows, pct, c.rate.RowsPerSecond(), c.startTime)
 }
 
 // estimateRowsPerSecondLoop feeds the copy rate with the rows the chunker
-// reports copied in each copyEstimateInterval. The chunker's Progress is the
+// reports copied in each status.RateSampleInterval. The chunker's Progress is the
 // source because the copier no longer counts rows itself; for the optimistic
 // chunker on a dense key it is keyspace distance rather than rows, which is
 // what the ETA is paced on either way. The chunker fixes its unit when it
 // opens, so two readings a run takes are always in the same unit.
 func (c *buffered) estimateRowsPerSecondLoop(ctx context.Context) {
 	prevRowsCount, _, _ := c.chunker.Progress()
-	ticker := time.NewTicker(copyEstimateInterval)
+	ticker := time.NewTicker(status.RateSampleInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -649,7 +649,7 @@ func (c *buffered) estimateRowsPerSecondLoop(ctx context.Context) {
 				return
 			}
 			newRowsCount, _, _ := c.chunker.Progress()
-			c.rate.observe(newRowsCount - prevRowsCount)
+			c.rate.Observe(newRowsCount - prevRowsCount)
 			prevRowsCount = newRowsCount
 		}
 	}
