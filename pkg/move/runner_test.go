@@ -1484,7 +1484,7 @@ func TestResumeAfterCopyAppliesChangesWithoutRecopy(t *testing.T) {
 	require.True(t, r.usedResumeFromCheckpoint.Load(), "the move must resume from the checkpoint, not start over")
 	require.True(t, r.copyComplete.Load(), "a checksum watermark must mark the copy complete")
 	require.Equal(t, r.copyRowsAtResume, r.copyChunker.RowsCopied(), "the resumed move must not copy any rows")
-	// The copy chunker is marked complete before the feed starts, so the
+	// The copy chunker is marked read before the feed starts, so the
 	// replayed inserts above the copier watermark are not reported as keys
 	// the copier has not reached.
 	require.Contains(t, logs.String(), "resuming after the copy finished")

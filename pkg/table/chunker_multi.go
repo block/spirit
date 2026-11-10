@@ -79,6 +79,9 @@ func (m *multiChunker) IsRead() bool {
 func (m *multiChunker) MarkRead() error {
 	m.Lock()
 	defer m.Unlock()
+	if !m.isOpen {
+		return ErrChunkerNotOpen
+	}
 	for tableName, chunker := range m.chunkers {
 		if err := chunker.MarkRead(); err != nil {
 			return fmt.Errorf("could not mark table %q read: %w", tableName, err)

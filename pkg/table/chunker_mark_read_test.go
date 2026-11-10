@@ -134,24 +134,29 @@ func TestCompositeMarkRead(t *testing.T) {
 	require.JSONEq(t, watermark, got)
 }
 
-// TestMultiChunkerMarkRead: the multi-chunker marks every child, and
-// fails if a child refuses rather than skipping it.
+// TestMultiChunkerMarkRead: the multi-chunker refuses when it is not open,
+// marks every child, and fails if a child refuses rather than skipping it.
 func TestMultiChunkerMarkRead(t *testing.T) {
-	t1 := newBufferedKeyChunker4Test(t)
-	t2 := newUnopenedOptimisticChunker4Test("t2")
-	require.NoError(t, t2.Open())
+	// Children open, the multi chunker not: only its own guard refuses.
+	openChild := newBufferedKeyChunker4Test(t)
+	unopened := NewMultiChunker(openChild, newUnopenedOptimisticChunker4Test("t2")).(*multiChunker)
+	require.ErrorIs(t, unopened.MarkRead(), ErrChunkerNotOpen)
+	require.False(t, openChild.IsRead())
 
+	t1 := newUnopenedOptimisticChunker4Test("t1")
+	t2 := newUnopenedOptimisticChunker4Test("t2")
 	multi := NewMultiChunker(t1, t2).(*multiChunker)
-	multi.isOpen = true
+	require.NoError(t, multi.Open())
 	require.False(t, multi.IsRead())
 	require.NoError(t, multi.MarkRead())
 	require.True(t, t1.IsRead())
 	require.True(t, t2.IsRead())
 	require.True(t, multi.IsRead())
 
-	opened, unopened := NewMockChunker("table1", 1000), NewMockChunker("table2", 1000)
-	require.NoError(t, opened.Open())
-	mocks := NewMultiChunker(opened, unopened).(*multiChunker)
+	closed := NewMockChunker("table2", 1000)
+	mocks := NewMultiChunker(NewMockChunker("table1", 1000), closed).(*multiChunker)
+	require.NoError(t, mocks.Open())
+	require.NoError(t, closed.Close())
 	require.ErrorIs(t, mocks.MarkRead(), ErrChunkerNotOpen)
 	require.False(t, mocks.IsRead())
 }
