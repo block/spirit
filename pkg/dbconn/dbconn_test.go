@@ -351,12 +351,14 @@ func TestShouldRetryForceExecAfterKill(t *testing.T) {
 		&mysql.MySQLError{Number: parsermysql.ErrLockWaitTimeout}), true))
 }
 
-// killedSessionLingersReason is why tests that force-kill an idle MDL holder
-// skip before MySQL 8.0.29: on 8.0.28 the KILLed session intermittently never
-// exits and keeps its metadata lock GRANTED, so every ForceExec attempt ends
-// in a lock wait timeout (block/spirit#1303). The cause is not confirmed: these
-// are also the real-kill tests whose killed blocker runs on a dbconn.New pool,
-// which defaults to TLS PREFERRED, so TLS is an alternative explanation.
+// killedSessionLingersReason is why tests that KILL an idle session holding a
+// metadata lock skip before MySQL 8.0.29: on 8.0.28 the KILLed session
+// intermittently never exits and keeps its metadata lock GRANTED, so every
+// ForceExec attempt ends in a lock wait timeout, and a KILLed LOCK TABLES
+// session keeps blocking writers to its table (block/spirit#1303). The cause
+// is not confirmed: these are also the real-kill tests whose killed session
+// runs on a dbconn.New pool, which defaults to TLS PREFERRED, so TLS is an
+// alternative explanation.
 const killedSessionLingersReason = "a KILLed idle session can keep its metadata lock indefinitely"
 
 func TestForceExec(t *testing.T) {
