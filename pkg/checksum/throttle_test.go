@@ -427,6 +427,10 @@ func (s *checksumGaugeSink) Send(_ context.Context, m *metrics.Metrics) error {
 }
 
 func TestFiniteLocklessEmitsConfiguredMetrics(t *testing.T) {
+	// The gauges are reported once per controller tick (autoscale.Tick, 5s).
+	old := csTick
+	csTick = 10 * time.Millisecond
+	defer func() { csTick = old }()
 	cfg := NewCheckerDefaultConfig()
 	cfg.Lockless = true
 	cfg.Autoscale.Enabled = true
@@ -450,7 +454,7 @@ func TestFiniteLocklessEmitsConfiguredMetrics(t *testing.T) {
 			}
 		}
 		require.True(t, found, "live checksum worker gauge must reach the configured sink")
-	case <-time.After(3 * csTick):
+	case <-time.After(5 * time.Second):
 		t.Fatal("no checksum metrics reached configured sink")
 	}
 }

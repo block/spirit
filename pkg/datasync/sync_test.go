@@ -12,7 +12,6 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
@@ -34,6 +33,11 @@ func TestMain(m *testing.M) {
 	// Run lockless-checksum passes back-to-back in tests so FirstCleanPass /
 	// convergence assertions don't wait on the 1h production pacing.
 	checksum.LocklessMinPassInterval = 0
+	// A mismatched chunk is re-read after DefaultLocklessRetryDelay (5s in
+	// production), so every test that plants a divergence would wait it out
+	// at least once. Set once here, as the migration and move packages do,
+	// so no parallel test mutates it.
+	checksum.DefaultLocklessRetryDelay = 1 * time.Second
 	goleak.VerifyTestMain(m)
 }
 
@@ -1947,11 +1951,12 @@ func TestCreateApplierReportsStatsToMetricsSink(t *testing.T) {
 	r.targetDBConfig = dbconn.NewDBConfig()
 	r.target = applier.Target{DB: dstDB, Config: dst, KeyRange: "0"}
 
+	applier.SetStatsEmitTickForTest(t, 10*time.Millisecond)
 	appl, err := r.createApplier()
 	require.NoError(t, err)
 	require.NoError(t, appl.Start(t.Context()))
 	defer func() { require.NoError(t, appl.Stop()) }()
 
-	require.Eventually(t, sink.seen.Load, 3*autoscale.Tick, 50*time.Millisecond,
+	require.Eventually(t, sink.seen.Load, 5*time.Second, 10*time.Millisecond,
 		"the sync's applier never reported its stats to the metrics sink")
 }
