@@ -84,27 +84,64 @@ func TestAdvisoryLockContextCancel(t *testing.T) {
 	require.NoError(t, lock2.Close())
 }
 
+// TestAdvisoryLockRefresh verifies that the refresh ticker keeps the lock's
+// session alive. GET_LOCK is session scoped and the pool never recycles its
+// connection client-side, so the only thing standing between the lock and the
+// server's wait_timeout is the ticker's GET_LOCK keepalive. The test gives the
+// lock's session a 1s wait_timeout and waits well past it: without the
+// keepalive the server closes the idle session, which releases the lock.
 func TestAdvisoryLockRefresh(t *testing.T) {
-	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-refresh"}
+	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-refresh-keepalive"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
 	logger := slog.Default()
 
 	lock, err := NewAdvisoryLock(t.Context(), testutils.DSN(), lockTables, NewDBConfig(), logger, func(lock *AdvisoryLock) {
-		// override the refresh interval for faster testing
-		lock.refreshInterval = 1 * time.Second
+		// Five ticks per wait_timeout, so a late tick on a loaded runner
+		// cannot let the session idle out.
+		lock.refreshInterval = 200 * time.Millisecond
+		lock.newDBConn = func(ctx context.Context) (*sql.DB, error) {
+			db, err := NewContext(ctx, testutils.DSN(), NewDBConfig())
+			if err != nil {
+				return nil, err
+			}
+			// newDSN pins wait_timeout to sessionWaitTimeout, so shorten it on
+			// the pool's single session after connecting.
+			if _, err := db.ExecContext(ctx, "SET SESSION wait_timeout = 1"); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+			return db, nil
+		}
 	})
 	require.NoError(t, err)
 	require.NotNil(t, lock)
+	closeLock := closeOnce(lock)
+	t.Cleanup(func() { _ = closeLock() })
 
-	// wait for the refresh to happen
-	time.Sleep(2 * time.Second)
+	var waitTimeout int
+	require.NoError(t, lock.db.QueryRowContext(t.Context(), "SELECT @@SESSION.wait_timeout").Scan(&waitTimeout))
+	require.Equal(t, 1, waitTimeout, "the lock's session must have the shortened wait_timeout")
+	var holder int64
+	require.NoError(t, lock.db.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&holder))
 
-	// Confirm the lock is still held
+	// Three times the wait_timeout: an idle session would be closed by now.
+	time.Sleep(3 * time.Second)
+
+	// The lock must still be held by the original session. Check from another
+	// connection, so the check itself cannot keep the lock's session alive.
+	observer, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(observer)
+	var usedBy sql.NullInt64
+	stmt := sqlescape.MustEscapeSQL("SELECT IS_USED_LOCK(%?)", computeLockName(&lockTableInfo))
+	require.NoError(t, observer.QueryRowContext(t.Context(), stmt).Scan(&usedBy))
+	require.True(t, usedBy.Valid, "the lock was released: the refresh did not keep its session alive past wait_timeout")
+	require.Equal(t, holder, usedBy.Int64, "the lock must still be held by its original session")
+
 	_, err = NewAdvisoryLock(t.Context(), testutils.DSN(), lockTables, NewDBConfig(), logger)
 	require.ErrorContains(t, err, "lock is held by another connection")
 
-	// Close the lock
-	require.NoError(t, lock.Close())
+	require.NoError(t, closeLock())
 }
 
 func TestComputeLockName(t *testing.T) {
