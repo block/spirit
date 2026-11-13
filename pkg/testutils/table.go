@@ -132,11 +132,23 @@ func isIdentifierTooLongError(err error) bool {
 //
 //	// With SQL functions — each row gets unique random data
 //	tt.SeedRows(t, "INSERT INTO mytable (pad) SELECT RANDOM_BYTES(1024)", 100000)
+//
+// The target counts every row already in the table, and each doubling copies
+// every row, so a second call with the same target would add one row.
+// SeedRows therefore fails on a table that already holds targetRows rows. To
+// seed several values, seed once and UPDATE the rows.
 func (tt *TestTable) SeedRows(t *testing.T, insertSelectSQL string, targetRows int) {
 	t.Helper()
 
+	var existing int
+	err := tt.DB.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", sqlescape.EscapeIdentifier(tt.Name))).Scan(&existing)
+	require.NoError(t, err)
+	require.Less(t, existing, targetRows,
+		"SeedRows: %s already holds %d rows, so seeding to %d would add one row; seed once and UPDATE the rows instead",
+		tt.Name, existing, targetRows)
+
 	// Initial insert from dual (creates 1 row).
-	_, err := tt.DB.ExecContext(t.Context(), insertSelectSQL+" FROM dual")
+	_, err = tt.DB.ExecContext(t.Context(), insertSelectSQL+" FROM dual")
 	require.NoError(t, err)
 
 	// Count initial rows (may be >1 if the SELECT produces multiple rows).
