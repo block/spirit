@@ -96,6 +96,7 @@ tt.SeedRows(t, "INSERT INTO mytable (pad) SELECT RANDOM_BYTES(1024)", 100000)
 **When NOT to use `SeedRows`:**
 - Tables with composite PKs where you need unique key pairs — use a loop with `RunSQL`
 - Rows with specific distinct values needed for the test logic (e.g., inserting specific data that will violate a constraint)
+- A second seed of the same table: the target counts every existing row, so `SeedRows` fails on a table that already holds `targetRows` rows. To seed several values, seed once and `UPDATE` the rows (e.g. `SET status = ELT(1 + id % 3, 'a', 'b', 'c')`)
 
 #### `NewTestRunner` — preferred way to create migration runners (migration package only)
 
