@@ -395,15 +395,23 @@ func TestApplierTimeoutScope(t *testing.T) {
 		}
 	}
 
+	// One attempt is enough to show a write outlives chunkTaskTimeout: the
+	// 1s lock wait is already longer than the 500ms bound. The default three
+	// attempts would only make each unbounded write take 3s.
+	oneAttempt := func() *ApplierConfig {
+		cfg := NewApplierDefaultConfig()
+		cfg.DBConfig.MaxRetries = 1
+		return cfg
+	}
 	appliers := []struct {
 		name string
 		new  func() (Applier, error)
 	}{
 		{"single", func() (Applier, error) {
-			return New([]Target{{DB: targetDB}}, NewApplierDefaultConfig())
+			return New([]Target{{DB: targetDB}}, oneAttempt())
 		}},
 		{"sharded", func() (Applier, error) {
-			return New([]Target{{DB: targetDB, KeyRange: "-"}}, NewApplierDefaultConfig())
+			return New([]Target{{DB: targetDB, KeyRange: "-"}}, oneAttempt())
 		}},
 	}
 	for _, tc := range appliers {

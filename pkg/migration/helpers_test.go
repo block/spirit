@@ -238,6 +238,24 @@ func WithCopyStalledAfterChunks(n int64) RunnerOption {
 	}
 }
 
+// WithFlushInterval sets the copy phase's periodic flush interval, which is
+// change.DefaultFlushInterval (30s) otherwise, so a test that waits for a
+// periodic flush does not wait 30s.
+func WithFlushInterval(d time.Duration) RunnerOption {
+	return func(m *Migration) {
+		m.testFlushInterval = d
+	}
+}
+
+// WithChecksumMaxPasses bounds the initial checksum's passes, which is
+// checksum.DefaultLocklessMaxPasses (10) otherwise, so a test of a checksum
+// that cannot converge does not wait for ten passes.
+func WithChecksumMaxPasses(n int) RunnerOption {
+	return func(m *Migration) {
+		m.testChecksumMaxPasses = n
+	}
+}
+
 // WithDeferCutOver enables deferred cutover mode.
 func WithDeferCutOver() RunnerOption {
 	return func(m *Migration) {

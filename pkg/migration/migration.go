@@ -61,6 +61,12 @@ type Migration struct {
 	useTestCutover bool
 	// testThrottler is a test-only copier throttler (see WithTestThrottler).
 	testThrottler throttler.Throttler
+	// testFlushInterval is a test-only periodic flush interval for the copy
+	// phase (see WithFlushInterval). Zero means change.DefaultFlushInterval.
+	testFlushInterval time.Duration
+	// testChecksumMaxPasses is a test-only bound on the initial checksum's
+	// passes (see WithChecksumMaxPasses). Zero means the checker's default.
+	testChecksumMaxPasses int
 }
 
 // Validate is called by Kong after parsing to reject invalid flag values.

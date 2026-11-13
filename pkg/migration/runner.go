@@ -918,6 +918,7 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 		Logger:       r.logger,
 		YieldTimeout: r.migration.LegacyChecksumYieldTimeout,
 		MetricsSink:  r.metricsSink,
+		MaxPasses:    r.migration.testChecksumMaxPasses,
 		// Repairing a mismatched chunk writes through the same applier the copy
 		// and binlog-apply phases use, so a repair inherits the configured write
 		// concurrency instead of standing up a second write path. The copier has
@@ -1276,7 +1277,11 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 	for _, change := range r.changes {
 		go change.table.AutoUpdateStatistics(ctx, tableStatUpdateInterval, r.logger)
 	}
-	r.replClient.StartPeriodicFlush(ctx, change.DefaultFlushInterval)
+	flushInterval := change.DefaultFlushInterval
+	if r.migration.testFlushInterval > 0 {
+		flushInterval = r.migration.testFlushInterval
+	}
+	r.replClient.StartPeriodicFlush(ctx, flushInterval)
 	// Start go routines for checkpointing and dumping status. The returned
 	// wait function is invoked from Close() so we can be sure no late
 	// checkpoint INSERT lands after teardown begins.
