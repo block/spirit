@@ -1516,3 +1516,227 @@ func TestForceExecRetriesAfterEveryLookupFails(t *testing.T) {
 	_, err = blocker.ExecContext(ctx, "SELECT 1")
 	require.NoError(t, err, "a kill that could not list the blockers must not kill them")
 }
+
+// A caller that cancels ForceExec while its statement waits for a metadata
+// lock gets the cancellation back only once the statement has ended on the
+// server, with KILL QUERY: its error is 1317 and its session survives, idle.
+// The statement then cannot take effect when the lock is released, as it
+// would if only the client had given up on it.
+func TestForceExecEndsACancelledStatementOnTheServer(t *testing.T) {
+	tt := testutils.NewTestTable(t, "forceexec_cancelled", "CREATE TABLE forceexec_cancelled (id INT PRIMARY KEY)")
+	config := NewDBConfig()
+	db, err := New(testutils.DSN(), config)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	// One connection: KILL QUERY must not need one from the pool.
+	db.SetMaxOpenConns(1)
+	setupCtx, setupCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer setupCancel()
+	blocker := holdTableLock(t, setupCtx, tt.DB, "forceexec_cancelled")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	isWaiting := waitingOn(tt.DB)
+	var stmtPID atomic.Int64
+	err = forceExec(ctx, db, config, slog.Default(),
+		"ALTER TABLE forceexec_cancelled ADD COLUMN c INT, ALGORITHM=INSTANT",
+		func(checkCtx context.Context, connID int) (bool, error) {
+			waiting, err := isWaiting(checkCtx, connID)
+			if waiting {
+				stmtPID.Store(int64(connID))
+				cancel()
+			}
+			return waiting, err
+		},
+		func(context.Context, int) ([]int, error) {
+			t.Error("the blocker must not be killed")
+			return nil, nil
+		}, waitForKilledTransactions, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrCancelledStatementMayStillRun)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrQueryInterrupted}, "KILL QUERY must have ended the statement")
+	require.NotZero(t, stmtPID.Load(), "the statement must have been seen waiting for its lock")
+	require.Equal(t, sessionIdle, sessionState(t, setupCtx, stmtPID.Load()), "KILL QUERY must end the statement and keep its session")
+	require.NoError(t, blocker.Rollback())
+	var columns int
+	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'forceexec_cancelled' AND column_name = 'c'").Scan(&columns))
+	require.Zero(t, columns, "the cancelled ALTER must not apply once the lock is released")
+}
+
+// When the session of a cancelled statement cannot be confirmed to have ended,
+// the error says the statement may still be running, and still carries the
+// statement's error and the cancellation.
+func TestEndCancelledStatementReportsAnUnconfirmedEnd(t *testing.T) {
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	require.NoError(t, db.Close()) // Neither the kill nor the wait can run.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	stmtErr := errors.New("statement interrupted")
+	err = endCancelledStatement(ctx, db, 12345, stmtErr, slog.Default())
+	require.ErrorIs(t, err, ErrCancelledStatementMayStillRun)
+	require.ErrorIs(t, err, stmtErr)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "session 12345")
+	var unconfirmed *CancelledStatementError
+	require.ErrorAs(t, err, &unconfirmed)
+	require.Equal(t, 12345, unconfirmed.ConnID, "the error names the session to check")
+}
+
+// A DROP TABLE cancelled by its caller while it waits for a metadata lock is
+// ended on the server with KILL QUERY before ExecKillOnCancel returns, so the
+// table is still there once the lock is released. The session holding the
+// lock is not killed, and the DROP's own session survives, idle.
+func TestExecKillOnCancelEndsACancelledStatementOnTheServer(t *testing.T) {
+	requireCancelledDropIsInterrupted(t, "exec_kill_on_cancel", func(ctx context.Context, db *sql.DB, stmt string) error {
+		return ExecKillOnCancel(ctx, db, slog.Default(), stmt)
+	})
+}
+
+// ExecWithoutForeignKeyChecks ends a cancelled statement on the server the same
+// way.
+func TestExecWithoutForeignKeyChecksEndsACancelledStatementOnTheServer(t *testing.T) {
+	requireCancelledDropIsInterrupted(t, "exec_without_fk_checks_cancel", func(ctx context.Context, db *sql.DB, stmt string) error {
+		return ExecWithoutForeignKeyChecks(ctx, db, slog.Default(), stmt)
+	})
+}
+
+// When KILL QUERY cannot be sent, here because the pool's Interrupter cannot
+// reach any server, a cancelled statement is still ended on the server: the
+// driver closes its connection, and its session is killed and waited for.
+func TestExecKillOnCancelKillsTheSessionWhenKillQueryFails(t *testing.T) {
+	connector, err := mysql.MySQLDriver{}.OpenConnector(testutils.DSN())
+	require.NoError(t, err)
+	unreachable, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	unreachable.Addr = "127.0.0.1:1"
+	interrupterConnector, err := mysql.NewConnector(unreachable)
+	require.NoError(t, err)
+	db := openPoolWithInterrupter(connector, mysql.NewInterrupter(interrupterConnector))
+	// One connection: the kill can only run once the cancelled statement's
+	// connection has given back its slot.
+	db.SetMaxOpenConns(1)
+	require.NotNil(t, poolInterrupter(db), "the statement must be armed, so that it is the fallback that ends it")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	pid, err := requireCancelledDropLeavesTable(t, "exec_kill_on_cancel_fallback", db, func(ctx context.Context, db *sql.DB, stmt string) error {
+		return ExecKillOnCancel(ctx, db, logger, stmt)
+	})
+	require.NotErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrQueryInterrupted})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, sessionGone, sessionState(t, t.Context(), pid), "the cancelled statement's session must have been killed")
+	require.Contains(t, logs.String(), "KILL QUERY did not end a cancelled statement")
+}
+
+// A pool opened by anything but New has no Interrupter, so its statements are
+// not armed: a cancel closes the connection, and the session is killed.
+func TestPoolInterrupterOnlyForPoolsNewOpened(t *testing.T) {
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	require.NotNil(t, poolInterrupter(db))
+	require.NoError(t, db.Close())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, poolInterrupter(db).KillQuery(ctx, mysql.KillTarget{ThreadID: 1}), mysql.ErrInterrupterClosed, "closing the pool closes its Interrupter")
+
+	other, err := sql.Open(DriverName, testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(other)
+	require.Nil(t, poolInterrupter(other))
+}
+
+func TestStatementReplied(t *testing.T) {
+	require.True(t, statementReplied(nil))
+	require.True(t, statementReplied(fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: parsermysql.ErrQueryInterrupted})))
+	require.True(t, statementReplied(errors.Join(&mysql.MySQLError{Number: parsermysql.ErrLockWaitTimeout}, context.Canceled)))
+	require.False(t, statementReplied(context.Canceled))
+	require.False(t, statementReplied(mysql.ErrInvalidConn))
+	require.False(t, statementReplied(&mysql.MySQLError{Number: errConnLost}), "a lost connection is not the statement's reply")
+}
+
+const (
+	sessionGone = "gone"
+	sessionIdle = "idle"
+	sessionBusy = "running a statement"
+)
+
+// sessionState reports whether the session pid is gone, idle, or still
+// running a statement. It asks on a pool of its own: on the pool of pid's
+// connection, it could ask on that very session, and see its own query.
+func sessionState(t *testing.T, ctx context.Context, pid int64) string {
+	t.Helper()
+	db, err := sql.Open(DriverName, testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var info sql.NullString
+	err = db.QueryRowContext(ctx, "SELECT info FROM information_schema.processlist WHERE id = ?", pid).Scan(&info)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sessionGone
+	}
+	require.NoError(t, err)
+	if info.Valid {
+		return sessionBusy
+	}
+	return sessionIdle
+}
+
+// requireCancelledDropIsInterrupted runs requireCancelledDropLeavesTable on a
+// pool New opened, and requires that KILL QUERY ended the DROP: its error is
+// 1317, and its session survives, idle. The pool has one connection, so KILL
+// QUERY must not need one of the pool's.
+func requireCancelledDropIsInterrupted(t *testing.T, table string, exec func(context.Context, *sql.DB, string) error) {
+	t.Helper()
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	pid, err := requireCancelledDropLeavesTable(t, table, db, exec)
+	require.ErrorIs(t, err, &mysql.MySQLError{Number: parsermysql.ErrQueryInterrupted}, "KILL QUERY must have ended the statement")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, sessionIdle, sessionState(t, t.Context(), pid), "KILL QUERY must end the statement and keep its session")
+}
+
+// requireCancelledDropLeavesTable cancels exec's DROP TABLE of table on db
+// while it waits for another session's metadata lock, and requires that the
+// DROP is no longer running when exec returns, that its end is confirmed,
+// that the lock holder was not killed, and that the table survives the lock's
+// release. It returns the DROP's session and exec's error. db is closed when
+// the test ends.
+func requireCancelledDropLeavesTable(t *testing.T, table string, db *sql.DB, exec func(context.Context, *sql.DB, string) error) (int64, error) {
+	t.Helper()
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	tt := testutils.NewTestTable(t, table, fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", table))
+	setupCtx, setupCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer setupCancel()
+	blocker := holdTableLock(t, setupCtx, tt.DB, table)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var workers sync.WaitGroup
+	var stmtPID atomic.Int64
+	workers.Go(func() {
+		// Cancel once the DROP is seen waiting for the blocker's lock.
+		for ctx.Err() == nil {
+			var pid int64
+			err := tt.DB.QueryRowContext(ctx, "SELECT id FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE "+table+"%").Scan(&pid)
+			if err == nil {
+				stmtPID.Store(pid)
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	execErr := exec(ctx, db, "DROP TABLE "+table)
+	workers.Wait()
+	require.Error(t, execErr)
+	require.NotErrorIs(t, execErr, ErrCancelledStatementMayStillRun)
+	require.NotZero(t, stmtPID.Load(), "the DROP must have been seen waiting for its lock")
+	require.NotEqual(t, sessionBusy, sessionState(t, setupCtx, stmtPID.Load()), "the cancelled DROP must not still be running")
+	_, err := blocker.ExecContext(setupCtx, "SELECT 1")
+	require.NoError(t, err, "the session holding the lock must not be killed")
+	require.NoError(t, blocker.Rollback())
+	var tables int
+	require.NoError(t, tt.DB.QueryRowContext(setupCtx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", table).Scan(&tables))
+	require.Equal(t, 1, tables, "the cancelled DROP must not apply once the lock is released")
+	return stmtPID.Load(), execErr
+}

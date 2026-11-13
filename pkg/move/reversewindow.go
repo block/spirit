@@ -155,7 +155,7 @@ func newReverseWindow(r *Runner) *reverseWindow {
 		persistPhase: func(ctx context.Context, phase string) error {
 			return r.checkpointTbl().Write(ctx, checkpoint.Record{Phase: phase, CutoverAt: r.cutoverAt})
 		},
-		dropMarker:     func(ctx context.Context) error { return dropRevertMarker(ctx, r.targets[0].DB) },
+		dropMarker:     func(ctx context.Context) error { return dropRevertMarker(ctx, r.targets[0].DB, r.logger) },
 		dropCheckpoint: func(ctx context.Context) error { return r.checkpointTbl().Drop(ctx) },
 		writeCheckpoint: func(ctx context.Context, rec checkpoint.Record) error {
 			return r.checkpointTbl().Write(ctx, rec)

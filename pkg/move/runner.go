@@ -1096,7 +1096,7 @@ func (r *Runner) decideResume(ctx context.Context) (resumeDecision, error) {
 func (r *Runner) wipeTargets(ctx context.Context) error {
 	for i := range r.targets {
 		for _, t := range r.sourceTables {
-			if err := dbconn.Exec(ctx, r.targets[i].DB, "DROP TABLE IF EXISTS %n", t.TableName); err != nil {
+			if err := dbconn.ExecKillOnCancel(ctx, r.targets[i].DB, r.logger, "DROP TABLE IF EXISTS %n", t.TableName); err != nil {
 				return fmt.Errorf("drop target table %q on target %d: %w", t.TableName, i, err)
 			}
 		}

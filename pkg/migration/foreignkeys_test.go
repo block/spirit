@@ -447,7 +447,7 @@ func TestRestoreForeignKeyNamesFromTable(t *testing.T) {
 	// The copies' names, as the cutover's RENAME leaves them: it gives a
 	// generated name back by itself.
 	exec := func(ctx context.Context, stmt string) error {
-		return dbconn.ExecWithoutForeignKeyChecks(ctx, db, "%r", sqlescape.RawSQL(stmt))
+		return dbconn.ExecWithoutForeignKeyChecks(ctx, db, slog.Default(), "%r", sqlescape.RawSQL(stmt))
 	}
 	fk := parsedCreateTable(t, db, "child").GetConstraints()
 	i := slices.IndexFunc(fk, func(c statement.Constraint) bool { return c.Name == "fk_child_parent" })
@@ -584,7 +584,7 @@ func TestForeignKeysResumeAfterFailedCutoverAttempt(t *testing.T) {
 	// What a failed cutover attempt writes: it adds the foreign keys under the
 	// lock, then drops them again before it unlocks.
 	exec := func(ctx context.Context, stmt string) error {
-		return dbconn.ExecWithoutForeignKeyChecks(ctx, db, "%r", sqlescape.RawSQL(stmt))
+		return dbconn.ExecWithoutForeignKeyChecks(ctx, db, slog.Default(), "%r", sqlescape.RawSQL(stmt))
 	}
 	require.NoError(t, exec(t.Context(), "ALTER TABLE _child_new ADD CONSTRAINT _fk_restrict_new FOREIGN KEY (pid) REFERENCES parent (id), ALGORITHM=INPLACE, LOCK=NONE"))
 	require.NoError(t, exec(t.Context(), "ALTER TABLE _child_new DROP FOREIGN KEY _fk_restrict_new, ALGORITHM=INPLACE, LOCK=NONE"))
