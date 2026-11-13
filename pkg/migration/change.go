@@ -4,13 +4,16 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -151,10 +154,12 @@ func (c *tableChange) alterNewTable(ctx context.Context) error {
 		// is not on the end of it. The clauses can still differ from what the user wrote:
 		// newTableAlter rewrites check constraint names for the new table, so either error
 		// may quote a server-generated name in place of the user's symbol.
-		if err := exec(ctx, sqlescape.MustEscapeSQL("ALTER TABLE %n %r", c.newTable.TableName, sqlescape.RawSQL(alter))); err != nil {
+		err = exec(ctx, sqlescape.MustEscapeSQL("ALTER TABLE %n %r", c.newTable.TableName, sqlescape.RawSQL(alter)))
+		if err != nil {
+			err = c.retryExpressionDefaults(ctx, exec, alter, err)
+		}
+		if err != nil {
 			if alter != c.stmt.TrimAlter() {
-				// Say which statement failed, since it is not the one the user
-				// wrote and the error can name a constraint they have never seen.
 				return fmt.Errorf("%w (applied to the new table as: ALTER TABLE %s %s)",
 					err, c.newTable.TableName, alter)
 			}
@@ -176,6 +181,35 @@ func (c *tableChange) alterNewTable(ctx context.Context) error {
 
 	// Preserve AUTO_INCREMENT value from the original table AFTER the ALTER.
 	return c.preserveAutoIncrement(ctx)
+}
+
+// retryExpressionDefaults handles MySQL's rejection of nondeterministic defaults
+// in ADD COLUMN (1674). DDL is statement-logged even under ROW logging, and MySQL
+// rejects this form even on an empty table. Setting the default separately does
+// not evaluate it; the later row copy does, under row-based logging.
+//
+// Only alterNewTable calls this, on a freshly created, empty shadow. The source
+// ALTER and checkpoint statement remain unchanged. A failure of either step
+// aborts setup before copying or creating a checkpoint; a fresh run recreates
+// the shadow rather than resuming a partially prepared schema.
+func (c *tableChange) retryExpressionDefaults(ctx context.Context, exec execFunc, alter string, original error) error {
+	if !errors.Is(original, &mysql.MySQLError{Number: parsermysql.ErrBinlogUnsafeSystemFunction}) {
+		return original
+	}
+	add, defaults, err := statement.SplitAddColumnExpressionDefaults(alter)
+	if err != nil {
+		return fmt.Errorf("%w (could not split expression defaults: %w)", original, err)
+	}
+	if add == "" {
+		return original
+	}
+	c.runner.logger.Info("retrying empty shadow ALTER with expression defaults set separately", "table", c.newTable.TableName)
+	for _, clause := range []string{add + ", ALGORITHM=COPY", defaults} {
+		if err := exec(ctx, sqlescape.MustEscapeSQL("ALTER TABLE %n %r", c.newTable.TableName, sqlescape.RawSQL(clause))); err != nil {
+			return fmt.Errorf("set up expression defaults on empty shadow %s: %w", c.newTable.TableName, err)
+		}
+	}
+	return nil
 }
 
 // foreignKeyExec returns how setup runs DDL on newName, the new table of a
