@@ -210,18 +210,29 @@ func doOneWriteLoop(ctx context.Context, db *sql.DB) error {
 	return trx.Commit()
 }
 
-// TestMoveWithNewTableCreation verifies that creating a new table in the source database
-// during a move operation causes the move to be cancelled immediately via table notification.
+// TestMoveWithNewTableCreation verifies that creating a new table in the source
+// database during a move cancels the move through the change feed's DDL
+// notification.
+//
+// The CREATE TABLE is issued only once the move is parked at the sentinel
+// (DeferCutOver), so the change feed is already streaming and must read it.
+// Issued earlier, it can land before the feed's start position and never be
+// seen; the move then ends on the sentinel wait limit, which the assertions
+// below reject.
 func TestMoveWithNewTableCreation(t *testing.T) {
+	// TestMain shrinks sentinel.WaitLimit to 10s for this package. Give the
+	// change feed a minute to read the DDL instead, so a slow feed on a loaded
+	// -race runner cannot fail the test on a sentinel timeout.
+	oldWaitLimit := sentinel.WaitLimit
+	sentinel.WaitLimit = time.Minute
+	t.Cleanup(func() { sentinel.WaitLimit = oldWaitLimit })
+
 	sourceDSN := testutils.DSNForDatabase("source_newtable")
 	targetDSN := testutils.DSNForDatabase("dest_newtable")
 
-	// Clean up both databases to ensure a fresh start
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS source_newtable`)
 	testutils.RunSQL(t, `DROP DATABASE IF EXISTS dest_newtable`)
 
-	// Setup source database with a table
-	t.Logf("Creating source database")
 	testutils.RunSQL(t, `CREATE DATABASE source_newtable`)
 	testutils.RunSQL(t, `CREATE TABLE source_newtable.xfers (
 		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
@@ -245,75 +256,75 @@ func TestMoveWithNewTableCreation(t *testing.T) {
 		KEY idx_s_token (s_token),
 		KEY idx_r_token (r_token)
 	)`)
-
-	// Insert more initial data to slow down the move operation
-	// This gives us more time for the table creation to happen during the move
 	testutils.RunSQL(t, `INSERT INTO source_newtable.xfers (x_token, cents, currency, s_token, r_token, version, created_at, updated_at)
-		VALUES ('initial-1', 100, 'USD', 'sender-1', 'receiver-1', 1, NOW(), NOW())`)
+		VALUES (UUID(), 100, 'USD', UUID(), UUID(), 1, NOW(), NOW())`)
+	for range 5 {
+		testutils.RunSQL(t, `INSERT INTO source_newtable.xfers (x_token, cents, currency, s_token, r_token, version, created_at, updated_at)
+			SELECT UUID(), cents, currency, UUID(), UUID(), version, NOW(), NOW() FROM source_newtable.xfers`)
+	}
 
-	// Add many more rows to make the copy phase take longer
-	// Use a cross join to quickly generate many rows
-	//nolint: dupword
-	testutils.RunSQL(t, `INSERT INTO source_newtable.xfers (x_token, cents, currency, s_token, r_token, version, created_at, updated_at)
-		SELECT UUID(), 100, 'USD', UUID(), UUID(), 1, NOW(), NOW()
-		FROM source_newtable.xfers a
-		CROSS JOIN source_newtable.xfers b
-		LIMIT 10000`)
-
-	// Setup target database
 	testutils.RunSQL(t, `CREATE DATABASE dest_newtable`)
 
-	// Open connection to source for concurrent writes
+	// Keep DML flowing on the source, so the DDL arrives in a stream of row
+	// events rather than an idle one.
 	sourceDB, err := sql.Open("block-mysql", sourceDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sourceDB)
-
-	// Start concurrent write load
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
+	writeCtx, stopWrites := context.WithCancel(t.Context())
 	var wg sync.WaitGroup
-	var writeCount atomic.Int64
-	var errorCount atomic.Int64
-	numThreads := 2
-
-	// Start write threads
-	for range numThreads {
+	defer func() {
+		stopWrites()
+		wg.Wait()
+	}()
+	var writeCount, errorCount atomic.Int64
+	for range 2 {
 		wg.Go(func() {
-			concurrentWriteThread(ctx, sourceDB, &writeCount, &errorCount)
+			concurrentWriteThread(writeCtx, sourceDB, &writeCount, &errorCount)
 		})
 	}
 
-	// Give the writers a moment to start
-	// it has a sentinel so it will never complete accidentally
-	time.Sleep(100 * time.Millisecond)
-	move := Move{
+	runner, err := NewRunner(&Move{
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
 		Common:    flags.Common{Threads: 2, WriteThreads: 2},
 		Cutover:   flags.Cutover{DeferCutOver: true},
-	}
-	wg.Go(func() {
-		err = move.Run()
-		// The error is context canceled, which is not that useful.
-		// But the problem is written to the log as:
-		// ERROR table definition changed during move operation table=source_newtable.new_table
-		// This is clear enough.
-		require.Error(t, err, "Move should fail when a new table is created")
 	})
+	require.NoError(t, err)
+	defer utils.CloseAndLog(runner)
 
-	// Give the move a moment to start
-	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, done)
 
-	// create a table which will break the move operation
+	// The change feed is streaming, so it must read this DDL and abort the move.
 	testutils.RunSQL(t, `CREATE TABLE source_newtable.new_table (
-			id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
-			data VARCHAR(255)
-		)`)
+		id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,
+		data VARCHAR(255)
+	)`)
 
-	// Stop the write threads
-	cancel()
-	wg.Wait()
+	// The sentinel wait limit bounds Run, so this timeout is only a backstop.
+	// When it fires, give Run a bounded time to honour the cancel before
+	// failing, so the deferred Close does not race a still-running Run.
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(2 * time.Minute):
+		cancel()
+		select {
+		case <-done:
+			t.Fatal("move did not return after a new table was created in the source schema")
+		case <-time.After(30 * time.Second):
+			t.Fatal("move did not return after a new table was created in the source schema, nor within 30s of being cancelled")
+		}
+	}
+
+	// Only the DDL notification raises the schema-change reason, so requiring
+	// it rejects every other way the move can end (sentinel timeout, cancel).
+	require.Error(t, runErr)
+	require.NotErrorIs(t, runErr, context.Canceled)
+	require.ErrorContains(t, runErr, "fatal change feed condition ("+change.FatalReasonSchemaChange.String()+")")
 }
 
 // TestMoveFailsGracefullyWithMinimalRBR verifies that a move operation fails
