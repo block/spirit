@@ -245,6 +245,12 @@ func TestTableLockCrossSchema(t *testing.T) {
 func TestTableLockCleanup(t *testing.T) {
 	for _, mode := range []string{"normal", "cancel_acquisition_context", "cancel_cleanup_context", "expired_cleanup_context", "lost_connection", "cancel_inflight_query", "discard_locked_session"} {
 		t.Run(mode, func(t *testing.T) {
+			if mode == "lost_connection" {
+				// This mode KILLs the locked session. Skip it before any table
+				// is created: on 8.0.28 the lock outlives the KILL and blocks the
+				// next subtests' setup.
+				testutils.SkipBeforeMySQLVersion(t, "8.0.29", killedSessionLingersReason)
+			}
 			tt := testutils.NewTestTable(t, "tablelock_cleanup", "CREATE TABLE tablelock_cleanup (id INT PRIMARY KEY)")
 			testutils.NewTestTable(t, "tablelock_unrelated", "CREATE TABLE tablelock_unrelated (id INT PRIMARY KEY)")
 			cfg := testConfig()
