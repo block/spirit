@@ -467,21 +467,20 @@ func TestSecondaryEngineAttribute(t *testing.T) {
 // and supporting a large number of changes in general. Apart from the advisory locks (currently 1 per table),
 // this shouldn't require more connections than regular single table changes.
 // https://github.com/block/spirit/issues/502
+//
+// It runs in its own database: the multi-table lock and checkpoint table are
+// scoped to the schema, so it cannot collide with another multi-table test and
+// can run in parallel.
 func TestLargeNumberOfMultiChanges(t *testing.T) {
+	t.Parallel()
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
 	var alterStmts []string
 	for i := range 50 {
-		testutils.RunSQL(t, fmt.Sprintf(`DROP TABLE IF EXISTS mt_%d, _mt_%d_new, _mt_%d_old, _mt_%d_chkpnt`, i, i, i, i))
-		testutils.RunSQL(t, fmt.Sprintf(`CREATE TABLE mt_%d (id int not null primary key auto_increment, b INT NOT NULL)`, i))
+		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(`CREATE TABLE mt_%d (id int not null primary key auto_increment, b INT NOT NULL)`, i))
 		alterStmts = append(alterStmts, fmt.Sprintf(`ALTER TABLE mt_%d ENGINE=InnoDB`, i))
 	}
-	t.Cleanup(func() {
-		for i := range 50 {
-			// only need to drop success artifacts
-			testutils.RunSQL(t, fmt.Sprintf(`DROP TABLE IF EXISTS mt_%d`, i))
-		}
-	})
 
-	m := NewTestMigration(t, WithStatement(strings.Join(alterStmts, "; ")))
+	m := NewTestMigration(t, WithDBName(dbName), WithStatement(strings.Join(alterStmts, "; ")))
 	require.NoError(t, m.Run())
 }
 

@@ -15,6 +15,7 @@ import (
 // Lockless is the default checker; --legacy-checksum is the only way to get
 // the snapshot checker.
 func TestLocklessMigration(t *testing.T) {
+	t.Parallel()
 	for _, alter := range []string{"ENGINE=InnoDB", "CHANGE COLUMN value renamed BIGINT NOT NULL"} {
 		t.Run(alter, func(t *testing.T) {
 			tt := testutils.NewTestTable(t, "lockless_migration", "CREATE TABLE lockless_migration (id INT AUTO_INCREMENT PRIMARY KEY, value INT NOT NULL)")
@@ -105,6 +106,7 @@ func TestLocklessCheckpointPersistsChecksumWatermark(t *testing.T) {
 // A checkpoint written under --legacy-checksum (the previous default) resumes
 // under the default lockless checksum at its saved watermark: the upgrade path.
 func TestLocklessResumesLegacyChecksumWatermark(t *testing.T) {
+	t.Parallel()
 	r := setupRunnerForChecksumTest(t, "legacy_to_lockless")
 	r.migration.LegacyChecksum = true
 	advanceRunnerToChecksumWatermarks(t, r)
@@ -131,6 +133,7 @@ func TestLocklessResumesLegacyChecksumWatermark(t *testing.T) {
 // discarded: resuming starts verification at the watermark and reports the
 // prefix below it as already checked.
 func TestLocklessResumeHonoursChecksumWatermark(t *testing.T) {
+	t.Parallel()
 	r := setupRunnerForChecksumTest(t, "lockless_resume")
 	advanceRunnerToChecksumWatermarks(t, r)
 	r.status.Set(status.Checksum)
