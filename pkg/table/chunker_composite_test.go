@@ -24,11 +24,11 @@ func TestCompositeChunkerCompositeBinary(t *testing.T) {
 		c int NOT NULL,
 		PRIMARY KEY (a,b)
 	)`)
-	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM dual`)                                                                                      //nolint: dupword
-	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 1000000`) //nolint: dupword
-	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 1000000`) //nolint: dupword
-	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 1000000`) //nolint: dupword
-	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 1000000`) //nolint: dupword
+	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM dual`)                                                                                    //nolint: dupword
+	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 10000`) //nolint: dupword
+	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 10000`) //nolint: dupword
+	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 10000`) //nolint: dupword
+	testutils.RunSQL(t, `INSERT INTO composite_binary_t1 (a, b, c) SELECT UUID(), UUID(), 1 FROM composite_binary_t1 a JOIN composite_binary_t1 b JOIN composite_binary_t1 c LIMIT 10000`) //nolint: dupword
 
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
@@ -115,10 +115,10 @@ func TestCompositeChunkerCompositeBinary(t *testing.T) {
 		totalChunks++
 		require.NotNil(t, chunk)
 	}
-	// there are 1001010 rows. It should be about 1002 chunks.
-	// we don't care that it's exact, since we don't want a flaky
-	// test if we make small changes.
-	require.True(t, totalChunks < 1005 && totalChunks > 995)
+	// There are 11010 rows and chunks of about 1000 rows, so about 12
+	// chunks. The bound is loose so small sizing changes don't make the
+	// test flaky.
+	require.True(t, totalChunks < 15 && totalChunks > 9, "got %d chunks", totalChunks)
 }
 
 func TestCompositeChunkerBinary(t *testing.T) {
@@ -130,10 +130,10 @@ func TestCompositeChunkerBinary(t *testing.T) {
 		PRIMARY KEY (pk)
 	)`)
 	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM dual`)
-	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 1000000`)
-	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 1000000`)
-	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 1000000`)
-	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 1000000`)
+	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 10000`)
+	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 10000`)
+	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 10000`)
+	testutils.RunSQL(t, `INSERT INTO composite_t1 (pk, a, b) SELECT UUID(), 1, 1 FROM composite_t1 a JOIN composite_t1 b JOIN composite_t1 c LIMIT 10000`)
 
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
@@ -195,10 +195,10 @@ func TestCompositeChunkerBinary(t *testing.T) {
 		totalChunks++
 		require.NotNil(t, chunk)
 	}
-	// there are 1001010 rows. It should be about 1002 chunks.
-	// we don't care that it's exact, since we don't want a flaky
-	// test if we make small changes.
-	require.True(t, totalChunks < 1005 && totalChunks > 995)
+	// There are 11010 rows and chunks of about 1000 rows, so about 12
+	// chunks. The bound is loose so small sizing changes don't make the
+	// test flaky.
+	require.True(t, totalChunks < 15 && totalChunks > 9, "got %d chunks", totalChunks)
 }
 
 // TestCompositeChunkerBinaryHexStringWatermark is a regression test for
@@ -307,10 +307,10 @@ func TestCompositeChunkerInt(t *testing.T) {
 		b int NOT NULL
 	)`)
 	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM dual`)
-	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 1000000`)
-	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 1000000`)
-	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 1000000`)
-	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 1000000`)
+	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 10000`)
+	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 10000`)
+	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 10000`)
+	testutils.RunSQL(t, `INSERT INTO compositeint_t1 (pk, a, b) SELECT NULL, 1, 1 FROM compositeint_t1 a JOIN compositeint_t1 b JOIN compositeint_t1 c LIMIT 10000`)
 	// remove autoinc before discovery.
 	testutils.RunSQL(t, "ALTER TABLE compositeint_t1 CHANGE COLUMN pk pk int NOT NULL") //nolint: dupword
 
@@ -359,10 +359,10 @@ func TestCompositeChunkerInt(t *testing.T) {
 		totalChunks++
 		require.NotNil(t, chunk)
 	}
-	// there are 1001010 rows. It should be about 1002 chunks.
-	// we don't care that it's exact, since we don't want a flaky
-	// test if we make small changes.
-	require.True(t, totalChunks < 1005 && totalChunks > 995)
+	// There are 11010 rows and chunks of about 1000 rows, so about 12
+	// chunks. The bound is loose so small sizing changes don't make the
+	// test flaky.
+	require.True(t, totalChunks < 15 && totalChunks > 9, "got %d chunks", totalChunks)
 }
 
 func TestCompositeLowWatermark(t *testing.T) {

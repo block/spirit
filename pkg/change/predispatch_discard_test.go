@@ -153,12 +153,14 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE predisp_src (a INT NOT NULL %s, b INT, PRIMARY KEY (a))", autoInc))
 	testutils.RunSQL(t, fmt.Sprintf("CREATE TABLE predisp_dst (a INT NOT NULL %s, b INT, PRIMARY KEY (a))", autoInc))
 	testutils.RunSQL(t, "INSERT INTO predisp_src (a,b) VALUES (1, 1)")
-	for n := 1; n < 16384; n *= 2 { // a = 1..16384
+	// a = 1..2048. The copier's first chunk covers table.StartingChunkSize
+	// (1000) keys, so the top key is outside it.
+	for n := 1; n < 2048; n *= 2 {
 		testutils.RunSQL(t, fmt.Sprintf("INSERT INTO predisp_src (a,b) SELECT a + %d, 1 FROM predisp_src", n))
 	}
 	testutils.RunSQL(t, "ANALYZE TABLE predisp_src")
 	t.Cleanup(func() { testutils.RunSQL(t, "DROP TABLE IF EXISTS predisp_src, predisp_dst") })
-	const key = 16384 // the top of the key space; far above the first chunk
+	const key = 2048 // the top of the key space; above the first chunk
 
 	src := table.NewTableInfo(db, "test", "predisp_src")
 	require.NoError(t, src.SetInfo(t.Context()))

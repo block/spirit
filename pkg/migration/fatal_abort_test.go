@@ -91,7 +91,7 @@ func TestMigrationFatalAbortBeforeFirstPhase(t *testing.T) {
 // TestMigrationCheckpointWriteFailureReturnsCause checks that when the
 // checkpoint dumper cannot write the checkpoint and stops the migration, Run
 // returns an error naming the checkpoint failure, not context.Canceled. The
-// test throttler paces the copy at one chunk per second, so the copy is still
+// copy stops after two chunks and holds until the run ends, so it is still
 // running when the checkpoint table is dropped.
 func TestMigrationCheckpointWriteFailureReturnsCause(t *testing.T) {
 	t.Parallel()
@@ -99,9 +99,9 @@ func TestMigrationCheckpointWriteFailureReturnsCause(t *testing.T) {
 		id int not null primary key auto_increment,
 		b varchar(100) not null
 	)`)
-	tt.SeedRows(t, "INSERT INTO ckptfail (b) SELECT 'abc'", 100000)
+	tt.SeedRows(t, "INSERT INTO ckptfail (b) SELECT 'abc'", 10000)
 
-	m := NewTestRunnerFromStatement(t, "ALTER TABLE ckptfail ENGINE=InnoDB", WithThreads(1), WithTestThrottler())
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE ckptfail ENGINE=InnoDB", WithThreads(1), WithCopyStalledAfterChunks(2))
 	sink := newOutcomeSink()
 	m.SetMetricsSink(sink)
 
