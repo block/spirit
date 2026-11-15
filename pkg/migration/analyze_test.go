@@ -20,6 +20,7 @@ import (
 // reports as an Error row. Dropping the real _new table instead would fire
 // the change feed's DDL guard and cancel the run before ANALYZE is reached.
 func TestPostCopyAnalyzeErrorFailsMigration(t *testing.T) {
+	t.Parallel()
 	testutils.NewTestTable(t, "analyzeerr", `CREATE TABLE analyzeerr (
 		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		pad INT NOT NULL DEFAULT 0)`)
