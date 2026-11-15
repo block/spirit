@@ -445,10 +445,12 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 		col1 varbinary(1024),
 		col2 varbinary(1024)
 	) character set utf8mb4`)
-	tt.SeedRows(t, "INSERT INTO t1modification (col1, col2) SELECT RANDOM_BYTES(1024), RANDOM_BYTES(1024)", 100000)
+	tt.SeedRows(t, "INSERT INTO t1modification (col1, col2) SELECT RANDOM_BYTES(16), RANDOM_BYTES(16)", 10000)
 
+	// The copy stops after two chunks and holds until the run ends, so the
+	// DDL below always lands during the copy.
 	m := NewTestRunnerFromStatement(t, "ALTER TABLE t1modification ENGINE=InnoDB",
-		WithThreads(1))
+		WithThreads(1), WithCopyStalledAfterChunks(2))
 	sink := newOutcomeSink()
 	m.SetMetricsSink(sink)
 
@@ -462,8 +464,11 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	// The abort must come back as the failure it is, not as the
 	// context.Canceled every phase observes once the migration is stopped:
 	// callers (and the phase metrics) tell an operator cancellation from a
-	// failure by exactly that.
-	err := running.wait(t)
+	// failure by exactly that. The copy cannot finish, so a migration that
+	// missed the DDL never returns.
+	err := running.waitWithin(t, time.Minute, func() string {
+		return fmt.Sprintf("migration still running (state %s) after the table was altered", m.status.Get())
+	})
 	require.Error(t, err)
 	require.NotErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, change.FatalReasonSchemaChange.String())
@@ -507,16 +512,14 @@ func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
 	_, err := tt.DB.ExecContext(t.Context(), "UPDATE flushapplyerr SET b = REPEAT('x', 50) WHERE id = ?", minID)
 	require.NoError(t, err)
 
-	select {
-	case <-running.done:
-	case <-time.After(time.Minute):
-		t.Fatalf("migration still running (state %s) after the periodic flush failed", m.status.Get())
-	}
-	require.Error(t, running.err)
+	err = running.waitWithin(t, time.Minute, func() string {
+		return fmt.Sprintf("migration still running (state %s) after the periodic flush failed", m.status.Get())
+	})
+	require.Error(t, err)
 	// The synchronous flush after the copy would fail on the same change,
 	// but with the bare apply error: the reason shows it was the periodic
 	// flush, during the copy, that stopped the migration.
-	require.ErrorContains(t, running.err, change.FatalReasonFlushError.String())
+	require.ErrorContains(t, err, change.FatalReasonFlushError.String())
 	require.True(t, checkpointTableExists(t, m), "the checkpoint is still valid and must be preserved")
 }
 
