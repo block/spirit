@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/check"
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/status"
@@ -283,9 +284,14 @@ func TestAddUniqueIndexChecksumEnabled(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO uniqmytable (name, b) VALUES ('a', REPEAT('c', 200))")
 	testutils.RunSQL(t, "INSERT INTO uniqmytable (name, b) VALUES ('a', REPEAT('a', 200))") // duplicate
 
-	m := NewTestRunner(t, "uniqmytable", "ADD UNIQUE INDEX b (b)")
+	// The duplicate makes every checksum pass find and repair a difference,
+	// so the run fails once the pass budget is spent. Two passes is the
+	// fewest that show a repair cannot close the divergence
+	// (ErrDifferencesExhausted); the default is ten.
+	m := NewTestRunner(t, "uniqmytable", "ADD UNIQUE INDEX b (b)", WithChecksumMaxPasses(2))
 	err := m.Run(t.Context())
-	require.Error(t, err) // not unique
+	require.ErrorIs(t, err, checksum.ErrVerificationUnresolved) // not unique
+	require.ErrorIs(t, err, checksum.ErrDifferencesExhausted)
 	require.NoError(t, m.Close())
 
 	// Fix the data and retry
@@ -477,12 +483,14 @@ func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
 		id int not null primary key auto_increment,
 		b varchar(100) not null
 	)`)
-	tt.SeedRows(t, "INSERT INTO flushapplyerr (b) SELECT 'abc'", 100000)
+	tt.SeedRows(t, "INSERT INTO flushapplyerr (b) SELECT 'abc'", 10000)
 
-	// Small chunks and the test throttler keep the copy running for far
-	// longer than the first periodic flush takes to fire.
+	// The copy stops after two small chunks and holds until the run ends, so
+	// the only way the run can end is the periodic flush failing. A 1s flush
+	// interval makes that flush fire soon.
 	m := NewTestRunnerFromStatement(t, "ALTER TABLE flushapplyerr MODIFY b VARCHAR(10) NOT NULL",
-		WithThreads(1), WithTestThrottler(), func(m *Migration) { m.TargetChunkSize = 8192 })
+		WithThreads(1), WithCopyStalledAfterChunks(2), WithFlushInterval(time.Second),
+		func(m *Migration) { m.TargetChunkSize = 8192 })
 	running := startTestRun(t, m.Run, m.Close)
 	waitForStatus(t, m, status.CopyRows, running)
 
@@ -501,7 +509,7 @@ func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
 
 	select {
 	case <-running.done:
-	case <-time.After(change.DefaultFlushInterval + time.Minute):
+	case <-time.After(time.Minute):
 		t.Fatalf("migration still running (state %s) after the periodic flush failed", m.status.Get())
 	}
 	require.Error(t, running.err)

@@ -16,7 +16,6 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
@@ -2315,11 +2314,12 @@ func TestCreateApplierReportsStatsToMetricsSink(t *testing.T) {
 	r.dbConfig = dbconn.NewDBConfig()
 	r.targets = []applier.Target{{DB: dstDB, Config: dst, KeyRange: "0"}}
 
+	applier.SetStatsEmitTickForTest(t, 10*time.Millisecond)
 	appl, err := r.createApplier()
 	require.NoError(t, err)
 	require.NoError(t, appl.Start(t.Context()))
 	defer func() { require.NoError(t, appl.Stop()) }()
 
-	require.Eventually(t, sink.seen.Load, 3*autoscale.Tick, 50*time.Millisecond,
+	require.Eventually(t, sink.seen.Load, 5*time.Second, 10*time.Millisecond,
 		"the move's applier never reported its stats to the metrics sink")
 }
