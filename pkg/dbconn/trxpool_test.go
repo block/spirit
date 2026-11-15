@@ -90,6 +90,7 @@ func TestTrxPoolBeginError(t *testing.T) {
 // through pool creation, NewTrxPool returns an error and the transactions
 // created by earlier iterations are rolled back (no connection leak).
 func TestTrxPoolBeginErrorMidLoop(t *testing.T) {
+	t.Parallel()
 	db, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
