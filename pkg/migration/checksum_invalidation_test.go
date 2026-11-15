@@ -176,10 +176,11 @@ func TestContinuousChecksumClearsCheckpointWatermark(t *testing.T) {
 // watermark is empty, so the resumed migration re-runs the initial checksum
 // from the start, which repairs the row, and then cuts over.
 //
-// Not parallel: it relies on the short lockless-checksum pacing / retry delay
-// set once in TestMain (checksum.LocklessMinPassInterval = 2s,
+// It relies on the short lockless-checksum pacing / retry delay set once in
+// TestMain (checksum.LocklessMinPassInterval = 2s,
 // checksum.DefaultLocklessRetryDelay = 1s) so the divergence is detected
-// promptly.
+// promptly. Each subtest runs in its own database because the sentinel table is
+// scoped to the schema; that is what makes it safe to run in parallel.
 func TestContinuousChecksumAbortsThenResumeRepairs(t *testing.T) {
 	t.Parallel()
 	for _, lockless := range []bool{false, true} {
