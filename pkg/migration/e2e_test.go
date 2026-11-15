@@ -466,12 +466,9 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	// callers (and the phase metrics) tell an operator cancellation from a
 	// failure by exactly that. The copy cannot finish, so a migration that
 	// missed the DDL never returns.
-	select {
-	case <-running.done:
-	case <-time.After(time.Minute):
-		t.Fatalf("migration still running (state %s) after the table was altered", m.status.Get())
-	}
-	err := running.err
+	err := running.waitWithin(t, time.Minute, func() string {
+		return fmt.Sprintf("migration still running (state %s) after the table was altered", m.status.Get())
+	})
 	require.Error(t, err)
 	require.NotErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, change.FatalReasonSchemaChange.String())
@@ -515,16 +512,14 @@ func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
 	_, err := tt.DB.ExecContext(t.Context(), "UPDATE flushapplyerr SET b = REPEAT('x', 50) WHERE id = ?", minID)
 	require.NoError(t, err)
 
-	select {
-	case <-running.done:
-	case <-time.After(time.Minute):
-		t.Fatalf("migration still running (state %s) after the periodic flush failed", m.status.Get())
-	}
-	require.Error(t, running.err)
+	err = running.waitWithin(t, time.Minute, func() string {
+		return fmt.Sprintf("migration still running (state %s) after the periodic flush failed", m.status.Get())
+	})
+	require.Error(t, err)
 	// The synchronous flush after the copy would fail on the same change,
 	// but with the bare apply error: the reason shows it was the periodic
 	// flush, during the copy, that stopped the migration.
-	require.ErrorContains(t, running.err, change.FatalReasonFlushError.String())
+	require.ErrorContains(t, err, change.FatalReasonFlushError.String())
 	require.True(t, checkpointTableExists(t, m), "the checkpoint is still valid and must be preserved")
 }
 
