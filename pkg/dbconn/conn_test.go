@@ -447,6 +447,7 @@ func stalledServerWithGreeting(t *testing.T, greeting []byte) string {
 // have no deadline, so New blocked forever; the driver's dial timeout does not
 // help here because the dial itself succeeds.
 func TestNewStalledHandshakeTimesOut(t *testing.T) {
+	t.Parallel()
 	addr := stalledServer(t)
 	dsn := fmt.Sprintf("spirit:spirit@tcp(%s)/test", addr)
 	for _, tlsMode := range []string{"DISABLED", "PREFERRED", "REQUIRED"} {
@@ -490,6 +491,7 @@ func TestNewPreferredFallbackStalledHandshakeTimesOut(t *testing.T) {
 // ping deadline. The dial runs under the ping's context, so taking only the
 // larger of the two would let a slow dial use up the handshake's budget.
 func TestNewAddsDSNTimeoutToDeadline(t *testing.T) {
+	t.Parallel()
 	addr := stalledServer(t)
 	cfg := NewDBConfig()
 	cfg.TLSMode = "DISABLED"

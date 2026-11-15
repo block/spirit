@@ -86,6 +86,7 @@ func TestLockWaitTimeouts(t *testing.T) {
 }
 
 func TestRetryableTrx(t *testing.T) {
+	t.Parallel()
 	config := NewDBConfig()
 	db, err := New(testutils.DSN(), config)
 	require.NoError(t, err)
@@ -477,6 +478,7 @@ func TestAnalyzeTable(t *testing.T) {
 // lock_wait_timeout makes ANALYZE return an Error row. That is transient,
 // not a reason to abandon a finished copy, so AnalyzeTable retries it.
 func TestAnalyzeTableOutlastsTransientLock(t *testing.T) {
+	t.Parallel()
 	dbName, scopedDB := testutils.CreateUniqueTestDatabase(t)
 	_, err := scopedDB.ExecContext(t.Context(), "CREATE TABLE t (id INT PRIMARY KEY)")
 	require.NoError(t, err)

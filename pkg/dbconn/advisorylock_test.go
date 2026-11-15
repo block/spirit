@@ -91,6 +91,7 @@ func TestAdvisoryLockContextCancel(t *testing.T) {
 // lock's session a 1s wait_timeout and waits well past it: without the
 // keepalive the server closes the idle session, which releases the lock.
 func TestAdvisoryLockRefresh(t *testing.T) {
+	t.Parallel()
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-refresh-keepalive"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
 	logger := slog.Default()
@@ -436,6 +437,7 @@ func failableConnFactory(refresh time.Duration) (option func(*AdvisoryLock), fai
 // process mid-migration. The loop must instead keep retrying the connection
 // and re-acquire the locks once the server is reachable again.
 func TestAdvisoryLockRefreshSurvivesReconnectFailure(t *testing.T) {
+	t.Parallel()
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "reconnect-fail-retry"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
 	logger := slog.Default()
@@ -626,6 +628,7 @@ func TestAdvisoryLockCloseDuringStalledReconnect(t *testing.T) {
 }
 
 func TestAdvisoryLockRefreshWithConnIssueSimulation(t *testing.T) {
+	t.Parallel()
 	lockTableInfo := table.TableInfo{SchemaName: "test", TableName: "test-refresh"}
 	lockTables := []*table.TableInfo{&lockTableInfo}
 	logger := slog.Default()
