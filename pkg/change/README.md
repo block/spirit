@@ -531,7 +531,7 @@ wrong in ways no test catches:
   should not hold its reader leaves the method out.
 - **`FeedStats`** — fill the fields the backend knows (last flush, buffered
   position and event time, and whatever its own reader counts), then call
-  `stats.MergeSubscriptions(subs)` for the rest. The rules for combining the
+  `change.MergeSubscriptionStats(&stats, subs)` for the rest. The rules for combining the
   per-subscription figures are not guessable: parks sum while `IsParked` ORs,
   and the flush shape is the *narrowest* effective one paired with the
   configured width it is narrow relative to. A field a backend genuinely has no

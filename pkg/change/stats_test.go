@@ -42,7 +42,7 @@ func pinClock(t *testing.T) time.Time {
 func TestFeedStatsStringNeverFlushed(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  never flushed",
-		FeedStats{}.String())
+		formatFeedStats(FeedStats{}))
 }
 
 func TestFeedStatsString(t *testing.T) {
@@ -56,7 +56,7 @@ func TestFeedStatsString(t *testing.T) {
 	}
 	require.Equal(t,
 		"rotations=4 (1 forced)  parks=0 is-parked=false  flushed 10s ago (took 2.855ms, 5583 rows)",
-		s.String())
+		formatFeedStats(s))
 }
 
 // Every Source reports stats, so the only way to have nothing to render is to
@@ -283,7 +283,7 @@ func TestFeedStatsStringWithBufferedPosition(t *testing.T) {
 	require.Equal(t,
 		"rotations=4 (1 forced)  parks=0 is-parked=false  flushed 10s ago (took 2.855ms, 5583 rows)  "+
 			"read=f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638",
-		s.String())
+		formatFeedStats(s))
 }
 
 // The position goes last and whole. A GTID set has no bounded length, so
@@ -294,16 +294,16 @@ func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
 	long := "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638," +
 		"a1b2c3d4-154f-3776-8f0f-ced626dbde36:1-42," +
 		"b7c8d9e0-154f-3776-8f0f-ced626dbde36:1-7"
-	got := FeedStats{BufferedPosition: long}.String()
+	got := formatFeedStats(FeedStats{BufferedPosition: long})
 	require.Equal(t, "rotations=0 (0 forced)  parks=0 is-parked=false  never flushed  read="+long, got)
 	require.True(t, strings.HasSuffix(got, long), "nothing may follow the position")
 
 	// The age is the one exception, and it is allowed because it is bounded:
 	// it cannot push anything else off the line the way the flush phrase would.
-	withAge := FeedStats{
+	withAge := formatFeedStats(FeedStats{
 		BufferedPosition: long,
 		BufferedEventAt:  now.Add(-90 * time.Second),
-	}.String()
+	})
 	require.True(t, strings.HasSuffix(withAge, long+" (1m30s behind)"))
 }
 
@@ -317,32 +317,32 @@ func TestFeedStatsStringRendersTheBufferedPositionAge(t *testing.T) {
 		BufferedPosition: "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-39441498306",
 		BufferedEventAt:  now.Add(-(14*time.Hour + 32*time.Minute + 11*time.Second)),
 	}
-	require.Contains(t, s.String(),
+	require.Contains(t, formatFeedStats(s),
 		"read=f50a3ec0-154f-3776-8f0f-ced626dbde36:1-39441498306 (14h32m11s behind)")
 
 	// A feed that has read nothing renders no age, which keeps every
 	// pre-existing status line byte-identical.
-	require.NotContains(t, FeedStats{BufferedPosition: "pos"}.String(), "behind)")
+	require.NotContains(t, formatFeedStats(FeedStats{BufferedPosition: "pos"}), "behind)")
 
 	// Sub-second lag is a caught-up feed, not a missing field.
-	require.Contains(t, FeedStats{
+	require.Contains(t, formatFeedStats(FeedStats{
 		BufferedPosition: "pos",
 		BufferedEventAt:  now.Add(-200 * time.Millisecond),
-	}.String(), "(0s behind)")
+	}), "(0s behind)")
 
 	// The source's clock running ahead of ours floors at zero. "(-3s behind)"
 	// reads as a bug in the migration rather than as the caught-up feed it is.
-	require.Contains(t, FeedStats{
+	require.Contains(t, formatFeedStats(FeedStats{
 		BufferedPosition: "pos",
 		BufferedEventAt:  now.Add(3 * time.Second),
-	}.String(), "(0s behind)")
+	}), "(0s behind)")
 }
 
 // A feed that has not read anything yet omits the field rather than rendering
 // an empty one, which also keeps every pre-existing status line byte-identical.
 func TestFeedStatsStringOmitsEmptyBufferedPosition(t *testing.T) {
-	require.Equal(t, "rotations=0 (0 forced)  parks=0 is-parked=false  never flushed", FeedStats{}.String())
-	require.NotContains(t, FeedStats{Rotations: 3}.String(), "read=")
+	require.Equal(t, "rotations=0 (0 forced)  parks=0 is-parked=false  never flushed", formatFeedStats(FeedStats{}))
+	require.NotContains(t, formatFeedStats(FeedStats{Rotations: 3}), "read=")
 }
 
 // The buffered position is taken from the same feed as the flush figures, not
@@ -404,7 +404,7 @@ func (p *parkingStub) ParkStats() (int64, bool) { return p.parks, p.parked }
 func TestFeedStatsStringRendersParks(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=417 is-parked=true  never flushed",
-		FeedStats{Parks: 417, IsParked: true}.String())
+		formatFeedStats(FeedStats{Parks: 417, IsParked: true}))
 }
 
 // Parks sum because each subscription throttles the shared reader
@@ -461,10 +461,10 @@ func (s *shapeStub) FlushShapes() (FlushShape, FlushShape) { return s.effective,
 func TestFeedStatsStringRendersFlushShape(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  flush=8x1000  never flushed",
-		FeedStats{
+		formatFeedStats(FeedStats{
 			FlushShape:           FlushShape{Concurrency: 8, BatchSize: 1000},
 			ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000},
-		}.String())
+		}))
 }
 
 // The configured shape appears only once it differs, so the *presence* of the
@@ -473,10 +473,10 @@ func TestFeedStatsStringRendersFlushShape(t *testing.T) {
 func TestFeedStatsStringRendersBackedOffFlushShape(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  flush=2x250 (of 8x1000)  never flushed",
-		FeedStats{
+		formatFeedStats(FeedStats{
 			FlushShape:           FlushShape{Concurrency: 2, BatchSize: 250},
 			ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000},
-		}.String())
+		}))
 }
 
 // Both dimensions are rendered because one AIMD step halves both: reporting
@@ -485,10 +485,10 @@ func TestFeedStatsStringRendersBothFlushDimensions(t *testing.T) {
 	// Batch size floored, concurrency still shrinking: the two no longer move
 	// in step, and a reader who only saw one would misjudge the other.
 	require.Contains(t,
-		FeedStats{
+		formatFeedStats(FeedStats{
 			FlushShape:           FlushShape{Concurrency: 1, BatchSize: 50},
 			ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 200},
-		}.String(),
+		}),
 		"flush=1x50 (of 8x200)")
 }
 
@@ -497,9 +497,9 @@ func TestFeedStatsStringRendersBothFlushDimensions(t *testing.T) {
 func TestFeedStatsStringOmitsAbsentFlushShape(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  never flushed",
-		FeedStats{}.String())
+		formatFeedStats(FeedStats{}))
 	require.NotContains(t,
-		FeedStats{ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000}}.String(),
+		formatFeedStats(FeedStats{ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000}}),
 		"flush=")
 }
 
@@ -573,7 +573,7 @@ func (s *parkingShapeStub) FlushShapes() (FlushShape, FlushShape) {
 // render a status block that silently drops the other.
 func TestMergeSubscriptionsCollectsBothKinds(t *testing.T) {
 	var stats FeedStats
-	stats.MergeSubscriptions([]Subscription{
+	MergeSubscriptionStats(&stats, []Subscription{
 		&parkingShapeStub{
 			parks:      3,
 			effective:  FlushShape{Concurrency: 8, BatchSize: 1000},
@@ -594,7 +594,7 @@ func TestMergeSubscriptionsCollectsBothKinds(t *testing.T) {
 	// Nothing to merge leaves the stats alone rather than zeroing what the
 	// Source already filled in.
 	stats = FeedStats{Parks: 9, FlushShape: FlushShape{Concurrency: 1, BatchSize: 1}}
-	stats.MergeSubscriptions(nil)
+	MergeSubscriptionStats(&stats, nil)
 	require.Equal(t, int64(9), stats.Parks)
 	require.Equal(t, FlushShape{Concurrency: 1, BatchSize: 1}, stats.FlushShape)
 }

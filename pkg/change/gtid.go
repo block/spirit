@@ -782,7 +782,7 @@ func (c *gtidClient) FeedStats() FeedStats {
 	// Collected before c.mu is taken: these lock each subscription, and the
 	// subscriptions take c.mu on their flush paths.
 	var stats FeedStats
-	stats.MergeSubscriptions(c.subs.Snapshot())
+	MergeSubscriptionStats(&stats, c.subs.Snapshot())
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

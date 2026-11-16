@@ -1,5 +1,7 @@
 // Package contract holds the types and interfaces that spirit's components
-// agree on, and nothing else: it contains no implementations.
+// agree on, and nothing else: it contains no implementations. A type here may
+// have only the methods that say what one of its values means, such as String
+// on an enum; how spirit renders, merges or acts on a value stays in spirit.
 //
 // It is the only code spirit shares with pg-sprite, so that higher-level tools
 // can use both projects in a composable way. To keep it importable by a project

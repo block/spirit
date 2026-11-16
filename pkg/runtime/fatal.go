@@ -63,7 +63,7 @@ func (g *FatalGate) Trip(reason change.FatalReason, t FatalTarget) bool {
 		if logger == nil {
 			logger = slog.Default()
 		}
-		if advice := reason.Advice(t.Noun); advice != "" {
+		if advice := change.FatalAdvice(reason, t.Noun); advice != "" {
 			logger.Error(advice)
 		}
 		if !reason.PreservesCheckpoint() {

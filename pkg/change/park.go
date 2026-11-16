@@ -2,10 +2,10 @@ package change
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"sync/atomic"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -41,31 +41,17 @@ import (
 // the range), and the dispatch reaches the park long after the verification is
 // gone. That is what ParkedRow.abandon exists for.
 
-// ErrRowRewritten means the watched row was written again before the
-// verification could read the target, so the image the caller was handed is no
-// longer what the target holds. The caller should retry.
-var ErrRowRewritten = errors.New("change: watched row was rewritten during verification")
+// ErrRowRewritten, ErrFlushIncomplete, RowWatch and RowVerifier moved to
+// pkg/contract; these aliases keep existing callers compiling.
+var (
+	ErrRowRewritten    = contract.ErrRowRewritten
+	ErrFlushIncomplete = contract.ErrFlushIncomplete
+)
 
-// ErrFlushIncomplete means the parked flush could not empty the buffer, so the
-// watched row's change may not have reached the target. The caller should
-// retry; it must not read the target and call the difference a divergence.
-var ErrFlushIncomplete = errors.New("change: parked flush did not drain the buffer")
-
-// RowWatch names the rows a verification is waiting for. Match is called with
-// the row's primary key values as the binlog decoded them, in the source
-// table's key order; returning true fires the watch.
-type RowWatch struct {
-	Schema string
-	Table  string
-	Match  func(key []any) bool
-}
-
-// RowVerifier is handed the event the feed parked at: the row's key, its
-// after-image (nil for a delete), and whether it was a delete. It runs with the
-// reader parked and the change flushed, so the target holds that image and
-// nothing beyond it. Returning an error fails the verification; the reader is
-// unparked either way.
-type RowVerifier func(ctx context.Context, key []any, image []any, deleted bool) error
+type (
+	RowWatch    = contract.RowWatch
+	RowVerifier = contract.RowVerifier
+)
 
 // parkGate holds a reader goroutine between events. It is advisory in one
 // direction only: arming it does not interrupt an event already being

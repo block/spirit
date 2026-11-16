@@ -77,14 +77,14 @@ func TestFatalReasonCheckpointPolicy(t *testing.T) {
 	require.False(t, FatalReasonLogPosWrapped.PreservesCheckpoint())
 	require.False(t, FatalReason(99).PreservesCheckpoint())
 
-	require.Empty(t, FatalReasonSchemaChange.Advice("move"))
-	require.Empty(t, FatalReason(99).Advice("move"))
+	require.Empty(t, FatalAdvice(FatalReasonSchemaChange, "move"))
+	require.Empty(t, FatalAdvice(FatalReason(99), "move"))
 	for _, reason := range []FatalReason{FatalReasonStreamError, FatalReasonFlushError} {
-		require.Contains(t, reason.Advice("move"), "the checkpoint has been preserved")
-		require.Contains(t, reason.Advice("move"), "resume the move from it")
+		require.Contains(t, FatalAdvice(reason, "move"), "the checkpoint has been preserved")
+		require.Contains(t, FatalAdvice(reason, "move"), "resume the move from it")
 	}
 	for _, reason := range []FatalReason{FatalReasonUnsupportedXA, FatalReasonLogPosWrapped} {
-		require.Contains(t, reason.Advice("migration"), "the checkpoint will be invalidated")
-		require.Contains(t, reason.Advice("migration"), "start a fresh migration")
+		require.Contains(t, FatalAdvice(reason, "migration"), "the checkpoint will be invalidated")
+		require.Contains(t, FatalAdvice(reason, "migration"), "start a fresh migration")
 	}
 }
