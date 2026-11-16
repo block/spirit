@@ -972,14 +972,14 @@ func TestFlushShapesReportsTheAIMDPenalty(t *testing.T) {
 	sub.flushConcurrency, sub.batchSize = 32, 250
 
 	effective, configured := sub.FlushShapes()
-	require.Equal(t, FlushShape{Concurrency: 32, BatchSize: 250}, effective)
+	require.Equal(t, contract.FlushShape{Concurrency: 32, BatchSize: 250}, effective)
 	require.Equal(t, configured, effective, "an unpenalized feed renders no parenthetical")
 
 	sub.adaptFlushConcurrency(true)
 	effective, configured = sub.FlushShapes()
-	require.Equal(t, FlushShape{Concurrency: 16, BatchSize: 125}, effective,
+	require.Equal(t, contract.FlushShape{Concurrency: 16, BatchSize: 125}, effective,
 		"one step halves both terms, which is the 4x an operator is being told about")
-	require.Equal(t, FlushShape{Concurrency: 32, BatchSize: 250}, configured,
+	require.Equal(t, contract.FlushShape{Concurrency: 32, BatchSize: 250}, configured,
 		"the configured shape is what the feed would run at, so it must not move")
 
 	for range 10 * cleanDrainsToRecover {
@@ -998,7 +998,7 @@ func TestFlushShapesFallsBackToDefaults(t *testing.T) {
 	require.Zero(t, sub.batchSize)
 
 	effective, configured := sub.FlushShapes()
-	require.Equal(t, FlushShape{Concurrency: 1, BatchSize: DefaultBatchSize}, effective,
+	require.Equal(t, contract.FlushShape{Concurrency: 1, BatchSize: DefaultBatchSize}, effective,
 		"the zero value is serial, not zero-width")
 	require.Equal(t, configured, effective)
 }

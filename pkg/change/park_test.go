@@ -12,6 +12,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -57,7 +58,7 @@ func TestParkGate(t *testing.T) {
 func TestParkedRowObserve(t *testing.T) {
 	matches := func(key []any) bool { return key[0] == int64(1) }
 	var g parkGate
-	w := newParkedRow(RowWatch{Schema: "test", Table: "t1", Match: matches}, &g)
+	w := newParkedRow(contract.RowWatch{Schema: "test", Table: "t1", Match: matches}, &g)
 
 	require.False(t, w.observe("test", "t2", []any{int64(1)}, []any{int64(1)}, false), "wrong table")
 	require.False(t, w.observe("other", "t1", []any{int64(1)}, []any{int64(1)}, false), "wrong schema")
@@ -92,7 +93,7 @@ func TestParkedRowObserve(t *testing.T) {
 	require.True(t, rewritten, "the caller must be told the image it holds is stale")
 
 	// A watch with no matcher matches nothing rather than everything.
-	require.False(t, newParkedRow(RowWatch{Schema: "test", Table: "t1"}, &g).
+	require.False(t, newParkedRow(contract.RowWatch{Schema: "test", Table: "t1"}, &g).
 		observe("test", "t1", []any{int64(1)}, nil, false))
 }
 
@@ -122,7 +123,7 @@ func newVerifyHarness() *verifyHarness {
 	return &verifyHarness{armed: make(chan struct{})}
 }
 
-func (h *verifyHarness) run(ctx context.Context, watch RowWatch, verify RowVerifier) error {
+func (h *verifyHarness) run(ctx context.Context, watch contract.RowWatch, verify contract.RowVerifier) error {
 	// Arming is internal to Verify, so the harness watches for it rather than
 	// hooking it. Bounded, because a Verify that returns before the watcher
 	// observes the slot would otherwise leave this goroutine spinning for the
@@ -171,7 +172,7 @@ func gateIsParked(g *parkGate) bool {
 	return g.parked != nil
 }
 
-var anyRow = RowWatch{Schema: "test", Table: "t1", Match: func([]any) bool { return true }}
+var anyRow = contract.RowWatch{Schema: "test", Table: "t1", Match: func([]any) bool { return true }}
 
 // TestVerifyRowAtNextChange pins the ordering that is the whole contract: the
 // watch is armed before the reader is released, the reader is parked when the
@@ -210,7 +211,7 @@ func TestVerifyRowAtNextChangeFailures(t *testing.T) {
 	for name, tc := range map[string]struct {
 		dispatch []func(h *verifyHarness)
 		flushErr error
-		verifyFn RowVerifier
+		verifyFn contract.RowVerifier
 		wantErr  error
 	}{
 		"no change arrives": {
@@ -228,7 +229,7 @@ func TestVerifyRowAtNextChangeFailures(t *testing.T) {
 			verifyFn: func(context.Context, []any, []any, bool) error {
 				return errors.New("the verifier ran against a target the rewrite had moved")
 			},
-			wantErr: ErrRowRewritten,
+			wantErr: contract.ErrRowRewritten,
 		},
 		"flush fails": {
 			dispatch: []func(h *verifyHarness){
@@ -395,7 +396,7 @@ func TestFlushParked(t *testing.T) {
 	require.Equal(t, 2, drains)
 
 	drains = 0
-	require.ErrorIs(t, flushParked(t.Context(), drain, func() bool { return false }), ErrFlushIncomplete)
+	require.ErrorIs(t, flushParked(t.Context(), drain, func() bool { return false }), contract.ErrFlushIncomplete)
 	require.Equal(t, 3, drains, "giving up must be bounded, not a spin")
 
 	boom := errors.New("boom")
@@ -482,7 +483,7 @@ func (s *recordingSubscription) HasChanged([]any, []any, bool) {
 // is parked, by us. And the target must hold the delivered image and nothing
 // past it, which is only meaningful while writes are still arriving.
 //
-// It asserts NoError, not "NoError or ErrRowRewritten", on purpose. Every
+// It asserts NoError, not "NoError or contract.ErrRowRewritten", on purpose. Every
 // change here is a single-row event, and the reader is parked from the watched
 // change until the verification returns, so no second change to the key can be
 // observed. A rewrite here means the reader ran past the watched event — the
@@ -531,7 +532,7 @@ func TestVerifyRowAtNextChangeLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	var verified bool
-	err = client.VerifyRowAtNextChange(ctx, RowWatch{
+	err = client.VerifyRowAtNextChange(ctx, contract.RowWatch{
 		Schema: "test", Table: "parkt1",
 		Match: func(key []any) bool { return fmt.Sprint(key[0]) == "1" },
 	}, func(ctx context.Context, _, image []any, deleted bool) error {
@@ -583,7 +584,7 @@ func TestVerifyRowAtNextChangeRewrittenDuringVerify(t *testing.T) {
 		h.dispatch([]any{int64(1)}, []any{int64(1), "second"}, false)
 		return nil
 	})
-	require.ErrorIs(t, err, ErrRowRewritten, "a verdict reached against a target that moved must be discarded")
+	require.ErrorIs(t, err, contract.ErrRowRewritten, "a verdict reached against a target that moved must be discarded")
 	require.Equal(t, 1, verified, "the verifier ran; it is its verdict that is thrown away")
 	require.False(t, h.readerParked(), "the reader must be released even so")
 }

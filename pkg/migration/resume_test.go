@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/block/mysql"
-	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
@@ -1001,7 +1001,7 @@ func TestResumeErrorClassification(t *testing.T) {
 		status.ErrMismatchedAlter,
 		fmt.Errorf("%w: stored=%q expected=%q", status.ErrCheckpointCollision, "a", "b"),
 		fmt.Errorf("%w: checkpoint is 200h old", status.ErrCheckpointTooOld),
-		fmt.Errorf("%w: %w", status.ErrBinlogNotFound, change.ErrPositionNotFound),
+		fmt.Errorf("%w: %w", status.ErrBinlogNotFound, contract.ErrPositionNotFound),
 		&mysql.MySQLError{Number: 1146, Message: "Table 'test._t1_new' doesn't exist"},
 		fmt.Errorf("could not read new table '_t1_new' to resume from checkpoint: %w",
 			&mysql.MySQLError{Number: 1146, Message: "Table 'test._t1_new' doesn't exist"}),

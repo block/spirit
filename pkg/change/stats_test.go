@@ -42,12 +42,12 @@ func pinClock(t *testing.T) time.Time {
 func TestFeedStatsStringNeverFlushed(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  never flushed",
-		formatFeedStats(FeedStats{}))
+		formatFeedStats(contract.FeedStats{}))
 }
 
 func TestFeedStatsString(t *testing.T) {
 	now := pinClock(t)
-	s := FeedStats{
+	s := contract.FeedStats{
 		LastFlushAt:       now.Add(-10 * time.Second),
 		LastFlushDuration: 2854617 * time.Nanosecond,
 		LastFlushRows:     5583,
@@ -79,7 +79,7 @@ func TestStatusRowNoSource(t *testing.T) {
 
 func TestStatusRowSingleSource(t *testing.T) {
 	now := pinClock(t)
-	src := &MockSource{FixedStats: FeedStats{
+	src := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:       now.Add(-3 * time.Second),
 		LastFlushDuration: 5 * time.Millisecond,
 		LastFlushRows:     12,
@@ -96,14 +96,14 @@ func TestStatusRowSingleSource(t *testing.T) {
 // least recently, because that is the one holding the position back.
 func TestStatusRowMergesSources(t *testing.T) {
 	now := pinClock(t)
-	recent := &MockSource{FixedStats: FeedStats{
+	recent := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:       now.Add(-time.Second),
 		LastFlushDuration: time.Millisecond,
 		LastFlushRows:     1,
 		Rotations:         2,
 		ForcedRotations:   1,
 	}}
-	stale := &MockSource{FixedStats: FeedStats{
+	stale := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:       now.Add(-90 * time.Second),
 		LastFlushDuration: 7 * time.Millisecond,
 		LastFlushRows:     900,
@@ -120,13 +120,13 @@ func TestStatusRowMergesSources(t *testing.T) {
 // A feed that has never flushed is the stalest of all: it must not be masked
 // by a sibling that has.
 func TestStatusRowNeverFlushedWins(t *testing.T) {
-	flushed := &MockSource{FixedStats: FeedStats{
+	flushed := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:       time.Now().Add(-time.Second),
 		LastFlushDuration: time.Millisecond,
 		LastFlushRows:     5,
 		Rotations:         1,
 	}}
-	never := &MockSource{FixedStats: FeedStats{Rotations: 1}}
+	never := &MockSource{FixedStats: contract.FeedStats{Rotations: 1}}
 	require.Equal(t,
 		"rotations=2 (0 forced)  parks=0 is-parked=false  never flushed",
 		StatusRow(flushed, never))
@@ -215,7 +215,7 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 	require.Contains(t, StatusRow(client), "never flushed")
 
 	// The flush shape reaches the row from a real subscription rather than
-	// from a hand-built FeedStats: the client has to reach into its
+	// from a hand-built contract.FeedStats: the client has to reach into its
 	// subscriptions for it, the way it already does for park stats.
 	// NewClientDefaultConfig derives no width, so this is the default pair.
 	require.Contains(t, StatusRow(client), "flush=8x1000")
@@ -233,7 +233,7 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 
 	// The event age has to come from a real event header, against a real
 	// server: it is the one field here that cannot be checked by constructing a
-	// FeedStats, because the read loop is what stamps it and the value has to
+	// contract.FeedStats, because the read loop is what stamps it and the value has to
 	// be a plausible wall-clock time rather than, say, a raw unix second
 	// rendered as 56 years. Bounds not equality — the insert above happened a
 	// moment ago on a clock we do not control.
@@ -272,7 +272,7 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 // cannot: it shows the flushed position, which is frozen in both cases.
 func TestFeedStatsStringWithBufferedPosition(t *testing.T) {
 	now := pinClock(t)
-	s := FeedStats{
+	s := contract.FeedStats{
 		LastFlushAt:       now.Add(-10 * time.Second),
 		LastFlushDuration: 2854617 * time.Nanosecond,
 		LastFlushRows:     5583,
@@ -294,13 +294,13 @@ func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
 	long := "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-38880294638," +
 		"a1b2c3d4-154f-3776-8f0f-ced626dbde36:1-42," +
 		"b7c8d9e0-154f-3776-8f0f-ced626dbde36:1-7"
-	got := formatFeedStats(FeedStats{BufferedPosition: long})
+	got := formatFeedStats(contract.FeedStats{BufferedPosition: long})
 	require.Equal(t, "rotations=0 (0 forced)  parks=0 is-parked=false  never flushed  read="+long, got)
 	require.True(t, strings.HasSuffix(got, long), "nothing may follow the position")
 
 	// The age is the one exception, and it is allowed because it is bounded:
 	// it cannot push anything else off the line the way the flush phrase would.
-	withAge := formatFeedStats(FeedStats{
+	withAge := formatFeedStats(contract.FeedStats{
 		BufferedPosition: long,
 		BufferedEventAt:  now.Add(-90 * time.Second),
 	})
@@ -313,7 +313,7 @@ func TestFeedStatsStringRendersLongPositionInFullAtTheEnd(t *testing.T) {
 // is not a time without the source's commit rate, which is not reported here.
 func TestFeedStatsStringRendersTheBufferedPositionAge(t *testing.T) {
 	now := pinClock(t)
-	s := FeedStats{
+	s := contract.FeedStats{
 		BufferedPosition: "f50a3ec0-154f-3776-8f0f-ced626dbde36:1-39441498306",
 		BufferedEventAt:  now.Add(-(14*time.Hour + 32*time.Minute + 11*time.Second)),
 	}
@@ -322,17 +322,17 @@ func TestFeedStatsStringRendersTheBufferedPositionAge(t *testing.T) {
 
 	// A feed that has read nothing renders no age, which keeps every
 	// pre-existing status line byte-identical.
-	require.NotContains(t, formatFeedStats(FeedStats{BufferedPosition: "pos"}), "behind)")
+	require.NotContains(t, formatFeedStats(contract.FeedStats{BufferedPosition: "pos"}), "behind)")
 
 	// Sub-second lag is a caught-up feed, not a missing field.
-	require.Contains(t, formatFeedStats(FeedStats{
+	require.Contains(t, formatFeedStats(contract.FeedStats{
 		BufferedPosition: "pos",
 		BufferedEventAt:  now.Add(-200 * time.Millisecond),
 	}), "(0s behind)")
 
 	// The source's clock running ahead of ours floors at zero. "(-3s behind)"
 	// reads as a bug in the migration rather than as the caught-up feed it is.
-	require.Contains(t, formatFeedStats(FeedStats{
+	require.Contains(t, formatFeedStats(contract.FeedStats{
 		BufferedPosition: "pos",
 		BufferedEventAt:  now.Add(3 * time.Second),
 	}), "(0s behind)")
@@ -341,8 +341,8 @@ func TestFeedStatsStringRendersTheBufferedPositionAge(t *testing.T) {
 // A feed that has not read anything yet omits the field rather than rendering
 // an empty one, which also keeps every pre-existing status line byte-identical.
 func TestFeedStatsStringOmitsEmptyBufferedPosition(t *testing.T) {
-	require.Equal(t, "rotations=0 (0 forced)  parks=0 is-parked=false  never flushed", formatFeedStats(FeedStats{}))
-	require.NotContains(t, formatFeedStats(FeedStats{Rotations: 3}), "read=")
+	require.Equal(t, "rotations=0 (0 forced)  parks=0 is-parked=false  never flushed", formatFeedStats(contract.FeedStats{}))
+	require.NotContains(t, formatFeedStats(contract.FeedStats{Rotations: 3}), "read=")
 }
 
 // The buffered position is taken from the same feed as the flush figures, not
@@ -350,13 +350,13 @@ func TestFeedStatsStringOmitsEmptyBufferedPosition(t *testing.T) {
 // feed is the one whose reader progress is in question.
 func TestStatusRowBufferedPositionFollowsStalestFeed(t *testing.T) {
 	now := pinClock(t)
-	recent := &MockSource{FixedStats: FeedStats{
+	recent := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:      now.Add(-time.Second),
 		BufferedPosition: "recent-feed-pos",
 		BufferedEventAt:  now.Add(-5 * time.Second),
 		Rotations:        2,
 	}}
-	stale := &MockSource{FixedStats: FeedStats{
+	stale := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:      now.Add(-90 * time.Second),
 		BufferedPosition: "stale-feed-pos",
 		BufferedEventAt:  now.Add(-2 * time.Minute),
@@ -404,7 +404,7 @@ func (p *parkingStub) ParkStats() (int64, bool) { return p.parks, p.parked }
 func TestFeedStatsStringRendersParks(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=417 is-parked=true  never flushed",
-		formatFeedStats(FeedStats{Parks: 417, IsParked: true}))
+		formatFeedStats(contract.FeedStats{Parks: 417, IsParked: true}))
 }
 
 // Parks sum because each subscription throttles the shared reader
@@ -412,7 +412,7 @@ func TestFeedStatsStringRendersParks(t *testing.T) {
 // stall that reader, and a sibling that is running does not make the stall any
 // less real.
 func TestMergeParkStatsAcrossSubscriptions(t *testing.T) {
-	var stats FeedStats
+	var stats contract.FeedStats
 	mergeParkStats(&stats, []Subscription{
 		&parkingStub{parks: 3, parked: false},
 		&parkingStub{parks: 4, parked: true},
@@ -423,7 +423,7 @@ func TestMergeParkStatsAcrossSubscriptions(t *testing.T) {
 
 	// A subscription that does not report parks contributes nothing rather
 	// than being counted as unparked-and-therefore-fine.
-	var noneReport FeedStats
+	var noneReport contract.FeedStats
 	mergeParkStats(&noneReport, []Subscription{&stubSubscription{}})
 	require.Zero(t, noneReport.Parks)
 	require.False(t, noneReport.IsParked)
@@ -432,12 +432,12 @@ func TestMergeParkStatsAcrossSubscriptions(t *testing.T) {
 // Same merge rules across feeds: a sharded move reads one feed per source, and
 // a stall on any of them is a stall.
 func TestStatusRowMergesParkStats(t *testing.T) {
-	busy := &MockSource{FixedStats: FeedStats{
+	busy := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt: time.Now().Add(-time.Second),
 		Parks:       9,
 		IsParked:    true,
 	}}
-	idle := &MockSource{FixedStats: FeedStats{
+	idle := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt: time.Now().Add(-2 * time.Second),
 		Parks:       1,
 		IsParked:    false,
@@ -450,20 +450,22 @@ func TestStatusRowMergesParkStats(t *testing.T) {
 // shapeStub reports a flush shape and nothing else.
 type shapeStub struct {
 	stubSubscription
-	effective  FlushShape
-	configured FlushShape
+	effective  contract.FlushShape
+	configured contract.FlushShape
 }
 
-func (s *shapeStub) FlushShapes() (FlushShape, FlushShape) { return s.effective, s.configured }
+func (s *shapeStub) FlushShapes() (contract.FlushShape, contract.FlushShape) {
+	return s.effective, s.configured
+}
 
 // The width is derived from the instance rather than fixed, so it is not
 // something an operator can look up — the status block is where they learn it.
 func TestFeedStatsStringRendersFlushShape(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  flush=8x1000  never flushed",
-		formatFeedStats(FeedStats{
-			FlushShape:           FlushShape{Concurrency: 8, BatchSize: 1000},
-			ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000},
+		formatFeedStats(contract.FeedStats{
+			FlushShape:           contract.FlushShape{Concurrency: 8, BatchSize: 1000},
+			ConfiguredFlushShape: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 		}))
 }
 
@@ -473,9 +475,9 @@ func TestFeedStatsStringRendersFlushShape(t *testing.T) {
 func TestFeedStatsStringRendersBackedOffFlushShape(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  flush=2x250 (of 8x1000)  never flushed",
-		formatFeedStats(FeedStats{
-			FlushShape:           FlushShape{Concurrency: 2, BatchSize: 250},
-			ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000},
+		formatFeedStats(contract.FeedStats{
+			FlushShape:           contract.FlushShape{Concurrency: 2, BatchSize: 250},
+			ConfiguredFlushShape: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 		}))
 }
 
@@ -485,9 +487,9 @@ func TestFeedStatsStringRendersBothFlushDimensions(t *testing.T) {
 	// Batch size floored, concurrency still shrinking: the two no longer move
 	// in step, and a reader who only saw one would misjudge the other.
 	require.Contains(t,
-		formatFeedStats(FeedStats{
-			FlushShape:           FlushShape{Concurrency: 1, BatchSize: 50},
-			ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 200},
+		formatFeedStats(contract.FeedStats{
+			FlushShape:           contract.FlushShape{Concurrency: 1, BatchSize: 50},
+			ConfiguredFlushShape: contract.FlushShape{Concurrency: 8, BatchSize: 200},
 		}),
 		"flush=1x50 (of 8x200)")
 }
@@ -497,9 +499,9 @@ func TestFeedStatsStringRendersBothFlushDimensions(t *testing.T) {
 func TestFeedStatsStringOmitsAbsentFlushShape(t *testing.T) {
 	require.Equal(t,
 		"rotations=0 (0 forced)  parks=0 is-parked=false  never flushed",
-		formatFeedStats(FeedStats{}))
+		formatFeedStats(contract.FeedStats{}))
 	require.NotContains(t,
-		formatFeedStats(FeedStats{ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000}}),
+		formatFeedStats(contract.FeedStats{ConfiguredFlushShape: contract.FlushShape{Concurrency: 8, BatchSize: 1000}}),
 		"flush=")
 }
 
@@ -507,28 +509,28 @@ func TestFeedStatsStringOmitsAbsentFlushShape(t *testing.T) {
 // throttling the slowest subscription — and the pair must stay together, or the
 // row shows a back-off no subscription is actually experiencing.
 func TestMergeFlushShapesKeepsTheNarrowestPair(t *testing.T) {
-	var stats FeedStats
+	var stats contract.FeedStats
 	mergeFlushShapes(&stats, []Subscription{
 		&shapeStub{
-			effective:  FlushShape{Concurrency: 8, BatchSize: 1000},
-			configured: FlushShape{Concurrency: 8, BatchSize: 1000},
+			effective:  contract.FlushShape{Concurrency: 8, BatchSize: 1000},
+			configured: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 		},
 		&shapeStub{ // narrowest: 500 rows in flight
-			effective:  FlushShape{Concurrency: 2, BatchSize: 250},
-			configured: FlushShape{Concurrency: 8, BatchSize: 1000},
+			effective:  contract.FlushShape{Concurrency: 2, BatchSize: 250},
+			configured: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 		},
 		&shapeStub{
-			effective:  FlushShape{Concurrency: 4, BatchSize: 500},
-			configured: FlushShape{Concurrency: 16, BatchSize: 500},
+			effective:  contract.FlushShape{Concurrency: 4, BatchSize: 500},
+			configured: contract.FlushShape{Concurrency: 16, BatchSize: 500},
 		},
 	})
-	require.Equal(t, FlushShape{Concurrency: 2, BatchSize: 250}, stats.FlushShape)
-	require.Equal(t, FlushShape{Concurrency: 8, BatchSize: 1000}, stats.ConfiguredFlushShape,
+	require.Equal(t, contract.FlushShape{Concurrency: 2, BatchSize: 250}, stats.FlushShape)
+	require.Equal(t, contract.FlushShape{Concurrency: 8, BatchSize: 1000}, stats.ConfiguredFlushShape,
 		"the configured shape must come from the same subscription as the effective one")
 
 	// A subscription that does not report a shape contributes nothing rather
 	// than being counted as a zero-width drain.
-	var none FeedStats
+	var none contract.FeedStats
 	mergeFlushShapes(&none, []Subscription{&stubSubscription{}})
 	require.Zero(t, none.FlushShape.Concurrency)
 }
@@ -536,15 +538,15 @@ func TestMergeFlushShapesKeepsTheNarrowestPair(t *testing.T) {
 // Same rule across feeds: a sharded move reads one feed per source, and the
 // narrowest of them is the one holding the move back.
 func TestStatusRowMergesFlushShapes(t *testing.T) {
-	wide := &MockSource{FixedStats: FeedStats{
+	wide := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:          time.Now().Add(-time.Second),
-		FlushShape:           FlushShape{Concurrency: 8, BatchSize: 1000},
-		ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000},
+		FlushShape:           contract.FlushShape{Concurrency: 8, BatchSize: 1000},
+		ConfiguredFlushShape: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 	}}
-	narrow := &MockSource{FixedStats: FeedStats{
+	narrow := &MockSource{FixedStats: contract.FeedStats{
 		LastFlushAt:          time.Now().Add(-2 * time.Second),
-		FlushShape:           FlushShape{Concurrency: 1, BatchSize: 125},
-		ConfiguredFlushShape: FlushShape{Concurrency: 8, BatchSize: 1000},
+		FlushShape:           contract.FlushShape{Concurrency: 1, BatchSize: 125},
+		ConfiguredFlushShape: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 	}}
 	row := StatusRow(wide, narrow)
 	require.Contains(t, row, "flush=1x125 (of 8x1000)")
@@ -558,43 +560,43 @@ type parkingShapeStub struct {
 	Subscription
 	parks      int64
 	parked     bool
-	effective  FlushShape
-	configured FlushShape
+	effective  contract.FlushShape
+	configured contract.FlushShape
 }
 
 func (s *parkingShapeStub) ParkStats() (int64, bool) { return s.parks, s.parked }
-func (s *parkingShapeStub) FlushShapes() (FlushShape, FlushShape) {
+func (s *parkingShapeStub) FlushShapes() (contract.FlushShape, contract.FlushShape) {
 	return s.effective, s.configured
 }
 
 // MergeSubscriptions is the one call an out-of-tree Source makes to fill the
-// subscription-derived half of its FeedStats. It has to collect both kinds of
+// subscription-derived half of its contract.FeedStats. It has to collect both kinds of
 // figure, on their own merge rules — a Source that got only one of them would
 // render a status block that silently drops the other.
 func TestMergeSubscriptionsCollectsBothKinds(t *testing.T) {
-	var stats FeedStats
+	var stats contract.FeedStats
 	MergeSubscriptionStats(&stats, []Subscription{
 		&parkingShapeStub{
 			parks:      3,
-			effective:  FlushShape{Concurrency: 8, BatchSize: 1000},
-			configured: FlushShape{Concurrency: 8, BatchSize: 1000},
+			effective:  contract.FlushShape{Concurrency: 8, BatchSize: 1000},
+			configured: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 		},
 		&parkingShapeStub{
 			parks:      4,
 			parked:     true,
-			effective:  FlushShape{Concurrency: 2, BatchSize: 250},
-			configured: FlushShape{Concurrency: 8, BatchSize: 1000},
+			effective:  contract.FlushShape{Concurrency: 2, BatchSize: 250},
+			configured: contract.FlushShape{Concurrency: 8, BatchSize: 1000},
 		},
 	})
 	require.Equal(t, int64(7), stats.Parks, "parks sum")
 	require.True(t, stats.IsParked, "one parked subscription stalls the reader")
-	require.Equal(t, FlushShape{Concurrency: 2, BatchSize: 250}, stats.FlushShape, "narrowest wins")
-	require.Equal(t, FlushShape{Concurrency: 8, BatchSize: 1000}, stats.ConfiguredFlushShape)
+	require.Equal(t, contract.FlushShape{Concurrency: 2, BatchSize: 250}, stats.FlushShape, "narrowest wins")
+	require.Equal(t, contract.FlushShape{Concurrency: 8, BatchSize: 1000}, stats.ConfiguredFlushShape)
 
 	// Nothing to merge leaves the stats alone rather than zeroing what the
 	// Source already filled in.
-	stats = FeedStats{Parks: 9, FlushShape: FlushShape{Concurrency: 1, BatchSize: 1}}
+	stats = contract.FeedStats{Parks: 9, FlushShape: contract.FlushShape{Concurrency: 1, BatchSize: 1}}
 	MergeSubscriptionStats(&stats, nil)
 	require.Equal(t, int64(9), stats.Parks)
-	require.Equal(t, FlushShape{Concurrency: 1, BatchSize: 1}, stats.FlushShape)
+	require.Equal(t, contract.FlushShape{Concurrency: 1, BatchSize: 1}, stats.FlushShape)
 }

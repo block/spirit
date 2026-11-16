@@ -6,6 +6,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -46,9 +47,9 @@ func TestImmutableColumnUpdateFatal(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	cancelled := make(chan FatalReason, 1)
+	cancelled := make(chan contract.FatalReason, 1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		select {
 		case cancelled <- reason:
 		default:
@@ -82,7 +83,7 @@ func TestImmutableColumnUpdateFatal(t *testing.T) {
 	case reason := <-cancelled:
 		// Reported as a stream error, not a schema change: the watched
 		// table's definition did not change, so resume state stays valid.
-		require.Equal(t, FatalReasonStreamError, reason)
+		require.Equal(t, contract.FatalReasonStreamError, reason)
 	case <-time.After(30 * time.Second):
 		t.Fatal("expected the client to cancel the operation after an UPDATE to the sharding column")
 	}
@@ -107,9 +108,9 @@ func TestImmutableColumnUpdateFatalGTID(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	cancelled := make(chan FatalReason, 1)
+	cancelled := make(chan contract.FatalReason, 1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		select {
 		case cancelled <- reason:
 		default:
@@ -147,7 +148,7 @@ func TestImmutableColumnUpdateFatalGTID(t *testing.T) {
 	testutils.RunSQL(t, "UPDATE immutcol_gtid_t1 SET user_id = 999 WHERE id = 2")
 	select {
 	case reason := <-cancelled:
-		require.Equal(t, FatalReasonStreamError, reason)
+		require.Equal(t, contract.FatalReasonStreamError, reason)
 	case <-time.After(30 * time.Second):
 		t.Fatal("expected the client to cancel the operation after an UPDATE to the sharding column")
 	}
@@ -174,9 +175,9 @@ func TestImmutableColumnUnconfigured(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	cancelled := make(chan FatalReason, 1)
+	cancelled := make(chan contract.FatalReason, 1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		select {
 		case cancelled <- reason:
 		default:

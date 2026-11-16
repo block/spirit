@@ -19,6 +19,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/concurrency"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -1773,11 +1774,11 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 // fatalError is the change client's CancelFunc: it records the fatal
 // condition and cancels the run so runContinuous can surface it. Per the
 // CancelFunc contract (change.ClientConfig), it fires for DDL detected on a
-// synced table (change.FatalReasonSchemaChange) AND for fatal stream errors
+// synced table (contract.FatalReasonSchemaChange) AND for fatal stream errors
 // such as minimal RBR detection or exhausted streamer recreation attempts
-// (change.FatalReasonStreamError), unsupported XA
-// (change.FatalReasonUnsupportedXA), or a wrapped binlog LogPos
-// (change.FatalReasonLogPosWrapped). The reason names the trigger class in the
+// (contract.FatalReasonStreamError), unsupported XA
+// (contract.FatalReasonUnsupportedXA), or a wrapped binlog LogPos
+// (contract.FatalReasonLogPosWrapped). The reason names the trigger class in the
 // recorded error; the change client's logs carry the details. Unlike
 // migration/move, no resume state is invalidated for any reason: the datasync
 // checkpoint is Persistent and the caller decides fresh-vs-resume. That
@@ -1790,7 +1791,7 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 // client's stream goroutine, which may run while Run is still publishing its
 // cancel function (runtime.Lifecycle guards it), and fatalOnce makes the
 // record-and-cancel side effects idempotent.
-func (r *Runner) fatalError(reason change.FatalReason) bool {
+func (r *Runner) fatalError(reason contract.FatalReason) bool {
 	r.recordFatal(fmt.Errorf("the change source signaled a fatal error (%s); sync cannot continue safely — see prior log lines for the cause", reason))
 	return true
 }

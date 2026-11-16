@@ -16,8 +16,8 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/metrics"
@@ -323,7 +323,7 @@ func TestMoveWithNewTableCreation(t *testing.T) {
 	// it rejects every other way the move can end (sentinel timeout, cancel).
 	require.Error(t, runErr)
 	require.NotErrorIs(t, runErr, context.Canceled)
-	require.ErrorContains(t, runErr, "fatal change feed condition ("+change.FatalReasonSchemaChange.String()+")")
+	require.ErrorContains(t, runErr, "fatal change feed condition ("+contract.FatalReasonSchemaChange.String()+")")
 }
 
 // TestMoveFailsGracefullyWithMinimalRBR verifies that a move operation fails
@@ -421,7 +421,7 @@ func TestMoveFailsGracefullyWithMinimalRBR(t *testing.T) {
 	// sentinel timeout) cannot pass the test.
 	require.Error(t, runErr)
 	require.NotErrorIs(t, runErr, context.Canceled)
-	require.ErrorContains(t, runErr, "fatal change feed condition ("+change.FatalReasonStreamError.String()+")")
+	require.ErrorContains(t, runErr, "fatal change feed condition ("+contract.FatalReasonStreamError.String()+")")
 	// The stream-error reason is shared with other rows-event failures: with
 	// the minimal-image check removed, the event still aborts the move because
 	// its after-image has no primary key. The returned error does not carry

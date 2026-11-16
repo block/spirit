@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/require"
@@ -48,18 +49,18 @@ type parkingFeed struct {
 	// waiting on its flush gate requests one), and a catch-up in FlushFn can then
 	// land before the settle runs, leaving the snapshot to verify by polling.
 	applyFn func(ctx context.Context) error
-	watches []change.RowWatch
+	watches []contract.RowWatch
 }
 
 var _ change.ParkableSource = (*parkingFeed)(nil)
 
-func (f *parkingFeed) VerifyRowAtNextChange(ctx context.Context, watch change.RowWatch, verify change.RowVerifier) error {
+func (f *parkingFeed) VerifyRowAtNextChange(ctx context.Context, watch contract.RowWatch, verify contract.RowVerifier) error {
 	f.mu.Lock()
 	f.watches = append(f.watches, watch)
 	switch {
 	case f.rewriteAfter > 0 && len(f.watches) > f.rewriteAfter:
 		f.mu.Unlock()
-		return change.ErrRowRewritten
+		return contract.ErrRowRewritten
 	case len(f.events) == 0:
 		f.mu.Unlock()
 		<-ctx.Done()
@@ -225,7 +226,7 @@ func TestSettleHotRowRewrittenDefers(t *testing.T) {
 	snapshotExec(t, db, "INSERT INTO dst VALUES (1,10),(2,99)")
 	snapshot := pendingSnapshot(t, db, chunk, 1)
 
-	feed := &parkingFeed{events: []parkedEvent{{err: change.ErrRowRewritten}}}
+	feed := &parkingFeed{events: []parkedEvent{{err: contract.ErrRowRewritten}}}
 	verdict, err := settleTestSettler(t, db, feed).settle(t.Context(), snapshot)
 	require.NoError(t, err)
 	require.Equal(t, settleUnavailable, verdict)

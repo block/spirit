@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,18 +23,18 @@ func TestStopDispatchSuppressesDDLNotification(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// build returns the notifier and a pointer to the call counter.
-		build func(cancel func(FatalReason) bool) (notify func(string, string), stop func())
+		build func(cancel func(contract.FatalReason) bool) (notify func(string, string), stop func())
 	}{
 		{
 			name: "binlog",
-			build: func(cancel func(FatalReason) bool) (func(string, string), func()) {
+			build: func(cancel func(contract.FatalReason) bool) (func(string, string), func()) {
 				c := &binlogClient{feedCore: feedCore{logger: logger, callerCancelFunc: cancel, ddlFilterSchema: "test", subs: newSubscriptionRegistry()}}
 				return func(schema, table string) { c.processDDL(schema, table, false) }, c.Stop
 			},
 		},
 		{
 			name: "gtid",
-			build: func(cancel func(FatalReason) bool) (func(string, string), func()) {
+			build: func(cancel func(contract.FatalReason) bool) (func(string, string), func()) {
 				c := &gtidClient{feedCore: feedCore{logger: logger, callerCancelFunc: cancel, ddlFilterSchema: "test", subs: newSubscriptionRegistry()}}
 				return func(schema, table string) { c.processDDL(schema, table, false) }, c.Stop
 			},
@@ -41,7 +42,7 @@ func TestStopDispatchSuppressesDDLNotification(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls int
-			notify, stop := tc.build(func(FatalReason) bool { calls++; return true })
+			notify, stop := tc.build(func(contract.FatalReason) bool { calls++; return true })
 
 			notify("test", "sometable")
 			require.Equal(t, 1, calls, "DDL on a watched schema must reach the caller before cutover")

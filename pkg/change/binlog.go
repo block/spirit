@@ -36,7 +36,7 @@ type binlogClient struct {
 	bufferedPos mysql.Position // buffered position
 	flushedPos  mysql.Position // safely written to new table
 
-	flushedBinlogs atomic.Int64 // stall-triggered rotations reported as FeedStats.ForcedRotations
+	flushedBinlogs atomic.Int64 // stall-triggered rotations reported as contract.FeedStats.ForcedRotations
 }
 
 // NewBinlogClient constructs the binlog-backed change.Source. The
@@ -138,14 +138,14 @@ func (c *binlogClient) StartFromPosition(ctx context.Context, pos string) error 
 	if pos == "" {
 		return errors.New("StartFromPosition: empty position; use Start instead for a fresh start")
 	}
-	// Parse failures are wrapped with ErrPositionNotFound, mirroring the
+	// Parse failures are wrapped with contract.ErrPositionNotFound, mirroring the
 	// GTID client: an unparseable position (e.g. a GTID-set checkpoint fed
 	// to this client directly, bypassing NewAutoClient's classification)
 	// can never become resumable by retrying, so callers should treat it
 	// the same as a purged binlog and start fresh.
 	parsed, err := parseBinlogPositionString(pos)
 	if err != nil {
-		return fmt.Errorf("%w: StartFromPosition: %w", ErrPositionNotFound, err)
+		return fmt.Errorf("%w: StartFromPosition: %w", contract.ErrPositionNotFound, err)
 	}
 	c.mu.Lock()
 	c.flushedPos = parsed
@@ -278,7 +278,7 @@ func (c *binlogClient) Start(ctx context.Context) error {
 			return fmt.Errorf("could not verify binlog position: %w", err)
 		}
 		if impossible {
-			return fmt.Errorf("%w: binlog %q is no longer on the server", ErrPositionNotFound, c.flushedPos.Name)
+			return fmt.Errorf("%w: binlog %q is no longer on the server", contract.ErrPositionNotFound, c.flushedPos.Name)
 		}
 	}
 	c.bufferedPos = c.flushedPos // set buffered to the initial flushed value
@@ -434,7 +434,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 						"recent_errors", recentErrors,
 						"is_closed", c.isClosed.Load())
 
-					c.fatalError(FatalReasonStreamError)
+					c.fatalError(contract.FatalReasonStreamError)
 					return
 				}
 
@@ -511,7 +511,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 				"event_log_pos", ev.Header.LogPos,
 				"previous_log_pos", logPos.last,
 				"buffered_position", c.getBufferedPos())
-			c.fatalError(FatalReasonLogPosWrapped)
+			c.fatalError(contract.FatalReasonLogPosWrapped)
 			return
 		}
 		// Handle the event.
@@ -552,7 +552,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			}
 			if err = c.processRowsEvent(ev, event); err != nil {
 				c.logger.Error("fatal error processing binlog rows event", "error", err)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(contract.FatalReasonStreamError)
 				return
 			}
 		case *replication.QueryEvent:
@@ -574,7 +574,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			// for the full rationale and group shape.
 			if info.xa {
 				c.logger.Error("fatal error processing binlog query event", "error", errXAUnsupported)
-				c.fatalError(FatalReasonUnsupportedXA)
+				c.fatalError(contract.FatalReasonUnsupportedXA)
 				return
 			}
 			// Query event, check if it is a DDL statement,
@@ -632,7 +632,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 			// in case a future server version reshapes the group.
 			if ev.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
 				c.logger.Error("fatal error processing binlog stream", "error", errXAUnsupported)
-				c.fatalError(FatalReasonUnsupportedXA)
+				c.fatalError(contract.FatalReasonUnsupportedXA)
 				return
 			}
 			c.logger.Debug("Received unknown event type", "type", ev.Header.EventType.String())
@@ -789,10 +789,10 @@ func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []contra
 
 // FeedStats satisfies Source, so the runner can fold the feed's
 // activity into the binlog row of its periodic status block.
-func (c *binlogClient) FeedStats() FeedStats {
+func (c *binlogClient) FeedStats() contract.FeedStats {
 	// Collected before c.mu is taken: these lock each subscription, and the
 	// subscriptions take c.mu on their flush paths.
-	var stats FeedStats
+	var stats contract.FeedStats
 	MergeSubscriptionStats(&stats, c.subs.Snapshot())
 
 	c.mu.Lock()
@@ -900,7 +900,7 @@ func parseBinlogPositionString(s string) (mysql.Position, error) {
 // VerifyRowAtNextChange satisfies ParkableSource. The parker owns the ordering; all
 // this supplies is the inner drain, which must not be Flush (see
 // RowParker.Verify).
-func (c *binlogClient) VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error {
+func (c *binlogClient) VerifyRowAtNextChange(ctx context.Context, watch contract.RowWatch, verify contract.RowVerifier) error {
 	return c.parker.Verify(ctx, watch, verify,
 		func(ctx context.Context) error { return c.flush(ctx, false, nil) },
 		c.AllChangesFlushed)

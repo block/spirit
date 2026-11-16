@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/stretchr/testify/require"
 )
@@ -737,11 +738,11 @@ func TestLogPosTracker(t *testing.T) {
 // TestFatalReasonForStreamError pins the error-to-reason mapping the readers
 // use to tell the caller whether its checkpoint survives.
 func TestFatalReasonForStreamError(t *testing.T) {
-	require.Equal(t, FatalReasonUnsupportedXA, fatalReasonForStreamError(errXAUnsupported))
-	require.Equal(t, FatalReasonLogPosWrapped, fatalReasonForStreamError(errLogPosWrapped))
-	require.Equal(t, FatalReasonLogPosWrapped,
+	require.Equal(t, contract.FatalReasonUnsupportedXA, fatalReasonForStreamError(errXAUnsupported))
+	require.Equal(t, contract.FatalReasonLogPosWrapped, fatalReasonForStreamError(errLogPosWrapped))
+	require.Equal(t, contract.FatalReasonLogPosWrapped,
 		fatalReasonForStreamError(fmt.Errorf("wrapping context: %w", errLogPosWrapped)))
-	require.Equal(t, FatalReasonStreamError, fatalReasonForStreamError(errors.New("some other failure")))
-	require.Equal(t, "logpos-wrapped", FatalReasonLogPosWrapped.String())
-	require.Equal(t, "flush-error", FatalReasonFlushError.String())
+	require.Equal(t, contract.FatalReasonStreamError, fatalReasonForStreamError(errors.New("some other failure")))
+	require.Equal(t, "logpos-wrapped", contract.FatalReasonLogPosWrapped.String())
+	require.Equal(t, "flush-error", contract.FatalReasonFlushError.String())
 }

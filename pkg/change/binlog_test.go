@@ -627,9 +627,9 @@ func TestDDLNotification(t *testing.T) {
 
 	// Use a channel to track cancel calls (and the reason passed)
 	// from the CancelFunc callback.
-	cancelled := make(chan FatalReason, 1)
+	cancelled := make(chan contract.FatalReason, 1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		cancelled <- reason
 		return true
 	}
@@ -645,7 +645,7 @@ func TestDDLNotification(t *testing.T) {
 
 	// CancelFunc was called, and DDL must be reported as a schema change so
 	// callers know to invalidate their checkpoints.
-	require.Equal(t, FatalReasonSchemaChange, <-cancelled)
+	require.Equal(t, contract.FatalReasonSchemaChange, <-cancelled)
 }
 
 // TestDDLNotificationTriggerAndForeignKey: a trigger created on a watched
@@ -689,9 +689,9 @@ func TestDDLNotificationTriggerAndForeignKey(t *testing.T) {
 				t2 := table.NewTableInfo(db, "test", "ddltrgfk_t2")
 				require.NoError(t, t2.SetInfo(t.Context()))
 
-				cancelled := make(chan FatalReason, 1)
+				cancelled := make(chan contract.FatalReason, 1)
 				clientConfig := NewClientDefaultConfig()
-				clientConfig.CancelFunc = func(reason FatalReason) bool {
+				clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 					cancelled <- reason
 					return true
 				}
@@ -705,7 +705,7 @@ func TestDDLNotificationTriggerAndForeignKey(t *testing.T) {
 				testutils.RunSQL(t, ddl)
 				select {
 				case reason := <-cancelled:
-					require.Equal(t, FatalReasonSchemaChange, reason)
+					require.Equal(t, contract.FatalReasonSchemaChange, reason)
 				case <-time.After(10 * time.Second):
 					t.Fatal("the client did not cancel")
 				}
@@ -737,9 +737,9 @@ func TestDDLNotificationTransactionCompression(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	cancelled := make(chan FatalReason, 1)
+	cancelled := make(chan contract.FatalReason, 1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		cancelled <- reason
 		return true
 	}
@@ -758,7 +758,7 @@ func TestDDLNotificationTransactionCompression(t *testing.T) {
 	_, err = conn.ExecContext(t.Context(), "ALTER TABLE ddl_compress_t1 ADD COLUMN d INT")
 	require.NoError(t, err)
 
-	require.Equal(t, FatalReasonSchemaChange, <-cancelled)
+	require.Equal(t, contract.FatalReasonSchemaChange, <-cancelled)
 }
 
 // TestBinlogClientXATransactionGuard is the binlog (file/offset) client's
@@ -812,7 +812,7 @@ func TestBinlogClientXATransactionGuard(t *testing.T) {
 	var gotReason atomic.Int64
 	gotReason.Store(-1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		gotReason.Store(int64(reason))
 		return true
 	}
@@ -847,7 +847,7 @@ func TestBinlogClientXATransactionGuard(t *testing.T) {
 	require.Equal(t, int64(-1), gotReason.Load(), "the guard must not fire before the XA group is binlogged")
 
 	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(contract.FatalReasonUnsupportedXA) },
 		5*time.Second, 5*time.Millisecond, "XA PREPARE must report unsupported XA")
 	client.streamWG.Wait() // reader fully exited: buffering is final
 	require.Equal(t, 0, client.GetDeltaLen(), "no prepared row events may be buffered once the guard fires")
@@ -931,7 +931,7 @@ func TestBinlogClientXAPrepareEventGuard(t *testing.T) {
 	var gotReason atomic.Int64
 	gotReason.Store(-1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		gotReason.Store(int64(reason))
 		return true
 	}
@@ -947,7 +947,7 @@ func TestBinlogClientXAPrepareEventGuard(t *testing.T) {
 		Header: &replication.EventHeader{EventType: replication.XA_PREPARE_LOG_EVENT},
 		Event:  &replication.GenericEvent{},
 	}))
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(contract.FatalReasonUnsupportedXA) },
 		5*time.Second, 5*time.Millisecond, "a lone XA_PREPARE_LOG_EVENT must report unsupported XA")
 }
 
@@ -1522,7 +1522,7 @@ func TestMaxRecreateAttemptsError(t *testing.T) {
 	var gotReason atomic.Int64
 	gotReason.Store(-1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		gotReason.Store(int64(reason))
 		cancel()
 		return true
@@ -1555,7 +1555,7 @@ func TestMaxRecreateAttemptsError(t *testing.T) {
 	// Verify that the caller's context was cancelled via the CancelFunc callback,
 	// and that the fatal was classified as a stream error.
 	require.Error(t, ctx.Err(), "caller context should be cancelled")
-	require.Equal(t, int64(FatalReasonStreamError), gotReason.Load(),
+	require.Equal(t, int64(contract.FatalReasonStreamError), gotReason.Load(),
 		"exhausted recreate attempts must be reported as a stream error")
 
 	client.Close()
@@ -1568,7 +1568,7 @@ func TestProcessDDLNotification(t *testing.T) {
 		c := &binlogClient{
 			feedCore: feedCore{
 				logger:           slog.Default(),
-				callerCancelFunc: func(FatalReason) bool { cancelled = true; return true },
+				callerCancelFunc: func(contract.FatalReason) bool { cancelled = true; return true },
 				ddlFilterSchema:  filterSchema,
 				ddlFilterTables:  toSet(filterTables),
 				subs:             newSubscriptionRegistry(),
@@ -1590,11 +1590,11 @@ func TestProcessDDLNotification(t *testing.T) {
 
 	t.Run("default mode: cancels on exact subscription match", func(t *testing.T) {
 		cancelled := false
-		reason := FatalReason(-1)
+		reason := contract.FatalReason(-1)
 		c := &binlogClient{
 			feedCore: feedCore{
 				logger: slog.Default(),
-				callerCancelFunc: func(r FatalReason) bool {
+				callerCancelFunc: func(r contract.FatalReason) bool {
 					cancelled = true
 					reason = r
 					return true
@@ -1614,7 +1614,7 @@ func TestProcessDDLNotification(t *testing.T) {
 		// DDL on the subscribed table should cancel, reported as a schema change.
 		c.processDDL(dbName, "orders", false)
 		require.True(t, cancelled, "should cancel on DDL matching a subscribed table")
-		require.Equal(t, FatalReasonSchemaChange, reason,
+		require.Equal(t, contract.FatalReasonSchemaChange, reason,
 			"DDL must be reported as a schema change so callers invalidate checkpoints")
 
 		// DDL on an unrelated table should not cancel.
@@ -1658,7 +1658,7 @@ func TestProcessDDLNotification(t *testing.T) {
 		c := &binlogClient{
 			feedCore: feedCore{
 				logger:           slog.Default(),
-				callerCancelFunc: func(FatalReason) bool { cancelled = true; return true },
+				callerCancelFunc: func(contract.FatalReason) bool { cancelled = true; return true },
 				subs:             newSubscriptionRegistry(),
 			},
 		}
@@ -1821,7 +1821,7 @@ func newWraparoundTestClient(t *testing.T, srcName, dstName string) (*binlogClie
 	gotReason := &atomic.Int64{}
 	gotReason.Store(-1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		gotReason.Store(int64(reason))
 		return true
 	}
@@ -1851,7 +1851,7 @@ func rotateTo(file string, pos uint64) *replication.BinlogEvent {
 // transaction boundary. Past the wrap, file+position stops identifying a
 // unique point in the stream: setBufferedPos freezes just under the wrap
 // and shouldSkipReplayedEvent would discard every later row event as a
-// replay. The stream must fail with FatalReasonLogPosWrapped (which tells
+// replay. The stream must fail with contract.FatalReasonLogPosWrapped (which tells
 // the runner to invalidate its checkpoint) rather than buffer events from
 // a coordinate space it can no longer track.
 func TestBinlogClientLogPosWraparoundGuard(t *testing.T) {
@@ -1871,7 +1871,7 @@ func TestBinlogClientLogPosWraparoundGuard(t *testing.T) {
 	postWrap, _ := mkRowsEventForTest(replication.WRITE_ROWS_EVENTv2, 500, "test", "logposwrapt1", 2)
 	require.NoError(t, streamer.AddEventToStreamer(postWrap))
 
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonLogPosWrapped) },
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(contract.FatalReasonLogPosWrapped) },
 		5*time.Second, 5*time.Millisecond, "a backwards LogPos within one file must report wraparound")
 	client.streamWG.Wait() // reader fully exited: buffering is final
 	require.Equal(t, 1, client.GetDeltaLen(),
@@ -1947,7 +1947,7 @@ func TestBinlogProcessRowsEventUnknownSubtype(t *testing.T) {
 
 	// It is a stream error, not an XA or schema-change one, so the caller
 	// keeps its checkpoint.
-	require.Equal(t, FatalReasonStreamError, fatalReasonForStreamError(err))
+	require.Equal(t, contract.FatalReasonStreamError, fatalReasonForStreamError(err))
 
 	// Events for tables without a subscription stay ignored regardless of
 	// subtype — that is how writes to the _new table are filtered out.

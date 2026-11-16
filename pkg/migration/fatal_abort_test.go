@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/stretchr/testify/assert"
@@ -43,14 +43,14 @@ func TestMigrationFatalAbortDuringChecksum(t *testing.T) {
 
 	m := NewTestRunnerFromStatement(t, "ALTER TABLE fatalchecksum ENGINE=InnoDB", WithThreads(1))
 	sink := &fatalOnPhaseSink{outcomeSink: newOutcomeSink(), phase: status.Checksum}
-	sink.fire = func() { assert.True(t, m.fatalError(change.FatalReasonStreamError)) }
+	sink.fire = func() { assert.True(t, m.fatalError(contract.FatalReasonStreamError)) }
 	m.SetMetricsSink(sink)
 
 	running := startTestRun(t, m.Run, m.Close)
 	err := running.wait(t)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, context.Canceled, "a fatal abort is not an operator cancellation")
-	require.ErrorContains(t, err, change.FatalReasonStreamError.String())
+	require.ErrorContains(t, err, contract.FatalReasonStreamError.String())
 
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
@@ -75,7 +75,7 @@ func TestMigrationFatalAbortBeforeFirstPhase(t *testing.T) {
 
 	m := NewTestRunnerFromStatement(t, "ALTER TABLE fatalsetup ENGINE=InnoDB", WithThreads(1))
 	m.logger = slog.New(testutils.NewOnLogHandler(slog.Default().Handler(), "Starting spirit migration", func() {
-		assert.True(t, m.fatalError(change.FatalReasonStreamError))
+		assert.True(t, m.fatalError(contract.FatalReasonStreamError))
 	}))
 	sink := newOutcomeSink()
 	m.SetMetricsSink(sink)
@@ -84,7 +84,7 @@ func TestMigrationFatalAbortBeforeFirstPhase(t *testing.T) {
 	err := running.wait(t)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, context.Canceled, "a fatal abort is not an operator cancellation")
-	require.ErrorContains(t, err, change.FatalReasonStreamError.String())
+	require.ErrorContains(t, err, contract.FatalReasonStreamError.String())
 	require.Empty(t, sink.outcomes(), "Run must stop before its first phase")
 }
 

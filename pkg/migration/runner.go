@@ -20,6 +20,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/concurrency"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -1397,9 +1398,9 @@ func (r *Runner) setup(ctx context.Context) error {
 
 // fatalError is the callback provided to the replication client.
 // It is called when a DDL change is detected on a subscribed table
-// (change.FatalReasonSchemaChange), when a fatal stream error occurs
-// (change.FatalReasonStreamError), or when the periodic flush fails to apply
-// changes (change.FatalReasonFlushError). The replication client is
+// (contract.FatalReasonSchemaChange), when a fatal stream error occurs
+// (contract.FatalReasonStreamError), or when the periodic flush fails to apply
+// changes (contract.FatalReasonFlushError). The replication client is
 // responsible for any logging related to these errors.
 // It returns true if the error was acted upon (migration cancelled),
 // or false if it was ignored (e.g. because the migration is already
@@ -1408,7 +1409,7 @@ func (r *Runner) setup(ctx context.Context) error {
 // The policy (cutover guard, checkpoint invalidation, abort cause) is shared
 // with move: see runtime.FatalGate.Trip. fatalError is safe to call
 // concurrently.
-func (r *Runner) fatalError(reason change.FatalReason) bool {
+func (r *Runner) fatalError(reason contract.FatalReason) bool {
 	return r.fatal.Trip(reason, runtime.FatalTarget{
 		Noun:    "migration",
 		Tracker: &r.status,
@@ -1653,7 +1654,7 @@ func (r *Runner) resumeFromCheckpoint(ctx context.Context) error {
 		r.logger.Warn("resuming from checkpoint failed because resuming from the previous source position failed",
 			"position", resumePosition,
 		)
-		if errors.Is(err, change.ErrPositionNotFound) {
+		if errors.Is(err, contract.ErrPositionNotFound) {
 			return fmt.Errorf("%w: %w", status.ErrBinlogNotFound, err)
 		}
 		return err

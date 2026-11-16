@@ -3,6 +3,7 @@ package change
 import (
 	"testing"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/stretchr/testify/require"
 )
 
@@ -70,20 +71,20 @@ func TestResolveFlushShape(t *testing.T) {
 // run's checkpoint resumable. An unknown reason must invalidate it: that
 // costs a restart, while wrongly resuming could corrupt data.
 func TestFatalReasonCheckpointPolicy(t *testing.T) {
-	require.True(t, FatalReasonStreamError.PreservesCheckpoint())
-	require.True(t, FatalReasonFlushError.PreservesCheckpoint())
-	require.False(t, FatalReasonSchemaChange.PreservesCheckpoint())
-	require.False(t, FatalReasonUnsupportedXA.PreservesCheckpoint())
-	require.False(t, FatalReasonLogPosWrapped.PreservesCheckpoint())
-	require.False(t, FatalReason(99).PreservesCheckpoint())
+	require.True(t, contract.FatalReasonStreamError.PreservesCheckpoint())
+	require.True(t, contract.FatalReasonFlushError.PreservesCheckpoint())
+	require.False(t, contract.FatalReasonSchemaChange.PreservesCheckpoint())
+	require.False(t, contract.FatalReasonUnsupportedXA.PreservesCheckpoint())
+	require.False(t, contract.FatalReasonLogPosWrapped.PreservesCheckpoint())
+	require.False(t, contract.FatalReason(99).PreservesCheckpoint())
 
-	require.Empty(t, FatalAdvice(FatalReasonSchemaChange, "move"))
-	require.Empty(t, FatalAdvice(FatalReason(99), "move"))
-	for _, reason := range []FatalReason{FatalReasonStreamError, FatalReasonFlushError} {
+	require.Empty(t, FatalAdvice(contract.FatalReasonSchemaChange, "move"))
+	require.Empty(t, FatalAdvice(contract.FatalReason(99), "move"))
+	for _, reason := range []contract.FatalReason{contract.FatalReasonStreamError, contract.FatalReasonFlushError} {
 		require.Contains(t, FatalAdvice(reason, "move"), "the checkpoint has been preserved")
 		require.Contains(t, FatalAdvice(reason, "move"), "resume the move from it")
 	}
-	for _, reason := range []FatalReason{FatalReasonUnsupportedXA, FatalReasonLogPosWrapped} {
+	for _, reason := range []contract.FatalReason{contract.FatalReasonUnsupportedXA, contract.FatalReasonLogPosWrapped} {
 		require.Contains(t, FatalAdvice(reason, "migration"), "the checkpoint will be invalidated")
 		require.Contains(t, FatalAdvice(reason, "migration"), "start a fresh migration")
 	}

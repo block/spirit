@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/status"
@@ -471,7 +471,7 @@ func TestMigrationCancelledFromTableModification(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.NotErrorIs(t, err, context.Canceled)
-	require.ErrorContains(t, err, change.FatalReasonSchemaChange.String())
+	require.ErrorContains(t, err, contract.FatalReasonSchemaChange.String())
 	outcomes := sink.outcomes()
 	require.Contains(t, outcomes, status.WorkflowPhaseOutcomeFailed, "the phase that observed the abort must be recorded as failed")
 	require.NotContains(t, outcomes, status.WorkflowPhaseOutcomeCancelled, "no phase may be recorded as cancelled")
@@ -519,7 +519,7 @@ func TestMigrationFailsOnPeriodicFlushError(t *testing.T) {
 	// The synchronous flush after the copy would fail on the same change,
 	// but with the bare apply error: the reason shows it was the periodic
 	// flush, during the copy, that stopped the migration.
-	require.ErrorContains(t, err, change.FatalReasonFlushError.String())
+	require.ErrorContains(t, err, contract.FatalReasonFlushError.String())
 	require.True(t, checkpointTableExists(t, m), "the checkpoint is still valid and must be preserved")
 }
 

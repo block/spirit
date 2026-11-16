@@ -41,18 +41,6 @@ import (
 // the range), and the dispatch reaches the park long after the verification is
 // gone. That is what ParkedRow.abandon exists for.
 
-// ErrRowRewritten, ErrFlushIncomplete, RowWatch and RowVerifier moved to
-// pkg/contract; these aliases keep existing callers compiling.
-var (
-	ErrRowRewritten    = contract.ErrRowRewritten
-	ErrFlushIncomplete = contract.ErrFlushIncomplete
-)
-
-type (
-	RowWatch    = contract.RowWatch
-	RowVerifier = contract.RowVerifier
-)
-
 // parkGate holds a reader goroutine between events. It is advisory in one
 // direction only: arming it does not interrupt an event already being
 // dispatched, it stops the next one from starting. That is the guarantee the
@@ -111,7 +99,7 @@ func (g *parkGate) wait(ctx context.Context) error {
 //
 // At most one is armed at a time, which RowParker enforces.
 type ParkedRow struct {
-	watch RowWatch
+	watch contract.RowWatch
 	gate  *parkGate
 
 	mu        sync.Mutex
@@ -126,7 +114,7 @@ type ParkedRow struct {
 	ch          chan struct{}
 }
 
-func newParkedRow(watch RowWatch, gate *parkGate) *ParkedRow {
+func newParkedRow(watch contract.RowWatch, gate *parkGate) *ParkedRow {
 	return &ParkedRow{watch: watch, gate: gate, ch: make(chan struct{})}
 }
 
@@ -208,7 +196,7 @@ func (w *ParkedRow) abandon() {
 // dispatch the watched change in between, and Release then parks the gate for
 // this row. Clearing that park would let the reader run past the watched event
 // while the flush and the verifier are still to come: the next change to the
-// key is counted as a rewrite, and the verification returns ErrRowRewritten
+// key is counted as a rewrite, and the verification returns contract.ErrRowRewritten
 // against a row written by nothing but single-row events. Deciding on w.mu,
 // which observe and Release also hold, means one of the two always happens:
 // either the unpark comes first and Release parks afterwards, or the watch has
@@ -253,7 +241,7 @@ func flushParked(ctx context.Context, flush func(context.Context) error, allFlus
 			return nil
 		}
 	}
-	return ErrFlushIncomplete
+	return contract.ErrFlushIncomplete
 }
 
 // RowParker is everything a Source needs to implement ParkableSource:
@@ -333,8 +321,8 @@ func (p *RowParker) Watch(tbl *table.TableInfo, key, image []any, deleted bool) 
 // reaching a verdict.
 func (p *RowParker) Verify(
 	ctx context.Context,
-	watch RowWatch,
-	verify RowVerifier,
+	watch contract.RowWatch,
+	verify contract.RowVerifier,
 	drain func(context.Context) error,
 	allFlushed func() bool,
 ) error {
@@ -368,7 +356,7 @@ func (p *RowParker) Verify(
 	}
 	key, image, deleted, rewritten := row.result()
 	if rewritten {
-		return ErrRowRewritten
+		return contract.ErrRowRewritten
 	}
 	if err := verify(ctx, key, image, deleted); err != nil {
 		return err
@@ -381,7 +369,7 @@ func (p *RowParker) Verify(
 	// verifier is mid-read. A verdict reached against a target that moved is
 	// not a verdict, so report the rewrite and let the caller retry.
 	if _, _, _, rewritten = row.result(); rewritten {
-		return ErrRowRewritten
+		return contract.ErrRowRewritten
 	}
 	return nil
 }

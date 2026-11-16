@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"golang.org/x/sync/errgroup"
@@ -246,7 +247,7 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 
 // onFatal records the first fatal feed condition for Err. It returns true
 // (we always act on it: the window degrades to complete-forward).
-func (rf *ReverseFeed) onFatal(reason change.FatalReason) bool {
+func (rf *ReverseFeed) onFatal(reason contract.FatalReason) bool {
 	rf.fatalOnce.Do(func() {
 		rf.fatalMu.Lock()
 		rf.fatalErr = fmt.Errorf("reverse feed hit a fatal condition (%s); rollback is no longer safe", reason)

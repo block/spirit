@@ -23,6 +23,7 @@ import (
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/concurrency"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -1933,9 +1934,9 @@ func (r *Runner) assertNoRevertMarker(ctx context.Context, phase string) error {
 
 // fatalError is the callback provided to the replication client.
 // It is called when a DDL change is detected on a subscribed table
-// (change.FatalReasonSchemaChange), when a fatal stream error occurs
-// (change.FatalReasonStreamError), or when the periodic flush fails to apply
-// changes (change.FatalReasonFlushError). The replication client may perform
+// (contract.FatalReasonSchemaChange), when a fatal stream error occurs
+// (contract.FatalReasonStreamError), or when the periodic flush fails to apply
+// changes (contract.FatalReasonFlushError). The replication client may perform
 // its own logging either before or after invoking this callback, and DDL
 // logging may be skipped entirely if this callback returns false.
 //
@@ -1948,7 +1949,7 @@ func (r *Runner) assertNoRevertMarker(ctx context.Context, phase string) error {
 // The policy (cutover guard, checkpoint invalidation, abort cause) is shared
 // with migration: see runtime.FatalGate.Trip. fatalError is safe to call
 // concurrently — every source's repl client is wired to this same callback.
-func (r *Runner) fatalError(reason change.FatalReason) bool {
+func (r *Runner) fatalError(reason contract.FatalReason) bool {
 	return r.fatal.Trip(reason, runtime.FatalTarget{
 		Noun:    "move",
 		Tracker: &r.status,

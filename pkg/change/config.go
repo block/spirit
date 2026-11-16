@@ -8,35 +8,23 @@ import (
 	"github.com/block/spirit/pkg/dbconn"
 )
 
-// FatalReason is contract.FatalReason; the type and its values moved to
-// pkg/contract. The aliases keep existing callers compiling.
-type FatalReason = contract.FatalReason
-
-const (
-	FatalReasonSchemaChange  = contract.FatalReasonSchemaChange
-	FatalReasonStreamError   = contract.FatalReasonStreamError
-	FatalReasonUnsupportedXA = contract.FatalReasonUnsupportedXA
-	FatalReasonLogPosWrapped = contract.FatalReasonLogPosWrapped
-	FatalReasonFlushError    = contract.FatalReasonFlushError
-)
-
 // FatalAdvice returns what a finite run logs when it aborts for reason f, naming
 // the run as noun ("migration", "move"): whether the checkpoint survives and
 // what the operator must do before re-running. It is empty for a schema
 // change, which the change client has already logged.
-func FatalAdvice(f FatalReason, noun string) string {
+func FatalAdvice(f contract.FatalReason, noun string) string {
 	switch f { //nolint: exhaustive // a schema change needs no further advice
-	case FatalReasonStreamError:
+	case contract.FatalReasonStreamError:
 		return fmt.Sprintf("fatal replication stream error; the checkpoint has been preserved — re-run spirit to resume the %s from it", noun)
-	case FatalReasonFlushError:
+	case contract.FatalReasonFlushError:
 		// The resume coordinate has stopped advancing, so a resume replays
 		// the same changes: the cause (logged just before) must be fixed
 		// first.
 		return fmt.Sprintf("fatal error applying replicated changes; the checkpoint has been preserved — fix the cause of the error and re-run spirit to resume the %s from it", noun)
-	case FatalReasonUnsupportedXA:
+	case contract.FatalReasonUnsupportedXA:
 		// Resuming streams straight back into the XA group.
 		return fmt.Sprintf("XA transaction detected; the checkpoint will be invalidated — stop XA activity and start a fresh %s", noun)
-	case FatalReasonLogPosWrapped:
+	case contract.FatalReasonLogPosWrapped:
 		// Resuming streams forward into the same oversized transaction.
 		return fmt.Sprintf("binlog LogPos wrapped past 4GiB; the checkpoint will be invalidated — enable GTIDs (or lower max_binlog_cache_size so no transaction can grow a binlog file beyond 4GiB) and start a fresh %s", noun)
 	default:
@@ -51,19 +39,19 @@ type ClientConfig struct {
 
 	// CancelFunc is an optional callback from the caller (e.g. migration or move runner).
 	// It is called when a DDL change is detected on a subscribed table
-	// (FatalReasonSchemaChange), or when a fatal stream error occurs, such as
+	// (contract.FatalReasonSchemaChange), or when a fatal stream error occurs, such as
 	// minimal RBR detection or exhausted streamer recreation attempts
-	// (FatalReasonStreamError), when XA is detected
-	// (FatalReasonUnsupportedXA), or when a binlog file's 4-byte LogPos wraps
-	// past 4GiB (FatalReasonLogPosWrapped), or when the periodic flush fails
-	// to apply changes (FatalReasonFlushError).
+	// (contract.FatalReasonStreamError), when XA is detected
+	// (contract.FatalReasonUnsupportedXA), or when a binlog file's 4-byte LogPos wraps
+	// past 4GiB (contract.FatalReasonLogPosWrapped), or when the periodic flush fails
+	// to apply changes (contract.FatalReasonFlushError).
 	// The caller is expected to handle cancellation
 	// and cleanup, using reason to decide whether persisted resume state
 	// (e.g. a checkpoint) must be invalidated (schema change) or is still
 	// safe to resume from (stream error).
 	// It returns true if the error was acted upon (caller actually cancelled),
 	// or false if it was ignored (e.g. because the caller is already past cutover).
-	CancelFunc func(reason FatalReason) bool
+	CancelFunc func(reason contract.FatalReason) bool
 
 	// DDLFilterSchema, when set, broadens DDL detection to cancel on any DDL change
 	// in the specified schema, rather than only on exact table matches against subscriptions.

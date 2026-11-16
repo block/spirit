@@ -8,10 +8,6 @@ import (
 	"github.com/block/spirit/pkg/table"
 )
 
-// ErrPositionNotFound is contract.ErrPositionNotFound; it moved to
-// pkg/contract. The alias keeps existing callers compiling.
-var ErrPositionNotFound = contract.ErrPositionNotFound
-
 // Source is the abstraction spirit uses to consume a stream of row
 // changes from a source database. It exists so spirit's replication
 // pipeline is not pinned to the MySQL binlog protocol — alternative
@@ -60,7 +56,7 @@ type Source interface {
 	// returned by Position(), then begins streaming as if Start had
 	// been called. Implementations validate the position is still
 	// resumable (e.g. MySQL: the binlog file has not been purged); an
-	// unresumable position is returned wrapped with ErrPositionNotFound.
+	// unresumable position is returned wrapped with contract.ErrPositionNotFound.
 	StartFromPosition(ctx context.Context, pos string) error
 
 	// Position returns the latest safe-to-resume position as an opaque
@@ -172,7 +168,7 @@ type Source interface {
 	// but that traded a compile error for a status block that silently goes
 	// blank — and a source that cannot say when it last flushed is one an
 	// operator cannot tell apart from a stalled one.
-	FeedStats() FeedStats
+	FeedStats() contract.FeedStats
 
 	// Stop ends delivery of events to subscriptions. Everything else stays
 	// live: the source keeps reading and tracking its position, and Flush /
@@ -222,11 +218,11 @@ type ParkableSource interface {
 	// whatever the outcome. See park.go for what this is for and why the image
 	// a change carries is a sound basis for comparison.
 	//
-	// It returns ErrRowRewritten if a further change to the same row was
+	// It returns contract.ErrRowRewritten if a further change to the same row was
 	// admitted before verify could run — the image handed over would no longer
-	// be what the target holds — ErrFlushIncomplete if the flush could not
+	// be what the target holds — contract.ErrFlushIncomplete if the flush could not
 	// land it, and ctx.Err() if no change arrived in time. A row that is
 	// genuinely hot produces one almost immediately; a row that does not is
 	// not the case this exists for.
-	VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error
+	VerifyRowAtNextChange(ctx context.Context, watch contract.RowWatch, verify contract.RowVerifier) error
 }

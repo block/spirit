@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -216,7 +217,7 @@ func (s *rowSettler) settleRow(ctx, parent context.Context, snapshot *hotSnapsho
 	defer cancel()
 
 	var verdict settleVerdict
-	err = parker.VerifyRowAtNextChange(rowCtx, change.RowWatch{
+	err = parker.VerifyRowAtNextChange(rowCtx, contract.RowWatch{
 		Schema: chunk.Table.SchemaName,
 		Table:  chunk.Table.TableName,
 		Match:  matcher,
@@ -230,11 +231,11 @@ func (s *rowSettler) settleRow(ctx, parent context.Context, snapshot *hotSnapsho
 		// The run itself is going away; that is not a verdict and not ours to
 		// swallow.
 		return settleUnavailable, parent.Err()
-	case errors.Is(err, change.ErrRowRewritten):
+	case errors.Is(err, contract.ErrRowRewritten):
 		s.logger.Debug("lockless checksum: watched row was rewritten mid-verification; deferring",
 			"chunk", chunk.String())
 		return settleUnavailable, nil
-	case errors.Is(err, change.ErrFlushIncomplete):
+	case errors.Is(err, contract.ErrFlushIncomplete):
 		// The image may not have reached the target, so any difference we
 		// found would be apply lag wearing a divergence's clothes.
 		s.logger.Debug("lockless checksum: feed could not drain while parked; deferring",

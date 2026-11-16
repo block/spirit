@@ -7,18 +7,11 @@ import (
 	"github.com/block/spirit/pkg/contract"
 )
 
-// FeedStats is contract.FeedStats; the type moved to pkg/contract. The alias
-// keeps existing callers compiling.
-type FeedStats = contract.FeedStats
-
-// FlushShape is contract.FlushShape; the type moved to pkg/contract.
-type FlushShape = contract.FlushShape
-
 // shapeRows is the shape's rows in flight, the product the two dimensions trade
 // against each other (see autoscale.FlushBounds, which holds it constant while
 // re-shaping the terms). Used to rank shapes, so that the narrowest — the one
 // actually holding throughput back — is the one reported.
-func shapeRows(f FlushShape) int { return f.Concurrency * f.BatchSize }
+func shapeRows(f contract.FlushShape) int { return f.Concurrency * f.BatchSize }
 
 // ParkReporter is implemented by Subscription implementations that apply
 // backpressure to the change reader and can report on it. Optional — unlike
@@ -42,7 +35,7 @@ type ParkReporter interface {
 //
 // Callers must not hold their own mutex: this reaches into each subscription's
 // lock, and subscriptions take the Source's lock on their flush paths.
-func MergeSubscriptionStats(s *FeedStats, subs []Subscription) {
+func MergeSubscriptionStats(s *contract.FeedStats, subs []Subscription) {
 	mergeParkStats(s, subs)
 	mergeFlushShapes(s, subs)
 }
@@ -54,7 +47,7 @@ func MergeSubscriptionStats(s *FeedStats, subs []Subscription) {
 // Callers must not hold the client's own mutex: this reaches into each
 // subscription's lock, and the subscriptions take the client's lock on their
 // flush paths.
-func mergeParkStats(stats *FeedStats, subs []Subscription) {
+func mergeParkStats(stats *contract.FeedStats, subs []Subscription) {
 	for _, sub := range subs {
 		reporter, ok := sub.(ParkReporter)
 		if !ok {
@@ -68,7 +61,7 @@ func mergeParkStats(stats *FeedStats, subs []Subscription) {
 
 // parkState reports the aggregate park counter and current park flag across
 // subs, on the same summing/ORing basis as mergeParkStats. Separate from it
-// because Flush wants the pair on its own, not folded into a FeedStats.
+// because Flush wants the pair on its own, not folded into a contract.FeedStats.
 //
 // Callers must not hold the client's own mutex — see mergeParkStats.
 func parkState(subs []Subscription) (parks int64, parked bool) {
@@ -151,7 +144,7 @@ func drainHitBudget(subs []Subscription) bool {
 // drains serially has no shape to report and contributes nothing rather than
 // having to grow a method.
 type FlushShapeReporter interface {
-	FlushShapes() (effective, configured FlushShape)
+	FlushShapes() (effective, configured contract.FlushShape)
 }
 
 // mergeFlushShapes folds the flush shapes of subs into stats, keeping the
@@ -167,7 +160,7 @@ type FlushShapeReporter interface {
 //
 // Callers must not hold the client's own mutex, for the reason on
 // mergeParkStats: this reaches into each subscription.
-func mergeFlushShapes(stats *FeedStats, subs []Subscription) {
+func mergeFlushShapes(stats *contract.FeedStats, subs []Subscription) {
 	for _, sub := range subs {
 		reporter, ok := sub.(FlushShapeReporter)
 		if !ok {
@@ -206,7 +199,7 @@ var nowFunc = time.Now
 // durations of different kinds: how long ago the flush was, and how long it
 // took. Side by side as bare `key=0s` pairs those are genuinely ambiguous;
 // as a phrase the reading is forced.
-func formatFeedStats(s FeedStats) string {
+func formatFeedStats(s contract.FeedStats) string {
 	// Read once and threaded through, so the row's two ages — how long ago the
 	// flush was, and how far behind the read position is — are measured against
 	// the same instant. Separate clock reads would let one status block report
@@ -258,7 +251,7 @@ func formatFeedStats(s FeedStats) string {
 // nothing to sit behind an unbounded GTID set.
 // Takes now from the caller rather than reading the clock itself, so the age
 // here and the flush age above describe the same instant; see formatFeedStats.
-func bufferedAgeField(s FeedStats, now time.Time) string {
+func bufferedAgeField(s contract.FeedStats, now time.Time) string {
 	if s.BufferedEventAt.IsZero() {
 		return ""
 	}
@@ -285,7 +278,7 @@ func bufferedAgeField(s FeedStats, now time.Time) string {
 // short field, and the *appearance* of the parenthetical is the signal that the
 // AIMD controller has stepped in — with its disappearance, some drains later,
 // the signal that the contention cleared.
-func flushShapeField(s FeedStats) string {
+func flushShapeField(s contract.FeedStats) string {
 	if s.FlushShape.Concurrency <= 0 {
 		return ""
 	}
@@ -306,7 +299,7 @@ func flushShapeField(s FeedStats) string {
 // the feed that flushed least recently, since that is the one holding the
 // position back.
 func StatusRow(srcs ...Source) string {
-	var merged FeedStats
+	var merged contract.FeedStats
 	var found bool
 	for _, src := range srcs {
 		if src == nil {
@@ -353,7 +346,7 @@ func StatusRow(srcs ...Source) string {
 
 // isStaler reports whether candidate's last flush is older than current's. A
 // feed that has never flushed is the stalest of all.
-func isStaler(candidate, current FeedStats) bool {
+func isStaler(candidate, current contract.FeedStats) bool {
 	if candidate.LastFlushAt.IsZero() {
 		return true
 	}

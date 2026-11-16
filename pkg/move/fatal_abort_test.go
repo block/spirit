@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
-	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
@@ -57,12 +57,12 @@ func TestMoveFatalAbort(t *testing.T) {
 
 	for _, tc := range []struct {
 		name   string
-		reason change.FatalReason
+		reason contract.FatalReason
 		cancel bool // the caller cancels instead of the change feed aborting
 	}{
-		{name: "FlushError", reason: change.FatalReasonFlushError},
-		{name: "StreamError", reason: change.FatalReasonStreamError},
-		{name: "SchemaChange", reason: change.FatalReasonSchemaChange},
+		{name: "FlushError", reason: contract.FatalReasonFlushError},
+		{name: "StreamError", reason: contract.FatalReasonStreamError},
+		{name: "SchemaChange", reason: contract.FatalReasonSchemaChange},
 		{name: "CallerCancel", cancel: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,7 +144,7 @@ func TestMoveFatalAbortBeforeFirstPhase(t *testing.T) {
 	})
 	require.NoError(t, err)
 	runner.logger = slog.New(testutils.NewOnLogHandler(slog.Default().Handler(), "Starting table move", func() {
-		assert.True(t, runner.fatalError(change.FatalReasonStreamError))
+		assert.True(t, runner.fatalError(contract.FatalReasonStreamError))
 	}))
 	sink := &outcomeSink{}
 	runner.SetMetricsSink(sink)
@@ -161,7 +161,7 @@ func TestMoveFatalAbortBeforeFirstPhase(t *testing.T) {
 
 	require.Error(t, runErr)
 	require.NotErrorIs(t, runErr, context.Canceled, "a fatal abort is not an operator cancellation")
-	require.ErrorContains(t, runErr, change.FatalReasonStreamError.String())
+	require.ErrorContains(t, runErr, contract.FatalReasonStreamError.String())
 	require.Empty(t, sink.outcomes(), "Run must stop before its first phase")
 }
 
