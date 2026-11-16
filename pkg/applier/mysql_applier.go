@@ -666,7 +666,7 @@ func (a *MySQLApplier) writeChunklet(ctx context.Context, shard *shardTarget, ch
 	// the two lists differ; without renames they are identical.
 	mapping := chunkletData.chunk.ColumnMapping
 	_, targetColumnList := mapping.Columns()
-	sourceColumnNames, _ := mapping.ColumnsSlice()
+	sourceColumnNames, _ := mapping.ColumnPairs()
 
 	// Resolve each column's type once per chunklet, not once per value. The
 	// type is a property of the column, so the inner loop was re-doing a map
@@ -913,9 +913,22 @@ func (a *MySQLApplier) resolveShardLocks(locks []contract.TableLock) (map[int]co
 // targetTable may be nil, meaning the same name as sourceTable. A different
 // name is used by migrations (the `_new` table) and by the reverse feed of a
 // sharded-source move, which writes back to the source's retired `_old` tables.
-func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error) {
+func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTableDesc, targetTableDesc contract.Table, keys [][]any, locks []contract.TableLock) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
+	}
+	// The rendering below needs the source's MySQL column types, which only
+	// a *table.TableInfo carries. A nil *table.TableInfo target counts as nil.
+	sourceTable, err := table.AsTableInfo(sourceTableDesc)
+	if err != nil {
+		return 0, fmt.Errorf("delete keys: source %w", err)
+	}
+	if sourceTable == nil {
+		return 0, errors.New("delete keys: sourceTable is nil")
+	}
+	targetTable, err := table.AsTableInfo(targetTableDesc)
+	if err != nil {
+		return 0, fmt.Errorf("delete keys: target %w", err)
 	}
 	// For move operations, targetTable may be nil - use sourceTable for both
 	if targetTable == nil {
@@ -1058,9 +1071,19 @@ func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 //
 // The sharding column and hash always come from the mapping's SOURCE table —
 // the watched table whose row images we are routing.
-func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *MySQLApplier) UpsertRows(ctx context.Context, mappingDesc contract.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
+	}
+	// The rendering below needs the source's MySQL column types and the
+	// mapping's precomputed ordinals, which only a *table.ColumnMapping
+	// carries.
+	mapping, err := table.AsColumnMapping(mappingDesc)
+	if err != nil {
+		return 0, fmt.Errorf("upsert rows: %w", err)
+	}
+	if mapping == nil {
+		return 0, errors.New("upsert rows: mapping is nil")
 	}
 
 	// Resolve which lock belongs to which shard before executing anything,
@@ -1075,7 +1098,7 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 	// generated columns, so we must index it via ordinal positions in
 	// the full column list — not via positions in NonGeneratedColumns.
 	sourceOrdinal := mapping.SourceOrdinalIndices()
-	sourceColumnNames, _ := mapping.ColumnsSlice()
+	sourceColumnNames, _ := mapping.ColumnPairs()
 
 	// Group rows by shard
 	shardRows := make([][]contract.LogicalRow, len(a.shards))

@@ -4,6 +4,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,23 +28,23 @@ func TestColumnMappingColumns(t *testing.T) {
 	require.Equal(t, "`a`, `c`", src)
 }
 
-func TestColumnMappingColumnsSlice(t *testing.T) {
+func TestColumnMappingColumnPairs(t *testing.T) {
 	t1 := NewTableInfo(nil, "test", "t1")
 	t1new := NewTableInfo(nil, "test", "t1_new")
 	setColumns(t1, "a", "b", "c")
 	setColumns(t1new, "a", "b", "c")
 	m := NewColumnMapping(t1, t1new, nil)
-	cols, _ := m.ColumnsSlice()
+	cols, _ := m.ColumnPairs()
 	require.Equal(t, []string{"a", "b", "c"}, cols)
 
 	setColumns(t1new, "a", "c")
 	m = NewColumnMapping(t1, t1new, nil)
-	cols, _ = m.ColumnsSlice()
+	cols, _ = m.ColumnPairs()
 	require.Equal(t, []string{"a", "c"}, cols)
 
 	setColumns(t1new, "a", "c", "d")
 	m = NewColumnMapping(t1, t1new, nil)
-	cols, _ = m.ColumnsSlice()
+	cols, _ = m.ColumnPairs()
 	require.Equal(t, []string{"a", "c"}, cols)
 }
 
@@ -61,7 +62,7 @@ func TestColumnMappingWithRenames(t *testing.T) {
 	require.Equal(t, "`a`, `b`, `c`", srcStr)
 	require.Equal(t, "`x`, `b`, `c`", tgtStr)
 
-	srcSlice, tgtSlice := m.ColumnsSlice()
+	srcSlice, tgtSlice := m.ColumnPairs()
 	require.Equal(t, []string{"a", "b", "c"}, srcSlice)
 	require.Equal(t, []string{"x", "b", "c"}, tgtSlice)
 
@@ -96,7 +97,7 @@ func TestColumnMappingWithRenames(t *testing.T) {
 	renames = map[string]string{"a": "x"}
 
 	m = NewColumnMapping(t1, t1new, renames)
-	srcSlice, tgtSlice = m.ColumnsSlice()
+	srcSlice, tgtSlice = m.ColumnPairs()
 	require.Equal(t, []string{"a", "b", "c"}, srcSlice)
 	require.Equal(t, []string{"x", "b", "c"}, tgtSlice)
 
@@ -106,7 +107,7 @@ func TestColumnMappingWithRenames(t *testing.T) {
 	renames = map[string]string{"a": "x"}
 
 	m = NewColumnMapping(t1, t1new, renames)
-	srcSlice, tgtSlice = m.ColumnsSlice()
+	srcSlice, tgtSlice = m.ColumnPairs()
 	require.Equal(t, []string{"a", "b"}, srcSlice)
 	require.Equal(t, []string{"x", "b"}, tgtSlice)
 
@@ -119,7 +120,7 @@ func TestColumnMappingWithRenames(t *testing.T) {
 	renames = map[string]string{"c1": "n1"}
 
 	m = NewColumnMapping(t1, t1new, renames)
-	srcSlice, tgtSlice = m.ColumnsSlice()
+	srcSlice, tgtSlice = m.ColumnPairs()
 	// Source c1 must map to target n1 (via rename), NOT to target c1 (identity match).
 	// The new target c1 has no source counterpart — it should get its DEFAULT value.
 	require.Equal(t, []string{"id", "c1"}, srcSlice)
@@ -134,7 +135,7 @@ func TestColumnMappingWithRenames(t *testing.T) {
 	renames = map[string]string{"a": "c"}
 
 	m = NewColumnMapping(t1, t1new, renames)
-	srcSlice, tgtSlice = m.ColumnsSlice()
+	srcSlice, tgtSlice = m.ColumnPairs()
 	// source.a → target.c (rename), source.c is excluded (target.c is claimed)
 	require.Equal(t, []string{"id", "a"}, srcSlice)
 	require.Equal(t, []string{"id", "c"}, tgtSlice)
@@ -150,7 +151,7 @@ func TestColumnMappingCaseInsensitive(t *testing.T) {
 	setColumns(t1, "id", "foo")
 	setColumns(t1new, "id", "bar")
 	m := NewColumnMapping(t1, t1new, map[string]string{"Foo": "bar"})
-	srcCols, tgtCols := m.ColumnsSlice()
+	srcCols, tgtCols := m.ColumnPairs()
 	require.Equal(t, []string{"id", "foo"}, srcCols)
 	require.Equal(t, []string{"id", "bar"}, tgtCols)
 
@@ -158,7 +159,7 @@ func TestColumnMappingCaseInsensitive(t *testing.T) {
 	// the mapping must emit the declared target name so downstream exact-name
 	// lookups (e.g. column type maps) succeed.
 	m = NewColumnMapping(t1, t1new, map[string]string{"foo": "BAR"})
-	srcCols, tgtCols = m.ColumnsSlice()
+	srcCols, tgtCols = m.ColumnPairs()
 	require.Equal(t, []string{"id", "foo"}, srcCols)
 	require.Equal(t, []string{"id", "bar"}, tgtCols)
 
@@ -167,7 +168,7 @@ func TestColumnMappingCaseInsensitive(t *testing.T) {
 	setColumns(t1, "id", "foo")
 	setColumns(t1new, "id", "FOO")
 	m = NewColumnMapping(t1, t1new, nil)
-	srcCols, tgtCols = m.ColumnsSlice()
+	srcCols, tgtCols = m.ColumnPairs()
 	require.Equal(t, []string{"id", "foo"}, srcCols)
 	require.Equal(t, []string{"id", "FOO"}, tgtCols)
 
@@ -177,7 +178,7 @@ func TestColumnMappingCaseInsensitive(t *testing.T) {
 	setColumns(t1, "id", "a", "c")
 	setColumns(t1new, "id", "C")
 	m = NewColumnMapping(t1, t1new, map[string]string{"A": "c"})
-	srcCols, tgtCols = m.ColumnsSlice()
+	srcCols, tgtCols = m.ColumnPairs()
 	require.Equal(t, []string{"id", "a"}, srcCols)
 	require.Equal(t, []string{"id", "C"}, tgtCols)
 }
@@ -300,7 +301,7 @@ func TestColumnMappingGeneratedColumns(t *testing.T) {
 	// Generated on both sides (unchanged, or with a changed expression): the
 	// target computes g itself, so it is neither read nor written.
 	m := NewColumnMapping(genTable(t, "t1", cols, "g"), genTable(t, "t1_new", cols, "g"), nil)
-	src, tgt := m.ColumnsSlice()
+	src, tgt := m.ColumnPairs()
 	require.Equal(t, []string{"id", "a", "r"}, src)
 	require.Equal(t, []string{"id", "a", "r"}, tgt)
 	require.Equal(t, []int{0, 1, 3}, m.SourceOrdinalIndices())
@@ -309,7 +310,7 @@ func TestColumnMappingGeneratedColumns(t *testing.T) {
 	// keeps the values, so g must be copied, replayed and checksummed. Its
 	// ordinal indexes the binlog row image, which carries every column.
 	m = NewColumnMapping(genTable(t, "t1", cols, "g"), genTable(t, "t1_new", cols), nil)
-	src, tgt = m.ColumnsSlice()
+	src, tgt = m.ColumnPairs()
 	require.Equal(t, []string{"id", "a", "g", "r"}, src)
 	require.Equal(t, []string{"id", "a", "g", "r"}, tgt)
 	require.Equal(t, []int{0, 1, 2, 3}, m.SourceOrdinalIndices())
@@ -321,21 +322,57 @@ func TestColumnMappingGeneratedColumns(t *testing.T) {
 	// Regular on the source, generated on the target (MODIFY r INT AS (...)
 	// STORED): r can't be written, so it is excluded.
 	m = NewColumnMapping(genTable(t, "t1", cols), genTable(t, "t1_new", cols, "r"), nil)
-	src, tgt = m.ColumnsSlice()
+	src, tgt = m.ColumnPairs()
 	require.Equal(t, []string{"id", "a", "g"}, src)
 	require.Equal(t, []string{"id", "a", "g"}, tgt)
 
 	// Generated on the source, renamed to a regular column on the target
 	// (CHANGE g g2 INT): the rename is honoured.
 	m = NewColumnMapping(genTable(t, "t1", cols, "g"), genTable(t, "t1_new", []string{"id", "a", "g2", "r"}), map[string]string{"g": "g2"})
-	src, tgt = m.ColumnsSlice()
+	src, tgt = m.ColumnPairs()
 	require.Equal(t, []string{"id", "a", "g", "r"}, src)
 	require.Equal(t, []string{"id", "a", "g2", "r"}, tgt)
 	require.Equal(t, []int{0, 1, 2, 3}, m.SourceOrdinalIndices())
 
 	// A generated source column dropped from the target is not mapped.
 	m = NewColumnMapping(genTable(t, "t1", cols, "g"), genTable(t, "t1_new", []string{"id", "a", "r"}), nil)
-	src, _ = m.ColumnsSlice()
+	src, _ = m.ColumnPairs()
 	require.Equal(t, []string{"id", "a", "r"}, src)
 	require.Equal(t, []int{0, 1, 3}, m.SourceOrdinalIndices())
+}
+
+// otherMapping is a contract.ColumnMapping that is not a *ColumnMapping.
+type otherMapping struct{}
+
+func (otherMapping) Source() contract.Table                 { return nil }
+func (otherMapping) Target() contract.Table                 { return nil }
+func (otherMapping) ColumnPairs() (source, target []string) { return nil, nil }
+
+func TestColumnMappingContract(t *testing.T) {
+	src := &TableInfo{SchemaName: "s", TableName: "t", Columns: []string{"id", "a"}, NonGeneratedColumns: []string{"id", "a"}, KeyColumns: []string{"id"}}
+	dst := &TableInfo{SchemaName: "s", TableName: "_t_new", Columns: []string{"id", "b"}, NonGeneratedColumns: []string{"id", "b"}, KeyColumns: []string{"id"}}
+	m := NewColumnMapping(src, dst, map[string]string{"a": "b"})
+
+	var asContract contract.ColumnMapping = m
+	require.Same(t, src, asContract.Source())
+	require.Same(t, dst, asContract.Target())
+	source, target := asContract.ColumnPairs()
+	require.Equal(t, []string{"id", "a"}, source)
+	require.Equal(t, []string{"id", "b"}, target)
+
+	got, err := AsColumnMapping(m)
+	require.NoError(t, err)
+	require.Same(t, m, got)
+
+	got, err = AsColumnMapping(nil)
+	require.NoError(t, err)
+	require.Nil(t, got)
+
+	var nilMapping *ColumnMapping
+	got, err = AsColumnMapping(nilMapping)
+	require.NoError(t, err)
+	require.Nil(t, got)
+
+	_, err = AsColumnMapping(otherMapping{})
+	require.EqualError(t, err, "column mapping is a table.otherMapping, not a *table.ColumnMapping")
 }

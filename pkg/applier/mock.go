@@ -129,7 +129,7 @@ func (m *MockApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]an
 	return nil
 }
 
-func (m *MockApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error) {
+func (m *MockApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable contract.Table, keys [][]any, locks []contract.TableLock) (int64, error) {
 	m.mu.Lock()
 	m.deleteCalls = append(m.deleteCalls, keys)
 	m.mu.Unlock()
@@ -139,7 +139,7 @@ func (m *MockApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *
 	return int64(len(keys)), nil
 }
 
-func (m *MockApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (m *MockApplier) UpsertRows(ctx context.Context, mapping contract.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	m.mu.Lock()
 	m.upsertCalls = append(m.upsertCalls, rows)
 	m.mu.Unlock()

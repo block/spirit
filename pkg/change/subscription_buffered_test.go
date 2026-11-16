@@ -1,6 +1,7 @@
 package change
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -2156,4 +2157,37 @@ func TestBufferedMapWideRowsFlushSplitsStatements(t *testing.T) {
 		"SELECT CONCAT(COUNT(*), '-', BIT_XOR(CRC32(CONCAT(id, payload)))) FROM %s", dstTable.QuotedTableName)).Scan(&dstSum)
 	require.NoError(t, err)
 	require.Equal(t, srcSum, dstSum, "source and destination must match after a split flush")
+}
+
+// targetRecordingWriter records the targetTable each DeleteKeys call
+// receives.
+type targetRecordingWriter struct {
+	applier.MockApplier
+	targets []contract.Table
+}
+
+func (w *targetRecordingWriter) DeleteKeys(_ context.Context, _, targetTable contract.Table, keys [][]any, _ []contract.TableLock) (int64, error) {
+	w.targets = append(w.targets, targetTable)
+	return int64(len(keys)), nil
+}
+
+// TestFlushPassesUntypedNilTargetForMoveFlow pins that a move-flow
+// subscription (no newTable) hands the writer an untyped nil targetTable.
+// A nil *table.TableInfo stored in a contract.Table is not == nil, so a
+// writer outside spirit that checks targetTable == nil for "same name as
+// sourceTable" would otherwise get a table it cannot read.
+func TestFlushPassesUntypedNilTargetForMoveFlow(t *testing.T) {
+	w := &targetRecordingWriter{}
+	sub, err := NewBufferedSubscription(BufferedSubscriptionConfig{
+		CurrentTable: &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}},
+		Applier:      w,
+		Chunker:      table.NewMockChunker("t1", 1000),
+	})
+	require.NoError(t, err)
+	sub.HasChanged([]any{int64(1)}, []any{int64(1)}, true)
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err)
+	require.True(t, allFlushed)
+	require.Len(t, w.targets, 1)
+	require.True(t, w.targets[0] == nil, "targetTable must be an untyped nil, got %#v", w.targets[0]) //nolint:testifylint // require.Nil would accept a typed nil
 }

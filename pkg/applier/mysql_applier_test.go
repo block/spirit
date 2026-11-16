@@ -1543,6 +1543,64 @@ func TestUnderLockRejectsNilLock(t *testing.T) {
 	require.ErrorContains(t, err, "table lock 0 is nil")
 }
 
+// foreignTable and foreignMapping are contract implementations that are not
+// spirit's own, as a project outside spirit would supply.
+type foreignTable struct{}
+
+func (foreignTable) ID() contract.TableID     { return contract.TableID{Schema: "test", Name: "foreign"} }
+func (foreignTable) ColumnNames() []string    { return []string{"id"} }
+func (foreignTable) KeyColumnNames() []string { return []string{"id"} }
+
+type foreignMapping struct{}
+
+func (foreignMapping) Source() contract.Table { return foreignTable{} }
+func (foreignMapping) Target() contract.Table { return foreignTable{} }
+func (foreignMapping) ColumnPairs() (source, target []string) {
+	return []string{"id"}, []string{"id"}
+}
+
+// TestStreamedWriteRequiresSpiritTables pins that MySQLApplier's
+// contract.StreamedChangesWriter methods refuse tables and mappings that are
+// not spirit's own (they need the source's MySQL column types), and a nil
+// source table or mapping, before writing anything: the applier here has no
+// usable connection, so reaching a write would fail differently. A nil
+// *table.TableInfo target counts as "same name as the source".
+func TestStreamedWriteRequiresSpiritTables(t *testing.T) {
+	a, err := New([]Target{{DB: &sql.DB{}}}, NewApplierDefaultConfig())
+	require.NoError(t, err)
+	tbl := table.NewTableInfo(nil, "test", "t1")
+	tbl.Columns = []string{"id"}
+	tbl.KeyColumns = []string{"id"}
+	keys := [][]any{{int64(1)}}
+	rows := []contract.LogicalRow{{RowImage: []any{int64(1)}}}
+
+	_, err = a.DeleteKeys(t.Context(), foreignTable{}, tbl, keys, nil)
+	require.ErrorContains(t, err, "delete keys: source table test.foreign is a applier.foreignTable, not a *table.TableInfo")
+	_, err = a.DeleteKeys(t.Context(), tbl, foreignTable{}, keys, nil)
+	require.ErrorContains(t, err, "delete keys: target table test.foreign is a applier.foreignTable, not a *table.TableInfo")
+	_, err = a.DeleteKeys(t.Context(), nil, tbl, keys, nil)
+	require.EqualError(t, err, "delete keys: sourceTable is nil")
+	var nilTable *table.TableInfo
+	_, err = a.DeleteKeys(t.Context(), nilTable, tbl, keys, nil)
+	require.EqualError(t, err, "delete keys: sourceTable is nil")
+
+	_, err = a.UpsertRows(t.Context(), foreignMapping{}, rows, nil)
+	require.EqualError(t, err, "upsert rows: column mapping is a applier.foreignMapping, not a *table.ColumnMapping")
+	_, err = a.UpsertRows(t.Context(), nil, rows, nil)
+	require.EqualError(t, err, "upsert rows: mapping is nil")
+	var nilMapping *table.ColumnMapping
+	_, err = a.UpsertRows(t.Context(), nilMapping, rows, nil)
+	require.EqualError(t, err, "upsert rows: mapping is nil")
+
+	// The conversions come after the empty-batch shortcut, as before.
+	n, err := a.DeleteKeys(t.Context(), foreignTable{}, nil, nil, nil)
+	require.NoError(t, err)
+	require.Zero(t, n)
+	n, err = a.UpsertRows(t.Context(), foreignMapping{}, nil, nil)
+	require.NoError(t, err)
+	require.Zero(t, n)
+}
+
 // TestSingleTargetPartialRangeRejectsUnownedRow verifies that a single target
 // that owns only part of the key space refuses a row it does not own, on the
 // copy path and the change-feed path, rather than write it or drop it.

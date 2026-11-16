@@ -144,7 +144,7 @@ type bufferedMap struct {
 	// bufferedMap stays source-agnostic and can be reused by alternative
 	// implementations (e.g. a VStream change.Source).
 	logger  *slog.Logger
-	applier applier.StreamedChangesWriter // writes changes to the target
+	applier contract.StreamedChangesWriter // writes changes to the target
 
 	table    *table.TableInfo
 	newTable *table.TableInfo
@@ -312,7 +312,7 @@ type BufferedSubscriptionConfig struct {
 	NewTable *table.TableInfo
 
 	// Applier writes batched changes to the target. Required.
-	Applier applier.StreamedChangesWriter
+	Applier contract.StreamedChangesWriter
 
 	// Chunker provides the watermark filter + column mapping. Required.
 	Chunker table.MappedChunker
@@ -1972,7 +1972,7 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 // per entry, in KeyColumns order).
 // If locks is non-empty, the operations are executed under the table
 // lock(s) — one lock per target server, matched to its target by the
-// applier (see applier.StreamedChangesWriter.DeleteKeys for the contract).
+// applier (see contract.StreamedChangesWriter for the lock contract).
 func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []contract.LogicalRow, locks []contract.TableLock) error {
 	if len(deleteKeys) == 0 && len(upsertRows) == 0 {
 		return nil
@@ -1982,7 +1982,14 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 
 	// Execute deletes
 	if len(deleteKeys) > 0 {
-		affectedRows, err := s.applier.DeleteKeys(ctx, s.table, s.newTable, deleteKeys, locks)
+		// A move-flow subscription has no newTable. Pass it as an untyped
+		// nil: a nil *table.TableInfo stored in a contract.Table is not
+		// == nil, so a writer would not see "same name as sourceTable".
+		var target contract.Table
+		if s.newTable != nil {
+			target = s.newTable
+		}
+		affectedRows, err := s.applier.DeleteKeys(ctx, s.table, target, deleteKeys, locks)
 		if err != nil {
 			return fmt.Errorf("failed to delete keys: %w", err)
 		}
