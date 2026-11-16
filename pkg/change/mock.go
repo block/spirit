@@ -25,6 +25,13 @@ import (
 // from the fields below, which is what a test that only needs the interface
 // satisfied wants.
 //
+// It is not a ParkingSource, so a test that hands it to the lockless checksum
+// gets a feed that settles no hot row, and wrapping a real client in it hides
+// the client's parking. A test that needs a change delivered at a park embeds
+// MockSource and adds VerifyRowAtNextChange itself — scripting an event is
+// specific enough to the test that a hook field here would not save it
+// anything.
+//
 // Recording is under a mutex, so the counters are safe to read while the code
 // under test runs. The configuration fields are not: set them before the source
 // is handed over.
@@ -205,19 +212,6 @@ func (m *MockSource) AllChangesFlushed() bool {
 		return m.Inner.AllChangesFlushed()
 	}
 	return !m.Pending
-}
-
-// VerifyRowAtNextChange stands in for a stream on which no matching change ever
-// arrives: the caller's budget ends the wait, which is what a row that went
-// quiet looks like. A test that needs a change delivered embeds MockSource and
-// overrides this — scripting an event is specific enough to the test that a
-// hook field here would not save it anything.
-func (m *MockSource) VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error {
-	if m.Inner != nil {
-		return m.Inner.VerifyRowAtNextChange(ctx, watch, verify)
-	}
-	<-ctx.Done()
-	return ctx.Err()
 }
 
 func (m *MockSource) Stop() {

@@ -51,6 +51,8 @@ type parkingFeed struct {
 	watches []change.RowWatch
 }
 
+var _ change.ParkingSource = (*parkingFeed)(nil)
+
 func (f *parkingFeed) VerifyRowAtNextChange(ctx context.Context, watch change.RowWatch, verify change.RowVerifier) error {
 	f.mu.Lock()
 	f.watches = append(f.watches, watch)
@@ -288,6 +290,27 @@ func TestSettleHotSnapshotWithoutFeedIsUnavailable(t *testing.T) {
 	verdict, err := settleTestSettler(t, db, nil).settle(t.Context(), snapshot)
 	require.NoError(t, err)
 	require.Equal(t, settleUnavailable, verdict)
+}
+
+// TestSettleHotSnapshotWithoutParkingIsUnavailable: a feed that is not a
+// change.ParkingSource cannot hold its reader at the watched change, so there
+// is nothing to compare against. The range defers at once, without waiting out
+// the budget for a change it could not be shown.
+func TestSettleHotSnapshotWithoutParkingIsUnavailable(t *testing.T) {
+	db, chunk := snapshotTestTables(t, "id INT PRIMARY KEY, value INT", []string{"id"})
+	snapshotExec(t, db, "INSERT INTO src VALUES (1,10),(2,20)")
+	snapshotExec(t, db, "INSERT INTO dst VALUES (1,10),(2,99)")
+	snapshot := pendingSnapshot(t, db, chunk, 1)
+
+	feed := &change.MockSource{}
+	_, parks := change.Source(feed).(change.ParkingSource)
+	require.False(t, parks, "the double must not be able to park for this test to mean anything")
+	start := time.Now()
+	verdict, err := settleTestSettler(t, db, feed).settle(t.Context(), snapshot)
+	require.NoError(t, err)
+	require.Equal(t, settleUnavailable, verdict)
+	require.Less(t, time.Since(start), settleRowBudget, "nothing can arrive, so nothing is waited for")
+	require.Len(t, snapshot.pending, 1, "no row is verified")
 }
 
 // TestSettleHotSnapshotPropagatesCancellation: the settle path swallows every

@@ -165,20 +165,6 @@ type Source interface {
 	// "have all received events been applied?".
 	AllChangesFlushed() bool
 
-	// VerifyRowAtNextChange waits for the next change to a row matching watch,
-	// parks the reader at that event, flushes so the target holds its image,
-	// and calls verify with it. The reader is unparked before returning,
-	// whatever the outcome. See park.go for what this is for and why the image
-	// a change carries is a sound basis for comparison.
-	//
-	// It returns ErrRowRewritten if a further change to the same row was
-	// admitted before verify could run — the image handed over would no longer
-	// be what the target holds — ErrFlushIncomplete if the flush could not
-	// land it, and ctx.Err() if no change arrived in time. A row that is
-	// genuinely hot produces one almost immediately; a row that does not is
-	// not the case this exists for.
-	VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error
-
 	// FeedStats reports what the runner's status block prints for this feed:
 	// rotation and park counters, the shape and timing of the last flush, and
 	// how far the reader has buffered. StatusRow merges it across feeds.
@@ -209,4 +195,35 @@ type Source interface {
 	// periodic flush loop. Subsequent StartPeriodicFlush calls are no-ops.
 	// Safe to call more than once.
 	Close()
+}
+
+// ParkingSource is a Source that can hold its reader at a chosen change. It is
+// optional: the lockless checksum asks for it with a type assertion and, from a
+// Source without it, settles no hot row — the range defers exactly as it does
+// when no change arrives in time.
+//
+// It is separate from Source because parking holds the whole stream, and what
+// that costs depends on the stream. Holding a binlog reader costs the server
+// nothing, since the binlog is kept whether or not anyone reads it. A stream
+// whose server keeps its log only until the consumer confirms it would grow
+// that log for as long as the reader is held.
+//
+// A wrapper around a Source must not implement this unconditionally: the type
+// assertion would then succeed for a wrapped Source that cannot park.
+type ParkingSource interface {
+	Source
+
+	// VerifyRowAtNextChange waits for the next change to a row matching watch,
+	// parks the reader at that event, flushes so the target holds its image,
+	// and calls verify with it. The reader is unparked before returning,
+	// whatever the outcome. See park.go for what this is for and why the image
+	// a change carries is a sound basis for comparison.
+	//
+	// It returns ErrRowRewritten if a further change to the same row was
+	// admitted before verify could run — the image handed over would no longer
+	// be what the target holds — ErrFlushIncomplete if the flush could not
+	// land it, and ctx.Err() if no change arrived in time. A row that is
+	// genuinely hot produces one almost immediately; a row that does not is
+	// not the case this exists for.
+	VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error
 }
