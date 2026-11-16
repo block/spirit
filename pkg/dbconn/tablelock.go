@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
 )
@@ -27,6 +28,10 @@ const lockedStatementCompletionMargin = 30 * time.Second
 // server but stopped waiting for. The server may have committed
 // it: the caller must check the server state before it acts on the failure.
 var ErrStatementOutcomeUnknown = errors.New("statement outcome unknown")
+
+// TableLock implements contract.TableLock: change feeds and appliers receive it
+// through that interface.
+var _ contract.TableLock = (*TableLock)(nil)
 
 type TableLock struct {
 	db       *sql.DB // the connection pool the lock was acquired on
@@ -208,7 +213,13 @@ func killTableLockBlockers(ctx, lockCtx context.Context, logger *slog.Logger, ki
 // any write to a locked table must go through this lock's own connection.
 // Callers holding locks on multiple servers (e.g. one per shard) use this
 // to match each lock to the target it belongs to.
+//
+// A nil *TableLock returns nil, so a typed nil held in a contract.TableLock
+// is detected rather than dereferenced.
 func (s *TableLock) DB() *sql.DB {
+	if s == nil {
+		return nil
+	}
 	return s.db
 }
 

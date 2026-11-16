@@ -14,6 +14,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
@@ -1185,7 +1186,7 @@ type gatedSubscription struct {
 
 func (s *gatedSubscription) HasChanged(key, row []any, deleted bool) {}
 func (s *gatedSubscription) Length() int                             { return 0 }
-func (s *gatedSubscription) Flush(_ context.Context, _ bool, _ []*dbconn.TableLock) (bool, error) {
+func (s *gatedSubscription) Flush(_ context.Context, _ bool, _ []contract.TableLock) (bool, error) {
 	<-<-s.gates
 	return true, nil
 }

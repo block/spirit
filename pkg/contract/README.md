@@ -19,3 +19,4 @@ The plan is to stabilize this package and then move it to its own module, `githu
 | Type | Moved from | Description |
 |------|------------|-------------|
 | `LogicalRow` | `pkg/applier` | The current state of a row in a subscription buffer: deleted, or a row image. |
+| `TableLock` | new; `*dbconn.TableLock` implements it | A held `LOCK TABLES` that a subscription's flush writes through. Change feeds only forward it. |

@@ -131,7 +131,7 @@ type StreamedChangesWriter interface {
 	// matched by connection identity. A missing lock for any target, or a lock
 	// that matches no target, is an error.
 	// Returns the number of rows affected and any error.
-	DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error)
+	DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error)
 
 	// UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously.
 	// The rows are contract.LogicalRow structs containing the row images.
@@ -139,7 +139,7 @@ type StreamedChangesWriter interface {
 	// the upsert is executed under the supplied table lock(s). See DeleteKeys
 	// for the lock contract (one lock per target).
 	// Returns the number of rows affected and any error.
-	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []*dbconn.TableLock) (int64, error)
+	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error)
 }
 
 // deleteKeysInClause renders key value tuples into the element list of a

@@ -10,6 +10,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/copier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
@@ -22,7 +23,7 @@ import (
 type preDispatchClient interface {
 	Source
 	Close()
-	flush(ctx context.Context, underLock bool, locks []*dbconn.TableLock) error
+	flush(ctx context.Context, underLock bool, locks []contract.TableLock) error
 }
 
 // preDispatchTiming says when the first change reaches the target relative to

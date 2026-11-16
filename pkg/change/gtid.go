@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
-	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/google/uuid"
@@ -701,7 +701,7 @@ func (c *gtidClient) processTransactionPayload(e *replication.TransactionPayload
 // FlushUnderTableLock satisfies Source. See feedCore.flushUnderTableLock:
 // flush the in-flight delta, wait for the events the flush itself generated
 // to be ingested, then flush again so the resume coordinate covers those.
-func (c *gtidClient) FlushUnderTableLock(ctx context.Context, locks []*dbconn.TableLock) error {
+func (c *gtidClient) FlushUnderTableLock(ctx context.Context, locks []contract.TableLock) error {
 	return c.flushUnderTableLock(ctx, locks, c.flush, c.BlockWait)
 }
 
@@ -716,7 +716,7 @@ func (c *gtidClient) StartPeriodicFlush(ctx context.Context, interval time.Durat
 	c.startPeriodicFlush(ctx, interval, c.flush, "GTID changeset")
 }
 
-func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []*dbconn.TableLock) error {
+func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []contract.TableLock) error {
 	// Sampled before the flush starts: this is the batch size the flush is
 	// about to work through. GetDeltaLen takes no lock of its own, so it is
 	// called before acquiring c.mu.

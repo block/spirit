@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -146,7 +146,7 @@ func (m *MockSource) Flush(ctx context.Context) error {
 	return nil
 }
 
-func (m *MockSource) FlushUnderTableLock(ctx context.Context, locks []*dbconn.TableLock) error {
+func (m *MockSource) FlushUnderTableLock(ctx context.Context, locks []contract.TableLock) error {
 	m.record(&m.flushes)
 	if m.Inner != nil {
 		return m.Inner.FlushUnderTableLock(ctx, locks)

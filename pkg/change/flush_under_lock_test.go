@@ -11,6 +11,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -92,7 +93,7 @@ func runFlushUnderTableLockErrorBranches(t *testing.T, useGTID bool, srcName, ds
 	// run, which would fail the UNLOCK and leave the lock held into teardown.
 	defer utils.CloseAndLogWithContext(t.Context(), lock)
 
-	err = client.FlushUnderTableLock(t.Context(), []*dbconn.TableLock{lock})
+	err = client.FlushUnderTableLock(t.Context(), []contract.TableLock{lock})
 	require.Error(t, err)
 	require.ErrorContains(t, err, dstName)
 }
@@ -178,7 +179,7 @@ type failingParkedSubscription struct {
 	stubSubscription
 }
 
-func (*failingParkedSubscription) Flush(context.Context, bool, []*dbconn.TableLock) (bool, error) {
+func (*failingParkedSubscription) Flush(context.Context, bool, []contract.TableLock) (bool, error) {
 	return false, errors.New("injected parked flush failure")
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -715,7 +716,7 @@ func (c *binlogClient) processTransactionPayload(e *replication.TransactionPaylo
 
 // FlushUnderTableLock satisfies Source. See feedCore.flushUnderTableLock for
 // the two-pass flush it performs.
-func (c *binlogClient) FlushUnderTableLock(ctx context.Context, locks []*dbconn.TableLock) error {
+func (c *binlogClient) FlushUnderTableLock(ctx context.Context, locks []contract.TableLock) error {
 	return c.flushUnderTableLock(ctx, locks, c.flush, c.BlockWait)
 }
 
@@ -738,7 +739,7 @@ func (c *binlogClient) StartPeriodicFlush(ctx context.Context, interval time.Dur
 // This means that the actual buffered position might be slightly ahead by
 // the end of the flush. That's OK, we only set the flushed position to the known
 // safe buffered position taken at the start.
-func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []*dbconn.TableLock) error {
+func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []contract.TableLock) error {
 	// Sampled before the flush starts: this is the batch size the flush is
 	// about to work through. GetDeltaLen takes no lock of its own, so it is
 	// called before acquiring c.mu.

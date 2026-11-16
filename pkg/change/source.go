@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -107,7 +107,7 @@ type Source interface {
 	// migrations; one per shard for sharded moves) — the applier
 	// executes each target's statements under that target's own lock,
 	// since LOCK TABLES blocks writes from every other connection.
-	FlushUnderTableLock(ctx context.Context, locks []*dbconn.TableLock) error
+	FlushUnderTableLock(ctx context.Context, locks []contract.TableLock) error
 
 	// BlockWait blocks until all events received from the underlying
 	// stream up to call-time have been delivered to their subscriptions.

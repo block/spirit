@@ -8,7 +8,6 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/contract"
-	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/require"
 )
@@ -30,7 +29,7 @@ type slowApplier struct {
 	perCall time.Duration
 }
 
-func (s *slowApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (s *slowApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	time.Sleep(s.perCall)
 	return s.MockApplier.UpsertRows(ctx, mapping, rows, locks)
 }

@@ -1002,7 +1002,7 @@ func TestShardedApplierUpsertRowsUnderLock(t *testing.T) {
 	// Pass the locks deliberately out of shard order: the applier must
 	// match each lock to its shard by the connection it was acquired on,
 	// not by position.
-	locks := []*dbconn.TableLock{lock2, lock1}
+	locks := []contract.TableLock{lock2, lock1}
 	affectedRows, err := applier.UpsertRows(ctx, table.NewColumnMapping(sourceTable, target1Table, nil), upsertRows, locks)
 	require.NoError(t, err)
 	require.Equal(t, int64(4), affectedRows)
@@ -1056,7 +1056,7 @@ func TestShardedApplierDeleteKeysUnderLock(t *testing.T) {
 		{int64(2)},
 		{int64(3)},
 	}
-	affected, err := applier.DeleteKeys(ctx, sourceTable, target1Table, keysToDelete, []*dbconn.TableLock{lock1, lock2})
+	affected, err := applier.DeleteKeys(ctx, sourceTable, target1Table, keysToDelete, []contract.TableLock{lock1, lock2})
 	require.NoError(t, err)
 	// Under lock the per-shard counts are unknown, so the key count is
 	// reported — once, not once per shard — matching single-target MySQLApplier.
@@ -1111,11 +1111,11 @@ func TestShardedApplierUnderLockMissingShardLock(t *testing.T) {
 	upsertRows := []contract.LogicalRow{
 		{RowImage: []any{int64(2), int64(102), "Bob"}}, // even -> shard 0
 	}
-	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(sourceTable, target1Table, nil), upsertRows, []*dbconn.TableLock{lock1})
+	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(sourceTable, target1Table, nil), upsertRows, []contract.TableLock{lock1})
 	require.ErrorContains(t, err, "no table lock supplied for shard 1")
 
 	keysToDelete := [][]any{{int64(1)}}
-	_, err = applier.DeleteKeys(ctx, sourceTable, target1Table, keysToDelete, []*dbconn.TableLock{lock1})
+	_, err = applier.DeleteKeys(ctx, sourceTable, target1Table, keysToDelete, []contract.TableLock{lock1})
 	require.ErrorContains(t, err, "no table lock supplied for shard 1")
 
 	// Nothing should have been written or deleted anywhere.
