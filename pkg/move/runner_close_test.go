@@ -316,7 +316,7 @@ func TestRunClosesOpenedSourcesWhenALaterSourceFailsToConnect(t *testing.T) {
 	require.Eventually(t, func() bool {
 		var n int
 		err := db.QueryRowContext(t.Context(),
-			"SELECT COUNT(*) FROM information_schema.processlist WHERE db = ?", srcName).Scan(&n)
+			"SELECT COUNT(*) FROM performance_schema.processlist WHERE db = ?", srcName).Scan(&n)
 		return err == nil && n == 0
 	}, 10*time.Second, 50*time.Millisecond, "the first source's connections were not closed")
 }

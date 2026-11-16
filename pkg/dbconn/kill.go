@@ -550,8 +550,8 @@ func killConnection(ctx context.Context, db *sql.DB, pid int, logger *slog.Logge
 // session that is already gone counts as success. ctx bounds both steps.
 //
 // It needs no extra privileges when pid belongs to the same user as db: a user
-// can KILL its own sessions and see them in information_schema.PROCESSLIST
-// without CONNECTION_ADMIN or PROCESS. Another user's session needs
+// can KILL its own sessions and see them in the processlist without
+// CONNECTION_ADMIN or PROCESS (see sessionListed). Another user's session needs
 // CONNECTION_ADMIN or SUPER, or, on RDS and Aurora, EXECUTE on mysql.rds_kill
 // (see killConnection).
 func KillSessionAndWait(ctx context.Context, db *sql.DB, pid int) error {
@@ -564,11 +564,11 @@ func KillSessionAndWait(ctx context.Context, db *sql.DB, pid int) error {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
-		var remaining int
-		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", pid).Scan(&remaining); err != nil {
+		listed, err := sessionListed(ctx, db, pid)
+		if err != nil {
 			return fmt.Errorf("waiting for killed session %d to exit: %w", pid, err)
 		}
-		if remaining == 0 {
+		if !listed {
 			return nil
 		}
 		select {
@@ -579,6 +579,37 @@ func KillSessionAndWait(ctx context.Context, db *sql.DB, pid int) error {
 		interval = min(interval*2, 100*time.Millisecond)
 		timer.Reset(interval)
 	}
+}
+
+// sessionListed reports whether the processlist still lists session pid.
+//
+// It reads performance_schema.processlist rather than
+// information_schema.processlist: from MySQL 9.7, information_schema.processlist
+// cannot be read at all while any running statement's text holds a 4-byte
+// character, such as an emoji (https://bugs.mysql.com/bug.php?id=121434), and
+// application traffic can hold one at any moment. Both list the same sessions
+// and need no grant to list the caller's own.
+//
+// With performance_schema disabled, performance_schema.processlist is empty
+// rather than an error, which would report every session as gone. So the read
+// also counts the querying session, which is always running; when it is not
+// listed, information_schema.processlist answers instead.
+func sessionListed(ctx context.Context, db *sql.DB, pid int) (bool, error) {
+	var listed, self int
+	err := db.QueryRowContext(ctx,
+		"SELECT COALESCE(SUM(id = ?), 0), COALESCE(SUM(id = CONNECTION_ID()), 0) FROM performance_schema.processlist WHERE id IN (?, CONNECTION_ID())",
+		pid, pid).Scan(&listed, &self)
+	if err == nil && self > 0 {
+		return listed > 0, nil
+	}
+	if ctx.Err() != nil {
+		return false, errors.Join(err, ctx.Err())
+	}
+	var remaining int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", pid).Scan(&remaining); err != nil {
+		return false, err
+	}
+	return remaining > 0, nil
 }
 
 func tablesToInList(tables []*table.TableInfo, logger *slog.Logger) (inList string, params []any) {
