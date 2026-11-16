@@ -549,7 +549,7 @@ func carryAutoIncrement(ctx context.Context, logger *slog.Logger, from, to []aut
 		if !ok || next >= maxNext {
 			return nil
 		}
-		if err := dbconn.Exec(ctx, t.db, "ALTER TABLE %n.%n AUTO_INCREMENT = %?", t.schema, t.name, maxNext); err != nil {
+		if err := dbconn.ExecKillOnCancel(ctx, t.db, logger, "ALTER TABLE %n.%n AUTO_INCREMENT = %?", t.schema, t.name, maxNext); err != nil {
 			return fmt.Errorf("failed to set AUTO_INCREMENT on %s.%s: %w", t.schema, t.name, err)
 		}
 		logger.Info("raised AUTO_INCREMENT so that ids the other side has issued are not issued again",
