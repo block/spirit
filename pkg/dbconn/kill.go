@@ -546,30 +546,47 @@ func killConnection(ctx context.Context, db *sql.DB, pid int, logger *slog.Logge
 }
 
 // KillSessionAndWait kills the session pid and waits until it has exited, so
-// any statement it was running has either finished or been rolled back. A
-// session that is already gone counts as success. ctx bounds both steps.
+// any statement it was running has either finished or been rolled back, and a
+// transaction it held open can no longer commit. A session that is already gone
+// counts as success. ctx bounds both steps.
+//
+// A session killed while idle in an open transaction leaves the server's thread
+// list while InnoDB may still be rolling that transaction back
+// (information_schema.innodb_trx shows ROLLING BACK), so its row locks can
+// outlast the wait.
+//
+// It waits by repeating the kill until the server answers ER_NO_SUCH_THREAD.
+// KILL looks the session up in the server's thread list, which keeps a killed
+// session until it has rolled back and closed, and a repeated KILL of a
+// session that is still exiting changes nothing. It reads no processlist
+// table: from MySQL 9.7 information_schema.processlist cannot be read while
+// any running statement's text holds a 4-byte character
+// (https://bugs.mysql.com/bug.php?id=121434), and performance_schema.processlist
+// omits sessions that performance_schema has no thread instance for, or every
+// session when performance_schema is disabled.
 //
 // It needs no extra privileges when pid belongs to the same user as db: a user
-// can KILL its own sessions and see them in information_schema.PROCESSLIST
-// without CONNECTION_ADMIN or PROCESS. Another user's session needs
-// CONNECTION_ADMIN or SUPER, or, on RDS and Aurora, EXECUTE on mysql.rds_kill
-// (see killConnection).
+// can KILL its own sessions without CONNECTION_ADMIN. Another user's session
+// needs CONNECTION_ADMIN or SUPER, or, on RDS and Aurora, EXECUTE on
+// mysql.rds_kill (see killConnection).
 func KillSessionAndWait(ctx context.Context, db *sql.DB, pid int) error {
 	if err := killConnection(ctx, db, pid, slog.Default()); err != nil {
-		if !errors.Is(err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread}) {
-			return fmt.Errorf("failed to kill session %d: %w", pid, err)
+		if errors.Is(err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread}) {
+			return nil
 		}
+		return fmt.Errorf("failed to kill session %d: %w", pid, err)
 	}
+	// The repeated kills would log the rds_kill fallback every time.
+	quiet := slog.New(slog.DiscardHandler)
 	interval := 10 * time.Millisecond
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
-		var remaining int
-		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", pid).Scan(&remaining); err != nil {
+		if err := killConnection(ctx, db, pid, quiet); err != nil {
+			if errors.Is(err, &mysql.MySQLError{Number: parsermysql.ErrNoSuchThread}) {
+				return nil
+			}
 			return fmt.Errorf("waiting for killed session %d to exit: %w", pid, err)
-		}
-		if remaining == 0 {
-			return nil
 		}
 		select {
 		case <-ctx.Done():

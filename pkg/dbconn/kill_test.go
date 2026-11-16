@@ -235,6 +235,28 @@ func TestCheckForceKillPrivilegesBesideAFourByteCharacterStatement(t *testing.T)
 	require.NoError(t, <-statementDone)
 }
 
+// The wait after the kill must not depend on what other sessions are running.
+// From MySQL 9.7 information_schema.processlist cannot be read while a running
+// statement holds a 4-byte character (block/spirit#1523), so a wait that read
+// it failed although the kill had succeeded.
+func TestKillSessionAndWaitBesideAFourByteCharacterStatement(t *testing.T) {
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	victim, err := db.Conn(ctx)
+	require.NoError(t, err)
+	defer func() { _ = victim.Close() }()
+	var pid int
+	require.NoError(t, victim.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&pid))
+	statementDone := runFourByteCharacterStatement(t, ctx, db, "killwait_mb4", 3)
+	require.NoError(t, KillSessionAndWait(ctx, db, pid))
+	_, err = victim.ExecContext(ctx, "SELECT 1")
+	require.Error(t, err, "the session must have been killed")
+	require.NoError(t, <-statementDone)
+}
+
 // From MySQL 9.7 the blocker lookup fails while a running statement holds a
 // 4-byte character. The error the kill logs must say that this is likely a
 // MySQL bug. It runs only from 9.7, where the statement it starts makes the
@@ -269,8 +291,9 @@ func TestBlockerLookupFailureNamesTheMySQLBug(t *testing.T) {
 // runFourByteCharacterStatement starts, in a transaction that has read its own
 // table, a statement that holds a 4-byte character and runs for seconds. It
 // returns once the statement is running, with a channel for its result. MySQL
-// 9.7 fails every read of information_schema.innodb_trx until the statement
-// ends, because it cannot copy the statement's text into that table.
+// 9.7 fails every read of information_schema.innodb_trx and
+// information_schema.processlist until the statement ends, because it cannot
+// copy the statement's text into those tables.
 func runFourByteCharacterStatement(t *testing.T, ctx context.Context, db *sql.DB, tableName string, seconds int) <-chan error {
 	t.Helper()
 	tt := testutils.NewTestTable(t, tableName, fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", tableName))

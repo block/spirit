@@ -49,11 +49,15 @@ func TestMoveReverseCutoverRetriesAfterLockTimeout(t *testing.T) {
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwlt_src", "rwlt_dst")
 
 	runner, err := NewRunner(&Move{
-		SourceDSN:          sourceDSN,
-		TargetDSN:          targetDSN,
-		Common:             flags.Common{Threads: 1, WriteThreads: 1},
-		ReverseWindow:      30 * time.Second, // long; the revert ends it early
-		CutoverLockTimeout: 300 * time.Millisecond,
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		ReverseWindow: 30 * time.Second, // long; the revert ends it early
+		// Attempt 1 waits out this whole timeout in the hook. Attempt 2 must
+		// fit the reverse feed's catch-up in it, and that reads the rest of a
+		// binlog other test packages are writing to at the same time: 300ms
+		// was not always enough on CI (#1513).
+		CutoverLockTimeout: 2 * time.Second,
 	})
 	require.NoError(t, err)
 	var reverseCutoverCalls atomic.Int32

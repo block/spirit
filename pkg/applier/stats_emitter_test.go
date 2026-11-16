@@ -61,9 +61,7 @@ func (p stubStats) Stats() Stats { return p.s }
 // state.
 func shortenStatsTick(t *testing.T) {
 	t.Helper()
-	old := statsEmitTick
-	statsEmitTick = 10 * time.Millisecond
-	t.Cleanup(func() { statsEmitTick = old })
+	SetStatsEmitTickForTest(t, 10*time.Millisecond)
 }
 
 // TestEmitStatsGauges pins the metric names, the GAUGE type, and the

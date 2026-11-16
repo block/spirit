@@ -129,11 +129,20 @@ func (r *testRun) result() error {
 
 func (r *testRun) wait(t *testing.T) error {
 	t.Helper()
+	return r.waitWithin(t, 3*time.Minute, func() string { return "runner did not complete" })
+}
+
+// waitWithin returns the run's error once it completes, and fails the test
+// with stuck()'s message if it is still running after d. stuck is called only
+// on timeout, so it can report the runner's state at that moment. The error is
+// read only after done is closed, which is what publishes it.
+func (r *testRun) waitWithin(t *testing.T, d time.Duration, stuck func() string) error {
+	t.Helper()
 	select {
 	case <-r.done:
 		return r.err
-	case <-time.After(3 * time.Minute):
-		t.Fatal("runner did not complete")
+	case <-time.After(d):
+		t.Fatal(stuck())
 		return nil
 	}
 }
@@ -235,6 +244,24 @@ func WithTestThrottler() RunnerOption {
 func WithCopyStalledAfterChunks(n int64) RunnerOption {
 	return func(m *Migration) {
 		m.testThrottler = throttler.NewStallingMock(n)
+	}
+}
+
+// WithFlushInterval sets the copy phase's periodic flush interval, which is
+// change.DefaultFlushInterval (30s) otherwise, so a test that waits for a
+// periodic flush does not wait 30s.
+func WithFlushInterval(d time.Duration) RunnerOption {
+	return func(m *Migration) {
+		m.testFlushInterval = d
+	}
+}
+
+// WithChecksumMaxPasses bounds the initial checksum's passes, which is
+// checksum.DefaultLocklessMaxPasses (10) otherwise, so a test of a checksum
+// that cannot converge does not wait for ten passes.
+func WithChecksumMaxPasses(n int) RunnerOption {
+	return func(m *Migration) {
+		m.testChecksumMaxPasses = n
 	}
 }
 

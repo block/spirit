@@ -129,6 +129,7 @@ func TestThrottleStatusIsZeroInUnpacedPhases(t *testing.T) {
 // so there would be no concurrent write to race with. It also lets the test
 // assert that a throttled copy reports its reason through the API.
 func TestProgressPolledConcurrentlyWithRun(t *testing.T) {
+	t.Parallel()
 	tt := testutils.NewTestTable(t, "progresspoll",
 		`CREATE TABLE progresspoll (
 			id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,

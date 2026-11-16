@@ -364,6 +364,11 @@ func TestKeywordFunctionCalls(t *testing.T) {
 			"create table t (v varchar(10) default (left('abc',2)))",
 			"CREATE TABLE `t` (`v` VARCHAR(10) DEFAULT (LEFT('abc', 2)))",
 		},
+		// CHAR() restores as CHAR, not the parser's internal char_func.
+		{
+			"create table t (a varchar(10), h binary(32) as (unhex(sha2(concat(a, char(30)), 256))) stored)",
+			"CREATE TABLE `t` (`a` VARCHAR(10),`h` BINARY(32) GENERATED ALWAYS AS(UNHEX(SHA2(CONCAT(`a`, CHAR(30)), 256))) STORED)",
+		},
 		// Spatial constructors in ordinary expression contexts: broken
 		// before because only POINT was in FunctionNameConflict.
 		{

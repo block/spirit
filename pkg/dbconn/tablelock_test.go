@@ -28,6 +28,7 @@ func testConfig() *DBConfig {
 }
 
 func TestTableLock(t *testing.T) {
+	t.Parallel()
 	db, err := New(testutils.DSN(), testConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -52,6 +53,7 @@ func TestTableLock(t *testing.T) {
 }
 
 func TestExecUnderLock(t *testing.T) {
+	t.Parallel()
 	db, err := New(testutils.DSN(), testConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -76,6 +78,7 @@ func TestExecUnderLock(t *testing.T) {
 }
 
 func TestTableLockMultiple(t *testing.T) {
+	t.Parallel()
 	db, err := New(testutils.DSN(), testConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -136,6 +139,7 @@ func TestTableLockMultiple(t *testing.T) {
 }
 
 func TestTableLockFail(t *testing.T) {
+	t.Parallel()
 	db, err := New(testutils.DSN(), testConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -178,6 +182,7 @@ func TestTableLockFail(t *testing.T) {
 // Both ForceKill=true and ForceKill=false variants must succeed, and neither
 // should require any force-killing (the locks are on different schemas).
 func TestTableLockCrossSchema(t *testing.T) {
+	t.Parallel()
 	for _, forceKill := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ForceKill=%v", forceKill), func(t *testing.T) {
 			db0Name := fmt.Sprintf("t_crosslock_0_%d", os.Getpid())
@@ -243,8 +248,15 @@ func TestTableLockCrossSchema(t *testing.T) {
 // TestTableLockCleanup verifies both sides of session cleanup: other sessions
 // can write to the locked table, and the next borrower can use unrelated tables.
 func TestTableLockCleanup(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"normal", "cancel_acquisition_context", "cancel_cleanup_context", "expired_cleanup_context", "lost_connection", "cancel_inflight_query", "discard_locked_session"} {
 		t.Run(mode, func(t *testing.T) {
+			if mode == "lost_connection" {
+				// This mode KILLs the locked session. Skip it before any table
+				// is created: on 8.0.28 the lock outlives the KILL and blocks the
+				// next subtests' setup.
+				testutils.SkipBeforeMySQLVersion(t, "8.0.29", killedSessionLingersReason)
+			}
 			tt := testutils.NewTestTable(t, "tablelock_cleanup", "CREATE TABLE tablelock_cleanup (id INT PRIMARY KEY)")
 			testutils.NewTestTable(t, "tablelock_unrelated", "CREATE TABLE tablelock_unrelated (id INT PRIMARY KEY)")
 			cfg := testConfig()
@@ -417,6 +429,7 @@ func TestTableLockKillsBesideAFourByteCharacterStatement(t *testing.T) {
 // statement starts after a cancel, and that a statement still running when the
 // completion bound expires is reported as having an unknown outcome.
 func TestExecUnderLockCancellation(t *testing.T) {
+	t.Parallel()
 	cfg := testConfig()
 	cfg.ForceKill = false
 
@@ -602,6 +615,7 @@ func TestExecUnderLockWithoutForeignKeyChecks(t *testing.T) {
 }
 
 func TestExecUnderLockWithWarnings(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		statement string
@@ -648,6 +662,7 @@ func TestExecUnderLockWithWarnings(t *testing.T) {
 // while its autocommit DML is running. Reading SHOW WARNINGS with the cancelled
 // caller context would lose the data-loss verdict after the write committed.
 func TestExecUnderLockWithWarningsDuringCancel(t *testing.T) {
+	t.Parallel()
 	tt := testutils.NewTestTable(t, "checked_lock_cancel", "CREATE TABLE checked_lock_cancel (id INT PRIMARY KEY, value VARCHAR(5))")
 	cfg := testConfig()
 	cfg.ForceKill = false

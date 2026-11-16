@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -224,13 +225,60 @@ func TestSQLModeAllowZeroInvalidDates(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+// lockWaiters returns the engine transaction IDs of the transactions waiting
+// for a lock on test.tbl. RetryableTransaction runs each attempt in a new
+// transaction, so each attempt that waits shows up under its own ID.
+func lockWaiters(ctx context.Context, db *sql.DB, tbl string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT w.REQUESTING_ENGINE_TRANSACTION_ID
+		FROM performance_schema.data_lock_waits w
+		JOIN performance_schema.data_locks l ON l.ENGINE = w.ENGINE AND l.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID
+		WHERE l.OBJECT_SCHEMA = 'test' AND l.OBJECT_NAME = ?`, tbl)
+	if err != nil {
+		return nil, err
+	}
+	defer utils.CloseAndLog(rows)
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// lockRowFor holds a FOR UPDATE lock on test.tbl's row a=1 until release is
+// called, so a write of that row waits. The row must exist: db's sessions run
+// READ COMMITTED, where a FOR UPDATE that matches no row locks nothing.
+func lockRowFor(t *testing.T, db *sql.DB, tbl string) (release func()) {
+	t.Helper()
+	tx, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(t.Context(), "SELECT a,b,c FROM "+tbl+" WHERE a = 1 FOR UPDATE")
+	require.NoError(t, err)
+	var once sync.Once
+	release = func() { once.Do(func() { require.NoError(t, tx.Rollback()) }) }
+	t.Cleanup(release)
+	return release
+}
+
+// TestLockWaitTimeoutIsRetyable verifies that a write which times out on a
+// row lock is retried, and succeeds once the lock is released. The lock is
+// held until the first attempt has timed out, so the copy can only succeed
+// through a retry.
 func TestLockWaitTimeoutIsRetyable(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS lockt1, lockt2")
 	testutils.RunSQL(t, "CREATE TABLE lockt1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
 	testutils.RunSQL(t, "CREATE TABLE lockt2 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
 	testutils.RunSQL(t, "INSERT IGNORE INTO lockt1 VALUES (1, 2, 3)")
+	// The blocker needs a row to lock: spirit's sessions run READ COMMITTED,
+	// where a FOR UPDATE that matches no row takes no gap lock.
+	testutils.RunSQL(t, "INSERT INTO lockt2 VALUES (1, 2, 3)")
 
-	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	config := dbconn.NewDBConfig()
+	config.InnodbLockWaitTimeout = 1
+	db, err := dbconn.New(testutils.DSN(), config)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -238,21 +286,9 @@ func TestLockWaitTimeoutIsRetyable(t *testing.T) {
 	require.NoError(t, t1.SetInfo(t.Context()))
 	t2 := table.NewTableInfo(db, "test", "lockt2")
 	require.NoError(t, t2.SetInfo(t.Context()))
-	wg1, wg2 := sync.WaitGroup{}, sync.WaitGroup{}
-	wg1.Add(1)
-	// Lock table t2 for 2 seconds.
-	// This should be enough to retry, but it will eventually be successful.
-	wg2.Go(func() {
-		tx, err := db.BeginTx(t.Context(), nil)
-		require.NoError(t, err)
-		_, err = tx.ExecContext(t.Context(), "SELECT a,b,c FROM lockt2 WHERE a = 1 FOR UPDATE")
-		require.NoError(t, err)
-		wg1.Done()
-		time.Sleep(2 * time.Second)
-		err = tx.Rollback()
-		require.NoError(t, err)
-	})
-	wg1.Wait()
+
+	release := lockRowFor(t, db, "lockt2")
+
 	// The retry-on-lock-wait logic lives in the shared dbconn layer; this
 	// exercises it via the applier's INSERT ... VALUES write.
 	cfg := bufferedConfig(t, db)
@@ -261,11 +297,35 @@ func TestLockWaitTimeoutIsRetyable(t *testing.T) {
 	require.NoError(t, chunker.Open())
 	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
-	err = copier.Run(t.Context())
-	require.NoError(t, err) // succeeded within retry.
-	wg2.Wait()
+	done := make(chan error, 1)
+	go func() { done <- copier.Run(t.Context()) }()
+
+	// Wait for the first attempt to start waiting on the lock, then for it to
+	// time out (its transaction stops waiting), and only then release the lock.
+	var first string
+	require.Eventually(t, func() bool {
+		ids, err := lockWaiters(t.Context(), db, "lockt2")
+		if err != nil || len(ids) == 0 {
+			return false
+		}
+		first = ids[0]
+		return true
+	}, 30*time.Second, 10*time.Millisecond, "the copier's write never waited on the lock")
+	require.Eventually(t, func() bool {
+		ids, err := lockWaiters(t.Context(), db, "lockt2")
+		return err == nil && !slices.Contains(ids, first)
+	}, 30*time.Second, 10*time.Millisecond, "the first attempt never timed out")
+	release()
+
+	require.NoError(t, <-done, "the copy must succeed through a retry after the first attempt timed out")
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM lockt2").Scan(&count))
+	require.Equal(t, 1, count)
 }
 
+// TestLockWaitTimeoutRetryExceeded verifies that a write which keeps timing
+// out on a row lock is attempted MaxRetries times, each in a new transaction,
+// and then fails the copy.
 func TestLockWaitTimeoutRetryExceeded(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS lock2t1, lock2t2")
 	testutils.RunSQL(t, "CREATE TABLE lock2t1 (a INT NOT NULL, b INT, c INT, PRIMARY KEY (a))")
@@ -288,30 +348,49 @@ func TestLockWaitTimeoutRetryExceeded(t *testing.T) {
 	t2 := table.NewTableInfo(db, "test", "lock2t2")
 	require.NoError(t, t2.SetInfo(t.Context()))
 
-	// Lock again but for 10 seconds.
-	// This will cause a failure because the retry is less than this (2 retries * 1 sec + backoff)
-	// TODO: can we use a channel instead here to notify cleanup can be done?
-	wg1, wg2 := sync.WaitGroup{}, sync.WaitGroup{}
-	wg1.Add(1)
-	wg2.Go(func() {
-		tx, err := db.BeginTx(t.Context(), nil)
-		require.NoError(t, err)
-		_, err = tx.ExecContext(t.Context(), "SELECT a,b,c FROM lock2t2 WHERE a = 1 FOR UPDATE")
-		require.NoError(t, err)
-		wg1.Done()
-		time.Sleep(10 * time.Second)
-		err = tx.Rollback()
-		require.NoError(t, err)
+	// Hold the lock until the copy has given up.
+	release := lockRowFor(t, db, "lock2t2")
+
+	// The retry budget is the applier's DBConfig, not the pool's: give the
+	// applier this test's config, so MaxRetries applies to its writes.
+	cfg := NewCopierDefaultConfig()
+	cfg.Applier, err = applier.New([]applier.Target{{DB: db}}, &applier.ApplierConfig{
+		Logger:   slog.Default(),
+		DBConfig: config,
+		Threads:  1,
 	})
-	wg1.Wait() // Wait only for the lock to be acquired.
-	cfg := bufferedConfig(t, db)
+	require.NoError(t, err)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second, Logger: cfg.Logger})
 	require.NoError(t, err)
+	require.NoError(t, chunker.Open())
 	copier, err := NewCopier(chunker, cfg)
 	require.NoError(t, err)
-	err = copier.Run(t.Context())
-	require.Error(t, err) // exceeded retry.
-	wg2.Wait()
+	done := make(chan error, 1)
+	go func() { done <- copier.Run(t.Context()) }()
+
+	// Record every transaction that waits on the lock until the copy returns.
+	// Each attempt waits the full 1s lock wait, so a 10ms poll sees each one.
+	attempts := map[string]struct{}{}
+	var runErr error
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(time.Minute)
+	for runErr == nil {
+		select {
+		case runErr = <-done:
+			require.Error(t, runErr, "the copy must fail once its retries are exhausted")
+		case <-ticker.C:
+			ids, err := lockWaiters(t.Context(), db, "lock2t2")
+			require.NoError(t, err)
+			for _, id := range ids {
+				attempts[id] = struct{}{}
+			}
+		case <-deadline:
+			t.Fatal("the copy did not return while the lock was held")
+		}
+	}
+	release()
+	require.Len(t, attempts, config.MaxRetries, "each of the MaxRetries attempts must wait on the lock in its own transaction")
 }
 
 func TestCopierValidation(t *testing.T) {

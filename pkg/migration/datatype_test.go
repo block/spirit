@@ -376,12 +376,14 @@ func TestEnumDrop(t *testing.T) {
 	// not appear in any row when the checksum runs. A few hundred rows is
 	// plenty: WithTestThrottler() paces the copy (1s per chunk), so the runtime
 	// is driven by the chunk count, not the row count — a larger seed just adds
-	// I/O without changing what's exercised. The concurrent DML below targets
-	// ids well within this range.
+	// I/O without changing what's exercised. SeedRows doubles every row in
+	// the table, so the rows are seeded once and then split between the two
+	// retained values.
 	tt.SeedRows(t, fmt.Sprintf("INSERT INTO %s (status) SELECT 'active'", tableName), 200)
-	tt.SeedRows(t, fmt.Sprintf("INSERT INTO %s (status) SELECT 'pending'", tableName), 200)
+	testutils.RunSQL(t, fmt.Sprintf("UPDATE %s SET status = 'pending' WHERE id %% 2 = 0", tableName))
 	_, err := tt.DB.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO %s (status) VALUES ('archived')", tableName))
 	require.NoError(t, err)
+	ids := seededIDs(t, tt.DB, tableName)
 
 	m := NewTestRunner(t, tableName, "MODIFY COLUMN status ENUM('active', 'pending', 'archived') NOT NULL",
 		WithThreads(1),
@@ -406,14 +408,15 @@ func TestEnumDrop(t *testing.T) {
 			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (status) VALUES ('active')`, tableName))
 			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (status) VALUES ('pending')`, tableName))
 			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (status) VALUES ('archived')`, tableName))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET status = 'pending' WHERE id = %d`, tableName, i))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET status = 'archived' WHERE id = %d`, tableName, 100+i))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET status = 'pending' WHERE id = %d`, tableName, ids[i-1]))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET status = 'archived' WHERE id = %d`, tableName, ids[99+i]))
 		}
 	}()
 
 	require.NoError(t, m.Run(ctx))
 	cancel()
 	<-dmlDone
+	requireNoConfirmedDifferences(t, m, "the checksum repaired rows: the change feed wrote a wrong ENUM value")
 	require.NoError(t, m.Close())
 
 	// The new column definition must omit 'inactive'.
@@ -469,9 +472,11 @@ func TestEnumToVarchar(t *testing.T) {
 		status ENUM('active', 'inactive', 'pending') NOT NULL
 	)`)
 	// Seed with every ENUM value so we can assert on the full mapping.
+	// SeedRows doubles every row in the table, so the rows are seeded once
+	// and then spread over the three values.
 	tt.SeedRows(t, "INSERT INTO enumtovarchar (status) SELECT 'active'", 3000)
-	tt.SeedRows(t, "INSERT INTO enumtovarchar (status) SELECT 'inactive'", 3000)
-	tt.SeedRows(t, "INSERT INTO enumtovarchar (status) SELECT 'pending'", 3000)
+	testutils.RunSQL(t, "UPDATE enumtovarchar SET status = ELT(1 + id % 3, 'active', 'inactive', 'pending')")
+	ids := seededIDs(t, tt.DB, "enumtovarchar")
 
 	m := NewTestRunner(t, "enumtovarchar", "MODIFY COLUMN status VARCHAR(32) NOT NULL",
 		WithThreads(1),
@@ -496,15 +501,19 @@ func TestEnumToVarchar(t *testing.T) {
 			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtovarchar (status) VALUES ('active')`)
 			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtovarchar (status) VALUES ('inactive')`)
 			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtovarchar (status) VALUES ('pending')`)
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'pending' WHERE id = %d`, i))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'inactive' WHERE id = %d`, 3000+i))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'active' WHERE id = %d`, 6000+i))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'pending' WHERE id = %d`, ids[i-1]))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'inactive' WHERE id = %d`, ids[len(ids)/3+i]))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'active' WHERE id = %d`, ids[2*len(ids)/3+i]))
 		}
 	}()
 
 	require.NoError(t, m.Run(ctx))
 	cancel()
 	<-dmlDone
+	// The initial checksum repairs a row the change feed wrote wrongly, so
+	// the final values alone cannot show the decode bug: a leaked ordinal is
+	// visible as a confirmed difference.
+	requireNoConfirmedDifferences(t, m, "the checksum repaired rows: the change feed wrote a wrong value for an ENUM ordinal")
 	require.NoError(t, m.Close())
 
 	// The column must now be VARCHAR and the values must be the original
@@ -528,6 +537,11 @@ func TestEnumToVarchar(t *testing.T) {
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
 		`SELECT COUNT(*) FROM enumtovarchar WHERE status NOT IN ('active','inactive','pending')`).Scan(&nonString))
 	require.Zero(t, nonString)
+
+	var distinct int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(DISTINCT status) FROM enumtovarchar`).Scan(&distinct))
+	require.Equal(t, 3, distinct, "every ENUM value must survive the migration")
 }
 
 // TestSetToVarchar verifies that SET → VARCHAR migrations decode the
@@ -596,9 +610,11 @@ func TestEnumToSet(t *testing.T) {
 		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		status ENUM('active', 'inactive', 'pending') NOT NULL
 	)`)
+	// SeedRows doubles every row in the table, so the rows are seeded once
+	// and then spread over the three values.
 	tt.SeedRows(t, "INSERT INTO enumtoset_mig (status) SELECT 'active'", 3000)
-	tt.SeedRows(t, "INSERT INTO enumtoset_mig (status) SELECT 'inactive'", 3000)
-	tt.SeedRows(t, "INSERT INTO enumtoset_mig (status) SELECT 'pending'", 3000)
+	testutils.RunSQL(t, "UPDATE enumtoset_mig SET status = ELT(1 + id % 3, 'active', 'inactive', 'pending')")
+	ids := seededIDs(t, tt.DB, "enumtoset_mig")
 
 	m := NewTestRunner(t, "enumtoset_mig",
 		"MODIFY COLUMN status SET('active', 'inactive', 'pending') NOT NULL",
@@ -621,14 +637,17 @@ func TestEnumToSet(t *testing.T) {
 			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtoset_mig (status) VALUES ('active')`)
 			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtoset_mig (status) VALUES ('inactive')`)
 			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtoset_mig (status) VALUES ('pending')`)
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtoset_mig SET status = 'pending' WHERE id = %d`, i))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtoset_mig SET status = 'inactive' WHERE id = %d`, 3000+i))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtoset_mig SET status = 'pending' WHERE id = %d`, ids[i-1]))
+			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtoset_mig SET status = 'inactive' WHERE id = %d`, ids[len(ids)/2+i]))
 		}
 	}()
 
 	require.NoError(t, m.Run(ctx))
 	cancel()
 	<-dmlDone
+	// The initial checksum repairs a row the change feed wrote wrongly, so
+	// the final values alone cannot show the decode bug.
+	requireNoConfirmedDifferences(t, m, "the checksum repaired rows: the change feed wrote a wrong value for an ENUM ordinal")
 	require.NoError(t, m.Close())
 
 	var colType string
@@ -645,6 +664,29 @@ func TestEnumToSet(t *testing.T) {
 		`SELECT COUNT(*) FROM enumtoset_mig
 		 WHERE status NOT IN ('active','inactive','pending')`).Scan(&bad))
 	require.Zero(t, bad)
+
+	var distinct int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+		`SELECT COUNT(DISTINCT status) FROM enumtoset_mig`).Scan(&distinct))
+	require.Equal(t, 3, distinct, "every ENUM value must survive the migration")
+}
+
+// seededIDs returns the table's primary keys in order. The INSERT ... SELECT
+// statements SeedRows runs leave auto-increment gaps, so DML aimed at seeded
+// rows reads their ids instead of assuming 1..N.
+func seededIDs(t *testing.T, db *sql.DB, table string) []int64 {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(), fmt.Sprintf("SELECT id FROM %s ORDER BY id", table))
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	return ids
 }
 
 // TestEnumSetExplicitCharset verifies that a migration creates an ENUM or SET

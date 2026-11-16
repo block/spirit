@@ -316,10 +316,12 @@ func TestNativeDDLDropsStaleCopyTables(t *testing.T) {
 		id int not null primary key auto_increment,
 		b varchar(100) not null
 	)`)
-	tt.SeedRows(t, "INSERT INTO stalecopy (b) SELECT 'abc'", 100000)
+	tt.SeedRows(t, "INSERT INTO stalecopy (b) SELECT 'abc'", 10000)
 
 	// Interrupt a copy once it has written a checkpoint with copy progress.
-	m := NewTestRunnerFromStatement(t, "ALTER TABLE stalecopy ENGINE=InnoDB", WithThreads(1), WithTestThrottler())
+	// The copy stops after two chunks and holds until the cancel, so the
+	// cancel always lands during the copy.
+	m := NewTestRunnerFromStatement(t, "ALTER TABLE stalecopy ENGINE=InnoDB", WithThreads(1), WithCopyStalledAfterChunks(2))
 	running := startTestRun(t, m.Run, m.Close)
 	require.Eventually(t, func() bool {
 		var n int

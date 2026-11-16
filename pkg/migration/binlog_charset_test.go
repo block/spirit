@@ -171,6 +171,7 @@ func TestBinlogCharsetValuesAfterChecksum(t *testing.T) {
 // ('é'), gbk D0B0 and A7D1. The replayed DELETE of the first used to remove
 // the second and leave the first in place.
 func TestBinlogCharsetPrimaryKeyDelete(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		charset      string
 		lookalike    string // valid UTF-8 whose utf8mb4 reading is other
@@ -220,6 +221,7 @@ func TestBinlogCharsetPrimaryKeyDelete(t *testing.T) {
 // The DML runs during the copy (verified by the checksum) and after the
 // checksum (verified by nothing).
 func TestLatin1ToUtf8mb4WithConcurrentDML(t *testing.T) {
+	t.Parallel()
 	// latin1 bytes written to the source, and their utf8mb4 conversion.
 	values := []struct{ latin1, utf8mb4 string }{
 		{"E9", "C3A9"},

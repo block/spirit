@@ -72,6 +72,7 @@ func (s *phaseSink) get(name string) []float64 {
 // attached and asserts the phases an operator would chart, plus the settled
 // copy totals read from the chunker.
 func TestMigrationReportsPhasesAndCopyTotals(t *testing.T) {
+	t.Parallel()
 	testutils.NewTestTable(t, "phasemetrics", `CREATE TABLE phasemetrics (
 		id int NOT NULL AUTO_INCREMENT,
 		name varchar(255) NOT NULL,

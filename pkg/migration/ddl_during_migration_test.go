@@ -109,7 +109,7 @@ func TestTriggerOrForeignKeyCreatedWhileCutoverWaitsForLock(t *testing.T) {
 			require.Eventually(t, func() bool {
 				var n int
 				require.NoError(t, db.QueryRowContext(t.Context(),
-					"SELECT COUNT(*) FROM information_schema.processlist WHERE db = ? AND info LIKE 'LOCK TABLES%' AND state = 'Waiting for table metadata lock'", dbName).Scan(&n))
+					"SELECT COUNT(*) FROM performance_schema.processlist WHERE db = ? AND info LIKE 'LOCK TABLES%' AND state = 'Waiting for table metadata lock'", dbName).Scan(&n))
 				return n > 0
 			}, 20*time.Second, 20*time.Millisecond, "the cutover never waited on its lock")
 			require.Equal(t, status.CutOver, m.status.Get())

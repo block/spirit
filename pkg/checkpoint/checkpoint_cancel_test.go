@@ -40,7 +40,7 @@ func waitForBlockedReplace(t *testing.T, db *sql.DB, name string) {
 	require.Eventually(t, func() bool {
 		var n int
 		err := db.QueryRowContext(t.Context(),
-			"SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE ?",
+			"SELECT COUNT(*) FROM performance_schema.processlist WHERE info LIKE ?",
 			"REPLACE INTO `"+name+"`%").Scan(&n)
 		return err == nil && n > 0
 	}, 10*time.Second, 10*time.Millisecond)

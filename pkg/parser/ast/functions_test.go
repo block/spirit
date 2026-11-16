@@ -136,6 +136,23 @@ func TestChar(t *testing.T) {
 	}
 }
 
+func TestCharRestore(t *testing.T) {
+	testCases := []NodeRestoreTestCase{
+		{"CHAR(65)", "CHAR(65)"},
+		{"char(77,121,83,81,'76')", "CHAR(77, 121, 83, 81, _UTF8MB4'76')"},
+		{"CHAR(65 USING utf8mb4)", "CHAR(65 USING UTF8MB4)"},
+		{"char(30, a using binary)", "CHAR(30, `a` USING BINARY)"},
+		// A function a user named char_func is not CHAR(): restore it as written.
+		{"char_func()", "CHAR_FUNC()"},
+		{"char_func(1)", "CHAR_FUNC(1)"},
+		{"db.char_func(1, 'x')", "`db`.`char_func`(1, _UTF8MB4'x')"},
+	}
+	extractNodeFunc := func(node Node) Node {
+		return node.(*SelectStmt).Fields.Fields[0].Expr
+	}
+	runNodeRestoreTest(t, testCases, "select %s from t", extractNodeFunc)
+}
+
 func TestWindowFuncExprRestore(t *testing.T) {
 	testCases := []NodeRestoreTestCase{
 		{"RANK() OVER w", "RANK() OVER `w`"},
