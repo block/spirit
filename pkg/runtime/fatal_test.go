@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,14 +37,14 @@ func (f *fatalRun) target() FatalTarget {
 // against a changed table.
 func TestFatalGateCheckpointPolicy(t *testing.T) {
 	for _, tc := range []struct {
-		reason change.FatalReason
+		reason contract.FatalReason
 		drops  int
 	}{
-		{change.FatalReasonSchemaChange, 1},
-		{change.FatalReasonStreamError, 0},
-		{change.FatalReasonUnsupportedXA, 1},
-		{change.FatalReasonLogPosWrapped, 1},
-		{change.FatalReasonFlushError, 0},
+		{contract.FatalReasonSchemaChange, 1},
+		{contract.FatalReasonStreamError, 0},
+		{contract.FatalReasonUnsupportedXA, 1},
+		{contract.FatalReasonLogPosWrapped, 1},
+		{contract.FatalReasonFlushError, 0},
 	} {
 		t.Run(tc.reason.String(), func(t *testing.T) {
 			var gate FatalGate
@@ -66,12 +66,12 @@ func TestFatalGateCheckpointPolicy(t *testing.T) {
 func TestFatalGateOnce(t *testing.T) {
 	var gate FatalGate
 	run := &fatalRun{dropErr: errors.New("server gone")}
-	require.True(t, gate.Trip(change.FatalReasonSchemaChange, run.target()))
+	require.True(t, gate.Trip(contract.FatalReasonSchemaChange, run.target()))
 	// The tracker is now at ErrCleanup, past CutOver, so later trips report
 	// false. Reset it to pin that the once guard holds on its own, as it must
 	// for a caller that raced the first past the cutover check.
 	run.tracker.Set(status.CopyRows)
-	require.True(t, gate.Trip(change.FatalReasonSchemaChange, run.target()))
+	require.True(t, gate.Trip(contract.FatalReasonSchemaChange, run.target()))
 	assert.Equal(t, 1, run.drops)
 	assert.Len(t, run.cancels, 1)
 }
@@ -82,7 +82,7 @@ func TestFatalGatePastCutOver(t *testing.T) {
 	var gate FatalGate
 	run := &fatalRun{}
 	run.tracker.Set(status.CutOver)
-	require.False(t, gate.Trip(change.FatalReasonSchemaChange, run.target()))
+	require.False(t, gate.Trip(contract.FatalReasonSchemaChange, run.target()))
 	assert.Equal(t, 0, run.drops)
 	assert.Empty(t, run.cancels)
 	assert.Equal(t, status.CutOver, run.tracker.Get())

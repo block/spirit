@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/table"
@@ -335,14 +336,14 @@ var errXAUnsupported = errors.New("XA transactions detected in the binlog stream
 // being off.
 var errLogPosWrapped = errors.New("binlog LogPos wrapped past 4GiB within a single file: spirit cannot track file+position coordinates past the wrap (enable GTIDs, or lower max_binlog_cache_size so no transaction can grow a binlog file beyond 4GiB)")
 
-func fatalReasonForStreamError(err error) FatalReason {
+func fatalReasonForStreamError(err error) contract.FatalReason {
 	switch {
 	case errors.Is(err, errXAUnsupported):
-		return FatalReasonUnsupportedXA
+		return contract.FatalReasonUnsupportedXA
 	case errors.Is(err, errLogPosWrapped):
-		return FatalReasonLogPosWrapped
+		return contract.FatalReasonLogPosWrapped
 	default:
-		return FatalReasonStreamError
+		return contract.FatalReasonStreamError
 	}
 }
 

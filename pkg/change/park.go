@@ -2,10 +2,10 @@ package change
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"sync/atomic"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -40,32 +40,6 @@ import (
 // times out and defers (correct, if useless: the caller was already deferring
 // the range), and the dispatch reaches the park long after the verification is
 // gone. That is what ParkedRow.abandon exists for.
-
-// ErrRowRewritten means the watched row was written again before the
-// verification could read the target, so the image the caller was handed is no
-// longer what the target holds. The caller should retry.
-var ErrRowRewritten = errors.New("change: watched row was rewritten during verification")
-
-// ErrFlushIncomplete means the parked flush could not empty the buffer, so the
-// watched row's change may not have reached the target. The caller should
-// retry; it must not read the target and call the difference a divergence.
-var ErrFlushIncomplete = errors.New("change: parked flush did not drain the buffer")
-
-// RowWatch names the rows a verification is waiting for. Match is called with
-// the row's primary key values as the binlog decoded them, in the source
-// table's key order; returning true fires the watch.
-type RowWatch struct {
-	Schema string
-	Table  string
-	Match  func(key []any) bool
-}
-
-// RowVerifier is handed the event the feed parked at: the row's key, its
-// after-image (nil for a delete), and whether it was a delete. It runs with the
-// reader parked and the change flushed, so the target holds that image and
-// nothing beyond it. Returning an error fails the verification; the reader is
-// unparked either way.
-type RowVerifier func(ctx context.Context, key []any, image []any, deleted bool) error
 
 // parkGate holds a reader goroutine between events. It is advisory in one
 // direction only: arming it does not interrupt an event already being
@@ -125,7 +99,7 @@ func (g *parkGate) wait(ctx context.Context) error {
 //
 // At most one is armed at a time, which RowParker enforces.
 type ParkedRow struct {
-	watch RowWatch
+	watch contract.RowWatch
 	gate  *parkGate
 
 	mu        sync.Mutex
@@ -140,7 +114,7 @@ type ParkedRow struct {
 	ch          chan struct{}
 }
 
-func newParkedRow(watch RowWatch, gate *parkGate) *ParkedRow {
+func newParkedRow(watch contract.RowWatch, gate *parkGate) *ParkedRow {
 	return &ParkedRow{watch: watch, gate: gate, ch: make(chan struct{})}
 }
 
@@ -222,7 +196,7 @@ func (w *ParkedRow) abandon() {
 // dispatch the watched change in between, and Release then parks the gate for
 // this row. Clearing that park would let the reader run past the watched event
 // while the flush and the verifier are still to come: the next change to the
-// key is counted as a rewrite, and the verification returns ErrRowRewritten
+// key is counted as a rewrite, and the verification returns contract.ErrRowRewritten
 // against a row written by nothing but single-row events. Deciding on w.mu,
 // which observe and Release also hold, means one of the two always happens:
 // either the unpark comes first and Release parks afterwards, or the watch has
@@ -267,7 +241,7 @@ func flushParked(ctx context.Context, flush func(context.Context) error, allFlus
 			return nil
 		}
 	}
-	return ErrFlushIncomplete
+	return contract.ErrFlushIncomplete
 }
 
 // RowParker is everything a Source needs to implement ParkableSource:
@@ -347,8 +321,8 @@ func (p *RowParker) Watch(tbl *table.TableInfo, key, image []any, deleted bool) 
 // reaching a verdict.
 func (p *RowParker) Verify(
 	ctx context.Context,
-	watch RowWatch,
-	verify RowVerifier,
+	watch contract.RowWatch,
+	verify contract.RowVerifier,
 	drain func(context.Context) error,
 	allFlushed func() bool,
 ) error {
@@ -382,7 +356,7 @@ func (p *RowParker) Verify(
 	}
 	key, image, deleted, rewritten := row.result()
 	if rewritten {
-		return ErrRowRewritten
+		return contract.ErrRowRewritten
 	}
 	if err := verify(ctx, key, image, deleted); err != nil {
 		return err
@@ -395,7 +369,7 @@ func (p *RowParker) Verify(
 	// verifier is mid-read. A verdict reached against a target that moved is
 	// not a verdict, so report the rewrite and let the caller retry.
 	if _, _, _, rewritten = row.result(); rewritten {
-		return ErrRowRewritten
+		return contract.ErrRowRewritten
 	}
 	return nil
 }

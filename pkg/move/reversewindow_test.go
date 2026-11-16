@@ -25,6 +25,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checkpoint"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/status"
@@ -1556,7 +1557,7 @@ func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
 	testutils.RunSQL(t, "INSERT INTO rwfe_dst.t1 (id, val) VALUES (500, 'too big for _old')")
 
 	h.awaitDone(waitTimeout, "the move to complete forward after the reverse feed's flush failed")
-	require.Equal(t, []string{change.FatalReasonFlushError.String()}, recorder.snapshot(),
+	require.Equal(t, []string{contract.FatalReasonFlushError.String()}, recorder.snapshot(),
 		"the reverse feed must stop on the flush error")
 	require.False(t, reverseCutoverCalled, "a dead reverse feed must not roll back")
 	require.True(t, tableExists(t, ctl, "rwfe_src", "t1_old"), "source table stays retired to _old")

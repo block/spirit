@@ -7,6 +7,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -128,7 +129,7 @@ func TestGTIDMaxRecreateAttemptsError(t *testing.T) {
 	var gotReason atomic.Int64
 	gotReason.Store(-1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		gotReason.Store(int64(reason))
 		cancel()
 		return true
@@ -157,7 +158,7 @@ func TestGTIDMaxRecreateAttemptsError(t *testing.T) {
 	client.streamWG.Wait()
 
 	require.Error(t, ctx.Err(), "caller context should be cancelled via CancelFunc on fatal stream error")
-	require.Equal(t, int64(FatalReasonStreamError), gotReason.Load(),
+	require.Equal(t, int64(contract.FatalReasonStreamError), gotReason.Load(),
 		"exhausted recreate attempts must be reported as a stream error")
 
 	client.Close()

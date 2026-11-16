@@ -495,11 +495,11 @@ func (s *bufferedMap) LastDrainHitBudget() bool {
 // held for a whole drain, so taking it here would block the status block behind
 // a 20-minute flush, which is precisely the situation an operator is reading
 // the status block to diagnose.
-func (s *bufferedMap) FlushShapes() (effective, configured FlushShape) {
-	return FlushShape{
+func (s *bufferedMap) FlushShapes() (effective, configured contract.FlushShape) {
+	return contract.FlushShape{
 			Concurrency: s.effectiveFlushConcurrency(),
 			BatchSize:   s.effectiveBatchSize(),
-		}, FlushShape{
+		}, contract.FlushShape{
 			Concurrency: s.configuredFlushConcurrency(),
 			BatchSize:   s.configuredBatchSize(),
 		}

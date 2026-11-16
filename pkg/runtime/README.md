@@ -34,7 +34,7 @@ This is the handler a runner wires to every change feed it starts. On the first 
 
 1. Moves the run to `status.ErrCleanup`.
 2. Logs the advice for the operator.
-3. Drops the checkpoint, unless the reason leaves the checkpoint resumable (`change.FatalReason.PreservesCheckpoint`).
+3. Drops the checkpoint, unless the reason leaves the checkpoint resumable (`contract.FatalReason.PreservesCheckpoint`).
 4. Cancels the run with a `status.FatalAbort` cause.
 
 Once the run has reached cutover, `Trip` does nothing. The runner supplies its noun, its checkpoint drop and its cancel function in a `FatalTarget`.

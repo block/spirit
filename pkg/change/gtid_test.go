@@ -13,6 +13,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -263,7 +264,7 @@ func TestGTIDStartFromMalformedPosition(t *testing.T) {
 	// most likely real-world trigger for this branch.
 	err = client.StartFromPosition(t.Context(), "binlog.000123:4567")
 	require.Error(t, err)
-	require.ErrorIs(t, err, ErrPositionNotFound)
+	require.ErrorIs(t, err, contract.ErrPositionNotFound)
 }
 
 // TestValidateResumeGTIDSet pins the set algebra of the resume-time GTID
@@ -348,7 +349,7 @@ func TestValidateResumeGTIDSet(t *testing.T) {
 				require.NoError(t, err)
 				return
 			}
-			require.ErrorIs(t, err, ErrPositionNotFound,
+			require.ErrorIs(t, err, contract.ErrPositionNotFound,
 				"validation failures must classify as definitive so the caller restarts fresh instead of failing the run")
 			require.ErrorContains(t, err, tt.wantErr)
 		})
@@ -411,7 +412,7 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 			require.NoError(t, client.AddSubscription(t1, t2, chunker))
 
 			err = client.StartFromPosition(t.Context(), flushed.String())
-			require.ErrorIs(t, err, ErrPositionNotFound)
+			require.ErrorIs(t, err, contract.ErrPositionNotFound)
 			require.ErrorContains(t, err, "@@GLOBAL.gtid_executed does not contain")
 		})
 	}
@@ -697,7 +698,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 		var gotReason atomic.Int64
 		gotReason.Store(-1)
 		clientConfig := NewClientDefaultConfig()
-		clientConfig.CancelFunc = func(reason FatalReason) bool {
+		clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 			gotReason.Store(int64(reason))
 			return true
 		}
@@ -739,7 +740,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 	// at its opening "XA START" QueryEvent — ahead of the row events —
 	// and classify it as an unsupported-XA reason.
 	xaExec(fmt.Sprintf("XA PREPARE '%s'", xid))
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(contract.FatalReasonUnsupportedXA) },
 		5*time.Second, 5*time.Millisecond, "XA PREPARE must fail the stream as unsupported XA")
 	client.streamWG.Wait() // reader fully exited: buffering is final
 	require.Equal(t, 0, client.GetDeltaLen(), "no prepared row events may be buffered once the guard fires")
@@ -769,7 +770,7 @@ func TestGTIDClientXATransaction(t *testing.T) {
 	xaExec(fmt.Sprintf("XA END '%s'", xid1p))
 	xaExec(fmt.Sprintf("XA COMMIT '%s' ONE PHASE", xid1p))
 
-	require.Eventually(t, func() bool { return gotReason2.Load() == int64(FatalReasonUnsupportedXA) },
+	require.Eventually(t, func() bool { return gotReason2.Load() == int64(contract.FatalReasonUnsupportedXA) },
 		5*time.Second, 5*time.Millisecond, "one-phase XA must fail the stream too")
 	client2.streamWG.Wait()
 	require.Equal(t, 0, client2.GetDeltaLen(), "no one-phase XA row events may be buffered")
@@ -828,7 +829,7 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	var gotReason atomic.Int64
 	gotReason.Store(-1)
 	clientConfig := NewClientDefaultConfig()
-	clientConfig.CancelFunc = func(reason FatalReason) bool {
+	clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 		gotReason.Store(int64(reason))
 		return true
 	}
@@ -857,7 +858,7 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 	// The prepare flushes the whole group as one compressed payload; the
 	// guard must fail it at the inner "XA START" QueryEvent, ahead of the
 	// inner row events.
-	require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+	require.Eventually(t, func() bool { return gotReason.Load() == int64(contract.FatalReasonUnsupportedXA) },
 		5*time.Second, 5*time.Millisecond, "a compressed XA group must fail the stream as unsupported XA")
 	client.streamWG.Wait() // reader fully exited: buffering is final
 	require.Equal(t, 0, client.GetDeltaLen(), "no row events inside the compressed XA group may be buffered")
@@ -872,7 +873,7 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 
 // TestGTIDClientXAGuardStream deterministically exercises the XA guard's
 // readStream wiring: any XA event must fail the stream via
-// CancelFunc(FatalReasonUnsupportedXA) — before the XA transaction's row
+// CancelFunc(contract.FatalReasonUnsupportedXA) — before the XA transaction's row
 // events are buffered, and without promoting its GTID into the resume
 // set (the refused group is never treated as applied).
 //
@@ -943,7 +944,7 @@ func TestGTIDClientXAGuardStream(t *testing.T) {
 		var gotReason atomic.Int64
 		gotReason.Store(-1)
 		clientConfig := NewClientDefaultConfig()
-		clientConfig.CancelFunc = func(reason FatalReason) bool {
+		clientConfig.CancelFunc = func(reason contract.FatalReason) bool {
 			gotReason.Store(int64(reason))
 			return true
 		}
@@ -975,7 +976,7 @@ func TestGTIDClientXAGuardStream(t *testing.T) {
 	// row events, and no XA GTID in the resume set.
 	expectAbort := func(t *testing.T, client *gtidClient, gotReason *atomic.Int64, gno int64) {
 		t.Helper()
-		require.Eventually(t, func() bool { return gotReason.Load() == int64(FatalReasonUnsupportedXA) },
+		require.Eventually(t, func() bool { return gotReason.Load() == int64(contract.FatalReasonUnsupportedXA) },
 			5*time.Second, 5*time.Millisecond, "the XA guard must fail the stream as unsupported XA")
 		client.streamWG.Wait() // reader fully exited: buffering is final
 		require.Equal(t, 0, client.GetDeltaLen(), "no row events may be buffered once the guard fires")
@@ -1072,13 +1073,13 @@ func TestGTIDClientCTASNotifiesSchemaFilter(t *testing.T) {
 	empty, err := mysql.ParseMysqlGTIDSet("")
 	require.NoError(t, err)
 	sid := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
-	var got []FatalReason
+	var got []contract.FatalReason
 	c := &gtidClient{
 		feedCore: feedCore{
 			logger:           slog.Default(),
 			subs:             newSubscriptionRegistry(),
 			ddlFilterSchema:  "test",
-			callerCancelFunc: func(r FatalReason) bool { got = append(got, r); return true },
+			callerCancelFunc: func(r contract.FatalReason) bool { got = append(got, r); return true },
 		},
 		bufferedGTID: empty,
 		flushedGTID:  empty.Clone(),
@@ -1087,7 +1088,7 @@ func TestGTIDClientCTASNotifiesSchemaFilter(t *testing.T) {
 	}
 	require.NoError(t, c.processQueryEvent(&replication.QueryEvent{Schema: []byte("test"),
 		Query: []byte("CREATE TABLE `ctas1` (`a` int NOT NULL) START TRANSACTION")}))
-	require.Equal(t, []FatalReason{FatalReasonSchemaChange}, got)
+	require.Equal(t, []contract.FatalReason{contract.FatalReasonSchemaChange}, got)
 	require.Equal(t, int64(7), c.pendingGNO, "CTAS must leave its GTID pending until XIDEvent")
 	require.Empty(t, c.getBufferedGTID().String(), "CTAS must not promote its GTID before row events")
 }
@@ -1803,7 +1804,7 @@ func TestGTIDProcessDDLNotificationMoveStyle(t *testing.T) {
 	c := &gtidClient{
 		feedCore: feedCore{
 			logger:           slog.Default(),
-			callerCancelFunc: func(FatalReason) bool { cancelled = true; return true },
+			callerCancelFunc: func(contract.FatalReason) bool { cancelled = true; return true },
 			subs:             newSubscriptionRegistry(),
 		},
 	}

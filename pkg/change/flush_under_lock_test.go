@@ -108,7 +108,7 @@ func TestGTIDFlushUnderTableLockErrors(t *testing.T) {
 }
 
 // runPeriodicFlushErrorIsFatal checks that a periodic flush which cannot apply
-// the buffered changes reports FatalReasonFlushError to the caller. The failed
+// the buffered changes reports contract.FatalReasonFlushError to the caller. The failed
 // changes stay buffered and the flushed position stops advancing, so a caller
 // that is never told keeps running while its resume position falls out of the
 // binlog retention window. The failure here is a value the target column
@@ -129,9 +129,9 @@ func runPeriodicFlushErrorIsFatal(t *testing.T, useGTID bool, srcName, dstName s
 	t2 := table.NewTableInfo(db, cfg.DBName, dstName)
 	require.NoError(t, t2.SetInfo(t.Context()))
 
-	reasons := make(chan FatalReason, 8)
+	reasons := make(chan contract.FatalReason, 8)
 	clientCfg := NewClientDefaultConfig()
-	clientCfg.CancelFunc = func(reason FatalReason) bool {
+	clientCfg.CancelFunc = func(reason contract.FatalReason) bool {
 		reasons <- reason
 		return true
 	}
@@ -157,7 +157,7 @@ func runPeriodicFlushErrorIsFatal(t *testing.T, useGTID bool, srcName, dstName s
 	defer client.StopPeriodicFlush()
 	select {
 	case reason := <-reasons:
-		require.Equal(t, FatalReasonFlushError, reason)
+		require.Equal(t, contract.FatalReasonFlushError, reason)
 	case <-time.After(30 * time.Second):
 		t.Fatal("a failed periodic flush must be reported to the caller as fatal")
 	}
@@ -190,9 +190,9 @@ func (*failingParkedSubscription) Flush(context.Context, bool, []contract.TableL
 // is an hour, so the ticker never fires during the test.
 func runParkedFlushErrorIsFatal(t *testing.T, useGTID bool, srcName, dstName string) {
 	t.Helper()
-	reasons := make(chan FatalReason, 8)
+	reasons := make(chan contract.FatalReason, 8)
 	clientCfg := NewClientDefaultConfig()
-	clientCfg.CancelFunc = func(reason FatalReason) bool {
+	clientCfg.CancelFunc = func(reason contract.FatalReason) bool {
 		reasons <- reason
 		return true
 	}
@@ -209,7 +209,7 @@ func runParkedFlushErrorIsFatal(t *testing.T, useGTID bool, srcName, dstName str
 	requests <- &failingParkedSubscription{}
 	select {
 	case reason := <-reasons:
-		require.Equal(t, FatalReasonFlushError, reason)
+		require.Equal(t, contract.FatalReasonFlushError, reason)
 	case <-time.After(10 * time.Second):
 		t.Fatal("a failed flush of a parked subscription must be reported to the caller as fatal")
 	}

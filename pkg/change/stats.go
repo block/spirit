@@ -3,143 +3,15 @@ package change
 import (
 	"fmt"
 	"time"
+
+	"github.com/block/spirit/pkg/contract"
 )
 
-// FeedStats is a point-in-time summary of what the change feed has been doing.
-// It exists so the runners can fold the feed's activity into the binlog row of
-// their single periodic status block, instead of the feed logging about itself
-// on its own schedule (see github.com/block/spirit/issues/329).
-//
-// The zero value means "nothing to report yet" and renders as a feed that has
-// not flushed.
-type FeedStats struct {
-	// LastFlushAt is when the most recently completed flush finished, or the
-	// zero time before the first flush completes.
-	LastFlushAt time.Time
-	// LastFlushDuration is how long that flush took.
-	LastFlushDuration time.Duration
-	// LastFlushRows is how many buffered changes were pending when that flush
-	// started — the "batch size" of the flush. Zero is normal and meaningful:
-	// it is what a feed that is keeping up looks like, and it is what
-	// Source.Flush always ends on (it loops until the backlog is trivial and
-	// then flushes once more).
-	LastFlushRows int
-	// BufferedPosition is how far the feed has *read*, in the same opaque
-	// encoding Source.Position uses. Empty before the feed has read anything.
-	//
-	// This is deliberately not the resume coordinate. Source.Position and the
-	// ckpt row both report the *flushed* position, which only advances when a
-	// flush lands every buffered change — so while any change is held back the
-	// checkpoint is frozen by design, and the status block goes silent about
-	// the reader even though it is working normally. That is indistinguishable
-	// from a genuinely stalled feed, which is the case an operator most needs
-	// to tell apart. Reporting the buffered position alongside restores the
-	// distinction: if it advances between status blocks the reader is fine and
-	// only publication is blocked, and the gap to the ckpt row is how much
-	// re-reading a restart would cost.
-	BufferedPosition string
-	// BufferedEventAt is the source's own wall-clock timestamp on the newest
-	// event the reader has read — i.e. when the source committed the
-	// transaction that BufferedPosition names. Zero before the feed has read
-	// an event carrying a timestamp.
-	//
-	// Rendered as an age next to BufferedPosition, which is the only form in
-	// which the position is legible as *progress*. A GTID coordinate says
-	// nothing about how far behind the feed is: on a resumed run the number
-	// looks the same whether it is seconds or a week stale, and the count of
-	// GTIDs to go cannot be turned into a time without knowing the source's
-	// commit rate, which nothing in the status block reports. The age answers
-	// it directly — and it answers it from data the reader already has, with no
-	// extra query against the source.
-	//
-	// This is the field to read when deciding whether a resumed migration can
-	// converge. A migration that resumes from a week-old checkpoint has to
-	// replay a week of binlog before it can cut over, and until now the only
-	// tell was the copier starting at 99.x%. It is also the honest measure of
-	// checkpoint staleness that Record.Age() is not: that measures when the
-	// checkpoint row was last written, which on a progressing run is always
-	// seconds ago no matter how stale the position inside it is.
-	//
-	// Measured against this host's clock, so clock skew against the source
-	// shifts it. At the multi-hour lags it exists to expose that is noise; at
-	// "caught up" it is why the rendering floors at zero rather than showing a
-	// negative age.
-	BufferedEventAt time.Time
-	// Rotations counts binlog rotations the feed has followed. Duplicate
-	// rotate events (the server sends a real one and an artificial one
-	// carrying the same position) are counted once.
-	Rotations int64
-	// ForcedRotations counts the `FLUSH BINARY LOGS` statements the feed
-	// issued itself, which only happens when BlockWait sees the buffered
-	// position stall. This is the number to watch when the question is
-	// whether cutover-time waiting is churning through binlogs; a rising
-	// count with a flat Rotations count means we are the one doing it.
-	ForcedRotations int64
-	// Parks counts, cumulatively, how many times a subscription has parked
-	// the binlog reader on one of its soft limits. Summed across the feed's
-	// subscriptions.
-	//
-	// Parking is normal under a write rate the applier cannot match, and a
-	// single sustained episode of backpressure produces many parks — flushes
-	// release capacity per applied batch, so the reader is woken and re-parks
-	// repeatedly while one drain runs. The number to read is therefore the
-	// *rate* between status blocks, not the absolute value.
-	Parks int64
-	// IsParked is true when at least one of the feed's subscriptions is
-	// parked at the instant the status block was rendered. Together with
-	// Parks this separates the two cases an operator cares about: a rising
-	// Parks with is-parked=false is a reader being briefly throttled and
-	// recovering, while is-parked=true across consecutive status blocks is a
-	// reader being held off for minutes at a time, which is what puts the
-	// source's binlog retention at risk.
-	IsParked bool
-	// FlushShape is how wide a map-mode drain is running right now, and
-	// ConfiguredFlushShape is how wide it would run with no AIMD penalty
-	// outstanding. Both are taken from the same subscription, so they are
-	// always comparable; see mergeFlushShapes for which subscription that is.
-	//
-	// These are reported for the same reason ActiveWorkers is on the applier
-	// row: the number is no longer a constant anyone can assume. Since #1173
-	// the width is derived from the instance rather than fixed, so an operator
-	// reading a status block has no other way to learn what it is — it is not a
-	// flag they set and not a default they can look up.
-	//
-	// The pair, rather than the effective figure alone, is what makes the AIMD
-	// controller legible. A bare `flush=2x250` is ambiguous between a small
-	// instance running at its derived width and a large one that contention has
-	// halved twice, which are opposite situations. The controller does log each
-	// step it takes, but those are events in a log that may be hours deep on a
-	// migration measured in days, whereas this is state, re-rendered every
-	// status block — so a width that is stuck down is visible without going
-	// looking for it, and so is its recovery.
-	FlushShape           FlushShape
-	ConfiguredFlushShape FlushShape
-}
-
-// FlushShape is the width of a map-mode drain: how many applier batches run
-// concurrently, and how many rows each of them renders into one statement.
-//
-// The two travel together because the AIMD controller moves them together —
-// one contention step halves both, so it costs 4x, and reporting either alone
-// would understate what a backed-off feed has given up. They are also the two
-// terms of the lock footprint that produced the back-off in the first place:
-// batch size sets how many records one statement locks, concurrency sets how
-// many such statements are in flight to collide.
-type FlushShape struct {
-	Concurrency int
-	BatchSize   int
-}
-
-// rows is the shape's rows in flight, the product the two dimensions trade
+// shapeRows is the shape's rows in flight, the product the two dimensions trade
 // against each other (see autoscale.FlushBounds, which holds it constant while
 // re-shaping the terms). Used to rank shapes, so that the narrowest — the one
 // actually holding throughput back — is the one reported.
-func (f FlushShape) rows() int { return f.Concurrency * f.BatchSize }
-
-// String renders the shape as it appears in the binlog row, e.g. "8x1000".
-func (f FlushShape) String() string {
-	return fmt.Sprintf("%dx%d", f.Concurrency, f.BatchSize)
-}
+func shapeRows(f contract.FlushShape) int { return f.Concurrency * f.BatchSize }
 
 // ParkReporter is implemented by Subscription implementations that apply
 // backpressure to the change reader and can report on it. Optional — unlike
@@ -150,7 +22,7 @@ type ParkReporter interface {
 	ParkStats() (parks int64, parked bool)
 }
 
-// MergeSubscriptions folds the per-subscription figures — the park counters and
+// MergeSubscriptionStats folds the per-subscription figures — the park counters and
 // the flush shapes — into stats. Every Source calls it from FeedStats with its
 // own subscriptions.
 //
@@ -163,7 +35,7 @@ type ParkReporter interface {
 //
 // Callers must not hold their own mutex: this reaches into each subscription's
 // lock, and subscriptions take the Source's lock on their flush paths.
-func (s *FeedStats) MergeSubscriptions(subs []Subscription) {
+func MergeSubscriptionStats(s *contract.FeedStats, subs []Subscription) {
 	mergeParkStats(s, subs)
 	mergeFlushShapes(s, subs)
 }
@@ -175,7 +47,7 @@ func (s *FeedStats) MergeSubscriptions(subs []Subscription) {
 // Callers must not hold the client's own mutex: this reaches into each
 // subscription's lock, and the subscriptions take the client's lock on their
 // flush paths.
-func mergeParkStats(stats *FeedStats, subs []Subscription) {
+func mergeParkStats(stats *contract.FeedStats, subs []Subscription) {
 	for _, sub := range subs {
 		reporter, ok := sub.(ParkReporter)
 		if !ok {
@@ -189,7 +61,7 @@ func mergeParkStats(stats *FeedStats, subs []Subscription) {
 
 // parkState reports the aggregate park counter and current park flag across
 // subs, on the same summing/ORing basis as mergeParkStats. Separate from it
-// because Flush wants the pair on its own, not folded into a FeedStats.
+// because Flush wants the pair on its own, not folded into a contract.FeedStats.
 //
 // Callers must not hold the client's own mutex — see mergeParkStats.
 func parkState(subs []Subscription) (parks int64, parked bool) {
@@ -272,7 +144,7 @@ func drainHitBudget(subs []Subscription) bool {
 // drains serially has no shape to report and contributes nothing rather than
 // having to grow a method.
 type FlushShapeReporter interface {
-	FlushShapes() (effective, configured FlushShape)
+	FlushShapes() (effective, configured contract.FlushShape)
 }
 
 // mergeFlushShapes folds the flush shapes of subs into stats, keeping the
@@ -288,7 +160,7 @@ type FlushShapeReporter interface {
 //
 // Callers must not hold the client's own mutex, for the reason on
 // mergeParkStats: this reaches into each subscription.
-func mergeFlushShapes(stats *FeedStats, subs []Subscription) {
+func mergeFlushShapes(stats *contract.FeedStats, subs []Subscription) {
 	for _, sub := range subs {
 		reporter, ok := sub.(FlushShapeReporter)
 		if !ok {
@@ -298,21 +170,21 @@ func mergeFlushShapes(stats *FeedStats, subs []Subscription) {
 		if effective.Concurrency <= 0 || configured.Concurrency <= 0 {
 			continue // a reporter with nothing to say
 		}
-		if stats.FlushShape.Concurrency > 0 && effective.rows() >= stats.FlushShape.rows() {
+		if stats.FlushShape.Concurrency > 0 && shapeRows(effective) >= shapeRows(stats.FlushShape) {
 			continue
 		}
 		stats.FlushShape, stats.ConfiguredFlushShape = effective, configured
 	}
 }
 
-// nowFunc is the clock the ages in String() are measured against. A var rather
+// nowFunc is the clock the ages in formatFeedStats are measured against. A var rather
 // than a direct time.Now call so tests can pin it, mirroring contentionBackoff
 // in subscription_buffered.go.
 //
 // Pinning is what lets those tests assert the exact rendered string. Without it
 // every "flushed 10s ago" / "(1m30s behind)" assertion is a race against
 // Duration.Round's half-second boundary: the test builds the timestamp from
-// time.Now() and String() reads the clock again a moment later, so enough
+// time.Now() and formatFeedStats reads the clock again a moment later, so enough
 // scheduling delay between the two renders 11s instead. Unlikely per run, but
 // the alternative — asserting each age within a tolerance — gives up the exact
 // expected strings that make these tests readable.
@@ -320,14 +192,14 @@ func mergeFlushShapes(stats *FeedStats, subs []Subscription) {
 // Package state, so pinning it is not safe under t.Parallel(); see pinClock.
 var nowFunc = time.Now
 
-// String renders the stats as the binlog row of a runner's status block.
+// formatFeedStats renders the stats as the binlog row of a runner's status block.
 //
 // The flush figures read as a phrase — "flushed 30s ago (took 9µs, 0 rows)" —
 // rather than as three separate duration fields, because two of them are
 // durations of different kinds: how long ago the flush was, and how long it
 // took. Side by side as bare `key=0s` pairs those are genuinely ambiguous;
 // as a phrase the reading is forced.
-func (s FeedStats) String() string {
+func formatFeedStats(s contract.FeedStats) string {
 	// Read once and threaded through, so the row's two ages — how long ago the
 	// flush was, and how far behind the read position is — are measured against
 	// the same instant. Separate clock reads would let one status block report
@@ -348,7 +220,7 @@ func (s FeedStats) String() string {
 	// wrong cannot be eye-diffed against the previous status block, and the
 	// reading that matters here is the delta between blocks.
 	out := fmt.Sprintf("rotations=%d (%d forced)  parks=%d is-parked=%t%s  %s",
-		s.Rotations, s.ForcedRotations, s.Parks, s.IsParked, s.flushShapeField(), flush)
+		s.Rotations, s.ForcedRotations, s.Parks, s.IsParked, flushShapeField(s), flush)
 	if s.BufferedPosition != "" {
 		// Last, and rendered whole. A GTID set gains a UUID per failover and
 		// has no upper bound on length, so putting it anywhere but the end of
@@ -363,7 +235,7 @@ func (s FeedStats) String() string {
 		// need not sort last in the set — a middle elision could hide exactly
 		// the digits that are changing and make a healthy reader look frozen,
 		// which is the misreading this field exists to prevent.
-		out += "  read=" + s.BufferedPosition + s.bufferedAgeField(now)
+		out += "  read=" + s.BufferedPosition + bufferedAgeField(s, now)
 	}
 	return out
 }
@@ -378,8 +250,8 @@ func (s FeedStats) String() string {
 // status block. It is short and bounded, so unlike the flush phrase it costs
 // nothing to sit behind an unbounded GTID set.
 // Takes now from the caller rather than reading the clock itself, so the age
-// here and the flush age above describe the same instant; see String.
-func (s FeedStats) bufferedAgeField(now time.Time) string {
+// here and the flush age above describe the same instant; see formatFeedStats.
+func bufferedAgeField(s contract.FeedStats, now time.Time) string {
 	if s.BufferedEventAt.IsZero() {
 		return ""
 	}
@@ -406,7 +278,7 @@ func (s FeedStats) bufferedAgeField(now time.Time) string {
 // short field, and the *appearance* of the parenthetical is the signal that the
 // AIMD controller has stepped in — with its disappearance, some drains later,
 // the signal that the contention cleared.
-func (s FeedStats) flushShapeField() string {
+func flushShapeField(s contract.FeedStats) string {
 	if s.FlushShape.Concurrency <= 0 {
 		return ""
 	}
@@ -427,7 +299,7 @@ func (s FeedStats) flushShapeField() string {
 // the feed that flushed least recently, since that is the one holding the
 // position back.
 func StatusRow(srcs ...Source) string {
-	var merged FeedStats
+	var merged contract.FeedStats
 	var found bool
 	for _, src := range srcs {
 		if src == nil {
@@ -461,7 +333,7 @@ func StatusRow(srcs ...Source) string {
 		// Narrowest across feeds, on the same reasoning as across the
 		// subscriptions of one feed, and again keeping the pair together.
 		if s.FlushShape.Concurrency > 0 &&
-			(merged.FlushShape.Concurrency <= 0 || s.FlushShape.rows() < merged.FlushShape.rows()) {
+			(merged.FlushShape.Concurrency <= 0 || shapeRows(s.FlushShape) < shapeRows(merged.FlushShape)) {
 			merged.FlushShape, merged.ConfiguredFlushShape = s.FlushShape, s.ConfiguredFlushShape
 		}
 		found = true
@@ -469,12 +341,12 @@ func StatusRow(srcs ...Source) string {
 	if !found {
 		return ""
 	}
-	return merged.String()
+	return formatFeedStats(merged)
 }
 
 // isStaler reports whether candidate's last flush is older than current's. A
 // feed that has never flushed is the stalest of all.
-func isStaler(candidate, current FeedStats) bool {
+func isStaler(candidate, current contract.FeedStats) bool {
 	if candidate.LastFlushAt.IsZero() {
 		return true
 	}

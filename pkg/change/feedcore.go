@@ -95,13 +95,13 @@ type feedCore struct {
 
 	// callerCancelFunc is an optional callback that is called when a DDL
 	// change is detected on a subscribed table, or when a fatal stream
-	// error occurs; the FatalReason distinguishes the two so the caller
+	// error occurs; the contract.FatalReason distinguishes the two so the caller
 	// can decide whether persisted resume state must be invalidated. The
 	// caller is expected to handle cancellation and cleanup in this
 	// callback. It returns true if the error was acted upon (i.e. the
 	// caller actually cancelled), or false if it was ignored (e.g.
 	// because the migration is already past cutover).
-	callerCancelFunc func(FatalReason) bool
+	callerCancelFunc func(contract.FatalReason) bool
 	ddlFilterSchema  string
 	ddlFilterTables  map[string]struct{}
 
@@ -113,14 +113,14 @@ type feedCore struct {
 	serverID uint32 // server ID for the binlog reader
 
 	// rotations counts binlog rotations followed by the reader. See
-	// FeedStats.Rotations. The GTID client tracks position by GTID, so for
+	// contract.FeedStats.Rotations. The GTID client tracks position by GTID, so for
 	// it this is diagnostic only.
 	rotations atomic.Int64
 
 	// lastEventTime is the source's own wall-clock timestamp on the newest
 	// binlog event the reader has seen, as unix seconds. Written by
 	// recordEventTime from the read loop, read back by eventTime; see
-	// FeedStats.BufferedEventAt.
+	// contract.FeedStats.BufferedEventAt.
 	lastEventTime atomic.Int64
 
 	// flushResidual is the pending-change count observed at the end of the
@@ -129,7 +129,7 @@ type feedCore struct {
 	flushResidual int
 	flushCount    int
 
-	// lastFlush* describe the most recently completed flush, for FeedStats.
+	// lastFlush* describe the most recently completed flush, for contract.FeedStats.
 	// Guarded by mu. Recorded for every flush, not just the periodic one, so
 	// the status block's "flushed X ago" answers "when did the position last
 	// advance?" rather than "when did the ticker last fire?".
@@ -418,21 +418,21 @@ func (c *feedCore) processDDL(schema, table string, foreignKeysOnly bool) {
 			return
 		}
 	}
-	if c.fatalError(FatalReasonSchemaChange) {
+	if c.fatalError(contract.FatalReasonSchemaChange) {
 		c.logger.Error("table definition changed, cancelling operation", "schema", schema, "table", table)
 	}
 }
 
 // fatalError is called from within the readStream goroutine when a truly fatal
 // condition occurs, with reason distinguishing DDL on a watched table
-// (FatalReasonSchemaChange) from stream failures such as an unrecoverable
+// (contract.FatalReasonSchemaChange) from stream failures such as an unrecoverable
 // stream error, minimal RBR detection, or a fatal rows event error
-// (FatalReasonStreamError). It returns true if the caller acknowledged the
+// (contract.FatalReasonStreamError). It returns true if the caller acknowledged the
 // error (i.e. the cancel function was called and acted upon).
 //
 // IMPORTANT: This method must NOT call Close() because Close() calls
 // streamWG.Wait(), which would deadlock since readStream is the caller.
-func (c *feedCore) fatalError(reason FatalReason) bool {
+func (c *feedCore) fatalError(reason contract.FatalReason) bool {
 	if c.callerCancelFunc != nil {
 		return c.callerCancelFunc(reason)
 	}
@@ -526,7 +526,7 @@ func (c *feedCore) flushUnderTableLock(ctx context.Context, locks []contract.Tab
 }
 
 // recordFlush captures what this flush left behind (for FlushResidual) and
-// how long it took on how many changes (for FeedStats). Recorded whether or
+// how long it took on how many changes (for contract.FeedStats). Recorded whether or
 // not every change could be flushed: a flush that could not drain everything
 // is exactly the case a caller watching for a feed losing ground needs to see.
 //
@@ -690,7 +690,7 @@ func (c *feedCore) runPeriodicFlush(ctx context.Context, interval time.Duration,
 					return
 				}
 				c.logger.Error("error flushing parked subscription", "error", err)
-				if c.fatalError(FatalReasonFlushError) {
+				if c.fatalError(contract.FatalReasonFlushError) {
 					return
 				}
 			}
@@ -710,7 +710,7 @@ func (c *feedCore) runPeriodicFlush(ctx context.Context, interval time.Duration,
 			// stays where it is, so every later pass would fail the same
 			// way while the checkpoint falls further behind the binlog
 			// retention window. Stop the caller rather than carry on.
-			if c.fatalError(FatalReasonFlushError) {
+			if c.fatalError(contract.FatalReasonFlushError) {
 				return
 			}
 		}

@@ -14,6 +14,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/flags"
@@ -480,25 +481,25 @@ func TestFatalErrorConcurrentWithRunSetup(t *testing.T) {
 		runner.lifecycle.SetCancel(func(error) { cancelCalls.Add(1) })
 	})
 	wg.Go(func() {
-		require.True(t, runner.fatalError(change.FatalReasonStreamError))
+		require.True(t, runner.fatalError(contract.FatalReasonStreamError))
 	})
 	wg.Wait()
 
 	// The fatal condition is recorded regardless of which goroutine won,
 	// and the recorded error names the reason class.
 	require.Error(t, runner.fatal())
-	require.ErrorContains(t, runner.fatal(), change.FatalReasonStreamError.String())
+	require.ErrorContains(t, runner.fatal(), contract.FatalReasonStreamError.String())
 
 	// Repeated invocations still report "acted upon" but never
 	// double-cancel or re-record (fatalOnce).
-	require.True(t, runner.fatalError(change.FatalReasonSchemaChange))
+	require.True(t, runner.fatalError(contract.FatalReasonSchemaChange))
 	require.LessOrEqual(t, cancelCalls.Load(), int64(1))
 }
 
 func TestFatalErrorUnsupportedXAReason(t *testing.T) {
 	runner, err := NewRunner(&Sync{})
 	require.NoError(t, err)
-	require.True(t, runner.fatalError(change.FatalReasonUnsupportedXA))
+	require.True(t, runner.fatalError(contract.FatalReasonUnsupportedXA))
 	require.ErrorContains(t, runner.fatal(), "unsupported-xa")
 }
 

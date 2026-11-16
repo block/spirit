@@ -7,8 +7,9 @@ It is the only code spirit shares with [pg-sprite](https://github.com/block/pg-s
 ## Rules
 
 - **Types and interfaces only.** No implementations, no constructors with behaviour, no helpers.
+- **Methods only where they say what a value means.** `FatalReason.String` and `FatalReason.PreservesCheckpoint` define the value; they belong here. How spirit renders, merges or acts on a value stays in spirit as a free function (`change.MergeSubscriptionStats`, `change.FatalAdvice`), because Go cannot declare a method on a type from another package.
 - **Standard library imports only.** A project must be able to import `contract` without depending on the rest of spirit. `TestImportsOnlyStandardLibrary` enforces this for the package's non-test files.
-- **Spirit uses these types directly.** When a type moves here, the package it came from does not keep an alias: spirit's own code refers to `contract.LogicalRow`, not `applier.LogicalRow`, so there is one name for each type.
+- **Spirit uses these types directly.** When a type, constant or sentinel error moves here, the package it came from does not keep an alias: spirit's own code refers to `contract.LogicalRow`, not `applier.LogicalRow`, so there is one name for each.
 
 ## Plan
 
@@ -20,3 +21,7 @@ The plan is to stabilize this package and then move it to its own module, `githu
 |------|------------|-------------|
 | `LogicalRow` | `pkg/applier` | The current state of a row in a subscription buffer: deleted, or a row image. |
 | `TableLock` | new; `*dbconn.TableLock` implements it | A held `LOCK TABLES` that a subscription's flush writes through. Change feeds only forward it. |
+| `FeedStats`, `FlushShape` | `pkg/change` | What a change feed reports for the runner's status block. |
+| `FatalReason` and its values | `pkg/change` | Why a change feed hit a fatal condition, and whether a checkpoint survives it. |
+| `RowWatch`, `RowVerifier` | `pkg/change` | The row a `ParkableSource` waits for, and the check run while it is parked. |
+| `ErrPositionNotFound`, `ErrRowRewritten`, `ErrFlushIncomplete` | `pkg/change` | Sentinel errors a source returns from `StartFromPosition` and `VerifyRowAtNextChange`. |

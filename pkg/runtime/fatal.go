@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/status"
 )
 
@@ -17,7 +18,7 @@ import (
 // goroutines is realistic: the gate acts on the first and ignores the rest.
 //
 // Datasync does not use it. It has no cutover to guard and always keeps its
-// checkpoint (see change.FatalReason.PreservesCheckpoint).
+// checkpoint (see contract.FatalReason.PreservesCheckpoint).
 type FatalGate struct {
 	once sync.Once
 }
@@ -43,9 +44,9 @@ type FatalTarget struct {
 // left to abort. Otherwise it returns true, and on the first call only:
 //
 //   - sets the state to status.ErrCleanup,
-//   - logs reason's operator advice (change.FatalReason.Advice),
+//   - logs reason's operator advice (change.FatalAdvice),
 //   - drops the checkpoint unless reason leaves it resumable
-//     (change.FatalReason.PreservesCheckpoint). A schema change, for example,
+//     (contract.FatalReason.PreservesCheckpoint). A schema change, for example,
 //     would otherwise block the run from proceeding permanently; starting
 //     again is the better choice. A dead stream preserves it: that is exactly
 //     the failure checkpoint resume exists to recover from.
@@ -53,7 +54,7 @@ type FatalTarget struct {
 //
 // Doing these once keeps the side effects from racing each other and the
 // runner's Close.
-func (g *FatalGate) Trip(reason change.FatalReason, t FatalTarget) bool {
+func (g *FatalGate) Trip(reason contract.FatalReason, t FatalTarget) bool {
 	if t.Tracker.Get() >= status.CutOver {
 		return false
 	}
@@ -63,7 +64,7 @@ func (g *FatalGate) Trip(reason change.FatalReason, t FatalTarget) bool {
 		if logger == nil {
 			logger = slog.Default()
 		}
-		if advice := reason.Advice(t.Noun); advice != "" {
+		if advice := change.FatalAdvice(reason, t.Noun); advice != "" {
 			logger.Error(advice)
 		}
 		if !reason.PreservesCheckpoint() {

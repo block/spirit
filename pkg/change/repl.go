@@ -162,7 +162,7 @@ func periodicFlushStopping(ctx context.Context) bool {
 
 // recordEventTime advances dst to the wall-clock timestamp carried in a binlog
 // event header, which is when the source committed that transaction. Both
-// clients call it once per event read; see FeedStats.BufferedEventAt for what
+// clients call it once per event read; see contract.FeedStats.BufferedEventAt for what
 // the number is for.
 //
 // Two guards, both load-bearing:

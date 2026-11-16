@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -35,7 +36,7 @@ func lockTimeoutCutover(t *testing.T, ctx context.Context, maxRetries int, logge
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(replDB) })
 	cfg := change.NewClientDefaultConfig()
-	cfg.CancelFunc = func(change.FatalReason) bool { return false }
+	cfg.CancelFunc = func(contract.FatalReason) bool { return false }
 	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
 	require.NoError(t, replClient.Start(ctx))
 	t.Cleanup(replClient.Close)

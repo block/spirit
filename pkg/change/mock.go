@@ -53,7 +53,7 @@ type MockSource struct {
 	Pos string
 
 	// FixedStats is what FeedStats reports when Inner is nil.
-	FixedStats FeedStats
+	FixedStats contract.FeedStats
 
 	// DeltaLen is what GetDeltaLen reports, and Residual the first return of
 	// FlushResidual, when Inner is nil. Both default to zero — a feed with
@@ -228,7 +228,7 @@ func (m *MockSource) Close() {
 	}
 }
 
-func (m *MockSource) FeedStats() FeedStats {
+func (m *MockSource) FeedStats() contract.FeedStats {
 	if m.Inner != nil {
 		return m.Inner.FeedStats()
 	}

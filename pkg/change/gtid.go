@@ -27,7 +27,7 @@ var _ ParkableSource = (*gtidClient)(nil)
 // Shared with binlogClient through the embedded feedCore (see feedcore.go):
 // the connection settings and syncer config, subscriptions and how they are
 // built, DDL filtering, the fatal-error callback, Stop/Close teardown, flush
-// bookkeeping (FlushResidual and the FeedStats flush fields), the Flush /
+// bookkeeping (FlushResidual and the contract.FeedStats flush fields), the Flush /
 // FlushUnderTableLock / periodic-flush loops, and rows-event processing with
 // row dispatch through the parker.
 //
@@ -128,11 +128,11 @@ func (c *gtidClient) getPurgedGTIDSet(ctx context.Context) (mysql.GTIDSet, error
 func validateResumeGTIDSet(flushed, executed, purged mysql.GTIDSet) error {
 	if !flushed.Contain(purged) {
 		return fmt.Errorf("%w: requested GTID set does not cover @@GLOBAL.gtid_purged (purged=%s, requested=%s)",
-			ErrPositionNotFound, purged.String(), flushed.String())
+			contract.ErrPositionNotFound, purged.String(), flushed.String())
 	}
 	if !executed.Contain(flushed) {
 		return fmt.Errorf("%w: @@GLOBAL.gtid_executed does not contain the requested GTID set; the server never executed transactions the checkpoint records as applied (failover or restore from backup?), so the migration must restart fresh (executed=%s, requested=%s)",
-			ErrPositionNotFound, executed.String(), flushed.String())
+			contract.ErrPositionNotFound, executed.String(), flushed.String())
 	}
 	return nil
 }
@@ -259,7 +259,7 @@ func (c *gtidClient) CurrentPosition(ctx context.Context) (string, error) {
 // against the server's GTID state (see validateResumeGTIDSet), then
 // begins streaming as Start would.
 //
-// Parse failures are wrapped with ErrPositionNotFound. This matters
+// Parse failures are wrapped with contract.ErrPositionNotFound. This matters
 // because the most likely real-world parse failure is an operator
 // resuming a legacy file:offset checkpoint (binlog.000123:4567)
 // against the GTID client (or vice-versa). Without the wrap the
@@ -273,7 +273,7 @@ func (c *gtidClient) StartFromPosition(ctx context.Context, pos string) error {
 	}
 	parsed, err := mysql.ParseMysqlGTIDSet(normalizeGTIDString(pos))
 	if err != nil {
-		return fmt.Errorf("%w: StartFromPosition: cannot parse %q as a GTID set (legacy file:offset checkpoint?): %w", ErrPositionNotFound, pos, err)
+		return fmt.Errorf("%w: StartFromPosition: cannot parse %q as a GTID set (legacy file:offset checkpoint?): %w", contract.ErrPositionNotFound, pos, err)
 	}
 	c.mu.Lock()
 	c.flushedGTID = parsed
@@ -430,7 +430,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 						"total_attempts", recreateAttempts,
 						"recent_errors", recentErrors,
 						"is_closed", c.isClosed.Load())
-					c.fatalError(FatalReasonStreamError)
+					c.fatalError(contract.FatalReasonStreamError)
 					return
 				}
 
@@ -515,7 +515,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 		case *replication.RowsEvent:
 			if err = c.processRowsEvent(ev, event); err != nil {
 				c.logger.Error("fatal error processing GTID rows event", "error", err)
-				c.fatalError(FatalReasonStreamError)
+				c.fatalError(contract.FatalReasonStreamError)
 				return
 			}
 		case *replication.QueryEvent:
@@ -562,7 +562,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 			// version reshapes the group.
 			if ev.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
 				c.logger.Error("fatal error processing GTID stream", "error", errXAUnsupported)
-				c.fatalError(FatalReasonUnsupportedXA)
+				c.fatalError(contract.FatalReasonUnsupportedXA)
 				return
 			}
 			c.logger.Debug("Received unknown event type", "type", ev.Header.EventType.String())
@@ -778,11 +778,11 @@ func (c *gtidClient) countRotation(currentLogName, nextLogName string) string {
 // FeedStats satisfies Source. ForcedRotations is always zero: this
 // client never issues `FLUSH BINARY LOGS` — BlockWait polls
 // @@GLOBAL.gtid_executed instead of chasing a file offset.
-func (c *gtidClient) FeedStats() FeedStats {
+func (c *gtidClient) FeedStats() contract.FeedStats {
 	// Collected before c.mu is taken: these lock each subscription, and the
 	// subscriptions take c.mu on their flush paths.
-	var stats FeedStats
-	stats.MergeSubscriptions(c.subs.Snapshot())
+	var stats contract.FeedStats
+	MergeSubscriptionStats(&stats, c.subs.Snapshot())
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -840,7 +840,7 @@ func (c *gtidClient) blockWait(ctx context.Context, timeout time.Duration) error
 // VerifyRowAtNextChange satisfies ParkableSource. The parker owns the ordering; all
 // this supplies is the inner drain, which must not be Flush (see
 // RowParker.Verify).
-func (c *gtidClient) VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error {
+func (c *gtidClient) VerifyRowAtNextChange(ctx context.Context, watch contract.RowWatch, verify contract.RowVerifier) error {
 	return c.parker.Verify(ctx, watch, verify,
 		func(ctx context.Context) error { return c.flush(ctx, false, nil) },
 		c.AllChangesFlushed)
