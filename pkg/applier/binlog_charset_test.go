@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
@@ -60,7 +61,7 @@ func TestApplierBinlogCharsets(t *testing.T) {
 
 	// Row images as the binlog decodes them: VARCHAR/CHAR as string, TEXT as
 	// []byte, each in its column's charset.
-	images := []LogicalRow{
+	images := []contract.LogicalRow{
 		{RowImage: []any{"\xc3\xa9", []byte("\xc3\xa9 caf\xe9"), "\xd0\xb0", "\x00M\x00\xe9"}},
 		{RowImage: []any{"\xe9", []byte(""), "", "\x00M"}},
 		{RowImage: []any{"a", []byte("a"), "a", "\x00a"}},

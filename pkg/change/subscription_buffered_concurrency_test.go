@@ -12,6 +12,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -51,7 +52,7 @@ func (g *gatedApplier) announce() {
 	}
 }
 
-func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
 	g.announce()
 	if g.upsertGate != nil {
 		<-g.upsertGate
@@ -516,7 +517,7 @@ type orderRecordingApplier struct {
 	order []string
 }
 
-func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
 	a.mu.Lock()
 	a.order = append(a.order, mapping.SourceTable().TableName)
 	a.mu.Unlock()
