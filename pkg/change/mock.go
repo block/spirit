@@ -92,7 +92,7 @@ type MockSource struct {
 
 var _ Source = (*MockSource)(nil)
 
-func (m *MockSource) AddSubscription(currentTable, newTable *table.TableInfo, chunker table.MappedChunker) error {
+func (m *MockSource) AddSubscription(currentTable, newTable contract.Table, chunker table.MappedChunker) error {
 	if m.Inner != nil {
 		return m.Inner.AddSubscription(currentTable, newTable, chunker)
 	}

@@ -1190,7 +1190,7 @@ func (s *gatedSubscription) Flush(_ context.Context, _ bool, _ []contract.TableL
 	<-<-s.gates
 	return true, nil
 }
-func (s *gatedSubscription) Tables() []*table.TableInfo                           { return nil }
+func (s *gatedSubscription) Tables() []contract.Table                             { return nil }
 func (s *gatedSubscription) ImmutableColumnOrdinal() int                          { return -1 }
 func (s *gatedSubscription) SetWatermarkOptimization(context.Context, bool) error { return nil }
 func (s *gatedSubscription) Close()                                               {}

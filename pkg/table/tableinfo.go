@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	parsermysql "github.com/block/spirit/pkg/parser/mysql"
 	"github.com/block/spirit/pkg/utils"
@@ -97,6 +98,54 @@ type TableInfo struct {
 // This matches Vitess vindex behavior where the hash is used to determine shard placement.
 // The hash value is then matched against key ranges to find the target shard.
 type HashFunc func(value any) (uint64, error)
+
+var _ contract.Table = (*TableInfo)(nil)
+
+// ID returns the table's schema and name. It satisfies contract.Table. A nil
+// receiver returns the zero TableID, so a nil *TableInfo stored in a
+// contract.Table does not panic a caller that reads it.
+func (t *TableInfo) ID() contract.TableID {
+	if t == nil {
+		return contract.TableID{}
+	}
+	return contract.TableID{Schema: t.SchemaName, Name: t.TableName}
+}
+
+// ColumnNames returns Columns. It satisfies contract.Table. A nil receiver
+// returns nil.
+func (t *TableInfo) ColumnNames() []string {
+	if t == nil {
+		return nil
+	}
+	return t.Columns
+}
+
+// KeyColumnNames returns KeyColumns. It satisfies contract.Table. A nil
+// receiver returns nil.
+func (t *TableInfo) KeyColumnNames() []string {
+	if t == nil {
+		return nil
+	}
+	return t.KeyColumns
+}
+
+// AsTableInfo returns t as a *TableInfo, for spirit code that receives a
+// contract.Table but needs MySQL detail that the contract does not carry
+// (column types, binlog decoding, sharding). A nil t, or a nil *TableInfo,
+// returns (nil, nil). Any other contract.Table implementation is an error:
+// spirit's MySQL change sources and applier can only work with tables they
+// read themselves.
+func AsTableInfo(t contract.Table) (*TableInfo, error) {
+	if t == nil {
+		return nil, nil
+	}
+	ti, ok := t.(*TableInfo)
+	if !ok {
+		id := t.ID()
+		return nil, fmt.Errorf("table %s.%s is a %T, not a *table.TableInfo", id.Schema, id.Name, t)
+	}
+	return ti, nil
+}
 
 // QualifiedName returns a stable key for this table suitable for use in
 // checkpoint watermarks. The format is "host.schema.table" when Host is set,

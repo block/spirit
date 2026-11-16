@@ -384,7 +384,7 @@ func (*stubSubscription) Length() int                   { return 0 }
 func (*stubSubscription) Flush(context.Context, bool, []contract.TableLock) (bool, error) {
 	return true, nil
 }
-func (*stubSubscription) Tables() []*table.TableInfo                           { return nil }
+func (*stubSubscription) Tables() []contract.Table                             { return nil }
 func (*stubSubscription) ImmutableColumnOrdinal() int                          { return -1 }
 func (*stubSubscription) SetWatermarkOptimization(context.Context, bool) error { return nil }
 func (*stubSubscription) Close()                                               {}

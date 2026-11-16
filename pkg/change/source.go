@@ -42,7 +42,14 @@ type Source interface {
 	// newTable, chunker) and registers it. ROW events matching the
 	// registered (schema, table) pair are pushed to the subscription's
 	// HasChanged. Must be called before Start / StartFromPosition.
-	AddSubscription(currentTable, newTable *table.TableInfo, chunker table.MappedChunker) error
+	//
+	// currentTable is required. newTable is nil for a move-flow
+	// subscription, which has no distinct destination table; a nil
+	// *table.TableInfo counts as nil. The built-in sources need the MySQL
+	// detail a *table.TableInfo carries (binlog decoding, column types),
+	// so they return an error for any other contract.Table implementation
+	// (see table.AsTableInfo). The check runs here, before any event.
+	AddSubscription(currentTable, newTable contract.Table, chunker table.MappedChunker) error
 
 	// Start begins streaming from the current source head and spawns the
 	// reader goroutine. Returns once the reader is running; the stream

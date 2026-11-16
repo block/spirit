@@ -530,18 +530,19 @@ func (s *bufferedMap) overSoftLimitLocked() bool {
 	return s.softLimitChanges > 0 && s.lengthLocked() >= s.softLimitChanges
 }
 
-func (s *bufferedMap) Tables() []*table.TableInfo {
+func (s *bufferedMap) Tables() []contract.Table {
 	if s.newTable == nil {
 		// Move-flow subscriptions have no destination-side TableInfo (see
-		// BufferedSubscriptionConfig.NewTable). Omit the nil rather than
+		// BufferedSubscriptionConfig.NewTable). Omit it rather than
 		// returning [table, nil]: Tables() consumers — the DDL
 		// subscription-match loops in the binlog/GTID clients, and
 		// out-of-tree change.Source implementations routing row events per
-		// the Source interface contract — iterate and dereference the
-		// entries, and a nil entry panics the stream-reader goroutine.
-		return []*table.TableInfo{s.table}
+		// the Source interface contract — iterate the entries and call
+		// their methods, and a nil entry panics the stream-reader
+		// goroutine.
+		return []contract.Table{s.table}
 	}
-	return []*table.TableInfo{s.table, s.newTable}
+	return []contract.Table{s.table, s.newTable}
 }
 
 // ImmutableColumnOrdinal satisfies Subscription. The ordinal is derived

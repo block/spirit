@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/block/spirit/pkg/contract"
-	"github.com/block/spirit/pkg/table"
 )
 
 // Subscription defines how the replication changes are tracked. The single
@@ -34,14 +33,14 @@ type Subscription interface {
 	Flush(ctx context.Context, underLock bool, locks []contract.TableLock) (allChangesFlushed bool, err error)
 	// Tables returns the tables related to the subscription in
 	// currentTable, newTable order. Move-flow subscriptions have no
-	// destination-side TableInfo, in which case only [currentTable] is
+	// destination-side table, in which case only [currentTable] is
 	// returned. Entries are never nil: consumers (the clients' DDL
 	// subscription-match loops, out-of-tree change.Source event routing)
-	// iterate and dereference them.
-	Tables() []*table.TableInfo
+	// iterate them and call their methods.
+	Tables() []contract.Table
 
 	// ImmutableColumnOrdinal returns the position (an index into
-	// Tables()[0].Columns, and thus into each full binlog row image) of a
+	// Tables()[0].ColumnNames(), and thus into each full row image) of a
 	// column whose value must never change between the before and after
 	// image of an UPDATE, or -1 when no such column is configured.
 	//

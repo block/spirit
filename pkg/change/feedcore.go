@@ -244,7 +244,18 @@ func (c *feedCore) configure(db *sql.DB, host, username, password string, appl a
 // AddSubscription adds a new subscription.
 // Returns an error if a subscription already exists for the given table.
 // Satisfies Source interface.
-func (c *feedCore) AddSubscription(currentTable, newTable *table.TableInfo, chunker table.MappedChunker) error {
+func (c *feedCore) AddSubscription(currentTableDesc, newTableDesc contract.Table, chunker table.MappedChunker) error {
+	currentTable, err := table.AsTableInfo(currentTableDesc)
+	if err != nil {
+		return fmt.Errorf("could not add subscription: current %w", err)
+	}
+	if currentTable == nil {
+		return errors.New("could not add subscription: currentTable is nil")
+	}
+	newTable, err := table.AsTableInfo(newTableDesc)
+	if err != nil {
+		return fmt.Errorf("could not add subscription for table %s.%s: new %w", currentTable.SchemaName, currentTable.TableName, err)
+	}
 	subKey := encodeSchemaTable(currentTable.SchemaName, currentTable.TableName)
 	// Build the buffered subscription via the shared public constructor so the
 	// in-tree clients and out-of-tree change.Source implementations
@@ -405,7 +416,7 @@ func (c *feedCore) processDDL(schema, table string, foreignKeysOnly bool) {
 					// crash the stream reader.
 					continue
 				}
-				if tsub.SchemaName == schema && tsub.TableName == table && (i == 0 || !foreignKeysOnly) {
+				if id := tsub.ID(); id.Schema == schema && id.Name == table && (i == 0 || !foreignKeysOnly) {
 					matchFound = true
 					break
 				}
@@ -820,7 +831,13 @@ func (c *feedCore) processRowsEvent(ev *replication.BinlogEvent, e *replication.
 		return fmt.Errorf("%w for table %s.%s", unsupportedRowsEventError(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
 	}
 
-	tbl := sub.Tables()[0]
+	// AddSubscription only registers subscriptions built from a
+	// *table.TableInfo, so this cannot fail for them; the check covers a
+	// subscription registered some other way.
+	tbl, err := table.AsTableInfo(sub.Tables()[0])
+	if err != nil {
+		return fmt.Errorf("decoding binlog rows: subscription %w", err)
+	}
 
 	// Decode ENUM ordinals / SET bitmasks back to their string form and
 	// re-pad BINARY(N) values (MySQL strips trailing 0x00 from the row
