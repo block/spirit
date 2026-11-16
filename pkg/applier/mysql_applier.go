@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/metrics"
@@ -863,16 +864,18 @@ func (a *MySQLApplier) feedbackCoordinator(ctx context.Context) {
 // every lock must belong to a shard; anything else is a caller bug (typically a
 // lock taken on a different server than this applier writes to) and is an
 // error returned before anything is executed.
-func (a *MySQLApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*dbconn.TableLock, error) {
+func (a *MySQLApplier) resolveShardLocks(locks []contract.TableLock) (map[int]contract.TableLock, error) {
 	if len(locks) == 0 {
 		return nil, nil
 	}
 	// Index the locks by the connection they were acquired on. Several shards
 	// may share one connection (and so one lock); two locks on one connection
 	// are ambiguous and refused.
-	lockByDB := make(map[*sql.DB]*dbconn.TableLock, len(locks))
+	lockByDB := make(map[*sql.DB]contract.TableLock, len(locks))
 	for i, lock := range locks {
-		if lock == nil {
+		// lock.DB() == nil also catches a typed nil (a nil *dbconn.TableLock
+		// held in the interface), which lock == nil does not.
+		if lock == nil || lock.DB() == nil {
 			return nil, fmt.Errorf("table lock %d is nil", i)
 		}
 		shardID := slices.IndexFunc(a.shards, func(s *shardTarget) bool { return s.writeDB == lock.DB() })
@@ -884,7 +887,7 @@ func (a *MySQLApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*db
 		}
 		lockByDB[lock.DB()] = lock
 	}
-	shardLocks := make(map[int]*dbconn.TableLock, len(a.shards))
+	shardLocks := make(map[int]contract.TableLock, len(a.shards))
 	for _, shard := range a.shards {
 		lock := lockByDB[shard.writeDB]
 		if lock == nil {
@@ -910,7 +913,7 @@ func (a *MySQLApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*db
 // targetTable may be nil, meaning the same name as sourceTable. A different
 // name is used by migrations (the `_new` table) and by the reverse feed of a
 // sharded-source move, which writes back to the source's retired `_old` tables.
-func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
@@ -1055,7 +1058,7 @@ func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 //
 // The sharding column and hash always come from the mapping's SOURCE table —
 // the watched table whose row images we are routing.
-func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []contract.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}

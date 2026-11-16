@@ -118,7 +118,7 @@ The applier interface provides both asynchronous and synchronous methods:
 - `DeleteKeys(ctx, sourceTable, targetTable, keys, locks)`: Deletes rows by primary key and waits for completion. Emits `DELETE FROM target WHERE (pk) IN (...)`.
 - `UpsertRows(ctx, mapping, rows, locks)`: Upserts rows using a `ColumnMapping` and waits for completion. Emits `REPLACE INTO target (cols) VALUES (...)` — see [REPLACE INTO semantics](#replace-into-semantics-and-eventual-consistency) below.
 
-`locks` is a `[]*dbconn.TableLock`. Leave it nil for ordinary flushes; under-lock writes require exactly one lock per distinct target `*sql.DB`. Targets sharing a database handle must share one lock covering all their tables; duplicate lock entries for the same handle are rejected. These synchronous methods execute on the calling flush goroutines, independently of the asynchronous copy-worker pool.
+`locks` is a `[]contract.TableLock` (a `*dbconn.TableLock` satisfies it). Leave it nil for ordinary flushes; under-lock writes require exactly one lock per distinct target `*sql.DB`. Targets sharing a database handle must share one lock covering all their tables; duplicate lock entries for the same handle are rejected. These synchronous methods execute on the calling flush goroutines, independently of the asynchronous copy-worker pool.
 
 This distinction exists because:
 - The **copier** processes large batches of rows and benefits from async processing with callbacks to advance its watermark.

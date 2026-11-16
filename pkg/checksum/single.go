@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/spirit/pkg/autoscale"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/status"
@@ -315,7 +316,7 @@ func (c *SingleChecker) initConnPool(ctx context.Context) error {
 	}
 	defer utils.CloseAndLogWithContext(ctx, tableLock)
 	// We only have a reader, so flush the read connection.
-	if err := c.feed.FlushUnderTableLock(ctx, []*dbconn.TableLock{tableLock}); err != nil {
+	if err := c.feed.FlushUnderTableLock(ctx, []contract.TableLock{tableLock}); err != nil {
 		return err
 	}
 

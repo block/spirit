@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -61,7 +61,7 @@ func TestConstructorsConfigureSharedCore(t *testing.T) {
 // flush, and give up on a cancelled context.
 func TestSharedFlushSequencing(t *testing.T) {
 	var calls []string
-	flush := func(_ context.Context, underLock bool, locks []*dbconn.TableLock) error {
+	flush := func(_ context.Context, underLock bool, locks []contract.TableLock) error {
 		calls = append(calls, fmt.Sprintf("flush(underLock=%v,locks=%d)", underLock, len(locks)))
 		return nil
 	}
@@ -70,7 +70,7 @@ func TestSharedFlushSequencing(t *testing.T) {
 		return func(context.Context) error { calls = append(calls, "blockWait"); return err }
 	}
 	c := &feedCore{logger: slog.Default(), subs: newSubscriptionRegistry()}
-	locks := []*dbconn.TableLock{nil}
+	locks := []contract.TableLock{nil}
 
 	require.NoError(t, c.flushUnderTableLock(t.Context(), locks, flush, blockWait(nil)))
 	assert.Equal(t, []string{"flush(underLock=true,locks=1)", "blockWait", "flush(underLock=true,locks=1)"}, calls)

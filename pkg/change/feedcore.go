@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -197,7 +198,7 @@ type feedCore struct {
 // fully, advances that client's flushed position. The shared flush loops below
 // take it as an argument because an embedded feedCore cannot call the
 // embedding client's methods.
-type flushFunc func(ctx context.Context, underLock bool, locks []*dbconn.TableLock) error
+type flushFunc func(ctx context.Context, underLock bool, locks []contract.TableLock) error
 
 // configure fills in the shared fields from a client constructor's arguments,
 // defaulting a nil config.DBConfig (in place, on the caller's config) and
@@ -507,7 +508,7 @@ func (c *feedCore) Close() {
 //
 // For the GTID client the second pass is what makes the resume coordinate
 // cover the GTIDs the first flush itself generated.
-func (c *feedCore) flushUnderTableLock(ctx context.Context, locks []*dbconn.TableLock, flush flushFunc, blockWait func(context.Context) error) error {
+func (c *feedCore) flushUnderTableLock(ctx context.Context, locks []contract.TableLock, flush flushFunc, blockWait func(context.Context) error) error {
 	if len(locks) == 0 {
 		// Flushing "under lock" without any lock would silently execute the
 		// statements outside the locks the caller believes are held.

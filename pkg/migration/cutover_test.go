@@ -17,6 +17,7 @@ import (
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/checkpoint"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
@@ -1482,7 +1483,7 @@ type cancelFlushSource struct {
 	cancel context.CancelFunc
 }
 
-func (s *cancelFlushSource) FlushUnderTableLock(ctx context.Context, _ []*dbconn.TableLock) error {
+func (s *cancelFlushSource) FlushUnderTableLock(ctx context.Context, _ []contract.TableLock) error {
 	s.cancel()
 	return ctx.Err()
 }

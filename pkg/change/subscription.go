@@ -3,7 +3,7 @@ package change
 import (
 	"context"
 
-	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -31,7 +31,7 @@ type Subscription interface {
 	// When underLock is true, locks carries the table locks the caller is
 	// holding — one per target server — and the applier executes each
 	// target's statements under that target's own lock.
-	Flush(ctx context.Context, underLock bool, locks []*dbconn.TableLock) (allChangesFlushed bool, err error)
+	Flush(ctx context.Context, underLock bool, locks []contract.TableLock) (allChangesFlushed bool, err error)
 	// Tables returns the tables related to the subscription in
 	// currentTable, newTable order. Move-flow subscriptions have no
 	// destination-side TableInfo, in which case only [currentTable] is

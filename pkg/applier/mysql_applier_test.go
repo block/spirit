@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -1365,19 +1366,19 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 
 	// More than one lock must be rejected before executing anything.
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock, lock})
+		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
-		[][]any{{int64(1)}}, []*dbconn.TableLock{lock, lock})
+		[][]any{{int64(1)}}, []contract.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 
 	// A single lock executes on the lock connection.
 	affected, err := applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock})
+		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affected)
 	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
-		[][]any{{int64(2)}}, []*dbconn.TableLock{lock})
+		[][]any{{int64(2)}}, []contract.TableLock{lock})
 	require.NoError(t, err)
 
 	require.NoError(t, lock.Close(ctx))
@@ -1391,10 +1392,10 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	otherLock, err := dbconn.NewTableLock(ctx, otherDB, []*table.TableInfo{targetTable}, dbconn.NewDBConfig(), slog.Default())
 	require.NoError(t, err)
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []*dbconn.TableLock{otherLock})
+		[]LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []contract.TableLock{otherLock})
 	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
 	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
-		[][]any{{int64(1)}}, []*dbconn.TableLock{otherLock})
+		[][]any{{int64(1)}}, []contract.TableLock{otherLock})
 	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
 	require.NoError(t, otherLock.Close(ctx))
 
@@ -1527,9 +1528,18 @@ func TestUnderLockRejectsNilLock(t *testing.T) {
 	tbl.Columns = []string{"id"}
 	tbl.KeyColumns = []string{"id"}
 	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
-		[]LogicalRow{{RowImage: []any{int64(1)}}}, []*dbconn.TableLock{nil})
+		[]LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{nil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
-	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []*dbconn.TableLock{nil})
+	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{nil})
+	require.ErrorContains(t, err, "table lock 0 is nil")
+
+	// A nil *dbconn.TableLock in the interface is not == nil; it must be
+	// refused the same way, not dereferenced.
+	var typedNil *dbconn.TableLock
+	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
+		[]LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{typedNil})
+	require.ErrorContains(t, err, "table lock 0 is nil")
+	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{typedNil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
 }
 
@@ -1605,7 +1615,7 @@ func TestUnderLockSharedConnection(t *testing.T) {
 	defer utils.CloseAndLogWithContext(ctx, lock)
 	mapping := table.NewColumnMapping(tbl, tbl, nil)
 
-	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{{RowImage: []any{int64(3), "c"}}}, []*dbconn.TableLock{lock, lock})
+	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{{RowImage: []any{int64(3), "c"}}}, []contract.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 
 	// One lock covers both shards: an even row routes to shard 0, an odd row
@@ -1613,9 +1623,9 @@ func TestUnderLockSharedConnection(t *testing.T) {
 	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{
 		{RowImage: []any{int64(3), "c"}},
 		{RowImage: []any{int64(4), "d"}},
-	}, []*dbconn.TableLock{lock})
+	}, []contract.TableLock{lock})
 	require.NoError(t, err)
-	_, err = a.DeleteKeys(ctx, tbl, tbl, [][]any{{int64(1)}}, []*dbconn.TableLock{lock})
+	_, err = a.DeleteKeys(ctx, tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{lock})
 	require.NoError(t, err)
 	require.NoError(t, lock.Close(ctx))
 
@@ -1659,6 +1669,6 @@ func TestUnderLockRejectsUnsafeWarnings(t *testing.T) {
 	lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{targetTable}, dbconn.NewDBConfig(), slog.Default())
 	require.NoError(t, err)
 	defer utils.CloseAndLogWithContext(t.Context(), lock)
-	_, err = appl.UpsertRows(t.Context(), mapping, rows, []*dbconn.TableLock{lock})
+	_, err = appl.UpsertRows(t.Context(), mapping, rows, []contract.TableLock{lock})
 	require.ErrorAs(t, err, &warning, "a locked flush must not silently accept truncated data")
 }

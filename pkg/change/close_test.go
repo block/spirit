@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,7 +18,7 @@ type closingSubscription struct {
 	release   chan struct{}
 }
 
-func (s *closingSubscription) Flush(ctx context.Context, _ bool, _ []*dbconn.TableLock) (bool, error) {
+func (s *closingSubscription) Flush(ctx context.Context, _ bool, _ []contract.TableLock) (bool, error) {
 	close(s.entered)
 	<-ctx.Done()
 	close(s.cancelled)

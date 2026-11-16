@@ -12,6 +12,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -51,7 +52,7 @@ func (g *gatedApplier) announce() {
 	}
 }
 
-func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
 	g.announce()
 	if g.upsertGate != nil {
 		<-g.upsertGate
@@ -65,7 +66,7 @@ func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 	return g.MockApplier.UpsertRows(ctx, mapping, rows, locks)
 }
 
-func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error) {
 	g.announce()
 	if g.deleteGate != nil {
 		<-g.deleteGate
@@ -516,7 +517,7 @@ type orderRecordingApplier struct {
 	order []string
 }
 
-func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
 	a.mu.Lock()
 	a.order = append(a.order, mapping.SourceTable().TableName)
 	a.mu.Unlock()

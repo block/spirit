@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -1090,7 +1091,7 @@ func (s *bufferedMap) requestFlush() {
 // map/queue has entries when Flush runs. Both branches are still
 // handled defensively in case anything ever leaves the inactive store
 // non-empty.
-func (s *bufferedMap) Flush(ctx context.Context, underLock bool, locks []*dbconn.TableLock) (allChangesFlushed bool, err error) {
+func (s *bufferedMap) Flush(ctx context.Context, underLock bool, locks []contract.TableLock) (allChangesFlushed bool, err error) {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
@@ -1897,14 +1898,14 @@ func (s *bufferedMap) reattachLocked(snapshot map[string]bufferedChange, snapsho
 // filter would skip keys above the low watermark and leave them behind in the
 // store we are about to abandon. underLock (cutover) implies bypass for the
 // same reason.
-func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks []*dbconn.TableLock, bypassWatermark bool) (bool, error) {
+func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks []contract.TableLock, bypassWatermark bool) (bool, error) {
 	var deleteKeys [][]any
 	var upsertRows []applier.LogicalRow
 	var keysFlushed []string
 	var batchBytes int64
 	allChangesFlushed := true
 
-	var locksToUse []*dbconn.TableLock
+	var locksToUse []contract.TableLock
 	if underLock {
 		locksToUse = locks
 	}
@@ -1971,7 +1972,7 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 // If locks is non-empty, the operations are executed under the table
 // lock(s) — one lock per target server, matched to its target by the
 // applier (see applier.Applier.DeleteKeys for the contract).
-func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []applier.LogicalRow, locks []*dbconn.TableLock) error {
+func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []applier.LogicalRow, locks []contract.TableLock) error {
 	if len(deleteKeys) == 0 && len(upsertRows) == 0 {
 		return nil
 	}
@@ -2021,11 +2022,11 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 // consecutive same-type operations into one applier call, e.g.
 // UPSERT<1>, UPSERT<2>, DELETE<3>, UPSERT<4> becomes
 // UpsertRows([1,2]); DeleteKeys([3]); UpsertRows([4]).
-func (s *bufferedMap) flushQueueLocked(ctx context.Context, underLock bool, locks []*dbconn.TableLock) error {
+func (s *bufferedMap) flushQueueLocked(ctx context.Context, underLock bool, locks []contract.TableLock) error {
 	if len(s.queue) == 0 {
 		return nil
 	}
-	var locksToUse []*dbconn.TableLock
+	var locksToUse []contract.TableLock
 	if underLock {
 		locksToUse = locks
 	}

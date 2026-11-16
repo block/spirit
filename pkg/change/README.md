@@ -373,7 +373,7 @@ defer lock.Close(ctx)
 
 // Supply exactly one lock per distinct target *sql.DB.
 // Targets sharing a handle share one lock covering all their tables.
-if err := client.FlushUnderTableLock(ctx, []*dbconn.TableLock{lock}); err != nil {
+if err := client.FlushUnderTableLock(ctx, []contract.TableLock{lock}); err != nil {
     return err
 }
 

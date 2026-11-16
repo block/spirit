@@ -8,6 +8,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -380,7 +381,7 @@ type stubSubscription struct{}
 
 func (*stubSubscription) HasChanged([]any, []any, bool) {}
 func (*stubSubscription) Length() int                   { return 0 }
-func (*stubSubscription) Flush(context.Context, bool, []*dbconn.TableLock) (bool, error) {
+func (*stubSubscription) Flush(context.Context, bool, []contract.TableLock) (bool, error) {
 	return true, nil
 }
 func (*stubSubscription) Tables() []*table.TableInfo                           { return nil }
