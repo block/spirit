@@ -8,7 +8,7 @@ It is the only code spirit shares with [pg-sprite](https://github.com/block/pg-s
 
 - **Types and interfaces only.** No implementations, no constructors with behaviour, no helpers.
 - **Standard library imports only.** A project must be able to import `contract` without depending on the rest of spirit. `TestImportsOnlyStandardLibrary` enforces this for the package's non-test files.
-- **Spirit keeps aliases.** When a type moves here, the package it came from keeps a type alias (`type LogicalRow = contract.LogicalRow` in `pkg/applier`), so existing callers compile unchanged.
+- **Spirit uses these types directly.** When a type moves here, the package it came from does not keep an alias: spirit's own code refers to `contract.LogicalRow`, not `applier.LogicalRow`, so there is one name for each type.
 
 ## Plan
 
