@@ -29,7 +29,7 @@ type slowApplier struct {
 	perCall time.Duration
 }
 
-func (s *slowApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (s *slowApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	time.Sleep(s.perCall)
 	return s.MockApplier.UpsertRows(ctx, mapping, rows, locks)
 }

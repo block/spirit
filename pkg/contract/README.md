@@ -7,9 +7,9 @@ It is the only code spirit shares with [pg-sprite](https://github.com/block/pg-s
 ## Rules
 
 - **Types and interfaces only.** No implementations, no constructors with behaviour, no helpers.
-- **Methods only where they say what a value means.** `FatalReason.String` and `FatalReason.PreservesCheckpoint` define the value; they belong here. How spirit renders, merges or acts on a value stays in spirit as a free function (`change.MergeSubscriptionStats`, `change.FatalAdvice`), because an alias cannot carry methods declared outside this package.
+- **Methods only where they say what a value means.** `FatalReason.String` and `FatalReason.PreservesCheckpoint` define the value; they belong here. How spirit renders, merges or acts on a value stays in spirit as a free function (`change.MergeSubscriptionStats`, `change.FatalAdvice`), because Go cannot declare a method on a type from another package.
 - **Standard library imports only.** A project must be able to import `contract` without depending on the rest of spirit. `TestImportsOnlyStandardLibrary` enforces this for the package's non-test files.
-- **Spirit keeps aliases.** When a type, constant or sentinel error moves here, the package it came from keeps an alias (`type LogicalRow = contract.LogicalRow` in `pkg/applier`, `var ErrRowRewritten = contract.ErrRowRewritten` in `pkg/change`), so existing callers compile unchanged and `errors.Is` matches either name.
+- **Spirit uses these types directly.** When a type, constant or sentinel error moves here, the package it came from does not keep an alias: spirit's own code refers to `contract.LogicalRow`, not `applier.LogicalRow`, so there is one name for each.
 
 ## Plan
 

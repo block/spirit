@@ -63,7 +63,7 @@ type MockApplier struct {
 	stops       int
 	waits       int
 	applyRows   [][][]any
-	upsertCalls [][]LogicalRow
+	upsertCalls [][]contract.LogicalRow
 	deleteCalls [][][]any
 }
 
@@ -139,7 +139,7 @@ func (m *MockApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *
 	return int64(len(keys)), nil
 }
 
-func (m *MockApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []contract.TableLock) (int64, error) {
+func (m *MockApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	m.mu.Lock()
 	m.upsertCalls = append(m.upsertCalls, rows)
 	m.mu.Unlock()
@@ -185,10 +185,10 @@ func (m *MockApplier) ApplyCalls() [][][]any {
 }
 
 // UpsertCalls returns the row batches passed to UpsertRows, in call order.
-func (m *MockApplier) UpsertCalls() [][]LogicalRow {
+func (m *MockApplier) UpsertCalls() [][]contract.LogicalRow {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append([][]LogicalRow(nil), m.upsertCalls...)
+	return append([][]contract.LogicalRow(nil), m.upsertCalls...)
 }
 
 // DeleteCalls returns the key batches passed to DeleteKeys, in call order.

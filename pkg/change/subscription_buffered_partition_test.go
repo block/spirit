@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -16,7 +17,7 @@ func upsertRow(key string, id int64, leading, trailing any) drainRow {
 	return drainRow{
 		key: key,
 		change: bufferedChange{
-			logicalRow:  applier.LogicalRow{RowImage: []any{id, leading, trailing}},
+			logicalRow:  contract.LogicalRow{RowImage: []any{id, leading, trailing}},
 			originalKey: []any{id},
 		},
 	}
@@ -26,7 +27,7 @@ func deleteRow(key string, id int64) drainRow {
 	return drainRow{
 		key: key,
 		change: bufferedChange{
-			logicalRow:  applier.LogicalRow{IsDeleted: true},
+			logicalRow:  contract.LogicalRow{IsDeleted: true},
 			originalKey: []any{id},
 		},
 	}

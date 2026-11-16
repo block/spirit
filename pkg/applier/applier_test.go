@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -437,7 +438,7 @@ func TestApplierTimeoutScope(t *testing.T) {
 
 			t.Run("UpsertRows is not bounded", func(t *testing.T) {
 				err := within(t, 30*time.Second, func() error {
-					_, err := applier.UpsertRows(ctx, mapping, []LogicalRow{{RowImage: []any{int64(1), "Bob"}}}, nil)
+					_, err := applier.UpsertRows(ctx, mapping, []contract.LogicalRow{{RowImage: []any{int64(1), "Bob"}}}, nil)
 					return err
 				})
 				require.NotErrorIs(t, err, context.DeadlineExceeded)

@@ -10,6 +10,5 @@
 //
 // The plan is to stabilize this package and then move it to its own module,
 // github.com/block/spirit-contract. Until then its API may change. Spirit's own
-// packages keep type aliases for anything moved here, so existing callers
-// compile unchanged.
+// packages use the types here directly; they do not re-export them as aliases.
 package contract
