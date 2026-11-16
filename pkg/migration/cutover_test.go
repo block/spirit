@@ -57,11 +57,12 @@ func TestCutOver(t *testing.T) {
 	t1new := table.NewTableInfo(db, cfg.DBName, "_cutovert1_new")
 	t1old := "_cutovert1_old"
 	logger := slog.Default()
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t1new, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 
 	cutoverConfig := []*cutoverConfig{
@@ -161,12 +162,12 @@ func TestCutoverStopsFeedDispatchUnderLock(t *testing.T) {
 	errLog := &errorCountingHandler{}
 	clientCfg := change.NewClientDefaultConfig()
 	clientCfg.Logger = slog.New(errLog)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd,
-		applier.NewSingleTargetForTest(t, db), clientCfg)
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientCfg)
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t1new, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 
 	cutover, err := NewCutOver(db, []*cutoverConfig{{
@@ -498,18 +499,18 @@ func newConnectionLossCutover(t *testing.T, tableName string) (*CutOver, *sql.DB
 	original := table.NewTableInfo(db, cfg.DBName, tableName)
 	require.NoError(t, original.SetInfo(t.Context()))
 	replacement := table.NewTableInfo(db, cfg.DBName, newTableName)
+	appl := applier.NewSingleTargetForTest(t, db)
 	feed := change.NewBinlogClient(
 		db,
 		cfg.Addr,
 		cfg.User,
 		cfg.Passwd,
-		applier.NewSingleTargetForTest(t, db),
 		change.NewClientDefaultConfig(),
 	)
 	t.Cleanup(feed.Close)
 	chunker, err := table.NewChunker(original, table.ChunkerConfig{NewTable: replacement})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(original, replacement, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(original, replacement, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 
 	cutover, err := NewCutOver(db, []*cutoverConfig{{
@@ -558,11 +559,12 @@ func TestCutoverDeterministicErrorDoesNotVerify(t *testing.T) {
 	require.NoError(t, t1.SetInfo(t.Context()))
 	t1new := table.NewTableInfo(db, cfg.DBName, "_cutoverdeterr_new")
 	logger := slog.Default()
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t1new, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 
 	cutover, err := NewCutOver(db, []*cutoverConfig{
@@ -614,11 +616,12 @@ func TestMDLLockFails(t *testing.T) {
 	t1new := table.NewTableInfo(db, cfg.DBName, "_mdllocks_new")
 	t1old := "test_old"
 	logger := slog.Default()
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t1new, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 
 	cutoverConfig := []*cutoverConfig{
@@ -683,10 +686,11 @@ func TestInvalidOptions(t *testing.T) {
 	require.NoError(t, t1.SetInfo(t.Context()))
 	t1new := table.NewTableInfo(db, cfg.DBName, "_invalid_t1_new")
 	t1old := "test_old"
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t1new})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t1new, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t1new, chunker, appl)))
 
 	// Invalid options — nil table.
 	_, err = NewCutOver(db, []*cutoverConfig{{
@@ -1555,11 +1559,12 @@ func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
 			tbl := table.NewTableInfo(db, dbName, "lockchk")
 			require.NoError(t, tbl.SetInfo(t.Context()))
 			newTbl := table.NewTableInfo(db, dbName, "_lockchk_new")
-			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+			appl := applier.NewSingleTargetForTest(t, db)
+			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 			defer feed.Close()
 			chunker, err := table.NewChunker(tbl, table.ChunkerConfig{NewTable: newTbl})
 			require.NoError(t, err)
-			require.NoError(t, feed.AddSubscription(tbl, newTbl, chunker))
+			require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(tbl, newTbl, chunker, appl)))
 			require.NoError(t, feed.Start(t.Context()))
 
 			dbConfig := dbconn.NewDBConfig()

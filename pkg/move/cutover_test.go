@@ -61,7 +61,7 @@ func TestNewCutOverValidation(t *testing.T) {
 	cfg.CancelFunc = func(change.FatalReason) bool { return false }
 	srcConfig, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	replClient := change.NewBinlogClient(db, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+	replClient := change.NewBinlogClient(db, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
 
 	_, err = NewCutOver([]CutOverSource{{
 		DB:         db,
@@ -142,7 +142,7 @@ func TestCutOverSingleSource(t *testing.T) {
 
 	cfg := change.NewClientDefaultConfig()
 	cfg.CancelFunc = func(change.FatalReason) bool { return false }
-	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
 	require.NoError(t, replClient.Start(ctx))
 	defer replClient.Close()
 
@@ -225,7 +225,7 @@ func TestCutOverCancelAfterSwitchStillRenamesSource(t *testing.T) {
 			defer utils.CloseAndLog(replDB)
 			cfg := change.NewClientDefaultConfig()
 			cfg.CancelFunc = func(change.FatalReason) bool { return false }
-			replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+			replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
 			require.NoError(t, replClient.Start(t.Context()))
 			defer replClient.Close()
 
@@ -321,7 +321,7 @@ func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 
 	cfg := change.NewClientDefaultConfig()
 	cfg.CancelFunc = func(change.FatalReason) bool { return false }
-	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
 	require.NoError(t, replClient.Start(ctx))
 	defer replClient.Close()
 
@@ -735,7 +735,7 @@ func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
 			defer utils.CloseAndLog(replDB)
 			cfg := change.NewClientDefaultConfig()
 			cfg.CancelFunc = func(change.FatalReason) bool { return false }
-			replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+			replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
 			require.NoError(t, replClient.Start(ctx))
 			defer replClient.Close()
 

@@ -95,10 +95,10 @@ func TestBufferedMapVariableColumns(t *testing.T) {
 	}
 	applier, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, NewClientDefaultConfig()).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(srcTable, dstTable, chunker, applier)))
 	require.NoError(t, client.Start(t.Context()))
 
 	defer client.Close()
@@ -145,10 +145,10 @@ func TestBufferedMapIllegalValues(t *testing.T) {
 	}
 	applier, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, NewClientDefaultConfig()).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(srcTable, dstTable, chunker, applier)))
 	require.NoError(t, client.Start(t.Context()))
 
 	defer client.Close()
@@ -2109,10 +2109,10 @@ func TestBufferedMapWideRowsFlushSplitsStatements(t *testing.T) {
 	require.NoError(t, err)
 	counting := &applier.MockApplier{Inner: realApplier}
 
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, counting, NewClientDefaultConfig()).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(srcTable, dstTable, chunker, counting)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 

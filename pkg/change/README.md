@@ -11,6 +11,17 @@ primary keys it falls back to a FIFO queue *internally* once the watermark
 optimization is disabled, but row images are still preserved and the applier
 path is still used.
 
+The caller builds each subscription, not the `Source`: it passes
+`AddSubscription` a `SubscriptionFactory`, and the source calls it with its own
+`SubscriptionSettings` (flush-request channel, soft limits, flush shape, load
+signal). `BufferedSubscriptionFactory(currentTable, newTable, chunker, applier)`
+is the factory for the buffered map. The tables' full metadata, the chunker and
+the applier therefore never cross the `Source` interface; a subscription
+describes its tables to the source as `TableDescriptor`s (schema, name,
+columns, key columns). The binlog clients still need the full MySQL table
+metadata to decode row images, so they accept only a subscription that carries
+it — the buffered map — and refuse anything else at `AddSubscription`.
+
 ## Subscription Implementation
 
 ### Background
@@ -520,6 +531,12 @@ This park is unrelated to the [memory backpressure](#memory-backpressure) park, 
 - **DDL detection**: Monitors for schema changes and notifies the migration coordinator. This is used to abandon any schema changes if the table was externally modified. An `ALTER TABLE` that only adds or drops foreign keys on a subscription's new table is not treated as a change: it changes no column and no row, and the migration's experimental foreign key support writes such `ALTER`s to the binary log on every cutover attempt, so a run resumed after a failed attempt reads them after its checkpoint.
 
 ## Implementing a Source
+
+`AddSubscription` takes a factory. Call it with the source's
+`SubscriptionSettings` and register what it returns under the table in its
+`Tables()[0]`. If the source cannot use the subscription, or the table already
+has one, `Close` it before returning the error: it may already hold
+resources.
 
 `Source` is a wide interface, but two methods are shared machinery rather
 than per-backend work, and an implementation that rolls its own gets them subtly

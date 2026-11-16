@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -80,8 +79,6 @@ type feedCore struct {
 	// goroutine; writing streamer from any other goroutine while the reader
 	// runs would race.
 	streamer *replication.BinlogStreamer
-
-	applier applier.Applier
 
 	// subs owns the table-keyed subscription set and its own lock. See
 	// subscriptionRegistry. The client mutex above does NOT cover map
@@ -204,7 +201,7 @@ type flushFunc func(ctx context.Context, underLock bool, locks []*dbconn.TableLo
 // resolving the soft-limit defaults: zero selects the package default and a
 // negative value is an explicit opt-out (stored as zero, which disables the
 // cap). c must be the zero value embedded in a freshly allocated client.
-func (c *feedCore) configure(db *sql.DB, host, username, password string, appl applier.Applier, config *ClientConfig) {
+func (c *feedCore) configure(db *sql.DB, host, username, password string, config *ClientConfig) {
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig() // default DB config
 	}
@@ -231,7 +228,6 @@ func (c *feedCore) configure(db *sql.DB, host, username, password string, appl a
 	c.ddlFilterSchema = config.DDLFilterSchema
 	c.ddlFilterTables = toSet(config.DDLFilterTables)
 	c.serverID = config.ServerID
-	c.applier = appl
 	c.subscriptionSoftLimitBytes = softLimit
 	c.subscriptionSoftLimitChanges = softLimitChanges
 	c.flushConcurrency = config.resolveFlushConcurrency()
@@ -240,23 +236,22 @@ func (c *feedCore) configure(db *sql.DB, host, username, password string, appl a
 	c.flushRequests = make(chan Subscription, 1)
 }
 
-// AddSubscription adds a new subscription.
-// Returns an error if a subscription already exists for the given table.
+// binlogSubscription is a Subscription the binlog clients can feed: one that
+// carries its source table's MySQL metadata, which they decode each row image
+// with (ENUM/SET members, BINARY widths, the key's columns and types). The
+// in-tree buffered subscription is one. The method is unexported because that
+// metadata is this package's TableInfo, not part of the Subscription contract.
+type binlogSubscription interface {
+	Subscription
+	sourceTableInfo() *table.TableInfo
+}
+
+// AddSubscription builds a subscription with this client's settings and
+// registers it. Returns an error if a subscription already exists for its
+// table, or if it is not a binlogSubscription.
 // Satisfies Source interface.
-func (c *feedCore) AddSubscription(currentTable, newTable *table.TableInfo, chunker table.MappedChunker) error {
-	subKey := encodeSchemaTable(currentTable.SchemaName, currentTable.TableName)
-	// Build the buffered subscription via the shared public constructor so the
-	// in-tree clients and out-of-tree change.Source implementations
-	// (e.g. a VStream source) construct it the same way. The bufferedMap
-	// transparently handles a non-memory-comparable PK: once the watermark
-	// optimizations are disabled (copy done, checksum about to start) it acts
-	// like a FIFO queue, which is required because of collation edge cases
-	// (A == a on the server, but not in our map).
-	sub, err := NewBufferedSubscription(BufferedSubscriptionConfig{
-		CurrentTable:     currentTable,
-		NewTable:         newTable,
-		Applier:          c.applier,
-		Chunker:          chunker,
+func (c *feedCore) AddSubscription(newSubscription SubscriptionFactory) error {
+	sub, err := newSubscription(SubscriptionSettings{
 		Logger:           c.logger,
 		SoftLimitBytes:   c.subscriptionSoftLimitBytes,
 		SoftLimitChanges: c.subscriptionSoftLimitChanges,
@@ -266,10 +261,17 @@ func (c *feedCore) AddSubscription(currentTable, newTable *table.TableInfo, chun
 		UnderLoad:        c.underLoad,
 	})
 	if err != nil {
-		return fmt.Errorf("could not build subscription for table %s.%s: %w", currentTable.SchemaName, currentTable.TableName, err)
+		return fmt.Errorf("could not build subscription: %w", err)
 	}
-	if !c.subs.Add(subKey, sub) {
-		return fmt.Errorf("subscription already exists for table %s.%s", currentTable.SchemaName, currentTable.TableName)
+	bsub, ok := sub.(binlogSubscription)
+	if !ok {
+		sub.Close()
+		return fmt.Errorf("a binlog change source needs a subscription that carries its source table's MySQL metadata, such as BufferedSubscriptionFactory builds; got %T", sub)
+	}
+	tbl := bsub.sourceTableInfo()
+	if !c.subs.Add(encodeSchemaTable(tbl.SchemaName, tbl.TableName), sub) {
+		sub.Close()
+		return fmt.Errorf("subscription already exists for table %s.%s", tbl.SchemaName, tbl.TableName)
 	}
 	return nil
 }
@@ -396,14 +398,6 @@ func (c *feedCore) processDDL(schema, table string, foreignKeysOnly bool) {
 		matchFound := false
 		for _, sub := range c.subs.Snapshot() {
 			for i, tsub := range sub.Tables() { // currentTable, newTable
-				if tsub == nil {
-					// Defensive: in-tree subscriptions never emit nil
-					// entries (bufferedMap.Tables omits a nil newTable),
-					// but the interface can't guarantee it for other
-					// implementations, and a DDL notification must never
-					// crash the stream reader.
-					continue
-				}
 				if tsub.SchemaName == schema && tsub.TableName == table && (i == 0 || !foreignKeysOnly) {
 					matchFound = true
 					break
@@ -819,7 +813,12 @@ func (c *feedCore) processRowsEvent(ev *replication.BinlogEvent, e *replication.
 		return fmt.Errorf("%w for table %s.%s", unsupportedRowsEventError(ev.Header.EventType), string(e.Table.Schema), string(e.Table.Table))
 	}
 
-	tbl := sub.Tables()[0]
+	bsub, ok := sub.(binlogSubscription)
+	if !ok {
+		// AddSubscription admits nothing else.
+		return fmt.Errorf("subscription for table %s.%s is a %T, not a binlogSubscription", string(e.Table.Schema), string(e.Table.Table), sub)
+	}
+	tbl := bsub.sourceTableInfo()
 
 	// Decode ENUM ordinals / SET bitmasks back to their string form and
 	// re-pad BINARY(N) values (MySQL strips trailing 0x00 from the row

@@ -23,7 +23,7 @@ import (
 //     from it applies a write made after the capture. This proves the string is
 //     both correctly formatted for the implementation and points at "now",
 //     without asserting on the opaque encoding itself.
-func currentPositionRoundTrip(t *testing.T, prefix string, newClient func(db *sql.DB, host, user, pass string, appl applier.Applier, cfg *ClientConfig) Source) {
+func currentPositionRoundTrip(t *testing.T, prefix string, newClient func(db *sql.DB, host, user, pass string, cfg *ClientConfig) Source) {
 	t.Helper()
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
@@ -41,11 +41,11 @@ func currentPositionRoundTrip(t *testing.T, prefix string, newClient func(db *sq
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := newClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
+	client := newClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 	defer client.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, applier.NewSingleTargetForTest(t, db))))
 
 	// (1) Unstarted feed: no progress, but a live head is readable.
 	require.Empty(t, client.Position(), "Position() must be empty before the feed starts")

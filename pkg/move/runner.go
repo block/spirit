@@ -1271,7 +1271,7 @@ func (r *Runner) buildReplClients(ctx context.Context, resumePositions map[strin
 	r.logger.Debug("Setting up repl clients", "sourceCount", len(r.sources))
 	for i := range r.sources {
 		src := &r.sources[i]
-		client, err := change.NewAutoClient(ctx, src.db, src.config.Addr, src.config.User, src.config.Passwd, r.applier, r.replClientConfig(src), resumePositions[src.sourceKey()])
+		client, err := change.NewAutoClient(ctx, src.db, src.config.Addr, src.config.User, src.config.Passwd, r.replClientConfig(src), resumePositions[src.sourceKey()])
 		if err != nil {
 			return fmt.Errorf("source %d: %w", i, err)
 		}
@@ -1385,7 +1385,7 @@ func (r *Runner) buildChunkers() error {
 			if err != nil {
 				return err
 			}
-			if err := r.sources[i].replClient.AddSubscription(tbl, nil, copyChunker); err != nil {
+			if err := r.sources[i].replClient.AddSubscription(change.BufferedSubscriptionFactory(tbl, nil, copyChunker, r.applier)); err != nil {
 				return err
 			}
 			checksumChunker, err := table.NewChunker(tbl, chunkerCfg)

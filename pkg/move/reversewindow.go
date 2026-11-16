@@ -60,7 +60,7 @@ func targetCurrentPosition(ctx context.Context, r *Runner, tgt *applier.Target) 
 	cfg := change.NewClientDefaultConfig()
 	cfg.Logger = r.logger
 	cfg.DBConfig = r.dbConfig
-	src, err := change.NewAutoClient(ctx, tgt.DB, tgt.Config.Addr, tgt.Config.User, tgt.Config.Passwd, nil, cfg, "")
+	src, err := change.NewAutoClient(ctx, tgt.DB, tgt.Config.Addr, tgt.Config.User, tgt.Config.Passwd, cfg, "")
 	if err != nil {
 		return "", err
 	}

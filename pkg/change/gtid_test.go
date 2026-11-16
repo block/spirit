@@ -84,13 +84,13 @@ func TestRowsEventDecodeFuncSkipsUnsubscribed(t *testing.T) {
 			testutils.RunSQL(t, "DELETE FROM decodefilter_noise")
 			var client Source
 			if mode == "gtid" {
-				client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
+				client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 			} else {
-				client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig())
+				client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig())
 			}
 			chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 			require.NoError(t, err)
-			require.NoError(t, client.AddSubscription(t1, t2, chunker))
+			require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, applier.NewSingleTargetForTest(t, db))))
 			require.NoError(t, client.Start(t.Context()))
 			defer client.Close()
 
@@ -134,10 +134,11 @@ func TestGTIDClient(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -180,10 +181,11 @@ func TestGTIDClientTransactionCompression(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -254,10 +256,11 @@ func TestGTIDStartFromMalformedPosition(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 
 	// A non-GTID input (e.g. a legacy file:offset checkpoint) is the
 	// most likely real-world trigger for this branch.
@@ -405,10 +408,11 @@ func TestGTIDResumeAfterGTIDHistoryRegression(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, flushed.Update(extra))
 
-			client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+			appl := applier.NewSingleTargetForTest(t, db)
+			client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 			chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 			require.NoError(t, err)
-			require.NoError(t, client.AddSubscription(t1, t2, chunker))
+			require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 
 			err = client.StartFromPosition(t.Context(), flushed.String())
 			require.ErrorIs(t, err, ErrPositionNotFound)
@@ -459,10 +463,11 @@ func TestGTIDClientUnparseableDDL(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -539,10 +544,11 @@ func TestGTIDClientNonXIDCommit(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -701,10 +707,11 @@ func TestGTIDClientXATransaction(t *testing.T) {
 			gotReason.Store(int64(reason))
 			return true
 		}
-		client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
+		appl := applier.NewSingleTargetForTest(t, db)
+		client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*gtidClient)
 		chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 		require.NoError(t, err)
-		require.NoError(t, client.AddSubscription(t1, t2, chunker))
+		require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 		require.NoError(t, client.Start(t.Context()))
 		return client, &gotReason
 	}
@@ -832,10 +839,11 @@ func TestGTIDClientXATransactionCompression(t *testing.T) {
 		gotReason.Store(int64(reason))
 		return true
 	}
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -947,10 +955,11 @@ func TestGTIDClientXAGuardStream(t *testing.T) {
 			gotReason.Store(int64(reason))
 			return true
 		}
-		client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
+		appl := applier.NewSingleTargetForTest(t, db)
+		client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*gtidClient)
 		chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 		require.NoError(t, err)
-		require.NoError(t, client.AddSubscription(t1, t2, chunker))
+		require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 
 		empty, err := mysql.ParseMysqlGTIDSet("")
 		require.NoError(t, err)
@@ -1114,10 +1123,11 @@ func TestGTIDProcessTransactionPayloadXAGuard(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	defer client.Close()
 
 	// A compressed XA prepare group as go-mysql decompresses it: the
@@ -1189,10 +1199,11 @@ func TestGTIDClientSavepointPromotionOrdering(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 
 	// Wire readStream to a synthetic streamer instead of client.Start().
 	empty, err := mysql.ParseMysqlGTIDSet("")
@@ -1327,10 +1338,11 @@ func TestGTIDClientSavepointTransaction(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -1440,10 +1452,11 @@ func TestGTIDClientQueryPromotionOrdering(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 
 	// Wire readStream to a synthetic streamer instead of client.Start().
 	empty, err := mysql.ParseMysqlGTIDSet("")
@@ -1604,10 +1617,11 @@ func TestGTIDClientCreateTableAsSelect(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -1763,10 +1777,11 @@ func TestGTIDRoundtripPosition(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -1776,10 +1791,11 @@ func TestGTIDRoundtripPosition(t *testing.T) {
 	// Spin up a second client and have it resume from the first's
 	// position. The validate path checks the position against
 	// @@GLOBAL.gtid_purged — on a healthy server this should succeed.
-	client2 := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl2 := applier.NewSingleTargetForTest(t, db)
+	client2 := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker2, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client2.AddSubscription(t1, t2, chunker2))
+	require.NoError(t, client2.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker2, appl2)))
 	require.NoError(t, client2.StartFromPosition(t.Context(), pos))
 	client2.Close()
 }
@@ -1850,10 +1866,11 @@ func TestGTIDProcessRowsEventUnknownSubtype(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	defer client.Close()
 
 	mkEvent := func(et replication.EventType, tbl string, pk int32) (*replication.BinlogEvent, *replication.RowsEvent) {

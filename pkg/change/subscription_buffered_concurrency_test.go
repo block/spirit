@@ -565,11 +565,11 @@ func TestPeriodicFlushPrioritizesParkedSubscription(t *testing.T) {
 	realApplier, err := applier.New([]applier.Target{{DB: db, KeyRange: "0", Config: cfg}}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 	rec := &orderRecordingApplier{Applier: realApplier}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, rec, NewClientDefaultConfig()).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	for _, pair := range []struct{ src, dst *table.TableInfo }{{srcA, dstA}, {srcB, dstB}} {
 		chunker, err := table.NewChunker(pair.src, table.ChunkerConfig{NewTable: pair.dst})
 		require.NoError(t, err)
-		require.NoError(t, client.AddSubscription(pair.src, pair.dst, chunker))
+		require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(pair.src, pair.dst, chunker, rec)))
 	}
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
@@ -821,18 +821,20 @@ func TestFlushConcurrencyClientPlumbing(t *testing.T) {
 
 			cfg := NewClientDefaultConfig()
 			cfg.FlushConcurrency = tc.cfg
-			bc := NewBinlogClient(nil, "localhost", "user", "pass", &applier.MockApplier{}, cfg).(*binlogClient)
+			appl := &applier.MockApplier{}
+			bc := NewBinlogClient(nil, "localhost", "user", "pass", cfg).(*binlogClient)
 			require.Equal(t, tc.want, bc.flushConcurrency)
-			require.NoError(t, bc.AddSubscription(current, nil, table.NewMockChunker("plumbing", 1000)))
+			require.NoError(t, bc.AddSubscription(BufferedSubscriptionFactory(current, nil, table.NewMockChunker("plumbing", 1000), appl)))
 			bsubs := bc.subs.Snapshot()
 			require.Len(t, bsubs, 1)
 			require.Equal(t, tc.want, bsubs[0].(*bufferedMap).flushConcurrency)
 
 			gcfg := NewClientDefaultConfig()
 			gcfg.FlushConcurrency = tc.cfg
-			gc := NewGTIDClient(nil, "localhost", "user", "pass", &applier.MockApplier{}, gcfg).(*gtidClient)
+			appl2 := &applier.MockApplier{}
+			gc := NewGTIDClient(nil, "localhost", "user", "pass", gcfg).(*gtidClient)
 			require.Equal(t, tc.want, gc.flushConcurrency)
-			require.NoError(t, gc.AddSubscription(current, nil, table.NewMockChunker("plumbing", 1000)))
+			require.NoError(t, gc.AddSubscription(BufferedSubscriptionFactory(current, nil, table.NewMockChunker("plumbing", 1000), appl2)))
 			gsubs := gc.subs.Snapshot()
 			require.Len(t, gsubs, 1)
 			require.Equal(t, tc.want, gsubs[0].(*bufferedMap).flushConcurrency)

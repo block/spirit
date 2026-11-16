@@ -33,11 +33,11 @@ func TestCloseJoinsPeriodicFlush(t *testing.T) {
 			var requests chan Subscription
 			var flushDone func() chan struct{}
 			if name == "binlog" {
-				c := NewBinlogClient(nil, "", "", "", nil, NewClientDefaultConfig()).(*binlogClient)
+				c := NewBinlogClient(nil, "", "", "", NewClientDefaultConfig()).(*binlogClient)
 				client, requests = c, c.flushRequests
 				flushDone = func() chan struct{} { return c.periodicFlushDone }
 			} else {
-				c := NewGTIDClient(nil, "", "", "", nil, NewClientDefaultConfig()).(*gtidClient)
+				c := NewGTIDClient(nil, "", "", "", NewClientDefaultConfig()).(*gtidClient)
 				client, requests = c, c.flushRequests
 				flushDone = func() chan struct{} { return c.periodicFlushDone }
 			}

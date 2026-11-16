@@ -51,10 +51,11 @@ func TestReplClient(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -96,7 +97,8 @@ func TestReplClientComplex(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: time.Second})
 	require.NoError(t, err)
@@ -106,7 +108,7 @@ func TestReplClientComplex(t *testing.T) {
 	_, err = copier.NewCopier(chunker, copierCfg)
 	require.NoError(t, err)
 	// Attach copier's keyabovewatermark to the repl client
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 	require.NoError(t, client.SetWatermarkOptimization(t.Context(), true))
@@ -217,10 +219,11 @@ func TestReplClientTransactionCompression(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -281,10 +284,11 @@ func TestReplClientResumeFromImpossible(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	err = client.StartFromPosition(t.Context(), "impossible:12345")
 	require.Error(t, err)
 }
@@ -305,10 +309,11 @@ func TestReplClientResumeFromPoint(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	pos, err := client.getCurrentBinlogPosition(t.Context())
 	require.NoError(t, err)
 	pos.Pos = 4
@@ -339,10 +344,11 @@ func TestReplClientOpts(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.Equal(t, 0, db.Stats().InUse) // no connections in use.
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
@@ -415,11 +421,11 @@ func TestPeriodicFlushLifecycle(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd,
-		applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -507,7 +513,8 @@ func TestReplClientQueue(t *testing.T) {
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: 1000})
 	require.NoError(t, err)
@@ -517,7 +524,7 @@ func TestReplClientQueue(t *testing.T) {
 	_, err = copier.NewCopier(chunker, copierCfg)
 	require.NoError(t, err)
 	// Attach chunker's keyabovewatermark to the repl client
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -579,10 +586,11 @@ func TestBlockWait(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -632,10 +640,11 @@ func TestDDLNotification(t *testing.T) {
 		cancelled <- reason
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -661,10 +670,10 @@ func TestDDLNotificationTriggerAndForeignKey(t *testing.T) {
 
 	clients := map[string]func(*sql.DB, *ClientConfig) Source{
 		"binlog": func(db *sql.DB, c *ClientConfig) Source {
-			return NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), c)
+			return NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, c)
 		},
 		"gtid": func(db *sql.DB, c *ClientConfig) Source {
-			return NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), c)
+			return NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, c)
 		},
 	}
 	ddls := map[string]string{
@@ -697,7 +706,7 @@ func TestDDLNotificationTriggerAndForeignKey(t *testing.T) {
 				client := newClient(db, clientConfig)
 				chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 				require.NoError(t, err)
-				require.NoError(t, client.AddSubscription(t1, t2, chunker))
+				require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, applier.NewSingleTargetForTest(t, db))))
 				require.NoError(t, client.Start(t.Context()))
 				defer client.Close()
 
@@ -742,10 +751,11 @@ func TestDDLNotificationTransactionCompression(t *testing.T) {
 		cancelled <- reason
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -815,10 +825,11 @@ func TestBinlogClientXATransactionGuard(t *testing.T) {
 		gotReason.Store(int64(reason))
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -882,10 +893,11 @@ func TestBinlogProcessTransactionPayloadXAGuard(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	defer client.Close()
 
 	// A compressed XA prepare group as go-mysql decompresses it: the
@@ -934,7 +946,7 @@ func TestBinlogClientXAPrepareEventGuard(t *testing.T) {
 		gotReason.Store(int64(reason))
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	streamer := replication.NewBinlogStreamer()
 	ctx, cancel := context.WithCancel(t.Context())
 	client.streamer = streamer
@@ -1001,12 +1013,13 @@ func TestCompositePKUpdate(t *testing.T) {
 	// Create replication client
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 
 	// Add subscription - note that keyAboveWatermark is disabled for composite PKs
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -1189,7 +1202,7 @@ func (s *gatedSubscription) Flush(_ context.Context, _ bool, _ []*dbconn.TableLo
 	<-<-s.gates
 	return true, nil
 }
-func (s *gatedSubscription) Tables() []*table.TableInfo                           { return nil }
+func (s *gatedSubscription) Tables() []TableDescriptor                            { return nil }
 func (s *gatedSubscription) ImmutableColumnOrdinal() int                          { return -1 }
 func (s *gatedSubscription) SetWatermarkOptimization(context.Context, bool) error { return nil }
 func (s *gatedSubscription) Close()                                               {}
@@ -1384,10 +1397,11 @@ func TestRecreateStreamerSkipsFlushedReplay(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -1526,10 +1540,11 @@ func TestMaxRecreateAttemptsError(t *testing.T) {
 		cancel()
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(ctx))
 
 	// Ensure we are no longer on the initial binary log.
@@ -1748,10 +1763,11 @@ func TestFlushResidual(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -1824,10 +1840,11 @@ func newWraparoundTestClient(t *testing.T, srcName, dstName string) (*binlogClie
 		gotReason.Store(int64(reason))
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 
 	streamer := replication.NewBinlogStreamer()
 	client.streamer = streamer

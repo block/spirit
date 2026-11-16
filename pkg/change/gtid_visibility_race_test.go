@@ -143,10 +143,11 @@ func TestKeyAboveWatermarkVisibilityWindow(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(srcTable, dstTable, chunker, appl)))
 	require.NoError(t, client.Start(ctx))
 	defer client.Close()
 

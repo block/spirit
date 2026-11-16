@@ -55,10 +55,11 @@ func TestImmutableColumnUpdateFatal(t *testing.T) {
 		}
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -116,11 +117,12 @@ func TestImmutableColumnUpdateFatalGTID(t *testing.T) {
 		}
 		return true
 	}
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{})
 	require.NoError(t, err)
 	// Subscribe move-style: no new table, source and destination share a schema.
-	require.NoError(t, client.AddSubscription(t1, nil, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, nil, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -183,10 +185,11 @@ func TestImmutableColumnUnconfigured(t *testing.T) {
 		}
 		return true
 	}
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -218,10 +221,11 @@ func TestImmutableColumnMissingAtSetup(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{})
 	require.NoError(t, err)
-	err = client.AddSubscription(t1, nil, chunker)
+	err = client.AddSubscription(BufferedSubscriptionFactory(t1, nil, chunker, appl))
 	require.Error(t, err)
 	require.ErrorContains(t, err, "does_not_exist")
 	require.ErrorContains(t, err, "not found in columns")
@@ -262,8 +266,9 @@ func TestProcessRowsEventImmutableColumn(t *testing.T) {
 	}
 
 	// The clients are never started; we drive processRowsEvent directly.
-	binlogC := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
-	gtidC := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	binlogC := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
+	gtidC := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 
 	process := map[string]func(*replication.BinlogEvent, *replication.RowsEvent) error{
 		"binlog": binlogC.processRowsEvent,
@@ -272,10 +277,10 @@ func TestProcessRowsEventImmutableColumn(t *testing.T) {
 	for _, client := range []Source{binlogC, gtidC} {
 		chunker1, err := table.NewChunker(t1, table.ChunkerConfig{})
 		require.NoError(t, err)
-		require.NoError(t, client.AddSubscription(t1, nil, chunker1))
+		require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, nil, chunker1, appl)))
 		chunker2, err := table.NewChunker(t2, table.ChunkerConfig{})
 		require.NoError(t, err)
-		require.NoError(t, client.AddSubscription(t2, nil, chunker2))
+		require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t2, nil, chunker2, appl)))
 	}
 
 	for name, processRowsEvent := range process {

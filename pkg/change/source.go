@@ -3,10 +3,10 @@ package change
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/block/spirit/pkg/table"
 )
 
 // ErrPositionNotFound is returned by StartFromPosition when the
@@ -45,11 +45,17 @@ var ErrPositionNotFound = errors.New("change.Source: cannot resume from position
 // (file+offset, GTID, VStream position, etc.) without leaking to
 // callers.
 type Source interface {
-	// AddSubscription constructs a bufferedMap from (currentTable,
-	// newTable, chunker) and registers it. ROW events matching the
-	// registered (schema, table) pair are pushed to the subscription's
+	// AddSubscription builds a subscription by calling newSubscription with
+	// this source's SubscriptionSettings, and registers it. Row changes to
+	// the subscription's first table (Tables()[0]) are pushed to its
 	// HasChanged. Must be called before Start / StartFromPosition.
-	AddSubscription(currentTable, newTable *table.TableInfo, chunker table.MappedChunker) error
+	//
+	// The caller builds the subscription, through the factory, because the
+	// caller holds what it is made of: the tables' full metadata, the chunker
+	// and the applier. The source supplies only the settings that are its
+	// own. BufferedSubscriptionFactory is the factory for the in-tree
+	// subscription.
+	AddSubscription(newSubscription SubscriptionFactory) error
 
 	// Start begins streaming from the current source head and spawns the
 	// reader goroutine. Returns once the reader is running; the stream
@@ -196,6 +202,62 @@ type Source interface {
 	// Safe to call more than once.
 	Close()
 }
+
+// SubscriptionSettings are what a Source supplies to each subscription it
+// builds: where it is asked for a flush, how much it may buffer before the
+// reader waits, and the shape of its flushes. They belong to the Source because
+// they describe how the source's reader and flush loop drive the subscription,
+// not the tables or the target.
+type SubscriptionSettings struct {
+	// Logger receives diagnostic events. Defaults to slog.Default()
+	// when nil.
+	Logger *slog.Logger
+
+	// SoftLimitBytes is the per-subscription byte cap before
+	// HasChanged blocks waiting on the flush path. Zero disables the
+	// cap. See bufferedMap.softLimitBytes for the semantics.
+	SoftLimitBytes int64
+
+	// SoftLimitChanges is the per-subscription cap on pending change
+	// *count* before HasChanged parks, applied alongside SoftLimitBytes;
+	// whichever binds first parks the reader. Zero disables it. See
+	// bufferedMap.overSoftLimitLocked for why both exist.
+	SoftLimitChanges int
+
+	// FlushRequest, when non-nil, receives the parked subscription (a
+	// non-blocking send) each time HasChanged parks on the soft limit.
+	// Owners that flush on a periodic ticker should select on it and
+	// flush the received subscription first, then run their normal
+	// all-subscription pass — flushing others first would leave the
+	// change reader parked for those entire drains. Optional; nil
+	// disables the signal.
+	FlushRequest chan<- Subscription
+
+	// FlushConcurrency is the maximum number of applier batches a
+	// map-mode flush keeps in flight concurrently. Zero or negative
+	// means serial, preserving prior behaviour for callers that do not
+	// set it; the in-tree clients pass DefaultFlushConcurrency. Queue-
+	// mode and under-lock flushes are always serial regardless.
+	FlushConcurrency int
+
+	// BatchSize is the maximum number of rows one flush batch renders
+	// into a single statement. Zero means DefaultBatchSize, preserving
+	// prior behaviour for callers that do not set it.
+	//
+	// It is not independent of FlushConcurrency: their product is the
+	// rows a drain has in flight, so a caller raising one should lower
+	// the other. autoscale.FlushBounds returns the pair.
+	BatchSize int
+
+	// UnderLoad is ClientConfig.UnderLoad: the server-load signal the drain
+	// narrows itself on. Optional; nil disables load shedding entirely.
+	UnderLoad func() bool
+}
+
+// SubscriptionFactory builds a subscription with a Source's settings. The
+// caller's closure holds everything else the subscription is made of, so the
+// Source sees neither the target's metadata nor how changes are written.
+type SubscriptionFactory func(SubscriptionSettings) (Subscription, error)
 
 // ParkableSource is a Source that can hold its reader at a chosen change. It is
 // optional: the lockless checksum asks for it with a type assertion and, from a

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/block/spirit/pkg/applier"
 	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
@@ -80,7 +79,7 @@ func useGTIDForResume(resumePosition string, gtidEnabled bool) (bool, error) {
 //
 // The remaining arguments mirror NewBinlogClient / NewGTIDClient, which this
 // delegates to. The chosen implementation is logged on config.Logger.
-func NewAutoClient(ctx context.Context, db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig, resumePosition string) (Source, error) {
+func NewAutoClient(ctx context.Context, db *sql.DB, host string, username, password string, config *ClientConfig, resumePosition string) (Source, error) {
 	gtidEnabled, err := GTIDEnabled(ctx, db)
 	if err != nil {
 		return nil, err
@@ -107,7 +106,7 @@ func NewAutoClient(ctx context.Context, db *sql.DB, host string, username, passw
 		}
 	}
 	if useGTID {
-		return NewGTIDClient(db, host, username, password, appl, config), nil
+		return NewGTIDClient(db, host, username, password, config), nil
 	}
-	return NewBinlogClient(db, host, username, password, appl, config), nil
+	return NewBinlogClient(db, host, username, password, config), nil
 }

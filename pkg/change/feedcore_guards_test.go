@@ -27,12 +27,13 @@ func TestFeedCoreProcessRowsEventGuards(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	binlogC := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
-	gtidC := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	binlogC := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
+	gtidC := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	for _, c := range []Source{binlogC, gtidC} {
 		chunker, err := table.NewChunker(t1, table.ChunkerConfig{})
 		require.NoError(t, err)
-		require.NoError(t, c.AddSubscription(t1, nil, chunker))
+		require.NoError(t, c.AddSubscription(BufferedSubscriptionFactory(t1, nil, chunker, appl)))
 	}
 	clients := map[string]struct {
 		process func(*replication.BinlogEvent, *replication.RowsEvent) error
@@ -75,10 +76,10 @@ func TestFeedCoreProcessRowsEventGuards(t *testing.T) {
 func TestFeedCorePrepareSyncerConfig(t *testing.T) {
 	for name, ctor := range map[string]func(*ClientConfig) *feedCore{
 		"binlog": func(c *ClientConfig) *feedCore {
-			return &NewBinlogClient(nil, "db.example.test:3307", "u", "p", nil, c).(*binlogClient).feedCore
+			return &NewBinlogClient(nil, "db.example.test:3307", "u", "p", c).(*binlogClient).feedCore
 		},
 		"gtid": func(c *ClientConfig) *feedCore {
-			return &NewGTIDClient(nil, "db.example.test:3307", "u", "p", nil, c).(*gtidClient).feedCore
+			return &NewGTIDClient(nil, "db.example.test:3307", "u", "p", c).(*gtidClient).feedCore
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

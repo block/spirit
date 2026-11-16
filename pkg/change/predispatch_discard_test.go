@@ -56,17 +56,17 @@ const (
 // Every case runs on both chunkers (optimistic and composite), with and
 // without the table.BufferedKeyNoter capability, and with both clients.
 func TestPreDispatchChangeThenAboveHighWatermark(t *testing.T) {
-	clients := map[string]func(t *testing.T, db *sql.DB, appl applier.Applier) preDispatchClient{
-		"binlog": func(t *testing.T, db *sql.DB, appl applier.Applier) preDispatchClient {
+	clients := map[string]func(t *testing.T, db *sql.DB) preDispatchClient{
+		"binlog": func(t *testing.T, db *sql.DB) preDispatchClient {
 			cfg, err := mysql2.ParseDSN(testutils.DSN())
 			require.NoError(t, err)
-			return NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, appl, NewClientDefaultConfig()).(*binlogClient)
+			return NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 		},
-		"gtid": func(t *testing.T, db *sql.DB, appl applier.Applier) preDispatchClient {
+		"gtid": func(t *testing.T, db *sql.DB) preDispatchClient {
 			skipUnlessGTIDEnabled(t)
 			cfg, err := mysql2.ParseDSN(testutils.DSN())
 			require.NoError(t, err)
-			return NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, appl, NewClientDefaultConfig()).(*gtidClient)
+			return NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 		},
 	}
 	timings := []preDispatchTiming{firstStillBuffered, firstFlushedBeforeDispatch, firstFlushedBeforeOptimization}
@@ -139,7 +139,7 @@ func subscriptionOf(t *testing.T, client preDispatchClient, schema, tbl string) 
 
 // runPreDispatchScenario runs the sequence described on
 // TestPreDispatchChangeThenAboveHighWatermark for one preDispatchCase.
-func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, applier.Applier) preDispatchClient, c preDispatchCase) {
+func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB) preDispatchClient, c preDispatchCase) {
 	timing, secondIsDelete, hideNoter := c.timing, c.secondIsDelete, c.hideNoter
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
@@ -170,7 +170,7 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 	appl := applier.NewSingleTargetForTest(t, db)
 	// CopyChunk starts the applier's workers and leaves them running.
 	defer func() { require.NoError(t, appl.Stop()) }()
-	client := newClient(t, db, appl)
+	client := newClient(t, db)
 
 	chunker, err := table.NewChunker(src, table.ChunkerConfig{NewTable: dst, TargetChunkTime: time.Second})
 	require.NoError(t, err)
@@ -186,7 +186,7 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 		_, ok := subChunker.(table.BufferedKeyNoter)
 		require.False(t, ok)
 	}
-	require.NoError(t, client.AddSubscription(src, dst, subChunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(src, dst, subChunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 	sub := subscriptionOf(t, client, "test", "predisp_src")

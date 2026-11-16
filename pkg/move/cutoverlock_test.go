@@ -36,7 +36,7 @@ func lockTimeoutCutover(t *testing.T, ctx context.Context, maxRetries int, logge
 	t.Cleanup(func() { utils.CloseAndLog(replDB) })
 	cfg := change.NewClientDefaultConfig()
 	cfg.CancelFunc = func(change.FatalReason) bool { return false }
-	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, nil, cfg)
+	replClient := change.NewBinlogClient(replDB, srcConfig.Addr, srcConfig.User, srcConfig.Passwd, cfg)
 	require.NoError(t, replClient.Start(ctx))
 	t.Cleanup(replClient.Close)
 

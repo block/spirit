@@ -67,15 +67,15 @@ func (f *parityFixture) start(t *testing.T, name string) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(f.db, cfg.Addr, cfg.User, cfg.Passwd,
-		applier.NewSingleTargetForTest(t, f.db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, f.db)
+	feed := change.NewBinlogClient(f.db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	t.Cleanup(feed.Close)
 	f.feed = feed
 
 	chunker, err := table.NewChunker(f.source, table.ChunkerConfig{NewTable: f.target})
 	require.NoError(t, err)
 	f.chunker = chunker
-	require.NoError(t, feed.AddSubscription(f.source, f.target, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(f.source, f.target, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, f.chunker.Open())
 }

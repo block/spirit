@@ -42,11 +42,12 @@ func TestJSONChecksumDecimalTypeDegradation(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -103,11 +104,12 @@ func TestJSONChecksumFullMantissaTextImage(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -179,11 +181,11 @@ func TestDistributedJSONChecksumTextImage(t *testing.T) {
 	app, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
-	feed := change.NewBinlogClient(src, cfg.Addr, cfg.User, cfg.Passwd, app, change.NewClientDefaultConfig())
+	feed := change.NewBinlogClient(src, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, app)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -241,11 +243,12 @@ func TestJSONChecksumMisparsedDoubleRepairConverges(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -307,11 +310,12 @@ func TestJSONChecksumDecimalGenuineMismatchStillCaught(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -349,11 +353,12 @@ func TestJSONChecksumTextToJSONConversion(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 

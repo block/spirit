@@ -41,11 +41,11 @@ func newRepairFixture(t *testing.T, srcName, dstName string, renames map[string]
 	// One applier for both the feed and the repairs, which is how the migration
 	// runner wires it: a repair Start/Stops the same applier the feed is using.
 	app := applier.NewSingleTargetForTest(t, db)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, app, change.NewClientDefaultConfig())
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	t.Cleanup(feed.Close)
 	chunker, err := table.NewChunker(src, table.ChunkerConfig{NewTable: dst, ColumnMapping: mapping})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(src, dst, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(src, dst, chunker, app)))
 	require.NoError(t, feed.Start(t.Context()))
 
 	config := NewCheckerDefaultConfig()

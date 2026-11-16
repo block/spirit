@@ -929,17 +929,17 @@ func (r *Runner) setupCopierCheckerAndReplClient(ctx context.Context, resumePosi
 	// checkpoint was written in (resumePosition), and a fresh one uses GTIDs
 	// whenever the server has them enabled.
 	replConfig := r.replClientConfig(r.autoscale.FlushConcurrency, r.autoscale.FlushBatchSize)
-	r.replClient, err = change.NewAutoClient(ctx, r.db, r.migration.Host, r.migration.Username, *r.migration.Password, appl, replConfig, resumePosition)
+	r.replClient, err = change.NewAutoClient(ctx, r.db, r.migration.Host, r.migration.Username, *r.migration.Password, replConfig, resumePosition)
 	if err != nil {
 		return err
 	}
 	// For each of the changes, we know the new table exists now
 	// So we should call SetInfo to populate the columns etc.
-	for _, change := range r.changes {
-		if err := change.newTable.SetInfo(ctx); err != nil {
+	for _, ch := range r.changes {
+		if err := ch.newTable.SetInfo(ctx); err != nil {
 			return err
 		}
-		if err := r.replClient.AddSubscription(change.table, change.newTable, change.chunker); err != nil {
+		if err := r.replClient.AddSubscription(change.BufferedSubscriptionFactory(ch.table, ch.newTable, ch.chunker, appl)); err != nil {
 			return err
 		}
 	}

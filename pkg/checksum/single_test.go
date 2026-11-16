@@ -67,11 +67,12 @@ func TestBasicChecksum(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 	checker, err := NewChecker([]*sql.DB{db}, chunker, []change.Source{feed}, newTestCheckerConfig(t, db))
@@ -99,11 +100,12 @@ func TestBasicValidation(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 
 	_, err = NewChecker(nil, chunker, []change.Source{feed}, newTestCheckerConfig(t, db)) // no source DBs
@@ -165,11 +167,12 @@ func TestUnfixableUniqueChecksum(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -205,11 +208,12 @@ func TestFixCorrupt(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -263,11 +267,12 @@ func TestRetryDoesNotVacuouslyPass(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -407,11 +412,12 @@ func TestRunDifferencesExhaustedNeedsARepairReread(t *testing.T) {
 
 			cfg, err := mysql.ParseDSN(testutils.DSN())
 			require.NoError(t, err)
-			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+			appl := applier.NewSingleTargetForTest(t, db)
+			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 			defer feed.Close()
 			chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 			require.NoError(t, err)
-			require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+			require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 			require.NoError(t, feed.Start(t.Context()))
 			require.NoError(t, chunker.Open())
 
@@ -462,11 +468,12 @@ func TestRunResetsPriorInvalidState(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -503,11 +510,12 @@ func TestCorruptChecksum(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -545,11 +553,12 @@ func TestCorruptBinaryChecksum(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -580,11 +589,12 @@ func TestBoundaryCases(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -651,11 +661,12 @@ func TestChangeDataTypeDatetime(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -687,13 +698,14 @@ func TestYieldTimeout(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	// A 100ms target (not ChunkerDefaultTarget, which is 5s) keeps the chunks
 	// small, so the pass is long enough for the yield timeout below to fire.
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2, TargetChunkTime: 100 * time.Millisecond})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -757,9 +769,10 @@ func TestFromWatermark(t *testing.T) {
 	defer utils.CloseAndLog(resumed)
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
-	require.NoError(t, feed.AddSubscription(t1, t2, resumed))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, resumed, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	config := newTestCheckerConfig(t, db)
 	config.Watermark = watermark
@@ -803,11 +816,12 @@ func TestColumnBoundaryShift(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -847,11 +861,12 @@ func TestChecksumChunkReleasesTrxDuringRepair(t *testing.T) {
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	defer feed.Close()
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -989,11 +1004,12 @@ func checksumRetryHarness(t *testing.T, name string, mutateSQL string) (*flakyCh
 
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+	appl := applier.NewSingleTargetForTest(t, db)
+	feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 	inner, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
 	chunker := &flakyChunker{MappedChunker: inner, failAtCall: 3}
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 
@@ -1134,11 +1150,12 @@ func TestChecksumCancelledMidAttempt(t *testing.T) {
 
 			cfg, err := mysql.ParseDSN(testutils.DSN())
 			require.NoError(t, err)
-			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+			appl := applier.NewSingleTargetForTest(t, db)
+			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 			defer feed.Close()
 			chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 			require.NoError(t, err)
-			require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+			require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 			require.NoError(t, feed.Start(t.Context()))
 			require.NoError(t, chunker.Open())
 
@@ -1224,11 +1241,12 @@ func TestChecksumTypeConversions(t *testing.T) {
 
 			cfg, err := mysql.ParseDSN(testutils.DSN())
 			require.NoError(t, err)
-			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), change.NewClientDefaultConfig())
+			appl := applier.NewSingleTargetForTest(t, db)
+			feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 			defer feed.Close()
 			chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 			require.NoError(t, err)
-			require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+			require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 			require.NoError(t, feed.Start(t.Context()))
 			require.NoError(t, chunker.Open())
 

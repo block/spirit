@@ -1,12 +1,10 @@
 package migration
 
 import (
-	"log/slog"
 	"os"
 	"testing"
 
 	"github.com/block/mysql"
-	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/flags"
@@ -231,13 +229,7 @@ func TestReplicationClientTLSConfig(t *testing.T) {
 			defer utils.CloseAndLog(db)
 
 			// Create replication client
-			appl, err := applier.New([]applier.Target{{DB: db}}, &applier.ApplierConfig{
-				Logger:   slog.Default(),
-				DBConfig: tlsConfig,
-				Threads:  1,
-			})
-			require.NoError(t, err)
-			client := change.NewBinlogClient(db, tc.host, "user", "pass", appl, clientConfig)
+			client := change.NewBinlogClient(db, tc.host, "user", "pass", clientConfig)
 			require.NotNil(t, client)
 
 			// Verify TLS config is stored

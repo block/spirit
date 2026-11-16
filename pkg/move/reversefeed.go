@@ -220,7 +220,7 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 		// failure later — and makes the empty head-start case (Position "",
 		// see ReverseSource) probe the server instead of silently defaulting
 		// to the file+offset scheme.
-		client, cerr := change.NewAutoClient(ctx, src.DB, src.Addr, src.User, src.Password, appl, clientCfg, src.Position)
+		client, cerr := change.NewAutoClient(ctx, src.DB, src.Addr, src.User, src.Password, clientCfg, src.Position)
 		if cerr != nil {
 			return nil, fmt.Errorf("reverse feed: source %d: %w", si, cerr)
 		}
@@ -236,7 +236,7 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 			if cerr != nil {
 				return nil, fmt.Errorf("reverse feed: chunker for %q: %w", sTbl.TableName, cerr)
 			}
-			if aerr := client.AddSubscription(sTbl, uTbl, chunker); aerr != nil {
+			if aerr := client.AddSubscription(change.BufferedSubscriptionFactory(sTbl, uTbl, chunker, appl)); aerr != nil {
 				return nil, fmt.Errorf("reverse feed: subscribe %q: %w", sTbl.TableName, aerr)
 			}
 		}

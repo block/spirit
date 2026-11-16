@@ -75,7 +75,7 @@ func TestNewAutoClient(t *testing.T) {
 	require.NoError(t, err)
 
 	newClient := func(resumePosition string) (Source, error) {
-		return NewAutoClient(t.Context(), db, cfg.Addr, cfg.User, cfg.Passwd, nil, NewClientDefaultConfig(), resumePosition)
+		return NewAutoClient(t.Context(), db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig(), resumePosition)
 	}
 
 	// Fresh run: the probe decides.

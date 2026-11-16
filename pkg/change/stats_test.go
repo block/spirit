@@ -201,11 +201,11 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 
 	cfg, err := mysql2.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd,
-		applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*binlogClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -383,7 +383,7 @@ func (*stubSubscription) Length() int                   { return 0 }
 func (*stubSubscription) Flush(context.Context, bool, []*dbconn.TableLock) (bool, error) {
 	return true, nil
 }
-func (*stubSubscription) Tables() []*table.TableInfo                           { return nil }
+func (*stubSubscription) Tables() []TableDescriptor                            { return nil }
 func (*stubSubscription) ImmutableColumnOrdinal() int                          { return -1 }
 func (*stubSubscription) SetWatermarkOptimization(context.Context, bool) error { return nil }
 func (*stubSubscription) Close()                                               {}

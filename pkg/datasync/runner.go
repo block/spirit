@@ -804,7 +804,7 @@ func (r *Runner) setup(ctx context.Context) error {
 	if r.sync.Source != nil {
 		r.setReplClient(r.sync.Source)
 	} else {
-		client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.applier, r.replClientConfig(), pos)
+		client, err := change.NewAutoClient(ctx, r.source.db, r.source.config.Addr, r.source.config.User, r.source.config.Passwd, r.replClientConfig(), pos)
 		if err != nil {
 			return err
 		}
@@ -1421,7 +1421,7 @@ func (r *Runner) buildChunkers() ([]table.Chunker, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := r.replClient.AddSubscription(tbl, nil, cc); err != nil {
+		if err := r.replClient.AddSubscription(change.BufferedSubscriptionFactory(tbl, nil, cc, r.applier)); err != nil {
 			return nil, err
 		}
 		chunkers = append(chunkers, cc)

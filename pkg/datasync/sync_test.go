@@ -1042,7 +1042,7 @@ func TestSyncResumeSourceIdentity(t *testing.T) {
 
 	// Pin this checkpoint to file:position even on GTID-enabled test servers.
 	// GTIDs deliberately remain portable; file coordinates require identity.
-	binlog := change.NewBinlogClient(srcDB, src.Addr, src.User, src.Passwd, nil, change.NewClientDefaultConfig())
+	binlog := change.NewBinlogClient(srcDB, src.Addr, src.User, src.Passwd, change.NewClientDefaultConfig())
 	defer binlog.Close()
 	filePosition, err := binlog.CurrentPosition(t.Context())
 	require.NoError(t, err)

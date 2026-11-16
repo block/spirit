@@ -45,13 +45,13 @@ func newStartedClientForFlushTest(t *testing.T, useGTID bool, srcName, dstName s
 	}
 	var client Source
 	if useGTID {
-		client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
+		client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientCfg)
 	} else {
-		client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
+		client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientCfg)
 	}
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, applier.NewSingleTargetForTest(t, db))))
 	require.NoError(t, client.Start(t.Context()))
 	t.Cleanup(client.Close)
 	return client, db, t1, t2
@@ -136,13 +136,13 @@ func runPeriodicFlushErrorIsFatal(t *testing.T, useGTID bool, srcName, dstName s
 	}
 	var client Source
 	if useGTID {
-		client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
+		client = NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientCfg)
 	} else {
-		client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientCfg)
+		client = NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientCfg)
 	}
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, applier.NewSingleTargetForTest(t, db))))
 	require.NoError(t, client.Start(t.Context()))
 	t.Cleanup(client.Close)
 	require.NoError(t, client.SetWatermarkOptimization(t.Context(), false))

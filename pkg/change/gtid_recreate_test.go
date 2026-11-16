@@ -58,10 +58,11 @@ func TestGTIDRecreateStreamerRecovers(t *testing.T) {
 	t2 := table.NewTableInfo(db, cfg.DBName, "gtidrecreatet2")
 	require.NoError(t, t2.SetInfo(t.Context()))
 
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), NewClientDefaultConfig()).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	defer client.Close()
 
@@ -133,10 +134,11 @@ func TestGTIDMaxRecreateAttemptsError(t *testing.T) {
 		cancel()
 		return true
 	}
-	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier.NewSingleTargetForTest(t, db), clientConfig).(*gtidClient)
+	appl := applier.NewSingleTargetForTest(t, db)
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd, clientConfig).(*gtidClient)
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(t1, t2, chunker, appl)))
 	require.NoError(t, client.Start(ctx))
 
 	// Point the syncer config at a dead address (closed port for an

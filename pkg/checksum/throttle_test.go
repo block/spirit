@@ -129,7 +129,7 @@ func checksumFixture(t *testing.T, name string, rows int, cfg *CheckerConfig) Ch
 	dsn, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	app := applier.NewSingleTargetForTest(t, db)
-	feed := change.NewBinlogClient(db, dsn.Addr, dsn.User, dsn.Passwd, app, change.NewClientDefaultConfig())
+	feed := change.NewBinlogClient(db, dsn.Addr, dsn.User, dsn.Passwd, change.NewClientDefaultConfig())
 	t.Cleanup(feed.Close)
 	// The single-server checker requires a repair applier even when the fixture
 	// never produces a mismatch; the callers here only care about pacing.
@@ -137,7 +137,7 @@ func checksumFixture(t *testing.T, name string, rows int, cfg *CheckerConfig) Ch
 
 	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
 	require.NoError(t, err)
-	require.NoError(t, feed.AddSubscription(t1, t2, chunker))
+	require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(t1, t2, chunker, app)))
 	require.NoError(t, feed.Start(t.Context()))
 	require.NoError(t, chunker.Open())
 

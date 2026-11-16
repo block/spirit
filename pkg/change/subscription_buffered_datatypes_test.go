@@ -289,10 +289,10 @@ func startBufferedSubscriptionFor(t *testing.T, srcTable, dstTable *table.TableI
 	}
 	appl, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, appl, NewClientDefaultConfig()).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(srcTable, dstTable, chunker, appl)))
 	require.NoError(t, client.Start(t.Context()))
 	t.Cleanup(func() { client.Close() })
 	return db, client

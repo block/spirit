@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -74,9 +73,9 @@ type gtidClient struct {
 // Most callers should use NewAutoClient instead, which selects between this
 // and the binlog client based on the server's GTID support (fresh runs) or
 // the checkpointed position's encoding (resumes).
-func NewGTIDClient(db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig) Source {
+func NewGTIDClient(db *sql.DB, host string, username, password string, config *ClientConfig) Source {
 	c := &gtidClient{}
-	c.configure(db, host, username, password, appl, config)
+	c.configure(db, host, username, password, config)
 	return c
 }
 

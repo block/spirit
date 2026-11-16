@@ -316,56 +316,36 @@ type BufferedSubscriptionConfig struct {
 	// Chunker provides the watermark filter + column mapping. Required.
 	Chunker table.MappedChunker
 
-	// Logger receives diagnostic events. Defaults to slog.Default()
-	// when nil.
-	Logger *slog.Logger
+	// SubscriptionSettings are the owning Source's: a Source's
+	// AddSubscription passes them to its SubscriptionFactory.
+	SubscriptionSettings
+}
 
-	// SoftLimitBytes is the per-subscription byte cap before
-	// HasChanged blocks waiting on the flush path. Zero disables the
-	// cap. See bufferedMap.softLimitBytes for the semantics.
-	SoftLimitBytes int64
-
-	// SoftLimitChanges is the per-subscription cap on pending change
-	// *count* before HasChanged parks, applied alongside SoftLimitBytes;
-	// whichever binds first parks the reader. Zero disables it. See
-	// bufferedMap.overSoftLimitLocked for why both exist.
-	SoftLimitChanges int
-
-	// FlushRequest, when non-nil, receives the parked subscription (a
-	// non-blocking send) each time HasChanged parks on the soft limit.
-	// Owners that flush on a periodic ticker should select on it and
-	// flush the received subscription first, then run their normal
-	// all-subscription pass — flushing others first would leave the
-	// change reader parked for those entire drains. Optional; nil
-	// disables the signal.
-	FlushRequest chan<- Subscription
-
-	// FlushConcurrency is the maximum number of applier batches a
-	// map-mode flush keeps in flight concurrently. Zero or negative
-	// means serial, preserving prior behaviour for callers that do not
-	// set it; the in-tree clients pass DefaultFlushConcurrency. Queue-
-	// mode and under-lock flushes are always serial regardless.
-	FlushConcurrency int
-
-	// BatchSize is the maximum number of rows one flush batch renders
-	// into a single statement. Zero means DefaultBatchSize, preserving
-	// prior behaviour for callers that do not set it.
-	//
-	// It is not independent of FlushConcurrency: their product is the
-	// rows a drain has in flight, so a caller raising one should lower
-	// the other. autoscale.FlushBounds returns the pair.
-	BatchSize int
-
-	// UnderLoad is ClientConfig.UnderLoad: the server-load signal the drain
-	// narrows itself on. Optional; nil disables load shedding entirely.
-	UnderLoad func() bool
+// BufferedSubscriptionFactory returns the SubscriptionFactory for the in-tree
+// buffered subscription over these tables, chunker and applier: what callers
+// pass to Source.AddSubscription. See BufferedSubscriptionConfig for the
+// arguments.
+//
+// The subscription handles a non-memory-comparable primary key itself: once
+// the watermark optimizations are disabled (copy done, checksum about to
+// start) it acts like a FIFO queue, which is required because of collation
+// edge cases (A == a on the server, but not in its map).
+func BufferedSubscriptionFactory(currentTable, newTable *table.TableInfo, chunker table.MappedChunker, appl applier.Applier) SubscriptionFactory {
+	return func(settings SubscriptionSettings) (Subscription, error) {
+		return NewBufferedSubscription(BufferedSubscriptionConfig{
+			CurrentTable:         currentTable,
+			NewTable:             newTable,
+			Applier:              appl,
+			Chunker:              chunker,
+			SubscriptionSettings: settings,
+		})
+	}
 }
 
 // NewBufferedSubscription constructs the default bufferedMap-backed
-// Subscription. It is the public counterpart to feedCore's AddSubscription,
-// which both binlog-backed clients share: out-of-tree change.Source implementations
-// (e.g. strata's pkg/vstream) call this from their own AddSubscription to
-// build a Subscription the runner / copier can drive.
+// Subscription. BufferedSubscriptionFactory wraps it for
+// Source.AddSubscription; an out-of-tree change.Source can also call it
+// directly.
 //
 // The returned Subscription is not yet wired into a registry — the caller
 // is responsible for storing it and routing row events to its HasChanged
@@ -529,18 +509,25 @@ func (s *bufferedMap) overSoftLimitLocked() bool {
 	return s.softLimitChanges > 0 && s.lengthLocked() >= s.softLimitChanges
 }
 
-func (s *bufferedMap) Tables() []*table.TableInfo {
-	if s.newTable == nil {
-		// Move-flow subscriptions have no destination-side TableInfo (see
-		// BufferedSubscriptionConfig.NewTable). Omit the nil rather than
-		// returning [table, nil]: Tables() consumers — the DDL
-		// subscription-match loops in the binlog/GTID clients, and
-		// out-of-tree change.Source implementations routing row events per
-		// the Source interface contract — iterate and dereference the
-		// entries, and a nil entry panics the stream-reader goroutine.
-		return []*table.TableInfo{s.table}
+func (s *bufferedMap) Tables() []TableDescriptor {
+	return describeTables(s.table, s.newTable)
+}
+
+// describeTables is what bufferedMap.Tables returns. It is derived on each
+// call rather than stored, so a bufferedMap built directly (tests do) still
+// describes its tables; Tables is only read when a DDL arrives. Move-flow subscriptions have no destination-side TableInfo
+// (see BufferedSubscriptionConfig.NewTable), so there is then one entry.
+func describeTables(currentTable, newTable *table.TableInfo) []TableDescriptor {
+	if newTable == nil {
+		return []TableDescriptor{DescribeTable(currentTable)}
 	}
-	return []*table.TableInfo{s.table, s.newTable}
+	return []TableDescriptor{DescribeTable(currentTable), DescribeTable(newTable)}
+}
+
+// sourceTableInfo satisfies binlogSubscription: the binlog clients decode a
+// row image with the source table's MySQL metadata.
+func (s *bufferedMap) sourceTableInfo() *table.TableInfo {
+	return s.table
 }
 
 // ImmutableColumnOrdinal satisfies Subscription. The ordinal is derived

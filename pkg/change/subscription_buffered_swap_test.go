@@ -182,10 +182,10 @@ func TestSwapPairEndToEndViaReplace(t *testing.T) {
 	applierInstance, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
 
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applierInstance, NewClientDefaultConfig()).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(srcTable, dstTable, chunker, applierInstance)))
 
 	const buckets = 50
 	var seed []string

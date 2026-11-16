@@ -106,10 +106,10 @@ func setupBufferedTest(t *testing.T) (*sql.DB, *binlogClient, *table.TableInfo, 
 	}
 	applier, err := applier.New([]applier.Target{target}, applier.NewApplierDefaultConfig())
 	require.NoError(t, err)
-	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, applier, NewClientDefaultConfig()).(*binlogClient)
+	client := NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, NewClientDefaultConfig()).(*binlogClient)
 	chunker, err := table.NewChunker(srcTable, table.ChunkerConfig{NewTable: dstTable})
 	require.NoError(t, err)
-	require.NoError(t, client.AddSubscription(srcTable, dstTable, chunker))
+	require.NoError(t, client.AddSubscription(BufferedSubscriptionFactory(srcTable, dstTable, chunker, applier)))
 	require.NoError(t, client.Start(t.Context()))
 	return db, client, srcTable, dstTable
 }

@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/block/spirit/pkg/table"
 )
 
 // MockSource is the shared Source test double. It lives here rather than in
@@ -92,9 +91,9 @@ type MockSource struct {
 
 var _ Source = (*MockSource)(nil)
 
-func (m *MockSource) AddSubscription(currentTable, newTable *table.TableInfo, chunker table.MappedChunker) error {
+func (m *MockSource) AddSubscription(newSubscription SubscriptionFactory) error {
 	if m.Inner != nil {
-		return m.Inner.AddSubscription(currentTable, newTable, chunker)
+		return m.Inner.AddSubscription(newSubscription)
 	}
 	return nil
 }

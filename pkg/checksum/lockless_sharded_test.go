@@ -72,11 +72,11 @@ func newShardedFixture(t *testing.T, sourceSQL, targetSQL []string) *shardedFixt
 		require.NoError(t, info.SetInfo(t.Context()))
 		info.ShardingColumn = "id"
 		info.HashFunc = testutils.EvenOddHasher
-		feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, app, change.NewClientDefaultConfig())
+		feed := change.NewBinlogClient(db, cfg.Addr, cfg.User, cfg.Passwd, change.NewClientDefaultConfig())
 		t.Cleanup(feed.Close)
 		chunker, err := table.NewChunker(info, table.ChunkerConfig{NewTable: info})
 		require.NoError(t, err)
-		require.NoError(t, feed.AddSubscription(info, info, chunker))
+		require.NoError(t, feed.AddSubscription(change.BufferedSubscriptionFactory(info, info, chunker, app)))
 		require.NoError(t, feed.Start(t.Context()))
 		f.sources = append(f.sources, db)
 		f.feeds = append(f.feeds, feed)
