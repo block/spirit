@@ -51,7 +51,7 @@ type parkingFeed struct {
 	watches []change.RowWatch
 }
 
-var _ change.ParkingSource = (*parkingFeed)(nil)
+var _ change.ParkableSource = (*parkingFeed)(nil)
 
 func (f *parkingFeed) VerifyRowAtNextChange(ctx context.Context, watch change.RowWatch, verify change.RowVerifier) error {
 	f.mu.Lock()
@@ -293,7 +293,7 @@ func TestSettleHotSnapshotWithoutFeedIsUnavailable(t *testing.T) {
 }
 
 // TestSettleHotSnapshotWithoutParkingIsUnavailable: a feed that is not a
-// change.ParkingSource cannot hold its reader at the watched change, so there
+// change.ParkableSource cannot hold its reader at the watched change, so there
 // is nothing to compare against. The range defers at once, without waiting out
 // the budget for a change it could not be shown.
 func TestSettleHotSnapshotWithoutParkingIsUnavailable(t *testing.T) {
@@ -303,7 +303,7 @@ func TestSettleHotSnapshotWithoutParkingIsUnavailable(t *testing.T) {
 	snapshot := pendingSnapshot(t, db, chunk, 1)
 
 	feed := &change.MockSource{}
-	_, parks := change.Source(feed).(change.ParkingSource)
+	_, parks := change.Source(feed).(change.ParkableSource)
 	require.False(t, parks, "the double must not be able to park for this test to mean anything")
 	start := time.Now()
 	verdict, err := settleTestSettler(t, db, feed).settle(t.Context(), snapshot)

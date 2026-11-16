@@ -197,7 +197,7 @@ type Source interface {
 	Close()
 }
 
-// ParkingSource is a Source that can hold its reader at a chosen change. It is
+// ParkableSource is a Source that can hold its reader at a chosen change. It is
 // optional: the lockless checksum asks for it with a type assertion and, from a
 // Source without it, settles no hot row — the range defers exactly as it does
 // when no change arrives in time.
@@ -210,7 +210,7 @@ type Source interface {
 //
 // A wrapper around a Source must not implement this unconditionally: the type
 // assertion would then succeed for a wrapped Source that cannot park.
-type ParkingSource interface {
+type ParkableSource interface {
 	Source
 
 	// VerifyRowAtNextChange waits for the next change to a row matching watch,

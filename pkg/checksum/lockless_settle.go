@@ -81,7 +81,7 @@ type settleVerdict int
 
 const (
 	// settleUnavailable means no verdict was reached: there is no feed, the
-	// feed cannot park (it is not a change.ParkingSource), no change arrived inside the budget, the flush could not land it, or a
+	// feed cannot park (it is not a change.ParkableSource), no change arrived inside the budget, the flush could not land it, or a
 	// change landed in the middle of the comparison. The caller defers the
 	// range exactly as it did before this path existed.
 	settleUnavailable settleVerdict = iota
@@ -189,7 +189,7 @@ func (s *rowSettler) settleRow(ctx, parent context.Context, snapshot *hotSnapsho
 			"chunk", chunk.String())
 		return settleUnavailable, nil
 	}
-	parker, ok := feed.(change.ParkingSource)
+	parker, ok := feed.(change.ParkableSource)
 	if !ok {
 		s.logger.Debug("lockless checksum: the owning source cannot park at a change; deferring",
 			"chunk", chunk.String())

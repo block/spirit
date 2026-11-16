@@ -475,9 +475,9 @@ Override via `ClientConfig.SubscriptionSoftLimitBytes`; pass a negative value to
 
 ### Parking at a row change (`VerifyRowAtNextChange`)
 
-`VerifyRowAtNextChange` is not part of the `Source` contract. It is the one method of `ParkingSource`, an optional extension of `Source` for a source that can hold its reader at a chosen event. It exists for one caller — the lockless checksum, verifying a row that is written continuously — which asks for it with a type assertion. From a `Source` that is not a `ParkingSource`, the checksum settles no hot row: the range defers, exactly as when no change arrives in time. Both built-in clients are `ParkingSource`s.
+`VerifyRowAtNextChange` is not part of the `Source` contract. It is the one method of `ParkableSource`, an optional extension of `Source` for a source that can hold its reader at a chosen event. It exists for one caller — the lockless checksum, verifying a row that is written continuously — which asks for it with a type assertion. From a `Source` that is not a `ParkableSource`, the checksum settles no hot row: the range defers, exactly as when no change arrives in time. Both built-in clients are `ParkableSource`s.
 
-It is optional because holding the reader holds the whole stream, and what that costs depends on the stream. A binlog is kept whether or not anyone reads it, so a held binlog reader costs the server nothing. A stream whose server keeps its log only until the consumer confirms it would grow that log for as long as the reader is held. A wrapper around a `Source` must not implement `ParkingSource` unconditionally, or the type assertion succeeds for a wrapped source that cannot park.
+It is optional because holding the reader holds the whole stream, and what that costs depends on the stream. A binlog is kept whether or not anyone reads it, so a held binlog reader costs the server nothing. A stream whose server keeps its log only until the consumer confirms it would grow that log for as long as the reader is held. A wrapper around a `Source` must not implement `ParkableSource` unconditionally, or the type assertion succeeds for a wrapped source that cannot park.
 
 Such a row cannot be verified by reading both sides. Any SQL comparison is between a source image at one position and a target state at a later one, and closing that window means stopping the writes. But with `binlog_row_image=FULL`, an event's after-image **is** the source's value for that row at that position, so the verification becomes:
 
@@ -525,7 +525,7 @@ This park is unrelated to the [memory backpressure](#memory-backpressure) park, 
 than per-backend work, and an implementation that rolls its own gets them subtly
 wrong in ways no test catches:
 
-- **`VerifyRowAtNextChange`** (only for a `ParkingSource`) — embed a [`RowParker`](#parking-at-a-row-change-verifyrowatnextchange)
+- **`VerifyRowAtNextChange`** (only for a `ParkableSource`) — embed a [`RowParker`](#parking-at-a-row-change-verifyrowatnextchange)
   by value and wire it into the read loop, the dispatch and the method. Supply
   only the backend's inner drain and its `AllChangesFlushed`. A source that
   should not hold its reader leaves the method out.
@@ -542,7 +542,7 @@ wrong in ways no test catches:
 
 `change.MockSource` (mock.go) is the shared test double, for this package and for every package that is handed a feed. `Source` is a wide interface, so a hand-rolled double is ~20 lines of no-op methods around the one or two that carry behaviour, and adding a method to `Source` means writing it once per copy — which is how the checksum, move and sync packages each ended up with their own.
 
-With `Inner` set it delegates to a real source and records the calls; with `Inner` nil every method is a success-shaped no-op reading from its configuration fields. It is not a `ParkingSource`, so wrapping a real client in it hides the client's parking. A test that needs a scripted change delivered at a park embeds it and adds `VerifyRowAtNextChange`.
+With `Inner` set it delegates to a real source and records the calls; with `Inner` nil every method is a success-shaped no-op reading from its configuration fields. It is not a `ParkableSource`, so wrapping a real client in it hides the client's parking. A test that needs a scripted change delivered at a park embeds it and adds `VerifyRowAtNextChange`.
 
 Prefer it over embedding a nil `change.Source`, even for a feed a test believes is never touched. Promotion through an embedded interface satisfies `Source` with methods that panic, so growing the interface turns a passing test into a nil dereference at a call site nobody was thinking about — which is what moving `FeedStats` onto `Source` did to `pkg/migration`'s status stub. Embed a nil `Source` only where an unintended call *should* be a panic that names itself: a parameter the code under test must not reach at all.
 

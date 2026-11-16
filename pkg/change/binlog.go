@@ -17,7 +17,7 @@ import (
 )
 
 // Compile-time assertion that the binlog-backed Client satisfies Source.
-var _ ParkingSource = (*binlogClient)(nil)
+var _ ParkableSource = (*binlogClient)(nil)
 
 // binlogClient is the change.Source that resumes by (binlog-file, offset).
 // NewAutoClient selects it when the source server does not have GTIDs
@@ -896,7 +896,7 @@ func parseBinlogPositionString(s string) (mysql.Position, error) {
 	return mysql.Position{Name: name, Pos: uint32(offset)}, nil
 }
 
-// VerifyRowAtNextChange satisfies ParkingSource. The parker owns the ordering; all
+// VerifyRowAtNextChange satisfies ParkableSource. The parker owns the ordering; all
 // this supplies is the inner drain, which must not be Flush (see
 // RowParker.Verify).
 func (c *binlogClient) VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error {

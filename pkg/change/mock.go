@@ -25,7 +25,7 @@ import (
 // from the fields below, which is what a test that only needs the interface
 // satisfied wants.
 //
-// It is not a ParkingSource, so a test that hands it to the lockless checksum
+// It is not a ParkableSource, so a test that hands it to the lockless checksum
 // gets a feed that settles no hot row, and wrapping a real client in it hides
 // the client's parking. A test that needs a change delivered at a park embeds
 // MockSource and adds VerifyRowAtNextChange itself — scripting an event is

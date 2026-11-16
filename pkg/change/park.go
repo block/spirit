@@ -270,7 +270,7 @@ func flushParked(ctx context.Context, flush func(context.Context) error, allFlus
 	return ErrFlushIncomplete
 }
 
-// RowParker is everything a Source needs to implement ParkingSource:
+// RowParker is everything a Source needs to implement ParkableSource:
 // the gate that holds the reader between events and the single armed watch.
 // Embed one by value, zero value ready, and wire it into three places:
 //
@@ -335,7 +335,7 @@ func (p *RowParker) Watch(tbl *table.TableInfo, key, image []any, deleted bool) 
 	return w
 }
 
-// Verify is the body of ParkingSource.VerifyRowAtNextChange. A Source supplies only
+// Verify is the body of ParkableSource.VerifyRowAtNextChange. A Source supplies only
 // the two parts that are its own: drain, which applies what is already
 // buffered, and allFlushed, which reports whether the buffer emptied.
 //
