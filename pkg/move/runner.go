@@ -1,6 +1,7 @@
 package move
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -49,8 +50,12 @@ const minChecksumPhaseReserve = 6
 // cutover (see run). As in migration.
 const postCutoverCleanupTimeout = 2 * time.Minute
 
+// defaultTableStatUpdateInterval is how often the source tables' statistics
+// are refreshed during the copy. Tests shorten it per Runner
+// (tunables.tableStatUpdateInterval).
+const defaultTableStatUpdateInterval = 5 * time.Minute
+
 var (
-	tableStatUpdateInterval = 5 * time.Minute
 	// checkpointTableName is deliberately distinct from migration's shared
 	// _spirit_checkpoint and datasync's _spirit_sync_checkpoint. A table with
 	// this name can only have been created by a move, which is what lets
@@ -102,7 +107,37 @@ func targetKey(t applier.Target) string {
 	return t.Config.Addr + "/" + t.Config.DBName + "/" + t.KeyRange
 }
 
+// tunables are waits and a hook that tests shorten or install on one Runner.
+// They are fields rather than package variables so that parallel tests do not
+// race on them. A zero value selects the production default.
+type tunables struct {
+	// renameRetryWait is the pause between rename attempts under table locks,
+	// forward and reverse (defaultRenameRetryWait).
+	renameRetryWait time.Duration
+	// reverseWindowPollInterval is how often the reverse window checks for a
+	// revert request, feed death or the deadline
+	// (defaultReverseWindowPollInterval).
+	reverseWindowPollInterval time.Duration
+	// reverseFeedFlushInterval is the reverse feed's periodic flush interval
+	// (defaultReverseFeedFlushInterval).
+	reverseFeedFlushInterval time.Duration
+	// reverseCutoverInitialBackoff and reverseCutoverMaxBackoff bound the
+	// wait between reverse cutover attempts
+	// (defaultReverseCutoverInitialBackoff, defaultReverseCutoverMaxBackoff).
+	reverseCutoverInitialBackoff time.Duration
+	reverseCutoverMaxBackoff     time.Duration
+	// tableStatUpdateInterval is how often the source tables' statistics are
+	// refreshed during the copy (defaultTableStatUpdateInterval).
+	tableStatUpdateInterval time.Duration
+	// reverseCutoverUnderLockHook, when non-nil, runs at the start of each
+	// reverse cutover attempt's work under the target locks, bounded by the
+	// cutover lock timeout, so a test can stall or fail an attempt there.
+	reverseCutoverUnderLockHook func(ctx context.Context) error
+}
+
 type Runner struct {
+	// tunables holds the test-shortened waits; see tunables.
+	tunables            tunables
 	move                *Move
 	reverseWriteThreads int // Configured count, unaffected by forward autoscaling.
 
@@ -1729,6 +1764,7 @@ func (r *Runner) Run(ctx context.Context) (retErr error) {
 			return err
 		}
 		cutover.SetLockTimeout(r.move.CutoverLockTimeout)
+		cutover.renameRetryWait = cmp.Or(r.tunables.renameRetryWait, defaultRenameRetryWait)
 		if r.cutoverResultFunc != nil || r.cutoverFunc != nil {
 			cutover.SetCutoverWithResult(r.runForwardCutoverCallback)
 		}
@@ -1826,7 +1862,9 @@ func (r *Runner) startBackgroundRoutines(ctx context.Context) {
 	var stats sync.WaitGroup
 	for i := range r.sources {
 		for _, tbl := range r.sources[i].tables {
-			stats.Go(func() { tbl.AutoUpdateStatistics(statsCtx, tableStatUpdateInterval, r.logger) })
+			stats.Go(func() {
+				tbl.AutoUpdateStatistics(statsCtx, cmp.Or(r.tunables.tableStatUpdateInterval, defaultTableStatUpdateInterval), r.logger)
+			})
 		}
 		r.sources[i].replClient.StartPeriodicFlush(ctx, change.DefaultFlushInterval)
 	}

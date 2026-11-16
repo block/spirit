@@ -114,7 +114,7 @@ The applier interface provides both asynchronous and synchronous methods:
 **Asynchronous (used by the copier and the checksum's chunk repair)**:
 - `Apply(ctx, chunk, rows, callback)`: Queues rows for writing and returns immediately. The callback is invoked when all rows have been written. Emits `INSERT IGNORE INTO target (cols) VALUES (...)`, not `REPLACE` — see the checksum's [Chunk repair](../checksum/README.md#chunk-repair) for why repair depends on that.
 
-**Synchronous (used by subscription)**:
+**Synchronous (used by subscription)**: the embedded `StreamedChangesWriter` interface.
 - `DeleteKeys(ctx, sourceTable, targetTable, keys, locks)`: Deletes rows by primary key and waits for completion. Emits `DELETE FROM target WHERE (pk) IN (...)`.
 - `UpsertRows(ctx, mapping, rows, locks)`: Upserts rows using a `ColumnMapping` and waits for completion. Emits `REPLACE INTO target (cols) VALUES (...)` — see [REPLACE INTO semantics](#replace-into-semantics-and-eventual-consistency) below.
 

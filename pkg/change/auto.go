@@ -80,7 +80,7 @@ func useGTIDForResume(resumePosition string, gtidEnabled bool) (bool, error) {
 //
 // The remaining arguments mirror NewBinlogClient / NewGTIDClient, which this
 // delegates to. The chosen implementation is logged on config.Logger.
-func NewAutoClient(ctx context.Context, db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig, resumePosition string) (Source, error) {
+func NewAutoClient(ctx context.Context, db *sql.DB, host string, username, password string, appl applier.StreamedChangesWriter, config *ClientConfig, resumePosition string) (Source, error) {
 	gtidEnabled, err := GTIDEnabled(ctx, db)
 	if err != nil {
 		return nil, err

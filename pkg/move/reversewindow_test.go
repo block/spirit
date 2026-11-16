@@ -56,22 +56,18 @@ func setupReverseWindowMove(t *testing.T, srcDBName, dstDBName string) (sourceDS
 	return src.FormatDSN(), dst.FormatDSN(), ctl
 }
 
-// shortenReverseWindowPolling makes the window loop responsive in tests.
-func shortenReverseWindowPolling(t *testing.T) {
-	t.Helper()
-	old := reverseWindowPollInterval
-	reverseWindowPollInterval = 100 * time.Millisecond
-	t.Cleanup(func() { reverseWindowPollInterval = old })
-	setReverseCutoverBackoff(t, 100*time.Millisecond)
+// shortenReverseWindowPolling makes r's window loop responsive in tests. It
+// sets r's own tunables, so parallel tests do not share it.
+func shortenReverseWindowPolling(r *Runner) {
+	r.tunables.reverseWindowPollInterval = 100 * time.Millisecond
+	setReverseCutoverBackoff(r, 100*time.Millisecond)
 }
 
-// setReverseCutoverBackoff sets the wait between reverse cutover attempts to
-// d for the test.
-func setReverseCutoverBackoff(t *testing.T, d time.Duration) {
-	t.Helper()
-	oldInitial, oldMax := reverseCutoverInitialBackoff, reverseCutoverMaxBackoff
-	reverseCutoverInitialBackoff, reverseCutoverMaxBackoff = d, d
-	t.Cleanup(func() { reverseCutoverInitialBackoff, reverseCutoverMaxBackoff = oldInitial, oldMax })
+// setReverseCutoverBackoff sets the wait between r's reverse cutover attempts
+// to d.
+func setReverseCutoverBackoff(r *Runner, d time.Duration) {
+	r.tunables.reverseCutoverInitialBackoff = d
+	r.tunables.reverseCutoverMaxBackoff = d
 }
 
 // Timing for the wait helpers below.
@@ -389,7 +385,7 @@ func (h *runHandle) close() {
 // move holds the window then finalizes forward — source retired to _old, target
 // serving, checkpoint dropped.
 func TestMoveReverseWindowCompleteForward(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcf_src", "rwcf_dst")
 
 	m := &Move{
@@ -400,6 +396,7 @@ func TestMoveReverseWindowCompleteForward(t *testing.T) {
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
 	defer utils.CloseAndLog(runner)
 
 	var cutoverCalled, reverseCutoverCalled bool
@@ -421,7 +418,7 @@ func TestMoveReverseWindowCompleteForward(t *testing.T) {
 // move back — writes that landed on the target during the window flow back to
 // the source, the source is un-retired and serving, the target is retired.
 func TestMoveReverseWindowRevert(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwrv_src", "rwrv_dst")
 
 	m := &Move{
@@ -432,6 +429,7 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
 
 	var reverseCutoverCalled bool
 	runner.SetCutover(func(context.Context) error { return nil })
@@ -469,7 +467,7 @@ func TestMoveReverseWindowRevert(t *testing.T) {
 // the cancelled context the phase write would fail and leave the checkpoint
 // at "reverting", which the next run rejects as ownership-ambiguous.
 func TestMoveReverseWindowRevertCancelAfterSwitchBack(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwrc_src", "rwrc_dst")
 
 	m := &Move{
@@ -480,6 +478,7 @@ func TestMoveReverseWindowRevertCancelAfterSwitchBack(t *testing.T) {
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
 
 	// The run's cancel func reaches the callback through a channel, which
 	// orders it after startRun for the race detector.
@@ -508,6 +507,7 @@ func TestMoveReverseWindowRevertCancelAfterSwitchBack(t *testing.T) {
 // ownership, so the rename must not be interrupted by a cancel. A cancelled
 // rename could still commit on the server without the client knowing.
 func TestUnretireSourceTableIgnoresCancel(t *testing.T) {
+	t.Parallel()
 	name, db := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, name, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY)")
 	w := &reverseWindow{r: &Runner{dbConfig: dbconn.NewDBConfig(), logger: slog.Default()}}
@@ -523,7 +523,7 @@ func TestUnretireSourceTableIgnoresCancel(t *testing.T) {
 // carry the target's AUTO_INCREMENT counter back or the source would issue
 // them again. Mirrors TestMoveCarriesAutoIncrement for the reverse cutover.
 func TestMoveReverseWindowRevertCarriesAutoIncrement(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	srcName, ctl := testutils.CreateUniqueTestDatabase(t)
 	dstName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE jobs (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)")
@@ -536,6 +536,7 @@ func TestMoveReverseWindowRevertCarriesAutoIncrement(t *testing.T) {
 		ReverseWindow: 30 * time.Second, // long; the revert ends it early
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
 	recorder := &fatalReasonState{}
 	runner.logger = slog.New(&fatalReasonRecorder{Handler: slog.Default().Handler(), state: recorder})
 	runner.SetCutover(func(context.Context) error { return nil })
@@ -576,6 +577,7 @@ func runRevertingMove(t *testing.T, sourceDSN, targetDSN string, ctl *sql.DB, ds
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { return nil })
 
@@ -594,7 +596,7 @@ func runRevertingMove(t *testing.T, sourceDSN, targetDSN string, ctl *sql.DB, ds
 // against the same source/target must not collide with the first revert's
 // retired (_revert) target tables — the fresh-start cleanup drops them.
 func TestMoveReverseWindowRevertIdempotentAcrossRetries(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwidem_src", "rwidem_dst")
 
 	for attempt := 1; attempt <= 2; attempt++ {
@@ -610,7 +612,7 @@ func TestMoveReverseWindowRevertIdempotentAcrossRetries(t *testing.T) {
 // — not re-discover/re-copy the source's now-_old tables. This is the reported
 // failure mode.
 func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwrk_src", "rwrk_dst")
 
 	// Run 1: reach the reverse window, then simulate a kill (cancel the context)
@@ -620,6 +622,7 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(run1)
 	run1.SetCutover(func(context.Context) error { return nil })
 	h1 := startRun(t, run1)
 
@@ -650,6 +653,7 @@ func TestMoveReverseWindowResumesAfterKill(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(run2)
 	run2.SetCutover(func(context.Context) error {
 		t.Error("resume must NOT run the forward cutover again (it re-copied instead of resuming)")
 		return nil
@@ -729,10 +733,7 @@ func positionCovers(ctx context.Context, db *sql.DB, have, want string) (bool, e
 // re-reads the whole window's binlog, and cannot resume at all once the target
 // has purged it — traffic is on the target by then, so the move is stuck.
 func TestMoveReverseWindowCheckpointsFeedPositions(t *testing.T) {
-	shortenReverseWindowPolling(t)
-	oldFlush := reverseFeedFlushInterval
-	reverseFeedFlushInterval = 100 * time.Millisecond
-	t.Cleanup(func() { reverseFeedFlushInterval = oldFlush })
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcp_src", "rwcp_dst")
 
 	run1, err := NewRunner(&Move{
@@ -740,6 +741,8 @@ func TestMoveReverseWindowCheckpointsFeedPositions(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(run1)
+	run1.tunables.reverseFeedFlushInterval = 100 * time.Millisecond
 	run1.SetCutover(func(context.Context) error { return nil })
 	h1 := startRun(t, run1)
 	deadline := h1.awaitReverseWindow(ctl, "rwcp_dst")
@@ -787,6 +790,8 @@ func TestMoveReverseWindowCheckpointsFeedPositions(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(run2)
+	run2.tunables.reverseFeedFlushInterval = 100 * time.Millisecond
 	run2.SetCutover(func(context.Context) error {
 		t.Error("resume must NOT run the forward cutover again")
 		return nil
@@ -824,8 +829,11 @@ func newCheckpointLoopWindow(t *testing.T, write func(context.Context, checkpoin
 	}
 	return &reverseWindow{
 		r: &Runner{
-			logger:           slog.Default(),
-			move:             &Move{ReverseWindow: time.Hour},
+			logger: slog.Default(),
+			move:   &Move{ReverseWindow: time.Hour},
+			// A long poll interval leaves the checkpoint as the only thing the
+			// loop does (status.CheckpointDumpInterval is 100ms here).
+			tunables:         tunables{reverseWindowPollInterval: time.Hour},
 			targets:          []applier.Target{{Config: cfg}},
 			cutoverAt:        time.Now(),
 			reversePositions: map[string]string{"target:3306/dst/": "uuid:1-5"},
@@ -846,6 +854,7 @@ func newCheckpointLoopWindow(t *testing.T, write func(context.Context, checkpoin
 // came from. A position stored under another target's key resumes that
 // target's feed at a coordinate on the wrong server.
 func TestReverseWindowCheckpointKeysEachPositionByItsTarget(t *testing.T) {
+	t.Parallel()
 	targets := []applier.Target{
 		{Config: &mysql.Config{Addr: "target-a:3306", DBName: "dst"}},
 		{Config: &mysql.Config{Addr: "target-b:3306", DBName: "dst"}},
@@ -884,13 +893,8 @@ func TestReverseWindowCheckpointKeysEachPositionByItsTarget(t *testing.T) {
 // to a terminal action the late REPLACE could overwrite. A write that was never
 // sent, or that the server answered with an error, left nothing pending and is
 // retried while the window stays open.
-//
-// Sequential: it lengthens reverseWindowPollInterval so the only thing the
-// loop does is checkpoint (status.CheckpointDumpInterval is 100ms here).
 func TestReverseWindowCheckpointWriteFailure(t *testing.T) {
-	old := reverseWindowPollInterval
-	reverseWindowPollInterval = time.Hour
-	t.Cleanup(func() { reverseWindowPollInterval = old })
+	t.Parallel()
 
 	t.Run("abandoned write ends the window", func(t *testing.T) {
 		// Pins the defensive arm: a real Write abandons only after ctx is
@@ -998,7 +1002,7 @@ func TestReverseWindowCheckpointWriteFailure(t *testing.T) {
 // resume refused before the reverse-window runner starts still publishes the
 // ownership ambiguity through Result.
 func TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwamb_src", "rwamb_dst")
 
 	newRunner := func() *Runner {
@@ -1009,6 +1013,7 @@ func TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence(t *testing.T) 
 			ReverseWindow: 30 * time.Second,
 		})
 		require.NoError(t, err)
+		shortenReverseWindowPolling(runner)
 		return runner
 	}
 
@@ -1040,6 +1045,7 @@ func TestMoveReverseWindowRevertingResumeRetainsOwnershipEvidence(t *testing.T) 
 // targets[0] (a prior reverse-window move that didn't complete) must make the
 // move refuse at pre-flight rather than start on an unknown-state target.
 func TestMoveReverseWindowRefusesStaleRevertMarker(t *testing.T) {
+	t.Parallel()
 	sourceDSN, targetDSN, _ := setupReverseWindowMove(t, "rwsm_src", "rwsm_dst")
 	testutils.RunSQL(t, "CREATE TABLE rwsm_dst."+revertMarkerName+" (id INT)")
 
@@ -1063,6 +1069,7 @@ func TestMoveReverseWindowRefusesStaleRevertMarker(t *testing.T) {
 // sharded (multi-DSN) source must fail fast — before any connection is opened
 // or copy starts — unless the reverse routing inputs are complete and valid.
 func TestMoveReverseWindowShardedSourceGuards(t *testing.T) {
+	t.Parallel()
 	newShardedMove := func() *Move {
 		return &Move{
 			SourceDSNs:    []string{"u:p@tcp(127.0.0.1:3306)/a", "u:p@tcp(127.0.0.1:3306)/b"},
@@ -1173,6 +1180,7 @@ func (f *nmReverseFixture) newRunner(t *testing.T, window time.Duration) *Runner
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
 	return runner
 }
 
@@ -1197,7 +1205,7 @@ func (f *nmReverseFixture) rows(t *testing.T, dbName string) map[int64]string {
 // the window — back to the source shard owning it, un-retires ALL source
 // shards, and retires ALL targets.
 func TestMoveReverseWindowRevertNM(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	f := setupNMReverseFixture(t)
 	runner := f.newRunner(t, 30*time.Second) // long; the revert ends it early
 
@@ -1240,7 +1248,7 @@ func TestMoveReverseWindowRevertNM(t *testing.T) {
 // re-running it resumes the window (rebuilding per-shard state for ALL sources)
 // and can still roll back with correct per-shard routing.
 func TestMoveReverseWindowNMResumesAfterKill(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	f := setupNMReverseFixture(t)
 
 	run1 := f.newRunner(t, 30*time.Second)
@@ -1295,6 +1303,7 @@ func TestMoveReverseWindowNMResumesAfterKill(t *testing.T) {
 // cleanup that is allowed to fail, so a crash mid-cleanup resumes into
 // idempotent work rather than into an ambiguous half-rollback.
 func TestFinalizeReversePersistsOwnershipBeforeCleanup(t *testing.T) {
+	t.Parallel()
 	cleanupErr := errors.New("cleanup failed")
 	for _, tt := range []struct {
 		name           string
@@ -1345,6 +1354,7 @@ func TestFinalizeReversePersistsOwnershipBeforeCleanup(t *testing.T) {
 }
 
 func TestReverseCutoverResultCallbackPreservesFailureEvidence(t *testing.T) {
+	t.Parallel()
 	callbackErr := errors.New("reverse topology write failed")
 	r := &Runner{
 		reverseCutoverResultFunc: func(context.Context) (CutoverResult, error) {
@@ -1372,6 +1382,7 @@ func TestReverseCutoverResultCallbackPreservesFailureEvidence(t *testing.T) {
 // finalized phase cannot be written, no cleanup may run. Dropping the
 // checkpoint first would erase the only record that the rollback got this far.
 func TestFinalizeReverseFailsClosedWhenOwnershipCannotBePersisted(t *testing.T) {
+	t.Parallel()
 	persistErr := errors.New("persist failed")
 	cleanupCalled := false
 	w := &reverseWindow{
@@ -1394,7 +1405,7 @@ func TestFinalizeReverseFailsClosedWhenOwnershipCannotBePersisted(t *testing.T) 
 // Traffic can reach the target before the switch callback returns. Those
 // commits must be included in the reverse feed's captured starting position.
 func TestMoveReverseWindowSwitchWrites(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	for _, resultCallback := range []bool{false, true} {
 		t.Run(fmt.Sprintf("result_%t", resultCallback), func(t *testing.T) {
 			srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
@@ -1407,6 +1418,7 @@ func TestMoveReverseWindowSwitchWrites(t *testing.T) {
 				Common:    flags.Common{Threads: 1, WriteThreads: 1}, ReverseWindow: 30 * time.Second,
 			})
 			require.NoError(t, err)
+			shortenReverseWindowPolling(r)
 			defer utils.CloseAndLog(r)
 			switchTraffic := func(ctx context.Context) error {
 				for _, stmt := range []string{
@@ -1507,10 +1519,7 @@ func (s *fatalReasonState) snapshot() []string {
 // table with sql_log_bin=0. Without binary logging the reverse feed does not
 // see the DDL (it would otherwise report a schema change, not a flush error).
 func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
-	shortenReverseWindowPolling(t)
-	oldFlush := reverseFeedFlushInterval
-	reverseFeedFlushInterval = 100 * time.Millisecond
-	t.Cleanup(func() { reverseFeedFlushInterval = oldFlush })
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwfe_src", "rwfe_dst")
 
 	m := &Move{
@@ -1521,6 +1530,8 @@ func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
 	}
 	runner, err := NewRunner(m)
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	runner.tunables.reverseFeedFlushInterval = 100 * time.Millisecond
 	recorder := &fatalReasonState{}
 	runner.logger = slog.New(&fatalReasonRecorder{Handler: slog.Default().Handler(), state: recorder})
 	var reverseCutoverCalled bool
@@ -1559,6 +1570,7 @@ func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
 // window left behind for a table whose name contains a '.' (by a version that
 // did not refuse such names) must be refused before those feeds start.
 func TestResumeReverseWindowRefusesUnsupportedNames(t *testing.T) {
+	t.Parallel()
 	const srcDB = "rwdot_src"
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
 	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
@@ -1589,6 +1601,7 @@ func TestResumeReverseWindowRefusesUnsupportedNames(t *testing.T) {
 // source schema must be refused before the feeds start. A view is not
 // refused. Both paths enter the window through reverseWindow.run.
 func TestReverseWindowEntryRefusesSourceSchemaObjects(t *testing.T) {
+	t.Parallel()
 	const srcDB = "rwobj_src"
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
 	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)
@@ -1637,6 +1650,7 @@ func TestReverseWindowEntryRefusesSourceSchemaObjects(t *testing.T) {
 // traffic switch, the target keeps serving and the checkpoint still records
 // the reverse window, so a re-run resumes it once the object is dropped.
 func TestMoveReverseCutoverRefusesTriggersAndEvents(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, db string
 		create   []string
@@ -1654,7 +1668,6 @@ func TestMoveReverseCutoverRefusesTriggersAndEvents(t *testing.T) {
 		}, "event 'cleanup_e'"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			shortenReverseWindowPolling(t)
 			srcDB, dstDB := tc.db+"_src", tc.db+"_dst"
 			sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, srcDB, dstDB)
 
@@ -1665,6 +1678,7 @@ func TestMoveReverseCutoverRefusesTriggersAndEvents(t *testing.T) {
 				ReverseWindow: 30 * time.Second, // long; the revert ends it early
 			})
 			require.NoError(t, err)
+			shortenReverseWindowPolling(runner)
 			var reverseCutoverCalled bool
 			runner.SetCutover(func(context.Context) error { return nil })
 			runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
@@ -1702,7 +1716,7 @@ func TestMoveReverseCutoverRefusesTriggersAndEvents(t *testing.T) {
 // rollback. One view is named like a retired table (report_old), which the
 // resume must not take for one.
 func TestMoveReverseWindowIgnoresViewsAndRoutines(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcign_src", "rwcign_dst")
 
 	newRunner := func() *Runner {
@@ -1713,6 +1727,7 @@ func TestMoveReverseWindowIgnoresViewsAndRoutines(t *testing.T) {
 			ReverseWindow: 30 * time.Second, // long; the revert ends it early
 		})
 		require.NoError(t, err)
+		shortenReverseWindowPolling(runner)
 		return runner
 	}
 
@@ -1780,6 +1795,7 @@ func execUnlogged(t *testing.T, db *sql.DB, stmt string) {
 // reverse window recovers the moved tables from the source's <table>_old
 // names. Only base tables are retired tables: a view named report_old is not.
 func TestReverseWindowLogicalTablesIgnoresViews(t *testing.T) {
+	t.Parallel()
 	const srcDB = "rwlog_src"
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
 	testutils.RunSQL(t, "CREATE DATABASE "+srcDB)

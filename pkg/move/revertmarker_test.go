@@ -16,6 +16,9 @@ import (
 // while the marker's DROP waits for another session's metadata lock ends the
 // DROP on the server before dropRevertMarker returns, so the DROP cannot remove
 // the marker once that lock is released.
+//
+// Not parallel: it finds the DROP in the processlist by its statement text,
+// which a revert marker drop in another test's schema would also match.
 func TestDropRevertMarkerEndsACancelledDropOnTheServer(t *testing.T) {
 	name, db := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, name, "CREATE TABLE "+revertMarkerName+" (id INT NOT NULL PRIMARY KEY)")

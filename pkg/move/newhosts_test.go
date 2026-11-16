@@ -56,6 +56,7 @@ func newHostsRunner(t *testing.T, read func(server string, exclude func(schema, 
 }
 
 func TestDetectNewHosts(t *testing.T) {
+	t.Parallel()
 	const empty = 1 << 20
 
 	// Every server measured once, leaving out only the move's own tables in
@@ -100,6 +101,7 @@ func TestDetectNewHosts(t *testing.T) {
 
 // On new hosts every target keeps at least two writers.
 func TestMoveSetupThrottlingNewHosts(t *testing.T) {
+	t.Parallel()
 	config, err := mysql.ParseDSN("spirit:spirit@tcp(127.0.0.1:3306)/test")
 	require.NoError(t, err)
 	r, err := NewRunner(&Move{})
@@ -168,6 +170,7 @@ func targetIndexes(t *testing.T, schema string) []string {
 // On new hosts a pre-created target table loses its deferrable secondary
 // indexes before the copy, as a table the move creates is built without them.
 func TestMoveDefersIndexesOfPreCreatedTables(t *testing.T) {
+	t.Parallel()
 	sourceDSN, targetDSN := preCreatedIndexTables(t, "precreated_defer_src", "precreated_defer_dst")
 	r, err := NewRunner(&Move{
 		SourceDSN:     sourceDSN,
@@ -204,6 +207,7 @@ func TestMoveDefersIndexesOfPreCreatedTables(t *testing.T) {
 // A move into a pre-created table on new hosts ends with the table's
 // secondary indexes back, matching the source.
 func TestMovePreCreatedTablesRestoresDeferredIndexes(t *testing.T) {
+	t.Parallel()
 	sourceDSN, targetDSN := preCreatedIndexTables(t, "precreated_restore_src", "precreated_restore_dst")
 	move := &Move{
 		SourceDSN:     sourceDSN,
@@ -237,6 +241,7 @@ func resumeWithIndexes(t *testing.T, srcName, dstName string) *Move {
 // written while, and after, restoreSecondaryIndexes runs, so a drop there
 // could undo a finished restore.
 func TestMoveResumeKeepsIndexes(t *testing.T) {
+	t.Parallel()
 	move := resumeWithIndexes(t, "resume_keep_src", "resume_keep_dst")
 	move.userDataBytes = fixedServerData(true)
 	db, err := sql.Open("block-mysql", testutils.DSN())
@@ -261,6 +266,7 @@ func TestMoveResumeKeepsIndexes(t *testing.T) {
 // without the deferrable index. The resumed move keeps the target as it is
 // and restores the index before its checksum.
 func TestMoveResumeRestoresDeferredIndexes(t *testing.T) {
+	t.Parallel()
 	sourceDSN, targetDSN := preCreatedIndexTables(t, "resume_restore_src", "resume_restore_dst")
 	move := &Move{
 		SourceDSN:     sourceDSN,

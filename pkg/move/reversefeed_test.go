@@ -5,8 +5,9 @@ package move
 // post-forward-copy state, then drive writes on the (former) target side and
 // assert they flow back to the (former) source.
 //
-// Layout: poc_rf_u = the unsharded source U (reverse target). poc_rf_s0 /
-// poc_rf_s1 = two former target shards S (reverse sources) holding DISJOINT,
+// Layout (fanInFixture, one unique database each): u = the unsharded source U
+// (reverse target). s0 / s1 = two former target shards S (reverse sources)
+// holding DISJOINT,
 // globally-unique PKs — so U is exactly their union and the N:1 merge back is
 // collision-free (the sequences/globally-unique-PK precondition from the design).
 
@@ -44,28 +45,33 @@ func reverseTableInfo(t *testing.T, db *sql.DB, schema, name string) *table.Tabl
 	return ti
 }
 
-// setupFanIn builds U + two shards in the post-forward-copy state (U == s0 ∪ s1).
-func setupFanIn(t *testing.T) {
+// fanInFixture names the databases of a fan-in layout: U and two shards.
+type fanInFixture struct{ u, s0, s1 string }
+
+// setupFanIn builds U + two shards in the post-forward-copy state (U == s0 ∪ s1),
+// each in a database of its own test, so the tests can run in parallel.
+func setupFanIn(t *testing.T) fanInFixture {
 	t.Helper()
-	for _, s := range []string{"poc_rf_u", "poc_rf_s0", "poc_rf_s1"} {
-		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+s)
-		testutils.RunSQL(t, "CREATE DATABASE "+s)
-		testutils.RunSQL(t, "CREATE TABLE "+s+".t1 (id INT NOT NULL PRIMARY KEY, val VARCHAR(255))")
+	var f fanInFixture
+	for _, s := range []*string{&f.u, &f.s0, &f.s1} {
+		*s, _ = testutils.CreateUniqueTestDatabase(t)
+		testutils.RunSQL(t, "CREATE TABLE "+*s+".t1 (id INT NOT NULL PRIMARY KEY, val VARCHAR(255))")
 	}
-	testutils.RunSQL(t, "INSERT INTO poc_rf_s0.t1 VALUES (1,'one'),(3,'three'),(5,'five')")
-	testutils.RunSQL(t, "INSERT INTO poc_rf_s1.t1 VALUES (2,'two'),(4,'four'),(6,'six')")
-	testutils.RunSQL(t, "INSERT INTO poc_rf_u.t1  VALUES (1,'one'),(2,'two'),(3,'three'),(4,'four'),(5,'five'),(6,'six')")
+	testutils.RunSQL(t, "INSERT INTO "+f.s0+".t1 VALUES (1,'one'),(3,'three'),(5,'five')")
+	testutils.RunSQL(t, "INSERT INTO "+f.s1+".t1 VALUES (2,'two'),(4,'four'),(6,'six')")
+	testutils.RunSQL(t, "INSERT INTO "+f.u+".t1  VALUES (1,'one'),(2,'two'),(3,'three'),(4,'four'),(5,'five'),(6,'six')")
+	return f
 }
 
 // newFanInFeed wires a reverse feed s0,s1 → U. positions[i], when non-empty,
 // starts source i from that captured position instead of the current head.
-func newFanInFeed(t *testing.T, positions []string) (*ReverseFeed, *sql.DB) {
+func newFanInFeed(t *testing.T, f fanInFixture, positions []string) (*ReverseFeed, *sql.DB) {
 	t.Helper()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	uDB := openSchemaConn(t, "poc_rf_u")
-	uTbl := reverseTableInfo(t, uDB, "poc_rf_u", "t1")
+	uDB := openSchemaConn(t, f.u)
+	uTbl := reverseTableInfo(t, uDB, f.u, "t1")
 
 	mkSource := func(schema string, idx int) ReverseSource {
 		sDB := openSchemaConn(t, schema)
@@ -84,7 +90,7 @@ func newFanInFeed(t *testing.T, positions []string) (*ReverseFeed, *sql.DB) {
 	}
 
 	feed, err := NewReverseFeed(t.Context(), ReverseFeedConfig{
-		Sources:      []ReverseSource{mkSource("poc_rf_s0", 0), mkSource("poc_rf_s1", 1)},
+		Sources:      []ReverseSource{mkSource(f.s0, 0), mkSource(f.s1, 1)},
 		Target:       applier.Target{DB: uDB, KeyRange: "0"},
 		TargetTables: map[string]*table.TableInfo{"t1": uTbl},
 	})
@@ -109,10 +115,10 @@ func dumpRows(t *testing.T, db *sql.DB, query string) []string {
 }
 
 // assertConverged asserts U equals the union of the two shards' current state.
-func assertConverged(t *testing.T, db *sql.DB) {
+func assertConverged(t *testing.T, db *sql.DB, f fanInFixture) {
 	t.Helper()
-	union := dumpRows(t, db, "SELECT id,val FROM poc_rf_s0.t1 UNION ALL SELECT id,val FROM poc_rf_s1.t1 ORDER BY id")
-	got := dumpRows(t, db, "SELECT id,val FROM poc_rf_u.t1 ORDER BY id")
+	union := dumpRows(t, db, "SELECT id,val FROM "+f.s0+".t1 UNION ALL SELECT id,val FROM "+f.s1+".t1 ORDER BY id")
+	got := dumpRows(t, db, "SELECT id,val FROM "+f.u+".t1 ORDER BY id")
 	require.Equal(t, union, got, "U must equal the union of all shards")
 }
 
@@ -120,36 +126,38 @@ func assertConverged(t *testing.T, db *sql.DB) {
 // update, delete) merge back into the single U. This is the N:1 case the
 // original PoC did not cover.
 func TestReverseFeedFanInConverges(t *testing.T) {
-	setupFanIn(t)
-	feed, uDB := newFanInFeed(t, nil)
+	t.Parallel()
+	f := setupFanIn(t)
+	feed, uDB := newFanInFeed(t, f, nil)
 	defer feed.Close()
 	require.NoError(t, feed.Start(t.Context()))
 
 	// "App writes" landing on each shard after cutover.
-	testutils.RunSQL(t, "INSERT INTO poc_rf_s0.t1 VALUES (7,'seven')")
-	testutils.RunSQL(t, "UPDATE poc_rf_s0.t1 SET val='ONE' WHERE id=1")
-	testutils.RunSQL(t, "DELETE FROM poc_rf_s0.t1 WHERE id=3")
-	testutils.RunSQL(t, "INSERT INTO poc_rf_s1.t1 VALUES (8,'eight')")
-	testutils.RunSQL(t, "UPDATE poc_rf_s1.t1 SET val='TWO' WHERE id=2")
-	testutils.RunSQL(t, "DELETE FROM poc_rf_s1.t1 WHERE id=4")
+	testutils.RunSQL(t, "INSERT INTO "+f.s0+".t1 VALUES (7,'seven')")
+	testutils.RunSQL(t, "UPDATE "+f.s0+".t1 SET val='ONE' WHERE id=1")
+	testutils.RunSQL(t, "DELETE FROM "+f.s0+".t1 WHERE id=3")
+	testutils.RunSQL(t, "INSERT INTO "+f.s1+".t1 VALUES (8,'eight')")
+	testutils.RunSQL(t, "UPDATE "+f.s1+".t1 SET val='TWO' WHERE id=2")
+	testutils.RunSQL(t, "DELETE FROM "+f.s1+".t1 WHERE id=4")
 
 	require.NoError(t, feed.Flush(t.Context()))
-	assertConverged(t, uDB)
+	assertConverged(t, uDB, f)
 }
 
 // TestReverseFeedIdempotentReplay: resuming a fresh feed from an EARLIER
 // captured position re-applies a window of events; idempotent REPLACE keeps U
 // correct. Confirms the imprecise-cutover-handoff safety, now per-source (N:1).
 func TestReverseFeedIdempotentReplay(t *testing.T) {
-	setupFanIn(t)
-	feed, uDB := newFanInFeed(t, nil)
+	t.Parallel()
+	f := setupFanIn(t)
+	feed, uDB := newFanInFeed(t, f, nil)
 	require.NoError(t, feed.Start(t.Context()))
 
 	// Batch 1, then capture positions (non-empty after a flush).
-	testutils.RunSQL(t, "INSERT INTO poc_rf_s0.t1 VALUES (7,'seven')")
-	testutils.RunSQL(t, "INSERT INTO poc_rf_s1.t1 VALUES (8,'eight')")
+	testutils.RunSQL(t, "INSERT INTO "+f.s0+".t1 VALUES (7,'seven')")
+	testutils.RunSQL(t, "INSERT INTO "+f.s1+".t1 VALUES (8,'eight')")
 	require.NoError(t, feed.Flush(t.Context()))
-	assertConverged(t, uDB)
+	assertConverged(t, uDB, f)
 
 	pos := feed.Positions()
 	require.Len(t, pos, 2)
@@ -158,32 +166,33 @@ func TestReverseFeedIdempotentReplay(t *testing.T) {
 	}
 
 	// Batch 2 (applied by the live feed), then close.
-	testutils.RunSQL(t, "UPDATE poc_rf_s0.t1 SET val='ONE' WHERE id=1")
-	testutils.RunSQL(t, "DELETE FROM poc_rf_s1.t1 WHERE id=4")
+	testutils.RunSQL(t, "UPDATE "+f.s0+".t1 SET val='ONE' WHERE id=1")
+	testutils.RunSQL(t, "DELETE FROM "+f.s1+".t1 WHERE id=4")
 	require.NoError(t, feed.Flush(t.Context()))
-	assertConverged(t, uDB)
+	assertConverged(t, uDB, f)
 	feed.Close()
 
 	// A fresh feed resumes from the batch-1 positions, replaying batch 2. U is
 	// already up to date, so idempotent apply must leave it converged.
-	replay, uDB2 := newFanInFeed(t, pos)
+	replay, uDB2 := newFanInFeed(t, f, pos)
 	defer replay.Close()
 	require.NoError(t, replay.Start(t.Context()))
 	require.NoError(t, replay.Flush(t.Context()))
-	assertConverged(t, uDB2)
+	assertConverged(t, uDB2, f)
 }
 
 // TestReverseFeedWindowHoldsAndReturns: the feeds stay healthy (no fatal) while
 // held open across a window with writes landing on the sources, and the final
 // drain at the end of the window leaves U converged.
 func TestReverseFeedWindowHoldsAndReturns(t *testing.T) {
-	setupFanIn(t)
-	feed, uDB := newFanInFeed(t, nil)
+	t.Parallel()
+	f := setupFanIn(t)
+	feed, uDB := newFanInFeed(t, f, nil)
 	defer feed.Close()
 	require.NoError(t, feed.Start(t.Context()))
 
-	testutils.RunSQL(t, "INSERT INTO poc_rf_s0.t1 VALUES (7,'seven')")
-	testutils.RunSQL(t, "UPDATE poc_rf_s1.t1 SET val='TWO' WHERE id=2")
+	testutils.RunSQL(t, "INSERT INTO "+f.s0+".t1 VALUES (7,'seven')")
+	testutils.RunSQL(t, "UPDATE "+f.s1+".t1 SET val='TWO' WHERE id=2")
 
 	// Hold the window; the periodic flush runs in the background throughout.
 	// A feed that died mid-window would report it through Err, which is what
@@ -195,7 +204,7 @@ func TestReverseFeedWindowHoldsAndReturns(t *testing.T) {
 	// the sources during the window.
 	require.NoError(t, feed.Flush(t.Context()))
 	require.True(t, feed.AllChangesFlushed())
-	assertConverged(t, uDB)
+	assertConverged(t, uDB, f)
 }
 
 // TestReverseFeedStartCleanupOnPartialFailure: when Start fails partway (here
@@ -205,10 +214,11 @@ func TestReverseFeedWindowHoldsAndReturns(t *testing.T) {
 // package's goleak TestMain fails if the first source's binlog-reader or
 // periodic-flush goroutines survive.
 func TestReverseFeedStartCleanupOnPartialFailure(t *testing.T) {
-	setupFanIn(t)
+	t.Parallel()
+	f := setupFanIn(t)
 	// Source 0 starts from head (succeeds, spawning goroutines); source 1
 	// resumes from an unparseable position and fails, tripping Start's cleanup.
-	feed, _ := newFanInFeed(t, []string{"", "not-a-valid-position"})
+	feed, _ := newFanInFeed(t, f, []string{"", "not-a-valid-position"})
 	err := feed.Start(t.Context())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "start source 1", "the second source must be the one that fails")
@@ -216,47 +226,52 @@ func TestReverseFeedStartCleanupOnPartialFailure(t *testing.T) {
 
 // --- Sharded (M:N) reverse feed ---
 //
-// Layout for the sharded variant: poc_rfnm_u0 / poc_rfnm_u1 = the former
+// Layout for the sharded variant (fanOutFixture): u0 / u1 = the former
 // SOURCE shards (reverse targets), holding their post-cutover retired t1_old
 // tables split by id parity (EvenOddHasher: even → "-80" → u0, odd → "80-" →
-// u1). poc_rfnm_s0 / poc_rfnm_s1 = the former move targets (reverse sources),
+// u1). s0 / s1 = the former move targets (reverse sources),
 // watched under their real t1 names, with the source keyspace's sharding
 // metadata attached — the reverse feed routes each row back to the source
 // shard whose key range contains its hash.
 
-// setupFanOut builds the post-forward-cutover state of a 2:2 move.
-func setupFanOut(t *testing.T) {
+// fanOutFixture names the databases of a 2:2 layout: the former source shards
+// u0 / u1 and the former targets s0 / s1.
+type fanOutFixture struct{ u0, u1, s0, s1 string }
+
+// setupFanOut builds the post-forward-cutover state of a 2:2 move, each
+// database unique to its test.
+func setupFanOut(t *testing.T) fanOutFixture {
 	t.Helper()
-	for _, s := range []string{"poc_rfnm_u0", "poc_rfnm_u1"} {
-		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+s)
-		testutils.RunSQL(t, "CREATE DATABASE "+s)
-		testutils.RunSQL(t, "CREATE TABLE "+s+".t1_old (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
+	var f fanOutFixture
+	for _, s := range []*string{&f.u0, &f.u1} {
+		*s, _ = testutils.CreateUniqueTestDatabase(t)
+		testutils.RunSQL(t, "CREATE TABLE "+*s+".t1_old (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
 	}
-	for _, s := range []string{"poc_rfnm_s0", "poc_rfnm_s1"} {
-		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+s)
-		testutils.RunSQL(t, "CREATE DATABASE "+s)
-		testutils.RunSQL(t, "CREATE TABLE "+s+".t1 (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
+	for _, s := range []*string{&f.s0, &f.s1} {
+		*s, _ = testutils.CreateUniqueTestDatabase(t)
+		testutils.RunSQL(t, "CREATE TABLE "+*s+".t1 (id BIGINT NOT NULL PRIMARY KEY, val VARCHAR(255))")
 	}
 	// Source shards split by id parity; the former targets split by id range
 	// (any distribution works — the feed only cares where rows land, not where
 	// they come from).
-	testutils.RunSQL(t, "INSERT INTO poc_rfnm_u0.t1_old VALUES (2,'two'),(4,'four'),(6,'six')")
-	testutils.RunSQL(t, "INSERT INTO poc_rfnm_u1.t1_old VALUES (1,'one'),(3,'three'),(5,'five')")
-	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s0.t1 VALUES (1,'one'),(2,'two'),(3,'three')")
-	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s1.t1 VALUES (4,'four'),(5,'five'),(6,'six')")
+	testutils.RunSQL(t, "INSERT INTO "+f.u0+".t1_old VALUES (2,'two'),(4,'four'),(6,'six')")
+	testutils.RunSQL(t, "INSERT INTO "+f.u1+".t1_old VALUES (1,'one'),(3,'three'),(5,'five')")
+	testutils.RunSQL(t, "INSERT INTO "+f.s0+".t1 VALUES (1,'one'),(2,'two'),(3,'three')")
+	testutils.RunSQL(t, "INSERT INTO "+f.s1+".t1 VALUES (4,'four'),(5,'five'),(6,'six')")
+	return f
 }
 
 // newFanOutFeed wires the sharded reverse feed s0,s1 → u0 ("-80"), u1 ("80-").
-func newFanOutFeed(t *testing.T) (*ReverseFeed, *sql.DB) {
+func newFanOutFeed(t *testing.T, f fanOutFixture) (*ReverseFeed, *sql.DB) {
 	t.Helper()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	u0DB := openSchemaConn(t, "poc_rfnm_u0")
-	u1DB := openSchemaConn(t, "poc_rfnm_u1")
+	u0DB := openSchemaConn(t, f.u0)
+	u1DB := openSchemaConn(t, f.u1)
 	// One shared _old mapping TableInfo: the name is unqualified, so each
 	// shard's own connection determines the database written to.
-	oldTbl := reverseTableInfo(t, u0DB, "poc_rfnm_u0", "t1_old")
+	oldTbl := reverseTableInfo(t, u0DB, f.u0, "t1_old")
 
 	mkSource := func(schema string) ReverseSource {
 		sDB := openSchemaConn(t, schema)
@@ -273,7 +288,7 @@ func newFanOutFeed(t *testing.T) (*ReverseFeed, *sql.DB) {
 	}
 
 	feed, err := NewReverseFeed(t.Context(), ReverseFeedConfig{
-		Sources: []ReverseSource{mkSource("poc_rfnm_s0"), mkSource("poc_rfnm_s1")},
+		Sources: []ReverseSource{mkSource(f.s0), mkSource(f.s1)},
 		Targets: []applier.Target{
 			{DB: u0DB, KeyRange: "-80"},
 			{DB: u1DB, KeyRange: "80-"},
@@ -288,29 +303,30 @@ func newFanOutFeed(t *testing.T) (*ReverseFeed, *sql.DB) {
 // to the source SHARD owning each row (by the source vindex), into its t1_old
 // table. This is the M:N reverse the 1:N fan-in tests above cannot cover.
 func TestReverseFeedFanOutRoutesByShard(t *testing.T) {
-	setupFanOut(t)
-	feed, ctl := newFanOutFeed(t)
+	t.Parallel()
+	f := setupFanOut(t)
+	feed, ctl := newFanOutFeed(t, f)
 	defer feed.Close()
 	require.NoError(t, feed.Start(t.Context()))
 
 	// "App writes" landing on each former target after cutover.
-	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s0.t1 VALUES (7,'seven')")  // odd  → u1
-	testutils.RunSQL(t, "INSERT INTO poc_rfnm_s1.t1 VALUES (8,'eight')")  // even → u0
-	testutils.RunSQL(t, "UPDATE poc_rfnm_s0.t1 SET val='TWO' WHERE id=2") // even → u0
-	testutils.RunSQL(t, "DELETE FROM poc_rfnm_s1.t1 WHERE id=5")          // broadcast delete
+	testutils.RunSQL(t, "INSERT INTO "+f.s0+".t1 VALUES (7,'seven')")  // odd  → u1
+	testutils.RunSQL(t, "INSERT INTO "+f.s1+".t1 VALUES (8,'eight')")  // even → u0
+	testutils.RunSQL(t, "UPDATE "+f.s0+".t1 SET val='TWO' WHERE id=2") // even → u0
+	testutils.RunSQL(t, "DELETE FROM "+f.s1+".t1 WHERE id=5")          // broadcast delete
 
 	require.NoError(t, feed.Flush(t.Context()))
 
 	require.Equal(t,
 		[]string{"2=TWO", "4=four", "6=six", "8=eight"},
-		dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_u0.t1_old ORDER BY id"),
+		dumpRows(t, ctl, "SELECT id,val FROM "+f.u0+".t1_old ORDER BY id"),
 		"u0 must hold exactly the even rows")
 	require.Equal(t,
 		[]string{"1=one", "3=three", "7=seven"},
-		dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_u1.t1_old ORDER BY id"),
+		dumpRows(t, ctl, "SELECT id,val FROM "+f.u1+".t1_old ORDER BY id"),
 		"u1 must hold exactly the odd rows")
-	union := dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_s0.t1 UNION ALL SELECT id,val FROM poc_rfnm_s1.t1 ORDER BY id")
-	got := dumpRows(t, ctl, "SELECT id,val FROM poc_rfnm_u0.t1_old UNION ALL SELECT id,val FROM poc_rfnm_u1.t1_old ORDER BY id")
+	union := dumpRows(t, ctl, "SELECT id,val FROM "+f.s0+".t1 UNION ALL SELECT id,val FROM "+f.s1+".t1 ORDER BY id")
+	got := dumpRows(t, ctl, "SELECT id,val FROM "+f.u0+".t1_old UNION ALL SELECT id,val FROM "+f.u1+".t1_old ORDER BY id")
 	require.Equal(t, union, got, "the source shards' union must equal the former targets' union")
 }
 
@@ -318,15 +334,16 @@ func TestReverseFeedFanOutRoutesByShard(t *testing.T) {
 // a config that could not route (both target forms set, or watched tables
 // without sharding metadata).
 func TestReverseFeedShardedConfigValidation(t *testing.T) {
-	setupFanOut(t)
+	t.Parallel()
+	f := setupFanOut(t)
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
-	u0DB := openSchemaConn(t, "poc_rfnm_u0")
-	u1DB := openSchemaConn(t, "poc_rfnm_u1")
-	oldTbl := reverseTableInfo(t, u0DB, "poc_rfnm_u0", "t1_old")
-	sDB := openSchemaConn(t, "poc_rfnm_s0")
-	bare := reverseTableInfo(t, sDB, "poc_rfnm_s0", "t1") // no sharding metadata
+	u0DB := openSchemaConn(t, f.u0)
+	u1DB := openSchemaConn(t, f.u1)
+	oldTbl := reverseTableInfo(t, u0DB, f.u0, "t1_old")
+	sDB := openSchemaConn(t, f.s0)
+	bare := reverseTableInfo(t, sDB, f.s0, "t1") // no sharding metadata
 	src := ReverseSource{
 		DB: sDB, Addr: cfg.Addr, User: cfg.User, Password: cfg.Passwd,
 		Tables: []*table.TableInfo{bare},
@@ -370,6 +387,7 @@ func TestReverseFeedShardedConfigValidation(t *testing.T) {
 // reports that by leaving the changes buffered, and Flush's own loop exits on a
 // *trivial* backlog rather than an empty one.
 func TestReverseFeedAllChangesFlushed(t *testing.T) {
+	t.Parallel()
 	clean := &change.MockSource{}
 	stuck := &change.MockSource{Pending: true}
 

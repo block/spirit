@@ -51,6 +51,7 @@ func (s *outcomeSink) outcomes() []status.WorkflowPhaseOutcome {
 // phase that returns the context error when it is stopped, so the test does
 // not race the copy.
 func TestMoveFatalAbort(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -125,6 +126,7 @@ func TestMoveFatalAbort(t *testing.T) {
 // what Run's own status.AbortCause is for. The fatal fires as Run logs its
 // first line, and the setup's next query then sees the cancelled context.
 func TestMoveFatalAbortBeforeFirstPhase(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
@@ -186,6 +188,7 @@ func (p *parkAfterChunks) BlockWait(ctx context.Context) {
 // cancellation, so Run returned context.Canceled and the failure was reported
 // as if an operator had cancelled the move.
 func TestMoveCheckpointWriteFailureReturnsCause(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)

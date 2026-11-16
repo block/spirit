@@ -21,31 +21,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setReverseCutoverUnderLockHook installs fn as reverseCutoverUnderLockHook
-// for the test. Tests that use it must not run in parallel.
-func setReverseCutoverUnderLockHook(t *testing.T, fn func(ctx context.Context) error) {
-	t.Helper()
-	old := reverseCutoverUnderLockHook
-	reverseCutoverUnderLockHook = fn
-	t.Cleanup(func() { reverseCutoverUnderLockHook = old })
+// setReverseCutoverUnderLockHook installs fn as r's reverse cutover
+// under-lock hook (tunables.reverseCutoverUnderLockHook).
+func setReverseCutoverUnderLockHook(r *Runner, fn func(ctx context.Context) error) {
+	r.tunables.reverseCutoverUnderLockHook = fn
 }
 
 // TestMoveReverseCutoverRetriesAfterLockTimeout: a reverse cutover attempt
 // that holds the target locks past the cutover lock timeout before it writes
 // the reverting phase moves no ownership. It releases the locks, the window
 // stays open with the reverse feed running, and the next tick tries again.
+//
+// Not parallel: the second attempt must fit the reverse feed's catch-up in its
+// 2s cutover lock timeout, which load from parallel moves makes less certain
+// (#1513).
 func TestMoveReverseCutoverRetriesAfterLockTimeout(t *testing.T) {
-	shortenReverseWindowPolling(t)
 	var attempts atomic.Int32
-	setReverseCutoverUnderLockHook(t, func(ctx context.Context) error {
-		if attempts.Add(1) == 1 {
-			// Stands in for slow work under the locks: it ends only when the
-			// cutover lock timeout cancels it.
-			<-ctx.Done()
-			return ctx.Err()
-		}
-		return nil
-	})
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwlt_src", "rwlt_dst")
 
 	runner, err := NewRunner(&Move{
@@ -60,6 +51,16 @@ func TestMoveReverseCutoverRetriesAfterLockTimeout(t *testing.T) {
 		CutoverLockTimeout: 2 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	setReverseCutoverUnderLockHook(runner, func(ctx context.Context) error {
+		if attempts.Add(1) == 1 {
+			// Stands in for slow work under the locks: it ends only when the
+			// cutover lock timeout cancels it.
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	})
 	var reverseCutoverCalls atomic.Int32
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalls.Add(1); return nil })
@@ -85,21 +86,15 @@ func TestMoveReverseCutoverRetriesAfterLockTimeout(t *testing.T) {
 // attempts. No ownership moved: the target keeps serving, the source stays
 // retired, and the checkpoint still records the reverse window, so a re-run
 // resumes it.
+//
+// Not parallel: every attempt runs under a 200ms cutover lock timeout and the
+// test asserts their spacing, and short lock timeouts flake on a busy binlog
+// (#1486, #1513).
 func TestMoveReverseCutoverGivesUpAfterMaxRetries(t *testing.T) {
-	shortenReverseWindowPolling(t)
 	const backoff = 500 * time.Millisecond
-	setReverseCutoverBackoff(t, backoff)
 	var attempts atomic.Int32
 	var mu sync.Mutex
 	var started []time.Time
-	setReverseCutoverUnderLockHook(t, func(ctx context.Context) error {
-		attempts.Add(1)
-		mu.Lock()
-		started = append(started, time.Now())
-		mu.Unlock()
-		<-ctx.Done()
-		return ctx.Err()
-	})
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwmr_src", "rwmr_dst")
 
 	runner, err := NewRunner(&Move{
@@ -110,6 +105,16 @@ func TestMoveReverseCutoverGivesUpAfterMaxRetries(t *testing.T) {
 		CutoverLockTimeout: 200 * time.Millisecond,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	setReverseCutoverBackoff(runner, backoff)
+	setReverseCutoverUnderLockHook(runner, func(ctx context.Context) error {
+		attempts.Add(1)
+		mu.Lock()
+		started = append(started, time.Now())
+		mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
+	})
 	var reverseCutoverCalled atomic.Bool
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled.Store(true); return nil })
@@ -147,10 +152,7 @@ func TestMoveReverseCutoverGivesUpAfterMaxRetries(t *testing.T) {
 // ownership changed nothing, so it is called again under the target locks
 // instead of leaving the move half rolled back.
 func TestMoveReverseCutoverRetriesCleanCallbackFailure(t *testing.T) {
-	shortenReverseWindowPolling(t)
-	oldWait := renameRetryWait
-	renameRetryWait = 10 * time.Millisecond
-	t.Cleanup(func() { renameRetryWait = oldWait })
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcb_src", "rwcb_dst")
 
 	runner, err := NewRunner(&Move{
@@ -160,6 +162,8 @@ func TestMoveReverseCutoverRetriesCleanCallbackFailure(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	runner.tunables.renameRetryWait = 10 * time.Millisecond
 	var calls atomic.Int32
 	runner.SetCutover(func(context.Context) error { return nil })
 	runner.SetReverseCutoverWithResult(func(context.Context) (CutoverResult, error) {
@@ -183,9 +187,7 @@ func TestMoveReverseCutoverRetriesCleanCallbackFailure(t *testing.T) {
 // TestSwitchTrafficToSourceRetryPolicy: only a callback failure that reports
 // neither a durable mutation nor ambiguous ownership is retried.
 func TestSwitchTrafficToSourceRetryPolicy(t *testing.T) {
-	oldWait := renameRetryWait
-	renameRetryWait = time.Millisecond
-	t.Cleanup(func() { renameRetryWait = oldWait })
+	t.Parallel()
 	callbackErr := errors.New("routing write failed")
 	for _, tc := range []struct {
 		name      string
@@ -201,6 +203,7 @@ func TestSwitchTrafficToSourceRetryPolicy(t *testing.T) {
 			w := &reverseWindow{r: &Runner{
 				dbConfig: dbconn.NewDBConfig(),
 				logger:   slog.Default(),
+				tunables: tunables{renameRetryWait: time.Millisecond},
 				reverseCutoverResultFunc: func(context.Context) (CutoverResult, error) {
 					calls.Add(1)
 					return tc.result, callbackErr
@@ -217,6 +220,7 @@ func TestSwitchTrafficToSourceRetryPolicy(t *testing.T) {
 // no ownership and that no check refused, while ctx is live and fewer than
 // MaxRetries attempts have failed.
 func TestMayRetryReverseCutover(t *testing.T) {
+	t.Parallel()
 	w := &reverseWindow{r: &Runner{dbConfig: dbconn.NewDBConfig()}}
 	maxRetries := w.r.dbConfig.MaxRetries
 	abandoned := abandonReverseCutover(errors.New("lock target 3: connection reset"))
@@ -237,6 +241,7 @@ func TestMayRetryReverseCutover(t *testing.T) {
 // the locks cannot wait on one already running, and restarts them when the
 // attempt is abandoned.
 func TestReverseFeedPauseResumePeriodicFlush(t *testing.T) {
+	t.Parallel()
 	a, b := &change.MockSource{}, &change.MockSource{}
 	rf := &ReverseFeed{clients: []change.Source{a, b}, flushInt: time.Second}
 	rf.PausePeriodicFlush()
@@ -252,10 +257,8 @@ func TestReverseFeedPauseResumePeriodicFlush(t *testing.T) {
 // which runs after the reverse feed is closed, is retried in place up to
 // MaxRetries attempts, each bounded by the cutover lock timeout.
 func TestRetryAutoIncrementCarry(t *testing.T) {
-	oldWait := renameRetryWait
-	renameRetryWait = time.Millisecond
-	t.Cleanup(func() { renameRetryWait = oldWait })
-	r := &Runner{dbConfig: dbconn.NewDBConfig(), logger: slog.Default()}
+	t.Parallel()
+	r := &Runner{dbConfig: dbconn.NewDBConfig(), logger: slog.Default(), tunables: tunables{renameRetryWait: time.Millisecond}}
 	maxRetries := int32(r.dbConfig.MaxRetries)
 	carryErr := errors.New("SHOW CREATE TABLE: connection reset")
 
@@ -311,7 +314,7 @@ func TestRetryAutoIncrementCarry(t *testing.T) {
 // more than one table drops every stale _revert table on the target, then
 // retires every table there in one rename, and logs how long the target took.
 func TestMoveReverseCutoverRetiresEveryTable(t *testing.T) {
-	shortenReverseWindowPolling(t)
+	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwmt_src", "rwmt_dst")
 	testutils.RunSQL(t, "CREATE TABLE rwmt_src.t2 (id INT PRIMARY KEY, val VARCHAR(255))")
 
@@ -322,6 +325,7 @@ func TestMoveReverseCutoverRetiresEveryTable(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
 	logs := &lockedBuffer{}
 	runner.SetLogger(slog.New(slog.NewTextHandler(logs, nil)))
 	runner.SetCutover(func(context.Context) error { return nil })
@@ -363,10 +367,8 @@ func columnExists(t *testing.T, db *sql.DB, schema, table, column string) bool {
 // update left running would fail against the renamed tables until the window
 // closes.
 func TestMoveStopsStatisticsUpdatesBeforeTheReverseWindow(t *testing.T) {
-	shortenReverseWindowPolling(t)
-	interval := tableStatUpdateInterval
-	tableStatUpdateInterval = 20 * time.Millisecond
-	t.Cleanup(func() { tableStatUpdateInterval = interval })
+	t.Parallel()
+	const statsInterval = 20 * time.Millisecond
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwst_src", "rwst_dst")
 
 	runner, err := NewRunner(&Move{
@@ -376,6 +378,8 @@ func TestMoveStopsStatisticsUpdatesBeforeTheReverseWindow(t *testing.T) {
 		ReverseWindow: 30 * time.Second,
 	})
 	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	runner.tunables.tableStatUpdateInterval = statsInterval
 	logs := &lockedBuffer{}
 	runner.SetLogger(slog.New(slog.NewTextHandler(logs, nil)))
 	runner.SetCutover(func(context.Context) error { return nil })
@@ -384,7 +388,7 @@ func TestMoveStopsStatisticsUpdatesBeforeTheReverseWindow(t *testing.T) {
 
 	h.awaitReverseWindow(ctl, "rwst_dst")
 	// Many update intervals inside the window.
-	time.Sleep(20 * tableStatUpdateInterval)
+	time.Sleep(20 * statsInterval)
 	testutils.RunSQL(t, "CREATE TABLE rwst_dst."+revertMarkerName+" (id INT)")
 	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete")
 

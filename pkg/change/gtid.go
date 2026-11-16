@@ -74,7 +74,7 @@ type gtidClient struct {
 // Most callers should use NewAutoClient instead, which selects between this
 // and the binlog client based on the server's GTID support (fresh runs) or
 // the checkpointed position's encoding (resumes).
-func NewGTIDClient(db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig) Source {
+func NewGTIDClient(db *sql.DB, host string, username, password string, appl applier.StreamedChangesWriter, config *ClientConfig) Source {
 	c := &gtidClient{}
 	c.configure(db, host, username, password, appl, config)
 	return c

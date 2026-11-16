@@ -20,10 +20,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// renameRetryWait is the pause between RENAME TABLE attempts while the
-// source table locks are still held. A var (not a const) so tests can
-// shorten it.
-var renameRetryWait = 1 * time.Second
+// defaultRenameRetryWait is the pause between RENAME TABLE attempts while the
+// table locks are still held. A test shortens it per CutOver
+// (CutOver.renameRetryWait) or per Runner (tunables.renameRetryWait).
+const defaultRenameRetryWait = 1 * time.Second
 
 // errRenameRollbackFailed marks a rename failure whose rollback also failed,
 // leaving the sources in a partially-renamed state. Retrying the rename in
@@ -100,6 +100,10 @@ type CutOver struct {
 	// lockTimeout bounds how long an attempt holds the source locks before the
 	// traffic switch. See SetLockTimeout.
 	lockTimeout time.Duration
+
+	// renameRetryWait is the pause between rename attempts under the source
+	// locks. NewCutOver sets it to defaultRenameRetryWait.
+	renameRetryWait time.Duration
 
 	// testSleep, when non-nil, replaces the backoff between cutover attempts
 	// (see runtime.CutoverRetry.Sleep). It is a test seam.
@@ -178,6 +182,8 @@ func NewCutOver(sources []CutOverSource, cutoverFunc func(ctx context.Context) e
 		dbConfig:    dbConfig,
 		logger:      logger,
 		lockTimeout: DefaultCutoverLockTimeout,
+		// A Runner replaces it with its own tunables.renameRetryWait.
+		renameRetryWait: defaultRenameRetryWait,
 	}, nil
 }
 
@@ -398,7 +404,7 @@ func (c *CutOver) algorithmCutover(ctx context.Context) (err error) {
 			c.logger.Warn("retrying rename while still holding source table locks",
 				"attempt", attempt,
 				"max_retries", c.dbConfig.MaxRetries)
-			time.Sleep(renameRetryWait)
+			time.Sleep(c.renameRetryWait)
 		}
 		if err = c.renameAllSources(afterSwitch, sourceLocks); err == nil {
 			// Every source is renamed and the source locks are still held, so no
