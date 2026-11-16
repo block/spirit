@@ -2165,8 +2165,8 @@ func TestMoveForcePreservesTargetOnSourceSideFailure(t *testing.T) {
 //
 // All three states reach --force through one predicate
 // (isDefinitivelyUnresumable), so they share one checkpoint: each is planted in
-// turn and refused without --force, which changes nothing, and one --force run
-// recovers from the last.
+// turn and refused without --force, which changes nothing. Each refusal is
+// asserted to satisfy the predicate, and one --force run recovers from the last.
 func TestMoveForceRecoversUnresumableCheckpoint(t *testing.T) {
 	t.Parallel()
 	srcDB, sourceDB := testutils.CreateUniqueTestDatabase(t)
@@ -2237,6 +2237,9 @@ func TestMoveForceRecoversUnresumableCheckpoint(t *testing.T) {
 			require.Error(t, err)
 			require.ErrorIs(t, err, tc.wantSentinel)
 			require.ErrorContains(t, err, tc.wantErrContains)
+			// The --force run below recovers from the last state only, so
+			// assert here that --force would recover from each of them.
+			require.True(t, isDefinitivelyUnresumable(err), "--force must wipe and restart from this state")
 			require.False(t, r.usedResumeFromCheckpoint.Load())
 			require.NoError(t, r.Close())
 
