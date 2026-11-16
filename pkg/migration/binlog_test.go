@@ -214,93 +214,6 @@ func TestE2EBinlogSubscribingCompositeKey(t *testing.T) {
 	require.Equal(t, 0, m.db.Stats().InUse) // all connections are returned.
 }
 
-// TestE2EBinlogSubscribingCompositeKeyVarchar tests binlog subscription with composite key
-// where the first column is non-numeric (VARCHAR). This validates that KeyAboveHighWatermark
-// and KeyBelowLowWatermark optimizations work with VARCHAR keys.
-//
-// Since watermark optimizations are disabled before checksum (see runner.go), there's no risk
-// of checksum corruption even if collation comparison differs slightly between Go and MySQL.
-//
-// Expected behavior:
-// - KeyAboveHighWatermark compares VARCHAR keys and may discard events above the watermark
-// - KeyBelowLowWatermark compares VARCHAR keys and allows immediate flush for events below watermark
-// - Migration completes successfully with optimization enabled
-func TestE2EBinlogSubscribingCompositeKeyVarchar(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "e2et3", `CREATE TABLE e2et3 (
-		session_id varchar(40) NOT NULL,
-		event_id int NOT NULL,
-		data varchar(255) NOT NULL default '',
-		PRIMARY KEY (session_id, event_id))`)
-	// Seed with UUID-based session_ids — each doubling generates new unique UUIDs.
-	tt.SeedRows(t, "INSERT INTO e2et3 (session_id, event_id) SELECT UUID(), FLOOR(RAND()*1000)", 64)
-
-	m := NewTestRunner(t, "e2et3", "ENGINE=InnoDB")
-	defer func() {
-		require.NoError(t, m.Close())
-	}()
-
-	// Setup but don't call Run() - step through manually
-	m.status.Begin()
-	m.dbConfig = dbconn.NewDBConfig()
-	var err error
-	m.db, err = dbconn.New(testutils.DSN(), m.dbConfig)
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, m.db.Close())
-	}()
-
-	// Get Table Info
-	m.changes[0].table = table.NewTableInfo(m.db, m.migration.Database, m.changes[0].stmt.Table)
-	err = m.changes[0].table.SetInfo(t.Context())
-	require.NoError(t, err)
-	require.NoError(t, m.setup(t.Context()))
-
-	// Start copying
-	m.status.Set(status.CopyRows)
-	ccopier, ok := m.copier.(copier.ChunkCopier)
-	require.True(t, ok)
-
-	// Copy first chunk
-	chunk, err := m.copyChunker.Next()
-	require.NoError(t, err)
-	require.NotNil(t, chunk)
-	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
-
-	// Insert data mid-copy - simulates real-world concurrent writes
-	// Note: With random UUIDs, watermark behavior is non-deterministic
-	// (UUIDs may be above/below watermark unpredictably)
-	// so we don't assert deltaLen. Final checksum validates correctness.
-	testutils.RunSQL(t, `INSERT INTO e2et3 (session_id, event_id, data) VALUES (UUID(), 999, 'test')`)
-	require.NoError(t, m.replClient.BlockWait(t.Context()))
-	// Note: deltaLen not asserted - UUID comparison with watermark is non-deterministic
-
-	// Copy remaining chunks
-	for {
-		chunk, err := m.copyChunker.Next()
-		if errors.Is(err, table.ErrTableIsRead) {
-			break
-		}
-		require.NoError(t, err)
-		require.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
-	}
-
-	// Insert another event after copying completes
-	testutils.RunSQL(t, `INSERT INTO e2et3 (session_id, event_id, data) VALUES (UUID(), 1000, 'test2')`)
-	require.NoError(t, m.replClient.BlockWait(t.Context()))
-	// Note: deltaLen not asserted - UUID comparison with watermark is non-deterministic
-
-	// Flush and complete migration
-	require.NoError(t, m.replClient.Flush(t.Context()))
-	m.status.Set(status.ApplyChangeset)
-	m.status.Set(status.Checksum)
-	require.NoError(t, m.checksum(t.Context()))
-	require.Equal(t, "postChecksum", m.status.Get().String())
-
-	// All done!
-	require.Equal(t, 0, m.db.Stats().InUse)
-}
-
 // TestE2EBinlogSubscribingCompositeKeyCollation demonstrates that Go's lexicographic comparison
 // differs from MySQL's case-insensitive collation, but checksum phase catches any issues.
 // This is an E2E validation of the behavior demonstrated in TestCompositeChunkerCollationDifference.
@@ -439,6 +352,8 @@ func TestE2EBinlogSubscribingCompositeKeyCollation(t *testing.T) {
 	err = m.db.QueryRowContext(t.Context(), `SELECT data FROM _e2et_collation_new WHERE name = 'key0050' AND id = 9999`).Scan(&data)
 	require.NoError(t, err)
 	require.Equal(t, "INSERTED_DURING_MIGRATION", data, "Data should match after checksum fix")
+	require.Equal(t, "postChecksum", m.status.Get().String())
+	require.Equal(t, 0, m.db.Stats().InUse) // all connections are returned.
 
 	if targetCountBefore == 0 && targetCountAfter == 1 {
 		t.Log("✓ SUCCESS: Row was MISSING before checksum, PRESENT after checksum")

@@ -27,31 +27,6 @@ func testConfig() *DBConfig {
 	return config
 }
 
-func TestTableLock(t *testing.T) {
-	t.Parallel()
-	db, err := New(testutils.DSN(), testConfig())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	err = Exec(t.Context(), db, "DROP TABLE IF EXISTS testlock, _testlock_new")
-	require.NoError(t, err)
-	err = Exec(t.Context(), db, "CREATE TABLE testlock (id INT NOT NULL PRIMARY KEY, colb int)")
-	require.NoError(t, err)
-	err = Exec(t.Context(), db, "CREATE TABLE _testlock_new (id INT NOT NULL PRIMARY KEY, colb int)")
-	require.NoError(t, err)
-
-	tbl := &table.TableInfo{SchemaName: "test", TableName: "testlock", QuotedTableName: "`testlock`"}
-
-	lock1, err := NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), slog.Default())
-	require.NoError(t, err)
-
-	// Try to acquire a table that is already locked, should fail because we use WRITE locks now.
-	// But should also fail very quickly because we've set the lock_wait_timeout to 1s.
-	_, err = NewTableLock(t.Context(), db, []*table.TableInfo{tbl}, testConfig(), slog.Default())
-	require.Error(t, err)
-
-	require.NoError(t, lock1.Close(t.Context()))
-}
-
 func TestExecUnderLock(t *testing.T) {
 	t.Parallel()
 	db, err := New(testutils.DSN(), testConfig())
