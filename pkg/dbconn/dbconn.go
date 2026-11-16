@@ -555,7 +555,9 @@ func (e *CancelledStatementError) Unwrap() []error {
 // cancelledStatementKillTimeout bounds killing the session of a cancelled
 // statement and waiting for it to exit. A killed statement that was changing a
 // table rolls back before its session exits, so this is independent of
-// LockWaitTimeout.
+// LockWaitTimeout. It bounds two waits in turn: for the statement to reply to
+// KILL QUERY, and then for its session to exit after KILL CONNECTION. A cancel
+// that needs both can take up to twice this long to return.
 const cancelledStatementKillTimeout = 30 * time.Second
 
 // endCancelledConn discards conn, whose statement the caller cancelled, and
