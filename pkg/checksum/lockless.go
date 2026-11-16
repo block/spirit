@@ -213,6 +213,9 @@ type LocklessChecker struct {
 	chunker   table.Chunker
 	feeds     []change.Source
 
+	// unparkableNoted makes noteUnparkableFeeds log once per checker.
+	unparkableNoted sync.Once
+
 	// recopier is the repair path Run uses. Read it through repairer, which
 	// withholds it from RunContinuous: a confirmed divergence is repaired by
 	// Run and returns ErrPermanentDivergence from RunContinuous. It is nil
@@ -1400,6 +1403,7 @@ func (c *LocklessChecker) checkHotSnapshot(ctx context.Context, res *workResult,
 	// settle each outstanding row against the change stream's own image of it —
 	// see lockless_settle.go for why that verdict is trustworthy where a poll's
 	// is not.
+	c.noteUnparkableFeeds()
 	verdict, err := newRowSettler(c.sourceDBs, c.feeds, c.cfg.Logger).settle(ctx, snapshot)
 	if err != nil {
 		res.err = fmt.Errorf("settle hot range: %w", err)
@@ -1428,6 +1432,26 @@ func (c *LocklessChecker) checkHotSnapshot(ctx context.Context, res *workResult,
 		c.cfg.Logger.Info("lockless checksum: hot range could not be settled; deferring to the next pass",
 			"chunk", res.item.chunk.String(), "rows_remaining", len(snapshot.pending), "attempts", snapshot.attempts)
 	}
+}
+
+// noteUnparkableFeeds logs, at info and once per checker, each feed that is not
+// a change.ParkableSource. Settling a hot row needs the feed to park, so every
+// hot range on such a feed defers on every pass, and the per-range "could not
+// be settled" line is the same one a row that merely went quiet produces. This
+// is the line that says retrying cannot help. It runs at the first escalation
+// rather than at construction so a run with no hot range does not mention it.
+func (c *LocklessChecker) noteUnparkableFeeds() {
+	c.unparkableNoted.Do(func() {
+		for i, feed := range c.feeds {
+			if feed == nil {
+				continue
+			}
+			if _, ok := feed.(change.ParkableSource); !ok {
+				c.cfg.Logger.Info("lockless checksum: change feed cannot park, so its hot ranges will defer on every pass",
+					"source", i, "feed_type", fmt.Sprintf("%T", feed))
+			}
+		}
+	})
 }
 
 // resolveSettledDivergence applies the configured divergence policy to a range

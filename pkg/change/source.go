@@ -209,7 +209,13 @@ type Source interface {
 // that log for as long as the reader is held.
 //
 // A wrapper around a Source must not implement this unconditionally: the type
-// assertion would then succeed for a wrapped Source that cannot park.
+// assertion would then succeed for a wrapped Source that cannot park. The
+// opposite mistake is the easier one to make: a struct that embeds the Source
+// interface does not keep the wrapped source's parking, because
+// VerifyRowAtNextChange is not in Source's method set. It still compiles, and
+// the checksum then defers every hot range it would have settled. A wrapper
+// that should keep parking forwards VerifyRowAtNextChange only when its inner
+// source is a ParkableSource.
 type ParkableSource interface {
 	Source
 
