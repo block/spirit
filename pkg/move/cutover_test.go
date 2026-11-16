@@ -27,6 +27,7 @@ import (
 )
 
 func TestNewCutOverValidation(t *testing.T) {
+	t.Parallel()
 	dbConfig := dbconn.NewDBConfig()
 	logger := slog.Default()
 
@@ -114,6 +115,7 @@ func TestNewCutOverValidation(t *testing.T) {
 // blocks source 1's LOCK TABLES attempt. In production, each source is
 // a separate MySQL server so this is not an issue.
 func TestCutOverSingleSource(t *testing.T) {
+	t.Parallel()
 	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
 
 	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE t1 (
@@ -187,6 +189,10 @@ func TestCutOverSingleSource(t *testing.T) {
 //   - the rename itself;
 //   - the reverse-window post-switch hook, which runs before the rename;
 //   - a rename retry after a first attempt that failed.
+//
+// Not parallel: the rename retry case drops the leftover t1_old 125ms into a
+// 250ms wait between rename attempts, a window that load from parallel tests
+// can push it out of.
 func TestCutOverCancelAfterSwitchStillRenamesSource(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -209,10 +215,8 @@ func TestCutOverCancelAfterSwitchStillRenamesSource(t *testing.T) {
 			testutils.RunSQLInDatabase(t, srcName, "INSERT INTO t1 (id, val) VALUES (1, 'a'), (2, 'b')")
 			if tc.failFirstRename {
 				testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1_old (id INT NOT NULL PRIMARY KEY)")
-				originalRenameRetryWait := renameRetryWait
-				renameRetryWait = 250 * time.Millisecond
-				t.Cleanup(func() { renameRetryWait = originalRenameRetryWait })
 			}
+			const renameRetryWait = 250 * time.Millisecond
 
 			dbConfig := dbconn.NewDBConfig()
 			dbConfig.MaxRetries = 5
@@ -253,6 +257,7 @@ func TestCutOverCancelAfterSwitchStillRenamesSource(t *testing.T) {
 				return nil
 			}, dbConfig, logger)
 			require.NoError(t, err)
+			cutover.renameRetryWait = renameRetryWait
 			if tc.postSwitch != nil {
 				cutover.SetPostSwitch(tc.postSwitch)
 			}
@@ -281,6 +286,8 @@ func TestCutOverCancelAfterSwitchStillRenamesSource(t *testing.T) {
 // invocation count (2) rather than on a Run error. On fixed code the second
 // invocation never happens; a background goroutine drops the leftover table
 // instead, allowing an under-lock rename retry to succeed.
+//
+// Not parallel: the drop must land between rename attempts 250ms apart.
 func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
 
@@ -298,13 +305,11 @@ func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 
 	dbConfig := dbconn.NewDBConfig()
 	// Pin MaxRetries explicitly so the rename retry loop's iteration count does
-	// not depend on the dbconn default, and shorten renameRetryWait so the test
-	// (which times a DROP to land between rename attempts) is fast and not
-	// coupled to the production constant. Restore on cleanup.
+	// not depend on the dbconn default, and shorten the CutOver's renameRetryWait so
+	// the test (which times a DROP to land between rename attempts) is fast and
+	// not coupled to the production constant.
 	dbConfig.MaxRetries = 5
-	originalRenameRetryWait := renameRetryWait
-	renameRetryWait = 250 * time.Millisecond
-	t.Cleanup(func() { renameRetryWait = originalRenameRetryWait })
+	const renameRetryWait = 250 * time.Millisecond
 	logger := slog.Default()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -364,6 +369,7 @@ func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 
 	cutover, err := NewCutOver(sources, cutoverFunc, dbConfig, logger)
 	require.NoError(t, err)
+	cutover.renameRetryWait = renameRetryWait
 
 	err = cutover.Run(ctx)
 	<-dropDone
@@ -387,6 +393,7 @@ func TestCutOverFuncCalledOnceAcrossRenameRetry(t *testing.T) {
 // once a failure has left ownership unresolved, another attempt from the top
 // could retire a source that is already retired, so there must be exactly one.
 func TestCutOverDoesNotRetryUnresolvedRenameOwnership(t *testing.T) {
+	t.Parallel()
 	for _, marker := range []error{errRenameRollbackFailed, status.ErrOwnershipAmbiguous} {
 		t.Run(marker.Error(), func(t *testing.T) {
 			cfg := dbconn.NewDBConfig()
@@ -409,6 +416,7 @@ func TestCutOverDoesNotRetryUnresolvedRenameOwnership(t *testing.T) {
 // TestCutOverRetriesResolvedFailures is the negative counterpart: a failure
 // that says nothing about ownership is still retried to exhaustion.
 func TestCutOverRetriesResolvedFailures(t *testing.T) {
+	t.Parallel()
 	cfg := dbconn.NewDBConfig()
 	cfg.MaxRetries = 3
 	var sleeps []time.Duration
@@ -439,6 +447,7 @@ func TestCutOverRetriesResolvedFailures(t *testing.T) {
 // "traffic switched, rename did not finish" abort: it keeps its message and
 // gains the machine-checkable marker.
 func TestCutOverFuncSucceededFailureIsAmbiguous(t *testing.T) {
+	t.Parallel()
 	cfg := dbconn.NewDBConfig()
 	cfg.MaxRetries = 3
 	cutover := &CutOver{dbConfig: cfg, logger: slog.Default(), cutoverFuncSucceeded: true}
@@ -457,6 +466,7 @@ func TestCutOverFuncSucceededFailureIsAmbiguous(t *testing.T) {
 }
 
 func TestCutOverResultCallbackPreservesFailureEvidence(t *testing.T) {
+	t.Parallel()
 	callbackErr := errors.New("topology write failed")
 	tests := []struct {
 		name          string
@@ -511,6 +521,7 @@ func TestCutOverResultCallbackPreservesFailureEvidence(t *testing.T) {
 }
 
 func TestCutOverLegacyCallbackFailureIsAmbiguousAndNotRetried(t *testing.T) {
+	t.Parallel()
 	cfg := dbconn.NewDBConfig()
 	cfg.MaxRetries = 3
 	callbackErr := errors.New("traffic switch failed")
@@ -538,6 +549,7 @@ func TestCutOverLegacyCallbackFailureIsAmbiguousAndNotRetried(t *testing.T) {
 }
 
 func TestCutOverSuccessfulCallbackDoesNotInventDurableMutation(t *testing.T) {
+	t.Parallel()
 	renameErr := errors.New("rename failed")
 	for _, tt := range []struct {
 		name        string
@@ -602,6 +614,7 @@ func nextAutoIncrement(t *testing.T, schema, tableName string) uint64 {
 // AUTO_INCREMENT = n down to MAX(id)+1, so an unconditional ALTER would move
 // it backwards.
 func TestCarryAutoIncrementOnlyRaises(t *testing.T) {
+	t.Parallel()
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
 	dstName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE jobs (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=9`)
@@ -623,6 +636,7 @@ func TestCarryAutoIncrementOnlyRaises(t *testing.T) {
 // with is stale by the cutover, so without carrying the source's counter over
 // the target would issue ids 4..8 again.
 func TestMoveCarriesAutoIncrement(t *testing.T) {
+	t.Parallel()
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
 	dstName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, `CREATE TABLE jobs (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)`)
@@ -654,6 +668,7 @@ func TestMoveCarriesAutoIncrement(t *testing.T) {
 // target gets the highest counter among the sources, so no target can issue
 // an id that any source has issued, whichever shard the row would land on.
 func TestNtoMShardedMoveCarriesAutoIncrement(t *testing.T) {
+	t.Parallel()
 	src0Name, _ := testutils.CreateUniqueTestDatabase(t)
 	src1Name, _ := testutils.CreateUniqueTestDatabase(t)
 	tgt0Name, _ := testutils.CreateUniqueTestDatabase(t)
@@ -709,6 +724,7 @@ func TestNtoMShardedMoveCarriesAutoIncrement(t *testing.T) {
 // traffic switch and no rename, and that any other error, which may be
 // transient, is retried. The locks are released either way.
 func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		firstErr error
@@ -799,6 +815,7 @@ func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
 // under the cutover's locks. The move fails at cutover on the first attempt,
 // with the source still live and traffic not switched.
 func TestMoveCutoverRefusesSourceSchemaObjectUnderLock(t *testing.T) {
+	t.Parallel()
 	srcName, ctl := testutils.CreateUniqueTestDatabase(t)
 	dstName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val VARCHAR(255))")

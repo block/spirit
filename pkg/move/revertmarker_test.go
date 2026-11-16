@@ -16,6 +16,9 @@ import (
 // while the marker's DROP waits for another session's metadata lock ends the
 // DROP on the server before dropRevertMarker returns, so the DROP cannot remove
 // the marker once that lock is released.
+//
+// Not parallel: it finds the DROP in the processlist by its statement text,
+// which a revert marker drop in another test's schema would also match.
 func TestDropRevertMarkerEndsACancelledDropOnTheServer(t *testing.T) {
 	name, db := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, name, "CREATE TABLE "+revertMarkerName+" (id INT NOT NULL PRIMARY KEY)")
@@ -32,7 +35,7 @@ func TestDropRevertMarkerEndsACancelledDropOnTheServer(t *testing.T) {
 	watcher.Go(func() {
 		for ctx.Err() == nil {
 			var id int64
-			err := db.QueryRowContext(ctx, "SELECT id FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE IF EXISTS `"+revertMarkerName+"`%").Scan(&id)
+			err := db.QueryRowContext(ctx, "SELECT id FROM performance_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE IF EXISTS `"+revertMarkerName+"`%").Scan(&id)
 			if err == nil {
 				dropSession.Store(id)
 				cancel()
@@ -47,7 +50,7 @@ func TestDropRevertMarkerEndsACancelledDropOnTheServer(t *testing.T) {
 	require.NotZero(t, dropSession.Load(), "the DROP must have been seen waiting for the lock")
 
 	var sessions int
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", dropSession.Load()).Scan(&sessions))
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM performance_schema.processlist WHERE id = ?", dropSession.Load()).Scan(&sessions))
 	require.Zero(t, sessions, "the cancelled DROP's session must have ended")
 	require.NoError(t, reader.Rollback())
 	exists, err := revertMarkerExists(t.Context(), db)

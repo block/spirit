@@ -26,17 +26,26 @@ import (
 func TestMain(m *testing.M) {
 	status.CheckpointDumpInterval = 100 * time.Millisecond
 	sentinel.CheckInterval = 100 * time.Millisecond
-	sentinel.WaitLimit = 10 * time.Second
+	// Long enough that a change feed slowed by a loaded -race runner still
+	// reads the event a test is waiting for before the sentinel wait ends the
+	// move. Each test bounds its own wait with a shorter timeout.
+	sentinel.WaitLimit = time.Minute
 	// Move verifies with the lockless checker, whose production retry delay
-	// (1m) is sized to the change feed's flush interval. Tests that write
+	// (5s) is sized to the change feed's flush interval. Tests that write
 	// during the checksum, or that plant a divergence, would each wait it out
-	// several times. Set once here, as the migration package does, so no
-	// parallel test mutates it.
+	// several times. Continuous-checksum pacing and the confirming retry's
+	// flush wait are shortened for TestMoveContinuousChecksumAbortsThenResumeRepairs;
+	// the other deferred tests drop the sentinel before a second pass.
+	// Set once here, as the migration package does, because the tests run in
+	// parallel and must not write package variables.
 	checksum.DefaultLocklessRetryDelay = 1 * time.Second
+	checksum.LocklessMinPassInterval = 2 * time.Second
+	checksum.DefaultLocklessRetryFlushWait = 1 * time.Second
 	goleak.VerifyTestMain(m)
 }
 
 func TestBasicMove(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -80,6 +89,7 @@ func TestBasicMove(t *testing.T) {
 	}
 }
 func TestResumeFromCheckpointE2E(t *testing.T) {
+	t.Parallel()
 	t.Run("deferFalse", func(t *testing.T) { // known to race.
 		testResumeFromCheckpointE2E(t, false)
 	})
@@ -211,6 +221,7 @@ func (s *copyAggregateSink) Send(_ context.Context, m *metrics.Metrics) error {
 // TestEmptyDatabaseMove tests that a move operation succeeds when the source database has no tables.
 // This is a valid scenario for shard splits where an empty shard needs to be split.
 func TestEmptyDatabaseMove(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -263,6 +274,7 @@ func TestEmptyDatabaseMove(t *testing.T) {
 // cancel that arrives after the traffic switch must not stop the source rename
 // or the checkpoint drop, so the committed move is reported as a success.
 func TestMoveCancelAfterCutoverReportsSuccess(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	src := cfg.Clone()
@@ -318,6 +330,7 @@ func TestMoveCancelAfterCutoverReportsSuccess(t *testing.T) {
 // chunkKeys without backticks. The move path drives the same chunker, so
 // it failed on the first chunk fetch.
 func TestMoveReservedWordPK(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -363,6 +376,7 @@ func TestMoveReservedWordPK(t *testing.T) {
 // rely on QuotedTableName being backtick-quoted; this test guards against
 // any SQL builder regressing to the unquoted TableName.
 func TestMoveReservedWordTableName(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -406,6 +420,7 @@ func TestMoveReservedWordTableName(t *testing.T) {
 // mysql.innodb_table_stats row, runs postCopyPhase, and asserts the row is
 // repopulated; on the unfixed code it never reappears.
 func TestPostCopyAnalyzeTargetSchema(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -507,6 +522,7 @@ func TestPostCopyAnalyzeTargetSchema(t *testing.T) {
 // active across the index restore. On the old code the deltas sat buffered
 // until the checksum phase and this test times out.
 func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -675,6 +691,7 @@ func TestDeltasFlushedDuringIndexRestore(t *testing.T) {
 // the default", which NewRunner fills in) pass. Mirrors
 // migration.Migration.Validate.
 func TestMoveValidate(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		m       Move
@@ -707,6 +724,7 @@ func TestMoveValidate(t *testing.T) {
 // form, so a replayed DELETE would miss; a BIT key cannot be read back as a
 // number, so the copy cannot compute its chunk boundaries.
 func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	for _, tc := range []struct{ name, create, insert, want string }{
@@ -765,6 +783,7 @@ func TestMoveRefusesFloatAndBitPrimaryKeys(t *testing.T) {
 // is created from that definition, so it would not have the member; with no
 // row using the member, the move used to complete and cut over without it.
 func TestMoveRefusesEnumSetMembersOutsideUTF8MB3(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	srcDB, destDB := "source_enum_4byte", "dest_enum_4byte"
@@ -804,6 +823,7 @@ func TestMoveRefusesEnumSetMembersOutsideUTF8MB3(t *testing.T) {
 // so only the second source's own stored members can refuse the move. This
 // covers the runner passing every source's tables to the checks.
 func TestNtoMMoveRefusesMisreportedEnumSetOnLaterSource(t *testing.T) {
+	t.Parallel()
 	src0Name, src1Name, tgtName := "ntom_enum4b_src0", "ntom_enum4b_src1", "ntom_enum4b_dst"
 	for _, db := range []string{src0Name, src1Name, tgtName} {
 		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
@@ -847,6 +867,7 @@ func TestNtoMMoveRefusesMisreportedEnumSetOnLaterSource(t *testing.T) {
 // tables as schema + "." + table, so a '.' makes two tables indistinguishable;
 // a backtick has to be escaped by every statement that names the table.
 func TestMoveRefusesUnsupportedNames(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	for _, tc := range []struct{ name, srcDB, table, want string }{
@@ -918,6 +939,7 @@ func TestMoveRefusesUnsupportedNames(t *testing.T) {
 // zero-table shortcut (which calls the cutover callback) or failing discovery
 // with a less specific error.
 func TestMoveRefusesSourceSchemaObjects(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name         string
 		srcDBs       []string
@@ -1056,6 +1078,7 @@ func TestMoveRefusesSourceSchemaObjects(t *testing.T) {
 // requirement is enforced again, the privileges check refuses this move
 // before anything is created on the target.
 func TestMoveDoesNotYetRequireRoutineVisibility(t *testing.T) {
+	t.Parallel()
 	const srcDB, destDB, user = "source_obj_hidden", "dest_obj_hidden", "testmovehiddenroutine"
 	for _, db := range []string{srcDB, destDB} {
 		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)

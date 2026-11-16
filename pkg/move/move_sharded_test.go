@@ -27,6 +27,7 @@ import (
 // and a reserved name column: `values` which stores an email address.
 // The generated column appears before the sharding column to test column order handling.
 func TestShardedMove(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -146,6 +147,7 @@ func TestShardedMove(t *testing.T) {
 // TestNtoMShardedMove tests an N:M resharding scenario:
 // 2 source shards → 2 target shards, with data redistributed by even/odd hash.
 func TestNtoMShardedMove(t *testing.T) {
+	t.Parallel()
 	// Create 2 source databases and 2 target databases.
 	src0Name, _ := testutils.CreateUniqueTestDatabase(t)
 	src1Name, _ := testutils.CreateUniqueTestDatabase(t)
@@ -247,6 +249,7 @@ func TestNtoMShardedMove(t *testing.T) {
 // with non-deterministic iteration order. sources[0] determinism is also
 // asserted: it remains the canonical source for schema/SHOW CREATE/copier.
 func TestNtoMShardedMoveCheckpointDeterminism(t *testing.T) {
+	t.Parallel()
 	src0Name, _ := testutils.CreateUniqueTestDatabase(t)
 	src1Name, _ := testutils.CreateUniqueTestDatabase(t)
 	tgt0Name, _ := testutils.CreateUniqueTestDatabase(t)
@@ -355,6 +358,7 @@ func TestNtoMShardedMoveCheckpointDeterminism(t *testing.T) {
 // must fail the whole move — otherwise the new row image would land on its
 // new shard while the old shard silently kept a stale copy.
 func TestShardedMoveVindexUpdateFails(t *testing.T) {
+	t.Parallel()
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
 	tgt0Name, _ := testutils.CreateUniqueTestDatabase(t)
 	tgt1Name, _ := testutils.CreateUniqueTestDatabase(t)

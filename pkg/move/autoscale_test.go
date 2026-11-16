@@ -21,6 +21,7 @@ import (
 )
 
 func TestMoveAutoscaleNonAurora(t *testing.T) {
+	t.Parallel()
 	tt := testutils.NewTestTable(t, "move_autoscale_probe", "CREATE TABLE move_autoscale_probe (id INT PRIMARY KEY)")
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
@@ -38,6 +39,7 @@ func TestMoveAutoscaleNonAurora(t *testing.T) {
 }
 
 func TestMoveAutoscaleDisabled(t *testing.T) {
+	t.Parallel()
 	r, err := NewRunner(&Move{Common: flags.Common{Threads: 3, WriteThreads: 5}})
 	require.NoError(t, err)
 	// No targets, so there is nothing to probe or throttle.
@@ -48,6 +50,7 @@ func TestMoveAutoscaleDisabled(t *testing.T) {
 }
 
 func TestMoveThrottleStatus(t *testing.T) {
+	t.Parallel()
 	r := &Runner{}
 	r.throttler.Set(&throttler.Mock{})
 	require.True(t, r.snapshot(status.CopyRows).ThrottleStatus().Throttled)
@@ -57,6 +60,7 @@ func TestMoveThrottleStatus(t *testing.T) {
 }
 
 func TestMoveAutoscaleFitsFixedPool(t *testing.T) {
+	t.Parallel()
 	for _, start := range []int{4, 16} {
 		r, err := NewRunner(&Move{Common: flags.Common{Threads: 2, MaxConnections: 16, WriteThreads: 20}})
 		require.NoError(t, err)
@@ -86,6 +90,7 @@ func (c *closeCountingThrottler) Close() error { c.closes++; return nil }
 // enabled, matching migration. Before this, move built them only when
 // autoscaling engaged, so a move on Aurora without autoscaling ran unthrottled.
 func TestMoveThrottlesWithoutAutoscaling(t *testing.T) {
+	t.Parallel()
 	r, err := NewRunner(&Move{Common: flags.Common{Threads: 3, WriteThreads: 5, SkipAutoscaling: true}})
 	require.NoError(t, err)
 	signal := &closeCountingThrottler{}
@@ -112,6 +117,7 @@ func (o *openFailingThrottler) Close() error               { o.closes++; return 
 // A probe that fails on a later target must close the results already built
 // for earlier targets, or their monitor pools and pollers leak.
 func TestMoveSetupThrottlingClosesBuiltResultsOnBuildError(t *testing.T) {
+	t.Parallel()
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	r, err := NewRunner(&Move{Common: flags.Common{Threads: 3, WriteThreads: 5}})
@@ -139,6 +145,7 @@ func TestMoveSetupThrottlingClosesBuiltResultsOnBuildError(t *testing.T) {
 // A composite Open that fails must close every result's throttlers and
 // monitor pool: nothing else owns them yet.
 func TestMoveApplyAuroraResultsClosesOnOpenError(t *testing.T) {
+	t.Parallel()
 	r, err := NewRunner(&Move{Common: flags.Common{Threads: 3, WriteThreads: 5}})
 	require.NoError(t, err)
 	monitor, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
@@ -169,6 +176,7 @@ func fakeAurora(r *Runner, vcpus int, results ...throttler.AuroraResult) {
 
 // setupThrottling end to end, from the probe to the source feed's config.
 func TestMoveSetupThrottling(t *testing.T) {
+	t.Parallel()
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	other := *config
@@ -221,6 +229,7 @@ func TestMoveSetupThrottling(t *testing.T) {
 // its bounds are not divided: four shards on one 8-vCPU server once pinned the
 // whole copy to one reader that the read controller could not grow.
 func TestMoveCopyReadsNotDividedByShards(t *testing.T) {
+	t.Parallel()
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	r, err := NewRunner(&Move{})
@@ -255,6 +264,7 @@ func TestMoveCopyReadsNotDividedByShards(t *testing.T) {
 // so the readers scale on the applier queue alone (IndependentReads) unless a
 // source is also a target server, whose load the readers then add to.
 func TestMoveCopyReadsIndependentOfTargetLoad(t *testing.T) {
+	t.Parallel()
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	source := *config
@@ -289,6 +299,7 @@ func TestMoveCopyReadsIndependentOfTargetLoad(t *testing.T) {
 // runs the whole move at one reader, one writer and one flush, with small copy
 // chunks, even when the other target is not Aurora.
 func TestMoveSmallInstance(t *testing.T) {
+	t.Parallel()
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	other := *config
@@ -314,6 +325,7 @@ func TestMoveSmallInstance(t *testing.T) {
 // A target whose probe failed or that is not Aurora keeps every other
 // target's throttling; only autoscaling needs all of them.
 func TestMoveAutoscaleNeedsEveryTarget(t *testing.T) {
+	t.Parallel()
 	config, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	groups := []host.Group{{Indices: []int{0}}, {Indices: []int{1}}}
@@ -339,6 +351,7 @@ func TestMoveAutoscaleNeedsEveryTarget(t *testing.T) {
 // --max-commit-latency matches migrate: the Go-API zero value is not
 // replaced with the CLI default, so zero disables the throttler here too.
 func TestMoveMaxCommitLatencyZero(t *testing.T) {
+	t.Parallel()
 	r, err := NewRunner(&Move{})
 	require.NoError(t, err)
 	require.Zero(t, r.move.MaxCommitLatency)

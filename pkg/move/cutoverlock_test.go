@@ -52,6 +52,10 @@ func lockTimeoutCutover(t *testing.T, ctx context.Context, maxRetries int, logge
 // TestCutOverLockTimeout checks that an attempt that holds the source locks
 // past the cutover lock timeout without reaching the traffic switch releases
 // them without switching, and is retried.
+//
+// Not parallel: the last two cases use a 100ms cutover lock timeout that the
+// lock and flush must fit in, and short lock timeouts flake on a busy binlog
+// (#1486).
 func TestCutOverLockTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -127,6 +131,9 @@ func TestCutOverLockTimeout(t *testing.T) {
 // TestCutOverLockTimeoutBoundsEveryStepBeforeTheSwitch: the checks under the
 // lock, and a pre-switch hook that ignores its context, each end an attempt
 // that has outlasted the cutover lock timeout without switching traffic.
+//
+// Not parallel: it uses 100ms cutover lock timeouts, which flake on a busy
+// binlog (#1486).
 func TestCutOverLockTimeoutBoundsEveryStepBeforeTheSwitch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -161,6 +168,7 @@ func TestCutOverLockTimeoutBoundsEveryStepBeforeTheSwitch(t *testing.T) {
 // TestLockAllReleasesOnFailure checks that when one lock cannot be taken,
 // lockAll releases the locks it did take.
 func TestLockAllReleasesOnFailure(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	srcName, srcDB := testutils.CreateUniqueTestDatabase(t)
@@ -190,6 +198,7 @@ func TestLockAllReleasesOnFailure(t *testing.T) {
 // TestLockAllIndexesLocks checks that lockAll returns every lock at the index
 // it was taken for.
 func TestLockAllIndexesLocks(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	dbConfig := dbconn.NewDBConfig()

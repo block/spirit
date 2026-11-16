@@ -143,7 +143,7 @@ type bufferedMap struct {
 	// bufferedMap stays source-agnostic and can be reused by alternative
 	// implementations (e.g. a VStream change.Source).
 	logger  *slog.Logger
-	applier applier.Applier // applier for writing changes to the target
+	applier applier.StreamedChangesWriter // writes changes to the target
 
 	table    *table.TableInfo
 	newTable *table.TableInfo
@@ -311,7 +311,7 @@ type BufferedSubscriptionConfig struct {
 	NewTable *table.TableInfo
 
 	// Applier writes batched changes to the target. Required.
-	Applier applier.Applier
+	Applier applier.StreamedChangesWriter
 
 	// Chunker provides the watermark filter + column mapping. Required.
 	Chunker table.MappedChunker
@@ -1970,7 +1970,7 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 // per entry, in KeyColumns order).
 // If locks is non-empty, the operations are executed under the table
 // lock(s) — one lock per target server, matched to its target by the
-// applier (see applier.Applier.DeleteKeys for the contract).
+// applier (see applier.StreamedChangesWriter.DeleteKeys for the contract).
 func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []applier.LogicalRow, locks []*dbconn.TableLock) error {
 	if len(deleteKeys) == 0 && len(upsertRows) == 0 {
 		return nil
