@@ -47,6 +47,7 @@ func awaitMoveStatus(ctx context.Context, runner *Runner, target status.State, d
 }
 
 func TestAwaitMoveStatus(t *testing.T) {
+	t.Parallel()
 	runner := &Runner{}
 	runner.status.Set(status.CutOver)
 	require.NoError(t, awaitMoveStatus(t.Context(), runner, status.WaitingOnSentinelTable, nil))

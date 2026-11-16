@@ -85,7 +85,7 @@ This runs the cutover's attempt loop for migration and move. It does the followi
 
 What happens after a failed attempt is the runner's. Its `StopFunc` is passed that attempt's error only, never the history, and returns a verdict: retry, succeeded (the runner proved the cutover committed) or failed (with an optional error appended after the history, such as `status.ErrOwnershipAmbiguous`). The runner also supplies what a cancel returns and what running out of attempts returns. Migration uses both to check whether a rename whose outcome was unknown committed after all. Move uses the defaults: the history joined with the context's error, and the history.
 
-The loop does not cover move's rename retries under the source locks (`renameRetryWait`). Those happen inside one attempt, after the traffic switch, and must not release the locks.
+The loop does not cover move's rename retries under the source locks (`CutOver.renameRetryWait`). Those happen inside one attempt, after the traffic switch, and must not release the locks.
 
 ## What does not live here (yet)
 

@@ -26,6 +26,7 @@ func (progressChecker) GetProgress() status.ChecksumProgress {
 func (progressChecker) ContinuousActive() bool { return false }
 
 func TestMoveProgress(t *testing.T) {
+	t.Parallel()
 	r := &Runner{}
 	require.Empty(t, r.Progress().Tables)
 	require.Empty(t, r.Progress().Copy)
@@ -78,6 +79,7 @@ func TestMoveProgress(t *testing.T) {
 }
 
 func TestMoveProgressChunkerPublication(t *testing.T) {
+	t.Parallel()
 	r := &Runner{}
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -94,6 +96,7 @@ func TestMoveProgressChunkerPublication(t *testing.T) {
 }
 
 func TestMoveProgressPolledConcurrently(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 
@@ -152,6 +155,7 @@ func TestMoveProgressPolledConcurrently(t *testing.T) {
 // its sources can span several schemas. With Source a struct, a field left nil
 // compiles and panics only when a report reads it.
 func TestSnapshotSourceIsComplete(t *testing.T) {
+	t.Parallel()
 	src := reflect.ValueOf((&Runner{}).snapshot(status.Initial).Source)
 	for i := range src.NumField() {
 		name := src.Type().Field(i).Name

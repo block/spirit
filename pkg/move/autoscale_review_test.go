@@ -16,6 +16,7 @@ type busyProgressThrottler struct{ throttler.Mock }
 func (*busyProgressThrottler) Utilization() float64 { return 1.2 }
 
 func TestMoveContinuousChecksumThrottleProgress(t *testing.T) {
+	t.Parallel()
 	r := &Runner{}
 	r.throttler.Set(&busyProgressThrottler{})
 	require.True(t, r.snapshot(status.Checksum).ThrottleStatus().Throttled)
@@ -32,6 +33,7 @@ func TestMoveContinuousChecksumThrottleProgress(t *testing.T) {
 }
 
 func TestReverseWindowPreservesConfiguredWorkers(t *testing.T) {
+	t.Parallel()
 	for _, configured := range []int{0, 7} {
 		r, err := NewRunner(&Move{Common: flags.Common{WriteThreads: configured}})
 		require.NoError(t, err)

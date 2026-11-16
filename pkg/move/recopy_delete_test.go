@@ -151,6 +151,7 @@ func (recopyDeleteConn) Begin() (driver.Tx, error) { return nil, errors.New("not
 // server runs one of them at a time, and different servers run at the same
 // time.
 func TestDeleteRecopyRangeRunsEveryDeleteOncePerServer(t *testing.T) {
+	t.Parallel()
 	f := newRecopyDeleteTargets()
 	f.delay = 20 * time.Millisecond
 	// Targets 0 and 2 share server-a.
@@ -174,6 +175,7 @@ func TestDeleteRecopyRangeRunsEveryDeleteOncePerServer(t *testing.T) {
 // server cancels the DELETEs still running on the others, and the resume
 // returns the failure, naming its target and table.
 func TestDeleteRecopyRangeFailureCancelsOtherServers(t *testing.T) {
+	t.Parallel()
 	f := newRecopyDeleteTargets()
 	f.block, f.fail = 0, 1
 	r := f.runner(t, []string{"server-a:3306", "server-b:3306"}, "t1")
@@ -193,6 +195,7 @@ func TestDeleteRecopyRangeFailureCancelsOtherServers(t *testing.T) {
 // TestDeleteRecopyRangeCanceled: canceling the resume stops a DELETE that is
 // still running, and the resume returns the cancellation.
 func TestDeleteRecopyRangeCanceled(t *testing.T) {
+	t.Parallel()
 	f := newRecopyDeleteTargets()
 	f.block = 0
 	// One target: with two, the other target's statement could also return
