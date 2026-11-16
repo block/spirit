@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/contract"
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -88,4 +90,43 @@ func TestSharedFlushSequencing(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, c.flushUntilTrivial(ctx, flush, blockWait(context.Canceled), "test"), context.Canceled)
 	assert.Equal(t, []string{"flush(underLock=false,locks=0)", "blockWait"}, calls)
+}
+
+// foreignTable is a contract.Table that is not a *table.TableInfo, as a
+// source outside spirit would supply.
+type foreignTable struct{}
+
+func (foreignTable) ID() contract.TableID {
+	return contract.TableID{Schema: "test", Name: "foreign"}
+}
+func (foreignTable) ColumnNames() []string    { return []string{"id"} }
+func (foreignTable) KeyColumnNames() []string { return []string{"id"} }
+
+// TestAddSubscriptionTableChecks pins how the built-in sources take a
+// contract.Table: they need a *table.TableInfo, so any other implementation
+// is refused when the subscription is added, not when its first event
+// arrives. A nil newTable — untyped or a nil *table.TableInfo — is a
+// move-flow subscription.
+func TestAddSubscriptionTableChecks(t *testing.T) {
+	newCore := func() *feedCore {
+		return &feedCore{logger: slog.Default(), subs: newSubscriptionRegistry(), applier: &applier.MockApplier{}}
+	}
+	t1 := &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	chunker := &table.MockChunker{}
+
+	err := newCore().AddSubscription(foreignTable{}, nil, chunker)
+	require.ErrorContains(t, err, "change.foreignTable, not a *table.TableInfo")
+
+	err = newCore().AddSubscription(t1, foreignTable{}, chunker)
+	require.ErrorContains(t, err, "change.foreignTable, not a *table.TableInfo")
+
+	require.ErrorContains(t, newCore().AddSubscription(nil, nil, chunker), "currentTable is nil")
+	var nilTable *table.TableInfo
+	require.ErrorContains(t, newCore().AddSubscription(nilTable, nil, chunker), "currentTable is nil")
+
+	c := newCore()
+	require.NoError(t, c.AddSubscription(t1, nilTable, chunker))
+	sub, ok := c.subs.Get(encodeSchemaTable("test", "t1"))
+	require.True(t, ok)
+	require.Equal(t, []contract.Table{t1}, sub.Tables(), "a nil *table.TableInfo newTable must not become a Tables() entry")
 }

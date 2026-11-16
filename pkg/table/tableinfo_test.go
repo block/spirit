@@ -11,6 +11,7 @@ import (
 	"time"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/testutils"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
@@ -729,4 +730,45 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// otherTable is a contract.Table that is not a *TableInfo.
+type otherTable struct{}
+
+func (otherTable) ID() contract.TableID     { return contract.TableID{Schema: "s", Name: "other"} }
+func (otherTable) ColumnNames() []string    { return nil }
+func (otherTable) KeyColumnNames() []string { return nil }
+
+func TestTableInfoContractTable(t *testing.T) {
+	ti := &TableInfo{SchemaName: "s", TableName: "t", Columns: []string{"a", "id"}, KeyColumns: []string{"id"}}
+	require.Equal(t, contract.TableID{Schema: "s", Name: "t"}, ti.ID())
+	require.Equal(t, []string{"a", "id"}, ti.ColumnNames())
+	require.Equal(t, []string{"id"}, ti.KeyColumnNames())
+
+	// A nil *TableInfo stored in a contract.Table is not a nil interface;
+	// reading it must not panic.
+	var nilTI *TableInfo
+	var asContract contract.Table = nilTI
+	require.Equal(t, contract.TableID{}, asContract.ID())
+	require.Nil(t, asContract.ColumnNames())
+	require.Nil(t, asContract.KeyColumnNames())
+}
+
+func TestAsTableInfo(t *testing.T) {
+	ti := &TableInfo{SchemaName: "s", TableName: "t"}
+	got, err := AsTableInfo(ti)
+	require.NoError(t, err)
+	require.Same(t, ti, got)
+
+	got, err = AsTableInfo(nil)
+	require.NoError(t, err)
+	require.Nil(t, got)
+
+	var nilTI *TableInfo
+	got, err = AsTableInfo(nilTI)
+	require.NoError(t, err)
+	require.Nil(t, got)
+
+	_, err = AsTableInfo(otherTable{})
+	require.EqualError(t, err, "table s.other is a table.otherTable, not a *table.TableInfo")
 }

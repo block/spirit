@@ -55,7 +55,7 @@ const (
 // left buffered and the flushed position past both transactions.
 //
 // Every case runs on both chunkers (optimistic and composite), with and
-// without the table.BufferedKeyNoter capability, and with both clients.
+// without the contract.BufferedKeyNoter capability, and with both clients.
 func TestPreDispatchChangeThenAboveHighWatermark(t *testing.T) {
 	clients := map[string]func(t *testing.T, db *sql.DB, appl applier.Applier) preDispatchClient{
 		"binlog": func(t *testing.T, db *sql.DB, appl applier.Applier) preDispatchClient {
@@ -103,7 +103,7 @@ type preDispatchCase struct {
 	timing         preDispatchTiming
 	secondIsDelete bool
 	// hideNoter gives the subscription a chunker without
-	// table.BufferedKeyNoter: it must then never discard a change as above
+	// contract.BufferedKeyNoter: it must then never discard a change as above
 	// the high watermark, and the target must still converge.
 	hideNoter bool
 	// composite uses a key without AUTO_INCREMENT, so the copy runs on the
@@ -112,7 +112,7 @@ type preDispatchCase struct {
 }
 
 // hiddenNoterChunker exposes only table.MappedChunker, hiding the wrapped
-// chunker's optional table.BufferedKeyNoter capability. It stands in for an
+// chunker's optional contract.BufferedKeyNoter capability. It stands in for an
 // out-of-tree chunker that predates that interface.
 type hiddenNoterChunker struct {
 	table.MappedChunker
@@ -184,7 +184,7 @@ func runPreDispatchScenario(t *testing.T, newClient func(*testing.T, *sql.DB, ap
 	subChunker := chunker
 	if hideNoter {
 		subChunker = hiddenNoterChunker{chunker}
-		_, ok := subChunker.(table.BufferedKeyNoter)
+		_, ok := subChunker.(contract.BufferedKeyNoter)
 		require.False(t, ok)
 	}
 	require.NoError(t, client.AddSubscription(src, dst, subChunker))

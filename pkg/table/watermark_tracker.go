@@ -18,7 +18,7 @@ import (
 // changes for keys that were already copied in a previous run.
 //
 // bufferedHighPtr is the same guard for rows the change stream may have
-// written to the target in *this* run: see BufferedKeyNoter.NoteBufferedKey.
+// written to the target in *this* run: see contract.BufferedKeyNoter.NoteBufferedKey.
 type watermarkTracker struct {
 	watermark              *Chunk
 	lowerBoundWatermarkMap map[string]*Chunk
@@ -48,7 +48,7 @@ type watermarkTracker struct {
 	inflightChunks uint64
 }
 
-// noteBufferedKey implements BufferedKeyNoter.NoteBufferedKey for both chunkers.
+// noteBufferedKey implements contract.BufferedKeyNoter.NoteBufferedKey for both chunkers.
 // dispatchPtr is the lowest key the chunker has not yet dispatched (chunks
 // are [lower, dispatchPtr)), or a nil Datum before the first dispatch;
 // convErr is the error from converting key0 to a Datum. tableName is only

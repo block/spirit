@@ -192,13 +192,13 @@ type bufferedMap struct {
 
 	watermarkOptimization bool
 	chunker               table.MappedChunker
-	// keyNoter is chunker's optional table.BufferedKeyNoter capability,
+	// keyNoter is chunker's optional contract.BufferedKeyNoter capability,
 	// asserted once at construction. When it is nil (a chunker that does
 	// not implement it), the subscription never applies the
 	// above-high-watermark discard: it could not tell the chunker which keys
 	// a flush may already have written ahead of the copier, so discarding a
 	// later change for such a key could leave a stale or phantom row.
-	keyNoter table.BufferedKeyNoter
+	keyNoter contract.BufferedKeyNoter
 
 	// closed is set by Close() to release any HasChanged caller parked on
 	// the soft memory limit. Without it, Client.Close() deadlocks on
@@ -413,10 +413,10 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 		batchSize:            cfg.BatchSize,
 		underLoad:            cfg.UnderLoad,
 	}
-	if noter, ok := cfg.Chunker.(table.BufferedKeyNoter); ok {
+	if noter, ok := cfg.Chunker.(contract.BufferedKeyNoter); ok {
 		sub.keyNoter = noter
 	} else if cfg.Chunker != nil {
-		logger.Warn("chunker does not implement table.BufferedKeyNoter; the above-high-watermark discard is disabled for this subscription",
+		logger.Warn("chunker does not implement contract.BufferedKeyNoter; the above-high-watermark discard is disabled for this subscription",
 			"table", cfg.CurrentTable.QuotedTableName, "chunker", fmt.Sprintf("%T", cfg.Chunker))
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
@@ -530,18 +530,19 @@ func (s *bufferedMap) overSoftLimitLocked() bool {
 	return s.softLimitChanges > 0 && s.lengthLocked() >= s.softLimitChanges
 }
 
-func (s *bufferedMap) Tables() []*table.TableInfo {
+func (s *bufferedMap) Tables() []contract.Table {
 	if s.newTable == nil {
 		// Move-flow subscriptions have no destination-side TableInfo (see
-		// BufferedSubscriptionConfig.NewTable). Omit the nil rather than
+		// BufferedSubscriptionConfig.NewTable). Omit it rather than
 		// returning [table, nil]: Tables() consumers — the DDL
 		// subscription-match loops in the binlog/GTID clients, and
 		// out-of-tree change.Source implementations routing row events per
-		// the Source interface contract — iterate and dereference the
-		// entries, and a nil entry panics the stream-reader goroutine.
-		return []*table.TableInfo{s.table}
+		// the Source interface contract — iterate the entries and call
+		// their methods, and a nil entry panics the stream-reader
+		// goroutine.
+		return []contract.Table{s.table}
 	}
-	return []*table.TableInfo{s.table, s.newTable}
+	return []contract.Table{s.table, s.newTable}
 }
 
 // ImmutableColumnOrdinal satisfies Subscription. The ordinal is derived

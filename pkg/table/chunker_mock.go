@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/block/spirit/pkg/contract"
 )
 
 // MockChunker provides a controllable chunker for tests. NewMockChunker
@@ -58,8 +60,8 @@ type FeedbackCall struct {
 }
 
 var (
-	_ MappedChunker    = &MockChunker{}
-	_ BufferedKeyNoter = &MockChunker{}
+	_ MappedChunker             = &MockChunker{}
+	_ contract.BufferedKeyNoter = &MockChunker{}
 )
 
 // NewMockChunker creates a new mock chunker for testing
