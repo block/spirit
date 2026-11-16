@@ -1705,7 +1705,7 @@ func TestDiffIntegrationBooleanKeywordDefaultAcrossFoldingTypes(t *testing.T) {
 // numericDefaultNormalizer folds it to the padded value, so the table created
 // from the declaration has nothing left to apply. binary is excluded too,
 // because it pads the keyword to the column width; binaryDefaultBytesNormalizer
-// folds it instead, and TestDiffIntegrationBinaryDefaultBytes covers it. year
+// folds it instead, and TestDiffIntegrationDefaultLiteralMatchesLive/BinaryDefaultBytes covers it. year
 // reads the keyword as a year (TRUE stores '2001'); yearDefaultNormalizer folds
 // it, and TestDiffIntegrationYearDefaultCreatedAsDeclared covers it.
 //
@@ -2562,26 +2562,35 @@ func TestDiffIntegrationTextBlobLengthUndeterminedCharset(t *testing.T) {
 // (MySQL Bug #104840).
 const binaryDefaultHexReason = "SHOW CREATE TABLE reports a non-utf8mb3 default as '?' rather than hex"
 
-// TestDiffIntegrationBinaryDefaultBytes verifies that a literal default on a
-// binary(N) column matches its live form, which MySQL stores NUL-padded to the
-// column width (binary(3) DEFAULT 'a' is reported as DEFAULT 'a\0\0'), or as a
-// hex literal when the padded bytes are not valid utf8mb3. A char(N) column
-// that the binary charset makes binary(N) is padded the same way. A varbinary
-// default is stored as the same bytes, unpadded (varbinary(4) DEFAULT x'61' is
-// reported as DEFAULT 'a'). Without the conversion the diff emits a MODIFY that
-// MySQL rewrites to its own form again, on every run.
+// TestDiffIntegrationDefaultLiteralMatchesLive verifies, for each group of
+// cases below, that a column default MySQL rewrites when it stores the table
+// matches its live form (SHOW CREATE TABLE) in both Diff directions. Without
+// the conversion the diff emits a MODIFY that MySQL rewrites to its own form
+// again, on every run. Each group's comment says what MySQL does to it.
 //
-// The hex form is only reported from MySQL 8.0.33. Before that, SHOW CREATE
-// TABLE replaces each byte that is not valid utf8mb3 with '?', so the stored
-// default cannot be read back and the column cannot converge. The cases in
-// needsHexReporting skip on those servers.
-func TestDiffIntegrationBinaryDefaultBytes(t *testing.T) {
+// A case whose live form is a hex literal skips before MySQL 8.0.33, which
+// reports it as '?' instead (see binaryDefaultHexReason).
+func TestDiffIntegrationDefaultLiteralMatchesLive(t *testing.T) {
 	needsHexReporting := map[string]bool{
 		"diff_binpad_hex_not_utf8": true,
 		"diff_binpad_4byte_char":   true,
 		"diff_varbin_hex_not_utf8": true,
+		"diff_binlit_char_4byte":   true,
 	}
-	for _, tc := range []struct{ name, ddl, live string }{
+	type defaultCase struct{ name, ddl, live string }
+
+	// binaryDefaultBytesCases: MySQL stores a literal default on a binary(N)
+	// column NUL-padded to the column width (binary(3) DEFAULT 'a' is reported
+	// as DEFAULT 'a\0\0'), or as a hex literal when the padded bytes are not
+	// valid utf8mb3. A char(N) column that the binary charset makes binary(N) is
+	// padded the same way. A varbinary default is stored as the same bytes,
+	// unpadded (varbinary(4) DEFAULT x'61' is reported as DEFAULT 'a').
+	//
+	// The hex form is only reported from MySQL 8.0.33. Before that, SHOW CREATE
+	// TABLE replaces each byte that is not valid utf8mb3 with '?', so the stored
+	// default cannot be read back and the column cannot converge. The cases in
+	// needsHexReporting skip on those servers.
+	binaryDefaultBytesCases := []defaultCase{
 		{"diff_binpad_string", "CREATE TABLE diff_binpad_string (id int NOT NULL, b binary(3) DEFAULT 'a', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` binary(3) DEFAULT 'a\\0\\0'"},
 		{"diff_binpad_empty", "CREATE TABLE diff_binpad_empty (id int NOT NULL, b binary(3) NOT NULL DEFAULT '', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` binary(3) NOT NULL DEFAULT '\\0\\0\\0'"},
 		{"diff_binpad_no_width", "CREATE TABLE diff_binpad_no_width (id int NOT NULL, b binary DEFAULT '', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` binary(1) DEFAULT '\\0'"},
@@ -2604,24 +2613,120 @@ func TestDiffIntegrationBinaryDefaultBytes(t *testing.T) {
 		{"diff_varbin_bit", "CREATE TABLE diff_varbin_bit (id int NOT NULL, b varbinary(4) DEFAULT b'0000000001100001', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varbinary(4) DEFAULT '\\0a'"},
 		{"diff_varbin_int", "CREATE TABLE diff_varbin_int (id int NOT NULL, b varbinary(4) DEFAULT 007, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varbinary(4) DEFAULT '7'"},
 		{"diff_varbin_hex_not_utf8", "CREATE TABLE diff_varbin_hex_not_utf8 (id int NOT NULL, b varbinary(4) DEFAULT x'ff', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varbinary(4) DEFAULT 0xFF"},
+	}
+
+	// binaryLiteralDefaultsCases: MySQL converts a hex or bit literal default on
+	// an integer, bit, char or varchar column to the column's own type and
+	// reports it in that form: int DEFAULT 0x1A as DEFAULT '26', bit(8) DEFAULT
+	// x'61' as DEFAULT b'1100001', and varchar(4) DEFAULT 0x61 as DEFAULT 'a'.
+	// An integer default on a bit column is converted the same way (bit(1)
+	// DEFAULT 0 is reported as DEFAULT b'0'). A char default that is not valid
+	// utf8mb3 is reported as a hex literal, so that case is in needsHexReporting.
+	binaryLiteralDefaultsCases := []defaultCase{
+		{"diff_binlit_int_hex", "CREATE TABLE diff_binlit_int_hex (id int NOT NULL, b int DEFAULT 0x1A, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` int DEFAULT '26'"},
+		{"diff_binlit_int_bit", "CREATE TABLE diff_binlit_int_bit (id int NOT NULL, b int DEFAULT b'1010', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` int DEFAULT '10'"},
+		{"diff_binlit_decimal_hex", "CREATE TABLE diff_binlit_decimal_hex (id int NOT NULL, b decimal(5) DEFAULT 0x1A, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` decimal(5,0) DEFAULT '26'"},
+		{"diff_binlit_decimal_max", "CREATE TABLE diff_binlit_decimal_max (id int NOT NULL, b decimal(20,0) DEFAULT 0x7FFFFFFFFFFFFFFF, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` decimal(20,0) DEFAULT '9223372036854775807'"},
+		{"diff_binlit_int_max", "CREATE TABLE diff_binlit_int_max (id int NOT NULL, b bigint unsigned NOT NULL DEFAULT 0xFFFFFFFFFFFFFFFF, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` bigint unsigned NOT NULL DEFAULT '18446744073709551615'"},
+		{"diff_binlit_bit_hex", "CREATE TABLE diff_binlit_bit_hex (id int NOT NULL, b bit(8) DEFAULT x'61', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` bit(8) DEFAULT b'1100001'"},
+		{"diff_binlit_bit_hex_zero", "CREATE TABLE diff_binlit_bit_hex_zero (id int NOT NULL, b bit(8) DEFAULT x'0000', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` bit(8) DEFAULT b'0'"},
+		{"diff_binlit_bit_int", "CREATE TABLE diff_binlit_bit_int (id int NOT NULL, b bit(1) NOT NULL DEFAULT 0, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` bit(1) NOT NULL DEFAULT b'0'"},
+		{"diff_binlit_bit_no_width", "CREATE TABLE diff_binlit_bit_no_width (id int NOT NULL, b bit DEFAULT 1, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` bit(1) DEFAULT b'1'"},
+		{"diff_binlit_bit_string", "CREATE TABLE diff_binlit_bit_string (id int NOT NULL, b bit(8) DEFAULT '0', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` bit(8) DEFAULT b'110000'"},
+		{"diff_binlit_char_hex", "CREATE TABLE diff_binlit_char_hex (id int NOT NULL, b char(4) DEFAULT x'61', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_binlit_varchar_hex", "CREATE TABLE diff_binlit_varchar_hex (id int NOT NULL, b varchar(4) DEFAULT 0x61, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a'"},
+		{"diff_binlit_varchar_bit", "CREATE TABLE diff_binlit_varchar_bit (id int NOT NULL, b varchar(4) DEFAULT b'01100001', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a'"},
+		{"diff_binlit_char_multibyte", "CREATE TABLE diff_binlit_char_multibyte (id int NOT NULL, b char(4) DEFAULT x'c3a9', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'é'"},
+		{"diff_binlit_char_quote", "CREATE TABLE diff_binlit_char_quote (id int NOT NULL, b char(4) DEFAULT x'27', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT ''''"},
+		{"diff_binlit_char_ascii", "CREATE TABLE diff_binlit_char_ascii (id int NOT NULL, b char(4) CHARACTER SET ascii DEFAULT x'61', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT 'a'"},
+		{"diff_binlit_char_4byte", "CREATE TABLE diff_binlit_char_4byte (id int NOT NULL, b char(4) DEFAULT x'f09f9880', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 0xF09F9880"},
+	}
+
+	// charDefaultSpacesCases: MySQL reports a string default on a char(N) column
+	// with every trailing space stripped (char(4) DEFAULT 'a  ' is reported as
+	// DEFAULT 'a'), in every charset and collation, NO PAD collations included.
+	// A varchar(N) default keeps its trailing spaces, except those past the
+	// column's width, which MySQL drops (varchar(4) DEFAULT 'ab      ' is
+	// reported as 'ab  '). A hex or bit literal default is reported as the
+	// string its bytes form, with the same spaces handling (char(4) DEFAULT
+	// x'612020' is reported as 'a').
+	charDefaultSpacesCases := []defaultCase{
+		{"diff_charpad_trailing", "CREATE TABLE diff_charpad_trailing (id int NOT NULL, b char(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_only_spaces", "CREATE TABLE diff_charpad_only_spaces (id int NOT NULL, b char(4) NOT NULL DEFAULT '    ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) NOT NULL DEFAULT ''"},
+		{"diff_charpad_no_width", "CREATE TABLE diff_charpad_no_width (id int NOT NULL, b char DEFAULT ' ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(1) DEFAULT ''"},
+		{"diff_charpad_leading", "CREATE TABLE diff_charpad_leading (id int NOT NULL, b char(4) DEFAULT ' a ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT ' a'"},
+		{"diff_charpad_past_width", "CREATE TABLE diff_charpad_past_width (id int NOT NULL, b char(4) DEFAULT 'abcd  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'abcd'"},
+		{"diff_charpad_tab", "CREATE TABLE diff_charpad_tab (id int NOT NULL, b char(4) DEFAULT 'ab\\t  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'ab\t'"},
+		{"diff_charpad_nul", "CREATE TABLE diff_charpad_nul (id int NOT NULL, b char(4) DEFAULT 'a\\0 ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a\\0'"},
+		{"diff_charpad_introducer", "CREATE TABLE diff_charpad_introducer (id int NOT NULL, b char(4) DEFAULT _latin1'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_no_pad", "CREATE TABLE diff_charpad_no_pad (id int NOT NULL, b char(4) COLLATE utf8mb4_0900_bin DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin DEFAULT 'a'"},
+		{"diff_charpad_utf16", "CREATE TABLE diff_charpad_utf16 (id int NOT NULL, b char(4) CHARACTER SET utf16 DEFAULT 'abcd  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) CHARACTER SET utf16 COLLATE utf16_general_ci DEFAULT 'abcd'"},
+		{"diff_charpad_latin1_table", "CREATE TABLE diff_charpad_latin1_table (id int NOT NULL, b char(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=latin1", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_hex", "CREATE TABLE diff_charpad_hex (id int NOT NULL, b char(4) DEFAULT x'612020', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_hex_past_width", "CREATE TABLE diff_charpad_hex_past_width (id int NOT NULL, b char(4) DEFAULT 0x61202020202020, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_charpad_bit", "CREATE TABLE diff_charpad_bit (id int NOT NULL, b char(4) DEFAULT b'011000010010000000100000', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
+		{"diff_varcharpad_hex_past_width", "CREATE TABLE diff_varcharpad_hex_past_width (id int NOT NULL, b varchar(4) DEFAULT x'61202020202020', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a   '"},
+		{"diff_varcharpad_keeps", "CREATE TABLE diff_varcharpad_keeps (id int NOT NULL, b varchar(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a  '"},
+		{"diff_varcharpad_past_width", "CREATE TABLE diff_varcharpad_past_width (id int NOT NULL, b varchar(4) DEFAULT 'ab      ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'ab  '"},
+		{"diff_varcharpad_multibyte", "CREATE TABLE diff_varcharpad_multibyte (id int NOT NULL, b varchar(2) DEFAULT 'é   ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(2) DEFAULT 'é '"},
+		{"diff_varcharpad_latin1", "CREATE TABLE diff_varcharpad_latin1 (id int NOT NULL, b varchar(4) CHARACTER SET latin1 NOT NULL DEFAULT 'ab    ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL DEFAULT 'ab  '"},
+	}
+
+	// enumSetDefaultCases: MySQL reports a string default on an enum or set
+	// column as the member text the default names: trailing spaces stripped
+	// (enum('a','b') DEFAULT 'b ' is reported as DEFAULT 'b'), the member's own
+	// case on a _ci collation, and a set default's members once each in
+	// definition order.
+	enumSetDefaultCases := []defaultCase{
+		{"diff_enumdef_trailing", "CREATE TABLE diff_enumdef_trailing (id int NOT NULL, b enum('a','b') DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') DEFAULT 'b'"},
+		{"diff_enumdef_not_null", "CREATE TABLE diff_enumdef_not_null (id int NOT NULL, b enum('a','b') NOT NULL DEFAULT 'b   ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') NOT NULL DEFAULT 'b'"},
+		{"diff_enumdef_member_spaces", "CREATE TABLE diff_enumdef_member_spaces (id int NOT NULL, b enum('a','b ') DEFAULT 'b  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') DEFAULT 'b'"},
+		{"diff_enumdef_empty_member", "CREATE TABLE diff_enumdef_empty_member (id int NOT NULL, b enum('','b') DEFAULT ' ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('','b') DEFAULT ''"},
+		{"diff_enumdef_introducer", "CREATE TABLE diff_enumdef_introducer (id int NOT NULL, b enum('a','b') DEFAULT _latin1'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') DEFAULT 'b'"},
+		{"diff_enumdef_no_pad", "CREATE TABLE diff_enumdef_no_pad (id int NOT NULL, b enum('a','b') COLLATE utf8mb4_0900_bin DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin DEFAULT 'b'"},
+		{"diff_enumdef_utf16", "CREATE TABLE diff_enumdef_utf16 (id int NOT NULL, b enum('a','b') CHARACTER SET utf16 DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') CHARACTER SET utf16 COLLATE utf16_general_ci DEFAULT 'b'"},
+		{"diff_enumdef_case", "CREATE TABLE diff_enumdef_case (id int NOT NULL, b enum('a','B') DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','B') DEFAULT 'B'"},
+		{"diff_enumdef_case_general_ci", "CREATE TABLE diff_enumdef_case_general_ci (id int NOT NULL, b enum('a','B') COLLATE utf8mb4_general_ci DEFAULT 'b', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','B') CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci DEFAULT 'B'"},
+		{"diff_enumdef_case_latin1", "CREATE TABLE diff_enumdef_case_latin1 (id int NOT NULL, b enum('a','B') DEFAULT 'b', PRIMARY KEY (id)) DEFAULT CHARSET=latin1", "`b` enum('a','B') DEFAULT 'B'"},
+		{"diff_enumdef_case_non_ascii", "CREATE TABLE diff_enumdef_case_non_ascii (id int NOT NULL, b enum('a','Bé') DEFAULT 'bé ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','Bé') DEFAULT 'Bé'"},
+		{"diff_setdef_trailing", "CREATE TABLE diff_setdef_trailing (id int NOT NULL, b set('a','b') DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b') DEFAULT 'b'"},
+		{"diff_setdef_several", "CREATE TABLE diff_setdef_several (id int NOT NULL, b set('a','b') DEFAULT 'a,b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b') DEFAULT 'a,b'"},
+		{"diff_setdef_order", "CREATE TABLE diff_setdef_order (id int NOT NULL, b set('a','b','c') DEFAULT 'c,A,b,a ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b','c') DEFAULT 'a,b,c'"},
+		{"diff_enumdef_binary_attr", "CREATE TABLE diff_enumdef_binary_attr (id int NOT NULL, b enum('a','B') BINARY DEFAULT 'B ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','B') CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT 'B'"},
+		{"diff_setdef_duplicate", "CREATE TABLE diff_setdef_duplicate (id int NOT NULL, b set('a','b') DEFAULT 'a,a', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b') DEFAULT 'a'"},
+	}
+
+	for _, group := range []struct {
+		name, kind string
+		cases      []defaultCase
+	}{
+		{"BinaryDefaultBytes", "binary", binaryDefaultBytesCases},
+		{"BinaryLiteralDefaults", "literal", binaryLiteralDefaultsCases},
+		{"CharDefaultSpaces", "char", charDefaultSpacesCases},
+		{"EnumSetDefault", "enum or set", enumSetDefaultCases},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if needsHexReporting[tc.name] {
-				testutils.SkipBeforeMySQLVersion(t, "8.0.33", binaryDefaultHexReason)
+		t.Run(group.name, func(t *testing.T) {
+			for _, tc := range group.cases {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					if needsHexReporting[tc.name] {
+						testutils.SkipBeforeMySQLVersion(t, "8.0.33", binaryDefaultHexReason)
+					}
+					tt := testutils.NewTestTable(t, tc.name, tc.ddl)
+					liveSQL := showCreateTable(t, tt.DB, tt.Name)
+					require.Contains(t, liveSQL, tc.live, "the reading this case pins")
+					desired, err := ParseCreateTable(tc.ddl)
+					require.NoError(t, err)
+					live, err := ParseCreateTable(liveSQL)
+					require.NoError(t, err)
+					stmts, err := live.Diff(desired, nil)
+					require.NoError(t, err)
+					require.Nil(t, stmts, "a "+group.kind+" default must match its live form")
+					stmts, err = desired.Diff(live, nil)
+					require.NoError(t, err)
+					require.Nil(t, stmts, "the live form must match the "+group.kind+" default")
+				})
 			}
-			tt := testutils.NewTestTable(t, tc.name, tc.ddl)
-			liveSQL := showCreateTable(t, tt.DB, tt.Name)
-			require.Contains(t, liveSQL, tc.live, "the reading this case pins")
-			desired, err := ParseCreateTable(tc.ddl)
-			require.NoError(t, err)
-			live, err := ParseCreateTable(liveSQL)
-			require.NoError(t, err)
-			stmts, err := live.Diff(desired, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "a binary default must match its live form")
-			stmts, err = desired.Diff(live, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "the live form must match the binary default")
 		})
 	}
 }
@@ -2747,60 +2852,6 @@ func TestDiffIntegrationZeroWidthCreatedAsDeclared(t *testing.T) {
 	require.Contains(t, liveSQL, "`d` decimal(10,0)")
 	requireConverged(t, tt.DB, tt.Name, declaredSQL)
 	requireNoSelfDiff(t, tt.DB, tt.Name)
-}
-
-// TestDiffIntegrationBinaryLiteralDefaults verifies that a hex or bit literal
-// default on an integer, bit, char or varchar column matches its live form.
-// MySQL converts the literal to the column's own type and reports it in that
-// form: int DEFAULT 0x1A as DEFAULT '26', bit(8) DEFAULT x'61' as
-// DEFAULT b'1100001', and varchar(4) DEFAULT 0x61 as DEFAULT 'a'. An integer
-// default on a bit column is converted the same way (bit(1) DEFAULT 0 is
-// reported as DEFAULT b'0'). Without the conversion the diff emits a MODIFY
-// that MySQL rewrites to its own form again, on every run.
-//
-// A char default that is not valid utf8mb3 is reported as a hex literal only
-// from MySQL 8.0.33 (see binaryDefaultHexReason), so that case skips before it.
-func TestDiffIntegrationBinaryLiteralDefaults(t *testing.T) {
-	needsHexReporting := map[string]bool{"diff_binlit_char_4byte": true}
-	for _, tc := range []struct{ name, column, live string }{
-		{"diff_binlit_int_hex", "b int DEFAULT 0x1A", "`b` int DEFAULT '26'"},
-		{"diff_binlit_int_bit", "b int DEFAULT b'1010'", "`b` int DEFAULT '10'"},
-		{"diff_binlit_decimal_hex", "b decimal(5) DEFAULT 0x1A", "`b` decimal(5,0) DEFAULT '26'"},
-		{"diff_binlit_decimal_max", "b decimal(20,0) DEFAULT 0x7FFFFFFFFFFFFFFF", "`b` decimal(20,0) DEFAULT '9223372036854775807'"},
-		{"diff_binlit_int_max", "b bigint unsigned NOT NULL DEFAULT 0xFFFFFFFFFFFFFFFF", "`b` bigint unsigned NOT NULL DEFAULT '18446744073709551615'"},
-		{"diff_binlit_bit_hex", "b bit(8) DEFAULT x'61'", "`b` bit(8) DEFAULT b'1100001'"},
-		{"diff_binlit_bit_hex_zero", "b bit(8) DEFAULT x'0000'", "`b` bit(8) DEFAULT b'0'"},
-		{"diff_binlit_bit_int", "b bit(1) NOT NULL DEFAULT 0", "`b` bit(1) NOT NULL DEFAULT b'0'"},
-		{"diff_binlit_bit_no_width", "b bit DEFAULT 1", "`b` bit(1) DEFAULT b'1'"},
-		{"diff_binlit_bit_string", "b bit(8) DEFAULT '0'", "`b` bit(8) DEFAULT b'110000'"},
-		{"diff_binlit_char_hex", "b char(4) DEFAULT x'61'", "`b` char(4) DEFAULT 'a'"},
-		{"diff_binlit_varchar_hex", "b varchar(4) DEFAULT 0x61", "`b` varchar(4) DEFAULT 'a'"},
-		{"diff_binlit_varchar_bit", "b varchar(4) DEFAULT b'01100001'", "`b` varchar(4) DEFAULT 'a'"},
-		{"diff_binlit_char_multibyte", "b char(4) DEFAULT x'c3a9'", "`b` char(4) DEFAULT 'é'"},
-		{"diff_binlit_char_quote", "b char(4) DEFAULT x'27'", "`b` char(4) DEFAULT ''''"},
-		{"diff_binlit_char_ascii", "b char(4) CHARACTER SET ascii DEFAULT x'61'", "`b` char(4) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT 'a'"},
-		{"diff_binlit_char_4byte", "b char(4) DEFAULT x'f09f9880'", "`b` char(4) DEFAULT 0xF09F9880"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if needsHexReporting[tc.name] {
-				testutils.SkipBeforeMySQLVersion(t, "8.0.33", binaryDefaultHexReason)
-			}
-			ddl := "CREATE TABLE " + tc.name + " (id int NOT NULL, " + tc.column + ", PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-			tt := testutils.NewTestTable(t, tc.name, ddl)
-			liveSQL := showCreateTable(t, tt.DB, tt.Name)
-			require.Contains(t, liveSQL, tc.live, "the reading this case pins")
-			desired, err := ParseCreateTable(ddl)
-			require.NoError(t, err)
-			live, err := ParseCreateTable(liveSQL)
-			require.NoError(t, err)
-			stmts, err := live.Diff(desired, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "a literal default must match its live form")
-			stmts, err = desired.Diff(live, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "the live form must match the literal default")
-		})
-	}
 }
 
 // TestDiffIntegrationBinaryLiteralDefaultsConverge verifies that the MODIFY
@@ -3019,56 +3070,6 @@ func TestDiffIntegrationTinyint1UnsignedConverges(t *testing.T) {
 	requireNoSelfDiff(t, tt.DB, tt.Name)
 }
 
-// TestDiffIntegrationCharDefaultSpaces verifies that a string default on a
-// char(N) column matches its live form, which MySQL reports with every
-// trailing space stripped (char(4) DEFAULT 'a  ' is reported as DEFAULT 'a'),
-// in every charset and collation, NO PAD collations included. A varchar(N)
-// default keeps its trailing spaces, except those past the column's width,
-// which MySQL drops (varchar(4) DEFAULT 'ab      ' is reported as 'ab  ').
-// A hex or bit literal default is reported as the string its bytes form, with
-// the same spaces handling (char(4) DEFAULT x'612020' is reported as 'a').
-// Without the conversion the diff emits a MODIFY that MySQL rewrites to its
-// own form again, on every run.
-func TestDiffIntegrationCharDefaultSpaces(t *testing.T) {
-	for _, tc := range []struct{ name, ddl, live string }{
-		{"diff_charpad_trailing", "CREATE TABLE diff_charpad_trailing (id int NOT NULL, b char(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
-		{"diff_charpad_only_spaces", "CREATE TABLE diff_charpad_only_spaces (id int NOT NULL, b char(4) NOT NULL DEFAULT '    ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) NOT NULL DEFAULT ''"},
-		{"diff_charpad_no_width", "CREATE TABLE diff_charpad_no_width (id int NOT NULL, b char DEFAULT ' ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(1) DEFAULT ''"},
-		{"diff_charpad_leading", "CREATE TABLE diff_charpad_leading (id int NOT NULL, b char(4) DEFAULT ' a ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT ' a'"},
-		{"diff_charpad_past_width", "CREATE TABLE diff_charpad_past_width (id int NOT NULL, b char(4) DEFAULT 'abcd  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'abcd'"},
-		{"diff_charpad_tab", "CREATE TABLE diff_charpad_tab (id int NOT NULL, b char(4) DEFAULT 'ab\\t  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'ab\t'"},
-		{"diff_charpad_nul", "CREATE TABLE diff_charpad_nul (id int NOT NULL, b char(4) DEFAULT 'a\\0 ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a\\0'"},
-		{"diff_charpad_introducer", "CREATE TABLE diff_charpad_introducer (id int NOT NULL, b char(4) DEFAULT _latin1'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
-		{"diff_charpad_no_pad", "CREATE TABLE diff_charpad_no_pad (id int NOT NULL, b char(4) COLLATE utf8mb4_0900_bin DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin DEFAULT 'a'"},
-		{"diff_charpad_utf16", "CREATE TABLE diff_charpad_utf16 (id int NOT NULL, b char(4) CHARACTER SET utf16 DEFAULT 'abcd  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) CHARACTER SET utf16 COLLATE utf16_general_ci DEFAULT 'abcd'"},
-		{"diff_charpad_latin1_table", "CREATE TABLE diff_charpad_latin1_table (id int NOT NULL, b char(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=latin1", "`b` char(4) DEFAULT 'a'"},
-		{"diff_charpad_hex", "CREATE TABLE diff_charpad_hex (id int NOT NULL, b char(4) DEFAULT x'612020', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
-		{"diff_charpad_hex_past_width", "CREATE TABLE diff_charpad_hex_past_width (id int NOT NULL, b char(4) DEFAULT 0x61202020202020, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
-		{"diff_charpad_bit", "CREATE TABLE diff_charpad_bit (id int NOT NULL, b char(4) DEFAULT b'011000010010000000100000', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` char(4) DEFAULT 'a'"},
-		{"diff_varcharpad_hex_past_width", "CREATE TABLE diff_varcharpad_hex_past_width (id int NOT NULL, b varchar(4) DEFAULT x'61202020202020', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a   '"},
-		{"diff_varcharpad_keeps", "CREATE TABLE diff_varcharpad_keeps (id int NOT NULL, b varchar(4) DEFAULT 'a  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'a  '"},
-		{"diff_varcharpad_past_width", "CREATE TABLE diff_varcharpad_past_width (id int NOT NULL, b varchar(4) DEFAULT 'ab      ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) DEFAULT 'ab  '"},
-		{"diff_varcharpad_multibyte", "CREATE TABLE diff_varcharpad_multibyte (id int NOT NULL, b varchar(2) DEFAULT 'é   ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(2) DEFAULT 'é '"},
-		{"diff_varcharpad_latin1", "CREATE TABLE diff_varcharpad_latin1 (id int NOT NULL, b varchar(4) CHARACTER SET latin1 NOT NULL DEFAULT 'ab    ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` varchar(4) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL DEFAULT 'ab  '"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tt := testutils.NewTestTable(t, tc.name, tc.ddl)
-			liveSQL := showCreateTable(t, tt.DB, tt.Name)
-			require.Contains(t, liveSQL, tc.live, "the reading this case pins")
-			desired, err := ParseCreateTable(tc.ddl)
-			require.NoError(t, err)
-			live, err := ParseCreateTable(liveSQL)
-			require.NoError(t, err)
-			stmts, err := live.Diff(desired, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "a char default must match its live form")
-			stmts, err = desired.Diff(live, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "the live form must match the char default")
-		})
-	}
-}
-
 // TestDiffIntegrationCharDefaultSpacesConverges verifies that the MODIFY
 // emitted for a char or varchar default with trailing spaces round-trips:
 // MySQL applies it and reports the value it carries, after which a re-diff
@@ -3129,49 +3130,6 @@ func TestDiffIntegrationCharDefaultSpacesPadCharToFullLength(t *testing.T) {
 	stmts, err := live.Diff(desired, nil)
 	require.NoError(t, err)
 	require.Nil(t, stmts, "a padded reading must match the char default")
-}
-
-// TestDiffIntegrationEnumSetDefault verifies that a string default on an enum
-// or set column matches its live form, which MySQL reports as the member text
-// the default names: trailing spaces stripped (enum('a','b') DEFAULT 'b ' is
-// reported as DEFAULT 'b'), the member's own case on a _ci collation, and a set
-// default's members once each in definition order. Without the conversion the
-// diff emits a MODIFY that MySQL rewrites to the member again, on every run.
-func TestDiffIntegrationEnumSetDefault(t *testing.T) {
-	for _, tc := range []struct{ name, ddl, live string }{
-		{"diff_enumdef_trailing", "CREATE TABLE diff_enumdef_trailing (id int NOT NULL, b enum('a','b') DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') DEFAULT 'b'"},
-		{"diff_enumdef_not_null", "CREATE TABLE diff_enumdef_not_null (id int NOT NULL, b enum('a','b') NOT NULL DEFAULT 'b   ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') NOT NULL DEFAULT 'b'"},
-		{"diff_enumdef_member_spaces", "CREATE TABLE diff_enumdef_member_spaces (id int NOT NULL, b enum('a','b ') DEFAULT 'b  ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') DEFAULT 'b'"},
-		{"diff_enumdef_empty_member", "CREATE TABLE diff_enumdef_empty_member (id int NOT NULL, b enum('','b') DEFAULT ' ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('','b') DEFAULT ''"},
-		{"diff_enumdef_introducer", "CREATE TABLE diff_enumdef_introducer (id int NOT NULL, b enum('a','b') DEFAULT _latin1'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') DEFAULT 'b'"},
-		{"diff_enumdef_no_pad", "CREATE TABLE diff_enumdef_no_pad (id int NOT NULL, b enum('a','b') COLLATE utf8mb4_0900_bin DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin DEFAULT 'b'"},
-		{"diff_enumdef_utf16", "CREATE TABLE diff_enumdef_utf16 (id int NOT NULL, b enum('a','b') CHARACTER SET utf16 DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','b') CHARACTER SET utf16 COLLATE utf16_general_ci DEFAULT 'b'"},
-		{"diff_enumdef_case", "CREATE TABLE diff_enumdef_case (id int NOT NULL, b enum('a','B') DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','B') DEFAULT 'B'"},
-		{"diff_enumdef_case_general_ci", "CREATE TABLE diff_enumdef_case_general_ci (id int NOT NULL, b enum('a','B') COLLATE utf8mb4_general_ci DEFAULT 'b', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','B') CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci DEFAULT 'B'"},
-		{"diff_enumdef_case_latin1", "CREATE TABLE diff_enumdef_case_latin1 (id int NOT NULL, b enum('a','B') DEFAULT 'b', PRIMARY KEY (id)) DEFAULT CHARSET=latin1", "`b` enum('a','B') DEFAULT 'B'"},
-		{"diff_enumdef_case_non_ascii", "CREATE TABLE diff_enumdef_case_non_ascii (id int NOT NULL, b enum('a','Bé') DEFAULT 'bé ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','Bé') DEFAULT 'Bé'"},
-		{"diff_setdef_trailing", "CREATE TABLE diff_setdef_trailing (id int NOT NULL, b set('a','b') DEFAULT 'b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b') DEFAULT 'b'"},
-		{"diff_setdef_several", "CREATE TABLE diff_setdef_several (id int NOT NULL, b set('a','b') DEFAULT 'a,b ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b') DEFAULT 'a,b'"},
-		{"diff_setdef_order", "CREATE TABLE diff_setdef_order (id int NOT NULL, b set('a','b','c') DEFAULT 'c,A,b,a ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b','c') DEFAULT 'a,b,c'"},
-		{"diff_enumdef_binary_attr", "CREATE TABLE diff_enumdef_binary_attr (id int NOT NULL, b enum('a','B') BINARY DEFAULT 'B ', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` enum('a','B') CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT 'B'"},
-		{"diff_setdef_duplicate", "CREATE TABLE diff_setdef_duplicate (id int NOT NULL, b set('a','b') DEFAULT 'a,a', PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", "`b` set('a','b') DEFAULT 'a'"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tt := testutils.NewTestTable(t, tc.name, tc.ddl)
-			liveSQL := showCreateTable(t, tt.DB, tt.Name)
-			require.Contains(t, liveSQL, tc.live, "the reading this case pins")
-			desired, err := ParseCreateTable(tc.ddl)
-			require.NoError(t, err)
-			live, err := ParseCreateTable(liveSQL)
-			require.NoError(t, err)
-			stmts, err := live.Diff(desired, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "an enum or set default must match its live form")
-			stmts, err = desired.Diff(live, nil)
-			require.NoError(t, err)
-			require.Nil(t, stmts, "the live form must match the enum or set default")
-		})
-	}
 }
 
 // TestDiffIntegrationEnumSetDefaultConverges verifies that the MODIFY emitted

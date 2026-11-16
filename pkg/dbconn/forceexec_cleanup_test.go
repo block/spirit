@@ -1686,7 +1686,7 @@ func sessionState(t *testing.T, ctx context.Context, pid int64) string {
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	var info sql.NullString
-	err = db.QueryRowContext(ctx, "SELECT info FROM information_schema.processlist WHERE id = ?", pid).Scan(&info)
+	err = db.QueryRowContext(ctx, "SELECT info FROM performance_schema.processlist WHERE id = ?", pid).Scan(&info)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sessionGone
 	}
@@ -1734,7 +1734,7 @@ func requireCancelledDropLeavesTable(t *testing.T, table string, db *sql.DB, exe
 		// Cancel once the DROP is seen waiting for the blocker's lock.
 		for ctx.Err() == nil {
 			var pid int64
-			err := tt.DB.QueryRowContext(ctx, "SELECT id FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE "+table+"%").Scan(&pid)
+			err := tt.DB.QueryRowContext(ctx, "SELECT id FROM performance_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE "+table+"%").Scan(&pid)
 			if err == nil {
 				stmtPID.Store(pid)
 				cancel()
