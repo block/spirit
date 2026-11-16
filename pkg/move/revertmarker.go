@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 
 	"github.com/block/spirit/pkg/dbconn"
 )
@@ -39,7 +40,9 @@ func revertMarkerExists(ctx context.Context, db *sql.DB) (bool, error) {
 	return true, nil
 }
 
-// dropRevertMarker removes the revert marker (idempotent).
-func dropRevertMarker(ctx context.Context, db *sql.DB) error {
-	return dbconn.Exec(ctx, db, "DROP TABLE IF EXISTS %n", revertMarkerName)
+// dropRevertMarker removes the revert marker (idempotent). A cancelled drop
+// is ended on the server before it returns, so it cannot remove a marker an
+// operator creates afterwards.
+func dropRevertMarker(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
+	return dbconn.ExecKillOnCancel(ctx, db, logger, "DROP TABLE IF EXISTS %n", revertMarkerName)
 }

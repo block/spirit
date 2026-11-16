@@ -4,7 +4,7 @@ go 1.26.11
 
 require (
 	github.com/alecthomas/kong v1.17.0
-	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6
+	github.com/block/mysql v0.0.0-20261110174027-9d0d79e18242
 	github.com/go-ini/ini v1.67.0
 	github.com/go-mysql-org/go-mysql v1.16.1-0.20260731133054-6f853f178dc3
 	github.com/google/uuid v1.6.0

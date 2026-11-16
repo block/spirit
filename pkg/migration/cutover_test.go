@@ -16,6 +16,7 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/check"
+	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/status"
@@ -1589,4 +1590,80 @@ func TestCutOverChecksUnderLockRetryPolicy(t *testing.T) {
 			require.Equal(t, 2, n, "the retried cutover must complete")
 		})
 	}
+}
+
+// When the DROP of a table left over once a change has applied is cancelled
+// and its end on the server cannot be confirmed, the runner returns that
+// error, naming the DROP's session, while Result still reports the change as
+// applied. The caller then knows a statement it issued may still run, without
+// mistaking the applied change for a failure. Any other DROP failure is only
+// logged, as the change has already applied.
+func TestRunnerReportsADropAfterTheChangeThatMayStillRun(t *testing.T) {
+	t.Parallel()
+	unconfirmed := &dbconn.CancelledStatementError{ConnID: 4242, Err: context.Canceled}
+
+	t.Run("stale copy after native DDL", func(t *testing.T) {
+		t.Parallel()
+		tt := testutils.NewTestTable(t, "dropunconfnative", `CREATE TABLE dropunconfnative (
+			id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(255) NOT NULL
+		)`)
+		testutils.RunSQL(t, "CREATE TABLE _dropunconfnative_new LIKE dropunconfnative")
+		ckpt := checkpoint.NewTable(tt.DB, "_dropunconfnative_chkpnt", checkpoint.Transient)
+		require.NoError(t, ckpt.Create(t.Context()))
+		require.NoError(t, ckpt.Write(t.Context(), checkpoint.Record{Statement: "ALTER TABLE dropunconfnative ENGINE=InnoDB", OriginalTableName: "dropunconfnative"}))
+
+		m := NewTestRunnerFromStatement(t, "ALTER TABLE dropunconfnative ADD COLUMN c INT NOT NULL DEFAULT 7", WithThreads(1))
+		m.testDropAfterChange = func(context.Context, string) error { return unconfirmed }
+		err := m.Run(t.Context())
+		var got *dbconn.CancelledStatementError
+		require.ErrorAs(t, err, &got)
+		require.Equal(t, 4242, got.ConnID, "the error names the DROP's session")
+		require.True(t, m.usedInstantDDL)
+		require.True(t, m.Result().DurableMutation, "the ALTER is still reported as applied")
+		require.NoError(t, m.Close())
+		require.Contains(t, showCreateTable(t, tt.DB, "dropunconfnative"), "`c` int NOT NULL DEFAULT '7'")
+	})
+
+	t.Run("old table after the cutover", func(t *testing.T) {
+		t.Parallel()
+		tt := testutils.NewTestTable(t, "dropunconfcutover", `CREATE TABLE dropunconfcutover (
+			id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(255) NOT NULL
+		)`)
+		testutils.RunSQL(t, "INSERT INTO dropunconfcutover (name) VALUES ('a'), ('b')")
+
+		m := NewTestRunner(t, "dropunconfcutover", "ENGINE=InnoDB")
+		var dropped []string
+		m.testDropAfterChange = func(_ context.Context, table string) error {
+			dropped = append(dropped, table)
+			return unconfirmed
+		}
+		err := m.Run(t.Context())
+		var got *dbconn.CancelledStatementError
+		require.ErrorAs(t, err, &got)
+		require.Equal(t, 4242, got.ConnID, "the error names the DROP's session")
+		require.Equal(t, []string{"_dropunconfcutover_old"}, dropped)
+		require.True(t, m.Result().DurableMutation, "the cutover is still reported as committed")
+		require.NoError(t, m.Close())
+
+		var count int
+		require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+			`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN (?, ?)`,
+			"_dropunconfcutover_new", "_dropunconfcutover_chkpnt").Scan(&count))
+		require.Zero(t, count, "the rest of the cleanup still runs")
+	})
+
+	t.Run("other drop failures are only logged", func(t *testing.T) {
+		t.Parallel()
+		testutils.NewTestTable(t, "dropfailcutover", `CREATE TABLE dropfailcutover (
+			id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(255) NOT NULL
+		)`)
+		m := NewTestRunner(t, "dropfailcutover", "ENGINE=InnoDB")
+		m.testDropAfterChange = func(context.Context, string) error { return errors.New("drop failed") }
+		require.NoError(t, m.Run(t.Context()), "the cutover committed, so a failed drop of _old is not the outcome")
+		require.True(t, m.Result().DurableMutation)
+		require.NoError(t, m.Close())
+	})
 }

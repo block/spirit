@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/status"
 	"github.com/stretchr/testify/require"
 )
@@ -34,6 +36,9 @@ func TestAmbiguousDDLError(t *testing.T) {
 		io.EOF,
 		&mysql.MySQLError{Number: 2013}, // CR_SERVER_LOST
 		fmt.Errorf("ALTER TABLE t1: %w", driver.ErrBadConn),
+		// A cancelled ALTER whose session could not be confirmed stopped
+		// may still apply on the server.
+		fmt.Errorf("%w: session 7: %w", dbconn.ErrCancelledStatementMayStillRun, context.Canceled),
 	} {
 		ambiguous := ambiguousDDLError(err)
 		require.Error(t, ambiguous, "%v must be ownership-ambiguous", err)
