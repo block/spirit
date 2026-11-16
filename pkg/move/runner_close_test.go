@@ -40,6 +40,7 @@ import (
 // path is a no-op. The cancel function is a counter we
 // observe.
 func TestFatalErrorIsIdempotent(t *testing.T) {
+	t.Parallel()
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger: slog.Default(),
@@ -64,6 +65,7 @@ func TestFatalErrorIsIdempotent(t *testing.T) {
 // exactly once even when the racing callers all pass the pre-CutOver
 // status check. Run with -race.
 func TestFatalErrorConcurrentRace(t *testing.T) {
+	t.Parallel()
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger: slog.Default(),
@@ -91,6 +93,7 @@ func TestFatalErrorConcurrentRace(t *testing.T) {
 // RENAME TABLE DDL is expected at that point and must not invalidate the
 // (already-irrelevant) checkpoint.
 func TestFatalErrorPastCutoverIsNoop(t *testing.T) {
+	t.Parallel()
 	var cancelCalls atomic.Int32
 	r := &Runner{
 		logger: slog.Default(),
@@ -107,6 +110,7 @@ func TestFatalErrorPastCutoverIsNoop(t *testing.T) {
 // cancel function (early setup / test paths that bypass Run). Without the
 // nil-check it nil-derefs.
 func TestFatalErrorSafeWithoutCancelFunc(t *testing.T) {
+	t.Parallel()
 	r := &Runner{
 		logger: slog.Default(),
 		// cancel function intentionally nil
@@ -120,6 +124,7 @@ func TestFatalErrorSafeWithoutCancelFunc(t *testing.T) {
 // runner that has not been Run: the cancel function is only set by Run, so without
 // the nil-check they nil-deref.
 func TestCancelAndAbortBeforeRun(t *testing.T) {
+	t.Parallel()
 	r, err := NewRunner(&Move{})
 	require.NoError(t, err)
 	require.NotPanics(t, r.Cancel)
@@ -129,6 +134,7 @@ func TestCancelAndAbortBeforeRun(t *testing.T) {
 // TestCancelConcurrentWithRun: Cancel is how another goroutine stops a move,
 // so it must be safe to call while Run is still setting up its context.
 func TestCancelConcurrentWithRun(t *testing.T) {
+	t.Parallel()
 	r, err := NewRunner(&Move{})
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -147,6 +153,7 @@ func TestCancelConcurrentWithRun(t *testing.T) {
 // Abort its cause, so Run returns the checkpoint error rather than
 // context.Canceled.
 func TestCancelAbortAndCloseCancelTheRun(t *testing.T) {
+	t.Parallel()
 	var causes []error
 	r := &Runner{
 		logger: slog.Default(),
@@ -163,6 +170,7 @@ func TestCancelAbortAndCloseCancelTheRun(t *testing.T) {
 // context with an error naming the reason, not with a bare cancellation: Run
 // returns that cause, so the abort is reported and recorded as a failure.
 func TestFatalErrorCancelsWithCause(t *testing.T) {
+	t.Parallel()
 	var cause error
 	r := &Runner{
 		logger: slog.Default(),
@@ -182,6 +190,7 @@ func TestFatalErrorCancelsWithCause(t *testing.T) {
 // after its recreate attempts) must PRESERVE it, because a dead stream is
 // exactly the failure checkpoint resume recovers from.
 func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
+	t.Parallel()
 	// makeRunner builds a minimal Runner whose first target holds a real
 	// checkpoint table, in a database unique to the subtest.
 	makeRunner := func(t *testing.T) (*Runner, *atomic.Int32) {
@@ -243,6 +252,7 @@ func TestFatalErrorReasonCheckpointHandling(t *testing.T) {
 // target DBs must still be closed, and both the chunker's and the applier's
 // errors must surface in the joined result.
 func TestCloseRunsAllClosersOnError(t *testing.T) {
+	t.Parallel()
 	chunkerErr := errors.New("chunker close failed")
 	mockChunker := table.NewMockChunker("t1", 100)
 	require.NoError(t, mockChunker.Open())
@@ -290,6 +300,7 @@ func TestCloseRunsAllClosersOnError(t *testing.T) {
 // The close used to be registered only after every source had connected, so
 // sources 0..i-1 leaked their pools.
 func TestRunClosesOpenedSourcesWhenALaterSourceFailsToConnect(t *testing.T) {
+	t.Parallel()
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
 	tgtName, _ := testutils.CreateUniqueTestDatabase(t)
 	// A unique name, dropped again, so source 1 is guaranteed to fail with

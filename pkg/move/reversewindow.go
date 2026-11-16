@@ -1,6 +1,7 @@
 package move
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -35,18 +36,14 @@ const (
 	phaseReverseFinalized = "reverse_finalized"
 )
 
-// reverseWindowPollInterval is how often the window loop checks for a revert
-// request, feed death, or the deadline. A var so tests can shorten it.
-var reverseWindowPollInterval = 1 * time.Second
+// defaultReverseWindowPollInterval is how often the window loop checks for a
+// revert request, feed death, or the deadline. Tests shorten it per Runner
+// (tunables.reverseWindowPollInterval).
+const defaultReverseWindowPollInterval = 1 * time.Second
 
-// reverseCutoverUnderLockHook, when non-nil, runs at the start of each reverse
-// cutover attempt's work under the target locks, bounded by the cutover lock
-// timeout. A var so tests can stall or fail an attempt there.
-var reverseCutoverUnderLockHook func(ctx context.Context) error
-
-// reverseFeedFlushInterval is the reverse feed's periodic flush interval. A var
-// so tests can shorten it.
-var reverseFeedFlushInterval = change.DefaultFlushInterval
+// defaultReverseFeedFlushInterval is the reverse feed's periodic flush
+// interval. Tests shorten it per Runner (tunables.reverseFeedFlushInterval).
+const defaultReverseFeedFlushInterval = change.DefaultFlushInterval
 
 // targetCurrentPosition reads target tgt's current head position in the change
 // feed's coordinate scheme — auto-detected from that target server (GTIDs when
@@ -200,7 +197,7 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 		"window", r.move.ReverseWindow, "deadline", deadline, "reverse_sources", len(r.targets))
 
 	return r.status.DoContext(ctx, status.ReverseWindow, func() error {
-		ticker := time.NewTicker(reverseWindowPollInterval)
+		ticker := time.NewTicker(cmp.Or(r.tunables.reverseWindowPollInterval, defaultReverseWindowPollInterval))
 		defer ticker.Stop()
 		checkpointTicker := time.NewTicker(status.CheckpointDumpInterval)
 		defer checkpointTicker.Stop()
@@ -210,7 +207,7 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 		// not lock the targets again on the next tick.
 		failedReverts := 0
 		var retryRevertAt time.Time
-		revertBackoff := reverseCutoverInitialBackoff
+		revertBackoff := cmp.Or(r.tunables.reverseCutoverInitialBackoff, defaultReverseCutoverInitialBackoff)
 		for {
 			select {
 			case <-ctx.Done():
@@ -278,7 +275,7 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					r.logger.Warn("reverse cutover attempt failed before ownership moved; the reverse window stays open and will try again",
 						"attempt", failedReverts, "max_retries", r.dbConfig.MaxRetries, "retry_in", revertBackoff, "error", err.Error())
 					retryRevertAt = time.Now().Add(revertBackoff)
-					revertBackoff = min(revertBackoff*2, reverseCutoverMaxBackoff)
+					revertBackoff = min(revertBackoff*2, cmp.Or(r.tunables.reverseCutoverMaxBackoff, defaultReverseCutoverMaxBackoff))
 					continue
 				}
 				if !time.Now().Before(deadline) {
@@ -430,7 +427,7 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 		Logger:        r.logger,
 		DBConfig:      r.dbConfig,
 		Threads:       r.reverseWriteThreads,
-		FlushInterval: reverseFeedFlushInterval,
+		FlushInterval: cmp.Or(r.tunables.reverseFeedFlushInterval, defaultReverseFeedFlushInterval),
 	}
 	if sharded {
 		revTargets := make([]applier.Target, len(r.sources))
@@ -529,8 +526,8 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 	beforePersist := func(err error) error {
 		return abandonReverseCutover(lockTimeoutError(ctx, lockedCtx, lockTimeout, err))
 	}
-	if reverseCutoverUnderLockHook != nil {
-		if err := reverseCutoverUnderLockHook(lockedCtx); err != nil {
+	if hook := w.r.tunables.reverseCutoverUnderLockHook; hook != nil {
+		if err := hook(lockedCtx); err != nil {
 			return beforePersist(err)
 		}
 	}
@@ -637,11 +634,12 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 	return w.finalizeReverse(finalizeCtx)
 }
 
-// reverseCutoverInitialBackoff and reverseCutoverMaxBackoff bound the wait
-// between reverse cutover attempts. Vars so tests can shorten them.
-var (
-	reverseCutoverInitialBackoff = 2 * time.Second
-	reverseCutoverMaxBackoff     = 10 * time.Second
+// defaultReverseCutoverInitialBackoff and defaultReverseCutoverMaxBackoff
+// bound the wait between reverse cutover attempts. Tests shorten them per
+// Runner (tunables.reverseCutoverInitialBackoff / reverseCutoverMaxBackoff).
+const (
+	defaultReverseCutoverInitialBackoff = 2 * time.Second
+	defaultReverseCutoverMaxBackoff     = 10 * time.Second
 )
 
 // retryAutoIncrementCarry runs carry, and runs it again, up to
@@ -658,7 +656,7 @@ func retryAutoIncrementCarry(ctx context.Context, r *Runner, timeout time.Durati
 			select {
 			case <-ctx.Done():
 				return errors.Join(err, ctx.Err())
-			case <-time.After(renameRetryWait):
+			case <-time.After(cmp.Or(r.tunables.renameRetryWait, defaultRenameRetryWait)):
 			}
 		}
 		err = carryAttempt(ctx, timeout, carry)
@@ -731,7 +729,7 @@ func (w *reverseWindow) switchTrafficToSource(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return errors.Join(err, ctx.Err())
-			case <-time.After(renameRetryWait):
+			case <-time.After(cmp.Or(r.tunables.renameRetryWait, defaultRenameRetryWait)):
 			}
 		}
 		err = w.runReverseCutoverCallback(ctx)
@@ -786,7 +784,7 @@ func (w *reverseWindow) retireTarget(ctx context.Context, i int, lock *dbconn.Ta
 		if attempt > 1 {
 			r.logger.Warn("retrying the retire of a former target while still holding its table locks",
 				"target", i, "attempt", attempt, "max_retries", r.dbConfig.MaxRetries, "error", err.Error())
-			time.Sleep(renameRetryWait)
+			time.Sleep(cmp.Or(r.tunables.renameRetryWait, defaultRenameRetryWait))
 		}
 		err = lock.ExecUnderLock(ctx, stmt)
 		if err == nil {

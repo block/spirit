@@ -27,6 +27,7 @@ const targetObjectsRefusal = "cannot move: triggers on the tables move writes to
 // write every row through it, so it fires once per copied row and again for
 // every replayed change. The move must refuse before writing to the target.
 func TestMoveRefusesTargetTriggerOnPrecreatedTable(t *testing.T) {
+	t.Parallel()
 	const src, dst = "tgt_trg_src", "tgt_trg_dst"
 	for _, db := range []string{src, dst} {
 		testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+db)
@@ -63,6 +64,7 @@ func TestMoveRefusesTargetTriggerOnPrecreatedTable(t *testing.T) {
 // The move is refused before anything is created on the target, even though
 // no target table exists yet.
 func TestMoveRefusesTargetEvent(t *testing.T) {
+	t.Parallel()
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
 	dstName, ctl := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE orders (id INT NOT NULL PRIMARY KEY, v INT)")
@@ -90,6 +92,7 @@ func TestMoveRefusesTargetEvent(t *testing.T) {
 // only targets[0] (where the checkpoint lives). The trigger is on the second
 // shard's pre-created table.
 func TestShardedMoveRefusesTargetTriggerOnOneShard(t *testing.T) {
+	t.Parallel()
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
 	shard0Name, ctl := testutils.CreateUniqueTestDatabase(t)
 	shard1Name, _ := testutils.CreateUniqueTestDatabase(t)
@@ -146,6 +149,7 @@ func TestShardedMoveRefusesTargetTriggerOnOneShard(t *testing.T) {
 // resume deletes and recopies rows above the watermark or replays changes.
 // --force does not wipe the target over it.
 func TestResumeFromCheckpointRefusesTargetTrigger(t *testing.T) {
+	t.Parallel()
 	srcName, ctl := testutils.CreateUniqueTestDatabase(t)
 	dstName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT, val VARBINARY(64))")
@@ -198,6 +202,7 @@ func TestResumeFromCheckpointRefusesTargetTrigger(t *testing.T) {
 // would stay live after traffic is switched. The cutover's checks under lock
 // find it and refuse on the first attempt, with the source still live.
 func TestMoveCutoverRefusesTargetTriggerUnderLock(t *testing.T) {
+	t.Parallel()
 	srcName, ctl := testutils.CreateUniqueTestDatabase(t)
 	dstName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, val VARCHAR(255))")
@@ -249,6 +254,7 @@ func countTables(t *testing.T, db *sql.DB, schema string) int {
 // setup and goes straight to the cutover callback. An event in the target
 // schema still refuses the move there, before the callback runs.
 func TestEmptySourceMoveRefusesTargetEvent(t *testing.T) {
+	t.Parallel()
 	srcName, _ := testutils.CreateUniqueTestDatabase(t)
 	dstName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabaseAsRoot(t, dstName, "CREATE EVENT orders_e ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1")

@@ -129,6 +129,7 @@ func advanceUntilWatermark(t *testing.T, c table.Chunker) {
 // checkpoint or fire fatalError. Resume safety lives in the DumpCheckpoint
 // invariant — see TestDumpCheckpointSuppressesWatermarkWithDifferences.
 func TestChecksumErrorPreservesCheckpoint(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -168,6 +169,7 @@ func TestChecksumErrorPreservesCheckpoint(t *testing.T) {
 // start of the checksum phase. Once the counter clears, the real watermark
 // is persisted again.
 func TestDumpCheckpointSuppressesWatermarkWithDifferences(t *testing.T) {
+	t.Parallel()
 	r, ctx := setupRunnerForChecksumTest(t, "invariant")
 
 	mock := &checksum.MockChecker{Chunker: r.checksumChunker}
@@ -198,6 +200,7 @@ func TestDumpCheckpointSuppressesWatermarkWithDifferences(t *testing.T) {
 // write it back. The copy checkpoint survives. Mirrors the migration-package
 // test of the same name.
 func TestContinuousChecksumClearsCheckpointWatermark(t *testing.T) {
+	t.Parallel()
 	r, ctx := setupRunnerForChecksumTest(t, "cont_invalidate")
 
 	mock := &checksum.MockChecker{Chunker: r.checksumChunker}
@@ -281,6 +284,7 @@ func latestCheckpointWatermarks(t *testing.T, r *Runner) (string, string) {
 // reverse-window row is written, a later periodic dump cannot overwrite it
 // with a phase-less copy-phase row (block/spirit#1239).
 func TestDumpCheckpointNoopAfterReverseWindowPersisted(t *testing.T) {
+	t.Parallel()
 	r, ctx := setupRunnerForChecksumTest(t, "rw_owned")
 	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.status.Set(status.Checksum)
@@ -307,6 +311,7 @@ func TestDumpCheckpointNoopAfterReverseWindowPersisted(t *testing.T) {
 // finds a post-cutover row on resume also stops copy-phase dumps, even though
 // this process never wrote the row itself.
 func TestDumpCheckpointNoopAfterResumingPastCutover(t *testing.T) {
+	t.Parallel()
 	r, ctx := setupRunnerForChecksumTest(t, "rw_resumed")
 	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.status.Set(status.Checksum)
@@ -332,6 +337,7 @@ func TestDumpCheckpointNoopAfterResumingPastCutover(t *testing.T) {
 // TestPersistReverseWindowFailureKeepsDumpEnabled verifies that the reverse
 // window claims the row only once its write succeeded.
 func TestPersistReverseWindowFailureKeepsDumpEnabled(t *testing.T) {
+	t.Parallel()
 	r, ctx := setupRunnerForChecksumTest(t, "rw_fail")
 	r.checker = &checksum.MockChecker{Chunker: r.checksumChunker}
 	r.status.Set(status.Checksum)

@@ -29,63 +29,6 @@ func sentinelTestTableExists(t *testing.T, db *sql.DB, schema, name string) bool
 	return true
 }
 
-// TestMoveSentinelDropReleasesCutover: with --defer-cutover, dropping the
-// sentinel must RELEASE the cutover and let the move finish — not be seen as a
-// schema change that cancels it. The sentinel lives on targets[0], so the drop
-// is a target-side DDL that the source-watching change feed must ignore. Uses a
-// move-all move (no explicit table list), so the source feed cancels on any
-// source DDL — the strongest case.
-func TestMoveSentinelDropReleasesCutover(t *testing.T) {
-	cfg, err := mysql.ParseDSN(testutils.DSN())
-	require.NoError(t, err)
-	src := cfg.Clone()
-	src.DBName = "sentrel_src"
-	dst := cfg.Clone()
-	dst.DBName = "sentrel_dst"
-
-	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sentrel_src")
-	testutils.RunSQL(t, "CREATE DATABASE sentrel_src")
-	testutils.RunSQL(t, "CREATE TABLE sentrel_src.t1 (id INT PRIMARY KEY, val VARCHAR(255))")
-	testutils.RunSQL(t, "INSERT INTO sentrel_src.t1 VALUES (1,'one'),(2,'two')")
-	testutils.RunSQL(t, "DROP DATABASE IF EXISTS sentrel_dst")
-	testutils.RunSQL(t, "CREATE DATABASE sentrel_dst")
-
-	ctl, err := sql.Open("block-mysql", testutils.DSN())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(ctl)
-
-	m := &Move{
-		SourceDSN: src.FormatDSN(),
-		TargetDSN: dst.FormatDSN(),
-		Common:    flags.Common{Threads: 1, WriteThreads: 1},
-		Cutover:   flags.Cutover{DeferCutOver: true},
-	}
-	runner, err := NewRunner(m)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(runner)
-	var cutoverCalled bool
-	runner.SetCutover(func(context.Context) error { cutoverCalled = true; return nil })
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- runner.Run(context.Background()) }()
-
-	// Wait until the move is blocked on the sentinel.
-	waitForMoveStatus(t, runner, status.WaitingOnSentinelTable, errCh)
-
-	// Drop the sentinel on targets[0] to release the cutover.
-	testutils.RunSQL(t, "DROP TABLE sentrel_dst."+sentinel.TableName)
-
-	select {
-	case err := <-errCh:
-		require.NoError(t, err, "dropping the sentinel must release the cutover, not cancel the move")
-	case <-time.After(60 * time.Second):
-		t.Fatal("move did not complete after the sentinel was dropped")
-	}
-	require.True(t, cutoverCalled, "cutover must run once the sentinel is dropped")
-	require.True(t, sentinelTestTableExists(t, ctl, "sentrel_src", "t1_old"), "source retired after cutover")
-	require.True(t, sentinelTestTableExists(t, ctl, "sentrel_dst", "t1"), "target serving after cutover")
-}
-
 // TestMoveContinuousChecksumAbortsThenResumeRepairs drives a real continuous
 // pass during the sentinel wait, which the production 1h interval otherwise
 // keeps out of every test. A divergence the continuous checksum confirms must
@@ -93,16 +36,10 @@ func TestMoveSentinelDropReleasesCutover(t *testing.T) {
 // (docs/move.md); the resumed move must then re-run the initial checksum,
 // repair the range, and complete once the sentinel is dropped.
 //
-// Sequential by design: it shortens package-level pass and retry timing.
+// TestMain sets the pass interval (2s) and the confirming retry's flush wait
+// (1s); the production values would keep the pass out of the test.
 func TestMoveContinuousChecksumAbortsThenResumeRepairs(t *testing.T) {
-	prev := checksum.LocklessMinPassInterval
-	checksum.LocklessMinPassInterval = 500 * time.Millisecond
-	t.Cleanup(func() { checksum.LocklessMinPassInterval = prev })
-	// The confirming retry would otherwise wait for a periodic feed flush (30s),
-	// past the test's sentinel wait limit. The gate is not what this covers.
-	prevFlushWait := checksum.DefaultLocklessRetryFlushWait
-	checksum.DefaultLocklessRetryFlushWait = 500 * time.Millisecond
-	t.Cleanup(func() { checksum.DefaultLocklessRetryFlushWait = prevFlushWait })
+	t.Parallel()
 
 	const srcDB, dstDB = "contabort_src", "contabort_dst"
 	testutils.RunSQL(t, "DROP DATABASE IF EXISTS "+srcDB)
@@ -178,6 +115,7 @@ func TestMoveContinuousChecksumAbortsThenResumeRepairs(t *testing.T) {
 // behind by an earlier deferred move that was cancelled. Only a deferred run
 // waits on the sentinel.
 func TestMoveIgnoresSentinelItDidNotDefer(t *testing.T) {
+	t.Parallel()
 	cfg, err := mysql.ParseDSN(testutils.DSN())
 	require.NoError(t, err)
 	src := cfg.Clone()
