@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
@@ -50,8 +51,8 @@ type compositeWatermark struct {
 }
 
 var (
-	_ MappedChunker    = &chunkerComposite{}
-	_ BufferedKeyNoter = &chunkerComposite{}
+	_ MappedChunker             = &chunkerComposite{}
+	_ contract.BufferedKeyNoter = &chunkerComposite{}
 )
 
 func (t *chunkerComposite) additionalConditionsSQL(whereSent bool) string {
@@ -624,7 +625,7 @@ func (t *chunkerComposite) KeyBelowLowWatermark(key0 any) bool {
 	return below
 }
 
-// KeyNotYetDispatched satisfies MappedChunker. See the interface docs.
+// KeyNotYetDispatched satisfies contract.KeyWatermarks. See the interface docs.
 func (t *chunkerComposite) KeyNotYetDispatched(key0 any) bool {
 	t.Lock()
 	defer t.Unlock()
@@ -649,7 +650,7 @@ func (t *chunkerComposite) KeyNotYetDispatched(key0 any) bool {
 	return above
 }
 
-// NoteBufferedKey satisfies BufferedKeyNoter. See the interface docs.
+// NoteBufferedKey satisfies contract.BufferedKeyNoter. See the interface docs.
 func (t *chunkerComposite) NoteBufferedKey(key0 any) {
 	t.Lock()
 	defer t.Unlock()

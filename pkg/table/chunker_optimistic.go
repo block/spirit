@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
@@ -97,8 +98,8 @@ type chunkerOptimistic struct {
 }
 
 var (
-	_ MappedChunker    = &chunkerOptimistic{}
-	_ BufferedKeyNoter = &chunkerOptimistic{}
+	_ MappedChunker             = &chunkerOptimistic{}
+	_ contract.BufferedKeyNoter = &chunkerOptimistic{}
 )
 
 // optimisticWatermark is the optimistic chunker's checkpoint format: the chunk
@@ -975,7 +976,7 @@ func (t *chunkerOptimistic) KeyBelowLowWatermark(key0 any) bool {
 	return below
 }
 
-// KeyNotYetDispatched satisfies MappedChunker. See the interface docs.
+// KeyNotYetDispatched satisfies contract.KeyWatermarks. See the interface docs.
 func (t *chunkerOptimistic) KeyNotYetDispatched(key0 any) bool {
 	t.Lock()
 	defer t.Unlock()
@@ -1001,7 +1002,7 @@ func (t *chunkerOptimistic) KeyNotYetDispatched(key0 any) bool {
 	return above
 }
 
-// NoteBufferedKey satisfies BufferedKeyNoter. See the interface docs.
+// NoteBufferedKey satisfies contract.BufferedKeyNoter. See the interface docs.
 func (t *chunkerOptimistic) NoteBufferedKey(key0 any) {
 	t.Lock()
 	defer t.Unlock()

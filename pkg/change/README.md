@@ -201,7 +201,7 @@ The copier maintains a "watermark" representing its progress. The replication cl
 ```go
 // Ingest time (HasChanged): discard above-high keys during the copy.
 // The repairing initial checksum closes the visibility window discussed below.
-// keyNoter is the chunker's optional table.BufferedKeyNoter, asserted once
+// keyNoter is the chunker's optional contract.BufferedKeyNoter, asserted once
 // when the subscription is created; nil disables the discard (see below).
 if keyNoter != nil && chunker.KeyAboveHighWatermark(key[0]) {
     return  // Skip, copier will handle this
@@ -245,7 +245,7 @@ discard mostly applies only to rows inserted after the copy started, and
 the key and the dispatch pointer, the first time the guard rises, so a lower
 drop count on a hot table has a visible cause.
 `NoteBufferedKey` is on a separate optional interface,
-`table.BufferedKeyNoter`, so a `MappedChunker` written before it existed still
+`contract.BufferedKeyNoter`, so a `MappedChunker` written before it existed still
 compiles. The subscription type-asserts for it once, when it is created. If
 the chunker does not implement it, the subscription never applies the
 above-high-watermark discard: every change is buffered and applied, which is

@@ -25,3 +25,4 @@ The plan is to stabilize this package and then move it to its own module, `githu
 | `FatalReason` and its values | `pkg/change` | Why a change feed hit a fatal condition, and whether a checkpoint survives it. |
 | `RowWatch`, `RowVerifier` | `pkg/change` | The row a `ParkableSource` waits for, and the check run while it is parked. |
 | `ErrPositionNotFound`, `ErrRowRewritten`, `ErrFlushIncomplete` | `pkg/change` | Sentinel errors a source returns from `StartFromPosition` and `VerifyRowAtNextChange`. |
+| `KeyWatermarks`, `BufferedKeyNoter` | `pkg/table` (`MappedChunker`'s key methods; `BufferedKeyNoter` moved) | What a change stream asks the table copier about a row key: discard, write now, or defer. `table.MappedChunker` embeds `KeyWatermarks`. |

@@ -192,13 +192,13 @@ type bufferedMap struct {
 
 	watermarkOptimization bool
 	chunker               table.MappedChunker
-	// keyNoter is chunker's optional table.BufferedKeyNoter capability,
+	// keyNoter is chunker's optional contract.BufferedKeyNoter capability,
 	// asserted once at construction. When it is nil (a chunker that does
 	// not implement it), the subscription never applies the
 	// above-high-watermark discard: it could not tell the chunker which keys
 	// a flush may already have written ahead of the copier, so discarding a
 	// later change for such a key could leave a stale or phantom row.
-	keyNoter table.BufferedKeyNoter
+	keyNoter contract.BufferedKeyNoter
 
 	// closed is set by Close() to release any HasChanged caller parked on
 	// the soft memory limit. Without it, Client.Close() deadlocks on
@@ -413,10 +413,10 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 		batchSize:            cfg.BatchSize,
 		underLoad:            cfg.UnderLoad,
 	}
-	if noter, ok := cfg.Chunker.(table.BufferedKeyNoter); ok {
+	if noter, ok := cfg.Chunker.(contract.BufferedKeyNoter); ok {
 		sub.keyNoter = noter
 	} else if cfg.Chunker != nil {
-		logger.Warn("chunker does not implement table.BufferedKeyNoter; the above-high-watermark discard is disabled for this subscription",
+		logger.Warn("chunker does not implement contract.BufferedKeyNoter; the above-high-watermark discard is disabled for this subscription",
 			"table", cfg.CurrentTable.QuotedTableName, "chunker", fmt.Sprintf("%T", cfg.Chunker))
 	}
 	sub.cond = sync.NewCond(&sub.Mutex)
