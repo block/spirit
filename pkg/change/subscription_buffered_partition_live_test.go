@@ -7,6 +7,7 @@ import (
 
 	mysql2 "github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -162,7 +163,7 @@ func TestFlushPartitioningChoosesTheCorrelatedIndex(t *testing.T) {
 				key: fmt.Sprintf("k%d", i),
 				change: bufferedChange{
 					originalKey: []any{i},
-					logicalRow: applier.LogicalRow{RowImage: []any{
+					logicalRow: contract.LogicalRow{RowImage: []any{
 						i,
 						fmt.Sprintf("tok-%05d", i),
 						leading,
@@ -216,7 +217,7 @@ func TestFlushPartitioningInactiveWithoutUniqueIndex(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, candidates, "a non-unique index is not a conflict surface between PK-disjoint rows")
 	require.Nil(t, choosePartitionIndex(candidates, []drainRow{
-		{key: "k", change: bufferedChange{logicalRow: applier.LogicalRow{RowImage: []any{int64(1), "a"}}}},
+		{key: "k", change: bufferedChange{logicalRow: contract.LogicalRow{RowImage: []any{int64(1), "a"}}}},
 	}))
 }
 
