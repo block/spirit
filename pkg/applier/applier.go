@@ -80,6 +80,10 @@ type ApplyCallback func(affectedRows int64, err error)
 // - Tracking pending writes
 // - Invoking callbacks when writes are complete
 type Applier interface {
+	// StreamedChangesWriter is the synchronous write path a change feed's
+	// subscription flushes through.
+	StreamedChangesWriter
+
 	// Start initializes the applier and starts its workers
 	Start(ctx context.Context) error
 
@@ -99,6 +103,23 @@ type Applier interface {
 	// approximate. See the Stats type for field semantics.
 	Stats() Stats
 
+	// Wait blocks until all pending work is complete and all callbacks have been invoked
+	Wait(ctx context.Context) error
+
+	// Stops the applier workers
+	Stop() error
+
+	// GetTargets returns target information for direct database access.
+	// This is used by operations like checksum that need to query targets directly.
+	GetTargets() []Target
+}
+
+// StreamedChangesWriter writes streamed row changes to the target(s)
+// synchronously: the changes a change feed's subscription has buffered, as
+// deletes by key and upserts of full row images. It is the part of Applier a
+// subscription's flush uses; the copier's asynchronous Apply path is not part
+// of it.
+type StreamedChangesWriter interface {
 	// DeleteKeys deletes rows by their key values synchronously. Each entry
 	// in keys is one key tuple of the original (typed) column values, in
 	// sourceTable.KeyColumns order.
@@ -119,16 +140,6 @@ type Applier interface {
 	// for the lock contract (one lock per target).
 	// Returns the number of rows affected and any error.
 	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []contract.TableLock) (int64, error)
-
-	// Wait blocks until all pending work is complete and all callbacks have been invoked
-	Wait(ctx context.Context) error
-
-	// Stops the applier workers
-	Stop() error
-
-	// GetTargets returns target information for direct database access.
-	// This is used by operations like checksum that need to query targets directly.
-	GetTargets() []Target
 }
 
 // LogicalRow is contract.LogicalRow; the type moved to pkg/contract. The alias

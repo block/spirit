@@ -43,7 +43,7 @@ type binlogClient struct {
 // returned Source talks to MySQL via go-mysql's BinlogSyncer; future
 // alternative sources (e.g. VStream) will live behind their own
 // constructors. config.Applier is required.
-func NewBinlogClient(db *sql.DB, host string, username, password string, appl applier.Applier, config *ClientConfig) Source {
+func NewBinlogClient(db *sql.DB, host string, username, password string, appl applier.StreamedChangesWriter, config *ClientConfig) Source {
 	c := &binlogClient{}
 	c.configure(db, host, username, password, appl, config)
 	return c
