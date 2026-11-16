@@ -23,7 +23,7 @@ import (
 //     from it applies a write made after the capture. This proves the string is
 //     both correctly formatted for the implementation and points at "now",
 //     without asserting on the opaque encoding itself.
-func currentPositionRoundTrip(t *testing.T, prefix string, newClient func(db *sql.DB, host, user, pass string, appl applier.Applier, cfg *ClientConfig) Source) {
+func currentPositionRoundTrip(t *testing.T, prefix string, newClient func(db *sql.DB, host, user, pass string, appl applier.StreamedChangesWriter, cfg *ClientConfig) Source) {
 	t.Helper()
 	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
 	require.NoError(t, err)
