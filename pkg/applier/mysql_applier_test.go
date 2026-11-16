@@ -652,7 +652,7 @@ func TestSingleTargetApplierUpsertRows(t *testing.T) {
 	require.NoError(t, err)
 
 	// Upsert rows: update id=1, insert id=3
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{
 			RowImage:  []any{int64(1), "Alice Updated", int64(150)},
 			IsDeleted: false,
@@ -739,7 +739,7 @@ func TestSingleTargetApplierUpsertRowsEmptyBlob(t *testing.T) {
 
 	// The application updates only `state`; the binlog row images still carry
 	// the full row, so the blobs are rewritten with their existing values.
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{RowImage: []any{int64(1), "settled", []byte{}}},
 		{RowImage: []any{int64(2), "settled", nil}},
 		{RowImage: []any{int64(3), "settled", []byte{0x00}}},
@@ -829,7 +829,7 @@ func TestSingleTargetApplierUpsertRowsWithGeneratedColumns(t *testing.T) {
 
 	// RowImage has all columns including the generated one (position 2),
 	// mirroring what the binlog reader produces.
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{
 			RowImage:  []any{int64(1), int64(100), int64(1), "abc-123", "2026-05-20 17:16:12.123"},
 			IsDeleted: false,
@@ -879,7 +879,7 @@ func TestSingleTargetApplierUpsertRowsSkipDeleted(t *testing.T) {
 	require.NoError(t, err)
 
 	// Upsert with deleted rows mixed in
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{
 			RowImage:  []any{int64(1), "Alice"},
 			IsDeleted: false,
@@ -936,7 +936,7 @@ func TestSingleTargetApplierUpsertRowsEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Upsert with empty rows
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), []LogicalRow{}, nil)
+	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), []contract.LogicalRow{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affectedRows)
 }
@@ -1366,7 +1366,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 
 	// More than one lock must be rejected before executing anything.
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock, lock})
+		[]contract.LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
 		[][]any{{int64(1)}}, []contract.TableLock{lock, lock})
@@ -1374,7 +1374,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 
 	// A single lock executes on the lock connection.
 	affected, err := applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock})
+		[]contract.LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affected)
 	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
@@ -1392,7 +1392,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	otherLock, err := dbconn.NewTableLock(ctx, otherDB, []*table.TableInfo{targetTable}, dbconn.NewDBConfig(), slog.Default())
 	require.NoError(t, err)
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []contract.TableLock{otherLock})
+		[]contract.LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []contract.TableLock{otherLock})
 	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
 	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
 		[][]any{{int64(1)}}, []contract.TableLock{otherLock})
@@ -1515,7 +1515,7 @@ func TestNewTargetValidation(t *testing.T) {
 	chunk := &table.Chunk{Table: tbl, NewTable: tbl, ColumnMapping: table.NewColumnMapping(tbl, tbl, nil)}
 	err = a.Apply(t.Context(), chunk, [][]any{{int64(1), "a"}}, func(int64, error) {})
 	require.ErrorContains(t, err, "ShardingColumn not configured")
-	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []LogicalRow{{RowImage: []any{int64(1), "a"}}}, nil)
+	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []contract.LogicalRow{{RowImage: []any{int64(1), "a"}}}, nil)
 	require.ErrorContains(t, err, "ShardingColumn not configured")
 }
 
@@ -1528,7 +1528,7 @@ func TestUnderLockRejectsNilLock(t *testing.T) {
 	tbl.Columns = []string{"id"}
 	tbl.KeyColumns = []string{"id"}
 	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
-		[]LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{nil})
+		[]contract.LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{nil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
 	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{nil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
@@ -1537,7 +1537,7 @@ func TestUnderLockRejectsNilLock(t *testing.T) {
 	// refused the same way, not dereferenced.
 	var typedNil *dbconn.TableLock
 	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
-		[]LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{typedNil})
+		[]contract.LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{typedNil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
 	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{typedNil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
@@ -1574,7 +1574,7 @@ func TestSingleTargetPartialRangeRejectsUnownedRow(t *testing.T) {
 	require.NoError(t, a.Wait(t.Context()))
 	require.False(t, called.Load(), "a rejected Apply must not report the chunk as written")
 
-	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []LogicalRow{{RowImage: []any{int64(3), "unowned"}}}, nil)
+	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []contract.LogicalRow{{RowImage: []any{int64(3), "unowned"}}}, nil)
 	require.ErrorContains(t, err, "no shard found")
 
 	var n int
@@ -1615,12 +1615,12 @@ func TestUnderLockSharedConnection(t *testing.T) {
 	defer utils.CloseAndLogWithContext(ctx, lock)
 	mapping := table.NewColumnMapping(tbl, tbl, nil)
 
-	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{{RowImage: []any{int64(3), "c"}}}, []contract.TableLock{lock, lock})
+	_, err = a.UpsertRows(ctx, mapping, []contract.LogicalRow{{RowImage: []any{int64(3), "c"}}}, []contract.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 
 	// One lock covers both shards: an even row routes to shard 0, an odd row
 	// to shard 1, and the delete broadcasts to both.
-	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{
+	_, err = a.UpsertRows(ctx, mapping, []contract.LogicalRow{
 		{RowImage: []any{int64(3), "c"}},
 		{RowImage: []any{int64(4), "d"}},
 	}, []contract.TableLock{lock})
@@ -1662,7 +1662,7 @@ func TestUnderLockRejectsUnsafeWarnings(t *testing.T) {
 	mapping := table.NewColumnMapping(sourceTable, targetTable, nil)
 	appl, err := New([]Target{{DB: db}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
-	rows := []LogicalRow{{RowImage: []any{int64(1), "too long"}}}
+	rows := []contract.LogicalRow{{RowImage: []any{int64(1), "too long"}}}
 	_, err = appl.UpsertRows(t.Context(), mapping, rows, nil)
 	var warning *dbconn.UnsafeWarningError
 	require.ErrorAs(t, err, &warning)

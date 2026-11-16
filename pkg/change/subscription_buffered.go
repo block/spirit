@@ -82,7 +82,7 @@ import (
 // the normal path.
 
 type bufferedChange struct {
-	logicalRow  applier.LogicalRow
+	logicalRow  contract.LogicalRow
 	originalKey []any // preserve original typed key for watermark comparison
 }
 
@@ -92,7 +92,7 @@ type bufferedChange struct {
 // continue to work for non-memory-comparable PKs (#607).
 type queuedChange struct {
 	key        string
-	logicalRow applier.LogicalRow
+	logicalRow contract.LogicalRow
 	// originalKey is the typed PK tuple. Deletes need it to build the
 	// DELETE statement via the applier's type-aware path; upserts use
 	// logicalRow.RowImage instead, but we store it uniformly.
@@ -442,7 +442,7 @@ func sizeOfQueuedChange(c queuedChange) int64 {
 // copy path cuts chunklets by: deletes contribute their key tuple (the
 // DELETE ... IN element list), upserts their full row image (the
 // REPLACE ... VALUES list).
-func renderedBytesOfChange(lr applier.LogicalRow, originalKey []any) int64 {
+func renderedBytesOfChange(lr contract.LogicalRow, originalKey []any) int64 {
 	if lr.IsDeleted {
 		return int64(utils.EstimateRenderedRowSize(originalKey))
 	}
@@ -1013,9 +1013,9 @@ func (s *bufferedMap) HasChanged(key, row []any, deleted bool) {
 	// that readStream advances after processRowsEvent returns, so a
 	// concurrent flush cannot publish a flushedPos that skips this event.
 
-	logicalRow := applier.LogicalRow{RowImage: row}
+	logicalRow := contract.LogicalRow{RowImage: row}
 	if deleted {
-		logicalRow = applier.LogicalRow{IsDeleted: true}
+		logicalRow = contract.LogicalRow{IsDeleted: true}
 	}
 
 	if s.queueModeActive() {
@@ -1191,7 +1191,7 @@ func (s *bufferedMap) Flush(ctx context.Context, underLock bool, locks []contrac
 type mapFlushBatch struct {
 	keys        []string
 	deleteKeys  [][]any
-	upsertRows  []applier.LogicalRow
+	upsertRows  []contract.LogicalRow
 	storedBytes int64
 }
 
@@ -1789,7 +1789,7 @@ func (s *bufferedMap) releaseAppliedBatch(snapshot map[string]bufferedChange, mu
 // that arrived during the drain.
 func (s *bufferedMap) drainQueueSnapshot(ctx context.Context, snapshot []queuedChange) ([]queuedChange, error) {
 	var deleteKeys [][]any
-	var upsertRows []applier.LogicalRow
+	var upsertRows []contract.LogicalRow
 	var batchBytes int64
 	segmentStart := 0 // index of the first snapshot entry in the current segment
 	applied := 0      // count of snapshot entries applied so far
@@ -1900,7 +1900,7 @@ func (s *bufferedMap) reattachLocked(snapshot map[string]bufferedChange, snapsho
 // same reason.
 func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks []contract.TableLock, bypassWatermark bool) (bool, error) {
 	var deleteKeys [][]any
-	var upsertRows []applier.LogicalRow
+	var upsertRows []contract.LogicalRow
 	var keysFlushed []string
 	var batchBytes int64
 	allChangesFlushed := true
@@ -1972,7 +1972,7 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 // If locks is non-empty, the operations are executed under the table
 // lock(s) — one lock per target server, matched to its target by the
 // applier (see applier.StreamedChangesWriter.DeleteKeys for the contract).
-func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []applier.LogicalRow, locks []contract.TableLock) error {
+func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []contract.LogicalRow, locks []contract.TableLock) error {
 	if len(deleteKeys) == 0 && len(upsertRows) == 0 {
 		return nil
 	}
@@ -2032,7 +2032,7 @@ func (s *bufferedMap) flushQueueLocked(ctx context.Context, underLock bool, lock
 	}
 
 	var deleteKeys [][]any
-	var upsertRows []applier.LogicalRow
+	var upsertRows []contract.LogicalRow
 	var batchBytes int64
 	flushSegment := func() error {
 		if err := s.flushBatch(ctx, deleteKeys, upsertRows, locksToUse); err != nil {

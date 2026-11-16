@@ -134,17 +134,13 @@ type StreamedChangesWriter interface {
 	DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error)
 
 	// UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously.
-	// The rows are LogicalRow structs containing the row images.
+	// The rows are contract.LogicalRow structs containing the row images.
 	// An empty locks slice means no under-lock flush; when locks is non-empty
 	// the upsert is executed under the supplied table lock(s). See DeleteKeys
 	// for the lock contract (one lock per target).
 	// Returns the number of rows affected and any error.
-	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []contract.TableLock) (int64, error)
+	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error)
 }
-
-// LogicalRow is contract.LogicalRow; the type moved to pkg/contract. The alias
-// keeps existing callers compiling.
-type LogicalRow = contract.LogicalRow
 
 // deleteKeysInClause renders key value tuples into the element list of a
 // `(keycols) IN (...)` clause. Values go through table.Datum so binary

@@ -76,7 +76,7 @@ func (c *contendingApplier) arrive() int {
 	return int(c.inFlight.Load())
 }
 
-func (c *contendingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (c *contendingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	c.inFlight.Add(1)
 	defer c.inFlight.Add(-1)
 	n := int64(c.arrive())
@@ -378,7 +378,7 @@ type sequencedApplier struct {
 	nCalls int
 }
 
-func (a *sequencedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *sequencedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	a.mu.Lock()
 	i := a.nCalls
 	a.nCalls++
@@ -401,7 +401,7 @@ func deadlockErr() error {
 // holder that never lets go.
 type alwaysContendingApplier struct{ applier.MockApplier }
 
-func (a *alwaysContendingApplier) UpsertRows(context.Context, *table.ColumnMapping, []applier.LogicalRow, []contract.TableLock) (int64, error) {
+func (a *alwaysContendingApplier) UpsertRows(context.Context, *table.ColumnMapping, []contract.LogicalRow, []contract.TableLock) (int64, error) {
 	return 0, deadlockErr()
 }
 
@@ -506,10 +506,10 @@ func TestPartialContentionKeepsLandedBatches(t *testing.T) {
 type oneStubbornBatchApplier struct {
 	applier.MockApplier
 	mu       sync.Mutex
-	stubborn []applier.LogicalRow
+	stubborn []contract.LogicalRow
 }
 
-func (a *oneStubbornBatchApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *oneStubbornBatchApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	a.mu.Lock()
 	if a.stubborn == nil {
 		a.stubborn = rows
@@ -614,7 +614,7 @@ type cancellingContendingApplier struct {
 	cancel context.CancelFunc
 }
 
-func (a *cancellingContendingApplier) UpsertRows(context.Context, *table.ColumnMapping, []applier.LogicalRow, []contract.TableLock) (int64, error) {
+func (a *cancellingContendingApplier) UpsertRows(context.Context, *table.ColumnMapping, []contract.LogicalRow, []contract.TableLock) (int64, error) {
 	a.cancel()
 	return 0, deadlockErr()
 }
@@ -673,7 +673,7 @@ type budgetBurningApplier struct {
 	sawCanceledCtx atomic.Bool
 }
 
-func (a *budgetBurningApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *budgetBurningApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	if ctx.Err() != nil {
 		a.sawCanceledCtx.Store(true)
 	}
@@ -845,7 +845,7 @@ type stallOnCallApplier struct {
 	sawCanceledCtx atomic.Bool
 }
 
-func (a *stallOnCallApplier) UpsertRows(ctx context.Context, _ *table.ColumnMapping, _ []applier.LogicalRow, _ []contract.TableLock) (int64, error) {
+func (a *stallOnCallApplier) UpsertRows(ctx context.Context, _ *table.ColumnMapping, _ []contract.LogicalRow, _ []contract.TableLock) (int64, error) {
 	if ctx.Err() != nil {
 		a.sawCanceledCtx.Store(true)
 	}

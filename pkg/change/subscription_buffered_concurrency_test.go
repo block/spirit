@@ -52,7 +52,7 @@ func (g *gatedApplier) announce() {
 	}
 }
 
-func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	g.announce()
 	if g.upsertGate != nil {
 		<-g.upsertGate
@@ -517,7 +517,7 @@ type orderRecordingApplier struct {
 	order []string
 }
 
-func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	a.mu.Lock()
 	a.order = append(a.order, mapping.SourceTable().TableName)
 	a.mu.Unlock()

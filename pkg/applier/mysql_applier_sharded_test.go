@@ -590,7 +590,7 @@ func TestShardedApplierUpsertRows(t *testing.T) {
 	// - Update id=2 (user_id=102, even -> shard 0)
 	// - Insert id=3 (user_id=103, odd -> shard 1)
 	// - Insert id=4 (user_id=104, even -> shard 0)
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{
 			RowImage:  []any{int64(1), int64(101), "Alice Updated", int64(150)},
 			IsDeleted: false,
@@ -727,7 +727,7 @@ func TestShardedApplierUpsertRowsSkipDeleted(t *testing.T) {
 	require.NoError(t, err)
 
 	// Upsert with deleted rows mixed in
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{
 			RowImage:  []any{int64(1), int64(101), "Alice"},
 			IsDeleted: false,
@@ -909,7 +909,7 @@ func TestShardedApplierUpsertRowsEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Upsert with empty rows
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), []LogicalRow{}, nil)
+	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), []contract.LogicalRow{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affectedRows)
 }
@@ -992,7 +992,7 @@ func TestShardedApplierUpsertRowsUnderLock(t *testing.T) {
 	lock2, err := dbconn.NewTableLock(ctx, target2DB, []*table.TableInfo{target1Table}, dbconn.NewDBConfig(), slog.Default())
 	require.NoError(t, err)
 
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{RowImage: []any{int64(1), int64(101), "Alice"}},   // odd -> shard 1
 		{RowImage: []any{int64(2), int64(102), "Bob"}},     // even -> shard 0
 		{RowImage: []any{int64(3), int64(103), "Charlie"}}, // odd -> shard 1
@@ -1108,7 +1108,7 @@ func TestShardedApplierUnderLockMissingShardLock(t *testing.T) {
 		require.NoError(t, lock1.Close(ctx))
 	}()
 
-	upsertRows := []LogicalRow{
+	upsertRows := []contract.LogicalRow{
 		{RowImage: []any{int64(2), int64(102), "Bob"}}, // even -> shard 0
 	}
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(sourceTable, target1Table, nil), upsertRows, []contract.TableLock{lock1})
@@ -1247,7 +1247,7 @@ func TestShardedApplierRenamedTarget(t *testing.T) {
 	require.NoError(t, err)
 
 	renamed := table.NewColumnMapping(sourceTable, oldTable, nil)
-	rows := []LogicalRow{
+	rows := []contract.LogicalRow{
 		{RowImage: []any{int64(1), int64(101), "odd-one"}},
 		{RowImage: []any{int64(2), int64(102), "even-two"}},
 		{RowImage: []any{int64(3), int64(103), "odd-three"}},

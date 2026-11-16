@@ -1000,7 +1000,7 @@ func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 }
 
 // UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously,
-// distributing rows across shards. The rows are LogicalRow structs containing
+// distributing rows across shards. The rows are contract.LogicalRow structs containing
 // inline row images from the binlog. If locks is non-empty, each shard's
 // upsert is executed under the table lock that was acquired on that shard's
 // own connection (one lock per shard, matched via resolveShardLocks).
@@ -1058,7 +1058,7 @@ func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 //
 // The sharding column and hash always come from the mapping's SOURCE table —
 // the watched table whose row images we are routing.
-func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
@@ -1078,7 +1078,7 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 	sourceColumnNames, _ := mapping.ColumnsSlice()
 
 	// Group rows by shard
-	shardRows := make([][]LogicalRow, len(a.shards))
+	shardRows := make([][]contract.LogicalRow, len(a.shards))
 	if a.unsharded {
 		for _, row := range rows {
 			if !row.IsDeleted {
@@ -1129,7 +1129,7 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 			shardsToCopy--
 			continue
 		}
-		go func(sid int, r []LogicalRow) {
+		go func(sid int, r []contract.LogicalRow) {
 			// Build the VALUES clause
 			valuesClauses := make([]string, 0, len(r))
 			values := make([]string, len(sourceOrdinal))
@@ -1213,7 +1213,7 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 // shardRows by hashing each image's sharding column. A binlog row image holds
 // ALL columns, generated ones included, so the sharding column is located by
 // its ordinal in the full column list.
-func (a *MySQLApplier) routeRowImages(sourceTable *table.TableInfo, rows []LogicalRow, shardRows [][]LogicalRow) error {
+func (a *MySQLApplier) routeRowImages(sourceTable *table.TableInfo, rows []contract.LogicalRow, shardRows [][]contract.LogicalRow) error {
 	if sourceTable.ShardingColumn == "" {
 		return errors.New("ShardingColumn not configured in TableInfo")
 	}
