@@ -35,7 +35,7 @@ func TestDropRevertMarkerEndsACancelledDropOnTheServer(t *testing.T) {
 	watcher.Go(func() {
 		for ctx.Err() == nil {
 			var id int64
-			err := db.QueryRowContext(ctx, "SELECT id FROM information_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE IF EXISTS `"+revertMarkerName+"`%").Scan(&id)
+			err := db.QueryRowContext(ctx, "SELECT id FROM performance_schema.processlist WHERE state = 'Waiting for table metadata lock' AND info LIKE ?", "DROP TABLE IF EXISTS `"+revertMarkerName+"`%").Scan(&id)
 			if err == nil {
 				dropSession.Store(id)
 				cancel()
@@ -50,7 +50,7 @@ func TestDropRevertMarkerEndsACancelledDropOnTheServer(t *testing.T) {
 	require.NotZero(t, dropSession.Load(), "the DROP must have been seen waiting for the lock")
 
 	var sessions int
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", dropSession.Load()).Scan(&sessions))
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM performance_schema.processlist WHERE id = ?", dropSession.Load()).Scan(&sessions))
 	require.Zero(t, sessions, "the cancelled DROP's session must have ended")
 	require.NoError(t, reader.Rollback())
 	exists, err := revertMarkerExists(t.Context(), db)
