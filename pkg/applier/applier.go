@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/metrics"
 	"github.com/block/spirit/pkg/table"
@@ -130,14 +131,9 @@ type Applier interface {
 	GetTargets() []Target
 }
 
-// LogicalRow represents the current state of a row in the subscription buffer.
-// This could be that it is deleted, or that it has RowImage that describes it.
-// If there is a RowImage, then it needs to be converted into the RowImage of the
-// newTable.
-type LogicalRow struct {
-	IsDeleted bool
-	RowImage  []any
-}
+// LogicalRow is contract.LogicalRow; the type moved to pkg/contract. The alias
+// keeps existing callers compiling.
+type LogicalRow = contract.LogicalRow
 
 // deleteKeysInClause renders key value tuples into the element list of a
 // `(keycols) IN (...)` clause. Values go through table.Datum so binary
