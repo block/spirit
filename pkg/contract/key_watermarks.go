@@ -17,6 +17,11 @@ type KeyWatermarks interface {
 	// key0 and will read it later, so the copier's read will carry the
 	// change to the target and the change stream may discard it.
 	//
+	// It must return FALSE for a key that an earlier run copied, when this
+	// run resumed from that run's progress. The row is already on the
+	// target, and the copier leaves an existing row as it is, so its later
+	// read would not carry the change: discarding it would lose the change.
+	//
 	// A change stream must not discard on this answer for an
 	// implementation that is not also a BufferedKeyNoter.
 	KeyAboveHighWatermark(key0 any) bool
@@ -63,6 +68,7 @@ type BufferedKeyNoter interface {
 	// must therefore never be discarded as above the high watermark: the
 	// target would keep the earlier image or, for a delete, a row the source
 	// no longer has. After this call KeyAboveHighWatermark returns FALSE for
-	// key0 and every key below it.
+	// key0 and every key below it, the same way it does for keys an earlier
+	// run copied.
 	NoteBufferedKey(key0 any)
 }
