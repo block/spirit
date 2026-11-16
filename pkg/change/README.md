@@ -28,9 +28,9 @@ applies it through the applier interface:
 - Maintains a map of `primaryKeyHash -> (isDelete, fullRowImage)`.
 - Multiple changes to the same row are automatically deduplicated (only the
   final state is stored).
-- Uses the applier's `UpsertRows` and `DeleteKeys` to write changes — there
+- Writes changes through the `applier.TableWriter` the applier returns for its column mapping (`UpsertRows` and `DeleteKeys`) — there
   is no `SELECT FROM original` round-trip.
-- Flushes batches concurrently through the applier's synchronous `UpsertRows` and `DeleteKeys` methods. Flush concurrency is independent of the asynchronous copy-worker pool.
+- Flushes batches concurrently through that writer's synchronous `UpsertRows` and `DeleteKeys` methods. Flush concurrency is independent of the asynchronous copy-worker pool.
 
 **Advantages:**
 - **Excellent deduplication**: if a row is modified 100 times, only one upsert is performed.

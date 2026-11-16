@@ -28,7 +28,7 @@ import (
 // the call error out (after the gate, without recording), exercising
 // the reattach paths.
 type gatedApplier struct {
-	applier.MockApplier
+	applier.MockTableWriter
 	entered     chan struct{}
 	upsertGate  chan struct{}
 	deleteGate  chan struct{}
@@ -51,7 +51,7 @@ func (g *gatedApplier) announce() {
 	}
 }
 
-func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (g *gatedApplier) UpsertRows(ctx context.Context, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
 	g.announce()
 	if g.upsertGate != nil {
 		<-g.upsertGate
@@ -62,10 +62,10 @@ func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 	if g.failOneUpsert.CompareAndSwap(true, false) {
 		return 0, errInjected
 	}
-	return g.MockApplier.UpsertRows(ctx, mapping, rows, locks)
+	return g.MockTableWriter.UpsertRows(ctx, rows, locks)
 }
 
-func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+func (g *gatedApplier) DeleteKeys(ctx context.Context, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
 	g.announce()
 	if g.deleteGate != nil {
 		<-g.deleteGate
@@ -73,7 +73,7 @@ func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 	if g.failDeletes.Load() {
 		return 0, errInjected
 	}
-	return g.MockApplier.DeleteKeys(ctx, sourceTable, targetTable, keys, locks)
+	return g.MockTableWriter.DeleteKeys(ctx, keys, locks)
 }
 
 // awaitEntered blocks until the applier reports a gated call in
@@ -90,8 +90,7 @@ func awaitEntered(t *testing.T, fake *gatedApplier) {
 // newGatedBufferedMap builds a map-or-queue-mode bufferedMap wired to a
 // gatedApplier, mirroring newByteCapBufferedMap.
 func newGatedBufferedMap(fake *gatedApplier, queueMode bool) *bufferedMap {
-	sub := newByteCapBufferedMap(&fake.MockApplier, queueMode)
-	sub.applier = fake
+	sub := newByteCapBufferedMap(fake, queueMode)
 	return sub
 }
 
@@ -508,7 +507,7 @@ func TestPeriodicFlushRespondsToParkRequest(t *testing.T) {
 }
 
 // orderRecordingApplier wraps a real applier and records the source
-// table name of every UpsertRows call, in call order. Used to assert
+// table name of every UpsertRows call made through its writers, in call order. Used to assert
 // which subscription a multi-subscription client flushed first.
 type orderRecordingApplier struct {
 	applier.Applier
@@ -516,11 +515,22 @@ type orderRecordingApplier struct {
 	order []string
 }
 
-func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
-	a.mu.Lock()
-	a.order = append(a.order, mapping.SourceTable().TableName)
-	a.mu.Unlock()
-	return a.Applier.UpsertRows(ctx, mapping, rows, locks)
+func (a *orderRecordingApplier) TableWriter(mapping *table.ColumnMapping) applier.TableWriter {
+	return &orderRecordingWriter{TableWriter: a.Applier.TableWriter(mapping), rec: a, table: mapping.SourceTable().TableName}
+}
+
+// orderRecordingWriter is orderRecordingApplier's writer for one table.
+type orderRecordingWriter struct {
+	applier.TableWriter
+	rec   *orderRecordingApplier
+	table string
+}
+
+func (w *orderRecordingWriter) UpsertRows(ctx context.Context, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+	w.rec.mu.Lock()
+	w.rec.order = append(w.rec.order, w.table)
+	w.rec.mu.Unlock()
+	return w.TableWriter.UpsertRows(ctx, rows, locks)
 }
 
 func (a *orderRecordingApplier) recorded() []string {

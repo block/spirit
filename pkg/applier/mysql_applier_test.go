@@ -461,7 +461,7 @@ func TestSingleTargetApplierDeleteKeys(t *testing.T) {
 		{int64(4)},
 	}
 
-	affectedRows, err := applier.DeleteKeys(t.Context(), targetTable, targetTable, keysToDelete, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).DeleteKeys(t.Context(), keysToDelete, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), affectedRows)
 
@@ -542,7 +542,7 @@ func TestSingleTargetApplierDeleteKeysSeparatorInValues(t *testing.T) {
 		{"a-#-b"},
 		{"-#-"},
 	}
-	affectedRows, err := applier.DeleteKeys(t.Context(), targetTable, targetTable, keysToDelete, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).DeleteKeys(t.Context(), keysToDelete, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), affectedRows)
 
@@ -564,8 +564,7 @@ func TestSingleTargetApplierDeleteKeysSeparatorInValues(t *testing.T) {
 	compositeTable := table.NewTableInfo(targetDB, target.DBName, "test_composite")
 	require.NoError(t, compositeTable.SetInfo(t.Context()))
 
-	affectedRows, err = applier.DeleteKeys(t.Context(), compositeTable, compositeTable,
-		[][]any{{"a-#-b", "c"}}, nil)
+	affectedRows, err = applier.TableWriter(table.NewColumnMapping(compositeTable, compositeTable, nil)).DeleteKeys(t.Context(), [][]any{{"a-#-b", "c"}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affectedRows, "only ('a-#-b','c') must be deleted, not ('a','b-#-c')")
 
@@ -609,7 +608,7 @@ func TestSingleTargetApplierDeleteKeysEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delete with empty keys
-	affectedRows, err := applier.DeleteKeys(t.Context(), targetTable, targetTable, [][]any{}, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).DeleteKeys(t.Context(), [][]any{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affectedRows)
 }
@@ -662,7 +661,7 @@ func TestSingleTargetApplierUpsertRows(t *testing.T) {
 		},
 	}
 
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), upsertRows, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(t.Context(), upsertRows, nil)
 	require.NoError(t, err)
 	// MySQL returns 1 for insert, 2 for update in ON DUPLICATE KEY UPDATE
 	// So we expect 1 (update of id=1) + 1 (insert of id=3) = at least 2
@@ -743,7 +742,7 @@ func TestSingleTargetApplierUpsertRowsEmptyBlob(t *testing.T) {
 		{RowImage: []any{int64(2), "settled", nil}},
 		{RowImage: []any{int64(3), "settled", []byte{0x00}}},
 	}
-	_, err = applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), upsertRows, nil)
+	_, err = applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(t.Context(), upsertRows, nil)
 	require.NoError(t, err)
 
 	// The REPLACE must preserve all three distinct values: empty, NULL, and a
@@ -835,7 +834,7 @@ func TestSingleTargetApplierUpsertRowsWithGeneratedColumns(t *testing.T) {
 		},
 	}
 
-	_, err = applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), upsertRows, nil)
+	_, err = applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(t.Context(), upsertRows, nil)
 	require.NoError(t, err)
 
 	var amount int64
@@ -893,7 +892,7 @@ func TestSingleTargetApplierUpsertRowsSkipDeleted(t *testing.T) {
 		},
 	}
 
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), upsertRows, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(t.Context(), upsertRows, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), affectedRows)
 
@@ -935,7 +934,7 @@ func TestSingleTargetApplierUpsertRowsEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Upsert with empty rows
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), []LogicalRow{}, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(t.Context(), []LogicalRow{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affectedRows)
 }
@@ -1364,20 +1363,16 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	require.NoError(t, err)
 
 	// More than one lock must be rejected before executing anything.
-	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock, lock})
+	_, err = applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(ctx, []LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
-	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
-		[][]any{{int64(1)}}, []*dbconn.TableLock{lock, lock})
+	_, err = applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).DeleteKeys(ctx, [][]any{{int64(1)}}, []*dbconn.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 
 	// A single lock executes on the lock connection.
-	affected, err := applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock})
+	affected, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(ctx, []LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []*dbconn.TableLock{lock})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affected)
-	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
-		[][]any{{int64(2)}}, []*dbconn.TableLock{lock})
+	_, err = applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).DeleteKeys(ctx, [][]any{{int64(2)}}, []*dbconn.TableLock{lock})
 	require.NoError(t, err)
 
 	require.NoError(t, lock.Close(ctx))
@@ -1390,11 +1385,9 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	defer utils.CloseAndLog(otherDB)
 	otherLock, err := dbconn.NewTableLock(ctx, otherDB, []*table.TableInfo{targetTable}, dbconn.NewDBConfig(), slog.Default())
 	require.NoError(t, err)
-	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
-		[]LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []*dbconn.TableLock{otherLock})
+	_, err = applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(ctx, []LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []*dbconn.TableLock{otherLock})
 	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
-	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
-		[][]any{{int64(1)}}, []*dbconn.TableLock{otherLock})
+	_, err = applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).DeleteKeys(ctx, [][]any{{int64(1)}}, []*dbconn.TableLock{otherLock})
 	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
 	require.NoError(t, otherLock.Close(ctx))
 
@@ -1514,7 +1507,7 @@ func TestNewTargetValidation(t *testing.T) {
 	chunk := &table.Chunk{Table: tbl, NewTable: tbl, ColumnMapping: table.NewColumnMapping(tbl, tbl, nil)}
 	err = a.Apply(t.Context(), chunk, [][]any{{int64(1), "a"}}, func(int64, error) {})
 	require.ErrorContains(t, err, "ShardingColumn not configured")
-	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []LogicalRow{{RowImage: []any{int64(1), "a"}}}, nil)
+	_, err = a.TableWriter(chunk.ColumnMapping).UpsertRows(t.Context(), []LogicalRow{{RowImage: []any{int64(1), "a"}}}, nil)
 	require.ErrorContains(t, err, "ShardingColumn not configured")
 }
 
@@ -1526,10 +1519,9 @@ func TestUnderLockRejectsNilLock(t *testing.T) {
 	tbl := table.NewTableInfo(nil, "test", "t1")
 	tbl.Columns = []string{"id"}
 	tbl.KeyColumns = []string{"id"}
-	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
-		[]LogicalRow{{RowImage: []any{int64(1)}}}, []*dbconn.TableLock{nil})
+	_, err = a.TableWriter(table.NewColumnMapping(tbl, tbl, nil)).UpsertRows(t.Context(), []LogicalRow{{RowImage: []any{int64(1)}}}, []*dbconn.TableLock{nil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
-	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []*dbconn.TableLock{nil})
+	_, err = a.TableWriter(table.NewColumnMapping(tbl, tbl, nil)).DeleteKeys(t.Context(), [][]any{{int64(1)}}, []*dbconn.TableLock{nil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
 }
 
@@ -1564,7 +1556,7 @@ func TestSingleTargetPartialRangeRejectsUnownedRow(t *testing.T) {
 	require.NoError(t, a.Wait(t.Context()))
 	require.False(t, called.Load(), "a rejected Apply must not report the chunk as written")
 
-	_, err = a.UpsertRows(t.Context(), chunk.ColumnMapping, []LogicalRow{{RowImage: []any{int64(3), "unowned"}}}, nil)
+	_, err = a.TableWriter(chunk.ColumnMapping).UpsertRows(t.Context(), []LogicalRow{{RowImage: []any{int64(3), "unowned"}}}, nil)
 	require.ErrorContains(t, err, "no shard found")
 
 	var n int
@@ -1605,17 +1597,17 @@ func TestUnderLockSharedConnection(t *testing.T) {
 	defer utils.CloseAndLogWithContext(ctx, lock)
 	mapping := table.NewColumnMapping(tbl, tbl, nil)
 
-	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{{RowImage: []any{int64(3), "c"}}}, []*dbconn.TableLock{lock, lock})
+	_, err = a.TableWriter(mapping).UpsertRows(ctx, []LogicalRow{{RowImage: []any{int64(3), "c"}}}, []*dbconn.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 
 	// One lock covers both shards: an even row routes to shard 0, an odd row
 	// to shard 1, and the delete broadcasts to both.
-	_, err = a.UpsertRows(ctx, mapping, []LogicalRow{
+	_, err = a.TableWriter(mapping).UpsertRows(ctx, []LogicalRow{
 		{RowImage: []any{int64(3), "c"}},
 		{RowImage: []any{int64(4), "d"}},
 	}, []*dbconn.TableLock{lock})
 	require.NoError(t, err)
-	_, err = a.DeleteKeys(ctx, tbl, tbl, [][]any{{int64(1)}}, []*dbconn.TableLock{lock})
+	_, err = a.TableWriter(table.NewColumnMapping(tbl, tbl, nil)).DeleteKeys(ctx, [][]any{{int64(1)}}, []*dbconn.TableLock{lock})
 	require.NoError(t, err)
 	require.NoError(t, lock.Close(ctx))
 
@@ -1653,12 +1645,12 @@ func TestUnderLockRejectsUnsafeWarnings(t *testing.T) {
 	appl, err := New([]Target{{DB: db}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
 	rows := []LogicalRow{{RowImage: []any{int64(1), "too long"}}}
-	_, err = appl.UpsertRows(t.Context(), mapping, rows, nil)
+	_, err = appl.TableWriter(mapping).UpsertRows(t.Context(), rows, nil)
 	var warning *dbconn.UnsafeWarningError
 	require.ErrorAs(t, err, &warning)
 	lock, err := dbconn.NewTableLock(t.Context(), db, []*table.TableInfo{targetTable}, dbconn.NewDBConfig(), slog.Default())
 	require.NoError(t, err)
 	defer utils.CloseAndLogWithContext(t.Context(), lock)
-	_, err = appl.UpsertRows(t.Context(), mapping, rows, []*dbconn.TableLock{lock})
+	_, err = appl.TableWriter(mapping).UpsertRows(t.Context(), rows, []*dbconn.TableLock{lock})
 	require.ErrorAs(t, err, &warning, "a locked flush must not silently accept truncated data")
 }

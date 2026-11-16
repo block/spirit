@@ -142,8 +142,10 @@ type bufferedMap struct {
 	// We keep only a *slog.Logger (not a back-pointer to the source) so the
 	// bufferedMap stays source-agnostic and can be reused by alternative
 	// implementations (e.g. a VStream change.Source).
-	logger  *slog.Logger
-	applier applier.Applier // applier for writing changes to the target
+	logger *slog.Logger
+	// writer writes flushed changes to the target table. It is bound to the
+	// chunker's column mapping, which names both tables.
+	writer applier.TableWriter
 
 	table    *table.TableInfo
 	newTable *table.TableInfo
@@ -310,10 +312,13 @@ type BufferedSubscriptionConfig struct {
 	// [CurrentTable].
 	NewTable *table.TableInfo
 
-	// Applier writes batched changes to the target. Required.
+	// Applier writes batched changes to the target, through the
+	// TableWriter it returns for the chunker's column mapping. Required.
 	Applier applier.Applier
 
-	// Chunker provides the watermark filter + column mapping. Required.
+	// Chunker provides the watermark filter + column mapping. Required. Its
+	// column mapping must map CurrentTable to NewTable (to CurrentTable
+	// when NewTable is nil).
 	Chunker table.MappedChunker
 
 	// Logger receives diagnostic events. Defaults to slog.Default()
@@ -382,6 +387,18 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 	if cfg.Chunker == nil {
 		return nil, fmt.Errorf("NewBufferedSubscription: Chunker is required")
 	}
+	// The writer takes both tables from the chunker's mapping, so the mapping
+	// must be for this subscription's tables: a delete names the target
+	// table, and an upsert maps the source row image to the target's columns.
+	mapping := cfg.Chunker.ColumnMapping()
+	wantTarget := cfg.NewTable
+	if wantTarget == nil {
+		wantTarget = cfg.CurrentTable
+	}
+	if mapping == nil || !sameTable(mapping.SourceTable(), cfg.CurrentTable) || !sameTable(mapping.TargetTable(), wantTarget) {
+		return nil, fmt.Errorf("NewBufferedSubscription: the chunker's column mapping is not from %s.%s to %s.%s",
+			cfg.CurrentTable.SchemaName, cfg.CurrentTable.TableName, wantTarget.SchemaName, wantTarget.TableName)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -403,7 +420,7 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 		changes:              make(map[string]bufferedChange),
 		logger:               logger,
 		chunker:              cfg.Chunker,
-		applier:              cfg.Applier,
+		writer:               cfg.Applier.TableWriter(mapping),
 		pkIsMemoryComparable: cfg.CurrentTable.PrimaryKeyIsMemoryComparable() == nil,
 		softLimitBytes:       cfg.SoftLimitBytes,
 		softLimitChanges:     cfg.SoftLimitChanges,
@@ -547,7 +564,7 @@ func (s *bufferedMap) Tables() []*table.TableInfo {
 // from the source table's ShardingColumn on each call rather than stored,
 // so a zero-value bufferedMap (tests build these directly) cannot
 // accidentally declare column 0 immutable. The same derivation is used by
-// the sharded applier when routing rows (see MySQLApplier.UpsertRows);
+// the sharded applier when routing rows (see the MySQLApplier TableWriter's UpsertRows);
 // NewBufferedSubscription validates at setup time that a configured column
 // resolves, so -1 here always means "not sharded". TableInfo.Columns and
 // ShardingColumn are fixed after setup, so no lock is required.
@@ -1970,7 +1987,7 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 // per entry, in KeyColumns order).
 // If locks is non-empty, the operations are executed under the table
 // lock(s) — one lock per target server, matched to its target by the
-// applier (see applier.Applier.DeleteKeys for the contract).
+// writer (see applier.TableWriter for the contract).
 func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []applier.LogicalRow, locks []*dbconn.TableLock) error {
 	if len(deleteKeys) == 0 && len(upsertRows) == 0 {
 		return nil
@@ -1980,7 +1997,7 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 
 	// Execute deletes
 	if len(deleteKeys) > 0 {
-		affectedRows, err := s.applier.DeleteKeys(ctx, s.table, s.newTable, deleteKeys, locks)
+		affectedRows, err := s.writer.DeleteKeys(ctx, deleteKeys, locks)
 		if err != nil {
 			return fmt.Errorf("failed to delete keys: %w", err)
 		}
@@ -1989,7 +2006,7 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 
 	// Execute upserts
 	if len(upsertRows) > 0 {
-		affectedRows, err := s.applier.UpsertRows(ctx, s.chunker.ColumnMapping(), upsertRows, locks)
+		affectedRows, err := s.writer.UpsertRows(ctx, upsertRows, locks)
 		if err != nil {
 			return fmt.Errorf("failed to upsert rows: %w", err)
 		}
@@ -2216,4 +2233,9 @@ func (s *bufferedMap) SetWatermarkOptimization(ctx context.Context, enabled bool
 		"size_bytes", s.sizeBytes,
 	)
 	return nil
+}
+
+// sameTable reports whether a and b name the same table.
+func sameTable(a, b *table.TableInfo) bool {
+	return a != nil && b != nil && a.SchemaName == b.SchemaName && a.TableName == b.TableName
 }

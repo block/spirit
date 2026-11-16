@@ -219,7 +219,7 @@ func TestCutAtValueBoundaryKeepsRunsWhole(t *testing.T) {
 // batches are contiguous in the sorted order and that no leading-value run is
 // split across two of them.
 func TestBuildBatchesProducesContiguousRanges(t *testing.T) {
-	sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+	sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 	sub.batchSize = 10
 
 	// 200 rows in runs of 4 sharing a leading value.
@@ -360,7 +360,7 @@ func TestCutAtValueBoundaryAlwaysAdvances(t *testing.T) {
 func TestBuildBatchesAlwaysConsumesRows(t *testing.T) {
 	for _, batchSize := range []int{1, 2, minAdaptiveBatchSize, DefaultBatchSize} {
 		for _, partitioned := range []bool{false, true} {
-			sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+			sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 			sub.batchSize = batchSize
 
 			// One leading value across the whole set: the shape with no

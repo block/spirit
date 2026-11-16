@@ -437,7 +437,7 @@ func TestApplierTimeoutScope(t *testing.T) {
 
 			t.Run("UpsertRows is not bounded", func(t *testing.T) {
 				err := within(t, 30*time.Second, func() error {
-					_, err := applier.UpsertRows(ctx, mapping, []LogicalRow{{RowImage: []any{int64(1), "Bob"}}}, nil)
+					_, err := applier.TableWriter(mapping).UpsertRows(ctx, []LogicalRow{{RowImage: []any{int64(1), "Bob"}}}, nil)
 					return err
 				})
 				require.NotErrorIs(t, err, context.DeadlineExceeded)
@@ -446,7 +446,7 @@ func TestApplierTimeoutScope(t *testing.T) {
 
 			t.Run("DeleteKeys is not bounded", func(t *testing.T) {
 				err := within(t, 30*time.Second, func() error {
-					_, err := applier.DeleteKeys(ctx, tbl, tbl, [][]any{{int64(1)}}, nil)
+					_, err := applier.TableWriter(table.NewColumnMapping(tbl, tbl, nil)).DeleteKeys(ctx, [][]any{{int64(1)}}, nil)
 					return err
 				})
 				require.NotErrorIs(t, err, context.DeadlineExceeded)

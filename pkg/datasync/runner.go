@@ -1063,7 +1063,7 @@ func (r *Runner) checkTargetEmpty(ctx context.Context) error {
 // single-target MySQLApplier for the target. The applier is not started
 // here — the copier starts its async workers for the initial copy and
 // stops them when it finishes; the subscription flush path uses the
-// applier's synchronous UpsertRows/DeleteKeys, which do not require the
+// applier's synchronous TableWriter (UpsertRows/DeleteKeys), which does not require the
 // workers, for steady-state streaming.
 func (r *Runner) createApplier() (applier.Applier, error) {
 	if r.sync.Applier != nil {

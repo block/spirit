@@ -129,22 +129,40 @@ func (m *MockApplier) Apply(ctx context.Context, chunk *table.Chunk, rows [][]an
 	return nil
 }
 
-func (m *MockApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
-	m.mu.Lock()
-	m.deleteCalls = append(m.deleteCalls, keys)
-	m.mu.Unlock()
+// TableWriter returns a writer that records its calls on m (UpsertCalls,
+// DeleteCalls) and, with Inner set, delegates to Inner's writer for mapping.
+func (m *MockApplier) TableWriter(mapping *table.ColumnMapping) TableWriter {
+	w := &mockApplierTableWriter{m: m}
 	if m.Inner != nil {
-		return m.Inner.DeleteKeys(ctx, sourceTable, targetTable, keys, locks)
+		w.inner = m.Inner.TableWriter(mapping)
+	}
+	return w
+}
+
+// mockApplierTableWriter is MockApplier's TableWriter. Recording on the
+// MockApplier rather than on the writer keeps one place to assert on, however
+// many writers the code under test asks for.
+type mockApplierTableWriter struct {
+	m     *MockApplier
+	inner TableWriter
+}
+
+func (w *mockApplierTableWriter) DeleteKeys(ctx context.Context, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+	w.m.mu.Lock()
+	w.m.deleteCalls = append(w.m.deleteCalls, keys)
+	w.m.mu.Unlock()
+	if w.inner != nil {
+		return w.inner.DeleteKeys(ctx, keys, locks)
 	}
 	return int64(len(keys)), nil
 }
 
-func (m *MockApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
-	m.mu.Lock()
-	m.upsertCalls = append(m.upsertCalls, rows)
-	m.mu.Unlock()
-	if m.Inner != nil {
-		return m.Inner.UpsertRows(ctx, mapping, rows, locks)
+func (w *mockApplierTableWriter) UpsertRows(ctx context.Context, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+	w.m.mu.Lock()
+	w.m.upsertCalls = append(w.m.upsertCalls, rows)
+	w.m.mu.Unlock()
+	if w.inner != nil {
+		return w.inner.UpsertRows(ctx, rows, locks)
 	}
 	return int64(len(rows)), nil
 }
@@ -205,4 +223,55 @@ func (m *MockApplier) Reset() {
 	defer m.mu.Unlock()
 	m.starts, m.stops, m.waits = 0, 0, 0
 	m.applyRows, m.upsertCalls, m.deleteCalls = nil, nil, nil
+}
+
+// MockTableWriter is the shared TableWriter test double, for a test that hands
+// a subscription a writer directly. Like MockApplier it records every call and,
+// with Inner set, delegates; with Inner nil every call succeeds and reports
+// every row or key as affected. A test double that needs one method to misbehave
+// embeds it and overrides that method, calling through to the embedded one for
+// the recording.
+type MockTableWriter struct {
+	// Inner is the writer to delegate to. Nil means this mock stands alone.
+	Inner TableWriter
+
+	mu          sync.Mutex
+	upsertCalls [][]LogicalRow
+	deleteCalls [][][]any
+}
+
+var _ TableWriter = (*MockTableWriter)(nil)
+
+func (w *MockTableWriter) UpsertRows(ctx context.Context, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+	w.mu.Lock()
+	w.upsertCalls = append(w.upsertCalls, rows)
+	w.mu.Unlock()
+	if w.Inner != nil {
+		return w.Inner.UpsertRows(ctx, rows, locks)
+	}
+	return int64(len(rows)), nil
+}
+
+func (w *MockTableWriter) DeleteKeys(ctx context.Context, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+	w.mu.Lock()
+	w.deleteCalls = append(w.deleteCalls, keys)
+	w.mu.Unlock()
+	if w.Inner != nil {
+		return w.Inner.DeleteKeys(ctx, keys, locks)
+	}
+	return int64(len(keys)), nil
+}
+
+// UpsertCalls returns the rows of every UpsertRows call, in call order.
+func (w *MockTableWriter) UpsertCalls() [][]LogicalRow {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]LogicalRow(nil), w.upsertCalls...)
+}
+
+// DeleteCalls returns the keys of every DeleteKeys call, in call order.
+func (w *MockTableWriter) DeleteCalls() [][][]any {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][][]any(nil), w.deleteCalls...)
 }

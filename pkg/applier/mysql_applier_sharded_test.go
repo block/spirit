@@ -433,7 +433,7 @@ func TestShardedApplierDeleteKeys(t *testing.T) {
 		{int64(4)},
 	}
 
-	affectedRows, err := applier.DeleteKeys(t.Context(), sourceTable, target1Table, keysToDelete, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(sourceTable, target1Table, nil)).DeleteKeys(t.Context(), keysToDelete, nil)
 	require.NoError(t, err)
 	t.Logf("Deleted %d rows total across all shards", affectedRows)
 
@@ -509,7 +509,7 @@ func TestShardedApplierDeleteKeysEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delete with empty keys
-	affectedRows, err := applier.DeleteKeys(t.Context(), targetTable, targetTable, [][]any{}, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).DeleteKeys(t.Context(), [][]any{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affectedRows)
 }
@@ -608,7 +608,7 @@ func TestShardedApplierUpsertRows(t *testing.T) {
 		},
 	}
 
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(sourceTable, target1Table, nil), upsertRows, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(sourceTable, target1Table, nil)).UpsertRows(t.Context(), upsertRows, nil)
 	require.NoError(t, err)
 	t.Logf("Upserted %d rows total across all shards", affectedRows)
 
@@ -741,7 +741,7 @@ func TestShardedApplierUpsertRowsSkipDeleted(t *testing.T) {
 		},
 	}
 
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), upsertRows, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(t.Context(), upsertRows, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), affectedRows)
 
@@ -908,7 +908,7 @@ func TestShardedApplierUpsertRowsEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Upsert with empty rows
-	affectedRows, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), []LogicalRow{}, nil)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(targetTable, targetTable, nil)).UpsertRows(t.Context(), []LogicalRow{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affectedRows)
 }
@@ -1002,7 +1002,7 @@ func TestShardedApplierUpsertRowsUnderLock(t *testing.T) {
 	// match each lock to its shard by the connection it was acquired on,
 	// not by position.
 	locks := []*dbconn.TableLock{lock2, lock1}
-	affectedRows, err := applier.UpsertRows(ctx, table.NewColumnMapping(sourceTable, target1Table, nil), upsertRows, locks)
+	affectedRows, err := applier.TableWriter(table.NewColumnMapping(sourceTable, target1Table, nil)).UpsertRows(ctx, upsertRows, locks)
 	require.NoError(t, err)
 	require.Equal(t, int64(4), affectedRows)
 
@@ -1055,7 +1055,7 @@ func TestShardedApplierDeleteKeysUnderLock(t *testing.T) {
 		{int64(2)},
 		{int64(3)},
 	}
-	affected, err := applier.DeleteKeys(ctx, sourceTable, target1Table, keysToDelete, []*dbconn.TableLock{lock1, lock2})
+	affected, err := applier.TableWriter(table.NewColumnMapping(sourceTable, target1Table, nil)).DeleteKeys(ctx, keysToDelete, []*dbconn.TableLock{lock1, lock2})
 	require.NoError(t, err)
 	// Under lock the per-shard counts are unknown, so the key count is
 	// reported — once, not once per shard — matching single-target MySQLApplier.
@@ -1110,11 +1110,11 @@ func TestShardedApplierUnderLockMissingShardLock(t *testing.T) {
 	upsertRows := []LogicalRow{
 		{RowImage: []any{int64(2), int64(102), "Bob"}}, // even -> shard 0
 	}
-	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(sourceTable, target1Table, nil), upsertRows, []*dbconn.TableLock{lock1})
+	_, err = applier.TableWriter(table.NewColumnMapping(sourceTable, target1Table, nil)).UpsertRows(ctx, upsertRows, []*dbconn.TableLock{lock1})
 	require.ErrorContains(t, err, "no table lock supplied for shard 1")
 
 	keysToDelete := [][]any{{int64(1)}}
-	_, err = applier.DeleteKeys(ctx, sourceTable, target1Table, keysToDelete, []*dbconn.TableLock{lock1})
+	_, err = applier.TableWriter(table.NewColumnMapping(sourceTable, target1Table, nil)).DeleteKeys(ctx, keysToDelete, []*dbconn.TableLock{lock1})
 	require.ErrorContains(t, err, "no table lock supplied for shard 1")
 
 	// Nothing should have been written or deleted anywhere.
@@ -1251,7 +1251,7 @@ func TestShardedApplierRenamedTarget(t *testing.T) {
 		{RowImage: []any{int64(2), int64(102), "even-two"}},
 		{RowImage: []any{int64(3), int64(103), "odd-three"}},
 	}
-	affected, err := applier.UpsertRows(ctx, renamed, rows, nil)
+	affected, err := applier.TableWriter(renamed).UpsertRows(ctx, rows, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(3), affected)
 
@@ -1275,7 +1275,7 @@ func TestShardedApplierRenamedTarget(t *testing.T) {
 	require.Equal(t, map[int64]string{1: "odd-one", 3: "odd-three"}, rowNames(shard2DB, "t1_old"))
 
 	// DeleteKeys with an explicit renamed target broadcasts to t1_old.
-	affected, err = applier.DeleteKeys(ctx, sourceTable, oldTable, [][]any{{int64(1)}, {int64(2)}}, nil)
+	affected, err = applier.TableWriter(table.NewColumnMapping(sourceTable, oldTable, nil)).DeleteKeys(ctx, [][]any{{int64(1)}, {int64(2)}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), affected)
 	require.Empty(t, rowNames(shard1DB, "t1_old"))
@@ -1288,13 +1288,13 @@ func TestShardedApplierRenamedTarget(t *testing.T) {
 		require.NoError(t, err)
 	}
 	forward := table.NewColumnMapping(sourceTable, nil, nil)
-	affected, err = applier.UpsertRows(ctx, forward, rows, nil)
+	affected, err = applier.TableWriter(forward).UpsertRows(ctx, rows, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(3), affected)
 	require.Equal(t, map[int64]string{2: "even-two"}, rowNames(shard1DB, "t1"))
 	require.Equal(t, map[int64]string{1: "odd-one", 3: "odd-three"}, rowNames(shard2DB, "t1"))
 
-	affected, err = applier.DeleteKeys(ctx, sourceTable, nil, [][]any{{int64(3)}}, nil)
+	affected, err = applier.TableWriter(table.NewColumnMapping(sourceTable, nil, nil)).DeleteKeys(ctx, [][]any{{int64(3)}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affected)
 	require.Equal(t, map[int64]string{1: "odd-one"}, rowNames(shard2DB, "t1"))

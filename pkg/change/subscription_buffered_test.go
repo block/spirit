@@ -238,7 +238,7 @@ func TestBufferedMapFlushUnderLockBypassesWatermark(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:                client.logger,
-		applier:               applierInstance,
+		writer:                applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                 srcTable,
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
@@ -368,7 +368,7 @@ func TestBufferedMapFlushWithoutLockRespectsWatermark(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:                client.logger,
-		applier:               applierInstance,
+		writer:                applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                 srcTable,
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
@@ -541,7 +541,7 @@ func TestBufferedMapQueueModeFlush(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:               client.logger,
-		applier:              applierInstance,
+		writer:               applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                srcTable,
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
@@ -625,7 +625,7 @@ func TestBufferedMapQueueModeFIFOOrder(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:               client.logger,
-		applier:              applierInstance,
+		writer:               applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                srcTable,
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
@@ -694,7 +694,7 @@ func TestBufferedMapTransitionDrainsOutgoing(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:                client.logger,
-		applier:               applierInstance,
+		writer:                applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                 srcTable,
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
@@ -782,7 +782,7 @@ func TestBufferedMapToggleDrainFailureLeavesFlagUnchanged(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:                client.logger,
-		applier:               applierInstance,
+		writer:                applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                 srcTable,
 		newTable:              dstTable,
 		changes:               make(map[string]bufferedChange),
@@ -1128,7 +1128,7 @@ func TestBufferedMapQueueFlushEmpty(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:               client.logger,
-		applier:              applierInstance,
+		writer:               applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                srcTable,
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
@@ -1185,7 +1185,7 @@ func TestBufferedMapQueueFlushUnderLock(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:               client.logger,
-		applier:              applierInstance,
+		writer:               applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                srcTable,
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
@@ -1266,7 +1266,7 @@ func TestBufferedMapQueueConcurrentFlush(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:               client.logger,
-		applier:              applierInstance,
+		writer:               applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                srcTable,
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
@@ -1870,7 +1870,7 @@ func TestBufferedMapSeparatorInPKValues(t *testing.T) {
 
 	sub := &bufferedMap{
 		logger:               client.logger,
-		applier:              applierInstance,
+		writer:               applierInstance.TableWriter(mockChunker.ColumnMapping()),
 		table:                srcTable,
 		newTable:             dstTable,
 		changes:              make(map[string]bufferedChange),
@@ -1922,11 +1922,11 @@ func TestBufferedMapSeparatorInPKValues(t *testing.T) {
 // newByteCapBufferedMap builds a bufferedMap wired to a applier.MockApplier and
 // a mock chunker, detached from any binlog client / DB, for tests that
 // assert on flush batch splitting.
-func newByteCapBufferedMap(fake *applier.MockApplier, queueMode bool) *bufferedMap {
+func newByteCapBufferedMap(fake applier.TableWriter, queueMode bool) *bufferedMap {
 	mockChunker := table.NewMockChunker("bytecap", 1000)
 	sub := &bufferedMap{
 		logger:               slog.Default(),
-		applier:              fake,
+		writer:               fake,
 		table:                &table.TableInfo{SchemaName: "test", TableName: "bytecap"},
 		changes:              make(map[string]bufferedChange),
 		chunker:              mockChunker,
@@ -1945,7 +1945,7 @@ func newByteCapBufferedMap(fake *applier.MockApplier, queueMode bool) *bufferedM
 // REPLACE that could exceed max_allowed_packet — a deterministic,
 // non-retryable apply failure (every retry re-renders the same statement).
 func TestBufferedMapFlushByteCapSplitsUpserts(t *testing.T) {
-	fake := &applier.MockApplier{}
+	fake := &applier.MockTableWriter{}
 	sub := newByteCapBufferedMap(fake, false)
 
 	// Five rows sized so each estimates to ~40% of the budget rendered.
@@ -1984,7 +1984,7 @@ func TestBufferedMapFlushByteCapSplitsUpserts(t *testing.T) {
 // change the DefaultBatchSize row-count semantics: narrow rows still batch
 // 1000 at a time.
 func TestBufferedMapFlushRowCountCapStillApplies(t *testing.T) {
-	fake := &applier.MockApplier{}
+	fake := &applier.MockTableWriter{}
 	sub := newByteCapBufferedMap(fake, false)
 
 	for i := range 2500 {
@@ -2012,7 +2012,7 @@ func TestBufferedMapFlushRowCountCapStillApplies(t *testing.T) {
 // well above MaxStatementSizeBytes, same as the copy path's chunklet splitting).
 // Queue mode is used for deterministic FIFO batching.
 func TestBufferedMapFlushByteCapOversizedRowAlone(t *testing.T) {
-	fake := &applier.MockApplier{}
+	fake := &applier.MockTableWriter{}
 	sub := newByteCapBufferedMap(fake, true)
 
 	small := strings.Repeat("s", 1024)
@@ -2043,7 +2043,7 @@ func TestBufferedMapFlushByteCapOversizedRowAlone(t *testing.T) {
 // DELETE batches: composite / binary PKs hex-encode in the IN(...) list and
 // can be wide too.
 func TestBufferedMapFlushByteCapSplitsDeletes(t *testing.T) {
-	fake := &applier.MockApplier{}
+	fake := &applier.MockTableWriter{}
 	sub := newByteCapBufferedMap(fake, false)
 
 	// 100 deletes whose string PKs render to ~2x the total budget in
@@ -2155,4 +2155,47 @@ func TestBufferedMapWideRowsFlushSplitsStatements(t *testing.T) {
 		"SELECT CONCAT(COUNT(*), '-', BIT_XOR(CRC32(CONCAT(id, payload)))) FROM %s", dstTable.QuotedTableName)).Scan(&dstSum)
 	require.NoError(t, err)
 	require.Equal(t, srcSum, dstSum, "source and destination must match after a split flush")
+}
+
+// TestNewBufferedSubscriptionWriterMatchesTables pins that the subscription's
+// writer is for its own tables. The writer takes both tables from the
+// chunker's column mapping (a delete names the target, an upsert maps the
+// source row image onto the target's columns), so a chunker mapped between
+// other tables must be refused rather than flushed to the wrong table.
+func TestNewBufferedSubscriptionWriterMatchesTables(t *testing.T) {
+	src := &table.TableInfo{SchemaName: "test", TableName: "wm"}
+	dst := &table.TableInfo{SchemaName: "test", TableName: "_wm_new"}
+	other := &table.TableInfo{SchemaName: "test", TableName: "other"}
+	newSub := func(newTable *table.TableInfo, mapping *table.ColumnMapping) (Subscription, *applier.MockApplier, error) {
+		chunker := table.NewMockChunker("wm", 10)
+		chunker.SetColumnMapping(mapping)
+		appl := &applier.MockApplier{}
+		sub, err := NewBufferedSubscription(BufferedSubscriptionConfig{
+			CurrentTable: src,
+			NewTable:     newTable,
+			Applier:      appl,
+			Chunker:      chunker,
+		})
+		return sub, appl, err
+	}
+
+	t.Run("migration", func(t *testing.T) {
+		sub, appl, err := newSub(dst, table.NewColumnMapping(src, dst, nil))
+		require.NoError(t, err)
+		_, err = sub.(*bufferedMap).writer.UpsertRows(t.Context(), []applier.LogicalRow{{RowImage: []any{1}}}, nil)
+		require.NoError(t, err)
+		require.Len(t, appl.UpsertCalls(), 1, "the writer must be the applier's")
+	})
+	t.Run("move: nil NewTable means the same table", func(t *testing.T) {
+		_, _, err := newSub(nil, table.NewColumnMapping(src, nil, nil))
+		require.NoError(t, err)
+	})
+	t.Run("mapping to another target is refused", func(t *testing.T) {
+		_, _, err := newSub(dst, table.NewColumnMapping(src, other, nil))
+		require.ErrorContains(t, err, "column mapping is not from test.wm to test._wm_new")
+	})
+	t.Run("mapping from another source is refused", func(t *testing.T) {
+		_, _, err := newSub(nil, table.NewColumnMapping(other, nil, nil))
+		require.ErrorContains(t, err, "column mapping is not from test.wm to test.wm")
+	})
 }

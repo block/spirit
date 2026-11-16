@@ -199,7 +199,7 @@ func New(targets []Target, cfg *ApplierConfig) (*MySQLApplier, error) {
 }
 
 // Start initializes all shard workers and begins processing.
-// This does not control the synchronous methods like UpsertRows/DeleteKeys.
+// This does not control the synchronous TableWriter methods (UpsertRows/DeleteKeys).
 // This method is idempotent and can restart the applier after Stop() is called.
 //
 // Lifecycle: callers MUST call Stop() to terminate the per-shard write workers
@@ -446,7 +446,7 @@ func (a *MySQLApplier) Wait(ctx context.Context) error {
 }
 
 // Stop signals the applier to shut down gracefully.
-// This does not control the synchronous methods like UpsertRows/DeleteKeys,
+// This does not control the synchronous TableWriter methods (UpsertRows/DeleteKeys),
 // which can continue after Stop() is called.
 // This method is idempotent - calling it multiple times is safe.
 func (a *MySQLApplier) Stop() error {
@@ -895,7 +895,27 @@ func (a *MySQLApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*db
 	return shardLocks, nil
 }
 
-// DeleteKeys deletes rows by their key values synchronously, broadcasting to all shards.
+// TableWriter returns the writer for mapping's tables. It satisfies Applier.
+func (a *MySQLApplier) TableWriter(mapping *table.ColumnMapping) TableWriter {
+	return &mysqlTableWriter{applier: a, mapping: mapping}
+}
+
+// mysqlTableWriter is MySQLApplier's TableWriter: the applier's targets and
+// connections, bound to one ColumnMapping.
+type mysqlTableWriter struct {
+	applier *MySQLApplier
+	mapping *table.ColumnMapping
+}
+
+func (w *mysqlTableWriter) UpsertRows(ctx context.Context, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+	return w.applier.upsertRows(ctx, w.mapping, rows, locks)
+}
+
+func (w *mysqlTableWriter) DeleteKeys(ctx context.Context, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+	return w.applier.deleteKeys(ctx, w.mapping, keys, locks)
+}
+
+// deleteKeys deletes rows by their key values synchronously, broadcasting to all shards.
 // Each entry in keys is one primary-key tuple of the original (typed)
 // column values, in sourceTable.KeyColumns order.
 // If locks is non-empty, each shard's delete is executed under the table lock
@@ -907,17 +927,14 @@ func (a *MySQLApplier) resolveShardLocks(locks []*dbconn.TableLock) (map[int]*db
 // the deletes to all shards. The vindex value is considered immutable, and we will
 // error if it changes on an update.
 //
-// targetTable may be nil, meaning the same name as sourceTable. A different
-// name is used by migrations (the `_new` table) and by the reverse feed of a
-// sharded-source move, which writes back to the source's retired `_old` tables.
-func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
+// The target table is the mapping's. It differs from the source table for
+// migrations (the `_new` table) and for the reverse feed of a sharded-source
+// move, which writes back to the source's retired `_old` tables.
+func (a *MySQLApplier) deleteKeys(ctx context.Context, mapping *table.ColumnMapping, keys [][]any, locks []*dbconn.TableLock) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
-	// For move operations, targetTable may be nil - use sourceTable for both
-	if targetTable == nil {
-		targetTable = sourceTable
-	}
+	sourceTable, targetTable := mapping.SourceTable(), mapping.TargetTable()
 	// Resolve which lock belongs to which shard before executing anything,
 	// so a missing lock fails loudly instead of partially applying.
 	shardLocks, err := a.resolveShardLocks(locks)
@@ -996,7 +1013,7 @@ func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 	return totalAffected, nil
 }
 
-// UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously,
+// upsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously,
 // distributing rows across shards. The rows are LogicalRow structs containing
 // inline row images from the binlog. If locks is non-empty, each shard's
 // upsert is executed under the table lock that was acquired on that shard's
@@ -1055,7 +1072,7 @@ func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 //
 // The sharding column and hash always come from the mapping's SOURCE table —
 // the watched table whose row images we are routing.
-func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (a *MySQLApplier) upsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}

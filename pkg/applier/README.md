@@ -84,7 +84,7 @@ The applier layer provides several critical functions:
 1. **Optimal Batching**: Rows are split into "chunklets" that respect both MySQL's `max_allowed_packet` limit and optimal write sizes
 2. **Parallel Processing**: Multiple write workers fan-out and process chunklets concurrently for ideal use of group commit.
 3. **Async Feedback**: Callers are notified via callbacks when writes complete, allowing the copier to advance its watermark.
-4. **Mixed Operations**: Supports both async bulk copying (`Apply`) and synchronous operations (`DeleteKeys`, `UpsertRows`) needed by the subscription.
+4. **Mixed Operations**: Supports both async bulk copying (`Apply`) and synchronous writes through a `TableWriter` (`DeleteKeys`, `UpsertRows`), which the subscription uses.
 
 Without the applier layer, the copier would need to handle all of this complexity itself, making the code harder to maintain and test. The copier is agnostic to sharded migrations.
 
@@ -114,9 +114,9 @@ The applier interface provides both asynchronous and synchronous methods:
 **Asynchronous (used by the copier and the checksum's chunk repair)**:
 - `Apply(ctx, chunk, rows, callback)`: Queues rows for writing and returns immediately. The callback is invoked when all rows have been written. Emits `INSERT IGNORE INTO target (cols) VALUES (...)`, not `REPLACE` — see the checksum's [Chunk repair](../checksum/README.md#chunk-repair) for why repair depends on that.
 
-**Synchronous (used by subscription)**:
-- `DeleteKeys(ctx, sourceTable, targetTable, keys, locks)`: Deletes rows by primary key and waits for completion. Emits `DELETE FROM target WHERE (pk) IN (...)`.
-- `UpsertRows(ctx, mapping, rows, locks)`: Upserts rows using a `ColumnMapping` and waits for completion. Emits `REPLACE INTO target (cols) VALUES (...)` — see [REPLACE INTO semantics](#replace-into-semantics-and-eventual-consistency) below.
+**Synchronous (used by subscription)**: `TableWriter(mapping)` returns a `TableWriter` bound to one `ColumnMapping`, which names the source and target tables. A subscription asks for its writer once and writes every flush through it, passing only rows and keys:
+- `DeleteKeys(ctx, keys, locks)`: Deletes rows by primary key and waits for completion. Emits `DELETE FROM target WHERE (pk) IN (...)`.
+- `UpsertRows(ctx, rows, locks)`: Upserts rows' images, mapped by the writer's `ColumnMapping`, and waits for completion. Emits `REPLACE INTO target (cols) VALUES (...)` — see [REPLACE INTO semantics](#replace-into-semantics-and-eventual-consistency) below.
 
 `locks` is a `[]*dbconn.TableLock`. Leave it nil for ordinary flushes; under-lock writes require exactly one lock per distinct target `*sql.DB`. Targets sharing a database handle must share one lock covering all their tables; duplicate lock entries for the same handle are rejected. These synchronous methods execute on the calling flush goroutines, independently of the asynchronous copy-worker pool.
 
@@ -206,7 +206,7 @@ The applier only tracks changes by `PRIMARY KEY`, not by sharding column (vindex
 
 ### Writing under a table lock
 
-`DeleteKeys` and `UpsertRows` take an optional list of table locks, used for the final flush at cutover. There must be exactly one lock per distinct target `*sql.DB`, acquired on that handle and covering every target table that uses it. Targets sharing a handle share that lock. The applier matches locks to targets by connection identity, and returns an error before writing anything if a handle has no lock, has two, or a lock matches no target. Executing a target's statements on another server's lock connection would write the rows to the wrong server.
+A `TableWriter`'s `DeleteKeys` and `UpsertRows` take an optional list of table locks, used for the final flush at cutover. There must be exactly one lock per distinct target `*sql.DB`, acquired on that handle and covering every target table that uses it. Targets sharing a handle share that lock. The applier matches locks to targets by connection identity, and returns an error before writing anything if a handle has no lock, has two, or a lock matches no target. Executing a target's statements on another server's lock connection would write the rows to the wrong server.
 
 ### Write-worker scaling
 

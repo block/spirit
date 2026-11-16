@@ -8,7 +8,6 @@ import (
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,13 +24,13 @@ func shortenDrainDispatchBudget(t *testing.T, d time.Duration) {
 // slowApplier makes every applier round trip take a fixed amount of wall clock,
 // which is what the dispatch budget is measured against.
 type slowApplier struct {
-	applier.MockApplier
+	applier.MockTableWriter
 	perCall time.Duration
 }
 
-func (s *slowApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
+func (s *slowApplier) UpsertRows(ctx context.Context, rows []applier.LogicalRow, locks []*dbconn.TableLock) (int64, error) {
 	time.Sleep(s.perCall)
-	return s.MockApplier.UpsertRows(ctx, mapping, rows, locks)
+	return s.MockTableWriter.UpsertRows(ctx, rows, locks)
 }
 
 // TestSoftLimitOnChangeCountParksTheReader is the regression test for the
@@ -42,7 +41,7 @@ func (s *slowApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMappi
 // they weigh — so the buffer needs a cap in that unit too.
 func TestSoftLimitOnChangeCountParksTheReader(t *testing.T) {
 	const limit = 8
-	sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+	sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 	sub.softLimitChanges = limit
 	// No byte cap at all, so this test can only pass on the count cap.
 	sub.softLimitBytes = 0
@@ -83,7 +82,7 @@ func TestSoftLimitOnChangeCountParksTheReader(t *testing.T) {
 // precisely the workload dedup handles for free.
 func TestChangeCountCapExemptsDedupOverwrites(t *testing.T) {
 	const limit = 4
-	sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+	sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 	sub.softLimitChanges = limit
 	sub.softLimitBytes = 0
 
@@ -114,7 +113,7 @@ func TestChangeCountCapExemptsDedupOverwrites(t *testing.T) {
 // and the pending total — which is what Length() and AllChangesFlushed() see —
 // would be twice the cap.
 func TestChangeCountCapIncludesInFlightEntries(t *testing.T) {
-	sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+	sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 	sub.softLimitChanges = 4
 	sub.softLimitBytes = 0
 
@@ -129,7 +128,7 @@ func TestChangeCountCapIncludesInFlightEntries(t *testing.T) {
 // SubscriptionSoftLimitChanges to zero, so this is the shape an explicit
 // opt-out reaches the subscription in.
 func TestChangeCountCapOptOut(t *testing.T) {
-	sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+	sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 	sub.softLimitChanges = 0
 	sub.softLimitBytes = 0
 	sub.Lock()
@@ -147,8 +146,7 @@ func TestDrainDispatchBudgetDefersTheRemainder(t *testing.T) {
 	shortenDrainDispatchBudget(t, 50*time.Millisecond)
 	const totalRows = 6 * DefaultBatchSize
 	fake := &slowApplier{perCall: 40 * time.Millisecond}
-	sub := newByteCapBufferedMap(&fake.MockApplier, false)
-	sub.applier = fake
+	sub := newByteCapBufferedMap(fake, false)
 	sub.flushConcurrency = 1 // serial, so the budget is spent predictably
 
 	for i := range totalRows {
@@ -197,8 +195,7 @@ func TestDrainDispatchBudgetBoundsQueueModeToo(t *testing.T) {
 	const segments = 4
 	const totalRows = segments * DefaultBatchSize
 	fake := &slowApplier{perCall: 40 * time.Millisecond}
-	sub := newByteCapBufferedMap(&fake.MockApplier, true) // queue mode
-	sub.applier = fake
+	sub := newByteCapBufferedMap(fake, true) // queue mode
 	require.True(t, sub.queueModeActive(), "this test must exercise the queue drain")
 
 	for i := range totalRows {
@@ -250,8 +247,7 @@ func TestDrainDispatchBudgetIsNotDefeatedByASlotWait(t *testing.T) {
 	const batches = 3
 	const totalRows = batches * DefaultBatchSize
 	fake := &slowApplier{perCall: 300 * time.Millisecond}
-	sub := newByteCapBufferedMap(&fake.MockApplier, false)
-	sub.applier = fake
+	sub := newByteCapBufferedMap(fake, false)
 	sub.flushConcurrency = 1
 
 	for i := range totalRows {
@@ -276,7 +272,7 @@ func TestDrainDispatchBudgetIsNotDefeatedByASlotWait(t *testing.T) {
 // which would freeze the checkpoint in the name of unfreezing it.
 func TestDrainWithinBudgetStillReportsComplete(t *testing.T) {
 	const totalRows = 3 * DefaultBatchSize
-	fake := &applier.MockApplier{}
+	fake := &applier.MockTableWriter{}
 	sub := newByteCapBufferedMap(fake, false)
 	sub.flushConcurrency = 4
 
@@ -332,7 +328,7 @@ func TestDrainBoundDefaultsAreOrdered(t *testing.T) {
 // a healthy feed if the only evidence is a counter that stopped moving.
 func TestParkStatsReportsAnInFlightPark(t *testing.T) {
 	const limit = 4
-	sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+	sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 	sub.softLimitChanges = limit
 	sub.softLimitBytes = 0
 
@@ -377,7 +373,7 @@ func TestParkStatsReportsAnInFlightPark(t *testing.T) {
 // own log lines.
 func TestFeedStatsReportsSubscriptionParks(t *testing.T) {
 	const limit = 2
-	sub := newByteCapBufferedMap(&applier.MockApplier{}, false)
+	sub := newByteCapBufferedMap(&applier.MockTableWriter{}, false)
 	sub.softLimitChanges = limit
 	sub.softLimitBytes = 0
 

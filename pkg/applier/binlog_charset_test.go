@@ -82,15 +82,15 @@ func TestApplierBinlogCharsets(t *testing.T) {
 	} {
 		t.Run(tc.target, func(t *testing.T) {
 			dst := info(tc.target)
-			_, err := applier.UpsertRows(t.Context(), table.NewColumnMapping(src, dst, nil), images, nil)
+			_, err := applier.TableWriter(table.NewColumnMapping(src, dst, nil)).UpsertRows(t.Context(), images, nil)
 			require.NoError(t, err)
 			require.Equal(t, tc.want, hexRows(t, db, tc.target))
 
 			// Delete the key whose bytes, read as utf8mb4, are the other key.
-			_, err = applier.DeleteKeys(t.Context(), src, dst, [][]any{{"\xc3\xa9"}}, nil)
+			_, err = applier.TableWriter(table.NewColumnMapping(src, dst, nil)).DeleteKeys(t.Context(), [][]any{{"\xc3\xa9"}}, nil)
 			require.NoError(t, err)
 			require.Equal(t, []string{tc.want[0], tc.want[2]}, hexRows(t, db, tc.target))
-			_, err = applier.DeleteKeys(t.Context(), src, dst, [][]any{{"\xe9"}}, nil)
+			_, err = applier.TableWriter(table.NewColumnMapping(src, dst, nil)).DeleteKeys(t.Context(), [][]any{{"\xe9"}}, nil)
 			require.NoError(t, err)
 			require.Equal(t, []string{tc.want[0]}, hexRows(t, db, tc.target))
 		})

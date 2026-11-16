@@ -47,7 +47,7 @@ const (
 // chunkTaskTimeout bounds one copy-path write (a chunklet INSERT), retries
 // included. A var only so tests can shorten it.
 //
-// It deliberately does not bound DeleteKeys or UpsertRows. Those run the
+// It deliberately does not bound a TableWriter's DeleteKeys or UpsertRows. Those run the
 // change feed's flushes, and pkg/change relies on no spirit-owned deadline
 // ever killing a flush statement: a healthy but slow REPLACE must finish, and
 // lock contention must surface as 1205/1213 so the batch is deferred rather
@@ -98,26 +98,12 @@ type Applier interface {
 	// approximate. See the Stats type for field semantics.
 	Stats() Stats
 
-	// DeleteKeys deletes rows by their key values synchronously. Each entry
-	// in keys is one key tuple of the original (typed) column values, in
-	// sourceTable.KeyColumns order.
-	// An empty locks slice means no under-lock flush: the delete runs on the
-	// regular write connection(s). When locks is non-empty, the delete is
-	// executed under the supplied table lock(s): one lock per target, each
-	// acquired on that target's own connection (the same *sql.DB as
-	// Target.DB). Each target's statements run under that target's lock,
-	// matched by connection identity. A missing lock for any target, or a lock
-	// that matches no target, is an error.
-	// Returns the number of rows affected and any error.
-	DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []*dbconn.TableLock) (int64, error)
-
-	// UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously.
-	// The rows are LogicalRow structs containing the row images.
-	// An empty locks slice means no under-lock flush; when locks is non-empty
-	// the upsert is executed under the supplied table lock(s). See DeleteKeys
-	// for the lock contract (one lock per target).
-	// Returns the number of rows affected and any error.
-	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error)
+	// TableWriter returns the writer for row changes from mapping's source
+	// table to its target table. A change feed's subscription holds one for
+	// the life of the subscription and writes every flush through it. The
+	// writer uses this applier's targets and connections; it does not start
+	// or need the asynchronous Apply workers.
+	TableWriter(mapping *table.ColumnMapping) TableWriter
 
 	// Wait blocks until all pending work is complete and all callbacks have been invoked
 	Wait(ctx context.Context) error
@@ -128,6 +114,31 @@ type Applier interface {
 	// GetTargets returns target information for direct database access.
 	// This is used by operations like checksum that need to query targets directly.
 	GetTargets() []Target
+}
+
+// TableWriter writes row changes for one source table to its target table,
+// synchronously. It is bound to the tables when it is created (see
+// Applier.TableWriter), so a caller passes only the rows: how a row image
+// becomes a statement on the target, and which target a row belongs to, is the
+// writer's business.
+//
+// The locks contract is the same for both methods. An empty locks slice means
+// no under-lock flush: the write runs on the regular write connection(s). When
+// locks is non-empty, the write is executed under the supplied table lock(s):
+// one lock per target, each acquired on that target's own connection (the same
+// *sql.DB as Target.DB). Each target's statements run under that target's lock,
+// matched by connection identity. A missing lock for any target, or a lock that
+// matches no target, is an error.
+type TableWriter interface {
+	// UpsertRows performs an upsert (REPLACE INTO ... VALUES) of the rows'
+	// images. Deleted rows are skipped: use DeleteKeys for them. Returns the
+	// number of rows affected.
+	UpsertRows(ctx context.Context, rows []LogicalRow, locks []*dbconn.TableLock) (int64, error)
+
+	// DeleteKeys deletes rows by their key values. Each entry in keys is one
+	// key tuple of the original (typed) column values, in the source table's
+	// KeyColumns order. Returns the number of rows affected.
+	DeleteKeys(ctx context.Context, keys [][]any, locks []*dbconn.TableLock) (int64, error)
 }
 
 // LogicalRow represents the current state of a row in the subscription buffer.
