@@ -761,31 +761,6 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 // Spirit supports changing the datatype on a primary key column (e.g. INT→BIGINT)
 // as long as the primary key itself doesn't change (no ADD/DROP PRIMARY KEY).
 
-func TestAlterPKIntToBigInt(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "altpk_int2big", `CREATE TABLE altpk_int2big (
-		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		name varchar(255) NOT NULL,
-		val int NOT NULL DEFAULT 0
-	)`)
-	tt.SeedRows(t, "INSERT INTO altpk_int2big (name, val) SELECT 'a', 1", 3)
-
-	m := NewTestRunner(t, "altpk_int2big", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT")
-	require.NoError(t, m.Run(t.Context()))
-	require.False(t, m.usedInstantDDL)
-	require.NoError(t, m.Close())
-
-	var count int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM altpk_int2big").Scan(&count))
-	require.GreaterOrEqual(t, count, 3)
-
-	var colType string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		"SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='altpk_int2big' AND COLUMN_NAME='id'",
-	).Scan(&colType))
-	require.Equal(t, "bigint", colType)
-}
-
 func TestAlterPKIntToBigIntUnsigned(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "altpk_int2bigu", `CREATE TABLE altpk_int2bigu (

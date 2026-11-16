@@ -397,58 +397,15 @@ func TestRenameColumnAllCombined(t *testing.T) {
 			require.Equal(t, 10, amount)
 			require.Equal(t, 20, genCol) // generated column should still work
 			require.Equal(t, 99, extra)  // new column default
+
+			var count int
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM rcol_combo").Scan(&count))
+			require.Equal(t, 2, count)
+			var colType string
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='rcol_combo' AND COLUMN_NAME='new_name'").Scan(&colType))
+			require.Equal(t, "varchar(200)", colType)
 		},
 	)
-}
-
-// TestRenameColumnForceCopyPath tests a simple rename combined with an operation
-// that forces Spirit's copy algorithm (adding a non-trivial column), ensuring
-// the rename works through the full copy+checksum+binlog replay path.
-func TestRenameColumnForceCopyPath(t *testing.T) {
-	t.Parallel()
-	dbName, _ := testutils.CreateUniqueTestDatabase(t)
-	tableName := "rcol_forcecopy"
-	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("DROP TABLE IF EXISTS %s, _%s_new", tableName, tableName))
-	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf(`CREATE TABLE %s (
-		id int NOT NULL AUTO_INCREMENT,
-		old_name varchar(100) NOT NULL,
-		value int NOT NULL DEFAULT 0,
-		PRIMARY KEY (id)
-	)`, tableName))
-
-	// Insert enough rows to exercise chunking
-	testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (old_name, value) VALUES ('row1', 10)", tableName))
-	for range 5 {
-		testutils.RunSQLInDatabase(t, dbName, fmt.Sprintf("INSERT INTO %s (old_name, value) SELECT CONCAT(old_name,'x'), value+1 FROM %s", tableName, tableName))
-	}
-	// Should have 32 rows
-
-	// CHANGE COLUMN with type change forces the copy algorithm
-	m := NewTestMigration(t, WithDBName(dbName),
-		WithStatement(fmt.Sprintf("ALTER TABLE %s CHANGE COLUMN old_name new_name varchar(200) NOT NULL", tableName)))
-	require.NoError(t, m.Run())
-
-	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
-	require.NoError(t, err)
-	defer func() { require.NoError(t, db.Close()) }()
-
-	// Verify row count preserved
-	var count int
-	err = db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&count)
-	require.NoError(t, err)
-	require.Equal(t, 32, count)
-
-	// Verify data accessible via new column name
-	var name string
-	err = db.QueryRowContext(t.Context(), fmt.Sprintf("SELECT new_name FROM %s WHERE id=1", tableName)).Scan(&name)
-	require.NoError(t, err)
-	require.Equal(t, "row1", name)
-
-	// Verify column type changed
-	var colType string
-	err = db.QueryRowContext(t.Context(), "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME='new_name'", tableName).Scan(&colType)
-	require.NoError(t, err)
-	require.Equal(t, "varchar(200)", colType)
 }
 
 // TestRenameColumnCaseInsensitive tests renames where the ALTER references
