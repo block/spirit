@@ -139,6 +139,7 @@ Available options: `WithThreads(n)`, `WithWriteThreads(n)`, `WithSkipAutoscaling
 - Test files live alongside their source files (e.g., `mysql_applier.go` / `mysql_applier_test.go`)
 - Use `wg.Go()` (Go 1.26+) instead of `wg.Add(1)` + `go func() { defer wg.Done(); ... }()`
 - Use `tt.DB` for DML in concurrent goroutines — no need to open a separate `*sql.DB` connection
+- To wait for a statement to reach the server, poll `performance_schema.processlist`, not `information_schema.processlist`. From MySQL 9.7, `information_schema.processlist` fails with error 3854 while any running statement's text holds a 4-byte character ([MySQL bug 121434](https://bugs.mysql.com/bug.php?id=121434)); other packages' tests run such statements concurrently. `performance_schema.processlist` was added in MySQL 8.0.22, so it exists on every version CI tests (the oldest is 8.0.28); revisit this if an older version is ever supported. Its `state` column reports stage names for some statements (an in-place `ALTER` shows `alter table (read PK and internal sort)`, not `altering table`); `Waiting for table metadata lock` matches in both tables. Production code reads neither table: `dbconn.KillSessionAndWait` repeats the `KILL` instead
 
 ## Linting
 
