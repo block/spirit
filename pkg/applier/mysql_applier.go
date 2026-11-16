@@ -900,7 +900,7 @@ func (a *MySQLApplier) resolveShardLocks(locks []contract.TableLock) (map[int]co
 
 // DeleteKeys deletes rows by their key values synchronously, broadcasting to all shards.
 // Each entry in keys is one primary-key tuple of the original (typed)
-// column values, in sourceTable.KeyColumns order.
+// column values, in the KeyColumns order of the mapping's source table.
 // If locks is non-empty, each shard's delete is executed under the table lock
 // that was acquired on that shard's own connection (one lock per shard,
 // matched via resolveShardLocks).
@@ -910,30 +910,18 @@ func (a *MySQLApplier) resolveShardLocks(locks []contract.TableLock) (map[int]co
 // the deletes to all shards. The vindex value is considered immutable, and we will
 // error if it changes on an update.
 //
-// targetTable may be nil, meaning the same name as sourceTable. A different
-// name is used by migrations (the `_new` table) and by the reverse feed of a
+// The rows are deleted from the mapping's target table. Its name differs from
+// the source's for migrations (the `_new` table) and for the reverse feed of a
 // sharded-source move, which writes back to the source's retired `_old` tables.
-func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTableDesc, targetTableDesc contract.Table, keys [][]any, locks []contract.TableLock) (int64, error) {
+func (a *MySQLApplier) DeleteKeys(ctx context.Context, m contract.ColumnMapping, keys [][]any, locks []contract.TableLock) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
-	// The rendering below needs the source's MySQL column types, which only
-	// a *table.TableInfo carries. A nil *table.TableInfo target counts as nil.
-	sourceTable, err := table.AsTableInfo(sourceTableDesc)
+	mapping, err := table.AsColumnMapping(m)
 	if err != nil {
-		return 0, fmt.Errorf("delete keys: source %w", err)
+		return 0, fmt.Errorf("delete keys: %w", err)
 	}
-	if sourceTable == nil {
-		return 0, errors.New("delete keys: sourceTable is nil")
-	}
-	targetTable, err := table.AsTableInfo(targetTableDesc)
-	if err != nil {
-		return 0, fmt.Errorf("delete keys: target %w", err)
-	}
-	// For move operations, targetTable may be nil - use sourceTable for both
-	if targetTable == nil {
-		targetTable = sourceTable
-	}
+	sourceTable, targetTable := mapping.SourceTable(), mapping.TargetTable()
 	// Resolve which lock belongs to which shard before executing anything,
 	// so a missing lock fails loudly instead of partially applying.
 	shardLocks, err := a.resolveShardLocks(locks)
@@ -1071,19 +1059,13 @@ func (a *MySQLApplier) DeleteKeys(ctx context.Context, sourceTableDesc, targetTa
 //
 // The sharding column and hash always come from the mapping's SOURCE table —
 // the watched table whose row images we are routing.
-func (a *MySQLApplier) UpsertRows(ctx context.Context, mappingDesc contract.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *MySQLApplier) UpsertRows(ctx context.Context, m contract.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	// The rendering below needs the source's MySQL column types and the
-	// mapping's precomputed ordinals, which only a *table.ColumnMapping
-	// carries.
-	mapping, err := table.AsColumnMapping(mappingDesc)
+	mapping, err := table.AsColumnMapping(m)
 	if err != nil {
 		return 0, fmt.Errorf("upsert rows: %w", err)
-	}
-	if mapping == nil {
-		return 0, errors.New("upsert rows: mapping is nil")
 	}
 
 	// Resolve which lock belongs to which shard before executing anything,

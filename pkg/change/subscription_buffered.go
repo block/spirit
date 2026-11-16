@@ -2,6 +2,7 @@ package change
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -382,6 +383,9 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 	}
 	if cfg.Chunker == nil {
 		return nil, fmt.Errorf("NewBufferedSubscription: Chunker is required")
+	}
+	if err := checkChunkerMapping(cfg); err != nil {
+		return nil, fmt.Errorf("NewBufferedSubscription: %w", err)
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -1967,6 +1971,29 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 	return allChangesFlushed, nil
 }
 
+// checkChunkerMapping checks that the chunker's column mapping maps
+// cfg.CurrentTable onto cfg.NewTable (or onto CurrentTable itself when
+// NewTable is nil). The subscription buffers keys and row images of
+// CurrentTable, and flushes both deletes and upserts through that mapping, so
+// a mapping of other tables would write them somewhere else.
+func checkChunkerMapping(cfg BufferedSubscriptionConfig) error {
+	mapping := cfg.Chunker.ColumnMapping()
+	if mapping == nil {
+		return errors.New("chunker has no column mapping")
+	}
+	target := cfg.NewTable
+	if target == nil {
+		target = cfg.CurrentTable
+	}
+	if got, want := mapping.Source().ID(), cfg.CurrentTable.ID(); got != want {
+		return fmt.Errorf("chunker's column mapping reads %s.%s, not CurrentTable %s.%s", got.Schema, got.Name, want.Schema, want.Name)
+	}
+	if got, want := mapping.Target().ID(), target.ID(); got != want {
+		return fmt.Errorf("chunker's column mapping writes %s.%s, not %s.%s", got.Schema, got.Name, want.Schema, want.Name)
+	}
+	return nil
+}
+
 // flushBatch flushes a batch of deletes and upserts using the applier.
 // deleteKeys holds the typed PK tuples of the rows to delete (one tuple
 // per entry, in KeyColumns order).
@@ -1980,16 +2007,13 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 	startTime := time.Now()
 	var deleteAffected, upsertAffected int64
 
+	// Deletes and upserts go through the same mapping, so they address the
+	// same target (NewBufferedSubscription checked it against the tables).
+	mapping := s.chunker.ColumnMapping()
+
 	// Execute deletes
 	if len(deleteKeys) > 0 {
-		// A move-flow subscription has no newTable. Pass it as an untyped
-		// nil: a nil *table.TableInfo stored in a contract.Table is not
-		// == nil, so a writer would not see "same name as sourceTable".
-		var target contract.Table
-		if s.newTable != nil {
-			target = s.newTable
-		}
-		affectedRows, err := s.applier.DeleteKeys(ctx, s.table, target, deleteKeys, locks)
+		affectedRows, err := s.applier.DeleteKeys(ctx, mapping, deleteKeys, locks)
 		if err != nil {
 			return fmt.Errorf("failed to delete keys: %w", err)
 		}
@@ -1998,7 +2022,7 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 
 	// Execute upserts
 	if len(upsertRows) > 0 {
-		affectedRows, err := s.applier.UpsertRows(ctx, s.chunker.ColumnMapping(), upsertRows, locks)
+		affectedRows, err := s.applier.UpsertRows(ctx, mapping, upsertRows, locks)
 		if err != nil {
 			return fmt.Errorf("failed to upsert rows: %w", err)
 		}

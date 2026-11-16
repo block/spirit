@@ -112,7 +112,7 @@ func TestAddSubscriptionTableChecks(t *testing.T) {
 		return &feedCore{logger: slog.Default(), subs: newSubscriptionRegistry(), applier: &applier.MockApplier{}}
 	}
 	t1 := &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}}
-	chunker := &table.MockChunker{}
+	chunker := table.NewMockChunker("t1", 0)
 
 	err := newCore().AddSubscription(foreignTable{}, nil, chunker)
 	require.ErrorContains(t, err, "change.foreignTable, not a *table.TableInfo")

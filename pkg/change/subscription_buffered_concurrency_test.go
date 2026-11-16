@@ -66,7 +66,7 @@ func (g *gatedApplier) UpsertRows(ctx context.Context, mapping contract.ColumnMa
 	return g.MockApplier.UpsertRows(ctx, mapping, rows, locks)
 }
 
-func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable contract.Table, keys [][]any, locks []contract.TableLock) (int64, error) {
+func (g *gatedApplier) DeleteKeys(ctx context.Context, mapping contract.ColumnMapping, keys [][]any, locks []contract.TableLock) (int64, error) {
 	g.announce()
 	if g.deleteGate != nil {
 		<-g.deleteGate
@@ -74,7 +74,7 @@ func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 	if g.failDeletes.Load() {
 		return 0, errInjected
 	}
-	return g.MockApplier.DeleteKeys(ctx, sourceTable, targetTable, keys, locks)
+	return g.MockApplier.DeleteKeys(ctx, mapping, keys, locks)
 }
 
 // awaitEntered blocks until the applier reports a gated call in

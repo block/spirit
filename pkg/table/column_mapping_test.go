@@ -364,14 +364,15 @@ func TestColumnMappingContract(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, m, got)
 
-	got, err = AsColumnMapping(nil)
-	require.NoError(t, err)
-	require.Nil(t, got)
+	_, err = AsColumnMapping(nil)
+	require.EqualError(t, err, "column mapping is nil")
 
 	var nilMapping *ColumnMapping
-	got, err = AsColumnMapping(nilMapping)
-	require.NoError(t, err)
-	require.Nil(t, got)
+	_, err = AsColumnMapping(nilMapping)
+	require.EqualError(t, err, "column mapping is nil")
+
+	_, err = AsColumnMapping(&ColumnMapping{})
+	require.EqualError(t, err, "column mapping has no source or target table")
 
 	_, err = AsColumnMapping(otherMapping{})
 	require.EqualError(t, err, "column mapping is a table.otherMapping, not a *table.ColumnMapping")

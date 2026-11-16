@@ -447,7 +447,7 @@ func TestApplierTimeoutScope(t *testing.T) {
 
 			t.Run("DeleteKeys is not bounded", func(t *testing.T) {
 				err := within(t, 30*time.Second, func() error {
-					_, err := applier.DeleteKeys(ctx, tbl, tbl, [][]any{{int64(1)}}, nil)
+					_, err := applier.DeleteKeys(ctx, table.NewColumnMapping(tbl, tbl, nil), [][]any{{int64(1)}}, nil)
 					return err
 				})
 				require.NotErrorIs(t, err, context.DeadlineExceeded)

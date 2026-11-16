@@ -14,12 +14,12 @@ import "context"
 // DB(). A target with no lock, or a lock that matches no target, is an error,
 // returned before anything is written.
 type StreamedChangesWriter interface {
-	// DeleteKeys deletes the target rows with the given keys. Each entry in
-	// keys is one key tuple of the source row's values, in
-	// sourceTable.KeyColumnNames() order. targetTable may be nil, meaning a
-	// table with the same name as sourceTable on the target. It returns the
-	// number of rows deleted.
-	DeleteKeys(ctx context.Context, sourceTable, targetTable Table, keys [][]any, locks []TableLock) (int64, error)
+	// DeleteKeys deletes the rows of mapping.Target() with the given keys.
+	// Each entry in keys is one key tuple of the source row's values, in
+	// mapping.Source().KeyColumnNames() order. It takes the same mapping as
+	// UpsertRows, so a subscription's deletes and upserts always address the
+	// same target. It returns the number of rows deleted.
+	DeleteKeys(ctx context.Context, mapping ColumnMapping, keys [][]any, locks []TableLock) (int64, error)
 
 	// UpsertRows writes each row so that the target row with its key ends
 	// up equal to its image, inserting it or replacing the existing row.

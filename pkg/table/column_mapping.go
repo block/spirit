@@ -1,6 +1,7 @@
 package table
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -308,17 +309,22 @@ func (m *ColumnMapping) Target() contract.Table {
 
 // AsColumnMapping returns m as a *ColumnMapping, for spirit code that
 // receives a contract.ColumnMapping but needs what the contract does not
-// carry (the source's MySQL column types, precomputed ordinals). A nil m, or
-// a nil *ColumnMapping, returns (nil, nil). Any other implementation is an
-// error: spirit's MySQL applier can only write through a mapping it built
-// from tables it read itself.
+// carry: the source's MySQL column types, its sharding column and hash, the
+// precomputed ordinals and the quoted target name. A non-nil result always
+// has a non-nil source and target table.
+//
+// A nil m, a nil *ColumnMapping, and any other implementation are errors:
+// spirit's MySQL applier can only write through a mapping it built from
+// tables it read itself.
 func AsColumnMapping(m contract.ColumnMapping) (*ColumnMapping, error) {
-	if m == nil {
-		return nil, nil
-	}
 	cm, ok := m.(*ColumnMapping)
-	if !ok {
+	switch {
+	case m == nil || (ok && cm == nil):
+		return nil, errors.New("column mapping is nil")
+	case !ok:
 		return nil, fmt.Errorf("column mapping is a %T, not a *table.ColumnMapping", m)
+	case cm.sourceTable == nil || cm.targetTable == nil:
+		return nil, errors.New("column mapping has no source or target table")
 	}
 	return cm, nil
 }

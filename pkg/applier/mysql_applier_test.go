@@ -462,7 +462,7 @@ func TestSingleTargetApplierDeleteKeys(t *testing.T) {
 		{int64(4)},
 	}
 
-	affectedRows, err := applier.DeleteKeys(t.Context(), targetTable, targetTable, keysToDelete, nil)
+	affectedRows, err := applier.DeleteKeys(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), keysToDelete, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), affectedRows)
 
@@ -543,7 +543,7 @@ func TestSingleTargetApplierDeleteKeysSeparatorInValues(t *testing.T) {
 		{"a-#-b"},
 		{"-#-"},
 	}
-	affectedRows, err := applier.DeleteKeys(t.Context(), targetTable, targetTable, keysToDelete, nil)
+	affectedRows, err := applier.DeleteKeys(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), keysToDelete, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), affectedRows)
 
@@ -565,7 +565,7 @@ func TestSingleTargetApplierDeleteKeysSeparatorInValues(t *testing.T) {
 	compositeTable := table.NewTableInfo(targetDB, target.DBName, "test_composite")
 	require.NoError(t, compositeTable.SetInfo(t.Context()))
 
-	affectedRows, err = applier.DeleteKeys(t.Context(), compositeTable, compositeTable,
+	affectedRows, err = applier.DeleteKeys(t.Context(), table.NewColumnMapping(compositeTable, compositeTable, nil),
 		[][]any{{"a-#-b", "c"}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affectedRows, "only ('a-#-b','c') must be deleted, not ('a','b-#-c')")
@@ -610,7 +610,7 @@ func TestSingleTargetApplierDeleteKeysEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delete with empty keys
-	affectedRows, err := applier.DeleteKeys(t.Context(), targetTable, targetTable, [][]any{}, nil)
+	affectedRows, err := applier.DeleteKeys(t.Context(), table.NewColumnMapping(targetTable, targetTable, nil), [][]any{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affectedRows)
 }
@@ -1368,7 +1368,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
 		[]contract.LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
-	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
+	_, err = applier.DeleteKeys(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
 		[][]any{{int64(1)}}, []contract.TableLock{lock, lock})
 	require.ErrorContains(t, err, "more than one table lock supplied for shard 0")
 
@@ -1377,7 +1377,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 		[]contract.LogicalRow{{RowImage: []any{int64(3), "Charlie"}}}, []contract.TableLock{lock})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affected)
-	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
+	_, err = applier.DeleteKeys(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
 		[][]any{{int64(2)}}, []contract.TableLock{lock})
 	require.NoError(t, err)
 
@@ -1394,7 +1394,7 @@ func TestSingleTargetApplierUnderLock(t *testing.T) {
 	_, err = applier.UpsertRows(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
 		[]contract.LogicalRow{{RowImage: []any{int64(4), "Dave"}}}, []contract.TableLock{otherLock})
 	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
-	_, err = applier.DeleteKeys(ctx, targetTable, targetTable,
+	_, err = applier.DeleteKeys(ctx, table.NewColumnMapping(targetTable, targetTable, nil),
 		[][]any{{int64(1)}}, []contract.TableLock{otherLock})
 	require.ErrorContains(t, err, "table lock 0 was not acquired on any target's connection")
 	require.NoError(t, otherLock.Close(ctx))
@@ -1530,7 +1530,7 @@ func TestUnderLockRejectsNilLock(t *testing.T) {
 	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
 		[]contract.LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{nil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
-	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{nil})
+	_, err = a.DeleteKeys(t.Context(), table.NewColumnMapping(tbl, tbl, nil), [][]any{{int64(1)}}, []contract.TableLock{nil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
 
 	// A nil *dbconn.TableLock in the interface is not == nil; it must be
@@ -1539,7 +1539,7 @@ func TestUnderLockRejectsNilLock(t *testing.T) {
 	_, err = a.UpsertRows(t.Context(), table.NewColumnMapping(tbl, tbl, nil),
 		[]contract.LogicalRow{{RowImage: []any{int64(1)}}}, []contract.TableLock{typedNil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
-	_, err = a.DeleteKeys(t.Context(), tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{typedNil})
+	_, err = a.DeleteKeys(t.Context(), table.NewColumnMapping(tbl, tbl, nil), [][]any{{int64(1)}}, []contract.TableLock{typedNil})
 	require.ErrorContains(t, err, "table lock 0 is nil")
 }
 
@@ -1560,40 +1560,34 @@ func (foreignMapping) ColumnPairs() (source, target []string) {
 }
 
 // TestStreamedWriteRequiresSpiritTables pins that MySQLApplier's
-// contract.StreamedChangesWriter methods refuse tables and mappings that are
-// not spirit's own (they need the source's MySQL column types), and a nil
-// source table or mapping, before writing anything: the applier here has no
-// usable connection, so reaching a write would fail differently. A nil
-// *table.TableInfo target counts as "same name as the source".
+// contract.StreamedChangesWriter methods refuse a mapping that is not spirit's
+// own (they need the source's MySQL column types), a nil mapping and an empty
+// *table.ColumnMapping, before writing anything: the applier here has no
+// usable connection, so reaching a write would fail differently.
 func TestStreamedWriteRequiresSpiritTables(t *testing.T) {
 	a, err := New([]Target{{DB: &sql.DB{}}}, NewApplierDefaultConfig())
 	require.NoError(t, err)
-	tbl := table.NewTableInfo(nil, "test", "t1")
-	tbl.Columns = []string{"id"}
-	tbl.KeyColumns = []string{"id"}
 	keys := [][]any{{int64(1)}}
 	rows := []contract.LogicalRow{{RowImage: []any{int64(1)}}}
-
-	_, err = a.DeleteKeys(t.Context(), foreignTable{}, tbl, keys, nil)
-	require.ErrorContains(t, err, "delete keys: source table test.foreign is a applier.foreignTable, not a *table.TableInfo")
-	_, err = a.DeleteKeys(t.Context(), tbl, foreignTable{}, keys, nil)
-	require.ErrorContains(t, err, "delete keys: target table test.foreign is a applier.foreignTable, not a *table.TableInfo")
-	_, err = a.DeleteKeys(t.Context(), nil, tbl, keys, nil)
-	require.EqualError(t, err, "delete keys: sourceTable is nil")
-	var nilTable *table.TableInfo
-	_, err = a.DeleteKeys(t.Context(), nilTable, tbl, keys, nil)
-	require.EqualError(t, err, "delete keys: sourceTable is nil")
-
-	_, err = a.UpsertRows(t.Context(), foreignMapping{}, rows, nil)
-	require.EqualError(t, err, "upsert rows: column mapping is a applier.foreignMapping, not a *table.ColumnMapping")
-	_, err = a.UpsertRows(t.Context(), nil, rows, nil)
-	require.EqualError(t, err, "upsert rows: mapping is nil")
 	var nilMapping *table.ColumnMapping
-	_, err = a.UpsertRows(t.Context(), nilMapping, rows, nil)
-	require.EqualError(t, err, "upsert rows: mapping is nil")
 
-	// The conversions come after the empty-batch shortcut, as before.
-	n, err := a.DeleteKeys(t.Context(), foreignTable{}, nil, nil, nil)
+	for _, tc := range []struct {
+		mapping contract.ColumnMapping
+		err     string
+	}{
+		{foreignMapping{}, "column mapping is a applier.foreignMapping, not a *table.ColumnMapping"},
+		{nil, "column mapping is nil"},
+		{nilMapping, "column mapping is nil"},
+		{&table.ColumnMapping{}, "column mapping has no source or target table"},
+	} {
+		_, err = a.DeleteKeys(t.Context(), tc.mapping, keys, nil)
+		require.EqualError(t, err, "delete keys: "+tc.err)
+		_, err = a.UpsertRows(t.Context(), tc.mapping, rows, nil)
+		require.EqualError(t, err, "upsert rows: "+tc.err)
+	}
+
+	// The conversion comes after the empty-batch shortcut, as before.
+	n, err := a.DeleteKeys(t.Context(), foreignMapping{}, nil, nil)
 	require.NoError(t, err)
 	require.Zero(t, n)
 	n, err = a.UpsertRows(t.Context(), foreignMapping{}, nil, nil)
@@ -1683,7 +1677,7 @@ func TestUnderLockSharedConnection(t *testing.T) {
 		{RowImage: []any{int64(4), "d"}},
 	}, []contract.TableLock{lock})
 	require.NoError(t, err)
-	_, err = a.DeleteKeys(ctx, tbl, tbl, [][]any{{int64(1)}}, []contract.TableLock{lock})
+	_, err = a.DeleteKeys(ctx, table.NewColumnMapping(tbl, tbl, nil), [][]any{{int64(1)}}, []contract.TableLock{lock})
 	require.NoError(t, err)
 	require.NoError(t, lock.Close(ctx))
 

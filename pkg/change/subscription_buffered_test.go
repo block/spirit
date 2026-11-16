@@ -2159,35 +2159,77 @@ func TestBufferedMapWideRowsFlushSplitsStatements(t *testing.T) {
 	require.Equal(t, srcSum, dstSum, "source and destination must match after a split flush")
 }
 
-// targetRecordingWriter records the targetTable each DeleteKeys call
-// receives.
-type targetRecordingWriter struct {
+// mappingRecordingWriter records the mapping each DeleteKeys and UpsertRows
+// call receives.
+type mappingRecordingWriter struct {
 	applier.MockApplier
-	targets []contract.Table
+	deleteMappings, upsertMappings []contract.ColumnMapping
 }
 
-func (w *targetRecordingWriter) DeleteKeys(_ context.Context, _, targetTable contract.Table, keys [][]any, _ []contract.TableLock) (int64, error) {
-	w.targets = append(w.targets, targetTable)
+func (w *mappingRecordingWriter) DeleteKeys(_ context.Context, mapping contract.ColumnMapping, keys [][]any, _ []contract.TableLock) (int64, error) {
+	w.deleteMappings = append(w.deleteMappings, mapping)
 	return int64(len(keys)), nil
 }
 
-// TestFlushPassesUntypedNilTargetForMoveFlow pins that a move-flow
-// subscription (no newTable) hands the writer an untyped nil targetTable.
-// A nil *table.TableInfo stored in a contract.Table is not == nil, so a
-// writer outside spirit that checks targetTable == nil for "same name as
-// sourceTable" would otherwise get a table it cannot read.
-func TestFlushPassesUntypedNilTargetForMoveFlow(t *testing.T) {
-	w := &targetRecordingWriter{}
+func (w *mappingRecordingWriter) UpsertRows(_ context.Context, mapping contract.ColumnMapping, rows []contract.LogicalRow, _ []contract.TableLock) (int64, error) {
+	w.upsertMappings = append(w.upsertMappings, mapping)
+	return int64(len(rows)), nil
+}
+
+// TestFlushWritesThroughChunkerMapping pins that a flush hands the writer the
+// chunker's column mapping for deletes as well as upserts, so both address
+// the same target table.
+func TestFlushWritesThroughChunkerMapping(t *testing.T) {
+	src := &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	dst := &table.TableInfo{SchemaName: "test", TableName: "_t1_new", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	mapping := table.NewColumnMapping(src, dst, nil)
+	chunker := table.NewMockChunker("t1", 1000)
+	chunker.SetColumnMapping(mapping)
+	w := &mappingRecordingWriter{}
 	sub, err := NewBufferedSubscription(BufferedSubscriptionConfig{
-		CurrentTable: &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}},
+		CurrentTable: src,
+		NewTable:     dst,
 		Applier:      w,
-		Chunker:      table.NewMockChunker("t1", 1000),
+		Chunker:      chunker,
 	})
 	require.NoError(t, err)
 	sub.HasChanged([]any{int64(1)}, []any{int64(1)}, true)
+	sub.HasChanged([]any{int64(2)}, []any{int64(2)}, false)
 	allFlushed, err := sub.Flush(t.Context(), false, nil)
 	require.NoError(t, err)
 	require.True(t, allFlushed)
-	require.Len(t, w.targets, 1)
-	require.True(t, w.targets[0] == nil, "targetTable must be an untyped nil, got %#v", w.targets[0]) //nolint:testifylint // require.Nil would accept a typed nil
+	require.Len(t, w.deleteMappings, 1)
+	require.Len(t, w.upsertMappings, 1)
+	require.Same(t, mapping, w.deleteMappings[0])
+	require.Same(t, mapping, w.upsertMappings[0])
+}
+
+// TestNewBufferedSubscriptionChecksChunkerMapping pins that the chunker's
+// column mapping must map CurrentTable onto NewTable, or onto CurrentTable
+// itself when NewTable is nil: the subscription flushes deletes and upserts
+// through it.
+func TestNewBufferedSubscriptionChecksChunkerMapping(t *testing.T) {
+	src := &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	dst := &table.TableInfo{SchemaName: "test", TableName: "_t1_new", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	other := &table.TableInfo{SchemaName: "test", TableName: "t2", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	build := func(newTable *table.TableInfo, mapping *table.ColumnMapping) error {
+		chunker := table.NewMockChunker("t1", 1000)
+		chunker.SetColumnMapping(mapping)
+		_, err := NewBufferedSubscription(BufferedSubscriptionConfig{
+			CurrentTable: src,
+			NewTable:     newTable,
+			Applier:      &applier.MockApplier{},
+			Chunker:      chunker,
+		})
+		return err
+	}
+
+	require.NoError(t, build(dst, table.NewColumnMapping(src, dst, nil)))
+	require.NoError(t, build(nil, table.NewColumnMapping(src, nil, nil)))
+	require.EqualError(t, build(dst, table.NewColumnMapping(other, dst, nil)),
+		"NewBufferedSubscription: chunker's column mapping reads test.t2, not CurrentTable test.t1")
+	require.EqualError(t, build(dst, table.NewColumnMapping(src, other, nil)),
+		"NewBufferedSubscription: chunker's column mapping writes test.t2, not test._t1_new")
+	require.EqualError(t, build(nil, table.NewColumnMapping(src, dst, nil)),
+		"NewBufferedSubscription: chunker's column mapping writes test._t1_new, not test.t1")
 }
