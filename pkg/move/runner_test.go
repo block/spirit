@@ -2166,7 +2166,8 @@ func TestMoveForcePreservesTargetOnSourceSideFailure(t *testing.T) {
 // All three states reach --force through one predicate
 // (isDefinitivelyUnresumable), so they share one checkpoint: each is planted in
 // turn and refused without --force, which changes nothing. Each refusal is
-// asserted to satisfy the predicate, and one --force run recovers from the last.
+// asserted to satisfy the predicate, and one --force run recovers from a
+// too-old checkpoint.
 func TestMoveForceRecoversUnresumableCheckpoint(t *testing.T) {
 	t.Parallel()
 	srcDB, sourceDB := testutils.CreateUniqueTestDatabase(t)
@@ -2256,7 +2257,10 @@ func TestMoveForceRecoversUnresumableCheckpoint(t *testing.T) {
 	}
 
 	// With --force: the definitive unresumable state falls through to
-	// wipe-and-restart.
+	// wipe-and-restart. Plant the too-old state again so this does not depend
+	// on which subtests -run selected (a valid checkpoint resumes even under
+	// --force).
+	testutils.RunSQL(t, "UPDATE "+dstDB+"."+checkpointTableName+" SET created_at = DATE_SUB(NOW(), INTERVAL 8 DAY)")
 	move.Force = true
 	r, err := NewRunner(move)
 	require.NoError(t, err)
