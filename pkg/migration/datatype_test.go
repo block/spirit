@@ -459,216 +459,177 @@ func TestEnumDropWithDroppedValueInData(t *testing.T) {
 	require.NoError(t, m.Close())
 }
 
-// TestEnumToVarchar verifies that ENUM → VARCHAR migrations correctly
-// decode binlog ordinals into element strings so that buffered replay
-// writes the original values (e.g. "active") to the new VARCHAR column
-// rather than the raw int64 ordinal that the go-mysql binlog reader
-// emits. Regression test for the gap reported in
-// ppe-schema-change-development on Slack (2026-05-19).
-func TestEnumToVarchar(t *testing.T) {
+// TestEnumSetTypeChange verifies that ENUM → VARCHAR, SET → VARCHAR and
+// ENUM → SET migrations decode the binlog wire format into element strings,
+// so that buffered replay writes the original values (e.g. "active",
+// "read,write") to the new column rather than the raw ENUM ordinal or SET
+// bitmask that the go-mysql binlog reader emits. Regression test for the gap
+// reported in ppe-schema-change-development on Slack (2026-05-19).
+//
+// Concurrent DML during the copy phase exercises the binlog replay path — the
+// bug only surfaces for rows that reach the target via the bufferedMap, not
+// via the chunker's SELECT. The initial checksum repairs a row the change feed
+// wrote wrongly, so the final values alone cannot show the decode bug: a
+// leaked ordinal or bitmask is visible as a confirmed difference.
+func TestEnumSetTypeChange(t *testing.T) {
 	t.Parallel()
-	tt := testutils.NewTestTable(t, "enumtovarchar", `CREATE TABLE enumtovarchar (
-		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		status ENUM('active', 'inactive', 'pending') NOT NULL
-	)`)
-	// Seed with every ENUM value so we can assert on the full mapping.
-	// SeedRows doubles every row in the table, so the rows are seeded once
-	// and then spread over the three values.
-	tt.SeedRows(t, "INSERT INTO enumtovarchar (status) SELECT 'active'", 3000)
-	testutils.RunSQL(t, "UPDATE enumtovarchar SET status = ELT(1 + id % 3, 'active', 'inactive', 'pending')")
-	ids := seededIDs(t, tt.DB, "enumtovarchar")
-
-	m := NewTestRunner(t, "enumtovarchar", "MODIFY COLUMN status VARCHAR(32) NOT NULL",
-		WithThreads(1),
-		WithTestThrottler())
-
-	// Concurrent DML during the copy phase exercises the binlog replay
-	// path — the bug we're regression-testing only surfaces for rows that
-	// reach the target via the bufferedMap, not via the chunker's SELECT.
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	dmlDone := make(chan struct{})
-	go func() {
-		defer close(dmlDone)
-		if !waitForCopyRows(t, ctx, m) {
-			return
-		}
-		for i := 1; i <= 100; i++ {
-			if ctx.Err() != nil {
-				return
+	type zeroRows struct{ where, msg string }
+	for _, tc := range []struct {
+		table  string
+		column string // the column under test is always named col
+		alter  string
+		// seed is the value SeedRows inserts. SeedRows doubles every row in
+		// the table, so a case that needs every ENUM value seeds one value
+		// and then spreads the rows over all of them with spread.
+		seed   string
+		spread string
+		// extra is a VALUES list inserted after the seed.
+		extra string
+		// dml returns the statements of one DML iteration. ids are the seeded
+		// primary keys: SeedRows leaves auto-increment gaps.
+		dml        func(ids []int64, i int) []string
+		iterations int
+		wantType   string
+		// zero lists WHERE clauses no row may match after the migration.
+		zero []zeroRows
+		// distinct is the number of distinct values that must survive, or 0.
+		distinct int
+	}{
+		{
+			table:  "enumtovarchar",
+			column: "col ENUM('active', 'inactive', 'pending') NOT NULL",
+			alter:  "MODIFY COLUMN col VARCHAR(32) NOT NULL",
+			seed:   "active",
+			spread: "ELT(1 + id % 3, 'active', 'inactive', 'pending')",
+			dml: func(ids []int64, i int) []string {
+				return []string{
+					`INSERT INTO enumtovarchar (col) VALUES ('active')`,
+					`INSERT INTO enumtovarchar (col) VALUES ('inactive')`,
+					`INSERT INTO enumtovarchar (col) VALUES ('pending')`,
+					fmt.Sprintf(`UPDATE enumtovarchar SET col = 'pending' WHERE id = %d`, ids[i-1]),
+					fmt.Sprintf(`UPDATE enumtovarchar SET col = 'inactive' WHERE id = %d`, ids[len(ids)/3+i]),
+					fmt.Sprintf(`UPDATE enumtovarchar SET col = 'active' WHERE id = %d`, ids[2*len(ids)/3+i]),
+				}
+			},
+			iterations: 100,
+			wantType:   "varchar",
+			zero: []zeroRows{
+				// ENUM ordinals would all be 1/2/3.
+				{"col IN ('1','2','3')", "binlog ENUM ordinals leaked into VARCHAR column"},
+				{"col NOT IN ('active','inactive','pending')", "every value must be one of the original element strings"},
+			},
+			distinct: 3,
+		},
+		{
+			table:  "settovarchar",
+			column: "col SET('read', 'write', 'execute') NOT NULL",
+			alter:  "MODIFY COLUMN col VARCHAR(64) NOT NULL",
+			seed:   "read,write",
+			extra:  "('read'),('write'),('execute'),('read,write,execute')",
+			dml: func(ids []int64, i int) []string {
+				return []string{
+					`INSERT INTO settovarchar (col) VALUES ('execute')`,
+					`INSERT INTO settovarchar (col) VALUES ('read,execute')`,
+					fmt.Sprintf(`UPDATE settovarchar SET col = 'read,write,execute' WHERE id = %d`, ids[i-1]),
+				}
+			},
+			iterations: 50,
+			wantType:   "varchar",
+			zero: []zeroRows{
+				// A leaked bitmask would render as a decimal string like "1", "3", "7".
+				{"col REGEXP '^[0-9]+$'", "binlog SET bitmask leaked into VARCHAR column"},
+			},
+		},
+		{
+			table:  "enumtoset_mig",
+			column: "col ENUM('active', 'inactive', 'pending') NOT NULL",
+			alter:  "MODIFY COLUMN col SET('active', 'inactive', 'pending') NOT NULL",
+			seed:   "active",
+			spread: "ELT(1 + id % 3, 'active', 'inactive', 'pending')",
+			dml: func(ids []int64, i int) []string {
+				return []string{
+					`INSERT INTO enumtoset_mig (col) VALUES ('active')`,
+					`INSERT INTO enumtoset_mig (col) VALUES ('inactive')`,
+					`INSERT INTO enumtoset_mig (col) VALUES ('pending')`,
+					fmt.Sprintf(`UPDATE enumtoset_mig SET col = 'pending' WHERE id = %d`, ids[i-1]),
+					fmt.Sprintf(`UPDATE enumtoset_mig SET col = 'inactive' WHERE id = %d`, ids[len(ids)/2+i]),
+				}
+			},
+			iterations: 100,
+			wantType:   "set(",
+			zero: []zeroRows{
+				// A failed decode would render as an integer-looking value, or
+				// the empty SET if an ordinal pointed at a missing element.
+				{"col NOT IN ('active','inactive','pending')", "every value must be one of the original element strings"},
+			},
+			distinct: 3,
+		},
+	} {
+		t.Run(tc.table, func(t *testing.T) {
+			t.Parallel()
+			tt := testutils.NewTestTable(t, tc.table, fmt.Sprintf(`CREATE TABLE %s (
+				id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+				%s
+			)`, tc.table, tc.column))
+			tt.SeedRows(t, fmt.Sprintf("INSERT INTO %s (col) SELECT '%s'", tc.table, tc.seed), 3000)
+			if tc.spread != "" {
+				testutils.RunSQL(t, fmt.Sprintf("UPDATE %s SET col = %s", tc.table, tc.spread))
 			}
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtovarchar (status) VALUES ('active')`)
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtovarchar (status) VALUES ('inactive')`)
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtovarchar (status) VALUES ('pending')`)
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'pending' WHERE id = %d`, ids[i-1]))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'inactive' WHERE id = %d`, ids[len(ids)/3+i]))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtovarchar SET status = 'active' WHERE id = %d`, ids[2*len(ids)/3+i]))
-		}
-	}()
-
-	require.NoError(t, m.Run(ctx))
-	cancel()
-	<-dmlDone
-	// The initial checksum repairs a row the change feed wrote wrongly, so
-	// the final values alone cannot show the decode bug: a leaked ordinal is
-	// visible as a confirmed difference.
-	requireNoConfirmedDifferences(t, m, "the checksum repaired rows: the change feed wrote a wrong value for an ENUM ordinal")
-	require.NoError(t, m.Close())
-
-	// The column must now be VARCHAR and the values must be the original
-	// element strings — not their integer ordinals.
-	var colType string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT column_type FROM information_schema.columns
-		 WHERE table_schema='test' AND table_name='enumtovarchar' AND column_name='status'`).Scan(&colType))
-	require.Contains(t, colType, "varchar")
-
-	// No row should have a numeric-looking status — that would mean the
-	// ordinal leaked through. Cast to numeric and look for any non-zero
-	// match; ENUM ordinals would all be 1/2/3.
-	var leaked int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM enumtovarchar WHERE status IN ('1','2','3')`).Scan(&leaked))
-	require.Zero(t, leaked, "binlog ENUM ordinals leaked into VARCHAR column")
-
-	// Every value should be one of the original element strings.
-	var nonString int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM enumtovarchar WHERE status NOT IN ('active','inactive','pending')`).Scan(&nonString))
-	require.Zero(t, nonString)
-
-	var distinct int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(DISTINCT status) FROM enumtovarchar`).Scan(&distinct))
-	require.Equal(t, 3, distinct, "every ENUM value must survive the migration")
-}
-
-// TestSetToVarchar verifies that SET → VARCHAR migrations decode the
-// bitmask wire format into a comma-joined element string. Companion to
-// TestEnumToVarchar.
-func TestSetToVarchar(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "settovarchar", `CREATE TABLE settovarchar (
-		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		perms SET('read', 'write', 'execute') NOT NULL
-	)`)
-	tt.SeedRows(t, "INSERT INTO settovarchar (perms) SELECT 'read,write'", 5000)
-	_, err := tt.DB.ExecContext(t.Context(), `INSERT INTO settovarchar (perms) VALUES ('read'),('write'),('execute'),('read,write,execute')`)
-	require.NoError(t, err)
-
-	m := NewTestRunner(t, "settovarchar", "MODIFY COLUMN perms VARCHAR(64) NOT NULL",
-		WithThreads(1),
-		WithTestThrottler())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	dmlDone := make(chan struct{})
-	go func() {
-		defer close(dmlDone)
-		if !waitForCopyRows(t, ctx, m) {
-			return
-		}
-		for i := 1; i <= 50; i++ {
-			if ctx.Err() != nil {
-				return
+			if tc.extra != "" {
+				testutils.RunSQL(t, fmt.Sprintf("INSERT INTO %s (col) VALUES %s", tc.table, tc.extra))
 			}
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO settovarchar (perms) VALUES ('execute')`)
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO settovarchar (perms) VALUES ('read,execute')`)
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE settovarchar SET perms = 'read,write,execute' WHERE id = %d`, i))
-		}
-	}()
+			ids := seededIDs(t, tt.DB, tc.table)
 
-	require.NoError(t, m.Run(ctx))
-	cancel()
-	<-dmlDone
-	require.NoError(t, m.Close())
+			m := NewTestRunner(t, tc.table, tc.alter,
+				WithThreads(1),
+				WithTestThrottler())
 
-	var colType string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT column_type FROM information_schema.columns
-		 WHERE table_schema='test' AND table_name='settovarchar' AND column_name='perms'`).Scan(&colType))
-	require.Contains(t, colType, "varchar")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
 
-	// No row should contain a numeric-looking bitmask value. Any bitmask
-	// leaking through would render as a decimal string like "1", "3", "7".
-	var leaked int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM settovarchar WHERE perms REGEXP '^[0-9]+$'`).Scan(&leaked))
-	require.Zero(t, leaked, "binlog SET bitmask leaked into VARCHAR column")
-}
+			dmlDone := make(chan struct{})
+			go func() {
+				defer close(dmlDone)
+				if !waitForCopyRows(t, ctx, m) {
+					return
+				}
+				for i := 1; i <= tc.iterations; i++ {
+					for _, stmt := range tc.dml(ids, i) {
+						if ctx.Err() != nil {
+							return
+						}
+						_, _ = tt.DB.ExecContext(ctx, stmt)
+					}
+				}
+			}()
 
-// TestEnumToSet verifies that ENUM → SET migrations work end-to-end.
-// Each ENUM ordinal decodes to a single-element string which the
-// destination SET column accepts unchanged. Companion to
-// TestEnumToVarchar; covers the same binlog replay path with a SET
-// target instead of VARCHAR.
-func TestEnumToSet(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "enumtoset_mig", `CREATE TABLE enumtoset_mig (
-		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		status ENUM('active', 'inactive', 'pending') NOT NULL
-	)`)
-	// SeedRows doubles every row in the table, so the rows are seeded once
-	// and then spread over the three values.
-	tt.SeedRows(t, "INSERT INTO enumtoset_mig (status) SELECT 'active'", 3000)
-	testutils.RunSQL(t, "UPDATE enumtoset_mig SET status = ELT(1 + id % 3, 'active', 'inactive', 'pending')")
-	ids := seededIDs(t, tt.DB, "enumtoset_mig")
+			require.NoError(t, m.Run(ctx))
+			cancel()
+			<-dmlDone
+			requireNoConfirmedDifferences(t, m, "the checksum repaired rows: the change feed wrote a wrong value for an ENUM ordinal or SET bitmask")
+			require.NoError(t, m.Close())
 
-	m := NewTestRunner(t, "enumtoset_mig",
-		"MODIFY COLUMN status SET('active', 'inactive', 'pending') NOT NULL",
-		WithThreads(1),
-		WithTestThrottler())
+			var colType string
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+				`SELECT column_type FROM information_schema.columns
+				 WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'col'`, tc.table).Scan(&colType))
+			require.Contains(t, colType, tc.wantType)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	dmlDone := make(chan struct{})
-	go func() {
-		defer close(dmlDone)
-		if !waitForCopyRows(t, ctx, m) {
-			return
-		}
-		for i := 1; i <= 100; i++ {
-			if ctx.Err() != nil {
-				return
+			for _, z := range tc.zero {
+				var n int
+				require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+					fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", tc.table, z.where)).Scan(&n))
+				require.Zero(t, n, z.msg)
 			}
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtoset_mig (status) VALUES ('active')`)
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtoset_mig (status) VALUES ('inactive')`)
-			_, _ = tt.DB.ExecContext(ctx, `INSERT INTO enumtoset_mig (status) VALUES ('pending')`)
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtoset_mig SET status = 'pending' WHERE id = %d`, ids[i-1]))
-			_, _ = tt.DB.ExecContext(ctx, fmt.Sprintf(`UPDATE enumtoset_mig SET status = 'inactive' WHERE id = %d`, ids[len(ids)/2+i]))
-		}
-	}()
 
-	require.NoError(t, m.Run(ctx))
-	cancel()
-	<-dmlDone
-	// The initial checksum repairs a row the change feed wrote wrongly, so
-	// the final values alone cannot show the decode bug.
-	requireNoConfirmedDifferences(t, m, "the checksum repaired rows: the change feed wrote a wrong value for an ENUM ordinal")
-	require.NoError(t, m.Close())
-
-	var colType string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT column_type FROM information_schema.columns
-		 WHERE table_schema='test' AND table_name='enumtoset_mig' AND column_name='status'`).Scan(&colType))
-	require.Contains(t, colType, "set(")
-
-	// Every row must hold one of the three known element strings. A
-	// failed decode would render as an integer-looking value, or the
-	// empty SET if an ordinal pointed at a missing element.
-	var bad int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM enumtoset_mig
-		 WHERE status NOT IN ('active','inactive','pending')`).Scan(&bad))
-	require.Zero(t, bad)
-
-	var distinct int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		`SELECT COUNT(DISTINCT status) FROM enumtoset_mig`).Scan(&distinct))
-	require.Equal(t, 3, distinct, "every ENUM value must survive the migration")
+			if tc.distinct > 0 {
+				var distinct int
+				require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+					fmt.Sprintf("SELECT COUNT(DISTINCT col) FROM %s", tc.table)).Scan(&distinct))
+				require.Equal(t, tc.distinct, distinct, "every ENUM value must survive the migration")
+			}
+		})
+	}
 }
 
 // seededIDs returns the table's primary keys in order. The INSERT ... SELECT
@@ -800,31 +761,6 @@ func TestBufferedMigrationFailsGracefullyWithMinimalRBR(t *testing.T) {
 // Spirit supports changing the datatype on a primary key column (e.g. INT→BIGINT)
 // as long as the primary key itself doesn't change (no ADD/DROP PRIMARY KEY).
 
-func TestAlterPKIntToBigInt(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "altpk_int2big", `CREATE TABLE altpk_int2big (
-		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		name varchar(255) NOT NULL,
-		val int NOT NULL DEFAULT 0
-	)`)
-	tt.SeedRows(t, "INSERT INTO altpk_int2big (name, val) SELECT 'a', 1", 3)
-
-	m := NewTestRunner(t, "altpk_int2big", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT")
-	require.NoError(t, m.Run(t.Context()))
-	require.False(t, m.usedInstantDDL)
-	require.NoError(t, m.Close())
-
-	var count int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM altpk_int2big").Scan(&count))
-	require.GreaterOrEqual(t, count, 3)
-
-	var colType string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		"SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='altpk_int2big' AND COLUMN_NAME='id'",
-	).Scan(&colType))
-	require.Equal(t, "bigint", colType)
-}
-
 func TestAlterPKIntToBigIntUnsigned(t *testing.T) {
 	t.Parallel()
 	tt := testutils.NewTestTable(t, "altpk_int2bigu", `CREATE TABLE altpk_int2bigu (
@@ -865,38 +801,89 @@ func TestAlterPKTinyIntToInt(t *testing.T) {
 	require.Equal(t, "int unsigned", colType)
 }
 
+// TestAlterPKIntToBigIntWithDML changes an AUTO_INCREMENT primary key from INT
+// to BIGINT, alone and together with another column's type, while DML runs
+// against the table during the copy. The checksum verifies the data; the test
+// asserts the copy path ran and the new column type.
 func TestAlterPKIntToBigIntWithDML(t *testing.T) {
 	t.Parallel()
-	tt := testutils.NewTestTable(t, "altpk_dml", `CREATE TABLE altpk_dml (
-		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		name varchar(255) NOT NULL,
-		val int NOT NULL DEFAULT 0
-	)`)
-	tt.SeedRows(t, "INSERT INTO altpk_dml (name, val) SELECT 'seed', 1", 4096)
-	m := NewTestRunner(t, "altpk_dml", "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT",
-		WithTestThrottler())
+	for _, tc := range []struct {
+		table, nameType, alter string
+		opts                   []RunnerOption
+		// dml returns the statements of one DML iteration. ids are the seeded
+		// primary keys: SeedRows leaves auto-increment gaps.
+		dml        func(ids []int64, i int) []string
+		iterations int
+		deletes    int // rows the DML deletes at most
+	}{
+		{
+			table:    "altpk_dml",
+			nameType: "varchar(255)",
+			alter:    "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT",
+			dml: func(ids []int64, i int) []string {
+				return []string{
+					fmt.Sprintf("INSERT INTO altpk_dml (name, val) VALUES ('dml_%d', %d)", i, i),
+					fmt.Sprintf("UPDATE altpk_dml SET val = val + 1 WHERE id = %d", ids[i]),
+					fmt.Sprintf("DELETE FROM altpk_dml WHERE id = %d", ids[len(ids)-1-i]),
+				}
+			},
+			iterations: 100,
+			deletes:    100,
+		},
+		{
+			table:    "altpk_multi",
+			nameType: "varchar(100)",
+			alter:    "MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT, MODIFY COLUMN name VARCHAR(255) NOT NULL",
+			opts:     []RunnerOption{WithThreads(2)},
+			dml: func(ids []int64, i int) []string {
+				return []string{
+					fmt.Sprintf("INSERT INTO altpk_multi (name, val) VALUES ('dml_%d', %d)", i, i),
+					fmt.Sprintf("UPDATE altpk_multi SET name = 'updated' WHERE id = %d", ids[i]),
+				}
+			},
+			iterations: 50,
+		},
+	} {
+		t.Run(tc.table, func(t *testing.T) {
+			t.Parallel()
+			tt := testutils.NewTestTable(t, tc.table, fmt.Sprintf(`CREATE TABLE %s (
+				id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+				name %s NOT NULL,
+				val int NOT NULL DEFAULT 0
+			)`, tc.table, tc.nameType))
+			tt.SeedRows(t, fmt.Sprintf("INSERT INTO %s (name, val) SELECT 'seed', 1", tc.table), 4096)
+			ids := seededIDs(t, tt.DB, tc.table)
+			m := NewTestRunner(t, tc.table, tc.alter, append(tc.opts, WithTestThrottler())...)
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		if !waitForCopyRows(t, t.Context(), m) {
-			return
-		}
-		for i := range 100 {
-			_, _ = tt.DB.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO altpk_dml (name, val) VALUES ('dml_%d', %d)", i, i))
-			_, _ = tt.DB.ExecContext(t.Context(), fmt.Sprintf("UPDATE altpk_dml SET val = val + 1 WHERE id = %d", i+1))
-			_, _ = tt.DB.ExecContext(t.Context(), fmt.Sprintf("DELETE FROM altpk_dml WHERE id = %d", i+4000))
-		}
-	})
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				if !waitForCopyRows(t, t.Context(), m) {
+					return
+				}
+				for i := range tc.iterations {
+					for _, stmt := range tc.dml(ids, i) {
+						_, _ = tt.DB.ExecContext(t.Context(), stmt)
+					}
+				}
+			})
 
-	require.NoError(t, m.Run(t.Context()))
-	wg.Wait()
-	require.NoError(t, m.Close())
+			require.NoError(t, m.Run(t.Context()))
+			wg.Wait()
+			require.False(t, m.usedInstantDDL)
+			require.NoError(t, m.Close())
 
-	var colType string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		"SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='altpk_dml' AND COLUMN_NAME='id'",
-	).Scan(&colType))
-	require.Equal(t, "bigint", colType)
+			var count int
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+				fmt.Sprintf("SELECT COUNT(*) FROM %s", tc.table)).Scan(&count))
+			require.GreaterOrEqual(t, count, len(ids)-tc.deletes)
+
+			var colType string
+			require.NoError(t, tt.DB.QueryRowContext(t.Context(),
+				"SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME='id'",
+				tc.table).Scan(&colType))
+			require.Equal(t, "bigint", colType)
+		})
+	}
 }
 
 func TestAlterPKCompositeDatatypeChange(t *testing.T) {
@@ -925,42 +912,6 @@ func TestAlterPKCompositeDatatypeChange(t *testing.T) {
 	var count int
 	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM altpk_comp").Scan(&count))
 	require.Equal(t, 200, count)
-}
-
-func TestAlterPKIntToBigIntWithDMLAndAdditionalColumnChange(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "altpk_multi", `CREATE TABLE altpk_multi (
-		id int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		name varchar(100) NOT NULL,
-		val int NOT NULL DEFAULT 0
-	)`)
-	tt.SeedRows(t, "INSERT INTO altpk_multi (name, val) SELECT 'seed', 1", 4096)
-
-	m := NewTestRunner(t, "altpk_multi",
-		"MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT, MODIFY COLUMN name VARCHAR(255) NOT NULL",
-		WithThreads(2),
-		WithTestThrottler())
-
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		if !waitForCopyRows(t, t.Context(), m) {
-			return
-		}
-		for i := range 50 {
-			_, _ = tt.DB.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO altpk_multi (name, val) VALUES ('dml_%d', %d)", i, i))
-			_, _ = tt.DB.ExecContext(t.Context(), fmt.Sprintf("UPDATE altpk_multi SET name = 'updated' WHERE id = %d", i+1))
-		}
-	})
-
-	require.NoError(t, m.Run(t.Context()))
-	wg.Wait()
-	require.NoError(t, m.Close())
-
-	var colType string
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(),
-		"SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='altpk_multi' AND COLUMN_NAME='id'",
-	).Scan(&colType))
-	require.Equal(t, "bigint", colType)
 }
 
 // TestSpatialGeneratedColumnAndIndex verifies that the parser accepts a combined

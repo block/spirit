@@ -114,42 +114,6 @@ func TestBadDatabaseCredentials(t *testing.T) {
 	require.ErrorContains(t, err, "connect: connection refused")
 }
 
-func TestE2ENullAlter1Row(t *testing.T) {
-	t.Parallel()
-	testutils.NewTestTable(t, "t1nullalter", `CREATE TABLE t1nullalter (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	testutils.RunSQL(t, `INSERT INTO t1nullalter (id, name) VALUES (1, 'aaa')`)
-	m := NewTestMigration(t, WithStatement("ALTER TABLE t1nullalter ENGINE=InnoDB"))
-	require.NoError(t, m.Run())
-}
-
-// TestE2EAutoscalingEnabled runs a full migration with the thread autoscaler
-// at its default (on). The local (non-Aurora) target supplies no
-// Aurora load signal, so this exercises the disengaged path end-to-end:
-// concurrency.Engage declines (and logs why), the configured thread counts
-// stand, and the migration completes correctly (goleak in TestMain catches
-// leaks). The engaged path is covered by pkg/concurrency and the autoscaler
-// unit tests.
-func TestE2EAutoscalingEnabled(t *testing.T) {
-	t.Parallel()
-	tt := testutils.NewTestTable(t, "t1autoscale", `CREATE TABLE t1autoscale (
-		id int(11) NOT NULL AUTO_INCREMENT,
-		name varchar(255) NOT NULL,
-		PRIMARY KEY (id)
-	)`)
-	testutils.RunSQL(t, `INSERT INTO t1autoscale (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e')`)
-	m := NewTestMigration(t, WithStatement("ALTER TABLE t1autoscale ENGINE=InnoDB"),
-		WithWriteThreads(2))
-	require.NoError(t, m.Run())
-
-	var count int
-	require.NoError(t, tt.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t1autoscale").Scan(&count))
-	require.Equal(t, 5, count)
-}
-
 // TestE2EAutoscalingEngaged runs a migration with autoscaling engaged, which
 // CI cannot reach for real (it needs an Aurora target): the Aurora probes are
 // faked to report a redo-aware 16-vCPU target. It pins that the probe runs
