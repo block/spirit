@@ -80,8 +80,8 @@ const (
 type settleVerdict int
 
 const (
-	// settleUnavailable means no verdict was reached: there is no feed, no
-	// change arrived inside the budget, the flush could not land it, or a
+	// settleUnavailable means no verdict was reached: there is no feed, the
+	// feed cannot park (it is not a change.ParkableSource), no change arrived inside the budget, the flush could not land it, or a
 	// change landed in the middle of the comparison. The caller defers the
 	// range exactly as it did before this path existed.
 	settleUnavailable settleVerdict = iota
@@ -189,6 +189,12 @@ func (s *rowSettler) settleRow(ctx, parent context.Context, snapshot *hotSnapsho
 			"chunk", chunk.String())
 		return settleUnavailable, nil
 	}
+	parker, ok := feed.(change.ParkableSource)
+	if !ok {
+		s.logger.Debug("lockless checksum: the owning source cannot park at a change; deferring",
+			"chunk", chunk.String())
+		return settleUnavailable, nil
+	}
 	want, err := binlogKey(ctx, db, chunk.Table, chunk.Key, row.key)
 	switch {
 	case parent.Err() != nil:
@@ -210,7 +216,7 @@ func (s *rowSettler) settleRow(ctx, parent context.Context, snapshot *hotSnapsho
 	defer cancel()
 
 	var verdict settleVerdict
-	err = feed.VerifyRowAtNextChange(rowCtx, change.RowWatch{
+	err = parker.VerifyRowAtNextChange(rowCtx, change.RowWatch{
 		Schema: chunk.Table.SchemaName,
 		Table:  chunk.Table.TableName,
 		Match:  matcher,

@@ -51,6 +51,8 @@ type parkingFeed struct {
 	watches []change.RowWatch
 }
 
+var _ change.ParkableSource = (*parkingFeed)(nil)
+
 func (f *parkingFeed) VerifyRowAtNextChange(ctx context.Context, watch change.RowWatch, verify change.RowVerifier) error {
 	f.mu.Lock()
 	f.watches = append(f.watches, watch)
@@ -288,6 +290,27 @@ func TestSettleHotSnapshotWithoutFeedIsUnavailable(t *testing.T) {
 	verdict, err := settleTestSettler(t, db, nil).settle(t.Context(), snapshot)
 	require.NoError(t, err)
 	require.Equal(t, settleUnavailable, verdict)
+}
+
+// TestSettleHotSnapshotWithoutParkingIsUnavailable: a feed that is not a
+// change.ParkableSource cannot hold its reader at the watched change, so there
+// is nothing to compare against. The range defers at once, without waiting out
+// the budget for a change it could not be shown.
+func TestSettleHotSnapshotWithoutParkingIsUnavailable(t *testing.T) {
+	db, chunk := snapshotTestTables(t, "id INT PRIMARY KEY, value INT", []string{"id"})
+	snapshotExec(t, db, "INSERT INTO src VALUES (1,10),(2,20)")
+	snapshotExec(t, db, "INSERT INTO dst VALUES (1,10),(2,99)")
+	snapshot := pendingSnapshot(t, db, chunk, 1)
+
+	feed := &change.MockSource{}
+	_, parks := change.Source(feed).(change.ParkableSource)
+	require.False(t, parks, "the double must not be able to park for this test to mean anything")
+	start := time.Now()
+	verdict, err := settleTestSettler(t, db, feed).settle(t.Context(), snapshot)
+	require.NoError(t, err)
+	require.Equal(t, settleUnavailable, verdict)
+	require.Less(t, time.Since(start), settleRowBudget, "nothing can arrive, so nothing is waited for")
+	require.Len(t, snapshot.pending, 1, "no row is verified")
 }
 
 // TestSettleHotSnapshotPropagatesCancellation: the settle path swallows every
@@ -699,6 +722,74 @@ func TestCheckHotSnapshotEscalatesOnlyWhenExhausted(t *testing.T) {
 	require.True(t, res.permanent, "no recopier configured, so a settled divergence is fatal")
 	require.Equal(t, uint64(1), c.hotChunksSettledThisPass.Load())
 	require.Equal(t, uint64(1), c.confirmedDifferences.Load(), "a settled divergence is a confirmed one")
+}
+
+// TestCheckHotSnapshotNotesAnUnparkableFeedOnce: from a feed that cannot park,
+// every hot range defers, and the per-range info line is the same one a quiet
+// row produces. The checker says why once, at the first escalation, so an
+// operator can tell that retrying will not help — and does not repeat it per
+// range. A feed that can park is not mentioned.
+func TestCheckHotSnapshotNotesAnUnparkableFeedOnce(t *testing.T) {
+	const notice = "lockless checksum: change feed cannot park, so its hot ranges will defer on every pass"
+	for _, parkable := range []bool{false, true} {
+		t.Run(fmt.Sprint("parkable=", parkable), func(t *testing.T) {
+			db, chunk := snapshotTestTables(t, "id INT PRIMARY KEY, value INT", []string{"id"})
+			snapshotExec(t, db, "INSERT INTO src VALUES (1,10),(2,20)")
+			snapshotExec(t, db, "INSERT INTO dst VALUES (1,10),(2,99)")
+			snapshot := pendingSnapshot(t, db, chunk, 1)
+
+			var feed change.Source = &change.MockSource{}
+			if parkable {
+				feed = &parkingFeed{} // parks, but no change arrives
+			}
+			logs := &settleLogRecorder{}
+			cfg := CheckerConfig{MaxHotAttempts: 1, Logger: slog.New(logs)}
+			applySharedDefaults(&cfg)
+			c := newLocklessChecker([]*sql.DB{db}, []*sql.DB{db}, nil, []change.Source{feed}, nil, &cfg)
+
+			for range 2 {
+				res := &workResult{item: &workItem{chunk: chunk}}
+				c.checkHotSnapshot(t.Context(), res, snapshot)
+				require.NoError(t, res.err)
+				require.True(t, res.deferHot)
+			}
+			want := 1
+			if parkable {
+				want = 0
+			}
+			require.Equal(t, want, logs.count(notice))
+		})
+	}
+}
+
+// settleLogRecorder counts log records by message.
+type settleLogRecorder struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (h *settleLogRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *settleLogRecorder) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.messages = append(h.messages, r.Message)
+	return nil
+}
+
+func (h *settleLogRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *settleLogRecorder) WithGroup(string) slog.Handler      { return h }
+
+func (h *settleLogRecorder) count(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, m := range h.messages {
+		if m == msg {
+			n++
+		}
+	}
+	return n
 }
 
 // TestLocklessSettlesHotChunkEndToEnd is the whole point of the escalation,

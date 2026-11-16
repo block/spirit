@@ -17,7 +17,7 @@ import (
 )
 
 // Compile-time assertion that the GTID-backed Client satisfies Source.
-var _ Source = (*gtidClient)(nil)
+var _ ParkableSource = (*gtidClient)(nil)
 
 // gtidClient is a change.Source that uses MySQL GTIDs as the resume
 // coordinate instead of (binlog-file, offset). It is selected automatically
@@ -837,7 +837,7 @@ func (c *gtidClient) blockWait(ctx context.Context, timeout time.Duration) error
 	}
 }
 
-// VerifyRowAtNextChange satisfies Source. The parker owns the ordering; all
+// VerifyRowAtNextChange satisfies ParkableSource. The parker owns the ordering; all
 // this supplies is the inner drain, which must not be Flush (see
 // RowParker.Verify).
 func (c *gtidClient) VerifyRowAtNextChange(ctx context.Context, watch RowWatch, verify RowVerifier) error {

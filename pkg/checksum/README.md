@@ -1223,7 +1223,8 @@ has to hold still.
 stream's own image of it, one row at a time:
 
 1. Ask the feed to wait for the next change to that row and park its reader
-   there (`change.Source.VerifyRowAtNextChange`). The change is buffered first and the reader parks
+   there (`change.ParkableSource.VerifyRowAtNextChange`; a feed that is not a
+   `ParkableSource` settles nothing, and the range defers). The change is buffered first and the reader parks
    immediately after, so nothing past that event is admitted.
 2. Drain the feed, so the target holds exactly that image. This is *not* the
    exported `Flush`, which ends in a `BlockWait` for the reader to reach the
