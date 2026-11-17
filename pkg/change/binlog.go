@@ -451,7 +451,11 @@ func (c *binlogClient) readStream(ctx context.Context) {
 				}
 
 				// Try to recreate the streamer
-				if recreateErr := c.recreateStreamer(); recreateErr != nil {
+				recreate := c.recreateStreamer
+				if c.recreateStreamerForTest != nil {
+					recreate = c.recreateStreamerForTest
+				}
+				if recreateErr := recreate(); recreateErr != nil {
 					c.logger.Error("Failed to recreate streamer", "error", recreateErr)
 
 					// Increase backoff duration for next attempt
@@ -460,9 +464,8 @@ func (c *binlogClient) readStream(ctx context.Context) {
 						backoffDuration = maxBackoffDuration
 					}
 				} else {
-					// Successfully recreated, reset counters
+					// Successfully recreated, reset consecutive error counter
 					consecutiveErrors = 0
-					recreateAttempts = 0
 					backoffDuration = initialBackoffDuration
 				}
 				lastErrorTime = currentTime
@@ -489,6 +492,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		recreateAttempts = 0
 		// Hold here if a verification has parked the reader. The event is
 		// already read but not acted on, so nothing is consumed and lost;
 		// dispatch resumes with it once the gate opens. See park.go.

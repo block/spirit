@@ -445,7 +445,11 @@ func (c *gtidClient) readStream(ctx context.Context) {
 					}
 				}
 
-				if recreateErr := c.recreateStreamer(); recreateErr != nil {
+				recreate := c.recreateStreamer
+				if c.recreateStreamerForTest != nil {
+					recreate = c.recreateStreamerForTest
+				}
+				if recreateErr := recreate(); recreateErr != nil {
 					c.logger.Error("Failed to recreate GTID streamer", "error", recreateErr)
 					backoffDuration *= backoffMultiplier
 					if backoffDuration > maxBackoffDuration {
@@ -453,7 +457,6 @@ func (c *gtidClient) readStream(ctx context.Context) {
 					}
 				} else {
 					consecutiveErrors = 0
-					recreateAttempts = 0
 					backoffDuration = initialBackoffDuration
 				}
 				lastErrorTime = currentTime
@@ -478,6 +481,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		recreateAttempts = 0
 		// Hold here if a verification has parked the reader. The event is
 		// already read but not acted on, so nothing is consumed and lost;
 		// dispatch resumes with it once the gate opens. See park.go.

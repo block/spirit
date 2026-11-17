@@ -80,7 +80,8 @@ type feedCore struct {
 	// goroutine itself and Start's write happens before it spawns that
 	// goroutine; writing streamer from any other goroutine while the reader
 	// runs would race.
-	streamer *replication.BinlogStreamer
+	streamer                *replication.BinlogStreamer
+	recreateStreamerForTest func() error
 
 	applier applier.StreamedChangesWriter
 
