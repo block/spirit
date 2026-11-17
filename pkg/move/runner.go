@@ -122,6 +122,9 @@ type tunables struct {
 	// reverseFeedFlushInterval is the reverse feed's periodic flush interval
 	// (defaultReverseFeedFlushInterval).
 	reverseFeedFlushInterval time.Duration
+	// reverseFeedProgressInterval is how often the reverse window logs the
+	// reverse feed's progress (defaultReverseFeedProgressInterval).
+	reverseFeedProgressInterval time.Duration
 	// reverseCutoverInitialBackoff and reverseCutoverMaxBackoff bound the
 	// wait between reverse cutover attempts
 	// (defaultReverseCutoverInitialBackoff, defaultReverseCutoverMaxBackoff).

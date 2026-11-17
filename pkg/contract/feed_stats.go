@@ -65,6 +65,44 @@ type FeedStats struct {
 	// "caught up" it is why the rendering floors at zero rather than showing a
 	// negative age.
 	BufferedEventAt time.Time
+	// FlushedEventAt is the source's commit timestamp on the newest change the
+	// feed has *applied*: BufferedEventAt as it stood when the buffered position
+	// was snapshotted for the most recent flush that applied every buffered
+	// change. It advances with the flushed position (Source.Position), so the
+	// gap between it and BufferedEventAt is what is read but not yet applied,
+	// and now minus it is how far behind the subscribed tables' destination
+	// is. Zero until such a flush completes in this process — a resumed feed
+	// does not know the commit time of the position it resumed from — and it
+	// stays put while flushes defer changes, for the same reason the flushed
+	// position does.
+	//
+	// Like BufferedEventAt, a timestamp says nothing on a source that has
+	// written no binlog events for a while: both ages grow while the feed is
+	// fully caught up. Read them with the position: an age that grows while
+	// the position stands still is an idle source, not a stalled feed —
+	// provided LastHeartbeatAt is recent.
+	FlushedEventAt time.Time
+	// LastReceivedAt is this host's clock when the reader last received
+	// anything from the source's binlog stream, heartbeats included. A stale
+	// one means the stream has stopped delivering (a hung connection) or the
+	// reader is parked. A recent one proves only that something arrived: a
+	// reconnect re-delivers housekeeping events, and a long transaction on an
+	// unsubscribed table delivers events without moving a GTID position. Zero
+	// before anything has been received.
+	LastReceivedAt time.Time
+	// LastHeartbeatAt is this host's clock when the reader last received a
+	// heartbeat, which the source sends only when the feed asked for them
+	// (change.ClientConfig.HeartbeatPeriod) and its dump thread has had
+	// nothing to send for that long: the reader has read everything the
+	// source has written. A recent one is positive evidence the reader is at
+	// the source's head. Zero before the first heartbeat, and always zero on a
+	// feed that did not ask for them.
+	LastHeartbeatAt time.Time
+	// LastCompleteFlushAt is this host's clock when a flush last applied every
+	// buffered change (the flushes that advance FlushedEventAt and the
+	// flushed position). It stays put while flushes defer changes. Zero until
+	// such a flush completes.
+	LastCompleteFlushAt time.Time
 	// Rotations counts binlog rotations the feed has followed. Duplicate
 	// rotate events (the server sends a real one and an artificial one
 	// carrying the same position) are counted once.

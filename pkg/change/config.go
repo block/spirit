@@ -3,6 +3,7 @@ package change
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
@@ -132,6 +133,15 @@ type ClientConfig struct {
 	// throttler during setup — a value captured at construction would be the
 	// wrong one.
 	UnderLoad func() bool
+
+	// HeartbeatPeriod, when positive, asks the source's dump thread to send a
+	// heartbeat whenever it has had nothing to send for this long
+	// (@source_heartbeat_period). The read loops record it as
+	// contract.FeedStats.LastHeartbeatAt and act on it no further. Zero (the
+	// default) requests none: the server sends no heartbeats to a dump that
+	// did not ask for them, and the SET that asks is one more statement that
+	// must succeed before the stream starts.
+	HeartbeatPeriod time.Duration
 }
 
 // resolveFlushConcurrency normalizes the FlushConcurrency knob for the

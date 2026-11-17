@@ -212,6 +212,7 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 
 	// Nothing flushed yet.
 	require.True(t, client.FeedStats().LastFlushAt.IsZero())
+	require.True(t, client.FeedStats().FlushedEventAt.IsZero(), "nothing applied yet")
 	require.Contains(t, StatusRow(client), "never flushed")
 
 	// The flush shape reaches the row from a real subscription rather than
@@ -241,6 +242,10 @@ func TestFeedStatsFromLiveFeed(t *testing.T) {
 	require.WithinDuration(t, time.Now(), stats.BufferedEventAt, time.Minute,
 		"a feed reading a live server is seconds behind, not hours")
 	require.Contains(t, StatusRow(client), " behind)")
+	// The flush applied every change it read, so the applied time is the read
+	// time as of the flush's snapshot: set, and never ahead of the reader.
+	require.False(t, stats.FlushedEventAt.IsZero(), "a complete flush must stamp the applied event time")
+	require.False(t, stats.FlushedEventAt.After(stats.BufferedEventAt), "nothing can be applied before it is read")
 	residual, flushes := client.FlushResidual()
 	require.Equal(t, 1, flushes)
 	require.Zero(t, residual, "the flush drained everything")
