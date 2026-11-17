@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/applier"
+	"github.com/block/spirit/pkg/change"
 	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/flags"
 	"github.com/block/spirit/pkg/testutils"
@@ -63,14 +66,16 @@ func messages(recs []progressRecord) []string {
 
 // sourceAt builds one source's progress as of now: read and applied are how
 // far behind now its newest read and applied events are (negative: none). The
-// stream last delivered something (a heartbeat, say) 5s ago; tests of a
-// stream that has stopped delivering override LastReceivedAt.
-func sourceAt(now time.Time, pos string, read, applied time.Duration, pending int, parked bool) ReverseSourceProgress {
+// stream last delivered a heartbeat 5s ago, and a flush last applied
+// everything 10s ago; tests about either override them.
+func sourceAt(now time.Time, pos string, read, applied time.Duration, pending int, parked bool) reverseSourceProgress {
 	s := contract.FeedStats{
-		BufferedPosition: pos,
-		IsParked:         parked,
-		LastFlushAt:      now.Add(-10 * time.Second),
-		LastReceivedAt:   now.Add(-5 * time.Second),
+		BufferedPosition:    pos,
+		IsParked:            parked,
+		LastFlushAt:         now.Add(-10 * time.Second),
+		LastCompleteFlushAt: now.Add(-10 * time.Second),
+		LastReceivedAt:      now.Add(-5 * time.Second),
+		LastHeartbeatAt:     now.Add(-5 * time.Second),
 	}
 	if read >= 0 {
 		s.BufferedEventAt = now.Add(-read)
@@ -78,7 +83,7 @@ func sourceAt(now time.Time, pos string, read, applied time.Duration, pending in
 	if applied >= 0 {
 		s.FlushedEventAt = now.Add(-applied)
 	}
-	return ReverseSourceProgress{Stats: s, Pending: pending}
+	return reverseSourceProgress{Stats: s, Pending: pending}
 }
 
 // TestReverseFeedProgressReport pins how each source is classified and how the
@@ -89,8 +94,8 @@ func TestReverseFeedProgressReport(t *testing.T) {
 	start := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	p := newReverseFeedProgress(labels, start)
 
-	sample := func(now time.Time, idlePos string) []ReverseSourceProgress {
-		return []ReverseSourceProgress{
+	sample := func(now time.Time, idlePos string) []reverseSourceProgress {
+		return []reverseSourceProgress{
 			sourceAt(now, "a:"+now.String(), 2*time.Second, 20*time.Second, 3, false), // at the head
 			sourceAt(now, "b:"+now.String(), time.Hour, -1, 500, true),                // far behind, nothing applied yet
 			sourceAt(now, "c:"+now.String(), 10*time.Minute, 12*time.Minute, 40, false),
@@ -130,29 +135,43 @@ func TestReverseFeedProgressReport(t *testing.T) {
 	require.Len(t, rep.worst(1), 1)
 }
 
-// receivedAgo returns src with the stream last delivering d before now, or
-// never (d < 0).
-func receivedAgo(src ReverseSourceProgress, now time.Time, d time.Duration) ReverseSourceProgress {
-	src.Stats.LastReceivedAt = time.Time{}
-	if d >= 0 {
-		src.Stats.LastReceivedAt = now.Add(-d)
+// ago returns now minus d, or the zero time (never) when d < 0.
+func ago(now time.Time, d time.Duration) time.Time {
+	if d < 0 {
+		return time.Time{}
 	}
+	return now.Add(-d)
+}
+
+// heartbeatAgo returns src with its last heartbeat d before now, or never
+// (d < 0). Ordinary delivery stays recent: a busy or reconnecting stream.
+func heartbeatAgo(src reverseSourceProgress, now time.Time, d time.Duration) reverseSourceProgress {
+	src.Stats.LastHeartbeatAt = ago(now, d)
+	src.Stats.LastReceivedAt = now
+	return src
+}
+
+// completeFlushAgo returns src with a flush last applying everything d before
+// now, or never (d < 0).
+func completeFlushAgo(src reverseSourceProgress, now time.Time, d time.Duration) reverseSourceProgress {
+	src.Stats.LastCompleteFlushAt = ago(now, d)
 	return src
 }
 
 // TestReverseFeedProgressIdleNeedsQuiet: an old event time with an unmoved
 // position is only idle when nothing is buffered, the reader is not parked —
 // a parked reader cannot move, and that is the stall the log is for — and the
-// stream has delivered something (a heartbeat, on a quiet source) within the
-// threshold. Without that delivery an unmoved position is as consistent with
-// a hung connection as with a quiet source, so it is reported behind.
+// source sent a heartbeat within the threshold. Ordinary delivery is not
+// enough: a reconnect loop re-delivers housekeeping events, and a long
+// transaction on an unsubscribed table delivers events without moving a GTID
+// position, so both are reported behind.
 func TestReverseFeedProgressIdleNeedsQuiet(t *testing.T) {
 	t.Parallel()
 	start := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	second := start.Add(time.Minute)
 	for _, tc := range []struct {
 		name    string
-		second  ReverseSourceProgress
+		second  reverseSourceProgress
 		pending int
 		want    reverseSourceState
 	}{
@@ -161,14 +180,15 @@ func TestReverseFeedProgressIdleNeedsQuiet(t *testing.T) {
 		{"parked", sourceAt(second, "p", time.Hour, time.Hour, 0, true), 0, reverseSourceBehind},
 		{"moved", sourceAt(second, "q", time.Hour, time.Hour, 0, false), 0, reverseSourceBehind},
 		{"nothing read", sourceAt(second, "p", -1, -1, 0, false), 0, reverseSourceIdle},
-		{"not receiving", receivedAgo(sourceAt(second, "p", time.Hour, time.Hour, 0, false), second, 2*time.Minute), 0, reverseSourceBehind},
-		{"never received", receivedAgo(sourceAt(second, "p", time.Hour, time.Hour, 0, false), second, -1), 0, reverseSourceBehind},
+		{"heartbeat at the threshold", heartbeatAgo(sourceAt(second, "p", time.Hour, time.Hour, 0, false), second, reverseFeedCaughtUpThreshold), 0, reverseSourceIdle},
+		{"heartbeat past the threshold", heartbeatAgo(sourceAt(second, "p", time.Hour, time.Hour, 0, false), second, reverseFeedCaughtUpThreshold+time.Second), 0, reverseSourceBehind},
+		{"events but no heartbeat", heartbeatAgo(sourceAt(second, "p", time.Hour, time.Hour, 0, false), second, -1), 0, reverseSourceBehind},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			p := newReverseFeedProgress([]string{"x"}, start)
-			p.report(start, []ReverseSourceProgress{sourceAt(start, "p", time.Hour, time.Hour, 0, false)})
-			rep := p.report(second, []ReverseSourceProgress{tc.second})
+			p.report(start, []reverseSourceProgress{sourceAt(start, "p", time.Hour, time.Hour, 0, false)})
+			rep := p.report(second, []reverseSourceProgress{tc.second})
 			require.Equal(t, tc.want, rep.sources[0].state)
 		})
 	}
@@ -189,21 +209,21 @@ func TestReverseFeedProgressLog(t *testing.T) {
 		labels[i] = fmt.Sprintf("host%d:3306/db", i)
 	}
 	p := newReverseFeedProgress(labels, start)
-	behindSample := func(now time.Time) []ReverseSourceProgress {
-		out := make([]ReverseSourceProgress, n)
+	behindSample := func(now time.Time) []reverseSourceProgress {
+		out := make([]reverseSourceProgress, n)
 		for i := range out {
 			out[i] = sourceAt(now, fmt.Sprintf("%d:%s", i, now), time.Duration(i+1)*time.Hour+1500*time.Millisecond, -1, 100, false)
 		}
 		return out
 	}
-	caughtUpSample := func(now time.Time) []ReverseSourceProgress {
-		out := make([]ReverseSourceProgress, n)
+	caughtUpSample := func(now time.Time) []reverseSourceProgress {
+		out := make([]reverseSourceProgress, n)
 		for i := range out {
 			out[i] = sourceAt(now, fmt.Sprintf("%d:%s", i, now), time.Second, 25*time.Second, 0, false)
 		}
 		return out
 	}
-	logAt := func(now time.Time, srcs []ReverseSourceProgress) []progressRecord {
+	logAt := func(now time.Time, srcs []reverseSourceProgress) []progressRecord {
 		p.log(logger, now, p.report(now, srcs))
 		return logs.take()
 	}
@@ -223,7 +243,9 @@ func TestReverseFeedProgressLog(t *testing.T) {
 	require.Equal(t, "7h0m2s", recs[1].attrs["read_behind"])
 	require.Equal(t, "unknown", recs[1].attrs["applied_behind"])
 	require.Equal(t, "10s ago", recs[1].attrs["last_flush"])
+	require.Equal(t, "10s ago", recs[1].attrs["last_complete_flush"])
 	require.Equal(t, "5s ago", recs[1].attrs["last_received"])
+	require.Equal(t, "5s ago", recs[1].attrs["last_heartbeat"])
 
 	now := start.Add(time.Minute)
 	recs = logAt(now, caughtUpSample(now))
@@ -240,6 +262,68 @@ func TestReverseFeedProgressLog(t *testing.T) {
 	recs = logAt(now, behindSample(now))
 	require.Equal(t, slog.LevelWarn, recs[len(recs)-1].level)
 	require.Equal(t, "reverse feed fell behind", recs[len(recs)-1].message)
+}
+
+// TestReverseFeedProgressCaughtUpNeedsApplied: a reader at the head is caught
+// up only if what it read has been applied — nothing pending, or a flush that
+// applied everything within reverseFeedAppliedThreshold. A rollback waits on
+// what is applied, so a reader whose flushes keep deferring is behind.
+func TestReverseFeedProgressCaughtUpNeedsApplied(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		src  reverseSourceProgress
+		want reverseSourceState
+	}{
+		{"nothing pending", completeFlushAgo(sourceAt(now, "p", 2*time.Second, 30*time.Minute, 0, false), now, -1), reverseSourceCaughtUp},
+		{"pending, recent complete flush", sourceAt(now, "p", 2*time.Second, 5*time.Second, 5000, false), reverseSourceCaughtUp},
+		{"pending, complete flush at the threshold", completeFlushAgo(sourceAt(now, "p", 2*time.Second, 5*time.Second, 5000, false), now, reverseFeedAppliedThreshold), reverseSourceCaughtUp},
+		{"pending, flushes deferring", completeFlushAgo(sourceAt(now, "p", 2*time.Second, 30*time.Minute, 5000, false), now, 30*time.Minute), reverseSourceBehind},
+		{"pending, never a complete flush", completeFlushAgo(sourceAt(now, "p", 2*time.Second, -1, 5000, false), now, -1), reverseSourceBehind},
+		{"read at the threshold", sourceAt(now, "p", reverseFeedCaughtUpThreshold, time.Minute, 0, false), reverseSourceCaughtUp},
+		{"read past the threshold", sourceAt(now, "p", reverseFeedCaughtUpThreshold+time.Second, time.Minute, 0, false), reverseSourceBehind},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rep := newReverseFeedProgress([]string{"a"}, now).report(now, []reverseSourceProgress{tc.src})
+			require.Equal(t, tc.want, rep.sources[0].state)
+			require.Equal(t, tc.want != reverseSourceBehind, rep.allCaughtUp())
+		})
+	}
+}
+
+// TestReverseFeedProgressEdges pins the small rules the other tests do not
+// reach: lag floors at zero when the source's clock is ahead, the median of an
+// even count is the lower middle, a source that has read nothing is the
+// slowest (in the summary and the per-source lines alike), and an unmoved
+// position needs a previous report before it can mean idle.
+func TestReverseFeedProgressEdges(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	future := sourceAt(now, "p", -1, -1, 0, false)
+	future.Stats.BufferedEventAt = now.Add(time.Minute)
+	ahead := newReverseFeedProgress([]string{"a"}, now).report(now, []reverseSourceProgress{future})
+	require.Zero(t, ahead.sources[0].readBehind, "a source clock ahead of ours reads as zero lag, not negative")
+	require.Equal(t, reverseSourceCaughtUp, ahead.sources[0].state)
+
+	even := newReverseFeedProgress([]string{"a", "b", "c", "d"}, now).report(now, []reverseSourceProgress{
+		sourceAt(now, "a", 10*time.Minute, -1, 1, false),
+		sourceAt(now, "b", 20*time.Minute, -1, 1, false),
+		sourceAt(now, "c", 30*time.Minute, -1, 1, false),
+		sourceAt(now, "d", 40*time.Minute, -1, 1, false),
+	})
+	require.Equal(t, 20*time.Minute, even.readBehindMedian, "lower middle of 10m, 20m, 30m, 40m")
+
+	unread := newReverseFeedProgress([]string{"ok", "unread"}, now).report(now, []reverseSourceProgress{
+		sourceAt(now, "p", 2*time.Second, 5*time.Second, 0, false),
+		sourceAt(now, "", -1, -1, 0, false),
+	})
+	require.Equal(t, "unread", unread.worst(1)[0].source)
+	require.Equal(t, "unread", unread.readSlowest, "the summary names the source the first per-source line names")
+	require.Equal(t, reverseSourceBehind, unread.sources[1].state,
+		"an empty position on the first report is not unmoved: there is no previous report")
 }
 
 func states(rep reverseFeedReport) []reverseSourceState {
@@ -375,4 +459,56 @@ func TestReverseWindowProgressWhileFeedStopped(t *testing.T) {
 	require.Equal(t, "true", stopped[0].attrs["restartable"].String())
 	require.Empty(t, sw.logs.matching("reverse feed progress"), "a stopped feed is not classified")
 	require.Empty(t, sw.logs.matching("reverse feed caught up"), "a stopped feed is never reported caught up")
+}
+
+// TestReverseWindowProgressRestartsWithTheFeed: a restarted feed resumes from
+// the checkpoint, so its catch-up is tracked from scratch — the caught-up line
+// is logged again once the new feed catches up, instead of the tracker carrying
+// the stopped feed's state over.
+func TestReverseWindowProgressRestartsWithTheFeed(t *testing.T) {
+	t.Parallel()
+	sw := newStoppedFeedWindow(t, time.Hour, tunables{
+		reverseWindowPollInterval:        2 * time.Millisecond,
+		reverseFeedProgressInterval:      2 * time.Millisecond,
+		reverseFeedRestartInitialBackoff: time.Millisecond,
+		reverseFeedRestartMaxBackoff:     time.Millisecond,
+	})
+	first := &ReverseFeed{logger: slog.Default()} // healthy, no sources: caught up at once
+	sw.feed = first
+	stopped := false
+	sw.restart = func(context.Context) error {
+		sw.recordRestart()
+		sw.feed = &ReverseFeed{logger: slog.Default()}
+		return nil
+	}
+	_ = sw.holdUntil(t, func() bool {
+		caughtUp := len(sw.logs.matching("reverse feed caught up"))
+		if caughtUp == 1 && !stopped {
+			stopped = true
+			first.onFatal(contract.FatalReasonFlushError)
+		}
+		return caughtUp >= 2
+	})
+	require.Len(t, sw.restarts(), 1)
+	require.Len(t, sw.logs.matching("reverse feed caught up"), 2, "once per feed")
+}
+
+// TestReverseFeedSourceProgress: sourceProgress reports every client, in the
+// configured order, with its stats and pending count; sourceLabels names them
+// in the same order as host:port/database.
+func TestReverseFeedSourceProgress(t *testing.T) {
+	t.Parallel()
+	a := &change.MockSource{FixedStats: contract.FeedStats{BufferedPosition: "a:1"}, DeltaLen: 3}
+	b := &change.MockSource{FixedStats: contract.FeedStats{BufferedPosition: "b:7"}, DeltaLen: 11}
+	got := (&ReverseFeed{clients: []change.Source{a, b}}).sourceProgress()
+	require.Equal(t, []reverseSourceProgress{
+		{Stats: contract.FeedStats{BufferedPosition: "a:1"}, Pending: 3},
+		{Stats: contract.FeedStats{BufferedPosition: "b:7"}, Pending: 11},
+	}, got)
+
+	w := &reverseWindow{r: &Runner{targets: []applier.Target{
+		{Config: &mysql.Config{Addr: "host-a:3306", DBName: "db_a"}},
+		{Config: &mysql.Config{Addr: "host-b:3306", DBName: "db_b"}},
+	}}}
+	require.Equal(t, []string{"host-a:3306/db_a", "host-b:3306/db_b"}, w.sourceLabels())
 }

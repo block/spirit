@@ -815,9 +815,7 @@ func (c *gtidClient) FeedStats() contract.FeedStats {
 	stats.Rotations = c.rotations.Load()
 	stats.BufferedEventAt = eventTime(&c.lastEventTime)
 	stats.FlushedEventAt = eventTime(&c.flushedEventTime)
-	if ns := c.lastReceived.Load(); ns != 0 {
-		stats.LastReceivedAt = time.Unix(0, ns)
-	}
+	c.fillLiveness(&stats)
 	// Already under c.mu, which is what guards bufferedGTID.
 	if c.bufferedGTID != nil && !c.bufferedGTID.IsEmpty() {
 		stats.BufferedPosition = c.bufferedGTID.String()

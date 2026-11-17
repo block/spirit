@@ -336,6 +336,9 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 			// budget) leaves the change feed's per-subscription default.
 			SubscriptionSoftLimitBytes: limits.softLimitBytes,
 			EventCacheCount:            limits.eventCacheCount,
+			// Heartbeats are how the progress log tells a quiet target from
+			// a stream that has stopped delivering; see reverseSourceIdle.
+			HeartbeatPeriod: reverseFeedHeartbeatPeriod,
 		}
 		// The captured start position's own encoding selects the change
 		// source implementation: it was captured by targetCurrentPosition in
@@ -523,13 +526,13 @@ func (rf *ReverseFeed) Positions() []string {
 	return out
 }
 
-// Progress returns each source's progress, in the same order as the configured
+// sourceProgress returns each source's progress, in the same order as the configured
 // sources, for the reverse window's periodic progress log. It does no server
 // I/O: every figure is the feed's in-memory state.
-func (rf *ReverseFeed) Progress() []ReverseSourceProgress {
-	out := make([]ReverseSourceProgress, len(rf.clients))
+func (rf *ReverseFeed) sourceProgress() []reverseSourceProgress {
+	out := make([]reverseSourceProgress, len(rf.clients))
 	for i, client := range rf.clients {
-		out[i] = ReverseSourceProgress{Stats: client.FeedStats(), Pending: client.GetDeltaLen()}
+		out[i] = reverseSourceProgress{Stats: client.FeedStats(), Pending: client.GetDeltaLen()}
 	}
 	return out
 }

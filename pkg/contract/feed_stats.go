@@ -80,18 +80,29 @@ type FeedStats struct {
 	// written no binlog events for a while: both ages grow while the feed is
 	// fully caught up. Read them with the position: an age that grows while
 	// the position stands still is an idle source, not a stalled feed —
-	// provided LastReceivedAt is recent.
+	// provided LastHeartbeatAt is recent.
 	FlushedEventAt time.Time
 	// LastReceivedAt is this host's clock when the reader last received
-	// anything from the source's binlog stream, including the heartbeats the
-	// source sends while it has nothing new (change.binlogHeartbeatPeriod).
-	// A heartbeat is only sent once the dump has caught up to the end of the
-	// source's binlog, so a recent LastReceivedAt with a position that stands
-	// still is positive evidence the reader is at the source's head; a stale
-	// one means the stream has stopped delivering (a hung connection, a
-	// reconnect loop) or the reader is parked. Zero before anything has been
-	// received.
+	// anything from the source's binlog stream, heartbeats included. A stale
+	// one means the stream has stopped delivering (a hung connection) or the
+	// reader is parked. A recent one proves only that something arrived: a
+	// reconnect re-delivers housekeeping events, and a long transaction on an
+	// unsubscribed table delivers events without moving a GTID position. Zero
+	// before anything has been received.
 	LastReceivedAt time.Time
+	// LastHeartbeatAt is this host's clock when the reader last received a
+	// heartbeat, which the source sends only when the feed asked for them
+	// (change.ClientConfig.HeartbeatPeriod) and its dump thread has had
+	// nothing to send for that long: the reader has read everything the
+	// source has written. A recent one is positive evidence the reader is at
+	// the source's head. Zero before the first heartbeat, and always zero on a
+	// feed that did not ask for them.
+	LastHeartbeatAt time.Time
+	// LastCompleteFlushAt is this host's clock when a flush last applied every
+	// buffered change (the flushes that advance FlushedEventAt and the
+	// flushed position). It stays put while flushes defer changes. Zero until
+	// such a flush completes.
+	LastCompleteFlushAt time.Time
 	// Rotations counts binlog rotations the feed has followed. Duplicate
 	// rotate events (the server sends a real one and an artificial one
 	// carrying the same position) are counted once.

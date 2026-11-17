@@ -1,11 +1,13 @@
 package change
 
 import (
+	"context"
 	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/stretchr/testify/require"
@@ -108,6 +110,7 @@ func TestBothClientsReportTheFlushedEventAge(t *testing.T) {
 		require.True(t, c.flushedAt().IsZero(), "%s: reading an event applies nothing", c.name)
 		require.NoError(t, c.flush())
 		require.Equal(t, first, c.flushedAt(), "%s: a complete flush applies what was read", c.name)
+		require.False(t, c.core.lastCompleteFlushAt.IsZero(), "%s: a complete flush is recorded", c.name)
 
 		// Stamped, not yet published: a flush now flushes the first
 		// coordinate, so it must record the first time.
@@ -122,30 +125,93 @@ func TestBothClientsReportTheFlushedEventAge(t *testing.T) {
 	}
 }
 
-// TestReadLoopHeartbeats: both clients ask the source for heartbeats, and the
-// read loops' received stamps liveness for every event — heartbeats included
-// — and reports a heartbeat so the loop skips it (its LogPos is the dump
-// thread's, not a position in the file being read).
+// TestReadLoopHeartbeats: heartbeats are requested only when the caller asks
+// (ClientConfig.HeartbeatPeriod), and the read loops' received stamps
+// LastReceivedAt for every event and LastHeartbeatAt for heartbeats alone, on
+// both clients, and reports a heartbeat so the loop skips it (its LogPos is the
+// dump thread's, not a position in the file being read).
 func TestReadLoopHeartbeats(t *testing.T) {
 	t.Parallel()
-	for name, cfg := range map[string]replication.BinlogSyncerConfig{
-		"binlog": (&binlogClient{feedCore: feedCore{subs: newSubscriptionRegistry()}}).buildSyncerConfig("127.0.0.1", 3306),
-		"gtid":   (&gtidClient{feedCore: feedCore{subs: newSubscriptionRegistry()}}).buildSyncerConfig("127.0.0.1", 3306),
-	} {
-		require.Equal(t, binlogHeartbeatPeriod, cfg.HeartbeatPeriod, "%s client must request heartbeats", name)
+	type client interface {
+		Source
+		buildSyncerConfig(host string, port uint16) replication.BinlogSyncerConfig
+		received(ev *replication.BinlogEvent) bool
 	}
+	constructors := map[string]func(*ClientConfig) client{
+		"binlog": func(cfg *ClientConfig) client {
+			return NewBinlogClient(nil, "127.0.0.1:3306", "u", "p", nil, cfg).(*binlogClient)
+		},
+		"gtid": func(cfg *ClientConfig) client {
+			return NewGTIDClient(nil, "127.0.0.1:3306", "u", "p", nil, cfg).(*gtidClient)
+		},
+	}
+	for name, newClient := range constructors {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			require.Zero(t, newClient(&ClientConfig{}).buildSyncerConfig("127.0.0.1", 3306).HeartbeatPeriod,
+				"no heartbeats unless asked for")
+			c := newClient(&ClientConfig{HeartbeatPeriod: 7 * time.Second})
+			require.Equal(t, 7*time.Second, c.buildSyncerConfig("127.0.0.1", 3306).HeartbeatPeriod)
 
-	c := &binlogClient{feedCore: feedCore{subs: newSubscriptionRegistry()}}
-	require.True(t, c.FeedStats().LastReceivedAt.IsZero(), "nothing received yet")
+			stats := c.FeedStats()
+			require.True(t, stats.LastReceivedAt.IsZero(), "nothing received yet")
+			require.True(t, stats.LastHeartbeatAt.IsZero(), "no heartbeat yet")
 
-	before := time.Now()
-	require.True(t, c.received(&replication.BinlogEvent{Header: &replication.EventHeader{LogPos: 999}, Event: &replication.HeartbeatEvent{}}),
-		"a heartbeat is skipped")
-	got := c.FeedStats().LastReceivedAt
-	require.False(t, got.Before(before), "a heartbeat stamps liveness")
-	require.Equal(t, mysql.Position{}, c.getBufferedPos(), "received publishes no position")
+			before := time.Now()
+			require.False(t, c.received(&replication.BinlogEvent{Header: &replication.EventHeader{}, Event: &replication.XIDEvent{}}),
+				"an ordinary event is processed")
+			stats = c.FeedStats()
+			require.False(t, stats.LastReceivedAt.Before(before), "an ordinary event stamps delivery")
+			require.True(t, stats.LastHeartbeatAt.IsZero(), "an ordinary event is not a heartbeat")
 
-	require.False(t, c.received(&replication.BinlogEvent{Header: &replication.EventHeader{}, Event: &replication.XIDEvent{}}),
-		"any other event is processed")
-	require.False(t, c.FeedStats().LastReceivedAt.Before(got))
+			require.True(t, c.received(&replication.BinlogEvent{Header: &replication.EventHeader{LogPos: 999}, Event: &replication.HeartbeatEvent{}}),
+				"a heartbeat is skipped")
+			stats = c.FeedStats()
+			require.False(t, stats.LastHeartbeatAt.Before(stats.LastReceivedAt), "a heartbeat stamps both")
+			require.False(t, stats.LastHeartbeatAt.Before(before))
+			require.Empty(t, stats.BufferedPosition, "received publishes no position")
+		})
+	}
+}
+
+// TestFlushThatDefersAdvancesNothing: a flush that leaves changes behind
+// advances neither FlushedEventAt nor LastCompleteFlushAt, on both clients —
+// the progress log reads both as "what has been applied", and a deferring
+// drain is exactly the case it must report as behind.
+func TestFlushThatDefersAdvancesNothing(t *testing.T) {
+	t.Parallel()
+	ts := time.Now().Add(-time.Hour).Truncate(time.Second)
+	empty, err := mysql.ParseMysqlGTIDSet("")
+	require.NoError(t, err)
+	gtid := &gtidClient{feedCore: feedCore{logger: slog.Default(), subs: newSubscriptionRegistry()}, bufferedGTID: empty}
+	binlog := &binlogClient{feedCore: feedCore{logger: slog.Default(), subs: newSubscriptionRegistry()}}
+	sid := make([]byte, 16)
+	sid[15] = 1
+	recordEventTime(&gtid.lastEventTime, uint32(ts.Unix()))
+	gtid.setBufferedGTID(sid, 1, ts.Unix())
+	recordEventTime(&binlog.lastEventTime, uint32(ts.Unix()))
+	binlog.setBufferedPos(mysql.Position{Name: "binlog.000001", Pos: 100})
+	for _, c := range []struct {
+		name  string
+		core  *feedCore
+		flush func() error
+		stats func() contract.FeedStats
+	}{
+		{"gtid", &gtid.feedCore, func() error { return gtid.flush(t.Context(), false, nil) }, gtid.FeedStats},
+		{"binlog", &binlog.feedCore, func() error { return binlog.flush(t.Context(), false, nil) }, binlog.FeedStats},
+	} {
+		require.True(t, c.core.subs.Add("deferring", &deferringStub{}))
+		require.NoError(t, c.flush())
+		stats := c.stats()
+		require.False(t, stats.LastFlushAt.IsZero(), "%s: the flush ran", c.name)
+		require.True(t, stats.FlushedEventAt.IsZero(), "%s: nothing is applied while a flush defers", c.name)
+		require.True(t, stats.LastCompleteFlushAt.IsZero(), "%s: a deferring flush is not complete", c.name)
+	}
+}
+
+// deferringStub is a subscription whose every flush leaves changes behind.
+type deferringStub struct{ stubSubscription }
+
+func (*deferringStub) Flush(context.Context, bool, []contract.TableLock) (bool, error) {
+	return false, nil
 }

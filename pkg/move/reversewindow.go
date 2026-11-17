@@ -259,7 +259,7 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					continue
 				}
 				now := time.Now()
-				progress.log(r.logger, now, progress.report(now, w.feed.Progress()))
+				progress.log(r.logger, now, progress.report(now, w.feed.sourceProgress()))
 			case <-checkpointTicker.C:
 				err := w.checkpointPositions(ctx)
 				if err == nil {

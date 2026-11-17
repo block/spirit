@@ -124,9 +124,11 @@ type feedCore struct {
 	lastEventTime atomic.Int64
 
 	// lastReceived is this host's clock (unix nanoseconds) when the read loop
-	// last got an event from the stream, heartbeats included. See
-	// contract.FeedStats.LastReceivedAt.
-	lastReceived atomic.Int64
+	// last got an event from the stream, heartbeats included, and
+	// lastHeartbeat when it last got a heartbeat. See
+	// contract.FeedStats.LastReceivedAt and LastHeartbeatAt.
+	lastReceived  atomic.Int64
+	lastHeartbeat atomic.Int64
 
 	// bufferedEventTime is the source timestamp of the newest event covered
 	// by the published buffered coordinate (bufferedPos / bufferedGTID).
@@ -163,6 +165,10 @@ type feedCore struct {
 	// each subscription's LastDrainHitBudget, to tell a backlog it can work
 	// through from one it cannot — see backlogWorthDraining.
 	lastFlushComplete bool
+	// lastCompleteFlushAt is when the most recent flush with
+	// lastFlushComplete set finished. See
+	// contract.FeedStats.LastCompleteFlushAt.
+	lastCompleteFlushAt time.Time
 
 	// periodicFlushLock protects the cancel/done pair below. The cancel
 	// signals the periodic-flush goroutine to exit; the done channel is
@@ -203,6 +209,9 @@ type feedCore struct {
 	// the two together set the rows a drain has in flight. See
 	// DefaultBatchSize.
 	batchSize int
+
+	// heartbeatPeriod is ClientConfig.HeartbeatPeriod; see buildSyncerConfig.
+	heartbeatPeriod time.Duration
 
 	// underLoad is ClientConfig.UnderLoad, handed to every subscription so the
 	// drain can narrow itself when the target is loaded. Nil disables it.
@@ -265,6 +274,7 @@ func (c *feedCore) configure(db *sql.DB, host, username, password string, appl a
 	c.flushConcurrency = config.resolveFlushConcurrency()
 	c.batchSize = config.resolveBatchSize()
 	c.underLoad = config.UnderLoad
+	c.heartbeatPeriod = config.HeartbeatPeriod
 	c.flushRequests = make(chan Subscription, 1)
 }
 
@@ -313,12 +323,6 @@ func (c *feedCore) AddSubscription(currentTableDesc, newTableDesc contract.Table
 	return nil
 }
 
-// binlogHeartbeatPeriod is how long the source's dump thread may have nothing
-// to send before it sends a heartbeat (@source_heartbeat_period). The
-// heartbeats are what let a quiet source be told apart from a stream that has
-// stopped delivering; see contract.FeedStats.LastReceivedAt.
-const binlogHeartbeatPeriod = 10 * time.Second
-
 // isHeartbeat reports whether ev is a heartbeat from the source's dump thread.
 // A heartbeat carries no change and no source timestamp, and its LogPos is the
 // dump thread's own position, which can name a different file than the one
@@ -329,12 +333,30 @@ func isHeartbeat(ev *replication.BinlogEvent) bool {
 }
 
 // received stamps lastReceived for ev, which the read loop has just taken off
-// the stream, and reports whether ev is a heartbeat, which the loop then skips.
-// Stamped before the reader can park, so the stamp is when the stream last
-// delivered, not when the loop last acted.
+// the stream, and lastHeartbeat too if ev is a heartbeat, and reports whether
+// it is one, which the loop then skips. Stamped before the reader can park, so
+// the stamps are when the stream last delivered, not when the loop last acted.
 func (c *feedCore) received(ev *replication.BinlogEvent) bool {
-	c.lastReceived.Store(time.Now().UnixNano())
-	return isHeartbeat(ev)
+	now := time.Now().UnixNano()
+	c.lastReceived.Store(now)
+	if !isHeartbeat(ev) {
+		return false
+	}
+	c.lastHeartbeat.Store(now)
+	return true
+}
+
+// fillLiveness sets the FeedStats fields that feedCore alone owns: when the
+// stream last delivered, when it last sent a heartbeat, and when a flush last
+// applied everything. The caller holds c.mu (for lastCompleteFlushAt).
+func (c *feedCore) fillLiveness(stats *contract.FeedStats) {
+	if ns := c.lastReceived.Load(); ns != 0 {
+		stats.LastReceivedAt = time.Unix(0, ns)
+	}
+	if ns := c.lastHeartbeat.Load(); ns != 0 {
+		stats.LastHeartbeatAt = time.Unix(0, ns)
+	}
+	stats.LastCompleteFlushAt = c.lastCompleteFlushAt
 }
 
 // GetDeltaLen returns the total number of changes
@@ -363,11 +385,10 @@ func (c *feedCore) buildSyncerConfig(host string, port uint16) replication.Binlo
 		// log; we report rotations on the status block instead. See
 		// syncerQuietMessages.
 		Logger: newDemotingLogger(c.logger, syncerQuietMessages),
-		// Ask the source to send a heartbeat whenever it has had nothing to
-		// send for this long. The read loops stamp it as liveness
-		// (feedCore.lastReceived) and act on it no further; see
-		// skipHeartbeat.
-		HeartbeatPeriod: binlogHeartbeatPeriod,
+		// Zero (the default) requests no heartbeats; see
+		// ClientConfig.HeartbeatPeriod. The read loops skip any that arrive
+		// (feedCore.received).
+		HeartbeatPeriod: c.heartbeatPeriod,
 		// Render JSON columns directly from the JSONB byte stream in the
 		// same textual form MySQL produces from SELECT json_col. The
 		// default decoder goes through Go intermediate values + json.Marshal
@@ -611,6 +632,9 @@ func (c *feedCore) recordFlush(start time.Time, batch int, complete bool) {
 	c.lastFlushDuration = time.Since(start)
 	c.lastFlushRows = batch
 	c.lastFlushComplete = complete
+	if complete {
+		c.lastCompleteFlushAt = c.lastFlushAt
+	}
 }
 
 // lastFlushWasComplete reports whether the most recent flush drained every

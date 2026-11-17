@@ -20,15 +20,27 @@ const defaultReverseFeedProgressInterval = time.Minute
 // clock skew between this host and the source.
 const reverseFeedCaughtUpThreshold = time.Minute
 
+// reverseFeedHeartbeatPeriod is how long a target's dump thread may have nothing
+// to send the reverse feed before it sends a heartbeat. Several heartbeats fit
+// in reverseFeedCaughtUpThreshold, so one lost or delayed heartbeat does not
+// make a quiet target read as behind.
+const reverseFeedHeartbeatPeriod = 10 * time.Second
+
+// reverseFeedAppliedThreshold is how long ago a flush must last have applied
+// everything buffered for a source with changes pending to count as caught up.
+// Room for one periodic flush (defaultReverseFeedFlushInterval), its drain,
+// and reverseFeedCaughtUpThreshold's clock skew.
+const reverseFeedAppliedThreshold = 2 * time.Minute
+
 // reverseFeedProgressWorst is how many lagging sources get a line of their own
 // in each progress report. A move can have over a hundred reverse sources, so
 // listing every one would bury the summary; the slowest few are the ones an
 // operator acts on.
 const reverseFeedProgressWorst = 5
 
-// ReverseSourceProgress is one reverse source's progress as ReverseFeed.Progress
+// reverseSourceProgress is one reverse source's progress as ReverseFeed.sourceProgress
 // reports it.
-type ReverseSourceProgress struct {
+type reverseSourceProgress struct {
 	// Stats is the source's change.Source.FeedStats.
 	Stats contract.FeedStats
 	// Pending is how many changes the source has read and not yet applied
@@ -41,16 +53,22 @@ type reverseSourceState string
 
 const (
 	// reverseSourceCaughtUp: the reader has read the source's binlog to
-	// within reverseFeedCaughtUpThreshold of the source's clock.
+	// within reverseFeedCaughtUpThreshold of the source's clock, and what it
+	// read has been applied: nothing is pending, or a flush applied
+	// everything buffered within reverseFeedAppliedThreshold. A reader at the
+	// head whose flushes keep deferring is behind: a rollback waits on what
+	// is applied, not on what is read.
 	reverseSourceCaughtUp reverseSourceState = "caught-up"
 	// reverseSourceIdle: the newest event read is older than the threshold,
 	// but the reader's position has not moved since the previous report,
-	// nothing is buffered or parked, and the stream delivered something
-	// (a heartbeat, on a quiet source) within the threshold. The source has
-	// written no binlog events in that time, so an old event time does not
-	// mean the reader is behind. Without the recent delivery, an unmoved
-	// position could equally be a stream that stopped delivering — a hung
-	// connection, a reconnect loop — and the source is reported behind.
+	// nothing is buffered or parked, and the source sent a heartbeat within
+	// the threshold. A heartbeat is sent only when the source's dump thread
+	// has had nothing to send for reverseFeedHeartbeatPeriod, so the reader
+	// has read everything the source has written, and an old event time does
+	// not mean it is behind. Ordinary events are not enough: a stream that
+	// reconnects in a loop re-delivers housekeeping events, and a long
+	// transaction on an unsubscribed table delivers events without moving a
+	// GTID position. Without a recent heartbeat the source is behind.
 	reverseSourceIdle reverseSourceState = "idle"
 	// reverseSourceBehind: everything else, including a reader that has not
 	// read an event yet on its first report.
@@ -78,9 +96,17 @@ type reverseSourceLag struct {
 	flushed   bool
 	// lastReceived is how long ago the stream last delivered anything,
 	// heartbeats included (FeedStats.LastReceivedAt); received is false
-	// before it has.
-	lastReceived time.Duration
-	received     bool
+	// before it has. lastHeartbeat/heartbeat are the same for heartbeats
+	// alone (FeedStats.LastHeartbeatAt).
+	lastReceived  time.Duration
+	received      bool
+	lastHeartbeat time.Duration
+	heartbeat     bool
+	// lastCompleteFlush is how long ago a flush last applied everything
+	// buffered (FeedStats.LastCompleteFlushAt); completeFlushed is false
+	// before one has.
+	lastCompleteFlush time.Duration
+	completeFlushed   bool
 }
 
 // reverseFeedReport is one progress report over every reverse source.
@@ -89,7 +115,8 @@ type reverseFeedReport struct {
 	// counts of each state.
 	caughtUp, idle, behind int
 	// readBehindMax/Median are over the sources that are not idle and have
-	// read an event; readSlowest names the source at the maximum.
+	// read an event. readSlowest names the furthest-behind source, as worst
+	// ranks them; empty when none is behind.
 	readBehindMax, readBehindMedian time.Duration
 	readSlowest                     string
 	readMeasured                    int
@@ -130,7 +157,7 @@ func (r reverseFeedReport) worst(n int) []reverseSourceLag {
 	return behind[:min(n, len(behind))]
 }
 
-// reverseFeedProgress turns successive ReverseFeed.Progress samples into
+// reverseFeedProgress turns successive ReverseFeed.sourceProgress samples into
 // progress reports and logs them. It keeps what a single sample cannot tell:
 // whether a source's position moved since the previous report (to tell an idle
 // source from a stalled one), and whether the feed was caught up at the
@@ -159,7 +186,7 @@ func newReverseFeedProgress(labels []string, now time.Time) *reverseFeedProgress
 
 // report classifies every source in srcs (in label order) as of now and
 // remembers their positions for the next report.
-func (p *reverseFeedProgress) report(now time.Time, srcs []ReverseSourceProgress) reverseFeedReport {
+func (p *reverseFeedProgress) report(now time.Time, srcs []reverseSourceProgress) reverseFeedReport {
 	var rep reverseFeedReport
 	var readAges []time.Duration
 	for i, src := range srcs {
@@ -183,12 +210,19 @@ func (p *reverseFeedProgress) report(now time.Time, srcs []ReverseSourceProgress
 		if !s.LastReceivedAt.IsZero() {
 			lag.lastReceived, lag.received = max(now.Sub(s.LastReceivedAt), 0), true
 		}
+		if !s.LastHeartbeatAt.IsZero() {
+			lag.lastHeartbeat, lag.heartbeat = max(now.Sub(s.LastHeartbeatAt), 0), true
+		}
+		if !s.LastCompleteFlushAt.IsZero() {
+			lag.lastCompleteFlush, lag.completeFlushed = max(now.Sub(s.LastCompleteFlushAt), 0), true
+		}
 		unmoved := p.sampled && i < len(p.prevRead) && s.BufferedPosition == p.prevRead[i]
-		live := lag.received && lag.lastReceived <= p.threshold
+		atHead := lag.heartbeat && lag.lastHeartbeat <= p.threshold
+		applied := src.Pending == 0 || (lag.completeFlushed && lag.lastCompleteFlush <= reverseFeedAppliedThreshold)
 		switch {
-		case lag.readKnown && lag.readBehind <= p.threshold:
+		case lag.readKnown && lag.readBehind <= p.threshold && applied:
 			lag.state = reverseSourceCaughtUp
-		case unmoved && live && src.Pending == 0 && !s.IsParked:
+		case unmoved && atHead && src.Pending == 0 && !s.IsParked:
 			lag.state = reverseSourceIdle
 		default:
 			lag.state = reverseSourceBehind
@@ -208,9 +242,7 @@ func (p *reverseFeedProgress) report(now time.Time, srcs []ReverseSourceProgress
 		if lag.state != reverseSourceIdle {
 			if lag.readKnown {
 				readAges = append(readAges, lag.readBehind)
-				if lag.readBehind >= rep.readBehindMax {
-					rep.readBehindMax, rep.readSlowest = lag.readBehind, lag.source
-				}
+				rep.readBehindMax = max(rep.readBehindMax, lag.readBehind)
 			}
 			if lag.appliedKnown {
 				rep.appliedBehindMax = max(rep.appliedBehindMax, lag.appliedBehind)
@@ -225,6 +257,12 @@ func (p *reverseFeedProgress) report(now time.Time, srcs []ReverseSourceProgress
 		rep.sources = append(rep.sources, lag)
 	}
 	p.sampled = true
+	// The same source the first "source behind" line names, so the summary
+	// and that line never disagree (worst puts a source that has read nothing
+	// ahead of one that is merely far behind).
+	if w := rep.worst(1); len(w) > 0 {
+		rep.readSlowest = w[0].source
+	}
 	rep.readMeasured = len(readAges)
 	if len(readAges) > 0 {
 		slices.Sort(readAges)
@@ -263,7 +301,9 @@ func (p *reverseFeedProgress) log(logger *slog.Logger, now time.Time, rep revers
 			"pending_changes", s.pending,
 			"parked", s.parked,
 			"last_flush", roundedAgo(s.lastFlush, s.flushed),
+			"last_complete_flush", roundedAgo(s.lastCompleteFlush, s.completeFlushed),
 			"last_received", roundedAgo(s.lastReceived, s.received),
+			"last_heartbeat", roundedAgo(s.lastHeartbeat, s.heartbeat),
 		)
 	}
 	switch caughtUp := rep.allCaughtUp(); {

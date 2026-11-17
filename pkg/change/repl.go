@@ -184,13 +184,10 @@ func recordEventTime(dst *atomic.Int64, headerTimestamp uint32) {
 	advanceUnixSeconds(dst, int64(headerTimestamp))
 }
 
-// advanceUnixSeconds moves dst forward to secs, and never backwards. A zero
-// secs is ignored, so dst stays zero ("nothing seen yet") until a real
-// timestamp arrives.
+// advanceUnixSeconds moves dst forward to secs, and never backwards. dst
+// starts at zero ("nothing seen yet") and every secs is >= 0, so a zero secs
+// never moves it.
 func advanceUnixSeconds(dst *atomic.Int64, secs int64) {
-	if secs == 0 {
-		return
-	}
 	for {
 		prev := dst.Load()
 		if secs <= prev {

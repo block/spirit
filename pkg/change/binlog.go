@@ -816,9 +816,7 @@ func (c *binlogClient) FeedStats() contract.FeedStats {
 	stats.ForcedRotations = c.flushedBinlogs.Load()
 	stats.BufferedEventAt = eventTime(&c.lastEventTime)
 	stats.FlushedEventAt = eventTime(&c.flushedEventTime)
-	if ns := c.lastReceived.Load(); ns != 0 {
-		stats.LastReceivedAt = time.Unix(0, ns)
-	}
+	c.fillLiveness(&stats)
 	// Already under c.mu, which is what guards bufferedPos.
 	if c.bufferedPos.Name != "" {
 		stats.BufferedPosition = formatBinlogPosition(c.bufferedPos)
