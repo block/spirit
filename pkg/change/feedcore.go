@@ -123,6 +123,14 @@ type feedCore struct {
 	// contract.FeedStats.BufferedEventAt.
 	lastEventTime atomic.Int64
 
+	// flushedEventTime is lastEventTime as it stood when the buffered position
+	// was snapshotted for the most recent flush that applied every change:
+	// the source's commit time of the newest change now applied. It advances
+	// with the flushed position, and like it, not at all while a flush defers
+	// changes. Unix seconds, written with advanceUnixSeconds; see
+	// contract.FeedStats.FlushedEventAt.
+	flushedEventTime atomic.Int64
+
 	// flushResidual is the pending-change count observed at the end of the
 	// most recent flush, and flushCount how many flushes have completed. Both
 	// guarded by mu. See Source.FlushResidual.

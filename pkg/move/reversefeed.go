@@ -422,6 +422,11 @@ func (rf *ReverseFeed) Restartable() bool {
 // Start opens every feed (StartFromPosition when a Position is set, else from
 // current head), switches it to change-only mode, and begins periodic flush.
 func (rf *ReverseFeed) Start(ctx context.Context) error {
+	// Start opens the sources one after another, and each open is a few round
+	// trips to its server, so with many sources it takes minutes. It does not
+	// wait for any source to catch up: that happens after it returns, and the
+	// reverse window's progress log reports it.
+	started := time.Now()
 	for i, client := range rf.clients {
 		var err error
 		if rf.sources[i].Position != "" {
@@ -444,6 +449,8 @@ func (rf *ReverseFeed) Start(ctx context.Context) error {
 		}
 		client.StartPeriodicFlush(ctx, rf.flushInt)
 	}
+	rf.logger.Info("reverse feed started; catching up from each source's start position",
+		"sources", len(rf.clients), "took", time.Since(started).Round(time.Millisecond).String())
 	return nil
 }
 
@@ -512,6 +519,17 @@ func (rf *ReverseFeed) Positions() []string {
 	out := make([]string, len(rf.clients))
 	for i, client := range rf.clients {
 		out[i] = client.Position()
+	}
+	return out
+}
+
+// Progress returns each source's progress, in the same order as the configured
+// sources, for the reverse window's periodic progress log. It does no server
+// I/O: every figure is the feed's in-memory state.
+func (rf *ReverseFeed) Progress() []ReverseSourceProgress {
+	out := make([]ReverseSourceProgress, len(rf.clients))
+	for i, client := range rf.clients {
+		out[i] = ReverseSourceProgress{Stats: client.FeedStats(), Pending: client.GetDeltaLen()}
 	}
 	return out
 }

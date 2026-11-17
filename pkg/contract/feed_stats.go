@@ -65,6 +65,22 @@ type FeedStats struct {
 	// "caught up" it is why the rendering floors at zero rather than showing a
 	// negative age.
 	BufferedEventAt time.Time
+	// FlushedEventAt is the source's commit timestamp on the newest change the
+	// feed has *applied*: BufferedEventAt as it stood when the buffered position
+	// was snapshotted for the most recent flush that applied every buffered
+	// change. It advances with the flushed position (Source.Position), so the
+	// gap between it and BufferedEventAt is what is read but not yet applied,
+	// and now minus it is how far behind the subscribed tables' destination
+	// is. Zero until such a flush completes in this process — a resumed feed
+	// does not know the commit time of the position it resumed from — and it
+	// stays put while flushes defer changes, for the same reason the flushed
+	// position does.
+	//
+	// Like BufferedEventAt, a timestamp says nothing on a source that has
+	// written no binlog events for a while: both ages grow while the feed is
+	// fully caught up. Read them with the position: an age that grows while
+	// the position stands still is an idle source, not a stalled feed.
+	FlushedEventAt time.Time
 	// Rotations counts binlog rotations the feed has followed. Duplicate
 	// rotate events (the server sends a real one and an artificial one
 	// carrying the same position) are counted once.

@@ -182,6 +182,22 @@ While the window is open the run reports the `reverseWindow` state. The reverse 
 
 A reverse feed that stops because a flush to the source failed (for example, the source refused new connections), or because a binlog stream failed, does **not** end the window. Neither changes the watched tables, so Move restarts the feed from its last checkpointed position and replays the changes it had not applied. Restarts are spaced by a backoff that doubles up to 30 seconds and resets once a restarted feed has stayed up for longer than a flush interval. A rollback requested while the feed is stopped is logged and waits until the feed is running again. Before it locks anything, a rollback also flushes the reverse feed. If the source still refuses the writes, or the backlog does not apply within `--cutover-lock-timeout`, the rollback is deferred and retried. A deferred rollback locks no tables and does not count against the retry limit. If the window elapses while the feed is stopped or the source is still behind, Move finalizes forward and logs that it discarded the pending rollback request.
 
+#### Reverse feed progress
+
+The run's periodic status block stops at cutover. While the window is open, Move logs the reverse feed's progress instead, once a minute:
+
+```
+msg="reverse feed progress" sources=128 caught_up=120 idle=2 behind=6 read_behind_max=2h14m0s read_behind_median=3s applied_behind_max=2h20m0s applied_unknown=1 pending_changes=214120 parked=1 slowest=host-b:3306/db_42_44
+msg="reverse feed source behind" source=host-b:3306/db_42_44 read_behind=2h14m0s applied_behind=unknown pending_changes=118000 parked=true last_flush="10s ago"
+```
+
+- `read_behind` is how far the reader is behind the source's clock: now, minus the commit time of the newest event it has read from that target's binlog. `applied_behind` is the same for the newest change written to the source's `_old` tables, and is what a rollback started now would be missing. It is `unknown` until the first flush in this process that applies everything buffered (a resumed window does not know the commit time of the position it resumed from).
+- A source is `caught-up` when `read_behind` is under a minute. It is `idle`, and left out of the lag figures, when its newest event is older than that but its position has not moved since the previous report and nothing is buffered or parked: the target has written no binlog events in that time.
+- `pending_changes` is what has been read and not yet applied. `parked` counts sources whose reader is held back because its buffer is full.
+- Up to five `reverse feed source behind` lines follow, slowest first. `reverse feed caught up` is logged once every source is caught up or idle, and `reverse feed fell behind` (a warning) if one falls behind again afterwards.
+
+The reverse feed also logs `reverse feed started` once every source's stream is open. It does not wait for the sources to catch up; the progress lines report that.
+
 #### Requesting a rollback
 
 A rollback is triggered out of band by creating a table named `_spirit_move_revert` on the **first target** database — the same database that holds the checkpoint. (The log line printed when the window opens names the exact host and database.) The window loop polls for the marker; on seeing it, Move:

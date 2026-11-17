@@ -747,6 +747,8 @@ func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []contra
 	batch := c.GetDeltaLen()
 	c.mu.Lock()
 	newFlushedPos := c.bufferedPos
+	// Taken with the snapshot it describes; see feedCore.flushedEventTime.
+	newFlushedEventTime := c.lastEventTime.Load()
 	c.mu.Unlock()
 	var allChangesFlushed = true
 	for _, subscription := range c.subs.Snapshot() {
@@ -782,6 +784,7 @@ func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []contra
 			c.flushedPos = newFlushedPos
 		}
 		c.mu.Unlock()
+		advanceUnixSeconds(&c.flushedEventTime, newFlushedEventTime)
 	}
 	c.recordFlush(start, batch, allChangesFlushed)
 	return nil
@@ -803,6 +806,7 @@ func (c *binlogClient) FeedStats() contract.FeedStats {
 	stats.Rotations = c.rotations.Load()
 	stats.ForcedRotations = c.flushedBinlogs.Load()
 	stats.BufferedEventAt = eventTime(&c.lastEventTime)
+	stats.FlushedEventAt = eventTime(&c.flushedEventTime)
 	// Already under c.mu, which is what guards bufferedPos.
 	if c.bufferedPos.Name != "" {
 		stats.BufferedPosition = formatBinlogPosition(c.bufferedPos)

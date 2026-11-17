@@ -724,6 +724,8 @@ func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []contract
 	batch := c.GetDeltaLen()
 	c.mu.Lock()
 	newFlushedGTID := c.bufferedGTID.Clone()
+	// Taken with the snapshot it describes; see feedCore.flushedEventTime.
+	newFlushedEventTime := c.lastEventTime.Load()
 	c.mu.Unlock()
 	allChangesFlushed := true
 	for _, subscription := range c.subs.Snapshot() {
@@ -749,6 +751,7 @@ func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []contract
 			c.flushedGTID = newFlushedGTID
 		}
 		c.mu.Unlock()
+		advanceUnixSeconds(&c.flushedEventTime, newFlushedEventTime)
 	}
 	c.recordFlush(start, batch, allChangesFlushed)
 	return nil
@@ -791,6 +794,7 @@ func (c *gtidClient) FeedStats() contract.FeedStats {
 	stats.LastFlushRows = c.lastFlushRows
 	stats.Rotations = c.rotations.Load()
 	stats.BufferedEventAt = eventTime(&c.lastEventTime)
+	stats.FlushedEventAt = eventTime(&c.flushedEventTime)
 	// Already under c.mu, which is what guards bufferedGTID.
 	if c.bufferedGTID != nil && !c.bufferedGTID.IsEmpty() {
 		stats.BufferedPosition = c.bufferedGTID.String()

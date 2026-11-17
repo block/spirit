@@ -214,6 +214,11 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 		defer ticker.Stop()
 		checkpointTicker := time.NewTicker(status.CheckpointDumpInterval)
 		defer checkpointTicker.Stop()
+		// The runner's status block stops at cutover, so this is the only
+		// periodic report of how far behind the reverse feed is.
+		progressTicker := time.NewTicker(cmp.Or(r.tunables.reverseFeedProgressInterval, defaultReverseFeedProgressInterval))
+		defer progressTicker.Stop()
+		progress := newReverseFeedProgress(w.sourceLabels(), time.Now())
 		// failedReverts counts reverse cutover attempts that failed before
 		// ownership moved (see errReverseCutoverAbandoned). After one, the
 		// next attempt waits until retryRevertAt, so a failing attempt does
@@ -248,6 +253,9 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-progressTicker.C:
+				now := time.Now()
+				progress.log(r.logger, now, progress.report(now, w.feed.Progress()))
 			case <-checkpointTicker.C:
 				err := w.checkpointPositions(ctx)
 				if err == nil {
@@ -630,6 +638,16 @@ func (w *reverseWindow) startReplacementFeed(ctx context.Context, stopped *Rever
 // recorded a condition after which rollback is no longer safe while it was
 // being closed; the window completes forward.
 var errReverseFeedNotRestartable = errors.New("reverse feed is no longer restartable")
+
+// sourceLabels names each reverse source for the progress log, in feed order
+// (the feed has one source per target): its host:port/database.
+func (w *reverseWindow) sourceLabels() []string {
+	labels := make([]string, len(w.r.targets))
+	for i, tgt := range w.r.targets {
+		labels[i] = tgt.Config.Addr + "/" + tgt.Config.DBName
+	}
+	return labels
+}
 
 func (w *reverseWindow) revertRequested(ctx context.Context) (bool, error) {
 	if w.readRevertMarker != nil {
