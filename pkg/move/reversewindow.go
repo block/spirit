@@ -553,6 +553,7 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 		DBConfig:      r.dbConfig,
 		Threads:       r.reverseWriteThreads,
 		FlushInterval: cmp.Or(r.tunables.reverseFeedFlushInterval, defaultReverseFeedFlushInterval),
+		MemoryBudget:  r.move.ReverseFeedMemoryBudget,
 	}
 	if sharded {
 		revTargets := make([]applier.Target, len(r.sources))

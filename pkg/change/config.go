@@ -79,6 +79,20 @@ type ClientConfig struct {
 	// DefaultSubscriptionSoftLimitChanges.
 	SubscriptionSoftLimitChanges int
 
+	// EventCacheCount sets go-mysql's BinlogSyncerConfig.EventCacheCount for
+	// this client: how many parsed binlog events the streamer may hold
+	// between the network reader and readStream. Zero or negative (the
+	// zero-value default) leaves go-mysql's own default, 10240 events.
+	//
+	// These events are held outside the subscription soft limits: they are
+	// parsed but not yet buffered, so a reader that is behind the server (or
+	// parked on a soft limit) holds a full cache of them on top of the
+	// buffered changes. One client's default cache is rarely a concern; a
+	// caller running many clients in one process (a reverse feed with one
+	// client per move target) sets a small value so the total does not scale
+	// with the number of clients at 10240 events each.
+	EventCacheCount int
+
 	// FlushConcurrency overrides DefaultFlushConcurrency for new
 	// subscriptions: the maximum number of applier batches a map-mode
 	// flush keeps in flight concurrently. Set to a negative value to

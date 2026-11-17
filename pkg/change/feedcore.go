@@ -168,6 +168,10 @@ type feedCore struct {
 	// DefaultSubscriptionSoftLimitChanges.
 	subscriptionSoftLimitChanges int
 
+	// eventCacheCount is ClientConfig.EventCacheCount, passed to the binlog
+	// syncer. Zero means go-mysql's default. See buildSyncerConfig.
+	eventCacheCount int
+
 	// flushConcurrency is the map-mode flush batch concurrency passed
 	// to each subscription on construction. See DefaultFlushConcurrency.
 	flushConcurrency int
@@ -235,6 +239,7 @@ func (c *feedCore) configure(db *sql.DB, host, username, password string, appl a
 	c.applier = appl
 	c.subscriptionSoftLimitBytes = softLimit
 	c.subscriptionSoftLimitChanges = softLimitChanges
+	c.eventCacheCount = max(config.EventCacheCount, 0) // <=0: go-mysql's default
 	c.flushConcurrency = config.resolveFlushConcurrency()
 	c.batchSize = config.resolveBatchSize()
 	c.underLoad = config.UnderLoad
@@ -336,6 +341,9 @@ func (c *feedCore) buildSyncerConfig(host string, port uint16) replication.Binlo
 		// binlog is dominated by spirit's own writes to the _new table; see
 		// newRowsEventDecodeFunc.
 		RowsEventDecodeFunc: newRowsEventDecodeFunc(c.subs, &c.stopped),
+		// Parsed events the streamer may hold ahead of readStream. Zero
+		// selects go-mysql's default (10240); see ClientConfig.EventCacheCount.
+		EventCacheCount: c.eventCacheCount,
 	}
 }
 
