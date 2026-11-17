@@ -219,6 +219,10 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 		// next attempt waits until retryRevertAt, so a failing attempt does
 		// not lock the targets again on the next tick.
 		failedReverts := 0
+		// deferredReverts counts attempts deferred because the source was not
+		// yet up to date (errReverseFeedNotCaughtUp); they take no lock and
+		// do not count against DBConfig.MaxRetries. For logs.
+		deferredReverts := 0
 		var retryRevertAt time.Time
 		revertBackoff := cmp.Or(r.tunables.reverseCutoverInitialBackoff, defaultReverseCutoverInitialBackoff)
 		// Restarts of a stopped feed are spaced out by retryRestartAt, which
@@ -367,6 +371,23 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					err := w.reverseCutover(ctx)
 					if err == nil {
 						return nil
+					}
+					if errors.Is(err, errReverseFeedNotCaughtUp) && ctx.Err() == nil {
+						// No lock was taken and nothing moved; the source is
+						// behind the targets. Wait for the feed, up to the
+						// deadline — the same bound as a revert requested
+						// while the feed is stopped.
+						if !time.Now().Before(deadline) {
+							r.logger.Error(fmt.Sprintf("reverse window elapsed before the reverse feed brought the source up to date; discarding the pending revert request (%s on %s) and completing forward: the source is behind the targets and cannot take traffic back",
+								revertMarkerName, revertLoc), "error", err.Error())
+							return w.completeForward(ctx)
+						}
+						deferredReverts++
+						r.logger.Warn("revert deferred: the reverse feed has not brought the source up to date; no lock was taken, and the reverse window will try again",
+							"deferrals", deferredReverts, "retry_in", revertBackoff, "deadline", deadline, "error", err.Error())
+						retryRevertAt = time.Now().Add(revertBackoff)
+						revertBackoff = min(revertBackoff*2, cmp.Or(r.tunables.reverseCutoverMaxBackoff, defaultReverseCutoverMaxBackoff))
+						continue
 					}
 					failedReverts++
 					if !w.mayRetryReverseCutover(ctx, err, failedReverts) {
@@ -580,13 +601,28 @@ func (w *reverseWindow) restartFeed(ctx context.Context) error {
 		w.feed = stopped
 		return err
 	}
-	if err := w.feed.Start(ctx); err != nil {
-		// Start closed the new feed. It reports no fatal condition, so keep
-		// the stopped one, whose Err makes the next tick retry.
-		w.feed = stopped
-		return fmt.Errorf("reverse window: restart feed: %w", err)
+	return w.startReplacementFeed(ctx, stopped)
+}
+
+// startReplacementFeed starts w.feed, built by restartFeed to replace
+// stopped. Start launches the sources one at a time, so when a later source
+// fails to start, an earlier one has already streamed and may have reported a
+// condition after which rollback is no longer safe; Start closes the new feed
+// either way. That verdict is kept — w.feed stays the new feed and
+// errReverseFeedNotRestartable sends the window to complete forward — rather
+// than discarded by putting back the stopped feed, whose own verdict is only
+// restartable. Otherwise the stopped feed goes back in place, and its Err
+// makes the next tick try again.
+func (w *reverseWindow) startReplacementFeed(ctx context.Context, stopped *ReverseFeed) error {
+	err := w.feed.Start(ctx)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if w.feed.Err() != nil && !w.feed.Restartable() {
+		return errReverseFeedNotRestartable
+	}
+	w.feed = stopped
+	return fmt.Errorf("reverse window: restart feed: %w", err)
 }
 
 // errReverseFeedNotRestartable is restartFeed's report that the stopped feed
@@ -643,6 +679,19 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 			w.feed.ResumePeriodicFlush(ctx)
 		}
 	}()
+
+	// Bring the source up to date before taking any lock. A feed that was
+	// just restarted, or that is still replaying a backlog, may not be able to
+	// apply its changes yet: the source can still be refusing them (the
+	// condition that stopped the feed), or the backlog can take longer to
+	// apply than the target locks may be held. Finding that out under the
+	// locks would block the targets' writes for each attempt and use up the
+	// attempts the window allows. Found out here, it costs no lock and no
+	// attempt (see errReverseFeedNotCaughtUp): the revert waits, bounded by
+	// the window's deadline. The drain under the locks (step 2) is then short.
+	if err := w.preDrainFeed(ctx); err != nil {
+		return abandonReverseCutover(err)
+	}
 
 	timing := newLockTiming(r.logger, "reverse cutover")
 	defer func() { timing.log(err) }()
@@ -843,6 +892,35 @@ func (w *reverseWindow) mayRetryReverseCutover(ctx context.Context, err error, f
 		!errors.Is(err, check.ErrRefused) &&
 		ctx.Err() == nil &&
 		failedReverts < w.r.dbConfig.MaxRetries
+}
+
+// errReverseFeedNotCaughtUp marks a reverse cutover attempt abandoned before it
+// took any lock because the reverse feed could not bring the source up to date
+// (see preDrainFeed). The source is behind, not wrong: the window waits and
+// tries again without counting the attempt against DBConfig.MaxRetries.
+var errReverseFeedNotCaughtUp = errors.New("the reverse feed has not brought the source up to date")
+
+// preDrainFeed flushes the reverse feed without holding any lock, bounded by
+// the cutover lock timeout: a backlog that takes longer than that to apply
+// would not fit under the locks either.
+func (w *reverseWindow) preDrainFeed(ctx context.Context) error {
+	timeout := w.r.move.cutoverLockTimeout()
+	drainCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := w.feed.Flush(drainCtx)
+	if err == nil {
+		err = w.feed.Err() // a feed that stopped meanwhile has not applied its changes
+	}
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(drainCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("reverse cutover: %w: flushing the backlog took longer than %s (--cutover-lock-timeout): %w", errReverseFeedNotCaughtUp, timeout, err)
+	}
+	return fmt.Errorf("reverse cutover: %w: %w", errReverseFeedNotCaughtUp, err)
 }
 
 // errReverseCutoverAbandoned marks a reverse cutover attempt that failed before

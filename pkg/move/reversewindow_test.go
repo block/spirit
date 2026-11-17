@@ -2192,3 +2192,108 @@ func TestMoveReverseWindowCancelAfterFeedRestart(t *testing.T) {
 	require.Equal(t, phaseReverseWindow, phase, "a cancelled window must stay resumable")
 	require.True(t, tableExists(t, ctl, "rwcr_src", "t1_old"), "the source stays retired")
 }
+
+// TestReverseWindowStartReplacementFeedKeepsUnsafeVerdict: Start launches the
+// sources one at a time, so a source that fails to start can follow one that
+// has already streamed and reported a condition after which rollback is no
+// longer safe. That verdict must survive the failed start; a failed start with
+// nothing unsafe reported puts the stopped feed back.
+func TestReverseWindowStartReplacementFeedKeepsUnsafeVerdict(t *testing.T) {
+	t.Parallel()
+	newFeed := func(reasons ...contract.FatalReason) *ReverseFeed {
+		rf := stoppedFeed(reasons...)
+		rf.clients = []change.Source{&change.MockSource{}, &change.MockSource{StartErr: errors.New("Error 1040: Too many connections")}}
+		rf.sources = []ReverseSource{{Position: "uuid:1-5"}, {Position: "uuid:1-7"}}
+		return rf
+	}
+	for _, tc := range []struct {
+		name     string
+		reported []contract.FatalReason // by the source that started, during Start
+		unsafe   bool
+	}{
+		{name: "schema change", reported: []contract.FatalReason{contract.FatalReasonSchemaChange}, unsafe: true},
+		{name: "stream error then XA", reported: []contract.FatalReason{contract.FatalReasonStreamError, contract.FatalReasonUnsupportedXA}, unsafe: true},
+		{name: "stream error", reported: []contract.FatalReason{contract.FatalReasonStreamError}},
+		{name: "nothing reported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			stopped := stoppedFeed(contract.FatalReasonFlushError)
+			fresh := newFeed(tc.reported...)
+			w := &reverseWindow{r: &Runner{logger: slog.Default()}, feed: fresh}
+			err := w.startReplacementFeed(t.Context(), stopped)
+			require.Error(t, err)
+			if tc.unsafe {
+				require.ErrorIs(t, err, errReverseFeedNotRestartable)
+				require.Same(t, fresh, w.feed, "the new feed's unsafe verdict must stay in place")
+				return
+			}
+			require.NotErrorIs(t, err, errReverseFeedNotRestartable)
+			require.Same(t, stopped, w.feed, "the stopped feed goes back, so the next tick tries again")
+		})
+	}
+}
+
+// TestMoveReverseWindowRevertWaitsForSourceToCatchUp: a revert requested while
+// the source still refuses the reverse feed's writes must wait, without using
+// up the reverse cutover's attempts (DBConfig.MaxRetries, 3 by default) and
+// without locking the targets, and run once the source accepts them. The
+// periodic flush is slow here, so it is mostly the reverse cutover's own
+// unlocked flush that finds the source refusing writes.
+func TestMoveReverseWindowRevertWaitsForSourceToCatchUp(t *testing.T) {
+	t.Parallel()
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcu_src", "rwcu_dst")
+	m := &Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		ReverseWindow: 5 * time.Minute,
+	}
+	runner, err := NewRunner(m)
+	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	runner.tunables.reverseFeedFlushInterval = 2 * time.Second
+	logs := &logCapture{}
+	runner.logger = slog.New(logs)
+	var locks atomic.Int32
+	runner.tunables.reverseCutoverUnderLockHook = func(context.Context) error { locks.Add(1); return nil }
+	runner.SetCutover(func(context.Context) error { return nil })
+	runner.SetReverseCutover(func(context.Context) error { return nil })
+
+	h := startRun(t, runner)
+	h.awaitReverseWindow(ctl, "rwcu_dst")
+
+	unlogged, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(unlogged)
+	execUnlogged := func(stmt string) {
+		t.Helper()
+		conn, err := unlogged.Conn(t.Context())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(conn)
+		_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+	execUnlogged("ALTER TABLE rwcu_src.t1_old ADD CONSTRAINT rwcu_id_small CHECK (id < 100)")
+	testutils.RunSQL(t, "INSERT INTO rwcu_dst.t1 (id, val) VALUES (500, 'too big for _old')")
+	testutils.RunSQL(t, "CREATE TABLE rwcu_dst."+revertMarkerName+" (id INT)")
+
+	const deferrals = 5 // more than DBConfig.MaxRetries
+	h.poll(time.Now().Add(waitTimeout), func() bool {
+		return len(logs.matching("revert deferred: the reverse feed has not brought the source up to date")) >= deferrals
+	}, func() string {
+		return fmt.Sprintf("%d deferred reverts; got %d", deferrals,
+			len(logs.matching("revert deferred: the reverse feed has not brought the source up to date")))
+	})
+	require.Zero(t, locks.Load(), "a revert the source is not ready for must not lock the targets")
+
+	execUnlogged("ALTER TABLE rwcu_src.t1_old DROP CHECK rwcu_id_small")
+	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete once the source accepts the reverse feed's writes")
+	require.Positive(t, locks.Load())
+	require.True(t, tableExists(t, ctl, "rwcu_src", "t1"), "source should be un-retired")
+	var val string
+	require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT val FROM rwcu_src.t1 WHERE id=500").Scan(&val))
+	require.Equal(t, "too big for _old", val, "the change the feed failed on must reach the source before traffic returns")
+}
