@@ -14,12 +14,14 @@ package move
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -400,4 +402,34 @@ func TestReverseFeedAllChangesFlushed(t *testing.T) {
 		"one feed still holding changes must fail the check")
 	require.False(t, (&ReverseFeed{clients: []change.Source{stuck, clean}}).AllChangesFlushed(),
 		"order must not matter")
+}
+
+// TestReverseFeedRestartable pins which fatal conditions leave a reverse feed
+// restartable: only those that leave the watched tables unchanged.
+func TestReverseFeedRestartable(t *testing.T) {
+	t.Parallel()
+	healthy := &ReverseFeed{logger: slog.Default()}
+	require.False(t, healthy.Restartable(), "a healthy feed has nothing to restart")
+
+	for _, tc := range []struct {
+		reason      contract.FatalReason
+		restartable bool
+	}{
+		{contract.FatalReasonFlushError, true},
+		{contract.FatalReasonStreamError, true},
+		{contract.FatalReasonSchemaChange, false},
+		{contract.FatalReasonUnsupportedXA, false},
+		{contract.FatalReasonLogPosWrapped, false},
+	} {
+		t.Run(tc.reason.String(), func(t *testing.T) {
+			t.Parallel()
+			rf := &ReverseFeed{logger: slog.Default()}
+			require.True(t, rf.onFatal(tc.reason))
+			require.Error(t, rf.Err())
+			require.Equal(t, tc.restartable, rf.Restartable())
+			// Only the first condition counts.
+			rf.onFatal(contract.FatalReasonSchemaChange)
+			require.Equal(t, tc.restartable, rf.Restartable())
+		})
+	}
 }

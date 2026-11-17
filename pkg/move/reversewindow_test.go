@@ -62,6 +62,8 @@ func setupReverseWindowMove(t *testing.T, srcDBName, dstDBName string) (sourceDS
 func shortenReverseWindowPolling(r *Runner) {
 	r.tunables.reverseWindowPollInterval = 100 * time.Millisecond
 	setReverseCutoverBackoff(r, 100*time.Millisecond)
+	r.tunables.reverseFeedRestartInitialBackoff = 100 * time.Millisecond
+	r.tunables.reverseFeedRestartMaxBackoff = 100 * time.Millisecond
 }
 
 // setReverseCutoverBackoff sets the wait between r's reverse cutover attempts
@@ -1482,7 +1484,7 @@ type fatalReasonState struct {
 }
 
 func (h *fatalReasonRecorder) Handle(ctx context.Context, rec slog.Record) error {
-	if rec.Message == "reverse feed fatal; source can no longer be trusted for rollback" {
+	if rec.Message == "reverse feed fatal" {
 		rec.Attrs(func(a slog.Attr) bool {
 			if a.Key == "reason" {
 				h.state.mu.Lock()
@@ -1509,17 +1511,21 @@ func (s *fatalReasonState) snapshot() []string {
 	return append([]string(nil), s.reasons...)
 }
 
-// TestMoveReverseWindowFlushErrorCompletesForward pins what a failed reverse
-// feed flush does to the window. The feed reports it as fatal, and the move
-// stops holding the window and completes forward at once: rollback is no
-// longer offered, because the source's _old tables no longer receive the
-// target's writes. The window is 5 minutes, so a run that returns within the
-// wait below did not wait it out.
+// TestMoveReverseWindowFlushErrorRestartsFeed pins what a failed reverse feed
+// flush does to the window. The flush failure stops the feed, but it changes
+// nothing the source's _old tables or the checkpoint depend on: the failed
+// changes were not applied and the flushed position did not move past them.
+// So the window stays open and restarts the feed from its last checkpointed
+// position, again and again while the cause persists. Once the cause is gone,
+// the restarted feed applies the change it failed on, and a revert requested
+// then rolls back with that change on the source. Completing forward here
+// instead would turn a transient apply failure on the source (a connection
+// limit, a failover) into a move that can no longer be rolled back.
 //
 // The flush is made to fail with a CHECK constraint added to the source's _old
 // table with sql_log_bin=0. Without binary logging the reverse feed does not
 // see the DDL (it would otherwise report a schema change, not a flush error).
-func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
+func TestMoveReverseWindowFlushErrorRestartsFeed(t *testing.T) {
 	t.Parallel()
 	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwfe_src", "rwfe_dst")
 
@@ -1535,9 +1541,9 @@ func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
 	runner.tunables.reverseFeedFlushInterval = 100 * time.Millisecond
 	recorder := &fatalReasonState{}
 	runner.logger = slog.New(&fatalReasonRecorder{Handler: slog.Default().Handler(), state: recorder})
-	var reverseCutoverCalled bool
+	var reverseCutoverCalled atomic.Bool
 	runner.SetCutover(func(context.Context) error { return nil })
-	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled = true; return nil })
+	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled.Store(true); return nil })
 
 	h := startRun(t, runner)
 	h.awaitReverseWindow(ctl, "rwfe_dst")
@@ -1545,25 +1551,53 @@ func TestMoveReverseWindowFlushErrorCompletesForward(t *testing.T) {
 	unlogged, err := sql.Open("block-mysql", testutils.DSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(unlogged)
-	conn, err := unlogged.Conn(t.Context())
-	require.NoError(t, err)
-	_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
-	require.NoError(t, err)
-	_, err = conn.ExecContext(t.Context(), "ALTER TABLE rwfe_src.t1_old ADD CONSTRAINT rwfe_id_small CHECK (id < 100)")
-	require.NoError(t, err)
-	utils.CloseAndLog(conn)
+	execUnlogged := func(stmt string) {
+		t.Helper()
+		conn, err := unlogged.Conn(t.Context())
+		require.NoError(t, err)
+		defer utils.CloseAndLog(conn)
+		_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+	execUnlogged("ALTER TABLE rwfe_src.t1_old ADD CONSTRAINT rwfe_id_small CHECK (id < 100)")
 
 	// A target write the reverse feed cannot apply to the source.
 	testutils.RunSQL(t, "INSERT INTO rwfe_dst.t1 (id, val) VALUES (500, 'too big for _old')")
 
-	h.awaitDone(waitTimeout, "the move to complete forward after the reverse feed's flush failed")
-	require.Equal(t, []string{contract.FatalReasonFlushError.String()}, recorder.snapshot(),
-		"the reverse feed must stop on the flush error")
-	require.False(t, reverseCutoverCalled, "a dead reverse feed must not roll back")
-	require.True(t, tableExists(t, ctl, "rwfe_src", "t1_old"), "source table stays retired to _old")
-	require.False(t, tableExists(t, ctl, "rwfe_src", "t1"), "source real table stays gone")
-	require.True(t, tableExists(t, ctl, "rwfe_dst", "t1"), "target keeps serving")
-	require.False(t, tableExists(t, ctl, "rwfe_dst", checkpointTableName), "checkpoint dropped by complete-forward")
+	// Two flush errors: the first stops the feed, the second is the restarted
+	// feed replaying the same change. Neither may end the run.
+	h.poll(time.Now().Add(waitTimeout), func() bool {
+		return len(recorder.snapshot()) >= 2
+	}, func() string {
+		return fmt.Sprintf("the restarted reverse feed to fail on the same change again; fatal reasons so far: %v", recorder.snapshot())
+	})
+	for _, reason := range recorder.snapshot() {
+		require.Equal(t, contract.FatalReasonFlushError.String(), reason, "only flush errors are expected")
+	}
+	require.True(t, tableExists(t, ctl, "rwfe_dst", checkpointTableName), "the window must keep its checkpoint")
+
+	// Remove the cause. The next restarted feed applies the change.
+	execUnlogged("ALTER TABLE rwfe_src.t1_old DROP CHECK rwfe_id_small")
+	h.poll(time.Now().Add(waitTimeout), func() bool {
+		qctx, cancel := context.WithTimeout(t.Context(), waitQueryTimeout)
+		defer cancel()
+		var n int
+		require.NoError(t, ctl.QueryRowContext(qctx, "SELECT COUNT(*) FROM rwfe_src.t1_old WHERE id = 500").Scan(&n))
+		return n == 1
+	}, func() string { return "the restarted reverse feed to apply the change it failed on" })
+
+	// The window is still open, so a revert is still possible.
+	testutils.RunSQL(t, "CREATE TABLE rwfe_dst."+revertMarkerName+" (id INT)")
+	h.awaitDone(reverseCutoverTimeout, "the reverse cutover to complete after the reverse feed was restarted")
+
+	require.True(t, reverseCutoverCalled.Load(), "the reverse cutover must run")
+	require.True(t, tableExists(t, ctl, "rwfe_src", "t1"), "source should be un-retired")
+	require.False(t, tableExists(t, ctl, "rwfe_src", "t1_old"), "source _old should be gone after un-retire")
+	var val string
+	require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT val FROM rwfe_src.t1 WHERE id=500").Scan(&val))
+	require.Equal(t, "too big for _old", val, "the change the feed first failed on must reach the source")
 }
 
 // TestResumeReverseWindowRefusesUnsupportedNames: resuming a reverse window
