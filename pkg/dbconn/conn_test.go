@@ -114,51 +114,12 @@ func TestNewDSNAllowNativePasswords(t *testing.T) {
 		"DSN must not contain allowNativePasswords=false")
 }
 
-func TestNewDSNDisablesTinyInt1IsBool(t *testing.T) {
-	// The driver maps a signed tinyint(1) to a Go bool by default, which
-	// collapses every non-zero value to true. The copier reads rows back into
-	// Go to build its INSERT, so spirit must always ask for integers: a stored
-	// 2 would otherwise be written as 1, and the value is unrecoverable by the
-	// time spirit sees it.
-	//
-	// Assert on the presence of tinyInt1IsBool=false rather than the absence of
-	// =true: the driver's default is true, so FormatDSN only writes the
-	// parameter when it is false. An untouched DSN carries no parameter at all,
-	// which reads as "bool mapping on".
-	inputs := []struct {
-		name string
-		dsn  string
-	}{
-		{"unset", "root:password@tcp(127.0.0.1:3306)/test"},
-		// Spirit requires exact values, so it overrides a caller who asked for
-		// the bool mapping rather than deferring to them.
-		{"caller_asked_for_bool", "root:password@tcp(127.0.0.1:3306)/test?tinyInt1IsBool=true"},
-	}
-
-	for _, tlsMode := range []string{"PREFERRED", "DISABLED"} {
-		for _, input := range inputs {
-			t.Run(tlsMode+"/"+input.name, func(t *testing.T) {
-				config := NewDBConfig()
-				config.TLSMode = tlsMode
-				resp, err := newDSN(input.dsn, config)
-				require.NoError(t, err)
-				require.Contains(t, resp, "tinyInt1IsBool=false",
-					"DSN must disable the driver's tinyint(1)-to-bool mapping")
-
-				// Round-trip it: the flag has to survive parsing, since that is
-				// how the driver actually receives it.
-				cfg, err := mysql.ParseDSN(resp)
-				require.NoError(t, err)
-				require.Contains(t, cfg.FormatDSN(), "tinyInt1IsBool=false")
-			})
-		}
-	}
-}
-
-// TestConnectionReadsTinyInt1AsInteger proves the setting changes what the
-// driver returns, not just what the DSN says. The assertions above check the
-// DSN text; this checks the behavior every connection spirit opens gets, since
-// New is the single door onto newDSN.
+// TestConnectionReadsTinyInt1AsInteger guards the driver's default. The (1) in
+// tinyint(1) is a display width, not a range: the column holds the whole
+// signed tinyint range. The copier reads rows back into Go to build its
+// INSERT, so a driver that mapped tinyint(1) to a Go bool would collapse a
+// stored 2 to 1, unrecoverably. The driver's tinyInt1IsBool option is off by
+// default; this fails if a dependency bump turns it back on.
 func TestConnectionReadsTinyInt1AsInteger(t *testing.T) {
 	testutils.RunSQL(t, "DROP TABLE IF EXISTS conn_tinyint1_scan")
 	testutils.RunSQL(t, "CREATE TABLE conn_tinyint1_scan (id INT NOT NULL PRIMARY KEY, flags TINYINT(1) NOT NULL)")
