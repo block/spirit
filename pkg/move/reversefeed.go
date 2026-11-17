@@ -103,12 +103,14 @@ type ReverseFeed struct {
 	flushInt time.Duration
 
 	// A fatal condition on any feed stops it, and U stops receiving the
-	// targets' writes. We capture the first one so the caller, which polls Err
-	// and Restartable, can act on it rather than silently letting U drift:
-	// restart the feed from its last checkpointed position when the condition
-	// left the watched tables unchanged (a failed flush or stream), or degrade
-	// to complete-forward when it did not.
-	fatalOnce   sync.Once
+	// targets' writes. We record it so the caller, which polls Err and
+	// Restartable, can act on it rather than silently letting U drift: restart
+	// the feed from its last checkpointed position when the condition left the
+	// watched tables unchanged (a failed flush or stream), or degrade to
+	// complete-forward when it did not. Several feeds (or one feed, more than
+	// once) can report: the first reason is kept unless a later one is not
+	// restartable, which always wins — one unsafe condition anywhere makes the
+	// whole feed unsafe to restart.
 	fatalMu     sync.Mutex
 	fatalErr    error
 	fatalReason contract.FatalReason
@@ -248,25 +250,32 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 	return rf, nil
 }
 
-// onFatal records the first fatal feed condition for Err and Restartable. It
-// returns true: the feed stops either way, and the window decides whether to
-// restart it or complete forward.
+// onFatal records a fatal feed condition for Err and Restartable. The first
+// condition is kept unless a later one is not restartable: an unsafe condition
+// (a schema change, XA, a wrapped LogPos) replaces an earlier restartable one,
+// and is never replaced itself, so a flush error on one feed cannot hide a
+// schema change on another. It returns true: the feed stops either way, and the
+// window decides whether to restart it or complete forward.
 func (rf *ReverseFeed) onFatal(reason contract.FatalReason) bool {
-	rf.fatalOnce.Do(func() {
-		rf.fatalMu.Lock()
+	restartable := reason.PreservesCheckpoint()
+	rf.fatalMu.Lock()
+	record := rf.fatalErr == nil || (!restartable && rf.fatalReason.PreservesCheckpoint())
+	if record {
 		rf.fatalReason = reason
-		if reason.PreservesCheckpoint() {
+		if restartable {
 			rf.fatalErr = fmt.Errorf("reverse feed stopped on a fatal condition (%s); it can be restarted from its last checkpointed position", reason)
 		} else {
 			rf.fatalErr = fmt.Errorf("reverse feed hit a fatal condition (%s); rollback is no longer safe", reason)
 		}
-		rf.fatalMu.Unlock()
-		rf.logger.Error("reverse feed fatal", "reason", reason.String(), "restartable", reason.PreservesCheckpoint())
-	})
+	}
+	rf.fatalMu.Unlock()
+	if record {
+		rf.logger.Error("reverse feed fatal", "reason", reason.String(), "restartable", restartable)
+	}
 	return true
 }
 
-// Err returns the first fatal feed error, if any.
+// Err returns the recorded fatal feed error, if any (see onFatal for which one).
 func (rf *ReverseFeed) Err() error {
 	rf.fatalMu.Lock()
 	defer rf.fatalMu.Unlock()

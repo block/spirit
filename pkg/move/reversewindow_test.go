@@ -1849,3 +1849,346 @@ func TestReverseWindowLogicalTablesIgnoresViews(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"t1"}, logical)
 }
+
+// logRecord is one record captured by logCapture.
+type logRecord struct {
+	level   slog.Level
+	message string
+	attrs   map[string]slog.Value
+}
+
+// logCapture is a slog.Handler that keeps every record, for tests that pin
+// what the window loop logs.
+type logCapture struct {
+	mu      sync.Mutex
+	records []logRecord
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, rec slog.Record) error {
+	attrs := map[string]slog.Value{}
+	rec.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value
+		return true
+	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, logRecord{level: rec.Level, message: rec.Message, attrs: attrs})
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+// matching returns the captured records whose message starts with prefix.
+func (c *logCapture) matching(prefix string) []logRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []logRecord
+	for _, rec := range c.records {
+		if strings.HasPrefix(rec.message, prefix) {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// stoppedFeed returns a feed with no sources that has reported reasons, in
+// order, as its own sources would.
+func stoppedFeed(reasons ...contract.FatalReason) *ReverseFeed {
+	rf := &ReverseFeed{logger: slog.Default()}
+	for _, reason := range reasons {
+		rf.onFatal(reason)
+	}
+	return rf
+}
+
+// stoppedFeedWindow is a reverse window over a feed that has stopped on a
+// failed flush, with every side effect the loop can reach faked: restart and
+// the revert-marker read are the tests' to set, and the terminal action
+// (complete forward) is counted.
+type stoppedFeedWindow struct {
+	*reverseWindow
+	logs           *logCapture
+	droppedMarker  atomic.Int32
+	droppedCkpt    atomic.Int32
+	restartCalls   []time.Time // written by restart, which runs on the loop goroutine
+	restartCallsMu sync.Mutex
+}
+
+func newStoppedFeedWindow(t *testing.T, window time.Duration, tun tunables) *stoppedFeedWindow {
+	t.Helper()
+	logs := &logCapture{}
+	cfg := &mysql.Config{Addr: "target:3306", DBName: "dst"}
+	sw := &stoppedFeedWindow{logs: logs}
+	sw.reverseWindow = &reverseWindow{
+		r: &Runner{
+			logger:           slog.New(logs),
+			move:             &Move{ReverseWindow: window},
+			tunables:         tun,
+			targets:          []applier.Target{{Config: cfg}},
+			cutoverAt:        time.Now(),
+			reversePositions: map[string]string{"target:3306/dst/": "uuid:1-5"},
+		},
+		feed: stoppedFeed(contract.FatalReasonFlushError),
+		persistPhase: func(context.Context, string) error {
+			t.Error("the window loop must not write a phase: no reverse cutover may start")
+			return nil
+		},
+		dropMarker:      func(context.Context) error { sw.droppedMarker.Add(1); return nil },
+		dropCheckpoint:  func(context.Context) error { sw.droppedCkpt.Add(1); return nil },
+		writeCheckpoint: func(context.Context, checkpoint.Record) error { return nil },
+		readRevertMarker: func(context.Context) (bool, error) {
+			return false, nil
+		},
+	}
+	return sw
+}
+
+// recordRestart notes the time of a restart attempt.
+func (sw *stoppedFeedWindow) recordRestart() {
+	sw.restartCallsMu.Lock()
+	defer sw.restartCallsMu.Unlock()
+	sw.restartCalls = append(sw.restartCalls, time.Now())
+}
+
+func (sw *stoppedFeedWindow) restarts() []time.Time {
+	sw.restartCallsMu.Lock()
+	defer sw.restartCallsMu.Unlock()
+	return append([]time.Time(nil), sw.restartCalls...)
+}
+
+// holdUntil runs the window loop until it returns or cond holds; in the
+// latter case it cancels the loop and expects context.Canceled.
+func (sw *stoppedFeedWindow) holdUntil(t *testing.T, cond func() bool) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sw.hold(ctx) }()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-deadline:
+			t.Fatal("the window loop neither returned nor reached the expected state")
+		case <-time.After(5 * time.Millisecond):
+			if cond != nil && cond() {
+				cancel()
+				err := <-done
+				require.ErrorIs(t, err, context.Canceled)
+				return err
+			}
+		}
+	}
+}
+
+// TestReverseWindowStoppedFeedCompletesForward pins the two ways a window over
+// a stopped feed ends without rollback: the feed (or one of its sources) has
+// reported a condition after which rollback is no longer safe, or the window's
+// deadline passes before a restart succeeds. A revert requested meanwhile is
+// discarded, and the discard is logged.
+func TestReverseWindowStoppedFeedCompletesForward(t *testing.T) {
+	t.Parallel()
+	fastPoll := tunables{
+		reverseWindowPollInterval:        2 * time.Millisecond,
+		reverseFeedRestartInitialBackoff: 5 * time.Millisecond,
+		reverseFeedRestartMaxBackoff:     5 * time.Millisecond,
+	}
+
+	t.Run("an unsafe condition after a restartable one", func(t *testing.T) {
+		t.Parallel()
+		sw := newStoppedFeedWindow(t, time.Hour, fastPoll)
+		sw.feed.onFatal(contract.FatalReasonSchemaChange)
+		sw.restart = func(context.Context) error {
+			t.Error("a feed that reported a schema change must not be restarted")
+			return nil
+		}
+		require.NoError(t, sw.holdUntil(t, nil))
+		require.Equal(t, int32(1), sw.droppedCkpt.Load(), "complete forward drops the checkpoint")
+		require.Len(t, sw.logs.matching("reverse feed died mid-window; completing forward"), 1)
+	})
+
+	t.Run("an unsafe condition reported while the stopped feed closes", func(t *testing.T) {
+		t.Parallel()
+		sw := newStoppedFeedWindow(t, time.Hour, fastPoll)
+		sw.restart = func(context.Context) error {
+			sw.recordRestart()
+			return errReverseFeedNotRestartable
+		}
+		require.NoError(t, sw.holdUntil(t, nil))
+		require.Len(t, sw.restarts(), 1)
+		require.Equal(t, int32(1), sw.droppedCkpt.Load(), "complete forward drops the checkpoint")
+	})
+
+	t.Run("the deadline passes while restarts fail", func(t *testing.T) {
+		t.Parallel()
+		sw := newStoppedFeedWindow(t, 200*time.Millisecond, fastPoll)
+		sw.readRevertMarker = func(context.Context) (bool, error) { return true, nil }
+		sw.restart = func(context.Context) error {
+			sw.recordRestart()
+			return errors.New("Error 1040: Too many connections")
+		}
+		require.NoError(t, sw.holdUntil(t, nil))
+		require.NotEmpty(t, sw.restarts(), "the window must try to restart the feed before the deadline")
+		require.Equal(t, int32(1), sw.droppedCkpt.Load(), "complete forward drops the checkpoint")
+		require.Equal(t, int32(1), sw.droppedMarker.Load(), "complete forward drops the revert marker")
+		require.Len(t, sw.logs.matching("revert requested ("), 1, "a revert pending while the feed is stopped is logged once")
+		discarded := sw.logs.matching("reverse window elapsed while the reverse feed was stopped; discarding the pending revert request")
+		require.Len(t, discarded, 1)
+		require.Equal(t, slog.LevelError, discarded[0].level)
+	})
+}
+
+// TestReverseWindowRestartFeedRechecksAfterClose: restartFeed reads the
+// stopped feed's verdict again after closing it, and builds no new feed over a
+// condition after which rollback is no longer safe. (The window has no sources,
+// so building one would panic.)
+func TestReverseWindowRestartFeedRechecksAfterClose(t *testing.T) {
+	t.Parallel()
+	stopped := stoppedFeed(contract.FatalReasonFlushError, contract.FatalReasonSchemaChange)
+	w := &reverseWindow{r: &Runner{logger: slog.Default()}, feed: stopped}
+	require.ErrorIs(t, w.restartFeed(t.Context()), errReverseFeedNotRestartable)
+	require.Same(t, stopped, w.feed, "the stopped feed stays in place for complete forward")
+}
+
+// TestReverseWindowRestartBackoff pins the spacing of restarts. A restart that
+// succeeds but stops again on its first flush must still wait out the backoff,
+// and the backoff doubles up to its maximum. Only a restarted feed that stays
+// up for two flush intervals resets it.
+func TestReverseWindowRestartBackoff(t *testing.T) {
+	t.Parallel()
+	const initial, maxBackoff = 20 * time.Millisecond, 80 * time.Millisecond
+	retryIns := func(sw *stoppedFeedWindow) []time.Duration {
+		var out []time.Duration
+		for _, rec := range sw.logs.matching("reverse feed restarted from its last checkpointed position") {
+			out = append(out, rec.attrs["next_restart_no_sooner_than"].Duration())
+		}
+		return out
+	}
+
+	t.Run("successful restarts that stop again back off", func(t *testing.T) {
+		t.Parallel()
+		sw := newStoppedFeedWindow(t, time.Hour, tunables{
+			reverseWindowPollInterval:        time.Millisecond,
+			reverseFeedRestartInitialBackoff: initial,
+			reverseFeedRestartMaxBackoff:     maxBackoff,
+			reverseFeedFlushInterval:         time.Hour,
+		})
+		sw.restart = func(context.Context) error {
+			sw.recordRestart()
+			sw.feed = stoppedFeed(contract.FatalReasonFlushError) // stops again at once
+			return nil
+		}
+		require.ErrorIs(t, sw.holdUntil(t, func() bool { return len(sw.restarts()) >= 5 }), context.Canceled)
+
+		want := []time.Duration{initial, 2 * initial, maxBackoff, maxBackoff}
+		require.Equal(t, want, retryIns(sw)[:4])
+		calls := sw.restarts()
+		for i, wait := range want {
+			require.GreaterOrEqual(t, calls[i+1].Sub(calls[i]), wait, "restart %d came too soon after restart %d", i+2, i+1)
+		}
+		require.Empty(t, sw.logs.matching("restarted reverse feed has stayed up"), "a feed that keeps stopping is never healthy")
+	})
+
+	t.Run("a restarted feed that stays up resets the backoff", func(t *testing.T) {
+		t.Parallel()
+		sw := newStoppedFeedWindow(t, time.Hour, tunables{
+			reverseWindowPollInterval:        time.Millisecond,
+			reverseFeedRestartInitialBackoff: initial,
+			reverseFeedRestartMaxBackoff:     time.Second,
+			reverseFeedFlushInterval:         10 * time.Millisecond, // healthy after 20ms
+		})
+		var healthy atomic.Pointer[ReverseFeed]
+		sw.restart = func(context.Context) error {
+			n := len(sw.restarts())
+			sw.recordRestart()
+			if n == 0 {
+				feed := &ReverseFeed{logger: slog.Default()}
+				healthy.Store(feed)
+				sw.feed = feed
+				return nil
+			}
+			sw.feed = stoppedFeed(contract.FatalReasonFlushError)
+			return nil
+		}
+		err := sw.holdUntil(t, func() bool {
+			if len(sw.logs.matching("restarted reverse feed has stayed up")) == 1 {
+				if feed := healthy.Swap(nil); feed != nil {
+					feed.onFatal(contract.FatalReasonFlushError) // stop it again
+				}
+			}
+			return len(retryIns(sw)) >= 2 // the second restart has logged its backoff
+		})
+		require.ErrorIs(t, err, context.Canceled)
+		// Without the reset the second restart would schedule the third
+		// 2*initial later.
+		require.Equal(t, []time.Duration{initial, initial}, retryIns(sw)[:2])
+	})
+}
+
+// TestReverseWindowDrainRefusesStoppedFeed: a feed that stops while a reverse
+// cutover is locking the targets has neither applied nor buffered the changes
+// it stopped on, so an empty buffer must not let the cutover proceed.
+func TestReverseWindowDrainRefusesStoppedFeed(t *testing.T) {
+	t.Parallel()
+	w := &reverseWindow{feed: stoppedFeed(contract.FatalReasonStreamError)}
+	err := w.drainFeed(t.Context())
+	require.ErrorContains(t, err, "the reverse feed stopped")
+}
+
+// TestMoveReverseWindowCancelAfterFeedRestart: a run cancelled while its window
+// is restarting a stopped feed returns the cancellation, closes the feed the
+// window is running then (not only the one it started with — TestMain's
+// goleak check fails the package on a leaked stream), and leaves the
+// checkpoint in the reverse_window phase so a re-run resumes the window.
+func TestMoveReverseWindowCancelAfterFeedRestart(t *testing.T) {
+	t.Parallel()
+	sourceDSN, targetDSN, ctl := setupReverseWindowMove(t, "rwcr_src", "rwcr_dst")
+	m := &Move{
+		SourceDSN:     sourceDSN,
+		TargetDSN:     targetDSN,
+		Common:        flags.Common{Threads: 1, WriteThreads: 1},
+		ReverseWindow: 5 * time.Minute,
+	}
+	runner, err := NewRunner(m)
+	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	runner.tunables.reverseFeedFlushInterval = 100 * time.Millisecond
+	recorder := &fatalReasonState{}
+	runner.logger = slog.New(&fatalReasonRecorder{Handler: slog.Default().Handler(), state: recorder})
+	runner.SetCutover(func(context.Context) error { return nil })
+
+	h := startRun(t, runner)
+	h.awaitReverseWindow(ctl, "rwcr_dst")
+
+	// As in TestMoveReverseWindowFlushErrorRestartsFeed: an unlogged CHECK
+	// constraint makes every flush of the change below fail.
+	unlogged, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(unlogged)
+	conn, err := unlogged.Conn(t.Context())
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "SET SESSION sql_log_bin = 0")
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "ALTER TABLE rwcr_src.t1_old ADD CONSTRAINT rwcr_id_small CHECK (id < 100)")
+	require.NoError(t, err)
+	utils.CloseAndLog(conn)
+	testutils.RunSQL(t, "INSERT INTO rwcr_dst.t1 (id, val) VALUES (500, 'too big for _old')")
+
+	// The second flush error comes from a restarted feed.
+	h.poll(time.Now().Add(waitTimeout), func() bool {
+		return len(recorder.snapshot()) >= 2
+	}, func() string {
+		return fmt.Sprintf("a restarted reverse feed to stop; fatal reasons so far: %v", recorder.snapshot())
+	})
+	require.ErrorIs(t, h.kill(), context.Canceled)
+
+	var phase string
+	require.NoError(t, ctl.QueryRowContext(t.Context(),
+		"SELECT move_phase FROM rwcr_dst."+checkpointTableName+" ORDER BY id DESC LIMIT 1").Scan(&phase))
+	require.Equal(t, phaseReverseWindow, phase, "a cancelled window must stay resumable")
+	require.True(t, tableExists(t, ctl, "rwcr_src", "t1_old"), "the source stays retired")
+}

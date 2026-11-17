@@ -427,9 +427,22 @@ func TestReverseFeedRestartable(t *testing.T) {
 			require.True(t, rf.onFatal(tc.reason))
 			require.Error(t, rf.Err())
 			require.Equal(t, tc.restartable, rf.Restartable())
-			// Only the first condition counts.
-			rf.onFatal(contract.FatalReasonSchemaChange)
+			first := rf.Err().Error()
+
+			// A later restartable condition never changes the verdict or the
+			// recorded error.
+			rf.onFatal(contract.FatalReasonFlushError)
 			require.Equal(t, tc.restartable, rf.Restartable())
+			require.Equal(t, first, rf.Err().Error())
+
+			// A later unsafe condition always wins: a flush error on one
+			// feed must not hide a schema change on another.
+			rf.onFatal(contract.FatalReasonSchemaChange)
+			require.False(t, rf.Restartable())
+			require.Contains(t, rf.Err().Error(), "rollback is no longer safe")
+			if !tc.restartable {
+				require.Equal(t, first, rf.Err().Error(), "the first unsafe condition is kept")
+			}
 		})
 	}
 }
