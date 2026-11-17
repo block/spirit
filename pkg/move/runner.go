@@ -127,6 +127,12 @@ type tunables struct {
 	// (defaultReverseCutoverInitialBackoff, defaultReverseCutoverMaxBackoff).
 	reverseCutoverInitialBackoff time.Duration
 	reverseCutoverMaxBackoff     time.Duration
+	// reverseFeedRestartInitialBackoff and reverseFeedRestartMaxBackoff bound
+	// the wait between attempts to restart a stopped reverse feed
+	// (defaultReverseFeedRestartInitialBackoff,
+	// defaultReverseFeedRestartMaxBackoff).
+	reverseFeedRestartInitialBackoff time.Duration
+	reverseFeedRestartMaxBackoff     time.Duration
 	// tableStatUpdateInterval is how often the source tables' statistics are
 	// refreshed during the copy (defaultTableStatUpdateInterval).
 	tableStatUpdateInterval time.Duration

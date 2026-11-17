@@ -102,13 +102,18 @@ type ReverseFeed struct {
 	logger   *slog.Logger
 	flushInt time.Duration
 
-	// A fatal error on any feed (schema change or stream failure) means U can no
-	// longer be trusted for rollback. We capture it once so
-	// the caller, which polls Err, can degrade to complete-forward rather than
-	// silently letting U drift.
-	fatalOnce sync.Once
-	fatalMu   sync.Mutex
-	fatalErr  error
+	// A fatal condition on any feed stops it, and U stops receiving the
+	// targets' writes. We record it so the caller, which polls Err and
+	// Restartable, can act on it rather than silently letting U drift: restart
+	// the feed from its last checkpointed position when the condition left the
+	// watched tables unchanged (a failed flush or stream), or degrade to
+	// complete-forward when it did not. Several feeds (or one feed, more than
+	// once) can report: the first reason is kept unless a later one is not
+	// restartable, which always wins — one unsafe condition anywhere makes the
+	// whole feed unsafe to restart.
+	fatalMu     sync.Mutex
+	fatalErr    error
+	fatalReason contract.FatalReason
 }
 
 // NewReverseFeed wires the feeds and their shared applier. It does not open any
@@ -245,23 +250,51 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 	return rf, nil
 }
 
-// onFatal records the first fatal feed condition for Err. It returns true
-// (we always act on it: the window degrades to complete-forward).
+// onFatal records a fatal feed condition for Err and Restartable. The first
+// condition is kept unless a later one is not restartable: an unsafe condition
+// (a schema change, XA, a wrapped LogPos) replaces an earlier restartable one,
+// and is never replaced itself, so a flush error on one feed cannot hide a
+// schema change on another. It returns true: the feed stops either way, and the
+// window decides whether to restart it or complete forward.
 func (rf *ReverseFeed) onFatal(reason contract.FatalReason) bool {
-	rf.fatalOnce.Do(func() {
-		rf.fatalMu.Lock()
-		rf.fatalErr = fmt.Errorf("reverse feed hit a fatal condition (%s); rollback is no longer safe", reason)
-		rf.fatalMu.Unlock()
-		rf.logger.Error("reverse feed fatal; source can no longer be trusted for rollback", "reason", reason.String())
-	})
+	restartable := reason.PreservesCheckpoint()
+	rf.fatalMu.Lock()
+	record := rf.fatalErr == nil || (!restartable && rf.fatalReason.PreservesCheckpoint())
+	if record {
+		rf.fatalReason = reason
+		if restartable {
+			rf.fatalErr = fmt.Errorf("reverse feed stopped on a fatal condition (%s); it can be restarted from its last checkpointed position", reason)
+		} else {
+			rf.fatalErr = fmt.Errorf("reverse feed hit a fatal condition (%s); rollback is no longer safe", reason)
+		}
+	}
+	rf.fatalMu.Unlock()
+	if record {
+		rf.logger.Error("reverse feed fatal", "reason", reason.String(), "restartable", restartable)
+	}
 	return true
 }
 
-// Err returns the first fatal feed error, if any.
+// Err returns the recorded fatal feed error, if any (see onFatal for which one).
 func (rf *ReverseFeed) Err() error {
 	rf.fatalMu.Lock()
 	defer rf.fatalMu.Unlock()
 	return rf.fatalErr
+}
+
+// Restartable reports whether the feed stopped on a fatal condition that left
+// the watched tables unchanged — a failed flush (after the applier's own
+// retries: for example the reverse target refusing new connections) or a failed
+// stream. Such a condition does not make the source untrustworthy: the failed
+// changes were not applied, the feed's flushed position did not advance past
+// them, and a new feed started from the last checkpointed position replays
+// them (the apply is idempotent). It is false while the feed is healthy, and
+// for a schema change, XA or a wrapped LogPos, after which rollback is no
+// longer safe.
+func (rf *ReverseFeed) Restartable() bool {
+	rf.fatalMu.Lock()
+	defer rf.fatalMu.Unlock()
+	return rf.fatalErr != nil && rf.fatalReason.PreservesCheckpoint()
 }
 
 // Start opens every feed (StartFromPosition when a Position is set, else from

@@ -166,7 +166,9 @@ While the window is open the run reports the `reverseWindow` state. The reverse 
 
 1. **It elapses.** Move finalizes forward exactly as a normal cutover would — the source stays retired as `_old`, the checkpoint is dropped — and exits.
 2. **A rollback is requested** (see below). Move rolls back to the source and exits.
-3. **The reverse feed dies** (a schema change on a target, or an unrecoverable stream error). Rollback is no longer safe, so Move finalizes forward and exits, logging the reason.
+3. **The reverse feed dies on a condition after which rollback is no longer safe** (a schema change on a target, an XA transaction, a wrapped binlog position). Move finalizes forward and exits, logging the reason.
+
+A reverse feed that stops because a flush to the source failed (for example, the source refused new connections), or because a binlog stream failed, does **not** end the window. Neither changes the watched tables, so Move restarts the feed from its last checkpointed position and replays the changes it had not applied. Restarts are spaced by a backoff that doubles up to 30 seconds and resets once a restarted feed has stayed up for longer than a flush interval. A rollback requested while the feed is stopped is logged and waits until the feed is running again. Before it locks anything, a rollback also flushes the reverse feed. If the source still refuses the writes, or the backlog does not apply within `--cutover-lock-timeout`, the rollback is deferred and retried. A deferred rollback locks no tables and does not count against the retry limit. If the window elapses while the feed is stopped or the source is still behind, Move finalizes forward and logs that it discarded the pending rollback request.
 
 #### Requesting a rollback
 
