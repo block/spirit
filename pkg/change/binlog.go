@@ -69,6 +69,11 @@ func (c *binlogClient) setBufferedPos(pos mysql.Position) {
 		return
 	}
 	c.bufferedPos = pos
+	// Only the read loop calls this, after it has acted on the event that
+	// ends at pos, so lastEventTime now covers exactly the events up to pos.
+	if t := c.lastEventTime.Load(); t > c.bufferedEventTime {
+		c.bufferedEventTime = t
+	}
 }
 
 // getBufferedPos returns the buffered position under a mutex.
@@ -489,6 +494,9 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		if c.received(ev) {
+			continue
+		}
 		// Hold here if a verification has parked the reader. The event is
 		// already read but not acted on, so nothing is consumed and lost;
 		// dispatch resumes with it once the gate opens. See park.go.
@@ -747,8 +755,9 @@ func (c *binlogClient) flush(ctx context.Context, underLock bool, locks []contra
 	batch := c.GetDeltaLen()
 	c.mu.Lock()
 	newFlushedPos := c.bufferedPos
-	// Taken with the snapshot it describes; see feedCore.flushedEventTime.
-	newFlushedEventTime := c.lastEventTime.Load()
+	// Published with bufferedPos, so the pair describes the same event; see
+	// feedCore.bufferedEventTime.
+	newFlushedEventTime := c.bufferedEventTime
 	c.mu.Unlock()
 	var allChangesFlushed = true
 	for _, subscription := range c.subs.Snapshot() {
@@ -807,6 +816,9 @@ func (c *binlogClient) FeedStats() contract.FeedStats {
 	stats.ForcedRotations = c.flushedBinlogs.Load()
 	stats.BufferedEventAt = eventTime(&c.lastEventTime)
 	stats.FlushedEventAt = eventTime(&c.flushedEventTime)
+	if ns := c.lastReceived.Load(); ns != 0 {
+		stats.LastReceivedAt = time.Unix(0, ns)
+	}
 	// Already under c.mu, which is what guards bufferedPos.
 	if c.bufferedPos.Name != "" {
 		stats.BufferedPosition = formatBinlogPosition(c.bufferedPos)

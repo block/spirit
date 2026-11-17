@@ -123,9 +123,23 @@ type feedCore struct {
 	// contract.FeedStats.BufferedEventAt.
 	lastEventTime atomic.Int64
 
-	// flushedEventTime is lastEventTime as it stood when the buffered position
-	// was snapshotted for the most recent flush that applied every change:
-	// the source's commit time of the newest change now applied. It advances
+	// lastReceived is this host's clock (unix nanoseconds) when the read loop
+	// last got an event from the stream, heartbeats included. See
+	// contract.FeedStats.LastReceivedAt.
+	lastReceived atomic.Int64
+
+	// bufferedEventTime is the source timestamp of the newest event covered
+	// by the published buffered coordinate (bufferedPos / bufferedGTID).
+	// Unlike lastEventTime, which the read loop stamps before it acts on an
+	// event, this is written under mu in the same critical section that
+	// publishes the coordinate, so a flush that snapshots the coordinate
+	// gets the matching time rather than the time of an event not yet
+	// buffered. Unix seconds, guarded by mu, never decreases.
+	bufferedEventTime int64
+
+	// flushedEventTime is bufferedEventTime as snapshotted, with the buffered
+	// coordinate, by the most recent flush that applied every change: the
+	// source's commit time of the newest change now applied. It advances
 	// with the flushed position, and like it, not at all while a flush defers
 	// changes. Unix seconds, written with advanceUnixSeconds; see
 	// contract.FeedStats.FlushedEventAt.
@@ -299,6 +313,30 @@ func (c *feedCore) AddSubscription(currentTableDesc, newTableDesc contract.Table
 	return nil
 }
 
+// binlogHeartbeatPeriod is how long the source's dump thread may have nothing
+// to send before it sends a heartbeat (@source_heartbeat_period). The
+// heartbeats are what let a quiet source be told apart from a stream that has
+// stopped delivering; see contract.FeedStats.LastReceivedAt.
+const binlogHeartbeatPeriod = 10 * time.Second
+
+// isHeartbeat reports whether ev is a heartbeat from the source's dump thread.
+// A heartbeat carries no change and no source timestamp, and its LogPos is the
+// dump thread's own position, which can name a different file than the one
+// being read, so the read loops must not treat it as a position.
+func isHeartbeat(ev *replication.BinlogEvent) bool {
+	_, ok := ev.Event.(*replication.HeartbeatEvent)
+	return ok
+}
+
+// received stamps lastReceived for ev, which the read loop has just taken off
+// the stream, and reports whether ev is a heartbeat, which the loop then skips.
+// Stamped before the reader can park, so the stamp is when the stream last
+// delivered, not when the loop last acted.
+func (c *feedCore) received(ev *replication.BinlogEvent) bool {
+	c.lastReceived.Store(time.Now().UnixNano())
+	return isHeartbeat(ev)
+}
+
 // GetDeltaLen returns the total number of changes
 // that are pending across all subscriptions.
 // Satisfies Source interface.
@@ -325,6 +363,11 @@ func (c *feedCore) buildSyncerConfig(host string, port uint16) replication.Binlo
 		// log; we report rotations on the status block instead. See
 		// syncerQuietMessages.
 		Logger: newDemotingLogger(c.logger, syncerQuietMessages),
+		// Ask the source to send a heartbeat whenever it has had nothing to
+		// send for this long. The read loops stamp it as liveness
+		// (feedCore.lastReceived) and act on it no further; see
+		// skipHeartbeat.
+		HeartbeatPeriod: binlogHeartbeatPeriod,
 		// Render JSON columns directly from the JSONB byte stream in the
 		// same textual form MySQL produces from SELECT json_col. The
 		// default decoder goes through Go intermediate values + json.Marshal

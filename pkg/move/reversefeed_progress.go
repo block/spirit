@@ -44,9 +44,13 @@ const (
 	// within reverseFeedCaughtUpThreshold of the source's clock.
 	reverseSourceCaughtUp reverseSourceState = "caught-up"
 	// reverseSourceIdle: the newest event read is older than the threshold,
-	// but the reader's position has not moved since the previous report and
-	// nothing is buffered or parked. The source has written no binlog events
-	// in that time, so an old event time does not mean the reader is behind.
+	// but the reader's position has not moved since the previous report,
+	// nothing is buffered or parked, and the stream delivered something
+	// (a heartbeat, on a quiet source) within the threshold. The source has
+	// written no binlog events in that time, so an old event time does not
+	// mean the reader is behind. Without the recent delivery, an unmoved
+	// position could equally be a stream that stopped delivering — a hung
+	// connection, a reconnect loop — and the source is reported behind.
 	reverseSourceIdle reverseSourceState = "idle"
 	// reverseSourceBehind: everything else, including a reader that has not
 	// read an event yet on its first report.
@@ -72,6 +76,11 @@ type reverseSourceLag struct {
 	// before the first.
 	lastFlush time.Duration
 	flushed   bool
+	// lastReceived is how long ago the stream last delivered anything,
+	// heartbeats included (FeedStats.LastReceivedAt); received is false
+	// before it has.
+	lastReceived time.Duration
+	received     bool
 }
 
 // reverseFeedReport is one progress report over every reverse source.
@@ -171,11 +180,15 @@ func (p *reverseFeedProgress) report(now time.Time, srcs []ReverseSourceProgress
 		if !s.LastFlushAt.IsZero() {
 			lag.lastFlush, lag.flushed = max(now.Sub(s.LastFlushAt), 0), true
 		}
+		if !s.LastReceivedAt.IsZero() {
+			lag.lastReceived, lag.received = max(now.Sub(s.LastReceivedAt), 0), true
+		}
 		unmoved := p.sampled && i < len(p.prevRead) && s.BufferedPosition == p.prevRead[i]
+		live := lag.received && lag.lastReceived <= p.threshold
 		switch {
 		case lag.readKnown && lag.readBehind <= p.threshold:
 			lag.state = reverseSourceCaughtUp
-		case unmoved && src.Pending == 0 && !s.IsParked:
+		case unmoved && live && src.Pending == 0 && !s.IsParked:
 			lag.state = reverseSourceIdle
 		default:
 			lag.state = reverseSourceBehind
@@ -250,6 +263,7 @@ func (p *reverseFeedProgress) log(logger *slog.Logger, now time.Time, rep revers
 			"pending_changes", s.pending,
 			"parked", s.parked,
 			"last_flush", roundedAgo(s.lastFlush, s.flushed),
+			"last_received", roundedAgo(s.lastReceived, s.received),
 		)
 	}
 	switch caughtUp := rep.allCaughtUp(); {
@@ -267,6 +281,19 @@ func (p *reverseFeedProgress) log(logger *slog.Logger, now time.Time, rep revers
 			"slowest", rep.readSlowest)
 		p.caughtUp = false
 	}
+}
+
+// logStopped writes the progress line for a feed that has stopped (ferr is
+// its Err). A stopped feed's stats are frozen where it stopped: its positions
+// stand still and nothing is pending, which report would read as idle, and
+// could then log a false "reverse feed caught up". So nothing is classified
+// and the catch-up state is left alone; the window restarts the feed and
+// replaces this tracker (newReverseFeedProgress) when it does.
+func (p *reverseFeedProgress) logStopped(logger *slog.Logger, ferr error, restartable bool) {
+	logger.Warn("reverse feed stopped; progress is not tracked until it restarts",
+		"sources", len(p.labels),
+		"restartable", restartable,
+		"error", ferr.Error())
 }
 
 // label names source i, or its index if no label was supplied for it.

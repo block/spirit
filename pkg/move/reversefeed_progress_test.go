@@ -62,9 +62,16 @@ func messages(recs []progressRecord) []string {
 }
 
 // sourceAt builds one source's progress as of now: read and applied are how
-// far behind now its newest read and applied events are (negative: none).
+// far behind now its newest read and applied events are (negative: none). The
+// stream last delivered something (a heartbeat, say) 5s ago; tests of a
+// stream that has stopped delivering override LastReceivedAt.
 func sourceAt(now time.Time, pos string, read, applied time.Duration, pending int, parked bool) ReverseSourceProgress {
-	s := contract.FeedStats{BufferedPosition: pos, IsParked: parked, LastFlushAt: now.Add(-10 * time.Second)}
+	s := contract.FeedStats{
+		BufferedPosition: pos,
+		IsParked:         parked,
+		LastFlushAt:      now.Add(-10 * time.Second),
+		LastReceivedAt:   now.Add(-5 * time.Second),
+	}
 	if read >= 0 {
 		s.BufferedEventAt = now.Add(-read)
 	}
@@ -123,29 +130,45 @@ func TestReverseFeedProgressReport(t *testing.T) {
 	require.Len(t, rep.worst(1), 1)
 }
 
+// receivedAgo returns src with the stream last delivering d before now, or
+// never (d < 0).
+func receivedAgo(src ReverseSourceProgress, now time.Time, d time.Duration) ReverseSourceProgress {
+	src.Stats.LastReceivedAt = time.Time{}
+	if d >= 0 {
+		src.Stats.LastReceivedAt = now.Add(-d)
+	}
+	return src
+}
+
 // TestReverseFeedProgressIdleNeedsQuiet: an old event time with an unmoved
-// position is only idle when nothing is buffered and the reader is not parked
-// — a parked reader cannot move, and that is the stall the log is for.
+// position is only idle when nothing is buffered, the reader is not parked —
+// a parked reader cannot move, and that is the stall the log is for — and the
+// stream has delivered something (a heartbeat, on a quiet source) within the
+// threshold. Without that delivery an unmoved position is as consistent with
+// a hung connection as with a quiet source, so it is reported behind.
 func TestReverseFeedProgressIdleNeedsQuiet(t *testing.T) {
 	t.Parallel()
 	start := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	second := start.Add(time.Minute)
 	for _, tc := range []struct {
 		name    string
 		second  ReverseSourceProgress
 		pending int
 		want    reverseSourceState
 	}{
-		{"quiet", sourceAt(start, "p", time.Hour, time.Hour, 0, false), 0, reverseSourceIdle},
-		{"buffered", sourceAt(start, "p", time.Hour, time.Hour, 7, false), 7, reverseSourceBehind},
-		{"parked", sourceAt(start, "p", time.Hour, time.Hour, 0, true), 0, reverseSourceBehind},
-		{"moved", sourceAt(start, "q", time.Hour, time.Hour, 0, false), 0, reverseSourceBehind},
-		{"nothing read", sourceAt(start, "p", -1, -1, 0, false), 0, reverseSourceIdle},
+		{"quiet", sourceAt(second, "p", time.Hour, time.Hour, 0, false), 0, reverseSourceIdle},
+		{"buffered", sourceAt(second, "p", time.Hour, time.Hour, 7, false), 7, reverseSourceBehind},
+		{"parked", sourceAt(second, "p", time.Hour, time.Hour, 0, true), 0, reverseSourceBehind},
+		{"moved", sourceAt(second, "q", time.Hour, time.Hour, 0, false), 0, reverseSourceBehind},
+		{"nothing read", sourceAt(second, "p", -1, -1, 0, false), 0, reverseSourceIdle},
+		{"not receiving", receivedAgo(sourceAt(second, "p", time.Hour, time.Hour, 0, false), second, 2*time.Minute), 0, reverseSourceBehind},
+		{"never received", receivedAgo(sourceAt(second, "p", time.Hour, time.Hour, 0, false), second, -1), 0, reverseSourceBehind},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			p := newReverseFeedProgress([]string{"x"}, start)
 			p.report(start, []ReverseSourceProgress{sourceAt(start, "p", time.Hour, time.Hour, 0, false)})
-			rep := p.report(start.Add(time.Minute), []ReverseSourceProgress{tc.second})
+			rep := p.report(second, []ReverseSourceProgress{tc.second})
 			require.Equal(t, tc.want, rep.sources[0].state)
 		})
 	}
@@ -200,6 +223,7 @@ func TestReverseFeedProgressLog(t *testing.T) {
 	require.Equal(t, "7h0m2s", recs[1].attrs["read_behind"])
 	require.Equal(t, "unknown", recs[1].attrs["applied_behind"])
 	require.Equal(t, "10s ago", recs[1].attrs["last_flush"])
+	require.Equal(t, "5s ago", recs[1].attrs["last_received"])
 
 	now := start.Add(time.Minute)
 	recs = logAt(now, caughtUpSample(now))
@@ -232,6 +256,13 @@ func repeat(s string, n int) []string {
 		out[i] = s
 	}
 	return out
+}
+
+// all returns every record logged so far, in order, without forgetting any.
+func (h *progressLogs) all() []progressRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]progressRecord(nil), h.records...)
 }
 
 // matching returns the records logged so far with message msg, without
@@ -278,6 +309,15 @@ func TestMoveReverseWindowLogsFeedProgress(t *testing.T) {
 	// A change on the target, for the feed to read and apply.
 	testutils.RunSQL(t, "INSERT INTO rwfp_dst.t1 (id, val) VALUES (42, 'reverse')")
 
+	// Wait for the row itself first: a report with a known applied time can
+	// come from a flush before the INSERT, so the report alone does not show
+	// the row was applied.
+	h.poll(time.Now().Add(waitTimeout), func() bool {
+		var n int
+		require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM rwfp_src.t1_old WHERE id = 42").Scan(&n))
+		return n == 1
+	}, func() string { return "row 42 reverse-applied to rwfp_src.t1_old" })
+
 	var last map[string]string
 	h.poll(time.Now().Add(waitTimeout), func() bool {
 		recs := logs.matching("reverse feed progress")
@@ -294,9 +334,45 @@ func TestMoveReverseWindowLogsFeedProgress(t *testing.T) {
 	applied, err := time.ParseDuration(last["applied_behind_max"])
 	require.NoError(t, err)
 	require.Less(t, applied, time.Minute, "a feed on a live server is seconds behind, not hours")
-	require.Empty(t, logs.matching("reverse feed source behind"), "a caught-up feed lists no lagging source")
+	// The initial catch-up may legitimately list the source as behind (its
+	// reader has read nothing yet), so only reports with behind=0 are checked:
+	// each must be followed by no per-source line before the next report.
+	recs := logs.all()
+	for i, rec := range recs {
+		if rec.message != "reverse feed progress" || rec.attrs["behind"] != "0" {
+			continue
+		}
+		for _, next := range recs[i+1:] {
+			if next.message == "reverse feed progress" {
+				break
+			}
+			require.NotEqual(t, "reverse feed source behind", next.message, "a caught-up report lists no lagging source")
+		}
+	}
+}
 
-	var n int
-	require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM rwfp_src.t1_old WHERE id = 42").Scan(&n))
-	require.Equal(t, 1, n, "the change the report counts as applied is on the source")
+// TestReverseWindowProgressWhileFeedStopped: while the feed is stopped its
+// stats are frozen (positions unmoved, nothing pending), which the classifier
+// would read as idle and log as caught up. The window logs that the feed is
+// stopped instead, and classifies nothing.
+func TestReverseWindowProgressWhileFeedStopped(t *testing.T) {
+	t.Parallel()
+	sw := newStoppedFeedWindow(t, time.Hour, tunables{
+		reverseWindowPollInterval:        time.Hour, // no restart attempts
+		reverseFeedProgressInterval:      2 * time.Millisecond,
+		reverseFeedRestartInitialBackoff: time.Hour,
+		reverseFeedRestartMaxBackoff:     time.Hour,
+	})
+	sw.restart = func(context.Context) error {
+		t.Error("the poll ticker is not expected to fire")
+		return nil
+	}
+	_ = sw.holdUntil(t, func() bool {
+		return len(sw.logs.matching("reverse feed stopped; progress is not tracked")) >= 3
+	})
+	stopped := sw.logs.matching("reverse feed stopped; progress is not tracked")
+	require.Equal(t, slog.LevelWarn, stopped[0].level)
+	require.Equal(t, "true", stopped[0].attrs["restartable"].String())
+	require.Empty(t, sw.logs.matching("reverse feed progress"), "a stopped feed is not classified")
+	require.Empty(t, sw.logs.matching("reverse feed caught up"), "a stopped feed is never reported caught up")
 }

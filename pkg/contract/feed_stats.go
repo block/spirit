@@ -79,8 +79,19 @@ type FeedStats struct {
 	// Like BufferedEventAt, a timestamp says nothing on a source that has
 	// written no binlog events for a while: both ages grow while the feed is
 	// fully caught up. Read them with the position: an age that grows while
-	// the position stands still is an idle source, not a stalled feed.
+	// the position stands still is an idle source, not a stalled feed —
+	// provided LastReceivedAt is recent.
 	FlushedEventAt time.Time
+	// LastReceivedAt is this host's clock when the reader last received
+	// anything from the source's binlog stream, including the heartbeats the
+	// source sends while it has nothing new (change.binlogHeartbeatPeriod).
+	// A heartbeat is only sent once the dump has caught up to the end of the
+	// source's binlog, so a recent LastReceivedAt with a position that stands
+	// still is positive evidence the reader is at the source's head; a stale
+	// one means the stream has stopped delivering (a hung connection, a
+	// reconnect loop) or the reader is parked. Zero before anything has been
+	// received.
+	LastReceivedAt time.Time
 	// Rotations counts binlog rotations the feed has followed. Duplicate
 	// rotate events (the server sends a real one and an artificial one
 	// carrying the same position) are counted once.

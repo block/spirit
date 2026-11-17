@@ -188,13 +188,13 @@ The run's periodic status block stops at cutover. While the window is open, Move
 
 ```
 msg="reverse feed progress" sources=128 caught_up=120 idle=2 behind=6 read_behind_max=2h14m0s read_behind_median=3s applied_behind_max=2h20m0s applied_unknown=1 pending_changes=214120 parked=1 slowest=host-b:3306/db_42_44
-msg="reverse feed source behind" source=host-b:3306/db_42_44 read_behind=2h14m0s applied_behind=unknown pending_changes=118000 parked=true last_flush="10s ago"
+msg="reverse feed source behind" source=host-b:3306/db_42_44 read_behind=2h14m0s applied_behind=unknown pending_changes=118000 parked=true last_flush="10s ago" last_received="0s ago"
 ```
 
 - `read_behind` is how far the reader is behind the source's clock: now, minus the commit time of the newest event it has read from that target's binlog. `applied_behind` is the same for the newest change written to the source's `_old` tables, and is what a rollback started now would be missing. It is `unknown` until the first flush in this process that applies everything buffered (a resumed window does not know the commit time of the position it resumed from).
-- A source is `caught-up` when `read_behind` is under a minute. It is `idle`, and left out of the lag figures, when its newest event is older than that but its position has not moved since the previous report and nothing is buffered or parked: the target has written no binlog events in that time.
+- A source is `caught-up` when `read_behind` is under a minute. It is `idle`, and left out of the lag figures, when its newest event is older than that, its position has not moved since the previous report, nothing is buffered or parked, and its stream delivered something within the last minute: the target has written no binlog events in that time. The feed asks each target for a binlog heartbeat every 10 seconds of quiet, so a quiet target keeps delivering. A source whose stream has stopped delivering (a hung connection, a reconnect loop) is reported `behind`, and its line's `last_received` says how long ago it last heard from the target.
 - `pending_changes` is what has been read and not yet applied. `parked` counts sources whose reader is held back because its buffer is full.
-- Up to five `reverse feed source behind` lines follow, slowest first. `reverse feed caught up` is logged once every source is caught up or idle, and `reverse feed fell behind` (a warning) if one falls behind again afterwards.
+- Up to five `reverse feed source behind` lines follow, slowest first. `reverse feed caught up` is logged once every source is caught up or idle, and `reverse feed fell behind` (a warning) if one falls behind again afterwards. While the reverse feed is stopped and the window is restarting it, the progress line is replaced by a `reverse feed stopped; progress is not tracked until it restarts` warning, and tracking starts over when the feed restarts.
 
 The reverse feed also logs `reverse feed started` once every source's stream is open. It does not wait for the sources to catch up; the progress lines report that.
 

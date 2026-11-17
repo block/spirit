@@ -254,6 +254,10 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-progressTicker.C:
+				if ferr := w.feed.Err(); ferr != nil {
+					progress.logStopped(r.logger, ferr, w.feed.Restartable())
+					continue
+				}
 				now := time.Now()
 				progress.log(r.logger, now, progress.report(now, w.feed.Progress()))
 			case <-checkpointTicker.C:
@@ -351,6 +355,10 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					restarts++
 					restartedAt = time.Now()
 					revertPendingLogged = false
+					// The replacement feed resumes from the checkpoint, so its
+					// catch-up starts over: track it from scratch rather than
+					// compare its positions with the stopped feed's.
+					progress = newReverseFeedProgress(w.sourceLabels(), restartedAt)
 					r.logger.Info("reverse feed restarted from its last checkpointed position; the reverse window stays open",
 						"stopped_on", ferr.Error(), "restarts", restarts, "failed_attempts", failedRestarts,
 						"next_restart_no_sooner_than", retryIn)
