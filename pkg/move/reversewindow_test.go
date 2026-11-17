@@ -2297,3 +2297,109 @@ func TestMoveReverseWindowRevertWaitsForSourceToCatchUp(t *testing.T) {
 	require.NoError(t, ctl.QueryRowContext(t.Context(), "SELECT val FROM rwcu_src.t1 WHERE id=500").Scan(&val))
 	require.Equal(t, "too big for _old", val, "the change the feed failed on must reach the source before traffic returns")
 }
+
+// modFourHasher shards an int64 id over four equal key ranges ("-40",
+// "40-80", "80-c0", "c0-") by id % 4.
+func modFourHasher(colAny any) (uint64, error) {
+	col, ok := colAny.(int64)
+	if !ok {
+		return 0, fmt.Errorf("expected int64 for sharding column, got %T", colAny)
+	}
+	return uint64(col%4)<<62 | uint64(col)&(1<<62-1), nil
+}
+
+// TestMoveReverseWindowRevertManyTargetsTinyBudget: a 1:4 move with two tables
+// whose reverse feed runs on a memory budget far below the window's writes
+// still applies every one of them, and a revert then hands the source back
+// with no row lost. Every reverse subscription is held at the per-subscription
+// floor, and each target writes more than that floor to each table in one
+// transaction, so the readers park on their soft limits — including when the
+// reverse cutover pauses the periodic flush and drains the feed under the
+// locks.
+func TestMoveReverseWindowRevertManyTargetsTinyBudget(t *testing.T) {
+	t.Parallel()
+	keyRanges := []string{"-40", "40-80", "80-c0", "c0-"}
+	srcName, _ := testutils.CreateUniqueTestDatabase(t)
+	tgtNames := make([]string, len(keyRanges))
+	for i := range tgtNames {
+		tgtNames[i], _ = testutils.CreateUniqueTestDatabase(t)
+	}
+	for _, tbl := range budgetTables {
+		testutils.RunSQLInDatabase(t, srcName, "CREATE TABLE "+tbl+" (id BIGINT NOT NULL PRIMARY KEY, val MEDIUMTEXT NOT NULL)")
+		testutils.RunSQLInDatabase(t, srcName, "INSERT INTO "+tbl+` (id, val)
+			WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 40)
+			SELECT n, CONCAT('seed-', n) FROM seq`)
+	}
+
+	dbConfig := dbconn.NewDBConfig()
+	targets := make([]applier.Target, len(keyRanges))
+	for i, name := range tgtNames {
+		db, err := dbconn.New(testutils.DSNForDatabase(name), dbConfig)
+		require.NoError(t, err)
+		cfg, err := mysql.ParseDSN(testutils.DSNForDatabase(name))
+		require.NoError(t, err)
+		targets[i] = applier.Target{DB: db, Config: cfg, KeyRange: keyRanges[i]}
+	}
+	// The checkpoint (and the revert marker) live on the sorted targets[0].
+	checkpointDB := targets[0]
+	for _, tgt := range targets[1:] {
+		if targetKey(tgt) < targetKey(checkpointDB) {
+			checkpointDB = tgt
+		}
+	}
+
+	runner, err := NewRunner(&Move{
+		SourceDSN:               testutils.DSNForDatabase(srcName),
+		Targets:                 targets,
+		ShardingProvider:        &testShardingProvider{shardingColumn: "id", hashFunc: modFourHasher},
+		Common:                  flags.Common{Threads: 1, WriteThreads: 1},
+		ReverseWindow:           2 * time.Minute, // long; the revert ends it early
+		ReverseFeedMemoryBudget: 1,               // every subscription at the floor
+	})
+	require.NoError(t, err)
+	shortenReverseWindowPolling(runner)
+	logs := &lockedBuffer{}
+	runner.SetLogger(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	runner.SetCutover(func(context.Context) error { return nil })
+	var reverseCutoverCalled atomic.Bool
+	runner.SetReverseCutover(func(context.Context) error { reverseCutoverCalled.Store(true); return nil })
+	h := startRun(t, runner)
+
+	ctl, err := sql.Open("block-mysql", testutils.DSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(ctl) })
+	h.awaitReverseWindow(ctl, checkpointDB.Config.DBName)
+
+	// Window-time app writes on every target: a wide batch per table, each
+	// row on the shard that owns it, plus an update and a delete of seeded rows
+	// that shard owns.
+	for i, name := range tgtNames {
+		for _, tbl := range budgetTables {
+			testutils.RunSQLInDatabase(t, name, fmt.Sprintf(`INSERT INTO %s (id, val)
+				WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM seq WHERE n < %d)
+				SELECT 1000 + 4*n + %d, REPEAT(CHAR(97 + n %% 26), %d) FROM seq`, tbl, wideRowsBatch-1, i, wideRowBytes))
+			testutils.RunSQLInDatabase(t, name, fmt.Sprintf("UPDATE %s SET val='updated' WHERE id = %d", tbl, 4+i))
+			testutils.RunSQLInDatabase(t, name, fmt.Sprintf("DELETE FROM %s WHERE id = %d", tbl, 8+i))
+		}
+	}
+	testutils.RunSQL(t, "CREATE TABLE "+checkpointDB.Config.DBName+"."+revertMarkerName+" (id INT)")
+	h.awaitDone(2*time.Minute, "the reverse cutover to complete")
+	require.True(t, reverseCutoverCalled.Load(), "reverse cutover func must run on revert")
+
+	for _, tbl := range budgetTables {
+		require.True(t, tableExists(t, ctl, srcName, tbl), "source %s must be un-retired", tbl)
+		var union []string
+		for _, name := range tgtNames {
+			require.True(t, tableExists(t, ctl, name, tbl+"_revert"), "target %s.%s must be retired to _revert", name, tbl)
+			union = append(union, "SELECT id, val FROM "+name+"."+tbl+"_revert")
+		}
+		want := tableDigest(t, ctl, "("+strings.Join(union, " UNION ALL ")+") AS u")
+		require.Equal(t, want, tableDigest(t, ctl, srcName+"."+tbl), "source %s must equal the union of the targets", tbl)
+		require.Equal(t, fmt.Sprintf("rows=%d", 40-len(tgtNames)+len(tgtNames)*wideRowsBatch), strings.Fields(want)[0])
+	}
+
+	out := logs.String()
+	require.Contains(t, out, fmt.Sprintf("subscription_soft_limit_bytes=%d", minReverseSubscriptionSoftLimitBytes),
+		"the reverse feed must run at the budget's per-subscription share")
+	require.Contains(t, out, "subscription parked on soft limit", "the window's writes must have parked a reverse reader")
+}

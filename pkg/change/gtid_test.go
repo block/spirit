@@ -47,6 +47,26 @@ func TestSyncerConfigDecodeOptions(t *testing.T) {
 	}
 }
 
+// TestSyncerConfigEventCacheCount verifies ClientConfig.EventCacheCount reaches
+// the binlog syncer through configure (shared by both clients), and that zero or a
+// negative value leaves go-mysql's own default in place (it substitutes 10240
+// for zero, so a negative value must not be passed through).
+func TestSyncerConfigEventCacheCount(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	for _, tc := range []struct {
+		configured, want int
+	}{
+		{configured: 0, want: 0},
+		{configured: -1, want: 0},
+		{configured: 64, want: 64},
+	} {
+		var core feedCore
+		core.configure(nil, "127.0.0.1", "u", "p", nil, &ClientConfig{Logger: logger, EventCacheCount: tc.configured})
+		got := core.buildSyncerConfig("127.0.0.1", 3306).EventCacheCount
+		require.Equal(t, tc.want, got, "EventCacheCount=%d", tc.configured)
+	}
+}
+
 // TestRowsEventDecodeFuncSkipsUnsubscribed drives the decode filter directly:
 // events for tables without a subscription must get their header decoded (the
 // table name and LogPos come from there) but not their row images, and the

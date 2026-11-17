@@ -1,6 +1,7 @@
 package move
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -63,6 +64,89 @@ type ReverseSource struct {
 	Position string
 }
 
+// DefaultReverseFeedMemoryBudget is the total, across every subscription of a
+// reverse feed, of the change feed's per-subscription soft limits: 4 GiB.
+//
+// The change feed bounds each subscription (one per watched table per source)
+// separately, at change.DefaultSubscriptionSoftLimitBytes. A reverse feed has
+// one change client per move target, each subscribing to every moved table, so
+// with per-subscription defaults its ceiling grows as targets × tables: a move
+// with 128 target shards and 17 tables has 2,176 subscriptions, a ceiling of
+// over 500 GiB, and the reverse feed's catch-up after a resume, when every
+// client is behind its server at once, is exactly when buffers fill. The
+// budget is divided evenly across the subscriptions instead (see
+// reverseSubscriptionSoftLimitBytes).
+//
+// 4 GiB is 16 × change.DefaultSubscriptionSoftLimitBytes (256 MiB): a move
+// with up to 16 subscriptions keeps exactly the buffering it had without a
+// budget, and a larger one is bounded at a figure that leaves room for the
+// rest of the process in an 8–16 GiB container.
+const DefaultReverseFeedMemoryBudget int64 = 4 << 30
+
+// minReverseSubscriptionSoftLimitBytes is the smallest per-subscription soft
+// limit a budget is divided into. Below it the reader would park every few
+// hundred changes, and each park costs a flush round trip. When the floor
+// binds, the feed's ceiling is subscriptions × this floor, above the budget;
+// NewReverseFeed logs it.
+const minReverseSubscriptionSoftLimitBytes int64 = 1 << 20
+
+// DefaultReverseFeedEventCacheCount is the number of parsed binlog events each
+// reverse-feed client's streamer may hold ahead of the reader (see
+// change.ClientConfig.EventCacheCount). go-mysql's default, 10240, is per
+// client, so it too scales with the number of targets — and those events are
+// held outside the subscription soft limits, filling while the reader is
+// behind or parked. 256 events still keeps the network reader well ahead of
+// the row decoder.
+const DefaultReverseFeedEventCacheCount = 256
+
+// reverseSubscriptionSoftLimitBytes divides a reverse feed's total memory
+// budget evenly across its subscriptions, returning the per-subscription soft
+// limit to set as change.ClientConfig.SubscriptionSoftLimitBytes.
+//
+// budget is ReverseFeedConfig.MemoryBudget: zero selects
+// DefaultReverseFeedMemoryBudget, and a negative value opts out of the total
+// budget, returning 0 so the change feed applies its own per-subscription
+// default. The share is clamped to at most that default — a budget never
+// raises a subscription's limit above what it would have without one — and to
+// at least minReverseSubscriptionSoftLimitBytes.
+func reverseSubscriptionSoftLimitBytes(budget int64, subscriptions int) int64 {
+	if budget < 0 {
+		return 0
+	}
+	if budget == 0 {
+		budget = DefaultReverseFeedMemoryBudget
+	}
+	share := budget / int64(max(subscriptions, 1))
+	return min(max(share, minReverseSubscriptionSoftLimitBytes), change.DefaultSubscriptionSoftLimitBytes)
+}
+
+// reverseFeedLimits are a ReverseFeedConfig's memory settings, resolved to
+// what every source's change.ClientConfig is given.
+type reverseFeedLimits struct {
+	budget          int64 // the resolved total budget; meaningless when softLimitBytes is 0
+	subscriptions   int   // across every source
+	softLimitBytes  int64 // change.ClientConfig.SubscriptionSoftLimitBytes; 0 = the change feed's default
+	eventCacheCount int   // change.ClientConfig.EventCacheCount; 0 = go-mysql's default
+}
+
+// resolveReverseFeedLimits resolves cfg's MemoryBudget and EventCacheCount.
+// Every source subscribes to its own tables, so the subscriptions the budget
+// is divided across are the sum over the sources.
+func resolveReverseFeedLimits(cfg ReverseFeedConfig) reverseFeedLimits {
+	l := reverseFeedLimits{budget: cmp.Or(cfg.MemoryBudget, DefaultReverseFeedMemoryBudget)}
+	for _, src := range cfg.Sources {
+		l.subscriptions += len(src.Tables)
+	}
+	l.softLimitBytes = reverseSubscriptionSoftLimitBytes(cfg.MemoryBudget, l.subscriptions)
+	switch {
+	case cfg.EventCacheCount == 0:
+		l.eventCacheCount = DefaultReverseFeedEventCacheCount
+	case cfg.EventCacheCount > 0:
+		l.eventCacheCount = cfg.EventCacheCount
+	}
+	return l
+}
+
 // ReverseFeedConfig configures a ReverseFeed.
 type ReverseFeedConfig struct {
 	Sources []ReverseSource
@@ -91,6 +175,24 @@ type ReverseFeedConfig struct {
 	DBConfig      *dbconn.DBConfig
 	Threads       int           // applier write threads; 0 => default (4)
 	FlushInterval time.Duration // 0 => change.DefaultFlushInterval
+
+	// MemoryBudget is the total, in bytes, of the soft limits of every
+	// subscription across every source: each subscription's limit is this
+	// divided by the number of subscriptions (see
+	// reverseSubscriptionSoftLimitBytes). 0 => DefaultReverseFeedMemoryBudget;
+	// negative => no total budget, each subscription at the change feed's own
+	// per-subscription default.
+	//
+	// The limit is soft in the change feed's sense: a subscription at its
+	// limit parks the binlog reader of its source until a flush applies part
+	// of the buffer, so a small budget slows the feed but loses no change.
+	// The streamers' parsed-event caches (EventCacheCount) are held outside
+	// it.
+	MemoryBudget int64
+	// EventCacheCount is each source client's streamer event cache (see
+	// change.ClientConfig.EventCacheCount). 0 =>
+	// DefaultReverseFeedEventCacheCount; negative => go-mysql's default.
+	EventCacheCount int
 }
 
 // ReverseFeed is a running change-only reverse feed: one change.Source per
@@ -187,6 +289,22 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 		return nil, fmt.Errorf("reverse feed: create applier: %w", err)
 	}
 
+	limits := resolveReverseFeedLimits(cfg)
+	if limits.softLimitBytes > 0 {
+		logger.Info("reverse feed memory budget",
+			"budget_bytes", limits.budget,
+			"subscriptions", limits.subscriptions,
+			"subscription_soft_limit_bytes", limits.softLimitBytes,
+			"event_cache_count", limits.eventCacheCount)
+		if ceiling := limits.softLimitBytes * int64(limits.subscriptions); ceiling > limits.budget {
+			logger.Warn("reverse feed memory budget is below the per-subscription minimum; buffers may exceed it",
+				"budget_bytes", limits.budget,
+				"subscriptions", limits.subscriptions,
+				"subscription_soft_limit_bytes", limits.softLimitBytes,
+				"ceiling_bytes", ceiling)
+		}
+	}
+
 	rf := &ReverseFeed{
 		sources:  cfg.Sources,
 		logger:   logger,
@@ -214,6 +332,10 @@ func NewReverseFeed(ctx context.Context, cfg ReverseFeedConfig) (_ *ReverseFeed,
 			ServerID:   change.NewServerID(),
 			DBConfig:   dbCfg,
 			CancelFunc: rf.onFatal,
+			// The feed's share of the memory budget: zero (a negative
+			// budget) leaves the change feed's per-subscription default.
+			SubscriptionSoftLimitBytes: limits.softLimitBytes,
+			EventCacheCount:            limits.eventCacheCount,
 		}
 		// The captured start position's own encoding selects the change
 		// source implementation: it was captured by targetCurrentPosition in

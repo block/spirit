@@ -48,6 +48,7 @@ The target check runs before the copy and on resume, before move writes anything
 - [lock-wait-timeout](#lock-wait-timeout)
 - [max-commit-latency](#max-commit-latency)
 - [max-connections](#max-connections)
+- [reverse-feed-memory-budget](#reverse-feed-memory-budget)
 - [reverse-window](#reverse-window)
 - [source-dsn](#source-dsn)
 - [target-chunk-size](#target-chunk-size)
@@ -154,6 +155,17 @@ The default of `100ms` is intentionally a high upper bound, so it trims only the
 Sets the fixed size of each source and target connection pool, matching `migrate`. Read and write workers share these pools; increasing worker counts does not grow them. Dedicated monitoring and advisory-lock connections are separate.
 
 The explicit budget must cover `--threads` plus six connections of checksum headroom. During setup, the reserve grows by one connection per source table beyond the first. For example, 20 tables reserve 25 connections, and a smaller pool lowers read concurrency to a minimum of one, allowing background queries to queue. Reusing a connection handle across targets also requires room for each target’s checksum snapshots and locks. Any reduction in read concurrency is logged at INFO. Write workers may wait for a connection. This is a per-pool limit, not a total across the move.
+
+### reverse-feed-memory-budget
+
+- Type: Integer (bytes)
+- Default value: `4294967296` (4 GiB)
+
+During a [`--reverse-window`](#reverse-window), bounds the memory the reverse feed uses to buffer changes from the targets before it applies them to the source. The reverse feed tails every target and buffers each moved table separately, so without a total bound its memory would grow with targets × tables — a move with 128 target shards and 17 tables has 2,176 buffers. The budget is divided evenly across them, with each buffer's share capped at the 256 MiB a buffer has on its own, so a move with up to 16 buffers (for example 4 targets × 4 tables) is unaffected by the default. No buffer is given less than 1 MiB; when the budget divided by the number of buffers is below that, the reverse feed may use more than the budget, and logs a warning saying how much.
+
+A buffer that reaches its share pauses reading that target's binary log until part of it has been applied. A smaller budget therefore makes the reverse feed slower to catch up — for example after a resume — but it does not skip or lose changes. A negative value removes the total bound and gives every buffer 256 MiB.
+
+The bound covers buffered changes, not all of the process's memory. Each target's binary log reader also holds up to 256 decoded events of its own.
 
 ### reverse-window
 
