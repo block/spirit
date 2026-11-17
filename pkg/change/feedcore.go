@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
@@ -82,7 +81,7 @@ type feedCore struct {
 	// runs would race.
 	streamer *replication.BinlogStreamer
 
-	applier applier.StreamedChangesWriter
+	applier contract.StreamedChangesWriter
 
 	// subs owns the table-keyed subscription set and its own lock. See
 	// subscriptionRegistry. The client mutex above does NOT cover map
@@ -205,7 +204,7 @@ type flushFunc func(ctx context.Context, underLock bool, locks []contract.TableL
 // resolving the soft-limit defaults: zero selects the package default and a
 // negative value is an explicit opt-out (stored as zero, which disables the
 // cap). c must be the zero value embedded in a freshly allocated client.
-func (c *feedCore) configure(db *sql.DB, host, username, password string, appl applier.StreamedChangesWriter, config *ClientConfig) {
+func (c *feedCore) configure(db *sql.DB, host, username, password string, appl contract.StreamedChangesWriter, config *ClientConfig) {
 	if config.DBConfig == nil {
 		config.DBConfig = dbconn.NewDBConfig() // default DB config
 	}

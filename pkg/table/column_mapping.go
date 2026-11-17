@@ -1,8 +1,11 @@
 package table
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
@@ -194,9 +197,10 @@ func isNumericColumnType(tp string) bool {
 	}
 }
 
-// ColumnsSlice returns parallel slices of source and target column names.
-// sourceColumns[i] corresponds to targetColumns[i].
-func (m *ColumnMapping) ColumnsSlice() (sourceColumns, targetColumns []string) {
+// ColumnPairs returns parallel slices of source and target column names.
+// sourceColumns[i] corresponds to targetColumns[i]. It satisfies
+// contract.ColumnMapping.
+func (m *ColumnMapping) ColumnPairs() (sourceColumns, targetColumns []string) {
 	return m.sourceColumns, m.targetColumns
 }
 
@@ -239,7 +243,7 @@ func (m *ColumnMapping) ChecksumExprs() (source, target string, err error) {
 }
 
 // ChecksumCastTypes returns the type each mapped column is CAST to by
-// ChecksumExprs, parallel to ColumnsSlice. The type is shared by both sides so
+// ChecksumExprs, parallel to ColumnPairs. The type is shared by both sides so
 // that type conversions (e.g. INT→BIGINT) are applied consistently; see
 // checksumCastTp for how it is chosen. Each column's type is looked up in its
 // own table under that table's column name, so renames are honoured.
@@ -287,4 +291,40 @@ func (m *ColumnMapping) TargetTable() *TableInfo {
 // SourceTable returns the source table.
 func (m *ColumnMapping) SourceTable() *TableInfo {
 	return m.sourceTable
+}
+
+var _ contract.ColumnMapping = (*ColumnMapping)(nil)
+
+// Source returns SourceTable as a contract.Table. It satisfies
+// contract.ColumnMapping.
+func (m *ColumnMapping) Source() contract.Table {
+	return m.sourceTable
+}
+
+// Target returns TargetTable as a contract.Table. It satisfies
+// contract.ColumnMapping.
+func (m *ColumnMapping) Target() contract.Table {
+	return m.targetTable
+}
+
+// AsColumnMapping returns m as a *ColumnMapping, for spirit code that
+// receives a contract.ColumnMapping but needs what the contract does not
+// carry: the source's MySQL column types, its sharding column and hash, the
+// precomputed ordinals and the quoted target name. A non-nil result always
+// has a non-nil source and target table.
+//
+// A nil m, a nil *ColumnMapping, and any other implementation are errors:
+// spirit's MySQL applier can only write through a mapping it built from
+// tables it read itself.
+func AsColumnMapping(m contract.ColumnMapping) (*ColumnMapping, error) {
+	cm, ok := m.(*ColumnMapping)
+	switch {
+	case m == nil || (ok && cm == nil):
+		return nil, errors.New("column mapping is nil")
+	case !ok:
+		return nil, fmt.Errorf("column mapping is a %T, not a *table.ColumnMapping", m)
+	case cm.sourceTable == nil || cm.targetTable == nil:
+		return nil, errors.New("column mapping has no source or target table")
+	}
+	return cm, nil
 }

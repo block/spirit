@@ -319,7 +319,7 @@ func expectedImageCRC(ctx context.Context, sourceDB *sql.DB, chunk *table.Chunk,
 	if err != nil {
 		return 0, err
 	}
-	columns, _ := chunk.ColumnMapping.ColumnsSlice()
+	columns, _ := chunk.ColumnMapping.ColumnPairs()
 	ordinals := chunk.ColumnMapping.SourceOrdinalIndices()
 	values := make([]any, len(ordinals))
 	placeholders := make([]string, len(ordinals))

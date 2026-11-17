@@ -2,6 +2,7 @@ package change
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -144,7 +145,7 @@ type bufferedMap struct {
 	// bufferedMap stays source-agnostic and can be reused by alternative
 	// implementations (e.g. a VStream change.Source).
 	logger  *slog.Logger
-	applier applier.StreamedChangesWriter // writes changes to the target
+	applier contract.StreamedChangesWriter // writes changes to the target
 
 	table    *table.TableInfo
 	newTable *table.TableInfo
@@ -312,7 +313,7 @@ type BufferedSubscriptionConfig struct {
 	NewTable *table.TableInfo
 
 	// Applier writes batched changes to the target. Required.
-	Applier applier.StreamedChangesWriter
+	Applier contract.StreamedChangesWriter
 
 	// Chunker provides the watermark filter + column mapping. Required.
 	Chunker table.MappedChunker
@@ -382,6 +383,9 @@ func NewBufferedSubscription(cfg BufferedSubscriptionConfig) (Subscription, erro
 	}
 	if cfg.Chunker == nil {
 		return nil, fmt.Errorf("NewBufferedSubscription: Chunker is required")
+	}
+	if err := checkChunkerMapping(cfg); err != nil {
+		return nil, fmt.Errorf("NewBufferedSubscription: %w", err)
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -1967,12 +1971,35 @@ func (s *bufferedMap) flushMapLocked(ctx context.Context, underLock bool, locks 
 	return allChangesFlushed, nil
 }
 
+// checkChunkerMapping checks that the chunker's column mapping maps
+// cfg.CurrentTable onto cfg.NewTable (or onto CurrentTable itself when
+// NewTable is nil). The subscription buffers keys and row images of
+// CurrentTable, and flushes both deletes and upserts through that mapping, so
+// a mapping of other tables would write them somewhere else.
+func checkChunkerMapping(cfg BufferedSubscriptionConfig) error {
+	mapping := cfg.Chunker.ColumnMapping()
+	if mapping == nil {
+		return errors.New("chunker has no column mapping")
+	}
+	target := cfg.NewTable
+	if target == nil {
+		target = cfg.CurrentTable
+	}
+	if got, want := mapping.Source().ID(), cfg.CurrentTable.ID(); got != want {
+		return fmt.Errorf("chunker's column mapping reads %s.%s, not CurrentTable %s.%s", got.Schema, got.Name, want.Schema, want.Name)
+	}
+	if got, want := mapping.Target().ID(), target.ID(); got != want {
+		return fmt.Errorf("chunker's column mapping writes %s.%s, not %s.%s", got.Schema, got.Name, want.Schema, want.Name)
+	}
+	return nil
+}
+
 // flushBatch flushes a batch of deletes and upserts using the applier.
 // deleteKeys holds the typed PK tuples of the rows to delete (one tuple
 // per entry, in KeyColumns order).
 // If locks is non-empty, the operations are executed under the table
 // lock(s) — one lock per target server, matched to its target by the
-// applier (see applier.StreamedChangesWriter.DeleteKeys for the contract).
+// applier (see contract.StreamedChangesWriter for the lock contract).
 func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsertRows []contract.LogicalRow, locks []contract.TableLock) error {
 	if len(deleteKeys) == 0 && len(upsertRows) == 0 {
 		return nil
@@ -1980,9 +2007,13 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 	startTime := time.Now()
 	var deleteAffected, upsertAffected int64
 
+	// Deletes and upserts go through the same mapping, so they address the
+	// same target (NewBufferedSubscription checked it against the tables).
+	mapping := s.chunker.ColumnMapping()
+
 	// Execute deletes
 	if len(deleteKeys) > 0 {
-		affectedRows, err := s.applier.DeleteKeys(ctx, s.table, s.newTable, deleteKeys, locks)
+		affectedRows, err := s.applier.DeleteKeys(ctx, mapping, deleteKeys, locks)
 		if err != nil {
 			return fmt.Errorf("failed to delete keys: %w", err)
 		}
@@ -1991,7 +2022,7 @@ func (s *bufferedMap) flushBatch(ctx context.Context, deleteKeys [][]any, upsert
 
 	// Execute upserts
 	if len(upsertRows) > 0 {
-		affectedRows, err := s.applier.UpsertRows(ctx, s.chunker.ColumnMapping(), upsertRows, locks)
+		affectedRows, err := s.applier.UpsertRows(ctx, mapping, upsertRows, locks)
 		if err != nil {
 			return fmt.Errorf("failed to upsert rows: %w", err)
 		}

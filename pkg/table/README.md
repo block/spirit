@@ -58,9 +58,10 @@ The optimistic and composite chunkers implement `MappedChunker`. Its key questio
 
 It provides:
 - `Columns()` — returns the comma-separated source and target column lists for the applier's `INSERT IGNORE` and `REPLACE` statements
-- `ColumnsSlice()` — returns the column lists as slices
+- `ColumnPairs()` — returns the column lists as slices
 - `ChecksumExprs()` — returns expressions for CRC32-based checksum comparison, handling type casting and renamed columns
 - `SourceTable()` / `TargetTable()` — returns the source/target `TableInfo`
+- `Source()` / `Target()` — the same tables as `contract.Table`. With `ColumnPairs()` they make `*ColumnMapping` a `contract.ColumnMapping`; `AsColumnMapping` converts back, and errors for a nil mapping or another implementation
 - `SourceOrdinalIndices()` — returns the position of each mapped source column in the full column list, for indexing binlog row images
 
 The mapped columns are the target's non-generated columns that have a source counterpart (by name, or through a rename). The source counterpart may itself be a generated column: `MODIFY g INT` on a `STORED` generated column makes it a regular column that keeps its values, so its values are copied, replayed from the binlog and checksummed. A column that is generated on the target is never written. With renames, the mapping maps old column names in the source to new column names in the target for all SQL generation.

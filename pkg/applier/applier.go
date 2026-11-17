@@ -80,9 +80,9 @@ type ApplyCallback func(affectedRows int64, err error)
 // - Tracking pending writes
 // - Invoking callbacks when writes are complete
 type Applier interface {
-	// StreamedChangesWriter is the synchronous write path a change feed's
-	// subscription flushes through.
-	StreamedChangesWriter
+	// contract.StreamedChangesWriter is the synchronous write path a change
+	// feed's subscription flushes through.
+	contract.StreamedChangesWriter
 
 	// Start initializes the applier and starts its workers
 	Start(ctx context.Context) error
@@ -112,34 +112,6 @@ type Applier interface {
 	// GetTargets returns target information for direct database access.
 	// This is used by operations like checksum that need to query targets directly.
 	GetTargets() []Target
-}
-
-// StreamedChangesWriter writes streamed row changes to the target(s)
-// synchronously: the changes a change feed's subscription has buffered, as
-// deletes by key and upserts of full row images. It is the part of Applier a
-// subscription's flush uses; the copier's asynchronous Apply path is not part
-// of it.
-type StreamedChangesWriter interface {
-	// DeleteKeys deletes rows by their key values synchronously. Each entry
-	// in keys is one key tuple of the original (typed) column values, in
-	// sourceTable.KeyColumns order.
-	// An empty locks slice means no under-lock flush: the delete runs on the
-	// regular write connection(s). When locks is non-empty, the delete is
-	// executed under the supplied table lock(s): one lock per target, each
-	// acquired on that target's own connection (the same *sql.DB as
-	// Target.DB). Each target's statements run under that target's lock,
-	// matched by connection identity. A missing lock for any target, or a lock
-	// that matches no target, is an error.
-	// Returns the number of rows affected and any error.
-	DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error)
-
-	// UpsertRows performs an upsert (REPLACE INTO ... VALUES) synchronously.
-	// The rows are contract.LogicalRow structs containing the row images.
-	// An empty locks slice means no under-lock flush; when locks is non-empty
-	// the upsert is executed under the supplied table lock(s). See DeleteKeys
-	// for the lock contract (one lock per target).
-	// Returns the number of rows affected and any error.
-	UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error)
 }
 
 // deleteKeysInClause renders key value tuples into the element list of a

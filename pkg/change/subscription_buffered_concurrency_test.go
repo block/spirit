@@ -52,7 +52,7 @@ func (g *gatedApplier) announce() {
 	}
 }
 
-func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (g *gatedApplier) UpsertRows(ctx context.Context, mapping contract.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	g.announce()
 	if g.upsertGate != nil {
 		<-g.upsertGate
@@ -66,7 +66,7 @@ func (g *gatedApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 	return g.MockApplier.UpsertRows(ctx, mapping, rows, locks)
 }
 
-func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable *table.TableInfo, keys [][]any, locks []contract.TableLock) (int64, error) {
+func (g *gatedApplier) DeleteKeys(ctx context.Context, mapping contract.ColumnMapping, keys [][]any, locks []contract.TableLock) (int64, error) {
 	g.announce()
 	if g.deleteGate != nil {
 		<-g.deleteGate
@@ -74,7 +74,7 @@ func (g *gatedApplier) DeleteKeys(ctx context.Context, sourceTable, targetTable 
 	if g.failDeletes.Load() {
 		return 0, errInjected
 	}
-	return g.MockApplier.DeleteKeys(ctx, sourceTable, targetTable, keys, locks)
+	return g.MockApplier.DeleteKeys(ctx, mapping, keys, locks)
 }
 
 // awaitEntered blocks until the applier reports a gated call in
@@ -517,9 +517,9 @@ type orderRecordingApplier struct {
 	order []string
 }
 
-func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
+func (a *orderRecordingApplier) UpsertRows(ctx context.Context, mapping contract.ColumnMapping, rows []contract.LogicalRow, locks []contract.TableLock) (int64, error) {
 	a.mu.Lock()
-	a.order = append(a.order, mapping.SourceTable().TableName)
+	a.order = append(a.order, mapping.Source().ID().Name)
 	a.mu.Unlock()
 	return a.Applier.UpsertRows(ctx, mapping, rows, locks)
 }

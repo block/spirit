@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -43,7 +42,7 @@ type binlogClient struct {
 // returned Source talks to MySQL via go-mysql's BinlogSyncer; future
 // alternative sources (e.g. VStream) will live behind their own
 // constructors. config.Applier is required.
-func NewBinlogClient(db *sql.DB, host string, username, password string, appl applier.StreamedChangesWriter, config *ClientConfig) Source {
+func NewBinlogClient(db *sql.DB, host string, username, password string, appl contract.StreamedChangesWriter, config *ClientConfig) Source {
 	c := &binlogClient{}
 	c.configure(db, host, username, password, appl, config)
 	return c

@@ -1,6 +1,7 @@
 package change
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -2156,4 +2157,79 @@ func TestBufferedMapWideRowsFlushSplitsStatements(t *testing.T) {
 		"SELECT CONCAT(COUNT(*), '-', BIT_XOR(CRC32(CONCAT(id, payload)))) FROM %s", dstTable.QuotedTableName)).Scan(&dstSum)
 	require.NoError(t, err)
 	require.Equal(t, srcSum, dstSum, "source and destination must match after a split flush")
+}
+
+// mappingRecordingWriter records the mapping each DeleteKeys and UpsertRows
+// call receives.
+type mappingRecordingWriter struct {
+	applier.MockApplier
+	deleteMappings, upsertMappings []contract.ColumnMapping
+}
+
+func (w *mappingRecordingWriter) DeleteKeys(_ context.Context, mapping contract.ColumnMapping, keys [][]any, _ []contract.TableLock) (int64, error) {
+	w.deleteMappings = append(w.deleteMappings, mapping)
+	return int64(len(keys)), nil
+}
+
+func (w *mappingRecordingWriter) UpsertRows(_ context.Context, mapping contract.ColumnMapping, rows []contract.LogicalRow, _ []contract.TableLock) (int64, error) {
+	w.upsertMappings = append(w.upsertMappings, mapping)
+	return int64(len(rows)), nil
+}
+
+// TestFlushWritesThroughChunkerMapping pins that a flush hands the writer the
+// chunker's column mapping for deletes as well as upserts, so both address
+// the same target table.
+func TestFlushWritesThroughChunkerMapping(t *testing.T) {
+	src := &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	dst := &table.TableInfo{SchemaName: "test", TableName: "_t1_new", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	mapping := table.NewColumnMapping(src, dst, nil)
+	chunker := table.NewMockChunker("t1", 1000)
+	chunker.SetColumnMapping(mapping)
+	w := &mappingRecordingWriter{}
+	sub, err := NewBufferedSubscription(BufferedSubscriptionConfig{
+		CurrentTable: src,
+		NewTable:     dst,
+		Applier:      w,
+		Chunker:      chunker,
+	})
+	require.NoError(t, err)
+	sub.HasChanged([]any{int64(1)}, []any{int64(1)}, true)
+	sub.HasChanged([]any{int64(2)}, []any{int64(2)}, false)
+	allFlushed, err := sub.Flush(t.Context(), false, nil)
+	require.NoError(t, err)
+	require.True(t, allFlushed)
+	require.Len(t, w.deleteMappings, 1)
+	require.Len(t, w.upsertMappings, 1)
+	require.Same(t, mapping, w.deleteMappings[0])
+	require.Same(t, mapping, w.upsertMappings[0])
+}
+
+// TestNewBufferedSubscriptionChecksChunkerMapping pins that the chunker's
+// column mapping must map CurrentTable onto NewTable, or onto CurrentTable
+// itself when NewTable is nil: the subscription flushes deletes and upserts
+// through it.
+func TestNewBufferedSubscriptionChecksChunkerMapping(t *testing.T) {
+	src := &table.TableInfo{SchemaName: "test", TableName: "t1", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	dst := &table.TableInfo{SchemaName: "test", TableName: "_t1_new", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	other := &table.TableInfo{SchemaName: "test", TableName: "t2", Columns: []string{"id"}, KeyColumns: []string{"id"}}
+	build := func(newTable *table.TableInfo, mapping *table.ColumnMapping) error {
+		chunker := table.NewMockChunker("t1", 1000)
+		chunker.SetColumnMapping(mapping)
+		_, err := NewBufferedSubscription(BufferedSubscriptionConfig{
+			CurrentTable: src,
+			NewTable:     newTable,
+			Applier:      &applier.MockApplier{},
+			Chunker:      chunker,
+		})
+		return err
+	}
+
+	require.NoError(t, build(dst, table.NewColumnMapping(src, dst, nil)))
+	require.NoError(t, build(nil, table.NewColumnMapping(src, nil, nil)))
+	require.EqualError(t, build(dst, table.NewColumnMapping(other, dst, nil)),
+		"NewBufferedSubscription: chunker's column mapping reads test.t2, not CurrentTable test.t1")
+	require.EqualError(t, build(dst, table.NewColumnMapping(src, other, nil)),
+		"NewBufferedSubscription: chunker's column mapping writes test.t2, not test._t1_new")
+	require.EqualError(t, build(nil, table.NewColumnMapping(src, dst, nil)),
+		"NewBufferedSubscription: chunker's column mapping writes test._t1_new, not test.t1")
 }

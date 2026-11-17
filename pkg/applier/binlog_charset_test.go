@@ -88,10 +88,10 @@ func TestApplierBinlogCharsets(t *testing.T) {
 			require.Equal(t, tc.want, hexRows(t, db, tc.target))
 
 			// Delete the key whose bytes, read as utf8mb4, are the other key.
-			_, err = applier.DeleteKeys(t.Context(), src, dst, [][]any{{"\xc3\xa9"}}, nil)
+			_, err = applier.DeleteKeys(t.Context(), table.NewColumnMapping(src, dst, nil), [][]any{{"\xc3\xa9"}}, nil)
 			require.NoError(t, err)
 			require.Equal(t, []string{tc.want[0], tc.want[2]}, hexRows(t, db, tc.target))
-			_, err = applier.DeleteKeys(t.Context(), src, dst, [][]any{{"\xe9"}}, nil)
+			_, err = applier.DeleteKeys(t.Context(), table.NewColumnMapping(src, dst, nil), [][]any{{"\xe9"}}, nil)
 			require.NoError(t, err)
 			require.Equal(t, []string{tc.want[0]}, hexRows(t, db, tc.target))
 		})

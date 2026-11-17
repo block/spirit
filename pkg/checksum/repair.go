@@ -157,7 +157,7 @@ func (r *chunkRepairer) Recopy(ctx context.Context, chunk *table.Chunk) error {
 	// does (pkg/copier/buffered.go): the predicate is a range over the primary
 	// key, and misleading statistics on a wide table can otherwise talk the
 	// optimizer into a scan.
-	sourceColumns, _ := chunk.ColumnMapping.ColumnsSlice()
+	sourceColumns, _ := chunk.ColumnMapping.ColumnPairs()
 	query := fmt.Sprintf("SELECT %s FROM %s FORCE INDEX (PRIMARY) WHERE %s",
 		chunk.ColumnMapping.SourceSelectList(),
 		chunk.Table.QuotedTableName,
