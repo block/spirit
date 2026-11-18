@@ -125,9 +125,11 @@ func persistReverseWindow(ctx context.Context, r *Runner) error {
 // reverseWindow drives the post-cutover reverse window: it stands up a
 // change-only reverse feed (targets → the source's _old tables) so the source
 // stays current, then holds until the window elapses (complete forward), a
-// revert is requested (reverse cutover), or the feed dies (complete forward —
-// rollback is no longer safe). It is a separate type so the Runner's methods
-// stay in runner.go.
+// revert is requested (reverse cutover), or the feed dies on a condition after
+// which rollback is no longer safe (complete forward). A feed that stops on a
+// failed flush or stream is restarted from its last checkpointed position
+// instead, and the window stays open. It is a separate type so the Runner's
+// methods stay in runner.go.
 type reverseWindow struct {
 	r    *Runner
 	feed *ReverseFeed
@@ -144,6 +146,12 @@ type reverseWindow struct {
 	// injectable so the loop's handling of a failed write can be tested
 	// without a live topology.
 	writeCheckpoint func(ctx context.Context, rec checkpoint.Record) error
+	// readRevertMarker and restart, when non-nil, replace the window loop's
+	// revert-marker read (revertMarkerExists on targets[0]) and its restart
+	// of a stopped feed (restartFeed), so the loop's handling of a stopped
+	// feed can be tested without live binlog streams.
+	readRevertMarker func(ctx context.Context) (bool, error)
+	restart          func(ctx context.Context) error
 }
 
 func newReverseWindow(r *Runner) *reverseWindow {
@@ -176,7 +184,9 @@ func (w *reverseWindow) run(ctx context.Context) error {
 	if err := w.buildFeed(ctx); err != nil {
 		return err
 	}
-	defer w.feed.Close() // idempotent; the terminal actions also close explicitly
+	// A closure, not `defer w.feed.Close()`: restartFeed replaces w.feed, and
+	// the feed to close on the way out is the one running then.
+	defer func() { w.feed.Close() }() // idempotent; the terminal actions also close explicitly
 	if err := w.feed.Start(ctx); err != nil {
 		return fmt.Errorf("reverse window: start feed: %w", err)
 	}
@@ -184,8 +194,11 @@ func (w *reverseWindow) run(ctx context.Context) error {
 }
 
 // hold runs the window loop over a started feed until the window elapses, a
-// revert is requested, the feed dies, or ctx is cancelled, and performs the
-// terminal action.
+// revert is requested, the feed dies on a condition that makes rollback unsafe,
+// or ctx is cancelled, and performs the terminal action. A feed that stops on a
+// restartable condition (see ReverseFeed.Restartable) is restarted, with
+// backoff, for as long as the window is open; a revert requested meanwhile
+// runs once the feed is running again.
 func (w *reverseWindow) hold(ctx context.Context) error {
 	r := w.r
 	deadline := r.cutoverAt.Add(r.move.ReverseWindow)
@@ -201,17 +214,52 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 		defer ticker.Stop()
 		checkpointTicker := time.NewTicker(status.CheckpointDumpInterval)
 		defer checkpointTicker.Stop()
+		// The runner's status block stops at cutover, so this is the only
+		// periodic report of how far behind the reverse feed is.
+		progressTicker := time.NewTicker(cmp.Or(r.tunables.reverseFeedProgressInterval, defaultReverseFeedProgressInterval))
+		defer progressTicker.Stop()
+		progress := newReverseFeedProgress(w.sourceLabels(), time.Now())
 		// failedReverts counts reverse cutover attempts that failed before
 		// ownership moved (see errReverseCutoverAbandoned). After one, the
 		// next attempt waits until retryRevertAt, so a failing attempt does
 		// not lock the targets again on the next tick.
 		failedReverts := 0
+		// deferredReverts counts attempts deferred because the source was not
+		// yet up to date (errReverseFeedNotCaughtUp); they take no lock and
+		// do not count against DBConfig.MaxRetries. For logs.
+		deferredReverts := 0
 		var retryRevertAt time.Time
 		revertBackoff := cmp.Or(r.tunables.reverseCutoverInitialBackoff, defaultReverseCutoverInitialBackoff)
+		// Restarts of a stopped feed are spaced out by retryRestartAt, which
+		// every attempt sets, failed or not: a restart that succeeds can stop
+		// again on its first flush (the cause is often still there), and
+		// restarting on every tick would re-read every target's binlog from
+		// the checkpoint each time. restartBackoff doubles with each attempt
+		// and goes back to its initial value only once a restarted feed has
+		// stayed up for restartHealthyAfter — two flush intervals, so it has
+		// flushed at least once. failedRestarts counts attempts that
+		// failed since the last one that succeeded, and restarts the
+		// successful ones since the backoff was last reset; both are for logs.
+		failedRestarts, restarts := 0, 0
+		var retryRestartAt, restartedAt time.Time
+		initialRestartBackoff := cmp.Or(r.tunables.reverseFeedRestartInitialBackoff, defaultReverseFeedRestartInitialBackoff)
+		maxRestartBackoff := cmp.Or(r.tunables.reverseFeedRestartMaxBackoff, defaultReverseFeedRestartMaxBackoff)
+		restartHealthyAfter := 2 * cmp.Or(r.tunables.reverseFeedFlushInterval, defaultReverseFeedFlushInterval)
+		restartBackoff := initialRestartBackoff
+		// revertPendingLogged is set once a revert requested while the feed
+		// is stopped has been logged, so it is logged once per stop.
+		revertPendingLogged := false
 		for {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-progressTicker.C:
+				if ferr := w.feed.Err(); ferr != nil {
+					progress.logStopped(r.logger, ferr, w.feed.Restartable())
+					continue
+				}
+				now := time.Now()
+				progress.log(r.logger, now, progress.report(now, w.feed.sourceProgress()))
 			case <-checkpointTicker.C:
 				err := w.checkpointPositions(ctx)
 				if err == nil {
@@ -248,8 +296,82 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 				r.logger.Warn("could not checkpoint reverse feed positions; will retry", "error", err)
 			case <-ticker.C:
 				if ferr := w.feed.Err(); ferr != nil {
-					r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", ferr)
-					return w.completeForward(ctx)
+					if !w.feed.Restartable() {
+						r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", ferr)
+						return w.completeForward(ctx)
+					}
+					// The feed stopped without the watched tables changing:
+					// typically the source refused the flush's writes for a
+					// while (connection limits, a failover). The source is
+					// behind, not wrong, so keep the window open and restart
+					// the feed — the window's deadline still bounds it.
+					//
+					// A revert requested meanwhile cannot run: the reverse
+					// cutover drains the feed, and the source is missing the
+					// target writes the stopped feed did not apply. It runs
+					// on the first tick after a restart succeeds (its drain
+					// then applies the backlog under the target locks); until
+					// then it is logged, once per stop.
+					requested, rerr := w.revertRequested(ctx)
+					revertPending := rerr == nil && requested
+					if revertPending && !revertPendingLogged {
+						r.logger.Warn(fmt.Sprintf("revert requested (a table named %s exists on %s), but the reverse feed is stopped and the source is behind the targets; the revert runs once the feed is running again",
+							revertMarkerName, revertLoc), "deadline", deadline, "error", ferr.Error())
+						revertPendingLogged = true
+					}
+					if !time.Now().Before(deadline) {
+						if revertPending {
+							r.logger.Error(fmt.Sprintf("reverse window elapsed while the reverse feed was stopped; discarding the pending revert request (%s on %s) and completing forward: the source is behind the targets and cannot take traffic back",
+								revertMarkerName, revertLoc), "error", ferr.Error())
+						} else {
+							r.logger.Error("reverse window elapsed while the reverse feed was stopped; completing forward", "error", ferr.Error())
+						}
+						return w.completeForward(ctx)
+					}
+					if time.Now().Before(retryRestartAt) {
+						continue
+					}
+					restart := w.restart
+					if restart == nil {
+						restart = w.restartFeed
+					}
+					err := restart(ctx)
+					if errors.Is(err, errReverseFeedNotRestartable) {
+						r.logger.Error("reverse feed died mid-window; completing forward (rollback no longer safe)", "error", w.feed.Err())
+						return w.completeForward(ctx)
+					}
+					if err != nil && ctx.Err() != nil {
+						return ctx.Err()
+					}
+					retryIn := restartBackoff
+					retryRestartAt = time.Now().Add(retryIn)
+					restartBackoff = min(restartBackoff*2, maxRestartBackoff)
+					if err != nil {
+						failedRestarts++
+						r.logger.Warn("could not restart the reverse feed; the reverse window stays open and will try again",
+							"attempt", failedRestarts, "retry_in", retryIn, "deadline", deadline, "error", err.Error())
+						continue
+					}
+					restarts++
+					restartedAt = time.Now()
+					revertPendingLogged = false
+					// The replacement feed resumes from the checkpoint, so its
+					// catch-up starts over: track it from scratch rather than
+					// compare its positions with the stopped feed's.
+					progress = newReverseFeedProgress(w.sourceLabels(), restartedAt)
+					r.logger.Info("reverse feed restarted from its last checkpointed position; the reverse window stays open",
+						"stopped_on", ferr.Error(), "restarts", restarts, "failed_attempts", failedRestarts,
+						"next_restart_no_sooner_than", retryIn)
+					failedRestarts = 0
+					continue
+				}
+				if !restartedAt.IsZero() && time.Since(restartedAt) >= restartHealthyAfter {
+					r.logger.Info("restarted reverse feed has stayed up; resetting the restart backoff",
+						"up_for", time.Since(restartedAt).Round(time.Second), "restarts", restarts)
+					restarts = 0
+					restartedAt = time.Time{}
+					restartBackoff = initialRestartBackoff
+					retryRestartAt = time.Time{}
 				}
 				if time.Now().Before(retryRevertAt) {
 					continue
@@ -265,6 +387,23 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 					err := w.reverseCutover(ctx)
 					if err == nil {
 						return nil
+					}
+					if errors.Is(err, errReverseFeedNotCaughtUp) && ctx.Err() == nil {
+						// No lock was taken and nothing moved; the source is
+						// behind the targets. Wait for the feed, up to the
+						// deadline — the same bound as a revert requested
+						// while the feed is stopped.
+						if !time.Now().Before(deadline) {
+							r.logger.Error(fmt.Sprintf("reverse window elapsed before the reverse feed brought the source up to date; discarding the pending revert request (%s on %s) and completing forward: the source is behind the targets and cannot take traffic back",
+								revertMarkerName, revertLoc), "error", err.Error())
+							return w.completeForward(ctx)
+						}
+						deferredReverts++
+						r.logger.Warn("revert deferred: the reverse feed has not brought the source up to date; no lock was taken, and the reverse window will try again",
+							"deferrals", deferredReverts, "retry_in", revertBackoff, "deadline", deadline, "error", err.Error())
+						retryRevertAt = time.Now().Add(revertBackoff)
+						revertBackoff = min(revertBackoff*2, cmp.Or(r.tunables.reverseCutoverMaxBackoff, defaultReverseCutoverMaxBackoff))
+						continue
 					}
 					failedReverts++
 					if !w.mayRetryReverseCutover(ctx, err, failedReverts) {
@@ -297,7 +436,9 @@ func (w *reverseWindow) hold(ctx context.Context) error {
 func (w *reverseWindow) checkpointPositions(ctx context.Context) error {
 	r := w.r
 	if w.feed.Err() != nil {
-		return nil // the window is about to complete forward; leave the row alone
+		// The feed is stopped. Leave the row alone: a restarted feed resumes
+		// from it, and a feed that cannot be restarted completes forward.
+		return nil
 	}
 	feedPositions := w.feed.Positions()
 	positions := make(map[string]string, len(feedPositions))
@@ -428,6 +569,7 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 		DBConfig:      r.dbConfig,
 		Threads:       r.reverseWriteThreads,
 		FlushInterval: cmp.Or(r.tunables.reverseFeedFlushInterval, defaultReverseFeedFlushInterval),
+		MemoryBudget:  r.move.ReverseFeedMemoryBudget,
 	}
 	if sharded {
 		revTargets := make([]applier.Target, len(r.sources))
@@ -451,7 +593,74 @@ func (w *reverseWindow) buildFeed(ctx context.Context) error {
 	return nil
 }
 
+// restartFeed replaces a feed that stopped on a restartable condition with a
+// new one started from the last checkpointed positions (r.reversePositions:
+// the cutover capture, or a later flushed position written by
+// checkpointPositions). The stopped feed's flushed position did not advance
+// past the changes it failed to apply, and the checkpointed one is no later
+// than that, so the new feed replays them; the apply is idempotent (REPLACE /
+// DELETE by primary key), the same contract a resumed window relies on. On
+// failure w.feed is left as the stopped feed, so the next tick tries again.
+//
+// Closing the stopped feed waits for its other sources' streams, and one of
+// them can report a condition after which rollback is no longer safe (a schema
+// change) while it stops. That condition overrides the restartable one (see
+// ReverseFeed.onFatal), so the verdict is read again after Close, and
+// errReverseFeedNotRestartable returned rather than starting a new feed over
+// it.
+func (w *reverseWindow) restartFeed(ctx context.Context) error {
+	stopped := w.feed
+	stopped.Close()
+	if !stopped.Restartable() {
+		return errReverseFeedNotRestartable
+	}
+	if err := w.buildFeed(ctx); err != nil {
+		w.feed = stopped
+		return err
+	}
+	return w.startReplacementFeed(ctx, stopped)
+}
+
+// startReplacementFeed starts w.feed, built by restartFeed to replace
+// stopped. Start launches the sources one at a time, so when a later source
+// fails to start, an earlier one has already streamed and may have reported a
+// condition after which rollback is no longer safe; Start closes the new feed
+// either way. That verdict is kept — w.feed stays the new feed and
+// errReverseFeedNotRestartable sends the window to complete forward — rather
+// than discarded by putting back the stopped feed, whose own verdict is only
+// restartable. Otherwise the stopped feed goes back in place, and its Err
+// makes the next tick try again.
+func (w *reverseWindow) startReplacementFeed(ctx context.Context, stopped *ReverseFeed) error {
+	err := w.feed.Start(ctx)
+	if err == nil {
+		return nil
+	}
+	if w.feed.Err() != nil && !w.feed.Restartable() {
+		return errReverseFeedNotRestartable
+	}
+	w.feed = stopped
+	return fmt.Errorf("reverse window: restart feed: %w", err)
+}
+
+// errReverseFeedNotRestartable is restartFeed's report that the stopped feed
+// recorded a condition after which rollback is no longer safe while it was
+// being closed; the window completes forward.
+var errReverseFeedNotRestartable = errors.New("reverse feed is no longer restartable")
+
+// sourceLabels names each reverse source for the progress log, in feed order
+// (the feed has one source per target): its host:port/database.
+func (w *reverseWindow) sourceLabels() []string {
+	labels := make([]string, len(w.r.targets))
+	for i, tgt := range w.r.targets {
+		labels[i] = tgt.Config.Addr + "/" + tgt.Config.DBName
+	}
+	return labels
+}
+
 func (w *reverseWindow) revertRequested(ctx context.Context) (bool, error) {
+	if w.readRevertMarker != nil {
+		return w.readRevertMarker(ctx)
+	}
 	return revertMarkerExists(ctx, w.r.targets[0].DB)
 }
 
@@ -497,6 +706,19 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 			w.feed.ResumePeriodicFlush(ctx)
 		}
 	}()
+
+	// Bring the source up to date before taking any lock. A feed that was
+	// just restarted, or that is still replaying a backlog, may not be able to
+	// apply its changes yet: the source can still be refusing them (the
+	// condition that stopped the feed), or the backlog can take longer to
+	// apply than the target locks may be held. Finding that out under the
+	// locks would block the targets' writes for each attempt and use up the
+	// attempts the window allows. Found out here, it costs no lock and no
+	// attempt (see errReverseFeedNotCaughtUp): the revert waits, bounded by
+	// the window's deadline. The drain under the locks (step 2) is then short.
+	if err := w.preDrainFeed(ctx); err != nil {
+		return abandonReverseCutover(err)
+	}
 
 	timing := newLockTiming(r.logger, "reverse cutover")
 	defer func() { timing.log(err) }()
@@ -634,6 +856,16 @@ func (w *reverseWindow) reverseCutover(ctx context.Context) (err error) {
 	return w.finalizeReverse(finalizeCtx)
 }
 
+// defaultReverseFeedRestartInitialBackoff and
+// defaultReverseFeedRestartMaxBackoff bound the wait between attempts to
+// restart a reverse feed that stopped on a restartable condition. Tests shorten
+// them per Runner (tunables.reverseFeedRestartInitialBackoff /
+// reverseFeedRestartMaxBackoff).
+const (
+	defaultReverseFeedRestartInitialBackoff = 2 * time.Second
+	defaultReverseFeedRestartMaxBackoff     = 30 * time.Second
+)
+
 // defaultReverseCutoverInitialBackoff and defaultReverseCutoverMaxBackoff
 // bound the wait between reverse cutover attempts. Tests shorten them per
 // Runner (tunables.reverseCutoverInitialBackoff / reverseCutoverMaxBackoff).
@@ -689,6 +921,35 @@ func (w *reverseWindow) mayRetryReverseCutover(ctx context.Context, err error, f
 		failedReverts < w.r.dbConfig.MaxRetries
 }
 
+// errReverseFeedNotCaughtUp marks a reverse cutover attempt abandoned before it
+// took any lock because the reverse feed could not bring the source up to date
+// (see preDrainFeed). The source is behind, not wrong: the window waits and
+// tries again without counting the attempt against DBConfig.MaxRetries.
+var errReverseFeedNotCaughtUp = errors.New("the reverse feed has not brought the source up to date")
+
+// preDrainFeed flushes the reverse feed without holding any lock, bounded by
+// the cutover lock timeout: a backlog that takes longer than that to apply
+// would not fit under the locks either.
+func (w *reverseWindow) preDrainFeed(ctx context.Context) error {
+	timeout := w.r.move.cutoverLockTimeout()
+	drainCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := w.feed.Flush(drainCtx)
+	if err == nil {
+		err = w.feed.Err() // a feed that stopped meanwhile has not applied its changes
+	}
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(drainCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("reverse cutover: %w: flushing the backlog took longer than %s (--cutover-lock-timeout): %w", errReverseFeedNotCaughtUp, timeout, err)
+	}
+	return fmt.Errorf("reverse cutover: %w: %w", errReverseFeedNotCaughtUp, err)
+}
+
 // errReverseCutoverAbandoned marks a reverse cutover attempt that failed before
 // it wrote the reverting phase. Nothing has moved ownership: the targets still
 // serve and the reverse feed is still running, so the window may try again.
@@ -711,6 +972,13 @@ func (w *reverseWindow) drainFeed(ctx context.Context) error {
 	if !w.feed.AllChangesFlushed() {
 		return fmt.Errorf("reverse cutover: %w; refusing to discard buffered target writes",
 			change.ErrChangesNotFlushed)
+	}
+	// A feed can stop between the window loop's last look and here: a
+	// periodic flush that fails, or a stream that breaks, while this attempt
+	// is locking the targets. Its changes are then neither applied nor
+	// buffered, so an empty buffer does not mean the source is current.
+	if err := w.feed.Err(); err != nil {
+		return fmt.Errorf("reverse cutover: the reverse feed stopped: %w", err)
 	}
 	return nil
 }

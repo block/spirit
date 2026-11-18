@@ -47,6 +47,26 @@ func TestSyncerConfigDecodeOptions(t *testing.T) {
 	}
 }
 
+// TestSyncerConfigEventCacheCount verifies ClientConfig.EventCacheCount reaches
+// the binlog syncer through configure (shared by both clients), and that zero or a
+// negative value leaves go-mysql's own default in place (it substitutes 10240
+// for zero, so a negative value must not be passed through).
+func TestSyncerConfigEventCacheCount(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	for _, tc := range []struct {
+		configured, want int
+	}{
+		{configured: 0, want: 0},
+		{configured: -1, want: 0},
+		{configured: 64, want: 64},
+	} {
+		var core feedCore
+		core.configure(nil, "127.0.0.1", "u", "p", nil, &ClientConfig{Logger: logger, EventCacheCount: tc.configured})
+		got := core.buildSyncerConfig("127.0.0.1", 3306).EventCacheCount
+		require.Equal(t, tc.want, got, "EventCacheCount=%d", tc.configured)
+	}
+}
+
 // TestRowsEventDecodeFuncSkipsUnsubscribed drives the decode filter directly:
 // events for tables without a subscription must get their header decoded (the
 // table name and LogPos come from there) but not their row images, and the
@@ -1885,4 +1905,60 @@ func TestGTIDProcessRowsEventUnknownSubtype(t *testing.T) {
 	ev, rows = mkEvent(replication.PARTIAL_UPDATE_ROWS_EVENT, "not_subscribed", 3)
 	require.NoError(t, client.processRowsEvent(ev, rows))
 	require.Equal(t, 1, client.GetDeltaLen())
+}
+
+// TestGTIDFeedStatsFromLiveFeed: against a real server, the GTID client's
+// applied event time comes through its read path (the GTIDEvent's time,
+// published when the group is promoted), and a feed that asks for heartbeats
+// gets them. (On a GTID dump the first heartbeat can arrive within a second of
+// connecting, before any quiet: the dump thread also sends one while it skips
+// transactions the reader already has. This test checks only that heartbeats
+// are requested and recorded, not when they arrive.)
+func TestGTIDFeedStatsFromLiveFeed(t *testing.T) {
+	db, err := dbconn.New(testutils.DSN(), dbconn.NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var gtidMode string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@gtid_mode").Scan(&gtidMode))
+	if gtidMode != "ON" {
+		t.Skip("needs gtid_mode=ON")
+	}
+
+	testutils.RunSQL(t, "DROP TABLE IF EXISTS gtidfeedstatst1, gtidfeedstatst2")
+	testutils.RunSQL(t, "CREATE TABLE gtidfeedstatst1 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+	testutils.RunSQL(t, "CREATE TABLE gtidfeedstatst2 (a INT NOT NULL, b INT, PRIMARY KEY (a))")
+	t1 := table.NewTableInfo(db, "test", "gtidfeedstatst1")
+	require.NoError(t, t1.SetInfo(t.Context()))
+	t2 := table.NewTableInfo(db, "test", "gtidfeedstatst2")
+	require.NoError(t, t2.SetInfo(t.Context()))
+
+	cfg, err := mysql2.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	clientCfg := NewClientDefaultConfig()
+	clientCfg.HeartbeatPeriod = time.Second
+	client := NewGTIDClient(db, cfg.Addr, cfg.User, cfg.Passwd,
+		applier.NewSingleTargetForTest(t, db), clientCfg).(*gtidClient)
+	chunker, err := table.NewChunker(t1, table.ChunkerConfig{NewTable: t2})
+	require.NoError(t, err)
+	require.NoError(t, client.AddSubscription(t1, t2, chunker))
+	require.NoError(t, client.Start(t.Context()))
+	defer client.Close()
+
+	testutils.RunSQL(t, "INSERT INTO gtidfeedstatst1 (a, b) VALUES (1, 2), (3, 4)")
+	require.NoError(t, client.BlockWait(t.Context()))
+	require.NoError(t, client.flush(t.Context(), false, nil))
+
+	stats := client.FeedStats()
+	require.False(t, stats.FlushedEventAt.IsZero(), "a complete flush must stamp the applied event time")
+	require.WithinDuration(t, time.Now(), stats.FlushedEventAt, time.Minute,
+		"the applied time is the insert's commit time, seconds ago")
+	require.False(t, stats.FlushedEventAt.After(stats.BufferedEventAt), "nothing can be applied before it is read")
+	require.False(t, stats.LastReceivedAt.IsZero())
+	require.False(t, stats.LastCompleteFlushAt.IsZero())
+
+	// Parallel tests may be writing to the binlog, so a heartbeat is not
+	// guaranteed within one period; it is within the skip at connect or the
+	// first quiet period, whichever comes first.
+	require.Eventually(t, func() bool { return !client.FeedStats().LastHeartbeatAt.IsZero() },
+		30*time.Second, 50*time.Millisecond, "the server must send heartbeats the feed asked for")
 }

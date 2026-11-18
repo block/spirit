@@ -122,11 +122,20 @@ type tunables struct {
 	// reverseFeedFlushInterval is the reverse feed's periodic flush interval
 	// (defaultReverseFeedFlushInterval).
 	reverseFeedFlushInterval time.Duration
+	// reverseFeedProgressInterval is how often the reverse window logs the
+	// reverse feed's progress (defaultReverseFeedProgressInterval).
+	reverseFeedProgressInterval time.Duration
 	// reverseCutoverInitialBackoff and reverseCutoverMaxBackoff bound the
 	// wait between reverse cutover attempts
 	// (defaultReverseCutoverInitialBackoff, defaultReverseCutoverMaxBackoff).
 	reverseCutoverInitialBackoff time.Duration
 	reverseCutoverMaxBackoff     time.Duration
+	// reverseFeedRestartInitialBackoff and reverseFeedRestartMaxBackoff bound
+	// the wait between attempts to restart a stopped reverse feed
+	// (defaultReverseFeedRestartInitialBackoff,
+	// defaultReverseFeedRestartMaxBackoff).
+	reverseFeedRestartInitialBackoff time.Duration
+	reverseFeedRestartMaxBackoff     time.Duration
 	// tableStatUpdateInterval is how often the source tables' statistics are
 	// refreshed during the copy (defaultTableStatUpdateInterval).
 	tableStatUpdateInterval time.Duration

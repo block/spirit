@@ -49,6 +49,16 @@ type Move struct {
 	// reverseWindow (reversewindow.go).
 	ReverseWindow time.Duration `name:"reverse-window" help:"After cutover, reverse the move (change-only) and keep it alive for this long to allow rollback. 0 disables (normal cutover)." default:"0"`
 
+	// ReverseFeedMemoryBudget bounds, in bytes, the changes the reverse feed
+	// buffers in memory across all of its subscriptions (one per moved table
+	// per target) during a ReverseWindow. It is divided evenly across them as
+	// each subscription's soft limit, so the total does not grow with the
+	// number of targets. Zero (the zero value of a programmatic Move) means
+	// DefaultReverseFeedMemoryBudget; negative removes the total budget, leaving
+	// each subscription at the change feed's per-subscription default. See
+	// ReverseFeedConfig.MemoryBudget.
+	ReverseFeedMemoryBudget int64 `name:"reverse-feed-memory-budget" help:"During --reverse-window, the total memory (in bytes) the reverse feed may buffer, divided across its subscriptions (one per moved table per target). Negative removes the total budget" optional:"" default:"4294967296"`
+
 	// CutoverLockTimeout bounds, per attempt and from the moment every table
 	// lock is held, the work a cutover (and a reverse cutover) does under the
 	// locks before it switches traffic: the final flush, the checks under the

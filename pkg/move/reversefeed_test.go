@@ -12,14 +12,18 @@ package move
 // collision-free (the sequences/globally-unique-PK precondition from the design).
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/change"
+	"github.com/block/spirit/pkg/contract"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/testutils"
@@ -400,4 +404,271 @@ func TestReverseFeedAllChangesFlushed(t *testing.T) {
 		"one feed still holding changes must fail the check")
 	require.False(t, (&ReverseFeed{clients: []change.Source{stuck, clean}}).AllChangesFlushed(),
 		"order must not matter")
+}
+
+// TestReverseFeedRestartable pins which fatal conditions leave a reverse feed
+// restartable: only those that leave the watched tables unchanged.
+func TestReverseFeedRestartable(t *testing.T) {
+	t.Parallel()
+	healthy := &ReverseFeed{logger: slog.Default()}
+	require.False(t, healthy.Restartable(), "a healthy feed has nothing to restart")
+
+	for _, tc := range []struct {
+		reason      contract.FatalReason
+		restartable bool
+	}{
+		{contract.FatalReasonFlushError, true},
+		{contract.FatalReasonStreamError, true},
+		{contract.FatalReasonSchemaChange, false},
+		{contract.FatalReasonUnsupportedXA, false},
+		{contract.FatalReasonLogPosWrapped, false},
+	} {
+		t.Run(tc.reason.String(), func(t *testing.T) {
+			t.Parallel()
+			rf := &ReverseFeed{logger: slog.Default()}
+			require.True(t, rf.onFatal(tc.reason))
+			require.Error(t, rf.Err())
+			require.Equal(t, tc.restartable, rf.Restartable())
+			first := rf.Err().Error()
+
+			// A later restartable condition never changes the verdict or the
+			// recorded error.
+			rf.onFatal(contract.FatalReasonFlushError)
+			require.Equal(t, tc.restartable, rf.Restartable())
+			require.Equal(t, first, rf.Err().Error())
+
+			// A later unsafe condition always wins: a flush error on one
+			// feed must not hide a schema change on another.
+			rf.onFatal(contract.FatalReasonSchemaChange)
+			require.False(t, rf.Restartable())
+			require.Contains(t, rf.Err().Error(), "rollback is no longer safe")
+			if !tc.restartable {
+				require.Equal(t, first, rf.Err().Error(), "the first unsafe condition is kept")
+			}
+		})
+	}
+}
+
+// TestReverseSubscriptionSoftLimitBytes pins how a reverse feed's total memory
+// budget becomes each subscription's soft limit: an even share, never above
+// the change feed's own per-subscription default and never below
+// minReverseSubscriptionSoftLimitBytes, with a negative budget opting out
+// (0, which the change feed reads as its default).
+func TestReverseSubscriptionSoftLimitBytes(t *testing.T) {
+	t.Parallel()
+	const mib = int64(1 << 20)
+	const changeDefault = int64(change.DefaultSubscriptionSoftLimitBytes)
+	for _, tc := range []struct {
+		name          string
+		budget        int64
+		subscriptions int
+		want          int64
+	}{
+		{"default budget, small move keeps the per-subscription default", 0, 16, changeDefault},
+		{"default budget, one subscription is capped at the default", 0, 1, changeDefault},
+		{"default budget, just past the default's reach", 0, 17, DefaultReverseFeedMemoryBudget / 17},
+		{"default budget, 128 targets x 17 tables", 0, 128 * 17, DefaultReverseFeedMemoryBudget / (128 * 17)},
+		{"explicit budget divides evenly", 100 * mib, 4, 25 * mib},
+		{"explicit budget is still capped at the default", 64 << 30, 4, changeDefault},
+		{"tiny budget is raised to the floor", 1, 8, minReverseSubscriptionSoftLimitBytes},
+		{"budget below floor x subscriptions is raised to the floor", 4 << 30, 8192, minReverseSubscriptionSoftLimitBytes},
+		{"zero subscriptions does not divide by zero", 100 * mib, 0, 100 * mib},
+		{"negative budget opts out", -1, 2176, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, reverseSubscriptionSoftLimitBytes(tc.budget, tc.subscriptions))
+		})
+	}
+	// The default budget really does cover a 16-subscription move at the
+	// change feed's default, as DefaultReverseFeedMemoryBudget documents.
+	require.Equal(t, DefaultReverseFeedMemoryBudget, 16*changeDefault)
+}
+
+// TestResolveReverseFeedLimits: the budget is divided across every source's
+// subscriptions (the sum of their table lists, which may differ), and the
+// event cache count defaults small, with a negative value selecting go-mysql's
+// default (0).
+func TestResolveReverseFeedLimits(t *testing.T) {
+	t.Parallel()
+	tables := func(n int) []*table.TableInfo { return make([]*table.TableInfo, n) }
+	sources := []ReverseSource{{Tables: tables(3)}, {Tables: tables(5)}}
+
+	l := resolveReverseFeedLimits(ReverseFeedConfig{Sources: sources, MemoryBudget: 80 << 20})
+	require.Equal(t, reverseFeedLimits{
+		budget:          80 << 20,
+		subscriptions:   8,
+		softLimitBytes:  10 << 20,
+		eventCacheCount: DefaultReverseFeedEventCacheCount,
+	}, l)
+
+	l = resolveReverseFeedLimits(ReverseFeedConfig{Sources: sources})
+	require.Equal(t, DefaultReverseFeedMemoryBudget, l.budget)
+	require.Equal(t, int64(change.DefaultSubscriptionSoftLimitBytes), l.softLimitBytes, "8 subscriptions fit the default budget at the default limit")
+
+	l = resolveReverseFeedLimits(ReverseFeedConfig{Sources: sources, MemoryBudget: -1, EventCacheCount: 32})
+	require.Zero(t, l.softLimitBytes, "a negative budget leaves the change feed's per-subscription default")
+	require.Equal(t, 32, l.eventCacheCount)
+
+	l = resolveReverseFeedLimits(ReverseFeedConfig{Sources: sources, EventCacheCount: -1})
+	require.Zero(t, l.eventCacheCount, "a negative event cache count selects go-mysql's default")
+}
+
+// budgetFixture is a reverse feed layout with many sources and two wide
+// tables each, all merging into one U: the shape whose memory a per-feed budget
+// bounds.
+type budgetFixture struct {
+	u       string
+	sources []string
+}
+
+var budgetTables = []string{"t1", "t2"}
+
+func setupBudgetFixture(t *testing.T, nSources int) budgetFixture {
+	t.Helper()
+	f := budgetFixture{sources: make([]string, nSources)}
+	f.u, _ = testutils.CreateUniqueTestDatabase(t)
+	for i := range f.sources {
+		f.sources[i], _ = testutils.CreateUniqueTestDatabase(t)
+	}
+	for _, db := range append([]string{f.u}, f.sources...) {
+		for _, tbl := range budgetTables {
+			testutils.RunSQL(t, "CREATE TABLE "+db+"."+tbl+" (id BIGINT NOT NULL PRIMARY KEY, val MEDIUMTEXT NOT NULL)")
+		}
+	}
+	return f
+}
+
+func newBudgetFeed(t *testing.T, f budgetFixture, budget int64) *ReverseFeed {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testutils.DSN())
+	require.NoError(t, err)
+	uDB := openSchemaConn(t, f.u)
+	targetTables := make(map[string]*table.TableInfo)
+	for _, tbl := range budgetTables {
+		targetTables[tbl] = reverseTableInfo(t, uDB, f.u, tbl)
+	}
+	var sources []ReverseSource
+	for _, schema := range f.sources {
+		sDB := openSchemaConn(t, schema)
+		var tbls []*table.TableInfo
+		for _, tbl := range budgetTables {
+			tbls = append(tbls, reverseTableInfo(t, sDB, schema, tbl))
+		}
+		sources = append(sources, ReverseSource{DB: sDB, Addr: cfg.Addr, User: cfg.User, Password: cfg.Passwd, Tables: tbls})
+	}
+	feed, err := NewReverseFeed(t.Context(), ReverseFeedConfig{
+		Sources:      sources,
+		Target:       applier.Target{DB: uDB, KeyRange: "0"},
+		TargetTables: targetTables,
+		MemoryBudget: budget,
+	})
+	require.NoError(t, err)
+	t.Cleanup(feed.Close)
+	return feed
+}
+
+// wideRowsBatch is how many rows writeWideRows inserts per table, each
+// wideRowBytes of payload: together over minReverseSubscriptionSoftLimitBytes,
+// so a subscription at the floor must park before it has buffered them all.
+const (
+	wideRowsBatch = 400
+	wideRowBytes  = 4000
+)
+
+// writeWideRows inserts wideRowsBatch rows into schema.tbl in one statement
+// (so they reach the feed as one transaction, faster than any flush), ids
+// base+1..base+wideRowsBatch, then updates and deletes a few of them.
+func writeWideRows(t *testing.T, schema, tbl string, base int) {
+	t.Helper()
+	testutils.RunSQL(t, fmt.Sprintf(`INSERT INTO %s.%s (id, val)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < %d)
+		SELECT %d+n, REPEAT(CHAR(97 + n %% 26), %d) FROM seq`, schema, tbl, wideRowsBatch, base, wideRowBytes))
+	testutils.RunSQL(t, fmt.Sprintf("UPDATE %s.%s SET val='updated' WHERE id IN (%d, %d)", schema, tbl, base+1, base+2))
+	testutils.RunSQL(t, fmt.Sprintf("DELETE FROM %s.%s WHERE id IN (%d, %d)", schema, tbl, base+3, base+4))
+}
+
+// tableDigest is a row count plus an order-independent checksum of query's
+// (id, val) rows, so two sets of thousands of wide rows compare in one value.
+func tableDigest(t *testing.T, db *sql.DB, from string) string {
+	t.Helper()
+	var n, sum int64
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*), COALESCE(SUM(CRC32(CONCAT(id, ':', val))), 0) FROM "+from).Scan(&n, &sum))
+	return fmt.Sprintf("rows=%d crc=%d", n, sum)
+}
+
+// TestReverseFeedMemoryBudgetManySources: a reverse feed with many sources and
+// a budget far below what they write still catches up with no lost change —
+// including while its periodic flush is paused, as a reverse cutover pauses it
+// before its own drain, so every reader is parked on its soft limit with no
+// flush coming but the drain's. The same writes under the default budget never
+// park, which is what shows the budget reached the subscriptions.
+func TestReverseFeedMemoryBudgetManySources(t *testing.T) {
+	t.Parallel()
+	const nSources = 6
+	for _, tc := range []struct {
+		name      string
+		budget    int64
+		wantParks bool
+	}{
+		{"tiny budget parks every reader", 1, true},
+		{"default budget does not park", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := setupBudgetFixture(t, nSources)
+			feed := newBudgetFeed(t, f, tc.budget)
+			require.NoError(t, feed.Start(t.Context()))
+			// The reverse cutover's ordering: no periodic flush from here on.
+			feed.PausePeriodicFlush()
+
+			for i, schema := range f.sources {
+				for j, tbl := range budgetTables {
+					writeWideRows(t, schema, tbl, (i*len(budgetTables)+j+1)*100000)
+				}
+			}
+
+			if tc.wantParks {
+				// Every source's reader reaches its first table's floor-sized
+				// limit within the first transaction and parks; with the
+				// periodic flush paused nothing unparks it.
+				require.Eventually(t, func() bool {
+					for _, c := range feed.clients {
+						if !c.FeedStats().IsParked {
+							return false
+						}
+					}
+					return true
+				}, 30*time.Second, 50*time.Millisecond, "every source's reader must park on its soft limit")
+			}
+
+			// The drain a reverse cutover runs: it must unpark the readers and
+			// apply everything, not wait on a periodic flush that is not coming.
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+			require.NoError(t, feed.Flush(ctx))
+			require.True(t, feed.AllChangesFlushed())
+
+			var parks int64
+			for _, c := range feed.clients {
+				parks += c.FeedStats().Parks
+			}
+			if tc.wantParks {
+				require.GreaterOrEqual(t, parks, int64(nSources))
+			} else {
+				require.Zero(t, parks)
+			}
+
+			ctl := openSchemaConn(t, f.u)
+			for _, tbl := range budgetTables {
+				var union []string
+				for _, schema := range f.sources {
+					union = append(union, "SELECT id, val FROM "+schema+"."+tbl)
+				}
+				want := tableDigest(t, ctl, "("+strings.Join(union, " UNION ALL ")+") AS u")
+				require.Equal(t, want, tableDigest(t, ctl, f.u+"."+tbl), "U.%s must equal the union of every source", tbl)
+				require.Equal(t, fmt.Sprintf("rows=%d", nSources*(wideRowsBatch-2)), strings.Fields(want)[0])
+			}
+		})
+	}
 }

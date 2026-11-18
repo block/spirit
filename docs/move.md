@@ -48,6 +48,7 @@ The target check runs before the copy and on resume, before move writes anything
 - [lock-wait-timeout](#lock-wait-timeout)
 - [max-commit-latency](#max-commit-latency)
 - [max-connections](#max-connections)
+- [reverse-feed-memory-budget](#reverse-feed-memory-budget)
 - [reverse-window](#reverse-window)
 - [source-dsn](#source-dsn)
 - [target-chunk-size](#target-chunk-size)
@@ -155,6 +156,17 @@ Sets the fixed size of each source and target connection pool, matching `migrate
 
 The explicit budget must cover `--threads` plus six connections of checksum headroom. During setup, the reserve grows by one connection per source table beyond the first. For example, 20 tables reserve 25 connections, and a smaller pool lowers read concurrency to a minimum of one, allowing background queries to queue. Reusing a connection handle across targets also requires room for each target’s checksum snapshots and locks. Any reduction in read concurrency is logged at INFO. Write workers may wait for a connection. This is a per-pool limit, not a total across the move.
 
+### reverse-feed-memory-budget
+
+- Type: Integer (bytes)
+- Default value: `4294967296` (4 GiB)
+
+During a [`--reverse-window`](#reverse-window), bounds the memory the reverse feed uses to buffer changes from the targets before it applies them to the source. The reverse feed tails every target and buffers each moved table separately, so without a total bound its memory would grow with targets × tables — a move with 128 target shards and 17 tables has 2,176 buffers. The budget is divided evenly across them, with each buffer's share capped at the 256 MiB a buffer has on its own, so a move with up to 16 buffers (for example 4 targets × 4 tables) is unaffected by the default. No buffer is given less than 1 MiB; when the budget divided by the number of buffers is below that, the reverse feed may use more than the budget, and logs a warning saying how much.
+
+A buffer that reaches its share pauses reading that target's binary log until part of it has been applied. A smaller budget therefore makes the reverse feed slower to catch up — for example after a resume — but it does not skip or lose changes. A negative value removes the total bound and gives every buffer 256 MiB.
+
+The bound covers buffered changes, not all of the process's memory. Each target's binary log reader also holds up to 256 decoded events of its own.
+
 ### reverse-window
 
 - Type: Duration
@@ -166,7 +178,26 @@ While the window is open the run reports the `reverseWindow` state. The reverse 
 
 1. **It elapses.** Move finalizes forward exactly as a normal cutover would — the source stays retired as `_old`, the checkpoint is dropped — and exits.
 2. **A rollback is requested** (see below). Move rolls back to the source and exits.
-3. **The reverse feed dies** (a schema change on a target, or an unrecoverable stream error). Rollback is no longer safe, so Move finalizes forward and exits, logging the reason.
+3. **The reverse feed dies on a condition after which rollback is no longer safe** (a schema change on a target, an XA transaction, a wrapped binlog position). Move finalizes forward and exits, logging the reason.
+
+A reverse feed that stops because a flush to the source failed (for example, the source refused new connections), or because a binlog stream failed, does **not** end the window. Neither changes the watched tables, so Move restarts the feed from its last checkpointed position and replays the changes it had not applied. Restarts are spaced by a backoff that doubles up to 30 seconds and resets once a restarted feed has stayed up for longer than a flush interval. A rollback requested while the feed is stopped is logged and waits until the feed is running again. Before it locks anything, a rollback also flushes the reverse feed. If the source still refuses the writes, or the backlog does not apply within `--cutover-lock-timeout`, the rollback is deferred and retried. A deferred rollback locks no tables and does not count against the retry limit. If the window elapses while the feed is stopped or the source is still behind, Move finalizes forward and logs that it discarded the pending rollback request.
+
+#### Reverse feed progress
+
+The run's periodic status block stops at cutover. While the window is open, Move logs the reverse feed's progress instead, once a minute:
+
+```
+msg="reverse feed progress" sources=128 caught_up=120 idle=2 behind=6 read_behind_max=2h14m0s read_behind_median=3s applied_behind_max=2h20m0s applied_unknown=1 pending_changes=214120 parked=1 slowest=host-b:3306/db_42_44
+msg="reverse feed source behind" source=host-b:3306/db_42_44 read_behind=2h14m0s applied_behind=unknown pending_changes=118000 parked=true last_flush="10s ago" last_complete_flush="35m0s ago" last_received="0s ago" last_heartbeat="never"
+```
+
+- `read_behind` is how far the reader is behind the source's clock: now, minus the commit time of the newest event it has read from that target's binlog. `applied_behind` is the same for the newest change written to the source's `_old` tables, and is what a rollback started now would be missing. It is `unknown` until the first flush in this process that applies everything buffered (a resumed window does not know the commit time of the position it resumed from).
+- A source is `caught-up` when `read_behind` is under a minute and what it read has been applied: nothing is pending, or a flush applied everything buffered within the last 2 minutes. A reader at the head whose flushes keep deferring is `behind`, because a rollback waits on what is applied, not on what is read. `last_complete_flush` on its line says when everything was last applied.
+- A source is `idle`, and left out of the lag figures, when its newest event is older than a minute, its position has not moved since the previous report, nothing is buffered or parked, and the target sent a binlog heartbeat within the last minute. The reverse feed asks each target for a heartbeat every 10 seconds of quiet, so a quiet target keeps sending them; a target writing events the feed does not apply (another table, a long transaction) sends none. Other events are not enough: a reconnect loop also delivers events without the source being at its head. A source without a recent heartbeat is reported `behind`; its line's `last_received` and `last_heartbeat` say when the stream last delivered anything and when it last sent a heartbeat. On a GTID stream a heartbeat also arrives right after each connect, while the target skips transactions the feed already has, so one recent heartbeat after a restart does not by itself mean the source was quiet.
+- `pending_changes` is what has been read and not yet applied. `parked` counts sources whose reader is held back because its buffer is full.
+- Up to five `reverse feed source behind` lines follow, slowest first. `reverse feed caught up` is logged once every source is caught up or idle, and `reverse feed fell behind` (a warning) if one falls behind again afterwards. While the reverse feed is stopped and the window is restarting it, the progress line is replaced by a `reverse feed stopped; progress is not tracked until it restarts` warning, and tracking starts over when the feed restarts.
+
+The reverse feed also logs `reverse feed started; catching up from each source's start position` once every source's stream is open. It does not wait for the sources to catch up; the progress lines report that.
 
 #### Requesting a rollback
 

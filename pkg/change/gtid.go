@@ -66,6 +66,12 @@ type gtidClient struct {
 	flushedGTID  mysql.GTIDSet
 	pendingSID   []byte
 	pendingGNO   int64
+	// pendingEventTime is the source timestamp of the pending GTID's
+	// GTIDEvent (unix seconds). promotePendingGTID publishes it with the
+	// GTID as bufferedEventTime. It is the group's first event time, so it
+	// can trail the group's commit by the transaction's duration: the
+	// applied lag it feeds errs toward reporting more lag, never less.
+	pendingEventTime int64
 }
 
 // NewGTIDClient constructs the GTID-backed change.Source. It mirrors
@@ -150,7 +156,7 @@ func normalizeGTIDString(s string) string {
 
 // setBufferedGTID adds gtid to bufferedGTID under c.mu. The set grows
 // monotonically — there is no "rewind" in GTID semantics.
-func (c *gtidClient) setBufferedGTID(sid []byte, gno int64) {
+func (c *gtidClient) setBufferedGTID(sid []byte, gno int64, eventTime int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	u, err := uuid.FromBytes(sid)
@@ -160,6 +166,12 @@ func (c *gtidClient) setBufferedGTID(sid []byte, gno int64) {
 	}
 	if err := c.bufferedGTID.Update(u.String() + ":" + strconv.FormatInt(gno, 10)); err != nil {
 		c.logger.Error("failed to update buffered GTID set", "error", err)
+		return
+	}
+	// Published in the same critical section as the GTID; see
+	// feedCore.bufferedEventTime.
+	if eventTime > c.bufferedEventTime {
+		c.bufferedEventTime = eventTime
 	}
 }
 
@@ -202,11 +214,13 @@ func (c *gtidClient) promotePendingGTID() {
 	c.mu.Lock()
 	pendingSID := c.pendingSID
 	pendingGNO := c.pendingGNO
+	pendingEventTime := c.pendingEventTime
 	c.pendingSID = nil
 	c.pendingGNO = 0
+	c.pendingEventTime = 0
 	c.mu.Unlock()
 	if len(pendingSID) > 0 {
-		c.setBufferedGTID(pendingSID, pendingGNO)
+		c.setBufferedGTID(pendingSID, pendingGNO, pendingEventTime)
 	}
 }
 
@@ -364,6 +378,7 @@ func (c *gtidClient) recreateStreamer() error {
 	// reconnect would be wrong to apply to a later XIDEvent.
 	c.pendingSID = nil
 	c.pendingGNO = 0
+	c.pendingEventTime = 0
 	return nil
 }
 
@@ -481,6 +496,9 @@ func (c *gtidClient) readStream(ctx context.Context) {
 		if ev == nil {
 			continue
 		}
+		if c.received(ev) {
+			continue
+		}
 		recreateAttempts = 0
 		// Hold here if a verification has parked the reader. The event is
 		// already read but not acted on, so nothing is consumed and lost;
@@ -511,6 +529,7 @@ func (c *gtidClient) readStream(ctx context.Context) {
 			c.mu.Lock()
 			c.pendingSID = append(c.pendingSID[:0], event.SID...)
 			c.pendingGNO = event.GNO
+			c.pendingEventTime = int64(ev.Header.Timestamp)
 			c.mu.Unlock()
 		case *replication.XIDEvent:
 			// Transaction commit (InnoDB). Promote the pending GTID
@@ -728,6 +747,9 @@ func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []contract
 	batch := c.GetDeltaLen()
 	c.mu.Lock()
 	newFlushedGTID := c.bufferedGTID.Clone()
+	// Published with bufferedGTID, so the pair describes the same
+	// transaction; see feedCore.bufferedEventTime.
+	newFlushedEventTime := c.bufferedEventTime
 	c.mu.Unlock()
 	allChangesFlushed := true
 	for _, subscription := range c.subs.Snapshot() {
@@ -753,6 +775,7 @@ func (c *gtidClient) flush(ctx context.Context, underLock bool, locks []contract
 			c.flushedGTID = newFlushedGTID
 		}
 		c.mu.Unlock()
+		advanceUnixSeconds(&c.flushedEventTime, newFlushedEventTime)
 	}
 	c.recordFlush(start, batch, allChangesFlushed)
 	return nil
@@ -795,6 +818,8 @@ func (c *gtidClient) FeedStats() contract.FeedStats {
 	stats.LastFlushRows = c.lastFlushRows
 	stats.Rotations = c.rotations.Load()
 	stats.BufferedEventAt = eventTime(&c.lastEventTime)
+	stats.FlushedEventAt = eventTime(&c.flushedEventTime)
+	c.fillLiveness(&stats)
 	// Already under c.mu, which is what guards bufferedGTID.
 	if c.bufferedGTID != nil && !c.bufferedGTID.IsEmpty() {
 		stats.BufferedPosition = c.bufferedGTID.String()

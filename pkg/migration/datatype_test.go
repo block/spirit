@@ -1511,9 +1511,9 @@ func TestTinyInt1ValuesSurviveCopy(t *testing.T) {
 
 	// The (1) in tinyint(1) is a display width, not a range: the column holds
 	// the whole signed tinyint range. The copier reads rows back into Go to
-	// build its INSERT, and the driver reports a signed tinyint(1) as a Go
-	// bool, so every non-zero value arrives as true. Each value must reach the
-	// new table unchanged.
+	// build its INSERT; a driver that reported a signed tinyint(1) as a Go
+	// bool would turn every non-zero value into true. Each value must reach
+	// the new table unchanged.
 	tt := testutils.NewTestTable(t, "tinyint1_copy", `CREATE TABLE tinyint1_copy (
 		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		info VARCHAR(255) NOT NULL,
@@ -1565,8 +1565,9 @@ func TestTinyInt1ValuesSurviveCopy(t *testing.T) {
 // column.
 func requireTinyInt1(t *testing.T, db *sql.DB, info string, want int) {
 	t.Helper()
-	// Adding zero forces an integer result: tinyint(1) otherwise reaches the
-	// driver as a bool, which is the coercion under test.
+	// Adding zero forces an integer result, so this read cannot be affected
+	// by the driver's tinyint(1)-to-bool mapping, which is the coercion under
+	// test.
 	var got int
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		`SELECT flags + 0 FROM tinyint1_copy WHERE info = ? LIMIT 1`, info).Scan(&got))
