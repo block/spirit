@@ -82,6 +82,13 @@ type feedCore struct {
 	// runs would race.
 	streamer *replication.BinlogStreamer
 
+	// recreate replaces syncer and streamer after repeated read errors. The
+	// client's constructor sets it to the client's recreateStreamer; it is a
+	// field so the read loops call it without knowing which client they are
+	// in, and so tests can substitute a reconnect that needs no server. It
+	// runs on the reader goroutine, like recreateStreamer.
+	recreate func() error
+
 	applier applier.StreamedChangesWriter
 
 	// subs owns the table-keyed subscription set and its own lock. See
@@ -330,6 +337,21 @@ func (c *feedCore) AddSubscription(currentTableDesc, newTableDesc contract.Table
 func isHeartbeat(ev *replication.BinlogEvent) bool {
 	_, ok := ev.Event.(*replication.HeartbeatEvent)
 	return ok
+}
+
+// isDumpPreamble reports whether ev is one of the events the server sends
+// to open a dump, before anything from the binlog's body: the artificial
+// RotateEvent (LogPos 0) naming the file, and that file's
+// FormatDescriptionEvent and PreviousGTIDsEvent. Every reconnect delivers
+// them, so they do not show that the stream can make progress.
+func isDumpPreamble(ev *replication.BinlogEvent) bool {
+	switch ev.Event.(type) {
+	case *replication.RotateEvent:
+		return ev.Header.LogPos == 0
+	case *replication.FormatDescriptionEvent, *replication.PreviousGTIDsEvent:
+		return true
+	}
+	return false
 }
 
 // received stamps lastReceived for ev, which the read loop has just taken off

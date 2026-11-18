@@ -45,6 +45,7 @@ type binlogClient struct {
 // constructors. config.Applier is required.
 func NewBinlogClient(db *sql.DB, host string, username, password string, appl applier.StreamedChangesWriter, config *ClientConfig) Source {
 	c := &binlogClient{}
+	c.recreate = c.recreateStreamer
 	c.configure(db, host, username, password, appl, config)
 	return c
 }
@@ -456,7 +457,7 @@ func (c *binlogClient) readStream(ctx context.Context) {
 				}
 
 				// Try to recreate the streamer
-				if recreateErr := c.recreateStreamer(); recreateErr != nil {
+				if recreateErr := c.recreate(); recreateErr != nil {
 					c.logger.Error("Failed to recreate streamer", "error", recreateErr)
 
 					// Increase backoff duration for next attempt
@@ -465,9 +466,8 @@ func (c *binlogClient) readStream(ctx context.Context) {
 						backoffDuration = maxBackoffDuration
 					}
 				} else {
-					// Successfully recreated, reset counters
+					// Successfully recreated, reset consecutive error counter
 					consecutiveErrors = 0
-					recreateAttempts = 0
 					backoffDuration = initialBackoffDuration
 				}
 				lastErrorTime = currentTime
@@ -496,6 +496,14 @@ func (c *binlogClient) readStream(ctx context.Context) {
 		}
 		if c.received(ev) {
 			continue
+		}
+		// The stream has delivered, so the reconnects it took to get here
+		// were not a loop that never recovers: give the next incident the
+		// full budget. The events every dump opens with do not count, or a
+		// reconnect that fails right after them would refill the budget
+		// each time and never reach the fatal limit.
+		if !isDumpPreamble(ev) {
+			recreateAttempts = 0
 		}
 		// Hold here if a verification has parked the reader. The event is
 		// already read but not acted on, so nothing is consumed and lost;
