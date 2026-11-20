@@ -301,40 +301,61 @@ func (s *TableLock) ExecUnderLockWithoutForeignKeyChecks(ctx context.Context, st
 	return execErr
 }
 
+// ExecUnderLockWithWarningsArgs is ExecUnderLockWithWarnings for one
+// statement with arguments bound to its placeholders. A statement with
+// arguments is prepared on the locking session, so a large argument travels as
+// its own bytes rather than as text in the statement.
+func (s *TableLock) ExecUnderLockWithWarningsArgs(ctx context.Context, stmt string, args ...any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lockConn == nil {
+		return sql.ErrConnDone
+	}
+	return s.execOneUnderLock(ctx, true, stmt, args)
+}
+
 func (s *TableLock) execUnderLock(ctx context.Context, inspectWarnings bool, stmts ...string) error {
 	if s.lockConn == nil {
 		return sql.ErrConnDone
 	}
 	for _, stmt := range stmts {
-		if stmt == "" {
-			continue
-		}
-		if err := ctx.Err(); err != nil {
+		if err := s.execOneUnderLock(ctx, inspectWarnings, stmt, nil); err != nil {
 			return err
 		}
-		execCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.completionTimeout)
-		stopKill := s.killReferencedBlockers(ctx, execCtx)
-		stopReport := s.reportSlowStatement(execCtx)
-		_, err := s.lockConn.ExecContext(execCtx, stmt)
-		expired := execCtx.Err() != nil
-		stopReport()
-		stopKill()
-		if err == nil && inspectWarnings {
-			// Read the diagnostics before any other statement can replace them.
-			// The successful DML outcome is known even if reading its warnings fails.
-			_, err = checkWarnings(execCtx, s.lockConn, ErrorOnDupKey)
-			if err != nil {
-				cancel()
-				return fmt.Errorf("checking locked statement warnings: %w", err)
-			}
+	}
+	return nil
+}
+
+// execOneUnderLock runs one statement on the locking session with the
+// completion, blocker-kill and slow-statement handling ExecUnderLock
+// describes. An empty statement is skipped.
+func (s *TableLock) execOneUnderLock(ctx context.Context, inspectWarnings bool, stmt string, args []any) error {
+	if stmt == "" {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	execCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.completionTimeout)
+	defer cancel()
+	stopKill := s.killReferencedBlockers(ctx, execCtx)
+	stopReport := s.reportSlowStatement(execCtx)
+	_, err := s.lockConn.ExecContext(execCtx, stmt, args...)
+	expired := execCtx.Err() != nil
+	stopReport()
+	stopKill()
+	if err == nil && inspectWarnings {
+		// Read the diagnostics before any other statement can replace them.
+		// The successful DML outcome is known even if reading its warnings fails.
+		if _, err = checkWarnings(execCtx, s.lockConn, ErrorOnDupKey); err != nil {
+			return fmt.Errorf("checking locked statement warnings: %w", err)
 		}
-		cancel()
-		if err != nil {
-			if expired {
-				return fmt.Errorf("%w: %w", ErrStatementOutcomeUnknown, err)
-			}
-			return err
+	}
+	if err != nil {
+		if expired {
+			return fmt.Errorf("%w: %w", ErrStatementOutcomeUnknown, err)
 		}
+		return err
 	}
 	return nil
 }

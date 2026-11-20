@@ -23,4 +23,8 @@ type TableLock interface {
 	// order, and fails if a statement raises a warning. A started statement
 	// runs to completion even if ctx is cancelled.
 	ExecUnderLockWithWarnings(ctx context.Context, stmts ...string) error
+
+	// ExecUnderLockWithWarningsArgs is ExecUnderLockWithWarnings for one
+	// statement with arguments bound to its placeholders.
+	ExecUnderLockWithWarningsArgs(ctx context.Context, stmt string, args ...any) error
 }
