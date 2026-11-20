@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // TableSchema represents a table's name and its raw CREATE TABLE DDL statement.
@@ -64,8 +65,41 @@ type ExcludedTable struct {
 	Filter FilterOption // The filter option that excluded the table
 }
 
+// ListBaseTables returns the base tables in the connection's selected
+// database, in the order SHOW FULL TABLES returns them. Views, and any other
+// object type MySQL lists alongside tables, are skipped: they hold no rows of
+// their own, and SHOW CREATE TABLE describes a view in a different shape
+// (four columns instead of two) and requires the SHOW VIEW privilege.
+//
+// The filter is applied to the Table_type column in Go rather than with a
+// WHERE clause, so the statement stays in the plain form that any
+// MySQL-protocol endpoint supports.
+func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SHOW FULL TABLES")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tables: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	var names []string
+	for rows.Next() {
+		var name, tableType string
+		if err := rows.Scan(&name, &tableType); err != nil {
+			return nil, fmt.Errorf("failed to scan table name: %w", err)
+		}
+		if !strings.EqualFold(tableType, "BASE TABLE") {
+			continue
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating tables: %w", err)
+	}
+	return names, nil
+}
+
 // LoadSchemaFromDB retrieves all table schemas from the database using the
-// provided connection. The returned tables and DDL are filtered according to
+// provided connection. Only base tables are loaded (see ListBaseTables): views
+// are never returned, as tables or as exclusions. The returned tables and DDL are filtered according to
 // the supplied options. With no options the raw DDL is returned unmodified.
 func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]TableSchema, error) {
 	tables, _, err := LoadSchemaAndExcludedTablesFromDB(ctx, db, opts...)
@@ -81,7 +115,7 @@ func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]
 // outside this package, to drift the next time a filter changes.
 //
 // A table is reported once, under the first option that excluded it, and the
-// exclusions keep the order SHOW TABLES returned them in. WithStrippedAutoIncrement
+// exclusions keep the order ListBaseTables returned them in. WithStrippedAutoIncrement
 // rewrites DDL rather than excluding a table, so it never appears.
 func LoadSchemaAndExcludedTablesFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]TableSchema, []ExcludedTable, error) {
 	optSet := make(map[FilterOption]bool, len(opts))
@@ -89,21 +123,9 @@ func LoadSchemaAndExcludedTablesFromDB(ctx context.Context, db *sql.DB, opts ...
 		optSet[o] = true
 	}
 
-	rows, err := db.QueryContext(ctx, "SHOW TABLES")
+	tableNames, err := ListBaseTables(ctx, db)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to list tables: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var tableNames []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, nil, fmt.Errorf("failed to scan table name: %w", err)
-		}
-		tableNames = append(tableNames, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("error iterating tables: %w", err)
+		return nil, nil, err
 	}
 	var tables []TableSchema
 	var excluded []ExcludedTable

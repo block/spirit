@@ -380,11 +380,10 @@ func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.Table
 	// Base tables only: a view has no rows of its own to copy. Views are
 	// refused by the source_schema_objects check, which names them; listing
 	// one here would fail first, on its missing primary key.
-	rows, err := src.db.QueryContext(ctx, "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+	tableNames, err := table.ListBaseTables(ctx, src.db)
 	if err != nil {
 		return nil, err
 	}
-	defer utils.CloseAndLog(rows)
 
 	// Build a map of source tables if filtering is requested
 	if len(r.move.SourceTables) > 0 {
@@ -394,12 +393,8 @@ func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.Table
 		}
 	}
 
-	var tableName, tableType string
 	tables := make([]*table.TableInfo, 0)
-	for rows.Next() {
-		if err := rows.Scan(&tableName, &tableType); err != nil {
-			return nil, err
-		}
+	for _, tableName := range tableNames {
 		if strings.HasPrefix(tableName, "_spirit_") {
 			// Skip Spirit-internal artifacts: this move's checkpoint
 			// (checkpointTableName) and sentinel (sentinel.TableName), and also
@@ -443,7 +438,7 @@ func (r *Runner) getTables(ctx context.Context, src *sourceInfo) ([]*table.Table
 	if r.sourceTableMap != nil && len(tables) != len(r.move.SourceTables) {
 		return nil, errors.New("could not find all SourceTables in the source database")
 	}
-	return tables, rows.Err()
+	return tables, nil
 }
 
 // createTargetTables creates tables on all targets.
