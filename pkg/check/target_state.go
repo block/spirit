@@ -10,7 +10,6 @@ import (
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
-	"github.com/block/spirit/pkg/utils"
 )
 
 // TargetStateCheckName is the registered name of the target-state check —
@@ -40,26 +39,16 @@ func targetStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 		sourceTableMap[tbl.TableName] = tbl
 	}
 	for i, target := range r.Targets {
-		rows, err := target.DB.QueryContext(ctx, "SHOW TABLES")
+		tables, err := table.ListBaseTables(ctx, target.DB)
 		if err != nil {
 			return fmt.Errorf("failed to check target %d: %w", i, err)
 		}
-		defer utils.CloseAndLog(rows)
-
-		var tableName string
+		// Only validate tables that are in our source list
 		var existingTables []string
-		for rows.Next() {
-			if err := rows.Scan(&tableName); err != nil {
-				return fmt.Errorf("failed to scan table name on target %d: %w", i, err)
-			}
-
-			// Only validate tables that are in our source list
+		for _, tableName := range tables {
 			if _, isSourceTable := sourceTableMap[tableName]; isSourceTable {
 				existingTables = append(existingTables, tableName)
 			}
-		}
-		if err := rows.Err(); err != nil {
-			return err
 		}
 
 		// If there are existing tables, validate they are empty and have matching schema

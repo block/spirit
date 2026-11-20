@@ -98,9 +98,10 @@ func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
 }
 
 // LoadSchemaFromDB retrieves all table schemas from the database using the
-// provided connection. Only base tables are loaded (see ListBaseTables): views
-// are never returned, as tables or as exclusions. The returned tables and DDL are filtered according to
-// the supplied options. With no options the raw DDL is returned unmodified.
+// provided connection. Only base tables are loaded (see ListBaseTables):
+// views are never returned, as tables or as exclusions. The returned tables
+// and DDL are filtered according to the supplied options. With no options the
+// raw DDL is returned unmodified.
 func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]TableSchema, error) {
 	tables, _, err := LoadSchemaAndExcludedTablesFromDB(ctx, db, opts...)
 	return tables, err
