@@ -37,6 +37,18 @@ func assertDSNConfig(t *testing.T, dsnStr string, user, password, addr, dbName, 
 	require.Equal(t, `"read-committed"`, cfg.Params["transaction_isolation"])
 }
 
+// TestNewDSNStrictSQLMode checks that StrictSQLMode adds strict mode to
+// spirit's sql_mode and leaves the zero-date checks off.
+func TestNewDSNStrictSQLMode(t *testing.T) {
+	config := NewDBConfig()
+	config.StrictSQLMode = true
+	resp, err := newDSN("root:password@tcp(127.0.0.1:3306)/test", config)
+	require.NoError(t, err)
+	cfg, err := mysql.ParseDSN(resp)
+	require.NoError(t, err)
+	require.Equal(t, `"NO_AUTO_VALUE_ON_ZERO,STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION"`, cfg.Params["sql_mode"])
+}
+
 func TestNewDSN(t *testing.T) {
 	// Start with a basic example
 	dsn := "root:password@tcp(127.0.0.1:3306)/test"
