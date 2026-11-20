@@ -399,3 +399,50 @@ func TestTargetStateCheckDeferredAutoIncrementSupport(t *testing.T) {
 		SourceTables: []*table.TableInfo{sourceTable},
 	}, slog.Default()))
 }
+
+// TestTargetStateCheckRejectsViewUnderSourceTableName: a target view named
+// like a moved table is refused before anything is created or copied, and the
+// table behind the view is left untouched. An insertable view would otherwise
+// stand in for the destination table and pass the copier's writes through to
+// its backing table.
+func TestTargetStateCheckRejectsViewUnderSourceTableName(t *testing.T) {
+	srcName, srcDB := createW3DDatabase(t)
+	tgtName, tgtDB := createW3DDatabase(t)
+
+	_, err := srcDB.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE %s.orders (id BIGINT NOT NULL, total INT NOT NULL, PRIMARY KEY (id))", srcName))
+	require.NoError(t, err)
+	_, err = srcDB.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO %s.orders VALUES (1, 10), (2, 20)", srcName))
+	require.NoError(t, err)
+	sourceTable := table.NewTableInfo(srcDB, srcName, "orders")
+	require.NoError(t, sourceTable.SetInfo(t.Context()))
+
+	_, err = tgtDB.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE %s.orders_backing (id BIGINT NOT NULL, total INT NOT NULL, PRIMARY KEY (id))", tgtName))
+	require.NoError(t, err)
+	_, err = tgtDB.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO %s.orders_backing VALUES (100, 1000)", tgtName))
+	require.NoError(t, err)
+	testutils.RunSQLInDatabaseAsRoot(t, tgtName, `CREATE VIEW orders AS SELECT id, total FROM orders_backing`)
+
+	err = targetStateCheck(t.Context(), Resources{
+		Runtime:      Move,
+		Sources:      []Endpoint{{DB: srcDB, Config: &mysql.Config{DBName: srcName}}},
+		Targets:      []applier.Target{{DB: tgtDB, Config: &mysql.Config{DBName: tgtName}}},
+		SourceTables: []*table.TableInfo{sourceTable},
+	}, slog.Default())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "'orders' on target 0")
+	require.Contains(t, err.Error(), "is a view, not a table")
+
+	var ids []int64
+	rows, err := tgtDB.QueryContext(t.Context(), fmt.Sprintf("SELECT id FROM %s.orders_backing ORDER BY id", tgtName))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var id int64
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []int64{100}, ids)
+}

@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/table"
-	"github.com/block/spirit/pkg/utils"
 )
 
 // TargetStateCheckName is the registered name of the target-state check —
@@ -40,26 +40,26 @@ func targetStateCheck(ctx context.Context, r Resources, logger *slog.Logger) err
 		sourceTableMap[tbl.TableName] = tbl
 	}
 	for i, target := range r.Targets {
-		rows, err := target.DB.QueryContext(ctx, "SHOW TABLES")
+		objects, err := table.ListTableObjects(ctx, target.DB)
 		if err != nil {
 			return fmt.Errorf("failed to check target %d: %w", i, err)
 		}
-		defer utils.CloseAndLog(rows)
-
-		var tableName string
+		// Only validate objects that are in our source list
 		var existingTables []string
-		for rows.Next() {
-			if err := rows.Scan(&tableName); err != nil {
-				return fmt.Errorf("failed to scan table name on target %d: %w", i, err)
+		for _, obj := range objects {
+			if _, isSourceTable := sourceTableMap[obj.Name]; !isSourceTable {
+				continue
 			}
-
-			// Only validate tables that are in our source list
-			if _, isSourceTable := sourceTableMap[tableName]; isSourceTable {
-				existingTables = append(existingTables, tableName)
+			// A view (or any other non-table object) under a moved table's
+			// name is never a usable destination: the move would skip
+			// creating the table, and the copier's writes would go through
+			// the view into whatever table backs it, bypassing the
+			// emptiness and schema checks below.
+			if !obj.IsBaseTable() {
+				return fmt.Errorf("'%s' on target %d (%s) is a %s, not a table; move-tables needs that name free or held by an empty table with the source schema. Please drop the %s or use a different target",
+					obj.Name, i, target.Config.DBName, strings.ToLower(obj.Type), strings.ToLower(obj.Type))
 			}
-		}
-		if err := rows.Err(); err != nil {
-			return err
+			existingTables = append(existingTables, obj.Name)
 		}
 
 		// If there are existing tables, validate they are empty and have matching schema
