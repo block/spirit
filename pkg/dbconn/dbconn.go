@@ -55,7 +55,10 @@ type DBConfig struct {
 	// it. Strict mode makes MySQL refuse those statements instead. The
 	// zero-date checks (NO_ZERO_DATE, NO_ZERO_IN_DATE) stay off, as in every
 	// spirit session, so a table holding or defaulting to '0000-00-00' can
-	// still be altered. Default: false.
+	// still be altered. The mode is part of the DSN, so it takes effect when
+	// the pool is opened: set it on the DBConfig passed to New or NewContext.
+	// Setting it only on the DBConfig passed to ForceExec leaves the pool's
+	// sessions non-strict. Default: false.
 	StrictSQLMode bool
 	// There is deliberately no RejectReadOnly here. It used to map to the
 	// driver's rejectReadOnly option and defaulted to true, guarding against
