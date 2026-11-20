@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // TableSchema represents a table's name and its raw CREATE TABLE DDL statement.
@@ -64,9 +65,71 @@ type ExcludedTable struct {
 	Filter FilterOption // The filter option that excluded the table
 }
 
+// TableObject is one entry SHOW FULL TABLES lists for a database: a base
+// table, a view, or any other object type MySQL lists alongside tables.
+type TableObject struct {
+	Name string // Object name
+	Type string // Table_type as MySQL reports it, e.g. BASE TABLE or VIEW
+}
+
+// IsBaseTable reports whether the object is a base table, as opposed to a
+// view or another object type sharing the table namespace.
+func (o TableObject) IsBaseTable() bool {
+	return strings.EqualFold(o.Type, "BASE TABLE")
+}
+
+// ListTableObjects returns every object in the connection's selected database
+// that occupies the table namespace, with its type, in the order SHOW FULL
+// TABLES returns them. Callers that must know whether a name is free, rather
+// than which base tables exist, need the views as well: a view blocks a
+// CREATE TABLE of the same name and accepts writes aimed at it.
+//
+// The statement stays in the plain form that any MySQL-protocol endpoint
+// supports; callers filter on Type in Go.
+func ListTableObjects(ctx context.Context, db *sql.DB) ([]TableObject, error) {
+	rows, err := db.QueryContext(ctx, "SHOW FULL TABLES")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tables: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	var objects []TableObject
+	for rows.Next() {
+		var o TableObject
+		if err := rows.Scan(&o.Name, &o.Type); err != nil {
+			return nil, fmt.Errorf("failed to scan table name: %w", err)
+		}
+		objects = append(objects, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating tables: %w", err)
+	}
+	return objects, nil
+}
+
+// ListBaseTables returns the base tables in the connection's selected
+// database, in the order SHOW FULL TABLES returns them. Views, and any other
+// object type MySQL lists alongside tables, are skipped: they hold no rows of
+// their own, and SHOW CREATE TABLE describes a view in a different shape
+// (four columns instead of two) and requires the SHOW VIEW privilege.
+func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
+	objects, err := ListTableObjects(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, o := range objects {
+		if o.IsBaseTable() {
+			names = append(names, o.Name)
+		}
+	}
+	return names, nil
+}
+
 // LoadSchemaFromDB retrieves all table schemas from the database using the
-// provided connection. The returned tables and DDL are filtered according to
-// the supplied options. With no options the raw DDL is returned unmodified.
+// provided connection. Only base tables are loaded (see ListBaseTables):
+// views are never returned, as tables or as exclusions. The returned tables
+// and DDL are filtered according to the supplied options. With no options the
+// raw DDL is returned unmodified.
 func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]TableSchema, error) {
 	tables, _, err := LoadSchemaAndExcludedTablesFromDB(ctx, db, opts...)
 	return tables, err
@@ -81,7 +144,7 @@ func LoadSchemaFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]
 // outside this package, to drift the next time a filter changes.
 //
 // A table is reported once, under the first option that excluded it, and the
-// exclusions keep the order SHOW TABLES returned them in. WithStrippedAutoIncrement
+// exclusions keep the order ListBaseTables returned them in. WithStrippedAutoIncrement
 // rewrites DDL rather than excluding a table, so it never appears.
 func LoadSchemaAndExcludedTablesFromDB(ctx context.Context, db *sql.DB, opts ...FilterOption) ([]TableSchema, []ExcludedTable, error) {
 	optSet := make(map[FilterOption]bool, len(opts))
@@ -89,21 +152,9 @@ func LoadSchemaAndExcludedTablesFromDB(ctx context.Context, db *sql.DB, opts ...
 		optSet[o] = true
 	}
 
-	rows, err := db.QueryContext(ctx, "SHOW TABLES")
+	tableNames, err := ListBaseTables(ctx, db)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to list tables: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var tableNames []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, nil, fmt.Errorf("failed to scan table name: %w", err)
-		}
-		tableNames = append(tableNames, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("error iterating tables: %w", err)
+		return nil, nil, err
 	}
 	var tables []TableSchema
 	var excluded []ExcludedTable

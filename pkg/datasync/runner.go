@@ -964,27 +964,16 @@ func (r *Runner) TargetUnderLoad() bool {
 //
 // Views are not synced (the unsynced_source_objects check logs them). SHOW
 // TABLES lists them too, and a view has no primary key, so without the filter
-// a view failed the sync with "no primary key found". The filter is applied to
-// the Table_type column of SHOW FULL TABLES in Go rather than with a WHERE
-// clause, so the statement stays in the plain form that any MySQL-protocol
-// source endpoint supports. Any other type that is not a base table is
-// skipped the same way.
+// a view failed the sync with "no primary key found". table.ListBaseTables
+// skips them, and any other type that is not a base table.
 func (r *Runner) getTables(ctx context.Context) (tables []*table.TableInfo, err error) {
-	rows, err := r.source.db.QueryContext(ctx, "SHOW FULL TABLES")
+	tableNames, err := table.ListBaseTables(ctx, r.source.db)
 	if err != nil {
 		return nil, err
 	}
-	defer utils.CloseAndLog(rows)
 
-	var tableName, tableType string
 	tables = make([]*table.TableInfo, 0)
-	for rows.Next() {
-		if err := rows.Scan(&tableName, &tableType); err != nil {
-			return nil, err
-		}
-		if !strings.EqualFold(tableType, "BASE TABLE") {
-			continue
-		}
+	for _, tableName := range tableNames {
 		// Skip the checkpoint table in case the source and target schemas
 		// coincide (e.g. local testing).
 		if tableName == syncCheckpointTableName {
@@ -1002,7 +991,7 @@ func (r *Runner) getTables(ctx context.Context) (tables []*table.TableInfo, err 
 		}
 		tables = append(tables, ti)
 	}
-	return tables, rows.Err()
+	return tables, nil
 }
 
 // runChecks runs the pkg/check checks registered for check.Sync and phase.

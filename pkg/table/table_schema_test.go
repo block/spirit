@@ -265,3 +265,76 @@ func TestLoadSchemaAndExcludedTablesFromDB_ReportsFirstMatchingFilter(t *testing
 	require.Empty(t, tables)
 	require.Equal(t, []ExcludedTable{{Name: "_users_archive_2024", Filter: WithoutUnderscoreTables}}, excluded)
 }
+
+func TestListBaseTables(t *testing.T) {
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (id bigint NOT NULL, active tinyint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE orders (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW active_users AS SELECT id FROM users WHERE active = 1`)
+
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	names, err := ListBaseTables(t.Context(), db)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"users", "orders"}, names)
+}
+
+func TestLoadSchemaAndExcludedTablesFromDB_SkipsViews(t *testing.T) {
+	// A view is not a table: it is neither loaded nor reported as excluded,
+	// even when its name matches a filter option. SHOW CREATE TABLE on a view
+	// returns a different column set and needs the SHOW VIEW privilege, so
+	// loading a schema that holds a view must never issue it.
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (
+		id bigint unsigned NOT NULL AUTO_INCREMENT,
+		active tinyint NOT NULL,
+		PRIMARY KEY (id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW active_users AS SELECT id FROM users WHERE active = 1`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW _users_view AS SELECT id FROM users`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW users_archive_2024 AS SELECT id FROM users`)
+
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	tables, err := LoadSchemaFromDB(t.Context(), db)
+	require.NoError(t, err)
+	require.Len(t, tables, 1)
+	require.Equal(t, "users", tables[0].Name)
+	require.Contains(t, tables[0].Schema, "CREATE TABLE `users`")
+
+	tables, excluded, err := LoadSchemaAndExcludedTablesFromDB(t.Context(), db,
+		WithoutUnderscoreTables,
+		WithoutArchiveTables,
+	)
+	require.NoError(t, err)
+	require.Len(t, tables, 1)
+	require.Equal(t, "users", tables[0].Name)
+	require.Empty(t, excluded)
+}
+
+func TestListTableObjects(t *testing.T) {
+	// ListTableObjects reports views alongside base tables, with their type,
+	// while ListBaseTables keeps only the base tables.
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW user_ids AS SELECT id FROM users`)
+
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	objects, err := ListTableObjects(t.Context(), db)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []TableObject{{Name: "users", Type: "BASE TABLE"}, {Name: "user_ids", Type: "VIEW"}}, objects)
+	for _, o := range objects {
+		require.Equal(t, o.Name == "users", o.IsBaseTable(), o.Name)
+	}
+
+	tables, err := ListBaseTables(t.Context(), db)
+	require.NoError(t, err)
+	require.Equal(t, []string{"users"}, tables)
+}

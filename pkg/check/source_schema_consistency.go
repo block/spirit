@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/block/spirit/pkg/utils"
+	"github.com/block/spirit/pkg/table"
 )
 
 func init() {
@@ -124,17 +124,12 @@ func listTables(ctx context.Context, r Resources, sourceIndex int) ([]string, er
 	src := r.Sources[sourceIndex]
 	// Base tables only, matching the runner's getTables (views are refused by
 	// the source_schema_objects check).
-	rows, err := src.DB.QueryContext(ctx, "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+	names, err := table.ListBaseTables(ctx, src.DB)
 	if err != nil {
 		return nil, err
 	}
-	defer utils.CloseAndLog(rows)
 	var tables []string
-	for rows.Next() {
-		var name, tableType string
-		if err := rows.Scan(&name, &tableType); err != nil {
-			return nil, err
-		}
+	for _, name := range names {
 		// Skip shadow tables so they never register as schema drift. The runner's
 		// getTables only filters _spirit_checkpoint/_spirit_sentinel (not the
 		// _new/_old shadow tables), so the canonical list built from sources[0]
@@ -145,7 +140,7 @@ func listTables(ctx context.Context, r Resources, sourceIndex int) ([]string, er
 		}
 		tables = append(tables, name)
 	}
-	return tables, rows.Err()
+	return tables, nil
 }
 
 // isShadowTable reports whether name is a Spirit-internal artifact or a leftover
