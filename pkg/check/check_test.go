@@ -83,6 +83,7 @@ func TestRegisteredChecks(t *testing.T) {
 	const (
 		pre, stmt, flight, post = PhasePreRun, PhaseStatement, PhasePreflight, PhasePostSetup
 		cut, locked, resume     = PhaseCutover, PhaseCutoverLocked, PhaseResume
+		tbl                     = PhaseTable
 		mig, mv, syn            = Migration, Move, Sync
 	)
 	want := map[string]registration{
@@ -91,8 +92,8 @@ func TestRegisteredChecks(t *testing.T) {
 		"dropadd":                      {flight, mig},
 		"enumReorder":                  {flight | stmt, mig},
 		"enumSetRemoval":               {flight | stmt, mig},
-		"hasforeignkeys":               {flight | post | cut | locked, mig},
-		"hastriggers":                  {flight | cut | locked, mig},
+		"hasforeignkeys":               {flight | post | cut | locked | tbl, mig},
+		"hastriggers":                  {flight | cut | locked | tbl, mig},
 		"illegalClause":                {flight | stmt, mig},
 		"primarykey":                   {flight | stmt, mig},
 		"primarykeybit":                {stmt | post, mig},

@@ -37,7 +37,7 @@ func init() {
 	// After setup and before the cutover it checks that the new table has no
 	// foreign keys, and under the cutover lock that the ones the cutover
 	// added to it match the table's.
-	register(check{name: "hasforeignkeys", run: hasForeignKeysCheck, phases: PhasePreflight | PhasePostSetup | PhaseCutover | PhaseCutoverLocked, runtimes: Migration})
+	register(check{name: "hasforeignkeys", run: hasForeignKeysCheck, phases: PhasePreflight | PhasePostSetup | PhaseCutover | PhaseCutoverLocked | PhaseTable, runtimes: Migration})
 }
 
 // The spirit OSC algorithm does not support adding foreign keys, or tables

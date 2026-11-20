@@ -14,7 +14,7 @@ func init() {
 	// they cannot, and are not acted on once the cutover starts. A trigger on
 	// the table is never created on the new table, so the cutover would drop
 	// it.
-	register(check{name: "hastriggers", run: hasTriggersCheck, phases: PhasePreflight | PhaseCutover | PhaseCutoverLocked, runtimes: Migration})
+	register(check{name: "hastriggers", run: hasTriggersCheck, phases: PhasePreflight | PhaseCutover | PhaseCutoverLocked | PhaseTable, runtimes: Migration})
 }
 
 // hasTriggersCheck check if table has triggers associated with it, which is not supported
