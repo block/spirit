@@ -270,7 +270,7 @@ func TestListBaseTables(t *testing.T) {
 	dbName, _ := testutils.CreateUniqueTestDatabase(t)
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (id bigint NOT NULL, active tinyint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
 	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE orders (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
-	testutils.RunSQLInDatabase(t, dbName, `CREATE VIEW active_users AS SELECT id FROM users WHERE active = 1`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW active_users AS SELECT id FROM users WHERE active = 1`)
 
 	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
@@ -292,9 +292,9 @@ func TestLoadSchemaAndExcludedTablesFromDB_SkipsViews(t *testing.T) {
 		active tinyint NOT NULL,
 		PRIMARY KEY (id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
-	testutils.RunSQLInDatabase(t, dbName, `CREATE VIEW active_users AS SELECT id FROM users WHERE active = 1`)
-	testutils.RunSQLInDatabase(t, dbName, `CREATE VIEW _users_view AS SELECT id FROM users`)
-	testutils.RunSQLInDatabase(t, dbName, `CREATE VIEW users_archive_2024 AS SELECT id FROM users`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW active_users AS SELECT id FROM users WHERE active = 1`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW _users_view AS SELECT id FROM users`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW users_archive_2024 AS SELECT id FROM users`)
 
 	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
 	require.NoError(t, err)
