@@ -727,7 +727,7 @@ func TestRetryableTransactionAllowsDeprecationWarning(t *testing.T) {
 // it was. DDL that keeps every row as written still runs, including a full
 // rebuild of a table that holds and defaults to a zero date. Spirit's default
 // session, by contrast, truncates the value with only a warning.
-func TestStrictSQLModeRefusesLossyDDL(t *testing.T) {
+func TestLossyNativeDDLFailsWhenSessionRefusesDataLoss(t *testing.T) {
 	strict := NewDBConfig()
 	strict.StrictSQLMode = true
 	db, err := New(testutils.DSN(), strict)
