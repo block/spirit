@@ -65,34 +65,62 @@ type ExcludedTable struct {
 	Filter FilterOption // The filter option that excluded the table
 }
 
-// ListBaseTables returns the base tables in the connection's selected
-// database, in the order SHOW FULL TABLES returns them. Views, and any other
-// object type MySQL lists alongside tables, are skipped: they hold no rows of
-// their own, and SHOW CREATE TABLE describes a view in a different shape
-// (four columns instead of two) and requires the SHOW VIEW privilege.
+// TableObject is one entry SHOW FULL TABLES lists for a database: a base
+// table, a view, or any other object type MySQL lists alongside tables.
+type TableObject struct {
+	Name string // Object name
+	Type string // Table_type as MySQL reports it, e.g. BASE TABLE or VIEW
+}
+
+// IsBaseTable reports whether the object is a base table, as opposed to a
+// view or another object type sharing the table namespace.
+func (o TableObject) IsBaseTable() bool {
+	return strings.EqualFold(o.Type, "BASE TABLE")
+}
+
+// ListTableObjects returns every object in the connection's selected database
+// that occupies the table namespace, with its type, in the order SHOW FULL
+// TABLES returns them. Callers that must know whether a name is free, rather
+// than which base tables exist, need the views as well: a view blocks a
+// CREATE TABLE of the same name and accepts writes aimed at it.
 //
-// The filter is applied to the Table_type column in Go rather than with a
-// WHERE clause, so the statement stays in the plain form that any
-// MySQL-protocol endpoint supports.
-func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
+// The statement stays in the plain form that any MySQL-protocol endpoint
+// supports; callers filter on Type in Go.
+func ListTableObjects(ctx context.Context, db *sql.DB) ([]TableObject, error) {
 	rows, err := db.QueryContext(ctx, "SHOW FULL TABLES")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tables: %w", err)
 	}
 	defer utils.CloseAndLog(rows)
-	var names []string
+	var objects []TableObject
 	for rows.Next() {
-		var name, tableType string
-		if err := rows.Scan(&name, &tableType); err != nil {
+		var o TableObject
+		if err := rows.Scan(&o.Name, &o.Type); err != nil {
 			return nil, fmt.Errorf("failed to scan table name: %w", err)
 		}
-		if !strings.EqualFold(tableType, "BASE TABLE") {
-			continue
-		}
-		names = append(names, name)
+		objects = append(objects, o)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating tables: %w", err)
+	}
+	return objects, nil
+}
+
+// ListBaseTables returns the base tables in the connection's selected
+// database, in the order SHOW FULL TABLES returns them. Views, and any other
+// object type MySQL lists alongside tables, are skipped: they hold no rows of
+// their own, and SHOW CREATE TABLE describes a view in a different shape
+// (four columns instead of two) and requires the SHOW VIEW privilege.
+func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
+	objects, err := ListTableObjects(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, o := range objects {
+		if o.IsBaseTable() {
+			names = append(names, o.Name)
+		}
 	}
 	return names, nil
 }

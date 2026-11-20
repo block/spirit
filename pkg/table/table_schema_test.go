@@ -315,3 +315,26 @@ func TestLoadSchemaAndExcludedTablesFromDB_SkipsViews(t *testing.T) {
 	require.Equal(t, "users", tables[0].Name)
 	require.Empty(t, excluded)
 }
+
+func TestListTableObjects(t *testing.T) {
+	// ListTableObjects reports views alongside base tables, with their type,
+	// while ListBaseTables keeps only the base tables.
+	dbName, _ := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, `CREATE TABLE users (id bigint NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB`)
+	testutils.RunSQLInDatabaseAsRoot(t, dbName, `CREATE VIEW user_ids AS SELECT id FROM users`)
+
+	db, err := sql.Open("block-mysql", testutils.DSNForDatabase(dbName))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	objects, err := ListTableObjects(t.Context(), db)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []TableObject{{Name: "users", Type: "BASE TABLE"}, {Name: "user_ids", Type: "VIEW"}}, objects)
+	for _, o := range objects {
+		require.Equal(t, o.Name == "users", o.IsBaseTable(), o.Name)
+	}
+
+	tables, err := ListBaseTables(t.Context(), db)
+	require.NoError(t, err)
+	require.Equal(t, []string{"users"}, tables)
+}
