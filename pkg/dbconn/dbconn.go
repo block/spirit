@@ -43,6 +43,23 @@ type DBConfig struct {
 	RangeOptimizerMaxMemSize int64
 	InterpolateParams        bool
 	ForceKill                bool // If true, kill locking transactions to acquire metadata locks (default: true)
+	// StrictSQLMode adds STRICT_ALL_TABLES and NO_ENGINE_SUBSTITUTION to the
+	// session sql_mode (see newDSN), for a caller that runs DDL natively with
+	// whatever algorithm the server picks. Spirit's own native DDL is limited
+	// to ALGORITHM=INSTANT and ALGORITHM=INPLACE, LOCK=NONE, and everything
+	// else goes through the copy, whose warnings check refuses a row that
+	// would change. A native ALGORITHM=COPY rebuild has no such check: in a
+	// non-strict session, narrowing a column truncates the values that no
+	// longer fit and NULLs become '' under a new NOT NULL, each with only a
+	// warning, and the ALTER has committed before SHOW WARNINGS could report
+	// it. Strict mode makes MySQL refuse those statements instead. The
+	// zero-date checks (NO_ZERO_DATE, NO_ZERO_IN_DATE) stay off, as in every
+	// spirit session, so a table holding or defaulting to '0000-00-00' can
+	// still be altered. The mode is part of the DSN, so it takes effect when
+	// the pool is opened: set it on the DBConfig passed to New or NewContext.
+	// Setting it only on the DBConfig passed to ForceExec leaves the pool's
+	// sessions non-strict. Default: false.
+	StrictSQLMode bool
 	// There is deliberately no RejectReadOnly here. It used to map to the
 	// driver's rejectReadOnly option and defaulted to true, guarding against
 	// landing on a demoted, now-read-only Aurora primary after a blue/green

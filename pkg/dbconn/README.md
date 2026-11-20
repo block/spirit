@@ -4,7 +4,7 @@ The `dbconn` package provides MySQL database connection management and locking u
 
 ## Connection Setup
 
-When creating a new connection, Spirit appends standardized DSN parameters to ensure consistent behavior across all connections. These include setting `sql_mode="NO_AUTO_VALUE_ON_ZERO"` (to be able to copy legacy data like `0000-00-00`), `time_zone=+00:00`, `transaction_isolation=read-committed`, `charset=utf8mb4`, `collation=utf8mb4_bin`, and `rejectReadOnly=true` (for Aurora failover resilience). `NO_AUTO_VALUE_ON_ZERO` preserves explicit zero values in auto-increment columns. Spirit also sets session lock timeouts and checks write warnings, so using a non-strict mode does not silently permit lossy copies.
+When creating a new connection, Spirit appends standardized DSN parameters to ensure consistent behavior across all connections. These include setting `sql_mode="NO_AUTO_VALUE_ON_ZERO"` (to be able to copy legacy data like `0000-00-00`), `time_zone=+00:00`, `transaction_isolation=read-committed`, `charset=utf8mb4`, `collation=utf8mb4_bin`, and `rejectReadOnly=true` (for Aurora failover resilience). `NO_AUTO_VALUE_ON_ZERO` preserves explicit zero values in auto-increment columns. Spirit also sets session lock timeouts and checks write warnings, so using a non-strict mode does not silently permit lossy copies. A caller that runs DDL natively with whatever algorithm the server picks, where no warnings check runs before the ALTER commits, sets `DBConfig.StrictSQLMode` to add `STRICT_ALL_TABLES` and `NO_ENGINE_SUBSTITUTION`: MySQL then refuses a rebuild that would truncate a value or turn a NULL into `''`, and still accepts zero dates.
 
 ## Pool sizing
 

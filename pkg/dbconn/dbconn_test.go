@@ -720,3 +720,61 @@ func TestRetryableTransactionAllowsDeprecationWarning(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT HEX(b) FROM test.deprecatedwarn1 WHERE a = 1").Scan(&got))
 	assert.Equal(t, "004D", got)
 }
+
+// A session opened with StrictSQLMode runs native DDL that would rewrite a
+// row as an error rather than a warning: narrowing a column over a value that
+// no longer fits, and NOT NULL over a NULL, both fail and leave the table as
+// it was. DDL that keeps every row as written still runs, including a full
+// rebuild of a table that holds and defaults to a zero date. Spirit's default
+// session, by contrast, truncates the value with only a warning.
+func TestLossyNativeDDLFailsWhenSessionRefusesDataLoss(t *testing.T) {
+	strict := NewDBConfig()
+	strict.StrictSQLMode = true
+	db, err := New(testutils.DSN(), strict)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	var mode string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@SESSION.sql_mode").Scan(&mode))
+	require.Equal(t, "NO_AUTO_VALUE_ON_ZERO,STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION", mode)
+
+	require.NoError(t, Exec(t.Context(), db, "DROP TABLE IF EXISTS test.strictddl1"))
+	require.NoError(t, Exec(t.Context(), db,
+		"CREATE TABLE test.strictddl1 (a INT NOT NULL PRIMARY KEY, "+
+			"created DATETIME NOT NULL DEFAULT '0000-00-00 00:00:00', v VARCHAR(20), n VARCHAR(10) NULL)"))
+	require.NoError(t, Exec(t.Context(), db,
+		"INSERT INTO test.strictddl1 (a, created, v, n) VALUES (1, '0000-00-00 00:00:00', 'hello world', NULL)"))
+	tbl := table.NewTableInfo(db, "test", "strictddl1")
+	forceExec := func(alter string) error {
+		return ForceExec(t.Context(), db, []*table.TableInfo{tbl}, strict, slog.Default(), "ALTER TABLE test.strictddl1 %r", sqlescape.RawSQL(alter))
+	}
+
+	require.NoError(t, forceExec("ADD COLUMN extra INT"))
+	require.NoError(t, forceExec("ENGINE=InnoDB"))
+	require.NoError(t, forceExec("ADD INDEX v_idx (v)"))
+
+	err = forceExec("MODIFY v VARCHAR(5)")
+	mysqlErr, ok := errors.AsType[*mysql.MySQLError](err)
+	require.True(t, ok, "narrowing over a value that does not fit is not a MySQL error: %v", err)
+	assert.Equal(t, uint16(1265), mysqlErr.Number)
+
+	err = forceExec("MODIFY n VARCHAR(10) NOT NULL")
+	mysqlErr, ok = errors.AsType[*mysql.MySQLError](err)
+	require.True(t, ok, "NOT NULL over a NULL is not a MySQL error: %v", err)
+	assert.Equal(t, uint16(1138), mysqlErr.Number)
+
+	var created, v string
+	var n sql.NullString
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT CAST(created AS CHAR), v, n FROM test.strictddl1 WHERE a = 1").Scan(&created, &v, &n))
+	assert.Equal(t, "0000-00-00 00:00:00", created)
+	assert.Equal(t, "hello world", v)
+	assert.False(t, n.Valid)
+
+	lax, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(lax)
+	require.NoError(t, Exec(t.Context(), lax, "ALTER TABLE test.strictddl1 MODIFY v VARCHAR(5)"))
+	require.NoError(t, lax.QueryRowContext(t.Context(), "SELECT v FROM test.strictddl1 WHERE a = 1").Scan(&v))
+	assert.Equal(t, "hello", v)
+}

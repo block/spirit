@@ -311,6 +311,22 @@ func getTLSConfigName(mode string) string {
 	}
 }
 
+// sqlMode is the sql_mode of every spirit session, and strictSQLMode the
+// modes DBConfig.StrictSQLMode adds to it. See newDSN for why spirit sets
+// sql_mode at all, and DBConfig.StrictSQLMode for when a caller wants strict.
+const (
+	sqlMode       = "NO_AUTO_VALUE_ON_ZERO"
+	strictSQLMode = "STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION"
+)
+
+// sessionSQLMode returns the quoted sql_mode value newDSN sets for config.
+func sessionSQLMode(config *DBConfig) string {
+	if config.StrictSQLMode {
+		return `"` + sqlMode + "," + strictSQLMode + `"`
+	}
+	return `"` + sqlMode + `"`
+}
+
 // newDSN returns a new DSN to be used to connect to MySQL.
 // It accepts a DSN as input and appends TLS configuration
 // based on the provided configuration and host detection.
@@ -399,11 +415,12 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	// auto-inc value). NO_AUTO_VALUE_ON_ZERO is otherwise a no-op (it
 	// only affects literal-0 inserts into AUTO_INCREMENT columns), so it
 	// is safe to enable on every connection — copier, checksum recopy,
-	// binlog applier.
+	// binlog applier. A caller that runs native DDL with whatever algorithm
+	// the server picks adds strict mode with DBConfig.StrictSQLMode.
 	if cfg.Params == nil {
 		cfg.Params = make(map[string]string)
 	}
-	cfg.Params["sql_mode"] = `"NO_AUTO_VALUE_ON_ZERO"`
+	cfg.Params["sql_mode"] = sessionSQLMode(config)
 	cfg.Params["time_zone"] = `"+00:00"`
 	cfg.Params["innodb_lock_wait_timeout"] = strconv.Itoa(config.InnodbLockWaitTimeout)
 	cfg.Params["lock_wait_timeout"] = strconv.Itoa(config.LockWaitTimeout)
