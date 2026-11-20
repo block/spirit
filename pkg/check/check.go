@@ -41,7 +41,7 @@ const (
 
 // Phase is when in a run a check runs. A check registers for every phase it
 // runs in.
-type Phase uint8
+type Phase uint16
 
 const (
 	PhasePreRun    Phase = 1 << 0
@@ -88,7 +88,8 @@ const (
 	// connection (existing foreign keys, triggers, privileges, ...) are not in
 	// this phase either: they run at preflight, and the foreign key and
 	// trigger checks run again before and during the cutover, to catch one
-	// created while the migration runs.
+	// created while the migration runs. A caller with a connection learns the
+	// foreign key and trigger refusals ahead of an apply through PhaseTable.
 	//
 	// A caller that reports these refusals somewhere other than its own logs
 	// judges the text by reading the checks that produce it, and a check added
@@ -113,6 +114,21 @@ const (
 	// on every source, after the final flush and before the traffic switch
 	// and the source rename. A refusal leaves the source live.
 	PhaseCutoverLocked Phase = 1 << 7
+	// PhaseTable marks checks a caller can run ahead of an apply, against the
+	// server, to learn that the copy process refuses the table as it stands:
+	// it is either end of a foreign key, or it has triggers. They are the
+	// connected counterpart of PhaseStatement, which decides from the
+	// statement alone. Callers run them via TableRefusal, which supplies one
+	// source connection and the table's schema and name; a check tagged with
+	// this phase must tolerate every other Resources field being unset.
+	//
+	// A failure here is certain only for the copy process. Spirit attempts
+	// MySQL's native DDL for a single-table change before its preflight
+	// checks, and an ALTER that MySQL completes that way, such as an instant
+	// ADD COLUMN, succeeds on a table these checks refuse. A caller may act on
+	// a failure by running the statement some other way, but must not report
+	// it as a promise that Spirit fails the statement.
+	PhaseTable Phase = 1 << 8
 )
 
 // Endpoint is one MySQL server a run reads from or writes to, at one schema.
