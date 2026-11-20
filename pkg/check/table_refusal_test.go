@@ -46,7 +46,7 @@ func TestTableRefusal(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.table, func(t *testing.T) {
-			reason, refused, err := TableRefusal(t.Context(), db, dbName, tt.table, nil)
+			reason, refused, err := TableRefusal(t.Context(), db, dbName, tt.table, Options{}, nil)
 			require.NoError(t, err)
 			if tt.wantReason == "" {
 				assert.False(t, refused)
@@ -59,6 +59,56 @@ func TestTableRefusal(t *testing.T) {
 	}
 }
 
+// TestTableRefusalFirstReasonOnly checks that a table refused by more than one
+// check reports the first refusal in name order: the foreign key, ahead of the
+// trigger. Once the foreign key is gone, the trigger refusal is reported.
+func TestTableRefusalFirstReasonOnly(t *testing.T) {
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	for _, stmt := range []string{
+		"CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
+		"CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT NOT NULL, " +
+			"CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parent (id))",
+		"CREATE TRIGGER child_ins BEFORE INSERT ON child FOR EACH ROW SET NEW.id = NEW.id",
+	} {
+		testutils.RunSQLInDatabase(t, dbName, stmt)
+	}
+
+	reason, refused, err := TableRefusal(t.Context(), db, dbName, "child", Options{}, nil)
+	require.NoError(t, err)
+	require.True(t, refused)
+	assert.Equal(t, "tables with existing foreign key constraints are not supported", reason)
+
+	testutils.RunSQLInDatabase(t, dbName, "ALTER TABLE child DROP FOREIGN KEY fk_child_parent")
+	reason, refused, err = TableRefusal(t.Context(), db, dbName, "child", Options{}, nil)
+	require.NoError(t, err)
+	require.True(t, refused)
+	assert.Equal(t, "tables with triggers associated are not supported", reason)
+}
+
+// TestTableRefusalExperimentalForeignKeys checks that the options reach the
+// checks: with experimental foreign keys, the referenced end of a foreign key
+// is refused with the reason a run with --enable-experimental-foreign-keys
+// gives, and the referencing end is no longer refused for having a foreign
+// key at all. Whether the server supports a table's own foreign keys depends
+// on its version, so the child's verdict is only required not to be the
+// default one.
+func TestTableRefusalExperimentalForeignKeys(t *testing.T) {
+	dbName, db := testutils.CreateUniqueTestDatabase(t)
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)")
+	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT NOT NULL, "+
+		"CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parent (id))")
+	opts := Options{ExperimentalForeignKeys: true}
+
+	reason, refused, err := TableRefusal(t.Context(), db, dbName, "parent", opts, nil)
+	require.NoError(t, err)
+	require.True(t, refused)
+	assert.Contains(t, reason, "tables referenced by a foreign key are not supported, even with --enable-experimental-foreign-keys")
+
+	reason, _, err = TableRefusal(t.Context(), db, dbName, "child", opts, nil)
+	require.NoError(t, err)
+	assert.NotEqual(t, "tables with existing foreign key constraints are not supported", reason)
+}
+
 // TestTableRefusalFollowsTheServer checks that the verdict is read from the
 // server each time: once the foreign key is dropped, neither of its former
 // ends is refused.
@@ -68,13 +118,13 @@ func TestTableRefusalFollowsTheServer(t *testing.T) {
 	testutils.RunSQLInDatabase(t, dbName, "CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT NOT NULL, "+
 		"CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parent (id))")
 
-	_, refused, err := TableRefusal(t.Context(), db, dbName, "parent", nil)
+	_, refused, err := TableRefusal(t.Context(), db, dbName, "parent", Options{}, nil)
 	require.NoError(t, err)
 	require.True(t, refused)
 
 	testutils.RunSQLInDatabase(t, dbName, "ALTER TABLE child DROP FOREIGN KEY fk_child_parent")
 	for _, table := range []string{"parent", "child"} {
-		reason, refused, err := TableRefusal(t.Context(), db, dbName, table, nil)
+		reason, refused, err := TableRefusal(t.Context(), db, dbName, table, Options{}, nil)
 		require.NoError(t, err)
 		assert.False(t, refused, "table %s: %s", table, reason)
 	}
@@ -89,11 +139,11 @@ func TestTableRefusalReadFailure(t *testing.T) {
 	require.NoError(t, openErr)
 	require.NoError(t, db.Close())
 
-	_, refused, err := TableRefusal(t.Context(), db, dbName, "standalone", nil)
+	_, refused, err := TableRefusal(t.Context(), db, dbName, "standalone", Options{}, nil)
 	require.Error(t, err)
 	assert.False(t, refused)
 
-	_, refused, err = TableRefusal(t.Context(), nil, dbName, "standalone", nil)
+	_, refused, err = TableRefusal(t.Context(), nil, dbName, "standalone", Options{}, nil)
 	require.Error(t, err)
 	assert.False(t, refused)
 }

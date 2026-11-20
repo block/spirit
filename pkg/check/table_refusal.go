@@ -13,8 +13,10 @@ import (
 
 // TableRefusal reports whether the copy process refuses tableName in schema
 // as it stands on db, and the reason it would give. It runs the PhaseTable
-// checks under the default migration options: the table is either end of a
-// foreign key, or it has triggers.
+// checks under opts, the options the run would use: by default the table is
+// refused when it is either end of a foreign key or has triggers, and with
+// opts.ExperimentalForeignKeys a table with foreign keys of its own is judged
+// as a run with --enable-experimental-foreign-keys judges it.
 //
 // It is the connected counterpart of StatementRefusal, for a caller that has a
 // connection to the server and needs to know ahead of an apply that the copy
@@ -27,8 +29,13 @@ import (
 // that way succeeds whatever these checks say (see PhaseTable). err reports a
 // failure to read the server, and is never itself a refusal.
 //
+// reason names the first refusal only. The checks run in name order and stop
+// at the first that refuses, so a table that is both the end of a foreign key
+// and has triggers reports the foreign key, and is refused for its triggers
+// once the foreign key is gone.
+//
 // logger may be nil, in which case the checks' own logging is discarded.
-func TableRefusal(ctx context.Context, db *sql.DB, schema, tableName string, logger *slog.Logger) (reason string, refused bool, err error) {
+func TableRefusal(ctx context.Context, db *sql.DB, schema, tableName string, opts Options, logger *slog.Logger) (reason string, refused bool, err error) {
 	if db == nil {
 		return "", false, errors.New("table refusal check requires a database connection")
 	}
@@ -36,6 +43,7 @@ func TableRefusal(ctx context.Context, db *sql.DB, schema, tableName string, log
 		Runtime: Migration,
 		Sources: []Endpoint{{DB: db, Config: &mysql.Config{DBName: schema}}},
 		Change:  Change{Table: table.NewTableInfo(db, schema, tableName)},
+		Options: opts,
 	}
 	if checkErr := RunChecks(ctx, resources, logger, PhaseTable); checkErr != nil {
 		if errors.Is(checkErr, ErrRefused) {
