@@ -691,6 +691,7 @@ func (a *MySQLApplier) writeChunklet(ctx context.Context, shard *shardTarget, ch
 	// Build VALUES clauses for all rows in the chunklet
 	valuesClauses := make([]string, 0, len(chunkletData.rows))
 	values := make([]string, len(sourceColumnNames))
+	var args []any
 	for _, row := range chunkletData.rows {
 		if len(sourceColumnNames) != len(row.values) {
 			return 0, time.Since(buildStart), fmt.Errorf("column count mismatch: chunk %s has %d columns, but chunklet has %d values",
@@ -701,11 +702,10 @@ func (a *MySQLApplier) writeChunklet(ctx context.Context, shard *shardTarget, ch
 			if err != nil {
 				return 0, time.Since(buildStart), fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)
 			}
-			// datum.String() returns a complete pre-escaped SQL literal
-			// (NULL, a numeric, 0x… hex, or a "..."-quoted string). Safe
-			// to concatenate into the VALUES clause as-is — see the
-			// contract on Datum.String.
-			values[i] = datum.String()
+			// A literal from datum.String() is pre-escaped and safe to
+			// concatenate into the VALUES clause as-is (see the contract on
+			// Datum.String); a large value is a placeholder bound to args.
+			values[i], args = valueSQL(datum, args)
 		}
 		valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 	}
@@ -725,7 +725,7 @@ func (a *MySQLApplier) writeChunklet(ctx context.Context, shard *shardTarget, ch
 		"rowCount", len(chunkletData.rows), "table", mapping.TargetTable().TableName)
 
 	// Execute the batch insert on this shard's database
-	result, err := dbconn.RetryableTransaction(ctx, shard.writeDB, dbconn.IgnoreDupKeyWarnings, shard.dbConfig, query)
+	result, err := dbconn.RetryableExec(ctx, shard.writeDB, dbconn.IgnoreDupKeyWarnings, shard.dbConfig, query, args...)
 	if err != nil {
 		return 0, buildTime, fmt.Errorf("failed to execute chunklet insert on shard %d: %w", shard.shardID, err)
 	}
@@ -1133,6 +1133,7 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 			// Build the VALUES clause
 			valuesClauses := make([]string, 0, len(r))
 			values := make([]string, len(sourceOrdinal))
+			var args []any
 			for _, logicalRow := range r {
 				for i, colIdx := range sourceOrdinal {
 					if colIdx >= len(logicalRow.RowImage) {
@@ -1144,11 +1145,11 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 						results <- result{err: fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)}
 						return
 					}
-					// datum.String() returns a complete pre-escaped SQL
-					// literal (NULL, a numeric, 0x… hex, or a "..."-quoted
-					// string). Safe to concatenate into the VALUES clause
-					// as-is — see the contract on Datum.String.
-					values[i] = datum.String()
+					// A literal from datum.String() is pre-escaped and safe
+					// to concatenate into the VALUES clause as-is (see the
+					// contract on Datum.String); a large value is a
+					// placeholder bound to args.
+					values[i], args = valueSQL(datum, args)
 				}
 				valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 			}
@@ -1174,7 +1175,7 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 			// The lock connection is the only connection allowed to write
 			// to this shard's table while LOCK TABLES is held.
 			if shardLocks != nil {
-				if err = shardLocks[sid].ExecUnderLockWithWarnings(ctx, upsertStmt); err != nil {
+				if err = shardLocks[sid].ExecUnderLockWithWarningsArgs(ctx, upsertStmt, args...); err != nil {
 					err = fmt.Errorf("failed to execute upsert under lock on shard %d: %w", sid, err)
 				} else {
 					// ExecUnderLock does not report affected rows, so return
@@ -1183,7 +1184,7 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 				}
 			} else {
 				// Execute as a retryable transaction
-				affected, err = dbconn.RetryableTransaction(ctx, a.shards[sid].writeDB, dbconn.ErrorOnDupKey, a.shards[sid].dbConfig, upsertStmt)
+				affected, err = dbconn.RetryableExec(ctx, a.shards[sid].writeDB, dbconn.ErrorOnDupKey, a.shards[sid].dbConfig, upsertStmt, args...)
 				if err != nil {
 					err = fmt.Errorf("failed to execute upsert on shard %d: %w", sid, err)
 				}

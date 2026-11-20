@@ -442,6 +442,41 @@ func (d Datum) String() string {
 	return "\"" + sqlescape.EscapeString(s) + "\""
 }
 
+// Placeholder returns a SQL expression holding one ? placeholder, and the
+// value to bind to it, that writes exactly what the literal from String writes.
+// It is for values too large to carry as literals: String renders a binary or
+// charset-labelled value as hex, two characters per byte, so a value that fits
+// in max_allowed_packet as stored bytes can produce a statement that does not.
+// A bound value travels as its own bytes, and the driver streams one that is
+// larger than a packet in pieces.
+//
+// Each expression gives the bound value the same type the literal has:
+//
+//   - CONVERT(CAST(? AS BINARY) USING charset) for a string whose bytes are in
+//     another charset, which labels the bytes the way the _charset introducer
+//     does, without converting them
+//   - CAST(? AS BINARY) for IsBinaryString(), a binary string like a 0x literal
+//   - ? for everything else, a string in the connection charset like a quoted
+//     literal
+//
+// ok is false for NULL and numerics, whose literals are already small.
+func (d Datum) Placeholder() (expr string, arg string, ok bool) {
+	if d.IsNil() || d.IsNumeric() {
+		return "", "", false
+	}
+	s, isString := d.Val.(string)
+	if !isString {
+		s = fmt.Sprintf("%v", d.Val)
+	}
+	if d.charset != "" {
+		return "CONVERT(CAST(? AS BINARY) USING " + d.charset + ")", s, true
+	}
+	if d.IsBinaryString() {
+		return "CAST(? AS BINARY)", s, true
+	}
+	return "?", s, true
+}
+
 // IsNumeric checks if it's signed or unsigned
 func (d Datum) IsNumeric() bool {
 	return d.Tp == signedType || d.Tp == unsignedType

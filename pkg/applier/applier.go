@@ -41,6 +41,15 @@ const (
 	// row count and this bound is much looser.)
 	MaxStatementSizeBytes = 1024 * 1024
 
+	// boundValueMinBytes is the size above which a value is bound to a
+	// placeholder instead of written into the statement as a literal. A
+	// literal can be twice the value's size (binary values render as hex), so
+	// a value that fits in max_allowed_packet can make a statement that does
+	// not; a bound value travels as its own bytes. Values below this stay
+	// literals, so ordinary statements are sent as text, unprepared, as
+	// before.
+	boundValueMinBytes = MaxStatementSizeBytes
+
 	defaultBufferSize   = 128 // Size of the shared buffer channel for chunklets
 	defaultWriteWorkers = 2   // Number of write workers, default low for tests, but in practice we can use 40+
 )
@@ -231,8 +240,9 @@ type rowData struct {
 // Returns a slice of row batches where each batch respects both chunkletMaxRows and MaxStatementSizeBytes limits.
 //
 // Note: A single row can exceed MaxStatementSizeBytes by itself. In this case, the row will be placed
-// in its own chunklet regardless of size. This is an edge case where we rely on max_allowed_packet
-// being large enough (typically 64 MiB default vs our 1 MiB threshold).
+// in its own chunklet regardless of size. Its values larger than boundValueMinBytes are bound to
+// placeholders rather than rendered (see valueSQL), so the statement stays small and each value
+// only has to fit in max_allowed_packet as stored bytes, which it already does to be in the table.
 func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 	if len(rows) == 0 {
 		return nil
@@ -260,4 +270,15 @@ func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 		chunklets = append(chunklets, currentChunklet)
 	}
 	return chunklets
+}
+
+// valueSQL returns the SQL for one value in a VALUES clause. A value larger
+// than boundValueMinBytes becomes a placeholder expression and its argument is
+// appended to args; anything else is the datum's literal. Placeholders appear
+// in the order their values are rendered, which is the order of args.
+func valueSQL(datum table.Datum, args []any) (string, []any) {
+	if expr, arg, ok := datum.Placeholder(); ok && len(arg) > boundValueMinBytes {
+		return expr, append(args, arg)
+	}
+	return datum.String(), args
 }

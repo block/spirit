@@ -105,7 +105,7 @@ The estimate is deliberately cheap and deliberately biased low. It runs on every
 
 That is not hypothetical. The previous implementation measured `len(fmt.Sprintf("%v", v))`, and a text-protocol `Scan` into `*any` returns `[]byte` for string, temporal and `DECIMAL` columns — which `%v` renders as `[49 50 51 …]`, about four characters per byte. It over-estimated by ~2.7x, so chunklets were cut well short of the budget they were sized for, and nothing failed, because an over-estimate is safe. It also cost ~2.2µs and 12 allocations per row, which on the copy path was more than building the statement it was sizing.
 
-**Important**: A single row can exceed the byte budget by itself. In this edge case, the row will be placed in its own chunklet regardless of size, relying on `max_allowed_packet` being large enough. This is rare in practice.
+**Important**: A single row can exceed the byte budget by itself. In this edge case, the row is placed in its own chunklet regardless of size. A literal can be twice its value's size, because binary values and strings in a charset other than utf8mb4 render as hex, so a row that fits in `max_allowed_packet` can make a statement that does not. Values larger than the byte budget are therefore bound to placeholders instead of rendered (`Datum.Placeholder`), and travel as their own bytes; the Go MySQL driver streams one larger than a packet in pieces. Any value the table holds can be copied this way. The binlog-apply path's `REPLACE` binds large values the same way.
 
 ### Async vs Sync Operations
 

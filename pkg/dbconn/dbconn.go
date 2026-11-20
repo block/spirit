@@ -336,9 +336,31 @@ func checkWarnings(ctx context.Context, session warningReader, dupKeyHandling Du
 	return false, rows.Err()
 }
 
+// boundStatement is a statement and the arguments bound to its placeholders.
+type boundStatement struct {
+	query string
+	args  []any
+}
+
 // RetryableTransaction retries all statements in a transaction, retrying if a statement
 // errors, or there is a deadlock. It will retry up to maxRetries times.
 func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKeyHandling, config *DBConfig, stmts ...string) (int64, error) {
+	bound := make([]boundStatement, 0, len(stmts))
+	for _, stmt := range stmts {
+		bound = append(bound, boundStatement{query: stmt})
+	}
+	return retryableTransaction(ctx, db, dupKeyHandling, config, bound)
+}
+
+// RetryableExec is RetryableTransaction for one statement with arguments
+// bound to its placeholders. A statement with arguments is prepared on the
+// server, so a large argument travels as its own bytes rather than as text in
+// the statement.
+func RetryableExec(ctx context.Context, db *sql.DB, dupKeyHandling DupKeyHandling, config *DBConfig, stmt string, args ...any) (int64, error) {
+	return retryableTransaction(ctx, db, dupKeyHandling, config, []boundStatement{{query: stmt, args: args}})
+}
+
+func retryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKeyHandling, config *DBConfig, stmts []boundStatement) (int64, error) {
 	switch dupKeyHandling {
 	case ErrorOnDupKey, IgnoreDupKeyWarnings:
 	default:
@@ -370,11 +392,11 @@ func RetryableTransaction(ctx context.Context, db *sql.DB, dupKeyHandling DupKey
 			}()
 			// Execute all statements.
 			for _, stmt := range stmts {
-				if stmt == "" {
+				if stmt.query == "" {
 					continue
 				}
 				var res sql.Result
-				if res, err = trx.ExecContext(ctx, stmt); err != nil {
+				if res, err = trx.ExecContext(ctx, stmt.query, stmt.args...); err != nil {
 					if !canRetryError(err) {
 						isFatal = true
 					}
