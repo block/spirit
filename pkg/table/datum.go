@@ -22,10 +22,10 @@ const (
 
 // Datum could be a binary string, uint64 or int64.
 type Datum struct {
-	Val            any
-	Tp             datumTp // signed, unsigned, binary
-	forceHexEncode bool    // when true, always hex-encode the value in String()
-	charset        string  // when set, Val holds bytes in this charset, and String() emits them with its introducer; see ColumnType
+	Val         any
+	Tp          datumTp // signed, unsigned, binary
+	forceBinary bool    // when true, String() always renders a binary literal, never a quoted string
+	charset     string  // when set, Val holds bytes in this charset, and String() emits them with its introducer; see ColumnType
 }
 
 // isBITType reports whether the given MySQL column type is a BIT(N) type.
@@ -90,7 +90,7 @@ func mySQLTypeToDatumTp(mysqlTp string) datumTp {
 		// MySQL only accepts it back as a binary-charset literal: a
 		// character-set string of the right length is rejected outright
 		// ("Value of type 'string, size: 12' cannot be converted to
-		// 'vector' type"). Classifying it as binaryType forces the 0x-hex
+		// 'vector' type"). Classifying it as binaryType forces a _binary
 		// literal in Datum.String() even for byte images that happen to be
 		// valid UTF-8 — e.g. the all-zeros vector [0,0,0], which the
 		// IsBinaryString() UTF-8 heuristic alone would emit as a quoted
@@ -169,7 +169,7 @@ func NewDatum(val any, tp datumTp) (Datum, error) {
 		// (datumValFromString) unconditionally hex-decodes binaryType values
 		// with a "0x" prefix, so serializing such a value as a plain string
 		// would corrupt the watermark boundary on resume.
-		forceHexEncode: tp == binaryType,
+		forceBinary: tp == binaryType,
 	}, nil
 }
 
@@ -218,9 +218,9 @@ func newDatumFromMySQL(val string, mysqlTp string) (Datum, error) {
 		Val: sVal,
 		Tp:  tp,
 	}
-	// Binary types should always be hex-encoded when serialized.
+	// Binary types always render as binary literals (see NewDatum).
 	if tp == binaryType {
-		d.forceHexEncode = true
+		d.forceBinary = true
 	}
 	return d, nil
 }
@@ -282,9 +282,9 @@ func NewDatumFromValueWithType(value any, ct ColumnType) (Datum, error) {
 	}
 
 	// Convert []byte to string. NewDatum parses numeric types from strings,
-	// and marks binaryType datums with forceHexEncode so binary data is
-	// always hex-encoded in SQL output — even data that is valid UTF-8
-	// (which IsBinaryString() would not catch).
+	// and marks binaryType datums with forceBinary so binary data always
+	// renders as a _binary literal in SQL output — even data that is valid
+	// UTF-8 (which the IsBinaryString() heuristic would not catch).
 	isString := false
 	switch v := value.(type) {
 	case []byte:
@@ -481,14 +481,14 @@ func (d Datum) IsNumeric() bool {
 }
 
 func (d Datum) IsBinaryString() bool {
-	if d.forceHexEncode {
+	if d.forceBinary {
 		return true
 	}
 	s, ok := d.Val.(string)
 	if !ok {
 		return false
 	}
-	// Hex encode if not valid UTF-8 (binary data that wasn't explicitly marked)
+	// Not valid UTF-8: binary data that wasn't explicitly marked.
 	return !utf8.ValidString(s)
 }
 

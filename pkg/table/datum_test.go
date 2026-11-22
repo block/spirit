@@ -430,7 +430,7 @@ func TestNewDatumFromValueBinaryString(t *testing.T) {
 // TestNewDatumFromValueWithType pins that resolving the column type once
 // (NewColumnType) and reusing it via NewDatumFromValueWithType produces a
 // Datum identical to NewDatumFromValue, across the type classifications
-// and wire forms that matter: numeric, binary (forceHexEncode), text, the
+// and wire forms that matter: numeric, binary (forceBinary), text, the
 // BIT []byte decode path, and nil. This is the fast path used by the
 // applier's DELETE builder (block/spirit#948); it must not diverge from
 // the per-value parse it replaces.

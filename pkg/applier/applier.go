@@ -60,6 +60,14 @@ var chunkTaskTimeout = time.Second * 60
 // Target represents a shard target with its database connection, configuration, and key range.
 // Key ranges are expressed as Vitess-style strings (e.g., "-80", "80-", "80-c0").
 // An empty string, "0" or "-" means all key space (unsharded).
+//
+// DB must be a session spirit's statements are valid on, as dbconn.New
+// configures it: connection charset utf8mb4 and an sql_mode without
+// NO_BACKSLASH_ESCAPES. Values are rendered as SQL literals
+// (table.Datum.String), and both backslash-escaped strings and the escaped
+// _binary'...' form of large binary values depend on these settings. Under
+// NO_BACKSLASH_ESCAPES, or a gbk/sjis/big5/cp932 connection charset, those
+// literals store different bytes, without an error.
 type Target struct {
 	DB       *sql.DB
 	Config   *mysql.Config
@@ -144,8 +152,9 @@ type StreamedChangesWriter interface {
 
 // deleteKeysInClause renders key value tuples into the element list of a
 // `(keycols) IN (...)` clause. Values go through table.Datum so binary
-// keys are hex-encoded; a quoted non-UTF-8 literal would trip MySQL's
-// utf8mb4 warning (block/spirit#948). String keys in a charset other than
+// keys render as _binary 0x... literals (a key is at most 3072 bytes, far
+// below table.EscapedBinaryMinBytes); a plain quoted non-UTF-8 literal would
+// trip MySQL's utf8mb4 warning (block/spirit#948). String keys in a charset other than
 // utf8mb4 are emitted with their charset introducer, so a latin1 key
 // matches its own row rather than the one its bytes spell in utf8mb4. Single-column keys render as a bare
 // literal, composite keys as a parenthesized tuple.
@@ -234,8 +243,9 @@ type rowData struct {
 // in its own chunklet regardless of size. This is an edge case where we rely on the server's
 // max_allowed_packet being large enough (64 MiB default vs our 1 MiB threshold). Binary values
 // of table.EscapedBinaryMinBytes or more render at about one byte per byte (Datum.String), so a
-// row the application could insert fits, and the driver takes its limit from the server (see
-// dbconn's newDSN).
+// row the application could insert usually fits (a value made mostly of quotes or backslashes
+// still doubles under escaping), and the driver takes its limit from the server (see dbconn's
+// newDSN). A row that does not fit fails loudly, in the driver or the server.
 func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 	if len(rows) == 0 {
 		return nil

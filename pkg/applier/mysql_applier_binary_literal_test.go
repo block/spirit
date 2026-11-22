@@ -195,3 +195,37 @@ func TestApplierLargeBinaryValue(t *testing.T) {
 		})
 	}
 }
+
+// TestApplierDeleteBinaryKeysWithQuotingBytes sends binary primary keys that
+// hold quotes, backslashes, NULs and UTF-8 lead bytes through DeleteKeys. A
+// key rendered wrongly would match no row, a silent no-op delete that only
+// the checksum would catch later.
+func TestApplierDeleteBinaryKeysWithQuotingBytes(t *testing.T) {
+	a, mapping, tbl := binaryLiteralTarget(t, "applier_binlit_delkeys",
+		"CREATE TABLE t (k VARBINARY(64) NOT NULL PRIMARY KEY, v INT NOT NULL)")
+	keys := [][]byte{
+		{'\''}, {'\\'}, []byte(`\'`), []byte(`'\`), {0x00, 0x01}, {0xFF, 0xFE},
+		{0xE0, '\''}, {0xC3, '\\', '\''}, []byte("plain"), {0x7f, 0x80, 0x81},
+	}
+	rows := make([][]any, len(keys))
+	for i, k := range keys {
+		rows[i] = []any{k, int64(i)}
+	}
+	applyAndWait(t, a, tbl, mapping, rows)
+
+	// A bystander whose bytes differ from the quote key only by a prefix.
+	_, err := tbl.DB().ExecContext(t.Context(), "INSERT INTO t VALUES (X'AA27', 99)")
+	require.NoError(t, err)
+
+	del := make([][]any, len(keys))
+	for i, k := range keys {
+		del[i] = []any{k}
+	}
+	n, err := a.DeleteKeys(t.Context(), tbl, tbl, del, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(keys)), n)
+
+	var left int
+	require.NoError(t, tbl.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM t").Scan(&left))
+	require.Equal(t, 1, left, "only the bystander remains")
+}

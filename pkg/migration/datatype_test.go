@@ -965,7 +965,7 @@ ADD SPATIAL INDEX idx_points_of_interest (points_of_interest)`)
 //     VARBINARY values than the rowcopy path for the same source bytes.
 //
 // Spirit's current applier path (NewDatumFromValue with the BINARY source
-// type → forceHexEncode → %#x on the full byte string) does preserve the
+// type → forceBinary → a _binary literal of the full byte string) preserves the
 // 20-byte width, so this test passes on main. It exists to lock that
 // behavior in: any future change that drops the trailing zeros, switches
 // the source-type lookup, or changes how the binlog row image is shaped
