@@ -72,8 +72,13 @@ func TestNewDSNMaxAllowedPacket(t *testing.T) {
 	cfg, err = mysql.ParseDSN(resp)
 	require.NoError(t, err)
 	require.Equal(t, 1048576, cfg.MaxAllowedPacket, "a DSN's own value is kept")
+}
 
-	// A real connection: the driver's read of the server value must succeed.
+// TestMaxAllowedPacketReadFromServer opens a real connection with the
+// limit set to 0, so the driver's read of @@max_allowed_packet on connect
+// must succeed. It is kept apart from TestNewDSNMaxAllowedPacket, which the
+// unit-tls workflow selects by name and runs without a MySQL server.
+func TestMaxAllowedPacketReadFromServer(t *testing.T) {
 	db, err := New(testutils.DSN(), NewDBConfig())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
