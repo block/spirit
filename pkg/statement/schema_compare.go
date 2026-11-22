@@ -2,6 +2,7 @@ package statement
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -38,29 +39,41 @@ import (
 //
 // If opts is nil, NewDiffOptions() defaults are used.
 func DiffCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions) (string, error) {
-	alter, _, _, err := DiffCreateTablesWithColumns(table, wantCreate, gotCreate, opts)
-	return alter, err
+	return diffCreateTables(table, wantCreate, gotCreate, opts, nil)
 }
 
-// DiffCreateTablesWithColumns also returns the normalized reference and
-// validated columns, in that order, when the comparison succeeds.
-func DiffCreateTablesWithColumns(table, wantCreate, gotCreate string, opts *DiffOptions) (string, Columns, Columns, error) {
+// CreateTableComparison reports the reconciliation SQL and, for an equivalent
+// schema under the diff options, any NOT NULL tightenings the diff accepted.
+type CreateTableComparison struct {
+	Alter            string
+	TightenedColumns []string
+}
+
+// CompareCreateTables compares CREATE TABLE statements as DiffCreateTables
+// does. When Alter is empty, TightenedColumns lists accepted nullability
+// differences using the validated schema's column names in lexical order.
+func CompareCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions) (CreateTableComparison, error) {
+	var tightened []string
+	alter, err := diffCreateTables(table, wantCreate, gotCreate, opts, &tightened)
+	if err != nil {
+		return CreateTableComparison{}, err
+	}
+	if alter != "" {
+		return CreateTableComparison{Alter: alter}, nil
+	}
+	slices.Sort(tightened)
+	return CreateTableComparison{TightenedColumns: tightened}, nil
+}
+
+func diffCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions, tightenedColumns *[]string) (string, error) {
 	want, err := ParseCreateTable(wantCreate)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("failed to parse reference CREATE TABLE: %w", err)
+		return "", fmt.Errorf("failed to parse reference CREATE TABLE: %w", err)
 	}
 	got, err := ParseCreateTable(gotCreate)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("failed to parse CREATE TABLE under validation: %w", err)
+		return "", fmt.Errorf("failed to parse CREATE TABLE under validation: %w", err)
 	}
-	alter, err := diffCreateTables(table, want, got, opts)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	return alter, want.Columns, got.Columns, nil
-}
-
-func diffCreateTables(table string, want, got *CreateTable, opts *DiffOptions) (string, error) {
 	// Diff requires both tables to have the same name. The two CREATE TABLE
 	// statements come from tables with the same logical name on different
 	// instances, but rewrite both names to a fixed token so the comparison is
@@ -71,7 +84,7 @@ func diffCreateTables(table string, want, got *CreateTable, opts *DiffOptions) (
 	// Diff(got -> want): the returned clauses are the ALTER that would morph the
 	// validated schema ("got") into the reference schema ("want"). If nil, the
 	// two schemas are equivalent under the canonicalization rules above.
-	stmts, err := got.Diff(want, opts)
+	stmts, err := got.diff(want, opts, tightenedColumns)
 	if err != nil {
 		return "", fmt.Errorf("failed to diff CREATE TABLE statements: %w", err)
 	}

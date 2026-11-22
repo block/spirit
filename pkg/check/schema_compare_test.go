@@ -336,7 +336,7 @@ func TestCompareTargetSchema(t *testing.T) {
 		},
 		{
 			name:      "case-insensitive columns use target spelling and sort order",
-			source:    "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, alpha INT, zeta INT)",
+			source:    "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, Alpha INT, zeta INT)",
 			target:    "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, alpha INT NOT NULL, Zeta INT NOT NULL)",
 			tightened: []string{"Zeta", "alpha"},
 		},
@@ -395,6 +395,8 @@ func TestCompareTargetSchemaMalformedDDL(t *testing.T) {
 	}{
 		{name: "source", source: malformed, target: valid},
 		{name: "target", source: valid, target: malformed},
+		{name: "missing source", target: valid},
+		{name: "missing target", source: valid},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			comparison, err := CompareTargetSchema("t", tc.source, tc.target)
