@@ -1728,6 +1728,10 @@ func (ct *CreateTable) parseExpression(expr ast.ExprNode) any {
 // DROP and ADD.
 // If opts is nil, NewDiffOptions() defaults are used.
 func (ct *CreateTable) Diff(target *CreateTable, opts *DiffOptions) ([]*AbstractStatement, error) {
+	return ct.diff(target, opts, nil)
+}
+
+func (ct *CreateTable) diff(target *CreateTable, opts *DiffOptions, tightenedColumns *[]string) ([]*AbstractStatement, error) {
 	if opts == nil {
 		opts = NewDiffOptions()
 	}
@@ -1769,7 +1773,7 @@ func (ct *CreateTable) Diff(target *CreateTable, opts *DiffOptions) ([]*Abstract
 	rebuilt := ct.rebuiltColumns(target)
 
 	// 1. Diff columns (DROP, ADD, MODIFY)
-	columnClauses := ct.diffColumns(target, opts, rebuilt)
+	columnClauses := ct.diffColumns(target, opts, rebuilt, tightenedColumns)
 	alterClauses = append(alterClauses, columnClauses...)
 
 	// 2. Diff indexes (DROP, ADD). An index whose options alone change (same
@@ -2028,7 +2032,7 @@ func isVirtualGenerated(col *Column) bool {
 // diffColumns compares columns and returns ALTER clauses for differences.
 // rebuilt names the columns that are dropped and added back instead of
 // modified (see rebuiltColumns).
-func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions, rebuilt map[string]bool) []string {
+func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions, rebuilt map[string]bool, tightenedColumns *[]string) []string {
 	var clauses []string
 
 	// Build maps for easier lookup. Keys are lowercased so identifier
@@ -2117,6 +2121,8 @@ func (ct *CreateTable) diffColumns(target *CreateTable, opts *DiffOptions, rebui
 					}
 				}
 				clauses = append(clauses, clause)
+			} else if tightenedColumns != nil && allowsNotNullRelaxation(sourceCol, &targetCol, opts) {
+				*tightenedColumns = append(*tightenedColumns, sourceCol.Name)
 			}
 		}
 
@@ -2928,6 +2934,10 @@ func flagText(v bool) *string {
 	return new("1")
 }
 
+func allowsNotNullRelaxation(validated, reference *Column, opts *DiffOptions) bool {
+	return opts.IgnoreNotNullRelaxation && !validated.Nullable && reference.Nullable
+}
+
 // columnsEqualWithContext checks if two columns are equal, considering table
 // context for charset/collation: a column with no explicit charset/collation
 // inherits its owning table's defaults, so those attributes are compared on
@@ -2972,11 +2982,8 @@ func (ct *CreateTable) columnsEqualWithContext(a, b *Column, target *CreateTable
 	// DiffCreateTables caller means `a` is the schema under validation and `b`
 	// the reference: this forgives a validated schema that is stricter, which
 	// is the direction the option documents.
-	if a.Nullable != b.Nullable {
-		forgivenRelaxation := opts.IgnoreNotNullRelaxation && !a.Nullable && b.Nullable
-		if !forgivenRelaxation {
-			return false
-		}
+	if a.Nullable != b.Nullable && !allowsNotNullRelaxation(a, b, opts) {
+		return false
 	}
 	// Normalize default values for nullable columns:
 	// For nullable columns, nil and the NULL *keyword* are semantically
