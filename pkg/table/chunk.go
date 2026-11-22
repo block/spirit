@@ -200,9 +200,9 @@ func jsonDatumString(v Datum) string {
 			bs = fmt.Sprintf("%v", v.Val)
 		}
 		if len(bs) == 0 {
-			// Matches Datum.String(): x'' is the zero-length binary value.
-			// It must not be 0x00 (a one-byte NUL — a different value);
-			// datumValFromString decodes x'' back to the empty string.
+			// x'' is the zero-length binary value (there is no zero-digit
+			// 0x literal). It must not be 0x00 (a one-byte NUL — a different
+			// value); datumValFromString decodes x'' back to the empty string.
 			s = "x''"
 		} else {
 			s = fmt.Sprintf("%#x", bs)
@@ -238,7 +238,7 @@ func jsonStrings2Datums(ti *TableInfo, keys []string, vals []string) ([]Datum, e
 		// datumValFromString handles hex decoding for binary types:
 		// if tp is binaryType and the string starts with "0x",
 		// it decodes the hex back to raw binary bytes. This is needed because
-		// checkpoint JSON serialization hex-encodes binary values via Datum.String().
+		// checkpoint JSON serialization hex-encodes binary values (jsonDatumString).
 		sVal, err := datumValFromString(str, tp)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create datum for key %s: %w", keys[i], err)
@@ -250,7 +250,7 @@ func jsonStrings2Datums(ti *TableInfo, keys []string, vals []string) ([]Datum, e
 		// If the original string was hex-encoded, the value is binary data
 		// that should be hex-encoded again when serialized.
 		if tp == binaryType {
-			datum.forceHexEncode = true
+			datum.forceBinary = true
 		}
 		datums[i] = datum
 	}

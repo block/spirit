@@ -438,6 +438,21 @@ func newDSN(dsn string, config *DBConfig) (string, error) {
 	// and its default-off are gone — so the blue/green and Aurora-failover
 	// protection spirit used to opt into is now simply how the driver behaves.
 	cfg.InterpolateParams = config.InterpolateParams
+	// Use the server's max_allowed_packet as the driver's packet limit
+	// instead of the driver's fixed 64 MiB default, unless the DSN sets a
+	// different value. A DSN that sets exactly the default (67108864) cannot
+	// be told apart from one that sets nothing, so it also reads the server's.
+	// Spirit writes a row as one VALUES tuple, so a row with a large blob can
+	// render a statement over 64 MiB that the server would accept, and the
+	// driver refused it with ErrPktTooLarge on every retry whatever the server
+	// was set to. With 0 the driver reads @@max_allowed_packet when it
+	// connects (one query per new connection), so raising the server variable
+	// is the whole remedy, and a statement over it still fails fast in the
+	// driver with ErrPktTooLarge rather than as a connection the server
+	// closed mid-write.
+	if cfg.MaxAllowedPacket == mysql.NewConfig().MaxAllowedPacket {
+		cfg.MaxAllowedPacket = 0
+	}
 	// Allow cleartext password authentication only when the connection is
 	// actually encrypted (required for AWS RDS IAM auth, safe because the
 	// connection uses TLS).

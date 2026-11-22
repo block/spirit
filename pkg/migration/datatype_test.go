@@ -202,6 +202,35 @@ func TestWideningConversions(t *testing.T) {
 	require.Equal(t, uint64(1), b)
 }
 
+// TestBinaryToIntegerModify converts VARBINARY columns holding decimal text
+// to integer types. MySQL's own COPY reads '12' as the number 12, and so must
+// the copy: a bare 0x3132 hex literal is the number 12594 in a numeric
+// context, which the checksum rejects (it casts the source to the target
+// type) after its repair passes cannot converge. The _binary introducer
+// makes the literal a binary string, converted as text.
+func TestBinaryToIntegerModify(t *testing.T) {
+	t.Parallel()
+	tt := testutils.NewTestTable(t, "binarytoint", `CREATE TABLE binarytoint (
+		id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		vb VARBINARY(20) NOT NULL,
+		vu VARBINARY(20) NOT NULL
+	)`)
+	tt.SeedRows(t, "INSERT INTO binarytoint (vb, vu) SELECT '12', '7'", 1000)
+	_, err := tt.DB.ExecContext(t.Context(),
+		"UPDATE binarytoint SET vb = ELT(1 + id % 3, '12', '-7', '0'), vu = ELT(1 + id % 2, '7', '4294967295')")
+	require.NoError(t, err)
+
+	m := NewTestRunner(t, "binarytoint", `MODIFY COLUMN vb BIGINT NOT NULL,
+		MODIFY COLUMN vu INT UNSIGNED NOT NULL`)
+	require.NoError(t, m.Run(t.Context()))
+	require.NoError(t, m.Close())
+
+	var wrong int
+	require.NoError(t, tt.DB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM binarytoint
+		WHERE vb <> ELT(1 + id % 3, 12, -7, 0) OR vu <> ELT(1 + id % 2, 7, 4294967295)`).Scan(&wrong))
+	require.Zero(t, wrong)
+}
+
 // TestTemporalPrecisionNarrowing checks that reducing a TIMESTAMP's
 // fractional-second precision fails the checksum when it would lose data.
 // MySQL rounds .999999 up to the next second with no warning, so the copy
@@ -965,7 +994,7 @@ ADD SPATIAL INDEX idx_points_of_interest (points_of_interest)`)
 //     VARBINARY values than the rowcopy path for the same source bytes.
 //
 // Spirit's current applier path (NewDatumFromValue with the BINARY source
-// type → forceHexEncode → %#x on the full byte string) does preserve the
+// type → forceBinary → a _binary literal of the full byte string) preserves the
 // 20-byte width, so this test passes on main. It exists to lock that
 // behavior in: any future change that drops the trailing zeros, switches
 // the source-type lookup, or changes how the binlog row image is shaped

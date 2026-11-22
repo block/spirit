@@ -534,3 +534,18 @@ func BenchmarkUnderlyingInt(b *testing.B) {
 		escapeSQL("select %?", myInt(3)) //nolint:errcheck
 	}
 }
+
+func TestQuoteBinary(t *testing.T) {
+	cases := map[string]string{
+		"":                 `_binary''`,
+		"abc":              `_binary'abc'`,
+		"'":                `_binary'\''`,
+		`\`:                `_binary'\\'`,
+		`\'`:               `_binary'\\\''`,
+		"a\x00b\n\r\x1a\"": "_binary'a\x00b\n\r\x1a\"'", // only ' and \ are escaped
+		"\xe0'":            "_binary'\xe0\\''",
+	}
+	for in, want := range cases {
+		require.Equal(t, want, QuoteBinary(in), "input %q", in)
+	}
+}

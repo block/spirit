@@ -49,6 +49,44 @@ func TestNewDSNStrictSQLMode(t *testing.T) {
 	require.Equal(t, `"NO_AUTO_VALUE_ON_ZERO,STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION"`, cfg.Params["sql_mode"])
 }
 
+// TestNewDSNMaxAllowedPacket checks that the driver takes its packet limit
+// from the server unless the DSN sets one, and that a connection reads the
+// server's value: the driver's fixed 64 MiB default refused statements the
+// server would accept.
+func TestNewDSNMaxAllowedPacket(t *testing.T) {
+	resp, err := newDSN("root:password@tcp(127.0.0.1:3306)/test", NewDBConfig())
+	require.NoError(t, err)
+	cfg, err := mysql.ParseDSN(resp)
+	require.NoError(t, err)
+	require.Zero(t, cfg.MaxAllowedPacket, "0 means the driver reads @@max_allowed_packet on connect")
+
+	// Applying newDSN to its own output keeps reading from the server.
+	resp, err = newDSN(resp, NewDBConfig())
+	require.NoError(t, err)
+	cfg, err = mysql.ParseDSN(resp)
+	require.NoError(t, err)
+	require.Zero(t, cfg.MaxAllowedPacket)
+
+	resp, err = newDSN("root:password@tcp(127.0.0.1:3306)/test?maxAllowedPacket=1048576", NewDBConfig())
+	require.NoError(t, err)
+	cfg, err = mysql.ParseDSN(resp)
+	require.NoError(t, err)
+	require.Equal(t, 1048576, cfg.MaxAllowedPacket, "a DSN's own value is kept")
+}
+
+// TestMaxAllowedPacketReadFromServer opens a real connection with the
+// limit set to 0, so the driver's read of @@max_allowed_packet on connect
+// must succeed. It is kept apart from TestNewDSNMaxAllowedPacket, which the
+// unit-tls workflow selects by name and runs without a MySQL server.
+func TestMaxAllowedPacketReadFromServer(t *testing.T) {
+	db, err := New(testutils.DSN(), NewDBConfig())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	var serverPacket int64
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@max_allowed_packet").Scan(&serverPacket))
+	require.Positive(t, serverPacket)
+}
+
 func TestNewDSN(t *testing.T) {
 	// Start with a basic example
 	dsn := "root:password@tcp(127.0.0.1:3306)/test"
