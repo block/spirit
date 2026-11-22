@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"math"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,12 +73,12 @@ func TestDatum(t *testing.T) {
 	require.Equal(t, "1", unsigned.String())
 
 	// Test binary type. Binary datums always render as binary literals —
-	// even valid-UTF-8 values: _binary'...' in SQL, and 0x hex in checkpoint
+	// even valid-UTF-8 values: _binary 0x... in SQL, and 0x hex in checkpoint
 	// JSON so that it round-trips through datumValFromString (which
 	// hex-decodes any binaryType value with a "0x" prefix).
 	binary, err := NewDatum("0", binaryType)
 	require.NoError(t, err)
-	require.Equal(t, "_binary'0'", binary.String())
+	require.Equal(t, "_binary 0x30", binary.String())
 
 	// Test string comparisons (VARCHAR/TEXT)
 	str1, err := NewDatumFromValue("apple", "VARCHAR(255)")
@@ -300,31 +301,32 @@ func TestNewDatumFromValue(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "\"123.45\"", d.String())
 
-	// Test VARBINARY/BLOB types - rendered as _binary'...' literals
+	// Test VARBINARY/BLOB types - should use hex encoding
 	binaryData := []byte{0x01, 0x02, 0x03}
 	d, err = NewDatumFromValue(binaryData, "VARBINARY(255)")
 	require.NoError(t, err)
-	require.Equal(t, "_binary'\x01\x02\x03'", d.String())
+	require.Equal(t, "_binary 0x010203", d.String())
 
 	// Test BLOB types
 	blobData := []byte{0xFF, 0xFE, 0xFD}
 	d, err = NewDatumFromValue(blobData, "BLOB")
 	require.NoError(t, err)
-	require.Equal(t, "_binary'\xff\xfe\xfd'", d.String())
+	require.Equal(t, "_binary 0xfffefd", d.String())
 
 	// A one-byte NUL serializes as its hex value.
 	d, err = NewDatumFromValue([]byte{0x00}, "MEDIUMBLOB")
 	require.NoError(t, err)
-	require.Equal(t, "_binary'\x00'", d.String())
-	// Empty binary values must be the zero-length literal, NOT a one-byte
-	// NUL: that is a different value, and emitting it once silently
-	// corrupted empty blobs applied via the binlog feed.
+	require.Equal(t, "_binary 0x00", d.String())
+	// Empty binary values must NOT serialize as "0x" (MySQL parses that as
+	// an identifier, not a hex literal) — and must NOT serialize as "0x00"
+	// either: a one-byte NUL is a different value, and emitting it here
+	// silently corrupted empty blobs applied via the binlog feed.
 	d, err = NewDatumFromValue([]byte{}, "VARBINARY(255)")
 	require.NoError(t, err)
-	require.Equal(t, "_binary''", d.String())
+	require.Equal(t, "_binary x''", d.String())
 	d, err = NewDatumFromValue("", "BLOB")
 	require.NoError(t, err)
-	require.Equal(t, "_binary''", d.String())
+	require.Equal(t, "_binary x''", d.String())
 	d, err = NewDatumFromValue(nil, "BLOB")
 	require.NoError(t, err)
 	require.Equal(t, "NULL", d.String())
@@ -402,13 +404,13 @@ func TestNewDatumFromValue(t *testing.T) {
 	require.Equal(t, "7", d.String())
 }
 
-// TestNewDatumFromValueBinaryString tests that binary strings render as binary literals
+// TestNewDatumFromValueBinaryString tests that binary strings are hex-encoded
 func TestNewDatumFromValueBinaryString(t *testing.T) {
 	// Test binary data that's not valid UTF-8
 	binaryData := []byte{0x00, 0x01, 0x02, 0xFF}
 	d, err := NewDatumFromValue(binaryData, "VARBINARY(255)")
 	require.NoError(t, err)
-	require.Equal(t, "_binary'\x00\x01\x02\xff'", d.String())
+	require.Equal(t, "_binary 0x000102ff", d.String())
 
 	// Test string that starts with 0x - for VARCHAR (unknownType), this is just a normal string.
 	// It should NOT be hex-encoded because datumValFromString only hex-decodes for binaryType,
@@ -458,10 +460,11 @@ func TestNewDatumFromValueWithType(t *testing.T) {
 	}
 }
 
-// TestDatumStringBinaryLiteral pins how String() renders a binary value: an
-// escaped _binary'...' literal at one byte per byte (only the quote and the
-// backslash are escaped), not 0x hex, including the empty value, VECTOR, and a
-// valid-UTF-8 value in a binary column. BIT stays numeric.
+// TestDatumStringBinaryLiteral pins how String() renders a binary value with
+// no charset label: _binary 0x... hex below EscapedBinaryMinBytes, readable
+// wherever a statement is shown, and an escaped _binary'...' literal at or
+// above it, one byte per byte so a large blob cannot double a statement past
+// max_allowed_packet. Only the quote and the backslash are escaped.
 func TestDatumStringBinaryLiteral(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -469,10 +472,10 @@ func TestDatumStringBinaryLiteral(t *testing.T) {
 		mysqlTp string
 		want    string
 	}{
-		{"binary non-utf8", []byte{0xbb, 0x00, '\\', '\''}, "varbinary(8)", "_binary'\xbb\x00\\\\\\''"},
-		{"binary utf8", "abc", "blob", "_binary'abc'"},
-		{"binary empty", []byte{}, "blob", "_binary''"},
-		{"vector", []byte{0, 0, 0, 0}, "vector(1)", "_binary'\x00\x00\x00\x00'"},
+		{"binary non-utf8", []byte{0xbb, 0x00, '\\', '\''}, "varbinary(8)", "_binary 0xbb005c27"},
+		{"binary utf8", "abc", "blob", "_binary 0x616263"},
+		{"binary empty", []byte{}, "blob", "_binary x''"},
+		{"vector", []byte{0, 0, 0, 0}, "vector(1)", "_binary 0x00000000"},
 		{"varchar", "it's", "varchar(10)", `"it\'s"`},
 		{"int", int64(42), "int", "42"},
 		{"bit", []byte{0x01, 0x00}, "bit(16)", "256"},
@@ -485,6 +488,17 @@ func TestDatumStringBinaryLiteral(t *testing.T) {
 			require.Equal(t, tc.want, d.String())
 		})
 	}
+
+	// The cut: one byte under the threshold is hex, the threshold is escaped.
+	under := strings.Repeat("a", EscapedBinaryMinBytes-1)
+	d, err := NewDatumFromValueWithType([]byte(under), NewColumnType("longblob"))
+	require.NoError(t, err)
+	require.Equal(t, "_binary 0x"+strings.Repeat("61", EscapedBinaryMinBytes-1), d.String())
+
+	at := strings.Repeat("a", EscapedBinaryMinBytes-4) + "'\\\x00\xff"
+	d, err = NewDatumFromValueWithType([]byte(at), NewColumnType("longblob"))
+	require.NoError(t, err)
+	require.Equal(t, "_binary'"+strings.Repeat("a", EscapedBinaryMinBytes-4)+"\\'\\\\\x00\xff'", d.String())
 }
 
 // TestDatumCompareTypeMismatch covers the checked type-assertion error paths in
@@ -533,8 +547,8 @@ func TestEmptyBinaryDatumRoundTrip(t *testing.T) {
 	empty, err := NewDatumFromValue([]byte{}, "BLOB")
 	require.NoError(t, err)
 
-	// SQL literal path: the zero-length binary string literal.
-	require.Equal(t, "_binary''", empty.String())
+	// SQL literal path: _binary x'' is the zero-length binary literal.
+	require.Equal(t, "_binary x''", empty.String())
 
 	// Checkpoint JSON path: emit, then decode back to the empty string.
 	require.Equal(t, `"x''"`, jsonQuoteDatum(empty))
@@ -544,10 +558,10 @@ func TestEmptyBinaryDatumRoundTrip(t *testing.T) {
 	require.True(t, ok, "decoded empty binary should be a string, got %T", val)
 	require.Empty(t, decoded)
 
-	// A one-byte NUL is a distinct value and must stay one NUL byte on both paths.
+	// A one-byte NUL is a distinct value and must stay 0x00 on both paths.
 	nul, err := NewDatumFromValue([]byte{0x00}, "BLOB")
 	require.NoError(t, err)
-	require.Equal(t, "_binary'\x00'", nul.String())
+	require.Equal(t, "_binary 0x00", nul.String())
 	require.Equal(t, `"0x00"`, jsonQuoteDatum(nul))
 	val, err = datumValFromString("0x00", binaryType)
 	require.NoError(t, err)
@@ -574,11 +588,11 @@ func TestVectorDatumIsBinary(t *testing.T) {
 	require.Equal(t, binaryType, mySQLTypeToDatumTp("vector(3)"))
 	require.Equal(t, binaryType, mySQLTypeToDatumTp("VECTOR(2048)"))
 
-	// [0,0,0]: valid UTF-8, and must still be emitted as a binary literal.
+	// [0,0,0]: valid UTF-8, and must still be emitted as a hex literal.
 	zeros, err := NewDatumFromValue(make([]byte, 12), "vector(3)")
 	require.NoError(t, err)
 	require.True(t, zeros.IsBinaryString())
-	require.Equal(t, "_binary'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'", zeros.String())
+	require.Equal(t, "_binary 0x000000000000000000000000", zeros.String())
 
 	// [1.5,-2,0.0003]: high bytes, not valid UTF-8, same literal form.
 	v, err := NewDatumFromValue([]byte{
@@ -587,7 +601,7 @@ func TestVectorDatumIsBinary(t *testing.T) {
 		0x52, 0x49, 0x9d, 0x39,
 	}, "vector(3)")
 	require.NoError(t, err)
-	require.Equal(t, "_binary'\x00\x00\xc0?\x00\x00\x00\xc0RI\x9d9'", v.String())
+	require.Equal(t, "_binary 0x0000c03f000000c052499d39", v.String())
 
 	// NULL round-trips as NULL, not as an empty vector.
 	require.Equal(t, "NULL", NewNilDatum(mySQLTypeToDatumTp("vector(3)")).String())

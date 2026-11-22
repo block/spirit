@@ -27,8 +27,8 @@ const (
 	// batches (pkg/change) so a REPLACE/DELETE can't grow unbounded with
 	// wide rows. Still far below the typical 64 MiB max_allowed_packet
 	// because the size estimates are rough — utils.EstimateRenderedRowSize is
-	// deliberately biased low (string escaping and wide integers
-	// under-measure; see its doc) and leans on that ~64x
+	// deliberately biased low (hex encoding, string escaping and wide
+	// integers all under-measure; see its doc) and leans on that ~64x
 	// headroom — and a single row larger than the budget still goes in
 	// its own statement.
 	//
@@ -233,8 +233,9 @@ type rowData struct {
 // Note: A single row can exceed MaxStatementSizeBytes by itself. In this case, the row will be placed
 // in its own chunklet regardless of size. This is an edge case where we rely on the server's
 // max_allowed_packet being large enough (64 MiB default vs our 1 MiB threshold). Binary values
-// render at about one byte per byte (Datum.String), so a row the application could insert
-// fits, and the driver takes its limit from the server (see dbconn's newDSN).
+// of table.EscapedBinaryMinBytes or more render at about one byte per byte (Datum.String), so a
+// row the application could insert fits, and the driver takes its limit from the server (see
+// dbconn's newDSN).
 func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 	if len(rows) == 0 {
 		return nil

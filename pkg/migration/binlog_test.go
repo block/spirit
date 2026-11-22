@@ -860,9 +860,9 @@ func TestE2EBinlogSubscribingRogueValues(t *testing.T) {
 	chunk, err := m.copyChunker.Next()
 	require.NoError(t, err)
 	require.NotNil(t, chunk)
-	// Binary boundary datums render as _binary'...' literals in SQL (the
-	// checkpoint JSON keeps 0x hex); the value here is `819 ". `.
-	require.Contains(t, chunk.String(), ` < _binary'819 ". '`)
+	// Binary boundary datums render as _binary 0x... hex literals (the
+	// checkpoint JSON keeps plain 0x); 0x38313920222e20 is `819 ". `.
+	require.Contains(t, chunk.String(), ` < _binary 0x38313920222e20`)
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
 
 	// Wait for replication to catch up and watermark to be established
@@ -881,7 +881,7 @@ func TestE2EBinlogSubscribingRogueValues(t *testing.T) {
 	// Second chunk
 	chunk, err = m.copyChunker.Next()
 	require.NoError(t, err)
-	require.Equal(t, "((`datetime` > _binary'819 \". ')\n OR (`datetime` = _binary'819 \". ' AND `col2` >= 1))", chunk.String())
+	require.Equal(t, "((`datetime` > _binary 0x38313920222e20)\n OR (`datetime` = _binary 0x38313920222e20 AND `col2` >= 1))", chunk.String())
 	require.NoError(t, ccopier.CopyChunk(t.Context(), chunk))
 
 	// Now insert some data.

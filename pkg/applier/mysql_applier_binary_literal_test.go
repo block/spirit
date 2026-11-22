@@ -1,9 +1,11 @@
 package applier
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -83,6 +85,14 @@ func TestApplierBinaryLiteralRoundTrip(t *testing.T) {
 		{0xFF, 0xFE, '\'', 0x00, '\\'},
 		[]byte("valid UTF-8 é 中 😀 with a quote ' and a backslash \\"),
 	}
+	// vb holds each value as is, which renders as a _binary 0x... hex literal.
+	// b wraps it in table.EscapedBinaryMinBytes of padding, so the same bytes
+	// also go through the escaped _binary'...' form, at both ends of a literal.
+	pad := bytes.Repeat([]byte{'x'}, table.EscapedBinaryMinBytes)
+	large := make([][]byte, len(values))
+	for i, v := range values {
+		large[i] = slices.Concat(v, pad, v)
+	}
 
 	for _, path := range []string{"apply", "upsert"} {
 		t.Run(path, func(t *testing.T) {
@@ -90,7 +100,7 @@ func TestApplierBinaryLiteralRoundTrip(t *testing.T) {
 				"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, b LONGBLOB, vb VARBINARY(512))")
 			rows := make([][]any, len(values))
 			for i, v := range values {
-				rows[i] = []any{int64(i), v, v}
+				rows[i] = []any{int64(i), large[i], v}
 			}
 			if path == "apply" {
 				applyAndWait(t, a, tbl, mapping, rows)
@@ -103,7 +113,7 @@ func TestApplierBinaryLiteralRoundTrip(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			res, err := tbl.DB().QueryContext(t.Context(), "SELECT id, HEX(b), HEX(vb) FROM t ORDER BY id")
+			res, err := tbl.DB().QueryContext(t.Context(), "SELECT id, SHA2(b, 256), HEX(vb) FROM t ORDER BY id")
 			require.NoError(t, err)
 			defer utils.CloseAndLog(res)
 			n := 0
@@ -111,8 +121,9 @@ func TestApplierBinaryLiteralRoundTrip(t *testing.T) {
 				var id int
 				var b, vb string
 				require.NoError(t, res.Scan(&id, &b, &vb))
+				sum := sha256.Sum256(large[id])
+				require.Equalf(t, hex.EncodeToString(sum[:]), b, "LONGBLOB value %d", id)
 				want := hex.EncodeToString(values[id])
-				require.Equalf(t, want, strings.ToLower(b), "LONGBLOB value %d", id)
 				require.Equalf(t, want, strings.ToLower(vb), "VARBINARY value %d", id)
 				n++
 			}

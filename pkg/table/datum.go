@@ -162,8 +162,8 @@ func NewDatum(val any, tp datumTp) (Datum, error) {
 	return Datum{
 		Val: val,
 		Tp:  tp,
-		// Binary values must always render as binary — a _binary'...'
-		// literal in String(), 0x hex in checkpoint JSON (jsonDatumString) —
+		// Binary values must always render as binary — a _binary literal
+		// in String(), 0x hex in checkpoint JSON (jsonDatumString) —
 		// even when they happen to be valid UTF-8 (e.g. a VARBINARY key
 		// holding the ASCII string "0xab"). The checkpoint-restore path
 		// (datumValFromString) unconditionally hex-decodes binaryType values
@@ -373,6 +373,28 @@ func (d Datum) Range(d2 Datum) (uint64, error) {
 	return d.Val.(uint64) - d2.Val.(uint64), nil
 }
 
+// EscapedBinaryMinBytes is the length at which String() renders a binary
+// value as an escaped _binary'...' literal (one byte per byte) instead of
+// _binary 0x... hex (two bytes per byte, but plain ASCII).
+//
+// Hex is kept below it because it reads cleanly wherever a statement is shown
+// — SHOW PROCESSLIST, logs, spirit's own chunk and error messages — where raw
+// bytes garble the terminal. Every index key is below it (InnoDB keys are at
+// most 3072 bytes), so chunk boundaries and delete keys are always hex.
+//
+// Above it, hex is what made a row whose blob was over half of
+// max_allowed_packet render into a VALUES list the driver or server refused on
+// every retry, although the application had written that row without trouble.
+// At 1 MiB, hex adds at most 1 MiB to any one value, far below any realistic
+// max_allowed_packet, and a statement holding such a value is unreadable in
+// either form. It matches applier.MaxStatementSizeBytes, the applier's
+// per-statement budget.
+//
+// Charset-labelled values keep _charset 0x... at every size: QuoteBinary's
+// escaping is unsafe in charsets where a backslash can be the second byte of
+// a character (gbk, sjis, ...).
+const EscapedBinaryMinBytes = 1 << 20
+
 // String returns the datum as a complete, self-contained SQL literal.
 // Every return path is safe to inline directly into a SQL statement
 // without further quoting or escaping by the caller:
@@ -381,8 +403,11 @@ func (d Datum) Range(d2 Datum) (uint64, error) {
 //   - the numeric literal (e.g. 42)   for IsNumeric()
 //   - _charset 0x... literal          for a string whose bytes are in a
 //     charset other than utf8mb4/utf8mb3 (see ColumnType.charset)
-//   - _binary'...' literal            for IsBinaryString(), with only the
-//     quote and the backslash escaped (sqlescape.QuoteBinary)
+//   - _binary 0x... literal           for IsBinaryString() under
+//     EscapedBinaryMinBytes (a zero-length value uses the empty x literal)
+//   - _binary'...' literal            for IsBinaryString() at or over
+//     EscapedBinaryMinBytes, with only the quote and the backslash
+//     escaped (sqlescape.QuoteBinary)
 //   - "..." with backslash escapes    for everything else
 //
 // The string-literal path runs sqlescape.EscapeString on the contents
@@ -428,20 +453,24 @@ func (d Datum) String() string {
 		return fmt.Sprintf("_%s %#x", d.charset, s)
 	}
 	if d.IsBinaryString() {
-		// Not a 0x hex literal, for two reasons. Size: hex is two bytes per
-		// byte, so a row whose blob was over half of max_allowed_packet
-		// rendered into a VALUES list the server or driver refused on every
-		// retry, although the application had written that row without
-		// trouble; the escaped literal is one byte per byte except for
-		// quotes and backslashes. Conversion: a hex literal is a number in
-		// numeric context (0x3132 is 12594), while the binary string '12'
-		// converts to 12 — what ALTER TABLE does for a VARBINARY -> BIGINT
-		// change. The empty value is _binary'', never a one-byte NUL.
-		//
-		// Charset-labelled values above keep the hex form: QuoteBinary's
-		// escaping is unsafe in charsets where a backslash can be the second
-		// byte of a character (gbk, sjis, ...).
-		return sqlescape.QuoteBinary(s)
+		// Both forms carry the _binary introducer, which makes the literal a
+		// binary string in every context. A bare 0x hex literal is a number
+		// in numeric context (0x3132 into a BIGINT is 12594), while the
+		// binary string converts to 12 — what ALTER TABLE does for a
+		// VARBINARY -> BIGINT change. _binary 0x3132 and _binary'12' store
+		// the same value in every column type, so the size cut below never
+		// changes what is written.
+		if len(s) >= EscapedBinaryMinBytes {
+			return sqlescape.QuoteBinary(s)
+		}
+		// The empty value must be the zero-length literal, never 0x00 (a
+		// one-byte NUL, a different value: emitting it once made every
+		// binlog-applied REPLACE corrupt empty blobs). There is no
+		// zero-digit 0x literal; a bare "0x" parses as an identifier.
+		if len(s) == 0 {
+			return "_binary x''"
+		}
+		return "_binary 0x" + hex.EncodeToString([]byte(s))
 	}
 	return "\"" + sqlescape.EscapeString(s) + "\""
 }
