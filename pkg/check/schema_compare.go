@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/block/spirit/pkg/applier"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -138,6 +140,59 @@ func schemaDiff(table, wantCreate, gotCreate string) (string, error) {
 func TargetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) {
 	diff, _, err := targetSchemaDiffDeferred(table, sourceCreate, targetCreate)
 	return diff, err
+}
+
+// TargetSchemaComparison describes whether a move accepts a pre-created target.
+type TargetSchemaComparison struct {
+	// Alter reconciles an incompatible target with the source. It is empty
+	// when the move accepts the target schema.
+	Alter string
+	// TightenedColumns are source-nullable columns that the accepted target
+	// declares NOT NULL, sorted by their spelling on the target.
+	TightenedColumns []string
+	// DeferredIndexes reports whether accepting the target required allowing
+	// missing deferrable secondary indexes.
+	DeferredIndexes bool
+}
+
+// CompareTargetSchema reports the same verdict as TargetSchemaDiff, along with
+// the nullability tightenings and deferred-index tolerance of an accepted
+// target. For an incompatible target it returns only the reconciliation SQL.
+// It compares CREATE TABLE definitions without reading or validating row data.
+func CompareTargetSchema(tableName, sourceCreate, targetCreate string) (TargetSchemaComparison, error) {
+	alter, deferred, err := targetSchemaDiffDeferred(tableName, sourceCreate, targetCreate)
+	if err != nil {
+		return TargetSchemaComparison{}, err
+	}
+	if alter != "" {
+		return TargetSchemaComparison{Alter: alter}, nil
+	}
+
+	// Read normalized column definitions only for accepted previews. Callers
+	// that need just the verdict or deferred-index flag keep their existing
+	// path through targetSchemaDiffDeferred.
+	source, err := statement.ParseCreateTable(sourceCreate)
+	if err != nil {
+		return TargetSchemaComparison{}, fmt.Errorf("parse source CREATE TABLE: %w", err)
+	}
+	target, err := statement.ParseCreateTable(targetCreate)
+	if err != nil {
+		return TargetSchemaComparison{}, fmt.Errorf("parse target CREATE TABLE: %w", err)
+	}
+	sourceNullable := make(map[string]bool, len(source.Columns))
+	for _, column := range source.Columns {
+		if column.Nullable {
+			sourceNullable[strings.ToLower(column.Name)] = true
+		}
+	}
+	comparison := TargetSchemaComparison{DeferredIndexes: deferred}
+	for _, column := range target.Columns {
+		if !column.Nullable && sourceNullable[strings.ToLower(column.Name)] {
+			comparison.TightenedColumns = append(comparison.TightenedColumns, column.Name)
+		}
+	}
+	slices.Sort(comparison.TightenedColumns)
+	return comparison, nil
 }
 
 // targetSchemaDiffDeferred is TargetSchemaDiff that also reports whether the
