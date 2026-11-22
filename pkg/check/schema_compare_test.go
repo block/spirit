@@ -318,3 +318,93 @@ func TestSchemaDiffDetectsRealMismatch(t *testing.T) {
 	require.NotEmpty(t, diff, "a genuine column type mismatch must still be reported")
 	require.Contains(t, diff, "sku", "the reported diff should name the mismatched column")
 }
+
+func TestCompareTargetSchema(t *testing.T) {
+	const source = "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, zeta INT, alpha INT, KEY idx_alpha (alpha))"
+	tests := []struct {
+		name      string
+		source    string
+		target    string
+		tightened []string
+		deferred  bool
+		reject    bool
+	}{
+		{
+			name:   "identical",
+			source: source,
+			target: source,
+		},
+		{
+			name:      "case-insensitive columns use target spelling and sort order",
+			source:    "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, Alpha INT, zeta INT)",
+			target:    "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, alpha INT NOT NULL, Zeta INT NOT NULL)",
+			tightened: []string{"Zeta", "alpha"},
+		},
+		{
+			name:   "implicit primary key nullability is normalized",
+			source: "CREATE TABLE src (id BIGINT, PRIMARY KEY (id))",
+			target: "CREATE TABLE dst (id BIGINT NOT NULL, PRIMARY KEY (id))",
+		},
+		{
+			name:     "deferred index only",
+			source:   source,
+			target:   "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, zeta INT, alpha INT)",
+			deferred: true,
+		},
+		{
+			name:      "deferred index with tightened column",
+			source:    source,
+			target:    "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, zeta INT, alpha INT NOT NULL)",
+			tightened: []string{"alpha"},
+			deferred:  true,
+		},
+		{
+			name:   "mismatch reports only alter",
+			source: source,
+			target: "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, zeta BIGINT, alpha INT NOT NULL)",
+			reject: true,
+		},
+		{
+			name:   "loosened nullability is rejected",
+			source: "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, alpha INT NOT NULL)",
+			target: "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, alpha INT)",
+			reject: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			comparison, err := CompareTargetSchema("t", tc.source, tc.target)
+			require.NoError(t, err)
+			alter, err := TargetSchemaDiff("t", tc.source, tc.target)
+			require.NoError(t, err)
+			require.Equal(t, alter, comparison.Alter)
+			require.Equal(t, tc.reject, comparison.Alter != "")
+			require.Equal(t, tc.tightened, comparison.TightenedColumns)
+			require.Equal(t, tc.deferred, comparison.DeferredIndexes)
+		})
+	}
+}
+
+func TestCompareTargetSchemaMalformedDDL(t *testing.T) {
+	const valid = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)"
+	const malformed = "CREATE TABLE t ("
+	for _, tc := range []struct {
+		name   string
+		source string
+		target string
+	}{
+		{name: "source", source: malformed, target: valid},
+		{name: "target", source: valid, target: malformed},
+		{name: "missing source", target: valid},
+		{name: "missing target", source: valid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			comparison, err := CompareTargetSchema("t", tc.source, tc.target)
+			require.Error(t, err)
+			require.Zero(t, comparison)
+			_, legacyErr := TargetSchemaDiff("t", tc.source, tc.target)
+			require.Error(t, legacyErr)
+			require.EqualError(t, err, legacyErr.Error())
+		})
+	}
+}

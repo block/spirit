@@ -104,3 +104,21 @@ func TestDiffCreateTablesParseErrors(t *testing.T) {
 	_, err = DiffCreateTables("t1", "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY)", "NOT A CREATE TABLE", nil)
 	require.ErrorContains(t, err, "failed to parse CREATE TABLE under validation")
 }
+
+func TestCompareCreateTablesTightenedColumns(t *testing.T) {
+	const reference = "CREATE TABLE src (id INT NOT NULL PRIMARY KEY, LowerCase INT, uppercase INT)"
+	const validated = "CREATE TABLE dst (id INT NOT NULL PRIMARY KEY, lowercase INT NOT NULL, UpperCase INT NOT NULL)"
+	opts := NewDiffOptions()
+	opts.IgnoreNotNullRelaxation = true
+
+	accepted, err := CompareCreateTables("t", reference, validated, opts)
+	require.NoError(t, err)
+	require.Equal(t, CreateTableComparison{TightenedColumns: []string{"UpperCase", "lowercase"}}, accepted)
+
+	rejected, err := CompareCreateTables("t", reference, validated, nil)
+	require.NoError(t, err)
+	alter, err := DiffCreateTables("t", reference, validated, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, alter)
+	require.Equal(t, CreateTableComparison{Alter: alter}, rejected)
+}

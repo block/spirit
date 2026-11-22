@@ -2,6 +2,7 @@ package statement
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
@@ -38,6 +39,33 @@ import (
 //
 // If opts is nil, NewDiffOptions() defaults are used.
 func DiffCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions) (string, error) {
+	return diffCreateTables(table, wantCreate, gotCreate, opts, nil)
+}
+
+// CreateTableComparison reports the reconciliation SQL and, for an equivalent
+// schema under the diff options, any NOT NULL tightenings the diff accepted.
+type CreateTableComparison struct {
+	Alter            string
+	TightenedColumns []string
+}
+
+// CompareCreateTables compares CREATE TABLE statements as DiffCreateTables
+// does. When Alter is empty, TightenedColumns lists accepted nullability
+// differences using the validated schema's column names in lexical order.
+func CompareCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions) (CreateTableComparison, error) {
+	var tightened []string
+	alter, err := diffCreateTables(table, wantCreate, gotCreate, opts, &tightened)
+	if err != nil {
+		return CreateTableComparison{}, err
+	}
+	if alter != "" {
+		return CreateTableComparison{Alter: alter}, nil
+	}
+	slices.Sort(tightened)
+	return CreateTableComparison{TightenedColumns: tightened}, nil
+}
+
+func diffCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions, tightenedColumns *[]string) (string, error) {
 	want, err := ParseCreateTable(wantCreate)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse reference CREATE TABLE: %w", err)
@@ -56,7 +84,7 @@ func DiffCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions) (s
 	// Diff(got -> want): the returned clauses are the ALTER that would morph the
 	// validated schema ("got") into the reference schema ("want"). If nil, the
 	// two schemas are equivalent under the canonicalization rules above.
-	stmts, err := got.Diff(want, opts)
+	stmts, err := got.diff(want, opts, tightenedColumns)
 	if err != nil {
 		return "", fmt.Errorf("failed to diff CREATE TABLE statements: %w", err)
 	}
