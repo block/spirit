@@ -60,7 +60,7 @@ func TestBinlogColumnType(t *testing.T) {
 		{"u3", "é", `"é"`},
 		{"e", "café", `"café"`}, // DecodeBinlogRow's element text, from information_schema
 		{"s", "é,ü", `"é,ü"`},
-		{"b", []byte("abc"), "0x616263"},
+		{"b", []byte("abc"), "_binary'abc'"},
 		{"unknown", "é", `"é"`},
 	} {
 		ct, err := ti.BinlogColumnType(tc.col)

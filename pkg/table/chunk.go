@@ -200,9 +200,9 @@ func jsonDatumString(v Datum) string {
 			bs = fmt.Sprintf("%v", v.Val)
 		}
 		if len(bs) == 0 {
-			// Matches Datum.String(): x'' is the zero-length binary value.
-			// It must not be 0x00 (a one-byte NUL — a different value);
-			// datumValFromString decodes x'' back to the empty string.
+			// x'' is the zero-length binary value (there is no zero-digit
+			// 0x literal). It must not be 0x00 (a one-byte NUL — a different
+			// value); datumValFromString decodes x'' back to the empty string.
 			s = "x''"
 		} else {
 			s = fmt.Sprintf("%#x", bs)

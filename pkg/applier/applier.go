@@ -233,7 +233,7 @@ type rowData struct {
 // Note: A single row can exceed MaxStatementSizeBytes by itself. In this case, the row will be placed
 // in its own chunklet regardless of size. This is an edge case where we rely on the server's
 // max_allowed_packet being large enough (64 MiB default vs our 1 MiB threshold). Binary values
-// render at about one byte per byte (Datum.ValueLiteral), so a row the application could insert
+// render at about one byte per byte (Datum.String), so a row the application could insert
 // fits, and the driver takes its limit from the server (see dbconn's newDSN).
 func splitRowsIntoChunklets(rows []rowData) [][]rowData {
 	if len(rows) == 0 {

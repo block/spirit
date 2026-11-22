@@ -701,11 +701,11 @@ func (a *MySQLApplier) writeChunklet(ctx context.Context, shard *shardTarget, ch
 			if err != nil {
 				return 0, time.Since(buildStart), fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)
 			}
-			// datum.ValueLiteral() returns a complete pre-escaped SQL
-			// literal (NULL, a numeric, a _binary'...' string, or a
-			// "..."-quoted string). Safe to concatenate into the VALUES
-			// clause as-is — see the contract on Datum.ValueLiteral.
-			values[i] = datum.ValueLiteral()
+			// datum.String() returns a complete pre-escaped SQL literal
+			// (NULL, a numeric, a _binary'...' string, or a "..."-quoted
+			// string). Safe to concatenate into the VALUES clause as-is —
+			// see the contract on Datum.String.
+			values[i] = datum.String()
 		}
 		valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 	}
@@ -1144,12 +1144,11 @@ func (a *MySQLApplier) UpsertRows(ctx context.Context, mapping *table.ColumnMapp
 						results <- result{err: fmt.Errorf("failed to convert value to datum for column %s: %w", sourceColumnNames[i], err)}
 						return
 					}
-					// datum.ValueLiteral() returns a complete pre-escaped
-					// SQL literal (NULL, a numeric, a _binary'...' string,
-					// or a "..."-quoted string). Safe to concatenate into
-					// the VALUES clause as-is — see the contract on
-					// Datum.ValueLiteral.
-					values[i] = datum.ValueLiteral()
+					// datum.String() returns a complete pre-escaped SQL
+					// literal (NULL, a numeric, a _binary'...' string, or a
+					// "..."-quoted string). Safe to concatenate into the
+					// VALUES clause as-is — see the contract on Datum.String.
+					values[i] = datum.String()
 				}
 				valuesClauses = append(valuesClauses, "("+strings.Join(values, ", ")+")")
 			}

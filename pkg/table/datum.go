@@ -162,9 +162,10 @@ func NewDatum(val any, tp datumTp) (Datum, error) {
 	return Datum{
 		Val: val,
 		Tp:  tp,
-		// Binary values must always serialize as 0x-hex literals, even when
-		// they happen to be valid UTF-8 (e.g. a VARBINARY key holding the
-		// ASCII string "0xab"). The checkpoint-restore path
+		// Binary values must always render as binary — a _binary'...'
+		// literal in String(), 0x hex in checkpoint JSON (jsonDatumString) —
+		// even when they happen to be valid UTF-8 (e.g. a VARBINARY key
+		// holding the ASCII string "0xab"). The checkpoint-restore path
 		// (datumValFromString) unconditionally hex-decodes binaryType values
 		// with a "0x" prefix, so serializing such a value as a plain string
 		// would corrupt the watermark boundary on resume.
@@ -380,8 +381,8 @@ func (d Datum) Range(d2 Datum) (uint64, error) {
 //   - the numeric literal (e.g. 42)   for IsNumeric()
 //   - _charset 0x... literal          for a string whose bytes are in a
 //     charset other than utf8mb4/utf8mb3 (see ColumnType.charset)
-//   - 0x... hex literal               for IsBinaryString()
-//     (a zero-length value uses the empty binary literal instead — see below)
+//   - _binary'...' literal            for IsBinaryString(), with only the
+//     quote and the backslash escaped (sqlescape.QuoteBinary)
 //   - "..." with backslash escapes    for everything else
 //
 // The string-literal path runs sqlescape.EscapeString on the contents
@@ -427,51 +428,22 @@ func (d Datum) String() string {
 		return fmt.Sprintf("_%s %#x", d.charset, s)
 	}
 	if d.IsBinaryString() {
-		// The empty value still needs a valid SQL literal: %#x renders ""
-		// as "" and a bare "0x" parses as an identifier, so emit the
-		// standard zero-length hex literal instead. It must NOT be 0x00 —
-		// that is a one-byte NUL, a different value, and emitting it here
-		// made every binlog-applied REPLACE corrupt empty blobs (minting
-		// endless checksum mismatches on tables that store empty strings,
-		// e.g. zero-length serialized protos).
-		if len(s) == 0 {
-			return "x''"
-		}
-		return fmt.Sprintf("%#x", s)
+		// Not a 0x hex literal, for two reasons. Size: hex is two bytes per
+		// byte, so a row whose blob was over half of max_allowed_packet
+		// rendered into a VALUES list the server or driver refused on every
+		// retry, although the application had written that row without
+		// trouble; the escaped literal is one byte per byte except for
+		// quotes and backslashes. Conversion: a hex literal is a number in
+		// numeric context (0x3132 is 12594), while the binary string '12'
+		// converts to 12 — what ALTER TABLE does for a VARBINARY -> BIGINT
+		// change. The empty value is _binary'', never a one-byte NUL.
+		//
+		// Charset-labelled values above keep the hex form: QuoteBinary's
+		// escaping is unsafe in charsets where a backslash can be the second
+		// byte of a character (gbk, sjis, ...).
+		return sqlescape.QuoteBinary(s)
 	}
 	return "\"" + sqlescape.EscapeString(s) + "\""
-}
-
-// ValueLiteral returns the datum as a SQL literal for a VALUES list. It is
-// String() except for a binary value with no charset label, which it renders
-// as an escaped _binary'...' literal (sqlescape.QuoteBinary) instead of 0x hex.
-//
-// The reason is size. Hex is two bytes per byte, so a row whose blob is over
-// half of max_allowed_packet produced a statement the server (or the driver)
-// refuses, failing the copy on every retry, although the application wrote
-// that row without trouble. The escaped literal is one byte per byte except
-// for quotes and backslashes.
-//
-// It also converts into a numeric target column the way ALTER TABLE does: a
-// hex literal is a number in numeric context (0x3132 is 12594) while the
-// binary string '12' is 12, which is what a VARBINARY -> BIGINT change
-// produces under ALGORITHM=COPY.
-//
-// It is not String() because String() has other consumers that need the hex
-// form: chunk boundaries and checkpoints are rendered with it and decoded
-// back (datumValFromString), and those stay short. Charset-labelled strings
-// keep String()'s _charset 0x... form: QuoteBinary's escaping is not safe in
-// charsets where a backslash can be the second byte of a character (gbk,
-// sjis, ...), and these values come from non-utf8mb4 columns, not blobs.
-func (d Datum) ValueLiteral() string {
-	if d.IsNil() || d.IsNumeric() || d.charset != "" || !d.IsBinaryString() {
-		return d.String()
-	}
-	s, ok := d.Val.(string)
-	if !ok {
-		return d.String()
-	}
-	return sqlescape.QuoteBinary(s)
 }
 
 // IsNumeric checks if it's signed or unsigned
