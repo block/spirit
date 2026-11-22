@@ -351,3 +351,30 @@ func MustEscapeSQL(sql string, args ...any) string {
 	}
 	return r
 }
+
+// QuoteBinary renders s as a binary string literal, _binary'...', with only
+// the quote and the backslash escaped. MySQL requires no other escape inside a
+// quoted literal (NUL, newline and Ctrl-Z are escaped by EscapeString for the
+// benefit of logs and terminals, not the parser), so the literal is one byte
+// per byte of s for every other byte value. A 0x hex literal of the same value
+// is two.
+//
+// The literal is lexed in the connection charset before the introducer
+// relabels it as binary, so it is safe only where neither escaped byte can be
+// the trailing byte of a multibyte character: true for utf8mb4 and every
+// single-byte charset, false for big5, cp932, gbk, gb18030 and sjis. It also
+// assumes sql_mode does not contain NO_BACKSLASH_ESCAPES. dbconn sets both
+// (charset utf8mb4, and a fixed sql_mode) on every connection it opens.
+func QuoteBinary(s string) string {
+	buf := make([]byte, 0, len(s)+len("_binary''")+8)
+	buf = append(buf, "_binary'"...)
+	for i := range len(s) {
+		c := s[i]
+		if c == '\'' || c == '\\' {
+			buf = append(buf, '\\')
+		}
+		buf = append(buf, c)
+	}
+	buf = append(buf, '\'')
+	return string(buf)
+}

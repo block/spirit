@@ -442,6 +442,38 @@ func (d Datum) String() string {
 	return "\"" + sqlescape.EscapeString(s) + "\""
 }
 
+// ValueLiteral returns the datum as a SQL literal for a VALUES list. It is
+// String() except for a binary value with no charset label, which it renders
+// as an escaped _binary'...' literal (sqlescape.QuoteBinary) instead of 0x hex.
+//
+// The reason is size. Hex is two bytes per byte, so a row whose blob is over
+// half of max_allowed_packet produced a statement the server (or the driver)
+// refuses, failing the copy on every retry, although the application wrote
+// that row without trouble. The escaped literal is one byte per byte except
+// for quotes and backslashes.
+//
+// It also converts into a numeric target column the way ALTER TABLE does: a
+// hex literal is a number in numeric context (0x3132 is 12594) while the
+// binary string '12' is 12, which is what a VARBINARY -> BIGINT change
+// produces under ALGORITHM=COPY.
+//
+// It is not String() because String() has other consumers that need the hex
+// form: chunk boundaries and checkpoints are rendered with it and decoded
+// back (datumValFromString), and those stay short. Charset-labelled strings
+// keep String()'s _charset 0x... form: QuoteBinary's escaping is not safe in
+// charsets where a backslash can be the second byte of a character (gbk,
+// sjis, ...), and these values come from non-utf8mb4 columns, not blobs.
+func (d Datum) ValueLiteral() string {
+	if d.IsNil() || d.IsNumeric() || d.charset != "" || !d.IsBinaryString() {
+		return d.String()
+	}
+	s, ok := d.Val.(string)
+	if !ok {
+		return d.String()
+	}
+	return sqlescape.QuoteBinary(s)
+}
+
 // IsNumeric checks if it's signed or unsigned
 func (d Datum) IsNumeric() bool {
 	return d.Tp == signedType || d.Tp == unsignedType

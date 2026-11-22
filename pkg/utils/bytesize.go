@@ -63,9 +63,10 @@ func EstimateRenderedRowSize(values []any) int {
 
 // estimateRenderedValueSize approximates the rendered length of one value.
 //
-// Two cases deliberately under-estimate rather than pad: a []byte bound to a
-// binary column renders as 0x-hex (two characters per byte), and a string
-// containing quotes or backslashes grows by escaping. Both are bounded by the
+// One case deliberately under-estimates rather than pads: a value containing
+// quotes or backslashes grows by escaping (a []byte bound to a binary column
+// renders as an escaped _binary'...' literal, so the same applies; the
+// "_binary" introducer itself is not counted). It is bounded by the
 // 64x headroom above, and padding for them would penalise the common text case
 // the way the old %v behaviour did — an over-estimate is not free, it shrinks
 // every chunklet.

@@ -459,6 +459,38 @@ func TestNewDatumFromValueWithType(t *testing.T) {
 	}
 }
 
+// TestDatumValueLiteral pins where ValueLiteral differs from String: only a
+// binary value without a charset label, which it renders as an escaped
+// _binary'...' literal instead of 0x hex. Everything else, including the
+// empty binary value, a numeric BIT and NULL, is String().
+func TestDatumValueLiteral(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   any
+		mysqlTp string
+		want    string
+	}{
+		{"binary non-utf8", []byte{0xbb, 0x00, '\\', '\''}, "varbinary(8)", "_binary'\xbb\x00\\\\\\''"},
+		{"binary utf8", "abc", "blob", "_binary'abc'"},
+		{"binary empty", []byte{}, "blob", "_binary''"},
+		{"vector", []byte{0, 0, 0, 0}, "vector(1)", "_binary'\x00\x00\x00\x00'"},
+		{"varchar", "it's", "varchar(10)", `"it\'s"`},
+		{"int", int64(42), "int", "42"},
+		{"bit", []byte{0x01, 0x00}, "bit(16)", "256"},
+		{"nil binary", nil, "blob", "NULL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := NewDatumFromValueWithType(tc.value, NewColumnType(tc.mysqlTp))
+			require.NoError(t, err)
+			require.Equal(t, tc.want, d.ValueLiteral())
+			if !d.IsBinaryString() {
+				require.Equal(t, d.String(), d.ValueLiteral())
+			}
+		})
+	}
+}
+
 // TestDatumCompareTypeMismatch covers the checked type-assertion error paths in
 // (Datum).compare: a Datum whose Tp claims signed/unsigned but whose Val holds
 // the wrong concrete type must yield a clean error rather than panic. This can
