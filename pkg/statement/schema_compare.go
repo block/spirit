@@ -38,14 +38,29 @@ import (
 //
 // If opts is nil, NewDiffOptions() defaults are used.
 func DiffCreateTables(table, wantCreate, gotCreate string, opts *DiffOptions) (string, error) {
+	alter, _, _, err := DiffCreateTablesWithColumns(table, wantCreate, gotCreate, opts)
+	return alter, err
+}
+
+// DiffCreateTablesWithColumns also returns the normalized reference and
+// validated columns, in that order, when the comparison succeeds.
+func DiffCreateTablesWithColumns(table, wantCreate, gotCreate string, opts *DiffOptions) (string, Columns, Columns, error) {
 	want, err := ParseCreateTable(wantCreate)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse reference CREATE TABLE: %w", err)
+		return "", nil, nil, fmt.Errorf("failed to parse reference CREATE TABLE: %w", err)
 	}
 	got, err := ParseCreateTable(gotCreate)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse CREATE TABLE under validation: %w", err)
+		return "", nil, nil, fmt.Errorf("failed to parse CREATE TABLE under validation: %w", err)
 	}
+	alter, err := diffCreateTables(table, want, got, opts)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return alter, want.Columns, got.Columns, nil
+}
+
+func diffCreateTables(table string, want, got *CreateTable, opts *DiffOptions) (string, error) {
 	// Diff requires both tables to have the same name. The two CREATE TABLE
 	// statements come from tables with the same logical name on different
 	// instances, but rewrite both names to a fixed token so the comparison is

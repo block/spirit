@@ -336,9 +336,9 @@ func TestCompareTargetSchema(t *testing.T) {
 		},
 		{
 			name:      "case-insensitive columns use target spelling and sort order",
-			source:    source,
-			target:    "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, Zeta INT NOT NULL, Alpha INT NOT NULL, KEY idx_alpha (Alpha))",
-			tightened: []string{"Alpha", "Zeta"},
+			source:    "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, alpha INT, zeta INT)",
+			target:    "CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, alpha INT NOT NULL, Zeta INT NOT NULL)",
+			tightened: []string{"Zeta", "alpha"},
 		},
 		{
 			name:   "implicit primary key nullability is normalized",

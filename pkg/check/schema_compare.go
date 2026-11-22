@@ -142,88 +142,83 @@ func TargetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) 
 	return diff, err
 }
 
-// TargetSchemaComparison describes whether a move accepts a pre-created target.
+// TargetSchemaComparison reports whether a pre-created target schema is
+// compatible with the source under the move's DDL comparison rules.
 type TargetSchemaComparison struct {
 	// Alter reconciles an incompatible target with the source. It is empty
-	// when the move accepts the target schema.
+	// when the comparison accepts the target schema.
 	Alter string
 	// TightenedColumns are source-nullable columns that the accepted target
-	// declares NOT NULL, sorted by their spelling on the target.
+	// declares NOT NULL, sorted lexicographically by their spelling on the
+	// target.
 	TightenedColumns []string
 	// DeferredIndexes reports whether accepting the target required allowing
 	// missing deferrable secondary indexes.
 	DeferredIndexes bool
 }
 
-// CompareTargetSchema reports the same verdict as TargetSchemaDiff, along with
-// the nullability tightenings and deferred-index tolerance of an accepted
-// target. For an incompatible target it returns only the reconciliation SQL.
-// It compares CREATE TABLE definitions without reading or validating row data.
+// CompareTargetSchema reports the same DDL verdict as TargetSchemaDiff,
+// along with any nullability tightenings and deferred-index tolerance that
+// apply when the target is accepted. For an incompatible target it returns
+// only the reconciliation SQL.
+//
+// This compares CREATE TABLE definitions. The move still checks live tables,
+// including whether MySQL misreports ENUM or SET members, before copying rows.
 func CompareTargetSchema(tableName, sourceCreate, targetCreate string) (TargetSchemaComparison, error) {
-	alter, deferred, err := targetSchemaDiffDeferred(tableName, sourceCreate, targetCreate)
+	return compareTargetSchema(tableName, sourceCreate, targetCreate, true)
+}
+
+// targetSchemaDiffDeferred also reports whether the target matched only after
+// allowing missing deferrable secondary indexes.
+func targetSchemaDiffDeferred(table, sourceCreate, targetCreate string) (string, bool, error) {
+	comparison, err := compareTargetSchema(table, sourceCreate, targetCreate, false)
+	return comparison.Alter, comparison.DeferredIndexes, err
+}
+
+func compareTargetSchema(table, sourceCreate, targetCreate string, collectTightenings bool) (TargetSchemaComparison, error) {
+	diffOpts := moveDiffOptions()
+	diffOpts.IgnoreNotNullRelaxation = true
+	diff, sourceColumns, targetColumns, err := statement.DiffCreateTablesWithColumns(table, sourceCreate, targetCreate, diffOpts)
 	if err != nil {
 		return TargetSchemaComparison{}, err
 	}
-	if alter != "" {
-		return TargetSchemaComparison{Alter: alter}, nil
+	comparison := TargetSchemaComparison{Alter: diff}
+	if diff != "" {
+		withoutMissing, err := statement.RemoveDeferredIndexes(sourceCreate, targetCreate)
+		if err != nil {
+			return TargetSchemaComparison{}, err
+		}
+		deferredDiff, err := statement.DiffCreateTables(table, withoutMissing, targetCreate, diffOpts)
+		if err != nil {
+			return TargetSchemaComparison{}, err
+		}
+		if deferredDiff != "" {
+			return comparison, nil
+		}
+		comparison.Alter = ""
+		comparison.DeferredIndexes = true
 	}
+	if collectTightenings {
+		comparison.TightenedColumns = tightenedColumns(sourceColumns, targetColumns)
+	}
+	return comparison, nil
+}
 
-	// Read normalized column definitions only for accepted previews. Callers
-	// that need just the verdict or deferred-index flag keep their existing
-	// path through targetSchemaDiffDeferred.
-	source, err := statement.ParseCreateTable(sourceCreate)
-	if err != nil {
-		return TargetSchemaComparison{}, fmt.Errorf("parse source CREATE TABLE: %w", err)
-	}
-	target, err := statement.ParseCreateTable(targetCreate)
-	if err != nil {
-		return TargetSchemaComparison{}, fmt.Errorf("parse target CREATE TABLE: %w", err)
-	}
-	sourceNullable := make(map[string]bool, len(source.Columns))
-	for _, column := range source.Columns {
+func tightenedColumns(sourceColumns, targetColumns statement.Columns) []string {
+	sourceNullable := make(map[string]bool, len(sourceColumns))
+	for _, column := range sourceColumns {
 		if column.Nullable {
 			sourceNullable[strings.ToLower(column.Name)] = true
 		}
 	}
-	comparison := TargetSchemaComparison{DeferredIndexes: deferred}
-	for _, column := range target.Columns {
+	var tightened []string
+	for _, column := range targetColumns {
 		if !column.Nullable && sourceNullable[strings.ToLower(column.Name)] {
-			comparison.TightenedColumns = append(comparison.TightenedColumns, column.Name)
+			tightened = append(tightened, column.Name)
 		}
 	}
-	slices.Sort(comparison.TightenedColumns)
-	return comparison, nil
-}
-
-// targetSchemaDiffDeferred is TargetSchemaDiff that also reports whether the
-// target matched only once the deferrable secondary indexes it lacks were
-// left out, so the checks can log it. A target that differs in anything else
-// returns the full diff against the source.
-func targetSchemaDiffDeferred(table, sourceCreate, targetCreate string) (diff string, deferred bool, err error) {
-	diff, err = relaxedTargetSchemaDiff(table, sourceCreate, targetCreate)
-	if err != nil || diff == "" {
-		return diff, false, err
-	}
-	withoutMissing, err := statement.RemoveDeferredIndexes(sourceCreate, targetCreate)
-	if err != nil {
-		return "", false, err
-	}
-	deferredDiff, err := relaxedTargetSchemaDiff(table, withoutMissing, targetCreate)
-	if err != nil {
-		return "", false, err
-	}
-	if deferredDiff == "" {
-		return "", true, nil
-	}
-	return diff, false, nil
-}
-
-// relaxedTargetSchemaDiff is TargetSchemaDiff's first two tolerances alone:
-// column-level AUTO_INCREMENT and a target that tightens NOT NULL.
-func relaxedTargetSchemaDiff(table, sourceCreate, targetCreate string) (string, error) {
-	diffOpts := moveDiffOptions()
-	diffOpts.IgnoreNotNullRelaxation = true
-	return statement.DiffCreateTables(table, sourceCreate, targetCreate, diffOpts)
+	slices.Sort(tightened)
+	return tightened
 }
 
 // moveDiffOptions returns the diff options every move-tables schema comparison
