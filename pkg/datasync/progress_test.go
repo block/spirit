@@ -122,4 +122,18 @@ func TestVerificationStatusBetweenPasses(t *testing.T) {
 	b = status.NewBlock("status")
 	appendVerificationStatus(b, stats)
 	require.Contains(t, b.String(), "first clean pass: 2026-09-18T15:00:00Z")
+	require.NotContains(t, b.String(), "last clean pass")
+	stats.LastCleanPass = &checksum.PassSummary{
+		StartedAt:      stats.FirstCleanPassAt.Add(-90 * time.Minute),
+		CompletedAt:    stats.FirstCleanPassAt,
+		RowsVerified:   1234,
+		ChunksVerified: 5,
+	}
+	b = status.NewBlock("status")
+	appendVerificationStatus(b, stats)
+	require.Contains(t, b.String(), "last clean pass: 2026-09-18T13:30:00Z to 2026-09-18T15:00:00Z (1h30m0s), 5 chunks verified by checksum covering 1234 rows\n")
+	stats.LastCleanPass.ChunksVerifiedByRows = 2
+	b = status.NewBlock("status")
+	appendVerificationStatus(b, stats)
+	require.Contains(t, b.String(), "(1h30m0s), 3 chunks verified by checksum covering 1234 rows, 2 chunks verified row by row\n")
 }

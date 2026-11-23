@@ -106,6 +106,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -283,9 +284,24 @@ type LocklessChecker struct {
 	inFlight        atomic.Int64
 	walkerStalls    atomic.Uint64
 
+	// passSequence numbers completed passes across runs; see
+	// PassSummary.Sequence. Never reset.
+	passSequence atomic.Uint64
+
 	statsMu          sync.RWMutex
 	firstCleanPassAt time.Time
 	nextPassAt       time.Time
+	// passStartedAt, passRowsVerified, passChunksByRows and passTables
+	// describe the current pass; lastPass and lastCleanPass the completed
+	// ones. All are written by the dispatcher goroutine and read by Stats,
+	// under statsMu. The summaries are never modified once stored, so Stats
+	// can hand out copies of them.
+	passStartedAt    time.Time
+	passRowsVerified uint64
+	passChunksByRows uint64
+	passTables       map[string]*TablePassSummary
+	lastPass         *PassSummary
+	lastCleanPass    *PassSummary
 	// started/elapsed/finished time the current (or last) run, for the
 	// StartTime and ExecTime accessors the Checker contract requires.
 	started  time.Time
@@ -961,6 +977,12 @@ func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPas
 		c.cfg.Logger.Debug("lockless checksum pass starting", "pass_number", passNum)
 		passStart := time.Now()
 		lastPassStart = passStart
+		c.statsMu.Lock()
+		c.passStartedAt = passStart
+		c.passRowsVerified = 0
+		c.passChunksByRows = 0
+		c.passTables = make(map[string]*TablePassSummary)
+		c.statsMu.Unlock()
 
 		if err := c.runOnePass(ctx, workCh, resultCh); err != nil {
 			return err
@@ -979,7 +1001,8 @@ func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPas
 		// differencesFound == 0 follow-up-pass rule in SingleChecker.
 		recopies := c.recopiesThisPass.Load()
 		deferredHot := c.hotChunksDeferredThisPass.Load()
-		if recopies == 0 && deferredHot == 0 {
+		summary := c.recordCompletedPass(passNum, passStart, recopies == 0 && deferredHot == 0)
+		if summary.Clean {
 			c.signalFirstCleanPass()
 		}
 		if recopies == 0 {
@@ -1008,7 +1031,10 @@ func (c *LocklessChecker) runPasses(ctx context.Context, untilClean bool, minPas
 			"hot_chunks_deferred", deferredHot,
 			"hot_chunks_settled", c.hotChunksSettledThisPass.Load(),
 			"hot_chunks_split", c.hotChunksSplitThisPass.Load(),
-			"duration", time.Since(passStart).Round(time.Millisecond).String(),
+			"rows_verified", summary.RowsVerified,
+			"clean", summary.Clean,
+			"sequence", summary.Sequence,
+			"duration", summary.Duration().Round(time.Millisecond).String(),
 		)
 		if untilClean && recopies == 0 && deferredHot == 0 {
 			return ctx.Err()
@@ -1229,9 +1255,15 @@ func (c *LocklessChecker) runOnePass(ctx context.Context, workCh chan<- *workIte
 					}
 				default:
 				}
-				if ctx.Err() == nil {
-					c.scanComplete.Store(true)
+				// The walker also closes walkCh, without an error, when ctx
+				// ends. That walk stopped part way, so the pass must not be
+				// able to reach the termination check above and complete: a
+				// partial pass with nothing recopied would read as clean and
+				// fire FirstCleanPass.
+				if err := ctx.Err(); err != nil {
+					return err
 				}
+				c.scanComplete.Store(true)
 				continue
 			}
 			pendingFresh = item
@@ -1706,6 +1738,7 @@ func (c *LocklessChecker) handleResult(res *workResult, enqueueRetry func(*retry
 	if res.passed {
 		c.chunksPassedThisPass.Add(1)
 		c.bucketPassed(res.item, res.recopied)
+		c.recordResolvedChunk(res)
 		if !res.recopied {
 			c.feedbackResolved(res)
 		}
@@ -1914,6 +1947,101 @@ func (c *LocklessChecker) bucketPassed(item *workItem, recopied bool) {
 	}
 }
 
+// recordResolvedChunk adds a resolved chunk to the current pass's summary
+// totals. Called by the dispatcher only, for results with passed set.
+//
+// Rows are counted only for a chunk verified by comparing aggregate
+// signatures. On that path newTgt is the target's signature at the read that
+// matched, and the match is on CRC and count, so its count is the number of
+// rows that compared equal. A chunk resolved by a hot snapshot compared rows,
+// not an aggregate, and its newTgt can still hold the aggregate read that
+// disagreed before the snapshot was taken; a recopied chunk's newTgt is the
+// read that disagreed. Neither counts.
+func (c *LocklessChecker) recordResolvedChunk(res *workResult) {
+	var rows uint64
+	if !res.recopied && res.snapshot == nil {
+		rows = res.newTgt.count
+	}
+	name := res.item.chunk.Table.TableName
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	t := c.passTables[name]
+	if t == nil {
+		// A nil map means a result arrived outside runPasses, which tests
+		// that drive handleResult directly do; there is no pass to add to.
+		if c.passTables == nil {
+			return
+		}
+		t = &TablePassSummary{Table: name}
+		c.passTables[name] = t
+	}
+	if res.recopied {
+		t.ChunksRecopied++
+		return
+	}
+	t.ChunksVerified++
+	t.RowsVerified += rows
+	c.passRowsVerified += rows
+	if res.snapshot != nil {
+		c.passChunksByRows++
+	}
+}
+
+// recordCompletedPass builds the summary of the pass that has just completed,
+// stores it as lastPass (and lastCleanPass when clean), and returns it. The
+// first clean pass also sets firstCleanPassAt, under the same lock, so Stats
+// never shows a LastCleanPass without a FirstCleanPassAt.
+func (c *LocklessChecker) recordCompletedPass(passNum uint64, started time.Time, clean bool) PassSummary {
+	recopied := c.recopiesThisPass.Load()
+	summary := PassSummary{
+		Sequence:              c.passSequence.Add(1),
+		Pass:                  passNum,
+		Continuous:            c.continuousActive.Load(),
+		StartedAt:             started,
+		CompletedAt:           time.Now(),
+		Clean:                 clean,
+		ChunksVerified:        c.chunksPassedThisPass.Load() - recopied,
+		ChunksRecopied:        recopied,
+		Mismatches:            c.mismatchesThisPass.Load(),
+		PassedFirstAttempt:    c.passedFirstAttemptThisPass.Load(),
+		PassedSecondAttempt:   c.passedSecondAttemptThisPass.Load(),
+		PassedUnder5Attempts:  c.passedUnder5AttemptsThisPass.Load(),
+		PassedUnder10Attempts: c.passedUnder10AttemptsThisPass.Load(),
+		HotChunksSettled:      c.hotChunksSettledThisPass.Load(),
+		HotChunksDeferred:     c.hotChunksDeferredThisPass.Load(),
+		HotChunksSplit:        c.hotChunksSplitThisPass.Load(),
+	}
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	summary.RowsVerified = c.passRowsVerified
+	summary.ChunksVerifiedByRows = c.passChunksByRows
+	summary.Tables = make([]TablePassSummary, 0, len(c.passTables))
+	for _, t := range c.passTables {
+		summary.Tables = append(summary.Tables, *t)
+	}
+	slices.SortFunc(summary.Tables, func(a, b TablePassSummary) int { return strings.Compare(a.Table, b.Table) })
+	stored := summary
+	c.lastPass = &stored
+	if clean {
+		c.lastCleanPass = &stored
+		if c.firstCleanPassAt.IsZero() {
+			c.firstCleanPassAt = summary.CompletedAt
+		}
+	}
+	return summary
+}
+
+// copyPassSummary returns a copy of s that shares nothing with it, so a
+// caller of Stats cannot modify a stored summary; nil stays nil.
+func copyPassSummary(s *PassSummary) *PassSummary {
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	cp.Tables = slices.Clone(s.Tables)
+	return &cp
+}
+
 // readChunkCRC issues the BIT_XOR(CRC32(...)) query against every source and
 // every target in parallel, and aggregates each side: CRCs XOR together and
 // counts sum, which gives exactly what one query over the union of the servers
@@ -1976,13 +2104,11 @@ func readChunkCRC(
 	return srcCRC, tgtCRC, srcCount, tgtCount, nil
 }
 
-// signalFirstCleanPass closes firstCleanPassCh on the first call and
-// records the wall-clock time. Subsequent calls are no-ops.
+// signalFirstCleanPass closes firstCleanPassCh on the first call. Subsequent
+// calls are no-ops. recordCompletedPass has already recorded FirstCleanPassAt,
+// so a waiter that reads Stats once the channel closes sees it.
 func (c *LocklessChecker) signalFirstCleanPass() {
 	c.firstCleanPassOnce.Do(func() {
-		c.statsMu.Lock()
-		c.firstCleanPassAt = time.Now()
-		c.statsMu.Unlock()
 		close(c.firstCleanPassCh)
 	})
 }
@@ -1993,6 +2119,10 @@ func (c *LocklessChecker) Stats() LocklessCheckerStats {
 	c.statsMu.RLock()
 	firstAt := c.firstCleanPassAt
 	nextAt := c.nextPassAt
+	passStartedAt := c.passStartedAt
+	rowsVerified := c.passRowsVerified
+	lastPass := copyPassSummary(c.lastPass)
+	lastCleanPass := copyPassSummary(c.lastCleanPass)
 	c.statsMu.RUnlock()
 	progress, _, total := c.chunker.Progress()
 	var progressBasisPoints uint64
@@ -2024,6 +2154,10 @@ func (c *LocklessChecker) Stats() LocklessCheckerStats {
 		ConfirmedDifferences:          c.confirmedDifferences.Load(),
 		FirstCleanPassAt:              firstAt,
 		NextPassAt:                    nextAt,
+		PassStartedAt:                 passStartedAt,
+		RowsVerifiedThisPass:          rowsVerified,
+		LastPass:                      lastPass,
+		LastCleanPass:                 lastCleanPass,
 	}
 }
 

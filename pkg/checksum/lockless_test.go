@@ -2159,3 +2159,293 @@ func TestSplitChildrenGoAheadOfGatedRetries(t *testing.T) {
 		return childReads == len(children)
 	}, 5*time.Second, time.Millisecond, "split children queued behind a retry that is waiting on a flush")
 }
+
+// newTwoTableTestChunker returns chunks over tables "b" and "a" (walked in that
+// order, so a summary sorted by table name is distinguishable from one in
+// walk order) and the row count each chunk reports.
+func newTwoTableTestChunker() (*table.MockChunker, map[*table.Chunk]uint64) {
+	counts := make(map[*table.Chunk]uint64)
+	var chunks []*table.Chunk
+	for i, spec := range []struct {
+		table string
+		rows  uint64
+	}{{"b", 7}, {"b", 11}, {"a", 13}} {
+		chunk := newTestChunk(uint64(i*1000), uint64((i+1)*1000))
+		chunk.Table = &table.TableInfo{SchemaName: "test", TableName: spec.table}
+		chunk.NewTable = &table.TableInfo{SchemaName: "test", TableName: spec.table}
+		counts[chunk] = spec.rows
+		chunks = append(chunks, chunk)
+	}
+	return table.NewMockChunkerFromChunks(chunks...), counts
+}
+
+// TestPassSummaryCleanPass: a clean pass is recorded with its timing, its row
+// and chunk totals, and a per-table breakdown sorted by table name.
+func TestPassSummaryCleanPass(t *testing.T) {
+	chunker, counts := newTwoTableTestChunker()
+	c := newTestChecker(t, chunker, fastConfig(),
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			if attempt == 1 && counts[chunk] == 11 {
+				return 100, 99, counts[chunk], nil // apply lag: matches on the retry
+			}
+			return 42, 42, counts[chunk], nil
+		},
+	)
+	require.Nil(t, c.Stats().LastPass, "no pass has completed")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, c.RunUntilClean(ctx))
+
+	stats := c.Stats()
+	last := stats.LastPass
+	require.NotNil(t, last)
+	require.Equal(t, uint64(1), last.Sequence)
+	require.Equal(t, uint64(1), last.Pass)
+	require.False(t, last.Continuous)
+	require.True(t, last.Clean)
+	require.Equal(t, stats.PassStartedAt, last.StartedAt)
+	require.False(t, last.CompletedAt.Before(last.StartedAt))
+	require.Equal(t, stats.FirstCleanPassAt, last.CompletedAt, "FirstCleanPassAt is the clean pass's completion time")
+	require.Equal(t, uint64(3), last.ChunksVerified)
+	require.Zero(t, last.ChunksRecopied)
+	require.Equal(t, uint64(7+11+13), last.RowsVerified)
+	require.Equal(t, last.RowsVerified, stats.RowsVerifiedThisPass)
+	require.Equal(t, uint64(1), last.Mismatches)
+	require.Equal(t, uint64(2), last.PassedFirstAttempt)
+	require.Equal(t, uint64(1), last.PassedSecondAttempt)
+	require.Equal(t, []TablePassSummary{
+		{Table: "a", ChunksVerified: 1, RowsVerified: 13},
+		{Table: "b", ChunksVerified: 2, RowsVerified: 7 + 11},
+	}, last.Tables)
+	require.Equal(t, last, stats.LastCleanPass)
+
+	// Stats hands out copies: changing one does not change the stored record.
+	last.Tables[0].RowsVerified = 0
+	stats.LastCleanPass.RowsVerified = 0
+	again := c.Stats()
+	require.Equal(t, uint64(13), again.LastPass.Tables[0].RowsVerified)
+	require.Equal(t, uint64(7+11+13), again.LastCleanPass.RowsVerified)
+}
+
+// TestPassSummaryRepairedPassIsNotClean: a pass that recopied chunks is
+// recorded as not clean, counts no rows for them, and does not become
+// LastCleanPass; the follow-up pass that re-reads them does.
+func TestPassSummaryRepairedPassIsNotClean(t *testing.T) {
+	chunker := newTestChunker(2)
+	var recopied sync.Map
+	c := newTestChecker(t, chunker, fastConfig(),
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			if _, ok := recopied.Load(chunk); ok {
+				return 42, 42, 1000, nil
+			}
+			return 100, 99, 1000, nil // stable divergence until recopied
+		},
+	)
+	c.recopier = &fakeRecopier{recopyFn: func(ctx context.Context, chunk *table.Chunk) error {
+		recopied.Store(chunk, true)
+		return nil
+	}}
+
+	// Hold the second pass at its first read, so pass 1's record can be read
+	// before pass 2 replaces it.
+	pass2Reached := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	read := c.readChunk
+	c.readChunk = func(ctx context.Context, chunk *table.Chunk) (int64, int64, uint64, uint64, error) {
+		if c.currentPass.Load() == 2 {
+			once.Do(func() { close(pass2Reached) })
+			<-release
+		}
+		return read(ctx, chunk)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.RunUntilClean(ctx) }()
+
+	select {
+	case <-pass2Reached:
+	case err := <-errCh:
+		t.Fatalf("run ended before a second pass: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("second pass never started; stats=%+v", c.Stats())
+	}
+	stats := c.Stats()
+	first := stats.LastPass
+	require.NotNil(t, first)
+	require.Equal(t, uint64(1), first.Sequence)
+	require.False(t, first.Clean)
+	require.Equal(t, uint64(2), first.ChunksRecopied)
+	require.Zero(t, first.ChunksVerified)
+	require.Zero(t, first.RowsVerified, "recopied rows were never observed equal")
+	require.Equal(t, []TablePassSummary{{Table: "t", ChunksRecopied: 2}}, first.Tables)
+	require.Nil(t, stats.LastCleanPass)
+	require.True(t, stats.FirstCleanPassAt.IsZero())
+
+	close(release)
+	require.NoError(t, <-errCh)
+	stats = c.Stats()
+	require.Equal(t, uint64(2), stats.LastPass.Sequence)
+	require.True(t, stats.LastPass.Clean)
+	require.Equal(t, uint64(2000), stats.LastPass.RowsVerified)
+	require.Equal(t, stats.LastPass, stats.LastCleanPass)
+	require.Equal(t, stats.FirstCleanPassAt, stats.LastCleanPass.CompletedAt)
+}
+
+// TestPassSummarySequenceAcrossRuns: a continuous run after the finite one
+// restarts Pass at 1 but not Sequence, marks its passes Continuous, and leaves
+// FirstCleanPassAt at the finite run's clean pass.
+func TestPassSummarySequenceAcrossRuns(t *testing.T) {
+	c := newTestChecker(t, newTestChunker(2), fastConfig(),
+		func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+			return 42, 42, 500, nil
+		},
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, c.RunUntilClean(ctx))
+	initial := c.Stats().LastCleanPass
+	require.NotNil(t, initial)
+	require.Equal(t, uint64(1), initial.Sequence)
+
+	stop, _ := runUntil(t, c)
+	require.Eventually(t, func() bool {
+		last := c.Stats().LastPass
+		return last != nil && last.Sequence >= 2
+	}, 5*time.Second, time.Millisecond)
+	require.NoError(t, ignoreCanceled(stop()))
+
+	stats := c.Stats()
+	require.True(t, stats.LastPass.Continuous)
+	require.Greater(t, stats.LastPass.Sequence, initial.Sequence)
+	require.Equal(t, stats.LastPass.Sequence-1, stats.LastPass.Pass, "Pass restarts at 1 in the continuous run")
+	require.Equal(t, uint64(1000), stats.LastPass.RowsVerified, "%+v", *stats.LastPass)
+	require.Equal(t, initial.CompletedAt, stats.FirstCleanPassAt)
+}
+
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+// cancelMidWalkChunker reproduces the moment a pass is canceled with nothing
+// queued or in flight. Its second Next blocks until the first chunk's result
+// is fed back, which happens on the dispatcher goroutine; Feedback then
+// cancels the run and waits for the walker to close its channel, so the
+// dispatcher's next select finds ctx.Done and the closed walk channel ready at
+// once. Feedback cancels only once the walker is inside its second Next: the
+// walker checks ctx before each Next, and one that saw the cancel first would
+// return without calling it. Every wait is bounded, so a broken handshake
+// fails the test instead of hanging it.
+type cancelMidWalkChunker struct {
+	*table.MockChunker
+	t         *testing.T
+	cancel    context.CancelFunc
+	nexts     atomic.Int32
+	inNext    chan struct{}
+	released  chan struct{}
+	walkerOut chan struct{}
+}
+
+func (m *cancelMidWalkChunker) Next() (*table.Chunk, error) {
+	if m.nexts.Add(1) == 1 {
+		return m.MockChunker.Next()
+	}
+	close(m.inNext)
+	m.await(m.released, "Feedback to release the second Next")
+	defer close(m.walkerOut)
+	return nil, table.ErrTableIsRead
+}
+
+func (m *cancelMidWalkChunker) Feedback(chunk *table.Chunk, d time.Duration, rows uint64) {
+	m.await(m.inNext, "the walker to enter its second Next")
+	m.cancel()
+	close(m.released)
+	m.await(m.walkerOut, "the walker to return from its second Next")
+	time.Sleep(5 * time.Millisecond) // for the walker's deferred close(walkCh)
+	m.MockChunker.Feedback(chunk, d, rows)
+}
+
+// await waits for ch to close. It runs on checker goroutines, where FailNow
+// is not allowed, so on timeout it records the failure and returns.
+func (m *cancelMidWalkChunker) await(ch <-chan struct{}, what string) {
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		m.t.Errorf("timed out waiting for %s", what)
+	}
+}
+
+// TestCanceledPassNeverCompletes: a pass whose context ends must not complete.
+// The walker closes its channel without an error on cancellation, and the
+// dispatcher's select could take that branch instead of ctx.Done. It then saw
+// an exhausted walk, an empty queue and nothing in flight and returned nil,
+// so a pass that had read one chunk of two completed with nothing recopied,
+// fired FirstCleanPass and was recorded as clean. Each attempt is a coin toss
+// between the two ready select arms, so the loop makes a regression all but
+// certain to fail.
+func TestCanceledPassNeverCompletes(t *testing.T) {
+	for range 40 {
+		ctx, cancel := context.WithCancel(context.Background())
+		chunker := &cancelMidWalkChunker{
+			MockChunker: newTestChunker(2),
+			t:           t,
+			cancel:      cancel,
+			inNext:      make(chan struct{}),
+			released:    make(chan struct{}),
+			walkerOut:   make(chan struct{}),
+		}
+		c := newTestChecker(t, chunker, fastConfig(),
+			func(ctx context.Context, chunk *table.Chunk, attempt int) (int64, int64, uint64, error) {
+				return 42, 42, 1, nil
+			},
+		)
+		require.ErrorIs(t, c.RunUntilClean(ctx), context.Canceled)
+		stats := c.Stats()
+		require.Zero(t, stats.PassesCompleted)
+		require.Nil(t, stats.LastPass)
+		require.True(t, stats.FirstCleanPassAt.IsZero())
+		select {
+		case <-c.FirstCleanPass():
+			t.Fatal("FirstCleanPass fired for a canceled pass")
+		default:
+		}
+		cancel()
+	}
+}
+
+// TestRowsVerifiedExcludesSnapshotResolvedChunks: a chunk resolved by a hot
+// snapshot can carry the aggregate read that disagreed before the snapshot was
+// taken. Its count is not rows verified by a matching aggregate, so it must
+// not be added to the pass's totals.
+func TestRowsVerifiedExcludesSnapshotResolvedChunks(t *testing.T) {
+	c := newTestChecker(t, newTestChunker(1), fastConfig(), nil)
+	c.statsMu.Lock()
+	c.passTables = map[string]*TablePassSummary{}
+	c.statsMu.Unlock()
+	chunk := newTestChunk(0, 1000)
+
+	c.recordResolvedChunk(&workResult{
+		item:     &workItem{chunk: chunk},
+		newTgt:   chunkSig{count: 500},
+		snapshot: &hotSnapshot{},
+	})
+	c.recordResolvedChunk(&workResult{
+		item:   &workItem{chunk: chunk},
+		newTgt: chunkSig{count: 7},
+	})
+
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	require.Equal(t, uint64(7), c.passRowsVerified)
+	require.Equal(t, uint64(1), c.passChunksByRows)
+	table := c.passTables[chunk.Table.TableName]
+	require.NotNil(t, table)
+	require.Equal(t, uint64(2), table.ChunksVerified)
+	require.Equal(t, uint64(7), table.RowsVerified)
+}
