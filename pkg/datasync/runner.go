@@ -2083,6 +2083,11 @@ func appendVerificationStatus(b *status.Block, stats checksum.LocklessCheckerSta
 	if !stats.FirstCleanPassAt.IsZero() {
 		b.Row("", "first clean pass: %s", stats.FirstCleanPassAt.UTC().Format(time.RFC3339))
 	}
+	if p := stats.LastCleanPass; p != nil {
+		b.Row("", "last clean pass: %s to %s (%s), %d rows in %d chunks verified",
+			p.StartedAt.UTC().Format(time.RFC3339), p.CompletedAt.UTC().Format(time.RFC3339),
+			p.Duration().Round(time.Second), p.RowsVerified, p.ChunksVerified)
+	}
 	b.Row("", "remaining: %d retrying (%d hot), %d in flight, %d deferred",
 		stats.RetryQueueDepth, stats.HotChunkCount, stats.InFlight, stats.HotChunksDeferredThisPass)
 	b.Row("", "pass activity: %d chunks mismatched: %d split, %d recopied, %d settled",

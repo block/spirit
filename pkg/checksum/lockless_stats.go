@@ -126,6 +126,93 @@ type LocklessCheckerStats struct {
 	ConfirmedDifferences uint64
 
 	// FirstCleanPassAt is the wall-clock time at which the first clean
-	// pass completed (zero before that).
+	// pass completed (zero before that). It equals LastCleanPass.CompletedAt
+	// until a later clean pass replaces LastCleanPass.
 	FirstCleanPassAt time.Time
+
+	// PassStartedAt is when the current (or most recently completed) pass
+	// started; zero before the first pass.
+	PassStartedAt time.Time
+
+	// RowsVerifiedThisPass is the running total of the current pass's
+	// PassSummary.RowsVerified. Resets each pass.
+	RowsVerifiedThisPass uint64
+
+	// LastPass summarizes the most recently completed pass, clean or not; nil
+	// before any pass completes. LastCleanPass summarizes the most recent
+	// clean one. Both survive later runs of the same checker, as
+	// FirstCleanPassAt does, so the initial verification's clean pass is
+	// still reported while a continuous run is on its first pass.
+	LastPass      *PassSummary
+	LastCleanPass *PassSummary
+}
+
+// PassSummary is the record of one completed pass: what it compared, when, and
+// what it found. It is written once, when the pass completes, and never
+// changed, so a caller can keep it as evidence of that pass.
+type PassSummary struct {
+	// Sequence numbers every pass this checker has completed, across runs,
+	// starting at 1. Pass restarts at 1 on every run (a RunContinuous that
+	// follows Run starts again at pass 1), so Sequence is the one that
+	// identifies a pass uniquely for this checker.
+	Sequence uint64
+	// Pass is the 1-indexed pass number within its run, as CurrentPass
+	// reported it.
+	Pass uint64
+	// Continuous is true for a pass of RunContinuous, which never repairs:
+	// a divergence it confirms ends the run instead.
+	Continuous bool
+
+	StartedAt   time.Time
+	CompletedAt time.Time
+
+	// Clean is true when every chunk was read back equal: nothing was
+	// recopied and no continuously changing chunk was deferred. It is the
+	// criterion FirstCleanPass fires on.
+	Clean bool
+
+	// ChunksVerified counts chunks resolved by a comparison, including those
+	// settled against the change stream. ChunksRecopied counts chunks
+	// resolved by a repair instead; they were never observed equal. Split
+	// parents are counted in HotChunksSplit, not here, since their children
+	// are verified in their place.
+	ChunksVerified uint64
+	ChunksRecopied uint64
+
+	// RowsVerified is the number of rows in the chunks verified by comparing
+	// aggregate signatures (CRC and row count): the row count of each such
+	// chunk at the read that matched, summed over the pass. Chunks are read
+	// at different times, so it is not a row count of the table at any one
+	// instant. Rows in chunks settled against the change stream
+	// (HotChunksSettled) and in recopied chunks are not included.
+	RowsVerified uint64
+
+	// The attempts-to-converge histogram and hot-chunk counters, with the
+	// same meanings as the *ThisPass fields of LocklessCheckerStats.
+	Mismatches            uint64
+	PassedFirstAttempt    uint64
+	PassedSecondAttempt   uint64
+	PassedUnder5Attempts  uint64
+	PassedUnder10Attempts uint64
+	HotChunksSettled      uint64
+	HotChunksDeferred     uint64
+	HotChunksSplit        uint64
+
+	// Tables breaks ChunksVerified, ChunksRecopied and RowsVerified down by
+	// source table name, sorted by name. A table appears once one of its
+	// chunks resolves.
+	Tables []TablePassSummary
+}
+
+// Duration is how long the pass took.
+func (s PassSummary) Duration() time.Duration {
+	return s.CompletedAt.Sub(s.StartedAt)
+}
+
+// TablePassSummary is one table's share of a PassSummary.
+type TablePassSummary struct {
+	Table          string
+	ChunksVerified uint64
+	ChunksRecopied uint64
+	RowsVerified   uint64
 }
