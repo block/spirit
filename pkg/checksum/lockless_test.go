@@ -2338,11 +2338,16 @@ func ignoreCanceled(err error) error {
 // is fed back, which happens on the dispatcher goroutine; Feedback then
 // cancels the run and waits for the walker to close its channel, so the
 // dispatcher's next select finds ctx.Done and the closed walk channel ready at
-// once.
+// once. Feedback cancels only once the walker is inside its second Next: the
+// walker checks ctx before each Next, and one that saw the cancel first would
+// return without calling it. Every wait is bounded, so a broken handshake
+// fails the test instead of hanging it.
 type cancelMidWalkChunker struct {
 	*table.MockChunker
+	t         *testing.T
 	cancel    context.CancelFunc
 	nexts     atomic.Int32
+	inNext    chan struct{}
 	released  chan struct{}
 	walkerOut chan struct{}
 }
@@ -2351,17 +2356,29 @@ func (m *cancelMidWalkChunker) Next() (*table.Chunk, error) {
 	if m.nexts.Add(1) == 1 {
 		return m.MockChunker.Next()
 	}
-	<-m.released
+	close(m.inNext)
+	m.await(m.released, "Feedback to release the second Next")
 	defer close(m.walkerOut)
 	return nil, table.ErrTableIsRead
 }
 
 func (m *cancelMidWalkChunker) Feedback(chunk *table.Chunk, d time.Duration, rows uint64) {
+	m.await(m.inNext, "the walker to enter its second Next")
 	m.cancel()
 	close(m.released)
-	<-m.walkerOut
+	m.await(m.walkerOut, "the walker to return from its second Next")
 	time.Sleep(5 * time.Millisecond) // for the walker's deferred close(walkCh)
 	m.MockChunker.Feedback(chunk, d, rows)
+}
+
+// await waits for ch to close. It runs on checker goroutines, where FailNow
+// is not allowed, so on timeout it records the failure and returns.
+func (m *cancelMidWalkChunker) await(ch <-chan struct{}, what string) {
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		m.t.Errorf("timed out waiting for %s", what)
+	}
 }
 
 // TestCanceledPassNeverCompletes: a pass whose context ends must not complete.
@@ -2377,7 +2394,9 @@ func TestCanceledPassNeverCompletes(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		chunker := &cancelMidWalkChunker{
 			MockChunker: newTestChunker(2),
+			t:           t,
 			cancel:      cancel,
+			inNext:      make(chan struct{}),
 			released:    make(chan struct{}),
 			walkerOut:   make(chan struct{}),
 		}
@@ -2398,4 +2417,35 @@ func TestCanceledPassNeverCompletes(t *testing.T) {
 		}
 		cancel()
 	}
+}
+
+// TestRowsVerifiedExcludesSnapshotResolvedChunks: a chunk resolved by a hot
+// snapshot can carry the aggregate read that disagreed before the snapshot was
+// taken. Its count is not rows verified by a matching aggregate, so it must
+// not be added to the pass's totals.
+func TestRowsVerifiedExcludesSnapshotResolvedChunks(t *testing.T) {
+	c := newTestChecker(t, newTestChunker(1), fastConfig(), nil)
+	c.statsMu.Lock()
+	c.passTables = map[string]*TablePassSummary{}
+	c.statsMu.Unlock()
+	chunk := newTestChunk(0, 1000)
+
+	c.recordResolvedChunk(&workResult{
+		item:     &workItem{chunk: chunk},
+		newTgt:   chunkSig{count: 500},
+		snapshot: &hotSnapshot{},
+	})
+	c.recordResolvedChunk(&workResult{
+		item:   &workItem{chunk: chunk},
+		newTgt: chunkSig{count: 7},
+	})
+
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	require.Equal(t, uint64(7), c.passRowsVerified)
+	require.Equal(t, uint64(1), c.passChunksByRows)
+	table := c.passTables[chunk.Table.TableName]
+	require.NotNil(t, table)
+	require.Equal(t, uint64(2), table.ChunksVerified)
+	require.Equal(t, uint64(7), table.RowsVerified)
 }

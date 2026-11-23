@@ -179,12 +179,18 @@ type PassSummary struct {
 	ChunksVerified uint64
 	ChunksRecopied uint64
 
+	// ChunksVerifiedByRows is the part of ChunksVerified resolved by
+	// comparing a hot chunk's rows one by one, from a snapshot checked
+	// against the source or settled against the change stream, rather than
+	// by aggregate signature. The rest were verified by aggregate signature.
+	ChunksVerifiedByRows uint64
+
 	// RowsVerified is the number of rows in the chunks verified by comparing
 	// aggregate signatures (CRC and row count): the row count of each such
 	// chunk at the read that matched, summed over the pass. Chunks are read
 	// at different times, so it is not a row count of the table at any one
-	// instant. Rows in chunks settled against the change stream
-	// (HotChunksSettled) and in recopied chunks are not included.
+	// instant. Rows in chunks verified row by row (ChunksVerifiedByRows) and
+	// in recopied chunks are not included.
 	RowsVerified uint64
 
 	// The attempts-to-converge histogram and hot-chunk counters, with the
