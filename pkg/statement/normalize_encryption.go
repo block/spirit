@@ -4,24 +4,22 @@ import "strings"
 
 func init() { registerNormalizer(encryptionNormalizer{}) }
 
-// encryptionNormalizer rewrites the table ENCRYPTION option to the form SHOW
-// CREATE TABLE reports. MySQL keeps the case the CREATE TABLE used
-// (ENCRYPTION='n' is stored and printed as 'n') but reads 'Y' and 'N' in either
-// case, so the value is upper-cased to compare equal.
+// encryptionNormalizer canonicalizes the case of the table ENCRYPTION option.
+// MySQL keeps the case the CREATE TABLE used (ENCRYPTION='n' is stored and
+// printed as 'n') but reads 'Y' and 'N' in either case, so the value is
+// upper-cased to compare equal.
 //
-// ENCRYPTION='N' is then dropped. On a server whose default_table_encryption
-// is OFF (the default), in a schema without DEFAULT ENCRYPTION='Y', SHOW CREATE
-// TABLE prints no ENCRYPTION for an unencrypted table, whether it was created
-// with ENCRYPTION='N', ENCRYPTION='n' or no option at all. Without the rule a
-// schema that spells out ENCRYPTION='N' differs from its own live table on
-// every run. After it, a parsed table carries Encryption only when it is
-// encrypted ('Y'), and an absent option means unencrypted.
-//
-// That reading does not hold where encryption is the default (a schema with
-// DEFAULT ENCRYPTION='Y', or default_table_encryption=ON). There a table that
-// omits the option is encrypted, and SHOW CREATE TABLE prints ENCRYPTION='N'
-// for one that opts out. A parsed CREATE TABLE knows neither default, so it
-// cannot tell those two apart: both read as unencrypted.
+// An explicit ENCRYPTION='N' is kept distinct from an absent option. What an
+// omitted option means depends on the server (default_table_encryption) and on
+// the schema (DEFAULT ENCRYPTION), neither of which a parsed CREATE TABLE
+// knows: with encryption off by default SHOW CREATE TABLE prints no ENCRYPTION
+// for an unencrypted table, but with it on by default a table that omits the
+// option is encrypted and one that opts out is printed as ENCRYPTION='N'.
+// Erasing 'N' here would make a schema that omits the option indistinguishable
+// from one that asks for decryption, so diffTableOptions decides what to emit
+// from the declared value instead: an omitted option is never changed, 'Y'
+// encrypts, and 'N' decrypts a table that is encrypted. A schema that wants a
+// table decrypted must say ENCRYPTION='N'.
 //
 // A value other than Y or N is left as written: MySQL rejects it (error 3184).
 type encryptionNormalizer struct{}
@@ -36,7 +34,7 @@ func (encryptionNormalizer) Normalize(ct *CreateTable) *CreateTable {
 	case "Y":
 		ct.TableOptions.Encryption = new("Y")
 	case "N":
-		ct.TableOptions.Encryption = nil
+		ct.TableOptions.Encryption = new("N")
 	}
 	if *ct.TableOptions == (TableOptions{}) {
 		ct.TableOptions = nil

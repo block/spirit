@@ -316,10 +316,15 @@ statements. An option-only change to a primary key's `KEY_BLOCK_SIZE` or
 name swap used for secondary indexes. Primary key comments still use the
 combined statement, which MySQL applies.
 
-`ENCRYPTION` is always compared. An unencrypted table has no `Encryption`
-(`encryptionNormalizer`), so a diff that decrypts a table emits `ENCRYPTION='N'`
-and one that encrypts it emits `ENCRYPTION='Y'`. There is no `Ignore` option for
-it: it is declared schema, like `SECONDARY_ENGINE_ATTRIBUTE`.
+`ENCRYPTION` is always compared, with one asymmetry: a desired schema that
+omits the option never changes it. An explicit `ENCRYPTION='Y'` encrypts a table
+that is not already encrypted, and an explicit `ENCRYPTION='N'` decrypts a table
+that is encrypted (a live table with no `ENCRYPTION` counts as unencrypted, so a
+declared `'N'` against it is a no-op). A schema that wants a table decrypted must
+say `ENCRYPTION='N'`. This keeps a schema written without the option from
+decrypting every table on a server where encryption is the default
+(`default_table_encryption=ON` or `DEFAULT ENCRYPTION='Y'`). There is no
+`Ignore` option for it: it is declared schema, like `SECONDARY_ENGINE_ATTRIBUTE`.
 
 ```go
 type TableOptions struct {
@@ -477,7 +482,7 @@ Two layers of canonicalization apply:
    | `partitionKeyAlgorithmNormalizer` | folds `KEY ALGORITHM=2`, MySQL's default, into the omitted form `SHOW CREATE TABLE` prints, on partitioning and subpartitioning. `ALGORITHM=1` is a different row placement and is kept |
    | `partitionCommentNormalizer` | pushes a partition-level `COMMENT` down onto explicitly named subpartitions that have none, and clears it from the partition — what MySQL stores for `PARTITION p0 ... COMMENT 'c' (SUBPARTITION s0, SUBPARTITION s1)`. A partition comment on implicit subpartitions (`SUBPARTITIONS n`) stays on the partition |
    | `engineNormalizer` | rewrites the table `ENGINE` to the name `SHOW CREATE TABLE` reports, since MySQL resolves engine names case-insensitively and through legacy aliases: `ENGINE=innodb` and `ENGINE=innobase` → `InnoDB`, `myisam` → `MyISAM`, `heap` → `MEMORY`, `merge` and `mrg_myisam` → `MRG_MyISAM`, and `CSV`, `ARCHIVE` and `BLACKHOLE` in any case. Without it a schema that writes `ENGINE=innodb` diffs to `ENGINE=InnoDB` on every run when `IgnoreEngine` is false. An engine not in that list keeps its written spelling. Per-partition `ENGINE` clauses are not compared, so they are left alone |
-   | `encryptionNormalizer` | upper-cases the table `ENCRYPTION` value (MySQL reads `'y'` and `'Y'` alike but prints the case it was given) and drops `ENCRYPTION='N'`. On a server with `default_table_encryption=OFF` (the default), in a schema without `DEFAULT ENCRYPTION='Y'`, `SHOW CREATE TABLE` prints no `ENCRYPTION` for an unencrypted table however it was created (`'N'`, `'n'` or no option; verified on MySQL 8.0.46), so an absent option means unencrypted and a schema that writes `ENCRYPTION='N'` would otherwise differ from its live table on every run. Where encryption is the default (a schema with `DEFAULT ENCRYPTION='Y'`, or `default_table_encryption=ON`) an omitted option means encrypted and `SHOW CREATE TABLE` prints `ENCRYPTION='N'` for an opt-out; a parsed `CREATE TABLE` does not know either default, so there both forms read as unencrypted. A value other than `Y` or `N` keeps its spelling (MySQL rejects it) |
+   | `encryptionNormalizer` | upper-cases the table `ENCRYPTION` value (MySQL reads `'y'` and `'Y'` alike but prints the case it was given) and keeps an explicit `ENCRYPTION='N'` distinct from an absent option. What an omitted option means depends on the server (`default_table_encryption`) and the schema (`DEFAULT ENCRYPTION`), which a parsed `CREATE TABLE` does not know, so the diff decides from the desired value: an omitted option is never changed, `'Y'` encrypts, and `'N'` decrypts only a table that is encrypted (a live table with no `ENCRYPTION` is unencrypted, as `SHOW CREATE TABLE` prints nothing for it when `default_table_encryption=OFF`). A schema that wants a table decrypted must say `ENCRYPTION='N'`. A value other than `Y` or `N` keeps its spelling (MySQL rejects it) |
 
 ### Pipeline
 

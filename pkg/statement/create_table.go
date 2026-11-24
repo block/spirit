@@ -396,9 +396,9 @@ type TableOptions struct {
 	// reports it re-serialized, and emitted as written. '' is not recorded.
 	SecondaryEngineAttribute *string `json:"secondary_engine_attribute,omitempty"`
 	// Encryption is the table's ENCRYPTION option ('Y' or 'N'; MySQL accepts
-	// either case). encryptionNormalizer upper-cases it and drops 'N', so a
-	// parsed table carries it only when it is encrypted: SHOW CREATE TABLE
-	// omits ENCRYPTION='N' on a server whose default_table_encryption is OFF.
+	// either case). encryptionNormalizer upper-cases it and keeps an explicit
+	// 'N' distinct from an absent option; diffTableOptions (encryptionClause)
+	// decides what an absent or 'N' value means when diffing.
 	Encryption *string `json:"encryption,omitempty"`
 }
 
@@ -2906,10 +2906,9 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 	optionClause("CHECKSUM", flagText(source.Checksum), flagText(dest.Checksum), "0")
 	optionClause("DELAY_KEY_WRITE", flagText(source.DelayKeyWrite), flagText(dest.DelayKeyWrite), "0")
 	optionClause("AUTOEXTEND_SIZE", uintText(source.AutoextendSize), uintText(dest.AutoextendSize), "0")
-	// ENCRYPTION is quoted in the clause. A table that is not encrypted has
-	// no Encryption (see encryptionNormalizer), so clearing one is
-	// ENCRYPTION='N'.
-	optionClause("ENCRYPTION", quotedText(source.Encryption), quotedText(dest.Encryption), "'N'")
+	if clause := encryptionClause(source.Encryption, dest.Encryption); clause != "" {
+		clauses = append(clauses, clause)
+	}
 	if !engineAttributeEqual(source.SecondaryEngineAttribute, dest.SecondaryEngineAttribute) {
 		attr := ""
 		if dest.SecondaryEngineAttribute != nil {
@@ -2921,6 +2920,29 @@ func (ct *CreateTable) diffTableOptions(target *CreateTable, opts *DiffOptions) 
 	return clauses
 }
 
+// encryptionClause returns the ENCRYPTION clause that takes a table with the
+// source option to one declared with the dest option, or "" when none is
+// needed. Absent and 'N' are the same state on the live side (SHOW CREATE
+// TABLE prints no ENCRYPTION for an unencrypted table on a server whose
+// default is OFF), so they compare equal; but an absent option on the declared
+// side means "not specified" and is never changed: where encryption is the
+// default an omitted option is encrypted, and planning ENCRYPTION='N' for it
+// would decrypt every such table. Only a declared 'N' decrypts, and only a
+// table that is encrypted. See encryptionNormalizer.
+func encryptionClause(source, dest *string) string {
+	if dest == nil {
+		return ""
+	}
+	current := "N"
+	if source != nil {
+		current = *source
+	}
+	if current == *dest {
+		return ""
+	}
+	return "ENCRYPTION='" + sqlescape.EscapeString(*dest) + "'"
+}
+
 // uintText, boolText and flagText render an optional table option value as
 // the text its ALTER clause carries, or nil when the option is unset, so that
 // every option diffs through the same optionClause path in diffTableOptions.
@@ -2929,15 +2951,6 @@ func uintText(v *uint64) *string {
 		return nil
 	}
 	return new(strconv.FormatUint(*v, 10))
-}
-
-// quotedText renders an optional string table option as a SQL string literal,
-// or nil when it is unset.
-func quotedText(v *string) *string {
-	if v == nil {
-		return nil
-	}
-	return new("'" + sqlescape.EscapeString(*v) + "'")
 }
 
 func boolText(v *bool) *string {
