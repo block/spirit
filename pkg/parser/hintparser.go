@@ -1135,12 +1135,9 @@ yynewstate:
 			if yyS[yypt-0].number > 9223372036854775808 {
 				yylex.AppendError(yylex.Errorf("the Signed Value should be at the range of [-9223372036854775808, 9223372036854775807]."))
 				return 1
-			} else if yyS[yypt-0].number == 9223372036854775808 {
-				signed_one := int64(1)
-				parser.yyVAL.setVar = ast.HintSetVar{Value: strconv.FormatInt(signed_one<<63, 10)}
-			} else {
-				parser.yyVAL.setVar = ast.HintSetVar{Value: strconv.FormatInt(-int64(yyS[yypt-0].number), 10)}
 			}
+			// Keep the text as written, so -0 does not lose its sign.
+			parser.yyVAL.setVar = ast.HintSetVar{Value: "-" + strconv.FormatUint(yyS[yypt-0].number, 10)}
 		}
 
 	}

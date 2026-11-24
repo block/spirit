@@ -198,6 +198,8 @@ func TestTableOptimizerHintRestore(t *testing.T) {
 		// restores unchanged.
 		{"SET_VAR(sort_buffer_size = -1)", "SET_VAR(sort_buffer_size = -1)"},
 		{"SET_VAR(sort_buffer_size = +1)", "SET_VAR(sort_buffer_size = +1)"},
+		{"SET_VAR(sort_buffer_size = -0)", "SET_VAR(sort_buffer_size = -0)"},
+		{"SET_VAR(x = -9223372036854775808)", "SET_VAR(x = -9223372036854775808)"},
 		{"SET_VAR(x = -0.3)", "SET_VAR(x = -0.3)"},
 	}
 	extractNodeFunc := func(node ast.Node) ast.Node {
@@ -287,6 +289,17 @@ func TestOptimizerHintRestoreSetVarValue(t *testing.T) {
 		{ast.HintSetVar{VarName: "x", Value: "1.5e-3"}, "SET_VAR(x = 1.5e-3)"},
 		{ast.HintSetVar{VarName: "x", Value: "a b"}, "SET_VAR(x = 'a b')"},
 		{ast.HintSetVar{VarName: "x", Value: "a-b"}, "SET_VAR(x = 'a-b')"},
+		{ast.HintSetVar{VarName: "x", Value: "a.b"}, "SET_VAR(x = 'a.b')"},
+		{ast.HintSetVar{VarName: "x", Value: "REPEATABLE-READ"}, "SET_VAR(x = 'REPEATABLE-READ')"},
+		{ast.HintSetVar{VarName: "x", Value: "1.2.3"}, "SET_VAR(x = '1.2.3')"},
+		{ast.HintSetVar{VarName: "x", Value: "1e"}, "SET_VAR(x = 1e)"},
+		{ast.HintSetVar{VarName: "x", Value: "1e+"}, "SET_VAR(x = '1e+')"},
+		{ast.HintSetVar{VarName: "x", Value: "-"}, "SET_VAR(x = '-')"},
+		{ast.HintSetVar{VarName: "x", Value: "."}, "SET_VAR(x = '.')"},
+		{ast.HintSetVar{VarName: "x", Value: "-0"}, "SET_VAR(x = -0)"},
+		{ast.HintSetVar{VarName: "x", Value: ".5"}, "SET_VAR(x = .5)"},
+		{ast.HintSetVar{VarName: "x", Value: "-1.5E+3"}, "SET_VAR(x = -1.5E+3)"},
+		{ast.HintSetVar{VarName: "x", Value: "16M"}, "SET_VAR(x = 16M)"},
 		{ast.HintSetVar{VarName: "x", Value: ""}, "SET_VAR(x = '')"},
 		{ast.HintSetVar{VarName: "x", Value: "it's"}, "SET_VAR(x = 'it''s')"},
 		{ast.HintSetVar{VarName: "x", Value: `a\b`, Quoted: true}, `SET_VAR(x = 'a\b')`},

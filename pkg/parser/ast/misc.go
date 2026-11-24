@@ -2761,26 +2761,71 @@ func writeHintString(ctx *format.RestoreCtx, str string) {
 	}
 }
 
-// isBareHintValue reports whether a SET_VAR value can be written unquoted: an
-// optionally signed run of letters, digits, '_', '$' and '.', with a sign
-// allowed after an exponent marker (1.5e-3).
+// isBareHintValue reports whether a SET_VAR value can be written unquoted
+// and still be read back as one token: either an unquoted word (letters,
+// digits, '_' and '$', which also covers 1048576 and 16M), or an optionally
+// signed decimal number with an optional fraction and exponent (-0.3,
+// 1.5e-3). Anything else, such as a.b or REPEATABLE-READ, which the hint
+// lexer splits into several tokens, must be quoted.
 func isBareHintValue(v string) bool {
-	if v != "" && (v[0] == '+' || v[0] == '-') {
-		v = v[1:]
-	}
 	if v == "" {
 		return false
 	}
+	if isHintWord(v) {
+		return true
+	}
+	return isHintNumber(v)
+}
+
+func isHintWordChar(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == '$'
+}
+
+func isHintWord(v string) bool {
 	for i := 0; i < len(v); i++ {
-		c := v[i]
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_', c == '$', c == '.':
-		case (c == '+' || c == '-') && i > 0 && (v[i-1] == 'e' || v[i-1] == 'E'):
-		default:
+		if !isHintWordChar(v[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// isHintNumber matches [+-]? (digits [. digits*] | . digits) ([eE] [+-]? digits)?.
+func isHintNumber(v string) bool {
+	i := 0
+	if i < len(v) && (v[i] == '+' || v[i] == '-') {
+		i++
+	}
+	intStart := i
+	for i < len(v) && isDigit(v[i]) {
+		i++
+	}
+	digits := i - intStart
+	if i < len(v) && v[i] == '.' {
+		i++
+		fracStart := i
+		for i < len(v) && isDigit(v[i]) {
+			i++
+		}
+		digits += i - fracStart
+	}
+	if digits == 0 {
+		return false
+	}
+	if i < len(v) && (v[i] == 'e' || v[i] == 'E') {
+		i++
+		if i < len(v) && (v[i] == '+' || v[i] == '-') {
+			i++
+		}
+		expStart := i
+		for i < len(v) && isDigit(v[i]) {
+			i++
+		}
+		if i == expStart {
+			return false
+		}
+	}
+	return i == len(v)
 }
 
 // Restore implements Node interface.

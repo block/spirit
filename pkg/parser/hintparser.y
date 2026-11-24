@@ -490,12 +490,9 @@ Value:
 		if $2 > 9223372036854775808 {
 			yylex.AppendError(yylex.Errorf("the Signed Value should be at the range of [-9223372036854775808, 9223372036854775807]."))
 			return 1
-		} else if $2 == 9223372036854775808 {
-			signed_one := int64(1)
-			$$ = ast.HintSetVar{Value: strconv.FormatInt(signed_one<<63, 10)}
-		} else {
-			$$ = ast.HintSetVar{Value: strconv.FormatInt(-int64($2), 10)}
 		}
+		// Keep the text as written, so -0 does not lose its sign.
+		$$ = ast.HintSetVar{Value: "-" + strconv.FormatUint($2, 10)}
 	}
 
 JoinOrderOptimizerHintName:
